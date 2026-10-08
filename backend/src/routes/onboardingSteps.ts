@@ -25,9 +25,11 @@
 import express, { Request, Response } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb } from "../services/db";
+import { viewAfterUnclaimedStart } from "../utils/startResponseView";
 import {
   ensurePersonaIds,
   ICPPersona,
+  ICP_TIMEOUT_MS,
   icpStartPatch,
   icpReadyPatch,
   icpFailedPatch,
@@ -123,17 +125,25 @@ router.post("/icp/start", authenticateToken, async (req, res) => {
   try {
     const userId = requireUserId(req, res);
     if (!userId) return;
-    // startIcpDiscoveryForUser applies icpStartPatch synchronously and
-    // launches the background LLM call (fire-and-forget). Return the
-    // running snapshot directly from the patch we just persisted — do
-    // NOT read the user back via getUserById here. UserIdIndex is
-    // eventually consistent, and a stale GSI read can return the
-    // pre-update row (icpStatus='ready' + previous icpResult), which
-    // tells the FE to stop polling. Source of truth for the response
+    // startIcpDiscoveryForUser claims the non-running -> running transition
+    // with a DynamoDB ConditionExpression and launches the background LLM
+    // call (fire-and-forget). Return the running snapshot directly from the
+    // patch we just persisted — do NOT read the user back via getUserById
+    // here. UserIdIndex is eventually consistent, and a stale GSI read can
+    // return the pre-update row (icpStatus='ready' + previous icpResult),
+    // which tells the FE to stop polling. Source of truth for the response
     // is what we just wrote, not what the GSI happens to surface in
     // the next 100-1000ms.
-    await startIcpDiscoveryForUser(userId);
-    return res.json({ status: icpSnapshot(icpStartPatch()) });
+    const patch = await startIcpDiscoveryForUser(userId);
+    if (!patch) {
+      // Lost the race (ENG-2308) — a concurrent /icp/start already claimed
+      // this run (e.g. OutreachIcpPick's watchdog re-firing while the first
+      // call's generation is still in flight). Do NOT launch a second
+      // parallel LLM call; return the in-flight snapshot instead.
+      const existing = await viewAfterUnclaimedStart(userId, "icpStatus", "running", icpStartPatch);
+      return res.json({ status: icpSnapshot(existing) });
+    }
+    return res.json({ status: icpSnapshot(patch) });
   } catch (err) {
     console.error("[icp] start failed", err);
     return res.status(500).json({ message: "Failed to start icp" });
@@ -231,14 +241,27 @@ router.post("/competitor/start", authenticateToken, async (req, res) => {
   try {
     const userId = requireUserId(req, res);
     if (!userId) return;
-    // startCompetitorStrategyForUser applies competitorStartPatch synchronously
-    // and launches the background per-ICP LLM loop (fire-and-forget). The
-    // route returns the running snapshot immediately so the UI can poll
-    // /competitor/status.
-    await startCompetitorStrategyForUser(userId);
-    const user = await userDb.getUserById(userId);
-    const fallback = competitorStartPatch();
-    return res.json({ status: competitorSnapshot(user || fallback) });
+    // startCompetitorStrategyForUser claims the non-running -> running
+    // transition with a DynamoDB ConditionExpression and launches the
+    // background per-ICP LLM loop (fire-and-forget). Return the running
+    // snapshot directly from the patch we just persisted — do NOT read the
+    // user back via getUserById on the win path (ENG-2308 review follow-up,
+    // mirrors icp/start's own fix for the same issue): UserIdIndex is
+    // eventually consistent, and a stale GSI read right after this write
+    // can return the pre-update row (competitorStatus='ready' + previous
+    // result), which tells the FE to stop polling.
+    const patch = await startCompetitorStrategyForUser(userId);
+    if (!patch) {
+      // Lost the race (ENG-2308) — a concurrent caller (the route itself,
+      // or the icp-ready cascade kickoff) already claimed this run. Do NOT
+      // launch a second parallel per-ICP LLM loop; return the in-flight
+      // snapshot instead. Fine to re-read here: we have no winning patch of
+      // our own to fall back on, so the eventually-consistent GSI row is
+      // the best available source of truth either way.
+      const existing = await viewAfterUnclaimedStart(userId, "competitorStatus", "running", competitorStartPatch);
+      return res.json({ status: competitorSnapshot(existing) });
+    }
+    return res.json({ status: competitorSnapshot(patch) });
   } catch (err) {
     console.error("[competitor] start failed", err);
     return res.status(500).json({ message: "Failed to start competitor" });
@@ -315,13 +338,22 @@ router.post("/creative-dir/start", authenticateToken, async (req, res) => {
   try {
     const userId = requireUserId(req, res);
     if (!userId) return;
-    // startCreativeDirForUser applies creativeDirStartPatch synchronously and
-    // launches the background LLM call (fire-and-forget). The route returns
-    // the running snapshot immediately so the UI can poll /creative-dir/status.
-    await startCreativeDirForUser(userId);
-    const user = await userDb.getUserById(userId);
-    const fallback = creativeDirStartPatch();
-    return res.json({ status: creativeDirSnapshot(user || fallback) });
+    // startCreativeDirForUser claims the non-running -> running transition
+    // with a DynamoDB ConditionExpression (ENG-2308) and launches the
+    // background LLM call (fire-and-forget). Return the running snapshot
+    // directly from the patch we just persisted on the win path — do NOT
+    // read back via getUserById there (ENG-2308 review follow-up, mirrors
+    // icp/start): UserIdIndex is eventually consistent and a stale GSI read
+    // can return the pre-update row.
+    const patch = await startCreativeDirForUser(userId);
+    if (!patch) {
+      // Lost the race (ENG-2308) — a concurrent caller already claimed this
+      // run. No winning patch of our own, so the eventually-consistent GSI
+      // row is the best available source of truth.
+      const existing = await viewAfterUnclaimedStart(userId, "creativeDirStatus", "running", creativeDirStartPatch);
+      return res.json({ status: creativeDirSnapshot(existing) });
+    }
+    return res.json({ status: creativeDirSnapshot(patch) });
   } catch (err) {
     console.error("[creative-dir] start failed", err);
     return res.status(500).json({ message: "Failed to start creative direction" });
@@ -407,17 +439,26 @@ router.post("/ad-image/start", authenticateToken, async (req, res) => {
   try {
     const userId = requireUserId(req, res);
     if (!userId) return;
-    // startAdImageGenerationForUser applies adImageStartPatch synchronously
-    // and launches the background Brick 8 / Step 5 image-generation loop
-    // (Gemini Pro, 3 variants in parallel, per-variant timeout). The route
-    // returns the running snapshot immediately so the UI can poll
-    // /ad-image/status. The orchestrator gates on creativeDirStatus ===
-    // 'ready' — if creative direction hasn't completed, it patches with
-    // adImageFailedPatch and the UI surfaces the gating reason.
+    // startAdImageGenerationForUser claims the run with a DynamoDB
+    // ConditionExpression (ENG-2308) and launches the background Brick 8 /
+    // Step 5 image-generation loop (Gemini Pro, 3 variants in parallel,
+    // per-variant timeout) — or no-ops (returns null) if a concurrent caller
+    // already claimed it, so we don't burn a second Gemini run. The
+    // orchestrator gates on creativeDirStatus === 'ready' — if creative
+    // direction hasn't completed, it patches with adImageFailedPatch and the
+    // UI surfaces the gating reason.
+    //
+    // Unlike the other four axes' routes, we always re-read below rather
+    // than returning the winning value directly: the resolved value here is
+    // just an AdImageRunIdentity (runId/startedAt), not a full
+    // AdImageStatusFields patch, so there's nothing snapshot-shaped to
+    // return on a win — and on the eager-pipeline branch this always
+    // resolves to null regardless of whether the claim succeeds (the
+    // orchestrator's own runAdImage owns that claim instead), so a
+    // winning-patch shortcut wouldn't even apply there.
     await startAdImageGenerationForUser(userId);
-    const user = await userDb.getUserById(userId);
-    const fallback = adImageStartPatch();
-    return res.json({ status: adImageSnapshot(user || fallback) });
+    const view = await viewAfterUnclaimedStart(userId, "adImageStatus", "running", adImageStartPatch);
+    return res.json({ status: adImageSnapshot(view) });
   } catch (err) {
     console.error("[ad-image] start failed", err);
     return res.status(500).json({ message: "Failed to start ad image" });
@@ -496,15 +537,25 @@ router.post("/ad-copy/start", authenticateToken, async (req, res) => {
   try {
     const userId = requireUserId(req, res);
     if (!userId) return;
-    // startAdCopyForUser applies adCopyStartPatch synchronously and launches
-    // the background per-image LLM loop. The orchestrator gates on
-    // adImageStatus === 'ready' — until the image step ships, it will fail
-    // immediately. The route returns the running snapshot regardless so the
-    // UI can poll /ad-copy/status.
-    await startAdCopyForUser(userId);
-    const user = await userDb.getUserById(userId);
-    const fallback = adCopyStartPatch();
-    return res.json({ status: adCopySnapshot(user || fallback) });
+    // startAdCopyForUser claims the non-running -> running transition with a
+    // DynamoDB ConditionExpression (ENG-2308) and launches the background
+    // per-image LLM loop (fire-and-forget — the orchestrator gates on
+    // adImageStatus === 'ready' and fails fast if not, but that happens
+    // after this function returns regardless, so there's nothing to gain by
+    // re-reading here). Return the running snapshot directly from the patch
+    // we just persisted on the win path — do NOT read back via getUserById
+    // there (ENG-2308 review follow-up, mirrors icp/start): UserIdIndex is
+    // eventually consistent and a stale GSI read can return the pre-update
+    // row. The FE polls /ad-copy/status shortly after regardless.
+    const patch = await startAdCopyForUser(userId);
+    if (!patch) {
+      // Lost the race (ENG-2308) — a concurrent caller already claimed this
+      // run. No winning patch of our own, so the eventually-consistent GSI
+      // row is the best available source of truth.
+      const existing = await viewAfterUnclaimedStart(userId, "adCopyStatus", "running", adCopyStartPatch);
+      return res.json({ status: adCopySnapshot(existing) });
+    }
+    return res.json({ status: adCopySnapshot(patch) });
   } catch (err) {
     console.error("[ad-copy] start failed", err);
     return res.status(500).json({ message: "Failed to start ad copy" });
@@ -802,7 +853,44 @@ router.post("/icp/regenerate-one", authenticateToken, async (req, res) => {
     // (ENG-255). Flip to `running` here, then hand off: the LLM round-trip is
     // ~20s and the FE polls `/icp/status` rather than holding this request
     // open.
-    await userDb.updateUser(userId, icpStartPatch());
+    //
+    // Deliberately UNCONDITIONAL, unlike /icp/start's claim (ENG-2308) — a
+    // review follow-up briefly guarded this write with the same global
+    // icpStatus ConditionExpression, which seemed like the same race but
+    // wasn't: icpStatus is a single per-user flag shared by every
+    // regenerate-one call, while the actual concurrency unit here is the
+    // PERSONA. ENG-255's whole premise is two different cards regenerating
+    // at once — the FE fires regenerate-one per card independently
+    // (`BrandReview.tsx`'s `regeneratingIds` is a Set, with a dedicated test
+    // "ENG-255: concurrent regenerations do not clear each other's
+    // spinners" that clicks two different cards back-to-back and expects
+    // both to actually be in flight) — and `regenerateSingleIcpForUser`'s
+    // completion path already explicitly tolerates this (re-reads the
+    // CURRENT list and splices by persona id, and persists even when
+    // `icpStatus` is no longer `running` because another card's
+    // regeneration already claimed the `ready` transition first). Guarding
+    // this write on the global flag would have silently dropped the second
+    // card's regeneration request — confirmed in review before it shipped,
+    // caught by exercising the actual two-cards-at-once path, not by the
+    // single-card tests this commit added. Closing the real remaining gap
+    // here (two rapid clicks on the SAME card) needs a per-persona claim,
+    // not a per-user one — left as a follow-up rather than rushed in, since
+    // the FE already disables a card's own regenerate control once it shows
+    // a spinner, which already covers the common case.
+    //
+    // If a full /icp/start run is already in flight, KEEP its icpStartedAt:
+    // that run's completion write is conditioned on it (ENG-2308), so stamping
+    // a fresh one here would make its whole-set result get dropped.
+    const inFlightStartedAt =
+      existing?.icpStatus === "running" &&
+      typeof existing?.icpStartedAt === "string" &&
+      Date.now() - Date.parse(existing.icpStartedAt) < ICP_TIMEOUT_MS
+        ? existing.icpStartedAt
+        : undefined;
+    await userDb.updateUser(
+      userId,
+      inFlightStartedAt ? { ...icpStartPatch(), icpStartedAt: inFlightStartedAt } : icpStartPatch(),
+    );
     void regenerateSingleIcpForUser(userId, idx).catch((err: unknown) => {
       console.error("[icp] regenerate-one failed", { userId, idx, err });
     });

@@ -37,6 +37,8 @@ import {
   WhatsAppUndeliverableError,
   WhatsAppRateLimitError,
   TEMPLATES,
+  sendOptOutConfirmation,
+  OPT_OUT_CONFIRMATION,
 } from '../services/whatsappService';
 import { MessagingChannelError } from '../services/messagingChannelService';
 
@@ -593,5 +595,68 @@ describe('Graph request shape', () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body);
     expect(body.messaging_product).toBe('whatsapp');
     expect(body.to).toBe('+14155550123');
+  });
+});
+
+// ── Opt-out confirmation ───────────────────────────────────────────────────
+
+describe('sendOptOutConfirmation', () => {
+  const PHONE = '+14155550123';
+
+  const windowOpenAndOptedOut = () =>
+    settingsService.getSetting.mockImplementation(async (k: string) => {
+      if (k.startsWith('whatsapp:window:')) return { settingValue: new Date().toISOString() };
+      if (k.startsWith('whatsapp:optout:')) return { settingValue: 'x' };
+      return null;
+    });
+
+  it('delivers to a number that has JUST opted out', async () => {
+    windowOpenAndOptedOut();
+
+    // This is the whole point of the function. Every other send path refuses an
+    // opted-out number through assertSendable; a STOP answered with silence is
+    // indistinguishable, to the sender, from a STOP that was dropped.
+    await expect(sendOptOutConfirmation(PHONE)).resolves.toEqual({ messageId: 'wamid.TEST1' });
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.to).toBe(PHONE);
+    expect(body.type).toBe('text');
+    expect(body.text.body).toBe(OPT_OUT_CONFIRMATION);
+  });
+
+  it('tells the customer how to come back', async () => {
+    // The confirmation is the only message they will get after opting out, so it has to
+    // carry the re-subscribe keyword the webhook actually honours.
+    expect(OPT_OUT_CONFIRMATION).toMatch(/UNSTOP/);
+  });
+
+  it('still refuses when the service window is shut', async () => {
+    settingsService.getSetting.mockImplementation(async (k: string) =>
+      k.startsWith('whatsapp:optout:') ? { settingValue: 'x' } : null,
+    );
+
+    // The bypass is scoped to the opt-out check alone. Meta's window rule is theirs,
+    // not ours, and an inbound STOP has always just opened it — so reaching this branch
+    // means something other than a STOP called in, and it must not get a free send.
+    await expect(sendOptOutConfirmation(PHONE)).rejects.toBeInstanceOf(WhatsAppWindowClosedError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a destination that is not a valid phone number', async () => {
+    await expect(sendOptOutConfirmation('not-a-number')).rejects.toBeInstanceOf(WhatsAppError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps the raw number out of its refusal messages (CWE-532)', async () => {
+    settingsService.getSetting.mockResolvedValue(null);
+    await expect(sendOptOutConfirmation(PHONE)).rejects.toThrow(
+      expect.objectContaining({ message: expect.not.stringContaining('4155550123') }),
+    );
+  });
+
+  it('cannot be repurposed to send arbitrary text', () => {
+    // Guards the design: the moment this takes a caller-supplied body it stops being an
+    // acknowledgement and becomes a way to message people who opted out.
+    expect(sendOptOutConfirmation).toHaveLength(1);
   });
 });
