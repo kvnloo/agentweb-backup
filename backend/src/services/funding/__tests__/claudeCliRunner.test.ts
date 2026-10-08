@@ -293,6 +293,41 @@ describe('ClaudeCliRunner', () => {
     expect(runner.activeProcessCount).toBe(0);
   });
 
+  it('closeAll() also prevents a fast-path spawn (never queued — a slot was free) from completing afterward', async () => {
+    // Regression: closeAll() used to mark only spawnQueue entries as pending-close.
+    // When the pool isn't at the cap, waitForFreeSlot never queues the call at all — it
+    // still doesn't resume past its own `await` until the next microtask tick, so a
+    // closeAll() running synchronously right after an un-awaited spawn() used to miss it
+    // entirely, letting a real process spawn asynchronously right after "shutdown" returned.
+    const runner = trackedRunner(); // default cap (8) — well above 1, so this is the fast path
+    const spawnPromise = runner.spawn('conv-fast', CONFIG_DIR, SYSTEM_PROMPT_FILE); // not awaited
+    runner.closeAll(); // synchronous, in the same tick — before doSpawn can resume past its await
+
+    await spawnPromise;
+    await flush();
+
+    expect(mockSpawn).toHaveBeenCalledTimes(0); // must never have actually spawned a process
+    expect(runner.activeProcessCount).toBe(0);
+  });
+
+  it('close() on a conversationId with nothing live or in flight is a no-op — it does not poison a later spawn()', async () => {
+    // Regression: close() used to unconditionally plant a pendingCloseRequests marker
+    // even when there was nothing live or queued to cancel. That marker then silently
+    // consumed the NEXT unrelated spawn() call for the same id, which would resolve with
+    // a fake-successful handle pointing at no real session.
+    const runner = trackedRunner();
+    runner.close({ conversationId: 'ghost' }); // nothing live, nothing in flight for 'ghost'
+
+    const handle = await runner.spawn('ghost', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    expect(mockSpawn).toHaveBeenCalledTimes(1); // must have actually spawned, not silently no-op'd
+    expect(runner.activeProcessCount).toBe(1);
+
+    const child = spawnedChildren[0];
+    const turn = runner.send(handle, 'hi');
+    emitResult(child, { type: 'result', is_error: false, result: 'ok' });
+    await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
+  });
+
   // ─── Idle close ─────────────────────────────────────────────────────────────
 
   it('closes an idle session after the idle timeout and cleans up its scratch HOME dir', async () => {

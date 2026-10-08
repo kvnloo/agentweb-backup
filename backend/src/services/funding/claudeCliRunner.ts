@@ -158,12 +158,9 @@ export class ClaudeCliRunner {
 
       this.pool.set(conversationId, session);
       this.scheduleIdleClose(session);
-
-      if (this.pendingCloseRequests.delete(conversationId)) {
-        // close() raced in during the synchronous setup above -- shut it down now
-        // rather than leave a live, unreachable orphan.
-        this.closeSessionInternal(session, "explicit-close");
-      }
+      // No await since the first pendingCloseRequests check above — nothing (including
+      // another close() call) can run between that check and this point, so a second
+      // check here would be unreachable; the single check above is sufficient.
     } finally {
       this.pendingCloseRequests.delete(conversationId);
     }
@@ -210,6 +207,15 @@ export class ClaudeCliRunner {
       return;
     }
 
+    // this.spawning is the actual source of truth for "something is in flight for this
+    // conversationId" — it covers a spawn still queued behind the cap AND one on the
+    // fast path that hasn't reached the queue or the pool yet. Without this guard, a
+    // defensive close() on an id with nothing live or queued would still plant a
+    // pendingCloseRequests marker that nothing would ever consume except a future,
+    // unrelated spawn() call for that same id — silently turning it into a no-op that
+    // resolves a fake-successful handle to no real session.
+    if (!this.spawning.has(conversationId)) return;
+
     this.pendingCloseRequests.add(conversationId);
     for (let i = this.spawnQueue.length - 1; i >= 0; i--) {
       if (this.spawnQueue[i].conversationId === conversationId) {
@@ -240,7 +246,13 @@ export class ClaudeCliRunner {
 
   /** Closes every open session, and guarantees nothing still queued or mid-spawn survives it either. */
   closeAll(): void {
-    for (const entry of this.spawnQueue) this.pendingCloseRequests.add(entry.conversationId);
+    // this.spawning (not just spawnQueue) is the real source of truth for "in flight" —
+    // it also covers a spawn on the fast path that hasn't reached the queue or the pool
+    // yet (the common case: a slot is free, so waitForFreeSlot never queues it, but the
+    // call still doesn't resume past its `await` until the next microtask tick). Marking
+    // only spawnQueue entries missed that case entirely, letting a real, unreachable
+    // process spawn asynchronously right after closeAll() had already returned.
+    for (const id of this.spawning.keys()) this.pendingCloseRequests.add(id);
     for (const session of [...this.pool.values()]) this.closeSessionInternal(session, "close-all");
 
     // Anything still queued after every live session closed (the queue was longer than
