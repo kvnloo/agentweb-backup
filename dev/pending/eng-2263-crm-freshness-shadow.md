@@ -34,6 +34,11 @@ Counts are flagged replies, not rates - the denominator comes from request logs.
 legitimate follow-up that restates an earlier number is flagged too. Decide enforcement only after reading production output.
 
 Known limits: numbers are matched only in the patterns above ("N lead lists", "N leads in total", "Total leads: N", "Lead lists: N",
-"N leads across K lists"); "1.2k", "twelve" and a bare "47 leads" are not claims. After a CRM write the check abstains. A turn that spans
-several generateMarketingResponse invocations (auto-continue) only sees evidence from the current one. Only count-like fields
+"N leads across K lists"); "1.2k", "twelve" and a bare "47 leads" are not claims. After a CRM write the check abstains. A task that spans
+several generateMarketingResponse invocations is handled: `crmToolsFromEarlierInvocations(history)` reads the markers already on persisted
+messages (`kind: auto-continuation`, an answered question/approval card, a `generation-timeout-continuation` partial followed by the user's
+"continue") and walks back to the request that opened the task. Those CRM tools count as run for the tag check, and the total check ABSTAINS
+(the earlier numbers are unrecoverable: the persisted ledger result is minimised). The log line carries `continuation: true|false`. A plain
+follow-up question is deliberately NOT a continuation - that is the failure this detector exists to see. Cost: a continuation that restates a
+stale total is not caught. Only count-like fields
 (count, total, totalLists, leadCount, ...) and array lengths back a number - not arbitrary numbers inside lead rows.
