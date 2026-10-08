@@ -9,8 +9,10 @@ verified on a fresh session) and the strong models (`claude-sonnet-5.5`, `gpt-5.
 
 `utils/crmFreshnessGuard.ts` detects that shape deterministically (no LLM): a `[verified: ...]` tag citing a CRM tool
 (`get_lead_lists`, `get_leads`, `search_leads`, `ask_crm`, ...) that did not run and succeed this turn
-(`toolCallSucceeded`: not errored, not `success:false`, not a duplicate, not deferred), or a bare tag beside CRM wording
-with no CRM tool that turn. Tags that already say earlier/previous/stale are skipped. It is LOG-ONLY: it logs
+(`toolCallSucceeded`: not errored, not `success:false`, not a duplicate, not deferred). Skipped: tags that already say
+earlier/previous/stale, and a tag being *discussed* ("I can't include the [verified] tag because no tool ran").
+A bare `[verified]` that names no tool is deliberately not judged: in the replay it caught nothing the cited rule missed,
+and on the preview it misfired on exactly that commentary (gemini-3.8-flash). It is LOG-ONLY: it logs
 `[crm-freshness-shadow] ... (message NOT modified)` with `{sessionId, model, kinds, findingCount, tagsSeen,
 crmToolsSucceeded, sample}` and never edits the reply. Always on (pure, try/catch-wrapped); kill switch
 `AGENT_CRM_FRESHNESS_GUARD=off`.
