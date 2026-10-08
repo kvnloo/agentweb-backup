@@ -143,6 +143,8 @@ export interface CompareUsageStatus {
 export interface CompareDeps {
   isAcceptingWork(): boolean;
   isFeatureEnabled(): Promise<boolean>;
+  /** Plan add-on gate (see modelCompareEntitlement). Omitted = not gated. */
+  isEntitled?(user: CompareUser): Promise<boolean>;
   getSession(sessionId: string): Promise<CompareSession | null>;
   checkUsage(userId: string): Promise<CompareUsageStatus>;
   /** Builds the 429 body fields shared with /generate (message + structured usageBlock). */
@@ -177,6 +179,8 @@ export interface CompareCallOptions {
 export interface SelectDeps {
   isAcceptingWork(): boolean;
   isFeatureEnabled(): Promise<boolean>;
+  /** Plan add-on gate (see modelCompareEntitlement). Omitted = not gated. */
+  isEntitled?(user: CompareUser): Promise<boolean>;
   /** `consistentRead` is requested for the re-read under the lock (replay/guard must see our own writes). */
   getSession(sessionId: string, options?: { consistentRead?: boolean }): Promise<CompareSession | null>;
   tryClaim(sessionId: string): boolean;
@@ -194,6 +198,11 @@ export interface SelectDeps {
 // ---------------------------------------------------------------------------
 function fail(status: number, error: string, code: string, extra: Record<string, unknown> = {}): ServiceOutcome {
   return { status, body: { error, code, ...extra } };
+}
+
+/** The plan does not include Compare models. Neutral wording; checked before any session read, lock or model call. */
+function notEntitledOutcome(): ServiceOutcome {
+  return fail(403, 'Compare models is not available on your current plan.', 'model_compare_not_entitled');
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -491,6 +500,7 @@ export async function compareModels(
   if (!(await deps.isFeatureEnabled())) {
     return fail(503, 'Model comparison is currently unavailable', 'model_compare_disabled');
   }
+  if (deps.isEntitled && !(await deps.isEntitled(input.user))) return notEntitledOutcome();
   const parsed = validateCompareRequest(input.body);
   if (!parsed.ok) return parsed.outcome;
   const { sessionId, prompt, models } = parsed.value;
@@ -773,6 +783,7 @@ async function selectCompareResultInner(
   if (!(await deps.isFeatureEnabled())) {
     return fail(503, 'Model comparison is currently unavailable', 'model_compare_disabled');
   }
+  if (deps.isEntitled && !(await deps.isEntitled(input.user))) return notEntitledOutcome();
   const parsed = validateSelectRequest(input.body);
   if (!parsed.ok) return parsed.outcome;
   const req = parsed.value;

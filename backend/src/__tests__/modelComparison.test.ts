@@ -250,6 +250,26 @@ describe('POST /compare access and gating', () => {
     expect(callLLM).not.toHaveBeenCalled();
   });
 
+  it('403 model_compare_not_entitled when the add-on is required and missing: no session read, no model call', async () => {
+    const isEntitled = jest.fn(async () => false);
+    const { deps, callLLM } = makeDeps({ isEntitled });
+    const out = await run(deps, body());
+    expect(out.status).toBe(403);
+    expect(res(out).code).toBe('model_compare_not_entitled');
+    expect(res(out).error).toBe('Compare models is not available on your current plan.');
+    expect(isEntitled).toHaveBeenCalledWith(OWNER);
+    expect(deps.getSession).not.toHaveBeenCalled();
+    expect(deps.checkUsage).not.toHaveBeenCalled();
+    expect(callLLM).not.toHaveBeenCalled();
+  });
+
+  it('runs normally when isEntitled allows, and when no isEntitled dep is supplied', async () => {
+    const a = makeDeps({ isEntitled: async () => true });
+    expect((await run(a.deps, body())).status).toBe(200);
+    const b = makeDeps();
+    expect((await run(b.deps, body())).status).toBe(200);
+  });
+
   it('503 while the instance is draining', async () => {
     const { deps, callLLM } = makeDeps({ isAcceptingWork: () => false });
     expect((await run(deps, body())).status).toBe(503);
@@ -1142,6 +1162,23 @@ describe('POST /compare/select', () => {
     const { deps, appendMessages } = makeSelect({ getSecret: () => { throw new Error('nope'); } });
     expect((await go(deps, sel())).status).toBe(500);
     noWrites(deps, appendMessages);
+  });
+
+  it('403 model_compare_not_entitled on select: no session read, no lock claimed, no write', async () => {
+    const isEntitled = jest.fn(async () => false);
+    const { deps, appendMessages } = makeSelect({ isEntitled });
+    const out = await go(deps, sel());
+    expect(out.status).toBe(403);
+    expect(res(out).code).toBe('model_compare_not_entitled');
+    expect(isEntitled).toHaveBeenCalledWith(OWNER);
+    expect(deps.getSession).not.toHaveBeenCalled();
+    expect(deps.tryClaim).not.toHaveBeenCalled();
+    noWrites(deps, appendMessages);
+  });
+
+  it('select proceeds when isEntitled allows', async () => {
+    const { deps } = makeSelect({ isEntitled: async () => true });
+    expect((await go(deps, sel())).status).toBe(200);
   });
 
   it('503 when disabled by the kill switch', async () => {
