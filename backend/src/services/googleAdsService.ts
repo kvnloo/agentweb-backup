@@ -3,7 +3,11 @@ import { getGoogleAdsCredentials } from '../utils/secretsManager';
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
 import { buildUtmSpec, mergeUtmIntoQueryString, mergeUtmIntoUrl, readUtmKeys, utmKeysInQueryString, utmQueryString } from '../utils/adUtm';
-import { validateNegativeCampaignCriteria } from './googleAdsCampaignCriteria';
+import {
+  buildDeviceBidAdjustmentOperations,
+  NormalizedDeviceBidAdjustments,
+  validateNegativeCampaignCriteria,
+} from './googleAdsCampaignCriteria';
 import {
   assertCountingType,
   assertConversionActionStatus,
@@ -1697,6 +1701,13 @@ export class GoogleAdsService {
 
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     await this.mutate(customerId, accessToken, 'campaignCriteria', operations, loginCustomerId);
+  }
+
+  /** ENG-2036: device bid adjustments (campaign DEVICE criteria or ad-group bid modifiers). */
+  async setDeviceBidAdjustments(userId: string, params: NormalizedDeviceBidAdjustments): Promise<void> {
+    const { resource, operations } = buildDeviceBidAdjustmentOperations(params);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, params.customerId);
+    await this.mutate(params.customerId, accessToken, resource, operations, loginCustomerId);
   }
 
   async listKeywords(userId: string, customerId: string, adGroupResourceName: string): Promise<any[]> {
