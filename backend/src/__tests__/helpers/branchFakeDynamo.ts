@@ -53,7 +53,7 @@ export class BranchFakeDynamo {
     return [...t.values()]
       .filter((i) => i.sessionId === sessionId)
       .sort((a, b) => a.messageIndex - b.messageIndex)
-      .map((i) => clone(i));
+      .map((i) => clone(i) as { messageIndex: number; message: Item });
   }
 
   session(sessionId: string): Item | undefined {
