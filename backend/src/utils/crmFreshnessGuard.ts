@@ -40,7 +40,12 @@ export interface CrmFreshnessResult {
   tagsSeen: number;
 }
 
-const TAG = /\[verified[^\]]*\]/gi;
+// Every quantifier below is BOUNDED and the input is capped: an unbounded `[^\]]*` rescans to the end of the
+// text from every unclosed `[verified`, which is quadratic (measured: 100KB of them blocked the event loop
+// for 1.5s, 500KB for 37s). This runs synchronously on every reply, so it must stay linear.
+const TAG = /\[verified[^\]]{0,300}\]/gi;
+const MAX_TEXT_CHARS = 200_000;
+const MAX_TAGS_SCANNED = 200;
 // A tag that already says it is not fresh is the honest form — nothing to flag.
 const ALREADY_LABELLED = /\b(earlier|previous|prior|before|stale|out of date|outdated|last turn|from the conversation)\b/i;
 const MAX_TAG_CHARS = 120;
@@ -51,8 +56,30 @@ const MAX_TAG_CHARS = 120;
 const MENTION_AFTER = /^\s*(tag|label|marker|badge|notation|annotation)s?\b/i;
 const MENTION_BEFORE = /\b(the|a|this|that|any|use|using|used|include|including|add|adding|attach|attaching|apply|applying|carry|put)\s+$/i;
 
+// Linear-time tag stripper. A regex like /<[^>]*>/g rescans to the end from every unclosed "<"; here the
+// next ">" is cached, so each character is visited a bounded number of times. A "<" with no ">" within
+// MAX_MARKUP_CHARS is literal text (e.g. "5 < 6"), not markup.
+const MAX_MARKUP_CHARS = 1000;
 function stripMarkup(text: string): string {
-  return text.replace(/<[^>]*>/g, '').replace(/`/g, '');
+  const out: string[] = [];
+  let i = 0;
+  let gt = -2;
+  while (i < text.length) {
+    const lt = text.indexOf('<', i);
+    if (lt === -1) { out.push(text.slice(i)); break; }
+    if (gt < lt) {
+      gt = text.indexOf('>', lt);
+      if (gt === -1) { out.push(text.slice(i)); break; }
+    }
+    if (gt - lt <= MAX_MARKUP_CHARS) {
+      out.push(text.slice(i, lt));
+      i = gt + 1;
+    } else {
+      out.push(text.slice(i, lt + 1));
+      i = lt + 1;
+    }
+  }
+  return out.join('').replace(/`/g, '');
 }
 
 function citedTools(tag: string): string[] {
@@ -71,10 +98,11 @@ export function detectCrmFreshnessMismatch(finalText: unknown, toolCalls: unknow
     }
   }
 
-  const text = stripMarkup(finalText);
+  const text = stripMarkup(finalText.length > MAX_TEXT_CHARS ? finalText.slice(0, MAX_TEXT_CHARS) : finalText);
   const findings: CrmFreshnessFinding[] = [];
   let tagsSeen = 0;
   for (const match of text.matchAll(TAG)) {
+    if (tagsSeen >= MAX_TAGS_SCANNED) break;
     tagsSeen++;
     const tag = match[0];
     if (ALREADY_LABELLED.test(tag)) continue;
