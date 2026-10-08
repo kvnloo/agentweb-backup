@@ -9765,7 +9765,11 @@ export const agentModeController = {
       // Taken AFTER the session claim, released in the finally below on every exit.
       let generationSlot: { release: () => void } | undefined;
       try {
-      const slot = await acquireInteractiveGenerationSlot(session.userId, sessionId);
+      // Answer/cancel turns already consumed a paused deck / work-plan request above
+      // (writes dispatched, state cleared), so refusing them now would lose the
+      // outcome and make a retry 409. They are never refused, only counted.
+      const continuesPausedTurn = Boolean(deckAnswer || deckCancel || workPlanInputAnswer);
+      const slot = await acquireInteractiveGenerationSlot(session.userId, sessionId, { bypassLimit: continuesPausedTurn });
       if (!slot.ok) {
         return res.status(429).json(buildTooManyRunsBody(slot.current, slot.limit));
       }

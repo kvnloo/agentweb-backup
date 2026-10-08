@@ -17,8 +17,15 @@ jest.mock('../services/chatbotService', () => ({
     createOrReuseInteractiveShare: jest.fn(),
     getMessagesFromMessagesTable: jest.fn(),
     updateSessionLlmModel: jest.fn(),
+    updateSessionApprovalDeck: jest.fn(),
+    updateSessionWorkPlanInputRequest: jest.fn(),
   },
   updateTaskExecutionStatus: jest.fn(),
+}));
+
+jest.mock('../services/agentMode/core/workPlanInputRequest', () => ({
+  ...jest.requireActual('../services/agentMode/core/workPlanInputRequest'),
+  resolveWorkPlanInputAnswer: jest.fn().mockReturnValue({ answer: { values: { a: 'b' } } }),
 }));
 
 jest.mock('../services/emailService', () => ({
@@ -40,6 +47,7 @@ jest.mock('../services/agentModeService', () => ({
     generateSessionTitle: jest.fn().mockResolvedValue('Test Title'),
     getMarketingSystemPrompt: jest.fn().mockResolvedValue('System prompt'),
     generateDiagnosticMessage: jest.fn().mockResolvedValue(null),
+    submitApprovalDeckAnswers: jest.fn(),
   },
   AgentModeService: jest.fn(),
 }));
@@ -231,5 +239,77 @@ describe('AgentModeController - per-user concurrent generation cap (ENG-110)', (
     expect(res.status).not.toHaveBeenCalledWith(429);
     run.finish();
     await run.done;
+  });
+
+  describe('answer/cancel turns are never refused after consuming their pending state', () => {
+    const setAtCap = async () => {
+      getSetting.mockResolvedValue({ settingValue: '1' });
+      const run = startHanging('other');
+      await waitFor(() => __activeGenerationCountForTests(userId) === 1);
+      return run;
+    };
+    const withPending = (extra: Record<string, unknown>) =>
+      mockChatbotDb.getChatSession.mockImplementation(async (id: string) => ({ ...sessionFor(id), ...extra }) as any);
+    const reqWith = (body: Record<string, unknown>) => {
+      const r = makeReq('paused') as any;
+      r.body = { ...r.body, ...body };
+      return r as Request;
+    };
+    const agentSvc = () => require('../services/agentModeService').agentModeService;
+
+    const cases: Array<[string, Record<string, unknown>, Record<string, unknown>, () => void, () => jest.Mock]> = [
+      ['deckAnswer', { deckAnswer: { deckId: 'd1', answers: [] } }, { pendingApprovalDeck: { deckId: 'd1', items: [] } },
+        () => agentSvc().submitApprovalDeckAnswers.mockResolvedValue({ outcome: 'ok', summary: null, answeredDeck: { answers: [], items: [] } }),
+        () => agentSvc().submitApprovalDeckAnswers],
+      ['deckCancel', { deckCancel: { deckId: 'd1' } }, { pendingApprovalDeck: { deckId: 'd1', items: [] } },
+        () => (mockChatbotDb as any).updateSessionApprovalDeck.mockResolvedValue(true),
+        () => (mockChatbotDb as any).updateSessionApprovalDeck],
+      ['workPlanInputAnswer', { workPlanInputAnswer: { requestId: 'r1', values: { a: 'b' } } }, { pendingWorkPlanInput: { requestId: 'r1' } },
+        () => (mockChatbotDb as any).updateSessionWorkPlanInputRequest.mockResolvedValue(true),
+        () => (mockChatbotDb as any).updateSessionWorkPlanInputRequest],
+    ];
+
+    it.each(cases)('%s at the cap: no 429 after the side effect; the turn runs and is counted', async (_n, body, pending, arm, sideEffect) => {
+      const other = await setAtCap();
+      withPending(pending);
+      arm();
+      let resolve!: (v: any) => void;
+      mockWorkerService.runInWorker.mockReturnValueOnce(new Promise((r) => { resolve = r; }));
+      const res = makeRes();
+      const done = agentModeController.generateResponse(reqWith(body), res);
+      await waitFor(() => __activeGenerationCountForTests(userId) === 2);
+      expect(sideEffect()).toHaveBeenCalled();
+      expect(res.status).not.toHaveBeenCalledWith(429);
+      resolve(EMPTY);
+      await done;
+      other.finish();
+      await other.done;
+      expect(__activeGenerationCountForTests(userId)).toBe(0);
+    });
+
+    it('a plain message on a new session at the cap is still refused (and consumes nothing)', async () => {
+      const other = await setAtCap();
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq('fresh'), res);
+      expect(res.status).toHaveBeenCalledWith(429);
+      expect((mockChatbotDb as any).updateSessionApprovalDeck).not.toHaveBeenCalled();
+      other.finish();
+      await other.done;
+    });
+  });
+
+  it('an ADMIN generating in a CUSTOMER session is counted against the customer, not the admin', async () => {
+    getSetting.mockResolvedValue({ settingValue: '1' });
+    mockChatbotDb.getChatSession.mockImplementation(async (id: string) => sessionFor(id, 'customer-1') as any);
+    let resolve!: (v: any) => void;
+    mockWorkerService.runInWorker.mockReturnValueOnce(new Promise((r) => { resolve = r; }));
+    const req = makeReq('cust-session') as any;
+    req.user = { userId: 'admin-1', email: 'a@example.com', isAdmin: true };
+    const done = agentModeController.generateResponse(req, makeRes());
+    await waitFor(() => __activeGenerationCountForTests('customer-1') === 1);
+    expect(__activeGenerationCountForTests('admin-1')).toBe(0);
+    resolve(EMPTY);
+    await done;
+    expect(__activeGenerationCountForTests('customer-1')).toBe(0);
   });
 });

@@ -58,10 +58,16 @@ export type SlotResult =
  * call `release()` in a `finally`. A rejected result holds nothing.
  * The check-and-add is synchronous (after the limit read), so it is race-free.
  */
-export async function acquireInteractiveGenerationSlot(userId: string, sessionId: string): Promise<SlotResult> {
+export async function acquireInteractiveGenerationSlot(
+  userId: string,
+  sessionId: string,
+  options?: { bypassLimit?: boolean },
+): Promise<SlotResult> {
   const limit = await getMaxConcurrentGenerationsPerUser();
   let sessions = active.get(userId);
-  if (limit > 0) {
+  // bypassLimit: the turn continues a paused conversation whose answer was already consumed
+  // (see /generate). It is never refused but is still counted, so it occupies a slot.
+  if (limit > 0 && !options?.bypassLimit) {
     const others = sessions ? [...sessions.keys()].filter((s) => s !== sessionId).length : 0;
     if (others >= limit) return { ok: false, limit, current: others };
   }
