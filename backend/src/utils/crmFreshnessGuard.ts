@@ -24,13 +24,17 @@ export const CRM_FRESHNESS_TOOLS: readonly string[] = [
 
 export type CrmFreshnessFindingKind =
   /** The tag names a CRM tool, and none of the tools it names succeeded this turn. */
-  'cited_tool_not_run';
+  | 'cited_tool_not_run'
+  /** An account-wide list/lead total whose number is in none of this turn's CRM tool results (nor a sum of them). */
+  | 'inventory_total_not_in_tool_results';
 
 export interface CrmFreshnessFinding {
   kind: CrmFreshnessFindingKind;
   /** The tag as written, markup stripped, capped. */
   tag: string;
   cited: string[];
+  /** For inventory_total_not_in_tool_results: the number the reply stated. */
+  claimed?: number;
 }
 
 export interface CrmFreshnessResult {
@@ -82,6 +86,74 @@ function stripMarkup(text: string): string {
   return out.join('').replace(/`/g, '');
 }
 
+// ---- Untagged account-wide totals ----------------------------------------------------------------------
+// get_lead_lists returns per-list leadCount plus totalLists and NO total-leads field, so a correct "N leads in
+// total" is a SUM the model computed. The check therefore accepts any number that appears in this turn's CRM
+// tool results, an array length, the sum of leadCount, or the sum of per-call match counts. Anything else, with
+// no honest "earlier / out of date" wording next to it, is a carried-over total.
+const MAX_RESULT_NODES = 20_000;
+const MAX_CLAIMS = 20;
+const CLAIM_LABEL_WINDOW = 140;
+
+function collectAllowedNumbers(calls: any[], succeeded: Set<string>): Set<number> {
+  const allowed = new Set<number>();
+  let nodes = 0;
+  let leadCountSum = 0;
+  let listObjects = 0;
+  let perCallCountSum = 0;
+  const walk = (value: unknown, depth: number): void => {
+    if (nodes++ > MAX_RESULT_NODES || depth > 8) return;
+    if (typeof value === 'number') { if (Number.isFinite(value)) allowed.add(Math.trunc(value)); return; }
+    if (typeof value === 'string') { if (/^\d{1,12}$/.test(value)) allowed.add(Number(value)); return; }
+    if (Array.isArray(value)) { allowed.add(value.length); for (const v of value) walk(v, depth + 1); return; }
+    if (value && typeof value === 'object') {
+      const o = value as Record<string, unknown>;
+      if (typeof o.leadCount === 'number') { leadCountSum += o.leadCount; listObjects++; }
+      for (const k of Object.keys(o)) walk(o[k], depth + 1);
+    }
+  };
+  for (const call of calls) {
+    if (!call || typeof call.name !== 'string' || !succeeded.has(call.name) || !toolCallSucceeded(call)) continue;
+    let result: any = call.result;
+    if (typeof result === 'string') { try { result = JSON.parse(result); } catch { continue; } }
+    walk(result, 0);
+    const c = result && typeof result === 'object'
+      ? [result.count, result.rowCount, result.total, result.totalCount].find((x) => typeof x === 'number')
+      ?? (Array.isArray(result.leads) ? result.leads.length : undefined)
+      : undefined;
+    if (typeof c === 'number') perCallCountSum += c;
+  }
+  if (listObjects > 0) { allowed.add(leadCountSum); allowed.add(listObjects); }
+  if (perCallCountSum > 0) allowed.add(perCallCountSum);
+  return allowed;
+}
+
+const NUM = '(\\d[\\d,]{0,14})';
+// "N lists", "N lead lists", "total lead lists: N", "N leads in total", "N leads across K lists / your CRM".
+// Deliberately NOT "N leads across all lists": that is how a filtered search total is phrased.
+const INVENTORY_PATTERNS: RegExp[] = [
+  new RegExp(`\\b${NUM}\\s+(?:total\\s+)?(?:lead\\s+)?lists\\b`, 'gi'),
+  new RegExp(`\\b(?:total|overall)\\s+(?:number\\s+of\\s+)?(?:lead\\s+)?(?:leads|lists|contacts)(?:\\s+across\\s+all\\s+(?:your\\s+)?(?:lead\\s+)?lists)?\\W{0,12}${NUM}`, 'gi'),
+  new RegExp(`\\b${NUM}\\s+(?:total\\s+)?leads\\s+(?:in\\s+total|total|in\\s+your\\s+(?:entire\\s+|whole\\s+)?crm)\\b`, 'gi'),
+  new RegExp(`\\b${NUM}\\s+leads\\s+(?:across|in)\\s+(?:${NUM}\\s+(?:\\w+\\s+)?lists|your\\s+(?:entire\\s+|whole\\s+)?crm)`, 'gi'),
+];
+
+function findInventoryClaims(text: string): Array<{ n: number; at: number }> {
+  const out: Array<{ n: number; at: number }> = [];
+  for (const re of INVENTORY_PATTERNS) {
+    re.lastIndex = 0;
+    for (const m of text.matchAll(re)) {
+      if (out.length >= MAX_CLAIMS) return out;
+      for (const g of m.slice(1)) {
+        if (!g) continue;
+        const n = Number(g.replace(/,/g, ''));
+        if (Number.isFinite(n)) out.push({ n, at: m.index ?? 0 });
+      }
+    }
+  }
+  return out;
+}
+
 function citedTools(tag: string): string[] {
   return CRM_FRESHNESS_TOOLS.filter((name) => new RegExp(`(^|[^a-z_])${name}($|[^a-z_])`, 'i').test(tag));
 }
@@ -114,6 +186,19 @@ export function detectCrmFreshnessMismatch(finalText: unknown, toolCalls: unknow
       findings.push({ kind: 'cited_tool_not_run', tag: tag.slice(0, MAX_TAG_CHARS), cited });
     }
   }
+
+  const claims = findInventoryClaims(text);
+  if (claims.length > 0) {
+    const allowed = collectAllowedNumbers(calls, succeeded);
+    const seen = new Set<number>();
+    for (const { n, at } of claims) {
+      if (allowed.has(n) || seen.has(n)) continue;
+      const near = text.slice(Math.max(0, at - CLAIM_LABEL_WINDOW), at + CLAIM_LABEL_WINDOW);
+      if (ALREADY_LABELLED.test(near)) continue;
+      seen.add(n);
+      findings.push({ kind: 'inventory_total_not_in_tool_results', tag: text.slice(at, at + 60), cited: [], claimed: n });
+    }
+  }
   return { findings, crmToolsSucceeded: [...succeeded].sort(), tagsSeen };
 }
 
@@ -134,8 +219,10 @@ export function runCrmFreshnessShadow(input: CrmFreshnessShadowInput): CrmFreshn
     if (process.env.AGENT_CRM_FRESHNESS_GUARD === 'off') return [];
     const result = detectCrmFreshnessMismatch(input.finalText, input.toolCalls);
     if (result.findings.length === 0) return [];
-    const log = input.log ?? ((message, detail) => console.warn(message, detail));
-    log('[crm-freshness-shadow] verified tag not backed by a CRM tool call this turn (message NOT modified)', {
+    // One line of JSON, so a plain grep / log search / the summarizer script can read it (console.warn(obj)
+    // spreads a multi-line dump that log shippers split apart).
+    const log = input.log ?? ((message, detail) => console.warn(`${message} ${JSON.stringify(detail)}`));
+    log('[crm-freshness-shadow] CRM freshness mismatch (message NOT modified)', {
       sessionId: input.sessionId,
       model: input.model,
       kinds: [...new Set(result.findings.map((f) => f.kind))],
