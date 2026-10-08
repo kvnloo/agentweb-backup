@@ -1020,9 +1020,58 @@ export function hasStalledAutocompleteWorkPlan(
   // otherwise call this turn "not stalled" even though no real required work got done, and no
   // further auto-continuation round would ever fire to go satisfy the debt. Checked before that
   // short-circuit so outstanding debt always wins regardless of what else happened this turn.
+  // ENG-2019: a non-retryable set_work_plan_status gate block means another automatic
+  // round cannot help — the model has already been told the call is final for this turn.
+  // Hand back to the human instead of burning continuation rounds and an oncall page.
+  if (hasNonRetryableWorkPlanStatusBlock(calls)) return false;
   if (workPlanHasUnresolvedDebt(workPlan, calledFunctions)) return true;
   if (calls.some((tc) => toolCallSucceeded(tc))) return false;
   return workPlanHasPendingStep(workPlan);
+}
+
+const NON_RETRYABLE_WORK_PLAN_BLOCK_REASONS = new Set(['workplan_unresolved_removed_requirements']);
+
+/**
+ * ENG-2019: true when this turn's LAST set_work_plan_status call came back as a deliberate,
+ * non-retryable gate block (e.g. a removed step's required function was never called). Session
+ * 15b230eb burned both continuation rounds and paged oncall on exactly this shape: the only
+ * path forward was a tool the model would not call, so automatic continuation cannot help.
+ */
+export function hasNonRetryableWorkPlanStatusBlock(toolCalls: unknown[] | undefined | null): boolean {
+  const calls = Array.isArray(toolCalls) ? toolCalls : [];
+  const statusCalls = calls.filter((tc: any) => tc?.name === 'set_work_plan_status' || tc?.function?.name === 'set_work_plan_status');
+  const last: any = statusCalls[statusCalls.length - 1];
+  if (!last) return false;
+  let result = last.result;
+  if (typeof result === 'string') {
+    try { result = JSON.parse(result); } catch { return false; }
+  }
+  return result?.blocked === true && NON_RETRYABLE_WORK_PLAN_BLOCK_REASONS.has(result?.reason);
+}
+
+export const WORK_PLAN_NEEDS_YOU_MESSAGE =
+  `⚠️ I can't finish this plan on my own — a required step is blocked and needs your input. ` +
+  `Reply here whenever you're ready and I'll pick up where I left off; nothing already done is lost.`;
+
+/** ENG-2019: post the single user-facing hand-back message (no continuation, no oncall page). */
+async function postWorkPlanNeedsYouMessage(sessionId: string, userId: string): Promise<void> {
+  await chatbotDb.addMessageToSession(sessionId, {
+    role: 'assistant',
+    content: WORK_PLAN_NEEDS_YOU_MESSAGE,
+    timestamp: new Date().toISOString(),
+    metadata: { timestamp: new Date().toISOString(), kind: 'work-plan-needs-you' },
+  }).catch((persistErr) =>
+    console.error('AgentMode: failed to persist work-plan-needs-you message:', persistErr),
+  );
+  try {
+    const { io } = await import('../server');
+    io.to(`user:${userId}`).emit('session-message-appended', {
+      sessionId,
+      message: { role: 'assistant', content: WORK_PLAN_NEEDS_YOU_MESSAGE },
+    });
+  } catch (emitErr) {
+    console.error(`AgentMode: failed to emit work-plan-needs-you message for session ${sessionId}:`, emitErr);
+  }
 }
 
 /** ENG-1699: whether an autocomplete work plan still has unfinished work, independent of any
@@ -1885,6 +1934,9 @@ async function scheduleAutoWorkPlanContinuation(
   )
     .then(async (resolved) => {
       stillStalled = hasStalledAutocompleteWorkPlan(resolved?.workPlan, resolved?.toolCalls, resolved?.calledFunctions);
+      if (resolved?.workPlan?.autocomplete && hasNonRetryableWorkPlanStatusBlock(resolved?.toolCalls)) {
+        await postWorkPlanNeedsYouMessage(sessionId, userId);
+      }
       if (resolved?.content) {
         const { io } = await import('../server');
         // ENG-1495: same reasoning as the media auto-continuation emit above.
@@ -10191,6 +10243,11 @@ export const agentModeController = {
       if (hasStalledAutocompleteWorkPlan(response.workPlan, response.toolCalls, response.calledFunctions)) {
         setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, modelToUse, 1).catch((err) =>
           console.error(`AgentMode: work-plan auto-continuation failed for session ${sessionId}:`, err),
+        ));
+      } else if (response.workPlan?.autocomplete && hasNonRetryableWorkPlanStatusBlock(response.toolCalls)) {
+        // ENG-2019: non-retryable gate block — hand back once instead of auto-continuing.
+        setImmediate(() => postWorkPlanNeedsYouMessage(sessionId, session.userId).catch((err) =>
+          console.error(`AgentMode: work-plan needs-you message failed for session ${sessionId}:`, err),
         ));
       }
 
