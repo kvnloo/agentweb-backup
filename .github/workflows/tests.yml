@@ -148,6 +148,7 @@ jobs:
           bash .github/scripts/deploy-failure-alert.test.sh
           bash .github/scripts/eb-config-conflict.test.sh
           bash .github/scripts/staging-env-override.test.sh
+          bash .github/scripts/sha-jest.test.sh
           bash .github/scripts/pipefail-hygiene.test.sh
           bash .github/scripts/paths-filter-hygiene.test.sh
           bash .github/scripts/offline-eval-report.test.sh
