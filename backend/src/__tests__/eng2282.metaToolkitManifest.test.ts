@@ -1,8 +1,7 @@
 /**
  * ENG-2282 acceptance contract:
  *  1. A single exported function returns only the v1 Meta tool definitions. No non-Meta tool leaks.
- *  2. Write tools route through the existing ENG-2046 guarded path, with no bypass. The handler
- *     is mocked at agentModeService.callMetaMarketingApi, the single guarded write entry.
+ *  2. ENG-2268: external v1 refuses all writes before dispatch; reads use shared handlers.
  *  3. No DB/persistence changes (this module imports no db).
  */
 jest.mock('../services/agentModeService', () => ({
@@ -55,7 +54,7 @@ describe('ENG-2282 Meta Toolkit manifest', () => {
     for (const def of manifest) expect(def.inputSchema.properties.client_id).toBeUndefined();
     const mkt = manifest.find((d: any) => d.name === 'call_meta_marketing_api');
     const actions: string[] = mkt.inputSchema.properties.action.enum;
-    for (const excluded of ['DELETE', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'UPLOAD_USERS', 'COPY_AD', 'RETAG_UTM']) {
+    for (const excluded of ['CREATE', 'UPDATE', 'DELETE', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'UPLOAD_USERS', 'COPY_AD', 'RETAG_UTM']) {
       expect(actions).not.toContain(excluded);
     }
     expect(mkt.inputSchema.properties.params.properties.override_tracking_check).toBeUndefined();
@@ -67,13 +66,12 @@ describe('ENG-2282 Meta Toolkit manifest', () => {
     expect(original.inputSchema.properties.action.enum).toContain('DELETE');
   });
 
-  it('routes a guarded write through callMetaMarketingApi (the ENG-2046 guard path) as externalMcp', async () => {
-    const args = { entity_type: 'AD_SET', action: 'UPDATE', account_id: 'act_1', ad_set_id: 'as_1', params: { daily_budget: 50 } };
-    const res = await executeMetaToolkitCall('call_meta_marketing_api', args, ctx);
-    expect(res).toMatchObject({ awaitingUserConfirmation: true });
-    expect(agentModeService.callMetaMarketingApi).toHaveBeenCalledWith(
-      'user-1', 'AD_SET', 'UPDATE', 'act_1', undefined, 'as_1', undefined, { daily_budget: 50 }, 's-1',
-    );
+  it.each(['CAMPAIGN', 'AD_SET', 'AD'].flatMap(entity =>
+    ['CREATE', 'UPDATE'].map(action => [entity, action])))
+  ('ENG-2268 refuses external %s %s before any handler runs', async (entity_type, action) => {
+    await expect(executeMetaToolkitCall('call_meta_marketing_api',
+      { entity_type, action, account_id: 'act_1' }, ctx)).rejects.toBeInstanceOf(MetaToolkitRefusal);
+    expect(agentModeService.callMetaMarketingApi).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -119,10 +117,10 @@ describe('ENG-2282 Meta Toolkit manifest', () => {
     expect(metaTools.metaToolRegistry.getToolNames()).toEqual([...META_TOOLKIT_V1_TOOL_NAMES]);
     expect(isolated.getMetaToolkitManifest().map((d: any) => d.name)).toEqual([...META_TOOLKIT_V1_TOOL_NAMES]);
 
-    const args = { entity_type: 'CAMPAIGN', action: 'CREATE', account_id: 'act_1', params: { name: 'x' } };
+    const args = { entity_type: 'CAMPAIGN', action: 'LIST', account_id: 'act_1', params: { name: 'x' } };
     await isolated.executeMetaToolkitCall('call_meta_marketing_api', args, ctx);
     expect(agentModeService.callMetaMarketingApi).toHaveBeenCalledWith(
-      'user-1', 'CAMPAIGN', 'CREATE', 'act_1', undefined, undefined, undefined, { name: 'x' }, 's-1',
+      'user-1', 'CAMPAIGN', 'LIST', 'act_1', undefined, undefined, undefined, { name: 'x' }, 's-1',
     );
   });
 
@@ -131,6 +129,11 @@ describe('ENG-2282 Meta Toolkit manifest', () => {
     for (const name of META_TOOLKIT_V1_TOOL_NAMES) {
       expect(emmaToolRegistry.getTool(name)).toBe(metaToolRegistry.getTool(name));
     }
+  });
+
+  it.each(['LIST', 'GET', 'PREVIEW', 'SEARCH', 'GET_MATCH_QUALITY'])('allows marketing read %s', async action => {
+    await executeMetaToolkitCall('call_meta_marketing_api', { entity_type: 'AD', action, account_id: 'act_1' }, ctx);
+    expect(agentModeService.callMetaMarketingApi).toHaveBeenCalled();
   });
 
   it('allows reads', async () => {

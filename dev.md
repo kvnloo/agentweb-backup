@@ -1,3 +1,61 @@
+## ENG-1459: C3b transport-remnant audit (2026-08-22)
+
+After C3a routed AgentMode text/tool calls through `callLLM` and the shared gateway, the only
+remaining unreachable Vertex Claude adapter artifacts were `vertex_client`,
+`vertex_client_promise`, and `convertContentToAnthropicBlocks`. They had no callers, and the
+converter's former tests covered only that retired transport. They were deleted with an AST-backed
+regression guard. The direct Gemini SDK site retained in `performDataAnalysis` is the documented
+Gemini code-execution/file-analysis exception, not a text/chat transport. Evidence: guard 21/21,
+all `agentMode*` suites green, and backend typecheck clean. Complexity delta: -171 lines overall.
+
+## ENG-1103: route-level authz tests for orphaned org join-request diagnostic (2026-10-07)
+
+Adds `adminOrgDiagnostics.route.test.ts`: unauthenticated 401, non-admin and delegated 403 with no scan, admin 200 breakdown, generic 500, no mutating verbs. Closes AC4 authorization-denied coverage; no runtime change.
+
+## ENG-2268: Encode approved reads-only Meta Toolkit v1 (2026-10-07)
+
+- Record Harsha's approved D1–D5 decisions in the product boundary, with pricing TBD and tier packaging documented only.
+- Remove external CREATE/UPDATE advertisement and dispatch allowance. All external writes now fail locally with MetaToolkitRefusal; internal Emma handlers are unchanged.
+- Keep launch_* and CUSTOM_AUDIENCE writes excluded. D2's blanket write refusal enforces D4 without scope/persistence changes.
+- Verify negative write cases and allowed reads with scoped manifest/gateway/REST/MCP tests. Production read-only E2E requires an existing account-scoped credential and connected Meta account; no key provisioning is part of this change.
+
+## ENG-976: post_on_account replies on X via in_reply_to_post_id (2026-10-07)
+
+`post_on_connected_account` / MCP `post_on_account` accept optional `in_reply_to_post_id` (X only). It routes through TwitterAdapter.createPost -> postTweet({inReplyToTweetId}) behind the same ENG-827 publish re-check. Omitted means the original-post path is unchanged; other platforms are refused with nothing posted.
+
+## ENG-903: An explicit model selection runs on that model or not at all (2026-10-07)
+
+Rule: a model the user explicitly chose (the request carries it, or a schedule pin) is either the model that runs, or nothing runs and the caller is told. It is never replaced by the default, never "corrected", and never overwritten in storage. No selection at all still uses the configured default; usage-paused is still the 429; registry legacy aliases (`LEGACY_MODEL_ALIASES`) still map forward; a user-configured backup model is unchanged.
+
+**How:** `resolveEffectiveModelForUser` throws `ModelUnavailableError` (`services/agentMode/modelUnavailable.ts`) when an explicit model is not served (`resolveGenerationModel(...).fellBack`, which used to mask the policy's `corrected`) or is not selectable. `allowSilentSwap` is true only when there is NO explicit selection (unpinned schedule, no-selection session creation, unselected shared session).
+
+**Behaviour per entry point**
+- **Explicit = the REQUEST carries a model** (`llmModel` on `/generate`, `llmModel` on session creation; trimmed, blank = none) or a schedule pin. Those 422 `{ error, code:'model_unavailable', requestedModel, reason }` (`not_served`, or `not_selectable` for internal/admin-only and live-voice ids) before any session write (a deck/work-plan answer is not consumed, the user message is not persisted), no LLM call, no metering, stored `llmModel` untouched, lock and idempotency claim released. A paused account still gets the plain 429.
+- A model merely STORED on a session is never explicit (no persisted flag can tell a pick from a system-stamped default, and none is added): `/generate` without `llmModel`, `verifiedGenerate`, shared and conversable chat run on the current default when the stored model is retired or not selectable. The portal always sends the picker value, so portal users still get the 422 and the 'Unavailable' badge.
+- Scheduled runs: the run ends `failure` **before** any session, resume claim or lease work, with `actualResponse: 'model_unavailable: pinned model "<id>" is not served|not selectable — ...'`, no requeue, no session; the existing oncall alert is kept (same dedupe key) and now says the run FAILED and nothing ran. Unpinned schedules keep the old alert-only behaviour.
+- System-assigned flows are UNCHANGED and keep the `resolveFallbackModel` safety net: Slack threads, session responder, work-plan launch, GTM, onboarding, approval inbox, emma-email. They get the automatically assigned configured default stamped into `session.llmModel`, have no model picker, and a retired default must not hard-fail them. There is no persisted "user picked" flag (and none is added), so `generateSessionResponse` itself is lenient.
+- Backup models are unchanged: the user backup is resolved and reported/stored, but the agent loop never retries on it (OpenRouter fails over inside the single request; `agentModeService.ts` ~4040), on `origin/main` as well.
+
+**Deploy prerequisite — run before shipping:** every stored pin that is not a served model or alias starts failing the day this deploys. `scripts/migrateStaleModelReferences.ts` (dry-run is the default) inventories and remaps them (schedules, templates, sessions, work plans, settings). Known example: ENG-903's schedules pinning `claude-sonnet-4-5`.
+
+**Not changed / decided:** no new persisted field, table or key; no owner email for a failed scheduled run (new customer copy needs review); no auto-pause (a failed run still consumes `runCount` like any other failed run); emma-email, work-plan `defaultModel` launch fallback, htmlCreation and the scoring judge are admin/internal configuration and untouched. **Rollback:** revert the PR (no data to repair).
+
+## ENG-55: Compare models in chat (2026-10-07)
+
+`POST /api/agent-mode/compare` fans one prompt out to 2-4 models (unique after alias resolution) as plain, tool-less completions through `agentModeService.callLLM` (no tools, web search, tool_choice or fallbackModels) and returns the answers side by side; `POST /api/agent-mode/compare/select` ("Continue with this answer") persists the chosen answer as a normal user+assistant turn and sets the session model. `/compare` never writes to the session or takes the generation lock. A model that is not honored as requested, is unpriced, live or internal-only is returned as `status:"rejected"`, never substituted; one failing model never fails the others. Responses carry no usage/token/cost data.
+
+Limits (`services/agentMode/modelComparison.ts`): prompt <= 8000 chars, 8192 output tokens (includes reasoning tokens; NOT yet live-smoke-tested with reasoning models, tune afterwards) and a 60s transport deadline per model call, 20 recent text turns / 24k chars of context (normalized to strictly alternating roles), 2 concurrent compares per user, selected content <= 200k chars, select token valid 24h. A `finish_reason: length` answer is returned as `output_limit` with no select token, so a truncated answer can never be continued. `callLLM` retries once on rate-limit/network/5xx/malformed responses (interactive_chat maxAttempts = 2), so worst case per request is 2 x N provider calls and about 2 x 60s plus backoff of latency, not N x. `callLLM` takes no AbortSignal, so a client disconnect does not stop spend, and the concurrency limiter is per instance (in-process). The usage gate runs once before fan-out (same 429 `usage_paused` shape as `/generate`) and the ledger lags, so overshoot is bounded only by the figures above. Calls are metered per call under feature `agent_mode:model_compare`.
+
+`selectToken` is an HMAC-SHA256 (key derived from `JWT_SECRET` with a purpose label) over session owner, session, compareId, prompt, model, sha256(content) and issuedAt; it stops clients forging assistant turns or `llm` attribution without any new storage. Replays are detected by scanning the recent history (newest-first, last 500 messages) for the same user+assistant pair persisted at or after `issuedAt` (so a late replay after more turns is also caught), so they return 200 without appending twice. Both routes return 409 `compare_session_not_started` (checked by `/compare` before any usage check or model call, and again by select) on a session with no user turn yet; a started chat is any chat with at least one user turn, wherever its system message sits (a skill-started chat has the assistant welcome at index 0 and the system message at 1). A comparison yields at most one pair: select returns 409 `compare_already_selected` (no write, session model unchanged) when the history already holds a user turn with the signed prompt persisted at or after `issuedAt` and the request is not the exact replay; a NEW compare with the same prompt has a later `issuedAt` and is selectable. Portal contract: treat `compare_already_selected` as "already added; reload the chat", not a retryable error.
+
+Kill switch: AW-Settings row `model_compare_enabled`; the value `false` makes both routes return 503 `{code:"model_compare_disabled"}` immediately (read per request). Absent or unreadable means enabled. Rollback: set the row to `false`, or revert the PR; there is no schema or data change, and persisted turns are ordinary messages.
+
+Compare has no role logic: an admin and a user get the same result for the same models, and who may select which model is decided only by the registry + usage-policy resolver, never by a model's name or in this feature. The selected model must be the only one that answers: the gateway-reported model is verified (exact id or a dated snapshot of it) and any other answer is discarded as `model_mismatch`, never shown or offered for "Continue".
+
+## ENG-2342: adSetBidAndSchedule test reads metaTools.ts after tools split (2026-10-07)
+
+Test-only path fix: the AD_SET CREATE contract moved from emma/tools.ts to emma/metaTools.ts.
+
 ## OPS: nginx request-timing access log for per-route p99 alarm (2026-10-07)
 
 - `backend/.platform/nginx/conf.d/access_log_timing.conf` defines `main_timing` = EB default `main` + `rt=$request_time urt=$upstream_response_time`.
