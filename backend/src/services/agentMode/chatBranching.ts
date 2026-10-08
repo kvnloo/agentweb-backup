@@ -48,8 +48,21 @@ export function parseBranchRateLimit(value: unknown): number {
   return Number(text);
 }
 
+/**
+ * Strict kill-switch: ONLY the exact string "true" enables branching. No trim, no case folding
+ * ("TRUE", "True", " true " are all OFF), so "set it to anything but true" is a reliable rollback.
+ * Shared by the endpoint gate and the portal capability hint (getModelOptions).
+ */
 export function isChatBranchingSettingEnabled(value: unknown): boolean {
-  return String(value ?? '').trim().toLowerCase() === 'true';
+  return value === 'true';
+}
+
+const MAX_SESSION_ID_CHARS = 256;
+const SESSION_ID_RE = /^[A-Za-z0-9_-]+$/;
+
+/** Session ids are uuids; accept the uuid alphabet (and any legacy id of it) up to 256 chars, like model compare's sessionId bound. */
+export function isAcceptableSessionId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= MAX_SESSION_ID_CHARS && SESSION_ID_RE.test(value);
 }
 
 export interface BranchOrigin {
@@ -441,6 +454,9 @@ async function branchInner(deps: BranchDeps, input: BranchInput, ctx: BranchRunC
   if (!parsed.ok) return parsed.outcome;
   const req = parsed.value;
 
+  // Before ANY storage call: a garbage / oversized id must not reach DynamoDB (it would surface as a 500).
+  if (!isAcceptableSessionId(input.sessionId)) return fail(400, 'Invalid session id', 'invalid_session_id');
+
   const source = await deps.getSession(input.sessionId);
   if (!source) return fail(404, 'Session not found', 'session_not_found');
   // OWNER only. A non-delegated admin writing a new session into a customer's account would leave no
@@ -529,6 +545,12 @@ async function branchInner(deps: BranchDeps, input: BranchInput, ctx: BranchRunC
         const newId = (created.body as { sessionId: string }).sessionId;
         // The branch is visible now: from here on the claim must never be released (a retry would
         // make a duplicate) and a bookkeeping failure must not turn this success into a 500.
+        // If the stamp (recordIdempotencySessionId) fails it is only logged: same-instance retries
+        // still replay via the in-process record (200, same branch). With the run store ON, a retry
+        // that lands on ANOTHER instance finds the claim without a session id and answers 409
+        // DUPLICATE_SUBMIT until the claim TTL (IDEM_TTL_INTERACTIVE_S) expires; the branch itself is
+        // intact and visible. The run store is OFF in production today (AGENT_RUN_STORE unset), so
+        // this path is currently not reachable there.
         const hadRunStore = runStoreHeld;
         runStoreHeld = false;
         try {

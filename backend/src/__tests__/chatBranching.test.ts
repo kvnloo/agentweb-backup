@@ -34,6 +34,7 @@ import {
   BRANCH_MIN_HEADROOM_MESSAGES,
   readBranchOrigin,
   __resetBranchIdempotencyForTests,
+  isChatBranchingSettingEnabled,
 } from '../services/agentMode/chatBranching';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { hasUnresolvedMediaDeferral } from '../utils/timeoutContinuation';
@@ -236,6 +237,41 @@ describe('flag and request validation', () => {
       expect(claimed.size).toBe(0);
     },
   );
+});
+
+describe('session id validation (before any storage call)', () => {
+  it.each([
+    ['oversized', 'a'.repeat(300)],
+    ['empty', ''],
+    ['non-uuid garbage', 'not a session!'],
+    ['path-ish', '../../etc/passwd'],
+    ['encoded slash', 'a%2Fb'],
+    ['non-string', 42 as unknown as string],
+  ])('%s id -> 400 invalid_session_id, no storage call', async (_n, id) => {
+    seedSource();
+    const getSession = jest.fn();
+    const out = await run({ messageIndex: 4 }, { sessionId: id }, makeDeps({ getSession }));
+    expect(out.status).toBe(400);
+    expect((out.body as any).code).toBe('invalid_session_id');
+    expect(getSession).not.toHaveBeenCalled();
+    expect(newSessionIds()).toEqual([]);
+  });
+
+  it('a normal uuid id passes validation', async () => {
+    const getSession = jest.fn().mockResolvedValue(null);
+    const out = await run({ messageIndex: 4 }, { sessionId: '123e4567-e89b-42d3-a456-426614174000' }, makeDeps({ getSession }));
+    expect(out.status).toBe(404);
+    expect(getSession).toHaveBeenCalled();
+  });
+});
+
+describe('isChatBranchingSettingEnabled', () => {
+  it('only the exact string "true" enables it', () => {
+    expect(isChatBranchingSettingEnabled('true')).toBe(true);
+    for (const v of ['TRUE', 'True', ' true ', 'true\n', true, 1, '1', '', null, undefined]) {
+      expect(isChatBranchingSettingEnabled(v)).toBe(false);
+    }
+  });
 });
 
 describe('authorisation and eligibility', () => {

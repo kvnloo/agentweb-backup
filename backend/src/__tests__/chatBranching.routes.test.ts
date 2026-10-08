@@ -133,9 +133,9 @@ describe('feature flag', () => {
     expect(others()).toEqual([]);
   });
 
-  it('only the exact value "true" (case-insensitive) enables it', async () => {
-    mockGetSetting.mockResolvedValue({ settingValue: ' True ' });
-    expect((await request(app).post(URL).set('Authorization', bearer('owner')).send({ messageIndex: 2 })).status).toBe(201);
+  it.each([[' True '], ['TRUE'], ['True'], [' true ']])('only the exact value "true" enables it: %j stays OFF', async (v) => {
+    mockGetSetting.mockResolvedValue({ settingValue: v });
+    expect((await request(app).post(URL).set('Authorization', bearer('owner')).send({ messageIndex: 2 })).status).toBe(404);
   });
 });
 

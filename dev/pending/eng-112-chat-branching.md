@@ -64,7 +64,11 @@ death. This is pre-existing behaviour of archived sessions, not new to branching
 backend log for `ChatBranching: branch session created (hidden until verified)` (it carries `sessionId`,
 `sourceSessionId`, `userId`); every later failure line (`unexpected failure`, `could not be revealed`, `vanished`,
 `idempotency bookkeeping failed`) carries the same `sessionId`. A branch whose reveal succeeded but whose idempotency
-bookkeeping failed still answers 201 and keeps its claim (never released once visible).
+bookkeeping failed still answers 201 and keeps its claim (never released once visible). Exactly what a failed stamp
+means: the branch is visible; a retry on the SAME instance replays it via the in-process record (200); with the run
+store ON, a retry on ANOTHER instance sees the claim without a session id and gets 409 DUPLICATE_SUBMIT until the
+claim TTL expires (no duplicate is created). The run store is OFF in production today (`AGENT_RUN_STORE` unset), so
+only the in-process layer is live there.
 
-**Rollback.** Set `chat_branching_enabled` to anything but `true`; the endpoint answers 404 and the portal hides
+**Rollback.** Set `chat_branching_enabled` to anything but the exact string `true` (`TRUE`, `True`, ` true ` are all OFF); the endpoint answers 404 and the portal hides
 the action. Branches already created are ordinary sessions and need no cleanup.
