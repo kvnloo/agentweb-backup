@@ -53,7 +53,7 @@ const DEFAULT_MAX_CONCURRENT_PROCESSES = 8;
 
 export class ClaudeCliRunner {
   private readonly pool = new Map<string, PooledSession>();
-  private readonly spawnQueue: Array<{ conversationId: string; resolve: () => void }> = [];
+  private readonly spawnQueue: Array<{ conversationId: string; resolve: (granted: boolean) => void }> = [];
   /** Slots committed to spawning OR already live. Incremented synchronously the instant a
    * spawn passes the cap check — never derived from pool.size, which only grows after that
    * spawn's own async gap and would let several different conversationIds, spawned without
@@ -119,11 +119,18 @@ export class ClaudeCliRunner {
     systemPromptFile: string,
     opts: ClaudeCliRunnerOptions,
   ): Promise<void> {
-    await this.waitForFreeSlot(conversationId); // claims (or is handed) a slot -- see the finally below
+    const slotGranted = await this.waitForFreeSlot(conversationId);
+    if (!slotGranted) {
+      // Cancelled while still queued -- never actually granted a slot, so there is
+      // nothing to release. Must not fall through to releaseSlotToQueue() below.
+      this.pendingCloseRequests.delete(conversationId);
+      return;
+    }
+
     let sessionCreated = false;
     try {
       if (this.pendingCloseRequests.delete(conversationId)) {
-        return; // close() arrived while this spawn was still queued -- never start the process.
+        return; // close() arrived right after the slot was granted -- it WAS granted, so the finally below must release it.
       }
 
       const scratchHomeDir = mkdtempSync(join(tmpdir(), "claude-cli-home-"));
@@ -163,8 +170,9 @@ export class ClaudeCliRunner {
       });
 
       this.pool.set(conversationId, session);
+      sessionCreated = true; // set immediately after pool.set() — if anything after this throws, the
+      // session is already live and will release its slot via its own eventual close, not here.
       this.scheduleIdleClose(session);
-      sessionCreated = true;
       // No await since the first pendingCloseRequests check above — nothing (including
       // another close() call) can run between that check and this point, so a second
       // check here would be unreachable; the single check above is sufficient.
@@ -232,7 +240,10 @@ export class ClaudeCliRunner {
     for (let i = this.spawnQueue.length - 1; i >= 0; i--) {
       if (this.spawnQueue[i].conversationId === conversationId) {
         const [entry] = this.spawnQueue.splice(i, 1);
-        entry.resolve(); // let its doSpawn resume immediately; it will see pendingCloseRequests and bail.
+        // false: this entry never held a slot (it was only ever queued, waiting for
+        // one) -- resolving it directly here, instead of through releaseSlotToQueue(),
+        // must not be mistaken by its doSpawn for a real grant it now owes a release for.
+        entry.resolve(false);
       }
     }
   }
@@ -271,7 +282,7 @@ export class ClaudeCliRunner {
     // the pool ever was) would otherwise wait forever for a slot that will never free on
     // its own. Release it now; pendingCloseRequests (set above) ensures none of it spawns.
     const remaining = this.spawnQueue.splice(0, this.spawnQueue.length);
-    for (const entry of remaining) entry.resolve();
+    for (const entry of remaining) entry.resolve(false); // never held a slot -- see close()'s own comment on this.
   }
 
   private handleLine(session: PooledSession, line: string): void {
@@ -333,19 +344,28 @@ export class ClaudeCliRunner {
     this.releaseSlotToQueue();
   }
 
-  private async waitForFreeSlot(conversationId: string): Promise<void> {
+  /**
+   * Resolves `true` once a slot is actually granted (fast path, or handed off from the
+   * queue by releaseSlotToQueue), or `false` if this call was cancelled while still
+   * queued (close()/closeAll() on a still-waiting conversationId) and was never granted
+   * one at all. The caller must not release a slot it was never granted — that was the
+   * bug: close()/closeAll() used to resolve a queued waiter directly, and doSpawn's own
+   * cleanup had no way to tell that apart from a real handoff, so it released a slot
+   * that was never counted, corrupting reservedSlots downward and reopening the cap.
+   */
+  private async waitForFreeSlot(conversationId: string): Promise<boolean> {
     if (this.reservedSlots < this.maxConcurrentProcesses) {
       this.reservedSlots++; // claim it now, synchronously -- not after this function's own await
-      return;
+      return true;
     }
-    return new Promise<void>((resolve) => this.spawnQueue.push({ conversationId, resolve }));
+    return new Promise<boolean>((resolve) => this.spawnQueue.push({ conversationId, resolve }));
   }
 
   /** Hands a freed slot directly to the next queued waiter, or actually frees it if none is waiting. */
   private releaseSlotToQueue(): void {
     const next = this.spawnQueue.shift();
     if (next) {
-      next.resolve(); // the slot transfers to them -- reservedSlots is unchanged, not re-claimed.
+      next.resolve(true); // the slot transfers to them -- reservedSlots is unchanged, not re-claimed.
     } else {
       this.reservedSlots--;
     }

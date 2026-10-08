@@ -309,6 +309,44 @@ describe('ClaudeCliRunner', () => {
     void handleD;
   });
 
+  it('cancelling a queued spawn via close() does not corrupt the slot count and reopen the cap', async () => {
+    // Regression: close()/closeAll() used to resolve a cancelled queued entry directly,
+    // without going through releaseSlotToQueue() -- but doSpawn's own cleanup had no way
+    // to tell that apart from a real slot handoff, so it released a slot that was never
+    // granted, driving the internal slot count negative. The previous test's single
+    // follow-up spawn couldn't reveal this (pool.size looks correct either way with only
+    // one more spawn) -- it only shows up once a SECOND un-awaited spawn exploits the
+    // corrupted count to bypass the cap again, exactly as found live against the real binary.
+    const runner = trackedRunner({ maxConcurrentProcesses: 1 });
+    const handleA = await runner.spawn('conv-a', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+
+    const spawnBPromise = runner.spawn('conv-b', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    await flush();
+    runner.close({ conversationId: 'conv-b' }); // cancel while queued -- never held a slot
+    runner.close(handleA); // free conv-a's slot
+    await spawnBPromise;
+    await flush();
+
+    let eSpawned = false;
+    const pD = runner.spawn('conv-d', CONFIG_DIR, SYSTEM_PROMPT_FILE); // not awaited
+    const pE = runner.spawn('conv-e', CONFIG_DIR, SYSTEM_PROMPT_FILE).then((h) => { // not awaited either
+      eSpawned = true;
+      return h;
+    });
+    await flush();
+
+    // With the cap genuinely still at 1, conv-e must queue behind conv-d, not spawn
+    // concurrently with it.
+    expect(mockSpawn).toHaveBeenCalledTimes(2); // conv-a and conv-d only; conv-e must still be queued
+    expect(eSpawned).toBe(false);
+    expect(runner.activeProcessCount).toBe(1);
+
+    await pD; // conv-d already has its slot (fast path) -- resolves immediately.
+    // conv-e stays queued by design (nothing closes conv-d here) -- afterEach's
+    // closeAll() cleans it up; asserting eSpawned === false above is the real check.
+    void pE;
+  });
+
   it('close() on a conversationId still queued behind the cap cancels it — it never spawns a process', async () => {
     const runner = trackedRunner({ maxConcurrentProcesses: 1 });
     const handleA = await runner.spawn('conv-a', CONFIG_DIR, SYSTEM_PROMPT_FILE);
