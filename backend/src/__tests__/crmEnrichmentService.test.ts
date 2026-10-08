@@ -85,6 +85,9 @@ jest.mock('../services/linkedInOutreachService', () => {
   const actual = jest.requireActual('../services/linkedInOutreachService');
   // Prevent isAccountConnected from calling the Unipile API in unit tests
   actual.linkedInOutreachService.isAccountConnected = jest.fn().mockResolvedValue(true);
+  // The resolvers call the tri-state probe directly (not isAccountConnected), so it must be
+  // mocked too or the real probe runs against the network.
+  actual.linkedInOutreachService.probeAccountSession = jest.fn().mockResolvedValue('connected');
   return actual;
 });
 
@@ -1441,6 +1444,42 @@ describe('CrmEnrichmentService', () => {
   // ─── SITE-WIDE UNIPILE ACCOUNT FALLBACK ─────────────────────────────────
 
   describe('site-wide Unipile account fallback', () => {
+    // ENG-2205: an account whose session probe is merely indeterminate (e.g. a Unipile
+    // outage) must NOT be handed to enrichment. It must behave exactly as it did before
+    // ENG-2205: no account -> the linkedin source is skipped with its warning.
+    it('skips the linkedin source (does not use an unverified account) when the probe is indeterminate', async () => {
+      const { linkedInOutreachService } = require('../services/linkedInOutreachService');
+      linkedInOutreachService.probeAccountSession.mockResolvedValue('unknown');
+      try {
+        mockGetAccountsByUserId.mockResolvedValue([{ platform: 'unipile', account_id: 'acc1' }] as any);
+        mockSettingsService.getSetting.mockResolvedValue({
+          settingName: 'site-wide-unipile-accounts',
+          settingValue: JSON.stringify([{ account_id: 'sw1', enabled: true }]),
+          updatedAt: '', updatedBy: '',
+        });
+        mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+        mockCrmDb.getLeadsByListId.mockResolvedValue({
+          items: [createLead({ leadId: 'lead1' })], lastEvaluatedKey: null, hasMore: false,
+        });
+        mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
+        mockCrmDb.updateLead.mockResolvedValue({} as any);
+        mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+        const result = await service.execute({
+          listId: 'list1', userId: 'user1',
+          instruction: 'Determine industry', outputFields: ['industry'],
+          sources: ['linkedin', 'existing_data'],
+        });
+
+        // An account EXISTS but could not be verified: say so, rather than claiming nothing is connected.
+        expect(result.warnings).toContain('LinkedIn (Unipile) is temporarily unreachable — linkedin source skipped');
+        expect(result.warnings).not.toContain('No LinkedIn (Unipile) account connected — linkedin source skipped');
+        expect(mockAgentModeService.linkedinOutreach).not.toHaveBeenCalled();
+      } finally {
+        linkedInOutreachService.probeAccountSession.mockResolvedValue('connected');
+      }
+    });
+
     it('should return null when no user account AND no site-wide setting', async () => {
       mockGetAccountsByUserId.mockResolvedValue([]);
       mockSettingsService.getSetting.mockResolvedValue(null);
