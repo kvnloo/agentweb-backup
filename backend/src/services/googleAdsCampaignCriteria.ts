@@ -274,7 +274,12 @@ export function validateDeviceBidAdjustments(
     if (typeof pct !== 'number' || !Number.isFinite(pct) || pct < -100 || pct > 900) {
       throw deviceValidationError('INVALID_BID_MODIFIER', `bid_modifier_percent for ${device} must be a number from -100 (exclude) to 900`);
     }
-    return { device: device as BidAdjustmentDevice, bidModifier: Math.round((1 + pct / 100) * 10000) / 10000 };
+    const bidModifier = pct === -100 ? 0 : Math.round((1 + pct / 100) * 10000) / 10000;
+    // 0 means device opt-out in Google Ads; only an explicit -100 may produce it.
+    if (pct !== -100 && bidModifier <= 0) {
+      throw deviceValidationError('INVALID_BID_MODIFIER', `bid_modifier_percent for ${device} is too close to -100; use exactly -100 to exclude the device`);
+    }
+    return { device: device as BidAdjustmentDevice, bidModifier };
   });
 
   return adGroup
@@ -283,7 +288,10 @@ export function validateDeviceBidAdjustments(
 }
 
 /** Pure: build the Google Ads mutate resource + operations for a validated adjustment set. */
-export function buildDeviceBidAdjustmentOperations(n: NormalizedDeviceBidAdjustments): {
+export function buildDeviceBidAdjustmentOperations(
+  n: NormalizedDeviceBidAdjustments,
+  existingAdGroupModifiers: Partial<Record<BidAdjustmentDevice, string>> = {},
+): {
   resource: 'campaignCriteria' | 'adGroupBidModifiers';
   operations: any[];
 } {
@@ -301,12 +309,11 @@ export function buildDeviceBidAdjustmentOperations(n: NormalizedDeviceBidAdjustm
   }
   return {
     resource: 'adGroupBidModifiers',
-    operations: n.adjustments.map((a) => ({
-      create: {
-        adGroup: n.adGroupResourceName,
-        bidModifier: a.bidModifier,
-        device: { type: a.device },
-      },
-    })),
+    operations: n.adjustments.map((a) => {
+      const existing = existingAdGroupModifiers[a.device];
+      return existing
+        ? { update: { resourceName: existing, bidModifier: a.bidModifier }, updateMask: 'bid_modifier' }
+        : { create: { adGroup: n.adGroupResourceName, bidModifier: a.bidModifier, device: { type: a.device } } };
+    }),
   };
 }

@@ -1408,6 +1408,7 @@ describe('handleCallGoogleAdsApi — CAMPAIGN_CRITERION SET_DEVICE_BID_ADJUSTMEN
   it.each([
     ['out-of-range percent', { campaign_resource_name: 'customers/1234567890/campaigns/555', device_bid_adjustments: [{ device: 'MOBILE', bid_modifier_percent: -101 }] }, 'INVALID_BID_MODIFIER'],
     ['above max percent', { campaign_resource_name: 'customers/1234567890/campaigns/555', device_bid_adjustments: [{ device: 'MOBILE', bid_modifier_percent: 901 }] }, 'INVALID_BID_MODIFIER'],
+    ['near-exclusion percent that rounds to opt-out', { campaign_resource_name: 'customers/1234567890/campaigns/555', device_bid_adjustments: [{ device: 'MOBILE', bid_modifier_percent: -99.999 }] }, 'INVALID_BID_MODIFIER'],
     ['unknown device', { campaign_resource_name: 'customers/1234567890/campaigns/555', device_bid_adjustments: [{ device: 'WATCH', bid_modifier_percent: 0 }] }, 'INVALID_DEVICE'],
     ['duplicate device', { campaign_resource_name: 'customers/1234567890/campaigns/555', device_bid_adjustments: [{ device: 'MOBILE', bid_modifier_percent: 0 }, { device: 'MOBILE', bid_modifier_percent: 10 }] }, 'INVALID_DEVICE'],
     ['empty adjustments', { campaign_resource_name: 'customers/1234567890/campaigns/555', device_bid_adjustments: [] }, 'MISSING_CRITERIA'],
