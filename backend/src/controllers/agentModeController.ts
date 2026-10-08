@@ -79,6 +79,7 @@ import {
   markRunTerminal,
   IDEM_TTL_INTERACTIVE_S,
 } from '../services/agentMode/runStore';
+import { validateModelPin, normalizeRequestedLlmModel, resolvePlanLaunchModel } from '../services/agentMode/modelPin';
 import { ModelUnavailableError, buildModelUnavailableBody, isModelUnavailableError, sanitizeModelLabel } from '../services/agentMode/modelUnavailable';
 import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
 // ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
@@ -484,23 +485,6 @@ export async function resolveEffectiveModelForUser(input: {
   };
 }
 
-/**
- * A request-body llmModel that is not a string (array, number, object...) is still an
- * explicit selection, but it must never reach the registry lookups, which coerce keys
- * (['gpt-5.5'] would match 'gpt-5.5' and then blow up later as a 500). Give it a
- * stable string form so it is refused like any other unserved id. null/undefined/blank
- * stay "no selection".
- */
-function normalizeRequestedLlmModel(raw: unknown): string | undefined {
-  if (raw === null || raw === undefined) return undefined;
-  if (typeof raw === 'string') return raw.trim() || undefined;
-  try {
-    return JSON.stringify(raw) ?? String(raw);
-  } catch {
-    return String(typeof raw);
-  }
-}
-
 /** The one 422 body for a ModelUnavailableError (display name from the registry when the id is one). */
 function modelUnavailableBody(err: ModelUnavailableError) {
   const displayName = typeof agentModeService.getModelDisplayName === 'function'
@@ -522,24 +506,8 @@ function modelUnavailableBody(err: ModelUnavailableError) {
  * exactly like the resolver above.
  */
 async function validateScheduleModelPin(userId: string, raw: unknown): Promise<string> {
-  const requested = normalizeRequestedLlmModel(raw);
-  if (!requested) return '';
-  if (typeof raw !== 'string') throw new ModelUnavailableError(requested, 'not_served');
-  if (
-    typeof agentModeService.resolveGenerationModel !== 'function'
-    || typeof agentModeService.isModelSelectableBy !== 'function'
-  ) {
-    return requested;
-  }
-  const resolution = agentModeService.resolveGenerationModel(requested);
-  if (resolution.fellBack) throw new ModelUnavailableError(requested, 'not_served');
-  if (!agentModeService.isModelSelectableBy(resolution.model, false)) {
-    // adminOnly is the only gate an admin can clear; internalOnly/live fail for everyone.
-    const adminCanSelect = agentModeService.isModelSelectableBy(resolution.model, true)
-      && await isUserAdmin(userId);
-    if (!adminCanSelect) throw new ModelUnavailableError(requested, 'not_selectable');
-  }
-  return requested;
+  // Shared rule set (services/agentMode/modelPin.ts) - also used by Work Plan writes and launches.
+  return validateModelPin(agentModeService, () => isUserAdmin(userId), raw);
 }
 
 async function resolveScheduleBackup(input: {
@@ -12043,6 +12011,10 @@ export const agentModeController = {
       // hands-off work-plan autocomplete, even if this session is scheduled.
       const result = await agentModeService.applyPredefinedWorkPlan(planId, sessionId, user.userId, { isUnattendedRun: false });
       if (!result.success) {
+        // ENG-903: the plan's pinned model cannot be served for this user: 422, nothing launched.
+        if (result.errorType === 'model_unavailable' && result.modelUnavailable) {
+          return res.status(422).json(result.modelUnavailable);
+        }
         return res.status(result.requiresConfirmation ? 409 : 404).json({
           error: result.requiresConfirmation ? 'ACTIVE_WORK_PLAN' : 'WORKPLAN_UNAVAILABLE',
           code: result.requiresConfirmation ? 'ACTIVE_WORK_PLAN' : 'WORKPLAN_UNAVAILABLE',
@@ -12146,6 +12118,10 @@ export const agentModeController = {
       // hands-off work-plan autocomplete, even if this session is scheduled.
       const result = await agentModeService.applyPredefinedWorkPlan(planId, sessionId, user.userId, { skipDeclineGate: true, isUnattendedRun: false });
       if (!result.success) {
+        // ENG-903: the plan's pinned model cannot be served for this user: 422, nothing launched.
+        if (result.errorType === 'model_unavailable' && result.modelUnavailable) {
+          return res.status(422).json(result.modelUnavailable);
+        }
         // Defensive backstop for a race between our pre-check above and this
         // call (e.g. a concurrent accept/launch landed in between) — never a
         // silent partial: chat/session state is left exactly as applyPredefinedWorkPlan
@@ -15063,6 +15039,23 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Not authorized to use this private work plan' });
       }
 
+      // ENG-903 FAIL-LOUD: a plan's non-empty `defaultModel` is an explicit pin set by its
+      // author. Resolve it against the LAUNCHING user (anonymous = non-admin) BEFORE the
+      // session or any side effect exists; an unserved/unselectable pin is a 422, never a
+      // silent swap to the account default. Empty = account default (unchanged).
+      let planPinnedModel: string | undefined;
+      try {
+        planPinnedModel = await resolvePlanLaunchModel(
+          agentModeService,
+          () => (result.user ? isUserAdmin(result.user.userId) : Promise.resolve(false)),
+          predefinedPlan.defaultModel,
+        );
+      } catch (modelError) {
+        if (!isModelUnavailableError(modelError)) throw modelError;
+        console.warn(`AgentMode: createSessionWithPlan "${predefinedPlan.title}" refused — plan model "${sanitizeModelLabel(modelError.requestedModel)}" is ${modelError.reason}.`);
+        return res.status(422).json(modelUnavailableBody(modelError));
+      }
+
       // Create session with userId (authenticated or anonymous)
       const session = await chatbotDb.createChatSession(
         userId,
@@ -15150,25 +15143,8 @@ export const agentModeController = {
         }
       }
 
-      // Set default model for new sessions
-      // Use work plan's default model if specified, otherwise use global default
-      let selectedModel = predefinedPlan.defaultModel;
-
-      // Validate work plan's default model
-      if (selectedModel) {
-        const supportedModels = await agentModeService.getSupportedModels();
-        if (!supportedModels.includes(selectedModel)) {
-          console.warn(`AgentMode: Work plan default model "${selectedModel}" not supported, using global default`);
-          selectedModel = undefined;
-        } else {
-          console.log(`AgentMode: Using work plan default model: ${selectedModel}`);
-        }
-      }
-
-      // Fall back to global default if no valid work plan model
-      if (!selectedModel) {
-        selectedModel = await agentModeService.getDefaultModel();
-      }
+      // Set the session model: the plan's validated pin, else the account default.
+      const selectedModel = planPinnedModel || await agentModeService.getDefaultModel();
 
       await chatbotDb.updateSessionLlmModel(session.sessionId, selectedModel);
 

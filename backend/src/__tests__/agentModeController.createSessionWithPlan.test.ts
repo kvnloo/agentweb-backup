@@ -38,7 +38,11 @@ jest.mock('../services/db', () => ({
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     getSupportedModels: jest.fn(),
-    getDefaultModel: jest.fn()
+    getDefaultModel: jest.fn(),
+    // ENG-903: registry doubles - the plan pin is resolved with the shared pin rules.
+    resolveGenerationModel: jest.fn(),
+    isModelSelectableBy: jest.fn(),
+    getModelDisplayName: jest.fn(),
   },
   // ENG-1802: the controller now imports the real title-normalization helper
   // directly (not through the agentModeService object above), so this module
@@ -158,6 +162,17 @@ describe('AgentModeController - createSessionWithPlan', () => {
     // Mock agent mode service methods
     mockAgentModeService.getSupportedModels.mockResolvedValue(['gpt-5-chat', 'gemini-3-pro-preview', 'claude-opus-4']);
     mockAgentModeService.getDefaultModel.mockResolvedValue('gpt-5-chat');
+    // Registry: three served ids + one honoured alias; admin-only / internal-only / live ids.
+    const REG = new Set(['gpt-5-chat', 'gemini-3-pro-preview', 'claude-opus-4', 'admin-only-model', 'internal-judge', 'live-voice']);
+    (mockAgentModeService.resolveGenerationModel as jest.Mock).mockImplementation((m: string) => {
+      const n = m === 'legacy-alias' ? 'gemini-3-pro-preview' : m;
+      return REG.has(n) ? { model: n, fellBack: false, requestedModel: m } : { model: 'gpt-5-chat', fellBack: true, requestedModel: m };
+    });
+    (mockAgentModeService.isModelSelectableBy as jest.Mock).mockImplementation((m: string, admin: boolean) => {
+      if (m === 'internal-judge' || m === 'live-voice') return false;
+      if (m === 'admin-only-model') return admin;
+      return true;
+    });
 
     // Mock updateSessionLlmModel to return session with llmModel
     mockChatbotDb.updateSessionLlmModel = jest.fn().mockImplementation((sessionId, llmModel) => {
@@ -870,7 +885,6 @@ describe('AgentModeController - createSessionWithPlan', () => {
 
       await agentModeController.createSessionWithPlan(req, res);
 
-      expect(mockAgentModeService.getSupportedModels).toHaveBeenCalled();
       expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
         'test-session-123',
         'gemini-3-pro-preview'
@@ -878,37 +892,71 @@ describe('AgentModeController - createSessionWithPlan', () => {
       expect(mockAgentModeService.getDefaultModel).not.toHaveBeenCalled();
     });
 
-    it('should fall back to global default when work plan model is invalid', async () => {
-      const workPlansWithInvalidModel = [
-        {
-          planId: 'plan-invalid-model',
-          title: 'Onboarding',
-          steps: [{ stepCount: 1, title: 'Step 1' }],
-          defaultModel: 'invalid-model-name',
-          visibility: 'system' as const,
-          isBuiltIn: true,
-          createdAt: '2024-01-01T00:00:00Z',
-          updatedAt: '2024-01-01T00:00:00Z'
-        }
-      ];
-      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) => {
-        if (visibility === 'system') {
-          return Promise.resolve(workPlansWithInvalidModel);
-        }
-        return Promise.resolve([]);
-      });
+    const planWithModel = (defaultModel: any, visibility: 'system' | 'private' = 'system') => {
+      const plans = [{
+        planId: 'plan-pinned',
+        title: 'Onboarding',
+        steps: [{ stepCount: 1, title: 'Step 1' }],
+        defaultModel,
+        visibility,
+        isBuiltIn: true,
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-01T00:00:00Z'
+      }];
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((v: string) =>
+        Promise.resolve(v === 'system' && visibility === 'system' ? plans : []));
+    };
 
-      const req = mockRequest(mockPlanTitle);
+    // ENG-903 FAIL-LOUD: an explicit plan pin that cannot be served is a 422 with NO session.
+    it.each([
+      ['retired / unserved', 'retired-model-9', 'not_served'],
+      ['non-string', ['gpt-5-chat'], 'not_served'],
+      ['internalOnly', 'internal-judge', 'not_selectable'],
+      ['live-voice', 'live-voice', 'not_selectable'],
+      ['adminOnly for an anonymous caller', 'admin-only-model', 'not_selectable'],
+    ])('returns 422 model_unavailable (%s) before any session or side effect', async (_label, model, reason) => {
+      planWithModel(model);
       const res = mockResponse();
 
-      await agentModeController.createSessionWithPlan(req, res);
+      await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle, {}, { startingMessage: 'go' }), res);
 
-      expect(mockAgentModeService.getSupportedModels).toHaveBeenCalled();
-      expect(mockAgentModeService.getDefaultModel).toHaveBeenCalled();
-      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
-        'test-session-123',
-        'gpt-5-chat' // The mocked default model
-      );
+      expect(res.status).toHaveBeenCalledWith(422);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'model_unavailable', reason }));
+      expect(String((res.json as jest.Mock).mock.calls[0][0].error)).toContain('nothing was sent to a different model');
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+      expect(mockChatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
+      expect(mockChatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
+      expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+      expect(mockChatbotDb.updateSessionInteractiveShareMetadata).not.toHaveBeenCalled();
+    });
+
+    it('adminOnly plan model: non-admin signed-in user gets 422, an admin launches on it', async () => {
+      planWithModel('admin-only-model');
+      mockGetUserFromToken.mockResolvedValue({ user: { userId: 'u-1', email: 'a@b.c' } } as any);
+      mockUserDb.getUserById.mockResolvedValue({ userId: 'u-1', isAdmin: false } as any);
+      const denied = mockResponse();
+      await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), denied);
+      expect(denied.status).toHaveBeenCalledWith(422);
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+
+      mockUserDb.getUserById.mockResolvedValue({ userId: 'u-1', isAdmin: true } as any);
+      const ok = mockResponse();
+      await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), ok);
+      expect(ok.status).not.toHaveBeenCalledWith(422);
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('test-session-123', 'admin-only-model');
+    });
+
+    it('honours a legacy alias by storing the canonical id', async () => {
+      planWithModel('legacy-alias');
+      await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), mockResponse());
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('test-session-123', 'gemini-3-pro-preview');
+      expect(mockAgentModeService.getDefaultModel).not.toHaveBeenCalled();
+    });
+
+    it('whitespace-only plan model is no pin (account default)', async () => {
+      planWithModel('   ');
+      await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), mockResponse());
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('test-session-123', 'gpt-5-chat');
     });
 
     it('should use global default when work plan has no default model', async () => {
@@ -935,7 +983,6 @@ describe('AgentModeController - createSessionWithPlan', () => {
 
       await agentModeController.createSessionWithPlan(req, res);
 
-      expect(mockAgentModeService.getSupportedModels).not.toHaveBeenCalled();
       expect(mockAgentModeService.getDefaultModel).toHaveBeenCalled();
       expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
         'test-session-123',
@@ -968,41 +1015,6 @@ describe('AgentModeController - createSessionWithPlan', () => {
 
       await agentModeController.createSessionWithPlan(req, res);
 
-      expect(mockAgentModeService.getSupportedModels).not.toHaveBeenCalled();
-      expect(mockAgentModeService.getDefaultModel).toHaveBeenCalled();
-      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
-        'test-session-123',
-        'gpt-5-chat'
-      );
-    });
-
-    it('should handle model validation when supported models list is empty', async () => {
-      const workPlansWithDefaultModel = [
-        {
-          planId: 'plan-empty-supported-models',
-          title: 'Onboarding',
-          steps: [{ stepCount: 1, title: 'Step 1' }],
-          defaultModel: 'some-model',
-          visibility: 'system' as const,
-          isBuiltIn: true,
-          createdAt: '2024-01-01T00:00:00Z',
-          updatedAt: '2024-01-01T00:00:00Z'
-        }
-      ];
-      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) => {
-        if (visibility === 'system') {
-          return Promise.resolve(workPlansWithDefaultModel);
-        }
-        return Promise.resolve([]);
-      });
-      mockAgentModeService.getSupportedModels.mockResolvedValue([]);
-
-      const req = mockRequest(mockPlanTitle);
-      const res = mockResponse();
-
-      await agentModeController.createSessionWithPlan(req, res);
-
-      expect(mockAgentModeService.getSupportedModels).toHaveBeenCalled();
       expect(mockAgentModeService.getDefaultModel).toHaveBeenCalled();
       expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
         'test-session-123',

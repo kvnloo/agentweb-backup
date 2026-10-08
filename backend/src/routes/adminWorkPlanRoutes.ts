@@ -4,6 +4,7 @@ import sharp from "sharp";
 import { workPlanService, type WorkPlanDisplayMetadataV1 } from "../services/workPlanService";
 import { normalizeWorkPlanSteps, findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContentLoss, mergeWorkPlanSteps, summarizeStepChange } from "../services/workPlanSteps";
 import { normalizeWorkPlanDisplayMetadata } from "../services/workPlanDisplayMetadata";
+import { checkPlanDefaultModelWrite } from "../services/agentMode/modelPin";
 import { workPlanThumbnailService } from "../services/workPlanThumbnailService";
 
 const THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
@@ -71,6 +72,11 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ message: "Title and at least one step are required" });
     }
 
+    // ENG-903: the writer is an admin (adminOnly models are selectable); an unserved,
+    // internal-only or live-voice model is refused now (422) instead of at launch.
+    const modelCheck = await checkPlanDefaultModelWrite(async () => true, defaultModel);
+    if (!modelCheck.ok) return res.status(422).json(modelCheck.body);
+
     const { steps: normalizedSteps, warnings } = normalizeWorkPlanSteps(steps);
 
     // No plan id exists yet at create time, so a self-reference in
@@ -92,7 +98,7 @@ router.post("/", async (req, res) => {
       requireLogin: requireLogin || false,
       showLoginSignup: showLoginSignup || 'after_plan_completed',
       showInAgentMode: showInAgentMode !== false,
-      defaultModel,
+      defaultModel: modelCheck.touched ? modelCheck.value : undefined,
       category,
       display: normalizedDisplay,
       visibility: visibility || 'system',
@@ -120,6 +126,9 @@ router.put("/:planId", async (req, res) => {
     if (steps !== undefined && !Array.isArray(steps)) {
       return res.status(400).json({ message: "steps must be an array" });
     }
+    // ENG-903: validate only a CHANGED model; re-sending the stored value never blocks an edit.
+    const modelCheck = await checkPlanDefaultModelWrite(async () => true, defaultModel, plan.defaultModel);
+    if (!modelCheck.ok) return res.status(422).json(modelCheck.body);
     // A caller that decided this write was safe by reading the plan first can
     // stake the revision it saw. `null` is a real value here ("the plan had no
     // revision"), so presence of the key is what counts (ENG-890).
@@ -356,7 +365,7 @@ router.put("/:planId", async (req, res) => {
       ...(requireLogin !== undefined && { requireLogin }),
       ...(showLoginSignup !== undefined && { showLoginSignup }),
       ...(showInAgentMode !== undefined && { showInAgentMode }),
-      ...(defaultModel !== undefined && { defaultModel }),
+      ...(modelCheck.touched && { defaultModel: modelCheck.value }),
       ...(category !== undefined && { category }),
       ...(visibility !== undefined && { visibility }),
       // Absent key -> spread from `...plan` above is left standing (preserved).

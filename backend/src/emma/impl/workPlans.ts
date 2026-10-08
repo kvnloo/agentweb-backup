@@ -251,6 +251,8 @@ import { extractProducedAssetCount } from '../../services/agentMode/core/synthes
 import { extractGeneratedImageFilenames } from './shared/generatedAssets';
 import { currentRunFunding } from '../../services/funding/runFunding';
 import { isNonConsumableRequiredFunctionCall } from '../../services/agentMode/workPlanRequiredCallsPolicy';
+import { resolvePlanLaunchModel, isUserAdminSafe, type ModelPinRegistry } from '../../services/agentMode/modelPin';
+import { buildModelUnavailableBody, isModelUnavailableError } from '../../services/agentMode/modelUnavailable';
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
 
@@ -293,7 +295,7 @@ function logMissingWorkPlanForDiagnosis(
  * `agentModeService.ts`'s type for no real benefit, since only this one
  * method is ever used.
  */
-export interface WorkPlanModelRegistry {
+export interface WorkPlanModelRegistry extends ModelPinRegistry {
   getSupportedModels(isAdmin?: boolean): Promise<string[]>;
 }
 
@@ -517,6 +519,44 @@ export async function applyPredefinedWorkPlan(
       return { success: false, message: 'Not authorized to use this private work plan' };
     }
 
+    // ENG-903 FAIL-LOUD: a plan's non-empty `defaultModel` is an explicit pin. Resolve it
+    // for the LAUNCHING (session-owner) user BEFORE any session mutation; an unserved or
+    // unselectable pin refuses the launch with the shared model_unavailable sentence
+    // instead of launching on another model. Empty = account default (unchanged).
+    let planPinnedModel: string | undefined;
+    try {
+      planPinnedModel = await resolvePlanLaunchModel(
+        modelRegistry,
+        () => isUserAdminSafe(userId),
+        predefinedPlan.defaultModel,
+      );
+    } catch (modelError) {
+      if (!isModelUnavailableError(modelError)) throw modelError;
+      const body = buildModelUnavailableBody(
+        modelError,
+        typeof modelRegistry.getModelDisplayName === 'function' ? modelRegistry.getModelDisplayName(modelError.requestedModel) : undefined,
+      );
+      console.warn(`[applyPredefinedWorkPlan] "${predefinedPlan.title}" not launched — plan model "${body.requestedModel}" is ${modelError.reason}.`);
+      if (options?.isUnattendedRun) {
+        void import('../../utils/agentModeAlerts')
+          .then(({ sendAgentModeOncallAlert }) => sendAgentModeOncallAlert({
+            subject: 'AgentMode: unavailable model pinned on a Work Plan launched by an unattended run',
+            message: `Work plan "${predefinedPlan.title}" (${predefinedPlan.planId}) pins model "${body.requestedModel}", which is not available (${modelError.reason}). The unattended launch was refused and nothing ran on another model. Choose a served model for the plan.`,
+            context: { Plan: String(predefinedPlan.planId), 'Pinned Model': body.requestedModel },
+            dedupeKey: `workplan_model_invalid:${predefinedPlan.planId}:${body.requestedModel}`,
+            dedupeWindowMs: 60 * 60 * 1000,
+          }))
+          .catch((alertError) => console.error('[applyPredefinedWorkPlan] Failed to send unavailable plan-model alert:', alertError));
+      }
+      return {
+        success: false,
+        errorType: 'model_unavailable',
+        code: 'model_unavailable',
+        modelUnavailable: body,
+        message: body.error,
+      };
+    }
+
     // ENG-1814: a title-based match (not a stable planId) that has a near-duplicate
     // sibling in the accessible set is exactly the shape of two real, live-confirmed
     // incidents (Founder_Linkedin_Sales_Readiness_Eval/_Audit) where the model picked
@@ -693,17 +733,12 @@ export async function applyPredefinedWorkPlan(
       }
     }
 
-    // Apply the plan's default model when it is supported.
-    if (predefinedPlan.defaultModel) {
+    // Apply the plan's pinned model (already validated above; no silent drop).
+    if (planPinnedModel) {
       try {
-        const supportedModels = await modelRegistry.getSupportedModels();
-        if (supportedModels.includes(predefinedPlan.defaultModel)) {
-          await chatbotDb.updateSessionLlmModel(sessionId, predefinedPlan.defaultModel);
-        } else {
-          console.warn(`[applyPredefinedWorkPlan] Plan model "${predefinedPlan.defaultModel}" not supported; leaving session model unchanged`);
-        }
+        await chatbotDb.updateSessionLlmModel(sessionId, planPinnedModel);
       } catch (modelErr) {
-        console.warn('[applyPredefinedWorkPlan] Error applying plan model:', (modelErr as Error).message);
+        console.error('[applyPredefinedWorkPlan] Error applying plan model:', (modelErr as Error).message);
       }
     }
 
