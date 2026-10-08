@@ -716,7 +716,20 @@ export async function sendApprovalRequestWithTracking(
   });
 
   console.log("✅ Approval request sent to Slack and stored in database");
-  
+
+  // ENG-273: WhatsApp is a peer notification channel, not a second place to approve
+  // from. Deliberately placed here rather than at the four call sites: this is the one
+  // choke point every approval already passes through, so a new caller cannot forget it.
+  // Imported dynamically and awaited only for its own internal error handling — it never
+  // throws, so the Slack result and the approval record above are unaffected either way.
+  const { notifyApprovalOnWhatsApp } = await import('./approvalChannelNotifier');
+  await notifyApprovalOnWhatsApp({
+    userId: request.userId,
+    assetType: request.assetType,
+    filename: request.filename,
+    assetUrl: request.imageUrl,
+  });
+
   return {
     messageTs: result.messageTs,
     approvalId: approval.assetUrl // Use assetUrl as the ID since that's the primary key
