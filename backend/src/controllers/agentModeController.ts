@@ -1,4 +1,10 @@
 import { scheduleBackupModels } from '../services/agentMode/modelSupersession';
+import {
+  acquireInteractiveGenerationSlot,
+  buildTooManyRunsBody,
+  TooManyConcurrentRunsError,
+  isTooManyConcurrentRunsError,
+} from '../services/agentMode/concurrentGenerationCap';
 import { isEvaluationUser, EvaluationDenied } from '../services/evaluationPolicy';
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken, isRealAdmin } from '../middleware/auth';
@@ -5255,20 +5261,28 @@ async function runVerifiedChatInner(
  */
 export async function runVerifiedChat(
   params: Parameters<typeof runVerifiedChatInner>[0],
-  options?: { lockTimeoutMs?: number },
+  options?: { lockTimeoutMs?: number; capInteractiveUserId?: string },
 ): Promise<RunVerifiedChatResult> {
   const { sessionId } = params;
   const claimed = await claimSessionGenerationWithRetry(sessionId);
   if (!claimed) {
     throw new SessionBusyError(sessionId);
   }
+  let generationSlot: { release: () => void } | undefined;
   try {
+    // ENG-110: only the interactive /verified-generate endpoint passes capInteractiveUserId.
+    if (options?.capInteractiveUserId) {
+      const slot = await acquireInteractiveGenerationSlot(options.capInteractiveUserId, sessionId);
+      if (!slot.ok) throw new TooManyConcurrentRunsError(slot.current, slot.limit);
+      generationSlot = slot;
+    }
     return await withGenerationTimeout(
       runVerifiedChatInner(params),
       sessionId,
       options?.lockTimeoutMs ?? RUN_VERIFIED_CHAT_LOCK_TIMEOUT_MS,
     );
   } finally {
+    generationSlot?.release();
     releaseSessionGeneration(sessionId);
   }
 }
@@ -9747,7 +9761,19 @@ export const agentModeController = {
         });
       }
 
+      // ENG-110: per-user soft cap on concurrently generating interactive chats.
+      // Taken AFTER the session claim, released in the finally below on every exit.
+      let generationSlot: { release: () => void } | undefined;
       try {
+      // Answer/cancel turns already consumed a paused deck / work-plan request above
+      // (writes dispatched, state cleared), so refusing them now would lose the
+      // outcome and make a retry 409. They are never refused, only counted.
+      const continuesPausedTurn = Boolean(deckAnswer || deckCancel || workPlanInputAnswer);
+      const slot = await acquireInteractiveGenerationSlot(session.userId, sessionId, { bypassLimit: continuesPausedTurn });
+      if (!slot.ok) {
+        return res.status(429).json(buildTooManyRunsBody(slot.current, slot.limit));
+      }
+      generationSlot = slot;
 
       // Check token usage limits
       const usageStatus = await checkTokenUsage(user.userId);
@@ -10264,6 +10290,7 @@ export const agentModeController = {
         void markRunTerminal(runSurvivalRunId, 'completed');
       }
       } finally {
+        generationSlot?.release();
         releaseSessionGeneration(sessionId);
         // Terminal state reached (success OR error unwinding through here):
         // release the submit-lock so an identical, legitimate resubmit is
@@ -15493,7 +15520,7 @@ export const agentModeController = {
         // ENG-2072: a real person is watching this turn — never force hands-off
         // work-plan autocomplete, even if this session happens to be scheduled.
         isUnattendedRun: false
-      }));
+      }, { capInteractiveUserId: session.userId }));
 
       // If client disconnected, don't try to send response
       // The results are already saved to the session
@@ -15529,6 +15556,11 @@ export const agentModeController = {
           message: 'A response is already being generated for this session. Please wait.',
           code: 'SESSION_BUSY',
         });
+      }
+
+      // ENG-110: per-user concurrent interactive generation cap.
+      if (isTooManyConcurrentRunsError(error)) {
+        return res.status(429).json(buildTooManyRunsBody(error.current, error.limit));
       }
 
       // ENG-2293: same handled outcome as the other three generate-response
