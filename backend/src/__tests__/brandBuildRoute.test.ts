@@ -58,7 +58,7 @@ describe("POST /api/onboarding/brand-build/start", () => {
       useEagerPipeline: true,
       companyUrl: "https://example.com",
     });
-    userDb.getUserByIdConsistent.mockResolvedValue({
+    userDb.getUserByIdConsistent.mockResolvedValueOnce({
       userId: "user-1",
       useEagerPipeline: true,
       companyUrl: "https://example.com",

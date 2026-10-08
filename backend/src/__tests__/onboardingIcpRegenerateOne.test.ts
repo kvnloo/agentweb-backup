@@ -323,6 +323,51 @@ describe("regenerateSingleIcpForUser — the persona list can move mid-flight", 
   });
 });
 
+// ─────────────── model omits a required field (ENG-2308 live finding) ───────────────
+//
+// Reproduced against the real model at ~1 in 3: it returns a persona without
+// `meta_targeting_brief`, which the sanitiser rejects, failing the user's click.
+
+describe("generateSingleIcpForUser — model drops a required field", () => {
+  const { generateSingleIcpForUser } = require("../services/onboardingIcpService");
+  const { name, pain, desire, objection } = REGENERATED as any;
+  const missingBrief = { icp: { name, pain, desire, objection } };
+
+  class SeqLlm {
+    public calls = 0;
+    constructor(private readonly seq: unknown[]) {}
+    async generateJsonRobust<T = unknown>(): Promise<T> {
+      return this.seq[Math.min(this.calls++, this.seq.length - 1)] as T;
+    }
+  }
+
+  it("retries once and returns the complete persona", async () => {
+    const llm = new SeqLlm([missingBrief, { icp: REGENERATED }]);
+    const got = await generateSingleIcpForUser({}, FIVE[1], [FIVE[0]], { llm });
+    expect(got.name).toBe(REGENERATED.name);
+    expect(llm.calls).toBe(2);
+  });
+
+  it("still fails (after exactly one retry) when the model keeps omitting it", async () => {
+    const llm = new SeqLlm([missingBrief, missingBrief, { icp: REGENERATED }]);
+    await expect(generateSingleIcpForUser({}, FIVE[1], [FIVE[0]], { llm })).rejects.toThrow(
+      "LLM returned no icp",
+    );
+    expect(llm.calls).toBe(2);
+  });
+
+  it("does not retry when the first answer is complete", async () => {
+    const llm = new SeqLlm([{ icp: REGENERATED }]);
+    await generateSingleIcpForUser({}, FIVE[1], [FIVE[0]], { llm });
+    expect(llm.calls).toBe(1);
+  });
+
+  it("tells the model all five fields are required, including meta_targeting_brief", () => {
+    expect(ICP_SINGLE_REGEN_SYSTEM_PROMPT).toMatch(/ALL FIVE fields are required/);
+    expect(ICP_SINGLE_REGEN_SYSTEM_PROMPT).toMatch(/Never omit meta_targeting_brief/);
+  });
+});
+
 // ───────────────────────── prompt construction ─────────────────────────
 
 describe("regenerateSingleIcpForUser — what the model is sent", () => {
