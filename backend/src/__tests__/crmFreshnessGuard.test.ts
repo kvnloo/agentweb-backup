@@ -175,9 +175,34 @@ describe('detectCrmFreshnessMismatch - untagged account-wide totals (ENG-2263)',
     expect(kinds('You have approximately 12,656 leads across 96 lists.').map((x) => x.claimed ?? 0).sort((a, b) => a - b)).toEqual([96, 12656]);
   });
 
+  it('skips the honest labels the models actually write (captured from gemini-3.8-flash on the preview)', () => {
+    for (const text of [
+      'You have 96 lead lists in total (from our check a moment ago).',
+      'You have 96 lead lists in total, based on our check earlier in this session.',
+      'From our check just moments ago, you have 96 lead lists in total (unverified this turn, as requested).',
+      'You have 96 lead lists in total (per the previous lookup, not re-queried).',
+      'In our session you had 96 lead lists in total; I have not re-run it.',
+    ]) expect(kinds(text)).toEqual([]);
+  });
+
+  it('still flags the same sentence when nothing says it is old', () => {
+    expect(kinds('You have 96 lead lists in total.').map((x) => x.claimed)).toEqual([96]);
+    expect(kinds('Right now you have 96 lead lists in total, confirmed.').map((x) => x.claimed)).toEqual([96]);
+  });
+
   it('skips a claim with honest wording right next to it', () => {
     expect(kinds('As of my earlier check, you had 47 leads in total across 18 lists.')).toEqual([]);
     expect(kinds('Both moved since my previous answer: 43 leads in total (was 47), 17 lead lists (was 18).')).toEqual([]);
+  });
+
+  it('does not treat a subset breakdown as the account total (captured from gemini-3.8-flash: "Remaining 15 lists")', () => {
+    expect(kinds('5 Test leads [verified: search_leads]:\n  Test Lead List: 3 leads\n  Remaining 15 lists: 0 leads', [ok('search_leads', { count: 5 })])).toEqual([]);
+    expect(kinds('The other 4 lists are empty.')).toEqual([]);
+    expect(kinds('Plus 12 lists with no matches.')).toEqual([]);
+  });
+
+  it('still flags a bare total with no subset word in front', () => {
+    expect(kinds('Across the CRM you have 15 lists.').map((x) => x.claimed)).toEqual([15]);
   });
 
   it('does not flag small numbers unrelated to inventory', () => {

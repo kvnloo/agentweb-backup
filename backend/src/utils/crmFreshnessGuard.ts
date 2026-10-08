@@ -51,7 +51,7 @@ const TAG = /\[verified[^\]]{0,300}\]/gi;
 const MAX_TEXT_CHARS = 200_000;
 const MAX_TAGS_SCANNED = 200;
 // A tag that already says it is not fresh is the honest form — nothing to flag.
-const ALREADY_LABELLED = /\b(earlier|previous|prior|before|stale|out of date|outdated|last turn|from the conversation)\b/i;
+const ALREADY_LABELLED = /\b(earlier|previous|prior|before|stale|out of date|outdated|last turn|from the conversation|ago|unverified|not (?:re-?)?(?:checked|verified|queried|run)|(?:from|per|in) (?:our|my|the) (?:last |earlier |previous |prior )?(?:check|lookup|query|session|conversation))\b/i;
 const MAX_TAG_CHARS = 120;
 // The model sometimes talks ABOUT the tag ("I can't include the [verified: ...] tag because no tool ran").
 // That is the honest behaviour, not a claim — a tag followed by "tag"/"label" or introduced by an
@@ -189,16 +189,21 @@ const INVENTORY_PATTERNS: RegExp[] = [
   new RegExp(`\\b${NUM}\\s+leads\\s+(?:across|in)\\s+(?:${NUM}\\s+(?:\\w+\\s+)?lists|your\\s+(?:entire\\s+|whole\\s+)?crm)`, 'gi'),
 ];
 
+const SUBSET_BEFORE = /\b(remaining|other|another|rest of(?: the)?|empty|those|these|all but|except(?: for)?|plus)\s+$/i;
+
 function findInventoryClaims(text: string): Array<{ n: number; at: number }> {
   const out: Array<{ n: number; at: number }> = [];
   for (const re of INVENTORY_PATTERNS) {
     re.lastIndex = 0;
     for (const m of text.matchAll(re)) {
       if (out.length >= MAX_CLAIMS) return out;
+      const at = m.index ?? 0;
+      // "Remaining 15 lists: 0 leads" / "the other 4 lists" is a breakdown of a subset, not the account total.
+      if (SUBSET_BEFORE.test(text.slice(Math.max(0, at - 24), at))) continue;
       for (const g of m.slice(1)) {
         if (!g) continue;
         const n = Number(g.replace(/,/g, ''));
-        if (Number.isFinite(n)) out.push({ n, at: m.index ?? 0 });
+        if (Number.isFinite(n)) out.push({ n, at });
       }
     }
   }
