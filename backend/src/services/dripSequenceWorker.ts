@@ -28,6 +28,16 @@ import { v4 as uuidv4 } from 'uuid';
 // socialEngagementExecutor.ts's INSTANCE_ID, used for log correlation only.
 const INSTANCE_ID = uuidv4();
 
+const PINNED_ACCOUNT_SNOOZE_MS = 30 * 60 * 1000;
+
+/** A LinkedIn step pins an account the sequence owner no longer owns or shares. */
+export class PinnedLinkedInAccountNotConnectedError extends Error {
+  constructor(stepNumber: number, userId: string) {
+    super(`LinkedIn step ${stepNumber} references an account that is not connected to user ${userId}`);
+    this.name = 'PinnedLinkedInAccountNotConnectedError';
+  }
+}
+
 export async function processDueEnrollments(): Promise<{
   processed: number;
   sent: number;
@@ -73,6 +83,14 @@ export async function processDueEnrollments(): Promise<{
         const retryAt = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
         await dripSequenceDb.snoozeEnrollment(enrollment.enrollmentId, retryAt).catch(() => {});
         console.log(`[dripWorker] Snoozed enrollment ${enrollment.enrollmentId} until ${retryAt} (not yet connected)`);
+      } else if (err instanceof PinnedLinkedInAccountNotConnectedError) {
+        // A config problem the owner has to fix (re-pick or reconnect the account). Retrying every 5-minute
+        // tick cannot succeed and only burns claims and log noise, so back off. Deliberately SHORT (30 min,
+        // not the 6h used for 'not yet connected'): editing a sequence does not reset an enrollment's
+        // nextSendAt, so a long snooze would delay sending long after the user has fixed the step.
+        const retryAt = new Date(Date.now() + PINNED_ACCOUNT_SNOOZE_MS).toISOString();
+        await dripSequenceDb.snoozeEnrollment(enrollment.enrollmentId, retryAt).catch(() => {});
+        console.log(`[dripWorker] Snoozed enrollment ${enrollment.enrollmentId} until ${retryAt} (pinned LinkedIn account not connected)`);
       } else if (err instanceof SenderDailyLimitExceededError) {
         // ENG-265: the sender's daily counter resets at UTC midnight — releasing
         // the claim here would just re-fail on the very next 5-minute tick until
@@ -326,6 +344,16 @@ async function sendLinkedInStep(
   }
 
   // Resolve which LinkedIn account to send from
+  if (step.linkedInAccountId) {
+    // ENG-2205: a pinned account must be the sequence owner's own or org-shared one. Checked here
+    // as well as on sequence write because sequences saved before that check may name any account.
+    // A config problem, so it throws (retried once the user fixes the step) rather than skipping.
+    const { resolveLinkedInAccountForWrite } = await import('./agentMode/linkedInDailyVolumeGate');
+    if (!(await resolveLinkedInAccountForWrite(enrollment.userId, step.linkedInAccountId))) {
+      console.error(`[dripWorker] LinkedIn step ${step.stepNumber} for enrollment ${enrollment.enrollmentId}: pinned account is not connected to user ${enrollment.userId}`);
+      throw new PinnedLinkedInAccountNotConnectedError(step.stepNumber, enrollment.userId);
+    }
+  }
   const accountId = step.linkedInAccountId
     || await linkedInOutreachService.resolveAccountId(enrollment.userId);
 

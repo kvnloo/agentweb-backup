@@ -27,6 +27,7 @@ const mockFilterByCompanySize = jest.fn(
   async (...args: any[]) => ({ items: args[0], excludedUnverifiable: 0 }),
 );
 const mockClearStatusCache = jest.fn();
+const mockProbeAccountSession = jest.fn();
 // Defaults to false (own account) so every pre-existing test below — none of
 // which care about site-wide-pool attribution — keeps working unmodified.
 // Only the reactive-handler tests override it to exercise usedSharedAccount: true.
@@ -64,6 +65,7 @@ jest.mock('../services/linkedInOutreachService', () => {
       probeSearchCapability: (...args: any[]) => mockProbeSearchCapability(...args),
       filterByCompanySize: (...args: any[]) => mockFilterByCompanySize(...args),
       clearStatusCache: (...args: any[]) => mockClearStatusCache(...args),
+      probeAccountSession: (...args: any[]) => mockProbeAccountSession(...args),
     },
   };
 });
@@ -766,6 +768,7 @@ describe('AgentModeService.importLeadsFromSearch — top-up loop', () => {
     mockDeleteLead.mockReset();
     mockSetLeadListSearchCursor.mockReset();
     mockClearStatusCache.mockReset();
+    mockProbeAccountSession.mockReset();
     mockRecordUnipileAccountHealth.mockReset();
     mockUsedSharedAccount.mockReset().mockReturnValue(false);
     service = new AgentModeService();
@@ -899,9 +902,54 @@ describe('AgentModeService.importLeadsFromSearch — top-up loop', () => {
 
     const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 10 });
 
-    expect(result.searchError).toContain('LinkedIn connectivity check timed out');
+    // Infrastructure failures are reported to the agent as a generic, retry-shaped message —
+    // never the raw internal text.
+    expect(result.searchError).toBe('LinkedIn is temporarily unavailable. Please try again in a few minutes.');
     expect(mockClearStatusCache).not.toHaveBeenCalled();
     expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
+  });
+
+  describe('a BARE 401 (no explicit disconnected_account code) needs a fresh second opinion before marking the account disconnected', () => {
+    const bare401 = () => { const err: any = new Error('Unauthorized'); err.structuredError = { status: 401, classification: 'AUTH_ERROR' }; return err; };
+    const run = async () => {
+      mockSearchPeople
+        .mockResolvedValueOnce({ items: [makeItem(1), makeItem(2)], cursor: 'c2' })
+        .mockRejectedValueOnce(bare401());
+      mockBatchCreateLeads.mockResolvedValueOnce(batchResult(2, 0, 'p1'));
+      return service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 10 });
+    };
+
+    it('records disconnected when the fresh probe CONFIRMS it', async () => {
+      mockProbeAccountSession.mockResolvedValue('disconnected');
+      await run();
+      expect(mockClearStatusCache).toHaveBeenCalledWith('test-account-id');
+      expect(mockProbeAccountSession).toHaveBeenCalledWith('test-account-id');
+      expect(mockRecordUnipileAccountHealth).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT record when the fresh probe says the session is fine (one-off auth blip)', async () => {
+      mockProbeAccountSession.mockResolvedValue('connected');
+      await run();
+      expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
+    });
+
+    it('does NOT record when the fresh probe is inconclusive (the cron decides)', async () => {
+      mockProbeAccountSession.mockResolvedValue('unknown');
+      await run();
+      expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
+    });
+
+    it("an explicit errors/disconnected_account is conclusive: recorded without needing the probe", async () => {
+      const explicit: any = new Error('Disconnected account');
+      explicit.structuredError = { code: 'errors/disconnected_account', status: 401, classification: 'AUTH_ERROR' };
+      mockSearchPeople
+        .mockResolvedValueOnce({ items: [makeItem(1), makeItem(2)], cursor: 'c2' })
+        .mockRejectedValueOnce(explicit);
+      mockBatchCreateLeads.mockResolvedValueOnce(batchResult(2, 0, 'p1'));
+      await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 10 });
+      expect(mockProbeAccountSession).not.toHaveBeenCalled();
+      expect(mockRecordUnipileAccountHealth).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('does not treat a bare 403 (permission/plan restriction) as a proven disconnect', async () => {
