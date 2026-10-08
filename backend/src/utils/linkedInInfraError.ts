@@ -12,6 +12,9 @@ export const LINKEDIN_UNAVAILABLE_MESSAGE =
 
 const TRANSPORT_CODE = /^(ECONNRESET|ETIMEDOUT|ENOTFOUND|ECONNREFUSED|EAI_AGAIN|EPIPE|EHOSTUNREACH|ENETUNREACH)$/;
 
+// 502/503/504 from nginx, plus Cloudflare-style 520-524 (unknown error, down, timed out, no TCP, no TLS).
+const GATEWAY_STATUSES = [502, 503, 504, 520, 521, 522, 523, 524];
+
 export function isLinkedInInfraError(error: any): boolean {
   const msg = String(error?.message ?? '');
   if (/Failed to fetch Unipile credentials/i.test(msg)) return true;
@@ -25,8 +28,8 @@ export function isLinkedInInfraError(error: any): boolean {
   }
   const classification = error?.structuredError?.classification;
   if (classification === 'TIMEOUT_ERROR') return true;
-  // Only gateway-style 5xx mean "Unipile is unreachable". A plain 500 can be request-specific
+  // Only gateway-style 5xx (see GATEWAY_STATUSES) mean "Unipile is unreachable". A plain 500 can be request-specific
   // (retrying will never help), so it keeps its normal error handling.
-  if (classification === 'SERVER_ERROR') return [502, 503, 504].includes(Number(error?.structuredError?.status));
+  if (classification === 'SERVER_ERROR') return GATEWAY_STATUSES.includes(Number(error?.structuredError?.status));
   return error?.isTimeout === true;
 }

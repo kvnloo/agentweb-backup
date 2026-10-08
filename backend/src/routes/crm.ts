@@ -5074,18 +5074,30 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
       const { emailEventsDb } = await import('../services/emailEventsDb');
       const emailDomain = `linkedin-${listId}`;
       const leadLinkedInKey = leadLinkedIn.toLowerCase();
-      await emailEventsDb.addLinkedInMessageEvent({
+      // eventId and timestamp are fixed BEFORE the retries: the write is a keyed put, so a retry overwrites the
+      // same item instead of creating a second engagement.
+      const engagementEvent = {
         eventId: `linkedin_sent_${Date.now()}_${leadId}`,
         emailDomain,
         leadEmail: leadLinkedInKey,
-        eventType: 'linkedin.message.sent',
+        eventType: 'linkedin.message.sent' as const,
         text: message.trim(),
         timestamp: new Date().toISOString(),
         senderId: accountId,
         messageProviderId: '',
-      });
+      };
+      const RETRY_DELAYS_MS = [150, 400];
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await emailEventsDb.addLinkedInMessageEvent(engagementEvent);
+          break;
+        } catch (writeErr) {
+          if (attempt >= RETRY_DELAYS_MS.length) throw writeErr;
+          await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[attempt]));
+        }
+      }
     } catch (recordErr) {
-      console.error('LinkedIn message was sent but its engagement could not be recorded (non-fatal):', recordErr);
+      console.error('LinkedIn message was sent but its engagement could not be recorded after retries (non-fatal):', recordErr);
       return res.json({ success: true, engagementRecorded: false });
     }
 

@@ -3165,8 +3165,18 @@ export async function importLeadsFromSearch(
       // handler in emma/impl/linkedin.ts. Uses the shared isProvenDisconnectError
       // predicate (not a hand-rolled AUTH_ERROR check) specifically because it
       // excludes a bare 403 — a permission/plan restriction, not a dead session.
-      if (isProvenDisconnectError(e)) {
+      let provenDead = isProvenDisconnectError(e);
+      if (provenDead) {
         linkedInOutreachService.clearStatusCache(accountId);
+        // Unipile's explicit `errors/disconnected_account` is conclusive. A bare 401 is not (it can be a one-off
+        // auth blip), and recording a disconnect pauses scheduled runs and emails the owner, so take a fresh
+        // second opinion first; the sync cron still catches a genuinely dead session on its next pass.
+        const explicitDisconnect = (e?.structuredError?.code || e?.body?.code || e?.code) === 'errors/disconnected_account';
+        if (!explicitDisconnect) {
+          provenDead = (await linkedInOutreachService.probeAccountSession(accountId)) === 'disconnected';
+        }
+      }
+      if (provenDead) {
         const { recordUnipileAccountHealth } = await import('../../services/linkedInConnectionHealth');
         // ownerUserId must be omitted for the site-wide pool: recordUnipileAccountHealth
         // resolves an attributed owner only via getAccountsByUserId(ownerUserId) /
