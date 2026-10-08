@@ -759,6 +759,41 @@ describe('idempotency', () => {
     await run({ messageIndex: 8, idempotencyKey: 'k2' }, {}, makeDeps({ ...base, appendMessages: async () => { throw new Error('x'); } }));
     expect(releaseIdempotency).toHaveBeenCalledWith(OWNER, JSON.stringify(['branch', SRC, 8, '', 'k2']));
   });
+
+  it('post-reveal bookkeeping failure: still 201, logged with the session id, claim NOT released, same-key retry replays (200)', async () => {
+    seedSource();
+    const logs: Array<[string, any]> = [];
+    const releaseIdempotency = jest.fn(async () => undefined);
+    const deps = makeDeps({
+      claimIdempotency: async () => ({ claimed: true as const }),
+      recordIdempotencySessionId: async () => { throw new Error('ddb down'); },
+      releaseIdempotency,
+      log: (m: string, d?: any) => { logs.push([m, d]); },
+    });
+    const out = await run({ messageIndex: 8, idempotencyKey: 'kb' }, {}, deps);
+    expect(out.status).toBe(201);
+    const id = (out.body as any).sessionId;
+    expect(releaseIdempotency).not.toHaveBeenCalled();
+    expect(logs.some(([, d]) => d?.sessionId === id)).toBe(true);
+    const before = newSessionIds().length;
+    const retry = await run({ messageIndex: 8, idempotencyKey: 'kb' }, {}, deps);
+    expect(retry.status).toBe(200);
+    expect((retry.body as any).sessionId).toBe(id);
+    expect(newSessionIds()).toHaveLength(before);
+  });
+
+  it('every failure log after creation carries the new session id (generic unexpected-failure line too)', async () => {
+    seedSource();
+    const logs: Array<[string, any]> = [];
+    const out = await run({ messageIndex: 8 }, {}, makeDeps({
+      appendMessages: async () => { throw new Error('x'); },
+      log: (m: string, d?: any) => { logs.push([m, d]); },
+    }));
+    expect(out.status).toBe(500);
+    const id = newSessionIds()[0];
+    const failure = logs.find(([m]) => m === 'ChatBranching: unexpected failure');
+    expect(failure?.[1].sessionId).toBe(id);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1138,6 +1173,34 @@ describe('per-user branching rate cap', () => {
     const deps = makeDeps({ getMaxBranchesPerHour: async () => 1 });
     expect((await run({ messageIndex: 4, idempotencyKey: 'k' }, {}, deps)).status).toBe(201);
     expect((await run({ messageIndex: 4, idempotencyKey: 'k' }, {}, deps)).status).toBe(200);
+  });
+
+  it('expired windows are pruned: idle users do not accumulate in memory', async () => {
+    const { RATE_SWEEP_EVERY, __branchWindowUsersForTests } = await import('../services/agentMode/chatBranching');
+    seedSource();
+    const users = ['pa', 'pb', 'pc'];
+    for (const u of users) seedSource({ userId: u }, sourceRows(), `src-${u}`);
+    const t = { v: NOW_MS };
+    const deps = makeDeps({ getMaxBranchesPerHour: async () => 5, ...at(t) });
+    for (const u of users) {
+      const o = await branchChatSession(deps, { user: { userId: u, isAdmin: false }, viewerIsAdmin: false, sessionId: `src-${u}`, body: { messageIndex: 4 } });
+      expect(o.status).toBe(201);
+    }
+    expect(__branchWindowUsersForTests()).toBe(3);
+    t.v += 3_600_000; // all three windows have fully expired
+    for (let i = 0; i < RATE_SWEEP_EVERY; i++) await run({ messageIndex: 999 }, {}, deps); // refunded, create nothing
+    expect(__branchWindowUsersForTests()).toBe(0);
+  });
+
+  it('a user over the cap whose window empties does not leave an empty entry behind', async () => {
+    seedSource();
+    const t = { v: NOW_MS };
+    const deps = makeDeps({ getMaxBranchesPerHour: async () => 1, ...at(t) });
+    const { __branchWindowUsersForTests } = await import('../services/agentMode/chatBranching');
+    await run({ messageIndex: 4 }, {}, deps);
+    t.v += 3_600_000;
+    await run({ messageIndex: 999 }, {}, deps); // slot taken then refunded
+    expect(__branchWindowUsersForTests()).toBe(0);
   });
 
   it('a failing settings read falls back to the default instead of failing the request', async () => {

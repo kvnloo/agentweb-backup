@@ -58,5 +58,13 @@ assumption.
 prefix appear in the branch's Images/Videos lists. Only `regular` agent-portal chats are branchable (others carry
 session-level state a branch deliberately does not copy).
 
+**Archived sessions and operators.** Admin-only readers (the admin recent-sessions list, the reliability snapshot
+cron) can see archived sessions, including a born-archived branch mid-copy and an archived orphan left by a process
+death. This is pre-existing behaviour of archived sessions, not new to branching. To find an orphan, grep the
+backend log for `ChatBranching: branch session created (hidden until verified)` (it carries `sessionId`,
+`sourceSessionId`, `userId`); every later failure line (`unexpected failure`, `could not be revealed`, `vanished`,
+`idempotency bookkeeping failed`) carries the same `sessionId`. A branch whose reveal succeeded but whose idempotency
+bookkeeping failed still answers 201 and keeps its claim (never released once visible).
+
 **Rollback.** Set `chat_branching_enabled` to anything but `true`; the endpoint answers 404 and the portal hides
 the action. Branches already created are ordinary sessions and need no cleanup.

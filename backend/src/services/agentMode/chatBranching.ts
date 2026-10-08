@@ -333,6 +333,18 @@ export function __resetBranchIdempotencyForTests(): void {
   inflightKeys.clear();
   recentBranches.clear();
   branchWindows.clear();
+  rateCallCount = 0;
+}
+export const __branchWindowUsersForTests = (): number => branchWindows.size;
+
+/** Every this-many cap checks, users whose whole window has expired are dropped from the map. */
+export const RATE_SWEEP_EVERY = 50;
+let rateCallCount = 0;
+
+function sweepExpiredWindows(now: number): void {
+  for (const [userId, list] of branchWindows) {
+    if (list.length === 0 || list.every((t) => now - t >= RATE_WINDOW_MS)) branchWindows.delete(userId);
+  }
 }
 
 interface RateSlot { userId: string; at: number }
@@ -346,11 +358,13 @@ async function takeRateSlot(deps: BranchDeps, userId: string): Promise<RateSlot 
   } catch {
     // a settings outage must not block branching: use the default
   }
-  if (max === 0) return 'unlimited';
   const now = deps.now();
+  if (++rateCallCount % RATE_SWEEP_EVERY === 0) sweepExpiredWindows(now);
+  if (max === 0) return 'unlimited';
   const recent = (branchWindows.get(userId) ?? []).filter((t) => now - t < RATE_WINDOW_MS);
   if (recent.length >= max) {
-    branchWindows.set(userId, recent);
+    if (recent.length === 0) branchWindows.delete(userId);
+    else branchWindows.set(userId, recent);
     return null;
   }
   recent.push(now);
@@ -406,16 +420,20 @@ function summarize(session: ChatSession, extra: Record<string, unknown> = {}): R
 }
 
 // ---------------------------------------------------------------------------
+interface BranchRunContext { createdId?: string }
+
 export async function branchChatSession(deps: BranchDeps, input: BranchInput): Promise<ServiceOutcome> {
+  const ctx: BranchRunContext = {};
   try {
-    return await branchInner(deps, input);
+    return await branchInner(deps, input, ctx);
   } catch (error) {
-    deps.log('ChatBranching: unexpected failure', { errorClass: (error as Error)?.name, message: String((error as Error)?.message ?? '').slice(0, 200) });
+    // Once a session exists every failure line names it, so an operator can find an orphan.
+    deps.log('ChatBranching: unexpected failure', { ...(ctx.createdId ? { sessionId: ctx.createdId } : {}), errorClass: (error as Error)?.name, message: String((error as Error)?.message ?? '').slice(0, 200) });
     return fail(500, 'Failed to branch this chat', 'branch_failed');
   }
 }
 
-async function branchInner(deps: BranchDeps, input: BranchInput): Promise<ServiceOutcome> {
+async function branchInner(deps: BranchDeps, input: BranchInput, ctx: BranchRunContext): Promise<ServiceOutcome> {
   if (!deps.isAcceptingWork()) return { status: 503, body: { message: 'Instance draining — retry on new instance' } };
   if (!(await deps.isFeatureEnabled())) return fail(404, 'Not found', 'chat_branching_disabled');
 
@@ -505,13 +523,22 @@ async function branchInner(deps: BranchDeps, input: BranchInput): Promise<Servic
         runStoreHeld = true;
       }
 
-      const created = await createBranch(deps, input, req, ownedSource);
+      const created = await createBranch(deps, input, req, ownedSource, ctx);
 
       if (created.status === 201 && scope && localKey) {
         const newId = (created.body as { sessionId: string }).sessionId;
-        rememberBranch(localKey, newId, deps.now());
-        if (runStoreHeld && deps.recordIdempotencySessionId) await deps.recordIdempotencySessionId(input.user.userId, scope, newId);
-        runStoreHeld = false; // keep the claim: it now points at the finished branch
+        // The branch is visible now: from here on the claim must never be released (a retry would
+        // make a duplicate) and a bookkeeping failure must not turn this success into a 500.
+        const hadRunStore = runStoreHeld;
+        runStoreHeld = false;
+        try {
+          rememberBranch(localKey, newId, deps.now());
+          if (hadRunStore && deps.recordIdempotencySessionId) await deps.recordIdempotencySessionId(input.user.userId, scope, newId);
+        } catch (error) {
+          deps.log('ChatBranching: branch created but idempotency bookkeeping failed; returning success', {
+            sessionId: newId, errorClass: (error as Error)?.name, message: String((error as Error)?.message ?? '').slice(0, 200),
+          });
+        }
       }
       return created;
     } finally {
@@ -540,6 +567,7 @@ async function createBranch(
   input: BranchInput,
   req: ParsedBranchRequest,
   firstRead: ChatSession,
+  ctx: BranchRunContext,
 ): Promise<ServiceOutcome> {
   // 1. Decide the model for the BRANCH OWNER before anything is written (entitlements, usage policy).
   const resolved = await deps.resolveModel({
@@ -608,6 +636,7 @@ async function createBranch(
       },
     });
     createdId = created.sessionId;
+    ctx.createdId = createdId;
     deps.log('ChatBranching: branch session created (hidden until verified)', {
       sessionId: createdId, sourceSessionId: source.sessionId, userId: source.userId,
     });
