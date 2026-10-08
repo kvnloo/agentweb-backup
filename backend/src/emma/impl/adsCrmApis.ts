@@ -154,6 +154,7 @@
 import { googleAdsService } from '../../services/googleAdsService';
 import {
   NegativeCampaignCriteriaValidationError,
+  validateDeviceBidAdjustments,
   validateNegativeCampaignCriteria,
 } from '../../services/googleAdsCampaignCriteria';
 import { preflightTrackingGate } from '../../services/googleAdsTrackingPreflight';
@@ -600,6 +601,23 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
     if (entity_type === 'BIDDING_STRATEGY' && action === 'LIST') {
       const biddingStrategies = await googleAdsService.listBiddingStrategies(userId, customer_id);
       return { success: true, biddingStrategies };
+    }
+
+    if (entity_type === 'CAMPAIGN_CRITERION' && action === 'SET_DEVICE_BID_ADJUSTMENT') {
+      // ENG-2036: validate fully before credentials/mutation; one atomic mutate.
+      const normalized = validateDeviceBidAdjustments(
+        customer_id,
+        args.campaign_resource_name,
+        args.ad_group_resource_name,
+        args.device_bid_adjustments,
+      );
+      await googleAdsService.setDeviceBidAdjustments(userId, normalized);
+      return {
+        success: true,
+        scope: normalized.scope,
+        adjustments: normalized.adjustments,
+        message: `Set ${normalized.adjustments.length} device bid adjustment(s) at ${normalized.scope.toLowerCase()} level`,
+      };
     }
 
     if (entity_type === 'CAMPAIGN_CRITERION' && action === 'ADD') {

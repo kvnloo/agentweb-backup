@@ -45,6 +45,7 @@ import {
   reserveWriteSlot,
   type DailyVolumeState,
 } from '../linkedInWritePacer';
+import { unipileIdsForAccount } from '../../utils/scheduledRunAccountGate';
 
 export interface ResolvedLinkedInAccount {
   /** The account's actual owner — may differ from the calling user for an org-shared account. */
@@ -70,7 +71,11 @@ export function resolveLinkedInAccountFromList(
   accounts: any[],
   accountId: string,
 ): ResolvedLinkedInAccount | null {
-  const matched = accounts.find((a: any) => a.platform === 'unipile' && a.account_id === accountId);
+  // A stored row is named by EITHER its account_id or Unipile's config.unipile_account_id (they differ on legacy
+  // rows; the sync cron and the scheduled-run gate already treat both as the same account). Matching only
+  // account_id wrongly refused a user's own account. Both ids belong to a row already scoped to the caller's own
+  // or org-shared accounts, so this widens naming, not access.
+  const matched = accounts.find((a: any) => a.platform === 'unipile' && unipileIdsForAccount(a).includes(accountId));
   if (!matched) return null;
   return {
     ownerUserId: (matched as any).userId,

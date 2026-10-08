@@ -23,6 +23,9 @@ jest.mock('../services/whatsappService', () => ({
   recordInboundMessage: jest.fn(),
   recordOptOut: jest.fn(),
   recordOptIn: jest.fn(),
+  sendText: jest.fn(),
+  sendOptOutConfirmation: jest.fn(),
+  OPT_IN_CONFIRMATION: 'opt-in-confirmation-copy',
   redactPhone: jest.requireActual('../services/whatsappService').redactPhone,
 }));
 jest.mock('../services/whatsappVerificationService', () => ({
@@ -32,7 +35,13 @@ jest.mock('../utils/secretsManager', () => ({
   getWhatsAppCredentials: jest.fn(),
 }));
 
-const { recordInboundMessage, recordOptOut, recordOptIn } = require('../services/whatsappService');
+const {
+  recordInboundMessage,
+  recordOptOut,
+  recordOptIn,
+  sendText,
+  sendOptOutConfirmation,
+} = require('../services/whatsappService');
 const { handleVerificationMessage } = require('../services/whatsappVerificationService');
 const { getWhatsAppCredentials } = require('../utils/secretsManager');
 
@@ -221,6 +230,50 @@ describe('POST — inbound messages', () => {
   it('records an opt-in on UNSTOP', async () => {
     await post(inboundPayload('UNSTOP'));
     expect(recordOptIn).toHaveBeenCalledWith('+14155550123', 'unstop_keyword');
+  });
+
+  it('confirms the opt-out, so a STOP is never answered with silence', async () => {
+    await post(inboundPayload('STOP'));
+    expect(sendOptOutConfirmation).toHaveBeenCalledWith('+14155550123');
+  });
+
+  it('records the opt-out BEFORE confirming it', async () => {
+    const order: string[] = [];
+    (recordOptOut as jest.Mock).mockImplementationOnce(async () => {
+      order.push('record');
+    });
+    (sendOptOutConfirmation as jest.Mock).mockImplementationOnce(async () => {
+      order.push('confirm');
+    });
+    await post(inboundPayload('STOP'));
+    // Recording is the compliance-critical half. If the confirmation were sent first and
+    // the process died between the two, the customer would believe they had opted out
+    // while still being subscribed — the one ordering that is actually unsafe.
+    expect(order).toEqual(['record', 'confirm']);
+  });
+
+  it('still records the opt-out when the confirmation fails to send', async () => {
+    (sendOptOutConfirmation as jest.Mock).mockRejectedValueOnce(new Error('meta down'));
+    const res = await post(inboundPayload('STOP'));
+    expect(recordOptOut).toHaveBeenCalledWith('+14155550123');
+    // 200, not 500: a retry would re-record an opt-out that already landed and send a
+    // second confirmation. The opt-out is not lost, so there is nothing to retry.
+    expect(res.status).toBe(200);
+  });
+
+  it('confirms the opt-in on UNSTOP through the ordinary send path', async () => {
+    await post(inboundPayload('UNSTOP'));
+    // Plain sendText, not the opt-out bypass: the number is opted back in by now, so the
+    // normal guards are the right ones to apply.
+    expect(sendText).toHaveBeenCalledWith('+14155550123', 'opt-in-confirmation-copy');
+    expect(sendOptOutConfirmation).not.toHaveBeenCalled();
+  });
+
+  it('still records the opt-in when its confirmation fails to send', async () => {
+    (sendText as jest.Mock).mockRejectedValueOnce(new Error('meta down'));
+    const res = await post(inboundPayload('UNSTOP'));
+    expect(recordOptIn).toHaveBeenCalledWith('+14155550123', 'unstop_keyword');
+    expect(res.status).toBe(200);
   });
 
   it('never puts the raw phone number in a STOP/START log line', async () => {
