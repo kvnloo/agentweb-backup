@@ -1,11 +1,15 @@
 import { detectCrmFreshnessMismatch, runCrmFreshnessShadow } from '../utils/crmFreshnessGuard';
 
 const ok = (name: string, result: any = { success: true }) => ({ id: name, name, arguments: {}, result });
+// The first describe is about the [verified: ...] tag check; account-wide totals are covered separately below.
+const tagOnly = (text: unknown, calls: unknown) =>
+  detectCrmFreshnessMismatch(text, calls).findings.filter((f) => f.kind === 'cited_tool_not_run');
 
 describe('detectCrmFreshnessMismatch (ENG-2263)', () => {
   it('flags a [verified: get_lead_lists] tag when no CRM tool ran this turn', () => {
-    const r = detectCrmFreshnessMismatch('Total leads across all lists: 47 [verified: get_lead_lists]', []);
-    expect(r.findings).toEqual([expect.objectContaining({ kind: 'cited_tool_not_run', cited: ['get_lead_lists'] })]);
+    expect(tagOnly('Total leads across all lists: 47 [verified: get_lead_lists]', [])).toEqual([
+      expect.objectContaining({ kind: 'cited_tool_not_run', cited: ['get_lead_lists'] }),
+    ]);
   });
 
   it('flags it when a DIFFERENT CRM tool ran (the one cited did not)', () => {
@@ -18,14 +22,14 @@ describe('detectCrmFreshnessMismatch (ENG-2263)', () => {
   });
 
   it('does not flag a tag whose cited tool succeeded this turn', () => {
-    const r = detectCrmFreshnessMismatch('17 lists [verified: get_lead_lists]', [ok('get_lead_lists')]);
+    const r = detectCrmFreshnessMismatch('17 lists [verified: get_lead_lists]', [ok('get_lead_lists', { success: true, lists: [{ leadCount: 5 }, { leadCount: 12 }], totalLists: 17 })]);
     expect(r.findings).toEqual([]);
   });
 
   it('sees through HTML wrappers and backticks around the tag', () => {
     const html = '<p>47 leads <span class="c">[verified: <code>get_lead_lists</code>]</span></p>';
-    expect(detectCrmFreshnessMismatch(html, []).findings).toHaveLength(1);
-    expect(detectCrmFreshnessMismatch('47 leads `[verified: get_lead_lists]`', []).findings).toHaveLength(1);
+    expect(tagOnly(html, [])).toHaveLength(1);
+    expect(tagOnly('47 leads `[verified: get_lead_lists]`', [])).toHaveLength(1);
   });
 
   it.each([
@@ -34,7 +38,7 @@ describe('detectCrmFreshnessMismatch (ENG-2263)', () => {
     ['a suppressed same-turn duplicate', { id: 'a', name: 'get_lead_lists', arguments: {}, result: {}, duplicateOf: 'b' }],
     ['a deferred call', ok('get_lead_lists', { deferred: true })],
   ])('treats %s as NOT run', (_label, call) => {
-    expect(detectCrmFreshnessMismatch('17 lists [verified: get_lead_lists]', [call]).findings).toHaveLength(1);
+    expect(tagOnly('17 lists [verified: get_lead_lists]', [call])).toHaveLength(1);
   });
 
   it('leaves an already-honest tag alone', () => {
@@ -43,13 +47,13 @@ describe('detectCrmFreshnessMismatch (ENG-2263)', () => {
       '47 leads [verified: previous turn]',
       '47 leads [verified: get_lead_lists, possibly out of date]',
     ]) {
-      expect(detectCrmFreshnessMismatch(text, []).findings).toEqual([]);
+      expect(tagOnly(text, [])).toEqual([]);
     }
   });
 
   it('does not judge a bare [verified] that names no tool (it caught nothing extra in the replay and misfired on commentary)', () => {
-    expect(detectCrmFreshnessMismatch('You have 18 lead lists [verified] and 47 leads.', []).findings).toEqual([]);
-    expect(detectCrmFreshnessMismatch('The pixel fires on page load [verified]', []).findings).toEqual([]);
+    expect(tagOnly('You have 18 lead lists [verified] and 47 leads.', [])).toEqual([]);
+    expect(tagOnly('The pixel fires on page load [verified]', [])).toEqual([]);
   });
 
   // Captured from the ENG-2263 preview run: gemini-3.8-flash declined to use the tag and said so.
@@ -61,21 +65,21 @@ describe('detectCrmFreshnessMismatch (ENG-2263)', () => {
       'The [verified: get_lead_lists] label is only for numbers re-queried this turn, so I left it off.',
       'Without using [verified: get_lead_lists] here, the total is 47 as of earlier in the conversation.',
     ];
-    for (const text of commentary) expect(detectCrmFreshnessMismatch(text, []).findings).toEqual([]);
+    for (const text of commentary) expect(tagOnly(text, [])).toEqual([]);
   });
 
   it('recognises a mention by the word AFTER the tag even when nothing introduces it', () => {
-    expect(detectCrmFreshnessMismatch('Skipping the usual [verified: get_lead_lists] tag, since nothing ran this turn.', []).findings).toEqual([]);
-    expect(detectCrmFreshnessMismatch('Total is 47 [verified: get_lead_lists] label omitted on purpose.', []).findings).toEqual([]);
+    expect(tagOnly('Skipping the usual [verified: get_lead_lists] tag, since nothing ran this turn.', [])).toEqual([]);
+    expect(tagOnly('Total is 47 [verified: get_lead_lists] label omitted on purpose.', [])).toEqual([]);
   });
 
   it('still flags a real claim even when the sentence mentions a tag elsewhere', () => {
     const text = "I can't re-check right now, but you have 47 leads in total [verified: get_lead_lists].";
-    expect(detectCrmFreshnessMismatch(text, []).findings).toHaveLength(1);
+    expect(tagOnly(text, [])).toHaveLength(1);
   });
 
   it('ignores tags citing non-CRM tools', () => {
-    expect(detectCrmFreshnessMismatch('Spend is $40 [verified: get_meta_ads_metrics]', []).findings).toEqual([]);
+    expect(tagOnly('Spend is $40 [verified: get_meta_ads_metrics]', [])).toEqual([]);
   });
 
   it('does not treat a longer tool name as a CRM tool (get_leads vs get_leads_needing_followup is distinct)', () => {
@@ -84,12 +88,12 @@ describe('detectCrmFreshnessMismatch (ENG-2263)', () => {
   });
 
   it.each([undefined, null, 42, '', {}, []])('returns nothing for non-text input %p', (input) => {
-    expect(detectCrmFreshnessMismatch(input, [ok('get_leads')]).findings).toEqual([]);
+    expect(tagOnly(input, [ok('get_leads')])).toEqual([]);
   });
 
   it('tolerates malformed tool-call ledgers', () => {
     expect(() => detectCrmFreshnessMismatch('x [verified: get_leads]', [null, 7, { name: 5 }, undefined] as any)).not.toThrow();
-    expect(detectCrmFreshnessMismatch('x [verified: get_leads]', 'nope' as any).findings).toHaveLength(1);
+    expect(tagOnly('x [verified: get_leads]', 'nope' as any)).toHaveLength(1);
   });
 
   // Real outputs captured in the ENG-2263 replay (cheap model, no CRM tool called).
@@ -99,7 +103,7 @@ describe('detectCrmFreshnessMismatch (ENG-2263)', () => {
       "**Lead overview** [verified: get_lead_lists]:\n- Total lead lists: 18\n- Total leads across all lists: 47",
       'In total, you have 18 lists and 47 leads across your entire CRM [verified: get_leads, list_id: list_1]',
     ];
-    for (const text of real) expect(detectCrmFreshnessMismatch(text, []).findings.length).toBeGreaterThan(0);
+    for (const text of real) expect(tagOnly(text, []).length).toBeGreaterThan(0);
   });
 
   it('stays quiet on the real good shapes (fresh re-query, truthful tag)', () => {
@@ -108,7 +112,93 @@ describe('detectCrmFreshnessMismatch (ENG-2263)', () => {
       '<p><strong>5</strong> <span>[verified: <code>get_lead_lists</code> + <code>search_leads</code> across all 17 lists]</span></p>',
       'Exact total: 5 leads [verified: search_leads, all 17 lists covered]',
     ];
-    for (const text of good) expect(detectCrmFreshnessMismatch(text, calls).findings).toEqual([]);
+    for (const text of good) expect(tagOnly(text, calls)).toEqual([]);
+  });
+});
+
+// Real get_lead_lists shape (emma/impl/leads.ts getLeadLists): per-list leadCount + totalLists, NO total-leads field,
+// so a correct "N leads in total" is a sum the model computed.
+const listsResult = (counts: number[]) => ({
+  success: true,
+  message: `Found ${counts.length} lead list(s)`,
+  lists: counts.map((leadCount, i) => ({ listId: `list_${i}`, name: `L${i}`, leadCount })),
+  totalLists: counts.length,
+});
+
+describe('detectCrmFreshnessMismatch - untagged account-wide totals (ENG-2263)', () => {
+  const kinds = (text: string, calls: any[] = []) =>
+    detectCrmFreshnessMismatch(text, calls).findings.filter((f) => f.kind === 'inventory_total_not_in_tool_results');
+
+  it('flags a stale total restated with no CRM tool this turn, even with no tag at all', () => {
+    const f = kinds('You have 18 lead lists containing a total of 47 leads in total.');
+    expect(f.map((x) => x.claimed).sort()).toEqual([18, 47]);
+  });
+
+  it('accepts the sum of leadCount and totalLists from this turn get_lead_lists result', () => {
+    const calls = [ok('get_lead_lists', listsResult([10, 8, 7, 6, 4, 4, 2, 2, 0]))];
+    expect(kinds('You have 9 lead lists and 43 leads in total.', calls)).toEqual([]);
+    expect(kinds('Total lead lists: 9. Total leads across all lists: 43', calls)).toEqual([]);
+  });
+
+  it('flags a stale total even when get_lead_lists ran, if the number is not in its result', () => {
+    const calls = [ok('get_lead_lists', listsResult([10, 8, 7, 6, 4, 4, 2, 2, 0]))];
+    expect(kinds('You have 9 lead lists and 47 leads in total.', calls).map((x) => x.claimed)).toEqual([47]);
+  });
+
+  it('accepts the sum of per-call match counts (3 + 1 + 1 = 5) without get_lead_lists', () => {
+    const calls = [
+      ok('search_leads', { leads: [{}, {}, {}], count: 3 }),
+      ok('search_leads', { leads: [{}], count: 1 }),
+      ok('search_leads', { leads: [{}], count: 1 }),
+    ];
+    expect(kinds('You have 5 leads in total matching Test.', calls)).toEqual([]);
+  });
+
+  it('accepts results delivered as JSON strings', () => {
+    const calls = [{ id: 'a', name: 'get_lead_lists', arguments: {}, result: JSON.stringify(listsResult([3, 2])) }];
+    expect(kinds('2 lead lists, 5 leads in total.', calls)).toEqual([]);
+  });
+
+  it('does not treat a filtered search total as an account-wide total', () => {
+    expect(kinds('You have 5 leads named Test across all lists.')).toEqual([]);
+    expect(kinds('Exact total: 5 leads across all lists [verified: search_leads].', [ok('search_leads', { count: 5 })])).toEqual([]);
+    expect(kinds('I found 5 leads across all lists.')).toEqual([]);
+    expect(kinds('I found 5 leads across all your lists.')).toEqual([]);
+    expect(kinds('Total Test leads: 5', [ok('search_leads', { count: 5 })])).toEqual([]);
+  });
+
+  it('catches the "Total Leads Across All Lists: N" label form seen from gpt-4o-mini', () => {
+    expect(kinds('- **Total Leads Across All Lists:** 47\n- **Total lead lists**: 17').map((x) => x.claimed).sort()).toEqual([17, 47]);
+  });
+
+  it('parses thousands separators and "N leads across K lists"', () => {
+    expect(kinds('You have approximately 12,656 leads across 96 lists.').map((x) => x.claimed ?? 0).sort((a, b) => a - b)).toEqual([96, 12656]);
+  });
+
+  it('skips a claim with honest wording right next to it', () => {
+    expect(kinds('As of my earlier check, you had 47 leads in total across 18 lists.')).toEqual([]);
+    expect(kinds('Both moved since my previous answer: 43 leads in total (was 47), 17 lead lists (was 18).')).toEqual([]);
+  });
+
+  it('does not flag small numbers unrelated to inventory', () => {
+    expect(kinds('Step 2 of 3: I will send 5 emails and update 3 contacts.')).toEqual([]);
+  });
+
+  it('reports each distinct stale number once', () => {
+    expect(kinds('47 leads in total. Again: 47 leads in total.')).toHaveLength(1);
+  });
+
+  it('caps the number of claims it evaluates', () => {
+    const text = Array.from({ length: 500 }, (_, i) => `${1000 + i} leads in total`).join('. ');
+    expect(kinds(text).length).toBeLessThanOrEqual(20);
+  });
+
+  it('stays linear on hostile digit/space input', () => {
+    const t0 = process.hrtime.bigint();
+    detectCrmFreshnessMismatch('1 '.repeat(100_000) + 'total leads ' + '9'.repeat(100_000), []);
+    detectCrmFreshnessMismatch(('9' + ' '.repeat(2000)).repeat(100), []);
+    detectCrmFreshnessMismatch('total lists '.repeat(15_000), []);
+    expect(Number(process.hrtime.bigint() - t0) / 1e6).toBeLessThan(1000);
   });
 });
 
@@ -163,9 +253,34 @@ describe('runCrmFreshnessShadow (ENG-2263)', () => {
     expect(text).toBe('47 leads [verified: get_lead_lists]');
   });
 
+  it('default sink writes ONE line: the marker followed by valid JSON', () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      runCrmFreshnessShadow({ finalText: 'You have 18 lead lists and 47 leads in total [verified: get_lead_lists]', toolCalls: [], sessionId: 's9', model: 'm1' });
+      expect(warn).toHaveBeenCalledTimes(1);
+      const line = String(warn.mock.calls[0][0]);
+      expect(line.includes('\n')).toBe(false);
+      const json = JSON.parse(line.slice(line.indexOf('{')));
+      expect(json).toMatchObject({ sessionId: 's9', model: 'm1' });
+      expect(json.kinds).toEqual(expect.arrayContaining(['cited_tool_not_run', 'inventory_total_not_in_tool_results']));
+      expect(JSON.stringify(json)).not.toContain('lead lists and');
+    } finally { warn.mockRestore(); }
+  });
+
+  it('survives hostile input through the real entry point (not just the detector)', () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const t0 = process.hrtime.bigint();
+      for (const text of ['[verified '.repeat(500_000), '<'.repeat(2_000_000), '1 '.repeat(500_000), 'total lists '.repeat(100_000)]) {
+        expect(() => runCrmFreshnessShadow({ finalText: text, toolCalls: [], sessionId: 'h', model: 'm' })).not.toThrow();
+      }
+      expect(Number(process.hrtime.bigint() - t0) / 1e6).toBeLessThan(1500);
+    } finally { warn.mockRestore(); }
+  });
+
   it('is silent when there is nothing to report', () => {
     const log = jest.fn();
-    runCrmFreshnessShadow({ finalText: '17 lists [verified: get_lead_lists]', toolCalls: [ok('get_lead_lists')], log });
+    runCrmFreshnessShadow({ finalText: '17 lists [verified: get_lead_lists]', toolCalls: [ok('get_lead_lists', { success: true, lists: [{ leadCount: 5 }], totalLists: 17 })], log });
     runCrmFreshnessShadow({ finalText: 'No tags here.', toolCalls: [], log });
     expect(log).not.toHaveBeenCalled();
   });
