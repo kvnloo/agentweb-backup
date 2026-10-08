@@ -8983,7 +8983,10 @@ const AgentModeSettings = () => {
     }
   };
 
-  const VIDEO_API_MODELS = ['veo-3.1-generate-preview', 'veo-3-generate-preview'];
+  const VIDEO_API_MODELS = ['gemini-omni-1.1-flash', 'seedance-2.0'];
+  // Retired Veo ids (Google shutdown 2026-10-22) may still be stored in the setting;
+  // the backend resolves them to gemini-omni-1.1-flash, so show them that way.
+  const LEGACY_VIDEO_API_MODELS = ['veo-3.1-generate-preview', 'veo-3.1-fast-generate-preview', 'veo-3-generate-preview', 'veo-3.0-generate-preview'];
 
   const loadVideoApiDefaultModel = async () => {
     try {
@@ -8991,7 +8994,8 @@ const AgentModeSettings = () => {
         headers: { Authorization: `Bearer ${token}` }
       });
       if (response.data && response.data.settingValue) {
-        const configuredModel = response.data.settingValue.trim();
+        const storedModel = response.data.settingValue.trim();
+        const configuredModel = LEGACY_VIDEO_API_MODELS.includes(storedModel) ? 'gemini-omni-1.1-flash' : storedModel;
         if (configuredModel && VIDEO_API_MODELS.includes(configuredModel)) {
           setVideoApiDefaultModel(configuredModel);
           return;
@@ -9014,7 +9018,7 @@ const AgentModeSettings = () => {
       if (videoApiDefaultModel) {
         await axios.put(buildApiUrl('/api/settings/agent_mode_video_api_default_model'), {
           settingValue: videoApiDefaultModel,
-          description: 'Default video API model for generate_video tool (e.g. veo-3.1-generate-preview)'
+          description: 'Default video API model for generate_video tool (e.g. seedance-2.0 or gemini-omni-1.1-flash)'
         }, {
           headers: { Authorization: `Bearer ${token}` }
         });
@@ -9978,7 +9982,7 @@ const AgentModeSettings = () => {
               onChange={(e) => setVideoApiDefaultModel(e.target.value as string)}
             >
               <MenuItem value="">
-                <em>Use hardcoded default (veo-3.1-generate-preview)</em>
+                <em>Use hardcoded default (seedance-2.0, falls back to gemini-omni-1.1-flash)</em>
               </MenuItem>
               {VIDEO_API_MODELS.map((model) => (
                 <MenuItem key={model} value={model}>
