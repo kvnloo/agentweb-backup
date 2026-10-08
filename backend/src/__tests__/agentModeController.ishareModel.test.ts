@@ -180,6 +180,29 @@ describe('AgentModeController - ishare Model Selection', () => {
       expect(JSON.stringify(body)).not.toContain('branchOrigin');
     });
 
+    it('ENG-112: the conversable (plan/ishare) session endpoint never serialises the branch provenance either', async () => {
+      const origin = { sourceSessionId: 'src-secret-id', sourceTitle: 'Source title', sourceMessageIndex: 2, branchedAt: 'x' };
+      mockAgentModeService.getDefaultModel.mockResolvedValue('gpt-5-chat-2' as any);
+      const mockReq = {
+        params: { sessionId: mockSessionId },
+        conversableSession: {
+          ...mockSessionWithModel,
+          messages: [
+            { role: 'system', content: 'SYS', metadata: { timestamp: 't', branchOrigin: origin } },
+            { role: 'user', content: 'hi' },
+          ],
+        },
+      } as unknown as Request;
+      const mockRes = { status: jest.fn().mockReturnThis(), json: jest.fn() } as unknown as Response;
+
+      await agentModeController.getConversableSession(mockReq, mockRes);
+
+      const body = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(body.messages.length).toBeGreaterThan(0);
+      expect(JSON.stringify(body)).not.toContain('src-secret-id');
+      expect(JSON.stringify(body)).not.toContain('branchOrigin');
+    });
+
     it('should return session with default model when session does not have model set', async () => {
       mockChatbotDb.getChatSession.mockResolvedValue(mockSessionWithoutModel);
 

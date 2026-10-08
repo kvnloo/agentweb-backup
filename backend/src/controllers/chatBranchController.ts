@@ -120,7 +120,6 @@ function branchDeps(): BranchDeps {
     setModel: (sessionId, model, policy) => chatbotDb.updateSessionLlmModel(sessionId, model, policy),
     setTitle: (sessionId, title) => chatbotDb.updateSessionTitle(sessionId, title),
     appendMessages: (sessionId, messages) => chatbotDb.addMessagesToSession(sessionId, messages),
-    archiveSession: (sessionId) => chatbotDb.archiveSession(sessionId),
     unarchiveSession: (sessionId) => chatbotDb.unarchiveSession(sessionId),
     getMaxBranchesPerHour: () => getChatBranchingMaxPerHour(),
     adminToolNames: ADMIN_SKILL_TOOL_NAMES,

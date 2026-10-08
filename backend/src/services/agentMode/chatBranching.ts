@@ -107,14 +107,15 @@ export interface BranchDeps {
     pageIdentifier: string;
     selectedStartupId?: string;
     delegateInfo?: DelegateInfo;
-    initialState: Partial<Pick<ChatSession, 'llmModel' | 'associatedSkills'>>;
+    initialState: Partial<Pick<ChatSession, 'llmModel' | 'associatedSkills' | 'archived'>>;
   }): Promise<ChatSession>;
   setModel(sessionId: string, model: string, policy: PolicyDecision): Promise<unknown>;
   setTitle(sessionId: string, title: string): Promise<unknown>;
   appendMessages(sessionId: string, messages: ChatMessage[]): Promise<unknown>;
-  /** Soft-delete (existing mechanism). A branch is created hidden this way and revealed once verified. */
-  archiveSession(sessionId: string): Promise<void>;
-  /** Reveal a verified branch (`archived = false`, the ordinary live value). */
+  /**
+   * Reveal a verified branch: REMOVES the `archived` attribute (an ordinary session has none). Rejects
+   * with `code: 'ConditionalCheckFailedException'` when the session no longer exists.
+   */
   unarchiveSession(sessionId: string): Promise<void>;
   /** Max branches per user per rolling hour (already cached/defaulted by the caller). 0 = unlimited. */
   getMaxBranchesPerHour(): Promise<number>;
@@ -323,7 +324,7 @@ function branchPageIdentifier(source: ChatSession): string {
 // guarantee holds with AGENT_RUN_STORE off (one instance). Layer 2 (deps.claimIdempotency): the same
 // cross-instance submit lock createSession uses, when the run store is enabled.
 // ---------------------------------------------------------------------------
-const inflightKeys = new Set<string>();
+const inflightKeys = new Map<string, Promise<ServiceOutcome>>();
 const recentBranches = new Map<string, { sessionId: string; at: number }>();
 
 const branchWindows = new Map<string, number[]>();
@@ -332,13 +333,6 @@ export function __resetBranchIdempotencyForTests(): void {
   inflightKeys.clear();
   recentBranches.clear();
   branchWindows.clear();
-}
-
-/** Thrown when a created-but-unverified branch could not be hidden. Carries the id for the response. */
-class BranchOrphanError extends Error {
-  constructor(readonly sessionId: string, cause: unknown) {
-    super(`branch session ${sessionId} could not be hidden: ${String((cause as Error)?.message ?? cause).slice(0, 200)}`);
-  }
 }
 
 interface RateSlot { userId: string; at: number }
@@ -372,6 +366,8 @@ function refundRateSlot(slot: RateSlot): void {
   if (list.length === 0) branchWindows.delete(slot.userId);
 }
 
+const isSessionVanished = (error: unknown): boolean => (error as { code?: string } | null)?.code === 'ConditionalCheckFailedException';
+
 async function retryCleanup(deps: BranchDeps, op: () => Promise<void>): Promise<unknown | undefined> {
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   let last: unknown;
@@ -381,6 +377,7 @@ async function retryCleanup(deps: BranchDeps, op: () => Promise<void>): Promise<
       return undefined;
     } catch (error) {
       last = error ?? new Error('unknown');
+      if (isSessionVanished(error)) break; // retrying cannot bring a deleted row back
       if (attempt < CLEANUP_ATTEMPTS) await sleep(100 * attempt);
     }
   }
@@ -414,9 +411,6 @@ export async function branchChatSession(deps: BranchDeps, input: BranchInput): P
     return await branchInner(deps, input);
   } catch (error) {
     deps.log('ChatBranching: unexpected failure', { errorClass: (error as Error)?.name, message: String((error as Error)?.message ?? '').slice(0, 200) });
-    if (error instanceof BranchOrphanError) {
-      return fail(500, 'Failed to branch this chat', 'branch_failed', { cleanupFailed: true, orphanSessionId: error.sessionId });
-    }
     return fail(500, 'Failed to branch this chat', 'branch_failed');
   }
 }
@@ -439,17 +433,19 @@ async function branchInner(deps: BranchDeps, input: BranchInput): Promise<Servic
 
   // The scope names everything that shapes the result, so one key can never be replayed onto a
   // branch from a different message or model.
+  // JSON-encoded so no value (a model id or key containing the old `|` delimiter) can masquerade as another.
   const scope = req.idempotencyKey
-    ? `branch|${input.sessionId}|${req.messageIndex}|${req.llmModel ?? ''}|${req.idempotencyKey}`
+    ? JSON.stringify(['branch', input.sessionId, req.messageIndex, req.llmModel ?? '', req.idempotencyKey])
     : undefined;
-  const localKey = scope ? `${input.user.userId}|${scope}` : undefined;
+  const localKey = scope ? JSON.stringify([input.user.userId, scope]) : undefined;
   let runStoreHeld = false;
 
   const replay = async (sessionId: string): Promise<ServiceOutcome | null> => {
     const existing = await deps.getSession(sessionId, { consistentRead: true });
+    const origin = existing ? readBranchOrigin(existing.messages) : null;
     if (
       existing && existing.userId === source.userId && existing.archived !== true
-      && readBranchOrigin(existing.messages)?.sourceSessionId === input.sessionId
+      && origin?.sourceSessionId === input.sessionId && origin.sourceMessageIndex === req.messageIndex
     ) {
       return { status: 200, body: summarize(existing, { idempotentReplay: true }) };
     }
@@ -458,37 +454,67 @@ async function branchInner(deps: BranchDeps, input: BranchInput): Promise<Servic
   const inFlight = () => fail(409, 'This request was already submitted and is still being processed. Please retry in a moment.', 'DUPLICATE_SUBMIT');
 
   if (localKey) {
-    const done = recentBranches.get(localKey);
-    if (done && deps.now() - done.at <= RECENT_BRANCH_TTL_MS) {
-      const again = await replay(done.sessionId);
-      if (again) return again;
+    // A second request with the same key does not fail: it WAITS for the first and answers with the
+    // same branch as a replay. (Nothing awaits between the last check below and inflightKeys.set, so
+    // exactly one caller owns the key.)
+    for (;;) {
+      const pending = inflightKeys.get(localKey);
+      if (pending) {
+        const first = await pending;
+        if (first.status === 201) {
+          const again = await replay((first.body as { sessionId: string }).sessionId);
+          if (again) return again;
+        }
+        continue; // the first attempt failed (its key is released) or did not match: take a turn of our own
+      }
+      const done = recentBranches.get(localKey);
+      if (done && deps.now() - done.at <= RECENT_BRANCH_TTL_MS) {
+        const again = await replay(done.sessionId);
+        if (again) return again;
+        if (inflightKeys.has(localKey)) continue; // someone else took the key while we were reading
+        recentBranches.delete(localKey);
+      }
+      break;
     }
-    if (inflightKeys.has(localKey)) return inFlight();
-    inflightKeys.add(localKey);
   }
 
+  let settle: ((outcome: ServiceOutcome) => void) | undefined;
+  if (localKey) inflightKeys.set(localKey, new Promise<ServiceOutcome>((resolve) => { settle = resolve; }));
+  let outcome: ServiceOutcome = fail(500, 'Failed to branch this chat', 'branch_failed'); // what waiters see if we throw
+
   try {
-    if (scope && deps.claimIdempotency) {
-      const claim = await deps.claimIdempotency(input.user.userId, scope);
-      if (!claim.claimed) {
-        const again = claim.sessionId ? await replay(claim.sessionId) : null;
-        return again ?? inFlight();
-      }
-      runStoreHeld = true;
-    }
-
-    const outcome = await createBranch(deps, input, req, source);
-
-    if (outcome.status === 201 && scope && localKey) {
-      const newId = (outcome.body as { sessionId: string }).sessionId;
-      rememberBranch(localKey, newId, deps.now());
-      if (runStoreHeld && deps.recordIdempotencySessionId) await deps.recordIdempotencySessionId(input.user.userId, scope, newId);
-      runStoreHeld = false; // keep the claim: it now points at the finished branch
-    }
+    outcome = await runOwned();
     return outcome;
   } finally {
-    if (runStoreHeld && scope && deps.releaseIdempotency) await deps.releaseIdempotency(input.user.userId, scope);
-    if (localKey) inflightKeys.delete(localKey);
+    if (localKey) {
+      inflightKeys.delete(localKey); // before settling: a woken waiter must find the key free
+      settle?.(outcome);
+    }
+  }
+
+  async function runOwned(): Promise<ServiceOutcome> {
+    try {
+      if (scope && deps.claimIdempotency) {
+        const claim = await deps.claimIdempotency(input.user.userId, scope);
+        if (!claim.claimed) {
+          const again = claim.sessionId ? await replay(claim.sessionId) : null;
+          return again ?? inFlight();
+        }
+        runStoreHeld = true;
+      }
+
+      const created = await createBranch(deps, input, req, source);
+
+      if (created.status === 201 && scope && localKey) {
+        const newId = (created.body as { sessionId: string }).sessionId;
+        rememberBranch(localKey, newId, deps.now());
+        if (runStoreHeld && deps.recordIdempotencySessionId) await deps.recordIdempotencySessionId(input.user.userId, scope, newId);
+        runStoreHeld = false; // keep the claim: it now points at the finished branch
+      }
+      return created;
+    } finally {
+      if (runStoreHeld && scope && deps.releaseIdempotency) await deps.releaseIdempotency(input.user.userId, scope);
+    }
   }
 }
 
@@ -563,7 +589,10 @@ async function createBranch(
     };
     const rows = buildBranchRows(history, plan.endInclusive, origin, nowIso);
 
-    // 4. A normal new session from an ALLOWLIST. Nothing else on the source is read into it.
+    // 4. A normal new session from an ALLOWLIST. Nothing else on the source is read into it. It is BORN
+    //    archived (hidden): until the copy is verified it must not show in any list, and a process
+    //    death mid-copy leaves a hidden session, never an empty visible one. There is no
+    //    create-then-hide window.
     const created = await deps.createSession({
       userId: source.userId,
       portalType: 'agent',
@@ -572,19 +601,14 @@ async function createBranch(
       delegateInfo: input.delegateInfo,
       initialState: {
         llmModel: resolved.model,
+        archived: true,
         ...(Array.isArray(source.associatedSkills) ? { associatedSkills: [...source.associatedSkills] } : {}),
       },
     });
     createdId = created.sessionId;
-    // Hide it BEFORE anything is copied: until the copy is verified it must not show in any list. A
-    // process death mid-copy then leaves a hidden (archived) session instead of an empty visible one.
-    const hideError = await retryCleanup(deps, () => deps.archiveSession(createdId!));
-    if (hideError !== undefined) {
-      deps.log('ChatBranching: ORPHAN branch session could not be hidden; it is visible and empty', {
-        sessionId: createdId, userId: source.userId, errorClass: (hideError as Error)?.name, message: String((hideError as Error)?.message ?? '').slice(0, 200),
-      });
-      throw new BranchOrphanError(createdId, hideError);
-    }
+    deps.log('ChatBranching: branch session created (hidden until verified)', {
+      sessionId: createdId, sourceSessionId: source.sessionId, userId: source.userId,
+    });
     if (resolved.policy) await deps.setModel(createdId, resolved.model, resolved.policy);
     const title = branchTitle(source);
     await deps.setTitle(createdId, title);
@@ -603,7 +627,12 @@ async function createBranch(
     //    request reports failure; the id is logged so it can be revealed or removed by hand.
     const revealError = await retryCleanup(deps, () => deps.unarchiveSession(createdId!));
     if (revealError !== undefined) {
-      deps.log('ChatBranching: verified branch could not be revealed; it stays hidden', { sessionId: createdId, errorClass: (revealError as Error)?.name });
+      deps.log(
+        isSessionVanished(revealError)
+          ? 'ChatBranching: branch session vanished before it could be revealed'
+          : 'ChatBranching: verified branch could not be revealed; it stays hidden',
+        { sessionId: createdId, errorClass: (revealError as Error)?.name },
+      );
       throw revealError;
     }
     return { status: 201, body: summarize(saved) };

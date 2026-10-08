@@ -96,6 +96,14 @@ export class BranchFakeDynamo {
           const key = this.keyOf(p.TableName, p.Key);
           this.writeLog.push({ op: 'update', table: p.TableName, key });
           const t = this.table(p.TableName);
+          if (p.ConditionExpression !== undefined) {
+            if (p.ConditionExpression !== 'attribute_exists(sessionId)') {
+              throw new Error(`BranchFakeDynamo: unsupported ConditionExpression: ${p.ConditionExpression}`);
+            }
+            if (!t.has(key)) {
+              throw Object.assign(new Error('The conditional request failed'), { code: 'ConditionalCheckFailedException' });
+            }
+          }
           const item = t.get(key) ?? { ...clone(p.Key) };
           this.applyUpdate(item, p);
           t.set(key, item);

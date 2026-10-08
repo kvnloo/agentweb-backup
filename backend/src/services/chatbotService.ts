@@ -742,7 +742,7 @@ export class ChatbotDB {
     emailCampaignTaskId?: string,
     sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email" | "meeting-intake",
     delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean },
-    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages">>
+    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages" | "archived">>
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -2670,9 +2670,11 @@ export class ChatbotDB {
   }
 
   /**
-   * ENG-112: inverse of archiveSession. `archived = false` is the ordinary "live" value (every list
-   * filters `!session.archived`, and a few filters spell it `archived = :false`). Used only by chat
-   * branching, which creates its session hidden and reveals it once the copy is verified.
+   * ENG-112: inverse of archiveSession. REMOVES the `archived` attribute (an ordinary session never has
+   * one: every reader treats absent as live, `!session.archived` and `attribute_not_exists(archived) OR
+   * archived = :false`), so a revealed branch carries no stored shape an ordinary session lacks.
+   * Conditional on the row existing: an update on a deleted id would otherwise upsert a ghost row;
+   * that case rejects with `code: 'ConditionalCheckFailedException'`. Used only by chat branching.
    */
   async unarchiveSession(sessionId: string): Promise<void> {
     const params = {
@@ -2680,9 +2682,9 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET archived = :archived, adminListPartition = :adminListPartition",
+      UpdateExpression: "SET adminListPartition = :adminListPartition REMOVE archived",
+      ConditionExpression: "attribute_exists(sessionId)",
       ExpressionAttributeValues: {
-        ":archived": false,
         ":adminListPartition": "all",
       },
     };

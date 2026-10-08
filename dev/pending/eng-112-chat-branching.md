@@ -20,7 +20,7 @@ assumption.
 - `addMessagesToSession` runs `incrementTokenUsage`; copying `usage` would bill the branch for turns it never ran.
   `usage`, `metadata.feedback`, `clientId` and the stale `messageIndex` are stripped; everything else is copied.
 - `addMessagesToMessagesTable` logs and swallows batch items still unprocessed after 3 retries (silent partial
-  copy). The service re-reads the new session consistently and fails (archiving the half-built branch) unless
+  copy). The service re-reads the new session consistently and fails (the half-built branch stays hidden) unless
   rows are dense `0..n-1`, `messageCount` matches and row 0 carries the provenance.
 - Raw `messageIndex` values are sparse in the client view (tool rows and tool_calls-only assistants are hidden).
   The index is resolved against the raw rows, must be visible to the viewer and must be a non-error assistant
@@ -37,10 +37,15 @@ assumption.
 - Continuation triggers: getSession re-fires a billed `scheduleAutoMediaContinuation` for an owner view whose tail is
   an unresolved media deferral < 1h old (`hasUnresolvedMediaDeferral`). Copied rows therefore lose
   `metadata.mediaBudgetDeferred` and the `deferred` flag of `media_generation_time_budget` entries in `toolCalls`.
-- Hidden until verified: the branch is created, immediately archived (existing `archived` field, excluded by every
-  list), filled, verified, then un-archived (`ChatbotDB.unarchiveSession`, `archived = false`). Archive/un-archive
-  retry 3x; an unhideable orphan is logged as `ORPHAN` with its id and the 500 carries `cleanupFailed` +
-  `orphanSessionId`. A process death mid-copy leaves a hidden session, never an empty visible one.
+- Hidden until verified: the session is BORN archived (`createChatSession` initialState `archived: true`, the
+  existing field, excluded by every list), filled, verified, then revealed by `ChatbotDB.unarchiveSession`, which
+  REMOVES the `archived` attribute (no new stored shape; every reader treats absent as live) and is conditional on
+  the row existing (a vanished id is not upserted; it is logged as vanished, not retried, and answers 500). Reveal
+  retries 3x. The new id is logged at creation, so a death mid-copy leaves a hidden, greppable session, never an
+  empty visible one.
+- Idempotency: scope is `JSON.stringify([...])` (injective). A concurrent request with the same key waits for the
+  first and answers 200 with the same branch (replay); replay also checks source session + message index. A
+  cross-instance in-flight claim (run store) is still 409 DUPLICATE_SUBMIT.
 - Idempotency scope = `branch|source|messageIndex|llmModel|key`. Owner-only (a delegated admin arrives as the
   target). `(branch)` suffix is not stacked. A target with no preceding user row is a 400 `no_user_message`.
 - Per-user cap: AW-Settings `chat_branching_max_per_hour` (cached ~60s, last-known fallback; absent/invalid = 30,
