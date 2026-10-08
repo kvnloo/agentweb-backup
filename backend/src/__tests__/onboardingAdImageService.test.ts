@@ -1688,6 +1688,11 @@ describe("onboardingAdImageService", () => {
       userDb.updateUser.mockResolvedValue({});
     });
 
+    it("clears the previous attempt's error (null REMOVEs it; undefined is skipped by updateUser)", async () => {
+      await claimAdImageRun("u1");
+      expect(userDb.updateUser.mock.calls[0][1].adImageError).toBeNull();
+    });
+
     it("publishes a start patch and returns THAT run's identity", async () => {
       const run = await claimAdImageRun("u1");
 
