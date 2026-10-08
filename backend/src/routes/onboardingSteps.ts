@@ -26,6 +26,7 @@ import express, { Request, Response } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb } from "../services/db";
 import { viewAfterUnclaimedStart } from "../utils/startResponseView";
+import { withClearedError } from "../utils/clearErrorOnClaim";
 import {
   ensurePersonaIds,
   ICPPersona,
@@ -881,16 +882,24 @@ router.post("/icp/regenerate-one", authenticateToken, async (req, res) => {
     // If a full /icp/start run is already in flight, KEEP its icpStartedAt:
     // that run's completion write is conditioned on it (ENG-2308), so stamping
     // a fresh one here would make its whole-set result get dropped.
+    // Read it consistently: the indexed read can still show the pre-claim row
+    // for a moment, which made this miss a run that started seconds ago.
+    let live: any = existing;
+    try {
+      live = (await userDb.getUserByIdConsistent(userId)) ?? existing;
+    } catch {
+      /* keep the indexed read */
+    }
     const inFlightStartedAt =
-      existing?.icpStatus === "running" &&
-      typeof existing?.icpStartedAt === "string" &&
-      Date.now() - Date.parse(existing.icpStartedAt) < ICP_TIMEOUT_MS
-        ? existing.icpStartedAt
+      live?.icpStatus === "running" &&
+      typeof live?.icpStartedAt === "string" &&
+      Date.now() - Date.parse(live.icpStartedAt) < ICP_TIMEOUT_MS
+        ? live.icpStartedAt
         : undefined;
-    await userDb.updateUser(
-      userId,
-      inFlightStartedAt ? { ...icpStartPatch(), icpStartedAt: inFlightStartedAt } : icpStartPatch(),
-    );
+    const startWrite = inFlightStartedAt
+      ? { ...icpStartPatch(), icpStartedAt: inFlightStartedAt }
+      : icpStartPatch();
+    await userDb.updateUser(userId, withClearedError(startWrite, "icpError"));
     void regenerateSingleIcpForUser(userId, idx).catch((err: unknown) => {
       console.error("[icp] regenerate-one failed", { userId, idx, err });
     });
@@ -901,7 +910,7 @@ router.post("/icp/regenerate-one", authenticateToken, async (req, res) => {
     // observed during the 2026-04-27 baseline rerun. With this change,
     // the FE always sees status='running' immediately after the POST
     // and keeps polling until the trigger persists fresh ICPs.
-    return res.json({ status: icpSnapshot(icpStartPatch()) });
+    return res.json({ status: icpSnapshot(startWrite) });
   } catch (err) {
     console.error("[icp] regenerate-one failed", err);
     return res.status(500).json({ message: "Failed to regenerate icp" });

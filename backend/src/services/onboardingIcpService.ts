@@ -1,3 +1,4 @@
+import { withClearedError } from "../utils/clearErrorOnClaim";
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 /**
  * Onboarding Epic Phase 2 — ICP discovery service.
@@ -539,6 +540,7 @@ export const ICP_SINGLE_REGEN_SYSTEM_PROMPT = [
   '  "icp": { "name": "...", "pain": "...", "desire": "...", "objection": "...", "meta_targeting_brief": "..." }',
   "}",
   "Each field is one short sentence. The name is an evocative archetype. No markdown, no commentary.",
+  "ALL FIVE fields are required. Never omit meta_targeting_brief: it is one sentence describing who to target in ad platforms (role, industry, company stage).",
 ].join("\n");
 
 /**
@@ -635,15 +637,21 @@ export async function generateSingleIcpForUser(
   userId?: string,
 ): Promise<ICPPersona> {
   const llm = deps.llm ?? new LLMService(ICP_MODEL, ICP_TEMPERATURE, ICP_MAX_TOKENS);
-  const raw = await llm.generateJsonRobust<{ icp: unknown }>(
-    ICP_SINGLE_REGEN_SYSTEM_PROMPT,
-    buildSingleRegenPrompt(brand, target, others),
-    undefined,
-    { userId, feature: "onboarding" },
-  );
-  const [persona] = sanitizeICPPersonas([raw?.icp]);
-  if (!persona) throw new Error("LLM returned no icp");
-  return persona;
+  // The model sometimes drops a required field (observed ~1 in 3 without the
+  // prompt's explicit reminder: it omits meta_targeting_brief), and the
+  // sanitiser rejects any persona missing one. One retry is cheap next to
+  // failing the user's click.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const raw = await llm.generateJsonRobust<{ icp: unknown }>(
+      ICP_SINGLE_REGEN_SYSTEM_PROMPT,
+      buildSingleRegenPrompt(brand, target, others),
+      undefined,
+      { userId, feature: "onboarding" },
+    );
+    const [persona] = sanitizeICPPersonas([raw?.icp]);
+    if (persona) return persona;
+  }
+  throw new Error("LLM returned no icp");
 }
 
 /**
@@ -879,7 +887,21 @@ export async function triggerIcpDiscoveryForUser(
     const personas = ensurePersonaIds(
       mergePreservingAnchoredPersonas(existing, generated),
     );
-    const patch = icpReadyPatch((current as any) || {}, personas);
+    // A card regeneration that overlapped this run keeps our icpStartedAt but
+    // sets its own status when it finishes (`ready`, or `failed` on an LLM
+    // miss). That is not a newer owner: this run still holds the claim, and the
+    // write below is conditioned on it. Without this the regenerate finishing
+    // first (~6s against ~12-22s here) silently discarded the whole-set result.
+    const currentRec = (current as any) || {};
+    const stillOurClaim =
+      Boolean(deps.expectedStartedAt) &&
+      currentRec.icpStartedAt === deps.expectedStartedAt;
+    const patch = icpReadyPatch(
+      stillOurClaim && currentRec.icpStatus !== "running"
+        ? { ...currentRec, icpStatus: "running" }
+        : currentRec,
+      personas,
+    );
     if (!patch) {
       // User no longer in `running` (UI navigated away or watchdog flipped).
       // Stale completion is not an error — drop silently.
@@ -1075,7 +1097,7 @@ export async function claimIcpRun(
 ): Promise<ICPStatusFields | null> {
   const patch = icpStartPatch();
   try {
-    await userDb.updateUser(userId, patch as any, {
+    await userDb.updateUser(userId, withClearedError(patch, "icpError") as any, {
       condition: icpStartClaimCondition(),
     });
   } catch (err: any) {

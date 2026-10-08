@@ -1,3 +1,4 @@
+import { withClearedError } from "../utils/clearErrorOnClaim";
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 /**
  * Onboarding brand-build service.
@@ -377,7 +378,7 @@ export async function claimBrandBuildRun(
 ): Promise<ReturnType<typeof buildStartPatch> | null> {
   const patch = buildStartPatch();
   try {
-    await userDb.updateUser(userId, patch as any, {
+    await userDb.updateUser(userId, withClearedError(patch, "brandBuildError") as any, {
       condition: brandBuildStartClaimCondition(),
     });
   } catch (err: any) {
