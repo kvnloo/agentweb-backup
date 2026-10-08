@@ -503,6 +503,39 @@ function modelUnavailableBody(err: ModelUnavailableError) {
   return buildModelUnavailableBody(err, displayName);
 }
 
+/**
+ * ENG-903: validate a schedule's model pin (llmModel / llmBackupModel) at the WRITE
+ * site, with the same rules the picker and `resolveEffectiveModelForUser` enforce, so a
+ * bad pin is refused with the portal's existing `model_unavailable` 422 instead of
+ * surviving until it fails the run.
+ *
+ * Returns the trimmed id to store ('' = no pin). Throws ModelUnavailableError when the
+ * id is not a string, not served (registry key or honoured alias), or not selectable by
+ * this user (internalOnly, live-voice, adminOnly for a non-admin). Does not change the
+ * run-time resolver. Partial service doubles (older unit tests) skip the registry checks,
+ * exactly like the resolver above.
+ */
+async function validateScheduleModelPin(userId: string, raw: unknown): Promise<string> {
+  const requested = normalizeRequestedLlmModel(raw);
+  if (!requested) return '';
+  if (typeof raw !== 'string') throw new ModelUnavailableError(requested, 'not_served');
+  if (
+    typeof agentModeService.resolveGenerationModel !== 'function'
+    || typeof agentModeService.isModelSelectableBy !== 'function'
+  ) {
+    return requested;
+  }
+  const resolution = agentModeService.resolveGenerationModel(requested);
+  if (resolution.fellBack) throw new ModelUnavailableError(requested, 'not_served');
+  if (!agentModeService.isModelSelectableBy(resolution.model, false)) {
+    // adminOnly is the only gate an admin can clear; internalOnly/live fail for everyone.
+    const adminCanSelect = agentModeService.isModelSelectableBy(resolution.model, true)
+      && await isUserAdmin(userId);
+    if (!adminCanSelect) throw new ModelUnavailableError(requested, 'not_selectable');
+  }
+  return requested;
+}
+
 async function resolveScheduleBackup(input: {
   userId: string;
   requestedBackupModel?: string | null;
@@ -12680,12 +12713,16 @@ export const agentModeController = {
         }
       }
 
+      // ENG-903: refuse an unservable/unselectable model pin at write time (422), not at run time.
+      const validatedLlmModel = await validateScheduleModelPin(user.userId, llmModel);
+      const validatedBackupModel = await validateScheduleModelPin(user.userId, llmBackupModel);
+
       // Create scheduled chat using the existing scheduleDb
       const scheduleId = require('uuid').v4();
       const now = new Date();
       const scheduleBackup = await resolveScheduleBackup({
         userId: user.userId,
-        requestedBackupModel: llmBackupModel,
+        requestedBackupModel: validatedBackupModel,
       });
 
       // Use provided nextRunTime or calculate default
@@ -12751,7 +12788,7 @@ export const agentModeController = {
         sessionId: sessionId || null, // Store original sessionId for reference (can be null)
         type: 'scheduled_chat', // Distinguish from regular task schedules
         emailCampaignTaskId: emailCampaignTaskId || null,
-        llmModel: llmModel || '', // Empty means "use default at runtime"
+        llmModel: validatedLlmModel, // Empty means "use default at runtime"
         ...scheduleBackup,
         runCount: runCount !== undefined ? runCount : -1, // Default to unlimited runs if not specified
         variables: [] as ScheduledChatVariable[],
@@ -12822,6 +12859,9 @@ export const agentModeController = {
         backupSelectionRequired: scheduleBackup.llmBackupNeedsConfirmation,
       });
     } catch (error) {
+      if (isModelUnavailableError(error)) {
+        return res.status(422).json(modelUnavailableBody(error));
+      }
       if (error instanceof Error && error.name === 'InvalidScheduledBackupModelError') {
         return res.status(400).json({ error: error.message });
       }
@@ -12947,14 +12987,35 @@ export const agentModeController = {
       }
 
       const now = new Date();
+      // ENG-903: validate a model pin only when this request CHANGES it. Re-sending the
+      // stored value (or omitting the field) must never be refused, or an old schedule whose
+      // model was since retired could not have unrelated fields edited.
+      const storedLlmModel = String((existingSchedule as any).llmModel ?? '').trim();
+      const incomingLlmModel = typeof llmModel === 'string' ? llmModel.trim() : llmModel;
+      const llmModelChanging = llmModel !== undefined && llmModel !== null && incomingLlmModel !== '' && incomingLlmModel !== storedLlmModel;
+      const validatedLlmModel = llmModelChanging ? await validateScheduleModelPin(user.userId, llmModel) : undefined;
+
+      const existingBackupFields = {
+        llmBackupModel: (existingSchedule as any).llmBackupModel || '',
+        llmBackupSource: ((existingSchedule as any).llmBackupSource || 'system') as ModelBackupSource,
+        llmBackupNeedsConfirmation: (existingSchedule as any).llmBackupNeedsConfirmation !== false,
+      };
       const requestedBackupWasProvided = llmBackupModel !== undefined;
-      const scheduleBackup = requestedBackupWasProvided
-        ? await resolveScheduleBackup({ userId: user.userId, requestedBackupModel: llmBackupModel })
-        : {
-            llmBackupModel: (existingSchedule as any).llmBackupModel || '',
-            llmBackupSource: ((existingSchedule as any).llmBackupSource || 'system') as ModelBackupSource,
-            llmBackupNeedsConfirmation: (existingSchedule as any).llmBackupNeedsConfirmation !== false,
-          };
+      const incomingBackup = typeof llmBackupModel === 'string' ? llmBackupModel.trim() : llmBackupModel;
+      const backupUnchanged = requestedBackupWasProvided && incomingBackup !== '' && incomingBackup === String(existingBackupFields.llmBackupModel).trim();
+      let scheduleBackup: Awaited<ReturnType<typeof resolveScheduleBackup>> = existingBackupFields;
+      if (requestedBackupWasProvided && !backupUnchanged) {
+        const validatedBackup = await validateScheduleModelPin(user.userId, llmBackupModel);
+        scheduleBackup = await resolveScheduleBackup({ userId: user.userId, requestedBackupModel: validatedBackup });
+      } else if (backupUnchanged) {
+        // Same as before the retirement: keep refreshing source as before when still valid,
+        // but a since-retired stored backup must not block the edit.
+        try {
+          scheduleBackup = await resolveScheduleBackup({ userId: user.userId, requestedBackupModel: incomingBackup as string });
+        } catch (backupError) {
+          if (!(backupError instanceof Error && backupError.name === 'InvalidScheduledBackupModelError')) throw backupError;
+        }
+      }
 
       // Determine nextRunTime: use provided value or keep existing
       let scheduledNextRunTime = existingSchedule.nextRunTime;
@@ -13024,7 +13085,7 @@ export const agentModeController = {
         // question and not a rename's business.
         // Explicit empty -> a REMOVAL below, because inheritance is the ABSENCE of
         // the attribute, not a blank value in it.
-        ...(llmModel !== undefined && llmModel !== '' ? { llmModel } : {}),
+        ...(validatedLlmModel ? { llmModel: validatedLlmModel } : (llmModel !== undefined && llmModel !== '' && !llmModelChanging ? { llmModel } : {})),
         ...scheduleBackup,
         // ENG-844: update the owner's timezone when a valid one is supplied; keep
         // the existing value otherwise (partial-update safe).
@@ -13316,6 +13377,9 @@ export const agentModeController = {
             'This schedule recorded a run while you were saving, so nothing was saved. ' +
             'Try again — its run history has changed.',
         });
+      }
+      if (isModelUnavailableError(error)) {
+        return res.status(422).json(modelUnavailableBody(error));
       }
       if (error instanceof Error && error.name === 'InvalidScheduledBackupModelError') {
         return res.status(400).json({ error: error.message });
@@ -16045,6 +16109,11 @@ export const agentModeController = {
         return res.status(400).json({ error: 'frequencyIntervalDays must be a positive integer for every_n_days frequency' });
       }
 
+      // ENG-903: an explicit per-use override is validated like a direct create. The template's
+      // own stored llmModel is deliberately not re-validated here (see dev note).
+      const validatedOverrideModel = await validateScheduleModelPin(user.userId, overrideModel);
+      const validatedOverrideBackup = await validateScheduleModelPin(user.userId, overrideBackupModel);
+
       const now = new Date();
       // Generated here (rather than at the schedule-object build below) so it can
       // seed the jitter that spreads this schedule's fire time off the exact round
@@ -16085,7 +16154,7 @@ export const agentModeController = {
 
       const scheduleBackup = await resolveScheduleBackup({
         userId: user.userId,
-        requestedBackupModel: overrideBackupModel,
+        requestedBackupModel: validatedOverrideBackup,
       });
       const scheduledChat: any = {
         scheduleId,
@@ -16109,7 +16178,7 @@ export const agentModeController = {
         updatedAt: now.toISOString(),
         sessionId: null,
         type: 'scheduled_chat',
-        llmModel: overrideModel || template.llmModel || '',
+        llmModel: validatedOverrideModel || template.llmModel || '',
         ...scheduleBackup,
         runCount: runCount !== undefined ? runCount : -1,
         variables: templateVars,
@@ -16157,6 +16226,9 @@ export const agentModeController = {
         backupSelectionRequired: scheduleBackup.llmBackupNeedsConfirmation,
       });
     } catch (error) {
+      if (isModelUnavailableError(error)) {
+        return res.status(422).json(modelUnavailableBody(error));
+      }
       if (error instanceof Error && error.name === 'InvalidScheduledBackupModelError') {
         return res.status(400).json({ error: error.message });
       }
