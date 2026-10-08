@@ -14,6 +14,7 @@ import { resolveAnalyticsConfig, resolveConfigTarget } from '../services/analyti
 import { resolveOrgProfileField } from '../services/orgProfileResolver';
 import { EvaluationDenied, isEvaluationUser, requireActiveEvaluation, sandboxInfo as buildSandboxInfo } from '../services/evaluationPolicy';
 import { sanitizeUserForResponse } from '../utils/accountSecretRedaction';
+import { modelCompareEntitlement } from '../services/agentMode/modelCompareEntitlement';
 
 const router = express.Router();
 
@@ -181,6 +182,17 @@ router.get('/me', authenticateToken, async (req, res) => {
         response.allowedSkills = [];
         response.allowedFeatures = [];
       }
+    }
+
+    // Plan add-on hint for the Compare models button. Additive, computed per request, never stored.
+    // The server enforces the same rule on /compare, so a missing hint (error here, older backend) is safe.
+    try {
+      response.modelCompareEntitled = await modelCompareEntitlement.isEntitled({
+        userId,
+        isAdmin: authenticatedReq.user?.isAdmin === true,
+      });
+    } catch (error) {
+      console.error('Error resolving model compare entitlement hint:', error);
     }
 
     response.hasBrandGuidelines = !!(user.brandGuidelines?.brandData?.brandName);

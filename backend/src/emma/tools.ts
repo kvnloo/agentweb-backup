@@ -4448,6 +4448,7 @@ emmaToolRegistry.register({
           items: { type: 'string' },
           description: 'Optional URLs of images/videos to attach. REQUIRED for YouTube — must be a direct video file URL (e.g. .mp4). The video will be downloaded and uploaded to YouTube.'
         },
+        in_reply_to_post_id: { type: 'string', description: 'X (Twitter) only. ID of an existing post to reply to; the content is published as a reply in that conversation. Omit for a new standalone post. Rejected for other platforms. Same approval rules as any post.' },
         save_as_draft: { type: 'boolean', description: 'LinkedIn only. When true, the post is saved as a LinkedIn draft instead of being published, so the user can review it on LinkedIn before it goes live. Rejected for other platforms.' }
       },
       required: ['content']
@@ -4456,7 +4457,9 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     // ENG-827: the context carries `assertPublishStillAuthorized`, which the handler
     // runs immediately before the post becomes real — see postOnConnectedAccount.
-    return await linkedinImpl.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform, context, ...(args.save_as_draft === true ? [{ saveAsDraft: true }] : []));
+    return await linkedinImpl.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform, context, ...(args.save_as_draft === true || args.in_reply_to_post_id
+      ? [{ ...(args.save_as_draft === true ? { saveAsDraft: true } : {}), ...(args.in_reply_to_post_id ? { inReplyToPostId: String(args.in_reply_to_post_id) } : {}) }]
+      : []));
   }
 });
 
@@ -9266,6 +9269,7 @@ ACTION MATRIX:
               ENG-1944: enabling the CAMPAIGN does NOT enable its ad groups, keywords, or ads — those default to PAUSED on creation and stay that way unless explicitly updated. A successful RESUME/UPDATE(ENABLED) response may include pausedChildEntitiesWarning naming ad groups/keywords/ads still PAUSED underneath — if present, the campaign will deliver ZERO traffic despite showing ENABLED. Do not report a launch as live until you've enabled those too (AD_GROUP/KEYWORD/AD UPDATE with status=ENABLED) and re-checked. Never rely on CAMPAIGN status alone to confirm something is live.
               ADD_PROXIMITY (campaign_resource_name, radius, and EITHER address{street_address?, city_name?, postal_code?, province_code?, province_name?, country_code?} OR latitude+longitude (decimal degrees); radius_units defaults MILES) — mile/km-radius targeting centered on a real address (Google geocodes it server-side). This is native API support for "within N miles of our store/showroom" requests — do NOT tell the user proximity/radius targeting requires the UI; it does not. Additive to any existing LOCATION (city) criteria — REMOVE_PROXIMITY the old one first if only the radius should apply.
               REMOVE_PROXIMITY (criterion_resource_name) — removes a campaign-level LOCATION or PROXIMITY criterion. Obtain resource names via a raw GAQL query on campaign_criterion (call_google_ads_reporting_api mode="raw").
+              DISCLOSURE RULE (AGW-155): if any targeting step cannot be completed via this API (ADD_PROXIMITY errors, or the user asks for a targeting type this tool does not support), tell the user explicitly in the same reply what was NOT applied and why, give the exact manual UI steps, and list it as an outstanding manual action in the launch summary. Never silently substitute a UI workaround or report the campaign as fully configured while a targeting step is pending.
               TRANSPARENCY GUARDRAIL: if any Google Ads request cannot be fully satisfied via this API — including cases where you genuinely must fall back to a UI-only step (e.g. linking Google Business Profile) — you MUST say so explicitly to the user at deployment: name the gap, what you did instead, and the exact manual step left for them. Never silently substitute a workaround or imply a request is fully done when a manual step remains outstanding.
   CAMPAIGN_CRITERION → ADD (campaign_resource_name, placement_urls? and/or mobile_app_category_resource_names?)
               Adds campaign-scoped negative placement and mobile-app-category criteria atomically. placement_urls accepts domains or HTTP(S) URLs. mobile_app_category_resource_names must use canonical mobileAppCategoryConstants/<id> resource names. This is not a keyword/ad-group fallback.
@@ -9411,7 +9415,9 @@ UNVERIFIED or failed reads forbid readiness/delivery claims. Today's telemetry c
 
 GAQL EXAMPLES:
   Campaign: SELECT campaign.id, campaign.name, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions FROM campaign WHERE segments.date DURING LAST_30_DAYS
-  Keywords: SELECT ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, metrics.clicks, metrics.cost_micros, metrics.average_cpc FROM keyword_view WHERE segments.date DURING LAST_30_DAYS`,
+  Keywords: SELECT ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, metrics.clicks, metrics.cost_micros, metrics.average_cpc FROM keyword_view WHERE segments.date DURING LAST_30_DAYS
+  Quality Score: SELECT ad_group_criterion.keyword.text, ad_group_criterion.quality_info.quality_score, ad_group_criterion.quality_info.creative_quality_score, ad_group_criterion.quality_info.post_click_quality_score, ad_group_criterion.quality_info.search_predicted_ctr FROM keyword_view WHERE ad_group_criterion.status = 'ENABLED'
+  (There is no quality_info.ad_relevance field; "ad relevance" is creative_quality_score. quality_info.* + segments.date is accepted FROM keyword_view but rejected FROM ad_group_criterion; for a per-day quality score history use metrics.historical_quality_score for date-segmented quality score.)`,
     inputSchema: {
       type: 'object',
       properties: {
