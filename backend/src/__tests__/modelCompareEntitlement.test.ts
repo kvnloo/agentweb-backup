@@ -91,14 +91,39 @@ describe('settings cache', () => {
     fail = true; advance(61_000);
     expect(await ent.isRequired()).toBe(true);
   });
-  it('a read error on cold start => not required', async () => {
-    const { ent } = make({ setting: async () => { throw new Error('boom'); } });
+  it('a read error on cold start => required (fail closed), never cached as success', async () => {
+    const { ent, getSetting } = make({ setting: async () => { throw new Error('boom'); } });
+    expect(await ent.isRequired()).toBe(true);
+    expect(await ent.isRequired()).toBe(true);
+    expect(getSetting).toHaveBeenCalledTimes(1); // within the short retry window
+  });
+  it('cold-start read error: non-admin without tier access denied, admin allowed', async () => {
+    const { ent, isFeatureEnabledForUser } = make({ setting: async () => { throw new Error('boom'); }, feature: async () => false });
+    expect(await ent.isEntitled({ userId: 'u', isAdmin: false })).toBe(false);
+    expect(await ent.isEntitled({ userId: 'a', isAdmin: true })).toBe(true);
+    expect(isFeatureEnabledForUser).toHaveBeenCalledTimes(1);
+  });
+  it('cold-start read error: a tier with the feature is still entitled', async () => {
+    const { ent } = make({ setting: async () => { throw new Error('boom'); }, feature: async () => true });
+    expect(await ent.isEntitled({ userId: 'u', isAdmin: false })).toBe(true);
+  });
+  it('recovers on a later successful read (absent row => not required)', async () => {
+    let fail = true;
+    const { ent, advance } = make({ setting: async () => { if (fail) throw new Error('x'); return null; } });
+    expect(await ent.isRequired()).toBe(true);
+    fail = false; advance(6_000);
     expect(await ent.isRequired()).toBe(false);
+  });
+  it('a successful absent row is not required and is cached as a success', async () => {
+    const { ent, getSetting } = make({ setting: async () => null });
+    expect(await ent.isRequired()).toBe(false);
+    expect(await ent.isRequired()).toBe(false);
+    expect(getSetting).toHaveBeenCalledTimes(1);
   });
   it('a failed refresh is retried soon, not cached for a full window', async () => {
     let fail = true;
     const { ent, getSetting, advance } = make({ setting: async () => { if (fail) throw new Error('x'); return { settingValue: 'true' }; } });
-    expect(await ent.isRequired()).toBe(false);
+    expect(await ent.isRequired()).toBe(true);
     fail = false; advance(6_000);
     expect(await ent.isRequired()).toBe(true);
     expect(getSetting).toHaveBeenCalledTimes(2);

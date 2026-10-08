@@ -16,8 +16,12 @@ AW-Settings switch is flipped, so deploying this changes nothing.
 - Entitled = requester is admin, OR `isSubscriptionFeatureEnabled(user, 'model_compare') === true`
   (the effective, org-owner-aware resolver). Unreadable tier or a thrown lookup = denied.
 - Denial: HTTP 403 `{ error: 'Compare models is not available on your current plan.', code: 'model_compare_not_entitled' }`.
-- The switch is cached ~60s; a failed read keeps the last-known value; with no known value
-  (cold start) it is treated as not required. A settings outage never flips behaviour.
+- The switch is cached ~60s; a failed read keeps the last-known value. A failed read with no
+  known value (cold start during a settings outage) fails CLOSED: Compare is treated as required
+  (admins and tiers with the feature still pass; an unreadable tier is denied), and the read is
+  retried after ~5s. A successful read of an absent/blank/non-`true` row is "not required", so a
+  healthy deploy changes nothing. `GET /api/auth/me` uses the same function, so during a settings
+  outage `modelCompareEntitled` may briefly be false and the button hidden for non-entitled users.
 - Delegated sessions: `req.user` is the target customer, so the customer's plan applies.
 
 **ROLLOUT STEPS (owner)**

@@ -9,7 +9,10 @@
  * When enforcement is on a caller is entitled when they are an admin, or the effective (org-aware)
  * subscription of that user includes the feature. An unreadable tier denies (fail closed). The settings
  * read is cached for ~60s and a failed refresh keeps the last-known value, so a settings outage can
- * never flip behaviour; with no known value (cold start) it is treated as "not required".
+ * never flip behaviour. A failed read with NO last-known value (cold start during an outage) is treated
+ * as REQUIRED (fail closed): the switch may really be 'true', and admins plus tiers that include the
+ * feature still pass. A failure is never cached as a success; it is retried after ERROR_RETRY_MS. Only a
+ * successful read of an absent/blank/non-'true' row means "not required".
  */
 import type { SubscriptionFeatureId } from '../subscriptionService';
 import { settingsService } from '../settingsService';
@@ -41,19 +44,19 @@ export function createModelCompareEntitlement(deps: ModelCompareEntitlementDeps)
 
   async function isRequired(): Promise<boolean> {
     const now = deps.now();
-    if (now < validUntil) return known === true;
+    if (now < validUntil) return known !== false;
     try {
       const row = await deps.getSetting(MODEL_COMPARE_REQUIRES_ENTITLEMENT_SETTING);
       known = String(row?.settingValue ?? '').trim().toLowerCase() === 'true';
       validUntil = now + CACHE_TTL_MS;
     } catch (error) {
-      deps.log('ModelCompare: failed to read entitlement switch; keeping last-known value', {
+      deps.log('ModelCompare: failed to read entitlement switch; keeping last-known value, or failing closed (required) if none', {
         errorClass: (error as Error)?.name ?? 'Error',
         known,
       });
       validUntil = now + ERROR_RETRY_MS;
     }
-    return known === true;
+    return known !== false; // null (never read successfully) => fail closed
   }
 
   async function isEntitled(user: { userId: string; isAdmin?: boolean }): Promise<boolean> {
