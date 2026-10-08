@@ -40,6 +40,7 @@ import {
 } from "./onboardingIcpService";
 import type { ICPPersona } from "./icpStatusService";
 import type { CompetitorResult } from "./competitorStatusService";
+import { cronJobRegistry } from "../utils/cronJobRegistry";
 
 /** Bedrock model alias. Same family as Steps 2 + 3 for tone consistency. */
 const CREATIVE_DIR_MODEL = "anthropic.claude-sonnet-4-6";
@@ -417,9 +418,15 @@ export async function startCreativeDirForUser(
   }
   const patch = await claimCreativeDirRun(userId);
   if (!patch) return null;
-  void triggerCreativeDirForUser(userId, {
-    ...deps,
-    expectedStartedAt: patch.creativeDirStartedAt,
-  });
+  // Tracked so a deploy's graceful shutdown waits for this run (cronJobRegistry
+  // is drained before the listener closes) instead of killing it mid-flight and
+  // leaving a dead `running` claim that nothing completes until it times out.
+  void cronJobRegistry.track(
+    "onboardingCreativeDir",
+    triggerCreativeDirForUser(userId, {
+      ...deps,
+      expectedStartedAt: patch.creativeDirStartedAt,
+    }),
+  );
   return patch;
 }

@@ -49,6 +49,7 @@ import {
   AdVariantRatingFields,
   recentRejectedRatings,
 } from "./adVariantRatingService";
+import { cronJobRegistry } from "../utils/cronJobRegistry";
 
 /** Bedrock model alias. Same family as Steps 2 / 3 / 4. */
 const AD_COPY_MODEL = "anthropic.claude-sonnet-4-6";
@@ -587,9 +588,15 @@ export async function startAdCopyForUser(
   }
   const patch = await claimAdCopyRun(userId);
   if (!patch) return null;
-  void triggerAdCopyForUser(userId, {
-    ...deps,
-    expectedStartedAt: patch.adCopyStartedAt,
-  });
+  // Tracked so a deploy's graceful shutdown waits for this run (cronJobRegistry
+  // is drained before the listener closes) instead of killing it mid-flight and
+  // leaving a dead `running` claim that nothing completes until it times out.
+  void cronJobRegistry.track(
+    "onboardingAdCopy",
+    triggerAdCopyForUser(userId, {
+      ...deps,
+      expectedStartedAt: patch.adCopyStartedAt,
+    }),
+  );
   return patch;
 }

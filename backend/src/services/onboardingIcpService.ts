@@ -29,6 +29,7 @@ import { getGCSPPrivateKey } from "../utils/secretsManager";
 import { getS3ObjectAsString } from "../utils/s3Utils";
 import { taskDb, userDb } from "./db";
 import { Storage } from "@google-cloud/storage";
+import { cronJobRegistry } from "../utils/cronJobRegistry";
 import {
   icpFailedPatch,
   icpReadyPatch,
@@ -1127,9 +1128,15 @@ export async function startIcpDiscoveryForUser(
   // Errors inside triggerIcpDiscoveryForUser are caught + persisted there.
   // expectedStartedAt: this run's own claim, so a later reclaim's zombie
   // completion can't be confused with a terminal state THIS run published.
-  void triggerIcpDiscoveryForUser(userId, {
-    ...deps,
-    expectedStartedAt: patch.icpStartedAt,
-  });
+  // Tracked so a deploy's graceful shutdown waits for this run (cronJobRegistry
+  // is drained before the listener closes) instead of killing it mid-flight and
+  // leaving a dead `running` claim that nothing completes until it times out.
+  void cronJobRegistry.track(
+    "onboardingIcp",
+    triggerIcpDiscoveryForUser(userId, {
+      ...deps,
+      expectedStartedAt: patch.icpStartedAt,
+    }),
+  );
   return patch;
 }

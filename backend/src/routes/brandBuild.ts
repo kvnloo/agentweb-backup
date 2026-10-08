@@ -31,6 +31,7 @@ import {
   claimBrandBuildRun,
   triggerBrandBuildForUser,
 } from "../services/onboardingBrandBuildService";
+import { cronJobRegistry } from "../utils/cronJobRegistry";
 
 const router = express.Router();
 
@@ -176,11 +177,16 @@ router.post("/brand-build/start", authenticateToken, async (req, res) => {
     // expectedStartedAt: this claim's own startedAt, so a later reclaim's
     // zombie failure write can't stomp a terminal state WE or the
     // reclaiming run have since published (ENG-2308 review follow-up).
-    void triggerBrandBuildForUser(userId, {
-      expectedStartedAt: patch.brandBuildStartedAt,
-    }).catch((e) => {
-      console.error("[brandBuild] background trigger crashed", e);
-    });
+    // Tracked so a deploy's graceful shutdown waits for the build's pre/post
+    // steps too (the Emma turn inside is already tracked on its own).
+    void cronJobRegistry.track(
+      "onboardingBrandBuild",
+      triggerBrandBuildForUser(userId, {
+        expectedStartedAt: patch.brandBuildStartedAt,
+      }).catch((e) => {
+        console.error("[brandBuild] background trigger crashed", e);
+      }),
+    );
     // Return the snapshot built from the patch we just persisted — do NOT
     // read back via getUserById here (ENG-2308 review follow-up, mirrors
     // icp/competitor/creative-dir/ad-copy's own fix for the same issue):

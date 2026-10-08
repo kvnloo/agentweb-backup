@@ -40,6 +40,7 @@ import {
   IcpBrandContext,
 } from "./onboardingIcpService";
 import type { ICPPersona } from "./icpStatusService";
+import { cronJobRegistry } from "../utils/cronJobRegistry";
 
 /** Bedrock model alias. Same family as Step 2 for tone consistency. */
 const COMPETITOR_MODEL = "anthropic.claude-sonnet-4-6";
@@ -690,9 +691,15 @@ export async function startCompetitorStrategyForUser(
   }
   const patch = await claimCompetitorRun(userId);
   if (!patch) return null;
-  void triggerCompetitorStrategyForUser(userId, {
-    ...deps,
-    expectedStartedAt: patch.competitorStartedAt,
-  });
+  // Tracked so a deploy's graceful shutdown waits for this run (cronJobRegistry
+  // is drained before the listener closes) instead of killing it mid-flight and
+  // leaving a dead `running` claim that nothing completes until it times out.
+  void cronJobRegistry.track(
+    "onboardingCompetitor",
+    triggerCompetitorStrategyForUser(userId, {
+      ...deps,
+      expectedStartedAt: patch.competitorStartedAt,
+    }),
+  );
   return patch;
 }

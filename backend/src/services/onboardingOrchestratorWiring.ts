@@ -43,6 +43,7 @@ import {
   DEFAULT_DAG,
 } from "./onboardingPipelineOrchestrator";
 import { userDb } from "./db";
+import { cronJobRegistry } from "../utils/cronJobRegistry";
 import { BRAND_BUILD_TIMEOUT_MS } from "./brandBuildStatusService";
 import { ICP_TIMEOUT_MS } from "./icpStatusService";
 import { COMPETITOR_TIMEOUT_MS } from "./competitorStatusService";
@@ -514,14 +515,16 @@ export async function reconcileForUser(
     return existing;
   }
 
-  const run = (async () => {
+  // Tracked for graceful shutdown (see cronJobRegistry): a deploy waits for the
+  // pipeline walk instead of killing a step mid-flight.
+  const run = cronJobRegistry.track("onboardingReconcile", (async () => {
     let report: ReconcileReport | null;
     do {
       _reconcileRequestedWhileRunning.delete(userId);
       report = await runReconcilePass(userId);
     } while (_reconcileRequestedWhileRunning.has(userId));
     return report;
-  })();
+  })());
 
   _inFlightReconciles.set(userId, run);
   try {
