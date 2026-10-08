@@ -42,7 +42,7 @@ import {
 } from './agentMode/metaImageSwapCheck';
 import { readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
-import { runCrmFreshnessShadow } from '../utils/crmFreshnessGuard';
+import { createCrmEvidenceCollector, runCrmFreshnessShadow } from '../utils/crmFreshnessGuard';
 import {
   evaluateTurnTimeBudget,
   buildTurnTimeBudgetNudge,
@@ -3472,6 +3472,8 @@ export class AgentModeService {
       let content = '';
       const toolCalls: any[] = [];
       _toolCallsForTelemetry = toolCalls;
+      // ENG-2263: numbers the CRM tools actually returned this turn (the ledger above stores minimised results).
+      const crmEvidence = createCrmEvidenceCollector();
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
       // ENG-351: accumulates the web sources this message consults across all its search
@@ -4739,6 +4741,7 @@ export class AgentModeService {
               }, userId),
             recordDuplicateSuppression: (entries) =>
               recordAgentModeDuplicateSuppression(agentRuntimeRunId, sessionId, iteration, entries),
+            observeFullToolResult: (toolName: string, fullResult: any) => crmEvidence.record(toolName, fullResult),
             extractMinimalToolResult: (result: any, toolName: string) => this.extractMinimalToolResult(result, toolName),
             extractToolContent,
             formatToolError: (toolName: string, errorMessage: string) => this.formatToolError(toolName, errorMessage),
@@ -5227,7 +5230,7 @@ export class AgentModeService {
       // a carried-over number dressed as fresh. Measures how often it happens, per model, before
       // anyone decides to enforce. Never edits `content`; kill switch AGENT_CRM_FRESHNESS_GUARD=off.
       if (content && !wasCancelled && !mockMode) {
-        runCrmFreshnessShadow({ finalText: content, toolCalls, sessionId, model: llmModel });
+        runCrmFreshnessShadow({ finalText: content, toolCalls, evidence: crmEvidence.snapshot(), sessionId, model: llmModel });
       }
 
       // ENG-1207 AC3: a run must not finish silently on an unread page.

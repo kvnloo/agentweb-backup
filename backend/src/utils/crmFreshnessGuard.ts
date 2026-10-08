@@ -95,36 +95,87 @@ const MAX_RESULT_NODES = 20_000;
 const MAX_CLAIMS = 20;
 const CLAIM_LABEL_WINDOW = 140;
 
-function collectAllowedNumbers(calls: any[], succeeded: Set<string>): Set<number> {
-  const allowed = new Set<number>();
+/** Numbers a CRM tool result can back: every number in it, array lengths, and the sums a model would compute. */
+function numbersFromResult(result: unknown): { numbers: Set<number>; matchCount?: number } {
+  const numbers = new Set<number>();
   let nodes = 0;
   let leadCountSum = 0;
   let listObjects = 0;
-  let perCallCountSum = 0;
   const walk = (value: unknown, depth: number): void => {
     if (nodes++ > MAX_RESULT_NODES || depth > 8) return;
-    if (typeof value === 'number') { if (Number.isFinite(value)) allowed.add(Math.trunc(value)); return; }
-    if (typeof value === 'string') { if (/^\d{1,12}$/.test(value)) allowed.add(Number(value)); return; }
-    if (Array.isArray(value)) { allowed.add(value.length); for (const v of value) walk(v, depth + 1); return; }
+    if (typeof value === 'number') { if (Number.isFinite(value)) numbers.add(Math.trunc(value)); return; }
+    if (typeof value === 'string') { if (/^\d{1,12}$/.test(value)) numbers.add(Number(value)); return; }
+    if (Array.isArray(value)) { numbers.add(value.length); for (const v of value) walk(v, depth + 1); return; }
     if (value && typeof value === 'object') {
       const o = value as Record<string, unknown>;
       if (typeof o.leadCount === 'number') { leadCountSum += o.leadCount; listObjects++; }
       for (const k of Object.keys(o)) walk(o[k], depth + 1);
     }
   };
+  let parsed: any = result;
+  if (typeof parsed === 'string') { try { parsed = JSON.parse(parsed); } catch { return { numbers }; } }
+  walk(parsed, 0);
+  if (listObjects > 0) { numbers.add(leadCountSum); numbers.add(listObjects); }
+  let matchCount: number | undefined;
+  if (parsed && typeof parsed === 'object') {
+    const c = [parsed.count, parsed.rowCount, parsed.total, parsed.totalCount].find((x) => typeof x === 'number');
+    matchCount = typeof c === 'number' ? c : Array.isArray(parsed.leads) ? parsed.leads.length : undefined;
+  }
+  return { numbers, matchCount };
+}
+
+/**
+ * What this turn's CRM tool calls actually returned. The tool-call LEDGER cannot be used for this: its stored
+ * result is minimised (search/lead tools collapse to `{}`), so a number check against it would flag every
+ * correct answer. toolDispatch sees the FULL result before minimising and hands it here; only numbers are kept.
+ */
+export interface CrmEvidence {
+  numbers: Set<number>;
+  tools: Set<string>;
+}
+
+export interface CrmEvidenceCollector {
+  /** Never throws; ignores non-CRM tools and failed results. */
+  record(toolName: unknown, fullResult: unknown): void;
+  snapshot(): CrmEvidence;
+}
+
+export function createCrmEvidenceCollector(): CrmEvidenceCollector {
+  const numbers = new Set<number>();
+  const tools = new Set<string>();
+  let matchCountSum = 0;
+  let recorded = 0;
+  return {
+    record(toolName, fullResult) {
+      try {
+        if (typeof toolName !== 'string' || !CRM_FRESHNESS_TOOLS.includes(toolName)) return;
+        if (recorded++ >= 200) return;
+        if (fullResult && typeof fullResult === 'object' && (fullResult as any).success === false) return;
+        const r = numbersFromResult(fullResult);
+        for (const n of r.numbers) if (numbers.size < 5000) numbers.add(n);
+        if (typeof r.matchCount === 'number') { matchCountSum += r.matchCount; numbers.add(matchCountSum); }
+        tools.add(toolName);
+      } catch { /* evidence is best-effort; a bad result must never reach the turn */ }
+    },
+    snapshot: () => ({ numbers, tools }),
+  };
+}
+
+/** Numbers backed by this turn, or null when a CRM tool succeeded but there is nothing to check its numbers against. */
+function allowedNumbers(calls: any[], succeeded: Set<string>, evidence?: CrmEvidence): Set<number> | null {
+  const allowed = new Set<number>(evidence?.numbers ?? []);
+  let matchCountSum = 0;
+  const coveredByLedger = new Set<string>();
   for (const call of calls) {
     if (!call || typeof call.name !== 'string' || !succeeded.has(call.name) || !toolCallSucceeded(call)) continue;
-    let result: any = call.result;
-    if (typeof result === 'string') { try { result = JSON.parse(result); } catch { continue; } }
-    walk(result, 0);
-    const c = result && typeof result === 'object'
-      ? [result.count, result.rowCount, result.total, result.totalCount].find((x) => typeof x === 'number')
-      ?? (Array.isArray(result.leads) ? result.leads.length : undefined)
-      : undefined;
-    if (typeof c === 'number') perCallCountSum += c;
+    const r = numbersFromResult(call.result);
+    if (r.numbers.size > 0) coveredByLedger.add(call.name);
+    for (const n of r.numbers) allowed.add(n);
+    if (typeof r.matchCount === 'number') { matchCountSum += r.matchCount; allowed.add(matchCountSum); }
   }
-  if (listObjects > 0) { allowed.add(leadCountSum); allowed.add(listObjects); }
-  if (perCallCountSum > 0) allowed.add(perCallCountSum);
+  for (const tool of succeeded) {
+    if (!evidence?.tools.has(tool) && !coveredByLedger.has(tool)) return null;
+  }
   return allowed;
 }
 
@@ -158,7 +209,7 @@ function citedTools(tag: string): string[] {
   return CRM_FRESHNESS_TOOLS.filter((name) => new RegExp(`(^|[^a-z_])${name}($|[^a-z_])`, 'i').test(tag));
 }
 
-export function detectCrmFreshnessMismatch(finalText: unknown, toolCalls: unknown): CrmFreshnessResult {
+export function detectCrmFreshnessMismatch(finalText: unknown, toolCalls: unknown, evidence?: CrmEvidence): CrmFreshnessResult {
   const empty: CrmFreshnessResult = { findings: [], crmToolsSucceeded: [], tagsSeen: 0 };
   if (typeof finalText !== 'string' || !finalText) return empty;
 
@@ -189,14 +240,17 @@ export function detectCrmFreshnessMismatch(finalText: unknown, toolCalls: unknow
 
   const claims = findInventoryClaims(text);
   if (claims.length > 0) {
-    const allowed = collectAllowedNumbers(calls, succeeded);
-    const seen = new Set<number>();
-    for (const { n, at } of claims) {
-      if (allowed.has(n) || seen.has(n)) continue;
-      const near = text.slice(Math.max(0, at - CLAIM_LABEL_WINDOW), at + CLAIM_LABEL_WINDOW);
-      if (ALREADY_LABELLED.test(near)) continue;
-      seen.add(n);
-      findings.push({ kind: 'inventory_total_not_in_tool_results', tag: text.slice(at, at + 60), cited: [], claimed: n });
+    // null = a CRM tool ran but its numbers are unavailable: abstain rather than guess.
+    const allowed = allowedNumbers(calls, succeeded, evidence);
+    if (allowed) {
+      const seen = new Set<number>();
+      for (const { n, at } of claims) {
+        if (allowed.has(n) || seen.has(n)) continue;
+        const near = text.slice(Math.max(0, at - CLAIM_LABEL_WINDOW), at + CLAIM_LABEL_WINDOW);
+        if (ALREADY_LABELLED.test(near)) continue;
+        seen.add(n);
+        findings.push({ kind: 'inventory_total_not_in_tool_results', tag: text.slice(at, at + 60), cited: [], claimed: n });
+      }
     }
   }
   return { findings, crmToolsSucceeded: [...succeeded].sort(), tagsSeen };
@@ -205,6 +259,7 @@ export function detectCrmFreshnessMismatch(finalText: unknown, toolCalls: unknow
 export interface CrmFreshnessShadowInput {
   finalText: unknown;
   toolCalls: unknown;
+  evidence?: CrmEvidence;
   sessionId?: string;
   model?: string;
   log?: (message: string, detail: Record<string, unknown>) => void;
@@ -217,7 +272,7 @@ export interface CrmFreshnessShadowInput {
 export function runCrmFreshnessShadow(input: CrmFreshnessShadowInput): CrmFreshnessFinding[] {
   try {
     if (process.env.AGENT_CRM_FRESHNESS_GUARD === 'off') return [];
-    const result = detectCrmFreshnessMismatch(input.finalText, input.toolCalls);
+    const result = detectCrmFreshnessMismatch(input.finalText, input.toolCalls, input.evidence);
     if (result.findings.length === 0) return [];
     // One line of JSON, so a plain grep / log search / the summarizer script can read it (console.warn(obj)
     // spreads a multi-line dump that log shippers split apart).
