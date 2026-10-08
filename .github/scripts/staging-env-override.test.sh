@@ -7,6 +7,8 @@
 #
 # Run with:  bash .github/scripts/staging-env-override.test.sh
 
+# shellcheck disable=SC2016,SC2034  # check() evals single-quoted asserts lazily; rc is read inside them
+
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,7 +40,7 @@ check() {
 rc=$(EB_ENVIRONMENT_NAME=agentweb-backend-prod run set LEAD_MAGNET_EXECUTE_DISABLED=true)
 check "refuses non-staging env" '[[ $rc == 2 && ! -s ${WORKDIR}/log ]]'
 
-rc=$(EB_ENVIRONMENT_NAME= run set LEAD_MAGNET_EXECUTE_DISABLED=true)
+rc=$(EB_ENVIRONMENT_NAME='' run set LEAD_MAGNET_EXECUTE_DISABLED=true)
 check "requires env name" '[[ $rc == 2 && ! -s ${WORKDIR}/log ]]'
 
 rc=$(EB_ENVIRONMENT_NAME=backend-staging run set OPENAI_API_KEY=x)
