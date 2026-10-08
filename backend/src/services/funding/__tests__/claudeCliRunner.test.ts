@@ -17,14 +17,16 @@ const mockRmSync = rmSync as jest.Mock;
 
 interface FakeChild extends EventEmitter {
   stdout: Readable;
-  stdin: { write: jest.Mock };
+  stderr: Readable;
+  stdin: { write: jest.Mock; on: jest.Mock };
   kill: jest.Mock;
 }
 
 function createFakeChild(): FakeChild {
   const child = new EventEmitter() as FakeChild;
   child.stdout = new Readable({ read() {} });
-  child.stdin = { write: jest.fn() };
+  child.stderr = new Readable({ read() {} });
+  child.stdin = { write: jest.fn(), on: jest.fn() };
   child.kill = jest.fn();
   return child;
 }
@@ -189,6 +191,36 @@ describe('ClaudeCliRunner', () => {
     expect(second).toEqual(first);
   });
 
+  it('serializes concurrent spawn() calls for the same conversationId onto one real process', async () => {
+    const runner = trackedRunner();
+    const [first, second] = await Promise.all([
+      runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE),
+      runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE),
+    ]);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    expect(second).toEqual(first);
+  });
+
+  it('closeSessionInternal deletes by identity, not by key — a stale session cannot erase a different live one at the same key', async () => {
+    // Regression for the fixed TOCTOU race: without the identity check, closing a
+    // stale session object could delete a different, live session that has since
+    // taken its old pool slot. spawn() itself now serializes concurrent calls so this
+    // race can no longer arise through the public API — this exercises the guard directly.
+    const runner = trackedRunner();
+    const handleA = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    const childA = spawnedChildren[0];
+    const pool: Map<string, any> = (runner as any).pool;
+    const sessionA = pool.get('conv-1');
+    expect(sessionA).toBeDefined();
+
+    const sessionB = { ...sessionA, closed: false };
+    pool.set('conv-1', sessionB); // simulate B having since taken A's old slot
+
+    childA.emit('exit', 0); // A's own process exiting late must not erase B
+    expect(pool.get('conv-1')).toBe(sessionB);
+    void handleA;
+  });
+
   // ─── Pre-warm — spawn ahead of the first real turn, same pool, no double-spawn ──
 
   it('prewarm() opens a session with no turn in flight, reused by a later send()', async () => {
@@ -225,6 +257,42 @@ describe('ClaudeCliRunner', () => {
     expect(mockSpawn).toHaveBeenCalledTimes(2);
   });
 
+  it('close() on a conversationId still queued behind the cap cancels it — it never spawns a process', async () => {
+    const runner = trackedRunner({ maxConcurrentProcesses: 1 });
+    const handleA = await runner.spawn('conv-a', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+
+    const spawnBPromise = runner.spawn('conv-b', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    await flush();
+    expect(mockSpawn).toHaveBeenCalledTimes(1); // conv-b is queued, not yet spawned
+
+    runner.close({ conversationId: 'conv-b' }); // cancel it while still queued
+    runner.close(handleA); // free the slot conv-b was waiting on
+    await spawnBPromise;
+    await flush();
+
+    expect(mockSpawn).toHaveBeenCalledTimes(1); // conv-b must never have spawned a real process
+    expect(runner.activeProcessCount).toBe(0);
+  });
+
+  it('closeAll() guarantees nothing still queued spawns afterward, even asynchronously', async () => {
+    const runner = trackedRunner({ maxConcurrentProcesses: 1 });
+    await runner.spawn('conv-a', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+
+    const spawnBPromise = runner.spawn('conv-b', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    await flush();
+    expect(mockSpawn).toHaveBeenCalledTimes(1); // conv-b still queued
+
+    runner.closeAll();
+    await spawnBPromise;
+    await flush();
+
+    // conv-b's queued spawn must self-abort, not spawn a process "after shutdown".
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    expect(runner.activeProcessCount).toBe(0);
+  });
+
   // ─── Idle close ─────────────────────────────────────────────────────────────
 
   it('closes an idle session after the idle timeout and cleans up its scratch HOME dir', async () => {
@@ -255,6 +323,22 @@ describe('ClaudeCliRunner', () => {
 
     emitResult(child, { type: 'result', is_error: false, result: 'ok' });
     await turn;
+    jest.useRealTimers();
+  });
+
+  it('the idle timer firing mid-turn does not kill a session with a genuinely in-flight turn', async () => {
+    jest.useFakeTimers();
+    const runner = trackedRunner({ idleCloseMs: 1000 });
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    const child = spawnedChildren[0];
+
+    const turn = runner.send(handle, 'a turn that runs long');
+    jest.advanceTimersByTime(1001); // the idle timer armed at send() fires while the turn is still pending
+    expect(child.kill).not.toHaveBeenCalled();
+    expect(runner.activeProcessCount).toBe(1); // must still be open, not closed as "idle"
+
+    emitResult(child, { type: 'result', is_error: false, result: 'finally done' });
+    await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'finally done' }));
     jest.useRealTimers();
   });
 
@@ -289,6 +373,35 @@ describe('ClaudeCliRunner', () => {
     const turn = runner.send(handle, 'hi');
     child.stdout.push('not json at all\n');
     await flush();
+    emitResult(child, { type: 'result', is_error: false, result: 'ok' });
+    await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
+  });
+
+  it('a synchronous stdin.write() throw rejects that turn and clears pending — the session is not permanently wedged', async () => {
+    const runner = trackedRunner();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    const child = spawnedChildren[0];
+    child.stdin.write.mockImplementationOnce(() => {
+      throw new Error('EPIPE');
+    });
+
+    await expect(runner.send(handle, 'first, fails to even write')).rejects.toThrow('EPIPE');
+
+    // A second send() must be accepted, not rejected by a stale "already in flight" guard.
+    const secondTurn = runner.send(handle, 'second, should be able to proceed');
+    emitResult(child, { type: 'result', is_error: false, result: 'ok' });
+    await expect(secondTurn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
+  });
+
+  it('drains stderr without crashing the session (prevents an OS pipe-buffer deadlock on this long-lived, --verbose child)', async () => {
+    const runner = trackedRunner();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    const child = spawnedChildren[0];
+
+    child.stderr.push('some diagnostic --verbose output\n'.repeat(500));
+    await flush();
+
+    const turn = runner.send(handle, 'hi');
     emitResult(child, { type: 'result', is_error: false, result: 'ok' });
     await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
   });

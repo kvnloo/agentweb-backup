@@ -32,6 +32,8 @@ export interface ClaudeCliSessionHandle {
   readonly conversationId: string;
 }
 
+const STDERR_TAIL_MAX_CHARS = 4000;
+
 interface PooledSession {
   conversationId: string;
   child: ChildProcessWithoutNullStreams;
@@ -42,6 +44,8 @@ interface PooledSession {
   closed: boolean;
   /** From the session's `system`/`init` event — the ENG-2107 contract-test field. Undefined until init arrives. */
   apiKeySource: string | undefined;
+  /** Last ~4000 chars of stderr, kept only for error diagnostics. Draining it also prevents an OS pipe-buffer deadlock on this long-lived, --verbose child. */
+  stderrTail: string;
 }
 
 const DEFAULT_IDLE_CLOSE_MS = 10 * 60 * 1000;
@@ -49,7 +53,13 @@ const DEFAULT_MAX_CONCURRENT_PROCESSES = 8;
 
 export class ClaudeCliRunner {
   private readonly pool = new Map<string, PooledSession>();
-  private readonly spawnQueue: Array<() => void> = [];
+  private readonly spawnQueue: Array<{ conversationId: string; resolve: () => void }> = [];
+  /** conversationId -> the in-flight spawn, so concurrent spawn()/prewarm() calls for the
+   * same conversation serialize onto one real process instead of racing to create two. */
+  private readonly spawning = new Map<string, Promise<void>>();
+  /** conversationIds whose close() arrived before the spawn it targets finished — the
+   * spawn must self-abort (or self-close immediately) rather than leave an orphan. */
+  private readonly pendingCloseRequests = new Set<string>();
   private readonly maxConcurrentProcesses: number;
   private readonly idleCloseMs: number;
 
@@ -65,7 +75,9 @@ export class ClaudeCliRunner {
   /**
    * Returns the pooled session for conversationId, spawning a fresh process only if
    * none is open. Queues behind the concurrency cap when every slot is in use by a
-   * different conversation.
+   * different conversation. Concurrent calls for the same conversationId (e.g. a
+   * chat-open signal firing twice) serialize onto the same spawn rather than each
+   * starting a real process.
    *
    * Calling this ahead of the first real turn IS pre-warming — it pays the ~1s CLI
    * cold-start cost before the user is waiting on it, so the first real send() lands
@@ -84,35 +96,77 @@ export class ClaudeCliRunner {
       return { conversationId };
     }
 
-    await this.waitForFreeSlot();
-
-    const scratchHomeDir = mkdtempSync(join(tmpdir(), "claude-cli-home-"));
-    const child = spawnChildProcess("claude", buildArgs(systemPromptFile, opts), {
-      env: buildAllowlistedEnv(configDir, scratchHomeDir),
-    });
-
-    const session: PooledSession = {
-      conversationId,
-      child,
-      rl: createInterface({ input: child.stdout }),
-      scratchHomeDir,
-      pending: null,
-      idleTimer: null,
-      closed: false,
-      apiKeySource: undefined,
-    };
-
-    session.rl.on("line", (line) => this.handleLine(session, line));
-    child.on("exit", () => this.closeSessionInternal(session, "process-exit"));
-    child.on("error", (err) => {
-      session.pending?.reject(err);
-      session.pending = null;
-      this.closeSessionInternal(session, "process-error");
-    });
-
-    this.pool.set(conversationId, session);
-    this.scheduleIdleClose(session);
+    let inFlight = this.spawning.get(conversationId);
+    if (!inFlight) {
+      inFlight = this.doSpawn(conversationId, configDir, systemPromptFile, opts);
+      this.spawning.set(conversationId, inFlight);
+      void inFlight.finally(() => {
+        if (this.spawning.get(conversationId) === inFlight) this.spawning.delete(conversationId);
+      });
+    }
+    await inFlight;
     return { conversationId };
+  }
+
+  private async doSpawn(
+    conversationId: string,
+    configDir: string,
+    systemPromptFile: string,
+    opts: ClaudeCliRunnerOptions,
+  ): Promise<void> {
+    try {
+      await this.waitForFreeSlot(conversationId);
+      if (this.pendingCloseRequests.delete(conversationId)) {
+        return; // close() arrived while this spawn was still queued -- never start the process.
+      }
+
+      const scratchHomeDir = mkdtempSync(join(tmpdir(), "claude-cli-home-"));
+      const child = spawnChildProcess("claude", buildArgs(systemPromptFile, opts), {
+        env: buildAllowlistedEnv(configDir, scratchHomeDir),
+      });
+
+      const session: PooledSession = {
+        conversationId,
+        child,
+        rl: createInterface({ input: child.stdout }),
+        scratchHomeDir,
+        pending: null,
+        idleTimer: null,
+        closed: false,
+        apiKeySource: undefined,
+        stderrTail: "",
+      };
+
+      session.rl.on("line", (line) => this.handleLine(session, line));
+      child.stderr.on("data", (chunk: Buffer) => {
+        // Drains the pipe (preventing a backpressure deadlock on this long-lived,
+        // --verbose child) and keeps a bounded tail for error diagnostics only.
+        session.stderrTail = (session.stderrTail + chunk.toString("utf8")).slice(-STDERR_TAIL_MAX_CHARS);
+      });
+      child.on("exit", () => this.closeSessionInternal(session, "process-exit"));
+      child.on("error", (err) => {
+        session.pending?.reject(err);
+        session.pending = null;
+        this.closeSessionInternal(session, "process-error");
+      });
+      child.stdin.on("error", (err) => {
+        // An async EPIPE-type error here is an EventEmitter 'error' event; leaving it
+        // unhandled would crash the whole backend process, not just this session.
+        session.pending?.reject(err);
+        session.pending = null;
+      });
+
+      this.pool.set(conversationId, session);
+      this.scheduleIdleClose(session);
+
+      if (this.pendingCloseRequests.delete(conversationId)) {
+        // close() raced in during the synchronous setup above -- shut it down now
+        // rather than leave a live, unreachable orphan.
+        this.closeSessionInternal(session, "explicit-close");
+      }
+    } finally {
+      this.pendingCloseRequests.delete(conversationId);
+    }
   }
 
   /** Sends one turn to an already-open session and resolves on its terminal `result` event. */
@@ -133,13 +187,36 @@ export class ClaudeCliRunner {
     return new Promise<ClaudeCliTurnResult>((resolve, reject) => {
       session.pending = { resolve, reject };
       const line = JSON.stringify({ type: "user", message: { role: "user", content: message } });
-      session.child.stdin.write(line + "\n");
+      try {
+        session.child.stdin.write(line + "\n");
+      } catch (err) {
+        session.pending = null;
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
     });
   }
 
+  /**
+   * Closes the session for conversationId. Safe to call while a spawn for the same
+   * conversationId is still queued behind the concurrency cap, or mid-flight past the
+   * queue but not yet in the pool — in both cases the spawn is made to self-abort (or
+   * self-close immediately) instead of completing as an orphaned, unreachable process.
+   */
   close(handle: ClaudeCliSessionHandle): void {
-    const session = this.pool.get(handle.conversationId);
-    if (session) this.closeSessionInternal(session, "explicit-close");
+    const { conversationId } = handle;
+    const session = this.pool.get(conversationId);
+    if (session) {
+      this.closeSessionInternal(session, "explicit-close");
+      return;
+    }
+
+    this.pendingCloseRequests.add(conversationId);
+    for (let i = this.spawnQueue.length - 1; i >= 0; i--) {
+      if (this.spawnQueue[i].conversationId === conversationId) {
+        const [entry] = this.spawnQueue.splice(i, 1);
+        entry.resolve(); // let its doSpawn resume immediately; it will see pendingCloseRequests and bail.
+      }
+    }
   }
 
   /** Alias of spawn() for a caller warming a session ahead of the first real turn (e.g. on chat open). */
@@ -161,9 +238,16 @@ export class ClaudeCliRunner {
     return this.pool.get(handle.conversationId)?.apiKeySource;
   }
 
-  /** Closes every open session. For process shutdown and test teardown. */
+  /** Closes every open session, and guarantees nothing still queued or mid-spawn survives it either. */
   closeAll(): void {
+    for (const entry of this.spawnQueue) this.pendingCloseRequests.add(entry.conversationId);
     for (const session of [...this.pool.values()]) this.closeSessionInternal(session, "close-all");
+
+    // Anything still queued after every live session closed (the queue was longer than
+    // the pool ever was) would otherwise wait forever for a slot that will never free on
+    // its own. Release it now; pendingCloseRequests (set above) ensures none of it spawns.
+    const remaining = this.spawnQueue.splice(0, this.spawnQueue.length);
+    for (const entry of remaining) entry.resolve();
   }
 
   private handleLine(session: PooledSession, line: string): void {
@@ -181,6 +265,7 @@ export class ClaudeCliRunner {
     if (parsed.type !== "result" || !session.pending) return;
     const { resolve } = session.pending;
     session.pending = null;
+    this.scheduleIdleClose(session); // restart the idle window from actual completion, not from when the turn started
     resolve({
       isError: parsed.is_error === true,
       resultText: typeof parsed.result === "string" ? parsed.result : "",
@@ -190,14 +275,26 @@ export class ClaudeCliRunner {
 
   private scheduleIdleClose(session: PooledSession): void {
     if (session.idleTimer) clearTimeout(session.idleTimer);
-    session.idleTimer = setTimeout(() => this.closeSessionInternal(session, "idle"), this.idleCloseMs);
+    session.idleTimer = setTimeout(() => {
+      if (session.pending) {
+        // A turn is still genuinely in flight -- this session isn't idle. Don't kill a
+        // live turn; just keep checking back every idle window instead.
+        this.scheduleIdleClose(session);
+        return;
+      }
+      this.closeSessionInternal(session, "idle");
+    }, this.idleCloseMs);
   }
 
   private closeSessionInternal(session: PooledSession, reason: string): void {
     if (session.closed) return;
     session.closed = true;
     if (session.idleTimer) clearTimeout(session.idleTimer);
-    this.pool.delete(session.conversationId);
+    // Delete by identity, not just by key -- a key collision from a since-fixed race
+    // must never let closing a stale session erase a different, live one at that key.
+    if (this.pool.get(session.conversationId) === session) {
+      this.pool.delete(session.conversationId);
+    }
     session.rl.close();
     session.child.kill();
     try {
@@ -212,14 +309,14 @@ export class ClaudeCliRunner {
     this.releaseSlotToQueue();
   }
 
-  private async waitForFreeSlot(): Promise<void> {
+  private async waitForFreeSlot(conversationId: string): Promise<void> {
     if (this.pool.size < this.maxConcurrentProcesses) return;
-    return new Promise<void>((resolve) => this.spawnQueue.push(resolve));
+    return new Promise<void>((resolve) => this.spawnQueue.push({ conversationId, resolve }));
   }
 
   private releaseSlotToQueue(): void {
     const next = this.spawnQueue.shift();
-    if (next) next();
+    if (next) next.resolve();
   }
 }
 
