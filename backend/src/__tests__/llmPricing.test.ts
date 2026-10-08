@@ -17,6 +17,9 @@ import {
   getModelPrice,
   imageGenerationCostUsd,
   videoGenerationCostUsd,
+  videoClipCount,
+  omniVideoUsageCostUsd,
+  isPerGenerationPriced,
   costScoreFromPrice,
   __resetUnknownModelWarnsForTests,
 } from '../utils/llmPricing';
@@ -57,7 +60,9 @@ describe('price book version (ENG-1250 §5, ENG-1934)', () => {
   it('matches the prices it versions — bump LLM_PRICE_BOOK_VERSION and this pin together', () => {
     expect({ version: LLM_PRICE_BOOK_VERSION, fingerprint: fingerprint() }).toEqual({
       version: '2026-10-08',
-      fingerprint: '0f0550111d679f49', // Catalog refresh price-book pin.
+      // + gemini-omni-1.1-flash video entry: additive only (no existing price moved),
+      // so events already stamped 2026-10-08 still re-derive exactly.
+      fingerprint: '8af6c4bc8ace9a99',
     });
   });
 });
@@ -385,6 +390,53 @@ describe('llmPricing', () => {
 
     it('falls back to $3.20/clip for an unknown video model', () => {
       expect(videoGenerationCostUsd('mystery-video-model', 8)).toBe(3.2);
+    });
+
+    it('estimates gemini-omni-1.1-flash at $0.1014 per actual requested second', () => {
+      expect(VIDEO_GENERATION_PRICING_USD_PER_CLIP['gemini-omni-1.1-flash']).toBeCloseTo(10 * 0.1014, 10);
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 5)).toBeCloseTo(5 * 0.1014, 10);
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 8)).toBeCloseTo(8 * 0.1014, 10);
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 10)).toBeCloseTo(10 * 0.1014, 10);
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 24)).toBeCloseTo(24 * 0.1014, 10);
+      // Default 8s; rounded; floored at Omni's 3s minimum.
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash')).toBeCloseTo(8 * 0.1014, 10);
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 6.6)).toBeCloseTo(7 * 0.1014, 10);
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 1)).toBeCloseTo(3 * 0.1014, 10);
+      expect(isPerGenerationPriced('gemini-omni-1.1-flash')).toBe(true);
+      expect(getModelPrice('gemini-omni-1.1-flash')).toBeNull();
+    });
+
+    it('counts Omni clips per 10s while other models keep the 8s clip', () => {
+      expect(videoClipCount(16, 'gemini-omni-1.1-flash')).toBe(2);
+      expect(videoClipCount(10, 'gemini-omni-1.1-flash')).toBe(1);
+      expect(videoClipCount(16, 'seedance-2.0')).toBe(2);
+      expect(videoClipCount(9)).toBe(2);
+    });
+  });
+
+  describe('omniVideoUsageCostUsd (bill gemini-omni-1.1-flash on actual usage)', () => {
+    it('bills video output at $17.50/M, other output at $9/M and input at $1.50/M', () => {
+      const cost = omniVideoUsageCostUsd({
+        total_input_tokens: 2_000,
+        total_output_tokens: 58_920,
+        output_tokens_by_modality: [{ modality: 'video', tokens: 57_920 }, { modality: 'text', tokens: 1_000 }],
+      });
+      expect(cost).toBeCloseTo((2_000 * 1.5 + 1_000 * 9 + 57_920 * 17.5) / 1e6, 12);
+    });
+
+    it('bills every output token at the video rate when there is no modality breakdown', () => {
+      expect(omniVideoUsageCostUsd({ total_output_tokens: 1_000_000 })).toBeCloseTo(17.5, 10);
+    });
+
+    it('an 8s 720p clip (5,792 tokens/s) costs ~$0.81', () => {
+      expect(omniVideoUsageCostUsd({ total_output_tokens: 8 * 5_792 })).toBeCloseTo(0.81, 2);
+    });
+
+    it('returns undefined when usage is missing or unusable (caller estimates instead)', () => {
+      expect(omniVideoUsageCostUsd(undefined)).toBeUndefined();
+      expect(omniVideoUsageCostUsd({})).toBeUndefined();
+      expect(omniVideoUsageCostUsd({ total_output_tokens: -5 })).toBeUndefined();
+      expect(omniVideoUsageCostUsd('nope')).toBeUndefined();
     });
   });
 

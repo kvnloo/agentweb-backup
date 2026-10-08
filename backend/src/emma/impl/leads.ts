@@ -806,9 +806,18 @@ export async function searchLeads(
       const hideCardRevenueForCaller = shouldHideCardRevenueForViewer(userId);
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
 
-      if ((!filters || filters.length === 0) && !options?.search?.trim()) {
-        return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion' };
+      // ENG-2360: a list-scoped read (non-empty list_id or list_ids) with no
+      // filters/search is a valid "page through these lists" intent. Only a
+      // call with no filters, no search AND no list scope is rejected.
+      const hasListScope = Boolean(listId) || Boolean(options?.listIds && options.listIds.length > 0);
+      if ((!filters || filters.length === 0) && !options?.search?.trim() && !hasListScope) {
+        return {
+          success: false,
+          message: 'At least one filter, a search query, or a list_id/list_ids is required',
+          error: 'Provide at least one filter criterion, a search query, or list_id/list_ids to scope the read',
+        };
       }
+      filters = Array.isArray(filters) ? filters : [];
 
       // Resolve target list set. list_ids takes precedence over single list_id.
       let targetListIds: string[];

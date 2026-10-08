@@ -196,6 +196,7 @@ import {
 import { declaredPlacementField } from '../../services/agentMode/generateImagePlacement';
 import { recordGeneratedCreative } from '../../services/creativeLineage';
 import { resolveModelForUser } from '../../services/modelRoles';
+import { normalizeVideoModel, SEEDANCE_VIDEO_MODEL } from '../../services/videoModels';
 import { withTimeoutOrReject } from './shared/withTimeoutOrReject';
 import type { LLMUsageContext } from '../../utils/llmService';
 // Self-import: `callVisionLLMWithTimeout`/`generateImage` reach
@@ -957,7 +958,10 @@ export async function generateVideo(
         // Session cost accounting (agent-mode chat). The per-user burn shadow record is
         // fired once at the generation SOURCE (videoService.generateVideo) so every caller
         // is metered exactly once — see llmPricing.videoGenerationCostUsd (ENG-200).
-        const videoCost = estimateVideoGenerationCost(videoModel || 'veo-3.1-generate-preview', durationSeconds);
+        // The service reports the model that actually produced the clip (after any
+        // Seedance→Omni fallback) and its actual cost when the provider returned usage.
+        const producedModel = result.model || normalizeVideoModel(videoModel) || SEEDANCE_VIDEO_MODEL;
+        const videoCost = result.costUsd ?? estimateVideoGenerationCost(producedModel, durationSeconds);
         chatbotDb.addToolCostToSession(sessionId, videoCost, 'generateVideo').catch((err) =>
           console.error('AgentMode: Failed to add video cost to session:', err)
         );
@@ -968,7 +972,7 @@ export async function generateVideo(
           filename: result.filename,
           generatedAt: new Date().toISOString(),
           prompt: prompt,
-          model: videoModel || 'veo-3.1-generate-preview'
+          model: producedModel
         };
 
         // Store video data in session metadata (optional)
@@ -994,7 +998,7 @@ export async function generateVideo(
           ...(isComposed && { composedVideoUrl: (result as any).composedVideoUrl }),
           filename: result.filename,
           prompt: prompt,
-          model: videoModel || 'veo-3.1-generate-preview',
+          model: producedModel,
           composed: isComposed,
         };
       } else {
@@ -1500,7 +1504,7 @@ export async function removeImageBackground(
     }
   }
 
-  /** Cost per video generation in USD. Veo bills per 8s clip, so longer videos cost proportionally more. */
+  /** Cost per video generation in USD. Video bills per clip, so longer videos cost proportionally more. */
 function estimateVideoGenerationCost(model: string, durationSeconds?: number): number {
     // Per-clip rates sourced from llmPricing (single source of truth).
     return videoGenerationCostUsd(model, durationSeconds);

@@ -652,6 +652,7 @@ export interface FileAutoIssueParams {
  */
 const ALERT_CLASS_CONTEXT_KEY = 'Alert Class';
 const ALERT_PRIORITY_CONTEXT_KEY = 'Alert Priority';
+const ALERT_SCOPE_CONTEXT_KEY = 'Alert Scope';
 
 export interface FiledAutoResult {
   pageId: string;
@@ -715,8 +716,19 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
   // "v0-credits-backup") can never cross-match — the writer always emits the class as the last
   // thing on its own line.
   const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const classNeedle = alertClass
+  // ENG-2267: an optional `Alert Scope` narrows the class to one subject (e.g. one ad account),
+  // so a fleet detector that alerts per account files one canonical PER ACCOUNT instead of
+  // folding every customer's occurrence onto whichever account happened to file first.
+  const rawScope = p.notionContext?.[ALERT_SCOPE_CONTEXT_KEY];
+  const alertScope = rawScope === undefined || rawScope === null ? '' : String(rawScope).trim();
+  const classRe = alertClass
     ? new RegExp(`${escapeRegExp(`${ALERT_CLASS_CONTEXT_KEY}: ${alertClass}`)}\\s*$`, 'm')
+    : null;
+  const scopeRe = alertScope
+    ? new RegExp(`${escapeRegExp(`${ALERT_SCOPE_CONTEXT_KEY}: ${alertScope}`)}\\s*$`, 'm')
+    : null;
+  const classNeedle = classRe
+    ? { test: (d: string) => classRe.test(d) && (!scopeRe || scopeRe.test(d)) }
     : null;
   const rawPriority = p.notionContext?.[ALERT_PRIORITY_CONTEXT_KEY];
   const priority = rawPriority ? LINEAR_PRIORITY[String(rawPriority).trim().toLowerCase()] : undefined;
@@ -727,7 +739,23 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
     open.find((i) => norm(i.title) === norm(p.title));
   if (match) {
     try {
-      await addIssueComment(match.issueId, [`Recurred on ${new Date().toISOString().slice(0, 10)}.`, ...contextLines(p.notionContext)].join('\n'));
+      const recurBody = [`Recurred on ${new Date().toISOString().slice(0, 10)}.`, ...contextLines(p.notionContext)].join('\n');
+      // ENG-2066: an hourly re-fire with byte-identical context (same day, same facts) adds no
+      // information — it buried ENG-2066 under ~20 identical comments in two days. Post only when
+      // this day's occurrence carries something new. Fails open: a comment-read error still posts.
+      let prior: { body: string }[] = [];
+      try {
+        const { getIssueCommentsDetailed } = await import('./linearService');
+        prior = (await getIssueCommentsDetailed(match.issueId)) || [];
+      } catch {
+        prior = []; // fail open
+      }
+      // Linear stores "- " bullets as "* ", so compare line-by-line with the bullet marker stripped.
+      const canon = (s: string) =>
+        (s || '').split('\n').map((l) => l.trim().replace(/^[-*]\s+/, '')).filter(Boolean).join('\n');
+      const target = canon(recurBody);
+      const alreadyPosted = (prior || []).some((c) => canon(c.body) === target);
+      if (!alreadyPosted) await addIssueComment(match.issueId, recurBody);
     } catch (e) {
       console.warn('[intake] auto recur-comment failed:', e instanceof Error ? e.message : e);
     }
