@@ -39,7 +39,7 @@ export type FilterForClientOptions = AdminRedactionOptions;
  * Mark every message index that falls inside an admin-tainted turn. Returns an all-false array
  * when the viewer is an admin or no admin tool names are supplied (nothing to redact).
  */
-function computeAdminTaintedTurns(messages: any[], viewerIsAdmin: boolean, adminToolNameSet: Set<string>): boolean[] {
+export function computeAdminTaintedTurns(messages: any[], viewerIsAdmin: boolean, adminToolNameSet: Set<string>): boolean[] {
   const adminTainted = new Array(messages.length).fill(false);
   if (viewerIsAdmin || adminToolNameSet.size === 0) return adminTainted;
 

@@ -133,6 +133,15 @@ export interface ChatMessage {
     imageFilename?: string;             // Filename when kind === 'image-generated'
     imageUrl?: string;                  // ENG-510: image URL on the immediate marker so a completed image survives a whole-turn-cap kill
     citations?: Citation[];             // ENG-351: de-duplicated web sources this message consulted (ChatGPT-style Sources UI)
+    // ENG-112: provenance of a branched chat. Stamped ONLY on row 0 (the stored system prompt, which
+    // is never sent to the model) of a session created by "Branch from here". Free-form metadata, not a
+    // session field: see services/agentMode/chatBranching.ts.
+    branchOrigin?: {
+      sourceSessionId: string;
+      sourceTitle?: string;
+      sourceMessageIndex: number;       // RAW row index in the source session
+      branchedAt: string;
+    };
     mediaBudgetDeferred?: boolean;      // ENG-1239: set on the tool-role deferral marker AND on the whole-turn-timeout partial-delivery message that reports it, so an unresolved media-batch pause is detectable from the tail of session history alone
   };
 }
