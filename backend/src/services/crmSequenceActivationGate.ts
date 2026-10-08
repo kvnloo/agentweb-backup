@@ -208,7 +208,9 @@ export function checkActivationApproval(
       reason: 'The sequence content, audience or cadence changed after the preview. Preview it again so the user approves what will actually be sent.',
     };
   }
-  const outcome = findAnsweredDeckItemByKind(messages, kind);
+  // Newest answer wins: a later 'Keep as draft' must override an earlier
+  // 'Activate' for the same (unchanged) preview kind.
+  const outcome = findAnsweredDeckItemByKind([...messages].reverse(), kind);
   if (!outcome.found) {
     return {
       allowed: false,

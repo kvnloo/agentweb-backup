@@ -255,6 +255,23 @@ describe("manage_crm_sequence (ENG-964)", () => {
     });
   });
 
+  it("AC4 — a later 'keep draft' answer overrides an earlier 'activate' for the same preview", async () => {
+    const p = await preview();
+    const kind = p.questionDeckPayload[0].kind;
+    const older = historyFor(kind, { verdict: "activate", answeredBy: "user" });
+    const newer = historyFor(kind, { verdict: "keep_draft", answeredBy: "user" }).map((m: any) => {
+      const md = JSON.parse(JSON.stringify(m.metadata));
+      if (md.pendingApprovalDeckId) md.pendingApprovalDeckId = "deck-2";
+      if (md.approvalDeckAnswer) md.approvalDeckAnswer.deckId = "deck-2";
+      return { metadata: md };
+    });
+    mockGetMessages.mockResolvedValue([...older, ...newer]);
+    const result = await activate({ preview_token: p.preview_token });
+    expect(result.success).toBe(false);
+    expect(result.code).toBe("not_affirmative");
+    expect(wroteActive()).toBe(false);
+  });
+
   it("AC6 — activation succeeds with preview + unchanged hash + affirmative human answer", async () => {
     const p = await preview();
     mockGetMessages.mockResolvedValue(historyFor(p.questionDeckPayload[0].kind, { verdict: "activate", answeredBy: "user" }));
