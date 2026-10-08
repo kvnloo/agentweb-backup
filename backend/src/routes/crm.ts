@@ -835,6 +835,73 @@ router.delete('/saved-views/:viewId', async (req: Request, res: Response) => {
   }
 });
 
+const CROSS_LIST_LEAD_STATUSES = new Set(['pending_review']);
+const CROSS_LIST_LEADS_CAP = 500;
+const CROSS_LIST_CONCURRENCY = 5;
+
+/**
+ * @route GET /api/crm/leads
+ * @desc Leads with a given status across every list the caller can access
+ *       (own + org-shared). Powers the CRM Inbox "Pending Review" quick
+ *       filter (ENG-2361). Each lead is annotated with listId + listName.
+ * @access Private
+ * @query status — required; v1 accepts only "pending_review"
+ */
+router.get('/leads', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const status = typeof req.query.status === 'string' ? req.query.status.trim() : '';
+    if (!CROSS_LIST_LEAD_STATUSES.has(status)) {
+      return res.status(400).json({ message: 'status must be "pending_review"' });
+    }
+
+    // Same enumeration as GET /lists: own lists + org-shared members' lists.
+    const ownLists = (await crmDb.getLeadListsByUserId(userId)) || [];
+    const memberIds = await getReadableOrgMemberIds(userId);
+    const memberLists = memberIds.length > 0
+      ? (await Promise.all(memberIds.map((id) => crmDb.getLeadListsByUserId(id)))).flat()
+      : [];
+    const candidateLists = [...ownLists, ...memberLists].filter(Boolean);
+    const accessible = await Promise.all(candidateLists.map((list: any) => canAccessCrmList(userId, list)));
+    const lists = candidateLists.filter((_list: any, i: number) => accessible[i]);
+
+    const collected: any[] = [];
+    let truncated = false;
+    for (let i = 0; i < lists.length; i += CROSS_LIST_CONCURRENCY) {
+      if (collected.length >= CROSS_LIST_LEADS_CAP) {
+        truncated = true;
+        break;
+      }
+      const batch = lists.slice(i, i + CROSS_LIST_CONCURRENCY);
+      const results = await Promise.all(
+        batch.map((list: any) => fetchAllLeadsByStatusIndex(list.listId, status, 200))
+      );
+      results.forEach((leads, j) => {
+        const list: any = batch[j];
+        for (const lead of leads) {
+          // The index fallback returns the whole list — re-check the status.
+          if (lead?.status !== status) continue;
+          collected.push({ ...sanitizeLeadForResponse(lead, userId), listId: list.listId, listName: list.name });
+        }
+      });
+    }
+
+    collected.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+    if (collected.length > CROSS_LIST_LEADS_CAP) truncated = true;
+    const leads = collected.slice(0, CROSS_LIST_LEADS_CAP);
+
+    res.json({ leads, total: leads.length, truncated });
+  } catch (error: any) {
+    console.error('Error in GET /api/crm/leads:', error);
+    res.status(500).json({ message: error?.message || 'Failed to fetch leads' });
+  }
+});
+
 /**
  * @route GET /api/crm/leads/:leadId/enrichment
  * @desc Internal enrichment endpoint (D1) — joins AW-Users + Stripe for a

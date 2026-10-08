@@ -143,9 +143,9 @@ export function parseIngestBody(body: unknown, nowMs: number): IngestParseResult
     }
   }
 
-  const landingUrl = cleanUrl(b.landingUrl, 1000);
+  const landingUrl = repairEscapedQuery(cleanUrl(b.landingUrl, 1000));
   const referrer = cleanUrl(b.referrer, 1000);
-  const firstTouchLanding = cleanUrl(b.firstTouchLanding, 1000);
+  const firstTouchLanding = repairEscapedQuery(cleanUrl(b.firstTouchLanding, 1000));
   return {
     ok: true,
     value: {
@@ -159,6 +159,23 @@ export function parseIngestBody(body: unknown, nowMs: number): IngestParseResult
       firstTouchLanding: isHttpUrl(firstTouchLanding) ? firstTouchLanding : '',
     },
   };
+}
+
+/**
+ * Undo HTML-entity damage to a shared link's query string. A link copied out of HTML arrives as
+ * `?utm_source=x&amp;utm_medium=y`, and some apps then drop the `&`, leaving `x` + `amp;utm_medium=y`
+ * as one value. Either way every UTM after the first is lost. Only `amp;` immediately followed by
+ * a `name=` pair is rewritten, so a value that merely contains "amp" is left alone.
+ */
+export function repairEscapedQuery(url: string): string {
+  const q = url.indexOf('?');
+  if (q < 0 || !/amp;/i.test(url)) return url;
+  const hashAt = url.indexOf('#', q);
+  const end = hashAt < 0 ? url.length : hashAt;
+  const query = url.slice(q + 1, end)
+    .replace(/&?amp;(?=[A-Za-z_][\w.-]*=)/gi, '&')
+    .replace(/^&+/, '');
+  return url.slice(0, q + 1) + query + url.slice(end);
 }
 
 export function deviceFromUserAgent(ua: string): string {
