@@ -91,6 +91,7 @@ describe('ClaudeCliRunner', () => {
       DISABLE_AUTOUPDATER: '1',
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
       CLAUDE_CODE_DISABLE_THINKING: '1',
+      MAX_THINKING_TOKENS: '0',
       CLAUDE_CODE_PROMPT_CACHE_TTL: '1h',
     });
   });

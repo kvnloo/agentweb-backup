@@ -233,6 +233,12 @@ function buildAllowlistedEnv(configDir: string, scratchHomeDir: string): NodeJS.
     DISABLE_AUTOUPDATER: "1",
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     CLAUDE_CODE_DISABLE_THINKING: "1",
+    // CLAUDE_CODE_DISABLE_THINKING alone does not stop sonnet from producing a real
+    // thinking block on a reasoning-shaped prompt (verified live, 2.1.294 — a step-by-step
+    // math question produced a 'thinking' content block and 111 thinking_tokens with only
+    // the var above set). MAX_THINKING_TOKENS=0 is what actually suppresses it; confirmed
+    // live afterward (0 thinking_tokens, no thinking block) and harmless on haiku.
+    MAX_THINKING_TOKENS: "0",
     CLAUDE_CODE_PROMPT_CACHE_TTL: "1h",
   };
 }
