@@ -8,6 +8,7 @@ describe('isLinkedInInfraError (ENG-2205)', () => {
     ['SERVER_ERROR with a gateway status (502)', Object.assign(new Error('x'), { structuredError: { classification: 'SERVER_ERROR', status: 502 } })],
     ['SERVER_ERROR with a gateway status (503)', Object.assign(new Error('x'), { structuredError: { classification: 'SERVER_ERROR', status: 503 } })],
     ['SERVER_ERROR with a gateway status (504)', Object.assign(new Error('x'), { structuredError: { classification: 'SERVER_ERROR', status: 504 } })],
+    ...[520, 521, 522, 523, 524].map((st) => [`SERVER_ERROR with a CDN-style gateway status (${st})`, Object.assign(new Error('x'), { structuredError: { classification: 'SERVER_ERROR', status: st } })] as [string, any]),
     ['TIMEOUT_ERROR classification', Object.assign(new Error('x'), { structuredError: { classification: 'TIMEOUT_ERROR' } })],
     ['isTimeout flag', Object.assign(new Error('x'), { isTimeout: true })],
     ['DNS failure (EAI_AGAIN)', new Error('getaddrinfo EAI_AGAIN api.unipile.com')],
@@ -26,6 +27,8 @@ describe('isLinkedInInfraError (ENG-2205)', () => {
     ['a message that merely contains "terminated"', new Error('Account terminated by LinkedIn')],
     ['numeric status code (not a transport code)', Object.assign(new Error('x'), { code: 404 })],
     ['a plain 500 (can be request-specific; retrying will not help)', Object.assign(new Error('Internal error'), { structuredError: { classification: 'SERVER_ERROR', status: 500 } })],
+    ['a 501/505/599 (not gateway outages)', Object.assign(new Error('x'), { structuredError: { classification: 'SERVER_ERROR', status: 501 } })],
+    ['a 525 (TLS handshake: not in the allowlist)', Object.assign(new Error('x'), { structuredError: { classification: 'SERVER_ERROR', status: 525 } })],
     ['SERVER_ERROR with no status', Object.assign(new Error('x'), { structuredError: { classification: 'SERVER_ERROR' } })],
     ['undefined', undefined],
   ])('does NOT treat %s as infrastructure', (_l, err) => expect(isLinkedInInfraError(err)).toBe(false));

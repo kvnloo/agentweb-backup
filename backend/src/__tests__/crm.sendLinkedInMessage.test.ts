@@ -316,11 +316,32 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-message', () =
 
   // The message is already out when the engagement is recorded; reporting a failed send would make the user
   // retry and message the lead twice.
-  it('still reports success (and does not invite a retry) when the engagement write fails AFTER a successful send', async () => {
+  // The message is already out when the engagement is recorded. A transient write failure is retried (keyed put with a
+  // fixed eventId, so a retry overwrites rather than duplicates); only a persistent failure is reported, and even then
+  // as success, because reporting a failed send would make the user message the lead twice.
+  it('recovers from a transient engagement-write failure: retried, recorded once with the SAME event, plain success', async () => {
+    mockAddLinkedInMessageEvent
+      .mockRejectedValueOnce(new Error('read ECONNRESET'))
+      .mockRejectedValueOnce(new Error('read ECONNRESET'))
+      .mockResolvedValueOnce(undefined);
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { message: 'Hello!' } } as any, res as any);
+    expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    expect(mockAddLinkedInMessageEvent).toHaveBeenCalledTimes(3);
+    const ids = new Set(mockAddLinkedInMessageEvent.mock.calls.map((c: any[]) => c[0].eventId));
+    const stamps = new Set(mockAddLinkedInMessageEvent.mock.calls.map((c: any[]) => c[0].timestamp));
+    expect(ids.size).toBe(1);
+    expect(stamps.size).toBe(1);
+    expect(res.status).not.toHaveBeenCalled();
+    expect(res.json).toHaveBeenCalledWith({ success: true });
+  });
+
+  it('still reports success (and does not invite a retry) when the engagement write keeps failing AFTER a successful send', async () => {
     mockAddLinkedInMessageEvent.mockRejectedValue(new Error('read ECONNRESET'));
     const res = makeRes();
     await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { message: 'Hello!' } } as any, res as any);
     expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    expect(mockAddLinkedInMessageEvent).toHaveBeenCalledTimes(3); // 1 try + 2 retries, then give up
     expect(res.status).not.toHaveBeenCalled();
     expect(res.json).toHaveBeenCalledWith({ success: true, engagementRecorded: false });
   });

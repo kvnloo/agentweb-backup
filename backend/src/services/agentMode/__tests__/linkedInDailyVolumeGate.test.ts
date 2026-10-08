@@ -72,6 +72,40 @@ describe('resolveLinkedInAccountForWrite — ownership resolution', () => {
     expect(result!.configuredDailyInviteCap).toBe(30);
   });
 
+  // Legacy rows carry two ids (account_id and Unipile's config.unipile_account_id) that can differ; either names the row.
+  it("accepts a legacy row's Unipile id (config.unipile_account_id) as naming the caller's own account", async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: 'our-internal-id', userId: 'user-1', config: { unipile_account_id: ACCOUNT_ID } },
+    ]);
+
+    const result = await resolveLinkedInAccountForWrite('user-1', ACCOUNT_ID);
+
+    expect(result).not.toBeNull();
+    expect(result!.ownerUserId).toBe('user-1');
+  });
+
+  it("still returns the row's own id when asked by account_id", async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: 'our-internal-id', userId: 'user-1', config: { unipile_account_id: ACCOUNT_ID } },
+    ]);
+    expect(await resolveLinkedInAccountForWrite('user-1', 'our-internal-id')).not.toBeNull();
+  });
+
+  it('does NOT widen access: an id that matches neither id of any of the caller\'s rows is refused (e.g. the shared pool account)', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: 'our-internal-id', userId: 'user-1', config: { unipile_account_id: ACCOUNT_ID } },
+    ]);
+    expect(await resolveLinkedInAccountForWrite('user-1', 'site-wide-pool-account')).toBeNull();
+  });
+
+  it('ignores non-unipile rows and rows with no config', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      { platform: 'gmail', account_id: ACCOUNT_ID, userId: 'user-1' },
+      { platform: 'unipile', account_id: 'other', userId: 'user-1' },
+    ]);
+    expect(await resolveLinkedInAccountForWrite('user-1', ACCOUNT_ID)).toBeNull();
+  });
+
   it('resolves the caller as owner for their own (non-shared) account', async () => {
     mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
       { platform: 'unipile', account_id: ACCOUNT_ID, userId: 'user-1' },
