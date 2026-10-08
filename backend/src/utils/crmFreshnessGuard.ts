@@ -262,11 +262,87 @@ function findInventoryClaims(text: string): Array<{ n: number; at: number }> {
   return out;
 }
 
+// ---- Work that spans several invocations -------------------------------------------------------------------
+// One user-visible task can be several generateMarketingResponse invocations: a server-authored auto-continuation, an
+// answer to a question/approval card that halted the run, or the user's "continue" after a time-limit partial. The
+// per-invocation evidence above only covers the CURRENT one, and the persisted ledger result is minimised (numbers are
+// gone), so for those invocations the earlier CRM calls can be NAMED but not CHECKED. We therefore (a) count them as having
+// run for the tag check and (b) abstain on the total check. A plain follow-up question is NOT a continuation: carrying a
+// number over from an earlier turn is exactly the failure this detector exists to see.
+const MAX_HISTORY_SCANNED = 120;
+const MAX_TOOLCALLS_PER_MESSAGE = 200;
+
+function isRecord(v: unknown): v is Record<string, any> {
+  return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
+/** Does this user message continue earlier work rather than start a new request? */
+function userMessageContinuesEarlierWork(user: Record<string, any>, previous: Record<string, any> | undefined): boolean {
+  const md = isRecord(user.metadata) ? user.metadata : {};
+  if (md.kind === 'auto-continuation') return true;
+  if (md.askUserQuestionAnswer || md.approvalDeckAnswer || md.approvalDeckCancelled) return true;
+  // The user's "continue" after a time-limit partial: the assistant message just before it is the server's marker.
+  const pmd = previous && isRecord(previous.metadata) ? previous.metadata : {};
+  return pmd.kind === 'generation-timeout-continuation';
+}
+
+/**
+ * CRM tools that ran (and did not error) in EARLIER invocations of the task the current invocation continues.
+ * `history` is the persisted session; the current user message is normally its last entry. Returns [] for a fresh
+ * request, so ordinary follow-ups are still fully checked.
+ */
+export function crmToolsFromEarlierInvocations(history: unknown): string[] {
+  try {
+    if (!Array.isArray(history) || history.length === 0) return [];
+    const msgs = history.length > MAX_HISTORY_SCANNED ? history.slice(-MAX_HISTORY_SCANNED) : history;
+    const lastIdx = msgs.length - 1;
+    const last = msgs[lastIdx];
+    // If the current user message is not in the history we cannot tell what this invocation continues.
+    if (!isRecord(last) || last.role !== 'user') return [];
+
+    const found = new Set<string>();
+    let userIdx = lastIdx;
+    for (let guard = 0; guard < MAX_HISTORY_SCANNED; guard++) {
+      const user = msgs[userIdx];
+      const prevIdx = userIdx - 1;
+      const before = prevIdx >= 0 && isRecord(msgs[prevIdx]) ? msgs[prevIdx] : undefined;
+      // The assistant message that closed the previous invocation (skip tool/other roles).
+      let closer: Record<string, any> | undefined;
+      for (let i = prevIdx; i >= 0; i--) { const m = msgs[i]; if (isRecord(m) && m.role === 'assistant') { closer = m; break; } }
+      if (!isRecord(user) || !userMessageContinuesEarlierWork(user, closer ?? before)) break;
+
+      // Walk back over the earlier invocation(s) of this task, up to the user message that opened them.
+      let i = prevIdx;
+      for (; i >= 0; i--) {
+        const m = msgs[i];
+        if (!isRecord(m)) continue;
+        if (m.role === 'user') break;
+        if (m.role !== 'assistant') continue;
+        const calls = isRecord(m.metadata) && Array.isArray(m.metadata.toolCalls) ? m.metadata.toolCalls : [];
+        for (const tc of calls.slice(0, MAX_TOOLCALLS_PER_MESSAGE)) {
+          if (isRecord(tc) && typeof tc.name === 'string' && CRM_FRESHNESS_TOOLS.includes(tc.name) && toolCallSucceeded(tc)) found.add(tc.name);
+        }
+      }
+      if (i < 0) break;
+      userIdx = i; // that user message may itself be a continuation boundary: keep walking
+    }
+    return [...found].sort();
+  } catch {
+    return [];
+  }
+}
+
 function citedTools(tag: string): string[] {
   return CRM_FRESHNESS_TOOLS.filter((name) => new RegExp(`(^|[^a-z_])${name}($|[^a-z_])`, 'i').test(tag));
 }
 
-export function detectCrmFreshnessMismatch(finalText: unknown, toolCalls: unknown, evidence?: CrmEvidence): CrmFreshnessResult {
+export function detectCrmFreshnessMismatch(
+  finalText: unknown,
+  toolCalls: unknown,
+  evidence?: CrmEvidence,
+  /** CRM tools that ran in earlier invocations of the task this one continues (see crmToolsFromEarlierInvocations). */
+  earlierInvocationTools: readonly string[] = [],
+): CrmFreshnessResult {
   const empty: CrmFreshnessResult = { findings: [], crmToolsSucceeded: [], tagsSeen: 0 };
   if (typeof finalText !== 'string' || !finalText) return empty;
 
@@ -290,15 +366,16 @@ export function detectCrmFreshnessMismatch(finalText: unknown, toolCalls: unknow
     if (MENTION_AFTER.test(text.slice(at + tag.length, at + tag.length + 24))) continue;
     if (MENTION_BEFORE.test(text.slice(Math.max(0, at - 24), at))) continue;
     const cited = citedTools(tag);
-    if (cited.length > 0 && !cited.some((name) => succeeded.has(name))) {
+    if (cited.length > 0 && !cited.some((name) => succeeded.has(name) || earlierInvocationTools.includes(name))) {
       findings.push({ kind: 'cited_tool_not_run', cited });
     }
   }
 
   const claims = findInventoryClaims(text);
   if (claims.length > 0) {
-    // null = a CRM tool ran but its numbers are unavailable: abstain rather than guess.
-    const allowed = allowedNumbers(calls, succeeded, evidence);
+    // null = a CRM tool ran but its numbers are unavailable (this includes every earlier invocation of a continued
+    // task: its ledger result is minimised): abstain rather than guess.
+    const allowed = earlierInvocationTools.length > 0 ? null : allowedNumbers(calls, succeeded, evidence);
     if (allowed) {
       const seen = new Set<number>();
       for (const { n, at } of claims) {
@@ -316,6 +393,7 @@ export interface CrmFreshnessShadowInput {
   finalText: unknown;
   toolCalls: unknown;
   evidence?: CrmEvidence;
+  earlierInvocationTools?: readonly string[];
   sessionId?: string;
   model?: string;
   log?: (message: string, detail: Record<string, unknown>) => void;
@@ -328,7 +406,7 @@ export interface CrmFreshnessShadowInput {
 export function runCrmFreshnessShadow(input: CrmFreshnessShadowInput): CrmFreshnessFinding[] {
   try {
     if (process.env.AGENT_CRM_FRESHNESS_GUARD === 'off') return [];
-    const result = detectCrmFreshnessMismatch(input.finalText, input.toolCalls, input.evidence);
+    const result = detectCrmFreshnessMismatch(input.finalText, input.toolCalls, input.evidence, input.earlierInvocationTools ?? []);
     if (result.findings.length === 0) return [];
     // One line of JSON, so a plain grep / log search / the summarizer script can read it (console.warn(obj)
     // spreads a multi-line dump that log shippers split apart).
@@ -340,6 +418,7 @@ export function runCrmFreshnessShadow(input: CrmFreshnessShadowInput): CrmFreshn
       findingCount: result.findings.length,
       tagsSeen: result.tagsSeen,
       crmToolsSucceeded: result.crmToolsSucceeded,
+      continuation: (input.earlierInvocationTools?.length ?? 0) > 0,
       // Numbers and tool names only - never reply text (replies carry names, emails, deal values).
       claimed: [...new Set(result.findings.map((f) => f.claimed).filter((n): n is number => typeof n === 'number'))].slice(0, 10),
       cited: [...new Set(result.findings.flatMap((f) => f.cited))].slice(0, 10),

@@ -1,4 +1,4 @@
-import { createCrmEvidenceCollector, detectCrmFreshnessMismatch, runCrmFreshnessShadow } from '../utils/crmFreshnessGuard';
+import { createCrmEvidenceCollector, crmToolsFromEarlierInvocations, detectCrmFreshnessMismatch, runCrmFreshnessShadow } from '../utils/crmFreshnessGuard';
 
 const ok = (name: string, result: any = { success: true }) => ({ id: name, name, arguments: {}, result });
 // The first describe is about the [verified: ...] tag check; account-wide totals are covered separately below.
@@ -389,6 +389,108 @@ describe('CRM evidence from the real dispatch path (ENG-2263)', () => {
   });
 });
 
+// One user-visible task can be several invocations. The ledger result of an earlier one is minimised (numbers gone), so its CRM
+// calls can be named but not checked: count them as run for the tag check and abstain on the total check.
+describe('work that spans several invocations (ENG-2263)', () => {
+  const user = (content: string, metadata: any = {}) => ({ role: 'user', content, metadata });
+  const asst = (content: string, tools: any[] = [], metadata: any = {}) => ({ role: 'assistant', content, metadata: { ...metadata, ...(tools.length ? { toolCalls: tools } : {}) } });
+  const call = (name: string, extra: any = {}) => ({ id: name, name, arguments: {}, result: {}, ...extra });
+  const earlier = crmToolsFromEarlierInvocations;
+
+  it('auto-continuation: the CRM calls of the invocation it continues count', () => {
+    expect(earlier([user('How many lead lists?'), asst('96', [call('get_lead_lists')]), user('[SYSTEM] auto', { kind: 'auto-continuation' })])).toEqual(['get_lead_lists']);
+  });
+
+  it('a chain of continuations reaches back to the request that opened the task', () => {
+    const h = [
+      user('Build the batch'), asst('part 1', [call('get_lead_lists')]),
+      user('[SYSTEM] auto', { kind: 'auto-continuation' }), asst('part 2', [call('search_leads')]),
+      user('[SYSTEM] auto', { kind: 'auto-continuation' }),
+    ];
+    expect(earlier(h)).toEqual(['get_lead_lists', 'search_leads']);
+  });
+
+  it('an answer to a question card or approval deck continues the task that asked', () => {
+    for (const md of [{ askUserQuestionAnswer: { questionId: 'q', optionId: 'o' } }, { approvalDeckAnswer: {} }, { approvalDeckCancelled: {} }]) {
+      expect(earlier([user('go'), asst('which list?', [call('get_lead_lists')]), user('the second one', md)])).toEqual(['get_lead_lists']);
+    }
+  });
+
+  it('the user typing "continue" after a time-limit partial continues the task', () => {
+    const h = [user('Audit everything'), asst('working', [call('get_leads')]), asst('Partial results - reply continue', [], { kind: 'generation-timeout-continuation' }), user('continue')];
+    expect(earlier(h)).toEqual(['get_leads']);
+  });
+
+  it('THE TICKET SCENARIO is not a continuation: a number carried across unrelated turns is still checked', () => {
+    const h = [
+      user('Overview of my CRM?'), asst('96 lists', [call('get_lead_lists')]),
+      user('On Test Lead List, first names?'), asst('A, B'),
+      user('Search all lists for Test, exact total'),
+    ];
+    expect(earlier(h)).toEqual([]);
+  });
+
+  it('a plain follow-up right after a CRM answer is not a continuation either', () => {
+    expect(earlier([user('How many lists?'), asst('96', [call('get_lead_lists')]), user('Remind me the total, do not re-run anything')])).toEqual([]);
+  });
+
+  it('a genuine request in the middle stops the walk (earlier tasks do not leak in)', () => {
+    const h = [
+      user('task one'), asst('x', [call('get_lead_lists')]),
+      user('task two'), asst('y', [call('search_leads')]),
+      user('[SYSTEM] auto', { kind: 'auto-continuation' }),
+    ];
+    expect(earlier(h)).toEqual(['search_leads']);
+  });
+
+  it('ignores errored calls and non-CRM tools', () => {
+    const h = [user('go'), asst('x', [call('get_lead_lists', { error: 'boom' }), call('web_search'), call('get_leads', { result: { success: false } })]), user('', { kind: 'auto-continuation' })];
+    expect(earlier(h)).toEqual([]);
+  });
+
+  it('returns [] when the current user message is not the last history entry, or history is junk', () => {
+    expect(earlier([user('a', { kind: 'auto-continuation' }), asst('b', [call('get_leads')])])).toEqual([]);
+    for (const junk of [undefined, null, 5, 'x', {}, [], [null, 7, undefined], [{ role: 'user' }]]) expect(earlier(junk)).toEqual([]);
+  });
+
+  it('stays bounded on a huge history of continuations', () => {
+    const h: any[] = [];
+    for (let i = 0; i < 20_000; i++) h.push(user('', { kind: 'auto-continuation' }), asst('x', [call('get_leads')]));
+    h.push(user('', { kind: 'auto-continuation' }));
+    const t0 = process.hrtime.bigint();
+    expect(earlier(h)).toEqual(['get_leads']);
+    expect(Number(process.hrtime.bigint() - t0) / 1e6).toBeLessThan(500);
+  });
+
+  describe('in the detector', () => {
+    const inv = (t: string, calls: any[], ev: any, prior: string[]) => detectCrmFreshnessMismatch(t, calls, ev, prior).findings;
+
+    it('a tag citing a tool that ran in an EARLIER invocation of the task is backed', () => {
+      expect(inv('17 lists [verified: get_lead_lists]', [], undefined, ['get_lead_lists'])).toEqual([]);
+      expect(inv('17 lists [verified: get_lead_lists]', [], undefined, []).filter((f) => f.kind === 'cited_tool_not_run')).toHaveLength(1);
+    });
+
+    it('a tag citing a tool that ran in NEITHER is still flagged', () => {
+      expect(inv('17 lists [verified: get_lead_lists]', [], undefined, ['search_leads']).filter((f) => f.kind === 'cited_tool_not_run')).toHaveLength(1);
+    });
+
+    it('abstains on the total check when the task continues earlier work (the numbers are unrecoverable)', () => {
+      const text = 'Your CRM has 18 lead lists and 47 leads in total.';
+      expect(inv(text, [], undefined, ['get_lead_lists'])).toEqual([]);
+      expect(inv(text, [], undefined, []).length).toBeGreaterThan(0);
+    });
+
+    it('the log says it was a continuation', () => {
+      const log = jest.fn();
+      runCrmFreshnessShadow({ finalText: '17 lists [verified: search_leads]', toolCalls: [], earlierInvocationTools: ['get_lead_lists'], log });
+      expect(log.mock.calls[0][1]).toMatchObject({ continuation: true });
+      const log2 = jest.fn();
+      runCrmFreshnessShadow({ finalText: '17 lists [verified: search_leads]', toolCalls: [], log: log2 });
+      expect(log2.mock.calls[0][1]).toMatchObject({ continuation: false });
+    });
+  });
+});
+
 // This runs synchronously on every reply. An unbounded `[^\]]*` / `[^>]*` regex is quadratic on unclosed
 // delimiters (measured before the fix: 100KB of "[verified " blocked the event loop 1.5s, 500KB 37s).
 describe('detectCrmFreshnessMismatch stays linear on hostile input (ENG-2263)', () => {
@@ -454,7 +556,7 @@ describe('runCrmFreshnessShadow (ENG-2263)', () => {
       expect(json.kinds).toEqual(expect.arrayContaining(['cited_tool_not_run', 'inventory_total_not_in_tool_results']));
       expect(json.claimed).toEqual(expect.arrayContaining([18, 47]));
       expect(json.cited).toEqual(['get_lead_lists']);
-      expect(Object.keys(json).sort()).toEqual(['cited', 'claimed', 'crmToolsSucceeded', 'findingCount', 'kinds', 'model', 'sessionId', 'tagsSeen']);
+      expect(Object.keys(json).sort()).toEqual(['cited', 'claimed', 'continuation', 'crmToolsSucceeded', 'findingCount', 'kinds', 'model', 'sessionId', 'tagsSeen']);
       for (const secret of ['Jane', 'Doe', 'jane.doe', 'acme', '98,500', 'deal value', 'lead lists and']) expect(line).not.toContain(secret);
     } finally { warn.mockRestore(); }
   });

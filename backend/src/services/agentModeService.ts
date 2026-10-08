@@ -42,7 +42,7 @@ import {
 } from './agentMode/metaImageSwapCheck';
 import { readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
-import { createCrmEvidenceCollector, runCrmFreshnessShadow } from '../utils/crmFreshnessGuard';
+import { createCrmEvidenceCollector, crmToolsFromEarlierInvocations, runCrmFreshnessShadow } from '../utils/crmFreshnessGuard';
 import {
   evaluateTurnTimeBudget,
   buildTurnTimeBudgetNudge,
@@ -3474,6 +3474,9 @@ export class AgentModeService {
       _toolCallsForTelemetry = toolCalls;
       // ENG-2263: numbers the CRM tools actually returned this turn (the ledger above stores minimised results).
       const crmEvidence = createCrmEvidenceCollector();
+      // ENG-2263: CRM tools that ran in earlier invocations of the task this one continues (auto-continuation, an answered
+      // question/approval card, "continue" after a time-limit partial). Their numbers are unrecoverable, so the check abstains.
+      const crmEarlierTools = crmToolsFromEarlierInvocations(sessionHistory);
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
       // ENG-351: accumulates the web sources this message consults across all its search
@@ -5230,7 +5233,7 @@ export class AgentModeService {
       // a carried-over number dressed as fresh. Measures how often it happens, per model, before
       // anyone decides to enforce. Never edits `content`; kill switch AGENT_CRM_FRESHNESS_GUARD=off.
       if (content && !wasCancelled && !mockMode) {
-        runCrmFreshnessShadow({ finalText: content, toolCalls, evidence: crmEvidence.snapshot(), sessionId, model: llmModel });
+        runCrmFreshnessShadow({ finalText: content, toolCalls, evidence: crmEvidence.snapshot(), earlierInvocationTools: crmEarlierTools, sessionId, model: llmModel });
       }
 
       // ENG-1207 AC3: a run must not finish silently on an unread page.
