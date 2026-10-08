@@ -54,6 +54,7 @@ CACHE="${ROOT}/nm-${LOCK_HASH}"
 WT="${ROOT}/wt-${SHA:0:12}-$$"
 mkdir -p "$ROOT"
 
+# shellcheck disable=SC2317  # invoked via trap
 cleanup() {
   if [[ "${KEEP_WORKTREE:-0}" != "1" ]]; then
     git -C "$REPO_DIR" worktree remove --force "$WT" >/dev/null 2>&1 || rm -rf "$WT"
