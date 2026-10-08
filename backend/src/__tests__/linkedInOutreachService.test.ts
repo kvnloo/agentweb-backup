@@ -2,7 +2,12 @@ import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { UnipileClient } from 'unipile-node-sdk';
 import { getUnipileCredentials } from '../utils/secretsManager';
 
-jest.mock('unipile-node-sdk');
+// Explicit factory (not bare automock): an automock is derived from the REAL package's exports, so its shape
+// depends on whether another test file in the same jest worker already loaded the real SDK. With an explicit
+// factory this file behaves identically regardless of which files share its worker.
+jest.mock('unipile-node-sdk', () => ({
+  UnipileClient: jest.fn(),
+}));
 jest.mock('../utils/secretsManager');
 jest.mock('../services/db', () => ({
   userDb: {
