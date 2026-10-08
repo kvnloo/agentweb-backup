@@ -11,7 +11,7 @@ import { cronJobRegistry } from "./cronJobRegistry";
  * no trace. This logs the rejection instead.
  */
 export function trackBackgroundRun(name: string, run: Promise<unknown>): void {
-  void cronJobRegistry.track(name, run).catch((err) => {
+  void cronJobRegistry.track(name, Promise.resolve(run)).catch((err) => {
     // eslint-disable-next-line no-console
     console.error(`[${name}] background run crashed`, err);
   });

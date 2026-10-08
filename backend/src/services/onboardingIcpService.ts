@@ -957,10 +957,10 @@ export async function triggerIcpDiscoveryForUser(
       const delay = CASCADE_TRIGGER_DELAY_MS;
       if (delay > 0) {
         setTimeout(() => {
-          void startCompetitorStrategyForUser(userId);
+          trackBackgroundRun("onboardingCompetitorKickoff", startCompetitorStrategyForUser(userId));
         }, delay);
       } else {
-        void startCompetitorStrategyForUser(userId);
+        trackBackgroundRun("onboardingCompetitorKickoff", startCompetitorStrategyForUser(userId));
       }
     }
   } catch (err) {

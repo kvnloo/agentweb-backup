@@ -25,9 +25,11 @@
 import express, { Request, Response } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb } from "../services/db";
+import { viewAfterUnclaimedStart } from "../utils/startResponseView";
 import {
   ensurePersonaIds,
   ICPPersona,
+  ICP_TIMEOUT_MS,
   icpStartPatch,
   icpReadyPatch,
   icpFailedPatch,
@@ -138,8 +140,8 @@ router.post("/icp/start", authenticateToken, async (req, res) => {
       // this run (e.g. OutreachIcpPick's watchdog re-firing while the first
       // call's generation is still in flight). Do NOT launch a second
       // parallel LLM call; return the in-flight snapshot instead.
-      const existing = await userDb.getUserById(userId);
-      return res.json({ status: icpSnapshot(existing || {}) });
+      const existing = await viewAfterUnclaimedStart(userId, "icpStatus", "running", icpStartPatch);
+      return res.json({ status: icpSnapshot(existing) });
     }
     return res.json({ status: icpSnapshot(patch) });
   } catch (err) {
@@ -256,9 +258,8 @@ router.post("/competitor/start", authenticateToken, async (req, res) => {
       // snapshot instead. Fine to re-read here: we have no winning patch of
       // our own to fall back on, so the eventually-consistent GSI row is
       // the best available source of truth either way.
-      const existing = await userDb.getUserById(userId);
-      const fallback = competitorStartPatch();
-      return res.json({ status: competitorSnapshot(existing || fallback) });
+      const existing = await viewAfterUnclaimedStart(userId, "competitorStatus", "running", competitorStartPatch);
+      return res.json({ status: competitorSnapshot(existing) });
     }
     return res.json({ status: competitorSnapshot(patch) });
   } catch (err) {
@@ -349,9 +350,8 @@ router.post("/creative-dir/start", authenticateToken, async (req, res) => {
       // Lost the race (ENG-2308) — a concurrent caller already claimed this
       // run. No winning patch of our own, so the eventually-consistent GSI
       // row is the best available source of truth.
-      const existing = await userDb.getUserById(userId);
-      const fallback = creativeDirStartPatch();
-      return res.json({ status: creativeDirSnapshot(existing || fallback) });
+      const existing = await viewAfterUnclaimedStart(userId, "creativeDirStatus", "running", creativeDirStartPatch);
+      return res.json({ status: creativeDirSnapshot(existing) });
     }
     return res.json({ status: creativeDirSnapshot(patch) });
   } catch (err) {
@@ -457,9 +457,8 @@ router.post("/ad-image/start", authenticateToken, async (req, res) => {
     // orchestrator's own runAdImage owns that claim instead), so a
     // winning-patch shortcut wouldn't even apply there.
     await startAdImageGenerationForUser(userId);
-    const user = await userDb.getUserById(userId);
-    const fallback = adImageStartPatch();
-    return res.json({ status: adImageSnapshot(user || fallback) });
+    const view = await viewAfterUnclaimedStart(userId, "adImageStatus", "running", adImageStartPatch);
+    return res.json({ status: adImageSnapshot(view) });
   } catch (err) {
     console.error("[ad-image] start failed", err);
     return res.status(500).json({ message: "Failed to start ad image" });
@@ -553,9 +552,8 @@ router.post("/ad-copy/start", authenticateToken, async (req, res) => {
       // Lost the race (ENG-2308) — a concurrent caller already claimed this
       // run. No winning patch of our own, so the eventually-consistent GSI
       // row is the best available source of truth.
-      const existing = await userDb.getUserById(userId);
-      const fallback = adCopyStartPatch();
-      return res.json({ status: adCopySnapshot(existing || fallback) });
+      const existing = await viewAfterUnclaimedStart(userId, "adCopyStatus", "running", adCopyStartPatch);
+      return res.json({ status: adCopySnapshot(existing) });
     }
     return res.json({ status: adCopySnapshot(patch) });
   } catch (err) {
@@ -879,7 +877,20 @@ router.post("/icp/regenerate-one", authenticateToken, async (req, res) => {
     // not a per-user one — left as a follow-up rather than rushed in, since
     // the FE already disables a card's own regenerate control once it shows
     // a spinner, which already covers the common case.
-    await userDb.updateUser(userId, icpStartPatch());
+    //
+    // If a full /icp/start run is already in flight, KEEP its icpStartedAt:
+    // that run's completion write is conditioned on it (ENG-2308), so stamping
+    // a fresh one here would make its whole-set result get dropped.
+    const inFlightStartedAt =
+      existing?.icpStatus === "running" &&
+      typeof existing?.icpStartedAt === "string" &&
+      Date.now() - Date.parse(existing.icpStartedAt) < ICP_TIMEOUT_MS
+        ? existing.icpStartedAt
+        : undefined;
+    await userDb.updateUser(
+      userId,
+      inFlightStartedAt ? { ...icpStartPatch(), icpStartedAt: inFlightStartedAt } : icpStartPatch(),
+    );
     void regenerateSingleIcpForUser(userId, idx).catch((err: unknown) => {
       console.error("[icp] regenerate-one failed", { userId, idx, err });
     });

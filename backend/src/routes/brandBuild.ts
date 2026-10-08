@@ -24,6 +24,7 @@ import { userDb } from "../services/db";
 import {
   buildAutoFailPatchIfStuck,
   buildFailedPatch,
+  buildStartPatch,
   logCompletionMetric,
   snapshot,
 } from "../services/brandBuildStatusService";
@@ -32,6 +33,7 @@ import {
   triggerBrandBuildForUser,
 } from "../services/onboardingBrandBuildService";
 import { cronJobRegistry } from "../utils/cronJobRegistry";
+import { viewAfterUnclaimedStart } from "../utils/startResponseView";
 
 const router = express.Router();
 
@@ -161,7 +163,8 @@ router.post("/brand-build/start", authenticateToken, async (req, res) => {
       void reconcileForUser(userId).catch((e: unknown) => {
         console.error("[brandBuild] background reconcile crashed", e);
       });
-      return res.json({ status: snapshot((current as any) || {}) });
+      const view = await viewAfterUnclaimedStart(userId, "brandBuildStatus", "building", buildStartPatch);
+      return res.json({ status: snapshot(view as any) });
     }
 
     const patch = await claimBrandBuildRun(userId);
@@ -169,8 +172,8 @@ router.post("/brand-build/start", authenticateToken, async (req, res) => {
       // Lost the race — another concurrent /brand-build/start already
       // claimed it. Same idempotent posture as the alreadyInFlight branch
       // above; just surface whatever is currently persisted.
-      const refreshed = await userDb.getUserById(userId);
-      return res.json({ status: snapshot(refreshed || (current as any) || {}) });
+      const view = await viewAfterUnclaimedStart(userId, "brandBuildStatus", "building", buildStartPatch);
+      return res.json({ status: snapshot(view as any) });
     }
     // Fire-and-forget background work; route returns immediately so the UI
     // can poll /status without holding an HTTP connection open for ~30s.
