@@ -44,7 +44,8 @@ const BENIGN_REPORTS: readonly RegExp[] = [
  */
 export function classifyReport(line: string): ReportSeverity {
   const text = line.trim().replace(/^[*_`>\-\s]+/, '');
-  if (text.startsWith('⚠') || /^Artificial Analysis failed:/.test(text)) return 'warning';
+  // Missing/failed Artificial Analysis data means the run was partly blind: a warning, never benign.
+  if (text.startsWith('⚠') || /^Artificial Analysis (?:failed|unavailable):/.test(text)) return 'warning';
   if (text.startsWith('ℹ') || text.startsWith('✅')) return 'info';
   return BENIGN_REPORTS.some(re => re.test(text)) ? 'benign' : 'unrecognized';
 }

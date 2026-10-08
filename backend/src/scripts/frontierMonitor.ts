@@ -43,7 +43,7 @@ async function main() {
   const existingChanges = classifyExistingChanges(LLM_MODEL_REGISTRY as any, plan.registryChanges as any, plan.additions);
   // Missing Artificial Analysis data or unreadable endpoint coverage means the run did not
   // see everything; that blocks auto-merge (a failed Slack post is a notification issue, not a data one).
-  const observationDegraded = !!aaError || coverage.some(r => r.status.startsWith('UNKNOWN:'));
+  const observationDegraded = !!aaError || !apiKey || coverage.some(r => r.status.startsWith('UNKNOWN:'));
   const review = buildReviewArtifacts({
     additions, reports: [...detection.reports, ...plan.reports, ...reviewReports],
     smoke: Object.fromEntries(plan.additions.map(id => [id, 'pending' as const])),

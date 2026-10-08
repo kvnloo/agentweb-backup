@@ -178,6 +178,7 @@ describe('classifyReport', () => {
   it.each([
     ['⚠️ PRICE OUTLIER: m', 'warning'], ['⚠ bare sign', 'warning'], [' **⚠️ wrapped**', 'warning'],
     ['Artificial Analysis failed: HTTP 500', 'warning'],
+    ['Artificial Analysis unavailable: ARTIFICIAL_ANALYSIS_API_KEY not set; top-N detection skipped.', 'warning'],
     ['ℹ️ PRICE DROP: m', 'info'], ['✅ LIVE SMOKE TEST passed: m (x)', 'info'],
     ['openrouter/x/y: AA unmatched; score unchanged', 'benign'],
     ['openrouter/x/y: live quote ($1/$2 in/out) diverges from curated price ($3/$4); not applied', 'benign'],
