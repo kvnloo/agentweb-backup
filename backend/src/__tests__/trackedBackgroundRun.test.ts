@@ -21,4 +21,8 @@ describe("trackBackgroundRun", () => {
     expect(errSpy).toHaveBeenCalledWith("[test-crash] background run crashed", boom);
     errSpy.mockRestore();
   });
+
+  it("tolerates a launcher that returned no promise instead of throwing into its caller", () => {
+    expect(() => trackBackgroundRun("test-undefined", undefined as unknown as Promise<unknown>)).not.toThrow();
+  });
 });

@@ -4,6 +4,7 @@ import express from "express";
 jest.mock("../services/db", () => ({
   userDb: {
     getUserById: jest.fn(),
+    getUserByIdConsistent: jest.fn(),
     getUserByEmailConsistent: jest.fn(),
     updateUser: jest.fn(),
   },
@@ -44,6 +45,32 @@ describe("POST /api/onboarding/brand-build/start", () => {
       .post("/api/onboarding/brand-build/start")
       .set("x-no-auth", "1");
     expect(res.status).toBe(401);
+  });
+
+  // ENG-2308 review: on the eager branch the route no longer persists `building`
+  // (the orchestrator's runner is the only claimant), but the client still
+  // stops polling on a non-in-flight response, so it must see one.
+  it("reports in-flight for an eager user before the orchestrator has claimed the build", async () => {
+    const wiring = require("../services/onboardingOrchestratorWiring");
+    const reconcile = jest.spyOn(wiring, "reconcileForUser").mockResolvedValue(undefined);
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      useEagerPipeline: true,
+      companyUrl: "https://example.com",
+    });
+    userDb.getUserByIdConsistent.mockResolvedValue({
+      userId: "user-1",
+      useEagerPipeline: true,
+      companyUrl: "https://example.com",
+      brandBuildStatus: "failed",
+    });
+    const res = await request(app)
+      .post("/api/onboarding/brand-build/start")
+      .send({ companyUrl: "https://example.com" });
+    reconcile.mockRestore();
+    expect(res.status).toBe(200);
+    expect(res.body.status.brandBuildStatus).toBe("building");
+    expect(res.body.status.inFlight).toBe(true);
   });
 
   it("writes a building patch and returns the new snapshot", async () => {

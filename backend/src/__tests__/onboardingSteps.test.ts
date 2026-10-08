@@ -14,6 +14,7 @@ import express from "express";
 jest.mock("../services/db", () => ({
   userDb: {
     getUserById: jest.fn(),
+    getUserByIdConsistent: jest.fn(),
     getUserByEmailConsistent: jest.fn(),
     updateUser: jest.fn(),
   },
@@ -830,6 +831,60 @@ describe("/icp/start and /competitor/start delegate to onboarding services", () 
   });
 });
 
+describe("/start routes when the call did not persist a claim (ENG-2308 review)", () => {
+  it("/icp/start answers from a consistent read, not the lagging index, after losing the race", async () => {
+    const { startIcpDiscoveryForUser } = require("../services/onboardingIcpService");
+    (startIcpDiscoveryForUser as jest.Mock).mockResolvedValueOnce(null);
+    // Indexed read lags: shows the previous attempt's terminal state.
+    userDb.getUserById.mockResolvedValue({ userId: "user-1", icpStatus: "failed" });
+    userDb.getUserByIdConsistent.mockResolvedValue({
+      userId: "user-1",
+      icpStatus: "running",
+      icpStartedAt: new Date().toISOString(),
+    });
+    const res = await request(app).post("/api/onboarding/icp/start");
+    expect(res.body.status.icpStatus).toBe("running");
+    expect(res.body.status.inFlight).toBe(true);
+  });
+
+  describe("eager pipeline", () => {
+    beforeEach(() => {
+      process.env.EAGER_ONBOARDING_PIPELINE_ENABLED = "true";
+    });
+    afterEach(() => {
+      delete process.env.EAGER_ONBOARDING_PIPELINE_ENABLED;
+    });
+
+    it("/icp/start reports in-flight before the orchestrator has claimed, so the client keeps polling", async () => {
+      const { startIcpDiscoveryForUser } = require("../services/onboardingIcpService");
+      (startIcpDiscoveryForUser as jest.Mock).mockResolvedValueOnce(null);
+      userDb.getUserByIdConsistent.mockResolvedValue({ userId: "user-1", icpStatus: "failed" });
+      const res = await request(app).post("/api/onboarding/icp/start");
+      expect(res.body.status.inFlight).toBe(true);
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    it("/icp/start does not overwrite a run the orchestrator already claimed", async () => {
+      const { startIcpDiscoveryForUser } = require("../services/onboardingIcpService");
+      (startIcpDiscoveryForUser as jest.Mock).mockResolvedValueOnce(null);
+      const startedAt = new Date(Date.now() - 5_000).toISOString();
+      userDb.getUserByIdConsistent.mockResolvedValue({
+        userId: "user-1",
+        icpStatus: "running",
+        icpStartedAt: startedAt,
+      });
+      const res = await request(app).post("/api/onboarding/icp/start");
+      expect(res.body.status.startedAt ?? res.body.status.icpStartedAt).toBe(startedAt);
+    });
+
+    it("/ad-image/start reports in-flight for an eager user", async () => {
+      userDb.getUserByIdConsistent.mockResolvedValue({ userId: "user-1", adImageStatus: "idle" });
+      const res = await request(app).post("/api/onboarding/ad-image/start");
+      expect(res.body.status.inFlight).toBe(true);
+    });
+  });
+});
+
 // ─────────────────────────────── ENG-255 ───────────────────────────────
 //
 // "Regenerate this one" used to regenerate all five personas and destroy any
@@ -898,6 +953,42 @@ describe("POST /api/onboarding/icp/regenerate-one", () => {
     expect(regenerateSingleIcpForUser).toHaveBeenCalledWith("user-1", 1);
     // Plain unconditional write — no ConditionExpression option at all.
     expect(userDb.updateUser.mock.calls[0][2]).toBeUndefined();
+  });
+
+  // ENG-2308 review: a full /icp/start run's completion write is conditioned on
+  // its own icpStartedAt. regenerate-one stamping a fresh one over an in-flight
+  // run would make that whole-set result get dropped.
+  it("keeps an in-flight run's icpStartedAt instead of stamping a new one", async () => {
+    const inFlight = new Date(Date.now() - 10_000).toISOString();
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      icpStatus: "running",
+      icpStartedAt: inFlight,
+      icpResult: goodPersonas,
+    });
+    userDb.updateUser.mockResolvedValue({});
+
+    const res = await request(app)
+      .post("/api/onboarding/icp/regenerate-one")
+      .send({ icpId: "icp-1" });
+
+    expect(res.status).toBe(200);
+    expect(userDb.updateUser.mock.calls[0][1].icpStartedAt).toBe(inFlight);
+  });
+
+  it("stamps a fresh icpStartedAt when the previous run is past its timeout", async () => {
+    const stale = new Date(Date.now() - 10 * 60_000).toISOString();
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      icpStatus: "running",
+      icpStartedAt: stale,
+      icpResult: goodPersonas,
+    });
+    userDb.updateUser.mockResolvedValue({});
+
+    await request(app).post("/api/onboarding/icp/regenerate-one").send({ icpId: "icp-1" });
+
+    expect(userDb.updateUser.mock.calls[0][1].icpStartedAt).not.toBe(stale);
   });
 });
 
