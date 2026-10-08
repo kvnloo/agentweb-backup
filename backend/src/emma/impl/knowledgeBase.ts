@@ -554,6 +554,22 @@ export async function attachKnowledgeBaseFiles(
       };
     }
 
+    // Models often reuse update_knowledge_base_file's `fileName` key; accept the aliases.
+    files = files.map((f: any) => ({
+      ...f,
+      name: f?.name ?? f?.fileName ?? f?.file_name ?? f?.filename,
+    }));
+
+    for (const f of files) {
+      if (typeof f.name !== 'string' || f.name.trim().length === 0) {
+        return {
+          success: false,
+          message: 'Each file needs a "name" (e.g. "design.md") alongside its "content"',
+          error: 'Invalid input: missing file name'
+        };
+      }
+    }
+
     // Validate each file has content
     for (const f of files) {
       if (!f.content || f.content.trim().length === 0) {
