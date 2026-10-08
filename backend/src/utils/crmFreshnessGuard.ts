@@ -24,9 +24,7 @@ export const CRM_FRESHNESS_TOOLS: readonly string[] = [
 
 export type CrmFreshnessFindingKind =
   /** The tag names a CRM tool, and none of the tools it names succeeded this turn. */
-  | 'cited_tool_not_run'
-  /** The tag names no tool, sits next to CRM wording, and no CRM tool succeeded this turn. */
-  | 'bare_tag_no_crm_tool';
+  'cited_tool_not_run';
 
 export interface CrmFreshnessFinding {
   kind: CrmFreshnessFindingKind;
@@ -45,9 +43,13 @@ export interface CrmFreshnessResult {
 const TAG = /\[verified[^\]]*\]/gi;
 // A tag that already says it is not fresh is the honest form — nothing to flag.
 const ALREADY_LABELLED = /\b(earlier|previous|prior|before|stale|out of date|outdated|last turn|from the conversation)\b/i;
-const CRM_WORDING = /\b(leads?|lists?|crm|contacts?|pipeline)\b/i;
 const MAX_TAG_CHARS = 120;
-const CONTEXT_CHARS = 200;
+// The model sometimes talks ABOUT the tag ("I can't include the [verified: ...] tag because no tool ran").
+// That is the honest behaviour, not a claim — a tag followed by "tag"/"label" or introduced by an
+// article/verb of using is a mention. Bare `[verified]` (no tool named) is deliberately not judged: in
+// the replay it caught nothing the cited rule missed, and it is what misfired on this commentary.
+const MENTION_AFTER = /^\s*(tag|label|marker|badge|notation|annotation)s?\b/i;
+const MENTION_BEFORE = /\b(the|a|this|that|any|use|using|used|include|including|add|adding|attach|attaching|apply|applying|carry|put)\s+$/i;
 
 function stripMarkup(text: string): string {
   return text.replace(/<[^>]*>/g, '').replace(/`/g, '');
@@ -76,19 +78,12 @@ export function detectCrmFreshnessMismatch(finalText: unknown, toolCalls: unknow
     tagsSeen++;
     const tag = match[0];
     if (ALREADY_LABELLED.test(tag)) continue;
+    const at = match.index ?? 0;
+    if (MENTION_AFTER.test(text.slice(at + tag.length, at + tag.length + 24))) continue;
+    if (MENTION_BEFORE.test(text.slice(Math.max(0, at - 24), at))) continue;
     const cited = citedTools(tag);
-    if (cited.length > 0) {
-      if (!cited.some((name) => succeeded.has(name))) {
-        findings.push({ kind: 'cited_tool_not_run', tag: tag.slice(0, MAX_TAG_CHARS), cited });
-      }
-      continue;
-    }
-    if (succeeded.size === 0) {
-      const at = match.index ?? 0;
-      const around = text.slice(Math.max(0, at - CONTEXT_CHARS), at + tag.length + CONTEXT_CHARS);
-      if (CRM_WORDING.test(around)) {
-        findings.push({ kind: 'bare_tag_no_crm_tool', tag: tag.slice(0, MAX_TAG_CHARS), cited: [] });
-      }
+    if (cited.length > 0 && !cited.some((name) => succeeded.has(name))) {
+      findings.push({ kind: 'cited_tool_not_run', tag: tag.slice(0, MAX_TAG_CHARS), cited });
     }
   }
   return { findings, crmToolsSucceeded: [...succeeded].sort(), tagsSeen };
