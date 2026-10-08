@@ -148,6 +148,13 @@ describe('catalog critical invariants', () => {
     const plan = await refreshModelCatalog({ fetch: request, aaApiKey: '' });
     expect(plan.reports.some(r => r.startsWith('openrouter/x-ai/grok-4.7:') && r.includes('time-of-day price windows'))).toBe(true);
   });
+  it('keeps a NEW model\'s own "no Artificial Analysis match" line visible as information', async () => {
+    const newRow = { ...row, id: 'x-ai/grok-4.9', pricing: { prompt: '0.000002', completion: '0.000006' } };
+    const aa = { data: [{ slug: 'something-else', model_creator: { slug: 'x-ai' }, evaluations: { artificial_analysis_intelligence_index: 40 } }] };
+    const plan = await refreshModelCatalog({ catalog: { data: [newRow] }, aa, additionIds: ['openrouter/x-ai/grok-4.9'] });
+    expect(plan.reports.some(r => r.startsWith('ℹ️ AA SCORE: openrouter/x-ai/grok-4.9'))).toBe(true);
+    expect(plan.reports.some(r => r === 'openrouter/x-ai/grok-4.9: AA unmatched; score unchanged')).toBe(false);
+  });
   it('strips the "<Vendor>: " prefix from OpenRouter display names', () => {
     expect(cleanModelName('Anthropic: Claude Haiku 5.5')).toBe('Claude Haiku 5.5');
     expect(cleanModelName('Z.ai: GLM 5.3')).toBe('GLM 5.3');

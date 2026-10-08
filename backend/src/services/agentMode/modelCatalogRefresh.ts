@@ -174,6 +174,13 @@ export async function refreshModelCatalog(options: {
   const pricingChanges: Record<string, ModelPrice> = {};
   for (const model of additions) { next[model.id] = model.config; registryChanges[model.id] = model.config; pricingChanges[model.id] = model.price; }
   const { changes, reports } = refreshScores(next, aa, date);
+  // A new model's own "no Artificial Analysis match" line is information a reviewer needs
+  // (it ships without a quality score); the other ~150 are daily noise.
+  const addedIds = new Set(additions.map(m => m.id));
+  reports.forEach((line, i) => {
+    const m = /^(.*): AA (unmatched|ambiguous); score unchanged$/.exec(line);
+    if (m && addedIds.has(m[1])) reports[i] = `ℹ️ AA SCORE: ${m[1]} has no unique Artificial Analysis match (${m[2]}) yet, so it ships without a quality score.`;
+  });
   // Flag a wildly mispriced addition loudly — never block on it. A hard gate here
   // would recreate the exact deadlock ENG-2293 fixed (one bad quote blocking every
   // future model forever); a report a reviewer can't miss is the safer trade-off.

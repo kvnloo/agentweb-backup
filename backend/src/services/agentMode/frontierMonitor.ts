@@ -3,7 +3,7 @@ import { parseOpenRouter, refreshScores } from './modelCatalogRefresh';
 import { inferFamily } from './modelSupersession';
 import { resolveOpenRouterUpstreamModelId } from '../../utils/openRouterGatewayContract';
 import { OPENROUTER_PROVIDER_PREFERENCES } from './openRouterRequestParams';
-import { AutoMergeVerdict, SmokeStatus, evaluateAutoMerge } from './catalogReview';
+import { AutoMergeVerdict, ExistingChanges, SmokeStatus, classifyReport, evaluateAutoMerge, oneLine } from './catalogReview';
 
 type Registry = Readonly<Record<string, Readonly<LLMModelConfig>>>;
 const DAY = 86_400;
@@ -146,20 +146,24 @@ export function renderCoverage(coverage: Awaited<ReturnType<typeof byokCoverage>
   ].join('\n');
 }
 
+/** GitHub rejects a PR body over 65,536 characters; stay well under it. */
+const MAX_BODY_CHARS = 60_000;
+
 /**
  * PR body for the daily refresh PR. Reviewer information used to exist only in the
  * run's GITHUB_STEP_SUMMARY, so a reviewer reading the PR never saw it. Layout:
- * the auto-merge verdict first, then warning-sign items (what a human must decide),
- * then notes on new models, and everything else collapsed.
+ * the auto-merge verdict first, then everything a human must decide (warnings AND
+ * any line the classifier does not recognise), then notes on new models, and the
+ * routine noise collapsed.
  */
 export function renderPrBody(reports: readonly string[], verdict?: AutoMergeVerdict): string {
+  const lines = reports.map(r => oneLine(r, 600));
   const aaUnmatched = /: AA (?:unmatched|ambiguous); score unchanged$/;
-  const isNote = (r: string) => r.startsWith('ℹ️') || r.startsWith('✅');
-  const warnings = reports.filter(r => r.startsWith('⚠️'));
-  const notes = reports.filter(isNote);
-  const unmatched = reports.filter(r => aaUnmatched.test(r));
-  const rest = reports.filter(r => !r.startsWith('⚠️') && !isNote(r) && !aaUnmatched.test(r));
-  return [
+  const flagged = lines.filter(r => ['warning', 'unrecognized'].includes(classifyReport(r)));
+  const notes = lines.filter(r => classifyReport(r) === 'info');
+  const unmatched = lines.filter(r => aaUnmatched.test(r));
+  const rest = lines.filter(r => classifyReport(r) === 'benign' && !aaUnmatched.test(r));
+  const build = (restLimit: number) => [
     'Daily frontier detection using OpenRouter release dates and the Artificial Analysis top 10.',
     'Auto-add validated text/tool models in tracked families or top-N models from tracked providers.',
     'Include advertised cloud BYOK endpoint coverage; credentials and quota are not verified.',
@@ -172,16 +176,23 @@ export function renderPrBody(reports: readonly string[], verdict?: AutoMergeVerd
     ...(verdict ? [
       `## Auto-merge check: ${verdict.eligible ? 'ELIGIBLE (as admin-only)' : 'NOT ELIGIBLE'}`, '',
       ...verdict.checks.map(c => `- ${c.ok ? '✅' : '❌'} ${c.name}: ${c.detail}`),
-      '', 'Scope: new models only (flags, price sanity, live routing). Score refreshes of existing models are not range-checked. Making a model customer-visible is a separate, later step.', '',
+      '', 'Scope: new models (flags, price sanity, routing with the smoke-test key only, not the production BYOK accounts) and the size of changes to existing models. A report line the script does not recognise blocks the verdict. Valid for the generated commit only; re-check after any push. Making a model customer-visible is a separate, later step.', '',
     ] : []),
-    ...(warnings.length ? ['## Review before merging', '', ...warnings.map(w => `- ${w}`), ''] : []),
+    ...(flagged.length ? ['## Review before merging', '', ...flagged.map(w => classifyReport(w) === 'unrecognized' ? `- ❓ (unrecognised report line) ${w}` : `- ${w}`), ''] : []),
     ...(notes.length ? ['## Notes on new models', '', ...notes.map(n => `- ${n}`), ''] : []),
     ...(rest.length || unmatched.length ? [
       '<details><summary>Other monitor notes</summary>', '',
       ...(unmatched.length ? [`- ${unmatched.length} registry model(s) have no Artificial Analysis match; their scores are unchanged.`] : []),
-      ...rest.map(r => `- ${r}`), '', '</details>', '',
+      ...rest.slice(0, restLimit).map(r => `- ${r}`),
+      ...(rest.length > restLimit ? [`- ... and ${rest.length - restLimit} more (see the workflow run summary).`] : []),
+      '', '</details>', '',
     ] : []),
   ].join('\n');
+  for (const limit of [Infinity, 100, 0]) {
+    const body = build(limit);
+    if (body.length <= MAX_BODY_CHARS) return body;
+  }
+  return build(0).slice(0, MAX_BODY_CHARS) + '\n\n_(truncated: body exceeded the size limit)_';
 }
 
 /** Verdict + PR body from one place, so the monitor step and the smoke-test step cannot drift. */
@@ -189,6 +200,8 @@ export function buildReviewArtifacts(input: {
   additions: ReadonlyArray<{ id: string; adminOnly?: boolean }>;
   reports: readonly string[];
   smoke: Readonly<Record<string, SmokeStatus>>;
+  existingChanges: ExistingChanges;
+  observationDegraded: boolean;
 }) {
   const autoMerge = evaluateAutoMerge(input);
   return { autoMerge, body: renderPrBody(input.reports, autoMerge) };

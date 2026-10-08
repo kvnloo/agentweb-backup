@@ -2,7 +2,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { buildReviewArtifacts, byokCoverage, detectFrontier, fetchJson, renderCoverage, upstreamId } from '../services/agentMode/frontierMonitor';
-import { endpointPriceReport } from '../services/agentMode/catalogReview';
+import { classifyExistingChanges, endpointPriceReport } from '../services/agentMode/catalogReview';
 import { blendedPrice } from '../services/agentMode/modelSupersession';
 import { LLM_MODEL_REGISTRY, LLMModelConfig } from '../services/agentMode/llmModelRegistry';
 import { refreshModelCatalog } from '../services/agentMode/modelCatalogRefresh';
@@ -40,9 +40,14 @@ async function main() {
   }
   const additions = plan.additions.map(id => ({ id, adminOnly: (plan.registryChanges[id] as LLMModelConfig | undefined)?.adminOnly }));
   // The live smoke test runs in its own step (it needs a secret); until then it is "pending".
+  const existingChanges = classifyExistingChanges(LLM_MODEL_REGISTRY as any, plan.registryChanges as any, plan.additions);
+  // Missing Artificial Analysis data or unreadable endpoint coverage means the run did not
+  // see everything; that blocks auto-merge (a failed Slack post is a notification issue, not a data one).
+  const observationDegraded = !!aaError || coverage.some(r => r.status.startsWith('UNKNOWN:'));
   const review = buildReviewArtifacts({
     additions, reports: [...detection.reports, ...plan.reports, ...reviewReports],
     smoke: Object.fromEntries(plan.additions.map(id => [id, 'pending' as const])),
+    existingChanges, observationDegraded,
   });
   const report = [ '# Frontier monitor', '', ...detection.alerts, '', ...detection.reports, ...plan.reports, ...reviewReports, '', markdown ].join('\n');
   if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, report);
@@ -64,7 +69,7 @@ async function main() {
       if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `\n${warning}\n`);
     }
   }
-  console.log(JSON.stringify({ ...detection, coverage, plan, reviewReports, autoMerge: review.autoMerge, degraded: notificationFailed || !!aaError || coverage.some(r => r.status.startsWith('UNKNOWN:')) }, null, 2));
+  console.log(JSON.stringify({ ...detection, coverage, plan, reviewReports, existingChanges, observationDegraded, autoMerge: review.autoMerge, degraded: notificationFailed || !!aaError || coverage.some(r => r.status.startsWith('UNKNOWN:')) }, null, 2));
   // The workflow checks degraded after preserving the report and opening the draft PR.
 }
 if (require.main === module) main().catch(error => { console.error(error); process.exitCode = 1; });

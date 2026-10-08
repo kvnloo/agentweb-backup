@@ -37,14 +37,25 @@ jobs:
           if node -e 'process.exit(require("/tmp/model-catalog-plan.json").additions.length ? 0 : 1)'; then
             npm run refresh:openrouter-params
           fi
+      # Registry-vs-endpoint capability test: catches a supports* flag some provider lacks
+      # (require_parameters then returns "no endpoints found"). Non-blocking on purpose: a
+      # failing test must not stop the PR from opening (ENG-2293); its result feeds the
+      # PR's auto-merge verdict instead.
+      - name: Capability guard (result feeds the verdict)
+        working-directory: backend
+        continue-on-error: true
+        run: npx jest --runInBand --runTestsByPath src/services/agentMode/__tests__/openRouterRequestParams.registryGuard.test.ts --json --outputFile=/tmp/guard-result.json
       # Live check that each NEW model actually routes with the backend's request shape
       # (tools + tool_choice + require_parameters). Needs a repo secret; without it the PR
-      # says "smoke test skipped" and is NOT eligible for auto-merge. Never fails the job.
+      # says "smoke test skipped" and is NOT eligible for auto-merge. Must never fail the job.
       - name: Live smoke test of new models
         working-directory: backend
+        continue-on-error: true
+        timeout-minutes: 5
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_SMOKE_API_KEY }}
           PR_BODY_PATH: /tmp/model-catalog-pr-body.md
+          GUARD_RESULT_PATH: /tmp/guard-result.json
         run: npx ts-node --transpile-only src/scripts/smokeTestAdditions.ts /tmp/model-catalog-plan.json
       - name: Verify critical catalog and price-book invariants
         working-directory: backend
