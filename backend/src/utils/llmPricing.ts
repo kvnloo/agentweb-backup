@@ -26,7 +26,7 @@
  * pins a fingerprint of the tables to this version, so a price change that
  * forgets the bump fails the build instead of silently sharing a version.
  */
-export const LLM_PRICE_BOOK_VERSION = "2026-10-07";
+export const LLM_PRICE_BOOK_VERSION = "2026-10-08";
 
 /** The rate provenance a spend event carries when this book priced it. */
 export const LLM_PRICE_BOOK_PROVENANCE = `llm-price-book:${LLM_PRICE_BOOK_VERSION}`;
@@ -144,6 +144,8 @@ const GEMINI_3_8_FLASH_PRICE: ModelPrice = { ...withDerivedCache(0.75, 3.75), ca
  *   price page is tagged with `// UNVERIFIED`.
  */
 export const MODEL_PRICING: Record<string, ModelPrice> = {
+  "openrouter/anthropic/claude-haiku-5.5": {"inPerM":0.1,"outPerM":0.5,"cacheReadPerM":0.01,"cacheWritePerM":0.125},
+
   "openrouter/anthropic/claude-sonnet-5.5": {"inPerM":2,"outPerM":10,"cacheReadPerM":0.2,"cacheWritePerM":2.5},
   "openrouter/deepseek/deepseek-v4-pro-0813": {"inPerM":1.32,"outPerM":3.96,"cacheReadPerM":0.044},
   "openrouter/deepseek/deepseek-v4.1-flash": {"inPerM":0.05,"outPerM":1.2,"cacheReadPerM":0.02},

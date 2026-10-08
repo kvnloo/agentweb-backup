@@ -2026,7 +2026,9 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await brandMarketStrategyImpl.updateBrandGuidelines(args, context?.userId);
+    return await brandMarketStrategyImpl.updateBrandGuidelines(args, context?.userId, {
+      sessionId: context?.sessionId,
+    });
   }
 });
 
@@ -2106,7 +2108,9 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await brandMarketStrategyImpl.updateMarketStrategy(args, context?.userId);
+    return await brandMarketStrategyImpl.updateMarketStrategy(args, context?.userId, {
+      sessionId: context?.sessionId,
+    });
   }
 });
 
@@ -2125,7 +2129,9 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await brandMarketStrategyImpl.regenerateMarketStrategy(context?.userId);
+    return await brandMarketStrategyImpl.regenerateMarketStrategy(context?.userId, {}, {
+      sessionId: context?.sessionId,
+    });
   }
 });
 
