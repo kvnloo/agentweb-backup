@@ -47,14 +47,31 @@ describe('detectCrmFreshnessMismatch (ENG-2263)', () => {
     }
   });
 
-  it('flags a bare [verified] beside CRM wording only when no CRM tool succeeded', () => {
-    const text = 'You have 18 lead lists [verified] and 47 leads.';
-    expect(detectCrmFreshnessMismatch(text, []).findings).toEqual([expect.objectContaining({ kind: 'bare_tag_no_crm_tool' })]);
-    expect(detectCrmFreshnessMismatch(text, [ok('get_leads')]).findings).toEqual([]);
+  it('does not judge a bare [verified] that names no tool (it caught nothing extra in the replay and misfired on commentary)', () => {
+    expect(detectCrmFreshnessMismatch('You have 18 lead lists [verified] and 47 leads.', []).findings).toEqual([]);
+    expect(detectCrmFreshnessMismatch('The pixel fires on page load [verified]', []).findings).toEqual([]);
   });
 
-  it('ignores a bare [verified] that is not about CRM data', () => {
-    expect(detectCrmFreshnessMismatch('The pixel fires on page load [verified]', []).findings).toEqual([]);
+  // Captured from the ENG-2263 preview run: gemini-3.8-flash declined to use the tag and said so.
+  it('does not flag the model talking ABOUT the tag instead of using it', () => {
+    const commentary = [
+      'I cannot include the <code>[verified]</code> tag because no tool was run in this turn to verify the count.',
+      'I cannot tag this count as verified because no tool was run in this turn — the <code>[verified]</code> tag is strictly reserved for data confirmed by a live tool call.',
+      "I can't attach the [verified: get_lead_lists] tag because get_lead_lists did not run this turn.",
+      'The [verified: get_lead_lists] label is only for numbers re-queried this turn, so I left it off.',
+      'Without using [verified: get_lead_lists] here, the total is 47 as of earlier in the conversation.',
+    ];
+    for (const text of commentary) expect(detectCrmFreshnessMismatch(text, []).findings).toEqual([]);
+  });
+
+  it('recognises a mention by the word AFTER the tag even when nothing introduces it', () => {
+    expect(detectCrmFreshnessMismatch('Skipping the usual [verified: get_lead_lists] tag, since nothing ran this turn.', []).findings).toEqual([]);
+    expect(detectCrmFreshnessMismatch('Total is 47 [verified: get_lead_lists] label omitted on purpose.', []).findings).toEqual([]);
+  });
+
+  it('still flags a real claim even when the sentence mentions a tag elsewhere', () => {
+    const text = "I can't re-check right now, but you have 47 leads in total [verified: get_lead_lists].";
+    expect(detectCrmFreshnessMismatch(text, []).findings).toHaveLength(1);
   });
 
   it('ignores tags citing non-CRM tools', () => {
