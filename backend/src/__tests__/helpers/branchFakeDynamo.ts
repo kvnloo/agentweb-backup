@@ -48,6 +48,14 @@ export class BranchFakeDynamo {
     });
   }
 
+  /** Seed rows at EXPLICIT raw indices (a store whose messageIndex values are not the array positions). */
+  seedMessagesAt(sessionId: string, messages: Item[], rawIndexes: number[]): void {
+    const t = this.table(MESSAGES_SUFFIX);
+    messages.forEach((message, i) => {
+      t.set(`${sessionId}\x00${rawIndexes[i]}`, clone({ sessionId, messageIndex: rawIndexes[i], message }));
+    });
+  }
+
   rows(sessionId: string): Array<{ messageIndex: number; message: Item }> {
     const t = this.table(MESSAGES_SUFFIX);
     return [...t.values()]

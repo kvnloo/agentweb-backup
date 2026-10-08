@@ -35,6 +35,18 @@ const SKILL_PAGE_IDENTIFIER_RE = /^skill-[A-Za-z0-9_-]{1,100}$/;
 const APPEND_ATTEMPTS = 3;
 const RECENT_BRANCH_TTL_MS = 10 * 60 * 1000;
 const RECENT_BRANCH_MAX = 500;
+const CLEANUP_ATTEMPTS = 3;
+const RATE_WINDOW_MS = 60 * 60 * 1000;
+
+/** AW-Settings row: max branches one user may create per rolling hour. Absent/invalid => default; 0 => unlimited. */
+export const CHAT_BRANCHING_MAX_PER_HOUR_SETTING = 'chat_branching_max_per_hour';
+export const DEFAULT_MAX_BRANCHES_PER_HOUR = 30;
+
+export function parseBranchRateLimit(value: unknown): number {
+  const text = String(value ?? '').trim();
+  if (!/^\d{1,9}$/.test(text)) return DEFAULT_MAX_BRANCHES_PER_HOUR;
+  return Number(text);
+}
 
 export function isChatBranchingSettingEnabled(value: unknown): boolean {
   return String(value ?? '').trim().toLowerCase() === 'true';
@@ -64,7 +76,8 @@ export interface ServiceOutcome<T = unknown> {
 
 export interface BranchUser {
   userId: string;
-  isAdmin: boolean;
+  /** Informational only: branching requires the requester to OWN the session (admins act via delegation). */
+  isAdmin?: boolean;
 }
 
 type DelegateInfo = NonNullable<ChatSession['delegateInfo']>;
@@ -99,8 +112,14 @@ export interface BranchDeps {
   setModel(sessionId: string, model: string, policy: PolicyDecision): Promise<unknown>;
   setTitle(sessionId: string, title: string): Promise<unknown>;
   appendMessages(sessionId: string, messages: ChatMessage[]): Promise<unknown>;
-  /** Soft-delete (existing mechanism) for a half-built branch. */
+  /** Soft-delete (existing mechanism). A branch is created hidden this way and revealed once verified. */
   archiveSession(sessionId: string): Promise<void>;
+  /** Reveal a verified branch (`archived = false`, the ordinary live value). */
+  unarchiveSession(sessionId: string): Promise<void>;
+  /** Max branches per user per rolling hour (already cached/defaulted by the caller). 0 = unlimited. */
+  getMaxBranchesPerHour(): Promise<number>;
+  /** Backoff between cleanup retries. Defaults to setTimeout. */
+  sleep?(ms: number): Promise<void>;
   adminToolNames: Iterable<string>;
   maxSessionMessages: number;
   now(): number;
@@ -207,6 +226,12 @@ export function planBranchPrefix(
     return { ok: false, outcome: fail(400, 'Only an assistant reply can be branched from', 'message_not_branchable') };
   }
 
+  // A reply with no question before it cannot seed a branch: the branch's first-turn logic (title,
+  // "first user message" detection) would misfire on a history that starts assistant-first.
+  if (!rows.slice(0, pos).some((m) => m.role === 'user')) {
+    return { ok: false, outcome: fail(400, 'There is no question before that reply to branch from', 'no_user_message') };
+  }
+
   let end = pos;
   while (end + 1 < rows.length && rows[end + 1].role === 'tool') end++;
   if (computeAdminTaintedTurns(rows, false, adminToolNames)[pos]) {
@@ -227,10 +252,35 @@ export function planBranchPrefix(
 /**
  * The rows a branch is written from. Strips what must NOT be re-counted or re-attributed:
  * `usage` (addMessagesToSession runs incrementTokenUsage, so a copied usage block would bill the
- * branch for turns it never ran), `metadata.feedback` (the source's like/dislike), `clientId`
+ * branch for turns it never ran), `metadata.feedback` (the source's like/dislike), the continuation-trigger flags (see stripContinuationTriggers), `clientId`
  * (the source's optimistic-render key) and the stale `messageIndex` (reassigned densely on write).
  * Everything else, including hidden tool rows and the tool ledger, is copied verbatim.
  */
+/**
+ * Copy of the message with every flag that makes a READ of the session start work removed.
+ * getSession re-fires scheduleAutoMediaContinuation (a billed generation) for an owner view whose
+ * tail is an unresolved media deferral younger than an hour (hasUnresolvedMediaDeferral): the
+ * `mediaBudgetDeferred` marker on a tool/assistant row, or a deferred `media_generation_time_budget`
+ * call in an assistant's `toolCalls` ledger. Copied verbatim, the portal's immediate navigation to a
+ * fresh branch would spend the user's credits on a continuation they never asked for. The visible
+ * text and the rest of the ledger are untouched.
+ */
+function stripContinuationTriggers(m: ChatMessage): ChatMessage {
+  const meta = m.metadata as (Record<string, any> & { toolCalls?: any[] }) | undefined | null;
+  if (!meta) return m;
+  const { mediaBudgetDeferred: _d, ...metadata } = meta;
+  if (Array.isArray(metadata.toolCalls)) {
+    metadata.toolCalls = metadata.toolCalls.map((tc: any) => {
+      if (tc?.result?.deferred === true && tc.result.reason === 'media_generation_time_budget') {
+        const { deferred: _x, ...result } = tc.result;
+        return { ...tc, result };
+      }
+      return tc;
+    });
+  }
+  return { ...m, metadata } as ChatMessage;
+}
+
 export function buildBranchRows(
   history: readonly ChatMessage[],
   endInclusive: number,
@@ -241,7 +291,7 @@ export function buildBranchRows(
     const { messageIndex: _i, usage: _u, clientId: _c, ...rest } = m as ChatMessage & { clientId?: string };
     if (!rest.metadata) return rest as ChatMessage;
     const { feedback: _f, ...metadata } = rest.metadata;
-    return { ...rest, metadata } as ChatMessage;
+    return stripContinuationTriggers({ ...rest, metadata } as ChatMessage);
   });
   const first = rows[0];
   rows[0] = {
@@ -256,7 +306,9 @@ export function buildBranchRows(
 }
 
 function branchTitle(source: ChatSession): string {
-  const base = (source.title ?? '').trim() || 'Chat';
+  let base = (source.title ?? '').trim() || 'Chat';
+  // Branching a branch must not stack the suffix ("X (branch) (branch)").
+  if (base.endsWith(BRANCH_TITLE_SUFFIX) && base.length > BRANCH_TITLE_SUFFIX.length) base = base.slice(0, -BRANCH_TITLE_SUFFIX.length).trimEnd() || 'Chat';
   return `${base.slice(0, MAX_TITLE_CHARS - BRANCH_TITLE_SUFFIX.length)}${BRANCH_TITLE_SUFFIX}`;
 }
 
@@ -274,9 +326,65 @@ function branchPageIdentifier(source: ChatSession): string {
 const inflightKeys = new Set<string>();
 const recentBranches = new Map<string, { sessionId: string; at: number }>();
 
+const branchWindows = new Map<string, number[]>();
+
 export function __resetBranchIdempotencyForTests(): void {
   inflightKeys.clear();
   recentBranches.clear();
+  branchWindows.clear();
+}
+
+/** Thrown when a created-but-unverified branch could not be hidden. Carries the id for the response. */
+class BranchOrphanError extends Error {
+  constructor(readonly sessionId: string, cause: unknown) {
+    super(`branch session ${sessionId} could not be hidden: ${String((cause as Error)?.message ?? cause).slice(0, 200)}`);
+  }
+}
+
+interface RateSlot { userId: string; at: number }
+
+/** Sliding window per user (in-memory, per instance). Returns null when the user is over the cap. */
+async function takeRateSlot(deps: BranchDeps, userId: string): Promise<RateSlot | null | 'unlimited'> {
+  let max = DEFAULT_MAX_BRANCHES_PER_HOUR;
+  try {
+    const configured = await deps.getMaxBranchesPerHour();
+    if (Number.isInteger(configured) && configured >= 0) max = configured;
+  } catch {
+    // a settings outage must not block branching: use the default
+  }
+  if (max === 0) return 'unlimited';
+  const now = deps.now();
+  const recent = (branchWindows.get(userId) ?? []).filter((t) => now - t < RATE_WINDOW_MS);
+  if (recent.length >= max) {
+    branchWindows.set(userId, recent);
+    return null;
+  }
+  recent.push(now);
+  branchWindows.set(userId, recent);
+  return { userId, at: now };
+}
+
+function refundRateSlot(slot: RateSlot): void {
+  const list = branchWindows.get(slot.userId);
+  if (!list) return;
+  const i = list.indexOf(slot.at);
+  if (i >= 0) list.splice(i, 1);
+  if (list.length === 0) branchWindows.delete(slot.userId);
+}
+
+async function retryCleanup(deps: BranchDeps, op: () => Promise<void>): Promise<unknown | undefined> {
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let last: unknown;
+  for (let attempt = 1; attempt <= CLEANUP_ATTEMPTS; attempt++) {
+    try {
+      await op();
+      return undefined;
+    } catch (error) {
+      last = error ?? new Error('unknown');
+      if (attempt < CLEANUP_ATTEMPTS) await sleep(100 * attempt);
+    }
+  }
+  return last;
 }
 
 function rememberBranch(localKey: string, sessionId: string, now: number): void {
@@ -306,6 +414,9 @@ export async function branchChatSession(deps: BranchDeps, input: BranchInput): P
     return await branchInner(deps, input);
   } catch (error) {
     deps.log('ChatBranching: unexpected failure', { errorClass: (error as Error)?.name, message: String((error as Error)?.message ?? '').slice(0, 200) });
+    if (error instanceof BranchOrphanError) {
+      return fail(500, 'Failed to branch this chat', 'branch_failed', { cleanupFailed: true, orphanSessionId: error.sessionId });
+    }
     return fail(500, 'Failed to branch this chat', 'branch_failed');
   }
 }
@@ -320,11 +431,17 @@ async function branchInner(deps: BranchDeps, input: BranchInput): Promise<Servic
 
   const source = await deps.getSession(input.sessionId);
   if (!source) return fail(404, 'Session not found', 'session_not_found');
-  if (source.userId !== input.user.userId && !input.user.isAdmin) return fail(403, 'Unauthorized access to session', 'forbidden');
+  // OWNER only. A non-delegated admin writing a new session into a customer's account would leave no
+  // trace of who did it; a delegated admin arrives with req.user = the target, so that case passes.
+  if (source.userId !== input.user.userId) return fail(403, 'Unauthorized access to session', 'forbidden');
   const refused = ineligible(source);
   if (refused) return refused;
 
-  const scope = req.idempotencyKey ? `branch|${input.sessionId}|${req.idempotencyKey}` : undefined;
+  // The scope names everything that shapes the result, so one key can never be replayed onto a
+  // branch from a different message or model.
+  const scope = req.idempotencyKey
+    ? `branch|${input.sessionId}|${req.messageIndex}|${req.llmModel ?? ''}|${req.idempotencyKey}`
+    : undefined;
   const localKey = scope ? `${input.user.userId}|${scope}` : undefined;
   let runStoreHeld = false;
 
@@ -412,7 +529,16 @@ async function createBranch(
     });
   }
   let createdId: string | undefined;
+  let slot: RateSlot | null | 'unlimited' = null;
   try {
+    // Per-user cap: counted only now that the request validated and holds the lock; handed back in
+    // `finally` unless a session was actually created.
+    slot = await takeRateSlot(deps, input.user.userId);
+    if (slot === null) {
+      const message = 'Too many branches were created recently. Please try again in a little while.';
+      return fail(429, message, 'TOO_MANY_BRANCHES', { message });
+    }
+
     // 3. Re-read under the lock (consistent): the pre-lock copy may be stale.
     const source = await deps.getSession(input.sessionId, { consistentRead: true });
     if (!source) return fail(404, 'Session not found', 'session_not_found');
@@ -450,6 +576,15 @@ async function createBranch(
       },
     });
     createdId = created.sessionId;
+    // Hide it BEFORE anything is copied: until the copy is verified it must not show in any list. A
+    // process death mid-copy then leaves a hidden (archived) session instead of an empty visible one.
+    const hideError = await retryCleanup(deps, () => deps.archiveSession(createdId!));
+    if (hideError !== undefined) {
+      deps.log('ChatBranching: ORPHAN branch session could not be hidden; it is visible and empty', {
+        sessionId: createdId, userId: source.userId, errorClass: (hideError as Error)?.name, message: String((hideError as Error)?.message ?? '').slice(0, 200),
+      });
+      throw new BranchOrphanError(createdId, hideError);
+    }
     if (resolved.policy) await deps.setModel(createdId, resolved.model, resolved.policy);
     const title = branchTitle(source);
     await deps.setTitle(createdId, title);
@@ -463,17 +598,18 @@ async function createBranch(
     if (!saved || !dense || saved.messageCount !== rows.length || readBranchOrigin(savedRows)?.sourceSessionId !== source.sessionId) {
       throw new Error(`branch verification failed: expected ${rows.length} rows, found ${savedRows.length} (messageCount ${saved?.messageCount})`);
     }
-    return { status: 201, body: summarize(saved) };
-  } catch (error) {
-    if (createdId) {
-      try {
-        await deps.archiveSession(createdId);
-      } catch (cleanupError) {
-        deps.log('ChatBranching: failed to archive a half-built branch', { sessionId: createdId, errorClass: (cleanupError as Error)?.name });
-      }
+
+    // 6. Verified: reveal it. If this keeps failing the branch simply stays hidden (safe) and the
+    //    request reports failure; the id is logged so it can be revealed or removed by hand.
+    const revealError = await retryCleanup(deps, () => deps.unarchiveSession(createdId!));
+    if (revealError !== undefined) {
+      deps.log('ChatBranching: verified branch could not be revealed; it stays hidden', { sessionId: createdId, errorClass: (revealError as Error)?.name });
+      throw revealError;
     }
-    throw error;
+    return { status: 201, body: summarize(saved) };
   } finally {
+    // A request that created nothing must not use up the user's allowance.
+    if (slot && slot !== 'unlimited' && !createdId) refundRateSlot(slot);
     deps.release(input.sessionId);
   }
 }

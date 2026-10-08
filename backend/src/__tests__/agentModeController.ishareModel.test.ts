@@ -159,6 +159,27 @@ describe('AgentModeController - ishare Model Selection', () => {
       );
     });
 
+    it('ENG-112: a share viewer never receives the branch provenance (source session id/title) on row 0', async () => {
+      const origin = { sourceSessionId: 'src-secret-id', sourceTitle: 'Source title', sourceMessageIndex: 2, branchedAt: 'x' };
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSessionWithModel,
+        messages: [
+          { role: 'system', content: 'SYS', metadata: { timestamp: 't', branchOrigin: origin } },
+          { role: 'user', content: 'hi' },
+        ],
+      } as any);
+      (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
+      const mockReq = { params: { shareId: mockSessionId }, query: { conversable: mockConversableToken }, on: jest.fn() } as unknown as Request;
+      const mockRes = { status: jest.fn().mockReturnThis(), json: jest.fn() } as unknown as Response;
+
+      await agentModeController.getSharedConversation(mockReq, mockRes);
+
+      const body = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(body.session.messages.length).toBeGreaterThan(0);
+      expect(JSON.stringify(body)).not.toContain('src-secret-id');
+      expect(JSON.stringify(body)).not.toContain('branchOrigin');
+    });
+
     it('should return session with default model when session does not have model set', async () => {
       mockChatbotDb.getChatSession.mockResolvedValue(mockSessionWithoutModel);
 

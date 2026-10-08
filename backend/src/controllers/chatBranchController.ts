@@ -31,7 +31,10 @@ import {
   BranchDeps,
   branchChatSession,
   CHAT_BRANCHING_ENABLED_SETTING,
+  CHAT_BRANCHING_MAX_PER_HOUR_SETTING,
+  DEFAULT_MAX_BRANCHES_PER_HOUR,
   isChatBranchingSettingEnabled,
+  parseBranchRateLimit,
 } from '../services/agentMode/chatBranching';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -48,6 +51,30 @@ export async function isChatBranchingEnabled(): Promise<boolean> {
     console.error('ChatBranching: failed to read the feature flag; treating as disabled:', error);
     return false;
   }
+}
+
+const RATE_SETTING_CACHE_MS = 60 * 1000;
+let rateSettingCache: { value: number; at: number } | undefined;
+
+export function __resetBranchRateLimitCacheForTests(): void {
+  rateSettingCache = undefined;
+}
+
+/**
+ * Per-user branches per rolling hour, from AW-Settings `chat_branching_max_per_hour`. Cached ~60s;
+ * an unreadable row serves the last known value (default 30 if there never was one). Absent or
+ * invalid => 30; "0" => unlimited.
+ */
+export async function getChatBranchingMaxPerHour(now: number = Date.now()): Promise<number> {
+  if (rateSettingCache && now - rateSettingCache.at < RATE_SETTING_CACHE_MS) return rateSettingCache.value;
+  try {
+    const setting = await settingsService.getSetting(CHAT_BRANCHING_MAX_PER_HOUR_SETTING);
+    rateSettingCache = { value: parseBranchRateLimit(setting?.settingValue), at: now };
+  } catch (error) {
+    console.error('ChatBranching: failed to read the rate-limit setting; using the last known value:', error);
+    rateSettingCache = { value: rateSettingCache?.value ?? DEFAULT_MAX_BRANCHES_PER_HOUR, at: now };
+  }
+  return rateSettingCache.value;
 }
 
 function branchDeps(): BranchDeps {
@@ -94,6 +121,8 @@ function branchDeps(): BranchDeps {
     setTitle: (sessionId, title) => chatbotDb.updateSessionTitle(sessionId, title),
     appendMessages: (sessionId, messages) => chatbotDb.addMessagesToSession(sessionId, messages),
     archiveSession: (sessionId) => chatbotDb.archiveSession(sessionId),
+    unarchiveSession: (sessionId) => chatbotDb.unarchiveSession(sessionId),
+    getMaxBranchesPerHour: () => getChatBranchingMaxPerHour(),
     adminToolNames: ADMIN_SKILL_TOOL_NAMES,
     maxSessionMessages: MAX_MESSAGE_SIZE_PER_SESSION,
     now: () => Date.now(),

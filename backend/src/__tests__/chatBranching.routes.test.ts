@@ -71,6 +71,8 @@ jest.mock('../controllers/release', () => ({ getReleases: jest.fn() }));
 jest.mock('../controllers/docsController', () => ({ getUserReleaseNotes: jest.fn() }));
 
 import agentModeRoutes from '../routes/agentMode';
+import { __resetBranchRateLimitCacheForTests } from '../controllers/chatBranchController';
+import { __resetBranchIdempotencyForTests } from '../services/agentMode/chatBranching';
 
 const SECRET = 'route-test-secret';
 const bearer = (userId: string, extra: Record<string, unknown> = {}) =>
@@ -88,8 +90,10 @@ beforeAll(() => { process.env.JWT_SECRET = SECRET; });
 beforeEach(() => {
   mockFake.tables.clear();
   mockClaimed.clear();
+  __resetBranchRateLimitCacheForTests();
+  __resetBranchIdempotencyForTests();
   mockGetSetting.mockReset();
-  mockGetSetting.mockResolvedValue({ settingName: 'chat_branching_enabled', settingValue: 'true' });
+  mockGetSetting.mockImplementation(async (name: string) => (name === 'chat_branching_enabled' ? { settingName: name, settingValue: 'true' } : null));
   mockResolve.mockReset();
   mockResolve.mockImplementation(async ({ requestedModel }: any) => ({ requestedModel, effectiveModel: requestedModel ?? 'gpt-5.5', modelSelection: 'honored' }));
   mockFake.seedSession({
@@ -175,6 +179,12 @@ describe('POST /session/:id/branch', () => {
     expect(item.delegateInfo).toMatchObject({ adminUserId: 'admin-1', adminEmail: 'admin-1@x.test', isDelegated: true });
   });
 
+  it('a NON-delegated admin cannot branch a customer\'s session: 403 and nothing is written', async () => {
+    const out = await request(app).post(URL).set('Authorization', bearer('admin-1')).send({ messageIndex: 2 });
+    expect(out.status).toBe(403);
+    expect(others()).toEqual([]);
+  });
+
   it('the model is resolved for the OWNER as an explicit selection; an unavailable model is 422 with nothing created', async () => {
     const ok = await request(app).post(URL).set('Authorization', bearer('owner')).send({ messageIndex: 2, llmModel: 'claude-opus-4-8' });
     expect(ok.status).toBe(201);
@@ -203,5 +213,46 @@ describe('POST /session/:id/branch', () => {
     expect(out.status).toBe(400);
     expect(out.body.code).toBe('message_index_out_of_range');
     expect(mockClaimed.size).toBe(0);
+  });
+});
+
+describe('per-user cap (AW-Settings chat_branching_max_per_hour)', () => {
+  const setCap = (value: unknown) =>
+    mockGetSetting.mockImplementation(async (name: string) =>
+      name === 'chat_branching_enabled' ? { settingValue: 'true' } : name === 'chat_branching_max_per_hour' ? (value === null ? null : { settingValue: value }) : null);
+  const post = () => request(app).post(URL).set('Authorization', bearer('owner')).send({ messageIndex: 2 });
+
+  it('429 TOO_MANY_BRANCHES with a neutral message once the configured cap is reached', async () => {
+    setCap('2');
+    expect((await post()).status).toBe(201);
+    expect((await post()).status).toBe(201);
+    const out = await post();
+    expect(out.status).toBe(429);
+    expect(out.body.code).toBe('TOO_MANY_BRANCHES');
+    expect(out.body.message).toMatch(/try again/i);
+    expect(others()).toHaveLength(2);
+    expect(mockClaimed.size).toBe(0);
+  });
+
+  it('"0" is unlimited; an absent row defaults to 30; garbage defaults to 30', async () => {
+    setCap('0');
+    for (let i = 0; i < 4; i++) expect((await post()).status).toBe(201);
+    __resetBranchRateLimitCacheForTests();
+    __resetBranchIdempotencyForTests();
+    setCap('banana');
+    for (let i = 0; i < 30; i++) expect((await post()).status).toBe(201);
+    expect((await post()).status).toBe(429);
+  }, 30000);
+
+  it('the setting is cached; an unreadable row serves the last known value', async () => {
+    setCap('1');
+    expect((await post()).status).toBe(201);
+    mockGetSetting.mockImplementation(async (name: string) => {
+      if (name === 'chat_branching_enabled') return { settingValue: 'true' };
+      throw new Error('settings down');
+    });
+    expect((await post()).status).toBe(429);
+    const reads = mockGetSetting.mock.calls.filter((c) => c[0] === 'chat_branching_max_per_hour').length;
+    expect(reads).toBe(1); // second request served from the ~60s cache
   });
 });

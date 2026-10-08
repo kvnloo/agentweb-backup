@@ -2669,6 +2669,32 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * ENG-112: inverse of archiveSession. `archived = false` is the ordinary "live" value (every list
+   * filters `!session.archived`, and a few filters spell it `archived = :false`). Used only by chat
+   * branching, which creates its session hidden and reveals it once the copy is verified.
+   */
+  async unarchiveSession(sessionId: string): Promise<void> {
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression: "SET archived = :archived, adminListPartition = :adminListPartition",
+      ExpressionAttributeValues: {
+        ":archived": false,
+        ":adminListPartition": "all",
+      },
+    };
+
+    try {
+      await dynamodb.update(params).promise();
+    } catch (error) {
+      console.error("Error unarchiving chat session:", error);
+      throw error;
+    }
+  }
+
   async deleteSession(sessionId: string): Promise<void> {
     const params = {
       TableName: this.tableName,

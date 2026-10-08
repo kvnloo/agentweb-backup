@@ -2608,8 +2608,8 @@ function evaluateScheduleResponse(
 // ENG-2163: thin wrapper over the pure, unit-tested util (src/utils/adminOnlyMessageFilter).
 // The util takes the admin-tool name set as a param so it stays dependency-free; the controller
 // supplies the real ADMIN_SKILL_TOOL_NAMES here. Default viewerIsAdmin=false fails CLOSED.
-const filterMessagesForClient = (messages: any[], opts: { viewerIsAdmin?: boolean } = {}) =>
-  filterMessagesForClientPure(messages, { viewerIsAdmin: opts.viewerIsAdmin, adminToolNames: ADMIN_SKILL_TOOL_NAMES });
+const filterMessagesForClient = (messages: any[], opts: { viewerIsAdmin?: boolean; omitBranchOrigin?: boolean } = {}) =>
+  filterMessagesForClientPure(messages, { viewerIsAdmin: opts.viewerIsAdmin, adminToolNames: ADMIN_SKILL_TOOL_NAMES, omitBranchOrigin: opts.omitBranchOrigin });
 
 // Helper function to check if this is the last run of the day for an hourly schedule
 function isLastRunOfDayForHourlySchedule(currentTime: Date, nextRunTime: Date): boolean {
@@ -11045,7 +11045,8 @@ export const agentModeController = {
         session: {
           sessionId: session.sessionId,
           title: session.title,
-          messages: filterMessagesForClient(session.messages),
+          // ENG-112: a share viewer is not the owner: no branch provenance (source session id/title).
+          messages: filterMessagesForClient(session.messages, { omitBranchOrigin: true }),
           createdAt: session.createdAt,
           updatedAt: session.updatedAt,
           shareMetadata: session.shareMetadata,
@@ -14721,7 +14722,7 @@ export const agentModeController = {
       res.json({
         sessionId: session.sessionId,
         title: session.title,
-        messages: filterMessagesForClient(session.messages),
+        messages: filterMessagesForClient(session.messages, { omitBranchOrigin: true }),
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
         workPlan: session.workPlan,

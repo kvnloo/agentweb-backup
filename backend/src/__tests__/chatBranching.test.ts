@@ -36,6 +36,7 @@ import {
   __resetBranchIdempotencyForTests,
 } from '../services/agentMode/chatBranching';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
+import { hasUnresolvedMediaDeferral } from '../utils/timeoutContinuation';
 
 const OWNER = 'user-owner';
 const SRC = 'src-session-1';
@@ -46,6 +47,7 @@ const ALLOWED_SESSION_KEYS = new Set([
   'sessionId', 'userId', 'title', 'createdAt', 'updatedAt', 'adminListPartition', 'portalType',
   'pageIdentifier', 'selectedStartupId', 'sessionType', 'delegateInfo', 'associatedSkills',
   'llmModel', 'llmUsagePolicyDecision', 'messageCount', 'messages',
+  'archived', // false once verified: the branch is created hidden and revealed (never carried from the source)
 ]);
 
 // Every session-level field the source carries that must NOT reach a branch.
@@ -176,6 +178,9 @@ function makeDeps(over: Partial<BranchDeps> = {}): BranchDeps {
     setTitle: (id, title) => chatbotDb.updateSessionTitle(id, title),
     appendMessages: (id, messages) => chatbotDb.addMessagesToSession(id, messages),
     archiveSession: (id) => chatbotDb.archiveSession(id),
+    unarchiveSession: (id) => chatbotDb.unarchiveSession(id),
+    getMaxBranchesPerHour: async () => 30,
+    sleep: async () => undefined,
     adminToolNames: ADMIN_TOOLS,
     maxSessionMessages: MAX_MESSAGE_SIZE_PER_SESSION,
     now: () => Date.parse('2026-10-08T12:00:00.000Z'),
@@ -249,11 +254,12 @@ describe('authorisation and eligibility', () => {
     expect(events).toEqual([]);
   });
 
-  it('an admin may branch another user\'s session; the branch stays owned by the source owner', async () => {
+  it('a non-delegated admin may NOT branch a customer\'s session (403, nothing written into the customer\'s account)', async () => {
     seedSource();
     const out = await run({ messageIndex: 4 }, { user: { userId: 'admin-1', isAdmin: true }, viewerIsAdmin: true });
-    expect(out.status).toBe(201);
-    expect(mockFake.session((out.body as any).sessionId)!.userId).toBe(OWNER);
+    expect(out.status).toBe(403);
+    expect(newSessionIds()).toEqual([]);
+    expect(events).toEqual([]);
   });
 
   it.each([
@@ -428,6 +434,20 @@ describe('the copy', () => {
 });
 
 // ---------------------------------------------------------------------------
+describe('branch titles', () => {
+  it('does not stack the suffix when branching a branch', async () => {
+    seedSource({ title: 'My campaign (branch)' });
+    const out = await run({ messageIndex: 4 });
+    expect((out.body as any).title).toBe('My campaign (branch)');
+    expect(mockFake.session((out.body as any).sessionId)!.title).toBe('My campaign (branch)');
+  });
+  it('only a TRAILING suffix is stripped', async () => {
+    seedSource({ title: '(branch) notes' });
+    const out = await run({ messageIndex: 4 });
+    expect((out.body as any).title).toBe('(branch) notes (branch)');
+  });
+});
+
 describe('session field handling (allowlist)', () => {
   it('the new session item carries ONLY allowlisted keys: no forbidden source field leaks', async () => {
     seedSource();
@@ -490,7 +510,7 @@ describe('session field handling (allowlist)', () => {
     seedSource();
     let seen: any;
     const deps = makeDeps({ resolveModel: async (i) => { seen = i; return { ok: true, model: i.requestedModel!, policy: undefined }; } });
-    await run({ messageIndex: 4, llmModel: ' claude-opus-4-8 ' }, { user: { userId: 'admin-1', isAdmin: true }, viewerIsAdmin: true }, deps);
+    await run({ messageIndex: 4, llmModel: ' claude-opus-4-8 ' }, { viewerIsAdmin: true }, deps);
     expect(seen).toMatchObject({ userId: OWNER, requestedModel: 'claude-opus-4-8', explicit: true });
   });
 
@@ -693,10 +713,10 @@ describe('idempotency', () => {
     const releaseIdempotency = jest.fn(async () => undefined);
     const base = { claimIdempotency: async () => ({ claimed: true as const }), recordIdempotencySessionId, releaseIdempotency };
     const ok = await run({ messageIndex: 8, idempotencyKey: 'k' }, {}, makeDeps(base));
-    expect(recordIdempotencySessionId).toHaveBeenCalledWith(OWNER, `branch|${SRC}|k`, (ok.body as any).sessionId);
+    expect(recordIdempotencySessionId).toHaveBeenCalledWith(OWNER, `branch|${SRC}|8||k`, (ok.body as any).sessionId);
     expect(releaseIdempotency).not.toHaveBeenCalled();
     await run({ messageIndex: 8, idempotencyKey: 'k2' }, {}, makeDeps({ ...base, appendMessages: async () => { throw new Error('x'); } }));
-    expect(releaseIdempotency).toHaveBeenCalledWith(OWNER, `branch|${SRC}|k2`);
+    expect(releaseIdempotency).toHaveBeenCalledWith(OWNER, `branch|${SRC}|8||k2`);
   });
 });
 
@@ -850,4 +870,267 @@ describe('size limits', () => {
     expect(out.status).toBe(201);
     expect(mockFake.rows((out.body as any).sessionId)).toHaveLength(5);
   }, 60000);
+});
+
+// ---------------------------------------------------------------------------
+// Review follow-ups
+// ---------------------------------------------------------------------------
+const RECENT = '2026-10-08T11:50:00.000Z'; // 10 minutes before makeDeps().now()
+const NOW_MS = Date.parse('2026-10-08T12:00:00.000Z');
+const recentMsg = (m: Partial<ChatMessage> & Pick<ChatMessage, 'role' | 'content'>): ChatMessage =>
+  ({ timestamp: RECENT, ...m, metadata: { timestamp: RECENT, ...(m.metadata ?? {}) } }) as ChatMessage;
+
+describe('a branch never inherits a continuation trigger (getSession would bill an auto media continuation)', () => {
+  const sys = () => msg({ role: 'system', content: 'SYS' });
+  const variants: Array<[string, () => ChatMessage[], number]> = [
+    ['assistant tail flagged mediaBudgetDeferred', () => [sys(), recentMsg({ role: 'user', content: 'make 4 images' }), recentMsg({ role: 'assistant', content: 'Two done, rest queued', metadata: { mediaBudgetDeferred: true } as any })], 2],
+    ['tool tail flagged mediaBudgetDeferred', () => [sys(), recentMsg({ role: 'user', content: 'make 4 images' }), recentMsg({ role: 'assistant', content: 'Working' }), recentMsg({ role: 'tool', content: '{"deferred":true}', name: 'generate_image', tool_call_id: 'c', metadata: { mediaBudgetDeferred: true } as any })], 2],
+    ['assistant toolCalls ledger with a deferred media call', () => [sys(), recentMsg({ role: 'user', content: 'make 4 images' }), recentMsg({ role: 'assistant', content: 'Queued', metadata: { toolCalls: [{ id: 'c', name: 'generate_image', arguments: {}, result: { deferred: true, reason: 'media_generation_time_budget' } }] } as any })], 2],
+  ];
+
+  it.each(variants)('%s', async (_name, build, idx) => {
+    const rows = build();
+    seedSource({}, rows);
+    // sanity: the SOURCE would trigger the backstop, so the test is meaningful
+    expect(hasUnresolvedMediaDeferral(rows as any, NOW_MS - 3600_000)).toBe(true);
+    const out = await run({ messageIndex: idx });
+    expect(out.status).toBe(201);
+    const branch = await chatbotDb.getChatSession((out.body as any).sessionId, true);
+    expect(hasUnresolvedMediaDeferral(branch!.messages as any, NOW_MS - 3600_000)).toBe(false);
+    expect(hasUnresolvedMediaDeferral(branch!.messages as any)).toBe(false);
+    for (const m of branch!.messages!) expect((m.metadata as any)?.mediaBudgetDeferred).toBeUndefined();
+    expect(branch!.messages!.at(-1)!.content).toBe(rows.at(-1)!.content); // the visible text still travels
+  });
+});
+
+describe('a source target with no preceding user message', () => {
+  it('is refused with 400 and nothing is created', async () => {
+    seedSource({}, [msg({ role: 'system', content: 'SYS' }), msg({ role: 'assistant', content: 'Welcome!' }), msg({ role: 'user', content: 'hi' }), msg({ role: 'assistant', content: 'hello' })]);
+    const out = await run({ messageIndex: 1 });
+    expect(out.status).toBe(400);
+    expect((out.body as any).code).toBe('no_user_message');
+    expect(newSessionIds()).toEqual([]);
+    expect(claimed.size).toBe(0);
+  });
+});
+
+describe('idempotency scope covers what the request asked for', () => {
+  it('the same key with a different messageIndex is a different branch, not the first one', async () => {
+    seedSource();
+    const deps = makeDeps();
+    const a = await run({ messageIndex: 4, idempotencyKey: 'k' }, {}, deps);
+    const b = await run({ messageIndex: 8, idempotencyKey: 'k' }, {}, deps);
+    expect(b.status).toBe(201);
+    expect((b.body as any).sessionId).not.toBe((a.body as any).sessionId);
+    expect(mockFake.rows((b.body as any).sessionId)).toHaveLength(9);
+  });
+  it('the same key with a different llmModel is a different branch', async () => {
+    seedSource();
+    const deps = makeDeps();
+    const a = await run({ messageIndex: 8, idempotencyKey: 'k' }, {}, deps);
+    const b = await run({ messageIndex: 8, idempotencyKey: 'k', llmModel: 'claude-opus-4-8' }, {}, deps);
+    expect(b.status).toBe(201);
+    expect((b.body as any).sessionId).not.toBe((a.body as any).sessionId);
+    expect(mockFake.session((b.body as any).sessionId)!.llmModel).toBe('claude-opus-4-8');
+  });
+  it('the same key with the same index and model still replays', async () => {
+    seedSource();
+    const deps = makeDeps();
+    await run({ messageIndex: 8, idempotencyKey: 'k', llmModel: 'm1' }, {}, deps);
+    const again = await run({ messageIndex: 8, idempotencyKey: 'k', llmModel: 'm1' }, {}, deps);
+    expect(again.status).toBe(200);
+  });
+  it('the run-store lane is scoped the same way', async () => {
+    seedSource();
+    const scopes: string[] = [];
+    const deps = makeDeps({ claimIdempotency: async (_u, scope) => { scopes.push(scope); return { claimed: true }; }, recordIdempotencySessionId: async () => undefined, releaseIdempotency: async () => undefined });
+    await run({ messageIndex: 8, idempotencyKey: 'k', llmModel: 'm1' }, {}, deps);
+    expect(scopes).toHaveLength(1);
+    expect(scopes[0]).toContain('|8|');
+    expect(scopes[0]).toContain('m1');
+  });
+});
+
+describe('the branch is hidden until it is verified', () => {
+  it('is archived from creation until the copy is verified, then un-archived (visible only when whole)', async () => {
+    seedSource();
+    let archivedDuringAppend: unknown = 'unset';
+    const deps = makeDeps({
+      appendMessages: async (id, m) => {
+        archivedDuringAppend = mockFake.session(id)!.archived;
+        return chatbotDb.addMessagesToSession(id, m);
+      },
+    });
+    const out = await run({ messageIndex: 8 }, {}, deps);
+    expect(out.status).toBe(201);
+    expect(archivedDuringAppend).toBe(true);
+    expect(mockFake.session((out.body as any).sessionId)!.archived).toBe(false);
+  });
+
+  it('when the copy fails AND archiving keeps failing, it retries 3x, logs loudly with the session id, and flags the response', async () => {
+    seedSource();
+    const log = jest.fn();
+    const archive = jest.fn(async () => { throw new Error('ddb throttled'); });
+    const deps = makeDeps({ archiveSession: archive, appendMessages: async () => { throw new Error('ddb down'); }, log });
+    const out = await run({ messageIndex: 8 }, {}, deps);
+    expect(out.status).toBe(500);
+    expect(archive).toHaveBeenCalledTimes(3);
+    const orphan = newSessionIds()[0];
+    expect((out.body as any).cleanupFailed).toBe(true);
+    expect((out.body as any).orphanSessionId).toBe(orphan);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('ORPHAN'), expect.objectContaining({ sessionId: orphan }));
+    expect(mockFake.rows(orphan)).toHaveLength(0); // the copy never started: nothing half-built to show
+  });
+
+  it('a transient archive failure is retried and the branch ends up hidden', async () => {
+    seedSource();
+    let n = 0;
+    const deps = makeDeps({
+      archiveSession: async (id) => { if (++n < 3) throw new Error('blip'); return chatbotDb.archiveSession(id); },
+      appendMessages: async () => { throw new Error('ddb down'); },
+    });
+    const out = await run({ messageIndex: 8 }, {}, deps);
+    expect(out.status).toBe(500);
+    expect((out.body as any).cleanupFailed).toBeUndefined();
+    expect(mockFake.session(newSessionIds()[0])!.archived).toBe(true);
+  });
+
+  it('a failed copy stays archived (hidden) even if the final archive attempt would fail', async () => {
+    seedSource();
+    let calls = 0;
+    const deps = makeDeps({
+      archiveSession: async (id) => { if (++calls > 1) throw new Error('late failure'); return chatbotDb.archiveSession(id); },
+      appendMessages: async () => { throw new Error('ddb down'); },
+    });
+    const out = await run({ messageIndex: 8 }, {}, deps);
+    expect(out.status).toBe(500);
+    expect(mockFake.session(newSessionIds()[0])!.archived).toBe(true);
+  });
+
+  it('if un-archiving keeps failing the branch stays hidden and the response says so', async () => {
+    seedSource();
+    const deps = makeDeps({ unarchiveSession: async () => { throw new Error('nope'); } });
+    const out = await run({ messageIndex: 8 }, {}, deps);
+    expect(out.status).toBe(500);
+    expect(mockFake.session(newSessionIds()[0])!.archived).toBe(true);
+  });
+});
+
+describe('visible index -> raw index mapping on a GAPPED store', () => {
+  // positions 0..10 of sourceRows(), stored at raw indexes that are NOT the positions
+  const RAW = [0, 4, 5, 6, 12, 13, 14, 15, 20, 21, 22];
+  const seedGapped = () => {
+    seedSource({ messageCount: RAW.length });
+    mockFake.tables.get('AW-ChatMessages')?.forEach((_v, k) => { if (k.startsWith(`${SRC}\x00`)) mockFake.tables.get('AW-ChatMessages')!.delete(k); });
+    mockFake.seedMessagesAt(SRC, sourceRows(), RAW);
+  };
+
+  it('raw 20 is the "Budget answer" reply: copies positions 0..8 and records the RAW index in provenance', async () => {
+    seedGapped();
+    const out = await run({ messageIndex: 20 });
+    expect(out.status).toBe(201);
+    const rows = mockFake.rows((out.body as any).sessionId);
+    expect(rows.map((r) => r.messageIndex)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(rows.at(-1)!.message.content).toBe('Budget answer');
+    expect(rows[0].message.metadata.branchOrigin.sourceMessageIndex).toBe(20);
+  });
+
+  it('a raw index that does not exist (a position number) is rejected, and a gap index is rejected', async () => {
+    seedGapped();
+    expect((await run({ messageIndex: 8 })).status).toBe(400); // position 8 is raw 20; raw 8 is a gap
+    expect((await run({ messageIndex: 3 })).status).toBe(400);
+    expect(newSessionIds()).toEqual([]);
+  });
+
+  it('hidden tool rows named by their raw index are refused as not visible', async () => {
+    seedGapped();
+    const out = await run({ messageIndex: 6 }); // raw 6 = the tool row at position 3
+    expect((out.body as any).code).toBe('message_not_visible');
+  });
+});
+
+describe('per-user branching rate cap', () => {
+  const at = (t: { v: number }) => ({ now: () => t.v });
+  it('429 TOO_MANY_BRANCHES after the cap, with a neutral message; the source lock is released and nothing is created', async () => {
+    seedSource();
+    const deps = makeDeps({ getMaxBranchesPerHour: async () => 2 });
+    expect((await run({ messageIndex: 4 }, {}, deps)).status).toBe(201);
+    expect((await run({ messageIndex: 4 }, {}, deps)).status).toBe(201);
+    const before = newSessionIds().length;
+    const out = await run({ messageIndex: 4 }, {}, deps);
+    expect(out.status).toBe(429);
+    expect((out.body as any).code).toBe('TOO_MANY_BRANCHES');
+    expect(typeof (out.body as any).message).toBe('string');
+    expect((out.body as any).message).not.toMatch(/limit of|2 per|per hour|rate/i);
+    expect(newSessionIds()).toHaveLength(before);
+    expect(claimed.size).toBe(0);
+  });
+
+  it('the window slides: allowed again after an hour', async () => {
+    seedSource();
+    const t = { v: NOW_MS };
+    const deps = makeDeps({ getMaxBranchesPerHour: async () => 1, ...at(t) });
+    expect((await run({ messageIndex: 4 }, {}, deps)).status).toBe(201);
+    t.v += 30 * 60_000;
+    expect((await run({ messageIndex: 4 }, {}, deps)).status).toBe(429);
+    t.v += 31 * 60_000;
+    expect((await run({ messageIndex: 4 }, {}, deps)).status).toBe(201);
+  });
+
+  it('0 means unlimited; absent/invalid values default to 30 (via parseBranchRateLimit)', async () => {
+    const { parseBranchRateLimit } = await import('../services/agentMode/chatBranching');
+    expect(parseBranchRateLimit(undefined)).toBe(30);
+    expect(parseBranchRateLimit(null)).toBe(30);
+    expect(parseBranchRateLimit('abc')).toBe(30);
+    expect(parseBranchRateLimit('-3')).toBe(30);
+    expect(parseBranchRateLimit('2.5')).toBe(30);
+    expect(parseBranchRateLimit('0')).toBe(0);
+    expect(parseBranchRateLimit(' 7 ')).toBe(7);
+    seedSource();
+    const deps = makeDeps({ getMaxBranchesPerHour: async () => 0 });
+    for (let i = 0; i < 5; i++) expect((await run({ messageIndex: 4 }, {}, deps)).status).toBe(201);
+  });
+
+  it('is per user', async () => {
+    seedSource();
+    seedSource({ userId: 'other' }, sourceRows(), 'src-other');
+    const deps = makeDeps({ getMaxBranchesPerHour: async () => 1 });
+    expect((await run({ messageIndex: 4 }, {}, deps)).status).toBe(201);
+    const o = await branchChatSession(deps, { user: { userId: 'other', isAdmin: false }, viewerIsAdmin: false, sessionId: 'src-other', body: { messageIndex: 4 } });
+    expect(o.status).toBe(201);
+  });
+
+  it('is NOT consumed by requests that fail validation, are refused, or create nothing', async () => {
+    seedSource();
+    const deps = makeDeps({ getMaxBranchesPerHour: async () => 1 });
+    expect((await run({ messageIndex: 'x' }, {}, deps)).status).toBe(400);   // body
+    expect((await run({ messageIndex: 999 }, {}, deps)).status).toBe(400);   // out of range (took the lock, created nothing)
+    expect((await run({ messageIndex: 3 }, {}, deps)).status).toBe(400);     // hidden row
+    claimed.add(SRC);
+    expect((await run({ messageIndex: 4 }, {}, deps)).status).toBe(409);     // busy (never took the lock)
+    claimed.delete(SRC);
+    expect((await run({ messageIndex: 4 }, {}, makeDeps({ getMaxBranchesPerHour: async () => 1, createSession: async () => { throw new Error('boom'); } }))).status).toBe(500);
+    expect((await run({ messageIndex: 4 }, {}, deps)).status).toBe(201);     // still has its one
+    expect((await run({ messageIndex: 4 }, {}, deps)).status).toBe(429);
+  });
+
+  it('IS consumed when a session was created but the copy failed', async () => {
+    seedSource();
+    const deps = makeDeps({ getMaxBranchesPerHour: async () => 1, appendMessages: async () => { throw new Error('ddb'); } });
+    expect((await run({ messageIndex: 4 }, {}, deps)).status).toBe(500);
+    expect((await run({ messageIndex: 4 }, {}, makeDeps({ getMaxBranchesPerHour: async () => 1 }))).status).toBe(429);
+  });
+
+  it('an idempotent replay is not counted', async () => {
+    seedSource();
+    const deps = makeDeps({ getMaxBranchesPerHour: async () => 1 });
+    expect((await run({ messageIndex: 4, idempotencyKey: 'k' }, {}, deps)).status).toBe(201);
+    expect((await run({ messageIndex: 4, idempotencyKey: 'k' }, {}, deps)).status).toBe(200);
+  });
+
+  it('a failing settings read falls back to the default instead of failing the request', async () => {
+    seedSource();
+    const deps = makeDeps({ getMaxBranchesPerHour: async () => { throw new Error('settings down'); } });
+    expect((await run({ messageIndex: 4 }, {}, deps)).status).toBe(201);
+  });
 });

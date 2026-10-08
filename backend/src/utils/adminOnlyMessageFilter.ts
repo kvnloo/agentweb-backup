@@ -30,6 +30,11 @@ export interface AdminRedactionOptions {
   viewerIsAdmin?: boolean;
   /** The set/list of admin-only tool names. Passed in so this stays a pure, dependency-free util. */
   adminToolNames?: Iterable<string>;
+  /**
+   * ENG-112: drop `metadata.branchOrigin` (chat-branching provenance: the source session id/title) from the
+   * returned rows. Set for viewers who are not the session owner (share / conversable links). Default false.
+   */
+  omitBranchOrigin?: boolean;
 }
 
 // Back-compat alias for the original name.
@@ -85,6 +90,12 @@ export function filterMessagesForClient(messages: any[], opts: AdminRedactionOpt
   const adminToolNameSet = new Set<string>(opts.adminToolNames ?? []);
   const adminTainted = computeAdminTaintedTurns(messages, viewerIsAdmin, adminToolNameSet);
 
+  const stripOrigin = (message: any) => {
+    if (!opts.omitBranchOrigin || !message?.metadata || !('branchOrigin' in message.metadata)) return message;
+    const { branchOrigin: _origin, ...metadata } = message.metadata;
+    return { ...message, metadata };
+  };
+
   return messages.filter((message, i) => {
     // Remove tool messages (all viewers).
     if (message.role === 'tool') return false;
@@ -110,7 +121,7 @@ export function filterMessagesForClient(messages: any[], opts: AdminRedactionOpt
     }
 
     return true;
-  });
+  }).map(stripOrigin);
 }
 
 /**
