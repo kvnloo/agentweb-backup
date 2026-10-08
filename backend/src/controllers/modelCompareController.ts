@@ -19,6 +19,7 @@ import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
 import { getModelPrice } from '../utils/llmPricing';
 import { resolveOpenRouterUpstreamModelId } from '../utils/openRouterGatewayContract';
 import { LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
+import { modelCompareEntitlement } from '../services/agentMode/modelCompareEntitlement';
 import { isCronEnabled } from '../utils/instanceState';
 import { resolveRunFunding, withRunFunding, type RunFunding } from '../services/funding/runFunding';
 import {
@@ -99,6 +100,7 @@ function compareDeps(): CompareDeps {
   return {
     isAcceptingWork: isCronEnabled,
     isFeatureEnabled: isModelCompareEnabled,
+    isEntitled: (user) => modelCompareEntitlement.isEntitled(user),
     getSession,
     checkUsage: (userId) => checkTokenUsage(userId),
     buildUsageBlock: (month) => buildUsageBlockCopy({ month }),
@@ -131,6 +133,7 @@ function selectDeps(): SelectDeps {
   return {
     isAcceptingWork: isCronEnabled,
     isFeatureEnabled: isModelCompareEnabled,
+    isEntitled: (user) => modelCompareEntitlement.isEntitled(user),
     getSession,
     tryClaim: tryClaimSessionGeneration,
     release: releaseSessionGeneration,

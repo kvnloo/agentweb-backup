@@ -2216,8 +2216,6 @@ export class AgentModeService {
 
   private openrouter_client: OpenAI | null = null;
   private openrouter_client_promise: Promise<OpenAI> | null = null;
-  private vertex_client: any | null = null;
-  private vertex_client_promise: Promise<any> | null = null;
 
   // OpenRouter is an OpenAI-compatible endpoint. HTTP-Referer/X-Title identify
   // the app for OpenRouter's own analytics
@@ -2271,47 +2269,6 @@ export class AgentModeService {
     return this.openrouter_client_promise;
   }
 
-  /** Convert OpenAI-format content into Anthropic-native content blocks. */
-  private static convertContentToAnthropicBlocks(content: any): any[] {
-    if (content === null || content === undefined) return [{ type: 'text', text: '' }];
-    if (typeof content === 'string') return [{ type: 'text', text: content }];
-    if (!Array.isArray(content)) return [{ type: 'text', text: String(content) }];
-
-    const validMediaTypes = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
-    const blocks: any[] = [];
-    for (const item of content) {
-      if (typeof item === 'string') {
-        blocks.push({ type: 'text', text: item });
-      } else if (!item || typeof item !== 'object') {
-        blocks.push({ type: 'text', text: String(item ?? '') });
-      } else if (item.type === 'text') {
-        blocks.push({ type: 'text', text: item.text || '' });
-      } else if (item.type === 'image_url') {
-        const url = item.image_url?.url || '';
-        if (url.startsWith('data:')) {
-          const match = url.match(/^data:(image\/[\w+.-]+)(?:;[^;]*)*;base64,(.+)$/s);
-          if (match) {
-            let mediaType = match[1].toLowerCase();
-            if (mediaType === 'image/jpg') mediaType = 'image/jpeg';
-            if (!validMediaTypes.has(mediaType)) mediaType = 'image/jpeg';
-            blocks.push({
-              type: 'image',
-              source: { type: 'base64', media_type: mediaType, data: match[2] },
-            });
-          } else {
-            console.warn(`AgentMode: Could not parse data URI for Anthropic image block, url prefix="${url.substring(0, 60)}"`);
-          }
-        } else if (url) {
-          blocks.push({ type: 'image', source: { type: 'url', url } });
-        }
-      } else if (item.type === 'image' || item.type === 'tool_result' || item.type === 'tool_use' || item.type === 'document') {
-        blocks.push(item);
-      } else {
-        blocks.push({ type: 'text', text: JSON.stringify(item) });
-      }
-    }
-    return blocks.length > 0 ? blocks : [{ type: 'text', text: '.' }];
-  }
 
   // ENG-1670: a scheduled run's own tool-calling loop can fire several Gemini
   // calls back-to-back within one turn (prod-verified: 4 calls in ~22s on the

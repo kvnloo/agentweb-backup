@@ -1,3 +1,112 @@
+## ENG-903: Validate scheduled-chat model pins at write time (2026-10-08)
+
+`createScheduledChat`, `updateScheduledChat` and `createScheduleFromTemplate` (per-use override) stored `llmModel` / `llmBackupModel` with no served/selectable check, so a bad pin only surfaced as a failed run plus an oncall alert. They now call `validateScheduleModelPin` (agentModeController.ts), which trims, resolves aliases via `agentModeService.resolveGenerationModel`, and requires `isModelSelectableBy(canonical, isAdmin)`; failure is HTTP 422 with the shared `buildModelUnavailableBody` (`code: 'model_unavailable'`, reason `not_served` | `not_selectable`). Non-strings are 422. Empty/absent = no pin.
+
+Compat rule: on update, a model/backup is validated only when it is being SET to a different non-empty value. Absent, unchanged, or `''` (clear) are never rejected, so old schedules whose model was later retired can still have other fields edited. An unchanged stored backup that is no longer valid is kept as stored.
+
+Not changed (run-time behaviour untouched): MCP/Emma schedule tools (they call these HTTP handlers, so they are covered transitively); template create/update (user and admin) and a template's own stored `llmModel`; admin routes; work-plan `defaultModel` (already filtered by `getSupportedModels` at apply); internal `scheduleDb.updateSchedule` callers (llmModelChangeService, scripts, linkedIn health).
+
+Portal: `useAgentModeSchedules.ts` save handler discards the server `error` text and shows a generic "Failed to save schedule" toast, so the 422 is not surfaced specifically yet (portal follow-up).
+
+## ENG-55: Compare models as a plan-gated add-on (2026-10-08)
+
+Compare models can now be sold as a plan add-on, enforced on the server. It is OFF until an
+AW-Settings switch is flipped, so deploying this changes nothing.
+
+**Pieces**
+- Subscription feature id `model_compare` ("Compare models") registered in
+  `services/subscriptionService.ts`. The partner-portal Subscription Types editor builds its
+  checklist from `GET /api/admin/subscription-features`, so it needs no code change.
+- AW-Settings `model_compare_requires_entitlement`. Only the string `true` (case/space
+  insensitive) enforces; absent or anything else = not required (today's behaviour).
+- `services/agentMode/modelCompareEntitlement.ts`: one function used by `/compare`,
+  `/compare/select` (via the existing deps seam, a new optional `isEntitled` dep checked right
+  after the `model_compare_enabled` kill switch, before any session read, usage check, lock,
+  model call or write) and by `GET /api/auth/me` (`modelCompareEntitled`, additive, not stored).
+- Entitled = requester is admin, OR `isSubscriptionFeatureEnabled(user, 'model_compare') === true`
+  (the effective, org-owner-aware resolver). Unreadable tier or a thrown lookup = denied.
+- Denial: HTTP 403 `{ error: 'Compare models is not available on your current plan.', code: 'model_compare_not_entitled' }`.
+- The switch is cached ~60s; a failed read keeps the last-known value. A failed read with no
+  known value (cold start during a settings outage) fails CLOSED: Compare is treated as required
+  (admins and tiers with the feature still pass; an unreadable tier is denied), and the read is
+  retried after ~5s. A successful read of an absent/blank/non-`true` row is "not required", so a
+  healthy deploy changes nothing. `GET /api/auth/me` uses the same function, so during a settings
+  outage `modelCompareEntitled` may briefly be false and the button hidden for non-entitled users.
+- Delegated sessions: `req.user` is the target customer, so the customer's plan applies.
+
+**ROLLOUT STEPS (owner)**
+1. Deploy backend then portal (either order is safe). After deploy nothing changes: the switch
+   is absent, nobody is gated, and the portal shows the button when the hint is missing or true.
+2. In the admin Subscription Types editor, tick "Compare models" on every tier that should have
+   it and save. NOTE: a saved tier with an explicit feature list that lacks `model_compare`
+   loses Compare as soon as the switch flips. Legacy rows that never saved a feature list keep
+   it (no list = all features), but the editor shows them with every box ticked and saving
+   writes that list explicitly, so review each tier before saving.
+3. Set AW-Settings `model_compare_requires_entitlement` = `true`. Takes effect within ~60s per
+   instance (cache TTL).
+4. Rollback: set the setting to anything other than `true` (or delete it); within ~60s everyone
+   is entitled again. Unticking the feature on a tier only matters while the switch is on.
+   `model_compare_enabled=false` remains the separate global kill switch (503).
+
+**Dialog hardening (portal)**: default suggested models are derived from the supported list at
+runtime (non-legacy, best quality score, one per provider) instead of hard-coded ids that had
+become legacy; the dialog shows a usage-multiplier note and a one-line privacy note.
+
+**Needs owner review**: the three user-facing strings (cost note, privacy note, 403 message).
+
+## ENG-110: Per-user cap on concurrently generating Emma chats (2026-10-08)
+
+- Backend: interactive `/generate` and `/verified-generate` now count a user's
+  concurrently generating sessions (keyed by the session owner's userId) and answer
+  `429 {code:'TOO_MANY_CONCURRENT_RUNS', message, limit}` over the cap. Counter logic
+  lives in `backend/src/services/agentMode/concurrentGenerationCap.ts`.
+- The slot is taken after the session generation claim succeeds and released in the
+  same `finally` as the session lock (success, throw, early return, 409s, disconnect).
+- Excluded (never counted, never blocked): scheduled runs, auto-continuations, Slack,
+  email, approval-inbox and other system `runVerifiedChat` callers. Compare keeps its
+  own separate cap of 2.
+- Limit: AW-Settings `max_concurrent_generations_per_user` (cached ~60s, last-known value
+  on read failure). Absent/invalid => 3; `0` => unlimited. Rollback = set `0`. No flag.
+  Admins are not exempt.
+- Accepted limitation: the counter is in-memory per instance. It resets on restart and
+  Immutable deploys briefly run two instances, so a user may hold up to `limit` slots on
+  each during the overlap (bounded by the deploy window). No data-plane change.
+- Portal (companion PR): live generating/finished indicators for background chats,
+  friendly 409/429 handling, and a few ENG-110 race fixes.
+- Answer/cancel turns (`deckAnswer`, `deckCancel`, `workPlanInputAnswer`) are exempt from the
+  cap's refusal but still counted. In `/generate` these run BEFORE the session claim and cap check
+  and already consumed state (approved writes dispatched, deck cleared), so a 429 afterwards lost
+  the outcome and made a retry 409 APPROVAL_DECK_INVALID. They continue a paused conversation that
+  holds no slot, so they take one via `acquireInteractiveGenerationSlot(..., {bypassLimit:true})`
+  (may briefly exceed the soft cap by the number of such turns). Chosen over moving the cap check
+  earlier because that would need a slot held across the pre-claim awaits and still leave the
+  SESSION_BUSY ordering flaw untouched (out of scope). `questionAnswer` has no side effects any more.
+
+## ENG-1459: C3b transport-remnant audit (2026-08-22)
+
+After C3a routed AgentMode text/tool calls through `callLLM` and the shared gateway, the only
+remaining unreachable Vertex Claude adapter artifacts were `vertex_client`,
+`vertex_client_promise`, and `convertContentToAnthropicBlocks`. They had no callers, and the
+converter's former tests covered only that retired transport. They were deleted with an AST-backed
+regression guard. The direct Gemini SDK site retained in `performDataAnalysis` is the documented
+Gemini code-execution/file-analysis exception, not a text/chat transport. Evidence: guard 21/21,
+all `agentMode*` suites green, and backend typecheck clean. Complexity delta: -171 lines overall.
+
+## ENG-1103: route-level authz tests for orphaned org join-request diagnostic (2026-10-07)
+
+Adds `adminOrgDiagnostics.route.test.ts`: unauthenticated 401, non-admin and delegated 403 with no scan, admin 200 breakdown, generic 500, no mutating verbs. Closes AC4 authorization-denied coverage; no runtime change.
+
+## ENG-2268: Encode approved reads-only Meta Toolkit v1 (2026-10-07)
+
+- Record Harsha's approved D1–D5 decisions in the product boundary, with pricing TBD and tier packaging documented only.
+- Remove external CREATE/UPDATE advertisement and dispatch allowance. All external writes now fail locally with MetaToolkitRefusal; internal Emma handlers are unchanged.
+- Keep launch_* and CUSTOM_AUDIENCE writes excluded. D2's blanket write refusal enforces D4 without scope/persistence changes.
+- Verify negative write cases and allowed reads with scoped manifest/gateway/REST/MCP tests. Production read-only E2E requires an existing account-scoped credential and connected Meta account; no key provisioning is part of this change.
+
+## ENG-976: post_on_account replies on X via in_reply_to_post_id (2026-10-07)
+
+`post_on_connected_account` / MCP `post_on_account` accept optional `in_reply_to_post_id` (X only). It routes through TwitterAdapter.createPost -> postTweet({inReplyToTweetId}) behind the same ENG-827 publish re-check. Omitted means the original-post path is unchanged; other platforms are refused with nothing posted.
+
 ## ENG-903: An explicit model selection runs on that model or not at all (2026-10-07)
 
 Rule: a model the user explicitly chose (the request carries it, or a schedule pin) is either the model that runs, or nothing runs and the caller is told. It is never replaced by the default, never "corrected", and never overwritten in storage. No selection at all still uses the configured default; usage-paused is still the 429; registry legacy aliases (`LEGACY_MODEL_ALIASES`) still map forward; a user-configured backup model is unchanged.

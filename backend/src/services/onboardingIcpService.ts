@@ -29,12 +29,15 @@ import { getGCSPPrivateKey } from "../utils/secretsManager";
 import { getS3ObjectAsString } from "../utils/s3Utils";
 import { taskDb, userDb } from "./db";
 import { Storage } from "@google-cloud/storage";
+import { trackBackgroundRun } from "../utils/trackedBackgroundRun";
 import {
   icpFailedPatch,
   icpReadyPatch,
   icpStartPatch,
   ICPPersona,
+  ICPStatusFields,
   ICP_PERSONA_FIELD_NAMES,
+  ICP_TIMEOUT_MS,
   ensurePersonaIds,
   MAX_ICP_PERSONAS,
   sanitizeICPPersonas,
@@ -811,9 +814,39 @@ async function regenerateCompetitorEntry(
 }
 
 /**
+ * Restate "the `running` record is still the one THIS run claimed" as a
+ * DynamoDB condition (ENG-2308 review follow-up, confirmed by direct
+ * reproduction). The stale-claim escape hatch in `icpStartClaimCondition`
+ * lets a second claim reclaim the axis while the first claimant's
+ * background work is merely slow, not crashed — `icpReadyPatch`'s own
+ * guard only checks `icpStatus === "running"`, with nothing distinguishing
+ * WHICH run's `running` it is. If the reclaimed (original) run finishes
+ * after the reclaiming run has started but before it has finished, its
+ * zombie write still passes that guard and can overwrite — or, if it lands
+ * second, silently drop — the reclaiming run's actual result. Keying the
+ * completion WRITE itself on the `icpStartedAt` this run's own claim
+ * minted closes the gap: a reclaim always mints a fresh timestamp, so a
+ * zombie's condition no longer matches once it's been superseded.
+ */
+function icpOwnershipCondition(expectedStartedAt: string) {
+  return {
+    expression: "#icpStartedAt = :icpOwnerStartedAt",
+    names: { "#icpStartedAt": "icpStartedAt" },
+    values: { ":icpOwnerStartedAt": expectedStartedAt },
+  };
+}
+
+/**
  * Fire-and-forget orchestrator. Called from `/icp/start` AFTER the status
  * has been flipped to `running`. Resolves immediately — the LLM work runs
  * in the background and patches the User record on completion.
+ *
+ * `deps.expectedStartedAt` — the `icpStartedAt` THIS run's own
+ * `claimIcpRun` call minted — is optional only for backward compatibility
+ * with existing direct callers/tests that don't go through a claim; every
+ * real caller (`startIcpDiscoveryForUser`, the orchestrator's `runIcp`)
+ * always has it in hand and must pass it, or completion writes fall back
+ * to the pre-ENG-2308-review posture (status-only, no ownership check).
  *
  * Tests can `await` the returned promise to assert persisted state.
  */
@@ -822,6 +855,7 @@ export async function triggerIcpDiscoveryForUser(
   deps: {
     llm?: { generateJsonRobust: LLMService["generateJsonRobust"] };
     loadStrategicContext?: (userId: string) => Promise<string | null>;
+    expectedStartedAt?: string;
   } = {},
 ): Promise<void> {
   const user = await userDb.getUserById(userId);
@@ -851,7 +885,28 @@ export async function triggerIcpDiscoveryForUser(
       // Stale completion is not an error — drop silently.
       return;
     }
-    await userDb.updateUser(userId, patch as any);
+    if (deps.expectedStartedAt) {
+      try {
+        await userDb.updateUser(userId, patch as any, {
+          condition: icpOwnershipCondition(deps.expectedStartedAt),
+        });
+      } catch (err: any) {
+        if (err?.code === "ConditionalCheckFailedException") {
+          // A reclaim superseded us while we were generating — our result
+          // is stale even though icpStatus still reads "running" (it's the
+          // RECLAIMING run's running, not ours). Drop silently, same as
+          // the icpReadyPatch===null case above.
+          console.warn(
+            "[onboardingIcpService] dropping stale completion — a newer claim owns the axis",
+            { userId },
+          );
+          return;
+        }
+        throw err;
+      }
+    } else {
+      await userDb.updateUser(userId, patch as any);
+    }
 
     // Mirror to marketStrategy.icp[] so the main account (Agent Mode,
     // chatbot, etc.) sees the ICPs the onboarding flow generated. Without
@@ -902,19 +957,38 @@ export async function triggerIcpDiscoveryForUser(
       const delay = CASCADE_TRIGGER_DELAY_MS;
       if (delay > 0) {
         setTimeout(() => {
-          void startCompetitorStrategyForUser(userId);
+          trackBackgroundRun("onboardingCompetitorKickoff", startCompetitorStrategyForUser(userId));
         }, delay);
       } else {
-        void startCompetitorStrategyForUser(userId);
+        trackBackgroundRun("onboardingCompetitorKickoff", startCompetitorStrategyForUser(userId));
       }
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const current = await userDb.getUserById(userId);
-    await userDb.updateUser(
-      userId,
-      icpFailedPatch((current as any) || {}, msg) as any,
-    );
+    const failedPatch = icpFailedPatch((current as any) || {}, msg);
+    if (deps.expectedStartedAt) {
+      try {
+        await userDb.updateUser(userId, failedPatch as any, {
+          condition: icpOwnershipCondition(deps.expectedStartedAt),
+        });
+      } catch (condErr: any) {
+        if (condErr?.code === "ConditionalCheckFailedException") {
+          // Same reasoning as the success path above: a reclaim superseded
+          // THIS run while its LLM call was failing. Reporting OUR failure
+          // here would stomp whatever the reclaiming run has since done —
+          // drop it, the reclaiming run owns the axis's fate now.
+          console.warn(
+            "[onboardingIcpService] dropping stale failure — a newer claim owns the axis",
+            { userId },
+          );
+          return;
+        }
+        throw condErr;
+      }
+    } else {
+      await userDb.updateUser(userId, failedPatch as any);
+    }
     console.error("[onboardingIcpService] generation failed", { userId, err: msg });
     void reportUIError({
       operation: "onboarding:icp:llm-generation",
@@ -930,21 +1004,112 @@ export async function triggerIcpDiscoveryForUser(
 }
 
 /**
+ * Guards the non-running -> `running` transition with a DynamoDB
+ * ConditionExpression (ENG-2308) — a plain read-then-write here lets two
+ * concurrent `/icp/start` calls both observe a non-running status and both
+ * win, launching two fully parallel LLM generations that race to decide
+ * which personas persist. This is not a rare interleaving: `OutreachIcpPick`'s
+ * watchdog (`ICP_AUTO_RETRY_MS` = 8s) re-fires `/icp/start` whenever
+ * generation is still running past that window, which real ICP generation
+ * routinely exceeds. `userDb.updateUser` already supports conditional
+ * writes for exactly this class of race (see designSystemBuild.ts's
+ * `START_CLAIM_CONDITION`, ENG-328); this uses the same primitive to make
+ * the claim atomic instead of trusting a prior read.
+ *
+ * Also allows a fresh claim once the in-flight run has exceeded
+ * `ICP_TIMEOUT_MS` (caught live: without this, a run genuinely stuck in
+ * `running` — background job lost to a deploy/instance recycle/crash —
+ * could never be retried again, since the claim would block every future
+ * `/icp/start` forever. Before this PR the write was unconditional, so a
+ * stuck run was always one retry away from unsticking itself; this clause
+ * keeps that escape hatch while still closing the sub-timeout double-fire
+ * race. The threshold matches `icpSnapshot`'s own `timedOut` flag exactly,
+ * so a claim becomes possible at precisely the moment the FE is told the
+ * run has timed out and offers a retry.
+ *
+ * NOT reusable for `/icp/regenerate-one`, even though that route flips the
+ * same `icpStatus` field: this condition treats `icpStatus` as a one-slot
+ * lock, but regenerate-one's actual concurrency unit is the PERSONA, not
+ * the user. Two different cards regenerating at once is a real, tested,
+ * intentional flow (ENG-255) — a prior version of this comment claimed
+ * regenerate-one had "the exact same race" and reused this condition
+ * there; that broke two-cards-at-once (the second card's claim lost the
+ * race and its regeneration silently never ran) and was reverted after
+ * review caught it before merge. See the comment on `/icp/regenerate-one`
+ * for the full reasoning.
+ */
+function icpStartClaimCondition(now: Date = new Date()) {
+  const staleBefore = new Date(now.getTime() - ICP_TIMEOUT_MS).toISOString();
+  return {
+    expression:
+      "attribute_not_exists(#icpStatus) OR #icpStatus <> :icpRunning OR #icpStartedAt <= :icpStaleBefore",
+    names: { "#icpStatus": "icpStatus", "#icpStartedAt": "icpStartedAt" },
+    values: { ":icpRunning": "running", ":icpStaleBefore": staleBefore },
+  };
+}
+
+/**
+ * Claim the icp axis for a new run: atomically flip `icpStatus` to
+ * `running` (or no-op, returning `null`, if someone else already holds
+ * the claim). Every entry point that wants to run ICP generation must go
+ * through here — both `/icp/start` (via `startIcpDiscoveryForUser`) and
+ * the eager-pipeline orchestrator's `runIcp` (`onboardingOrchestratorWiring.ts`).
+ *
+ * `runIcp` needed this split out (ENG-2308 follow-up, caught live): it
+ * used to call `triggerIcpDiscoveryForUser` directly, with nothing ever
+ * flipping `icpStatus` to `running` first on a pure orchestrator-driven
+ * cascade (one where `/icp/start`'s own route was never separately hit).
+ * `icpReadyPatch` requires `current.icpStatus === 'running'` to persist a
+ * result — without it, `triggerIcpDiscoveryForUser` ran the real LLM call,
+ * then silently dropped the result (returned without writing or
+ * throwing), and the orchestrator recorded the step `ready` with a `null`
+ * output anyway, since nothing threw. `shouldFire`'s hash-match then never
+ * re-fires it. Confirmed live: ICP only ever "worked" in testing because
+ * the test happened to call `/icp/start` manually first, which flipped the
+ * field as an incidental side effect of a completely different call path
+ * — not because the orchestrator's own cascade could make it succeed on
+ * its own.
+ */
+export async function claimIcpRun(
+  userId: string,
+): Promise<ICPStatusFields | null> {
+  const patch = icpStartPatch();
+  try {
+    await userDb.updateUser(userId, patch as any, {
+      condition: icpStartClaimCondition(),
+    });
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") {
+      return null;
+    }
+    throw err;
+  }
+  return patch;
+}
+
+/**
  * Synchronous entry point for routes — flips status to `running` and
- * launches background work. Returns once the start patch has been
- * persisted so the route can return the running snapshot.
+ * launches background work. Returns the persisted start patch once it has
+ * landed so the route can return the running snapshot, or `null` if a
+ * concurrent call already claimed this run (ENG-2308) — callers must NOT
+ * launch a second background generation in that case.
+ *
+ * Checks eager-pipeline status BEFORE claiming (ENG-2308 fix-of-a-fix,
+ * caught live): the orchestrator's `runIcp` claims this SAME axis itself
+ * (via `claimIcpRun`) when it actually fires the step. If this function
+ * also claimed before checking eager status, it would win the claim an
+ * instant before handing off to `reconcileForUser` — and since `runIcp`'s
+ * own claim attempt happens inside that SAME reconcile pass, moments
+ * later, it would always lose to this function's own prior write,
+ * permanently starving the real trigger. Exactly the same shape as the
+ * ad-image pre-claim bug (`startAdImageGenerationForUser`) — this mirrors
+ * that fix: skip claiming entirely on the eager branch, leaving
+ * `claimIcpRun` as the sole claimant there.
  */
 export async function startIcpDiscoveryForUser(
   userId: string,
   deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {},
-): Promise<void> {
-  await userDb.updateUser(userId, icpStartPatch() as any);
-  // Eager DAG sub-task 2: kick the orchestrator. No-op for users not on
-  // `useEagerPipeline`; for opted-in users the orchestrator drives the
-  // ICP runner (which delegates to triggerIcpDiscoveryForUser), so we
-  // do NOT invoke the legacy trigger directly to avoid running the
-  // step twice in parallel. For everyone else, the legacy trigger is
-  // the source of truth.
+): Promise<ICPStatusFields | null> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const {
     isEagerPipelineActiveFor,
@@ -955,9 +1120,23 @@ export async function startIcpDiscoveryForUser(
     | null;
   if (isEagerPipelineActiveFor(current)) {
     void reconcileForUser(userId);
-    return;
+    return null;
   }
+  const patch = await claimIcpRun(userId);
+  if (!patch) return null;
   // Intentionally not awaited — the route returns immediately.
   // Errors inside triggerIcpDiscoveryForUser are caught + persisted there.
-  void triggerIcpDiscoveryForUser(userId, deps);
+  // expectedStartedAt: this run's own claim, so a later reclaim's zombie
+  // completion can't be confused with a terminal state THIS run published.
+  // Tracked so a deploy's graceful shutdown waits for this run (cronJobRegistry
+  // is drained before the listener closes) instead of killing it mid-flight and
+  // leaving a dead `running` claim that nothing completes until it times out.
+  trackBackgroundRun(
+    "onboardingIcp",
+    triggerIcpDiscoveryForUser(userId, {
+      ...deps,
+      expectedStartedAt: patch.icpStartedAt,
+    }),
+  );
+  return patch;
 }

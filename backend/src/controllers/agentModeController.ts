@@ -1,4 +1,10 @@
 import { scheduleBackupModels } from '../services/agentMode/modelSupersession';
+import {
+  acquireInteractiveGenerationSlot,
+  buildTooManyRunsBody,
+  TooManyConcurrentRunsError,
+  isTooManyConcurrentRunsError,
+} from '../services/agentMode/concurrentGenerationCap';
 import { isEvaluationUser, EvaluationDenied } from '../services/evaluationPolicy';
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken, isRealAdmin } from '../middleware/auth';
@@ -503,6 +509,39 @@ function modelUnavailableBody(err: ModelUnavailableError) {
   return buildModelUnavailableBody(err, displayName);
 }
 
+/**
+ * ENG-903: validate a schedule's model pin (llmModel / llmBackupModel) at the WRITE
+ * site, with the same rules the picker and `resolveEffectiveModelForUser` enforce, so a
+ * bad pin is refused with the portal's existing `model_unavailable` 422 instead of
+ * surviving until it fails the run.
+ *
+ * Returns the trimmed id to store ('' = no pin). Throws ModelUnavailableError when the
+ * id is not a string, not served (registry key or honoured alias), or not selectable by
+ * this user (internalOnly, live-voice, adminOnly for a non-admin). Does not change the
+ * run-time resolver. Partial service doubles (older unit tests) skip the registry checks,
+ * exactly like the resolver above.
+ */
+async function validateScheduleModelPin(userId: string, raw: unknown): Promise<string> {
+  const requested = normalizeRequestedLlmModel(raw);
+  if (!requested) return '';
+  if (typeof raw !== 'string') throw new ModelUnavailableError(requested, 'not_served');
+  if (
+    typeof agentModeService.resolveGenerationModel !== 'function'
+    || typeof agentModeService.isModelSelectableBy !== 'function'
+  ) {
+    return requested;
+  }
+  const resolution = agentModeService.resolveGenerationModel(requested);
+  if (resolution.fellBack) throw new ModelUnavailableError(requested, 'not_served');
+  if (!agentModeService.isModelSelectableBy(resolution.model, false)) {
+    // adminOnly is the only gate an admin can clear; internalOnly/live fail for everyone.
+    const adminCanSelect = agentModeService.isModelSelectableBy(resolution.model, true)
+      && await isUserAdmin(userId);
+    if (!adminCanSelect) throw new ModelUnavailableError(requested, 'not_selectable');
+  }
+  return requested;
+}
+
 async function resolveScheduleBackup(input: {
   userId: string;
   requestedBackupModel?: string | null;
@@ -981,9 +1020,58 @@ export function hasStalledAutocompleteWorkPlan(
   // otherwise call this turn "not stalled" even though no real required work got done, and no
   // further auto-continuation round would ever fire to go satisfy the debt. Checked before that
   // short-circuit so outstanding debt always wins regardless of what else happened this turn.
+  // ENG-2019: a non-retryable set_work_plan_status gate block means another automatic
+  // round cannot help — the model has already been told the call is final for this turn.
+  // Hand back to the human instead of burning continuation rounds and an oncall page.
+  if (hasNonRetryableWorkPlanStatusBlock(calls)) return false;
   if (workPlanHasUnresolvedDebt(workPlan, calledFunctions)) return true;
   if (calls.some((tc) => toolCallSucceeded(tc))) return false;
   return workPlanHasPendingStep(workPlan);
+}
+
+const NON_RETRYABLE_WORK_PLAN_BLOCK_REASONS = new Set(['workplan_unresolved_removed_requirements']);
+
+/**
+ * ENG-2019: true when this turn's LAST set_work_plan_status call came back as a deliberate,
+ * non-retryable gate block (e.g. a removed step's required function was never called). Session
+ * 15b230eb burned both continuation rounds and paged oncall on exactly this shape: the only
+ * path forward was a tool the model would not call, so automatic continuation cannot help.
+ */
+export function hasNonRetryableWorkPlanStatusBlock(toolCalls: unknown[] | undefined | null): boolean {
+  const calls = Array.isArray(toolCalls) ? toolCalls : [];
+  const statusCalls = calls.filter((tc: any) => tc?.name === 'set_work_plan_status' || tc?.function?.name === 'set_work_plan_status');
+  const last: any = statusCalls[statusCalls.length - 1];
+  if (!last) return false;
+  let result = last.result;
+  if (typeof result === 'string') {
+    try { result = JSON.parse(result); } catch { return false; }
+  }
+  return result?.blocked === true && NON_RETRYABLE_WORK_PLAN_BLOCK_REASONS.has(result?.reason);
+}
+
+export const WORK_PLAN_NEEDS_YOU_MESSAGE =
+  `⚠️ I can't finish this plan on my own — a required step is blocked and needs your input. ` +
+  `Reply here whenever you're ready and I'll pick up where I left off; nothing already done is lost.`;
+
+/** ENG-2019: post the single user-facing hand-back message (no continuation, no oncall page). */
+async function postWorkPlanNeedsYouMessage(sessionId: string, userId: string): Promise<void> {
+  await chatbotDb.addMessageToSession(sessionId, {
+    role: 'assistant',
+    content: WORK_PLAN_NEEDS_YOU_MESSAGE,
+    timestamp: new Date().toISOString(),
+    metadata: { timestamp: new Date().toISOString(), kind: 'work-plan-needs-you' },
+  }).catch((persistErr) =>
+    console.error('AgentMode: failed to persist work-plan-needs-you message:', persistErr),
+  );
+  try {
+    const { io } = await import('../server');
+    io.to(`user:${userId}`).emit('session-message-appended', {
+      sessionId,
+      message: { role: 'assistant', content: WORK_PLAN_NEEDS_YOU_MESSAGE },
+    });
+  } catch (emitErr) {
+    console.error(`AgentMode: failed to emit work-plan-needs-you message for session ${sessionId}:`, emitErr);
+  }
 }
 
 /** ENG-1699: whether an autocomplete work plan still has unfinished work, independent of any
@@ -1846,6 +1934,9 @@ async function scheduleAutoWorkPlanContinuation(
   )
     .then(async (resolved) => {
       stillStalled = hasStalledAutocompleteWorkPlan(resolved?.workPlan, resolved?.toolCalls, resolved?.calledFunctions);
+      if (resolved?.workPlan?.autocomplete && hasNonRetryableWorkPlanStatusBlock(resolved?.toolCalls)) {
+        await postWorkPlanNeedsYouMessage(sessionId, userId);
+      }
       if (resolved?.content) {
         const { io } = await import('../server');
         // ENG-1495: same reasoning as the media auto-continuation emit above.
@@ -5222,20 +5313,28 @@ async function runVerifiedChatInner(
  */
 export async function runVerifiedChat(
   params: Parameters<typeof runVerifiedChatInner>[0],
-  options?: { lockTimeoutMs?: number },
+  options?: { lockTimeoutMs?: number; capInteractiveUserId?: string },
 ): Promise<RunVerifiedChatResult> {
   const { sessionId } = params;
   const claimed = await claimSessionGenerationWithRetry(sessionId);
   if (!claimed) {
     throw new SessionBusyError(sessionId);
   }
+  let generationSlot: { release: () => void } | undefined;
   try {
+    // ENG-110: only the interactive /verified-generate endpoint passes capInteractiveUserId.
+    if (options?.capInteractiveUserId) {
+      const slot = await acquireInteractiveGenerationSlot(options.capInteractiveUserId, sessionId);
+      if (!slot.ok) throw new TooManyConcurrentRunsError(slot.current, slot.limit);
+      generationSlot = slot;
+    }
     return await withGenerationTimeout(
       runVerifiedChatInner(params),
       sessionId,
       options?.lockTimeoutMs ?? RUN_VERIFIED_CHAT_LOCK_TIMEOUT_MS,
     );
   } finally {
+    generationSlot?.release();
     releaseSessionGeneration(sessionId);
   }
 }
@@ -9714,7 +9813,19 @@ export const agentModeController = {
         });
       }
 
+      // ENG-110: per-user soft cap on concurrently generating interactive chats.
+      // Taken AFTER the session claim, released in the finally below on every exit.
+      let generationSlot: { release: () => void } | undefined;
       try {
+      // Answer/cancel turns already consumed a paused deck / work-plan request above
+      // (writes dispatched, state cleared), so refusing them now would lose the
+      // outcome and make a retry 409. They are never refused, only counted.
+      const continuesPausedTurn = Boolean(deckAnswer || deckCancel || workPlanInputAnswer);
+      const slot = await acquireInteractiveGenerationSlot(session.userId, sessionId, { bypassLimit: continuesPausedTurn });
+      if (!slot.ok) {
+        return res.status(429).json(buildTooManyRunsBody(slot.current, slot.limit));
+      }
+      generationSlot = slot;
 
       // Check token usage limits
       const usageStatus = await checkTokenUsage(user.userId);
@@ -10133,6 +10244,11 @@ export const agentModeController = {
         setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, modelToUse, 1).catch((err) =>
           console.error(`AgentMode: work-plan auto-continuation failed for session ${sessionId}:`, err),
         ));
+      } else if (response.workPlan?.autocomplete && hasNonRetryableWorkPlanStatusBlock(response.toolCalls)) {
+        // ENG-2019: non-retryable gate block — hand back once instead of auto-continuing.
+        setImmediate(() => postWorkPlanNeedsYouMessage(sessionId, session.userId).catch((err) =>
+          console.error(`AgentMode: work-plan needs-you message failed for session ${sessionId}:`, err),
+        ));
       }
 
       // Compute page invalidations for emma-sidebar sessions so the frontend
@@ -10231,6 +10347,7 @@ export const agentModeController = {
         void markRunTerminal(runSurvivalRunId, 'completed');
       }
       } finally {
+        generationSlot?.release();
         releaseSessionGeneration(sessionId);
         // Terminal state reached (success OR error unwinding through here):
         // release the submit-lock so an identical, legitimate resubmit is
@@ -12680,12 +12797,16 @@ export const agentModeController = {
         }
       }
 
+      // ENG-903: refuse an unservable/unselectable model pin at write time (422), not at run time.
+      const validatedLlmModel = await validateScheduleModelPin(user.userId, llmModel);
+      const validatedBackupModel = await validateScheduleModelPin(user.userId, llmBackupModel);
+
       // Create scheduled chat using the existing scheduleDb
       const scheduleId = require('uuid').v4();
       const now = new Date();
       const scheduleBackup = await resolveScheduleBackup({
         userId: user.userId,
-        requestedBackupModel: llmBackupModel,
+        requestedBackupModel: validatedBackupModel,
       });
 
       // Use provided nextRunTime or calculate default
@@ -12751,7 +12872,7 @@ export const agentModeController = {
         sessionId: sessionId || null, // Store original sessionId for reference (can be null)
         type: 'scheduled_chat', // Distinguish from regular task schedules
         emailCampaignTaskId: emailCampaignTaskId || null,
-        llmModel: llmModel || '', // Empty means "use default at runtime"
+        llmModel: validatedLlmModel, // Empty means "use default at runtime"
         ...scheduleBackup,
         runCount: runCount !== undefined ? runCount : -1, // Default to unlimited runs if not specified
         variables: [] as ScheduledChatVariable[],
@@ -12822,6 +12943,9 @@ export const agentModeController = {
         backupSelectionRequired: scheduleBackup.llmBackupNeedsConfirmation,
       });
     } catch (error) {
+      if (isModelUnavailableError(error)) {
+        return res.status(422).json(modelUnavailableBody(error));
+      }
       if (error instanceof Error && error.name === 'InvalidScheduledBackupModelError') {
         return res.status(400).json({ error: error.message });
       }
@@ -12947,14 +13071,42 @@ export const agentModeController = {
       }
 
       const now = new Date();
+      // ENG-903: validate a model pin only when this request CHANGES it. Re-sending the
+      // stored value (or omitting the field) must never be refused, or an old schedule whose
+      // model was since retired could not have unrelated fields edited.
+      const storedLlmModel = String((existingSchedule as any).llmModel ?? '').trim();
+      // Normalise ONCE; every later decision and the write use only this value.
+      // null is treated as "omitted" (the field is simply not touched): create treats null as
+      // "no selection", and a PATCH-style null must never be stored or silently clear the pin.
+      // '' / whitespace-only is the explicit clear. Any other non-string stays as-is so
+      // validateScheduleModelPin rejects it with the usual 422.
+      const llmModelProvided = llmModel !== undefined && llmModel !== null;
+      const incomingLlmModel: unknown = typeof llmModel === 'string' ? llmModel.trim() : llmModel;
+      const llmModelClearing = llmModelProvided && incomingLlmModel === '';
+      const llmModelChanging = llmModelProvided && !llmModelClearing && incomingLlmModel !== storedLlmModel;
+      const validatedLlmModel = llmModelChanging ? await validateScheduleModelPin(user.userId, incomingLlmModel) : undefined;
+
+      const existingBackupFields = {
+        llmBackupModel: (existingSchedule as any).llmBackupModel || '',
+        llmBackupSource: ((existingSchedule as any).llmBackupSource || 'system') as ModelBackupSource,
+        llmBackupNeedsConfirmation: (existingSchedule as any).llmBackupNeedsConfirmation !== false,
+      };
       const requestedBackupWasProvided = llmBackupModel !== undefined;
-      const scheduleBackup = requestedBackupWasProvided
-        ? await resolveScheduleBackup({ userId: user.userId, requestedBackupModel: llmBackupModel })
-        : {
-            llmBackupModel: (existingSchedule as any).llmBackupModel || '',
-            llmBackupSource: ((existingSchedule as any).llmBackupSource || 'system') as ModelBackupSource,
-            llmBackupNeedsConfirmation: (existingSchedule as any).llmBackupNeedsConfirmation !== false,
-          };
+      const incomingBackup = typeof llmBackupModel === 'string' ? llmBackupModel.trim() : llmBackupModel;
+      const backupUnchanged = requestedBackupWasProvided && incomingBackup !== '' && incomingBackup === String(existingBackupFields.llmBackupModel).trim();
+      let scheduleBackup: Awaited<ReturnType<typeof resolveScheduleBackup>> = existingBackupFields;
+      if (requestedBackupWasProvided && !backupUnchanged) {
+        const validatedBackup = await validateScheduleModelPin(user.userId, llmBackupModel);
+        scheduleBackup = await resolveScheduleBackup({ userId: user.userId, requestedBackupModel: validatedBackup });
+      } else if (backupUnchanged) {
+        // Same as before the retirement: keep refreshing source as before when still valid,
+        // but a since-retired stored backup must not block the edit.
+        try {
+          scheduleBackup = await resolveScheduleBackup({ userId: user.userId, requestedBackupModel: incomingBackup as string });
+        } catch (backupError) {
+          if (!(backupError instanceof Error && backupError.name === 'InvalidScheduledBackupModelError')) throw backupError;
+        }
+      }
 
       // Determine nextRunTime: use provided value or keep existing
       let scheduledNextRunTime = existingSchedule.nextRunTime;
@@ -13024,7 +13176,7 @@ export const agentModeController = {
         // question and not a rename's business.
         // Explicit empty -> a REMOVAL below, because inheritance is the ABSENCE of
         // the attribute, not a blank value in it.
-        ...(llmModel !== undefined && llmModel !== '' ? { llmModel } : {}),
+        ...(validatedLlmModel ? { llmModel: validatedLlmModel } : (llmModelProvided && !llmModelClearing && !llmModelChanging ? { llmModel: incomingLlmModel as string } : {})),
         ...scheduleBackup,
         // ENG-844: update the owner's timezone when a valid one is supplied; keep
         // the existing value otherwise (partial-update safe).
@@ -13280,7 +13432,7 @@ export const agentModeController = {
         // can re-derive it, only an edit can reset it. Otherwise "remove the
         // cross-account tools" could never get the schedule running again.
         [
-          ...(llmModel === '' ? ['llmModel'] : []),
+          ...(llmModelClearing ? ['llmModel'] : []),
           ...((toolsChanged || effectiveStartingMessage !== previousStartingMessage)
             && (existingSchedule as any).lastKnownSensitive !== undefined
             ? ['lastKnownSensitive', 'lastKnownSensitiveAt']
@@ -13316,6 +13468,9 @@ export const agentModeController = {
             'This schedule recorded a run while you were saving, so nothing was saved. ' +
             'Try again — its run history has changed.',
         });
+      }
+      if (isModelUnavailableError(error)) {
+        return res.status(422).json(modelUnavailableBody(error));
       }
       if (error instanceof Error && error.name === 'InvalidScheduledBackupModelError') {
         return res.status(400).json({ error: error.message });
@@ -15422,7 +15577,7 @@ export const agentModeController = {
         // ENG-2072: a real person is watching this turn — never force hands-off
         // work-plan autocomplete, even if this session happens to be scheduled.
         isUnattendedRun: false
-      }));
+      }, { capInteractiveUserId: session.userId }));
 
       // If client disconnected, don't try to send response
       // The results are already saved to the session
@@ -15458,6 +15613,11 @@ export const agentModeController = {
           message: 'A response is already being generated for this session. Please wait.',
           code: 'SESSION_BUSY',
         });
+      }
+
+      // ENG-110: per-user concurrent interactive generation cap.
+      if (isTooManyConcurrentRunsError(error)) {
+        return res.status(429).json(buildTooManyRunsBody(error.current, error.limit));
       }
 
       // ENG-2293: same handled outcome as the other three generate-response
@@ -16045,6 +16205,11 @@ export const agentModeController = {
         return res.status(400).json({ error: 'frequencyIntervalDays must be a positive integer for every_n_days frequency' });
       }
 
+      // ENG-903: an explicit per-use override is validated like a direct create. The template's
+      // own stored llmModel is deliberately not re-validated here (see dev note).
+      const validatedOverrideModel = await validateScheduleModelPin(user.userId, overrideModel);
+      const validatedOverrideBackup = await validateScheduleModelPin(user.userId, overrideBackupModel);
+
       const now = new Date();
       // Generated here (rather than at the schedule-object build below) so it can
       // seed the jitter that spreads this schedule's fire time off the exact round
@@ -16085,7 +16250,7 @@ export const agentModeController = {
 
       const scheduleBackup = await resolveScheduleBackup({
         userId: user.userId,
-        requestedBackupModel: overrideBackupModel,
+        requestedBackupModel: validatedOverrideBackup,
       });
       const scheduledChat: any = {
         scheduleId,
@@ -16109,7 +16274,11 @@ export const agentModeController = {
         updatedAt: now.toISOString(),
         sessionId: null,
         type: 'scheduled_chat',
-        llmModel: overrideModel || template.llmModel || '',
+        // Omitted (undefined/null) inherits the template pin; an explicit ''/whitespace
+        // override means UNPINNED and must not fall back to it.
+        llmModel: (overrideModel === undefined || overrideModel === null)
+          ? (template.llmModel || '')
+          : validatedOverrideModel,
         ...scheduleBackup,
         runCount: runCount !== undefined ? runCount : -1,
         variables: templateVars,
@@ -16157,6 +16326,9 @@ export const agentModeController = {
         backupSelectionRequired: scheduleBackup.llmBackupNeedsConfirmation,
       });
     } catch (error) {
+      if (isModelUnavailableError(error)) {
+        return res.status(422).json(modelUnavailableBody(error));
+      }
       if (error instanceof Error && error.name === 'InvalidScheduledBackupModelError') {
         return res.status(400).json({ error: error.message });
       }

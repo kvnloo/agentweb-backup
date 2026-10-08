@@ -22,6 +22,7 @@ jest.mock('../services/googleAdsService', () => ({
     addKeywords: jest.fn().mockResolvedValue(undefined),
     addNegativeKeywords: jest.fn().mockResolvedValue(undefined),
     addNegativeCampaignCriteria: jest.fn().mockResolvedValue(undefined),
+    setDeviceBidAdjustments: jest.fn().mockResolvedValue(undefined),
     searchLocations: jest.fn().mockResolvedValue([
       { id: '2840', name: 'United States', countryCode: 'US', targetType: 'Country' },
     ]),
@@ -1362,5 +1363,61 @@ describe('Search serving-chain Emma dispatch', () => {
     expect(toolResultError(result)?.message).toBe(success ? undefined : JSON.stringify(report));
     expect(tool.definition.inputSchema.properties!.mode.enum).toContain('serving_chain');
     expect(tool.definition.description).toContain('READY is not evidence of delivery');
+  });
+});
+
+describe('handleCallGoogleAdsApi — CAMPAIGN_CRITERION SET_DEVICE_BID_ADJUSTMENT (ENG-2036)', () => {
+  const base = { customer_id: '1234567890', entity_type: 'CAMPAIGN_CRITERION' as const, action: 'SET_DEVICE_BID_ADJUSTMENT' };
+
+  it('excludes mobile and tablet at campaign level (-100% => modifier 0)', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      ...base,
+      campaign_resource_name: 'customers/1234567890/campaigns/555',
+      device_bid_adjustments: [
+        { device: 'MOBILE', bid_modifier_percent: -100 },
+        { device: 'tablet', bid_modifier_percent: -100 },
+      ],
+    } as any);
+    expect(result).toMatchObject({ success: true, scope: 'CAMPAIGN' });
+    expect(googleAdsService.setDeviceBidAdjustments).toHaveBeenCalledWith('user-123', {
+      scope: 'CAMPAIGN',
+      customerId: '1234567890',
+      campaignId: '555',
+      adjustments: [
+        { device: 'MOBILE', bidModifier: 0 },
+        { device: 'TABLET', bidModifier: 0 },
+      ],
+    });
+  });
+
+  it('supports ad-group scope', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      ...base,
+      ad_group_resource_name: 'customers/1234567890/adGroups/77',
+      device_bid_adjustments: [{ device: 'DESKTOP', bid_modifier_percent: 25 }],
+    } as any);
+    expect(result.success).toBe(true);
+    expect(googleAdsService.setDeviceBidAdjustments).toHaveBeenCalledWith('user-123', {
+      scope: 'AD_GROUP',
+      customerId: '1234567890',
+      adGroupResourceName: 'customers/1234567890/adGroups/77',
+      adjustments: [{ device: 'DESKTOP', bidModifier: 1.25 }],
+    });
+  });
+
+  it.each([
+    ['out-of-range percent', { campaign_resource_name: 'customers/1234567890/campaigns/555', device_bid_adjustments: [{ device: 'MOBILE', bid_modifier_percent: -101 }] }, 'INVALID_BID_MODIFIER'],
+    ['above max percent', { campaign_resource_name: 'customers/1234567890/campaigns/555', device_bid_adjustments: [{ device: 'MOBILE', bid_modifier_percent: 901 }] }, 'INVALID_BID_MODIFIER'],
+    ['near-exclusion percent that rounds to opt-out', { campaign_resource_name: 'customers/1234567890/campaigns/555', device_bid_adjustments: [{ device: 'MOBILE', bid_modifier_percent: -99.999 }] }, 'INVALID_BID_MODIFIER'],
+    ['unknown device', { campaign_resource_name: 'customers/1234567890/campaigns/555', device_bid_adjustments: [{ device: 'WATCH', bid_modifier_percent: 0 }] }, 'INVALID_DEVICE'],
+    ['duplicate device', { campaign_resource_name: 'customers/1234567890/campaigns/555', device_bid_adjustments: [{ device: 'MOBILE', bid_modifier_percent: 0 }, { device: 'MOBILE', bid_modifier_percent: 10 }] }, 'INVALID_DEVICE'],
+    ['empty adjustments', { campaign_resource_name: 'customers/1234567890/campaigns/555', device_bid_adjustments: [] }, 'MISSING_CRITERIA'],
+    ['both scopes', { campaign_resource_name: 'customers/1234567890/campaigns/555', ad_group_resource_name: 'customers/1234567890/adGroups/77', device_bid_adjustments: [{ device: 'MOBILE', bid_modifier_percent: 0 }] }, 'MISSING_IDENTIFIERS'],
+    ['foreign campaign', { campaign_resource_name: 'customers/9999999999/campaigns/555', device_bid_adjustments: [{ device: 'MOBILE', bid_modifier_percent: 0 }] }, 'CAMPAIGN_CUSTOMER_MISMATCH'],
+    ['malformed ad group', { ad_group_resource_name: 'adGroups/77', device_bid_adjustments: [{ device: 'MOBILE', bid_modifier_percent: 0 }] }, 'INVALID_AD_GROUP_RESOURCE_NAME'],
+  ])('rejects %s with a typed validation error and no mutation', async (_label, extra, code) => {
+    const result = await service.handleCallGoogleAdsApi('user-123', { ...base, ...extra } as any);
+    expect(result).toMatchObject({ success: false, errorType: 'VALIDATION_ERROR', errorCode: code });
+    expect(googleAdsService.setDeviceBidAdjustments).not.toHaveBeenCalled();
   });
 });

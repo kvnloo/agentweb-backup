@@ -3,7 +3,12 @@ import { getGoogleAdsCredentials } from '../utils/secretsManager';
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
 import { buildUtmSpec, mergeUtmIntoQueryString, mergeUtmIntoUrl, readUtmKeys, utmKeysInQueryString, utmQueryString } from '../utils/adUtm';
-import { validateNegativeCampaignCriteria } from './googleAdsCampaignCriteria';
+import {
+  BidAdjustmentDevice,
+  buildDeviceBidAdjustmentOperations,
+  NormalizedDeviceBidAdjustments,
+  validateNegativeCampaignCriteria,
+} from './googleAdsCampaignCriteria';
 import {
   assertCountingType,
   assertConversionActionStatus,
@@ -1697,6 +1702,27 @@ export class GoogleAdsService {
 
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     await this.mutate(customerId, accessToken, 'campaignCriteria', operations, loginCustomerId);
+  }
+
+  /** ENG-2036: device bid adjustments (campaign DEVICE criteria or ad-group bid modifiers). */
+  async setDeviceBidAdjustments(userId: string, params: NormalizedDeviceBidAdjustments): Promise<void> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, params.customerId);
+    // Ad-group device modifiers may already exist; those need update, not create.
+    const existing: Partial<Record<BidAdjustmentDevice, string>> = {};
+    if (params.scope === 'AD_GROUP') {
+      const rows = await this.search(
+        params.customerId,
+        accessToken,
+        `SELECT ad_group_bid_modifier.resource_name, ad_group_bid_modifier.device.type FROM ad_group_bid_modifier WHERE ad_group_bid_modifier.ad_group = '${params.adGroupResourceName}'`,
+        loginCustomerId,
+      );
+      for (const r of rows) {
+        const type = r?.adGroupBidModifier?.device?.type as BidAdjustmentDevice | undefined;
+        if (type && r.adGroupBidModifier.resourceName) existing[type] = r.adGroupBidModifier.resourceName;
+      }
+    }
+    const { resource, operations } = buildDeviceBidAdjustmentOperations(params, existing);
+    await this.mutate(params.customerId, accessToken, resource, operations, loginCustomerId);
   }
 
   async listKeywords(userId: string, customerId: string, adGroupResourceName: string): Promise<any[]> {

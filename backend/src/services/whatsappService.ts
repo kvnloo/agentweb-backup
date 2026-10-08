@@ -426,6 +426,54 @@ export async function sendText(
   });
 }
 
+export const OPT_OUT_CONFIRMATION =
+  "You're opted out. AgentWeb won't send any more WhatsApp notifications to this number. " +
+  'Reply UNSTOP to turn them back on.';
+
+export const OPT_IN_CONFIRMATION =
+  "You're opted back in. AgentWeb will send notifications to this WhatsApp number again. " +
+  'Reply STOP at any time to opt out.';
+
+/**
+ * The one message an opted-out number is allowed to receive: confirmation that the
+ * opt-out landed (ENG-273).
+ *
+ * Every other send goes through `assertSendable`, which refuses an opted-out number
+ * outright. That is right for notifications and wrong for this: a STOP that is answered
+ * with silence is indistinguishable, to the person who sent it, from a STOP that was
+ * dropped. Acknowledging it once is what people expect from SMS, and the webhook records
+ * the opt-out BEFORE calling this, so a failure here can never leave someone still
+ * subscribed.
+ *
+ * Deliberately a separate narrow export rather than a `force`/`ignoreOptOut` flag on
+ * sendText: a bypass any caller can pass is a bypass that eventually gets passed by
+ * accident. This one takes no text and no template, so it cannot be repurposed into a
+ * way to message someone who opted out — and it still honours the service window, which
+ * the inbound STOP itself just opened.
+ */
+export async function sendOptOutConfirmation(
+  destination: string,
+): Promise<{ messageId: string | null }> {
+  const phone = toE164(destination);
+  if (!phone) {
+    throw new WhatsAppError(
+      `"${redactPhone(destination)}" is not a valid phone number in E.164 form — refusing to send.`,
+    );
+  }
+  if (!(await isServiceWindowOpen(phone))) {
+    throw new WhatsAppWindowClosedError(
+      `${redactPhone(phone)} is outside the 24-hour service window.`,
+    );
+  }
+  return postToGraph({
+    messaging_product: 'whatsapp',
+    to: phone,
+    type: 'text',
+    text: { body: OPT_OUT_CONFIRMATION },
+  });
+}
+
+
 export interface WhatsAppSendParams {
   destination: string;
   text: string;
