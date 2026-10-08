@@ -14,6 +14,8 @@
  * models to Sonnet pricing, which hides pricing gaps).
  */
 
+import { GEMINI_OMNI_VIDEO_MODEL, omniClipDurations } from '../services/videoModels';
+
 /**
  * Version stamp for every price in this file (ENG-1250 §5: "A price change
  * creates a new version; historical events retain the rate version used").
@@ -358,9 +360,9 @@ export const IMAGE_GENERATION_PRICING_USD: Record<string, number> = {
  * Ported from agentModeService.estimateVideoGenerationCost().
  */
 export const VIDEO_GENERATION_PRICING_USD_PER_CLIP: Record<string, number> = {
-  // gemini-omni-1.1-flash (Interactions API): $17.50/M video output tokens x 5,792
-  // tokens/s at 720p = ~$0.1014/s; one clip is ~10s → $1.014. This is only the
-  // ESTIMATE used when the API reports no usage — see omniVideoUsageCostUsd.
+  // gemini-omni-1.1-flash: a full 10s clip at GEMINI_OMNI_VIDEO_ESTIMATE_USD_PER_SECOND.
+  // videoGenerationCostUsd prices Omni per actual second; this entry marks it as
+  // per-generation priced. Real cost comes from usage — see omniVideoUsageCostUsd.
   'gemini-omni-1.1-flash': 1.014,
   // Retired Veo ids (shut down 2026-10-22) — kept so historical records still price.
   'veo-3.1-generate-preview': 3.2, // $0.40/s x 8s, audio incl. (ai.google.dev); was 2.8
@@ -418,6 +420,12 @@ export function geminiFlashImageUsage(usage: unknown, hasImage: boolean) {
   };
 }
 
+/**
+ * gemini-omni-1.1-flash estimate when the API reports no usage: $17.50/M video
+ * output tokens x 5,792 tokens/s at 720p. Billed on the actual requested seconds.
+ */
+export const GEMINI_OMNI_VIDEO_ESTIMATE_USD_PER_SECOND = 0.1014;
+
 /** Max seconds a single generated clip covers, per model (default 8s). */
 export const VIDEO_CLIP_MAX_SECONDS: Record<string, number> = {
   'gemini-omni-1.1-flash': 10,
@@ -428,6 +436,11 @@ export const VIDEO_CLIP_MAX_SECONDS: Record<string, number> = {
  * requested duration bills as ceil(seconds / clipSeconds) clips.
  */
 export function videoGenerationCostUsd(model: string, durationSeconds?: number): number {
+  if (model === GEMINI_OMNI_VIDEO_MODEL) {
+    // Omni is asked for each clip's exact length, so the estimate is per actual second.
+    const seconds = omniClipDurations(durationSeconds).reduce((a, b) => a + b, 0);
+    return seconds * GEMINI_OMNI_VIDEO_ESTIMATE_USD_PER_SECOND;
+  }
   const clipPrice = VIDEO_GENERATION_PRICING_USD_PER_CLIP[model] ?? 3.2;
   return clipPrice * videoClipCount(durationSeconds, model);
 }
@@ -438,6 +451,7 @@ export function videoGenerationCostUsd(model: string, durationSeconds?: number):
  * was multiplied by.
  */
 export function videoClipCount(durationSeconds?: number, model?: string): number {
+  if (model === GEMINI_OMNI_VIDEO_MODEL) return omniClipDurations(durationSeconds).length;
   const clipSeconds = (model && VIDEO_CLIP_MAX_SECONDS[model]) || 8;
   return durationSeconds && durationSeconds > clipSeconds
     ? Math.ceil(durationSeconds / clipSeconds)

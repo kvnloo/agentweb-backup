@@ -81,8 +81,23 @@ describe('VideoService', () => {
       expect(body).toEqual({
         model: 'gemini-omni-1.1-flash',
         input: 'A cat surfing',
-        response_format: { type: 'video', aspect_ratio: '9:16', resolution: '1080p' },
+        // No duration requested → the 8s default is sent as Omni's string form.
+        response_format: { type: 'video', aspect_ratio: '9:16', resolution: '1080p', duration: '8s' },
       });
+    });
+
+    it('sends response_format.duration as a "<n>s" string, rounded and clamped to 3–10s', async () => {
+      const sent = async (durationSeconds: number) => {
+        mockedAxios.post.mockClear();
+        await videoService.generateVideo({ ...baseParams, durationSeconds });
+        return (mockedAxios.post.mock.calls[0] as any[])[1].response_format.duration;
+      };
+      expect(await sent(5)).toBe('5s');
+      expect(await sent(6.6)).toBe('7s');
+      expect(await sent(10)).toBe('10s');
+      expect(await sent(1)).toBe('3s');
+      // Never the integer form (the API rejects {"duration":5} with 400).
+      expect(typeof (await sent(5))).toBe('string');
     });
 
     it('decodes the base64 video from steps[].content[] and uploads the bytes to S3', async () => {
@@ -97,7 +112,7 @@ describe('VideoService', () => {
 
     it('defaults to 720p, omits aspect_ratio for auto, and maps Seedance ratios to 16:9/9:16', async () => {
       await videoService.generateVideo({ ...baseParams, resolution: '480p' });
-      expect((mockedAxios.post.mock.calls[0] as any[])[1].response_format).toEqual({ type: 'video', resolution: '720p' });
+      expect((mockedAxios.post.mock.calls[0] as any[])[1].response_format).toEqual({ type: 'video', resolution: '720p', duration: '8s' });
 
       await videoService.generateVideo({ ...baseParams, aspectRatio: '21:9' });
       expect((mockedAxios.post.mock.calls[1] as any[])[1].response_format.aspect_ratio).toBe('16:9');
@@ -149,10 +164,10 @@ describe('VideoService', () => {
       expect(mockMeterUserUsage.mock.calls[0][0].costUsdOverride).toBeCloseTo(expected, 10);
     });
 
-    it('falls back to the $0.1014/s estimate ($1.014 per ~10s clip) when no usage is reported', async () => {
+    it('falls back to the $0.1014/s estimate on the actual requested seconds when no usage is reported', async () => {
       const result = await videoService.generateVideo({ ...baseParams, durationSeconds: 8 });
-      expect(result.costUsd).toBeCloseTo(1.014, 10);
-      expect(mockMeterUserUsage.mock.calls[0][0].costUsdOverride).toBeCloseTo(1.014, 10);
+      expect(result.costUsd).toBeCloseTo(8 * 0.1014, 10);
+      expect(mockMeterUserUsage.mock.calls[0][0].costUsdOverride).toBeCloseTo(8 * 0.1014, 10);
     });
 
     it('fails clearly on a quota error (HTTP 429) with no fallback model and no charge', async () => {
@@ -181,7 +196,7 @@ describe('VideoService', () => {
       expect(mockedUpload).not.toHaveBeenCalled();
     });
 
-    it('generates ~10s clips: >10s requests run ceil(s/10) clips and are stitched in Remotion', async () => {
+    it('splits >10s requests into <=10s clips, each requested at its exact length, and stitches them', async () => {
       const mockedCompose = remotionService.compose as jest.Mock;
       mockedCompose.mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/stitched.mp4', filename: 'cat.mp4' });
       mockedUpload.mockImplementation(async (_b: any, filename: string) => ({ success: true, url: `https://s3.example.com/${filename}` }));
@@ -189,14 +204,31 @@ describe('VideoService', () => {
       const result = await videoService.generateVideo({ ...baseParams, durationSeconds: 14 });
 
       expect(mockedAxios.post).toHaveBeenCalledTimes(2);
+      const durations = (mockedAxios.post.mock.calls as any[]).map((c) => c[1].response_format.duration).sort();
+      expect(durations).toEqual(['10s', '4s']);
       const arg = mockedCompose.mock.calls[0][0];
       expect(arg.clipUrl).toBe('https://s3.example.com/cat_clip1.mp4');
       expect(arg.extraClipUrls).toEqual(['https://s3.example.com/cat_clip2.mp4']);
       expect(arg.clipDurationsSeconds).toEqual([10, 4]);
       expect(arg.maxClipSeconds).toBe(10);
       expect(result.videoUrl).toBe('https://s3.example.com/stitched.mp4');
-      expect(mockMeterUserUsage.mock.calls[0][0].costUsdOverride).toBeCloseTo(2 * 1.014, 10);
+      expect(mockMeterUserUsage.mock.calls[0][0].costUsdOverride).toBeCloseTo(14 * 0.1014, 10);
       expect(mockMeterUserUsage.mock.calls[0][0].generationCount).toBe(2);
+    });
+
+    it('a remainder under 3s borrows from the previous clip so clips sum to the request (21s → 10/8/3)', async () => {
+      const mockedCompose = remotionService.compose as jest.Mock;
+      mockedCompose.mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/stitched.mp4', filename: 'cat.mp4' });
+      mockedUpload.mockImplementation(async (_b: any, filename: string) => ({ success: true, url: `https://s3.example.com/${filename}` }));
+
+      await videoService.generateVideo({ ...baseParams, durationSeconds: 21 });
+
+      const byFile = Object.fromEntries((mockedUpload.mock.calls as any[]).map((c, i) =>
+        [c[1], (mockedAxios.post.mock.calls[i] as any[])[1].response_format.duration]));
+      expect(mockedAxios.post).toHaveBeenCalledTimes(3);
+      expect(Object.values(byFile).sort()).toEqual(['10s', '3s', '8s']);
+      expect(mockedCompose.mock.calls[0][0].clipDurationsSeconds).toEqual([10, 8, 3]);
+      expect(mockMeterUserUsage.mock.calls[0][0].costUsdOverride).toBeCloseTo(21 * 0.1014, 10);
     });
   });
 
@@ -412,7 +444,7 @@ describe('VideoService', () => {
         expect.objectContaining({
           model: 'gemini-omni-1.1-flash',
           feature: 'video_generation',
-          costUsdOverride: 1.014,
+          costUsdOverride: expect.closeTo(8 * 0.1014, 10), // default 8s at $0.1014/s
         })
       );
       expect(result.model).toBe('gemini-omni-1.1-flash');

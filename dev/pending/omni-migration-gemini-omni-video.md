@@ -14,15 +14,17 @@ The replacement is `gemini-omni-1.1-flash`.
 - Synchronous: the response has `status:"completed"` and the clip as base64 in
   `steps[].content[]` (`{type:"video", mime_type:"video/mp4", data}`). No polling,
   no file download. A 360p request took 25s and returned a 10.0s clip.
-- No duration field exists in the `@google/genai` 2.0.0 Interactions types, so we send
-  none; clips come back ~10s. Requests >10s run `ceil(s/10)` clips in parallel and are
-  stitched in Remotion (`maxClipSeconds: 10`). A single clip is not trimmed, so a 5s
-  request returns ~10s (and bills ~10s).
+- Duration (live-verified 2026-10-08): `response_format.duration` is a STRING such as
+  `"5s"` (integer 3–10). `{"duration":5}` → 400 Invalid input; `"duration_seconds"` →
+  unknown parameter; `{"duration":"5s"}` returned a 5.01s clip. We always send each
+  clip's exact length (default 8s). Requests >10s split into <=10s clips that sum to the
+  request (14s → 10+4; a <3s remainder borrows from the previous clip: 21s → 10+8+3),
+  generated in parallel and stitched in Remotion (`maxClipSeconds: 10`).
 - Same secret as Veo: `{dev,prod}/AgentWeb/Google/Video`.
 
 **Pricing:** $17.50/M video output tokens (5,792 tokens/s at 720p ≈ $0.1014/s),
 $9/M text output, $1.50/M input. `omniVideoUsageCostUsd` bills the response `usage`;
-when absent we estimate $1.014 per ~10s clip. Legacy Veo price entries stay so
+when absent we estimate $0.1014 x the actual requested seconds. Legacy Veo price entries stay so
 historical spend events still re-derive. The price-book version stays `2026-10-08`
 (the addition is a new key only; no existing price moved) and the fingerprint pin was
 updated.

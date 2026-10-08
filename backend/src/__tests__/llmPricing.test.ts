@@ -392,11 +392,16 @@ describe('llmPricing', () => {
       expect(videoGenerationCostUsd('mystery-video-model', 8)).toBe(3.2);
     });
 
-    it('estimates gemini-omni-1.1-flash at $0.1014/s per ~10s clip ($1.014/clip)', () => {
+    it('estimates gemini-omni-1.1-flash at $0.1014 per actual requested second', () => {
       expect(VIDEO_GENERATION_PRICING_USD_PER_CLIP['gemini-omni-1.1-flash']).toBeCloseTo(10 * 0.1014, 10);
-      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 8)).toBeCloseTo(1.014, 10);
-      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 10)).toBeCloseTo(1.014, 10);
-      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 24)).toBeCloseTo(3 * 1.014, 10);
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 5)).toBeCloseTo(5 * 0.1014, 10);
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 8)).toBeCloseTo(8 * 0.1014, 10);
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 10)).toBeCloseTo(10 * 0.1014, 10);
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 24)).toBeCloseTo(24 * 0.1014, 10);
+      // Default 8s; rounded; floored at Omni's 3s minimum.
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash')).toBeCloseTo(8 * 0.1014, 10);
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 6.6)).toBeCloseTo(7 * 0.1014, 10);
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 1)).toBeCloseTo(3 * 0.1014, 10);
       expect(isPerGenerationPriced('gemini-omni-1.1-flash')).toBe(true);
       expect(getModelPrice('gemini-omni-1.1-flash')).toBeNull();
     });

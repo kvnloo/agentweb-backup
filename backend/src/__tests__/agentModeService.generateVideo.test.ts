@@ -230,7 +230,7 @@ describe('AgentModeService - generate_video function', () => {
   });
 
   describe('Cost Tracking', () => {
-    // gemini-omni-1.1-flash estimate: ~10s clip x $0.1014/s = $1.014 per clip,
+    // gemini-omni-1.1-flash estimate: $0.1014 per actual requested second,
     // used only when the service reports no actual cost.
     const generated = (extra: Record<string, any> = {}) => ({
       success: true, videoUrl: 'https://example.com/video.mp4', filename: 'test.mp4', ...extra,
@@ -248,7 +248,7 @@ describe('AgentModeService - generate_video function', () => {
       expect(chatbotDb.addToolCostToSession).toHaveBeenCalledWith('session123', 0.8123, 'generateVideo');
     });
 
-    it('estimates $1.014 per ~10s Omni clip when no actual cost is reported', async () => {
+    it('estimates $0.1014 per requested second for Omni when no actual cost is reported', async () => {
       const { chatbotDb } = require('../services/chatbotService');
       mockVideoService.generateVideo.mockResolvedValue(generated({ model: 'gemini-omni-1.1-flash' }));
 
@@ -262,8 +262,8 @@ describe('AgentModeService - generate_video function', () => {
       );
 
       const calls = chatbotDb.addToolCostToSession.mock.calls;
-      expect(calls[0][1]).toBeCloseTo(1.014, 5);     // 1 clip
-      expect(calls[1][1]).toBeCloseTo(3 * 1.014, 5); // 24s → 3 × 10s clips
+      expect(calls[0][1]).toBeCloseTo(8 * 0.1014, 5);  // 8s
+      expect(calls[1][1]).toBeCloseTo(24 * 0.1014, 5); // 24s → clips 10/10/4, billed on 24s
     });
 
     it('prices a legacy Veo id as gemini-omni-1.1-flash (alias, not the retired $3.20 rate)', async () => {
@@ -275,7 +275,7 @@ describe('AgentModeService - generate_video function', () => {
         'veo-3.1-fast-generate-preview', undefined, undefined, false, undefined, 8
       );
 
-      expect(chatbotDb.addToolCostToSession.mock.calls[0][1]).toBeCloseTo(1.014, 5);
+      expect(chatbotDb.addToolCostToSession.mock.calls[0][1]).toBeCloseTo(8 * 0.1014, 5);
       expect(result.model).toBe('gemini-omni-1.1-flash');
     });
 
@@ -288,7 +288,7 @@ describe('AgentModeService - generate_video function', () => {
         'seedance-2.0', undefined, undefined, false, undefined, 8
       );
 
-      expect(chatbotDb.addToolCostToSession.mock.calls[0][1]).toBeCloseTo(1.014, 5);
+      expect(chatbotDb.addToolCostToSession.mock.calls[0][1]).toBeCloseTo(8 * 0.1014, 5);
       expect(result.model).toBe('gemini-omni-1.1-flash');
     });
 

@@ -17,6 +17,10 @@ import {
   VIDEO_MODELS,
   isSupportedVideoModel,
   normalizeVideoModel,
+  omniClipDurations,
+  omniDurationParam,
+  OMNI_MAX_CLIP_SECONDS,
+  DEFAULT_VIDEO_SECONDS,
 } from "./videoModels";
 
 interface VideoGenerationResult {
@@ -37,9 +41,9 @@ interface VideoGenerationResult {
 const GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions";
 // Omni output resolutions. Seedance's 480p (and anything unknown) maps to 720p.
 export const OMNI_RESOLUTIONS = ["360p", "720p", "1080p", "4k"] as const;
-// Omni returns ~10s per clip (no duration parameter is sent — it is not in the
-// Interactions API types, so we take the model default and trim in Remotion).
-const OMNI_CLIP_SECONDS = 10;
+// Omni clips are at most 10s; each is requested at its exact length via
+// response_format.duration ("5s" — see omniDurationParam / omniClipDurations).
+const OMNI_CLIP_SECONDS = OMNI_MAX_CLIP_SECONDS;
 
 // Seedance 2.0 is served only through Higgsfield's hosted MCP server (registered in
 // the admin MCP Servers tab as "higgsfield", OAuth). The name is overridable via env.
@@ -333,6 +337,9 @@ export class VideoService {
           ? (params.resolution as string)
           : "720p",
       };
+      if (typeof params.durationSeconds === "number" && Number.isFinite(params.durationSeconds)) {
+        responseFormat.duration = omniDurationParam(params.durationSeconds);
+      }
       // 'auto' is left unset so Omni defaults / matches the input frame.
       const aspect = closestOmniAspectRatio(params.aspectRatio);
       if (aspect === "16:9" || aspect === "9:16") {
@@ -342,6 +349,7 @@ export class VideoService {
       const timeoutMs = remainingBudgetMs(Date.now(), deadlineMs);
       console.log(
         `VideoService: Omni request (${imageParts.length} frame(s), ${responseFormat.resolution}, ` +
+        `duration=${responseFormat.duration ?? "default"}, ` +
         `aspect=${responseFormat.aspect_ratio ?? "auto"}, timeout=${Math.round(timeoutMs / 1000)}s)`
       );
       const response = await axios.post(
@@ -743,17 +751,11 @@ export class VideoService {
       const modelToUse = params.videoModel;
       
       // Determine how many clips to generate.
-      // Omni returns ~10s per clip; for longer videos generate multiple clips in parallel.
-      // Per-clip playback durations can be variable (e.g. [10,10,10] / [10,4] for 30s / 14s).
-      const OMNI_MIN_SECONDS = 4;
-      const requestedDuration = params.durationSeconds ?? 8;
-      const clipCount = requestedDuration > OMNI_CLIP_SECONDS ? Math.ceil(requestedDuration / OMNI_CLIP_SECONDS) : 1;
-      // Playback durations: all full-length except possibly the last
-      const remainder = requestedDuration - (clipCount - 1) * OMNI_CLIP_SECONDS;
-      const lastClipPlayback = Math.max(OMNI_MIN_SECONDS, Math.min(OMNI_CLIP_SECONDS, remainder));
-      const clipPlaybackDurations: number[] = Array.from({ length: clipCount }, (_, i) =>
-        i === clipCount - 1 ? lastClipPlayback : OMNI_CLIP_SECONDS
-      );
+      // Omni clips are <=10s; longer videos are split into clips generated in parallel,
+      // each requested at its exact length (e.g. [10,10,10] / [10,4] / [10,8,3] for 30s / 14s / 21s).
+      const requestedDuration = params.durationSeconds ?? DEFAULT_VIDEO_SECONDS;
+      const clipPlaybackDurations = omniClipDurations(requestedDuration);
+      const clipCount = clipPlaybackDurations.length;
 
       // Generate video
       let result: VideoGenerationResult;
@@ -788,7 +790,7 @@ export class VideoService {
         } else if (modelToUse === GEMINI_OMNI_VIDEO_MODEL) {
           console.log(`VideoService: Generating ${clipCount} Omni clip(s) for requested ${requestedDuration}s, playback=[${clipPlaybackDurations.join(',')}]s`);
           if (clipCount === 1) {
-            result = await this.generateWithOmni(params);
+            result = await this.generateWithOmni({ ...params, durationSeconds: clipPlaybackDurations[0] });
             if (result.success && result.videoUrl) {
               clipUrls = [result.videoUrl];
             }
@@ -806,6 +808,7 @@ export class VideoService {
                 this.generateWithOmni({
                   ...params,
                   filename: `${filenameBase}_clip${i + 1}.mp4`,
+                  durationSeconds: clipPlaybackDurations[i],
                   // Keyframe steering: clip[i] goes from frame[i] to frame[i+1]
                   startFrame: keyframes ? keyframes[i] : params.startFrame,
                   endFrame: keyframes ? keyframes[i + 1] : params.endFrame,
