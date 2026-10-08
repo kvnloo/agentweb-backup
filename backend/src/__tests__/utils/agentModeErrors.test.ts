@@ -3,7 +3,9 @@ import {
   isSessionLimitError,
   isContextLimitError,
   isTransientLLMError,
-  isWorkerShutdownError
+  isWorkerShutdownError,
+  isProviderNoEndpointsError,
+  extractAffordableTokens
 } from '../../utils/agentModeErrors';
 
 describe('agentModeErrors utils', () => {
@@ -145,6 +147,56 @@ describe('agentModeErrors utils', () => {
     it('should return false for unrelated worker strings', () => {
       expect(isWorkerShutdownError(new Error('Worker shutdown unexpectedly'))).toBe(false);
       expect(isWorkerShutdownError('ordinary failure')).toBe(false);
+    });
+  });
+
+  describe('isProviderNoEndpointsError', () => {
+    it('should return false for null/undefined', () => {
+      expect(isProviderNoEndpointsError(null)).toBe(false);
+      expect(isProviderNoEndpointsError(undefined)).toBe(false);
+    });
+
+    it('should detect the real OpenRouter 404 message (ENG-2293 Opslane finding)', () => {
+      expect(isProviderNoEndpointsError(new Error('404 No endpoints found that can handle the requested parameters'))).toBe(true);
+    });
+
+    it('should check originalMessage on a wrapped error', () => {
+      const wrapped = new Error('Unknown Error');
+      (wrapped as any).originalMessage = 'No endpoints found that can handle the requested parameters';
+      expect(isProviderNoEndpointsError(wrapped)).toBe(true);
+    });
+
+    it('should return false for unrelated errors', () => {
+      expect(isProviderNoEndpointsError(new Error('high demand'))).toBe(false);
+      expect(isProviderNoEndpointsError('ordinary failure')).toBe(false);
+    });
+
+    it('should tolerate case and "available" wording drift', () => {
+      expect(isProviderNoEndpointsError(new Error('no endpoints found'))).toBe(true);
+      expect(isProviderNoEndpointsError(new Error('No endpoints available for this model'))).toBe(true);
+    });
+
+    it('should find the message on the nested original error', () => {
+      const wrapped: any = new Error('Unknown Error');
+      wrapped.originalError = new Error('404 No endpoints found that can handle the requested parameters');
+      expect(isProviderNoEndpointsError(wrapped)).toBe(true);
+    });
+
+    it('should match a reworded 404 that still names the requested parameters', () => {
+      const wrapped: any = new Error('Unknown Error');
+      wrapped.status = 404;
+      wrapped.originalMessage = 'No routable provider for the requested parameters';
+      expect(isProviderNoEndpointsError(wrapped)).toBe(true);
+    });
+
+    it('should NOT treat a bare 404 as a routing failure (wrong slug/URL must stay loud)', () => {
+      const wrapped: any = new Error('Unknown Error');
+      wrapped.status = 404;
+      wrapped.originalMessage = 'Not Found';
+      expect(isProviderNoEndpointsError(wrapped)).toBe(false);
+      const wording: any = new Error('Unknown Error');
+      wording.originalMessage = 'the requested parameters were invalid';
+      expect(isProviderNoEndpointsError(wording)).toBe(false);
     });
   });
 
@@ -349,6 +401,53 @@ describe('agentModeErrors utils', () => {
         originalMessage: 'context length exceeded',
       });
       expect(isContextLimitError(wrappedError)).toBe(true);
+    });
+  });
+
+  // ENG-2185: prod session f6c882d0… (2026-09-25) — a spend-limited OpenRouter
+  // key rejected a request with this exact message; the affordable-tokens
+  // number is what a capped retry needs to turn the failure into a success.
+  describe('extractAffordableTokens', () => {
+    it('should return null for falsy/unrelated errors', () => {
+      expect(extractAffordableTokens(null)).toBeNull();
+      expect(extractAffordableTokens(undefined)).toBeNull();
+      expect(extractAffordableTokens(new Error('some other error'))).toBeNull();
+    });
+
+    it('should extract the affordable token count from the real production message', () => {
+      const err = new Error(
+        'This request requires more credits, or fewer max_tokens. You requested up to 32000 tokens, but can only afford 24420. To increase, visit https://openrouter.ai/workspaces/default/keys/abc123 and adjust the key\'s monthly limit',
+      );
+      expect(extractAffordableTokens(err)).toBe(24420);
+    });
+
+    it('should be case-insensitive', () => {
+      const err = new Error('REQUIRES MORE CREDITS. YOU REQUESTED... BUT CAN ONLY AFFORD 100');
+      expect(extractAffordableTokens(err)).toBe(100);
+    });
+
+    it('should detect the pattern via originalMessage on a wrapped error', () => {
+      const wrappedError = Object.assign(new Error('wrapped'), {
+        originalMessage: 'requires more credits, or fewer max_tokens... can only afford 500',
+      });
+      expect(extractAffordableTokens(wrappedError)).toBe(500);
+    });
+
+    it('should return null when the message names credits but not an affordable count', () => {
+      expect(extractAffordableTokens(new Error('requires more credits, please upgrade your plan'))).toBeNull();
+    });
+
+    // CodeRabbit (PR #3117): an earlier version matched both markers with a single
+    // regex and an unbounded greedy `.*` between them — quadratic on a long
+    // non-matching message (benchmarked at ~1.43s for 160KB). Pins that a large,
+    // adversarial-shaped message that never actually matches still resolves
+    // near-instantly, on both the primary message and the originalMessage path.
+    it('should resolve near-instantly on a large non-matching message (no catastrophic backtracking)', () => {
+      const huge = 'requires more credits, '.repeat(20_000); // ~480KB, never contains the second marker
+      const start = Date.now();
+      expect(extractAffordableTokens(new Error(huge))).toBeNull();
+      expect(extractAffordableTokens(Object.assign(new Error('wrapped'), { originalMessage: huge }))).toBeNull();
+      expect(Date.now() - start).toBeLessThan(200);
     });
   });
 });

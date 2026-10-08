@@ -14,6 +14,10 @@ let mockUsers: Record<string, any> = {};
 let mockOrgs: Record<string, any> = {};
 let mockSubscriptionType = 'Starter';
 let mockSubscriptionResolution: { subscriptionType: string; resolved: boolean } | undefined;
+// `null` by default: most tests never configured a tier's `seatPricing`
+// (matches production reality for every tier until an admin sets it), so
+// `/me`'s seatInfo.seatPricing should be absent unless a test opts in.
+let mockTierConfig: { seatPricing?: any; llmUsagePolicy?: any } | null = null;
 
 // Mock auth middleware
 jest.mock('../middleware/auth', () => ({
@@ -110,6 +114,13 @@ jest.mock('../services/subscriptionService', () => ({
   getUserSubscriptionResolution: jest.fn(() => Promise.resolve(
     mockSubscriptionResolution ?? { subscriptionType: mockSubscriptionType, resolved: true },
   )),
+  // Controllable per-test via `mockTierConfig` below — exercises the real
+  // `/me` code path that reads `seatPricing`/`llmUsagePolicy` off the tier
+  // config, rather than assuming the mock would never diverge from it (the
+  // previous version of this mock omitted `getTierConfig` entirely, which
+  // would have thrown "not a function" the moment `/me` started calling it —
+  // caught here, not in production).
+  getTierConfig: jest.fn(() => Promise.resolve(mockTierConfig)),
 }));
 const orgRoutes = require('../routes/org').default;
 
@@ -145,6 +156,7 @@ describe('Organization routes', () => {
     // each test's `attemptedFetches` assertions independent of run order.
     installNoNetworkGuard();
     mockSendEmail.mockResolvedValue(undefined);
+    mockTierConfig = null;
     mockOrgs = {};
     mockUsers = {
       'user-1': {
@@ -299,6 +311,118 @@ describe('Organization routes', () => {
       // Members should not include sensitive data
       expect(res.body.data.members[0]).not.toHaveProperty('password');
     });
+
+    // ENG-2250: the frontend's paywall/usage UI reads org.seatInfo. It was
+    // never sent before this, so that UI has been silently inert.
+    describe('seatInfo', () => {
+      beforeEach(() => {
+        mockOrgs['org-1'] = {
+          orgId: 'org-1',
+          name: 'Test Org',
+          ownerUserId: 'user-1',
+        };
+        mockUsers['user-1'].orgId = 'org-1';
+        mockUsers['user-1'].orgRole = 'owner';
+      });
+
+      it('returns seatInfo for a capped-tier org, computed from the owner tier and live member count', async () => {
+        mockSubscriptionType = 'Starter'; // base 2
+        mockUsers['user-2'].orgId = 'org-1';
+        mockUsers['user-2'].orgRole = 'member';
+        (mockOrgs['org-1'] as any).purchasedExtraSeats = 3;
+
+        const res = await request(app).get('/api/org/me');
+
+        expect(res.status).toBe(200);
+        expect(res.body.data.seatInfo).toEqual({
+          baseSeats: 2,
+          purchasedExtraSeats: 3,
+          effectiveCap: 5,
+          currentMemberCount: 2,
+        });
+      });
+
+      it('reports a true pre-existing overage rather than special-casing it — currentMemberCount can exceed effectiveCap', async () => {
+        mockSubscriptionType = 'Starter'; // base 2, no purchased extra seats
+        for (let i = 0; i < 4; i++) {
+          mockUsers[`filler-${i}`] = { userId: `filler-${i}`, email: `filler-${i}@example.com`, orgId: 'org-1', orgRole: 'member' };
+        }
+        // 5 members total (owner + 4 fillers) against an effective cap of 2.
+
+        const res = await request(app).get('/api/org/me');
+
+        expect(res.status).toBe(200);
+        expect(res.body.data.seatInfo).toEqual({
+          baseSeats: 2,
+          purchasedExtraSeats: 0,
+          effectiveCap: 2,
+          currentMemberCount: 5,
+        });
+      });
+
+      it('omits seatInfo entirely (not null) for an uncapped-tier org', async () => {
+        mockSubscriptionType = 'Managed';
+
+        const res = await request(app).get('/api/org/me');
+
+        expect(res.status).toBe(200);
+        expect(Object.prototype.hasOwnProperty.call(res.body.data, 'seatInfo')).toBe(false);
+      });
+
+      // Found via live production verification (2026-10-01): the frontend's
+      // SeatPaywallModal/getSeatUsageBoostCopy have been reading
+      // `org.seatInfo.seatPricing` since they shipped, but nothing ever sent
+      // it — confirmed live by triggering the real paywall modal in a browser
+      // and seeing the hardcoded "$50/mo" fallback and no usage-boost line,
+      // not the real configured numbers. This is the fix: forward the tier's
+      // admin-configured seatPricing (and the hard cost cap the boost
+      // percentage is computed against) once it exists, omit it when it
+      // doesn't — same "absent means nothing to show" contract as seatInfo
+      // itself, so an unconfigured tier doesn't regress to showing zeros.
+      it('forwards seatPricing (+ the tier hard cap) once an admin has configured it, so the already-built paywall copy stops being permanently inert', async () => {
+        mockSubscriptionType = 'Starter';
+        mockTierConfig = {
+          seatPricing: { priceCents: 5000, usageCreditMicroUsd: 30_000_000, baseSeats: 2 },
+          llmUsagePolicy: { hardCostThresholdMicroUsd: 80_000_000 },
+        };
+
+        const res = await request(app).get('/api/org/me');
+
+        expect(res.status).toBe(200);
+        expect(res.body.data.seatInfo.seatPricing).toEqual({
+          priceCents: 5000,
+          usageCreditMicroUsd: 30_000_000,
+          hardCostThresholdMicroUsd: 80_000_000,
+        });
+      });
+
+      it('omits seatPricing (not zeros) when the tier has no seatPricing configured yet — the live production state for every tier until this session configured it', async () => {
+        mockSubscriptionType = 'Starter';
+        mockTierConfig = { llmUsagePolicy: { hardCostThresholdMicroUsd: 80_000_000 } }; // no seatPricing
+
+        const res = await request(app).get('/api/org/me');
+
+        expect(res.status).toBe(200);
+        expect(Object.prototype.hasOwnProperty.call(res.body.data.seatInfo, 'seatPricing')).toBe(false);
+      });
+
+      it('omits hardCostThresholdMicroUsd (not null) when seatPricing is configured but the tier has no llmUsagePolicy', async () => {
+        mockSubscriptionType = 'Starter';
+        mockTierConfig = {
+          seatPricing: { priceCents: 5000, usageCreditMicroUsd: 30_000_000, baseSeats: 2 },
+          // llmUsagePolicy deliberately absent
+        };
+
+        const res = await request(app).get('/api/org/me');
+
+        expect(res.status).toBe(200);
+        expect(res.body.data.seatInfo.seatPricing).toEqual({
+          priceCents: 5000,
+          usageCreditMicroUsd: 30_000_000,
+          hardCostThresholdMicroUsd: undefined,
+        });
+      });
+    });
   });
 
   describe('PUT /api/org/:orgId - update org', () => {
@@ -376,6 +500,7 @@ describe('Organization routes', () => {
           meta_targeting_brief: 'VP Sales and RevOps leaders at B2B SaaS companies',
         },
       ];
+      mockUsers['user-1'].icpCompletedAt = '2026-06-20T00:00:00.000Z';
 
       const res = await request(app).post('/api/org/org-1/copy-profile').send({});
 
@@ -389,6 +514,48 @@ describe('Organization routes', () => {
           buyerPersonas: ['VP Sales and RevOps leaders at B2B SaaS companies'],
         },
       ]);
+      // ENG-1955 follow-up (Greptile P1): this is a system copy of the
+      // owner's own icpResult generation, not a fresh manual edit — must be
+      // backdated to icpCompletedAt, not stamped with copy-time `now()`, or
+      // the org's very first "Use my ICP" click after copy-profile would
+      // wrongly look like a genuine correction and skip the icpResult cache
+      // for every member forever.
+      expect(mockOrgs['org-1'].marketStrategy.icpUpdatedAt).toBe('2026-06-20T00:00:00.000Z');
+    });
+
+    it('falls back to copy-time now() for icpUpdatedAt when the owner has no icpCompletedAt (defensive — should not normally happen)', async () => {
+      mockUsers['user-1'].icpResult = [
+        { name: 'A', pain: 'p', desire: 'd', objection: 'o', meta_targeting_brief: 'm' },
+      ];
+      delete mockUsers['user-1'].icpCompletedAt;
+
+      const res = await request(app).post('/api/org/org-1/copy-profile').send({});
+
+      expect(res.status).toBe(200);
+      expect(typeof mockOrgs['org-1'].marketStrategy.icpUpdatedAt).toBe('string');
+    });
+
+    it('preserves the existing icpUpdatedAt when icp is already populated (this copy only fills competitors)', async () => {
+      mockUsers['user-1'].marketStrategy = {
+        businessOverview: 'Existing overview.',
+        competitors: [],
+        icp: [{ title: 'Existing ICP', description: '', valueProposition: '', buyerPersonas: [] }],
+        createdAt: '2026-06-20T00:00:00.000Z',
+        updatedAt: '2026-06-20T00:00:00.000Z',
+        icpUpdatedAt: '2026-06-19T00:00:00.000Z',
+      };
+      mockUsers['user-1'].competitorResult = {
+        per_icp: [
+          { icp_id: 'icp-1', competitor_names: ['Some Competitor'], offer_angles: ['Angle'], meta_targeting_brief: 'brief' },
+        ],
+      };
+
+      const res = await request(app).post('/api/org/org-1/copy-profile').send({});
+
+      expect(res.status).toBe(200);
+      expect(mockOrgs['org-1'].marketStrategy.competitors.length).toBeGreaterThan(0);
+      // icp content untouched by this copy — icpUpdatedAt must not move either.
+      expect(mockOrgs['org-1'].marketStrategy.icpUpdatedAt).toBe('2026-06-19T00:00:00.000Z');
     });
 
     it('copies competitors from onboarding results when marketStrategy is missing', async () => {
@@ -553,15 +720,36 @@ describe('Organization routes', () => {
       expect(mockOrgs['org-1'].pendingInvites).toHaveLength(1);
     });
 
-    // Replaces the removed maxMembers/memberCount capacity tests. Org size is no
-    // longer capped: tiers are usage-based, not seat-based, so there is nothing
-    // for a seat limit to enforce. Orgs that predate this still carry a stored
-    // maxMembers attribute; nothing reads it, so it is inert.
-    it('does not cap org size — an invite succeeds well past the old limit of 5', async () => {
-      for (let i = 0; i < 12; i++) {
+    // ENG-2250 superseded this invariant. This test used to prove org size was
+    // never capped (tiers were usage-based, not seat-based, so there was
+    // nothing for a seat limit to enforce). Seat-based billing reinstates a
+    // real cap for capped tiers (Starter/Pro) going forward — this is the
+    // confirmed, intended behavior, not a regression: an org already over its
+    // new cap (this one has 5 Starter-tier members against a base of 2, no
+    // purchased extra seats — exactly the "already over-cap before this
+    // feature" case) cannot add a new member until the owner buys seats or
+    // removes someone. No existing member is touched by this — see
+    // orgSeatService.test.ts / the dedicated non-removal test below for that.
+    it('blocks an invite for an org already over its seat cap before this feature shipped (no retroactive punishment, just no further growth)', async () => {
+      for (let i = 0; i < 4; i++) {
         mockUsers[`filler-${i}`] = { userId: `filler-${i}`, email: `filler-${i}@example.com`, orgId: 'org-1', orgRole: 'member' };
       }
-      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'thirteenth@example.com' });
+      // 5 members total (owner + 4 fillers) against a Starter base of 2 —
+      // already over cap, with zero purchased extra seats.
+      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'sixth@example.com' });
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('SEAT_LIMIT_REACHED');
+      // No existing member is removed, demoted, or otherwise touched.
+      for (let i = 0; i < 4; i++) {
+        expect(mockUsers[`filler-${i}`].orgId).toBe('org-1');
+      }
+      expect(mockOrgs['org-1'].pendingInvites).toHaveLength(0);
+    });
+
+    it('succeeds for a Starter org below its seat cap', async () => {
+      // Only the owner is in the org at this point (base beforeEach) — 1 of 2
+      // Starter seats used, so there's room for exactly one more.
+      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'second@example.com' });
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
     });

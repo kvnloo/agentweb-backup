@@ -74,11 +74,22 @@ describe('MCP Publishing & Content Tools', () => {
     });
   });
 
-  describe('post_on_account tool', () => {
+  describe('post_on_account tool (internalOnly)', () => {
     it('should be registered in the tool registry', () => {
       const tool = mcpToolRegistry.getTool('post_on_account');
       expect(tool).toBeDefined();
       expect(tool?.name).toBe('post_on_account');
+    });
+
+    it('should be hidden from external MCP clients', () => {
+      const externalNames = mcpToolRegistry.getToolDefinitions().map((d: any) => d.name);
+      expect(externalNames).not.toContain('post_on_account');
+    });
+
+    it('should refuse external MCP execute (ENG-974)', () => {
+      const tool = mcpToolRegistry.getTool('post_on_account');
+      expect(tool?.internal).toBe(true);
+      expect(tool?.internalOnly).toBe(true);
     });
 
     it('should have required parameters', () => {
@@ -110,7 +121,7 @@ describe('MCP Publishing & Content Tools', () => {
       const toolNames = definitions.map((d: any) => d.name);
 
       // External tools visible to MCP clients
-      expect(toolNames).toContain('post_on_account');
+      expect(toolNames).not.toContain('post_on_account');
       expect(toolNames).toContain('list_connected_accounts');
 
       // Internal tools hidden from MCP clients

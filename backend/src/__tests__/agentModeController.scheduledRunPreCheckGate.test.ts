@@ -1,3 +1,5 @@
+jest.mock('../services/evaluationStore', () => ({ evaluationStore: { discardJob: jest.fn().mockResolvedValue(undefined) } }));
+import { evaluationStore } from '../services/evaluationStore';
 /**
  * ENG-1259 — cheap pre-check gate wiring in `runScheduledChat`.
  *
@@ -157,6 +159,11 @@ const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockWorker = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
 
 describe('runScheduledChat — ENG-1259 cheap pre-check gate', () => {
+  it('ENG-1870 rejects evaluation jobs before invoking any generation worker', async () => {
+    await expect(runScheduledChat({ scheduleId: 'synthetic', userId: 'eval_test' }, 'eval_test')).rejects.toThrow('Evaluation access denied');
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    expect(evaluationStore.discardJob).toHaveBeenCalledWith('eval_test', 'synthetic');
+  });
   const mockUserId = 'test-user-lucas';
   const mockScheduleId = 'test-schedule-lucas';
 

@@ -19,7 +19,7 @@ jest.mock('../services/db', () => ({
   },
 }));
 
-import { mirrorLinkedInInviteToCrm } from '../services/linkedInInviteCrmMirror';
+import { mirrorLinkedInInviteToCrm, recordInviteWithdrawnInCrm, INVITE_WITHDRAWN_EVENT } from '../services/linkedInInviteCrmMirror';
 
 const LIST = 'list_1782945941846_b0ptvsguv';
 
@@ -138,7 +138,7 @@ describe('mirrorLinkedInInviteToCrm', () => {
       userId: 'user_1',
       leadId: expect.stringMatching(/^lead_li_[0-9a-f]+$/),
       failIfExists: true,
-    }));
+    }), 'linkedin');
     // Engagement appended through the unified CAS path (4th opts arg present).
     expect(addLeadEngagement).toHaveBeenCalledWith(LIST, 'lead_new_1', expect.objectContaining({
       eventType: 'linkedin.invite.sent',
@@ -403,7 +403,7 @@ describe('mirrorLinkedInInviteToCrm', () => {
       });
 
       expect(res).toEqual({ leadId: 'lead_new_1', listId: LIST, created: true, engagementLogged: true });
-      expect(createLead).toHaveBeenCalledWith(LIST, expect.objectContaining({ linkedin: PROFILE }));
+      expect(createLead).toHaveBeenCalledWith(LIST, expect.objectContaining({ linkedin: PROFILE }), 'linkedin');
     });
 
     it('accepts a leadId whose URL matches only after canonicalization', async () => {
@@ -604,7 +604,7 @@ describe('mirrorLinkedInInviteToCrm', () => {
         listId: LIST, linkedinUrl: PROFILE, searchListIds: [OTHER],
       });
       expect(res?.listId).toBe(LIST);
-      expect(createLead).toHaveBeenCalledWith(LIST, expect.anything());
+      expect(createLead).toHaveBeenCalledWith(LIST, expect.anything(), 'linkedin');
     });
 
     it('bounds the cross-list search so a huge account cannot fan out', async () => {
@@ -825,5 +825,85 @@ describe('mirrorLinkedInInviteToCrm', () => {
         listId: LIST, linkedinUrl: PROFILE, accountId: 'acct_1', invitationId: 'inv_1',
       })).rejects.toThrow('dynamo down');
     });
+  });
+});
+
+// ENG-1719 / CodeRabbit on PR #2801. The first version of recordInviteWithdrawnInCrm
+// had the duplicate GUARD but not the CAS: addLeadEngagement appends
+// unconditionally unless expectedUpdatedAt is supplied, so the read and the append
+// are two operations and two concurrent drains can both observe "not present" and
+// both append.
+describe('recordInviteWithdrawnInCrm', () => {
+  const URL = 'https://www.linkedin.com/in/withdrawee/';
+  // What normalizeLinkedInUrl stores — the trailing slash is stripped, so a
+  // fixture using the raw URL would never match the duplicate check.
+  const NORM = 'https://www.linkedin.com/in/withdrawee';
+  const lead = (engagements: any[] = [], updatedAt = '2026-09-01T00:00:00.000Z') => ({
+    leadId: 'lead_w1', updatedAt, engagements,
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    addLeadEngagement.mockResolvedValue({});
+    getLeadById.mockResolvedValue(null);
+  });
+
+  it('guards the append on the lead being unchanged since the read', async () => {
+    findLeadByLinkedinInList.mockResolvedValue(lead());
+
+    await recordInviteWithdrawnInCrm({
+      userId: 'u1', accountId: 'acc-1', linkedinUrl: URL, invitationId: 'inv-1', listId: LIST,
+    });
+
+    expect(addLeadEngagement).toHaveBeenCalledWith(
+      LIST, 'lead_w1',
+      expect.objectContaining({ eventType: INVITE_WITHDRAWN_EVENT }),
+      { expectedUpdatedAt: '2026-09-01T00:00:00.000Z' },
+    );
+  });
+
+  it('on a lost race, re-reads and skips when the winner already wrote it', async () => {
+    findLeadByLinkedinInList.mockResolvedValue(lead());
+    const precondition: any = new Error('stale'); precondition.preconditionFailed = true;
+    addLeadEngagement.mockRejectedValueOnce(precondition);
+    // The winner's engagement is present on re-read.
+    getLeadById.mockResolvedValue(lead([{
+      eventType: INVITE_WITHDRAWN_EVENT,
+      eventData: { linkedin: NORM, accountId: 'acc-1', invitationId: 'inv-1' },
+    }], '2026-09-01T00:00:05.000Z'));
+
+    const res = await recordInviteWithdrawnInCrm({
+      userId: 'u1', accountId: 'acc-1', linkedinUrl: URL, invitationId: 'inv-1', listId: LIST,
+    });
+
+    expect(res).toEqual({ leadId: 'lead_w1', listId: LIST, engagementLogged: true });
+    // One failed attempt, then the duplicate check stops it — no blind second append.
+    expect(addLeadEngagement).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not append twice for the same withdrawal', async () => {
+    findLeadByLinkedinInList.mockResolvedValue(lead([{
+      eventType: INVITE_WITHDRAWN_EVENT,
+      eventData: { linkedin: NORM, accountId: 'acc-1', invitationId: 'inv-1' },
+    }]));
+
+    await recordInviteWithdrawnInCrm({
+      userId: 'u1', accountId: 'acc-1', linkedinUrl: URL, invitationId: 'inv-1', listId: LIST,
+    });
+
+    expect(addLeadEngagement).not.toHaveBeenCalled();
+  });
+
+  it('never creates a lead — a withdrawal is not an act of outreach', async () => {
+    findLeadByLinkedinInList.mockResolvedValue(null);
+
+    const res = await recordInviteWithdrawnInCrm({
+      userId: 'u1', accountId: 'acc-1', linkedinUrl: URL, invitationId: 'inv-1', listId: LIST,
+    });
+
+    expect(res).toBeNull();
+    expect(createLead).not.toHaveBeenCalled();
+    expect(updateLead).not.toHaveBeenCalled();
+    expect(addLeadEngagement).not.toHaveBeenCalled();
   });
 });

@@ -1,3 +1,4 @@
+jest.mock('../services/agentMode/adsLearning', () => ({ recordCreativeLearningReceipt: jest.fn().mockResolvedValue(undefined) }));
 // Mock MCP client service first
 jest.mock('../mcp/client/mcpClientService', () => ({
   McpClientService: jest.fn().mockImplementation(() => ({
@@ -7,7 +8,9 @@ jest.mock('../mcp/client/mcpClientService', () => ({
 
 // Mock the dependencies
 jest.mock('../services/metaService', () => ({
+  normalizeMetaMoney: jest.requireActual('../services/metaService').normalizeMetaMoney,
   metaService: {
+    getAdAccountCurrency: jest.fn().mockResolvedValue('USD'),
     listAdSets: jest.fn(),
     createAdSet: jest.fn(),
     updateAdSet: jest.fn(),
@@ -45,6 +48,11 @@ jest.mock('../services/db', () => ({
   }
 }));
 
+jest.mock('../services/landerUtmStore', () => ({
+  getCustomerUtmDefault: jest.fn(),
+  getLanderUtmOverride: jest.fn(),
+}));
+
 jest.mock('../utils/secretsManager', () => ({
   getMetaAccessToken: jest.fn().mockResolvedValue('mock-access-token')
 }));
@@ -52,6 +60,7 @@ jest.mock('../utils/secretsManager', () => ({
 import { AgentModeService } from '../services/agentModeService';
 import { metaService } from '../services/metaService';
 import { userDb } from '../services/db';
+import { getCustomerUtmDefault, getLanderUtmOverride } from '../services/landerUtmStore';
 
 describe('AgentModeService - Meta Ads Complete CRUD', () => {
   let agentModeService: AgentModeService;
@@ -137,7 +146,7 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         const result = await agentModeService.createMetaAdsAdSet('user123', params);
 
         expect(result.success).toBe(true);
-        expect(result.message).toBe('Ad set "New Ad Set" created successfully');
+        expect(result.message).toBe('Ad set "New Ad Set" created successfully (money submitted: daily_budget: 100000 (= $1,000.00); bid_amount: 200 (= $2.00))');
         expect(result.adSet).toEqual(mockAdSetData);
       });
 
@@ -224,7 +233,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateAdSet).toHaveBeenCalledWith(
           'mock-access-token',
           'adset_123',
-          expect.objectContaining({ daily_budget: 15000 })
+          expect.objectContaining({ daily_budget: 15000 }),
+          '123456789'
         );
       });
 
@@ -239,7 +249,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateAdSet).toHaveBeenCalledWith(
           'mock-access-token',
           'adset_123',
-          expect.objectContaining({ lifetime_budget: 50000 })
+          expect.objectContaining({ lifetime_budget: 50000 }),
+          '123456789'
         );
       });
 
@@ -254,7 +265,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateAdSet).toHaveBeenCalledWith(
           'mock-access-token',
           'adset_123',
-          expect.objectContaining({ bid_amount: 250 })
+          expect.objectContaining({ bid_amount: 250 }),
+          '123456789'
         );
       });
 
@@ -269,7 +281,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateAdSet).toHaveBeenCalledWith(
           'mock-access-token',
           'adset_123',
-          expect.objectContaining({ name: 'Renamed Ad Set', status: 'ACTIVE' })
+          expect.objectContaining({ name: 'Renamed Ad Set', status: 'ACTIVE' }),
+          '123456789'
         );
       });
     });
@@ -324,6 +337,83 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
     });
 
     describe('createMetaAdsAdCreative', () => {
+      const utmParams = {
+        name: 'UTM Creative',
+        page_id: 'page_123',
+        image_hash: 'hash_123',
+        body: 'Body',
+        title: 'Title',
+        link_url: 'https://example.com/lander',
+        lander_id: 'lander_123',
+      };
+
+      it('emits customer defaults through the shared lander resolver', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (getCustomerUtmDefault as jest.Mock).mockResolvedValue({ utm_source: 'customer', utm_medium: 'paid' });
+        (getLanderUtmOverride as jest.Mock).mockResolvedValue(null);
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_utm', name: 'UTM Creative' });
+
+        await agentModeService.createMetaAdsAdCreative('user123', utmParams);
+
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({
+            url_tags: 'utm_source=customer&utm_medium=paid&aw_lander=1',
+          }),
+        );
+      });
+
+      it('keeps Meta macros unencoded in configured UTM values', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (getCustomerUtmDefault as jest.Mock).mockResolvedValue({ utm_campaign: '{{campaign.id}}' });
+        (getLanderUtmOverride as jest.Mock).mockResolvedValue(null);
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_utm', name: 'UTM Creative' });
+
+        await agentModeService.createMetaAdsAdCreative('user123', utmParams);
+
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({ url_tags: 'utm_campaign={{campaign.id}}&aw_lander=1' }),
+        );
+      });
+
+      it('lets a per-lander override win and preserves click ids', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (getCustomerUtmDefault as jest.Mock).mockResolvedValue({ utm_source: 'customer', utm_campaign: 'default' });
+        (getLanderUtmOverride as jest.Mock).mockResolvedValue({ utm_source: 'lander', utm_campaign: 'override' });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_utm', name: 'UTM Creative' });
+
+        await agentModeService.createMetaAdsAdCreative('user123', {
+          ...utmParams,
+          url_tags: 'gclid=google-click&fbclid=meta-click',
+        });
+
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({
+            url_tags: 'utm_source=lander&utm_campaign=override&gclid=google-click&fbclid=meta-click&aw_lander=1',
+          }),
+        );
+      });
+
+      it('keeps url_tags absent when no default or override exists', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (getCustomerUtmDefault as jest.Mock).mockResolvedValue(null);
+        (getLanderUtmOverride as jest.Mock).mockResolvedValue(null);
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_utm', name: 'UTM Creative' });
+
+        await agentModeService.createMetaAdsAdCreative('user123', utmParams);
+
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.not.objectContaining({ url_tags: expect.anything() }),
+        );
+      });
+
       it('should successfully create an ad creative', async () => {
         const mockCreativeData = { id: 'creative_123', name: 'New Creative' };
         const params = {
@@ -567,7 +657,7 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
 
         expect(result.success).toBe(true);
         expect(result.message).toBe('Ad updated successfully');
-        expect(metaService.updateAd).toHaveBeenCalledWith('mock-access-token', 'ad_123', params);
+        expect(metaService.updateAd).toHaveBeenCalledWith('mock-access-token', 'ad_123', params, '123456789');
         // Should NOT call getAd or getAdCreative for ad-level updates
         expect(metaService.getAd).not.toHaveBeenCalled();
         expect(metaService.getAdCreative).not.toHaveBeenCalled();
@@ -593,7 +683,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateAd).toHaveBeenCalledWith(
           'mock-access-token',
           'ad_123',
-          { creative: { creative_id: 'new_creative_B' } }
+          { creative: { creative_id: 'new_creative_B' } },
+          '123456789'
         );
         // Must NOT pass a bare top-level creative_id to Meta
         expect(metaService.updateAd).not.toHaveBeenCalledWith(
@@ -627,13 +718,15 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateAd).toHaveBeenCalledWith(
           'mock-access-token',
           'ad_123',
-          { creative: { creative_id: 'new_creative_B' } }
+          { creative: { creative_id: 'new_creative_B' } },
+          '123456789'
         );
         // The ad-level status change is issued separately, without the creative_id
         expect(metaService.updateAd).toHaveBeenCalledWith(
           'mock-access-token',
           'ad_123',
-          { status: 'ACTIVE' }
+          { status: 'ACTIVE' },
+          '123456789'
         );
       });
 
@@ -731,7 +824,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateAd).toHaveBeenCalledWith(
           'mock-access-token',
           'ad_123',
-          { creative: { creative_id: 'new_creative_456' } }
+          { creative: { creative_id: 'new_creative_456' } },
+          '123456789'
         );
       });
 
@@ -965,6 +1059,129 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect((metaService.updateAd as jest.Mock).mock.calls.filter(
           (c: any[]) => c[2]?.creative?.creative_id === 'new_creative_456'
         ).length).toBe(3);
+      });
+
+      describe('image swap (ENG-2169)', () => {
+        const OLD_LINK_SPEC = {
+          page_id: 'page_123',
+          link_data: { message: 'Hi', link: 'https://old.com', name: 'T', image_hash: 'old_hash', picture: 'https://cdn/old.jpg' }
+        };
+        const OLD_VIDEO_SPEC = {
+          page_id: 'page_123',
+          video_data: { video_id: 'vid_1', image_hash: 'old_thumb_hash', message: 'Hi', title: 'T' }
+        };
+
+        // getAdCreative: first call reads the old creative, second reads back the created one.
+        const mockSwap = (oldSpec: object, createdSpec: object) => {
+          jest.mocked(userDb.getUserById).mockResolvedValue(mockUser as never);
+          jest.mocked(metaService.getAd)
+            .mockResolvedValueOnce({ id: 'ad_123', creative: { creative_id: 'old_creative_123' } } as never)
+            .mockResolvedValue({ id: 'ad_123', creative: { creative_id: 'new_creative_456' } } as never);
+          jest.mocked(metaService.getAdCreative)
+            .mockResolvedValueOnce({ id: 'old_creative_123', name: 'My Creative', object_story_spec: oldSpec } as never)
+            .mockResolvedValue({ id: 'new_creative_456', object_story_spec: createdSpec } as never);
+          jest.mocked(metaService.createAdCreative).mockResolvedValue({ id: 'new_creative_456' } as never);
+          jest.mocked(metaService.updateAd).mockResolvedValue({ success: true } as never);
+        };
+        const sentCreative = () => jest.mocked(metaService.createAdCreative).mock.calls[0][2];
+        const attachCalls = () => jest.mocked(metaService.updateAd).mock.calls
+          .filter(c => (c[2] as { creative?: unknown }).creative !== undefined);
+
+        it('drops the old image_hash when only a new image_url is given (single image)', async () => {
+          mockSwap(OLD_LINK_SPEC, { page_id: 'page_123', link_data: { image_hash: 'fresh_hash' } });
+
+          const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', { image_url: 'https://cdn/new.jpg' });
+
+          expect(sentCreative().image_hash).toBeUndefined();
+          expect(sentCreative().image_url).toBe('https://cdn/new.jpg');
+          expect(result.success).toBe(true);
+          expect(result.verified).toBe(true);
+          expect(result.image_verified).toBe(true);
+        });
+
+        it('drops the old thumbnail hash when only a new image_url is given (video)', async () => {
+          mockSwap(OLD_VIDEO_SPEC, { page_id: 'page_123', video_data: { video_id: 'vid_1', image_hash: 'fresh_hash' } });
+
+          const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', { image_url: 'https://cdn/thumb.jpg' });
+
+          expect(sentCreative().image_hash).toBeUndefined();
+          expect(sentCreative().image_url).toBe('https://cdn/thumb.jpg');
+          expect(sentCreative().video_id).toBe('vid_1');
+          expect(result.success).toBe(true);
+        });
+
+        it('uses a new image_hash when one is given', async () => {
+          mockSwap(OLD_LINK_SPEC, { page_id: 'page_123', link_data: { image_hash: 'new_hash' } });
+
+          const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', { image_hash: 'new_hash' });
+
+          expect(sentCreative().image_hash).toBe('new_hash');
+          expect(result.success).toBe(true);
+        });
+
+        it('carries the old image over unchanged when no image is given', async () => {
+          mockSwap(OLD_LINK_SPEC, OLD_LINK_SPEC);
+          jest.mocked(metaService.getAd).mockReset()
+            .mockResolvedValueOnce({ id: 'ad_123', creative: { creative_id: 'old_creative_123' } } as never)
+            .mockResolvedValue({
+              id: 'ad_123',
+              creative: { creative_id: 'new_creative_456', object_story_spec: { link_data: { link: 'https://new.com' } } }
+            } as never);
+
+          const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', { link_url: 'https://new.com' });
+
+          expect(sentCreative().image_hash).toBe('old_hash');
+          expect(sentCreative().image_url).toBe('https://cdn/old.jpg');
+          expect(result.success).toBe(true);
+          // No image was requested, so the created creative is not re-read for its image.
+          expect(metaService.getAdCreative).toHaveBeenCalledTimes(1);
+        });
+
+        it('fails with SWAP_NOT_REFLECTED and does not attach when the new creative still has the old image', async () => {
+          mockSwap(OLD_LINK_SPEC, OLD_LINK_SPEC);
+
+          const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', { image_url: 'https://cdn/new.jpg' });
+
+          expect(result.success).toBe(false);
+          expect(result.error).toBe('SWAP_NOT_REFLECTED');
+          expect(result.live_image_hash).toBe('old_hash');
+          expect(result.new_creative_id).toBe('new_creative_456');
+          expect(attachCalls()).toHaveLength(0);
+        });
+
+        it('fails with SWAP_NOT_REFLECTED when a hash-less read-back still shows the old picture URL', async () => {
+          mockSwap(OLD_LINK_SPEC, { page_id: 'page_123', link_data: { picture: 'https://cdn/old.jpg' } });
+
+          const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', { image_url: 'https://cdn/new.jpg' });
+
+          expect(result.success).toBe(false);
+          expect(result.error).toBe('SWAP_NOT_REFLECTED');
+          expect(result.live_image_url).toBe('https://cdn/old.jpg');
+          expect(attachCalls()).toHaveLength(0);
+        });
+
+        it('attaches but reports image_verified:false when the read-back identifies no image', async () => {
+          mockSwap(OLD_LINK_SPEC, { page_id: 'page_123', link_data: { link: 'https://old.com' } });
+
+          const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', { image_url: 'https://cdn/new.jpg' });
+
+          expect(result.success).toBe(true);
+          expect(result.image_verified).toBe(false);
+          expect(result.message).toContain('image could not be confirmed');
+          expect(attachCalls()).toHaveLength(1);
+        });
+
+        it('fails with SWAP_NOT_REFLECTED when the new creative does not carry the requested image_hash', async () => {
+          mockSwap(OLD_VIDEO_SPEC, { page_id: 'page_123', video_data: { video_id: 'vid_1', image_hash: 'other_hash' } });
+
+          const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', { image_hash: 'new_thumb_hash' });
+
+          expect(result.success).toBe(false);
+          expect(result.error).toBe('SWAP_NOT_REFLECTED');
+          expect(result.requested_image_hash).toBe('new_thumb_hash');
+          expect(result.live_image_hash).toBe('other_hash');
+          expect(attachCalls()).toHaveLength(0);
+        });
       });
 
       it('returns DESTINATION_PENDING when the live URL never matches after retries', async () => {
@@ -1309,7 +1526,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateAd).toHaveBeenCalledWith(
           'mock-access-token',
           'ad_123',
-          { creative: { creative_id: 'new_placement_creative' } }
+          { creative: { creative_id: 'new_placement_creative' } },
+          '123456789'
         );
       });
 
@@ -1571,7 +1789,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateCampaign).toHaveBeenCalledWith(
           'mock-access-token',
           'camp_123',
-          expect.objectContaining({ daily_budget: 15000 })
+          expect.objectContaining({ daily_budget: 15000 }),
+          '123456789'
         );
         const call = (metaService.updateCampaign as jest.Mock).mock.calls[0][2];
         expect(call.budget_amount).toBeUndefined();
@@ -1586,7 +1805,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateCampaign).toHaveBeenCalledWith(
           'mock-access-token',
           'camp_123',
-          expect.objectContaining({ name: 'New Name', status: 'PAUSED' })
+          expect.objectContaining({ name: 'New Name', status: 'PAUSED' }),
+          '123456789'
         );
       });
 

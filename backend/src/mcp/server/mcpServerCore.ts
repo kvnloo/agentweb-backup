@@ -21,12 +21,21 @@ import {
   recordMcpFirstToolUse,
   recordMcpToolUse,
 } from '../../services/mcpUsageEventsService';
+import { cronJobRegistry } from '../../utils/cronJobRegistry';
 
 // Import API-wrapping tools (replaces direct tools.ts and portalTools.ts)
 import './apiTools';
+import './evaluationTools';
 // ENG-982: the job-shaped workflow layer. Additive — registers alongside the
 // granular tools; unlisting those behind tool search is ENG-983.
 import './workflowTools';
+// ENG-1004: tranche 2 (landing pages). Same additive contract.
+import './landingWorkflowTools';
+import './publishWorkflowTools';
+// ENG-983: progressive disclosure — tools/list returns the workflow layer plus
+// emma_search_tools; the granular catalogue stays callable and discoverable.
+import { getListedToolDefinitions } from './toolDiscovery';
+import { sanitizePublicToolResult, shouldSanitizePublicResponse } from './publicResponseSanitizer';
 
 export interface McpSessionContext {
   agentUserId?: string;
@@ -78,14 +87,15 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
    * Tool descriptions guide proper usage.
    */
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    const allTools = mcpToolRegistry.getToolDefinitions();
-    return { tools: allTools };
+    return { tools: getListedToolDefinitions() };
   });
   /**
    * Handler for tool execution.
    */
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
+
+    return cronJobRegistry.track('mcpToolCall', (async () => {
 
     // Extract context fields from args (injected by internal MCP clients)
     const { userId, sessionId, llmModel, ...toolArgs } = (args || {}) as any;
@@ -116,7 +126,11 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
     };
 
     try {
-      const result = await mcpToolRegistry.execute(name, toolArgs, context);
+      const rawResult = await mcpToolRegistry.execute(name, toolArgs, context);
+      // ENG-2335: public (external, non-admin) responses never carry internal IDs.
+      const result = shouldSanitizePublicResponse(name, toolArgs, context)
+        ? sanitizePublicToolResult(rawResult)
+        : rawResult;
       if (context.externalMcp && effectiveUserId) {
         void Promise.all([
           recordMcpToolUse({
@@ -172,6 +186,7 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
         isError: true,
       };
     }
+    })());
   });
 
   return server;

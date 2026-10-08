@@ -89,6 +89,115 @@ describe('AgentModeService - extractMinimalToolResult', () => {
     });
   });
 
+  // ENG-1635/1644 (ask_user_question retirement) — REGRESSION, found live on
+  // env1, not by any pre-existing test: ask_user_question's migrated execute()
+  // and resolveCampaignObjectiveGate's Path 3 both still set
+  // `type: 'ask_user_question'` (unchanged calling-convention tag) while ALSO
+  // carrying `questionDeckPayload` — extractMinimalToolResult's OLD branching
+  // checked `result.type === 'ask_user_question'` FIRST and returned a
+  // fixed field set that did NOT include questionDeckPayload, silently
+  // stripping it. Downstream, partitionApprovalHalts (agentModeService.ts)
+  // classifies a halt as a question-deck ONLY via
+  // `Array.isArray(r.questionDeckPayload)` — with it stripped, the halt fell
+  // into `otherHalts` and the iteration-end seam bailed to the OLD plain-text
+  // prompt instead of building a real deck-of-one card. This exact class of
+  // bug already bit this feature twice before (metaWriteManifestDigest,
+  // metaWriteDispatch — see the comments in extractMinimalToolResult) and
+  // this suite still didn't catch it because every existing test here calls
+  // the function directly with a result shaped like ONE OR THE OTHER
+  // (questionDeckPayload set XOR type set) — never both, which is exactly the
+  // real shape both migrated producers emit. These tests pin the fix: the
+  // questionDeckPayload check must run BEFORE the type==='ask_user_question'
+  // branch, regardless of what `type` a producer sets.
+  describe('questionDeckPayload preservation (ENG-1635/1644)', () => {
+    it('preserves questionDeckPayload on a halt that ALSO carries the legacy type:"ask_user_question" tag (ask_user_question tool)', () => {
+      const result = {
+        success: true,
+        awaitingUserConfirmation: true,
+        type: 'ask_user_question',
+        questionDeckPayload: [{
+          question: 'Which Meta campaign objective?',
+          options: [{ id: 'leads', label: 'Leads', recommended: true }],
+          kind: 'meta_objective',
+          immutable: true,
+        }],
+        confirmationPrompt: 'Which Meta campaign objective?',
+        summary: 'Which Meta campaign objective?',
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'ask_user_question');
+
+      expect(minimalResult.awaitingUserConfirmation).toBe(true);
+      expect(Array.isArray(minimalResult.questionDeckPayload)).toBe(true);
+      expect(minimalResult.questionDeckPayload).toEqual(result.questionDeckPayload);
+    });
+
+    it('preserves questionDeckPayload on the objective gate\'s halt (call_meta_marketing_api, also tagged type:"ask_user_question")', () => {
+      const result = {
+        success: true,
+        awaitingUserConfirmation: true,
+        type: 'ask_user_question',
+        sessionId: 'session-1',
+        questionDeckPayload: [{
+          question: 'Which Meta campaign objective should this campaign use? It cannot be changed after creation.',
+          options: [
+            { id: 'leads', label: 'Leads', recommended: true, payload: { objective: 'OUTCOME_LEADS' } },
+            { id: 'traffic', label: 'Traffic' },
+          ],
+          allowEmmaDecide: true,
+          kind: 'meta_objective:123|test|||NONE',
+          immutable: true,
+        }],
+        confirmationPrompt: 'Which Meta campaign objective should this campaign use? It cannot be changed after creation.',
+        summary: 'Which Meta campaign objective should this campaign use? It cannot be changed after creation.',
+        message: 'The campaign objective is immutable and has not been confirmed by the user yet.',
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'call_meta_marketing_api');
+
+      expect(Array.isArray(minimalResult.questionDeckPayload)).toBe(true);
+      expect(minimalResult.questionDeckPayload).toHaveLength(1);
+      expect(minimalResult.questionDeckPayload[0].kind).toBe('meta_objective:123|test|||NONE');
+      expect(minimalResult.questionDeckPayload[0].immutable).toBe(true);
+    });
+
+    it('still preserves questionDeckPayload when the producer tags it type:"present_question_deck" (unchanged behavior)', () => {
+      const result = {
+        success: true,
+        awaitingUserConfirmation: true,
+        type: 'present_question_deck',
+        questionDeckPayload: [{ question: 'What daily budget?', options: [{ id: '50', label: '$50/day', recommended: true }] }],
+        confirmationPrompt: 'Review the following 1 question(s)...',
+        summary: 'Review the following 1 question(s)...',
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'present_question_deck');
+
+      expect(Array.isArray(minimalResult.questionDeckPayload)).toBe(true);
+      expect(minimalResult.questionDeckPayload).toEqual(result.questionDeckPayload);
+    });
+
+    it('falls back to the true legacy shape (options/questionId, no questionDeckPayload) when a result genuinely has neither', () => {
+      const result = {
+        success: true,
+        awaitingUserConfirmation: true,
+        type: 'ask_user_question',
+        questionId: 'q-1',
+        question: 'Legacy card question?',
+        options: [{ id: 'a', label: 'A' }],
+        recommendedOptionId: 'a',
+        allowEmmaDecide: true,
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'ask_user_question');
+
+      expect(minimalResult.questionDeckPayload).toBeUndefined();
+      expect(minimalResult.type).toBe('ask_user_question');
+      expect(minimalResult.questionId).toBe('q-1');
+      expect(minimalResult.options).toEqual(result.options);
+    });
+  });
+
   describe('landing-page deployment result extraction (ENG-736)', () => {
     it('preserves buildStatus + deployedUrl from a get_deployment_status result', () => {
       const result = {
@@ -101,6 +210,7 @@ describe('AgentModeService - extractMinimalToolResult', () => {
         status: 'deployed',
         buildStatus: 'success',
         deployedUrl: 'https://example.agentwebforms.com/pilot',
+        launchReadiness: { ready: true, reasons: [] },
       });
     });
 
@@ -121,6 +231,7 @@ describe('AgentModeService - extractMinimalToolResult', () => {
         deployedUrl: 'https://example.agentwebforms.com/pilot',
         name: 'Cold Outreach',
         leadListId: 'list-9',
+        launchReadiness: { ready: true, reasons: [] },
       });
     });
 
@@ -135,6 +246,37 @@ describe('AgentModeService - extractMinimalToolResult', () => {
       expect(minimalResult).toEqual({
         buildStatus: 'success',
         previewUrl: 'https://preview.example.com',
+        launchReadiness: { ready: true, reasons: [] },
+      });
+    });
+
+    // ENG-1868: a failed smoke test must survive minimization — this is the exact ledger
+    // evidence the truthful-reporting reconciler needs to append a launch-readiness caveat.
+    it('surfaces launchReadiness.ready = false when the smoke test failed', () => {
+      const result = {
+        status: 'deployed',
+        buildStatus: 'success',
+        deployedUrl: 'https://example.agentwebforms.com/pilot',
+        smokeTestResult: { ok: false, leadCaptured: false, checkedAt: '2026-09-11T00:00:00Z' },
+      };
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'get_deployment_status');
+      expect(minimalResult.launchReadiness).toEqual({
+        ready: false,
+        reasons: ['Post-deploy smoke test failed'],
+      });
+    });
+
+    it('surfaces launchReadiness.ready = false when tracking was not installed', () => {
+      const result = {
+        status: 'deployed',
+        buildStatus: 'success',
+        deployedUrl: 'https://example.agentwebforms.com/pilot',
+        trackingInstalled: false,
+      };
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'get_deployment_status');
+      expect(minimalResult.launchReadiness).toEqual({
+        ready: false,
+        reasons: ['No conversion tracking (GTM) installed'],
       });
     });
   });
@@ -365,6 +507,75 @@ describe('AgentModeService - extractMinimalToolResult', () => {
     });
   });
 
+  // ENG-738: perform_deep_research previously fell through to the generic `{}`
+  // fallback, which drops success/error — the exact fields the
+  // open-research-request tracker needs to tell a real success from a
+  // still-unresolved timeout result using only this minimized entry.
+  describe('perform_deep_research result extraction (ENG-738)', () => {
+    it('preserves success and the research URL on a completed result', () => {
+      const result = {
+        success: true,
+        message: 'Deep research completed successfully. Generated 2200 words of content and saved to S3.',
+        data: {
+          research_url: 'https://s3.amazonaws.com/bucket/research.md',
+          title: 'AI in Marketing',
+          summary: 'Summary text',
+          word_count: 2200,
+          research_depth: 'detailed',
+          topic: 'AI in marketing'
+        }
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'perform_deep_research');
+
+      expect(minimalResult).toEqual({
+        success: true,
+        research_url: 'https://s3.amazonaws.com/bucket/research.md',
+        research_depth: 'detailed',
+      });
+    });
+
+    it('preserves success:false and a truncated error on a timeout result', () => {
+      const result = {
+        success: false,
+        message: 'Deep research failed',
+        error: 'Deep research failed: Request timed out',
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'perform_deep_research');
+
+      expect(minimalResult).toEqual({
+        success: false,
+        error: 'Deep research failed: Request timed out',
+      });
+    });
+
+    it('preserves success:false on a plain unavailable-service failure', () => {
+      const result = {
+        success: false,
+        message: 'Deep Research service is not available. Please check API key configuration.',
+        error: 'Service unavailable'
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'perform_deep_research');
+
+      expect(minimalResult).toEqual({
+        success: false,
+        error: 'Service unavailable',
+      });
+    });
+
+    it('truncates a very long error to avoid bloating stored history', () => {
+      const longError = 'x'.repeat(500);
+      const result = { success: false, error: longError };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'perform_deep_research');
+
+      expect(minimalResult.error.length).toBeLessThanOrEqual(200);
+      expect(longError.startsWith(minimalResult.error)).toBe(true);
+    });
+  });
+
   // ENG-1472: the workplan_recommendation result MUST survive minimization —
   // it is the only thing that lets the customer portal render the recommendation
   // card again after a reload (the ledger entry is all it has at that point).
@@ -425,4 +636,30 @@ describe('AgentModeService - extractMinimalToolResult', () => {
       expect(minimalResult.plan).toBeUndefined();
     });
   });
+
+  // ENG-1720: the de-dupe outcome must survive the minimizer, or the requirement
+  // verdict cannot tell a skipped send from a delivered one. linkedin_outreach has
+  // no general branch, so anything not named here becomes the `{}` default — and a
+  // `{}` result reads as SUCCESS to toolCallSucceeded (no error, no success:false).
+  // That is how a run which contacted nobody stored passed:true / { actual: 2 }.
+  describe('linkedin_outreach de-duplicated send (ENG-1720)', () => {
+    it('preserves alreadyInvited so a skipped send is not scored as a delivery', () => {
+      const result = {
+        success: true,
+        alreadyInvited: true,
+        message: 'A LinkedIn connection invitation is already pending for this profile. Skipped to avoid a duplicate — no invite quota was used.',
+        data: { alreadyInvited: true, sentAt: '2026-09-09T13:32:45.644Z' },
+      };
+      const minimal = (agentModeService as any).extractMinimalToolResult(result, 'linkedin_outreach');
+      expect(minimal.alreadyInvited).toBe(true);
+      expect(minimal.success).toBe(true);
+    });
+
+    it('a real delivery is NOT marked alreadyInvited', () => {
+      const result = { success: true, data: { invitationId: '7503444979126583297' } };
+      const minimal = (agentModeService as any).extractMinimalToolResult(result, 'linkedin_outreach');
+      expect(minimal?.alreadyInvited).toBeFalsy();
+    });
+  });
+
 });

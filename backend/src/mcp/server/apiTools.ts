@@ -1,3 +1,4 @@
+import { mapManageBrandUpdate } from '../../utils/brandGuidelines';
 import { findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContentLoss, mergeWorkPlanSteps, summarizeStepChange } from '../../services/workPlanSteps';
 /**
  * API Tools — MCP tools that wrap the backend REST API via HTTP self-calls.
@@ -11,22 +12,18 @@ import { findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContent
 
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
+import './adminLookupTools';
+import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 // ENG-982: `ctx` and `jsonResult` moved to ./toolHelpers so workflowTools.ts can
 // share them instead of keeping a second copy. Behaviour unchanged.
-import { ctx, jsonResult } from './toolHelpers';
+import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 import { resolveClientScopedContext } from './adminClientScope';
 import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd, resolveDryRunFlag } from './manageLeadsCrossAccountAdd';
-
-const CLIENT_ID_SCHEMA_PROPERTY = {
-  type: 'string' as const,
-  description:
-    "Admin-only. Scope this call to a specific client's account instead of the caller's own — accepts the client's email or userId. Non-admin callers are rejected.",
-};
 
 function normalizeSkillQuery(value: unknown): string {
   return String(value ?? '')
@@ -190,7 +187,7 @@ mcpToolRegistry.register({
   name: 'emma_send_message',
   definition: {
     name: 'emma_send_message',
-    description: 'Send a message to an Emma chat session and get a response. Use this to delegate any marketing or growth request in natural language; Emma plans and executes it end to end with capabilities well beyond the tools listed here. Do not pre-judge from the visible tool set whether something is supported — hand the request to Emma. If a task genuinely cannot be done or needs a prerequisite (e.g. a connected account), Emma says so and explains what is needed; relay her response rather than declaring the capability unavailable yourself. If the response (or emma_get_session) shows an awaiting pendingUserQuestion (a blocking AskUserQuestion card), do NOT answer it by sending a plain message here — that abandons the question instead of answering it. Use emma_answer_question.',
+    description: 'Send a message to an Emma chat session and get a response. Use this to delegate any marketing or growth request in natural language; Emma plans and executes it end to end with capabilities well beyond the tools listed here. Do not pre-judge from the visible tool set whether something is supported — hand the request to Emma. If a task genuinely cannot be done or needs a prerequisite (e.g. a connected account), Emma says so and explains what is needed; relay her response rather than declaring the capability unavailable yourself. If the response (or emma_get_session) shows an awaiting pendingUserQuestion (a blocking legacy AskUserQuestion card) or an awaiting pendingApprovalDeck (a blocking question/approval deck), do NOT answer it by sending a plain message here — that abandons the question instead of answering it. Use emma_answer_question for pendingUserQuestion, or emma_answer_question_deck for pendingApprovalDeck.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -224,34 +221,38 @@ mcpToolRegistry.register({
   }
 });
 
-// ENG-400: MCP transport for the ENG-396 AskUserQuestion primitive. Without
-// this, a blocking objective card fired by Emma over MCP (Claude.ai driving
-// `emma_send_message`) degrades to prose — the client sees `pendingUserQuestion`
-// on emma_get_session but has no way to resolve it STRUCTURALLY, so a plain
-// reply (e.g. "Leads") never reaches the answer channel and the write gate
-// stays blocked forever (the one-live-question guard also prevents Emma from
-// re-asking). This posts through the SAME structured `questionAnswer` channel
-// the chat card uses — the gate's human-attribution guarantee is unchanged,
-// it just has a second front door. Prose is NEVER accepted as an answer here
-// either: a plain emma_send_message reply to an awaiting question still just
-// abandons the card server-side (agentModeController.generateResponse), same
-// as typing past the card in the web UI.
+// ENG-1635/1644 PR2: the emma_answer_question tool (ENG-400's original MCP
+// transport for the AskUserQuestion primitive) is deleted — it posted a
+// structured `questionAnswer` body that generateResponse no longer handles
+// (nothing ever populates session.pendingUserQuestion for it to resolve
+// against anymore). emma_answer_question_deck below is the sole, sufficient
+// MCP transport for every producer that used to reach this primitive.
+
+// ENG-1635/1644 (ask_user_question retirement): the deck-of-one MCP transport.
+// ask_user_question and the Meta objective-confirmation gate no longer
+// populate pendingUserQuestion at all — they build a single-item
+// pendingApprovalDeck instead, through the SAME present_question_deck deck
+// mechanism, for UI consistency with the rest of the approval deck. Without
+// this tool, an MCP client would see pendingApprovalDeck on emma_get_session
+// but have no structured way to resolve it. Posts through the same
+// `deckAnswer` channel the chat card uses (POST /api/agent-mode/generate
+// body.deckAnswer); prose is never accepted as an answer here either.
 mcpToolRegistry.register({
-  name: 'emma_answer_question',
+  name: 'emma_answer_question_deck',
   definition: {
-    name: 'emma_answer_question',
-    description:
-      'Answer a blocking AskUserQuestion card on an Emma session (see pendingUserQuestion on emma_get_session) — the ONLY way to resolve one over MCP. Provide option_id for a direct pick, or delegate:true for "Let Emma decide" (takes the recommended option). A plain emma_send_message reply is NOT an answer — it abandons the open question instead, same as typing past the card in the chat UI.',
+    name: 'emma_answer_question_deck',
+    description: 'Answer a blocking single-question deck card on an Emma session (see pendingApprovalDeck on emma_get_session, when it has exactly one item) — the sole MCP transport for ask_user_question and the Meta campaign-objective confirmation. Provide option_id for a direct pick, or delegate:true for "Let Emma decide" (takes the recommended option). A plain emma_send_message reply is NOT an answer — it abandons the open deck instead, same as typing past the card in the chat UI.',
     inputSchema: {
       type: 'object',
       properties: {
-        session_id: { type: 'string', description: 'The chat session ID with the awaiting question.' },
-        question_id: { type: 'string', description: 'The pendingUserQuestion.questionId from emma_get_session — must match the currently awaiting question.' },
+        session_id: { type: 'string', description: 'The chat session ID with the awaiting deck.' },
+        deck_id: { type: 'string', description: 'The pendingApprovalDeck.deckId from emma_get_session — must match the currently awaiting deck.' },
+        item_id: { type: 'string', description: 'The pendingApprovalDeck.items[0].itemId from emma_get_session — the single item being answered.' },
         option_id: { type: 'string', description: 'The chosen option id. Required unless delegate is true.' },
         delegate: { type: 'boolean', description: 'Set true for "Let Emma decide" — proceeds with the recommended option, logged as a delegation. option_id is ignored when true.' },
         label: { type: 'string', description: 'Optional human-readable text to show as the chat message for this selection (e.g. the option label). Defaults to option_id, or "Let Emma decide" when delegating.' },
       },
-      required: ['session_id', 'question_id'],
+      required: ['session_id', 'deck_id', 'item_id'],
     },
   },
   execute: async (args: any, context: any) => {
@@ -270,7 +271,82 @@ mcpToolRegistry.register({
       body: {
         sessionId: args.session_id,
         userMessage: label,
-        questionAnswer: { questionId: args.question_id, optionId: args.option_id, delegated: delegate },
+        deckAnswer: {
+          deckId: args.deck_id,
+          answers: [{ itemId: args.item_id, verdict: delegate ? '' : args.option_id, delegated: delegate }],
+        },
+      },
+    });
+    return jsonResult(data);
+  },
+});
+
+// ENG-2057: expose the customer work-plan lifecycle as discrete outcomes so
+// connector discovery can rank launch and structured answering independently.
+// Keep both lifecycle tools public: external agents need the launch and unblock pair.
+mcpToolRegistry.register({
+  name: 'emma_launch_work_plan',
+  requiresUserAccount: true,
+  definition: {
+    name: 'emma_launch_work_plan',
+    description: 'Launch an accessible predefined work plan in an existing Emma session. Find a plan with list_predefined_work_plans first, then poll progress with emma_get_session. Refuses to replace a different active work plan.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: 'The Emma session ID.' },
+        plan_id: { type: 'string', description: 'The predefined plan ID. Alias: work_plan_id.' },
+        work_plan_id: { type: 'string', description: 'Alias for plan_id.' },
+      },
+      required: ['session_id'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const planId = args.plan_id ?? args.work_plan_id;
+    if (typeof planId !== 'string' || planId.trim() === '') {
+      return jsonResult({ success: false, message: 'plan_id (or work_plan_id) is required.' });
+    }
+    const data = await mcpFetch({
+      method: 'POST',
+      path: `/api/agent-mode/session/${encodeURIComponent(args.session_id)}/work-plan`,
+      context: ctx(context),
+      body: { planId },
+    });
+    return jsonResult(data);
+  },
+});
+
+mcpToolRegistry.register({
+  name: 'emma_answer_work_plan_input',
+  definition: {
+    name: 'emma_answer_work_plan_input',
+    description: 'Answer a pending structured work-plan input request shown by emma_get_session. Values must be keyed by the field IDs in pendingWorkPlanInput. A plain emma_send_message does not submit these structured values.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: 'The Emma session ID.' },
+        request_id: { type: 'string', description: 'The pendingWorkPlanInput.requestId. Alias: work_plan_request_id.' },
+        work_plan_request_id: { type: 'string', description: 'Alias for request_id.' },
+        values: { type: 'object', additionalProperties: true, description: 'Answers keyed by pendingWorkPlanInput field ID.' },
+        label: { type: 'string', description: 'Optional chat-visible summary. Defaults to a neutral submission message.' },
+      },
+      required: ['session_id', 'values'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const requestId = args.request_id ?? args.work_plan_request_id;
+    if (typeof requestId !== 'string' || requestId.trim() === '') {
+      return jsonResult({ success: false, message: 'request_id (or work_plan_request_id) is required.' });
+    }
+    const data = await mcpFetch({
+      method: 'POST',
+      path: '/api/agent-mode/generate',
+      context: ctx(context),
+      body: {
+        sessionId: args.session_id,
+        userMessage: typeof args.label === 'string' && args.label.trim() !== ''
+          ? args.label
+          : 'Submitted requested work plan details.',
+        workPlanInputAnswer: { requestId, values: args.values },
       },
     });
     return jsonResult(data);
@@ -281,16 +357,43 @@ mcpToolRegistry.register({
   name: 'emma_get_session',
   definition: {
     name: 'emma_get_session',
-    description: 'Get details of an Emma chat session by ID. Includes pendingUserQuestion when a blocking AskUserQuestion is awaiting or was recently answered — check its status before assuming a run has completed; resolve an "awaiting" one with emma_answer_question, never with a plain emma_send_message reply.',
+    description: 'Get details of an Emma chat session by ID, including the active workPlan summary and pendingWorkPlanInput when structured details are awaiting an answer, and pendingApprovalDeck when a blocking question/approval deck is awaiting (a single-item deck is the deck-of-one that ask_user_question and the Meta objective confirmation use). Pass run_id to check durable terminal status: completion_confirmed means the run ended, not that it succeeded. Missing records and detached handoffs remain unconfirmed. Check status before assuming a run has completed; resolve an "awaiting" pendingApprovalDeck with emma_answer_question_deck and pendingWorkPlanInput with emma_answer_work_plan_input, never with a plain emma_send_message reply. pendingUserQuestion may still appear on a session that predates this mechanism, but nothing produces a new one — always resolve via pendingApprovalDeck.',
     inputSchema: {
       type: 'object',
-      properties: { session_id: { type: 'string', description: 'The session ID' } },
+      properties: {
+        session_id: { type: 'string', description: 'The session ID' },
+        run_id: { type: 'string', description: 'The run_id returned by a detached task (runId from emma_send_message). Pass it to check durable terminal status.' },
+      },
       required: ['session_id']
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: `/api/agent-mode/session/${args.session_id}`, context: ctx(context) });
-    return jsonResult(data);
+    const data = await mcpFetch({ method: 'GET', path: `/api/agent-mode/session/${encodeURIComponent(args.session_id)}`, context: ctx(context) });
+    let run: AgentRunStatus | null = null;
+    if (typeof args.run_id === 'string' && args.run_id) {
+      try {
+        const record: any = await mcpFetch({
+          method: 'GET', path: `/api/agent-mode/runs/${encodeURIComponent(args.run_id)}`, context: ctx(context),
+        });
+        // This is a network boundary: validate identity and every field used as evidence.
+        if (record && record.runId === args.run_id && record.sessionId === args.session_id &&
+            ['running', 'completed', 'failed', 'interrupted'].includes(record.status) &&
+            (record.finishReason == null || typeof record.finishReason === 'string')) {
+          run = { runId: record.runId, sessionId: record.sessionId, status: record.status,
+            finishReason: record.finishReason ?? null };
+        }
+      } catch {
+        // A refusal, missing record or operational failure is never completion evidence.
+      }
+    }
+    return jsonResult({
+      ...data,
+      run,
+      // Terminal means the request ended, not that all detached or continuation work did.
+      completion_confirmed: run !== null && run.status !== 'running' &&
+        !['detached_still_building', 'timeout_partial_media', 'timeout_partial_work'].includes(run.finishReason ?? '') &&
+        data?.pendingUserQuestion?.status !== 'awaiting' && data?.pendingWorkPlanInput?.status !== 'awaiting',
+    });
   }
 });
 
@@ -539,7 +642,7 @@ mcpToolRegistry.register({
         next_run_time: { type: 'string', description: 'ISO 8601 datetime for the first/next run (create/update)' },
         description: { type: 'string', description: 'Description (create/update)' },
         keywords: { type: 'array', items: { type: 'string' }, description: 'Keywords to look for in results (create/update)' },
-        required_function_calls: { type: 'array', items: { type: 'string' }, description: 'Function calls required in each run (create/update)' },
+        required_function_calls: { type: 'array', items: { type: 'string' }, description: 'Function calls required in each run (create/update). Without a tool listed here, its delivery is best-effort — the run can complete "successfully" even if the model skips it, silently. IMPORTANT (ENG-2204): if starting_message instructs posting, alerting, or notifying via Slack, ALWAYS include slack_send_message here too — an unattended run has no live approval step for it, and without this it may be silently skipped even when the task asked for it. Same reasoning applies to any other action the run must actually take (a publish tool, etc.) — list it here rather than trusting the prompt wording alone.' },
         function_call_min_calls: { type: 'object', description: 'Minimum call counts per function (create/update)' },
         email_notifications: { type: 'array', items: { type: 'string' }, description: 'Email addresses for notifications (optional for create/update but strongly recommended — without it, the user gets no automatic notification when a run completes; if provided, must be non-empty)' },
         daily_digest: { type: 'boolean', description: 'Send daily digest instead of per-run emails (create/update, hourly only)' },
@@ -777,11 +880,15 @@ mcpToolRegistry.register({
         name: { type: 'string', description: 'Template name (create/update)' },
         description: { type: 'string', description: 'Template description (create/update)' },
         category: { type: 'string', description: 'Template category e.g. SEO, Social, Email, Content, Analytics, General (create/update)' },
-        visibility: { type: 'string', enum: ['system', 'private', 'public', 'pending_review'], description: 'Visibility: system (admin-created, always visible), private (only visible to creator), public (approved, visible to all), pending_review (submitted for admin review). Default: private. (create/update)' },
+        visibility: { type: 'string', enum: ['private', 'pending_review'], description: "Visibility, on 'update' only. 'create' ALWAYS produces a private template and ignores this field. "
+          + "Only these two are settable here: 'private' (visible to you alone) and 'pending_review' "
+          + "(submitted for an administrator to approve). 'system' and 'public' are platform-wide and "
+          + "admin-only — asking for them is refused, not silently downgraded. To share a template with "
+          + "everyone, set 'pending_review' and an administrator approves or rejects it (ENG-1716)." },
         starting_message: { type: 'string', description: 'The prompt/message template. Use {{variable_name}} for variables. (create/update)' },
         variables: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' }, type: { type: 'string', enum: ['text', 'long_text', 'file'] } }, required: ['name'] }, description: 'Variable definitions (auto-extracted from message if not provided)' },
         keywords: { type: 'array', items: { type: 'string' }, description: 'Keywords to verify in scheduled chat output (create/update)' },
-        required_function_calls: { type: 'array', items: { type: 'string' }, description: 'Function calls required in each run (create/update)' },
+        required_function_calls: { type: 'array', items: { type: 'string' }, description: 'Function calls required in each run (create/update). Without a tool listed here, its delivery is best-effort — the run can complete "successfully" even if the model skips it, silently. IMPORTANT (ENG-2204): if starting_message instructs posting, alerting, or notifying via Slack, ALWAYS include slack_send_message here too — an unattended run has no live approval step for it, and without this it may be silently skipped even when the task asked for it. Same reasoning applies to any other action the run must actually take (a publish tool, etc.) — list it here rather than trusting the prompt wording alone.' },
         function_call_min_calls: { type: 'object', description: 'Minimum call counts per function (create/update)' },
         suggested_frequency: { type: 'string', description: 'Suggested frequency: hourly, daily, weekly, monthly, every_n_days (create/update)' },
         frequency_interval_days: { type: 'number', description: 'Days between runs when suggested_frequency is every_n_days (create/update)' },
@@ -862,6 +969,7 @@ mcpToolRegistry.register({
         run_count: { type: 'number', description: 'Number of runs (-1 for unlimited)' },
         llm_model: { type: 'string', description: 'Override LLM model' },
         backup_model: { type: 'string', description: 'Legacy field, retained for compatibility. Since ENG-1211 the preferred model is not restricted at run time below the hard usage cap, so this is never consulted.' },
+        required_function_calls: { type: 'array', items: { type: 'string' }, description: 'Override the function calls required in each run — replaces the template\'s own list rather than merging with it. Without a tool listed here, its delivery is best-effort — the run can complete "successfully" even if the model skips it, silently. IMPORTANT (ENG-2204): if the template\'s starting message instructs posting, alerting, or notifying via Slack and its own required_function_calls does not already include slack_send_message (older templates predate this guidance), pass the full list here with slack_send_message added — an unattended run has no live approval step for it, and without this it may be silently skipped even when the task asked for it. Omit to use the template\'s stored list as-is.' },
       },
       required: ['template_id']
     }
@@ -877,6 +985,7 @@ mcpToolRegistry.register({
     if (args.run_count !== undefined) body.runCount = args.run_count;
     if (args.llm_model !== undefined) body.llmModel = args.llm_model;
     if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
+    if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
     const data = await mcpFetch({ method: 'POST', path: `/api/agent-mode/schedule-templates/${args.template_id}/use`, context: ctx(context), body });
     return jsonResult(data);
   }
@@ -918,7 +1027,7 @@ mcpToolRegistry.register({
         list_id: { type: 'string', description: 'List ID (required for get/update/delete)' },
         name: { type: 'string', description: 'List name (create/update)' },
         description: { type: 'string', description: 'List description (create/update)' },
-        list_type: { type: 'string', description: 'List type (create only)' }
+        list_type: { type: 'string', description: 'List type: sales | customers | session (create only; validated by the API)' }
       },
       required: ['action']
     }
@@ -946,6 +1055,108 @@ mcpToolRegistry.register({
         return jsonResult({ error: `Unknown action: ${args.action}` });
     }
   }
+});
+
+// ─── CRM drip / nurture sequences, read-only (ENG-962) ──────────────────────
+//
+// `get_leads_by_crm_criteria` scopes WHO a campaign targets; this tool inspects
+// the campaign itself. Read-only by construction: list + inspect + enrollment
+// counts only. Create/activate/pause live in the sibling ENG-442 work
+// (manage_crm_sequence, ENG-963/964) behind the send-safety gate and must
+// never be added here.
+
+mcpToolRegistry.register({
+  name: 'list_crm_sequences',
+  definition: {
+    name: 'list_crm_sequences',
+    description: `List the CRM email drip / nurture sequences on the caller's account, and inspect one with enrollment counts. Read-only — safe to call any time, including in a scheduled run. It cannot create, start, pause, or otherwise change a sequence; to change one, use the CRM UI.
+
+Use this to answer "are any email campaigns running for our CRM leads?". Each entry reports \`name\`, \`status\` (draft | active | paused | archived), \`audience\` (who the drip worker actually enrolls — auto-enroll lists, never the aspirational trigger), \`step_count\`, \`is_sending\` (true ONLY for \`active\` sequences, because the drip worker mails nothing for a draft/paused/archived sequence), and \`enrollment_count\` when a single sequence is inspected.
+
+An account with no sequences returns \`{ total: 0, sequences: [] }\` with a summary line. That is a valid answer meaning "no campaigns exist", not an error — report it as such instead of retrying or guessing.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        status: {
+          type: 'string',
+          enum: ['draft', 'active', 'paused', 'archived'],
+          description: 'Only return sequences in this status. Omit to return all of them.',
+        },
+        sequence_id: {
+          type: 'string',
+          description: 'Inspect one sequence: returns its summary plus enrollment counts. Omit to list all.',
+        },
+      },
+      required: [],
+      additionalProperties: false,
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const { summarizeSequence } = await import('../../services/crmSequenceRead');
+    try {
+      // Inspect-one path: summary + enrollment counts. The routes 403 when the
+      // sequence belongs to another user, so cross-account reads fail closed
+      // at the API boundary, not in this tool.
+      if (typeof args?.sequence_id === 'string' && args.sequence_id.trim()) {
+        const sequenceId = args.sequence_id.trim();
+        const data = await mcpFetch({
+          method: 'GET',
+          path: `/api/crm/sequences/${encodeURIComponent(sequenceId)}`,
+          context: ctx(context),
+        });
+        const sequence = data?.sequence;
+        if (!sequence) return jsonResult({ error: `Sequence not found: ${sequenceId}` });
+        let enrollment_count: unknown = undefined;
+        let enrollment_error: string | undefined = undefined;
+        try {
+          const enrollments = await mcpFetch({
+            method: 'GET',
+            path: `/api/crm/sequences/${encodeURIComponent(sequenceId)}/enrollments`,
+            context: ctx(context),
+          });
+          enrollment_count = enrollments?.stats ?? enrollments?.enrollments?.length ?? undefined;
+        } catch (err: any) {
+          // Surface enrollment-endpoint failures explicitly instead of
+          // silently dropping the count (CodeRabbit, PR #2974): the
+          // inspect-one contract promises an enrollment count, and a 401/403,
+          // timeout, or 5xx here must not read as "zero enrollments".
+          enrollment_count = undefined;
+          enrollment_error = err?.message || String(err);
+        }
+        return jsonResult({
+          ...summarizeSequence(sequence),
+          enrollment_count,
+          ...(enrollment_error ? { enrollment_error } : {}),
+        });
+      }
+
+      const data = await mcpFetch({
+        method: 'GET',
+        path: '/api/crm/sequences',
+        context: ctx(context),
+      });
+
+      const all = Array.isArray(data?.sequences) ? data.sequences : [];
+      const filtered =
+        typeof args?.status === 'string' ? all.filter((s: any) => s?.status === args.status) : all;
+      const sequences = filtered.map(summarizeSequence);
+      const activeCount = sequences.filter((s: any) => s.is_sending).length;
+
+      return jsonResult({
+        total: sequences.length,
+        active_count: activeCount,
+        sequences,
+        summary:
+          sequences.length === 0
+            ? typeof args?.status === 'string'
+              ? `No CRM drip sequences match status "${args.status}".`
+              : 'No CRM drip sequences exist on this account. No campaign email is being sent to CRM leads.'
+            : `${sequences.length} sequence(s); ${activeCount} actively sending.`,
+      });
+    } catch (err: any) {
+      return jsonResult({ success: false, error: err?.message || String(err) });
+    }
+  },
 });
 
 mcpToolRegistry.register({
@@ -1345,7 +1556,7 @@ mcpToolRegistry.register({
       const data = await mcpFetch({ method: 'GET', path: '/api/brand/guidelines', context: c });
       return jsonResult(data);
     }
-    const { action, ...body } = args;
+    const body = mapManageBrandUpdate(args);
     const data = await mcpFetch({ method: 'POST', path: '/api/brand/guidelines', context: c, body });
     return jsonResult(data);
   }
@@ -1493,6 +1704,9 @@ Admin-only: pass client_id to list a specific client's connected accounts instea
 
 mcpToolRegistry.register({
   name: 'post_on_account',
+  internal: true,
+  // ENG-974: outbound action — hidden AND refused for external MCP callers.
+  internalOnly: true,
   definition: {
     name: 'post_on_account',
     description: 'Post content on a connected social media account.',
@@ -1501,7 +1715,8 @@ mcpToolRegistry.register({
       properties: {
         account_id: { type: 'string', description: 'Connected account ID' },
         content: { type: 'string', description: 'Post content' },
-        media_urls: { type: 'array', items: { type: 'string' }, description: 'Optional media URLs' }
+        media_urls: { type: 'array', items: { type: 'string' }, description: 'Optional media URLs' },
+        in_reply_to_post_id: { type: 'string', description: 'X (Twitter) only. ID of an existing post to reply to. Omit for a new post.' }
       },
       required: ['account_id', 'content']
     }
@@ -1512,7 +1727,7 @@ mcpToolRegistry.register({
     if (withdrawn) return jsonResult({ success: false, message: withdrawn.error });
     const data = await mcpFetch({
       method: 'POST', path: '/api/emma/post-on-account', context: ctx(context),
-      body: { account_id: args.account_id, content: args.content, media_urls: args.media_urls || [] }
+      body: { account_id: args.account_id, content: args.content, media_urls: args.media_urls || [], ...(args.in_reply_to_post_id ? { in_reply_to_post_id: args.in_reply_to_post_id } : {}) }
     });
     return jsonResult(data);
   }
@@ -1524,7 +1739,7 @@ mcpToolRegistry.register({
   name: 'generate_landing_page',
   definition: {
     name: 'generate_landing_page',
-    description: 'Generate AND deploy a production landing page in one step. This tool sends brand guidelines + prompt to v0, which generates a polished React/Next.js site, pushes it to a private GitHub repo, and deploys to Vercel automatically. Returns the live URL when done. PREREQUISITE: Before calling this tool, you MUST have: 1. Called read_brand_guidelines to get brand data, 2. Called create_lead_list to create a lead list named "LP Leads - {page name}" for the contact form, 3. Called enable_lead_list_public_access to enable public form capture. Pass the lead list ID as lead_list_id. Include all brand details in the prompt for best results. Do NOT call deploy_landing_page after this — deployment is automatic.',
+    description: 'Generate AND deploy a production landing page in one step. This tool sends brand guidelines + prompt to v0, which generates a polished React/Next.js site, pushes it to a private GitHub repo, and deploys to Vercel automatically. Returns the live URL when done. PREREQUISITE: Before calling this tool, you MUST have: 1. Called read_brand_guidelines to get brand data, 2. Called create_lead_list to create a lead list named "LP Leads - {page name}" for the contact form, 3. Called enable_lead_list_public_access to enable public form capture. Pass the lead list ID as lead_list_id. Include all brand details in the prompt for best results. Do NOT call deploy_landing_page after this — deployment is automatic. IMPORTANT: a returned "deployed" status means the BUILD succeeded, not that the page is launch-ready — check the response\'s launchReadiness field (or call get_deployment_status) before telling the user the page is ready to send traffic to. If launchReadiness.ready is false, relay the reasons plainly instead of calling it done.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1769,6 +1984,57 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
+  name: 'enable_session_tracking',
+  definition: {
+    name: 'enable_session_tracking',
+    description: 'Turn on organic and paid visitor SESSION tracking for a landing page: creates (or reuses) a session list named "LP Sessions - {page name}" and adds the AgentWeb tracking tag to the page\'s own repo in one commit (the site redeploys in about a minute). Safe to call again: it never duplicates the tag or the list. Use it for a deployed landing page that has no session tracking yet, or after the page gains a new domain (re-running adds the new address to the list). Returns listId, embedSnippet, installed and alreadyInstalled. If the page already has its own tracker the tool refuses with an explanation instead of double-counting visits; report that to the user rather than retrying.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID (from list_landing_pages or get_landing_page)' },
+        html_path: { type: 'string', description: 'Only for a static-HTML page whose file is not public/<slug>.html or public/index.html: the file to tag, e.g. "public/offer.html"' }
+      },
+      required: ['page_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    // ENG-827: this commits to a customer's live repo, so it honours the same last-moment consent re-check
+    // as publish_landing_page_changes (an unattended schedule whose consent was withdrawn mid-run stops here).
+    const withdrawn = await publishWithdrawnMidFlight(context);
+    if (withdrawn) return jsonResult({ success: false, message: withdrawn.error });
+    const data = await mcpFetch({
+      method: 'POST', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/session-tracking`, context: ctx(context),
+      body: { ...(args.html_path ? { htmlPath: args.html_path } : {}) }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'set_landing_page_lead_list',
+  definition: {
+    name: 'set_landing_page_lead_list',
+    description: 'Attach, change, or clear the CRM lead list on an existing landing page (including imported externally-deployed pages) without regenerating it. Pass lead_list_id=null to clear. Enables public submissions on the list and syncs the page capture route where the page has a repo.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' },
+        lead_list_id: { type: ['string', 'null'], description: 'Lead list ID to associate, or null to clear' }
+      },
+      required: ['page_id', 'lead_list_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const leadListId = typeof args.lead_list_id === 'string' && args.lead_list_id.trim() ? args.lead_list_id.trim() : null;
+    const data = await mcpFetch({
+      method: 'PATCH', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/lead-list`, context: ctx(context),
+      body: { leadListId }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
   name: 'edit_landing_page_file',
   definition: {
     name: 'edit_landing_page_file',
@@ -1841,7 +2107,7 @@ mcpToolRegistry.register({
   name: 'get_deployment_status',
   definition: {
     name: 'get_deployment_status',
-    description: 'Check the Vercel build/deployment status of a landing page. Use this after deploy_landing_page to verify the build succeeded. Note: for code edits, prefer using coding_agent which checks deployment status automatically after edits.',
+    description: 'Check the Vercel build/deployment status of a landing page. Use this after deploy_landing_page to verify the build succeeded. Note: for code edits, prefer using coding_agent which checks deployment status automatically after edits. The response\'s launchReadiness field is a SEPARATE signal from status/buildStatus: a page can build and deploy successfully and still not be launch-ready (failed post-deploy smoke test, no conversion tracking installed). Check launchReadiness.ready before telling the user the page is ready to send traffic to — if false, relay launchReadiness.reasons plainly.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2076,7 +2342,6 @@ mcpToolRegistry.register({
 
 mcpToolRegistry.register({
   name: 'generate_image',
-  internal: true,
   definition: {
     name: 'generate_image',
     description: 'Generate images using AI image generation models.',
@@ -2201,10 +2466,17 @@ mcpToolRegistry.register({
   name: 'list_predefined_work_plans',
   definition: {
     name: 'list_predefined_work_plans',
-    description: 'List the predefined work plan templates available to start. Non-admin users see published templates (system/public) plus their own and org-shared private plans. Admins (or admin-delegated sessions) get the full management list including unpublished and pending-review plans. To begin one, call launch_predefined_work_plan with the chosen title.',
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: 'List the predefined work plan templates available to start. Non-admin users see published templates (system/public) plus their own and org-shared private plans. Admins (or admin-delegated sessions) get the full management list including unpublished and pending-review plans. To begin one, call launch_predefined_work_plan with the chosen title. Returns a compact listing shape by default (id, title, category, autocomplete, visibility, display) -- pass verbose=true only if you need a template\'s full per-step body (description, userInstructions, skillIds, requiredFunctionCalls), and pair it with plan_id (the id from a prior compact listing, or the exact title) to scope the full detail to that one template instead of the whole catalog. Prefer the default shape for browsing/matching, and always pass plan_id alongside verbose=true when you already know which template you want -- verbose without plan_id re-fetches full detail for every accessible template and may exceed the response-size threshold, getting offloaded to search_tool_response.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        verbose: { type: 'boolean', description: 'Return the full legacy shape (every step\'s complete body) instead of the compact listing. Defaults to false.' },
+        plan_id: { type: 'string', description: 'Only used with verbose=true. Scope the full-detail response to the one template matching this id/planId or exact title, instead of the whole catalog.' },
+      },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
+  execute: async (args: any, context: any) => {
     // Role-aware: admins (or admin-delegated sessions) get the full management
     // list via the admin route; everyone else gets the published/launchable set
     // via the public agent-mode route. Both go through authenticateToken.
@@ -2219,7 +2491,60 @@ mcpToolRegistry.register({
     }
     const path = isAdmin ? '/api/admin/work-plans' : '/api/agent-mode/public/plans';
     const data = await mcpFetch({ method: 'GET', path, context: c });
-    return jsonResult(data);
+    // ENG-1814: the raw HTTP response carries every step's full body (description,
+    // userInstructions, skillIds, requiredFunctionCalls) for every accessible template --
+    // trivially exceeds the platform's 8,000-char tool-response-to-S3 threshold for any
+    // non-trivial catalog, forcing the model into a fragile multi-step
+    // search_tool_response/read_tool_response detour just to find a specific title (the
+    // detour that mis-selected a near-duplicate title in the live-reproduced ENG-1814
+    // incident). launch_predefined_work_plan (applyPredefinedWorkPlan) never consumes
+    // this tool's output -- it re-fetches its own candidates independently -- so nothing
+    // needs the full shape here by default. Real external MCP clients (confirmed via
+    // mcp_tool_used telemetry -- claude_ai OAuth callers) DO call this tool though, and
+    // unlike launch_predefined_work_plan, an external end user reading the response
+    // (via their own client's LLM) could legitimately want a template's full step
+    // detail -- so the full legacy shape stays reachable behind an explicit opt-in
+    // rather than being silently removed.
+    if (args?.verbose === true) {
+      // Round-4 review finding: verbose alone re-fetches full detail for the WHOLE
+      // catalog, reopening the same oversized-response/S3-offload mechanism this PR
+      // fixes -- for a caller who usually only wants one template's detail. plan_id
+      // scopes the response to just the matching template(s) so the common case
+      // (verbose + plan_id together) never re-triggers that risk; verbose alone with
+      // no plan_id is still allowed (there's a real, if rarer, use case for "diff
+      // every template's full detail at once") but isn't the guided default.
+      const scoped = args?.plan_id && Array.isArray(data)
+        ? data.filter((p: any) => p.id === args.plan_id || p.planId === args.plan_id || p.title === args.plan_id)
+        : data;
+      return jsonResult(scoped);
+    }
+    const { projectWorkPlanForCustomer } = await import('../../services/workPlanCustomerProjection');
+    // Return only what a listing/matching consumer needs by default: the
+    // already-built, already-tested ENG-1469 safe projection (`display`) plus the few
+    // top-level fields launch/recommend calls actually reference.
+    const compact = Array.isArray(data)
+      ? data.map((p: any) => ({
+          // Non-admin (getAllPredefinedWorkPlans) already remaps to `id`. Admin
+          // (getAllWorkPlans -> raw WorkPlan records) never has `id` at all -- only
+          // `planId`, the interface's actual primary key (workPlanService.ts) -- so
+          // `p.id` alone silently dropped the identifier entirely for every
+          // admin/delegated listing (JSON.stringify drops an undefined key), worse
+          // than the pre-fix raw passthrough. Fall back to `planId` so both shapes
+          // keep a real identifier under the `id` key recommend/launch expect.
+          id: p.id ?? p.planId,
+          title: p.title,
+          category: p.category,
+          autocomplete: p.autocomplete,
+          visibility: p.visibility,
+          // Non-admin already carries the computed ENG-1469 projection under
+          // `display`. Admin (raw WorkPlan records) only ever has the raw,
+          // often-undefined WorkPlanDisplayMetadataV1 shape (`stepLabels`, not
+          // `steps`) -- compute the same projection here so admin/delegated
+          // listings get equally useful disambiguating context.
+          display: p.display?.steps ? p.display : (projectWorkPlanForCustomer(p) ?? p.display),
+        }))
+      : data;
+    return jsonResult(compact);
   }
 });
 
@@ -2253,7 +2578,7 @@ mcpToolRegistry.register({
             properties: {
               title: { type: 'string' },
               description: { type: 'string' },
-              requiredFunctionCalls: { type: 'array', items: { type: 'string' }, description: 'Tool names the step must call before it can complete. Note the camelCase name; the snake_case alias required_function_calls is also accepted.' },
+              requiredFunctionCalls: { type: 'array', items: { type: 'string' }, description: 'Tool names the step must call before it can complete. Note the camelCase name; the snake_case alias required_function_calls is also accepted. Without a tool listed here, its delivery is best-effort — the step can complete even if the model skips it, silently. IMPORTANT (ENG-2204): if this step\'s instructions call for posting, alerting, or notifying via Slack, ALWAYS include slack_send_message here too.' },
               skillIds: { type: 'array', items: { type: 'string' }, description: 'Skill IDs attached to this step (from list_skills / resolve_skill). Alias: skill_ids.' },
               userInstructions: { type: 'string', description: 'Instructions shown to the user for this step. Alias: user_instructions.' },
               stepCount: { type: 'number', description: 'Step order, 1-based. Defaults to the array position. In steps_mode="merge" this is what selects the existing step to amend. Alias: step_count.' },
@@ -2568,7 +2893,9 @@ The two underlying fields are also returned, and they are NOT interchangeable:
 - llmModel: the model *selected* in the picker. A client-side selection only — the session may never have run on it (it can name a model outside the registry, or a live voice model that cannot generate text at all).
 - generationModels: the models that actually generated the assistant turns, derived from the transcript. Null when no message recorded one.
 
-TOKEN vs COST — they are not on the same basis. totalTokens EXCLUDES prompt-cache tokens, but totalCost/estimated_cost BILLS them. cacheTokens ({creation, read}, null when none) reports what was cached. A cache-heavy scheduled run can show 371 totalTokens against $2.94 of real spend, so a cost-per-token or "cheap because few tokens" claim computed from totalTokens alone is wrong by orders of magnitude. When reporting spend, use totalCost directly; when reporting volume, add cacheTokens to totalTokens and say you did.
+TOKEN vs COST — they are not on the same basis. totalTokens EXCLUDES prompt-cache tokens, but totalCost/estimated_cost BILLS them. cacheTokens ({creation, read}, null when none) reports what was cached. A cache-heavy scheduled run can show 371 totalTokens against $2.94 of real spend, so a cost-per-token or "cheap because few tokens" claim computed from totalTokens alone is wrong by orders of magnitude. When reporting spend, use totalCost directly for lifetime spend; when reporting volume, add cacheTokens to totalTokens and say you did.
+
+IN-WINDOW COST — sessions match the range on last activity, so a long-lived session carries its LIFETIME totalCost into a daily window. inWindowCost is the spend from assistant turns timestamped inside [start_time, end_time); use it for "spend in this period" (e.g. true 24h burn) and totalCost for lifetime. inWindowCost is null when no assistant turn recorded a timestamp — then the in-window share is unknown; say so rather than using totalCost as the period's spend.
 
 PER-MODEL COST — use costByModel, never attributedModels. attributedModels says WHICH models ran; it does not say how the money split. costByModel ({model: usd}, null when no turn recorded cost) is the actual per-turn allocation, so a session that ran two models contributes correctly to each rather than being double-counted or dropped. unattributedCost is the residual, on the same micro-USD basis as costByModel and totalCost: sum(costByModel) + unattributedCost reconciles to totalCost, exactly whenever there is spend left to attribute. It is null when the residual is not positive — in that case the per-model buckets already account for the whole session and may exceed totalCost by a few micro-dollars of per-turn rounding, which is noise, not missing money. Never treat a null as licence to rescale the buckets. It covers both spend on turns that recorded no model AND cost that never lands on a turn at all (tool/image spend counts toward totalCost but belongs to no model). When it is non-null the per-model split does NOT account for all of this session's cost — report it as its own line rather than folding it into a model, or your model percentages will not sum to the total.
 
@@ -2618,6 +2945,8 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
 
     // Format response — return all metadata shown in the admin Chat History tab, but exclude raw messages
     const sessions = (data as any)?.sessions || [];
+    const windowStartMs = Date.parse(args.start_time);
+    const windowEndMs = Date.parse(args.end_time);
     const formattedSessions = sessions.map((session: any) => {
       const messages: any[] = session.messages || [];
 
@@ -2653,10 +2982,22 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       // Greptile P1 (ENG-1313): the denominator for unlabelledAssistantTurns, so
       // "partial" can be quantified (N of M) rather than just flagged.
       let assistantTurnCount = 0;
+      // ENG-972: the range filter matches on last activity, so a long-lived
+      // session enters the window carrying its lifetime totalCost. Sum only the
+      // spend from assistant turns timestamped inside [start_time, end_time).
+      let inWindowCostMicro = 0;
+      let timestampedAssistantTurns = 0;
       for (const msg of messages) {
         if (msg?.role !== 'assistant') continue;
         assistantTurnCount++;
         const turnCost = msg?.usage?.estimated_cost || 0;
+        const turnMs = msg?.timestamp ? Date.parse(msg.timestamp) : NaN;
+        if (!Number.isNaN(turnMs)) {
+          timestampedAssistantTurns++;
+          if (turnMs >= windowStartMs && turnMs < windowEndMs && turnCost) {
+            inWindowCostMicro += Math.round(turnCost * 1e6);
+          }
+        }
         if (typeof msg?.llm === 'string' && msg.llm) {
           generationModels.add(msg.llm);
           if (turnCost) {
@@ -2786,6 +3127,9 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
         // Same micro-USD basis as costByModel/unattributedCost below, so the three
         // reconcile exactly rather than each being rounded independently.
         totalCost: session.totalCost != null ? Math.round(Number(session.totalCost) * 1e6) / 1e6 : null,
+        // ENG-972: spend from assistant turns inside the requested window only.
+        // Null when no assistant turn carries a timestamp (unknown, not zero).
+        inWindowCost: timestampedAssistantTurns > 0 ? inWindowCostMicro / 1e6 : null,
         satisfactionScore: session.satisfactionScore || null,
         judgeScores: session.judgeScores || null,
         // ENG-929: under sync=true, why this session does or does not have a
@@ -2885,7 +3229,9 @@ mcpToolRegistry.register({
 Returns for each client:
 - userId: internal account id — use this to map a userId (e.g. from get_chat_history) back to a human-readable email/displayName
 - displayName, email, roles
-- has_ads: whether they have a Meta ad account connected
+- has_ads: whether a Meta ad account is on record (it may have expired — see ad_connection)
+- ad_connection: never_connected (no ad account anywhere: activation, not churn) / connected / expired (Meta connection broke) / other_platform (ads on Google Ads or LinkedIn Ads, no Meta)
+- ad_connection_all_platforms: never_connected / connected / expired across Meta, Google Ads and LinkedIn Ads — expired means no ad account on any platform is usable (reconnect needed; a setup problem, not churn)
 - has_lander: whether they have landing pages (productDomain or seoDomains)
 - has_crm: whether they have CRM integrations (email domain, LinkedIn)
 - last_activity: last login timestamp
@@ -2924,7 +3270,11 @@ Returns a structured health assessment with:
 - **Lander layer**: Landing page / website presence (productDomain, seoDomains)
 - **Lead quality layer**: CRM / lead capture integrations (email domain, LinkedIn)
 - **Creative variety**: Distinct creatives, cannibalization warnings, fatigue indicators
-- **Overall status**: healthy / mediocre / at-risk / blocked with reasons
+- **Overall status**: healthy / mediocre / needs-attention / blocked / onboarding with reasons
+  - onboarding = activation incomplete (no ad account ever connected). This is NOT churn or at-risk — treat it as an activation nudge.
+  - ads_layer.connection other_platform = ads run on Google Ads or LinkedIn Ads; the Meta layer is not assessed and this is not a problem.
+  - needs-attention = setup or reconnect work: every ad connection expired (ads_layer.connection_all_platforms, all_platforms_expired_at) or several setup gaps. This is NOT churn or at-risk evidence — never describe it as churn risk.
+  - This tool never returns at-risk: churn risk needs behavioural evidence (spend, results, payments, feedback) and is not assessed here.
 
 Use this to quickly diagnose a client's marketing funnel completeness.`,
     inputSchema: {
@@ -2942,6 +3292,159 @@ Use this to quickly diagnose a client's marketing funnel completeness.`,
     const data = await mcpFetch({
       method: 'GET',
       path: `/api/client-health/${encodeURIComponent(args.client_name_or_email)}`,
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'check_account_tracking_health',
+  definition: {
+    name: 'check_account_tracking_health',
+    description: `Check Meta pixel/CAPI health and destination-URL coverage for a specific client's ad account. Admin-only tool, read-only — never sends a real alert, always runs in dry-run mode against this one account.
+
+Resolves the client (email or name) to their Meta ad account via the same lookup assess_client_health uses, then runs the tracking-integrity check scoped to that one account only.
+
+Returns:
+- 'summary': aggregate counts (blackouts, tokenErrors, fetchErrors, healthy, destinationAlerts, destinationOk, etc.) — since this call is scoped to exactly one account, a nonzero count on any of these describes THIS account, not a fleet-wide total.
+- 'summary.capturedAlerts': the specific findings that would have alerted, each with a subject, message, and structured context — this is the actual evidence (which pixel, which destination check, why) behind the aggregate counts above.
+
+Use this to check "is the pixel broken" / "is CAPI deployed" / "does this ad's destination actually carry a pixel this account owns" BEFORE concluding a lead-volume or CTR/CPM anomaly is caused by tracking failure rather than a genuine performance issue — the same reasoning monitor_lead_volume's 'requiresTrackingValidation' field already points here for.
+
+If the client has no connected Meta ad account, this returns an error rather than a health result — check assess_client_health first if account connectivity itself is in question.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const healthData: any = await mcpFetch({
+      method: 'GET',
+      path: `/api/client-health/${encodeURIComponent(args.client_name_or_email)}`,
+      context: ctx(context)
+    });
+    if (!healthData?.success || !healthData?.health?.client?.userId) {
+      return jsonResult({ success: false, error: healthData?.message || `Could not resolve client "${args.client_name_or_email}"` });
+    }
+    const userId = healthData.health.client.userId;
+    const adAccountId = healthData.health.ads_layer?.ad_account_id;
+    if (!adAccountId) {
+      return jsonResult({ success: false, error: `Client "${args.client_name_or_email}" has no connected Meta ad account — nothing to check.` });
+    }
+    const data = await mcpFetch({
+      method: 'POST',
+      path: '/api/admin/tracking-monitor/run',
+      context: ctx(context),
+      body: { dryRun: true, userId, adAccountId },
+    });
+    return jsonResult({ success: true, client: healthData.health.client, ...data });
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'diagnose_leads_at_zero',
+  definition: {
+    name: 'diagnose_leads_at_zero',
+    description: `Discriminate between look-alike causes for a client's "leads at zero" symptom, per connected Meta ad account. Admin-only, read-only.
+
+Evaluates five causes — pixel_capi_broken, landing_page_unreachable, budget_exhausted, genuine_demand_drop, normal_variance — using monitor_lead_volume and the tracking-health sweep as evidence, and applies a strict discrimination gate: 'determined' is only returned when exactly one cause has DIRECT supporting evidence and every other checkable cause has been ruled out. 'budget_exhausted' has no evidence source anywhere in this system today and is always reported as 'unchecked'. 'genuine_demand_drop' can be ruled out but never confirmed here either — a real drought requires a Conversion Tracking Validator pass this tool cannot run, so it stops at 'unchecked' rather than a confident but unvalidated 'supported'. Neither blocks a determined diagnosis on a different, well-evidenced cause — both are always disclosed.
+
+⚠ When the result is 'could_not_determine', do NOT pick a cause anyway and do NOT recommend an action — report it as an honest diagnosis gap, listing which causes remain live/unchecked. A confidently wrong diagnosis is worse than an honest "could not determine" — this is the one thing this tool must never be used to work around.
+
+Returns one diagnosis per connected Meta ad account, each with: outcome ('determined'|'could_not_determine'), concludedCause (null unless determined), causes (every cause evaluated, with its verdict and evidence — always read this, not just the top-line outcome), and reason (populated only when could_not_determine).`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/l2-diagnose/leads-at-zero/${encodeURIComponent(args.client_name_or_email)}`,
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+// ENG-1994: the /api/lead-volume-monitor route accepts only YYYY-MM-DD. Models routinely send a
+// full ISO-8601 datetime for a schema field described as a date, which the route rejected as
+// invalid_args. Truncate a well-formed datetime to its date; anything else passes through
+// untouched so the route still fails closed with a 400 instead of being silently coerced.
+const LEAD_VOLUME_DATE_PATTERN = '^\\d{4}-\\d{2}-\\d{2}(T[0-9:.]+(Z|[+-]\\d{2}:?\\d{2})?)?$';
+const ISO_DATETIME_RE = /^(\d{4}-\d{2}-\d{2})T([01]\d|2[0-3]):[0-5]\d(:[0-5]\d(\.\d+)?)?(Z|[+-]([01]\d|2[0-3]):?[0-5]\d)?$/;
+export function normalizeLeadVolumeDate(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const str = String(value).trim();
+  const m = ISO_DATETIME_RE.exec(str);
+  if (!m) return str;
+  // Only truncate a real calendar date; otherwise pass the raw value through so the route's
+  // YYYY-MM-DD check rejects it with a 400 instead of forwarding e.g. 2025-02-31.
+  const [y, mo, d] = m[1].split('-').map(Number);
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  const real = dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
+  return real ? m[1] : str;
+}
+
+mcpToolRegistry.register({
+  name: 'monitor_lead_volume',
+  definition: {
+    name: 'monitor_lead_volume',
+    description: `Report spend and CRM-landed leads per Meta ad campaign per day for a specific client, and flag campaigns whose lead volume has collapsed relative to THAT CAMPAIGN'S OWN history. Admin-only tool.
+
+Trigger is distribution-aware, not a fixed day count: a campaign is flagged only when its trailing 7-day lead average falls below its OWN 5th-percentile historical floor. A campaign needs at least 14 days of baseline history (excluding the trailing window) before it can be flagged at all — with less, status is 'insufficient_history', not 'normal' or 'drought'.
+
+⚠ A flagged campaign ('status': 'drought') is NOT a confirmed drought — 'requiresTrackingValidation' is always true on that verdict, and you MUST run Conversion Tracking Validator on the same client before reporting it as a real issue. Pixel/CAPI breakage produces the same signal as a genuine lead collapse, and this tool cannot distinguish them.
+
+⚠ The response also includes 'unattributedContext' and 'totalUnattributedLeads' at the ACCOUNT level, separate from every campaign's own totals. A nonzero unattributed count is normal (not every ad carries a matchable UTM) — NEVER read it as evidence any specific campaign's volume collapsed, and never subtract it from a campaign's lead total.
+
+Returns one report per connected Meta ad account for the client.
+
+⚠ If the response has 'truncated': true, the underlying data read was cut short and every verdict in this response (including 'normal' ones) may be based on incomplete history — narrow the since/until window and retry rather than reporting any of it as final.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        },
+        since: {
+          type: 'string',
+          pattern: LEAD_VOLUME_DATE_PATTERN,
+          description: 'Optional window start, YYYY-MM-DD (a full ISO-8601 datetime is truncated to its date). Must not be after `until`; the since..until window must not exceed 366 days. Defaults to 60 days before `until`.'
+        },
+        until: {
+          type: 'string',
+          pattern: LEAD_VOLUME_DATE_PATTERN,
+          description: 'Optional window end, YYYY-MM-DD (a full ISO-8601 datetime is truncated to its date). Defaults to today.'
+        }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const query = new URLSearchParams();
+    const since = normalizeLeadVolumeDate(args.since);
+    const until = normalizeLeadVolumeDate(args.until);
+    if (since) query.set('since', since);
+    if (until) query.set('until', until);
+    const qs = query.toString();
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/lead-volume-monitor/${encodeURIComponent(args.client_name_or_email)}${qs ? `?${qs}` : ''}`,
       context: ctx(context)
     });
     return jsonResult(data);

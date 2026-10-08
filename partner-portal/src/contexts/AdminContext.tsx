@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useCallback } from "react";
+import React, { createContext, useContext, useState, useCallback, useMemo } from "react";
 import axios from "axios";
 import { useAuth } from "./AuthContext";
 import { API_URL } from "../config";
@@ -57,6 +57,8 @@ interface User {
   productDomain?: string; // Product site domain for feature usage tracking
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   subscriptionType?: string; // Subscription type for customer portal users
+  /** Settled spend this month from the spend ledger (ENG-1250 AC7); absent if the lookup failed. */
+  spendThisMonthUsd?: number;
   tokenUsage?: {
     month: string;
     totalTokens: number;
@@ -75,17 +77,6 @@ interface User {
     totalAdminGrantedMicroUsd?: number;
     totalMigrationOffsetMicroUsd?: number;
   };
-  extraCostUsage?: {
-    month: string;
-    totalCost: number;
-    breakdown: Record<string, number>;
-    resetDate: string;
-  };
-  extraCostUsageHistory?: Array<{
-    month: string;
-    totalCost: number;
-    breakdown: Record<string, number>;
-  }>;
   introductionEmailSent?: string; // ISO date when the team introduction email was last sent
   replayUrl?: string; // Microsoft Clarity replay session URL
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders
@@ -157,12 +148,18 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
   const [error, setError] = useState<string | null>(null);
   const { token, user } = useAuth();
 
-  const api = axios.create({
+  // Memoized: a fresh instance per render changed every loader's identity and
+  // made consumer effects (Users tab) refetch in an endless loop.
+  const api = useMemo(
+    () =>
+      axios.create({
     baseURL: API_URL,
     headers: {
       Authorization: `Bearer ${token}`,
     },
-  });
+  }),
+    [token]
+  );
 
   const loadUsers = useCallback(async (hideBotLike = true) => {
     try {

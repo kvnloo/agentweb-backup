@@ -21,7 +21,13 @@
 const mockAxiosPost = jest.fn();
 const mockAxiosGet = jest.fn();
 jest.mock('axios', () => ({
-  create: () => ({ post: (...a: any[]) => mockAxiosPost(...a), get: (...a: any[]) => mockAxiosGet(...a) }),
+  create: () => ({
+    post: (...a: any[]) => mockAxiosPost(...a),
+    get: (...a: any[]) => mockAxiosGet(...a),
+    // The same import chain (see the aws-sdk mock above) also pulls in hubspotService.ts, which
+    // registers a response interceptor on its module-level axios instance at load time.
+    interceptors: { response: { use: jest.fn() } },
+  }),
 }));
 
 jest.mock('aws-sdk', () => ({
@@ -30,6 +36,13 @@ jest.mock('aws-sdk', () => ({
     put: () => ({ promise: () => Promise.resolve({}) }),
     get: () => ({ promise: () => Promise.resolve({}) }),
   })) },
+  // This file's import chain transitively pulls in s3Utils.ts (via chatbotService.ts ->
+  // agentModeService.ts -> crmEnrichmentService.ts -> enrichmentIdentityResolver.ts ->
+  // routes/crmEnrichSo.ts -> enrichSoServiceFactory.ts), which constructs `new AWS.S3(...)` at
+  // module load time. Without this, that throws "AWS.S3 is not a constructor" before any test
+  // in this file runs, unrelated to anything this file actually tests. Matches the S3 stub
+  // convention already used elsewhere (accountMemory.test.ts, accountSummary.test.ts, etc.).
+  S3: jest.fn(() => ({})),
 }));
 
 jest.mock('../services/db', () => ({
@@ -87,7 +100,9 @@ describe('Apollo $ ledger mirroring (ENG-696)', () => {
     expect(ctx.provider).toBe('apollo');
     expect(ctx.userId).toBe(OWNER);
     expect(ctx.operation).toBe('person_match');
-    expect(ctx.costSource).toBe('allocated');
+    // ENG-1929: priced by the recorder from the rate key, never at the call site.
+    expect(ctx.rateKey).toBe('person_match');
+    expect(ctx).not.toHaveProperty('costUsd');
   });
 
   it('AC2: records against the platform when no userId is resolvable', async () => {

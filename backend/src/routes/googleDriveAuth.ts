@@ -4,8 +4,13 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getGoogleDriveConfig } from '../config/integrations';
 import { createAccount } from '../services/connectedAccountsDb';
+import { redactAccountSecrets } from '../utils/accountSecretRedaction';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
+import { userDb, orgDb } from '../services/db';
+import { canInOrg } from '../services/orgAuthz';
+import { getAccountByPlatform } from '../services/connectedAccountsDb';
+import { buildDriveAccessInventory, DriveListClient } from '../services/integrationAccessService';
 
 const router = express.Router();
 
@@ -217,11 +222,43 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
       },
     });
 
-    res.json({ success: true, account });
+    res.json({ success: true, account: redactAccountSecrets(account) });
   } catch (error: any) {
     console.error('[GoogleDrive OAuth /connect]', error);
     const details = IS_PRODUCTION ? undefined : error.message;
     res.status(500).json({ error: 'Failed to connect Google Drive account', ...(details && { details }) });
+  }
+});
+
+// GET /access-inventory — ENG-2118: org-admin-only, read-only list of the
+// shared drives and folder NAMES the connected Drive token can reach. Live on
+// every call, so a refresh reflects sharing changes immediately.
+router.get('/access-inventory', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  try {
+    const user = await userDb.getUserById(userId);
+    if (!user?.orgId) return res.status(403).json({ error: 'Org admin access required' });
+    const org = await orgDb.getOrgById(user.orgId);
+    if (!canInOrg({ userId, orgId: user.orgId, orgRole: (user as any).orgRole }, org, 'org:accounts:read')) {
+      return res.status(403).json({ error: 'Org admin access required' });
+    }
+    const account = await getAccountByPlatform(userId, 'google_drive');
+    let drive: DriveListClient | null = null;
+    const cfg = (account?.config || {}) as any;
+    if (account) {
+      const config = await getGoogleDriveConfig();
+      const { OAuth2Client } = await import('google-auth-library');
+      const auth = new OAuth2Client(config.clientId, config.clientSecret);
+      auth.setCredentials({ access_token: cfg.access_token, refresh_token: cfg.refresh_token, expiry_date: cfg.token_expires_at });
+      const { google } = await import('googleapis');
+      drive = google.drive({ version: 'v3', auth }) as unknown as DriveListClient;
+    }
+    const inventory = await buildDriveAccessInventory(drive, cfg.email ?? null);
+    res.set('Cache-Control', 'no-store');
+    res.json(inventory);
+  } catch (error: any) {
+    console.error('[GoogleDrive AccessInventory] Error:', error.message);
+    res.status(502).json({ error: 'Failed to read Google Drive access inventory' });
   }
 });
 

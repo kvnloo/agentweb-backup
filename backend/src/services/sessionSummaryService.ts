@@ -1,5 +1,8 @@
 import { chatbotDb, ChatSession } from "./chatbotService";
-import { detectFalseCompletionClaim, ExecutedToolCall } from "./agentMode/core/synthesisResidue";
+import { detectFalseCompletionClaim, ExecutedToolCall, assetProducingToolsInPlay } from "./agentMode/core/synthesisResidue";
+import { meteringFeature } from "./llmUsageAttributionService";
+import { extractScheduleId } from "../utils/schedulePublishApproval";
+import type { LLMUsageContext } from "../utils/llmService";
 
 const SUMMARY_MODEL = "gemini-3.1-flash-lite";
 const MAX_MESSAGES_FOR_SUMMARY = 50;
@@ -22,7 +25,8 @@ Respond with ONLY valid JSON: {"summary": "<1-2 sentence summary>"}`;
 
 export async function summarizeSession(
   messages: Array<{ role: string; content: string }>,
-  currentMessageCount: number
+  currentMessageCount: number,
+  usageContext?: LLMUsageContext
 ): Promise<{ summary: string; evaluatedMessageIndex: number }> {
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SUMMARY);
   const conversationText = recentMessages
@@ -42,6 +46,8 @@ export async function summarizeSession(
       max_completion_tokens: 200,
       response_format: { type: "json_object" },
       taskClass: 'nonstandard_consumer',
+      // ENG-1858: summarizing the user's own session — attribute it to them.
+      usageContext: usageContext ?? { feature: "session_summary" },
     }
   );
 
@@ -102,14 +108,28 @@ export async function summarizeSessionIfNeeded(
     return null;
   }
 
-  const simplifiedMessages = (session.messages || [])
+  // ENG-2163: the summary is served to the customer verbatim via the customer-reachable
+  // `account_summary` tool, so it must not paraphrase delegated-admin activity. Redact admin
+  // tool results + admin-tainted assistant narration from the input first. adminToolNames comes
+  // from agentModeService via a lazy import to avoid a static cycle (this file already lazy-imports
+  // agentModeService for callLLM below).
+  const { redactAdminActivity } = await import("../utils/adminOnlyMessageFilter");
+  const { ADMIN_SKILL_TOOL_NAMES } = await import("./agentModeService");
+  const redactedMessages = redactAdminActivity(session.messages || [], { adminToolNames: ADMIN_SKILL_TOOL_NAMES });
+
+  const simplifiedMessages = redactedMessages
     .filter((m: any) => m.role === "user" || m.role === "assistant")
     .map((m: any) => ({
       role: m.role,
       content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
     }));
 
-  const result = await summarizeSession(simplifiedMessages, messageCount);
+  // ENG-1858: bill the summary to the session owner instead of "system".
+  const result = await summarizeSession(simplifiedMessages, messageCount, {
+    userId: session.userId,
+    sessionId: session.sessionId,
+    feature: meteringFeature("session_summary", session.sessionType, extractScheduleId(session.pageIdentifier)),
+  });
 
   let summaryText = result.summary;
   const toolCallLedger = flattenSessionToolCalls(session.messages);
@@ -119,7 +139,24 @@ export async function summarizeSessionIfNeeded(
   // call, which is correct for a single closing turn but would misread a truthful
   // claim about several completed steps' assets as false the moment the currently
   // -open step hasn't produced anything of its own yet.
-  const falseClaim = detectFalseCompletionClaim(summaryText, toolCallLedger, false);
+  //
+  // ENG-2076: gated on `assetProducingToolsInPlay(toolCallLedger)` — this check only
+  // understands image/video/HTML-template tools (`ASSET_PRODUCING_TOOL_NAMES`), so a
+  // session built entirely on a different domain (Meta Ads, CRM, LinkedIn outreach,
+  // etc.) always reads `actual: 0` here regardless of what really happened. Without
+  // this gate, a Meta Ads session whose LLM-written summary happens to phrase a true
+  // result with a digit near an asset noun (the summarizer's own system prompt
+  // models exactly that: `"Created 3 LinkedIn posts..."`) would have its accurate
+  // summary silently REPLACED by a false "0 of 3... not yet complete" line — worse
+  // than the inline chat correction this same bug caused elsewhere, since this one
+  // persists to `session.sessionSummary` and is served verbatim by the
+  // `account_summary` Emma tool. Unlike the per-turn call site in
+  // agentModeService.ts, gating on this SAME whole-session `toolCallLedger` (not a
+  // narrower per-turn one) is correct here: `actual` is computed from this identical
+  // ledger, so the gate and the count never disagree on scope.
+  const falseClaim = assetProducingToolsInPlay(toolCallLedger)
+    ? detectFalseCompletionClaim(summaryText, toolCallLedger, false)
+    : null;
   if (falseClaim) {
     console.warn(
       `SessionSummary: generated summary for session ${session.sessionId} claims ${falseClaim.claimed} completed ` +

@@ -1,10 +1,12 @@
 import Stripe from 'stripe';
 import { createStripeClient } from './stripeClientFactory';
 import dotenv from 'dotenv';
-import { userDb } from './db';
+import { userDb, orgDb, User } from './db';
 import { getTierConfig, DEFAULT_PAGES } from './subscriptionService';
 import { paymentHistoryDb } from './paymentHistoryDb';
 import { syncUserUpdateToLeadList } from './crmAutoSyncService';
+import { waitlistDb, WaitlistEntry } from './waitlistDb';
+import { findSeatLineItem } from './orgSeatBillingService';
 
 dotenv.config();
 
@@ -38,6 +40,189 @@ export function getSubscriptionPeriodEndIso(sub: any): string | undefined {
     sub?.items?.data?.[0]?.current_period_end ?? sub?.current_period_end;
   if (raw == null) return undefined;
   return new Date(typeof raw === 'number' ? raw * 1000 : raw).toISOString();
+}
+
+/**
+ * Identify "the" base-plan subscription item, robust to the presence of the
+ * seat-billing extra-seat line item (ENG-2243..2246) that can now coexist on
+ * the same subscription alongside the plan item.
+ *
+ * Every plan-mutating call site in this file (`upgradeSubscription`,
+ * `changeSubscriptionPrice`) was written when a subscription could only ever
+ * have one item, and picked it with `items.data[0]`. Seat billing breaks that
+ * assumption — a subscription can now carry two items — and Stripe does not
+ * document `items.data` as being stably ordered with the originally-
+ * subscribed item first. If a seat item ever sorted ahead of the plan item,
+ * `items.data[0]` would silently become the SEAT item, and a plan
+ * upgrade/downgrade would overwrite the seat item's price with the new
+ * plan's price — corrupting the seat line item while leaving the real plan
+ * item (and its old price) untouched. Explicitly excluding the known seat
+ * product id removes the dependency on ordering entirely.
+ *
+ * Behavior-preserving: returns `items[0]` whenever there's at most one item
+ * or the seat product id isn't configured, which is every subscription that
+ * predates seat billing.
+ */
+export function findBasePlanItem(
+  subscription: Pick<Stripe.Subscription, 'items'>
+): Stripe.SubscriptionItem | undefined {
+  const items = subscription.items.data;
+  if (items.length <= 1) return items[0];
+
+  const seatProductId = process.env.STRIPE_EXTRA_SEAT_PRODUCT_ID;
+  if (!seatProductId) return items[0];
+
+  const seatItem = findSeatLineItem(subscription, seatProductId);
+  if (!seatItem) return items[0];
+
+  const nonSeatItems = items.filter((item) => item.id !== seatItem.id);
+  return nonSeatItems[0] ?? items[0];
+}
+
+/**
+ * Extract the two custom checkout fields ("companyname" and
+ * "howdoyouplantousethisproduct") from a Stripe Checkout Session's
+ * `custom_fields` array. Shared by the authenticated webhook handler
+ * (source of truth) so the profile-enrichment side effects that used to
+ * live in the public, unauthenticated `GET /api/stripe/session/:sessionId`
+ * route (ENG-1756) still happen — just from a signature-verified event.
+ */
+export function extractCheckoutCustomFields(session: any): {
+  companyName?: string;
+  productUsageLabel?: string;
+} {
+  let companyName: string | undefined;
+  let productUsageLabel: string | undefined;
+
+  if (session?.custom_fields && Array.isArray(session.custom_fields)) {
+    for (const field of session.custom_fields) {
+      if (
+        field.key === 'companyname' &&
+        field.text &&
+        typeof field.text.value === 'string'
+      ) {
+        companyName = field.text.value;
+      }
+      if (
+        field.key === 'howdoyouplantousethisproduct' &&
+        field.dropdown &&
+        typeof field.dropdown.value === 'string'
+      ) {
+        const selectedValue = field.dropdown.value;
+        const selectedOption = field.dropdown.options?.find(
+          (opt: any) => opt.value === selectedValue
+        );
+        productUsageLabel =
+          selectedOption && typeof selectedOption.label === 'string'
+            ? selectedOption.label
+            : selectedValue;
+      }
+    }
+  }
+
+  return { companyName, productUsageLabel };
+}
+
+/**
+ * Sync companyName / useCaseCategories from a Checkout Session's custom
+ * fields onto the matching user (or waitlist entry) record. Only ever
+ * called from the signature-verified webhook handler — this is the write
+ * path formerly reachable from the public GET session-lookup route
+ * (ENG-1756).
+ */
+async function syncCheckoutProfileFields(session: any): Promise<void> {
+  const { companyName, productUsageLabel } = extractCheckoutCustomFields(session);
+  if (!companyName && !productUsageLabel) return;
+
+  let email: string | undefined;
+  if (
+    session.customer &&
+    typeof session.customer === 'object' &&
+    !session.customer.deleted &&
+    session.customer.email
+  ) {
+    email = session.customer.email;
+  } else if (session.customer_details?.email) {
+    email = session.customer_details.email;
+  }
+  if (!email) return;
+  email = email.toLowerCase();
+
+  let stripeCustomerId: string | undefined;
+  if (session.customer) {
+    if (typeof session.customer === 'string') {
+      stripeCustomerId = session.customer;
+    } else if (session.customer.id && !session.customer.deleted) {
+      stripeCustomerId = session.customer.id;
+    }
+  }
+
+  try {
+    const existingUser = await userDb.getUserByEmail(email);
+
+    if (existingUser && existingUser.userId) {
+      const userUpdates: Partial<User> = {};
+      if (stripeCustomerId && existingUser.stripe_customer_id !== stripeCustomerId) {
+        userUpdates.stripe_customer_id = stripeCustomerId;
+      }
+      if (companyName && existingUser.companyName !== companyName) {
+        userUpdates.companyName = companyName;
+      }
+      if (
+        productUsageLabel &&
+        (!existingUser.useCaseCategories ||
+          existingUser.useCaseCategories.length !== 1 ||
+          existingUser.useCaseCategories[0] !== productUsageLabel)
+      ) {
+        userUpdates.useCaseCategories = [productUsageLabel];
+      }
+      if (Object.keys(userUpdates).length > 0) {
+        await userDb.updateUser(existingUser.userId, userUpdates);
+      }
+
+      const waitlistUpdates: Partial<WaitlistEntry> = {};
+      if (stripeCustomerId) waitlistUpdates.stripe_customer_id = stripeCustomerId;
+      if (companyName) waitlistUpdates.companyName = companyName;
+      if (productUsageLabel) waitlistUpdates.useCaseCategories = [productUsageLabel];
+      if (Object.keys(waitlistUpdates).length > 0) {
+        const waitlistEntry = await waitlistDb.getByEmail(email);
+        if (waitlistEntry) {
+          const changesExist = Object.keys(waitlistUpdates).some(
+            (key) =>
+              waitlistUpdates[key as keyof typeof waitlistUpdates] !==
+              waitlistEntry[key as keyof typeof waitlistEntry]
+          );
+          if (changesExist) {
+            await waitlistDb.updateDetails(email, waitlistUpdates);
+          }
+        }
+      }
+    } else {
+      const existingWaitlistEntry = await waitlistDb.getByEmail(email);
+      const waitlistData: Partial<WaitlistEntry> & { email: string } = {
+        email,
+        companyName: companyName || existingWaitlistEntry?.companyName || 'Freelancer',
+        useCaseCategories: productUsageLabel
+          ? [productUsageLabel]
+          : existingWaitlistEntry?.useCaseCategories || [],
+        stripe_customer_id: stripeCustomerId,
+        supportNote: existingWaitlistEntry?.supportNote || 'Joined/Updated from Stripe',
+        joinedAt: existingWaitlistEntry?.joinedAt || new Date().toISOString(),
+        status: 'invited',
+        invitedAt: new Date().toISOString(),
+      };
+      if (existingWaitlistEntry) {
+        await waitlistDb.updateDetails(email, waitlistData);
+      } else {
+        await waitlistDb.add(waitlistData as WaitlistEntry);
+      }
+    }
+  } catch (err: any) {
+    console.error(
+      `[STRIPE] Failed to sync checkout profile fields for session ${session?.id}:`,
+      err.message
+    );
+  }
 }
 
 /**
@@ -89,7 +274,7 @@ export const stripeService = {
 
     const s = getStripeOrThrow();
     const subscription = await s.subscriptions.retrieve(stripeSubscriptionId);
-    const existingItemId = subscription.items.data[0]?.id;
+    const existingItemId = findBasePlanItem(subscription)?.id;
 
     if (!existingItemId) {
       throw new Error('No subscription item found on the existing subscription.');
@@ -225,7 +410,7 @@ export async function changeSubscriptionPrice(
 
   const stripe = getStripeOrThrow();
   const current = await stripe.subscriptions.retrieve(subscriptionId);
-  const currentItem = current.items.data[0];
+  const currentItem = findBasePlanItem(current);
   if (!currentItem) throw new Error(`Subscription ${subscriptionId} has no items`);
 
   if (newPriceId === currentItem.price.id) {
@@ -262,6 +447,21 @@ export async function changeSubscriptionPrice(
   });
   const currentPhase = schedule.phases[0];
 
+  // Carry forward every item that ISN'T the plan item being downgraded — in
+  // particular the seat-billing extra-seat item (ENG-2243..2246), which can
+  // now coexist on the same subscription. Without this, phase 2 would only
+  // ever list `newPriceId`, and Stripe would silently drop every other item
+  // (including a paid seat item, at whatever quantity it was) the moment the
+  // scheduled downgrade takes effect — canceling seat billing entirely
+  // without going through removeExtraSeat's occupied-seat safety check.
+  const planPriceId = currentItem.price.id;
+  const carryForwardItems = currentPhase.items
+    .map((i: any) => ({
+      price: typeof i.price === 'string' ? i.price : i.price?.id,
+      quantity: i.quantity ?? 1,
+    }))
+    .filter((i: { price: string }) => i.price !== planPriceId);
+
   const updated = await stripe.subscriptionSchedules.update(schedule.id, {
     phases: [
       {
@@ -273,7 +473,7 @@ export async function changeSubscriptionPrice(
         end_date: currentPhase.end_date ?? periodEnd,
       },
       {
-        items: [{ price: newPriceId, quantity: 1 }],
+        items: [{ price: newPriceId, quantity: 1 }, ...carryForwardItems],
       },
     ],
     end_behavior: 'release', // After phase 2, drop back to a plain subscription
@@ -358,7 +558,14 @@ export async function syncSubscriptionFromStripe(
       activeOffer: extractActiveOffer(sub),
     };
 
-    // Derive tier from price if available
+    // Derive tier from price if available.
+    //
+    // NOTE: still `items.data[0]`, not `findBasePlanItem` — left alone by the
+    // seat-billing (ENG-2243..2246) correctness review as low-risk, since a
+    // wrong read here just skips an additive-only tier backfill rather than
+    // corrupting billing state. Don't copy this pattern elsewhere: see
+    // findBasePlanItem's doc comment for why position-based lookup breaks
+    // once a seat item can coexist on the same subscription.
     const priceId = sub.items?.data?.[0]?.price?.id;
     if (priceId) {
       const derivedType = deriveSubscriptionTypeFromPriceId(priceId);
@@ -519,6 +726,14 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
     stripe_customer_id: updateData.stripe_customer_id,
   });
 
+  // Sync companyName/useCaseCategories from custom checkout fields — this
+  // used to happen from the public, unauthenticated GET session-lookup
+  // route (ENG-1756); moved here since this handler is signature-verified.
+  // Awaited (not fire-and-forget): this function already catches its own
+  // errors internally, so awaiting only ensures the work completes before
+  // the webhook handler returns — it cannot make this handler throw.
+  await syncCheckoutProfileFields(session);
+
   // Cancel any duplicate subscriptions for this customer (keep only the latest)
   if (stripeCustomerId && stripeSubscriptionId) {
     try {
@@ -636,9 +851,15 @@ export async function handleSubscriptionUpdated(
     updateData.current_period_end = updatedPeriodEndIso;
   }
 
-  // Sync plan tier on upgrades/downgrades
-  if (subscription.items?.data?.[0]?.price?.id) {
-    const newType = deriveSubscriptionTypeFromPriceId(subscription.items.data[0].price.id);
+  // Sync plan tier on upgrades/downgrades. Use findBasePlanItem rather than
+  // items.data[0] — a subscription can now also carry a seat-billing extra-
+  // seat item (ENG-2243..2246), and Stripe doesn't guarantee the originally-
+  // subscribed item stays first in `items.data` once a second item exists.
+  const basePlanPriceId = subscription.items?.data?.length
+    ? findBasePlanItem(subscription)?.price?.id
+    : undefined;
+  if (basePlanPriceId) {
+    const newType = deriveSubscriptionTypeFromPriceId(basePlanPriceId);
     if (newType) {
       updateData.subscriptionType = newType;
       const tierConfig = await getTierConfig(newType);
@@ -657,6 +878,32 @@ export async function handleSubscriptionUpdated(
     subscriptionType: updateData.subscriptionType,
     subscription_status: updateData.subscription_status,
   });
+
+  // Seat-based billing (ENG-2243..2246): mirror the extra-seat line item's
+  // quantity onto Organization.purchasedExtraSeats when this user is an
+  // org's billing owner. This webhook is the ONLY writer of that field —
+  // orgSeatBillingService reads Stripe live and never writes the mirror.
+  // Idempotent (same quantity in = no-op write) and tolerant of an absent
+  // line item (treated as 0 extra seats) or an unconfigured product id
+  // (skipped entirely rather than guessing).
+  if (user.orgId) {
+    try {
+      const org = await orgDb.getOrgById(user.orgId, ['orgId', 'ownerUserId', 'purchasedExtraSeats']);
+      const productId = process.env.STRIPE_EXTRA_SEAT_PRODUCT_ID;
+      if (org && org.ownerUserId === user.userId && productId) {
+        const seatItem = findSeatLineItem(subscription, productId);
+        const newExtraSeats = seatItem?.quantity ?? 0;
+        if (org.purchasedExtraSeats !== newExtraSeats) {
+          await orgDb.updateOrg(org.orgId, { purchasedExtraSeats: newExtraSeats });
+        }
+      }
+    } catch (seatSyncError: any) {
+      console.error(
+        `[STRIPE] Failed to sync extra-seat quantity for user ${user.userId}'s org:`,
+        seatSyncError.message
+      );
+    }
+  }
 
   console.log(
     `Subscription updated: user ${user.userId} → status=${subscription.status}, has_pm=${hasPaymentMethod}, periodEnd=${updateData.current_period_end || 'unchanged'}, offer=${updateData.activeOffer?.couponId ?? 'none'}`
@@ -768,7 +1015,15 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
             stripe_subscription_id: activeSub.id,
           };
 
-          // Derive tier from the remaining subscription's price
+          // Derive tier from the remaining subscription's price.
+          //
+          // NOTE: still `items.data[0]`, not `findBasePlanItem` — left alone
+          // by the seat-billing (ENG-2243..2246) correctness review as
+          // low-risk: this only sets subscriptionType/allowedPages, and a
+          // seat item sorting first here would just skip that sync rather
+          // than corrupt billing state. See findBasePlanItem's doc comment
+          // for why position-based lookup is otherwise unsafe once a seat
+          // item can coexist on the same subscription.
           const priceId = activeSub.items?.data?.[0]?.price?.id;
           if (priceId) {
             const newType = deriveSubscriptionTypeFromPriceId(priceId);
@@ -1227,6 +1482,14 @@ function deriveSubscriptionType(session: any, subscription?: any): string | null
   // fetches explicitly) and fall back to session.line_items only when a
   // caller happens to have expanded them (e.g. an admin-invoked flow that
   // retrieves the session with { expand: ['line_items'] }).
+  //
+  // NOTE: still `items.data[0]`, not `findBasePlanItem` — left alone by the
+  // seat-billing (ENG-2243..2246) correctness review as low-risk: a
+  // freshly-completed checkout session's subscription is brand new and
+  // can't yet carry a seat line item (that's only added later, via
+  // purchaseExtraSeat), so there's nothing for items.data[0] to collide
+  // with here. Don't copy this pattern elsewhere a subscription's items can
+  // have grown since creation — see findBasePlanItem's doc comment.
   const priceId = subscription?.items?.data?.[0]?.price?.id
     || session.line_items?.data?.[0]?.price?.id
     || session.display_items?.[0]?.price?.id;
@@ -1337,7 +1600,15 @@ export async function reconcileStripeUser(
     hasPaymentMethod = methods.data.length > 0;
   }
 
-  // Derive tier
+  // Derive tier.
+  //
+  // NOTE: still `items.data[0]`, not `findBasePlanItem`. Same hazard class as
+  // syncSubscriptionFromStripe above (not one of the sites the seat-billing
+  // ENG-2243..2246 correctness review named, but identical in kind): a seat
+  // item sorting first here would just leave this admin-triggered
+  // reconciliation skipping a tier overwrite rather than corrupting billing
+  // state. See findBasePlanItem's doc comment before reusing this pattern
+  // anywhere a subscription's items can include a seat line item.
   const priceId = sub.items?.data?.[0]?.price?.id;
   const derivedType = priceId ? deriveSubscriptionTypeFromPriceId(priceId) : null;
 

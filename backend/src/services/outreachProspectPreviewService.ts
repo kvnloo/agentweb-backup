@@ -344,10 +344,27 @@ export async function searchProspectsPreview(
   // doesn't take a server-side limit, so we slice in JS.
   const limit = Math.max(1, Math.min(10, args.limit ?? 10));
 
-  const searchResult = await linkedInOutreachService.searchPeople(
-    accountId,
-    params,
-  );
+  // ENG-2205: resolveAccountId can now hand back an account whose probe was
+  // merely indeterminate (not proven dead), so this real call is the backstop
+  // that proves it either way — and unlike the ENG-281-era comment below,
+  // `handleError` (linkedInOutreachService.ts) always THROWS (Promise<never>),
+  // it never resolves with `{ error: '...' }`. Without a try/catch here, a
+  // real Unipile failure (an outage, or even a Secrets Manager credential
+  // fetch failure) propagated uncaught through this previously-unreachable
+  // "detect the error shape" check, out of this function, and into the
+  // route's generic catch-all — a raw 500 with an internal error message
+  // instead of the structured 502/503 envelope the route already has a
+  // switch case for.
+  let searchResult: any;
+  try {
+    searchResult = await linkedInOutreachService.searchPeople(accountId, params);
+  } catch (err: any) {
+    return {
+      ok: false,
+      error: "unipile_error",
+      message: err?.message ?? "Unipile search failed",
+    };
+  }
 
   // `handleError` returns `{ error: '...' }` instead of throwing, so we
   // detect it here and 502 at the route layer.

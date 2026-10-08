@@ -18,7 +18,13 @@ import {
   META_ADS_READ_SCOPES,
   META_ADS_RECONSENT_MESSAGE,
   META_ADS_ASSET_ACCESS_MESSAGE,
+  META_ADS_NO_PAGES_MESSAGE,
   getMetaAdsScopeState,
+  getMetaPagesAccessState,
+  getMetaAdsNoPagesMessage,
+  buildMetaAdsWrongPageMessage,
+  getAccessiblePageIds,
+  buildMetaAdsPageNotAccessibleMessage,
   hasMetaAdsReadScope,
   isMetaAdsScopeRefusal,
   buildMetaAdsScopeError,
@@ -468,9 +474,178 @@ describe('describeMetaAdsCapability', () => {
     ).toEqual({ ads_capable: false, capability_warning: META_ADS_RECONSENT_MESSAGE });
   });
 
+  it('reports declined required OAuth permissions as incapable even when an ads scope is present', () => {
+    const result = describeMetaAdsCapability(
+      adAccount({
+        granted_scopes: ['ads_read'],
+        declined_required_permissions: ['pages_read_engagement'],
+      })
+    );
+    expect(result.ads_capable).toBe(false);
+    expect(result.capability_warning).toContain('pages_read_engagement');
+    expect(result.capability_warning).toContain('Edit access');
+  });
+
+  it('reports an OAuth health read failure as not healthy rather than capable', () => {
+    const result = describeMetaAdsCapability(
+      adAccount({
+        granted_scopes: ['ads_read'],
+        meta_oauth_health_error: 'Meta permissions endpoint timed out',
+      })
+    );
+    expect(result.ads_capable).toBe(false);
+    expect(result.capability_warning).toContain('could not be fully verified');
+    expect(result.capability_warning).toContain('Meta permissions endpoint timed out');
+  });
+
   it('tolerates a null/undefined account without throwing', () => {
     expect(describeMetaAdsCapability(null)).toEqual({});
     expect(describeMetaAdsCapability(undefined)).toEqual({});
+  });
+});
+
+/**
+ * ENG-2232 — Page access is a second, independent Meta grant. A connection can
+ * have ads_read granted and still have zero accessible Facebook Pages, which
+ * is fatal for every AD_CREATIVE (each one needs a page_id). Production case:
+ * ad account 1209971551106961 reported `ads_capable: true` with PAGE LIST
+ * returning 0 Pages both before and after the customer reconnected, so
+ * `list_connected_accounts` never warned before 4 campaigns + 4 ad sets were
+ * already built and approved.
+ */
+describe('getMetaPagesAccessState', () => {
+  it("returns 'granted' when has_meta_pages is true", () => {
+    expect(getMetaPagesAccessState({ has_meta_pages: true })).toBe<MetaAdsScopeState>('granted');
+  });
+
+  it("returns 'missing' when has_meta_pages is false", () => {
+    expect(getMetaPagesAccessState({ has_meta_pages: false })).toBe<MetaAdsScopeState>('missing');
+  });
+
+  it("returns 'unknown' when has_meta_pages was never probed", () => {
+    expect(getMetaPagesAccessState({})).toBe<MetaAdsScopeState>('unknown');
+    expect(getMetaPagesAccessState(undefined)).toBe<MetaAdsScopeState>('unknown');
+    expect(getMetaPagesAccessState(null)).toBe<MetaAdsScopeState>('unknown');
+  });
+});
+
+describe('describeMetaAdsCapability — Page access (ENG-2232)', () => {
+  const adAccount = (config: Record<string, unknown>) => ({
+    platform: 'meta',
+    account_id: '1209971551106961',
+    config: { account_type: 'ad_account', ...config },
+  });
+
+  it('is incapable with the Page-specific warning when ads_read is granted but 0 Pages are accessible', () => {
+    // The exact production shape: ads_read granted, has_meta_pages confirmed false.
+    expect(
+      describeMetaAdsCapability(adAccount({ granted_scopes: ['ads_read'], has_meta_pages: false }))
+    ).toEqual({ ads_capable: false, capability_warning: META_ADS_NO_PAGES_MESSAGE });
+  });
+
+  it('is incapable with the Page-specific warning even when the ads scope state is unknown', () => {
+    // No granted_scopes on record at all, but the Page probe still ran and found none.
+    expect(
+      describeMetaAdsCapability(adAccount({ has_meta_pages: false }))
+    ).toEqual({ ads_capable: false, capability_warning: META_ADS_NO_PAGES_MESSAGE });
+  });
+
+  it('stays capable when ads_read is granted and Pages are confirmed accessible', () => {
+    expect(
+      describeMetaAdsCapability(adAccount({ granted_scopes: ['ads_read'], has_meta_pages: true }))
+    ).toEqual({ ads_capable: true });
+  });
+
+  it('stays capable (no page warning) when the Page probe never ran — never crying wolf on a legacy record', () => {
+    expect(
+      describeMetaAdsCapability(adAccount({ granted_scopes: ['ads_read'] }))
+    ).toEqual({ ads_capable: true });
+  });
+
+  it('prefers the OAuth re-consent message when BOTH the ads scope and Page access are missing', () => {
+    // Reconnecting fixes the OAuth grant and lets the user pick Pages in the same flow —
+    // one actionable message beats two competing ones.
+    expect(
+      describeMetaAdsCapability(
+        adAccount({ granted_scopes: ['pages_show_list'], has_meta_pages: false })
+      )
+    ).toEqual({ ads_capable: false, capability_warning: META_ADS_RECONSENT_MESSAGE });
+  });
+
+  it('names the specific Page when has_meta_pages is false because of a wrong-Page mismatch, not zero Pages', () => {
+    // This account DOES have Page access — just not to the Page its own ads use.
+    // "no Facebook Pages are accessible" would be false here.
+    const warning = describeMetaAdsCapability(
+      adAccount({
+        granted_scopes: ['ads_read'],
+        has_meta_pages: false,
+        existing_ads_page_id: '1010991085424542',
+      })
+    ).capability_warning;
+    expect(warning).toContain('1010991085424542');
+    expect(warning).not.toEqual(META_ADS_NO_PAGES_MESSAGE);
+  });
+
+  it('falls back to the generic zero-Pages message when existing_ads_page_id is absent', () => {
+    expect(
+      describeMetaAdsCapability(
+        adAccount({ granted_scopes: ['ads_read'], has_meta_pages: false, existing_ads_page_id: undefined })
+      )
+    ).toEqual({ ads_capable: false, capability_warning: META_ADS_NO_PAGES_MESSAGE });
+  });
+});
+
+describe('getMetaAdsNoPagesMessage', () => {
+  it('returns the generic message when no existing_ads_page_id is recorded', () => {
+    expect(getMetaAdsNoPagesMessage({})).toBe(META_ADS_NO_PAGES_MESSAGE);
+    expect(getMetaAdsNoPagesMessage(null)).toBe(META_ADS_NO_PAGES_MESSAGE);
+    expect(getMetaAdsNoPagesMessage({ existing_ads_page_id: null })).toBe(META_ADS_NO_PAGES_MESSAGE);
+  });
+
+  it('returns the Page-specific message, naming the Page, when existing_ads_page_id is a string', () => {
+    const message = getMetaAdsNoPagesMessage({ existing_ads_page_id: '1010991085424542' });
+    expect(message).toBe(buildMetaAdsWrongPageMessage('1010991085424542'));
+    expect(message).toContain('1010991085424542');
+  });
+
+  it('ignores a non-string existing_ads_page_id (defensive, shouldn\'t happen)', () => {
+    expect(getMetaAdsNoPagesMessage({ existing_ads_page_id: 12345 })).toBe(META_ADS_NO_PAGES_MESSAGE);
+  });
+});
+
+describe('getAccessiblePageIds', () => {
+  it('returns undefined when never probed — must not be read as an empty, confirmed list', () => {
+    expect(getAccessiblePageIds({})).toBeUndefined();
+    expect(getAccessiblePageIds(null)).toBeUndefined();
+    expect(getAccessiblePageIds(undefined)).toBeUndefined();
+  });
+
+  it('returns the probed ids', () => {
+    expect(getAccessiblePageIds({ accessible_page_ids: ['1010991085424542', 'page_2'] })).toEqual([
+      '1010991085424542',
+      'page_2',
+    ]);
+  });
+
+  it('returns [] (not undefined) when probed and confirmed empty', () => {
+    expect(getAccessiblePageIds({ accessible_page_ids: [] })).toEqual([]);
+  });
+
+  it('filters out non-string entries defensively', () => {
+    expect(getAccessiblePageIds({ accessible_page_ids: ['page_1', 42, null] })).toEqual(['page_1']);
+  });
+
+  it('treats a non-array value as never-probed', () => {
+    expect(getAccessiblePageIds({ accessible_page_ids: 'page_1' })).toBeUndefined();
+  });
+});
+
+describe('buildMetaAdsPageNotAccessibleMessage', () => {
+  it('names the specific requested Page', () => {
+    const message = buildMetaAdsPageNotAccessibleMessage('1010991085424542');
+    expect(message).toContain('1010991085424542');
+    expect(message).toContain('Choose Pages');
+    expect(message).toContain('Advertiser');
   });
 });
 

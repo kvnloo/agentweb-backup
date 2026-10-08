@@ -27,26 +27,51 @@ async function reviseAgentModeImage(
   const action = candidate.action;
   if (action?.type !== 'agent_mode_image_revision') return;
 
-  const { runVerifiedChat } = await import('../controllers/agentModeController');
+  const { runVerifiedChat, isSessionBusyError } = await import('../controllers/agentModeController');
   const { cronJobRegistry } = await import('../utils/cronJobRegistry');
-  // ENG-1189: this run's tool calls self-call back into this process via
-  // mcpFetch — tracked so a deploy mid-run waits for it instead of
-  // abandoning it against a closed listener.
-  await cronJobRegistry.track('humanEvalVerifiedChat', runVerifiedChat({
-    sessionId: action.sessionId,
-    userId: action.userId,
-    startingMessage:
-      `Please revise this image based on Matt's human eval feedback.\n\n` +
-      `Original image: ${action.artifactUrl || candidate.artifactUrl || 'not provided'}\n` +
-      `Original filename: ${action.filename || 'unknown'}\n\n` +
-      `Feedback: ${feedback.text}\n\n` +
-      `Use the original image as an input image/reference when possible. ` +
-      `Call generate_image and produce a new revised image that directly addresses the feedback.`,
-    requiredFunctions: [{ functionName: 'generate_image', minCount: 1 }],
-    keywords: [],
-    attachments: [],
-    maxAttempts: 5,
-  }));
+  try {
+    // ENG-1189: this run's tool calls self-call back into this process via
+    // mcpFetch — tracked so a deploy mid-run waits for it instead of
+    // abandoning it against a closed listener.
+    await cronJobRegistry.track('humanEvalVerifiedChat', runVerifiedChat({
+      sessionId: action.sessionId,
+      userId: action.userId,
+      startingMessage:
+        `Please revise this image based on Matt's human eval feedback.\n\n` +
+        `Original image: ${action.artifactUrl || candidate.artifactUrl || 'not provided'}\n` +
+        `Original filename: ${action.filename || 'unknown'}\n\n` +
+        `Feedback: ${feedback.text}\n\n` +
+        `Use the original image as an input image/reference when possible. ` +
+        `Call generate_image and produce a new revised image that directly addresses the feedback.`,
+      requiredFunctions: [{ functionName: 'generate_image', minCount: 1 }],
+      keywords: [],
+      attachments: [],
+      maxAttempts: 5,
+    }));
+  } catch (error) {
+    // ENG-1719: on ordinary lock contention this used to propagate up to the caller's bare
+    // `.catch(err => console.warn(...))`, which never reaches the reviewer — but the ack
+    // reply already told them "the revised result will post back to this thread when
+    // ready," so silence here reads as the bot having forgotten. Tell them explicitly
+    // instead of leaving that promise unfulfilled with no explanation.
+    if (isSessionBusyError(error)) {
+      // Reachable only via a Slack thread reply, so a real posted message must already
+      // exist — but the type is optional now (ENG-1854, posting can be skipped), so guard
+      // explicitly rather than asserting.
+      if (!candidate.slackChannel) return;
+      const { postSlackMessage } = await import('./slackService');
+      await postSlackMessage(
+        candidate.slackChannel,
+        ':hourglass_flowing_sand: This session was busy with another generation in progress, ' +
+        'so the auto-revision couldn\'t run just now. Please retry the feedback in a moment.',
+        candidate.slackMessageTs,
+      ).catch((slackErr: any) =>
+        console.warn('[human-eval] failed to post session-busy notice:', slackErr?.message || slackErr),
+      );
+      return;
+    }
+    throw error;
+  }
 }
 
 async function iterateAndDeployLandingPage(

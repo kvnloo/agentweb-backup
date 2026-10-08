@@ -21,6 +21,7 @@ import {
 } from "@mui/material";
 import { useAuth } from "../../contexts/AuthContext";
 import { buildApiUrl } from "../../config";
+import { COST_SERIES_PALETTE } from './chartPalette';
 
 interface Counters {
   inputTokens: number;
@@ -36,6 +37,18 @@ interface Counters {
 interface ModelCost extends Counters {
   model: string;
 }
+
+/** One upstream's spend, mirroring the backend CostByProviderRow (ENG-1859). */
+interface ProviderCost extends Counters {
+  provider: string;
+}
+
+/**
+ * The bucket the backend uses for rows written before the ledger persisted a
+ * provider at all (pre-ENG-693). Matched by value so the UI can caveat it
+ * rather than render it as though it were an upstream called this.
+ */
+const PROVIDER_UNRECORDED = "(recorded before provider tracking)";
 
 interface SeriesCost {
   date: string;
@@ -57,6 +70,8 @@ interface CostAggregation {
   end: string;
   totals: Counters;
   byModel: ModelCost[];
+  /** Optional: an older backend omits it, and the section then does not render. */
+  byProvider?: ProviderCost[];
   series: SeriesCost[];
   topUsers: TopUser[];
 }
@@ -163,7 +178,7 @@ export default function CostDashboardTab() {
 
   const dailySeries = seriesByDate(data?.series ?? []);
   const maxDailySpend = Math.max(...dailySeries.map((row) => row.total), 0);
-  const colors = ["#155EEF", "#7F56D9", "#039855", "#DC6803", "#D92D20", "#667085"];
+  const colors = COST_SERIES_PALETTE;
 
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
@@ -266,6 +281,57 @@ export default function CostDashboardTab() {
               </Grid>
             ))}
           </Grid>
+
+          {/* Which upstream served the tokens (ENG-1859). Deliberately above
+              by-model: one model is reachable through more than one provider
+              (Bedrock vs OpenRouter), so the finer cut cannot answer this. */}
+          {data.byProvider && data.byProvider.length > 0 && (
+            <Box sx={{ mb: 3 }}>
+              <Typography variant="h6" gutterBottom>
+                Spend by provider
+              </Typography>
+              <TableContainer component={Paper} variant="outlined">
+                <Table size="small" aria-label="Spend by provider">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>Provider</TableCell>
+                      <TableCell align="right">Spend</TableCell>
+                      <TableCell align="right">Share</TableCell>
+                      <TableCell align="right">Calls</TableCell>
+                      <TableCell align="right">Tokens</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {data.byProvider.map((row) => (
+                      <TableRow key={row.provider} data-testid={`provider-row-${row.provider}`}>
+                        <TableCell>
+                          {row.provider === PROVIDER_UNRECORDED ? (
+                            <Typography variant="body2" color="text.secondary">
+                              Not recorded
+                              <Typography component="span" variant="caption" sx={{ ml: 1 }}>
+                                (spend from before the ledger tracked a provider — real spend, no
+                                upstream on the row)
+                              </Typography>
+                            </Typography>
+                          ) : (
+                            row.provider
+                          )}
+                        </TableCell>
+                        <TableCell align="right">{usd.format(row.costUsd)}</TableCell>
+                        <TableCell align="right">
+                          {data.totals.costUsd > 0
+                            ? `${((row.costUsd / data.totals.costUsd) * 100).toFixed(1)}%`
+                            : "—"}
+                        </TableCell>
+                        <TableCell align="right">{integer.format(row.callCount)}</TableCell>
+                        <TableCell align="right">{integer.format(row.totalTokens)}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+            </Box>
+          )}
 
           <Grid container spacing={3}>
             <Grid item xs={12} lg={6}>

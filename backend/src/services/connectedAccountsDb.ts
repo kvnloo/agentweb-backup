@@ -7,7 +7,7 @@ import type { DailyVolumeState } from './linkedInWritePacer';
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly' | 'slack';
 
 /**
  * ENG-1616 — the subset of `PlatformType` that `postOnConnectedAccount` treats as
@@ -400,7 +400,13 @@ export interface CalendlyConfig extends BaseOAuthConfig {
   attributionDisabled?: boolean;
 }
 
-export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig;
+/** Org-owned Emma Slack bot installation; account_id must equal team_id. */
+export interface SlackConfig extends BaseOAuthConfig {
+  account_type: 'bot';
+  team_id: string;
+}
+
+export type PlatformConfig = SlackConfig | LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig;
 
 /**
  * Per-connection engagement memory: a persona profile generated from LinkedIn data
@@ -441,6 +447,12 @@ export interface ConnectedAccount {
   created_at: string;
   updated_at: string;
 }
+
+// ENG-2258: redaction helpers that strip access/refresh tokens and other
+// connected-account secrets from a response live in
+// `utils/accountSecretRedaction.ts`, not here — this module is `jest.mock`'d
+// wholesale across ~90 test files, so a route-facing helper needs to live
+// somewhere those mocks don't shadow it.
 
 /**
  * Input type for creating a connected account
@@ -755,6 +767,27 @@ export type AccountConfigMutation =
       skip?: boolean;
     });
 
+/**
+ * How many times `updateAccountConfig` retries a write that collided with an
+ * in-flight DynamoDB transaction on the same user item, and how long it waits.
+ *
+ * ENG-1873. `TransactionConflictException` means another request holds a
+ * transaction on this item right now — on the users table that is, in practice,
+ * `applyMonthlyChargeAtomic`, which `tokenUsageService` runs for each LLM
+ * completion. A tool call executes the moment its completion returns, often
+ * while that completion's charge transaction is still committing, so the tool's
+ * config write lost the race and was treated as fatal. AWS documents the error
+ * as transient; `paymentHistoryDb` and `usageRecordDb` already classify it so.
+ *
+ * Kept separate from the CAS attempt budget below so it cannot change when a
+ * genuine concurrent overwrite gives up with `ConnectedAccountChanged`.
+ */
+export const TRANSACTION_CONFLICT_RETRIES = 4;
+export const transactionConflictBackoffMs = (retry: number): number =>
+  25 * 2 ** retry + Math.floor(Math.random() * 25);
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 export const updateAccountConfig = async (
   userId: string,
   platform: PlatformType,
@@ -773,7 +806,9 @@ export const updateAccountConfig = async (
   // so a fresh read followed by the same merge is exactly the right answer —
   // provided the merge itself is recomputed from that fresh read when it needs
   // to be (see AccountConfigMutation above).
-  for (let attempt = 0; attempt < 3; attempt++) {
+  let casAttempts = 0;
+  let transactionConflictRetries = 0;
+  for (;;) {
     const user = await userDb.getUserByIdConsistent(userId);
     if (!user) {
       throw new Error('User not found');
@@ -827,8 +862,21 @@ export const updateAccountConfig = async (
       });
       return;
     } catch (error: any) {
+      // ENG-1873: an in-flight transaction on this item (see
+      // TRANSACTION_CONFLICT_RETRIES). Back off briefly, then re-read and
+      // re-apply exactly as the CAS path does — the merge is recomputed from the
+      // fresh read, so a retry can never write a stale snapshot.
+      if (
+        error?.code === 'TransactionConflictException'
+        && transactionConflictRetries < TRANSACTION_CONFLICT_RETRIES
+      ) {
+        transactionConflictRetries++;
+        await sleep(transactionConflictBackoffMs(transactionConflictRetries));
+        continue;
+      }
       if (error?.code !== 'ConditionalCheckFailedException') throw error;
-      if (attempt === 2) {
+      casAttempts++;
+      if (casAttempts >= 3) {
         throw Object.assign(
           new Error(`Connected account "${accountId}" changed while updating its config; retry`),
           { code: 'ConnectedAccountChanged' },
@@ -1096,8 +1144,36 @@ export const getAccountsByAttioWorkspaceId = async (
  * Check if an account token is still valid
  * First checks expiry timestamp, then verifies via API if not expired
  */
+/**
+ * Platforms where `config.needs_reconnect` means THE CREDENTIAL IS DEAD.
+ *
+ * The key is not used consistently, so this cannot be a blanket check:
+ *  - hubspot / twitter  — the refresh token was rejected; nothing works until re-OAuth.
+ *    twitterService.getClient and HubSpotService.create both refuse outright.
+ *  - attio              — set ONLY for a 403 registering the webhook, i.e. a missing
+ *                         `webhook:read-write` scope (attioWebhookSubscription.ts:64).
+ *                         The token is fine and CRM reads/writes still work; treating it
+ *                         as dead would tell Emma a usable account is broken, which is
+ *                         the same class of lie in the other direction.
+ *  - calendarTools      — returns `needs_reconnect` on a TOOL RESULT, never writes it to
+ *                         config, so it is irrelevant here.
+ *
+ * Attio would be better served by its own key (e.g. `webhook_scope_missing`); until then
+ * the exception is explicit rather than implied.
+ */
+const RECONNECT_MEANS_DEAD_CREDENTIAL = new Set(['hubspot', 'twitter']);
+
 export const isTokenValid = async (account: ConnectedAccount): Promise<boolean> => {
   const now = Date.now();
+
+  // A dead credential outranks every check below, including the refresh_token presence
+  // test. Without this, an account that Settings reports as "Reconnect required" was
+  // still handed to Emma as `is_active: true` — the assistant telling a customer their
+  // integration is fine while the UI tells them it is broken. The Meta Ads branch of
+  // routes/connectedAccounts.ts exists for exactly this consistency (ENG-1158).
+  if (RECONNECT_MEANS_DEAD_CREDENTIAL.has(account.platform) && (account.config as any)?.needs_reconnect) {
+    return false;
+  }
 
   // First check: is the token expired based on timestamp?
   if (account.config.token_expires_at <= now) {

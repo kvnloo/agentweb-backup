@@ -1,8 +1,8 @@
 import { crmDb } from './db';
+import { matchLifecyclePresenceFilter } from '../utils/lifecycleFilterSemantics';
 import { usablePublicIdentifier, usableProfileUrl, withoutFabricatedProfileFields } from '../utils/linkedInAnonymizedProfile';
 import { agentModeService } from './agentModeService';
 import { settingsService } from './settingsService';
-import { incrementExtraCostUsage } from './tokenUsageService';
 import { v4 as uuidv4 } from 'uuid';
 import {
   getRawDataFromCache,
@@ -12,7 +12,7 @@ import {
   isLinkedInCacheEligible,
   splitFieldsByGroup,
 } from './enrichmentCacheService';
-import { FIELD_GROUPS } from './enrichmentGroups';
+import { FIELD_GROUPS, isCardRevenueField } from './enrichmentGroups';
 import type { RawWebResult, RawCacheData } from './enrichmentGroups';
 import {
   buildDataExtractionSystemPrompt,
@@ -51,8 +51,6 @@ function isLinkedInIdResolutionEnabled(): boolean {
 const PARALLELISM_WITH_LINKEDIN = 5;
 /** Web-only enrichment can be more aggressive */
 const PARALLELISM_WEB_ONLY = 20;
-// Estimated cost per enriched lead in USD (Google Custom Search dominates at $0.005/query)
-const ENRICHMENT_COST_PER_LEAD = 0.0052;
 
 // Callback type for emitting Socket.IO events.
 // In the main process this uses the real `io` instance directly;
@@ -180,6 +178,23 @@ export interface LoadAndFilterResult {
   storedLinkedinSearchTemplate: string;
 }
 
+/**
+ * Fields the LLM extraction units may fill: everything a specialist did not
+ * already resolve, minus Enigma card revenue.
+ *
+ * ENG-1388 AC7: no web or LLM tier may ever fill a card-revenue field — those
+ * values are measured or absent. Filtering here covers every unit built below,
+ * including the linkedin and no_context fallbacks that never pass through
+ * splitFieldsByGroup, and the per-field refresh route that reaches them with
+ * forceOverwrite on.
+ */
+export function llmEligibleFields(
+  outputFields: string[],
+  specialistFields: Record<string, unknown>,
+): string[] {
+  return outputFields.filter(f => !(f in specialistFields) && !isCardRevenueField(f));
+}
+
 export class CrmEnrichmentService {
   private async loadAndFilterLeads(spec: EnrichmentJobSpec): Promise<LoadAndFilterResult> {
     const list = await crmDb.getLeadListById(spec.listId);
@@ -223,6 +238,8 @@ export class CrmEnrichmentService {
     if (spec.filters && spec.filters.length > 0) {
       filtered = filtered.filter(lead => {
         return spec.filters!.every(filter => {
+          const lifecyclePresence = matchLifecyclePresenceFilter(filter.field, filter.operator);
+          if (lifecyclePresence !== undefined) return lifecyclePresence;
           const value = lead[filter.field] ?? lead?.customFields?.[filter.field];
           switch (filter.operator) {
             case 'equals': return value === filter.value;
@@ -1210,7 +1227,7 @@ export class CrmEnrichmentService {
     const specialistFields = specialistOut.resolvedFields;
     const specialistMeta = specialistOut.resolvedMeta;
     const specialistSourceContexts = specialistOut.sourceContexts;
-    const fieldsForLLM = spec.outputFields.filter(f => !(f in specialistFields));
+    const fieldsForLLM = llmEligibleFields(spec.outputFields, specialistFields);
     if (Object.keys(specialistFields).length > 0) {
       console.log(`[CrmEnrichment][enrichLead] specialists resolved ${Object.keys(specialistFields).length} fields lead=${lead.leadId}: ${Object.keys(specialistFields).join(',')}`);
     }
@@ -1951,13 +1968,6 @@ export class CrmEnrichmentService {
         emit(socketId, completeEvent, completionPayload);
       }
       emit(userRoom, completeEvent, completionPayload);
-    }
-
-    // Record extra cost for this job (fire-and-forget — never block the response)
-    if (counters.processed > 0) {
-      incrementExtraCostUsage(spec.userId, {
-        enrichment: Math.round(counters.processed * ENRICHMENT_COST_PER_LEAD * 10000) / 10000,
-      }).catch((err) => console.error('[CrmEnrichment] Failed to record extra cost:', err));
     }
 
     return {

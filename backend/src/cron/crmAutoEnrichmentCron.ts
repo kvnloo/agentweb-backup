@@ -39,6 +39,8 @@ import { buildOrchestratorDeps as buildV3OrchestratorDeps } from '../services/en
 import { getEnrichmentConfig as svcGetEnrichmentConfig } from '../services/enrichmentConfigService';
 import { buildConfigServiceDeps } from '../services/enrichmentConfigDeps';
 import { crmDb } from '../services/db';
+import { isCardRevenueField } from '../services/enrichmentGroups';
+import { CrmEnrichmentService } from '../services/crmEnrichmentService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 
 const TAG = '[crmAutoEnrichmentCron]';
@@ -91,10 +93,48 @@ export interface CrmAutoEnrichmentCronDeps {
  * it up. (CodeRabbit, PR #2583.)
  */
 function isUnenriched(
-  lead: { enrichmentMetadata?: Record<string, unknown> },
+  lead: {
+    enrichmentMetadata?: Record<string, unknown>;
+    email?: string | null;
+    linkedin?: string | null;
+    firstName?: string | null;
+    lastName?: string | null;
+  },
   config: EnrichmentConfig,
 ): boolean {
-  const enabledFieldNames = config.fields.filter((f) => f.include).map((f) => f.name);
+  // Agree with the engine's own precondition, or this cron reselects the same rows forever.
+  // resolveLeadIdentity (enrichmentIdentityResolver.ts:293) rejects a lead with no email,
+  // no LinkedIn and no full name as 'no_identity_signal', and crmEnrichmentServiceV3.ts
+  // `continue`s on that category BEFORE pendingWrites — so no enrichmentMetadata is ever
+  // stamped and the selector below picks the identical lead up on the next tick.
+  //
+  // ENG-2082 made this reachable in volume: a phone-only capture with no name has exactly
+  // that shape. At MAX_LEADS_PER_LIST_PER_RUN = 50, fifty such rows permanently consume a
+  // list's per-run budget and NO other lead on that list is ever enriched again. Silent,
+  // because they count as `skipped` rather than `failed`, so no alert fires.
+  // A PLACEHOLDER-domain address is not an identity signal, because resolveIdentity
+  // zeroes it (`email = ''`) before its own no_identity_signal check. A bare non-empty
+  // test therefore disagrees with the resolver: a lead whose only signal is
+  // `queue-verify@example.com`, with no name and no linkedin, counts as having identity
+  // here, is selected, is rejected there, gets no enrichmentMetadata stamp, and is
+  // reselected on the very next tick — the exact infinite loop this guard was added to
+  // close, just narrower than the phone-only shape it was written for. Same predicate as
+  // the resolver so the two cannot drift.
+  const rawEmail = typeof lead.email === 'string' ? lead.email.trim() : '';
+  const emailIsPlaceholder =
+    !!rawEmail && CrmEnrichmentService.isPlaceholderDomain(rawEmail.split('@')[1] || '');
+  const hasEmail = rawEmail !== '' && !emailIsPlaceholder;
+  const hasLinkedin = typeof lead.linkedin === 'string' && lead.linkedin.trim() !== '';
+  const hasFullName =
+    typeof lead.firstName === 'string' && lead.firstName.trim() !== '' &&
+    typeof lead.lastName === 'string' && lead.lastName.trim() !== '';
+  if (!hasEmail && !hasLinkedin && !hasFullName) return false;
+
+  // Card-revenue fields are never filled by the cron (it doesn't use Enigma,
+  // ENG-1388); counting them would reselect the same leads on every tick.
+  const enabledFieldNames = config.fields
+    .filter((f) => f.include && !isCardRevenueField(f.aliasFor ?? f.name))
+    .map((f) => f.name);
   if (enabledFieldNames.length === 0) return false; // nothing configured to enrich
   const meta = lead.enrichmentMetadata;
   return enabledFieldNames.some((name) => !meta || !(name in meta));

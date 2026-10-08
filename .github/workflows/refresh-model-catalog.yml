@@ -1,0 +1,97 @@
+name: Frontier monitor and model catalog
+on:
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+concurrency:
+  group: refresh-model-catalog
+  cancel-in-progress: false
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci --ignore-scripts
+        working-directory: backend
+      - name: Monitor frontier and prepare code-only catalog patch
+        working-directory: backend
+        env:
+          ARTIFICIAL_ANALYSIS_API_KEY: ${{ secrets.ARTIFICIAL_ANALYSIS_API_KEY }}
+          SLACK_MODEL_ALERTS_WEBHOOK: ${{ secrets.SLACK_MODEL_ALERTS_WEBHOOK }}
+          PR_BODY_PATH: /tmp/model-catalog-pr-body.md
+        run: npx ts-node --transpile-only src/scripts/frontierMonitor.ts --write --notify > /tmp/model-catalog-plan.json
+      - name: Refresh capability evidence for added models
+        working-directory: backend
+        run: |
+          if node -e 'process.exit(require("/tmp/model-catalog-plan.json").additions.length ? 0 : 1)'; then
+            npm run refresh:openrouter-params
+          fi
+      - name: Verify critical catalog and price-book invariants
+        working-directory: backend
+        run: npx jest --runInBand --runTestsByPath src/services/agentMode/__tests__/modelCatalogRefresh.test.ts src/services/agentMode/__tests__/frontierMonitor.test.ts src/__tests__/llmPricing.test.ts
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: model-catalog-plan
+          path: |
+            /tmp/model-catalog-plan.json
+            docs/openrouter-byok-coverage.md
+      - uses: peter-evans/create-pull-request@v8
+        id: open_pr
+        with:
+          branch: automation/model-catalog-refresh
+          base: main
+          author: deploy <deploy@agentweb.pro>
+          committer: deploy <deploy@agentweb.pro>
+          draft: true
+          title: 'Refresh frontier models and OpenRouter BYOK coverage'
+          commit-message: 'chore: refresh model catalog from OpenRouter and Artificial Analysis'
+          body-path: /tmp/model-catalog-pr-body.md
+          add-paths: |
+            backend/src/services/agentMode/llmModelRegistry.ts
+            backend/src/utils/llmPricing.ts
+            backend/src/__tests__/llmPricing.test.ts
+            backend/src/services/agentMode/__tests__/fixtures/openRouterSupportedParameters.json
+            docs/openrouter-byok-coverage.md
+      # ENG-2293 follow-up: the job previously only alerted on detected frontier lag,
+      # never on its own outcome — a human had no way to learn a PR landed (or that
+      # the job died) short of checking GitHub Actions by hand.
+      - name: Notify Slack the draft PR was opened or updated
+        if: steps.open_pr.outputs.pull-request-operation == 'created' || steps.open_pr.outputs.pull-request-operation == 'updated'
+        env:
+          SLACK_MODEL_ALERTS_WEBHOOK: ${{ secrets.SLACK_MODEL_ALERTS_WEBHOOK }}
+        run: |
+          if [ -z "$SLACK_MODEL_ALERTS_WEBHOOK" ]; then exit 0; fi
+          OP="${{ steps.open_pr.outputs.pull-request-operation }}"
+          VERB="opened"; [ "$OP" = "updated" ] && VERB="updated"
+          curl -sf -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"Model catalog refresh PR ${VERB}: ${{ steps.open_pr.outputs.pull-request-url }}\"}" \
+            "$SLACK_MODEL_ALERTS_WEBHOOK" || echo "::warning::Slack notification failed — check SLACK_MODEL_ALERTS_WEBHOOK (rotated/revoked?)"
+      - name: Surface incomplete upstream observations
+        run: node -e 'if (require("/tmp/model-catalog-plan.json").degraded) { console.error("Upstream observation incomplete; inspect monitor report"); process.exit(1); }'
+      - name: Notify Slack on any job failure
+        # cancelled(), not just failure(): this job's concurrency group is
+        # cancel-in-progress: false, so unlike deploy.yml there's no routine
+        # queue-induced cancellation to stay silent for — the only way this
+        # job gets cancelled is a human doing it on purpose (rare, harmless to
+        # notify about) or the 15-minute timeout firing, which is exactly the
+        # "it hung and died" case this step exists to catch.
+        if: failure() || cancelled()
+        env:
+          SLACK_MODEL_ALERTS_WEBHOOK: ${{ secrets.SLACK_MODEL_ALERTS_WEBHOOK }}
+        run: |
+          if [ -z "$SLACK_MODEL_ALERTS_WEBHOOK" ]; then exit 0; fi
+          curl -sf -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"Model catalog refresh job FAILED: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$SLACK_MODEL_ALERTS_WEBHOOK" || echo "::warning::Slack notification failed — check SLACK_MODEL_ALERTS_WEBHOOK (rotated/revoked?)"

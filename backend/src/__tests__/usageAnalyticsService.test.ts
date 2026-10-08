@@ -26,11 +26,11 @@ import { usageRecordDb } from '../services/usageRecordDb';
 import { userDb } from '../services/db';
 import {
   getUserUsageByModelDay,
-  getUsageComparison,
   getCostAggregation,
   getXAllocatedTotals,
   currentXBillingCycle,
   getUserXBreakdown,
+  PROVIDER_UNRECORDED,
 } from '../services/usageAnalyticsService';
 
 const mockQuery = usageRecordDb.queryByUserDateRange as jest.Mock;
@@ -199,106 +199,6 @@ describe('usageAnalyticsService', () => {
     });
   });
 
-  describe('getUsageComparison', () => {
-    it('rejects malformed months', async () => {
-      await expect(getUsageComparison('u', '2026-6')).rejects.toThrow('YYYY-MM');
-      await expect(getUsageComparison('u', 'June 2026')).rejects.toThrow('YYYY-MM');
-    });
-
-    it('compares shadow totals against the current-month legacy counter', async () => {
-      mockQuery.mockResolvedValue([
-        row({ totalTokens: 1100, costMicroUsd: 3500 }),
-        row({ totalTokens: 900, costMicroUsd: 1500 }),
-      ]);
-      mockGetUser.mockResolvedValue({
-        userId: 'user-1',
-        tokenUsage: { month: '2026-06', totalTokens: 1800, totalCost: 0.004, resetDate: 'x' },
-      });
-
-      const result = await getUsageComparison('user-1', '2026-06');
-
-      expect(mockQuery).toHaveBeenCalledWith('user-1', '2026-06-01', '2026-06-31');
-      expect(result.shadow).toEqual({ totalTokens: 2000, costUsd: 0.005, callCount: 6 });
-      expect(result.legacy).toEqual({ totalTokens: 1800, costUsd: 0.004, source: 'current' });
-      expect(result.delta.totalTokens).toBe(200);
-      expect(result.delta.costUsd).toBeCloseTo(0.001, 10);
-    });
-
-    it('falls back to tokenUsageHistory for past months', async () => {
-      mockGetUser.mockResolvedValue({
-        userId: 'user-1',
-        tokenUsage: { month: '2026-06', totalTokens: 50, totalCost: 0.1, resetDate: 'x' },
-        tokenUsageHistory: [
-          { month: '2026-04', totalTokens: 10, totalCost: 0.01 },
-          { month: '2026-05', totalTokens: 4000, totalCost: 0.02 },
-        ],
-      });
-
-      const result = await getUsageComparison('user-1', '2026-05');
-      expect(result.legacy).toEqual({ totalTokens: 4000, costUsd: 0.02, source: 'history' });
-    });
-
-    it('reports legacy source "none" for unknown users or untracked months', async () => {
-      const result = await getUsageComparison('user-1', '2026-01');
-      expect(result.legacy).toEqual({ totalTokens: 0, costUsd: 0, source: 'none' });
-      expect(result.shadow).toEqual({ totalTokens: 0, costUsd: 0, callCount: 0 });
-    });
-
-    it('treats missing shadow item fields as 0 in the monthly reduce', async () => {
-      // A shadow record missing totalTokens/costMicroUsd/callCount — exercises
-      // the `item.X || 0` fallbacks in the shadow reduce (lines 133-135).
-      mockQuery.mockResolvedValue([
-        {
-          userId: 'user-1',
-          sk: '2026-06-02#gpt-5-chat-2#agent-chat',
-          date: '2026-06-02',
-          model: 'gpt-5-chat-2',
-          feature: 'agent-chat',
-          totalTokens: undefined,
-          costMicroUsd: undefined,
-          callCount: undefined,
-        },
-        row({ totalTokens: 700, costMicroUsd: 2000, callCount: 2 }),
-      ]);
-      mockGetUser.mockResolvedValue(null);
-
-      const result = await getUsageComparison('user-1', '2026-06');
-
-      // The undefined-field record contributes 0 to each accumulator.
-      expect(result.shadow).toEqual({ totalTokens: 700, costUsd: 0.002, callCount: 2 });
-      expect(result.legacy.source).toBe('none');
-    });
-
-    it('treats missing current-month legacy fields as 0', async () => {
-      // tokenUsage.month matches but totalTokens/totalCost are undefined —
-      // exercises the `|| 0` fallbacks in the current branch (lines 146-147).
-      mockGetUser.mockResolvedValue({
-        userId: 'user-1',
-        tokenUsage: { month: '2026-06', totalTokens: undefined, totalCost: undefined, resetDate: 'x' },
-      });
-
-      const result = await getUsageComparison('user-1', '2026-06');
-
-      expect(result.legacy).toEqual({ totalTokens: 0, costUsd: 0, source: 'current' });
-    });
-
-    it('treats missing history legacy fields as 0', async () => {
-      // A matching tokenUsageHistory entry with undefined totalTokens/totalCost —
-      // exercises the `|| 0` fallbacks in the history branch (lines 156-157).
-      mockGetUser.mockResolvedValue({
-        userId: 'user-1',
-        tokenUsage: { month: '2026-06', totalTokens: 50, totalCost: 0.1, resetDate: 'x' },
-        tokenUsageHistory: [
-          { month: '2026-05', totalTokens: undefined, totalCost: undefined },
-        ],
-      });
-
-      const result = await getUsageComparison('user-1', '2026-05');
-
-      expect(result.legacy).toEqual({ totalTokens: 0, costUsd: 0, source: 'history' });
-    });
-  });
-
   // ENG-366 — admin cost aggregation (backend slice of ENG-353).
   // Test → contract mapping (ENG-353 behavioral contract, HUMAN-WRITTEN):
   //   assertion 2 (by-model totals = sum of underlying per-user stored costs, no
@@ -384,6 +284,153 @@ describe('usageAnalyticsService', () => {
       mockScan.mockResolvedValue(rows);
       const all = await getCostAggregation('2026-06-01', '2026-06-30', 10, 'all');
       expect(all.totals.costUsd).toBeCloseTo(3.5, 6);
+    });
+
+    // ── availableProviders: the admin picker's option list (ENG-1837) ────────
+    // AC1-3 of ENG-1837. The union of a registry and what the window actually
+    // contains, computed BEFORE the provider filter.
+
+    it('offers every metered vendor even when the ledger is empty (ENG-1837 AC2)', async () => {
+      mockScan.mockResolvedValue([]);
+      const agg = await getCostAggregation('2026-06-01', '2026-06-30', 10, 'all');
+      // A vendor with an adapter but no spend must still be SELECTABLE, so the
+      // admin gets an empty state instead of the option silently missing.
+      expect(agg.availableProviders).toEqual([
+        'all',
+        'llm',
+        '2captcha',
+        'apollo',
+        'elevenlabs',
+        'enigma',
+        'enrich.so',
+        'google_cse',
+        'placid',
+        'remotion',
+        'twitter',
+        'v0',
+        'you.com',
+      ]);
+    });
+
+    it('includes a provider present in the window but absent from the registry (ENG-1837 AC3)', async () => {
+      mockGetAccountById.mockResolvedValue(null);
+      mockScan.mockResolvedValue([
+        aggRow({ model: 'newvendor:lookup', provider: 'newvendor', unit: 'lookup', costMicroUsd: 1_000 }),
+      ]);
+      const agg = await getCostAggregation('2026-06-01', '2026-06-30', 10, 'all');
+      // A vendor whose adapter shipped after the registry was last edited must
+      // still surface — a forgotten registry entry degrades to a missing empty
+      // state, never to hidden spend.
+      expect(agg.availableProviders).toContain('newvendor');
+    });
+
+    // ── byProvider: spend by upstream (ENG-1859) ────────────────────────────
+
+    it('groups LLM spend by the provider that served it', async () => {
+      mockScan.mockResolvedValue([
+        aggRow({ model: 'anthropic.claude-opus-5', provider: 'bedrock', costMicroUsd: 3_000_000 }),
+        aggRow({ model: 'anthropic.claude-sonnet-5', provider: 'bedrock', costMicroUsd: 1_000_000 }),
+        aggRow({ model: 'gemini-3.5-flash', provider: 'gemini', costMicroUsd: 500_000 }),
+      ]);
+
+      const agg = await getCostAggregation('2026-06-01', '2026-06-30');
+
+      expect(agg.byProvider.map((p) => [p.provider, p.costUsd])).toEqual([
+        ['bedrock', 4],
+        ['gemini', 0.5],
+      ]);
+      // The cut must reconcile with the headline, or it is worse than absent.
+      expect(agg.byProvider.reduce((t, p) => t + p.costMicroUsd, 0)).toBe(agg.totals.costMicroUsd);
+    });
+
+    it('separates the same model served through two different providers', async () => {
+      // The reason this cut cannot be derived from byModel: one model, two
+      // upstreams, two different costs to us.
+      mockScan.mockResolvedValue([
+        aggRow({ model: 'anthropic.claude-sonnet-4-6', provider: 'bedrock', costMicroUsd: 2_000_000 }),
+        aggRow({ model: 'anthropic/claude-sonnet-4.6', provider: 'openrouter', costMicroUsd: 700_000 }),
+      ]);
+
+      const agg = await getCostAggregation('2026-06-01', '2026-06-30');
+      expect(agg.byProvider.map((p) => p.provider)).toEqual(['bedrock', 'openrouter']);
+    });
+
+    it('buckets pre-ENG-693 rows as unrecorded rather than inventing a provider', async () => {
+      mockScan.mockResolvedValue([
+        aggRow({ model: 'gpt-5-chat-2', costMicroUsd: 1_000_000 }), // no provider attribute
+        aggRow({ model: 'gemini-3.5-flash', provider: 'gemini', costMicroUsd: 500_000 }),
+      ]);
+
+      const agg = await getCostAggregation('2026-06-01', '2026-06-30');
+
+      const unrecorded = agg.byProvider.find((p) => p.provider === PROVIDER_UNRECORDED);
+      expect(unrecorded?.costUsd).toBe(1);
+      // Not attributed to a provider, and not dropped — the rows still sum.
+      expect(agg.byProvider.reduce((t, p) => t + p.costMicroUsd, 0)).toBe(agg.totals.costMicroUsd);
+    });
+
+    it('excludes LLM providers, which also carry a `provider` since ENG-693', async () => {
+      mockGetAccountById.mockResolvedValue(null);
+      mockScan.mockResolvedValue([
+        // Real shape of an LLM row after ENG-693: it HAS a provider, but no
+        // unit, and its model is not vendor-namespaced. Returning row.provider
+        // unconditionally put bedrock/gemini/openai/azure-openai/openrouter into
+        // the per-unit vendor picker in production (ENG-1837 follow-up).
+        aggRow({ model: 'anthropic.claude-opus-5', provider: 'bedrock', costMicroUsd: 3_000_000 }),
+        aggRow({ model: 'gemini-3.5-flash', provider: 'gemini', costMicroUsd: 1_000_000 }),
+        aggRow({ model: 'gpt-5.5', provider: 'azure-openai', costMicroUsd: 500_000 }),
+        // A genuine vendor row, so the assertion is not vacuous.
+        xRow('apollo:email_reveal', { provider: 'apollo', unit: 'reveal', costMicroUsd: 49_500 }),
+      ]);
+
+      const agg = await getCostAggregation('2026-06-01', '2026-06-30', 10, 'all');
+
+      expect(agg.availableProviders).toContain('apollo');
+      for (const llmProvider of ['bedrock', 'gemini', 'azure-openai', 'openai', 'openrouter']) {
+        expect(agg.availableProviders).not.toContain(llmProvider);
+      }
+      // The registry entries are still offered — this narrows what the WINDOW
+      // contributes, not what the registry guarantees.
+      expect(agg.availableProviders).toEqual([
+        'all', 'llm', '2captcha', 'apollo', 'elevenlabs', 'enigma', 'enrich.so', 'google_cse',
+        'placid', 'remotion', 'twitter', 'v0', 'you.com',
+      ]);
+    });
+
+    it('detects a vendor by model namespace when the provider attribute is absent', async () => {
+      mockGetAccountById.mockResolvedValue(null);
+      mockScan.mockResolvedValue([
+        // No `provider` attribute, but the filter would still match this row on
+        // its "{provider}:" model prefix — so the option list must too, or the
+        // vendor is filterable yet unlistable.
+        aggRow({ model: 'legacyvendor:op', costMicroUsd: 1_000 }),  // no provider, no unit
+      ]);
+      const agg = await getCostAggregation('2026-06-01', '2026-06-30', 10, 'all');
+      expect(agg.availableProviders).toContain('legacyvendor');
+    });
+
+    it('does not treat a Bedrock numeric version suffix as a provider', async () => {
+      mockScan.mockResolvedValue([
+        aggRow({ model: 'anthropic.claude-sonnet-4-5-20250929-v1:0', costMicroUsd: 2_000_000 }),
+      ]);
+      const agg = await getCostAggregation('2026-06-01', '2026-06-30');
+      expect(agg.availableProviders).not.toContain('anthropic.claude-sonnet-4-5-20250929-v1');
+    });
+
+    it('is computed over the UNFILTERED window, so selecting one provider does not collapse the list', async () => {
+      mockGetAccountById.mockResolvedValue(null);
+      mockScan.mockResolvedValue([
+        aggRow({ costMicroUsd: 3_000_000 }),
+        xRow('twitter:post', { provider: 'twitter', unit: 'post', costMicroUsd: 500_000 }),
+        aggRow({ model: 'zzvendor:call', provider: 'zzvendor', unit: 'call', costMicroUsd: 1_000 }),
+      ]);
+      // Scoped to twitter: the ROWS are X-only...
+      const agg = await getCostAggregation('2026-06-01', '2026-06-30', 10, 'twitter');
+      expect(agg.byModel.every((m) => m.model.startsWith('twitter:'))).toBe(true);
+      // ...but the picker must still offer everything, or switching away from a
+      // selection would be impossible once it was made.
+      expect(agg.availableProviders).toContain('zzvendor');
+      expect(agg.availableProviders).toContain('llm');
     });
 
     it('"llm" scope excludes a twitter:* row even if it is missing the unit field, but keeps Bedrock :0 versions', async () => {
@@ -652,11 +699,30 @@ describe('usageAnalyticsService', () => {
           costUsd: 0,
         },
         byModel: [],
+        byProvider: [],
         series: [],
         byFeature: [],
         topUsers: [],
         userCount: 0,
         byXAccount: [],
+        // Not a spend figure: the picker's options are a capability list, so an
+        // empty window still offers every metered vendor (ENG-1837 AC2) rather
+        // than emptying the dropdown along with the data.
+        availableProviders: [
+          'all',
+          'llm',
+          '2captcha',
+          'apollo',
+          'elevenlabs',
+          'enigma',
+          'enrich.so',
+          'google_cse',
+          'placid',
+          'remotion',
+          'twitter',
+          'v0',
+          'you.com',
+        ],
       });
       expect(mockGetUser).not.toHaveBeenCalled();
     });

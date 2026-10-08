@@ -1,0 +1,143 @@
+/**
+ * ENG-2282 acceptance contract:
+ *  1. A single exported function returns only the v1 Meta tool definitions. No non-Meta tool leaks.
+ *  2. ENG-2268: external v1 refuses all writes before dispatch; reads use shared handlers.
+ *  3. No DB/persistence changes (this module imports no db).
+ */
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: {
+    listMetaAdsCampaignsNew: jest.fn().mockResolvedValue({ success: true, campaigns: [] }),
+    getMetaAdsMetrics: jest.fn(),
+    callMetaAdsInsightsApiWrapper: jest.fn(),
+    callMetaMarketingApi: jest.fn().mockResolvedValue({ success: true, awaitingUserConfirmation: true }),
+    launchTargetedAudienceCampaign: jest.fn(),
+    launchRetargetingCampaign: jest.fn(),
+  },
+}));
+jest.mock('../utils/scheduledPublishConsentGuard', () => ({
+  refuseUnauthorizedScheduledPublish: jest.fn().mockResolvedValue(null),
+  attachPublishRevalidation: (_: unknown, context: unknown) => context,
+}));
+jest.mock('../services/evaluationPolicy', () => ({ enforceEvaluationTool: jest.fn().mockResolvedValue(undefined) }));
+
+import { agentModeService } from '../services/agentModeService';
+import { emmaToolRegistry } from '../emma/registry';
+import '../emma/tools';
+import {
+  META_TOOLKIT_V1_TOOL_NAMES,
+  MetaToolkitRefusal,
+  executeMetaToolkitCall,
+  getMetaToolkitManifest,
+} from '../mcp/metaToolkitManifest';
+
+const ctx = { userId: 'user-1', sessionId: 's-1' };
+
+describe('ENG-2282 Meta Toolkit manifest', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('returns exactly the v1 Meta tools and nothing else from the Emma registry', () => {
+    const manifest = getMetaToolkitManifest();
+    expect(manifest.map((d: any) => d.name)).toEqual([...META_TOOLKIT_V1_TOOL_NAMES]);
+    expect(emmaToolRegistry.getToolNames().length).toBeGreaterThan(manifest.length + 10);
+    for (const def of manifest) {
+      expect(def.name).toMatch(/meta/);
+      expect(typeof def.description).toBe('string');
+      expect(def.inputSchema?.type).toBe('object');
+    }
+    const names = manifest.map((d: any) => d.name);
+    expect(names).not.toContain('launch_targeted_audience_campaign');
+    expect(names).not.toContain('launch_retargeting_campaign');
+  });
+
+  it('narrows the advertised schema: no client_id, no excluded actions, no tracking override', () => {
+    const manifest = getMetaToolkitManifest();
+    for (const def of manifest) expect(def.inputSchema.properties.client_id).toBeUndefined();
+    const mkt = manifest.find((d: any) => d.name === 'call_meta_marketing_api');
+    const actions: string[] = mkt.inputSchema.properties.action.enum;
+    for (const excluded of ['CREATE', 'UPDATE', 'DELETE', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'UPLOAD_USERS', 'COPY_AD', 'RETAG_UTM']) {
+      expect(actions).not.toContain(excluded);
+    }
+    expect(mkt.inputSchema.properties.params.properties.override_tracking_check).toBeUndefined();
+  });
+
+  it('does not mutate the shared Emma registry definitions', () => {
+    getMetaToolkitManifest();
+    const original = emmaToolRegistry.getTool('call_meta_marketing_api')!.definition;
+    expect(original.inputSchema.properties.action.enum).toContain('DELETE');
+  });
+
+  it.each(['CAMPAIGN', 'AD_SET', 'AD'].flatMap(entity =>
+    ['CREATE', 'UPDATE'].map(action => [entity, action])))
+  ('ENG-2268 refuses external %s %s before any handler runs', async (entity_type, action) => {
+    await expect(executeMetaToolkitCall('call_meta_marketing_api',
+      { entity_type, action, account_id: 'act_1' }, ctx)).rejects.toBeInstanceOf(MetaToolkitRefusal);
+    expect(agentModeService.callMetaMarketingApi).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['DELETE', 'CAMPAIGN'],
+    ['UPLOAD_USERS', 'CUSTOM_AUDIENCE'],
+    ['CREATE', 'CUSTOM_AUDIENCE'],
+    ['UPLOAD_IMAGE', 'AD_CREATIVE'],
+    ['COPY_AD', 'AD'],
+    ['RETAG_UTM', 'AD'],
+  ])('refuses excluded action %s %s before any handler runs', async (action, entity) => {
+    await expect(
+      executeMetaToolkitCall('call_meta_marketing_api', { entity_type: entity, action, account_id: 'act_1' }, ctx),
+    ).rejects.toBeInstanceOf(MetaToolkitRefusal);
+    expect(agentModeService.callMetaMarketingApi).not.toHaveBeenCalled();
+  });
+
+  it('refuses override_tracking_check, client_id, non-toolkit tools and missing user', async () => {
+    await expect(executeMetaToolkitCall('call_meta_marketing_api',
+      { entity_type: 'CAMPAIGN', action: 'UPDATE', account_id: 'a', params: { status: 'ACTIVE', override_tracking_check: true } }, ctx))
+      .rejects.toBeInstanceOf(MetaToolkitRefusal);
+    await expect(executeMetaToolkitCall('list_meta_ads_campaigns', { client_id: 'other' }, ctx)).rejects.toBeInstanceOf(MetaToolkitRefusal);
+    await expect(executeMetaToolkitCall('launch_retargeting_campaign', {}, ctx)).rejects.toBeInstanceOf(MetaToolkitRefusal);
+    await expect(executeMetaToolkitCall('send_email', {}, ctx)).rejects.toBeInstanceOf(MetaToolkitRefusal);
+    await expect(executeMetaToolkitCall('list_meta_ads_campaigns', {}, { userId: '' })).rejects.toBeInstanceOf(MetaToolkitRefusal);
+    expect(agentModeService.callMetaMarketingApi).not.toHaveBeenCalled();
+    expect(agentModeService.listMetaAdsCampaignsNew).not.toHaveBeenCalled();
+    expect(agentModeService.launchRetargetingCampaign).not.toHaveBeenCalled();
+  });
+
+  it('sources the manifest + default dispatcher from the Meta-only module, never the full Emma registry', async () => {
+    let isolated: any;
+    let metaTools: any;
+    let emmaRegistryModule: any;
+    jest.isolateModules(() => {
+      jest.doMock('../emma/tools', () => {
+        throw new Error('ENG-2282: full Emma tool registry must not be imported');
+      });
+      isolated = require('../mcp/metaToolkitManifest');
+      metaTools = require('../emma/metaTools');
+      emmaRegistryModule = require('../emma/registry');
+    });
+    expect(emmaRegistryModule.emmaToolRegistry.getToolNames()).toEqual([]);
+    expect(metaTools.metaToolRegistry.getToolNames()).toEqual([...META_TOOLKIT_V1_TOOL_NAMES]);
+    expect(isolated.getMetaToolkitManifest().map((d: any) => d.name)).toEqual([...META_TOOLKIT_V1_TOOL_NAMES]);
+
+    const args = { entity_type: 'CAMPAIGN', action: 'LIST', account_id: 'act_1', params: { name: 'x' } };
+    await isolated.executeMetaToolkitCall('call_meta_marketing_api', args, ctx);
+    expect(agentModeService.callMetaMarketingApi).toHaveBeenCalledWith(
+      'user-1', 'CAMPAIGN', 'LIST', 'act_1', undefined, undefined, undefined, { name: 'x' }, 's-1',
+    );
+  });
+
+  it('Emma registers the same Meta handler objects (single source, no fork)', () => {
+    const { metaToolRegistry } = require('../emma/metaTools');
+    for (const name of META_TOOLKIT_V1_TOOL_NAMES) {
+      expect(emmaToolRegistry.getTool(name)).toBe(metaToolRegistry.getTool(name));
+    }
+  });
+
+  it.each(['LIST', 'GET', 'PREVIEW', 'SEARCH', 'GET_MATCH_QUALITY'])('allows marketing read %s', async action => {
+    await executeMetaToolkitCall('call_meta_marketing_api', { entity_type: 'AD', action, account_id: 'act_1' }, ctx);
+    expect(agentModeService.callMetaMarketingApi).toHaveBeenCalled();
+  });
+
+  it('allows reads', async () => {
+    await executeMetaToolkitCall('list_meta_ads_campaigns', {}, ctx);
+    expect(agentModeService.listMetaAdsCampaignsNew).toHaveBeenCalledWith('user-1');
+  });
+});

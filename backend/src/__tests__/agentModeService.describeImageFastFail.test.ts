@@ -100,7 +100,7 @@ describe('describeImage — fast-fail on an undecodable upload (ENG-370)', () =>
     expect(callLLMSpy).toHaveBeenCalled();
     // The mislabeled octet-stream was corrected to a real PNG data URI.
     const [, messages] = callLLMSpy.mock.calls[0];
-    const imgBlock = (messages[0].content as any[]).find((c: any) => c.type === 'image_url');
+    const imgBlock = (messages[1].content as any[]).find((c: any) => c.type === 'image_url');
     expect(imgBlock.image_url.url).toMatch(/^data:image\/png;base64,/);
   });
 });

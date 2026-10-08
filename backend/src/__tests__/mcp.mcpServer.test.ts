@@ -6,6 +6,19 @@
 import express, { Express, Request, Response, NextFunction } from 'express';
 import request from 'supertest';
 
+const mockIsCronEnabled = jest.fn(() => true);
+const mockValidateAgentKey = jest.fn();
+
+jest.mock('../utils/instanceState', () => ({
+  isCronEnabled: () => mockIsCronEnabled(),
+}));
+
+jest.mock('../services/agentApiKeyService', () => ({
+  agentApiKeyService: {
+    validateKey: (...args: any[]) => mockValidateAgentKey(...args),
+  },
+}));
+
 // Mock the MCP SDK modules
 jest.mock('@modelcontextprotocol/sdk/server/mcp.js', () => ({
   McpServer: jest.fn().mockImplementation(() => ({
@@ -92,6 +105,8 @@ describe('MCP Server', () => {
     process.env = { ...originalEnv };
     process.env.MCP_HTTP_ENABLED = 'true'; // Enable HTTP server for tests
     delete process.env.MCP_ACCESS_TOKEN;
+    mockIsCronEnabled.mockReturnValue(true);
+    mockValidateAgentKey.mockReset();
     
     app = express();
     app.use(express.json());
@@ -200,6 +215,57 @@ describe('MCP Server', () => {
     beforeEach(() => {
       process.env.MCP_ACCESS_TOKEN = TEST_TOKEN;
       setupMcpServer(app);
+    });
+
+    it('A-019: refuses a new external tools/call with JSON 503 while draining', async () => {
+      mockIsCronEnabled.mockReturnValue(false);
+      mockValidateAgentKey.mockResolvedValue({
+        keyId: 'key-1',
+        userId: 'user-1',
+        rateLimitPerMin: 60,
+      });
+
+      const response = await request(app)
+        .post('/mcp')
+        .set('Authorization', 'Bearer aw_test')
+        .send({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'test_tool', arguments: {} }, id: 1 });
+
+      expect(response.status).toBe(503);
+      expect(response.body).toEqual({ message: 'Instance draining — retry on new instance' });
+      expect(StreamableHTTPServerTransport).not.toHaveBeenCalled();
+    });
+
+    it('A-019: refuses an external JSON-RPC batch when any entry starts tools/call', async () => {
+      mockIsCronEnabled.mockReturnValue(false);
+      mockValidateAgentKey.mockResolvedValue({
+        keyId: 'key-1',
+        userId: 'user-1',
+        rateLimitPerMin: 60,
+      });
+
+      const response = await request(app)
+        .post('/mcp')
+        .set('Authorization', 'Bearer aw_test')
+        .send([
+          { jsonrpc: '2.0', method: 'tools/list', id: 1 },
+          { jsonrpc: '2.0', method: 'tools/call', params: { name: 'test_tool', arguments: {} }, id: 2 },
+        ]);
+
+      expect(response.status).toBe(503);
+      expect(response.body).toEqual({ message: 'Instance draining — retry on new instance' });
+      expect(StreamableHTTPServerTransport).not.toHaveBeenCalled();
+    });
+
+    it('A-019: keeps internal self-calls admitted during drain so existing AgentWeb turns can finish', async () => {
+      process.env.MCP_ACCESS_TOKEN = TEST_TOKEN;
+      mockIsCronEnabled.mockReturnValue(false);
+
+      const response = await request(app)
+        .post('/mcp')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
+        .send({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'test_tool', arguments: {} }, id: 1 });
+
+      expect(response.status).not.toBe(503);
     });
 
     it('should handle initialization request and create session', async () => {

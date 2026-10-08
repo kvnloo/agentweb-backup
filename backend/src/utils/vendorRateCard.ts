@@ -33,6 +33,7 @@ export type VendorRateProvider =
   | "google_cse"
   | "apollo"
   | "enrich.so"
+  | "enigma"
   | "2captcha"
   | "elevenlabs"
   | "placid"
@@ -44,6 +45,18 @@ interface VendorRateEntry {
   /** Allocated USD per unit. */
   usdPerUnit: number;
 }
+
+/**
+ * Version stamp for the rates below (ENG-1250 §5: "A price change creates a new
+ * version; historical events retain the rate version used").
+ *
+ * Dated to the last change to the rates in this file — currently the ENG-696
+ * Apollo `org_enrichment` / enrich.so `reverse_lookup` confirmations of
+ * 2026-09-02. **Bump this in the same commit as any rate edit**, otherwise two
+ * different prices share one version and a historical event can no longer be
+ * re-derived from the card that produced it.
+ */
+export const VENDOR_RATE_CARD_VERSION = "2026-09-14";
 
 const RATE_CARD: Record<VendorRateProvider, Record<string, VendorRateEntry>> = {
   v0: {
@@ -84,6 +97,18 @@ const RATE_CARD: Record<VendorRateProvider, Record<string, VendorRateEntry>> = {
     // successful-call path.
     reverse_lookup: { recordingUnit: "lookup", usdPerUnit: 0.05 },
   },
+  // ENG-1388 — PLACEHOLDERS at Enigma's public list price (enigma.com/pricing/
+  // rate-card, pricing effective 2026-08-10, checked 2026-09-14; 1 credit =
+  // $0.01). Enigma bills per value returned ("per fill"), not per request, so
+  // each key is one billed value: Brand 12M Card Revenue Amount = 10 credits,
+  // Brand 12M Card Revenue YoY Growth = 10, Brand Name / Website = 2 each.
+  // Pending Harsha's allocation confirmation (ENG-1706 pattern) before any
+  // call site goes live — Phase 1 ships the adapter with no caller.
+  enigma: {
+    card_revenue_12m: { recordingUnit: "fill", usdPerUnit: 0.1 },
+    card_revenue_yoy_growth_12m: { recordingUnit: "fill", usdPerUnit: 0.1 },
+    brand_attribute: { recordingUnit: "fill", usdPerUnit: 0.02 },
+  },
   "2captcha": {
     solve: { recordingUnit: "solve", usdPerUnit: 0.00725 },
   },
@@ -106,7 +131,9 @@ const RATE_CARD: Record<VendorRateProvider, Record<string, VendorRateEntry>> = {
  * Callers pass the configured key unchanged (for example,
  * `landing_page_generation`, not its human recording unit `generation`).
  * Returns null for an unknown provider or rate key — callers must not default a
- * missing rate to $0 or any other value (see computeAllocatedCost).
+ * missing rate to $0 or any other value. Metering resolves it inside
+ * `recordVendorUsage` from a `rateKey`, recording an unpriced key as `unpriced`
+ * (ENG-703 AC2, ENG-1929).
  */
 export function getAllocatedRate(
   provider: VendorRateProvider,
@@ -126,22 +153,16 @@ export function getAllocatedRate(
 }
 
 /**
- * Allocated USD cost for `quantity` units of a vendor/unit pair.
- *
- * @throws if the provider/unit has no rate entry — an unpriced unit must fail
- *         loudly rather than silently book $0 (ENG-703 AC2).
+ * The card's own unit label for a vendor/rate-key pair, or null when unpriced.
+ * Lets a caller record `unit` from the card rather than restating it at the call
+ * site, where it can drift from the rate it is supposed to describe.
  */
-export function computeAllocatedCost(
+export function getRecordingUnit(
   provider: VendorRateProvider,
-  rateKey: string,
-  quantity: number
-): number {
-  const rate = getAllocatedRate(provider, rateKey);
-  if (rate === null) {
-    throw new Error(
-      `No allocated rate for vendor "${provider}" rate key "${rateKey}" — add it to vendorRateCard.ts before metering this call`
-    );
-  }
-  const safeQuantity = Number.isFinite(quantity) && quantity > 0 ? quantity : 0;
-  return safeQuantity * rate;
+  rateKey: string
+): string | null {
+  if (!rateKey || !Object.prototype.hasOwnProperty.call(RATE_CARD, provider)) return null;
+  const providerCard = RATE_CARD[provider];
+  if (!Object.prototype.hasOwnProperty.call(providerCard, rateKey)) return null;
+  return providerCard[rateKey].recordingUnit;
 }

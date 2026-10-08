@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
 import { buildApiUrl } from '../config';
 import { useAuth } from '../contexts/AuthContext';
@@ -21,6 +21,7 @@ import RefreshIcon from '@mui/icons-material/Refresh';
 import SaveIcon from '@mui/icons-material/Save';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import CancelIcon from '@mui/icons-material/Cancel';
+import RemoveCircleOutlineIcon from '@mui/icons-material/RemoveCircleOutline';
 import ChevronRightIcon from '@mui/icons-material/ChevronRight';
 import CampaignIcon from '@mui/icons-material/Campaign';
 import LanguageIcon from '@mui/icons-material/Language';
@@ -29,12 +30,21 @@ import PaletteIcon from '@mui/icons-material/Palette';
 import TrendingUpIcon from '@mui/icons-material/TrendingUp';
 import AccessTimeIcon from '@mui/icons-material/AccessTime';
 import ShieldIcon from '@mui/icons-material/Shield';
+import {
+  adConnectionOf,
+  adsLayerConnection,
+  campaignCountLabel,
+  deriveQuickStatus,
+  quickSummary,
+  type AdConnectionState,
+  type AllPlatformsConnectionState,
+  type HealthStatus,
+} from '../utils/clientHealthStatus';
 
 // ------------------------------------------------------------------
 // Types
 // ------------------------------------------------------------------
 
-type HealthStatus = 'healthy' | 'mediocre' | 'at-risk' | 'blocked' | 'onboarding';
 
 interface ClientSummary {
   userId: string;
@@ -42,6 +52,8 @@ interface ClientSummary {
   displayName: string;
   roles: string[];
   has_ads: boolean;
+  ad_connection?: AdConnectionState;
+  ad_connection_all_platforms?: AllPlatformsConnectionState;
   has_lander: boolean;
   has_crm: boolean;
   last_activity: string | null;
@@ -49,9 +61,25 @@ interface ClientSummary {
 
 interface AdsLayerHealth {
   connected: boolean;
+  connection?: AdConnectionState;
+  token_expired_at?: string;
   ad_account_id?: string;
   active_campaigns: number;
+  campaigns_complete?: boolean;
   campaigns?: Array<{ id: string; name: string; status: string; objective: string }>;
+  meta_connection_health?: MetaConnectionHealth;
+}
+
+interface MetaConnectionHealth {
+  permissions: 'granted' | 'declined' | 'unknown';
+  declined_permissions?: string[];
+  permissions_error?: string;
+  page_access: 'available' | 'missing' | 'unknown';
+  page_count?: number;
+  page_error?: string;
+  selected_event: 'recent' | 'missing' | 'unknown';
+  reconnect_required: boolean;
+  reconnect_instructions?: string;
 }
 
 interface LanderLayerHealth {
@@ -94,15 +122,31 @@ const STATUS_CONFIG: Record<
   'at-risk': { label: 'At Risk', color: 'error' },
   blocked: { label: 'Blocked', color: 'default' },
   onboarding: { label: 'Onboarding', color: 'info' },
+  // ENG-2188: setup / reconnect work, not churn — amber, never the red "At Risk".
+  'needs-attention': { label: 'Needs attention', color: 'warning' },
 };
 
-function deriveQuickStatus(client: ClientSummary): HealthStatus {
-  if (!client.has_ads && !client.has_lander && !client.has_crm) return 'blocked';
-  if (!client.has_ads) return 'at-risk';
-  const issues = [!client.has_lander, !client.has_crm].filter(Boolean).length;
-  if (issues === 0) return 'healthy';
-  return 'mediocre';
-}
+// ENG-2133: a never-connected ad account is activation (neutral), not a red failure.
+const ADS_INDICATOR: Record<AdConnectionState, { title: string; color: string }> = {
+  connected: { title: 'Ads connected', color: 'success.main' },
+  never_connected: { title: 'Ads not connected yet (activation)', color: 'text.disabled' },
+  expired: { title: 'Ad connection expired', color: 'error.light' },
+  other_platform: { title: 'Ads on Google/LinkedIn (no Meta account)', color: 'info.main' },
+};
+
+const ADS_PANEL: Record<AdConnectionState, { border: string; bg: string }> = {
+  connected: { border: 'success.light', bg: 'success.50' },
+  never_connected: { border: 'grey.300', bg: 'grey.50' },
+  expired: { border: 'error.light', bg: 'error.50' },
+  other_platform: { border: 'info.light', bg: 'info.50' },
+};
+
+const ADS_ACCOUNT_LABEL: Record<AdConnectionState, string> = {
+  connected: 'Connected',
+  never_connected: 'Not connected yet',
+  expired: 'Expired — reconnect needed',
+  other_platform: 'Not on Meta (ads on Google/LinkedIn)',
+};
 
 function formatRelativeTime(dateStr: string | null): string {
   if (!dateStr) return 'Never';
@@ -113,13 +157,11 @@ function formatRelativeTime(dateStr: string | null): string {
   return `${days}d ago`;
 }
 
-function quickSummary(client: ClientSummary): string {
-  const parts: string[] = [];
-  if (!client.has_ads) parts.push('No ads');
-  if (!client.has_lander) parts.push('No lander');
-  if (!client.has_crm) parts.push('No CRM');
-  if (parts.length === 0) return 'All layers connected';
-  return parts.join(' \u00B7 ');
+// ENG-2133: not having Meta yet (or advertising elsewhere) is neutral; only a broken connection is red.
+function AdAccountIcon({ state }: { state: AdConnectionState }) {
+  if (state === 'connected') return <StatusIcon ok />;
+  if (state === 'expired') return <StatusIcon ok={false} />;
+  return <RemoveCircleOutlineIcon sx={{ fontSize: 16, color: 'text.disabled' }} />;
 }
 
 function StatusIcon({ ok }: { ok: boolean }) {
@@ -129,6 +171,32 @@ function StatusIcon({ ok }: { ok: boolean }) {
     <CancelIcon sx={{ fontSize: 16, color: 'error.main' }} />
   );
 }
+
+function healthChipColor(
+  state: 'available' | 'granted' | 'recent' | 'missing' | 'declined' | 'unknown',
+): 'success' | 'error' | 'warning' {
+  if (state === 'available' || state === 'granted' || state === 'recent') return 'success';
+  if (state === 'missing' || state === 'declined') return 'error';
+  return 'warning';
+}
+
+function permissionLabel(health: MetaConnectionHealth): string {
+  if (health.permissions === 'declined') return `Declined: ${(health.declined_permissions || []).join(', ')}`;
+  if (health.permissions === 'unknown') return health.permissions_error ? 'Unknown: read failed' : 'Unknown';
+  return 'Granted';
+}
+
+function pageAccessLabel(health: MetaConnectionHealth): string {
+  if (health.page_access === 'available') return health.page_count === undefined ? 'Available' : `${health.page_count} Page${health.page_count === 1 ? '' : 's'}`;
+  if (health.page_access === 'missing') return 'Missing';
+  return health.page_error ? 'Unknown: read failed' : 'Unknown';
+}
+
+const EVENT_HEALTH_LABEL: Record<MetaConnectionHealth['selected_event'], string> = {
+  recent: 'Recent',
+  missing: 'Missing',
+  unknown: 'Unknown',
+};
 
 // ------------------------------------------------------------------
 // Component
@@ -149,13 +217,7 @@ export default function ClientHealth() {
   const [notes, setNotes] = useState<Record<string, string>>({});
   const [savingNote, setSavingNote] = useState(false);
 
-  useEffect(() => {
-    if (user?.isAdmin) {
-      fetchClients();
-    }
-  }, [token, user?.isAdmin]);
-
-  const fetchClients = async () => {
+  const fetchClients = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
@@ -172,7 +234,13 @@ export default function ClientHealth() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [token]);
+
+  useEffect(() => {
+    if (user?.isAdmin) {
+      fetchClients();
+    }
+  }, [token, user?.isAdmin, fetchClients]);
 
   const fetchClientDetail = async (client: ClientSummary) => {
     setSelectedClient(client);
@@ -311,16 +379,18 @@ export default function ClientHealth() {
                       p: 2,
                       borderRadius: 2,
                       border: 2,
-                      borderColor: detail.ads_layer.connected ? 'success.light' : 'error.light',
-                      bgcolor: detail.ads_layer.connected ? 'success.50' : 'error.50',
+                      borderColor: ADS_PANEL[adsLayerConnection(detail.ads_layer)].border,
+                      bgcolor: ADS_PANEL[adsLayerConnection(detail.ads_layer)].bg,
                     }}
                   >
                     <CampaignIcon sx={{ mb: 0.5 }} />
                     <Typography variant="subtitle2">Meta Ads</Typography>
                     <Typography variant="caption" color="text.secondary">
-                      {detail.ads_layer.connected
-                        ? `${detail.ads_layer.active_campaigns} active`
-                        : 'Not connected'}
+                      {adsLayerConnection(detail.ads_layer) === 'connected'
+                        ? detail.ads_layer.campaigns_complete === false
+                          ? `Campaigns: ${campaignCountLabel(detail.ads_layer)}`
+                          : `${detail.ads_layer.active_campaigns} active`
+                        : ADS_INDICATOR[adsLayerConnection(detail.ads_layer)].title}
                     </Typography>
                   </Box>
                   <ChevronRightIcon color="disabled" />
@@ -381,18 +451,61 @@ export default function ClientHealth() {
                   <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 1 }}>
                     <Typography variant="body2" color="text.secondary">Ad Account</Typography>
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                      <StatusIcon ok={detail.ads_layer.connected} />
+                      <AdAccountIcon state={adsLayerConnection(detail.ads_layer)} />
                       <Typography variant="body2">
-                        {detail.ads_layer.connected ? 'Connected' : 'Disconnected'}
+                        {ADS_ACCOUNT_LABEL[adsLayerConnection(detail.ads_layer)]}
                       </Typography>
                     </Box>
                   </Box>
                   <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 1 }}>
                     <Typography variant="body2" color="text.secondary">Active Campaigns</Typography>
                     <Typography variant="body2" fontWeight={600}>
-                      {detail.ads_layer.active_campaigns}
+                      {campaignCountLabel(detail.ads_layer)}
                     </Typography>
                   </Box>
+                  {detail.ads_layer.meta_connection_health && (
+                    <Box sx={{ borderTop: 1, borderColor: 'divider', pt: 1, mt: 1 }}>
+                      <Typography variant="caption" fontWeight={700} color="text.secondary" sx={{ textTransform: 'uppercase' }}>
+                        Meta connection health
+                      </Typography>
+                      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mt: 0.75, gap: 1 }}>
+                        <Typography variant="body2" color="text.secondary">Page access</Typography>
+                        <Tooltip title={detail.ads_layer.meta_connection_health.page_error || ''}>
+                          <Chip
+                            label={pageAccessLabel(detail.ads_layer.meta_connection_health)}
+                            color={healthChipColor(detail.ads_layer.meta_connection_health.page_access)}
+                            size="small"
+                            variant="outlined"
+                          />
+                        </Tooltip>
+                      </Box>
+                      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mt: 0.75, gap: 1 }}>
+                        <Typography variant="body2" color="text.secondary">Permissions</Typography>
+                        <Tooltip title={detail.ads_layer.meta_connection_health.permissions_error || ''}>
+                          <Chip
+                            label={permissionLabel(detail.ads_layer.meta_connection_health)}
+                            color={healthChipColor(detail.ads_layer.meta_connection_health.permissions)}
+                            size="small"
+                            variant="outlined"
+                          />
+                        </Tooltip>
+                      </Box>
+                      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mt: 0.75, gap: 1 }}>
+                        <Typography variant="body2" color="text.secondary">Selected event</Typography>
+                        <Chip
+                          label={EVENT_HEALTH_LABEL[detail.ads_layer.meta_connection_health.selected_event]}
+                          color={healthChipColor(detail.ads_layer.meta_connection_health.selected_event)}
+                          size="small"
+                          variant="outlined"
+                        />
+                      </Box>
+                      {detail.ads_layer.meta_connection_health.reconnect_required && (
+                        <Alert severity="warning" sx={{ mt: 1 }}>
+                          {detail.ads_layer.meta_connection_health.reconnect_instructions}
+                        </Alert>
+                      )}
+                    </Box>
+                  )}
                   {detail.ads_layer.campaigns && detail.ads_layer.campaigns.length > 0 && (
                     <Box sx={{ borderTop: 1, borderColor: 'divider', pt: 1, mt: 1 }}>
                       <Typography variant="caption" fontWeight={700} color="text.secondary" sx={{ textTransform: 'uppercase' }}>
@@ -646,7 +759,7 @@ export default function ClientHealth() {
       {!loading && !error && clients.length > 0 && (
         <>
           {/* Summary cards */}
-          <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 2, mb: 3 }}>
+          <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 2, mb: 3 }}>
             <Card>
               <CardContent sx={{ textAlign: 'center', py: 2, '&:last-child': { pb: 2 } }}>
                 <Typography variant="h4" fontWeight={700}>{clients.length}</Typography>
@@ -671,12 +784,18 @@ export default function ClientHealth() {
             </Card>
             <Card>
               <CardContent sx={{ textAlign: 'center', py: 2, '&:last-child': { pb: 2 } }}>
-                <Typography variant="h4" fontWeight={700} color="error.main">
-                  {clients.filter(
-                    (c) => deriveQuickStatus(c) === 'at-risk' || deriveQuickStatus(c) === 'blocked'
-                  ).length}
+                <Typography variant="h4" fontWeight={700} color="info.main">
+                  {clients.filter((c) => deriveQuickStatus(c) === 'onboarding').length}
                 </Typography>
-                <Typography variant="caption" color="text.secondary">At Risk / Blocked</Typography>
+                <Typography variant="caption" color="text.secondary">Onboarding</Typography>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent sx={{ textAlign: 'center', py: 2, '&:last-child': { pb: 2 } }}>
+                <Typography variant="h4" fontWeight={700} color="warning.dark">
+                  {clients.filter((c) => deriveQuickStatus(c) === 'needs-attention').length}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">Needs attention</Typography>
               </CardContent>
             </Card>
           </Box>
@@ -710,10 +829,10 @@ export default function ClientHealth() {
 
                       {/* Quick indicators */}
                       <Box sx={{ display: { xs: 'none', sm: 'flex' }, gap: 1.5, alignItems: 'center' }}>
-                        <Tooltip title={client.has_ads ? 'Ads connected' : 'No ad account'}>
+                        <Tooltip title={ADS_INDICATOR[adConnectionOf(client)].title}>
                           <CampaignIcon
                             fontSize="small"
-                            sx={{ color: client.has_ads ? 'success.main' : 'error.light' }}
+                            sx={{ color: ADS_INDICATOR[adConnectionOf(client)].color }}
                           />
                         </Tooltip>
                         <Tooltip title={client.has_lander ? 'Lander detected' : 'No lander'}>

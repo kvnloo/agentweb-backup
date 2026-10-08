@@ -491,6 +491,25 @@ describe('scheduledRunSignalsConditionalSkip', () => {
   //     that did not produce what was required. create_image_task_from_prompt
   //     and create_revision are also [DEPRECATED], further lowering their
   //     real-world likelihood.
+  //   - present_question_deck -> ask_user_question (ENG-1635/1644): both build
+  //     a blocking question halt, but for different SITUATIONS, not the same
+  //     requirement — present_question_deck front-loads 1-6 predictable
+  //     planning questions determinable up front, ask_user_question is the
+  //     narrow escape hatch for a genuinely unpredictable question that only
+  //     comes up mid-execution (present_question_deck's own description says
+  //     so explicitly). Calling one is not evidence the other's requirement
+  //     was also satisfied. Not aliased; logged here so it isn't silently
+  //     missed.
+  //   - stage_pending_decision -> ask_user_question / present_question_deck:
+  //     stage_pending_decision's own description says to use it "instead of
+  //     ask_user_question/present_question_deck when the answer genuinely
+  //     belongs to someone OTHER than the person you're talking to right
+  //     now" — a durable, named-approver decision routed to Slack (or a
+  //     customer email), answered possibly days later, not a blocking
+  //     in-session halt. Different AUDIENCE and different timing, not the
+  //     same requirement — calling one is not evidence the other's
+  //     requirement was also satisfied. Not aliased; logged here so it
+  //     isn't silently missed.
   it('redirect audit: pins every "use/prefer tool X instead" cross-reference between two registered tools (ENG-1276 follow-up #3)', () => {
     const allTools = emmaToolRegistry.getAllTools();
     const allNames = allTools.map((t) => t.name);
@@ -532,6 +551,7 @@ describe('scheduledRunSignalsConditionalSkip', () => {
         'list_knowledge_base_files -> materialize_knowledge_base_asset',
         'list_knowledge_base_files -> read_knowledge_base_files',
         'perform_deep_research -> create_blog_article',
+        'present_question_deck -> ask_user_question',
         'read_file_content -> describe_image',
         'read_file_content -> describe_video',
         'read_knowledge_base_files -> materialize_knowledge_base_asset',
@@ -541,6 +561,8 @@ describe('scheduledRunSignalsConditionalSkip', () => {
         'remove_image_background -> update_html_file',
         'search_leads -> ask_crm',
         'send_email_from_sender -> email',
+        'stage_pending_decision -> ask_user_question',
+        'stage_pending_decision -> present_question_deck',
         'twitter_manage_post -> post_on_connected_account',
         'update_book_content -> generate_book_content',
       ].sort()

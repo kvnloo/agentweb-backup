@@ -93,7 +93,9 @@ describe('LinkedIn Outreach Auth Router', () => {
       const response = await request(app).post('/save-account').send({ unipileAccountId: 'acc-123' });
 
       expect(response.status).toBe(200);
-      expect(response.body).toEqual({ success: true, account: mockCreatedAccount });
+      // redactAccountSecrets (ENG-2258) always normalizes `config` to an object,
+      // even when the mocked createAccount result omits it entirely.
+      expect(response.body).toEqual({ success: true, account: { ...mockCreatedAccount, config: {} } });
       // Retried 3 times before falling back
       expect(linkedInOutreachService.getAccount).toHaveBeenCalledTimes(3);
       expect(createAccount).toHaveBeenCalledWith('user-123', 'unipile', expect.objectContaining({
@@ -118,7 +120,9 @@ describe('LinkedIn Outreach Auth Router', () => {
       const response = await request(app).post('/save-account').send({ unipileAccountId: 'acc-123' });
 
       expect(response.status).toBe(200);
-      expect(response.body).toEqual({ success: true, account: mockCreatedAccount });
+      // redactAccountSecrets (ENG-2258) always normalizes `config` to an object,
+      // even when the mocked createAccount result omits it entirely.
+      expect(response.body).toEqual({ success: true, account: { ...mockCreatedAccount, config: {} } });
       expect(linkedInOutreachService.getAccount).toHaveBeenCalledWith('acc-123');
       expect(linkedInOutreachService.clearStatusCache).toHaveBeenCalledWith('acc-123');
       expect(createAccount).toHaveBeenCalledWith('user-123', 'unipile', {

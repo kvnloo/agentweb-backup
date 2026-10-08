@@ -358,4 +358,39 @@ describe('summarizeSessionIfNeeded', () => {
 
     expect(result!.summary).toBe('Rendered all 3 sizes for the display ad set.');
   });
+
+  // ENG-2076: detectFalseCompletionClaim only understands ASSET_PRODUCING_TOOL_NAMES
+  // (image/video/HTML-template tools) — a session built entirely on a different
+  // domain (here, Meta Ads' call_meta_marketing_api) always reads actual: 0
+  // regardless of what really happened. The summarizer's own system prompt models
+  // digit-form phrasing ("Created 3 LinkedIn posts..."), so a truthful Meta Ads
+  // summary like this one is a plausible real output — without the domain gate it
+  // would get silently REPLACED by a false "0 of 3... not yet complete" line, worse
+  // than the inline chat correction this same bug caused elsewhere because this one
+  // persists to session.sessionSummary and is served verbatim by account_summary.
+  test('leaves a truthful non-media (Meta Ads) completion claim unchanged', async () => {
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse('Created 3 ad creatives and launched a new Meta Ads campaign targeting 18 Bay Area ZIP codes.')
+    );
+
+    const session = makeSession({
+      sessionId: 'sess-meta-ads-truthful',
+      messageCount: 4,
+      messages: [
+        { role: 'user', content: 'Set up the warranty-check campaign' },
+        toolCallMessage([
+          { name: 'call_meta_marketing_api' },
+          { name: 'call_meta_marketing_api' },
+          { name: 'call_meta_marketing_api' },
+        ]),
+      ],
+    });
+
+    const result = await summarizeSessionIfNeeded(session);
+
+    expect(result!.summary).toBe(
+      'Created 3 ad creatives and launched a new Meta Ads campaign targeting 18 Bay Area ZIP codes.'
+    );
+    expect(result!.summary).not.toContain('not yet complete');
+  });
 });

@@ -163,6 +163,40 @@ export async function getUnipileHealth(
 }
 
 /**
+ * How long an ownerless (site-wide) account may sit in the indeterminate
+ * 'unknown' state before oncall is paged anyway (ENG-2182).
+ *
+ * A site-wide account has no owner row to carry `needs_reconnect`, so a probe
+ * failure that never resolves to a proven 401/AUTH_ERROR never reaches the
+ * `state === 'disconnected'` alert below — and per ENG-281 a single 'unknown'
+ * reading must stay silent, since it usually just means a timeout or 5xx blip.
+ * But confirmed on ENG-2182: two site-wide accounts failed their connectivity
+ * probe with an unclassified error (Unipile returning a non-JSON/HTML body, so
+ * `isProvenDisconnectError` never sees a status/code to classify) continuously
+ * for 3+ days — 'unknown' on every single one of ~430 probes — while every
+ * customer without their own LinkedIn account silently lost lead discovery and
+ * nobody at AgentWeb was ever paged. For an ownerless account there is no
+ * customer whose inbox a false alarm could cost, only an operator's few minutes
+ * to check a shared account many customers depend on — so 'unknown' that never
+ * clears for hours running is itself treated as a signal worth paging on.
+ */
+export const SITE_WIDE_UNKNOWN_ALERT_THRESHOLD_MS = 3 * 60 * 60 * 1000; // 3 hours
+
+/**
+ * In-memory only, same tradeoff as `connectedStatusCache`/`lastAlertAtByKey`
+ * elsewhere in this codebase: a process restart resets the clock, which only
+ * delays this ops-only alert by a few hours in the worst case and never
+ * suppresses it outright (the account is still unhealthy every 10-minute cycle
+ * either way).
+ */
+const siteWideUnknownSinceByAccount = new Map<string, number>();
+
+/** Test-only: clears the site-wide unknown-duration tracker between tests. */
+export function __resetSiteWideUnknownTrackingForTests(): void {
+  siteWideUnknownSinceByAccount.clear();
+}
+
+/**
  * Record a probe verdict and fire the owner/oncall notification on the transition.
  *
  * Never throws: this runs inside a cron loop whose other accounts must keep syncing,
@@ -181,13 +215,6 @@ export async function recordUnipileAccountHealth(params: {
   const { accountId, ownerUserId: viewerUserId, state } = params;
   const now = params.now ?? Date.now();
 
-  // An indeterminate probe (timeout, 5xx, transport) proves nothing about the
-  // session. Acting on it would flag a healthy account and tell its owner to
-  // reconnect for no reason — the exact failure ENG-281's tri-state exists to
-  // prevent, and it would be far worse here because this verdict is persisted
-  // rather than expiring out of a 10-minute cache.
-  if (state === 'unknown') return 'no-op';
-
   // Site-wide/shared accounts belong to no customer: there is no user record to
   // write to and nobody whose inbox this belongs in.
   //
@@ -198,7 +225,12 @@ export async function recordUnipileAccountHealth(params: {
   // the same 38-day blind spot this module exists to close, so oncall is paged even
   // though there is no owner record to persist against.
   if (!viewerUserId) {
+    if (state === 'connected') {
+      siteWideUnknownSinceByAccount.delete(accountId);
+      return 'no-op';
+    }
     if (state === 'disconnected') {
+      siteWideUnknownSinceByAccount.delete(accountId);
       await sendAgentModeOncallAlert({
         subject: 'Site-wide LinkedIn Outreach account disconnected',
         message:
@@ -208,9 +240,38 @@ export async function recordUnipileAccountHealth(params: {
         dedupeKey: `linkedin-disconnected-ownerless:${accountId}`,
         dedupeWindowMs: 12 * 60 * 60 * 1000,
       }).catch(() => undefined);
+      return 'no-op';
+    }
+
+    // state === 'unknown' — see SITE_WIDE_UNKNOWN_ALERT_THRESHOLD_MS doc above.
+    const since = siteWideUnknownSinceByAccount.get(accountId) ?? now;
+    if (!siteWideUnknownSinceByAccount.has(accountId)) {
+      siteWideUnknownSinceByAccount.set(accountId, since);
+    }
+    const elapsedMs = now - since;
+    if (elapsedMs >= SITE_WIDE_UNKNOWN_ALERT_THRESHOLD_MS) {
+      await sendAgentModeOncallAlert({
+        subject: `Site-wide LinkedIn account unreachable for ${Math.floor(elapsedMs / (60 * 60 * 1000))}h+: ${accountId}`,
+        message:
+          `Unipile account ${accountId} (shared fallback pool) has failed its connectivity probe with an `
+          + `unclassified error (not a proven 401/disconnect — likely a non-JSON/HTML response from Unipile) `
+          + `continuously since ${new Date(since).toISOString()}. Every customer without their own connected `
+          + `LinkedIn account depends on this pool for lead discovery/enrichment and is failing silently. `
+          + `Check Unipile directly and reconnect via Settings → Connected Accounts (Admin) if needed.`,
+        context: { accountId, state, unknownSince: new Date(since).toISOString() },
+        dedupeKey: `linkedin-sitewide-unknown:${accountId}`,
+        dedupeWindowMs: 24 * 60 * 60 * 1000,
+      }).catch(() => undefined);
     }
     return 'no-op';
   }
+
+  // An indeterminate probe (timeout, 5xx, transport) proves nothing about the
+  // session. Acting on it would flag a healthy account and tell its owner to
+  // reconnect for no reason — the exact failure ENG-281's tri-state exists to
+  // prevent, and it would be far worse here because this verdict is persisted
+  // rather than expiring out of a 10-minute cache.
+  if (state === 'unknown') return 'no-op';
 
   try {
     const account = await findUnipileAccount(accountId, viewerUserId);

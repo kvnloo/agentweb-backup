@@ -1,3 +1,5 @@
+import { enforceEvaluationTool } from '../../services/evaluationPolicy';
+import { currentRunFunding, resolveRunFunding, withRunFunding } from '../../services/funding/runFunding';
 import { isAnonymousUserId, buildAnonymousToolRefusal } from '../anonymousToolAccess';
 import { refuseUnauthorizedScheduledPublish, attachPublishRevalidation } from '../../utils/scheduledPublishConsentGuard';
 
@@ -23,10 +25,11 @@ export interface McpToolHandler {
    * When true, the tool is hidden from external MCP clients' `tools/list`.
    *
    * Hiding only — a client that knows the name can still call it. That is
-   * deliberate for the cost-driven tools (image generation, the searches,
-   * `save_file`): ENG-973 meters the `/api/emma/*` routes they self-call, so
-   * naming one buys no free spend. Where the damage would be the *action*
-   * rather than the cost, use `internalOnly` instead.
+   * deliberate for the cost-driven tools (the searches, `save_file`):
+   * ENG-973 meters the `/api/emma/*` routes they self-call, so naming one
+   * buys no free spend. `generate_image` is listed for external MCP
+   * (metered on `/api/emma/generate-image`). Where the damage would be the
+   * *action* rather than the cost, use `internalOnly` instead.
    */
   internal?: boolean;
   /**
@@ -70,6 +73,29 @@ export interface McpToolHandler {
 
 export { isAnonymousUserId } from '../anonymousToolAccess';
 
+/**
+ * ENG-336 — MCP tool annotations (readOnlyHint / destructiveHint /
+ * openWorldHint) required for ChatGPT app publication. Derived from the
+ * existing `readOnly` flag; anything not declared read-only is labelled a
+ * destructive write (conservative: a client confirms rather than auto-runs).
+ * Every Emma tool reaches third-party services/the web, so openWorldHint
+ * defaults true. Explicit `definition.annotations` hints always win.
+ * Returns a copy; the registered definition is never mutated.
+ */
+export function withToolAnnotations(t: McpToolHandler): any {
+  const readOnly = t.readOnly === true;
+  const explicit = (t.definition && t.definition.annotations) || {};
+  return {
+    ...t.definition,
+    annotations: {
+      readOnlyHint: readOnly,
+      destructiveHint: !readOnly,
+      openWorldHint: true,
+      ...explicit,
+    },
+  };
+}
+
 export class McpToolRegistry {
   private tools: Map<string, McpToolHandler> = new Map();
 
@@ -81,7 +107,7 @@ export class McpToolRegistry {
   getToolDefinitions() {
     return Array.from(this.tools.values())
       .filter(t => !t.internal)
-      .map(t => t.definition);
+      .map(t => withToolAnnotations(t));
   }
 
   /** All tool definitions including internal-only (for Emma's internal registry). */
@@ -103,6 +129,7 @@ export class McpToolRegistry {
   }
 
   async execute(name: string, args: any, context?: any) {
+    await enforceEvaluationTool(context?.userId, name);
     const handler = this.tools.get(name);
     if (!handler) {
       throw new Error(`Tool ${name} not found`);
@@ -150,7 +177,30 @@ export class McpToolRegistry {
     // A publishing handler may do minutes of work (media download, video upload)
     // between being admitted here and actually committing the post, so admission
     // alone is not enough — hand it a re-validation to run at its last moment.
-    return await handler.execute(args, attachPublishRevalidation(name, context, args));
+    const publishContext = attachPublishRevalidation(name, context, args);
+
+    // ENG-1816 F1: resolve funding ONLY when no ambient RunFunding is already active.
+    // This method is the single dispatch point for BOTH Emma's own in-process tool
+    // calls (agentModeService.ts, already inside the worker's withRunFunding scope)
+    // AND genuinely external entry points that never go through the worker at all —
+    // e.g. an internal MCP_ACCESS_TOKEN caller hitting POST /mcp directly, which
+    // reaches create_blog_article -> agentModeService.createBlogArticle ->
+    // generateBlogContent/restyleContent with no scope ever entered, so their
+    // currentRunFunding()-based attribution fix silently read undefined. Found by
+    // an independent review of this same PR's earlier leak fixes.
+    //
+    // Checking currentRunFunding() first, and only resolving when it's absent, is
+    // load-bearing, not a micro-optimization: a run's funding must be resolved ONCE,
+    // at that run's true entry point. Unconditionally re-resolving here would
+    // overwrite an outer, already-correct funding decision for the duration of every
+    // nested tool call inside an agent-mode turn — harmless today (F1 always
+    // resolves 'agentweb'), but wrong the moment a real customer route exists,
+    // since a fresh resolve could return something different mid-run.
+    if (currentRunFunding() || !context?.userId) {
+      return await handler.execute(args, publishContext);
+    }
+    const runFunding = await resolveRunFunding({ userId: context.userId });
+    return await withRunFunding(runFunding, () => handler.execute(args, publishContext));
   }
 }
 

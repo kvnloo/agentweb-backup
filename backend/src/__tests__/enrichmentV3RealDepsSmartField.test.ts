@@ -10,6 +10,13 @@
 import { buildOrchestratorDeps } from '../services/enrichmentV3RealDeps';
 import type { LeadRecord } from '../services/crmEnrichmentService';
 import type { OrchestratorDeps } from '../services/crmEnrichmentServiceV3';
+import { resolveModelForUser } from '../services/modelRoles';
+
+// ── model role seam ───────────────────────────────────────────────────────────
+// The enrichment role default (gpt-5.5, ENG-2184) and org overrides are covered
+// in modelRoles.test.ts; here it is the seam evaluateSmartField calls.
+jest.mock('../services/modelRoles');
+const ENRICHMENT_DEFAULT = 'gpt-5.5';
 
 // ── LLM mock ──────────────────────────────────────────────────────────────────
 
@@ -61,6 +68,7 @@ beforeEach(() => {
   mockBuildSmartFieldEvalUserPrompt.mockClear();
   mockBuildSmartFieldEvalSystemPrompt.mockClear();
   mockGenerateJSONContent.mockResolvedValue({ value: 'true', reasoning: 'ok' });
+  jest.mocked(resolveModelForUser).mockResolvedValue(ENRICHMENT_DEFAULT);
 });
 
 afterEach(() => {
@@ -262,7 +270,8 @@ describe('evaluateSmartField — LLM response handling', () => {
       lead: makeLead({ company: 'Acme' }),
       fieldName: 'f', condition: 'c', depValues: {},
     });
-    expect(result).toEqual({ value: 'yes', reasoning: 'matched', model: 'gpt-5-chat-2' });
+    expect(result).toEqual({ value: 'yes', reasoning: 'matched', model: ENRICHMENT_DEFAULT });
+    expect(resolveModelForUser).toHaveBeenCalledWith('user-1', 'enrichment');
   });
 
   it('returns value: null when LLM returns null value', async () => {
@@ -272,7 +281,7 @@ describe('evaluateSmartField — LLM response handling', () => {
       lead: makeLead({}),
       fieldName: 'f', condition: 'c', depValues: {},
     });
-    expect(result).toEqual({ value: null, reasoning: '', model: 'gpt-5-chat-2' });
+    expect(result).toEqual({ value: null, reasoning: '', model: ENRICHMENT_DEFAULT });
   });
 
   it('coerces non-null LLM value to string', async () => {
@@ -302,6 +311,6 @@ describe('evaluateSmartField — LLM response handling', () => {
       lead: makeLead({}),
       fieldName: 'f', condition: 'c', depValues: {},
     });
-    expect(result).toEqual({ value: null, reasoning: '', model: 'gpt-5-chat-2' });
+    expect(result).toEqual({ value: null, reasoning: '', model: ENRICHMENT_DEFAULT });
   });
 });

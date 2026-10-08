@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getLinkedInAdsConfig } from '../config/integrations';
 import { createAccount } from '../services/connectedAccountsDb';
+import { redactAccountSecrets } from '../utils/accountSecretRedaction';
 import { listAdAccounts } from '../services/linkedInAdsService';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
@@ -14,6 +15,27 @@ const STATE_EXPIRATION = '15m';
 const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
+/**
+ * ENG-1644 gap-closing: linkedin_ads was a live platform with zero
+ * auto-resolve wiring — a customer_credential decision for a LinkedIn Ads
+ * reconnect could never resolve on its own, no matter what the customer
+ * did. Same pattern as metaAuth.ts/linkedinAuth.ts's identical helper:
+ * safeAutoResolveCredentialDecision itself never throws, but the import
+ * statement can — own try/catch so that can't abort this response. The
+ * wrapper's own logic lives once in approvalInboxCustomerNotify.ts, not
+ * duplicated per file (review fix — this local copy was flagged as
+ * duplicated 3x across this file, metaAuth.ts, and linkedinAuth.ts by 4
+ * independent review passes).
+ */
+async function safeAutoResolve(label: string, userId: string, platform: string, accountId: string): Promise<void> {
+  try {
+    const { safeAutoResolveCredentialDecision } = await import('../services/approvalInboxCustomerNotify');
+    await safeAutoResolveCredentialDecision(label, userId, platform, accountId);
+  } catch (err: any) {
+    console.warn(`[${label}] auto-resolve module failed to load:`, err?.message || err);
+  }
+}
 
 interface StatePayload {
   userId: string;
@@ -251,7 +273,9 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
       },
     });
 
-    res.json({ success: true, account });
+    await safeAutoResolve('LinkedIn Ads Connect', userId, 'linkedin_ads', adAccountId);
+
+    res.json({ success: true, account: redactAccountSecrets(account) });
   } catch (error: any) {
     console.error('[LinkedIn Ads OAuth] Connect error:', error);
     const details = IS_PRODUCTION ? undefined : error.message;

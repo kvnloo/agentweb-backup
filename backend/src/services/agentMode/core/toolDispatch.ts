@@ -27,9 +27,11 @@
 
 import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
 import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
+import { isReadOnlyToolName } from '../../../utils/toolWriteClassification';
 import { ToolResultPolicyBlockedError } from '../../../utils/toolResultError';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../../../utils/citations';
 import { appendRetryabilityGuidance } from './errorRetryability';
+import { LLM_MODEL_REGISTRY } from '../llmModelRegistry';
 import { sealTruncatedPayload, sealTruncatedPayloadWithNotice } from './truncatedPayload';
 import { parseToolCallArguments, TruncatedToolCallArgumentsError } from './repairToolCallArguments';
 import {
@@ -252,6 +254,20 @@ export function seedSearchCallCountFromHistory(
 }
 
 /** A tool-result outcome from the gateway, normalized into the loop's union shape. */
+/**
+ * Owner-scoped tools a share-link visitor (who runs as the owner's userId) must never reach:
+ * org settings reads/writes and org/personal memory writes. Memory written here is injected
+ * into later owner/org sessions, so a visitor could otherwise poison or delete it.
+ */
+export const SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS: ReadonlySet<string> = new Set([
+  'get_lead_notification_settings',
+  'update_lead_notification_settings',
+  'save_org_memory',
+  'delete_org_memory',
+  'save_memory',
+  'delete_memory',
+]);
+
 export interface ToolExecOutcome {
   status: 'success' | 'error';
   result?: any;
@@ -389,9 +405,24 @@ export interface ExecutePreparedToolsInput {
   isDelegatedAccess: boolean;
   hasAdminAccess: boolean;
   isInteractiveShare: boolean;
+  /**
+   * ENG-2072: tri-state — see ToolContext.isUnattendedRun in mcp/client/toolRegistry.ts.
+   * Forwarded verbatim to executePreparedAgentTool so it survives into the tool
+   * dispatch context; an explicit `false` (attended) must not collapse to
+   * `undefined` on the way through.
+   */
+  isUnattendedRun?: boolean;
   // ---- skill/tool gating (read-only) ----
   adminSkillToolNames: string[];
   excludeTools?: string[];
+  /**
+   * ENG-1337: true while the ENG-763 anti-loop directive is active for this turn.
+   * The directive forbids write/publish/send tools in prose; this makes it a hard
+   * execution-layer deny: any tool not classified read-only (fail-safe allowlist in
+   * utils/toolWriteClassification) — including install_skills — is refused before
+   * it reaches the gateway. Read-only/verification tools still execute.
+   */
+  loopBreakerActive?: boolean;
   publishedSkillsCount: number;
   sessionAssociatedSkillIdsCount: number;
   allowedToolNames: Set<string>;
@@ -510,18 +541,51 @@ export interface ExecutePreparedToolsResult {
 
 /**
  * ENG-936: normalize image input fields into a single string array for source checks.
+ *
+ * Review fix: `logo_image` is folded in alongside `inputImages`/`input_images`.
+ * `imageGeneration.ts`'s `generateImage()` appends `params.logoImage` onto
+ * `params.inputImages` before generating (and `agentModeService.ts`'s own
+ * `editsExistingImage` check already treats `inputImages.length > 0 || !!logoImage`
+ * as equivalent), so a `logo_image` is a real edit source at execution time — this
+ * gate must see it too, or a call with `confirm:true`, no `inputImages`, and an
+ * unapproved `logo_image` sails through as "not an edit" and bypasses source
+ * validation entirely.
  */
 function getInputImages(toolCallArgs: any): string[] {
   const rawInputImages = toolCallArgs?.inputImages ?? toolCallArgs?.input_images;
-  if (typeof rawInputImages === 'string') return [rawInputImages];
-  if (!Array.isArray(rawInputImages)) return [];
-  return rawInputImages.filter((item): item is string => typeof item === 'string');
+  const images: string[] = [];
+  if (typeof rawInputImages === 'string') {
+    images.push(rawInputImages);
+  } else if (Array.isArray(rawInputImages)) {
+    images.push(...rawInputImages.filter((item): item is string => typeof item === 'string'));
+  }
+
+  const logoImage = toolCallArgs?.logo_image ?? toolCallArgs?.logoImage;
+  if (typeof logoImage === 'string' && logoImage.length > 0) {
+    images.push(logoImage);
+  }
+
+  return images;
 }
 
 /**
  * ENG-936: ensure a revision-style image edit binds to an explicitly approved
  * source URL before execution. A false pass here means `confirm=true` was issued
  * for the wrong source and must be stopped before gateway execution.
+ *
+ * ENG-2166 fix: this gate exists to validate an EDIT's source, not to gate
+ * `generate_image` in general. `approvedRevisionImageSources` is fixed for an
+ * entire run (e.g. revisionService.ts's Slack-driven "revise this asset" flow
+ * sets it once for the whole bounded runVerifiedChat call). Previously, once
+ * that list was non-empty, EVERY generate_image call for the rest of the run
+ * was forced through this check — including plain text-to-image calls that
+ * never set inputImages at all and were never attempting an edit. A real
+ * customer session hit this: Emma made one approved, confirmed edit, then
+ * every subsequent unrelated text-to-image call in the same run failed with
+ * "Expected one of: [the one approved URL]. Received none." — permanently
+ * blocking all new generations for the rest of the session. A call with no
+ * inputImages isn't a revision at all, so this gate must not apply to it
+ * regardless of whether an approved-sources list happens to be active.
  */
 function isApprovedImageSourceForRevision(
   args: any,
@@ -533,12 +597,8 @@ function isApprovedImageSourceForRevision(
 
   const inputImages = getInputImages(args);
   if (!Array.isArray(inputImages) || inputImages.length === 0) {
-    return {
-      approved: false,
-      errorMessage:
-        `generate_image confirmation requires explicit approved source inputImages. ` +
-        `Expected one of: ${approvedSources.join(', ')}. Received none.`,
-    };
+    // Not an edit — a plain generation never needs an approved source.
+    return { approved: true };
   }
 
   const mismatch = inputImages.find((url) => !approvedSources.includes(url));
@@ -580,8 +640,10 @@ export async function executePreparedTools(
     isDelegatedAccess,
     hasAdminAccess,
     isInteractiveShare,
+    isUnattendedRun,
     adminSkillToolNames,
     excludeTools,
+    loopBreakerActive = false,
     publishedSkillsCount,
     sessionAssociatedSkillIdsCount,
     allowedToolNames,
@@ -608,6 +670,23 @@ export async function executePreparedTools(
   let mediaBudgetDeferred = false;
   // ENG-426: search calls ALLOWED to execute this iteration (see SEARCH_CALL_SESSION_CAP).
   let searchCallsThisIteration = 0;
+  // ENG-1945 follow-up: install_skills calls that already ran an eager head-start
+  // execution in Phase 1 below (so a sibling call gated by the newly-installed skill,
+  // appearing later in this SAME batch, sees it unlocked). Keyed by tool_call_id so
+  // Phase 2's runOne can replay this outcome instead of executing install_skills a
+  // second time for the identical call — see the eager block below for why a second,
+  // independent execution is unsafe rather than merely redundant.
+  const eagerToolOutcomes = new Map<string, ToolExecOutcome>();
+  // Same, but keyed by (name + args) signature rather than tool_call_id: the eager
+  // block below runs BEFORE the shared same-turn dedupe check further down (that
+  // check's own suppression bookkeeping — messages/ledger/counters — must stay
+  // ordered after every call has had a chance to unlock siblings, so it can't be
+  // moved earlier to gate the eager execution itself). Without this, two
+  // install_skills calls with IDENTICAL arguments emitted in the same batch (the
+  // model repeats itself) would each run the eager execution for real — the second
+  // one re-recording a failure/re-mutating session state for a call the later
+  // dedupe check goes on to suppress as a duplicate anyway.
+  const eagerInstallSkillsByArgs = new Map<string, ToolExecOutcome>();
 
   // Phase 1: Validate and prepare tool calls (synchronous)
   const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision; dedupeKey: string }> = [];
@@ -699,9 +778,27 @@ export async function executePreparedTools(
         continue;
       }
 
+      // A share-link visitor runs under the owner's userId, so owner-only org-settings
+      // writes must be refused here rather than by the tool's own role check.
+      if (isInteractiveShare && SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS.has(toolCall.function.name)) {
+        const errorMsg = `Tool "${toolCall.function.name}" acts on the owner's organization settings or memory and is not available in shared sessions. The owner can use it in Agent Mode in their own session.`;
+        appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
+        continue;
+      }
+
       if (isInteractiveShare && toolCall.function.name === 'connect_account') {
         const errorMsg = 'Account connections are not available in shared sessions. Tell the user they need to open Agent Mode in their own account to connect this account, then come back here.';
         appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
+        continue;
+      }
+
+      // ask_user_question passes the ask_ read classifier but halts the run for a question deck.
+      if (loopBreakerActive && (
+        toolCall.function.name === 'ask_user_question'
+        || !isReadOnlyToolName(toolCall.function.name)
+      )) {
+        const errorMsg = `Tool "${toolCall.function.name}" was not run: the same request has repeated several times, so only read-only or verification tools may run this turn. Do not retry it; use a read-only tool or answer the user directly.`;
+        appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg, deniedBy: 'loop_breaker' }));
         continue;
       }
 
@@ -727,13 +824,31 @@ export async function executePreparedTools(
       }
 
       if (publishedSkillsCount > 0 && sessionAssociatedSkillIdsCount > 0 && !allowedToolNames.has(toolCall.function.name)) {
-        const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
+        /*
+         * The install directive alone left the model with no instruction for the case where the
+         * install ALSO fails. Observed in a live delegated session: the gate refused
+         * `audit_ad_utm_coverage`, `install_skills` was refused, and the model then ran an
+         * unrelated AD LIST and presented a confident "UTM Tagging Audit Summary — PASS, 6/6
+         * tagged" table built from it. A downstream truthfulness guard appended a correction,
+         * but underneath the fabricated table — a correction is not a substitute for not
+         * fabricating.
+         *
+         * ENG-1844 review (found while working a different ticket, bundled in per Manan):
+         * this used to name ONE specific cause ("for example it is not available on this
+         * subscription") and tell the model to assert it plainly. install_skills refuses for
+         * FOUR distinct reasons (unentitled/billing, unavailable/catalog gap, unresolved/bad
+         * id, forbidden/role) — see `describeRejections` — and ENG-1795 exists specifically
+         * because collapsing the non-billing ones into a billing claim is false. This fires
+         * BEFORE install_skills ever runs, so asserting a specific cause here pre-empts its
+         * own accurate, already-bucketed reason. Defer to that instead of guessing.
+         *
+         * The prefix is unchanged: `classifyToolErrorClass` keys 'tool_unavailable' off it.
+         */
+        const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`
+          + ` If install_skills cannot install it, STOP — do NOT guess or assume why (it is not always a billing/subscription limit). Relay install_skills' own response message to the user exactly as it states the reason.`
+          + ` Do NOT run a different tool and present its output as this tool's result: reporting that a specific check ran, or passed, is a claim about THAT check, and substituting other data makes the claim false.`;
         appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
         continue;
-      }
-
-      if (toolCall.function.name === 'install_skills') {
-        skillsUpdated = true;
       }
 
       const initialPolicyDecision = ports.evaluateAgentToolPolicy({
@@ -743,6 +858,10 @@ export async function executePreparedTools(
         isSharedSession: isInteractiveShare,
         enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
       });
+
+      if (toolCall.function.name === 'install_skills') {
+        skillsUpdated = true;
+      }
 
       const inputSchema = ports.getToolInputSchema(toolCall.function.name);
       const contractResult = ports.validateAndRepairToolArgs({
@@ -784,6 +903,78 @@ export async function executePreparedTools(
         const errorMsg = `Tool "${toolCall.function.name}" was blocked by Agent Tool Gateway policy: ${policyDecision.flags.map((flag) => flag.message).join(' ')}`;
         appendPreflightToolFailure(toolCall, preparedFunctionArgs, errorMsg, JSON.stringify({ error: errorMsg, policy: policyDecision }), policyDecision);
         continue;
+      }
+
+      if (toolCall.function.name === 'install_skills') {
+        /*
+         * ENG-1945: a model very commonly emits install_skills AND a tool that skill
+         * gates in the SAME batch ("install the browser skill, then navigate"). Phase 2
+         * below runs every prepared call's tool ONLY after this whole Phase-1 loop
+         * finishes gating every call in the batch against `allowedToolNames` — so the
+         * sibling navigate/snapshot/etc. call, appearing later in this same array, was
+         * rejected as "not available" a beat before the install it depends on actually
+         * took effect.
+         *
+         * Run install_skills HERE instead — once, for real, through the gateway — the
+         * moment it has cleared every preflight gate every other tool call clears before
+         * reaching Phase 2 (schema validation/repair above, policy allow-check just
+         * above). That ordering matters, not just for consistency: running it any
+         * earlier (e.g. on the raw pre-repair args, before the policy gate) could
+         * execute — and mutate session state via addAssociatedSkills — for a call this
+         * same loop iteration goes on to preflight-reject a moment later, leaving the
+         * model told the call never happened while it actually did.
+         *
+         * The outcome is cached by tool_call_id in `eagerToolOutcomes` and Phase 2's
+         * runOne replays it instead of executing install_skills a SECOND time for the
+         * identical call. A second independent execution is not just redundant, it is
+         * actively unsafe for the repeated-failure breaker: a rejected install (bad
+         * skillId, unentitled skill) classifies as a FAST_TRIP error class
+         * (skill_install_refused/subscription_blocked/invalid_args — 2-failure
+         * threshold), and the gateway's own failure counter is keyed by run+tool+scope,
+         * not by tool_call_id — so two executions of ONE model-emitted call would
+         * record two failures and trip the breaker after a single turn instead of two,
+         * silently halving the model's real retry budget and replacing install_skills'
+         * accurate, bucketed rejection reason with a generic "stop retrying" message on
+         * what the model experiences as its very next attempt.
+         */
+        const argsKey = stableStringify(preparedFunctionArgs);
+        let outcome = eagerInstallSkillsByArgs.get(argsKey);
+        if (!outcome) {
+          // Same execute_tool span shape runOne (Phase 2) creates for every other tool —
+          // this eager call is install_skills' only real execution now, so it must be the
+          // one carrying the span, or the tool would vanish from OTel entirely.
+          const span = startRunChildSpan(agentRuntimeRunId, `${SPAN_EXECUTE_TOOL_PREFIX} install_skills`, {
+            [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OP_EXECUTE_TOOL,
+            [ATTR_GEN_AI_TOOL_NAME]: 'install_skills',
+            [ATTR_SESSION_ID]: sessionId,
+          });
+          outcome = await ports.executeAgentToolThroughGateway({
+            toolName: 'install_skills',
+            args: preparedFunctionArgs,
+            policyDecision,
+            runId: agentRuntimeRunId,
+            budgetScopeId: sessionId,
+            execute: () => ports.executePreparedAgentTool({
+              llmModel,
+              toolName: 'install_skills',
+              functionArgs: preparedFunctionArgs,
+              userId,
+              sessionId,
+              mockMode,
+              isDelegatedAccess,
+              isUnattendedRun,
+            }),
+          });
+          endExecuteToolSpan(span, outcome.status === 'error'
+            ? { errorClass: classifyToolErrorClass(outcome.error), error: outcome.error }
+            : {});
+        }
+        eagerInstallSkillsByArgs.set(argsKey, outcome);
+        eagerToolOutcomes.set(toolCall.id, outcome);
+        const result = outcome.status === 'success' ? outcome.result : undefined;
+        if (Array.isArray(result?.installedToolNames)) {
+          result.installedToolNames.forEach((name: string) => allowedToolNames.add(name));
+        }
       }
 
       if (
@@ -897,6 +1088,13 @@ export async function executePreparedTools(
   let toolResults: DispatchToolResult[];
 
   const runOne = async (toolCall: any, functionArgs: any, policyDecision: AgentToolPolicyDecision): Promise<ToolExecOutcome> => {
+    // ENG-1945 follow-up: install_skills already ran (for real, through the gateway) in
+    // Phase 1 above so a sibling call gated by it could unlock within the same batch —
+    // replay that outcome instead of executing it again. See the Phase-1 eager block for
+    // why a second execution is unsafe, not merely redundant.
+    const cachedOutcome = eagerToolOutcomes.get(toolCall.id);
+    if (cachedOutcome) return cachedOutcome;
+
     // OTel `execute_tool` span (ENG-141) — observability only; the gateway call,
     // its outcome shape, and error propagation are untouched.
     const span = startRunChildSpan(agentRuntimeRunId, `${SPAN_EXECUTE_TOOL_PREFIX} ${toolCall.function.name}`, {
@@ -921,6 +1119,7 @@ export async function executePreparedTools(
           socketEmit: ports.socketEmit,
           screenshotUrl,
           isDelegatedAccess,
+          isUnattendedRun,
           // Long-render tools (compose_video) read this to hand off before the run's hard
           // wall-clock timeout rather than blocking until killed with no asset (ENG-123).
           renderDeadlineMs: mediaGenerationDeadlineMs,
@@ -932,6 +1131,10 @@ export async function executePreparedTools(
           // a soft media-only budget, so it both under-budgets the work and, once it has
           // passed, would report no time left while the turn still has minutes.
           turnHardCapMs,
+          // ENG-1945 follow-up: the server's own id for the run THIS call is executing
+          // within, so a tool (report_product_issues) can verify a same-turn claim against
+          // ground truth instead of requiring the model to know/supply an opaque id.
+          agentRuntimeRunId,
         }),
       });
       endExecuteToolSpan(span, outcome.status === 'error'
@@ -1201,15 +1404,28 @@ export async function executePreparedTools(
         }
       }
 
-      // For playwright screenshots, pass the image back to the LLM as a vision input.
+      // For playwright screenshots, pass the image back to the LLM as a vision input —
+      // but only to a model that can actually take one.
+      //
+      // ENG-2132: this used to gate on `!isGeminiModel` alone, added in a0e5523ce for a
+      // DIFFERENT, Gemini-specific reason (its OpenAI-compat endpoint 400s on `image_url`
+      // inside a tool-role message regardless of vision capability). That condition
+      // silently assumed every OTHER model accepts an inline image, which is false for a
+      // model with no verified vision support at all — openrouter/deepseek/deepseek-v4-flash
+      // has no `supportsVision` entry in LLM_MODEL_REGISTRY, so OpenRouter has no endpoint
+      // for it that accepts image input, and the next LLM call 404s with "No endpoints
+      // found that support image input" (prod session ffe0e1ad-16f4-4ca6-ada2-3bc87c3d3761,
+      // 2026-09-23). Use the SAME registry flag getVisionModelOptions already trusts for
+      // this, rather than inferring capability from "isn't Gemini".
       let toolContent: any;
       const isGeminiModel = llmModel.startsWith('gemini-');
-      if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).dataUrl && !isGeminiModel) {
+      const modelSupportsInlineScreenshot = !isGeminiModel && LLM_MODEL_REGISTRY[llmModel]?.supportsVision === true;
+      if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).dataUrl && modelSupportsInlineScreenshot) {
         toolContent = [
           { type: 'text', text: 'Screenshot captured. Analyze the image below to verify the result visually. Do not include the raw image URL or data URI in your response to the user.' },
           { type: 'image_url', image_url: { url: (processedResult as any).dataUrl, detail: 'high' } },
         ];
-      } else if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).screenshotUrl && isGeminiModel) {
+      } else if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).screenshotUrl) {
         toolContent = `Screenshot captured. URL: ${(processedResult as any).screenshotUrl}\n\n${ports.extractToolContent(result)}`;
       } else {
         toolContent = ports.extractToolContent(result);
@@ -1362,11 +1578,38 @@ export async function executePreparedTools(
       // classifier the telemetry uses — so a terminal failure (auth, provider
       // rejection, schema reject) carries a hard stop signal instead of inviting
       // a retry spiral.
+      //
+      // ENG-2086: unlike the success path above, this branch had no size guard at
+      // all. A tool can fail by echoing its own (unbounded) result back inside
+      // `error` — call_google_ads_reporting_api's serving_chain mode does exactly
+      // this, JSON.stringify-ing the full campaign/ad-group/keyword tree into
+      // `error` whenever the account isn't fully READY/DELIVERING. For a large
+      // account that reached multiple MB, went out to the LLM provider unbounded
+      // (this branch is on the hot path to the next request, not just persistence),
+      // and OpenRouter/Gemini 400'd on the oversized request — surfaced to the user
+      // as an opaque "please rephrase" (prod session d02669e9-c3b8-4b65-ab51-a9c045c63b65,
+      // 2026-09-22).
+      //
+      // Cap the FINAL assembled content, not the raw message: formatToolError's
+      // per-tool fix text and appendRetryabilityGuidance's verdict line are each
+      // appended AFTER this point, so bounding only the raw message would still
+      // let their added text push the actual wire content past maxToolContentSize.
       const errMsg = error instanceof Error ? error.message : String(error);
-      const errorContent = appendRetryabilityGuidance(
+      const formattedError = appendRetryabilityGuidance(
         ports.formatToolError(toolCall.function.name, errMsg),
         classifyToolErrorClass(error),
       );
+      let errorContent = formattedError;
+      if (formattedError.length > maxToolContentSize) {
+        const notice = `[Error message truncated for size — original length: ${formattedError.length} chars]`;
+        // Reserve room for the notice AND the '\n\n' separator sealTruncatedPayload
+        // inserts before it — otherwise appending the notice after slicing to the
+        // full cap pushes the sealed result past maxToolContentSize (CodeRabbit,
+        // PR #3039). Mirrors messageSizeGuard.ts's fitContent, which reserves the
+        // same way for the DynamoDB persistence cap.
+        const sliceBudget = Math.max(0, maxToolContentSize - notice.length - 2);
+        errorContent = sealTruncatedPayloadWithNotice(formattedError.substring(0, sliceBudget), notice);
+      }
       messages.push({
         tool_call_id: toolCall.id,
         role: 'tool',

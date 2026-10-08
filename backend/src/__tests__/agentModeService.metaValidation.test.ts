@@ -11,6 +11,7 @@ jest.mock('../services/metaService', () => {
   return {
     ...actual,
     metaService: {
+      getAdAccountCurrency: jest.fn().mockResolvedValue('USD'),
       createCampaign: jest.fn(),
       updateCampaign: jest.fn(),
       deleteCampaign: jest.fn(),
@@ -28,6 +29,7 @@ jest.mock('../services/metaService', () => {
       updateAd: jest.fn(),
       deleteAd: jest.fn(),
       listAds: jest.fn(),
+      getDatasetEventStats: jest.fn(),
       listCustomAudiences: jest.fn(),
       createCustomAudience: jest.fn(),
       uploadCustomAudienceUsers: jest.fn(),
@@ -56,13 +58,13 @@ jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     getMessagesFromMessagesTable: jest.fn().mockResolvedValue([]),
     getChatSession: jest.fn().mockResolvedValue(null),
-    updateSessionAskUserQuestion: jest.fn().mockResolvedValue({}),
+    updateSessionObjectiveConfirmation: jest.fn().mockResolvedValue(undefined),
     createChatSession: jest.fn().mockResolvedValue({ sessionId: 'auto-created-session' }),
   },
 }));
 
 import { AgentModeService } from '../services/agentModeService';
-import { metaService } from '../services/metaService';
+import { metaService, META_ACCOUNT_SCOPE_REFUSAL_MARKER } from '../services/metaService';
 import { userDb } from '../services/db';
 import { chatbotDb } from '../services/chatbotService';
 import { toolResultError } from '../utils/toolResultError';
@@ -109,6 +111,13 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
     service = new AgentModeService();
     jest.clearAllMocks();
     (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+    // ENG-1635/1644 gap 5: params.confirm=true is no longer independently
+    // sufficient to pass the write-confirmation gate — a real grant is
+    // required. This file is about param validation/error enrichment, not
+    // the grant mechanism itself (that's metaWriteManifestConsent.test.ts),
+    // so stub the grant true by default; the two tests that specifically
+    // exercise the gate's own confirm=true behavior override this locally.
+    jest.spyOn(service as any, 'claimMetaWriteManifestGrant').mockResolvedValue({ granted: true, digest: 'stub-digest' });
   });
 
   // ==================== Pre-validation via callMetaMarketingApi ====================
@@ -190,16 +199,15 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
     });
 
     it('rejects a malformed spend_cap on CAMPAIGN UPDATE before writing to Meta', async () => {
-      // UPDATE forwards params verbatim, so without this guard a fractional cap reaches
-      // Meta and comes back as an opaque "Invalid parameter".
+      // Reject negative major-unit caps before reaching Meta.
       const result = await callApi(service, 'CAMPAIGN', 'UPDATE', {
         campaign_id: 'camp_1',
-        params: { spend_cap: 1000.5 },
+        params: { spend_cap: -1000.5 },
       });
 
       expect(result.success).toBe(false);
       expect(result.error).toMatch(/^PARAM_VALIDATION_ERROR/);
-      expect(result.message).toMatch(/positive whole number of cents/i);
+      expect(result.message).toMatch(/positive amount/i);
       expect(metaService.updateCampaign).not.toHaveBeenCalled();
     });
 
@@ -312,26 +320,29 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
 
       expect(result.success).toBe(true); // halting-card responses use success:true (see ask_user_question tool)
       expect(result.awaitingUserConfirmation).toBe(true);
-      expect(result.type).toBe('ask_user_question');
-      expect(result.recommendedOptionId).toBe('leads'); // OUTCOME_LEADS default, no account preference set
+      expect(result.type).toBe('ask_user_question'); // legacy tag kept for calling-convention continuity (ENG-1635/1644)
+      // ENG-1635/1644: the gate no longer writes pendingUserQuestion synchronously or
+      // returns a top-level recommendedOptionId — it returns a bare halt marker
+      // (questionDeckPayload) built through the same deck-of-one mechanism
+      // present_question_deck uses; see agentModeService.metaObjectiveGate.test.ts's
+      // dedicated coverage of this shape for the full picture.
+      expect(result.questionDeckPayload).toHaveLength(1);
+      const leadsOption = result.questionDeckPayload[0].options.find((o: any) => o.id === 'leads');
+      expect(leadsOption?.recommended).toBe(true); // OUTCOME_LEADS default, no account preference set
       expect(metaService.createCampaign).not.toHaveBeenCalled();
-      expect(chatbotDb.updateSessionAskUserQuestion).toHaveBeenCalled();
+      // PR2: updateSessionAskUserQuestion (the old sync-persist method this
+      // once asserted "not called" against) is deleted entirely now.
     });
 
-    it('ALLOWS a CAMPAIGN CREATE whose objective was already answered via ask_user_question (kind meta_objective)', async () => {
+    it('ALLOWS a CAMPAIGN CREATE whose objective was already confirmed this session (ENG-1635/1644 PR2: objectiveConfirmations)', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
         sessionId: 'session-1',
-        pendingUserQuestion: {
-          questionId: 'q-1',
-          question: 'Which objective?',
-          options: [{ id: 'sales', label: 'Sales', consequence: 'x', recommended: true, why: 'y', payload: { objective: 'OUTCOME_SALES' } }],
-          recommendedOptionId: 'sales',
-          immutable: true,
-          allowEmmaDecide: true,
-          kind: 'meta_objective:123456789|test|||NONE',
-          status: 'answered',
-          createdAt: '2026-07-24T00:00:00.000Z',
-          answer: { optionId: 'sales', delegated: false, answeredBy: 'user', at: '2026-07-24T00:01:00.000Z' },
+        objectiveConfirmations: {
+          'meta_objective:123456789|test|||NONE': {
+            objective: 'OUTCOME_SALES',
+            answeredBy: 'user',
+            at: '2026-07-24T00:01:00.000Z',
+          },
         },
       });
       (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_456', name: 'Test' });
@@ -374,10 +385,18 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(result.target.ad_set).toContain('Maintenance Ad Set');
     });
 
-    it('executes AD CREATE when confirm=true and strips the flag before dispatch', async () => {
+    it('a granted AD CREATE executes and strips confirm before dispatch — confirm itself grants nothing (gap 5)', async () => {
+      // ENG-1635/1644 gap 5: confirm=true is included here to prove it is
+      // stripped and inert, NOT because it is what authorizes this call —
+      // the top-level beforeEach's claimMetaWriteManifestGrant stub is what
+      // actually grants it. See the next test for confirm=true with no grant.
       (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'ad_new', name: 'New Maintenance Ad' });
 
       const result = await callApi(service, 'AD', 'CREATE', {
+        // ENG-1635/1644 gap 5: the grant check only runs at all when a
+        // sessionId is present (no session -> always halt, fail-closed) — a
+        // stubbed-granted spy that's never reached still halts.
+        sessionId: 'session-1',
         ad_set_id: 'adset_1',
         params: { name: 'New Maintenance Ad', creative_id: 'creative_1', confirm: true }
       });
@@ -388,6 +407,20 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       // confirm must never leak into the params passed to metaService.
       const paramsArg = (metaService.createAd as jest.Mock).mock.calls[0][2];
       expect(paramsArg.confirm).toBeUndefined();
+    });
+
+    it('gap 5: confirm=true with NO grant still halts — the raw flag is never independently sufficient', async () => {
+      jest.spyOn(service as any, 'claimMetaWriteManifestGrant').mockResolvedValue({ granted: false, digest: 'stub-digest' });
+      (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'ad_new', name: 'New Maintenance Ad' });
+
+      const result = await callApi(service, 'AD', 'CREATE', {
+        sessionId: 'session-1', // with a session present, this genuinely exercises the false-grant path, not just "no session halts"
+        ad_set_id: 'adset_1',
+        params: { name: 'New Maintenance Ad', creative_id: 'creative_1', confirm: true }
+      });
+
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.createAd).not.toHaveBeenCalled();
     });
 
     it('blocks a VALID AD UPDATE without confirm and does not call metaService.updateAd', async () => {
@@ -449,6 +482,117 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(result.message).toContain('adset_999');
     });
 
+    /*
+     * A tenancy refusal must BLOCK the write, not soften the prompt.
+     *
+     * The resolvers above are wrapped in a best-effort `catch` written for a transient Graph
+     * blip — and the ad-account ownership check added to getAd/getAdSet/getCampaign throws
+     * through that same catch. Swallowed as a hiccup, "this node belongs to another ad account"
+     * degraded the prompt to `ID <id>` and the write went on to confirmation, where a user
+     * approval is exactly what unlocks the confirmed replay. A guard whose only effect is a
+     * vaguer prompt is not a guard.
+     *
+     * The refusal message is built from the marker the real guard throws
+     * (META_ACCOUNT_SCOPE_REFUSAL_MARKER, imported rather than retyped), so a reworded refusal
+     * fails here rather than silently reopening the path. metaService.singleNodeScope.test.ts
+     * pins the other half: that the real thrown error carries this marker.
+     */
+    describe('a node in another ad account blocks the write instead of degrading the prompt', () => {
+      const tenancyRefusal = () =>
+        new Error(
+          `The requested ad ${META_ACCOUNT_SCOPE_REFUSAL_MARKER}. ` +
+          `If it belongs to a different ad account, select that account and try again.`,
+        );
+
+      it('does not ask the user to approve a write to an out-of-scope ad', async () => {
+        (metaService.getAd as jest.Mock).mockRejectedValue(tenancyRefusal());
+
+        const result = await callApi(service, 'AD', 'UPDATE', {
+          ad_id: 'ad_from_another_account',
+          params: { status: 'PAUSED' },
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.requiresConfirmation).toBeUndefined();
+        expect(result.awaitingUserConfirmation).toBeUndefined();
+        expect(result.confirmationPrompt).toBeUndefined();
+        expect(result.error).toMatch(/^ACCOUNT_SCOPE_REFUSED/);
+        expect(metaService.updateAd).not.toHaveBeenCalled();
+      });
+
+      it('blocks a DELETE the same way, not only an UPDATE', async () => {
+        (metaService.getAd as jest.Mock).mockRejectedValue(tenancyRefusal());
+
+        const result = await callApi(service, 'AD', 'DELETE', { ad_id: 'ad_from_another_account' });
+
+        expect(result.success).toBe(false);
+        expect(result.requiresConfirmation).toBeUndefined();
+        expect(metaService.deleteAd).not.toHaveBeenCalled();
+      });
+
+      it('blocks when the refused node is the AD SET a create would publish into', async () => {
+        // The refusal can come from any resolver, not just the one naming the write's own id.
+        (metaService.getAdSet as jest.Mock).mockRejectedValue(tenancyRefusal());
+
+        const result = await callApi(service, 'AD', 'CREATE', {
+          ad_set_id: 'adset_from_another_account',
+          params: { name: 'Ad', creative_id: 'creative_1' },
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.requiresConfirmation).toBeUndefined();
+        expect(metaService.createAd).not.toHaveBeenCalled();
+      });
+
+      it('blocks a CAMPAIGN UPDATE whose campaign is in another ad account', async () => {
+        (metaService.getCampaign as jest.Mock).mockRejectedValue(tenancyRefusal());
+
+        const result = await callApi(service, 'CAMPAIGN', 'UPDATE', {
+          campaign_id: 'camp_from_another_account',
+          params: { status: 'PAUSED' },
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.requiresConfirmation).toBeUndefined();
+        expect(metaService.updateCampaign).not.toHaveBeenCalled();
+      });
+
+      it('the refusal is not an oracle: no node name, no owning account, no node id', async () => {
+        (metaService.getAd as jest.Mock).mockRejectedValue(tenancyRefusal());
+
+        const result = await callApi(service, 'AD', 'UPDATE', {
+          ad_id: 'ad_from_another_account',
+          params: { status: 'PAUSED' },
+        });
+
+        // The whole reason assertOwnedByAccount withholds these — relaying them through the
+        // confirmation gate would answer the question the block exists to refuse.
+        const text = `${result.message} ${result.error}`;
+        expect(text).not.toContain('ad_from_another_account');
+        expect(text).not.toMatch(/owned by/i);
+        // The SELECTED account is the one the caller already supplied, so naming it discloses
+        // nothing — and without it the model cannot tell the user what to switch away from.
+        expect(result.message).toContain('123456789');
+      });
+
+      it('a TRANSIENT lookup failure still degrades to a prompt rather than blocking', async () => {
+        // The behaviour the best-effort catch was written for, and the reason the two are told
+        // apart instead of the catch simply being removed.
+        (metaService.getAd as jest.Mock).mockRejectedValue(new Error('Meta unreachable'));
+        (metaService.getAdSet as jest.Mock).mockRejectedValue(new Error('Meta unreachable'));
+        (metaService.getCampaign as jest.Mock).mockRejectedValue(new Error('Meta unreachable'));
+
+        const result = await callApi(service, 'AD', 'UPDATE', {
+          ad_id: 'ad_1',
+          params: { status: 'PAUSED' },
+        });
+
+        expect(result.requiresConfirmation).toBe(true);
+        expect(result.error).toBeUndefined();
+        expect(metaService.updateAd).not.toHaveBeenCalled();
+      });
+    });
+
     it('does NOT gate read-only AD LIST', async () => {
       (metaService.listAds as jest.Mock).mockResolvedValue([]);
 
@@ -502,7 +646,7 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
     });
 
     it('blocks AD_SET UPDATE without confirm and does not call metaService.updateAdSet', async () => {
-      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint' });
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint', daily_budget: '900000' }); // ENG-2279: prior budget read; same-size change is 'normal'
       (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
 
       const result = await callApi(service, 'AD_SET', 'UPDATE', {
@@ -589,13 +733,18 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(typeof result.confirmationPrompt).toBe('string');
       expect(result.confirmationPrompt).toContain('Maintenance Ad Set');
       expect(result.confirmationPrompt).toContain('Maintenance Campaign');
-      expect(result.confirmationPrompt.toLowerCase()).toContain('confirm');
+      // ENG-1635/1644 gap 5: must ask for approval through a review card, never invite a
+      // typed "confirm"/"yes" reply — that flag is fully inert now (see the sibling
+      // `message` field's own "Do NOT re-call... with params.confirm=true" instruction).
+      expect(result.confirmationPrompt.toLowerCase()).toContain('approval');
+      expect(result.confirmationPrompt.toLowerCase()).not.toContain('reply "yes"');
     });
 
-    it('does NOT set awaitingUserConfirmation when confirm=true (gate bypassed, executes)', async () => {
+    it('does NOT set awaitingUserConfirmation on a GRANTED write (gap 5: confirm=true itself grants nothing — the top-level beforeEach stub does)', async () => {
       (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'ad_new', name: 'New Maintenance Ad' });
 
       const result = await callApi(service, 'AD', 'CREATE', {
+        sessionId: 'session-1', // gap 5: the grant check only runs at all with a sessionId present
         ad_set_id: 'adset_1',
         params: { name: 'New Maintenance Ad', creative_id: 'creative_1', confirm: true }
       });
@@ -698,7 +847,7 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(out).toContain('AD: pause Prospecting Ad');
       expect(out).toContain('AD_SET: pause Prospecting Ad Set');
       expect(out).toContain('CAMPAIGN: pause Prospecting Campaign');
-      expect(out.match(/Reply "yes" \/ "confirm"/g)?.length).toBe(1);
+      expect(out.match(/This needs your explicit approval through a review card/g)?.length).toBe(1);
     });
 
     it('batches multiple confirmations under ONE intro/footer using confirmationDetail', () => {
@@ -720,7 +869,7 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(out).not.toContain('FULL PROMPT 1');
       expect(out).not.toContain('FULL PROMPT 2');
       // Footer appears exactly once.
-      expect(out.match(/Reply "yes" \/ "confirm"/g)?.length).toBe(1);
+      expect(out.match(/This needs your explicit approval through a review card/g)?.length).toBe(1);
     });
 
     it('ignores requiresConfirmation-only results (delete_leads / work-plan stay un-halted)', () => {
@@ -932,6 +1081,12 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
 
     beforeEach(() => {
       (metaService.createAdSet as jest.Mock).mockResolvedValue({ id: 'adset_new', name: 'Ad Set' });
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_new' });
+      (metaService.getDatasetEventStats as jest.Mock).mockResolvedValue({
+        id: 'px_1',
+        name: 'Pixel',
+        event_stats: [{ event: 'Lead', last_30d_count: 12 }]
+      });
     });
 
     it('defaults destination_type=WEBSITE for a website traffic goal (LINK_CLICKS)', async () => {
@@ -968,6 +1123,74 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       });
       const calledWith = (metaService.createAdSet as jest.Mock).mock.calls[0][2];
       expect(calledWith.destination_type).toBe('ON_AD');
+    });
+
+    it('adds no optimization-event warning when the selected pixel reports the chosen event', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_LEADS' });
+      const result = await service.createMetaAdsAdSet('user123', {
+        ...websiteGoalParams,
+        optimization_goal: 'OFFSITE_CONVERSIONS',
+        promoted_object: { pixel_id: 'px_1', custom_event_type: 'LEAD' }
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.optimisationEventWarning).toBeUndefined();
+      expect(metaService.getDatasetEventStats).toHaveBeenCalledWith('px_1', 'mock-access-token');
+    });
+
+    it('surfaces an unknown selected optimization-event health warning without failing the write', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_LEADS' });
+      (metaService.getDatasetEventStats as jest.Mock).mockRejectedValueOnce(new Error('Graph stats unavailable'));
+
+      const result = await service.createMetaAdsAdSet('user123', {
+        ...websiteGoalParams,
+        optimization_goal: 'OFFSITE_CONVERSIONS',
+        promoted_object: { pixel_id: 'px_1', custom_event_type: 'LEAD' }
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.optimisationEventWarning).toContain('unknown');
+      expect(result.optimisationEventWarning).toContain('Lead');
+      expect(result.warning).toBe(result.optimisationEventWarning);
+    });
+
+    it('does not claim last-30-day event health when Meta returns only an unwindowed count', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_LEADS' });
+      (metaService.getDatasetEventStats as jest.Mock).mockResolvedValueOnce({
+        id: 'px_1',
+        name: 'Pixel',
+        event_stats: [{ event: 'Lead', count: 12 }]
+      });
+
+      const result = await service.createMetaAdsAdSet('user123', {
+        ...websiteGoalParams,
+        optimization_goal: 'OFFSITE_CONVERSIONS',
+        promoted_object: { pixel_id: 'px_1', custom_event_type: 'LEAD' }
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.optimisationEventWarning).toContain('unknown');
+      expect(result.optimisationEventWarning).toContain('explicit last-30-day count');
+      expect(result.optimisationEventWarning).not.toContain('in the last 30 days');
+    });
+
+    it('warns missing when explicit last-30-day stats omit the selected optimization event', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_LEADS' });
+      (metaService.getDatasetEventStats as jest.Mock).mockResolvedValueOnce({
+        id: 'px_1',
+        name: 'Pixel',
+        event_stats: [{ event: 'Purchase', last_30d_count: 4 }]
+      });
+
+      const result = await service.createMetaAdsAdSet('user123', {
+        ...websiteGoalParams,
+        optimization_goal: 'OFFSITE_CONVERSIONS',
+        promoted_object: { pixel_id: 'px_1', custom_event_type: 'LEAD' }
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.optimisationEventWarning).toContain('Lead');
+      expect(result.optimisationEventWarning).toContain('in the last 30 days');
     });
   });
 });

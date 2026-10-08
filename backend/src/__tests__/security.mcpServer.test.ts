@@ -119,16 +119,17 @@ jest.mock('../services/db', () => ({
 import { createMcpServer, mcpToolRegistry, McpSessionContext } from '../mcp/server/mcpServerCore';
 import { McpToolRegistry } from '../mcp/server/registry';
 import { mcpFetch } from '../mcp/server/httpClient';
+import { cronJobRegistry } from '../utils/cronJobRegistry';
 
 const INTERNAL_TOOL_NAMES = [
   'you_search_web',
-  'generate_image',
   'send_email',
   'save_file',
   'create_blog_article',
   'publish_blog_article',
   'install_skills',
   'list_available_skills',
+  'post_on_account',
 ];
 
 // ─── Test suites ───────────────────────────────────────────────────────────
@@ -199,7 +200,7 @@ describe('MCP Server Security', () => {
     // ENG-974 replaced the test that used to live here. It asserted that an
     // external client CAN execute internal tools by name, on the rationale that
     // "the real defense is that external clients never discover internal tool
-    // names". The hidden names include `send_email` and `generate_image`, so the
+    // names". The hidden names include `send_email` and `save_file`, so the
     // secret was guessable and the defence was obscurity.
     //
     // Harsha's decision (2026-08-08) was to enforce on the OUTBOUND-ACTION subset
@@ -273,11 +274,36 @@ describe('MCP Server Security', () => {
       spy.mockRestore();
     });
 
+    it('A-019: keeps the CallTool handler registered as in-flight until execution settles', async () => {
+      createMcpServer('test-server', {
+        agentUserId: 'external-user',
+        isInternal: false,
+      } as McpSessionContext);
+      expect(callToolHandler).not.toBeNull();
+
+      let release!: (value: any) => void;
+      const pending = new Promise((resolve) => { release = resolve; });
+      const spy = jest.spyOn(mcpToolRegistry, 'execute').mockReturnValue(pending as any);
+
+      const responsePromise = callToolHandler!({
+        params: { name: 'slow_tool', arguments: {} },
+      } as any);
+
+      await Promise.resolve();
+      expect(cronJobRegistry.snapshot()).toMatchObject({ mcpToolCall: 1 });
+
+      release({ ok: true });
+      await responsePromise;
+      expect(cronJobRegistry.snapshot().mcpToolCall).toBeUndefined();
+      spy.mockRestore();
+    });
+
     it('ENG-974: a merely-hidden tool is still callable by name — deliberate, scoped', async () => {
-      // NOT a bug and NOT an oversight. Cost-driven internal tools (generate_image,
-      // the searches, save_file) stay callable because ENG-973 bounds them by
-      // metering the /api/emma/* routes they self-call. If that ever stops being
-      // true, this test is the thing that should change.
+      // NOT a bug and NOT an oversight. Cost-driven internal tools (the
+      // searches, save_file) stay callable because ENG-973 bounds them by
+      // metering the /api/emma/* routes they self-call. generate_image is
+      // listed for external MCP and still metered on that route. If that
+      // ever stops being true, this test is the thing that should change.
       const registry = new McpToolRegistry();
       const mockFn = jest.fn().mockResolvedValue({ ok: true });
       registry.register({
@@ -292,14 +318,23 @@ describe('MCP Server Security', () => {
       expect(mockFn).toHaveBeenCalled();
     });
 
-    it('ENG-974: the four outbound-action tools are actually marked in the real registry', () => {
+    it('ENG-974: the outbound-action tools are actually marked in the real registry', () => {
       // Guards against the enforcement being real but never applied to anything.
-      const OUTBOUND = ['send_email', 'publish_blog_article', 'create_blog_article', 'install_skills'];
+      const OUTBOUND = ['send_email', 'publish_blog_article', 'create_blog_article', 'install_skills', 'post_on_account'];
       for (const name of OUTBOUND) {
         const tool = mcpToolRegistry.getTool(name);
         expect(tool).toBeDefined();
         expect(tool!.internalOnly).toBe(true);
       }
+    });
+
+    it('generate_image is listed for external MCP clients and is not internalOnly', () => {
+      const externalNames = mcpToolRegistry.getToolDefinitions().map((d: any) => d.name);
+      expect(externalNames).toContain('generate_image');
+      const tool = mcpToolRegistry.getTool('generate_image');
+      expect(tool).toBeDefined();
+      expect(tool!.internal).not.toBe(true);
+      expect(tool!.internalOnly).not.toBe(true);
     });
   });
 

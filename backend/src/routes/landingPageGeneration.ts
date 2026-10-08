@@ -54,9 +54,12 @@ import {
 import { injectGtmIntoLayout, verifyGtmInjection } from "../utils/gtmInjection";
 import { injectGoogleAdsIntoLayout, verifyGoogleAdsInjection } from "../utils/googleAdsInjection";
 import { injectPixelIntoLayout, verifyPixelInjection } from "../utils/pixelInjection";
+import { SessionTrackingError, disableSessionTrackingForPage, enableSessionTrackingForPage } from "../services/sessionTrackingService";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { MISSING_BRAND_LOGO_ERROR } from "../services/agentMode/brandLogo";
+import { isSessionList, SESSION_LIST_LEAD_CAPTURE_ERROR } from "../utils/sessionList";
 import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
+import { isExternalLandingPageRecord } from "../services/externalLandingPageCatalog";
 import { verifyLanderLiveMapping } from "../services/landerLiveMappingCheck";
 import { assertOwnedMetaPixel } from "../services/metaAccountCredentials";
 
@@ -621,6 +624,10 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       if (!(await crmDb.canOrgMemberAccessList(userId, explicitList))) {
         return res.status(403).json({ error: `lead_list_id "${lead_list_id}" is not accessible to you` });
       }
+      // ENG-2323: a session (telemetry) list is never a page's lead list.
+      if (isSessionList(explicitList)) {
+        return res.status(400).json({ error: SESSION_LIST_LEAD_CAPTURE_ERROR });
+      }
     }
 
     const pageName = name || prompt.slice(0, 60);
@@ -721,7 +728,15 @@ router.post("/generated/:id/deploy", rateLimiter, async (req, res: Response) => 
     res.json(result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error deploying:", error);
-    const status = error.message?.includes("not found") ? 404 : 500;
+    // ENG-2083: a page that is already deployed (or otherwise in a non-deployable state) is
+    // a 409, not a 500 — the request is invalid, the server is fine, and retrying it can
+    // never succeed. Checked by `code` rather than `instanceof` so it survives re-wrapping.
+    const status =
+      error?.code === "LP_NOT_DEPLOYABLE"
+        ? 409
+        : error.message?.includes("not found")
+        ? 404
+        : 500;
     res.status(status).json({ error: error.message || "Failed to deploy" });
   }
 });
@@ -816,10 +831,38 @@ router.get("/generated", async (req, res: Response) => {
       // Prefer a verified custom domain over a managed subdomain; break ties by
       // most-recently-updated.
       const bestByOwnerProject = new Map<string, CustomDomainRecord>();
-      const rank = (d: CustomDomainRecord) => (d.type === "custom" ? 1 : 0);
+      // Three tiers, not two. A verified custom domain is what the customer wants shown; a
+      // managed subdomain is the working fallback; a custom domain that is not verified yet
+      // cannot serve at all and must never be picked.
+      //
+      // Ranking on type alone let a `pending_verification` custom domain win. Since the
+      // reachability sweep deliberately does not probe unverified domains, that winning row
+      // could never carry a verdict — so a managed subdomain confirmed UNREACHABLE went
+      // unreported for as long as a custom domain sat half-configured on the same project, and
+      // the page's URL was rewritten to a host with no DNS. Demoting it to the subdomain's own
+      // tier is not enough either: the tie then breaks on `updatedAt`, and the freshly-added
+      // custom domain is always the newer row.
+      //
+      // NOT the same ordering as `getProjectDomain`, despite the similar shape: that helper
+      // returns active-custom → pending-custom → null and never considers subdomains at all,
+      // so it still answers with the pending custom exactly where this ranking prefers the
+      // working subdomain. Deliberate — it answers "which custom domain is attached", this
+      // answers "what should we show the customer".
+      const rank = (d: CustomDomainRecord) => {
+        if (d.type === "custom") return d.status === "active" ? 2 : 0;
+        return 1; // managed subdomain — addSubdomain writes these active unconditionally
+      };
       for (const [ownerId, domains] of domainsByOwner) {
         for (const d of domains) {
           if (!d.vercelProjectId) continue;
+          /*
+           * `rank` is a comparator, not a filter, and the `!existing` seed below is
+           * unconditional — so rank 0 means "loses a comparison", never "is rejected". Skip
+           * these outright: a project whose only attached row is an unverified custom domain
+           * has nothing to lose to, and would otherwise be adopted as the page's reported host
+           * despite having no DNS. That is the failure this ranking exists to prevent.
+           */
+          if (rank(d) === 0) continue;
           const key = `${ownerId}::${d.vercelProjectId}`;
           const existing = bestByOwnerProject.get(key);
           if (
@@ -836,6 +879,22 @@ router.get("/generated", async (req, res: Response) => {
         if (!page.vercelProjectId || !page.userId) continue;
         const best = bestByOwnerProject.get(`${page.userId}::${page.vercelProjectId}`);
         if (!best) continue;
+
+        // ENG-1839: surface whether the domain actually serves. The value is written by the
+        // hourly reachability sweep; this only reads what is already loaded here for URL
+        // enrichment, so it costs no extra calls and triggers no verification of its own.
+        // (An earlier version fired verification from this read — see the sweep's header for
+        // why that was wrong.)
+        // Reachability, written by the hourly sweep to its own attribute. Deliberately NOT
+        // `best.status` — that is the Vercel verification state, and conflating the two made a
+        // transient 5xx render a customer's custom domain as "not configured".
+        page.domainHost = best.domain;
+        if (best.reachabilityStatus === "unreachable") {
+          page.domainStatus = "error";
+          if (best.reachabilityError) page.domainErrorMessage = best.reachabilityError;
+        } else if (best.reachabilityStatus === "reachable") {
+          page.domainStatus = "active";
+        }
         // Sub-pages have a slug and live at /{slug} under the attached domain.
         const targetUrl = page.slug
           ? `https://${best.domain}/${page.slug}`
@@ -895,7 +954,10 @@ router.get("/generated", async (req, res: Response) => {
     // calls. Owner fast-paths to true; otherwise canEditItem gates on
     // editor/owner role.
     const annotated = pages.map((p) => ({
-      ...p,
+      ...(isExternalLandingPageRecord(p)
+        ? { ...p, customDomainUrl: p.customDomainUrl || p.canonicalUrl || p.deployedUrl }
+        : p),
+      isExternalImport: isExternalLandingPageRecord(p),
       editable: canEditItem(
         { userId: p.userId },
         { userId, orgId, orgRole: user?.orgRole as "owner" | "member" | undefined },
@@ -997,6 +1059,11 @@ router.post("/generated/:id/duplicate", rateLimiter, async (req, res: Response) 
 
     const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
     if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    // ENG-1238: external imports have no build behind them — duplicating would
+    // re-run a full v0 generation from the imported stub prompt.
+    if (isExternalLandingPageRecord(auth.page)) {
+      return res.status(409).json({ error: "Externally-imported pages cannot be duplicated" });
+    }
     const original = auth.page;
 
     const { name } = req.body;
@@ -1027,6 +1094,11 @@ router.post("/generated/:id/duplicate", rateLimiter, async (req, res: Response) 
     // otherwise resolve/create the same default list /generate uses. A duplicated page
     // used to start completely unbound — this closes that gap without needing a new
     // request field, consistent with the "no page is ever generated unbound" intent.
+    // ENG-2323: a page bound to a session list before it was refused (or via the API) must not hand
+    // that binding on to the copy. Checked before any generation spend.
+    if (original.leadListId && isSessionList(await crmDb.getLeadListById(original.leadListId))) {
+      return res.status(400).json({ error: SESSION_LIST_LEAD_CAPTURE_ERROR });
+    }
     const leadListId = original.leadListId || (await resolveOrCreateDefaultLeadList(userId, user?.orgId)).id;
 
     // ENG-967: same as /generate — a bound list that isn't publicly submittable makes the
@@ -1832,23 +1904,88 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
       }
     }
 
+    // Fetch the checks for this draft first — unchanged position, so a repo that DOES report a
+    // Tests check behaves exactly as before and makes no extra API call.
     const checksRes = await axios.get<any>(
       `${repoBase}/commits/${draftSha}/check-runs`,
       { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
     );
-    const testsCheck = (checksRes.data.check_runs || []).find(
-      (check: { name?: string }) => check.name === "Tests"
+    const checkRuns = checksRes.data?.check_runs || [];
+    const testsCheck = checkRuns.find((check: { name?: string }) => check.name === "Tests");
+
+    // Checks posted by GitHub Apps we KNOW are not test runners — Vercel's own integration
+    // auto-deploys and posts a check ("Vercel Preview Comments") for ANY PR on a connected
+    // project, unconditionally, and this route always opens a PR as its first step. Filtered by
+    // `app.slug` (a stable identifier) rather than the check's display name, which Vercel could
+    // change without notice.
+    const KNOWN_NON_TEST_CHECK_APP_SLUGS = new Set(["vercel"]);
+    const nonBenignCheckRuns = checkRuns.filter(
+      (check: { app?: { slug?: string } }) =>
+        !KNOWN_NON_TEST_CHECK_APP_SLUGS.has(check.app?.slug?.toLowerCase() ?? "")
     );
 
-    if (!testsCheck || testsCheck.status !== "completed" || testsCheck.conclusion === "cancelled") {
+    // Is this a repo that can never produce a Tests check at all?
+    //
+    // The gate is correct for a repo that runs tests and UNSATISFIABLE for one that does not.
+    // Generated landing-page repos contain no `.github/workflows`, so no check named "Tests"
+    // can appear and publish returned 409 required_tests_pending forever — its own message
+    // said "retry after GitHub starts it", which GitHub never would. That blocked a customer's
+    // rebuilt page from being published at all.
+    //
+    // ENG-1856: an earlier version of this fix required `checkRuns.length === 0` before
+    // trusting the workflow count — a repo whose checks come from a GitHub App (CircleCI,
+    // Buildkite, a bespoke checker) reports `actions/workflows` total_count 0 while real checks
+    // exist, so demanding zero check runs kept the gate honest for that case. In practice
+    // `checkRuns.length` was never actually 0 on a real publish attempt (Vercel's own bot check
+    // is always present, for the reason above), so the workflow-count check never ran and the
+    // gate reproduced the exact unsatisfiable-forever bug it was built to close. Confirmed
+    // live: zero of a random sample of generated repos ever had a merged publish PR since this
+    // gate shipped.
+    //
+    // Dropping the length check entirely (an earlier version of this fix) was too broad: Vercel's
+    // own app is itself proof that a check CAN appear here without a human wiring up CI, and
+    // nothing currently blocks a `.circleci/`-style config from landing in one of these repos via
+    // the chat-editing routes (only `.github/` is blocked there) — so "no other check can ever
+    // exist" is not something this code actually guarantees. Filtering out the one KNOWN-benign
+    // source by identity, rather than trusting `checkRuns.length` at all, keeps protection against
+    // any other real check while still closing the confirmed bug.
+    //
+    // FAIL CLOSED still holds: the workflow count is consulted only when nothing OTHER than the
+    // known-benign check has reported, and any error leaves it non-zero so the gate applies.
+    // "Could not determine whether this repo has CI" must never be read as "it has none".
+    let noCiAtAll = false;
+    if (!testsCheck && nonBenignCheckRuns.length === 0) {
+      let workflowCount = 1;
+      try {
+        const workflowsRes = await axios.get<any>(`${repoBase}/actions/workflows`, {
+          headers: ghHeaders,
+          timeout: GITHUB_TIMEOUT_MS,
+        });
+        workflowCount = workflowsRes.data?.total_count ?? 1;
+      } catch (wfErr: any) {
+        console.warn(
+          `[LP GENERATION] Could not list workflows for ${owner}/${repoName}; ` +
+            `keeping the required-Tests gate: ${wfErr.message}`
+        );
+      }
+      noCiAtAll = workflowCount === 0;
+    }
+
+    if (noCiAtAll) {
+      console.log(
+        `[LP GENERATION] ${owner}/${repoName} reported no check runs and no workflows, so no ` +
+          `Tests check can exist — the required-Tests gate does not apply to this publish.`
+      );
+    } else if (!testsCheck || testsCheck.status !== "completed" || testsCheck.conclusion === "cancelled") {
       const message = !testsCheck
         ? "Required Tests check has not started for this draft yet. Keep the draft and retry publish after GitHub starts it."
         : testsCheck.conclusion === "cancelled"
           ? "Required Tests check was cancelled for this draft. Keep the draft and retry publish after Tests runs again."
         : "Required Tests check is still running for this draft. Keep the draft and retry publish when it completes."
       return res.status(409).json({ error: "required_tests_pending", message });
-    }
-    if (testsCheck.conclusion !== "success") {
+    } else if (testsCheck.conclusion !== "success") {
+      // Chained onto the branch above: when there is no CI, `testsCheck` is undefined and
+      // reading `.conclusion` here would throw.
       return res.status(409).json({
         error: "required_tests_failed",
         message: "Required Tests check failed for this draft. Fix the draft and retry publish after Tests passes.",
@@ -1886,16 +2023,38 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
     } catch (mergeErr: any) {
       if (mergeErr.response?.status !== 409) throw mergeErr;
 
-      console.warn(`[LP GENERATION] Standard merge returned 409; force-advancing main to draft branch tip`);
+      // Force-advancing main to the draft tip is only safe when the draft already
+      // contains every main commit. If main moved on since the draft was cut, a force
+      // update silently reverts those commits (other pages, manual PRs) in production.
+      try {
+        const cmp = await axios.get<any>(
+          `${repoBase}/compare/${draftSha}...main`,
+          { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+        );
+        if (Number(cmp.data?.ahead_by) > 0) {
+          return res.status(409).json({
+            error: "draft_behind_main",
+            message: `The draft is missing ${cmp.data.ahead_by} commit(s) that are already on main and conflicts with them. Publishing would revert live changes. Re-run the edit so it is rebuilt on current main.`,
+          });
+        }
+      } catch (cmpErr: any) {
+        return res.status(409).json({
+          error: "draft_divergence_unknown",
+          message: "Could not confirm the draft contains main; refusing to force-publish.",
+        });
+      }
+
+      console.warn(`[LP GENERATION] Standard merge returned 409; fast-forwarding main to draft branch tip`);
 
       // The post-Tests ref read above proved that this exact SHA is still the
       // draft tip. Use that immutable SHA here, never a newer untested branch tip.
       if (await refuseIfConsentWithdrawn()) return;
 
-      // Force-update main to the tested draft SHA.
+      // Fast-forward main to the tested draft SHA. force:false makes GitHub reject
+      // the update if main advanced between the compare above and this PATCH.
       await axios.patch<any>(
         `${repoBase}/git/refs/heads/main`,
-        { sha: draftSha, force: true },
+        { sha: draftSha, force: false },
         { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
       );
       mergeCommitSha = draftSha;
@@ -2142,7 +2301,11 @@ router.get("/generated/:id/preview-url", async (req, res: Response) => {
       return res.status(400).json({ error: "Invalid branch name" });
     }
 
-    const result = await getPreviewDeploymentUrl(vercelProjectId, branch);
+    const commitSha = req.query.commitSha;
+    if (commitSha !== undefined && (typeof commitSha !== 'string' || !/^[a-f0-9]{40}$/i.test(commitSha))) {
+      return res.status(400).json({ error: 'Invalid commit SHA' });
+    }
+    const result = await getPreviewDeploymentUrl(vercelProjectId, branch, commitSha);
     res.json(result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error getting preview URL:", error);
@@ -2862,6 +3025,78 @@ router.post("/generated/:id/meta-pixel", editRateLimiter, async (req, res: Respo
 });
 
 // ---------------------------------------------------------------------------
+// POST|DELETE /generated/:id/session-tracking  (ENG-2327)
+// Create-or-reuse the page's session list, commit the AgentWeb SDK tag into the page's own repo,
+// and record sessionTrackingListId on the page. Idempotent. DELETE removes the tag and keeps the list.
+// ---------------------------------------------------------------------------
+function sendSessionTrackingError(res: Response, error: any, label: string) {
+  if (error instanceof SessionTrackingError) {
+    return res.status(error.httpStatus).json({ error: error.message, code: error.code });
+  }
+  const ghStatus = error?.response?.status;
+  console.error(`[LP GENERATION] Error ${label} (HTTP ${ghStatus}):`, error?.response?.data?.message || error?.message);
+  if (error?.code === "ECONNABORTED" || error?.code === "ETIMEDOUT") {
+    return res.status(504).json({ error: "GitHub API timed out. Try again in a moment." });
+  }
+  return res.status(500).json({ error: `Failed ${label}: ${error?.response?.data?.message || error?.message || "unknown error"}` });
+}
+
+router.post("/generated/:id/session-tracking", editRateLimiter, async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+
+    const body = req.body ?? {};
+    const { overrideExistingTracker, htmlPath } = body as { overrideExistingTracker?: unknown; htmlPath?: unknown };
+    if (overrideExistingTracker !== undefined && typeof overrideExistingTracker !== "boolean") {
+      return res.status(400).json({ error: "overrideExistingTracker must be a boolean" });
+    }
+    if (htmlPath !== undefined && typeof htmlPath !== "string") {
+      return res.status(400).json({ error: "htmlPath must be a string" });
+    }
+
+    const result = await enableSessionTrackingForPage(auth.page, {
+      overrideExistingTracker: overrideExistingTracker === true,
+      ...(htmlPath !== undefined ? { htmlPath } : {}),
+    });
+    res.json({
+      success: true,
+      ...result,
+      message: result.alreadyInstalled
+        ? "Session tracking was already installed on this page."
+        : "Session tracking added. Your site will redeploy shortly.",
+    });
+  } catch (error: any) {
+    sendSessionTrackingError(res, error, "enabling session tracking");
+  }
+});
+
+router.delete("/generated/:id/session-tracking", editRateLimiter, async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+
+    const htmlPath = typeof req.query.htmlPath === "string" ? req.query.htmlPath : undefined;
+    const result = await disableSessionTrackingForPage(auth.page, { htmlPath });
+    res.json({
+      success: true,
+      ...result,
+      message: result.alreadyRemoved
+        ? "Session tracking was not installed on this page."
+        : "Session tracking removed. The session list and its history were kept.",
+    });
+  } catch (error: any) {
+    sendSessionTrackingError(res, error, "disabling session tracking");
+  }
+});
+
+// ---------------------------------------------------------------------------
 // POST /site/gtm
 // Injects GTM into the caller's root landing site.
 // ---------------------------------------------------------------------------
@@ -3011,6 +3246,9 @@ router.patch("/generated/:id/lead-list", async (req, res: Response) => {
         );
         if (!allowed) return res.status(403).json({ error: "Lead list not accessible" });
       }
+      // ENG-2323: a session (telemetry) list is never a page's lead list. After the access checks so
+      // a list the caller cannot see still answers 403/404 rather than revealing its type.
+      if (isSessionList(list)) return res.status(400).json({ error: SESSION_LIST_LEAD_CAPTURE_ERROR });
     }
 
     try {
@@ -3078,7 +3316,10 @@ async function syncLeadCaptureForPage(
   const repoMatch = page.githubRepoUrl.match(/github\.com\/([^/]+\/[^/]+?)(?:\.git)?(?:\s|$)/);
   if (!repoMatch) {
     console.error(`[LP GENERATION] ENG-310: unparseable githubRepoUrl on page ${page.id}: ${page.githubRepoUrl}`);
-    return "Lead list saved, but this page's GitHub repo URL is malformed so the live site was not updated.";
+    // Same "saved" wrongness the captureRouteSkipped arm below was fixed for: a detach that
+    // reports "saved" tells the owner the opposite of what they asked for.
+    return `${leadListId === null ? "Lead list removed" : "Lead list saved"}, but this page's ` +
+      `GitHub repo URL is malformed so the live site was not updated.`;
   }
   const repoFullName = repoMatch[1];
 
@@ -3127,6 +3368,45 @@ async function syncLeadCaptureForPage(
       rootRecord?.metaPixelId,
       rootRecord?.metaAdAccountId,
     );
+    // captureRouteSkipped first: its contract states that NEITHER `committed` nor
+    // `up-to-date` implies the route carries this page's path — when the deployed
+    // LIST_BY_PATH could not be parsed, route.ts is left out of the commit entirely.
+    // Returning "saved" over that reports success for a list attachment whose leads will
+    // still 422, which is the one outcome the flag exists to prevent.
+    if (result.captureRouteSkipped) {
+      // Attaching and DETACHING both come through here, and the consequence is opposite for
+      // each. captureRouteSkipped means route.ts was left EXACTLY as deployed, so it still
+      // carries the old mapping: an attach's leads are not filed yet, while a detach's leads
+      // keep being filed into the list the user just removed. Saying "will not be filed" on
+      // a detach tells the user the opposite of what happens.
+      const untouched =
+        `capture route could not be updated — its deployed route file could not be parsed, ` +
+        `so it was left untouched.`;
+      if (leadListId === null) {
+        return (
+          `Lead list removed, but this site's ${untouched} Submissions from this page will ` +
+          `KEEP being filed into the list you just removed until the route is repaired.`
+        );
+      }
+      // Re-submitting the SAME list is not a change at all: the untouched deployed route
+      // already maps this path to exactly the list that was asked for, so there is nothing
+      // to warn about. Reachable from an idempotent PATCH retry or re-picking the current
+      // list. Warning here would claim leads are not being filed while they are.
+      if (page.leadListId === leadListId) return undefined;
+      // A SWITCH is not a first attach. The deployed route still carries the old mapping, so
+      // submissions keep arriving — into the PREVIOUS list, silently. "Will not be filed"
+      // would be wrong in the same direction the detach arm above was wrong.
+      if (page.leadListId) {
+        return (
+          `The lead list was saved, but this site's ${untouched} Submissions from this page ` +
+          `will KEEP being filed into the previously attached list until the route is repaired.`
+        );
+      }
+      return (
+        `The lead list was saved, but this site's ${untouched} Submissions from this page ` +
+        `will not be filed until the route is repaired.`
+      );
+    }
     if (result.committed || result.reason === "up-to-date") return undefined;
     // Attaching and DETACHING both come through here; "saved" is wrong for a removal.
     const lead = leadListId === null ? "Lead list removed" : "Lead list saved";
@@ -3142,7 +3422,8 @@ async function syncLeadCaptureForPage(
   } catch (err: any) {
     // syncLeadCaptureFilesToRepo does not throw, so this is a sibling-fetch failure.
     console.error(`[LP GENERATION] ENG-310: lead-capture sync failed for page ${page.id}:`, err?.message || err);
-    return "Lead list saved, but the live site was not updated. It will be applied on the next deploy or retry.";
+    return `${leadListId === null ? "Lead list removed" : "Lead list saved"}, but the live site ` +
+      `was not updated. It will be applied on the next deploy or retry.`;
   }
 }
 

@@ -1,3 +1,5 @@
+jest.mock('../services/settingsService', () => ({ settingsService: { getSetting: jest.fn().mockResolvedValue(null) } }));
+jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn().mockResolvedValue({ orgId: 'blog-org' }) }, orgDb: { getOrgById: jest.fn().mockResolvedValue({ modelRoles: { content_generation: 'openrouter/openai/gpt-5.6-luna' } }) } }));
 // ENG-351: inline source citations are required in RESEARCH/MEASUREMENT outputs (the
 // deep research report itself, analytics summaries, competitive research). A published
 // blog article is a different, polished deliverable — the deep-research → blog restyle
@@ -57,5 +59,9 @@ describe('restyleContent — blog articles are citation-free (ENG-351 scope deci
     const prompt = getPrompt();
     expect(prompt).toMatch(/\(Author, Year\)/);
     expect(prompt).toMatch(/bibliography/i);
+  });
+  it('uses the tenant content role for blog restyling', async () => {
+    await restyleContent('A draft', 'topic', 'professional', 'default', false, 'blog-user');
+    expect(mockCallLLM.mock.calls[0][0]).toBe('openrouter/openai/gpt-6-luna'); // GPT-6 Luna: cheaper, newer tenant-content-role model
   });
 });

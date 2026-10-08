@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   Box,
   Typography,
@@ -66,7 +66,7 @@ export default function ImageModelsSettings() {
   });
 
   // Initialize default image model settings if they don't exist
-  const initializeSettings = async () => {
+  const initializeSettings = useCallback(async () => {
     try {
       const defaultModels = [
         {
@@ -115,10 +115,10 @@ export default function ImageModelsSettings() {
     } catch (err: any) {
       setError(err.response?.data?.error || 'Failed to initialize image model settings');
     }
-  };
+  }, [token]);
 
   // Fetch image model configuration
-  const fetchConfig = async () => {
+  const fetchConfig = useCallback(async () => {
     try {
       setLoading(true);
       const response = await axios.get(buildApiUrl('/api/image-models'), {
@@ -143,7 +143,7 @@ export default function ImageModelsSettings() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [token, initializeSettings]);
 
   // Update default image model
   const updateDefaultModel = async (newDefault: string) => {
@@ -246,7 +246,7 @@ export default function ImageModelsSettings() {
 
   useEffect(() => {
     fetchConfig();
-  }, []);
+  }, [fetchConfig]);
 
   if (loading) {
     return (

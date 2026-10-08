@@ -113,7 +113,7 @@ describe('describeImage — Gemini vision path inlines + downscales (ENG-834)', 
     expect(mockAxiosGet).toHaveBeenCalled();
     expect(callLLMSpy).toHaveBeenCalled();
     const [, messages] = callLLMSpy.mock.calls[0];
-    const imgBlock = (messages[0].content as any[]).find((c: any) => c.type === 'image_url');
+    const imgBlock = (messages[1].content as any[]).find((c: any) => c.type === 'image_url');
     // Must be inlined bytes — NOT the bare S3 URL Gemini's fileData.fileUri cannot fetch.
     expect(imgBlock.image_url.url).toMatch(/^data:image\//);
     expect(imgBlock.image_url.url).not.toContain('s3.us-west-2.amazonaws.com');
@@ -137,7 +137,7 @@ describe('describeImage — Gemini vision path inlines + downscales (ENG-834)', 
 
     expect(result.success).toBe(true);
     const [, messages] = callLLMSpy.mock.calls[0];
-    const imgBlock = (messages[0].content as any[]).find((c: any) => c.type === 'image_url');
+    const imgBlock = (messages[1].content as any[]).find((c: any) => c.type === 'image_url');
     expect(imgBlock.image_url.url).toMatch(/^data:image\/jpeg;base64,/);
     // The inlined, downscaled payload must be well under the original 4K size.
     const b64 = imgBlock.image_url.url.split(',')[1];
@@ -170,7 +170,7 @@ describe('describeImage — Gemini vision path inlines + downscales (ENG-834)', 
     expect(mockAxiosGet).not.toHaveBeenCalled();
     // Image was still inlined for the Gemini path.
     const [, messages] = callLLMSpy.mock.calls[0];
-    const imgBlock = (messages[0].content as any[]).find((c: any) => c.type === 'image_url');
+    const imgBlock = (messages[1].content as any[]).find((c: any) => c.type === 'image_url');
     expect(imgBlock.image_url.url).toMatch(/^data:image\//);
   });
 
@@ -195,7 +195,7 @@ describe('describeImage — Gemini vision path inlines + downscales (ENG-834)', 
     expect(mockGuardedFetch).toHaveBeenCalledWith(driveUrl);
     // Inlined, not handed to Gemini as a bare URL it cannot follow.
     const [, messages] = callLLMSpy.mock.calls[0];
-    const imgBlock = (messages[0].content as any[]).find((c: any) => c.type === 'image_url');
+    const imgBlock = (messages[1].content as any[]).find((c: any) => c.type === 'image_url');
     expect(imgBlock.image_url.url).toMatch(/^data:image\//);
     expect(imgBlock.image_url.url).not.toBe(driveUrl);
   });
@@ -215,7 +215,7 @@ describe('describeImage — Gemini vision path inlines + downscales (ENG-834)', 
     expect(mockAxiosGet).not.toHaveBeenCalled();
     // No inlined bytes were produced; the raw URL is passed through unchanged.
     const [, messages] = callLLMSpy.mock.calls[0];
-    const imgBlock = (messages[0].content as any[]).find((c: any) => c.type === 'image_url');
+    const imgBlock = (messages[1].content as any[]).find((c: any) => c.type === 'image_url');
     expect(imgBlock.image_url.url).toBe(internalUrl);
   });
 
@@ -248,7 +248,7 @@ describe('describeImage — Gemini vision path inlines + downscales (ENG-834)', 
     expect(result.success).toBe(true);
     expect(callLLMSpy).toHaveBeenCalled();
     const [, messages] = callLLMSpy.mock.calls[0];
-    const imgBlock = (messages[0].content as any[]).find((c: any) => c.type === 'image_url');
+    const imgBlock = (messages[1].content as any[]).find((c: any) => c.type === 'image_url');
     expect(imgBlock.image_url.url).toBe(externalUrl);
 
     consoleError.mockRestore();

@@ -71,6 +71,18 @@ describe('httpClient', () => {
       ).rejects.toThrow('User not found: nonexistent');
     });
 
+    it('warns that a SERVER_RESTARTING turn may have saved the message before retrying', async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        headers: { get: () => 'application/json' },
+        json: async () => ({ code: 'SERVER_RESTARTING', message: 'The server is restarting. Please try again in a moment.' }),
+      }) as any;
+      await expect(mcpFetch({ method: 'POST', path: '/api/agent-mode/generate', context: { userId: 'user-123' } }))
+        .rejects.toThrow('The message may have been saved. Check the session before retrying to avoid duplicate messages.');
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+    });
+
     it('should throw on HTTP error responses', async () => {
       const mockResponse = {
         ok: false,
@@ -83,6 +95,55 @@ describe('httpClient', () => {
       await expect(
         mcpFetch({ method: 'GET', path: '/api/test', context: { userId: 'user-123' } })
       ).rejects.toThrow('API error (403): Forbidden');
+    });
+
+    // ENG-1844: a route can emit BOTH a human `message` (used for the thrown Error's
+    // text, unchanged — this must stay human) and a stable machine `error` code. The
+    // code was previously lost entirely once `message` won the `||`. Preserved
+    // separately on `.code` so classifyToolErrorClass can key off the code instead of
+    // the human prose.
+    it('preserves a distinct data.error as .code without changing the thrown message', async () => {
+      const mockResponse = {
+        ok: false,
+        status: 422,
+        headers: { get: () => 'application/json' },
+        json: () =>
+          Promise.resolve({
+            error: 'missing_brand_logo',
+            message: 'No brand logo is saved in Brand Guidelines. Upload your logo in brand config (Brand Guidelines), then generate again.',
+          }),
+      };
+      global.fetch = jest.fn().mockResolvedValue(mockResponse) as any;
+
+      let caught: any;
+      try {
+        await mcpFetch({ method: 'POST', path: '/api/landing-pages/v0/generate', context: { userId: 'user-123' } });
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect(caught.message).toBe(
+        'API error (422): No brand logo is saved in Brand Guidelines. Upload your logo in brand config (Brand Guidelines), then generate again.'
+      );
+      expect(caught.code).toBe('missing_brand_logo');
+    });
+
+    it('does not set .code when data.error and data.message are the same string', async () => {
+      const mockResponse = {
+        ok: false,
+        status: 400,
+        headers: { get: () => 'application/json' },
+        json: () => Promise.resolve({ error: 'Bad request' }),
+      };
+      global.fetch = jest.fn().mockResolvedValue(mockResponse) as any;
+
+      let caught: any;
+      try {
+        await mcpFetch({ method: 'GET', path: '/api/test', context: { userId: 'user-123' } });
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught.code).toBeUndefined();
     });
 
     // ENG-1189: a raw network failure (undici's TypeError('fetch failed') on a self-call,

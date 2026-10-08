@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getLinkedInConfig, getLinkedInScopesForType, LinkedInAccountType } from '../config/integrations';
 import { createAccount } from '../services/connectedAccountsDb';
+import { redactAccountsSecrets } from '../utils/accountSecretRedaction';
 import { linkedInService } from '../services/linkedInService';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
@@ -24,6 +25,26 @@ const STATE_EXPIRATION = '15m';
 const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
+/**
+ * ENG-1644 gap-closing: resolve any pending reconnect decision for this
+ * exact account. Dynamic import — see metaAuth.ts's identical comment for
+ * why (heavy transitive chain, must stay out of this file's static load).
+ * safeAutoResolveCredentialDecision itself never throws, but the import
+ * statement can — own try/catch (review fix) so that can't abort the
+ * response. The wrapper's own logic lives once in
+ * approvalInboxCustomerNotify.ts, not duplicated per file (review fix — this
+ * local copy was flagged as duplicated 3x across this file, metaAuth.ts, and
+ * linkedInAdsAuth.ts by 4 independent review passes).
+ */
+async function safeAutoResolve(label: string, userId: string, platform: string, accountId: string): Promise<void> {
+  try {
+    const { safeAutoResolveCredentialDecision } = await import('../services/approvalInboxCustomerNotify');
+    await safeAutoResolveCredentialDecision(label, userId, platform, accountId);
+  } catch (err: any) {
+    console.warn(`[${label}] auto-resolve module failed to load:`, err?.message || err);
+  }
+}
 
 interface StatePayload {
   userId: string;
@@ -368,6 +389,8 @@ router.post('/connect-accounts', authenticateToken, async (req: any, res) => {
 
       const account = await createAccount(userId, 'linkedin', accountInput);
       connectedAccounts.push(account);
+
+      await safeAutoResolve('LinkedIn Connect', userId, 'linkedin', profile.urn);
     }
 
     // Connect selected organizations
@@ -392,10 +415,13 @@ router.post('/connect-accounts', authenticateToken, async (req: any, res) => {
 
         const account = await createAccount(userId, 'linkedin', accountInput);
         connectedAccounts.push(account);
+
+        // ENG-1644 gap-closing: same as the personal-account case above.
+        await safeAutoResolve('LinkedIn Connect (org)', userId, 'linkedin', org.urn);
       }
     }
 
-    res.json({ success: true, accounts: connectedAccounts });
+    res.json({ success: true, accounts: redactAccountsSecrets(connectedAccounts) });
 
   } catch (error: any) {
     console.error('[LinkedIn Connect Accounts] Error:', error);

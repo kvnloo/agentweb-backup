@@ -81,7 +81,11 @@ describe('MetaService campaign spend_cap (ENG-1018)', () => {
   });
 
   it('getCampaign reads spend_cap back so a write can be verified', async () => {
-    const get = jest.fn().mockResolvedValue({ _data: { id: 'camp_9', spend_cap: '300000' } });
+    // getCampaign now verifies ownership from the same response, so Graph answers `account_id`
+    // alongside the requested fields; it is stripped before the caller sees the payload.
+    const get = jest.fn().mockResolvedValue({
+      _data: { id: 'camp_9', spend_cap: '300000', account_id: accountId },
+    });
     (Campaign as unknown as jest.Mock).mockImplementation(() => ({ get }));
 
     const result = await service.getCampaign(accountId, token, 'camp_9');
@@ -181,18 +185,17 @@ describe('MetaService campaign spend_cap (ENG-1018)', () => {
   // ---------------- SPEND CAP SHAPE ----------------
 
   it.each([
-    ['a fraction', 1000.5],
     ['a negative', -100000],
     ['zero', 0],
     ['NaN from a bad parse', Number.NaN],
     ['Infinity', Number.POSITIVE_INFINITY],
     ['a string', '100000'],
   ])('rejects %s as a spend_cap instead of forwarding it to Meta', (_label, value) => {
-    expect(() => MetaService.assertValidSpendCap(value)).toThrow(/positive whole number of cents/i);
+    expect(() => MetaService.assertValidSpendCap(value)).toThrow(/positive amount/i);
   });
 
   it('accepts a positive whole number, and ignores an absent cap', () => {
-    expect(() => MetaService.assertValidSpendCap(300000)).not.toThrow();
+    expect(() => MetaService.assertValidSpendCap(3000.50)).not.toThrow();
     expect(() => MetaService.assertValidSpendCap(undefined)).not.toThrow();
     expect(() => MetaService.assertValidSpendCap(null)).not.toThrow();
   });
@@ -200,9 +203,9 @@ describe('MetaService campaign spend_cap (ENG-1018)', () => {
   it('blocks a malformed spend_cap on CAMPAIGN CREATE before anything is created', () => {
     expect(() =>
       MetaService.validateCampaignParams('CREATE', {
-        name: 'C', objective: 'OUTCOME_TRAFFIC', special_ad_categories: ['NONE'], spend_cap: 1000.5,
+        name: 'C', objective: 'OUTCOME_TRAFFIC', special_ad_categories: ['NONE'], spend_cap: -1000.5,
       } as any)
-    ).toThrow(/positive whole number of cents/i);
+    ).toThrow(/positive amount/i);
   });
 
   it('does not police params on UPDATE (pass-through is real there)', () => {

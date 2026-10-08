@@ -44,6 +44,7 @@ jest.mock('../services/agentModeService', () => ({
     generateSessionTitle: jest.fn().mockResolvedValue('Test Title'),
     getMarketingSystemPrompt: jest.fn().mockResolvedValue('System prompt'),
     generateDiagnosticMessage: jest.fn().mockResolvedValue(null),
+    getSkillsForDisplay: jest.fn().mockResolvedValue([]),
   },
   AgentModeService: jest.fn(),
 }));
@@ -118,5 +119,133 @@ describe('hasStalledAutocompleteWorkPlan (ENG-1684)', () => {
 
   it('handles a work plan with no steps array without throwing', () => {
     expect(hasStalledAutocompleteWorkPlan({ autocomplete: true } as any, [])).toBe(false);
+  });
+});
+
+/**
+ * ENG-1700 — the ENG-1684 fix above only covered a turn with ZERO tool calls. Live-reproduced
+ * 2026-09-02: the Reddit Pain Point Research Report workplan hung ~10 minutes because
+ * create_html_file failed three times in a row (TruncatedToolCallArgumentsError, the separately-
+ * tracked ENG-1477 gateway bug) — the backstop never fired, since tool calls WERE attempted, they
+ * just all failed. A human had to type "continue" manually. Fix: a stall is now "no tool calls" OR
+ * "one or more tool calls, none of which succeeded" — reusing the existing toolCallSucceeded
+ * ledger check (already used elsewhere in this file) rather than a new ad-hoc failure detector.
+ */
+describe('hasStalledAutocompleteWorkPlan (ENG-1700 — all tool calls failed)', () => {
+  it('fires when every tool call this turn failed and a step is still pending', () => {
+    const workPlan = { autocomplete: true, steps: [{ stepCount: 6, status: 'pending' }] };
+    const failedCalls = [
+      { name: 'create_html_file', error: 'TruncatedToolCallArgumentsError: cut off mid-object' },
+    ];
+    expect(hasStalledAutocompleteWorkPlan(workPlan, failedCalls)).toBe(true);
+  });
+
+  it('does not fire when at least one tool call this turn succeeded, even alongside failures', () => {
+    const workPlan = { autocomplete: true, steps: [{ stepCount: 6, status: 'pending' }] };
+    const mixedCalls = [
+      { name: 'create_html_file', error: 'TruncatedToolCallArgumentsError: cut off mid-object' },
+      { name: 'read_market_strategy' }, // no error/result.success===false -> counts as succeeded
+    ];
+    expect(hasStalledAutocompleteWorkPlan(workPlan, mixedCalls)).toBe(false);
+  });
+
+  it('does not fire for an all-failed turn on an interactive (non-autocomplete) plan', () => {
+    const workPlan = { autocomplete: false, steps: [{ stepCount: 6, status: 'pending' }] };
+    const failedCalls = [{ name: 'create_html_file', error: 'TruncatedToolCallArgumentsError' }];
+    expect(hasStalledAutocompleteWorkPlan(workPlan, failedCalls)).toBe(false);
+  });
+
+  it('does not fire for an all-failed turn once every step is already completed or skipped', () => {
+    const workPlan = {
+      autocomplete: true,
+      steps: [{ stepCount: 6, status: 'completed' }],
+    };
+    const failedCalls = [{ name: 'create_html_file', error: 'TruncatedToolCallArgumentsError' }];
+    expect(hasStalledAutocompleteWorkPlan(workPlan, failedCalls)).toBe(false);
+  });
+
+  it('fires for an all-deferred turn that is not the media-budget deferral (e.g. a duplicate call)', () => {
+    // toolCallNeverExecuted (backend/src/utils/toolCallOutcome.ts) also treats a de-duplicated
+    // call as "never executed" -> not succeeded. That's still a stall: nothing progressed.
+    const workPlan = { autocomplete: true, steps: [{ stepCount: 6, status: 'pending' }] };
+    const dedupedCalls = [{ name: 'create_html_file', duplicateOf: 'call_abc123' }];
+    expect(hasStalledAutocompleteWorkPlan(workPlan, dedupedCalls)).toBe(true);
+  });
+
+  it('does NOT fire for a media-budget-deferred call — scheduleAutoMediaContinuation owns resuming that turn', () => {
+    // Exact shape hasDeferredMediaBudgetToolCall (backend/src/utils/timeoutContinuation.ts)
+    // recognizes: result.deferred === true AND result.reason === 'media_generation_time_budget'.
+    // Without this guard, a turn shaped like this would trigger BOTH auto-continuations at once,
+    // racing for the same session-generation lock.
+    const workPlan = { autocomplete: true, steps: [{ stepCount: 6, status: 'pending' }] };
+    const mediaDeferredCalls = [
+      { name: 'generate_image', result: { deferred: true, reason: 'media_generation_time_budget' } },
+    ];
+    expect(hasStalledAutocompleteWorkPlan(workPlan, mediaDeferredCalls)).toBe(false);
+  });
+});
+
+/**
+ * ENG-1813 — found during round-4 review of PR agentweb#2808 (the ENG-1811 debt-ledger fix).
+ * An autocomplete plan's modify_work_plan call that deletes the LAST pending step while
+ * creating genuine ENG-1811 debt (a removed step's required function call that never actually
+ * succeeded) IS a successful tool call — the pre-fix ENG-1684/1700 short-circuit
+ * (`calls.some(toolCallSucceeded) -> not stalled`) would call this turn "not stalled" even
+ * though no real required work got done, so no further auto-continuation round would ever fire
+ * to go satisfy the debt. Fixed by checking workPlan.pendingRequiredFunctionCalls (resolved
+ * against real calledFunctions) BEFORE that short-circuit — outstanding debt always wins.
+ */
+describe('hasStalledAutocompleteWorkPlan (ENG-1813 — unresolved debt from a removed step)', () => {
+  it('fires when a modify_work_plan call succeeded this turn but left genuine ENG-1811 debt unresolved', () => {
+    const workPlan = {
+      autocomplete: true,
+      steps: [{ stepCount: 1, status: 'completed' }],
+      pendingRequiredFunctionCalls: ['list_html_templates'],
+    };
+    const succeededCalls = [{ name: 'modify_work_plan' }]; // no error -> counts as succeeded
+    expect(hasStalledAutocompleteWorkPlan(workPlan, succeededCalls, {})).toBe(true);
+    // Without the debt fix, the pre-existing short-circuit would have returned false here
+    // (a tool call succeeded) -- confirm the OLD behavior really would have missed it.
+    expect(hasStalledAutocompleteWorkPlan({ ...workPlan, pendingRequiredFunctionCalls: undefined }, succeededCalls, {})).toBe(false);
+  });
+
+  it('does not fire once the debt function has genuinely succeeded, even if calledFunctions is stale/unchecked elsewhere', () => {
+    const workPlan = {
+      autocomplete: true,
+      steps: [{ stepCount: 1, status: 'completed' }],
+      pendingRequiredFunctionCalls: ['list_html_templates'],
+    };
+    const succeededCalls = [{ name: 'modify_work_plan' }];
+    expect(hasStalledAutocompleteWorkPlan(workPlan, succeededCalls, { list_html_templates: 1 })).toBe(false);
+  });
+
+  it('never fires for debt on an interactive (non-autocomplete) plan', () => {
+    const workPlan = {
+      autocomplete: false,
+      steps: [{ stepCount: 1, status: 'completed' }],
+      pendingRequiredFunctionCalls: ['list_html_templates'],
+    };
+    expect(hasStalledAutocompleteWorkPlan(workPlan, [{ name: 'modify_work_plan' }], {})).toBe(false);
+  });
+
+  it('media-budget deferral still wins over unresolved debt — scheduleAutoMediaContinuation owns that turn', () => {
+    const workPlan = {
+      autocomplete: true,
+      steps: [{ stepCount: 1, status: 'completed' }],
+      pendingRequiredFunctionCalls: ['list_html_templates'],
+    };
+    const mediaDeferredCalls = [
+      { name: 'generate_image', result: { deferred: true, reason: 'media_generation_time_budget' } },
+    ];
+    expect(hasStalledAutocompleteWorkPlan(workPlan, mediaDeferredCalls, {})).toBe(false);
+  });
+
+  it('an empty pendingRequiredFunctionCalls array behaves exactly like no debt at all', () => {
+    const workPlan = {
+      autocomplete: true,
+      steps: [{ stepCount: 1, status: 'completed' }],
+      pendingRequiredFunctionCalls: [],
+    };
+    expect(hasStalledAutocompleteWorkPlan(workPlan, [{ name: 'modify_work_plan' }], {})).toBe(false);
   });
 });

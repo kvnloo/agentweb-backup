@@ -1,3 +1,4 @@
+import { isEvaluationUser } from '../services/evaluationPolicy';
 import { scheduleDb, userDb, socialEngagementTrackingDb } from '../services/db';
 import { LinkedInAdapter } from '../services/adapters/linkedInAdapter';
 import { ConnectedAccount } from '../services/connectedAccountsDb';
@@ -220,6 +221,10 @@ export class SocialEngagementExecutor {
     }
 
     private async processAction(action: any) {
+        if (isEvaluationUser(action?.userId)) {
+            await (await import('../services/evaluationStore')).evaluationStore.discardJob(action.userId, action.scheduleId);
+            return;
+        }
         const { userId, variableValues, scheduleId } = action;
         const { postId, commentId, commentText, platform, ownerAccountId, engagingAccountId, actionType, targetType } = variableValues || {};
 

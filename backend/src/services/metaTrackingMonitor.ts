@@ -36,6 +36,7 @@
 
 import { createHash } from 'crypto';
 import { META_GRAPH_TIMEOUT_MS } from '../utils/metaApiFetch';
+import { isEvaluationUser } from './evaluationPolicy';
 
 
 const TAG = '[Tracking Monitor]';
@@ -841,6 +842,10 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     eventMixStale: 0,
   };
 
+  // ENG-1907: a sandbox principal's Meta connection is simulated. Reading it with a sentinel
+  // token would raise token/blackout alerts about an account that does not exist.
+  if (isEvaluationUser(user?.userId)) return summary;
+
   const fetchActivity =
     deps?.fetchActivity ??
     ((id: string, token: string, days: number) => fetchDailyAdAccountActivity(id, token, days));
@@ -1441,6 +1446,11 @@ async function checkDestinationCoverage(
  * instead would silently change what `evaluateAdAccountDays` streaks over, and that function
  * decides whether a customer gets paged.
  */
+/** Internal AgentWeb accounts (ENG-2124): excluded from the customer landing-page rollup. */
+function isInternalAgentWebEmail(email?: string | null): boolean {
+  return /@agentweb\.pro$/i.test(String(email ?? '').trim());
+}
+
 /**
  * ONE alert for every generated landing page across the whole fleet that cannot report a
  * conversion — not one per customer.
@@ -1458,7 +1468,11 @@ export async function raiseLandingPageRollup(
   findings: MonitorSummary['landingPageFindings'],
   opts: { transport?: AlertTransport; dryRun?: boolean; now?: number } = {},
 ): Promise<void> {
-  if (!findings?.length) return;
+  // ENG-2124: AgentWeb's own accounts (test/verification and internal webinar sites) are not
+  // customers. With no ad pointing at them this alert is pure noise that recurs weekly, so they
+  // are dropped here; real customers still roll up exactly as before.
+  findings = (findings ?? []).filter((f) => !isInternalAgentWebEmail(f.email));
+  if (!findings.length) return;
   const now = opts.now ?? Date.now();
   const dryRun = opts.dryRun === true;
   const sink: AlertSink = {

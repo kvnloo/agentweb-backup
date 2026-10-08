@@ -76,6 +76,13 @@ export type EnrollmentStatus =
 
 export type ExitReason =
   | 'completed'
+  /**
+   * Ran to the end without a single step being delivered — every step was skipped
+   * because the lead could not be reached on that channel. Distinct from 'completed'
+   * on purpose: those two rows are otherwise identical in the dashboard, and one means
+   * the lead received the entire sequence while the other means it received nothing.
+   */
+  | 'completed_no_sends'
   | 'converted'
   | 'engagement'
   | 'unsubscribed'
@@ -200,6 +207,14 @@ export interface CreateEnrollmentInput {
   leadId: string;
   leadEmail: string;
   startAt?: string;            // override first send time; defaults to now
+  /**
+   * Other identities this lead may already be stored under, for the dedup check only —
+   * never written. `leadEmail` is derived from mutable lead data (email wins over the
+   * LinkedIn URL), so an address-less lead enrolled under its profile URL gets a
+   * DIFFERENT identity the day it gains an email, and re-enrols. See
+   * `enrollmentIdentityCandidates`.
+   */
+  identityCandidates?: string[];
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -366,7 +381,81 @@ async function deleteSequence(sequenceId: string, userId: string): Promise<void>
 
 // ─── Enrollments ─────────────────────────────────────────────────────────────
 
-async function enrollLead(input: CreateEnrollmentInput): Promise<SequenceEnrollment> {
+/** Every identity this write could collide under — same set `getExistingEnrollment`
+ * callers probe, computed once so the claim-transaction below and a caller's own
+ * pre-check can never silently diverge. */
+function allEnrollmentCandidates(input: CreateEnrollmentInput): string[] {
+  return Array.from(new Set([input.leadEmail, ...(input.identityCandidates ?? [])])).filter(Boolean);
+}
+
+/** `claim#<sequenceId>#<identity>` — never collides with a real `generateEnrollmentId()`
+ * value (always `enr_...`). Deliberately carries none of this table's GSI key
+ * attributes (leadEmail; sequenceId+status; userId+nextSendAt) and never sets status to
+ * 'active', so it is invisible to every existing query AND to getAllDueEnrollments'
+ * scan — confirmed against every read path against ENROLLMENTS_TABLE before relying on
+ * it. The only way to ever see one is a `get` by this exact key, which nothing does. */
+function claimKey(sequenceId: string, identity: string): string {
+  return `claim#${sequenceId}#${identity}`;
+}
+
+/**
+ * A TransactWriteItems that fails because ONE of its condition checks did not hold
+ * surfaces as `TransactionCanceledException` with `CancellationReasons[i].Code ===
+ * 'ConditionalCheckFailed'` — a genuine duplicate: some other write already holds this
+ * exact claim, so the condition itself was evaluated and failed.
+ */
+function isGenuineConditionalFailure(error: any): boolean {
+  if (error?.code !== 'TransactionCanceledException') return false;
+  const reasons = error?.CancellationReasons || [];
+  return reasons.some((r: any) => r?.Code === 'ConditionalCheckFailed');
+}
+
+/**
+ * `TransactionConflictException` (and the `TransactionConflict` cancellation reason) is
+ * a DIFFERENT AWS error shape from a conditional failure: it means another transaction
+ * was concurrently touching the same item and this one couldn't proceed — AWS's own
+ * guidance is to retry, not to treat it as a resolved outcome. The condition was never
+ * actually evaluated, so there's no evidence the other party's write committed either.
+ *
+ * Treating this the same as a genuine conditional failure (an earlier version of this
+ * helper did, mirroring `llmUsageCreditService.ts`'s own `isTransactionalConditionalFailure`
+ * — the same conflation exists there) would silently drop a lead from a sequence with
+ * zero signal anything went wrong: indistinguishable in logs from a correct dedup skip.
+ */
+function isTransientTransactionConflict(error: any): boolean {
+  if (error?.code === 'TransactionConflictException') return true;
+  if (error?.code !== 'TransactionCanceledException') return false;
+  const reasons = error?.CancellationReasons || [];
+  return reasons.some((r: any) => r?.Code === 'TransactionConflict');
+}
+
+/**
+ * Writes the enrollment, atomically claiming every identity candidate first.
+ *
+ * TODO (ENG-2127) this replaced: enrollment keys were random IDs and the only duplicate
+ * check was a query against the eventually-consistent `leadEmail-index`, so two
+ * concurrent callers (or the same caller a moment after its own prior write) could both
+ * pass the check and both write — the whole sequence delivered twice. A
+ * TransactWriteItems that conditionally claims each candidate identity against THIS
+ * TABLE'S OWN PRIMARY KEY (strongly consistent, no GSI lag) in the same transaction as
+ * the real enrollment write closes that window: either every claim and the enrollment
+ * land together, or none of them do. No table, key, or index changed — the existing
+ * `leadEmail-index` pre-check callers already do stays as the cheap fast path (and is
+ * still what finds enrollments written before this fix existed, which carry no claim);
+ * this transaction is the backstop for the race specifically, not a replacement for it.
+ *
+ * Returns `null` if a candidate was already claimed — by a concurrent request, or by an
+ * enrollment this same transaction raced against — which callers must treat exactly like
+ * `getExistingEnrollment` finding a row: already enrolled, skip.
+ *
+ * A transient `TransactionConflictException`/`TransactionConflict` is retried (bounded,
+ * short backoff) rather than treated as a resolved duplicate — see
+ * `isTransientTransactionConflict`'s own doc comment for why conflating the two would be
+ * a silent, undetectable lead-drop. If every retry is itself a transient conflict, this
+ * throws rather than guessing at the outcome — the caller's own retry/error handling
+ * takes over from there, same as any other unexpected write failure.
+ */
+async function enrollLead(input: CreateEnrollmentInput): Promise<SequenceEnrollment | null> {
   const ts = now();
   const enrollment: SequenceEnrollment = {
     enrollmentId: generateEnrollmentId(),
@@ -381,15 +470,50 @@ async function enrollLead(input: CreateEnrollmentInput): Promise<SequenceEnrollm
     enrolledAt: ts,
   };
 
-  await dynamodb.put({
-    TableName: ENROLLMENTS_TABLE,
-    Item: enrollment,
-  }).promise();
+  const candidates = allEnrollmentCandidates(input);
+  const claimItems = candidates.map((identity) => ({
+    Put: {
+      TableName: ENROLLMENTS_TABLE,
+      Item: {
+        enrollmentId: claimKey(input.sequenceId, identity),
+        claimedEnrollmentId: enrollment.enrollmentId,
+        createdAt: ts,
+      },
+      ConditionExpression: 'attribute_not_exists(enrollmentId)',
+    },
+  }));
 
-  return enrollment;
+  const MAX_CONFLICT_RETRIES = 3;
+  for (let attempt = 0; attempt <= MAX_CONFLICT_RETRIES; attempt++) {
+    try {
+      await dynamodb.transactWrite({
+        TransactItems: [
+          ...claimItems,
+          { Put: { TableName: ENROLLMENTS_TABLE, Item: enrollment } },
+        ],
+      }).promise();
+      return enrollment;
+    } catch (error: any) {
+      if (isGenuineConditionalFailure(error)) return null;
+      if (isTransientTransactionConflict(error) && attempt < MAX_CONFLICT_RETRIES) {
+        await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+        continue;
+      }
+      throw error;
+    }
+  }
+  // Unreachable — the loop above always returns or throws — but TypeScript can't see
+  // that the for-loop's last iteration always hits one of the three branches above.
+  throw new Error('enrollLead: exhausted retries without resolving');
 }
 
-/** Bulk-enroll multiple leads; skips leads already enrolled (active or completed/converted). */
+/** Bulk-enroll multiple leads; skips leads already enrolled (active or completed/converted).
+ * ENG-2127: the GSI pre-check below is the cheap fast path (and still what finds
+ * enrollments written before the claim-transaction existed), but `enrollLead` itself now
+ * closes the race between this check and its own write — see that function's doc
+ * comment. A `null` return means a candidate was already claimed; treat it exactly like
+ * the pre-check finding a row.
+ */
 async function bulkEnroll(
   inputs: CreateEnrollmentInput[],
 ): Promise<{ enrolled: number; skipped: number }> {
@@ -397,12 +521,24 @@ async function bulkEnroll(
   let skipped = 0;
 
   for (const input of inputs) {
-    const existing = await getExistingEnrollment(input.sequenceId, input.leadEmail);
+    // Check every identity the lead could already be stored under, not just the one we
+    // would write today — the identity moves when the lead's data changes, and a miss
+    // here re-delivers the whole sequence.
+    const candidates = allEnrollmentCandidates(input);
+    let existing: SequenceEnrollment | null = null;
+    for (const identity of candidates) {
+      existing = await getExistingEnrollment(input.sequenceId, identity);
+      if (existing) break;
+    }
     if (existing) {
       skipped++;
       continue;
     }
-    await enrollLead(input);
+    const result = await enrollLead(input);
+    if (!result) {
+      skipped++;
+      continue;
+    }
     enrolled++;
   }
 
@@ -431,7 +567,15 @@ async function getExistingEnrollment(
   }).promise();
 
   const items = (result.Items ?? []) as SequenceEnrollment[];
-  return items[0] ?? null;
+  // An enrollment that completed WITHOUT sending anything must not block a re-enrol.
+  //
+  // This query deliberately matches regardless of status, so a lead already enrolled is
+  // never enrolled twice. But a row that skipped every step and exited
+  // 'completed_no_sends' delivered nothing — and it permanently barred that lead from
+  // the sequence even after the user fixed the data that made it unreachable. Ignoring
+  // those rows cannot cause a double send, because by definition nothing was sent.
+  const blocking = items.filter((e) => (e as any).exitReason !== 'completed_no_sends');
+  return blocking[0] ?? null;
 }
 
 async function getActiveEnrollment(
@@ -532,16 +676,24 @@ async function advanceEnrollment(
   nextStep: number,
   nextSendAt: string,
   channel: SequenceChannel = 'email',
+  /**
+   * False when the step was SKIPPED because the lead could not receive it. Stamping a
+   * sent-timestamp for a message that was never sent is a false record — the worker
+   * advances past undeliverable steps now, so this is reachable.
+   */
+  delivered: boolean = true,
 ): Promise<void> {
   const sentField = channel === 'linkedin' ? 'lastLinkedInSentAt' : 'lastEmailSentAt';
   await dynamodb.update({
     TableName: ENROLLMENTS_TABLE,
     Key: { enrollmentId },
-    UpdateExpression: `SET currentStep = :step, nextSendAt = :next, ${sentField} = :sent REMOVE claimedAt`,
+    UpdateExpression: delivered
+      ? `SET currentStep = :step, nextSendAt = :next, ${sentField} = :sent REMOVE claimedAt`
+      : 'SET currentStep = :step, nextSendAt = :next REMOVE claimedAt',
     ExpressionAttributeValues: {
       ':step': nextStep,
       ':next': nextSendAt,
-      ':sent': now(),
+      ...(delivered ? { ':sent': now() } : {}),
     },
   }).promise();
 }
@@ -551,18 +703,22 @@ async function completeEnrollment(
   exitReason: ExitReason,
   finalStatus: EnrollmentStatus = 'completed',
   channel: SequenceChannel = 'email',
+  /** See advanceEnrollment: false when the final step was skipped, not sent. */
+  delivered: boolean = true,
 ): Promise<void> {
   const sentField = channel === 'linkedin' ? 'lastLinkedInSentAt' : 'lastEmailSentAt';
   await dynamodb.update({
     TableName: ENROLLMENTS_TABLE,
     Key: { enrollmentId },
-    UpdateExpression: `SET #s = :status, exitReason = :reason, completedAt = :ts, ${sentField} = :sent REMOVE claimedAt`,
+    UpdateExpression: delivered
+      ? `SET #s = :status, exitReason = :reason, completedAt = :ts, ${sentField} = :sent REMOVE claimedAt`
+      : 'SET #s = :status, exitReason = :reason, completedAt = :ts REMOVE claimedAt',
     ExpressionAttributeNames: { '#s': 'status' },
     ExpressionAttributeValues: {
       ':status': finalStatus,
       ':reason': exitReason,
       ':ts': now(),
-      ':sent': now(),
+      ...(delivered ? { ':sent': now() } : {}),
     },
   }).promise();
 }
@@ -617,7 +773,11 @@ async function exitEnrollment(
   exitReason: ExitReason,
 ): Promise<void> {
   const finalStatus: EnrollmentStatus = exitReason === 'unsubscribed' ? 'unsubscribed' : 'exited';
-  await completeEnrollment(enrollmentId, exitReason, finalStatus);
+  // delivered=false. An exit sends NOTHING — unsubscribe, conversion, engagement exit,
+  // archived sequence, condition-not-met — so stamping a sent-timestamp records a message
+  // that never existed. This is the highest-volume caller of completeEnrollment and the
+  // `delivered` flag was added without reaching it.
+  await completeEnrollment(enrollmentId, exitReason, finalStatus, 'email', false);
 }
 
 async function getEnrollmentStats(sequenceId: string): Promise<{

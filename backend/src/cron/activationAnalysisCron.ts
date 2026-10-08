@@ -1,5 +1,6 @@
 import { userDb, crmDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
+import { isEvaluationUser } from '../services/evaluationPolicy';
 
 const getCrmSyncSettingName = (source: string) => `admin_crm_sync_${source}`;
 const parseCrmSyncSetting = (rawValue?: string | null) => {
@@ -40,7 +41,9 @@ export function getActivationFields(user: any): {
 export async function runActivationAnalysis() {
     console.log("[ActivationCron] Starting execution...");
     try {
-        const allUsers = await userDb.getAllUsers();
+        // ENG-1907: a sandbox principal never finishes brand onboarding by design; it must
+        // not be synced into the internal CRM as a "stuck" customer or nudged.
+        const allUsers = (await userDb.getAllUsers()).filter((u: any) => !isEvaluationUser(u.userId));
         console.log(`[ActivationCron] Found ${allUsers.length} users to analyze`);
 
         // chatSessionCount is already computed by userDb.getAllUsers() via UserIdIndex GSI
@@ -63,7 +66,7 @@ export async function runActivationAnalysis() {
             }
             // Map back to the format crmDb expects for leads
             const leadsToUpdate = metrics.map(m => ({ email: m.email, customFields: m.customFields }));
-            const crmResult = await crmDb.batchCreateLeads(parsed.listId, leadsToUpdate);
+            const crmResult = await crmDb.batchCreateLeads(parsed.listId, leadsToUpdate, { origin: 'integration' });
             console.log(`[ActivationCron] CRM Update complete: ${crmResult.mergedCount} merged, ${crmResult.newCount} new, ${crmResult.errorCount} errors`);
         } else {
             console.log("[ActivationCron] CRM Sync disabled or no list ID configured for users.");

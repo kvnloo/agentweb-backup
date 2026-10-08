@@ -33,6 +33,9 @@ import {
 } from '../../../../utils/toolOutputContract';
 import { extractToolContent } from '../../../../utils/extractToolContent';
 import { classifyToolErrorClass } from '../../../../utils/toolErrorClassifier';
+// The REAL downgrade the dispatcher is wired with in production, so the install_skills ledger
+// shape below is established rather than assumed.
+import { toolResultError as realToolResultError } from '../../../../utils/toolResultError';
 
 /** Build a model tool_call in the shape the loop emits. */
 function toolCall(id: string, name: string, args: string) {
@@ -102,6 +105,283 @@ function makeInput(
 }
 
 describe('executePreparedTools', () => {
+  // ENG-1337: the loop-breaker is a hard execution-layer deny, not just prose.
+  describe('while loopBreakerActive', () => {
+    const run = async (name: string, active = true) => {
+      const executed: string[] = [];
+      const ports = makePorts({
+        executePreparedAgentTool: async (i: any) => { executed.push(i.toolName); return { success: true }; },
+      } as any);
+      const gateway = jest.spyOn(ports, 'executeAgentToolThroughGateway');
+      const input = makeInput([toolCall('c1', name, '{}')], ports, { loopBreakerActive: active });
+      await executePreparedTools(input);
+      return { executed, input, gateway };
+    };
+
+    it.each(['send_email', 'create_lead', 'update_crm_contact', 'delete_campaign', 'publish_social_post'])(
+      'denies write/publish/send tool %s before it reaches the gateway',
+      async (name) => {
+        const { executed, input } = await run(name);
+        expect(executed).toEqual([]);
+        expect(String(input.toolCallsLedger[0]?.error ?? '')).toMatch(/only read-only or verification tools/);
+        expect(JSON.stringify(input.messages)).toContain('loop_breaker');
+      },
+    );
+
+    it.each(['read_brand_guidelines', 'read_market_strategy', 'get_google_ads_report', 'list_leads', 'web_search'])(
+      'still executes read-only/verification tool %s',
+      async (name) => {
+        const { executed } = await run(name);
+        expect(executed).toEqual([name]);
+      },
+    );
+
+    it('still denies install_skills (ENG-763 regression)', async () => {
+      const { executed } = await run('install_skills');
+      expect(executed).toEqual([]);
+    });
+
+    it('denies ask_user_question before it can halt the run with another question deck', async () => {
+      const { executed, input, gateway } = await run('ask_user_question');
+      expect(gateway).not.toHaveBeenCalled();
+      expect(executed).toEqual([]);
+      expect(String(input.toolCallsLedger[0]?.error ?? '')).toMatch(/only read-only or verification tools/);
+      expect(JSON.stringify(input.messages)).toContain('loop_breaker');
+    });
+
+    it('still executes ask_user_question when the loop-breaker is inactive', async () => {
+      const { executed, gateway } = await run('ask_user_question', false);
+      expect(gateway).toHaveBeenCalledTimes(1);
+      expect(executed).toEqual(['ask_user_question']);
+    });
+
+    it('does not deny writes when the loop-breaker is inactive', async () => {
+      const { executed } = await run('send_email', false);
+      expect(executed).toEqual(['send_email']);
+    });
+  });
+
+  /*
+   * Observed live (delegated session a1a6345a, Phoenix): this gate refused
+   * `audit_ad_utm_coverage`, the `install_skills` fallback was refused by subscription, and the
+   * model then ran an unrelated AD LIST and presented a confident "UTM Tagging Audit Summary —
+   * PASS, 6/6 tagged" table built from it, as though the audit had run and passed. A downstream
+   * truthfulness guard appended a correction, but BELOW the fabricated table.
+   *
+   * The gate error told the model to install the skill and said nothing about what to do when
+   * the install itself fails — so it improvised. These pin the instruction it now carries.
+   */
+  describe('a skill-gated tool refusal', () => {
+    const gatedInput = (ports: any) =>
+      makeInput([toolCall('g', 'audit_ad_utm_coverage', '{}')], ports, {
+        publishedSkillsCount: 1,
+        sessionAssociatedSkillIdsCount: 1,
+        allowedToolNames: new Set<string>(['read_brand_guidelines']),
+      });
+
+    it('forbids substituting another tool and presenting it as this tool having run', async () => {
+      const ports = makePorts();
+      const input = gatedInput(ports);
+
+      await executePreparedTools(input);
+
+      const err = String(input.toolCallsLedger[0]?.error ?? '');
+      expect(err).toMatch(/do not run a different tool/i);
+      expect(err).toMatch(/substituting other data makes the claim false/i);
+    });
+
+    it('says what to do when the install itself cannot succeed', async () => {
+      const ports = makePorts();
+      const input = gatedInput(ports);
+
+      await executePreparedTools(input);
+
+      const err = String(input.toolCallsLedger[0]?.error ?? '');
+      // Was `/unavailable on their plan/i` -- ENG-1844 (de6002c8e, 2026-09-11) removed that
+      // guessed cause deliberately: this gate fires BEFORE install_skills ever runs, and
+      // install_skills refuses for four distinct reasons (billing, catalog gap, bad id, role),
+      // only one of which is billing (the exact bug ENG-1795 exists for). Asserting a specific
+      // guessed cause here pre-empts install_skills' own accurate, already-bucketed reason. The
+      // invariant this test protects is now "defer, don't guess," not "name the billing cause."
+      expect(err).toMatch(/do not guess or assume why/i);
+      expect(err).toMatch(/relay install_skills' own response message/i);
+    });
+
+    it('keeps the prefix that classifyToolErrorClass keys tool_unavailable off', async () => {
+      const ports = makePorts();
+      const input = gatedInput(ports);
+
+      await executePreparedTools(input);
+
+      const err = String(input.toolCallsLedger[0]?.error ?? '');
+      // Appending guidance must not change how the error is classified upstream.
+      expect(err).toContain('is not available. You must install the required skill first using install_skills.');
+      expect(classifyToolErrorClass(new Error(err))).toBe('tool_unavailable');
+    });
+
+    it('still does not execute the gated tool', async () => {
+      const ports = makePorts();
+      const input = gatedInput(ports);
+
+      await executePreparedTools(input);
+
+      expect((ports as any).__execOrder ?? []).not.toContain('audit_ad_utm_coverage');
+    });
+
+    /*
+     * What a REFUSED install_skills actually looks like in the ledger, established here rather
+     * than assumed anywhere downstream.
+     *
+     * `installSkills` never throws — every refusal returns `{ success: false, message }` and so
+     * travels the dispatcher's SUCCESS path. The claim that this therefore reaches the ledger
+     * with neither an `error` nor a `success: false` is WRONG, and worth pinning so nobody
+     * re-derives it: the downgrade below (the REAL `toolResultError`, wired as the production
+     * port is) converts a `success: false` result into a tool failure first, so the entry does
+     * carry an `error`.
+     *
+     * Anything reading the ledger to decide whether the install worked keys off exactly that,
+     * so this test is what keeps the two from drifting: unwire the downgrade and it fails here,
+     * not silently in production.
+     */
+    it('a refused install_skills reaches the ledger as a failure, not a bare success', async () => {
+      const ports = makePorts({
+        toolResultError: realToolResultError,
+        executePreparedAgentTool: async () => ({
+          success: false,
+          message: 'The requested skills are not available with your current subscription.',
+        }),
+      });
+      const input = makeInput([toolCall('i', 'install_skills', '{"skillIds":["utm-audit"]}')], ports);
+
+      await executePreparedTools(input);
+
+      const entry = input.toolCallsLedger[0];
+      expect(entry.name).toBe('install_skills');
+      expect(String(entry.error)).toMatch(/not available with your current subscription/i);
+    });
+
+    /*
+     * The gap the downgrade genuinely cannot cover. A PARTIAL install returns `success: true` —
+     * something did install — so `toolResultError` raises nothing and the entry is an ordinary
+     * success. Only the minimized RESULT can say that the skill the gated tool needed may have
+     * been the one refused, which is why extractMinimalToolResult keeps `rejectedSkillIds`.
+     */
+    it('a PARTIAL install reaches the ledger as a success, so the result must carry the refusal', async () => {
+      const partial = {
+        success: true,
+        message: 'Successfully installed 1 skill(s). Could not resolve these skill IDs to any known skill: no-such-id. This is an ID problem, not a billing one.',
+        installedSkills: ['Some Other Skill'],
+        rejectedSkillIds: ['utm-audit'],
+        // The tool names installSkills resolved rejectedSkillIds to (agentModeService.ts) —
+        // what buildUnavailableCapabilityNotice's per-tool scoping keys off. Included here so
+        // this test proves it reaches the ledger through the actual dispatch boundary, not
+        // just through extractMinimalToolResult called directly.
+        rejectedToolNames: ['audit_ad_utm_coverage'],
+      };
+      const ports = makePorts({
+        toolResultError: realToolResultError,
+        executePreparedAgentTool: async () => partial,
+      });
+      const input = makeInput([toolCall('i', 'install_skills', '{"skillIds":["a","utm-audit"]}')], ports);
+
+      await executePreparedTools(input);
+
+      const entry = input.toolCallsLedger[0];
+      expect(entry.error).toBeUndefined();
+      expect(entry.result.rejectedToolNames).toEqual(['audit_ad_utm_coverage']);
+      // makePorts' minimizer is identity, so this asserts the FIELD survives to the minimizer.
+      // agentModeService.skills.test.ts pins that the real minimizer keeps it.
+      expect(entry.result.rejectedSkillIds).toEqual(['utm-audit']);
+    });
+  });
+
+  /*
+   * ENG-1945 follow-up: install_skills now runs its real, gateway-routed execution
+   * eagerly in Phase 1 (so a sibling call gated by it can unlock in the SAME batch —
+   * see installSkillsSameBatchToolGate.test.ts), instead of only in Phase 2. That
+   * eager call must be the tool's ONLY execution for a given tool_call_id, not an
+   * extra one layered on top of Phase 2 — a second, independent execution through
+   * the REAL gateway double-records failures against the same per-run breaker key,
+   * which halves the model's genuine 2-strike retry budget for install_skills'
+   * FAST_TRIP rejection classes (skill_install_refused/subscription_blocked/
+   * invalid_args) without either the model or a human ever seeing two attempts.
+   */
+  describe('install_skills executes exactly once per call (breaker budget)', () => {
+    const REJECTION = {
+      success: false,
+      message: 'Could not resolve these skill IDs to any known skill: no-such-skill.',
+    };
+
+    const realGatewayPorts = (spy: jest.Mock) =>
+      makePorts({
+        evaluateAgentToolPolicy,
+        validateAndRepairToolArgs,
+        toolResultError: realToolResultError,
+        getToolInputSchema: () => undefined,
+        executeAgentToolThroughGateway: spy,
+        executePreparedAgentTool: async () => REJECTION,
+      });
+
+    it('calls the real gateway exactly once for a single install_skills tool call', async () => {
+      const spy = jest.fn(executeAgentToolThroughGateway);
+      const ports = realGatewayPorts(spy);
+      const input = makeInput(
+        [toolCall('i1', 'install_skills', '{"skillIds":["no-such-skill"]}')],
+        ports,
+        { agentRuntimeRunId: 'run-single-exec' },
+      );
+
+      await executePreparedTools(input);
+
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(String(input.toolCallsLedger[0].error)).toContain('no-such-skill');
+    });
+
+    // The regression this pins: with a double execution, ONE rejected call in turn 1
+    // already records 2 failures (fast-trip threshold), so turn 2 — the model's
+    // first genuine retry — is silently short-circuited by the breaker instead of
+    // re-running and reporting the real, bucketed rejection reason. With a single
+    // execution, turn 1 records exactly 1 failure, so turn 2 still runs for real and
+    // only turn 3 (the model's SECOND genuine retry) trips the breaker.
+    it('takes two genuine identical failures across turns to trip the repeated-failure breaker, not one', async () => {
+      const spy = jest.fn(executeAgentToolThroughGateway);
+      const ports = realGatewayPorts(spy);
+      const runId = 'run-breaker-budget';
+
+      const turn2 = makeInput(
+        [toolCall('i2', 'install_skills', '{"skillIds":["no-such-skill"]}')],
+        ports,
+        { agentRuntimeRunId: runId },
+      );
+      const turn1 = makeInput(
+        [toolCall('i1', 'install_skills', '{"skillIds":["no-such-skill"]}')],
+        ports,
+        { agentRuntimeRunId: runId },
+      );
+      await executePreparedTools(turn1);
+      await executePreparedTools(turn2);
+
+      // Turn 2 must still be the REAL rejection reason (gateway ran install_skills
+      // again), not a generic repeated-failure stop message — that only happens once
+      // the breaker has actually seen 2 genuine failures.
+      expect(String(turn2.toolCallsLedger[0].error)).toContain('no-such-skill');
+      expect(spy).toHaveBeenCalledTimes(2);
+
+      const turn3 = makeInput(
+        [toolCall('i3', 'install_skills', '{"skillIds":["no-such-skill"]}')],
+        ports,
+        { agentRuntimeRunId: runId },
+      );
+      await executePreparedTools(turn3);
+
+      // Now (2 genuine prior failures) the breaker trips: the gateway is still
+      // invoked (it does the tripped-check internally) but its own `execute()` must
+      // NOT run a 3rd time, and the model sees the repeated-failure stop message.
+      expect(spy).toHaveBeenCalledTimes(3);
+      expect(String(turn3.toolCallsLedger[0].error)).toMatch(/already failed 2 times/i);
+    });
+  });
+
   it('executes a batch and appends tool messages in original order', async () => {
     const ports = makePorts();
     const input = makeInput(
@@ -238,6 +518,62 @@ describe('executePreparedTools', () => {
     expect(input.messages[0].content).toContain('Retryable:');
     expect(result.failedCounterUpdates).toEqual({ read_brand_guidelines: 1 });
     expect(result.pendingCounterUpdates).toEqual({});
+  });
+
+  // ENG-2086: a tool can fail by echoing its own (unbounded) result back inside
+  // `error` — call_google_ads_reporting_api's serving_chain mode JSON.stringifies
+  // the full campaign/ad-group/keyword tree into `error` whenever the account
+  // isn't fully READY/DELIVERING. Unlike the success path (which offloads/caps
+  // `toolContent` above), this error branch had NO size guard at all, so a
+  // multi-MB error message went out to the LLM provider unbounded and
+  // OpenRouter/Gemini 400'd on the oversized request (prod session
+  // d02669e9-c3b8-4b65-ab51-a9c045c63b65, surfaced as an opaque "please
+  // rephrase" to the user). This pins that the error branch is capped the same
+  // way the success branch caps `toolContent`.
+  it('caps an oversized error message before it reaches the LLM', async () => {
+    const huge = 'X'.repeat(400_000);
+    const ports = makePorts({
+      executePreparedAgentTool: async () => {
+        throw new Error(huge);
+      },
+    });
+    const input = makeInput([toolCall('a', 'call_google_ads_reporting_api', '{}')], ports);
+    await executePreparedTools(input);
+
+    const stored = input.messages[0].content as string;
+    // The cap reserves room for the notice before slicing, so the final sealed
+    // result never exceeds maxToolContentSize (300_000) — not "roughly", exactly.
+    expect(stored.length).toBeLessThanOrEqual(300_000);
+    expect(stored).toContain('[Error message truncated for size — original length:');
+  });
+
+  // ENG-2086 follow-up (CodeRabbit): the FINAL assembled content must be capped,
+  // not just the raw message. formatToolError's per-tool fix text and
+  // appendRetryabilityGuidance's verdict line are appended AFTER the raw
+  // message — a raw-message-only cap could still let their added text push the
+  // actual wire content past maxToolContentSize. Construct a raw message that
+  // is UNDER the cap by itself but pushes over it once wrapped, and confirm the
+  // final content is still bounded.
+  it('caps the fully-formatted error content even when the raw message alone is under the limit', async () => {
+    // 'ERR: ' (the fake formatToolError prefix) + this message is exactly
+    // maxToolContentSize; appendRetryabilityGuidance's non-empty verdict line
+    // then pushes the assembled content over.
+    const justUnderCap = 'X'.repeat(300_000 - 'ERR: '.length);
+    const ports = makePorts({
+      executePreparedAgentTool: async () => {
+        throw new Error(justUnderCap);
+      },
+    });
+    const input = makeInput([toolCall('a', 'call_google_ads_reporting_api', '{}')], ports);
+    await executePreparedTools(input);
+
+    const stored = input.messages[0].content as string;
+    // Proves the fix: the raw message (299,995 chars) is UNDER maxToolContentSize
+    // on its own, so a raw-message-only cap would have left this untouched. The
+    // assembled content (300,000+ once formatted and retryability-guided) must
+    // still come out capped — exactly, notice included.
+    expect(stored.length).toBeLessThanOrEqual(300_000);
+    expect(stored).toContain('[Error message truncated for size — original length:');
   });
 
   // ENG-1626: a ToolResultPolicyBlockedError is a tool refusing BY DESIGN (e.g.
@@ -385,6 +721,40 @@ describe('executePreparedTools', () => {
     expect(result.failedCounterUpdates).toEqual({ freeze_user_account: 1 });
     // the gateway should never have been reached for a preflight failure
     expect((ports as any).__execOrder).toEqual([]);
+  });
+
+  it('preflight-blocks org notification settings writes in a shared (share-link) session', async () => {
+    const ports = makePorts();
+    const input = makeInput(
+      [toolCall('a', 'update_lead_notification_settings', '{"leadTypes":[]}')],
+      ports,
+      { hasAdminAccess: false, isInteractiveShare: true },
+    );
+    await executePreparedTools(input);
+
+    expect(input.toolCallsLedger[0].error).toContain('not available in shared sessions');
+    expect((ports as any).__execOrder).toEqual([]);
+  });
+
+  it.each([
+    ['get_lead_notification_settings', '{}'],
+    ['save_org_memory', '{"content":"Remember for the whole org: x"}'],
+    ['delete_org_memory', '{"memoryId":"m1"}'],
+    ['save_memory', '{"content":"x"}'],
+    ['delete_memory', '{"memoryId":"m1"}'],
+  ])('preflight-blocks owner-scoped %s in a shared (share-link) session', async (name, args) => {
+    const ports = makePorts();
+    const input = makeInput([toolCall('a', name, args)], ports, { hasAdminAccess: true, isInteractiveShare: true });
+    await executePreparedTools(input);
+    expect(input.toolCallsLedger[0].error).toContain('not available in shared sessions');
+    expect((ports as any).__execOrder).toEqual([]);
+  });
+
+  it('still allows save_org_memory in the owner\'s own session', async () => {
+    const ports = makePorts();
+    const input = makeInput([toolCall('a', 'save_org_memory', '{"content":"x"}')], ports, { hasAdminAccess: true, isInteractiveShare: false });
+    await executePreparedTools(input);
+    expect(input.toolCallsLedger[0].error).toBeUndefined();
   });
 
   it('records a JSON-parse failure as a preflight error', async () => {
@@ -779,6 +1149,67 @@ describe('executePreparedTools', () => {
     });
   });
 
+  // ENG-2132: openrouter/deepseek/deepseek-v4-flash has no verified vision support
+  // (no `supportsVision` entry in LLM_MODEL_REGISTRY). The prior gate only checked
+  // "isn't Gemini" and assumed every other model could take an inline image — for
+  // this model OpenRouter has no endpoint that accepts image input at all, so the
+  // next LLM call 404'd with "No endpoints found that support image input" (prod
+  // session ffe0e1ad-16f4-4ca6-ada2-3bc87c3d3761). Pins that the inline-image
+  // branch requires a verified `supportsVision: true`, not just "not Gemini".
+  describe('screenshot inline-image gating by model vision support (ENG-2132)', () => {
+    function screenshotWithImagePorts() {
+      return makePorts({
+        executePreparedAgentTool: async () => ({
+          raw: { content: [{ type: 'image', data: 'ZmFrZQ==', mimeType: 'image/png' }] },
+        }),
+        uploadScreenshotToS3: async () => ({ url: 'https://s3/shot.png' }),
+      });
+    }
+
+    it('does NOT embed the image for a model with no verified vision support', async () => {
+      const ports = screenshotWithImagePorts();
+      const input = makeInput(
+        [toolCall('a', 'playwright_browser_take_screenshot', '{}')],
+        ports,
+        { llmModel: 'openrouter/deepseek/deepseek-v4-flash' },
+      );
+      await executePreparedTools(input);
+
+      const content = input.messages[0].content;
+      expect(typeof content).toBe('string');
+      expect(content).toContain('https://s3/shot.png');
+      expect(JSON.stringify(content)).not.toContain('image_url');
+    });
+
+    it('still embeds the image for a non-Gemini model with verified vision support', async () => {
+      const ports = screenshotWithImagePorts();
+      const input = makeInput(
+        [toolCall('a', 'playwright_browser_take_screenshot', '{}')],
+        ports,
+        { llmModel: 'gpt-5.4' },
+      );
+      await executePreparedTools(input);
+
+      const content = input.messages[0].content as Array<{ type: string }>;
+      expect(Array.isArray(content)).toBe(true);
+      expect(content.some((part) => part.type === 'image_url')).toBe(true);
+    });
+
+    it('still uses the text+URL fallback for Gemini (unrelated, pre-existing reason)', async () => {
+      const ports = screenshotWithImagePorts();
+      const input = makeInput(
+        [toolCall('a', 'playwright_browser_take_screenshot', '{}')],
+        ports,
+        { llmModel: 'gemini-3.8-flash' },
+      );
+      await executePreparedTools(input);
+
+      const content = input.messages[0].content;
+      expect(typeof content).toBe('string');
+      expect(content).toContain('https://s3/shot.png');
+    });
+  });
+
   describe('adaptive hard-cap deferral (ENG-510)', () => {
     // Gateway fake whose media-gen calls report a configurable wall-clock duration,
     // so we can prove the deferral reserves enough time for one more call below the
@@ -1167,7 +1598,7 @@ describe('executePreparedTools', () => {
       expect(result.mediaAssetsProduced).toBe(1);
     });
 
-    it('requires revision source inputImages when approved sources are provided', async () => {
+    it('requires an edit call (inputImages set) to use one of the approved sources', async () => {
       const execOrder: string[] = [];
       const ports = makePorts({
         executeAgentToolThroughGateway: async (i) => {
@@ -1175,6 +1606,171 @@ describe('executePreparedTools', () => {
           const result = await i.execute();
           return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
         },
+      });
+
+      const input = makeInput(
+        [toolCall('a', 'generate_image', JSON.stringify({
+          prompt: 'edit', confirm: true, inputImages: ['https://assets.example.com/unapproved.png'],
+        }))],
+        ports,
+        {
+          approvedRevisionImageSources: ['https://assets.example.com/approved.png'],
+        },
+      );
+
+      const result = await executePreparedTools(input);
+
+      expect(execOrder).toEqual([]);
+      expect(result.failedCounterUpdates).toEqual({ generate_image: 1 });
+      expect(result.pendingCounterUpdates).toEqual({});
+      expect(input.toolCallsLedger[0]).toMatchObject({
+        name: 'generate_image',
+        error: expect.stringContaining('source mismatch'),
+      });
+      expect(input.messages[0].content).toContain('source mismatch');
+    });
+
+    it('allows an edit call that uses exactly the approved source', async () => {
+      const execOrder: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          execOrder.push(i.toolName);
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async () => ({ success: true, imageUrl: 'https://s3/edited.png', filename: 'edited.png' }),
+      });
+
+      const input = makeInput(
+        [toolCall('a', 'generate_image', JSON.stringify({
+          prompt: 'edit', confirm: true, inputImages: ['https://assets.example.com/approved.png'],
+        }))],
+        ports,
+        {
+          approvedRevisionImageSources: ['https://assets.example.com/approved.png'],
+        },
+      );
+
+      const result = await executePreparedTools(input);
+
+      expect(execOrder).toEqual(['generate_image']);
+      expect(result.failedCounterUpdates).toEqual({});
+      expect(result.pendingCounterUpdates).toEqual({ generate_image: 1 });
+    });
+
+    // Review fix: `logo_image` is a real edit source at execution time —
+    // imageGeneration.ts's generateImage() appends it onto inputImages before
+    // generating — but the gate previously only inspected inputImages/input_images.
+    // A call with confirm:true, no inputImages, and an unapproved logo_image sailed
+    // through as "not an edit" (getInputImages returned []) and bypassed source
+    // validation entirely. Must be rejected the same way a mismatched inputImages
+    // call is.
+    it('rejects a logo_image that is not one of the approved sources, even with no inputImages set', async () => {
+      const execOrder: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          execOrder.push(i.toolName);
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+      });
+
+      const input = makeInput(
+        [toolCall('a', 'generate_image', JSON.stringify({
+          prompt: 'add our logo', confirm: true, logo_image: 'https://assets.example.com/unapproved-logo.png',
+        }))],
+        ports,
+        {
+          approvedRevisionImageSources: ['https://assets.example.com/approved.png'],
+        },
+      );
+
+      const result = await executePreparedTools(input);
+
+      expect(execOrder).toEqual([]);
+      expect(result.failedCounterUpdates).toEqual({ generate_image: 1 });
+      expect(result.pendingCounterUpdates).toEqual({});
+      expect(input.toolCallsLedger[0]).toMatchObject({
+        name: 'generate_image',
+        error: expect.stringContaining('source mismatch'),
+      });
+    });
+
+    it('allows a logo_image that matches exactly the approved source', async () => {
+      const execOrder: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          execOrder.push(i.toolName);
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async () => ({ success: true, imageUrl: 'https://s3/branded.png', filename: 'branded.png' }),
+      });
+
+      const input = makeInput(
+        [toolCall('a', 'generate_image', JSON.stringify({
+          prompt: 'add our logo', confirm: true, logo_image: 'https://assets.example.com/approved.png',
+        }))],
+        ports,
+        {
+          approvedRevisionImageSources: ['https://assets.example.com/approved.png'],
+        },
+      );
+
+      const result = await executePreparedTools(input);
+
+      expect(execOrder).toEqual(['generate_image']);
+      expect(result.failedCounterUpdates).toEqual({});
+      expect(result.pendingCounterUpdates).toEqual({ generate_image: 1 });
+    });
+
+    // ENG-2166: a real customer (Vincent Hu) hit this. An approved-source list is
+    // fixed for the WHOLE run (e.g. revisionService.ts's Slack-driven "revise this
+    // asset" flow sets one approved URL for the whole bounded runVerifiedChat call).
+    // Once one confirmed edit against that URL succeeded, every LATER, UNRELATED
+    // generate_image call in the same run — plain text-to-image, no inputImages at
+    // all — started failing with "Expected one of: [the one approved URL]. Received
+    // none.", permanently blocking all new generations for the rest of the session.
+    // A call with no inputImages isn't an edit/revision at all, so the approved-
+    // source gate must never apply to it, regardless of whether an approved-sources
+    // list happens to be active for the run.
+    it('never blocks a plain text-to-image call (no inputImages) even when an approved-sources list is active (ENG-2166)', async () => {
+      const execOrder: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          execOrder.push(i.toolName);
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async () => ({ success: true, imageUrl: 'https://s3/fresh.png', filename: 'fresh.png' }),
+      });
+
+      const input = makeInput(
+        [toolCall('a', 'generate_image', JSON.stringify({ prompt: 'a brand new unrelated image' }))],
+        ports,
+        {
+          approvedRevisionImageSources: ['https://assets.example.com/approved.png'],
+        },
+      );
+
+      const result = await executePreparedTools(input);
+
+      expect(execOrder).toEqual(['generate_image']);
+      expect(result.failedCounterUpdates).toEqual({});
+      expect(result.pendingCounterUpdates).toEqual({ generate_image: 1 });
+    });
+
+    // Same case with confirm:true set but still no inputImages — confirm is only
+    // meaningful for an edit; a plain generation must not be gated on it either.
+    it('never blocks a plain text-to-image call with confirm=true but no inputImages (ENG-2166)', async () => {
+      const execOrder: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          execOrder.push(i.toolName);
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async () => ({ success: true, imageUrl: 'https://s3/fresh2.png', filename: 'fresh2.png' }),
       });
 
       const input = makeInput(
@@ -1187,44 +1783,9 @@ describe('executePreparedTools', () => {
 
       const result = await executePreparedTools(input);
 
-      expect(execOrder).toEqual([]);
-      expect(result.failedCounterUpdates).toEqual({ generate_image: 1 });
-      expect(result.pendingCounterUpdates).toEqual({});
-      expect(input.toolCallsLedger[0]).toMatchObject({
-        name: 'generate_image',
-        error: expect.stringContaining('explicit approved source inputImages'),
-      });
-      expect(input.messages[0].content).toContain('explicit approved source inputImages');
-    });
-
-    it('requires revision source inputImages even without explicit confirm=true', async () => {
-      const execOrder: string[] = [];
-      const ports = makePorts({
-        executeAgentToolThroughGateway: async (i) => {
-          execOrder.push(i.toolName);
-          const result = await i.execute();
-          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
-        },
-      });
-
-      const input = makeInput(
-        [toolCall('a', 'generate_image', JSON.stringify({ prompt: 'edit' }))],
-        ports,
-        {
-          approvedRevisionImageSources: ['https://assets.example.com/approved.png'],
-        },
-      );
-
-      const result = await executePreparedTools(input);
-
-      expect(execOrder).toEqual([]);
-      expect(result.failedCounterUpdates).toEqual({ generate_image: 1 });
-      expect(result.pendingCounterUpdates).toEqual({});
-      expect(input.toolCallsLedger[0]).toMatchObject({
-        name: 'generate_image',
-        error: expect.stringContaining('explicit approved source inputImages'),
-      });
-      expect(input.messages[0].content).toContain('explicit approved source inputImages');
+      expect(execOrder).toEqual(['generate_image']);
+      expect(result.failedCounterUpdates).toEqual({});
+      expect(result.pendingCounterUpdates).toEqual({ generate_image: 1 });
     });
   });
 

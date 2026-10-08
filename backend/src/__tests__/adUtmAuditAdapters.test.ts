@@ -107,7 +107,7 @@ import { metaService } from '../services/metaService';
 import { googleAdsService } from '../services/googleAdsService';
 import * as linkedInAdsService from '../services/linkedInAdsService';
 import { metaAdReadPort, googleAdReadPort, linkedInAdReadPort } from '../services/adUtmAuditAdapters';
-import { auditCampaigns } from '../services/adUtmAuditService';
+import { auditCampaigns, readPortResult } from '../services/adUtmAuditService';
 import { getAccountsWithOwnerIncludingOrgShared } from '../services/connectedAccountsDb';
 
 const USER = 'user-1';
@@ -321,8 +321,11 @@ describe('Meta — listAdsForUtmAudit reads every site createAdCreative writes',
       metaAd('ad2', 'c2', { id: 'cr2', link_url: 'https://example.com/b' }), // other campaign
     ]);
 
-    const ads = await metaAdReadPort.listAdDestinations(USER, '1234567890', 'c1');
-    expect(ads.map((a) => a.adId)).toEqual(['ad1']);
+    // The Meta port now reports read completeness alongside the rows (see PortRead), so the
+    // adapter returns `{ items, truncated }`. The invariant under test — that an ad from
+    // another campaign is filtered out — is unchanged.
+    const ads = readPortResult(await metaAdReadPort.listAdDestinations(USER, '1234567890', 'c1'));
+    expect(ads.items.map((a) => a.adId)).toEqual(['ad1']);
   });
 });
 
@@ -337,9 +340,19 @@ describe('Google — listAdsForUtmAudit and final_url_suffix inheritance', () =>
   const mockGaql = (opts: { campaigns?: any[]; adRows?: any[]; assetGroupRows?: any[] }) => {
     mockAxiosPost.mockImplementation(async (_url: string, body: any) => {
       const q = String(body?.query ?? '');
-      if (q.includes('FROM ad_group_ad')) return { data: { results: opts.adRows ?? [] } };
-      if (q.includes('FROM asset_group')) return { data: { results: opts.assetGroupRows ?? [] } };
-      return { data: { results: opts.campaigns ?? [] } };
+      // search() requires totalResultsCount whenever the caller asked for completeness
+      // tracking (searchSettings.returnTotalResultsCount) — every port call does. A
+      // single-page mock with no more rows than it returns reports its own row count.
+      if (q.includes('FROM ad_group_ad')) {
+        const adRows = opts.adRows ?? [];
+        return { data: { results: adRows, totalResultsCount: adRows.length } };
+      }
+      if (q.includes('FROM asset_group')) {
+        const assetGroupRows = opts.assetGroupRows ?? [];
+        return { data: { results: assetGroupRows, totalResultsCount: assetGroupRows.length } };
+      }
+      const campaigns = opts.campaigns ?? [];
+      return { data: { results: campaigns, totalResultsCount: campaigns.length } };
     });
   };
 
@@ -365,6 +378,59 @@ describe('Google — listAdsForUtmAudit and final_url_suffix inheritance', () =>
     expect(report).toEqual([
       { campaignId: '111', name: 'Search — Brand', tagged: true, missingKeys: [], untaggedAdIds: [], unreadableAdIds: [] },
     ]);
+  });
+
+  /*
+   * THE FABRICATED ✅, on the platform the first fix missed.
+   *
+   * `googleAdsService.search` walks pages until a 50-page cap and then returns what it has.
+   * The Google port used to hand the audit a bare array, which `readPortResult` reads as
+   * "complete by construction" — so a capped read produced "✅ All N campaign(s) on google
+   * carry UTM tracking" about ads that were never fetched. Same sentence shape as the Meta
+   * fabricated PASS, one platform over.
+   *
+   * Driven through the real service (axios mocked), not by stubbing the port: the point is
+   * that the cap is what sets the flag.
+   */
+  it('a page-capped Google read reports truncation instead of a clean bill of health', async () => {
+    // Every response carries a nextPageToken, so the walk can only stop at MAX_PAGES.
+    mockAxiosPost.mockImplementation(async (_url: string, body: any) => {
+      const q = String(body?.query ?? '');
+      if (q.includes('FROM ad_group_ad')) {
+        return {
+          data: {
+            results: [
+              {
+                campaign: { id: '111', name: 'Capped' },
+                adGroupAd: { ad: { id: '5001', finalUrls: ['https://example.com/lp'], finalUrlSuffix: GOOGLE_SUFFIX } },
+              },
+            ],
+            // Google reports the same total on every page of a walk; consistently below what
+            // MAX_PAGES will ever collect, since the point of this fixture is that the cap bites.
+            totalResultsCount: 999,
+            nextPageToken: 'more',
+          },
+        };
+      }
+      if (q.includes('FROM asset_group')) return { data: { results: [], nextPageToken: 'more' } };
+      return { data: { results: [campaignRow('111', 'Capped')], totalResultsCount: 999, nextPageToken: 'more' } };
+    });
+
+    const campaignsResult: any = await googleAdReadPort.listCampaigns(USER, CUSTOMER);
+    expect(campaignsResult.truncated).toBe(true);
+
+    const adsResult: any = await googleAdReadPort.listAdDestinations(USER, CUSTOMER, '111');
+    expect(adsResult.truncated).toBe(true);
+
+    // And the audit must carry it, not swallow it: every ad it DID see is tagged, so without
+    // the flag this returns a clean report and the caller prints the ✅.
+    const completeness: { incomplete?: boolean; campaignListIncomplete?: boolean } = {};
+    const reports = await auditCampaigns('google', USER, CUSTOMER, googleAdReadPort, completeness);
+
+    expect(completeness.campaignListIncomplete).toBe(true);
+    expect(completeness.incomplete).toBe(true);
+    expect(reports[0].tagged).toBe(true);      // the rows it read really were tagged …
+    expect(reports[0].adReadIncomplete).toBe(true); // … and it still may not claim the campaign is clean
   });
 
   it('INHERITANCE: an ad with no suffix inherits the campaign suffix → campaign reports tagged', async () => {
@@ -506,9 +572,19 @@ describe('Google — PMax asset groups are audited, never vacuously passed', () 
   const mockGaql = (opts: { campaigns?: any[]; adRows?: any[]; assetGroupRows?: any[] }) => {
     mockAxiosPost.mockImplementation(async (_url: string, body: any) => {
       const q = String(body?.query ?? '');
-      if (q.includes('FROM ad_group_ad')) return { data: { results: opts.adRows ?? [] } };
-      if (q.includes('FROM asset_group')) return { data: { results: opts.assetGroupRows ?? [] } };
-      return { data: { results: opts.campaigns ?? [] } };
+      // search() requires totalResultsCount whenever the caller asked for completeness
+      // tracking (searchSettings.returnTotalResultsCount) — every port call does. A
+      // single-page mock with no more rows than it returns reports its own row count.
+      if (q.includes('FROM ad_group_ad')) {
+        const adRows = opts.adRows ?? [];
+        return { data: { results: adRows, totalResultsCount: adRows.length } };
+      }
+      if (q.includes('FROM asset_group')) {
+        const assetGroupRows = opts.assetGroupRows ?? [];
+        return { data: { results: assetGroupRows, totalResultsCount: assetGroupRows.length } };
+      }
+      const campaigns = opts.campaigns ?? [];
+      return { data: { results: campaigns, totalResultsCount: campaigns.length } };
     });
   };
 
@@ -547,10 +623,13 @@ describe('Google — PMax asset groups are audited, never vacuously passed', () 
       },
     ]);
 
+    // The Google port reports completeness alongside its rows (googleAdsService.search stops at
+    // a 50-page cap), so it returns the `{ items, truncated }` shape rather than a bare array.
     const port = await googleAdReadPort.listAdDestinations(USER, CUSTOMER, '222');
-    expect(port).toEqual([
-      { adId: 'assetGroup/8001', destinationUrls: [BAKED_URL], appendField: undefined },
-    ]);
+    expect(port).toEqual({
+      items: [{ adId: 'assetGroup/8001', destinationUrls: [BAKED_URL], appendField: undefined }],
+      truncated: undefined,
+    });
 
     const report = await auditCampaigns('google', USER, CUSTOMER, googleAdReadPort);
 

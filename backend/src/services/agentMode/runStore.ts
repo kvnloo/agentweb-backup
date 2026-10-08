@@ -145,6 +145,34 @@ export async function createRunRecord(p: CreateRunRecordParams): Promise<void> {
     .promise();
 }
 
+/** Public status projection; never return the raw DynamoDB item. */
+export interface AgentRunStatus {
+  runId: string;
+  sessionId: string;
+  status: 'running' | AgentRunTerminalStatus;
+  finishReason: string | null;
+}
+
+/** Owner-only, read-only lookup. Missing, expired and foreign records are indistinguishable. */
+export async function getOwnedRunStatus(runId: string, userId: string): Promise<AgentRunStatus | null> {
+  if (!isRunStoreEnabled() || !userId) return null;
+  // Run IDs are opaque; reject keys that cannot fit DynamoDB's 2048-byte partition key.
+  if (!runId || Buffer.byteLength(`run#${runId}`, 'utf8') > 2048) return null;
+  const { Item: item } = await getClient().get({
+    TableName: AGENT_RUNS_TABLE,
+    Key: { pk: `run#${runId}` },
+    ConsistentRead: true,
+  }).promise();
+  if (!item || item.userId !== userId || item.runId !== runId ||
+      typeof item.sessionId !== 'string' || !item.sessionId ||
+      !['running', 'completed', 'failed', 'interrupted'].includes(item.status) ||
+      typeof item.ttl !== 'number' || !Number.isFinite(item.ttl) || item.ttl <= nowEpochS() ||
+      (item.finishReason !== undefined && typeof item.finishReason !== 'string')) {
+    return null;
+  }
+  return { runId, sessionId: item.sessionId, status: item.status, finishReason: item.finishReason ?? null };
+}
+
 /**
  * Mark a run terminal (completed / failed / interrupted).
  *

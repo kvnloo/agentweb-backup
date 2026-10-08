@@ -1,5 +1,5 @@
 import { getSubscriptionTypeConfig, getUserSubscriptionType } from "./subscriptionService";
-import { getUserTokenUsage, resolveBillingUserId } from "./tokenUsageService";
+import { getCurrentMonth, getUserTokenUsage, resolveBillingUserId } from "./tokenUsageService";
 import {
   evaluateLlmUsageMode,
   type LlmUsageModeDecision,
@@ -7,12 +7,12 @@ import {
 } from "./llmUsagePolicyService";
 import { userDb } from './db';
 import { applyLlmUsageCredits, getLlmUsageCreditAdjustment } from './llmUsageCreditService';
+import { resolveEnforcementCostBasisMicroUsd } from './spendEnforcementBasis';
 
 export async function getEffectiveLlmUsagePolicy(userId: string): Promise<{
   billingUserId: string;
   policy: LlmUsagePolicy | null;
   costUsedMicroUsd: number;
-  tokenUsed: number;
   mode: LlmUsageModeDecision;
   /**
    * Whether ANY credit moved this cycle's spend or ceiling (ENG-1215 AC4).
@@ -43,20 +43,31 @@ export async function getEffectiveLlmUsagePolicy(userId: string): Promise<{
       policy: null,
       costUsedMicroUsd: 0,
       creditsApplied: false,
-      tokenUsed: 0,
-      mode: evaluateLlmUsageMode({ costUsedMicroUsd: 0, tokenUsed: 0, policy: null }),
+      mode: evaluateLlmUsageMode({ costUsedMicroUsd: 0, policy: null }),
     };
   }
   const billingUserId = await resolveBillingUserId(userId);
-  const [usage, subscriptionType, billingUser] = await Promise.all([
-    getUserTokenUsage(billingUserId),
+  // ENG-1250 AC7: month from the clock; the legacy counter is read only on the rollback fallback.
+  const month = getCurrentMonth();
+  const [subscriptionType, billingUser] = await Promise.all([
     getUserSubscriptionType(billingUserId),
     userDb.getUserById(billingUserId),
   ]);
   const config = await getSubscriptionTypeConfig(subscriptionType);
   const basePolicy = config?.llmUsagePolicy || null;
-  const rawCostUsedMicroUsd = Math.max(0, Math.round((usage.totalCost || 0) * 1_000_000));
-  const adjustment = getLlmUsageCreditAdjustment(billingUser?.llmUsageCredits, usage.month);
+  // Lazy: read only if the basis falls back to legacy (rollback path), never on the live ledger path.
+  const legacyRawCostUsedMicroUsd = async (): Promise<number> =>
+    Math.max(0, Math.round(((await getUserTokenUsage(billingUserId)).totalCost || 0) * 1_000_000));
+  // ENG-1250 §9.6 enforcement cutover (dark by default): swap the raw spend basis
+  // onto the vendor-inclusive spend ledger and leave the rest of this pipeline —
+  // credit application, threshold, predicate — untouched. See spendEnforcementBasis.ts.
+  const { rawCostUsedMicroUsd } = await resolveEnforcementCostBasisMicroUsd({
+    billingUserId,
+    billingMonth: month,
+    legacyRawCostUsedMicroUsd,
+    tier: subscriptionType,
+  });
+  const adjustment = getLlmUsageCreditAdjustment(billingUser?.llmUsageCredits, month);
   const adjusted = basePolicy
     ? applyLlmUsageCredits({
         rawCostUsedMicroUsd,
@@ -72,8 +83,7 @@ export async function getEffectiveLlmUsagePolicy(userId: string): Promise<{
     billingUserId,
     policy,
     costUsedMicroUsd,
-    tokenUsed: usage.totalTokens,
-    mode: evaluateLlmUsageMode({ costUsedMicroUsd, tokenUsed: usage.totalTokens, policy }),
+    mode: evaluateLlmUsageMode({ costUsedMicroUsd, policy }),
     creditsApplied:
       adjustment.purchasedMicroUsd > 0 ||
       adjustment.adminGrantedMicroUsd > 0 ||

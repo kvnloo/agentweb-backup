@@ -27,7 +27,6 @@ jest.mock("../middleware/auth", () => ({
 
 jest.mock("../services/usageAnalyticsService", () => ({
   getUserUsageByModelDay: jest.fn(),
-  getUsageComparison: jest.fn(),
   getCostAggregation: jest.fn(),
   getUserOrgUsageRollup: jest.fn(),
   getXAllocatedTotals: jest.fn(),

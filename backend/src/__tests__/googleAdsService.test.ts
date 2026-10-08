@@ -705,6 +705,44 @@ describe('addProximityCriterion / removeCampaignCriterion (ENG-487)', () => {
     expect(body.operations[0].create.proximity.address).toEqual({ postalCode: '99201' });
   });
 
+  it('creates a PROXIMITY criterion centered on lat/long in micro-degrees (ENG-486)', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/campaignCriteria/1~3' }] } });
+    await service.addProximityCriterion('user-123', '1234567890', 'customers/123/campaigns/2', {
+      radius: 25, radiusUnits: 'KILOMETERS', address: {},
+      geoPoint: { latitude: 47.4668, longitude: -122.2668 },
+    });
+    const create = mockAxiosPost.mock.calls[0][1].operations[0].create;
+    expect(create.proximity).toEqual({
+      radius: 25, radiusUnits: 'KILOMETERS',
+      geoPoint: { latitudeInMicroDegrees: 47466800, longitudeInMicroDegrees: -122266800 },
+    });
+  });
+
+  it('rejects out-of-range coordinates before any API call (ENG-486)', async () => {
+    await expect(service.addProximityCriterion('user-123', '1234567890', 'customers/123/campaigns/2', {
+      radius: 25, address: {}, geoPoint: { latitude: 120, longitude: 0 },
+    })).rejects.toThrow('latitude');
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, null, NaN, Infinity, 0, -1])('rejects invalid radius %s before credential lookup (ENG-486)', async (radius) => {
+    const credentials = jest.spyOn(service as any, 'getAccountCredentials');
+    await expect(service.addProximityCriterion('user-123', '1234567890', 'customers/123/campaigns/2', {
+      radius: radius as number, address: { postalCode: '99201' },
+    })).rejects.toThrow('radius must be a positive finite number');
+    expect(credentials).not.toHaveBeenCalled();
+    credentials.mockRestore();
+  });
+
+  it('rejects a missing center before credential lookup (ENG-486)', async () => {
+    const credentials = jest.spyOn(service as any, 'getAccountCredentials');
+    await expect(service.addProximityCriterion('user-123', '1234567890', 'customers/123/campaigns/2', {
+      radius: 25, address: {},
+    })).rejects.toThrow('at least one address field');
+    expect(credentials).not.toHaveBeenCalled();
+    credentials.mockRestore();
+  });
+
   it('rejects an address with no fields set', async () => {
     await expect(service.addProximityCriterion('user-123', '1234567890', 'customers/123/campaigns/2', {
       radius: 25,
@@ -1322,6 +1360,45 @@ describe('updateCampaign', () => {
     expect(body.operations[0].update.finalUrlSuffix).toBe('utm_source=google&utm_medium=cpc');
     expect(body.operations[0].updateMask).toContain('final_url_suffix');
     expect(didUpdate).toBe(true);
+  });
+
+  it('sends each explicitly supplied campaign network setting with a leaf update mask', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    const didUpdate = await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+      targetGoogleSearch: true,
+      targetSearchNetwork: false,
+      targetContentNetwork: false,
+      targetPartnerSearchNetwork: true,
+    });
+    const operation = mockAxiosPost.mock.calls[0][1].operations[0];
+    expect(operation.update.networkSettings).toEqual({
+      targetGoogleSearch: true,
+      targetSearchNetwork: false,
+      targetContentNetwork: false,
+      targetPartnerSearchNetwork: true,
+    });
+    expect(operation.updateMask).toBe([
+      'network_settings.target_google_search',
+      'network_settings.target_search_network',
+      'network_settings.target_content_network',
+      'network_settings.target_partner_search_network',
+    ].join(','));
+    expect(didUpdate).toBe(true);
+  });
+
+  it('rejects enabling the search network while disabling Google Search', async () => {
+    await expect(service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+      targetGoogleSearch: false,
+      targetSearchNetwork: true,
+    })).rejects.toThrow(/requires target_google_search=true.*nothing was sent/i);
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
+  it('rejects enabling the search network without explicitly enabling Google Search', async () => {
+    await expect(service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+      targetSearchNetwork: true,
+    })).rejects.toThrow(/requires target_google_search=true.*nothing was sent/i);
+    expect(mockAxiosPost).not.toHaveBeenCalled();
   });
 
   it('returns false and makes no API call when no recognized fields are provided', async () => {

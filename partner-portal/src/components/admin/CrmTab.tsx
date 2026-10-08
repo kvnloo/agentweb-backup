@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import EnrichmentHistoryTab from './EnrichmentHistoryTab';
 import {
   Box,
@@ -82,13 +82,14 @@ export default function CrmTab() {
 
   const headers = { Authorization: `Bearer ${token}` };
 
-  const fetchData = async () => {
+  const fetchData = useCallback(async () => {
     try {
       setLoading(true);
+      const requestHeaders = { Authorization: `Bearer ${token}` };
       const [siteWideRes, allAccountsRes, enrichmentConfigRes] = await Promise.all([
-        axios.get(buildApiUrl('/api/settings/site-wide-unipile-accounts'), { headers }),
-        axios.get(buildApiUrl('/api/admin/unipile-accounts'), { headers }),
-        axios.get(buildApiUrl('/api/settings/crm-enrichment-config'), { headers }),
+        axios.get(buildApiUrl('/api/settings/site-wide-unipile-accounts'), { headers: requestHeaders }),
+        axios.get(buildApiUrl('/api/admin/unipile-accounts'), { headers: requestHeaders }),
+        axios.get(buildApiUrl('/api/settings/crm-enrichment-config'), { headers: requestHeaders }),
       ]);
       setSiteWideAccounts(siteWideRes.data.accounts || []);
       setAllUnipileAccounts(allAccountsRes.data.accounts || []);
@@ -100,11 +101,11 @@ export default function CrmTab() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [token]);
 
   useEffect(() => {
     if (token) fetchData();
-  }, [token]);
+  }, [token, fetchData]);
 
   const handleSaveEnrichmentConfig = async () => {
     setSavingConfig(true);

@@ -161,8 +161,10 @@ describe("getUserTokenUsage - anonymous session owner (ENG-1163)", () => {
   });
 });
 
-describe("checkTokenUsage - blocked at 100%", () => {
-  it("blocks when user has used all tokens", async () => {
+// ENG-1250 AC7: token volume is no longer measured or gated (it needed the retiring counter; dollars
+// are what bound spend). A tier with no enforced policy / cost gate is uncapped by design.
+describe("checkTokenUsage - token volume no longer gates (ENG-1250 AC7)", () => {
+  it("does not block a user who has used all of a token allowance", async () => {
     mockGetUserById.mockResolvedValue({
       userId: "u1",
       email: "a@b.com",
@@ -178,12 +180,15 @@ describe("checkTokenUsage - blocked at 100%", () => {
     });
 
     const result = await checkTokenUsage("u1");
-    expect(result.allowed).toBe(false);
-    expect(result.percentUsed).toBe(100);
-    expect(result.warning).toBe(false); // at exactly 100% it's blocked, not warning
+    expect(result.allowed).toBe(true);
+    expect(result.percentUsed).toBe(0);
+    expect(result.warning).toBe(false);
+    expect(result.effectiveAllowance).toBeNull(); // reads as "no token limit"; hides the customer meter
+    expect(result.allowance).toBeNull();
+    expect(result.used).toBe(0);
   });
 
-  it("blocks when user exceeded allowance", async () => {
+  it("does not block a user far over the old allowance", async () => {
     mockGetUserById.mockResolvedValue({
       userId: "u1",
       email: "a@b.com",
@@ -199,8 +204,8 @@ describe("checkTokenUsage - blocked at 100%", () => {
     });
 
     const result = await checkTokenUsage("u1");
-    expect(result.allowed).toBe(false);
-    expect(result.percentUsed).toBe(120);
+    expect(result.allowed).toBe(true);
+    expect(result.percentUsed).toBe(0);
   });
 });
 
@@ -284,7 +289,7 @@ describe("checkTokenUsage", () => {
     expect(result.percentUsed).toBe(0);
   });
 
-  it("warns at 80% usage", async () => {
+  it("no longer warns on token volume (the token dimension is gone)", async () => {
     mockGetUserById.mockResolvedValue({
       userId: "u1",
       email: "a@b.com",
@@ -301,12 +306,11 @@ describe("checkTokenUsage", () => {
 
     const result = await checkTokenUsage("u1");
     expect(result.allowed).toBe(true);
-    expect(result.warning).toBe(true);
-    expect(result.percentUsed).toBe(85);
+    expect(result.warning).toBe(false);
+    expect(result.percentUsed).toBe(0);
   });
 
-  it("bonus tokens extend effective allowance", async () => {
-    // User at 95000 of 100000 base, but has 20000 bonus → effective 120000
+  it("still reports a token bonus, but it no longer extends a token allowance", async () => {
     mockGetUserById.mockResolvedValue({
       userId: "u1",
       email: "a@b.com",
@@ -323,9 +327,9 @@ describe("checkTokenUsage", () => {
 
     const result = await checkTokenUsage("u1");
     expect(result.allowed).toBe(true);
-    expect(result.warning).toBe(false); // 95000/120000 = 79% < 80%
-    expect(result.percentUsed).toBe(79);
-    expect(result.effectiveAllowance).toBe(120000);
+    expect(result.warning).toBe(false);
+    expect(result.bonus).toBe(20000);
+    expect(result.effectiveAllowance).toBeNull();
   });
 });
 
@@ -566,7 +570,7 @@ describe("checkTokenUsage - cost tracking (observe-only by default)", () => {
     expect(result.costUsed).toBe(20.0);
     expect(result.costAllowance).toBe(20);
     expect(result.costPercentUsed).toBe(100);
-    expect(result.percentUsed).toBe(10);
+    expect(result.percentUsed).toBe(0); // no token dimension any more
     // Observe-only: no decided/enforced cost quota yet → UIs keep the cost figure hidden.
     expect(result.costEnforced).toBe(false);
   });
@@ -591,8 +595,7 @@ describe("checkTokenUsage - cost tracking (observe-only by default)", () => {
     const result = await checkTokenUsage("u1");
     expect(result.allowed).toBe(false);
     expect(result.costPercentUsed).toBe(100);
-    // token dimension alone would have allowed the request
-    expect(result.percentUsed).toBe(10);
+    expect(result.percentUsed).toBe(0); // no token dimension any more
     // Cost cap is the enforced gate → a real cost quota exists → UIs may surface it.
     expect(result.costEnforced).toBe(true);
   });
@@ -711,6 +714,10 @@ describe("checkTokenUsage - cost tracking (observe-only by default)", () => {
 });
 
 describe("incrementUserTokenUsage", () => {
+  // The legacy writer is off by default (ENG-1250 AC7); these suites exercise it for the rollback window.
+  beforeEach(() => { process.env.AW_LEGACY_TOKEN_COUNTER_WRITES = "true"; });
+  afterEach(() => { delete process.env.AW_LEGACY_TOKEN_COUNTER_WRITES; });
+
   it("initializes usage for new month (lazy reset)", async () => {
     mockGetUserById.mockResolvedValue({
       userId: "u1",
@@ -978,7 +985,7 @@ describe("resolveBillingUserId - success cases", () => {
 });
 
 describe("checkTokenUsage - org member uses owner quota", () => {
-  it("checks against org owner allowance when called for org member", async () => {
+  it("resolves the org owner's tier when called for an org member", async () => {
     // member1 belongs to org1, owner is owner1
     // ENG-1215: keyed by id rather than a positional mockResolvedValueOnce
     // chain. `resolveBillingUserId` now verifies the org owner resolves before
@@ -1003,14 +1010,13 @@ describe("checkTokenUsage - org member uses owner quota", () => {
     });
 
     const result = await checkTokenUsage("member1");
-    expect(result.used).toBe(90000);
-    expect(result.allowance).toBe(500000);
     expect(result.allowed).toBe(true);
+    expect(result.allowance).toBeNull(); // token allowance no longer applied
     // Subscription type should have been resolved for owner, not member
     expect(mockGetUserSubscriptionType).toHaveBeenCalledWith("owner1");
   });
 
-  it("blocks org member when org owner is at 100% usage", async () => {
+  it("does not block an org member because the owner is at the old token cap", async () => {
     // ENG-1215: keyed by id rather than a positional mockResolvedValueOnce
     // chain. `resolveBillingUserId` now verifies the org owner resolves before
     // returning it, which adds a getUserById call and silently shifted every
@@ -1034,12 +1040,18 @@ describe("checkTokenUsage - org member uses owner quota", () => {
     });
 
     const result = await checkTokenUsage("member1");
-    expect(result.allowed).toBe(false);
-    expect(result.percentUsed).toBe(100);
+    // No token gate any more: the owner being at the old token cap blocks nobody. (A dollar cap
+    // still pools onto the owner — covered by the versioned-policy and cost-gate suites.)
+    expect(result.allowed).toBe(true);
+    expect(mockGetUserSubscriptionType).toHaveBeenCalledWith("owner1");
   });
 });
 
 describe("incrementUserTokenUsage - org member increments owner counter", () => {
+  // The legacy writer is off by default (ENG-1250 AC7); these suites exercise it for the rollback window.
+  beforeEach(() => { process.env.AW_LEGACY_TOKEN_COUNTER_WRITES = "true"; });
+  afterEach(() => { delete process.env.AW_LEGACY_TOKEN_COUNTER_WRITES; });
+
   it("increments org owner's usage when called for org member", async () => {
     // ENG-1215: keyed by id rather than a positional mockResolvedValueOnce
     // chain. `resolveBillingUserId` now verifies the org owner resolves before
@@ -1138,7 +1150,7 @@ describe("checkTokenUsage - cost replaces tokens as the gate (ENG-1116)", () => 
     const result = await checkTokenUsage("u1");
 
     expect(result.allowed).toBe(true);
-    expect(result.percentUsed).toBe(1600);
+    expect(result.percentUsed).toBe(0);
     expect(result.costPercentUsed).toBe(10);
   });
 
@@ -1156,17 +1168,17 @@ describe("checkTokenUsage - cost replaces tokens as the gate (ENG-1116)", () => 
     expect(deriveBlockedByCost(result).blockedByCost).toBe(true);
   });
 
-  it("falls back to the token cap for a tier with no cost allowance (never ungated)", async () => {
-    // Guard: flipping the env var must not silently remove all limits from a tier
-    // nobody has priced yet.
+  it("a tier with no cost allowance is uncapped even with the flag on (token cap retired, ENG-1250 AC7)", async () => {
+    // Previously this fell back to the token cap ("never ungated"). The token counter is retired, so
+    // an unpriced tier has no gate: accepted explicitly for the accounts on such tiers.
     process.env.ENFORCE_COST_CAP = "true";
     usageOf(150000, 999.0);
     tierWithoutCostCap();
 
     const result = await checkTokenUsage("u1");
 
-    expect(result.allowed).toBe(false);
-    expect(result.percentUsed).toBe(150);
+    expect(result.allowed).toBe(true);
+    expect(result.percentUsed).toBe(0);
   });
 
   it("reports costEnforced=false for a tier with no cost allowance, even with the flag on", async () => {
@@ -1195,24 +1207,23 @@ describe("checkTokenUsage - cost replaces tokens as the gate (ENG-1116)", () => 
     expect(result.warning).toBe(false);
   });
 
-  it("still warns on the token dimension when the flag is off", async () => {
+  it("does not warn on tokens when the flag is off (no token dimension)", async () => {
     usageOf(85000, 2.0);
     tierWithCostCap();
 
     const result = await checkTokenUsage("u1");
 
     expect(result.allowed).toBe(true);
-    expect(result.warning).toBe(true);
+    expect(result.warning).toBe(false);
   });
 
-  it("still blocks on tokens when the flag is off, whatever the spend", async () => {
-    // Byte-identical-to-today guarantee for the un-flipped environment.
+  it("does not block on tokens when the flag is off, whatever the token count (ENG-1250 AC7)", async () => {
     usageOf(150000, 0.5);
     tierWithCostCap();
 
     const result = await checkTokenUsage("u1");
 
-    expect(result.allowed).toBe(false);
+    expect(result.allowed).toBe(true);
     expect(result.costEnforced).toBe(false);
   });
 });
@@ -1280,6 +1291,10 @@ describe("deriveBlockedByCost - respects the enforced dimension (ENG-1116)", () 
 // to the same counter alongside agent mode and Emma.
 
 describe("incrementUserTokenUsage - concurrent month rollover (ENG-1134)", () => {
+  // The legacy writer is off by default (ENG-1250 AC7); these suites exercise it for the rollback window.
+  beforeEach(() => { process.env.AW_LEGACY_TOKEN_COUNTER_WRITES = "true"; });
+  afterEach(() => { delete process.env.AW_LEGACY_TOKEN_COUNTER_WRITES; });
+
   it("does not lose a charge when another writer resets the month first", async () => {
     const staleUser = {
       userId: "u1",
@@ -1394,5 +1409,46 @@ describe("incrementUserTokenUsage - concurrent month rollover (ENG-1134)", () =>
     await incrementUserTokenUsage("u1", 500, 5);
 
     expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe("incrementUserTokenUsage - legacy counter writes are OFF by default (ENG-1250 AC7 stage 3)", () => {
+  beforeEach(() => {
+    delete process.env.AW_LEGACY_TOKEN_COUNTER_WRITES;
+    mockApplyMonthlyChargeAtomic.mockClear();
+    mockRecordLlmChargeEvent.mockClear();
+    mockGetUserById.mockReset();
+  });
+  afterEach(() => { delete process.env.AW_LEGACY_TOKEN_COUNTER_WRITES; });
+
+  it("writes nothing and reads nothing by default: no counter update, no audit row, no user lookup", async () => {
+    await incrementUserTokenUsage("u1", 1000, 0.5);
+
+    expect(mockApplyMonthlyChargeAtomic).not.toHaveBeenCalled();
+    expect(mockRecordLlmChargeEvent).not.toHaveBeenCalled();
+    expect(mockGetUserById).not.toHaveBeenCalled();
+  });
+
+  it("only the exact value 'true' re-enables it (rollback), nothing truthy-ish", async () => {
+    // A resolvable user, so an unguarded writer WOULD reach the atomic apply (otherwise this proves nothing).
+    const user = { userId: "u1", email: "a@b.com", tokenUsage: { month: currentMonth(), totalTokens: 1, totalCost: 0, resetDate: "2026-11-01T00:00:00.000Z" } };
+    mockGetUserById.mockResolvedValue(user);
+    (userDb as any).getUserByIdConsistent?.mockResolvedValue?.(user);
+    for (const v of ["", "1", "TRUE", "yes", "false"]) {
+      process.env.AW_LEGACY_TOKEN_COUNTER_WRITES = v;
+      await incrementUserTokenUsage("u1", 1000, 0.5);
+    }
+    expect(mockApplyMonthlyChargeAtomic).not.toHaveBeenCalled();
+  });
+
+  it("resumes the legacy writes when AW_LEGACY_TOKEN_COUNTER_WRITES=true (the rollback path works)", async () => {
+    process.env.AW_LEGACY_TOKEN_COUNTER_WRITES = "true";
+    mockGetUserById.mockResolvedValue({ userId: "u1", email: "a@b.com", tokenUsage: { month: currentMonth(), totalTokens: 1, totalCost: 0, resetDate: "2026-11-01T00:00:00.000Z" } });
+    (userDb as any).getUserByIdConsistent?.mockResolvedValue?.({ userId: "u1", email: "a@b.com", tokenUsage: { month: currentMonth(), totalTokens: 1, totalCost: 0, resetDate: "2026-11-01T00:00:00.000Z" } });
+
+    await incrementUserTokenUsage("u1", 1000, 0.5);
+
+    expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalled();
   });
 });

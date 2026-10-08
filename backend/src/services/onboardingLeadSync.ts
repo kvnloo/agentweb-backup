@@ -147,12 +147,26 @@ export async function mirrorOnboardingEventToLead(
 
     // No Lead yet — create one. Signup auto-enroll should have done this
     // already; creating on the fly handles pre-existing users and races.
-    const createdLead: any = await crmDb.createLead(list.listId, {
-      email,
-      lifecycle: 'signed_up',
-      tenantId: FOUNDERS_USERID,
-      accountOwnerUserId: FOUNDERS_USERID,
-    });
+    let createdLead: any;
+    try {
+      createdLead = await crmDb.createLead(list.listId, {
+        email,
+        lifecycle: 'signed_up',
+        tenantId: FOUNDERS_USERID,
+        accountOwnerUserId: FOUNDERS_USERID,
+      }, 'integration');
+    } catch (createErr: any) {
+      // The lookup above missed but createLead's own pre-check found the row (a concurrent
+      // signup enrolment won). Mirror onto that row instead of dropping this event's analytics.
+      if (!createErr?.duplicateEmail || !createErr.existingLead?.leadId) throw createErr;
+      await crmDb.updateLeadOnboardingAnalytics(list.listId, createErr.existingLead.leadId, analytics);
+      return {
+        mirrored: true,
+        reason: 'updated',
+        listId: list.listId,
+        leadId: createErr.existingLead.leadId,
+      };
+    }
     if (createdLead && createdLead.leadId) {
       await crmDb.updateLeadOnboardingAnalytics(list.listId, createdLead.leadId, analytics);
       return {

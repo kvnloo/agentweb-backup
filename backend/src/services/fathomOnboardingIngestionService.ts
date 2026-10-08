@@ -250,7 +250,12 @@ export async function extractFathomOnboardingContext(
     systemPrompt,
     userPrompt,
     undefined,
-    { userId: 'system', feature: 'fathom_onboarding_ingestion' },
+    // ENG-1961: the only hardcoded `userId: 'system'` in the codebase, and the
+    // one place where that was nearly honest — extraction runs BEFORE
+    // matchFathomOnboardingTarget resolves an account, so there is no user yet.
+    // Naming it platform work says so, instead of leaving a literal that reads
+    // like an account; the recorder's own fallback still books it to AgentWeb.
+    { feature: 'platform:fathom_onboarding_ingestion' },
   );
   return normalizeContext(parsed, recordingUrl);
 }

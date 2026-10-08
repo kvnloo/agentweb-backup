@@ -14,6 +14,21 @@ import { getAllowedConnectedAccounts } from '../services/subscriptionService';
 import { userDb, orgDb, crmDb } from '../services/db';
 import { can } from "../services/orgAuthz";
 import { assertOwnedMetaPixel } from '../services/metaAccountCredentials';
+import { DEFAULT_DAILY_INVITE_CAP } from '../services/linkedInWritePacer';
+
+/**
+ * ENG-1574: bounds for the user-editable LinkedIn daily invite cap. 30 matches the
+ * pacer's production absolute ceiling (`dailyInviteAbsoluteMax`); 0 is a real
+ * block ("send nothing"), never "unlimited" — `resolveDailyInviteCap` enforces that.
+ */
+const DAILY_INVITE_CAP_USER_MAX = 30;
+
+function displayDailyInviteCap(raw: unknown): number {
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0) {
+    return Math.min(raw, DAILY_INVITE_CAP_USER_MAX);
+  }
+  return DEFAULT_DAILY_INVITE_CAP;
+}
 
 const router = express.Router();
 
@@ -312,6 +327,15 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         // reconnect prompt instead of a misleading "Connected" badge.
         status = 'disconnected';
         expiryMessage = 'Reconnect required — X revoked the token';
+      } else if (acc.platform === 'hubspot' && (acc.config as any).needs_reconnect) {
+        // Same as X above: HubSpot rejected the refresh token, so the stored grant is
+        // dead. Without this branch the row falls through to the generic
+        // `hasRefreshToken ? 'active'` case and reports "Connected" forever, because
+        // holding a refresh_token is all that case checks — it never learns the token
+        // stopped working. That is exactly how one portal read "Active · Connected"
+        // for 97 days while every CRM sync against it returned 401.
+        status = 'disconnected';
+        expiryMessage = 'Reconnect required — HubSpot revoked the token';
       } else if (adsCapability.ads_capable === false) {
         // The token is valid and unexpired, but the Meta account never granted (or
         // has since lost) ads_read/ads_management, so this ad account cannot serve
@@ -351,6 +375,8 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         owned: acc.userId === userId,
         // LinkedIn Outreach (unipile) only: Premium accounts allow 300-char invites.
         is_premium: acc.platform === 'unipile' ? ((acc.config as any).is_premium === true) : undefined,
+        // LinkedIn Outreach (unipile) only (ENG-1574): self-reported daily invite cap, default when unset.
+        daily_invite_cap: acc.platform === 'unipile' ? displayDailyInviteCap((acc.config as any).daily_invite_cap) : undefined,
         // Calendly only: false when the connecting account's plan doesn't support
         // webhooks (Free tier) — OAuth succeeded but no booking events will arrive (ENG-524).
         booking_tracking_active: acc.platform === 'calendly' ? ((acc.config as any).booking_tracking_active === true) : undefined,
@@ -525,6 +551,35 @@ router.patch('/connected-accounts/unipile/:accountId/premium', authenticateToken
     }
     console.error('Update LinkedIn Premium flag error:', error);
     res.status(500).json({ error: 'Failed to update LinkedIn Premium status' });
+  }
+});
+
+// ENG-1574: set the self-reported LinkedIn daily invite cap directly (Settings),
+// without needing an Emma conversation. Integer 0–30; 0 blocks all invites.
+// Additive to the Premium toggle above, which it does not touch.
+router.patch('/connected-accounts/unipile/:accountId/daily-invite-cap', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { accountId } = req.params;
+  const { dailyInviteCap } = req.body ?? {};
+
+  if (
+    typeof dailyInviteCap !== 'number' ||
+    !Number.isInteger(dailyInviteCap) ||
+    dailyInviteCap < 0 ||
+    dailyInviteCap > DAILY_INVITE_CAP_USER_MAX
+  ) {
+    return res.status(400).json({ error: `dailyInviteCap must be an integer between 0 and ${DAILY_INVITE_CAP_USER_MAX}` });
+  }
+
+  try {
+    await updateAccountConfig(userId, 'unipile', accountId, { daily_invite_cap: dailyInviteCap });
+    res.json({ success: true, accountId, daily_invite_cap: dailyInviteCap });
+  } catch (error: any) {
+    if (typeof error?.message === 'string' && error.message.includes('No unipile account')) {
+      return res.status(404).json({ error: error.message });
+    }
+    console.error('Update LinkedIn daily invite cap error:', error);
+    res.status(500).json({ error: 'Failed to update LinkedIn daily invite cap' });
   }
 });
 

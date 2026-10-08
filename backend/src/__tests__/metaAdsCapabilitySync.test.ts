@@ -29,10 +29,21 @@
 
 const mockProbeAdsAccountAccess = jest.fn();
 const mockClassifyAdsRefusalTier = jest.fn().mockResolvedValue('unknown');
+// Rejects by default, matching the pre-ENG-2232 behaviour of an unmocked
+// getPages — no write from the Page-access block unless a test opts in, so
+// existing ads-scope tests (and their `mock.calls[0]` assumptions) are
+// unaffected.
+const mockGetPages = jest.fn().mockRejectedValue(new Error('getPages not stubbed for this test'));
+// ENG-2232: defaults to [] (never throws), matching the real method's own
+// best-effort contract — the wrong-Page cross-check is a no-op unless a test
+// explicitly opts in, so pre-existing getPages-only assertions are unaffected.
+const mockGetExistingAdPageIds = jest.fn().mockResolvedValue([]);
 jest.mock('../services/metaService', () => ({
   metaService: {
     probeAdsAccountAccess: (...args: any[]) => mockProbeAdsAccountAccess(...args),
     classifyAdsRefusalTier: (...args: any[]) => mockClassifyAdsRefusalTier(...args),
+    getPages: (...args: any[]) => mockGetPages(...args),
+    getExistingAdPageIds: (...args: any[]) => mockGetExistingAdPageIds(...args),
   },
 }));
 
@@ -610,6 +621,196 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
 
       expect(result.outcome).toBe('skipped');
       expect(mockProbeAdsAccountAccess).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * ENG-2232: before this, Page access was only ever probed once, at
+   * connect/reconnect time (metaAuth.ts) — nothing revisited it, so an
+   * already-connected account whose Page access was never granted (or was
+   * revoked later) stayed reported as ads_capable:true indefinitely unless the
+   * user redid a full OAuth reconnect. This is the twice-daily sweep's half of
+   * that fix: it must persist has_meta_pages itself, independent of the
+   * ads-scope outcome above, since Page access is a second, separate Meta
+   * grant.
+   */
+  describe('Page access reconciliation (ENG-2232)', () => {
+    beforeEach(() => {
+      // Undetermined on purpose: isolates the Page-probe write from the
+      // ads-scope write assertions covered elsewhere in this file.
+      mockProbeAdsAccountAccess.mockResolvedValue('unknown');
+    });
+
+    it('persists has_meta_pages:true the first time Pages are found for an unprobed account', async () => {
+      mockGetPages.mockResolvedValueOnce([{ id: '1010991085424542', name: 'My Health Surveys' }]);
+      const account = metaAccount({ granted_scopes: ['ads_read'] });
+      const configSnapshot = { ...account.config };
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      expect(mockGetPages).toHaveBeenCalledWith('EAA-token');
+      const [userId, platform, accountId] = mockUpdateAccountConfig.mock.calls[0];
+      expect(userId).toBe('user1');
+      expect(platform).toBe('meta');
+      expect(accountId).toBe(AD_ACCOUNT_ID);
+      const { updates } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], configSnapshot);
+      expect(updates).toEqual({
+        has_meta_pages: true,
+        accessible_page_ids: ['1010991085424542'],
+        page_access_probed_at: expect.any(String),
+      });
+      expect(account.config.has_meta_pages).toBe(true);
+    });
+
+    it('persists has_meta_pages:false when PAGE LIST comes back empty for an already-connected account', async () => {
+      // The exact production case (ENG-2232): ad account 1209971551106961
+      // stayed ads_capable:true indefinitely because nothing but a manual
+      // OAuth reconnect ever probed Page access. The twice-daily sweep now
+      // catches it without the customer having to reconnect.
+      mockGetPages.mockResolvedValueOnce([]);
+      const account = metaAccount({ granted_scopes: ['ads_read'] });
+      const configSnapshot = { ...account.config };
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      const { updates } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], configSnapshot);
+      expect(updates).toEqual({ has_meta_pages: false, page_access_probed_at: expect.any(String) });
+      expect(account.config.has_meta_pages).toBe(false);
+    });
+
+    /**
+     * ENG-2232 code review follow-up: the Page-access write must use the same
+     * function-form CAS discipline as the ads-scope writes above, for the
+     * identical reason — a plain object reapplied unchanged on every retry
+     * could clobber a concurrent writer's (another sweep's, or a reconnect's)
+     * newer Page probe. Mirrors 'does not record a suspicion that a newer
+     * recovery has already superseded' above.
+     */
+    it('defers to a fresher concurrent Page probe instead of overwriting it with stale data', async () => {
+      mockGetPages.mockResolvedValueOnce([{ id: '1010991085424542', name: 'My Health Surveys' }]);
+      const account = metaAccount({ granted_scopes: ['ads_read'] });
+      const configSnapshot = { ...account.config };
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      const [, , , configUpdates] = mockUpdateAccountConfig.mock.calls[0];
+      expect(typeof configUpdates).toBe('function');
+
+      // A concurrent writer (another sweep run, or the user's own reconnect)
+      // already landed a NEWER, more authoritative Page probe in between this
+      // sweep's own probe and its write finally committing — e.g. the
+      // reconnect's cross-check found a wrong-Page mismatch this sweep's
+      // simpler "at least one Page" answer doesn't know about.
+      const newerFreshConfig = {
+        ...configSnapshot,
+        has_meta_pages: false,
+        existing_ads_page_id: '1010991085424542',
+        page_access_probed_at: '3000-01-01T00:00:00.000Z',
+      };
+      const { updates } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], newerFreshConfig);
+      expect(updates).toEqual({});
+    });
+
+    it('does not write when the newly-probed answer matches what is already recorded', async () => {
+      mockGetPages.mockResolvedValueOnce([{ id: '1010991085424542', name: 'My Health Surveys' }]);
+      const account = metaAccount({
+        granted_scopes: ['ads_read'],
+        has_meta_pages: true,
+        accessible_page_ids: ['1010991085424542'],
+      });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+    });
+
+    it('leaves the recorded value untouched when the Page probe itself fails', async () => {
+      mockGetPages.mockRejectedValueOnce(new Error('rate limited'));
+      const account = metaAccount({ granted_scopes: ['ads_read'], has_meta_pages: true });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+      expect(account.config.has_meta_pages).toBe(true);
+    });
+  });
+
+  /**
+   * ENG-2232 — the subtler sibling of the block above: "has at least one
+   * Page" isn't the same as "has the Page this account's own ads actually
+   * run under". Lets the sweep catch an account that holds access to some
+   * unrelated Page while its real ads keep failing.
+   */
+  describe('wrong-Page cross-check (ENG-2232)', () => {
+    beforeEach(() => {
+      mockProbeAdsAccountAccess.mockResolvedValue('unknown');
+    });
+
+    it('downgrades has_meta_pages to false and names the Page when existing ads use a Page outside the accessible set', async () => {
+      mockGetPages.mockResolvedValueOnce([{ id: 'page_unrelated', name: 'Some Other Page' }]);
+      mockGetExistingAdPageIds.mockResolvedValueOnce(['1010991085424542']);
+      const account = metaAccount({ granted_scopes: ['ads_read'] });
+      const configSnapshot = { ...account.config };
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      expect(mockGetExistingAdPageIds).toHaveBeenCalledWith(AD_ACCOUNT_ID, 'EAA-token');
+      const { updates } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], configSnapshot);
+      expect(updates).toEqual({
+        has_meta_pages: false,
+        existing_ads_page_id: '1010991085424542',
+        accessible_page_ids: ['page_unrelated'],
+        page_access_probed_at: expect.any(String),
+      });
+      expect(account.config.has_meta_pages).toBe(false);
+      expect(account.config.existing_ads_page_id).toBe('1010991085424542');
+    });
+
+    it('keeps has_meta_pages true (no write) when the accessible Pages already match the one existing ads use', async () => {
+      mockGetPages.mockResolvedValueOnce([{ id: '1010991085424542', name: 'My Health Surveys' }]);
+      mockGetExistingAdPageIds.mockResolvedValueOnce(['1010991085424542']);
+      const account = metaAccount({
+        granted_scopes: ['ads_read'],
+        has_meta_pages: true,
+        accessible_page_ids: ['1010991085424542'],
+      });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+      expect(account.config.has_meta_pages).toBe(true);
+    });
+
+    it('does not run the cross-check when PAGE LIST itself is already empty (nothing to tighten)', async () => {
+      mockGetPages.mockResolvedValueOnce([]);
+      const account = metaAccount({ granted_scopes: ['ads_read'] });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      expect(mockGetExistingAdPageIds).not.toHaveBeenCalled();
+    });
+
+    it('clears a stale existing_ads_page_id once the mismatch is fixed', async () => {
+      mockGetPages.mockResolvedValueOnce([{ id: '1010991085424542', name: 'My Health Surveys' }]);
+      mockGetExistingAdPageIds.mockResolvedValueOnce(['1010991085424542']);
+      const account = metaAccount({
+        granted_scopes: ['ads_read'],
+        has_meta_pages: false,
+        existing_ads_page_id: '1010991085424542',
+      });
+      const configSnapshot = { ...account.config };
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      const { updates } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], configSnapshot);
+      expect(updates).toEqual({
+        has_meta_pages: true,
+        existing_ads_page_id: null,
+        accessible_page_ids: ['1010991085424542'],
+        page_access_probed_at: expect.any(String),
+      });
+      expect(account.config.has_meta_pages).toBe(true);
+      expect(account.config.existing_ads_page_id).toBeUndefined();
     });
   });
 });

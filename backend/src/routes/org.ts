@@ -2,11 +2,20 @@ import { Router, Request, Response } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb, orgDb, Organization } from "../services/db";
 import { defaultShareSettings } from "../services/orgShareService";
-import { callerCan, can, roleOf } from "../services/orgAuthz";
+import { callerCan, can, roleOf, isBillingRoot } from "../services/orgAuthz";
 import { v4 as uuidv4 } from "uuid";
 import crypto from "crypto";
 import { isCompanyEmail } from "../utils/validation";
-import { getUserSubscriptionResolution } from "../services/subscriptionService";
+import { getUserSubscriptionResolution, getUserSubscriptionType, getTierConfig } from "../services/subscriptionService";
+import { redactAccountSecrets } from "../utils/accountSecretRedaction";
+import { purchaseExtraSeat, removeExtraSeat } from "../services/orgSeatBillingService";
+import {
+  assertSeatAvailable,
+  baseSeatsForTier,
+  effectiveSeatCap,
+  SeatLimitReachedError,
+  SEAT_LIMIT_REACHED,
+} from "../services/orgSeatService";
 
 const router = Router();
 
@@ -88,6 +97,18 @@ function buildOrgMarketStrategyForCopy(user: any): MarketStrategy | undefined {
     icp: shouldFillIcps ? fallbackIcps : (existing?.icp ?? []),
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
+    // Tracked separately from updatedAt (ENG-1955 follow-up). When this copy
+    // fills in icp from the owner's onboarding icpResult, it's a system copy
+    // of that generation, not a fresh manual edit — backdate to the owner's
+    // own icpCompletedAt (mirrors mirrorIcpsToMarketStrategy's reasoning) so
+    // routes/crm.ts's staleness check doesn't mistake "profile copied to org"
+    // for "ICP corrected", which would permanently switch every org member
+    // off their cached, richer icpResult-derived filters for no reason. When
+    // icp isn't being (re)filled here, carry the existing value forward
+    // unchanged — this copy didn't touch icp content.
+    icpUpdatedAt: shouldFillIcps
+      ? (user.icpCompletedAt ?? now)
+      : existing?.icpUpdatedAt,
   };
 }
 
@@ -253,29 +274,42 @@ function deriveDomainFromEmail(email: string): string | undefined {
   return email.split("@")[1]?.toLowerCase() || undefined;
 }
 
+/**
+ * Seat-based billing (ENG-2250): shared `SeatLimitReachedError` → 409 mapping
+ * for every membership-creation path (invite-send, accept-invite, and
+ * domain-join approval). Returns the 409 response when `error` is the seat
+ * limit, or `null` for any other error so the caller's existing catch block
+ * handles it exactly as before (unrelated failures must not change shape).
+ */
+function respondIfSeatLimitReached(error: unknown, res: Response): Response | null {
+  if (error instanceof SeatLimitReachedError) {
+    return res.status(409).json({ error: error.message, code: SEAT_LIMIT_REACHED });
+  }
+  return null;
+}
+
 function sanitizeConnectedAccountForOrgResponse(account: any): any {
-  const safeConfig: Record<string, any> = {};
+  // Credential stripping (access/refresh tokens, API keys, webhook signing
+  // keys) delegates to the shared helper (ENG-2258) — this function's own
+  // pattern-based denylist missed `webhook_signing_key` (doesn't end in
+  // "token" or contain "secret"), which the shared, explicit field list does
+  // not.
+  const { config: safeConfig, ...safeAccount } = redactAccountSecrets(account);
+
   // Daily outreach limits are account-activity data, not org-shared connection
   // metadata. The owner-facing account endpoint has its own explicit contract;
   // this member-visible projection must not expose the cap, count, or window.
   const privateOperationalKeys = new Set(['daily_invite_cap', 'daily_volume']);
-  for (const [key, value] of Object.entries(account.config || {})) {
-    const normalizedKey = key.toLowerCase();
-    const looksCredentialLike =
-      normalizedKey === "token" ||
-      normalizedKey.endsWith("_token") ||
-      normalizedKey.endsWith("token") ||
-      normalizedKey.includes("secret") ||
-      normalizedKey === "api_key" ||
-      normalizedKey === "apikey";
-    if (!looksCredentialLike && !privateOperationalKeys.has(normalizedKey)) {
-      safeConfig[key] = value;
+  const projectedConfig: Record<string, any> = {};
+  for (const [key, value] of Object.entries(safeConfig || {})) {
+    if (!privateOperationalKeys.has(key)) {
+      projectedConfig[key] = value;
     }
   }
 
   return {
-    ...account,
-    config: safeConfig,
+    ...safeAccount,
+    config: projectedConfig,
   };
 }
 
@@ -460,6 +494,57 @@ router.get("/me", async (req: Request, res: Response) => {
       return res.json({ success: true, data: null });
     }
 
+    // Seat-based billing (ENG-2250): surface seat usage so the frontend's
+    // already-built paywall/usage UI (`org.seatInfo`) has something to read.
+    // `baseSeatsForTier` returns null for a tier with no seat cap concept
+    // (Managed, etc.) — that is "unlimited," not "zero," so `seatInfo` must be
+    // omitted entirely rather than sent as a capped-at-zero object. The
+    // frontend already treats an absent `seatInfo` as "nothing to show," so
+    // uncapped orgs need no frontend change. The extra `getOrgMemberCount`
+    // read only happens for a capped tier — every other org on every `/me`
+    // call pays nothing for this.
+    const ownerTier = await getUserSubscriptionType(org.ownerUserId);
+    const baseSeats = baseSeatsForTier(ownerTier);
+    let seatInfo:
+      | {
+          baseSeats: number;
+          purchasedExtraSeats: number;
+          effectiveCap: number | null;
+          currentMemberCount: number;
+          // Forwarded as-is to the already-built (but, until this field existed,
+          // permanently inert — confirmed live, 2026-10-01: the real paywall
+          // modal rendered its hardcoded "$50/mo" fallback and no usage-boost
+          // line) frontend paywall/usage-boost copy — see SeatPaywallModal's
+          // `seatPricing` prop and getSeatUsageBoostCopy. Omitted (not sent
+          // with zeros) when the tier has no seatPricing configured yet, same
+          // "absent means nothing to show" contract as `seatInfo` itself.
+          seatPricing?: {
+            priceCents: number;
+            usageCreditMicroUsd: number;
+            hardCostThresholdMicroUsd?: number;
+          };
+        }
+      | undefined;
+    if (baseSeats != null) {
+      const currentMemberCount = await orgDb.getOrgMemberCount(org.orgId);
+      const ownerTierConfig = await getTierConfig(ownerTier);
+      seatInfo = {
+        baseSeats,
+        purchasedExtraSeats: org.purchasedExtraSeats || 0,
+        effectiveCap: effectiveSeatCap(baseSeats, org.purchasedExtraSeats),
+        currentMemberCount,
+        ...(ownerTierConfig?.seatPricing
+          ? {
+              seatPricing: {
+                priceCents: ownerTierConfig.seatPricing.priceCents,
+                usageCreditMicroUsd: ownerTierConfig.seatPricing.usageCreditMicroUsd,
+                hardCostThresholdMicroUsd: ownerTierConfig.llmUsagePolicy?.hardCostThresholdMicroUsd,
+              },
+            }
+          : {}),
+      };
+    }
+
     // Get members (without sensitive data)
     const members = await orgDb.getOrgMembers(user.orgId);
     // EFFECTIVE role, not the stored column. `roleOf` unions `ownerUserId`, so
@@ -497,6 +582,9 @@ router.get("/me", async (req: Request, res: Response) => {
       success: true,
       data: {
         ...projectOrgForMemberResponse(org, canManageMembers),
+        // Absent (not null) for an uncapped tier — see the comment above
+        // where `seatInfo` is computed.
+        seatInfo,
         members: safeMembers,
         // Server-computed capabilities. Clients must gate on these rather than
         // comparing orgRole themselves — that comparison is exactly what has to
@@ -611,6 +699,17 @@ router.post("/:orgId/invite", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "An invite is already pending for this email" });
     }
 
+    // Seat-based billing (ENG-2250): checked here at invite-send time, and
+    // again in accept-invite at accept time. A pending invite doesn't occupy
+    // a seat, so this isn't the only enforcement point — time can pass
+    // between a send and an accept, during which the org can fill up some
+    // other way (another invite accepted, a domain-join approved), so the
+    // accept-time check is the one that actually prevents overfill. This one
+    // exists so an owner gets the paywall immediately, at the point where
+    // they're deciding whether to invite, rather than only discovering it
+    // when the invitee tries to accept.
+    await assertSeatAvailable(orgId);
+
     // Generate invite token
     const inviteToken = crypto.randomBytes(32).toString("hex");
 
@@ -667,6 +766,8 @@ router.post("/:orgId/invite", async (req: Request, res: Response) => {
 
     return res.json({ success: true, message: "Invitation sent" });
   } catch (error) {
+    const seatLimitResponse = respondIfSeatLimitReached(error, res);
+    if (seatLimitResponse) return seatLimitResponse;
     console.error("Error inviting member:", error);
     return res.status(500).json({ error: "Internal server error" });
   }
@@ -704,6 +805,13 @@ router.post("/accept-invite", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Invalid or expired invitation" });
     }
 
+    // Seat-based billing (ENG-2250): re-checked here at accept time, not just
+    // at invite-send time. A pending invite doesn't occupy a seat, so time
+    // between send and accept can let the org fill up some other way (e.g.
+    // another invite accepted, or a domain-join auto-approved) — this is the
+    // check that actually prevents the org from exceeding its cap.
+    await assertSeatAvailable(orgId);
+
     // Add user to org first — the conditional write in joinOrg rejects a user
     // who already belongs to an org, so two concurrent accepts/approvals for the
     // same person resolve to exactly one membership. We
@@ -727,6 +835,8 @@ router.post("/accept-invite", async (req: Request, res: Response) => {
 
     return res.json({ success: true, message: "Successfully joined the organization" });
   } catch (error) {
+    const seatLimitResponse = respondIfSeatLimitReached(error, res);
+    if (seatLimitResponse) return seatLimitResponse;
     console.error("Error accepting invite:", error);
     return res.status(500).json({ error: "Internal server error" });
   }
@@ -766,6 +876,12 @@ router.post("/:orgId/domain-requests/:requestToken/approve", async (req: Request
       return res.status(400).json({ error: "This user is already in an organization" });
     }
 
+    // Seat-based billing (ENG-2250): a domain-join request can sit pending
+    // for a while (it waits on owner approval), during which the org can
+    // fill up — so this is checked here, right before the join, not when the
+    // request was first created.
+    await assertSeatAvailable(orgId);
+
     // Only remove the request from this org's pending list once the join
     // actually succeeds — removing it first would silently drop the request
     // if the atomic join loses the race, with no way to retry.
@@ -782,6 +898,8 @@ router.post("/:orgId/domain-requests/:requestToken/approve", async (req: Request
 
     return res.json({ success: true, message: "Domain-join request approved" });
   } catch (error) {
+    const seatLimitResponse = respondIfSeatLimitReached(error, res);
+    if (seatLimitResponse) return seatLimitResponse;
     console.error("Error approving domain-join request:", error);
     return res.status(500).json({ error: "Internal server error" });
   }
@@ -1060,6 +1178,86 @@ router.delete("/:orgId", async (req: Request, res: Response) => {
   } catch (error) {
     console.error("Error deleting organization:", error);
     return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Seat-based billing (ENG-2243..2246) error mapping shared by both routes
+// below. orgSeatBillingService throws plain `Error`s with descriptive
+// messages for expected, client-correctable conditions (org/owner not found,
+// owner has no Stripe subscription yet, tier has no seatPricing configured,
+// or — removeExtraSeat only — removal would drop below occupied seats). Those
+// map to 404/400 with their own message, since it's safe and useful to show
+// the caller (they're the org's billing owner). Anything else — a raw Stripe
+// SDK error, a DB failure, or any other unexpected exception — must NOT reach
+// the client as-is: Stripe error text/stack can carry internal identifiers or
+// implementation detail that has no business being in a 500 body, so those
+// collapse to a generic message. The full error is always logged server-side.
+function mapSeatBillingError(error: any, res: Response): Response {
+  const message = typeof error?.message === "string" ? error.message : "";
+
+  if (message.startsWith("Cannot remove extra seat")) {
+    return res.status(400).json({ error: message });
+  }
+  if (/\bnot found\b/i.test(message)) {
+    return res.status(404).json({ error: "Organization not found" });
+  }
+  if (message.includes("has no Stripe subscription") || message.includes("no seatPricing configured")) {
+    return res.status(400).json({ error: message });
+  }
+
+  console.error("Error managing extra seat:", error);
+  return res.status(500).json({ error: "Internal server error" });
+}
+
+// Seat-based billing (ENG-2243..2246): purchase/remove an extra paid team
+// seat for the org. Owner-only (isBillingRoot) — this charges the org's
+// billing owner's Stripe subscription, not a generic "manager" action.
+router.post("/:orgId/seats", async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Not authenticated" });
+
+    const { orgId } = req.params;
+    const org = await orgDb.getOrgById(orgId, ["orgId", "ownerUserId"]);
+    if (!org) return res.status(404).json({ error: "Organization not found" });
+
+    if (!isBillingRoot({ userId }, org)) {
+      return res.status(403).json({ error: "Only the organization's billing owner can purchase extra seats" });
+    }
+
+    const { newTotalSeats } = await purchaseExtraSeat(orgId);
+    const ownerTier = await getUserSubscriptionType(org.ownerUserId);
+    const effectiveCap = effectiveSeatCap(baseSeatsForTier(ownerTier), newTotalSeats);
+
+    return res.json({ newTotalSeats, effectiveCap });
+  } catch (error: any) {
+    return mapSeatBillingError(error, res);
+  }
+});
+
+router.delete("/:orgId/seats", async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Not authenticated" });
+
+    const { orgId } = req.params;
+    const org = await orgDb.getOrgById(orgId, ["orgId", "ownerUserId"]);
+    if (!org) return res.status(404).json({ error: "Organization not found" });
+
+    if (!isBillingRoot({ userId }, org)) {
+      return res.status(403).json({ error: "Only the organization's billing owner can remove extra seats" });
+    }
+
+    const { newTotalSeats } = await removeExtraSeat(orgId);
+    const ownerTier = await getUserSubscriptionType(org.ownerUserId);
+    const effectiveCap = effectiveSeatCap(baseSeatsForTier(ownerTier), newTotalSeats);
+
+    return res.json({ newTotalSeats, effectiveCap });
+  } catch (error: any) {
+    // removeExtraSeat throws a plain, descriptive Error when removing a seat
+    // would drop the org below its currently-occupied extra-seat count —
+    // that's a client-correctable 400, not a server failure.
+    return mapSeatBillingError(error, res);
   }
 });
 

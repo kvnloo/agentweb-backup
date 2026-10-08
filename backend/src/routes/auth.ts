@@ -12,6 +12,8 @@ import * as authController from '../controllers/auth';
 import rateLimit from 'express-rate-limit';
 import { resolveAnalyticsConfig, resolveConfigTarget } from '../services/analyticsConfigResolver';
 import { resolveOrgProfileField } from '../services/orgProfileResolver';
+import { EvaluationDenied, isEvaluationUser, requireActiveEvaluation, sandboxInfo as buildSandboxInfo } from '../services/evaluationPolicy';
+import { sanitizeUserForResponse } from '../utils/accountSecretRedaction';
 
 const router = express.Router();
 
@@ -60,15 +62,29 @@ router.get('/me', authenticateToken, async (req, res) => {
     if (!userId) {
       return res.status(401).json({ message: 'User not authenticated' });
     }
+    // A sandbox principal (ENG-1907) gets the one field the portal needs for its
+    // "Sandbox" pill; a revoked or expired sandbox must not receive a normal profile.
+    let sandboxInfo: ReturnType<typeof buildSandboxInfo> | undefined;
+    if (isEvaluationUser(userId)) {
+      try {
+        sandboxInfo = buildSandboxInfo(await requireActiveEvaluation(userId));
+      } catch (error) {
+        // Only a policy denial is a session problem; a store outage must surface as a 500,
+        // not lock every sandbox account out with a "session invalid".
+        if (error instanceof EvaluationDenied) return res.status(401).json({ code: 'session_invalid', message: 'Invalid token' });
+        throw error;
+      }
+    }
     const user = await userDb.getUserById(userId);
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
     // Don't send sensitive information
-    const { password, ...userWithoutPassword } = user;
+    const userWithoutPassword = sanitizeUserForResponse(user);
 
     // Add delegation information if this is a delegate session
     const response: any = userWithoutPassword;
+    if (sandboxInfo) response.sandboxInfo = sandboxInfo;
     if (authenticatedReq.delegateInfo) {
       response.delegateInfo = {
         isDelegated: true,
@@ -168,6 +184,10 @@ router.get('/me', authenticateToken, async (req, res) => {
     }
 
     response.hasBrandGuidelines = !!(user.brandGuidelines?.brandData?.brandName);
+    // ENG-328 — mandatory design-system scrape. 'ready' covers both a real
+    // scrape and the manual-fallback path (mirrors hasBrandGuidelines making
+    // no distinction between a scraped and a manually-typed brand).
+    response.hasDesignSystem = user.designSystem?.status === 'ready';
 
     // Include org info if user is in an org
     if (org) {
@@ -188,6 +208,13 @@ router.get('/me', authenticateToken, async (req, res) => {
       } catch (e: any) {
         console.error('Error resolving org brand for /me:', e?.message);
         response.hasBrandGuidelines = !!(org.brandGuidelines?.brandData?.brandName);
+      }
+      try {
+        const orgDesignSystem = await resolveOrgProfileField(user, org, 'designSystem');
+        response.hasDesignSystem = orgDesignSystem?.status === 'ready';
+      } catch (e: any) {
+        console.error('Error resolving org design system for /me:', e?.message);
+        response.hasDesignSystem = org.designSystem?.status === 'ready';
       }
       // Merge org-level and user-level Drive folders so legacy user-record folders
       // (added before the org feature) continue to appear in the UI without migration.
@@ -308,7 +335,10 @@ const googleAuthFinalHandler = (req: Request, res: Response) => {
         return res.redirect(`${targetFrontendUrl}/oauth-callback?error=${encodeURIComponent('Authentication token is missing after Google auth. Please try again.')}&code=token_missing`);
     }
 
-    res.redirect(`${targetFrontendUrl}/oauth-callback?token=${userAuthInfo.token}`);
+    // ENG-470: propagate the new-vs-returning signal only when true. Returning
+    // logins get no param, so the portal can never mistake them for signups.
+    const newUserSuffix = userAuthInfo.isNewUser === true ? '&isNewUser=true' : '';
+    res.redirect(`${targetFrontendUrl}/oauth-callback?token=${userAuthInfo.token}${newUserSuffix}`);
 };
 
 router.get('/google/callback', 

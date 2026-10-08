@@ -982,3 +982,76 @@ describe("DELETE /api/brand/guidelines/asset/:key — write identity", () => {
     (console.error as jest.Mock).mockRestore();
   });
 });
+
+describe('POST /api/brand/guidelines — MCP partial update persistence', () => {
+  it.each([false, true])('persists mapped fields and retains founders/assets (org=%s)', async inOrg => {
+    const { mapManageBrandUpdate } = await import('../utils/brandGuidelines');
+    const brand = { ...ownBrand, rev: 'old-revision', custom: 'preserved', brandData: { ...ownBrand.brandData,
+      founders: [{ name: 'Founder' }], logoUrl: 'logo', tagline: 'Keep this' } };
+    const user = { ...soloUser, brandGuidelines: brand, ...(inOrg ? { orgId: 'org', orgRole: 'owner' } : {}) };
+    mockDynamoGet.mockResolvedValue({ Item: user });
+    mockGetOrgById.mockResolvedValue({ orgId: 'org', ownerUserId: 'me', brandGuidelines: brand });
+    const res = await request(makeApp(user)).post('/api/brand/guidelines').send(mapManageBrandUpdate({
+      company_name: 'New Corp', mission: 'Make IT easy', tone_of_voice: 'Direct',
+      target_audience: 'IT teams', key_messages: ['Simplify IT'],
+    }));
+    expect(res.status).toBe(201);
+    const saved = inOrg ? mockUpdateOrg.mock.calls[0][1].brandGuidelines :
+      mockDynamoUpdate.mock.calls[0][0].ExpressionAttributeValues[':brandGuidelines'];
+    expect(saved.brandData).toMatchObject({ brandName: 'New Corp', valueProposition: 'Make IT easy',
+      toneOfVoice: 'Direct', targetAudience: 'IT teams', keyMessages: ['Simplify IT'],
+      founders: brand.brandData.founders, logoUrl: 'logo', tagline: 'Keep this' });
+    expect(saved.attachments).toEqual(brand.attachments);
+    expect(saved.custom).toBe('preserved');
+    expect(saved.rev).toEqual(expect.any(String));
+    expect(saved.rev).not.toBe(brand.rev);
+  });
+});
+
+
+describe('POST guidelines concurrent attachment deletion', () => {
+  it('saves an inherited org brand conditionally on the owner record', async () => {
+    const user = { ...soloUser, orgId: 'org', orgRole: 'owner' };
+    mockDynamoGet.mockResolvedValue({ Item: user });
+    mockGetOrgById.mockResolvedValue({ orgId: 'org', ownerUserId: 'me' });
+    const res = await request(makeApp(user)).post('/api/brand/guidelines').send({ brandName: 'Changed' });
+    expect(res.status).toBe(201);
+    expect(mockUpdateOrg).not.toHaveBeenCalled();
+    expect(mockUpdateUser).toHaveBeenCalledWith('me', expect.objectContaining({
+      brandGuidelines: expect.objectContaining({ attachments: ownBrand.attachments,
+        brandData: expect.objectContaining({ brandName: 'Changed' }) }),
+    }), { condition: { expression: 'attribute_not_exists(brandGuidelines.updatedAt) AND attribute_not_exists(brandGuidelines.rev)', values: {} } });
+  });
+
+  it.each(['solo', 'org', 'owner-fallback'])('rejects a stale revision and preserves the deletion (%s)', async owner => {
+    const inOrg = owner !== 'solo';
+    const before = { ...ownBrand, rev: 'read-rev', updatedAt: '2026-09-22T00:00:00.000Z' };
+    let stored = { ...before, rev: 'deleted-rev', attachments: [ownBrand.attachments[0]] };
+    const user = { ...soloUser, brandGuidelines: before, ...(inOrg ? { orgId: 'org', orgRole: 'owner' } : {}) };
+    mockDynamoGet.mockResolvedValue({ Item: user });
+    mockGetOrgById.mockResolvedValue({ orgId: 'org', ownerUserId: 'me',
+      ...(owner === 'org' ? { brandGuidelines: before } : {}) });
+    const write = (next: any, expression: string, values: any) => {
+      expect(expression).toContain('brandGuidelines.updatedAt = :expectedBrandUpdatedAt');
+      expect(expression).toContain('brandGuidelines.rev = :expectedBrandRev');
+      expect(values[':expectedBrandUpdatedAt']).toBe(before.updatedAt);
+      expect(values[':expectedBrandRev']).toBe(before.rev);
+      if (values[':expectedBrandRev'] !== stored.rev) {
+        throw Object.assign(new Error('conflict'), { code: 'ConditionalCheckFailedException' });
+      }
+      stored = next;
+      return {};
+    };
+    const writeMock = owner === 'solo' ? mockDynamoUpdate : owner === 'org' ? mockUpdateOrg : mockUpdateUser;
+    if (owner === 'solo') {
+      writeMock.mockImplementationOnce(p => write(p.ExpressionAttributeValues[':brandGuidelines'], p.ConditionExpression, p.ExpressionAttributeValues));
+    } else {
+      writeMock.mockImplementationOnce((_id, patch, options) => write(patch.brandGuidelines, options?.condition?.expression, options?.condition?.values));
+    }
+    const res = await request(makeApp(user)).post('/api/brand/guidelines').send({ brandName: 'Changed' });
+    expect(res.status).toBe(409);
+    expect(stored.attachments).toEqual([ownBrand.attachments[0]]);
+    expect(stored.rev).toBe('deleted-rev');
+    expect(writeMock).toHaveBeenCalledTimes(1);
+  });
+});

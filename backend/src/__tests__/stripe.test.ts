@@ -368,6 +368,54 @@ describe('Stripe Backend Integration', () => {
 
       consoleSpy.mockRestore();
     });
+
+    it('syncs companyName/useCaseCategories from custom_fields onto the existing user (ENG-1756: moved off the public GET route)', async () => {
+      const mockUser = {
+        userId: 'user-cf-1',
+        email: 'custom-fields@example.com',
+        stripe_customer_id: undefined,
+        companyName: undefined,
+        useCaseCategories: undefined,
+      };
+
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValue(mockUser);
+      (userDb.updateUser as jest.Mock).mockResolvedValue(mockUser);
+      mockSubscriptionsRetrieve.mockResolvedValue({ ...proSubscription, id: 'sub_cf_1' });
+
+      const { waitlistDb } = require('../services/waitlistDb');
+      (waitlistDb.getByEmail as jest.Mock).mockResolvedValue(null);
+
+      const { handleCheckoutSessionCompleted } = await import('../services/stripeService');
+
+      await handleCheckoutSessionCompleted({
+        customer: 'cus_cf_1',
+        subscription: 'sub_cf_1',
+        metadata: { userId: 'user-cf-1' },
+        customer_details: { email: 'custom-fields@example.com' },
+        custom_fields: [
+          { key: 'companyname', text: { value: 'Acme Inc' } },
+          {
+            key: 'howdoyouplantousethisproduct',
+            dropdown: {
+              value: 'agency',
+              options: [{ value: 'agency', label: 'Running an agency' }],
+            },
+          },
+        ],
+      });
+
+      // Wait one microtask tick for the fire-and-forget sync to run.
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(userDb.updateUser).toHaveBeenCalledWith(
+        'user-cf-1',
+        expect.objectContaining({
+          companyName: 'Acme Inc',
+          useCaseCategories: ['Running an agency'],
+        })
+      );
+    });
   });
 
   describe('Webhook Handler - customer.subscription.updated', () => {

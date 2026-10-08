@@ -95,17 +95,53 @@ describe('thresholds come from the live policy, never a constant', () => {
   });
 });
 
-describe('vendor spend is never presented as all-in', () => {
-  it('keeps vendor separate from LLM and flags coverage as partial', async () => {
+describe('all-in cost (AC3) — coverage is now complete', () => {
+  // The prior invariant ("coverage partial, so never sum an all-in") no longer
+  // applies: as of 2026-09-14 every paid vendor writes to the ledger, so the
+  // all-in figure is honest. The enduring invariant is that all-in still
+  // SEPARATES its parts rather than presenting one opaque number.
+  it('sums an honest all-in and keeps the parts separable', async () => {
     mockScanByDateRange.mockResolvedValue([llmRow('u1', 10_000_000), vendorRow('u1', 2_000_000)]);
     mockGetAllUsers.mockResolvedValue([{ userId: 'u1', email: 'a@x.com', subscriptionType: 'Pro' }]);
     const r = await buildUnitEconomicsReport('2026-09');
     expect(r.rows[0].llmCostUsd).toBe(10);
     expect(r.rows[0].vendorCostUsd).toBe(2);
-    expect(r.rows[0].vendorCoverage).toBe('partial');
-    // No summed all-in field exists to be mistaken for one.
-    expect(r.rows[0]).not.toHaveProperty('allInCostUsd');
-    expect(r.vendorCoverageNote).toMatch(/not an all-in figure/i);
+    expect(r.rows[0].vendorCoverage).toBe('complete');
+    // The all-in is the sum, and the parts remain individually readable.
+    expect(r.rows[0].allInCostUsd).toBe(12);
+    expect(r.rows[0].llmCostUsd + r.rows[0].vendorCostUsd).toBe(r.rows[0].allInCostUsd);
+    expect(r.vendorCoverageNote).toMatch(/complete/i);
+  });
+
+  it('per-account infrastructure is $0 — shared overhead is not per-account attributable', async () => {
+    mockScanByDateRange.mockResolvedValue([llmRow('u1', 10_000_000), vendorRow('u1', 2_000_000)]);
+    mockGetAllUsers.mockResolvedValue([{ userId: 'u1', email: 'a@x.com', subscriptionType: 'Pro' }]);
+    const r = await buildUnitEconomicsReport('2026-09');
+    expect(r.rows[0].infrastructureUsd).toBe(0);
+  });
+
+  it('measures admitted-work overrun against the effective cap', async () => {
+    // Pro cap is $200; $250 of LLM spend admitted before the boundary => $50 overrun.
+    mockScanByDateRange.mockResolvedValue([llmRow('u1', 250_000_000)]);
+    mockGetAllUsers.mockResolvedValue([{ userId: 'u1', email: 'a@x.com', subscriptionType: 'Pro' }]);
+    const r = await buildUnitEconomicsReport('2026-09');
+    expect(r.rows[0].admittedWorkOverrunUsd).toBe(50);
+  });
+
+  it('reports $0 overrun for an account within its cap', async () => {
+    mockScanByDateRange.mockResolvedValue([llmRow('u1', 10_000_000)]);
+    mockGetAllUsers.mockResolvedValue([{ userId: 'u1', email: 'a@x.com', subscriptionType: 'Pro' }]);
+    const r = await buildUnitEconomicsReport('2026-09');
+    expect(r.rows[0].admittedWorkOverrunUsd).toBe(0);
+  });
+
+  it('reports $0 overrun for an uncapped tier — it cannot overrun a cap it does not have', async () => {
+    mockGetSubscriptionTypeConfig.mockResolvedValue({}); // no llmUsagePolicy
+    mockScanByDateRange.mockResolvedValue([llmRow('u1', 999_000_000)]);
+    mockGetAllUsers.mockResolvedValue([{ userId: 'u1', email: 'a@x.com', subscriptionType: 'Unpriced' }]);
+    const r = await buildUnitEconomicsReport('2026-09');
+    expect(r.rows[0].admittedWorkOverrunUsd).toBe(0);
+    expect(r.rows[0].allInCostUsd).toBe(999);
   });
 });
 
@@ -142,42 +178,8 @@ describe('credit ledger and the cap arithmetic', () => {
   });
 });
 
-describe('AC2 — discrepancies are visible, not hidden', () => {
-  it('surfaces a ledger/counter drift instead of silently trusting one', async () => {
-    mockScanByDateRange.mockResolvedValue([llmRow('u1', 100_000_000)]);
-    mockGetAllUsers.mockResolvedValue([{
-      userId: 'u1', email: 'drift@x.com', subscriptionType: 'Pro',
-      tokenUsage: { month: '2026-09', totalCost: 92.7 },
-    }]);
-    const r = await buildUnitEconomicsReport('2026-09');
-    expect(r.rows[0].reconciled).toBe(false);
-    expect(r.rows[0].ledgerVsCounterDeltaUsd).toBeCloseTo(7.3, 2);
-    expect(r.unreconciled).toHaveLength(1);
-    expect(r.alerts.find((a) => a.kind === 'ledger_counter_drift')?.count).toBe(1);
-  });
-
-  it('does not flag sub-cent rounding as drift', async () => {
-    mockScanByDateRange.mockResolvedValue([llmRow('u1', 100_000_000)]);
-    mockGetAllUsers.mockResolvedValue([{
-      userId: 'u1', email: 'ok@x.com', subscriptionType: 'Pro',
-      tokenUsage: { month: '2026-09', totalCost: 100.004 },
-    }]);
-    const r = await buildUnitEconomicsReport('2026-09');
-    expect(r.rows[0].reconciled).toBe(true);
-    expect(r.unreconciled).toHaveLength(0);
-  });
-
-  it('does not compare against a counter describing a different month', async () => {
-    mockScanByDateRange.mockResolvedValue([llmRow('u1', 100_000_000)]);
-    mockGetAllUsers.mockResolvedValue([{
-      userId: 'u1', email: 'ok@x.com', subscriptionType: 'Pro',
-      tokenUsage: { month: '2026-08', totalCost: 5 },
-    }]);
-    const r = await buildUnitEconomicsReport('2026-09');
-    expect(r.rows[0].counterCostUsd).toBeNull();
-    expect(r.rows[0].reconciled).toBe(true);
-  });
-});
+// AC2 (ledger vs the legacy counter) was retired with the counter: ENG-1250 AC7. The cap
+// enforces on the ledger itself, so there is nothing left to reconcile against.
 
 describe('AC1 — filters', () => {
   const seed = () => {

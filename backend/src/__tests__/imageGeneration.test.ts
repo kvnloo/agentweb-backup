@@ -1,3 +1,5 @@
+jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn().mockResolvedValue({ orgId: 'image-org' }) }, orgDb: { getOrgById: jest.fn().mockResolvedValue({ modelRoles: {} }) } }));
+jest.mock('../services/settingsService', () => ({ settingsService: { getSetting: jest.fn().mockResolvedValue(null) } }));
 // Unit tests for imageGeneration service
 
 import { ImageService, normalizeImageModel } from '../services/imageGeneration';
@@ -1935,3 +1937,17 @@ describe('ImageService.getAzureImageConfig (ENG-410 endpoint migration)', () => 
   });
 });
 
+
+
+it('routes the org image override and preserves an explicit request model', async () => {
+  const { orgDb } = await import('../services/db');
+  const { invalidateModelRoles } = await import('../services/modelRoles');
+  invalidateModelRoles('image-org');
+  (orgDb.getOrgById as jest.Mock).mockResolvedValueOnce({ modelRoles: { image: 'gpt-image-2' } });
+  const service = new ImageService();
+  const dispatch = jest.spyOn(service as any, 'generateWithAzureAI').mockResolvedValue({ success: false, error: 'fixture' });
+  await service.generateImage({ prompt: 'a cat', filename: 'cat.png', userId: 'image-role-user' });
+  expect(dispatch.mock.calls[0][1]).toBe('gpt-image-2');
+  await service.generateImage({ prompt: 'a cat', filename: 'cat.png', userId: 'image-role-user', imageModel: 'gpt-image-1' });
+  expect(dispatch.mock.calls[1][1]).toBe('gpt-image-1');
+});

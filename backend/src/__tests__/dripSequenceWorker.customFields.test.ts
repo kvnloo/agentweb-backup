@@ -68,7 +68,7 @@ const baseEnrollment = {
   sequenceId: 'seq-1',
   leadId: 'lead-1',
   listId: 'list-1',
-  leadEmail: 'lead@example.com',
+  leadEmail: 'lead@acme.io',
   userId: 'user-1',
   currentStep: 0,
   status: 'active',
@@ -78,7 +78,7 @@ const baseEnrollment = {
 
 const baseUser = {
   userId: 'user-1',
-  email: 'sender@example.com',
+  email: 'sender@acme.io',
   displayName: 'Sender',
   emailDomain: 'example.com',
   defaultSenderUsername: 'sender',
@@ -120,7 +120,7 @@ describe('dripSequenceWorker - custom field substitution', () => {
     mockDripSequenceDb.getSequence.mockResolvedValue(sequence as any);
     mockCrmDb.getLeadById.mockResolvedValue({
       leadId: 'lead-1',
-      email: 'lead@example.com',
+      email: 'lead@acme.io',
       firstName: 'Pat',
       customFields: { region: 'EMEA' },
     } as any);
@@ -161,7 +161,7 @@ describe('dripSequenceWorker - custom field substitution', () => {
     mockDripSequenceDb.getSequence.mockResolvedValue(sequence as any);
     mockCrmDb.getLeadById.mockResolvedValue({
       leadId: 'lead-1',
-      email: 'lead@example.com',
+      email: 'lead@acme.io',
       firstName: 'Pat',
       linkedin: 'https://linkedin.com/in/pat',
       customFields: { region: 'EMEA' },
@@ -192,7 +192,7 @@ describe('dripSequenceWorker - custom field substitution', () => {
     mockDripSequenceDb.getAllDueEnrollments.mockResolvedValue([baseEnrollment as any]);
     mockDripSequenceDb.getSequence.mockResolvedValue(sequence as any);
     mockCrmDb.getLeadById.mockResolvedValue({
-      leadId: 'lead-1', email: 'lead@example.com', firstName: 'Pat', title: 'CTO',
+      leadId: 'lead-1', email: 'lead@acme.io', firstName: 'Pat', title: 'CTO',
     } as any);
     mockResendService.sendEmail.mockResolvedValue({ id: 'email-1' } as any);
     mockDripSequenceDb.completeEnrollment.mockResolvedValue(undefined as any);

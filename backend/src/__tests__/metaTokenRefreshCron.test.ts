@@ -121,6 +121,23 @@ describe('runMetaTokenRefresh', () => {
     expect(ensureFreshMetaAdAccountToken).not.toHaveBeenCalled();
   });
 
+  // ENG-1907: a sandbox account's Meta connection is simulated. Refreshing it would call
+  // Meta's real token exchange with a sentinel token, and the capability probe would then
+  // stamp the connection as revoked — flipping the sandbox's Settings page to "Reconnect".
+  it('never touches a sandbox (eval_) principal, even with a Meta account inside the refresh window', async () => {
+    (userDb.getAllUsers as jest.Mock).mockResolvedValue([
+      { userId: 'eval_3b3b3b3b-0000-4000-8000-000000000000', connected_accounts: [metaAd('act-sbx', SOON)] },
+      { userId: 'u-real', connected_accounts: [metaAd('act-real', SOON)] },
+    ]);
+    (ensureFreshMetaAdAccountToken as jest.Mock).mockResolvedValue({ attempted: true, refreshed: true });
+
+    const summary = await runMetaTokenRefresh();
+
+    expect(ensureFreshMetaAdAccountToken).toHaveBeenCalledTimes(1);
+    expect(mockSyncMetaAdsCapability).toHaveBeenCalledTimes(1);
+    expect(summary.metaAccounts).toBe(1);
+  });
+
   it('skips non-Meta and far-from-expiry accounts; refreshes only those in window', async () => {
     (userDb.getAllUsers as jest.Mock).mockResolvedValue([
       {

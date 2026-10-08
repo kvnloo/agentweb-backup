@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   Box,
   Button,
@@ -77,6 +77,11 @@ interface SubscriptionType {
       active: boolean;
     }>;
   };
+  seatPricing?: {
+    priceCents: number;
+    usageCreditMicroUsd: number;
+    baseSeats: number;
+  };
 }
 
 interface AvailableFeature {
@@ -100,6 +105,7 @@ const AVAILABLE_CONNECTED_ACCOUNTS = [
   { id: 'attio', label: 'Attio' },
   { id: 'google_ads', label: 'Google Ads' },
   { id: 'google_drive', label: 'Google Drive' },
+  { id: 'linkedin_ads', label: 'LinkedIn Ads' },
 ];
 
 interface AvailableSkill {
@@ -151,14 +157,73 @@ const SubscriptionTypesTab: React.FC = () => {
   const [topUpEnabled, setTopUpEnabled] = useState(false);
   const [topUpMinimumMarkupInput, setTopUpMinimumMarkupInput] = useState('2.5');
   const [topUpPackagesInput, setTopUpPackagesInput] = useState('');
+  const [seatPriceInput, setSeatPriceInput] = useState('');
+  const [seatCreditInput, setSeatCreditInput] = useState('');
+  const [seatBaseSeatsInput, setSeatBaseSeatsInput] = useState('');
   const [expandedSkills, setExpandedSkills] = useState<Set<string>>(new Set());
+
+  const loadSubscriptionTypes = useCallback(async () => {
+    try {
+      setLoading(true);
+      const response = await axios.get(buildApiUrl('/api/admin/subscription-types'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setSubscriptionTypes(response.data);
+      setError('');
+    } catch (err: any) {
+      console.error('Error loading subscription types:', err);
+      setError(err.response?.data?.message || 'Failed to load subscription types');
+    } finally {
+      setLoading(false);
+    }
+  }, [token]);
+
+  const loadAvailableSkills = useCallback(async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/admin/available-skills'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (response.data && Array.isArray(response.data)) {
+        setAvailableSkills(response.data);
+      }
+    } catch (error) {
+      console.error('Error loading available skills:', error);
+    }
+  }, [token]);
+
+  const loadAvailablePages = useCallback(async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/subscription/customer-portal-pages'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (response.data && response.data.pages) {
+        // Pages are already in the correct format (without /marketing prefix)
+        setAvailablePages(response.data.pages);
+      }
+    } catch (error) {
+      console.error('Error loading available pages:', error);
+    }
+  }, [token]);
+
+  const loadAvailableFeatures = useCallback(async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/admin/subscription-features'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (Array.isArray(response.data?.features)) {
+        setAvailableFeatures(response.data.features);
+      }
+    } catch (error) {
+      console.error('Error loading subscription features:', error);
+    }
+  }, [token]);
 
   useEffect(() => {
     loadSubscriptionTypes();
     loadAvailableSkills();
     loadAvailablePages();
     loadAvailableFeatures();
-  }, []);
+  }, [loadSubscriptionTypes, loadAvailableSkills, loadAvailablePages, loadAvailableFeatures]);
 
   // Update formData when availableSkills or availablePages loads (for new types or when editing types with "*")
   useEffect(() => {
@@ -206,62 +271,6 @@ const SubscriptionTypesTab: React.FC = () => {
       }
     }
   }, [availableSkills, availablePages, availableFeatures, editDialogOpen, editingType]);
-
-  const loadSubscriptionTypes = async () => {
-    try {
-      setLoading(true);
-      const response = await axios.get(buildApiUrl('/api/admin/subscription-types'), {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      setSubscriptionTypes(response.data);
-      setError('');
-    } catch (err: any) {
-      console.error('Error loading subscription types:', err);
-      setError(err.response?.data?.message || 'Failed to load subscription types');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const loadAvailableSkills = async () => {
-    try {
-      const response = await axios.get(buildApiUrl('/api/admin/available-skills'), {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (response.data && Array.isArray(response.data)) {
-        setAvailableSkills(response.data);
-      }
-    } catch (error) {
-      console.error('Error loading available skills:', error);
-    }
-  };
-
-  const loadAvailablePages = async () => {
-    try {
-      const response = await axios.get(buildApiUrl('/api/subscription/customer-portal-pages'), {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (response.data && response.data.pages) {
-        // Pages are already in the correct format (without /marketing prefix)
-        setAvailablePages(response.data.pages);
-      }
-    } catch (error) {
-      console.error('Error loading available pages:', error);
-    }
-  };
-
-  const loadAvailableFeatures = async () => {
-    try {
-      const response = await axios.get(buildApiUrl('/api/admin/subscription-features'), {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (Array.isArray(response.data?.features)) {
-        setAvailableFeatures(response.data.features);
-      }
-    } catch (error) {
-      console.error('Error loading subscription features:', error);
-    }
-  };
 
   const handleOpenEditDialog = (type?: SubscriptionType) => {
     if (type) {
@@ -323,6 +332,9 @@ const SubscriptionTypesTab: React.FC = () => {
         (item.usageCreditMicroUsd / 1_000_000).toFixed(2),
         item.active ? 'active' : 'inactive',
       ].join('|')).join('\n') || '');
+      setSeatPriceInput(type.seatPricing ? (type.seatPricing.priceCents / 100).toFixed(2) : '');
+      setSeatCreditInput(type.seatPricing ? (type.seatPricing.usageCreditMicroUsd / 1_000_000).toFixed(2) : '');
+      setSeatBaseSeatsInput(type.seatPricing != null ? String(type.seatPricing.baseSeats) : '');
     } else {
       setEditingType(null);
       // When creating new, start with all pages, skills, and platforms selected
@@ -349,6 +361,9 @@ const SubscriptionTypesTab: React.FC = () => {
       setTopUpEnabled(false);
       setTopUpMinimumMarkupInput('2.5');
       setTopUpPackagesInput('');
+      setSeatPriceInput('');
+      setSeatCreditInput('');
+      setSeatBaseSeatsInput('');
     }
     setExpandedSkills(new Set());
     setEditDialogOpen(true);
@@ -380,6 +395,9 @@ const SubscriptionTypesTab: React.FC = () => {
     setTopUpEnabled(false);
     setTopUpMinimumMarkupInput('2.5');
     setTopUpPackagesInput('');
+    setSeatPriceInput('');
+    setSeatCreditInput('');
+    setSeatBaseSeatsInput('');
     setExpandedSkills(new Set());
   };
 
@@ -487,6 +505,28 @@ const SubscriptionTypesTab: React.FC = () => {
         };
       }
 
+      let seatPricing: SubscriptionType['seatPricing'];
+      if (seatPriceInput.trim() || seatCreditInput.trim() || seatBaseSeatsInput.trim()) {
+        const seatPriceUsd = Number(seatPriceInput.replace(/[$,]/g, ''));
+        const seatCreditUsd = Number(seatCreditInput.replace(/[$,]/g, ''));
+        const baseSeats = Number(seatBaseSeatsInput);
+        const priceCents = Math.round(seatPriceUsd * 100);
+        const usageCreditMicroUsd = Math.round(seatCreditUsd * 1_000_000);
+        if (!Number.isInteger(priceCents) || priceCents <= 0) {
+          setError('Extra seat price must be a positive dollar amount');
+          return;
+        }
+        if (!Number.isInteger(usageCreditMicroUsd) || usageCreditMicroUsd <= 0) {
+          setError('Extra seat usage credit must be a positive dollar amount');
+          return;
+        }
+        if (!Number.isInteger(baseSeats) || baseSeats < 0) {
+          setError('Base seats must be a whole number of 0 or more');
+          return;
+        }
+        seatPricing = { priceCents, usageCreditMicroUsd, baseSeats };
+      }
+
       // Convert all selected items back to "*" if all are selected
       const dataToSave: SubscriptionType = {
         name: formData.name,
@@ -505,6 +545,7 @@ const SubscriptionTypesTab: React.FC = () => {
         monthlyCostAllowance: parsedCostAllowance,
         ...(llmUsagePolicy ? { llmUsagePolicy } : {}),
         ...(llmUsageTopUp ? { llmUsageTopUp } : {}),
+        ...(seatPricing ? { seatPricing } : {}),
       };
 
       let updatedTypes = [...subscriptionTypes];
@@ -955,6 +996,44 @@ const SubscriptionTypesTab: React.FC = () => {
                 onChange={(e) => setTopUpPackagesInput(e.target.value)}
                 placeholder="aw-10|10 AgentWeb Credits|25.00|10.00|active"
                 helperText="One per line: id | customer label | customer price USD | provider usage USD | active/inactive"
+              />
+            </Paper>
+
+            <Paper variant="outlined" sx={{ p: 2, mb: 3 }}>
+              <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                Extra seat pricing
+              </Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                Price charged per extra team seat beyond this tier's free base, and how much of
+                that charge becomes shared LLM usage credit for the org. Leave all three blank if
+                this tier doesn't sell extra seats (e.g. Managed).
+              </Typography>
+              <TextField
+                fullWidth
+                label="Extra seat price (USD / month)"
+                value={seatPriceInput}
+                onChange={(e) => setSeatPriceInput(e.target.value)}
+                placeholder="50.00"
+                helperText="Full monthly charge per extra seat."
+                sx={{ mb: 2 }}
+              />
+              <TextField
+                fullWidth
+                label="Usage credit per seat (USD / month)"
+                value={seatCreditInput}
+                onChange={(e) => setSeatCreditInput(e.target.value)}
+                placeholder="30.00"
+                helperText="Portion of the seat price granted back as shared LLM usage credit."
+                sx={{ mb: 2 }}
+              />
+              <TextField
+                fullWidth
+                label="Base seats"
+                value={seatBaseSeatsInput}
+                onChange={(e) => setSeatBaseSeatsInput(e.target.value)}
+                placeholder="2"
+                helperText="Free seats included with this tier before extra-seat billing applies."
+                inputProps={{ inputMode: 'numeric' }}
               />
             </Paper>
 

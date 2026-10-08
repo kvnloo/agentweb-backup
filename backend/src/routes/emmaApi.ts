@@ -8,7 +8,8 @@ import { Router, Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { requireEmmaTokenBudget } from '../middleware/emmaTokenBudget';
 import { chatbotDb } from '../services/chatbotService';
-import { publishRevalidationForForwardedRun } from '../utils/scheduledPublishConsentGuard';
+import { publishRevalidationForForwardedRun, publishWithdrawnMidFlight, SCHEDULED_SESSION_HEADER } from '../utils/scheduledPublishConsentGuard';
+import { getMetaAdsMetricsArgsSchema } from '../utils/metaCampaignIds';
 
 const router = Router();
 
@@ -200,12 +201,21 @@ router.post('/generate-video', async (req: Request, res: Response) => {
 router.post('/describe-media', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const { type, url, prompt, llm_model, return_transcript, return_scenes, start_time, end_time } = req.body;
+    const { type, url, prompt, llm_model, return_transcript, return_scenes, start_time, end_time, session_id } = req.body;
     let result;
     if (type === 'video') {
-      result = await svc.describeVideo(url, prompt, { return_transcript, return_scenes, start_time, end_time, userId: userId(req) });
+      // ENG-1961: carry the session too, so analysis run through this API is
+      // traceable to its chat the same way the tool path is (the sibling
+      // /generate-video route already takes session_id).
+      result = await svc.describeVideo(url, prompt, {
+        return_transcript, return_scenes, start_time, end_time,
+        userId: userId(req), sessionId: session_id,
+      });
     } else {
-      result = await svc.describeImage(llm_model || 'gpt-4o', url, prompt);
+      // ENG-1858: meter to the API caller instead of "system".
+      result = await svc.describeImage(llm_model || 'gpt-4o', url, prompt, {
+        userId: userId(req), sessionId: session_id, feature: 'describe_image',
+      });
     }
     res.json(result);
   } catch (err: any) {
@@ -329,11 +339,57 @@ router.post('/post-on-account', async (req: Request, res: Response) => {
     const toolContext = buildScheduledPublishContext(req);
     const result = await svc.postOnConnectedAccount(
       userId(req), req.body.account_id, req.body.content, req.body.media_urls || [],
-      undefined, toolContext
+      undefined, toolContext,
+      req.body.save_as_draft === true || req.body.in_reply_to_post_id
+        ? { ...(req.body.save_as_draft === true ? { saveAsDraft: true } : {}), ...(typeof req.body.in_reply_to_post_id === 'string' && req.body.in_reply_to_post_id ? { inReplyToPostId: req.body.in_reply_to_post_id } : {}) }
+        : undefined
     );
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
+  }
+});
+
+// ENG-1005: authenticated, metered counterparts of the internal blog tools.
+// Keep the existing service behavior and carry scheduled consent to the CMS write.
+router.post('/create-blog-article', async (req: Request, res: Response) => {
+  try {
+    const args = req.body;
+    if (![args.title_draft, args.content_draft].every(value => typeof value === 'string' && value.trim())) {
+      return res.status(400).json({ message: 'title_draft and content_draft are required.' });
+    }
+    const svc = await getAgentModeService();
+    const result = await svc.createBlogArticle(
+      args.title_draft, args.content_draft, args.length || 'medium',
+      args.researchContext || '', args.requirements || '',
+      userId(req), req.header(SCHEDULED_SESSION_HEADER) || '',
+      args.style || 'default', args.deep_research === true
+    );
+    return res.json(result);
+  } catch (err: any) {
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+router.post('/publish-blog-article', async (req: Request, res: Response) => {
+  try {
+    const args = req.body;
+    if (![args.title, args.description, args.hero_image_url, args.blog_html_url].every(value => typeof value === 'string' && value.trim())) {
+      return res.status(400).json({ message: 'title, description, hero_image_url, and blog_html_url are required.' });
+    }
+    const status = args.status ?? 'draft';
+    if (status !== 'draft' && status !== 'published') return res.status(400).json({ message: 'status must be draft or published.' });
+    const publishContext = status === 'published' ? publishRevalidationForForwardedRun(req, 'publish_blog_article') : undefined;
+    const withdrawn = await publishWithdrawnMidFlight(publishContext);
+    if (withdrawn) return res.json(withdrawn);
+    const svc = await getAgentModeService();
+    return res.json(await svc.publishBlogArticle(
+      args.title, args.description, args.hero_image_url, args.blog_html_url,
+      userId(req), req.header(SCHEDULED_SESSION_HEADER) || '',
+      status, args.author, args.categories, publishContext?.assertPublishStillAuthorized
+    ));
+  } catch (err: any) {
+    return res.status(500).json({ message: err.message });
   }
 });
 
@@ -402,7 +458,20 @@ router.get('/meta-ads/campaigns', async (req: Request, res: Response) => {
 
 router.post('/meta-ads/marketing-api', async (req: Request, res: Response) => {
   try {
-    const { entity_type, action, account_id, parent_id, entity_id, fields, params, session_id } = req.body;
+    /*
+     * ENG-1725: this used to destructure parent_id/entity_id/fields and pass them positionally
+     * into callMetaMarketingApi's (campaign_id, ad_set_id, ad_id) slots — none of those names
+     * exist anywhere in this tool's own published schema (emma/tools.ts's call_meta_marketing_api
+     * definition), which documents campaign_id/ad_set_id/ad_id as the actual field names, and
+     * whose `execute()` handler (the path every LLM/agent tool call actually takes) already
+     * passes args.campaign_id/args.ad_set_id/args.ad_id straight through correctly. Only this
+     * raw REST route was out of sync with its own spec — `fields` in particular was never an id
+     * at all, so it could end up silently occupying the ad_id slot. Reading the documented names
+     * here instead makes this route consistent with the one path (agent tool-calling) that was
+     * already correct, and with anyone who followed the published schema rather than the
+     * previously-undocumented parent_id/entity_id/fields shape.
+     */
+    const { entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, session_id } = req.body;
     // Greptile P1/security ("Session does not bind authorization"): session_id
     // feeds the objective gate's confirmation check (a prior answer, or the
     // transcript for an explicit-statement quote) — an authenticated caller
@@ -415,7 +484,7 @@ router.post('/meta-ads/marketing-api', async (req: Request, res: Response) => {
       }
     }
     const svc = await getAgentModeService();
-    const result = await svc.callMetaMarketingApi(userId(req), entity_type, action, account_id, parent_id, entity_id, fields, params, session_id);
+    const result = await svc.callMetaMarketingApi(userId(req), entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, session_id);
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
@@ -434,12 +503,21 @@ router.post('/meta-ads/insights', async (req: Request, res: Response) => {
 
 router.post('/meta-ads/metrics', async (req: Request, res: Response) => {
   try {
+    // Direct HTTP clients historically sent numeric IDs; keep accepting them here
+    // while the tool-gateway contract stays string-only.
+    const requestBody = Array.isArray(req.body?.campaign_ids)
+      ? { ...req.body, campaign_ids: req.body.campaign_ids.map((id: unknown) =>
+        (typeof id === 'number' ? String(id) : id)) }
+      : req.body;
+    const parsed = getMetaAdsMetricsArgsSchema.safeParse(requestBody);
+    if (!parsed.success) return res.json({ success: false,
+      message: 'campaign_ids is required and must contain at least one campaign ID.', error: 'Invalid campaign_ids' });
     const svc = await getAgentModeService();
     const result = await svc.getMetaAdsMetrics(
-      req.body.timeframe || '7d',
+      parsed.data.timeframe || '7d',
       userId(req),
-      req.body.campaign_ids,
-      req.body.account_id,
+      parsed.data.campaign_ids,
+      parsed.data.account_id,
     );
     res.json(result);
   } catch (err: any) {

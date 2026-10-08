@@ -239,7 +239,9 @@ describe('Agent Mode Controller - Daily Digest', () => {
           expect.objectContaining({ runId: 'run-3' })
         ]),
         'schedule-123',
-        expect.any(Date)
+        expect.any(Date),
+        // ENG-1552: a manual resend never records delivery state.
+        { recordDelivery: false }
       );
       expect(mockRes.json).toHaveBeenCalledWith({
         success: true,
@@ -267,7 +269,9 @@ describe('Agent Mode Controller - Daily Digest', () => {
           sessionId: 'session-1'
         }),
         'schedule-123',
-        undefined
+        undefined,
+        // ENG-1552: a manual resend never records delivery state.
+        { recordDelivery: false }
       );
       expect(mockRes.json).toHaveBeenCalledWith({ success: true });
     });
@@ -362,7 +366,9 @@ describe('Agent Mode Controller - Daily Digest', () => {
           expect.objectContaining({ runId: 'run-3' })
         ]),
         'schedule-123',
-        expect.any(Date) // The selected result date
+        expect.any(Date), // The selected result date
+        // ENG-1552: a manual resend never records delivery state.
+        { recordDelivery: false }
       );
       
       // Should NOT send individual email
@@ -527,7 +533,9 @@ describe('Agent Mode Controller - Daily Digest', () => {
           expect.objectContaining({ runId: 'run-3' })
         ]),
         'schedule-123',
-        expect.any(Date)
+        expect.any(Date),
+        // ENG-1552: a manual resend never records delivery state.
+        { recordDelivery: false }
       );
 
       // Should not include run-4 from different date

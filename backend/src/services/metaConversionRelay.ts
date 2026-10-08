@@ -32,7 +32,9 @@
  */
 
 import * as crypto from 'crypto';
-import { isSmokeTestEmail } from '../utils/smokeTestLead';
+import { isSmokeTestLead } from '../utils/smokeTestLead';
+import { defaultStatusConfigFor } from '../utils/leadSchema';
+import { isSessionList } from '../utils/sessionList';
 
 export type LeadStatusType = 'active' | 'won' | 'lost' | 'churned';
 
@@ -59,16 +61,17 @@ export const META_WON_NO_VALUE_EVENT = 'CRMWonDeal';
  *  statusConfig existed (or created without one). Kept in sync deliberately: a list with
  *  no config still has statuses, and treating it as "no conversions possible" would
  *  silently relay nothing for exactly the oldest accounts. */
-const DEFAULT_LEAD_STATUS_CONFIG: LeadStatusConfigEntry[] = [
-  { value: 'new', label: 'New', color: 'gray', type: 'active' },
-  { value: 'contacted', label: 'Contacted', color: 'blue', type: 'active' },
-  { value: 'qualified', label: 'Qualified', color: 'indigo', type: 'active' },
-  { value: 'proposal_sent', label: 'Proposal Sent', color: 'purple', type: 'active' },
-  { value: 'negotiating', label: 'Negotiating', color: 'yellow', type: 'active' },
-  { value: 'won', label: 'Won', color: 'green', type: 'won' },
-  { value: 'lost', label: 'Lost', color: 'red', type: 'lost' },
-  { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
-];
+// Sourced from leadSchema, which is where createLeadList and getLeadListStatuses also
+// read it — this was a fourth hand-maintained copy of the same eight statuses.
+//
+// KNOWN GAP, deliberately not closed here: this resolves the PROSPECT default because
+// mapStatusToMetaEvent is not given the list's `listType`. A customers list with no
+// stored statusConfig therefore reads `onboarding/active/at_risk/churned` everywhere else
+// and `new/contacted/qualified/...` here. Threading listType through `ctx` is a behaviour
+// change on the revenue-relay path and belongs in its own PR, not slipped into this one.
+// Before this de-duplication all four copies agreed — and all four were equally wrong for
+// a customers list — so nothing regresses by centralising the literal.
+const DEFAULT_LEAD_STATUS_CONFIG = defaultStatusConfigFor() as LeadStatusConfigEntry[];
 
 const normalize = (value: unknown): string =>
   typeof value === 'string' ? value.trim().toLowerCase().replace(/[\s-]+/g, '_') : '';
@@ -399,6 +402,9 @@ export interface RelayContext {
    *  status says now. Absent on the first, inline attempt, where current state is the
    *  transition. See processConversionRelayJob for why this matters. */
   conversionKind?: ConversionKind;
+  /** The list's listType, from the list row the caller already loaded. A session list never
+   *  relays (ENG-2311) — see the guards in dispatchLeadStatusConversion / relayLeadStatusEvent. */
+  listType?: string | null;
 }
 
 export type RelayResult =
@@ -526,6 +532,12 @@ export async function relayLeadStatusEvent(
   try {
     if (!leadId) return { skipped: true, reason: 'lead has no leadId', retryable: false };
 
+    // ENG-2311: every send funnels through here (inline, queued job, fallback). Prod session
+    // lists were created untyped with the SALES statusConfig (it has `won`), and retagging
+    // 'session' keeps that config — so a status edit on a session row must still never
+    // reach Meta. settled=true so any pending marker is released rather than swept forever.
+    if (isSessionList({ listType: ctx.listType })) return skip('session list never relays conversions', false, false, true);
+
     // A queued kind is authoritative: the conversion happened when the status changed, and
     // a later edit does not un-happen it. Only fall back to deriving one from current status
     // on the inline first attempt, where they are the same thing.
@@ -544,7 +556,7 @@ export async function relayLeadStatusEvent(
 
     // Never pollute a real ad account with the automated smoke test's synthetic lead —
     // same guard the form-submission path applies (routes/webhooks.ts).
-    if (isSmokeTestEmail(lead.email)) {
+    if (isSmokeTestLead(lead)) {
       return skip('smoke-test lead', true, false, true);
     }
 
@@ -740,6 +752,7 @@ export async function processConversionRelayJob(payload: ConversionRelayJobPaylo
     lead,
     statusConfig: (list as any)?.statusConfig,
     conversionMapping: (list as any)?.conversionMapping,
+    listType: (list as any)?.listType,
     conversionKind: payload.conversionKind,
   });
 
@@ -865,6 +878,8 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<D
 
   const leadId = ctx.lead?.leadId;
   if (!leadId) return 'noop';
+  // ENG-2311: don't even enqueue a job for a session list (see relayLeadStatusEvent).
+  if (isSessionList({ listType: ctx.listType })) return 'noop';
 
   // An explicitly supplied kind is authoritative — it comes either from a queued job or from
   // a `metaConversionPending` marker, and in both cases the lead's CURRENT status may have

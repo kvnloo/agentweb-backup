@@ -1,3 +1,5 @@
+import { writeWithEvaluationGuard } from './evaluationPersistence';
+import { isEvaluationUser, requireActiveEvaluation } from './evaluationPolicy';
 import AWS from "aws-sdk";
 import crypto from "crypto";
 import { v4 as uuidv4 } from "uuid";
@@ -40,6 +42,7 @@ export class AgentApiKeyService {
     rateLimitPerMin: number = 60,
     expiresAt?: string
   ): Promise<{ rawKey: string; keyRecord: AgentApiKey }> {
+    if (isEvaluationUser(userId)) await requireActiveEvaluation(userId);
     const keyId = uuidv4();
     const rawKey = `aw_${crypto.randomBytes(32).toString("hex")}`;
     const keyHash = crypto.createHash("sha256").update(rawKey).digest("hex");
@@ -58,13 +61,12 @@ export class AgentApiKeyService {
       ...(expiresAt && { expiresAt }),
     };
 
-    await dynamodb
-      .put({
-        TableName: this.tableName,
-        Item: keyRecord,
-      })
-      .promise();
+    await writeWithEvaluationGuard(dynamodb, userId, TABLE_PREFIX, { Put: {
+      TableName: this.tableName,
+      Item: keyRecord,
+    } });
 
+    if (isEvaluationUser(userId)) await requireActiveEvaluation(userId);
     return { rawKey, keyRecord };
   }
 
@@ -81,22 +83,27 @@ export class AgentApiKeyService {
         })
         .promise();
 
-      if (!result.Items || result.Items.length === 0) {
+      if (!Array.isArray(result.Items) || result.Items.length === 0) {
         return null;
       }
 
       const key = result.Items[0] as AgentApiKey;
+      if (!key || typeof key.userId !== 'string' || !key.userId || typeof key.keyId !== 'string') return null;
 
       if (key.status !== "active") {
         return null;
       }
 
-      if (key.expiresAt && new Date(key.expiresAt) < new Date()) {
+      if (key.expiresAt !== undefined && (typeof key.expiresAt !== 'string' || !Number.isFinite(Date.parse(key.expiresAt)) || Date.parse(key.expiresAt) <= Date.now())) {
         return null;
       }
 
+      if (isEvaluationUser(key.userId)) {
+        try { await requireActiveEvaluation(key.userId); } catch { return null; }
+      }
+
       // Fire-and-forget lastUsedAt update
-      this.updateLastUsed(key.keyId);
+      this.updateLastUsed(key.keyId, key.userId);
 
       return key;
     } catch (error) {
@@ -139,32 +146,38 @@ export class AgentApiKeyService {
       throw new Error("Unauthorized");
     }
 
-    await dynamodb
-      .update({
-        TableName: this.tableName,
-        Key: { keyId },
-        UpdateExpression: "SET #status = :status, revokedAt = :revokedAt",
-        ExpressionAttributeNames: { "#status": "status" },
-        ExpressionAttributeValues: {
-          ":status": "revoked",
-          ":revokedAt": new Date().toISOString(),
-        },
-      })
-      .promise();
+    await writeWithEvaluationGuard(dynamodb, userId, TABLE_PREFIX, { Update: {
+      TableName: this.tableName,
+      Key: { keyId },
+      ConditionExpression: "userId = :owner",
+      UpdateExpression: "SET #status = :status, revokedAt = :revokedAt",
+      ExpressionAttributeNames: { "#status": "status" },
+      ExpressionAttributeValues: {
+        ":owner": userId,
+        ":status": "revoked",
+        ":revokedAt": new Date().toISOString(),
+      },
+    } });
   }
 
-  async updateLastUsed(keyId: string): Promise<void> {
+  async updateLastUsed(keyId: string, userId?: string): Promise<void> {
     try {
-      await dynamodb
-        .update({
-          TableName: this.tableName,
-          Key: { keyId },
-          UpdateExpression: "SET lastUsedAt = :lastUsedAt",
-          ExpressionAttributeValues: {
-            ":lastUsedAt": new Date().toISOString(),
-          },
-        })
-        .promise();
+      // Direct callers must resolve the owner too; a missing row must never be recreated.
+      if (userId === undefined) {
+        const result = await dynamodb.get({ TableName: this.tableName, Key: { keyId }, ConsistentRead: true }).promise();
+        if (typeof result.Item?.userId !== 'string' || !result.Item.userId) return;
+        userId = result.Item.userId;
+      }
+      await writeWithEvaluationGuard(dynamodb, userId, TABLE_PREFIX, { Update: {
+        TableName: this.tableName,
+        Key: { keyId },
+        ConditionExpression: "userId = :owner",
+        UpdateExpression: "SET lastUsedAt = :lastUsedAt",
+        ExpressionAttributeValues: {
+          ":owner": userId,
+          ":lastUsedAt": new Date().toISOString(),
+        },
+      } });
     } catch (error) {
       // Fire-and-forget: log but don't throw
       console.error("Error updating lastUsedAt:", error);

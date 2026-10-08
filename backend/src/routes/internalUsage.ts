@@ -34,8 +34,51 @@ import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { recordUsage, computeCostMicroUsd, RecordUsageContext } from "../services/usageRecorderService";
 import { incrementUserTokenUsage, resolveBillingUserId } from "../services/tokenUsageService";
 import { usageRecordDb } from "../services/usageRecordDb";
+import { retryTransientWrite } from "../services/usageWriteFailureMonitor";
+import { allocateMicroUsd, buildLlmSpendEvent, isLlmDualWriteEnabled } from "../services/spendLedgerDualWrite";
+import { getModelPrice, isPerGenerationPriced, LLM_PRICE_BOOK_PROVENANCE } from "../utils/llmPricing";
+
+/** ENG-1934: rate provenance for a dollar figure the agent engine computed itself. */
+const ENGINE_COST_PROVENANCE = "caller:agent-engine";
 
 const router = express.Router();
+
+/** ENG-1934: one (pricing source, provider) slice of a charge group. */
+interface PricedPortion {
+  source: "book" | "engine";
+  provider: string;
+  tokens: number;
+  calls: number;
+  costUsd: number;
+}
+
+/**
+ * Most spend events one charge group may add to its transaction.
+ *
+ * DynamoDB allows 100 actions per TransactWriteItems, and the group already
+ * spends two (aggregate + charge event). `provider` arrives from the engine
+ * per record, so a batch can name any number of them. Past this bound the
+ * portions collapse to one per pricing source under provider "mixed", which
+ * keeps the write atomic and idempotent rather than overflowing into the
+ * non-atomic fallback (CodeRabbit, PR #2904). Real groups have one or two.
+ */
+export const MAX_SPEND_EVENTS_PER_GROUP = 10;
+export const MIXED_PROVIDER = "mixed";
+
+function collapsePortionsForTransaction(portions: PricedPortion[]): PricedPortion[] {
+  if (portions.length <= MAX_SPEND_EVENTS_PER_GROUP) return portions;
+  const bySource = new Map<PricedPortion["source"], PricedPortion>();
+  for (const portion of portions) {
+    const merged =
+      bySource.get(portion.source) ||
+      { source: portion.source, provider: MIXED_PROVIDER, tokens: 0, calls: 0, costUsd: 0 };
+    merged.tokens += portion.tokens;
+    merged.calls += portion.calls;
+    merged.costUsd += portion.costUsd;
+    bySource.set(portion.source, merged);
+  }
+  return [...bySource.values()];
+}
 
 /** Hard cap on batch size — one task run produces far fewer records. */
 const MAX_RECORDS_PER_BATCH = 500;
@@ -193,6 +236,16 @@ router.post(
           // First non-empty provider wins -- matches the ledger row's own
           // if_not_exists(provider) semantic (first writer sticks).
           provider: string;
+          // ENG-1934: subtotals by WHO PRICED each record and WHICH PROVIDER
+          // served it. One group (user, model, feature) can mix records the
+          // engine priced (costUsdOverride) with records this backend's book
+          // priced, can span providers, and — for a model the book does not
+          // know — can hold records nobody priced. A spend event carries one
+          // provenance and one provider, so each (pricing, provider) portion
+          // becomes its own event and the unpriced records become none
+          // (CodeRabbit, PR #2904). Insertion order is the records' order, so
+          // a resubmitted batch rebuilds the same portions and ids.
+          pricedPortions: Map<string, PricedPortion>;
         }
       >();
 
@@ -265,6 +318,7 @@ router.post(
               userId, model: record.model!, feature: chargeFeature, tokens: 0, cost: 0, calls: 0,
               recordFingerprints: [], inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
               provider: recordProvider,
+              pricedPortions: new Map<string, PricedPortion>(),
             };
           entry.tokens +=
             record.inputTokens! + record.outputTokens! + cacheReadTokens + cacheWriteTokens;
@@ -277,6 +331,32 @@ router.post(
               cacheWriteTokens
             ) / 1e6
           );
+          // "book" only when this route's own pricing produced the cost: a
+          // token-priced model the book knows. An image/video record without
+          // an engine cost is priced at $0 here (computeCostMicroUsd has no
+          // per-generation rate), so it is unpriced, not a confirmed $0
+          // allocation (CodeRabbit, PR #2904).
+          const source: PricedPortion["source"] | null =
+            costUsdOverride != null ? "engine" : getModelPrice(record.model!) !== null ? "book" : null;
+          if (source) {
+            const portionKey = `${source}\u0001${recordProvider}`;
+            const portion =
+              entry.pricedPortions.get(portionKey) ||
+              { source, provider: recordProvider, tokens: 0, calls: 0, costUsd: 0 };
+            portion.tokens +=
+              record.inputTokens! + record.outputTokens! + cacheReadTokens + cacheWriteTokens;
+            portion.calls += 1;
+            portion.costUsd += costUsdOverride ?? (
+              computeCostMicroUsd(
+                record.model!,
+                record.inputTokens!,
+                record.outputTokens!,
+                cacheReadTokens,
+                cacheWriteTokens
+              ) / 1e6
+            );
+            entry.pricedPortions.set(portionKey, portion);
+          }
           entry.calls += 1;
           entry.inputTokens += record.inputTokens!;
           entry.outputTokens += record.outputTokens!;
@@ -323,7 +403,11 @@ router.post(
             cacheReadTokens,
             cacheWriteTokens,
             costUsdOverride,
+            // ENG-1934: an engine-supplied amount was priced by the engine, not
+            // by this backend's book — say so on the spend event.
+            ...(costUsdOverride != null ? { costProvenance: ENGINE_COST_PROVENANCE } : {}),
             date: requestDate,
+            occurredAt: requestReceivedAt.toISOString(),
           },
         });
         accepted++;
@@ -401,39 +485,103 @@ router.post(
           const eventId = eventIdByChargeKey.get(chargeKey)!;
           const billingUserId = billingUserIdByActor.get(entry.userId) || entry.userId;
           const costMicroUsd = Math.max(0, Math.round(entry.cost * 1_000_000));
+          // ENG-1934: the group's spend events ride the same transaction, keyed
+          // off its charge event's id, so a retried batch no-ops every item
+          // together. One event per priced portion — see the subtotals above.
+          const priced = collapsePortionsForTransaction([...entry.pricedPortions.values()]);
+          // One integer total split across the portions by their exact costs, so
+          // the events sum EXACTLY to the aggregate row whatever the rounding.
+          const shares = allocateMicroUsd(costMicroUsd, priced.map((portion) => portion.costUsd));
+          const portions = priced.map((portion, i) => ({
+            ...portion,
+            costMicroUsd: shares[i],
+            rateProvenance: portion.source === "engine" ? ENGINE_COST_PROVENANCE : LLM_PRICE_BOOK_PROVENANCE,
+            // The group's own provider keeps the plain ids; another provider's
+            // portion is suffixed with it. Deterministic, and distinct per portion.
+            callId:
+              (portion.source === "engine" ? `${eventId}#engine` : eventId) +
+              (portion.provider === entry.provider ? "" : `@${portion.provider}`),
+          }));
+          const spendEvents = isLlmDualWriteEnabled()
+            ? portions
+                .map((portion) =>
+                  buildLlmSpendEvent(
+                    {
+                      actingUserId: entry.userId,
+                      billingUserId,
+                      provider: portion.provider,
+                      model: entry.model,
+                      feature: entry.feature,
+                      totalTokens: portion.tokens,
+                      perGeneration: isPerGenerationPriced(entry.model),
+                      generationCount: portion.calls,
+                      costMicroUsd: portion.costMicroUsd,
+                      costSource: "allocated",
+                      rateProvenance: portion.rateProvenance,
+                      callId: portion.callId,
+                    },
+                    requestReceivedAt.toISOString(),
+                  ),
+                )
+                .flatMap((built) => ("event" in built ? [built.event] : []))
+            : [];
           try {
-            const outcome = await usageRecordDb.incrementUsageWithChargeEvent(
-              {
-                userId: entry.userId,
-                date: requestDate,
-                model: entry.model,
-                feature: entry.feature,
-                inputTokens: entry.inputTokens,
-                outputTokens: entry.outputTokens,
-                cacheReadTokens: entry.cacheReadTokens,
-                cacheWriteTokens: entry.cacheWriteTokens,
-                costMicroUsd,
-                billingUserId,
-                costSource: "allocated",
-                provider: entry.provider,
-                calls: entry.calls,
-              },
-              {
-                billingUserId,
-                eventId,
-                occurredAt: requestReceivedAt.toISOString(),
-                actingUserId: entry.userId,
-                tokens: Math.max(0, Math.round(entry.tokens)),
-                costMicroUsd,
-                model: entry.model,
-                feature: entry.feature,
-                calls: entry.calls,
+            // Retry the SAME grouped transaction before falling back
+            // (CodeRabbit, PR #2904). A conflict or throttle can arrive after
+            // DynamoDB committed; replaying the identical items then returns
+            // "duplicate" instead of the per-record fallback writing the
+            // aggregate twice and minting a second, unkeyed spend event. The
+            // fallback below still runs when the retries cannot settle it.
+            const outcome = await retryTransientWrite(async () => {
+              const attempt = await usageRecordDb.incrementUsageWithChargeEvent(
+                {
+                  userId: entry.userId,
+                  date: requestDate,
+                  model: entry.model,
+                  feature: entry.feature,
+                  inputTokens: entry.inputTokens,
+                  outputTokens: entry.outputTokens,
+                  cacheReadTokens: entry.cacheReadTokens,
+                  cacheWriteTokens: entry.cacheWriteTokens,
+                  costMicroUsd,
+                  billingUserId,
+                  // ENG-700 semantics, previously skipped on this path: a group in
+                  // which nobody priced anything is "unpriced", not a confirmed $0.
+                  costSource: entry.pricedPortions.size > 0 ? "allocated" : "unpriced",
+                  provider: entry.provider,
+                  calls: entry.calls,
+                },
+                {
+                  billingUserId,
+                  eventId,
+                  occurredAt: requestReceivedAt.toISOString(),
+                  actingUserId: entry.userId,
+                  tokens: Math.max(0, Math.round(entry.tokens)),
+                  costMicroUsd,
+                  model: entry.model,
+                  feature: entry.feature,
+                  calls: entry.calls,
+                },
+                // Passed only when there are any: with the kill switch off, or an
+                // unpriced group, the call is exactly the two-item transaction it
+                // always was.
+                ...(spendEvents.length ? [spendEvents] : [])
+              );
+              if (attempt === "conflict") {
+                throw Object.assign(new Error("transaction conflict on engine usage"), {
+                  code: "TransactionConflictException",
+                });
               }
-            );
+              return attempt;
+            });
             chargeOutcomeByKey.set(chargeKey, outcome);
-          } catch (err) {
-            console.error(`[internalUsage] atomic ledger+charge write failed for eventId=${eventId}:`, err);
-            chargeOutcomeByKey.set(chargeKey, "error");
+          } catch (err: any) {
+            if (err?.code === "TransactionConflictException") {
+              chargeOutcomeByKey.set(chargeKey, "conflict");
+            } else {
+              console.error(`[internalUsage] atomic ledger+charge write failed for eventId=${eventId}:`, err);
+              chargeOutcomeByKey.set(chargeKey, "error");
+            }
           }
         })
       );

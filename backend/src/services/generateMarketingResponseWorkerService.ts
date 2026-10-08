@@ -8,8 +8,10 @@ import path from 'path';
 import { clearTerminalProgress } from '../utils/sseProgress';
 import { DRAIN_CEILING_MS, DRAIN_POLL_INTERVAL_MS } from '../utils/shutdownConstants';
 import type { WorkPlanTurnDisposition } from './agentMode/core/workPlanTurnDisposition';
+import type { PendingApprovalDeck } from './agentMode/core/approvalDeck';
+import type { RunFunding } from './funding/runFunding';
 
-interface GenerateMarketingResponseParams {
+export interface GenerateMarketingResponseParams {
   messageContent: string;
   sessionHistory: any[];
   userId: string;
@@ -23,6 +25,15 @@ interface GenerateMarketingResponseParams {
   // ENG-473: when set, the worker persists each settled turn to the session as it
   // completes so a hard process kill leaves a visible partial transcript.
   persistIncrementally?: boolean;
+  // ENG-1816 F1: the run's funding decision, resolved once by the caller and carried
+  // across the fork IPC boundary exactly like publishAuthorizationOverride below —
+  // plain serializable data, never a positional argument (this interface already has
+  // ~15 fields; generateMarketingResponse's own signature has ~19 positional params).
+  // The worker enters an AsyncLocalStorage scope with this value before calling into
+  // agentModeService, so every nested callLLM call sees it without being edited.
+  // Optional only for callers not yet updated; absent is treated as 'agentweb' (F1
+  // never assigns any other route, so this is not yet a real branch in practice).
+  runFunding?: RunFunding;
   // ENG-827 (Greptile): the publish authorization the CALLER already resolved, carried
   // across the worker boundary so the system prompt is built from the same value the
   // required-function checker uses. Two independent reads can land either side of a
@@ -39,9 +50,12 @@ interface GenerateMarketingResponseParams {
   // any unapproved source image for this run.
   approvedRevisionImageSources?: string[];
   requireWorkPlanDisposition?: boolean;
+  // ENG-2072: tri-state — see ToolContext.isUnattendedRun in mcp/client/toolRegistry.ts.
+  // Plain boolean, so it survives the IPC serialization to the worker process.
+  isUnattendedRun?: boolean;
 }
 
-interface GenerateMarketingResponseResult {
+export interface GenerateMarketingResponseResult {
   content: string;
   toolCalls: any[];
   knowledgeBaseQueries: string[];
@@ -52,6 +66,28 @@ interface GenerateMarketingResponseResult {
   // run, so the caller's final batch persists only the remaining tail.
   persistedResponseCount?: number;
   workPlanTurnDisposition?: WorkPlanTurnDisposition;
+  // ENG-1635/1644: the deck built this turn, when present — plain data, survives
+  // the fork IPC boundary like publishAuthorizationOverride above.
+  pendingApprovalDeck?: PendingApprovalDeck;
+}
+
+/**
+ * ENG-2294: the dev-mode worker must load ts-node in transpile-only mode, matching the parent
+ * process (`ts-node --transpile-only src/server.ts`). Full type-checking at require-time made
+ * every dev/preview brand-build worker exit 1 on any type error (e.g. untyped `nspell`).
+ * The deployed (dist) branch is unchanged.
+ */
+export function resolveWorkerLaunch(dir: string, isLocalDevelopment: boolean): { workerScript: string; execArgv: string[] } {
+  if (isLocalDevelopment) {
+    return {
+      workerScript: path.join(dir, '../workers/generateMarketingResponseWorker.ts'),
+      execArgv: ['-r', 'ts-node/register/transpile-only', '--max-old-space-size=4096']
+    };
+  }
+  return {
+    workerScript: path.join(dir, '../workers/generateMarketingResponseWorker.js'),
+    execArgv: ['--max-old-space-size=4096']
+  };
 }
 
 export class GenerateMarketingResponseWorkerService {
@@ -86,13 +122,7 @@ export class GenerateMarketingResponseWorkerService {
     const isDeployedEnvironment = __dirname.includes('/dist/') || __dirname.includes('\\dist\\');
     const isLocalDevelopment = process.env.NODE_ENV === 'development' && !isDeployedEnvironment;
 
-    if (isLocalDevelopment) {
-      workerScript = path.join(__dirname, '../workers/generateMarketingResponseWorker.ts');
-      execArgv = ['-r', 'ts-node/register', '--max-old-space-size=4096'];
-    } else {
-      workerScript = path.join(__dirname, '../workers/generateMarketingResponseWorker.js');
-      execArgv = ['--max-old-space-size=4096'];
-    }
+    ({ workerScript, execArgv } = resolveWorkerLaunch(__dirname, isLocalDevelopment));
 
     // Fork a new process with increased memory limit (4GB) to prevent OOM errors
     this.worker = fork(workerScript, [], {
@@ -238,6 +268,14 @@ export class GenerateMarketingResponseWorkerService {
         if (message.retryAfterMs !== undefined) {
           error.retryAfterMs = message.retryAfterMs;
         }
+        // ENG-2121: restore the whole-turn-timeout tag so the controller's own
+        // backstop (withGenerationTimeout's caller — salvages any images/tool work
+        // already persisted this turn) treats a bounded per-call LLM timeout the
+        // same as its own hard-cap race firing, instead of silently losing the
+        // signal at this same IPC boundary ENG-1670 already had to patch once.
+        if (message.isGenerationTimeout) {
+          error.isGenerationTimeout = message.isGenerationTimeout;
+        }
         pending.reject(error);
       }
     });
@@ -357,16 +395,16 @@ export class GenerateMarketingResponseWorkerService {
 
   /**
    * Shutdown the worker process, draining any in-flight requests first.
-   * Blocks until pendingRequests.size === 0 or DRAIN_CEILING_MS elapses.
+   * Blocks until pendingRequests.size === 0 or the remaining drain budget elapses.
    */
-  async shutdown(): Promise<void> {
+  async shutdown(ceilingMs: number = DRAIN_CEILING_MS): Promise<void> {
     this.draining = true;
     console.log(`[Worker] Drain started — ${this.pendingRequests.size} in-flight request(s)`);
 
-    const deadline = Date.now() + DRAIN_CEILING_MS;
+    const deadline = Date.now() + Math.max(0, ceilingMs);
 
     while (this.pendingRequests.size > 0 && Date.now() < deadline) {
-      await new Promise(resolve => setTimeout(resolve, DRAIN_POLL_INTERVAL_MS));
+      await new Promise(resolve => setTimeout(resolve, Math.min(DRAIN_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now()))));
     }
 
     if (this.pendingRequests.size > 0) {

@@ -226,6 +226,20 @@ describe('startLiveSession', () => {
     expect(connectionConfig.systemInstruction.parts[0].text).toContain('neutral');
   });
 
+  // ENG-450: voice onboarding must be docs-grounded the same way the text
+  // path is (agentModeSystemPrompt.ts) — consult search_user_guide before
+  // asking the user for manual input on a blocked setup/integration step.
+  it('tells the voice model to consult search_user_guide before manual input', async () => {
+    makeCallbacks();
+
+    await startLiveSession('session-voice-docs', 'socket-voice-docs', jest.fn(), 'test-user-id', 'onboarding');
+
+    const systemText = mockLiveConnect.mock.calls[0][0].config.systemInstruction.parts[0].text;
+    expect(systemText).toContain('search_user_guide');
+    expect(systemText.toLowerCase()).toContain('docs.agentweb.pro');
+    expect(systemText.toLowerCase()).toMatch(/before asking.*manual|manual.*search_user_guide|consult.*before/);
+  });
+
   it('directs Emma to use General American English', async () => {
     makeCallbacks();
 
@@ -1266,6 +1280,8 @@ describe('ENG-763 onboarding install_skills tool-gate (live path)', () => {
 
     expect(mockExecuteTool).toHaveBeenCalledWith(
       expect.any(String), 'read_brand_guidelines', {}, 'test-user-id', 'session-onboarding-allowed', false,
+      // ENG-2072: a live voice call is always attended, even on a schedule-created session.
+      { isUnattendedRun: false },
     );
   });
 
@@ -1286,6 +1302,8 @@ describe('ENG-763 onboarding install_skills tool-gate (live path)', () => {
     // Default (non-onboarding) sessions are unaffected by the onboarding gate.
     expect(mockExecuteTool).toHaveBeenCalledWith(
       expect.any(String), 'install_skills', {}, 'test-user-id', 'session-default-gate', false,
+      // ENG-2072: a live voice call is always attended, even on a schedule-created session.
+      { isUnattendedRun: false },
     );
   });
 });

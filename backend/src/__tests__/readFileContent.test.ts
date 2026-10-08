@@ -69,7 +69,14 @@ jest.mock('../utils/s3Utils', () => ({
 }));
 
 // Mock crypto
+// ENG-2103 F2 full-suite checkpoint: spread the REAL crypto module rather than
+// a bare { createHash } stub — agentModeController.ts (transitively required
+// via agentModeService.ts -> approvalInboxExecution.ts) calls uuid's v4() at
+// module load, which needs crypto.randomFillSync. A createHash-only mock left
+// that undefined, breaking module load for ANY test file that mocks crypto
+// this way, regardless of whether it ever touches uuid itself.
 jest.mock('crypto', () => ({
+  ...jest.requireActual('crypto'),
   createHash: jest.fn()
 }));
 
@@ -297,6 +304,44 @@ describe('readFileContent', () => {
       expect(result.message).toContain('Failed to read file content');
     });
 
+    // ENG-1162: a plain external-URL fetch (no AgentWeb account involved) that
+    // comes back 403/401 means the PUBLISHER refused the request (bot-block,
+    // WAF, paywall) — not an AgentWeb auth/permission problem. Left as a bare
+    // "HTTP 403: Forbidden", classifyToolErrorClass's embedded-status regex
+    // swept this into the generic 'auth' class, whose model-visible guidance
+    // says to "reconnect the account" — nonsensical for an anonymous read, and
+    // it gave no signal that the failed read is NOT evidence the content is
+    // missing. The message must name the publisher as the blocker so the
+    // classifier (and the model) don't read this as our own account/permissions
+    // failure.
+    it('should flag a 403 from an external fetch as a publisher-side refusal, not an AgentWeb auth problem', async () => {
+      const axios = require('axios');
+      const axiosError: any = new Error('Request failed with status code 403');
+      axiosError.isAxiosError = true;
+      axiosError.response = { status: 403, statusText: 'Forbidden' };
+      axios.get.mockRejectedValue(axiosError);
+
+      const result = await (agentModeService as any).readFileContent('https://files.gao.gov/some-report.pdf');
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('publisher');
+      expect(result.message).not.toMatch(/reconnect/i);
+      expect(result.error).toContain('publisher');
+    });
+
+    it('should flag a 401 from an external fetch as a publisher-side refusal, not an AgentWeb auth problem', async () => {
+      const axios = require('axios');
+      const axiosError: any = new Error('Request failed with status code 401');
+      axiosError.isAxiosError = true;
+      axiosError.response = { status: 401, statusText: 'Unauthorized' };
+      axios.get.mockRejectedValue(axiosError);
+
+      const result = await (agentModeService as any).readFileContent('https://example.com/gated.pdf');
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('publisher');
+    });
+
     it('should handle invalid URL format', async () => {
       const result = await (agentModeService as any).readFileContent('invalid-url');
 
@@ -368,6 +413,29 @@ describe('readFileContent', () => {
 
       expect(result.success).toBe(true);
       expect(result.file_type).toBe('text');
+    });
+
+    it('reads SVG source as text instead of rejecting it as an image (ENG-1468)', async () => {
+      const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="40"><text>Logo</text></svg>';
+      const axios = require('axios');
+      axios.get.mockResolvedValue({ data: Buffer.from(svg), headers: { 'content-type': 'image/svg+xml' } });
+
+      const result = await (agentModeService as any).readFileContent('https://example.com/logo.svg');
+
+      expect(result.success).toBe(true);
+      expect(result.content).toBe(svg);
+      expect(result.file_type).toBe('text');
+    });
+
+    it('still rejects raster images and points to describe_image (ENG-1468)', async () => {
+      const axios = require('axios');
+      axios.get.mockClear();
+
+      const result = await (agentModeService as any).readFileContent('https://example.com/photo.png');
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('describe_image');
+      expect(axios.get).not.toHaveBeenCalled();
     });
 
     it('should detect unknown file types', async () => {

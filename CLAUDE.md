@@ -439,8 +439,8 @@ Claude models on Vertex AI use a GCP service account for authentication (OAuth t
    ```
 
 **To add a new model:**
-1. Add an entry to `llmModels` in `backend/src/services/agentModeService.ts` using the model ID as the key (e.g. `claude-opus-4-8`). Set `supportsTemperature: false` if the model has deprecated temperature.
-2. Add pricing to `modelPricing` in the same file.
+1. Add an entry to `LLM_MODEL_REGISTRY` in `backend/src/services/agentMode/llmModelRegistry.ts` using the model ID as the key (e.g. `claude-opus-4-8`). Set `supportsTemperature: false` if the model has deprecated temperature. Then run `npm run refresh:openrouter-params` (in `backend/`) so `openRouterRequestParams.registryGuard.test.ts` checks the model against OpenRouter's `supported_parameters`; it tells you which `supports*` flag to set.
+2. Add pricing to `MODEL_PRICING` in `backend/src/utils/llmPricing.ts`.
 3. The `getClientForModel` / `callLLM` lazy-load branch routes any key starting with `claude-` to `getVertexClient()` automatically.
 4. Add registry and lazy-load tests in `backend/src/__tests__/agentModeService.sonnet45.test.ts`.
 
@@ -452,7 +452,7 @@ To find the model ID and inference profile for a new Claude model on AWS Bedrock
 2. **Look up the inference profile ID** on the [cross-region inference page](https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference-support.html). Use the `global.*` prefix for cross-region access. Example: `global.anthropic.claude-sonnet-4-6`
 3. **Update these files:**
    - `backend/src/utils/bedrockInferenceProfiles.ts` — add ONE entry to `BEDROCK_INFERENCE_PROFILE_MAP`. This is the single source of truth; `agentModeService`, `codingAgentService`, `llmService`, and the loops all resolve through it. If the model is served from the separate bearer-token account (231030591963), also add it to `BEDROCK_BEARER_TOKEN_MODELS`.
-   - `backend/src/services/agentModeService.ts` — add to the `llmModels` registry (model metadata only — NOT the profile mapping)
+   - `backend/src/services/agentMode/llmModelRegistry.ts` — add to `LLM_MODEL_REGISTRY` (model metadata only — NOT the profile mapping)
    - `backend/src/__tests__/agentModeService.sonnet45.test.ts` — add model registry, lazy-loading, and inference profile ARN tests
 4. The inference profile ARN format is: `arn:aws:bedrock:us-west-2:992382574572:inference-profile/{profile_id}`
    Do **not** paste that ARN into a service file — `backend/src/__tests__/sdkConstructionGuard.test.ts` fails the build if these literals appear outside `bedrockInferenceProfiles.ts` (ENG-683: the map was previously duplicated across four files and drifted).
@@ -747,7 +747,11 @@ These checks prevent CI failures and ensure code quality. The `npm run typecheck
 - A new feature is its own commit
 - Unit tests are their own commit
 - User release notes updates are their own commit
-- Documentation changes (dev.md, CLAUDE.md) are their own commit
+- Documentation changes (dev.md fragments, CLAUDE.md) are their own commit
+
+**dev.md notes are fragments (ENG-809).** Never edit `dev.md` directly — CI rejects it. Write
+`dev/pending/<eng-id>-<slug>.md` whose first line is `## ENG-<n>: <title> (YYYY-MM-DD)`; after merge a
+workflow folds fragments into `dev.md` newest first. See `dev/pending/README.md`.
 
 For example, a PR that fixes a bug and adds a feature should have at minimum: one commit for the bug fix, one for the feature, one for tests, one for release notes, and one for any dev.md investigation notes — not a single commit bundling everything together.
 
@@ -818,7 +822,7 @@ When making changes, these files are critical to understand:
 
 3. **Documentation:**
    - `README.md` - Setup and features
-   - `dev.md` - Known issues, troubleshooting, database operations
+   - `dev.md` - Known issues, troubleshooting, database operations (add notes via `dev/pending/` fragments, ENG-809)
    - `design.md` - System architecture and security model
 
 ## Additional Notes
@@ -845,6 +849,14 @@ For manual testing on test/staging environments:
 - **Password:** `Test123!`
 - **Subscription:** Basic (default for DIY users)
 - **Purpose:** Test features available to users with Basic subscription
+
+### Verifier-owned skill fixture (ENG-2302)
+- `qa-user@agentweb.pro` owns throwaway `[qa-fixture] ENG-2302 conflict probe` user skills.
+- `QA_USER_PASSWORD=... node backend/scripts/verify-skill-conflict.mjs` (optional `VERIFY_BASE_URL`)
+  creates a fixture, races submit-for-review vs delete, asserts one 2xx + one 409 (never a
+  double write or 5xx), and deletes every fixture it created. It fails closed if the fixture
+  is not owned by the QA user and never touches customer skills. Offline test:
+  `node --test backend/scripts/verify-skill-conflict.test.mjs`.
 
 ## Cloud Test Environment
 

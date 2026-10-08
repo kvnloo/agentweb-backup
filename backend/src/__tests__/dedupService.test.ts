@@ -48,3 +48,61 @@ describe('dedupService.findDuplicate', () => {
     expect(await findDuplicate({ type: 'bug', title: 'x', description: 'y' }, CANDS)).toBeNull();
   });
 });
+
+// ENG-1961: the judge is an LLM call the caller triggered. It used to run with no
+// usage context at all, so its spend booked to the `system` placeholder —
+// recorded, but charged to nobody.
+describe('dedupService.findDuplicate attribution (ENG-1961)', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('bills the triggering user and tags the feature', async () => {
+    mockJudge(JSON.stringify({ matchedIndex: null, confidence: 0, reason: 'different' }));
+    await findDuplicate(
+      { type: 'bug', title: 'crash on save', description: 'x' },
+      CANDS,
+      { userId: 'user-7', sessionId: 'sess-7' },
+    );
+
+    const options = (agentModeService.callLLM as jest.Mock).mock.calls[0][2];
+    expect(options.usageContext).toEqual({
+      userId: 'user-7',
+      sessionId: 'sess-7',
+      feature: 'intake_dedup',
+    });
+  });
+
+  it('meters feature-only rather than inventing a user when none is in scope', async () => {
+    mockJudge(JSON.stringify({ matchedIndex: null, confidence: 0, reason: 'different' }));
+    await findDuplicate({ type: 'bug', title: 'crash', description: 'x' }, CANDS);
+
+    const options = (agentModeService.callLLM as jest.Mock).mock.calls[0][2];
+    expect(options.usageContext).toEqual({ feature: 'intake_dedup' });
+    expect(options.usageContext.userId).toBeUndefined();
+  });
+});
+
+
+// ENG-1335: the judge must compare the substantive ask, not title tokens, and must keep
+// adjacent-but-different asks (publish-refusal vs awaiting-user-input) apart.
+describe('dedupService.findDuplicate prompt (ENG-1335)', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('instructs substantive-ask matching with an explicit over-match guard', async () => {
+    mockJudge(JSON.stringify({ matchedIndex: null, confidence: 0 }));
+    await findDuplicate({ type: 'bug', title: 'a', description: 'b' }, CANDS);
+    const system = (agentModeService.callLLM as jest.Mock).mock.calls[0][1][0].content as string;
+    expect(system).toMatch(/substantive ask/);
+    expect(system).toMatch(/no distinctive title words/);
+    expect(system).toMatch(/DIFFERENT change are NOT a match/);
+    expect(system).toMatch(/publish-approval gate/);
+  });
+
+  it('keeps an ask that sits past a long preamble (ENG-1334 shape) in the prompt', async () => {
+    mockJudge(JSON.stringify({ matchedIndex: null, confidence: 0 }));
+    const description = 'REPEAT REQUEST — evidence. '.repeat(30) + 'ASK: score awaiting-user-input sessions neutral';
+    expect(description.length).toBeGreaterThan(600);
+    await findDuplicate({ type: 'bug', title: 'x', description }, CANDS);
+    const user = (agentModeService.callLLM as jest.Mock).mock.calls[0][1][1].content as string;
+    expect(user).toContain('ASK: score awaiting-user-input sessions neutral');
+  });
+});

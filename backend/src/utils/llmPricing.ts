@@ -14,6 +14,23 @@
  * models to Sonnet pricing, which hides pricing gaps).
  */
 
+/**
+ * Version stamp for every price in this file (ENG-1250 §5: "A price change
+ * creates a new version; historical events retain the rate version used").
+ *
+ * Written onto each LLM spend event this book priced (ENG-1934), so a
+ * historical event can be re-derived from the prices that produced it. Dated
+ * to the last commit that changed a price here.
+ *
+ * **Bump this in the same commit as any price edit.** `llmPricing.test.ts`
+ * pins a fingerprint of the tables to this version, so a price change that
+ * forgets the bump fails the build instead of silently sharing a version.
+ */
+export const LLM_PRICE_BOOK_VERSION = "2026-10-07";
+
+/** The rate provenance a spend event carries when this book priced it. */
+export const LLM_PRICE_BOOK_PROVENANCE = `llm-price-book:${LLM_PRICE_BOOK_VERSION}`;
+
 export interface ModelPrice {
   /** USD per 1M input tokens */
   inPerM: number;
@@ -104,6 +121,13 @@ const HAIKU_4_5_PRICE = withDerivedCache(1, 5);
 // over-bills 4x. cacheWritePerM is left on the standard 125%-of-input
 // convention (Anthropic did not publish a changed write rate).
 const FABLE_5_1_PRICE: ModelPrice = { ...withDerivedCache(10, 50), cacheReadPerM: 0.25 };
+// Claude Opus 5.5 (released 2026-09-22): Anthropic list $4/$20 per 1M
+// in/out (20% below Opus 5), cache-read $0.20/1M (60% below Opus 5,
+// openrouter.ai/anthropic/claude-opus-5.5 live 2026-09-22). The 5%-of-input
+// read rate breaks withDerivedCache's 10% convention, so it is overridden
+// explicitly — same pattern as FABLE_5_1_PRICE above. Write stays on the
+// standard 125% convention (Anthropic published no changed write rate).
+const OPUS_5_5_PRICE: ModelPrice = { ...withDerivedCache(4, 20), cacheReadPerM: 0.2 };
 // Gemini 3.8 Flash (released 2026-09-02): same $0.75/$3.75 base rate as
 // Gemini 3.7 Flash, confirmed live on openrouter.ai 2026-09-02. Cache-read
 // follows the standard 10%-of-input convention ($0.075/1M — matches live).
@@ -120,6 +144,14 @@ const GEMINI_3_8_FLASH_PRICE: ModelPrice = { ...withDerivedCache(0.75, 3.75), ca
  *   price page is tagged with `// UNVERIFIED`.
  */
 export const MODEL_PRICING: Record<string, ModelPrice> = {
+  "openrouter/anthropic/claude-sonnet-5.5": {"inPerM":2,"outPerM":10,"cacheReadPerM":0.2,"cacheWritePerM":2.5},
+  "openrouter/deepseek/deepseek-v4-pro-0813": {"inPerM":1.32,"outPerM":3.96,"cacheReadPerM":0.044},
+  "openrouter/deepseek/deepseek-v4.1-flash": {"inPerM":0.05,"outPerM":1.2,"cacheReadPerM":0.02},
+  "openrouter/google/gemini-3.5-flash-lite": {"inPerM":0.3,"outPerM":2.5,"cacheReadPerM":0.03,"cacheWritePerM":0.0833333333333333},
+  "openrouter/openai/gpt-6.1-sol": {"inPerM":2,"outPerM":10,"cacheReadPerM":0.1,"cacheWritePerM":2.5},
+  "openrouter/z-ai/glm-5.3": {"inPerM":0.07,"outPerM":7,"cacheReadPerM":0.065},
+  "openrouter/z-ai/glm-5.3-flash": {"inPerM":0.15,"outPerM":0.5,"cacheReadPerM":0.03},
+
   // ── AWS Bedrock Anthropic (ported from estimateCost) ───────────────────────
   // ENG-893: every cacheWritePerM here is the DEFAULT-TTL (1.25x) rate, even
   // for models agent-mode invokes with `ttl: '1h'`. The 1-hour rate is 2x, but
@@ -173,6 +205,8 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'gemini-3.5-flash': withDerivedCache(1.5, 9), // was 0.15/0.6 — stale
   // Google's official introductory rate (ai.google.dev), verified live 2026-08-19.
   // Scheduled to increase to $1.50/$7.50 on 2027-01-01 — not modeled here yet.
+  // Official Gemini API rate verified 2026-09-11; same introductory window as 3.7.
+  'gemini-3.6-flash': withDerivedCache(0.75, 3.75),
   'gemini-3.7-flash': withDerivedCache(0.75, 3.75),
   'gemini-3.8-flash': GEMINI_3_8_FLASH_PRICE,
   'gemini-2.5-flash': withDerivedCache(0.3, 2.5), // text/chat model — was MISSING (recorded $0)
@@ -215,12 +249,36 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   // live 2026-08-19 with gpt-5.6-sol/terra/luna deployed & Running). OpenRouter's own
   // marketplace promo pricing does NOT apply to BYOK traffic — we're billed Azure's real
   // GlobalStandard list rate. Prices below = Azure's official "Global", short-context
-  // GPT-5.6 Series rate (azure.microsoft.com/pricing/details/cognitive-services/azure-openai),
-  // verified live 2026-08-19. (Cached/write rates already match our 10%/125% derived-cache
-  // convention exactly against Azure's own published cache rates for all three.)
+  // GPT-5.6 Series rate (azure.microsoft.com/pricing/details/cognitive-services/azure-openai).
+  // (Cached/write rates already match our 10%/125% derived-cache convention exactly against
+  // Azure's own published cache rates for all three.)
+  //
+  // 2026-09-05 (ENG-1781): Terra and Luna re-verified stale — Azure cut both on 2026-07-30
+  // mirroring OpenAI's direct-API cut (Terra -20%, Luna -80%) and this table was never
+  // updated, so BYOK Terra/Luna calls were over-metered against the customer's usage cap
+  // (Luna ~5x, Terra ~1.25x). Re-verified against Azure's official published GlobalStandard
+  // rate via azurespeed.com/AzureAiModelPricing (Models.dev Azure catalog snapshot, meter
+  // effective date 2026-07-01) and independently corroborated by cloudzero.com's 2026 Azure
+  // OpenAI pricing guide and a LiteLLM maintainer issue (BerriAI/litellm#36192) documenting
+  // the identical Azure-meter-vs-cost-map drift on the same two models. Sol unchanged — Azure
+  // did not cut it. OpenRouter's per-endpoint listing corroborates but is not the source.
   'openrouter/openai/gpt-5.6-sol': withDerivedCache(5.0, 30.0),
-  'openrouter/openai/gpt-5.6-terra': withDerivedCache(2.5, 15.0),
-  'openrouter/openai/gpt-5.6-luna': withDerivedCache(1.0, 6.0),
+  'openrouter/openai/gpt-5.6-terra': withDerivedCache(2.0, 12.0),
+  'openrouter/openai/gpt-5.6-luna': withDerivedCache(0.2, 1.2),
+  // ENG-1769 (2026-09-05): GPT-6 Astra — BYOK-routed to the same Azure
+  // resource as the GPT-5.6 trio (deployment `gpt-6-astra`, GlobalStandard),
+  // so Azure's GlobalStandard list rate applies, not OpenRouter's marketplace
+  // price (identical today, but that is a coincidence, not the reason).
+  // Live-confirmed 2026-09-05 from the BYOK generation record: 13 prompt +
+  // 5 completion tokens billed $0.00013 + $0.00025 upstream = exactly $10 /
+  // $50 per 1M. Cache read $1.00 / write $12.50 per 1M match OpenRouter's
+  // listed input_cache_read / input_cache_write for this model, i.e. the
+  // standard 10% / 125% derivation — no override needed.
+  // NOT modeled: Azure/OpenAI reprice the WHOLE request to $20/$75 once the
+  // prompt exceeds 272k tokens (OpenRouter `pricing.overrides`). No row in
+  // this table models long-context tiers, and the BYOK path bills from this
+  // table, so a >272k-token Astra call under-bills ~2x — see ENG-1774.
+  'openrouter/openai/gpt-6-astra': withDerivedCache(10.0, 50.0),
   // ENG-199/ENG-1685: Claude Fable 5.1 (Anthropic, released 2026-09-01),
   // routed through OpenRouter per the ENG-9/ENG-1414 gateway convention —
   // same as every other OpenRouter entry in this block, NOT the direct
@@ -233,6 +291,17 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   // mode's default provider). FABLE_5_1_PRICE already encodes the override;
   // reused here (not re-derived) so the two ids can never drift on price.
   'openrouter/anthropic/claude-fable-5.1': FABLE_5_1_PRICE,
+  // Claude Opus 5.5 (released 2026-09-22), OpenRouter-routed per ENG-9 —
+  // same pattern as Fable 5.1 above. OpenRouter `usage.cost` remains the
+  // per-call authority; this entry is the pre-call estimate + BYOK fallback.
+  'openrouter/anthropic/claude-opus-5.5': OPUS_5_5_PRICE,
+  // 2026-09-22 adds, live-verified against openrouter.ai model pricing.
+  // Sol/Luna cache rates match the 10%/125% convention exactly. Grok 4.7's
+  // cache read is 25% of input ($0.40), so it is overridden. None model the
+  // >272k (OpenAI) / >200k (xAI) long-context 2x tier — same gap as ENG-1774.
+  'openrouter/openai/gpt-6-sol': withDerivedCache(2.0, 10.0),
+  'openrouter/openai/gpt-6-luna': withDerivedCache(0.1, 0.5),
+  'openrouter/x-ai/grok-4.7': { ...withDerivedCache(1.6, 4.8), cacheReadPerM: 0.4 },
   'openrouter/x-ai/grok-4.6': withDerivedCache(2.0, 6.0), // was $3/$15 — stale, ~2x over live
   'openrouter/deepseek/deepseek-v4-pro': withDerivedCache(0.657, 1.315), // live "62% off" promo; lowest-confidence entry in this batch — the promo makes list price hard to reconstruct cleanly, re-verify if this model becomes cost-sensitive
   'openrouter/deepseek/deepseek-v4-flash': withDerivedCache(0.068, 0.168), // was ~2x over live
@@ -259,6 +328,7 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'openrouter/perplexity/sonar-pro-search': withDerivedCache(3, 15),
 
   // ── Embeddings (output side is always 0 — embeddings have no completion) ────
+  'openai/text-embedding-3-large': { inPerM: 0.13, outPerM: 0 },
   'text-embedding-3-large': { inPerM: 0.13, outPerM: 0 },
   'text-embedding-3-small': { inPerM: 0.02, outPerM: 0 },
   'text-embedding-ada-002': { inPerM: 0.1, outPerM: 0 },
@@ -319,8 +389,25 @@ export function isPerGenerationPriced(model: string | undefined | null): boolean
   );
 }
 
-export function imageGenerationCostUsd(model: string): number {
+export function imageGenerationCostUsd(model: string, resolution?: '1K'): number {
+  // Explicit 1K output: 1,120 image tokens × $60/M (ai.google.dev/gemini-api/docs/pricing, 2026-09-11).
+  if (model === 'gemini-3.1-flash-image' && resolution === '1K') return 0.0672;
   return IMAGE_GENERATION_PRICING_USD[model] ?? 0.04;
+}
+
+/** Gemini 3.1 Flash Image at explicit 1K: official standard rates, verified 2026-09-11. */
+export function geminiFlashImageUsage(usage: unknown, hasImage: boolean) {
+  const data = usage && typeof usage === 'object' ? usage as Record<string, unknown> : {};
+  const count = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  const inputTokens = count(data.promptTokenCount);
+  const candidates = count(data.candidatesTokenCount);
+  const thinking = count(data.thoughtsTokenCount);
+  const imageTokens = hasImage ? 1120 : 0;
+  return {
+    inputTokens, outputTokens: candidates + thinking,
+    costUsdOverride: (hasImage ? imageGenerationCostUsd('gemini-3.1-flash-image', '1K') : 0) +
+      (inputTokens * 0.5 + (Math.max(0, candidates - imageTokens) + thinking) * 3) / 1e6,
+  };
 }
 
 /**
@@ -329,12 +416,19 @@ export function imageGenerationCostUsd(model: string): number {
  */
 export function videoGenerationCostUsd(model: string, durationSeconds?: number): number {
   const clipPrice = VIDEO_GENERATION_PRICING_USD_PER_CLIP[model] ?? 3.2;
+  return clipPrice * videoClipCount(durationSeconds);
+}
+
+/**
+ * How many billed clips a requested duration is. Shared with the spend ledger
+ * (ENG-1934), so an event's generation quantity is the same number the cost
+ * was multiplied by.
+ */
+export function videoClipCount(durationSeconds?: number): number {
   const VEO_MAX_SECONDS = 8;
-  const clipCount =
-    durationSeconds && durationSeconds > VEO_MAX_SECONDS
-      ? Math.ceil(durationSeconds / VEO_MAX_SECONDS)
-      : 1;
-  return clipPrice * clipCount;
+  return durationSeconds && durationSeconds > VEO_MAX_SECONDS
+    ? Math.ceil(durationSeconds / VEO_MAX_SECONDS)
+    : 1;
 }
 
 /** Models we've already warned about this process — dedupes the unknown-model warn. */

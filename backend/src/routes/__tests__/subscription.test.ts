@@ -54,6 +54,7 @@ jest.mock('../../services/llmUsageLedgerReader', () => ({
   readBilledLedgerRows: jest.fn(),
 }));
 
+
 // @jest/globals' bare `jest.Mock` defaults its return type to `unknown`, so
 // mockResolvedValueOnce's argument infers as `never`. Tying the mock to the
 // real function's type gives it a real Promise<T> return to infer against.

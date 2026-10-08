@@ -58,6 +58,10 @@ const SEQUENCE_WITH_FILTER = {
   name: 'LinkedIn Drip',
   status: 'active',
   enrollmentTrigger: { type: 'linkedin_connection_accepted' },
+  // A connection-accepted sequence sends LinkedIn DMs. The fixture had no steps at all,
+  // which makes requiredChannels fall back to email — so it could not show whether this
+  // path serves the LinkedIn-only leads it exists for.
+  steps: [{ stepId: 's1', stepNumber: 1, name: 'DM', channel: 'linkedin', delayDays: 0, messageText: 'hi' }],
   autoEnrollListIds: ['list-correct'],
 };
 
@@ -71,7 +75,7 @@ const WRONG_LIST   = { listId: 'list-wrong',   name: 'Some Other List' };
 
 const MATCHING_LEAD = {
   leadId: 'lead-1',
-  email: 'john@example.com',
+  email: 'john@acme.io',
   linkedin: 'https://www.linkedin.com/in/john-prospect',
 };
 
@@ -153,5 +157,117 @@ describe('enrollNewConnections - autoEnrollListIds filter', () => {
     await enrollNewConnections([NEW_CONNECTION]);
 
     expect(mockDripDb.enrollLead).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Review round 2, finding 3. enrollNewConnections is the FIFTH enrolment path, and it
+ * was the one left behind: `if (!lead.linkedin || !lead.email) continue;` — the exact
+ * email-only gate removed from the other four — on the path whose trigger is literally
+ * "a LinkedIn connection was accepted". It also keyed the row on `lead.email` raw
+ * rather than the shared identity, so the same person could be stored under two
+ * different identities by two different paths and neither dedup check saw the other.
+ */
+describe('enrollNewConnections serves LinkedIn-only leads', () => {
+  const LI_ONLY_LEAD = {
+    leadId: 'lead-li',
+    linkedin: 'https://www.linkedin.com/in/john-prospect',
+  };
+
+  beforeEach(() => {
+    mockDripDb.getAllSequencesByTriggerType.mockResolvedValue([SEQUENCE_WITH_FILTER] as any);
+    mockCrmDb.getLeadListsByUserId.mockResolvedValue([CORRECT_LIST] as any);
+  });
+
+  it('enrols a lead with a profile and NO email — the lead this cron exists for', async () => {
+    mockCrmDb.getLeadsByListId.mockResolvedValue(
+      { items: [LI_ONLY_LEAD], lastEvaluatedKey: null, hasMore: false } as any,
+    );
+
+    const enrolled = await enrollNewConnections([NEW_CONNECTION]);
+
+    expect(enrolled).toBe(1);
+    expect(mockDripDb.enrollLead).toHaveBeenCalledWith(
+      expect.objectContaining({ leadId: 'lead-li', leadEmail: 'https://www.linkedin.com/in/john-prospect/' }),
+    );
+  });
+
+  it('keys on the shared identity, not the raw address, so paths agree on one person', async () => {
+    // A junk address plus a good profile: the routes key this on the profile URL. Keying
+    // it on the junk address here made one person two enrollments.
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [{ ...LI_ONLY_LEAD, email: 'a@x..com' }], lastEvaluatedKey: null, hasMore: false,
+    } as any);
+
+    await enrollNewConnections([NEW_CONNECTION]);
+
+    expect(mockDripDb.enrollLead).toHaveBeenCalledWith(
+      expect.objectContaining({ leadEmail: 'https://www.linkedin.com/in/john-prospect/' }),
+    );
+  });
+
+  it('looks for an existing enrollment under BOTH identities before enrolling again', async () => {
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [{ ...LI_ONLY_LEAD, email: 'john@acme.io' }], lastEvaluatedKey: null, hasMore: false,
+    } as any);
+    // Already enrolled under the profile URL by another path; today's identity is the
+    // address, so a single-key check would miss it and re-deliver the sequence.
+    mockDripDb.getExistingEnrollment.mockImplementation(async (_seq: string, identity: string) => (
+      identity === 'https://www.linkedin.com/in/john-prospect/' ? ({ enrollmentId: 'old' } as any) : null
+    ));
+
+    const enrolled = await enrollNewConnections([NEW_CONNECTION]);
+
+    expect(enrolled).toBe(0);
+    expect(mockDripDb.enrollLead).not.toHaveBeenCalled();
+  });
+
+  it('still refuses a lead with neither a usable profile nor an address', async () => {
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [{ leadId: 'lead-x', linkedin: 'https://www.linkedin.com/company/acme' }],
+      lastEvaluatedKey: null, hasMore: false,
+    } as any);
+
+    const enrolled = await enrollNewConnections([NEW_CONNECTION]);
+
+    expect(enrolled).toBe(0);
+    expect(mockDripDb.enrollLead).not.toHaveBeenCalled();
+  });
+
+  /**
+   * ENG-2127: this call site used to pass only `leadEmail`, not `identityCandidates` —
+   * the one identity its own pre-check (two tests up) already looks across, left out of
+   * the write that now atomically claims every candidate. A write under just the
+   * primary identity left the claim transaction protecting only one of the (up to) three
+   * identities the pre-check guards against.
+   */
+  it('passes every identity candidate through to enrollLead, not just the primary one', async () => {
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [{ ...LI_ONLY_LEAD, email: 'john@acme.io' }], lastEvaluatedKey: null, hasMore: false,
+    } as any);
+
+    await enrollNewConnections([NEW_CONNECTION]);
+
+    expect(mockDripDb.enrollLead).toHaveBeenCalledWith(
+      expect.objectContaining({
+        identityCandidates: expect.arrayContaining([
+          'https://www.linkedin.com/in/john-prospect/',
+          'john@acme.io',
+        ]),
+      }),
+    );
+  });
+
+  /** enrollLead now returns null when a concurrent caller already claimed this lead —
+   * must not be counted as a successful enrollment. */
+  it('does not count a lost race (null from enrollLead) as enrolled', async () => {
+    mockCrmDb.getLeadsByListId.mockResolvedValue(
+      { items: [LI_ONLY_LEAD], lastEvaluatedKey: null, hasMore: false } as any,
+    );
+    mockDripDb.enrollLead.mockResolvedValueOnce(null);
+
+    const enrolled = await enrollNewConnections([NEW_CONNECTION]);
+
+    expect(enrolled).toBe(0);
   });
 });

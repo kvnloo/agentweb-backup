@@ -71,6 +71,8 @@ const EXACT_MATCH_COMMENT_SCAN_LIMIT = 10; // bounds worst-case Linear calls; bo
 async function findExactCanonicalMatch(
   refs: CanonicalRefs,
   candidates: OpenCanonical[],
+  /** ENG-1335: receives the matched candidate's comments so the caller need not re-read them. */
+  onMatchComments?: (comments: Array<{ body: string }>) => void,
 ): Promise<OpenCanonical | null> {
   if (refs.agwNumbers.size === 0 || candidates.length === 0) return null;
 
@@ -79,7 +81,10 @@ async function findExactCanonicalMatch(
     try {
       const comments = await getIssueCommentsDetailed(c.issueId);
       for (const n of refs.agwNumbers) {
-        if (comments.some((cm) => cm.body.includes(`[reporter-ticket #${n} `))) return c;
+        if (comments.some((cm) => cm.body.includes(`[reporter-ticket #${n} `))) {
+          onMatchComments?.(comments);
+          return c;
+        }
       }
     } catch (e) {
       // Also catches a malformed (non-array) resolved value, not just a rejection — keeps the
@@ -154,6 +159,27 @@ function bugPriorityForFunnel(funnelStatus?: string | null): number {
   return (coarse && BUG_PRIORITY_BY_COARSE_TAG[coarse]) || BUG_PRIORITY.MEDIUM;
 }
 
+/**
+ * ENG-1335 occurrence ladder (mirrors loop-pm.md: 2 reporters -> >= Medium, 3+ -> >= High).
+ * Counts the reports already recorded on a canonical from the per-report notes this service
+ * writes (`[reporter-ticket #N …]` for attributed reports, the "Surfaced via telemetry/…" note
+ * for unattributed ones). Derived from comments, so no new persisted field is needed.
+ */
+const REPORT_NOTE = /^(?:\[reporter-ticket #\d+ |Surfaced via telemetry\/satisfaction-report review)/m;
+export function countRecordedReports(comments: Array<{ body: string }>): number {
+  return comments.filter((c) => REPORT_NOTE.test(c?.body || '')).length;
+}
+export function occurrencePriority(occurrence: number): number {
+  if (occurrence >= 3) return BUG_PRIORITY.HIGH;
+  if (occurrence >= 2) return BUG_PRIORITY.MEDIUM;
+  return 4; // Low — never raises anything on its own
+}
+
+/** Visible count on the canonical row (ENG-1335 AC2) — only once it is actually a repeat. */
+function occurrenceLine(occurrence: number): string[] {
+  return occurrence >= 2 ? [`Occurrences: ${occurrence} reports on this canonical.`] : [];
+}
+
 export interface FileUserIssueParams {
   type: 'feature_request' | 'bug';
   title: string;
@@ -164,6 +190,17 @@ export interface FileUserIssueParams {
   reportedByAdmin?: string;
   /** Chat session id of the reporter, so eng can jump straight to the offending session. */
   sessionId?: string;
+  /**
+   * Who TRIGGERED this filing — the account whose action ran it, which is not
+   * necessarily who it is filed for. ENG-1961: the dedup judge is an LLM call
+   * that used to book to the `system` placeholder; it is now charged here.
+   *
+   * Deliberately distinct from `userEmail`. Under ENG-939 `userEmail` is the
+   * AFFECTED user of a cross-user telemetry review, who asked for nothing — so
+   * metering against them would charge a customer for an admin's triage. The
+   * actor is the one who spent the tokens.
+   */
+  actingUserId?: string;
   /**
    * Stable identity of THIS report by THIS reporter (`utils/reportIntake.reportFingerprint`).
    * ENG-529 AC5 / ENG-598 option A: stamped on the created Featurebase ticket and looked up before
@@ -253,6 +290,7 @@ async function fileFeatureRequest(p: FileUserIssueParams): Promise<FiledUserResu
   const dup = await findDuplicate(
     { type: 'feature_request', title: p.title, description: p.description },
     posts.map((x) => ({ ref: x.id, title: x.title, description: x.description })),
+    { userId: p.actingUserId, sessionId: p.sessionId },
   );
 
   if (dup) {
@@ -299,7 +337,7 @@ async function fileFeatureRequest(p: FileUserIssueParams): Promise<FiledUserResu
  */
 async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   const { findDuplicate, MAX_CANDIDATES } = await import('./dedupService');
-  const { listOpenBugCanonicals, listRecentlyResolvedBugCanonicals, createInternalLinearIssue, addIssueComment, raiseIssueTriage, reopenIssue } = await import('./linearService');
+  const { listOpenBugCanonicals, listRecentlyResolvedBugCanonicals, createInternalLinearIssue, addIssueComment, raiseIssueTriage, reopenIssue, getIssueCommentsDetailed } = await import('./linearService');
   const { createTicket, findTicketByMarker } = await import('./featurebaseService');
 
   // Linear-side triage enrichment (ENG-187): the reporter's funnel stage becomes stage labels
@@ -365,12 +403,14 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   // Deterministic short-circuit (fixes the ENG-329 false-duplicate incident): an explicit AGW-N
   // reference is checked for an EXACT match — via its private reporter-ticket comment — before the
   // fuzzy judge ever runs. No AGW-N reference present -> no-op -> behavior identical to today.
-  const exactOpenMatch = await findExactCanonicalMatch(refs, cans);
+  let exactMatchComments: Array<{ body: string }> | null = null;
+  const exactOpenMatch = await findExactCanonicalMatch(refs, cans, (cm) => { exactMatchComments = cm; });
   const dup = exactOpenMatch
     ? { ref: exactOpenMatch.identifier, title: exactOpenMatch.title, description: exactOpenMatch.description }
     : await findDuplicate(
         { type: 'bug', title: p.title, description: p.description },
         cans.map((c) => ({ ref: c.identifier, title: c.title, description: c.description })),
+        { userId: p.actingUserId, sessionId: p.sessionId },
       );
 
   // Reopen, not refile (ENG-240 contract #3): when no OPEN canonical matches but the report explicitly
@@ -388,6 +428,7 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
         const rdup = await findDuplicate(
           { type: 'bug', title: p.title, description: p.description },
           resolved.map((c) => ({ ref: c.identifier, title: c.title, description: c.description })),
+          { userId: p.actingUserId, sessionId: p.sessionId },
         );
         reopenTarget = rdup ? rByRef.get(rdup.ref) || null : null;
       }
@@ -398,6 +439,7 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   let canonicalUrl = '';
   let grouped = false;  // grouped onto an existing canonical (open dup OR reopened resolved one)
   let reopened = false; // reopened a Done/canceled canonical for a regression / failed retest
+  let occurrence = 0;   // ENG-1335: Nth report on an OPEN canonical (0 = not grouped onto one)
   if (dup) {
     const matched = byRef.get(dup.ref)!;
     canonicalUuid = matched.issueId;
@@ -405,11 +447,20 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
     // A deduped report returns the SAME canonical link (ENG-289). listOpenBugCanonicals gives us
     // the identifier (e.g. ENG-42) but not the url, so build it from the stable issue-URL base.
     canonicalUrl = `${LINEAR_ISSUE_BASE}/${matched.identifier}`;
+    // ENG-1335 occurrence ladder: count the reports already recorded on this canonical so that
+    // repetition escalates instead of being silently absorbed. Best-effort: a failed read falls
+    // back to "this is the second report" — never blocks the filing.
+    try {
+      occurrence = countRecordedReports(exactMatchComments ?? (await getIssueCommentsDetailed(canonicalUuid))) + 1;
+    } catch (e) {
+      occurrence = 2;
+      console.warn('[intake] bug canonical occurrence count failed:', e instanceof Error ? e.message : e);
+    }
     // Dedup triage upgrade (ENG-187): a higher-tier reporter hitting an existing canonical unions
     // its stage labels in and raises the priority — never lowers it (raise-only by contract of
     // raiseIssueTriage). Best-effort: a failed upgrade must not block the filing.
     try {
-      await raiseIssueTriage(canonicalUuid, { addLabelNames: stageTags, priority });
+      await raiseIssueTriage(canonicalUuid, { addLabelNames: stageTags, priority: Math.min(priority, occurrencePriority(occurrence)) });
     } catch (e) {
       console.warn('[intake] bug canonical triage upgrade failed:', e instanceof Error ? e.message : e);
     }
@@ -453,7 +504,9 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
       ].join('\n'),
       // Stage labels + no-rot defaults (ENG-187): every customer bug lands in Todo, assigned,
       // with a funnel-derived priority — never unowned in Backlog.
-      labelNames: ['Bug', 'Customer Reported', ...stageTags],
+      // ENG-1590: Delegated-Filed marks issues filed via a delegated admin session; absence is the
+      // queryable self-filed signal (matches the repo's Auto-label convention — no paired default).
+      labelNames: ['Bug', 'Customer Reported', ...(p.reportedByAdmin ? ['Delegated-Filed'] : []), ...stageTags],
       priority,
       stateName: BUG_CANONICAL_STATE,
       assigneeId: BUG_DEFAULT_ASSIGNEE_ID,
@@ -476,6 +529,7 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
       ...(reopened ? ['⚠️ Reopened by a new report (regression / failed retest) — this bug is back.', ''] : []),
       `[reporter-ticket #${ticket.number} ${p.userEmail}] Affected user: ${reporterLabel(p)}${p.reportedByAdmin ? ` — via ${p.reportedByAdmin}` : ''} on ${new Date().toISOString().slice(0, 10)}.`,
       ...(p.sessionId ? [`Session: ${p.sessionId}`] : []),
+      ...occurrenceLine(occurrence),
       // The reopened canonical's body is the OLD report, so fold in this reporter's text too — as we
       // do for any reporter grouped onto an existing canonical. Only the brand-new canonical already
       // carries the text in its description.
@@ -488,6 +542,7 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
       ...(reopened ? ['⚠️ Reopened by a new report (regression / failed retest) — this bug is back.', ''] : []),
       `Surfaced via telemetry/satisfaction-report review${p.reportedByAdmin ? ` by ${p.reportedByAdmin}` : ''} — affected user could not be resolved automatically; no reporter-ticket attached (nobody notified on resolve).`,
       ...(p.sessionId ? [`Session: ${p.sessionId}`] : []),
+      ...occurrenceLine(occurrence),
       ...(grouped ? ['', 'Report:', p.description] : []),
       ...contextLines(p.notionContext),
     ].join('\n');
@@ -695,11 +750,34 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
     // (escalateIssue is raise-only and a distinct, intentional ENG-358 behavior); routing is not.
     return { pageId: match.identifier, url: `${LINEAR_ISSUE_BASE}/${match.identifier}`, deduped: true, tracker: 'Linear' };
   }
+
+  // No LIVE canonical matched (none, or the only match(es) were archived — listOpenIssuesByLabel
+  // never returns an archived row, see linearService). ENG-730: archival is otherwise a SILENT
+  // dedupe-breaking event — the occurrence history for this alert class goes cold with no trace.
+  // Best-effort look up the most recently archived issue of the same class/idempotency-key/title
+  // so the fresh canonical records what it replaces (AC3). Never blocks filing: any failure here
+  // just means the new canonical carries no predecessor line, exactly like before this change.
+  let archivedPredecessorLine = '';
+  try {
+    const { findMostRecentArchivedIssueByLabel } = await import('./linearService');
+    const archived = await findMostRecentArchivedIssueByLabel('Auto', (i) => {
+      if (classNeedle && classNeedle.test(i.description || '')) return true;
+      if (idKeys.length && idKeys.some((k) => (i.description || '').includes(k))) return true;
+      return norm(i.title) === norm(p.title);
+    });
+    if (archived) {
+      archivedPredecessorLine = `Predecessor (archived): ${archived.identifier} — that canonical was archived, so this occurrence could not be attached to it and a new canonical was filed instead.`;
+    }
+  } catch (e) {
+    console.warn('[intake] archived-predecessor lookup failed:', e instanceof Error ? e.message : e);
+  }
+
   const body = [
     p.description,
     '',
     '---',
     `Source: ${p.source} — auto-identified by the system.`,
+    ...(archivedPredecessorLine ? [archivedPredecessorLine] : []),
     ...contextLines(p.notionContext),
   ].join('\n');
   const li = await createInternalLinearIssue({

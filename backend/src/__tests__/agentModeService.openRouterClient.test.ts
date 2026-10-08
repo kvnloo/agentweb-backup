@@ -1,3 +1,4 @@
+import { OPENROUTER_PROVIDER_PREFERENCES } from '../services/agentMode/openRouterRequestParams';
 jest.mock('../services/db', () => ({
   getSession: jest.fn(),
   saveMessage: jest.fn(),
@@ -36,10 +37,16 @@ jest.mock('@aws-sdk/client-bedrock-runtime', () => ({
 }));
 
 jest.mock('openai', () => jest.fn().mockImplementation((config: any) => ({ _config: config })));
+jest.mock('../services/funding/recordLlmUsage', () => ({
+  ...jest.requireActual('../services/funding/recordLlmUsage'),
+  recordLlmUsage: jest.fn(),
+}));
 
 import { AgentModeService } from '../services/agentModeService';
+import { recordLlmUsage } from '../services/funding/recordLlmUsage';
 import { getSecret } from '../utils/secretsManager';
 import { resolveOpenRouterUpstreamModelId } from '../utils/openRouterGatewayContract';
+import type OpenAI from 'openai';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const MockOpenAI = require('openai') as jest.Mock;
 const mockGetSecret = getSecret as jest.Mock;
@@ -276,7 +283,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect((service as any).llmModels['gpt-5.4'].supportsTemperature).toBe(false);
     expect(request).toEqual(expect.objectContaining({
       model: 'openai/gpt-5.4',
-      provider: { allow_fallbacks: true, require_parameters: true },
+      provider: { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true },
       usage: { include: true },
     }));
     expect(request).not.toHaveProperty('temperature');
@@ -423,7 +430,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
       model: 'openai/gpt-5.5',
       tools: [{ type: 'openrouter:web_search' }],
-      provider: { allow_fallbacks: true, require_parameters: true },
+      provider: { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true },
     }));
     expect(create.mock.calls[0][0]).not.toHaveProperty('tool_choice');
     expect(create).toHaveBeenCalledTimes(1);
@@ -535,10 +542,108 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
       model: 'perplexity/sonar-deep-research',
       models: ['perplexity/sonar-pro-search'],
-      provider: { allow_fallbacks: true, require_parameters: true },
+      provider: { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true },
       usage: { include: true },
     }));
     expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  describe('ENG-1345: metering attributes a served fallback, not the primary', () => {
+    const meterCalls = () => (recordLlmUsage as jest.Mock).mock.calls.map((c: any[]) => c[1]);
+    beforeEach(() => (recordLlmUsage as jest.Mock).mockClear());
+
+    const callWith = async (servedModel: string | undefined) => {
+      const service = new AgentModeService();
+      const create = jest.fn().mockResolvedValue({
+        id: 'gen-1',
+        ...(servedModel !== undefined ? { model: servedModel } : {}),
+        choices: [],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      });
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
+      await service.callLLM(
+        'openrouter/perplexity/sonar-deep-research',
+        [{ role: 'user', content: 'Research' }],
+        { fallbackModels: ['openrouter/perplexity/sonar-pro-search'] } as any,
+      );
+    };
+
+    it('records the fallback model when OpenRouter served the fallback', async () => {
+      await callWith('perplexity/sonar-pro-search');
+      expect(meterCalls()).toHaveLength(1);
+      expect(meterCalls()[0]).toEqual(expect.objectContaining({
+        model: 'openrouter/perplexity/sonar-pro-search',
+        provider: 'openrouter',
+      }));
+    });
+
+    it('records the fallback model when OpenRouter returns a dated variant of it', async () => {
+      await callWith('perplexity/sonar-pro-search-20260901');
+      expect(meterCalls()[0].model).toBe('openrouter/perplexity/sonar-pro-search');
+    });
+
+    it('keeps primary-path metering unchanged when the primary served the call', async () => {
+      await callWith('perplexity/sonar-deep-research');
+      expect(meterCalls()[0].model).toBe('openrouter/perplexity/sonar-deep-research');
+    });
+
+    it('keeps the primary when the response does not name a served model', async () => {
+      await callWith(undefined);
+      expect(meterCalls()[0].model).toBe('openrouter/perplexity/sonar-deep-research');
+    });
+
+    it('never attributes to a model outside the requested chain', async () => {
+      await callWith('openai/gpt-5.4');
+      expect(meterCalls()[0].model).toBe('openrouter/perplexity/sonar-deep-research');
+    });
+  });
+
+  it('ENG-1831: refuses tools for a tool-less model before sending, instead of a routing 404', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn();
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+    const tools = [{ type: 'function', function: { name: 'noop', parameters: { type: 'object', properties: {} } } }];
+
+    await expect(service.callLLM(
+      'openrouter/perplexity/sonar-deep-research',
+      [{ role: 'user', content: 'Research' }],
+      { tools } as any,
+    )).rejects.toThrow(/sonar-deep-research' cannot receive tools/);
+    await expect(service.callLLM(
+      'openrouter/perplexity/sonar-pro-search',
+      [{ role: 'user', content: 'Research' }],
+      { webSearch: true } as any,
+    )).rejects.toThrow(/sonar-pro-search' cannot receive tools/);
+    // A tool-capable primary with a tool-less fallback: the fallback gets the same tools.
+    await expect(service.callLLM(
+      'anthropic.claude-opus-5',
+      [{ role: 'user', content: 'Research' }],
+      { tools, fallbackModels: ['openrouter/perplexity/sonar-pro-search'] } as any,
+    )).rejects.toThrow(/sonar-pro-search' cannot receive tools/);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('ENG-1831: keeps temperature for the tool-less Sonar deep-research chain', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+
+    await service.callLLM(
+      'openrouter/perplexity/sonar-deep-research',
+      [{ role: 'user', content: 'Research' }],
+      { temperature: 0.2, fallbackModels: ['openrouter/perplexity/sonar-pro-search'] } as any,
+    );
+
+    const request = create.mock.calls[0][0];
+    expect(request.temperature).toBe(0.2);
+    expect(request).not.toHaveProperty('tools');
+    expect(request).not.toHaveProperty('tool_choice');
   });
 
   it('rejects an unregistered fallback before sending a gateway request', async () => {
@@ -605,7 +710,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
 
     const request = create.mock.calls[0][0];
     expect(request.provider).toEqual({
-      allow_fallbacks: true,
+      ...OPENROUTER_PROVIDER_PREFERENCES,
       require_parameters: true,
       ignore: ['Google'],
     });
@@ -988,6 +1093,88 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(sleep).toHaveBeenCalledWith(1500);
   });
 
+  // ENG-1681: hit the same customer session 8 times over 9 days across 4
+  // distinct error signatures, with no fix ever landing despite being routed
+  // to `autofix` on day one. Two of the four signatures ("invalid json
+  // response body ... Unexpected end of JSON input" and the downstream
+  // "Cannot read properties of undefined (reading '0')" this produces when
+  // callLLM's caller does `response.choices[0].message` unguarded) are
+  // one-off provider glitches where a fresh request usually just works —
+  // callLLM had no retry for either case before this fix.
+  describe('retries a malformed/empty OpenRouter response (ENG-1681)', () => {
+    it('retries when the response has no choices array, then succeeds', async () => {
+      const service = new AgentModeService();
+      const goodResponse = { choices: [{ message: { role: 'assistant', content: 'hi' } }], usage: {} };
+      const create = jest.fn()
+        .mockResolvedValueOnce({ usage: {} }) // no `choices` key at all
+        .mockResolvedValueOnce(goodResponse);
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
+      jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+      const result = await service.callLLM('gpt-5.5', [{ role: 'user', content: 'Hello' }]);
+
+      expect(create).toHaveBeenCalledTimes(2);
+      expect(result).toEqual(goodResponse);
+    });
+
+    it('exhausts retries and throws a clear, greppable error when choices never appears', async () => {
+      const service = new AgentModeService();
+      const create = jest.fn().mockResolvedValue({ usage: {} });
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
+      jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+      await expect(service.callLLM('gpt-5.5', [{ role: 'user', content: 'Hello' }]))
+        .rejects.toThrow(/MALFORMED_OPENROUTER_RESPONSE/);
+
+      // Non-scheduled caller: same 2-attempt cap as the existing 429 retry.
+      expect(create).toHaveBeenCalledTimes(2);
+    });
+
+    it('retries when the SDK throws on a truncated/invalid JSON body, then succeeds', async () => {
+      const service = new AgentModeService();
+      const goodResponse = { choices: [{ message: { role: 'assistant', content: 'hi' } }], usage: {} };
+      const parseError = new Error(
+        'invalid json response body at https://openrouter.ai/api/v1/chat/completions reason: Unexpected end of JSON input',
+      );
+      const create = jest.fn()
+        .mockRejectedValueOnce(parseError)
+        .mockResolvedValueOnce(goodResponse);
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
+      jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+      const result = await service.callLLM('gpt-5.5', [{ role: 'user', content: 'Hello' }]);
+
+      expect(create).toHaveBeenCalledTimes(2);
+      expect(result).toEqual(goodResponse);
+    });
+
+    // Pins the invariant the fix above depends on: an empty-but-present
+    // `choices: []` is a different, already-handled case elsewhere in this
+    // function (and is exactly the shape dozens of other tests in this file
+    // mock as their default response) — it must NOT be treated as malformed,
+    // or every one of those tests would start retrying and this fix would
+    // have silently widened its own blast radius.
+    it('does NOT retry a genuinely empty (but present) choices array', async () => {
+      const service = new AgentModeService();
+      const emptyChoicesResponse = { choices: [], usage: {} };
+      const create = jest.fn().mockResolvedValue(emptyChoicesResponse);
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
+
+      const result = await service.callLLM('gpt-5.5', [{ role: 'user', content: 'Hello' }]);
+
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(result).toEqual(emptyChoicesResponse);
+    });
+  });
+
   // 2026-08-19: was adminOnly: true on every new-roster entry (gated as
   // unproven-in-our-stack). Harsha: "i'm fine to include open source /
   // open router stuff for all users not just isadmin" — removed from all
@@ -1006,5 +1193,220 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(MockOpenAI.mock.calls.find((call: any[]) =>
       call[0]?.baseURL?.includes('openrouter.ai')
     )?.[0]?.baseURL).toBe('https://openrouter.ai/api/v1');
+  });
+});
+
+
+describe('ENG-1788: opt-in reasoning effort', () => {
+  const contract = require('../utils/openRouterGatewayContract');
+  const { endChatSpan } = require('../observability/tracing');
+  const model = 'openrouter/openai/gpt-6-astra';
+  const messages = [{ role: 'user', content: 'Hello' }];
+  let service: AgentModeService;
+  let row: any;
+  let create: jest.Mock;
+
+  beforeEach(() => {
+    service = new AgentModeService();
+    row = (service as any).llmModels[model];
+    create = jest.fn().mockResolvedValue({
+      id: 'completion-effort', model: 'openai/gpt-6-astra',
+      choices: [], usage: { prompt_tokens: 10, completion_tokens: 2 },
+    });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+  });
+
+  afterEach(() => {
+    if (contract.GATEWAY_REASONING_EFFORT_OVERRIDES) {
+      for (const key of Object.keys(contract.GATEWAY_REASONING_EFFORT_OVERRIDES)) {
+        delete contract.GATEWAY_REASONING_EFFORT_OVERRIDES[key];
+      }
+    }
+    jest.restoreAllMocks();
+  });
+
+  it('characterizes the unset request byte-for-byte and preserves the response', async () => {
+    const result = await service.callLLM(model, messages);
+    expect(JSON.stringify(create.mock.calls[0][0])).toBe(
+      '{"model":"openai/gpt-6-astra","messages":[{"role":"user","content":"Hello"}],"provider":{"order":["amazon-bedrock","azure","google-vertex","anthropic","openai"],"allow_fallbacks":true,"require_parameters":true},"usage":{"include":true},"plugins":[{"id":"context-compression"}]}',
+    );
+    expect(result).toEqual({
+      id: 'completion-effort', model: 'openai/gpt-6-astra',
+      choices: [], usage: { prompt_tokens: 10, completion_tokens: 2 },
+    });
+    expect(Object.values((service as any).llmModels).every((config: any) => config.reasoningEffort === undefined)).toBe(true);
+  });
+
+  it('starts with an empty task-class override map', () => {
+    expect(contract.GATEWAY_REASONING_EFFORT_OVERRIDES).toEqual({});
+  });
+
+  it('sends the registry effort for a model with verified supported_efforts', async () => {
+    row.reasoningEffort = 'high';
+    await service.callLLM(model, messages);
+    expect(create.mock.calls[0][0].reasoning).toEqual({ effort: 'high' });
+  });
+
+  it('task-class override wins and does not leak into another class', async () => {
+    row.reasoningEffort = 'medium';
+    contract.GATEWAY_REASONING_EFFORT_OVERRIDES.scheduled_background = 'high';
+    await service.callLLM(model, messages, { taskClass: 'scheduled_background' });
+    await service.callLLM(model, messages, { taskClass: 'interactive_chat' });
+    expect(create.mock.calls.map(([params]) => params.reasoning)).toEqual([
+      { effort: 'high' }, { effort: 'medium' },
+    ]);
+  });
+
+  it('allows a task override without a registry default', async () => {
+    contract.GATEWAY_REASONING_EFFORT_OVERRIDES.mcp_api = 'low';
+    await service.callLLM(model, messages, { taskClass: 'mcp_api' });
+    expect(create.mock.calls[0][0].reasoning).toEqual({ effort: 'low' });
+  });
+
+  it.each([undefined, [], 'high', [null, 'high'], [42], ['low']])(
+    'omits reasoning for absent, malformed, or incompatible supported_efforts: %j', async (supported) => {
+      row.reasoningEffort = 'high';
+      row.supportedReasoningEfforts = supported;
+      await service.callLLM(model, messages);
+      expect(create.mock.calls[0][0]).not.toHaveProperty('reasoning');
+    },
+  );
+
+  it('does not let an override bypass the capability guard', async () => {
+    delete row.supportedReasoningEfforts;
+    contract.GATEWAY_REASONING_EFFORT_OVERRIDES.interactive_chat = 'high';
+    await service.callLLM(model, messages, { taskClass: 'interactive_chat' });
+    expect(create.mock.calls[0][0]).not.toHaveProperty('reasoning');
+  });
+
+  it('omits reasoning if a fallback model cannot accept the effort', async () => {
+    row.reasoningEffort = 'high';
+    await service.callLLM(model, messages, { fallbackModels: ['openrouter/z-ai/glm-5.2'] });
+    expect(create.mock.calls[0][0]).not.toHaveProperty('reasoning');
+  });
+
+  it('records effective effort in usage, the success log, and the run chat span', async () => {
+    row.reasoningEffort = 'high';
+    const log = jest.spyOn(console, 'log').mockImplementation(() => {});
+    const result = await service.callLLM(model, messages);
+    expect(result.usage).toEqual({ prompt_tokens: 10, completion_tokens: 2, reasoning_effort: 'high' });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('OpenRouter call succeeded'),
+      expect.objectContaining({ reasoningEffort: 'high' }));
+    const span = { setAttribute: jest.fn(), setStatus: jest.fn(), end: jest.fn() };
+    endChatSpan(span, { model, response: result });
+    expect(span.setAttribute).toHaveBeenCalledWith('agentweb.reasoning_effort', 'high');
+  });
+
+  it('does not label an unsupported or unset effort as served', async () => {
+    row.reasoningEffort = 'high';
+    delete row.supportedReasoningEfforts;
+    const result = await service.callLLM(model, messages);
+    expect(result.usage).not.toHaveProperty('reasoning_effort');
+    const span = { setAttribute: jest.fn(), setStatus: jest.fn(), end: jest.fn() };
+    endChatSpan(span, { model, response: result });
+    expect(span.setAttribute).not.toHaveBeenCalledWith('agentweb.reasoning_effort', expect.anything());
+  });
+});
+
+// ENG-2185: prod session f6c882d0… (2026-09-25) — a spend-limited OpenRouter key
+// rejected gemini-3.8-flash calls with this exact message 6x in 33 minutes,
+// hard-failing to the generic "I apologize... try again" fallback every time.
+describe('callLLM insufficient-credits retry (ENG-2185)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    process.env.OPENROUTER_API_KEY = 'test-openrouter-key';
+  });
+
+  afterEach(() => {
+    delete process.env.OPENROUTER_API_KEY;
+  });
+
+  const creditError = (requested: number, affordable: number) => new Error(
+    `This request requires more credits, or fewer max_tokens. You requested up to ${requested} tokens, `
+    + `but can only afford ${affordable}. To increase, visit https://openrouter.ai/workspaces/default/keys/abc `
+    + `and adjust the key's monthly limit`,
+  );
+
+  it('retries with max_tokens capped to the affordable amount instead of hard-failing', async () => {
+    const service = new AgentModeService();
+    // The loop reuses and mutates the SAME `params` object across attempts, so
+    // a plain jest.fn() mock's `.mock.calls` would end up storing the final,
+    // already-mutated reference for every call — snapshot max_tokens at the
+    // moment each call actually happens instead.
+    const seenMaxTokens: unknown[] = [];
+    const create = jest.fn().mockImplementation(async (params: { max_tokens?: number }) => {
+      seenMaxTokens.push(params.max_tokens);
+      if (seenMaxTokens.length === 1) throw creditError(32000, 24420);
+      return { choices: [{ message: { content: 'ok' } }], usage: {} };
+    });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as unknown as OpenAI);
+
+    const result = await service.callLLM(
+      'gpt-5.4',
+      [{ role: 'user', content: 'Hello' }],
+      { max_completion_tokens: 32000 },
+    );
+
+    expect(create).toHaveBeenCalledTimes(2);
+    // 24420 minus the safety margin, since the affordable estimate is a
+    // snapshot that can shift slightly before the retry lands.
+    expect(seenMaxTokens).toEqual([32000, 24320]);
+    expect((result.choices as Array<{ message: { content: string } }>)[0].message.content).toBe('ok');
+  });
+
+  it('does not treat a same-or-larger affordable amount as a reason to retry', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockRejectedValue(creditError(100, 999999));
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as unknown as OpenAI);
+
+    await expect(
+      service.callLLM('gpt-5.4', [{ role: 'user', content: 'Hello' }], { max_completion_tokens: 100 }),
+    ).rejects.toThrow(/requires more credits/i);
+
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  // CodeRabbit (PR #3117): a key with truly zero balance left would still get
+  // rejected at max_tokens=1 (the retry's own floor) — retrying is a wasted
+  // attempt against the identical rejection, not a useful fallback.
+  it('does not retry when the provider reports zero affordable tokens', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockRejectedValue(creditError(100, 0));
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as unknown as OpenAI);
+
+    await expect(
+      service.callLLM('gpt-5.4', [{ role: 'user', content: 'Hello' }], { max_completion_tokens: 100 }),
+    ).rejects.toThrow(/requires more credits/i);
+
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it('is bounded by the same maxAttempts as every other retry path, not unbounded', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn()
+      .mockRejectedValueOnce(creditError(32000, 20000))
+      .mockRejectedValueOnce(creditError(20000, 10000));
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as unknown as OpenAI);
+
+    await expect(
+      service.callLLM(
+        'gpt-5.4',
+        [{ role: 'user', content: 'Hello' }],
+        { max_completion_tokens: 32000, taskClass: 'interactive_chat' },
+      ),
+    ).rejects.toThrow(/can only afford 10000/);
+
+    // interactive_chat => maxAttempts=2, so exactly 2 attempts total.
+    expect(create).toHaveBeenCalledTimes(2);
   });
 });

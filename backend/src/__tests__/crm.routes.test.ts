@@ -32,8 +32,13 @@ jest.mock('../config/aws', () => ({
   },
 }));
 
+jest.mock('../services/enigmaCardRevenueEnrichment', () => ({
+  isEnigmaEnrichmentEnabledForUser: jest.fn().mockReturnValue(false),
+}));
+
 import { Request, Response } from 'express';
 import { crmDb, userDb, orgDb } from '../services/db';
+import { isEnigmaEnrichmentEnabledForUser } from '../services/enigmaCardRevenueEnrichment';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { agentModeService } from '../services/agentModeService';
@@ -699,7 +704,7 @@ describe('CRM Routes', () => {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
-      expect(crmDb.createLead).toHaveBeenCalledWith('list1', mockRequest.body);
+      expect(crmDb.createLead).toHaveBeenCalledWith('list1', mockRequest.body, 'manual');
       expect(mockResponse.status).toHaveBeenCalledWith(201);
       expect(mockResponse.json).toHaveBeenCalledWith(mockLead);
     });
@@ -776,7 +781,7 @@ describe('CRM Routes', () => {
           lastTouch: expect.objectContaining({
             utm: expect.objectContaining({ source: 'meta' }),
           }),
-        })
+        }), 'manual'
       );
       // Envelope stripped so createLead doesn't see an unknown `attribution` key
       const call = (crmDb.createLead as jest.Mock).mock.calls[0][1];
@@ -806,6 +811,42 @@ describe('CRM Routes', () => {
       const call = (crmDb.createLead as jest.Mock).mock.calls[0][1];
       expect(call.firstTouch).toBeUndefined();
       expect(call.lastTouch).toBeUndefined();
+    });
+
+    // ENG-2322: createLead's duplicate-email pre-check throws a typed error. For the owner's own
+    // create that is a conflict (409 + the existing leadId), not a 500 server failure.
+    const postCreate = async () => {
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads' && r.route?.methods?.post
+      );
+      await handler!.route!.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+    };
+
+    it('returns 409 with the existing leadId and the unchanged message on a duplicate email', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', name: 'L', userId: 'test-user-id' });
+      const message = 'Lead with email "dup@example.com" already exists in this list';
+      (crmDb.createLead as jest.Mock).mockRejectedValue(
+        Object.assign(new Error(message), { duplicateEmail: true, existingLead: { leadId: 'lead_existing', email: 'dup@example.com' } }),
+      );
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { email: 'dup@example.com' };
+
+      await postCreate();
+
+      expect(mockResponse.status).toHaveBeenCalledWith(409);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message, duplicate: true, leadId: 'lead_existing' });
+    });
+
+    it('still returns 500 for a non-duplicate createLead failure', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', name: 'L', userId: 'test-user-id' });
+      (crmDb.createLead as jest.Mock).mockRejectedValue(new Error('dynamo down'));
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { email: 'x@example.com' };
+
+      await postCreate();
+
+      expect(mockResponse.status).toHaveBeenCalledWith(500);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'dynamo down' });
     });
   });
 
@@ -2267,7 +2308,7 @@ describe('CRM Routes', () => {
       }
 
       expect(crmDb.createLeadList).not.toHaveBeenCalled();
-      expect(crmDb.batchCreateLeads).toHaveBeenCalledWith('existing-list', expect.any(Array));
+      expect(crmDb.batchCreateLeads).toHaveBeenCalledWith('existing-list', expect.any(Array), { origin: 'integration' });
     });
 
     it('should return 400 if no subscribers to sync', async () => {
@@ -2588,10 +2629,91 @@ describe('CRM Routes', () => {
         expect.objectContaining({ message: 'Failed to upload CSV to storage' })
       );
     });
+
+    // ENG-1388: card revenue is Enigma-licensed internal-use-only data. A CSV
+    // export leaves the system as a downloadable file, so it must never carry
+    // a card-revenue column/value for a requester who isn't Enigma-allowlisted
+    // — found live: the export route's only gate was list-editor access, with
+    // no allowlist awareness at all.
+    describe('card revenue exclusion (ENG-1388)', () => {
+      afterEach(() => {
+        (isEnigmaEnrichmentEnabledForUser as jest.Mock).mockReturnValue(false);
+      });
+
+      it('excludes card-revenue columns and values for a non-allowlisted requester', async () => {
+        (isEnigmaEnrichmentEnabledForUser as jest.Mock).mockReturnValue(false);
+        const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id', fieldNames: [] };
+        const mockLeads = [
+          {
+            leadId: 'lead1',
+            email: 'john@example.com',
+            customFields: { card_revenue_12m: '41999657', card_revenue_period_end: '2026-06-30', industry: 'Software' },
+          },
+        ];
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({ items: mockLeads, lastEvaluatedKey: null, hasMore: false });
+        (crmDb.updateLeadList as jest.Mock).mockResolvedValue({});
+        mockUploadFileToS3.mockResolvedValue({ success: true, url: 'https://s3.amazonaws.com/bucket/export.csv', key: 'export.csv' });
+
+        mockRequest.params = { listId: 'list1' };
+        mockRequest.body = {};
+        const handler = router.stack.find((r: any) =>
+          r.route?.path === '/lists/:listId/leads/export' && r.route?.methods?.post
+        );
+        if (handler && handler.route) {
+          await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+        }
+
+        const csvBuffer: Buffer = mockUploadFileToS3.mock.calls[0][0];
+        const csvContent = csvBuffer.toString('utf-8');
+        expect(csvContent).not.toContain('card_revenue_12m');
+        expect(csvContent).not.toContain('card_revenue_period_end');
+        expect(csvContent).not.toContain('41999657');
+        expect(csvContent).toContain('industry');
+        expect(csvContent).toContain('Software');
+      });
+
+      it('includes card-revenue columns and values for an allowlisted requester', async () => {
+        (isEnigmaEnrichmentEnabledForUser as jest.Mock).mockReturnValue(true);
+        const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id', fieldNames: [] };
+        const mockLeads = [
+          {
+            leadId: 'lead1',
+            email: 'john@example.com',
+            customFields: { card_revenue_12m: '41999657', industry: 'Software' },
+          },
+        ];
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({ items: mockLeads, lastEvaluatedKey: null, hasMore: false });
+        (crmDb.updateLeadList as jest.Mock).mockResolvedValue({});
+        mockUploadFileToS3.mockResolvedValue({ success: true, url: 'https://s3.amazonaws.com/bucket/export.csv', key: 'export.csv' });
+
+        mockRequest.params = { listId: 'list1' };
+        mockRequest.body = {};
+        const handler = router.stack.find((r: any) =>
+          r.route?.path === '/lists/:listId/leads/export' && r.route?.methods?.post
+        );
+        if (handler && handler.route) {
+          await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+        }
+
+        const csvBuffer: Buffer = mockUploadFileToS3.mock.calls[0][0];
+        const csvContent = csvBuffer.toString('utf-8');
+        expect(csvContent).toContain('card_revenue_12m');
+        expect(csvContent).toContain('41999657');
+      });
+    });
   });
 
   describe('GET /api/crm/lists/:listId/export-history', () => {
-    it('should return export history for a list', async () => {
+    it('should return export history for a list, for an Enigma-allowlisted requester', async () => {
+      // ENG-1388 (CodeRabbit on #3108): a stored export's fileUrl carries
+      // whatever the list had at export time, potentially including card
+      // revenue, and history has no per-entry record of that — so a
+      // non-allowlisted requester now gets fileUrl redacted (see the
+      // dedicated describe block below). This test pins the unrestricted
+      // case: an allowlisted requester still sees the real link.
+      (isEnigmaEnrichmentEnabledForUser as jest.Mock).mockReturnValue(true);
       const mockHistory = [
         {
           exportId: 'exp_1',
@@ -2621,6 +2743,40 @@ describe('CRM Routes', () => {
       }
 
       expect(mockResponse.json).toHaveBeenCalledWith({ history: mockHistory });
+      (isEnigmaEnrichmentEnabledForUser as jest.Mock).mockReturnValue(false);
+    });
+
+    // ENG-1388: a past export's fileUrl is a public S3 link, and history
+    // carries no record of whether that specific export included card
+    // revenue — the export route only started excluding it going forward.
+    // A non-allowlisted viewer must not be able to fetch an old export's
+    // link through this endpoint just because they can read the list.
+    it('redacts fileUrl on every history entry for a non-allowlisted requester', async () => {
+      (isEnigmaEnrichmentEnabledForUser as jest.Mock).mockReturnValue(false);
+      const mockHistory = [
+        { exportId: 'exp_1', recordCount: 10, exportedAt: '2026-02-18T00:00:00.000Z', fileUrl: 'https://s3.amazonaws.com/bucket/export.csv', filename: 'export.csv' },
+        { exportId: 'exp_2', recordCount: 5, exportedAt: '2026-02-10T00:00:00.000Z', fileUrl: 'https://s3.amazonaws.com/bucket/old.csv', filename: 'old.csv' },
+      ];
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id', csvExportHistory: mockHistory };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.params = { listId: 'list1' };
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/export-history' && r.route?.methods?.get
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      const responseArg = (mockResponse.json as jest.Mock).mock.calls[0][0];
+      expect(responseArg.history).toHaveLength(2);
+      for (const entry of responseArg.history) {
+        expect(entry.fileUrl).toBeNull();
+        expect(entry.restricted).toBe(true);
+      }
+      // Non-sensitive fields survive so the UI can still list past exports.
+      expect(responseArg.history[0].exportId).toBe('exp_1');
+      expect(responseArg.history[0].recordCount).toBe(10);
     });
 
     it('should return empty array when no export history exists', async () => {
@@ -2803,7 +2959,41 @@ describe('CRM Routes', () => {
       }
 
       expect(mockResponse.status).toHaveBeenCalledWith(400);
-      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'listType must be "sales" or "customers"' });
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'listType must be "sales", "customers" or "session"' });
+    });
+
+    // ENG-2311: 'session' is a valid set-once type; the contract is the vocabulary + set-once.
+    it('should accept "session" when listType is not yet set', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.updateLeadList as jest.Mock).mockResolvedValue({ ...mockList, listType: 'session' });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { listType: 'session' };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.updateLeadList).toHaveBeenCalledWith('list1', { listType: 'session' });
+    });
+
+    it.each(['session', 'sales', 'customers'])('set-once: refuses to change a list already typed "%s"', async (existing) => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id', listType: existing };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { listType: existing === 'session' ? 'sales' : 'session' };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'listType is already set and cannot be changed' });
+      expect(crmDb.updateLeadList).not.toHaveBeenCalled();
     });
   });
 

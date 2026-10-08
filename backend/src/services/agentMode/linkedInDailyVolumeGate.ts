@@ -40,6 +40,7 @@ import { getAccountsWithOwnerIncludingOrgShared, updateAccountConfig } from '../
 import {
   PACED_WRITE_ACTIONS,
   dailyInviteAbsoluteMax,
+  dailyVolumeClassFor,
   reserveDailyVolumeSlot,
   reserveWriteSlot,
   type DailyVolumeState,
@@ -50,6 +51,33 @@ export interface ResolvedLinkedInAccount {
   ownerUserId: string;
   configuredDailyInviteCap: number | null | undefined;
   dailyVolumeState: DailyVolumeState | null | undefined;
+  /**
+   * ENG-1721: when this LinkedIn account was first connected, driving the
+   * warm-up ramp. Read from the stored `created_at`, which survives re-OAuth, so
+   * an established account that reconnects does not restart its ramp.
+   */
+  connectedAt: string | null | undefined;
+}
+
+/**
+ * Same resolution as `resolveLinkedInAccountForWrite`, against an already-fetched
+ * accounts list — for a caller (ENG-1614's account-routing layer) that needs to
+ * resolve the requested account AND scan every other candidate in the same
+ * request, so it should fetch `getAccountsWithOwnerIncludingOrgShared` once and
+ * reuse it rather than repeating the same org-member scan per lookup.
+ */
+export function resolveLinkedInAccountFromList(
+  accounts: any[],
+  accountId: string,
+): ResolvedLinkedInAccount | null {
+  const matched = accounts.find((a: any) => a.platform === 'unipile' && a.account_id === accountId);
+  if (!matched) return null;
+  return {
+    ownerUserId: (matched as any).userId,
+    configuredDailyInviteCap: (matched as any)?.config?.daily_invite_cap,
+    dailyVolumeState: (matched as any)?.config?.daily_volume,
+    connectedAt: (matched as any)?.created_at,
+  };
 }
 
 /**
@@ -63,14 +91,23 @@ export async function resolveLinkedInAccountForWrite(
   accountId: string,
 ): Promise<ResolvedLinkedInAccount | null> {
   const accounts = await getAccountsWithOwnerIncludingOrgShared(callerUserId);
-  const matched = accounts.find((a: any) => a.platform === 'unipile' && a.account_id === accountId);
-  if (!matched) return null;
-  return {
-    ownerUserId: (matched as any).userId,
-    configuredDailyInviteCap: (matched as any)?.config?.daily_invite_cap,
-    dailyVolumeState: (matched as any)?.config?.daily_volume,
-  };
+  return resolveLinkedInAccountFromList(accounts, accountId);
 }
+
+/**
+ * Which check refused a paced LinkedIn write. `paceLinkedInWrite` has three
+ * independent refusal sources and their messages are prose, so callers that need
+ * to REPORT the cause must key on this rather than on wording (ENG-1873: the
+ * stale-invitation drain collapsed all three into "write-pacing limit", which sent
+ * its only investigation to the wrong subsystem).
+ */
+export type PaceRefusalGate =
+  /** The account's daily connection-request cap (incl. the durable re-check). */
+  | 'daily_volume'
+  /** The hourly ceiling / queue in `reserveWriteSlot`. */
+  | 'write_pacer'
+  /** Both checks passed but the daily reservation could not be written. */
+  | 'reservation_persistence';
 
 export type PaceLinkedInWriteResult =
   | { refusal: null }
@@ -79,6 +116,7 @@ export type PaceLinkedInWriteResult =
         success: false;
         message: string;
         error: string;
+        gate: PaceRefusalGate;
       };
     };
 
@@ -100,13 +138,19 @@ export async function paceLinkedInWrite(
 ): Promise<PaceLinkedInWriteResult> {
   if (!PACED_WRITE_ACTIONS.has(action)) return { refusal: null };
 
-  const dailySlot = reserveDailyVolumeSlot(action, account.configuredDailyInviteCap, account.dailyVolumeState);
+  const dailySlot = reserveDailyVolumeSlot(
+    action,
+    account.configuredDailyInviteCap,
+    account.dailyVolumeState,
+    { connectedAt: account.connectedAt },
+  );
   if (!dailySlot.allowed) {
     console.log(`[linkedInDailyVolumeGate] ${action} on ${accountId} refused by daily volume cap — ${dailySlot.reason}`);
     return {
       refusal: {
         success: false,
         message: 'LinkedIn daily volume limit reached',
+        gate: 'daily_volume',
         error: [
           dailySlot.reason,
           '',
@@ -125,6 +169,7 @@ export async function paceLinkedInWrite(
       refusal: {
         success: false,
         message: 'LinkedIn write actions are being paced',
+        gate: 'write_pacer',
         error: [
           hourlySlot.reason,
           '',
@@ -138,6 +183,12 @@ export async function paceLinkedInWrite(
     };
   }
 
+  // ENG-1594: maintenance writes (cancel/accept-invitation) carry no daily
+  // volume class, so there is no reservation to commit. Skipping the durable
+  // write keeps them governed by the hourly/burst pacer only and means a
+  // connected_accounts persistence failure can never refuse them.
+  if (dailyVolumeClassFor(action) === null) return { refusal: null };
+
   // Both checks passed — NOW durably commit the daily reservation against the
   // account OWNER's record. The callback runs again from fresh config on every
   // CAS retry, so concurrent writers cannot lose a reservation. Failing closed
@@ -149,6 +200,13 @@ export async function paceLinkedInWrite(
         action,
         freshConfig.daily_invite_cap,
         freshConfig.daily_volume,
+        // ENG-1721: the ramp must apply on the DURABLE re-check too. `created_at`
+        // lives on the account row, not in its config, and cannot change during a
+        // single call — so it comes from the already-resolved account rather than
+        // from `freshConfig`. Omitting it here would have re-checked against the
+        // unramped cap and committed a reservation the first check had just
+        // refused.
+        { connectedAt: account.connectedAt },
       );
       if (!freshDailySlot.allowed) {
         durableRefusalReason = freshDailySlot.reason;
@@ -162,6 +220,7 @@ export async function paceLinkedInWrite(
       refusal: {
         success: false,
         message: 'LinkedIn daily volume reservation could not be secured',
+        gate: 'reservation_persistence',
         error: 'The LinkedIn write was not attempted because its daily safety reservation could not be persisted. Please try again later.',
       },
     };
@@ -172,6 +231,7 @@ export async function paceLinkedInWrite(
       refusal: {
         success: false,
         message: 'LinkedIn daily volume limit reached',
+        gate: 'daily_volume',
         error: [
           durableRefusalReason,
           '',
@@ -186,6 +246,14 @@ export async function paceLinkedInWrite(
   return { refusal: null };
 }
 
+/** Thrown when a non-owner (e.g. an org-shared member) tries to change the cap. */
+export class DailyInviteCapNotOwnerError extends Error {
+  constructor(accountId: string) {
+    super(`Only the owner of LinkedIn account ${accountId} can change its daily invite cap. Ask the account owner to change it in Settings.`);
+    this.name = 'DailyInviteCapNotOwnerError';
+  }
+}
+
 /**
  * Persist a self-reported daily invite cap for an account (the `linkedin_outreach`
  * action `set-daily-invite-cap`). Writes through the account OWNER's record —
@@ -195,7 +263,13 @@ export async function setDailyInviteCap(
   account: ResolvedLinkedInAccount,
   accountId: string,
   cap: unknown,
+  callerUserId: string,
 ): Promise<number> {
+  // ENG-1594: org-shared USE of an account does not grant authority over its
+  // safety config. Only the account owner may change its daily invite cap.
+  if (!callerUserId || callerUserId !== account.ownerUserId) {
+    throw new DailyInviteCapNotOwnerError(accountId);
+  }
   const parsedCap = typeof cap === 'number' ? cap : Number(cap);
   if (!Number.isFinite(parsedCap) || !Number.isInteger(parsedCap) || parsedCap < 0) {
     throw new Error('daily_invite_cap must be a non-negative integer for set-daily-invite-cap');

@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getAttioConfig } from '../config/integrations';
 import { createAccount } from '../services/connectedAccountsDb';
+import { redactAccountSecrets } from '../utils/accountSecretRedaction';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
 import { NON_EXPIRING_TOKEN_TIMESTAMP } from '../utils/tokenUtils';
@@ -200,7 +201,7 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
       },
     });
 
-    res.json({ success: true, account });
+    res.json({ success: true, account: redactAccountSecrets(account) });
   } catch (error: any) {
     console.error('[Attio OAuth /connect]', error);
     const details = IS_PRODUCTION ? undefined : error.message;

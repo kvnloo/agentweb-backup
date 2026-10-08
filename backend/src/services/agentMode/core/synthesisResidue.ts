@@ -18,6 +18,7 @@
 
 import { SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE } from './termination';
 import { buildTurnTimeBudgetNudge } from '../../../utils/turnTimeBudget';
+import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
 
 /**
  * Residue is short by nature — it is the tail of a structure the model failed to
@@ -271,6 +272,35 @@ function isDeferred(call: ExecutedToolCall): boolean {
 function isReportedFailure(call: ExecutedToolCall): boolean {
   return resultFlags(call)?.success === false;
 }
+
+/**
+ * True for an `install_skills` call that installed SOME of what was asked for and had the
+ * rest refused.
+ *
+ * That result carries `success: true` (something was installed), so every failure test above
+ * reads it as a clean install — and a partial install is exactly the shape where the ONE skill
+ * the gated tool needed is the one that was refused. Treating it as a clean success disarmed
+ * the notice on the case it is most likely to be needed for.
+ *
+ * `rejectedSkillIds` is set by `agentModeService.installSkills` precisely so this is a fact in
+ * the result rather than something inferred from prose in `message`.
+ */
+function isPartialInstall(call: ExecutedToolCall): boolean {
+  const rejected = (call.result as { rejectedSkillIds?: unknown } | null | undefined)?.rejectedSkillIds;
+  return Array.isArray(rejected) && rejected.length > 0;
+}
+
+/**
+ * The tool names a rejected skill would have unlocked, per `installSkills` (agentModeService.ts)
+ * resolving `rejectedSkillIds` before this reader ever sees them. Empty for any call that did
+ * not carry the field — an unscoped throw, a legacy result shape, or a full subscription refusal
+ * that never got as far as knowing which ids to look up.
+ */
+function getRejectedToolNames(call: ExecutedToolCall): string[] {
+  const names = (call.result as { rejectedToolNames?: unknown } | null | undefined)?.rejectedToolNames;
+  return Array.isArray(names) ? names.filter((n): n is string => typeof n === 'string') : [];
+}
+
 
 /**
  * ENG-1188 root-cause fix recommendation #2: a ledger of tool NAMES and counts
@@ -674,6 +704,34 @@ export function detectFalseCompletionClaim(
 }
 
 /**
+ * ENG-2076: whether `detectFalseCompletionClaim`'s domain (image/video/HTML-template
+ * generation) is actually in play THIS turn — i.e. whether `toolCalls` contains at
+ * least one call to `ASSET_PRODUCING_TOOL_NAMES`. Callers should skip the guard
+ * entirely when this is false.
+ *
+ * Deliberately turn-scoped only — an earlier revision of this fix also treated a
+ * session's persisted `calledFunctions` (an asset tool used in a PRIOR turn) as
+ * enough to let the guard run, on the theory that it would widen coverage. It does
+ * the opposite: `detectFalseCompletionClaim`'s `actual` is unconditionally computed
+ * from `toolCalls` (this turn only — see `countProducedAssets` above), never from
+ * history. So gating on session history while still computing `actual` from an empty
+ * this-turn ledger reproduces the exact ENG-2076 bug one level up: a session that
+ * generated real images earlier and later TRUTHFULLY recaps that true count on a
+ * turn with no new tool calls (a normal "what's next" follow-up) would get told
+ * "0 of N were actually produced" again — just gated to media-generating sessions
+ * instead of firing on every session. Turn-scoped-only avoids that: a recap turn
+ * with zero matching tool calls skips the check entirely, exactly as it does for the
+ * live ENG-2076 repro (a Meta Ads session recapping "3 creatives created" on a turn
+ * that made no tool calls at all — a clarifying question, not new work), while a
+ * turn that DOES call an asset-producing tool (the original ENG-1188/ENG-1331
+ * same-turn shortfall: N screenshots claimed, fewer actually taken) still runs the
+ * check exactly as before.
+ */
+export function assetProducingToolsInPlay(toolCalls: ExecutedToolCall[]): boolean {
+  return toolCalls.some((call) => typeof call.name === 'string' && ASSET_PRODUCING_TOOL_NAMES.has(call.name));
+}
+
+/**
  * Correction to APPEND when `detectFalseCompletionClaim` finds a claim the ledger
  * cannot back up. Keeps the model's original prose (it may still hold other real,
  * useful detail) but states the real count and the named shortfall right underneath
@@ -684,6 +742,263 @@ export function detectFalseCompletionClaim(
  * very count the correction is stating (e.g. "only 4 of 12" next to a list that
  * includes 40 unrelated successes from earlier steps).
  */
+/**
+ * A line stating, as fact, that a capability could not run this turn — or null when every tool
+ * that was refused later succeeded.
+ *
+ * PREPENDED by the caller, and deliberately UNCONDITIONAL rather than gated on detecting a false
+ * claim in the prose. Both of those are the lessons from the live case this exists for: a
+ * delegated session where the skill gate refused `audit_ad_utm_coverage`, `install_skills` was
+ * refused by subscription, and the model then ran an unrelated AD LIST and presented a confident
+ * "UTM Tagging Audit Summary — PASS, 6/6 ads tagged" table built from it. A correction WAS
+ * produced by `buildFalseClaimCorrectionFooter` — but appended below the fabricated table, and
+ * only because that particular claim happened to carry a checkable number.
+ *
+ * So this does not try to decide whether the answer claims the tool ran. Whether a tool was
+ * refused by the gate and never afterwards succeeded is a FACT already in the ledger, needing no
+ * inference, so it cannot false-positive: it only ever states something that definitively
+ * happened. And a claim phrased in a way no detector anticipates is exactly the case a
+ * conditional guard misses, which is why this one is not conditional.
+ *
+ * Redundant when the model was already honest about it. That is the cheap direction to be wrong.
+ */
+export function buildUnavailableCapabilityNotice(toolCalls: ExecutedToolCall[]): string | null {
+  const calls = toolCalls ?? [];
+
+  /*
+   * Fires only when the model ATTEMPTED to obtain the capability and could not.
+   *
+   * Three failure modes this narrowing exists for, all found in review:
+   *
+   *  - The gate refuses ANY name not in the session's allowed set, including one the model tried
+   *    speculatively and then simply did without. Warning there puts a banner above a perfectly
+   *    correct answer, and a warning that appears when nothing is wrong is one people learn to
+   *    skip — exactly when it finally matters. If no install was attempted, the model was not
+   *    blocked from something it needed.
+   *  - An install that FAILED is not always shaped as a throw: `installSkills` NEVER throws —
+   *    every one of its paths returns `{ success: false, message }`. In today's wiring the
+   *    dispatcher's `toolResultError` downgrade does convert that into a ledger `error`, so the
+   *    throw check happens to catch it; `isReportedFailure` reads the returned shape directly
+   *    so this does not silently depend on that downgrade staying wired.
+   *  - A PARTIAL install reports `success: true` because SOMETHING installed, while the skill
+   *    the gated tool needed may be the one that was refused (`isPartialInstall`). Nothing
+   *    upstream flags this one: no error is raised, because from installSkills' point of view
+   *    the call succeeded.
+   *
+   * Note what is deliberately NOT required: that the install came AFTER the refusal, or even
+   * that no install this turn succeeded. Both used to be enforced via a ledger-index comparison
+   * (`installSucceededAfter > i`), which is meaningless: `executePreparedTools` (toolDispatch.ts)
+   * always appends Phase 1 preflight failures — which is what a skill-gate refusal is — before
+   * any Phase 3 executed result, including every `install_skills` outcome, regardless of the
+   * order the model emitted the calls in. So an index comparison could never see a gate refusal
+   * as coming AFTER a successful install; on the real incident shape (a refusal plus ANY
+   * install_skills call, failed or not) it would only ever suppress the notice, never correctly
+   * arm it — including when the turn also contains an install failure that is the actual cause.
+   *
+   * A per-tool "did the skill THIS tool needed actually arrive" check is possible on a PARTIAL
+   * install: `installSkills` resolves its `rejectedSkillIds` to the tool names they would have
+   * unlocked (`rejectedToolNames`, agentModeService.ts) precisely so this reader does not have
+   * to guess. When that field is present, only a gated tool whose name is actually in it counts
+   * as still unavailable — a failure over here does not arm the notice for an unrelated tool B
+   * whose own skill installed fine.
+   *
+   * A full refusal (subscription-blocked, no valid ids at all) carries no such mapping — nothing
+   * in the ledger says which tool names the model was after. For that shape only, this falls
+   * back to turn-global: any install failure with no name info arms the notice for every gated
+   * tool in the turn. A redundant banner on a turn that in fact recovered is the cheap direction
+   * to be wrong; silently hiding a real gap is not.
+   */
+  let installAttempted = false;
+  let installFailed = false;
+  let unscopedInstallFailure = false;
+  const rejectedToolNames = new Set<string>();
+  calls.forEach((call) => {
+    if (call?.name !== 'install_skills') return;
+    installAttempted = true;
+    const threw = call?.error !== undefined && call?.error !== null;
+    if (threw || isReportedFailure(call) || isPartialInstall(call)) {
+      installFailed = true;
+      const names = getRejectedToolNames(call);
+      if (names.length > 0) {
+        names.forEach((n) => rejectedToolNames.add(n));
+      } else {
+        unscopedInstallFailure = true;
+      }
+    }
+  });
+
+  const succeeded = new Set<string>();
+  for (const call of calls) {
+    const name = typeof call?.name === 'string' ? call.name : '';
+    if (!name) continue;
+    const threw = call?.error !== undefined && call?.error !== null;
+    if (!threw && !isReportedFailure(call)) succeeded.add(name);
+  }
+
+  const unavailable = new Set<string>();
+  calls.forEach((call) => {
+    const name = typeof call?.name === 'string' ? call.name : '';
+    if (!name || call?.error === undefined || call?.error === null) return;
+    const err = call.error instanceof Error ? call.error : new Error(String(call.error));
+    if (classifyToolErrorClass(err) !== 'tool_unavailable') return;
+    /*
+     * The INSTALLER is never itself the missing capability (ENG-1795). This notice exists to
+     * say "the tool you were expecting output from did not run"; `install_skills` did run, and
+     * refused — naming it here tells the user a tool was unavailable when what actually
+     * happened is that it worked and reported a reason.
+     *
+     * Load-bearing, though no longer for install_skills' OWN refusals — those now classify
+     * `skill_install_refused` and never reach this filter. Four other install_skills failures
+     * still classify `tool_unavailable`, because the classifier matches the bare tool name
+     * inside the message: a gateway policy block, the repeated-failure breaker, an excludeTools
+     * removal, and a timeout. Any of them would otherwise name install_skills in a banner as a
+     * capability that "did not run".
+     */
+    if (name === 'install_skills') return;
+    // Ran successfully at some point in the turn — the capability is present.
+    if (succeeded.has(name)) return;
+    // Never tried to obtain it: doing without a speculative tool is not a missing capability.
+    if (!installAttempted) return;
+    // Every install this turn came back clean, so nothing stopped the model from getting what
+    // it asked for. Only an install that could NOT deliver means a capability was missing.
+    if (!installFailed) return;
+    // A failure this turn was scoped to specific tool names (a partial install) and THIS tool
+    // is not among them — some other skill was refused, not the one this tool needed. Only an
+    // unscoped failure (no name info at all) falls back to arming every gated tool.
+    if (rejectedToolNames.size > 0 && !rejectedToolNames.has(name) && !unscopedInstallFailure) return;
+    unavailable.add(name);
+  });
+
+  if (unavailable.size === 0) return null;
+  const names = [...unavailable].sort();
+  const one = names.length === 1;
+  return (
+    `⚠️ ${one ? 'This capability was' : 'These capabilities were'} not available this turn and did not run: ` +
+    `${names.map((n) => `\`${n}\``).join(', ')}. ` +
+    `Anything below that would normally come from ${one ? 'it' : 'them'} was not produced by ${one ? 'that tool' : 'those tools'}.`
+  );
+}
+
+/** Shape of the fields `coding_agent`'s own result carries through to the ledger — see
+ *  `codingAgentService.ts`'s `AcceptanceStatus`/`AcceptanceVerificationResult` for the source of
+ *  truth; duplicated narrowly here rather than imported so this module stays free of a dependency
+ *  on a specific tool's service file, matching how the rest of this file reads `call.result`. */
+interface CodingAgentResultShape {
+  acceptanceStatus?: string;
+  acceptance?: {
+    checks?: Array<{ label?: string; status?: string; message?: string }>;
+  };
+}
+
+function codingAgentResult(call: ExecutedToolCall): CodingAgentResultShape | null {
+  if (call?.name !== 'coding_agent') return null;
+  const result = call.result as CodingAgentResultShape | null | undefined;
+  return result && typeof result === 'object' ? result : null;
+}
+
+/**
+ * Stable, unique substring identifying this notice — used both to build the banner and, below, to
+ * detect one already present in `content` before prepending another. Kept as one constant so the
+ * two can never drift apart.
+ */
+const ACCEPTANCE_FAILURE_MARKER = 'VERIFICATION FAILED — coding_agent';
+
+/**
+ * ENG-1899. `coding_agent`'s own deterministic acceptance checks are real — they run against the
+ * actual preview URL, not the model's opinion of it — and `codingAgentService.ts` already forces
+ * `success: false` when they fail. But the human-readable `message` it returns is built as
+ * `${result.message}\n\n${acceptance.summary}...` — a concatenation that puts the MODEL's own
+ * original claim first and the real verification failure after. A live incident (ENG-1899): the
+ * model reported "visual verification passed with screenshot" while its own `selector_exists`
+ * check had failed and the button copy it described matched neither the brief nor the deployed
+ * page. The failure was always present in `acceptanceStatus`/`acceptance` on the ledger entry —
+ * nothing downstream read it before this.
+ *
+ * Same fix shape as `buildUnavailableCapabilityNotice` above, for the same reason:
+ * UNCONDITIONAL — this states a fact already in the ledger (a specific check failed), never tries
+ * to detect that the model's prose claims success, so a claim phrased in a way no detector
+ * anticipated (exactly what happened live) cannot slip through. And it is PREPENDED — the true
+ * state must be seen before the model's own possibly-false claim, not after it, or the same
+ * anchoring effect that produced the original incident this module exists for repeats here.
+ *
+ * `currentContent` (optional) is the text this notice is about to be prepended to. Found live on
+ * env1 (not a hypothetical): a session that hits two consecutive coding_agent failures — the
+ * ORIGINAL ENG-1899 incident's own shape — can have the model's second completion echo its own
+ * prior (already-decorated) turn from conversation history, so the banner appears twice: once
+ * copied by the model, once freshly prepended here. This function still ran exactly once per call
+ * (confirmed live via container logs); the model supplied the duplicate.
+ *
+ * Independent-review finding: an earlier revision suppressed on any occurrence of the bare marker
+ * PHRASE anywhere in `currentContent` — which also fires when the model's prose merely recaps an
+ * OLDER, different failure (e.g. "last time you saw: ⚠️ VERIFICATION FAILED..."), silently
+ * swallowing a genuinely new, currently-real failure this same turn. That is the expensive
+ * direction to be wrong — a live problem going unreported — not the cheap one. Fixed by computing
+ * the full notice text FIRST and only suppressing when `currentContent` already contains that
+ * EXACT string: a real echo of this turn's own notice reproduces it verbatim (same failed checks,
+ * same messages), while a different or new failure produces different text that won't match.
+ *
+ * Returns null when no `coding_agent` call this turn has a real failure — a `'passed'` result, a
+ * `'not_run'` result (no acceptance checks configured), or no `coding_agent` call at all — or when
+ * `currentContent` already contains this exact notice verbatim. Redundant when the model was
+ * already honest about it (or already showing this exact notice); that is the cheap direction to
+ * be wrong.
+ */
+export function buildAcceptanceFailureNotice(
+  toolCalls: ExecutedToolCall[],
+  currentContent?: string,
+): string | null {
+  const calls = toolCalls ?? [];
+  const failures: Array<{ summaryLine: string }> = [];
+
+  // Independent review finding (ENG-1899): a failure isn't still true once a LATER
+  // coding_agent call in the same turn passed. The tool's own contract ("call
+  // coding_agent ONCE per user request unless it explicitly fails") means a second
+  // call in the same turn is a retry of the same request, and `acceptance.checks`
+  // re-verifies the full configured set fresh each call, not incrementally — so a
+  // later 'passed' result is a complete, current statement that nothing is broken
+  // anymore. Reporting the earlier, now-superseded failure would itself be exactly
+  // the "stale claim contradicts current true state" defect this notice exists to
+  // prevent. No per-call target id (e.g. page_id) is threaded onto the ledger, so
+  // this can't distinguish "retried the same page" from "edited a different page
+  // that happens to pass" — accepted, since the tool's contract treats same-turn
+  // calls as sequential attempts at one request, not independent parallel targets.
+  calls.forEach((call, index) => {
+    const result = codingAgentResult(call);
+    if (!result) return;
+    if (result.acceptanceStatus !== 'failed' && result.acceptanceStatus !== 'blocked') return;
+
+    const supersededByLaterPass = calls.slice(index + 1).some((laterCall) => {
+      const laterResult = codingAgentResult(laterCall);
+      return laterResult?.acceptanceStatus === 'passed';
+    });
+    if (supersededByLaterPass) return;
+
+    const failedChecks = (result.acceptance?.checks ?? []).filter((c) => c.status !== 'passed');
+    const checkLines = failedChecks.length > 0
+      ? failedChecks.map((c) => `  - ${c.label ?? 'check'}: ${c.message ?? 'failed'}`).join('\n')
+      : '  - (no per-check detail was returned)';
+    failures.push({ summaryLine: checkLines });
+  });
+
+  if (failures.length === 0) return null;
+
+  const plural = failures.length > 1;
+  const notice = (
+    `⚠️ ${ACCEPTANCE_FAILURE_MARKER}'s own acceptance check${plural ? 's did' : ' did'} not ` +
+    `pass this turn, so the change below may not actually be live or correct even if it is ` +
+    `described as done:\n` +
+    failures.map((f) => f.summaryLine).join('\n') +
+    `\n\nTreat the summary that follows as the model's own unverified account of what it did, not ` +
+    `as confirmed fact — it may describe a state that does not match what is actually deployed.`
+  );
+
+  if (typeof currentContent === 'string' && currentContent.includes(notice)) {
+    return null;
+  }
+
+  return notice;
+}
+
 export function buildFalseClaimCorrectionFooter(
   claim: FalseCompletionClaim,
   toolCalls: ExecutedToolCall[],

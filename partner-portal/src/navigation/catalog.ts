@@ -150,6 +150,15 @@ export const portalRouteCatalog: readonly PortalRouteCatalogEntry[] = [
     surface: 'primary',
     header: { audience: 'admin', order: 100 },
   }),
+  route('eval-labelling', 'Eval Labelling', '/eval-labelling', 'Label golden-set cases for grader validation', 'admin', 'Label a case', 'Unprovisioned store and empty surfaces are handled by the page', {
+    surface: 'primary',
+    header: { audience: 'admin', order: 102 },
+  }),
+  route('creative-calibration', 'Creative Calibration', '/eval-labelling/calibration', 'Compare pairs of generated ads for the weekly judge calibration', 'admin', 'Pick the better ad', 'Unprovisioned store and an empty batch are handled by the page'),
+  route('sandbox-accounts', 'Sandbox Accounts', '/sandbox-accounts', 'Provision and manage simulated-Meta accounts for candidates or demos', 'admin', 'Create a sandbox account', 'Empty account list offers Create', {
+    surface: 'primary',
+    header: { audience: 'admin', order: 105 },
+  }),
   route('prompt-templates', 'Prompt Templates', '/prompt-templates', 'Manage prompt templates', 'admin', 'Create or edit a prompt', 'Empty prompt collection is handled by the page', {
     surface: 'primary',
     header: { audience: 'admin', order: 110 },
@@ -269,6 +278,33 @@ export function getHeaderNavigation(
       && audienceIsVisible(entry.header.audience, context)
     ))
     .sort((left, right) => (left.header?.order ?? 0) - (right.header?.order ?? 0));
+}
+
+export interface GroupedHeaderNavigation {
+  direct: readonly PortalRouteCatalogEntry[];
+  build: readonly PortalRouteCatalogEntry[];
+  operate: readonly PortalRouteCatalogEntry[];
+}
+
+const DIRECT_HEADER_IDS = ['home', 'tasks', 'workflows', 'admin', 'release'] as const;
+const BUILD_HEADER_IDS = ['templates', 'html-templates', 'prompt-templates', 'skills', 'work-plans', 'schedule-templates'] as const;
+const OPERATE_HEADER_IDS = ['gtm-ops', 'client-health', 'agent-runs', 'eval-labelling', 'sandbox-accounts', 'contractor-accesses', 'config'] as const;
+
+/** Groups visible destinations without changing their routes or access rules. */
+export function getGroupedHeaderNavigation(
+  context: HeaderNavigationContext,
+): GroupedHeaderNavigation {
+  const visible = new Map(getHeaderNavigation(context).map((entry) => [entry.id, entry]));
+  const pick = (ids: readonly string[]) => ids.flatMap((id) => {
+    const entry = visible.get(id);
+    return entry ? [entry] : [];
+  });
+
+  return {
+    direct: pick(DIRECT_HEADER_IDS),
+    build: pick(BUILD_HEADER_IDS),
+    operate: pick(OPERATE_HEADER_IDS),
+  };
 }
 
 export function getPortalRoute(id: string): PortalRouteCatalogEntry {

@@ -18,6 +18,7 @@
 
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { ToolOutputContractError } from '../utils/toolOutputContract';
+import { MISSING_BRAND_LOGO_ERROR } from '../services/agentMode/brandLogo';
 
 function err(message: string, name?: string): Error {
   const e = new Error(message);
@@ -56,6 +57,32 @@ describe('classifyToolErrorClass', () => {
     expect(classifyToolErrorClass(err('gpt-image-2 API failed: quota exceeded for this billing period'))).toBe('quota_exceeded');
     // Genuine per-minute throttling stays rate_limit even though both are 429s.
     expect(classifyToolErrorClass(err('Too Many Requests'))).toBe('rate_limit');
+  });
+
+  // A real OpenAI-SDK APIError (thrown by every OpenRouter call, including a
+  // BYOK upstream that's run out of quota) carries a numeric `.status`, unlike
+  // the plain-message `err()` errors above. classFromStatus(429) must not win
+  // by default over the quota_exceeded message check, or ENG-1661's
+  // OpenRouter retry loop (keyed on 'rate_limit') would blindly retry a
+  // permanent billing stop that can never succeed.
+  it('prefers quota_exceeded over rate_limit for a status-429 error with quota-exhaustion text', () => {
+    const quotaErrorWithStatus = Object.assign(
+      new Error('429 You exceeded your current quota, please check your plan and billing details.'),
+      { status: 429 }
+    );
+    expect(classifyToolErrorClass(quotaErrorWithStatus)).toBe('quota_exceeded');
+
+    // The real ENG-1661 incident shape ("Provider returned error") must stay
+    // rate_limit/retryable even with a numeric .status present.
+    const genuineRateLimitWithStatus = Object.assign(
+      new Error('429 Provider returned error'),
+      { status: 429 }
+    );
+    expect(classifyToolErrorClass(genuineRateLimitWithStatus)).toBe('rate_limit');
+
+    // Sibling statuses are unaffected by the 429-specific message check.
+    const paymentRequiredWithStatus = Object.assign(new Error('402 insufficient credits'), { status: 402 });
+    expect(classifyToolErrorClass(paymentRequiredWithStatus)).toBe('payment_required');
   });
 
   it('classifies argument validation — the LinkedIn outreach cluster', () => {
@@ -176,6 +203,162 @@ describe('classifyToolErrorClass', () => {
     expect(classifyToolErrorClass(err('Tool "describe_image" is not available. You must install the required skill first using install_skills.'))).toBe('tool_unavailable');
   });
 
+  /*
+   * An install_skills refusal is NOT an uninstalled-skill call: the skill exists, the plan does
+   * not include it. Left unclassified it fell to the legacy `Error` class, whose default next
+   * step ends "...use a different tool" — appended by the dispatcher directly beneath a refusal
+   * whose own text forbids substituting another tool's output. That contradiction is how the
+   * absence of a gated tool becomes a fabricated result (ENG-1625).
+   */
+  /*
+   * ENG-1795. Our own refusal is matched at the TOP of classFromMessage so a model-authored
+   * skill id cannot hijack the class. That hoist must stay ANCHORED to our full sentence:
+   * "not available with your current subscription" on its own is ordinary vendor English, and
+   * promoting it above the embedded-status guard reclassified a vendor 403 from `auth` to
+   * `subscription_blocked` — telling the model to say the capability is off the user's plan
+   * when the real remedy is reconnecting the account.
+   */
+  it('keeps a vendor 403 as auth, even when it mentions a subscription', () => {
+    expect(classifyToolErrorClass(err(
+      'Request failed with status code 403: this feature is not available with your current subscription.'
+    ))).toBe('auth');
+  });
+
+  it('classifies OUR refusal as subscription_blocked despite a status-shaped skill id', () => {
+    // The id is admin-authored and real; it just happens to start with digits that the
+    // embedded-status regex would read as an upstream 500 — which is RETRYABLE.
+    expect(classifyToolErrorClass(err(
+      'The requested skills are not available with your current subscription: 500-error-playbook.'
+      + ' Tell the user plainly that this capability is not on their plan.'
+    ))).toBe('subscription_blocked');
+  });
+
+  it('classifies a plan-gated install_skills refusal as subscription_blocked', () => {
+    expect(classifyToolErrorClass(err(
+      "The requested skills are not available with your current subscription."
+      + " Tell the user plainly that this capability is not on their plan."
+      + " Do NOT substitute a different tool's output for the tool that needed this skill, and do not describe that tool as having run.",
+    ))).toBe('subscription_blocked');
+  });
+
+  /*
+   * The verdict appended after a refusal must not assert what the refusal spends three
+   * sentences denying.
+   *
+   * Every one of these messages exists to stop the model concluding absence. Unclassified they
+   * fell to `not_found` — whose next step is literally "the target was not found" — or, after
+   * main widened the invalid_args regex with `is too large`, to "fix the arguments" for a
+   * filename that was never wrong. The verdict is appended AFTER the message, so it is the last
+   * thing the model reads: ENG-1584 rebuilt in the guidance channel.
+   */
+  it('classifies an incomplete read as read_incomplete, never as not_found', () => {
+    expect(classifyToolErrorClass(err(
+      'File "ad.png" was not found, but Google Drive rate-limited the scan of folder "X". Wait a minute and try again. Do NOT report the file as absent.',
+    ))).toBe('read_incomplete');
+    expect(classifyToolErrorClass(err(
+      'File "a.png" not found in folder "X" - but the folder scan did not cover the whole tree, so this is not a confirmed absence. Retry.',
+    ))).toBe('read_incomplete');
+    expect(classifyToolErrorClass(err(
+      'the file search itself failed (rate limited). This is a FAILED read, not a confirmed absence. Retry the read.',
+    ))).toBe('read_incomplete');
+    expect(classifyToolErrorClass(err(
+      'Google Drive is rate-limiting this account right now - a temporary quota answer. Wait a minute and retry.',
+    ))).toBe('read_incomplete');
+  });
+
+  /*
+   * A file or folder NAME must not change the verdict.
+   *
+   * The embedded-status regex matches any whitespace-preceded 3-digit 4xx/5xx-shaped number, and
+   * these messages interpolate ${fileName}/${rootName}. It ran before the incomplete-read branch,
+   * so "Landing 404 Copy.docx" classified not_found and appended "the target was not found"
+   * directly beneath "Do NOT report the file as absent" — ENG-1584 restored by a customer's
+   * choice of filename. "Creative 500x500.png" is an everyday ad dimension in this product.
+   */
+  it.each([
+    'Client Assets',
+    'Landing 404 Copy.docx',
+    'Studio 403 Shared',
+    'Creative 500x500.png',
+    'Fortune 500 Clients',
+  ])('a name containing a status-shaped number does not hijack the class (%s)', (name) => {
+    const msg =
+      `File "${name}" was not found, but Google Drive rate-limited the scan of folder "${name}". `
+      + 'Wait a minute and try again. Do NOT report the file as absent.';
+    expect(classifyToolErrorClass(err(msg))).toBe('read_incomplete');
+  });
+
+  it('separates a DETERMINISTIC bound, which must not be retried, from a transient one', () => {
+    // The capped-search message says "Do NOT retry this same call ... will stop in the same
+    // place every time". A Retryable: yes beneath that is the same contradiction one level down.
+    expect(classifyToolErrorClass(err(
+      'This is an INCOMPLETE read, not a confirmed absence: do not report the file as missing. '
+      + 'Do NOT retry this same call - a tree this large will stop in the same place every time.',
+    ))).toBe('read_bounded');
+  });
+
+  /*
+   * scope_refused must key on the MISMATCH branch only.
+   *
+   * assertOwnedByAccount deliberately varies its remedy across three branches, and the classifier
+   * collapsing them into one class would attach "select the account that owns it" to the two
+   * branches where that is false — including the branch account_id ?? '' deliberately routes an
+   * unresolved credential into, which would have told a user their OWN object belongs to someone
+   * else's ad account.
+   */
+  it('classifies the ownership MISMATCH branch as scope_refused, and the other two branches as upstream_5xx', () => {
+    const M = 'is not available in the selected ad account';
+    const mismatch = `The requested ad ${M}. If it belongs to a different ad account, select that account and try again.`;
+    const noOwner = `The requested ad ${M}. Meta did not report which ad account owns it, so ownership could not be CONFIRMED — this is a failed check, not a proven mismatch. Retry; if it persists, verify the object in Meta Ads Manager.`;
+    const noAccount = `The requested ad ${M}. No ad account could be determined for this request, so ownership could not be checked. This is a connection problem, not a permissions one — reconnect Meta in Settings.`;
+
+    expect(classifyToolErrorClass(err(mismatch))).toBe('scope_refused');
+    expect(classifyToolErrorClass(err(noOwner))).toBe('upstream_5xx');
+    expect(classifyToolErrorClass(err(noAccount))).toBe('upstream_5xx');
+  });
+
+  it('main\'s "is too large" invalid_args rule no longer swallows a Drive capped read', () => {
+    /*
+     * Asserted against the REAL message, not a paraphrase.
+     *
+     * ENG-1672 widened invalid_args with `is too large`, and the Drive capped message used to end
+     * "this folder is too large to search within the read budget" — they met at auto-merge and
+     * the model was told to fix a filename that was never wrong.
+     *
+     * The first version of this test asserted `not.toBe('invalid_args')` on a hand-written
+     * fragment, which classified as the legacy `Error` and so passed before the fix as well as
+     * after: it proved nothing. Pinning the sentence `driveNameSearchIncompleteMessage` actually
+     * emits means a reword that reintroduces the collision fails here.
+     */
+    const REAL_CAPPED_MESSAGE =
+      'File "notes.txt" was not found, but the file search ran out of its time budget before it '
+      + 'had covered the whole folder tree. This is an INCOMPLETE read, not a confirmed absence: '
+      + 'do not report the file as missing. Do NOT retry this same call — the budget is a fixed '
+      + 'wall-clock bound spent walking this folder\'s sub-folders, so a tree this large will stop '
+      + 'in the same place every time. The only thing that changes the outcome is a SMALLER '
+      + 'search scope: ask the user for the file\'s direct Google Drive link, or for the specific '
+      + 'sub-folder it lives in so that sub-folder can be registered as its own knowledge base '
+      + 'source. If neither is available, tell the user plainly that this folder exceeded the '
+      + 'read budget for a single search — do not describe it as a temporary glitch and do not '
+      + 'try again.';
+
+    // Positively classified, not merely "not invalid_args" — a message that matched nothing
+    // would satisfy the negative alone.
+    expect(classifyToolErrorClass(err(REAL_CAPPED_MESSAGE))).toBe('read_bounded');
+    expect(classifyToolErrorClass(err(REAL_CAPPED_MESSAGE))).not.toBe('invalid_args');
+
+    // And the collision itself: the old wording WOULD have been swallowed, which is what makes
+    // the assertion above meaningful rather than incidental.
+    expect(classifyToolErrorClass(err(
+      'tell the user plainly that this folder is too large to search within the read budget',
+    ))).toBe('invalid_args');
+  });
+
+  it('classifies bad skill ids as invalid_args, not as a plan problem', () => {
+    // The model's fault, not the subscription's — the remedy is different.
+    expect(classifyToolErrorClass(err('No valid skills found for the provided IDs.'))).toBe('invalid_args');
+  });
+
   it('classifies contract/schema-validation rejections as invalid_args (~45)', () => {
     expect(classifyToolErrorClass(err('Tool "read_tool_response" arguments failed schema validation before execution. Argument "char_offset" has the wrong type. Expected number.'))).toBe('invalid_args');
     expect(classifyToolErrorClass(err('Tool "wait_seconds" arguments failed schema validation before execution. Missing required argument "reason".'))).toBe('invalid_args');
@@ -276,5 +459,56 @@ describe('rate_limit — AWS SDK v2 DynamoDB throttling (ENG-1626)', () => {
   it('classifies ThrottlingException as rate_limit with no statusCode at all', () => {
     const err = Object.assign(new Error('Throttling'), { code: 'ThrottlingException' });
     expect(classifyToolErrorClass(err)).toBe('rate_limit');
+  });
+});
+
+// ENG-1844: the landing-page generate/duplicate routes' brand-logo 422 reaches the model
+// as `API error (422): No brand logo is saved...` via httpClient.ts's self-call Error.
+// The embedded-status regex requires whitespace/start-of-string before the digits, but
+// "(422)" has "(" immediately before them, so it never matched — this fell all the way to
+// the generic unclassified fallback. httpClient.ts now preserves the route's own
+// `missing_brand_logo` marker on `.code` (separately from the human `.message`), so this
+// must classify by that STRING code, not by the numeric status at all.
+describe('missing_brand_logo — brand-logo content gate (ENG-1844)', () => {
+  it('classifies by the .code marker even though the message embeds "(422)" unmatchably', () => {
+    const err = Object.assign(
+      new Error(
+        'API error (422): No brand logo is saved in Brand Guidelines. Upload your logo in brand config (Brand Guidelines), then generate again — landing pages are never generated with an invented or approximate logo.'
+      ),
+      { code: MISSING_BRAND_LOGO_ERROR }
+    );
+    expect(classifyToolErrorClass(err)).toBe('missing_brand_logo');
+  });
+
+  it('falls back to invalid_args for an ordinary 422 with no .code marker (no regression)', () => {
+    const err = Object.assign(new Error('API error (422): "prompt" is required'), { status: 422 });
+    expect(classifyToolErrorClass(err)).toBe('invalid_args');
+  });
+});
+
+// ENG-1162: a publisher (not an AgentWeb-connected account) refusing or failing to serve a
+// plain external fetch — read_file_content's own 401/403 marker, or a Chromium/Playwright
+// browser-navigation net-error — must not be swept into 'auth' ("reconnect the account" is
+// nonsensical for an anonymous read) nor left in the unclassified legacy fallback (no signal
+// that the failed read is not evidence the content is missing).
+describe('publisher_refused — publisher/site blocks on a plain external fetch (ENG-1162)', () => {
+  it('classifies a browser navigation net::ERR_* failure as publisher_refused, not the legacy fallback', () => {
+    expect(classifyToolErrorClass(err(
+      'page.goto: net::ERR_EMPTY_RESPONSE at https://ramaonhealthcare.com/hhs-working-to-strike-medicaid-work-requirement-deal-with-blue-states/'
+    ))).toBe('publisher_refused');
+    expect(classifyToolErrorClass(err('net::ERR_CONNECTION_REFUSED at https://example.com/'))).toBe('publisher_refused');
+  });
+
+  it('classifies read_file_content\'s publisher-refusal marker as publisher_refused, not auth', () => {
+    expect(classifyToolErrorClass(err(
+      'The publisher refused this fetch (HTTP 403: Forbidden) — this is a site-side access block '
+      + '(bot filtering, WAF, or paywall), not an AgentWeb account or permissions problem.'
+    ))).toBe('publisher_refused');
+  });
+
+  it('leaves an unrelated bare 401/403 (e.g. a connected-account API) classified as auth', () => {
+    expect(classifyToolErrorClass(err('HTTP 403: Forbidden'))).toBe('auth');
+    expect(classifyToolErrorClass(err('403 Forbidden'))).toBe('auth');
+    expect(classifyToolErrorClass(err('Request failed with status code 401'))).toBe('auth');
   });
 });

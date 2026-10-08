@@ -18,7 +18,8 @@ import {
   type EnrichSoFetchContext,
 } from './enrichmentGroupWaterfall';
 import { normalizeFills } from './enrichmentNormalizer';
-import { FIELD_GROUPS } from './enrichmentGroups';
+import { FIELD_GROUPS, isCardRevenueField } from './enrichmentGroups';
+import type { EnigmaRunSummary } from './enigmaCardRevenueEnrichment';
 import type { LeadRecord, SocketEmitFn } from './crmEnrichmentService';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 import type { ResolveIdentityResult } from './enrichmentIdentityResolver';
@@ -135,6 +136,8 @@ interface TierCount {
   unipile: number;
   web: number;
   missing: number;
+  /** ENG-1388: fields filled by Enigma card revenue. */
+  enigma?: number;
 }
 
 export interface RunEnrichmentResult {
@@ -149,6 +152,9 @@ export interface RunEnrichmentResult {
   };
   tierFillBreakdown: { total: TierCount } & Record<string, TierCount>;
   durationMs: number;
+  /** ENG-1388: present only when this run was allowed to use Enigma. Skips
+   *  and provider failures here never count toward `failed`. */
+  enigma?: EnigmaRunSummary;
   preview?: Array<{
     leadId: string;
     extractedFields: Record<string, string>;
@@ -239,6 +245,10 @@ export interface OrchestratorDeps {
      *  and the lead's existing field data. */
     depValues: Record<string, string>;
   }): Promise<{ value: string | null; reasoning: string; model?: string }>;
+
+  /** ENG-1388: per-run Enigma card-revenue summary. Absent when the run was
+   *  not allowed to buy Enigma data. */
+  enigmaSummary?(): EnigmaRunSummary;
 }
 
 /** Standard CRM lead columns — values for these field names go to top-level
@@ -255,7 +265,7 @@ const IDENTITY_PERSIST_FIELDS = new Set<string>([
   'firstName', 'lastName', 'email', 'linkedin', 'company', 'website', 'title',
 ]);
 
-type SourceKey = 'apollo' | 'unipile' | 'enrichSo' | 'webSearch' | 'sibling' | 'llm';
+type SourceKey = 'apollo' | 'unipile' | 'enrichSo' | 'webSearch' | 'sibling' | 'llm' | 'enigma';
 
 function providerToSourceKey(meta: EnrichedFieldMeta): SourceKey | null {
   if (meta.source === 'llm') return 'llm';
@@ -263,6 +273,7 @@ function providerToSourceKey(meta: EnrichedFieldMeta): SourceKey | null {
     case 'apollo': return 'apollo';
     case 'unipile': return 'unipile';
     case 'enrich.so': return 'enrichSo';
+    case 'enigma': return 'enigma';
     case 'llm_web_search': return 'webSearch';
     case 'agentweb': return 'sibling';
     default: return null;
@@ -317,7 +328,7 @@ function emptyTierCount(): TierCount {
 }
 
 function addTierCounts(a: TierCount, b: TierCount): TierCount {
-  return {
+  const sum: TierCount = {
     crm: a.crm + b.crm,
     apollo: a.apollo + b.apollo,
     enrichSo: a.enrichSo + b.enrichSo,
@@ -325,6 +336,11 @@ function addTierCounts(a: TierCount, b: TierCount): TierCount {
     web: a.web + b.web,
     missing: a.missing + b.missing,
   };
+  // Only runs that used Enigma carry the key, so every other run's breakdown
+  // keeps its existing shape.
+  const enigma = (a.enigma ?? 0) + (b.enigma ?? 0);
+  if (enigma > 0) sum.enigma = enigma;
+  return sum;
 }
 
 interface FieldRouting {
@@ -845,8 +861,9 @@ async function writeLeadOutcome(
   input: RunEnrichmentInput,
   deps: OrchestratorDeps,
   runId: string,
-): Promise<{ ok: true } | { ok: false; reason: 'update' }> {
-  if (input.mode === 'preview') return { ok: true };
+): Promise<{ ok: true; wrote: boolean } | { ok: false; reason: 'update' }> {
+  // Preview writes nothing by definition; the preview path counts its own samples above.
+  if (input.mode === 'preview') return { ok: true, wrote: false };
   const { fillIfEmpty, alwaysOverwrite } = bucketByOverwritePolicy(lead, outcome.fills, input.config);
 
   // Split each fill by destination — standard CRM columns write to the lead's
@@ -882,7 +899,10 @@ async function writeLeadOutcome(
         ifNotExists: false,
       });
     }
-    return { ok: true };
+    // `wrote` distinguishes "enriched" from "ran and found nothing". Both used to report
+    // ok:true and be counted as processed, so a run over leads the providers could not fill
+    // announced "500 enriched, 0 skipped, 0 failed" having changed nothing at all.
+    return { ok: true, wrote: allFills.length > 0 };
   } catch (err) {
     return { ok: false, reason: 'update' };
   }
@@ -949,6 +969,9 @@ export async function runEnrichment(
   const injectedDeps: EnrichmentFieldConfig[] = [];
   for (const sf of smartFields) {
     for (const dep of sf.smartDependencies ?? []) {
+      // Card revenue is bought per value, so a smart field may read an existing
+      // value but never trigger an Enigma purchase (ENG-1388).
+      if (isCardRevenueField(dep)) continue;
       if (!existingCanonicals.has(dep) && !injectedDepNames.has(dep)) {
         injectedDeps.push({
           name: dep,
@@ -988,7 +1011,8 @@ export async function runEnrichment(
   // fields, canonical match is free). Passed to every processLead call. Skipped
   // entirely when there are no leads — no processLead would consume it.
   const siblingMappingTable: SiblingFieldMappingTable = leads.length > 0
-    ? await buildSiblingFieldMappingTable(workingConfig.fields)
+    // ENG-1858: meter the mapping call to the run's user, not "system".
+    ? await buildSiblingFieldMappingTable(workingConfig.fields, { userId: input.userId, feature: 'crm_enrichment_field_mapping' })
     : { canonical: new Map(), llm: new Map() };
   const configFieldsByName: Record<string, EnrichmentFieldConfig> = {};
   const fieldAliasMap: Record<string, string> = {};
@@ -1016,19 +1040,23 @@ export async function runEnrichment(
   const tierBreakdown: Record<string, TierCount> = {};
   const previewSamples: NonNullable<RunEnrichmentResult['preview']> = [];
   let processed = 0;
+  // Leads that ran cleanly and produced no fill — neither enriched nor failed.
+  let filledNothing = 0;
   let identityResolutionFailed = 0;
   const skippedLeadIds: string[] = [];
   let apolloFailed = 0;
   let llmOrParseFailed = 0;
   let updateFailed = 0;
 
-  const sourceBreakdown = {
+  type SourceCounts = { live: number; cached: number };
+  const sourceBreakdown: Record<Exclude<SourceKey, 'enigma'>, SourceCounts> & { enigma?: SourceCounts } = {
     apollo:    { live: 0, cached: 0 },
     unipile:   { live: 0, cached: 0 },
     enrichSo:  { live: 0, cached: 0 },
     webSearch: { live: 0, cached: 0 },
     sibling:   { live: 0, cached: 0 },
     llm:       { live: 0, cached: 0 },
+    // `enigma` is added on first use so non-Enigma job records keep their shape.
   };
 
   emitToRooms(progressEvent, {
@@ -1166,10 +1194,16 @@ export async function runEnrichment(
       );
       for (const { writeResult, leadBreakdown } of writeResults) {
         if (writeResult.ok) {
+          // `processed` keeps meaning "completed without failing" — it is also the progress
+          // counter, and a run that fills nothing must still show N/N rather than 0/N.
+          // filledNothing is tracked ALONGSIDE it purely so the summary can tell the two
+          // apart instead of announcing "500 enriched" over a run that changed nothing.
           processed += 1;
+          if (!writeResult.wrote) filledNothing += 1;
           for (const { key, fromCache } of leadBreakdown) {
-            if (fromCache) sourceBreakdown[key].cached++;
-            else sourceBreakdown[key].live++;
+            const counts = (sourceBreakdown[key] ??= { live: 0, cached: 0 });
+            if (fromCache) counts.cached++;
+            else counts.live++;
           }
         } else {
           updateFailed += 1;
@@ -1180,7 +1214,8 @@ export async function runEnrichment(
     const completedSoFar = Math.min(i + CONCURRENCY, leads.length);
     const skippedSoFar = identityResolutionFailed;
     const hardFailedSoFar = llmOrParseFailed + updateFailed;
-    const parts = [`${processed} enriched`];
+    const parts = [`${Math.max(0, processed - filledNothing)} enriched`];
+    if (filledNothing > 0) parts.push(`${filledNothing} no new data`);
     if (skippedSoFar > 0) parts.push(`${skippedSoFar} skipped`);
     if (hardFailedSoFar > 0) parts.push(`${hardFailedSoFar} failed`);
     emitToRooms(progressEvent, {
@@ -1217,6 +1252,11 @@ export async function runEnrichment(
     tierFillBreakdown: { total, ...tierBreakdown },
     durationMs: Date.now() - startedAt,
   };
+  const enigmaSummary = deps.enigmaSummary?.();
+  if (enigmaSummary) {
+    result.enigma = enigmaSummary;
+    console.log(`[v3] enigma runId=${runId} ${JSON.stringify(enigmaSummary)}`);
+  }
 
   if (input.mode === 'preview') {
     result.preview = previewSamples;
@@ -1236,6 +1276,7 @@ export async function runEnrichment(
     failureBreakdown: result.failed,
     tierFillBreakdown: result.tierFillBreakdown,
     durationMs: result.durationMs,
+    ...(result.enigma ? { enigma: result.enigma } : {}),
   });
 
   const attemptedLeadIds = leads.map((l: LeadRecord) => l.leadId);

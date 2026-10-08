@@ -14,12 +14,112 @@ import {
   UpdateSequenceInput,
 } from '../services/dripSequenceDb';
 import { crmDb } from '../services/db';
+import { isSessionList, SESSION_LIST_SEQUENCE_ERROR } from '../utils/sessionList';
 import { resolveSenderForSend } from '../services/crmSenderService';
 import { CrmSender } from '../services/crmSenderTypes';
 import { sendAsSender } from '../services/sendAsSender';
 import axios from 'axios';
 import { extractVariables, leadHasVariable, isSupportedVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
+import { LEAD_LIFECYCLES, defaultStatusConfigFor } from '../utils/leadSchema';
+import { computeLifecycle, LifecycleStage } from '../services/lifecycleService';
+import {
+  requiredChannels, leadIsReachable, skipKeyForChannels, enrollmentIdentity,
+  enrollmentIdentityCandidates,
+} from '../utils/leadReachability';
+
+/**
+ * ENG-2127: the by-list enrol accepts a `lifecycle` filter and hands it to
+ * crmDb.getLeadsByStatus, which queries the `status` attribute on listId-status-index and
+ * never reads `lifecycle` at all. The two vocabularies are disjoint — measured against
+ * production, `status` holds contacted/new/qualified/open/lost/closed/won/… while
+ * `lifecycle` holds inbox/signed_up — so a lifecycle-filtered enrol can never match
+ * anything. It returns an empty array, which is a legitimate result, so the caller reports
+ * "0 leads enrolled" and nothing anywhere says why.
+ *
+ * Fixing it properly means deciding what the filter should mean (a listId-lifecycle-index,
+ * or dropping the control) and is tracked on ENG-2127. Until then this at least refuses to
+ * fail silently.
+ */
+const LIFECYCLE_STAGES: ReadonlySet<string> = new Set<string>(LEAD_LIFECYCLES);
+
+function lifecycleForLead(lead: any): LifecycleStage {
+  const currentLifecycle = LIFECYCLE_STAGES.has(lead?.lifecycle)
+    ? lead.lifecycle as LifecycleStage
+    : undefined;
+  const computed = computeLifecycle({
+    email: lead?.email ?? undefined,
+    phone: lead?.phone ?? undefined,
+    domain: lead?.domain ?? undefined,
+    hasUserRecord: lead?.hasUserRecord ?? undefined,
+    subscriptionState: lead?.subscriptionState ?? undefined,
+    lastActivityAt: lead?.lastActivityAt ?? undefined,
+    lastUsageAt: lead?.lastUsageAt ?? undefined,
+    healthScore: lead?.healthScore ?? undefined,
+    currentLifecycle,
+    openDealStages: lead?.openDealStages ?? undefined,
+  });
+
+  if (!currentLifecycle || computed === currentLifecycle) return computed;
+
+  const subscriptionIsDefinitive =
+    lead?.subscriptionState === 'active' ||
+    lead?.subscriptionState === 'trialing' ||
+    lead?.subscriptionState === 'past_due' ||
+    lead?.subscriptionState === 'canceled';
+  const hasOpenDeal =
+    Array.isArray(lead?.openDealStages) && lead.openDealStages.length > 0;
+  const dealCanPromoteCurrent =
+    hasOpenDeal &&
+    (currentLifecycle === 'unknown' ||
+      currentLifecycle === 'inbox' ||
+      currentLifecycle === 'signed_up');
+  const provesSignup =
+    lead?.hasUserRecord === true &&
+    (currentLifecycle === 'unknown' || currentLifecycle === 'inbox');
+
+  const nowMs = Date.now();
+  const ageDays = (value: unknown): number | null => {
+    if (typeof value !== 'string' || !value) return null;
+    const parsed = Date.parse(value);
+    if (Number.isNaN(parsed) || parsed > nowMs) return null;
+    return (nowMs - parsed) / (24 * 60 * 60 * 1000);
+  };
+  const activityProvesChurn = (ageDays(lead?.lastActivityAt) ?? 0) > 60;
+  const payingOrAtRisk =
+    currentLifecycle === 'paying' || currentLifecycle === 'at_risk';
+  const healthProvesRisk =
+    payingOrAtRisk &&
+    typeof lead?.healthScore === 'number' &&
+    lead.healthScore < 40;
+  const usageProvesRisk =
+    payingOrAtRisk && (ageDays(lead?.lastUsageAt) ?? 0) > 30;
+
+  return subscriptionIsDefinitive ||
+    dealCanPromoteCurrent ||
+    provesSignup ||
+    activityProvesChurn ||
+    healthProvesRisk ||
+    usageProvesRisk
+    ? computed
+    : currentLifecycle;
+}
+
+async function getAllLeadsByStatus(
+  listId: string,
+  status: string,
+  pageSize = 200,
+): Promise<any[]> {
+  const items: any[] = [];
+  let lastKey: any = undefined;
+  do {
+    const page = await crmDb.getLeadsByStatus(listId, status, pageSize, lastKey);
+    if (Array.isArray(page)) return page;
+    items.push(...((page as any).items ?? (page as any).leads ?? []));
+    lastKey = (page as any).lastEvaluatedKey;
+  } while (lastKey);
+  return items;
+}
 
 const router = express.Router();
 
@@ -84,6 +184,15 @@ router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response
   const authReq = req as AuthenticatedRequest;
   const { name, description, campaignType, enrollmentTrigger, enrollmentCondition, exitConditions, autoEnrollListIds, steps, status } = req.body;
   try {
+    // ENG-2311: auto-enrolment is driven solely by autoEnrollListIds, so refusing a session
+    // list HERE (the only writer besides by-list enrol, guarded below) keeps every enrol path
+    // — crm.ts, webhooks.ts, imports — from ever seeing a sequence bound to one.
+    if (Array.isArray(autoEnrollListIds)) {
+      for (const lid of autoEnrollListIds) {
+        const bound = typeof lid === 'string' && lid ? await crmDb.getLeadListById(lid).catch(() => null) : null;
+        if (isSessionList(bound)) return res.status(400).json({ error: SESSION_LIST_SEQUENCE_ERROR });
+      }
+    }
     const input: UpdateSequenceInput = {
       name,
       description,
@@ -169,17 +278,109 @@ router.post(
         return res.status(400).json({ error: 'Sequence has no steps' });
       }
 
-      const inputs = leads.map((l: any) => ({
+      // Reachability is decided from the CRM ROW, not the request body. This route's
+      // payload is `{ listId, leadId, leadEmail }` — `linkedin` was never part of its
+      // contract, so reading `l.linkedin` here meant every lead looked unreachable to a
+      // LinkedIn sequence and the route enrolled NOBODY. That is the identical regression
+      // this guard was introduced to fix, reintroduced on the sibling route; the by-list
+      // route escaped it only because it reads real rows. The lead is loaded once per
+      // entry and reused for the identity below.
+      const channels = requiredChannels(sequence);
+
+      // AUTHORIZE EVERY LIST BEFORE READING ANY LEAD.
+      //
+      // `listId` and `leadId` come straight out of the request body, and `getLeadById` is
+      // a bare GetItem with no ownership filter. Authorizing only the SEQUENCE — which is
+      // all this route did — let a caller read any lead row in the table through their own
+      // sequence: the skipped-count became a per-lead "does this lead have an email"
+      // oracle, and the victim's address was written into the caller's enrollment and
+      // handed back by GET /:sequenceId/enrollments. Before this commit the route touched
+      // no CRM data at all, so adding the read added the hole. The sibling by-list route
+      // has always done exactly this check.
+      //
+      // Deduped: one authorization per distinct listId, not per lead.
+      const listIds = Array.from(new Set(leads.map((l: any) => String(l.listId ?? ''))));
+      const listAuth = new Map<string, boolean>();
+      const sessionListIdsInRequest: string[] = [];
+      for (const lid of listIds) {
+        if (!lid) { listAuth.set(lid, false); continue; }
+        const list = await crmDb.getLeadListById(lid).catch(() => null);
+        listAuth.set(lid, !!list && await crmDb.canOrgMemberAccessList(authReq.user!.userId, list));
+        if (isSessionList(list)) sessionListIdsInRequest.push(lid);
+      }
+      if (sessionListIdsInRequest.length > 0) {
+        return res.status(400).json({ error: SESSION_LIST_SEQUENCE_ERROR });
+      }
+      const unauthorized = listIds.filter((lid) => !listAuth.get(lid));
+      if (unauthorized.length > 0) {
+        // Refuse the whole call rather than silently enrolling the authorized subset —
+        // a partial success here is indistinguishable from "that lead was unreachable",
+        // which is the oracle this guard exists to close.
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+
+      // BatchGetItem-style chunking rather than one promise per lead: `leads` is
+      // caller-supplied and capped only by the 50mb body limit, so an unbounded
+      // Promise.all over it is a self-inflicted load problem — and a throttled read
+      // degrades to the payload, which for a LinkedIn sequence means reporting the
+      // caller's own leads as unreachable.
+      const CHUNK = 25;
+      const resolved: Array<{ input: any; lead: any; readFailed: boolean }> = [];
+      for (let i = 0; i < leads.length; i += CHUNK) {
+        const batch = await Promise.all(leads.slice(i, i + CHUNK).map(async (l: any) => {
+          // Promise.resolve().then(...) so a SYNCHRONOUS throw is caught too — a bare
+          // `.catch()` only handles a rejection.
+          const row = await Promise.resolve()
+            .then(() => crmDb.getLeadById(l.listId, l.leadId))
+            .catch(() => null);
+          // `||` not `??`: a row that exists with `email: ''` must not block an address
+          // the caller supplied. `??` only falls through on null/undefined, so an empty
+          // string on the row dropped a lead the caller could legitimately enrol.
+          //
+          // `linkedin` comes ONLY from the CRM row. This route's payload contract is
+          // { listId, leadId, leadEmail } — `linkedin` was never part of it, and
+          // honouring it let a caller enrol a genuinely unreachable lead by supplying a
+          // profile URL the lead does not have, under a dedup identity of their
+          // choosing. leadEmail stays honoured because it IS in the contract.
+          return {
+            input: l,
+            lead: {
+              email: (row as any)?.email || l.leadEmail || l.email || '',
+              linkedin: (row as any)?.linkedin || '',
+            },
+            readFailed: row === null,
+          };
+        }));
+        resolved.push(...batch);
+      }
+      const enrollable = resolved.filter((r) => leadIsReachable(r.lead, channels));
+      // Separate "we could not check" from "we checked and cannot reach".
+      //
+      // readFailed was computed and then never read. A throttled or failing getLeadById
+      // leaves the lead with no CRM data, so for a LinkedIn sequence it falls out as
+      // unreachable and is reported in the same bucket as a lead that genuinely has no
+      // profile — indistinguishable from real data, and silently lost. A deleted lead
+      // takes the same path, which is fine; the point is that the caller can tell.
+      const notEnrollable = resolved.filter((r) => !leadIsReachable(r.lead, channels));
+      const skippedReadFailed = notEnrollable.filter((r) => r.readFailed).length;
+      const skippedUnreachable = notEnrollable.length - skippedReadFailed;
+      const inputs = enrollable.map((r) => ({
         sequenceId: req.params.sequenceId,
         userId: authReq.user!.userId,
-        listId: l.listId,
-        leadId: l.leadId,
-        leadEmail: l.leadEmail,
+        listId: r.input.listId,
+        leadId: r.input.leadId,
+        leadEmail: enrollmentIdentity(r.lead),
+        identityCandidates: enrollmentIdentityCandidates(r.lead),
         startAt: startAt ?? undefined,
       }));
 
       const result = await dripSequenceDb.bulkEnroll(inputs);
-      res.json(result);
+      const skipKey = skipKeyForChannels(channels);
+      res.json({
+        ...result,
+        ...(skippedUnreachable > 0 ? { [skipKey]: skippedUnreachable } : {}),
+        ...(skippedReadFailed > 0 ? { skippedReadFailed } : {}),
+      });
     } catch (err: any) {
       if (err instanceof SequenceNotFoundError) return res.status(404).json({ error: err.message });
       if (err instanceof SequenceAuthError) return res.status(403).json({ error: err.message });
@@ -195,7 +396,9 @@ router.post(
   authenticateToken,
   async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
-    const { listId, lifecycle, startAt, confirm } = req.body;
+    const { listId, lifecycle, status: rawStatus, startAt, confirm } = req.body;
+    // Blank status is absent, including for lifecycle validation and auto-enrollment.
+    const status = rawStatus != null && String(rawStatus).trim() !== '' ? String(rawStatus) : undefined;
     if (!listId) return res.status(400).json({ error: 'listId is required' });
 
     try {
@@ -212,16 +415,108 @@ router.post(
       if (!(await crmDb.canOrgMemberAccessList(authReq.user!.userId, list))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
+      // ENG-2311: a session list's rows are per-visit telemetry, never enrolled in sequences.
+      if (isSessionList(list)) return res.status(400).json({ error: SESSION_LIST_SEQUENCE_ERROR });
 
-      // Load ALL leads. Lifecycle-filtered enroll keeps its existing path; the
-      // default list enroll uses the paginated loader so counts/enrollment are complete.
+      // The historical request field `lifecycle` also carried lead status values.
+      // Keep that compatibility for current or still-materialized legacy statuses, while
+      // lifecycle-only values are derived from the complete lead rows.
+      const storedStatusConfig = (list as any)?.statusConfig;
+      const effectiveStatusConfig = Array.isArray(storedStatusConfig) && storedStatusConfig.length > 0
+        ? storedStatusConfig
+        : defaultStatusConfigFor((list as any)?.listType);
+      const listStatuses = new Set(effectiveStatusConfig.map((entry: any) => String(entry?.value)));
+      // Defaults are not a stored vocabulary: older lists may have arbitrary statuses.
+      if (status != null && Array.isArray(storedStatusConfig) && storedStatusConfig.length > 0 && !listStatuses.has(status)) {
+        return res.status(400).json({
+          error: 'invalid_status',
+          message: `Unknown status "${status}". Allowed values: ${Array.from(listStatuses).join(', ')}.`,
+        });
+      }
+
+      const legacyValue = lifecycle != null ? String(lifecycle) : undefined;
+      // With both fields supplied, lifecycle is canonical (not the legacy status alias).
+      // Validate it even when a status query would otherwise return no candidates.
+      if (status != null && legacyValue !== undefined && !LIFECYCLE_STAGES.has(legacyValue)) {
+        return res.status(400).json({
+          error: 'invalid_lifecycle',
+          message: `Unknown lifecycle stage "${legacyValue}". Use status for custom lead statuses.`,
+        });
+      }
+      const legacyIsLifecycle =
+        legacyValue !== undefined &&
+        LIFECYCLE_STAGES.has(legacyValue) &&
+        (status != null || !listStatuses.has(legacyValue));
+
+      let legacyStatusProbeLeads: any[] | undefined;
+      if (
+        status == null &&
+        legacyValue !== undefined &&
+        !legacyIsLifecycle &&
+        !listStatuses.has(legacyValue)
+      ) {
+        legacyStatusProbeLeads = await getAllLeadsByStatus(listId, legacyValue);
+        if (legacyStatusProbeLeads.length === 0) {
+          return res.status(400).json({
+            error: 'invalid_lifecycle',
+            message: `Unknown lifecycle stage "${legacyValue}". Use status for custom lead statuses.`,
+          });
+        }
+      }
+
+      const requestedStatus = status != null
+        ? String(status)
+        : (legacyValue && !legacyIsLifecycle ? legacyValue : undefined);
+      const requestedLifecycle = legacyIsLifecycle ? legacyValue : undefined;
+
       let leads: any[];
-      if (lifecycle) {
-        const r = await crmDb.getLeadsByStatus(listId, lifecycle);
-        leads = Array.isArray(r) ? r : ((r as any).items ?? (r as any).leads ?? []);
+      if (requestedStatus) {
+        if (legacyStatusProbeLeads !== undefined) {
+          leads = legacyStatusProbeLeads;
+        } else {
+          leads = await getAllLeadsByStatus(listId, requestedStatus);
+        }
+      } else if (requestedLifecycle) {
+        const allLeads = await crmDb.getAllLeadsByListId(listId);
+        leads = allLeads.filter(
+          (lead: any) => lifecycleForLead(lead) === requestedLifecycle,
+        );
       } else {
         leads = await crmDb.getAllLeadsByListId(listId);
       }
+      // Both filters are an intersection: status match AND derived lifecycle match.
+      if (requestedStatus && requestedLifecycle) {
+        leads = leads.filter((lead: any) => lifecycleForLead(lead) === requestedLifecycle);
+      }
+
+      // Filtered HERE, before coverage — not at the mapper. A lead the sequence can reach
+      // on no channel would enrol into a row that skips every step and completes having
+      // sent nothing; and an empty identity is the leadEmail-index partition key, so the
+      // row is invisible to getExistingEnrollment and is re-created on every run.
+      //
+      // (The older rationale — that the worker RETHROWS and the enrollment retries
+      // forever — described behaviour that has since been fixed: undeliverable steps are
+      // skipped now. Left corrected rather than deleted because that change is precisely
+      // why this test is at-least-one rather than every-channel.)
+      //
+      // Filtering up front rather than at the mapper keeps one population throughout:
+      // leadCount, the missing/present warning counts and the confirm gate all describe
+      // exactly the leads that will be enrolled. Filtering later made the dialog report a
+      // different set than the one it enrolled — and could raise needsConfirmation over
+      // variables missing only on leads that were never candidates.
+      //
+      // Email-less leads were already reachable (LinkedIn imports, the invite mirror);
+      // ENG-2082 made a whole new list type produce them.
+      // Both counts, deliberately. Filtering silently would shrink leadCount from 100 to 20
+      // with nothing on screen to explain where 80 went — the dialog would look like leads
+      // had vanished. Reporting the population AND the enrollable subset lets the caller say
+      // "20 of 100 leads can be emailed", which is the true statement.
+      const totalLeads = leads.length;
+      // Channel-aware: the first version tested `l.email` only, which excluded a
+      // LinkedIn-only lead from a LinkedIn sequence the worker could actually deliver.
+      const channels = requiredChannels(sequence);
+      leads = leads.filter((l: any) => leadIsReachable(l, channels));
+      const enrollableLeads = leads.length;
 
       // Variable coverage across all steps + channels (email subject/body + LinkedIn
       // messageText). Warn — but allow override via `confirm` — when a supported
@@ -249,32 +544,44 @@ router.post(
           enrolled: false,
           needsConfirmation: true,
           leadCount: leads.length,
+          totalLeads,
+          enrollableLeads,
+          ...(totalLeads > enrollableLeads ? { [skipKeyForChannels(channels)]: totalLeads - enrollableLeads } : {}),
           warnings: { unsupported, missing },
         });
       }
 
-      const inputs = leads.map((l: any) => ({
-        sequenceId: req.params.sequenceId,
-        userId: authReq.user!.userId,
-        listId,
-        leadId: l.leadId,
-        leadEmail: l.email,
-        startAt: startAt ?? undefined,
-      }));
+      const inputs = leads
+        .map((l: any) => ({
+          sequenceId: req.params.sequenceId,
+          userId: authReq.user!.userId,
+          listId,
+          leadId: l.leadId,
+          leadEmail: enrollmentIdentity(l),
+          identityCandidates: enrollmentIdentityCandidates(l),
+          startAt: startAt ?? undefined,
+        }));
 
       const result = await dripSequenceDb.bulkEnroll(inputs);
+      const counts = {
+        totalLeads,
+        enrollableLeads,
+        ...(totalLeads > enrollableLeads ? { [skipKeyForChannels(channels)]: totalLeads - enrollableLeads } : {}),
+      };
 
       // Auto-enroll is on by default: add listId to sequence's autoEnrollListIds
       // unless it's already there. This means new leads added to this list later
       // will be automatically enrolled.
       const existing = sequence.autoEnrollListIds ?? [];
-      if (!existing.includes(listId)) {
+      // A filtered enrollment is a one-shot selection. Persisting only the list id would
+      // discard the filter and auto-enroll every future lead from the list.
+      if (!requestedStatus && !requestedLifecycle && !existing.includes(listId)) {
         void dripSequenceDb.updateSequence(req.params.sequenceId, authReq.user!.userId, {
           autoEnrollListIds: [...existing, listId],
         }).catch((e) => console.error('[sequences] autoEnrollListIds update error:', e));
       }
 
-      res.json(result);
+      res.json({ ...result, ...counts });
     } catch (err: any) {
       if (err instanceof SequenceNotFoundError) return res.status(404).json({ error: err.message });
       if (err instanceof SequenceAuthError) return res.status(403).json({ error: err.message });
@@ -548,15 +855,65 @@ router.post(
         return res.status(401).json({ message: 'Unauthorized' });
       }
 
+      // AUTHORIZE BEFORE READING ANYTHING.
+      //
+      // This route read three things belonging to whoever the ids pointed at, with no
+      // ownership check of any kind: the list's leads, the sequence definition, and — in
+      // the else-branch — the sequence's enrollments and then each enrolled lead. Both
+      // ids come straight from the request, so a caller could aim it at another tenant
+      // and read back `totalLeads`, per-variable coverage counts, and a skip-reason key
+      // whose NAME leaks whether the victim's sequence contains a LinkedIn step.
+      //
+      // The sibling enrol-by-list route has always done exactly these two checks. This
+      // one is a copy of that check, not an invention.
+      //
+      // The 'test' sentinel keeps its existing meaning: no sequence to authorize.
+      const hasSequence = !!req.params.sequenceId && req.params.sequenceId !== 'test';
+      const sequenceForVerify = hasSequence
+        ? await dripSequenceDb.getSequence(req.params.sequenceId).catch(() => null)
+        : null;
+      if (hasSequence) {
+        if (!sequenceForVerify) return res.status(404).json({ error: 'Sequence not found' });
+        if (sequenceForVerify.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
+      }
+      if (listId) {
+        const list = await crmDb.getLeadListById(listId).catch(() => null);
+        if (!list) return res.status(404).json({ error: 'List not found' });
+        if (!(await crmDb.canOrgMemberAccessList(userId, list))) {
+          return res.status(403).json({ error: 'Forbidden' });
+        }
+      }
+
       const allTemplate = (subject || '') + (htmlContent || '');
       const variables = extractVariables(allTemplate);
 
       let leads: any[] = [];
+      let verifyTotalLeads = 0;
+      // Declared out here so the response below can name the skip reason after the
+      // channel that was actually missing, the same way the two enrol routes do.
+      let verifyChannels = new Set<string>(['email']);
       if (listId) {
-        const leadsResult = await crmDb.getLeadsByListId(listId);
+        // getAllLeadsByListId, not getLeadsByListId.
+        //
+        // getLeadsByListId returns ONE ~1MB DynamoDB page; db.ts says verbatim "Use this
+        // anywhere a complete list is required (enrollment, coverage counts)". The enrol
+        // route paginates, so on any list over a page this screen reported coverage over
+        // a different, smaller population than the one that gets enrolled — while the
+        // comment here claimed they matched. Two screens, same list, contradictory
+        // numbers, and coverage warnings computed from a truncated sample.
+        const leadsResult = await crmDb.getAllLeadsByListId(listId);
         leads = Array.isArray(leadsResult)
           ? leadsResult
           : ((leadsResult as any).items ?? (leadsResult as any).leads ?? []);
+        // Same population the enrol routes use. Without this, this screen reported variable
+        // coverage over leads enrol-by-list will never enrol — two screens, same list,
+        // contradictory numbers, and coverage warnings raised over rows that were never
+        // candidates. ENG-2082 made address-less leads common enough to diverge visibly.
+        verifyTotalLeads = leads.length;
+        // Mirrors the enrol routes exactly — including their channel awareness, or this
+        // screen reports coverage over a different population again.
+        verifyChannels = requiredChannels(sequenceForVerify);
+        leads = leads.filter((l: any) => leadIsReachable(l, verifyChannels));
       } else if (req.params.sequenceId && req.params.sequenceId !== 'test') {
         // Verify against the sequence's enrolled leads
         const enrollments = await dripSequenceDb.listEnrollmentsForSequence(req.params.sequenceId);
@@ -585,6 +942,9 @@ router.post(
         variables,
         variableCoverage,
         leadCount: leads.length,
+        ...(verifyTotalLeads > leads.length
+          ? { totalLeads: verifyTotalLeads, [skipKeyForChannels(verifyChannels)]: verifyTotalLeads - leads.length }
+          : {}),
       });
     } catch (error) {
       console.error('[sequences] verify-variables error:', error);
@@ -685,7 +1045,8 @@ router.post('/load-from-url', authenticateToken, async (req: Request, res: Respo
 
     // Convert class-based CSS to inline styles now so the stored HTML is email-client-safe.
     // Doing this at import time avoids the LLM call at every test-send or real send.
-    const { html: inlinedContent } = await inlineEmailStyles(bodyContent);
+    // ENG-1961: the inlining LLM call is this user's import, not "system".
+    const { html: inlinedContent } = await inlineEmailStyles(bodyContent, { userId });
 
     return res.json({
       success: true,

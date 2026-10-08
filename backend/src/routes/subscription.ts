@@ -20,7 +20,7 @@ import {
 } from '../services/llmModelChangeService';
 import { resolveBillingUserId, toCustomerTokenUsage } from '../services/tokenUsageService';
 import { readBilledLedgerRows } from '../services/llmUsageLedgerReader';
-import { listLlmChargeEvents } from '../services/llmChargeAuditDb';
+import { readItemizationChargeEvents } from '../services/ledgerItemizationReader';
 import { reconcileItemizedUsage } from '../services/usageItemization';
 
 const router = express.Router();
@@ -307,7 +307,7 @@ router.get('/usage/itemized', authenticateToken, async (req, res) => {
     // historical window in place: both halves read data exactly as it already
     // exists, so no backfill is required.
     const [events, rows] = await Promise.all([
-      listLlmChargeEvents(billingUserId, `${month}-01`, `${month}-31`),
+      readItemizationChargeEvents(billingUserId, month),
       readBilledLedgerRows(billingUserId, `${month}-01`, `${month}-31`),
     ]);
     const { items, precision } = reconcileItemizedUsage(events, rows);

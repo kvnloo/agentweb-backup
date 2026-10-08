@@ -6,6 +6,9 @@ import path from "path";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken, getLandingPagesConfig } from "../utils/secretsManager";
 import { resolveLandingPageGa4 } from "../utils/landingPageGa4";
 import { injectGtmIntoLayoutFiles } from "../utils/gtmInjection";
+import { injectUtmDecorationIntoLayoutFiles, type LanderUtmLayers } from "../utils/landerUtmDecoration";
+import { getCustomerUtmDefault, getLanderUtmOverride } from "./landerUtmStore";
+import { isAutoSessionTrackingEnabled } from "../utils/sessionTrackingInjection";
 import { injectPixelIntoLayoutFiles, injectPixelIntoLayout, verifyPixelInjection } from "../utils/pixelInjection";
 import { injectGoogleAdsIntoLayoutFiles, injectGoogleAdsIntoLayout, verifyGoogleAdsInjection } from "../utils/googleAdsInjection";
 import { metaService } from "./metaService";
@@ -14,13 +17,20 @@ import { canEditItem } from "./orgShareService";
 import { addSubdomain, generateSubdomain, listDomains, SUBDOMAIN_BASE } from "./customDomainService";
 import { settingsService } from "./settingsService";
 import { paginatedQuery } from "../utils/dynamoPagination";
-import { guardedV0ChatCreate, guardedV0CorrectionMessage, clearV0UsageForPage, hashV0Prompt } from "./v0UsageGuard";
+import { guardedV0ChatCreate, guardedV0CorrectionMessage, guardedV0IterateMessage, clearV0UsageForPage, hashV0Prompt } from "./v0UsageGuard";
 import { meteredV0 } from "./v0Metering";
 // Type-only imports from durableLandingService live elsewhere; this constant import is
 // runtime-safe because durableLandingService only imports a TYPE from this module.
 import { STUCK_CEILING_MS } from "./durableLandingService";
 import { enqueueAutoHumanEval } from "./autoHumanEvalService";
+import { runLandingPagePageSpeedCheck } from "./landingPagePageSpeedCheck";
+import { landingPageSourceForJudge, type GeneratedFile } from "./landingPageJudgeSource";
 import { getPersistedBrandLogoUrl } from "./agentMode/brandLogo";
+import { getLandingPageLaunchReadiness } from "../utils/landingPageLaunchReadiness";
+// ENG-2087: syntax-only validation of generated modules (see findUnparseableModule).
+// Already a runtime dependency, not a devDependency.
+import * as ts from "typescript";
+export { getLandingPageLaunchReadiness } from "../utils/landingPageLaunchReadiness";
 
 // Note: global fetch (undici) timeouts are managed by httpClient.ts (15 min headersTimeout/bodyTimeout).
 // No setGlobalDispatcher call here — duplicate calls cause the last-loaded config to win unpredictably.
@@ -209,6 +219,58 @@ function startBuildHeartbeat(id: string): () => void {
 }
 
 /**
+ * ENG-2079: await a correction we are allowed to ship WITHOUT, and never let it fail the page.
+ *
+ * The enhancement corrections (Meta Pixel Lead event, Google Ads conversion, bridge-out
+ * redirect) each end in an explicit "still missing after retries — proceeding without it"
+ * fallback: a page that lacks them is degraded, not broken, and must still deploy. That
+ * fallback was unreachable whenever v0 answered the correction with no new version at all,
+ * because the failure happened at the AWAIT rather than at the check — waitForCompletedV0Version
+ * throws on deadline, and the outer catch marks the whole page `failed`.
+ *
+ * Observed live: a page whose form v0 could not attach a Lead event to (no lead-capture form
+ * on it) burned the full 34-attempt / ~17-minute budget and failed with "v0 is still generating
+ * or has stalled" — blaming v0 for a page that had already generated and validated fine.
+ *
+ * Returns the corrected version id, or undefined when no new version arrived. Undefined means
+ * "fall through and ship what we already validated"; the caller's existing `proceeding without
+ * it` path then runs unchanged. Deliberately NOT used for the validateV0Output correction,
+ * where un-correctable output genuinely must not ship.
+ */
+async function awaitOptionalV0Correction(
+  label: string,
+  wait: () => Promise<string | undefined>,
+  state?: { chatDead: boolean }
+): Promise<string | undefined> {
+  try {
+    return await wait();
+  } catch (err: any) {
+    // Never rethrow. The page's own output has already been downloaded and passed
+    // validateV0Output by this point; the only thing that failed is an OPTIONAL enhancement
+    // (a Lead event, a conversion call, a redirect). Rethrowing reaches the outer catch and
+    // marks the whole page `failed`, so the customer gets no page at all and the retry pays
+    // for a fresh generation — which is precisely the behaviour ENG-2079 was opened to stop.
+    //
+    // A dead-end failure (v0 marked the version failed) still matters, just not enough to
+    // discard a working page: it is reported so the remaining corrections skip rather than
+    // spend more billed messages on a chat that can never answer.
+    if (state && isDeadEndV0Failure(err)) {
+      state.chatDead = true;
+      console.error(
+        `[V0 SERVICE] ${label}: v0 reported a DEAD-END failure (${err?.message || err}). ` +
+          `Shipping the page and skipping the remaining corrections for this chat.`
+      );
+      return undefined;
+    }
+    console.warn(
+      `[V0 SERVICE] ${label}: no corrected version arrived (${err?.message || err}). ` +
+        `Shipping the page without this correction rather than failing it.`
+    );
+    return undefined;
+  }
+}
+
+/**
  * Poll a v0 chat until its latest version reaches a terminal state and return the
  * completed version id.
  *
@@ -310,6 +372,55 @@ async function waitForCompletedV0Version(
 }
 
 // Vercel deployment polling config
+// ENG-2078 follow-up: the capture-route gate must be bounded independently of
+// pollVercelDeployment, which is bounded by ATTEMPT COUNT (60 x 5s) and not by wall clock —
+// with axios timeouts a superseded commit that never gets its own deployment can hold the
+// gate far longer than the ~30-40s the gate is documented to cost.
+// Sized to pollVercelDeployment's OWN budget (vercelPollMaxAttempts x
+// vercelPollIntervalMs = 300s), deliberately, not to an optimistic guess at build time. A
+// cap below the real build time does not bound a wait — it re-opens the ENG-2078 race by
+// releasing the smoke test before the capture route is live, which is the bug this gate
+// exists to prevent. This is a backstop for the pathological case only: the poll is bounded
+// by ATTEMPT COUNT, so axios timeouts can stretch it far past its nominal 300s.
+let captureRouteGateMaxMsOverride: number | null = null;
+/**
+ * Derived, not frozen. This caps the POLL only — the settle runs after the race, not inside
+ * it, so budgeting for the settle here would buy nothing. pollVercelDeployment is bounded by
+ * ATTEMPT COUNT (vercelPollMaxAttempts x vercelPollIntervalMs) plus an axios round trip per
+ * attempt, so a literal equal to the nominal budget is always slightly short; the headroom
+ * covers those round trips. Recomputing it means setVercelPollConfig cannot silently
+ * falsify it. Worst case for the whole gate is this cap PLUS captureRouteSettleMs.
+ */
+export const captureRouteGateMaxMs = (): number =>
+  captureRouteGateMaxMsOverride ?? vercelPollMaxAttempts * vercelPollIntervalMs + 60_000;
+// And when the poll comes back anything other than READY-for-our-commit, the route is NOT
+// known to be live: Vercel auto-cancels a superseded deployment, and pollVercelDeployment
+// maps CANCELED to `error` and returns on its FIRST tick. Resolving there would reopen the
+// exact race ENG-2078 closed, so a non-ready outcome buys a bounded settle window instead.
+let captureRouteSettleMs = 45_000;
+
+/** Test hook: keeps the gate's waits out of unit-test wall-clock. */
+export function setCaptureRouteGateConfig(maxMs: number | null, settleMs: number): void {
+  // null clears the override so the derived value is used — without this a test can never
+  // observe the derivation, which is how the cap came to be a literal nobody checked.
+  captureRouteGateMaxMsOverride = maxMs;
+  captureRouteSettleMs = settleMs;
+}
+
+/**
+ * unref()'d on purpose: this timer must never be the reason the process stays alive. The
+ * module already sets that precedent twice — withTimeout clears and unrefs, and
+ * startBuildHeartbeat unrefs. Without it each sub-page add leaves a live 300s timer, which
+ * is benign on a long-lived server but leaks on shutdown and makes jest force-exit workers.
+ */
+const sleepMs = (ms: number): Promise<void> => {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    if (typeof timer.unref === "function") timer.unref();
+  });
+};
+
 let vercelPollIntervalMs = 5_000;
 let vercelPollMaxAttempts = 60;
 
@@ -420,6 +531,12 @@ export interface PendingIteration {
   baseVersionId: string;
   messageHash: string;
   startedAt: string;
+  /**
+   * ENG-1728: true only between the pre-send write and v0 accepting the message. Absent
+   * means the send is known to have reached v0 (including records written before this
+   * field existed, which were only ever written after the send).
+   */
+  unsent?: boolean;
 }
 
 export interface GeneratedLandingPage {
@@ -428,6 +545,17 @@ export interface GeneratedLandingPage {
   name: string;
   prompt: string;
   status: "generating" | "draft" | "deploying" | "deployed" | "failed";
+  /**
+   * Whether the domain this page is served from actually responds (ENG-1839). Written by the
+   * hourly reachability sweep and attached by the list route; never persisted on the page.
+   *
+   * `status` above describes the BUILD. A page can read "deployed" while its domain has no
+   * usable certificate and no browser can open it — which is exactly how three live customer
+   * pages went unnoticed.
+   */
+  domainStatus?: "active" | "pending_verification" | "error";
+  domainHost?: string;
+  domainErrorMessage?: string;
   pendingIteration?: PendingIteration;
   v0ProjectId?: string;
   v0ChatId?: string;
@@ -538,6 +666,18 @@ export interface GeneratedLandingPage {
    */
   googleAdsTrackingInstalled?: boolean;
   /**
+   * ENG-2327: the `listType:'session'` list the AgentWeb SDK tag on this page writes visitor
+   * sessions into. Site-level in effect, like gtmContainerId: the tag lives in the shared root
+   * layout, so every page of one repo carries the same id (kept in sync across siblings).
+   * Written ONLY by sessionTrackingService; set once the list exists, even if the tag commit
+   * failed, so a retry reuses the list instead of creating a second one.
+   */
+  sessionTrackingListId?: string;
+  /** True once the SDK tag is committed to the repo's main branch (false/absent = not installed). */
+  sessionTrackingInstalled?: boolean;
+  /** Last enablement failure, for the portal/Emma to surface; cleared by the next success. */
+  sessionTrackingError?: string;
+  /**
    * Per-page (not site-level) — whether the generated form component was confirmed,
    * via the validation-retry check, to actually call fbq('track','Lead') on submit. v0 authors
    * the form freeform, so unlike layout-level injection this can only be checked, not guaranteed.
@@ -562,8 +702,9 @@ export interface GeneratedLandingPage {
   /**
    * ENG-449 gap #3: result of the automated post-deploy Playwright smoke test
    * (loads the live page, submits the lead form for real, confirms the lead lands in
-   * the CRM and — if a pixel is configured — that a real facebook.com/tr request
-   * fired). Unlike pixelLeadEventVerified/bridgeOutVerified (static code checks at
+   * the CRM and — if a pixel is configured — that the page's JS calls
+   * fbq('track','Lead',...) on submit; the real beacon is blocked, so this is a
+   * JS-call check, not a network sniff). Unlike pixelLeadEventVerified/bridgeOutVerified (static code checks at
    * generation time), this verifies the actually-deployed, actually-live page.
    * Written by runGenerationSmokeTest (landingPageSmokeTest.ts), fire-and-forget
    * after deploy — absent until that first run completes.
@@ -574,7 +715,53 @@ export interface GeneratedLandingPage {
     pixelFired?: boolean;
     checkedAt: string;
     error?: string;
+    /**
+     * ENG-2081: why the submit produced no lead, persisted rather than left only in the
+     * Slack alert text. `ok:false, leadCaptured:false` alone cannot distinguish "this page
+     * has no lead form at all" (nothing to fix in capture — the PAGE is the problem) from
+     * "a form submitted and the row never landed" (a real capture/CRM problem). Those need
+     * opposite responses, and the alert that carried the difference is ephemeral.
+     */
+    noFormOnPage?: boolean;
+    authFormOnly?: boolean;
+    iframeCount?: number;
+    /** ENG-449: handoff id extracted from a cross-origin chat-handoff redirect
+     * (chat.waterheater.app/text?handoff_id=...) accepted in place of a CRM row.
+     * Persisted so the handoff can be verified against the chat/handoff backend. */
+    handoffId?: string;
+    /**
+     * ENG-2193: did the synthetic UTM params this run appended to the navigation URL make it
+     * onto the resulting lead's own attribution fields? Set only when the check actually ran
+     * (an email-keyed lead landed); absent — not `false` — on a phone-only lander, a page with
+     * no lead at all, or when the run predates this check. Advisory: never affects `ok`.
+     */
+    utmPropagated?: boolean;
+    utmPropagationDetail?: string;
   };
+  /**
+   * ENG-2193: PageSpeed Insights (Lighthouse) performance/accessibility check on the deployed
+   * page. Same fire-and-forget contract as `smokeTestResult` — written by
+   * `runLandingPagePageSpeedCheck` (`landingPagePageSpeedCheck.ts`) after deploy, absent until
+   * that first run completes. Advisory only; nothing reads this to gate anything.
+   */
+  pageSpeedResult?: {
+    ok: boolean;
+    performanceScore?: number;
+    accessibilityScore?: number;
+    checkedAt: string;
+    error?: string;
+  };
+  /**
+   * ENG-1238: externally-deployed/imported page marker. Records registered via
+   * the admin external-import route carry sourceType 'external' + canonicalUrl
+   * + repo/project ref + leadListId and are otherwise plain AW-LandingPages rows,
+   * so the owner-scoped list route already surfaces them; build/deploy/poller/
+   * janitor paths never match them (no siteId/v0/vercel fields set).
+   */
+  sourceType?: "external";
+  canonicalUrl?: string;
+  repoRef?: string;
+  projectRef?: string;
   context?: string;
   /**
    * State captured at the most recent publish, used to revert it. The pre-merge
@@ -650,7 +837,16 @@ export async function resolveLandingPageLiveUrl(
     const domains = await listDomains(page.userId, page.vercelProjectId);
     if (domains.length === 0) return fallback;
 
-    const rank = (d: { type: string }) => (d.type === "custom" ? 1 : 0);
+    // Same three tiers as the list route's `bestByOwnerProject` (ENG-1839). This function is
+    // the sibling read path — it feeds `live_url` on publish/edit and the "Your site at … will
+    // update shortly" message — so a status-blind ranking here reported a `pending_verification`
+    // host with no DNS as the live URL even after the list route was corrected. The doc comment
+    // above has always promised a VERIFIED custom domain; this is the first version that
+    // delivers one.
+    const rank = (d: { type: string; status?: string }) => {
+      if (d.type === "custom") return d.status === "active" ? 2 : 0;
+      return 1; // managed subdomain — addSubdomain writes these active unconditionally
+    };
     let best = domains[0];
     for (const d of domains) {
       if (
@@ -660,6 +856,14 @@ export async function resolveLandingPageLiveUrl(
         best = d;
       }
     }
+
+    /*
+     * `rank` is a comparator, not a filter — the seed above is unconditional, so rank 0 means
+     * "loses a comparison", never "is rejected". A project whose ONLY attached row is an
+     * unverified custom domain has nothing to lose to, so it would be adopted and reported as
+     * the live URL despite having no DNS. Reject it explicitly and keep the stored value.
+     */
+    if (rank(best) === 0) return fallback;
 
     const targetUrl = page.slug
       ? `https://${best.domain}/${page.slug}`
@@ -1465,8 +1669,8 @@ async function generateFirstPage(
       // (3–15 min in prod), guaranteeing a loss against the 300s attempt timeout and
       // minting an orphan, credit-burning chat on every "timeout". Async returns the
       // chatId in seconds; waitForCompletedV0Version absorbs the generation time. (ENG-287)
-      create: () => withRetry(
-        meteredV0({ userId, operation: "chat_create" }, () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" })),
+      create: (meteringKey) => withRetry(
+        meteredV0({ userId, operation: "chat_create", idempotencyKey: meteringKey }, () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" })),
         "v0 chat creation",
         // Interactive path: fail fast on a timeout instead of re-burning 3 × 300s
         // ≈ 15 min. 5xx/network still retry. The guard makes the user's retry clean. (ENG-287)
@@ -1851,8 +2055,8 @@ async function addPageToExistingRepo(
       prompt: enrichedPrompt,
       // responseMode async — see the first-page call site for why sync mode cannot
       // survive the 300s attempt timeout. (ENG-287)
-      create: () => withRetry(
-        meteredV0({ userId, operation: "chat_create" }, () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" })),
+      create: (meteringKey) => withRetry(
+        meteredV0({ userId, operation: "chat_create", idempotencyKey: meteringKey }, () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" })),
         "v0 chat creation (additional page)",
         // Interactive path: fail fast on a timeout instead of re-burning 3 × 300s
         // ≈ 15 min. 5xx/network still retry. The guard makes the user's retry clean. (ENG-287)
@@ -1937,152 +2141,144 @@ async function addPageToExistingRepo(
 
       try {
         validateV0Output(previewFiles);
+        
+        // ENG-2080: the enhancement corrections below all ask v0 to fix "the lead capture
+        // form". On a page that has none, that request can never be satisfied, v0 returns no
+        // new version, and each correction burns its full ~17-minute wait for nothing. Skip
+        // them and fall straight to the existing "proceeding without it" reporting.
+        const correctionState = { chatDead: false };
+        const shippedHasCaptureForm = hasLeadCaptureForm(remapFilesForSubPage(previewFiles, slug, name));
 
-        // Same verify-and-retry as deployLandingPage — a sub-page has its OWN form
-        // component, so the Lead event must be checked here too, not just on the first page.
-        if (effectivePixelId) {
-          // ENG-482: validate against the file set that ACTUALLY ships (post-remap), not
-          // previewFiles (v0's raw, unfiltered zip). remapFilesForSubPage's skip-list drops
-          // files like app/layout.tsx — v0's own scaffold layout.tsx can independently
-          // contain something matching the fbq('track','Lead') regex, which used to make
-          // this check pass against code that never reaches the deployed site at all.
-          const pixelCheck = validatePixelLeadEvent(remapFilesForSubPage(previewFiles, slug, name));
-          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
-            console.warn(`[V0 SERVICE] Meta Pixel Lead event missing for /${slug} (attempt ${validationAttempt + 1}): ${pixelCheck.reason}`);
+        // ENG-2082: the most basic completeness check of all, and the one that was missing.
+        // /api/capture rejects a submission carrying neither an email nor a phone (webhooks.ts returns
+        // 400 "Email or phone is required" before a lead row is ever built), so a form collecting
+        // only, say, a phone number is structurally incapable of producing a lead — and the
+        // generator will build one whenever asked. Reported loudly here rather than corrected:
+        // making v0 add a field the user did not ask for is a product decision, and the
+        // correction round-trip needs fixture work across this suite. Tracked on ENG-2082.
+        if (shippedHasCaptureForm) {
+          const contactCheck = validateCaptureFormHasContactField(remapFilesForSubPage(previewFiles, slug, name));
+          if (!contactCheck.ok) {
+            console.error(
+              `[V0 SERVICE] ENG-2082: capture form for /${slug} collects NO email and NO phone — ` +
+                `every submission will be rejected and this page will capture zero leads: ${contactCheck.reason}`
+            );
+          }
+        }
 
-            await guardedV0CorrectionMessage({
-              userId,
-              scopeId: existingPage.siteId ?? existingPage.id,
-              chatId,
-              attempt: validationAttempt,
-              send: () => withRetry(
-                meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
-                  chatId,
-                  message:
-                    "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
-                    "generate `const eventId = crypto.randomUUID();`, include it as an \"eventId\" field in the " +
-                    "fetch('/api/capture', ...) JSON body, and on a successful response call " +
-                    "`window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });`. " +
-                    `Issue: ${pixelCheck.reason}`,
-                })),
-                "v0 correction message (pixel lead event, additional page)",
-                undefined, undefined, undefined,
-                { retryOnTimeout: false }
-              ),
-            });
+        // ENG-2099: all three enhancement checks run up front, and whichever ones still
+        // fail are batched into ONE v0 message + ONE wait this attempt, instead of each
+        // check sending its own correction and `continue`-ing on success. The old
+        // per-check continue consumed a whole loop iteration each — on a page needing
+        // all three, bridge-out's own guard (validationAttempt < V0_VALIDATION_MAX_RETRIES)
+        // was already false by the time pixel and ads had each taken a turn, so it was
+        // structurally unreachable, not merely unlucky (ENG-2099). Batching means no
+        // correction can consume another's turn: every configured one is evaluated, and
+        // gets a correction attempt, every round.
+        //
+        // Same file-set rationale as before (ENG-482): validate against what ACTUALLY
+        // ships (post-remap), not previewFiles (v0's raw zip, whose scaffold layout.tsx
+        // can independently satisfy an inline-pattern check against code the site never
+        // serves).
+        const pixelCheck = effectivePixelId
+          ? validatePixelLeadEvent(remapFilesForSubPage(previewFiles, slug, name))
+          : undefined;
+        const adsCheck = subPageGoogleAds
+          ? validateGoogleAdsConversion(remapFilesForSubPage(previewFiles, slug, name))
+          : undefined;
+        const bridgeCheck = (leadListId && bridgeOutUrl)
+          ? validateBridgeOutRedirect(remapFilesForSubPage(previewFiles, slug, name), bridgeOutUrl)
+          : undefined;
 
-            versionId = await waitForCompletedV0Version(
-              v0,
-              chatId,
-              `v0 correction (pixel lead event) for /${slug}`,
-              {
+        const canCorrectThisAttempt =
+          validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead;
+        const needsPixelCorrection = !!pixelCheck && !pixelCheck.ok && canCorrectThisAttempt;
+        const needsAdsCorrection = !!adsCheck && !adsCheck.ok && canCorrectThisAttempt;
+        const needsBridgeCorrection = !!bridgeCheck && !bridgeCheck.ok && canCorrectThisAttempt;
+
+        if (needsPixelCorrection || needsAdsCorrection || needsBridgeCorrection) {
+          const messageParts: string[] = [];
+          const labelParts: string[] = [];
+          if (needsPixelCorrection) {
+            console.warn(`[V0 SERVICE] Meta Pixel Lead event missing for /${slug} (attempt ${validationAttempt + 1}): ${pixelCheck!.reason}`);
+            messageParts.push(
+              "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
+              "generate `const eventId = crypto.randomUUID();`, include it as an \"eventId\" field in the " +
+              "fetch('/api/capture', ...) JSON body, and on a successful response call " +
+              "`window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });`. " +
+              `Issue: ${pixelCheck!.reason}`
+            );
+            labelParts.push("pixel lead event");
+          }
+          if (needsAdsCorrection) {
+            console.warn(`[V0 SERVICE] Google Ads conversion call missing for /${slug} (attempt ${validationAttempt + 1}): ${adsCheck!.reason}`);
+            messageParts.push(
+              "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
+              "ON A SUCCESSFUL submission response only, call the platform-owned helper with the googleAds " +
+              "argument included: `await fireLeadTracking({ email, eventId, googleAds })`. Do NOT hand-author " +
+              "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
+              "shared root layout. " +
+              `Issue: ${adsCheck!.reason}`
+            );
+            labelParts.push("google ads conversion");
+          }
+          if (needsBridgeCorrection) {
+            console.warn(`[V0 SERVICE] Bridge-out redirect missing for /${slug} (attempt ${validationAttempt + 1}): ${bridgeCheck!.reason}`);
+            messageParts.push(
+              "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
+              `redirect the visitor via window.location.href to ${bridgeOutUrl} with the submitted email ` +
+              "appended as an email= query param (URL-encoded). " +
+              `Issue: ${bridgeCheck!.reason}`
+            );
+            labelParts.push("bridge-out redirect");
+          }
+          const correctionLabel = labelParts.join(", ");
+
+          await guardedV0CorrectionMessage({
+            userId,
+            scopeId: existingPage.siteId ?? existingPage.id,
+            chatId,
+            attempt: validationAttempt,
+            send: (meteringKey) => withRetry(
+              meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
+                chatId,
+                message: messageParts.join("\n\n"),
+              })),
+              `v0 correction message (${correctionLabel}, additional page)`,
+              undefined, undefined, undefined,
+              { retryOnTimeout: false }
+            ),
+          });
+
+          const correctedVersionId = await awaitOptionalV0Correction(
+            `v0 correction (${correctionLabel}) for /${slug}`,
+            () =>
+              waitForCompletedV0Version(v0, chatId, `v0 correction (${correctionLabel}) for /${slug}`, {
                 heartbeat: () => touchLandingPageRecord(id),
                 deadline: buildDeadline,
                 afterVersionId: versionId,
-              }
-            );
-
+              }),
+            correctionState
+          );
+          // undefined = v0 never produced a corrected version for any of the batched
+          // corrections. Fall through to the per-check `proceeding without it` reporting
+          // below instead of failing the whole page.
+          if (correctedVersionId) {
+            versionId = correctedVersionId;
             continue;
           }
+        }
+
+        if (pixelCheck) {
           pixelLeadEventVerified = pixelCheck.ok;
           if (!pixelCheck.ok) {
             console.warn(`[V0 SERVICE] Meta Pixel Lead event still missing for /${slug} after retries — proceeding without it: ${pixelCheck.reason}`);
           }
         }
-
-        // ENG-1524. Sibling of the deployLandingPage check, and it has to exist in BOTH
-        // places for the same reason the pixel check does: a sub-page has its own form
-        // component, and `subPageGoogleAds` above inherits the site's conversion pair, so
-        // the generated handler is expected to fire it. Adding this on one branch only is
-        // how the original gap happened.
-        //
-        // Post-remap file set (ENG-482), like the pixel check: previewFiles is v0's raw
-        // zip, and its scaffold layout.tsx can carry a gtag conversion that never ships —
-        // which would satisfy the inline-pattern arm against code the site never sees.
-        if (subPageGoogleAds) {
-          const adsCheck = validateGoogleAdsConversion(remapFilesForSubPage(previewFiles, slug, name));
-          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
-            console.warn(`[V0 SERVICE] Google Ads conversion call missing for /${slug} (attempt ${validationAttempt + 1}): ${adsCheck.reason}`);
-
-            await guardedV0CorrectionMessage({
-              userId,
-              scopeId: existingPage.siteId ?? existingPage.id,
-              chatId: chatId!,
-              attempt: validationAttempt,
-              send: () => withRetry(
-                meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
-                  chatId: chatId!,
-                  message:
-                    "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
-                    "ON A SUCCESSFUL submission response only, call the platform-owned helper with the googleAds " +
-                    "argument included: `await fireLeadTracking({ email, eventId, googleAds })`. Do NOT hand-author " +
-                    "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
-                    "shared root layout. " +
-                    `Issue: ${adsCheck.reason}`,
-                })),
-                "v0 correction message (google ads conversion, sub-page)",
-                undefined, undefined, undefined,
-                { retryOnTimeout: false }
-              ),
-            });
-
-            versionId = await waitForCompletedV0Version(
-              v0,
-              chatId!,
-              "v0 correction (google ads conversion, sub-page)",
-              {
-                heartbeat: () => touchLandingPageRecord(id),
-                deadline: buildDeadline,
-                afterVersionId: versionId,
-              }
-            );
-
-            continue;
-          }
-          if (!adsCheck.ok) {
-            console.warn(`[V0 SERVICE] Google Ads conversion call still missing for /${slug} after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
-          }
+        if (adsCheck && !adsCheck.ok) {
+          console.warn(`[V0 SERVICE] Google Ads conversion call still missing for /${slug} after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
         }
-
-        if (leadListId && bridgeOutUrl) {
-          // Same post-remap file set rationale as the pixel check above (ENG-482).
-          const bridgeCheck = validateBridgeOutRedirect(remapFilesForSubPage(previewFiles, slug, name), bridgeOutUrl);
-          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
-            console.warn(`[V0 SERVICE] Bridge-out redirect missing for /${slug} (attempt ${validationAttempt + 1}): ${bridgeCheck.reason}`);
-
-            await guardedV0CorrectionMessage({
-              userId,
-              scopeId: existingPage.siteId ?? existingPage.id,
-              chatId,
-              attempt: validationAttempt,
-              send: () => withRetry(
-                meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
-                  chatId,
-                  message:
-                    "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
-                    `redirect the visitor via window.location.href to ${bridgeOutUrl} with the submitted email ` +
-                    "appended as an email= query param (URL-encoded). " +
-                    `Issue: ${bridgeCheck.reason}`,
-                })),
-                "v0 correction message (bridge-out redirect, additional page)",
-                undefined, undefined, undefined,
-                { retryOnTimeout: false }
-              ),
-            });
-
-            versionId = await waitForCompletedV0Version(
-              v0,
-              chatId,
-              `v0 correction (bridge-out redirect) for /${slug}`,
-              {
-                heartbeat: () => touchLandingPageRecord(id),
-                deadline: buildDeadline,
-                afterVersionId: versionId,
-              }
-            );
-
-            continue;
-          }
+        if (bridgeCheck) {
           bridgeOutVerified = bridgeCheck.ok;
           if (!bridgeCheck.ok) {
             console.warn(`[V0 SERVICE] Bridge-out redirect still missing for /${slug} after retries — proceeding without it: ${bridgeCheck.reason}`);
@@ -2103,8 +2299,8 @@ async function addPageToExistingRepo(
             // the SAME version and re-downloaded the SAME broken zip — a 3-attempt self-heal
             // that was really 1. (ENG-287 residual)
             attempt: validationAttempt,
-            send: () => withRetry(
-              meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
+            send: (meteringKey) => withRetry(
+              meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
                 chatId,
                 message:
                   "The previous output was not valid code. Please generate actual React/Next.js code — " +
@@ -2462,6 +2658,16 @@ async function addPageToExistingRepo(
     // lookup or GitHub sync fails must still keep its just-deployed page. Reuses the
     // exact ENG-310 mechanism (`syncLeadCaptureForPage` in routes/landingPageGeneration.ts)
     // which does this same thing when a lead list is attached after the fact.
+    //
+    // ENG-449: the smoke test dispatched at the end of this function submits this page's
+    // OWN form, and that form cannot capture until the sync commit pushed below has
+    // actually BUILT — the new page's path only enters the deployed LIST_BY_PATH in that
+    // second build. Gating the (already-detached) smoke dispatch on this promise is what
+    // stops every newly-added sub-page from reporting a false `ok: false`. Resolves as
+    // soon as the build outcome is known (ready, error, timeout or superseded) and never
+    // rejects, so a sync that fails or never commits leaves the smoke test running exactly
+    // as it did before.
+    let captureRouteBuild: Promise<void> = Promise.resolve();
     try {
       // ENG-485: re-derived FRESH by syncLeadCaptureFilesToRepo on every retry attempt, not
       // just once here — see that function's own doc comment on why a static snapshot isn't
@@ -2492,21 +2698,46 @@ async function addPageToExistingRepo(
         pixelOverrideAbandoned ? existingPage.metaPixelId : effectivePixelId,
         pixelOverrideAbandoned ? existingPage.metaAdAccountId : effectiveMetaAccountId,
       );
-      if (!syncResult.committed && syncResult.reason !== "up-to-date") {
+      // syncLeadCaptureFilesToRepo documents captureRouteSkipped as mandatory reading: it
+      // means the deployed LIST_BY_PATH could not be parsed, so route.ts was left out of the
+      // commit and neither `committed` nor `up-to-date` implies this page's path is in the
+      // deployed route. Surfaced here rather than discarded, because the gate below would
+      // otherwise poll a commit that never contained the route and log a clean sync.
+      if (syncResult.captureRouteSkipped) {
+        console.error(
+          `[V0 SERVICE] ENG-483: capture route was NOT written for /${slug} in ${repoFullName} ` +
+            `(its deployed LIST_BY_PATH could not be parsed). This page's path is not in the ` +
+            `live route, so its form will 422 until the route is repaired by hand.`
+        );
+      }
+      if (!syncResult.committed && syncResult.reason === "up-to-date") {
+        // "up-to-date" means OUR commit added nothing — almost always because a concurrent
+        // sibling add already wrote the identical map moments ago. That proves the map is in
+        // the repo, NOT that it is deployed: the sibling's build is typically still running.
+        // Treating it as proven-live is how the concurrent sub-page add — the case ENG-483
+        // exists for — still produced a false `ok: false`. There is no commit of our own to
+        // poll, so buy the same bounded settle window a non-success poll outcome gets.
+        captureRouteBuild = sleepMs(captureRouteSettleMs);
+      } else if (!syncResult.committed) {
         console.warn(
           `[V0 SERVICE] ENG-483: lead-capture route sync did not commit for new page /${slug}: ${syncResult.reason}`
         );
       } else if (syncResult.committed && syncResult.pushedCommitSha) {
-        // Fire-and-forget: never block returning this page as deployed on a SECOND
-        // Vercel build. A concurrent sub-page add is the common case ENG-483 exists
-        // for, and it routinely supersedes this exact commit before Vercel ever
-        // finishes building it — awaiting this poll here would hang every bulk/rapid
-        // page add for up to the full poll window (production: up to 5 minutes) for a
-        // build result that, in the common case, will never resolve to this commit at
-        // all. Visibility only: the page's OWN content already deployed successfully
-        // above, so nothing here can change this page's outcome, only get logged.
+        // Still never blocks returning this page as deployed on a SECOND Vercel build.
+        // A concurrent sub-page add is the common case ENG-483 exists for, and it
+        // routinely supersedes this exact commit before Vercel ever finishes building it —
+        // awaiting this poll HERE would hang every bulk/rapid page add for up to the full
+        // poll window (production: up to 5 minutes) for a build result that, in the common
+        // case, will never resolve to this commit at all. So the result is still not
+        // awaited on the request path; the page's OWN content already deployed above and
+        // nothing here can change this page's outcome.
+        //
+        // ENG-449: the promise is now RETAINED rather than dropped, so the detached smoke
+        // dispatch below can await it. That costs the request nothing (it is already off
+        // the response path) and is the whole fix: submitting the form before this build
+        // lands means submitting to a route that does not yet know this page's path.
         const { pushedCommitSha, pushTimestampMs } = syncResult;
-        void pollVercelDeployment(existingPage.vercelProjectId!, vercelToken, pushTimestampMs, pushedCommitSha)
+        const syncBuildPoll = pollVercelDeployment(existingPage.vercelProjectId!, vercelToken, pushTimestampMs, pushedCommitSha)
           .then((syncDeployResult) => {
             if (syncDeployResult.buildStatus === "error") {
               console.error(
@@ -2522,13 +2753,34 @@ async function addPageToExistingRepo(
                   `likely just slow, or superseded by a newer concurrent commit; not treated as a failure.`
               );
             }
+            return syncDeployResult.buildStatus;
           })
           .catch((pollErr: any) => {
             console.error(
               `[V0 SERVICE] ENG-483: capture-route sync build poll itself failed for ${repoFullName}:`,
               pollErr?.message || pollErr
             );
+            return undefined;
           });
+
+        // The cap bounds the POLL, not the gate as a whole. Racing the whole chain meant the
+        // cap could swallow the settle that follows it: pollVercelDeployment is bounded by
+        // attempt count, and each attempt can burn VERCEL_POLL_TIMEOUT_MS on a hung request,
+        // so a handful of slow polls pushed the chain past the cap and the settle — the
+        // thing the cap was raised to make room for — never ran.
+        //
+        // Only a `success` for THIS commit proves the route carries this page's path.
+        // Anything else — ERROR, CANCELED (auto-cancel on supersession, returned on the
+        // first tick), the attempt budget running out, or the cap expiring with no answer —
+        // means we do not know, and proceeding immediately is how the original race behaved.
+        // So the settle runs on every one of those, and the smoke test runs after it either
+        // way: a late check is recoverable, a false `ok: false` on every page is not.
+        captureRouteBuild = Promise.race([
+          syncBuildPoll,
+          sleepMs(captureRouteGateMaxMs()).then(() => undefined),
+        ]).then((buildStatus) =>
+          buildStatus === "success" ? undefined : sleepMs(captureRouteSettleMs)
+        );
       }
     } catch (syncErr: any) {
       console.error(
@@ -2566,12 +2818,35 @@ async function addPageToExistingRepo(
       })
       .promise();
 
-    void enqueueLandingPageHumanEval(deployedSubPage);
+    // ENG-2327: the session tag lives in the shared root layout, so a sub-page of a tracked site inherits the
+    // site's list with no repo work. Flag-gated and never throws (see the same call in deployLandingPage).
+    if (isAutoSessionTrackingEnabled()) {
+      try {
+        const tracking = await import("./sessionTrackingService").then((m) => m.autoEnableSessionTracking(deployedSubPage, existingPage));
+        if (tracking) {
+          deployedSubPage.sessionTrackingListId = tracking.listId;
+          deployedSubPage.sessionTrackingInstalled = tracking.installed;
+        }
+      } catch (trackingErr: any) {
+        console.warn(`[V0 SERVICE] Session tracking inheritance could not run (generation unaffected): ${trackingErr?.message}`);
+      }
+    }
+
+    void enqueueLandingPageHumanEval(deployedSubPage, async () => allFiles);
     // Dynamic import: landingPageSmokeTest.ts imports FROM this module (GeneratedLandingPage,
     // updateLandingPageSmokeTestResult), so a static import here would be circular.
     void import("./landingPageSmokeTest")
-      .then((m) => m.runGenerationSmokeTest(deployedSubPage))
+      .then(async (m) => {
+        // ENG-449: wait for the capture-route sync build (above) before submitting this
+        // page's form. Without this the smoke test races that build and every newly-added
+        // sub-page reports a false `ok: false` — the submit 422s because the deployed
+        // route has no entry for this page's path yet. Already resolved when no sync was
+        // needed, and never rejects, so the no-sync path is unchanged.
+        await captureRouteBuild;
+        return m.runGenerationSmokeTest(deployedSubPage);
+      })
       .catch((err) => console.warn(`[V0 SERVICE] Smoke test dispatch failed: ${err?.message}`));
+    dispatchLandingPagePageSpeedCheck(deployedSubPage.id, deployedSubPage.deployedUrl);
 
     return deployedSubPage;
   } catch (error: any) {
@@ -3020,7 +3295,7 @@ export async function deployLandingPage(
       ? ["generating", "draft", "failed", "deploying"]
       : ["draft", "failed", "deploying"];
   if (!deployableStatuses.includes(record.status)) {
-    throw new Error(`Cannot deploy a landing page with status: ${record.status}`);
+    throw new LandingPageNotDeployableError(record.status);
   }
 
   // Sub-pages (those with a slug) are always added to the existing repo — they must
@@ -3086,146 +3361,140 @@ export async function deployLandingPage(
 
       try {
         validateV0Output(previewFiles);
+        
+        // ENG-2080: the enhancement corrections below all ask v0 to fix "the lead capture
+        // form". On a page that has none, that request can never be satisfied, v0 returns no
+        // new version, and each correction burns its full ~17-minute wait for nothing. Skip
+        // them and fall straight to the existing "proceeding without it" reporting.
+        const correctionState = { chatDead: false };
+        const shippedHasCaptureForm = hasLeadCaptureForm(previewFiles);
+
+        // ENG-2082: the most basic completeness check of all, and the one that was missing.
+        // /api/capture rejects a submission carrying neither an email nor a phone (webhooks.ts returns
+        // 400 "Email or phone is required" before a lead row is ever built), so a form collecting
+        // only, say, a phone number is structurally incapable of producing a lead — and the
+        // generator will build one whenever asked. Reported loudly here rather than corrected:
+        // making v0 add a field the user did not ask for is a product decision, and the
+        // correction round-trip needs fixture work across this suite. Tracked on ENG-2082.
+        if (shippedHasCaptureForm) {
+          const contactCheck = validateCaptureFormHasContactField(previewFiles);
+          if (!contactCheck.ok) {
+            console.error(
+              `[V0 SERVICE] ENG-2082: capture form for the root page collects NO email and NO phone — ` +
+                `every submission will be rejected and this page will capture zero leads: ${contactCheck.reason}`
+            );
+          }
+        }
 
         // v0 authors the form component freeform — there's no platform-owned seam
         // to guarantee the Lead event the way layout.tsx injection guarantees the base pixel.
         // Verify it, and retry (same correction-message mechanism as validateV0Output) if
         // missing. Exhausted retries must NOT fail generation — just record the miss.
-        if (record.metaPixelId) {
-          const pixelCheck = validatePixelLeadEvent(previewFiles);
-          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
-            console.warn(`[V0 SERVICE] Meta Pixel Lead event missing (attempt ${validationAttempt + 1}): ${pixelCheck.reason}`);
+        // ENG-2099: all three enhancement checks run up front, and whichever ones still
+        // fail are batched into ONE v0 message + ONE wait this attempt — see the matching
+        // comment in addPageToExistingRepo (sub-page path) for why the old per-check
+        // continue made bridge-out structurally unreachable whenever pixel and ads both
+        // needed a correction.
+        const pixelCheck = record.metaPixelId ? validatePixelLeadEvent(previewFiles) : undefined;
+        const adsCheck = (record.googleAdsConversionId && record.googleAdsConversionLabel)
+          ? validateGoogleAdsConversion(previewFiles)
+          : undefined;
+        const bridgeCheck = (record.leadListId && record.bridgeOutUrl)
+          ? validateBridgeOutRedirect(previewFiles, record.bridgeOutUrl)
+          : undefined;
 
-            await guardedV0CorrectionMessage({
-              userId,
-              scopeId: record.siteId ?? record.id,
-              chatId: record.v0ChatId!,
-              attempt: validationAttempt,
-              send: () => withRetry(
-                meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
-                  chatId: record.v0ChatId!,
-                  message:
-                    "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
-                    "generate `const eventId = crypto.randomUUID();`, include it as an \"eventId\" field in the " +
-                    "fetch('/api/capture', ...) JSON body, and on a successful response call " +
-                    "`window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });`. " +
-                    `Issue: ${pixelCheck.reason}`,
-                })),
-                "v0 correction message (pixel lead event)",
-                undefined, undefined, undefined,
-                { retryOnTimeout: false }
-              ),
-            });
+        const canCorrectThisAttempt =
+          validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead;
+        const needsPixelCorrection = !!pixelCheck && !pixelCheck.ok && canCorrectThisAttempt;
+        const needsAdsCorrection = !!adsCheck && !adsCheck.ok && canCorrectThisAttempt;
+        const needsBridgeCorrection = !!bridgeCheck && !bridgeCheck.ok && canCorrectThisAttempt;
 
-            versionId = await waitForCompletedV0Version(
-              v0,
-              record.v0ChatId!,
-              "v0 correction (pixel lead event)",
-              {
+        if (needsPixelCorrection || needsAdsCorrection || needsBridgeCorrection) {
+          const messageParts: string[] = [];
+          const labelParts: string[] = [];
+          if (needsPixelCorrection) {
+            console.warn(`[V0 SERVICE] Meta Pixel Lead event missing (attempt ${validationAttempt + 1}): ${pixelCheck!.reason}`);
+            messageParts.push(
+              "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
+              "generate `const eventId = crypto.randomUUID();`, include it as an \"eventId\" field in the " +
+              "fetch('/api/capture', ...) JSON body, and on a successful response call " +
+              "`window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });`. " +
+              `Issue: ${pixelCheck!.reason}`
+            );
+            labelParts.push("pixel lead event");
+          }
+          if (needsAdsCorrection) {
+            console.warn(`[V0 SERVICE] Google Ads conversion call missing (attempt ${validationAttempt + 1}): ${adsCheck!.reason}`);
+            messageParts.push(
+              "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
+              "ON A SUCCESSFUL submission response only, call the platform-owned helper with the googleAds " +
+              "argument included: `await fireLeadTracking({ email, eventId, googleAds })`. Do NOT hand-author " +
+              "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
+              "root layout. " +
+              `Issue: ${adsCheck!.reason}`
+            );
+            labelParts.push("google ads conversion");
+          }
+          if (needsBridgeCorrection) {
+            console.warn(`[V0 SERVICE] Bridge-out redirect missing (attempt ${validationAttempt + 1}): ${bridgeCheck!.reason}`);
+            messageParts.push(
+              "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
+              `redirect the visitor via window.location.href to ${record.bridgeOutUrl} with the submitted email ` +
+              "appended as an email= query param (URL-encoded). " +
+              `Issue: ${bridgeCheck!.reason}`
+            );
+            labelParts.push("bridge-out redirect");
+          }
+          const correctionLabel = labelParts.join(", ");
+
+          await guardedV0CorrectionMessage({
+            userId,
+            scopeId: record.siteId ?? record.id,
+            chatId: record.v0ChatId!,
+            attempt: validationAttempt,
+            send: (meteringKey) => withRetry(
+              meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
+                chatId: record.v0ChatId!,
+                message: messageParts.join("\n\n"),
+              })),
+              `v0 correction message (${correctionLabel})`,
+              undefined, undefined, undefined,
+              { retryOnTimeout: false }
+            ),
+          });
+
+          const correctedVersionId = await awaitOptionalV0Correction(
+            `v0 correction (${correctionLabel})`,
+            () =>
+              waitForCompletedV0Version(v0, record.v0ChatId!, `v0 correction (${correctionLabel})`, {
                 heartbeat: () => touchLandingPageRecord(id),
                 deadline: buildDeadline,
                 afterVersionId: versionId,
-              }
-            );
-
+              }),
+            correctionState
+          );
+          // undefined = v0 never produced a corrected version for any of the batched
+          // corrections. Fall through to the per-check `proceeding without it` reporting
+          // below instead of failing the whole page.
+          if (correctedVersionId) {
+            versionId = correctedVersionId;
             continue;
           }
+        }
+
+        if (pixelCheck) {
           pixelLeadEventVerified = pixelCheck.ok;
           if (!pixelCheck.ok) {
             console.warn(`[V0 SERVICE] Meta Pixel Lead event still missing after retries — proceeding without it (never fails generation): ${pixelCheck.reason}`);
           }
         }
-
-        // ENG-1524. Same contract as the pixel check above, for the platform that had none.
-        // Gated on the conversion PAIR, not just the id: without a label the helper cannot
-        // fire anyway (ENG-1328), so demanding the call would be asking v0 to write
-        // something that does nothing.
-        if (record.googleAdsConversionId && record.googleAdsConversionLabel) {
-          const adsCheck = validateGoogleAdsConversion(previewFiles);
-          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
-            console.warn(`[V0 SERVICE] Google Ads conversion call missing (attempt ${validationAttempt + 1}): ${adsCheck.reason}`);
-
-            await guardedV0CorrectionMessage({
-              userId,
-              scopeId: record.siteId ?? record.id,
-              chatId: record.v0ChatId!,
-              attempt: validationAttempt,
-              send: () => withRetry(
-                meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
-                  chatId: record.v0ChatId!,
-                  message:
-                    "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
-                    "ON A SUCCESSFUL submission response only, call the platform-owned helper with the googleAds " +
-                    "argument included: `await fireLeadTracking({ email, eventId, googleAds })`. Do NOT hand-author " +
-                    "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
-                    "root layout. " +
-                    `Issue: ${adsCheck.reason}`,
-                })),
-                "v0 correction message (google ads conversion)",
-                undefined, undefined, undefined,
-                { retryOnTimeout: false }
-              ),
-            });
-
-            versionId = await waitForCompletedV0Version(
-              v0,
-              record.v0ChatId!,
-              "v0 correction (google ads conversion)",
-              {
-                heartbeat: () => touchLandingPageRecord(id),
-                deadline: buildDeadline,
-                afterVersionId: versionId,
-              }
-            );
-
-            continue;
-          }
-          if (!adsCheck.ok) {
-            // Never fails generation, same as the pixel path: a lander that captures leads
-            // is worth more than one that refuses to exist. But this is the line that turns
-            // an invisible miss into a visible one.
-            console.warn(`[V0 SERVICE] Google Ads conversion call still missing after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
-          }
+        if (adsCheck && !adsCheck.ok) {
+          // Never fails generation, same as the pixel path: a lander that captures leads
+          // is worth more than one that refuses to exist. But this is the line that turns
+          // an invisible miss into a visible one.
+          console.warn(`[V0 SERVICE] Google Ads conversion call still missing after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
         }
-
-        if (record.leadListId && record.bridgeOutUrl) {
-          const bridgeCheck = validateBridgeOutRedirect(previewFiles, record.bridgeOutUrl);
-          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
-            console.warn(`[V0 SERVICE] Bridge-out redirect missing (attempt ${validationAttempt + 1}): ${bridgeCheck.reason}`);
-
-            await guardedV0CorrectionMessage({
-              userId,
-              scopeId: record.siteId ?? record.id,
-              chatId: record.v0ChatId!,
-              attempt: validationAttempt,
-              send: () => withRetry(
-                meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
-                  chatId: record.v0ChatId!,
-                  message:
-                    "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
-                    `redirect the visitor via window.location.href to ${record.bridgeOutUrl} with the submitted email ` +
-                    "appended as an email= query param (URL-encoded). " +
-                    `Issue: ${bridgeCheck.reason}`,
-                })),
-                "v0 correction message (bridge-out redirect)",
-                undefined, undefined, undefined,
-                { retryOnTimeout: false }
-              ),
-            });
-
-            versionId = await waitForCompletedV0Version(
-              v0,
-              record.v0ChatId!,
-              "v0 correction (bridge-out redirect)",
-              {
-                heartbeat: () => touchLandingPageRecord(id),
-                deadline: buildDeadline,
-                afterVersionId: versionId,
-              }
-            );
-
-            continue;
-          }
+        if (bridgeCheck) {
           bridgeOutVerified = bridgeCheck.ok;
           if (!bridgeCheck.ok) {
             console.warn(`[V0 SERVICE] Bridge-out redirect still missing after retries — proceeding without it (never fails generation): ${bridgeCheck.reason}`);
@@ -3245,8 +3514,8 @@ export async function deployLandingPage(
             // Each loop round is a different send — without this discriminator round 2 was
             // skipped and we re-downloaded the same broken zip. (ENG-287 residual)
             attempt: validationAttempt,
-            send: () => withRetry(
-              meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
+            send: (meteringKey) => withRetry(
+              meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
                 chatId: record.v0ChatId!,
                 message:
                   "The previous output was not valid code. Please generate actual React/Next.js code — " +
@@ -3338,6 +3607,7 @@ export async function deployLandingPage(
       metaPixelId,
       metaAdAccountId,
       record.googleAdsConversionId,
+      await loadLanderUtmLayers(id, userId),
     );
     // Reflect the tracking signals on the in-memory record so every downstream return
     // (deployed or build-failed) carries them consistently with what we persisted.
@@ -3484,12 +3754,32 @@ export async function deployLandingPage(
       updatedAt: now,
     };
 
-    void enqueueLandingPageHumanEval(deployedRecord);
+    // ENG-2327: automatic session tracking (flag AUTO_SESSION_TRACKING, default OFF). It runs AFTER the
+    // GTM / Meta / Google Ads injection and the deploy because the list's allowed origins are the page's
+    // own domains, which only exist now; the tag therefore goes in as one extra commit (one extra Vercel
+    // build). It never throws and never fails generation: a failure is logged and recorded on the page.
+    // The flag is read synchronously first, so with it OFF (the default) nothing below is even imported.
+    // Dynamic import: sessionTrackingService imports FROM this module, so a static import would be circular.
+    if (isAutoSessionTrackingEnabled()) {
+      try {
+        const tracking = await import("./sessionTrackingService").then((m) => m.autoEnableSessionTracking(deployedRecord));
+        if (tracking) {
+          deployedRecord.sessionTrackingListId = tracking.listId;
+          deployedRecord.sessionTrackingInstalled = tracking.installed;
+        }
+      } catch (trackingErr: any) {
+        console.warn(`[V0 SERVICE] Session tracking auto-enable could not run (generation unaffected): ${trackingErr?.message}`);
+      }
+    }
+
+    const deployedZip = zipBuffer;
+    void enqueueLandingPageHumanEval(deployedRecord, () => unzipBuffer(deployedZip));
     // Dynamic import: landingPageSmokeTest.ts imports FROM this module (GeneratedLandingPage,
     // updateLandingPageSmokeTestResult), so a static import here would be circular.
     void import("./landingPageSmokeTest")
       .then((m) => m.runGenerationSmokeTest(deployedRecord))
       .catch((err) => console.warn(`[V0 SERVICE] Smoke test dispatch failed: ${err?.message}`));
+    dispatchLandingPagePageSpeedCheck(deployedRecord.id, deployedRecord.deployedUrl);
 
     return deployedRecord;
   } catch (error: any) {
@@ -3529,7 +3819,14 @@ export async function deployLandingPage(
   }
 }
 
-function enqueueLandingPageHumanEval(page: GeneratedLandingPage): void {
+/**
+ * `generatedFiles` is the v0 output this deploy already holds in memory; the rubric judge
+ * (ENG-2192) reads the page source from it only when the page is sampled.
+ */
+function enqueueLandingPageHumanEval(
+  page: GeneratedLandingPage,
+  generatedFiles?: () => Promise<GeneratedFile[]>,
+): void {
   if (page.status !== "deployed") return;
   const artifactUrl = getLandingPageLiveUrl(page);
   void enqueueAutoHumanEval({
@@ -3545,6 +3842,10 @@ function enqueueLandingPageHumanEval(page: GeneratedLandingPage): void {
       landingPageId: page.id,
       userId: page.userId,
     },
+    ...(page.prompt ? { creativeBrief: { generationRequest: page.prompt } } : {}),
+    ...(generatedFiles
+      ? { loadLandingPageSource: async () => landingPageSourceForJudge(await generatedFiles()) }
+      : {}),
   });
 }
 
@@ -3637,6 +3938,27 @@ export function autoFixV0Files(files: Array<{ path: string; content: Buffer }>):
 // ---------------------------------------------------------------------------
 // v0 output validation — catches "prompts instead of code", empty files, garbage
 // ---------------------------------------------------------------------------
+
+/**
+ * ENG-2083: refusing to redeploy a page that is already `deployed` is a PRECONDITION
+ * failure, not a server fault. It was a bare Error, and the route's only classifier is
+ * `error.message?.includes("not found") ? 404 : 500` — so a deliberate, well-understood
+ * refusal came back as a 500. That lands in error monitoring as a crash, and tells callers
+ * (and their retry logic) that the server broke and the request is worth repeating, when
+ * in fact repeating it can never succeed.
+ *
+ * Message text is deliberately unchanged — callers and tests already match on it.
+ */
+export class LandingPageNotDeployableError extends Error {
+  /** Same rationale as V0OutputValidationError.code: survives re-wrapping across a throw
+   *  boundary, where `instanceof` does not. */
+  readonly code = "LP_NOT_DEPLOYABLE";
+  readonly httpStatus = 409;
+  constructor(public readonly pageStatus: string) {
+    super(`Cannot deploy a landing page with status: ${pageStatus}`);
+    this.name = "LandingPageNotDeployableError";
+  }
+}
 
 export class V0OutputValidationError extends Error {
   /**
@@ -3836,6 +4158,59 @@ function resolveInternalImportFile(
  * false-positive on a real, well-named page that merely leaves a stray component unused. Together
  * they fire only on the actual blank-page bug. Pure and exported for direct unit testing.
  */
+/**
+ * ENG-2087: the first generated module that does not parse, or null when they all do.
+ *
+ * Deliberately syntax-only. `transpileModule` reports parse diagnostics and never type errors,
+ * so an import of a dependency this function cannot resolve is not an error here — only source
+ * that no compiler could read. Every file is parsed as TSX, which is a superset of what v0 emits
+ * for these paths.
+ */
+export function findUnparseableModule(
+  files: Array<{ path: string; content: Buffer }>
+): { path: string; reason: string } | null {
+  for (const file of files) {
+    if (!/\.(tsx|ts|jsx|js)$/.test(file.path)) continue;
+    // A declaration file emits nothing, and transpileModule treats "nothing to emit" as an
+    // internal Debug.assert — it throws a bare Error rather than returning a diagnostic.
+    // v0 zips do carry these (remapFilesForSubPage's own skip list names next-env.d.ts), and
+    // a bare Error is not a V0OutputValidationError, so it would bypass the correction retry
+    // and fail the page outright with "Debug Failure. Output generation failed".
+    if (/\.d\.ts$/.test(file.path)) continue;
+
+    let result: ReturnType<typeof ts.transpileModule>;
+    try {
+      result = ts.transpileModule(file.content.toString("utf-8"), {
+        fileName: file.path,
+        reportDiagnostics: true,
+        compilerOptions: {
+          jsx: ts.JsxEmit.Preserve,
+          target: ts.ScriptTarget.ESNext,
+          module: ts.ModuleKind.ESNext,
+        },
+      });
+    } catch (err: any) {
+      // FAIL OPEN, deliberately. This check exists to stop unparseable code reaching a
+      // commit; it must never be the thing that fails a generation. Any throw here is a
+      // compiler-internal surprise, not evidence about the customer's code, so treat the
+      // file as fine and let the remaining checks (and the build itself) speak.
+      console.warn(
+        `[V0 SERVICE] ENG-2087: parse check could not run on ${file.path} (${err?.message || err}) — treating as parseable.`
+      );
+      continue;
+    }
+
+    const error = (result.diagnostics || []).find((d) => d.category === ts.DiagnosticCategory.Error);
+    if (error) {
+      return {
+        path: file.path,
+        reason: ts.flattenDiagnosticMessageText(error.messageText, " "),
+      };
+    }
+  }
+  return null;
+}
+
 export function detectIncompleteSyntheticPage(
   files: Array<{ path: string; content: Buffer }>
 ): { entryPath: string; orphaned: string[] } | null {
@@ -3876,6 +4251,23 @@ export function detectIncompleteSyntheticPage(
   // primitives (leaf building blocks legitimately imported by sections, not by the page), and
   // provider/util-ish files are not sections — both are excluded so only real orphaned content
   // (hero, features, pricing, …) counts.
+  // ENG-2087: gate 2 below asks "did the stub orphan a section?". When the generation
+  // produced NO section components at all, that question has no answer and the page silently
+  // passed — which is how a stub with nothing behind it reached a live repo. A synthetic
+  // marker with zero sections is not the healthy single-component case this gate was relaxed
+  // for; it is the stub, with nothing to compose. Flag it.
+  // Counted with the SAME exclusions the orphan loop below applies — shadcn primitives under
+  // ui/ and provider/util-ish files are not sections. The live case had exactly one component,
+  // `_components/theme-provider.tsx`, which is excluded there and so must be excluded here too;
+  // counting it as a section is what let the stub through.
+  const isSectionComponent = (p: string): boolean => {
+    if (!p.endsWith(".tsx")) return false;
+    if (!p.startsWith("components/") && !/\/_components\//.test(p)) return false;
+    if (/(^|\/)ui\//.test(p)) return false;
+    return !NON_SECTION_COMPONENT_NAME.test(path.posix.basename(p).replace(/\.tsx$/, ""));
+  };
+  const sectionCount = files.filter((f) => isSectionComponent(f.path)).length;
+
   const orphaned: string[] = [];
   for (const file of files) {
     const p = file.path;
@@ -3887,6 +4279,35 @@ export function detectIncompleteSyntheticPage(
     if (NON_SECTION_COMPONENT_NAME.test(base)) continue;
     orphaned.push(p);
   }
+
+  // A synthetic stub with no sections at all has nothing to orphan, so the gate below could
+  // never fire for it (ENG-2087). Report it with an empty `orphaned` list — the caller's message
+  // already names the entry, which is the actionable part.
+  // ENG-2087 follow-up: `sectionCount` uses the orphan loop's filter, which is much narrower
+  // than "a section" — it misses .jsx, `app/components/hero.tsx` (starts with neither
+  // `components/` nor `/_components/`), and any basename the UNANCHORED
+  // NON_SECTION_COMPONENT_NAME matches as a substring (`service-types`, `config-panel`).
+  // In the orphan loop that narrowness is harmless: an invisible file simply is not reported.
+  // Here it inverts — invisible means FAIL — so a healthy marker page that renders one
+  // legitimately-named component would be rejected and could fail the generation.
+  //
+  // The reachability conjunct is what actually separates the two: a stub has nothing behind
+  // it, while a healthy marker page reaches its component no matter where that component
+  // lives or what it is called.
+  // KNOWN GAP, accepted deliberately. A stub that imports exactly one non-section file (a
+  // theme provider, a context) still escapes this, because it is statically
+  // indistinguishable from a healthy marker page rendering one real component whose name
+  // merely happens to match the UNANCHORED NON_SECTION_COMPONENT_NAME — `service-types.tsx`
+  // matches `types?` as a substring but is almost certainly a real "service types" section.
+  // Both live in a components dir, both are rendered in JSX by the entry; no heuristic here
+  // separates them.
+  //
+  // So the choice is which way to be wrong. Flagging throws V0OutputValidationError, which
+  // burns two correction rounds and can FAIL the generation outright — the customer gets no
+  // page. Missing one ships a page that renders thin, which the parse gate and the remaining
+  // checks may still catch and which a human can see. The cheap failure is the right one to
+  // prefer, so this stays as the narrow "reaches nothing at all" test.
+  if (sectionCount === 0 && reachable.size <= 1) return { entryPath, orphaned: [] };
 
   return orphaned.length > 0 ? { entryPath, orphaned } : null;
 }
@@ -4139,11 +4560,36 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
   // for the top bar. Detect the stub + orphaned sections and reject so the retry loop asks v0 to
   // compose the real page. Distinct failure class from ENG-374/384 (both build FAILURES); this
   // one deploys silently, which is exactly why it recurs unnoticed.
+  // ENG-2087: does every generated module actually PARSE?
+  //
+  // Checks 1-7 are all shape heuristics — they ask whether the text looks like React, not
+  // whether it is syntactically valid. A stub of the form `import  from ".."` / `return < />`
+  // satisfies every one of them (it has `export`, a `function`, no markdown, resolvable-looking
+  // imports) and was committed to a live site repo. It does not merely render blank: it fails
+  // `npm run build`, so EVERY subsequent deploy of that site fails — for every sibling page —
+  // until somebody deletes it. Observed live: one bad generation, then an unrelated page two
+  // minutes later failing with a syntax error pointing at a file its author never touched.
+  //
+  // Syntactic diagnostics only (transpileModule reports no type errors), so this cannot reject
+  // code that merely fails to typecheck against deps we do not resolve here — verified against
+  // TSX generics, the classic false-positive for a hand-rolled parser.
+  const unparseable = findUnparseableModule(files);
+  if (unparseable) {
+    throw new V0OutputValidationError(
+      `${unparseable.path} is not valid TypeScript/JSX and would fail the build for the whole ` +
+      `site, not just this page: ${unparseable.reason}. Regenerate the file as complete, ` +
+      `syntactically valid React.`
+    );
+  }
+
   const incomplete = detectIncompleteSyntheticPage(files);
   if (incomplete) {
     throw new V0OutputValidationError(
       `${incomplete.entryPath} is a placeholder page (${SYNTHETIC_V0_PAGE_MARKER}) that renders only one ` +
-      `component; these generated section components are never rendered: ${incomplete.orphaned.join(", ")}. ` +
+      (incomplete.orphaned.length > 0
+        ? `component; these generated section components are never rendered: ${incomplete.orphaned.join(", ")}. `
+        // ENG-2087: no sections were generated at all, so there is nothing orphaned to name.
+        : `component, and no page sections were generated at all. `) +
       `Rewrite ${incomplete.entryPath} to import and render the full page — compose ALL generated sections ` +
       `(e.g. hero, features, how-it-works, testimonials, pricing, signup, footer), not just the nav.`
     );
@@ -4162,9 +4608,102 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
  * whether to send a correction message and retry; if retries are exhausted, generation must
  * still proceed (AC3 — never fail generation over a missing client-side event).
  */
+/**
+ * ENG-2080: does this page actually have a lead-capture form?
+ *
+ * Keyed on the POST to /api/capture, which is the platform-owned contract every generated
+ * capture form uses — not on the presence of a <form> tag, which a login form or a search
+ * box would also satisfy.
+ *
+ * Used to skip the enhancement corrections (Meta Pixel Lead event, Google Ads conversion,
+ * bridge-out redirect) on a page that has no form for them to attach to. Those corrections
+ * ask v0 to "fix the lead capture form"; with no such form the request is unsatisfiable,
+ * v0 returns no new version, and the wait burns its whole ~17-minute budget before the
+ * caller can fall through. ENG-2079 stopped that from FAILING the page; this stops the
+ * pointless wait from happening at all.
+ */
+/**
+ * Which generated files the CONTENT greps below may read.
+ *
+ * Excluding by path, not by extension. These checks join every accepted file and regex the
+ * result, so a file that merely MENTIONS a pattern satisfies them — next.config.js with
+ * `fbq('track','Lead')` in a comment made a missing pixel read as present, and a service
+ * worker mentioning "/api/capture" made a form-less page read as having a form. Excluding
+ * `.js` wholesale fixed that but also blinded the checks to `app/page.js`, which
+ * MODULE_EXTENSIONS and detectIncompleteSyntheticPage both treat as a real page shape, and
+ * which survives remapFilesForSubPage. Naming the non-source paths keeps both properties.
+ *
+ * Only the first-page path can see these files at all — remapFilesForSubPage already drops
+ * config and public/ — but the raw v0 zip reaches the validators unfiltered there.
+ */
+const isScannableSource = (path: string): boolean =>
+  /\.(tsx|ts|jsx|js)$/.test(path) &&
+  // Any *.config.*, not a list of the six we happened to have seen: v0 ships sanity,
+  // contentlayer and playwright configs too, and a name list silently readmits each new one.
+  !/(^|\/)[^/]+\.config\.[jt]sx?$/.test(path) &&
+  // Service workers are not page source wherever they are emitted. `public/` is the
+  // conventional home and is never compiled by Next, but the root is just as common.
+  !/^public\//.test(path) &&
+  !/(^|\/)(sw|service-worker)\.[jt]sx?$/.test(path);
+
+export function hasLeadCaptureForm(files: Array<{ path: string; content: Buffer }>): boolean {
+  const source = files
+    .filter((f) => isScannableSource(f.path))
+    .map((f) => f.content.toString("utf-8"))
+    .join("\n");
+  // Any reference to the path in shipped source, not only the prescribed
+  // `fetch('/api/capture', …)` idiom. A false NEGATIVE here silently disables all three
+  // enhancement corrections AND the ENG-2082 contact-field warning on a page that really
+  // does capture — so a customer paying for conversion tracking would ship without it,
+  // recorded only as a console.warn. Probed misses for the narrow form: axios.post(),
+  // a template literal (`${base}/api/capture`), a hoisted const, and <form action=…>.
+  // `}` covers a template literal that interpolates a base (`${base}/api/capture`). A bare
+  // occurrence is deliberately NOT matched: lib/agentweb-track.ts ships with every page and
+  // mentions the path twice in COMMENTS, so matching unquoted text would make every page
+  // look like it captures and would silently undo the gate above.
+  return /["'`}]\/api\/capture\b/.test(source);
+}
+
+/**
+ * ENG-2082: does the capture form collect anything we can actually contact the lead by?
+ *
+ * /api/capture accepts a submission carrying an email OR a phone and rejects one carrying
+ * neither, because a lead nobody can reach is not a lead. A generated form that asks only
+ * for, say, a name is therefore structurally incapable of producing one — and the generator
+ * will build it whenever asked, with nothing telling the owner until the leads never arrive.
+ *
+ * This deliberately accepts phone-only: requiring an email specifically is what made an
+ * ordinary phone-only lander impossible, and the capture route no longer does.
+ *
+ * Mirrors validatePixelLeadEvent's contract — verified, not guaranteed. Only meaningful on a
+ * page that HAS a capture form; see hasLeadCaptureForm.
+ */
+export function validateCaptureFormHasContactField(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
+  const source = files
+    .filter((f) => isScannableSource(f.path))
+    .map((f) => f.content.toString("utf-8"))
+    .join("\n");
+
+  // Either an input of that type or a field of that name — both are how v0 emits them, and
+  // the name is what the capture route reads off the JSON body.
+  const hasEmail = /type\s*=\s*["'`]email["'`]/.test(source) || /name\s*=\s*["'`]email["'`]/.test(source);
+  const hasPhone = /type\s*=\s*["'`]tel["'`]/.test(source) || /name\s*=\s*["'`]phone["'`]/.test(source);
+  if (!hasEmail && !hasPhone) {
+    return {
+      ok: false,
+      reason: "capture form collects neither an email nor a phone, and /api/capture rejects a submission carrying neither",
+    };
+  }
+  return { ok: true };
+}
+
 export function validatePixelLeadEvent(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
   const tsxSource = files
-    .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
+    // Must match the set hasLeadCaptureForm scans. A validator narrower than that gate is
+    // worse than either one alone: the gate opens on a page whose form these validators
+    // cannot see, so each fires a BILLED correction asking v0 to add tracking that is
+    // already there, and re-fails identically on every retry.
+    .filter((f) => isScannableSource(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
 
@@ -4209,7 +4748,11 @@ export function validatePixelLeadEvent(files: Array<{ path: string; content: Buf
  */
 export function validateGoogleAdsConversion(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
   const tsxSource = files
-    .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
+    // Must match the set hasLeadCaptureForm scans. A validator narrower than that gate is
+    // worse than either one alone: the gate opens on a page whose form these validators
+    // cannot see, so each fires a BILLED correction asking v0 to add tracking that is
+    // already there, and re-fails identically on every retry.
+    .filter((f) => isScannableSource(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
 
@@ -4248,7 +4791,11 @@ export function validateGoogleAdsConversion(files: Array<{ path: string; content
  */
 export function validateBridgeOutRedirect(files: Array<{ path: string; content: Buffer }>, bridgeOutUrl: string): { ok: boolean; reason?: string } {
   const tsxSource = files
-    .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
+    // Must match the set hasLeadCaptureForm scans. A validator narrower than that gate is
+    // worse than either one alone: the gate opens on a page whose form these validators
+    // cannot see, so each fires a BILLED correction asking v0 to add tracking that is
+    // already there, and re-fails identically on every retry.
+    .filter((f) => isScannableSource(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
 
@@ -4788,6 +5335,25 @@ export function injectLeadCaptureAttribution(
 }
 
 /**
+ * ENG-726: read the two stored UTM layers fresh at push time. Read failures degrade
+ * to "no layer" so a storage hiccup never fails generation (the lander simply ships
+ * undecorated, which is today's behavior).
+ */
+async function loadLanderUtmLayers(pageId: string, userId: string): Promise<LanderUtmLayers> {
+  const [override, customerDefault] = await Promise.all([
+    getLanderUtmOverride(pageId, userId).catch((err: any) => {
+      console.warn(`[V0 SERVICE] UTM override read failed for ${pageId}: ${err?.message}`);
+      return null;
+    }),
+    getCustomerUtmDefault(userId).catch((err: any) => {
+      console.warn(`[V0 SERVICE] UTM default read failed for ${userId}: ${err?.message}`);
+      return null;
+    }),
+  ]);
+  return { override, customerDefault };
+}
+
+/**
  * Create a GitHub repo under the AgentWebPro org and push all files via the Contents API.
  */
 async function createGitHubRepoAndPush(
@@ -4823,6 +5389,12 @@ async function createGitHubRepoAndPush(
    * When absent, NOTHING is injected — no fallback tag on a customer page.
    */
   googleAdsConversionId?: string,
+  /**
+   * ENG-726: the stored UTM layers (per-lander override + customer default). When
+   * either is configured, an outbound-link decoration script resolved by the shared
+   * ENG-723 resolver is injected into the root layout. Neither set: nothing injected.
+   */
+  utmLayers: LanderUtmLayers = {},
 ): Promise<{ githubRepoUrl: string; repoFullName: string; commitSha: string; gtmInjected: boolean; pixelInjected: boolean; googleAdsInjected: boolean }> {
   const { token, org } = await getGitHubOrgToken();
   const headers = {
@@ -4977,6 +5549,15 @@ async function createGitHubRepoAndPush(
   // measurable from the first deploy — no manual "Add GTM" step. Absent a container id,
   // nothing is injected and the caller records a "no tracking installed" signal.
   const gtmInjected = injectGtmIntoLayoutFiles(finalFiles, gtmContainerId);
+  // ENG-726: decorate outbound links with the resolved UTMs. A malformed stored
+  // config must not fail generation — log and ship undecorated, as before this slice.
+  try {
+    if (injectUtmDecorationIntoLayoutFiles(finalFiles, utmLayers)) {
+      console.log(`[V0 SERVICE] Injected UTM outbound-link decoration into app/layout.tsx`);
+    }
+  } catch (err: any) {
+    console.error(`[V0 SERVICE] UTM decoration skipped (invalid stored UTM config): ${err?.message}`);
+  }
   console.log(
     gtmInjected
       ? `[V0 SERVICE] Injected GTM container ${gtmContainerId} into app/layout.tsx`
@@ -5407,10 +5988,17 @@ async function assignManagedSubdomain(
 export async function getDeploymentStatus(
   id: string,
   userId: string
-): Promise<{ status: string; buildStatus?: string; buildError?: string; deployedUrl?: string }> {
+): Promise<{
+  status: string;
+  buildStatus?: string;
+  buildError?: string;
+  deployedUrl?: string;
+  launchReadiness: { ready: boolean; reasons: string[] };
+}> {
   const record = await getLandingPage(id, userId);
   if (!record) throw new Error("Landing page not found");
-  if (!record.vercelProjectId) return { status: record.status };
+  const launchReadiness = getLandingPageLaunchReadiness(record);
+  if (!record.vercelProjectId) return { status: record.status, launchReadiness };
 
   const vercelToken = await getVercelToken();
   const headers = { Authorization: `Bearer ${vercelToken}` };
@@ -5421,13 +6009,13 @@ export async function getDeploymentStatus(
   );
 
   const deployment = deploymentsRes.data?.deployments?.[0];
-  if (!deployment) return { status: record.status, buildStatus: "no_deployment" };
+  if (!deployment) return { status: record.status, buildStatus: "no_deployment", launchReadiness };
 
   const state = deployment.readyState || deployment.state;
 
   if (state === "ERROR" || state === "CANCELED") {
     const buildError = await getVercelBuildErrors(deployment.uid, vercelToken);
-    return { status: record.status, buildStatus: "error", buildError, deployedUrl: record.deployedUrl };
+    return { status: record.status, buildStatus: "error", buildError, deployedUrl: record.deployedUrl, launchReadiness };
   }
 
   // Auto-heal: if Vercel shows the project is READY but our record says
@@ -5466,6 +6054,7 @@ export async function getDeploymentStatus(
         status: "deployed",
         buildStatus: "success",
         deployedUrl: record.deployedUrl,
+        launchReadiness,
       };
     }
     // Project is READY but this page's route is not live — do not heal.
@@ -5473,6 +6062,7 @@ export async function getDeploymentStatus(
       status: record.status,
       buildStatus: "route_not_live",
       deployedUrl: record.deployedUrl,
+      launchReadiness,
     };
   }
 
@@ -5480,6 +6070,7 @@ export async function getDeploymentStatus(
     status: record.status,
     buildStatus: state === "READY" ? "success" : state.toLowerCase(),
     deployedUrl: record.deployedUrl,
+    launchReadiness,
   };
 }
 
@@ -5490,7 +6081,8 @@ export async function getDeploymentStatus(
  */
 export async function getPreviewDeploymentUrl(
   vercelProjectId: string,
-  branch: string
+  branch: string,
+  commitSha?: string
 ): Promise<{ previewUrl?: string; buildStatus: string; buildError?: string; prUrl?: string }> {
   const vercelToken = await getVercelToken();
   const headers = { Authorization: `Bearer ${vercelToken}`, "Content-Type": "application/json" };
@@ -5525,12 +6117,16 @@ export async function getPreviewDeploymentUrl(
     { headers }
   );
 
-  const deployments = deploymentsRes.data?.deployments || [];
+  const deployments = deploymentsRes.data?.deployments;
+  if (!Array.isArray(deployments) || deployments.some((d: any) =>
+    !d || typeof d !== 'object' || typeof (d.readyState || d.state) !== 'string' ||
+    (d.meta != null && (typeof d.meta !== 'object' || Array.isArray(d.meta)))
+  )) throw new Error('Invalid Vercel deployments response');
   console.log(`[V0 SERVICE] Found ${deployments.length} deployments for project ${vercelProjectId}, looking for branch "${branch}". Branches in deployments: [${deployments.map((d: any) => d.meta?.githubCommitRef || 'none').join(', ')}]`);
 
   // Find the most recent deployment for this branch
   const branchDeployment = deployments.find((d: any) =>
-    d.meta?.githubCommitRef === branch
+    d.meta?.githubCommitRef === branch && (!commitSha || deploymentCommitSha(d) === commitSha)
   );
 
   if (!branchDeployment) {
@@ -5547,7 +6143,9 @@ export async function getPreviewDeploymentUrl(
         console.warn(`[V0 SERVICE] Failed to create draft PR for branch "${branch}": ${prErr.response?.data?.message || prErr.message}`);
       }
     }
-    return { buildStatus: "not_found", previewUrl: undefined };
+    // A push may not have appeared yet; older builds cannot verify this SHA.
+    // Retain PR creation above even if an older deployment exists (its PR may be closed).
+    return { buildStatus: commitSha ? "building" : "not_found", previewUrl: undefined };
   }
 
   const state = branchDeployment.readyState || branchDeployment.state;
@@ -5805,22 +6403,15 @@ export async function iterateLandingPage(
       return await finishIteration(id, record, baseVersionId);
     }
 
-    if (!isSameEdit) {
-      // responseMode async: sync mode blocks the HTTP call for the whole edit, which is the
-      // 300s race that made a slow iteration fail while v0 applied and CHARGED for it anyway
-      // — leaving the edit stranded (the record stayed `deployed`, which deployLandingPage
-      // refuses). Async returns in seconds; the version wait below absorbs the real time.
-      // Safe now only because that wait is anchored to `afterVersionId` — without it, a deploy
-      // could grab the PRE-iteration version and silently ship the page without the edit.
-      await withRetry(
-        meteredV0({ userId: iterateActorUserId, billingUserId: iterateOwnerUserId, ...(iterateActorUserId && iterateOwnerUserId && iterateActorUserId !== iterateOwnerUserId ? { onBehalfOf: iterateActorUserId } : {}), operation: "iterate_message" }, () => v0.chats.sendMessage({ chatId, message, responseMode: "async" })),
-        "v0 chat iterate",
-        undefined, undefined, undefined,
-        { retryOnTimeout: false }
-      );
+    // ENG-1728: the base this edit is anchored to. For a retry of a recorded edit it is the
+    // ORIGINAL pre-send base, never the version we just read — v0 may already be past it.
+    const anchorBaseVersionId = isSameEdit ? pending!.baseVersionId : baseVersionId;
 
-      // Record it the instant v0 accepts, BEFORE the wait — if the wait dies (timeout, crash,
-      // lost response), the retry must know the message is already with v0.
+    if (!isSameEdit) {
+      // Persist the pre-send base BEFORE v0 is called (ENG-1728). Recording it only after
+      // the send left a crash window: v0 had the message, the record did not, so the retry
+      // read the post-edit version as its base, the usage guard skipped the already-sent
+      // message, and the retry waited for a version no send would ever create.
       const nowIso = new Date().toISOString();
       await dynamodb
         .update({
@@ -5828,13 +6419,51 @@ export async function iterateLandingPage(
           Key: { id },
           UpdateExpression: "SET pendingIteration = :p, updatedAt = :now",
           ExpressionAttributeValues: {
-            ":p": { baseVersionId, messageHash, startedAt: nowIso },
+            ":p": { baseVersionId, messageHash, startedAt: nowIso, unsent: true },
             ":now": nowIso,
           },
         })
         .promise();
-    } else {
+    }
+
+    // A recorded edit without `unsent` is known to be with v0: resume the wait, never re-send.
+    // With `unsent` the process died between the pre-send write above and v0 accepting,
+    // so route through the usage guard: keyed on (chat, content hash), it returns
+    // `{skipped: true}` if a send did reach v0 (no second call or charge) and sends otherwise.
+    // Either way the wait below is anchored to the ORIGINAL base.
+    if (isSameEdit && !pending!.unsent) {
       console.log(`[V0 SERVICE] iterate: message already sent and still generating — resuming the wait, not re-sending`);
+    } else {
+      // responseMode async: sync mode blocks the HTTP call for the whole edit, which is the
+      // 300s race that made a slow iteration fail while v0 applied and CHARGED for it anyway.
+      // Async is safe only because the version wait below is anchored to the pre-send base.
+      await guardedV0IterateMessage({
+        userId: iterateActorUserId,
+        scopeId: id,
+        chatId,
+        message,
+        send: (meteringKey) => withRetry(
+          meteredV0({ userId: iterateActorUserId, billingUserId: iterateOwnerUserId, ...(iterateActorUserId && iterateOwnerUserId && iterateActorUserId !== iterateOwnerUserId ? { onBehalfOf: iterateActorUserId } : {}), operation: "iterate_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({ chatId, message, responseMode: "async" })),
+          "v0 chat iterate",
+          undefined, undefined, undefined,
+          { retryOnTimeout: false }
+        ),
+      });
+
+      // Stamp the send the instant v0 accepts (or the guard confirms a prior send), BEFORE
+      // the wait — if the wait dies, the retry must know the message is already with v0.
+      const sentIso = new Date().toISOString();
+      await dynamodb
+        .update({
+          TableName: TABLE_NAME,
+          Key: { id },
+          UpdateExpression: "SET pendingIteration = :p, updatedAt = :now",
+          ExpressionAttributeValues: {
+            ":p": { baseVersionId: anchorBaseVersionId, messageHash, startedAt: isSameEdit ? pending!.startedAt : sentIso },
+            ":now": sentIso,
+          },
+        })
+        .promise();
     }
 
     // Do not return until v0 publishes a version that is NOT the one we started from. This is
@@ -5844,7 +6473,7 @@ export async function iterateLandingPage(
       v0,
       chatId,
       "v0 iterate",
-      { deadline, afterVersionId: pending && isSameEdit ? pending.baseVersionId : baseVersionId }
+      { deadline, afterVersionId: anchorBaseVersionId }
     );
 
     return await finishIteration(id, record, newVersionId);
@@ -6414,16 +7043,25 @@ export async function updateLandingPageMetaPixel(
   if (!record) throw new Error("Landing page not found");
 
   if (pixelId) {
+    const sets = ["metaPixelId = :px", "updatedAt = :now"];
+    const values: Record<string, any> = { ":px": pixelId, ":now": new Date().toISOString() };
+    const removes: string[] = [];
+    // Mirrors updateLandingPageGoogleAds's conversionLabel/customerId handling: `undefined`
+    // means the caller didn't mention an account (leave whatever is stored — a standalone
+    // page can carry a pixel with no ad account tied to it), `""` means explicitly clear
+    // it. Previously this always referenced `:acc` even when `accountId` was undefined,
+    // and the SDK silently drops an undefined value from ExpressionAttributeValues — so
+    // DynamoDB rejected the whole update as referencing an undefined placeholder.
+    if (accountId === undefined) { /* not mentioned — leave whatever is stored */ }
+    else if (accountId === "") { removes.push("metaAdAccountId"); }
+    else { sets.push("metaAdAccountId = :acc"); values[":acc"] = accountId; }
+
     await dynamodb
       .update({
         TableName: TABLE_NAME,
         Key: { id },
-        UpdateExpression: "SET metaPixelId = :px, metaAdAccountId = :acc, updatedAt = :now",
-        ExpressionAttributeValues: {
-          ":px": pixelId,
-          ":acc": accountId,
-          ":now": new Date().toISOString(),
-        },
+        UpdateExpression: `SET ${sets.join(", ")}` + (removes.length ? ` REMOVE ${removes.join(", ")}` : ""),
+        ExpressionAttributeValues: values,
       })
       .promise();
   } else {
@@ -6466,6 +7104,43 @@ export async function updateLandingPageSmokeTestResult(
 }
 
 /**
+ * ENG-2193: persists the result of the post-deploy PageSpeed Insights check
+ * (runLandingPagePageSpeedCheck, landingPagePageSpeedCheck.ts). Fire-and-forget by design —
+ * mirrors updateLandingPageSmokeTestResult above for the same reason.
+ */
+export async function updateLandingPagePageSpeedResult(
+  id: string,
+  result: NonNullable<GeneratedLandingPage["pageSpeedResult"]>
+): Promise<void> {
+  try {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "SET pageSpeedResult = :result, updatedAt = :now",
+        ExpressionAttributeValues: {
+          ":result": result,
+          ":now": new Date().toISOString(),
+        },
+      })
+      .promise();
+  } catch (error) {
+    console.warn(`[V0 SERVICE] Could not persist PageSpeed result for page ${id}: ${error instanceof Error ? error.message : error}`);
+  }
+}
+
+/**
+ * ENG-2193: fire-and-forget PageSpeed check dispatch, called alongside the smoke test dispatch
+ * at both post-deploy call sites below. Never throws — a failed check still writes a
+ * `{ok:false, error}` result (see runLandingPagePageSpeedCheck), and a failed WRITE only warns.
+ */
+function dispatchLandingPagePageSpeedCheck(id: string, url: string | undefined): void {
+  void runLandingPagePageSpeedCheck(url)
+    .then((result) => updateLandingPagePageSpeedResult(id, result))
+    .catch((err) => console.warn(`[V0 SERVICE] PageSpeed check dispatch failed: ${err?.message}`));
+}
+
+/**
  * Mirrors updateLandingPageTrackingInstalled for the Meta pixel signal. Split out
  * the same way, for the same reason: a site-level pixel change affects every page sharing
  * the root layout, not just the record `metaPixelId` was written to.
@@ -6482,6 +7157,75 @@ export async function updateLandingPageMetaTrackingInstalled(
       ExpressionAttributeValues: {
         ":t": metaTrackingInstalled,
         ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
+}
+
+/**
+ * ENG-2327: record the session-tracking list on a page. DATA-PLANE: writes the new persisted
+ * attributes sessionTrackingListId / sessionTrackingInstalled / sessionTrackingError.
+ *
+ * Conditional: it only claims the page when no list is recorded yet (or the recorded one is the
+ * `replacing` id the caller found dead), so two concurrent enables can never leave a page pointing
+ * at a list the other one then orphans. Returns false when another caller already holds the claim.
+ */
+export async function claimLandingPageSessionTrackingList(
+  id: string,
+  listId: string,
+  replacing?: string,
+): Promise<boolean> {
+  try {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression:
+          "SET sessionTrackingListId = :l, sessionTrackingInstalled = :f, updatedAt = :now REMOVE sessionTrackingError",
+        ConditionExpression: replacing
+          ? "attribute_exists(id) AND (attribute_not_exists(sessionTrackingListId) OR sessionTrackingListId = :replacing)"
+          : "attribute_exists(id) AND attribute_not_exists(sessionTrackingListId)",
+        ExpressionAttributeValues: {
+          ":l": listId,
+          ":f": false,
+          ":now": new Date().toISOString(),
+          ...(replacing ? { ":replacing": replacing } : {}),
+        },
+      })
+      .promise();
+    return true;
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
+ * ENG-2327: set the session-tracking install state on a page (and the list id, when given).
+ * Mirrors updateLandingPageMetaTrackingInstalled; split out because the tag lives in the SHARED
+ * root layout, so callers loop it across the siblings sharing that repo. `error` records the last
+ * failure on the page (cleared when absent), the same "fail loud" signal the other injectors keep.
+ */
+export async function updateLandingPageSessionTracking(
+  id: string,
+  state: { installed: boolean; listId?: string; error?: string },
+): Promise<void> {
+  const error = state.error ? state.error.slice(0, 500) : undefined;
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      ConditionExpression: "attribute_exists(id)", // never upsert a ghost record for a page deleted meanwhile
+      UpdateExpression:
+        "SET sessionTrackingInstalled = :i, updatedAt = :now" +
+        (state.listId ? ", sessionTrackingListId = :l" : "") +
+        (error ? ", sessionTrackingError = :e" : "") +
+        (error ? "" : " REMOVE sessionTrackingError"),
+      ExpressionAttributeValues: {
+        ":i": state.installed,
+        ":now": new Date().toISOString(),
+        ...(state.listId ? { ":l": state.listId } : {}),
+        ...(error ? { ":e": error } : {}),
       },
     })
     .promise();

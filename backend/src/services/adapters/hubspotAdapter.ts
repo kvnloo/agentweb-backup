@@ -1,4 +1,5 @@
 import { CrmAdapter, CrmAuth, PushContext } from './crmAdapterTypes';
+import { mergeCustomFields } from '../../utils/customFieldsGuard';
 import { ExternalCrmSyncConfig, FieldMapping, SyncResult } from '../externalCrmSyncService';
 import { HubSpotService } from '../hubspotService';
 import { crmDb } from '../db';
@@ -280,25 +281,87 @@ export class HubspotAdapter implements CrmAdapter {
 
                 let contactId: string;
                 let wasNew: boolean;
-                if (email) {
-                    // Email present — find-or-create by email (dedup).
-                    const upserted = await svc.upsertContact(contactData);
-                    contactId = upserted.contactId;
-                    wasNew = upserted.isNew;
-                } else {
-                    // No email to dedup on. If we synced this lead before, update the
-                    // known contact by id; otherwise create a fresh email-less contact.
-                    const existingContactId: string | undefined =
-                        lead.syncMetadata?.hubspot_contact_id || lead.customFields?.hubspot_contact_id;
-                    if (existingContactId) {
+                // A contact id we stored ourselves is a stronger identity than the email,
+                // and it is checked FIRST regardless of whether an email is present now.
+                // Previously the branch was chosen by email alone, so a lead first synced
+                // without one (ENG-2082) got contact A by id — and then, the moment it
+                // gained an address, upsertContact matched on email instead, created
+                // contact B, and overwrote our stored id. Contact A was orphaned in the
+                // customer's HubSpot: a real person, now a duplicate nobody updates again.
+                //
+                // SCOPE, stated plainly: this is pushLeadsPerLead. `batchEnabled()` defaults
+                // TRUE (HUBSPOT_BATCH_PUSH_ENABLED is set nowhere), so in production this
+                // path is reached only for EMAIL-LESS leads — which is the ENG-2082
+                // population and the point of the fix. A lead that HAS an email goes to
+                // pushLeadsBatched, whose Stage 1 partitions on email alone, upserts by
+                // email, and overwrites the stored id at Stage 3. So the orphaning described
+                // above is closed for a lead that never had an address and is NOT closed for
+                // one that later gains it.
+                //
+                // Fixing the batched half means routing stored-id leads to
+                // batchUpdateContacts (which exists) AND handling its all-or-nothing partial
+                // failure — one contact the customer deleted in HubSpot would otherwise 404
+                // an entire 100-lead batch, where the per-lead path falls back to create on
+                // 404/410. That is its own change with its own failure modes: ENG-2167.
+                const existingContactId: string | undefined =
+                    lead.syncMetadata?.hubspot_contact_id || lead.customFields?.hubspot_contact_id;
+                const upsertOrCreate = async () => {
+                    if (email) {
+                        const upserted = await svc.upsertContact(contactData);
+                        return { contactId: upserted.contactId, wasNew: upserted.isNew };
+                    }
+                    const created = await svc.createContact(contactData);
+                    return { contactId: created.contactId, wasNew: true };
+                };
+
+                if (existingContactId) {
+                    // Update the contact we know we created, and fall back to the
+                    // email/create path if that id no longer resolves — a contact deleted
+                    // in HubSpot must still be recoverable, which is what upsert gave us
+                    // for free before.
+                    try {
                         const updated = await svc.updateContact(existingContactId, contactData);
                         contactId = updated.contactId;
                         wasNew = false;
-                    } else {
-                        const created = await svc.createContact(contactData);
-                        contactId = created.contactId;
-                        wasNew = true;
+                    } catch (err: any) {
+                        // ONLY fall back when the contact is genuinely gone. The fallback
+                        // exists for a contact deleted in HubSpot; catching everything
+                        // turned a 429 or a 5xx into "create a new contact", which is the
+                        // duplicate this whole branch prevents — and hubspotService retries
+                        // 429 exactly once before throwing, so a sustained rate limit would
+                        // reach here and silently fork the record.
+                        const status = err?.response?.status;
+                        if (status !== 404 && status !== 410) {
+                            const msg = this.formatError(err);
+                            result.errorCount++;
+                            result.errors.push(
+                                `Lead ${lead.leadId}: updating stored contact ${existingContactId} failed (${msg})`,
+                            );
+                            // Stamp the failure, exactly as the per-lead catch below and
+                            // every sibling error branch in this file do. `continue` skips
+                            // that catch, so without this the lead keeps reading `synced`
+                            // in the customer's CRM and never appears under the sync-failed
+                            // filter (routes/crm.ts:1938) — a silent sync outage after a
+                            // sustained 429.
+                            await this.persistSyncMetadata(
+                                lead,
+                                config.listId,
+                                buildFailedMetadata(lead.syncMetadata, msg),
+                            ).catch(() => {});
+                            continue;
+                        }
+                        console.warn(
+                            `[HubspotAdapter] stored contact ${existingContactId} for lead ${lead.leadId} ` +
+                            `no longer exists (${status}) — falling back to upsert/create.`,
+                        );
+                        const fresh = await upsertOrCreate();
+                        contactId = fresh.contactId;
+                        wasNew = fresh.wasNew;
                     }
+                } else {
+                    const fresh = await upsertOrCreate();
+                    contactId = fresh.contactId;
+                    wasNew = fresh.wasNew;
                 }
                 if (wasNew) result.newCount++; else result.updatedCount++;
 
@@ -1028,6 +1091,9 @@ export class HubspotAdapter implements CrmAdapter {
 
         let cursor: string | undefined;
 
+        // Lazy, built at most once per pull — see the email-less branch below.
+        let contactIdIndex: Map<string, any> | null = null;
+
         do {
             const { results, nextCursor } = await svc.listContactsPage(contactProps, cursor);
             const pageLeadData: any[] = [];
@@ -1096,11 +1162,84 @@ export class HubspotAdapter implements CrmAdapter {
 
                 leadData.customFields = customFields;
                 if (Object.keys(syncMetadata).length > 0) leadData.syncMetadata = syncMetadata;
+
+                // batchCreateLeads dedupes on email, then LinkedIn URL. A contact with
+                // NEITHER matches nothing, so it was created fresh on EVERY pull —
+                // accumulating a duplicate per run. Attio's pull sidesteps this by skipping
+                // email-less people outright (attioAdapter.ts:578), but that is the wrong
+                // trade now that phone-only leads are first-class: it would silently refuse
+                // to import a contactable person. Resolve them by the contact id we already
+                // store instead, and update in place.
+                if (!leadData.email && !leadData.linkedin) {
+                    // Resolved from ONE pass over the list, built lazily on first need and
+                    // reused for the whole pull. The first version queried per contact, and
+                    // getLeadByHubSpotContactId is a partition Query with a FilterExpression
+                    // — no index — so a pull with 100 email-less contacts meant 100 full
+                    // scans of the list, sequentially, inside the page loop.
+                    if (!contactIdIndex) {
+                        contactIdIndex = new Map<string, any>();
+                        try {
+                            for (const l of await crmDb.getAllLeadsByListId(listId)) {
+                                const cid = (l as any)?.syncMetadata?.hubspot_contact_id;
+                                if (cid && !contactIdIndex.has(String(cid))) contactIdIndex.set(String(cid), l);
+                            }
+                        } catch (err: any) {
+                            // Degrade to "no match" rather than failing the pull: the worst
+                            // case is the pre-existing duplicate behaviour, not a lost sync.
+                            console.warn(`[HubspotAdapter] could not index contact ids for ${listId}: ${this.formatError(err)}`);
+                        }
+                    }
+                    const existing = contactIdIndex.get(String(contact.id)) ?? null;
+                    if (existing) {
+                        try {
+                            // MERGE, never replace. crmDb.updateLead does
+                            // `SET customFields = :customFields` and `SET syncMetadata = …`
+                            // — wholesale map replacement. batchCreateLeads, the path this
+                            // branch bypasses, merges both on purpose ("Merging syncMetadata
+                            // to avoid overwriting existing provider IDs"). Writing the
+                            // mapped properties straight through would delete every custom
+                            // field the customer has on that lead AND their attio_record_id,
+                            // on every pull, silently.
+                            const mergedCustomFields = mergeCustomFields(
+                                existing.customFields,
+                                customFields,
+                                { source: 'hubspotAdapter.pull', listId, leadId: existing.leadId },
+                            );
+                            const mergedSyncMetadata = {
+                                ...(existing.syncMetadata || {}),
+                                ...syncMetadata,
+                            };
+                            const merged: Record<string, any> = {
+                                ...leadData,
+                                customFields: mergedCustomFields,
+                                syncMetadata: mergedSyncMetadata,
+                            };
+                            // Nothing new? Don't write. An unconditional update re-bumps
+                            // updatedAt, re-projects three GSIs and re-runs the CAPI relay
+                            // hook on every pull. batchCreateLeads writes only `if (changed)`.
+                            const unchanged = Object.keys(merged).every((k) => {
+                                const a = (existing as any)[k];
+                                const b = (merged as any)[k];
+                                return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+                            });
+                            if (unchanged) { result.successCount++; continue; }
+
+                            await crmDb.updateLead(listId, existing.leadId, merged);
+                            result.successCount++;
+                            result.updatedCount++;
+                        } catch (err: any) {
+                            result.errorCount++;
+                            result.errors.push(`Contact ${contact.id} update: ${this.formatError(err)}`);
+                        }
+                        continue;
+                    }
+                }
+
                 pageLeadData.push(leadData);
             }
 
             if (pageLeadData.length > 0) {
-                const batchResult = await crmDb.batchCreateLeads(listId, pageLeadData);
+                const batchResult = await crmDb.batchCreateLeads(listId, pageLeadData, { origin: 'integration' });
                 result.successCount += batchResult.successCount;
                 result.newCount += batchResult.newCount;
                 result.updatedCount += batchResult.mergedCount;

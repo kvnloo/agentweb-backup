@@ -963,6 +963,39 @@ checkruns "${d}" '[
 run_gate "${d}"
 check 'ENG-1453: a similarly-named but distinct check is NOT swallowed by the allowlist' 1 'Require Greptile Review (extended) (failure)'
 
+# ENG-502: the retired integration still emits pending check-runs on ready PRs.
+for conclusion in pending failure success; do
+  d="$(new_fixture_dir)"
+  pr_view "${d}" 'MERGEABLE'
+  if [ "${conclusion}" = pending ]; then
+    review='"status":"in_progress","conclusion":null'
+  else
+    review="\"status\":\"completed\",\"conclusion\":\"${conclusion}\""
+  fi
+  checkruns "${d}" '[
+    {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+    {"name":"Greptile Review",'"${review}"'}
+  ]'
+  run_gate "${d}"
+  check "retired Greptile integration ${conclusion} is excluded" 0 'VERDICT: PASS'
+done
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"CI script tests","status":"completed","conclusion":"failure"},
+  {"name":"Greptile Review","status":"in_progress","conclusion":null}
+]'
+run_gate "${d}"
+check 'active failure still blocks beside retired integration' 1 'CI script tests (failure)'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[{"name":"Greptile Review","status":"completed","conclusion":"success"}]'
+run_gate "${d}"
+check 'retired integration success is not execution evidence' 3 'NO_EVIDENCE'
+
 # ---------------------------------------------------------------------------
 # Regression proof — the previous procedure returns a false green here
 # ---------------------------------------------------------------------------
@@ -1551,6 +1584,31 @@ else
   printf "FAIL  invariant: two jobs share a concurrency group, so they will cancel each other:\n"
   printf "      %s\n" "${dupe_group}"
 fi
+
+# ---------------------------------------------------------------------------
+# ENG-2116: Argusoft-owned PRs are never merge-eligible for an agent
+# ---------------------------------------------------------------------------
+foreign_pr() {
+  local dir="$1" author="$2" ref="$3"
+  pr_view "${dir}" 'MERGEABLE'
+  jq --arg a "${author}" --arg r "${ref}" '. + {author: {login: $a}, headRefName: $r}' \
+    "${dir}/pr_view.json" >"${dir}/pr_view.tmp" && mv "${dir}/pr_view.tmp" "${dir}/pr_view.json"
+  checkruns "${dir}" "${HEALTHY_RUNS}"
+  workflowruns "${dir}" '[]'
+  changed_files "${dir}" 'docs/README.md'
+  base_compare "${dir}" 0 ''
+}
+
+d="$(new_fixture_dir)"; foreign_pr "${d}" 'anurag-seth' 'anurag/eng-1-x'; run_gate "${d}"
+check 'ENG-2116: a green PR authored by Anurag is FOREIGN_OWNER, never PASS' 5 'VERDICT: FOREIGN_OWNER'
+d="$(new_fixture_dir)"; foreign_pr "${d}" 'mananv-argusoft' 'eng-1575-meta-action-families'; run_gate "${d}"
+check 'ENG-2116: a PR authored by Manan on an unprefixed branch is FOREIGN_OWNER' 5 "author 'mananv-argusoft'"
+d="$(new_fixture_dir)"; foreign_pr "${d}" 'harshmoney123' 'manan/eng-9-fix'; run_gate "${d}"
+check 'ENG-2116: an agent-pushed PR on a manan/ branch is still FOREIGN_OWNER' 5 "head branch 'manan/eng-9-fix'"
+d="$(new_fixture_dir)"; foreign_pr "${d}" 'harshmoney123' 'swarm/eng-2116-x'; run_gate "${d}"
+check 'ENG-2116: a swarm-owned green PR is not FOREIGN_OWNER' 0 'VERDICT: PASS'
+d="$(new_fixture_dir)"; foreign_pr "${d}" 'harshmoney123' 'mananx/eng-1'; run_gate "${d}"
+check 'ENG-2116: prefix match is exact (mananx/ is not manan/)' 0 'VERDICT: PASS'
 
 printf '\n%s tests, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
 [ "${TESTS_FAILED}" -eq 0 ]

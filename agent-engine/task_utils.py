@@ -93,18 +93,19 @@ def create_jwt_token(user_id: str) -> str:
     """
     try:
         import jwt
-        from datetime import datetime, timedelta
-        
+        from datetime import datetime, timedelta, timezone
+
         jwt_secret = secrets_manager.get_jwt_secret()
         if not jwt_secret:
             logger.error("JWT_SECRET environment variable not set")
             return None
-            
+
         # Create payload with user_id and expiration
+        now = datetime.now(timezone.utc)
         payload = {
             'userId': user_id,
-            'exp': datetime.utcnow() + timedelta(hours=1),  # Token expires in 1 hour
-            'iat': datetime.utcnow()
+            'exp': now + timedelta(hours=1),  # Token expires in 1 hour
+            'iat': now
         }
         
         # Create JWT token
@@ -135,10 +136,7 @@ def generate_content_hash(content: Any) -> str:
 
 def get_downloads_path(user_id: Optional[str] = None, execution_id: Optional[str] = None) -> str:
     """Get the downloads path for storing task outputs
-    
-    This is a shared utility function used by both web_agent.py and deep_research_agent.py
-    to ensure consistent file storage location.
-    
+
     Args:
         user_id: Optional user ID to create user-specific directory
         execution_id: Optional execution ID to create execution-specific directory

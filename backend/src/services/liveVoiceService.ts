@@ -27,6 +27,7 @@ import { chatbotDb, ChatMessage } from './chatbotService';
 import { getSecret } from '../utils/secretsManager';
 import { agentModeService } from './agentModeService';
 import { meterUserUsage } from './usageRecorderService';
+import type { LLMUsageContext } from '../utils/llmService';
 import {
   ONBOARDING_TELEMETRY_EVENTS,
   recordOnboardingEvent,
@@ -42,6 +43,15 @@ export const LIVE_MODEL = 'models/gemini-3.1-flash-live-preview';
 const LIVE_VOICE_NAME = 'Kore';
 const LIVE_TOOL_TIMEOUT_MS = 12_000;
 const LIVE_TOOL_SUMMARY_TIMEOUT_MS = 5_000;
+// ENG-2072: a live voice call is always a real person talking to Emma right now,
+// even if it's attached to a session originally created by a schedule — never let
+// create_work_plan/modify_work_plan/launch_predefined_work_plan fall back to
+// session.sessionType and force hands-off autocomplete. Frozen because this one
+// object is reused across every concurrent tool call this process handles —
+// executeTool only ever reads or spreads it today, but a future accidental
+// `context.foo = ...` on a shared reference would silently corrupt every other
+// in-flight live voice call instead of just this one.
+const ATTENDED_TOOL_CONTEXT = Object.freeze({ isUnattendedRun: false });
 export type LiveToolProfile = 'default' | 'onboarding';
 
 const ONBOARDING_LIVE_TOOLS = new Set([
@@ -92,6 +102,7 @@ function stableToolExecutionKey(toolName: string, args: unknown): string {
  * are interpreted by Gemini 3.1 Flash's voice director layer.
  */
 const LIVE_SYSTEM_PROMPT = `You are Emma, an expert marketing assistant having a voice conversation.
+When the user is stuck on a product or integration setup step, call search_user_guide with the exact blocked step before asking them for manual input. It searches the canonical docs at docs.agentweb.pro — give the one relevant action and its source link, not a library.
 Speak with a neutral General American English accent.
 Respond naturally and conversationally — keep answers concise and direct.
 Be warm and friendly, enthusiastic about good news, thoughtful when analyzing data, encouraging when motivating the user, and concerned when flagging problems.
@@ -782,6 +793,7 @@ async function summarizeToolResult(
   toolResult: Record<string, unknown>,
   seen: Set<string>,
   out: LiveArtifact[],
+  usageContext?: LLMUsageContext,
 ): Promise<string | undefined> {
   const resultJson = JSON.stringify(toolResult).slice(0, 3000);
   const argsJson = JSON.stringify(toolArgs).slice(0, 500);
@@ -809,7 +821,13 @@ Tool result: ${resultJson}`;
       agentModeService.callLLM(
         ARTIFACT_EXTRACT_MODEL,
         [{ role: 'user', content: prompt }],
-        { max_completion_tokens: 600, temperature: 0, taskClass: 'interactive_chat' },
+        {
+          max_completion_tokens: 600,
+          temperature: 0,
+          taskClass: 'interactive_chat',
+          // ENG-1858: part of the live session user's turn, not "system".
+          usageContext: usageContext ?? { feature: 'live_voice_tool_summary' },
+        },
       ),
       LIVE_TOOL_SUMMARY_TIMEOUT_MS,
       `Live tool summary for ${toolName}`,
@@ -1100,7 +1118,7 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
           let execution: Promise<any>;
           if (isOnboardingSafe) {
             execution = agentModeService.executeTool(
-              LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false,
+              LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false, ATTENDED_TOOL_CONTEXT,
             );
           } else {
             const executionKey = stableToolExecutionKey(toolName, toolArgs);
@@ -1108,7 +1126,7 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
             if (!trackedExecution) {
               trackedExecution = {
                 promise: Promise.resolve().then(() => agentModeService.executeTool(
-                  LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false,
+                  LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false, ATTENDED_TOOL_CONTEXT,
                 )),
                 settled: false,
               };
@@ -1136,7 +1154,11 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
           const resultObj = typeof result === 'object' && result !== null
             ? result as Record<string, unknown>
             : { result: text };
-          const narrative = await summarizeToolResult(toolName, toolArgs, resultObj, seenUrls, entry.pendingArtifacts);
+          const narrative = await summarizeToolResult(toolName, toolArgs, resultObj, seenUrls, entry.pendingArtifacts, {
+            userId: entry.userId,
+            sessionId,
+            feature: 'live_voice_tool_summary',
+          });
           // Record for UI display (collapsible "Used N tools" block, like other models)
           if (!entry.pendingToolCalls) entry.pendingToolCalls = [];
           entry.pendingToolCalls.push({ id: fc.id || toolName, name: toolName, arguments: toolArgs, result, narrative });

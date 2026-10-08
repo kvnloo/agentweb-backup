@@ -3,6 +3,9 @@ import { authenticateToken } from "../middleware/auth";
 import { userDb, taskDb } from "../services/db";
 import { getMetaAccessToken } from "../utils/secretsManager";
 import { applyLeadMetrics, finalizeLeadCosts } from "../utils/metaActionFamilies";
+import { sandboxManagementUrl } from "../services/sandboxManagementUrl";
+import { isEvaluationUser } from "../services/evaluationPolicy";
+import { stampMetaImageUpload, stampMetaPublish } from "../services/creativeLineage";
 
 const router = express.Router();
 
@@ -142,21 +145,31 @@ router.get("/ad-performance", async (req, res) => {
 
     // Import Meta API fetch utilities with retry and pagination support
     const { fetchWithRetryAndPaging } = await import('../utils/metaApiFetch');
-    
+
+    /*
+     * ENG-1584 sibling: fetchWithRetryAndPaging is bounded (META_PAGING_MAX_PAGES) and none of
+     * these six reads set a `limit`, so a dashboard for an account past the default page-size
+     * bound was silently short with no signal at all. The helper already reports
+     * `pagingTruncated` for exactly this; this route just never read it.
+     */
+    const truncatedSections: string[] = [];
+
     // Get campaigns using Graph API
     console.log("Fetching campaigns for timeframe:", timeframe);
     let campaigns;
     try {
       const campaignsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`;
-      console.log("Campaigns URL:", campaignsUrl);
+      // Never log the URL itself: it carries `access_token` in the query string.
+      console.log("Fetching campaigns for act_%s", adAccountId);
 
       const campaignsData = await fetchWithRetryAndPaging(campaignsUrl);
-      
+
       if (campaignsData.error) {
         throw new Error(`Graph API Error: ${campaignsData.error.message}`);
       }
-      
+
       campaigns = campaignsData.data || [];
+      if (campaignsData.pagingTruncated === true) truncatedSections.push('Campaigns');
       console.log("Campaigns fetched successfully:", campaigns.length);
     } catch (campaignError: any) {
       console.error("Error fetching campaigns:", campaignError);
@@ -168,15 +181,16 @@ router.get("/ad-performance", async (req, res) => {
     let adSets;
     try {
       const adSetsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adsets?fields=id,name,status,campaign_id,targeting&access_token=${accessToken}`;
-      console.log("Ad Sets URL:", adSetsUrl);
+      console.log("Fetching ad sets for act_%s", adAccountId);
       
       const adSetsData = await fetchWithRetryAndPaging(adSetsUrl);
-      
+
       if (adSetsData.error) {
         throw new Error(`Graph API Error: ${adSetsData.error.message}`);
       }
-      
+
       adSets = adSetsData.data || [];
+      if (adSetsData.pagingTruncated === true) truncatedSections.push('Ad Sets');
       console.log("Ad Sets fetched successfully:", adSets.length);
     } catch (adSetsError: any) {
       console.error("Error fetching ad sets:", adSetsError);
@@ -187,16 +201,23 @@ router.get("/ad-performance", async (req, res) => {
     console.log("Fetching ads for timeframe:", timeframe);
     let ads;
     try {
-      const adsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}&access_token=${accessToken}`;
-      console.log("Ads URL:", adsUrl);
+      // ENG-1742 follow-up: unencoded `{...}` in a nested field selector is silently mangled
+      // by Graph — on this `ads` edge it doesn't hard-error, it just drops the `creative` field
+      // from every result with no indication anything is missing. Confirmed live 2026-09-04:
+      // this exact string returned every ad with `creative` entirely absent; the encoded form
+      // (`encodeURIComponent('creative{...}')`) returns real thumbnail_url/title/body/image_url.
+      const creativeFields = encodeURIComponent('creative{thumbnail_url,title,body,image_url}');
+      const adsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,status,adset_id,campaign_id,${creativeFields}&access_token=${accessToken}`;
+      console.log("Fetching ads for act_%s", adAccountId);
       
       const adsData = await fetchWithRetryAndPaging(adsUrl);
-      
+
       if (adsData.error) {
         throw new Error(`Graph API Error: ${adsData.error.message}`);
       }
-      
+
       ads = adsData.data || [];
+      if (adsData.pagingTruncated === true) truncatedSections.push('Ads');
       console.log("Ads fetched successfully:", ads.length);
     } catch (adsError: any) {
       console.error("Error fetching ads:", adsError);
@@ -217,6 +238,7 @@ router.get("/ad-performance", async (req, res) => {
       }
       
       insights = adInsightsData.data || [];
+      if (adInsightsData.pagingTruncated === true) truncatedSections.push('Ad-level Insights');
       console.log("Ad-level insights fetched successfully:", insights.length);
 
       // Fetch adset-level insights for ad sets processing
@@ -229,6 +251,7 @@ router.get("/ad-performance", async (req, res) => {
       }
       
       adSetInsights = adSetInsightsData.data || [];
+      if (adSetInsightsData.pagingTruncated === true) truncatedSections.push('Adset-level Insights');
       console.log("Adset-level insights fetched successfully:", adSetInsights.length);
 
       // Fetch campaign-level insights for campaigns processing
@@ -241,6 +264,7 @@ router.get("/ad-performance", async (req, res) => {
       }
       
       campaignInsights = campaignInsightsData.data || [];
+      if (campaignInsightsData.pagingTruncated === true) truncatedSections.push('Campaign-level Insights');
       console.log("Campaign-level insights fetched successfully:", campaignInsights.length);
     } catch (insightsError: any) {
       console.error("Error fetching insights:", insightsError);
@@ -266,7 +290,10 @@ router.get("/ad-performance", async (req, res) => {
       adsData,
       campaignSummary,
       timeframe,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      // Empty when every read was complete — present and non-empty when the dashboard is
+      // short some rows, so a caller does not read a truncated read as the whole account.
+      ...(truncatedSections.length > 0 ? { truncatedSections, complete: false } : { complete: true })
     });
   } catch (error: any) {
     console.error("Error fetching ad performance:", error);
@@ -560,7 +587,8 @@ router.get("/campaigns-and-adsets", async (req, res) => {
     console.log("Ad Account:", adAccountId);
 
     const businessUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}?fields=account_id,name,currency,timezone_name,business&access_token=${accessToken}`;
-    console.log("Business URL:", businessUrl);
+    // The URL carries `access_token`; log the target, never the query string.
+    console.log("Fetching business portfolio for act_%s", adAccountId);
     
     const businessResponse = await fetch(businessUrl);
     const businessData = await businessResponse.json();
@@ -582,7 +610,7 @@ router.get("/campaigns-and-adsets", async (req, res) => {
     // Now fetch pages from the business portfolio
     console.log("=== Fetching Pages from Business Portfolio ===");
     const pagesUrl = `https://graph.facebook.com/${apiVersion}/${businessId}/owned_pages?fields=id,name,category&access_token=${accessToken}`;
-    console.log("Pages URL:", pagesUrl);
+    console.log("Fetching owned pages for business %s", businessId);
     
     const pagesResponse = await fetch(pagesUrl);
     const pagesData = await pagesResponse.json();
@@ -701,7 +729,7 @@ router.post("/create-ad", async (req, res) => {
     // First, verify the ad account exists and get its details
     console.log("=== Verifying Ad Account ===");
     const accountUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}?fields=account_id,name,currency,timezone_name,account_status&access_token=${accessToken}`;
-    console.log("Account URL:", accountUrl);
+    console.log("Verifying ad account act_%s", adAccountId);
     
     const accountResponse = await fetch(accountUrl);
     const accountData = await accountResponse.json();
@@ -862,9 +890,22 @@ router.post("/create-ad", async (req, res) => {
       console.error("Ad creation API Error details:", createAdData.error);
       throw new Error(`Graph API Error: ${createAdData.error.message} (Code: ${createAdData.error.code})`);
     }
+
+    // ENG-2194: link a generated image published from the dialog to its Meta creative and ad, as
+    // agent mode does (inert unless CREATIVE_LINEAGE_ENABLED + table; never throws).
+    if (creativeResult.id && createAdData.id) {
+      void stampMetaImageUpload({ userId, imageUrl, imageHash });
+      void stampMetaPublish({
+        userId, accountId: CLEAN_ACCOUNT_ID(adAccountId), metaCreativeId: String(creativeResult.id),
+        adId: String(createAdData.id), params: { image_hash: imageHash }, via: 'create_ad',
+      });
+    }
     
-    // Generate ad management URL using Facebook Ads Manager
-    const adManagementUrl = `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${adAccountId}`;
+    // Generate ad management URL using Facebook Ads Manager — a sandbox account's ad
+    // account is fictional, so it gets a portal-internal link instead (ENG-1909).
+    const adManagementUrl = isEvaluationUser(userId)
+      ? sandboxManagementUrl(campaignId)
+      : `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${adAccountId}`;
     console.log("Ad Management URL:", adManagementUrl);
     
     // Record the ad creation in the existing image file in result_files

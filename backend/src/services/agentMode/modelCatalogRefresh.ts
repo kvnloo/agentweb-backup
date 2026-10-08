@@ -1,0 +1,214 @@
+import { LLM_MODEL_REGISTRY, LLMModelConfig, ModelProvider } from './llmModelRegistry';
+import { MODEL_PRICING, ModelPrice, costScoreFromPrice } from '../../utils/llmPricing';
+import { resolveOpenRouterUpstreamModelId } from '../../utils/openRouterGatewayContract';
+import { blendedPrice, inferFamily, supersession } from './modelSupersession';
+
+type Registry = Readonly<Record<string, Readonly<LLMModelConfig>>>;
+const PROVIDERS: Record<string, ModelProvider> = {
+  'x-ai': 'xai', openai: 'openai', anthropic: 'anthropic', google: 'google',
+  deepseek: 'deepseek', qwen: 'qwen', moonshotai: 'moonshot', 'z-ai': 'zai', mistralai: 'mistral',
+};
+const object = (v: unknown): Record<string, unknown> | undefined =>
+  v !== null && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : undefined;
+function rows(payload: unknown): unknown[] {
+  const data = object(payload)?.data;
+  if (!Array.isArray(data)) throw new Error('Catalog response must contain a data array');
+  return data;
+}
+function upstream(id: string): string {
+  try { return resolveOpenRouterUpstreamModelId(id); } catch { return id; }
+}
+function rate(value: unknown): number | undefined {
+  if (typeof value !== 'number' && (typeof value !== 'string' || !/^\d+(\.\d+)?([eE][+-]?\d+)?$/.test(value))) return;
+  // Avoid binary scaling noise causing a price-book diff on unchanged quotes.
+  const n = Number((Number(value) * 1e6).toPrecision(15));
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+export interface CatalogCandidate { id: string; config: LLMModelConfig; price: ModelPrice }
+
+/** A new addition priced more than 3x off its CLOSEST existing family sibling gets a
+ * loud review-time warning (ENG-2293 follow-up) — e.g. a transient OpenRouter
+ * promo/glitch quote, not a hard gate. */
+const PRICE_OUTLIER_RATIO = 3;
+
+/** OpenRouter prices are per token. Only supported text/tool product lines enter this catalog.
+ * Source: https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties
+ */
+export function discoverNewModels(payload: unknown, registry: Registry = LLM_MODEL_REGISTRY, additionIds: readonly string[] = []): CatalogCandidate[] {
+  const known = new Set(Object.keys(registry).map(upstream));
+  return parseOpenRouter(payload).filter(m => !known.has(upstream(m.id)) &&
+    (additionIds.includes(m.id) || Object.keys(registry).some(id => upstream(id).split('/')[0] === upstream(m.id).split('/')[0]
+      && inferFamily(id) === inferFamily(m.id))));
+}
+export function parseOpenRouter(payload: unknown): CatalogCandidate[] {
+  const result = new Map<string, CatalogCandidate>();
+  for (const value of rows(payload)) {
+    const row = object(value), p = object(row?.pricing), architecture = object(row?.architecture);
+    if (!row || typeof row.id !== 'string' || !/^[\w-]+\/[\w.:-]+$/.test(row.id)) continue;
+    const providerId = row.id.split('/')[0];
+    if (!Object.prototype.hasOwnProperty.call(PROVIDERS, providerId)) continue;
+    const provider = PROVIDERS[providerId];
+    const params = row.supported_parameters;
+    const outputs = architecture?.output_modalities;
+    if (!provider || !Array.isArray(params) || !params.every(v => typeof v === 'string') || !params.includes('tools')
+      || !Array.isArray(outputs) || !outputs.every(v => typeof v === 'string') || outputs.length !== 1 || outputs[0] !== 'text') continue;
+    const inPerM = rate(p?.prompt), outPerM = rate(p?.completion);
+    if (inPerM === undefined || outPerM === undefined) continue;
+    const price: ModelPrice = { inPerM, outPerM };
+    let invalidCache = false;
+    for (const [field, key] of [['input_cache_read', 'cacheReadPerM'], ['input_cache_write', 'cacheWritePerM']] as const) {
+      if (p?.[field] != null) {
+        const n = rate(p[field]);
+        if (n === undefined) invalidCache = true;
+        else price[key] = n;
+      }
+    }
+    if (invalidCache) continue;
+    const id = `openrouter/${row.id}`;
+    result.set(id, { id, price, config: {
+      client: null, name: typeof row.name === 'string' ? row.name : row.id,
+      description: 'Auto-added from OpenRouter; benchmark score shown when available.',
+      // Unreviewed pricing/capabilities must never reach customers on their own:
+      // adminOnly drops the entry from every customer-facing model list and from
+      // the session model switch. A human removes the flag after review.
+      adminOnly: true,
+      provider, family: inferFamily(id), supportsTemperature: params.includes('temperature'),
+      supportsTools: true, supportsToolChoice: params.includes('tool_choice'),
+      // Vision stays opt-in until the describe_image path is verified.
+      ...(provider === 'google' || provider === 'openai' ? { maxTools: 128 } : {}),
+    } });
+  }
+  return [...result.values()].sort((a, b) => a.id.localeCompare(b.id));
+}
+
+/**
+ * Registry id -> the Artificial Analysis slug that is actually that model. Needed
+ * only where the two catalogs disagree on which release a bare name means:
+ * OpenRouter's `deepseek/deepseek-v4-pro` is the 0423 release, but AA's
+ * `deepseek-v4-pro` slug now names the newer 0813 release (the 0423 one is
+ * `deepseek-v4-pro-0424`). Without this the daily refresh matched the 0423 entry
+ * to the 0813 row and wrote 0813's score onto it (36 instead of 30). A slug that
+ * is absent from the payload simply reports "unmatched; score unchanged".
+ */
+const AA_SLUG_OVERRIDES: Readonly<Record<string, string>> = {
+  'openrouter/deepseek/deepseek-v4-pro': 'deepseek-v4-pro-0424',
+  'openrouter/deepseek/deepseek-v4-pro-0813': 'deepseek-v4-pro',
+};
+
+/** Exact model-version matching only. Ambiguous effort variants are reported, never guessed.
+ * Source: https://artificialanalysis.ai/api-reference
+ */
+export function refreshScores(registry: Registry, payload: unknown | undefined, date: string) {
+  const changes: Record<string, Partial<LLMModelConfig>> = {};
+  const reports: string[] = [];
+  if (payload === undefined) return { changes, reports: ['Artificial Analysis skipped: ARTIFICIAL_ANALYSIS_API_KEY is missing; scores unchanged.'] };
+  const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const scores = rows(payload).flatMap(value => {
+    const row = object(value), creator = object(row?.model_creator), evaluations = object(row?.evaluations);
+    const score = evaluations?.artificial_analysis_intelligence_index;
+    if (!row || typeof row.slug !== 'string' || typeof creator?.slug !== 'string'
+      || typeof score !== 'number' || !Number.isFinite(score) || score < 0 || score > 100) return [];
+    return [{ slug: row.slug, provider: normalize(creator.slug), score,
+      name: typeof row.name === 'string' ? row.name : row.slug }];
+  });
+  for (const [id, config] of Object.entries(registry)) {
+    if (config.isLive) continue;
+    const [provider, model] = upstream(id).split('/');
+    if (!model) continue;
+    const source = normalize((config.qualityScoreSource ?? '').replace(/\(https?:.*$/, ''));
+    const slugOverride = AA_SLUG_OVERRIDES[id];
+    const matches = scores.filter(s => (s.provider === normalize(provider) || s.provider === normalize(config.provider ?? ''))
+      && (slugOverride ? normalize(s.slug) === normalize(slugOverride)
+        : normalize(s.slug) === normalize(model) || normalize(s.name) === normalize(model)
+        // An existing AA source can explicitly identify a benchmark effort variant.
+        // Do not pick the highest scoring variant or strip arbitrary effort suffixes.
+        || ([s.slug, s.name].some(name => normalize(name).startsWith(normalize(model))
+          && source.endsWith(normalize(name))))));
+    if (matches.length !== 1) { reports.push(`${id}: AA ${matches.length ? 'ambiguous' : 'unmatched'}; score unchanged`); continue; }
+    const match = matches[0];
+    if (config.qualityScore === match.score) continue;
+    changes[id] = { qualityScore: match.score, qualityScoreSource:
+      `Artificial Analysis Intelligence Index, API v2, snapshot ${date}, ${match.slug} (https://artificialanalysis.ai/)` };
+  }
+  return { changes, reports };
+}
+
+/** Fetch once, compose pure steps, return a reviewable code-only patch plan. No writes. */
+export async function refreshModelCatalog(options: {
+  fetch?: typeof fetch; aaApiKey?: string; registry?: Registry;
+  prices?: Readonly<Record<string, ModelPrice>>; date?: string;
+  catalog?: unknown; aa?: unknown; additionIds?: readonly string[];
+} = {}) {
+  const request = options.fetch ?? fetch;
+  const registry = options.registry ?? LLM_MODEL_REGISTRY, prices = options.prices ?? MODEL_PRICING;
+  const date = options.date ?? new Date().toISOString().slice(0, 10);
+  const apiKey = options.aaApiKey ?? process.env.ARTIFICIAL_ANALYSIS_API_KEY;
+  const get = async (url: string, headers?: Record<string, string>) => {
+    const res = await request(url, { headers, signal: AbortSignal.timeout(30_000) });
+    if (!res.ok) throw new Error(`Catalog fetch failed: ${new URL(url).hostname} HTTP ${res.status}`);
+    return res.json() as Promise<unknown>;
+  };
+  const catalog = options.catalog ?? await get('https://openrouter.ai/api/v1/models');
+  const aa = options.aa ?? (apiKey ? await get('https://artificialanalysis.ai/api/v2/data/llms/models', { 'x-api-key': apiKey }) : undefined);
+  const additions = discoverNewModels(catalog, registry, options.additionIds)
+    .filter(m => !options.additionIds || options.additionIds.includes(m.id));
+  const next: Record<string, Readonly<LLMModelConfig>> = { ...registry };
+  const registryChanges: Record<string, Partial<LLMModelConfig>> = {};
+  const pricingChanges: Record<string, ModelPrice> = {};
+  for (const model of additions) { next[model.id] = model.config; registryChanges[model.id] = model.config; pricingChanges[model.id] = model.price; }
+  const { changes, reports } = refreshScores(next, aa, date);
+  // Flag a wildly mispriced addition loudly — never block on it. A hard gate here
+  // would recreate the exact deadlock ENG-2293 fixed (one bad quote blocking every
+  // future model forever); a report a reviewer can't miss is the safer trade-off.
+  // Symmetric ratio distance between two non-negative prices. Both zero is a
+  // match (free addition into a free family); exactly one zero is an extreme
+  // mismatch, never Infinity-by-default on an unrelated zero baseline.
+  const priceRatio = (a: number, b: number): number =>
+    a > 0 && b > 0 ? Math.max(a / b, b / a) : a === 0 && b === 0 ? 1 : Infinity;
+  for (const model of additions) {
+    const siblingPrices = Object.entries(registry)
+      .filter(([id, config]) => (config.family ?? inferFamily(id)) === model.config.family && prices[id])
+      .map(([id]) => blendedPrice(prices[id]));
+    if (!siblingPrices.length) continue;
+    const addedPrice = blendedPrice(model.price);
+    // Compare against the CLOSEST existing sibling, not the family average — a
+    // family can legitimately span several price tiers under one family name
+    // (verified: gpt-sol's two real, correctly-priced members alone span 2.8x),
+    // so a plain average is already near the outlier cutoff before any new
+    // addition even arrives, and would false-flag a normal new tier member.
+    let nearest = siblingPrices[0], bestRatio = priceRatio(addedPrice, nearest);
+    for (const p of siblingPrices.slice(1)) {
+      const r = priceRatio(addedPrice, p);
+      if (r < bestRatio) { bestRatio = r; nearest = p; }
+    }
+    if (bestRatio > PRICE_OUTLIER_RATIO) {
+      reports.push(`⚠️ PRICE OUTLIER: ${model.id} blended $${addedPrice.toFixed(3)}/M is ${bestRatio.toFixed(1)}x its closest "${model.config.family}" family sibling ($${nearest.toFixed(3)}/M) — verify before merging.`);
+    }
+  }
+  for (const [id, config] of Object.entries(next)) {
+    const patch = { ...(!config.family ? { family: inferFamily(id) } : {}), ...changes[id] };
+    if (Object.keys(patch).length) registryChanges[id] = { ...registryChanges[id], ...patch };
+    next[id] = { ...config, ...patch };
+  }
+  // Every existing price is a human decision (see withDerivedCache usage and inline
+  // confidence/promo commentary in llmPricing.ts) — a live quote never silently
+  // overwrites it, for any upstream. Only report the drift for human review; only
+  // brand-new additions (above) get priced directly from the quote.
+  const quotes = new Map(parseOpenRouter(catalog).map(m => [upstream(m.id), m.price]));
+  const additionIds = new Set(additions.map(m => m.id));
+  for (const id of Object.keys(registry)) {
+    if (additionIds.has(id)) continue;
+    const quote = quotes.get(upstream(id));
+    if (!quote || !prices[id]) continue;
+    if (prices[id].inPerM !== quote.inPerM || prices[id].outPerM !== quote.outPerM)
+      reports.push(`${id}: live quote ($${quote.inPerM}/$${quote.outPerM} in/out) diverges from curated price ($${prices[id].inPerM}/$${prices[id].outPerM}); not applied`);
+  }
+  const nextPrices = { ...prices, ...pricingChanges };
+  const candidates = Object.entries(next).filter(([, m]) => !m.isLive && !m.internalOnly)
+    .map(([id, config]) => ({ id, ...config, cost: nextPrices[id] ? blendedPrice(nextPrices[id]) : NaN }));
+  return { date, additions: additions.map(m => m.id), registryChanges, pricingChanges, reports,
+    costs: Object.fromEntries(candidates.map(m => [m.id, {
+      blendedPerM: Number.isFinite(m.cost) ? m.cost : null,
+      costScore: nextPrices[m.id] ? costScoreFromPrice(nextPrices[m.id]) : null,
+    }])), supersededBy: Object.fromEntries(supersession(candidates)) };
+}

@@ -1,3 +1,4 @@
+import { isEvaluationUser } from '../services/evaluationPolicy';
 import express from "express";
 import { disconnectStaleUserSockets } from "../services/sessionSockets";
 import jwt from "jsonwebtoken";
@@ -7,9 +8,10 @@ import axios from "axios";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { userDb, taskDb, subscriberDb, crmDb, orgDb } from "../services/db";
-import { mintDelegateToken } from "../services/delegateAccessToken";
+import { mintDelegateToken, mintEvaluationDelegateToken } from "../services/delegateAccessToken";
 import { linkedInOutreachService } from "../services/linkedInOutreachService";
 import { deleteAccountById, createAccount } from "../services/connectedAccountsDb";
+import { sanitizeUserForResponse } from "../utils/accountSecretRedaction";
 import { waitlistDb } from "../services/waitlistDb";
 import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
@@ -23,8 +25,10 @@ import { workflowDb } from "../services/workflowDb";
 import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
+import { deriveSelfActivity } from "../utils/selfActivity";
+import { getProjectionsBatch } from "../services/spendProjectionDb";
 import { generateSecurePassword, getInitialPasswordExpiry } from "../utils/secureRandom";
-import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance, resolveBillingUserId } from "../services/tokenUsageService";
+import { grantTokenBonus, resolveBillingUserId } from "../services/tokenUsageService";
 import { grantMonthlyLlmUsageCredit } from "../services/llmUsageCreditService";
 import { getRevenueMetrics } from "../services/revenueService";
 import { detectMrrCollectionGaps } from "../services/mrrCollectionGapService";
@@ -40,6 +44,7 @@ import { resolveConfigTarget } from "../services/analyticsConfigResolver";
 import { readAnalyticsConfig, writeAnalyticsConfig } from "../services/analyticsConfigStore";
 import { validateAnalyticsConfig } from "../services/analyticsConfigValidator";
 import { sweepUndeliverableDomains } from "../services/emailDeliverabilityService";
+import { isSessionList } from "../utils/sessionList";
 
 const router = express.Router();
 
@@ -203,12 +208,9 @@ const ADMIN_USER_LIST_FIELDS = [
   "productDomain",
   "cmsType",
   "subscriptionType",
-  "tokenUsage",
   "tokenUsageHistory",
   "tokenAllowanceBonus",
   "llmUsageCredits",
-  "extraCostUsage",
-  "extraCostUsageHistory",
   "googleDriveFolders",
   "introductionEmailSent",
   "utmSource",
@@ -227,7 +229,7 @@ const ADMIN_USER_LIST_FIELDS = [
   "orgRole",
 ] as const;
 
-const compactAdminUserForList = (user: any): Record<string, any> => {
+const compactAdminUserForList = (user: any, hasUsageThisMonth = false, spendThisMonthUsd?: number): Record<string, any> => {
   const compact: Record<string, any> = {};
   for (const field of ADMIN_USER_LIST_FIELDS) {
     if (user[field] !== undefined) {
@@ -235,6 +237,10 @@ const compactAdminUserForList = (user: any): Record<string, any> => {
     }
   }
   compact.secretNames = user.secrets ? Object.keys(user.secrets) : [];
+  // ENG-1271: per-account customer self-activity vs staff-operated signal.
+  compact.selfActivity = deriveSelfActivity(user, hasUsageThisMonth);
+  // Settled spend this month from the ledger (ENG-1250 AC7); omitted when the lookup failed so the UI shows "—", not a false $0.
+  if (spendThisMonthUsd !== undefined) compact.spendThisMonthUsd = spendThisMonthUsd;
   return compact;
 };
 
@@ -715,7 +721,7 @@ router.post("/crm-sync/:source/start", async (req, res) => {
 
     const syncStartedAt = new Date().toISOString();
     const results = leads.length > 0
-      ? await crmDb.batchCreateLeads(parsed.listId, leads)
+      ? await crmDb.batchCreateLeads(parsed.listId, leads, { origin: 'integration' })
       : { successCount: 0, newCount: 0, mergedCount: 0, errorCount: 0, errors: [] as string[], anonymizedSkipped: 0 };
 
     let updatedLastSyncAt: string | null = parsed.lastSyncAt || null;
@@ -786,8 +792,33 @@ router.get("/email-deliverability/mx-sweep", async (_req, res) => {
 router.get("/users", async (req, res) => {
   try {
     const hideBotLike = req.query.hideBotLike !== "false";
-    const users = await userDb.getAllUsers(hideBotLike);
-    const sanitized = users.map(compactAdminUserForList);
+    // The partner-portal roster is where Access Portal lives; sandbox (eval_)
+    // accounts must stay reachable here even though every fleet sweep excludes them.
+    const users = await userDb.getAllUsers(hideBotLike, { includeSandbox: true });
+    // ENG-1271 / ENG-1250 AC7: "has spend this month" for the self-activity signal comes
+    // from the spend ledger in one batched read, not the retired legacy counter. It is a
+    // secondary signal, so a failed read must not take the whole roster down: log it and
+    // treat usage as unknown (staffOperatedSuspect false) rather than silently inventing it.
+    // Keyed by each ACCOUNT's own id, deliberately not its billing owner: the counter this replaces was
+    // per-account, and pooled usage was charged to the owner's counter only, so a member's own was always
+    // empty. Resolving to the owner would flag every member of an org because the owner spent.
+    let spendingThisMonth: Map<string, { settledMicroUsd: number }> | null = null;
+    try {
+      spendingThisMonth = await getProjectionsBatch(
+        users.map((u: any) => u.userId),
+        new Date().toISOString().slice(0, 7),
+      );
+    } catch (error) {
+      console.error("[admin/users] spend lookup for the self-activity signal failed; leaving it unset:", error);
+    }
+    const sanitized = users.map((u: any) => {
+      const settledMicroUsd = spendingThisMonth ? (spendingThisMonth.get(u.userId)?.settledMicroUsd ?? 0) : undefined;
+      return compactAdminUserForList(
+        u,
+        (settledMicroUsd ?? 0) > 0,
+        settledMicroUsd === undefined ? undefined : settledMicroUsd / 1_000_000,
+      );
+    });
 
     // Batch-fetch org name + owner + analytics-sharing flag for users in an org.
     // Also capture the owner's subscription tier so org members can inherit it
@@ -837,18 +868,31 @@ router.get("/users", async (req, res) => {
       }
     }
 
-    // Batch-fetch Clarity replay session URLs for all users
-    const replayResults = await Promise.all(
-      sanitized.map((user: any) =>
-        settingsService.getSetting(`replay_sessions_${user.userId}`).catch(() => null)
-      )
-    );
-    for (let i = 0; i < sanitized.length; i++) {
-      const setting = replayResults[i];
-      if (setting?.settingValue) {
+    // Fetch only replay settings for these users in bounded BatchGet chunks.
+    // Preserve the old per-setting best-effort behavior.
+    const replaySettings = await settingsService.getSettings(
+      sanitized.map((user: any) => `replay_sessions_${user.userId}`),
+    ).catch(() => []);
+    const replayByUserId = new Map<string, string>();
+    if (Array.isArray(replaySettings)) {
+      for (const setting of replaySettings) {
+        if (typeof setting?.settingName !== "string" ||
+            !setting.settingName.startsWith("replay_sessions_") ||
+            typeof setting.settingValue !== "string") {
+          continue;
+        }
+        replayByUserId.set(
+          setting.settingName.slice("replay_sessions_".length),
+          setting.settingValue,
+        );
+      }
+    }
+    for (const user of sanitized) {
+      const settingValue = replayByUserId.get(user.userId);
+      if (settingValue) {
         try {
-          const parsed = JSON.parse(setting.settingValue);
-          sanitized[i].replayUrl = parsed.replayUrl;
+          const parsed = JSON.parse(settingValue);
+          user.replayUrl = parsed.replayUrl;
         } catch {
           // skip malformed setting
         }
@@ -987,10 +1031,10 @@ router.get("/users/:userId", async (req, res) => {
     }
 
     // Strip encrypted secret values, expose only key names
-    const { secrets, ...rest } = user as any;
+    const secretNames = (user as any).secrets ? Object.keys((user as any).secrets) : [];
     res.json({
-      ...rest,
-      secretNames: secrets ? Object.keys(secrets) : [],
+      ...sanitizeUserForResponse(user),
+      secretNames,
     });
   } catch (error) {
     console.error("Error getting user:", error);
@@ -1019,7 +1063,7 @@ router.post("/users/:userId/deactivate", async (req, res) => {
 
     const updatedUser = await userDb.deactivateUser(userId);
     syncUserUpdateToLeadList(user.email, { isActive: false });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error deactivating user:", error);
     res.status(500).json({ message: "Error deactivating user" });
@@ -1042,7 +1086,7 @@ router.post("/users/:userId/reactivate", async (req, res) => {
 
     const updatedUser = await userDb.reactivateUser(userId);
     syncUserUpdateToLeadList(user.email, { isActive: true });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error reactivating user:", error);
     res.status(500).json({ message: "Error reactivating user" });
@@ -1063,7 +1107,7 @@ router.put("/users/:userId/support-note", async (req, res) => {
 
     // Update the user's support note
     const updatedUser = await userDb.updateUser(userId, { supportNote });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user support note:", error);
     res.status(500).json({ message: "Error updating support note" });
@@ -1095,7 +1139,7 @@ router.put("/users/:userId/funnel-status", async (req, res) => {
     const updatedUser = await userDb.updateUser(userId, {
       funnelStatus: normalizedStatus || null,
     });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user funnel status:", error);
     res.status(500).json({ message: "Error updating funnel status" });
@@ -1116,7 +1160,7 @@ router.put("/users/:userId/name", async (req, res) => {
     const updatedUser = await userDb.updateUser(userId, {
       displayName: displayName || null,
     });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user display name:", error);
     res.status(500).json({ message: "Error updating user display name" });
@@ -1252,7 +1296,7 @@ router.put("/users/:userId/stripe-customer-id", async (req, res) => {
 
     // Update the user's Stripe Customer ID
     const updatedUser = await userDb.updateUser(userId, { stripe_customer_id: stripeCustomerId });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating Stripe Customer ID:", error);
     res.status(500).json({ message: "Error updating Stripe Customer ID" });
@@ -1273,7 +1317,7 @@ router.put("/users/:userId/ad-account", async (req, res) => {
 
     // Update the user's ad account
     const updatedUser = await userDb.updateUser(userId, { adAccount });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user ad account:", error);
     res.status(500).json({ message: "Error updating ad account" });
@@ -1298,7 +1342,7 @@ router.put("/users/:userId/email-sender", async (req, res) => {
       defaultSenderUsername,
       fromName
     });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user email sender:", error);
     res.status(500).json({ message: "Error updating email sender" });
@@ -1358,7 +1402,7 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
     const updatedUser = await userDb.updateUser(userId, {
       slackChannels: channels.length > 0 ? channels : (null as any),
     });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user slack channels:", error);
     res.status(500).json({ message: "Error updating slack channels" });
@@ -1466,7 +1510,7 @@ router.put("/users/:userId/seo-domains", async (req, res) => {
     const updatedUser = await userDb.updateUser(userId, {
       seoDomains: seoDomains || []
     });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user SEO domains:", error);
     res.status(500).json({ message: "Error updating SEO domains" });
@@ -1592,7 +1636,7 @@ router.put("/users/:userId/google-drive-folders", async (req, res) => {
     }));
 
     const updatedUser = await userDb.updateUser(userId, { googleDriveFolders: sanitizedFolders });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user Google Drive folders:", error);
     res.status(500).json({ message: "Error updating Google Drive folders" });
@@ -1622,7 +1666,7 @@ router.put("/users/:userId/cms-type", async (req, res) => {
     const updatedUser = await userDb.updateUser(userId, {
       cmsType: cmsTypeValue
     });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user CMS Type:", error);
     res.status(500).json({ message: "Error updating CMS Type" });
@@ -1649,7 +1693,7 @@ router.put("/users/:userId/email", async (req, res) => {
       return res.status(400).json({ message: result.message });
     }
 
-    res.json(result.user);
+    res.json(sanitizeUserForResponse(result.user));
   } catch (error) {
     console.error("Error updating user email:", error);
     res.status(500).json({ message: "Error updating user email" });
@@ -1880,16 +1924,19 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
     //
     // ENG-1596: minting extracted to delegateAccessToken.ts so the MCP tool layer
     // (apiTools.ts) can mint the same shape of token internally, per tool call.
-    const delegateToken = mintDelegateToken(
+    const evaluationTarget = isEvaluationUser(targetUser.userId);
+    const delegateToken = (evaluationTarget ? mintEvaluationDelegateToken : mintDelegateToken)(
       { userId: adminReq.user.userId, email: adminReq.user.email },
       targetUser,
       DELEGATE_TOKEN_TTL,
     );
 
-    // Return the delegate token and customer portal URL
+    // Return the delegate token and customer portal URL. A sandbox account is a
+    // real customer-portal account (ENG-1907), so it opens through the same
+    // callback; only the token scope differs.
     const customerPortalUrl = process.env.CUSTOMER_FRONTEND_URL || "http://localhost:5174";
 
-    res.json({
+    res.set('Cache-Control', 'no-store').json({
       delegateToken,
       customerPortalUrl: `${customerPortalUrl}/oauth-callback?token=${delegateToken}`,
       expiresIn: DELEGATE_TOKEN_TTL
@@ -3890,10 +3937,17 @@ router.get("/analytics/crm", async (req, res) => {
       return items;
     };
 
-    const [leadLists, leads] = await Promise.all([
+    const [allLeadLists, allLeads] = await Promise.all([
       scanAll(`${TABLE_PREFIX}AW-LeadLists`),
       scanAll(`${TABLE_PREFIX}AW-Leads`),
     ]);
+
+    // ENG-2311: session lists hold one telemetry row per landing-page visit; counting them
+    // as lists/leads would swamp every platform total. Leads carry no listType, so exclude
+    // by the set of session listIds. Non-session lists pass through unchanged.
+    const sessionListIds = new Set(allLeadLists.filter((l) => isSessionList(l)).map((l) => l.listId));
+    const leadLists = allLeadLists.filter((l) => !sessionListIds.has(l.listId));
+    const leads = sessionListIds.size ? allLeads.filter((l) => !sessionListIds.has(l.listId)) : allLeads;
 
     const totalLists = leadLists.length;
     const totalLeads = leads.length;
@@ -4910,6 +4964,7 @@ router.get("/subscription-types", async (req, res) => {
         ...(type.monthlyCostAllowance != null ? { monthlyCostAllowance: type.monthlyCostAllowance } : {}),
         ...(type.llmUsagePolicy ? { llmUsagePolicy: type.llmUsagePolicy } : {}),
         ...(type.llmUsageTopUp ? { llmUsageTopUp: type.llmUsageTopUp } : {}),
+        ...(type.seatPricing ? { seatPricing: type.seatPricing } : {}),
       };
     }));
 
@@ -5061,6 +5116,23 @@ router.post("/subscription-types", async (req, res) => {
         }
       }
 
+      // Seat-based billing (ENG-2243..2246): admin-configured pricing for extra
+      // org seats. priceCents is the full monthly per-seat charge; baseSeats
+      // mirrors orgSeatService.baseSeatsForTier for display/config purposes.
+      let normalizedSeatPricing: any = undefined;
+      if (type.seatPricing != null) {
+        const { validateSeatPricingConfig } = await import('../services/orgSeatService');
+        normalizedSeatPricing = {
+          priceCents: Number(type.seatPricing.priceCents),
+          usageCreditMicroUsd: Number(type.seatPricing.usageCreditMicroUsd),
+          baseSeats: Number(type.seatPricing.baseSeats),
+        };
+        const seatPricingErrors = validateSeatPricingConfig(normalizedSeatPricing);
+        if (seatPricingErrors.length > 0) {
+          throw new Error(`${type.name} seat pricing: ${seatPricingErrors.join('; ')}`);
+        }
+      }
+
       // Pass through hiddenPages as-is; validate it's an array of strings
       const hiddenPages: string[] = Array.isArray(type.hiddenPages)
         ? type.hiddenPages.filter((p: any) => typeof p === 'string')
@@ -5077,6 +5149,7 @@ router.post("/subscription-types", async (req, res) => {
         ...(parsedCostAllowance != null && !isNaN(parsedCostAllowance) ? { monthlyCostAllowance: parsedCostAllowance } : {}),
         ...(normalizedLlmUsagePolicy ? { llmUsagePolicy: normalizedLlmUsagePolicy } : {}),
         ...(normalizedLlmUsageTopUp ? { llmUsageTopUp: normalizedLlmUsageTopUp } : {}),
+        ...(normalizedSeatPricing ? { seatPricing: normalizedSeatPricing } : {}),
       };
     }));
 
@@ -5279,7 +5352,7 @@ router.put("/users/:userId/subscription-type", async (req, res) => {
     // Update the user's subscription type
     const updatedUser = await userDb.updateUser(userId, { subscriptionType });
     syncUserUpdateToLeadList(user.email, { subscriptionType });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user subscription type:", error);
     res.status(500).json({ message: "Error updating subscription type" });
@@ -5303,7 +5376,7 @@ router.post("/users/:userId/token-bonus", async (req, res) => {
 
     await grantTokenBonus(userId, bonusTokens);
     const updatedUser = await userDb.getUserById(userId);
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error granting token bonus:", error);
     res.status(500).json({ message: "Error granting token bonus" });
@@ -5386,23 +5459,10 @@ router.post("/users/:userId/send-intro-email", async (req, res) => {
     await emailService.sendTeamIntroductionEmail(user.email, user.displayName);
     const sentAt = new Date().toISOString();
     const updatedUser = await userDb.updateUser(userId, { introductionEmailSent: sentAt });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error sending team introduction email:", error);
     res.status(500).json({ message: "Error sending team introduction email" });
-  }
-});
-
-// Get token usage for a specific user
-router.get("/users/:userId/token-usage", async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const usage = await getUserTokenUsage(userId);
-    const { allowance, bonus, effectiveAllowance } = await getUserTokenAllowance(userId);
-    res.json({ ...usage, allowance, effectiveAllowance });
-  } catch (error) {
-    console.error("Error getting user token usage:", error);
-    res.status(500).json({ message: "Error getting token usage" });
   }
 });
 
@@ -5554,6 +5614,10 @@ router.delete("/result-endpoints/:name", async (req, res) => {
   }
 });
 
+// ENG-2222: caps how much of a per-session score failure reason reaches
+// logs/the API response — see the truncation comment at its one call site below.
+const MAX_SCORE_FAILURE_REASON_LENGTH = 300;
+
 // Score chat sessions for satisfaction
 router.post("/chat-sessions/score", async (req, res) => {
   try {
@@ -5580,12 +5644,24 @@ router.post("/chat-sessions/score", async (req, res) => {
     );
 
     const scores: Record<string, any> = {};
-    const failed: string[] = [];
+    const failed: Array<{ sessionId: string; reason: string }> = [];
     results.forEach((result, i) => {
       if (result.status === "fulfilled") {
         scores[result.value.sessionId] = result.value.score;
       } else {
-        failed.push(sessionIds[i]);
+        const sessionId = sessionIds[i];
+        // Bounded, not the raw reason verbatim: a scoring failure message can
+        // echo back provider response content, which may itself derive from a
+        // real session transcript. Capping what reaches logs and the API
+        // response keeps this diagnostic without risking an unbounded dump of
+        // that content (CWE-532).
+        const rawReason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        const reason =
+          rawReason.length > MAX_SCORE_FAILURE_REASON_LENGTH
+            ? rawReason.slice(0, MAX_SCORE_FAILURE_REASON_LENGTH) + "…"
+            : rawReason;
+        console.error(`Score failed for session ${sessionId}: ${reason}`);
+        failed.push({ sessionId, reason });
       }
     });
 
@@ -5627,6 +5703,10 @@ router.put("/chat-sessions/:sessionId/score", async (req, res) => {
     res.status(500).json({ message: "Failed to update satisfaction score" });
   }
 });
+
+// ENG-2216: caps how much of a per-session judge-score failure reason reaches
+// logs/the API response — see the truncation comment at its one call site below.
+const MAX_JUDGE_SCORE_FAILURE_REASON_LENGTH = 300;
 
 // Score sessions with a custom judge
 router.post("/chat-sessions/judge-score", async (req, res) => {
@@ -5673,12 +5753,25 @@ router.post("/chat-sessions/judge-score", async (req, res) => {
     );
 
     const scores: Record<string, any> = {};
-    const failed: string[] = [];
+    const failed: Array<{ sessionId: string; reason: string }> = [];
     results.forEach((result, i) => {
       if (result.status === "fulfilled") {
         scores[result.value.sessionId] = result.value.score;
       } else {
-        failed.push(sessionIds[i]);
+        const sessionId = sessionIds[i];
+        // Bounded, not the raw reason verbatim: a judge-score failure message can
+        // echo back judge/provider response content (e.g. the "missing score"
+        // guard's JSON.stringify(parsed.score)), which may itself derive from a
+        // real session transcript. Capping what reaches logs and the API
+        // response keeps this diagnostic without risking an unbounded dump of
+        // that content (CWE-532).
+        const rawReason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        const reason =
+          rawReason.length > MAX_JUDGE_SCORE_FAILURE_REASON_LENGTH
+            ? rawReason.slice(0, MAX_JUDGE_SCORE_FAILURE_REASON_LENGTH) + "…"
+            : rawReason;
+        console.error(`Judge-score failed for session ${sessionId} (judge ${judgeId}): ${reason}`);
+        failed.push({ sessionId, reason });
       }
     });
 
@@ -5809,7 +5902,7 @@ router.post("/users/:userId/sync-stripe", async (req, res) => {
     // fills NULL fields and cannot unstick such an account.
     const updates = await reconcileStripeUserById(userId);
     const updatedUser = await userDb.getUserById(userId);
-    res.json({ updates, user: updatedUser });
+    res.json({ updates, user: updatedUser ? sanitizeUserForResponse(updatedUser) : null });
   } catch (error: any) {
     console.error("Error syncing Stripe subscription:", error.message);
     res.status(500).json({ message: "Failed to sync Stripe subscription" });

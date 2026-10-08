@@ -922,6 +922,41 @@ export class TwitterService {
     }, { operation: 'get_bookmarks', units: arrayLen });
   }
 
+  /**
+   * Retrieve recent posts liked by a user (GET /2/users/:id/liked_tweets) (ENG-979).
+   * Defaults to the connected account itself; pass a handle to read another user's likes.
+   * Requires the `like.read` scope, already requested by the X connect flow.
+   */
+  async getLikedTweets(ownerUserId: string, accountId: string, handle?: string, maxResults?: number): Promise<any[]> {
+    const target = handle?.trim();
+    let fetchedCount = 0;
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const userId = target
+        ? await this.resolveHandleToUserId(client, target)
+        : await this.getMyTwitterUserId(ownerUserId, accountId);
+      const limit = this.clampMaxResults(maxResults, 10, 10);
+      const tweets: any[] = [];
+      const seenTokens = new Set<string>();
+      let paginationToken: string | undefined;
+      do {
+        const res: any = await client.v2.userLikedTweets(userId, {
+          max_results: Math.max(10, limit - tweets.length),
+          'tweet.fields': ['public_metrics', 'created_at', 'author_id', 'conversation_id'],
+          ...(paginationToken ? { pagination_token: paginationToken } : {}),
+        });
+        const rows = res?.data?.data ?? res?.data;
+        if (!Array.isArray(rows) || rows.length === 0) break;
+        fetchedCount += rows.length;
+        tweets.push(...rows);
+        const nextToken = res?.data?.meta?.next_token ?? res?.meta?.next_token;
+        if (typeof nextToken !== 'string' || !nextToken || seenTokens.has(nextToken)) break;
+        seenTokens.add(nextToken);
+        paginationToken = nextToken;
+      } while (tweets.length < limit);
+      return tweets.slice(0, limit);
+    }, { operation: 'get_liked_tweets', requiredScope: 'like.read', units: () => fetchedCount, extraUserReads: target ? 1 : 0 });
+  }
+
   // ─── X Lists (read) ────────────────────────────────────────────────────────────
   // The X List read endpoints (owned_lists / list members / list tweets) require the
   // `list.read` OAuth scope. Accounts connected before that scope was added to the

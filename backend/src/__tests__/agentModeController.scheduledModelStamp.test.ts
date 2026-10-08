@@ -183,7 +183,6 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
       billingUserId: 'test-user-123',
       policy: null,
       costUsedMicroUsd: 0,
-      tokenUsed: 1,
       creditsApplied: false,
       mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' },
     });
@@ -200,11 +199,16 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
     } as any);
   });
 
-  it('does not stamp an unserved schedule model — records the fallback generation resolves to', async () => {
-    await runScheduledChat({ ...baseSchedule, llmModel: 'claude-sonnet-4-5' } as any, 'test-user-123', false);
+  // FAIL-LOUD (WP-G): this used to assert the silent swap to the fallback. An explicit
+  // pin that is not served now ends the run failed, before any session exists, so
+  // nothing is stamped and nothing runs on a different model.
+  it('does not run an unserved schedule model on the fallback — fails the run, nothing stamped', async () => {
+    const result: any = await runScheduledChat({ ...baseSchedule, llmModel: 'claude-sonnet-4-5' } as any, 'test-user-123', false);
 
-    expect(stampedModel()).toBe(FALLBACK);
-    expect(stampedModel()).not.toBe('claude-sonnet-4-5');
+    expect(result.status).toBe('failure');
+    expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
   });
 
   it('stamps the canonical id for a legacy alias, not the alias', async () => {
@@ -236,7 +240,9 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
     const alert = mockAlert.mock.calls[0][0];
     expect(alert.subject).toContain('unsupported');
     expect(alert.message).toContain('claude-sonnet-4-5');
-    expect(alert.message).toContain(FALLBACK);
+    // FAIL-LOUD (WP-G): the run no longer continues on a fallback model.
+    expect(alert.message).toContain('FAILED');
+    expect(alert.message).not.toContain(FALLBACK);
     // Deduped per (schedule, bad value) so a daily schedule cannot flood oncall.
     expect(alert.dedupeKey).toBe('schedule_model_invalid:sched-1:claude-sonnet-4-5');
   });
@@ -259,7 +265,6 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
         optimizedDefaultModel: 'gpt-5-chat-2',
       },
       costUsedMicroUsd: 80_000_000,
-      tokenUsed: 300_000_000,
       creditsApplied: false,
       mode: { usageMode: 'optimized', admissionAllowed: true, reason: 'optimization_threshold_reached' },
     });
@@ -308,9 +313,9 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
 });
 
 describe('getModelOptions — authoritative model discovery', () => {
-  it('keeps every entitled model selectable past the former optimization threshold (ENG-1211)', async () => {
+  it('keeps entitled models selectable and replaces superseded backup recommendations', async () => {
     mockAgentModeService.getSupportedModels.mockResolvedValue([
-      'anthropic.claude-opus-5', 'gpt-5-chat-2',
+      'anthropic.claude-opus-5', 'openrouter/x-ai/grok-4.6', 'openrouter/x-ai/grok-4.7',
     ] as any);
     mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
       billingUserId: 'test-user-123',
@@ -318,11 +323,10 @@ describe('getModelOptions — authoritative model discovery', () => {
         version: 'pro-v1', enforcementState: 'enforce',
         optimizationCostThresholdMicroUsd: 80_000_000,
         hardCostThresholdMicroUsd: 150_000_000,
-        optimizedModelIds: ['gpt-5-chat-2'],
-        optimizedDefaultModel: 'gpt-5-chat-2',
+        optimizedModelIds: ['openrouter/x-ai/grok-4.6'],
+        optimizedDefaultModel: 'openrouter/x-ai/grok-4.6',
       },
       costUsedMicroUsd: 80_000_000,
-      tokenUsed: 1,
       creditsApplied: false,
       mode: { usageMode: 'optimized', admissionAllowed: true, reason: 'optimization_threshold_reached' },
     });
@@ -336,15 +340,36 @@ describe('getModelOptions — authoritative model discovery', () => {
 
     // ENG-1211 AC1: nothing below the hard cap hides a model, so the picker
     // offers the full entitled set even on a legacy `optimized` usage state.
-    // scheduleBackupModels still exposes the cheap catalog for the legacy backup
-    // field and the ENG-1213 recommendation surface.
+    // Backup recommendations advance to Grok 4.7; stored choices remain selectable.
     expect(json).toHaveBeenCalledWith(expect.objectContaining({
       usageMode: 'optimized',
       canGenerate: true,
-      selectableModels: ['anthropic.claude-opus-5', 'gpt-5-chat-2'],
-      allModels: ['anthropic.claude-opus-5', 'gpt-5-chat-2'],
-      scheduleBackupModels: ['gpt-5-chat-2'],
+      selectableModels: ['anthropic.claude-opus-5', 'openrouter/x-ai/grok-4.6', 'openrouter/x-ai/grok-4.7'],
+      allModels: ['anthropic.claude-opus-5', 'openrouter/x-ai/grok-4.6', 'openrouter/x-ai/grok-4.7'],
+      scheduleBackupModels: ['openrouter/x-ai/grok-4.7'],
     }));
+  });
+
+  it('never offers a live-voice model: every consumer is a text-chat picker and an explicit live pick now 422s', async () => {
+    mockAgentModeService.getSupportedModels.mockResolvedValue(['gpt-a', 'live-voice-1', 'gpt-b'] as any);
+    (mockAgentModeService as any).isLiveModel = jest.fn((id: string) => id === 'live-voice-1');
+    mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+      billingUserId: 'test-user-123', policy: null, costUsedMicroUsd: 0, creditsApplied: false,
+      mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' },
+    });
+    const json = jest.fn();
+    try {
+      await agentModeController.getModelOptions(
+        { user: { userId: 'test-user-123', isAdmin: false } } as any,
+        { json, status: jest.fn(() => ({ json })) } as any,
+      );
+    } finally {
+      delete (mockAgentModeService as any).isLiveModel;
+    }
+    const body = json.mock.calls[0][0];
+    expect(body.allModels).toEqual(['gpt-a', 'gpt-b']);
+    expect(body.selectableModels).toEqual(['gpt-a', 'gpt-b']);
+    expect(body.scheduleBackupModels).not.toContain('live-voice-1');
   });
 });
 
@@ -410,7 +435,6 @@ describe('resolveScheduleBackup via updateScheduledChat (ENG-1211)', () => {
         optimizedDefaultModel: 'gemini-3.1-flash-lite',
       },
       costUsedMicroUsd: 0,
-      tokenUsed: 0,
       creditsApplied: false,
       mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'hard_cap_only' },
     } as any);

@@ -55,6 +55,10 @@ import { emmaToolRegistry } from '../emma/registry';
 import '../emma/tools'; // side-effect: registers call_meta_marketing_api + generate_image
 import { metaService } from '../services/metaService';
 import { agentModeService } from '../services/agentModeService';
+// ENG-2103 (F2 design-decision-list follow-up, Pattern A): generate_image's
+// tool handler now calls emma/impl/mediaVideo.ts's generateImage directly,
+// not agentModeService.generateImage.
+import * as mediaVideoImpl from '../emma/impl/mediaVideo';
 
 const ctx = { userId: 'user123', sessionId: 'sess1' } as any;
 
@@ -75,7 +79,10 @@ describe('emma tool handlers wire args into the confirmation gate', () => {
     expect(metaService.createAd).not.toHaveBeenCalled();
   });
 
-  it('call_meta_marketing_api: confirm=true (in params) bypasses the gate and writes', async () => {
+  // ENG-1635/1644 gap 5: params.confirm is now fully inert as a trust signal — a Meta write
+  // executes ONLY once the user has approved it through the approval-deck UI, never because
+  // the model set this flag itself. Re-calling with confirm=true must still halt, not write.
+  it('call_meta_marketing_api: confirm=true (in params) is inert — still halts and does not write', async () => {
     (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'ad_new', name: 'New Ad' });
 
     const result: any = await emmaToolRegistry.execute('call_meta_marketing_api', {
@@ -86,8 +93,9 @@ describe('emma tool handlers wire args into the confirmation gate', () => {
       params: { name: 'New Ad', creative_id: 'creative_1', confirm: true }
     }, ctx);
 
-    expect(result.awaitingUserConfirmation).toBeUndefined();
-    expect(metaService.createAd).toHaveBeenCalledTimes(1);
+    expect(result.awaitingUserConfirmation).toBe(true);
+    expect(result.requiresConfirmation).toBe(true);
+    expect(metaService.createAd).not.toHaveBeenCalled();
   });
 
   // ENG-600
@@ -152,8 +160,11 @@ describe('emma tool handlers wire args into the confirmation gate', () => {
     const defaultSpy = jest
       .spyOn(agentModeService, 'getImageApiDefaultModel')
       .mockResolvedValue('gemini-3.1-flash-image-preview');
+    // ENG-2103 (F2 design-decision-list follow-up, Pattern A): the tool now
+    // calls emma/impl/mediaVideo.ts's generateImage directly, not
+    // agentModeService.generateImage.
     const genSpy = jest
-      .spyOn(agentModeService, 'generateImage')
+      .spyOn(mediaVideoImpl, 'generateImage')
       .mockResolvedValue({ success: true } as any);
 
     await emmaToolRegistry.execute('generate_image', {
@@ -191,8 +202,11 @@ describe('emma tool handlers wire args into the confirmation gate', () => {
   });
 
   it('generate_image: threads the declared category through to the service', async () => {
+    // ENG-2103 (F2 design-decision-list follow-up, Pattern A): the tool now
+    // calls emma/impl/mediaVideo.ts's generateImage directly, not
+    // agentModeService.generateImage.
     const genSpy = jest
-      .spyOn(agentModeService as any, 'generateImage')
+      .spyOn(mediaVideoImpl as any, 'generateImage')
       .mockResolvedValue({ success: true, imageUrl: 'https://cdn.example.com/x.png' });
 
     await emmaToolRegistry.execute('generate_image', {

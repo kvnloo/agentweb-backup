@@ -14,6 +14,11 @@ jest.mock('../utils/secretsManager', () => ({
   getJwtSecret: jest.fn().mockResolvedValue('test-jwt-secret'),
 }));
 
+const mockRecordUnipileAccountHealth = jest.fn().mockResolvedValue('no-op');
+jest.mock('../services/linkedInConnectionHealth', () => ({
+  recordUnipileAccountHealth: (...args: any[]) => mockRecordUnipileAccountHealth(...args),
+}));
+
 // Mock connectedAccountsDb
 const mockGetAccountsByUserId = jest.fn();
 const mockGetAccountsByUserIdIncludingOrgShared = jest.fn();
@@ -56,7 +61,29 @@ const mockClearStatusCache = jest.fn();
 const mockFilterByCompanySize = jest.fn(
   async (...args: any[]) => ({ items: args[0], excludedUnverifiable: 0 }),
 );
-jest.mock('../services/linkedInOutreachService', () => ({
+const mockListSentInvitations = jest.fn();
+// ENG-1719: the bulk drain withdraws through the same service call the single-shot
+// cancel-invitation action uses.
+const mockCancelInvitation = jest.fn().mockResolvedValue({ ok: true });
+// A faithful inline copy of isProvenDisconnectError's logic (pure,
+// dependency-free). jest.requireActual on this module was tried first, but
+// that pulls in linkedInOutreachService.ts's real top-level `import {
+// UnipileClient } from 'unipile-node-sdk'` at load time, which interacted
+// unreliably with another test file's `{virtual: true}` mock of that same
+// package when both ran in the same jest worker — reproducibly ~50% failure
+// rate across runs of the combined suite, 0% in isolation. Inlining avoids
+// loading the real module's import graph at all.
+function isProvenDisconnectErrorMock(error: any): boolean {
+  const structured = error?.structuredError;
+  const code = structured?.code || error?.body?.code || error?.code || '';
+  const status = structured?.status || error?.body?.status || error?.status;
+  const classification = structured?.classification || error?.body?.classification || error?.classification;
+  if (Number(status) === 403 && code !== 'errors/disconnected_account') return false;
+  return code === 'errors/disconnected_account' || classification === 'AUTH_ERROR' || Number(status) === 401;
+}
+jest.mock('../services/linkedInOutreachService', () => {
+  return {
+  isProvenDisconnectError: isProvenDisconnectErrorMock,
   linkedInOutreachService: {
     sendMessage: (...args: any[]) => mockSendMessage(...args),
     getLinkedInProfile: (...args: any[]) => mockGetLinkedInProfile(...args),
@@ -65,6 +92,8 @@ jest.mock('../services/linkedInOutreachService', () => ({
     acceptInvitation: (...args: any[]) => mockAcceptInvitation(...args),
     getProfile: (...args: any[]) => mockGetProfile(...args),
     listReceivedInvitations: (...args: any[]) => mockListReceivedInvitations(...args),
+    listSentInvitations: (...args: any[]) => mockListSentInvitations(...args),
+    cancelInvitation: (...args: any[]) => mockCancelInvitation(...args),
     // ENG-126 breaker check — must be present or send-invite throws before pacing.
     isUnderInvitationCooldown: (...args: any[]) => mockIsUnderInvitationCooldown(...args),
     getMessagesWithContact: (...args: any[]) => mockGetMessagesWithContact(...args),
@@ -80,7 +109,8 @@ jest.mock('../services/linkedInOutreachService', () => ({
     filterByCompanySize: (...args: any[]) => mockFilterByCompanySize(...args),
     clearStatusCache: (...args: any[]) => mockClearStatusCache(...args),
   },
-}));
+  };
+});
 
 // Mock emailEventsDb
 const mockAddLinkedInMessageEvent = jest.fn().mockResolvedValue(undefined);
@@ -118,6 +148,7 @@ jest.mock('../services/db', () => ({
 // path reconciles the invitee — gated on the list-access check below.
 const mockMirrorLinkedInInviteToCrm = jest.fn().mockResolvedValue({ leadId: 'lead_x', listId: 'list_owned', created: true, engagementLogged: true });
 const mockResolveListIdForAccount = jest.fn().mockResolvedValue(null);
+const mockRecordInviteWithdrawnInCrm = jest.fn().mockResolvedValue(null);
 jest.mock('../services/linkedInInviteCrmMirror', () => ({
   mirrorLinkedInInviteToCrm: (...args: any[]) => mockMirrorLinkedInInviteToCrm(...args),
   resolveListIdForAccount: (...args: any[]) => mockResolveListIdForAccount(...args),
@@ -126,15 +157,24 @@ jest.mock('../services/linkedInInviteCrmMirror', () => ({
   splitInvitedUserName: jest.requireActual('../services/linkedInInviteCrmMirror').splitInvitedUserName,
   INVITE_SENT_EVENT: 'linkedin.invite.sent',
   INVITE_ACCEPTED_EVENT: 'linkedin.invite.accepted',
+  INVITE_WITHDRAWN_EVENT: 'linkedin.invite.withdrawn',
+  recordInviteWithdrawnInCrm: (...args: any[]) => mockRecordInviteWithdrawnInCrm(...args),
 }));
 
 // Mock unipileSentInvitationsDb (ENG-182 pre-invite dedup cache). The pre-check
 // uses the publicProfileUrl GSI getter (case-robust, matches the CRM path).
 const mockGetSentInvitationByProfileUrlAndAccount = jest.fn().mockResolvedValue(null);
 const mockUpsertSentInvitation = jest.fn().mockResolvedValue(undefined);
+// ENG-1718: list-sent-invitations now falls back to this same ledger when the live
+// read is unusable, so the getter belongs on the ONE mock for this module — a second
+// jest.mock for the same path silently overrides the first.
+const mockGetAllSentInvitationsByAccount = jest.fn().mockResolvedValue([]);
+const mockDeleteSentInvitationByInvitationId = jest.fn().mockResolvedValue(1);
 jest.mock('../services/unipileSentInvitationsDb', () => ({
   getSentInvitationByProfileUrlAndAccount: (...args: any[]) => mockGetSentInvitationByProfileUrlAndAccount(...args),
   upsertSentInvitation: (...args: any[]) => mockUpsertSentInvitation(...args),
+  getAllSentInvitationsByAccount: (...args: any[]) => mockGetAllSentInvitationsByAccount(...args),
+  deleteSentInvitationByInvitationId: (...args: any[]) => mockDeleteSentInvitationByInvitationId(...args),
 }));
 
 // Mock unipileConnectionsDb (normalizeLinkedInUrl used by the write-through upsert)
@@ -801,6 +841,43 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(mockSearchPeople).not.toHaveBeenCalled();
     });
 
+    it('records health with the real owner for the preflight disconnect on an owned account (ENG-2205)', async () => {
+      mockProbeAccountSession.mockResolvedValue('disconnected');
+
+      await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'stealth founder',
+      });
+
+      expect(mockRecordUnipileAccountHealth).toHaveBeenCalledWith({
+        accountId: 'test-account-id',
+        ownerUserId: 'user-1',
+        state: 'disconnected',
+      });
+    });
+
+    it('omits ownerUserId for the preflight disconnect on a site-wide pool account (ENG-2205)', async () => {
+      // account_id is not in the caller's own account list — usedSharedAccount
+      // becomes true (ENG-1198 determination), so recordUnipileAccountHealth
+      // must not be told this customer owns it: its owner lookup can never
+      // resolve the global fallback pool under an unrelated caller's userId.
+      mockListUserOwnedUnipileAccountIds.mockResolvedValue([]);
+      mockProbeAccountSession.mockResolvedValue('disconnected');
+
+      await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'stealth founder',
+      });
+
+      expect(mockRecordUnipileAccountHealth).toHaveBeenCalledWith({
+        accountId: 'test-account-id',
+        ownerUserId: undefined,
+        state: 'disconnected',
+      });
+    });
+
     it('fails fast on a write action before any invite is attempted', async () => {
       mockProbeAccountSession.mockResolvedValue('disconnected');
 
@@ -935,6 +1012,54 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(result.error).toContain('Common reasons');
       expect(result.error).toContain('Settings > Connected Accounts');
       expect(result.error).toContain('remove the connection');
+    });
+
+    it('records health with the real owner for the reactive disconnect on an owned account (ENG-2205)', async () => {
+      mockSearchPeople.mockRejectedValue(makeDisconnectedError());
+
+      await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'stealth founder',
+      });
+
+      expect(mockRecordUnipileAccountHealth).toHaveBeenCalledWith({
+        accountId: 'test-account-id',
+        ownerUserId: 'user-1',
+        state: 'disconnected',
+      });
+    });
+
+    it('omits ownerUserId for the reactive disconnect on a site-wide pool account (ENG-2205)', async () => {
+      mockListUserOwnedUnipileAccountIds.mockResolvedValue([]);
+      mockSearchPeople.mockRejectedValue(makeDisconnectedError());
+
+      await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'stealth founder',
+      });
+
+      expect(mockRecordUnipileAccountHealth).toHaveBeenCalledWith({
+        accountId: 'test-account-id',
+        ownerUserId: undefined,
+        state: 'disconnected',
+      });
+    });
+
+    it('does not treat a bare 403 (permission/plan restriction) as a proven disconnect (ENG-2205)', async () => {
+      const forbiddenError: any = new Error('Forbidden');
+      forbiddenError.structuredError = { status: 403, classification: 'AUTH_ERROR' };
+      mockSearchPeople.mockRejectedValue(forbiddenError);
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'stealth founder',
+      });
+
+      expect(result.message).not.toBe('LinkedIn account disconnected');
+      expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
     });
 
     // ENG-281: the preflight probe is cached for 10 minutes, so a session that dies
@@ -2364,5 +2489,517 @@ describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
       expect(mockUpdateAccountConfig).toHaveBeenCalledTimes(1);
     });
 
+  });
+
+  describe('multi-account routing (ENG-1614)', () => {
+    beforeEach(() => {
+      __resetWritePacerForTests();
+      process.env.LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX = '30';
+    });
+
+    afterEach(() => {
+      delete process.env.LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX;
+      __resetWritePacerForTests();
+      mockIsUnderInvitationCooldown.mockReturnValue(false);
+    });
+
+    const routingInviteArgs = {
+      action: 'send-invite',
+      account_id: 'capped-account',
+      profile_url: 'https://www.linkedin.com/in/chang-liu/',
+      message: 'Great to connect!',
+    };
+
+    it('routes send-invite to an org-shared account with headroom when the requested account is at its daily cap (AC1) and reports the routing decision (AC3)', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        {
+          platform: 'unipile',
+          account_id: 'capped-account',
+          userId: 'user-1',
+          config: { daily_invite_cap: 10, daily_volume: { invite: { count: 10, windowStartedAt: Date.now() } } },
+        },
+        {
+          platform: 'unipile',
+          account_id: 'headroom-account',
+          userId: 'teammate-2',
+          sharedWithOrg: true,
+          config: { daily_invite_cap: 30, daily_volume: { invite: { count: 1, windowStartedAt: Date.now() } } },
+        },
+      ]);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockSendInvitation.mockResolvedValue({ id: 'inv-routed' });
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(true);
+      // The whole write went through the account with headroom, not the capped one.
+      expect(mockSendInvitation.mock.calls[0][0]).toBe('headroom-account');
+      expect(mockGetSentInvitationByProfileUrlAndAccount.mock.calls[0][1]).toBe('headroom-account');
+      // AC3: routing must be visible/reported, never a silent fallback (ENG-1198).
+      expect(result.data.accountRouting).toEqual({
+        fromAccountId: 'capped-account',
+        toAccountId: 'headroom-account',
+        reason: expect.stringContaining('headroom-account'),
+      });
+    });
+
+    it('does not route (and fails normally) when no other connected account has headroom either', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        {
+          platform: 'unipile',
+          account_id: 'capped-account',
+          userId: 'user-1',
+          config: { daily_invite_cap: 10, daily_volume: { invite: { count: 10, windowStartedAt: Date.now() } } },
+        },
+      ]);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('LinkedIn daily volume limit reached');
+      expect(mockSendInvitation).not.toHaveBeenCalled();
+    });
+
+    it('does not route when the requested account already has headroom (AC5 — single/unconstrained-account behavior unchanged)', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        {
+          platform: 'unipile',
+          account_id: 'capped-account',
+          userId: 'user-1',
+          config: { daily_invite_cap: 10, daily_volume: { invite: { count: 2, windowStartedAt: Date.now() } } },
+        },
+      ]);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockSendInvitation.mockResolvedValue({ id: 'inv-unrouted' });
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockSendInvitation.mock.calls[0][0]).toBe('capped-account');
+      expect(result.data).not.toHaveProperty('accountRouting');
+    });
+
+    const routedAccounts = [
+      {
+        platform: 'unipile',
+        account_id: 'capped-account',
+        userId: 'user-1',
+        config: { daily_invite_cap: 10, daily_volume: { invite: { count: 10, windowStartedAt: Date.now() } } },
+      },
+      {
+        platform: 'unipile',
+        account_id: 'headroom-account',
+        userId: 'teammate-2',
+        sharedWithOrg: true,
+        config: { daily_invite_cap: 30, daily_volume: { invite: { count: 1, windowStartedAt: Date.now() } } },
+      },
+    ];
+
+    it('discloses the routing decision on the disconnected-session preflight refusal, not just on success (AC3)', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(routedAccounts);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockProbeAccountSession.mockImplementation(async (accountId: string) => (
+        accountId === 'headroom-account' ? 'disconnected' : 'connected'
+      ));
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('LinkedIn account disconnected');
+      // The refusal is for the ROUTED account, not the one the caller named —
+      // without accountRouting on this payload the customer can't tell why.
+      expect(result.accountRouting).toEqual({
+        fromAccountId: 'capped-account',
+        toAccountId: 'headroom-account',
+        reason: expect.stringContaining('headroom-account'),
+      });
+      expect(mockSendInvitation).not.toHaveBeenCalled();
+      mockProbeAccountSession.mockResolvedValue('connected');
+    });
+
+    it('routes send-invite to another account when the requested one is under LinkedIn\'s own invitation cooldown, even with daily-cap headroom to spare (ENG-1132 root cause, not just AC1\'s daily-cap case)', async () => {
+      // The real production incidents behind this ticket (iTrials/Sweta, Hannah K)
+      // were all this in-process "Cannot resend yet" breaker — never the
+      // daily_invite_cap. An account can have plenty of daily headroom left and
+      // still be unusable this run once LinkedIn itself has rejected one send.
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        {
+          platform: 'unipile',
+          account_id: 'capped-account',
+          userId: 'user-1',
+          config: { daily_invite_cap: 10, daily_volume: { invite: { count: 2, windowStartedAt: Date.now() } } },
+        },
+        {
+          platform: 'unipile',
+          account_id: 'headroom-account',
+          userId: 'teammate-2',
+          sharedWithOrg: true,
+          config: { daily_invite_cap: 30, daily_volume: { invite: { count: 1, windowStartedAt: Date.now() } } },
+        },
+      ]);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockIsUnderInvitationCooldown.mockImplementation((accountId: string) => accountId === 'capped-account');
+      mockSendInvitation.mockResolvedValue({ id: 'inv-routed-cooldown' });
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockSendInvitation.mock.calls[0][0]).toBe('headroom-account');
+      expect(result.data.accountRouting).toEqual({
+        fromAccountId: 'capped-account',
+        toAccountId: 'headroom-account',
+        reason: expect.stringContaining('cooldown'),
+      });
+    });
+
+    it('does not route to a candidate that is itself under cooldown — falls through to the requested account\'s own refusal (AC5-style: no viable candidate means unchanged behavior)', async () => {
+      // Both accounts are compromised, just for different reasons: capped-account
+      // is at its daily cap, headroom-account has daily headroom but is ALSO under
+      // an active cooldown. Routing to a candidate that is doomed to fail anyway
+      // would misreport what actually happened, so it must not be selected —
+      // the refusal stays on the originally-requested account's real state.
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(routedAccounts);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockIsUnderInvitationCooldown.mockImplementation((accountId: string) => accountId === 'headroom-account');
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('LinkedIn daily volume limit reached');
+      expect(result.accountRouting).toBeUndefined();
+      expect(mockSendInvitation).not.toHaveBeenCalled();
+    });
+
+    it('discloses the routing decision on the hourly/burst pacer refusal, not just on success (AC2 + AC3)', async () => {
+      process.env.LINKEDIN_WRITE_MIN_GAP_MS = '0';
+      process.env.LINKEDIN_WRITE_MAX_PER_HOUR = '1';
+      try {
+        mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(routedAccounts);
+        mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+        mockSendInvitation.mockResolvedValue({ id: 'inv-routed' });
+
+        // First call routes capped-account -> headroom-account and spends its one slot.
+        const first = await service.linkedinOutreach('user-1', routingInviteArgs);
+        // Second call routes to the same headroom-account, which the hourly pacer now refuses.
+        const second = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+        expect(first.success).toBe(true);
+        expect(second.success).toBe(false);
+        expect(second.message).toBe('LinkedIn write actions are being paced');
+        expect(second.accountRouting).toEqual({
+          fromAccountId: 'capped-account',
+          toAccountId: 'headroom-account',
+          reason: expect.stringContaining('headroom-account'),
+        });
+        expect(mockSendInvitation).toHaveBeenCalledTimes(1);
+      } finally {
+        delete process.env.LINKEDIN_WRITE_MIN_GAP_MS;
+        delete process.env.LINKEDIN_WRITE_MAX_PER_HOUR;
+      }
+    });
+
+    it('discloses the routing decision on the already-pending refusal, not just on the eventual send (CodeRabbit finding on PR #2742)', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(routedAccounts);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue({ sentAt: '2026-09-01T00:00:00.000Z' });
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(true);
+      expect(result.alreadyInvited).toBe(true);
+      expect(result.accountRouting).toEqual({
+        fromAccountId: 'capped-account',
+        toAccountId: 'headroom-account',
+        reason: expect.stringContaining('headroom-account'),
+      });
+      expect(mockSendInvitation).not.toHaveBeenCalled();
+    });
+
+    it('discloses the routing decision on the note-quota decision-gate hold, not just on a clean send (CodeRabbit finding on PR #2742)', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(routedAccounts);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      const quotaErr: any = new Error('note quota exceeded');
+      quotaErr.noteQuotaExceeded = true;
+      mockSendInvitation.mockRejectedValue(quotaErr);
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(false);
+      expect(result.requiresDecision).toBe(true);
+      expect(result.noteQuotaExceeded).toBe(true);
+      expect(result.accountRouting).toEqual({
+        fromAccountId: 'capped-account',
+        toAccountId: 'headroom-account',
+        reason: expect.stringContaining('headroom-account'),
+      });
+    });
+
+    it('discloses the routing decision on an unexpected/generic send failure, not just the classified refusal paths (CodeRabbit finding on PR #2742)', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(routedAccounts);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockSendInvitation.mockRejectedValue(new Error('unexpected upstream failure'));
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('LinkedIn outreach action failed');
+      expect(result.accountRouting).toEqual({
+        fromAccountId: 'capped-account',
+        toAccountId: 'headroom-account',
+        reason: expect.stringContaining('headroom-account'),
+      });
+    });
+
+    it('fetches the org account list only once for a routed write, not once to resolve the account and again to scan candidates (CodeRabbit performance finding on PR #2742)', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(routedAccounts);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockSendInvitation.mockResolvedValue({ id: 'inv-routed' });
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockGetAccountsWithOwnerIncludingOrgShared).toHaveBeenCalledTimes(1);
+    });
+  });
+});
+
+/**
+ * ENG-1718 — the handler wiring, on top of linkedInSentInvitationsView.test.ts
+ * which pins the decision. The defect was in this dispatch: any body without an
+ * `items` array became `{ success: true, data: <that body> }`, so a non-conforming
+ * 200 read as "no pending invitations".
+ */
+describe('ENG-1718: list-sent-invitations never returns a bare empty result', () => {
+  let service: AgentModeService;
+
+  beforeEach(() => {
+    service = new AgentModeService();
+    mockListSentInvitations.mockReset();
+    mockGetAllSentInvitationsByAccount.mockReset();
+    mockGetAllSentInvitationsByAccount.mockResolvedValue([]);
+  });
+
+  it('falls back to our own ledger when the live read returns the non-conforming {}', async () => {
+    // The exact body the SDK hands back at its default validateRequestPayloadLevel
+    // of 'warn' when the response fails its own schema.
+    mockListSentInvitations.mockResolvedValue({});
+    mockGetAllSentInvitationsByAccount.mockResolvedValue([
+      { invitationId: 'inv-1', invitedUserPublicId: 'monid', invitedUserName: 'Monica DeVreese', sentAt: '2026-07-28T00:00:00Z' },
+    ]);
+
+    const result = await service.linkedinOutreach('user-1', {
+      action: 'list-sent-invitations',
+      account_id: 'test-account-id',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.data.source).toBe('cache');
+    expect(result.data.liveUnavailable).toBe(true);
+    expect(result.data.totalPending).toBe(1);
+    expect(result.data.items[0].sent_at).toBe('2026-07-28T00:00:00Z');
+    expect(result.data.notice).toEqual(expect.stringContaining('live read was unavailable'));
+  });
+
+  it('says "not tracked here" explicitly when live and ledger genuinely agree on none', async () => {
+    mockListSentInvitations.mockResolvedValue({ object: 'InvitationList', items: [], cursor: null });
+
+    const result = await service.linkedinOutreach('user-1', {
+      action: 'list-sent-invitations',
+      account_id: 'test-account-id',
+    });
+
+    expect(result.data.source).toBe('none');
+    expect(result.data.liveUnavailable).toBeUndefined();
+    expect(result.data.notice).toEqual(expect.stringContaining('outside AgentWeb'));
+  });
+
+  it('never reports an unreadable backlog as an empty one', async () => {
+    mockListSentInvitations.mockRejectedValue(new Error('502 Bad Gateway'));
+
+    const result = await service.linkedinOutreach('user-1', {
+      action: 'list-sent-invitations',
+      account_id: 'test-account-id',
+    });
+
+    expect(result.data.source).toBe('none');
+    expect(result.data.liveUnavailable).toBe(true);
+    expect(result.data.notice).toEqual(expect.stringContaining('NOT evidence'));
+  });
+
+  it('returns live rows with sent_at, which the old trim dropped', async () => {
+    mockListSentInvitations.mockResolvedValue({
+      object: 'InvitationList',
+      cursor: null,
+      items: [{
+        object: 'InvitationSent',
+        id: 'inv-live-1',
+        date: '2026-08-20T00:00:00Z',
+        parsed_datetime: '2026-08-20T00:00:00Z',
+        invited_user: 'Clara Paye',
+        invited_user_id: 'uid-1',
+        invited_user_public_id: 'clarapaye',
+      }],
+    });
+
+    const result = await service.linkedinOutreach('user-1', {
+      action: 'list-sent-invitations',
+      account_id: 'test-account-id',
+    });
+
+    expect(result.data.source).toBe('live');
+    expect(result.data.items[0].sent_at).toBe('2026-08-20T00:00:00Z');
+    expect(result.data.items[0].id).toBe('inv-live-1');
+  });
+});
+
+// ENG-1719 / ENG-1609 AC #8 — the bulk drain, wired end-to-end through the tool.
+// The drain's own arithmetic and checkpointing are pinned in
+// linkedInStaleInvitationDrain.test.ts; this pins the tool wiring: ownership,
+// pacing through the real pacer, and the shape the model actually receives.
+describe('withdraw-stale-invitations (ENG-1719)', () => {
+  let drainService: AgentModeService;
+  const DAY = 24 * 60 * 60 * 1000;
+  const pendingRow = (publicId: string, ageDays: number) => ({
+    accountId: 'test-account-id',
+    invitedUserPublicId: publicId,
+    publicProfileUrl: `https://www.linkedin.com/in/${publicId}/`,
+    invitationId: `inv-${publicId}`,
+    invitedUserName: publicId.toUpperCase(),
+    invitationText: '',
+    sentAt: new Date(Date.now() - ageDays * DAY).toISOString(),
+    syncedAt: new Date().toISOString(),
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    __resetWritePacerForTests();
+    drainService = new AgentModeService();
+    mockUpdateAccountConfig.mockImplementation(async (...args: any[]) => {
+      const mutation = args[3];
+      if (typeof mutation === 'function') mutation({});
+    });
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: 'test-account-id', userId: 'user-1' },
+    ]);
+    mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: 'test-account-id' },
+    ]);
+    mockIsAccountConnected.mockResolvedValue(true);
+    mockCancelInvitation.mockResolvedValue({ ok: true });
+    mockDeleteSentInvitationByInvitationId.mockResolvedValue(1);
+    mockRecordInviteWithdrawnInCrm.mockResolvedValue(null);
+  });
+
+  const drain = (args: any) => (drainService as any).linkedinOutreach(
+    'user-1',
+    { action: 'withdraw-stale-invitations', account_id: 'test-account-id', ...args },
+  );
+
+  it('AC #1: withdraws the stale backlog in ONE call, oldest first', async () => {
+    mockGetAllSentInvitationsByAccount.mockResolvedValue([
+      pendingRow('fresh', 2), pendingRow('older', 40), pendingRow('oldest', 90),
+    ]);
+
+    const result = await drain({ older_than_days: 14 });
+
+    expect(result.success).toBe(true);
+    expect(mockCancelInvitation).toHaveBeenCalledTimes(2);
+    expect(mockCancelInvitation).toHaveBeenNthCalledWith(1, 'inv-oldest', 'test-account-id');
+    expect(mockCancelInvitation).toHaveBeenNthCalledWith(2, 'inv-older', 'test-account-id');
+    expect(result.data.withdrawn).toHaveLength(2);
+    expect(result.data.stopReason).toBe('completed');
+    expect(result.data.notice).toContain('Withdrew 2 invitations older than 14 days');
+  });
+
+  it('AC #4: drops the ledger row and records CRM provenance for each withdrawal', async () => {
+    mockGetAllSentInvitationsByAccount.mockResolvedValue([pendingRow('old', 40)]);
+
+    await drain({ older_than_days: 14, list_id: 'list_test123' });
+
+    expect(mockDeleteSentInvitationByInvitationId).toHaveBeenCalledWith('test-account-id', 'inv-old');
+    expect(mockRecordInviteWithdrawnInCrm).toHaveBeenCalledWith(expect.objectContaining({
+      userId: 'user-1',
+      accountId: 'test-account-id',
+      invitationId: 'inv-old',
+      listId: 'list_test123',
+      linkedinUrl: 'https://www.linkedin.com/in/old/',
+    }));
+  });
+
+  it('refuses an account the caller does not own or share', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([]);
+
+    const result = await drain({ older_than_days: 14 });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('is not connected to your profile');
+    expect(mockCancelInvitation).not.toHaveBeenCalled();
+  });
+
+  it('rejects a missing or nonsensical age threshold rather than draining everything', async () => {
+    mockGetAllSentInvitationsByAccount.mockResolvedValue([pendingRow('old', 40)]);
+
+    for (const bad of [undefined, 0, -5, 'soon']) {
+      const result = await drain({ older_than_days: bad });
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('older_than_days');
+    }
+    expect(mockCancelInvitation).not.toHaveBeenCalled();
+  });
+
+  it('AC #2: stops at the real hourly pacing ceiling and reports how far it got', async () => {
+    process.env.LINKEDIN_WRITE_MAX_PER_HOUR = '2';
+    try {
+      __resetWritePacerForTests();
+      mockGetAllSentInvitationsByAccount.mockResolvedValue([
+        pendingRow('a', 90), pendingRow('b', 80), pendingRow('c', 70), pendingRow('d', 60),
+      ]);
+
+      const result = await drain({ older_than_days: 14 });
+
+      expect(result.success).toBe(true);
+      expect(mockCancelInvitation).toHaveBeenCalledTimes(2);
+      expect(result.data.stopReason).toBe('paced');
+      expect(result.data.withdrawn).toHaveLength(2);
+      expect(result.data.remainingStale).toBe(2);
+      expect(result.data.notice).toContain('at its write-pacing limit');
+    } finally {
+      delete process.env.LINKEDIN_WRITE_MAX_PER_HOUR;
+      __resetWritePacerForTests();
+    }
+  });
+
+  it('AC #3: a drain does not consume the account\'s daily invite budget', async () => {
+    process.env.LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX = '30';
+    try {
+      mockGetAllSentInvitationsByAccount.mockResolvedValue([
+        pendingRow('a', 90), pendingRow('b', 80), pendingRow('c', 70),
+      ]);
+
+      await drain({ older_than_days: 14 });
+
+      // Every persisted config mutation from a drain leaves daily_volume.invite
+      // untouched — withdrawals are account maintenance, not send volume.
+      const mutations = mockUpdateAccountConfig.mock.calls
+        .map((call: any[]) => call[3])
+        .filter((fn: any) => typeof fn === 'function')
+        .map((fn: any) => fn({ daily_volume: { invite: { count: 4, windowStartedAt: Date.now() } } }));
+      mutations.forEach((m: any) => {
+        expect(m?.updates?.daily_volume?.invite?.count ?? 4).toBe(4);
+      });
+    } finally {
+      delete process.env.LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX;
+    }
+  });
+
+  it('reports an empty backlog honestly instead of returning a bare empty result', async () => {
+    mockGetAllSentInvitationsByAccount.mockResolvedValue([]);
+
+    const result = await drain({ older_than_days: 30 });
+
+    expect(result.success).toBe(true);
+    expect(result.data.withdrawn).toEqual([]);
+    expect(result.data.notice).toContain('Withdrew nothing older than 30 days');
+    expect(mockCancelInvitation).not.toHaveBeenCalled();
   });
 });

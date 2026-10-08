@@ -280,13 +280,19 @@ describe('recommend_predefined_work_plan Emma tool wiring', () => {
     expect(Object.keys(schema.properties).sort()).toEqual(['planId', 'reason']);
   });
 
-  it('delegates to agentModeService.recommendPredefinedWorkPlan with parsed args + context', async () => {
+  it('delegates to emma/impl/workPlans recommendPredefinedWorkPlan with parsed args + context', async () => {
+    // ENG-2103 (F2): recommend_predefined_work_plan's handler body now lives in
+    // emma/impl/workPlans.ts and emma/tools.ts calls it directly instead of
+    // through agentModeService (which still exists as a one-line delegating
+    // wrapper, but is no longer what the tool's execute() calls) — spy on the
+    // impl module's real export instead.
     const { emmaToolRegistry } = require('../emma/registry');
+    const workPlansImpl = require('../emma/impl/workPlans');
     require('../emma/tools');
     const tool = emmaToolRegistry.getTool(toolName);
     if (!tool) throw new Error(`Tool ${toolName} not found`);
 
-    const spy = jest.spyOn(agentModeService, 'recommendPredefinedWorkPlan').mockResolvedValue({ success: true, type: 'workplan_recommendation' });
+    const spy = jest.spyOn(workPlansImpl, 'recommendPredefinedWorkPlan').mockResolvedValue({ success: true, type: 'workplan_recommendation' });
 
     const context = { sessionId: 'sess-x', userId: 'user-x' };
     await tool.execute({ planId: 'plan-onboard', reason: 'because X' }, context);

@@ -4,8 +4,10 @@
  * spend, a featured TV segment can all blow past any fixed request-count we'd pick). An
  * earlier version of this fix gated the whole request; that was reverted after live-testing
  * surfaced two problems: (1) a big enough customer's own real traffic could eventually hit
- * the cap and lose real leads, and (2) this app never configures Express's `trust proxy`
- * (ENG-493), so an IP-keyed limiter would collapse to one shared bucket for every caller.
+ * the cap and lose real leads, and (2) even with Express's `trust proxy` now correctly
+ * configured (ENG-493), per-listId is still the more meaningful boundary for this public,
+ * multi-tenant endpoint than per-IP — one list's real traffic spike shouldn't starve every
+ * other list's budget just because they happen to share an IP-keyed bucket.
  *
  * Instead, only the optional, best-effort Meta CAPI send is budgeted (shouldAttemptCapiSend,
  * keyed by listId) — before ENG-449, unbounded abuse here only created junk CRM leads; since
@@ -296,12 +298,11 @@ describe('forward-lead: CAPI client IP prefers x-forwarded-for over req.ip (scop
     (metaService.sendCapiLeadEvent as jest.Mock).mockResolvedValue({ success: true });
   });
 
-  // This app never configures Express's `trust proxy` (ENG-493), so `req.ip` collapses to
-  // the same internal/shared value for every caller — actively hurting Meta's match quality
-  // since client_ip_address is a real matching signal. Rather than flip the global `trust
-  // proxy` setting (which would also change auth.ts's IP-keyed rate limiters — separate,
-  // riskier change), this scopes the fix to just this CAPI call site, reusing the pattern
-  // already established in loopEvents.ts/assetController.ts.
+  // Reads x-forwarded-for directly rather than req.ip, even though Express's `trust proxy`
+  // is now correctly configured app-wide (ENG-493): this endpoint wants the ORIGINATING
+  // address (leftmost of the chain) for Meta match quality, which is a different value than
+  // trust-proxy's numeric hop-skip resolves to `req.ip` — same reasoning already established
+  // in loopEvents.ts/assetController.ts, and the app.ts hop count is irrelevant to it either way.
   it('SUCCESS: uses the first x-forwarded-for IP when present, not req.ip', async () => {
     await request(rateLimitTestServer)
       .post('/api/webhooks/forward-lead')

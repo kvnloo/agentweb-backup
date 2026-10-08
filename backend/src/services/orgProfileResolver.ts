@@ -4,7 +4,7 @@ import { userDb } from "./db";
  * Profile pillars that become org-authoritative the moment a user joins or
  * creates an organization.
  */
-export type OrgProfileField = "brandGuidelines" | "marketStrategy";
+export type OrgProfileField = "brandGuidelines" | "marketStrategy" | "designSystem";
 
 /**
  * Resolve an org-authoritative profile pillar with an owner-record fallback.

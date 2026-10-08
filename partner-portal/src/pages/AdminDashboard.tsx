@@ -1,10 +1,8 @@
-import React, { useEffect, useState, useRef } from "react";
+import React, { useEffect, useState, useRef, useCallback } from "react";
 import { useAdmin } from "../contexts/AdminContext";
 import { Link as RouterLink, useSearchParams } from "react-router-dom";
 import {
   Box,
-  Tabs,
-  Tab,
   Typography,
   Paper,
   Table,
@@ -21,7 +19,6 @@ import {
   CardContent,
   TextField,
   Chip,
-  Container,
   Dialog,
   DialogTitle,
   DialogContent,
@@ -45,6 +42,13 @@ import {
   Divider,
   Switch,
 } from "@mui/material";
+import { alpha } from "@mui/material/styles";
+import { ADMIN_NAVIGATION_SECTIONS, ADMIN_TAB_MAP, ADMIN_TABS } from "./adminNavigation";
+
+// One-line descriptions shown under the page title (copy from the approved ENG-1707 mock).
+const ADMIN_TAB_DESCRIPTIONS: Readonly<Record<string, string>> = {
+  users: "Manage access, status, and account health.",
+};
 import { format } from "date-fns";
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
@@ -61,10 +65,13 @@ import UsageCostByUserTab from "../components/admin/UsageCostByUserTab";
 import CostDashboardTab from "../components/admin/CostDashboardTab";
 import ResultEndpointsTab from "../components/admin/ResultEndpointsTab";
 import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
+import EvalV2Tab from "../components/admin/EvalV2Tab";
+import { LegacySatisfactionToggle, SatisfactionBadges, SatisfactionColumnHeader } from "../components/admin/SatisfactionBadges";
 import CrmTab from "../components/admin/CrmTab";
 import V0CreditsCard from "../components/admin/V0CreditsCard";
 import CostBreakdownBody, { OrgUsageRollup } from "../components/admin/CostBreakdownBody";
 import XCostBreakdownBody, { XOrgUsageRollup } from "../components/admin/XCostBreakdownBody";
+import SpendLedgerBody, { SpendLedgerPayload } from "../components/admin/SpendLedgerBody";
 import RevenueTab from "../components/admin/RevenueTab";
 import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
@@ -106,6 +113,7 @@ import {
   Search as SearchIcon,
   Email as EmailIcon,
   BarChart as BarChartIcon,
+  ReceiptLong as ReceiptLongIcon,
   ContentCopy as ContentCopyIcon,
 } from "@mui/icons-material";
 
@@ -283,6 +291,8 @@ interface User {
   productDomain?: string; // Product site domain for feature usage tracking
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   subscriptionType?: string; // Subscription type for customer portal users
+  /** Settled spend this month from the spend ledger (ENG-1250 AC7); absent if the lookup failed. */
+  spendThisMonthUsd?: number;
   tokenUsage?: {
     month: string;
     totalTokens: number;
@@ -301,17 +311,6 @@ interface User {
     totalAdminGrantedMicroUsd?: number;
     totalMigrationOffsetMicroUsd?: number;
   };
-  extraCostUsage?: {
-    month: string;
-    totalCost: number;
-    breakdown: Record<string, number>;
-    resetDate: string;
-  };
-  extraCostUsageHistory?: Array<{
-    month: string;
-    totalCost: number;
-    breakdown: Record<string, number>;
-  }>;
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders
   introductionEmailSent?: string; // ISO date when team introduction email was sent
   utmSource?: string;
@@ -765,35 +764,8 @@ const ChatDialog = ({
 export default function AdminDashboard() {
   const [searchParams, setSearchParams] = useSearchParams();
   
-  // Tab mapping for URL parameters
-  const TAB_MAP = {
-    overview: 0,
-    announcements: 1,
-    users: 2,
-    waitlist: 3,
-    tasks: 4,
-    workflows: 5,
-    'chat-history': 6,
-    'knowledge-base': 7,
-    'agent-mode': 8,
-    'image-models': 9,
-    'default-prompts': 10,
-    'benchmarks': 11,
-    'subscriptions': 12,
-    'mcp-servers': 13,
-    'result-endpoints': 14,
-    'scoring-judges': 15,
-    'crm': 16,
-    'revenue': 17,
-    'funnel': 18,
-    'alert-emails': 19,
-    'onboarding': 20,
-    'connected-accounts': 21,
-    'contractors': 22,
-    'emma-mcp': 23,
-    'costs': 24,
-    'usage-cost': 25,
-  };
+  // Stable deep-link mapping; presentation groups live in adminNavigation.ts.
+  const TAB_MAP = ADMIN_TAB_MAP;
   
   // Get initial tab value from URL or default to Users
   const getInitialTabValue = () => {
@@ -853,6 +825,8 @@ export default function AdminDashboard() {
     useState<AdminChatSession | null>(null);
   const [chatDialogOpen, setChatDialogOpen] = useState(false);
   const [scoringSessionIds, setScoringSessionIds] = useState<Set<string>>(new Set());
+  // ENG-2196: the unvalidated Satisfaction column, its auto-scoring and override stay off until an admin opens them.
+  const [showLegacySatisfaction, setShowLegacySatisfaction] = useState(false);
   const [failedScoringIds, setFailedScoringIds] = useState<Set<string>>(new Set());
   const [scoringJudges, setScoringJudges] = useState<Array<{ id: string; name: string; systemPrompt: string }>>([]);
   const [selectedJudgeId, setSelectedJudgeId] = useState<string>("");
@@ -933,7 +907,6 @@ export default function AdminDashboard() {
   const [currentSubscriptionType, setCurrentSubscriptionType] = useState<string>("");
   const [subscriptionTypeEditLoading, setSubscriptionTypeEditLoading] = useState(false);
   const [availableSubscriptionTypes, setAvailableSubscriptionTypes] = useState<string[]>([]);
-  const [subscriptionTypeAllowanceMap, setSubscriptionTypeAllowanceMap] = useState<Record<string, number | null>>({});
   const [subscriptionTypeCostAllowanceMap, setSubscriptionTypeCostAllowanceMap] = useState<Record<string, number | null>>({});
   // Per-user LLM cost breakdown modal (burn, from the shadow-usage table)
   const [costBreakdownUser, setCostBreakdownUser] = useState<User | null>(null);
@@ -962,6 +935,17 @@ export default function AdminDashboard() {
   const [xBreakdownLoading, setXBreakdownLoading] = useState(false);
   const [xBreakdownError, setXBreakdownError] = useState<string | null>(null);
   const xBreakdownReqRef = useRef(0);
+
+  // ── Cross-vendor spend ledger (ENG-1838, over the ENG-1250 §7 read models) ──
+  // Sibling of the two breakdowns above, but sourced from the immutable
+  // AW-SpendEvents ledger rather than the daily aggregate: per-call, every
+  // metered vendor at once, and the only one that can show reservations.
+  const [spendLedgerUser, setSpendLedgerUser] = useState<User | null>(null);
+  const [spendLedgerMonth, setSpendLedgerMonth] = useState<string>("");
+  const [spendLedgerData, setSpendLedgerData] = useState<SpendLedgerPayload | null>(null);
+  const [spendLedgerLoading, setSpendLedgerLoading] = useState(false);
+  const [spendLedgerError, setSpendLedgerError] = useState<string | null>(null);
+  const spendLedgerReqRef = useRef(0);
   const [usageCreditDialogOpen, setUsageCreditDialogOpen] = useState(false);
   const [usageCreditUserId, setUsageCreditUserId] = useState<string | null>(null);
   const [usageCreditEmail, setUsageCreditEmail] = useState("");
@@ -1063,6 +1047,54 @@ export default function AdminDashboard() {
   const [crmSyncForceFull, setCrmSyncForceFull] = useState(false);
   const [crmSyncAutoSync, setCrmSyncAutoSync] = useState(false);
 
+  // Moved up from further below and wrapped in useCallback: the two effects right after this
+  // read them, and referencing a `const` in a dependency array before its declaration is a
+  // temporal-dead-zone error, not just a stale closure.
+  const loadSubscriptionTypes = useCallback(async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/admin/subscription-types'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const types = response.data;
+      // Extract type names, including "Basic" as default
+      const typeNames = types.length > 0
+        ? types.map((t: any) => t.name)
+        : ['Basic'];
+      setAvailableSubscriptionTypes(typeNames);
+      const costAllowanceMap: Record<string, number | null> = {};
+      types.forEach((t: any) => {
+        costAllowanceMap[t.name] = t.llmUsagePolicy?.hardCostThresholdMicroUsd != null
+          ? t.llmUsagePolicy.hardCostThresholdMicroUsd / 1_000_000
+          : (t.monthlyCostAllowance ?? null);
+      });
+      setSubscriptionTypeCostAllowanceMap(costAllowanceMap);
+    } catch (error) {
+      console.error('Error loading subscription types:', error);
+      // Default to Basic if loading fails
+      setAvailableSubscriptionTypes(['Basic']);
+    }
+  }, [token]);
+
+  const resolveSlackChannelNames = useCallback(async (channelIds: string[]) => {
+    const unresolved = channelIds.filter((id) => !slackChannelNames[id]);
+    if (unresolved.length === 0) return;
+    const results: Record<string, string> = {};
+    await Promise.all(
+      unresolved.map(async (id) => {
+        try {
+          const res = await axios.get(
+            buildApiUrl(`/api/admin/slack/channel-info?channelId=${encodeURIComponent(id)}`),
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+          results[id] = res.data.displayName || res.data.name || id;
+        } catch {
+          results[id] = id;
+        }
+      })
+    );
+    setSlackChannelNames((prev) => ({ ...prev, ...results }));
+  }, [slackChannelNames, token]);
+
   // Load users data only when Users tab (2) is selected
   useEffect(() => {
     if (tabValue === 2) {
@@ -1095,7 +1127,7 @@ export default function AdminDashboard() {
         setAvailableSlackChannelsLoading(false);
       });
     }
-  }, [tabValue]);
+  }, [tabValue, loadSubscriptionTypes, loadUsers, token, userFilterHideBotLike]);
 
   // Resolve Slack channel names for all users whenever users list loads
   useEffect(() => {
@@ -1109,36 +1141,8 @@ export default function AdminDashboard() {
     if (allChannelIds.length > 0) {
       resolveSlackChannelNames(allChannelIds);
     }
-  }, [contextUsers]);
+  }, [contextUsers, resolveSlackChannelNames]);
 
-  // Load subscription types
-  const loadSubscriptionTypes = async () => {
-    try {
-      const response = await axios.get(buildApiUrl('/api/admin/subscription-types'), {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const types = response.data;
-      // Extract type names, including "Basic" as default
-      const typeNames = types.length > 0
-        ? types.map((t: any) => t.name)
-        : ['Basic'];
-      setAvailableSubscriptionTypes(typeNames);
-      const allowanceMap: Record<string, number | null> = {};
-      const costAllowanceMap: Record<string, number | null> = {};
-      types.forEach((t: any) => {
-        allowanceMap[t.name] = t.monthlyTokenAllowance ?? null;
-        costAllowanceMap[t.name] = t.llmUsagePolicy?.hardCostThresholdMicroUsd != null
-          ? t.llmUsagePolicy.hardCostThresholdMicroUsd / 1_000_000
-          : (t.monthlyCostAllowance ?? null);
-      });
-      setSubscriptionTypeAllowanceMap(allowanceMap);
-      setSubscriptionTypeCostAllowanceMap(costAllowanceMap);
-    } catch (error) {
-      console.error('Error loading subscription types:', error);
-      // Default to Basic if loading fails
-      setAvailableSubscriptionTypes(['Basic']);
-    }
-  };
 
   // Fetch the per-model LLM cost burn for a user over a calendar month (YYYY-MM).
   const fetchCostBreakdown = async (userId: string, month: string) => {
@@ -1220,13 +1224,53 @@ export default function AdminDashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [xBreakdownUser?.userId, xBreakdownMonth]);
 
+  // ── Cross-vendor spend ledger (ENG-1838) ──
+  const fetchSpendLedger = async (userId: string, month: string) => {
+    const reqId = ++spendLedgerReqRef.current;
+    const isStale = () => reqId !== spendLedgerReqRef.current;
+    setSpendLedgerLoading(true);
+    setSpendLedgerError(null);
+    try {
+      // The route resolves the billing ROOT itself, so passing a member's id is
+      // safe and the response says whose ledger came back.
+      const response = await axios.get(
+        buildApiUrl(`/api/admin/users/${userId}/spend/breakdown`),
+        { headers: { Authorization: `Bearer ${token}` }, params: { month } }
+      );
+      if (isStale()) return;
+      setSpendLedgerData(response.data);
+    } catch (error: any) {
+      if (isStale()) return;
+      setSpendLedgerData(null);
+      setSpendLedgerError(
+        error.response?.data?.error || error.response?.data?.message || "Failed to load the spend ledger"
+      );
+    } finally {
+      if (!isStale()) setSpendLedgerLoading(false);
+    }
+  };
+
+  const openSpendLedger = (user: User) => {
+    setSpendLedgerUser(user);
+    setSpendLedgerData(null);
+    setSpendLedgerError(null);
+    setSpendLedgerMonth(new Date().toISOString().slice(0, 7));
+  };
+
+  useEffect(() => {
+    if (spendLedgerUser && spendLedgerMonth) {
+      fetchSpendLedger(spendLedgerUser.userId, spendLedgerMonth);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [spendLedgerUser?.userId, spendLedgerMonth]);
+
   // Load waitlist data only when Waitlist tab (3) is selected
   useEffect(() => {
     if (tabValue === 3) {
       loadWaitlist();
       loadUsers(userFilterHideBotLike); // Also load users to check if waitlist entries are registered
     }
-  }, [tabValue]);
+  }, [tabValue, loadUsers, loadWaitlist, userFilterHideBotLike]);
 
   // Handle URL parameter changes
   useEffect(() => {
@@ -1237,7 +1281,7 @@ export default function AdminDashboard() {
     }
     setSearchParams({ tab: "users" });
     setTabValue(TAB_MAP.users);
-  }, [searchParams, setSearchParams]);
+  }, [searchParams, setSearchParams, TAB_MAP]);
 
   // Track last loaded dates to prevent unnecessary reloads
   const lastLoadedDatesRef = React.useRef<{ startDate: string; endDate: string } | null>(null);
@@ -1279,7 +1323,7 @@ export default function AdminDashboard() {
     if (tabValue === 4 && tasks.length === 0) {
       loadTasks();
     }
-  }, [tabValue, token]);
+  }, [tabValue, token, tasks.length]);
 
   useEffect(() => {
     const loadWorkflows = async () => {
@@ -1299,7 +1343,7 @@ export default function AdminDashboard() {
     if (tabValue === 5 && workflows.length === 0) {
       loadWorkflows();
     }
-  }, [tabValue, token]);
+  }, [tabValue, token, workflows.length]);
 
   const loadChatSessions = React.useCallback(
     async (options?: { reset?: boolean; sessionIdOverride?: string; userFilterOverride?: string }) => {
@@ -1393,7 +1437,7 @@ export default function AdminDashboard() {
         setScoringJudges(res.data.judges || []);
       }).catch(() => {});
     }
-  }, [tabValue, chatSessionsInitialized, loadChatSessions]);
+  }, [tabValue, chatSessionsInitialized, loadChatSessions, scoringJudges.length, token]);
 
   useEffect(() => {
     if (tabValue !== 6 || !chatSessionsHasMore) {
@@ -1419,9 +1463,9 @@ export default function AdminDashboard() {
     return () => observer.disconnect();
   }, [tabValue, chatSessionsHasMore, chatSessionsLoading, loadChatSessions]);
 
-  // Trigger satisfaction scoring for sessions that need it
+  // Trigger satisfaction scoring for sessions that need it — only while the legacy column is shown
   useEffect(() => {
-    if (!token || chatSessions.length === 0) return;
+    if (!showLegacySatisfaction || !token || chatSessions.length === 0) return;
 
     const needsScoring = chatSessions.filter((s) => {
       if (scoringSessionIds.has(s.sessionId)) return false;
@@ -1458,8 +1502,9 @@ export default function AdminDashboard() {
           );
           const { scores, failed = [] } = response.data as {
             scores: Record<string, AdminChatSession["satisfactionScore"] | null>;
-            failed?: string[];
+            failed?: Array<{ sessionId: string; reason: string }>;
           };
+          const failedIds = failed.map((f) => f.sessionId);
           setChatSessions((prev) =>
             prev.map((s) => {
               const newScore = scores[s.sessionId];
@@ -1474,8 +1519,8 @@ export default function AdminDashboard() {
             return next;
           });
           // Mark sessions that didn't get a score as failed (retryable)
-          const noResult = batch.filter((id) => !scores[id] && !failed.includes(id));
-          const allFailed = [...failed, ...noResult];
+          const noResult = batch.filter((id) => !scores[id] && !failedIds.includes(id));
+          const allFailed = [...failedIds, ...noResult];
           if (allFailed.length > 0) {
             setFailedScoringIds((prev) => {
               const next = new Set(prev);
@@ -1502,7 +1547,7 @@ export default function AdminDashboard() {
 
     scoreBatches();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chatSessions.length, token]);
+  }, [chatSessions.length, token, showLegacySatisfaction]);
 
   const handleScoreOverrideSave = async () => {
     if (!scoreOverrideSession || !token) return;
@@ -1548,7 +1593,7 @@ export default function AdminDashboard() {
     if (tabValue === 7 && !knowledgeBaseMetrics) {
       loadKnowledgeBaseMetrics();
     }
-  }, [tabValue, token]);
+  }, [tabValue, token, knowledgeBaseMetrics]);
 
   const handleTabChange = (_event: React.SyntheticEvent, newValue: number) => {
     setTabValue(newValue);
@@ -1765,8 +1810,7 @@ export default function AdminDashboard() {
       case "isActive":
         return user.isActive === false ? 0 : 1;
       case "tokenUsage":
-        return user.tokenUsage?.month === new Date().toISOString().slice(0, 7)
-          ? (user.tokenUsage?.totalTokens || 0) : 0;
+        return user.spendThisMonthUsd ?? 0;
       default:
         return (user as unknown as Record<string, unknown>)[property] ?? "";
     }
@@ -1795,11 +1839,9 @@ export default function AdminDashboard() {
       if (userFilterPaid === "paid" && user.subscription_status !== "active") return false;
       if (userFilterPaid === "unpaid" && user.subscription_status === "active") return false;
       if (userFilterPaid === "bounced" && !(user.stripe_customer_id && !user.subscription_status && !user.subscription_amount)) return false;
-      // Has-usage filter — match the display logic: current-month tokens only
+      // Has-usage filter — match the display logic: settled spend this month (ledger)
       if (userFilterHasUsage) {
-        const currentMonth = new Date().toISOString().slice(0, 7);
-        const used = user.tokenUsage?.month === currentMonth ? (user.tokenUsage?.totalTokens || 0) : 0;
-        if (used <= 0) return false;
+        if ((user.spendThisMonthUsd ?? 0) <= 0) return false;
       }
       return true;
     });
@@ -2614,25 +2656,6 @@ export default function AdminDashboard() {
     }
   };
 
-  const resolveSlackChannelNames = async (channelIds: string[]) => {
-    const unresolved = channelIds.filter((id) => !slackChannelNames[id]);
-    if (unresolved.length === 0) return;
-    const results: Record<string, string> = {};
-    await Promise.all(
-      unresolved.map(async (id) => {
-        try {
-          const res = await axios.get(
-            buildApiUrl(`/api/admin/slack/channel-info?channelId=${encodeURIComponent(id)}`),
-            { headers: { Authorization: `Bearer ${token}` } }
-          );
-          results[id] = res.data.displayName || res.data.name || id;
-        } catch {
-          results[id] = id;
-        }
-      })
-    );
-    setSlackChannelNames((prev) => ({ ...prev, ...results }));
-  };
 
   const handleSaveSlackChannel = async () => {
     if (!editingSlackChannelUserId) return;
@@ -3365,52 +3388,132 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
     "Other",
   ];
 
+  const currentAdminTab = ADMIN_TABS.find((adminTab) => adminTab.value === tabValue);
+
   if (adminError) {
     return <Alert severity="error">{adminError}</Alert>;
   }
 
   return (
-    <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
-      <Typography variant="h4" component="h1" gutterBottom>
-        Admin Dashboard
-      </Typography>
-
-      <Paper sx={{ width: "100%", mt: 3 }}>
-        <Box sx={{ borderBottom: 1, borderColor: "divider" }}>
-          <Tabs
-            value={tabValue}
-            onChange={handleTabChange}
-            aria-label="admin tabs"
-            variant="scrollable"
-            scrollButtons="auto"
-          >
-            <Tab label="Overview" {...a11yProps(0)} />
-            <Tab label="Announcements" {...a11yProps(1)} />
-            <Tab label="Users" {...a11yProps(2)} />
-            <Tab label="Waitlist" {...a11yProps(3)} />
-            <Tab label="Tasks" {...a11yProps(4)} />
-            <Tab label="Workflows" {...a11yProps(5)} />
-            <Tab label="Chat History" {...a11yProps(6)} />
-            <Tab label="Knowledge Base" {...a11yProps(7)} />
-            <Tab label="Agent Mode" {...a11yProps(8)} />
-            <Tab label="Image Models (Legacy)" {...a11yProps(9)} />
-            <Tab label="Default Prompts" {...a11yProps(10)} />
-            <Tab label="Benchmarks" {...a11yProps(11)} />
-            <Tab label="Subscriptions" {...a11yProps(12)} />
-            <Tab label="MCP Servers" {...a11yProps(13)} />
-            <Tab label="Result Endpoints" {...a11yProps(14)} />
-            <Tab label="Scoring Judges" {...a11yProps(15)} />
-            <Tab label="CRM" {...a11yProps(17)} />
-            <Tab label="Revenue" {...a11yProps(18)} />
-            <Tab label="Funnel" {...a11yProps(19)} />
-            <Tab label="Alert Emails" {...a11yProps(18)} />
-            <Tab label="Onboarding" {...a11yProps(20)} />
-            <Tab label="Connected Accounts" {...a11yProps(21)} />
-            <Tab label="Contractors" {...a11yProps(22)} />
-            <Tab label="Emma MCP" {...a11yProps(23)} />
-            <Tab label="LLM Costs" {...a11yProps(24)} />
-            <Tab label="Usage & Cost" {...a11yProps(25)} />
-          </Tabs>
+    <>
+    <Box
+      sx={{
+        display: "flex",
+        flexDirection: { xs: "column", md: "row" },
+        alignItems: "stretch",
+        flexGrow: 1,
+        minHeight: { md: "calc(100vh - 58px)" },
+        bgcolor: "background.default",
+      }}
+    >
+      {/* Admin sidebar — seven named sections (ENG-1707 round 2). Grouping is presentational; ?tab= deep links are unchanged. */}
+      <Box
+        component="nav"
+        aria-label="Admin sections"
+        sx={{
+          width: { xs: "100%", md: 232 },
+          flexShrink: 0,
+          bgcolor: "background.paper",
+          borderRight: { md: "1px solid" },
+          borderBottom: { xs: "1px solid", md: 0 },
+          borderColor: "divider",
+          px: 1.25,
+          py: 1.5,
+          position: { md: "sticky" },
+          top: 0,
+          alignSelf: { md: "flex-start" },
+          maxHeight: { xs: 280, md: "100vh" },
+          overflowY: "auto",
+          scrollbarWidth: "thin",
+          scrollbarColor: (theme) => `${alpha(theme.palette.text.primary, 0.16)} transparent`,
+          "&::-webkit-scrollbar": { width: 6 },
+          "&::-webkit-scrollbar-thumb": { bgcolor: (theme) => alpha(theme.palette.text.primary, 0.16), borderRadius: 3 },
+        }}
+      >
+        {ADMIN_NAVIGATION_SECTIONS.map((section, sectionIndex) => (
+          <Box key={section.label} sx={{ mb: 0.75 }}>
+            <Typography
+              component="div"
+              sx={{
+                px: 1.25,
+                pt: sectionIndex === 0 ? 0.5 : 1.5,
+                pb: 0.5,
+                fontSize: "0.625rem",
+                fontWeight: 700,
+                letterSpacing: "0.07em",
+                textTransform: "uppercase",
+                color: "text.disabled",
+              }}
+            >
+              {section.label}
+            </Typography>
+            {section.tabs.map((adminTab) => {
+              const selected = tabValue === adminTab.value;
+              return (
+                <Button
+                  key={adminTab.slug}
+                  role="tab"
+                  aria-selected={selected}
+                  {...a11yProps(adminTab.value)}
+                  onClick={(event) => handleTabChange(event, adminTab.value)}
+                  fullWidth
+                  disableElevation
+                  sx={{
+                    justifyContent: "flex-start",
+                    textAlign: "left",
+                    my: "1px",
+                    px: 1.25,
+                    py: 0.875,
+                    minHeight: 0,
+                    borderRadius: "6px",
+                    fontSize: "0.8125rem",
+                    lineHeight: 1.35,
+                    fontWeight: selected ? 700 : 500,
+                    color: selected ? "primary.dark" : "text.secondary",
+                    bgcolor: selected ? (theme) => alpha(theme.palette.primary.main, 0.14) : "transparent",
+                    "&:hover": { bgcolor: selected ? (theme) => alpha(theme.palette.primary.main, 0.14) : "background.default", color: selected ? "primary.dark" : "text.primary" },
+                    "&.Mui-focusVisible": { boxShadow: (theme) => `0 0 0 2px ${alpha(theme.palette.primary.main, 0.35)}` },
+                  }}
+                >
+                  {adminTab.label}
+                </Button>
+              );
+            })}
+          </Box>
+        ))}
+      </Box>
+      <Box sx={{ minWidth: 0, flexGrow: 1, display: "flex", flexDirection: "column" }}>
+        {/* Page header for the selected admin surface: title, optional description, and surface-level actions. */}
+        <Box
+          sx={{
+            px: 3,
+            pt: 3,
+            display: "flex",
+            flexWrap: "wrap",
+            alignItems: "flex-start",
+            gap: 1.5,
+          }}
+        >
+          <Box sx={{ flexGrow: 1, minWidth: 200 }}>
+            <Typography component="h1" sx={{ fontSize: "1.25rem", fontWeight: 700, lineHeight: 1.3, letterSpacing: "-0.01em" }}>
+              {currentAdminTab?.label ?? "Admin"}
+            </Typography>
+            {currentAdminTab && ADMIN_TAB_DESCRIPTIONS[currentAdminTab.slug] && (
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.25 }}>
+                {ADMIN_TAB_DESCRIPTIONS[currentAdminTab.slug]}
+              </Typography>
+            )}
+          </Box>
+          {tabValue === ADMIN_TAB_MAP.users && (
+            <Box sx={{ display: "flex", gap: 1, flexShrink: 0, flexWrap: "wrap" }}>
+              <Button variant="outlined" size="small" startIcon={resyncPaymentsLoading ? <CircularProgress size={14} /> : <SyncIcon />} onClick={handleResyncPayments} disabled={resyncPaymentsLoading}>
+                Resync Payments
+              </Button>
+              <Button variant="contained" size="small" disableElevation startIcon={<SyncIcon />} onClick={() => handleOpenCrmSyncDialog("users")}>
+                Sync to CRM
+              </Button>
+            </Box>
+          )}
         </Box>
 
         <TabPanel value={tabValue} index={0}>
@@ -4146,9 +4249,9 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
             const hasAttention = pastDue.length > 0 || trialEnding.length > 0 || trialExpired.length > 0 || subscriptionExpired.length > 0;
             if (!hasAttention) return null;
             return (
-              <Paper variant="outlined" sx={{ mb: 3, p: 2, borderColor: "error.light", bgcolor: "error.50" }}>
+              <Paper variant="outlined" sx={{ mb: 3, p: 2, borderRadius: 2, boxShadow: "none", borderColor: (theme) => alpha(theme.palette.error.main, 0.35), bgcolor: (theme) => alpha(theme.palette.error.main, 0.08) }}>
                 <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 1.5, color: "error.main" }}>
-                  ⚠️ Attention Needed
+                  Attention needed
                 </Typography>
                 {pastDue.length > 0 && (
                   <Box sx={{ mb: 1.5 }}>
@@ -4201,8 +4304,8 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
               </Paper>
             );
           })()}
-          {/* Summary cards - Stripe-style muted design */}
-          <Box sx={{ display: "flex", gap: 2, mb: 3, flexWrap: "wrap" }}>
+          {/* Summary cards — one even row on desktop, wraps to a grid on narrower widths */}
+          <Box sx={{ display: "grid", gridTemplateColumns: { xs: "repeat(2, minmax(0, 1fr))", sm: "repeat(3, minmax(0, 1fr))", md: "repeat(4, minmax(0, 1fr))", lg: "repeat(7, minmax(0, 1fr))" }, gap: 1.25, mb: 2.5 }}>
             {(() => {
               const active = contextUsers.filter(u => u.isActive !== false);
               const paying = contextUsers.filter(u => u.subscription_status === "active");
@@ -4228,15 +4331,15 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                 { label: "Showing", value: sortedUsers.length, sub: undefined },
               ];
             })().map((stat) => (
-              <Paper key={stat.label} variant="outlined" sx={{ px: 2.5, py: 1.5, minWidth: 100, borderColor: stat.warn ? "error.main" : undefined }}>
-                <Typography variant="h5" sx={{ fontWeight: 600, lineHeight: 1.2, color: stat.warn ? "error.main" : undefined }}>
-                  {stat.value}
-                </Typography>
-                <Typography variant="caption" color="text.secondary">
+              <Paper key={stat.label} variant="outlined" sx={{ px: 1.75, py: 1.5, minWidth: 0, borderRadius: 2, boxShadow: "none", borderColor: stat.warn ? (theme) => alpha(theme.palette.error.main, 0.35) : "divider", bgcolor: stat.warn ? (theme) => alpha(theme.palette.error.main, 0.08) : "background.paper" }}>
+                <Typography variant="caption" sx={{ display: "block", color: "text.secondary", fontSize: "0.6875rem", lineHeight: 1.4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                   {stat.label}
                 </Typography>
+                <Typography sx={{ fontSize: "1.25rem", fontWeight: 700, lineHeight: 1.3, mt: 0.25, color: stat.warn ? "error.main" : "text.primary" }}>
+                  {stat.value}
+                </Typography>
                 {stat.sub && (
-                  <Typography variant="caption" display="block" color="text.disabled" sx={{ fontSize: "0.65rem", mt: 0.25 }}>
+                  <Typography variant="caption" display="block" color="text.disabled" sx={{ fontSize: "0.6875rem", mt: 0.25, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                     {stat.sub}
                   </Typography>
                 )}
@@ -4244,13 +4347,13 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
             ))}
           </Box>
           {/* Filter bar */}
-          <Box sx={{ display: "flex", gap: 1.5, mb: 2, alignItems: "center" }}>
+          <Box sx={{ display: "flex", gap: 1.25, mb: 2, alignItems: "center", flexWrap: "wrap" }}>
             <TextField
               size="small"
               placeholder="Search users..."
               value={userSearchQuery}
               onChange={(e) => setUserSearchQuery(e.target.value)}
-              sx={{ minWidth: 240 }}
+              sx={{ flex: "1 1 220px", maxWidth: 360 }}
               InputProps={{
                 startAdornment: (
                   <InputAdornment position="start">
@@ -4295,7 +4398,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                 />
               }
               label={<Typography variant="body2">Has usage</Typography>}
-              sx={{ ml: 0 }}
+              sx={{ ml: 0, mr: 0, whiteSpace: "nowrap" }}
             />
             <FormControlLabel
               control={
@@ -4309,35 +4412,18 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                 />
               }
               label={<Typography variant="body2">Hide bots</Typography>}
-              sx={{ ml: 0 }}
+              sx={{ ml: 0, mr: 0, whiteSpace: "nowrap" }}
             />
             {(userSearchQuery || userFilterStatus !== "active" || userFilterTier !== "all" || userFilterPaid !== "all" || userFilterHasUsage || !userFilterHideBotLike) && (
               <Button size="small" onClick={() => { setUserSearchQuery(""); setUserFilterStatus("active"); setUserFilterTier("all"); setUserFilterPaid("all"); setUserFilterHasUsage(false); setUserFilterHideBotLike(true); loadUsers(true); }}>
                 Clear
               </Button>
             )}
-            <Box sx={{ flexGrow: 1 }} />
-            <Button variant="outlined" size="small" startIcon={resyncPaymentsLoading ? <CircularProgress size={14} /> : <SyncIcon />} onClick={handleResyncPayments} disabled={resyncPaymentsLoading}>
-              Resync Payments
-            </Button>
-            <Button variant="contained" size="small" startIcon={<SyncIcon />} onClick={() => handleOpenCrmSyncDialog("users")}>
-              Sync to CRM
-            </Button>
           </Box>
-          <Box sx={{ mb: 2, p: 2, bgcolor: 'background.paper', borderRadius: 1, border: '1px solid', borderColor: 'divider' }}>
-            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-              <Typography variant="subtitle2" sx={{ minWidth: 160, whiteSpace: 'nowrap' }}>Admin Slack Channels:</Typography>
-              <Button
-                variant="contained"
-                size="small"
-                onClick={handleSaveAdminSlackChannel}
-                disabled={adminSlackChannelLoading}
-              >
-                {adminSlackChannelLoading ? <CircularProgress size={20} /> : 'Save'}
-              </Button>
-              {adminSlackChannelSaved && (
-                <Typography variant="caption" color="success.main">Saved!</Typography>
-              )}
+          <Box sx={{ mb: 2, px: 1.75, py: 1.25, display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1.5, bgcolor: 'background.default', borderRadius: 2, border: '1px solid', borderColor: 'divider' }}>
+            <Box sx={{ minWidth: 150 }}>
+              <Typography variant="subtitle2" sx={{ fontWeight: 600, lineHeight: 1.3 }}>Admin Slack channels</Typography>
+              <Typography variant="caption" color="text.secondary">Where admin alerts are posted</Typography>
             </Box>
             <Autocomplete
               multiple
@@ -4366,11 +4452,24 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                   />
                 ))
               }
-              sx={{ maxWidth: 560 }}
+              sx={{ flex: '1 1 280px', maxWidth: 560, bgcolor: 'background.paper', borderRadius: 2 }}
               noOptionsText={availableSlackChannelsLoading ? "Loading channels…" : "No channels found — make sure the bot is added to the channels"}
             />
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={handleSaveAdminSlackChannel}
+                disabled={adminSlackChannelLoading}
+              >
+                {adminSlackChannelLoading ? <CircularProgress size={16} /> : 'Save'}
+              </Button>
+              {adminSlackChannelSaved && (
+                <Typography variant="caption" color="success.main">Saved</Typography>
+              )}
+            </Box>
             {adminSlackChannels.length > 0 && (
-              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, mt: 1 }}>
+              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, flexBasis: '100%' }}>
                 {adminSlackChannels.map((id) => {
                   const ch = availableSlackChannels.find((c) => c.id === id);
                   return (
@@ -4388,7 +4487,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
               </Box>
             )}
           </Box>
-          <TableContainer component={Paper} variant="outlined">
+          <TableContainer component={Paper} variant="outlined" sx={{ borderRadius: 2, boxShadow: "none" }}>
             <Table size="small">
               <TableHead>
                 <TableRow sx={{ "& th": { fontWeight: 600, fontSize: "0.75rem", color: "text.secondary", textTransform: "uppercase", letterSpacing: "0.05em", py: 1.5 } }}>
@@ -4410,7 +4509,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                     <UserSortLabel property="lastLoginTime" label="Last Active" />
                   </TableCell>
                   <TableCell>
-                    <UserSortLabel property={"tokenUsage" as keyof User} label="Usage" />
+                    <UserSortLabel property={"tokenUsage" as keyof User} label="Spend (mo)" />
                   </TableCell>
                   <TableCell>Intro Email</TableCell>
                   <TableCell sx={{ width: 100 }}>Actions</TableCell>
@@ -4449,8 +4548,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                       if (diffD < 7) return `${diffD}d ago`;
                       return format(d, "MMM d");
                     })() : "Never";
-                    const used = user.tokenUsage?.month === new Date().toISOString().slice(0, 7)
-                      ? (user.tokenUsage?.totalTokens || 0) : 0;
+                    const spendUsd = user.spendThisMonthUsd;
 
                     return (
                       <React.Fragment key={user.userId}>
@@ -4561,7 +4659,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                         </TableCell>
                         <TableCell>
                           <Typography variant="body2" sx={{ fontVariantNumeric: "tabular-nums" }}>
-                            {used > 0 ? used.toLocaleString() : "—"}
+                            {spendUsd != null ? `$${spendUsd.toFixed(2)}` : "—"}
                           </Typography>
                         </TableCell>
                         <TableCell>
@@ -4913,20 +5011,10 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                 </Grid>
                                 {/* Usage + actions row */}
                                 <Grid item xs={6}>
-                                  <Typography variant="caption" color="text.secondary">Token Usage</Typography>
-                                  <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
-                                    {user.roles?.includes("customer") ? (() => {
-                                      const baseAllowance = subscriptionTypeAllowanceMap[user.subscriptionType || "Basic"] ?? null;
-                                      const bonus = user.tokenAllowanceBonus || 0;
-                                      const effectiveAllowance = baseAllowance != null ? baseAllowance + bonus : null;
-                                      return (
-                                        <Typography variant="body2">
-                                          {used.toLocaleString()} / {effectiveAllowance != null ? effectiveAllowance.toLocaleString() : "∞"}
-                                          {bonus > 0 && <Typography component="span" variant="caption" color="text.secondary"> (+{bonus.toLocaleString()} bonus)</Typography>}
-                                        </Typography>
-                                      );
-                                    })() : <Typography variant="body2" color="text.disabled">—</Typography>}
-                                  </Box>
+                                  <Typography variant="caption" color="text.secondary">Token usage (archived)</Typography>
+                                  <Typography variant="body2" color="text.disabled" sx={{ mt: 0.5 }}>
+                                    Live token counting is retired — spend is metered in dollars (see LLM Cost).
+                                  </Typography>
                                   {user.roles?.includes("customer") && user.tokenUsageHistory && user.tokenUsageHistory.length > 0 && (
                                     <Box sx={{ mt: 0.5 }}>
                                       <Typography variant="caption" color="text.secondary">History: </Typography>
@@ -4942,19 +5030,19 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                 <Grid item xs={6}>
                                   <HelpCaption
                                     label="LLM Cost"
-                                    help="Dollars deducted from this user's monthly cost cap so far this month, vs the cap (∞ = no cap). This is the counted/deducted figure — open the breakdown for gross burn per model, including platform-absorbed cost."
+                                    help="Settled spend this month from the spend ledger, vs the cap (∞ = no cap). Accounts on ledger enforcement (every tier at present) are capped on this figure; a rollback to the legacy basis would count LLM spend only. A dash means the ledger lookup failed. Open the breakdown for gross burn per model, including platform-absorbed cost."
                                   />
                                   <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
                                     {user.roles?.includes("customer") ? (() => {
                                       const currentMonth = new Date().toISOString().slice(0, 7);
-                                      const costUsed = user.tokenUsage?.month === currentMonth ? (user.tokenUsage?.totalCost ?? 0) : 0;
+                                      const costUsed = user.spendThisMonthUsd;
                                       const costAllowance = subscriptionTypeCostAllowanceMap[user.subscriptionType || "Basic"] ?? null;
                                       const credits = user.llmUsageCredits?.month === currentMonth
                                         ? ((user.llmUsageCredits.totalPurchasedMicroUsd || 0) + (user.llmUsageCredits.totalAdminGrantedMicroUsd || 0)) / 1_000_000
                                         : 0;
                                       return (
                                         <Typography variant="body2">
-                                          ${costUsed.toFixed(2)} / {costAllowance != null ? `$${(costAllowance + credits).toFixed(2)}` : "∞"}
+                                          {costUsed != null ? `$${costUsed.toFixed(2)}` : "—"} / {costAllowance != null ? `$${(costAllowance + credits).toFixed(2)}` : "∞"}
                                           {credits > 0 && <Typography component="span" variant="caption" color="text.secondary"> (+${credits.toFixed(2)} credits)</Typography>}
                                           <Typography component="span" variant="caption" color="text.secondary"> deducted</Typography>
                                         </Typography>
@@ -4998,45 +5086,32 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                     </Box>
                                   </Grid>
                                 )}
-                                {/* Extra Cost Usage (enrichment, image gen, etc.) */}
+                                {/* Cross-vendor spend ledger (ENG-1838). Separate from the two
+                                    cost figures above because it answers a different question:
+                                    those are "what did this user burn on X / on models", this is
+                                    "where did this billing subject's whole month go, and why is
+                                    it paused" — from the immutable per-call ledger. */}
                                 {user.roles?.includes("customer") && (
                                   <Grid item xs={6}>
-                                    <Typography variant="caption" color="text.secondary">Extra Cost Usage</Typography>
-                                    <Box sx={{ mt: 0.5 }}>
-                                      {(() => {
-                                        const currentMonth = new Date().toISOString().slice(0, 7);
-                                        const extraUsage = user.extraCostUsage?.month === currentMonth ? user.extraCostUsage : null;
-                                        const totalCost = extraUsage?.totalCost ?? 0;
-                                        const breakdown = (extraUsage?.breakdown ?? {}) as Record<string, number>;
-                                        const breakdownEntries = Object.entries(breakdown).filter(([, v]) => v > 0);
-                                        return (
-                                          <>
-                                            <Typography variant="body2">
-                                              ${totalCost.toFixed(4)} this month
-                                            </Typography>
-                                            {breakdownEntries.length > 0 && (
-                                              <Box sx={{ mt: 0.25 }}>
-                                                {breakdownEntries.map(([key, val]) => (
-                                                  <Typography key={key} component="span" variant="caption" color="text.secondary" sx={{ mr: 1 }}>
-                                                    {key}: ${(val as number).toFixed(4)}
-                                                  </Typography>
-                                                ))}
-                                              </Box>
-                                            )}
-                                          </>
-                                        );
-                                      })()}
+                                    <HelpCaption
+                                      label="Spend ledger"
+                                      help="Every AgentWeb-paid call for this billing subject this month, LLM and vendor alike, from the immutable spend ledger: by provider, feature, member and session, plus open reservations and the allowance comparison with how much of the month's LLM spend it covers. It does not explain a pause (the live cap counts LLM spend only). Read-only; nothing here changes a balance."
+                                    />
+                                    <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
+                                      <Typography variant="body2" color="text.secondary">
+                                        LLM + vendors, this month
+                                      </Typography>
+                                      <Tooltip title="Open the spend ledger (LLM + vendors)">
+                                        <IconButton
+                                          size="small"
+                                          onClick={() => openSpendLedger(user)}
+                                          color="primary"
+                                          data-testid={`open-spend-ledger-${user.userId}`}
+                                        >
+                                          <ReceiptLongIcon fontSize="small" />
+                                        </IconButton>
+                                      </Tooltip>
                                     </Box>
-                                    {user.extraCostUsageHistory && user.extraCostUsageHistory.length > 0 && (
-                                      <Box sx={{ mt: 0.5 }}>
-                                        <Typography variant="caption" color="text.secondary">History: </Typography>
-                                        {[...user.extraCostUsageHistory].reverse().slice(0, 6).map((h) => (
-                                          <Typography key={h.month} component="span" variant="caption" color="text.secondary" sx={{ mr: 1 }}>
-                                            {h.month}: ${h.totalCost.toFixed(4)}
-                                          </Typography>
-                                        ))}
-                                      </Box>
-                                    )}
                                   </Grid>
                                 )}
                                 <Grid item xs={6}>
@@ -5930,6 +6005,8 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                 Clear
               </Button>
             )}
+            <Box sx={{ flexGrow: 1 }} />
+            <LegacySatisfactionToggle checked={showLegacySatisfaction} onChange={setShowLegacySatisfaction} />
           </Box>
           <TableContainer component={Paper}>
             <Table>
@@ -5948,14 +6025,18 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                   <TableCell>Longest Wait</TableCell>
                   <TableCell>Max Heap</TableCell>
                   <TableCell>Feedback</TableCell>
-                  <TableCell>Satisfaction</TableCell>
                   <TableCell>Actions</TableCell>
+                  {showLegacySatisfaction && (
+                    <TableCell>
+                      <SatisfactionColumnHeader />
+                    </TableCell>
+                  )}
                 </TableRow>
               </TableHead>
               <TableBody>
                 {chatSessionsLoading && chatSessions.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={15} align="center">
+                    <TableCell colSpan={showLegacySatisfaction ? 15 : 14} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -6170,121 +6251,6 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                           })()}
                         </TableCell>
                         <TableCell>
-                          {(() => {
-                            const sat = session.satisfactionScore;
-                            if (scoringSessionIds.has(session.sessionId) && !sat) {
-                              return <CircularProgress size={16} />;
-                            }
-                            if (failedScoringIds.has(session.sessionId) && !sat) {
-                              return (
-                                <Tooltip title="Scoring failed. Click to retry.">
-                                  <IconButton
-                                    size="small"
-                                    color="error"
-                                    onClick={async () => {
-                                      setFailedScoringIds((prev) => {
-                                        const next = new Set(prev);
-                                        next.delete(session.sessionId);
-                                        return next;
-                                      });
-                                      setScoringSessionIds((prev) => new Set(prev).add(session.sessionId));
-                                      try {
-                                        const response = await axios.post(
-                                          buildApiUrl("/api/admin/chat-sessions/score"),
-                                          { sessionIds: [session.sessionId] },
-                                          { headers: { Authorization: `Bearer ${token}` }, timeout: 30000 }
-                                        );
-                                        const { scores, failed = [] } = response.data;
-                                        const newScore = scores[session.sessionId];
-                                        if (newScore) {
-                                          setChatSessions((prev) =>
-                                            prev.map((s) =>
-                                              s.sessionId === session.sessionId ? { ...s, satisfactionScore: newScore } : s
-                                            )
-                                          );
-                                        }
-                                        if (failed.includes(session.sessionId)) {
-                                          setFailedScoringIds((prev) => new Set(prev).add(session.sessionId));
-                                        }
-                                      } catch {
-                                        setFailedScoringIds((prev) => new Set(prev).add(session.sessionId));
-                                      } finally {
-                                        setScoringSessionIds((prev) => {
-                                          const next = new Set(prev);
-                                          next.delete(session.sessionId);
-                                          return next;
-                                        });
-                                      }
-                                    }}
-                                  >
-                                    <ReplayIcon sx={{ fontSize: '1rem' }} />
-                                  </IconButton>
-                                </Tooltip>
-                              );
-                            }
-                            if (!sat && (!session.judgeScores || Object.keys(session.judgeScores).length === 0)) {
-                              return <span style={{ color: '#999' }}>-</span>;
-                            }
-                            const chips: React.ReactNode[] = [];
-                            if (sat) {
-                              const color = sat.score <= 2 ? 'error' : sat.score === 3 ? 'warning' : 'success';
-                              const dimSummary = sat.dimensions
-                                ? ` | Goal:${sat.dimensions.goalCompletion} Accuracy:${sat.dimensions.dataAccuracy} Quality:${sat.dimensions.outputQuality}`
-                                : '';
-                              chips.push(
-                                <Tooltip key="default" title={`Default: ${sat.reason}${dimSummary}${sat.adminOverride ? ' (admin override)' : ''}`}>
-                                  <Chip
-                                    label={`Default: ${sat.score}`}
-                                    size="small"
-                                    color={color}
-                                    variant={sat.adminOverride ? 'filled' : 'outlined'}
-                                    icon={sat.adminOverride ? <EditIcon sx={{ fontSize: '0.8rem' }} /> : undefined}
-                                    onClick={(e) => {
-                                      setScoreOverrideAnchor(e.currentTarget);
-                                      setScoreOverrideSession(session);
-                                      setScoreOverrideValue(sat.score);
-                                      setScoreOverrideReason(sat.reason);
-                                    }}
-                                    sx={{ cursor: 'pointer' }}
-                                  />
-                                </Tooltip>
-                              );
-                              if (sat.dimensions) {
-                                const { goalCompletion, dataAccuracy, outputQuality } = sat.dimensions;
-                                const dimColor = (v: number) => v <= 2 ? 'error' : v === 3 ? 'warning' : 'success';
-                                chips.push(
-                                  <Tooltip key="dim-goal" title="Goal completion"><Chip label={`G:${goalCompletion}`} size="small" color={dimColor(goalCompletion) as any} variant="outlined" sx={{ fontSize: '0.65rem', height: 18 }} /></Tooltip>,
-                                  <Tooltip key="dim-acc" title="Data accuracy"><Chip label={`A:${dataAccuracy}`} size="small" color={dimColor(dataAccuracy) as any} variant="outlined" sx={{ fontSize: '0.65rem', height: 18 }} /></Tooltip>,
-                                  <Tooltip key="dim-qual" title="Output quality"><Chip label={`Q:${outputQuality}`} size="small" color={dimColor(outputQuality) as any} variant="outlined" sx={{ fontSize: '0.65rem', height: 18 }} /></Tooltip>,
-                                );
-                              }
-                            }
-                            if (session.judgeScores) {
-                              Object.entries(session.judgeScores).forEach(([jId, jScore]) => {
-                                const jColor = jScore.score <= 2 ? 'error' : jScore.score === 3 ? 'warning' : 'success';
-                                const jDimSummary = jScore.dimensions
-                                  ? ` | Goal:${jScore.dimensions.goalCompletion} Accuracy:${jScore.dimensions.dataAccuracy} Quality:${jScore.dimensions.outputQuality}`
-                                  : '';
-                                chips.push(
-                                  <Tooltip key={jId} title={`${jScore.judgeName}: ${jScore.reason}${jDimSummary}`}>
-                                    <Chip
-                                      label={`${jScore.judgeName}: ${jScore.score}`}
-                                      size="small"
-                                      color={jColor as any}
-                                      variant="outlined"
-                                    />
-                                  </Tooltip>
-                                );
-                              });
-                            }
-                            return (
-                              <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
-                                {chips}
-                              </Box>
-                            );
-                          })()}
-                        </TableCell>
-                        <TableCell>
                           <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
                             <Button
                               variant="outlined"
@@ -6328,11 +6294,86 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                             )}
                           </Box>
                         </TableCell>
+                        {showLegacySatisfaction && (
+                          <TableCell>
+                            {(() => {
+                              const sat = session.satisfactionScore;
+                              if (scoringSessionIds.has(session.sessionId) && !sat) {
+                                return <CircularProgress size={16} />;
+                              }
+                              if (failedScoringIds.has(session.sessionId) && !sat) {
+                                return (
+                                  <Tooltip title="Scoring failed. Click to retry.">
+                                    <IconButton
+                                      size="small"
+                                      color="error"
+                                      onClick={async () => {
+                                        setFailedScoringIds((prev) => {
+                                          const next = new Set(prev);
+                                          next.delete(session.sessionId);
+                                          return next;
+                                        });
+                                        setScoringSessionIds((prev) => new Set(prev).add(session.sessionId));
+                                        try {
+                                          const response = await axios.post(
+                                            buildApiUrl("/api/admin/chat-sessions/score"),
+                                            { sessionIds: [session.sessionId] },
+                                            { headers: { Authorization: `Bearer ${token}` }, timeout: 30000 }
+                                          );
+                                          const { scores, failed = [] } = response.data as {
+                                            scores: Record<string, AdminChatSession["satisfactionScore"] | null>;
+                                            failed?: Array<{ sessionId: string; reason: string }>;
+                                          };
+                                          const newScore = scores[session.sessionId];
+                                          if (newScore) {
+                                            setChatSessions((prev) =>
+                                              prev.map((s) =>
+                                                s.sessionId === session.sessionId ? { ...s, satisfactionScore: newScore } : s
+                                              )
+                                            );
+                                          }
+                                          if (failed.some((f) => f.sessionId === session.sessionId)) {
+                                            setFailedScoringIds((prev) => new Set(prev).add(session.sessionId));
+                                          }
+                                        } catch {
+                                          setFailedScoringIds((prev) => new Set(prev).add(session.sessionId));
+                                        } finally {
+                                          setScoringSessionIds((prev) => {
+                                            const next = new Set(prev);
+                                            next.delete(session.sessionId);
+                                            return next;
+                                          });
+                                        }
+                                      }}
+                                    >
+                                      <ReplayIcon sx={{ fontSize: '1rem' }} />
+                                    </IconButton>
+                                  </Tooltip>
+                                );
+                              }
+                              if (!sat && (!session.judgeScores || Object.keys(session.judgeScores).length === 0)) {
+                                return <span style={{ color: '#999' }}>-</span>;
+                              }
+                              return (
+                                <SatisfactionBadges
+                                  score={sat}
+                                  judgeScores={session.judgeScores}
+                                  onOverride={(anchor, score) => {
+                                    setScoreOverrideAnchor(anchor);
+                                    setScoreOverrideSession(session);
+                                    setScoreOverrideValue(score.score);
+                                    setScoreOverrideReason(score.reason);
+                                  }}
+                                />
+                              );
+                            })()}
+                          </TableCell>
+                        )}
                       </TableRow>
                     ))}
                     {chatSessionsLoading && (
                       <TableRow>
-                        <TableCell colSpan={15} align="center">
+                        <TableCell colSpan={showLegacySatisfaction ? 15 : 14} align="center">
                           <CircularProgress size={24} />
                         </TableCell>
                       </TableRow>
@@ -6639,7 +6680,11 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
           <UsageCostByUserTab />
         </TabPanel>
 
-      </Paper>
+        <TabPanel value={tabValue} index={26}>
+          <EvalV2Tab />
+        </TabPanel>
+        </Box>
+      </Box>
 
       {/* Satisfaction Score Override Popover */}
       <Popover
@@ -6920,6 +6965,39 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setXBreakdownUser(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Cross-vendor spend ledger (ENG-1838 / ENG-1250 §7) */}
+      <Dialog open={!!spendLedgerUser} onClose={() => setSpendLedgerUser(null)} maxWidth="md" fullWidth>
+        <DialogTitle sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 2 }}>
+          <span>Spend ledger — {spendLedgerUser?.email}</span>
+          <TextField
+            select
+            size="small"
+            label="Month"
+            value={spendLedgerMonth}
+            onChange={(e) => setSpendLedgerMonth(e.target.value)}
+            sx={{ width: 170 }}
+          >
+            {recentMonthOptions(12).map((m) => (
+              <MenuItem key={m.value} value={m.value}>{m.label}</MenuItem>
+            ))}
+          </TextField>
+        </DialogTitle>
+        <DialogContent dividers>
+          {spendLedgerLoading ? (
+            <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}><CircularProgress /></Box>
+          ) : spendLedgerError ? (
+            <Typography color="error" variant="body2" sx={{ py: 2 }} data-testid="spend-ledger-error">
+              {spendLedgerError}
+            </Typography>
+          ) : (
+            <SpendLedgerBody data={spendLedgerData} />
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setSpendLedgerUser(null)}>Close</Button>
         </DialogActions>
       </Dialog>
 
@@ -8386,7 +8464,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
           </Button>
         </DialogActions>
       </Dialog>
-    </Container>
+    </>
   );
 }
 

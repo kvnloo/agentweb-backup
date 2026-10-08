@@ -116,6 +116,7 @@ jest.mock('../utils/agentModeErrors', () => ({
   isSessionLimitError: jest.fn().mockReturnValue(false),
   isTransientLLMError: jest.fn().mockReturnValue(false),
   isWorkerShutdownError: jest.fn().mockReturnValue(false),
+  isProviderNoEndpointsError: jest.fn().mockReturnValue(false),
 }));
 
 import { agentModeController, activeSessionGenerations } from '../controllers/agentModeController';

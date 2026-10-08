@@ -27,6 +27,12 @@ jest.mock('../services/metaLaunchGate', () => ({
 import { AgentModeService } from '../services/agentModeService';
 import { metaService } from '../services/metaService';
 import { isMetaSpendStartingWrite, runMetaTrackingGate } from '../services/metaLaunchGate';
+// ENG-2103 (F2 follow-up): resolveOrCreateSeedAudience moved to
+// emma/impl/adsApis.ts as a real export — the spy below was retargeted from
+// `service` (the class instance) to this module, since executeAudienceCampaignLaunch
+// now reaches it via a same-module self-import that still routes through
+// this exports object.
+import * as adsApisImpl from '../emma/impl/adsApis';
 
 const ACCOUNT = '409853340719899';
 const CAMPAIGN = '120200000000000';
@@ -42,6 +48,21 @@ beforeEach(() => {
   manageCampaignsSpy = jest
     .spyOn(service as any, 'manageMetaAdsCampaigns')
     .mockResolvedValue({ success: true, message: 'campaign updated' });
+  // ENG-1635/1644 gap 5: params.confirm=true is no longer independently
+  // sufficient to reach dispatch — the grant check now always decides. This
+  // file is entirely about the ENG-941 tracking gate and override binding,
+  // both of which run AFTER authorization and are untouched by gap 5, so
+  // stubbing the grant itself (rather than building real approval-deck
+  // fixtures per test) keeps every existing assertion exercising exactly
+  // what it always did.
+  jest.spyOn(service as any, 'claimMetaWriteManifestGrant').mockResolvedValue({ granted: true, digest: 'stub-digest' });
+  // ENG-2277/2278/2279/2280: checkMetaBudgetChange is a separate, newer gate
+  // that also runs on every CAMPAIGN/AD_SET UPDATE carrying a budget field —
+  // several tests below vary daily_budget purely as an arbitrary
+  // distinguishing value to prove override-token binding, not to exercise
+  // budget-anomaly detection. Out of scope here, same reasoning as the
+  // manifest-grant stub above.
+  jest.spyOn(service as any, 'checkMetaBudgetChange').mockResolvedValue(undefined);
 });
 
 describe('callMetaMarketingApi — ENG-941 gate wiring', () => {
@@ -153,8 +174,8 @@ describe('ENG-600 launch flows — ENG-941 gate wiring', () => {
 
   beforeEach(() => {
     seedSpy = jest
-      .spyOn(service as any, 'resolveOrCreateSeedAudience')
-      .mockResolvedValue({ audience: { id: 'aud-1' } });
+      .spyOn(adsApisImpl, 'resolveOrCreateSeedAudience')
+      .mockResolvedValue({ audience: { id: 'aud-1', name: 'aud-1' } } as any);
   });
 
   const run = (adSetParams: any, extra: any = {}) =>
@@ -190,8 +211,12 @@ describe('ENG-600 launch flows — ENG-941 gate wiring', () => {
 
     await run({ status: 'ACTIVE' }, { override_tracking_check: true }).catch(() => undefined);
 
+    // ENG-1909: a 6th arg is now always passed — `buildSandboxFetchHtml(userId)`, which
+    // resolves to `undefined` for this test's non-sandbox userId (it short-circuits on
+    // `isEvaluationUser` before touching anything else), so the gate call is otherwise
+    // unchanged from before that field existed.
     expect(runMetaTrackingGate).toHaveBeenCalledWith(
-      expect.anything(), CAMPAIGN, 'TARGETED_AUDIENCE_LAUNCH', true, 'sess-1',
+      expect.anything(), CAMPAIGN, 'TARGETED_AUDIENCE_LAUNCH', true, 'sess-1', { fetchHtml: undefined },
     );
   });
 });

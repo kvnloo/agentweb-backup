@@ -4,6 +4,17 @@ import dotenv from "dotenv";
 import path from "path";
 import { paginatedScan } from "../utils/dynamoPagination";
 import { validateWelcomeMessage } from "../utils/welcomeMessageValidation";
+import { OpeningAction, validateOpeningAction } from "../utils/openingActionValidation";
+import { changedEvalSkillFields, recordSkillChange } from "../loops/eval/evalChangeMarkers";
+
+/** ENG-1390: message for a lost read→write race on a skill row; routes map it to 409. */
+export const SKILL_CONFLICT_MESSAGE = 'Skill was changed by someone else — refresh and try again';
+
+/** Rethrow a DynamoDB conditional-check failure as the distinct conflict error. */
+function rethrowConflict(error: any): never {
+  if (error?.code === 'ConditionalCheckFailedException') throw new Error(SKILL_CONFLICT_MESSAGE);
+  throw error;
+}
 
 // Load environment variables
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -51,6 +62,7 @@ export interface Skill {
   triggerMode?: SkillTriggerMode;
   schedule?: SkillSchedule;
   welcomeMessage?: string;
+  openingAction?: OpeningAction;
   llmModel?: string;
   maxIterations?: number;
   isBuiltIn?: boolean;
@@ -149,6 +161,8 @@ export class SkillService {
     try {
       await dynamodb.put(params).promise();
       this.invalidatePublishedSkillsCache();
+      // ENG-2145/2195: report-only "needs eval" marker, recorded here so every caller is covered.
+      void recordSkillChange(skill.skillId, 'create', { ...skill });
       return skill;
     } catch (error) {
       console.error("Error creating skill:", error);
@@ -292,8 +306,18 @@ export class SkillService {
    * conditional write) must apply the returned value itself.
    */
   async updateSkill(skill: Skill, expectedUpdatedAt?: string): Promise<string> {
+    return this.putSkill(skill, expectedUpdatedAt, 'update');
+  }
+
+  /**
+   * The write behind updateSkill and approveSkill. ALL_OLD returns the row it replaced, so the
+   * "needs eval" marker names only the eval-relevant fields this write actually changed.
+   */
+  private async putSkill(skill: Skill, expectedUpdatedAt: string | undefined, action: 'update' | 'approve'): Promise<string> {
     const welcomeMessageError = validateWelcomeMessage(skill.welcomeMessage);
     if (welcomeMessageError) throw new Error(welcomeMessageError);
+    const openingActionError = validateOpeningAction(skill.openingAction, skill.toolNames || []);
+    if (openingActionError) throw new Error(openingActionError);
     const updatedAt = new Date().toISOString();
     const skillItem: any = {
       ...skill,
@@ -307,6 +331,7 @@ export class SkillService {
     const params: any = {
       TableName: this.tableName,
       Item: skillItem,
+      ReturnValues: 'ALL_OLD',
     };
 
     // Explicitly `!== undefined`: a row whose updatedAt is an empty string must
@@ -317,8 +342,11 @@ export class SkillService {
     }
 
     try {
-      await dynamodb.put(params).promise();
+      const result = await dynamodb.put(params).promise();
       this.invalidatePublishedSkillsCache();
+      const before = result?.Attributes ? this.normalizeSkill(result.Attributes) : undefined;
+      const changed = changedEvalSkillFields(before ? { ...before } : undefined, { ...skill });
+      void recordSkillChange(skill.skillId, action, action === 'approve' ? { ...changed, systemPrompt: skill.systemPrompt, isPublished: skill.isPublished } : changed);
       return updatedAt;
     } catch (error) {
       console.error(`Error updating skill ${skill.skillId}:`, error);
@@ -343,18 +371,25 @@ export class SkillService {
 
       const skill = this.normalizeSkill(result.Item);
 
-      // Write to target table, converting toolNames back to DynamoDB Set
-      const skillItem: any = { ...skill };
+      // Write to target table, converting toolNames back to DynamoDB Set.
+      // ENG-1390: stamp a fresh updatedAt instead of copying the source's. The
+      // review transitions guard on `updatedAt = :expected`; a sync that kept the
+      // source timestamp could land a value equal to what a concurrent transition
+      // read, letting that stale transition overwrite the synced row.
+      const skillItem: any = { ...skill, updatedAt: new Date().toISOString() };
       if (skill.toolNames && skill.toolNames.length > 0) {
         skillItem.toolNames = dynamodb.createSet(skill.toolNames);
       } else {
         delete skillItem.toolNames;
       }
 
-      await dynamodb.put({
+      const replaced = await dynamodb.put({
         TableName: targetTable,
         Item: skillItem,
+        ReturnValues: 'ALL_OLD',
       }).promise();
+      const before = replaced?.Attributes ? this.normalizeSkill(replaced.Attributes) : undefined;
+      void recordSkillChange(skillId, 'sync', { ...changedEvalSkillFields(before ? { ...before } : undefined, { ...skill }), systemPrompt: skill.systemPrompt });
 
       // ENG-1222: only invalidate when the sync wrote to THIS environment's own
       // table (this.tableName) — getPublishedSkills only ever reads that one, so
@@ -490,9 +525,14 @@ export class SkillService {
     if (skill.ownerId !== ownerId) throw new Error('Not authorized');
     if (skill.visibility !== 'private') throw new Error('Only private skills can be submitted for review');
 
+    const expectedUpdatedAt = skill.updatedAt;
     skill.visibility = 'pending_review';
     skill.reviewFeedback = undefined;
-    await this.updateSkill(skill);
+    try {
+      skill.updatedAt = await this.updateSkill(skill, expectedUpdatedAt);
+    } catch (error: any) {
+      rethrowConflict(error);
+    }
     return skill;
   }
 
@@ -501,9 +541,14 @@ export class SkillService {
     if (!skill) throw new Error('Skill not found');
     if (skill.visibility !== 'pending_review') throw new Error('Skill is not pending review');
 
+    const expectedUpdatedAt = skill.updatedAt;
     skill.visibility = 'public';
     skill.isPublished = true;
-    await this.updateSkill(skill);
+    try {
+      skill.updatedAt = await this.putSkill(skill, expectedUpdatedAt, 'approve');
+    } catch (error: any) {
+      rethrowConflict(error);
+    }
     return skill;
   }
 
@@ -512,9 +557,14 @@ export class SkillService {
     if (!skill) throw new Error('Skill not found');
     if (skill.visibility !== 'pending_review') throw new Error('Skill is not pending review');
 
+    const expectedUpdatedAt = skill.updatedAt;
     skill.visibility = 'private';
     skill.reviewFeedback = feedback;
-    await this.updateSkill(skill);
+    try {
+      skill.updatedAt = await this.updateSkill(skill, expectedUpdatedAt);
+    } catch (error: any) {
+      rethrowConflict(error);
+    }
     return skill;
   }
 
@@ -539,24 +589,48 @@ export class SkillService {
       // clobber whichever one lost the race.
       skill.updatedAt = await this.updateSkill(skill, expectedUpdatedAt);
     } catch (error: any) {
-      if (error?.code === 'ConditionalCheckFailedException') {
-        throw new Error('Skill was changed by someone else — refresh and try again');
-      }
-      throw error;
+      rethrowConflict(error);
     }
     return skill;
   }
 
-  async deleteSkill(skillId: string): Promise<void> {
-    const params = {
+  /**
+   * ENG-1390: `expected` (optional) carries the ownerId/visibility the caller
+   * authorized against; the delete is then conditional on the row still having
+   * them, so a concurrent ownership/visibility change fails with
+   * SKILL_CONFLICT_MESSAGE instead of being silently deleted through.
+   */
+  async deleteSkill(skillId: string, expected?: { ownerId?: string; visibility?: string }): Promise<void> {
+    const params: AWS.DynamoDB.DocumentClient.DeleteItemInput = {
       TableName: this.tableName,
       Key: { skillId },
+      ReturnValues: 'ALL_OLD',
     };
+    if (expected) {
+      const conds: string[] = [];
+      const names: Record<string, string> = {};
+      const values: Record<string, any> = {};
+      for (const key of ['ownerId', 'visibility'] as const) {
+        if (expected[key] !== undefined) {
+          conds.push(`#${key} = :${key}`);
+          names[`#${key}`] = key;
+          values[`:${key}`] = expected[key];
+        }
+      }
+      if (conds.length) {
+        params.ConditionExpression = conds.join(' AND ');
+        params.ExpressionAttributeNames = names;
+        params.ExpressionAttributeValues = values;
+      }
+    }
 
     try {
-      await dynamodb.delete(params).promise();
+      const result = await dynamodb.delete(params).promise();
       this.invalidatePublishedSkillsCache();
-    } catch (error) {
+      // Only a row that existed changes agent behaviour when it goes.
+      if (result?.Attributes) void recordSkillChange(skillId, 'delete', {});
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') throw new Error(SKILL_CONFLICT_MESSAGE);
       console.error(`Error deleting skill ${skillId}:`, error);
       throw error;
     }

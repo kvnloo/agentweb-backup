@@ -10,29 +10,57 @@ import { INTEGRATION_CONFIG } from '../config/integrations';
 import { getMetaCredentials } from '../utils/secretsManager';
 import { buildUtmSpec, readUtmKeys, utmQueryString, mergeUtmIntoQueryString, utmKeysInQueryString } from '../utils/adUtm';
 
+// Meta offsets differ from ISO defaults (notably TWD, HUF and IDR).
+// https://developers.facebook.com/docs/marketing-api/currencies/
+// Keep an explicit allow-list: a new/unknown currency must never imply offset 100.
+const META_CURRENCY_OFFSETS = new Map<string, number>([
+  ...'TWD JPY KRW CLP COP CRC HUF ISK IDR PYG VND'.split(' ').map(code => [code, 1] as [string, number]),
+  ...('AED ARS AUD BDT BGN BHD BOB BRL CAD CHF CNY CZK DKK DZD EGP EUR FBZ GBP GTQ HKD HNL HRK ' +
+    'ILS INR JOD KES LKR LTL LVL MOP MXN MYR NGN NIO NOK NZD PEN PHP PKR PLN QAR RON RSD RUB SAR SEK SGD SKK THB TRY UAH USD UYU VEF VES ZAR')
+    .split(' ').map(code => [code, 100] as [string, number]),
+]);
+
+/** One conversion for agent major-unit inputs and Meta minor-unit read-backs. */
+export function normalizeMetaMoney(value: unknown, currency: unknown, unit: 'major' | 'minor' = 'major') {
+  const offset = typeof currency === 'string' ? META_CURRENCY_OFFSETS.get(currency) : undefined;
+  if (offset === undefined) {
+    throw new Error(`Unsupported or missing Meta ad account currency ${JSON.stringify(currency)}; money write rejected.`);
+  }
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new Error('Meta money amounts must be finite, non-negative numbers in the ad account currency.');
+  }
+  const scaled = unit === 'major' ? value * offset : value;
+  const minorUnits = Math.round(scaled);
+  if (!Number.isSafeInteger(minorUnits) || (scaled > 0 && minorUnits === 0) || Math.abs(scaled - minorUnits) > 1e-7) {
+    throw new Error(`Meta money amount ${value} cannot be represented in ${currency} minor units.`);
+  }
+  const formatted = new Intl.NumberFormat('en-US', {
+    style: 'currency', currency: currency as string, minimumFractionDigits: 2, maximumFractionDigits: 2,
+  }).format(minorUnits / offset);
+  return { minorUnits, description: `${minorUnits} (= ${formatted})` };
+}
+
 export interface MetaAdsCampaignParams {
   name: string;
   objective: string;
   status?: string;
   special_ad_categories?: string[];
-  // Lifetime hard-stop spend cap for the campaign, in the ad account currency's MINOR units
-  // (cents) — e.g. 300000 = $3,000. Kept in minor units to match Meta's own field and the
-  // long-standing CAMPAIGN UPDATE pass-through, which already applies this value verbatim;
-  // converting only here would silently reinterpret every existing caller's number by 100x.
+  // SDK-layer money fields are already normalized to Meta minor units by the agent.
+  daily_budget?: number;
   spend_cap?: number;
 }
 
 export interface MetaAdsAdSetParams {
   name: string;
   campaign_id: string;
-  daily_budget?: number; // Budget in CENTS (e.g., 100 = $1.00). Caller must convert.
-  lifetime_budget?: number; // Budget in CENTS (e.g., 5000 = $50.00). Caller must convert.
+  daily_budget?: number; // Budget in Meta minor units. Caller must normalize by account currency.
+  lifetime_budget?: number; // Budget in Meta minor units. Caller must normalize by account currency.
   start_time?: string;
   end_time?: string;
   billing_event: string;
   optimization_goal: string;
   bid_strategy?: string;
-  bid_amount?: number; // Bid in CENTS (e.g., 50 = $0.50). Caller must convert.
+  bid_amount?: number; // Bid in Meta minor units. Caller must normalize by account currency.
   targeting: any;
   status?: string;
   promoted_object?: any;
@@ -41,6 +69,12 @@ export interface MetaAdsAdSetParams {
   // in Ads Manager (ENG-415). agentModeService.createMetaAdsAdSet defaults this to 'WEBSITE' for
   // website optimization goals.
   destination_type?: string;
+  // Dayparting (ENG-842). Meta requires a lifetime_budget (and therefore end_time) for this to take
+  // effect — agentModeService.createMetaAdsAdSet enforces that rule and defaults pacing_type to
+  // ['day_parting'] whenever adset_schedule is present and pacing_type was not explicitly set,
+  // because Meta silently ignores adset_schedule without it.
+  adset_schedule?: Array<{ start_minute: number; end_minute: number; days: number[]; timezone_type?: string }>;
+  pacing_type?: string[];
 }
 
 export interface MetaPlacementAsset {
@@ -140,6 +174,7 @@ export const META_LIST_MAX_PAGES = 25;
  */
 export const META_LIST_MAX_MS = 45_000;
 
+
 /**
  * Ceiling on how long ONE Graph read may block this request.
  *
@@ -162,6 +197,12 @@ export const META_LIST_MAX_MS = 45_000;
  * wait that was previously unbounded anyway. So this is a backstop against a hang, not a latency
  * target. One slow page fits inside META_LIST_MAX_MS; a second cannot, so the loop then stops and
  * reports `truncated` rather than grinding on.
+ *
+ * ⚠ That last sentence holds for the 45s default and NOT for the launch path, which passes
+ * `maxMs: META_LAUNCH_READ_MAX_MS` (240s) — there roughly eight slow pages fit. Deliberate: a
+ * truncated read refuses a launch rather than degrading an answer, so stopping early is the
+ * expensive outcome. Worst case is the 240s loop plus one in-flight 30s page, ~270s, against
+ * nginx `proxy_read_timeout` and the ALB `IdleTimeout` of 600s — checked, with headroom.
  */
 export const META_READ_CALL_TIMEOUT_MS = 30_000;
 
@@ -241,6 +282,15 @@ export interface MetaPixelListResult {
   pagesFetched: number;
 }
 
+export interface MetaOAuthConnectionHealth {
+  pageCount: number;
+  pageIds: string[];
+  pagesError?: string;
+  grantedPermissions: string[];
+  declinedRequiredPermissions: string[];
+  permissionsError?: string;
+}
+
 /**
  * Parse `X-Business-Use-Case-Usage` off a real Marketing API response. The
  * header is a JSON object keyed by ad account id, each value an array with one
@@ -270,6 +320,33 @@ function parseBusinessUseCaseUsage(response: { headers?: { get?: (name: string) 
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The one sentence every ad-account ownership refusal carries (`assertOwnedByAccount`).
+ *
+ * A constant, not a literal repeated at the read site, because the pairing is load-bearing: a
+ * caller that has to tell "this node belongs to another ad account" apart from "Meta blipped"
+ * gets it wrong silently if the wording drifts, and gets it wrong in the permissive direction.
+ */
+export const META_ACCOUNT_SCOPE_REFUSAL_MARKER = 'is not available in the selected ad account';
+
+/**
+ * True only for a refusal thrown by the ad-account ownership guard — never for a transient
+ * Graph failure.
+ *
+ * Both arrive at a caller's `catch` as an Error, and they mean opposite things. A timeout, a
+ * 5xx or a rate limit says "we could not look"; this says "we looked, and the node is out of
+ * scope". A caller that treats the second as the first degrades to a best-effort path and
+ * carries on with a node it has been told not to touch.
+ *
+ * Deliberately does NOT match `assertNodeInAccount`'s unverifiable-lookup message ("Could not
+ * verify the requested … please retry"), which is a genuine transient and must keep the
+ * best-effort behaviour.
+ */
+export function isMetaAccountScopeRefusal(error: unknown): boolean {
+  const message = (error as { message?: unknown } | null | undefined)?.message;
+  return typeof message === 'string' && message.includes(META_ACCOUNT_SCOPE_REFUSAL_MARKER);
 }
 
 export class MetaService {
@@ -452,21 +529,13 @@ export class MetaService {
     MetaService.assertNoUnappliedCampaignCreateParams(params);
   }
 
-  /**
-   * `spend_cap` is a whole number of minor currency units, so anything else is a caller
-   * mistake we should catch rather than forward: a fraction (1000.5), a negative, a NaN from
-   * a bad parse, or a string. Meta would reject most of these, but as an opaque "Invalid
-   * parameter" — and on CREATE that rejection arrives AFTER the campaign question is settled,
-   * where a clear pre-flight message costs nothing. 0 is rejected here too, matching Meta,
-   * which refuses it explicitly ("Spend Cap Can't Be Zero", subcode 1885099): removing a cap
-   * is a different operation, not a cap of nothing.
-   */
+  /** Validate the agent's major-unit spend cap before account-aware normalization. */
   public static assertValidSpendCap(value: unknown): void {
     if (value === undefined || value === null) return;
-    if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
       throw new Error(
-        `Campaign "spend_cap" must be a positive whole number of cents (e.g. 300000 = $3,000) — got ${JSON.stringify(value)}. ` +
-        `It is NOT in dollars: multiply the amount the user asked for by 100. ` +
+        `Campaign "spend_cap" must be a positive amount in the ad account currency (e.g. 3000 = $3,000 USD) — got ${JSON.stringify(value)}. ` +
+        `Supply major units; the server converts using the ad account currency. ` +
         `To remove an existing cap, do not send 0 — Meta rejects that.`
       );
     }
@@ -518,9 +587,9 @@ export class MetaService {
       `Campaign CREATE does not support param(s): ${unapplied.join(', ')} — they would NOT be applied ` +
       `to the campaign, so this create was rejected instead of silently ignoring them. ` +
       `Supported CAMPAIGN CREATE params: ${MetaService.CAMPAIGN_CREATE_APPLIED_PARAMS.join(', ')}. ` +
-      `Campaign-level budget: set advantage_campaign_budget=true plus budget_amount (in dollars) — ` +
+      `Campaign-level budget: set advantage_campaign_budget=true plus budget_amount (in account currency major units) — ` +
       `do NOT pass daily_budget/lifetime_budget here. ` +
-      `Hard spend cap: spend_cap (in cents, e.g. 300000 = $3,000). ` +
+      `Hard spend cap: spend_cap (in account currency major units, e.g. 3000 = $3,000 USD). ` +
       `Scheduling (start_time/stop_time) comes from the campaign's AD SETS — Meta accepts those ` +
       `on a campaign create and then ignores them, so set them on AD_SET CREATE. ` +
       `Ad-set fields (bid_strategy, bid_amount, targeting, ` +
@@ -791,6 +860,17 @@ export class MetaService {
     }
   }
 
+  /** Read and validate the selected account currency before converting money. */
+  public async getAdAccountCurrency(adAccountId: string, accessToken: string): Promise<string> {
+    this.initApi(accessToken);
+    const account = new AdAccount(`act_${adAccountId.replace(/^act_/, '')}`);
+    const result = await MetaService.withReadDeadline<any>(() => account.get(['currency']), 'ad account currency');
+    const currency: unknown = (result?._data ?? result)?.currency;
+    // Validate network data before any write; no cached/default currency guesses.
+    normalizeMetaMoney(0, currency);
+    return currency as string;
+  }
+
   /**
    * Get ad accounts accessible by the user using Facebook SDK
    * @param accessToken - Meta OAuth access token
@@ -874,11 +954,43 @@ export class MetaService {
       this.initApi(accessToken);
       const user = new User('me');
       const fields = ['id', 'name', 'access_token', 'category', 'tasks'];
+      const params: Record<string, any> = { limit: META_LIST_PAGE_SIZE };
 
-      // Fetch pages (accounts edge on User)
-      const pagesPath = await user.getAccounts(fields);
+      // Fetch pages (accounts edge on User). Drains pagination (ENG-2232 code
+      // review follow-up) — this result no longer only feeds an informational
+      // count, it backs the AD_CREATIVE CREATE page_id gate and the wrong-Page
+      // cross-check (ENG-2232), both exact-membership checks against the
+      // returned set. Before those existed, only taking the first batch was
+      // harmless — has_meta_pages is a presence check, unaffected by
+      // truncation. Now, an account with more accessible Pages than fit in one
+      // batch would have a REAL Page silently missing from this list, and the
+      // gate would wrongly block a legitimate creative, or the cross-check
+      // would wrongly flag a healthy account as broken.
+      const cursor = await MetaService.withReadDeadline<any>(
+        () => user.getAccounts(fields, params) as Promise<any>,
+        'page list',
+      );
+      const { items, truncated } = await this.drainCursor(cursor, META_LIST_MAX_PAGES);
+      if (truncated) {
+        // ENG-2232 code review follow-up: draining pagination closed the
+        // "page 1 only" gap, but `drainCursor` can ALSO report truncated:true
+        // for a transient page-N fetch failure mid-walk (by design — see its
+        // own "a page-N failure must not throw away pages 1..N-1" comment) or
+        // for hitting the META_LIST_MAX_PAGES bound. Either way, this result
+        // backs exact-membership, absence-sensitive checks (the AD_CREATIVE
+        // CREATE page_id gate, the wrong-Page cross-check) where an
+        // incomplete list read as complete reproduces the exact bug class
+        // this fix exists for, just one layer deeper. Throwing — rather than
+        // returning the partial list — means every real caller's EXISTING
+        // best-effort try/catch (all five already treat a getPages() failure
+        // as "could not determine", never as a confirmed negative) handles
+        // this correctly for free, with no caller-side changes needed.
+        const message = `Page list pagination stopped early after ${items.length} item(s); treating as undetermined rather than risking an incomplete list being read as complete`;
+        this.log(`getPages: ${message}`, { itemsSoFar: items.length });
+        throw new Error(message);
+      }
 
-      const pages = pagesPath.map((page: any) => ({
+      const pages = items.map((page: any) => ({
         id: page.id || page._data?.id,
         name: page.name || page._data?.name,
         access_token: page.access_token || page._data?.access_token,
@@ -898,6 +1010,84 @@ export class MetaService {
       this.handleError(error);
       return []; // Unreachable
     }
+  }
+
+  /**
+   * OAuth-time health check for the two Meta grants that most often look
+   * "connected" while being unusable:
+   *   - /me/accounts: Pages selected in the consent dialog.
+   *   - /me/permissions: required permissions the user explicitly declined.
+   *
+   * Unlike getPages(), this keeps pagination/read errors distinct from a true
+   * zero-Page result so a transient Graph problem never gets persisted as
+   * "confirmed no Pages".
+   */
+  public async checkOAuthConnectionHealth(
+    accessToken: string,
+    requiredPermissions: readonly string[],
+  ): Promise<MetaOAuthConnectionHealth> {
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    const required = new Set(requiredPermissions.map(p => String(p).trim()).filter(Boolean));
+    const result: MetaOAuthConnectionHealth = {
+      pageCount: 0,
+      pageIds: [],
+      grantedPermissions: [],
+      declinedRequiredPermissions: [],
+    };
+
+    try {
+      let after: string | undefined;
+      const seen = new Set<string>();
+      for (let page = 0; page < META_LIST_MAX_PAGES; page++) {
+        const qs = new URLSearchParams({
+          fields: 'id,name,access_token,category,tasks',
+          limit: String(META_LIST_PAGE_SIZE),
+          access_token: accessToken,
+          ...(after ? { after } : {}),
+        });
+        const res = await fetch(`https://graph.facebook.com/${apiVersion}/me/accounts?${qs.toString()}`);
+        const body: any = await res.json();
+        if (body?.error) throw new Error(body.error.message || 'Meta returned an error reading Pages');
+        if (!Array.isArray(body?.data)) throw new Error('Meta returned an unexpected Page list shape');
+        for (const raw of body.data) {
+          const id = raw?.id;
+          if (typeof id === 'string' && id.trim()) seen.add(id.trim());
+        }
+        const next = body?.paging?.cursors?.after;
+        if (!body?.paging?.next || typeof next !== 'string' || !next.trim()) break;
+        after = next.trim();
+        if (page === META_LIST_MAX_PAGES - 1) {
+          throw new Error(`Page list exceeded ${META_LIST_MAX_PAGES} pages; treating health as unknown`);
+        }
+      }
+      result.pageIds = [...seen];
+      result.pageCount = result.pageIds.length;
+    } catch (error: any) {
+      result.pagesError = error?.message || String(error);
+    }
+
+    try {
+      const res = await fetch(
+        `https://graph.facebook.com/${apiVersion}/me/permissions?access_token=${encodeURIComponent(accessToken)}`
+      );
+      const body: any = await res.json();
+      if (body?.error) throw new Error(body.error.message || 'Meta returned an error reading permissions');
+      if (!Array.isArray(body?.data)) throw new Error('Meta returned an unexpected permissions shape');
+      const granted = new Set<string>();
+      const declined = new Set<string>();
+      for (const item of body.data) {
+        const permission = typeof item?.permission === 'string' ? item.permission.trim() : '';
+        if (!permission) continue;
+        if (item?.status === 'granted') granted.add(permission);
+        if (item?.status === 'declined' && required.has(permission)) declined.add(permission);
+      }
+      result.grantedPermissions = [...granted];
+      result.declinedRequiredPermissions = [...declined];
+    } catch (error: any) {
+      result.permissionsError = error?.message || String(error);
+    }
+
+    return result;
   }
 
   /**
@@ -1217,8 +1407,18 @@ export class MetaService {
       const campaign = new Campaign(campaignId);
       const fields = ['id', 'name', 'status', 'objective', 'daily_budget', 'lifetime_budget', 'budget_remaining', 'spend_cap'];
       this.log(`Fetching campaign: ${campaignId}`);
-      const result = await campaign.get(fields);
-      return result._data;
+      /*
+       * `adAccountId` was accepted and never used: a node id is global, so this returned any
+       * campaign the token could reach. It matters more here than on a plain list, because one
+       * caller renders the result's NAME into the confirmation prompt a user approves — so an id
+       * from another ad account disclosed that account's campaign name to this user, which is
+       * precisely the oracle behaviour assertOwnedByAccount refuses to produce.
+       */
+      const result = await campaign.get(MetaService.withOwnershipField(fields));
+      const data = { ...(result?._data ?? {}) };
+      MetaService.assertOwnedByAccount(data.account_id, campaignId, 'Campaign', adAccountId);
+      delete data.account_id;
+      return data;
     } catch (error) {
       return this.handleError(error, 'getCampaign');
     }
@@ -1254,11 +1454,32 @@ export class MetaService {
       [...MetaService.CAMPAIGN_READ_FIELDS];
     try {
       this.initApi(accessToken);
-      if (options.campaignId) {
-        this.log(`Fetching single campaign ${options.campaignId}`, { fields });
-        const campaign = new Campaign(options.campaignId);
-        const result = await MetaService.withReadDeadline<any>(() => campaign.get(fields), 'single campaign fetch');
-        return { campaigns: [result._data], truncated: false, pagesFetched: 1 };
+      // `!== undefined`, not truthiness: `''` is the input `resolveScopeId` exists to REFUSE, and
+      // a truthy test skipped the branch entirely and fell through to the account-wide list —
+      // the silent widening the guard was written to stop, on the one input that names it.
+      if (options.campaignId !== undefined && options.campaignId !== null) {
+        const wantedId = MetaService.resolveScopeId(options.campaignId, 'campaign_id')!;
+        this.log(`Fetching single campaign ${wantedId}`, { fields });
+        const campaign = new Campaign(wantedId);
+        // A node id is global — `new Campaign(id)` is NOT bounded by the ad account the way
+        // the `/act_X/` edge is, and one Meta OAuth token routinely spans several ad accounts.
+        // Without a check the selected-account scope is advisory: a caller could read a campaign
+        // from an account it never selected.
+        //
+        // `account_id` is requested ALONGSIDE the caller's fields so ownership is answered by the
+        // same response as the payload — one round trip, and no separate probe that could fail on
+        // its own and refuse a read which would otherwise have succeeded.
+        const result = await MetaService.withReadDeadline<any>(
+          () => campaign.get(MetaService.withOwnershipField(fields)),
+          'single campaign fetch',
+        );
+        const data = { ...(result?._data ?? {}) };
+        MetaService.assertOwnedByAccount(data.account_id, wantedId, 'Campaign', adAccountId);
+        // Always requested for the check, never by the caller: `account_id` is in neither
+        // READ_FIELDS allow-list, so resolveReadFields would have thrown on an explicit request
+        // for it. Dropped unconditionally, so the payload is exactly what the caller selected.
+        delete data.account_id;
+        return { campaigns: [data], truncated: false, pagesFetched: 1 };
       }
       const account = new AdAccount(`act_${adAccountId}`);
       const params: Record<string, any> = { limit: META_LIST_PAGE_SIZE };
@@ -1276,7 +1497,8 @@ export class MetaService {
   }
 
   /**
-   * Create a new campaign
+   * Create a new campaign. Money fields use Meta minor units, except the legacy
+   * budget_amount convenience input. Agent-input validation happens before normalization.
    */
   public async createCampaign(adAccountId: string, accessToken: string, params: MetaAdsCampaignParams) {
     try {
@@ -1294,16 +1516,16 @@ export class MetaService {
         is_adset_budget_sharing_enabled: false, // Required by some accounts when CBO is off
       };
 
-      // Handle Advantage Campaign Budget (CBO)
-      if ((params as any).advantage_campaign_budget && (params as any).budget_amount) {
-        finalParams.daily_budget = Math.round((params as any).budget_amount * 100);
+      // Agent calls supply normalized daily_budget. Direct SDK-wrapper callers may
+      // still supply budget_amount in major units; use the same currency normalizer.
+      if (params.daily_budget !== undefined) {
+        finalParams.daily_budget = params.daily_budget;
+      } else if ((params as any).advantage_campaign_budget && (params as any).budget_amount !== undefined) {
+        const currency = await this.getAdAccountCurrency(adAccountId, accessToken);
+        finalParams.daily_budget = normalizeMetaMoney((params as any).budget_amount, currency).minorUnits;
       }
 
-      // Campaign hard-stop spend cap, in minor units (cents), forwarded verbatim — the same
-      // way CAMPAIGN UPDATE has always sent it. This allow-list used to omit spend_cap
-      // entirely, so a create that asked for a cap produced an UNCAPPED campaign and still
-      // reported success (ENG-1018). The caller verifies the applied value with a read-back;
-      // this only guarantees the request reaches Meta.
+      // Already normalized by the agent, just like the ad-set SDK write fields.
       if (params.spend_cap !== undefined && params.spend_cap !== null) {
         finalParams.spend_cap = params.spend_cap;
       }
@@ -1320,11 +1542,18 @@ export class MetaService {
 
   /**
    * Update campaign
+   *
+   * ENG-1724: a campaign id is a GLOBAL node id, so without this check the write reached any
+   * campaign the token could touch, not just one in the caller's selected ad account — the
+   * write-side counterpart to the read-side gap `getCampaign` already closed. Required (not
+   * optional like the read-side scoping on `getAdSet`/`getAd`): a read has legitimate unscoped
+   * callers reading their own back-reference; a write does not.
    */
-  public async updateCampaign(accessToken: string, campaignId: string, params: any) {
+  public async updateCampaign(accessToken: string, campaignId: string, params: any, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
+      await MetaService.verifyWriteOwnership(campaign, campaignId, 'Campaign', adAccountId);
       this.log(`Updating campaign ${campaignId} with params:`, params);
       await campaign.update([], params);
       return { success: true };
@@ -1335,11 +1564,15 @@ export class MetaService {
 
   /**
    * Delete a campaign
+   *
+   * ENG-1724: same reasoning as `updateCampaign` above — a delete is the write this guard
+   * matters most for, since it is irreversible.
    */
-  public async deleteCampaign(accessToken: string, campaignId: string) {
+  public async deleteCampaign(accessToken: string, campaignId: string, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
+      await MetaService.verifyWriteOwnership(campaign, campaignId, 'Campaign', adAccountId);
       this.log(`Deleting campaign ${campaignId}`);
       await campaign.delete([], {});
       return { success: true };
@@ -1386,11 +1619,24 @@ export class MetaService {
       [...MetaService.AD_SET_READ_FIELDS];
     try {
       this.initApi(accessToken);
-      if (options.adSetId) {
-        this.log(`Fetching single ad set ${options.adSetId}`, { fields });
-        const adSet = new AdSet(options.adSetId);
-        const result = await MetaService.withReadDeadline<any>(() => adSet.get(fields), 'single ad set fetch');
-        return { adSets: [result._data], truncated: false, pagesFetched: 1, scope: { adSetId: options.adSetId } };
+      // Same reason as the single-campaign branch above.
+      if (options.adSetId !== undefined && options.adSetId !== null) {
+        const wantedId = MetaService.resolveScopeId(options.adSetId, 'ad_set_id')!;
+        this.log(`Fetching single ad set ${wantedId}`, { fields });
+        const adSet = new AdSet(wantedId);
+        // Same global-node-id boundary, and the same one-round-trip check, as the single
+        // campaign fetch above.
+        const result = await MetaService.withReadDeadline<any>(
+          () => adSet.get(MetaService.withOwnershipField(fields)),
+          'single ad set fetch',
+        );
+        const data = { ...(result?._data ?? {}) };
+        MetaService.assertOwnedByAccount(data.account_id, wantedId, 'Ad set', adAccountId);
+        // Always requested for the check, never by the caller: `account_id` is in neither
+        // READ_FIELDS allow-list, so resolveReadFields would have thrown on an explicit request
+        // for it. Dropped unconditionally, so the payload is exactly what the caller selected.
+        delete data.account_id;
+        return { adSets: [data], truncated: false, pagesFetched: 1, scope: { adSetId: wantedId } };
       }
 
       const wantedCampaign = MetaService.resolveScopeId(campaignId, 'campaign_id');
@@ -1439,8 +1685,8 @@ export class MetaService {
       if (params.targeting !== undefined) adSetParams[AdSet.Fields.targeting] = params.targeting;
       if (params.status !== undefined) adSetParams[AdSet.Fields.status] = params.status;
       
-      // Monetary values: Expected in CENTS (integer). Caller (agentModeService.createMetaAdsAdSet)
-      // converts dollars to cents via Math.round(val * 100) before passing to this method.
+      // Monetary values: Expected in Meta minor units (integer). Caller (agentModeService.createMetaAdsAdSet)
+      // normalizes major units using the ad account currency before passing to this method.
       if (params.daily_budget !== undefined) adSetParams[AdSet.Fields.daily_budget] = params.daily_budget;
       if (params.lifetime_budget !== undefined) adSetParams[AdSet.Fields.lifetime_budget] = params.lifetime_budget;
       if (params.bid_strategy !== undefined) adSetParams[AdSet.Fields.bid_strategy] = params.bid_strategy;
@@ -1454,6 +1700,10 @@ export class MetaService {
       // is not guaranteed to exist on the SDK's AdSet.Fields enum across versions. Emitted only when
       // present so the payload is byte-identical to before when the caller passes nothing.
       if (params.destination_type !== undefined) adSetParams['destination_type'] = params.destination_type;
+      // Dayparting (ENG-842). Emitted only when present so the payload is byte-identical to before
+      // for every existing caller that never sends a schedule.
+      if (params.adset_schedule !== undefined) adSetParams[AdSet.Fields.adset_schedule] = params.adset_schedule;
+      if (params.pacing_type !== undefined) adSetParams[AdSet.Fields.pacing_type] = params.pacing_type;
 
       // Defensive: Ensure no 'id' or other accidental fields
       delete adSetParams.id;
@@ -1476,7 +1726,14 @@ export class MetaService {
    * Get a single ad set with the fields needed to confirm a write target
    * (name + the campaign it belongs to).
    */
-  public async getAdSet(accessToken: string, adSetId: string) {
+  public async getAdSet(
+    accessToken: string,
+    adSetId: string,
+    /** When supplied, the node is verified to belong to this ad account before anything is
+     *  returned. Optional so existing read-back callers are unchanged; the callers whose result
+     *  reaches a user-facing prompt pass it. */
+    adAccountId?: string,
+  ) {
     try {
       this.initApi(accessToken);
       const adSet = new AdSet(adSetId);
@@ -1490,8 +1747,27 @@ export class MetaService {
         'start_time', 'end_time'
       ];
       this.log(`Fetching ad set: ${adSetId}`);
-      const result = await adSet.get(fields);
-      return result._data;
+      /*
+       * `adAccountId !== undefined/null`, not a truthiness test.
+       *
+       * `if (adAccountId)` treats a caller that SUPPLIED an empty string as one that supplied
+       * nothing, and skips the ownership check entirely — so a scope that failed to resolve
+       * silently widened the read to any ad set the token can reach. getCampaign fails closed
+       * on exactly that input (assertOwnedByAccount refuses when the selected account is
+       * blank); these two now agree. `undefined`/`null` still means "not supplied" and
+       * legitimately opts out, which is what the post-write read-back callers rely on. Same
+       * distinction resolveScopeId already draws for scope ids.
+       */
+      const scoped = adAccountId !== undefined && adAccountId !== null;
+      const result = await adSet.get(
+        scoped ? MetaService.withOwnershipField(fields) : fields,
+      );
+      const data = { ...(result?._data ?? {}) };
+      if (scoped) {
+        MetaService.assertOwnedByAccount(data.account_id, adSetId, 'Ad set', adAccountId);
+        delete data.account_id;
+      }
+      return data;
     } catch (error) {
       return this.handleError(error, 'getAdSet');
     }
@@ -1499,11 +1775,15 @@ export class MetaService {
 
   /**
    * Update ad set
+   *
+   * ENG-1724: see `updateCampaign` above — same global-node-id gap, write-side counterpart to
+   * the read-side scoping `getAdSet` already has.
    */
-  public async updateAdSet(accessToken: string, adSetId: string, params: any) {
+  public async updateAdSet(accessToken: string, adSetId: string, params: any, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const adSet = new AdSet(adSetId);
+      await MetaService.verifyWriteOwnership(adSet, adSetId, 'Ad set', adAccountId);
       this.log(`Updating ad set ${adSetId} with params:`, params);
       await adSet.update([], params);
       return { success: true };
@@ -1514,11 +1794,14 @@ export class MetaService {
 
   /**
    * Delete an ad set
+   *
+   * ENG-1724: same reasoning as `updateAdSet` above.
    */
-  public async deleteAdSet(accessToken: string, adSetId: string) {
+  public async deleteAdSet(accessToken: string, adSetId: string, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const adSet = new AdSet(adSetId);
+      await MetaService.verifyWriteOwnership(adSet, adSetId, 'Ad set', adAccountId);
       this.log(`Deleting ad set ${adSetId}`);
       await adSet.delete([], {});
       return { success: true };
@@ -1584,57 +1867,41 @@ export class MetaService {
   }
 
   /**
-   * Resolve the creative-level `url_tags` (UTM append rules) for a creative (ENG-239).
+   * Facebook Page IDs this account's existing ad creatives were built against,
+   * sampled from the most recent page of creatives. Best-effort: returns []
+   * on any failure rather than throwing, same discipline as `getPages`'
+   * granular-scopes fallback — a failed sample must read as "couldn't tell",
+   * never as "no existing ads".
    *
-   * An explicitly-supplied `params.url_tags` always wins and is returned verbatim —
-   * this both honours a caller who hand-authored tracking and preserves the
-   * carried-over `url_tags` on a creative swap (agentModeService's carriedUrlTags).
+   * Lets a caller distinguish "this connection has zero accessible Pages"
+   * from the subtler "it has Pages, but not the one this account's ads
+   * actually run under" (ENG-2232) — a token can hold access to an unrelated
+   * Page while the account's real ads keep failing.
+   */
+  public async getExistingAdPageIds(adAccountId: string, accessToken: string): Promise<string[]> {
+    try {
+      const { creatives } = await this.listAdCreatives(adAccountId, accessToken, { maxPages: 1 });
+      const pageIds = new Set<string>();
+      for (const creative of creatives) {
+        const pageId = creative?.object_story_spec?.page_id;
+        if (typeof pageId === 'string' && pageId) pageIds.add(pageId);
+      }
+      return [...pageIds];
+    } catch (error: any) {
+      console.warn(`[MetaService] getExistingAdPageIds failed for account ${adAccountId}: ${error?.message || error}`);
+      return [];
+    }
+  }
+
+  /**
+   * Return caller-resolved creative `url_tags` verbatim.
    *
-   * Otherwise we auto-generate Emma's UTM set (utm_source=meta, utm_medium=paid,
-   * utm_campaign / utm_content as Meta click-time macros).
-   *
-   * AC4 trap: Meta APPENDS `url_tags` to the destination link at delivery, so if the
-   * link already carries e.g. `utm_source`, emitting it again produces a duplicate
-   * param on the click URL. We therefore omit any UTM key the reference URL already
-   * carries; if it carries them all, `utmQueryString` returns "" and we return
-   * undefined so the caller writes no `url_tags` field at all.
-   *
-   * AC4 reference URL: `url_tags` is creative-level and Meta applies it to EVERY link
-   * on the creative, but there is only one tag string. We reference `params.link_url`
-   * (the single-image/video link, and the carousel fallback link at :989). Carousels
-   * may omit the top-level link and rely on per-card `child_attachments[].link` (:992),
-   * so when `link_url` is absent we fall back to the first card's `link_url`. If no
-   * reference URL exists at all, we omit nothing and emit the full set.
+   * Customer defaults and per-lander overrides are resolved in AgentMode, where
+   * both the authenticated customer and optional lander id are available. This
+   * Meta boundary deliberately does not implement a second precedence system.
    */
   private static resolveUrlTags(params: MetaAdsAdCreativeParams): string | undefined {
-    if (params.url_tags) {
-      return params.url_tags;
-    }
-
-    // `url_tags` is creative-level: Meta appends the SAME string to EVERY link on the
-    // creative (the top-level link and every carousel card). So a key must be omitted
-    // if ANY of those links already carries it — emitting it would give that link the
-    // param twice, and a duplicated utm_source corrupts the very attribution this
-    // feature exists to produce. The cost is that a card the user tagged only
-    // partially may stay under-tagged; that is strictly better than a duplicate.
-    const linkUrls = [
-      params.link_url,
-      ...(params.carousel_cards?.map((c) => c.link_url) ?? []),
-    ].filter((u): u is string => Boolean(u));
-
-    const omit = new Set<string>();
-    for (const url of linkUrls) {
-      const keys = readUtmKeys(url);
-      // Unreadable link → we cannot know what it already carries, so we do not tag at
-      // all rather than risk a duplicate. Meta still rejects the bad URL with its own
-      // (precise) error; tagging must never be the thing that breaks an ad build.
-      if (!keys) return undefined;
-      for (const k of keys) omit.add(k);
-    }
-
-    const spec = buildUtmSpec('meta', { campaign: '{{campaign.id}}', content: '{{ad.id}}' });
-    const tags = utmQueryString(spec, omit);
-    return tags || undefined;
+    return params.url_tags || undefined;
   }
 
   /**
@@ -1944,7 +2211,9 @@ export class MetaService {
 
   private async drainCursor(
     cursor: any,
-    maxPages: number
+    maxPages: number,
+    /** Wall-clock budget for this walk. Defaults to the ordinary read ceiling. */
+    maxMs: number = META_LIST_MAX_MS,
   ): Promise<{ items: any[]; truncated: boolean; pagesFetched: number }> {
     /*
      * Normalise the bound before it is used as one. `maxPages` arrives from a caller-supplied
@@ -1966,11 +2235,14 @@ export class MetaService {
     const canPage = typeof cursor?.hasNext === 'function' && typeof cursor?.next === 'function';
     if (!canPage) return { items, truncated: false, pagesFetched };
 
-    const deadline = Date.now() + META_LIST_MAX_MS;
+    // Same normalisation discipline as `pageLimit` above: a caller-supplied budget that is not a
+    // positive safe integer must not quietly become an unbounded walk.
+    const budgetMs = Number.isSafeInteger(maxMs) && maxMs > 0 ? maxMs : META_LIST_MAX_MS;
+    const deadline = Date.now() + budgetMs;
 
     while (cursor.hasNext()) {
       if (Date.now() >= deadline) {
-        this.log(`Stopped paginating at the ${META_LIST_MAX_MS}ms wall-clock bound`, {
+        this.log(`Stopped paginating at the ${budgetMs}ms wall-clock bound`, {
           pagesFetched,
           itemsSoFar: items.length,
         });
@@ -2021,21 +2293,47 @@ export class MetaService {
     return { items, truncated: false, pagesFetched };
   }
 
+  /** Add `account_id` to a field selection so a single-entity read can verify its own ownership. */
+  private static withOwnershipField(fields: string[]): string[] {
+    return fields.includes('account_id') ? fields : [...fields, 'account_id'];
+  }
+
   /**
-   * Bind a campaign / ad-set node to the SELECTED ad account before reading through it.
+   * Fetch a node's own `account_id` and verify it against `adAccountId` via `assertOwnedByAccount`
+   * — the shared pre-write ownership check for `updateCampaign`/`deleteCampaign`/`updateAdSet`/
+   * `deleteAdSet`/`updateAd`/`deleteAd` (ENG-1724).
    *
-   * ⚠ This is a tenancy boundary, not a nicety. Listing through `new AdAccount('act_X')` was
-   * implicitly account-scoped: Meta could only ever hand back X's ads. Reading through
-   * `new Campaign(id)` / `new AdSet(id)` is NOT — a node id addresses a node globally, and one
-   * Meta OAuth token routinely reaches several ad accounts. Without this check a caller could
-   * select account A, pass a campaign id from account B, and receive B's ads labelled as A's.
-   *
-   * `getMetaCredentials` validates the selected account and returns its token; it says nothing
-   * about the node. The token being valid is not the same as the node being in scope. This
-   * mirrors the guard `AD_CREATIVE GET` already applies for exactly this reason (ENG-471).
-   *
-   * Fails closed on every uncertain branch: an unverifiable owner is refused, not returned.
+   * The Graph `.get()` call here has its OWN try/catch, deliberately separate from each write
+   * method's outer one. Without it, a Graph failure DURING this ownership check (a transient
+   * 5xx, a malformed response — anything short of an actual ownership mismatch) fell through to
+   * the write's generic `catch (error) { return this.handleError(error, ...); }`, and
+   * `handleError` copies `error.response?.data`/`error_user_msg`/etc. into the thrown error
+   * largely unsanitized — correct for a failed WRITE (the caller needs Meta's real reason), but
+   * this failure never reached the write at all. `assertOwnedByAccount`'s own refusal is
+   * provably marker-only (see its doc comment); this closes the one path beside it that could
+   * still carry raw Graph content — a Graph error message can embed account/business/page names,
+   * which is exactly what the ownership check exists to keep from leaking. `refuse()` below
+   * throws a fixed, generic message instead, same anti-oracle bar as the check it guards.
    */
+  private static async verifyWriteOwnership(
+    node: { get: (fields: string[]) => Promise<any> },
+    nodeId: string,
+    nodeLabel: string,
+    adAccountId: string,
+  ): Promise<void> {
+    let ownerData: Record<string, any>;
+    try {
+      const owner = await node.get(MetaService.withOwnershipField([]));
+      ownerData = { ...((owner as any)?._data ?? {}) };
+    } catch (error) {
+      console.error(`[MetaService] ownership check failed for ${nodeLabel} ${nodeId}:`, error);
+      throw new Error(
+        `Could not verify ownership of the requested ${nodeLabel.toLowerCase()} before this write. Retry; if it persists, verify the object in Meta Ads Manager.`,
+      );
+    }
+    MetaService.assertOwnedByAccount(ownerData.account_id, nodeId, nodeLabel, adAccountId);
+  }
+
   /**
    * Resolve a scope id that was SUPPLIED versus one that was omitted.
    *
@@ -2058,6 +2356,21 @@ export class MetaService {
     return trimmed;
   }
 
+  /**
+   * Bind a campaign / ad-set node to the SELECTED ad account before reading through it.
+   *
+   * ⚠ This is a tenancy boundary, not a nicety. Listing through `new AdAccount('act_X')` was
+   * implicitly account-scoped: Meta could only ever hand back X's ads. Reading through
+   * `new Campaign(id)` / `new AdSet(id)` is NOT — a node id addresses a node globally, and one
+   * Meta OAuth token routinely reaches several ad accounts. Without this check a caller could
+   * select account A, pass a campaign id from account B, and receive B's ads labelled as A's.
+   *
+   * `getMetaCredentials` validates the selected account and returns its token; it says nothing
+   * about the node. The token being valid is not the same as the node being in scope. This
+   * mirrors the guard `AD_CREATIVE GET` already applies for exactly this reason (ENG-471).
+   *
+   * Fails closed on every uncertain branch: an unverifiable owner is refused, not returned.
+   */
   private async assertNodeInAccount(
     node: any,
     nodeId: string,
@@ -2098,8 +2411,31 @@ export class MetaService {
       );
     }
 
+    MetaService.assertOwnedByAccount(data.account_id, nodeId, nodeLabel, adAccountId);
+  }
+
+  /**
+   * Compare an ALREADY-READ `account_id` against the selected ad account and refuse a mismatch.
+   *
+   * Split out of `assertNodeInAccount` so a caller about to read the node anyway can request
+   * `account_id` in the SAME call and check it here — one round trip instead of two. That
+   * matters on the single-entity paths: a separate probe would double the Graph calls on a
+   * routine read-back path AND add a failure mode of its own, refusing a read that would
+   * otherwise have succeeded because the probe blipped. Edge-scoped callers still need
+   * `assertNodeInAccount`, having no payload response to fold the field into.
+   */
+  /**
+   * Public so the one guard that predates it (`AD_CREATIVE GET` in agentModeService) can share
+   * this exact refusal instead of hand-rolling a near-copy that names the owning account.
+   */
+  public static assertOwnedByAccount(
+    ownerAccountId: unknown,
+    nodeId: string,
+    nodeLabel: string,
+    adAccountId: string,
+  ): void {
     const norm = (id: unknown) => String(id ?? '').replace(/^act_/, '').trim();
-    const owner = norm(data.account_id);
+    const owner = norm(ownerAccountId);
     const selected = norm(adAccountId);
 
     /*
@@ -2109,23 +2445,60 @@ export class MetaService {
      * could learn which ad account owns it, which is cross-account disclosure of exactly the
      * kind the guard exists to prevent — a block that answers the question it is refusing.
      *
-     * So the caller (and the model, and ultimately the user) gets one generic message for every
-     * failed branch, and the discriminating detail goes to the server log only.
+     * So the caller (and the model, and ultimately the user) gets the SAME marker sentence on
+     * every failed branch, and the owning account never appears in any of them — the log keeps
+     * that. What may differ after the marker is the remedy, because "select the other account"
+     * is right for a mismatch and impossible when Meta reported no owner at all; see `refuse`.
      */
-    const refuse = (serverDetail: string): never => {
+    /*
+     * One marker sentence for every branch, but the REMEDY may differ.
+     *
+     * The marker is what `isMetaAccountScopeRefusal` keys on, so it must not vary — a caller
+     * that stops recognising a refusal degrades past a guard it was told to respect, and for a
+     * write that means proceeding to confirmation on a node the guard refused. What may vary is
+     * the sentence after it, and it should: "select that account and try again" is the right
+     * remedy when the node lives in a DIFFERENT account, and no remedy at all when Meta simply
+     * did not tell us who owns it. Naming an action the user cannot take is the ENG-1636 shape.
+     *
+     * Neither variant discloses the owning account — that is the oracle this guard exists to
+     * refuse, and the discriminating detail stays in the server log.
+     */
+    const OTHER_ACCOUNT_REMEDY = 'If it belongs to a different ad account, select that account and try again.';
+    const refuse = (serverDetail: string, remedy: string = OTHER_ACCOUNT_REMEDY): never => {
       console.warn(`[MetaService] scope ownership refused: ${serverDetail}`);
       throw new Error(
-        `The requested ${nodeLabel.toLowerCase()} is not available in the selected ad account.`,
+        `The requested ${nodeLabel.toLowerCase()} ${META_ACCOUNT_SCOPE_REFUSAL_MARKER}. ${remedy}`,
       );
     };
 
     if (!owner) {
-      refuse(`no account_id on ${nodeLabel} ${nodeId}`);
+      // Fails closed on purpose: the field was requested, so its absence means the assumption
+      // behind this check no longer holds — not that the node is in scope.
+      refuse(
+        `no account_id on ${nodeLabel} ${nodeId}`,
+        `Meta did not report which ad account owns it, so ownership could not be CONFIRMED — ` +
+        `this is a failed check, not a proven mismatch. Retry; if it persists, verify the object ` +
+        `in Meta Ads Manager and that the intended ad account is selected.`,
+      );
     }
     // Both sides must be known. An empty selected account cannot be compared against anything,
     // so treating it as "no mismatch" would pass every node the token can reach.
     if (!selected) {
-      refuse(`no selected account resolved for ${nodeLabel} ${nodeId}`);
+      /*
+       * OUR failure, not the user's, and it must not read like theirs.
+       *
+       * This fires when no ad account could be resolved for the request — a credential or
+       * wiring problem on our side. The shared remedy ("it belongs to a different ad account,
+       * select that one") accuses the user of pointing at someone else's node, which is a
+       * confusing, unactionable thing to read about your own campaign. It is the same mistake
+       * that shipped as "in ad account (undefined)" earlier in this work.
+       */
+      refuse(
+        `no selected account resolved for ${nodeLabel} ${nodeId}`,
+        `No ad account could be determined for this request, so ownership could not be checked. ` +
+        `This is a connection problem, not a permissions one — reconnect Meta in Settings, or ` +
+        `name the ad account explicitly, then try again.`,
+      );
     }
     if (owner !== selected) {
       refuse(`${nodeLabel} ${nodeId} owned by ${owner}, selected ${selected}`);
@@ -2288,7 +2661,7 @@ export class MetaService {
     adAccountId: string,
     accessToken: string,
     campaignId?: string,
-    options: { maxPages?: number } = {},
+    options: { maxPages?: number; maxMs?: number } = {},
   ): Promise<{
     items: Array<{ adId: string; campaignId: string; destinationUrls: string[]; urlTags?: string }>;
     truncated: boolean;
@@ -2314,10 +2687,23 @@ export class MetaService {
         params.filtering = [{ field: 'campaign.id', operator: 'IN', value: [campaignId] }];
       }
       this.log(`Listing ads for UTM audit in account: ${adAccountId}`, { fields, campaignId });
-      const cursor = await MetaService.withReadDeadline(async () => account.getAds(fields, params), 'UTM audit ad list');
+      /*
+       * The FIRST page must honour the caller's budget too.
+       *
+       * `drainCursor` applies `maxMs` to the pages it walks, but this initial fetch went through
+       * the fixed per-call ceiling — so a caller arriving with its budget already spent still
+       * paid for one full read. The launch gate's `Math.max(1_000, …)` floor made that concrete:
+       * an exhausted wall still bought a 30s page. Capped to whatever the caller actually has.
+       */
+      const cursor = await MetaService.withReadDeadline(
+        async () => account.getAds(fields, params),
+        'UTM audit ad list',
+        options.maxMs,
+      );
       const { items: pages, truncated, pagesFetched } = await this.drainCursor(
         cursor,
-        options.maxPages ?? META_LIST_MAX_PAGES
+        options.maxPages ?? META_LIST_MAX_PAGES,
+        options.maxMs,
       );
       const items = pages.map((a: any) => {
         const data = a._data ?? a;
@@ -2362,7 +2748,14 @@ export class MetaService {
   /**
    * Get a single ad with its creative reference
    */
-  public async getAd(accessToken: string, adId: string) {
+  public async getAd(
+    accessToken: string,
+    adId: string,
+    /** When supplied, the node is verified to belong to this ad account before anything is
+     *  returned. Optional so existing read-back callers are unchanged; the callers whose result
+     *  reaches a user-facing prompt pass it. Same treatment getAdSet received. */
+    adAccountId?: string,
+  ) {
     try {
       this.initApi(accessToken);
       const ad = new Ad(adId);
@@ -2374,8 +2767,25 @@ export class MetaService {
         'creative{id,name,body,title,image_url,thumbnail_url,object_story_spec,status}'
       ];
       this.log(`Fetching ad: ${adId}`);
-      const result = await ad.get(fields);
-      return result._data;
+      /*
+       * An ad id is a GLOBAL node id, so this returns any ad the token can reach — and one Meta
+       * OAuth token routinely spans several ad accounts. buildMetaWriteConfirmation renders this
+       * result's NAME into the prompt the user approves, so an ad_id from another ad account
+       * disclosed that account's ad name to this user. getCampaign and getAdSet were both given
+       * this check; getAd, the resolver sitting between them, was not.
+       */
+      // Fails closed on a supplied-but-empty account id, exactly as getAdSet and getCampaign do:
+      // "" is a scope that failed to resolve, not a caller opting out of scoping.
+      const scoped = adAccountId !== undefined && adAccountId !== null;
+      const result = await ad.get(
+        scoped ? MetaService.withOwnershipField(fields) : fields,
+      );
+      const data = { ...(result?._data ?? {}) };
+      if (scoped) {
+        MetaService.assertOwnedByAccount(data.account_id, adId, 'Ad', adAccountId);
+        delete data.account_id;
+      }
+      return data;
     } catch (error) {
       return this.handleError(error, 'getAd');
     }
@@ -2437,13 +2847,48 @@ export class MetaService {
     }
   }
 
+  /** Render one existing ad or creative in a Meta placement. */
+  public async generateAdPreview(accessToken: string, nodeId: string, adFormat: string) {
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const response = await axios.get(
+        `https://graph.facebook.com/${apiVersion}/${encodeURIComponent(nodeId)}/previews`,
+        {
+          params: { ad_format: adFormat, access_token: accessToken },
+          timeout: META_READ_CALL_TIMEOUT_MS,
+          maxContentLength: 1_000_000,
+        },
+      );
+      const rows = response?.data?.data;
+      if (
+        !Array.isArray(rows)
+        || rows.length === 0
+        || rows.some((row: any) => !row || typeof row.body !== 'string' || row.body.trim().length === 0)
+      ) {
+        throw new Error('Meta returned an invalid ad preview response.');
+      }
+      return rows.map((row: any) => ({ body: row.body }));
+    } catch (error) {
+      const responseData = (error as any)?.response?.data;
+      const safeError = new Error((error as any)?.message || 'Meta ad preview request failed.');
+      if (responseData) {
+        (safeError as any).response = { data: responseData };
+      }
+      return this.handleError(safeError, 'generateAdPreview');
+    }
+  }
+
   /**
    * Update ad
+   *
+   * ENG-1724: see `updateCampaign` above — same global-node-id gap, write-side counterpart to
+   * the read-side scoping `getAd` already has.
    */
-  public async updateAd(accessToken: string, adId: string, params: any) {
+  public async updateAd(accessToken: string, adId: string, params: any, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const ad = new Ad(adId);
+      await MetaService.verifyWriteOwnership(ad, adId, 'Ad', adAccountId);
       this.log(`Updating ad ${adId} with params:`, params);
       await ad.update([], params);
       return { success: true };
@@ -2454,11 +2899,14 @@ export class MetaService {
 
   /**
    * Delete an ad
+   *
+   * ENG-1724: same reasoning as `updateAd` above.
    */
-  public async deleteAd(accessToken: string, adId: string) {
+  public async deleteAd(accessToken: string, adId: string, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const ad = new Ad(adId);
+      await MetaService.verifyWriteOwnership(ad, adId, 'Ad', adAccountId);
       this.log(`Deleting ad ${adId}`);
       await ad.delete([], {});
       return { success: true };
@@ -2724,15 +3172,15 @@ export class MetaService {
         const isLastBatch = batchSeq === totalBatches;
         this.log(`Uploading batch ${batchSeq}/${totalBatches} to custom audience: ${audienceId}`, { session_id: sessionId, rows: chunk.length });
         const result = await audience.createUser([], {
-          payload: {
-            schema,
-            data: chunk,
-            session: {
-              session_id: sessionId,
-              batch_seq: batchSeq,
-              last_batch_flag: isLastBatch,
-              estimated_num_total: rows.length,
-            },
+          // ENG-1343: Meta rejects `session` nested in `payload` ("(#100)
+          // Invalid keys \"session\" were found in param \"payload\"") — it
+          // must be a top-level sibling param, same as /usersreplace.
+          payload: { schema, data: chunk },
+          session: {
+            session_id: sessionId,
+            batch_seq: batchSeq,
+            last_batch_flag: isLastBatch,
+            estimated_num_total: rows.length,
           },
         });
         lastResult = result._data || result;
@@ -2780,15 +3228,15 @@ export class MetaService {
         const isLastBatch = batchSeq === totalBatches;
         this.log(`Deleting batch ${batchSeq}/${totalBatches} from custom audience: ${audienceId}`, { session_id: sessionId, rows: chunk.length });
         const result = await audience.deleteUsers({
-          payload: {
-            schema,
-            data: chunk,
-            session: {
-              session_id: sessionId,
-              batch_seq: batchSeq,
-              last_batch_flag: isLastBatch,
-              estimated_num_total: rows.length,
-            },
+          // ENG-1343: Meta rejects `session` nested in `payload` ("(#100)
+          // Invalid keys \"session\" were found in param \"payload\"") — it
+          // must be a top-level sibling param, same as /usersreplace.
+          payload: { schema, data: chunk },
+          session: {
+            session_id: sessionId,
+            batch_seq: batchSeq,
+            last_batch_flag: isLastBatch,
+            estimated_num_total: rows.length,
           },
         });
         lastResult = result._data || result;
@@ -2817,11 +3265,10 @@ export class MetaService {
 
       this.log(`Replacing users in custom audience: ${audienceId}`, { schema, payloadType: typeof payload });
 
-      // Live-test finding: unlike createUser/deleteUsers (session nested
-      // inside `payload`), Meta's /usersreplace edge requires `session` as a
-      // TOP-LEVEL param sibling to `payload`, always — even for a single
-      // batch. Nesting it inside `payload` (mirroring the /users edges)
-      // still produces "(#100) The parameter session is required", confirmed
+      // Live-test finding: Meta's /usersreplace edge requires `session` as a
+      // TOP-LEVEL param sibling to `payload` (as the /users edges do for
+      // multi-batch, ENG-1343), always — even for a single batch. Nesting it
+      // inside `payload` produces "(#100) The parameter session is required", confirmed
       // live against the real Graph API.
       const rows = payload;
       const sessionId = Math.floor(Math.random() * 1_000_000_000);

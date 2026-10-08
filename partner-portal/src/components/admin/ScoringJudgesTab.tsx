@@ -1,10 +1,11 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   Box,
   Button,
   Dialog,
   DialogActions,
   DialogContent,
+  DialogContentText,
   DialogTitle,
   FormControl,
   IconButton,
@@ -40,6 +41,10 @@ interface ScoringJudge {
   name: string;
   systemPrompt: string;
   llmModel?: string;
+  // ENG-2218: shadow judges (e.g. outcome-judge-b-shadow) carry these; the edit form must
+  // display them read-only rather than silently drop them on save.
+  shadow?: boolean;
+  sampleRate?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -53,6 +58,7 @@ export default function ScoringJudgesTab() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingJudge, setEditingJudge] = useState<ScoringJudge | null>(null);
   const [editingDefault, setEditingDefault] = useState(false);
+  const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
   const [name, setName] = useState('');
   const [systemPrompt, setSystemPrompt] = useState('');
   const [llmModel, setLlmModel] = useState('');
@@ -65,12 +71,13 @@ export default function ScoringJudgesTab() {
 
   const headers = { Authorization: `Bearer ${token}` };
 
-  const fetchJudges = async () => {
+  const fetchJudges = useCallback(async () => {
     try {
       setLoading(true);
+      const requestHeaders = { Authorization: `Bearer ${token}` };
       const [judgesRes, defaultRes] = await Promise.all([
-        axios.get(buildApiUrl('/api/settings/scoring-judges'), { headers }),
-        axios.get(buildApiUrl('/api/settings/scoring-judges/default-prompt'), { headers }),
+        axios.get(buildApiUrl('/api/settings/scoring-judges'), { headers: requestHeaders }),
+        axios.get(buildApiUrl('/api/settings/scoring-judges/default-prompt'), { headers: requestHeaders }),
       ]);
       setJudges(judgesRes.data.judges || []);
       setAvailableModels(judgesRes.data.availableModels || []);
@@ -83,11 +90,11 @@ export default function ScoringJudgesTab() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [token]);
 
   useEffect(() => {
     if (token) fetchJudges();
-  }, [token]);
+  }, [token, fetchJudges]);
 
   const handleOpenCreate = () => {
     setEditingJudge(null);
@@ -155,8 +162,12 @@ export default function ScoringJudgesTab() {
     }
   };
 
-  const handleResetDefault = async () => {
-    if (!confirm('Reset the default judge prompt to the built-in default?')) return;
+  const handleResetDefault = () => {
+    setResetConfirmOpen(true);
+  };
+
+  const handleConfirmResetDefault = async () => {
+    setResetConfirmOpen(false);
     try {
       const res = await axios.delete(buildApiUrl('/api/settings/scoring-judges/default-prompt'), { headers });
       setDefaultPrompt(res.data.systemPrompt);
@@ -249,7 +260,17 @@ export default function ScoringJudgesTab() {
             {/* Custom judges */}
             {judges.map((judge) => (
               <TableRow key={judge.id}>
-                <TableCell sx={{ fontWeight: 500 }}>{judge.name}</TableCell>
+                <TableCell sx={{ fontWeight: 500 }}>
+                  {judge.name}{' '}
+                  {judge.shadow && (
+                    <Chip
+                      label={`shadow${typeof judge.sampleRate === 'number' ? ` · ${Math.round(judge.sampleRate * 100)}%` : ''}`}
+                      size="small"
+                      color="info"
+                      sx={{ ml: 1 }}
+                    />
+                  )}
+                </TableCell>
                 <TableCell>
                   <Tooltip title={judge.systemPrompt}>
                     <Typography
@@ -290,6 +311,14 @@ export default function ScoringJudgesTab() {
           {editingDefault ? 'Edit Default Judge Prompt' : editingJudge ? 'Edit Judge' : 'Create Judge'}
         </DialogTitle>
         <DialogContent>
+          {editingJudge?.shadow && (
+            <Alert severity="info" sx={{ mt: 1, mb: 2 }}>
+              Shadow judge{typeof editingJudge.sampleRate === 'number' ? ` · sampled ${Math.round(editingJudge.sampleRate * 100)}%` : ''}.
+              It runs on a sample of sessions, is billed as system spend (not to customers), and never
+              affects the primary satisfaction score. Its shadow status and sample rate are preserved
+              when you save — only name, model, and prompt below are editable here.
+            </Alert>
+          )}
           {!editingDefault && (
             <TextField
               label="Name"
@@ -335,6 +364,23 @@ export default function ScoringJudgesTab() {
             disabled={saving || !systemPrompt.trim() || (!editingDefault && !name.trim())}
           >
             {saving ? <CircularProgress size={20} /> : 'Save'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={resetConfirmOpen} onClose={() => setResetConfirmOpen(false)}>
+        <DialogTitle>Reset default judge prompt?</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            This clears the custom default prompt and model override, and restores the built-in
+            default prompt for the "Default" judge. This cannot be undone — you'll need to
+            re-enter the custom prompt to restore it.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setResetConfirmOpen(false)}>Cancel</Button>
+          <Button variant="contained" color="warning" onClick={handleConfirmResetDefault}>
+            Reset
           </Button>
         </DialogActions>
       </Dialog>

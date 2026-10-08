@@ -26,6 +26,7 @@ jest.mock('../services/linearService', () => ({
   listOpenIssuesByLabel: jest.fn(),
   escalateIssue: jest.fn(),
   getIssueCommentsDetailed: jest.fn().mockResolvedValue([]),
+  findMostRecentArchivedIssueByLabel: jest.fn().mockResolvedValue(null),
 }));
 jest.mock('../services/resendService', () => ({ resendService: { sendSystemEmail: jest.fn() } }));
 jest.mock('../services/shipNotifyService', () => ({ notifyReporterShipped: jest.fn().mockResolvedValue('sent') }));
@@ -148,7 +149,8 @@ describe('fileUserIssue — bug, noResolvableReporter (ENG-939 AC4: unresolved t
   it('still creates/dedupes the Linear canonical (still files)', async () => {
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
     const r = await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'rui@agentweb.pro', noResolvableReporter: true, reportedByAdmin: 'rui@agentweb.pro' });
-    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({ labelNames: ['Bug', 'Customer Reported'] }));
+    // ENG-1590: reportedByAdmin set => Delegated-Filed is appended alongside the base labels.
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({ labelNames: ['Bug', 'Customer Reported', 'Delegated-Filed'] }));
     expect(r.canonicalUrl).toBe('lin');
   });
 
@@ -719,6 +721,90 @@ describe('intakeService.fileAutoIssue', () => {
   });
 });
 
+describe('intakeService.fileAutoIssue — archived canonical (ENG-730)', () => {
+  const realFlag = process.env.FEATUREBASE_INTAKE;
+  beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; });
+  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+
+  // AC1/AC2: the only matching canonical for this class was archived. listOpenIssuesByLabel never
+  // returns archived rows (linearService contract), so `open` is empty here — exactly as it would
+  // be against the live API. The gate must create exactly ONE new canonical and must not throw.
+  it('the only matching canonical is archived -> creates exactly one new canonical, does not throw', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([]); // archived candidate never surfaces here
+    linear.findMostRecentArchivedIssueByLabel.mockResolvedValue({
+      identifier: 'ENG-461',
+      issueId: 'uuid-461',
+      title: 'Scheduled Chat Abandoned Run Recovered: Lead Auto Enrichment',
+      description: 'Alert Class: scheduled-chat-abandoned-run\nSchedule ID: sched-abc',
+    });
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-719', url: 'https://linear.app/x/ENG-719', id: 'uuid-719' });
+
+    const r = await expect(fileAutoIssue({
+      title: 'Scheduled Chat Abandoned Run Recovered: Lead Auto Enrichment',
+      description: 'd',
+      source: 'Scheduled chat (error)',
+      notionContext: { 'Alert Class': 'scheduled-chat-abandoned-run', 'Schedule ID': 'sched-abc' },
+    })).resolves.toMatchObject({ deduped: false, tracker: 'Linear', pageId: 'ENG-719' });
+
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    void r;
+  });
+
+  // AC3: the fresh canonical records the archived predecessor's identifier so occurrence history
+  // stays followable — verified in the description text passed to createInternalLinearIssue.
+  it('records the archived predecessor identifier in the new canonical body', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([]);
+    linear.findMostRecentArchivedIssueByLabel.mockResolvedValue({
+      identifier: 'ENG-461',
+      issueId: 'uuid-461',
+      title: 'Scheduled Chat Abandoned Run Recovered: Lead Auto Enrichment',
+      description: 'Alert Class: scheduled-chat-abandoned-run',
+    });
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-719', url: 'u' });
+
+    await fileAutoIssue({
+      title: 'Scheduled Chat Abandoned Run Recovered: Lead Auto Enrichment',
+      description: 'd',
+      source: 'Scheduled chat (error)',
+      notionContext: { 'Alert Class': 'scheduled-chat-abandoned-run' },
+    });
+
+    const call = linear.createInternalLinearIssue.mock.calls[0][0];
+    expect(call.description).toContain('Predecessor (archived): ENG-461');
+  });
+
+  // AC4 (no regression): a normal open-canonical match still groups exactly as before — the
+  // archived-predecessor lookup must not even run when a live match exists.
+  it('an open canonical match still groups normally; archived lookup is never consulted', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-900', issueId: 'uuid-900', title: 'Some Auto Issue', description: 'Alert Class: some-class' },
+    ]);
+    const r = await fileAutoIssue({
+      title: 'Some Auto Issue',
+      description: 'd',
+      source: 'Scheduled chat',
+      notionContext: { 'Alert Class': 'some-class' },
+    });
+    expect(r).toMatchObject({ deduped: true, tracker: 'Linear' });
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(linear.findMostRecentArchivedIssueByLabel).not.toHaveBeenCalled();
+  });
+
+  // Best-effort contract: a failure in the archived-predecessor lookup must never block filing.
+  it('archived-predecessor lookup failure does not block filing the new canonical', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([]);
+    linear.findMostRecentArchivedIssueByLabel.mockRejectedValue(new Error('Linear API hiccup'));
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-719', url: 'u' });
+
+    await expect(fileAutoIssue({
+      title: 'new auto issue',
+      description: 'd',
+      source: 'Scheduled chat',
+    })).resolves.toMatchObject({ deduped: false, tracker: 'Linear' });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('intakeService.fileAutoIssue — idempotency-key dedup (ENG-240)', () => {
   const realFlag = process.env.FEATUREBASE_INTAKE;
   beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; });
@@ -1245,5 +1331,101 @@ describe('intakeService.fileAutoIssue — alert-class clustering (ENG-358)', () 
     expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-7', expect.stringContaining('Recurred on'));
     expect(linear.escalateIssue).not.toHaveBeenCalled();
     expect(r).toMatchObject({ deduped: true });
+  });
+});
+
+
+// ENG-1335: live-but-differently-worded canonicals. Regression corpus: ENG-1334 (new filing) vs
+// ENG-1165 (open canonical) share no distinctive title tokens but the same substantive ask.
+describe('fileUserIssue — bug, ENG-1335 occurrence ladder + semantic grouping', () => {
+  const ENG_1165 = {
+    identifier: 'ENG-1165', issueId: 'uuid-1165',
+    title: "Make 'blocked by external auth / awaiting user input' a neutral EXCLUDED scoring state, like the Slack-suggestion exception",
+    description: 'add a neutral terminal state (e.g. blocked_external / awaiting_user_input) that the judges can assign instead of a low goalCompletion',
+  };
+  const ENG_1334_REPORT = {
+    type: 'bug' as const,
+    title: 'Add a neutral awaiting-user-input scoring state so judges stop docking goalCompletion',
+    description: 'REPEAT REQUEST — sixth window. When the user simply has not replied, judges dock goalCompletion; score it neutral instead.',
+    userEmail: 'rep@e.com',
+  };
+  const realFlag = process.env.FEATUREBASE_INTAKE;
+  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; });
+  beforeEach(() => {
+    jest.clearAllMocks();
+    process.env.FEATUREBASE_INTAKE = 'true';
+    linear.listOpenBugCanonicals.mockResolvedValue([ENG_1165]);
+    fb.createTicket.mockResolvedValue({ id: 'tk', number: 42, url: 'https://fb/t/42' });
+    fb.findTicketByMarker = jest.fn().mockResolvedValue(null);
+  });
+  const reportComments = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ body: `[reporter-ticket #${i + 1} u${i}@e.com] Affected user: u${i}`, createdAt: '' }));
+
+  it('AC1: a judged match attaches as ONE comment and creates ZERO issues', async () => {
+    dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-1165', title: ENG_1165.title, description: ENG_1165.description });
+    linear.getIssueCommentsDetailed.mockResolvedValue(reportComments(1));
+    const r = await fileUserIssue(ENG_1334_REPORT);
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(linear.addIssueComment).toHaveBeenCalledTimes(1);
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-1165', expect.stringContaining('score it neutral instead'));
+    expect(r.deduped).toBe(true);
+  });
+
+  it('AC1: the judge is shown the ENG-1334 report alongside the open ENG-1165 canonical', async () => {
+    dedup.findDuplicate.mockResolvedValue(null);
+    linear.createInternalLinearIssue.mockResolvedValue({ id: 'new', identifier: 'ENG-9', url: 'lin' });
+    await fileUserIssue(ENG_1334_REPORT);
+    const [input, cands] = dedup.findDuplicate.mock.calls[0];
+    expect(input).toMatchObject({ title: ENG_1334_REPORT.title, description: ENG_1334_REPORT.description });
+    expect(cands).toEqual([{ ref: 'ENG-1165', title: ENG_1165.title, description: ENG_1165.description }]);
+  });
+
+  it('AC2: the occurrence count increments and is visible on the canonical', async () => {
+    dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-1165', title: '', description: '' });
+    linear.getIssueCommentsDetailed.mockResolvedValue(reportComments(4));
+    await fileUserIssue(ENG_1334_REPORT);
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-1165', expect.stringContaining('Occurrences: 5 reports on this canonical.'));
+  });
+
+  it('AC3: 2nd report raises to at least Medium (3); never lowers a more urgent funnel tier', async () => {
+    dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-1165', title: '', description: '' });
+    linear.getIssueCommentsDetailed.mockResolvedValue(reportComments(1));
+    await fileUserIssue(ENG_1334_REPORT);
+    expect(linear.raiseIssueTriage).toHaveBeenCalledWith('uuid-1165', expect.objectContaining({ priority: 3 }));
+  });
+
+  it('AC3: 3rd+ report raises to at least High (2)', async () => {
+    dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-1165', title: '', description: '' });
+    linear.getIssueCommentsDetailed.mockResolvedValue(reportComments(2));
+    await fileUserIssue(ENG_1334_REPORT);
+    expect(linear.raiseIssueTriage).toHaveBeenCalledWith('uuid-1165', expect.objectContaining({ priority: 2 }));
+  });
+
+  it('AC3: unattributed telemetry notes count as reports too', async () => {
+    dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-1165', title: '', description: '' });
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: 'Surfaced via telemetry/satisfaction-report review — affected user could not be resolved', createdAt: '' },
+      { body: 'unrelated human comment', createdAt: '' },
+      { body: '[reporter-ticket #3 a@e.com] Affected user: a', createdAt: '' },
+    ]);
+    await fileUserIssue(ENG_1334_REPORT);
+    expect(linear.raiseIssueTriage).toHaveBeenCalledWith('uuid-1165', expect.objectContaining({ priority: 2 }));
+  });
+
+  it('comment-read failure never blocks the filing (falls back to occurrence 2)', async () => {
+    dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-1165', title: '', description: '' });
+    linear.getIssueCommentsDetailed.mockRejectedValue(new Error('linear down'));
+    const r = await fileUserIssue(ENG_1334_REPORT);
+    expect(r.deduped).toBe(true);
+    expect(linear.raiseIssueTriage).toHaveBeenCalledWith('uuid-1165', expect.objectContaining({ priority: 3 }));
+  });
+
+  it('AC4: a publish-refusal report the judge does not match files its own canonical (no over-attach)', async () => {
+    dedup.findDuplicate.mockResolvedValue(null);
+    linear.createInternalLinearIssue.mockResolvedValue({ id: 'uuid-new', identifier: 'ENG-999', url: 'lin' });
+    await fileUserIssue({ ...ENG_1334_REPORT, title: 'Scheduled run publish gate vs judge rubric', description: 'agent correctly withholds publish under approval setting, judge docks it' });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    expect(linear.addIssueComment).not.toHaveBeenCalledWith('uuid-1165', expect.anything());
+    expect(linear.raiseIssueTriage).not.toHaveBeenCalled();
   });
 });

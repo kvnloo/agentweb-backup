@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { 
   Box, 
   Typography, 
@@ -40,32 +40,7 @@ const MarketResearchDetail: React.FC = () => {
   const [task, setTask] = useState<MarketResearchTask | null>(null);
   const [refreshInterval, setRefreshInterval] = useState<NodeJS.Timeout | null>(null);
 
-  // Load task details when component mounts
-  useEffect(() => {
-    if (isAuthenticated() && token && taskId) {
-      loadTaskDetails();
-    }
-  }, [isAuthenticated, token, taskId]);
-
-  // Auto-refresh if task is running
-  useEffect(() => {
-    if (task && task.execution?.status === 'running' && token) {
-      const interval = setInterval(() => {
-        refreshTaskStatus();
-      }, 5000); // Check every 5 seconds
-      
-      setRefreshInterval(interval);
-      
-      return () => {
-        if (interval) clearInterval(interval);
-      };
-    } else if (refreshInterval) {
-      clearInterval(refreshInterval);
-      setRefreshInterval(null);
-    }
-  }, [task, token]);
-
-  const loadTaskDetails = async () => {
+  const loadTaskDetails = useCallback(async () => {
     if (!token || !taskId) {
       setError('Authentication token or task ID is missing');
       return;
@@ -73,7 +48,7 @@ const MarketResearchDetail: React.FC = () => {
 
     setIsLoading(true);
     setError(null);
-    
+
     try {
       const taskData = await getMarketResearch(taskId, token);
       setTask(taskData);
@@ -83,9 +58,9 @@ const MarketResearchDetail: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [token, taskId]);
 
-  const refreshTaskStatus = async () => {
+  const refreshTaskStatus = useCallback(async () => {
     if (!token || !taskId) return;
 
     try {
@@ -94,7 +69,37 @@ const MarketResearchDetail: React.FC = () => {
     } catch (error) {
       console.error('Error refreshing task status:', error);
     }
-  };
+  }, [token, taskId]);
+
+  // Load task details when component mounts
+  useEffect(() => {
+    if (isAuthenticated() && token && taskId) {
+      loadTaskDetails();
+    }
+  }, [isAuthenticated, token, taskId, loadTaskDetails]);
+
+  // Auto-refresh if task is running
+  // Note: 'refreshInterval' is intentionally not added as a dependency here even though
+  // ESLint flags it. This effect both reads and sets refreshInterval (via setRefreshInterval),
+  // and setInterval() returns a new Timeout object identity on every run, so adding it to the
+  // deps array would make the effect re-fire every time it sets state, which is a bona fide
+  // effect-loops-on-its-own-state-setter risk. Left as-is per the "don't force a risky dep" rule.
+  useEffect(() => {
+    if (task && task.execution?.status === 'running' && token) {
+      const interval = setInterval(() => {
+        refreshTaskStatus();
+      }, 5000); // Check every 5 seconds
+
+      setRefreshInterval(interval);
+
+      return () => {
+        if (interval) clearInterval(interval);
+      };
+    } else if (refreshInterval) {
+      clearInterval(refreshInterval);
+      setRefreshInterval(null);
+    }
+  }, [task, token, refreshTaskStatus]);
 
   const goBack = () => {
     navigate('/marketing/research');

@@ -6,17 +6,46 @@
  * `file_url` argument, not grow per-tool alias/missing-arg logic.
  */
 
+// ENG-2103 (F2 design-decision-list follow-up): create_html_from_template's
+// execute() now binds callLLM/getDefaultModel/resolveGenerationModel straight
+// off the agentModeService singleton (all three are public) and calls
+// emma/impl/htmlCreation.ts directly — createHtmlFromTemplate itself is no
+// longer called on agentModeService from this tool (see
+// emmaTools.createHtmlFromTemplate.test.ts for its own dedicated coverage).
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
-    readFileContent: jest.fn(),
-    createHtmlFile: jest.fn(),
-    createHtmlFromTemplate: jest.fn(),
-    updateHtmlFile: jest.fn(),
+    callLLM: jest.fn(),
+    getDefaultModel: jest.fn(),
+    resolveGenerationModel: jest.fn(),
   },
 }));
 
+// ENG-2103 (F2): create_html_file's execute() calls emma/impl/htmlCreation.ts
+// directly (not agentModeService) — mock it separately. createHtmlFromTemplate
+// is also in this module now (F2 design-decision-list follow-up).
+jest.mock('../emma/impl/htmlCreation', () => ({
+  createHtmlFile: jest.fn(),
+  createHtmlTemplate: jest.fn(),
+  createHtmlFromTemplate: jest.fn(),
+}));
+
+// ENG-2103 (F2): update_html_file's execute() calls emma/impl/htmlUpdate.ts
+// directly (not agentModeService) — mock it separately.
+jest.mock('../emma/impl/htmlUpdate', () => ({
+  updateHtmlFile: jest.fn(),
+}));
+
+// ENG-2103 (F2), cluster 22: read_file_content's execute() calls
+// emma/impl/misc.ts's readFileContent directly (not agentModeService) —
+// mock it separately.
+jest.mock('../emma/impl/misc', () => ({
+  readFileContent: jest.fn(),
+}));
+
 import { emmaToolRegistry } from '../emma/registry';
-import { agentModeService } from '../services/agentModeService';
+import * as htmlCreationImpl from '../emma/impl/htmlCreation';
+import * as htmlUpdateImpl from '../emma/impl/htmlUpdate';
+import * as miscImpl from '../emma/impl/misc';
 
 // Import tools.ts to ensure tools are registered.
 import '../emma/tools';
@@ -47,7 +76,7 @@ describe('read_file_content Emma tool', () => {
     const tool = emmaToolRegistry.getTool(toolName);
     if (!tool) throw new Error(`Tool ${toolName} not found`);
 
-    (agentModeService.readFileContent as jest.Mock).mockResolvedValue({
+    (miscImpl.readFileContent as jest.Mock).mockResolvedValue({
       success: true,
       content: 'hello from attachment'
     });
@@ -57,7 +86,7 @@ describe('read_file_content Emma tool', () => {
       { userId: 'user-123', sessionId: 'sess-1' }
     );
 
-    expect(agentModeService.readFileContent).toHaveBeenCalledWith('https://example.com/pasted-text.txt');
+    expect(miscImpl.readFileContent).toHaveBeenCalledWith('https://example.com/pasted-text.txt');
     expect(result).toEqual({
       content: [{ type: 'text', text: 'hello from attachment' }]
     });
@@ -67,7 +96,7 @@ describe('read_file_content Emma tool', () => {
     const tool = emmaToolRegistry.getTool(toolName);
     if (!tool) throw new Error(`Tool ${toolName} not found`);
 
-    (agentModeService.readFileContent as jest.Mock).mockResolvedValue({
+    (miscImpl.readFileContent as jest.Mock).mockResolvedValue({
       success: false,
       message: 'file_url is required and must be a non-empty HTTP or HTTPS URL.',
       error: 'Missing file_url'
@@ -75,7 +104,7 @@ describe('read_file_content Emma tool', () => {
 
     const result = await tool.execute({}, { userId: 'user-123', sessionId: 'sess-1' });
 
-    expect(agentModeService.readFileContent).toHaveBeenCalledWith(undefined);
+    expect(miscImpl.readFileContent).toHaveBeenCalledWith(undefined);
     expect(result).toMatchObject({ isError: true });
     expect(result.content?.[0]?.text).toContain('file_url is required');
   });
@@ -116,7 +145,7 @@ describe('HTML Emma tools contract cleanup', () => {
     const tool = emmaToolRegistry.getTool('create_html_file');
     if (!tool) throw new Error('Tool create_html_file not found');
 
-    (agentModeService.createHtmlFile as jest.Mock).mockResolvedValue({ success: true, s3_url: 'https://example.com/doc.html' });
+    (htmlCreationImpl.createHtmlFile as jest.Mock).mockResolvedValue({ success: true, s3_url: 'https://example.com/doc.html' });
 
     const result = await tool.execute(
       {
@@ -128,7 +157,7 @@ describe('HTML Emma tools contract cleanup', () => {
       { userId: 'user-123', sessionId: 'sess-1' }
     );
 
-    expect(agentModeService.createHtmlFile).toHaveBeenCalledWith(
+    expect(htmlCreationImpl.createHtmlFile).toHaveBeenCalledWith(
       'Weekly Report',
       'Full report body',
       'Use brand colors',
@@ -143,7 +172,7 @@ describe('HTML Emma tools contract cleanup', () => {
     const tool = emmaToolRegistry.getTool('update_html_file');
     if (!tool) throw new Error('Tool update_html_file not found');
 
-    (agentModeService.updateHtmlFile as jest.Mock).mockResolvedValue({ success: true, s3_url: 'https://example.com/updated.html' });
+    (htmlUpdateImpl.updateHtmlFile as jest.Mock).mockResolvedValue({ success: true, s3_url: 'https://example.com/updated.html' });
 
     const operations = [{ action: 'replaceInner', selector: 'h1', html: 'New title' }];
     const result = await tool.execute(
@@ -155,7 +184,7 @@ describe('HTML Emma tools contract cleanup', () => {
       { userId: 'user-123', sessionId: 'sess-1' }
     );
 
-    expect(agentModeService.updateHtmlFile).toHaveBeenCalledWith(
+    expect(htmlUpdateImpl.updateHtmlFile).toHaveBeenCalledWith(
       'https://example.com/source.html',
       'css',
       operations,
@@ -169,7 +198,7 @@ describe('HTML Emma tools contract cleanup', () => {
     const tool = emmaToolRegistry.getTool('create_html_from_template');
     if (!tool) throw new Error('Tool create_html_from_template not found');
 
-    (agentModeService.createHtmlFromTemplate as jest.Mock).mockResolvedValue({ success: true, s3_url: 'https://example.com/template.html' });
+    (htmlCreationImpl.createHtmlFromTemplate as jest.Mock).mockResolvedValue({ success: true, s3_url: 'https://example.com/template.html' });
 
     const result = await tool.execute(
       {
@@ -180,14 +209,20 @@ describe('HTML Emma tools contract cleanup', () => {
       { llmModel: 'anthropic.claude-sonnet-4-6', userId: 'user-123', sessionId: 'sess-1' }
     );
 
-    expect(agentModeService.createHtmlFromTemplate).toHaveBeenCalledWith(
+    const callArgs = (htmlCreationImpl.createHtmlFromTemplate as jest.Mock).mock.calls[0];
+    expect(callArgs.slice(0, 6)).toEqual([
       'anthropic.claude-sonnet-4-6',
       'tpl_123',
       { title: 'Hello' },
       { links_n: [] },
       'user-123',
       'sess-1'
-    );
+    ]);
+    // Trailing args are the 3 injected LLM-gateway functions
+    // (callLLM/getDefaultModel/resolveGenerationModel), bound off the
+    // agentModeService singleton — see emmaTools.createHtmlFromTemplate.test.ts
+    // for dedicated coverage that they're genuinely live bindings, not stale.
+    expect(callArgs).toHaveLength(9);
     expect(result).toEqual({ success: true, s3_url: 'https://example.com/template.html' });
   });
 });

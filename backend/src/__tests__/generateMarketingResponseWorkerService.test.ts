@@ -303,6 +303,59 @@ describe('GenerateMarketingResponseWorkerService', () => {
       expect(caught.retryAfterMs).toBeUndefined();
     });
 
+    // ENG-2121: same IPC-boundary hazard as the status/code case above, for the
+    // whole-turn-timeout tag the loop's per-call bound now sets. Without restoring
+    // it here, the controller's timeout-salvage backstop (which checks
+    // `genErr?.isGenerationTimeout` before looking for images/tool work already
+    // persisted this turn) never sees the flag, regardless of whether the worker
+    // forwarded it — live-verified in preview (2026-09-24) that this reconstruction
+    // is the OTHER half of that same round-trip and drops the flag just as silently
+    // if only the worker side is fixed.
+    it('should restore isGenerationTimeout from a worker error message', async () => {
+      const promise = workerService.runInWorker(mockParams);
+
+      await waitForSend();
+
+      const messageHandler = messageHandlers.get('default');
+      const sendCall = mockWorker.send.mock.calls[0];
+      const requestId = sendCall[0].requestId;
+      messageHandler!({
+        type: 'error',
+        requestId,
+        error: 'Your request took longer than expected. Please try again.',
+        stack: 'Error stack trace',
+        isGenerationTimeout: true,
+      });
+
+      await expect(promise).rejects.toMatchObject({
+        isGenerationTimeout: true,
+      });
+    });
+
+    it('should not set isGenerationTimeout on the reconstructed error when the worker omits it', async () => {
+      const promise = workerService.runInWorker(mockParams);
+
+      await waitForSend();
+
+      const messageHandler = messageHandlers.get('default');
+      const sendCall = mockWorker.send.mock.calls[0];
+      const requestId = sendCall[0].requestId;
+      messageHandler!({
+        type: 'error',
+        requestId,
+        error: 'Generic failure',
+        stack: 'Error stack trace',
+      });
+
+      let caught: any;
+      try {
+        await promise;
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught.isGenerationTimeout).toBeUndefined();
+    });
+
     it('should handle worker process errors', async () => {
       const promise = workerService.runInWorker(mockParams);
 
@@ -498,7 +551,7 @@ describe('GenerateMarketingResponseWorkerService', () => {
       // In test environment, __dirname is in src/__tests__, so it should detect as local dev
       // and use TypeScript with ts-node
       if (scriptPath.includes('generateMarketingResponseWorker.ts')) {
-        expect(forkCall[2].execArgv).toEqual(['-r', 'ts-node/register', '--max-old-space-size=4096']);
+        expect(forkCall[2].execArgv).toEqual(['-r', 'ts-node/register/transpile-only', '--max-old-space-size=4096']);
       } else {
         // If it uses .js, it means __dirname contains 'dist' (deployed environment)
         expect(scriptPath).toContain('generateMarketingResponseWorker.js');
@@ -535,7 +588,7 @@ describe('GenerateMarketingResponseWorkerService', () => {
       // But the logic should handle the case where __dirname contains 'dist' even with NODE_ENV=development
       if (scriptPath.includes('generateMarketingResponseWorker.ts')) {
         // Local development: uses TypeScript with ts-node
-        expect(forkCall[2].execArgv).toEqual(['-r', 'ts-node/register', '--max-old-space-size=4096']);
+        expect(forkCall[2].execArgv).toEqual(['-r', 'ts-node/register/transpile-only', '--max-old-space-size=4096']);
       } else {
         // Deployed environment (even with NODE_ENV=development): uses compiled JavaScript
         expect(scriptPath).toContain('generateMarketingResponseWorker.js');

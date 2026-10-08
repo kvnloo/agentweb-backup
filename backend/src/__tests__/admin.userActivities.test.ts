@@ -53,8 +53,6 @@ jest.mock("../utils/dynamoPagination", () => ({ paginatedScan: jest.fn() }));
 jest.mock("../utils/crypto", () => ({ encryptPassword: jest.fn() }));
 jest.mock("../services/tokenUsageService", () => ({
   grantTokenBonus: jest.fn(),
-  getUserTokenUsage: jest.fn(),
-  getUserTokenAllowance: jest.fn(),
 }));
 jest.mock("../services/revenueService", () => ({ getRevenueMetrics: jest.fn() }));
 jest.mock("../services/businessFunnelService", () => ({ getBusinessFunnelMetrics: jest.fn() }));

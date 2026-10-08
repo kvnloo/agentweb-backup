@@ -6,6 +6,7 @@ import path from 'path';
 // Mock dependencies
 jest.mock('axios');
 jest.mock('fs', () => ({
+  ...jest.requireActual('fs'),
   promises: {
     writeFile: jest.fn().mockResolvedValue(undefined),
     mkdir: jest.fn().mockResolvedValue(undefined),
@@ -741,6 +742,41 @@ describe('AgentModeService - callMetaAdsInsightsApiWrapper', () => {
       const classified = toolResultError(result);
       expect(classifyToolErrorClass(classified)).toBe('auth');
       expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+    });
+
+    // ENG-1908: a sandbox (evaluation) account's Meta credential is a sentinel
+    // token the simulator answers instantly and locally — there is no real
+    // Graph rate limit to respect, so making a candidate sit through the
+    // product's real 10s-per-attempt poll (up to 60 attempts) for every
+    // insights call would make the sandbox feel broken, not real. Real timers
+    // here (not the fake timers this suite otherwise uses) make the assertion
+    // an actual wall-clock proof: a real Meta token would block this test for
+    // 10+ seconds on the very first poll tick.
+    it('ENG-1908: skips the 10s poll delay entirely for a sandbox access token', async () => {
+      jest.useRealTimers();
+      try {
+        const sandboxToken = 'sbx.eval_abc123.0123456789abcdef01234567';
+        mockUserDb.getUserById.mockResolvedValue({ id: userId, adAccount: '922903076601160' });
+        const secretsManager = await import('../utils/secretsManager');
+        (secretsManager.getMetaAccessToken as jest.Mock).mockResolvedValueOnce(sandboxToken);
+        mockedAxios.post.mockResolvedValueOnce({ status: 200, data: { report_run_id: 'sbx-report-1' } } as any);
+        mockedAxios.get.mockResolvedValueOnce({ status: 200, data: { async_status: 'Job Completed' } } as any);
+        mockedAxios.get.mockResolvedValueOnce({ status: 200, data: { data: [{ impressions: '10' }], paging: {} } } as any);
+
+        const startedAt = Date.now();
+        const result = await service.callMetaAdsInsightsApiWrapper(userId, {
+          account_id: '922903076601160',
+          object_type: 'account',
+          fields: ['impressions'],
+          date_preset: 'last_30d',
+        });
+        const elapsedMs = Date.now() - startedAt;
+
+        expect(result.success).toBe(true);
+        expect(elapsedMs).toBeLessThan(2000);
+      } finally {
+        jest.useFakeTimers();
+      }
     });
   });
 });

@@ -1,3 +1,4 @@
+import { OPENROUTER_PROVIDER_PREFERENCES } from './agentMode/openRouterRequestParams';
 /**
  * Coding Agent Service
  *
@@ -9,6 +10,7 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
+import { checkCodingAgentSyntax } from './codingAgentSyntax';
 import { mcpFetch } from '../mcp/server/httpClient';
 import { agentModeService } from './agentModeService';
 import { getGitHubOrgToken, getSecret } from '../utils/secretsManager';
@@ -149,7 +151,7 @@ async function refreshPreviewUrlForDraftBranchStrict(
     const data = await mcpFetch({
       method: 'GET',
       path: `/api/landing-pages/v0/generated/${context.pageId}/preview-url`,
-      queryParams: { branch: result.branch },
+      queryParams: { branch: result.branch, ...(result.latestCommitSha ? { commitSha: result.latestCommitSha } : {}) },
       context: { userId: context.userId },
     });
 
@@ -299,6 +301,30 @@ export async function _previewBranchCommitsAheadOfMain(
   }
 }
 
+/**
+ * ENG stale-draft: ahead/behind counts for the preview branch vs main. `behindBy > 0`
+ * means main moved on (other merges / manual PRs) since the draft was cut. Building on
+ * such a branch and publishing it later reverts every one of those main commits.
+ * Returns null on any error so the caller can fall back to the ahead-only guard.
+ */
+export async function _previewBranchDivergence(
+  repoBase: string,
+  headers: Record<string, string>,
+): Promise<{ aheadBy: number; behindBy: number } | null> {
+  try {
+    const res = await axios.get<any>(
+      `${repoBase}/compare/main...${encodeURIComponent(LANDING_PAGE_PREVIEW_BRANCH)}`,
+      { headers, timeout: GITHUB_API_TIMEOUT_MS },
+    );
+    const aheadBy = Number(res?.data?.ahead_by);
+    const behindBy = Number(res?.data?.behind_by);
+    if (!Number.isFinite(aheadBy) || !Number.isFinite(behindBy)) return null;
+    return { aheadBy, behindBy };
+  } catch {
+    return null;
+  }
+}
+
 async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Promise<void> {
   if (context.draftBranch !== LANDING_PAGE_PREVIEW_BRANCH) return;
 
@@ -352,6 +378,34 @@ async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Pr
   // (not ahead of main) — the case the reusable branch was designed for.
   const aheadBy = await _previewBranchCommitsAheadOfMain(repoBase, headers);
   if (aheadBy > 0) {
+    // Unpublished edits exist. Only layer on top if the draft still contains main;
+    // otherwise sync main in first (or back up + reset if that conflicts), so a later
+    // publish cannot silently revert commits that landed on main after the draft was cut.
+    const divergence = await _previewBranchDivergence(repoBase, headers);
+    if (divergence && divergence.behindBy > 0) {
+      try {
+        await axios.post(
+          `${repoBase}/merges`,
+          { base: LANDING_PAGE_PREVIEW_BRANCH, head: mainSha, commit_message: 'Sync main into draft/agentweb-preview' },
+          { headers, timeout: GITHUB_API_TIMEOUT_MS },
+        );
+        console.log(`[CODING AGENT] Draft was ${divergence.behindBy} behind main; merged main into it`);
+        return;
+      } catch (mergeErr: any) {
+        // Only a confirmed merge conflict (409) justifies backup + reset. Timeouts,
+        // rate limits, or auth failures leave the merge result unknown, so keep the draft.
+        if (mergeErr?.response?.status !== 409) {
+          throw new Error(`Cannot prepare preview branch: ${_describeGithubError(mergeErr, 'sync main into the draft')}`);
+        }
+        const draftRef = await axios.get<any>(`${repoBase}/git/ref/heads/${LANDING_PAGE_PREVIEW_BRANCH}`, { headers, timeout: GITHUB_API_TIMEOUT_MS });
+        const draftSha = draftRef.data?.object?.sha;
+        const backup = `refs/heads/backup/agentweb-preview-${Date.now()}`;
+        await axios.post(`${repoBase}/git/refs`, { ref: backup, sha: draftSha }, { headers, timeout: GITHUB_API_TIMEOUT_MS });
+        await axios.patch(`${repoBase}/git/refs/heads/${LANDING_PAGE_PREVIEW_BRANCH}`, { sha: mainSha, force: true }, { headers, timeout: GITHUB_API_TIMEOUT_MS });
+        console.warn(`[CODING AGENT] Stale draft conflicted with main; backed up to ${backup} and reset to main (${mainSha.substring(0, 7)})`);
+        return;
+      }
+    }
     console.log(
       `[CODING AGENT] ${LANDING_PAGE_PREVIEW_BRANCH} has ${aheadBy} unpublished commit(s) ahead of main; ` +
         `layering new edit on top instead of resetting (ENG-176)`,
@@ -407,27 +461,9 @@ export async function _rollbackEditedFiles(input: {
     };
   }
 
-  const basePath = `/api/landing-pages/v0/generated/${input.context.pageId}`;
-  const branch = input.context.draftBranch || 'main';
-
+  const workspace = newEditWorkspace();
   const deleteInsteadOfRevert = async (filePath: string): Promise<void> => {
-    try {
-      const deleteResult = await mcpFetch({
-        method: 'PUT',
-        path: `${basePath}/update-files`,
-        body: {
-          files: [{ file_path: filePath, deleted: true }],
-          commit_message: `Rollback: remove ${filePath} (new this session, nothing to revert to)`,
-          ...(branch !== 'main' ? { branch } : {}),
-        },
-        context: { userId: input.context.userId }
-      });
-      if (!deleteResult?.success) {
-        failures.push(`${filePath}: could not delete new file during rollback`);
-      }
-    } catch (error) {
-      failures.push(`${filePath}: could not delete new file during rollback (${error instanceof Error ? error.message : String(error)})`);
-    }
+    workspace.pending.set(filePath, { file_path: filePath, deleted: true });
   };
 
   const failures: string[] = [];
@@ -437,7 +473,7 @@ export async function _rollbackEditedFiles(input: {
         file_path: filePath,
         commit_sha: input.baseCommitSha,
         commit_message: `Rollback ${filePath} after failed coding-agent run`,
-      }, input.context);
+      }, input.context, workspace);
 
       // Belt-and-suspenders: revert_file's OWN read step can (in principle)
       // return this string without throwing if the API call itself succeeds
@@ -467,6 +503,11 @@ export async function _rollbackEditedFiles(input: {
         failures.push(`${filePath}: ${message}`);
       }
     }
+  }
+
+  if (!failures.length) {
+    try { await commitStagedFiles(input.context, workspace); }
+    catch (error) { failures.push(error instanceof Error ? error.message : String(error)); }
   }
 
   if (failures.length > 0) {
@@ -541,7 +582,7 @@ You CAN create new files using \`edit_file\`. For a file that does not yet exist
 The tool will create the file if it doesn't exist. No need to read it first.
 
 ## Editing multiple files for one fix
-If a single logical change requires editing 2+ files (e.g. a page plus a new API route it calls), use \`edit_files\` instead of multiple \`edit_file\` calls — it lands all of them in ONE atomic commit, so the repo never sits in a broken intermediate state between commits.
+All edits and reverts are staged in memory. Reads and searches see your staged changes. Make ALL edits first; \`check_deployment\` validates changed TS/JS/CSS syntax and commits the entire batch atomically before polling Vercel. Syntax errors leave changes staged: fix the reported file/line and retry. A real Vercel build error can require a further atomic repair commit.
 
 ## Principles
 - Make targeted, small edits (1-5 edit blocks per call). Never rewrite entire files.
@@ -895,7 +936,7 @@ function getToolDefinitions(): Anthropic.Tool[] {
     },
     {
       name: 'edit_files',
-      description: 'Commit changes to MULTIPLE files in ONE atomic commit. Use this instead of calling edit_file N times when a single logical fix spans 2+ files (e.g. editing a page AND adding a new API route it depends on) — landing them in separate commits can leave the repo in a broken intermediate state if something fails partway. Each file entry supports the same line_edits/edits modes as edit_file, or deleted: true to remove a file.',
+      description: 'Stage changes to multiple files together. check_deployment validates and commits ALL staged edits once. Each entry supports line_edits/edits as in edit_file, or deleted: true to remove a file.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -941,7 +982,7 @@ function getToolDefinitions(): Anthropic.Tool[] {
               },
               required: ['file_path']
             },
-            description: 'Files to commit together atomically. Each needs line_edits, edits, or deleted: true.'
+            description: 'Files to stage together. Each needs line_edits, edits, or deleted: true.'
           },
           commit_message: {
             type: 'string',
@@ -953,7 +994,7 @@ function getToolDefinitions(): Anthropic.Tool[] {
     },
     {
       name: 'check_deployment',
-      description: 'Check the Vercel deployment status. Use this after editing files to verify the build succeeded.',
+      description: 'After ALL edits, validate staged TS/JS/CSS syntax, commit all staged files atomically, and check Vercel. Fix reported syntax or build errors and retry.',
       input_schema: {
         type: 'object' as const,
         properties: {},
@@ -1052,20 +1093,70 @@ function getToolDefinitions(): Anthropic.Tool[] {
 
 // ─── Tool Execution ─────────────────────────────────────────────────────────
 
-/**
- * Shared by `edit_file` and `edit_files` (ENG-497): read a file's current
- * content (from the draft branch if applicable; a 404 means "doesn't exist
- * yet, start empty" so new files can be created), then apply either
- * line_edits (preferred) or edits (search/replace fallback) to compute the
- * new full content. Does NOT write anything — callers batch the write
- * themselves (one PUT per file for edit_file, one atomic multi-file PUT for
- * edit_files).
- */
+interface EditWorkspace {
+  pending: Map<string, { file_path: string; content?: string; deleted?: boolean }>;
+  committed: Set<string>;
+  originals: Map<string, string | null>;
+  latestCommitSha?: string;
+  deploymentStatus?: string;
+}
+
+function newEditWorkspace(): EditWorkspace {
+  return { pending: new Map(), committed: new Set(), originals: new Map() };
+}
+
+async function readWorkingFile(
+  basePath: string, branchQuery: Record<string, string>, context: CodingAgentContext,
+  workspace: EditWorkspace, filePath: string,
+): Promise<string> {
+  const staged = workspace.pending.get(normalizeRepoPath(filePath));
+  if (staged?.deleted) throw new Error('API error (404): File is staged for deletion');
+  if (staged) return staged.content!;
+  const data = await mcpFetch({
+    method: 'GET', path: `${basePath}/file-content`,
+    queryParams: { path: filePath, ...branchQuery }, context: { userId: context.userId },
+  });
+  if (typeof data?.content !== 'string') throw new Error(`Invalid file content returned for ${filePath}`);
+  workspace.originals.set(normalizeRepoPath(filePath), data.content);
+  return data.content;
+}
+
+function stageFile(workspace: EditWorkspace, file: { file_path: string; content?: string; deleted?: boolean }): void {
+  const path = normalizeRepoPath(file.file_path);
+  if (workspace.originals.has(path) && workspace.originals.get(path) === (file.deleted ? null : file.content)) {
+    workspace.pending.delete(path);
+  } else {
+    workspace.pending.set(path, { ...file, file_path: path });
+  }
+}
+
+async function commitStagedFiles(context: CodingAgentContext, workspace: EditWorkspace): Promise<void> {
+  if (!workspace.pending.size) return;
+  const files = [...workspace.pending.values()];
+  const errors = files.flatMap(f => f.deleted ? [] : checkCodingAgentSyntax(f.file_path, f.content!));
+  if (errors.length) throw new Error(`Syntax check failed; nothing committed. Fix staged files and retry check_deployment:\n${errors.join('\n')}`);
+  throwIfAborted(context.abortSignal);
+  const result = await mcpFetch({
+    method: 'PUT', path: `/api/landing-pages/v0/generated/${context.pageId}/update-files`,
+    body: { files, commit_message: `Coding agent: update ${files.length} file(s)`,
+      ...(context.draftBranch ? { branch: context.draftBranch } : {}) },
+    context: { userId: context.userId },
+  });
+  if (result?.success !== true) throw new Error('Atomic commit failed; changes remain staged.');
+  workspace.latestCommitSha = typeof result.commit_url === 'string' ? result.commit_url.match(/\/commit\/([a-f0-9]{40})$/i)?.[1] : undefined;
+  for (const f of files) workspace.committed.add(f.file_path);
+  workspace.pending.clear();
+  workspace.originals.clear();
+  workspace.deploymentStatus = undefined;
+}
+
+/** Compute against the staged version, or the draft branch on first read. */
 async function computeFileEdit(
   basePath: string,
   branchQuery: Record<string, string>,
   context: CodingAgentContext,
-  file: { file_path: string; line_edits?: unknown; edits?: unknown }
+  file: { file_path: string; line_edits?: unknown; edits?: unknown },
+  workspace: EditWorkspace
 ): Promise<
   | { ok: true; content: string; appliedCount: number; totalEdits: number; errors: string[] }
   | { ok: false; reason: 'no_edits' }
@@ -1080,16 +1171,12 @@ async function computeFileEdit(
 
   let currentContent = '';
   try {
-    const fileData = await mcpFetch({
-      method: 'GET',
-      path: `${basePath}/file-content`,
-      queryParams: { path: file.file_path, ...branchQuery },
-      context: { userId: context.userId }
-    });
-    currentContent = fileData.content || '';
+    currentContent = await readWorkingFile(basePath, branchQuery, context, workspace, file.file_path);
   } catch (readErr: unknown) {
     if (readErr instanceof Error && /API error \(404\)/i.test(readErr.message)) {
       currentContent = '';
+      const path = normalizeRepoPath(file.file_path);
+      if (!workspace.pending.has(path)) workspace.originals.set(path, null);
     } else {
       throw readErr;
     }
@@ -1123,12 +1210,22 @@ async function computeFileEdit(
 async function executeTool(
   toolName: string,
   args: any,
-  context: CodingAgentContext
+  context: CodingAgentContext,
+  workspace: EditWorkspace = newEditWorkspace()
 ): Promise<string | ToolImageResult> {
   throwIfAborted(context.abortSignal);
   const basePath = `/api/landing-pages/v0/generated/${context.pageId}`;
   const branch = context.draftBranch || "main";
   const branchQuery: Record<string, string> = branch !== "main" ? { branch } : {};
+
+  if (['edit_file', 'edit_files', 'revert_file'].includes(toolName) && workspace.committed.size &&
+      workspace.deploymentStatus !== 'error' && workspace.deploymentStatus !== 'canceled') {
+    return 'Error: This session has already committed its edits. Check deployment; further edits are allowed only to repair a failed build.';
+  }
+
+  if ((toolName === 'edit_file' || toolName === 'revert_file') && typeof args?.file_path !== 'string') {
+    return 'Error: file_path is required.';
+  }
 
   // Safety guard: block writes whose path escapes the repo (absolute or "../"
   // traversal). Edits across route directories within the SAME repo are allowed —
@@ -1145,7 +1242,7 @@ async function executeTool(
   // whole-batch rejection.
   if (toolName === 'edit_files' && Array.isArray(args.files)) {
     for (const f of args.files) {
-      if (f?.file_path && !isSafeRepoPath(f.file_path)) {
+      if (typeof f?.file_path === 'string' && !isSafeRepoPath(f.file_path)) {
         return scopeViolationMessage(f.file_path);
       }
     }
@@ -1159,21 +1256,22 @@ async function executeTool(
         queryParams: branchQuery,
         context: { userId: context.userId }
       });
-      const files = data.files || [];
-      return files.map((f: any) => `${f.path} (${f.size} bytes)`).join('\n') || 'No files found.';
+      if (!Array.isArray(data?.files) || data.files.some((f: any) => !f || typeof f.path !== 'string' || typeof f.size !== 'number')) {
+        throw new Error('Invalid file listing returned by repository');
+      }
+      const files = new Map<string, number>(data.files.map((f: any) => [f.path, f.size]));
+      for (const f of workspace.pending.values()) {
+        if (f.deleted) files.delete(f.file_path);
+        else files.set(f.file_path, Buffer.byteLength(f.content!));
+      }
+      return [...files].map(([path, size]) => `${path} (${size} bytes)`).join('\n') || 'No files found.';
     }
 
     case 'search_in_file': {
       if (!args.file_path || !args.pattern) {
         return 'Error: file_path and pattern are required.';
       }
-      const data = await mcpFetch({
-        method: 'GET',
-        path: `${basePath}/file-content`,
-        queryParams: { path: args.file_path, ...branchQuery },
-        context: { userId: context.userId }
-      });
-      const content = data.content || '';
+      const content = await readWorkingFile(basePath, branchQuery, context, workspace, args.file_path);
       const lines = content.split('\n');
       const pattern = args.pattern.toLowerCase();
       const contextLines = 3;
@@ -1216,13 +1314,7 @@ async function executeTool(
     }
 
     case 'read_file': {
-      const data = await mcpFetch({
-        method: 'GET',
-        path: `${basePath}/file-content`,
-        queryParams: { path: args.file_path, ...branchQuery },
-        context: { userId: context.userId }
-      });
-      const content = data.content || '';
+      const content = await readWorkingFile(basePath, branchQuery, context, workspace, args.file_path);
       const lines = content.split('\n');
 
       // Apply line range if specified
@@ -1248,7 +1340,7 @@ async function executeTool(
         file_path: args.file_path,
         line_edits: args.line_edits,
         edits: args.edits,
-      });
+      }, workspace);
       if (!computed.ok) {
         if (computed.reason === 'no_edits') {
           return 'Error: either line_edits or edits array is required and must not be empty.';
@@ -1257,28 +1349,9 @@ async function executeTool(
       }
       const { content: newContent, appliedCount, totalEdits, errors } = computed;
 
-      // Write back via GitHub API
-      const writeResult = await mcpFetch({
-        method: 'PUT',
-        path: `${basePath}/github-edit`,
-        body: {
-          file_path: args.file_path,
-          content: newContent,
-          commit_message: args.commit_message || `Edit ${args.file_path}`,
-          ...(branch !== "main" ? { branch } : {}),
-        },
-        context: { userId: context.userId }
-      });
-
-      let response = `Applied ${appliedCount}/${totalEdits} edits to ${args.file_path}.`;
-      if (writeResult.is_staging) {
-        response += ` Changes pushed to draft branch ${branch}. A preview deployment is being created.`;
-      } else if (writeResult.deployed_url) {
-        response += ` Changes will auto-deploy to ${writeResult.deployed_url}.`;
-      }
-      if (writeResult.commit_url) {
-        response += ` Commit: ${writeResult.commit_url}`;
-      }
+      const filePath = normalizeRepoPath(args.file_path);
+      stageFile(workspace, { file_path: filePath, content: newContent });
+      let response = `Applied ${appliedCount}/${totalEdits} edits to ${filePath}. Staged in memory; call check_deployment after all edits to validate and commit.`;
       if (errors.length > 0) {
         response += `\nWarnings (${errors.length} edits skipped):\n${errors.join('\n')}`;
       }
@@ -1286,10 +1359,6 @@ async function executeTool(
     }
 
     case 'edit_files': {
-      // ENG-497: commit several files in ONE atomic commit — use this instead
-      // of calling edit_file N times when a single logical fix spans multiple
-      // files (the ENG-443 incident's exact shape: a lander file + a new API
-      // route landing together).
       if (!Array.isArray(args.files) || args.files.length === 0) {
         return 'Error: files must be a non-empty array.';
       }
@@ -1304,7 +1373,7 @@ async function executeTool(
           filesToCommit.push({ file_path: f.file_path, deleted: true });
           continue;
         }
-        const computed = await computeFileEdit(basePath, branchQuery, context, f);
+        const computed = await computeFileEdit(basePath, branchQuery, context, f, workspace);
         if (!computed.ok) {
           if (computed.reason === 'no_edits') {
             return `Error: ${f.file_path}: either line_edits or edits array is required and must not be empty (or deleted: true).`;
@@ -1323,27 +1392,11 @@ async function executeTool(
         filesToCommit.push({ file_path: f.file_path, content: computed.content });
       }
 
-      const writeResult = await mcpFetch({
-        method: 'PUT',
-        path: `${basePath}/update-files`,
-        body: {
-          files: filesToCommit,
-          commit_message: args.commit_message || `Update ${filesToCommit.length} files`,
-          ...(branch !== "main" ? { branch } : {}),
-        },
-        context: { userId: context.userId }
-      });
-
-      let response = `Committed ${filesToCommit.length} file(s) in one atomic commit: ${filesToCommit.map((f) => f.file_path).join(', ')}.`;
-      if (writeResult.is_staging) {
-        response += ` Changes pushed to draft branch ${branch}. A preview deployment is being created.`;
-      } else if (writeResult.deployed_url) {
-        response += ` Changes will auto-deploy to ${writeResult.deployed_url}.`;
+      for (const f of filesToCommit) {
+        const filePath = normalizeRepoPath(f.file_path);
+        stageFile(workspace, { ...f, file_path: filePath });
       }
-      if (writeResult.commit_url) {
-        response += ` Commit: ${writeResult.commit_url}`;
-      }
-      return response;
+      return `Staged ${filesToCommit.length} file(s). Call check_deployment after all edits to validate and commit.`;
     }
 
     case 'list_commits': {
@@ -1379,34 +1432,21 @@ async function executeTool(
       // real) — only an actually-missing key (undefined/null) means "no such
       // file recorded here." Greptile: the previous falsy check treated an
       // empty-but-real file the same as a missing one.
-      if (oldFileData.content === undefined || oldFileData.content === null) {
+      if (oldFileData?.content == null) {
         return `Error: Could not read ${args.file_path} at commit ${args.commit_sha}. The file may not exist at that commit.`;
       }
+      if (typeof oldFileData.content !== 'string') throw new Error(`Invalid file content returned for ${args.file_path}`);
 
-      // Step 2: Write it back via the existing github-edit endpoint
-      const writeResult = await mcpFetch({
-        method: 'PUT',
-        path: `${basePath}/github-edit`,
-        body: {
-          file_path: args.file_path,
-          content: oldFileData.content,
-          commit_message: args.commit_message || `Revert ${args.file_path} to commit ${args.commit_sha.substring(0, 7)}`,
-          ...(branch !== "main" ? { branch } : {}),
-        },
-        context: { userId: context.userId }
-      });
-
-      let response = `Reverted ${args.file_path} to commit ${args.commit_sha.substring(0, 7)}.`;
-      if (writeResult.deployed_url) {
-        response += ` Changes will auto-deploy to ${writeResult.deployed_url}.`;
-      }
-      if (writeResult.commit_url) {
-        response += ` Commit: ${writeResult.commit_url}`;
-      }
-      return response;
+      const filePath = normalizeRepoPath(args.file_path);
+      stageFile(workspace, { file_path: filePath, content: oldFileData.content });
+      return `Staged revert of ${filePath} to ${args.commit_sha}. Call check_deployment to validate and commit.`;
     }
 
     case 'check_deployment': {
+      await commitStagedFiles(context, workspace);
+      if (workspace.committed.size && !workspace.latestCommitSha) {
+        throw new Error('Commit succeeded but its SHA was missing; cannot verify deployment. Do not recommit.');
+      }
       if (branch !== "main") {
         // For draft branches, poll for preview deployment URL.
         // Vercel builds triggered by PR creation take 30-120 seconds to complete,
@@ -1418,9 +1458,11 @@ async function executeTool(
           lastData = await mcpFetch({
             method: 'GET',
             path: `${basePath}/preview-url`,
-            queryParams: { branch },
+            queryParams: { branch, ...(workspace.latestCommitSha ? { commitSha: workspace.latestCommitSha } : {}) },
             context: { userId: context.userId }
           });
+          if (!lastData || typeof lastData.buildStatus !== 'string') throw new Error('Invalid deployment status response');
+          workspace.deploymentStatus = lastData.buildStatus;
           // Return immediately on terminal states
           if (
             lastData.buildStatus === 'success' ||
@@ -1450,6 +1492,9 @@ async function executeTool(
         path: `${basePath}/deployment-status`,
         context: { userId: context.userId }
       });
+      // A page without a Vercel project returns only its lifecycle status.
+      if (!data || typeof (data.buildStatus ?? data.status) !== 'string') throw new Error('Invalid deployment status response');
+      workspace.deploymentStatus = data.buildStatus ?? 'no_deployment';
       return JSON.stringify(data, null, 2);
     }
 
@@ -1622,7 +1667,7 @@ async function callOpenRouter(
   const request = {
     ...params,
     model: upstreamModel,
-    provider: { allow_fallbacks: true, require_parameters: true },
+    provider: { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true },
     plugins: [{ id: 'context-compression' }],
     ...(upstreamModel !== managedFallback ? { fallbacks: [{ model: managedFallback }] } : {}),
     ...(sessionId.length <= 256 ? { session_id: sessionId } : {}),
@@ -1786,6 +1831,7 @@ async function runCodingAgentInternal(
   // Thread the resolved scope through to executeTool's write guard without
   // mutating the caller's context object.
   const scopedContext: CodingAgentContext = { ...context, scope };
+  const workspace = newEditWorkspace();
 
   // Pre-fetch the file listing so the agent knows the repo structure from the first iteration.
   // This prevents it from blindly guessing file paths (e.g. editing index.html instead of app/page.tsx).
@@ -1793,7 +1839,7 @@ async function runCodingAgentInternal(
   // multi-route project lives in one repo and edits may legitimately span routes.
   let fileListingPreamble = '';
   try {
-    const fileList = await executeTool('list_files', {}, scopedContext);
+    const fileList = await executeTool('list_files', {}, scopedContext, workspace);
     fileListingPreamble = `\n\n## Repository file listing (use this to orient yourself — do not call list_files again)\n\`\`\`\n${typeof fileList === 'string' ? fileList : ''}\n\`\`\`\n\n`;
   } catch (e) {
     if (is403Error(e)) throw e; // Authorization failure — propagate immediately
@@ -1811,7 +1857,7 @@ async function runCodingAgentInternal(
   ];
 
   let iteration = 0;
-  const editedFiles = new Set<string>();
+  const editedFiles = workspace.committed;
 
   try {
     while (iteration < maxIterations) {
@@ -1934,11 +1980,20 @@ async function runCodingAgentInternal(
 
       // If no tool use, the LLM is done — return its text
       if (response.stop_reason === 'end_turn' || response.stop_reason !== 'tool_use') {
+        if (workspace.pending.size || (editedFiles.size && workspace.deploymentStatus !== 'success')) {
+          let feedback: string | ToolImageResult;
+          try { feedback = await executeTool('check_deployment', {}, scopedContext, workspace); }
+          catch (error) { if (is403Error(error) || isAbortError(error)) throw error; feedback = String(error); }
+          messages.push({ role: 'user', content: `Finish the staged edits and verify deployment before reporting success. ${feedback}` });
+          continue;
+        }
         const textBlock = response.content.find(b => b.type === 'text');
         return {
           success: true,
           message: textBlock && 'text' in textBlock ? textBlock.text : 'Coding agent completed without a report.',
-          iterations: iteration
+          iterations: iteration,
+          editedFiles: Array.from(editedFiles),
+          latestCommitSha: workspace.latestCommitSha,
         };
       }
 
@@ -1953,13 +2008,15 @@ async function runCodingAgentInternal(
         const fnArgs = block.input as any;
 
         // Check for terminal tool
-        if (fnName === 'report_to_user') {
+        if (fnName === 'report_to_user' && ((fnArgs.status && fnArgs.status !== 'success') ||
+            (!workspace.pending.size && (!editedFiles.size || workspace.deploymentStatus === 'success')))) {
           const status = fnArgs.status || 'success';
           return {
             success: status === 'success',
             message: fnArgs.message || 'Done.',
             iterations: iteration,
             previewUrl: fnArgs.preview_url,
+            latestCommitSha: workspace.latestCommitSha,
             branch: context.draftBranch,
             editedFiles: Array.from(editedFiles),
           };
@@ -1969,17 +2026,9 @@ async function runCodingAgentInternal(
         let toolResult: string | ToolImageResult;
         try {
           throwIfAborted(context.abortSignal);
-          toolResult = await executeTool(fnName, fnArgs, scopedContext);
-          if (fnName === 'edit_file' && fnArgs.file_path && typeof toolResult === 'string' && !/^Failed to apply edits|^Error:/i.test(toolResult)) {
-            editedFiles.add(fnArgs.file_path);
-          }
-          if (fnName === 'edit_files' && Array.isArray(fnArgs.files) && typeof toolResult === 'string' && !/^Error:/i.test(toolResult)) {
-            // ENG-497 / Greptile: batch commits must be tracked too, or a failed
-            // deployment/acceptance check after this can't roll them back.
-            for (const f of fnArgs.files) {
-              if (f?.file_path) editedFiles.add(f.file_path);
-            }
-          }
+          // A premature report gets validation/deployment feedback as a tool result
+          // and another model turn, so it cannot bypass the commit gate.
+          toolResult = await executeTool(fnName === 'report_to_user' ? 'check_deployment' : fnName, fnArgs, scopedContext, workspace);
 
           // Emit progress about tool execution
           if (context.socketEmit) {
@@ -2185,7 +2234,7 @@ export async function runCodingAgent(
       abortController.abort();
       resolve({
         success: false,
-        message: 'Coding agent timed out after 10 minutes. The run was cancelled; check the recorded draft branch for any recoverable partial work.',
+        message: `Coding agent timed out after ${Math.round(AGENT_TIMEOUT_MS / 60_000)} minutes. The run was cancelled; check the recorded draft branch for any recoverable partial work.`,
         iterations: -1,
         runId: run.runId,
         state: 'timed_out',

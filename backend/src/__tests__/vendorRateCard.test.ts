@@ -7,8 +7,9 @@
 
 import {
   getAllocatedRate,
-  computeAllocatedCost,
   VendorRateProvider,
+  VENDOR_RATE_CARD_VERSION,
+  getRecordingUnit,
 } from "../utils/vendorRateCard";
 
 describe("getAllocatedRate", () => {
@@ -83,33 +84,39 @@ describe("getAllocatedRate", () => {
   });
 });
 
-describe("computeAllocatedCost", () => {
-  it("throws loudly for an unpriced unit instead of booking $0 (AC2)", () => {
-    expect(() => computeAllocatedCost("v0", "not-a-real-unit", 1)).toThrow(
-      /no allocated rate/i
-    );
+// computeAllocatedCost was removed by ENG-1929: pricing now happens inside
+// recordVendorUsage from a rateKey, so an unpriced unit can no longer throw into
+// a vendor request. Its AC2 cases (unpriced is loud, never $0; quantity clamps)
+// moved to usageRecorderService.vendorRateKey.test.ts.
+describe("vendor rate card", () => {
+  describe("rate-card version (ENG-1250 §5)", () => {
+    it("is a dated version string", () => {
+      expect(VENDOR_RATE_CARD_VERSION).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    });
+
+    it("matches the last commit that changed a rate in this file", () => {
+      // Pinned deliberately. A rate edit that does not bump this leaves two
+      // different prices sharing one version, and a historical spend event can
+      // no longer be re-derived from the card that produced it.
+      expect(VENDOR_RATE_CARD_VERSION).toBe("2026-09-14");
+    });
   });
 
-  it("throws loudly for an unknown provider", () => {
-    expect(() =>
-      computeAllocatedCost("not-a-vendor" as VendorRateProvider, "generate", 1)
-    ).toThrow(/no allocated rate/i);
-  });
+  describe("getRecordingUnit", () => {
+    it("returns the card's own unit label for a priced entry", () => {
+      expect(getRecordingUnit("elevenlabs", "characters_flash_turbo")).toBe("1k_characters");
+      expect(getRecordingUnit("you.com", "query")).toBe("query");
+    });
 
-  it("computes quantity * rate for a priced unit", () => {
-    const cost = computeAllocatedCost("apollo", "email_reveal", 4);
-    expect(cost).toBeCloseTo(0.198, 6);
-  });
+    it("returns null for an unknown provider or rate key, never a default", () => {
+      expect(getRecordingUnit("v0", "no_such_key")).toBeNull();
+      expect(getRecordingUnit("not_a_vendor" as never, "query")).toBeNull();
+      expect(getRecordingUnit("v0", "")).toBeNull();
+    });
 
-  it("clamps a negative quantity to 0 (never a negative charge)", () => {
-    expect(computeAllocatedCost("v0", "landing_page_generation", -3)).toBe(0);
-  });
-
-  it("returns 0 for a zero quantity", () => {
-    expect(computeAllocatedCost("v0", "landing_page_generation", 0)).toBe(0);
-  });
-
-  it("treats a non-finite quantity as 0", () => {
-    expect(computeAllocatedCost("v0", "landing_page_generation", Number.NaN)).toBe(0);
+    it("does not resolve inherited Object properties as rate keys", () => {
+      expect(getRecordingUnit("v0", "constructor")).toBeNull();
+      expect(getRecordingUnit("v0", "toString")).toBeNull();
+    });
   });
 });
