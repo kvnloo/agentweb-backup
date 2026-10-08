@@ -33,7 +33,24 @@ export function normalizeRequestedLlmModel(raw: unknown): string | undefined {
 }
 
 /**
- * Returns the trimmed id ('' = no pin). Throws ModelUnavailableError when the id is not
+ * Canonical registry id for a stored/requested pin, or undefined when it does not resolve
+ * (retired / not served) or the registry double cannot resolve. Never throws.
+ */
+export function canonicalPinId(registry: ModelPinRegistry, value: unknown): string | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  if (typeof registry.resolveGenerationModel !== 'function') return undefined;
+  try {
+    const r = registry.resolveGenerationModel(value.trim());
+    return r.fellBack ? undefined : r.model;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Returns the id to persist ('' = no pin): the CANONICAL registry id when the registry can
+ * resolve it (so a legacy alias is never stored), otherwise the trimmed requested id (partial
+ * registry doubles). Throws ModelUnavailableError when the id is not
  * a string, not served, or not selectable by this user. `isAdmin` is only invoked when
  * the model is adminOnly (the one gate an admin can clear).
  */
@@ -54,7 +71,7 @@ export async function validateModelPin(
     const adminCanSelect = registry.isModelSelectableBy(resolution.model, true) && await isAdmin();
     if (!adminCanSelect) throw new ModelUnavailableError(requested, 'not_selectable');
   }
-  return requested;
+  return resolution.model || requested;
 }
 
 /**
@@ -115,6 +132,12 @@ export async function validatePlanDefaultModelWrite(
   if (trimmed === '') return { touched: true, value: '' };
   const storedTrimmed = typeof stored === 'string' ? stored.trim() : '';
   if (trimmed === storedTrimmed) return { touched: true, value: storedTrimmed };
+  // Same model as the stored value under its canonical form (stored alias, canonical resent,
+  // or the reverse): unchanged, so no re-validation (a later selectability change must not block it).
+  const storedCanonical = canonicalPinId(registry, storedTrimmed);
+  if (storedCanonical && typeof trimmed === 'string' && (trimmed === storedCanonical || canonicalPinId(registry, trimmed) === storedCanonical)) {
+    return { touched: true, value: trimmed === storedCanonical ? trimmed : storedTrimmed };
+  }
   return { touched: true, value: await validateModelPin(registry, isAdmin, trimmed) };
 }
 

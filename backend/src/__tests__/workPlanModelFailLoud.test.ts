@@ -47,7 +47,7 @@ jest.mock('../services/orgAuthz', () => ({ can: jest.fn(() => true), canEditItem
 const REG = new Set(['gpt-5-chat', 'claude-sonnet-x', 'admin-only-model', 'internal-judge', 'live-voice']);
 const registry = {
   resolveGenerationModel: (m: string) => {
-    const n = m === 'legacy-alias' ? 'claude-sonnet-x' : m;
+    const n = m === 'legacy-alias' ? 'claude-sonnet-x' : m === 'legacy-internal' ? 'internal-judge' : m;
     return REG.has(n) ? { model: n, fellBack: false, requestedModel: m } : { model: 'gpt-5-chat', fellBack: true, requestedModel: m };
   },
   isModelSelectableBy: (m: string, admin: boolean) => {
@@ -424,6 +424,63 @@ describe('plan write routes (create/update)', () => {
     const changedGood = await request(app).put(`${base}/p1`).send({ defaultModel: ' gpt-5-chat ' });
     expect(changedGood.status).toBe(200);
     expect(wps.updateWorkPlan.mock.calls[1][0].defaultModel).toBe('gpt-5-chat');
+  });
+});
+
+describe('canonical id storage (alias in => canonical persisted)', () => {
+  const app = express();
+  app.use(express.json());
+  app.use('/api/admin/work-plans', authenticateToken, isAdmin, adminWorkPlanRoutes);
+  app.use('/api/user-work-plans', authenticateToken, userWorkPlanRoutes);
+  const step = { stepCount: 1, title: 'S', description: 'd' };
+  const stored = (defaultModel?: string) => ({
+    planId: 'p1', title: 'T', steps: [step], visibility: 'private', ownerId: 'user-1', defaultModel,
+    createdAt: 'x', updatedAt: 'x',
+  });
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockIsAdminCaller = true;
+    getUser.mockResolvedValue({ userId: 'user-1', isAdmin: true });
+    wps.createWorkPlan.mockImplementation(async (p: any) => ({ ...p, planId: 'new' }));
+    wps.updateWorkPlan.mockResolvedValue('rev');
+  });
+
+  it.each(['/api/user-work-plans', '/api/admin/work-plans'])('POST %s stores the canonical id for an alias', async (base) => {
+    const res = await request(app).post(base).send({ title: 'T', steps: [step], defaultModel: ' legacy-alias ' });
+    expect(res.status).toBe(201);
+    expect(wps.createWorkPlan.mock.calls[0][0].defaultModel).toBe('claude-sonnet-x');
+  });
+
+  it.each(['/api/user-work-plans', '/api/admin/work-plans'])('PUT %s stores the canonical id for an alias', async (base) => {
+    wps.getWorkPlan.mockResolvedValue(stored('gpt-5-chat') as any);
+    const res = await request(app).put(`${base}/p1`).send({ defaultModel: 'legacy-alias' });
+    expect(res.status).toBe(200);
+    expect(wps.updateWorkPlan.mock.calls[0][0].defaultModel).toBe('claude-sonnet-x');
+  });
+
+  it.each(['/api/user-work-plans', '/api/admin/work-plans'])('PUT %s: an alias that resolves to a non-selectable model is still 422', async (base) => {
+    wps.getWorkPlan.mockResolvedValue(stored('gpt-5-chat') as any);
+    const res = await request(app).put(`${base}/p1`).send({ defaultModel: 'legacy-internal' });
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({ code: 'model_unavailable', reason: 'not_selectable', requestedModel: 'legacy-internal' });
+    expect(wps.updateWorkPlan).not.toHaveBeenCalled();
+  });
+
+  it.each(['/api/user-work-plans', '/api/admin/work-plans'])('PUT %s: an unchanged stored alias resent is tolerated and not rewritten', async (base) => {
+    wps.getWorkPlan.mockResolvedValue(stored('legacy-alias') as any);
+    const res = await request(app).put(`${base}/p1`).send({ title: 'R', defaultModel: ' legacy-alias ' });
+    expect(res.status).toBe(200);
+    expect(wps.updateWorkPlan.mock.calls[0][0].defaultModel).toBe('legacy-alias');
+    // the canonical form of the stored alias is also "unchanged"
+    const res2 = await request(app).put(`${base}/p1`).send({ defaultModel: 'claude-sonnet-x' });
+    expect(res2.status).toBe(200);
+    expect(wps.updateWorkPlan.mock.calls[1][0].defaultModel).toBe('claude-sonnet-x');
+  });
+
+  it('validatePlanDefaultModelWrite: canonical for alias; requested value for a registry without resolveGenerationModel', async () => {
+    const notAdmin = async () => false;
+    expect(await validatePlanDefaultModelWrite(registry, notAdmin, 'legacy-alias')).toEqual({ touched: true, value: 'claude-sonnet-x' });
+    expect(await validatePlanDefaultModelWrite({}, notAdmin, ' legacy-alias ')).toEqual({ touched: true, value: 'legacy-alias' });
   });
 });
 

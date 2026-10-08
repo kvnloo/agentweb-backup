@@ -80,7 +80,7 @@ import {
   IDEM_TTL_INTERACTIVE_S,
 } from '../services/agentMode/runStore';
 import { assertSequentialStepCounts } from '../services/workPlanSteps';
-import { validateModelPin, normalizeRequestedLlmModel, resolvePlanLaunchModel } from '../services/agentMode/modelPin';
+import { validateModelPin, normalizeRequestedLlmModel, resolvePlanLaunchModel, canonicalPinId } from '../services/agentMode/modelPin';
 import { ModelUnavailableError, MODEL_SAVE_FAILED_MESSAGE, buildAnonymousModelUnavailableBody, buildModelUnavailableBody, isModelUnavailableError, sanitizeModelLabel } from '../services/agentMode/modelUnavailable';
 import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
 // ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
@@ -509,7 +509,7 @@ function modelUnavailableBody(err: ModelUnavailableError) {
  * bad pin is refused with the portal's existing `model_unavailable` 422 instead of
  * surviving until it fails the run.
  *
- * Returns the trimmed id to store ('' = no pin). Throws ModelUnavailableError when the
+ * Returns the CANONICAL registry id to store (the trimmed id for partial doubles; '' = no pin). Throws ModelUnavailableError when the
  * id is not a string, not served (registry key or honoured alias), or not selectable by
  * this user (internalOnly, live-voice, adminOnly for a non-admin). Does not change the
  * run-time resolver. Partial service doubles (older unit tests) skip the registry checks,
@@ -13077,7 +13077,8 @@ export const agentModeController = {
       const llmModelProvided = llmModel !== undefined && llmModel !== null;
       const incomingLlmModel: unknown = typeof llmModel === 'string' ? llmModel.trim() : llmModel;
       const llmModelClearing = llmModelProvided && incomingLlmModel === '';
-      const llmModelChanging = llmModelProvided && !llmModelClearing && incomingLlmModel !== storedLlmModel;
+      const llmModelChanging = llmModelProvided && !llmModelClearing && incomingLlmModel !== storedLlmModel
+        && !(storedLlmModel && incomingLlmModel === canonicalPinId(agentModeService, storedLlmModel));
       const validatedLlmModel = llmModelChanging ? await validateScheduleModelPin(user.userId, incomingLlmModel) : undefined;
 
       const existingBackupFields = {
