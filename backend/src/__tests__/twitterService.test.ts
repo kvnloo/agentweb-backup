@@ -1210,10 +1210,45 @@ describe('TwitterService — pre-write scope guard', () => {
 // ─── getLikedTweets (ENG-979) ─────────────────────────────────────────────────
 
 describe('TwitterService.getLikedTweets', () => {
+  it('follows liked timeline next tokens up to the requested result bound', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockUserLikedTweets.mockReset();
+    mockUserLikedTweets
+      .mockResolvedValueOnce({ data: { data: [{ id: 'page1' }], meta: { next_token: 'cursor2' } } })
+      .mockResolvedValueOnce({ data: { data: [{ id: 'page2' }] } });
+    expect(await twitterService.getLikedTweets(OWNER, ACCOUNT_ID)).toEqual([{ id: 'page1' }, { id: 'page2' }]);
+    expect(mockUserLikedTweets).toHaveBeenNthCalledWith(2, '12345', expect.objectContaining({ pagination_token: 'cursor2' }));
+  });
+
   beforeEach(() => {
     mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
     mockUserLikedTweets.mockReset();
     mockUserLikedTweets.mockResolvedValue({ data: { data: [{ id: 'lk1', text: 'liked', author_id: 'a1' }] } });
+  });
+
+  it('stops when X repeats a pagination token', async () => {
+    mockUserLikedTweets.mockResolvedValue({ data: { data: [{ id: 'repeat' }], meta: { next_token: 'same' } } });
+    expect(await twitterService.getLikedTweets(OWNER, ACCOUNT_ID)).toHaveLength(2);
+    expect(mockUserLikedTweets).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds results and stops fetching after reaching the requested count', async () => {
+    const rows = Array.from({ length: 10 }, (_, i) => ({ id: String(i) }));
+    mockUserLikedTweets.mockResolvedValue({ data: { data: rows, meta: { next_token: 'unused' } } });
+    expect(await twitterService.getLikedTweets(OWNER, ACCOUNT_ID)).toEqual(rows);
+    expect(mockUserLikedTweets).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a disconnected account before calling X', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([]);
+    await expect(twitterService.getLikedTweets(OWNER, ACCOUNT_ID)).rejects.toThrow();
+    expect(mockUserLikedTweets).not.toHaveBeenCalled();
+  });
+
+  it('refuses missing like.read before calling X', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount({ scopes: ['tweet.read'] })]);
+    await expect(twitterService.getLikedTweets(OWNER, ACCOUNT_ID)).rejects.toThrow(/like.read/);
+    expect(mockUserLikedTweets).not.toHaveBeenCalled();
   });
 
   it('defaults to the connected account own user id (no handle lookup)', async () => {

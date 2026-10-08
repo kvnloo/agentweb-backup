@@ -723,6 +723,40 @@ describe('executePreparedTools', () => {
     expect((ports as any).__execOrder).toEqual([]);
   });
 
+  it('preflight-blocks org notification settings writes in a shared (share-link) session', async () => {
+    const ports = makePorts();
+    const input = makeInput(
+      [toolCall('a', 'update_lead_notification_settings', '{"leadTypes":[]}')],
+      ports,
+      { hasAdminAccess: false, isInteractiveShare: true },
+    );
+    await executePreparedTools(input);
+
+    expect(input.toolCallsLedger[0].error).toContain('not available in shared sessions');
+    expect((ports as any).__execOrder).toEqual([]);
+  });
+
+  it.each([
+    ['get_lead_notification_settings', '{}'],
+    ['save_org_memory', '{"content":"Remember for the whole org: x"}'],
+    ['delete_org_memory', '{"memoryId":"m1"}'],
+    ['save_memory', '{"content":"x"}'],
+    ['delete_memory', '{"memoryId":"m1"}'],
+  ])('preflight-blocks owner-scoped %s in a shared (share-link) session', async (name, args) => {
+    const ports = makePorts();
+    const input = makeInput([toolCall('a', name, args)], ports, { hasAdminAccess: true, isInteractiveShare: true });
+    await executePreparedTools(input);
+    expect(input.toolCallsLedger[0].error).toContain('not available in shared sessions');
+    expect((ports as any).__execOrder).toEqual([]);
+  });
+
+  it('still allows save_org_memory in the owner\'s own session', async () => {
+    const ports = makePorts();
+    const input = makeInput([toolCall('a', 'save_org_memory', '{"content":"x"}')], ports, { hasAdminAccess: true, isInteractiveShare: false });
+    await executePreparedTools(input);
+    expect(input.toolCallsLedger[0].error).toBeUndefined();
+  });
+
   it('records a JSON-parse failure as a preflight error', async () => {
     const ports = makePorts();
     const input = makeInput([toolCall('a', 'read_brand_guidelines', '{not json}')], ports);

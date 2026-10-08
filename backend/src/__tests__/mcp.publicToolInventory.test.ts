@@ -123,6 +123,14 @@ jest.mock('../services/db', () => ({
 import * as fs from 'fs';
 import * as path from 'path';
 import { createMcpServer, mcpToolRegistry } from '../mcp/server/mcpServerCore';
+import {
+  BANNED_DESCRIPTION_PHRASES,
+  BANNED_SCHEMA_FIELD,
+  CATCH_ALL_FIELD,
+  MCP_TOOL_SIDE_EFFECTS,
+  UnclassifiedMcpToolError,
+  classifyMcpTool,
+} from '../mcp/server/toolAnnotationPolicy';
 
 const SNAPSHOT = path.join(__dirname, '__fixtures__', 'mcp-public-tool-inventory.json');
 
@@ -198,5 +206,91 @@ describe('public MCP tool inventory (ENG-2333)', () => {
     expect(fs.existsSync(SNAPSHOT)).toBe(true);
     const golden = JSON.parse(fs.readFileSync(SNAPSHOT, 'utf8'));
     expect(JSON.parse(JSON.stringify(inventory))).toEqual(golden);
+  });
+});
+
+// ─── ENG-2334 (ENG-336.2): annotation policy + publication CI gate ─────────
+
+function* schemaProps(schema: any): Generator<[string, any]> {
+  if (!schema || typeof schema !== 'object') return;
+  for (const [k, v] of Object.entries<any>(schema.properties ?? {})) {
+    yield [k, v];
+    yield* schemaProps(v);
+  }
+  if (schema.items && typeof schema.items === 'object') yield* schemaProps(schema.items);
+}
+
+describe('MCP tool annotation policy gate (ENG-2334)', () => {
+  let inventory: InventoryEntry[];
+  let annotated: Map<string, any>;
+  beforeAll(async () => {
+    inventory = await buildPublicToolInventory();
+    annotated = new Map(mcpToolRegistry.getToolDefinitions().map((d: any) => [d.name, d]));
+  });
+
+  it('every public tool is explicitly classified (unclassified fails closed)', () => {
+    const missing = inventory.map((e) => e.name).filter((n) => !(n in MCP_TOOL_SIDE_EFFECTS));
+    expect(missing).toEqual([]);
+  });
+
+  it('classifyMcpTool throws for an unclassified tool instead of defaulting', () => {
+    expect(() => classifyMcpTool('definitely_not_a_tool')).toThrow(UnclassifiedMcpToolError);
+    expect(() => classifyMcpTool('toString')).toThrow(UnclassifiedMcpToolError);
+    expect(classifyMcpTool('emma_search_tools')).toBe('read');
+  });
+
+  it('every public tool emits all three annotation hints matching its policy class', () => {
+    for (const e of inventory) {
+      const a = annotated.get(e.name)?.annotations;
+      expect({ name: e.name, a: a && typeof a.readOnlyHint }).toEqual({ name: e.name, a: 'boolean' });
+      expect(typeof a.destructiveHint).toBe('boolean');
+      expect(typeof a.openWorldHint).toBe('boolean');
+      const isRead = classifyMcpTool(e.name) === 'read';
+      expect({ name: e.name, readOnlyHint: a.readOnlyHint }).toEqual({ name: e.name, readOnlyHint: isRead });
+    }
+  });
+
+  it('get_chat_history is not read-only (sync=true persists satisfaction scores)', () => {
+    expect(classifyMcpTool('get_chat_history')).toBe('write');
+    expect(annotated.get('get_chat_history')?.annotations?.readOnlyHint).toBe(false);
+  });
+
+  it('mutating tools are never read-only', () => {
+    const mutating = /(^|_)(post|publish|send|email|create|update|delete|manage|deploy|duplicate|edit|freeze|enable|configure|set|share|revert|launch|execute|submit|schedule|generate|iterate|file|answer)(_|$)/;
+    const bad = inventory.filter((e) => mutating.test(e.name) && classifyMcpTool(e.name) === 'read');
+    expect(bad.map((e) => e.name)).toEqual([]);
+  });
+
+  it('no public schema carries banned fields (transcripts, raw location, catch-all context objects)', () => {
+    const hits: string[] = [];
+    for (const e of inventory) {
+      for (const [k, v] of schemaProps(e.inputSchema)) {
+        if (BANNED_SCHEMA_FIELD.test(k)) hits.push(`${e.name}.${k}`);
+        if (
+          CATCH_ALL_FIELD.test(k) &&
+          v?.type === 'object' &&
+          !v.properties &&
+          v.additionalProperties !== false
+        ) {
+          hits.push(`${e.name}.${k} (catch-all)`);
+        }
+      }
+    }
+    expect(hits).toEqual([]);
+  });
+
+  it('the banned-field gate actually catches a planted violation', () => {
+    const planted = { properties: { opts: { type: 'object', properties: { full_transcript: { type: 'string' } } } } };
+    expect([...schemaProps(planted)].some(([k]) => BANNED_SCHEMA_FIELD.test(k))).toBe(true);
+    expect(CATCH_ALL_FIELD.test('context')).toBe(true);
+  });
+
+  it('no public description contains a banned phrase', () => {
+    const hits: string[] = [];
+    for (const e of inventory) {
+      const d = e.description.toLowerCase();
+      for (const ph of BANNED_DESCRIPTION_PHRASES) if (d.includes(ph)) hits.push(`${e.name}: ${ph}`);
+    }
+    expect(hits).toEqual([]);
   });
 });

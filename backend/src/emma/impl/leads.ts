@@ -356,6 +356,7 @@ export async function addLeadsToList(
 
       const { leadImportWriteBudgetMs } = await import('../../utils/leadImportLedger');
       const result = await crmDb.batchCreateLeads(listId, formattedLeads, {
+        origin: 'enrichment_import',
         // A file the user may re-send after a truncated run: dedupe the rows
         // that carry no identity of their own, or every retry duplicates them.
         dedupeByNameCompany: true,
@@ -3021,7 +3022,7 @@ export async function importLeadsFromSearch(
     return { success: false, error: 'At least one search filter is required: keywords, search_url, cursor, or a structured filter (title, company, location, industry, school)' };
   }
 
-  const { linkedInOutreachService } = await import('../../services/linkedInOutreachService');
+  const { linkedInOutreachService, isProvenDisconnectError } = await import('../../services/linkedInOutreachService');
 
   // Access check (ENG-1049): this function creates leads (batchCreateLeads
   // below), and is called directly by the import_leads_from_search Emma tool
@@ -3045,8 +3046,11 @@ export async function importLeadsFromSearch(
     return { success: false, error: 'Failed to verify list access' };
   }
 
-  // Resolve account: user's own or platform-wide fallback
-  const accountId = await linkedInOutreachService.resolveAccountId(userId);
+  // Resolve account: user's own or platform-wide fallback. Keep usedSharedAccount
+  // (not the flag-discarding resolveAccountId wrapper) — the reactive handler
+  // below needs it to know whether accountId is this user's own account or the
+  // ownerless site-wide pool (see the ownerUserId comment there).
+  const { accountId, usedSharedAccount } = await linkedInOutreachService.resolveAccountIdWithSource(userId);
   if (!accountId) {
     return {
       success: false,
@@ -3143,6 +3147,32 @@ export async function importLeadsFromSearch(
       });
     } catch (e: any) {
       searchError = e?.message ? String(e.message) : String(e);
+      // ENG-2205: resolveAccountId can now hand back an account whose probe was
+      // merely indeterminate (not proven dead — see linkedInOutreachService's
+      // probeAccountSession), so a real failure here is the backstop that proves
+      // it either way. On a proven-dead session, correct the probe cache and
+      // record the health event — otherwise this account stays cached as
+      // 'unknown' for the full 10-minute window and gets handed to the next
+      // caller (same user's retry, or another user sharing the site-wide pool)
+      // instead of the pool correctly skipping it. Mirrors the identical reactive
+      // handler in emma/impl/linkedin.ts. Uses the shared isProvenDisconnectError
+      // predicate (not a hand-rolled AUTH_ERROR check) specifically because it
+      // excludes a bare 403 — a permission/plan restriction, not a dead session.
+      if (isProvenDisconnectError(e)) {
+        linkedInOutreachService.clearStatusCache(accountId);
+        const { recordUnipileAccountHealth } = await import('../../services/linkedInConnectionHealth');
+        // ownerUserId must be omitted for the site-wide pool: recordUnipileAccountHealth
+        // resolves an attributed owner only via getAccountsByUserId(ownerUserId) /
+        // getAccountsByUserIdIncludingOrgShared(ownerUserId) — neither of which can ever
+        // find the global fallback pool account under an unrelated customer's userId. A
+        // truthy-but-wrong ownerUserId silently no-ops instead of reaching the dedicated
+        // ownerless/oncall branch that exists specifically for this account class.
+        await recordUnipileAccountHealth({
+          accountId,
+          ownerUserId: usedSharedAccount ? undefined : userId,
+          state: 'disconnected',
+        });
+      }
       break;
     }
 
@@ -3328,7 +3358,7 @@ export async function importLeadsFromSearch(
       continue;
     }
 
-    const result = await crmDb.batchCreateLeads(listId, importable);
+    const result = await crmDb.batchCreateLeads(listId, importable, { origin: 'linkedin' });
     cumulativeNew += result.newCount ?? 0;
     cumulativeMerged += result.mergedCount ?? 0;
     if (Array.isArray(result.errors) && result.errors.length) allErrors.push(...result.errors);

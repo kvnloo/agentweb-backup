@@ -207,7 +207,7 @@ describe('POST /lists/:listId/leads/bulk-import', () => {
 
     await handler!(mockReq, mockRes);
 
-    expect(crmDb.batchCreateLeads).toHaveBeenCalledWith('list-123', validLeads);
+    expect(crmDb.batchCreateLeads).toHaveBeenCalledWith('list-123', validLeads, { origin: 'enrichment_import' });
     expect(mockRes.status).toHaveBeenCalledWith(201);
     expect(mockRes.json).toHaveBeenCalledWith(
       expect.objectContaining({ imported: 2, skipped: 0, errors: [] })

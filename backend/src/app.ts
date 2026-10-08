@@ -115,6 +115,7 @@ import leadVolumeMonitorRoutes from "./routes/leadVolumeMonitor";
 import l2DiagnoseRoutes from "./routes/l2Diagnose";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import orgRoutes from "./routes/org";
+import sourceAccessRoutes from "./routes/sourceAccess";
 import orgMemoryRoutes from "./routes/orgMemory";
 import orgModelRolesRoutes from './routes/orgModelRoles';
 import orgShareSettingsRoutes from "./routes/orgShareSettings";
@@ -457,6 +458,9 @@ app.use("/api/crm/webhooks/apollo", apolloWebhookRoutes);
 app.use("/api/crm/sequences", sequenceRoutes);
 app.use("/api/crm/companies", crmCompaniesRoutes);
 app.use("/api/crm", crmRoutes);
+// ENG-1100 — caller-scoped, Super Premium-gated recap read paths (ENG-711 consumer).
+import recapRoutes from "./routes/recap";
+app.use("/api/recap", recapRoutes);
 // ENG-918 — per-account ads-detection thresholds. Every route authenticates and re-derives
 // ad-account ownership from the caller's own connected accounts; see the route file's header.
 app.use("/api/ads-thresholds", adsThresholdsRoutes);
@@ -577,6 +581,7 @@ app.use("/batch-review", batchReviewPublicRouter);
 app.use("/api/image-reports", imageReportsRoutes);
 app.use("/api/lead-magnet", leadMagnetRoutes);
 app.use("/api/org", orgRoutes);
+app.use("/api/source-access", sourceAccessRoutes);
 app.use("/api/org", orgMemoryRoutes);
 app.use("/api/orgs/me/model-roles", authenticateToken, orgModelRolesRoutes);
 app.use("/api/orgs/me/share-settings", authenticateToken, orgShareSettingsRoutes);

@@ -96,7 +96,8 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     }
   }
 
-  async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult> {
+  async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string, assertStillAuthorized?: AssertStillAuthorized, options?: { draft?: boolean }): Promise<PostResult> {
+    const draft = options?.draft === true;
     const config = account.config as LinkedInConfig;
     const authorUrn = account.account_id; // Expecting strict URN format stored in DB
 
@@ -140,8 +141,20 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       // moment for that shape. linkedInService re-runs it at the request itself.
       const postUrn = await linkedInService.createPost(
         token, authorUrn, content, imageUrns.length > 0 ? imageUrns : undefined,
-        assertStillAuthorized
+        assertStillAuthorized,
+        ...(draft ? [{ draft: true }] : [])
       );
+
+      // ENG-428: a draft is not a published post — do not cache it as one (the
+      // posts cache is served back as lifecycleState PUBLISHED) and do not claim a
+      // public feed URL for it.
+      if (draft) {
+        return {
+          success: true,
+          message: 'Saved as a draft on LinkedIn (not published). Review and publish it from LinkedIn.',
+          postId: postUrn,
+        } as PostResult;
+      }
 
       // Store post in database for both personal and company page accounts
       if (userId && (config.account_type === 'personal' || config.account_type === 'company_page')) {

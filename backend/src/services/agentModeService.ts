@@ -2021,11 +2021,34 @@ export class AgentModeService {
     return null;
   }
 
+  /** Bad configured-default values already warned about (once per process each). */
+  private warnedUnusableDefaults = new Set<string>();
+
+  /** Selectable by a non-admin through the picker: served, not internalOnly/adminOnly/live. */
+  private isPubliclySelectable(modelId: string): boolean {
+    const config = this.llmModels[modelId];
+    return Boolean(config) && !config.internalOnly && !config.adminOnly && !config.isLive;
+  }
+
   async getDefaultModel(): Promise<string> {
-    return (
-      (await this.resolveConfiguredModel(this.defaultModelSettingName, 'default')) ??
-      this.default_model
-    );
+    const configured = await this.resolveConfiguredModel(this.defaultModelSettingName, 'default');
+    if (!configured) return this.default_model;
+    // The default stands in for every user, so it must be one the picker offers a
+    // non-admin (the same rules getSupportedModels(false) applies). Otherwise the
+    // usage policy rejects it ("system default model is not supported") and a turn
+    // with no stored/request model fails. Fall back to the code constant -- but only
+    // when that constant is itself usable; otherwise keep the existing behaviour.
+    if (!this.isPubliclySelectable(configured) && this.isPubliclySelectable(this.default_model)) {
+      if (!this.warnedUnusableDefaults.has(configured)) {
+        this.warnedUnusableDefaults.add(configured);
+        console.warn(
+          `AgentMode: ${this.defaultModelSettingName} "${configured}" is internal-only, admin-only, or a live-voice model ` +
+            `and cannot serve users; using "${this.default_model}" instead. Fix the AW-Settings row.`
+        );
+      }
+      return this.default_model;
+    }
+    return configured;
   }
 
   async getReportsModel(): Promise<string> {
@@ -2355,17 +2378,49 @@ export class AgentModeService {
   }
 
   /**
-   * Would the model picker accept this id for this user? Mirrors the two gates
-   * `agentModeController.updateSessionLlmModel` applies, in the same order: the
-   * supported-model allow-list, then the non-admin Opus restriction. Kept next
-   * to the registry it reads so the two cannot drift.
+   * Registry display name for a model id, or undefined when the id is not a
+   * registry key (own-property check, so 'constructor' etc. don't match).
+   * Used only to word the fail-loud model_unavailable message.
+   */
+  getModelDisplayName(modelId: string): string | undefined {
+    if (!modelId || !Object.prototype.hasOwnProperty.call(this.llmModels, modelId)) return undefined;
+    return this.llmModels[modelId].name;
+  }
+
+  /** True for a live-voice registry model (never valid for a text chat). Own-property check. */
+  isLiveModel(modelId: string): boolean {
+    return Boolean(modelId && Object.prototype.hasOwnProperty.call(this.llmModels, modelId) && this.llmModels[modelId].isLive);
+  }
+
+  /**
+   * Would the model picker accept this id for this user? The single source of
+   * truth for "can this user pick this model" — internal/live exclusion and the
+   * adminOnly gate. `updateSessionLlmModel`
+   * / `updateSharedSessionLlmModel` call this directly (ENG-2293: they used to
+   * re-derive a subset inline — just the opus check — which let a non-admin
+   * who named an adminOnly auto-added model by id bypass it) so the two cannot
+   * drift again.
    */
   isModelSelectableBy(modelId: string, isAdmin: boolean): boolean {
     const config = this.llmModels[modelId];
     if (!config || config.internalOnly || config.isLive) return false;
     if (config.adminOnly && !isAdmin) return false;
-    if (modelId.includes('opus') && !isAdmin) return false;
     return true;
+  }
+
+  /**
+   * ENG-55: registry facts the model-compare feature needs (display name, lab, live
+   * flag) without exposing the registry. Null for ids that are not registry keys.
+   */
+  getModelCompareInfo(modelId: string): { name: string; provider: string; isLive: boolean; internalOnly: boolean } | null {
+    if (!Object.prototype.hasOwnProperty.call(this.llmModels, modelId)) return null;
+    const config = this.llmModels[modelId];
+    return {
+      name: config.name ?? modelId,
+      provider: config.provider ?? 'other',
+      isLive: config.isLive === true,
+      internalOnly: config.internalOnly === true,
+    };
   }
 
   /**
@@ -2437,7 +2492,7 @@ export class AgentModeService {
   }
 
   async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
-    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || (!this.llmModels[m].adminOnly && !m.includes('opus'))));
+    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || !this.llmModels[m].adminOnly));
   }
   /**
    * Make an LLM call with the specified model and parameters
@@ -6397,6 +6452,10 @@ export class AgentModeService {
     // Org Memory (shared facts for all org members)
     'save_org_memory',
     'delete_org_memory',
+
+    // Org notification preferences use the same org-settings authorization.
+    'get_lead_notification_settings',
+    'update_lead_notification_settings',
 
     // Scheduled Chat Management
     'list_scheduled_chats',
@@ -12488,7 +12547,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const withBudget = (r: any) => {
         if (!budgetFields) return r;
         const { budget_message, error, ...rest } = budgetFields;
-        const out: any = { ...r, ...rest, message: `${r.message} — ${budget_message}` };
+        const out: any = {
+          ...r, ...rest,
+          success: r.success && rest.budget_verification === 'CONFIRMED',
+          message: rest.budget_verification === 'CONFIRMED' ? `${r.message} — ${budget_message}` : budget_message,
+        };
         if (error && !r.error) out.error = error;
         else if (error) out.budget_error = error;
         return out;
@@ -12586,8 +12649,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         (v: number) => normalizeMetaMoney(v, money.currency, 'minor').description
       );
       return {
-        success: true,
-        message: `Ad set updated successfully${money.confirmation} — ${budget_message}`,
+        success: verdict.budget_verification === 'CONFIRMED',
+        message: verdict.budget_verification === 'CONFIRMED'
+          ? `Ad set updated successfully${money.confirmation} — ${budget_message}` : budget_message,
         ...verdict,
       };
     } catch (error: any) {
@@ -17370,8 +17434,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // delegating wrapper — real callers beyond tools.ts: routes/emmaApi.ts's
   // POST /social-post handler, and many direct real-instance calls in
   // agentModeService.socialTools.test.ts.
-  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any): Promise<any> {
-    return linkedinImpl.postOnConnectedAccount(userId, accountId, content, mediaUrls, platform, toolContext);
+  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean; inReplyToPostId?: string }): Promise<any> {
+    return linkedinImpl.postOnConnectedAccount(userId, accountId, content, mediaUrls, platform, toolContext, options);
   }
 
   /**

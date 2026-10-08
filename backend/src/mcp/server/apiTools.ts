@@ -1958,7 +1958,8 @@ mcpToolRegistry.register({
       properties: {
         account_id: { type: 'string', description: 'Connected account ID' },
         content: { type: 'string', description: 'Post content' },
-        media_urls: { type: 'array', items: { type: 'string' }, description: 'Optional media URLs' }
+        media_urls: { type: 'array', items: { type: 'string' }, description: 'Optional media URLs' },
+        in_reply_to_post_id: { type: 'string', description: 'X (Twitter) only. ID of an existing post to reply to. Omit for a new post.' }
       },
       required: ['account_id', 'content']
     }
@@ -1969,7 +1970,7 @@ mcpToolRegistry.register({
     if (withdrawn) return jsonResult({ success: false, message: withdrawn.error });
     const data = await mcpFetch({
       method: 'POST', path: '/api/emma/post-on-account', context: ctx(context),
-      body: { account_id: args.account_id, content: args.content, media_urls: args.media_urls || [] }
+      body: { account_id: args.account_id, content: args.content, media_urls: args.media_urls || [], ...(args.in_reply_to_post_id ? { in_reply_to_post_id: args.in_reply_to_post_id } : {}) }
     });
     return jsonResult(data);
   }
