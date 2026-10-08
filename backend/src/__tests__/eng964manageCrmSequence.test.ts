@@ -78,7 +78,15 @@ function installFetch() {
     if (opts.method === "GET" && opts.path === "/api/crm/sequences/seq-1") return { sequence: storedSequence };
     if (opts.method === "PUT" && opts.path === "/api/crm/sequences/seq-1") {
       putCalls.push(opts.body);
-      storedSequence = { ...storedSequence, ...opts.body };
+      // Mirror the route's atomic guards (dripSequenceDb.updateSequence ConditionExpression).
+      const { expectedUpdatedAt, requireStatusNot, ...fields } = opts.body;
+      if (expectedUpdatedAt !== undefined && expectedUpdatedAt !== storedSequence.updatedAt) {
+        throw new Error("API error (409): Sequence seq-1 changed since it was read");
+      }
+      if (requireStatusNot !== undefined && storedSequence.status === requireStatusNot) {
+        throw new Error("API error (409): Sequence seq-1 changed since it was read");
+      }
+      storedSequence = { ...storedSequence, ...fields };
       return { sequence: storedSequence };
     }
     if (opts.method === "POST" && opts.path === "/api/crm/sequences") {
@@ -277,8 +285,34 @@ describe("manage_crm_sequence (ENG-964)", () => {
     mockGetMessages.mockResolvedValue(historyFor(p.questionDeckPayload[0].kind, { verdict: "activate", answeredBy: "user" }));
     const result = await activate({ preview_token: p.preview_token });
     expect(result.success).toBe(true);
-    expect(putCalls).toEqual([{ status: "active" }]);
+    expect(putCalls).toEqual([{ status: "active", expectedUpdatedAt: "2026-10-01T00:00:00Z", requireStatusNot: "active" }]);
     expect(mockGetMessages).toHaveBeenCalledWith(SESSION_ID);
+  });
+
+  it("AC6 — a concurrent edit between approval read and write refuses activation atomically", async () => {
+    const p = await preview();
+    mockGetMessages.mockImplementation(async () => {
+      // Another writer edits the steps after activate() has read the sequence.
+      storedSequence = { ...storedSequence, updatedAt: "2026-10-02T00:00:00Z", steps: [] };
+      return historyFor(p.questionDeckPayload[0].kind, { verdict: "activate", answeredBy: "user" });
+    });
+    const result = await activate({ preview_token: p.preview_token });
+    expect(result.success).toBe(false);
+    expect(result.code).toBe("stale_preview");
+    expect(storedSequence.status).toBe("draft");
+  });
+
+  it("update refuses atomically when the sequence went active after the status check", async () => {
+    mockFetch.mockImplementationOnce(async () => ({ sequence: storedSequence }));
+    mockFetch.mockImplementationOnce(async () => {
+      storedSequence = { ...storedSequence, status: "active" };
+      throw new Error("API error (409): Sequence seq-1 changed since it was read");
+    });
+    const result = parse(
+      await mcpToolRegistry.execute("manage_crm_sequence", { action: "update", sequence_id: "seq-1", name: "New" }, attendedCtx),
+    );
+    expect(result.success).toBe(false);
+    expect(result.code).toBe("active_sequence");
   });
 
   it("AC6 — a mismatched preview_token argument is refused even when the stored state is approved", async () => {
@@ -323,7 +357,7 @@ describe("manage_crm_sequence (ENG-964)", () => {
         attendedCtx,
       );
       expect(wroteActive()).toBe(false);
-      expect(putCalls.at(-1)).toEqual({ autoEnrollListIds: ["list-2"] });
+      expect(putCalls.at(-1)).toEqual({ autoEnrollListIds: ["list-2"], requireStatusNot: "active" });
 
       storedSequence = baseSequence({ status: "active" });
       putCalls = [];

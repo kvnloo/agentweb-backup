@@ -1255,6 +1255,7 @@ Use list_crm_sequences to find sequence ids.`,
     const action = args?.action;
     const sequenceId = typeof args?.sequence_id === 'string' ? args.sequence_id.trim() : '';
     const refuse = (code: string, error: string) => ({ success: false, blocked: true, code, error });
+    const isSequenceConflict = (err: any) => /API error \(409\)/.test(String(err?.message ?? ''));
     const path = `/api/crm/sequences/${encodeURIComponent(sequenceId)}`;
     const loadSequence = async () => {
       const data = await mcpFetch({ method: 'GET', path, context: ctx(context) });
@@ -1320,7 +1321,15 @@ Use list_crm_sequences to find sequence ids.`,
           if (steps.steps) body.steps = steps.steps;
           if (audience.ids) body.autoEnrollListIds = audience.ids;
           if (Object.keys(body).length === 0) return { success: false, error: 'Nothing to update' };
-          const data = await mcpFetch({ method: 'PUT', path, context: ctx(context), body });
+          // Atomic: the route refuses (409) if the sequence went active after the check above.
+          body.requireStatusNot = 'active';
+          let data: any;
+          try {
+            data = await mcpFetch({ method: 'PUT', path, context: ctx(context), body });
+          } catch (err: any) {
+            if (isSequenceConflict(err)) return refuse('active_sequence', 'This sequence became active while editing. Pause it before editing, then preview and activate it again.');
+            throw err;
+          }
           return { success: true, sequence_id: sequenceId, status: data?.sequence?.status, audience: describeSequenceAudience(data?.sequence ?? {}) };
         }
 
@@ -1389,7 +1398,20 @@ Use list_crm_sequences to find sequence ids.`,
             return refuse('stale_preview', 'preview_token does not match the sequence as it is now. Preview it again.');
           }
 
-          const data = await mcpFetch({ method: 'PUT', path, context: ctx(context), body: { status: 'active' } });
+          // Atomic: activate only the exact version the user approved. If anything edited the
+          // sequence after the read that produced `token`, the route returns 409 and nothing goes live.
+          let data: any;
+          try {
+            data = await mcpFetch({
+              method: 'PUT',
+              path,
+              context: ctx(context),
+              body: { status: 'active', expectedUpdatedAt: sequence.updatedAt, requireStatusNot: 'active' },
+            });
+          } catch (err: any) {
+            if (isSequenceConflict(err)) return refuse('stale_preview', 'The sequence changed after the preview was approved. Preview it again.');
+            throw err;
+          }
           return { success: true, sequence_id: sequenceId, status: data?.sequence?.status ?? 'active' };
         }
 
