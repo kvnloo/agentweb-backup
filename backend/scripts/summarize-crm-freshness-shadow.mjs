@@ -25,13 +25,12 @@ export function summarize(records) {
   const sessions = new Set();
   for (const r of records) {
     const model = r.model || 'unknown';
-    const m = (byModel[model] ||= { lines: 0, sessions: new Set(), kinds: {}, claimedNumbers: {}, sampleTags: {} });
+    const m = (byModel[model] ||= { lines: 0, sessions: new Set(), kinds: {}, claimedNumbers: {}, citedTools: {} });
     m.lines++;
     if (r.sessionId) { m.sessions.add(r.sessionId); sessions.add(r.sessionId); }
     for (const k of r.kinds || []) m.kinds[k] = (m.kinds[k] || 0) + 1;
-    const s = r.sample || {};
-    if (typeof s.claimed === 'number') m.claimedNumbers[s.claimed] = (m.claimedNumbers[s.claimed] || 0) + 1;
-    if (s.tag && s.kind === 'cited_tool_not_run') m.sampleTags[s.tag] = (m.sampleTags[s.tag] || 0) + 1;
+    for (const n of r.claimed || []) m.claimedNumbers[n] = (m.claimedNumbers[n] || 0) + 1;
+    for (const t of r.cited || []) m.citedTools[t] = (m.citedTools[t] || 0) + 1;
   }
   return { totalLines: records.length, distinctSessions: sessions.size, byModel };
 }
@@ -44,7 +43,7 @@ export function format(summary, skipped = 0) {
     out.push(`  kinds: ${JSON.stringify(m.kinds)}`);
     const top = (o) => Object.entries(o).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => `${k} x${v}`).join(', ');
     if (Object.keys(m.claimedNumbers).length) out.push(`  most-claimed unbacked numbers: ${top(m.claimedNumbers)}`);
-    if (Object.keys(m.sampleTags).length) out.push(`  most-seen unbacked tags: ${top(m.sampleTags)}`);
+    if (Object.keys(m.citedTools).length) out.push(`  tools cited by unbacked tags: ${top(m.citedTools)}`);
   }
   if (models.length === 0) out.push('(no [crm-freshness-shadow] lines found)');
   return out.join('\n');

@@ -22,6 +22,12 @@ export const CRM_FRESHNESS_TOOLS: readonly string[] = [
   'get_hot_leads',
 ];
 
+/** CRM tools that CHANGE the totals; a total restated after one of these is not comparable to an earlier read. */
+const CRM_WRITE_TOOLS: readonly string[] = [
+  'create_lead_list', 'add_leads_to_list', 'update_lead_list', 'delete_lead_list', 'delete_leads', 'delete_leads_by_filter',
+  'import_leads_from_search', 'import_leads', 'enrich_leads_execute', 'create_lead', 'update_lead', 'update_lead_status',
+];
+
 export type CrmFreshnessFindingKind =
   /** The tag names a CRM tool, and none of the tools it names succeeded this turn. */
   | 'cited_tool_not_run'
@@ -30,8 +36,7 @@ export type CrmFreshnessFindingKind =
 
 export interface CrmFreshnessFinding {
   kind: CrmFreshnessFindingKind;
-  /** The tag as written, markup stripped, capped. */
-  tag: string;
+  /** Tool names the tag cited. NEVER reply text: findings are logged, and replies contain customer data. */
   cited: string[];
   /** For inventory_total_not_in_tool_results: the number the reply stated. */
   claimed?: number;
@@ -51,8 +56,7 @@ const TAG = /\[verified[^\]]{0,300}\]/gi;
 const MAX_TEXT_CHARS = 200_000;
 const MAX_TAGS_SCANNED = 200;
 // A tag that already says it is not fresh is the honest form — nothing to flag.
-const ALREADY_LABELLED = /\b(earlier|previous|prior|before|stale|out of date|outdated|last turn|from the conversation|ago|unverified|not (?:re-?)?(?:checked|verified|queried|run)|(?:from|per|in) (?:our|my|the) (?:last |earlier |previous |prior )?(?:check|lookup|query|session|conversation))\b/i;
-const MAX_TAG_CHARS = 120;
+const ALREADY_LABELLED = /\b(earlier|previous(?:ly)?|stale|out of date|outdated|last turn|from the conversation|unverified|(?:a few |some )?(?:moments?|minutes?|seconds?) ago|(?:a )?(?:while|bit) ago|just now|prior (?:check|lookup|query|answer|analysis|turn|message|result|run|response)|not (?:re-?)?(?:checked|verified|queried|run|refreshed)|(?:from|per|in|on) (?:our|my|the) (?:last |earlier |previous |prior )?(?:check|lookup|query|session|conversation))\b/i;
 // The model sometimes talks ABOUT the tag ("I can't include the [verified: ...] tag because no tool ran").
 // That is the honest behaviour, not a claim — a tag followed by "tag"/"label" or introduced by an
 // article/verb of using is a mention. Bare `[verified]` (no tool named) is deliberately not judged: in
@@ -93,29 +97,59 @@ function stripMarkup(text: string): string {
 // no honest "earlier / out of date" wording next to it, is a carried-over total.
 const MAX_RESULT_NODES = 20_000;
 const MAX_CLAIMS = 20;
-const CLAIM_LABEL_WINDOW = 140;
+// An honest label only excuses a claim when it is in the SAME sentence (a label two sentences away is about
+// something else: "Your last import was 2 days ago. You have 18 lead lists.").
+function sentenceAround(text: string, at: number, maxEachSide = 160): string {
+  let a = at;
+  const lo = Math.max(0, at - maxEachSide);
+  while (a > lo && !'.!?\n'.includes(text[a - 1] as string)) a--;
+  let b = at;
+  const hi = Math.min(text.length, at + maxEachSide);
+  while (b < hi && !'.!?\n'.includes(text[b] as string)) b++;
+  // keep a trailing parenthetical that closes the sentence: "...(from our check earlier)."
+  return text.slice(a, b);
+}
 
-/** Numbers a CRM tool result can back: every number in it, array lengths, and the sums a model would compute. */
+// Only count-like fields can back a total. Accepting EVERY number in a result masks stale totals: lead rows carry
+// icpScore / engagementCount / dealValue / phone digits, so for a 20-lead page ~1 in 3 numbers up to 100 would be
+// "backed" by coincidence (measured by the PR #3351 review).
+const COUNT_KEYS = new Set([
+  'count', 'rowCount', 'total', 'totalCount', 'totalLists', 'totalLeads', 'totalConsidered', 'scanned', 'matchCount',
+  'leadCount', 'listCount', 'returned', 'totalMatches', 'resultCount',
+]);
+
+/** Numbers a CRM tool result can back: its count fields, array lengths, and the sums a model would compute. */
 function numbersFromResult(result: unknown): { numbers: Set<number>; matchCount?: number } {
   const numbers = new Set<number>();
+  const listIds = new Set<string>();
   let nodes = 0;
   let leadCountSum = 0;
   let listObjects = 0;
   const walk = (value: unknown, depth: number): void => {
     if (nodes++ > MAX_RESULT_NODES || depth > 8) return;
-    if (typeof value === 'number') { if (Number.isFinite(value)) numbers.add(Math.trunc(value)); return; }
-    if (typeof value === 'string') { if (/^\d{1,12}$/.test(value)) numbers.add(Number(value)); return; }
-    if (Array.isArray(value)) { numbers.add(value.length); for (const v of value) walk(v, depth + 1); return; }
+    if (Array.isArray(value)) {
+      numbers.add(value.length);
+      for (const v of value) { if (nodes > MAX_RESULT_NODES) return; walk(v, depth + 1); }
+      return;
+    }
     if (value && typeof value === 'object') {
       const o = value as Record<string, unknown>;
       if (typeof o.leadCount === 'number') { leadCountSum += o.leadCount; listObjects++; }
-      for (const k of Object.keys(o)) walk(o[k], depth + 1);
+      if (typeof o.listId === 'string' && listIds.size < 5000) listIds.add(o.listId);
+      for (const k of Object.keys(o)) {
+        const v = o[k];
+        if (typeof v === 'number') { if (COUNT_KEYS.has(k) && Number.isFinite(v)) numbers.add(Math.trunc(v)); }
+        else if (typeof v === 'string') { if (COUNT_KEYS.has(k) && /^\d{1,12}$/.test(v)) numbers.add(Number(v)); }
+        else walk(v, depth + 1);
+      }
     }
   };
   let parsed: any = result;
   if (typeof parsed === 'string') { try { parsed = JSON.parse(parsed); } catch { return { numbers }; } }
   walk(parsed, 0);
   if (listObjects > 0) { numbers.add(leadCountSum); numbers.add(listObjects); }
+  // "Found 20 leads across 3 lists": distinct lists the returned leads belong to.
+  if (listIds.size > 1) numbers.add(listIds.size);
   let matchCount: number | undefined;
   if (parsed && typeof parsed === 'object') {
     const c = [parsed.count, parsed.rowCount, parsed.total, parsed.totalCount].find((x) => typeof x === 'number');
@@ -163,6 +197,9 @@ export function createCrmEvidenceCollector(): CrmEvidenceCollector {
 
 /** Numbers backed by this turn, or null when a CRM tool succeeded but there is nothing to check its numbers against. */
 function allowedNumbers(calls: any[], succeeded: Set<string>, evidence?: CrmEvidence): Set<number> | null {
+  for (const call of calls) {
+    if (call && typeof call.name === 'string' && CRM_WRITE_TOOLS.includes(call.name) && toolCallSucceeded(call)) return null;
+  }
   const allowed = new Set<number>(evidence?.numbers ?? []);
   let matchCountSum = 0;
   const coveredByLedger = new Set<string>();
@@ -184,12 +221,25 @@ const NUM = '(\\d[\\d,]{0,14})';
 // Deliberately NOT "N leads across all lists": that is how a filtered search total is phrased.
 const INVENTORY_PATTERNS: RegExp[] = [
   new RegExp(`\\b${NUM}\\s+(?:total\\s+)?(?:lead\\s+)?lists\\b`, 'gi'),
-  new RegExp(`\\b(?:total|overall)\\s+(?:number\\s+of\\s+)?(?:lead\\s+)?(?:leads|lists|contacts)(?:\\s+across\\s+all\\s+(?:your\\s+)?(?:lead\\s+)?lists)?\\W{0,12}${NUM}`, 'gi'),
+  new RegExp(`\\b(?:total|overall)\\s+(?:number\\s+of\\s+)?(?:lead\\s+)?(?:leads|lists|contacts)(?:\\s+across\\s+all\\s+(?:your\\s+)?(?:lead\\s+)?lists)?[ \\t:*\\-\u2013\u2014]{0,12}${NUM}\\b(?![.)]\\s)`, 'gi'),
   new RegExp(`\\b${NUM}\\s+(?:total\\s+)?leads\\s+(?:in\\s+total|total|in\\s+your\\s+(?:entire\\s+|whole\\s+)?crm)\\b`, 'gi'),
+  new RegExp(`\\b(?:total |overall )?(?:number of )?lead lists[ \\t:*\\-\u2013\u2014]{1,12}${NUM}\\b(?![.)]\\s)`, 'gi'),
   new RegExp(`\\b${NUM}\\s+leads\\s+(?:across|in)\\s+(?:${NUM}\\s+(?:\\w+\\s+)?lists|your\\s+(?:entire\\s+|whole\\s+)?crm)`, 'gi'),
 ];
 
-const SUBSET_BEFORE = /\b(remaining|other|another|rest of(?: the)?|empty|those|these|all but|except(?: for)?|plus)\s+$/i;
+const SUBSET_BEFORE = /\b(remaining|other|another|rest of(?: the)?|empty|those|these|all but|except(?: for)?|plus|new|created|added|imported|built|made|found)\s+$/i;
+// "N leads in total" / "Total leads: N" also describe a Apollo search, an import, a pasted list. Count them as an account
+// total only when CRM wording is in the same sentence.
+const CRM_CONTEXT = /\b(crm|lead lists?|your lists?|all (?:of )?(?:your )?lists|across (?:all )?(?:your |the )?(?:\d+ )?(?:lead )?lists|pipeline|contacts? database)\b/i;
+
+// CRM wording anywhere in the same paragraph (a bullet list is one paragraph) - not just the same line.
+function paragraphAround(text: string, at: number, maxEachSide = 300): string {
+  const lo = Math.max(0, at - maxEachSide);
+  const hi = Math.min(text.length, at + maxEachSide);
+  const before = text.lastIndexOf('\n\n', at);
+  const after = text.indexOf('\n\n', at);
+  return text.slice(Math.max(lo, before === -1 ? 0 : before), after === -1 ? hi : Math.min(hi, after));
+}
 
 function findInventoryClaims(text: string): Array<{ n: number; at: number }> {
   const out: Array<{ n: number; at: number }> = [];
@@ -198,6 +248,8 @@ function findInventoryClaims(text: string): Array<{ n: number; at: number }> {
     for (const m of text.matchAll(re)) {
       if (out.length >= MAX_CLAIMS) return out;
       const at = m.index ?? 0;
+      // patterns 2 and 3 are generic ("Total leads: N", "N leads in total"): require CRM wording in the sentence.
+      if ((re === INVENTORY_PATTERNS[1] || re === INVENTORY_PATTERNS[2]) && !(CRM_CONTEXT.test(sentenceAround(text, at)) || CRM_CONTEXT.test(paragraphAround(text, at)))) continue;
       // "Remaining 15 lists: 0 leads" / "the other 4 lists" is a breakdown of a subset, not the account total.
       if (SUBSET_BEFORE.test(text.slice(Math.max(0, at - 24), at))) continue;
       for (const g of m.slice(1)) {
@@ -239,7 +291,7 @@ export function detectCrmFreshnessMismatch(finalText: unknown, toolCalls: unknow
     if (MENTION_BEFORE.test(text.slice(Math.max(0, at - 24), at))) continue;
     const cited = citedTools(tag);
     if (cited.length > 0 && !cited.some((name) => succeeded.has(name))) {
-      findings.push({ kind: 'cited_tool_not_run', tag: tag.slice(0, MAX_TAG_CHARS), cited });
+      findings.push({ kind: 'cited_tool_not_run', cited });
     }
   }
 
@@ -251,10 +303,9 @@ export function detectCrmFreshnessMismatch(finalText: unknown, toolCalls: unknow
       const seen = new Set<number>();
       for (const { n, at } of claims) {
         if (allowed.has(n) || seen.has(n)) continue;
-        const near = text.slice(Math.max(0, at - CLAIM_LABEL_WINDOW), at + CLAIM_LABEL_WINDOW);
-        if (ALREADY_LABELLED.test(near)) continue;
+        if (ALREADY_LABELLED.test(sentenceAround(text, at))) continue;
         seen.add(n);
-        findings.push({ kind: 'inventory_total_not_in_tool_results', tag: text.slice(at, at + 60), cited: [], claimed: n });
+        findings.push({ kind: 'inventory_total_not_in_tool_results', cited: [], claimed: n });
       }
     }
   }
@@ -289,7 +340,9 @@ export function runCrmFreshnessShadow(input: CrmFreshnessShadowInput): CrmFreshn
       findingCount: result.findings.length,
       tagsSeen: result.tagsSeen,
       crmToolsSucceeded: result.crmToolsSucceeded,
-      sample: result.findings[0],
+      // Numbers and tool names only - never reply text (replies carry names, emails, deal values).
+      claimed: [...new Set(result.findings.map((f) => f.claimed).filter((n): n is number => typeof n === 'number'))].slice(0, 10),
+      cited: [...new Set(result.findings.flatMap((f) => f.cited))].slice(0, 10),
     });
     return result.findings;
   } catch {
