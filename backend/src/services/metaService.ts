@@ -1525,6 +1525,13 @@ export class MetaService {
         finalParams.daily_budget = normalizeMetaMoney((params as any).budget_amount, currency).minorUnits;
       }
 
+      // ENG-2364: under CBO the bid strategy lives on the campaign. Without one, Meta rejects
+      // every ad set with subcode 1815857 ("Bid amount required") even when the ad set asks
+      // for LOWEST_COST_WITHOUT_CAP. Send the no-cap default whenever we set a campaign budget.
+      if (finalParams.daily_budget !== undefined) {
+        finalParams.bid_strategy = 'LOWEST_COST_WITHOUT_CAP';
+      }
+
       // Already normalized by the agent, just like the ad-set SDK write fields.
       if (params.spend_cap !== undefined && params.spend_cap !== null) {
         finalParams.spend_cap = params.spend_cap;
