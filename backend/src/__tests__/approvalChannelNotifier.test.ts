@@ -30,10 +30,19 @@ const { userDb } = require('../services/db');
 import { notifyApprovalOnWhatsApp } from '../services/approvalChannelNotifier';
 import { TEMPLATES } from '../services/whatsappService';
 
-const USER = { userId: 'user-1', email: 'reviewer@example.com' };
+const APPROVAL_CHANNEL = 'C0APPROVALS';
+
+// normalizeUserChannels is the REAL implementation here (the mock spreads requireActual),
+// so this user genuinely resolves to the approval's Slack channel.
+const USER = {
+  userId: 'user-1',
+  email: 'reviewer@example.com',
+  slackChannel: APPROVAL_CHANNEL,
+};
 
 const params = {
   userId: 'user-1',
+  approvalChannel: APPROVAL_CHANNEL,
   assetType: 'image',
   filename: 'q4-launch-hero.png',
   assetUrl: 'https://assets.example.com/q4-launch-hero.png',
@@ -88,6 +97,33 @@ describe('notifyApprovalOnWhatsApp', () => {
     const sent = send.mock.calls[0][0];
     expect(sent.text).toContain('q4-launch-hero.png');
     expect(sent.text).toContain(params.assetUrl);
+  });
+
+  it('does not notify a requester who does not watch the approval channel', async () => {
+    // userId on POST /send-approval is the authenticated CALLER, not the reviewer.
+    // Notifying on userId alone pings the requester about a decision nobody asked them
+    // to make — and, worse, about an asset that may not be theirs.
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      ...USER,
+      slackChannel: 'C0SOMETHING-ELSE',
+    });
+    await notifyApprovalOnWhatsApp(params);
+    expect(resolveDestination).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the approval carries no channel', async () => {
+    await notifyApprovalOnWhatsApp({ ...params, approvalChannel: '' });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('notifies a reviewer whose channel is held in the slackChannels list', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: 'user-1',
+      slackChannels: ['C0OTHER', APPROVAL_CHANNEL],
+    });
+    await notifyApprovalOnWhatsApp(params);
+    expect(send).toHaveBeenCalled();
   });
 
   it('does nothing when the user has no WhatsApp destination', async () => {

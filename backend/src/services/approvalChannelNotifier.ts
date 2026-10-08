@@ -16,12 +16,20 @@
 import {
   bootstrapMessagingChannels,
   getMessagingChannel,
+  normalizeUserChannels,
   resolveDestination,
 } from './messagingChannelService';
 import { TEMPLATES } from './whatsappService';
 
 export interface ApprovalChannelNotification {
+  /**
+   * The approval record's owning account. NOT necessarily the reviewer — on
+   * `POST /send-approval` this is the authenticated caller, i.e. whoever REQUESTED the
+   * approval. See the audience check in the implementation.
+   */
   userId: string;
+  /** The Slack channel the approval was posted to — the reviewers' actual audience. */
+  approvalChannel: string;
   /** Asset kind, e.g. "image" or "video" — becomes the template's {{1}}. */
   assetType: string;
   /** Human-readable asset name — the template's {{2}}. */
@@ -45,6 +53,24 @@ export async function notifyApprovalOnWhatsApp(
     const { userDb } = await import('./db');
     const user = await userDb.getUserById(params.userId);
     if (!user) return;
+
+    // Only notify someone who is genuinely an audience of THIS approval. `userId` is
+    // the requester, and the reviewers are whoever watches the Slack channel the
+    // approval went to — the two are often the same person but are not the same field,
+    // and sending on `userId` alone pings the requester about a decision nobody asked
+    // them to make. Requiring their own Slack destination to include the approval's
+    // channel makes this a true mirror of the Slack message's audience. It costs
+    // nothing: the channels are already on the user record just loaded, and no reverse
+    // channel-to-user index exists to do it the other way round.
+    //
+    // Deliberately fails CLOSED. A reviewer who watches the channel but has not linked
+    // that channel to their account gets no WhatsApp ping, which is a missing
+    // notification; the alternative messages the wrong person about someone else's
+    // asset, which is a privacy problem.
+    const watchesApprovalChannel = normalizeUserChannels(user as any).some(
+      (c) => c.channel === 'slack' && c.enabled && c.destination === params.approvalChannel,
+    );
+    if (!params.approvalChannel || !watchesApprovalChannel) return;
 
     await bootstrapMessagingChannels();
     const destination = await resolveDestination(user as any, 'whatsapp');

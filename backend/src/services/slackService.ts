@@ -720,15 +720,27 @@ export async function sendApprovalRequestWithTracking(
   // ENG-273: WhatsApp is a peer notification channel, not a second place to approve
   // from. Deliberately placed here rather than at the four call sites: this is the one
   // choke point every approval already passes through, so a new caller cannot forget it.
-  // Imported dynamically and awaited only for its own internal error handling — it never
-  // throws, so the Slack result and the approval record above are unaffected either way.
-  const { notifyApprovalOnWhatsApp } = await import('./approvalChannelNotifier');
-  await notifyApprovalOnWhatsApp({
-    userId: request.userId,
-    assetType: request.assetType,
-    filename: request.filename,
-    assetUrl: request.imageUrl,
-  });
+  //
+  // The IMPORT is inside the guard, not just the call. notifyApprovalOnWhatsApp handles
+  // its own errors, but a module-load failure rejects before any of that code runs — and
+  // by this point Slack has already sent and the approval record already exists, so
+  // throwing here would fail an approval that actually succeeded and invite a duplicate
+  // on retry.
+  try {
+    const { notifyApprovalOnWhatsApp } = await import('./approvalChannelNotifier');
+    await notifyApprovalOnWhatsApp({
+      userId: request.userId,
+      approvalChannel: request.channel,
+      assetType: request.assetType,
+      filename: request.filename,
+      assetUrl: request.imageUrl,
+    });
+  } catch (notifyError: any) {
+    console.warn(
+      '[slackService] WhatsApp approval notification could not be dispatched:',
+      notifyError?.message || notifyError,
+    );
+  }
 
   return {
     messageTs: result.messageTs,
