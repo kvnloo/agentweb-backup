@@ -1,4 +1,10 @@
 import { scheduleBackupModels } from '../services/agentMode/modelSupersession';
+import {
+  acquireInteractiveGenerationSlot,
+  buildTooManyRunsBody,
+  TooManyConcurrentRunsError,
+  isTooManyConcurrentRunsError,
+} from '../services/agentMode/concurrentGenerationCap';
 import { isEvaluationUser, EvaluationDenied } from '../services/evaluationPolicy';
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken, isRealAdmin } from '../middleware/auth';
@@ -73,6 +79,7 @@ import {
   markRunTerminal,
   IDEM_TTL_INTERACTIVE_S,
 } from '../services/agentMode/runStore';
+import { ModelUnavailableError, buildModelUnavailableBody, isModelUnavailableError, sanitizeModelLabel } from '../services/agentMode/modelUnavailable';
 import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
 // ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
 // on existing report/run envelopes. No surface parses or re-ranks on its own.
@@ -368,11 +375,16 @@ async function isUserAdmin(userId: string): Promise<boolean> {
  * The caller's model id is only a preference; current cost state and the
  * admin-managed policy decide what can actually reach the provider.
  */
+// Exported so the fail-loud unit tests can call it directly.
 export async function resolveEffectiveModelForUser(input: {
   userId: string;
   requestedModel?: string | null;
   backupModel?: string | null;
   backupSource?: ModelBackupSource | null;
+  // True when there is NO explicit selection (unpinned schedule, session creation without
+  // a requested model, a shared session with no stored model): the configured default
+  // may then stand in as before. An explicit selection that cannot be served throws.
+  allowSilentSwap?: boolean;
 }): Promise<EffectiveModelPolicyDecision> {
   const [usage, systemDefaultModel] = await Promise.all([
     getEffectiveLlmUsagePolicy(input.userId),
@@ -412,20 +424,122 @@ export async function resolveEffectiveModelForUser(input: {
       supportedModelIds = adminModelIds;
     }
   }
+  // FAIL-LOUD: an explicit selection that is not served must not be replaced by
+  // the default (resolveGenerationModel's fallback would otherwise mask it as
+  // 'honored'). A paused account still gets the plain 'blocked' decision.
+  if (
+    !input.allowSilentSwap
+    && requestedResolution?.fellBack
+    && usage.mode.usageMode !== 'paused'
+  ) {
+    throw new ModelUnavailableError(input.requestedModel as string, 'not_served');
+  }
+  // A live-voice model cannot serve a text chat: callLLM would throw late (500, user
+  // message already saved). Refuse an explicit pick up front.
+  if (
+    !input.allowSilentSwap
+    && requestedResolution
+    && usage.mode.usageMode !== 'paused'
+    && typeof agentModeService.isLiveModel === 'function'
+    && agentModeService.isLiveModel(requestedResolution.model)
+  ) {
+    throw new ModelUnavailableError(input.requestedModel as string, 'not_selectable');
+  }
+  // No explicit selection (allowSilentSwap) but the requested/stored model is a live-voice
+  // id: it cannot serve a text chat, so treat it as not selectable. Dropping it from the
+  // supported set makes selectPolicyModel 'correct' it to the default, exactly like an
+  // internalOnly/adminOnly model.
+  if (
+    input.allowSilentSwap
+    && requestedResolution
+    && typeof agentModeService.isLiveModel === 'function'
+    && agentModeService.isLiveModel(requestedResolution.model)
+  ) {
+    supportedModelIds = supportedModelIds.filter((id) => id !== requestedResolution.model);
+  }
   const decision = selectPolicyModel({
     usageMode: usage.mode.usageMode,
-    requestedModel: requestedResolution?.model || input.requestedModel,
+    // A silently-swappable request that is not served (retired stored model) must NOT be
+    // replaced by resolveGenerationModel's code-constant fallback: that constant is not the
+    // configured default and would be labelled 'honored'. Keep the unserved id so
+    // selectPolicyModel corrects it to the configured default (same as a new session).
+    requestedModel: input.allowSilentSwap && requestedResolution?.fellBack
+      ? input.requestedModel
+      : (requestedResolution?.model || input.requestedModel),
     backupModel: backupResolution?.fellBack ? null : (backupResolution?.model || input.backupModel),
     backupSource: input.backupSource,
     systemDefaultModel,
     supportedModelIds,
     policy: usage.policy,
   });
+  // FAIL-LOUD: a valid id that is not selectable (internalOnly, or adminOnly for
+  // a non-admin) used to be 'corrected' to the default; refuse instead.
+  if (decision.modelSelection === 'corrected' && !input.allowSilentSwap) {
+    throw new ModelUnavailableError(input.requestedModel as string, 'not_selectable');
+  }
   return {
     ...decision,
     usageMode: usage.mode.usageMode,
     usagePolicyVersion: usage.policy?.version || null,
   };
+}
+
+/**
+ * A request-body llmModel that is not a string (array, number, object...) is still an
+ * explicit selection, but it must never reach the registry lookups, which coerce keys
+ * (['gpt-5.5'] would match 'gpt-5.5' and then blow up later as a 500). Give it a
+ * stable string form so it is refused like any other unserved id. null/undefined/blank
+ * stay "no selection".
+ */
+function normalizeRequestedLlmModel(raw: unknown): string | undefined {
+  if (raw === null || raw === undefined) return undefined;
+  if (typeof raw === 'string') return raw.trim() || undefined;
+  try {
+    return JSON.stringify(raw) ?? String(raw);
+  } catch {
+    return String(typeof raw);
+  }
+}
+
+/** The one 422 body for a ModelUnavailableError (display name from the registry when the id is one). */
+function modelUnavailableBody(err: ModelUnavailableError) {
+  const displayName = typeof agentModeService.getModelDisplayName === 'function'
+    ? agentModeService.getModelDisplayName(err.requestedModel)
+    : undefined;
+  return buildModelUnavailableBody(err, displayName);
+}
+
+/**
+ * ENG-903: validate a schedule's model pin (llmModel / llmBackupModel) at the WRITE
+ * site, with the same rules the picker and `resolveEffectiveModelForUser` enforce, so a
+ * bad pin is refused with the portal's existing `model_unavailable` 422 instead of
+ * surviving until it fails the run.
+ *
+ * Returns the trimmed id to store ('' = no pin). Throws ModelUnavailableError when the
+ * id is not a string, not served (registry key or honoured alias), or not selectable by
+ * this user (internalOnly, live-voice, adminOnly for a non-admin). Does not change the
+ * run-time resolver. Partial service doubles (older unit tests) skip the registry checks,
+ * exactly like the resolver above.
+ */
+async function validateScheduleModelPin(userId: string, raw: unknown): Promise<string> {
+  const requested = normalizeRequestedLlmModel(raw);
+  if (!requested) return '';
+  if (typeof raw !== 'string') throw new ModelUnavailableError(requested, 'not_served');
+  if (
+    typeof agentModeService.resolveGenerationModel !== 'function'
+    || typeof agentModeService.isModelSelectableBy !== 'function'
+  ) {
+    return requested;
+  }
+  const resolution = agentModeService.resolveGenerationModel(requested);
+  if (resolution.fellBack) throw new ModelUnavailableError(requested, 'not_served');
+  if (!agentModeService.isModelSelectableBy(resolution.model, false)) {
+    // adminOnly is the only gate an admin can clear; internalOnly/live fail for everyone.
+    const adminCanSelect = agentModeService.isModelSelectableBy(resolution.model, true)
+      && await isUserAdmin(userId);
+    if (!adminCanSelect) throw new ModelUnavailableError(requested, 'not_selectable');
+  }
+  return requested;
 }
 
 async function resolveScheduleBackup(input: {
@@ -5147,20 +5261,28 @@ async function runVerifiedChatInner(
  */
 export async function runVerifiedChat(
   params: Parameters<typeof runVerifiedChatInner>[0],
-  options?: { lockTimeoutMs?: number },
+  options?: { lockTimeoutMs?: number; capInteractiveUserId?: string },
 ): Promise<RunVerifiedChatResult> {
   const { sessionId } = params;
   const claimed = await claimSessionGenerationWithRetry(sessionId);
   if (!claimed) {
     throw new SessionBusyError(sessionId);
   }
+  let generationSlot: { release: () => void } | undefined;
   try {
+    // ENG-110: only the interactive /verified-generate endpoint passes capInteractiveUserId.
+    if (options?.capInteractiveUserId) {
+      const slot = await acquireInteractiveGenerationSlot(options.capInteractiveUserId, sessionId);
+      if (!slot.ok) throw new TooManyConcurrentRunsError(slot.current, slot.limit);
+      generationSlot = slot;
+    }
     return await withGenerationTimeout(
       runVerifiedChatInner(params),
       sessionId,
       options?.lockTimeoutMs ?? RUN_VERIFIED_CHAT_LOCK_TIMEOUT_MS,
     );
   } finally {
+    generationSlot?.release();
     releaseSessionGeneration(sessionId);
   }
 }
@@ -6162,6 +6284,74 @@ export async function runScheduledChat(
       return capacitySkipResult;
     }
 
+    // FAIL-LOUD selected model: resolve the model ONCE, before the resume claim, the
+    // pre-check gate and session creation. A schedule can outlive a policy/model
+    // change by months, so neither its pin nor backup is trusted merely because it was
+    // valid when saved. A pinned model that is not served must NOT run on another
+    // model: the run ends failed and nothing runs. This RETURNS (like the token-limit
+    // gate) instead of throwing — a throw would be requeued 3x by the zero-output
+    // path with a false "will be retried automatically" message. The resolver sees the
+    // RAW pin (it applies legacy aliases itself); an unpinned schedule uses the
+    // admin-configured scheduled default, unchanged.
+    const defaultModel = await agentModeService.getScheduledChatsDefaultModel();
+    // A whitespace-only pin is no pin.
+    const schedulePin = typeof schedule.llmModel === 'string' ? schedule.llmModel.trim() : '';
+    const rawRequestedModel = schedulePin || defaultModel;
+    const requestedModelResolution = agentModeService.resolveGenerationModel(rawRequestedModel);
+    let scheduleModelPolicy: EffectiveModelPolicyDecision;
+    try {
+      scheduleModelPolicy = await resolveEffectiveModelForUser({
+        userId,
+        requestedModel: rawRequestedModel,
+        backupModel: schedule.llmBackupModel,
+        backupSource: schedule.llmBackupSource,
+        allowSilentSwap: !schedulePin,
+      });
+    } catch (modelError) {
+      if (!isModelUnavailableError(modelError)) throw modelError;
+      const pinnedLabel = sanitizeModelLabel(modelError.requestedModel);
+      console.error(
+        `runScheduledChat: schedule ${schedule.scheduleId} not run — pinned model "${pinnedLabel}" is ${modelError.reason === 'not_served' ? 'not served' : 'not selectable'}.`,
+      );
+      void sendAgentModeOncallAlert({
+        subject: 'AgentMode: unsupported model pinned on a scheduled chat',
+        message:
+          `Schedule "${schedule.scheduleName}" (${schedule.scheduleId}) pins model "${pinnedLabel}", which is ` +
+          `not available (${modelError.reason}) even after legacy-alias resolution. The run FAILED and nothing ran: ` +
+          `the schedule is never run on a different model. Choose a served model for this schedule.`,
+        context: {
+          Schedule: schedule.scheduleId,
+          'Pinned Model': pinnedLabel,
+        },
+        dedupeKey: `schedule_model_invalid:${schedule.scheduleId}:${rawRequestedModel}`,
+        dedupeWindowMs: 60 * 60 * 1000,
+      }).catch((alertError) => {
+        console.error('AgentMode: Failed to send unsupported schedule-model alert:', alertError);
+      });
+      const modelUnavailableResult = {
+        scheduleId: schedule.scheduleId,
+        runId: preGeneratedRunId || require('uuid').v4(),
+        status: 'failure' as const,
+        passed: false,
+        actualResponse: `model_unavailable: pinned model "${pinnedLabel}" is ${modelError.reason === 'not_served' ? 'not served' : 'not selectable'} — choose a served model for this schedule`,
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: Date.now() - now.getTime(),
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      };
+      try {
+        await scheduleDb.addRunResult(schedule.scheduleId, modelUnavailableResult);
+      } catch (saveError) {
+        console.error(`Error saving model-unavailable run result for schedule ${schedule.scheduleId}:`, saveError);
+      }
+      return modelUnavailableResult;
+    }
+
     // ENG-657: resume path. When the reconciler marked this schedule to resume an
     // abandoned session (it ended on a safe boundary), CONTINUE that session from
     // its last completed step instead of creating a fresh one and re-running the
@@ -6456,30 +6646,20 @@ export async function runScheduledChat(
     // Set the session title to the schedule name
     await chatbotDb.updateSessionTitle(sessionId, sessionTitle);
 
-    // Resolve the stored preference at execution time. A schedule can outlive a
-    // policy/model change by months, so neither its preferred nor backup model is
-    // trusted merely because it was valid when saved.
-    const defaultModel = await agentModeService.getScheduledChatsDefaultModel();
-    const rawRequestedModel = schedule.llmModel || defaultModel;
-    const requestedModelResolution = agentModeService.resolveGenerationModel(rawRequestedModel);
-    const requestedModel = requestedModelResolution.model;
-    const scheduleModelPolicy = await resolveEffectiveModelForUser({
-      userId,
-      requestedModel,
-      backupModel: schedule.llmBackupModel,
-      backupSource: schedule.llmBackupSource,
-    });
     if (!scheduleModelPolicy.effectiveModel) {
       const pausedError: any = new Error('usage_paused');
       pausedError.code = 'usage_paused';
       throw pausedError;
     }
     const modelToUse = scheduleModelPolicy.effectiveModel;
-    if (requestedModelResolution.fellBack) {
+    // Unpinned schedule only (a pinned unserved model failed in the pre-flight above):
+    // the admin-configured scheduled default itself is not served and the resolver
+    // swapped it, which stays an alert-only event.
+    if (!schedulePin && requestedModelResolution.fellBack) {
       void sendAgentModeOncallAlert({
         subject: 'AgentMode: unsupported model pinned on a scheduled chat',
         message:
-          `Schedule "${schedule.scheduleName}" (${schedule.scheduleId}) pins model "${rawRequestedModel}", which is ` +
+          `Schedule "${schedule.scheduleName}" (${schedule.scheduleId}) uses the scheduled-chats default model "${rawRequestedModel}", which is ` +
           `not a served model even after legacy-alias resolution. The policy resolver selected "${modelToUse}".`,
         context: {
           Schedule: schedule.scheduleId,
@@ -8931,7 +9111,9 @@ export const agentModeController = {
     try {
       const authReq = req as AuthenticatedRequest;
       const user = authReq.user as User;
-      const { portalType: requestedPortalType = 'agent', pageIdentifier: requestedPageIdentifier = 'agent-mode', sessionType, idempotencyKey, llmModel: requestedLlmModel } = req.body;
+      const { portalType: requestedPortalType = 'agent', pageIdentifier: requestedPageIdentifier = 'agent-mode', sessionType, idempotencyKey, llmModel: rawRequestedLlmModel } = req.body;
+      // A padded id is trimmed; blank counts as NO selection (like '').
+      const requestedLlmModel = normalizeRequestedLlmModel(rawRequestedLlmModel);
       const skillId = req.params?.skillId;
       const portalType = skillId ? 'agent' : requestedPortalType;
       let skill;
@@ -8992,11 +9174,28 @@ export const agentModeController = {
         modelToUse = await agentModeService.getDefaultModel();
       }
       let initialModelPolicy: EffectiveModelPolicyDecision | undefined;
+      // Only plain 'regular' sessions honor a client `requestedLlmModel`. Skill,
+      // emma-sidebar, report and image/video sessions take their model from admin
+      // configuration (above) and intentionally ignore it, so they never 422 here.
       if (!skillId && finalSessionType === 'regular' && portalType !== 'emma-sidebar') {
-        initialModelPolicy = await resolveEffectiveModelForUser({
-          userId: user.userId,
-          requestedModel: requestedLlmModel || modelToUse,
-        });
+        try {
+          initialModelPolicy = await resolveEffectiveModelForUser({
+            userId: user.userId,
+            requestedModel: requestedLlmModel || modelToUse,
+            // Only an explicit requestedLlmModel is a selection; a misconfigured
+            // default keeps the resolver's old safety net instead of a 422.
+            allowSilentSwap: !requestedLlmModel,
+          });
+        } catch (modelError) {
+          if (!isModelUnavailableError(modelError)) throw modelError;
+          // Before any session record is written: give back the idem claim so a
+          // retry with a different model is accepted, then fail loudly (422).
+          if (createIdemKeyHeld) {
+            await releaseIdempotency(createIdemKeyHeld);
+            createIdemKeyHeld = undefined;
+          }
+          return res.status(422).json(modelUnavailableBody(modelError));
+        }
         // Creating a session itself spends nothing. A paused account can still
         // open/read the session; provider admission remains blocked on send.
         if (initialModelPolicy.effectiveModel) modelToUse = initialModelPolicy.effectiveModel;
@@ -9283,8 +9482,10 @@ export const agentModeController = {
       }
 
       const user = req.user as User;
-      const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer, deckAnswer, deckCancel, clientId } = req.body;
+      const { sessionId, llmModel: rawLlmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer, deckAnswer, deckCancel, clientId } = req.body;
       let { userMessage } = req.body;
+      // A padded id is trimmed; blank counts as NO selection (like '').
+      const llmModel = normalizeRequestedLlmModel(rawLlmModel);
 
       // If the request contains audio, transcribe it to text first
       if (audioInput?.data && !userMessage) {
@@ -9321,6 +9522,39 @@ export const agentModeController = {
       turnStartCalledFunctions = session.calledFunctions || {};
       if (session.userId !== user.userId && !user.isAdmin) {
         return res.status(403).json({ error: 'Unauthorized access to session' });
+      }
+
+      // EXPLICIT = the REQUEST carries a model. A model merely STORED on the session is
+      // never explicit: the system stamps the configured default into session.llmModel
+      // (Slack, work-plan launch, GTM, onboarding...), no persisted flag can tell that
+      // from a user's pick (and none is added), so a retired/not-selectable stored model
+      // falls back to the current default exactly as before. The portal always sends the
+      // picker value, so portal users still get the loud 422 + 'Unavailable' badge.
+      //
+      // FAIL-LOUD pre-flight: validate an explicit model BEFORE anything below
+      // mutates the session (work-plan input answer, approval-deck answer/cancel
+      // each persist state that a 422 would otherwise consume without a turn).
+      // Read-only: nothing is claimed yet, so there is nothing to release. A
+      // blocked account keeps its 429 (the resolver does not throw when paused,
+      // and an exhausted allowance falls through to the 429 below).
+      // The decision is kept and reused at the dispatch site below (one resolver
+      // pass per turn: it costs several uncached settings reads).
+      const explicitModelSelection = Boolean(llmModel);
+      let preflightDecision: EffectiveModelPolicyDecision | undefined;
+      try {
+        preflightDecision = await resolveEffectiveModelForUser({
+          userId: session.userId,
+          requestedModel: llmModel || session.llmModel || null,
+          backupModel: llmBackupModel,
+          backupSource: llmBackupModel ? 'user' : null,
+          allowSilentSwap: !explicitModelSelection,
+        });
+      } catch (modelError) {
+        if (!isModelUnavailableError(modelError)) throw modelError;
+        const preflightUsage = await checkTokenUsage(user.userId);
+        if (preflightUsage.allowed) {
+          return res.status(422).json(modelUnavailableBody(modelError));
+        }
       }
 
       // ENG-1635/1644 PR2: the legacy questionAnswer/pendingUserQuestion
@@ -9527,7 +9761,19 @@ export const agentModeController = {
         });
       }
 
+      // ENG-110: per-user soft cap on concurrently generating interactive chats.
+      // Taken AFTER the session claim, released in the finally below on every exit.
+      let generationSlot: { release: () => void } | undefined;
       try {
+      // Answer/cancel turns already consumed a paused deck / work-plan request above
+      // (writes dispatched, state cleared), so refusing them now would lose the
+      // outcome and make a retry 409. They are never refused, only counted.
+      const continuesPausedTurn = Boolean(deckAnswer || deckCancel || workPlanInputAnswer);
+      const slot = await acquireInteractiveGenerationSlot(session.userId, sessionId, { bypassLimit: continuesPausedTurn });
+      if (!slot.ok) {
+        return res.status(429).json(buildTooManyRunsBody(slot.current, slot.limit));
+      }
+      generationSlot = slot;
 
       // Check token usage limits
       const usageStatus = await checkTokenUsage(user.userId);
@@ -9535,13 +9781,19 @@ export const agentModeController = {
       // disagree with each other either (ENG-1344 AC6).
       const usageBlockCopy = buildUsageBlockCopy({ month: usageStatus.month });
       if (!usageStatus.allowed) {
+        // A ModelUnavailableError here must not mask the 429: fall through to the plain one.
         if (usageStatus.usagePolicyVersion) {
           modelPolicyDecision = await resolveEffectiveModelForUser({
             userId: session.userId,
-            requestedModel: llmModel || session.llmModel || agentModeService.default_model,
+            requestedModel: llmModel || session.llmModel || null,
             backupModel: llmBackupModel,
             backupSource: llmBackupModel ? 'user' : null,
+          }).catch((modelError) => {
+            if (isModelUnavailableError(modelError)) return undefined;
+            throw modelError;
           });
+        }
+        if (modelPolicyDecision) {
           await chatbotDb.updateSessionLlmModel(
             sessionId,
             session.llmModel || agentModeService.default_model,
@@ -9607,12 +9859,26 @@ export const agentModeController = {
       // A request/session model is a preference, not authority. Resolve it
       // against the current cost state immediately before dispatch so an old
       // MCP client or stored session cannot bypass optimized mode.
-      modelPolicyDecision = await resolveEffectiveModelForUser({
-        userId: session.userId,
-        requestedModel: llmModel || session.llmModel || agentModeService.default_model,
-        backupModel: llmBackupModel,
-        backupSource: llmBackupModel ? 'user' : null,
-      });
+      try {
+        // Same inputs as the pre-flight above (nothing in between changes the model
+        // or the request), so reuse its decision when it resolved cleanly.
+        modelPolicyDecision = preflightDecision ?? await resolveEffectiveModelForUser({
+          userId: session.userId,
+          requestedModel: llmModel || session.llmModel || null,
+          backupModel: llmBackupModel,
+          backupSource: llmBackupModel ? 'user' : null,
+          allowSilentSwap: !explicitModelSelection,
+        });
+      } catch (modelError) {
+        if (!isModelUnavailableError(modelError)) throw modelError;
+        // FAIL-LOUD: nothing was sent to any model. No session write, no
+        // metering, user message not persisted. The inner finally releases the
+        // generation lock + idem claim; close the run record created above.
+        if (runSurvivalRunId) {
+          void markRunTerminal(runSurvivalRunId, 'failed', { finishReason: 'model_unavailable' });
+        }
+        return res.status(422).json(modelUnavailableBody(modelError));
+      }
       if (!modelPolicyDecision.effectiveModel) {
         await chatbotDb.updateSessionLlmModel(
           sessionId,
@@ -10024,6 +10290,7 @@ export const agentModeController = {
         void markRunTerminal(runSurvivalRunId, 'completed');
       }
       } finally {
+        generationSlot?.release();
         releaseSessionGeneration(sessionId);
         // Terminal state reached (success OR error unwinding through here):
         // release the submit-lock so an identical, legitimate resubmit is
@@ -10328,10 +10595,15 @@ export const agentModeController = {
   async getModelOptions(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const [usage, supportedModels] = await Promise.all([
+      const [usage, entitledModels] = await Promise.all([
         getEffectiveLlmUsagePolicy(user.userId),
         agentModeService.getSupportedModels(user.isAdmin === true),
       ]);
+      // Every consumer (chat composer, schedule form, MCP) is a text-chat picker, and an
+      // explicit live-voice pick is refused (422 not_selectable), so never offer one.
+      const supportedModels = typeof agentModeService.isLiveModel === 'function'
+        ? entitledModels.filter((id) => !agentModeService.isLiveModel(id))
+        : entitledModels;
       const optimizedModels = scheduleBackupModels(
         usage.policy?.optimizedModelIds ?? supportedModels, supportedModels,
       );
@@ -10856,6 +11128,8 @@ export const agentModeController = {
 
       try {
 
+      const defaultModel = await agentModeService.getDefaultModel();
+
       if (workPlanInputAnswer) {
         try {
           const pendingWorkPlanInput = session.pendingWorkPlanInput;
@@ -10999,10 +11273,12 @@ export const agentModeController = {
       // The anonymous caller cannot choose the model, but the owner's stored
       // preference is still subject to the same current cost policy as every
       // authenticated, scheduled, and MCP dispatch.
-      const defaultModel = await agentModeService.getDefaultModel();
-      const modelPolicyDecision = await resolveEffectiveModelForUser({
+      // The visitor selects nothing, so a stored model that is retired or not
+      // selectable falls back to the current default (allowSilentSwap) and never throws.
+      const modelPolicyDecision: EffectiveModelPolicyDecision = await resolveEffectiveModelForUser({
         userId: session.userId,
         requestedModel: session.llmModel || defaultModel,
+        allowSilentSwap: true,
       });
       if (!modelPolicyDecision.effectiveModel) {
         // Runtime always exposes this method. The guard preserves older
@@ -12464,12 +12740,16 @@ export const agentModeController = {
         }
       }
 
+      // ENG-903: refuse an unservable/unselectable model pin at write time (422), not at run time.
+      const validatedLlmModel = await validateScheduleModelPin(user.userId, llmModel);
+      const validatedBackupModel = await validateScheduleModelPin(user.userId, llmBackupModel);
+
       // Create scheduled chat using the existing scheduleDb
       const scheduleId = require('uuid').v4();
       const now = new Date();
       const scheduleBackup = await resolveScheduleBackup({
         userId: user.userId,
-        requestedBackupModel: llmBackupModel,
+        requestedBackupModel: validatedBackupModel,
       });
 
       // Use provided nextRunTime or calculate default
@@ -12535,7 +12815,7 @@ export const agentModeController = {
         sessionId: sessionId || null, // Store original sessionId for reference (can be null)
         type: 'scheduled_chat', // Distinguish from regular task schedules
         emailCampaignTaskId: emailCampaignTaskId || null,
-        llmModel: llmModel || '', // Empty means "use default at runtime"
+        llmModel: validatedLlmModel, // Empty means "use default at runtime"
         ...scheduleBackup,
         runCount: runCount !== undefined ? runCount : -1, // Default to unlimited runs if not specified
         variables: [] as ScheduledChatVariable[],
@@ -12606,6 +12886,9 @@ export const agentModeController = {
         backupSelectionRequired: scheduleBackup.llmBackupNeedsConfirmation,
       });
     } catch (error) {
+      if (isModelUnavailableError(error)) {
+        return res.status(422).json(modelUnavailableBody(error));
+      }
       if (error instanceof Error && error.name === 'InvalidScheduledBackupModelError') {
         return res.status(400).json({ error: error.message });
       }
@@ -12731,14 +13014,42 @@ export const agentModeController = {
       }
 
       const now = new Date();
+      // ENG-903: validate a model pin only when this request CHANGES it. Re-sending the
+      // stored value (or omitting the field) must never be refused, or an old schedule whose
+      // model was since retired could not have unrelated fields edited.
+      const storedLlmModel = String((existingSchedule as any).llmModel ?? '').trim();
+      // Normalise ONCE; every later decision and the write use only this value.
+      // null is treated as "omitted" (the field is simply not touched): create treats null as
+      // "no selection", and a PATCH-style null must never be stored or silently clear the pin.
+      // '' / whitespace-only is the explicit clear. Any other non-string stays as-is so
+      // validateScheduleModelPin rejects it with the usual 422.
+      const llmModelProvided = llmModel !== undefined && llmModel !== null;
+      const incomingLlmModel: unknown = typeof llmModel === 'string' ? llmModel.trim() : llmModel;
+      const llmModelClearing = llmModelProvided && incomingLlmModel === '';
+      const llmModelChanging = llmModelProvided && !llmModelClearing && incomingLlmModel !== storedLlmModel;
+      const validatedLlmModel = llmModelChanging ? await validateScheduleModelPin(user.userId, incomingLlmModel) : undefined;
+
+      const existingBackupFields = {
+        llmBackupModel: (existingSchedule as any).llmBackupModel || '',
+        llmBackupSource: ((existingSchedule as any).llmBackupSource || 'system') as ModelBackupSource,
+        llmBackupNeedsConfirmation: (existingSchedule as any).llmBackupNeedsConfirmation !== false,
+      };
       const requestedBackupWasProvided = llmBackupModel !== undefined;
-      const scheduleBackup = requestedBackupWasProvided
-        ? await resolveScheduleBackup({ userId: user.userId, requestedBackupModel: llmBackupModel })
-        : {
-            llmBackupModel: (existingSchedule as any).llmBackupModel || '',
-            llmBackupSource: ((existingSchedule as any).llmBackupSource || 'system') as ModelBackupSource,
-            llmBackupNeedsConfirmation: (existingSchedule as any).llmBackupNeedsConfirmation !== false,
-          };
+      const incomingBackup = typeof llmBackupModel === 'string' ? llmBackupModel.trim() : llmBackupModel;
+      const backupUnchanged = requestedBackupWasProvided && incomingBackup !== '' && incomingBackup === String(existingBackupFields.llmBackupModel).trim();
+      let scheduleBackup: Awaited<ReturnType<typeof resolveScheduleBackup>> = existingBackupFields;
+      if (requestedBackupWasProvided && !backupUnchanged) {
+        const validatedBackup = await validateScheduleModelPin(user.userId, llmBackupModel);
+        scheduleBackup = await resolveScheduleBackup({ userId: user.userId, requestedBackupModel: validatedBackup });
+      } else if (backupUnchanged) {
+        // Same as before the retirement: keep refreshing source as before when still valid,
+        // but a since-retired stored backup must not block the edit.
+        try {
+          scheduleBackup = await resolveScheduleBackup({ userId: user.userId, requestedBackupModel: incomingBackup as string });
+        } catch (backupError) {
+          if (!(backupError instanceof Error && backupError.name === 'InvalidScheduledBackupModelError')) throw backupError;
+        }
+      }
 
       // Determine nextRunTime: use provided value or keep existing
       let scheduledNextRunTime = existingSchedule.nextRunTime;
@@ -12808,7 +13119,7 @@ export const agentModeController = {
         // question and not a rename's business.
         // Explicit empty -> a REMOVAL below, because inheritance is the ABSENCE of
         // the attribute, not a blank value in it.
-        ...(llmModel !== undefined && llmModel !== '' ? { llmModel } : {}),
+        ...(validatedLlmModel ? { llmModel: validatedLlmModel } : (llmModelProvided && !llmModelClearing && !llmModelChanging ? { llmModel: incomingLlmModel as string } : {})),
         ...scheduleBackup,
         // ENG-844: update the owner's timezone when a valid one is supplied; keep
         // the existing value otherwise (partial-update safe).
@@ -13064,7 +13375,7 @@ export const agentModeController = {
         // can re-derive it, only an edit can reset it. Otherwise "remove the
         // cross-account tools" could never get the schedule running again.
         [
-          ...(llmModel === '' ? ['llmModel'] : []),
+          ...(llmModelClearing ? ['llmModel'] : []),
           ...((toolsChanged || effectiveStartingMessage !== previousStartingMessage)
             && (existingSchedule as any).lastKnownSensitive !== undefined
             ? ['lastKnownSensitive', 'lastKnownSensitiveAt']
@@ -13100,6 +13411,9 @@ export const agentModeController = {
             'This schedule recorded a run while you were saving, so nothing was saved. ' +
             'Try again — its run history has changed.',
         });
+      }
+      if (isModelUnavailableError(error)) {
+        return res.status(422).json(modelUnavailableBody(error));
       }
       if (error instanceof Error && error.name === 'InvalidScheduledBackupModelError') {
         return res.status(400).json({ error: error.message });
@@ -14374,7 +14688,14 @@ export const agentModeController = {
 
       // Use session's llmModel if available, otherwise use default
       const defaultModel = await agentModeService.getDefaultModel();
-      const modelToUse = session.llmModel || defaultModel;
+      // The visitor selects nothing: a stored model that is retired or not selectable
+      // falls back to the current default (allowSilentSwap never throws).
+      const conversablePolicy = await resolveEffectiveModelForUser({
+        userId: session.userId,
+        requestedModel: session.llmModel || defaultModel,
+        allowSilentSwap: true,
+      });
+      const modelToUse = conversablePolicy.effectiveModel || session.llmModel || defaultModel;
 
       // Cancel generation immediately when the client disconnects
       req.on('close', () => {
@@ -15142,6 +15463,20 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Access denied to this session' });
       }
 
+      // A STORED model is not an explicit selection: when it is retired or not
+      // selectable by the owner, store the current default instead (as /generate
+      // does) so runVerifiedChat, which reads the session, never runs the stored one.
+      if (session.llmModel) {
+        const storedPolicy = await resolveEffectiveModelForUser({
+          userId: session.userId,
+          requestedModel: session.llmModel,
+          allowSilentSwap: true,
+        });
+        if (storedPolicy.modelSelection === 'corrected' && storedPolicy.effectiveModel) {
+          await chatbotDb.updateSessionLlmModel(sessionId, storedPolicy.effectiveModel, toStoredModelPolicyDecision(storedPolicy));
+        }
+      }
+
       // Track if client disconnected (user navigated away)
       let clientDisconnected = false;
       req.on('close', () => {
@@ -15185,7 +15520,7 @@ export const agentModeController = {
         // ENG-2072: a real person is watching this turn — never force hands-off
         // work-plan autocomplete, even if this session happens to be scheduled.
         isUnattendedRun: false
-      }));
+      }, { capInteractiveUserId: session.userId }));
 
       // If client disconnected, don't try to send response
       // The results are already saved to the session
@@ -15223,6 +15558,11 @@ export const agentModeController = {
         });
       }
 
+      // ENG-110: per-user concurrent interactive generation cap.
+      if (isTooManyConcurrentRunsError(error)) {
+        return res.status(429).json(buildTooManyRunsBody(error.current, error.limit));
+      }
+
       // ENG-2293: same handled outcome as the other three generate-response
       // chains (generateResponse, generateSharedResponse,
       // generateConversableResponse) — this one calls an LLM via
@@ -15236,7 +15576,6 @@ export const agentModeController = {
           suggestion: 'wait_and_retry',
         });
       }
-
       console.error('AgentMode: Verified generate error:', error);
       const sessionId = req.body?.sessionId;
       const user = req.user as User;
@@ -15809,6 +16148,11 @@ export const agentModeController = {
         return res.status(400).json({ error: 'frequencyIntervalDays must be a positive integer for every_n_days frequency' });
       }
 
+      // ENG-903: an explicit per-use override is validated like a direct create. The template's
+      // own stored llmModel is deliberately not re-validated here (see dev note).
+      const validatedOverrideModel = await validateScheduleModelPin(user.userId, overrideModel);
+      const validatedOverrideBackup = await validateScheduleModelPin(user.userId, overrideBackupModel);
+
       const now = new Date();
       // Generated here (rather than at the schedule-object build below) so it can
       // seed the jitter that spreads this schedule's fire time off the exact round
@@ -15849,7 +16193,7 @@ export const agentModeController = {
 
       const scheduleBackup = await resolveScheduleBackup({
         userId: user.userId,
-        requestedBackupModel: overrideBackupModel,
+        requestedBackupModel: validatedOverrideBackup,
       });
       const scheduledChat: any = {
         scheduleId,
@@ -15873,7 +16217,11 @@ export const agentModeController = {
         updatedAt: now.toISOString(),
         sessionId: null,
         type: 'scheduled_chat',
-        llmModel: overrideModel || template.llmModel || '',
+        // Omitted (undefined/null) inherits the template pin; an explicit ''/whitespace
+        // override means UNPINNED and must not fall back to it.
+        llmModel: (overrideModel === undefined || overrideModel === null)
+          ? (template.llmModel || '')
+          : validatedOverrideModel,
         ...scheduleBackup,
         runCount: runCount !== undefined ? runCount : -1,
         variables: templateVars,
@@ -15921,6 +16269,9 @@ export const agentModeController = {
         backupSelectionRequired: scheduleBackup.llmBackupNeedsConfirmation,
       });
     } catch (error) {
+      if (isModelUnavailableError(error)) {
+        return res.status(422).json(modelUnavailableBody(error));
+      }
       if (error instanceof Error && error.name === 'InvalidScheduledBackupModelError') {
         return res.status(400).json({ error: error.message });
       }
