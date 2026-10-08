@@ -1517,3 +1517,48 @@ describe('intakeService.fileAutoIssue — Alert Scope narrows class clustering (
     expect(r).toMatchObject({ pageId: 'ENG-337', deduped: true });
   });
 });
+
+// ENG-2363: LinkedIn disconnect alerts (first + 7d/14d reminders) carry a stable per-account
+// Alert Class, so one disconnected account files exactly one canonical regardless of title churn.
+describe('intakeService.fileAutoIssue — LinkedIn disconnect alert class (ENG-2363)', () => {
+  const { linkedInDisconnectAlertClass } = jest.requireActual('../services/linkedInConnectionHealth');
+  afterEach(() => { jest.clearAllMocks(); });
+
+  function statefulBoard() {
+    const open: any[] = [];
+    let n = 3000;
+    linear.listOpenIssuesByLabel.mockImplementation(async () => open.slice());
+    linear.createInternalLinearIssue.mockImplementation(async (a: any) => {
+      n += 1;
+      // Linear normalizes "- " bullets to "* " in stored descriptions.
+      open.push({ identifier: `ENG-${n}`, issueId: `uuid-${n}`, title: a.title, description: String(a.description).replace(/^- /gm, '* ') });
+      return { identifier: `ENG-${n}`, url: 'u' };
+    });
+    return open;
+  }
+  const file = (accountId: string, title: string) => fileAutoIssue({
+    title, description: 'd', source: 'Agent Mode oncall',
+    notionContext: { accountId, 'Alert Class': linkedInDisconnectAlertClass(accountId) },
+  });
+
+  it('first alert files one issue; 7d and 14d reminders comment on it and create nothing', async () => {
+    statefulBoard();
+    const a = await file('ofGscnIrR5qZYZ00ovNsTQ', 'LinkedIn Outreach account disconnected: Jennifer Sun');
+    const b = await file('ofGscnIrR5qZYZ00ovNsTQ', 'LinkedIn Outreach account still disconnected (7d): Jennifer Sun');
+    const c = await file('ofGscnIrR5qZYZ00ovNsTQ', 'LinkedIn Outreach account still disconnected (14d): Jennifer Sun');
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    expect(b).toMatchObject({ pageId: a.pageId, deduped: true });
+    expect(c).toMatchObject({ pageId: a.pageId, deduped: true });
+    expect(linear.addIssueComment).toHaveBeenCalledTimes(2);
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-3001', expect.stringMatching(/^Recurred on /));
+  });
+
+  it('a different account, including a prefix account id, still gets its own issue', async () => {
+    statefulBoard();
+    await file('abc123', 'LinkedIn Outreach account still disconnected (7d): Sue Xu');
+    await file('abc', 'LinkedIn Outreach account still disconnected (8d): Kevin Rajan');
+    await file('abc1234', 'LinkedIn Outreach account still disconnected (9d): Other');
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(3);
+    expect(linear.addIssueComment).not.toHaveBeenCalled();
+  });
+});
