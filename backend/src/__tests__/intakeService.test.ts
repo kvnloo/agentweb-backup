@@ -709,6 +709,39 @@ describe('intakeService.fileAutoIssue', () => {
     expect(r).toMatchObject({ deduped: true, tracker: 'Linear' });
   });
 
+  describe('identical same-day recurrence (ENG-2066)', () => {
+    const ctx = { email: 'order@x.com', capability: 'ad_platform_integration' };
+    const today = () => new Date().toISOString().slice(0, 10);
+    beforeEach(() => {
+      linear.listOpenIssuesByLabel.mockResolvedValue([{ identifier: 'ENG-66', issueId: 'uuid-66', title: 'Renewal at risk' }]);
+    });
+    afterEach(() => linear.getIssueCommentsDetailed.mockResolvedValue([]));
+
+    it('skips the comment when an identical one (Linear "* " bullets) was already posted today', async () => {
+      linear.getIssueCommentsDetailed.mockResolvedValue([
+        { body: `Recurred on ${today()}.\n* email: order@x.com\n* capability: ad_platform_integration`, createdAt: '' },
+      ]);
+      const r = await fileAutoIssue({ title: 'Renewal at risk', description: 'd', source: 'Oncall', notionContext: ctx });
+      expect(linear.addIssueComment).not.toHaveBeenCalled();
+      expect(r).toMatchObject({ deduped: true });
+    });
+
+    it('still posts when the context changed or the prior comment is from another day', async () => {
+      linear.getIssueCommentsDetailed.mockResolvedValue([
+        { body: `Recurred on 2000-01-01.\n* email: order@x.com\n* capability: ad_platform_integration`, createdAt: '' },
+        { body: `Recurred on ${today()}.\n* email: order@x.com\n* capability: other`, createdAt: '' },
+      ]);
+      await fileAutoIssue({ title: 'Renewal at risk', description: 'd', source: 'Oncall', notionContext: ctx });
+      expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-66', expect.stringContaining('Recurred on'));
+    });
+
+    it('fails open: a comment-read error still posts the recurrence', async () => {
+      linear.getIssueCommentsDetailed.mockRejectedValue(new Error('linear down'));
+      await fileAutoIssue({ title: 'Renewal at risk', description: 'd', source: 'Oncall', notionContext: ctx });
+      expect(linear.addIssueComment).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it('flag ON + no match -> creates a private internal issue with the Auto label', async () => {
     process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenIssuesByLabel.mockResolvedValue([]);
