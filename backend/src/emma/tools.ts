@@ -9416,7 +9416,7 @@ GAQL EXAMPLES:
   Campaign: SELECT campaign.id, campaign.name, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions FROM campaign WHERE segments.date DURING LAST_30_DAYS
   Keywords: SELECT ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, metrics.clicks, metrics.cost_micros, metrics.average_cpc FROM keyword_view WHERE segments.date DURING LAST_30_DAYS
   Quality Score: SELECT ad_group_criterion.keyword.text, ad_group_criterion.quality_info.quality_score, ad_group_criterion.quality_info.creative_quality_score, ad_group_criterion.quality_info.post_click_quality_score, ad_group_criterion.quality_info.search_predicted_ctr FROM keyword_view WHERE ad_group_criterion.status = 'ENABLED'
-  (There is no quality_info.ad_relevance field; "ad relevance" is creative_quality_score. Quality-score fields cannot be combined with segments.date.)`,
+  (There is no quality_info.ad_relevance field; "ad relevance" is creative_quality_score. ad_group_criterion.quality_info.* fields cannot be combined with segments.date; use metrics.historical_quality_score for date-segmented quality score.)`,
     inputSchema: {
       type: 'object',
       properties: {
