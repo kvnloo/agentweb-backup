@@ -207,4 +207,44 @@ describe('AgentModeService - attachKnowledgeBaseFiles', () => {
     expect(updatedFiles[0].filename).toBe('existing.txt');
     expect(updatedFiles[1].filename).toBe('new-file.txt');
   });
+  it.each(['fileName', 'file_name', 'filename'])(
+    'should accept "%s" as the file name key (ENG-2350)',
+    async (key) => {
+      mockTaskDb.getTaskById.mockResolvedValue({
+        taskId: 'task-123',
+        userId: 'user-123',
+        knowledgeBaseType: 'private',
+        knowledgeBaseFiles: [],
+      });
+      mockTaskDb.updateTask.mockResolvedValue({});
+
+      const mockFile = new Storage().bucket().file();
+      mockFile.save.mockResolvedValue(undefined);
+      mockFile.getSignedUrl.mockResolvedValue(['https://example.com/signed-url']);
+
+      const result = await agentModeService.attachKnowledgeBaseFiles(
+        'task-123',
+        [{ [key]: 'design.md', content: '# Design' } as any],
+        'user-123',
+        'session-123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(mockTaskDb.updateTask.mock.calls[0][1].knowledgeBaseFiles[0].filename).toBe('design.md');
+    }
+  );
+
+  it('should return an actionable error when a file has no name (ENG-2350)', async () => {
+    const result = await agentModeService.attachKnowledgeBaseFiles(
+      'task-123',
+      [{ content: 'some content' } as any],
+      'user-123',
+      'session-123'
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('Invalid input: missing file name');
+    expect(result.message).toContain('"name"');
+    expect(mockTaskDb.updateTask).not.toHaveBeenCalled();
+  });
 });
