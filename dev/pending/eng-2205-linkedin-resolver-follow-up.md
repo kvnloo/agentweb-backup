@@ -6,7 +6,8 @@
   an `unknown` account is returned as a last resort (own before pool).
 - **Side effects handled in #3341:** a caller that then makes a real call can throw an infrastructure error.
   `isLinkedInInfraError` (utils/linkedInInfraError.ts: credential fetch, gateway html, transport errors, timeouts,
-  and SERVER_ERROR only for 502/503/504 - a plain 500 can be request-specific) maps these to a handled 503 on
+  and SERVER_ERROR only for gateway statuses 502/503/504 and Cloudflare-style 520-524 - a plain 500 can be
+  request-specific) maps these to a handled 503 on
   send-linkedin-message, send-linkedin-invite, sync-linkedin-connections and the prospect preview.
   `import_leads_from_search` hands the agent the generic text and, on a PROVEN dead session only
   (`isProvenDisconnectError`, which excludes a bare 403), clears the probe cache and records account health with
@@ -22,7 +23,14 @@
   caller's own LinkedIn steps are exempt so an unrelated edit still saves after an account is disconnected. The drip
   worker re-checks the pin at send time and snoozes that enrollment 30 minutes (typed
   `PinnedLinkedInAccountNotConnectedError`); a failed ownership lookup keeps the normal retry.
-- **send-linkedin-message:** a failed engagement write AFTER a successful send now returns success with
+- **send-linkedin-message:** the engagement write after a successful send is retried twice (keyed put with a fixed
+  event id, so a retry overwrites rather than duplicates); if it still fails the route returns success with
   `engagementRecorded: false` instead of a failure that invites a duplicate message.
+- **Ownership gate** (`resolveLinkedInAccountFromList`) accepts either of a row's two ids (`account_id` or Unipile's
+  `config.unipile_account_id`; they differ on legacy rows, as `scheduledRunAccountGate` already assumes). Both ids belong
+  to a row already scoped to the caller's own/org-shared accounts, so this widens naming, not access.
+- **import_leads_from_search** records an account as disconnected immediately only for Unipile's explicit
+  `errors/disconnected_account`; a bare 401 needs a fresh probe to confirm first (recording pauses scheduled runs and
+  emails the owner).
 - **Still true, by design (tracked in ENG-2347):** read/search tools, send-linkedin-message auto-resolve, the full
   resync route and the drip worker's auto-resolved account may use the site-wide pool.
