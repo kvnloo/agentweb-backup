@@ -22,9 +22,14 @@ export function staffOperatedBadge(user: unknown): StaffOperatedBadge | null {
   if (!user || typeof user !== "object") return null;
   const signal = (user as { selfActivity?: Partial<SelfActivitySignal> | null }).selfActivity;
   if (!signal || typeof signal !== "object" || signal.staffOperatedSuspect !== true) return null;
+  // A malformed signal renders no chip: lastSelfActiveAt must be null/absent or a parseable date.
+  const raw = signal.lastSelfActiveAt;
+  if (raw !== null && raw !== undefined && (typeof raw !== "string" || Number.isNaN(Date.parse(raw)))) {
+    return null;
+  }
   const last =
-    typeof signal.lastSelfActiveAt === "string" && signal.lastSelfActiveAt
-      ? `Last customer self-activity: ${signal.lastSelfActiveAt.slice(0, 10)}.`
+    typeof raw === "string"
+      ? `Last customer self-activity: ${new Date(raw).toISOString().slice(0, 10)}.`
       : "No customer self-activity ever recorded.";
   return {
     label: "Staff-operated?",

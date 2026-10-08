@@ -34,4 +34,13 @@ describe("staffOperatedBadge (ENG-1271)", () => {
     expect(staffOperatedBadge({ selfActivity: null as any })).toBeNull();
     expect(staffOperatedBadge({ selfActivity: { staffOperatedSuspect: "yes" } as any })).toBeNull();
   });
+
+  it("returns null for a malformed lastSelfActiveAt", () => {
+    expect(
+      staffOperatedBadge({ selfActivity: { selfActiveRecently: false, lastSelfActiveAt: "not-a-date", staffOperatedSuspect: true } }),
+    ).toBeNull();
+    expect(
+      staffOperatedBadge({ selfActivity: { selfActiveRecently: false, lastSelfActiveAt: 42, staffOperatedSuspect: true } as any }),
+    ).toBeNull();
+  });
 });
