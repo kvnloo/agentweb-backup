@@ -207,6 +207,6 @@ describe('ENG-112 omitBranchOrigin', () => {
     expect(out[0].metadata).toEqual({ timestamp: 't', systemPromptVersion: 'v1' });
     expect(JSON.stringify(out)).not.toContain('Secret title');
     expect(out).toHaveLength(3);
-    expect(input[0].metadata.branchOrigin.sourceSessionId).toBe('src');
+    expect((input[0].metadata as any).branchOrigin.sourceSessionId).toBe('src');
   });
 });
