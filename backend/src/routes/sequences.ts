@@ -138,6 +138,41 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
   }
 });
 
+// ENG-2205: a step's linkedInAccountId is the Unipile account the drip worker will SEND from.
+// It arrives in the request body, so it must be an account the caller owns or that is shared with
+// their org — otherwise any user could name the site-wide pool account (whose id is disclosed in
+// agent tool responses) or another customer's account and have the worker send from it. Same
+// check send-linkedin-message/-invite, withdraw and accept-invitation already apply.
+const LINKEDIN_STEP_ACCOUNT_ERROR = 'A LinkedIn step references an account that is not connected to your user.';
+
+// `alreadyPinned` (PUT only) holds the account ids already stored on the caller's own sequence. Those are not
+// re-validated: a user can legitimately have a sequence whose pinned account was later disconnected, and an
+// unrelated edit must still save. They cannot be abused to send, because the drip worker re-checks the pin at
+// send time. Only a NEW or CHANGED pin has to be an account the caller owns or shares.
+// Mirrors the drip worker's channel derivation (dripSequenceWorker.ts): a step is a LinkedIn step only when its
+// channel normalises to 'linkedin'. A pin left behind on an email step is never used to send, so it is neither
+// validated here nor trusted as an already-stored pin.
+const isLinkedInChannelStep = (step: any): boolean =>
+  String(step?.channel ?? 'email').trim().toLowerCase() === 'linkedin';
+
+async function stepsReferenceForeignLinkedInAccount(
+  userId: string,
+  steps: unknown,
+  alreadyPinned: ReadonlySet<string> = new Set(),
+): Promise<boolean> {
+  if (!Array.isArray(steps)) return false;
+  const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+  for (const step of steps) {
+    if (!isLinkedInChannelStep(step)) continue; // pin on a non-LinkedIn step is inert
+    const id = step?.linkedInAccountId;
+    if (id === undefined || id === null || id === '') continue; // auto-resolved by the worker
+    if (typeof id !== 'string') return true;
+    if (alreadyPinned.has(id)) continue;
+    if (!(await resolveLinkedInAccountForWrite(userId, id))) return true;
+  }
+  return false;
+}
+
 // POST /api/crm/sequences
 router.post('/', authenticateToken, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
@@ -147,6 +182,9 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
   }
 
   try {
+    if (await stepsReferenceForeignLinkedInAccount(authReq.user!.userId, steps)) {
+      return res.status(403).json({ error: LINKEDIN_STEP_ACCOUNT_ERROR });
+    }
     const input: CreateSequenceInput = {
       userId: authReq.user!.userId,
       name: name.trim(),
@@ -193,6 +231,21 @@ router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response
         const bound = typeof lid === 'string' && lid ? await crmDb.getLeadListById(lid).catch(() => null) : null;
         if (isSessionList(bound)) return res.status(400).json({ error: SESSION_LIST_SEQUENCE_ERROR });
       }
+    }
+    // Only trust the stored pins of the CALLER's own sequence (updateSequence rejects anyone else below).
+    // A failed read is NOT treated as "no stored pins": that would turn a transient DynamoDB error into a
+    // misleading 403. It propagates to the generic handler (500, retryable) like updateSequence's own read would.
+    const stored = Array.isArray(steps) ? await dripSequenceDb.getSequence(req.params.sequenceId) : null;
+    const alreadyPinned = new Set<string>(
+      stored && stored.userId === authReq.user!.userId
+        ? (stored.steps ?? [])
+            .filter(isLinkedInChannelStep)
+            .map((st: any) => st?.linkedInAccountId)
+            .filter((v: unknown): v is string => typeof v === 'string' && !!v)
+        : [],
+    );
+    if (await stepsReferenceForeignLinkedInAccount(authReq.user!.userId, steps, alreadyPinned)) {
+      return res.status(403).json({ error: LINKEDIN_STEP_ACCOUNT_ERROR });
     }
     const input: UpdateSequenceInput = {
       name,
