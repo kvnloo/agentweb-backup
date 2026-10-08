@@ -112,6 +112,39 @@ describe('detectCrmFreshnessMismatch (ENG-2263)', () => {
   });
 });
 
+// This runs synchronously on every reply. An unbounded `[^\]]*` / `[^>]*` regex is quadratic on unclosed
+// delimiters (measured before the fix: 100KB of "[verified " blocked the event loop 1.5s, 500KB 37s).
+describe('detectCrmFreshnessMismatch stays linear on hostile input (ENG-2263)', () => {
+  const ms = (text: string) => { const t0 = process.hrtime.bigint(); detectCrmFreshnessMismatch(text, []); return Number(process.hrtime.bigint() - t0) / 1e6; };
+  it.each([
+    ['unclosed [verified', '[verified '.repeat(100_000)],
+    ['unclosed <', '<'.repeat(500_000)],
+    ['unclosed <a', '<a '.repeat(200_000)],
+    ['"< " then one far ">"', '< '.repeat(100_000) + '>'],
+    ['mixed unclosed < and [verified', '<[verified '.repeat(20_000)],
+  ])('%s finishes well under a second', (_label, text) => {
+    expect(ms(text)).toBeLessThan(500);
+  });
+
+  it('caps the work on a reply stuffed with tags', () => {
+    const r = detectCrmFreshnessMismatch('[verified: get_leads] '.repeat(20_000), []);
+    expect(r.tagsSeen).toBe(200);
+    expect(r.findings).toHaveLength(200);
+  });
+
+  it('treats a lone "<" as text, and still finds a tag after it', () => {
+    expect(detectCrmFreshnessMismatch('5 < 6 and 47 leads [verified: get_lead_lists]', []).findings).toHaveLength(1);
+  });
+
+  it('strips real markup around and inside a tag', () => {
+    expect(detectCrmFreshnessMismatch('<b>47</b> leads <i>[verified: <code>get_lead_lists</code>]</i>', []).findings).toHaveLength(1);
+  });
+
+  it('does not match a tag longer than the 300-char bound (not a real tag)', () => {
+    expect(detectCrmFreshnessMismatch('[verified: get_lead_lists ' + 'x'.repeat(400) + ']', []).findings).toEqual([]);
+  });
+});
+
 describe('runCrmFreshnessShadow (ENG-2263)', () => {
   const OLD = process.env.AGENT_CRM_FRESHNESS_GUARD;
   afterEach(() => {
