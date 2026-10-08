@@ -26,7 +26,14 @@ models; with the total check, 39/39 on the set the patterns were tuned on and 36
 number; one reply that deliberately compared "was 18 / 47" against fresh counts was a genuine false alarm.
 
 Reading it: one JSON line per flagged reply, `[crm-freshness-shadow] ... {"sessionId","model","kinds","findingCount","tagsSeen",
-"crmToolsSucceeded","sample"}` (no message text). Summarise with
-`node backend/scripts/summarize-crm-freshness-shadow.mjs web.stdout.log` (counts per model/kind, most-claimed numbers). Counts are
-flagged replies, not rates - the denominator comes from request logs. Decide enforcement (rewrite the tag / append a caveat) only after
-reading production output.
+"crmToolsSucceeded","claimed":[numbers],"cited":[tool names]}`. It carries NO reply text - only numbers and tool names (an earlier
+revision logged a 60-120 char slice of the reply, which can contain names and emails; the PR #3351 review caught it and a test now
+asserts the exact key set and that PII in the reply never reaches the line). Summarise with
+`node backend/scripts/summarize-crm-freshness-shadow.mjs web.stdout.log` (counts per model/kind, most-claimed numbers, cited tools).
+Counts are flagged replies, not rates - the denominator comes from request logs. "Not backed this turn" is not the same as "stale": a
+legitimate follow-up that restates an earlier number is flagged too. Decide enforcement only after reading production output.
+
+Known limits: numbers are matched only in the patterns above ("N lead lists", "N leads in total", "Total leads: N", "Lead lists: N",
+"N leads across K lists"); "1.2k", "twelve" and a bare "47 leads" are not claims. After a CRM write the check abstains. A turn that spans
+several generateMarketingResponse invocations (auto-continue) only sees evidence from the current one. Only count-like fields
+(count, total, totalLists, leadCount, ...) and array lengths back a number - not arbitrary numbers inside lead rows.
