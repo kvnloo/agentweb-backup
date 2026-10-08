@@ -1021,7 +1021,7 @@ describe('AgentModeController - createSessionWithPlan', () => {
       const withInputStep = () => mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((v: string) =>
         Promise.resolve(v === 'system' ? [{
           ...mockWorkPlans[0], defaultModel: 'gpt-5-chat',
-          steps: [{ stepCount: 1, title: 'a', inputRequest: { title: 'T', fields: [] } }, { stepCount: 2, title: 'b' }],
+          steps: [{ stepCount: 1, title: 'a', inputRequest: { title: 'T', prompt: 'P', fields: [] } }, { stepCount: 2, title: 'b' }],
         }] : []));
 
       it.each([
