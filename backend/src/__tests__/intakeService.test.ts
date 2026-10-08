@@ -1430,6 +1430,61 @@ describe('fileUserIssue — bug, ENG-1335 occurrence ladder + semantic grouping'
   });
 });
 
+// ENG-2267: a per-account fleet detector carries `Alert Scope`, so one account's alert never
+// folds onto another customer's canonical just because they share an Alert Class.
+describe('intakeService.fileAutoIssue — Alert Scope narrows class clustering (ENG-2267)', () => {
+  afterEach(() => { jest.clearAllMocks(); });
+
+  function statefulBoard(seed: any[] = []) {
+    const open: any[] = seed.slice();
+    let n = 4000;
+    linear.listOpenIssuesByLabel.mockImplementation(async () => open.slice());
+    linear.createInternalLinearIssue.mockImplementation(async (a: any) => {
+      n += 1;
+      open.push({ identifier: `ENG-${n}`, issueId: `uuid-${n}`, title: a.title, description: String(a.description).replace(/^- /gm, '* ') });
+      return { identifier: `ENG-${n}`, url: 'u' };
+    });
+    return open;
+  }
+  const file = (acct: string, count: number) => fileAutoIssue({
+    title: `Meta ad account ${acct} is paying for traffic to ${count} destination(s) that cannot report conversions`,
+    description: 'd', source: 'Oncall alert',
+    notionContext: { 'Alert Class': 'meta-destination-unmeasured', 'Alert Scope': `meta-ad-account:${acct}`, 'Alert Priority': 'high', 'Ad Account': acct },
+  });
+
+  it('two accounts in the same class get separate canonicals; each recurrence folds onto its own', async () => {
+    statefulBoard();
+    const a1 = await file('1030388036131162', 2);
+    const b1 = await file('874451754937843', 1);
+    const b2 = await file('874451754937843', 3);
+    const a2 = await file('1030388036131162', 2);
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(2);
+    expect(b1.pageId).not.toBe(a1.pageId);
+    expect(b2).toMatchObject({ pageId: b1.pageId, deduped: true });
+    expect(a2).toMatchObject({ pageId: a1.pageId, deduped: true });
+  });
+
+  it('a scope that is a prefix of another account id never cross-matches', async () => {
+    statefulBoard();
+    await file('123', 1);
+    await file('1234', 1);
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(2);
+  });
+
+  it('a legacy unscoped canonical of the class does not absorb a scoped occurrence for a different account', async () => {
+    statefulBoard([{ identifier: 'ENG-2267', issueId: 'uuid-2267', title: 'Meta ad account 1030388036131162 is paying for traffic to 2 destination(s) that cannot report conversions', description: 'x\n* Alert Class: meta-destination-unmeasured' }]);
+    const r = await file('874451754937843', 3);
+    expect(r.deduped).toBe(false);
+    expect(linear.addIssueComment).not.toHaveBeenCalled();
+  });
+
+  it('unscoped alerts keep plain class clustering (no behaviour change for other classes)', async () => {
+    statefulBoard([{ identifier: 'ENG-337', issueId: 'uuid-337', title: 'v0', description: 'x\n* Alert Class: v0-credits' }]);
+    const r = await fileAutoIssue({ title: 'v0 credits LOW', description: 'd', source: 'Oncall alert', notionContext: { 'Alert Class': 'v0-credits' } });
+    expect(r).toMatchObject({ pageId: 'ENG-337', deduped: true });
+  });
+});
+
 // ENG-2363: LinkedIn disconnect alerts (first + 7d/14d reminders) carry a stable per-account
 // Alert Class, so one disconnected account files exactly one canonical regardless of title churn.
 describe('intakeService.fileAutoIssue — LinkedIn disconnect alert class (ENG-2363)', () => {
