@@ -652,6 +652,7 @@ export interface FileAutoIssueParams {
  */
 const ALERT_CLASS_CONTEXT_KEY = 'Alert Class';
 const ALERT_PRIORITY_CONTEXT_KEY = 'Alert Priority';
+const ALERT_SCOPE_CONTEXT_KEY = 'Alert Scope';
 
 export interface FiledAutoResult {
   pageId: string;
@@ -715,8 +716,19 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
   // "v0-credits-backup") can never cross-match — the writer always emits the class as the last
   // thing on its own line.
   const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const classNeedle = alertClass
+  // ENG-2267: an optional `Alert Scope` narrows the class to one subject (e.g. one ad account),
+  // so a fleet detector that alerts per account files one canonical PER ACCOUNT instead of
+  // folding every customer's occurrence onto whichever account happened to file first.
+  const rawScope = p.notionContext?.[ALERT_SCOPE_CONTEXT_KEY];
+  const alertScope = rawScope === undefined || rawScope === null ? '' : String(rawScope).trim();
+  const classRe = alertClass
     ? new RegExp(`${escapeRegExp(`${ALERT_CLASS_CONTEXT_KEY}: ${alertClass}`)}\\s*$`, 'm')
+    : null;
+  const scopeRe = alertScope
+    ? new RegExp(`${escapeRegExp(`${ALERT_SCOPE_CONTEXT_KEY}: ${alertScope}`)}\\s*$`, 'm')
+    : null;
+  const classNeedle = classRe
+    ? { test: (d: string) => classRe.test(d) && (!scopeRe || scopeRe.test(d)) }
     : null;
   const rawPriority = p.notionContext?.[ALERT_PRIORITY_CONTEXT_KEY];
   const priority = rawPriority ? LINEAR_PRIORITY[String(rawPriority).trim().toLowerCase()] : undefined;

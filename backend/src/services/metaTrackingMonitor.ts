@@ -947,6 +947,8 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
         ].join('\n'),
         {
           'Alert Class': TOKEN_ALERT_CLASS,
+          // ENG-2267: one canonical per ad account, not one per class fleet-wide.
+          'Alert Scope': `meta-ad-account:${adAccountId}`,
           'Alert Priority': 'high',
           'Ad Account': adAccountId,
           'Owner User Id': user?.userId,
@@ -1068,6 +1070,8 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
       ].join('\n'),
       {
         'Alert Class': BLACKOUT_ALERT_CLASS,
+        // ENG-2267: one canonical per ad account, not one per class fleet-wide.
+        'Alert Scope': `meta-ad-account:${adAccountId}`,
         'Alert Priority': 'high',
         'Consecutive Days': verdict.consecutiveBlackoutDays,
         'Spend In Blackout': verdict.spendInBlackout.toFixed(2),
@@ -1286,6 +1290,8 @@ async function checkOptimisationCoverage(
       ].join('\n'),
       {
         'Alert Class': OPTIMISATION_ALERT_CLASS,
+        // ENG-2267: one canonical per ad account, not one per class fleet-wide.
+        'Alert Scope': `meta-ad-account:${adAccountId}`,
         'Alert Priority': 'high',
         'Ad Account': adAccountId,
         'Owner User Id': user?.userId,
@@ -1414,6 +1420,8 @@ async function checkDestinationCoverage(
       ].join('\n'),
       {
         'Alert Class': DESTINATION_ALERT_CLASS,
+        // ENG-2267: one canonical per ad account, not one per class fleet-wide.
+        'Alert Scope': `meta-ad-account:${adAccountId}`,
         'Alert Priority': 'high',
         'Ad Account': adAccountId,
         'Owner User Id': user?.userId,
@@ -1694,6 +1702,8 @@ async function checkEventMixCoverage(
       ].join('\n'),
       {
         'Alert Class': EVENT_MIX_ALERT_CLASS,
+        // ENG-2267: one canonical per ad account, not one per class fleet-wide.
+        'Alert Scope': `meta-ad-account:${adAccountId}`,
         'Alert Priority': 'high',
         'Ad Account': adAccountId,
         'Owner User Id': user?.userId,
