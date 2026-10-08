@@ -162,11 +162,24 @@ describe('leads/CRM cluster delegates to emma/impl/leads.ts (ENG-2103 F2)', () =
       { userId: 'u1' }
     );
 
+    // include_all_fields (ENG-425) is always forwarded as a strict boolean; omitted -> false.
     expect(mockLeads.getLeads).toHaveBeenCalledWith('L1', 'u1', {
       search: 'acme', status: 'qualified', icpOnly: true, engagedOnly: false, limit: 10, cursor: 'c1',
       includeAllFields: false, // defaults false when include_all_fields isn't requested
     });
     expect(result).toBe(expected);
+  });
+
+  it('get_leads forwards include_all_fields: true as includeAllFields (ENG-425 export path), and only a literal true', async () => {
+    mockLeads.getLeads.mockResolvedValue({ success: true, leads: [] });
+    const tool = emmaToolRegistry.getTool('get_leads')!;
+
+    await tool.execute({ list_id: 'L1', include_all_fields: true }, { userId: 'u1' });
+    expect(mockLeads.getLeads).toHaveBeenLastCalledWith('L1', 'u1', expect.objectContaining({ includeAllFields: true }));
+
+    // A truthy non-boolean (e.g. the string "true" from a sloppy caller) must NOT enable the full export.
+    await tool.execute({ list_id: 'L1', include_all_fields: 'true' }, { userId: 'u1' });
+    expect(mockLeads.getLeads).toHaveBeenLastCalledWith('L1', 'u1', expect.objectContaining({ includeAllFields: false }));
   });
 
   it('search_leads forwards list_id/filters/userId/limit and the options bag (list_ids -> listIds)', async () => {
