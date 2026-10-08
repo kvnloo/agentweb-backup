@@ -37,6 +37,10 @@ jest.mock('../services/dripSequenceDb', () => ({
 }));
 
 jest.mock('../services/resendService', () => ({ resendService: { sendEmail: jest.fn() } }));
+const mockResolveLinkedInAccountForWrite = jest.fn();
+jest.mock('../services/agentMode/linkedInDailyVolumeGate', () => ({
+  resolveLinkedInAccountForWrite: (...args: any[]) => mockResolveLinkedInAccountForWrite(...args),
+}));
 
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
@@ -127,6 +131,9 @@ beforeEach(() => {
   mockLi.resolveAccountId.mockResolvedValue('acct-1' as any);
   mockLi.resolveProviderId.mockResolvedValue('prov-1' as any);
   mockLi.sendMessage.mockResolvedValue(undefined as any);
+  mockResolveLinkedInAccountForWrite.mockReset();
+  mockResolveLinkedInAccountForWrite.mockResolvedValue({ ownerUserId: 'user-1' });
+  mockDb.snoozeEnrollment.mockResolvedValue(undefined as any);
 });
 
 describe('the LinkedIn send path uses the canonical URL the predicate validated', () => {
@@ -238,5 +245,58 @@ describe('the LinkedIn reply-exit resolves the same canonical URL', () => {
 
     expect(mockLi.getMessagesWithContact).not.toHaveBeenCalled();
     expect(mockDb.exitEnrollment).not.toHaveBeenCalled();
+  });
+});
+
+
+// ENG-2205: a step's pinned linkedInAccountId arrives from the request body when a sequence is saved,
+// and sequences stored before that was validated may name any account (including the shared pool).
+describe('a pinned LinkedIn account must belong to the sequence owner (ENG-2205)', () => {
+  const pinned = (id: string) => ({
+    ...linkedInSequence,
+    steps: [{ ...linkedInSequence.steps[0], linkedInAccountId: id }],
+  });
+  beforeEach(() => {
+    mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'lead-1', linkedin: 'https://www.linkedin.com/in/ada/' } as any);
+  });
+
+  it('sends from the pinned account when the owner owns or shares it', async () => {
+    mockDb.getSequence.mockResolvedValue(pinned('owned-acct') as any);
+    const stats = await processDueEnrollments();
+    expect(mockResolveLinkedInAccountForWrite).toHaveBeenCalledWith('user-1', 'owned-acct');
+    expect(stats.errors).toBe(0);
+    expect(mockLi.sendMessage).toHaveBeenCalledWith('owned-acct', expect.any(String), true, expect.any(String));
+  });
+
+  it('refuses to send, and SNOOZES (not retry every tick) when the pinned account is not theirs', async () => {
+    mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+    mockDb.getSequence.mockResolvedValue(pinned('pool-or-foreign-acct') as any);
+    const stats = await processDueEnrollments();
+    expect(mockLi.sendMessage).not.toHaveBeenCalled();
+    expect(stats.errors).toBe(1);
+    expect(mockDb.snoozeEnrollment).toHaveBeenCalledTimes(1);
+    const retryAt = new Date(mockDb.snoozeEnrollment.mock.calls[0][1]).getTime();
+    // Backed off (well past the next 5-minute tick) but short, so a fixed step resumes soon: editing a
+    // sequence does not reset nextSendAt.
+    expect(retryAt - Date.now()).toBeGreaterThan(20 * 60 * 1000);
+    expect(retryAt - Date.now()).toBeLessThan(40 * 60 * 1000);
+    expect(mockDb.releaseEnrollmentClaim).not.toHaveBeenCalled();
+  });
+
+  it('a transient failure of the ownership LOOKUP itself is not treated as "not connected" (keeps the normal retry)', async () => {
+    mockResolveLinkedInAccountForWrite.mockRejectedValue(new Error('DynamoDB throttled'));
+    mockDb.getSequence.mockResolvedValue(pinned('owned-acct') as any);
+    await processDueEnrollments();
+    expect(mockLi.sendMessage).not.toHaveBeenCalled();
+    expect(mockDb.snoozeEnrollment).not.toHaveBeenCalled();
+    expect(mockDb.releaseEnrollmentClaim).toHaveBeenCalled();
+  });
+
+  it('does not run the check when no account is pinned (auto-resolve path unchanged)', async () => {
+    const stats = await processDueEnrollments();
+    expect(mockResolveLinkedInAccountForWrite).not.toHaveBeenCalled();
+    expect(mockLi.resolveAccountId).toHaveBeenCalledWith('user-1');
+    expect(stats.errors).toBe(0);
+    expect(mockLi.sendMessage).toHaveBeenCalledTimes(1);
   });
 });
