@@ -134,6 +134,6 @@ export async function checkPlanDefaultModelWrite(
     const display = typeof agentModeService.getModelDisplayName === 'function'
       ? agentModeService.getModelDisplayName(error.requestedModel)
       : undefined;
-    return { ok: false, body: buildModelUnavailableBody(error, display) };
+    return { ok: false, body: buildModelUnavailableBody(error, display, 'work_plan_pin') };
   }
 }

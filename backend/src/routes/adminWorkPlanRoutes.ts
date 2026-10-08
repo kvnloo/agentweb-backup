@@ -4,7 +4,7 @@ import sharp from "sharp";
 import { workPlanService, type WorkPlanDisplayMetadataV1 } from "../services/workPlanService";
 import { normalizeWorkPlanSteps, findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContentLoss, mergeWorkPlanSteps, summarizeStepChange } from "../services/workPlanSteps";
 import { normalizeWorkPlanDisplayMetadata } from "../services/workPlanDisplayMetadata";
-import { checkPlanDefaultModelWrite } from "../services/agentMode/modelPin";
+import { checkPlanDefaultModelWrite, isUserAdminSafe } from "../services/agentMode/modelPin";
 import { workPlanThumbnailService } from "../services/workPlanThumbnailService";
 
 const THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
@@ -72,9 +72,9 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ message: "Title and at least one step are required" });
     }
 
-    // ENG-903: the writer is an admin (adminOnly models are selectable); an unserved,
-    // internal-only or live-voice model is refused now (422) instead of at launch.
-    const modelCheck = await checkPlanDefaultModelWrite(async () => true, defaultModel);
+    // ENG-903: validate as the plan's LAUNCHERS will. A plan created here has no owner, so
+    // nobody launches it as an admin: adminOnly / internal / unserved models are refused now.
+    const modelCheck = await checkPlanDefaultModelWrite(async () => false, defaultModel);
     if (!modelCheck.ok) return res.status(422).json(modelCheck.body);
 
     const { steps: normalizedSteps, warnings } = normalizeWorkPlanSteps(steps);
@@ -127,7 +127,15 @@ router.put("/:planId", async (req, res) => {
       return res.status(400).json({ message: "steps must be an array" });
     }
     // ENG-903: validate only a CHANGED model; re-sending the stored value never blocks an edit.
-    const modelCheck = await checkPlanDefaultModelWrite(async () => true, defaultModel, plan.defaultModel);
+    // Admin status applies only when the plan is (and stays) private AND owned by an admin
+    // (its only launcher); any system/public/shared/other-owner plan is launched by
+    // non-admins too, so an adminOnly pin there would 422 every launch.
+    const effectiveVisibility = visibility !== undefined ? visibility : plan.visibility;
+    const modelCheck = await checkPlanDefaultModelWrite(
+      () => effectiveVisibility === 'private' && plan.ownerId ? isUserAdminSafe(plan.ownerId) : Promise.resolve(false),
+      defaultModel,
+      plan.defaultModel,
+    );
     if (!modelCheck.ok) return res.status(422).json(modelCheck.body);
     // A caller that decided this write was safe by reading the plan first can
     // stake the revision it saw. `null` is a real value here ("the plan had no

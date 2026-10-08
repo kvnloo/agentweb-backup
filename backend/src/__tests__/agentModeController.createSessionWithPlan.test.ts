@@ -913,21 +913,56 @@ describe('AgentModeController - createSessionWithPlan', () => {
       ['non-string', ['gpt-5-chat'], 'not_served'],
       ['internalOnly', 'internal-judge', 'not_selectable'],
       ['live-voice', 'live-voice', 'not_selectable'],
-      ['adminOnly for an anonymous caller', 'admin-only-model', 'not_selectable'],
     ])('returns 422 model_unavailable (%s) before any session or side effect', async (_label, model, reason) => {
       planWithModel(model);
       const res = mockResponse();
+      mockGetUserFromToken.mockResolvedValue({ user: { userId: 'u-1', email: 'a@b.c' } } as any);
+      mockUserDb.getUserById.mockResolvedValue({ userId: 'u-1', isAdmin: false } as any);
 
       await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle, {}, { startingMessage: 'go' }), res);
 
       expect(res.status).toHaveBeenCalledWith(422);
       expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'model_unavailable', reason }));
       expect(String((res.json as jest.Mock).mock.calls[0][0].error)).toContain('nothing was sent to a different model');
+      expect(String((res.json as jest.Mock).mock.calls[0][0].error)).not.toContain('you selected');
       expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
       expect(mockChatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
       expect(mockChatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
       expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
       expect(mockChatbotDb.updateSessionInteractiveShareMetadata).not.toHaveBeenCalled();
+    });
+
+    it('anonymous caller: 422 body names no model, display name or reason', async () => {
+      planWithModel('admin-only-model');
+      mockGetUserFromToken.mockResolvedValue({ user: null });
+      const res = mockResponse();
+      await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), res);
+      expect(res.status).toHaveBeenCalledWith(422);
+      expect((res.json as jest.Mock).mock.calls[0][0]).toEqual({
+        error: "This work plan can't start right now because its model is unavailable.",
+        code: 'model_unavailable',
+      });
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    });
+
+    it.each([['pinned', 'gpt-5-chat'], ['unpinned', undefined]])('%s plan: a FAILED model write returns 503 and writes no plan/skills/share', async (_l, model) => {
+      planWithModel(model);
+      mockChatbotDb.updateSessionLlmModel.mockRejectedValueOnce(new Error('ddb down'));
+      const res = mockResponse();
+      await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle, {}, { startingMessage: 'go' }), res);
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect((res.json as jest.Mock).mock.calls[0][0]).toMatchObject({ code: 'model_save_failed' });
+      expect((res.json as jest.Mock).mock.calls[0][0].sessionId).toBeUndefined();
+      expect(mockChatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
+      expect(mockChatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
+      expect(mockChatbotDb.updateSessionInteractiveShareMetadata).not.toHaveBeenCalled();
+    });
+
+    it('the model write precedes the plan write', async () => {
+      planWithModel('gpt-5-chat');
+      await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), mockResponse());
+      expect(mockChatbotDb.updateSessionLlmModel.mock.invocationCallOrder[0])
+        .toBeLessThan(mockChatbotDb.updateSessionWorkPlan.mock.invocationCallOrder[0]);
     });
 
     it('adminOnly plan model: non-admin signed-in user gets 422, an admin launches on it', async () => {

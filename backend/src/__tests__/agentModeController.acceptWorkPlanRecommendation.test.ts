@@ -165,6 +165,15 @@ describe('agentModeController.acceptWorkPlanRecommendation', () => {
     expect(res.json).toHaveBeenCalledWith(body);
   });
 
+  it('maps a model_save_failed launch result to a transient 503 (not 404)', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith({}) as any);
+    mockAgentModeService.applyPredefinedWorkPlan.mockResolvedValue({ success: false, errorType: 'model_save_failed', code: 'model_save_failed', message: 'x' });
+    const res = mockResponse();
+    await agentModeController.acceptWorkPlanRecommendation(mockRequest(authedUser, { sessionId: 'sess-1', recommendationId: 'reco-abc' }), res);
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'model_save_failed' }));
+  });
+
   it('is idempotent: double accept (same templatePlanId already active) returns 200 alreadyApplied without re-applying', async () => {
     const existingWorkPlan = { title: 'Client Onboarding', steps: [{ stepCount: 1, title: 'Analyze website', status: 'pending' }], templatePlanId: 'plan-onboard' };
     mockChatbotDb.getChatSession.mockResolvedValue(sessionWith({ workPlan: existingWorkPlan }) as any);
@@ -264,6 +273,15 @@ describe('agentModeController.launchWorkPlan', () => {
 
     expect(res.status).toHaveBeenCalledWith(422);
     expect(res.json).toHaveBeenCalledWith(body);
+  });
+
+  it('launchWorkPlan maps a model_save_failed result to 503', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith({}) as any);
+    mockAgentModeService.applyPredefinedWorkPlan.mockResolvedValue({ success: false, errorType: 'model_save_failed', code: 'model_save_failed', message: 'x' });
+    const res = mockResponse();
+    await agentModeController.launchWorkPlan(launchRequest(authedUser), res);
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'model_save_failed' }));
   });
 
   it('refuses to launch in another user\'s session', async () => {

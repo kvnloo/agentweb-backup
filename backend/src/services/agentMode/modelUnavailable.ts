@@ -56,13 +56,53 @@ export interface ModelUnavailableBody {
   reason: ModelUnavailableReason;
 }
 
-/** The single producer of the 422 body (and its message text). */
-export function buildModelUnavailableBody(err: ModelUnavailableError, displayName?: string | null): ModelUnavailableBody {
+export type ModelUnavailableSubject = 'selection' | 'work_plan_pin';
+
+/**
+ * The single producer of the 422 body (and its message text). `subject` says whose
+ * choice failed: a `selection` is something the caller picked in the request; a
+ * `work_plan_pin` is the plan author's pinned model, which the launching user did not
+ * choose and cannot change, so the copy must not say "you selected".
+ */
+export function buildModelUnavailableBody(
+  err: ModelUnavailableError,
+  displayName?: string | null,
+  subject: ModelUnavailableSubject = 'selection',
+): ModelUnavailableBody {
   const label = sanitizeModelLabel(displayName || err.requestedModel);
+  const error = subject === 'work_plan_pin'
+    ? `This work plan's pinned model (${label}) isn't available right now, so the plan was not started and nothing was sent to a different model. The plan's model needs to be changed in the work plan settings.`
+    : `The model you selected (${label}) isn't available right now, so nothing was sent to a different model. Choose another model and try again.`;
   return {
-    error: `The model you selected (${label}) isn't available right now, so nothing was sent to a different model. Choose another model and try again.`,
+    error,
     code: 'model_unavailable',
     requestedModel: sanitizeModelLabel(err.requestedModel),
     reason: err.reason,
   };
 }
+
+export interface AnonymousModelUnavailableBody {
+  error: string;
+  code: 'model_unavailable';
+}
+
+/**
+ * Body for an UNAUTHENTICATED caller: names no model id, display name or reason (an
+ * anonymous visitor must not learn which models exist, are admin-only or internal).
+ * Same `code`, so clients' `isModelUnavailableBody` guards still match.
+ */
+export function buildAnonymousModelUnavailableBody(): AnonymousModelUnavailableBody {
+  return {
+    error: "This work plan can't start right now because its model is unavailable.",
+    code: 'model_unavailable',
+  };
+}
+
+/** Emma tool-result text for a plan whose pinned model is unavailable (the LLM cannot change it). */
+export function buildPlanModelToolMessage(body: ModelUnavailableBody): string {
+  return `${body.error} Do not retry; tell the user the plan's model needs to be changed in the work plan settings.`;
+}
+
+/** A model write to the session failed (storage), distinct from the model being unavailable. */
+export const MODEL_SAVE_FAILED_MESSAGE =
+  "This work plan couldn't be started because its model could not be saved to the session. Nothing was started; please try again in a moment.";

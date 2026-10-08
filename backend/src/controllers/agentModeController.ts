@@ -80,7 +80,7 @@ import {
   IDEM_TTL_INTERACTIVE_S,
 } from '../services/agentMode/runStore';
 import { validateModelPin, normalizeRequestedLlmModel, resolvePlanLaunchModel } from '../services/agentMode/modelPin';
-import { ModelUnavailableError, buildModelUnavailableBody, isModelUnavailableError, sanitizeModelLabel } from '../services/agentMode/modelUnavailable';
+import { ModelUnavailableError, MODEL_SAVE_FAILED_MESSAGE, buildAnonymousModelUnavailableBody, buildModelUnavailableBody, isModelUnavailableError, sanitizeModelLabel } from '../services/agentMode/modelUnavailable';
 import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
 // ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
 // on existing report/run envelopes. No surface parses or re-ranks on its own.
@@ -12015,6 +12015,10 @@ export const agentModeController = {
         if (result.errorType === 'model_unavailable' && result.modelUnavailable) {
           return res.status(422).json(result.modelUnavailable);
         }
+        // The model could not be saved to the session (storage): transient, nothing launched.
+        if (result.errorType === 'model_save_failed') {
+          return res.status(503).json({ error: MODEL_SAVE_FAILED_MESSAGE, code: 'model_save_failed' });
+        }
         return res.status(result.requiresConfirmation ? 409 : 404).json({
           error: result.requiresConfirmation ? 'ACTIVE_WORK_PLAN' : 'WORKPLAN_UNAVAILABLE',
           code: result.requiresConfirmation ? 'ACTIVE_WORK_PLAN' : 'WORKPLAN_UNAVAILABLE',
@@ -12121,6 +12125,10 @@ export const agentModeController = {
         // ENG-903: the plan's pinned model cannot be served for this user: 422, nothing launched.
         if (result.errorType === 'model_unavailable' && result.modelUnavailable) {
           return res.status(422).json(result.modelUnavailable);
+        }
+        // The model could not be saved to the session (storage): transient, nothing launched.
+        if (result.errorType === 'model_save_failed') {
+          return res.status(503).json({ error: MODEL_SAVE_FAILED_MESSAGE, code: 'model_save_failed' });
         }
         // Defensive backstop for a race between our pre-check above and this
         // call (e.g. a concurrent accept/launch landed in between) — never a
@@ -15053,7 +15061,10 @@ export const agentModeController = {
       } catch (modelError) {
         if (!isModelUnavailableError(modelError)) throw modelError;
         console.warn(`AgentMode: createSessionWithPlan "${predefinedPlan.title}" refused — plan model "${sanitizeModelLabel(modelError.requestedModel)}" is ${modelError.reason}.`);
-        return res.status(422).json(modelUnavailableBody(modelError));
+        // An anonymous visitor learns nothing about which models exist or why.
+        return res.status(422).json(result.user
+          ? buildModelUnavailableBody(modelError, agentModeService.getModelDisplayName?.(modelError.requestedModel), 'work_plan_pin')
+          : buildAnonymousModelUnavailableBody());
       }
 
       // Create session with userId (authenticated or anonymous)
@@ -15068,6 +15079,18 @@ export const agentModeController = {
         undefined, // emailCampaignTaskId
         'predefined-work-plan' // sessionType
       );
+
+      // Set the session model FIRST: the plan's validated pin, else the account default.
+      // If the write fails nothing else has been written, so the plan is never started on
+      // a model other than the one it pins; the empty session is removed best-effort.
+      const selectedModel = planPinnedModel || await agentModeService.getDefaultModel();
+      try {
+        await chatbotDb.updateSessionLlmModel(session.sessionId, selectedModel);
+      } catch (modelErr) {
+        console.error(`AgentMode: createSessionWithPlan failed to save model for ${session.sessionId}; launch refused:`, modelErr);
+        try { await chatbotDb.deleteSession(session.sessionId); } catch { /* best-effort cleanup */ }
+        return res.status(503).json({ error: MODEL_SAVE_FAILED_MESSAGE, code: 'model_save_failed' });
+      }
 
       // Convert predefined plan to session work plan format
       const workPlan = {
@@ -15142,11 +15165,6 @@ export const agentModeController = {
           console.error('AgentMode: Error auto-installing plan skills:', skillErr);
         }
       }
-
-      // Set the session model: the plan's validated pin, else the account default.
-      const selectedModel = planPinnedModel || await agentModeService.getDefaultModel();
-
-      await chatbotDb.updateSessionLlmModel(session.sessionId, selectedModel);
 
       // Enable interactive sharing for the session
       const conversableToken = crypto.randomBytes(32).toString('hex');

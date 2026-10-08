@@ -252,7 +252,7 @@ import { extractGeneratedImageFilenames } from './shared/generatedAssets';
 import { currentRunFunding } from '../../services/funding/runFunding';
 import { isNonConsumableRequiredFunctionCall } from '../../services/agentMode/workPlanRequiredCallsPolicy';
 import { resolvePlanLaunchModel, isUserAdminSafe, type ModelPinRegistry } from '../../services/agentMode/modelPin';
-import { buildModelUnavailableBody, isModelUnavailableError } from '../../services/agentMode/modelUnavailable';
+import { buildModelUnavailableBody, buildPlanModelToolMessage, isModelUnavailableError, MODEL_SAVE_FAILED_MESSAGE } from '../../services/agentMode/modelUnavailable';
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
 
@@ -535,6 +535,7 @@ export async function applyPredefinedWorkPlan(
       const body = buildModelUnavailableBody(
         modelError,
         typeof modelRegistry.getModelDisplayName === 'function' ? modelRegistry.getModelDisplayName(modelError.requestedModel) : undefined,
+        'work_plan_pin',
       );
       console.warn(`[applyPredefinedWorkPlan] "${predefinedPlan.title}" not launched — plan model "${body.requestedModel}" is ${modelError.reason}.`);
       if (options?.isUnattendedRun) {
@@ -553,7 +554,7 @@ export async function applyPredefinedWorkPlan(
         errorType: 'model_unavailable',
         code: 'model_unavailable',
         modelUnavailable: body,
-        message: body.error,
+        message: buildPlanModelToolMessage(body),
       };
     }
 
@@ -655,6 +656,23 @@ export async function applyPredefinedWorkPlan(
       // detect "this recommendation was already applied".
       templatePlanId: predefinedPlan.planId,
     };
+    // Apply the plan's pinned model FIRST (already validated above): it is the one write
+    // that may not fail silently. If it fails nothing else has been written, so the plan
+    // is not started rather than running on the session's previous model.
+    if (planPinnedModel) {
+      try {
+        await chatbotDb.updateSessionLlmModel(sessionId, planPinnedModel);
+      } catch (modelErr) {
+        console.error('[applyPredefinedWorkPlan] Failed to save plan model; launch refused:', (modelErr as Error).message);
+        return {
+          success: false,
+          errorType: 'model_save_failed',
+          code: 'model_save_failed',
+          retryable: true,
+          message: `${MODEL_SAVE_FAILED_MESSAGE} Do not retry automatically; tell the user it failed to start.`,
+        };
+      }
+    }
     await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
 
     // ENG-1765: the reactive "surface the next pending step's inputRequest"
@@ -730,15 +748,6 @@ export async function applyPredefinedWorkPlan(
         await chatbotDb.addAssociatedSkills(sessionId, Array.from(allSkillIds));
       } catch (skillErr) {
         console.error('[applyPredefinedWorkPlan] Error auto-installing plan skills:', skillErr);
-      }
-    }
-
-    // Apply the plan's pinned model (already validated above; no silent drop).
-    if (planPinnedModel) {
-      try {
-        await chatbotDb.updateSessionLlmModel(sessionId, planPinnedModel);
-      } catch (modelErr) {
-        console.error('[applyPredefinedWorkPlan] Error applying plan model:', (modelErr as Error).message);
       }
     }
 
