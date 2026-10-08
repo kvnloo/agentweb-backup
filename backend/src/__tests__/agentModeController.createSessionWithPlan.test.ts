@@ -14,6 +14,7 @@ jest.mock('../services/chatbotService', () => ({
     createChatSession: jest.fn(),
     updateSessionWorkPlan: jest.fn(),
     updateSessionInteractiveShareMetadata: jest.fn(),
+    updateSessionWorkPlanInputRequest: jest.fn().mockResolvedValue(undefined),
     updateSessionLlmModel: jest.fn(),
     getChatSession: jest.fn(),
     addChatMessage: jest.fn(),
@@ -1009,7 +1010,32 @@ describe('AgentModeController - createSessionWithPlan', () => {
         await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), res);
         expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
         expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
-        expect((res.status as jest.Mock).mock.calls[0][0]).toBeGreaterThanOrEqual(400);
+        expect(res.status).toHaveBeenCalledWith(422);
+        expect((res.json as jest.Mock).mock.calls[0][0]).toEqual({
+          error: 'This work plan is misconfigured and cannot be started right now.',
+          code: 'workplan_invalid',
+        });
+      });
+
+      // Every write AFTER createChatSession must remove the just-created session on failure.
+      const withInputStep = () => mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((v: string) =>
+        Promise.resolve(v === 'system' ? [{
+          ...mockWorkPlans[0], defaultModel: 'gpt-5-chat',
+          steps: [{ stepCount: 1, title: 'a', inputRequest: { title: 'T', fields: [] } }, { stepCount: 2, title: 'b' }],
+        }] : []));
+
+      it.each([
+        ['updateSessionWorkPlanInputRequest', () => { withInputStep(); mockChatbotDb.updateSessionWorkPlanInputRequest.mockRejectedValueOnce(new Error('ddb down')); }],
+        ['updateSessionInteractiveShareMetadata', () => { planWithModel('gpt-5-chat'); mockChatbotDb.updateSessionInteractiveShareMetadata.mockRejectedValueOnce(new Error('ddb down')); }],
+        ['getDefaultModel (unpinned)', () => { planWithModel(undefined); mockAgentModeService.getDefaultModel.mockRejectedValueOnce(new Error('registry down')); }],
+      ])('later write %s failing deletes exactly the new session and sends no success body', async (_n, arrange) => {
+        arrange();
+        const res = mockResponse();
+        await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), res);
+        expect((res.status as jest.Mock).mock.calls[0][0]).toBeGreaterThanOrEqual(500);
+        expect(del).toHaveBeenCalledTimes(1);
+        expect(del).toHaveBeenCalledWith('new-sess-1');
+        expect(res.json).not.toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'new-sess-1' }));
       });
 
       it('plan write failing after the model write removes the new session (best effort) and returns a failure', async () => {

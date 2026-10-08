@@ -695,9 +695,14 @@ export async function applyPredefinedWorkPlan(
       // the OLD plan would otherwise keep running on the NEW model). Restore, then fail.
       if (planPinnedModel) {
         try {
-          const restoreModel = previousModel || await modelRegistry.getDefaultModel?.();
-          if (!restoreModel) throw new Error('session had no explicit llmModel and no default model is available to restore');
-          await chatbotDb.updateSessionLlmModel(sessionId, restoreModel, previousPolicyDecision);
+          // Conditional on the model THIS launch wrote: if a user changed it since, keep theirs.
+          const restored = await chatbotDb.restoreSessionLlmModelIfUnchanged(sessionId, planPinnedModel, {
+            llmModel: previousModel,
+            llmUsagePolicyDecision: previousPolicyDecision,
+          });
+          if (!restored) {
+            console.info(`[applyPredefinedWorkPlan] plan write failed for session ${sessionId}; model no longer "${planPinnedModel}" (changed since the launch's write), so the previous model was NOT restored over it.`);
+          }
         } catch (restoreErr) {
           console.error(
             `[applyPredefinedWorkPlan] CRITICAL: plan write failed for session ${sessionId} AND restoring the previous model "${previousModel}" failed; the session is left on "${planPinnedModel}":`,

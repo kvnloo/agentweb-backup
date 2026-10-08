@@ -153,7 +153,7 @@ router.put("/:planId", async (req, res) => {
     // left it the one write path with no report of what it discarded (ENG-889).
     // ENG-903: validate only a CHANGED model; re-sending the stored value never blocks an edit.
     const modelCheck = await checkPlanDefaultModelWrite(
-      () => planAdminStatusApplies(plan) ? isUserAdminSafe(userId) : Promise.resolve(false),
+      () => planAdminStatusApplies(plan) ? isUserAdminSafe(plan.ownerId) : Promise.resolve(false),
       defaultModel,
       plan.defaultModel,
     );

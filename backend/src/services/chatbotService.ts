@@ -3824,6 +3824,55 @@ export class ChatbotDB {
   }
 
   /**
+   * ENG-903: undo a plan-launch model write, but only if the session still holds the model
+   * that launch wrote. A plain conditional UpdateItem on EXISTING attributes (no schema
+   * change). If a user changed the model after the launch's write, the condition fails and
+   * their choice is left alone (resolves false). A session that had NO explicit model gets
+   * `REMOVE llmModel`, returning it to exactly its prior state instead of a stored default.
+   * Resolves true when restored; rethrows any other failure.
+   */
+  async restoreSessionLlmModelIfUnchanged(
+    sessionId: string,
+    expectedModel: string,
+    previous: { llmModel?: string; llmUsagePolicyDecision?: NonNullable<ChatSession['llmUsagePolicyDecision']> },
+  ): Promise<boolean> {
+    const sets: string[] = [];
+    const removes: string[] = [];
+    const values: Record<string, any> = { ":planModel": expectedModel };
+    if (previous.llmModel) {
+      sets.push("llmModel = :prevModel");
+      values[":prevModel"] = previous.llmModel;
+    } else {
+      removes.push("llmModel");
+    }
+    if (previous.llmUsagePolicyDecision) {
+      sets.push("llmUsagePolicyDecision = :prevDecision");
+      values[":prevDecision"] = previous.llmUsagePolicyDecision;
+    } else {
+      removes.push("llmUsagePolicyDecision");
+    }
+    sets.push("adminListPartition = :adminListPartition");
+    values[":adminListPartition"] = "all";
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: `SET ${sets.join(", ")}${removes.length ? ` REMOVE ${removes.join(", ")}` : ""}`,
+      ConditionExpression: "llmModel = :planModel",
+      ExpressionAttributeValues: values,
+    };
+    try {
+      await dynamodb.update(params).promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === "ConditionalCheckFailedException" || error?.name === "ConditionalCheckFailedException") {
+        return false;
+      }
+      console.error("Error restoring session LLM model:", error);
+      throw error;
+    }
+  }
+
+  /**
    * ENG-827: stamp the publish authorization a scheduled run was admitted under.
    *
    * The dispatch-time consent guard re-reads the SCHEDULE so a revocation bites

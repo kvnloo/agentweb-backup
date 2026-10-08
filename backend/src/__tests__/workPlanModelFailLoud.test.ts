@@ -14,6 +14,7 @@ jest.mock('../services/chatbotService', () => ({
     updateCalledFunctions: jest.fn(),
     addAssociatedSkills: jest.fn(),
     updateSessionLlmModel: jest.fn(),
+    restoreSessionLlmModelIfUnchanged: jest.fn(),
   },
 }));
 jest.mock('../services/predefinedWorkPlanResolver', () => ({
@@ -69,6 +70,7 @@ import { resolvePlanLaunchModel, validatePlanDefaultModelWrite } from '../servic
 import { workPlanService } from '../services/workPlanService';
 import adminWorkPlanRoutes from '../routes/adminWorkPlanRoutes';
 import userWorkPlanRoutes from '../routes/userWorkPlanRoutes';
+import * as orgShareService from '../services/orgShareService';
 import { authenticateToken, isAdmin } from '../middleware/auth';
 
 const db = chatbotDb as jest.Mocked<typeof chatbotDb>;
@@ -233,23 +235,54 @@ describe('applyPredefinedWorkPlan (Emma tool / launch / accept core)', () => {
       } as any);
     });
 
-    it('plan write fails: previous model AND policy decision are restored, caller gets a failure', async () => {
+    it('plan write fails: previous model AND policy decision are restored conditionally on the model we wrote', async () => {
+      db.restoreSessionLlmModelIfUnchanged.mockResolvedValue(true);
       db.updateSessionWorkPlan.mockRejectedValueOnce(new Error('ddb throttled'));
       const r: any = await launch('gpt-5-chat', { force: true });
       expect(r.success).toBe(false);
-      expect(db.updateSessionLlmModel).toHaveBeenNthCalledWith(1, 's1', 'gpt-5-chat');
-      expect(db.updateSessionLlmModel).toHaveBeenNthCalledWith(2, 's1', 'old-model', PRIOR_DECISION);
-      expect(db.updateSessionLlmModel).toHaveBeenCalledTimes(2);
+      expect(db.updateSessionLlmModel).toHaveBeenCalledTimes(1);
+      expect(db.updateSessionLlmModel).toHaveBeenCalledWith('s1', 'gpt-5-chat');
+      expect(db.restoreSessionLlmModelIfUnchanged).toHaveBeenCalledWith('s1', 'gpt-5-chat', { llmModel: 'old-model', llmUsagePolicyDecision: PRIOR_DECISION });
     });
 
-    it('restore itself fails: logged loudly with the session id, caller still gets a failure, never success', async () => {
+    it('session had NO explicit model: restore asks for absence, never a stored default', async () => {
+      db.getChatSession.mockResolvedValue({ sessionId: 's1', messages: [], workPlan: { title: 'Old', steps: [{ stepCount: 1, title: 'x', status: 'pending' }] } } as any);
+      db.restoreSessionLlmModelIfUnchanged.mockResolvedValue(true);
+      db.updateSessionWorkPlan.mockRejectedValueOnce(new Error('ddb throttled'));
+      const r: any = await launch('gpt-5-chat', { force: true });
+      expect(r.success).toBe(false);
+      expect(db.restoreSessionLlmModelIfUnchanged).toHaveBeenCalledWith('s1', 'gpt-5-chat', { llmModel: undefined, llmUsagePolicyDecision: undefined });
+      expect(db.updateSessionLlmModel).toHaveBeenCalledTimes(1);
+    });
+
+    it('a user model change in the window is preserved (condition fails -> info log, no CRITICAL, still a failure)', async () => {
+      // In-memory session with the real conditional semantics.
+      const row: any = { llmModel: 'old-model' };
+      db.updateSessionLlmModel.mockImplementation(async (_id: string, m: string) => { row.llmModel = m; return {} as any; });
+      db.restoreSessionLlmModelIfUnchanged.mockImplementation(async (_id: string, expected: string, prev: any) => {
+        if (row.llmModel !== expected) return false;
+        row.llmModel = prev.llmModel;
+        return true;
+      });
+      db.updateSessionWorkPlan.mockImplementationOnce(async () => { row.llmModel = 'USER-PICK'; throw new Error('ddb throttled'); });
+      const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      const infoSpy = jest.spyOn(console, 'info').mockImplementation(() => {});
+      const r: any = await launch('gpt-5-chat', { force: true });
+      expect(r.success).toBe(false);
+      expect(row.llmModel).toBe('USER-PICK');
+      expect(errSpy.mock.calls.map((c) => c.map(String).join(' ')).join('\n')).not.toMatch(/CRITICAL/);
+      expect(infoSpy.mock.calls.map((c) => c.map(String).join(' ')).join('\n')).toContain('s1');
+      errSpy.mockRestore(); infoSpy.mockRestore();
+    });
+
+    it('restore itself fails: CRITICAL log with the session id, caller still gets a failure, never success', async () => {
       const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
       db.updateSessionWorkPlan.mockRejectedValueOnce(new Error('ddb throttled'));
-      db.updateSessionLlmModel.mockResolvedValueOnce({} as any).mockRejectedValueOnce(new Error('restore down'));
+      db.restoreSessionLlmModelIfUnchanged.mockRejectedValueOnce(new Error('restore down'));
       const r: any = await launch('gpt-5-chat', { force: true });
       expect(r.success).toBe(false);
       const logged = errSpy.mock.calls.map((c) => c.map(String).join(' ')).join('\n');
-      expect(logged).toMatch(/restore/i);
+      expect(logged).toMatch(/CRITICAL/);
       expect(logged).toContain('s1');
       errSpy.mockRestore();
     });
@@ -448,6 +481,21 @@ describe('admin status scope: private + owner-admin + NO org only', () => {
     getUser.mockResolvedValue({ userId: 'user-1', isAdmin: true });
     const ok = await request(app).post('/api/user-work-plans').send({ title: 'T', steps: [step], defaultModel: 'admin-only-model' });
     expect(ok.status).toBe(201);
+  });
+
+  it('user PUT: the OWNER decides adminOnly, not the editor (admin editing a non-admin owner\'s private plan is 422; non-admin editing an admin owner\'s is 200)', async () => {
+    // The editor is an org editor allowed to edit another member's plan (real rule lives in orgShareService).
+    const editSpy = jest.spyOn(orgShareService, 'canEditItem').mockReturnValue(true);
+    getUser.mockImplementation(async (id: string) => ({ userId: id, isAdmin: id === 'user-1' }));
+    wps.getWorkPlan.mockResolvedValue(stored({ ownerId: 'owner-2' }) as any);
+    const denied = await request(app).put('/api/user-work-plans/p1').send({ defaultModel: 'admin-only-model' });
+    expect(denied.status).toBe(422);
+    expect(denied.body).toMatchObject({ code: 'model_unavailable', reason: 'not_selectable' });
+    expect(wps.updateWorkPlan).not.toHaveBeenCalled();
+    getUser.mockImplementation(async (id: string) => ({ userId: id, isAdmin: id === 'owner-2' }));
+    const ok = await request(app).put('/api/user-work-plans/p1').send({ defaultModel: 'admin-only-model' });
+    expect(ok.status).toBe(200);
+    editSpy.mockRestore();
   });
 
   it('user PUT: admin owner of an org-scoped private plan cannot set an adminOnly pin; non-org can', async () => {
