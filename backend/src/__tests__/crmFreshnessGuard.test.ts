@@ -1,4 +1,4 @@
-import { detectCrmFreshnessMismatch, runCrmFreshnessShadow } from '../utils/crmFreshnessGuard';
+import { createCrmEvidenceCollector, detectCrmFreshnessMismatch, runCrmFreshnessShadow } from '../utils/crmFreshnessGuard';
 
 const ok = (name: string, result: any = { success: true }) => ({ id: name, name, arguments: {}, result });
 // The first describe is about the [verified: ...] tag check; account-wide totals are covered separately below.
@@ -199,6 +199,90 @@ describe('detectCrmFreshnessMismatch - untagged account-wide totals (ENG-2263)',
     detectCrmFreshnessMismatch(('9' + ' '.repeat(2000)).repeat(100), []);
     detectCrmFreshnessMismatch('total lists '.repeat(15_000), []);
     expect(Number(process.hrtime.bigint() - t0) / 1e6).toBeLessThan(1000);
+  });
+});
+
+// In production the ledger holds a MINIMISED result (get_lead_lists / search_leads collapse to {}), so numbers
+// come from a collector fed the full result at dispatch. Without it, every correct answer would be flagged.
+describe('CRM evidence from the real dispatch path (ENG-2263)', () => {
+  const ledgerEmpty = (name: string) => ({ id: name, name, arguments: {}, result: {} });
+  const inv = (text: string, calls: any[], evidence?: any) =>
+    detectCrmFreshnessMismatch(text, calls, evidence).findings.filter((f) => f.kind === 'inventory_total_not_in_tool_results');
+  const collector = (...pairs: Array<[string, unknown]>) => { const c = createCrmEvidenceCollector(); for (const [n, r] of pairs) c.record(n, r); return c; };
+
+  it('REGRESSION: a correct total is not flagged when the ledger result is empty but the collector saw the real one', () => {
+    const c = collector(['get_lead_lists', listsResult([10, 8, 7, 6, 4, 4, 2, 2, 0])]);
+    expect(inv('You have 9 lead lists and 43 leads in total.', [ledgerEmpty('get_lead_lists')], c.snapshot())).toEqual([]);
+  });
+
+  it('flags a stale number even when the collector saw a fresh result', () => {
+    const c = collector(['get_lead_lists', listsResult([10, 8, 7, 6, 4, 4, 2, 2, 0])]);
+    expect(inv('You have 9 lead lists and 47 leads in total.', [ledgerEmpty('get_lead_lists')], c.snapshot()).map((f) => f.claimed)).toEqual([47]);
+  });
+
+  it('ABSTAINS when a CRM tool succeeded but nothing can verify its numbers (no collector, empty ledger result)', () => {
+    expect(inv('You have 96 lead lists and 47 leads in total.', [ledgerEmpty('get_lead_lists')])).toEqual([]);
+  });
+
+  it('ABSTAINS for a succeeded tool the collector never saw, even if another tool was seen', () => {
+    const c = collector(['search_leads', { count: 3, leads: [{}, {}, {}] }]);
+    expect(inv('You have 47 leads in total.', [ledgerEmpty('search_leads'), ledgerEmpty('get_lead_lists')], c.snapshot())).toEqual([]);
+  });
+
+  it('with NO CRM tool at all it still judges (this is the carried-over total case)', () => {
+    expect(inv('You have 18 lead lists and 47 leads in total.', [], collector().snapshot()).map((f) => f.claimed).sort()).toEqual([18, 47]);
+  });
+
+  it('sums match counts across several search calls', () => {
+    const c = collector(['search_leads', { count: 3, leads: [{}, {}, {}] }], ['search_leads', { count: 1, leads: [{}] }], ['search_leads', { count: 1, leads: [{}] }]);
+    const calls = [ledgerEmpty('search_leads'), ledgerEmpty('search_leads'), ledgerEmpty('search_leads')];
+    expect(inv('You have 5 leads in total matching Test.', calls, c.snapshot())).toEqual([]);
+  });
+
+  it('keeps a second get_lead_lists result from corrupting the first (sums are per call)', () => {
+    const c = collector(['get_lead_lists', listsResult([5, 5])], ['get_lead_lists', listsResult([7, 3, 2])]);
+    const calls = [ledgerEmpty('get_lead_lists'), ledgerEmpty('get_lead_lists')];
+    expect(inv('You have 3 lead lists and 12 leads in total.', calls, c.snapshot())).toEqual([]);
+  });
+
+  describe('collector', () => {
+    it('ignores non-CRM tools and failed results', () => {
+      const c = collector(['web_search', { count: 99 }], ['get_lead_lists', { success: false, totalLists: 77 }]);
+      expect(c.snapshot().tools.size).toBe(0);
+      expect(c.snapshot().numbers.has(99)).toBe(false);
+      expect(c.snapshot().numbers.has(77)).toBe(false);
+    });
+
+    it.each([undefined, null, 5, 'not json', [], { a: { b: { c: { d: { e: { f: { g: { h: { i: 1 } } } } } } } } }])('never throws on result %p', (r) => {
+      const c = createCrmEvidenceCollector();
+      expect(() => c.record('get_lead_lists', r)).not.toThrow();
+      expect(() => c.record(undefined, r)).not.toThrow();
+      expect(() => c.record(42, r)).not.toThrow();
+    });
+
+    it('stays bounded on a giant result and on thousands of calls', () => {
+      const c = createCrmEvidenceCollector();
+      const t0 = process.hrtime.bigint();
+      c.record('search_leads', { leads: Array.from({ length: 200_000 }, (_, i) => ({ leadCount: i, id: i })) });
+      for (let i = 0; i < 5000; i++) c.record('get_leads', { count: i });
+      expect(Number(process.hrtime.bigint() - t0) / 1e6).toBeLessThan(1500);
+      // 5000 distinct result numbers + at most 200 recorded calls' running match-count sums.
+      expect(c.snapshot().numbers.size).toBeLessThanOrEqual(5200);
+    });
+
+    it('parses JSON-string results', () => {
+      const c = collector(['get_lead_lists', JSON.stringify(listsResult([3, 2]))]);
+      expect(c.snapshot().numbers.has(5)).toBe(true);
+    });
+  });
+
+  it('runCrmFreshnessShadow threads the evidence through to the detector', () => {
+    const log = jest.fn();
+    const c = collector(['get_lead_lists', listsResult([3, 2])]);
+    runCrmFreshnessShadow({ finalText: '2 lead lists, 5 leads in total.', toolCalls: [ledgerEmpty('get_lead_lists')], evidence: c.snapshot(), log });
+    expect(log).not.toHaveBeenCalled();
+    runCrmFreshnessShadow({ finalText: '2 lead lists, 47 leads in total.', toolCalls: [ledgerEmpty('get_lead_lists')], evidence: c.snapshot(), log });
+    expect(log).toHaveBeenCalledTimes(1);
   });
 });
 
