@@ -353,10 +353,16 @@ export const IMAGE_GENERATION_PRICING_USD: Record<string, number> = {
 };
 
 /**
- * Video generation models — USD per 8s clip (longer videos bill as multiple clips).
+ * Video generation models — USD per clip (longer videos bill as multiple clips; clip
+ * length per model is VIDEO_CLIP_MAX_SECONDS, default 8s).
  * Ported from agentModeService.estimateVideoGenerationCost().
  */
 export const VIDEO_GENERATION_PRICING_USD_PER_CLIP: Record<string, number> = {
+  // gemini-omni-1.1-flash (Interactions API): $17.50/M video output tokens x 5,792
+  // tokens/s at 720p = ~$0.1014/s; one clip is ~10s → $1.014. This is only the
+  // ESTIMATE used when the API reports no usage — see omniVideoUsageCostUsd.
+  'gemini-omni-1.1-flash': 1.014,
+  // Retired Veo ids (shut down 2026-10-22) — kept so historical records still price.
   'veo-3.1-generate-preview': 3.2, // $0.40/s x 8s, audio incl. (ai.google.dev); was 2.8
   'veo-3.1-fast-generate-preview': 1.4, // within official fast range ($0.10-0.30/s)
   'veo-3-generate-preview': 3.2, // $0.40/s x 8s (ai.google.dev); was unpriced -> recorded $0
@@ -412,13 +418,18 @@ export function geminiFlashImageUsage(usage: unknown, hasImage: boolean) {
   };
 }
 
+/** Max seconds a single generated clip covers, per model (default 8s). */
+export const VIDEO_CLIP_MAX_SECONDS: Record<string, number> = {
+  'gemini-omni-1.1-flash': 10,
+};
+
 /**
- * Per-generation USD cost for a video model. Video is billed per 8s clip; a longer
- * requested duration bills as ceil(seconds / 8) clips.
+ * Per-generation USD cost for a video model. Video is billed per clip; a longer
+ * requested duration bills as ceil(seconds / clipSeconds) clips.
  */
 export function videoGenerationCostUsd(model: string, durationSeconds?: number): number {
   const clipPrice = VIDEO_GENERATION_PRICING_USD_PER_CLIP[model] ?? 3.2;
-  return clipPrice * videoClipCount(durationSeconds);
+  return clipPrice * videoClipCount(durationSeconds, model);
 }
 
 /**
@@ -426,11 +437,44 @@ export function videoGenerationCostUsd(model: string, durationSeconds?: number):
  * (ENG-1934), so an event's generation quantity is the same number the cost
  * was multiplied by.
  */
-export function videoClipCount(durationSeconds?: number): number {
-  const VEO_MAX_SECONDS = 8;
-  return durationSeconds && durationSeconds > VEO_MAX_SECONDS
-    ? Math.ceil(durationSeconds / VEO_MAX_SECONDS)
+export function videoClipCount(durationSeconds?: number, model?: string): number {
+  const clipSeconds = (model && VIDEO_CLIP_MAX_SECONDS[model]) || 8;
+  return durationSeconds && durationSeconds > clipSeconds
+    ? Math.ceil(durationSeconds / clipSeconds)
     : 1;
+}
+
+/** gemini-omni-1.1-flash token rates (USD per 1M tokens), ai.google.dev, 2026-10-08. */
+export const GEMINI_OMNI_VIDEO_TOKEN_PRICING = {
+  inputPerM: 1.5,
+  textOutputPerM: 9,
+  videoOutputPerM: 17.5,
+} as const;
+
+/**
+ * Actual USD cost of one gemini-omni-1.1-flash interaction from its `usage` block.
+ * Video output tokens bill at the video rate, other output tokens at the text rate,
+ * input at the input rate. When there is no per-modality breakdown, every output
+ * token is billed at the (higher) video rate. Returns undefined when the response
+ * carries no usable usage — the caller then falls back to the per-clip estimate.
+ */
+export function omniVideoUsageCostUsd(usage: unknown): number | undefined {
+  if (!usage || typeof usage !== 'object') return undefined;
+  const u = usage as Record<string, unknown>;
+  const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined);
+  const totalOut = n(u.total_output_tokens);
+  if (totalOut === undefined) return undefined;
+  const input = n(u.total_input_tokens) ?? 0;
+  const byModality = Array.isArray(u.output_tokens_by_modality) ? u.output_tokens_by_modality : undefined;
+  let videoOut = totalOut;
+  if (byModality) {
+    videoOut = byModality
+      .filter((m: any) => m?.modality === 'video')
+      .reduce((sum: number, m: any) => sum + (n(m?.tokens) ?? 0), 0);
+  }
+  const otherOut = Math.max(0, totalOut - videoOut);
+  const p = GEMINI_OMNI_VIDEO_TOKEN_PRICING;
+  return (input * p.inputPerM + otherOut * p.textOutputPerM + videoOut * p.videoOutputPerM) / 1e6;
 }
 
 /** Models we've already warned about this process — dedupes the unknown-model warn. */
