@@ -37,6 +37,7 @@ import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
 import { PendingApprovalDeck } from './agentMode/core/approvalDeck';
 import { WorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import { WorkflowRunState } from './agentMode/core/workflow';
+import { assertSequentialStepCounts } from './workPlanSteps';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -3728,15 +3729,7 @@ export class ChatbotDB {
     const timestamp = new Date().toISOString();
 
     // Validate stepCount - must be sequential starting from 1 (index+1)
-    for (let i = 0; i < workPlan.steps.length; i++) {
-      const expectedStepCount = i + 1;
-      if (workPlan.steps[i].stepCount !== expectedStepCount) {
-        throw new Error(
-          `Invalid stepCount at index ${i}: expected ${expectedStepCount} but got ${workPlan.steps[i].stepCount}. ` +
-          `Steps must be numbered sequentially starting from 1 (stepCount must equal index+1).`
-        );
-      }
-    }
+    assertSequentialStepCounts(workPlan.steps);
 
     const validatedWorkPlan = {
       ...workPlan,

@@ -75,6 +75,16 @@ export async function resolvePlanLaunchModel(
   return resolution.fellBack ? pin : resolution.model;
 }
 
+/**
+ * Whether the plan OWNER's admin status may clear an adminOnly pin: only a private plan
+ * owned by an admin and not org-scoped. System/public plans, other owners' plans and
+ * org-shared private plans (`orgId` set: org members launch them) are launched by
+ * non-admins too, so an adminOnly pin there would 422 every such launch.
+ */
+export function planAdminStatusApplies(plan: { visibility?: string; ownerId?: string; orgId?: string }): boolean {
+  return plan.visibility === 'private' && !!plan.ownerId && !plan.orgId;
+}
+
 /** Admin flag for a user id; never throws (failed read = non-admin, same as the resolver). */
 export async function isUserAdminSafe(userId: string | undefined): Promise<boolean> {
   if (!userId || userId.startsWith('anon_')) return false;

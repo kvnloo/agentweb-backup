@@ -252,7 +252,8 @@ import { extractGeneratedImageFilenames } from './shared/generatedAssets';
 import { currentRunFunding } from '../../services/funding/runFunding';
 import { isNonConsumableRequiredFunctionCall } from '../../services/agentMode/workPlanRequiredCallsPolicy';
 import { resolvePlanLaunchModel, isUserAdminSafe, type ModelPinRegistry } from '../../services/agentMode/modelPin';
-import { buildModelUnavailableBody, buildPlanModelToolMessage, isModelUnavailableError, MODEL_SAVE_FAILED_MESSAGE } from '../../services/agentMode/modelUnavailable';
+import { assertSequentialStepCounts } from '../../services/workPlanSteps';
+import { buildAnonymousModelUnavailableBody, buildAnonymousPlanModelToolMessage, buildModelUnavailableBody, buildPlanModelToolMessage, isModelUnavailableError, MODEL_SAVE_FAILED_MESSAGE } from '../../services/agentMode/modelUnavailable';
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
 
@@ -297,6 +298,7 @@ function logMissingWorkPlanForDiagnosis(
  */
 export interface WorkPlanModelRegistry extends ModelPinRegistry {
   getSupportedModels(isAdmin?: boolean): Promise<string[]>;
+  getDefaultModel?: () => Promise<string>;
 }
 
 
@@ -537,6 +539,10 @@ export async function applyPredefinedWorkPlan(
         typeof modelRegistry.getModelDisplayName === 'function' ? modelRegistry.getModelDisplayName(modelError.requestedModel) : undefined,
         'work_plan_pin',
       );
+      // An anonymous/visitor session can reach this tool (public plan sessions): the visitor
+      // sees the model's reply, so they learn no model id, name or reason. Server logs and the
+      // oncall alert below still carry the details.
+      const isAnonymousCaller = !userId || userId.startsWith('anon_');
       console.warn(`[applyPredefinedWorkPlan] "${predefinedPlan.title}" not launched — plan model "${body.requestedModel}" is ${modelError.reason}.`);
       if (options?.isUnattendedRun) {
         void import('../../utils/agentModeAlerts')
@@ -553,8 +559,8 @@ export async function applyPredefinedWorkPlan(
         success: false,
         errorType: 'model_unavailable',
         code: 'model_unavailable',
-        modelUnavailable: body,
-        message: buildPlanModelToolMessage(body),
+        modelUnavailable: isAnonymousCaller ? buildAnonymousModelUnavailableBody() : body,
+        message: isAnonymousCaller ? buildAnonymousPlanModelToolMessage() : buildPlanModelToolMessage(body),
       };
     }
 
@@ -656,9 +662,18 @@ export async function applyPredefinedWorkPlan(
       // detect "this recommendation was already applied".
       templatePlanId: predefinedPlan.planId,
     };
+    // Validate the plan structure BEFORE the model write: updateSessionWorkPlan rejects a
+    // non-sequential stepCount, and by then the model would already have been changed.
+    // A malformed plan must fail with no state change at all.
+    assertSequentialStepCounts(workPlan.steps);
+
     // Apply the plan's pinned model FIRST (already validated above): it is the one write
     // that may not fail silently. If it fails nothing else has been written, so the plan
-    // is not started rather than running on the session's previous model.
+    // is not started rather than running on the session's previous model. Capture what the
+    // write replaces (updateSessionLlmModel also clears llmUsagePolicyDecision) so a LATER
+    // failure can put the session back exactly as it was.
+    const previousModel = session.llmModel;
+    const previousPolicyDecision = session.llmUsagePolicyDecision;
     if (planPinnedModel) {
       try {
         await chatbotDb.updateSessionLlmModel(sessionId, planPinnedModel);
@@ -673,7 +688,25 @@ export async function applyPredefinedWorkPlan(
         };
       }
     }
-    await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+    try {
+      await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+    } catch (planWriteErr) {
+      // The plan did not start, so the session must not keep the plan's model (with force=true
+      // the OLD plan would otherwise keep running on the NEW model). Restore, then fail.
+      if (planPinnedModel) {
+        try {
+          const restoreModel = previousModel || await modelRegistry.getDefaultModel?.();
+          if (!restoreModel) throw new Error('session had no explicit llmModel and no default model is available to restore');
+          await chatbotDb.updateSessionLlmModel(sessionId, restoreModel, previousPolicyDecision);
+        } catch (restoreErr) {
+          console.error(
+            `[applyPredefinedWorkPlan] CRITICAL: plan write failed for session ${sessionId} AND restoring the previous model "${previousModel}" failed; the session is left on "${planPinnedModel}":`,
+            restoreErr,
+          );
+        }
+      }
+      throw planWriteErr;
+    }
 
     // ENG-1765: the reactive "surface the next pending step's inputRequest"
     // check in setWorkPlanStatusAttempt only runs after a set_work_plan_status

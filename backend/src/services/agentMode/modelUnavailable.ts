@@ -103,6 +103,14 @@ export function buildPlanModelToolMessage(body: ModelUnavailableBody): string {
   return `${body.error} Do not retry; tell the user the plan's model needs to be changed in the work plan settings.`;
 }
 
+/**
+ * Emma tool-result text for an ANONYMOUS/visitor session: the same wording as the anonymous
+ * 422 body, so the visitor (who sees the model's reply) learns no model id, name or reason.
+ */
+export function buildAnonymousPlanModelToolMessage(): string {
+  return `${buildAnonymousModelUnavailableBody().error} Do not retry; tell the user the plan can't be started right now.`;
+}
+
 /** A model write to the session failed (storage), distinct from the model being unavailable. */
 export const MODEL_SAVE_FAILED_MESSAGE =
   "This work plan couldn't be started because its model could not be saved to the session. Nothing was started; please try again in a moment.";

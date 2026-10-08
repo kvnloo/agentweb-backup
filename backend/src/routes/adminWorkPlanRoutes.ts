@@ -4,7 +4,7 @@ import sharp from "sharp";
 import { workPlanService, type WorkPlanDisplayMetadataV1 } from "../services/workPlanService";
 import { normalizeWorkPlanSteps, findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContentLoss, mergeWorkPlanSteps, summarizeStepChange } from "../services/workPlanSteps";
 import { normalizeWorkPlanDisplayMetadata } from "../services/workPlanDisplayMetadata";
-import { checkPlanDefaultModelWrite, isUserAdminSafe } from "../services/agentMode/modelPin";
+import { checkPlanDefaultModelWrite, isUserAdminSafe, planAdminStatusApplies } from "../services/agentMode/modelPin";
 import { workPlanThumbnailService } from "../services/workPlanThumbnailService";
 
 const THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
@@ -127,16 +127,24 @@ router.put("/:planId", async (req, res) => {
       return res.status(400).json({ message: "steps must be an array" });
     }
     // ENG-903: validate only a CHANGED model; re-sending the stored value never blocks an edit.
-    // Admin status applies only when the plan is (and stays) private AND owned by an admin
-    // (its only launcher); any system/public/shared/other-owner plan is launched by
-    // non-admins too, so an adminOnly pin there would 422 every launch.
+    // Admin status applies only to a plan that is (and stays) private, owned by an admin and
+    // not org-scoped (its only launcher); any system/public/org-shared/other-owner plan is
+    // launched by non-admins too, so an adminOnly pin there would 422 every launch.
     const effectiveVisibility = visibility !== undefined ? visibility : plan.visibility;
+    const adminClearsAfter = planAdminStatusApplies({ visibility: effectiveVisibility, ownerId: plan.ownerId, orgId: plan.orgId });
+    // The plan is leaving the "admin-only launcher" scope (e.g. private -> system/public): the
+    // STORED model must now be valid for a non-admin, even if it is not being edited.
+    const scopeWidened = planAdminStatusApplies(plan) && !adminClearsAfter;
     const modelCheck = await checkPlanDefaultModelWrite(
-      () => effectiveVisibility === 'private' && plan.ownerId ? isUserAdminSafe(plan.ownerId) : Promise.resolve(false),
+      () => adminClearsAfter ? isUserAdminSafe(plan.ownerId) : Promise.resolve(false),
       defaultModel,
-      plan.defaultModel,
+      scopeWidened ? undefined : plan.defaultModel,
     );
     if (!modelCheck.ok) return res.status(422).json(modelCheck.body);
+    if (scopeWidened && (defaultModel === undefined || defaultModel === null) && plan.defaultModel) {
+      const storedCheck = await checkPlanDefaultModelWrite(() => Promise.resolve(false), plan.defaultModel);
+      if (!storedCheck.ok) return res.status(422).json(storedCheck.body);
+    }
     // A caller that decided this write was safe by reading the plan first can
     // stake the revision it saw. `null` is a real value here ("the plan had no
     // revision"), so presence of the key is what counts (ENG-890).

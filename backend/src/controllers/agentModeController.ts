@@ -79,6 +79,7 @@ import {
   markRunTerminal,
   IDEM_TTL_INTERACTIVE_S,
 } from '../services/agentMode/runStore';
+import { assertSequentialStepCounts } from '../services/workPlanSteps';
 import { validateModelPin, normalizeRequestedLlmModel, resolvePlanLaunchModel } from '../services/agentMode/modelPin';
 import { ModelUnavailableError, MODEL_SAVE_FAILED_MESSAGE, buildAnonymousModelUnavailableBody, buildModelUnavailableBody, isModelUnavailableError, sanitizeModelLabel } from '../services/agentMode/modelUnavailable';
 import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
@@ -483,6 +484,15 @@ export async function resolveEffectiveModelForUser(input: {
     usageMode: usage.mode.usageMode,
     usagePolicyVersion: usage.policy?.version || null,
   };
+}
+
+/** Remove a session this request just created after a refused launch; failure is logged, never thrown. */
+async function deleteNewSessionBestEffort(sessionId: string): Promise<void> {
+  try {
+    await chatbotDb.deleteSession(sessionId);
+  } catch (deleteErr) {
+    console.error(`AgentMode: failed to delete session ${sessionId} after a refused plan launch (orphaned empty session):`, deleteErr);
+  }
 }
 
 /** The one 422 body for a ModelUnavailableError (display name from the registry when the id is one). */
@@ -15067,6 +15077,15 @@ export const agentModeController = {
           : buildAnonymousModelUnavailableBody());
       }
 
+      // Same structure check updateSessionWorkPlan performs, run BEFORE any session or model
+      // write exists: a malformed plan (non-sequential stepCount) is refused with no state change.
+      try {
+        assertSequentialStepCounts(predefinedPlan.steps || []);
+      } catch (planErr) {
+        console.error(`AgentMode: createSessionWithPlan "${predefinedPlan.title}" refused — invalid plan structure:`, (planErr as Error).message);
+        return res.status(422).json({ error: 'This work plan is misconfigured and cannot be started right now.', code: 'workplan_invalid' });
+      }
+
       // Create session with userId (authenticated or anonymous)
       const session = await chatbotDb.createChatSession(
         userId,
@@ -15088,7 +15107,7 @@ export const agentModeController = {
         await chatbotDb.updateSessionLlmModel(session.sessionId, selectedModel);
       } catch (modelErr) {
         console.error(`AgentMode: createSessionWithPlan failed to save model for ${session.sessionId}; launch refused:`, modelErr);
-        try { await chatbotDb.deleteSession(session.sessionId); } catch { /* best-effort cleanup */ }
+        await deleteNewSessionBestEffort(session.sessionId);
         return res.status(503).json({ error: MODEL_SAVE_FAILED_MESSAGE, code: 'model_save_failed' });
       }
 
@@ -15136,7 +15155,15 @@ export const agentModeController = {
         // template regardless of which route created it.
         templatePlanId: predefinedPlan.planId,
       };
-      await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
+      try {
+        await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
+      } catch (planWriteErr) {
+        // Nothing has been shown to the user yet: drop the half-built session (it already holds
+        // the plan's model but no plan) and fail loudly.
+        console.error(`AgentMode: createSessionWithPlan failed to save the plan for ${session.sessionId}; launch refused:`, planWriteErr);
+        await deleteNewSessionBestEffort(session.sessionId);
+        throw planWriteErr;
+      }
       const firstInput = predefinedPlan.steps[0]?.inputRequest;
       if (firstInput) {
         await chatbotDb.updateSessionWorkPlanInputRequest(session.sessionId, buildWorkPlanInputRequest({

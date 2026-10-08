@@ -958,6 +958,71 @@ describe('AgentModeController - createSessionWithPlan', () => {
       expect(mockChatbotDb.updateSessionInteractiveShareMetadata).not.toHaveBeenCalled();
     });
 
+    describe('session cleanup (deleteSession)', () => {
+      let errSpy: jest.SpyInstance;
+      let del: jest.Mock;
+      beforeEach(() => {
+        errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+        del = jest.fn().mockResolvedValue(undefined);
+        (mockChatbotDb as any).deleteSession = del;
+        mockChatbotDb.createChatSession.mockResolvedValue({ ...mockSession, sessionId: 'new-sess-1' } as any);
+      });
+      afterEach(() => { errSpy.mockRestore(); });
+
+      it('model-save failure: deleteSession called exactly once with the NEW session id; 503', async () => {
+        planWithModel('gpt-5-chat');
+        mockChatbotDb.updateSessionLlmModel.mockRejectedValueOnce(new Error('ddb down'));
+        const res = mockResponse();
+        await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), res);
+        expect(res.status).toHaveBeenCalledWith(503);
+        expect(del).toHaveBeenCalledTimes(1);
+        expect(del).toHaveBeenCalledWith('new-sess-1');
+      });
+
+      it('refused launch (422) creates no session and deletes nothing; success deletes nothing', async () => {
+        planWithModel('retired-model-9');
+        const refused = mockResponse();
+        await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), refused);
+        expect(refused.status).toHaveBeenCalledWith(422);
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        planWithModel('gpt-5-chat');
+        await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), mockResponse());
+        expect(del).not.toHaveBeenCalled();
+      });
+
+      it('a rejecting deleteSession still returns 503 and logs the session id', async () => {
+        planWithModel('gpt-5-chat');
+        mockChatbotDb.updateSessionLlmModel.mockRejectedValueOnce(new Error('ddb down'));
+        del.mockRejectedValueOnce(new Error('delete down'));
+        const res = mockResponse();
+        await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), res);
+        expect(res.status).toHaveBeenCalledWith(503);
+        const logged = errSpy.mock.calls.map((c) => c.map(String).join(' ')).join('\n');
+        expect(logged).toContain('new-sess-1');
+        expect(logged).toMatch(/delete/i);
+      });
+
+      it('non-sequential stepCount: no session is created and no model is written (422/4xx-5xx, nothing to clean)', async () => {
+        mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((v: string) =>
+          Promise.resolve(v === 'system' ? [{ ...mockWorkPlans[0], defaultModel: 'gpt-5-chat', steps: [{ stepCount: 1, title: 'a' }, { stepCount: 4, title: 'b' }] }] : []));
+        const res = mockResponse();
+        await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), res);
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+        expect((res.status as jest.Mock).mock.calls[0][0]).toBeGreaterThanOrEqual(400);
+      });
+
+      it('plan write failing after the model write removes the new session (best effort) and returns a failure', async () => {
+        planWithModel('gpt-5-chat');
+        mockChatbotDb.updateSessionWorkPlan.mockRejectedValueOnce(new Error('ddb down'));
+        const res = mockResponse();
+        await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), res);
+        expect((res.status as jest.Mock).mock.calls[0][0]).toBeGreaterThanOrEqual(500);
+        expect(del).toHaveBeenCalledTimes(1);
+        expect(del).toHaveBeenCalledWith('new-sess-1');
+      });
+    });
+
     it('the model write precedes the plan write', async () => {
       planWithModel('gpt-5-chat');
       await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), mockResponse());

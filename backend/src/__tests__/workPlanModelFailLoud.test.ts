@@ -224,6 +224,59 @@ describe('applyPredefinedWorkPlan (Emma tool / launch / accept core)', () => {
     expect(r.modelUnavailable.error).not.toContain('you selected');
   });
 
+  describe('compensation and pre-validation (model write is rolled back / never happens)', () => {
+    const PRIOR_DECISION = { requestedModel: 'old-model', honored: true } as any;
+    beforeEach(() => {
+      db.getChatSession.mockResolvedValue({
+        sessionId: 's1', messages: [], llmModel: 'old-model', llmUsagePolicyDecision: PRIOR_DECISION,
+        workPlan: { title: 'Old', steps: [{ stepCount: 1, title: 'x', status: 'pending' }] },
+      } as any);
+    });
+
+    it('plan write fails: previous model AND policy decision are restored, caller gets a failure', async () => {
+      db.updateSessionWorkPlan.mockRejectedValueOnce(new Error('ddb throttled'));
+      const r: any = await launch('gpt-5-chat', { force: true });
+      expect(r.success).toBe(false);
+      expect(db.updateSessionLlmModel).toHaveBeenNthCalledWith(1, 's1', 'gpt-5-chat');
+      expect(db.updateSessionLlmModel).toHaveBeenNthCalledWith(2, 's1', 'old-model', PRIOR_DECISION);
+      expect(db.updateSessionLlmModel).toHaveBeenCalledTimes(2);
+    });
+
+    it('restore itself fails: logged loudly with the session id, caller still gets a failure, never success', async () => {
+      const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      db.updateSessionWorkPlan.mockRejectedValueOnce(new Error('ddb throttled'));
+      db.updateSessionLlmModel.mockResolvedValueOnce({} as any).mockRejectedValueOnce(new Error('restore down'));
+      const r: any = await launch('gpt-5-chat', { force: true });
+      expect(r.success).toBe(false);
+      const logged = errSpy.mock.calls.map((c) => c.map(String).join(' ')).join('\n');
+      expect(logged).toMatch(/restore/i);
+      expect(logged).toContain('s1');
+      errSpy.mockRestore();
+    });
+
+    it('non-sequential stepCount: no model write at all (nothing changes)', async () => {
+      candidates.mockResolvedValue([{ ...plan('gpt-5-chat'), steps: [{ stepCount: 1, title: 'a' }, { stepCount: 3, title: 'b' }] }]);
+      const r: any = await workPlansImpl.applyPredefinedWorkPlan('Client Onboarding', 's1', 'user-1', { force: true }, registry as any);
+      expect(r.success).toBe(false);
+      expect(db.updateSessionLlmModel).not.toHaveBeenCalled();
+      expect(db.updateSessionWorkPlan).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('anonymous (visitor) session via the Emma tool', () => {
+    it('model_unavailable message and body name no model id, name or reason', async () => {
+      candidates.mockResolvedValue([plan('admin-only-model')]);
+      const r: any = await workPlansImpl.applyPredefinedWorkPlan('Client Onboarding', 's1', 'anon_abc', {}, registry as any);
+      expect(r.errorType).toBe('model_unavailable');
+      const text = JSON.stringify(r);
+      expect(text).not.toContain('admin-only-model');
+      expect(text).not.toMatch(/not_selectable|not_served/);
+      expect(r.modelUnavailable).toEqual({ error: "This work plan can't start right now because its model is unavailable.", code: 'model_unavailable' });
+      expect(r.message).toContain("can't start right now");
+      expect(db.updateSessionLlmModel).not.toHaveBeenCalled();
+    });
+  });
+
   it('interactive launch does not page oncall', async () => {
     await launch('retired-9');
     await new Promise((res) => setImmediate(res));
@@ -338,5 +391,72 @@ describe('plan write routes (create/update)', () => {
     const changedGood = await request(app).put(`${base}/p1`).send({ defaultModel: ' gpt-5-chat ' });
     expect(changedGood.status).toBe(200);
     expect(wps.updateWorkPlan.mock.calls[1][0].defaultModel).toBe('gpt-5-chat');
+  });
+});
+
+describe('admin status scope: private + owner-admin + NO org only', () => {
+  const app = express();
+  app.use(express.json());
+  app.use('/api/admin/work-plans', authenticateToken, isAdmin, adminWorkPlanRoutes);
+  app.use('/api/user-work-plans', authenticateToken, userWorkPlanRoutes);
+  const step = { stepCount: 1, title: 'S', description: 'd' };
+  const stored = (over: any = {}) => ({
+    planId: 'p1', title: 'T', steps: [step], visibility: 'private', ownerId: 'user-1',
+    createdAt: 'x', updatedAt: 'x', ...over,
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockIsAdminCaller = true;
+    getUser.mockResolvedValue({ userId: 'user-1', isAdmin: true });
+    wps.createWorkPlan.mockImplementation(async (p: any) => ({ ...p, planId: 'new' }));
+    wps.updateWorkPlan.mockResolvedValue('rev');
+  });
+
+  it.each(['system', 'public'])('admin PUT visibility private->%s over a STORED adminOnly pin (model omitted): 422 not_selectable, nothing written', async (visibility) => {
+    wps.getWorkPlan.mockResolvedValue(stored({ defaultModel: 'admin-only-model' }) as any);
+    const res = await request(app).put('/api/admin/work-plans/p1').send({ visibility });
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({ code: 'model_unavailable', reason: 'not_selectable' });
+    expect(wps.updateWorkPlan).not.toHaveBeenCalled();
+  });
+
+  it('admin PUT visibility private->system with the SAME adminOnly model re-sent: still 422', async () => {
+    wps.getWorkPlan.mockResolvedValue(stored({ defaultModel: 'admin-only-model' }) as any);
+    const res = await request(app).put('/api/admin/work-plans/p1').send({ visibility: 'system', defaultModel: 'admin-only-model' });
+    expect(res.status).toBe(422);
+  });
+
+  it('admin PUT visibility private->system is fine when the stored model is selectable by everyone, or when it also clears the pin', async () => {
+    wps.getWorkPlan.mockResolvedValue(stored({ defaultModel: 'gpt-5-chat' }) as any);
+    expect((await request(app).put('/api/admin/work-plans/p1').send({ visibility: 'system' })).status).toBe(200);
+    wps.getWorkPlan.mockResolvedValue(stored({ defaultModel: 'admin-only-model' }) as any);
+    expect((await request(app).put('/api/admin/work-plans/p1').send({ visibility: 'system', defaultModel: '' })).status).toBe(200);
+  });
+
+  it('admin PUT: an org-scoped private plan is shared, so adminOnly is 422 even for its admin owner', async () => {
+    wps.getWorkPlan.mockResolvedValue(stored({ orgId: 'org-1', defaultModel: 'gpt-5-chat' }) as any);
+    const res = await request(app).put('/api/admin/work-plans/p1').send({ defaultModel: 'admin-only-model' });
+    expect(res.status).toBe(422);
+  });
+
+  it('user POST: admin-1 in an org -> plan gets orgId -> adminOnly pin is 422; admin-1 with no org -> 201', async () => {
+    getUser.mockResolvedValue({ userId: 'user-1', isAdmin: true, orgId: 'org-1' });
+    const denied = await request(app).post('/api/user-work-plans').send({ title: 'T', steps: [step], defaultModel: 'admin-only-model' });
+    expect(denied.status).toBe(422);
+    expect(wps.createWorkPlan).not.toHaveBeenCalled();
+    getUser.mockResolvedValue({ userId: 'user-1', isAdmin: true });
+    const ok = await request(app).post('/api/user-work-plans').send({ title: 'T', steps: [step], defaultModel: 'admin-only-model' });
+    expect(ok.status).toBe(201);
+  });
+
+  it('user PUT: admin owner of an org-scoped private plan cannot set an adminOnly pin; non-org can', async () => {
+    getUser.mockResolvedValue({ userId: 'user-1', isAdmin: true });
+    wps.getWorkPlan.mockResolvedValue(stored({ orgId: 'org-1' }) as any);
+    const denied = await request(app).put('/api/user-work-plans/p1').send({ defaultModel: 'admin-only-model' });
+    expect(denied.status).toBe(422);
+    wps.getWorkPlan.mockResolvedValue(stored() as any);
+    const ok = await request(app).put('/api/user-work-plans/p1').send({ defaultModel: 'admin-only-model' });
+    expect(ok.status).toBe(200);
   });
 });
