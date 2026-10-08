@@ -86,6 +86,11 @@ jest.mock('../services/linkedInOutreachService', () => ({
   },
 }));
 
+const mockResolveLinkedInAccountForWrite = jest.fn().mockResolvedValue({ ownerUserId: 'test-user-id' });
+jest.mock('../services/agentMode/linkedInDailyVolumeGate', () => ({
+  resolveLinkedInAccountForWrite: (...args: any[]) => mockResolveLinkedInAccountForWrite(...args),
+}));
+
 jest.mock('../services/agentModeService', () => ({ agentModeService: {} }));
 jest.mock('../utils/llmService', () => ({ createLLMService: jest.fn() }));
 jest.mock('../services/settingsService', () => ({ settingsService: {} }));
@@ -139,6 +144,7 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
   );
 
   beforeEach(() => {
+    mockResolveLinkedInAccountForWrite.mockResolvedValue({ ownerUserId: 'test-user-id' });
     jest.clearAllMocks();
     mockGetLeadListById.mockResolvedValue(OWNED_LIST);
     mockGetLeadById.mockResolvedValue(LEAD_WITH_LINKEDIN);
@@ -230,6 +236,33 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
     expect(mockResolveUserOwnedAccountId).not.toHaveBeenCalled();
   });
 
+  // ENG-2205 follow-up: a client-supplied accountId is untrusted. It used to be passed straight
+  // to Unipile, so any authenticated user could send from any account id they could name —
+  // including the site-wide pool account, whose id is disclosed in tool responses.
+  it('checks a caller-specified account against the caller\'s own/org-shared accounts', async () => {
+    mockGetLeadListById.mockResolvedValue(OWNED_LIST_WITH_ACCT);
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { accountId: 'caller-acct-1' } } as any, res as any);
+    expect(mockResolveLinkedInAccountForWrite).toHaveBeenCalledWith('test-user-id', 'caller-acct-1');
+  });
+
+  it('refuses with 403 and sends nothing when the caller-specified account is not theirs', async () => {
+    mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+    mockGetLeadListById.mockResolvedValue(OWNED_LIST_WITH_ACCT);
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { accountId: 'someone-elses-acct' } } as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'linkedin_account_not_connected', message: expect.stringContaining('not connected to your user') }));
+    expect(mockSendInvitation).not.toHaveBeenCalled();
+  });
+
+  it('does not run the ownership check when no account was supplied (list/own-resolved accounts are unchanged)', async () => {
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: {} } as any, res as any);
+    expect(mockResolveLinkedInAccountForWrite).not.toHaveBeenCalled();
+    expect(mockSendInvitation).toHaveBeenCalled();
+  });
+
   it('falls back to the user own account when list has none assigned', async () => {
     const req: any = { user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: {} };
     const res = makeRes();
@@ -269,6 +302,28 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
   });
 
   // ─── Note-quota hold / decision gate (ENG-213) ───────────────────────────────
+
+  // ENG-2205: an unreachable Unipile (credential fetch / gateway) is a handled 503, not a 500 that
+  // echoes an internal message — same as send-linkedin-message.
+  it.each([
+    ['credentials failure', new Error('Failed to fetch Unipile credentials from Secrets Manager')],
+    ['gateway 502', new Error('<html><head><title>502 Bad Gateway</title></head></html>')],
+  ])('returns 503 (no raw message, nothing recorded) on %s', async (_label, err) => {
+    mockSendInvitation.mockRejectedValue(err);
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: {} } as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'linkedin_unavailable' }));
+    expect(JSON.stringify((res.json as jest.Mock).mock.calls)).not.toMatch(/Secrets Manager|Bad Gateway/);
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
+  it('keeps a plain 500 for a non-infrastructure invite error', async () => {
+    mockSendInvitation.mockRejectedValue(new Error('something unrelated broke'));
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: {} } as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(500);
+  });
 
   it('holds (does not send) and returns a decision gate when the note quota is spent', async () => {
     const held: any = new Error('LinkedIn note quota reached — the personalized note could not be attached.');
