@@ -1,4 +1,4 @@
-import { byokCoverage, detectFrontier, parseEndpointProviders, renderCoverage, renderPrBody } from '../frontierMonitor';
+import { byokCoverage, detectFrontier, parseEndpointProviders, renderCoverage, renderPrBody, buildReviewArtifacts } from '../frontierMonitor';
 import { refreshModelCatalog } from '../modelCatalogRefresh';
 import { LLMModelConfig } from '../llmModelRegistry';
 
@@ -91,5 +91,36 @@ describe('renderPrBody', () => {
     expect(body).not.toContain('Review before merging');
     expect(body).not.toContain('<details>');
     expect(body).toContain('Rollback: revert this PR.');
+  });
+});
+
+describe('renderPrBody verdict and noise handling', () => {
+  it('leads with the auto-merge verdict and lists each check', () => {
+    const { body, autoMerge } = buildReviewArtifacts({ additions: [{ id: 'm', adminOnly: true }], reports: [], smoke: { m: 'passed' } });
+    expect(autoMerge.eligible).toBe(true);
+    expect(body).toContain('## Auto-merge check: ELIGIBLE (as admin-only)');
+    expect(body).toContain('- ✅ Live smoke test passed for every new model: 1 passed');
+    expect(body.indexOf('Auto-merge check')).toBeLessThan(body.indexOf('Complexity') + 200);
+  });
+
+  it('says NOT ELIGIBLE and shows the blocker when a warning is raised', () => {
+    const { body } = buildReviewArtifacts({ additions: [{ id: 'm', adminOnly: true }], reports: ['⚠️ LONG-PROMPT PRICE TIER: m'], smoke: { m: 'passed' } });
+    expect(body).toContain('## Auto-merge check: NOT ELIGIBLE');
+    expect(body).toContain('- ❌ No review items (⚠️) raised: 1 item(s) below');
+    expect(body).toContain('## Review before merging');
+  });
+
+  it('shows information lines visibly and collapses "AA unmatched" lines into a count', () => {
+    const unmatched = Array.from({ length: 150 }, (_, i) => `openrouter/x/m${i}: AA unmatched; score unchanged`);
+    const body = renderPrBody(['ℹ️ PRICE DROP: m is 10.0x cheaper', ...unmatched, 'x: live quote diverges']);
+    expect(body).toContain('## Notes on new models');
+    expect(body).toContain('- ℹ️ PRICE DROP: m is 10.0x cheaper');
+    expect(body).toContain('150 registry model(s) have no Artificial Analysis match');
+    expect(body).not.toContain('m149: AA unmatched');
+    expect(body).toContain('- x: live quote diverges');
+  });
+
+  it('keeps the old behaviour when called without a verdict', () => {
+    expect(renderPrBody([])).not.toContain('Auto-merge check');
   });
 });

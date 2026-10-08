@@ -3,6 +3,7 @@ import { parseOpenRouter, refreshScores } from './modelCatalogRefresh';
 import { inferFamily } from './modelSupersession';
 import { resolveOpenRouterUpstreamModelId } from '../../utils/openRouterGatewayContract';
 import { OPENROUTER_PROVIDER_PREFERENCES } from './openRouterRequestParams';
+import { AutoMergeVerdict, SmokeStatus, evaluateAutoMerge } from './catalogReview';
 
 type Registry = Readonly<Record<string, Readonly<LLMModelConfig>>>;
 const DAY = 86_400;
@@ -146,14 +147,18 @@ export function renderCoverage(coverage: Awaited<ReturnType<typeof byokCoverage>
 }
 
 /**
- * PR body for the daily refresh PR. Reviewer warnings (price outliers, price
- * drift, unmatched scores) used to exist only in the run's GITHUB_STEP_SUMMARY,
- * so a reviewer reading the PR never saw them. Lines starting with the warning
- * sign are surfaced up front; everything else sits in a collapsed block.
+ * PR body for the daily refresh PR. Reviewer information used to exist only in the
+ * run's GITHUB_STEP_SUMMARY, so a reviewer reading the PR never saw it. Layout:
+ * the auto-merge verdict first, then warning-sign items (what a human must decide),
+ * then notes on new models, and everything else collapsed.
  */
-export function renderPrBody(reports: readonly string[]): string {
+export function renderPrBody(reports: readonly string[], verdict?: AutoMergeVerdict): string {
+  const aaUnmatched = /: AA (?:unmatched|ambiguous); score unchanged$/;
+  const isNote = (r: string) => r.startsWith('ℹ️') || r.startsWith('✅');
   const warnings = reports.filter(r => r.startsWith('⚠️'));
-  const rest = reports.filter(r => !r.startsWith('⚠️'));
+  const notes = reports.filter(isNote);
+  const unmatched = reports.filter(r => aaUnmatched.test(r));
+  const rest = reports.filter(r => !r.startsWith('⚠️') && !isNote(r) && !aaUnmatched.test(r));
   return [
     'Daily frontier detection using OpenRouter release dates and the Artificial Analysis top 10.',
     'Auto-add validated text/tool models in tracked families or top-N models from tracked providers.',
@@ -164,7 +169,27 @@ export function renderPrBody(reports: readonly string[]): string {
     'No database writes or changes to saved model selections. Rollback: revert this PR.',
     'Complexity: extends the existing registry and price book; no new runtime service or storage.',
     '',
+    ...(verdict ? [
+      `## Auto-merge check: ${verdict.eligible ? 'ELIGIBLE (as admin-only)' : 'NOT ELIGIBLE'}`, '',
+      ...verdict.checks.map(c => `- ${c.ok ? '✅' : '❌'} ${c.name}: ${c.detail}`),
+      '', 'Scope: new models only (flags, price sanity, live routing). Score refreshes of existing models are not range-checked. Making a model customer-visible is a separate, later step.', '',
+    ] : []),
     ...(warnings.length ? ['## Review before merging', '', ...warnings.map(w => `- ${w}`), ''] : []),
-    ...(rest.length ? ['<details><summary>Other monitor notes</summary>', '', ...rest.map(r => `- ${r}`), '', '</details>', ''] : []),
+    ...(notes.length ? ['## Notes on new models', '', ...notes.map(n => `- ${n}`), ''] : []),
+    ...(rest.length || unmatched.length ? [
+      '<details><summary>Other monitor notes</summary>', '',
+      ...(unmatched.length ? [`- ${unmatched.length} registry model(s) have no Artificial Analysis match; their scores are unchanged.`] : []),
+      ...rest.map(r => `- ${r}`), '', '</details>', '',
+    ] : []),
   ].join('\n');
+}
+
+/** Verdict + PR body from one place, so the monitor step and the smoke-test step cannot drift. */
+export function buildReviewArtifacts(input: {
+  additions: ReadonlyArray<{ id: string; adminOnly?: boolean }>;
+  reports: readonly string[];
+  smoke: Readonly<Record<string, SmokeStatus>>;
+}) {
+  const autoMerge = evaluateAutoMerge(input);
+  return { autoMerge, body: renderPrBody(input.reports, autoMerge) };
 }

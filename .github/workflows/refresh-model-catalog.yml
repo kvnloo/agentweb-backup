@@ -37,9 +37,18 @@ jobs:
           if node -e 'process.exit(require("/tmp/model-catalog-plan.json").additions.length ? 0 : 1)'; then
             npm run refresh:openrouter-params
           fi
+      # Live check that each NEW model actually routes with the backend's request shape
+      # (tools + tool_choice + require_parameters). Needs a repo secret; without it the PR
+      # says "smoke test skipped" and is NOT eligible for auto-merge. Never fails the job.
+      - name: Live smoke test of new models
+        working-directory: backend
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_SMOKE_API_KEY }}
+          PR_BODY_PATH: /tmp/model-catalog-pr-body.md
+        run: npx ts-node --transpile-only src/scripts/smokeTestAdditions.ts /tmp/model-catalog-plan.json
       - name: Verify critical catalog and price-book invariants
         working-directory: backend
-        run: npx jest --runInBand --runTestsByPath src/services/agentMode/__tests__/modelCatalogRefresh.test.ts src/services/agentMode/__tests__/frontierMonitor.test.ts src/__tests__/llmPricing.test.ts
+        run: npx jest --runInBand --runTestsByPath src/services/agentMode/__tests__/modelCatalogRefresh.test.ts src/services/agentMode/__tests__/frontierMonitor.test.ts src/services/agentMode/__tests__/catalogReview.test.ts src/__tests__/llmPricing.test.ts
       - uses: actions/upload-artifact@v7
         if: always()
         with:
