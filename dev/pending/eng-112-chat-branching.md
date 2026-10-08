@@ -33,6 +33,21 @@ assumption.
   /generate and compare/select. Idempotency: in-process in-flight/replay map plus the `AGENT_RUN_STORE` `idem#`
   lane createSession uses (so with the store off, only same-instance retries are deduped).
 
+**Review hardening (follow-up commit).**
+- Continuation triggers: getSession re-fires a billed `scheduleAutoMediaContinuation` for an owner view whose tail is
+  an unresolved media deferral < 1h old (`hasUnresolvedMediaDeferral`). Copied rows therefore lose
+  `metadata.mediaBudgetDeferred` and the `deferred` flag of `media_generation_time_budget` entries in `toolCalls`.
+- Hidden until verified: the branch is created, immediately archived (existing `archived` field, excluded by every
+  list), filled, verified, then un-archived (`ChatbotDB.unarchiveSession`, `archived = false`). Archive/un-archive
+  retry 3x; an unhideable orphan is logged as `ORPHAN` with its id and the 500 carries `cleanupFailed` +
+  `orphanSessionId`. A process death mid-copy leaves a hidden session, never an empty visible one.
+- Idempotency scope = `branch|source|messageIndex|llmModel|key`. Owner-only (a delegated admin arrives as the
+  target). `(branch)` suffix is not stacked. A target with no preceding user row is a 400 `no_user_message`.
+- Per-user cap: AW-Settings `chat_branching_max_per_hour` (cached ~60s, last-known fallback; absent/invalid = 30,
+  `0` = unlimited), in-memory sliding window per instance, 429 `TOO_MANY_BRANCHES`; counted once the request holds
+  the source lock and refunded unless a session was created.
+- Share/conversable views drop `metadata.branchOrigin` (`filterMessagesForClient({omitBranchOrigin})`).
+
 **Residual risks.** Analytics that count sessions/user messages (satisfaction scoring, summaries, asset cache,
 `engagement.emma_session` CRM event) see a branch as a new session with copied history; assets generated in the
 prefix appear in the branch's Images/Videos lists. Only `regular` agent-portal chats are branchable (others carry
