@@ -42,7 +42,7 @@ import {
 } from './agentMode/metaImageSwapCheck';
 import { readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
-import { createCrmEvidenceCollector, crmToolsFromEarlierInvocations, runCrmFreshnessShadow } from '../utils/crmFreshnessGuard';
+import { createCrmEvidenceCollector, crmEvidenceFromEarlierInvocations, runCrmFreshnessShadow, serializeCrmEvidence } from '../utils/crmFreshnessGuard';
 import {
   evaluateTurnTimeBudget,
   buildTurnTimeBudgetNudge,
@@ -3476,7 +3476,7 @@ export class AgentModeService {
       const crmEvidence = createCrmEvidenceCollector();
       // ENG-2263: CRM tools that ran in earlier invocations of the task this one continues (auto-continuation, an answered
       // question/approval card, "continue" after a time-limit partial). Their numbers are unrecoverable, so the check abstains.
-      const crmEarlierTools = crmToolsFromEarlierInvocations(sessionHistory);
+      const crmEarlier = crmEvidenceFromEarlierInvocations(sessionHistory);
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
       // ENG-351: accumulates the web sources this message consults across all its search
@@ -5233,7 +5233,7 @@ export class AgentModeService {
       // a carried-over number dressed as fresh. Measures how often it happens, per model, before
       // anyone decides to enforce. Never edits `content`; kill switch AGENT_CRM_FRESHNESS_GUARD=off.
       if (content && !wasCancelled && !mockMode) {
-        runCrmFreshnessShadow({ finalText: content, toolCalls, evidence: crmEvidence.snapshot(), earlierInvocationTools: crmEarlierTools, sessionId, model: llmModel });
+        runCrmFreshnessShadow({ finalText: content, toolCalls, evidence: crmEvidence.snapshot(), earlier: crmEarlier, sessionId, model: llmModel });
       }
 
       // ENG-1207 AC3: a run must not finish silently on an unread page.
@@ -5393,6 +5393,12 @@ export class AgentModeService {
             memoryUsage,
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
             ...(citations.length > 0 ? { citations } : {}),
+            // ENG-2263: the numbers (never text) this invocation's CRM tools returned, so a continuation of this task can check
+            // its totals against them. Additive and optional; bounded to 64 numbers + tool names. Off with the guard's kill switch.
+            ...(process.env.AGENT_CRM_FRESHNESS_GUARD === 'off' ? {} : (() => {
+              const ev = serializeCrmEvidence(crmEvidence.snapshot());
+              return ev ? { crmEvidence: ev } : {};
+            })()),
           };
         }
       }

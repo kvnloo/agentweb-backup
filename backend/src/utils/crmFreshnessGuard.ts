@@ -138,7 +138,9 @@ function numbersFromResult(result: unknown): { numbers: Set<number>; matchCount?
       if (typeof o.listId === 'string' && listIds.size < 5000) listIds.add(o.listId);
       for (const k of Object.keys(o)) {
         const v = o[k];
-        if (typeof v === 'number') { if (COUNT_KEYS.has(k) && Number.isFinite(v)) numbers.add(Math.trunc(v)); }
+        // A per-list `leadCount` only counts through the SUM below: accepting each list's own count would let "8 lead lists"
+        // be "backed" because some list happens to hold 8 leads. At the top level (a single-list result) it is the answer.
+        if (typeof v === 'number') { if (COUNT_KEYS.has(k) && Number.isFinite(v) && !(k === 'leadCount' && depth > 0)) numbers.add(Math.trunc(v)); }
         else if (typeof v === 'string') { if (COUNT_KEYS.has(k) && /^\d{1,12}$/.test(v)) numbers.add(Number(v)); }
         else walk(v, depth + 1);
       }
@@ -195,6 +197,29 @@ export function createCrmEvidenceCollector(): CrmEvidenceCollector {
   };
 }
 
+/** What is persisted on the assistant message so a LATER invocation of the same task can check its totals. */
+export interface PersistedCrmEvidence {
+  tools: string[];
+  numbers: number[];
+  truncated?: true;
+}
+const MAX_PERSISTED_NUMBERS = 64;
+
+/** Numbers and CRM tool names only. Never reply text, lead rows or names: this lands in the customer's chat history. */
+export function serializeCrmEvidence(evidence: CrmEvidence | undefined): PersistedCrmEvidence | undefined {
+  try {
+    if (!evidence || evidence.tools.size === 0) return undefined;
+    const nums = [...evidence.numbers].filter((n) => Number.isSafeInteger(n) && n >= 0).sort((a, b) => a - b);
+    return {
+      tools: [...evidence.tools].filter((t) => CRM_FRESHNESS_TOOLS.includes(t)).sort(),
+      numbers: nums.slice(0, MAX_PERSISTED_NUMBERS),
+      ...(nums.length > MAX_PERSISTED_NUMBERS ? { truncated: true as const } : {}),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 /** Numbers backed by this turn, or null when a CRM tool succeeded but there is nothing to check its numbers against. */
 function allowedNumbers(calls: any[], succeeded: Set<string>, evidence?: CrmEvidence): Set<number> | null {
   for (const call of calls) {
@@ -216,15 +241,74 @@ function allowedNumbers(calls: any[], succeeded: Set<string>, evidence?: CrmEvid
   return allowed;
 }
 
-const NUM = '(\\d[\\d,]{0,14})';
-// "N lists", "N lead lists", "total lead lists: N", "N leads in total", "N leads across K lists / your CRM".
-// Deliberately NOT "N leads across all lists": that is how a filtered search total is phrased.
-const INVENTORY_PATTERNS: RegExp[] = [
-  new RegExp(`\\b${NUM}\\s+(?:total\\s+)?(?:lead\\s+)?lists\\b`, 'gi'),
-  new RegExp(`\\b(?:total|overall)\\s+(?:number\\s+of\\s+)?(?:lead\\s+)?(?:leads|lists|contacts)(?:\\s+across\\s+all\\s+(?:your\\s+)?(?:lead\\s+)?lists)?[ \\t:*\\-\u2013\u2014]{0,12}${NUM}\\b(?![.)]\\s)`, 'gi'),
-  new RegExp(`\\b${NUM}\\s+(?:total\\s+)?leads\\s+(?:in\\s+total|total|in\\s+your\\s+(?:entire\\s+|whole\\s+)?crm)\\b`, 'gi'),
-  new RegExp(`\\b(?:total |overall )?(?:number of )?lead lists[ \\t:*\\-\u2013\u2014]{1,12}${NUM}\\b(?![.)]\\s)`, 'gi'),
-  new RegExp(`\\b${NUM}\\s+leads\\s+(?:across|in)\\s+(?:${NUM}\\s+(?:\\w+\\s+)?lists|your\\s+(?:entire\\s+|whole\\s+)?crm)`, 'gi'),
+// ---- Count tokens: "47", "1,234", "1.2k", "12 thousand", "twelve", "forty-seven" ------------------------------------------
+const WORD_ONES: Record<string, number> = {
+  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12,
+  thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19,
+};
+const WORD_TENS: Record<string, number> = { twenty: 20, thirty: 30, forty: 40, fourty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90 };
+const START_WORDS = [...Object.keys(WORD_ONES), ...Object.keys(WORD_TENS)].join('|');
+// Every quantifier is bounded (see the ReDoS note at the top): at most 6 following words, 1-3 separators between them.
+const NUM = `(\\d[\\d,]{0,14}(?:\\.\\d{1,2})?(?:\\s?(?:k|thousand|million)\\b)?|(?:${START_WORDS})(?:[\\s-]{1,3}(?:${START_WORDS}|hundred|thousand|and)){0,6})`;
+
+interface CountRange { lo: number; hi: number; mid: number }
+const HEDGE_BEFORE = /\b(about|around|roughly|approximately|approx\.?|nearly|almost|over|under|some|circa)\s+$|~\s*$/i;
+
+/** "1.2k" -> [1150,1250); "forty-seven" -> 47; "about 40" (hedged round number) -> [35,45). null if unparseable. */
+function parseCount(raw: string, hedged: boolean): CountRange | null {
+  const t = raw.trim().toLowerCase();
+  let value: number;
+  let half = 0;
+  const m = /^(\d[\d,]*)(?:\.(\d{1,2}))?(?:\s?(k|thousand|million))?$/.exec(t);
+  if (m) {
+    const intPart = (m[1] as string).replace(/,/g, '');
+    const frac = m[2] ?? '';
+    const unit = m[3] === 'million' ? 1_000_000 : m[3] ? 1_000 : 1;
+    value = Number(`${intPart}${frac ? '.' + frac : ''}`) * unit;
+    if (!Number.isFinite(value)) return null;
+    value = Math.round(value);
+    if (unit > 1) half = (unit / 10 ** frac.length) / 2; // "1.2k" is rounded to the nearest hundred
+    else if (frac) return null; // a decimal count of leads is not a count
+  } else {
+    const words = t.split(/[\s-]+/).filter((w) => w && w !== 'and');
+    if (words.length === 0) return null;
+    let total = 0;
+    let current = 0;
+    for (const w of words) {
+      if (w in WORD_ONES) current += WORD_ONES[w] as number;
+      else if (w in WORD_TENS) current += WORD_TENS[w] as number;
+      else if (w === 'hundred') current = (current || 1) * 100;
+      else if (w === 'thousand') { total += (current || 1) * 1000; current = 0; }
+      else return null;
+    }
+    value = total + current;
+  }
+  if (!Number.isFinite(value) || value < 0 || value > 1e9) return null;
+  if (half === 0 && hedged && value >= 20) {
+    // "about 40" means 40 to the nearest ten, "about 1,200" to the nearest hundred: precision = the trailing zeros it was written with.
+    let zeros = 0;
+    for (let v = value; v % 10 === 0 && zeros < 6; v = v / 10) zeros++;
+    if (zeros > 0) half = 10 ** zeros / 2;
+  }
+  return { lo: value - half, hi: value + half - (half > 0 ? 1 : 0), mid: value };
+}
+
+// "N lists", "N lead lists", "total lead lists: N", "N leads in total", "Lead lists: N", "N leads across K lists / your CRM",
+// "Your CRM has N leads", "You have N leads." Deliberately NOT "N leads across all lists": that is how a filtered search total is phrased.
+const HEDGE = '(?:(?:about|around|roughly|approximately|approx\\.?|nearly|almost|over|some)\\s+)?';
+// pluralOnly: the pattern is only grammatical for a count above one ("N lists", "N leads"), so a claim of 1 there is a verb
+// ("No one lists the prices"), not a count.
+interface InventoryPattern { re: RegExp; needsCrmContext: boolean; pluralOnly: boolean }
+const INVENTORY_PATTERNS: InventoryPattern[] = [
+  { pluralOnly: true, needsCrmContext: false, re: new RegExp(`\\b${NUM}\\s+(?:total\\s+)?(?:lead\\s+)?lists\\b`, 'gi') },
+  { pluralOnly: false, needsCrmContext: true, re: new RegExp(`\\b(?:total|overall)\\s+(?:number\\s+of\\s+)?(?:lead\\s+)?(?:leads|lists|contacts)(?:\\s+across\\s+all\\s+(?:your\\s+)?(?:lead\\s+)?lists)?[ \\t:*\\-\u2013\u2014]{0,12}${NUM}\\b(?![.)]\\s)`, 'gi') },
+  { pluralOnly: true, needsCrmContext: true, re: new RegExp(`\\b${NUM}\\s+(?:total\\s+)?leads\\s+(?:in\\s+total|total|in\\s+your\\s+(?:entire\\s+|whole\\s+)?crm)\\b`, 'gi') },
+  { pluralOnly: false, needsCrmContext: false, re: new RegExp(`\\b(?:total |overall )?(?:number of )?lead lists[ \\t:*\\-\u2013\u2014]{1,12}${NUM}\\b(?![.)]\\s)`, 'gi') },
+  { pluralOnly: true, needsCrmContext: false, re: new RegExp(`\\b${NUM}\\s+leads\\s+(?:across|in)\\s+(?:${NUM}\\s+(?:\\w+\\s+)?lists|your\\s+(?:entire\\s+|whole\\s+)?crm)`, 'gi') },
+  // "Your CRM currently has / contains / holds about 1.2k leads"
+  { pluralOnly: true, needsCrmContext: false, re: new RegExp(`\\b(?:crm|account|database|pipeline)\\b[^.\\n]{0,40}?\\b(?:has|have|contains?|holds?|includes?|stands at|totals?|is at|comes? to)\\s+${HEDGE}${NUM}\\s+(?:total\\s+)?(?:leads|contacts|records|lists)\\b`, 'gi') },
+  // "You have 47 leads." (a bare statement, not "5 leads named Test" / "3 leads needing follow-up")
+  { pluralOnly: true, needsCrmContext: true, re: new RegExp(`\\byou\\s+(?:currently\\s+|now\\s+)?(?:have|hold|manage)\\s+${HEDGE}${NUM}\\s+(?:total\\s+)?(?:leads|contacts|records)\\b(?=\\s*(?:[.,;:!)\\]]|$|in\\s+total|overall|altogether|in\\s+your|across\\s+(?:all\\s+)?(?:your\\s+)?(?:\\d+\\s+|\\w+\\s+)?(?:lists|the\\s+crm)))`, 'gi') },
 ];
 
 const SUBSET_BEFORE = /\b(remaining|other|another|rest of(?: the)?|empty|those|these|all but|except(?: for)?|plus|new|created|added|imported|built|made|found)\s+$/i;
@@ -241,110 +325,178 @@ function paragraphAround(text: string, at: number, maxEachSide = 300): string {
   return text.slice(Math.max(lo, before === -1 ? 0 : before), after === -1 ? hi : Math.min(hi, after));
 }
 
-function findInventoryClaims(text: string): Array<{ n: number; at: number }> {
-  const out: Array<{ n: number; at: number }> = [];
-  for (const re of INVENTORY_PATTERNS) {
+function findInventoryClaims(text: string): Array<CountRange & { at: number }> {
+  const out: Array<CountRange & { at: number }> = [];
+  for (const { re, needsCrmContext, pluralOnly } of INVENTORY_PATTERNS) {
     re.lastIndex = 0;
     for (const m of text.matchAll(re)) {
       if (out.length >= MAX_CLAIMS) return out;
       const at = m.index ?? 0;
-      // patterns 2 and 3 are generic ("Total leads: N", "N leads in total"): require CRM wording in the sentence.
-      if ((re === INVENTORY_PATTERNS[1] || re === INVENTORY_PATTERNS[2]) && !(CRM_CONTEXT.test(sentenceAround(text, at)) || CRM_CONTEXT.test(paragraphAround(text, at)))) continue;
+      if (needsCrmContext && !(CRM_CONTEXT.test(sentenceAround(text, at)) || CRM_CONTEXT.test(paragraphAround(text, at)))) continue;
       // "Remaining 15 lists: 0 leads" / "the other 4 lists" is a breakdown of a subset, not the account total.
       if (SUBSET_BEFORE.test(text.slice(Math.max(0, at - 24), at))) continue;
       for (const g of m.slice(1)) {
         if (!g) continue;
-        const n = Number(g.replace(/,/g, ''));
-        if (Number.isFinite(n)) out.push({ n, at });
+        const gAt = m[0].indexOf(g);
+        const hedged = HEDGE_BEFORE.test(text.slice(Math.max(0, at + Math.max(0, gAt) - 24), at + Math.max(0, gAt)));
+        const range = parseCount(g, hedged);
+        if (range && !(pluralOnly && range.mid === 1)) out.push({ ...range, at });
       }
     }
   }
   return out;
 }
 
+/** Is any backed number inside [lo, hi]? Exact claims are a Set lookup; rounded ones scan the (small) set. */
+function backed(allowed: ReadonlySet<number>, lo: number, hi: number): boolean {
+  if (lo === hi) return allowed.has(lo);
+  for (const n of allowed) if (n >= lo && n <= hi) return true;
+  return false;
+}
+
 // ---- Work that spans several invocations -------------------------------------------------------------------
-// One user-visible task can be several generateMarketingResponse invocations: a server-authored auto-continuation, an
-// answer to a question/approval card that halted the run, or the user's "continue" after a time-limit partial. The
-// per-invocation evidence above only covers the CURRENT one, and the persisted ledger result is minimised (numbers are
-// gone), so for those invocations the earlier CRM calls can be NAMED but not CHECKED. We therefore (a) count them as having
-// run for the tag check and (b) abstain on the total check. A plain follow-up question is NOT a continuation: carrying a
-// number over from an earlier turn is exactly the failure this detector exists to see.
+// One user-visible task can be several generateMarketingResponse invocations: a server-authored auto-continuation, an answer
+// to a question/approval card that halted the run, or the user asking to "continue". Each invocation persists a small
+// numbers-only `metadata.crmEvidence` on its closing assistant message, so a later invocation of the SAME task can check its
+// totals against what the task's earlier CRM calls really returned. Where that evidence is missing (messages saved before this
+// existed, a truncated record, a CRM write in between) the total check abstains instead of guessing. A plain follow-up question
+// is NOT a continuation: carrying a number over from an earlier turn is exactly the failure this detector exists to see.
 const MAX_HISTORY_SCANNED = 120;
 const MAX_TOOLCALLS_PER_MESSAGE = 200;
+
+export interface EarlierInvocationEvidence {
+  /** CRM tools that ran and succeeded in earlier invocations of the task this one continues. */
+  tools: string[];
+  /** Numbers those calls returned (only what was persisted). */
+  numbers: Set<number>;
+  /** True when every CRM call in the earlier invocations has its numbers recorded, so totals can be checked against them. */
+  complete: boolean;
+}
+const NO_EARLIER_EVIDENCE: EarlierInvocationEvidence = { tools: [], numbers: new Set(), complete: true };
 
 function isRecord(v: unknown): v is Record<string, any> {
   return !!v && typeof v === 'object' && !Array.isArray(v);
 }
 
+// What a person types to resume: "continue", "go on", "keep going", "ok proceed" ... and nothing else of substance.
+const CONTINUE_REQUEST = /^(?:(?:ok(?:ay)?|yes|yep|sure|please|pls|thanks?|great)[\s,.!-]+){0,2}(?:continue|go on|keep going|carry on|proceed|resume|go ahead|pick (?:it )?up|keep at it)\b[\s\S]{0,40}$/i;
+
+/** A typed "continue" (short, and says nothing else). Anything longer is a new request that happens to start that way. */
+export function looksLikeContinueRequest(content: unknown): boolean {
+  if (typeof content !== 'string') return false;
+  const t = content.trim();
+  if (!t || t.length > 60) return false;
+  if (t.split(/\s+/).length > 8) return false;
+  return CONTINUE_REQUEST.test(t);
+}
+
 /** Does this user message continue earlier work rather than start a new request? */
-function userMessageContinuesEarlierWork(user: Record<string, any>, previous: Record<string, any> | undefined): boolean {
+function userMessageContinuesEarlierWork(user: Record<string, any>): boolean {
   const md = isRecord(user.metadata) ? user.metadata : {};
   if (md.kind === 'auto-continuation') return true;
   if (md.askUserQuestionAnswer || md.approvalDeckAnswer || md.approvalDeckCancelled) return true;
-  // The user's "continue" after a time-limit partial: the assistant message just before it is the server's marker.
-  const pmd = previous && isRecord(previous.metadata) ? previous.metadata : {};
-  return pmd.kind === 'generation-timeout-continuation';
+  // The server tells people to 'reply "continue"' after a time-limit partial, a step-budget stop, and a whole-turn timeout.
+  // Only the first leaves a marker, so the typed words are what decides - and a marker alone no longer does: someone who
+  // ignores the partial and asks something new is not continuing.
+  return looksLikeContinueRequest(user.content);
+}
+
+function validPersistedEvidence(v: unknown): PersistedCrmEvidence | undefined {
+  if (!isRecord(v) || !Array.isArray(v.tools) || !Array.isArray(v.numbers)) return undefined;
+  return {
+    tools: v.tools.filter((t: unknown): t is string => typeof t === 'string' && CRM_FRESHNESS_TOOLS.includes(t)).slice(0, 20),
+    numbers: v.numbers.filter((n: unknown): n is number => typeof n === 'number' && Number.isSafeInteger(n)).slice(0, MAX_PERSISTED_NUMBERS),
+    ...(v.truncated === true ? { truncated: true as const } : {}),
+  };
 }
 
 /**
- * CRM tools that ran (and did not error) in EARLIER invocations of the task the current invocation continues.
- * `history` is the persisted session; the current user message is normally its last entry. Returns [] for a fresh
- * request, so ordinary follow-ups are still fully checked.
+ * What the CRM tools of the EARLIER invocations of the task the current invocation continues returned.
+ * `history` is the persisted session; the current user message is normally its last entry. Returns an empty, complete
+ * record for a fresh request, so ordinary follow-ups are still fully checked.
  */
-export function crmToolsFromEarlierInvocations(history: unknown): string[] {
+export function crmEvidenceFromEarlierInvocations(history: unknown): EarlierInvocationEvidence {
   try {
-    if (!Array.isArray(history) || history.length === 0) return [];
+    if (!Array.isArray(history) || history.length === 0) return NO_EARLIER_EVIDENCE;
     const msgs = history.length > MAX_HISTORY_SCANNED ? history.slice(-MAX_HISTORY_SCANNED) : history;
     const lastIdx = msgs.length - 1;
     const last = msgs[lastIdx];
     // If the current user message is not in the history we cannot tell what this invocation continues.
-    if (!isRecord(last) || last.role !== 'user') return [];
+    if (!isRecord(last) || last.role !== 'user') return NO_EARLIER_EVIDENCE;
 
-    const found = new Set<string>();
+    const ran = new Set<string>();       // CRM tools seen succeeding in toolCalls
+    const recorded = new Set<string>();  // CRM tools whose numbers were persisted
+    const numbers = new Set<number>();
+    let truncated = false;
+    let wrote = false;
     let userIdx = lastIdx;
     for (let guard = 0; guard < MAX_HISTORY_SCANNED; guard++) {
       const user = msgs[userIdx];
-      const prevIdx = userIdx - 1;
-      const before = prevIdx >= 0 && isRecord(msgs[prevIdx]) ? msgs[prevIdx] : undefined;
-      // The assistant message that closed the previous invocation (skip tool/other roles).
-      let closer: Record<string, any> | undefined;
-      for (let i = prevIdx; i >= 0; i--) { const m = msgs[i]; if (isRecord(m) && m.role === 'assistant') { closer = m; break; } }
-      if (!isRecord(user) || !userMessageContinuesEarlierWork(user, closer ?? before)) break;
+      if (!isRecord(user) || !userMessageContinuesEarlierWork(user)) break;
 
       // Walk back over the earlier invocation(s) of this task, up to the user message that opened them.
-      let i = prevIdx;
+      let i = userIdx - 1;
       for (; i >= 0; i--) {
         const m = msgs[i];
         if (!isRecord(m)) continue;
         if (m.role === 'user') break;
         if (m.role !== 'assistant') continue;
-        const calls = isRecord(m.metadata) && Array.isArray(m.metadata.toolCalls) ? m.metadata.toolCalls : [];
+        const md = isRecord(m.metadata) ? m.metadata : {};
+        const calls = Array.isArray(md.toolCalls) ? md.toolCalls : [];
         for (const tc of calls.slice(0, MAX_TOOLCALLS_PER_MESSAGE)) {
-          if (isRecord(tc) && typeof tc.name === 'string' && CRM_FRESHNESS_TOOLS.includes(tc.name) && toolCallSucceeded(tc)) found.add(tc.name);
+          if (!isRecord(tc) || typeof tc.name !== 'string' || !toolCallSucceeded(tc)) continue;
+          if (CRM_FRESHNESS_TOOLS.includes(tc.name)) ran.add(tc.name);
+          else if (CRM_WRITE_TOOLS.includes(tc.name)) wrote = true;
+        }
+        const ev = validPersistedEvidence(md.crmEvidence);
+        if (ev) {
+          for (const t of ev.tools) recorded.add(t);
+          for (const n of ev.numbers) numbers.add(n);
+          if (ev.truncated) truncated = true;
         }
       }
       if (i < 0) break;
       userIdx = i; // that user message may itself be a continuation boundary: keep walking
     }
-    return [...found].sort();
+    const tools = [...new Set([...ran, ...recorded])].sort();
+    if (tools.length === 0 && !wrote) return NO_EARLIER_EVIDENCE;
+    // Complete = every CRM tool that ran has its numbers on file, nothing was cut off, and no write changed the totals since.
+    const complete = !wrote && !truncated && [...ran].every((t) => recorded.has(t));
+    return { tools, numbers, complete };
   } catch {
-    return [];
+    return NO_EARLIER_EVIDENCE;
   }
+}
+
+/** CRM tools that ran in earlier invocations of the task this one continues (names only; see crmEvidenceFromEarlierInvocations). */
+export function crmToolsFromEarlierInvocations(history: unknown): string[] {
+  return crmEvidenceFromEarlierInvocations(history).tools;
 }
 
 function citedTools(tag: string): string[] {
   return CRM_FRESHNESS_TOOLS.filter((name) => new RegExp(`(^|[^a-z_])${name}($|[^a-z_])`, 'i').test(tag));
 }
 
+function normalizeEarlier(e: EarlierInvocationEvidence | readonly string[] | undefined): EarlierInvocationEvidence {
+  if (!e) return NO_EARLIER_EVIDENCE;
+  if (Array.isArray(e) || !('numbers' in (e as object))) {
+    // A bare list of tool names: the tools ran, but nothing is known about their numbers.
+    const tools = [...(e as readonly string[])];
+    return tools.length ? { tools, numbers: new Set(), complete: false } : NO_EARLIER_EVIDENCE;
+  }
+  return e as EarlierInvocationEvidence;
+}
+
 export function detectCrmFreshnessMismatch(
   finalText: unknown,
   toolCalls: unknown,
   evidence?: CrmEvidence,
-  /** CRM tools that ran in earlier invocations of the task this one continues (see crmToolsFromEarlierInvocations). */
-  earlierInvocationTools: readonly string[] = [],
+  /** What the earlier invocations of the task this one continues returned (see crmEvidenceFromEarlierInvocations). */
+  earlierInput?: EarlierInvocationEvidence | readonly string[],
 ): CrmFreshnessResult {
   const empty: CrmFreshnessResult = { findings: [], crmToolsSucceeded: [], tagsSeen: 0 };
   if (typeof finalText !== 'string' || !finalText) return empty;
+  const earlier = normalizeEarlier(earlierInput);
 
   const calls: any[] = Array.isArray(toolCalls) ? toolCalls : [];
   const succeeded = new Set<string>();
@@ -366,23 +518,24 @@ export function detectCrmFreshnessMismatch(
     if (MENTION_AFTER.test(text.slice(at + tag.length, at + tag.length + 24))) continue;
     if (MENTION_BEFORE.test(text.slice(Math.max(0, at - 24), at))) continue;
     const cited = citedTools(tag);
-    if (cited.length > 0 && !cited.some((name) => succeeded.has(name) || earlierInvocationTools.includes(name))) {
+    if (cited.length > 0 && !cited.some((name) => succeeded.has(name) || earlier.tools.includes(name))) {
       findings.push({ kind: 'cited_tool_not_run', cited });
     }
   }
 
   const claims = findInventoryClaims(text);
   if (claims.length > 0) {
-    // null = a CRM tool ran but its numbers are unavailable (this includes every earlier invocation of a continued
-    // task: its ledger result is minimised): abstain rather than guess.
-    const allowed = earlierInvocationTools.length > 0 ? null : allowedNumbers(calls, succeeded, evidence);
-    if (allowed) {
+    // null = a CRM tool ran but its numbers are unavailable: abstain rather than guess. For a continued task that means an
+    // earlier invocation has no persisted evidence (saved before it existed, truncated, or a CRM write changed the totals).
+    const current = earlier.tools.length > 0 && !earlier.complete ? null : allowedNumbers(calls, succeeded, evidence);
+    if (current) {
+      const allowed = earlier.numbers.size > 0 ? new Set<number>([...current, ...earlier.numbers]) : current;
       const seen = new Set<number>();
-      for (const { n, at } of claims) {
-        if (allowed.has(n) || seen.has(n)) continue;
+      for (const { lo, hi, mid, at } of claims) {
+        if (backed(allowed, lo, hi) || seen.has(mid)) continue;
         if (ALREADY_LABELLED.test(sentenceAround(text, at))) continue;
-        seen.add(n);
-        findings.push({ kind: 'inventory_total_not_in_tool_results', cited: [], claimed: n });
+        seen.add(mid);
+        findings.push({ kind: 'inventory_total_not_in_tool_results', cited: [], claimed: mid });
       }
     }
   }
@@ -393,7 +546,8 @@ export interface CrmFreshnessShadowInput {
   finalText: unknown;
   toolCalls: unknown;
   evidence?: CrmEvidence;
-  earlierInvocationTools?: readonly string[];
+  /** What the earlier invocations of the task this one continues returned (or just their tool names). */
+  earlier?: EarlierInvocationEvidence | readonly string[];
   sessionId?: string;
   model?: string;
   log?: (message: string, detail: Record<string, unknown>) => void;
@@ -406,7 +560,7 @@ export interface CrmFreshnessShadowInput {
 export function runCrmFreshnessShadow(input: CrmFreshnessShadowInput): CrmFreshnessFinding[] {
   try {
     if (process.env.AGENT_CRM_FRESHNESS_GUARD === 'off') return [];
-    const result = detectCrmFreshnessMismatch(input.finalText, input.toolCalls, input.evidence, input.earlierInvocationTools ?? []);
+    const result = detectCrmFreshnessMismatch(input.finalText, input.toolCalls, input.evidence, input.earlier);
     if (result.findings.length === 0) return [];
     // One line of JSON, so a plain grep / log search / the summarizer script can read it (console.warn(obj)
     // spreads a multi-line dump that log shippers split apart).
@@ -418,7 +572,7 @@ export function runCrmFreshnessShadow(input: CrmFreshnessShadowInput): CrmFreshn
       findingCount: result.findings.length,
       tagsSeen: result.tagsSeen,
       crmToolsSucceeded: result.crmToolsSucceeded,
-      continuation: (input.earlierInvocationTools?.length ?? 0) > 0,
+      continuation: normalizeEarlier(input.earlier).tools.length > 0,
       // Numbers and tool names only - never reply text (replies carry names, emails, deal values).
       claimed: [...new Set(result.findings.map((f) => f.claimed).filter((n): n is number => typeof n === 'number'))].slice(0, 10),
       cited: [...new Set(result.findings.flatMap((f) => f.cited))].slice(0, 10),
