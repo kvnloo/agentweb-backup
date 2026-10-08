@@ -669,6 +669,7 @@ const SIDE_EFFECTING_PREFIXES = [
 export const EXTERNAL_SEND_TOOLS = new Set([
   'send_email',
   'linkedin_outreach',
+  'manage_crm_sequence', // ENG-964: activation starts drip email to real leads
 ]);
 
 export const EXTERNAL_PUBLISH_TOOLS = new Set([

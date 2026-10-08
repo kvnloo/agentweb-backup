@@ -56,8 +56,8 @@ describe('price book version (ENG-1250 §5, ENG-1934)', () => {
 
   it('matches the prices it versions — bump LLM_PRICE_BOOK_VERSION and this pin together', () => {
     expect({ version: LLM_PRICE_BOOK_VERSION, fingerprint: fingerprint() }).toEqual({
-      version: '2026-09-26',
-      fingerprint: '1a418422ee41b613', // Adds the OpenRouter embedding model alias at the existing rate.
+      version: '2026-10-08',
+      fingerprint: '0f0550111d679f49', // Catalog refresh price-book pin.
     });
   });
 });
@@ -245,7 +245,7 @@ describe('llmPricing', () => {
       // at add time (ENG-2293) — not inferred from the registry's human-editable
       // `description` field, which the draft-PR review step explicitly tells
       // reviewers to rewrite before marking a model ready.
-      const explicitCacheOverrides = new Set(['gpt-4o', 'openrouter/anthropic/claude-fable-5.1', 'gemini-3.8-flash', 'openrouter/anthropic/claude-opus-5.5', 'openrouter/x-ai/grok-4.7']);
+      const explicitCacheOverrides = new Set(['gpt-4o', 'openrouter/anthropic/claude-fable-5.1', 'gemini-3.8-flash', 'openrouter/anthropic/claude-opus-5.5', 'openrouter/x-ai/grok-4.7', 'openrouter/anthropic/claude-sonnet-5.5', 'openrouter/deepseek/deepseek-v4-pro-0813', 'openrouter/deepseek/deepseek-v4.1-flash', 'openrouter/google/gemini-3.5-flash-lite', 'openrouter/openai/gpt-6.1-sol', 'openrouter/z-ai/glm-5.3', 'openrouter/z-ai/glm-5.3-flash', 'openrouter/anthropic/claude-haiku-5.5']);
       for (const [model, price] of Object.entries(MODEL_PRICING)) {
         if (price.outPerM === 0) continue; // embeddings have no cache convention
         if (explicitCacheOverrides.has(model)) continue;

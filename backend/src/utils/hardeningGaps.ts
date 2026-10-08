@@ -38,6 +38,7 @@ export const SEND_TOOLS = new Set<string>([
   "send_email",
   "send_email_to_lead",
   "send_email_from_sender",
+  "manage_crm_sequence", // ENG-964: drip sequence activation
   // LinkedIn / X outreach + post management (DMs, threads, replies, deletes)
   "linkedin_outreach",
   "linkedin_manage_post",

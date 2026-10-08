@@ -25,12 +25,10 @@ export const META_TOOLKIT_V1_TOOL_NAMES = [
 
 export type MetaToolkitToolName = (typeof META_TOOLKIT_V1_TOOL_NAMES)[number];
 
-/** call_meta_marketing_api actions allowed in v1 (§4). DELETE, uploads, COPY_AD, RETAG_UTM are excluded. */
-export const META_TOOLKIT_V1_ACTIONS = ['LIST', 'GET', 'PREVIEW', 'CREATE', 'UPDATE', 'SEARCH', 'GET_MATCH_QUALITY'] as const;
+/** ENG-2268 D2: external v1 is reads-only, regardless of plan or granted Meta scopes. */
+export const META_TOOLKIT_V1_ACTIONS = ['LIST', 'GET', 'PREVIEW', 'SEARCH', 'GET_MATCH_QUALITY'] as const;
 
-const READ_ACTIONS = new Set(['LIST', 'GET', 'PREVIEW', 'SEARCH', 'GET_MATCH_QUALITY']);
-/** Guarded writes in v1: only CAMPAIGN / AD_SET / AD CREATE + UPDATE (deck-gated path). */
-const GUARDED_WRITE_ENTITIES = new Set(['CAMPAIGN', 'AD_SET', 'AD']);
+const READ_ACTIONS = new Set<string>(META_TOOLKIT_V1_ACTIONS);
 
 export class MetaToolkitRefusal extends Error {
   constructor(message: string) {
@@ -50,6 +48,7 @@ function narrowDefinition(definition: any): any {
     // client_id is admin-only cross-client access: internal only (§4).
     delete props.client_id;
     if (def.name === 'call_meta_marketing_api') {
+      def.description = "Read-only Meta Marketing API for external agents. Actions: LIST, GET, PREVIEW, SEARCH, GET_MATCH_QUALITY. All writes are excluded from v1.";
       if (props.action?.enum) props.action.enum = [...META_TOOLKIT_V1_ACTIONS];
       // The waiver replay is not wired through the deck flow (§4).
       if (props.params?.properties) delete props.params.properties.override_tracking_check;
@@ -90,7 +89,6 @@ export function assertMetaToolkitV1Call(name: string, args: any): void {
     throw new MetaToolkitRefusal('override_tracking_check is not available to external Meta Toolkit callers.');
   }
   if (READ_ACTIONS.has(action)) return;
-  if ((action === 'CREATE' || action === 'UPDATE') && GUARDED_WRITE_ENTITIES.has(entity)) return;
   throw new MetaToolkitRefusal(`${entity} ${action} is not part of the Meta Toolkit v1 surface.`);
 }
 

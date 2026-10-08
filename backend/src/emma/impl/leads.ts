@@ -209,6 +209,7 @@ import type { AgentModeService } from '../../services/agentModeService';
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
 import { matchLifecyclePresenceFilter } from '../../utils/lifecycleFilterSemantics';
+import { isLinkedInInfraError, LINKEDIN_UNAVAILABLE_MESSAGE } from '../../utils/linkedInInfraError';
 
 export async function getLeadLists(userId: string): Promise<any> {
     try {
@@ -356,6 +357,7 @@ export async function addLeadsToList(
 
       const { leadImportWriteBudgetMs } = await import('../../utils/leadImportLedger');
       const result = await crmDb.batchCreateLeads(listId, formattedLeads, {
+        origin: 'enrichment_import',
         // A file the user may re-send after a truncated run: dedupe the rows
         // that carry no identity of their own, or every retry duplicates them.
         dedupeByNameCompany: true,
@@ -3145,7 +3147,13 @@ export async function importLeadsFromSearch(
         cursor: lastFetchCursor ?? undefined,
       });
     } catch (e: any) {
-      searchError = e?.message ? String(e.message) : String(e);
+      const infraFailure = isLinkedInInfraError(e);
+      if (infraFailure) {
+        console.warn('[importLeadsFromSearch] LinkedIn search unavailable (infrastructure):', e?.message);
+      }
+      searchError = infraFailure
+        ? LINKEDIN_UNAVAILABLE_MESSAGE
+        : (e?.message ? String(e.message) : String(e));
       // ENG-2205: resolveAccountId can now hand back an account whose probe was
       // merely indeterminate (not proven dead — see linkedInOutreachService's
       // probeAccountSession), so a real failure here is the backstop that proves
@@ -3157,8 +3165,18 @@ export async function importLeadsFromSearch(
       // handler in emma/impl/linkedin.ts. Uses the shared isProvenDisconnectError
       // predicate (not a hand-rolled AUTH_ERROR check) specifically because it
       // excludes a bare 403 — a permission/plan restriction, not a dead session.
-      if (isProvenDisconnectError(e)) {
+      let provenDead = isProvenDisconnectError(e);
+      if (provenDead) {
         linkedInOutreachService.clearStatusCache(accountId);
+        // Unipile's explicit `errors/disconnected_account` is conclusive. A bare 401 is not (it can be a one-off
+        // auth blip), and recording a disconnect pauses scheduled runs and emails the owner, so take a fresh
+        // second opinion first; the sync cron still catches a genuinely dead session on its next pass.
+        const explicitDisconnect = (e?.structuredError?.code || e?.body?.code || e?.code) === 'errors/disconnected_account';
+        if (!explicitDisconnect) {
+          provenDead = (await linkedInOutreachService.probeAccountSession(accountId)) === 'disconnected';
+        }
+      }
+      if (provenDead) {
         const { recordUnipileAccountHealth } = await import('../../services/linkedInConnectionHealth');
         // ownerUserId must be omitted for the site-wide pool: recordUnipileAccountHealth
         // resolves an attributed owner only via getAccountsByUserId(ownerUserId) /
@@ -3357,7 +3375,7 @@ export async function importLeadsFromSearch(
       continue;
     }
 
-    const result = await crmDb.batchCreateLeads(listId, importable);
+    const result = await crmDb.batchCreateLeads(listId, importable, { origin: 'linkedin' });
     cumulativeNew += result.newCount ?? 0;
     cumulativeMerged += result.mergedCount ?? 0;
     if (Array.isArray(result.errors) && result.errors.length) allErrors.push(...result.errors);

@@ -551,7 +551,7 @@ describe('GenerateMarketingResponseWorkerService', () => {
       // In test environment, __dirname is in src/__tests__, so it should detect as local dev
       // and use TypeScript with ts-node
       if (scriptPath.includes('generateMarketingResponseWorker.ts')) {
-        expect(forkCall[2].execArgv).toEqual(['-r', 'ts-node/register', '--max-old-space-size=4096']);
+        expect(forkCall[2].execArgv).toEqual(['-r', 'ts-node/register/transpile-only', '--max-old-space-size=4096']);
       } else {
         // If it uses .js, it means __dirname contains 'dist' (deployed environment)
         expect(scriptPath).toContain('generateMarketingResponseWorker.js');
@@ -588,7 +588,7 @@ describe('GenerateMarketingResponseWorkerService', () => {
       // But the logic should handle the case where __dirname contains 'dist' even with NODE_ENV=development
       if (scriptPath.includes('generateMarketingResponseWorker.ts')) {
         // Local development: uses TypeScript with ts-node
-        expect(forkCall[2].execArgv).toEqual(['-r', 'ts-node/register', '--max-old-space-size=4096']);
+        expect(forkCall[2].execArgv).toEqual(['-r', 'ts-node/register/transpile-only', '--max-old-space-size=4096']);
       } else {
         // Deployed environment (even with NODE_ENV=development): uses compiled JavaScript
         expect(scriptPath).toContain('generateMarketingResponseWorker.js');

@@ -1,7 +1,7 @@
 # Org lead notifications (ENG-2120)
 
 `Organization.leadNotifications` opts an org into immediate Slack delivery for
-**every successful CRM insert and every accepted LP form submission**, including
+**inbound form fills and new-lead bookings by default**, including
 unknown/future landing pages, repeat email submissions and phone-only submissions
 that merge into existing rows. No LP registry, org-name branch or source allowlist
 is required. Unprocessed/failed CRM writes and ordinary CRM updates do not notify.
@@ -19,13 +19,61 @@ This is AgentWeb's destination. Haven uses `#haven-agentweb`; SWH uses
 `#smartwaterheater-agentweb`, with their actual channel IDs verified at activation.
 **Do not set `maskPhone` for Haven, SWH or AgentWeb.** It is optional and defaults
 to false. Explicit `true` remains available for other configurations. `sources`
-is optional/off by default: omit it for all three orgs so every LP and CRM insert
-notifies. If explicitly configured, it matches persisted list ID/name or LP/source
+is optional/off by default: omit it to allow every source within the selected
+lead types. If explicitly configured, it matches persisted list ID/name or LP/source
 identifiers case-insensitively; an empty array selects none.
 
 Only email placeholders matching `noemail+*@waterheater.app` (case-insensitive)
 are hidden automatically. The notification still sends. Other addresses are
 visible; legacy `excludeEmailPatterns` values no longer broaden email hiding.
+
+## Lead-type filter and Emma tools
+
+`leadTypes` is optional on the existing org JSON config. Absent means
+`["form_fill", "booking"]`; an explicit list replaces that default, and `[]`
+selects none. Unknown values, malformed arrays, or duplicate values fail config
+validation. Missing/unknown event origins never notify, including old queued jobs
+without an origin. `enabled`, type selection, and `sources` must all allow delivery.
+Existing orgs with no `leadTypes` therefore stop receiving discovery/import/manual/
+integration alerts immediately after deployment. There is no backfill or replay
+when an org later opts in.
+
+Origin is a separate server argument, never read from lead data, form fields,
+`source`, or caller-supplied custom fields. It travels through the DB insert hook
+and into the existing queued job. No origin attribute is added to lead records.
+
+| Origin | Server call sites |
+| --- | --- |
+| `form_fill` | `routes/webhooks.ts` forward-lead create and accepted repeat submission dispatch; `routes/crmPublic.ts` public form capture |
+| `booking` | `routes/calendlyWebhook.ts` new lead created by a booking |
+| `linkedin` | `services/linkedInInviteCrmMirror.ts`; `agentModeService.ts` LinkedIn discovery `importLeadsFromSearch` batch |
+| `enrichment_import` | `routes/crm.ts` bulk/CSV/LinkedIn-file imports; `agentModeService.ts` `addLeadsToList` batch; `outreachOnboardingSaveService.ts` prospect-list save |
+| `manual` | `routes/crm.ts` single UI/API add |
+| `integration` | `utils/attioPersonWebhookEvent.ts`; HubSpot record-sync creates in `routes/webhooks.ts` and `routes/crmWebhook.ts`; `signupAutoEnrollService.ts`; `onboardingLeadSync.ts`; batches in Attio/HubSpot adapters, `crmAutoSyncService.ts`, `activationAnalysisCron.ts`, `routes/admin.ts`, and `routes/crm.ts` subscriber sync |
+
+`crmWebhook.ts` is a provider record-sync endpoint, not a form-capture endpoint;
+its HubSpot/Attio records use `integration`. Existing-lead Calendly updates and
+ordinary CRM updates retain their existing behavior; they do not create new-lead
+notifications. All batch origins are explicit through `batchCreateLeads` options
+and `dispatchLeadsCreated`; neither defaults missing provenance to inbound.
+
+Emma tools are registered as foundation tools:
+
+- `get_lead_notification_settings({})` returns effective `leadTypes`,
+  `availableOptions` (values/descriptions), `enabled`, `channel`, `mentions`,
+  `sources` (`null` means all), and `maskPhone`. An unconfigured org returns
+  disabled/defaults with a null channel. No Slack credentials are returned.
+- `update_lead_notification_settings({"leadTypes":["form_fill"]})` implements
+  “only form fills”. To “also notify me about LinkedIn leads”, read settings and
+  add `linkedin` to the returned list (defaults become
+  `["form_fill","booking","linkedin"]`). Optional `enabled` and `mentions` replace
+  those fields. Channel, source filters, masking, and unrelated settings survive.
+
+Both tools derive org membership from the authenticated user; neither accepts an
+org/user override. Reads permit members; writes require the existing
+`org:configure` owner/admin permission. Updating requires an existing valid channel
+configuration (these tools do not connect Slack). Conditional writes reject
+concurrent edits; re-read before retrying. Disabled configs can be re-enabled.
 
 ## Exact layout
 
@@ -124,14 +172,14 @@ ordinary update alerts and email/WhatsApp behavior remain unchanged.
 
 Three immediate attempts use 1s/2s backoff, 8s request timeouts and bounded
 Retry-After handling; recovery handles exhausted/interrupted jobs. Healthy delivery
-targets <60 seconds. Routing/config is revalidated on recovery. Acknowledged Slack
+targets <60 seconds. Routing/config and the type filter are revalidated before each delivery and on recovery. Acknowledged Slack
 sends are not retried merely because saving the sent marker fails.
 
 Limits: a crash between saving a lead and durable enqueue, or queue unavailability,
 can lose a notification. Ambiguous Slack timeouts are not an exactly-once guarantee.
 Recovery reads the latest persisted lead, so subsequent edits can change details
-shown by a delayed notification. Large imports can exceed Slack channel rate limits.
-Lead saves never wait for Slack. Queue payloads contain IDs/timestamps, not contacts.
+shown by a delayed notification. Opted-in large imports can exceed Slack channel rate limits.
+Lead saves never wait for Slack. Queue payloads contain IDs/timestamps and the server-assigned origin, not contacts.
 
 ## Activation checklist — no production writes performed
 
@@ -163,16 +211,17 @@ Lead saves never wait for Slack. Queue payloads contain IDs/timestamps, not cont
   lead-gating form). Confirm each event in `#smartwaterheater-agentweb`; the generated
   `noemail+*@waterheater.app` address must be absent and the full phone must remain.
 - Live test AgentWeb: submit a unique company-email lead through the public AgentWeb
-  signup/lead form (the generic insert routes to the founders/signup list), then
-  confirm one message in `#lead-capture` and open its CRM link.
+  lead form, then confirm one message in `#lead-capture` and open its CRM link.
+  Signup auto-enrollment is `integration` and does not notify by default.
 - For each org, additionally submit an arbitrary newly-created/unknown LP form and a
-  direct CRM insert. Verify one Emma alert per event in the correct channel within
-  60s, exact top layout/full contacts, available details, empty-field omission and
+  direct CRM insert. Verify one Emma alert for the form and none for the manual
+  insert under defaults. Opt in to `manual` and repeat with a new lead to verify
+  an alert in the correct channel within 60s, exact top layout/full contacts, available details, empty-field omission and
   CRM link. Replay a queued event and verify no duplicate.
 - Verify placeholder email is omitted while real email and full phone remain, and
   verify no delivery to another org. No live Slack smoke was performed here.
 
-Rollback: disable the org config; pending jobs recheck before delivery.
+Rollback: revert the PR. Operationally, disable the org config to stop delivery; pending jobs recheck before sending.
 Complexity impact: extends one generic formatter and existing queue; adds one
 repeat-submission hook and removes arbitrary email-hiding/field-count behavior.
 No dependency, new table, polling loop, production config or data mutation added.

@@ -24,6 +24,7 @@ import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { suppressLeadSideEffects } from '../utils/sessionList';
+import { isLinkedInInfraError, LINKEDIN_UNAVAILABLE_MESSAGE } from '../utils/linkedInInfraError';
 import { isValidLeadLifecycle, LEAD_LIFECYCLES, isLeadListType, type LeadListType } from '../utils/leadSchema';
 import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
 import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValidation';
@@ -75,6 +76,9 @@ import { runEnrichment as svcRunEnrichmentV3 } from '../services/crmEnrichmentSe
 import { buildOrchestratorDeps as buildV3OrchestratorDeps } from '../services/enrichmentV3RealDeps';
 import { sanitizeLeadForResponse, shouldHideCardRevenueForViewer } from '../utils/enrichmentMetadataPresentation';
 import { getExternalCrmConnection, getMappedAgentwebFields, mappedFieldChanged, resolveSyncStatus } from '../utils/leadSyncStatus';
+
+const LINKEDIN_ACCOUNT_NOT_YOURS_MESSAGE =
+  'That LinkedIn account is not connected to your user. Send from one of your own connected LinkedIn accounts (Settings → Connected Accounts).';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
 
@@ -2128,7 +2132,7 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
     // ENG-2311: session lists are telemetry — no CRM push, sequence enrolment or paid
     // email validation for their rows. Flag only added when true (other lists unchanged).
     const suppressSideEffects = suppressLeadSideEffects(list);
-    const lead = await crmDb.createLead(listId, suppressSideEffects ? { ...leadData, suppressSideEffects: true } : leadData);
+    const lead = await crmDb.createLead(listId, suppressSideEffects ? { ...leadData, suppressSideEffects: true } : leadData, 'manual');
 
     if (!suppressSideEffects) void Promise.allSettled([
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'hubspot', 'created'),
@@ -2214,7 +2218,7 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
       return normalized;
     });
 
-    const result = await crmDb.batchCreateLeads(listId, normalizedLeads);
+    const result = await crmDb.batchCreateLeads(listId, normalizedLeads, { origin: 'enrichment_import' });
 
     // Auto-enroll new leads into any sequences watching this list (fire-and-forget)
     if (result.newCount > 0 && !suppressLeadSideEffects(list)) {
@@ -3242,7 +3246,7 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
     const leads = records.map((record) => projectRecordWithMapping(record, columnMapping));
 
     // Batch create leads
-    const results = await crmDb.batchCreateLeads(listId, leads);
+    const results = await crmDb.batchCreateLeads(listId, leads, { origin: 'enrichment_import' });
 
     if (results.newCount > 0 && !suppressLeadSideEffects(list)) {
       void autoEnrollListIntoSequences(userId, listId);
@@ -3827,7 +3831,7 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
 
       for (let i = 0; i < leads.length; i += leadBatchSize) {
         const batch = leads.slice(i, i + leadBatchSize);
-        const results = await crmDb.batchCreateLeads(listId, batch);
+        const results = await crmDb.batchCreateLeads(listId, batch, { origin: 'enrichment_import' });
 
         connectionsSuccessCount += results.successCount;
         connectionsErrorCount += results.errorCount;
@@ -4989,6 +4993,9 @@ router.post('/lists/:listId/sync-linkedin-connections', async (req: Request, res
     return res.json({ synced: synced.length, syncedAt: new Date().toISOString() });
   } catch (error: any) {
     console.error('Error syncing LinkedIn connections for list:', error);
+    if (isLinkedInInfraError(error)) {
+      return res.status(503).json({ message: LINKEDIN_UNAVAILABLE_MESSAGE, code: 'linkedin_unavailable' });
+    }
     return res.status(500).json({ message: error.message || 'Failed to sync LinkedIn connections' });
   }
 });
@@ -5036,6 +5043,14 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
     if (!accountId) {
       return res.status(400).json({ message: 'No LinkedIn account connected. Connect LinkedIn outreach in Settings first.' });
     }
+    // A client-supplied accountId is untrusted: it must be the caller's own account or one
+    // shared with their org — the same check withdraw/accept-invitation already apply.
+    if (requestedAccountId && typeof requestedAccountId === 'string') {
+      const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+      if (!(await resolveLinkedInAccountForWrite(userId, accountId))) {
+        return res.status(403).json({ message: LINKEDIN_ACCOUNT_NOT_YOURS_MESSAGE, code: 'linkedin_account_not_connected' });
+      }
+    }
 
     // ENG-1026: cross-check the live profile's identity against the lead before
     // sending. Positive mismatch (wrong person behind the stored URL) → 409.
@@ -5053,26 +5068,47 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
 
     await linkedInOutreachService.sendMessage(accountId, leadLinkedIn, true, message.trim());
 
-    // Record the engagement
-    const { emailEventsDb } = await import('../services/emailEventsDb');
-    const emailDomain = `linkedin-${listId}`;
-    const leadLinkedInKey = leadLinkedIn.toLowerCase();
-    await emailEventsDb.addLinkedInMessageEvent({
-      eventId: `linkedin_sent_${Date.now()}_${leadId}`,
-      emailDomain,
-      leadEmail: leadLinkedInKey,
-      eventType: 'linkedin.message.sent',
-      text: message.trim(),
-      timestamp: new Date().toISOString(),
-      senderId: accountId,
-      messageProviderId: '',
-    });
+    // Record the engagement. The message is ALREADY sent at this point, so a failure here must not be
+    // reported as a failed send: the user would retry and message the lead twice.
+    try {
+      const { emailEventsDb } = await import('../services/emailEventsDb');
+      const emailDomain = `linkedin-${listId}`;
+      const leadLinkedInKey = leadLinkedIn.toLowerCase();
+      // eventId and timestamp are fixed BEFORE the retries: the write is a keyed put, so a retry overwrites the
+      // same item instead of creating a second engagement.
+      const engagementEvent = {
+        eventId: `linkedin_sent_${Date.now()}_${leadId}`,
+        emailDomain,
+        leadEmail: leadLinkedInKey,
+        eventType: 'linkedin.message.sent' as const,
+        text: message.trim(),
+        timestamp: new Date().toISOString(),
+        senderId: accountId,
+        messageProviderId: '',
+      };
+      const RETRY_DELAYS_MS = [150, 400];
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await emailEventsDb.addLinkedInMessageEvent(engagementEvent);
+          break;
+        } catch (writeErr) {
+          if (attempt >= RETRY_DELAYS_MS.length) throw writeErr;
+          await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[attempt]));
+        }
+      }
+    } catch (recordErr) {
+      console.error('LinkedIn message was sent but its engagement could not be recorded after retries (non-fatal):', recordErr);
+      return res.json({ success: true, engagementRecorded: false });
+    }
 
     return res.json({ success: true });
   } catch (error: any) {
     console.error('Error sending LinkedIn message:', error);
     if (error.message?.startsWith('Cannot send message:')) {
       return res.status(400).json({ message: error.message });
+    }
+    if (isLinkedInInfraError(error)) {
+      return res.status(503).json({ message: LINKEDIN_UNAVAILABLE_MESSAGE, code: 'linkedin_unavailable' });
     }
     return res.status(500).json({ message: error.message || 'Failed to send LinkedIn message' });
   }
@@ -5120,6 +5156,14 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
       : ((list as any).linkedInAccountId || await linkedInOutreachService.resolveUserOwnedAccountId(userId));
     if (!accountId) {
       return res.status(400).json({ message: 'No LinkedIn account connected. Connect LinkedIn outreach in Settings first.' });
+    }
+    // A client-supplied accountId is untrusted: it must be the caller's own account or one
+    // shared with their org — the same check withdraw/accept-invitation already apply.
+    if (requestedAccountId && typeof requestedAccountId === 'string') {
+      const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+      if (!(await resolveLinkedInAccountForWrite(userId, accountId))) {
+        return res.status(403).json({ message: LINKEDIN_ACCOUNT_NOT_YOURS_MESSAGE, code: 'linkedin_account_not_connected' });
+      }
     }
 
     // ENG-1026: cross-check the live profile's identity against the lead before
@@ -5224,6 +5268,11 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     return res.json({ success: true, linkedInInviteSentAt: sentAt, noteDropped });
   } catch (error: any) {
     console.error('Error sending LinkedIn invite:', error);
+    // Same infrastructure handling as send-linkedin-message: an unreachable Unipile (credential
+    // fetch, gateway/5xx, timeout) is a handled 503, never a 500 echoing an internal message.
+    if (isLinkedInInfraError(error)) {
+      return res.status(503).json({ message: LINKEDIN_UNAVAILABLE_MESSAGE, code: 'linkedin_unavailable' });
+    }
     return res.status(500).json({ message: error.message || 'Failed to send LinkedIn invite' });
   }
 });
@@ -6647,7 +6696,7 @@ router.post('/sync-subscribers', async (req: Request, res: Response) => {
     });
 
     // Batch create/merge leads (always force update)
-    const results = await crmDb.batchCreateLeads(leadList.listId, leads);
+    const results = await crmDb.batchCreateLeads(leadList.listId, leads, { origin: 'integration' });
 
     const syncAnonymizedSkipped = results.anonymizedSkipped || 0;
     res.json({

@@ -2021,11 +2021,34 @@ export class AgentModeService {
     return null;
   }
 
+  /** Bad configured-default values already warned about (once per process each). */
+  private warnedUnusableDefaults = new Set<string>();
+
+  /** Selectable by a non-admin through the picker: served, not internalOnly/adminOnly/live. */
+  private isPubliclySelectable(modelId: string): boolean {
+    const config = this.llmModels[modelId];
+    return Boolean(config) && !config.internalOnly && !config.adminOnly && !config.isLive;
+  }
+
   async getDefaultModel(): Promise<string> {
-    return (
-      (await this.resolveConfiguredModel(this.defaultModelSettingName, 'default')) ??
-      this.default_model
-    );
+    const configured = await this.resolveConfiguredModel(this.defaultModelSettingName, 'default');
+    if (!configured) return this.default_model;
+    // The default stands in for every user, so it must be one the picker offers a
+    // non-admin (the same rules getSupportedModels(false) applies). Otherwise the
+    // usage policy rejects it ("system default model is not supported") and a turn
+    // with no stored/request model fails. Fall back to the code constant -- but only
+    // when that constant is itself usable; otherwise keep the existing behaviour.
+    if (!this.isPubliclySelectable(configured) && this.isPubliclySelectable(this.default_model)) {
+      if (!this.warnedUnusableDefaults.has(configured)) {
+        this.warnedUnusableDefaults.add(configured);
+        console.warn(
+          `AgentMode: ${this.defaultModelSettingName} "${configured}" is internal-only, admin-only, or a live-voice model ` +
+            `and cannot serve users; using "${this.default_model}" instead. Fix the AW-Settings row.`
+        );
+      }
+      return this.default_model;
+    }
+    return configured;
   }
 
   async getReportsModel(): Promise<string> {
@@ -2193,8 +2216,6 @@ export class AgentModeService {
 
   private openrouter_client: OpenAI | null = null;
   private openrouter_client_promise: Promise<OpenAI> | null = null;
-  private vertex_client: any | null = null;
-  private vertex_client_promise: Promise<any> | null = null;
 
   // OpenRouter is an OpenAI-compatible endpoint. HTTP-Referer/X-Title identify
   // the app for OpenRouter's own analytics
@@ -2248,47 +2269,6 @@ export class AgentModeService {
     return this.openrouter_client_promise;
   }
 
-  /** Convert OpenAI-format content into Anthropic-native content blocks. */
-  private static convertContentToAnthropicBlocks(content: any): any[] {
-    if (content === null || content === undefined) return [{ type: 'text', text: '' }];
-    if (typeof content === 'string') return [{ type: 'text', text: content }];
-    if (!Array.isArray(content)) return [{ type: 'text', text: String(content) }];
-
-    const validMediaTypes = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
-    const blocks: any[] = [];
-    for (const item of content) {
-      if (typeof item === 'string') {
-        blocks.push({ type: 'text', text: item });
-      } else if (!item || typeof item !== 'object') {
-        blocks.push({ type: 'text', text: String(item ?? '') });
-      } else if (item.type === 'text') {
-        blocks.push({ type: 'text', text: item.text || '' });
-      } else if (item.type === 'image_url') {
-        const url = item.image_url?.url || '';
-        if (url.startsWith('data:')) {
-          const match = url.match(/^data:(image\/[\w+.-]+)(?:;[^;]*)*;base64,(.+)$/s);
-          if (match) {
-            let mediaType = match[1].toLowerCase();
-            if (mediaType === 'image/jpg') mediaType = 'image/jpeg';
-            if (!validMediaTypes.has(mediaType)) mediaType = 'image/jpeg';
-            blocks.push({
-              type: 'image',
-              source: { type: 'base64', media_type: mediaType, data: match[2] },
-            });
-          } else {
-            console.warn(`AgentMode: Could not parse data URI for Anthropic image block, url prefix="${url.substring(0, 60)}"`);
-          }
-        } else if (url) {
-          blocks.push({ type: 'image', source: { type: 'url', url } });
-        }
-      } else if (item.type === 'image' || item.type === 'tool_result' || item.type === 'tool_use' || item.type === 'document') {
-        blocks.push(item);
-      } else {
-        blocks.push({ type: 'text', text: JSON.stringify(item) });
-      }
-    }
-    return blocks.length > 0 ? blocks : [{ type: 'text', text: '.' }];
-  }
 
   // ENG-1670: a scheduled run's own tool-calling loop can fire several Gemini
   // calls back-to-back within one turn (prod-verified: 4 calls in ~22s on the
@@ -2355,17 +2335,49 @@ export class AgentModeService {
   }
 
   /**
-   * Would the model picker accept this id for this user? Mirrors the two gates
-   * `agentModeController.updateSessionLlmModel` applies, in the same order: the
-   * supported-model allow-list, then the non-admin Opus restriction. Kept next
-   * to the registry it reads so the two cannot drift.
+   * Registry display name for a model id, or undefined when the id is not a
+   * registry key (own-property check, so 'constructor' etc. don't match).
+   * Used only to word the fail-loud model_unavailable message.
+   */
+  getModelDisplayName(modelId: string): string | undefined {
+    if (!modelId || !Object.prototype.hasOwnProperty.call(this.llmModels, modelId)) return undefined;
+    return this.llmModels[modelId].name;
+  }
+
+  /** True for a live-voice registry model (never valid for a text chat). Own-property check. */
+  isLiveModel(modelId: string): boolean {
+    return Boolean(modelId && Object.prototype.hasOwnProperty.call(this.llmModels, modelId) && this.llmModels[modelId].isLive);
+  }
+
+  /**
+   * Would the model picker accept this id for this user? The single source of
+   * truth for "can this user pick this model" — internal/live exclusion and the
+   * adminOnly gate. `updateSessionLlmModel`
+   * / `updateSharedSessionLlmModel` call this directly (ENG-2293: they used to
+   * re-derive a subset inline — just the opus check — which let a non-admin
+   * who named an adminOnly auto-added model by id bypass it) so the two cannot
+   * drift again.
    */
   isModelSelectableBy(modelId: string, isAdmin: boolean): boolean {
     const config = this.llmModels[modelId];
     if (!config || config.internalOnly || config.isLive) return false;
     if (config.adminOnly && !isAdmin) return false;
-    if (modelId.includes('opus') && !isAdmin) return false;
     return true;
+  }
+
+  /**
+   * ENG-55: registry facts the model-compare feature needs (display name, lab, live
+   * flag) without exposing the registry. Null for ids that are not registry keys.
+   */
+  getModelCompareInfo(modelId: string): { name: string; provider: string; isLive: boolean; internalOnly: boolean } | null {
+    if (!Object.prototype.hasOwnProperty.call(this.llmModels, modelId)) return null;
+    const config = this.llmModels[modelId];
+    return {
+      name: config.name ?? modelId,
+      provider: config.provider ?? 'other',
+      isLive: config.isLive === true,
+      internalOnly: config.internalOnly === true,
+    };
   }
 
   /**
@@ -2437,7 +2449,7 @@ export class AgentModeService {
   }
 
   async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
-    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || (!this.llmModels[m].adminOnly && !m.includes('opus'))));
+    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || !this.llmModels[m].adminOnly));
   }
   /**
    * Make an LLM call with the specified model and parameters
@@ -6397,6 +6409,10 @@ export class AgentModeService {
     // Org Memory (shared facts for all org members)
     'save_org_memory',
     'delete_org_memory',
+
+    // Org notification preferences use the same org-settings authorization.
+    'get_lead_notification_settings',
+    'update_lead_notification_settings',
 
     // Scheduled Chat Management
     'list_scheduled_chats',
@@ -17375,7 +17391,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // delegating wrapper — real callers beyond tools.ts: routes/emmaApi.ts's
   // POST /social-post handler, and many direct real-instance calls in
   // agentModeService.socialTools.test.ts.
-  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean }): Promise<any> {
+  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean; inReplyToPostId?: string }): Promise<any> {
     return linkedinImpl.postOnConnectedAccount(userId, accountId, content, mediaUrls, platform, toolContext, options);
   }
 

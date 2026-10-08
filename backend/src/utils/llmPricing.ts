@@ -26,7 +26,7 @@
  * pins a fingerprint of the tables to this version, so a price change that
  * forgets the bump fails the build instead of silently sharing a version.
  */
-export const LLM_PRICE_BOOK_VERSION = "2026-09-26";
+export const LLM_PRICE_BOOK_VERSION = "2026-10-08";
 
 /** The rate provenance a spend event carries when this book priced it. */
 export const LLM_PRICE_BOOK_PROVENANCE = `llm-price-book:${LLM_PRICE_BOOK_VERSION}`;
@@ -144,6 +144,16 @@ const GEMINI_3_8_FLASH_PRICE: ModelPrice = { ...withDerivedCache(0.75, 3.75), ca
  *   price page is tagged with `// UNVERIFIED`.
  */
 export const MODEL_PRICING: Record<string, ModelPrice> = {
+  "openrouter/anthropic/claude-haiku-5.5": {"inPerM":0.1,"outPerM":0.5,"cacheReadPerM":0.01,"cacheWritePerM":0.125},
+
+  "openrouter/anthropic/claude-sonnet-5.5": {"inPerM":2,"outPerM":10,"cacheReadPerM":0.2,"cacheWritePerM":2.5},
+  "openrouter/deepseek/deepseek-v4-pro-0813": {"inPerM":1.32,"outPerM":3.96,"cacheReadPerM":0.044},
+  "openrouter/deepseek/deepseek-v4.1-flash": {"inPerM":0.05,"outPerM":1.2,"cacheReadPerM":0.02},
+  "openrouter/google/gemini-3.5-flash-lite": {"inPerM":0.3,"outPerM":2.5,"cacheReadPerM":0.03,"cacheWritePerM":0.0833333333333333},
+  "openrouter/openai/gpt-6.1-sol": {"inPerM":2,"outPerM":10,"cacheReadPerM":0.1,"cacheWritePerM":2.5},
+  "openrouter/z-ai/glm-5.3": {"inPerM":0.07,"outPerM":7,"cacheReadPerM":0.065},
+  "openrouter/z-ai/glm-5.3-flash": {"inPerM":0.15,"outPerM":0.5,"cacheReadPerM":0.03},
+
   // ── AWS Bedrock Anthropic (ported from estimateCost) ───────────────────────
   // ENG-893: every cacheWritePerM here is the DEFAULT-TTL (1.25x) rate, even
   // for models agent-mode invokes with `ttl: '1h'`. The 1-hour rate is 2x, but

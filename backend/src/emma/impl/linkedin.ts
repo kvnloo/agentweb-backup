@@ -246,6 +246,7 @@ import {
   resolveLinkedInAccountForWrite,
   resolveLinkedInAccountFromList,
   setDailyInviteCap,
+  DailyInviteCapNotOwnerError,
   type ResolvedLinkedInAccount,
 } from '../../services/agentMode/linkedInDailyVolumeGate';
 import {
@@ -409,7 +410,7 @@ function linkedInPublicIdFromUrl(url: string | undefined | null): string | null 
 }
 
 // Post on connected account helper
-export async function postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean }): Promise<any> {
+export async function postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean; inReplyToPostId?: string }): Promise<any> {
   console.log('[AgentMode] postOnConnectedAccount called:', {
     userId,
     accountId,
@@ -516,7 +517,19 @@ export async function postOnConnectedAccount(userId: string, accountId: string |
     if (saveAsDraft && account.platform !== 'linkedin') {
       return { success: false, message: `save_as_draft is only supported for LinkedIn accounts, not ${account.platform}. Nothing was posted.` };
     }
-    const result = saveAsDraft
+    // ENG-976: replying to an existing post is an X-only capability here; refuse
+    // elsewhere rather than publishing a standalone post the caller did not ask for.
+    const inReplyToPostId = typeof options?.inReplyToPostId === 'string' && options.inReplyToPostId.trim()
+      ? options.inReplyToPostId.trim() : undefined;
+    if (inReplyToPostId && account.platform !== 'twitter') {
+      return { success: false, message: `in_reply_to_post_id is only supported for X (Twitter) accounts, not ${account.platform}. Nothing was posted.` };
+    }
+    const result = inReplyToPostId
+      ? await (adapter as any).createPost(
+        account, content, mediaUrls, ownerUserId,
+        toolContext?.assertPublishStillAuthorized, { inReplyToPostId }
+      )
+      : saveAsDraft
       ? await (adapter as any).createPost(
         account, content, mediaUrls, ownerUserId,
         toolContext?.assertPublishStillAuthorized, { draft: true }
@@ -2241,11 +2254,20 @@ export async function linkedinOutreach(
         // for an unattended/scheduled run (there's no one to ask).
         // Writes through the account OWNER's record, not necessarily the
         // caller's — see linkedInDailyVolumeGate.ts's module doc comment.
-        const clampedCap = await setDailyInviteCap(
-          resolvedLinkedInAccount!,
-          account_id,
-          args.daily_invite_cap,
-        );
+        let clampedCap: number;
+        try {
+          clampedCap = await setDailyInviteCap(
+            resolvedLinkedInAccount!,
+            account_id,
+            args.daily_invite_cap,
+            userId,
+          );
+        } catch (err) {
+          if (err instanceof DailyInviteCapNotOwnerError) {
+            return { success: false, error: err.message };
+          }
+          throw err;
+        }
         return {
           success: true,
           data: {
