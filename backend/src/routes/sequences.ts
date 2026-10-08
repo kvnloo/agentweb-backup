@@ -9,6 +9,7 @@ import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import {
   dripSequenceDb,
   SequenceNotFoundError,
+  SequenceStatus,
   SequenceAuthError,
   CreateSequenceInput,
   UpdateSequenceInput,
@@ -182,7 +183,7 @@ router.get('/:sequenceId', authenticateToken, async (req: Request, res: Response
 // PUT /api/crm/sequences/:sequenceId
 router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
-  const { name, description, campaignType, enrollmentTrigger, enrollmentCondition, exitConditions, autoEnrollListIds, steps, status } = req.body;
+  const { name, description, campaignType, enrollmentTrigger, enrollmentCondition, exitConditions, autoEnrollListIds, steps, status, expectedUpdatedAt, requireStatusNot } = req.body;
   try {
     // ENG-2311: auto-enrolment is driven solely by autoEnrollListIds, so refusing a session
     // list HERE (the only writer besides by-list enrol, guarded below) keeps every enrol path
@@ -204,13 +205,16 @@ router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response
       steps,
       status,
     };
-    const sequence = await dripSequenceDb.updateSequence(
-      req.params.sequenceId,
-      authReq.user!.userId,
-      input,
-    );
+    const guard: { expectedUpdatedAt?: string; requireStatusNot?: SequenceStatus } = {
+      ...(typeof expectedUpdatedAt === 'string' ? { expectedUpdatedAt } : {}),
+      ...(['draft', 'active', 'paused', 'archived'].includes(requireStatusNot) ? { requireStatusNot: requireStatusNot as SequenceStatus } : {}),
+    };
+    const sequence = Object.keys(guard).length > 0
+      ? await dripSequenceDb.updateSequence(req.params.sequenceId, authReq.user!.userId, input, guard)
+      : await dripSequenceDb.updateSequence(req.params.sequenceId, authReq.user!.userId, input);
     res.json({ sequence });
   } catch (err: any) {
+    if (err?.name === 'SequenceConflictError') return res.status(409).json({ error: err.message, code: 'sequence_conflict' });
     if (err instanceof SequenceNotFoundError) return res.status(404).json({ error: err.message });
     if (err instanceof SequenceAuthError) return res.status(403).json({ error: err.message });
     console.error('[sequences] updateSequence error:', err);
