@@ -66,6 +66,11 @@ export class ClaudeCliRunner {
    * Returns the pooled session for conversationId, spawning a fresh process only if
    * none is open. Queues behind the concurrency cap when every slot is in use by a
    * different conversation.
+   *
+   * Calling this ahead of the first real turn IS pre-warming — it pays the ~1s CLI
+   * cold-start cost before the user is waiting on it, so the first real send() lands
+   * at warm-session latency instead. `prewarm()` below is this same method under the
+   * name a caller reaches for on a chat-open signal.
    */
   async spawn(
     conversationId: string,
@@ -135,6 +140,16 @@ export class ClaudeCliRunner {
   close(handle: ClaudeCliSessionHandle): void {
     const session = this.pool.get(handle.conversationId);
     if (session) this.closeSessionInternal(session, "explicit-close");
+  }
+
+  /** Alias of spawn() for a caller warming a session ahead of the first real turn (e.g. on chat open). */
+  prewarm(
+    conversationId: string,
+    configDir: string,
+    systemPromptFile: string,
+    opts: ClaudeCliRunnerOptions = {},
+  ): Promise<ClaudeCliSessionHandle> {
+    return this.spawn(conversationId, configDir, systemPromptFile, opts);
   }
 
   /**
@@ -259,6 +274,15 @@ export function send(handle: ClaudeCliSessionHandle, message: string): Promise<C
 
 export function close(handle: ClaudeCliSessionHandle): void {
   defaultRunner.close(handle);
+}
+
+export function prewarm(
+  conversationId: string,
+  configDir: string,
+  systemPromptFile: string,
+  opts?: ClaudeCliRunnerOptions,
+): Promise<ClaudeCliSessionHandle> {
+  return defaultRunner.prewarm(conversationId, configDir, systemPromptFile, opts);
 }
 
 export function apiKeySourceFor(handle: ClaudeCliSessionHandle): string | undefined {

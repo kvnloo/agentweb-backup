@@ -188,6 +188,20 @@ describe('ClaudeCliRunner', () => {
     expect(second).toEqual(first);
   });
 
+  // ─── Pre-warm — spawn ahead of the first real turn, same pool, no double-spawn ──
+
+  it('prewarm() opens a session with no turn in flight, reused by a later send()', async () => {
+    const runner = trackedRunner();
+    const handle = await runner.prewarm('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+
+    const turn = runner.send(handle, 'first real turn');
+    const child = spawnedChildren[0];
+    emitResult(child, { type: 'result', is_error: false, result: 'ok' });
+    await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
+    expect(mockSpawn).toHaveBeenCalledTimes(1); // still the pre-warmed process, not a second one
+  });
+
   // ─── Concurrency cap + queue ────────────────────────────────────────────────
 
   it('queues a spawn for a new conversation once the concurrency cap is full, releasing a slot on close', async () => {
