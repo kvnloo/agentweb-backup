@@ -210,7 +210,7 @@ describe('detectCrmFreshnessMismatch - untagged account-wide totals (ENG-2263)',
   });
 
   it('reports each distinct stale number once', () => {
-    expect(kinds('47 leads in total. Again: 47 leads in total.')).toHaveLength(1);
+    expect(kinds('Your CRM has 47 leads in total. Again: your CRM has 47 leads in total.')).toHaveLength(1);
   });
 
   it('caps the number of claims it evaluates', () => {
@@ -229,6 +229,84 @@ describe('detectCrmFreshnessMismatch - untagged account-wide totals (ENG-2263)',
 
 // In production the ledger holds a MINIMISED result (get_lead_lists / search_leads collapse to {}), so numbers
 // come from a collector fed the full result at dispatch. Without it, every correct answer would be flagged.
+describe('false alarms and masks found by the PR #3351 review (ENG-2263)', () => {
+  const inv = (t: string, calls: any[] = [], ev?: any) =>
+    detectCrmFreshnessMismatch(t, calls, ev).findings.filter((f) => f.kind === 'inventory_total_not_in_tool_results').map((f) => f.claimed);
+  const led = (name: string, result: any = {}) => ({ id: name, name, arguments: {}, result });
+  const col = (...p: Array<[string, unknown]>) => { const c = createCrmEvidenceCollector(); for (const [n, r] of p) c.record(n, r); return c.snapshot(); };
+
+  it('does not read a non-CRM lead total as the CRM total', () => {
+    expect(inv('Apollo found 2,500 leads in total.')).toEqual([]);
+    expect(inv('Got it, you have 50 leads in total.')).toEqual([]);
+    expect(inv('Here are the total leads:\n\n1. Alice\n2. Bob')).toEqual([]);
+    expect(inv('Total leads\n\n2024 plan')).toEqual([]);
+  });
+
+  it('still judges the generic form when CRM wording is in the same sentence', () => {
+    expect(inv('Your CRM has 47 leads in total.')).toEqual([47]);
+    expect(inv('Across all your lists you have 47 leads in total.')).toEqual([47]);
+  });
+
+  it('abstains after a CRM write (the totals changed, so an earlier read is not comparable)', () => {
+    expect(inv('Your CRM now has 150 leads in total.', [led('add_leads_to_list', { success: true })])).toEqual([]);
+    expect(inv('I created 4 lead lists.', [led('create_lead_list', { success: true })])).toEqual([]);
+  });
+
+  it('does not read "I created/added N lists" as a total even without a write ledger', () => {
+    expect(inv('I created 4 lead lists for you.')).toEqual([]);
+    expect(inv('Imported 12 lead lists from the CSV.')).toEqual([]);
+  });
+
+  it('accepts the number of DISTINCT lists a multi-list search touched', () => {
+    const r = { count: 20, leads: Array.from({ length: 20 }, (_, i) => ({ listId: `list_${i % 3}`, leadId: `l${i}` })) };
+    expect(inv('Found 20 leads across 3 lists.', [led('search_leads')], col(['search_leads', r]))).toEqual([]);
+  });
+
+  it('does not let numbers inside lead rows (scores, deal values, phone digits) back a stale total', () => {
+    const rows = Array.from({ length: 20 }, (_, i) => ({ leadId: `l${i}`, icpScore: 60 + i, engagementCount: i, dealValue: 100 + i, phone: `${5550000 + i}` }));
+    const ev = col(['get_leads', { success: true, count: 20, leads: rows }]);
+    const calls = [led('get_leads')];
+    expect(inv('Your CRM has 63 leads in total.', calls, ev)).toEqual([63]);
+    expect(inv('You have 15 lead lists.', calls, ev)).toEqual([15]);
+    expect(inv('Your CRM has 20 leads in total.', calls, ev)).toEqual([]);
+  });
+
+  it('an honest label two sentences away does NOT excuse a stale claim', () => {
+    expect(inv('Your last import was 2 days ago. You have 18 lead lists.')).toEqual([18]);
+    expect(inv('Before I continue, here is the summary: you have 18 lead lists.')).toEqual([18]);
+    expect(inv('You have 18 lead lists. (This was last checked before your import.)')).toEqual([18]);
+  });
+
+  it('catches the bullet-list form: "Lead lists: 18" with "Total leads: 47" on the next line (gpt-4o-mini)', () => {
+    expect(inv('**Overview Summary:**\n- Lead lists: 18\n- Total leads: 47\n- Specific lead total: 1').sort()).toEqual([18, 47]);
+    expect(inv('- **Overall Lead Lists:** 17\n- **Total Leads:** 47').sort()).toEqual([17, 47]);
+  });
+
+  it('paragraph-level CRM wording enables the generic form, a different paragraph does not', () => {
+    expect(inv('Your CRM summary\n- Total leads: 47')).toEqual([47]);
+    expect(inv('Your CRM is great.\n\nApollo search results\n- Total leads: 47')).toEqual([]);
+  });
+
+  it('a label phrase in a PREVIOUS sentence does not excuse a later claim', () => {
+    expect(inv('Earlier I imported your file. You have 18 lead lists.')).toEqual([18]);
+    expect(inv('I checked this previously for another account. Your CRM has 47 leads in total.')).toEqual([47]);
+  });
+
+  it('a heading with CRM wording does not capture the number on the next line (list index / year)', () => {
+    expect(inv('Your CRM total leads\n\n2024 plan')).toEqual([]);
+    expect(inv('Total lead lists\n3. Review')).toEqual([]);
+    expect(inv('Total lead lists: 17', [], undefined)).toEqual([17]);
+  });
+
+  it('an honest label in the SAME sentence still excuses it', () => {
+    expect(inv('You have 18 lead lists (from our check earlier).')).toEqual([]);
+    expect(inv('You have 18 lead lists, per the prior check.')).toEqual([]);
+    expect(inv('You have 18 lead lists (from our check a moment ago).')).toEqual([]);
+    expect(inv('As noted previously, you have 18 lead lists.')).toEqual([]);
+    expect(inv('Based on the prior analysis, you have 18 lead lists.')).toEqual([]);
+  });
+});
+
 describe('CRM evidence from the real dispatch path (ENG-2263)', () => {
   const ledgerEmpty = (name: string) => ({ id: name, name, arguments: {}, result: {} });
   const inv = (text: string, calls: any[], evidence?: any) =>
@@ -362,17 +440,22 @@ describe('runCrmFreshnessShadow (ENG-2263)', () => {
     expect(text).toBe('47 leads [verified: get_lead_lists]');
   });
 
-  it('default sink writes ONE line: the marker followed by valid JSON', () => {
+  it('default sink writes ONE line of valid JSON and NEVER any reply text (names, emails, amounts)', () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     try {
-      runCrmFreshnessShadow({ finalText: 'You have 18 lead lists and 47 leads in total [verified: get_lead_lists]', toolCalls: [], sessionId: 's9', model: 'm1' });
+      // Inventory finding FIRST and a tag finding after, with PII in the surrounding reply.
+      const reply = 'Hi Jane Doe (jane.doe@acme.com), you have 18 lead lists and 47 leads in total, deal value $98,500 [verified: get_lead_lists]';
+      runCrmFreshnessShadow({ finalText: reply, toolCalls: [], sessionId: 's9', model: 'm1' });
       expect(warn).toHaveBeenCalledTimes(1);
       const line = String(warn.mock.calls[0][0]);
       expect(line.includes('\n')).toBe(false);
       const json = JSON.parse(line.slice(line.indexOf('{')));
       expect(json).toMatchObject({ sessionId: 's9', model: 'm1' });
       expect(json.kinds).toEqual(expect.arrayContaining(['cited_tool_not_run', 'inventory_total_not_in_tool_results']));
-      expect(JSON.stringify(json)).not.toContain('lead lists and');
+      expect(json.claimed).toEqual(expect.arrayContaining([18, 47]));
+      expect(json.cited).toEqual(['get_lead_lists']);
+      expect(Object.keys(json).sort()).toEqual(['cited', 'claimed', 'crmToolsSucceeded', 'findingCount', 'kinds', 'model', 'sessionId', 'tagsSeen']);
+      for (const secret of ['Jane', 'Doe', 'jane.doe', 'acme', '98,500', 'deal value', 'lead lists and']) expect(line).not.toContain(secret);
     } finally { warn.mockRestore(); }
   });
 
