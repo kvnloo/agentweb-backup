@@ -1,4 +1,7 @@
-import { createCrmEvidenceCollector, crmToolsFromEarlierInvocations, detectCrmFreshnessMismatch, runCrmFreshnessShadow } from '../utils/crmFreshnessGuard';
+import {
+  createCrmEvidenceCollector, crmEvidenceFromEarlierInvocations, crmToolsFromEarlierInvocations, detectCrmFreshnessMismatch,
+  looksLikeContinueRequest, runCrmFreshnessShadow, serializeCrmEvidence,
+} from '../utils/crmFreshnessGuard';
 
 const ok = (name: string, result: any = { success: true }) => ({ id: name, name, arguments: {}, result });
 // The first describe is about the [verified: ...] tag check; account-wide totals are covered separately below.
@@ -482,12 +485,196 @@ describe('work that spans several invocations (ENG-2263)', () => {
 
     it('the log says it was a continuation', () => {
       const log = jest.fn();
-      runCrmFreshnessShadow({ finalText: '17 lists [verified: search_leads]', toolCalls: [], earlierInvocationTools: ['get_lead_lists'], log });
+      runCrmFreshnessShadow({ finalText: '17 lists [verified: search_leads]', toolCalls: [], earlier: ['get_lead_lists'], log });
       expect(log.mock.calls[0][1]).toMatchObject({ continuation: true });
       const log2 = jest.fn();
       runCrmFreshnessShadow({ finalText: '17 lists [verified: search_leads]', toolCalls: [], log: log2 });
       expect(log2.mock.calls[0][1]).toMatchObject({ continuation: false });
     });
+  });
+});
+
+describe('number formats and phrasings beyond "N leads in total" (ENG-2263)', () => {
+  const inv = (t: string, calls: any[] = [], ev?: any) =>
+    detectCrmFreshnessMismatch(t, calls, ev).findings.filter((f) => f.kind === 'inventory_total_not_in_tool_results').map((f) => f.claimed);
+  const led = (name: string) => ({ id: name, name, arguments: {}, result: {} });
+  const ev = (counts: number[]) => { const c = createCrmEvidenceCollector(); c.record('get_lead_lists', listsResult(counts)); return c.snapshot(); };
+
+  it.each([
+    ['You have 1.2k leads in total across your CRM.', 1200],
+    ['Your CRM has 12k leads.', 12000],
+    ['You have 12 thousand leads in total in your CRM.', 12000],
+    ['Your CRM has twelve lead lists.', 12],
+    ['You have forty-seven leads in total across your CRM.', 47],
+    ['Your CRM has one hundred and five leads.', 105],
+    ['Your CRM contains 1,234 leads.', 1234],
+    ['You have 47 leads in total across your CRM.', 47],
+  ])('flags a stale total written as %p', (text, claimed) => {
+    // fresh state is nowhere near the claim, so any claim in this table is stale
+    expect(inv(text, [led('get_lead_lists')], ev([5, 5, 3]))).toEqual([claimed]);
+  });
+
+  it('a rounded form is backed when the real number rounds to it (1.2k vs 1,234; about 40 vs 43)', () => {
+    const big = (() => { const c = createCrmEvidenceCollector(); c.record('get_leads', { success: true, count: 1234, leads: [{}] }); return c.snapshot(); })();
+    expect(inv('Your CRM has about 1.2k leads in total.', [led('get_leads')], big)).toEqual([]);
+    expect(inv('Your CRM has 1.3k leads in total.', [led('get_leads')], big)).toEqual([1300]);
+    const forty = ev([20, 15, 8]); // 43 leads, 3 lists
+    expect(inv('Your CRM has about 40 leads in total.', [led('get_lead_lists')], forty)).toEqual([]);
+    expect(inv('Your CRM has about 50 leads in total.', [led('get_lead_lists')], forty)).toEqual([50]);
+  });
+
+  it('a k/thousand form is itself a rounding (no hedge word needed): 1.2k covers 1,234 but not 1,300', () => {
+    const big = (() => { const c = createCrmEvidenceCollector(); c.record('get_leads', { success: true, count: 1234, leads: [{}] }); return c.snapshot(); })();
+    expect(inv('Your CRM has 1.2k leads in total.', [led('get_leads')], big)).toEqual([]);
+    expect(inv('Your CRM has 1.3k leads in total.', [led('get_leads')], big)).toEqual([1300]);
+    expect(inv('Your CRM has 1k leads in total.', [led('get_leads')], big)).toEqual([]); // nearest thousand
+    expect(inv('Your CRM has 2k leads in total.', [led('get_leads')], big)).toEqual([2000]);
+  });
+
+  it('a list\'s own lead count does not back a wrong NUMBER OF LISTS (only the sum and the list count do)', () => {
+    expect(inv('You have 8 lead lists.', [led('get_lead_lists')], ev([20, 15, 8]))).toEqual([8]);
+    expect(inv('You have 3 lead lists and 43 leads in total.', [led('get_lead_lists')], ev([20, 15, 8]))).toEqual([]);
+  });
+
+  it('an unhedged number must match exactly: 47 is not "near" 43', () => {
+    expect(inv('Your CRM has 47 leads in total.', [led('get_lead_lists')], ev([20, 15, 8]))).toEqual([47]);
+  });
+
+  it('a correct number written as a word or with k is backed', () => {
+    expect(inv('Your CRM has three lead lists.', [led('get_lead_lists')], ev([20, 15, 8]))).toEqual([]);
+    expect(inv('You have forty-three leads in total across your CRM.', [led('get_lead_lists')], ev([20, 15, 8]))).toEqual([]);
+  });
+
+  it('catches "Your CRM has/contains N leads" and a bare "You have N leads."', () => {
+    expect(inv('Your CRM currently contains 47 leads.')).toEqual([47]);
+    expect(inv('Right now your CRM holds approximately 47 leads and 18 lists.').sort()).toEqual([18, 47]);
+    expect(inv('Across the CRM, you have 47 leads.')).toEqual([47]);
+  });
+
+  it('does not read a search or segment count as the account total', () => {
+    expect(inv('You have 5 leads named Test across your lists.')).toEqual([]);
+    expect(inv('You have 3 leads needing follow-up in your CRM.')).toEqual([]);
+    expect(inv('You have 47 leads.')).toEqual([]); // no CRM wording anywhere: not judged
+  });
+
+  it('does not misread ordinary words that are number words or contain them', () => {
+    for (const t of ['Someone lists the features.', 'One of your lists is empty.', 'Phone lists are great.', 'No one lists the prices.', 'The money lists below.']) expect(inv(t)).toEqual([]);
+  });
+
+  it('stays linear on hostile number-word / separator input', () => {
+    const t0 = process.hrtime.bigint();
+    for (const text of ['one '.repeat(100_000), 'forty-'.repeat(60_000), 'twelve' + ' '.repeat(100_000) + 'lists', ('five ' + '-'.repeat(50)).repeat(5000), 'crm '.repeat(40_000) + 'has', '1.2'.repeat(60_000) + 'k leads']) {
+      detectCrmFreshnessMismatch(text, []);
+    }
+    expect(Number(process.hrtime.bigint() - t0) / 1e6).toBeLessThan(1500);
+  });
+});
+
+describe('what a continuation can be checked against (ENG-2263)', () => {
+  const user = (content: string, metadata: any = {}) => ({ role: 'user', content, metadata });
+  const asst = (content: string, tools: any[] = [], metadata: any = {}) => ({ role: 'assistant', content, metadata: { ...metadata, ...(tools.length ? { toolCalls: tools } : {}) } });
+  const call = (name: string, extra: any = {}) => ({ id: name, name, arguments: {}, result: {}, ...extra });
+  const taskEvidence = (...pairs: Array<[string, unknown]>) => { const c = createCrmEvidenceCollector(); for (const [n, r] of pairs) c.record(n, r); return serializeCrmEvidence(c.snapshot()); };
+  const inv = (text: string, history: any[], calls: any[] = [], ev?: any) =>
+    detectCrmFreshnessMismatch(text, calls, ev, crmEvidenceFromEarlierInvocations(history)).findings
+      .filter((f) => f.kind === 'inventory_total_not_in_tool_results').map((f) => f.claimed);
+
+  it('serialises numbers and tool names only, bounded', () => {
+    const c = createCrmEvidenceCollector();
+    c.record('get_leads', { success: true, count: 3, leads: [{ email: 'jane@acme.com', firstName: 'Jane', dealValue: 98500 }] });
+    const e = serializeCrmEvidence(c.snapshot());
+    expect(e?.tools).toEqual(['get_leads']);
+    expect(JSON.stringify(e)).not.toMatch(/jane|acme|98500/i);
+    const many = createCrmEvidenceCollector();
+    for (let i = 0; i < 150; i++) many.record('get_leads', { success: true, count: 1000 + i, leads: [] });
+    const capped = serializeCrmEvidence(many.snapshot())!;
+    expect(capped.numbers.length).toBeLessThanOrEqual(64);
+    expect(capped.truncated).toBe(true);
+    expect(serializeCrmEvidence(createCrmEvidenceCollector().snapshot())).toBeUndefined();
+    expect(serializeCrmEvidence(undefined)).toBeUndefined();
+  });
+
+  it('a continuation restating the TASK\'s own total is not flagged (the numbers are on file)', () => {
+    const h = [user('How many lists?'), asst('96', [call('get_lead_lists')], { crmEvidence: taskEvidence(['get_lead_lists', listsResult([5, 5, 3])]) }), user('continue')];
+    expect(inv('Your CRM has 3 lead lists and 13 leads in total.', h)).toEqual([]);
+  });
+
+  it('a continuation restating a total from BEFORE the task IS flagged (this was the unfixable gap)', () => {
+    const h = [
+      user('How many lists?'), asst('96', [call('get_lead_lists')], { crmEvidence: taskEvidence(['get_lead_lists', listsResult(Array(96).fill(1))]) }),
+      user('Find leads named Test'), asst('found 5', [call('search_leads')], { crmEvidence: taskEvidence(['search_leads', { count: 5, leads: [{}, {}, {}, {}, {}] }]) }),
+      user('continue'),
+    ];
+    expect(inv('Your CRM has 96 lead lists.', h)).toEqual([96]);
+    expect(inv('You have 5 leads in total across your CRM.', h)).toEqual([]);
+  });
+
+  it('abstains when an earlier invocation has no persisted evidence (messages saved before this existed)', () => {
+    const h = [user('How many lists?'), asst('96', [call('get_lead_lists')]), user('continue')];
+    expect(crmEvidenceFromEarlierInvocations(h).complete).toBe(false);
+    expect(inv('Your CRM has 96 lead lists.', h)).toEqual([]);
+  });
+
+  it('abstains when the persisted evidence was truncated or a CRM write changed the totals in between', () => {
+    const many = createCrmEvidenceCollector(); for (let i = 0; i < 150; i++) many.record('get_leads', { success: true, count: 1000 + i, leads: [] });
+    const truncated = [user('go'), asst('x', [call('get_leads')], { crmEvidence: serializeCrmEvidence(many.snapshot()) }), user('continue')];
+    expect(inv('Your CRM has 9999 lead lists.', truncated)).toEqual([]);
+    const wrote = [user('go'), asst('x', [call('get_lead_lists'), call('add_leads_to_list', { result: { success: true } })], { crmEvidence: taskEvidence(['get_lead_lists', listsResult([1])]) }), user('continue')];
+    expect(crmEvidenceFromEarlierInvocations(wrote).complete).toBe(false);
+    expect(inv('Your CRM has 9999 lead lists.', wrote)).toEqual([]);
+  });
+
+  it('ignores malformed persisted evidence rather than trusting it', () => {
+    for (const bad of [null, 'x', 5, [], { tools: 'get_leads', numbers: [1] }, { tools: ['get_leads'], numbers: 'no' }, { tools: ['rm_rf'], numbers: [1e30, -1, 'a'] }]) {
+      const h = [user('go'), asst('x', [call('get_leads')], { crmEvidence: bad }), user('continue')];
+      expect(() => crmEvidenceFromEarlierInvocations(h)).not.toThrow();
+      expect(crmEvidenceFromEarlierInvocations(h).complete).toBe(false);
+    }
+  });
+
+  it('drops tool names the guard does not know from stored evidence', () => {
+    const h = [user('go'), asst('x', [call('get_leads')], { crmEvidence: { tools: ['rm_rf', 'get_leads', 42], numbers: [3] } }), user('continue')];
+    expect(crmEvidenceFromEarlierInvocations(h).tools).toEqual(['get_leads']);
+  });
+
+  it('the current invocation own evidence still applies on top of the earlier evidence', () => {
+    const h = [user('go'), asst('x', [call('get_leads')], { crmEvidence: taskEvidence(['get_leads', { count: 7, leads: [] }]) }), user('continue')];
+    const c = createCrmEvidenceCollector(); c.record('get_lead_lists', listsResult([5, 5, 3]));
+    expect(inv('Your CRM has 3 lead lists and 13 leads in total.', h, [call('get_lead_lists')], c.snapshot())).toEqual([]);
+    expect(inv('Your CRM has 40 leads in total.', h, [call('get_lead_lists')], c.snapshot())).toEqual([40]);
+  });
+});
+
+describe('what counts as asking to continue (ENG-2263)', () => {
+  it.each(['continue', 'Continue.', 'continue!', 'ok continue', 'yes, please continue', 'go on', 'keep going', 'carry on', 'proceed', 'resume', 'go ahead', 'pick it up', 'continue with the rest'])('%p is a continue request', (t) => {
+    expect(looksLikeContinueRequest(t)).toBe(true);
+  });
+
+  it.each([
+    'continue. Remind me, how many lead lists do I have in total? Do not re-run anything.',
+    'How many lead lists do I have?', 'yes', 'ok', 'thanks', 'what is the weather', 'discontinue the campaign', 'Please do not continue.',
+    'continuing is not an option for this one at all really today', '', '   ', 'x'.repeat(500),
+    'continue a b c d e f g h i j k',
+  ])('%p is not', (t) => { expect(looksLikeContinueRequest(t)).toBe(false); });
+
+  it.each([undefined, null, 5, {}, []])('%p is not (non-text)', (t) => { expect(looksLikeContinueRequest(t as any)).toBe(false); });
+
+  const user = (content: string, metadata: any = {}) => ({ role: 'user', content, metadata });
+  const asst = (content: string, tools: any[] = [], metadata: any = {}) => ({ role: 'assistant', content, metadata: { ...metadata, ...(tools.length ? { toolCalls: tools } : {}) } });
+  const call = (name: string) => ({ id: name, name, arguments: {}, result: {} });
+
+  it('after a time-limit partial, someone who ignores it and asks something new is NOT continuing', () => {
+    const h = [user('Audit'), asst('x', [call('get_leads')]), asst('Partial - reply continue', [], { kind: 'generation-timeout-continuation' }), user('Actually, how many lead lists do I have?')];
+    expect(crmToolsFromEarlierInvocations(h)).toEqual([]);
+  });
+
+  it('a typed "continue" counts even with NO marker (the step-budget and time-budget stops leave none)', () => {
+    expect(crmToolsFromEarlierInvocations([user('Audit'), asst('Reached the step limit - reply continue', [call('get_leads')]), user('continue')])).toEqual(['get_leads']);
+  });
+
+  it('a long message that merely starts with "continue" is a new request', () => {
+    const h = [user('How many lists?'), asst('96', [call('get_lead_lists')]), user('continue. Remind me how many lead lists I have in total? Do not re-run anything.')];
+    expect(crmToolsFromEarlierInvocations(h)).toEqual([]);
   });
 });
 
