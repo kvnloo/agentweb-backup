@@ -60,6 +60,7 @@ const FREE_TIER_FALLBACK: SubscriptionType = {
 
 export const SUBSCRIPTION_FEATURES = {
   SCHEDULED_CHATS: "scheduled_chats",
+  MODEL_COMPARE: "model_compare",
 } as const;
 
 /**
@@ -258,6 +259,10 @@ const AVAILABLE_SUBSCRIPTION_FEATURES: ReadonlyArray<{
   id: SUBSCRIPTION_FEATURES.SCHEDULED_CHATS,
   label: "Scheduled chats",
   description: "Create, edit, test, resume, and execute recurring Agent Mode chats.",
+}, {
+  id: SUBSCRIPTION_FEATURES.MODEL_COMPARE,
+  label: "Compare models",
+  description: "Send one prompt to several models and compare their answers side by side.",
 }];
 
 export function getAllAvailableSubscriptionFeatures() {
