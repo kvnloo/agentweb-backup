@@ -12991,9 +12991,16 @@ export const agentModeController = {
       // stored value (or omitting the field) must never be refused, or an old schedule whose
       // model was since retired could not have unrelated fields edited.
       const storedLlmModel = String((existingSchedule as any).llmModel ?? '').trim();
-      const incomingLlmModel = typeof llmModel === 'string' ? llmModel.trim() : llmModel;
-      const llmModelChanging = llmModel !== undefined && llmModel !== null && incomingLlmModel !== '' && incomingLlmModel !== storedLlmModel;
-      const validatedLlmModel = llmModelChanging ? await validateScheduleModelPin(user.userId, llmModel) : undefined;
+      // Normalise ONCE; every later decision and the write use only this value.
+      // null is treated as "omitted" (the field is simply not touched): create treats null as
+      // "no selection", and a PATCH-style null must never be stored or silently clear the pin.
+      // '' / whitespace-only is the explicit clear. Any other non-string stays as-is so
+      // validateScheduleModelPin rejects it with the usual 422.
+      const llmModelProvided = llmModel !== undefined && llmModel !== null;
+      const incomingLlmModel: unknown = typeof llmModel === 'string' ? llmModel.trim() : llmModel;
+      const llmModelClearing = llmModelProvided && incomingLlmModel === '';
+      const llmModelChanging = llmModelProvided && !llmModelClearing && incomingLlmModel !== storedLlmModel;
+      const validatedLlmModel = llmModelChanging ? await validateScheduleModelPin(user.userId, incomingLlmModel) : undefined;
 
       const existingBackupFields = {
         llmBackupModel: (existingSchedule as any).llmBackupModel || '',
@@ -13085,7 +13092,7 @@ export const agentModeController = {
         // question and not a rename's business.
         // Explicit empty -> a REMOVAL below, because inheritance is the ABSENCE of
         // the attribute, not a blank value in it.
-        ...(validatedLlmModel ? { llmModel: validatedLlmModel } : (llmModel !== undefined && llmModel !== '' && !llmModelChanging ? { llmModel } : {})),
+        ...(validatedLlmModel ? { llmModel: validatedLlmModel } : (llmModelProvided && !llmModelClearing && !llmModelChanging ? { llmModel: incomingLlmModel as string } : {})),
         ...scheduleBackup,
         // ENG-844: update the owner's timezone when a valid one is supplied; keep
         // the existing value otherwise (partial-update safe).
@@ -13341,7 +13348,7 @@ export const agentModeController = {
         // can re-derive it, only an edit can reset it. Otherwise "remove the
         // cross-account tools" could never get the schedule running again.
         [
-          ...(llmModel === '' ? ['llmModel'] : []),
+          ...(llmModelClearing ? ['llmModel'] : []),
           ...((toolsChanged || effectiveStartingMessage !== previousStartingMessage)
             && (existingSchedule as any).lastKnownSensitive !== undefined
             ? ['lastKnownSensitive', 'lastKnownSensitiveAt']
@@ -16178,7 +16185,11 @@ export const agentModeController = {
         updatedAt: now.toISOString(),
         sessionId: null,
         type: 'scheduled_chat',
-        llmModel: validatedOverrideModel || template.llmModel || '',
+        // Omitted (undefined/null) inherits the template pin; an explicit ''/whitespace
+        // override means UNPINNED and must not fall back to it.
+        llmModel: (overrideModel === undefined || overrideModel === null)
+          ? (template.llmModel || '')
+          : validatedOverrideModel,
         ...scheduleBackup,
         runCount: runCount !== undefined ? runCount : -1,
         variables: templateVars,

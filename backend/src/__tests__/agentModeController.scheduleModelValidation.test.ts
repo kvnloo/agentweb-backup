@@ -52,9 +52,10 @@ jest.mock('../services/db', () => ({
     updateSchedule: jest.fn(),
   },
   userDb: { getUserById: jest.fn() },
+  scheduleTemplateDb: { getTemplateById: jest.fn() },
 }));
 
-import { scheduleDb, userDb } from '../services/db';
+import { scheduleDb, userDb, scheduleTemplateDb } from '../services/db';
 import { agentModeController } from '../controllers/agentModeController';
 
 const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
@@ -198,5 +199,71 @@ describe('updateScheduledChat model pin', () => {
     const cleared = await update({ llmBackupModel: '' });
     expect(cleared.status).not.toHaveBeenCalledWith(422);
     expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('updateScheduledChat model pin normalisation (CodeRabbit)', () => {
+  const written = () => mockScheduleDb.updateSchedule.mock.calls[0][1] as any;
+  const removed = () => mockScheduleDb.updateSchedule.mock.calls[0][4] as any;
+
+  it('writes the TRIMMED value when a padded copy of the stored model is re-sent', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored({ llmModel: 'gpt-4-retired' }) as any);
+    await update({ llmModel: ' gpt-4-retired ' });
+    expect(written().llmModel).toBe('gpt-4-retired');
+  });
+
+  it('treats a whitespace-only llmModel as an explicit clear (same as empty)', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored({ llmModel: 'gpt-5-chat-2' }) as any);
+    await update({ llmModel: '   ' });
+    expect(written().llmModel).toBeUndefined();
+    expect(removed()).toEqual(expect.arrayContaining(['llmModel']));
+  });
+
+  it('treats explicit null llmModel as omitted: never writes null, never clears', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored({ llmModel: 'gpt-5-chat-2' }) as any);
+    const res = await update({ llmModel: null, scheduleName: 'R' });
+    expect(res.status).not.toHaveBeenCalledWith(422);
+    expect('llmModel' in written()).toBe(false);
+    expect(removed() || []).not.toContain('llmModel');
+  });
+
+  it('backup: padded value is stored trimmed; whitespace-only clears', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(
+      stored({ llmBackupModel: 'gpt-5-chat-2', llmBackupSource: 'user', llmBackupNeedsConfirmation: false }) as any);
+    await update({ llmBackupModel: ' anthropic.claude-sonnet-5 ' });
+    expect(written().llmBackupModel).toBe('anthropic.claude-sonnet-5');
+    mockScheduleDb.updateSchedule.mockClear();
+    await update({ llmBackupModel: '   ' });
+    expect(written().llmBackupModel).toBe('');
+  });
+});
+
+describe('createScheduleFromTemplate override semantics (CodeRabbit)', () => {
+  const tpl = { templateId: 't1', visibility: 'system', name: 'T', startingMessage: 'Hi', suggestedFrequency: 'daily',
+    llmModel: 'gpt-5-chat-2', variables: [] };
+  const fromTemplate = async (body: Record<string, unknown>) => {
+    const res = makeRes();
+    await (agentModeController as any).createScheduleFromTemplate(
+      { user: { userId: USER, email: 'a@b.c' }, params: { templateId: 't1' }, body: { scheduleName: 'S', ...body } } as unknown as Request, res);
+    return res;
+  };
+  beforeEach(() => { (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue(tpl); });
+  const model = () => (mockScheduleDb.createSchedule.mock.calls[0][0] as any).llmModel;
+
+  it('omitted override inherits the template pin', async () => {
+    await fromTemplate({});
+    expect(model()).toBe('gpt-5-chat-2');
+  });
+  it.each([[''], ['   ']])('explicit %j override produces an UNPINNED schedule', async (v) => {
+    await fromTemplate({ llmModel: v });
+    expect(model()).toBe('');
+  });
+  it('a valid override wins, trimmed', async () => {
+    await fromTemplate({ llmModel: ' anthropic.claude-sonnet-5 ' });
+    expect(model()).toBe('anthropic.claude-sonnet-5');
+  });
+  it('explicit empty backup override stays unpinned', async () => {
+    await fromTemplate({ llmBackupModel: '' });
+    expect((mockScheduleDb.createSchedule.mock.calls[0][0] as any).llmBackupModel).toBe('');
   });
 });
