@@ -30,8 +30,24 @@ jest.mock('../services/db', () => ({
 }));
 
 const mockGetChatSessionRecord = jest.fn();
+const mockGetMessages = jest.fn();
 jest.mock('../services/chatbotService', () => ({
-  chatbotDb: { getChatSessionRecord: (...a: unknown[]) => mockGetChatSessionRecord(...a) },
+  chatbotDb: {
+    getChatSessionRecord: (...a: unknown[]) => mockGetChatSessionRecord(...a),
+    getMessagesFromMessagesTable: (...a: unknown[]) => mockGetMessages(...a),
+  },
+}));
+
+const mockGenerateIcps = jest.fn();
+const mockGenerateCompetitors = jest.fn();
+jest.mock('../services/onboardingIcpService', () => ({
+  extractIcpBrandContext: () => ({ companyName: 'Acme', companyUrl: 'acme.com' }),
+  generateIcpsForUser: (...a: unknown[]) => mockGenerateIcps(...a),
+  mapIcpResultToMarketStrategy: (p: any[]) => p.map((x) => ({ title: x.name })),
+}));
+jest.mock('../services/onboardingCompetitorService', () => ({
+  generateCompetitorStrategyForUser: (...a: unknown[]) => mockGenerateCompetitors(...a),
+  mapCompetitorResultToMarketStrategy: () => [{ name: 'Rival' }],
 }));
 
 jest.mock('../services/agentMode/brandLogo', () => ({
@@ -39,11 +55,12 @@ jest.mock('../services/agentMode/brandLogo', () => ({
   downloadBrandLogoToS3: jest.fn(),
 }));
 
-import { updateBrandGuidelines, updateMarketStrategy } from '../emma/impl/brandMarketStrategy';
+import { regenerateMarketStrategy, updateBrandGuidelines, updateMarketStrategy } from '../emma/impl/brandMarketStrategy';
 import {
   brandBuildOwnershipCondition,
   brandBuildSessionPageIdentifier,
-  BRAND_BUILD_SESSION_LIFETIME_MS,
+  BRAND_BUILD_PROMPT_SENTINEL,
+  countHumanMessages,
   isClaimSuperseded,
   parseBrandBuildSessionClaim,
   shouldRefuseBrandBuildSessionWrite,
@@ -99,6 +116,13 @@ beforeEach(() => {
     brandGuidelines: JSON.parse(JSON.stringify(ORIGINAL_GUIDELINES)),
   };
   mockGetChatSessionRecord.mockReset();
+  mockGetMessages.mockReset();
+  mockGenerateIcps.mockReset();
+  mockGenerateCompetitors.mockReset();
+  mockGenerateIcps.mockResolvedValue([{ name: 'P' }]);
+  mockGenerateCompetitors.mockResolvedValue({ per_icp: [] });
+  // default history: just the build's own opening prompt (a zombie: no human has written)
+  mockGetMessages.mockResolvedValue([{ role: 'user', content: `You are Emma, ${BRAND_BUILD_PROMPT_SENTINEL}. ...` }]);
   userDb.getUserById.mockImplementation(async () => JSON.parse(JSON.stringify(record)));
   userDb.updateUser.mockImplementation(
     async (_id: string, patch: Record<string, any>, options?: any) => {
@@ -139,27 +163,47 @@ describe('brand-build session marker', () => {
     expect(isClaimSuperseded(T1, undefined)).toBe(false);
   });
 
-  describe('shouldRefuseBrandBuildSessionWrite (a zombie is bounded; an old reopened chat is not)', () => {
-    const justAfterT1 = Date.parse(T1) + 60_000;
-    const longAfterT1 = Date.parse(T1) + BRAND_BUILD_SESSION_LIFETIME_MS + 1_000;
-
-    it('refuses a superseded session while its claim is recent enough that the session may still be running', () => {
-      expect(shouldRefuseBrandBuildSessionWrite(T1, { startedAt: T2, status: 'ready' }, justAfterT1)).toBe(true);
+  describe('shouldRefuseBrandBuildSessionWrite (decided by content, not age)', () => {
+    it('refuses a superseded session nobody has talked to, however long ago it started (a slow zombie)', () => {
+      expect(shouldRefuseBrandBuildSessionWrite(T1, { startedAt: T2, status: 'ready' }, 0)).toBe(true);
+      expect(shouldRefuseBrandBuildSessionWrite(T1, { startedAt: T2, status: 'failed' }, 0)).toBe(true);
     });
 
-    it('refuses a superseded session whenever a newer build is in flight, however old the session', () => {
-      expect(shouldRefuseBrandBuildSessionWrite(T1, { startedAt: T2, status: 'building' }, longAfterT1)).toBe(true);
+    it('lets a superseded session a human has written in (a reopened chat) behave like ordinary chat', () => {
+      expect(shouldRefuseBrandBuildSessionWrite(T1, { startedAt: T2, status: 'ready' }, 1)).toBe(false);
     });
 
-    it('lets an old brand-build chat, reopened long after with no build in flight, behave like ordinary chat', () => {
-      expect(shouldRefuseBrandBuildSessionWrite(T1, { startedAt: T2, status: 'ready' }, longAfterT1)).toBe(false);
-      expect(shouldRefuseBrandBuildSessionWrite(T1, { startedAt: T2, status: 'failed' }, longAfterT1)).toBe(false);
+    it('refuses any superseded session while a newer build is in flight, whoever has written in it', () => {
+      expect(shouldRefuseBrandBuildSessionWrite(T1, { startedAt: T2, status: 'building' }, 5)).toBe(true);
     });
 
-    it('never refuses the current claim, an unmarked session, or an unparseable marker', () => {
-      expect(shouldRefuseBrandBuildSessionWrite(T2, { startedAt: T2, status: 'building' }, justAfterT1)).toBe(false);
-      expect(shouldRefuseBrandBuildSessionWrite(undefined, { startedAt: T2, status: 'building' }, justAfterT1)).toBe(false);
-      expect(shouldRefuseBrandBuildSessionWrite('garbage', { startedAt: T2, status: 'ready' }, justAfterT1)).toBe(false);
+    it('does not refuse on the strength of an unreadable history alone, unless a build is in flight', () => {
+      expect(shouldRefuseBrandBuildSessionWrite(T1, { startedAt: T2, status: 'ready' }, undefined)).toBe(false);
+      expect(shouldRefuseBrandBuildSessionWrite(T1, { startedAt: T2, status: 'building' }, undefined)).toBe(true);
+    });
+
+    it('never refuses the current claim, an unmarked session, or an unknown current claim', () => {
+      expect(shouldRefuseBrandBuildSessionWrite(T2, { startedAt: T2, status: 'building' }, 0)).toBe(false);
+      expect(shouldRefuseBrandBuildSessionWrite(undefined, { startedAt: T2, status: 'building' }, 0)).toBe(false);
+      expect(shouldRefuseBrandBuildSessionWrite(T1, { startedAt: undefined, status: 'building' }, 0)).toBe(false);
+    });
+  });
+
+  describe('countHumanMessages', () => {
+    it('ignores the build prompt, assistant/tool/system messages', () => {
+      expect(countHumanMessages([
+        { role: 'user', content: `You are Emma, ${BRAND_BUILD_PROMPT_SENTINEL}. Scrape...` },
+        { role: 'assistant', content: 'hi' },
+        { role: 'tool', content: '{}' },
+        { role: 'system', content: 'x' },
+      ])).toBe(0);
+    });
+    it('counts what a human typed', () => {
+      expect(countHumanMessages([
+        { role: 'user', content: `You are Emma, ${BRAND_BUILD_PROMPT_SENTINEL}.` },
+        { role: 'user', content: 'change my primary color' },
+      ])).toBe(1);
+      expect(countHumanMessages(undefined)).toBe(0);
     });
   });
 });
@@ -309,16 +353,19 @@ describe('update_brand_guidelines from sessions that are NOT brand-build session
   });
 });
 
-describe('an old brand-build chat reopened long after (ordinary chat again)', () => {
-  it('may still update brand guidelines, unconditionally, once no build is in flight and the claim is old', async () => {
-    const OLD = new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString();
+describe('an old brand-build chat reopened later (ordinary chat again)', () => {
+  const OLD = new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString();
+
+  it('may still update brand guidelines, unconditionally, once a human has written in it and no build is in flight', async () => {
     record.brandBuildStatus = 'ready';
     record.brandBuildStartedAt = new Date().toISOString(); // a later build finished
     mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(OLD));
+    mockGetMessages.mockResolvedValue([
+      { role: 'user', content: `You are Emma, ${BRAND_BUILD_PROMPT_SENTINEL}.` },
+      { role: 'user', content: 'rename the brand to Renamed' },
+    ]);
 
-    const result = await updateBrandGuidelines({ brandData: { brandName: 'Renamed' } }, 'u1', {
-      sessionId: 'old-chat',
-    });
+    const result = await updateBrandGuidelines({ brandData: { brandName: 'Renamed' } }, 'u1', { sessionId: 'old-chat' });
 
     expect(result.success).toBe(true);
     expect(record.brandGuidelines.brandData.brandName).toBe('Renamed');
@@ -326,16 +373,107 @@ describe('an old brand-build chat reopened long after (ordinary chat again)', ()
   });
 
   it('is refused while a newer build is in flight', async () => {
-    const OLD = new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString();
     record.brandBuildStatus = 'building';
     mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(OLD));
+    mockGetMessages.mockResolvedValue([{ role: 'user', content: 'rename it' }]);
 
-    const result = await updateBrandGuidelines({ brandData: { brandName: 'Renamed' } }, 'u1', {
-      sessionId: 'old-chat',
-    });
+    const result = await updateBrandGuidelines({ brandData: { brandName: 'Renamed' } }, 'u1', { sessionId: 'old-chat' });
 
     expect(result).toMatchObject({ success: false, superseded: true });
     expect(record.brandGuidelines).toEqual(ORIGINAL_GUIDELINES);
+  });
+});
+
+describe('a SLOW zombie (the turn cap does not apply to the brand build, so age proves nothing)', () => {
+  it('is refused even though its claim is hours old and the newer build already finished', async () => {
+    const HOURS_AGO = new Date(Date.now() - 5 * 3600 * 1000).toISOString();
+    record.brandBuildStatus = 'ready'; // the newer run finished
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(HOURS_AGO));
+    // history is only the build prompt: nobody ever talked to this session
+
+    const result = await updateBrandGuidelines({ brandData: { brandName: 'Zombie Brand' } }, 'u1', { sessionId: 'slow' });
+
+    expect(result).toMatchObject({ success: false, superseded: true });
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+    expect(record.brandGuidelines).toEqual(ORIGINAL_GUIDELINES);
+  });
+
+  it('is also refused when the newer run FAILED', async () => {
+    record.brandBuildStatus = 'failed';
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(new Date(Date.now() - 5 * 3600 * 1000).toISOString()));
+    const result = await updateMarketStrategy({ businessOverview: 'Zombie' }, 'u1', { sessionId: 'slow' });
+    expect(result).toMatchObject({ success: false, superseded: true });
+  });
+
+  it('does not read the history at all for the current claim or an unmarked session', async () => {
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(T2));
+    await updateBrandGuidelines({ brandData: { brandName: 'A' } }, 'u1', { sessionId: 'cur' });
+    mockGetChatSessionRecord.mockResolvedValue({ sessionId: 'x', pageIdentifier: 'agent-mode' });
+    await updateBrandGuidelines({ brandData: { brandName: 'B' } }, 'u1', { sessionId: 'plain' });
+    expect(mockGetMessages).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the in-flight rule when the history cannot be read', async () => {
+    mockGetMessages.mockRejectedValue(new Error('dynamo hiccup'));
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(T1));
+    record.brandBuildStatus = 'ready';
+    expect((await updateBrandGuidelines({ brandData: { brandName: 'X' } }, 'u1', { sessionId: 's' })).success).toBe(true);
+    record.brandBuildStatus = 'building';
+    expect(await updateBrandGuidelines({ brandData: { brandName: 'X' } }, 'u1', { sessionId: 's' })).toMatchObject({ superseded: true });
+  });
+});
+
+describe('refreshMarketStrategy and regenerate_market_strategy carry the session through', () => {
+  const NEWER = { businessOverview: 'Newer', competitors: [{ name: 'Keep' }], icp: [{ title: 'Keep' }] };
+
+  it('regenerate_market_strategy from a superseded session writes nothing and leaves the newer strategy intact', async () => {
+    record.marketStrategy = JSON.parse(JSON.stringify(NEWER));
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(T1));
+
+    const result = await regenerateMarketStrategy('u1', {}, { sessionId: 'z' });
+
+    expect(result).toMatchObject({ success: false, superseded: true });
+    expect(record.marketStrategy).toEqual(NEWER);
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+  });
+
+  it('the owning session regenerates, and the strategy write is conditioned on its claim', async () => {
+    record.marketStrategy = JSON.parse(JSON.stringify(NEWER));
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(T2));
+
+    const result = await regenerateMarketStrategy('u1', {}, { sessionId: 'o' });
+
+    expect(result.success).toBe(true);
+    const write = userDb.updateUser.mock.calls.find(([, p]: any) => 'marketStrategy' in p);
+    expect(write[2].condition).toEqual(brandBuildOwnershipCondition(T2));
+  });
+
+  it('a reclaim landing DURING the (slow) regeneration rejects the write: the newer run keeps its strategy', async () => {
+    record.marketStrategy = JSON.parse(JSON.stringify(NEWER));
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(T2));
+    mockGenerateIcps.mockImplementation(async () => {
+      record.brandBuildStartedAt = '2026-10-07T10:09:00.000Z'; // reclaim lands mid-regeneration
+      return [{ name: 'P' }];
+    });
+
+    const result = await regenerateMarketStrategy('u1', {}, { sessionId: 'o' });
+
+    expect(result).toMatchObject({ success: false, superseded: true });
+    expect(record.marketStrategy).toEqual(NEWER);
+  });
+
+  it('update_brand_guidelines with refreshMarketStrategy:true hands the session to the regeneration', async () => {
+    record.marketStrategy = JSON.parse(JSON.stringify(NEWER));
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(T2));
+    // the reclaim lands while the strategy is being regenerated, after the guidelines write passed
+    mockGenerateIcps.mockImplementation(async () => {
+      record.brandBuildStartedAt = '2026-10-07T10:09:00.000Z';
+      return [{ name: 'P' }];
+    });
+
+    await updateBrandGuidelines({ brandData: { brandName: 'Acme' }, refreshMarketStrategy: true }, 'u1', { sessionId: 'o' });
+
+    expect(record.marketStrategy).toEqual(NEWER);
   });
 });
 
@@ -366,6 +504,16 @@ describe('org members (brand data lives on the org record, which has no claim to
       return brandBuildSession(T2);
     });
     const result = await updateBrandGuidelines({ brandData: { brandName: 'Zombie' } }, 'u1', { sessionId: 'z' });
+    expect(result).toMatchObject({ success: false, superseded: true });
+    expect(require('../services/db').orgDb.updateOrg).not.toHaveBeenCalled();
+  });
+
+  it('update_market_strategy for an org member re-reads the claim before the org write', async () => {
+    mockGetChatSessionRecord.mockImplementation(async () => {
+      record.brandBuildStartedAt = '2026-10-07T10:09:00.000Z';
+      return brandBuildSession(T2);
+    });
+    const result = await updateMarketStrategy({ businessOverview: 'Zombie' }, 'u1', { sessionId: 'z' });
     expect(result).toMatchObject({ success: false, superseded: true });
     expect(require('../services/db').orgDb.updateOrg).not.toHaveBeenCalled();
   });
