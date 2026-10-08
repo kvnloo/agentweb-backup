@@ -54,6 +54,11 @@ const DEFAULT_MAX_CONCURRENT_PROCESSES = 8;
 export class ClaudeCliRunner {
   private readonly pool = new Map<string, PooledSession>();
   private readonly spawnQueue: Array<{ conversationId: string; resolve: () => void }> = [];
+  /** Slots committed to spawning OR already live. Incremented synchronously the instant a
+   * spawn passes the cap check — never derived from pool.size, which only grows after that
+   * spawn's own async gap and would let several different conversationIds, spawned without
+   * awaiting between them, all observe the same stale count and all bypass the cap. */
+  private reservedSlots = 0;
   /** conversationId -> the in-flight spawn, so concurrent spawn()/prewarm() calls for the
    * same conversation serialize onto one real process instead of racing to create two. */
   private readonly spawning = new Map<string, Promise<void>>();
@@ -114,8 +119,9 @@ export class ClaudeCliRunner {
     systemPromptFile: string,
     opts: ClaudeCliRunnerOptions,
   ): Promise<void> {
+    await this.waitForFreeSlot(conversationId); // claims (or is handed) a slot -- see the finally below
+    let sessionCreated = false;
     try {
-      await this.waitForFreeSlot(conversationId);
       if (this.pendingCloseRequests.delete(conversationId)) {
         return; // close() arrived while this spawn was still queued -- never start the process.
       }
@@ -158,11 +164,17 @@ export class ClaudeCliRunner {
 
       this.pool.set(conversationId, session);
       this.scheduleIdleClose(session);
+      sessionCreated = true;
       // No await since the first pendingCloseRequests check above — nothing (including
       // another close() call) can run between that check and this point, so a second
       // check here would be unreachable; the single check above is sufficient.
     } finally {
       this.pendingCloseRequests.delete(conversationId);
+      // If no session was created, this doSpawn is the sole owner of the slot
+      // waitForFreeSlot claimed above, and nothing else will ever release it — a live
+      // session's own close (closeSessionInternal) owns that release instead, exactly
+      // once, so this must not also run when sessionCreated is true (that would double-free).
+      if (!sessionCreated) this.releaseSlotToQueue();
     }
   }
 
@@ -322,13 +334,21 @@ export class ClaudeCliRunner {
   }
 
   private async waitForFreeSlot(conversationId: string): Promise<void> {
-    if (this.pool.size < this.maxConcurrentProcesses) return;
+    if (this.reservedSlots < this.maxConcurrentProcesses) {
+      this.reservedSlots++; // claim it now, synchronously -- not after this function's own await
+      return;
+    }
     return new Promise<void>((resolve) => this.spawnQueue.push({ conversationId, resolve }));
   }
 
+  /** Hands a freed slot directly to the next queued waiter, or actually frees it if none is waiting. */
   private releaseSlotToQueue(): void {
     const next = this.spawnQueue.shift();
-    if (next) next.resolve();
+    if (next) {
+      next.resolve(); // the slot transfers to them -- reservedSlots is unchanged, not re-claimed.
+    } else {
+      this.reservedSlots--;
+    }
   }
 }
 

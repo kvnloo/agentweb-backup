@@ -257,6 +257,58 @@ describe('ClaudeCliRunner', () => {
     expect(mockSpawn).toHaveBeenCalledTimes(2);
   });
 
+  it('enforces the cap across DIFFERENT conversationIds fired without awaiting between them', async () => {
+    // Regression: the cap check used to read pool.size, which only grows after a spawn's
+    // own async gap. Firing spawn() for several different conversationIds back-to-back,
+    // with no await between them, let every one of them see the same stale pool.size (0)
+    // before any had actually incremented it -- all bypassing the cap. Found live against
+    // the real binary: cap=2, three real `claude -p` processes ended up running at once.
+    // The existing cap test above never caught this because it awaits conv-a before
+    // spawning conv-b, so pool.size was already correctly incremented by then.
+    const runner = trackedRunner({ maxConcurrentProcesses: 2 });
+
+    let cSpawned = false;
+    const pA = runner.spawn('conv-a', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    const pB = runner.spawn('conv-b', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    const pC = runner.spawn('conv-c', CONFIG_DIR, SYSTEM_PROMPT_FILE).then((h) => {
+      cSpawned = true;
+      return h;
+    });
+
+    await flush();
+    expect(mockSpawn).toHaveBeenCalledTimes(2); // only conv-a and conv-b may have actually spawned
+    expect(cSpawned).toBe(false); // conv-c must be queued, not a third real process
+
+    const handleA = await pA;
+    runner.close(handleA);
+    await pC;
+    expect(cSpawned).toBe(true);
+    expect(mockSpawn).toHaveBeenCalledTimes(3);
+    expect(runner.activeProcessCount).toBe(2);
+
+    await pB;
+  });
+
+  it('releasing a slot abandoned by an aborted queued spawn does not leak capacity', async () => {
+    // A queued spawn that gets cancelled via close() while still queued never creates a
+    // session, so nothing but its own doSpawn's cleanup can release the slot it was handed.
+    const runner = trackedRunner({ maxConcurrentProcesses: 1 });
+    const handleA = await runner.spawn('conv-a', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+
+    const spawnBPromise = runner.spawn('conv-b', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    await flush();
+    runner.close({ conversationId: 'conv-b' }); // cancel conv-b while still queued
+    runner.close(handleA); // free conv-a's slot -- conv-b's doSpawn wakes, sees pendingCloseRequests, aborts
+    await spawnBPromise;
+    await flush();
+
+    // The slot conv-b aborted with must still be usable -- not leaked.
+    const handleD = await runner.spawn('conv-d', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    expect(mockSpawn).toHaveBeenCalledTimes(2); // conv-a and conv-d; conv-b never actually spawned
+    expect(runner.activeProcessCount).toBe(1);
+    void handleD;
+  });
+
   it('close() on a conversationId still queued behind the cap cancels it — it never spawns a process', async () => {
     const runner = trackedRunner({ maxConcurrentProcesses: 1 });
     const handleA = await runner.spawn('conv-a', CONFIG_DIR, SYSTEM_PROMPT_FILE);
