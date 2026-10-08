@@ -37,14 +37,25 @@ export interface DeployedCaptureFiles {
   captureRoute: string | null;
 }
 
-const PER_SITE_CONSTANTS = ['LIST_BY_PATH', 'FORWARD_URL', 'PIXEL_ID', 'META_ACCOUNT_ID'];
+// Static patterns for the exact literal shapes buildCaptureRoute() emits. Only a JSON
+// string literal (or `undefined`) / a flat string->string object literal is masked; any
+// other initializer (a function call, a computed expression) is left unmasked and so
+// reports as drift instead of a false `match`.
+const STR = String.raw`"(?:[^"\\\n]|\\.)*"`;
+const PER_SITE_PATTERNS: Array<[string, RegExp]> = [
+  [
+    'const LIST_BY_PATH: Record<string, string> = <per-site>;',
+    new RegExp(String.raw`^const LIST_BY_PATH: Record<string, string> = \{(?:\s*${STR}\s*:\s*${STR}\s*,?)*\s*\};$`, 'm'),
+  ],
+  ['const FORWARD_URL = <per-site>;', new RegExp(String.raw`^const FORWARD_URL = ${STR};$`, 'm')],
+  ['const PIXEL_ID = <per-site>;', new RegExp(String.raw`^const PIXEL_ID = (?:${STR}|undefined);$`, 'm')],
+  ['const META_ACCOUNT_ID = <per-site>;', new RegExp(String.raw`^const META_ACCOUNT_ID = (?:${STR}|undefined);$`, 'm')],
+];
 
 function normalize(source: string): string[] {
   let text = source.replace(/\r\n/g, '\n');
-  for (const name of PER_SITE_CONSTANTS) {
-    // `const NAME[: Type] = <value>;` where value may span lines (the JSON map).
-    const re = new RegExp(`const ${name}(\\s*:[^=]+)?\\s*=[\\s\\S]*?;\\n`);
-    text = text.replace(re, `const ${name} = <per-site>;\n`);
+  for (const [placeholder, re] of PER_SITE_PATTERNS) {
+    text = text.replace(re, placeholder);
   }
   return text.trimEnd().split('\n').map((l) => l.trimEnd());
 }

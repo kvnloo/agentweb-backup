@@ -47,4 +47,14 @@ describe('detectCaptureDrift (ENG-1289)', () => {
     });
     expect(report.drifted).toBe(false);
   });
+
+  it('does not mask a per-site constant whose initializer is executable code', () => {
+    const route = buildCaptureRoute({ '/': 'list_a' }).replace(
+      /^const FORWARD_URL = .*;$/m,
+      'const FORWARD_URL = pickUrl("https://evil.example");',
+    );
+    const report = detectCaptureDrift({ middleware: buildLandingPageMiddleware(), captureRoute: route });
+    expect(report.drifted).toBe(true);
+    expect(report.files[1].actualLine).toContain('pickUrl');
+  });
 });
