@@ -7509,16 +7509,6 @@ the dedicated bot identity `automated-work-attribution.md` already calls for.
 
 ## ENG-967 — "two landing pages returned 0 leads": a real bug, and two lists that do not have it (2026-08-21)
 
-## 2026-08-22 — ENG-1459 C3b transport-remnant audit
-
-After C3a routed AgentMode text/tool calls through `callLLM` and the shared gateway, the only
-remaining unreachable Vertex Claude adapter artifacts were `vertex_client`,
-`vertex_client_promise`, and `convertContentToAnthropicBlocks`. They had no callers, and the
-converter's former tests covered only that retired transport. They were deleted with an AST-backed
-regression guard. The direct Gemini SDK site retained in `performDataAnalysis` is the documented
-Gemini code-execution/file-analysis exception, not a text/chat transport. Evidence: guard 21/21,
-all `agentMode*` suites green, and backend typecheck clean. Complexity delta: -171 lines overall.
-
 Reported as one bug: two CRM lead lists returned 0 leads on every Inbound Website Lead
 Engagement run since May 2026. Investigating it surfaced a genuine silent-lead-loss defect —
 but **neither reported list is an instance of it.** Both halves are recorded here because the
