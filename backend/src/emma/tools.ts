@@ -2129,7 +2129,9 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await brandMarketStrategyImpl.regenerateMarketStrategy(context?.userId);
+    return await brandMarketStrategyImpl.regenerateMarketStrategy(context?.userId, {}, {
+      sessionId: context?.sessionId,
+    });
   }
 });
 

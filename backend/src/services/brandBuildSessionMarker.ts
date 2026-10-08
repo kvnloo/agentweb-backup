@@ -45,36 +45,51 @@ export function isClaimSuperseded(
 }
 
 /**
- * How long a brand-build session can still be running after its claim started.
- * Agent turns are capped at AGENT_MODE_GENERATION_TIMEOUT_MS (10 min), so a
- * session whose claim is older than this is no longer a live "zombie": it is a
- * chat the user reopened, which must behave like any ordinary chat.
+ * Text that identifies the brand build's own opening prompt. The prompt builder
+ * embeds this verbatim so the two cannot drift; a message containing it was
+ * written by the system, not by a human.
  */
-export const BRAND_BUILD_SESSION_LIFETIME_MS = 15 * 60 * 1000;
+export const BRAND_BUILD_PROMPT_SENTINEL =
+  "running an autonomous brand-build for an onboarding flow";
+
+/** True when `content` is the brand build's own opening prompt. */
+export function isBrandBuildPrompt(content: unknown): boolean {
+  return typeof content === "string" && content.includes(BRAND_BUILD_PROMPT_SENTINEL);
+}
 
 /**
- * Whether a write from a brand-build session must be refused. The session's
- * claim must be superseded AND the superseding build must be one the session
- * could still be corrupting: either a newer build is in flight right now, or the
- * session's own claim is recent enough that the session may still be running.
- * Otherwise (an old session reopened long after, with no build in flight) it is
- * ordinary chat and may write, so a user can still say "change my primary
- * color" in the chat that built their brand.
+ * Number of messages a human wrote in a session (user-role messages other than
+ * the brand build's own opening prompt).
+ */
+export function countHumanMessages(
+  messages: Array<{ role?: string; content?: unknown }> | undefined,
+): number {
+  return (messages ?? []).filter((m) => m?.role === "user" && !isBrandBuildPrompt(m.content)).length;
+}
+
+/**
+ * Whether a write from a brand-build session whose claim is superseded must be
+ * refused. A session that is still "the build" (nobody has talked to it) is a
+ * zombie and is refused. A session a human has since written in is that chat
+ * reopened, i.e. ordinary chat, and may write, unless a newer build is in flight
+ * right now (then nothing from an old session may touch the build's data).
  *
- * `nowMs` is compared with the claim timestamp the marker carries; both come
- * from backend clocks and the lifetime is minutes, so skew does not matter.
- * An unparseable claim cannot be proven recent, so it is not refused.
+ * This is decided by content, not by age. An earlier version bounded it to 15
+ * minutes after the claim, on the premise that agent turns are capped at 10
+ * minutes; that cap does not apply to the brand build's direct call, so a slow
+ * zombie outlived the bound and wrote unconditionally.
+ *
+ * `humanMessages` is `undefined` when the history could not be read: only the
+ * in-flight rule applies then, since we cannot prove a human is involved.
  */
 export function shouldRefuseBrandBuildSessionWrite(
   sessionClaim: string | undefined,
   current: { startedAt?: string; status?: string },
-  nowMs: number = Date.now(),
+  humanMessages?: number,
 ): boolean {
   if (!isClaimSuperseded(sessionClaim, current.startedAt)) return false;
   if (current.status === "building") return true;
-  const claimMs = Date.parse(sessionClaim as string);
-  if (!Number.isFinite(claimMs)) return false;
-  return nowMs - claimMs <= BRAND_BUILD_SESSION_LIFETIME_MS;
+  return humanMessages === 0;
 }
 
 /**

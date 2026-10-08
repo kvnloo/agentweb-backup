@@ -84,6 +84,8 @@ import {
 import { buildReadyPatch, logCompletionMetric } from '../../services/brandBuildStatusService';
 import {
   brandBuildOwnershipCondition,
+  countHumanMessages,
+  isClaimSuperseded,
   parseBrandBuildSessionClaim,
   shouldRefuseBrandBuildSessionWrite,
 } from '../../services/brandBuildSessionMarker';
@@ -547,10 +549,33 @@ async function guardBrandBuildSession(
     }
   }
 
-  const refuse = shouldRefuseBrandBuildSessionWrite(sessionClaim, {
-    startedAt: currentStartedAt,
-    status: user?.brandBuildStatus,
-  });
+  // Whether a human has written in this session is only needed to tell a
+  // zombie from a reopened chat, i.e. when its claim is superseded and no newer
+  // build is in flight. Rare, so reading the history here costs nothing in the
+  // normal case.
+  let humanMessages: number | undefined;
+  if (
+    sessionId &&
+    isClaimSuperseded(sessionClaim, currentStartedAt) &&
+    user?.brandBuildStatus !== 'building'
+  ) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { chatbotDb } = require('../../services/chatbotService');
+      humanMessages = countHumanMessages(await chatbotDb.getMessagesFromMessagesTable(sessionId, true));
+    } catch (historyErr: any) {
+      console.warn('[brandBuild] session history read failed; cannot tell a zombie from a reopened chat', {
+        userId,
+        error: historyErr?.message ?? String(historyErr),
+      });
+    }
+  }
+
+  const refuse = shouldRefuseBrandBuildSessionWrite(
+    sessionClaim,
+    { startedAt: currentStartedAt, status: user?.brandBuildStatus },
+    humanMessages,
+  );
   if (refuse) {
     console.warn('[brandBuild] dropping update from a superseded brand-build session', {
       userId,
@@ -923,7 +948,7 @@ export async function updateBrandGuidelines(
       }
 
       const marketStrategyRefresh = refreshMarketStrategy === true
-        ? await regenerateMarketStrategy(userId)
+        ? await regenerateMarketStrategy(userId, {}, { sessionId: opts.sessionId })
         : undefined;
 
       // Onboarding v2 Phase 1: flip brand-build status to ready if we were
@@ -1045,6 +1070,7 @@ export async function regenerateMarketStrategy(
       llm?: any;
       webSearchFn?: any;
     } = {},
+    opts: { sessionId?: string } = {},
   ): Promise<any> {
     try {
       const { userDb } = await import('../../services/db');
@@ -1098,7 +1124,7 @@ export async function regenerateMarketStrategy(
 
       // Persist via updateMarketStrategy with replace:true so org-vs-user routing,
       // permission checks, and businessOverview preservation are all reused.
-      const writeResult = await updateMarketStrategy({ icp, competitors }, userId, { replace: true });
+      const writeResult = await updateMarketStrategy({ icp, competitors }, userId, { replace: true, sessionId: opts.sessionId });
       if (!writeResult.success) return writeResult;
 
       return {

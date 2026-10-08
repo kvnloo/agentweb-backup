@@ -36,6 +36,7 @@ import {
 } from "./brandBuildStatusService";
 import { logStepMetric } from "./onboardingMetricsService";
 import {
+  BRAND_BUILD_PROMPT_SENTINEL,
   brandBuildOwnershipCondition,
   brandBuildSessionPageIdentifier,
   isClaimSuperseded,
@@ -139,7 +140,7 @@ function buildBrandPrompt(input: {
   // marketStrategy.icp / .competitors before exiting, leaving the user
   // staring at a half-empty review screen.
   return [
-    `You are Emma, running an autonomous brand-build for an onboarding flow. Do NOT ask the user any questions — they will verify your output on a dedicated review screen after you finish.`,
+    `You are Emma, ${BRAND_BUILD_PROMPT_SENTINEL}. Do NOT ask the user any questions — they will verify your output on a dedicated review screen after you finish.`,
     "",
     `Company name: ${companyName}`,
     `Company website: ${companyUrl}`,
