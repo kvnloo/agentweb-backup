@@ -25,9 +25,6 @@ import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { suppressLeadSideEffects } from '../utils/sessionList';
 import { isLinkedInInfraError, LINKEDIN_UNAVAILABLE_MESSAGE } from '../utils/linkedInInfraError';
-
-const LINKEDIN_ACCOUNT_NOT_YOURS_MESSAGE =
-  'That LinkedIn account is not connected to your user. Send from one of your own connected LinkedIn accounts (Settings → Connected Accounts).';
 import { isValidLeadLifecycle, LEAD_LIFECYCLES, isLeadListType, type LeadListType } from '../utils/leadSchema';
 import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
 import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValidation';
@@ -79,6 +76,9 @@ import { runEnrichment as svcRunEnrichmentV3 } from '../services/crmEnrichmentSe
 import { buildOrchestratorDeps as buildV3OrchestratorDeps } from '../services/enrichmentV3RealDeps';
 import { sanitizeLeadForResponse, shouldHideCardRevenueForViewer } from '../utils/enrichmentMetadataPresentation';
 import { getExternalCrmConnection, getMappedAgentwebFields, mappedFieldChanged, resolveSyncStatus } from '../utils/leadSyncStatus';
+
+const LINKEDIN_ACCOUNT_NOT_YOURS_MESSAGE =
+  'That LinkedIn account is not connected to your user. Send from one of your own connected LinkedIn accounts (Settings → Connected Accounts).';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
 

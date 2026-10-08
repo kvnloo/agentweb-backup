@@ -3147,10 +3147,11 @@ export async function importLeadsFromSearch(
         cursor: lastFetchCursor ?? undefined,
       });
     } catch (e: any) {
-      if (isLinkedInInfraError(e)) {
+      const infraFailure = isLinkedInInfraError(e);
+      if (infraFailure) {
         console.warn('[importLeadsFromSearch] LinkedIn search unavailable (infrastructure):', e?.message);
       }
-      searchError = isLinkedInInfraError(e)
+      searchError = infraFailure
         ? LINKEDIN_UNAVAILABLE_MESSAGE
         : (e?.message ? String(e.message) : String(e));
       // ENG-2205: resolveAccountId can now hand back an account whose probe was

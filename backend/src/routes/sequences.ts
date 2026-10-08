@@ -149,6 +149,12 @@ const LINKEDIN_STEP_ACCOUNT_ERROR = 'A LinkedIn step references an account that 
 // re-validated: a user can legitimately have a sequence whose pinned account was later disconnected, and an
 // unrelated edit must still save. They cannot be abused to send, because the drip worker re-checks the pin at
 // send time. Only a NEW or CHANGED pin has to be an account the caller owns or shares.
+// Mirrors the drip worker's channel derivation (dripSequenceWorker.ts): a step is a LinkedIn step only when its
+// channel normalises to 'linkedin'. A pin left behind on an email step is never used to send, so it is neither
+// validated here nor trusted as an already-stored pin.
+const isLinkedInChannelStep = (step: any): boolean =>
+  String(step?.channel ?? 'email').trim().toLowerCase() === 'linkedin';
+
 async function stepsReferenceForeignLinkedInAccount(
   userId: string,
   steps: unknown,
@@ -157,6 +163,7 @@ async function stepsReferenceForeignLinkedInAccount(
   if (!Array.isArray(steps)) return false;
   const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
   for (const step of steps) {
+    if (!isLinkedInChannelStep(step)) continue; // pin on a non-LinkedIn step is inert
     const id = step?.linkedInAccountId;
     if (id === undefined || id === null || id === '') continue; // auto-resolved by the worker
     if (typeof id !== 'string') return true;
@@ -226,12 +233,15 @@ router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response
       }
     }
     // Only trust the stored pins of the CALLER's own sequence (updateSequence rejects anyone else below).
-    const stored = Array.isArray(steps)
-      ? await dripSequenceDb.getSequence(req.params.sequenceId).catch(() => null)
-      : null;
+    // A failed read is NOT treated as "no stored pins": that would turn a transient DynamoDB error into a
+    // misleading 403. It propagates to the generic handler (500, retryable) like updateSequence's own read would.
+    const stored = Array.isArray(steps) ? await dripSequenceDb.getSequence(req.params.sequenceId) : null;
     const alreadyPinned = new Set<string>(
       stored && stored.userId === authReq.user!.userId
-        ? (stored.steps ?? []).map((st: any) => st?.linkedInAccountId).filter((v: unknown): v is string => typeof v === 'string' && !!v)
+        ? (stored.steps ?? [])
+            .filter(isLinkedInChannelStep)
+            .map((st: any) => st?.linkedInAccountId)
+            .filter((v: unknown): v is string => typeof v === 'string' && !!v)
         : [],
     );
     if (await stepsReferenceForeignLinkedInAccount(authReq.user!.userId, steps, alreadyPinned)) {
