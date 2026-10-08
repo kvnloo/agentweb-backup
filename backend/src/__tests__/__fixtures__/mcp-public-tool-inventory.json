@@ -1785,7 +1785,7 @@
   {
     "name": "list_crm_sequences",
     "listed": false,
-    "description": "List the CRM email drip / nurture sequences on the caller's account, and inspect one with enrollment counts. Read-only — safe to call any time, including in a scheduled run. It cannot create, start, pause, or otherwise change a sequence; to change one, use the CRM UI.\n\nUse this to answer \"are any email campaigns running for our CRM leads?\". Each entry reports `name`, `status` (draft | active | paused | archived), `audience` (who the drip worker actually enrolls — auto-enroll lists, never the aspirational trigger), `step_count`, `is_sending` (true ONLY for `active` sequences, because the drip worker mails nothing for a draft/paused/archived sequence), and `enrollment_count` when a single sequence is inspected.\n\nAn account with no sequences returns `{ total: 0, sequences: [] }` with a summary line. That is a valid answer meaning \"no campaigns exist\", not an error — report it as such instead of retrying or guessing.",
+    "description": "List the CRM email drip / nurture sequences on the caller's account, and inspect one with enrollment counts. Read-only — safe to call any time, including in a scheduled run. It cannot create, start, pause, or otherwise change a sequence; to change one, use manage_crm_sequence.\n\nUse this to answer \"are any email campaigns running for our CRM leads?\". Each entry reports `name`, `status` (draft | active | paused | archived), `audience` (who the drip worker actually enrolls — auto-enroll lists, never the aspirational trigger), `step_count`, `is_sending` (true ONLY for `active` sequences, because the drip worker mails nothing for a draft/paused/archived sequence), and `enrollment_count` when a single sequence is inspected.\n\nAn account with no sequences returns `{ total: 0, sequences: [] }` with a summary line. That is a valid answer meaning \"no campaigns exist\", not an error — report it as such instead of retrying or guessing.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2083,6 +2083,103 @@
         "visual_identity": {
           "type": "object",
           "description": "Visual identity settings (update)"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "manage_crm_sequence",
+    "listed": false,
+    "description": "Create, edit, preview, activate, or pause a CRM email drip sequence on the caller's account.\n\n- \"create\": builds a new sequence as a DRAFT (nothing is sent). `audience_list_ids` are the lead lists whose new leads auto-enroll once it is active.\n- \"update\": edits a draft or paused sequence. An active sequence must be paused first.\n- \"preview_activation\": shows the user the exact steps, audience and timing and asks them to approve. Always do this before \"activate\".\n- \"activate\": starts sending. Only works in a live chat, after \"preview_activation\", once the user has picked \"Activate\" on the approval card, and only if the sequence has not changed since the preview. Never call it in the same turn as the preview — wait for the user's choice.\n- \"pause\": stops sending. Always allowed.\n\nUse list_crm_sequences to find sequence ids.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "create",
+            "update",
+            "preview_activation",
+            "activate",
+            "pause"
+          ]
+        },
+        "sequence_id": {
+          "type": "string",
+          "description": "Required for every action except create."
+        },
+        "name": {
+          "type": "string",
+          "description": "Sequence name (create; optional on update)."
+        },
+        "description": {
+          "type": "string"
+        },
+        "campaign_type": {
+          "type": "string",
+          "enum": [
+            "conversion",
+            "onboarding",
+            "reengagement",
+            "nurture",
+            "upsell",
+            "custom"
+          ]
+        },
+        "audience_list_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Lead list ids whose new leads auto-enroll while the sequence is active."
+        },
+        "steps": {
+          "type": "array",
+          "description": "Ordered steps. Replaces all steps on update.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "delay_days": {
+                "type": "number",
+                "description": "Days after the previous step (or enrollment, for step 1)."
+              },
+              "channel": {
+                "type": "string",
+                "enum": [
+                  "email",
+                  "linkedin"
+                ]
+              },
+              "subject": {
+                "type": "string"
+              },
+              "body_html": {
+                "type": "string"
+              },
+              "message_text": {
+                "type": "string",
+                "description": "LinkedIn steps only."
+              },
+              "sender_id": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "preview_token": {
+          "type": "string",
+          "description": "activate only: the preview_token returned by preview_activation."
         }
       },
       "required": [
