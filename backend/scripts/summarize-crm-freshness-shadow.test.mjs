@@ -27,6 +27,19 @@ test('aggregates by model and kind, ignores unrelated and broken lines', () => {
   assert.match(format(s, skipped), /gemini-3\.1-flash-lite: 2 line\(s\), 1 session\(s\)/);
 });
 
+test('counts arithmetic-drift findings per model and says so in the output', () => {
+  const log = [
+    line({ sessionId: 's1', model: 'm1', kinds: ['inventory_total_not_in_tool_results'], claimed: [15479], cited: [], drift: 1 }),
+    line({ sessionId: 's2', model: 'm1', kinds: ['inventory_total_not_in_tool_results'], claimed: [6000], cited: [], drift: 0 }),
+    line({ sessionId: 's3', model: 'm1', kinds: ['cited_tool_not_run'], claimed: [], cited: ['get_lead_lists'] }), // older line, no drift key
+  ].join('\n');
+  const { records } = parseLines(log);
+  const s = summarize(records);
+  assert.equal(s.byModel.m1.drift, 1);
+  assert.match(format(s, 0), /arithmetic drift .*: 1/);
+  assert.doesNotMatch(format(summarize(parseLines(line({ sessionId: 'x', model: 'm2', kinds: [], claimed: [1], cited: [] })).records), 0), /arithmetic drift/);
+});
+
 test('says so when there is nothing', () => {
   assert.match(format(summarize([]), 0), /no \[crm-freshness-shadow\] lines found/);
 });

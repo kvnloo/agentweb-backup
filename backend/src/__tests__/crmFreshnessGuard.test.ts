@@ -570,6 +570,100 @@ describe('number formats and phrasings beyond "N leads in total" (ENG-2263)', ()
   });
 });
 
+// Captured from the real-pipeline run on the preview (gemini-3.8-flash / gpt-4o-mini): Emma replies are HTML.
+describe('HTML replies, lead-in labels and arithmetic drift (ENG-2263)', () => {
+  const inv = (t: string, calls: any[] = [], ev?: any) => detectCrmFreshnessMismatch(t, calls, ev).findings.filter((f) => f.kind === 'inventory_total_not_in_tool_results');
+  const nums = (t: string, calls: any[] = [], ev?: any) => inv(t, calls, ev).map((f) => f.claimed);
+  const led = (name: string) => ({ id: name, name, arguments: {}, result: {} });
+  const evFor = (counts: number[]) => { const c = createCrmEvidenceCollector(); c.record('get_lead_lists', listsResult(counts)); return c.snapshot(); };
+
+  it('a block tag becomes a line break, so a bulleted HTML list is read line by line', () => {
+    const html = '<p>Going from what we know:</p><ul><li>Total lead lists: 97</li><li>Total leads: 15,480</li></ul>';
+    expect(nums(html).sort((a, b) => (a ?? 0) - (b ?? 0))).toEqual([97, 15480]);
+  });
+
+  it('an honest lead-in line that introduces the list labels every bullet under it', () => {
+    const html = '<p>From our check earlier in the conversation (not freshly re-queried):</p><ul><li>Total lead lists: 97</li><li>Total leads: 15,480</li></ul>';
+    expect(nums(html)).toEqual([]);
+    expect(nums('From earlier in our conversation (unverified this turn):\n- Total lead lists: 96\n- Total leads: 6,000')).toEqual([]);
+  });
+
+  it('a lead-in only counts when it ends with a colon: an unrelated earlier line never excuses a claim', () => {
+    expect(nums('Earlier I imported your file.\n- Total lead lists: 97')).toEqual([97]);
+    expect(nums('<p>From our check earlier we saw a few things.</p><ul><li>Total lead lists: 97</li></ul>')).toEqual([97]);
+  });
+
+  it('a lead-in label does not leak past a new paragraph that makes its own claim', () => {
+    expect(nums('From our check earlier:\n- Total lead lists: 97\n\nYour CRM now has 150 leads in total.')).toEqual([150]);
+  });
+
+  it('inline tags vanish without breaking a number or a sentence', () => {
+    expect(nums('<p>Your CRM has <strong>97</strong> <code>lead lists</code> and <em>15,480</em> leads in total.</p>').sort((a, b) => (a ?? 0) - (b ?? 0))).toEqual([97, 15480]);
+  });
+
+  it('catches "a total of N leads" (gpt-4o-mini) only with CRM wording', () => {
+    const real = evFor([...Array(95).fill(100), 5978]); // 96 lists, 15,478 leads
+    expect(nums('You have a total of **96 lead lists** and a total of 6,000 leads overall.', [led('get_lead_lists')], real)).toEqual([6000]);
+    expect(nums('You have a total of **96 lead lists** and a total of 15,478 leads overall.', [led('get_lead_lists')], real)).toEqual([]);
+    expect(nums('Apollo returned a total of 6,000 leads.')).toEqual([]);
+  });
+
+  it('a lead-in covers the unbroken run of bullets under it, in plain text and in HTML', () => {
+    expect(nums('From our check earlier:\n- Total lead lists: 97\n- Total leads: 15,480\n- Overall lead lists: 97')).toEqual([]);
+    expect(nums('<p>From our check earlier (not re-queried):</p><ol><li>Total lead lists: 97</li><li>Total leads: 15,480</li></ol>')).toEqual([]);
+  });
+
+  it('a plain claim right under the list is not part of the list, even with no blank line', () => {
+    expect(nums('From our check earlier:\n- Total lead lists: 97\nYour CRM now has 150 leads in total.')).toEqual([150]);
+    expect(nums('<p>From our check earlier:</p><ul><li>Total lead lists: 97</li></ul><p>Your CRM now has 150 leads in total.</p>')).toEqual([150]);
+  });
+
+  it('a blank line inside the bullet run ends the lead-in\'s reach', () => {
+    expect(nums('From our check earlier:\n- Total lead lists: 97\n\n- Your CRM has 15,480 leads in total')).toEqual([15480]);
+    expect(nums('From our check earlier:\n- Total lead lists: 97\n- Your CRM has 15,480 leads in total')).toEqual([]);
+  });
+
+  it('a blank line directly between the lead-in and its first bullet does not break the link', () => {
+    expect(nums('From our check earlier:\n\n- Total lead lists: 97\n- Your CRM has 15,480 leads in total')).toEqual([]);
+  });
+
+  it('a plain claim directly under a lead-in is covered', () => {
+    expect(nums('From our check earlier:\nYour CRM has 97 lead lists.')).toEqual([]);
+  });
+
+  it('marks a claim within 0.5% of a number the tools really returned as arithmetic drift, not a stale total', () => {
+    const ev = evFor([8000, 7478]); // 15,478 leads, 2 lists
+    const f = inv('Your CRM has 15,479 leads in total.', [led('get_lead_lists')], ev);
+    expect(f.map((x) => x.claimed)).toEqual([15479]);
+    expect(f[0]?.drift).toBe(true);
+  });
+
+  it('a stale or invented total is NOT drift', () => {
+    const ev = evFor([8000, 7478]);
+    expect(inv('Your CRM has 6,000 leads in total.', [led('get_lead_lists')], ev)[0]?.drift).toBeUndefined();
+    expect(inv('Your CRM has 15,000 leads in total.', [led('get_lead_lists')], ev)[0]?.drift).toBeUndefined();
+  });
+
+  it('drift is not claimed for tiny numbers (a list count of 3 vs 4 is a real difference)', () => {
+    const ev = evFor([5, 5, 3]); // 3 lists
+    expect(inv('You have 4 lead lists.', [led('get_lead_lists')], ev)[0]?.drift).toBeUndefined();
+  });
+
+  it('the log carries the drift count and still no text', () => {
+    const logs: any[] = [];
+    runCrmFreshnessShadow({ finalText: 'Your CRM has 15,479 leads in total.', toolCalls: [led('get_lead_lists')], evidence: evFor([8000, 7478]), log: (_m, d) => logs.push(d) });
+    expect(logs[0]).toMatchObject({ drift: 1, claimed: [15479] });
+  });
+
+  it('stays linear on a huge HTML reply of block tags and bullets', () => {
+    const t0 = process.hrtime.bigint();
+    detectCrmFreshnessMismatch('<ul>' + '<li>Total leads: 15,480</li>'.repeat(20_000) + '</ul>', []);
+    detectCrmFreshnessMismatch('<p>'.repeat(100_000), []);
+    detectCrmFreshnessMismatch('<li>\n \n \t'.repeat(60_000), []);
+    expect(Number(process.hrtime.bigint() - t0) / 1e6).toBeLessThan(2000);
+  });
+});
+
 describe('what a continuation can be checked against (ENG-2263)', () => {
   const user = (content: string, metadata: any = {}) => ({ role: 'user', content, metadata });
   const asst = (content: string, tools: any[] = [], metadata: any = {}) => ({ role: 'assistant', content, metadata: { ...metadata, ...(tools.length ? { toolCalls: tools } : {}) } });
@@ -743,7 +837,7 @@ describe('runCrmFreshnessShadow (ENG-2263)', () => {
       expect(json.kinds).toEqual(expect.arrayContaining(['cited_tool_not_run', 'inventory_total_not_in_tool_results']));
       expect(json.claimed).toEqual(expect.arrayContaining([18, 47]));
       expect(json.cited).toEqual(['get_lead_lists']);
-      expect(Object.keys(json).sort()).toEqual(['cited', 'claimed', 'continuation', 'crmToolsSucceeded', 'findingCount', 'kinds', 'model', 'sessionId', 'tagsSeen']);
+      expect(Object.keys(json).sort()).toEqual(['cited', 'claimed', 'continuation', 'crmToolsSucceeded', 'drift', 'findingCount', 'kinds', 'model', 'sessionId', 'tagsSeen']);
       for (const secret of ['Jane', 'Doe', 'jane.doe', 'acme', '98,500', 'deal value', 'lead lists and']) expect(line).not.toContain(secret);
     } finally { warn.mockRestore(); }
   });

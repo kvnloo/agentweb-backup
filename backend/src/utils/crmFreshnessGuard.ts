@@ -40,6 +40,8 @@ export interface CrmFreshnessFinding {
   cited: string[];
   /** For inventory_total_not_in_tool_results: the number the reply stated. */
   claimed?: number;
+  /** The claim is within 0.5% (min 1) of a number the tool results do back: arithmetic drift, not a stale or invented total. */
+  drift?: true;
 }
 
 export interface CrmFreshnessResult {
@@ -67,23 +69,43 @@ const MENTION_BEFORE = /\b(the|a|this|that|any|use|using|used|include|including|
 // Linear-time tag stripper. A regex like /<[^>]*>/g rescans to the end from every unclosed "<"; here the
 // next ">" is cached, so each character is visited a bounded number of times. A "<" with no ">" within
 // MAX_MARKUP_CHARS is literal text (e.g. "5 < 6"), not markup.
+// Emma replies are HTML: a block tag (</p>, <li>, <br> ...) must become a line break, otherwise "...:</p><ul><li>Total lead
+// lists: 97</li><li>Total leads: 15,480" collapses into "...:Total lead lists: 97Total leads: 15,480" and neither the numbers nor
+// the "From our check earlier:" lead-in can be read. Inline tags (<strong>, <code>) vanish without a trace.
 const MAX_MARKUP_CHARS = 1000;
+const BLOCK_TAG = /^<\/?\s*(?:p|div|li|ul|ol|br|tr|td|th|table|tbody|thead|h[1-6]|blockquote|section|hr|pre)\b/i;
 function stripMarkup(text: string): string {
   const out: string[] = [];
+  let endsWithNewline = true;
+  const push = (chunk: string): void => {
+    if (!chunk) return;
+    out.push(chunk);
+    endsWithNewline = chunk.charCodeAt(chunk.length - 1) === 10;
+  };
   let i = 0;
   let gt = -2;
   while (i < text.length) {
     const lt = text.indexOf('<', i);
-    if (lt === -1) { out.push(text.slice(i)); break; }
+    if (lt === -1) { push(text.slice(i)); break; }
     if (gt < lt) {
       gt = text.indexOf('>', lt);
-      if (gt === -1) { out.push(text.slice(i)); break; }
+      if (gt === -1) { push(text.slice(i)); break; }
     }
     if (gt - lt <= MAX_MARKUP_CHARS) {
-      out.push(text.slice(i, lt));
+      push(text.slice(i, lt));
       i = gt + 1;
+      const head = text.slice(lt, Math.min(gt + 1, lt + 24));
+      if (BLOCK_TAG.test(head)) {
+        if (!endsWithNewline) push('\n');
+        // An opening <li> becomes a bullet, so the items of a list stay recognisable as a run under their lead-in line.
+        if (/^<\s*li\b/i.test(head)) push('\u2022 ');
+        // The whitespace a model puts BETWEEN two tags is formatting, not a paragraph break.
+        let j = i;
+        while (j < text.length && (text.charCodeAt(j) === 32 || text.charCodeAt(j) === 10 || text.charCodeAt(j) === 13 || text.charCodeAt(j) === 9)) j++;
+        if (j < text.length && text.charCodeAt(j) === 60) i = j;
+      }
     } else {
-      out.push(text.slice(i, lt + 1));
+      push(text.slice(i, lt + 1));
       i = lt + 1;
     }
   }
@@ -307,6 +329,8 @@ const INVENTORY_PATTERNS: InventoryPattern[] = [
   { pluralOnly: true, needsCrmContext: false, re: new RegExp(`\\b${NUM}\\s+leads\\s+(?:across|in)\\s+(?:${NUM}\\s+(?:\\w+\\s+)?lists|your\\s+(?:entire\\s+|whole\\s+)?crm)`, 'gi') },
   // "Your CRM currently has / contains / holds about 1.2k leads"
   { pluralOnly: true, needsCrmContext: false, re: new RegExp(`\\b(?:crm|account|database|pipeline)\\b[^.\\n]{0,40}?\\b(?:has|have|contains?|holds?|includes?|stands at|totals?|is at|comes? to)\\s+${HEDGE}${NUM}\\s+(?:total\\s+)?(?:leads|contacts|records|lists)\\b`, 'gi') },
+  // "a total of 4,999 leads", "with a total of twelve lead lists"
+  { pluralOnly: true, needsCrmContext: true, re: new RegExp(`\\btotal\\s+of\\s+${HEDGE}${NUM}\\s+(?:lead\\s+)?(?:leads|contacts|records|lists)\\b`, 'gi') },
   // "You have 47 leads." (a bare statement, not "5 leads named Test" / "3 leads needing follow-up")
   { pluralOnly: true, needsCrmContext: true, re: new RegExp(`\\byou\\s+(?:currently\\s+|now\\s+)?(?:have|hold|manage)\\s+${HEDGE}${NUM}\\s+(?:total\\s+)?(?:leads|contacts|records)\\b(?=\\s*(?:[.,;:!)\\]]|$|in\\s+total|overall|altogether|in\\s+your|across\\s+(?:all\\s+)?(?:your\\s+)?(?:\\d+\\s+|\\w+\\s+)?(?:lists|the\\s+crm)))`, 'gi') },
 ];
@@ -345,6 +369,13 @@ function findInventoryClaims(text: string): Array<CountRange & { at: number }> {
     }
   }
   return out;
+}
+
+/** Within 0.5% (at least 1) of a backed number, but not equal: the model mis-added a column it really had. */
+function nearBacked(allowed: ReadonlySet<number>, n: number): boolean {
+  const tol = Math.max(1, Math.round(n * 0.005));
+  for (const a of allowed) if (a !== n && Math.abs(a - n) <= tol && a >= 10) return true;
+  return false;
 }
 
 /** Is any backed number inside [lo, hi]? Exact claims are a Set lookup; rounded ones scan the (small) set. */
@@ -473,6 +504,40 @@ export function crmToolsFromEarlierInvocations(history: unknown): string[] {
   return crmEvidenceFromEarlierInvocations(history).tools;
 }
 
+// An honest label often sits in a lead-in line that introduces a list ("From our check earlier (not re-queried):") and covers
+// every bullet under it. Rules, all deliberately narrow so a label never excuses an unrelated claim:
+//  - the lead-in is a NON-bullet line that ends with ":";
+//  - a claim on a bullet line is covered by walking up through the unbroken run of bullets directly above it (a blank line ends
+//    the run, except between the lead-in and its first bullet);
+//  - a claim on a plain line is covered only if the lead-in is the line directly above it.
+const BULLET_LINE = /^(?:[-*\u2022]|\d{1,3}[.)])\s/;
+const LEAD_IN_END = /:\s*(?:\*\*|__)?\s*$/;
+function leadInLine(text: string, at: number): string {
+  const lineStart = text.lastIndexOf('\n', at - 1) + 1;
+  const lineEndIdx = text.indexOf('\n', at);
+  const claimLine = text.slice(lineStart, lineEndIdx === -1 ? text.length : lineEndIdx).trim();
+  const claimIsBullet = BULLET_LINE.test(claimLine);
+  const lines: string[] = [];
+  let end = lineStart - 1; // the newline that ends the previous line
+  for (let hops = 0; hops < 14 && end >= 0; hops++) {
+    const start = text.lastIndexOf('\n', end - 1) + 1;
+    lines.push(text.slice(start, end).trim());
+    end = start - 1;
+  }
+  let blankAbove = false; // blank line(s) seen since the last non-blank line, walking upwards
+  for (const line of lines) {
+    if (!line) { blankAbove = true; continue; }
+    if (BULLET_LINE.test(line)) {
+      if (!claimIsBullet) return '';          // a plain claim under a list is not part of that list
+      if (blankAbove) return '';              // a blank line inside the run ends it
+      continue;
+    }
+    // A non-bullet line: it must be the lead-in. Blank lines directly between it and what follows are fine.
+    return LEAD_IN_END.test(line) ? line : '';
+  }
+  return '';
+}
+
 function citedTools(tag: string): string[] {
   return CRM_FRESHNESS_TOOLS.filter((name) => new RegExp(`(^|[^a-z_])${name}($|[^a-z_])`, 'i').test(tag));
 }
@@ -533,9 +598,9 @@ export function detectCrmFreshnessMismatch(
       const seen = new Set<number>();
       for (const { lo, hi, mid, at } of claims) {
         if (backed(allowed, lo, hi) || seen.has(mid)) continue;
-        if (ALREADY_LABELLED.test(sentenceAround(text, at))) continue;
+        if (ALREADY_LABELLED.test(sentenceAround(text, at)) || ALREADY_LABELLED.test(leadInLine(text, at))) continue;
         seen.add(mid);
-        findings.push({ kind: 'inventory_total_not_in_tool_results', cited: [], claimed: mid });
+        findings.push({ kind: 'inventory_total_not_in_tool_results', cited: [], claimed: mid, ...(nearBacked(allowed, mid) ? { drift: true as const } : {}) });
       }
     }
   }
@@ -576,6 +641,7 @@ export function runCrmFreshnessShadow(input: CrmFreshnessShadowInput): CrmFreshn
       // Numbers and tool names only - never reply text (replies carry names, emails, deal values).
       claimed: [...new Set(result.findings.map((f) => f.claimed).filter((n): n is number => typeof n === 'number'))].slice(0, 10),
       cited: [...new Set(result.findings.flatMap((f) => f.cited))].slice(0, 10),
+      drift: result.findings.filter((f) => f.drift).length,
     });
     return result.findings;
   } catch {
