@@ -155,7 +155,7 @@ describe("onboarding background runs are tracked for graceful shutdown", () => {
     for (const f of files) {
       const src = fs.readFileSync(path.join(root, f), "utf8");
       expect({ file: f, bare: /void\s+trigger\w+ForUser\s*\(/.test(src) }).toEqual({ file: f, bare: false });
-      expect({ file: f, tracked: /cronJobRegistry\.track\(/.test(src) }).toEqual({ file: f, tracked: true });
+      expect({ file: f, tracked: /(cronJobRegistry\.track|trackBackgroundRun)\(/.test(src) }).toEqual({ file: f, tracked: true });
     }
   });
 

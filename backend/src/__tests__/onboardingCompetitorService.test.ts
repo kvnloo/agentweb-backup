@@ -465,6 +465,62 @@ describe("onboardingCompetitorService", () => {
       expect(userDb.updateUser).not.toHaveBeenCalled();
     });
 
+    it("runs when the indexed read lags but a consistent read shows icp ready", async () => {
+      const personas = [samplePersona(1)];
+      userDb.getUserById
+        .mockResolvedValueOnce({ userId: "user-1", icpStatus: "running" })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          competitorStatus: "running",
+          competitorStartedAt: "2026-04-24T11:59:00.000Z",
+        });
+      userDb.getUserByIdConsistent = jest.fn().mockResolvedValueOnce({
+        userId: "user-1",
+        icpStatus: "ready",
+        icpResult: personas,
+        brandGuidelines: { brandData: { brandName: "Acme" } },
+      });
+      userDb.updateUser.mockResolvedValue({});
+      const llm = new FakeLlm([sampleCompetitorResp(1)]);
+      try {
+        await triggerCompetitorStrategyForUser("user-1", { llm: llm as any });
+      } finally {
+        delete userDb.getUserByIdConsistent;
+      }
+      expect(llm.calls.length).toBeGreaterThan(0);
+      expect(userDb.updateUser.mock.calls[0][1].competitorStatus).toBe("ready");
+    });
+
+    it("releases its own claim (idle, conditioned on its startedAt) when gated by icp, so a retry is not blocked until timeout", async () => {
+      userDb.getUserById.mockResolvedValueOnce({ userId: "user-1", icpStatus: "running" });
+      userDb.updateUser.mockResolvedValue({});
+      const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
+      await triggerCompetitorStrategyForUser("user-1", {
+        expectedStartedAt: "2026-04-24T11:59:00.000Z",
+      } as any);
+      logSpy.mockRestore();
+
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      const [, patch, opts] = userDb.updateUser.mock.calls[0];
+      expect(patch).toEqual({ competitorStatus: "idle" });
+      expect(opts.condition).toBeDefined();
+      expect(JSON.stringify(opts)).toContain("2026-04-24T11:59:00.000Z");
+    });
+
+    it("does not throw when releasing the gated claim loses to a newer run", async () => {
+      userDb.getUserById.mockResolvedValueOnce({ userId: "user-1", icpStatus: "running" });
+      userDb.updateUser.mockRejectedValueOnce(
+        Object.assign(new Error("cond"), { code: "ConditionalCheckFailedException" }),
+      );
+      const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
+      await expect(
+        triggerCompetitorStrategyForUser("user-1", {
+          expectedStartedAt: "2026-04-24T11:59:00.000Z",
+        } as any),
+      ).resolves.toBeUndefined();
+      logSpy.mockRestore();
+    });
+
     it("no-ops when icpStatus is 'idle' or missing — gated by icp step", async () => {
       userDb.getUserById.mockResolvedValueOnce({
         userId: "user-1",
