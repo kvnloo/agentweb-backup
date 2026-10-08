@@ -176,7 +176,6 @@ function makeDeps(over: Partial<BranchDeps> = {}): BranchDeps {
     setModel: (id, model, policy) => chatbotDb.updateSessionLlmModel(id, model, policy),
     setTitle: (id, title) => chatbotDb.updateSessionTitle(id, title),
     appendMessages: (id, messages) => chatbotDb.addMessagesToSession(id, messages),
-    archiveSession: (id) => chatbotDb.archiveSession(id),
     unarchiveSession: (id) => chatbotDb.unarchiveSession(id),
     getMaxBranchesPerHour: async () => 30,
     sleep: async () => undefined,

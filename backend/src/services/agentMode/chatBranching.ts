@@ -478,6 +478,7 @@ async function branchInner(deps: BranchDeps, input: BranchInput): Promise<Servic
     }
   }
 
+  const sourceRead: ChatSession = source;
   let settle: ((outcome: ServiceOutcome) => void) | undefined;
   if (localKey) inflightKeys.set(localKey, new Promise<ServiceOutcome>((resolve) => { settle = resolve; }));
   let outcome: ServiceOutcome = fail(500, 'Failed to branch this chat', 'branch_failed'); // what waiters see if we throw
@@ -493,6 +494,7 @@ async function branchInner(deps: BranchDeps, input: BranchInput): Promise<Servic
   }
 
   async function runOwned(): Promise<ServiceOutcome> {
+    const ownedSource: ChatSession = sourceRead;
     try {
       if (scope && deps.claimIdempotency) {
         const claim = await deps.claimIdempotency(input.user.userId, scope);
@@ -503,7 +505,7 @@ async function branchInner(deps: BranchDeps, input: BranchInput): Promise<Servic
         runStoreHeld = true;
       }
 
-      const created = await createBranch(deps, input, req, source);
+      const created = await createBranch(deps, input, req, ownedSource);
 
       if (created.status === 201 && scope && localKey) {
         const newId = (created.body as { sessionId: string }).sessionId;
