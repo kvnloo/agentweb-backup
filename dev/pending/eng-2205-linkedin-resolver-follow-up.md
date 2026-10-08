@@ -2,18 +2,27 @@
 
 - **Root cause (#3275):** a 4-day Unipile outage (502 for every account) made the binary `isAccountConnected` probe
   fail for the whole pool, so `resolveAccountId*` returned null and users were told to connect an account they
-  already had. Fix: resolvers use the tri-state `probeAccountSession`; only a PROVEN `disconnected` is skipped, an
-  `unknown` account is returned as a last resort (own before pool).
-- **Side effects handled in #3341:** any caller that then makes a real call can throw an infrastructure error.
-  `isLinkedInInfraError` (utils/linkedInInfraError.ts) maps credential-fetch/gateway/transport failures to a handled
-  503 on send-linkedin-message, sync-linkedin-connections and the prospect preview. CRM enrichment keeps the
-  pre-fix behavior via `resolveAccountId(userId, { verifiedOnly: true })`; `resolveAccountIdForEnrichment` is
-  unchanged. `{ ownOnly: true }` = never the shared pool.
-- **Authorization:** a client-supplied `accountId` was passed straight to Unipile by send-linkedin-message and
-  send-linkedin-invite, and a sequence step's `linkedInAccountId` was stored unvalidated and used by the drip
-  worker to send. All three now require the account to be the caller's own or org-shared
-  (`resolveLinkedInAccountForWrite`); the worker re-checks at send time for sequences saved before the check existed.
-- **Still true, by design:** read/search tools and the drip worker's AUTO-resolved account may still fall back to the
-  site-wide pool. send-linkedin-message no longer does.
-- **Tooling lesson:** Opslane (black-box PR verifier) found two real bugs here that unit tests and four reviews
-  missed. Read its report on the final head before merging.
+  already had. Fix: the resolvers use the tri-state `probeAccountSession`; only a PROVEN `disconnected` is skipped,
+  an `unknown` account is returned as a last resort (own before pool).
+- **Side effects handled in #3341:** a caller that then makes a real call can throw an infrastructure error.
+  `isLinkedInInfraError` (utils/linkedInInfraError.ts: credential fetch, gateway html, transport errors, timeouts,
+  and SERVER_ERROR only for 502/503/504 - a plain 500 can be request-specific) maps these to a handled 503 on
+  send-linkedin-message, send-linkedin-invite, sync-linkedin-connections and the prospect preview.
+  `import_leads_from_search` hands the agent the generic text and, on a PROVEN dead session only
+  (`isProvenDisconnectError`, which excludes a bare 403), clears the probe cache and records account health with
+  `ownerUserId` omitted for a shared-pool account.
+- **Enrichment is deliberately unchanged from before #3275:** CRM enrichment uses
+  `resolveAccountId(userId, { verifiedOnly: true })` (null unless an account is proven live => LinkedIn skipped);
+  `resolveAccountIdForEnrichment` is restored byte-for-byte. The skip warning now says "temporarily unreachable"
+  when an account exists but could not be verified, and keeps "No LinkedIn (Unipile) account connected" otherwise.
+- **Authorization (pre-existing hole):** a client-supplied `accountId` on send-linkedin-message / send-linkedin-invite
+  and a sequence step's pinned `linkedInAccountId` were never checked. They now require
+  `resolveLinkedInAccountForWrite` (caller's own or org-shared) => 403 with `code: linkedin_account_not_connected`.
+  Only LinkedIn-channel steps are checked (a pin left on an email step is inert), and on PUT pins already stored on the
+  caller's own LinkedIn steps are exempt so an unrelated edit still saves after an account is disconnected. The drip
+  worker re-checks the pin at send time and snoozes that enrollment 30 minutes (typed
+  `PinnedLinkedInAccountNotConnectedError`); a failed ownership lookup keeps the normal retry.
+- **send-linkedin-message:** a failed engagement write AFTER a successful send now returns success with
+  `engagementRecorded: false` instead of a failure that invites a duplicate message.
+- **Still true, by design (tracked in ENG-2347):** read/search tools, send-linkedin-message auto-resolve, the full
+  resync route and the drip worker's auto-resolved account may use the site-wide pool.
