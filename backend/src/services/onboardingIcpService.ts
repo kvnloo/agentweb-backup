@@ -29,7 +29,7 @@ import { getGCSPPrivateKey } from "../utils/secretsManager";
 import { getS3ObjectAsString } from "../utils/s3Utils";
 import { taskDb, userDb } from "./db";
 import { Storage } from "@google-cloud/storage";
-import { cronJobRegistry } from "../utils/cronJobRegistry";
+import { trackBackgroundRun } from "../utils/trackedBackgroundRun";
 import {
   icpFailedPatch,
   icpReadyPatch,
@@ -1131,7 +1131,7 @@ export async function startIcpDiscoveryForUser(
   // Tracked so a deploy's graceful shutdown waits for this run (cronJobRegistry
   // is drained before the listener closes) instead of killing it mid-flight and
   // leaving a dead `running` claim that nothing completes until it times out.
-  void cronJobRegistry.track(
+  trackBackgroundRun(
     "onboardingIcp",
     triggerIcpDiscoveryForUser(userId, {
       ...deps,

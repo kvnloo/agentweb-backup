@@ -49,7 +49,7 @@ import {
   AdVariantRatingFields,
   recentRejectedRatings,
 } from "./adVariantRatingService";
-import { cronJobRegistry } from "../utils/cronJobRegistry";
+import { trackBackgroundRun } from "../utils/trackedBackgroundRun";
 
 /** Bedrock model alias. Same family as Steps 2 / 3 / 4. */
 const AD_COPY_MODEL = "anthropic.claude-sonnet-4-6";
@@ -591,7 +591,7 @@ export async function startAdCopyForUser(
   // Tracked so a deploy's graceful shutdown waits for this run (cronJobRegistry
   // is drained before the listener closes) instead of killing it mid-flight and
   // leaving a dead `running` claim that nothing completes until it times out.
-  void cronJobRegistry.track(
+  trackBackgroundRun(
     "onboardingAdCopy",
     triggerAdCopyForUser(userId, {
       ...deps,

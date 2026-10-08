@@ -40,7 +40,7 @@ import {
   IcpBrandContext,
 } from "./onboardingIcpService";
 import type { ICPPersona } from "./icpStatusService";
-import { cronJobRegistry } from "../utils/cronJobRegistry";
+import { trackBackgroundRun } from "../utils/trackedBackgroundRun";
 
 /** Bedrock model alias. Same family as Step 2 for tone consistency. */
 const COMPETITOR_MODEL = "anthropic.claude-sonnet-4-6";
@@ -505,11 +505,28 @@ export async function triggerCompetitorStrategyForUser(
   const user = await userDb.getUserById(userId);
   if (!user) return;
 
-  const u = user as any;
-  const icpStatus = typeof u.icpStatus === "string" ? u.icpStatus : "idle";
-  const personas: ICPPersona[] = Array.isArray(u.icpResult)
-    ? (u.icpResult as ICPPersona[])
-    : [];
+  let u = user as any;
+  const readiness = (rec: any) => {
+    const status = typeof rec.icpStatus === "string" ? rec.icpStatus : "idle";
+    const list: ICPPersona[] = Array.isArray(rec.icpResult) ? (rec.icpResult as ICPPersona[]) : [];
+    return { icpStatus: status, personas: list };
+  };
+  let { icpStatus, personas } = readiness(u);
+  if (icpStatus !== "ready" || personas.length === 0) {
+    // The read above is the eventually-consistent index: the legacy cascade
+    // calls us moments after icp turned `ready`, so a lagging read would gate a
+    // run that is actually good to go. Confirm with a consistent read before
+    // giving up. If that read is unavailable the original decision stands.
+    try {
+      const fresh = await (userDb as any).getUserByIdConsistent(userId);
+      if (fresh) {
+        u = fresh;
+        ({ icpStatus, personas } = readiness(u));
+      }
+    } catch {
+      /* keep the gate decision */
+    }
+  }
   if (icpStatus !== "ready" || personas.length === 0) {
     // Don't mark failed. Don't run. The polling tick and the next
     // cascade kickoff will re-call us once ICP is actually ready.
@@ -518,6 +535,25 @@ export async function triggerCompetitorStrategyForUser(
       userId,
       reason: `icp not ready (status=${icpStatus}, personas=${personas.length})`,
     });
+    // This run holds the axis claim but is not going to do any work. Left
+    // `running`, the claim would turn every retry into a no-op until the axis
+    // times out (3 minutes), where before the claims a retry simply re-fired.
+    // Hand the axis back (conditioned on OUR claim, so a newer run's state is
+    // never touched) so the next start or cascade kickoff can claim it.
+    if (deps.expectedStartedAt) {
+      try {
+        await userDb.updateUser(userId, { competitorStatus: "idle" } as any, {
+          condition: competitorOwnershipCondition(deps.expectedStartedAt),
+        });
+      } catch (releaseErr: any) {
+        if (releaseErr?.code !== "ConditionalCheckFailedException") {
+          console.warn("[onboardingCompetitorService] could not release gated claim", {
+            userId,
+            err: releaseErr?.message ?? String(releaseErr),
+          });
+        }
+      }
+    }
     return;
   }
 
@@ -694,7 +730,7 @@ export async function startCompetitorStrategyForUser(
   // Tracked so a deploy's graceful shutdown waits for this run (cronJobRegistry
   // is drained before the listener closes) instead of killing it mid-flight and
   // leaving a dead `running` claim that nothing completes until it times out.
-  void cronJobRegistry.track(
+  trackBackgroundRun(
     "onboardingCompetitor",
     triggerCompetitorStrategyForUser(userId, {
       ...deps,

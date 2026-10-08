@@ -74,7 +74,7 @@ import {
   type Aesthetic,
   type Archetype,
 } from "./brick5Archetypes";
-import { cronJobRegistry } from "../utils/cronJobRegistry";
+import { trackBackgroundRun } from "../utils/trackedBackgroundRun";
 
 /** Number of ad image variants per run. Brick 8 spec is "3 per ICP". */
 const AD_IMAGE_VARIANT_COUNT = 3;
@@ -1361,7 +1361,7 @@ export async function startAdImageGenerationForUser(
   // Tracked so a deploy's graceful shutdown waits for this run (cronJobRegistry
   // is drained before the listener closes) instead of killing it mid-flight and
   // leaving a dead `running` claim that nothing completes until it times out.
-  void cronJobRegistry.track(
+  trackBackgroundRun(
     "onboardingAdImage",
     triggerAdImageGenerationForUser(userId, { ...deps, run }),
   );
