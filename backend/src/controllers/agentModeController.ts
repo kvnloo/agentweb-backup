@@ -9147,6 +9147,16 @@ export const agentModeController = {
       const requestedLlmModel = normalizeRequestedLlmModel(rawRequestedLlmModel);
       const skillId = req.params?.skillId;
       const portalType = skillId ? 'agent' : requestedPortalType;
+      // ENG-903: skill, emma-sidebar and every non-'regular' session type (report, image,
+      // video, book, ...) run on a fixed admin-configured model, so a chat-model choice is
+      // meaningless there. Refuse it loudly instead of silently ignoring it. This runs
+      // before the skill lookup, the idempotency claim and every write.
+      if (requestedLlmModel && (skillId || portalType === 'emma-sidebar' || (sessionType || 'regular') !== 'regular')) {
+        return res.status(422).json({
+          error: 'This kind of session uses a fixed model and does not accept a model choice.',
+          code: 'model_not_selectable_for_session_type',
+        });
+      }
       let skill;
       if (skillId) {
         skill = await agentModeService.getAuthorizedSkill(skillId, user.userId);
@@ -9205,9 +9215,10 @@ export const agentModeController = {
         modelToUse = await agentModeService.getDefaultModel();
       }
       let initialModelPolicy: EffectiveModelPolicyDecision | undefined;
-      // Only plain 'regular' sessions honor a client `requestedLlmModel`. Skill,
+      // Only plain 'regular' sessions take a client `requestedLlmModel`. Skill,
       // emma-sidebar, report and image/video sessions take their model from admin
-      // configuration (above) and intentionally ignore it, so they never 422 here.
+      // configuration (above); an explicit model for them was already refused (422
+      // model_not_selectable_for_session_type) at the top of this handler.
       if (!skillId && finalSessionType === 'regular' && portalType !== 'emma-sidebar') {
         try {
           initialModelPolicy = await resolveEffectiveModelForUser({
