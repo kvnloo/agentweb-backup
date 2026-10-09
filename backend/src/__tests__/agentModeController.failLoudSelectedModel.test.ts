@@ -104,6 +104,15 @@ jest.mock('../services/skillService', () => ({
 jest.mock('../services/subscriptionService', () => ({
   getAllowedSkills: jest.fn().mockResolvedValue([]),
 }));
+// Delegates to the real runStore unless a test overrides it (ENG-903 ordering tests).
+jest.mock('../services/agentMode/runStore', () => {
+  const actual = jest.requireActual('../services/agentMode/runStore');
+  return {
+    ...actual,
+    isRunStoreEnabled: jest.fn((...a: unknown[]) => actual.isRunStoreEnabled(...a)),
+    claimIdempotency: jest.fn((...a: unknown[]) => actual.claimIdempotency(...a)),
+  };
+});
 jest.mock('../utils/agentModeAlerts', () => ({
   sendAgentModeOncallAlert: jest.fn().mockResolvedValue(undefined),
 }));
@@ -126,6 +135,7 @@ import { userDb } from '../services/db';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
 import { checkTokenUsage, incrementUserTokenUsage } from '../services/tokenUsageService';
+import { isRunStoreEnabled, claimIdempotency } from '../services/agentMode/runStore';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockWorker = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
@@ -588,6 +598,53 @@ describe('createSession (fail-loud)', () => {
       expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, undefined);
     }
   });
+
+  afterEach(() => {
+    (isRunStoreEnabled as jest.Mock).mockImplementation(() => jest.requireActual('../services/agentMode/runStore').isRunStoreEnabled());
+  });
+
+  it('refuses the fixed-model 422 BEFORE the idempotency claim (no claim, no session)', async () => {
+    (isRunStoreEnabled as jest.Mock).mockReturnValue(true);
+    (claimIdempotency as jest.Mock).mockClear();
+    const res = makeRes();
+    await agentModeController.createSession(
+      createReq({ sessionType: 'report_generation', llmModel: 'gpt-5.5', idempotencyKey: 'k' }), res);
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toMatchObject({ code: FIXED_BODY_CODE });
+    expect(claimIdempotency).not.toHaveBeenCalled();
+    expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+  });
+
+  it('refuses the skill-route 422 BEFORE the idempotency claim (no claim, no session)', async () => {
+    (isRunStoreEnabled as jest.Mock).mockReturnValue(true);
+    (claimIdempotency as jest.Mock).mockClear();
+    const res = makeRes();
+    await agentModeController.createSession(
+      { user: { userId: OWNER }, params: { skillId: 'skill-1' }, body: { llmModel: 'gpt-5.5', idempotencyKey: 'k' } } as unknown as Request,
+      res,
+    );
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toMatchObject({ code: FIXED_BODY_CODE });
+    expect(claimIdempotency).not.toHaveBeenCalled();
+    expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+  });
+
+  // Documents current behavior: sessionType is matched exactly ('regular'), as the old code
+  // did. Any other spelling is a non-regular (fixed-model) type, so a model is refused.
+  it.each(['Regular', ' regular', 'REGULAR'])(
+    'sessionType %j is NOT "regular": 422 with a model, 201 without',
+    async (sessionType) => {
+      const refused = makeRes();
+      await agentModeController.createSession(createReq({ portalType: 'agent', sessionType, llmModel: 'gpt-5.5' }), refused);
+      expect(refused.statusCode).toBe(422);
+      expect(refused.body).toMatchObject({ code: FIXED_BODY_CODE });
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+
+      const ok = makeRes();
+      await agentModeController.createSession(createReq({ portalType: 'agent', sessionType }), ok);
+      expect(ok.statusCode).toBe(201);
+    },
+  );
 
   it('an explicit sessionType "regular" with a served model is still an ordinary chat session', async () => {
     const res = makeRes();
