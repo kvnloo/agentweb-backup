@@ -1263,3 +1263,31 @@ describe("PRODUCTION_DAG", () => {
     }
   });
 });
+
+// ENG-2308 review: settleAxis polls every few seconds while it waits for another
+// run. Only its FIRST read follows the runner's own write and needs the base
+// table; the polls after it just wait for the in-flight state to clear, so they
+// use the cheaper index read instead of paying for a consistent read each time.
+describe("settleAxis read cost while joining another run (ENG-2308)", () => {
+  it("makes one consistent read, then plain index reads for the polls", async () => {
+    await jest.isolateModulesAsync(async () => {
+      const inflight = { userId: "u1", icpStatus: "running", icpStartedAt: "2026-10-07T10:00:00.000Z", icpResult: "STALE-PLACEHOLDER" };
+      const done = { userId: "u1", icpStatus: "ready", icpStartedAt: "2026-10-07T10:00:00.000Z", icpResult: { real: true } };
+      const getUserById = jest.fn().mockResolvedValueOnce(inflight).mockResolvedValue(done);
+      const getUserByIdConsistent = jest.fn().mockResolvedValue(inflight);
+      jest.doMock("../services/db", () => ({
+        userDb: { getUserById, getUserByIdConsistent, updateUser: jest.fn().mockResolvedValue(undefined) },
+      }));
+      jest.doMock("../services/onboardingIcpService", () => ({
+        claimIcpRun: jest.fn(async () => null), // lost the claim: join the other run
+        triggerIcpDiscoveryForUser: jest.fn(),
+      }));
+      const wiring = require("../services/onboardingOrchestratorWiring");
+      wiring._setJoinPollMsForTests(1);
+      const result = await wiring.PRODUCTION_DAG.icp.runner({ userId: "u1" });
+      expect(result).toEqual({ real: true });
+      expect(getUserByIdConsistent).toHaveBeenCalledTimes(1);
+      expect(getUserById.mock.calls.length).toBeGreaterThanOrEqual(2);
+    });
+  });
+});
