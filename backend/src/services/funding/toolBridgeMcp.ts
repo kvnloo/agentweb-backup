@@ -63,18 +63,17 @@ export class ToolBridgeMcpAdapter {
   }
 
   /**
-   * Handles one HTTP request addressed to `runId`. A rejected token gets the same bare
-   * 404 an unknown path gets, so the response shows neither why it was rejected nor
-   * that the endpoint exists.
+   * Handles one HTTP request addressed to `runId`. Returns false, with nothing written,
+   * when the token is not valid for the run: the route then answers exactly as it does
+   * for a path that does not exist, so the response shows neither why the token was
+   * rejected nor that the endpoint is there.
    */
-  async handle(req: BridgeRequest, res: ServerResponse, runId: string): Promise<void> {
+  async handle(req: BridgeRequest, res: ServerResponse, runId: string): Promise<boolean> {
     const token = bearerToken(req);
     try {
       this.bridge.verify(token, runId);
     } catch {
-      res.writeHead(404);
-      res.end();
-      return;
+      return false;
     }
 
     const sessionId = headerValue(req, "mcp-session-id");
@@ -84,11 +83,11 @@ export class ToolBridgeMcpAdapter {
     if (!session) {
       if (sessionId) {
         respondJson(res, 404, rpcError("Session not found"));
-        return;
+        return true;
       }
       if (req.method !== "POST" || !isInitializeRequest(req.body)) {
         respondJson(res, 400, rpcError("Bad Request: no session"));
-        return;
+        return true;
       }
       // A harness that reconnects abandons its old session without closing it; drop the
       // oldest rather than lock the run out.
@@ -101,6 +100,7 @@ export class ToolBridgeMcpAdapter {
     }
 
     await session.transport.handleRequest(req, res, req.body);
+    return true;
   }
 
   private async createSession(runId: string, token: string): Promise<McpSession> {

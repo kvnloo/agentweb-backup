@@ -8,15 +8,17 @@
  *
  *  1. Local only. Every request from outside reaches Node through nginx, which always
  *     adds X-Forwarded-For; a process on this host connecting to the port directly
- *     does not. A request that is not from loopback, or carries a forwarding header,
- *     gets a plain 404, as if the route did not exist.
+ *     does not.
  *  2. The run token, checked on every request by the adapter.
+ *
+ * A request that fails either check is passed on untouched, so it gets the app's own
+ * response for a path that does not exist and cannot be told apart from one.
  *
  * When the runner moves to the worker host (ENG-2114) the first check has to change;
  * the second does not.
  */
 
-import express, { Request, Response } from "express";
+import express, { NextFunction, Request, Response } from "express";
 import type { ToolBridgeMcpAdapter } from "../services/funding/toolBridgeMcp";
 
 const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
@@ -29,13 +31,13 @@ export function isLocalOnlyRequest(req: Pick<Request, "headers" | "socket">): bo
 export function createToolBridgeRouter(adapter: ToolBridgeMcpAdapter): express.Router {
   const router = express.Router();
 
-  router.all("/:runId/mcp", async (req: Request, res: Response) => {
+  router.all("/:runId/mcp", async (req: Request, res: Response, next: NextFunction) => {
     if (!isLocalOnlyRequest(req)) {
-      res.status(404).end();
+      next();
       return;
     }
     try {
-      await adapter.handle(req, res, req.params.runId);
+      if (!(await adapter.handle(req, res, req.params.runId))) next();
     } catch (err) {
       console.error("[tool-bridge] request failed:", err instanceof Error ? err.message : String(err));
       if (!res.headersSent) res.status(500).json({ error: "internal error" });
