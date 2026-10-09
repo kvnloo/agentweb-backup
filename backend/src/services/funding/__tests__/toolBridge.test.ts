@@ -628,4 +628,119 @@ describe('ToolBridge', () => {
     now = 1_900;
     await expect(bridge.callTool(token, { name: 'get_leads', args: {} })).rejects.toEqual(new ToolBridgeAuthError('expired'));
   });
+  // ─── identical calls in one model message ──────────────────────────────────
+
+  it('collapses an identical write repeated in the same model message, running it once', async () => {
+    const deps = makeDeps();
+    const bridge = new ToolBridge(deps);
+    const token = bridge.openRun(RUN);
+    bridge.noteCallGroup(RUN.runId, 'toolu_1', 'msg_A');
+    bridge.noteCallGroup(RUN.runId, 'toolu_2', 'msg_A');
+
+    const first = await bridge.callTool(token, { name: 'send_email', args: { to: 'a@x.com', body: 'hi' }, callId: 'toolu_1' });
+    const second = await bridge.callTool(token, { name: 'send_email', args: { body: 'hi', to: 'a@x.com' }, callId: 'toolu_2' });
+
+    expect(first).toEqual({ content: 'send_email done', isError: false });
+    expect(second.isError).toBe(false);
+    expect(second.content).toMatch(/collapsed: an identical send_email call .* tool_call_id toolu_1/);
+    expect(deps.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('collapses identical reads that run concurrently in the same model message', async () => {
+    const deps = makeDeps();
+    const gate = deferred<BridgeExecuteOutcome>();
+    deps.execute.mockImplementationOnce(() => gate.promise);
+    const bridge = new ToolBridge(deps);
+    const token = bridge.openRun(RUN);
+    bridge.noteCallGroup(RUN.runId, 'toolu_1', 'msg_A');
+    bridge.noteCallGroup(RUN.runId, 'toolu_2', 'msg_A');
+
+    const a = bridge.callTool(token, { name: 'get_leads', args: {}, callId: 'toolu_1' });
+    const b = bridge.callTool(token, { name: 'get_leads', args: {}, callId: 'toolu_2' });
+    expect((await b).content).toMatch(/collapsed/);
+    gate.resolve(ok('leads'));
+    expect((await a).content).toBe('leads');
+    expect(deps.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs the same call again when it comes from a later model message', async () => {
+    const deps = makeDeps();
+    const bridge = new ToolBridge(deps);
+    const token = bridge.openRun(RUN);
+    bridge.noteCallGroup(RUN.runId, 'toolu_1', 'msg_A');
+    bridge.noteCallGroup(RUN.runId, 'toolu_2', 'msg_B');
+
+    await bridge.callTool(token, { name: 'send_email', args: { to: 'a@x.com' }, callId: 'toolu_1' });
+    await bridge.callTool(token, { name: 'send_email', args: { to: 'a@x.com' }, callId: 'toolu_2' });
+    expect(deps.execute).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not collapse calls with different arguments, or a tool the executor exempts', async () => {
+    const deps = { ...makeDeps(), isDedupable: jest.fn((name: string) => name !== 'launch_campaign') };
+    const bridge = new ToolBridge(deps);
+    const token = bridge.openRun(RUN);
+    for (const id of ['t1', 't2', 't3', 't4']) bridge.noteCallGroup(RUN.runId, id, 'msg_A');
+
+    await bridge.callTool(token, { name: 'send_email', args: { to: 'a@x.com' }, callId: 't1' });
+    await bridge.callTool(token, { name: 'send_email', args: { to: 'b@x.com' }, callId: 't2' });
+    await bridge.callTool(token, { name: 'launch_campaign', args: {}, callId: 't3' });
+    await bridge.callTool(token, { name: 'launch_campaign', args: {}, callId: 't4' });
+    expect(deps.execute).toHaveBeenCalledTimes(4);
+  });
+
+  it('waits for a call\'s message to be reported when it arrives first, then collapses the repeat', async () => {
+    const deps = makeDeps();
+    const bridge = new ToolBridge(deps);
+    const token = bridge.openRun(RUN, { callGroupWaitMs: 5_000 });
+    bridge.noteCallGroup(RUN.runId, 'toolu_1', 'msg_A');
+    await bridge.callTool(token, { name: 'send_email', args: {}, callId: 'toolu_1' });
+
+    const late = bridge.callTool(token, { name: 'send_email', args: {}, callId: 'toolu_2' });
+    await flush();
+    expect(deps.execute).toHaveBeenCalledTimes(1); // still waiting to learn its message
+    bridge.noteCallGroup(RUN.runId, 'toolu_2', 'msg_A');
+    expect((await late).content).toMatch(/collapsed/);
+    expect(deps.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs the call when its message is never reported, after the wait', async () => {
+    jest.useFakeTimers();
+    try {
+      const deps = makeDeps();
+      const bridge = new ToolBridge(deps);
+      const token = bridge.openRun(RUN, { callGroupWaitMs: 200 });
+      const call = bridge.callTool(token, { name: 'send_email', args: {}, callId: 'toolu_9' });
+      await jest.advanceTimersByTimeAsync(199);
+      expect(deps.execute).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(2);
+      expect((await call).content).toBe('send_email done');
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('does not wait or collapse when no call id or no wait is configured', async () => {
+    const deps = makeDeps();
+    const bridge = new ToolBridge(deps);
+    const token = bridge.openRun(RUN);
+    await bridge.callTool(token, { name: 'send_email', args: {} });
+    await bridge.callTool(token, { name: 'send_email', args: {} });
+    await bridge.callTool(token, { name: 'send_email', args: {}, callId: 'x1' });
+    await bridge.callTool(token, { name: 'send_email', args: {}, callId: 'x2' });
+    expect(deps.execute).toHaveBeenCalledTimes(4);
+  });
+
+  it('still refuses a repeat while the session is halted rather than calling it collapsed', async () => {
+    const deps = makeDeps();
+    deps.execute.mockResolvedValueOnce(ok('preview', { requiresConfirmation: true }));
+    const bridge = new ToolBridge(deps);
+    const token = bridge.openRun(RUN);
+    bridge.noteCallGroup(RUN.runId, 't1', 'msg_A');
+    bridge.noteCallGroup(RUN.runId, 't2', 'msg_A');
+
+    await bridge.callTool(token, { name: 'launch_campaign', args: {}, callId: 't1' });
+    const repeat = await bridge.callTool(token, { name: 'launch_campaign', args: {}, callId: 't2' });
+    expect(repeat.isError).toBe(true);
+    expect(repeat.content).toMatch(/waiting for the user to confirm/);
+  });
 });

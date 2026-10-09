@@ -618,5 +618,44 @@ describe('ClaudeCliRunner', () => {
     await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
   });
 
+  it('reports each tool call the model emits with the id of its model message', async () => {
+    const runner = trackedRunner();
+    const onToolUse = jest.fn();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { onToolUse });
+    const child = spawnedChildren[0];
+    const turn = runner.send(handle, 'hi');
+
+    const assistant = (content: unknown[]) => JSON.stringify({ type: 'assistant', message: { id: 'msg_1', content } }) + '\n';
+    child.stdout.push(assistant([{ type: 'text', text: 'working' }]));
+    child.stdout.push(assistant([{ type: 'tool_use', id: 'toolu_a', name: 'mcp__emma__get_leads', input: {} }]));
+    child.stdout.push(assistant([{ type: 'tool_use', id: 'toolu_b', name: 'mcp__emma__get_leads', input: {} }]));
+    await flush();
+
+    expect(onToolUse.mock.calls.map((c) => c[0])).toEqual([
+      { messageId: 'msg_1', toolUseId: 'toolu_a', name: 'mcp__emma__get_leads' },
+      { messageId: 'msg_1', toolUseId: 'toolu_b', name: 'mcp__emma__get_leads' },
+    ]);
+    emitResult(child, { type: 'result', is_error: false, result: 'ok' });
+    await turn;
+  });
+
+  it('keeps the turn alive when the tool-use callback throws', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    const runner = trackedRunner();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, {
+      onToolUse: () => {
+        throw new Error('boom');
+      },
+    });
+    const child = spawnedChildren[0];
+    const turn = runner.send(handle, 'hi');
+    child.stdout.push(
+      JSON.stringify({ type: 'assistant', message: { id: 'm', content: [{ type: 'tool_use', id: 't', name: 'x' }] } }) + '\n',
+    );
+    await flush();
+    emitResult(child, { type: 'result', is_error: false, result: 'ok' });
+    await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
+  });
+
   void mkdtempSync; // referenced only via the module under test; keeps the fs mock import used
 });
