@@ -354,6 +354,8 @@ function paragraphAround(text: string, at: number, maxEachSide = 300): string {
 // A label that introduces the whole account ("Summary:", "Your CRM:", "Total:") keeps its claim; any other "Label: 23 leads across 2 lists" row
 // ("Calendly Bookings: ...") describes one group.
 const WHOLE_ACCOUNT_LABEL = /\b(total|overall|crm|your|account|all|entire|summary|snapshot|overview|status|current|now|result|inventory)\b/i;
+// "Six lists account for 14,829 of your contacts": the lists the sentence goes on to single out, not how many there are.
+const SUBSET_AFTER = /^\s*(?:account(?:s|ed)?\s+for|make\s+up|represent|together|combined|each|alone)\b/i;
 function inBreakdownRow(text: string, at: number): boolean {
   const lineStart = text.lastIndexOf('\n', at - 1) + 1;
   const before = text.slice(Math.max(lineStart, at - 200), at);
@@ -374,7 +376,7 @@ function findInventoryClaims(text: string): Array<CountRange & { at: number }> {
       if (needsCrmContext && !(CRM_CONTEXT.test(sentenceAround(text, at)) || CRM_CONTEXT.test(paragraphAround(text, at)))) continue;
       // "Remaining 15 lists: 0 leads" / "the other 4 lists" is a breakdown of a subset, not the account total.
       if (SUBSET_BEFORE.test(text.slice(Math.max(0, at - 24), at))) continue;
-      if (subsetProne && /\blists\b/i.test(m[0]) && inBreakdownRow(text, at)) continue;
+      if (subsetProne && /\blists\b/i.test(m[0]) && (inBreakdownRow(text, at) || SUBSET_AFTER.test(text.slice(at + m[0].length, at + m[0].length + 24)))) continue;
       for (const g of m.slice(1)) {
         if (!g) continue;
         const gAt = m[0].indexOf(g);
