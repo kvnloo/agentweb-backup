@@ -484,7 +484,7 @@ function splitServedModel(id: string): { vendor: string; tokens: string[]; date:
   return { vendor, tokens, date: dated ? `${dated[1]}${dated[2]}${dated[3]}` : null };
 }
 
-function mapCallError(error: unknown, policy?: CompareProviderPolicy | null): { errorCode: CompareErrorCode; errorClass: string } {
+function mapCallError(error: unknown, policy: CompareProviderPolicy | null | undefined, modelKnown: boolean): { errorCode: CompareErrorCode; errorClass: string } {
   let errorClass = 'unknown';
   try {
     // classifyToolErrorClass tolerates non-Error values, but never let classification itself throw.
@@ -492,7 +492,7 @@ function mapCallError(error: unknown, policy?: CompareProviderPolicy | null): { 
   } catch {
     /* keep 'unknown' */
   }
-  if (isProviderPolicyUnavailableError(error, policy)) {
+  if (isProviderPolicyUnavailableError(error, policy, modelKnown)) {
     return { errorCode: COMPARE_PROVIDER_POLICY_UNAVAILABLE_CODE, errorClass };
   }
   return { errorCode: errorClass === 'timeout' ? 'timeout' : 'upstream_error', errorClass };
@@ -736,7 +736,7 @@ async function runOne(
     return { status: 'ok', content: text, latencyMs };
   } catch (error) {
     const latencyMs = Math.max(0, deps.now() - started);
-    const { errorCode, errorClass } = mapCallError(error, policy);
+    const { errorCode, errorClass } = mapCallError(error, policy, !!candidate.info);
     // Class only: provider error text can echo the prompt or carry provider internals.
     deps.log('ModelCompare: model call failed', { model: candidate.canonical, errorClass });
     return { status: 'error', errorCode, latencyMs };

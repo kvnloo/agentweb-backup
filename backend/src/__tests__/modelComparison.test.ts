@@ -1363,6 +1363,19 @@ describe('ENG-55 data-collection policy (provider_policy_unavailable)', () => {
     expect(res(out).results[1]).toMatchObject({ status: 'error', errorCode: 'upstream_error' });
   });
 
+  it.each([
+    ['require_parameters 404', 'No endpoints found that can handle the requested parameters'],
+    ['unknown/retired model 404', 'No endpoints found for foo/bar-9.'],
+  ])('policy on + %s is NOT labelled a privacy problem (stays upstream_error)', async (_n, text) => {
+    const callLLM = jest.fn(async (m: string) => {
+      if (m === 'gemini-3.5-flash') throw Object.assign(new Error(text), { status: 404 });
+      return ok(`answer from ${m}`, m);
+    });
+    const { deps } = makeDeps({ callLLM: callLLM as any, getProviderPolicy: async () => DENY });
+    const out = await run(deps, body());
+    expect(res(out).results[1]).toMatchObject({ status: 'error', errorCode: 'upstream_error' });
+  });
+
   it('policy on + an unrelated error stays upstream_error', async () => {
     const callLLM = jest.fn(async (m: string) => {
       if (m === 'gemini-3.5-flash') throw new Error('socket hang up');

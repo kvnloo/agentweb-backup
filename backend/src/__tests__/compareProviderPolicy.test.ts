@@ -56,9 +56,30 @@ describe('createCompareProviderPolicy', () => {
       const { policy } = make(async () => row as any);
       expect(await policy.getPolicy()).toBeNull();
     });
-  it('exact string true (trim, case-insensitive) => deny', async () => {
-    const { policy } = make(async () => ({ settingValue: ' True ' }));
+  it('exact string true => deny', async () => {
+    const { policy } = make(async () => ({ settingValue: 'true' }));
     expect(await policy.getPolicy()).toEqual({ data_collection: 'deny' });
+  });
+  it.each([' True ', 'TRUE', 'True', 'true ', ' true', true])('only the exact string "true" turns it on: %j => off', async (v) => {
+    const { policy } = make(async () => ({ settingValue: v }));
+    expect(await policy.getPolicy()).toBeNull();
+  });
+  it('4 concurrent cold calls share ONE in-flight settings read', async () => {
+    let release!: (v: { settingValue: string }) => void;
+    const { policy, getSetting } = make(() => new Promise((resolve) => { release = resolve as any; }));
+    const calls = [policy.getPolicy(), policy.getPolicy(), policy.getPolicy(), policy.getPolicy()];
+    release({ settingValue: 'true' });
+    const out = await Promise.all(calls);
+    expect(getSetting).toHaveBeenCalledTimes(1);
+    expect(out).toEqual(Array(4).fill({ data_collection: 'deny' }));
+  });
+  it('concurrent calls during a failing refresh share one read and all get the last-known value', async () => {
+    let reject!: (e: Error) => void;
+    const { policy, getSetting } = make(() => new Promise((_r, rej) => { reject = rej; }));
+    const calls = [policy.getPolicy(), policy.getPolicy(), policy.getPolicy()];
+    reject(new Error('down'));
+    expect(await Promise.all(calls)).toEqual([null, null, null]);
+    expect(getSetting).toHaveBeenCalledTimes(1);
   });
   it('caches for ~60s then refreshes', async () => {
     let v = 'true';
@@ -103,17 +124,34 @@ describe('createCompareProviderPolicy', () => {
   });
 });
 
-describe('isProviderPolicyUnavailableError', () => {
-  const noEndpoints = Object.assign(new Error('404 No endpoints found matching your data policy'), { status: 404 });
-  it('policy on + no-endpoints 404 => true', () => {
-    expect(isProviderPolicyUnavailableError(noEndpoints, DENY_DATA_COLLECTION_POLICY)).toBe(true);
+describe('isProviderPolicyUnavailableError (conservative)', () => {
+  const nf = (message: string, status = 404) => Object.assign(new Error(message), { status });
+  const generic = nf('404 No endpoints found matching your data policy');
+  const on = DENY_DATA_COLLECTION_POLICY;
+  it('policy on + generic no-endpoints 404 + known model => true', () => {
+    expect(isProviderPolicyUnavailableError(generic, on, true)).toBe(true);
+    expect(isProviderPolicyUnavailableError(nf('No endpoints available'), on, true)).toBe(true);
   });
   it('policy off => false (unchanged behaviour)', () => {
-    expect(isProviderPolicyUnavailableError(noEndpoints, null)).toBe(false);
+    expect(isProviderPolicyUnavailableError(generic, null, true)).toBe(false);
+  });
+  it('MISLABEL 1: require_parameters 404 stays upstream (not a privacy problem)', () => {
+    expect(isProviderPolicyUnavailableError(nf('404 No endpoints found that can handle the requested parameters'), on, true)).toBe(false);
+    expect(isProviderPolicyUnavailableError(nf('No endpoints found that support the parameters: tools'), on, true)).toBe(false);
+  });
+  it('MISLABEL 2: unknown/retired model 404 stays upstream', () => {
+    expect(isProviderPolicyUnavailableError(nf('No endpoints found for foo/bar-9.'), on, true)).toBe(false);
+  });
+  it('model id not known to the registry => false', () => {
+    expect(isProviderPolicyUnavailableError(generic, on, false)).toBe(false);
+  });
+  it('wrapped originalMessage with parameters text is also excluded', () => {
+    const wrapped = Object.assign(new Error('LLM call failed'), { originalMessage: 'No endpoints found that can handle the requested parameters' });
+    expect(isProviderPolicyUnavailableError(wrapped, on, true)).toBe(false);
   });
   it('policy on + unrelated errors => false', () => {
-    expect(isProviderPolicyUnavailableError(new Error('socket hang up'), DENY_DATA_COLLECTION_POLICY)).toBe(false);
-    expect(isProviderPolicyUnavailableError(Object.assign(new Error('Not Found'), { status: 404 }), DENY_DATA_COLLECTION_POLICY)).toBe(false);
+    expect(isProviderPolicyUnavailableError(new Error('socket hang up'), on, true)).toBe(false);
+    expect(isProviderPolicyUnavailableError(nf('Not Found'), on, true)).toBe(false);
   });
   it('code constant', () => {
     expect(COMPARE_PROVIDER_POLICY_UNAVAILABLE_CODE).toBe('provider_policy_unavailable');
