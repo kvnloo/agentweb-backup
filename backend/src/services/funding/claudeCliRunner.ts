@@ -12,13 +12,26 @@
 
 import { spawn as spawnChildProcess, type ChildProcessWithoutNullStreams } from "child_process";
 import { createInterface, type Interface } from "readline";
-import { mkdtempSync, rmSync } from "fs";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+
+/** The one MCP server a session may reach: the tool bridge (ENG-2109), with its run token. */
+export interface ClaudeCliMcpServer {
+  name: string;
+  url: string;
+  bearerToken: string;
+}
 
 export interface ClaudeCliRunnerOptions {
   /** Model alias or id, e.g. "haiku" | "sonnet" | "opus" | a full model id. Omit for the CLI's own default. */
   model?: string;
+  /**
+   * Gives the session tools through this MCP server and nothing else. The config,
+   * token included, is written to a 0600 file in the session's scratch dir rather than
+   * passed on the command line, where it would be visible in the process list.
+   */
+  mcpServer?: ClaudeCliMcpServer;
 }
 
 export interface ClaudeCliTurnResult {
@@ -46,6 +59,10 @@ interface PooledSession {
   apiKeySource: string | undefined;
   /** Last ~4000 chars of stderr, kept only for error diagnostics. Draining it also prevents an OS pipe-buffer deadlock on this long-lived, --verbose child. */
   stderrTail: string;
+  /** Name of the MCP server this session was given, if any. */
+  expectedMcpServer: string | undefined;
+  /** That server's status from the latest `system/init` event. */
+  mcpServerStatus: string | undefined;
 }
 
 const DEFAULT_IDLE_CLOSE_MS = 10 * 60 * 1000;
@@ -134,7 +151,8 @@ export class ClaudeCliRunner {
       }
 
       const scratchHomeDir = mkdtempSync(join(tmpdir(), "claude-cli-home-"));
-      const child = spawnChildProcess("claude", buildArgs(systemPromptFile, opts), {
+      const mcpConfigFile = opts.mcpServer ? writeMcpConfig(scratchHomeDir, opts.mcpServer) : undefined;
+      const child = spawnChildProcess("claude", buildArgs(systemPromptFile, opts, mcpConfigFile), {
         env: buildAllowlistedEnv(configDir, scratchHomeDir),
       });
 
@@ -148,6 +166,8 @@ export class ClaudeCliRunner {
         closed: false,
         apiKeySource: undefined,
         stderrTail: "",
+        expectedMcpServer: opts.mcpServer?.name,
+        mcpServerStatus: undefined,
       };
 
       session.rl.on("line", (line) => this.handleLine(session, line));
@@ -267,6 +287,11 @@ export class ClaudeCliRunner {
     return this.pool.get(handle.conversationId)?.apiKeySource;
   }
 
+  /** Status of the session's MCP server from its latest `system/init` event ("connected" when usable). */
+  mcpServerStatusFor(handle: ClaudeCliSessionHandle): string | undefined {
+    return this.pool.get(handle.conversationId)?.mcpServerStatus;
+  }
+
   /** Closes every open session, and guarantees nothing still queued or mid-spawn survives it either. */
   closeAll(): void {
     // this.spawning (not just spawnQueue) is the real source of truth for "in flight" —
@@ -295,6 +320,21 @@ export class ClaudeCliRunner {
     }
     if (parsed.type === "system" && parsed.subtype === "init") {
       session.apiKeySource = typeof parsed.apiKeySource === "string" ? parsed.apiKeySource : undefined;
+      if (session.expectedMcpServer) {
+        session.mcpServerStatus = mcpStatus(parsed.mcp_servers, session.expectedMcpServer);
+        if (session.mcpServerStatus !== "connected") {
+          // The CLI carries on with zero tools when its MCP server fails to connect (a
+          // rejected token, an unreachable bridge) and reports the turn as a success.
+          // A toolless Emma turn must not pass for a real one, so stop here.
+          session.pending?.reject(
+            new Error(
+              `claudeCliRunner: MCP server "${session.expectedMcpServer}" is not connected (${session.mcpServerStatus ?? "missing"})`,
+            ),
+          );
+          session.pending = null;
+          this.closeSessionInternal(session, "mcp-not-connected");
+        }
+      }
       return;
     }
     if (parsed.type !== "result" || !session.pending) return;
@@ -392,7 +432,24 @@ function buildAllowlistedEnv(configDir: string, scratchHomeDir: string): NodeJS.
   };
 }
 
-function buildArgs(systemPromptFile: string, opts: ClaudeCliRunnerOptions): string[] {
+function writeMcpConfig(scratchHomeDir: string, server: ClaudeCliMcpServer): string {
+  const file = join(scratchHomeDir, "mcp.json");
+  const config = {
+    mcpServers: {
+      [server.name]: { type: "http", url: server.url, headers: { Authorization: `Bearer ${server.bearerToken}` } },
+    },
+  };
+  writeFileSync(file, JSON.stringify(config), { mode: 0o600 });
+  return file;
+}
+
+function mcpStatus(servers: unknown, name: string): string | undefined {
+  if (!Array.isArray(servers)) return undefined;
+  const entry = servers.find((server) => server && typeof server === "object" && (server as any).name === name);
+  return typeof (entry as any)?.status === "string" ? (entry as any).status : undefined;
+}
+
+function buildArgs(systemPromptFile: string, opts: ClaudeCliRunnerOptions, mcpConfigFile?: string): string[] {
   const args = [
     "-p",
     "--input-format",
@@ -409,6 +466,8 @@ function buildArgs(systemPromptFile: string, opts: ClaudeCliRunnerOptions): stri
     "",
   ];
   if (opts.model) args.push("--model", opts.model);
+  // --strict-mcp-config above already limits the session to exactly this file.
+  if (mcpConfigFile) args.push("--mcp-config", mcpConfigFile);
   return args;
 }
 

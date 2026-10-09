@@ -17,7 +17,6 @@
  */
 
 import express, { Request, Response } from "express";
-import { toolBridgeMcp } from "../services/funding/toolBridgeService";
 import type { ToolBridgeMcpAdapter } from "../services/funding/toolBridgeMcp";
 
 const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
@@ -45,5 +44,3 @@ export function createToolBridgeRouter(adapter: ToolBridgeMcpAdapter): express.R
 
   return router;
 }
-
-export default createToolBridgeRouter(toolBridgeMcp);
