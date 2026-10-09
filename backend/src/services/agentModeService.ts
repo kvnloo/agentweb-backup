@@ -362,7 +362,7 @@ export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
-const MAX_TOOL_CONTENT_SIZE = 300_000;
+export const MAX_TOOL_CONTENT_SIZE = 300_000;
 
 // Floor above which trimToolMessagesForContext compresses an OLD tool result down to a
 // 200-char preview (per-tool allowances in LARGE_TOOL_RESULT_LIMIT may raise it, never lower it).

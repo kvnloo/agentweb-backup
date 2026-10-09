@@ -41,6 +41,8 @@ export interface BridgeListedTool extends BridgeTool {
 export interface BridgeToolCall {
   name: string;
   args: Record<string, unknown>;
+  /** The harness's own id for this call, when it supplies one. Used for telemetry only. */
+  callId?: string;
 }
 
 export interface BridgeExecuteOutcome {
