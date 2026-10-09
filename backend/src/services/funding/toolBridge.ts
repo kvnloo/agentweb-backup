@@ -83,8 +83,12 @@ export interface ToolBridgeDeps {
 }
 
 export interface OpenRunOptions {
-  /** Fires when the harness must re-read the tool list. */
-  onToolsChanged?: () => void;
+  /**
+   * Fires when the harness must re-read the tool list. The call that changed the list
+   * is not answered until this settles, so the harness can have the new tools before
+   * the model's next step. Must bound its own wait.
+   */
+  onToolsChanged?: () => void | Promise<void>;
   /** Fires when a result halts the session, so the caller can persist it. */
   onHalted?: () => void;
   /** Set when the session was already waiting on a confirmation before this run opened. */
@@ -122,7 +126,7 @@ interface RunState {
   waiters: Set<() => void>;
   /** Tail of the queue that serializes calls to tools not known to be read-only. */
   serialTail: Promise<void>;
-  onToolsChanged?: () => void;
+  onToolsChanged?: () => void | Promise<void>;
   onHalted?: () => void;
   callGroupWaitMs: number;
   /** Harness call id -> the model message it came from. */
@@ -394,7 +398,13 @@ export class ToolBridge {
     if (outcome.toolsChanged) {
       state.toolsPromise = null;
       state.toolsGeneration++;
-      if (!state.closed) notify(state.onToolsChanged, "onToolsChanged");
+      if (!state.closed && state.onToolsChanged) {
+        try {
+          await state.onToolsChanged();
+        } catch (err) {
+          console.error("[tool-bridge] onToolsChanged failed (swallowed):", err instanceof Error ? err.message : String(err));
+        }
+      }
     }
     return {
       content: outcome.content,

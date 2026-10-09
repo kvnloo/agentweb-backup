@@ -23,11 +23,19 @@ import { ToolBridge, ToolBridgeAuthError, type OpenRunOptions } from "./toolBrid
 export const HARNESS_TOOL_USE_ID_META_KEY = "claudecode/toolUseId";
 
 const MAX_SESSIONS_PER_RUN = 4;
+/**
+ * After a tool-list change, how long the changing call's answer is held for the harness
+ * to fetch the new list. Without it the model's next step can go out with the old list
+ * and the new tool is only usable a turn later.
+ */
+const RELIST_WAIT_MS = 2_000;
 const EMPTY_INPUT_SCHEMA = { type: "object", properties: {} };
 
 interface McpSession {
   server: Server;
   transport: StreamableHTTPServerTransport;
+  /** Settled the next time this session fetches its tool list. */
+  relistWaiters: Set<() => void>;
 }
 
 type BridgeRequest = IncomingMessage & { body?: unknown };
@@ -113,6 +121,7 @@ export class ToolBridgeMcpAdapter {
       } catch (err) {
         throw new Error(err instanceof ToolBridgeAuthError ? "This run has ended." : "The tool list is unavailable.");
       }
+      for (const wake of [...session.relistWaiters]) wake();
       return {
         tools: tools.map((tool) => ({
           name: tool.name,
@@ -178,17 +187,33 @@ export class ToolBridgeMcpAdapter {
       }
     };
 
-    const session: McpSession = { server, transport };
+    const session: McpSession = { server, transport, relistWaiters: new Set() };
     await server.connect(transport);
     return session;
   }
 
-  private notifyToolsChanged(runId: string): void {
-    for (const session of this.sessionsByRun.get(runId)?.values() ?? []) {
-      session.server.sendToolListChanged().catch((err: unknown) => {
-        console.error("[tool-bridge] list_changed not delivered:", err instanceof Error ? err.message : String(err));
-      });
-    }
+  private async notifyToolsChanged(runId: string): Promise<void> {
+    const sessions = [...(this.sessionsByRun.get(runId)?.values() ?? [])];
+    await Promise.all(
+      sessions.map(async (session) => {
+        const relisted = new Promise<void>((resolve) => {
+          const settle = () => {
+            clearTimeout(timer);
+            session.relistWaiters.delete(settle);
+            resolve();
+          };
+          const timer = setTimeout(settle, RELIST_WAIT_MS);
+          session.relistWaiters.add(settle);
+        });
+        try {
+          await session.server.sendToolListChanged();
+        } catch (err) {
+          console.error("[tool-bridge] list_changed not delivered:", err instanceof Error ? err.message : String(err));
+          for (const wake of [...session.relistWaiters]) wake();
+        }
+        await relisted;
+      }),
+    );
   }
 
   private closeSessions(runId: string): void {
@@ -196,6 +221,7 @@ export class ToolBridgeMcpAdapter {
     if (!sessions) return;
     this.sessionsByRun.delete(runId);
     for (const session of sessions.values()) {
+      for (const wake of [...session.relistWaiters]) wake();
       session.transport.close().catch(() => undefined);
     }
   }
