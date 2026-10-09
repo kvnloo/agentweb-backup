@@ -372,7 +372,9 @@ async function mirrorIcpsToMarketStrategy(
   completedAt: string,
 ): Promise<void> {
   try {
-    const fresh: any = await userDb.getUserById(userId);
+    // Consistent where possible: this rewrites the whole marketStrategy object,
+    // so a lagging index read could write back stale competitors/overview.
+    const fresh: any = await readUserForRegeneration(userId);
     if (!fresh) return;
     const now = new Date().toISOString();
     const existing = (fresh.marketStrategy ?? {}) as {
@@ -432,12 +434,21 @@ async function mirrorIcpsUntilStable(userId: string, completedAt: string): Promi
     const u: any = await readUserForRegeneration(userId);
     return u && Array.isArray(u.icpResult) ? (u.icpResult as ICPPersona[]) : null;
   };
-  for (let pass = 0; pass < MAX_MIRROR_PASSES; pass++) {
-    const before = await listOf();
-    if (!before) return;
-    await mirrorIcpsToMarketStrategy(userId, before, completedAt);
-    const after = await listOf();
-    if (!after || JSON.stringify(after) === JSON.stringify(before)) return;
+  // Best-effort like the single mirror write it wraps: the card is already
+  // saved, so a failed re-read here must not turn the run into `failed`.
+  try {
+    for (let pass = 0; pass < MAX_MIRROR_PASSES; pass++) {
+      const before = await listOf();
+      if (!before) return;
+      await mirrorIcpsToMarketStrategy(userId, before, completedAt);
+      const after = await listOf();
+      if (!after || JSON.stringify(after) === JSON.stringify(before)) return;
+    }
+  } catch (err) {
+    console.error("[onboardingIcpService] mirror re-check failed", {
+      userId,
+      err: err instanceof Error ? err.message : String(err),
+    });
   }
 }
 
@@ -774,8 +785,13 @@ export async function regenerateSingleIcpForUser(
           userId,
           icpId: target.id,
         });
-        const gonePatch = icpReadyPatch(current, currentList);
-        if (gonePatch) await userDb.updateUser(userId, gonePatch as any);
+        // Joined a full run: the status is that run's to settle, and flipping it
+        // here would make its completion (conditioned on `running`) fail.
+        if (deps.deferStatusToFullRun && current.icpStatus === "running") return;
+        // Status only: writing the list back too would be a whole-list write that
+        // can erase a concurrent regeneration's slot.
+        const { icpResult: _unchanged, ...goneStatus } = (icpReadyPatch(current, currentList) ?? {}) as Record<string, unknown>;
+        if (Object.keys(goneStatus).length > 0) await userDb.updateUser(userId, goneStatus as any);
         return;
       }
 
