@@ -200,8 +200,20 @@ const VERDICTS: Record<string, 'approved' | 'rejected'> = {
 
 const claimKey = (assetUrl: string) => `whatsapp:approval-claim:${assetUrl}`;
 
-const ALREADY_ANSWERED =
-  'That one is already recorded — no need to tap again. Thanks!';
+/**
+ * WhatsApp cannot lock or remove buttons once a message is sent — the client greys out
+ * only the one that was tapped, and the other stays live forever. So the answer to a
+ * later tap has to do the locking in words: say what was recorded and that it is final.
+ */
+function alreadyAnsweredReply(status?: string): string {
+  if (status === 'approved') {
+    return 'This was already approved, so the buttons no longer do anything. Nothing has changed.';
+  }
+  if (status === 'rejected') {
+    return 'This was already rejected, so the buttons no longer do anything. Nothing has changed.';
+  }
+  return 'This one is already answered, so the buttons no longer do anything. Nothing has changed.';
+}
 
 /**
  * Record an approval verdict tapped on WhatsApp.
@@ -250,7 +262,14 @@ export async function handleApprovalButtonTap(params: {
     if (!claimed) {
       // Already answered. Say so rather than going quiet: with no way to grey the
       // button out, silence is indistinguishable from a failure.
-      await sendText(params.phone, ALREADY_ANSWERED).catch(() => {});
+      let recorded: string | undefined;
+      try {
+        const { approvalDb } = await import('./approvalDb');
+        recorded = (await approvalDb.getApproval(ref.assetUrl))?.status;
+      } catch {
+        // The generic wording is fine if the record cannot be read.
+      }
+      await sendText(params.phone, alreadyAnsweredReply(recorded)).catch(() => {});
       return;
     }
 

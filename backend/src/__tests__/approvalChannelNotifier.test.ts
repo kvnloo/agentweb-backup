@@ -28,7 +28,7 @@ jest.mock('../services/settingsService', () => ({
   },
 }));
 jest.mock('../services/approvalDb', () => ({
-  approvalDb: { updateApprovalStatus: jest.fn() },
+  approvalDb: { updateApprovalStatus: jest.fn(), getApproval: jest.fn() },
 }));
 jest.mock('../services/whatsappService', () => ({
   ...jest.requireActual('../services/whatsappService'),
@@ -341,7 +341,25 @@ describe('handleApprovalButtonTap', () => {
     await tap();
 
     expect(approvalDb.updateApprovalStatus).not.toHaveBeenCalled();
-    expect(whatsapp.sendText).toHaveBeenCalledWith(PHONE, expect.stringMatching(/already recorded/i));
+    expect(whatsapp.sendText).toHaveBeenCalledWith(PHONE, expect.stringMatching(/already answered/i));
+  });
+
+  it('tells a later tap on the OTHER button what was actually recorded', async () => {
+    // WhatsApp greys out only the tapped button. Reject stays live after an Approve, so
+    // the reply has to say the earlier answer stands.
+    (settingsService.claimSetMember as jest.Mock).mockResolvedValue(false);
+    (approvalDb.getApproval as jest.Mock).mockResolvedValue({ status: 'approved' });
+    await tap('reject');
+
+    expect(approvalDb.updateApprovalStatus).not.toHaveBeenCalled();
+    expect(whatsapp.sendText).toHaveBeenCalledWith(PHONE, expect.stringMatching(/already approved/i));
+  });
+
+  it('still answers a later tap when the record cannot be read', async () => {
+    (settingsService.claimSetMember as jest.Mock).mockResolvedValue(false);
+    (approvalDb.getApproval as jest.Mock).mockRejectedValue(new Error('dynamo down'));
+    await tap('reject');
+    expect(whatsapp.sendText).toHaveBeenCalledWith(PHONE, expect.stringMatching(/already answered/i));
   });
 
   it('claims BEFORE writing the verdict', async () => {
