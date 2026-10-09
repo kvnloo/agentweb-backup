@@ -1,4 +1,3 @@
-import { withClearedError } from "../utils/clearErrorOnClaim";
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 /**
  * Onboarding brand-build service.
@@ -36,6 +35,7 @@ import {
   logCompletionMetric,
 } from "./brandBuildStatusService";
 import { logStepMetric } from "./onboardingMetricsService";
+import { withClearedError } from "../utils/clearErrorOnClaim";
 import {
   BRAND_BUILD_PROMPT_SENTINEL,
   brandBuildOwnershipCondition,

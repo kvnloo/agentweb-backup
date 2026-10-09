@@ -1,4 +1,3 @@
-import { withClearedError } from "../utils/clearErrorOnClaim";
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 /**
  * Onboarding Epic Phase 2 — ICP discovery service.
@@ -31,6 +30,7 @@ import { getS3ObjectAsString } from "../utils/s3Utils";
 import { taskDb, userDb } from "./db";
 import { Storage } from "@google-cloud/storage";
 import { trackBackgroundRun } from "../utils/trackedBackgroundRun";
+import { withClearedError } from "../utils/clearErrorOnClaim";
 import {
   icpFailedPatch,
   icpReadyPatch,
@@ -696,9 +696,11 @@ export async function generateSingleIcpForUser(
  * all five personas and destroying any the user had edited (ENG-255).
  *
  * Assumes `icpStatus` is already `running` (the route flips it). Validates
- * before touching the DB so a bad index writes nothing. Persists with a
- * read-modify-write so a concurrent `/icp/edit-one` on a different persona is
- * not lost to the ~20s LLM round-trip.
+ * before touching the DB so a bad index writes nothing. The card is saved by
+ * replacing ONLY its own slot (conditioned on the slot still holding that
+ * card's id, retried from a fresh read if the list shifted), so concurrent
+ * regenerations of other cards, and edits to them, are not lost to the LLM
+ * round-trip.
  */
 export async function regenerateSingleIcpForUser(
   userId: string,
@@ -714,12 +716,13 @@ export async function regenerateSingleIcpForUser(
       ) => Promise<{ per_icp: unknown[] }>;
     };
     /**
-     * A full /icp/start run holds the axis claim and this regeneration joined
-     * it (the route reused its icpStartedAt). Save the card but leave the
-     * status to that run: the UI stops polling at the first terminal status,
-     * so flipping to `ready` here hid the full run's result until a reload.
+     * The route reused an in-flight claim (icpStartedAt) instead of minting one:
+     * either a full /icp/start run or ANOTHER card's regeneration, which look
+     * identical. Save this card but leave the status to that claim's owner. The
+     * UI stops polling at the first terminal status, so flipping to `ready` here
+     * hid a full run's result until a reload.
      */
-    deferStatusToFullRun?: boolean;
+    statusOwnedElsewhere?: boolean;
   } = {},
 ): Promise<void> {
   const user: any = await readUserForRegeneration(userId);
@@ -760,7 +763,6 @@ export async function regenerateSingleIcpForUser(
     let patch: ICPStatusFields | null = null;
     let wrote = false;
     let writtenAt = -1;
-    let deferred = false;
     for (let attempt = 0; attempt < MAX_CARD_WRITE_ATTEMPTS && !wrote; attempt++) {
       if (attempt > 0) current = (await readUserForRegeneration(userId)) ?? current;
       const currentList: ICPPersona[] = Array.isArray(current.icpResult)
@@ -785,9 +787,9 @@ export async function regenerateSingleIcpForUser(
           userId,
           icpId: target.id,
         });
-        // Joined a full run: the status is that run's to settle, and flipping it
+        // Joined another claim: its owner settles the status, and flipping it
         // here would make its completion (conditioned on `running`) fail.
-        if (deps.deferStatusToFullRun && current.icpStatus === "running") return;
+        if (deps.statusOwnedElsewhere && current.icpStatus === "running") return;
         // Status only: writing the list back too would be a whole-list write that
         // can erase a concurrent regeneration's slot.
         const { icpResult: _unchanged, ...goneStatus } = (icpReadyPatch(current, currentList) ?? {}) as Record<string, unknown>;
@@ -807,31 +809,30 @@ export async function regenerateSingleIcpForUser(
         : "attribute_exists(#icpResult[" + spliceAt + "])";
       const slotValues: Record<string, unknown> = target.id ? { ":icpCardId": target.id } : {};
 
-      const joinedFullRun = Boolean(deps.deferStatusToFullRun) && current.icpStatus === "running";
-      // Joined a full run: save the card only. It replaces every non-anchored
+      const joinedRun = Boolean(deps.statusOwnedElsewhere) && current.icpStatus === "running";
+      // Joined another claim: save the card only. A full run replaces every non-anchored
       // card when it lands and its cascade re-derives the mirror and competitors,
       // and the write is conditioned on that run still being in flight so a
       // newer full set is never overwritten by this one.
-      patch = joinedFullRun ? null : icpReadyPatch(current, currentList);
+      patch = joinedRun ? null : icpReadyPatch(current, currentList);
       const { icpResult: _wholeList, ...statusOnly } = (patch ?? {}) as Record<string, unknown>;
       try {
         await userDb.updateUser(userId, statusOnly as any, {
           elementSets: [{ path: ["icpResult"], index: spliceAt, value: card }],
           condition: {
-            expression: joinedFullRun
+            expression: joinedRun
               ? `#icpStatus = :icpDeferRunning AND #icpStartedAt = :icpDeferStartedAt AND ${slotIsOurs}`
               : slotIsOurs,
-            names: joinedFullRun
+            names: joinedRun
               ? { ...slot, "#icpStatus": "icpStatus", "#icpStartedAt": "icpStartedAt" }
               : slot,
-            values: joinedFullRun
+            values: joinedRun
               ? { ...slotValues, ":icpDeferRunning": "running", ":icpDeferStartedAt": current.icpStartedAt }
               : slotValues,
           },
         });
         wrote = true;
         writtenAt = spliceAt;
-        deferred = joinedFullRun;
       } catch (err: any) {
         if (err?.code !== "ConditionalCheckFailedException") throw err;
         // Either the slot moved, or the run we joined ended while this card was
@@ -847,8 +848,12 @@ export async function regenerateSingleIcpForUser(
     if (!wrote) {
       throw new Error("could not save the regenerated persona: the ICP list kept changing");
     }
-    if (deferred) return;
-
+    // Runs even when the status was left to another claim's owner. That owner may
+    // be a full run (whose cascade re-derives all of this, discarding our work via
+    // the persona-name condition below) but is often just ANOTHER card's
+    // regeneration, which refreshes only its own card: skipping here left this
+    // card's competitor entry describing its previous persona.
+    //
     // Use whichever icpCompletedAt this write actually landed under — the
     // patch's freshly-stamped one, or (when another regeneration already
     // owned the `ready` transition) the one already on the record.
@@ -860,8 +865,8 @@ export async function regenerateSingleIcpForUser(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const current = await userDb.getUserById(userId);
-    // Joined a full run: its terminal status is not ours to write.
-    if (!(deps.deferStatusToFullRun && (current as any)?.icpStatus === "running")) {
+    // Joined another claim: its terminal status is not ours to write.
+    if (!(deps.statusOwnedElsewhere && (current as any)?.icpStatus === "running")) {
       await userDb.updateUser(userId, icpFailedPatch((current as any) || {}, msg) as any);
     }
     console.error("[onboardingIcpService] single-persona regeneration failed", {

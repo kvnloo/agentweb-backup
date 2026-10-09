@@ -27,6 +27,7 @@ import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb } from "../services/db";
 import { viewAfterUnclaimedStart } from "../utils/startResponseView";
 import { withClearedError } from "../utils/clearErrorOnClaim";
+import { trackBackgroundRun } from "../utils/trackedBackgroundRun";
 import {
   ensurePersonaIds,
   ICPPersona,
@@ -855,31 +856,18 @@ router.post("/icp/regenerate-one", authenticateToken, async (req, res) => {
     // ~20s and the FE polls `/icp/status` rather than holding this request
     // open.
     //
-    // Deliberately UNCONDITIONAL, unlike /icp/start's claim (ENG-2308) — a
-    // review follow-up briefly guarded this write with the same global
-    // icpStatus ConditionExpression, which seemed like the same race but
-    // wasn't: icpStatus is a single per-user flag shared by every
-    // regenerate-one call, while the actual concurrency unit here is the
-    // PERSONA. ENG-255's whole premise is two different cards regenerating
-    // at once — the FE fires regenerate-one per card independently
-    // (`BrandReview.tsx`'s `regeneratingIds` is a Set, with a dedicated test
-    // "ENG-255: concurrent regenerations do not clear each other's
-    // spinners" that clicks two different cards back-to-back and expects
-    // both to actually be in flight) — and `regenerateSingleIcpForUser`'s
-    // completion path already explicitly tolerates this (re-reads the
-    // CURRENT list and splices by persona id, and persists even when
-    // `icpStatus` is no longer `running` because another card's
-    // regeneration already claimed the `ready` transition first). Guarding
-    // this write on the global flag would have silently dropped the second
-    // card's regeneration request — confirmed in review before it shipped,
-    // caught by exercising the actual two-cards-at-once path, not by the
-    // single-card tests this commit added. Closing the real remaining gap
-    // here (two rapid clicks on the SAME card) needs a per-persona claim,
-    // not a per-user one — left as a follow-up rather than rushed in, since
-    // the FE already disables a card's own regenerate control once it shows
-    // a spinner, which already covers the common case.
+    // Not guarded like /icp/start's claim (ENG-2308): icpStatus is one per-user
+    // flag shared by every regenerate-one call, while the real concurrency unit
+    // is the PERSONA, and two different cards regenerating at once is a tested,
+    // intended flow (ENG-255; BrandReview's `regeneratingIds` is a Set). A global
+    // guard would silently drop the second card's request.
     //
-    // If a full /icp/start run is already in flight, KEEP its icpStartedAt:
+    // What IS guarded is the join below: an in-flight claim is reused only while
+    // it is still the live one. Two rapid clicks on the SAME card still run twice
+    // (the FE disables a card's control once its spinner shows).
+    //
+    // If a claim (a full /icp/start run or another card's regeneration) is already
+    // in flight, KEEP its icpStartedAt:
     // that run's completion write is conditioned on it (ENG-2308), so stamping
     // a fresh one here would make its whole-set result get dropped.
     // Read it consistently: the indexed read can still show the pre-claim row
@@ -921,12 +909,17 @@ router.post("/icp/regenerate-one", authenticateToken, async (req, res) => {
     } else {
       await userDb.updateUser(userId, withClearedError(startWrite, "icpError"));
     }
-    void (joined
-      ? regenerateSingleIcpForUser(userId, idx, { deferStatusToFullRun: true })
-      : regenerateSingleIcpForUser(userId, idx)
-    ).catch((err: unknown) => {
-      console.error("[icp] regenerate-one failed", { userId, idx, err });
-    });
+    // Tracked so a deploy's graceful shutdown waits for it instead of killing the
+    // regeneration mid-flight and leaving the axis `running` until its timeout.
+    trackBackgroundRun(
+      "onboardingIcpRegenerate",
+      (joined
+        ? regenerateSingleIcpForUser(userId, idx, { statusOwnedElsewhere: true })
+        : regenerateSingleIcpForUser(userId, idx)
+      ).catch((err: unknown) => {
+        console.error("[icp] regenerate-one failed", { userId, idx, err });
+      }),
+    );
     // Return the running snapshot directly from the patch we just wrote.
     // Do NOT read back via getUserById — UserIdIndex is eventually
     // consistent and the stale GSI row (icpStatus='ready' + old
