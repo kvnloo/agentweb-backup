@@ -29,12 +29,9 @@
  *     there for `normalizeMetaCampaignIds` — so the existing
  *     `__testHooks.parseTimecodeToSeconds` access keeps working unchanged.
  *
- * `VIDEO_API_MODELS` (was `AgentModeService.VIDEO_API_MODELS`, a `static
- * readonly` class field, confirmed exclusive to `getVideoApiDefaultModel` by
- * whole-backend grep — the only other references are doc comments in
- * `migrateStaleModelReferences.ts`/its test explaining why that script
- * excludes this setting, not code) is moved here as a plain module-level
- * const.
+ * `VIDEO_API_MODELS` (was `AgentModeService.VIDEO_API_MODELS`) now lives in
+ * `services/videoModels.ts` as `VIDEO_MODELS`, shared with the video service so
+ * the allowed list and legacy-Veo aliasing cannot drift.
  *
  * `IMAGE_EXTENSIONS` is NOT moved — the original set is shared with an
  * out-of-scope call site elsewhere in `agentModeService.ts` (unrelated to
@@ -107,14 +104,13 @@ import path from 'path';
 import { Readable } from 'stream';
 import { getSecret } from '../../utils/secretsManager';
 import { meterUsageFromResponse } from '../../utils/llmClients';
+import { isSupportedVideoModel, normalizeVideoModel } from '../../services/videoModels';
 
 // Shared with an out-of-scope call site elsewhere in agentModeService.ts
 // (unrelated to this cluster) — duplicated here rather than exported/imported
 // back, per the F2 design draft §3.2 ("just strings/literals; inline them").
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
 
-// Supported video API models (was AgentModeService.VIDEO_API_MODELS).
-const VIDEO_API_MODELS = ['veo-3.1-generate-preview', 'veo-3-generate-preview', 'seedance-2.0'];
 
 /**
  * Normalize a video timecode to a numeric number of seconds.
@@ -160,15 +156,17 @@ export async function getVideoApiDefaultModel(): Promise<string | undefined> {
     const setting = await settingsService.getSetting('agent_mode_video_api_default_model');
     const configuredModel = setting?.settingValue?.trim();
     if (configuredModel) {
-      if (VIDEO_API_MODELS.includes(configuredModel)) {
-        return configuredModel;
+      // Retired Veo ids still stored in the setting resolve to gemini-omni-1.1-flash
+      // (read-time alias only — the stored value is never rewritten).
+      if (isSupportedVideoModel(configuredModel)) {
+        return normalizeVideoModel(configuredModel);
       }
       console.warn(`AgentMode: Unsupported video API default model "${configuredModel}" in settings; using hardcoded default.`);
     }
   } catch (error) {
     console.error('AgentMode: Error getting video API default model setting:', error);
   }
-  // Seedance 2.0 is the product default for all video generation (Veo is an
+  // Seedance 2.0 is the product default for all video generation (gemini-omni is an
   // automatic fallback inside the video service). Return it explicitly so the
   // model is never undefined in logs / cost estimation.
   return 'seedance-2.0';

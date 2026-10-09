@@ -446,6 +446,54 @@ describe('CRM Group Email Endpoints', () => {
       expect(response.skippedUnsubscribed).toBe(1);
     });
 
+    describe('ENG-2367 — RFC 8058 List-Unsubscribe headers', () => {
+      // clearMocks keeps implementations; don't leak the mailbox sender into later tests.
+      afterEach(() => {
+        (settingsService.getSetting as jest.Mock).mockReset();
+        mockGetEmailProvider.mockReset();
+      });
+      const leadsSetup = () => {
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+          items: [{ leadId: 'lead-9', email: 'a@test.com', firstName: 'A' }],
+          lastEvaluatedKey: undefined,
+        });
+        mockReq.body = { senderEmail: 'me@test.com', senderName: 'Me', subject: 'Hi', htmlContent: '<p>Hi</p>' };
+      };
+
+      it('Resend group send carries List-Unsubscribe + One-Click headers signed like the body link', async () => {
+        leadsSetup();
+        (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'msg-1' });
+        await findHandler('/lists/:listId/group-email/send', 'post')!(mockReq, mockRes);
+
+        const call = (resendService.sendEmail as jest.Mock).mock.calls[0][0];
+        expect(call.headers['List-Unsubscribe-Post']).toBe('List-Unsubscribe=One-Click');
+        const m = /^<(https:\/\/[^>]+)>$/.exec(call.headers['List-Unsubscribe']);
+        expect(m).not.toBeNull();
+        const headerUrl = new URL(m![1]);
+        expect(headerUrl.pathname).toBe('/api/crm/public/lists/list-1/leads/lead-9/group-email-unsubscribe');
+        const bodySig = /[?&]sig=([0-9a-f]+)/.exec(call.html)![1];
+        expect(headerUrl.searchParams.get('sig')).toBe(bodySig);
+        expect(headerUrl.searchParams.get('email')).toBe('a@test.com');
+      });
+
+      it('mailbox (Outlook/Gmail) group send passes the same headers to the provider', async () => {
+        leadsSetup();
+        (settingsService.getSetting as jest.Mock).mockResolvedValue({
+          settingValue: JSON.stringify({
+            senders: [{ id: 'g-1', email: 'me@test.com', senderType: 'gmail', connectedAccountId: 'acct-1' }],
+          }),
+        });
+        const sendEmail = jest.fn().mockResolvedValue({ messageId: 'g-1', threadId: '' });
+        mockGetEmailProvider.mockReturnValue({ sendEmail });
+        mockReq.body.senderId = 'g-1';
+        await findHandler('/lists/:listId/group-email/send', 'post')!(mockReq, mockRes);
+
+        expect(sendEmail).toHaveBeenCalledTimes(1);
+        expect(sendEmail.mock.calls[0][2].headers['List-Unsubscribe-Post']).toBe('List-Unsubscribe=One-Click');
+      });
+    });
+
     it('ENG-1194: skips malformed and provider-disallowed test-domain leads by default, never attempting them', async () => {
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
         listId: 'list-1',

@@ -191,3 +191,22 @@ describe('ENG-2163 F1 (final review): the admin user-prompt in a tainted turn is
     expect(JSON.stringify(out)).toContain('pull my leads');
   });
 });
+
+describe('ENG-112 omitBranchOrigin', () => {
+  const rows = () => [
+    { role: 'system', content: 'SYS', metadata: { timestamp: 't', systemPromptVersion: 'v1', branchOrigin: { sourceSessionId: 'src', sourceTitle: 'Secret title', sourceMessageIndex: 4, branchedAt: 'x' } } },
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: 'yo', metadata: { timestamp: 't' } },
+  ];
+  it('keeps branchOrigin by default (the owner view)', () => {
+    expect(filterMessagesForClient(rows())[0].metadata.branchOrigin.sourceSessionId).toBe('src');
+  });
+  it('drops ONLY the branchOrigin key for a non-owner viewer, without mutating the input', () => {
+    const input = rows();
+    const out = filterMessagesForClient(input, { omitBranchOrigin: true });
+    expect(out[0].metadata).toEqual({ timestamp: 't', systemPromptVersion: 'v1' });
+    expect(JSON.stringify(out)).not.toContain('Secret title');
+    expect(out).toHaveLength(3);
+    expect((input[0].metadata as any).branchOrigin.sourceSessionId).toBe('src');
+  });
+});
