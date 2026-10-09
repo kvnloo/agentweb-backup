@@ -751,7 +751,21 @@ export async function regenerateSingleIcpForUser(
     if (deps.deferStatusToFullRun && current.icpStatus === "running") {
       // The full run replaces every non-anchored card when it lands, and its
       // cascade re-derives the mirror and competitors, so only the card is saved.
-      await userDb.updateUser(userId, { icpResult: sanitizeICPPersonas(currentList) } as any);
+      // Conditioned on the run we joined still being in flight: if its result
+      // landed while this card was being read-modify-written, that newer full
+      // set must not be overwritten by the old list plus this card.
+      try {
+        await userDb.updateUser(userId, { icpResult: sanitizeICPPersonas(currentList) } as any, {
+          condition: {
+            expression: "#icpStatus = :icpDeferRunning AND #icpStartedAt = :icpDeferStartedAt",
+            names: { "#icpStatus": "icpStatus", "#icpStartedAt": "icpStartedAt" },
+            values: { ":icpDeferRunning": "running", ":icpDeferStartedAt": current.icpStartedAt },
+          },
+        });
+      } catch (err: any) {
+        if (err?.code !== "ConditionalCheckFailedException") throw err;
+        console.warn("[onboardingIcpService] full run landed first — dropping deferred card save", { userId });
+      }
       return;
     }
 
@@ -924,9 +938,15 @@ export async function triggerIcpDiscoveryForUser(
       // Stale completion is not an error — drop silently.
       return;
     }
+    // Landing over a `failed` status (a watchdog or a regenerate miss) must also
+    // clear that failure's message; `undefined` in the patch is skipped on write.
+    const writePatch =
+      stillOurClaim && currentRec.icpStatus !== "running"
+        ? withClearedError(patch, "icpError")
+        : patch;
     if (deps.expectedStartedAt) {
       try {
-        await userDb.updateUser(userId, patch as any, {
+        await userDb.updateUser(userId, writePatch as any, {
           condition: icpOwnershipCondition(deps.expectedStartedAt),
         });
       } catch (err: any) {

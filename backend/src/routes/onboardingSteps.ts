@@ -896,11 +896,32 @@ router.post("/icp/regenerate-one", authenticateToken, async (req, res) => {
       Date.now() - Date.parse(live.icpStartedAt) < ICP_TIMEOUT_MS
         ? live.icpStartedAt
         : undefined;
-    const startWrite = inFlightStartedAt
+    let joined = Boolean(inFlightStartedAt);
+    let startWrite = joined
       ? { ...icpStartPatch(), icpStartedAt: inFlightStartedAt }
       : icpStartPatch();
-    await userDb.updateUser(userId, withClearedError(startWrite, "icpError"));
-    void (inFlightStartedAt
+    if (joined) {
+      try {
+        // Only join if that run is STILL the live one: it may have finished in
+        // the moment since the read, and forcing `running` after that would leave
+        // nobody to flip the status back.
+        await userDb.updateUser(userId, withClearedError(startWrite, "icpError"), {
+          condition: {
+            expression: "#icpStatus = :icpJoinRunning AND #icpStartedAt = :icpJoinStartedAt",
+            names: { "#icpStatus": "icpStatus", "#icpStartedAt": "icpStartedAt" },
+            values: { ":icpJoinRunning": "running", ":icpJoinStartedAt": inFlightStartedAt },
+          },
+        });
+      } catch (err: any) {
+        if (err?.code !== "ConditionalCheckFailedException") throw err;
+        joined = false;
+        startWrite = icpStartPatch();
+        await userDb.updateUser(userId, withClearedError(startWrite, "icpError"));
+      }
+    } else {
+      await userDb.updateUser(userId, withClearedError(startWrite, "icpError"));
+    }
+    void (joined
       ? regenerateSingleIcpForUser(userId, idx, { deferStatusToFullRun: true })
       : regenerateSingleIcpForUser(userId, idx)
     ).catch((err: unknown) => {
