@@ -90,7 +90,11 @@ async function forwardToTeam(phone: string, text: string, messageType: string): 
   const { emailService } = await import('./emailService');
   await emailService.sendEmail(
     inbox,
-    `WhatsApp message from ${phone}`,
+    // Masked in the SUBJECT, full in the body. Subjects are logged by the mail layer
+    // (the non-prod guard prints every suppressed one), and a customer's phone number
+    // must not reach application logs (CWE-532). The team still gets the full number
+    // where they need it — inside the message.
+    `WhatsApp message from ${redactPhone(phone)}`,
     `From: ${phone}\nAccount: ${account}\n\n${body}`,
     `<p><strong>From:</strong> ${escapeHtml(phone)}<br><strong>Account:</strong> ${escapeHtml(account)}</p>` +
       `<blockquote>${escapeHtml(body).replace(/\n/g, '<br>')}</blockquote>`,

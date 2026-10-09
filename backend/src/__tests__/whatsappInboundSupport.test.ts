@@ -129,7 +129,11 @@ describe('forwarding to the team', () => {
 
     const [to, subject, textBody] = emailService.sendEmail.mock.calls[0];
     expect(to).toBe('support@example.com');
-    expect(subject).toContain(PHONE);
+    // The subject is logged by the mail layer, so it carries only the last four digits.
+    expect(subject).not.toContain('918005326946');
+    expect(subject).toContain('6946');
+    // The body is where the team gets the full number to reply to.
+    expect(textBody).toContain(PHONE);
     expect(textBody).toContain('My campaign is stuck');
     expect(textBody).toContain('cust@example.com');
   });
