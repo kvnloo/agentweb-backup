@@ -23,8 +23,11 @@ function truthy(v: unknown): boolean {
 export function parseWithImagesQuery(query: Record<string, unknown>): WithImagesQuery | { error: string } | null {
   const favorites = truthy(query.favorites);
   const approved = truthy(query.approved);
-  const hasLimit = query.limit !== undefined && query.limit !== '';
-  const hasCursor = query.cursor !== undefined && query.cursor !== '';
+  const hasLimit = query.limit !== undefined;
+  const hasCursor = query.cursor !== undefined;
+  const blank = (v: unknown): boolean => typeof v !== 'string' || v.trim() === '';
+  if (hasLimit && blank(query.limit)) return { error: 'limit must be a positive integer' };
+  if (hasCursor && blank(query.cursor)) return { error: 'cursor must be a non-negative integer' };
   if (!favorites && !approved && !hasLimit && !hasCursor) return null;
 
   let limit: number | undefined;

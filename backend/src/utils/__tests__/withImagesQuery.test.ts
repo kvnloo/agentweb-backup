@@ -25,6 +25,11 @@ describe('parseWithImagesQuery (ENG-2386)', () => {
 });
 
 describe('applyWithImagesQuery (ENG-2386)', () => {
+  it('rejects empty, whitespace-only, or repeated limit/cursor', () => {
+    for (const q of [{ limit: '' }, { limit: '  ' }, { cursor: '' }, { cursor: ' ' }, { limit: ['1', '2'] }]) {
+      expect(parseWithImagesQuery(q)).toHaveProperty('error');
+    }
+  });
   it('favorites keeps only favorited files and drops empty tasks', () => {
     const r = applyWithImagesQuery(result, { favorites: true, approved: false, cursor: 0 });
     expect(Object.keys(r.tasks)).toEqual(['c', 'a']);
