@@ -42,6 +42,12 @@ export interface CrmFreshnessFinding {
   claimed?: number;
   /** The claim is within 0.5% (min 1) of a number the tool results do back: arithmetic drift, not a stale or invented total. */
   drift?: true;
+  /**
+   * The claimed number equals a CRM number an EARLIER turn of this session really returned (persisted crmEvidence) and this turn's tools
+   * do not back it: the reply restated an old value. Absent = no earlier evidence matched (which includes sessions saved before
+   * evidence was persisted), not "not stale".
+   */
+  echoesEarlier?: true;
 }
 
 export interface CrmFreshnessResult {
@@ -242,6 +248,24 @@ export function serializeCrmEvidence(evidence: CrmEvidence | undefined): Persist
   }
 }
 
+const MAX_SESSION_NUMBERS = 2000;
+
+/** Every CRM number the EARLIER turns of this session really returned (numbers only, from persisted per-message evidence). */
+export function crmNumbersFromSessionHistory(history: unknown): Set<number> {
+  const out = new Set<number>();
+  try {
+    if (!Array.isArray(history)) return out;
+    const msgs = history.length > MAX_HISTORY_SCANNED ? history.slice(-MAX_HISTORY_SCANNED) : history;
+    for (const m of msgs) {
+      if (!isRecord(m) || m.role !== 'assistant' || !isRecord(m.metadata)) continue;
+      const ev = validPersistedEvidence(m.metadata.crmEvidence);
+      if (!ev) continue;
+      for (const n of ev.numbers) if (out.size < MAX_SESSION_NUMBERS) out.add(n);
+    }
+  } catch { /* best effort: no earlier numbers just means echoesEarlier stays unset */ }
+  return out;
+}
+
 /** Numbers backed by this turn, or null when a CRM tool succeeded but there is nothing to check its numbers against. */
 function allowedNumbers(calls: any[], succeeded: Set<string>, evidence?: CrmEvidence): Set<number> | null {
   for (const call of calls) {
@@ -322,13 +346,13 @@ const HEDGE = '(?:(?:about|around|roughly|approximately|approx\\.?|nearly|almost
 // ("No one lists the prices"), not a count.
 interface InventoryPattern { re: RegExp; needsCrmContext: boolean; pluralOnly: boolean; /** also reads as a per-category row in a breakdown: skipped inside parentheses or after a row label */ subsetProne?: boolean; /** 'Some Qualifier Lead Lists: N' is a category row when a qualifier word precedes the label */ rowLabelProne?: boolean }
 const INVENTORY_PATTERNS: InventoryPattern[] = [
-  { pluralOnly: true, needsCrmContext: false, subsetProne: true, re: new RegExp(`\\b${NUM}\\s+(?:total\\s+)?(?:lead\\s+)?lists\\b`, 'gi') },
+  { pluralOnly: true, needsCrmContext: false, subsetProne: true, re: new RegExp(`\\b${NUM}\\s+(?:total\\s+)?(?:(?:lead|crm)\\s+)?lists\\b`, 'gi') },
   { pluralOnly: false, needsCrmContext: true, re: new RegExp(`\\b(?:total|overall)\\s+(?:number\\s+of\\s+)?(?:lead\\s+)?(?:leads|lists|contacts)(?:\\s+across\\s+all\\s+(?:your\\s+)?(?:lead\\s+)?lists)?[ \\t:*\\-\u2013\u2014]{0,12}${NUM}\\b(?![.)]\\s)`, 'gi') },
   { pluralOnly: true, needsCrmContext: true, re: new RegExp(`\\b${NUM}\\s+(?:total\\s+)?leads\\s+(?:in\\s+total|total|in\\s+your\\s+(?:entire\\s+|whole\\s+)?crm)\\b`, 'gi') },
   { pluralOnly: false, needsCrmContext: false, rowLabelProne: true, re: new RegExp(`\\b(?:total |overall )?(?:number of )?lead lists[ \\t:*\\-\u2013\u2014]{1,12}${NUM}\\b(?![.)]\\s)`, 'gi') },
   { pluralOnly: true, needsCrmContext: false, subsetProne: true, re: new RegExp(`\\b${NUM}\\s+leads\\s+(?:across|in)\\s+(?:${NUM}\\s+(?:\\w+\\s+)?lists|your\\s+(?:entire\\s+|whole\\s+)?crm)`, 'gi') },
   // "Your CRM currently has / contains / holds about 1.2k leads"
-  { pluralOnly: true, needsCrmContext: false, re: new RegExp(`\\b(?:crm|account|database|pipeline)\\b(?:\\s+(?:currently|now|account|database|data|total|overall|also|still|right\\s+now|as\\s+a\\s+whole))*\\s+(?:has|have|contains?|holds?|includes?|stands at|totals?|is at|comes? to)\\s+${HEDGE}${NUM}\\s+(?:total\\s+)?(?:leads|contacts|records|lists)\\b`, 'gi') },
+  { pluralOnly: true, needsCrmContext: false, re: new RegExp(`\\b(?:crm|account|database|pipeline)\\b(?:\\s+(?:currently|now|account|database|data|total|overall|also|still|right\\s+now|as\\s+a\\s+whole))*\\s+(?:size\\s+(?:is|remains?|stays?|stands at)|has|have|contains?|holds?|includes?|stands at|totals?|is at|comes? to)\\s+${HEDGE}${NUM}\\s+(?:total\\s+)?(?:leads|contacts|records|lists)\\b`, 'gi') },
   // "a total of 4,999 leads", "with a total of twelve lead lists"
   { pluralOnly: true, needsCrmContext: true, re: new RegExp(`\\btotal\\s+of\\s+${HEDGE}${NUM}\\s+(?:lead\\s+)?(?:leads|contacts|records|lists)\\b`, 'gi') },
   // "You have 47 leads." (a bare statement, not "5 leads named Test" / "3 leads needing follow-up")
@@ -583,6 +607,8 @@ export function detectCrmFreshnessMismatch(
   evidence?: CrmEvidence,
   /** What the earlier invocations of the task this one continues returned (see crmEvidenceFromEarlierInvocations). */
   earlierInput?: EarlierInvocationEvidence | readonly string[],
+  /** CRM numbers earlier turns of the session returned (see crmNumbersFromSessionHistory); used only to mark `echoesEarlier`. */
+  sessionNumbers?: ReadonlySet<number>,
 ): CrmFreshnessResult {
   const empty: CrmFreshnessResult = { findings: [], crmToolsSucceeded: [], tagsSeen: 0 };
   if (typeof finalText !== 'string' || !finalText) return empty;
@@ -625,7 +651,11 @@ export function detectCrmFreshnessMismatch(
         if (backed(allowed, lo, hi) || seen.has(mid)) continue;
         if (ALREADY_LABELLED.test(sentenceAround(text, at)) || ALREADY_LABELLED.test(leadInLine(text, at))) continue;
         seen.add(mid);
-        findings.push({ kind: 'inventory_total_not_in_tool_results', cited: [], claimed: mid, ...(nearBacked(allowed, mid) ? { drift: true as const } : {}) });
+        findings.push({
+          kind: 'inventory_total_not_in_tool_results', cited: [], claimed: mid,
+          ...(nearBacked(allowed, mid) ? { drift: true as const } : {}),
+          ...(sessionNumbers && sessionNumbers.size > 0 && backed(sessionNumbers, lo, hi) ? { echoesEarlier: true as const } : {}),
+        });
       }
     }
   }
@@ -638,6 +668,8 @@ export interface CrmFreshnessShadowInput {
   evidence?: CrmEvidence;
   /** What the earlier invocations of the task this one continues returned (or just their tool names). */
   earlier?: EarlierInvocationEvidence | readonly string[];
+  /** CRM numbers earlier turns of this session returned; marks findings that restate one (`echoesEarlier`). */
+  sessionNumbers?: ReadonlySet<number>;
   sessionId?: string;
   model?: string;
   log?: (message: string, detail: Record<string, unknown>) => void;
@@ -650,7 +682,7 @@ export interface CrmFreshnessShadowInput {
 export function runCrmFreshnessShadow(input: CrmFreshnessShadowInput): CrmFreshnessFinding[] {
   try {
     if (process.env.AGENT_CRM_FRESHNESS_GUARD === 'off') return [];
-    const result = detectCrmFreshnessMismatch(input.finalText, input.toolCalls, input.evidence, input.earlier);
+    const result = detectCrmFreshnessMismatch(input.finalText, input.toolCalls, input.evidence, input.earlier, input.sessionNumbers);
     if (result.findings.length === 0) return [];
     // One line of JSON, so a plain grep / log search / the summarizer script can read it (console.warn(obj)
     // spreads a multi-line dump that log shippers split apart).
@@ -667,6 +699,7 @@ export function runCrmFreshnessShadow(input: CrmFreshnessShadowInput): CrmFreshn
       claimed: [...new Set(result.findings.map((f) => f.claimed).filter((n): n is number => typeof n === 'number'))].slice(0, 10),
       cited: [...new Set(result.findings.flatMap((f) => f.cited))].slice(0, 10),
       drift: result.findings.filter((f) => f.drift).length,
+      echoesEarlier: result.findings.filter((f) => f.echoesEarlier).length,
     });
     return result.findings;
   } catch {

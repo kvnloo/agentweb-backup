@@ -25,13 +25,14 @@ export function summarize(records) {
   const sessions = new Set();
   for (const r of records) {
     const model = r.model || 'unknown';
-    const m = (byModel[model] ||= { lines: 0, sessions: new Set(), kinds: {}, claimedNumbers: {}, citedTools: {}, drift: 0 });
+    const m = (byModel[model] ||= { lines: 0, sessions: new Set(), kinds: {}, claimedNumbers: {}, citedTools: {}, drift: 0, echoes: 0, echoLines: 0 });
     m.lines++;
     if (r.sessionId) { m.sessions.add(r.sessionId); sessions.add(r.sessionId); }
     for (const k of r.kinds || []) m.kinds[k] = (m.kinds[k] || 0) + 1;
     for (const n of r.claimed || []) m.claimedNumbers[n] = (m.claimedNumbers[n] || 0) + 1;
     for (const t of r.cited || []) m.citedTools[t] = (m.citedTools[t] || 0) + 1;
     m.drift += Number(r.drift) || 0;
+    if (Number(r.echoesEarlier) > 0) { m.echoes += Number(r.echoesEarlier); m.echoLines++; }
   }
   return { totalLines: records.length, distinctSessions: sessions.size, byModel };
 }
@@ -45,6 +46,7 @@ export function format(summary, skipped = 0) {
     const top = (o) => Object.entries(o).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => `${k} x${v}`).join(', ');
     if (Object.keys(m.claimedNumbers).length) out.push(`  most-claimed unbacked numbers: ${top(m.claimedNumbers)}`);
     if (m.drift) out.push(`  arithmetic drift (claim within 0.5% of a number the tool really returned): ${m.drift}`);
+    if (m.echoLines) out.push(`  restated a number an EARLIER turn of the session returned (stale-looking): ${m.echoLines} of ${m.lines} line(s); the rest are unbacked but match no earlier value (or the session predates persisted evidence)`);
     if (Object.keys(m.citedTools).length) out.push(`  tools cited by unbacked tags: ${top(m.citedTools)}`);
   }
   if (models.length === 0) out.push('(no [crm-freshness-shadow] lines found)');
