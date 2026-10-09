@@ -34,6 +34,8 @@ jest.mock('../services/whatsappService', () => ({
   ...jest.requireActual('../services/whatsappService'),
   resolveUserIdByPhone: jest.fn(),
   sendText: jest.fn(),
+  sendInteractiveButtons: jest.fn(),
+  isServiceWindowOpen: jest.fn(),
 }));
 
 const {
@@ -82,6 +84,8 @@ describe('notifyApprovalOnWhatsApp', () => {
     (userDb.getUserById as jest.Mock).mockResolvedValue(USER);
     (resolveDestination as jest.Mock).mockResolvedValue('+918005326946');
     (settingsService.setSetting as jest.Mock).mockResolvedValue(undefined);
+    // Window shut by default, so these cases exercise the template path.
+    (whatsapp.isServiceWindowOpen as jest.Mock).mockResolvedValue(false);
     jest.spyOn(console, 'warn').mockImplementation(() => {});
   });
 
@@ -208,6 +212,7 @@ describe('correlating an inbound button tap back to the approval', () => {
     (userDb.getUserById as jest.Mock).mockResolvedValue(USER);
     (resolveDestination as jest.Mock).mockResolvedValue('+918005326946');
     (settingsService.setSetting as jest.Mock).mockResolvedValue(undefined);
+    (whatsapp.isServiceWindowOpen as jest.Mock).mockResolvedValue(false);
     jest.spyOn(console, 'warn').mockImplementation(() => {});
   });
 
@@ -386,5 +391,55 @@ describe('handleApprovalButtonTap', () => {
     await tap();
     const logged = (console.warn as jest.Mock).mock.calls.flat().join(' ');
     expect(logged).not.toContain('918005326946');
+  });
+});
+
+describe('choosing the message shape by window state', () => {
+  let send: jest.Mock;
+
+  beforeEach(() => {
+    jest.resetAllMocks();
+    send = jest.fn().mockResolvedValue({ messageId: 'wamid.T' });
+    (bootstrapMessagingChannels as jest.Mock).mockResolvedValue(undefined);
+    (getMessagingChannel as jest.Mock).mockReturnValue({ sendMessage: send });
+    (userDb.getUserById as jest.Mock).mockResolvedValue(USER);
+    (resolveDestination as jest.Mock).mockResolvedValue('+918005326946');
+    (settingsService.setSetting as jest.Mock).mockResolvedValue(undefined);
+    (whatsapp.sendInteractiveButtons as jest.Mock).mockResolvedValue({ messageId: 'wamid.I' });
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  it('sends real Approve/Reject buttons when the window is open', async () => {
+    // Interactive messages are service messages — no template, no Meta review.
+    (whatsapp.isServiceWindowOpen as jest.Mock).mockResolvedValue(true);
+    await notifyApprovalOnWhatsApp(params);
+
+    expect(send).not.toHaveBeenCalled();
+    const [dest, body, buttons] = (whatsapp.sendInteractiveButtons as jest.Mock).mock.calls[0];
+    expect(dest).toBe('+918005326946');
+    expect(body).toContain('q4-launch-hero.png');
+    expect(buttons).toEqual([
+      { id: 'approve', title: 'Approve' },
+      { id: 'reject', title: 'Reject' },
+    ]);
+  });
+
+  it('falls back to the template when the window is shut', async () => {
+    // Outside the window a template is the only thing Meta will deliver at all.
+    (whatsapp.isServiceWindowOpen as jest.Mock).mockResolvedValue(false);
+    await notifyApprovalOnWhatsApp(params);
+
+    expect(whatsapp.sendInteractiveButtons).not.toHaveBeenCalled();
+    expect(send.mock.calls[0][0].template.name).toBe(TEMPLATES.APPROVAL_REQUEST.name);
+  });
+
+  it('records the message id from the interactive send too', async () => {
+    // Without this the buttons it just sent would be untappable — nothing would link
+    // the tap back to the asset.
+    (whatsapp.isServiceWindowOpen as jest.Mock).mockResolvedValue(true);
+    await notifyApprovalOnWhatsApp(params);
+
+    const [key] = (settingsService.setSetting as jest.Mock).mock.calls[0];
+    expect(key).toBe('whatsapp:approval-msg:wamid.I');
   });
 });

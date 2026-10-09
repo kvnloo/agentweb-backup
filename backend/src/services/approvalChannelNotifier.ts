@@ -19,7 +19,14 @@ import {
   normalizeUserChannels,
   resolveDestination,
 } from './messagingChannelService';
-import { TEMPLATES, resolveUserIdByPhone, redactPhone, sendText } from './whatsappService';
+import {
+  TEMPLATES,
+  isServiceWindowOpen,
+  redactPhone,
+  resolveUserIdByPhone,
+  sendInteractiveButtons,
+  sendText,
+} from './whatsappService';
 import { settingsService } from './settingsService';
 
 export interface ApprovalChannelNotification {
@@ -79,23 +86,38 @@ export async function notifyApprovalOnWhatsApp(
 
     const assetType = params.assetType || 'Asset';
     const filename = params.filename || 'Untitled';
+    const summary = `${assetType} "${filename}" is waiting for your approval. ${params.assetUrl}`;
 
-    const sent = await getMessagingChannel('whatsapp').sendMessage({
-      destination,
-      // Used when the 24-hour window happens to be open; outside it Meta requires the
-      // template below, which carries the same three facts.
-      text: `${assetType} "${filename}" is waiting for your approval. ${params.assetUrl}`,
-      template: {
-        name: TEMPLATES.APPROVAL_REQUEST.name,
-        variables: [assetType, filename, params.assetUrl],
-      },
-    } as any);
+    // Two shapes, chosen by the window, because Meta allows very different things
+    // either side of it.
+    //
+    // INSIDE: real Approve/Reject buttons. Interactive messages are service messages,
+    // so they need no pre-approved template — which also means this path is testable
+    // the moment a customer has written to us, with no Meta review in the loop.
+    //
+    // OUTSIDE: only a template can be delivered at all, so the reviewer gets the text
+    // and a link and answers in Slack or the portal. Putting quick-reply buttons on the
+    // template would work, but Meta returns a template button's own LABEL rather than
+    // an id, and more than three buttons (or mixing button types) breaks WhatsApp
+    // Desktop — so that variant is worth its own change, not a silent upgrade here.
+    const sent = (await isServiceWindowOpen(destination))
+      ? await sendInteractiveButtons(destination, summary, [
+          { id: 'approve', title: 'Approve' },
+          { id: 'reject', title: 'Reject' },
+        ])
+      : await getMessagingChannel('whatsapp').sendMessage({
+          destination,
+          text: summary,
+          template: {
+            name: TEMPLATES.APPROVAL_REQUEST.name,
+            variables: [assetType, filename, params.assetUrl],
+          },
+        } as any);
 
-    // Keep the provider's message id. When this message grows Approve/Reject buttons,
-    // the tap arrives carrying `context.id` — the id of the message the button was on —
-    // and NOTHING else that identifies the approval: Meta sets `button.payload` to the
-    // button's own label, so a decision id cannot be smuggled through the button.
-    // This row is therefore the only link from a tap back to what was being approved.
+    // Keep the provider's message id. A tap arrives carrying `context.id` — the id of
+    // the message the button was on — and NOTHING else that identifies the approval:
+    // Meta sets `button.payload` to the button's own label, so a decision id cannot be
+    // smuggled through the button. This row is the only link back to what was approved.
     if (sent?.messageId) {
       await rememberApprovalMessage(sent.messageId, {
         assetUrl: params.assetUrl,
