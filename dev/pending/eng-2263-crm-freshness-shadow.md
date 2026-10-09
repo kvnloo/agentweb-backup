@@ -20,10 +20,19 @@ It never edits the reply. Always on, try/catch-wrapped, kill switch `AGENT_CRM_F
 {0,300}, input capped at 200KB, <=200 tags, <=20 claims, linear tag stripper): unbounded `[^\]]*`/`[^>]*` were quadratic (100KB of
 unclosed `[verified ` blocked the event loop 1.5s, 500KB 37s).
 
-Replay of saved outputs (simulated CRM tool results, real prompt): tag check alone catches ~51% of stale unlabelled totals from weak
-models; with the total check, 39/39 on the set the patterns were tuned on and 36/36 on a fresh held-out batch (untuned). Default model:
-0 false alarms on stale-free replies except one stale-derived count. Every flagged reply I inspected involved a stale or stale-derived
-number; one reply that deliberately compared "was 18 / 47" against fresh counts was a genuine false alarm.
+Replay of the ~270 saved A/B replies with the harness's simulated tool results supplied as evidence (the earlier snapshot was 18 lists / 47
+leads; the fresh one 17 / 43): 110 of 129 failing replies flagged (85%). The 19 misses are 9 honest "down from 18/47 earlier" comparisons
+(the model re-queried; the harness labels them failures), 9 that label themselves "earlier"/"previous turn" (skipped by design) and 1 hedged
+reply - none is an unlabelled stale restatement. This is IN-SAMPLE: the wordings were tuned on this corpus, so it is an upper bound, not a
+forecast for production traffic. 6 of 82 correct replies were flagged: 3 short "searched 4 of your 17 lists" subset phrasings and 3
+gpt-4o-mini mis-added totals (44/45/46 for a real 43 - correct flags, wrong numbers, not "stale").
+
+`echoesEarlier`: a flag only means "not backed this turn", and a correct breakdown subtotal looks like a stale grand total. Each flagged claim
+is also compared with the CRM numbers earlier turns of the SAME session persisted (`metadata.crmEvidence`, numbers only, bounded to 120
+messages / 2000 numbers). Equal to one of them and unbacked now means the reply restated an old value; the log line carries an
+`echoesEarlier` count and the summarizer reports those lines separately. Nothing is suppressed. Absence means UNKNOWN (a session saved before
+evidence was persisted, or a number outside the 64 kept per message), not "not stale". On the replay all 104 number-flagged failing replies
+carry the mark and none of the 82 correct ones do.
 
 Reading it: one JSON line per flagged reply, `[crm-freshness-shadow] ... {"sessionId","model","kinds","findingCount","tagsSeen",
 "crmToolsSucceeded","claimed":[numbers],"cited":[tool names]}`. It carries NO reply text - only numbers and tool names (an earlier
