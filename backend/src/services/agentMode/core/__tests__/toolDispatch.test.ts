@@ -105,6 +105,54 @@ function makeInput(
 }
 
 describe('executePreparedTools', () => {
+  // ENG-2263: the ledger stores a MINIMISED result, so number checks need the full one.
+  describe('observeFullToolResult (ENG-2263)', () => {
+    const full = { success: true, lists: [{ leadCount: 5 }, { leadCount: 12 }], totalLists: 17 };
+
+    it('hands the observer the FULL result while the ledger keeps the minimised one', async () => {
+      const seen: Array<[string, any]> = [];
+      const ports = makePorts({
+        executePreparedAgentTool: async () => full,
+        extractMinimalToolResult: () => ({}),
+        observeFullToolResult: (name: string, r: any) => { seen.push([name, r]); },
+      } as any);
+      const input = makeInput([toolCall('c1', 'get_lead_lists', '{}')], ports);
+      await executePreparedTools(input);
+      expect(seen).toEqual([['get_lead_lists', full]]);
+      expect(input.toolCallsLedger[0].result).toEqual({});
+    });
+
+    it('a throwing observer cannot break the turn or lose the ledger entry', async () => {
+      const ports = makePorts({
+        executePreparedAgentTool: async () => full,
+        observeFullToolResult: () => { throw new Error('observer exploded'); },
+      } as any);
+      const input = makeInput([toolCall('c1', 'get_lead_lists', '{}')], ports);
+      await expect(executePreparedTools(input)).resolves.toBeDefined();
+      expect(input.toolCallsLedger).toHaveLength(1);
+      expect(input.toolCallsLedger[0].name).toBe('get_lead_lists');
+      expect(input.toolCallsLedger[0].error).toBeUndefined();
+    });
+
+    it('works when no observer is wired (every other caller)', async () => {
+      const ports = makePorts({ executePreparedAgentTool: async () => full } as any);
+      const input = makeInput([toolCall('c1', 'get_lead_lists', '{}')], ports);
+      await executePreparedTools(input);
+      expect(input.toolCallsLedger).toHaveLength(1);
+    });
+
+    it('does not observe a call that was refused', async () => {
+      const seen: string[] = [];
+      const ports = makePorts({
+        executePreparedAgentTool: async () => full,
+        observeFullToolResult: (name: string) => { seen.push(name); },
+      } as any);
+      const input = makeInput([toolCall('c1', 'send_email', '{}')], ports, { loopBreakerActive: true });
+      await executePreparedTools(input);
+      expect(seen).toEqual([]);
+    });
+  });
+
   // ENG-1337: the loop-breaker is a hard execution-layer deny, not just prose.
   describe('while loopBreakerActive', () => {
     const run = async (name: string, active = true) => {

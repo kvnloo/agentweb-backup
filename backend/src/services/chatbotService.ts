@@ -132,6 +132,7 @@ export interface ChatMessage {
     kind?: string;                      // Stable marker for system messages (e.g. 'image-generated')
     imageFilename?: string;             // Filename when kind === 'image-generated'
     imageUrl?: string;                  // ENG-510: image URL on the immediate marker so a completed image survives a whole-turn-cap kill
+    crmEvidence?: { tools: string[]; numbers: number[]; truncated?: true }; // ENG-2263: numbers (never text) this turn's CRM tools returned, so a continuation can check its totals
     citations?: Citation[];             // ENG-351: de-duplicated web sources this message consulted (ChatGPT-style Sources UI)
     // ENG-112: provenance of a branched chat. Stamped ONLY on row 0 (the stored system prompt, which
     // is never sent to the model) of a session created by "Branch from here". Free-form metadata, not a
