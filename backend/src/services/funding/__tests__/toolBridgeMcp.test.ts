@@ -12,9 +12,6 @@ import { ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/typ
 import { ToolBridge, type BridgeExecuteOutcome, type BridgeTool, type ToolBridgeDeps } from '../toolBridge';
 import { ToolBridgeMcpAdapter, HARNESS_TOOL_USE_ID_META_KEY } from '../toolBridgeMcp';
 
-// The route module builds its default export from the process-wide bridge, which pulls
-// in agentModeService. Only the router factory and the local-only check are under test.
-jest.mock('../toolBridgeService', () => ({ toolBridgeMcp: {} }));
 import { createToolBridgeRouter, isLocalOnlyRequest } from '../../../routes/toolBridge';
 
 const RUN = { runId: 'run-1', userId: 'user-1', sessionId: 'session-1' };

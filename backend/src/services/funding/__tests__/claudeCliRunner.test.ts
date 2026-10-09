@@ -6,14 +6,16 @@ jest.mock('fs', () => ({
   ...jest.requireActual('fs'),
   mkdtempSync: jest.fn((prefix: string) => `${prefix}fake`),
   rmSync: jest.fn(),
+  writeFileSync: jest.fn(),
 }));
 
 import { spawn as mockSpawnFn } from 'child_process';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { ClaudeCliRunner } from '../claudeCliRunner';
 
 const mockSpawn = mockSpawnFn as jest.Mock;
 const mockRmSync = rmSync as jest.Mock;
+const mockWriteFileSync = writeFileSync as jest.Mock;
 
 interface FakeChild extends EventEmitter {
   stdout: Readable;
@@ -527,6 +529,91 @@ describe('ClaudeCliRunner', () => {
     await flush();
 
     const turn = runner.send(handle, 'hi');
+    emitResult(child, { type: 'result', is_error: false, result: 'ok' });
+    await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
+  });
+
+  // ─── MCP server: the tool bridge (ENG-2109) ─────────────────────────────────
+
+  const MCP = {
+    name: 'emma',
+    url: 'http://127.0.0.1:8080/internal/tool-bridge/run-1/mcp',
+    bearerToken: 'run-token-secret',
+  };
+
+  it('gives the session its MCP server through a 0600 config file, never on the command line', async () => {
+    const runner = trackedRunner();
+    await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP });
+
+    const [, args] = mockSpawn.mock.calls[0];
+    const flagIndex = args.indexOf('--mcp-config');
+    expect(flagIndex).toBeGreaterThan(-1);
+    const file = args[flagIndex + 1];
+    expect(file).toMatch(/claude-cli-home-.*mcp\.json$/);
+    expect(args.join(' ')).not.toContain('run-token-secret');
+    expect(args).toContain('--strict-mcp-config');
+
+    expect(mockWriteFileSync).toHaveBeenCalledWith(file, expect.any(String), { mode: 0o600 });
+    expect(JSON.parse(mockWriteFileSync.mock.calls[0][1])).toEqual({
+      mcpServers: { emma: { type: 'http', url: MCP.url, headers: { Authorization: 'Bearer run-token-secret' } } },
+    });
+  });
+
+  it('passes no MCP config when the session has no MCP server', async () => {
+    const runner = trackedRunner();
+    await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+
+    expect(mockSpawn.mock.calls[0][1]).not.toContain('--mcp-config');
+    expect(mockWriteFileSync).not.toHaveBeenCalled();
+  });
+
+  it('fails the turn and closes the session when the MCP server did not connect', async () => {
+    const runner = trackedRunner();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP });
+    const child = spawnedChildren[0];
+
+    const turn = runner.send(handle, 'hi');
+    child.stdout.push(
+      JSON.stringify({ type: 'system', subtype: 'init', apiKeySource: 'none', mcp_servers: [{ name: 'emma', status: 'failed' }] }) + '\n',
+    );
+    await expect(turn).rejects.toThrow(/MCP server "emma" is not connected \(failed\)/);
+    expect(child.kill).toHaveBeenCalled();
+    expect(runner.activeProcessCount).toBe(0);
+  });
+
+  it('fails the turn when the init event does not list the MCP server at all', async () => {
+    const runner = trackedRunner();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP });
+    const child = spawnedChildren[0];
+
+    const turn = runner.send(handle, 'hi');
+    child.stdout.push(JSON.stringify({ type: 'system', subtype: 'init', apiKeySource: 'none', mcp_servers: [] }) + '\n');
+    await expect(turn).rejects.toThrow(/not connected \(missing\)/);
+  });
+
+  it('lets the turn proceed and reports the status when the MCP server is connected', async () => {
+    const runner = trackedRunner();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP });
+    const child = spawnedChildren[0];
+
+    const turn = runner.send(handle, 'hi');
+    child.stdout.push(
+      JSON.stringify({ type: 'system', subtype: 'init', apiKeySource: 'none', mcp_servers: [{ name: 'emma', status: 'connected' }] }) + '\n',
+    );
+    await flush();
+    expect(runner.mcpServerStatusFor(handle)).toBe('connected');
+    emitResult(child, { type: 'result', is_error: false, result: 'ok' });
+    await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
+  });
+
+  it('does not check MCP status for a session that was given no MCP server', async () => {
+    const runner = trackedRunner();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    const child = spawnedChildren[0];
+
+    const turn = runner.send(handle, 'hi');
+    child.stdout.push(JSON.stringify({ type: 'system', subtype: 'init', apiKeySource: 'none', mcp_servers: [] }) + '\n');
+    await flush();
     emitResult(child, { type: 'result', is_error: false, result: 'ok' });
     await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
   });
