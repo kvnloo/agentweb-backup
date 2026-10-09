@@ -15,7 +15,7 @@ import { leadListAlertService } from '../services/leadListAlertService';
 import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, checkEmailFormat, injectColorSchemeMeta } from '../utils/emailVariables';
 import axios from 'axios';
 import { assertPublicHostname, SsrfBlockedError } from '../utils/ssrfGuard';
-import { signUnsubscribeUrl } from '../utils/unsubscribeUrl';
+import { signUnsubscribeUrl, signOneClickUnsubscribeUrl, listUnsubscribeHeaders } from '../utils/unsubscribeUrl';
 import multer from 'multer';
 import { parse } from 'csv-parse/sync';
 import AdmZip from 'adm-zip';
@@ -7086,6 +7086,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     }
 
     const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
+    const BACKEND_PUBLIC_URL = process.env.BACKEND_URL || 'https://api.agentweb.pro';
 
     let sent = 0;
     let failed = 0;
@@ -7123,12 +7124,20 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
           email: lead.email,
         });
         personalizedHtml = injectUnsubscribeUrl(personalizedHtml, unsubscribeUrl, unsubscribeFooterHtml);
+        // ENG-2367: RFC 8058 one-click header, same signature, backend POST target.
+        const oneClickUrl = signOneClickUnsubscribeUrl({
+          baseUrl: BACKEND_PUBLIC_URL,
+          listId,
+          leadId: lead.leadId,
+          email: lead.email,
+        });
 
         await sendAsSender(userId, sender, {
           to: lead.email,
           subject: personalizedSubject,
           html: personalizedHtml,
           text: personalizedText,
+          headers: listUnsubscribeHeaders(oneClickUrl),
         });
         sent++;
       } catch (err: any) {
