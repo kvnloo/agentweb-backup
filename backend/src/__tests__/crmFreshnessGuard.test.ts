@@ -1,6 +1,6 @@
 import {
   createCrmEvidenceCollector, crmEvidenceFromEarlierInvocations, crmToolsFromEarlierInvocations, detectCrmFreshnessMismatch,
-  looksLikeContinueRequest, runCrmFreshnessShadow, serializeCrmEvidence,
+  crmNumbersFromSessionHistory, looksLikeContinueRequest, runCrmFreshnessShadow, serializeCrmEvidence,
 } from '../utils/crmFreshnessGuard';
 
 const ok = (name: string, result: any = { success: true }) => ({ id: name, name, arguments: {}, result });
@@ -837,7 +837,7 @@ describe('runCrmFreshnessShadow (ENG-2263)', () => {
       expect(json.kinds).toEqual(expect.arrayContaining(['cited_tool_not_run', 'inventory_total_not_in_tool_results']));
       expect(json.claimed).toEqual(expect.arrayContaining([18, 47]));
       expect(json.cited).toEqual(['get_lead_lists']);
-      expect(Object.keys(json).sort()).toEqual(['cited', 'claimed', 'continuation', 'crmToolsSucceeded', 'drift', 'findingCount', 'kinds', 'model', 'sessionId', 'tagsSeen']);
+      expect(Object.keys(json).sort()).toEqual(['cited', 'claimed', 'continuation', 'crmToolsSucceeded', 'drift', 'echoesEarlier', 'findingCount', 'kinds', 'model', 'sessionId', 'tagsSeen']);
       for (const secret of ['Jane', 'Doe', 'jane.doe', 'acme', '98,500', 'deal value', 'lead lists and']) expect(line).not.toContain(secret);
     } finally { warn.mockRestore(); }
   });
@@ -960,4 +960,68 @@ describe('per-category breakdown rows are not account totals (ENG-2263, seen liv
     'Your CRM currently holds 15,490 leads.',
     'The CRM database now contains 15,490 leads.',
   ])('%p is still a total claim', (t) => { expect(flagged(t)).toContain('inventory_total_not_in_tool_results'); });
+});
+
+describe('echoesEarlier: a flagged number an earlier turn of the session really returned (ENG-2263)', () => {
+  const calls = [ok('get_lead_lists')];
+  const fresh = () => {
+    const c = createCrmEvidenceCollector();
+    c.record('get_lead_lists', { success: true, totalLists: 17, lists: Array.from({ length: 17 }, (_, i) => ({ listId: 'l' + i, leadCount: i === 0 ? 26 : 1 })) });
+    return c.snapshot();
+  };
+  const asst = (numbers: number[], extra: any = {}) => ({ role: 'assistant', content: 'x', metadata: { crmEvidence: { tools: ['get_lead_lists'], numbers }, ...extra } });
+  const earlierTurn = [{ role: 'user', content: 'how many?' }, asst([18, 47]), { role: 'user', content: 'and now?' }];
+
+  it('collects numbers from persisted assistant evidence only', () => {
+    const h = [...earlierTurn, { role: 'user', content: 'u', metadata: { crmEvidence: { tools: ['get_lead_lists'], numbers: [999] } } }, asst([200])];
+    expect([...crmNumbersFromSessionHistory(h)].sort((a, b) => a - b)).toEqual([18, 47, 200]);
+  });
+
+  it.each([undefined, null, 'x', 5, {}, [null, 1, 'a', { role: 'assistant' }, { role: 'assistant', metadata: 5 }, { role: 'assistant', metadata: { crmEvidence: { numbers: 'no', tools: [] } } }]])(
+    'survives hostile history %p', (h) => { expect(() => crmNumbersFromSessionHistory(h)).not.toThrow(); expect(crmNumbersFromSessionHistory(h).size).toBe(0); });
+
+  it('bounds how many numbers it keeps', () => {
+    const h = Array.from({ length: 120 }, (_, i) => asst(Array.from({ length: 64 }, (_, j) => i * 100 + j + 1)));
+    expect(crmNumbersFromSessionHistory(h).size).toBeLessThanOrEqual(2000);
+  });
+
+  it('marks a restated earlier total (18 lists / 47 leads) that this turn does not back', () => {
+    const r = detectCrmFreshnessMismatch('You have 18 lead lists and 47 leads in total.', calls, fresh(), undefined, crmNumbersFromSessionHistory(earlierTurn));
+    expect(r.findings.map((f) => [f.claimed, f.echoesEarlier])).toEqual([[18, true], [47, true]]);
+  });
+
+  it('does not mark a number no earlier turn returned (invented, or a subtotal)', () => {
+    const r = detectCrmFreshnessMismatch('You have 52 lead lists.', calls, fresh(), undefined, crmNumbersFromSessionHistory(earlierTurn));
+    expect(r.findings).toHaveLength(1);
+    expect(r.findings[0].echoesEarlier).toBeUndefined();
+  });
+
+  it('marks nothing when there is no earlier evidence (older session): absence means unknown, not not-stale', () => {
+    expect(detectCrmFreshnessMismatch('You have 18 lead lists.', calls, fresh()).findings[0].echoesEarlier).toBeUndefined();
+    expect(detectCrmFreshnessMismatch('You have 18 lead lists.', calls, fresh(), undefined, new Set()).findings[0].echoesEarlier).toBeUndefined();
+  });
+
+  it('a number this turn backs is not flagged at all, echo or not', () => {
+    expect(detectCrmFreshnessMismatch('You have 17 lead lists.', calls, fresh(), undefined, new Set([17])).findings).toEqual([]);
+  });
+
+  it('matches a rounded claim ("1.2k") against an earlier exact value inside its range', () => {
+    const r = detectCrmFreshnessMismatch('Your CRM has about 1.2k leads in total.', calls, fresh(), undefined, new Set([1180]));
+    expect(r.findings[0]?.echoesEarlier).toBe(true);
+  });
+
+  it('the log line carries the echo count and still only numbers', () => {
+    const logs: any[] = [];
+    runCrmFreshnessShadow({ finalText: 'You have 18 lead lists and 52 leads in total.', toolCalls: calls, evidence: fresh(), sessionNumbers: new Set([18, 47]), log: (_m, d) => logs.push(d) });
+    expect(logs[0]).toMatchObject({ echoesEarlier: 1, claimed: [18, 52] });
+  });
+
+  it.each(['Across all 18 CRM lists, there are 5 leads whose first name contains "Test".', 'Your total CRM size remains 47 leads.', 'The CRM size is 47 leads.'])(
+    '%p is read as a total claim', (t) => {
+      expect(detectCrmFreshnessMismatch(t, calls, fresh()).findings.length).toBeGreaterThan(0);
+    });
+
+  it.each(['Across all 17 CRM lists, there are 5 leads.', 'The CRM size is 42 leads.'])('%p is backed and not flagged', (t) => {
+    expect(detectCrmFreshnessMismatch(t, calls, fresh()).findings).toEqual([]);
+  });
 });

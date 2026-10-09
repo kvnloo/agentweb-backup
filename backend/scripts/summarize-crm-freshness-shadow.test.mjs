@@ -43,3 +43,16 @@ test('counts arithmetic-drift findings per model and says so in the output', () 
 test('says so when there is nothing', () => {
   assert.match(format(summarize([]), 0), /no \[crm-freshness-shadow\] lines found/);
 });
+
+test('splits stale-looking lines (restate an earlier turn\'s number) from merely unbacked ones, and says what absence means', () => {
+  const text = [
+    line({ sessionId: 's1', model: 'm1', kinds: ['inventory_total_not_in_tool_results'], claimed: [18, 47], cited: [], drift: 0, echoesEarlier: 2 }),
+    line({ sessionId: 's2', model: 'm1', kinds: ['inventory_total_not_in_tool_results'], claimed: [76], cited: [], drift: 0, echoesEarlier: 0 }),
+    line({ sessionId: 's3', model: 'm1', kinds: ['cited_tool_not_run'], claimed: [], cited: ['get_lead_lists'] }), // older line, no echo key
+  ].join('\n');
+  const s = summarize(parseLines(text).records);
+  assert.equal(s.byModel.m1.echoLines, 1);
+  assert.equal(s.byModel.m1.echoes, 2);
+  assert.match(format(s, 0), /EARLIER turn.*: 1 of 3 line\(s\).*predates persisted evidence/);
+  assert.doesNotMatch(format(summarize(parseLines(line({ sessionId: 'x', model: 'm2', kinds: [], claimed: [1], cited: [] })).records), 0), /EARLIER turn/);
+});
