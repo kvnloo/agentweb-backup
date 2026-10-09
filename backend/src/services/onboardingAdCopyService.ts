@@ -25,6 +25,7 @@
  * prompt contains "Brick 10" + the 125-character hook rule.
  */
 
+import { withClearedError } from "../utils/clearErrorOnClaim";
 import { LLMService } from "../utils/llmService";
 import type { LLMUsageContext } from "../utils/llmService";
 import { reportUIError } from "../utils/errorReporter";
@@ -546,7 +547,7 @@ export async function claimAdCopyRun(
 ): Promise<AdCopyStatusFields | null> {
   const patch = adCopyStartPatch();
   try {
-    await userDb.updateUser(userId, patch as any, {
+    await userDb.updateUser(userId, withClearedError(patch, "adCopyError") as any, {
       condition: adCopyStartClaimCondition(),
     });
   } catch (err: any) {
