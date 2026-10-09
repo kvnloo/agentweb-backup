@@ -204,6 +204,43 @@ describe("concurrent regenerate-one", () => {
   });
 });
 
+describe("competitor entry follows the latest persona of its card", () => {
+  beforeEach(() => seed());
+
+  it("a card regenerated twice ends with the entry for its second persona", async () => {
+    for (const label of ["first", "second"]) {
+      const { release, llmFor } = gatedLlm({ a: fresh(label) });
+      const run = regenerateSingleIcpForUser("u1", 2, deps(llmFor("a")));
+      setTimeout(release, 5);
+      await run;
+    }
+    expect(names()[2]).toBe("Regenerated second");
+    expect(table().row.competitorResult.per_icp[2].icp_id).toBe("Regenerated second");
+  });
+
+  it("drops a refresh whose card was regenerated again in the meantime, leaving the entry untouched", async () => {
+    // While the first regeneration's competitor entry is being written, the card
+    // is regenerated again: its persona name no longer matches what the entry
+    // was generated for.
+    table().beforeUpdate = (params, t) => {
+      if (Object.values(params.ExpressionAttributeNames ?? {}).includes("competitorResult")) {
+        const list = [...t.row.icpResult];
+        list[2] = { ...list[2], name: "Regenerated again" };
+        t.row = { ...t.row, icpResult: list };
+        t.beforeUpdate = undefined;
+      }
+    };
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const { release, llmFor } = gatedLlm({ a: fresh("first") });
+    const run = regenerateSingleIcpForUser("u1", 2, deps(llmFor("a")));
+    setTimeout(release, 5);
+    await run;
+    warn.mockRestore();
+
+    expect(table().row.competitorResult.per_icp[2].icp_id).toBe("Original 2");
+  });
+});
+
 describe("regenerate-one that joined a full /icp/start run", () => {
   it("saves only its card and leaves the status to the full run", async () => {
     seed();

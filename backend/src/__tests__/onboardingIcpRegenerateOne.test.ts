@@ -575,9 +575,12 @@ describe("regenerateSingleIcpForUser — competitor entry follows the persona", 
     expect(opts.elementSets).toHaveLength(1);
     expect(opts.elementSets[0]).toMatchObject({ path: ["competitorResult", "per_icp"], index: 2 });
     expect(opts.elementSets[0].value.icp_id).toBe(REGENERATED.name);
-    // ...and only if that slot still holds the entry generated for this card.
-    expect(opts.condition.expression).toBe("#competitorResult.#perIcp[2].#icpId = :slotIcpId");
-    expect(opts.condition.values).toEqual({ ":slotIcpId": FIVE[2].name });
+    // ...and only while the card in that slot is still the persona it was
+    // generated for (keyed on the persona, not on the entry being replaced).
+    expect(opts.condition.expression).toBe(
+      "attribute_exists(#competitorResult.#perIcp[2]) AND #icpResult[2].#personaName = :personaName",
+    );
+    expect(opts.condition.values).toEqual({ ":personaName": REGENERATED.name });
   });
 });
 
