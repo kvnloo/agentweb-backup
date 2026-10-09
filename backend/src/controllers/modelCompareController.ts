@@ -27,6 +27,7 @@ import {
   resolveEffectiveModelForUser,
   tryClaimSessionGeneration,
 } from './agentModeController';
+import { createCompareProviderPolicy } from '../services/agentMode/compareProviderPolicy';
 import {
   compareModels,
   CompareDeps,
@@ -56,6 +57,13 @@ async function isModelCompareEnabled(): Promise<boolean> {
     return true;
   }
 }
+
+/** ENG-55: one cache, one answer (60s, last-known on error, cold start => off). */
+const compareProviderPolicy = createCompareProviderPolicy({
+  getSetting: (name) => settingsService.getSetting(name),
+  now: () => Date.now(),
+  log: (message, fields) => console.error(message, fields),
+});
 
 const getSession = (sessionId: string, options?: { consistentRead?: boolean }): Promise<CompareSession | null> =>
   chatbotDb.getChatSession(sessionId, options?.consistentRead === true) as Promise<CompareSession | null>;
@@ -122,6 +130,7 @@ function compareDeps(): CompareDeps {
       const runFunding = await fundingFor(options.usageContext.userId);
       return withRunFunding(runFunding, () => agentModeService.callLLM(model, messages, options));
     },
+    getProviderPolicy: () => compareProviderPolicy.getPolicy(),
     getSecret: getJwtSecret,
     now: () => Date.now(),
     newId: newCompareId,
