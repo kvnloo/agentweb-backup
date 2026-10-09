@@ -895,20 +895,26 @@ async function regenerateCompetitorEntry(
     // Replace only this persona's entry. The LLM and web-search calls above
     // take long enough for another regeneration to finish meanwhile, and
     // writing back the whole `per_icp` read before them would erase its entry.
-    // `icp_id` is the persona name the slot was generated for, so a list that
-    // shifted under us (a delete) fails the condition instead of corrupting a
-    // neighbour's entry.
-    const slotIcpId = (existing[index] as { icp_id?: unknown } | undefined)?.icp_id;
+    //
+    // The entry is written only if the card in that slot is STILL the persona it
+    // was generated for. Comparing against the entry already stored (as an
+    // earlier version did) made two back-to-back regenerations of the same card
+    // both expect the same old entry, so whichever refresh landed second was
+    // skipped even when it was the newer one. Keyed on the persona instead, a
+    // refresh for a card that has since been regenerated again is dropped, and
+    // the newer regeneration's own refresh supplies the right entry.
     const slot = "#competitorResult.#perIcp[" + index + "]";
     await userDb.updateUser(userId, {} as any, {
       elementSets: [{ path: ["competitorResult", "per_icp"], index, value: entry }],
       condition: {
-        expression: typeof slotIcpId === "string" ? `${slot}.#icpId = :slotIcpId` : `attribute_exists(${slot})`,
-        names:
-          typeof slotIcpId === "string"
-            ? { "#competitorResult": "competitorResult", "#perIcp": "per_icp", "#icpId": "icp_id" }
-            : { "#competitorResult": "competitorResult", "#perIcp": "per_icp" },
-        values: typeof slotIcpId === "string" ? { ":slotIcpId": slotIcpId } : {},
+        expression: `attribute_exists(${slot}) AND #icpResult[${index}].#personaName = :personaName`,
+        names: {
+          "#competitorResult": "competitorResult",
+          "#perIcp": "per_icp",
+          "#icpResult": "icpResult",
+          "#personaName": "name",
+        },
+        values: { ":personaName": persona.name },
       },
     });
   } catch (err: any) {
