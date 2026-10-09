@@ -50,12 +50,12 @@ write between two calls), not a stale or invented total; the summarizer reports 
 Evidence on the preview, real pipeline (turn 1 really calls get_lead_lists, the account then really changes, turn 2 asks a follow-up that
 invites restating the old totals; ground truth read from the API, not from the detector):
 - `gemini-3.1-flash-lite` 10/10 and `gpt-4o-mini` 9/9 unlabelled stale answers flagged; `gemini-3.8-flash` (the default) 4/4 stale flagged.
-- Over 9 + 8 `gemini-3.8-flash` runs, 4 flags landed on replies that had re-queried and were correct: 3 were `drift` (off by one: the
-  account's test list reports `leadCount: -1`, and the three runs shared one account so each other's scratch lead moved the totals) and one
-  was a `[verified: get_lead_lists]` tag with no call, a true tag finding.
-- Caveats: n is small (8-10 per model); the three runs shared one account, which adds drift noise; recall is measured on the wordings the
-  patterns cover and real traffic will phrase it more widely, so treat it as an upper bound. Runs stopped short of the planned 12 because
-  turn-2 list reads intermittently returned nothing under load (the harness retries now) and RUNS was set to 9 for the default model.
+- Over 9 + 8 `gemini-3.8-flash` runs, 4 flags landed on replies not stale by my ground truth: 3 had re-queried (the log marks those `drift`,
+  off by about one: the account's test list reports `leadCount: -1`, and the three runs shared one account so each other's scratch lead moved
+  the totals) and one was a `[verified: get_lead_lists]` tag with no call that turn, which is a true tag finding.
+- Caveats: n is small (8-10 per model); the runs shared one account, which adds drift noise; recall is measured on the wordings the
+  patterns cover and real traffic will phrase it more widely, so treat it as an upper bound. Two earlier attempts crashed mid-run when the
+  turn-2 list read returned nothing (the harness now retries), so they stopped short of the planned count.
 
 Known limits: a total phrased outside the patterns is not seen; after a CRM write the check abstains; only count-like fields (count, total,
 totalLists, leadCount, ...) and array lengths back a number - not arbitrary numbers inside lead rows. A flag means "not backed this turn".
