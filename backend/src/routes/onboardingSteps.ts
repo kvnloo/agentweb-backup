@@ -900,7 +900,10 @@ router.post("/icp/regenerate-one", authenticateToken, async (req, res) => {
       ? { ...icpStartPatch(), icpStartedAt: inFlightStartedAt }
       : icpStartPatch();
     await userDb.updateUser(userId, withClearedError(startWrite, "icpError"));
-    void regenerateSingleIcpForUser(userId, idx).catch((err: unknown) => {
+    void (inFlightStartedAt
+      ? regenerateSingleIcpForUser(userId, idx, { deferStatusToFullRun: true })
+      : regenerateSingleIcpForUser(userId, idx)
+    ).catch((err: unknown) => {
       console.error("[icp] regenerate-one failed", { userId, idx, err });
     });
     // Return the running snapshot directly from the patch we just wrote.

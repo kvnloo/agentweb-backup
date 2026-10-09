@@ -679,6 +679,13 @@ export async function regenerateSingleIcpForUser(
         deps?: unknown,
       ) => Promise<{ per_icp: unknown[] }>;
     };
+    /**
+     * A full /icp/start run holds the axis claim and this regeneration joined
+     * it (the route reused its icpStartedAt). Save the card but leave the
+     * status to that run: the UI stops polling at the first terminal status,
+     * so flipping to `ready` here hid the full run's result until a reload.
+     */
+    deferStatusToFullRun?: boolean;
   } = {},
 ): Promise<void> {
   const user: any = await readUserForRegeneration(userId);
@@ -741,6 +748,13 @@ export async function regenerateSingleIcpForUser(
 
     currentList[spliceAt] = fresh;
 
+    if (deps.deferStatusToFullRun && current.icpStatus === "running") {
+      // The full run replaces every non-anchored card when it lands, and its
+      // cascade re-derives the mirror and competitors, so only the card is saved.
+      await userDb.updateUser(userId, { icpResult: sanitizeICPPersonas(currentList) } as any);
+      return;
+    }
+
     const patch = icpReadyPatch(current, currentList);
     if (patch) {
       await userDb.updateUser(userId, patch as any);
@@ -762,7 +776,10 @@ export async function regenerateSingleIcpForUser(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const current = await userDb.getUserById(userId);
-    await userDb.updateUser(userId, icpFailedPatch((current as any) || {}, msg) as any);
+    // Joined a full run: its terminal status is not ours to write.
+    if (!(deps.deferStatusToFullRun && (current as any)?.icpStatus === "running")) {
+      await userDb.updateUser(userId, icpFailedPatch((current as any) || {}, msg) as any);
+    }
     console.error("[onboardingIcpService] single-persona regeneration failed", {
       userId,
       index,
