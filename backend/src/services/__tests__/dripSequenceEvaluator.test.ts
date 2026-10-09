@@ -74,6 +74,12 @@ describe('nextSequenceAction (ENG-2368)', () => {
   });
 
   describe('AC4: idempotency', () => {
+    it('a send stamped after `now` (clock skew) still dedups its step', () => {
+      const now = T0 + 10;
+      const events: SequenceEvent[] = [{ type: 'sent', stepIndex: 0, at: now + 1 }];
+      expect(nextSequenceAction(def, enr, events, now)).toEqual({ type: 'wait', until: now + 1 + 24 * H });
+    });
+
     it('a recorded send for step N never yields send for N again', () => {
       const events: SequenceEvent[] = [
         { type: 'sent', stepIndex: 0, at: T0 },

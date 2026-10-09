@@ -41,8 +41,10 @@ export function nextSequenceAction(
   events: readonly SequenceEvent[],
   now: number,
 ): SequenceAction {
-  // Only events that have happened by `now` count; order of the input array is irrelevant.
-  const past = events.filter((e) => e.at <= now);
+  // Stop events count only once they have happened by `now`; a recorded send always
+  // dedups its step regardless of timestamp (clock skew must not cause a re-send).
+  // Order of the input array is irrelevant.
+  const past = events.filter((e) => e.type === 'sent' || e.at <= now);
 
   // AC2: the earliest stop event wins and takes precedence over any due send.
   let earliestStop: { reason: StopReason; at: number } | undefined;
