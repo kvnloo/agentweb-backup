@@ -944,6 +944,8 @@ describe('per-category breakdown rows are not account totals (ENG-2263, seen liv
     'Calendly Bookings: 23 leads across 2 lists (17 and 6)',
     '- Calendly Bookings: 23 leads across 2 lists',
     'Six lists account for 14,829 of your total contacts:',
+    '- Landing Page Lead Lists: 15+ dedicated capture lists',
+    '<strong>Local Ops CRM Sync</strong> holds 4,850 contacts from your offline sync.',
     '- Populated Lists (>=1 lead): 58 lists',
     '- Empty Lists (0 leads): 37 lists (mostly landing page stubs)',
     '12 lists together hold most of the volume.',
@@ -954,5 +956,8 @@ describe('per-category breakdown rows are not account totals (ENG-2263, seen liv
     'Summary: 15,490 leads across 97 lists',
     'You have 97 lead lists (15,490 leads in total).',
     'Your CRM has 15,490 leads across 97 lists.',
+    'Your total lead lists: 97 (15,490 leads in total)',
+    'Your CRM currently holds 15,490 leads.',
+    'The CRM database now contains 15,490 leads.',
   ])('%p is still a total claim', (t) => { expect(flagged(t)).toContain('inventory_total_not_in_tool_results'); });
 });
