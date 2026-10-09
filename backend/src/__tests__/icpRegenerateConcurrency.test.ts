@@ -241,6 +241,79 @@ describe("competitor entry follows the latest persona of its card", () => {
   });
 });
 
+describe("regenerate-one edge cases found in review", () => {
+  beforeEach(() => seed());
+
+  it("a failing mirror re-check does not turn a saved card into a failed run", async () => {
+    const err = jest.spyOn(console, "error").mockImplementation(() => {});
+    let reads = 0;
+    // Fail every read made AFTER the slot write has landed.
+    const { release, llmFor } = gatedLlm({ a: fresh("A") });
+    const svc = require("../services/onboardingIcpService");
+    const db = require("../services/db").userDb;
+    const realById = db.getUserById.bind(db);
+    const realConsistent = db.getUserByEmailConsistent?.bind(db);
+    let slotWritten = false;
+    table().beforeUpdate = (params) => {
+      if (writesIcpList(params)) slotWritten = true;
+    };
+    db.getUserById = async (id: string) => {
+      if (slotWritten && ++reads > 1) throw new Error("throttled");
+      return realById(id);
+    };
+    if (realConsistent) {
+      db.getUserByEmailConsistent = async (e: string) => {
+        if (slotWritten) throw new Error("throttled");
+        return realConsistent(e);
+      };
+    }
+    try {
+      const run = svc.regenerateSingleIcpForUser("u1", 1, deps(llmFor("a")));
+      setTimeout(release, 5);
+      await expect(run).resolves.toBeUndefined();
+    } finally {
+      db.getUserById = realById;
+      if (realConsistent) db.getUserByEmailConsistent = realConsistent;
+      err.mockRestore();
+    }
+    expect(names()[1]).toBe("Regenerated A");
+    expect(table().row.icpStatus).toBe("ready");
+  });
+
+  it("a card deleted mid-flight leaves the list untouched and only settles the status", async () => {
+    table().beforeUpdate = (params, t) => {
+      // First write attempt: the card is deleted just before it lands.
+      if (writesIcpList(params) && t.row.icpResult.some((p: any) => p.id === "icp_2")) {
+        t.row = { ...t.row, icpResult: t.row.icpResult.filter((p: any) => p.id !== "icp_2") };
+      }
+    };
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const { release, llmFor } = gatedLlm({ a: fresh("A") });
+    const run = regenerateSingleIcpForUser("u1", 2, deps(llmFor("a")));
+    setTimeout(release, 5);
+    await run;
+    warn.mockRestore();
+    expect(names()).toEqual(["Original 0", "Original 1", "Original 3", "Original 4"]);
+    expect(table().row.icpStatus).toBe("ready");
+  });
+
+  it("a card deleted while joined to a full run leaves the status to that run", async () => {
+    const { release, llmFor } = gatedLlm({ a: fresh("A") });
+    const run = regenerateSingleIcpForUser("u1", 2, { ...deps(llmFor("a")), deferStatusToFullRun: true });
+    // Deleted while the LLM call is in flight, i.e. before the regeneration re-reads.
+    setTimeout(() => {
+      table().row = { ...table().row, icpResult: table().row.icpResult.filter((p: any) => p.id !== "icp_2") };
+      release();
+    }, 5);
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    await run;
+    warn.mockRestore();
+    expect(names()).toEqual(["Original 0", "Original 1", "Original 3", "Original 4"]);
+    expect(table().row.icpStatus).toBe("running");
+    expect(table().row.icpStartedAt).toBe("2026-10-09T10:00:00.000Z");
+  });
+});
+
 describe("regenerate-one that joined a full /icp/start run", () => {
   it("saves only its card and leaves the status to the full run", async () => {
     seed();
