@@ -868,6 +868,27 @@ router.get("/users", async (req, res) => {
       }
     }
 
+    // ENG-273: which messaging platform each customer is on. Read from the same policy
+    // that enforces one-platform-per-customer, so this column can never disagree with
+    // what the rule allows. Computed from the full records (the compact list rows drop
+    // the channel fields), each organisation resolved once, and strictly best-effort:
+    // a failure here leaves the column empty rather than failing the whole user list.
+    try {
+      const { getPlatformSummary } = await import('../services/customerChannelPolicy');
+      const fullRecordById = new Map<string, any>(users.map((u: any) => [u.userId, u]));
+      const orgSlackCache = new Map<string, Promise<boolean>>();
+      await Promise.all(
+        sanitized.map(async (user: any) => {
+          const summary = await getPlatformSummary(fullRecordById.get(user.userId), orgSlackCache);
+          user.messagingPlatform = summary.platform;
+          user.messagingPlatformSource = summary.source;
+          user.whatsappNumberMasked = summary.whatsappNumberMasked;
+        }),
+      );
+    } catch (error) {
+      console.error('[admin/users] messaging platform lookup failed; leaving it unset:', error);
+    }
+
     // Fetch only replay settings for these users in bounded BatchGet chunks.
     // Preserve the old per-setting best-effort behavior.
     const replaySettings = await settingsService.getSettings(

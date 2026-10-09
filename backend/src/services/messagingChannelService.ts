@@ -274,6 +274,13 @@ const VERIFIED_OPT_IN_CHANNELS: ReadonlySet<MessagingChannel> = new Set(['whatsa
  * Returns null rather than throwing. Every caller is a notification path where a
  * missing destination must degrade to the email baseline, never take down the send.
  */
+/** True once this account has a WhatsApp number it has proven it controls. */
+export function hasVerifiedWhatsApp(user: ChannelUser | null | undefined): boolean {
+  return normalizeUserChannels(user).some(
+    (c) => c.channel === 'whatsapp' && c.enabled && !!c.optIn?.verifiedAt,
+  );
+}
+
 export async function resolveDestination(
   user: (ChannelUser & Record<string, unknown>) | null | undefined,
   channel: MessagingChannel,
@@ -292,6 +299,15 @@ export async function resolveDestination(
     // Org fallback is Slack-only: an org-wide Slack channel is a shared room, whereas a
     // phone number belongs to one person and must never be inherited from the org.
     if (channel !== 'slack' || !user?.orgId) return null;
+
+    // One platform per customer (ENG-273). A member who personally verified a WhatsApp
+    // number does not ALSO inherit their organisation's Slack channel. Connecting a
+    // second platform is refused up front wherever it can be, but an organisation can
+    // gain a Slack channel — or a WhatsApp user can join one — after the fact, through
+    // three different routes. Deciding it here means none of them can ever produce a
+    // double delivery: the choice the person made themselves wins over the default
+    // they would have inherited.
+    if (hasVerifiedWhatsApp(user)) return null;
 
     const { userDb, orgDb } = await import('./db');
     const org = await orgDb.getOrgById(user.orgId);

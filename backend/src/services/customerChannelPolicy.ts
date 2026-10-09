@@ -14,7 +14,11 @@
  *
  * Fails toward refusing a second connection, not toward allowing it.
  */
-import { normalizeUserChannels, resolveDestination } from './messagingChannelService';
+import {
+  hasVerifiedWhatsApp,
+  normalizeUserChannels,
+  resolveDestination,
+} from './messagingChannelService';
 
 export type CustomerPlatform = 'slack' | 'whatsapp';
 
@@ -34,30 +38,96 @@ export class PlatformConflictError extends Error {
   }
 }
 
+/** How the customer came to be on their platform — shown to admins. */
+export type PlatformSource = 'account' | 'organisation' | 'slack_connect';
+
+export interface PlatformSummary {
+  platform: CustomerPlatform | null;
+  source: PlatformSource | null;
+  /** WhatsApp number with all but the last four digits masked. Never the full number. */
+  whatsappNumberMasked: string | null;
+}
+
+const NONE: PlatformSummary = { platform: null, source: null, whatsappNumberMasked: null };
+
 /** A WhatsApp number counts only once the customer has proven they control it. */
 export function hasWhatsApp(user: any): boolean {
-  return normalizeUserChannels(user).some(
-    (c) => c.channel === 'whatsapp' && c.enabled && !!c.optIn?.verifiedAt,
-  );
+  return hasVerifiedWhatsApp(user);
+}
+
+function maskNumber(phone: string): string {
+  const digits = phone.replace(/\D/g, '');
+  return digits.length <= 4 ? '****' : `${'*'.repeat(digits.length - 4)}${digits.slice(-4)}`;
 }
 
 /**
- * Slack counts in every form it takes: an assigned or linked channel, an org's shared
- * channel the account inherits, or a Slack Connect channel provisioned at onboarding
- * (stored separately and not used for sending, but it IS the customer being on Slack).
+ * The single answer to "which platform is this customer on, and why".
+ *
+ * Enforcement (assertCanConnect) and display (the admin list, the customer's Settings)
+ * both read this, so what a screen shows can never disagree with what the rule allows.
+ * Derived from the connection records every time rather than stored as its own field:
+ * a stored "platform" would be a second copy of the truth, free to drift the first time
+ * a channel was assigned or removed by a path that forgot to update it.
+ *
+ * `orgSlackCache` lets a caller listing many accounts resolve each organisation once.
  */
+export async function getPlatformSummary(
+  user: any,
+  orgSlackCache?: Map<string, Promise<boolean>>,
+): Promise<PlatformSummary> {
+  if (!user) return NONE;
+
+  const whatsapp = normalizeUserChannels(user).find(
+    (c) => c.channel === 'whatsapp' && c.enabled && !!c.optIn?.verifiedAt,
+  );
+  if (whatsapp) {
+    return {
+      platform: 'whatsapp',
+      source: 'account',
+      whatsappNumberMasked: maskNumber(whatsapp.destination),
+    };
+  }
+
+  if (normalizeUserChannels(user).some((c) => c.channel === 'slack' && c.enabled)) {
+    return { platform: 'slack', source: 'account', whatsappNumberMasked: null };
+  }
+  if (user.slackConnectChannelId && user.slackConnectStatus === 'created') {
+    return { platform: 'slack', source: 'slack_connect', whatsappNumberMasked: null };
+  }
+
+  if (user.orgId) {
+    // Ask the real resolver, with only the org on the record, whether membership alone
+    // yields a Slack channel — the same code path a send would take.
+    let inherited = orgSlackCache?.get(user.orgId);
+    if (!inherited) {
+      inherited = resolveDestination({ orgId: user.orgId }, 'slack').then((d) => !!d);
+      orgSlackCache?.set(user.orgId, inherited);
+    }
+    if (await inherited) {
+      return { platform: 'slack', source: 'organisation', whatsappNumberMasked: null };
+    }
+  }
+  return NONE;
+}
+
+/** Slack in any form: assigned or linked, inherited from the org, or Slack Connect. */
 export async function hasSlack(user: any): Promise<boolean> {
   if (!user) return false;
-  if (user.slackConnectChannelId && user.slackConnectStatus === 'created') return true;
-  return !!(await resolveDestination(user, 'slack'));
+  // Judged as if the WhatsApp entry were absent: this is asked precisely when deciding
+  // whether WhatsApp may be connected, and a number already on the record must not hide
+  // the Slack connection it would conflict with.
+  const withoutWhatsApp = {
+    ...user,
+    messagingChannels: (Array.isArray(user.messagingChannels) ? user.messagingChannels : []).filter(
+      (c: any) => c?.channel !== 'whatsapp',
+    ),
+  };
+  return (await getPlatformSummary(withoutWhatsApp)).platform === 'slack';
 }
 
 /** The platform this customer is on, or null if they have not connected either. */
 export async function getConnectedPlatform(user: any): Promise<CustomerPlatform | null> {
-  if (!user) return null;
-  if (hasWhatsApp(user)) return 'whatsapp';
-  if (await hasSlack(user)) return 'slack';
-  return null;
+  return (await getPlatformSummary(user)).platform;
 }
 
 /**

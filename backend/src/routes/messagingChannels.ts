@@ -26,7 +26,11 @@ import { explicitChannels, normalizeUserChannels } from '../services/messagingCh
 import { getDisplayPhoneNumber, isOptedOut } from '../services/whatsappService';
 import { getVerificationStatus, startVerification } from '../services/whatsappVerificationService';
 import { unbindPhone } from '../services/whatsappService';
-import { assertCanConnect, PlatformConflictError } from '../services/customerChannelPolicy';
+import {
+  assertCanConnect,
+  getPlatformSummary,
+  PlatformConflictError,
+} from '../services/customerChannelPolicy';
 
 const router = express.Router();
 
@@ -48,7 +52,16 @@ router.get('/', authenticateToken, async (req: any, res: any) => {
           : {}),
       })),
     );
-    res.json({ success: true, channels: enriched });
+    // Which single platform this account is on (ENG-273), from the same policy that
+    // refuses a second one — so the portal can explain up front why WhatsApp is not
+    // offered to a Slack customer instead of letting them hit the refusal.
+    const summary = await getPlatformSummary(user);
+    res.json({
+      success: true,
+      channels: enriched,
+      platform: summary.platform,
+      platformSource: summary.source,
+    });
   } catch (error: any) {
     console.error('[messaging-channels] list failed:', error);
     res.status(500).json({ error: 'Failed to load messaging channels' });

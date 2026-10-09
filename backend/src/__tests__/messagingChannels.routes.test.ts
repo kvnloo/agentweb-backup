@@ -118,6 +118,33 @@ describe('there is no way to save a typed-in number', () => {
   });
 });
 
+describe('GET / — which platform the account is on', () => {
+  it('reports Slack for a Slack customer', async () => {
+    userDb.getUserById.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
+    const res = await request(app).get('/api/messaging-channels');
+    expect(res.body.platform).toBe('slack');
+    expect(res.body.platformSource).toBe('account');
+  });
+
+  it('reports WhatsApp for a customer with a verified number', async () => {
+    isOptedOut.mockResolvedValue(false);
+    userDb.getUserById.mockResolvedValue({
+      userId: 'u1',
+      messagingChannels: [
+        { channel: 'whatsapp', destination: '+14155550123', enabled: true, optIn: { verifiedAt: 'y' } },
+      ],
+    });
+    const res = await request(app).get('/api/messaging-channels');
+    expect(res.body.platform).toBe('whatsapp');
+  });
+
+  it('reports no platform for an account that has connected neither', async () => {
+    userDb.getUserById.mockResolvedValue({ userId: 'u1' });
+    const res = await request(app).get('/api/messaging-channels');
+    expect(res.body.platform).toBeNull();
+  });
+});
+
 describe('POST /whatsapp/verification', () => {
   beforeEach(() => {
     getDisplayPhoneNumber.mockResolvedValue('14155550100');
