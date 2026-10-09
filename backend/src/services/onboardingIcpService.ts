@@ -834,12 +834,13 @@ export async function regenerateSingleIcpForUser(
         deferred = joinedFullRun;
       } catch (err: any) {
         if (err?.code !== "ConditionalCheckFailedException") throw err;
-        if (joinedFullRun) {
-          // The run we joined finished (or was replaced) while this card was
-          // being written; its set stands, ours is dropped.
-          console.warn("[onboardingIcpService] full run landed first — dropping deferred card save", { userId });
-          return;
-        }
+        // Either the slot moved, or the run we joined ended while this card was
+        // being written. Do NOT drop the card in the second case: the "run" may
+        // have been another card's regeneration (its claim looks identical to a
+        // full run's), and that one finishing first says nothing about this card.
+        // Re-read and re-decide: if a full run replaced the list this card's id is
+        // gone and the next pass settles as "no longer exists"; otherwise the card
+        // is written on the normal path.
         // Slot moved or changed under us: loop to re-read and re-resolve.
       }
     }
