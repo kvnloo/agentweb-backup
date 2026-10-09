@@ -3,7 +3,7 @@
  * argument parser is strict (a typo must not start live judge calls) and the report is
  * aggregates only.
  */
-import { parseArgs, replaySession, summarizeReplay, type JudgedSession } from '../scripts/evalOutcomeJudge';
+import { loadPromptFile, parseArgs, replaySession, summarizeReplay, type JudgedSession } from '../scripts/evalOutcomeJudge';
 import type { ChatSession } from '../services/chatbotService';
 import { DEFAULT_OUTCOME_JUDGE_MODEL } from '../services/outcomeJudge';
 
@@ -18,6 +18,16 @@ describe('evalOutcomeJudge parseArgs', () => {
       model: DEFAULT_OUTCOME_JUDGE_MODEL,
       dryRun: false,
     });
+  });
+
+  it('accepts --prompt-file for a candidate rubric and rejects an empty one (ENG-2380)', () => {
+    expect(parseArgs(['--from', '2026-07-10', '--to', '2026-10-07', '--prompt-file', '/tmp/B.txt'])).toEqual(
+      expect.objectContaining({ mode: 'replay', promptFile: '/tmp/B.txt' }),
+    );
+    expect(parseArgs(['--from', '2026-07-10', '--to', '2026-10-07'])).not.toHaveProperty('promptFile');
+    expect(() => parseArgs(['--from', '2026-07-10', '--to', '2026-10-07', '--prompt-file'])).toThrow(/--prompt-file needs a value/);
+    expect(loadPromptFile('x', () => '  rubric B  \n')).toBe('rubric B');
+    expect(() => loadPromptFile('x', () => ' \n ')).toThrow(/is empty/);
   });
 
   it('rejects unknown flags, missing operands, bad dates and a reversed window', () => {
