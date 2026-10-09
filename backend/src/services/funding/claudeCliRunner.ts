@@ -38,6 +38,12 @@ export interface ClaudeCliRunnerOptions {
    * one message, which the MCP request alone cannot show.
    */
   onToolUse?: (event: ClaudeCliToolUseEvent) => void;
+  /**
+   * Called once when the session's process is gone for any reason (idle close, exit,
+   * close(), MCP not connected), so the caller can end what it tied to the session,
+   * such as the tool-bridge run and its token.
+   */
+  onClose?: (reason: string) => void;
 }
 
 export interface ClaudeCliToolUseEvent {
@@ -76,6 +82,9 @@ interface PooledSession {
   /** That server's status from the latest `system/init` event. */
   mcpServerStatus: string | undefined;
   onToolUse: ((event: ClaudeCliToolUseEvent) => void) | undefined;
+  onClose: ((reason: string) => void) | undefined;
+  /** The MCP server this process was started with; it cannot be changed afterwards. */
+  mcpServer: ClaudeCliMcpServer | undefined;
 }
 
 const DEFAULT_IDLE_CLOSE_MS = 10 * 60 * 1000;
@@ -127,6 +136,11 @@ export class ClaudeCliRunner {
   ): Promise<ClaudeCliSessionHandle> {
     const existing = this.pool.get(conversationId);
     if (existing && !existing.closed) {
+      // The MCP config is fixed at process start. Handing back a process that holds a
+      // different (by now revoked) run token would give the caller a toolless session.
+      if (opts.mcpServer && !sameMcpServer(existing.mcpServer, opts.mcpServer)) {
+        throw new Error("claudeCliRunner: a session is already open for this conversation with a different MCP server; close it first");
+      }
       this.scheduleIdleClose(existing);
       return { conversationId };
     }
@@ -168,10 +182,16 @@ export class ClaudeCliRunner {
       }
 
       const scratchHomeDir = mkdtempSync(join(tmpdir(), "claude-cli-home-"));
-      const mcpConfigFile = opts.mcpServer ? writeMcpConfig(scratchHomeDir, opts.mcpServer) : undefined;
-      const child = spawnChildProcess("claude", buildArgs(systemPromptFile, opts, mcpConfigFile), {
-        env: buildAllowlistedEnv(configDir, scratchHomeDir),
-      });
+      let child: ChildProcessWithoutNullStreams;
+      try {
+        const env = buildAllowlistedEnv(configDir, scratchHomeDir);
+        const mcpConfigFile = opts.mcpServer ? writeMcpConfig(scratchHomeDir, opts.mcpServer) : undefined;
+        child = spawnChildProcess("claude", buildArgs(systemPromptFile, opts, mcpConfigFile), { env });
+      } catch (err) {
+        // Nothing owns the scratch dir yet, and it may already hold the run token.
+        rmSync(scratchHomeDir, { recursive: true, force: true });
+        throw err;
+      }
 
       const session: PooledSession = {
         conversationId,
@@ -186,6 +206,8 @@ export class ClaudeCliRunner {
         expectedMcpServer: opts.mcpServer?.name,
         mcpServerStatus: undefined,
         onToolUse: opts.onToolUse,
+        onClose: opts.onClose,
+        mcpServer: opts.mcpServer,
       };
 
       session.rl.on("line", (line) => this.handleLine(session, line));
@@ -404,6 +426,13 @@ export class ClaudeCliRunner {
       session.pending = null;
     }
     this.releaseSlotToQueue();
+    if (session.onClose) {
+      try {
+        session.onClose(reason);
+      } catch (err) {
+        console.error("[claudeCliRunner] onClose failed (swallowed):", err instanceof Error ? err.message : String(err));
+      }
+    }
   }
 
   /**
@@ -463,6 +492,10 @@ function writeMcpConfig(scratchHomeDir: string, server: ClaudeCliMcpServer): str
   };
   writeFileSync(file, JSON.stringify(config), { mode: 0o600 });
   return file;
+}
+
+function sameMcpServer(a: ClaudeCliMcpServer | undefined, b: ClaudeCliMcpServer): boolean {
+  return !!a && a.name === b.name && a.url === b.url && a.bearerToken === b.bearerToken;
 }
 
 function reportToolUses(message: unknown, report: (event: ClaudeCliToolUseEvent) => void): void {
