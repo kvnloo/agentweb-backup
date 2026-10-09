@@ -318,9 +318,12 @@ describe("regenerateSingleIcpForUser — the persona list can move mid-flight", 
 
     await regenerateSingleIcpForUser("u1", 3, { llm: new FakeLlm({ icp: REGENERATED }) });
 
-    const written = lastWrittenIcps()!;
-    expect(written).toHaveLength(4);
-    expect(written.some((p: any) => p.name === REGENERATED.name)).toBe(false);
+    // Nothing is written to the list: a whole-list write here could erase a
+    // concurrent regeneration's slot, and there is no card left to save.
+    expect(lastWrittenIcps()).toBeUndefined();
+    expect(
+      userDb.updateUser.mock.calls.some((c: any[]) => JSON.stringify(c).includes(REGENERATED.name)),
+    ).toBe(false);
     // Status must still leave `running`, or the FE spins until it times out.
     const statuses = userDb.updateUser.mock.calls.map((c: any[]) => c[1]?.icpStatus);
     expect(statuses).toContain("ready");
