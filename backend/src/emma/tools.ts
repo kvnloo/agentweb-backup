@@ -4121,6 +4121,18 @@ emmaToolRegistry.register({
         notes: {
           type: 'string',
           description: 'Optional notes about this status change'
+        },
+        message_draft: {
+          type: 'string',
+          description: 'Optional. The exact LinkedIn message text you drafted for this lead. Saved verbatim on the lead (messageDraft) so it appears in the CRM lead panel and the Pending Review queue for human approval. Pass it whenever you set status to pending_review for a LinkedIn draft.'
+        },
+        email_subject: {
+          type: 'string',
+          description: 'Optional. Subject of the email you drafted for this lead. Must be passed together with email_body. Saved verbatim on the lead (emailDraft).'
+        },
+        email_body: {
+          type: 'string',
+          description: 'Optional. Plain-text body of the email you drafted for this lead. Must be passed together with email_subject. Saved verbatim on the lead (emailDraft).'
         }
       },
       required: ['list_id', 'lead_id', 'status']
@@ -4129,7 +4141,8 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     return await leadsImpl.updateLeadStatus(
       args.list_id, args.lead_id, args.status, context?.userId,
-      args.deal_value, args.deal_currency, args.notes
+      args.deal_value, args.deal_currency, args.notes,
+      { messageDraft: args.message_draft, emailSubject: args.email_subject, emailBody: args.email_body, sessionId: context?.sessionId }
     );
   }
 });
