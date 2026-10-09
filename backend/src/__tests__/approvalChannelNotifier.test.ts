@@ -27,6 +27,9 @@ jest.mock('../services/settingsService', () => ({
     claimSetMember: jest.fn(), releaseSetMember: jest.fn(),
   },
 }));
+jest.mock('../services/approvalSubscriberNotify', () => ({
+  notifySubscribersOfApproval: jest.fn(),
+}));
 jest.mock('../services/approvalDb', () => ({
   approvalDb: { updateApprovalStatus: jest.fn(), getApproval: jest.fn() },
 }));
@@ -46,6 +49,7 @@ const {
 const { userDb } = require('../services/db');
 const { settingsService } = require('../services/settingsService');
 const { approvalDb } = require('../services/approvalDb');
+const { notifySubscribersOfApproval } = require('../services/approvalSubscriberNotify');
 const whatsapp = require('../services/whatsappService');
 
 import {
@@ -383,6 +387,23 @@ describe('handleApprovalButtonTap', () => {
       `whatsapp:approval-claim:${ASSET}`,
       'answered',
     );
+  });
+
+  it('emails the task subscribers on approval, exactly as Slack does', async () => {
+    (approvalDb.updateApprovalStatus as jest.Mock).mockResolvedValue({ executionId: 'exec-9' });
+    await tap('approve');
+    expect(notifySubscribersOfApproval).toHaveBeenCalledWith({ executionId: 'exec-9' });
+  });
+
+  it('does not email subscribers on a rejection', async () => {
+    await tap('reject');
+    expect(notifySubscribersOfApproval).not.toHaveBeenCalled();
+  });
+
+  it('does not email subscribers again on a repeat tap', async () => {
+    (settingsService.claimSetMember as jest.Mock).mockResolvedValue(false);
+    await tap('approve');
+    expect(notifySubscribersOfApproval).not.toHaveBeenCalled();
   });
 
   it('confirms the verdict back to the customer', async () => {

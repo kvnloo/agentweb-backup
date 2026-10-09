@@ -273,14 +273,27 @@ export async function handleApprovalButtonTap(params: {
       return;
     }
 
+    let recordedApproval: { executionId?: string } | null = null;
     try {
       const { approvalDb } = await import('./approvalDb');
-      await approvalDb.updateApprovalStatus(ref.assetUrl, verdict, `whatsapp:${ref.userId}`);
+      recordedApproval = await approvalDb.updateApprovalStatus(
+        ref.assetUrl,
+        verdict,
+        `whatsapp:${ref.userId}`,
+      );
     } catch (error) {
       // Release so the customer can retry; a consumed claim with no recorded verdict
       // would leave the approval permanently unanswerable from WhatsApp.
       await settings.releaseSetMember(claimKey(ref.assetUrl), 'answered').catch(() => {});
       throw error;
+    }
+
+    if (verdict === 'approved') {
+      // Same consequence as approving on Slack: the task's subscribers are emailed.
+      // Safe to run here because the claim above guarantees it happens once per
+      // approval, however many times the button is tapped. Never throws.
+      const { notifySubscribersOfApproval } = await import('./approvalSubscriberNotify');
+      await notifySubscribersOfApproval(recordedApproval);
     }
 
     await sendText(

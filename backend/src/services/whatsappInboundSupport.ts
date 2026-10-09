@@ -22,14 +22,29 @@ export const SUPPORT_GREETING =
 const GREETING_COOLDOWN_MS = 12 * 60 * 60 * 1000;
 const greetedKey = (phone: string) => `whatsapp:greeted:${phone}`;
 
+const INBOX_SETTING = 'whatsapp:support-inbox';
+
 /**
- * Where forwarded messages go. Explicit env wins; production falls back to the address
- * the product already publishes; everywhere else forwarding is off, so a staging test
- * cannot mail the founders.
+ * Where forwarded messages go, in order of precedence:
+ *
+ *  1. WHATSAPP_SUPPORT_INBOX — an explicit deploy-time choice.
+ *  2. The `whatsapp:support-inbox` setting — changeable at runtime, so the inbox can be
+ *     pointed at a real support address (or switched on for a staging test) without a
+ *     deploy or an infrastructure change.
+ *  3. In production only, the address the product already publishes.
+ *
+ * Everywhere else forwarding is off, so a staging test cannot mail the founders.
  */
-export function supportInbox(): string | null {
+export async function supportInbox(): Promise<string | null> {
   const configured = process.env.WHATSAPP_SUPPORT_INBOX?.trim();
   if (configured) return configured;
+  try {
+    const row = await settingsService.getSetting(INBOX_SETTING);
+    const fromSetting = row?.settingValue?.trim();
+    if (fromSetting) return fromSetting;
+  } catch {
+    // Fall through to the default rather than lose the customer's message.
+  }
   return process.env.NODE_ENV === 'production' ? 'founders@agentweb.pro' : null;
 }
 
@@ -56,7 +71,7 @@ async function greetOncePerCooldown(phone: string): Promise<void> {
 }
 
 async function forwardToTeam(phone: string, text: string, messageType: string): Promise<void> {
-  const inbox = supportInbox();
+  const inbox = await supportInbox();
   if (!inbox) return;
 
   let account = 'not a connected AgentWeb number';

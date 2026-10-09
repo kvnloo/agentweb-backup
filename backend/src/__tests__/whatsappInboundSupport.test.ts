@@ -52,14 +52,18 @@ describe('the greeting', () => {
   });
 
   it('is sent once, not after every line the customer types', async () => {
-    settingsService.getSetting.mockResolvedValue({ settingValue: new Date().toISOString() });
+    settingsService.getSetting.mockImplementation(async (k: string) =>
+      k.startsWith('whatsapp:greeted:') ? { settingValue: new Date().toISOString() } : null,
+    );
     await handleUnrecognizedMessage(PHONE, 'and another thing');
     expect(whatsapp.sendText).not.toHaveBeenCalled();
   });
 
   it('is sent again once the cooldown has passed', async () => {
     const thirteenHoursAgo = new Date(Date.now() - 13 * 60 * 60 * 1000).toISOString();
-    settingsService.getSetting.mockResolvedValue({ settingValue: thirteenHoursAgo });
+    settingsService.getSetting.mockImplementation(async (k: string) =>
+      k.startsWith('whatsapp:greeted:') ? { settingValue: thirteenHoursAgo } : null,
+    );
     await handleUnrecognizedMessage(PHONE, 'hello again');
     expect(whatsapp.sendText).toHaveBeenCalled();
   });
@@ -87,14 +91,33 @@ describe('the greeting', () => {
 
 describe('forwarding to the team', () => {
   it('is off outside production unless an inbox is configured', async () => {
-    expect(supportInbox()).toBeNull();
+    await expect(supportInbox()).resolves.toBeNull();
     await handleUnrecognizedMessage(PHONE, 'hi');
     expect(emailService.sendEmail).not.toHaveBeenCalled();
   });
 
-  it('defaults to the published address in production', () => {
+  it('defaults to the published address in production', async () => {
     process.env.NODE_ENV = 'production';
-    expect(supportInbox()).toBe('founders@agentweb.pro');
+    await expect(supportInbox()).resolves.toBe('founders@agentweb.pro');
+  });
+
+  it('can be pointed at an inbox at runtime through a setting', async () => {
+    settingsService.getSetting.mockImplementation(async (k: string) =>
+      k === 'whatsapp:support-inbox' ? { settingValue: 'help@example.com' } : null,
+    );
+    await expect(supportInbox()).resolves.toBe('help@example.com');
+  });
+
+  it('lets the environment variable win over the setting', async () => {
+    process.env.WHATSAPP_SUPPORT_INBOX = 'env@example.com';
+    settingsService.getSetting.mockResolvedValue({ settingValue: 'help@example.com' });
+    await expect(supportInbox()).resolves.toBe('env@example.com');
+  });
+
+  it('falls back to the default when the setting cannot be read', async () => {
+    process.env.NODE_ENV = 'production';
+    settingsService.getSetting.mockRejectedValue(new Error('dynamo down'));
+    await expect(supportInbox()).resolves.toBe('founders@agentweb.pro');
   });
 
   it('forwards the customer query with who it is from', async () => {
@@ -121,7 +144,9 @@ describe('forwarding to the team', () => {
 
   it('forwards every message even while the greeting is on cooldown', async () => {
     process.env.WHATSAPP_SUPPORT_INBOX = 'support@example.com';
-    settingsService.getSetting.mockResolvedValue({ settingValue: new Date().toISOString() });
+    settingsService.getSetting.mockImplementation(async (k: string) =>
+      k.startsWith('whatsapp:greeted:') ? { settingValue: new Date().toISOString() } : null,
+    );
     await handleUnrecognizedMessage(PHONE, 'second line of my question');
     expect(emailService.sendEmail).toHaveBeenCalled();
     expect(whatsapp.sendText).not.toHaveBeenCalled();
