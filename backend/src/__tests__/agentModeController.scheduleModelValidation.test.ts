@@ -22,7 +22,7 @@ const REGISTRY: Record<string, Cfg> = {
   'internal-model': { name: 'Internal', internalOnly: true },
   'live-voice': { name: 'Live', isLive: true },
 };
-const ALIASES: Record<string, string> = { 'claude-sonnet-5': 'anthropic.claude-sonnet-5' };
+const ALIASES: Record<string, string> = { 'claude-sonnet-5': 'anthropic.claude-sonnet-5', 'legacy-internal': 'internal-model' };
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
@@ -121,13 +121,13 @@ describe('createScheduledChat model pin', () => {
     expect422(await create({ llmModel: 'internal-model' }), 'internal-model', 'not_selectable');
   });
 
-  it('stores a trimmed valid id, an honoured alias, and no pin for empty/absent', async () => {
+  it('stores a trimmed valid id, the canonical id for an honoured alias, and no pin for empty/absent', async () => {
     await create({ llmModel: '  gpt-5-chat-2  ' });
     await create({ llmModel: 'claude-sonnet-5' });
     await create({ llmModel: '' });
     await create({});
     const models = mockScheduleDb.createSchedule.mock.calls.map((c) => (c[0] as any).llmModel);
-    expect(models).toEqual(['gpt-5-chat-2', 'claude-sonnet-5', '', '']);
+    expect(models).toEqual(['gpt-5-chat-2', 'anthropic.claude-sonnet-5', '', '']);
   });
 
   it('validates llmBackupModel too (422, nothing written)', async () => {
@@ -235,6 +235,29 @@ describe('updateScheduledChat model pin normalisation (CodeRabbit)', () => {
     mockScheduleDb.updateSchedule.mockClear();
     await update({ llmBackupModel: '   ' });
     expect(written().llmBackupModel).toBe('');
+  });
+});
+
+describe('canonical id storage for schedule pins', () => {
+  it('create: alias resolving to a non-selectable model is still 422', async () => {
+    expect422(await create({ llmModel: 'legacy-internal' }), 'legacy-internal', 'not_selectable');
+    expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+  });
+  it('update: alias in => canonical written', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored({ llmModel: 'gpt-5-chat-2' }) as any);
+    await update({ llmModel: 'claude-sonnet-5' });
+    expect((mockScheduleDb.updateSchedule.mock.calls[0][1] as any).llmModel).toBe('anthropic.claude-sonnet-5');
+  });
+  it('update: unchanged stored alias resent is tolerated and not rewritten', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored({ llmModel: 'claude-sonnet-5' }) as any);
+    await update({ llmModel: ' claude-sonnet-5 ' });
+    expect((mockScheduleDb.updateSchedule.mock.calls[0][1] as any).llmModel).toBe('claude-sonnet-5');
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(1);
+  });
+  it('create: backup alias stored canonical', async () => {
+    await create({ llmBackupModel: 'claude-sonnet-5' });
+    const arg = mockScheduleDb.createSchedule.mock.calls[0]?.[0] as any;
+    expect(arg?.llmBackupModel).toBe('anthropic.claude-sonnet-5');
   });
 });
 
