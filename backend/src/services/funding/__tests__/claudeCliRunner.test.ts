@@ -657,5 +657,43 @@ describe('ClaudeCliRunner', () => {
     await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
   });
 
+  it('tells the caller when a session closes, whatever closed it', async () => {
+    const runner = trackedRunner();
+    const onClose = jest.fn();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP, onClose });
+    const turn = runner.send(handle, 'hi');
+    spawnedChildren[0].stdout.push(
+      JSON.stringify({ type: 'system', subtype: 'init', mcp_servers: [{ name: 'emma', status: 'failed' }] }) + '\n',
+    );
+    await expect(turn).rejects.toThrow();
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onClose).toHaveBeenCalledWith('mcp-not-connected');
+
+    const onClose2 = jest.fn();
+    const handle2 = await runner.spawn('conv-2', CONFIG_DIR, SYSTEM_PROMPT_FILE, { onClose: onClose2 });
+    runner.close(handle2);
+    expect(onClose2).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses to hand back an open session when asked for a different MCP server', async () => {
+    const runner = trackedRunner();
+    await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP });
+    await expect(
+      runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: { ...MCP, bearerToken: 'a-newer-token' } }),
+    ).rejects.toThrow(/different MCP server/);
+    await expect(runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP })).resolves.toEqual({ conversationId: 'conv-1' });
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+  });
+
+  it('removes the scratch dir, token file included, when the process cannot be started', async () => {
+    const runner = trackedRunner();
+    mockSpawn.mockImplementationOnce(() => {
+      throw new Error('spawn failed');
+    });
+    await expect(runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP })).rejects.toThrow('spawn failed');
+    expect(mockRmSync).toHaveBeenCalledWith(expect.stringMatching(/claude-cli-home-/), { recursive: true, force: true });
+    expect(runner.activeProcessCount).toBe(0);
+  });
+
   void mkdtempSync; // referenced only via the module under test; keeps the fs mock import used
 });

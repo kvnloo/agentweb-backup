@@ -7,6 +7,7 @@
 import { agentModeService } from '../../agentModeService';
 import { ToolBridge } from '../toolBridge';
 import { EmmaToolBridgeExecutor } from '../emmaToolBridgeExecutor';
+import * as toolDispatch from '../../agentMode/core/toolDispatch';
 
 jest.mock('openai');
 jest.mock('../../settingsService');
@@ -41,6 +42,9 @@ const probeLaunch = jest.fn(async (args: any) => {
     previewToken: 'tok-123',
   };
 });
+// Flags the loop does NOT stop the turn for.
+const probeSoftConfirm = jest.fn(async () => ({ success: true, requiresConfirmation: true, message: 'Are you sure?' }));
+const probeFailedConfirm = jest.fn(async () => ({ success: false, error: 'blocked', awaitingUserConfirmation: true }));
 const probeFail = jest.fn(async () => {
   throw new Error('provider exploded');
 });
@@ -92,6 +96,8 @@ describe('tool bridge against the real agentModeService and dispatcher (ENG-2109
       tool('launch_bridge_probe', probeLaunch, { confirm: { type: 'boolean' }, preview_token: { type: 'string' } }),
     );
     registry.register(tool('update_bridge_failing_probe', probeFail));
+    registry.register(tool('delete_bridge_soft_probe', probeSoftConfirm));
+    registry.register(tool('update_bridge_failed_confirm_probe', probeFailedConfirm));
   });
 
   beforeEach(() => {
@@ -228,5 +234,81 @@ describe('tool bridge against the real agentModeService and dispatcher (ENG-2109
     const result = await bridge.callTool(token, { name: 'get_bridge_probe', args: {} });
     expect(result).toEqual({ content: 'get_bridge_probe is not available in this run.', isError: true });
     expect(probeRead).not.toHaveBeenCalled();
+  });
+  it('does not halt on requiresConfirmation alone, or on a failed result, exactly as the loop does not', async () => {
+    const { bridge, token } = openBridge();
+
+    const soft = await bridge.callTool(token, { name: 'delete_bridge_soft_probe', args: {} });
+    expect(soft.isError).toBe(false);
+    expect(bridge.isHalted('s1')).toBe(false);
+
+    await bridge.callTool(token, { name: 'update_bridge_failed_confirm_probe', args: {} });
+    expect(probeFailedConfirm).toHaveBeenCalledTimes(1);
+    expect(bridge.isHalted('s1')).toBe(false);
+
+    expect((await bridge.callTool(token, { name: 'get_bridge_probe', args: {} })).isError).toBe(false);
+  });
+
+  it('keeps working when a run is registered and opened again under the same id', async () => {
+    const { bridge, executor } = openBridge();
+    executor.registerRun(RUN.runId, { llmModel: agentModeService.default_model });
+    const token = bridge.openRun(RUN);
+    expect((await bridge.callTool(token, { name: 'get_bridge_probe', args: {} })).isError).toBe(false);
+  });
+
+  it('treats the ask_* tools as ordered, not read-only', () => {
+    expect(new EmmaToolBridgeExecutor().isReadOnly('ask_user_question')).toBe(false);
+  });
+
+  describe('with the dispatcher observed', () => {
+    function fakeDispatch(content: unknown, gate?: Promise<void>) {
+      const seen: any[] = [];
+      jest.spyOn(toolDispatch, 'executePreparedTools').mockImplementation(async (input: any) => {
+        seen.push(input);
+        if (gate) await gate;
+        const id = input.toolCalls[0].id;
+        input.messages.push({ role: 'tool', tool_call_id: id, content });
+        input.toolCallsLedger.push({ id, result: {} });
+        const isSearch = input.toolCalls[0].function.name === 'google_search_web';
+        return {
+          mediaAssetsProduced: 0,
+          searchCallsThisIteration: isSearch ? 1 : 0,
+          failedCounterUpdates: {},
+          pendingCounterUpdates: {},
+          skillsUpdated: false,
+        } as any;
+      });
+      return seen;
+    }
+
+    it('makes concurrent web searches each count the ones dispatched before them', async () => {
+      let open!: () => void;
+      const gate = new Promise<void>((resolve) => (open = resolve));
+      const seen = fakeDispatch('results', gate);
+      const { executor } = openBridge();
+      await executor.resolveTools(RUN);
+      executor.beginTurn(RUN.runId, { priorSearchCallCount: 7 });
+
+      const calls = [1, 2, 3].map((n) => executor.execute(RUN, { name: 'google_search_web', args: { q: `q${n}` } }));
+      await new Promise((resolve) => setImmediate(resolve));
+      open();
+      await Promise.all(calls);
+      expect(seen.map((input) => input.priorSearchCallCount)).toEqual([7, 8, 9]);
+
+      await executor.execute(RUN, { name: 'google_search_web', args: { q: 'q4' } });
+      expect(seen[3].priorSearchCallCount).toBe(10);
+    });
+
+    it('returns a screenshot as text plus an image, not as base64 inside text', async () => {
+      fakeDispatch([
+        { type: 'text', text: 'Screenshot captured.' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,QUJDRA==', detail: 'high' } },
+      ]);
+      const { executor } = openBridge();
+      await executor.resolveTools(RUN);
+      const outcome = await executor.execute(RUN, { name: 'playwright_browser_take_screenshot', args: {} });
+      expect(outcome.content).toBe('Screenshot captured.');
+      expect(outcome.images).toEqual([{ mimeType: 'image/png', data: 'QUJDRA==' }]);
+    });
   });
 });

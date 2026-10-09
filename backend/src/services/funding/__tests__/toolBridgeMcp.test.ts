@@ -113,7 +113,7 @@ describe('tool bridge MCP endpoint', () => {
     expect(deps.execute).toHaveBeenCalledWith(RUN, { name: 'get_leads', args: { q: 'acme' }, callId: 'toolu_abc123' });
   });
 
-  it('rejects a forged token with a bare 401 and never reaches the bridge', async () => {
+  it('answers a forged token with the same bare 404 as an unknown path, and never reaches the bridge', async () => {
     adapter.openRun(RUN);
     await expect(connect('forged-token')).rejects.toThrow();
 
@@ -122,13 +122,13 @@ describe('tool bridge MCP endpoint', () => {
       headers: { 'content-type': 'application/json', authorization: 'Bearer forged-token' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
     });
-    expect(res.status).toBe(401);
-    expect(await res.json()).toEqual({ error: 'unauthorized' });
+    expect(res.status).toBe(404);
+    expect(await res.text()).toBe('');
     expect(deps.resolveTools).not.toHaveBeenCalled();
     expect(deps.execute).not.toHaveBeenCalled();
   });
 
-  it('rejects one run\'s valid token on another run\'s URL, with the same bare 401', async () => {
+  it('rejects one run\'s valid token on another run\'s URL, and with another run\'s session id', async () => {
     const tokenA = adapter.openRun(RUN);
     adapter.openRun({ runId: 'run-2', userId: 'user-2', sessionId: 'session-2' });
 
@@ -137,8 +137,48 @@ describe('tool bridge MCP endpoint', () => {
       headers: { 'content-type': 'application/json', authorization: `Bearer ${tokenA}` },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
     });
-    expect(res.status).toBe(401);
-    expect(await res.json()).toEqual({ error: 'unauthorized' });
+    expect(res.status).toBe(404);
+    expect(await res.text()).toBe('');
+
+    // A's token on A's URL, naming a session that belongs to run 2.
+    const tokenB = adapter.openRun({ runId: 'run-2', userId: 'user-2', sessionId: 'session-2' });
+    const clientB = await connect(tokenB, 'run-2');
+    const sessionB = (clientB.transport as StreamableHTTPClientTransport).sessionId as string;
+    const crossed = await fetch(`${baseUrl}/internal/tool-bridge/${RUN.runId}/mcp`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${tokenA}`, 'mcp-session-id': sessionB },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'get_leads', arguments: {} } }),
+    });
+    expect(crossed.status).toBe(404);
+    expect(deps.execute).not.toHaveBeenCalled();
+  });
+
+  it('keeps serving a run whose harness reconnects many times, dropping its oldest sessions', async () => {
+    const token = adapter.openRun(RUN);
+    for (let i = 0; i < 6; i++) await connect(token);
+    const latest = await connect(token);
+    expect((await latest.listTools()).tools.length).toBe(3);
+  });
+
+  it('returns a tool\'s image as an image block, not as text', async () => {
+    deps.execute.mockResolvedValueOnce(ok('Screenshot captured.', { images: [{ mimeType: 'image/png', data: 'QUJD' }] }));
+    const token = adapter.openRun(RUN);
+    const client = await connect(token);
+    const result = await client.callTool({ name: 'get_leads', arguments: {} });
+    expect(result.content).toEqual([
+      { type: 'text', text: 'Screenshot captured.' },
+      { type: 'image', data: 'QUJD', mimeType: 'image/png' },
+    ]);
+  });
+
+  it('lifts and reports the halt through the adapter', async () => {
+    deps.execute.mockResolvedValueOnce(ok('preview', { requiresConfirmation: true }));
+    const token = adapter.openRun(RUN);
+    const client = await connect(token);
+    await client.callTool({ name: 'launch_campaign', arguments: {} });
+    expect(adapter.isHalted(RUN.sessionId)).toBe(true);
+    adapter.clearHalt(RUN.sessionId);
+    expect(adapter.isHalted(RUN.sessionId)).toBe(false);
   });
 
   it('answers a request that came through a proxy with a plain 404, even with a valid token', async () => {

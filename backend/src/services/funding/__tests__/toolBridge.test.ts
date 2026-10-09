@@ -743,4 +743,28 @@ describe('ToolBridge', () => {
     expect(repeat.isError).toBe(true);
     expect(repeat.content).toMatch(/waiting for the user to confirm/);
   });
+  it('reopening a run that is still open does not release the executor state set up for it', async () => {
+    const deps = makeDeps();
+    const bridge = new ToolBridge(deps);
+    const first = bridge.openRun(RUN);
+    const second = bridge.openRun(RUN);
+
+    expect(deps.releaseRun).not.toHaveBeenCalled();
+    await expect(bridge.listTools(first)).rejects.toEqual(new ToolBridgeAuthError('unknown'));
+    expect((await bridge.listTools(second)).length).toBe(3);
+    bridge.closeRun(RUN.runId);
+    expect(deps.releaseRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('passes a tool\'s images through with its result', async () => {
+    const deps = makeDeps();
+    deps.execute.mockResolvedValueOnce(ok('shot', { images: [{ mimeType: 'image/png', data: 'QUJD' }] }));
+    const bridge = new ToolBridge(deps);
+    const token = bridge.openRun(RUN);
+    expect(await bridge.callTool(token, { name: 'get_leads', args: {} })).toEqual({
+      content: 'shot',
+      isError: false,
+      images: [{ mimeType: 'image/png', data: 'QUJD' }],
+    });
+  });
 });
