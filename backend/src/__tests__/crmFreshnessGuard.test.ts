@@ -944,6 +944,8 @@ describe('per-category breakdown rows are not account totals (ENG-2263, seen liv
     'Calendly Bookings: 23 leads across 2 lists (17 and 6)',
     '- Calendly Bookings: 23 leads across 2 lists',
     'Six lists account for 14,829 of your total contacts:',
+    '- Populated Lists (>=1 lead): 58 lists',
+    '- Empty Lists (0 leads): 37 lists (mostly landing page stubs)',
     '12 lists together hold most of the volume.',
   ])('%p is not a total', (t) => { expect(flagged(`Your CRM has 96 lists.\n${t}`)).toEqual([]); });
 
