@@ -46,7 +46,7 @@ import { emitProgress, registerProgressCallback, getLatestProgress, progressStor
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { CHAT_BRANCHING_ENABLED_SETTING, isChatBranchingSettingEnabled } from '../services/agentMode/chatBranching';
 import { resolveRunFunding } from '../services/funding/runFunding';
-import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
+import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError, isProviderUnavailableError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
@@ -10575,6 +10575,17 @@ export const agentModeController = {
           return;
         }
 
+        // ENG-2381: a final upstream provider 5xx is an outage, not an unknown error.
+        if (isProviderUnavailableError(error)) {
+          res.status(503).json({
+            error: 'AI provider unavailable',
+            message: error.message,
+            code: 'PROVIDER_UNAVAILABLE',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
         if (error.message.includes('Generation timed out')) {
           res.status(504).json({
             error: 'Generation timed out',
@@ -11670,6 +11681,17 @@ export const agentModeController = {
             error: 'Rate limit exceeded',
             message: error.message,
             code: 'RATE_LIMIT',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
+        // ENG-2381: a final upstream provider 5xx is an outage, not an unknown error.
+        if (isProviderUnavailableError(error)) {
+          res.status(503).json({
+            error: 'AI provider unavailable',
+            message: error.message,
+            code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
           });
           return;
@@ -14846,6 +14868,17 @@ export const agentModeController = {
             error: 'Rate limit exceeded',
             message: error.message,
             code: 'RATE_LIMIT',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
+        // ENG-2381: a final upstream provider 5xx is an outage, not an unknown error.
+        if (isProviderUnavailableError(error)) {
+          res.status(503).json({
+            error: 'AI provider unavailable',
+            message: error.message,
+            code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
           });
           return;
