@@ -1704,6 +1704,17 @@ export class UserDB {
         names?: { [key: string]: string };
         values?: { [key: string]: any };
       };
+      /**
+       * Replace single elements of a list attribute in place
+       * (`SET #a.#b[3] = :v`) instead of rewriting the whole list. Two writers
+       * touching DIFFERENT elements then never overwrite each other, which a
+       * read-modify-write of the full list cannot guarantee. `path` is the
+       * attribute (and optional nested key) holding the list. Pair it with a
+       * `condition` on the element: DynamoDB appends when the index is past the
+       * end of the list, so an index that was valid at read time must be
+       * re-asserted at write time.
+       */
+      elementSets?: Array<{ path: [string] | [string, string]; index: number; value: any }>;
     }
   ) {
     // First, get the user by userId to ensure they exist and to get their email
@@ -1721,7 +1732,7 @@ export class UserDB {
       ...updatableFields
     } = updates;
 
-    if (Object.keys(updatableFields).length === 0) {
+    if (Object.keys(updatableFields).length === 0 && !options?.elementSets?.length) {
       return user; // Return the fetched user object if no updates are needed
     }
 
@@ -1743,6 +1754,19 @@ export class UserDB {
         setExpressions.push(`#${key} = :${key}`);
         expressionAttributeValues[`:${key}`] = value;
       }
+    });
+
+    (options?.elementSets ?? []).forEach((el, n) => {
+      if (!Number.isInteger(el.index) || el.index < 0) {
+        throw new Error(`updateUser elementSets[${n}]: index must be a non-negative integer`);
+      }
+      const pathNames = el.path.map((segment, k) => {
+        const placeholder = `#el${n}p${k}`;
+        expressionAttributeNames[placeholder] = segment;
+        return placeholder;
+      });
+      expressionAttributeValues[`:el${n}`] = el.value;
+      setExpressions.push(`${pathNames.join(".")}[${el.index}] = :el${n}`);
     });
 
     if (setExpressions.length === 0 && removeExpressions.length === 0) {

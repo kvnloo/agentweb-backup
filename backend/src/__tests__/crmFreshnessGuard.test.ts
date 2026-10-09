@@ -1025,3 +1025,30 @@ describe('echoesEarlier: a flagged number an earlier turn of the session really 
     expect(detectCrmFreshnessMismatch(t, calls, fresh()).findings).toEqual([]);
   });
 });
+
+describe('"combined count of N leads" phrasing (ENG-2263, seen from a scheduled run)', () => {
+  const calls = [ok('get_lead_lists')];
+  const fresh = () => {
+    const c = createCrmEvidenceCollector();
+    c.record('get_lead_lists', { success: true, totalLists: 97, lists: [{ listId: 'a', leadCount: 15390 }, ...Array.from({ length: 96 }, (_, i) => ({ listId: 'l' + i, leadCount: 1 }))] });
+    return c.snapshot();
+  };
+
+  it.each([
+    'You have <strong>97 lead lists</strong> in total, containing a combined count of <strong>12,746 leads</strong>.',
+    'Your CRM has 97 lead lists with an overall count of 12,746 leads.',
+    'Your CRM has 97 lead lists with an aggregate total of 12,746 leads.',
+    'Your CRM has 97 lead lists, a combined number of 12,746 leads.',
+  ])('flags an unbacked sum in %p', (t) => {
+    const f = detectCrmFreshnessMismatch(t, calls, fresh()).findings;
+    expect(f.map((x) => x.claimed)).toEqual([12746]);
+  });
+
+  it('does not flag the same wording when the number is the real sum', () => {
+    expect(detectCrmFreshnessMismatch('You have 97 lead lists in total, containing a combined count of 15,486 leads.', calls, fresh()).findings).toEqual([]);
+  });
+
+  it('does not flag it without CRM wording nearby', () => {
+    expect(detectCrmFreshnessMismatch('The campaign reached a combined count of 12,746 leads from three sources.', calls, fresh()).findings).toEqual([]);
+  });
+});
