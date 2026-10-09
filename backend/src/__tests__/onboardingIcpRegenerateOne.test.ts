@@ -431,15 +431,17 @@ describe("regenerateSingleIcpForUser — joined a full run (deferStatusToFullRun
     });
   });
 
-  it("drops the card save without error when the full run landed first (condition fails)", async () => {
+  it("re-reads and retries (rather than dropping the card) when the joined claim ended before the write", async () => {
     userDb.getUserById.mockResolvedValue(seedUser());
-    userDb.updateUser.mockRejectedValueOnce(Object.assign(new Error("cond"), { code: "ConditionalCheckFailedException" }));
-    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    userDb.updateUser
+      .mockRejectedValueOnce(Object.assign(new Error("cond"), { code: "ConditionalCheckFailedException" }))
+      .mockResolvedValue({});
     await expect(
       regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), deferStatusToFullRun: true }),
     ).resolves.toBeUndefined();
-    expect(userDb.updateUser).toHaveBeenCalledTimes(1);
-    warn.mockRestore();
+    const withCard = userDb.updateUser.mock.calls.filter((c: any[]) => c[2]?.elementSets?.length);
+    expect(withCard).toHaveLength(2);
+    expect(withCard[1][2].elementSets[0].value.name).toBe(REGENERATED.name);
   });
 
   it("does not mark the axis failed on an LLM miss while the full run is still running", async () => {

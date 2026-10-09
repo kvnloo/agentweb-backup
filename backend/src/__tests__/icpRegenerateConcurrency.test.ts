@@ -327,11 +327,35 @@ describe("regenerate-one that joined a full /icp/start run", () => {
     expect(table().row.icpStartedAt).toBe("2026-10-09T10:00:00.000Z");
   });
 
-  it("drops its card, leaving the full run's set intact, when that run landed first", async () => {
+  it("leaves a full run's set intact when that run landed first and replaced the cards", async () => {
     seed();
-    const landed = [0, 1, 2, 3, 4].map((i) => persona(i, { name: `Full run ${i}` }));
+    // A full run mints new ids for the cards it generates.
+    const landed = [0, 1, 2, 3, 4].map((i) => persona(i, { id: `full_${i}`, name: `Full run ${i}` }));
     table().beforeUpdate = (_p, t) => {
       t.row = { ...t.row, icpStatus: "ready", icpResult: landed };
+      t.beforeUpdate = undefined;
+    };
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const { release, llmFor } = gatedLlm({ a: fresh("A") });
+    const run = regenerateSingleIcpForUser("u1", 2, { ...deps(llmFor("a")), deferStatusToFullRun: true });
+    setTimeout(release, 5);
+    await run;
+    warn.mockRestore();
+
+    expect(names()).toEqual(landed.map((p) => p.name));
+  });
+
+  // Found by driving the real UI: the second click lands ~50ms after the first,
+  // so the second request sees the first's fresh claim, mistakes it for a full
+  // run and defers. The "run" then finishes first -- but it was another card's
+  // regeneration, so this card must still be saved.
+  it("still saves its card when the claim it joined was another card's regeneration that finished first", async () => {
+    seed();
+    table().beforeUpdate = (_p, t) => {
+      // Card 0's regeneration completes between this one's read and its write.
+      const list = [...t.row.icpResult];
+      list[0] = { ...list[0], name: "Regenerated card 0" };
+      t.row = { ...t.row, icpStatus: "ready", icpResult: list };
       t.beforeUpdate = undefined;
     };
     const { release, llmFor } = gatedLlm({ a: fresh("A") });
@@ -339,6 +363,7 @@ describe("regenerate-one that joined a full /icp/start run", () => {
     setTimeout(release, 5);
     await run;
 
-    expect(names()).toEqual(landed.map((p) => p.name));
+    expect(names()).toEqual(["Regenerated card 0", "Original 1", "Regenerated A", "Original 3", "Original 4"]);
+    expect(table().row.icpStatus).toBe("ready");
   });
 });
