@@ -281,6 +281,11 @@ interface User {
   fromName?: string; // From name for emails
   slackChannel?: string; // @deprecated — use slackChannels
   slackChannels?: string[]; // Slack channels configured for this user
+  // ENG-273: one messaging platform per customer. Derived by the backend from the same
+  // policy that enforces the rule, so this never disagrees with what an edit will allow.
+  messagingPlatform?: "slack" | "whatsapp" | null;
+  messagingPlatformSource?: "account" | "organisation" | "slack_connect" | null;
+  whatsappNumberMasked?: string | null; // last four digits only
   secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
@@ -4864,30 +4869,48 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                   </Box>
                                 </Grid>
                                 <Grid item xs={3}>
-                                  <Typography variant="caption" color="text.secondary">Slack Channels</Typography>
-                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, flexWrap: "wrap" }}>
-                                    <Typography variant="body2">
-                                      {(() => {
-                                        const ids = user.slackChannels && user.slackChannels.length > 0
+                                  <Typography variant="caption" color="text.secondary">Messaging Platform</Typography>
+                                  {user.messagingPlatform === "whatsapp" ? (
+                                    // A customer is on ONE platform. On WhatsApp there is no Slack
+                                    // channel to edit, and the backend would refuse one — so the
+                                    // editor is not offered rather than offered and then rejected.
+                                    <Box>
+                                      <Typography variant="body2">
+                                        WhatsApp{user.whatsappNumberMasked ? ` (${user.whatsappNumberMasked})` : ""}
+                                      </Typography>
+                                      <Typography variant="caption" color="text.secondary">
+                                        Slack can't be added while WhatsApp is connected.
+                                      </Typography>
+                                    </Box>
+                                  ) : (
+                                    <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, flexWrap: "wrap" }}>
+                                      <Typography variant="body2">
+                                        {(() => {
+                                          const ids = user.slackChannels && user.slackChannels.length > 0
+                                            ? user.slackChannels
+                                            : user.slackChannel ? [user.slackChannel] : [];
+                                          if (ids.length === 0) {
+                                            if (user.messagingPlatformSource === "organisation") return "Slack (via organisation)";
+                                            if (user.messagingPlatformSource === "slack_connect") return "Slack (Slack Connect)";
+                                            return "Not connected";
+                                          }
+                                          return "Slack: " + ids.map((id) =>
+                                            slackChannelNames[id] ? `${slackChannelNames[id]} (${id})` : id
+                                          ).join(", ");
+                                        })()}
+                                      </Typography>
+                                      <IconButton size="small" aria-label="Edit Slack channels" onClick={() => {
+                                        setEditingSlackChannelUserId(user.userId);
+                                        const channels = user.slackChannels && user.slackChannels.length > 0
                                           ? user.slackChannels
                                           : user.slackChannel ? [user.slackChannel] : [];
-                                        if (ids.length === 0) return "—";
-                                        return ids.map((id) =>
-                                          slackChannelNames[id] ? `${slackChannelNames[id]} (${id})` : id
-                                        ).join(", ");
-                                      })()}
-                                    </Typography>
-                                    <IconButton size="small" onClick={() => {
-                                      setEditingSlackChannelUserId(user.userId);
-                                      const channels = user.slackChannels && user.slackChannels.length > 0
-                                        ? user.slackChannels
-                                        : user.slackChannel ? [user.slackChannel] : [];
-                                      setCurrentSlackChannels(channels);
-                                      setSlackChannelInputText("");
-                                      setSlackChannelDialogOpen(true);
-                                      resolveSlackChannelNames(channels);
-                                    }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
-                                  </Box>
+                                        setCurrentSlackChannels(channels);
+                                        setSlackChannelInputText("");
+                                        setSlackChannelDialogOpen(true);
+                                        resolveSlackChannelNames(channels);
+                                      }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                    </Box>
+                                  )}
                                 </Grid>
                                 <Grid item xs={3}>
                                   <Typography variant="caption" color="text.secondary">SEO / GA / Clarity</Typography>
