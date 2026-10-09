@@ -22,7 +22,18 @@ jest.mock('../services/db', () => ({
 // Without this the correlation row below hits real DynamoDB from a unit test — the
 // write is inside a try/catch, so the suite would pass while quietly calling AWS.
 jest.mock('../services/settingsService', () => ({
-  settingsService: { setSetting: jest.fn(), getSetting: jest.fn(), deleteSetting: jest.fn() },
+  settingsService: {
+    setSetting: jest.fn(), getSetting: jest.fn(), deleteSetting: jest.fn(),
+    claimSetMember: jest.fn(), releaseSetMember: jest.fn(),
+  },
+}));
+jest.mock('../services/approvalDb', () => ({
+  approvalDb: { updateApprovalStatus: jest.fn() },
+}));
+jest.mock('../services/whatsappService', () => ({
+  ...jest.requireActual('../services/whatsappService'),
+  resolveUserIdByPhone: jest.fn(),
+  sendText: jest.fn(),
 }));
 
 const {
@@ -32,10 +43,13 @@ const {
 } = require('../services/messagingChannelService');
 const { userDb } = require('../services/db');
 const { settingsService } = require('../services/settingsService');
+const { approvalDb } = require('../services/approvalDb');
+const whatsapp = require('../services/whatsappService');
 
 import {
   notifyApprovalOnWhatsApp,
   lookupApprovalMessage,
+  handleApprovalButtonTap,
 } from '../services/approvalChannelNotifier';
 import { TEMPLATES } from '../services/whatsappService';
 
@@ -249,5 +263,128 @@ describe('correlating an inbound button tap back to the approval', () => {
   it('returns null rather than throwing on a corrupt row', async () => {
     (settingsService.getSetting as jest.Mock).mockResolvedValue({ settingValue: 'not json' });
     await expect(lookupApprovalMessage('wamid.BAD')).resolves.toBeNull();
+  });
+});
+
+describe('handleApprovalButtonTap', () => {
+  const PHONE = '+918005326946';
+  const MSG = 'wamid.ABC';
+  const ASSET = 'https://assets.example.com/q4-launch-hero.png';
+  const tap = (action = 'approve') =>
+    handleApprovalButtonTap({ phone: PHONE, approvalMessageId: MSG, action });
+
+  beforeEach(() => {
+    jest.resetAllMocks();
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    (settingsService.getSetting as jest.Mock).mockResolvedValue({
+      settingValue: JSON.stringify({ assetUrl: ASSET, userId: 'user-1' }),
+    });
+    (whatsapp.resolveUserIdByPhone as jest.Mock).mockResolvedValue('user-1');
+    (settingsService.claimSetMember as jest.Mock).mockResolvedValue(true);
+    (approvalDb.updateApprovalStatus as jest.Mock).mockResolvedValue({});
+    (whatsapp.sendText as jest.Mock).mockResolvedValue({ messageId: 'wamid.reply' });
+  });
+
+  it('records an approval', async () => {
+    await tap('approve');
+    expect(approvalDb.updateApprovalStatus).toHaveBeenCalledWith(ASSET, 'approved', 'whatsapp:user-1');
+  });
+
+  it('records a rejection', async () => {
+    await tap('reject');
+    expect(approvalDb.updateApprovalStatus).toHaveBeenCalledWith(ASSET, 'rejected', 'whatsapp:user-1');
+  });
+
+  it('accepts the LABEL a template quick-reply sends back', async () => {
+    // Meta fills a template button's payload with its own label, so the action can
+    // arrive capitalised and human-shaped rather than as the id we chose.
+    await tap('Approve');
+    expect(approvalDb.updateApprovalStatus).toHaveBeenCalledWith(ASSET, 'approved', 'whatsapp:user-1');
+  });
+
+  it('ignores a button that is not an approval verdict', async () => {
+    await tap('tell-me-more');
+    expect(settingsService.claimSetMember).not.toHaveBeenCalled();
+    expect(approvalDb.updateApprovalStatus).not.toHaveBeenCalled();
+  });
+
+  it('does nothing for a tap on an unknown or expired message', async () => {
+    (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
+    await tap();
+    expect(approvalDb.updateApprovalStatus).not.toHaveBeenCalled();
+  });
+
+  it('refuses a tap from someone who does not own the approval', async () => {
+    // The number resolves to a real user — just not this approval's owner.
+    (whatsapp.resolveUserIdByPhone as jest.Mock).mockResolvedValue('someone-else');
+    await tap();
+    expect(settingsService.claimSetMember).not.toHaveBeenCalled();
+    expect(approvalDb.updateApprovalStatus).not.toHaveBeenCalled();
+  });
+
+  it('refuses a tap from an unrecognised number', async () => {
+    (whatsapp.resolveUserIdByPhone as jest.Mock).mockResolvedValue(null);
+    await tap();
+    expect(approvalDb.updateApprovalStatus).not.toHaveBeenCalled();
+  });
+
+  it('answers a second tap without re-running the verdict', async () => {
+    // THE case this handler exists for. WhatsApp cannot remove the buttons, so they
+    // stay tappable forever and approving fans out subscriber email.
+    (settingsService.claimSetMember as jest.Mock).mockResolvedValue(false);
+    await tap();
+
+    expect(approvalDb.updateApprovalStatus).not.toHaveBeenCalled();
+    expect(whatsapp.sendText).toHaveBeenCalledWith(PHONE, expect.stringMatching(/already recorded/i));
+  });
+
+  it('claims BEFORE writing the verdict', async () => {
+    const order: string[] = [];
+    (settingsService.claimSetMember as jest.Mock).mockImplementation(async () => {
+      order.push('claim');
+      return true;
+    });
+    (approvalDb.updateApprovalStatus as jest.Mock).mockImplementation(async () => {
+      order.push('write');
+      return {};
+    });
+    await tap();
+    expect(order).toEqual(['claim', 'write']);
+  });
+
+  it('releases the claim when the verdict write fails, so the customer can retry', async () => {
+    (approvalDb.updateApprovalStatus as jest.Mock).mockRejectedValue(new Error('dynamo down'));
+    await tap();
+    expect(settingsService.releaseSetMember).toHaveBeenCalledWith(
+      `whatsapp:approval-claim:${ASSET}`,
+      'answered',
+    );
+  });
+
+  it('confirms the verdict back to the customer', async () => {
+    // No way to grey the button out, so silence reads as failure.
+    await tap('approve');
+    expect(whatsapp.sendText).toHaveBeenCalledWith(PHONE, expect.stringMatching(/approved/i));
+  });
+
+  it('still records the verdict when the confirmation fails to send', async () => {
+    (whatsapp.sendText as jest.Mock).mockRejectedValue(new Error('meta down'));
+    await tap();
+    expect(approvalDb.updateApprovalStatus).toHaveBeenCalled();
+  });
+
+  it('never throws into the webhook', async () => {
+    // A throw becomes a 500, Meta retries, and the retry is reported to the customer
+    // as "already recorded" — a confusing answer to a tap that genuinely failed.
+    (settingsService.getSetting as jest.Mock).mockRejectedValue(new Error('boom'));
+    await expect(tap()).resolves.toBeUndefined();
+  });
+
+  it('keeps the phone number out of its logs', async () => {
+    (whatsapp.resolveUserIdByPhone as jest.Mock).mockResolvedValue(null);
+    await tap();
+    const logged = (console.warn as jest.Mock).mock.calls.flat().join(' ');
+    expect(logged).not.toContain('918005326946');
   });
 });

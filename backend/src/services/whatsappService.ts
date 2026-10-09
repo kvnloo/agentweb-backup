@@ -543,6 +543,95 @@ export async function sendOptOutConfirmation(
   });
 }
 
+// ── Interactive messages ───────────────────────────────────────────────────
+
+/** One tappable reply button. `id` comes back on the tap; `title` is what is shown. */
+export interface WhatsAppReplyButton {
+  /** Returned verbatim as `interactive.button_reply.id`. Max 256 chars. */
+  id: string;
+  /** Button face. Max 20 chars, and must be unique among the buttons sent. */
+  title: string;
+}
+
+const MAX_REPLY_BUTTONS = 3;
+const BUTTON_TITLE_MAX = 20;
+const BUTTON_ID_MAX = 256;
+const INTERACTIVE_BODY_MAX = 1024;
+
+/**
+ * Reply buttons, for use INSIDE the 24-hour service window (ENG-273).
+ *
+ * The window is the whole reason this is separate from `sendTemplate`. Interactive
+ * messages are "service messages" in Meta's taxonomy, which need no pre-approval —
+ * so inside the window we can put real Approve/Reject buttons on a message with no
+ * template round-trip at all. Outside it, the same affordance has to be carried by an
+ * approved template instead, which is a different send and a different registry entry.
+ *
+ * Unlike Slack, the buttons CANNOT be removed once tapped — there is no edit operation
+ * in the Cloud API. Callers must therefore treat a tap as repeatable and make the
+ * action behind it idempotent; the buttons stay on the customer's screen forever.
+ *
+ * `id` is the only field a caller controls that survives the round trip. Meta sets a
+ * TEMPLATE quick-reply's `button.payload` to the button's own label, so a template
+ * cannot carry an identifier this way — only this non-template form can.
+ */
+export async function sendInteractiveButtons(
+  destination: string,
+  body: string,
+  buttons: WhatsAppReplyButton[],
+): Promise<{ messageId: string | null }> {
+  const phone = await assertSendable(destination);
+
+  if (!(await isServiceWindowOpen(phone))) {
+    throw new WhatsAppWindowClosedError(
+      `${redactPhone(phone)} is outside the 24-hour service window — ` +
+        'interactive buttons require an approved template out there.',
+    );
+  }
+
+  // Validated locally rather than discovered as a Meta rejection: these limits are
+  // fixed and documented, and a 400 from Graph names the field, not the caller.
+  if (buttons.length === 0 || buttons.length > MAX_REPLY_BUTTONS) {
+    throw new WhatsAppError(
+      `WhatsApp allows 1-${MAX_REPLY_BUTTONS} reply buttons, got ${buttons.length}.`,
+    );
+  }
+  const titles = buttons.map((b) => b.title);
+  if (new Set(titles).size !== titles.length) {
+    // Meta rejects duplicate titles outright.
+    throw new WhatsAppError('Reply button titles must be unique.');
+  }
+  for (const b of buttons) {
+    if (!b.id || b.id.length > BUTTON_ID_MAX) {
+      throw new WhatsAppError(`Reply button id must be 1-${BUTTON_ID_MAX} characters.`);
+    }
+    if (!b.title || b.title.length > BUTTON_TITLE_MAX) {
+      throw new WhatsAppError(
+        `Reply button title "${b.title}" must be 1-${BUTTON_TITLE_MAX} characters.`,
+      );
+    }
+  }
+
+  const text = formatForChannel(body, 'whatsapp').slice(0, INTERACTIVE_BODY_MAX);
+
+  return postToGraph({
+    messaging_product: 'whatsapp',
+    to: phone,
+    type: 'interactive',
+    interactive: {
+      type: 'button',
+      body: { text },
+      action: {
+        buttons: buttons.map((b) => ({
+          type: 'reply',
+          reply: { id: b.id, title: b.title },
+        })),
+      },
+    },
+  });
+}
+
+
 
 export interface WhatsAppSendParams {
   destination: string;

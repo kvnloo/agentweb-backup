@@ -31,6 +31,9 @@ jest.mock('../services/whatsappService', () => ({
 jest.mock('../services/whatsappVerificationService', () => ({
   handleVerificationMessage: jest.fn(),
 }));
+jest.mock('../services/approvalChannelNotifier', () => ({
+  handleApprovalButtonTap: jest.fn(),
+}));
 jest.mock('../utils/secretsManager', () => ({
   getWhatsAppCredentials: jest.fn(),
 }));
@@ -43,6 +46,7 @@ const {
   sendOptOutConfirmation,
 } = require('../services/whatsappService');
 const { handleVerificationMessage } = require('../services/whatsappVerificationService');
+const { handleApprovalButtonTap } = require('../services/approvalChannelNotifier');
 const { getWhatsAppCredentials } = require('../utils/secretsManager');
 
 import whatsappWebhookRouter from '../routes/whatsappWebhook';
@@ -423,5 +427,98 @@ describe('POST — number verification', () => {
   it('200s when verification completes, whatever the outcome it chose to reply with', async () => {
     handleVerificationMessage.mockResolvedValue(true);
     expect((await post(inboundPayload('Verify K7Q2M9XA'))).status).toBe(200);
+  });
+});
+
+describe('POST — tapped buttons', () => {
+  const post = (body: string) =>
+    request(app)
+      .post('/api/webhooks/whatsapp')
+      .set('X-Hub-Signature-256', sign(body))
+      .set('Content-Type', 'application/json')
+      .send(body);
+
+  const envelope = (msg: any) =>
+    JSON.stringify({
+      object: 'whatsapp_business_account',
+      entry: [
+        { id: 'W', changes: [{ field: 'messages', value: { messaging_product: 'whatsapp', messages: [msg] } }] },
+      ],
+    });
+
+  const base = { from: '14155550123', id: 'wamid.IN', timestamp: '1' };
+
+  it('routes a non-template reply button, keeping the id we set', async () => {
+    await post(
+      envelope({
+        ...base,
+        type: 'interactive',
+        context: { from: 'biz', id: 'wamid.APPROVAL' },
+        interactive: { type: 'button_reply', button_reply: { id: 'approve', title: 'Approve' } },
+      }),
+    );
+    expect(handleApprovalButtonTap).toHaveBeenCalledWith({
+      phone: '+14155550123',
+      approvalMessageId: 'wamid.APPROVAL',
+      action: 'approve',
+    });
+  });
+
+  it('routes a TEMPLATE quick-reply, where Meta sends back the label', async () => {
+    await post(
+      envelope({
+        ...base,
+        type: 'button',
+        context: { from: 'biz', id: 'wamid.APPROVAL' },
+        button: { payload: 'Approve', text: 'Approve' },
+      }),
+    );
+    expect(handleApprovalButtonTap).toHaveBeenCalledWith({
+      phone: '+14155550123',
+      approvalMessageId: 'wamid.APPROVAL',
+      action: 'Approve',
+    });
+  });
+
+  it('ignores a tap with no context — it cannot be attributed to anything', async () => {
+    await post(
+      envelope({
+        ...base,
+        type: 'interactive',
+        interactive: { type: 'button_reply', button_reply: { id: 'approve', title: 'Approve' } },
+      }),
+    );
+    expect(handleApprovalButtonTap).not.toHaveBeenCalled();
+  });
+
+  it('still opens the service window for a tap', async () => {
+    // The tap is a user message; treating it otherwise would leave us unable to reply.
+    await post(
+      envelope({
+        ...base,
+        type: 'button',
+        context: { from: 'biz', id: 'wamid.APPROVAL' },
+        button: { payload: 'Approve', text: 'Approve' },
+      }),
+    );
+    expect(recordInboundMessage).toHaveBeenCalledWith('+14155550123');
+  });
+
+  it('does not hand a tap to the verification parser', async () => {
+    await post(
+      envelope({
+        ...base,
+        type: 'button',
+        context: { from: 'biz', id: 'wamid.APPROVAL' },
+        button: { payload: 'Approve', text: 'Approve' },
+      }),
+    );
+    expect(handleVerificationMessage).not.toHaveBeenCalled();
+  });
+
+  it('leaves ordinary text alone', async () => {
+    await post(inboundPayload('hello there'));
+    expect(handleApprovalButtonTap).not.toHaveBeenCalled();
+    expect(handleVerificationMessage).toHaveBeenCalled();
   });
 });

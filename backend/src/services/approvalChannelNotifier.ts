@@ -19,7 +19,7 @@ import {
   normalizeUserChannels,
   resolveDestination,
 } from './messagingChannelService';
-import { TEMPLATES } from './whatsappService';
+import { TEMPLATES, resolveUserIdByPhone, redactPhone, sendText } from './whatsappService';
 import { settingsService } from './settingsService';
 
 export interface ApprovalChannelNotification {
@@ -162,5 +162,96 @@ export async function lookupApprovalMessage(
     // A wamid is an opaque provider handle, not PII — safe to log as-is.
     console.warn(`[approval-notify] unparseable approval-message row for ${messageId}`);
     return null;
+  }
+}
+
+// ── Inbound: a tapped Approve / Reject button ──────────────────────────────
+
+const VERDICTS: Record<string, 'approved' | 'rejected'> = {
+  approve: 'approved',
+  approved: 'approved',
+  reject: 'rejected',
+  rejected: 'rejected',
+};
+
+const claimKey = (assetUrl: string) => `whatsapp:approval-claim:${assetUrl}`;
+
+const ALREADY_ANSWERED =
+  'That one is already recorded — no need to tap again. Thanks!';
+
+/**
+ * Record an approval verdict tapped on WhatsApp.
+ *
+ * Idempotency is not optional here, and this is the part that differs sharply from
+ * Slack. Slack strips an approval's buttons the moment it is answered, so a second
+ * click is impossible. WhatsApp has no edit operation: the buttons stay on the
+ * customer's screen forever, and every tap arrives as a fresh inbound message. Since
+ * approving fans out email to every task subscriber, an un-claimed handler would turn
+ * an idle double-tap into duplicate mail. The claim is taken BEFORE the status write
+ * so a repeat loses the race rather than re-running the work.
+ *
+ * Attribution is checked, not assumed: the tapping number must resolve to the very
+ * user the approval belongs to. A number that has since moved accounts, or simply
+ * isn't this approval's owner, is ignored rather than allowed to answer someone
+ * else's decision.
+ */
+export async function handleApprovalButtonTap(params: {
+  phone: string;
+  approvalMessageId: string;
+  action: string;
+}): Promise<void> {
+  try {
+    const verdict = VERDICTS[params.action.trim().toLowerCase()];
+    if (!verdict) return; // Not an approval button — nothing to do.
+
+    const ref = await lookupApprovalMessage(params.approvalMessageId);
+    if (!ref) {
+      // Expired (30-day TTL) or never ours.
+      console.warn(
+        `[approval-notify] tap from ${redactPhone(params.phone)} referenced an unknown message`,
+      );
+      return;
+    }
+
+    const senderUserId = await resolveUserIdByPhone(params.phone);
+    if (!senderUserId || senderUserId !== ref.userId) {
+      console.warn(
+        `[approval-notify] tap from ${redactPhone(params.phone)} does not own that approval — ignored`,
+      );
+      return;
+    }
+
+    const { settingsService: settings } = await import('./settingsService');
+    const claimed = await settings.claimSetMember(claimKey(ref.assetUrl), 'answered');
+    if (!claimed) {
+      // Already answered. Say so rather than going quiet: with no way to grey the
+      // button out, silence is indistinguishable from a failure.
+      await sendText(params.phone, ALREADY_ANSWERED).catch(() => {});
+      return;
+    }
+
+    try {
+      const { approvalDb } = await import('./approvalDb');
+      await approvalDb.updateApprovalStatus(ref.assetUrl, verdict, `whatsapp:${ref.userId}`);
+    } catch (error) {
+      // Release so the customer can retry; a consumed claim with no recorded verdict
+      // would leave the approval permanently unanswerable from WhatsApp.
+      await settings.releaseSetMember(claimKey(ref.assetUrl), 'answered').catch(() => {});
+      throw error;
+    }
+
+    await sendText(
+      params.phone,
+      verdict === 'approved' ? 'Approved — thanks, that is recorded.' : 'Rejected — thanks, that is recorded.',
+    ).catch((e) =>
+      console.warn('[approval-notify] verdict confirmation failed to send:', e?.message || e),
+    );
+  } catch (error) {
+    // Never throw into the webhook: a 500 makes Meta retry, and a retried tap would
+    // hit the claim and be reported to the customer as "already recorded".
+    console.error(
+      '[approval-notify] handling an approval button tap failed:',
+      error instanceof Error ? error.message : error,
+    );
   }
 }

@@ -34,6 +34,7 @@ import {
   OPT_IN_CONFIRMATION,
 } from '../services/whatsappService';
 import { handleVerificationMessage } from '../services/whatsappVerificationService';
+import { handleApprovalButtonTap } from '../services/approvalChannelNotifier';
 
 const router = express.Router();
 
@@ -140,6 +141,34 @@ router.post('/', async (req, res) => {
   }
 });
 
+/**
+ * A tapped button, in whichever of the two shapes Meta sends.
+ *
+ * Non-template interactive buttons return the `id` WE set, which is the useful case.
+ * TEMPLATE quick-replies do not: Meta fills `button.payload` with the button's own
+ * LABEL, so the label is all that comes back and the action has to be inferred from it.
+ * Either way the only link to what was being approved is `context.id` — the id of the
+ * message the button sat on — so a tap without it cannot be attributed and is ignored.
+ */
+function readButtonTap(
+  message: any,
+): { action: string; contextMessageId: string } | null {
+  const contextMessageId = message?.context?.id;
+  if (typeof contextMessageId !== 'string' || !contextMessageId) return null;
+
+  if (message?.type === 'interactive' && message?.interactive?.type === 'button_reply') {
+    const action = message.interactive.button_reply?.id;
+    return typeof action === 'string' && action ? { action, contextMessageId } : null;
+  }
+
+  if (message?.type === 'button') {
+    const action = message.button?.payload ?? message.button?.text;
+    return typeof action === 'string' && action ? { action, contextMessageId } : null;
+  }
+
+  return null;
+}
+
 async function handleInboundMessage(message: any): Promise<void> {
   const from = message?.from;
   if (typeof from !== 'string' || !from) return;
@@ -148,6 +177,18 @@ async function handleInboundMessage(message: any): Promise<void> {
   // Any inbound message opens the 24-hour service window, including a STOP —
   // that is what makes the opt-out confirmation deliverable.
   await recordInboundMessage(phone);
+
+  // A tapped button carries no text body, so it must be read before the text branches
+  // below — otherwise it falls through to the verification parser and is dropped.
+  const tap = readButtonTap(message);
+  if (tap) {
+    await handleApprovalButtonTap({
+      phone,
+      approvalMessageId: tap.contextMessageId,
+      action: tap.action,
+    });
+    return;
+  }
 
   const text: string = message?.text?.body ?? '';
   const normalized = text.trim().toLowerCase();

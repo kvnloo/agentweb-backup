@@ -42,6 +42,7 @@ import {
   bindPhoneToUser,
   unbindPhone,
   resolveUserIdByPhone,
+  sendInteractiveButtons,
 } from '../services/whatsappService';
 import { MessagingChannelError } from '../services/messagingChannelService';
 
@@ -751,5 +752,88 @@ describe('phone -> user index', () => {
     settingsService.getSetting.mockResolvedValue({ settingValue: 'user-1' });
     userDb.getUserById.mockResolvedValue(null);
     await expect(resolveUserIdByPhone(PHONE)).resolves.toBeNull();
+  });
+});
+
+// ── Interactive reply buttons ──────────────────────────────────────────────
+
+describe('sendInteractiveButtons', () => {
+  const PHONE = '+14155550123';
+  const BUTTONS = [
+    { id: 'approve', title: 'Approve' },
+    { id: 'reject', title: 'Reject' },
+  ];
+  const openWindow = () =>
+    settingsService.getSetting.mockImplementation(async (k: string) =>
+      k.startsWith('whatsapp:window:') ? { settingValue: new Date().toISOString() } : null,
+    );
+
+  it('sends the interactive shape Meta expects', async () => {
+    openWindow();
+    await sendInteractiveButtons(PHONE, 'Asset waiting', BUTTONS);
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.type).toBe('interactive');
+    expect(body.interactive.type).toBe('button');
+    expect(body.interactive.body.text).toBe('Asset waiting');
+    expect(body.interactive.action.buttons).toEqual([
+      { type: 'reply', reply: { id: 'approve', title: 'Approve' } },
+      { type: 'reply', reply: { id: 'reject', title: 'Reject' } },
+    ]);
+  });
+
+  it('refuses outside the service window — out there a template is required', async () => {
+    settingsService.getSetting.mockResolvedValue(null);
+    await expect(sendInteractiveButtons(PHONE, 'x', BUTTONS)).rejects.toBeInstanceOf(
+      WhatsAppWindowClosedError,
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses more than three buttons', async () => {
+    openWindow();
+    const four = ['a', 'b', 'c', 'd'].map((x) => ({ id: x, title: x }));
+    await expect(sendInteractiveButtons(PHONE, 'x', four)).rejects.toBeInstanceOf(WhatsAppError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses an empty button list', async () => {
+    openWindow();
+    await expect(sendInteractiveButtons(PHONE, 'x', [])).rejects.toBeInstanceOf(WhatsAppError);
+  });
+
+  it('refuses duplicate titles, which Meta rejects', async () => {
+    openWindow();
+    await expect(
+      sendInteractiveButtons(PHONE, 'x', [
+        { id: 'a', title: 'Same' },
+        { id: 'b', title: 'Same' },
+      ]),
+    ).rejects.toBeInstanceOf(WhatsAppError);
+  });
+
+  it('refuses a title over 20 characters', async () => {
+    openWindow();
+    await expect(
+      sendInteractiveButtons(PHONE, 'x', [{ id: 'a', title: 'x'.repeat(21) }]),
+    ).rejects.toBeInstanceOf(WhatsAppError);
+  });
+
+  it('refuses an opted-out number like every other send', async () => {
+    settingsService.getSetting.mockImplementation(async (k: string) => {
+      if (k.startsWith('whatsapp:optout:')) return { settingValue: 'x' };
+      if (k.startsWith('whatsapp:window:')) return { settingValue: new Date().toISOString() };
+      return null;
+    });
+    await expect(sendInteractiveButtons(PHONE, 'x', BUTTONS)).rejects.toBeInstanceOf(
+      WhatsAppOptedOutError,
+    );
+  });
+
+  it('strips invisible characters from the body', async () => {
+    openWindow();
+    await sendInteractiveButtons(PHONE, 'he\u200Bllo', BUTTONS);
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.interactive.body.text).toBe('hello');
   });
 });
