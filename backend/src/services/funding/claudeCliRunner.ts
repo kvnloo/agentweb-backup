@@ -32,6 +32,18 @@ export interface ClaudeCliRunnerOptions {
    * passed on the command line, where it would be visible in the process list.
    */
   mcpServer?: ClaudeCliMcpServer;
+  /**
+   * Called for every tool call the model emits, with the id of the model message it
+   * came in. The tool bridge needs this to collapse an identical call repeated within
+   * one message, which the MCP request alone cannot show.
+   */
+  onToolUse?: (event: ClaudeCliToolUseEvent) => void;
+}
+
+export interface ClaudeCliToolUseEvent {
+  messageId: string;
+  toolUseId: string;
+  name: string;
 }
 
 export interface ClaudeCliTurnResult {
@@ -63,6 +75,7 @@ interface PooledSession {
   expectedMcpServer: string | undefined;
   /** That server's status from the latest `system/init` event. */
   mcpServerStatus: string | undefined;
+  onToolUse: ((event: ClaudeCliToolUseEvent) => void) | undefined;
 }
 
 const DEFAULT_IDLE_CLOSE_MS = 10 * 60 * 1000;
@@ -168,6 +181,7 @@ export class ClaudeCliRunner {
         stderrTail: "",
         expectedMcpServer: opts.mcpServer?.name,
         mcpServerStatus: undefined,
+        onToolUse: opts.onToolUse,
       };
 
       session.rl.on("line", (line) => this.handleLine(session, line));
@@ -337,6 +351,10 @@ export class ClaudeCliRunner {
       }
       return;
     }
+    if (parsed.type === "assistant") {
+      if (session.onToolUse) reportToolUses(parsed.message, session.onToolUse);
+      return;
+    }
     if (parsed.type !== "result" || !session.pending) return;
     const { resolve } = session.pending;
     session.pending = null;
@@ -441,6 +459,19 @@ function writeMcpConfig(scratchHomeDir: string, server: ClaudeCliMcpServer): str
   };
   writeFileSync(file, JSON.stringify(config), { mode: 0o600 });
   return file;
+}
+
+function reportToolUses(message: unknown, report: (event: ClaudeCliToolUseEvent) => void): void {
+  const { id, content } = (message ?? {}) as { id?: unknown; content?: unknown };
+  if (typeof id !== "string" || !Array.isArray(content)) return;
+  for (const block of content) {
+    if (block?.type !== "tool_use" || typeof block.id !== "string") continue;
+    try {
+      report({ messageId: id, toolUseId: block.id, name: typeof block.name === "string" ? block.name : "" });
+    } catch (err) {
+      console.error("[claudeCliRunner] onToolUse failed (swallowed):", err instanceof Error ? err.message : String(err));
+    }
+  }
 }
 
 function mcpStatus(servers: unknown, name: string): string | undefined {

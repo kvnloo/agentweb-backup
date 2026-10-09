@@ -43,6 +43,11 @@ export class ToolBridgeMcpAdapter {
     return this.bridge.openRun(claims, { ...opts, onToolsChanged: () => this.notifyToolsChanged(claims.runId) });
   }
 
+  /** Pass each tool-use the runner reports here so identical calls in one model message collapse. */
+  noteCallGroup(runId: string, callId: string, groupId: string): void {
+    this.bridge.noteCallGroup(runId, callId, groupId);
+  }
+
   closeRun(runId: string): void {
     this.closeSessions(runId);
     this.bridge.closeRun(runId);

@@ -22,7 +22,7 @@ import {
   MAX_TOOL_CONTENT_SIZE,
   TOOL_RESPONSE_S3_THRESHOLD,
 } from "../agentModeService";
-import { executePreparedTools, type ToolDispatchPorts } from "../agentMode/core/toolDispatch";
+import { executePreparedTools, NON_DEDUPABLE_TOOLS, type ToolDispatchPorts } from "../agentMode/core/toolDispatch";
 import { evaluateAgentToolPolicy } from "../agentToolGatewayService";
 import { chatbotDb } from "../chatbotService";
 import type { RunToolTokenClaims } from "./runToolToken";
@@ -116,6 +116,11 @@ export class EmmaToolBridgeExecutor implements ToolBridgeDeps {
   isReadOnly(toolName: string): boolean {
     if (toolName.startsWith("call_")) return false;
     return evaluateAgentToolPolicy({ toolName, args: {} }).effect === "read";
+  }
+
+  /** Same exemptions Emma's dispatcher applies to its own same-message collapsing. */
+  isDedupable(toolName: string): boolean {
+    return !NON_DEDUPABLE_TOOLS.has(toolName);
   }
 
   async execute(run: RunToolTokenClaims, call: BridgeToolCall): Promise<BridgeExecuteOutcome> {
