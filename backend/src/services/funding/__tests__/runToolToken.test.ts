@@ -31,15 +31,35 @@ describe('RunToolTokenStore', () => {
     expect(store.verify(tokenA, 'run-2')).toEqual({ ok: false, reason: 'wrong_run' });
   });
 
-  it('rejects an expired token and forgets it', () => {
+  it('expires a token that has been idle for the TTL, and forgets it', () => {
+    let now = 1_000;
+    const store = new RunToolTokenStore({ ttlMs: 500, now: () => now });
+    const token = store.mint(CLAIMS);
+    now = 1_500;
+    expect(store.verify(token)).toEqual({ ok: false, reason: 'expired' });
+    expect(store.verify(token)).toEqual({ ok: false, reason: 'unknown' });
+  });
+
+  it('keeps a token alive while it is in use: each successful verify extends it', () => {
     let now = 1_000;
     const store = new RunToolTokenStore({ ttlMs: 500, now: () => now });
     const token = store.mint(CLAIMS);
     now = 1_499;
     expect(store.verify(token).ok).toBe(true);
+    now = 1_998;
+    expect(store.verify(token).ok).toBe(true);
+    now = 2_498;
+    expect(store.verify(token)).toEqual({ ok: false, reason: 'expired' });
+  });
+
+  it('does not extend a token when it is presented for the wrong run', () => {
+    let now = 1_000;
+    const store = new RunToolTokenStore({ ttlMs: 500, now: () => now });
+    const token = store.mint(CLAIMS);
+    now = 1_400;
+    expect(store.verify(token, 'run-2')).toEqual({ ok: false, reason: 'wrong_run' });
     now = 1_500;
     expect(store.verify(token)).toEqual({ ok: false, reason: 'expired' });
-    expect(store.verify(token)).toEqual({ ok: false, reason: 'unknown' });
   });
 
   it('rejects a token once its run is revoked', () => {
