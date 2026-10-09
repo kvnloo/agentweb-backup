@@ -58,7 +58,8 @@ phone. Multi-tenant onboarding was evaluated and deferred — see "Deferred" bel
 | Window-aware send | Yes | `services/whatsappService.ts` `sendMessage` | Picks text vs template; this is what callers should use. |
 | Webhooks | Yes | `routes/whatsappWebhook.ts` | Inbound messages and STOP/UNSTOP. Delivery-status events are acknowledged but ignored and not persisted. |
 | Consent acknowledgement | Yes | `services/whatsappService.ts` `sendOptOutConfirmation` | The one message an opted-out number may receive. Sent AFTER the opt-out is recorded, and bypasses only the opt-out check — never the service window. |
-| Approval requests | Notify only | `services/approvalChannelNotifier.ts` | Tells the reviewer an approval is waiting and links the asset. Approving still happens in Slack or the portal — WhatsApp has no Block Kit, and reply buttons need an approved interactive template we do not have. |
+| Approval requests | **Yes, interactive** | `services/approvalRequestService.ts`, `services/approvalChannelNotifier.ts` | Inside the 24h window the customer gets Approve / Reject reply buttons (a service message — no template). Outside it, the `agentweb_approval_request` template with a link. A tap is correlated through `context.id` → `whatsapp:approval-msg:<wamid>`, because Meta returns a template button's LABEL as its payload. First tap wins (claim before write); later taps are answered, not acted on, since buttons can never be removed. Approving emails the task's subscribers exactly as a Slack approval does. |
+| Customer writes in | Yes | `services/whatsappInboundSupport.ts` | A non-command message gets a fixed greeting (once per 12h per number) and is forwarded to the team by email — `WHATSAPP_SUPPORT_INBOX`, else the `whatsapp:support-inbox` setting, else founders@ in production only. No model is involved. |
 | Read history | **No** | — | Cloud API has no history endpoint. We know only what the webhook delivered. |
 | Edit / delete a sent message | **No** | — | Not supported by the API at all. Callers send a follow-up. |
 | Threads | **No** | — | Quoted replies only. |
@@ -181,6 +182,27 @@ future channel's errors are covered without editing every call site — the mist
   messages being delivered; counting one as inbound would open a service window and
   let us message someone who never wrote to us.
 
+## One Platform Per Customer
+
+A customer is onboarded on Slack **or** WhatsApp, never both, and neither feature
+depends on the other. `services/customerChannelPolicy.ts` is the single definition of
+which platform an account is on; enforcement and every screen read it.
+
+- Connecting a second platform is refused wherever it can be asked for: starting or
+  completing WhatsApp verification for an account on Slack; an admin assigning a Slack
+  channel, the `link this channel` command, or Slack Connect provisioning for an account
+  on WhatsApp.
+- "On Slack" counts an assigned or linked channel, an organisation's channel the account
+  inherits, and a Slack Connect channel. "On WhatsApp" counts only a verified number.
+- An organisation can gain Slack after a member connected WhatsApp (three routes). That
+  is settled in the resolver rather than guarded at each route: a member who personally
+  verified WhatsApp does not also inherit the organisation's Slack channel.
+- Approvals do not require Slack. `POST /api/approval-requests` asks on whichever channel
+  the account has and answers `409 no_channel` when it has none; the task engine uses it
+  for tasks with no Slack channel and keeps the Slack endpoint, unchanged, for the rest.
+- Admins see the platform (WhatsApp number masked to four digits) on each customer row
+  and can disconnect WhatsApp on a customer's behalf.
+
 ## Deferred (documented decisions, not oversights)
 
 | Deferred | Why |
@@ -188,7 +210,7 @@ future channel's errors are covered without editing every call site — the mist
 | Campaign / marketing sends | Meta's US (+1) marketing pause makes the primary use case undeliverable to AgentWeb's customer base. |
 | Multi-tenant Embedded Signup | Half-unblocked as of 2026-10-08: the business is now **verified as a Tech Provider**, confirmed in the app's Verification page. Still needs App Review for advanced access (the app is Unpublished), and its main use case remains blocked by the same US marketing pause. |
 | Group messaging | Needs an Official Business Account and caps at 8 participants. |
-| Conversational Emma over WhatsApp | Prohibited by the Business Solution Terms since 2026-01-15. |
+| Conversational Emma over WhatsApp | A product decision, **not** a platform prohibition. The January 2026 Business Solution Terms restrict *AI Providers* distributing general-purpose assistants, not a business using AI to answer its own customers (verified against Meta's developer docs, 2026-10-09; an earlier version of this row overstated it). It stays out because the 24h window makes an assistant go mute a day after the customer's last message, and a general-purpose Emma sits on the riskier side of that line. A narrow, support-scoped assistant would be defensible. |
 
 ## Live Verification
 
