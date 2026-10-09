@@ -872,3 +872,44 @@ describe('runCrmFreshnessShadow (ENG-2263)', () => {
     expect(() => runCrmFreshnessShadow({ finalText: '47 [verified: get_lead_lists]', toolCalls: [], log })).not.toThrow();
   });
 });
+
+describe('review findings on the continuation + parsing paths (ENG-2263)', () => {
+  it.each(['go ahead, how many lists now?', 'keep going and re-query', 'continue and tell me the total', 'proceed - how many leads?'])(
+    '%p is a new request, not a bare continue', (t) => { expect(looksLikeContinueRequest(t)).toBe(false); });
+
+  it.each(['go ahead please', 'continue from where you left off', 'ok keep going now', 'yes, continue.'])(
+    '%p is still a continue', (t) => { expect(looksLikeContinueRequest(t)).toBe(true); });
+
+  it('a "go ahead, how many lists now?" follow-up still has its stale restated total flagged', () => {
+    const history = [
+      { role: 'user', content: 'how many lists?' },
+      { role: 'assistant', content: 'You have 18 lead lists.', metadata: { toolCalls: [ok('get_lead_lists')], crmEvidence: { numbers: [18], tools: ['get_lead_lists'] } } },
+      { role: 'user', content: 'go ahead, how many lists now?' },
+    ];
+    const r = detectCrmFreshnessMismatch('You have 18 lead lists.', [], undefined, crmEvidenceFromEarlierInvocations(history));
+    expect(r.findings.map((f) => f.kind)).toEqual(['inventory_total_not_in_tool_results']);
+  });
+
+  it('abstains on totals when the earlier invocation only WROTE to the CRM (the totals moved and nothing recorded them)', () => {
+    const history = [
+      { role: 'user', content: 'make a list' },
+      { role: 'assistant', content: 'done', metadata: { toolCalls: [ok('create_lead_list')] } },
+      { role: 'user', content: 'go', metadata: { kind: 'auto-continuation' } },
+    ];
+    const r = detectCrmFreshnessMismatch('You now have 18 lead lists.', [], undefined, crmEvidenceFromEarlierInvocations(history));
+    expect(r.findings).toEqual([]);
+  });
+
+  it('a colon followed by a huge whitespace run does not stall the detector (quadratic lead-in regex)', () => {
+    const t0 = Date.now();
+    const r = detectCrmFreshnessMismatch('Note:' + ' '.repeat(80000) + 'x\nYou have 47 lead lists.', []);
+    expect(Date.now() - t0).toBeLessThan(400);
+    expect(r.findings).toHaveLength(1);
+  });
+
+  it('200k of claims with no paragraph breaks stays fast (unbounded paragraph search)', () => {
+    const t0 = Date.now();
+    detectCrmFreshnessMismatch('5 leads in total. '.repeat(11000), []);
+    expect(Date.now() - t0).toBeLessThan(400);
+  });
+});
