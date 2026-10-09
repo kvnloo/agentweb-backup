@@ -37,6 +37,7 @@ import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
 import { PendingApprovalDeck } from './agentMode/core/approvalDeck';
 import { WorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import { WorkflowRunState } from './agentMode/core/workflow';
+import { assertSequentialStepCounts } from './workPlanSteps';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -3728,15 +3729,7 @@ export class ChatbotDB {
     const timestamp = new Date().toISOString();
 
     // Validate stepCount - must be sequential starting from 1 (index+1)
-    for (let i = 0; i < workPlan.steps.length; i++) {
-      const expectedStepCount = i + 1;
-      if (workPlan.steps[i].stepCount !== expectedStepCount) {
-        throw new Error(
-          `Invalid stepCount at index ${i}: expected ${expectedStepCount} but got ${workPlan.steps[i].stepCount}. ` +
-          `Steps must be numbered sequentially starting from 1 (stepCount must equal index+1).`
-        );
-      }
-    }
+    assertSequentialStepCounts(workPlan.steps);
 
     const validatedWorkPlan = {
       ...workPlan,
@@ -3826,6 +3819,55 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session LLM model:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-903: undo a plan-launch model write, but only if the session still holds the model
+   * that launch wrote. A plain conditional UpdateItem on EXISTING attributes (no schema
+   * change). If a user changed the model after the launch's write, the condition fails and
+   * their choice is left alone (resolves false). A session that had NO explicit model gets
+   * `REMOVE llmModel`, returning it to exactly its prior state instead of a stored default.
+   * Resolves true when restored; rethrows any other failure.
+   */
+  async restoreSessionLlmModelIfUnchanged(
+    sessionId: string,
+    expectedModel: string,
+    previous: { llmModel?: string; llmUsagePolicyDecision?: NonNullable<ChatSession['llmUsagePolicyDecision']> },
+  ): Promise<boolean> {
+    const sets: string[] = [];
+    const removes: string[] = [];
+    const values: Record<string, any> = { ":planModel": expectedModel };
+    if (previous.llmModel) {
+      sets.push("llmModel = :prevModel");
+      values[":prevModel"] = previous.llmModel;
+    } else {
+      removes.push("llmModel");
+    }
+    if (previous.llmUsagePolicyDecision) {
+      sets.push("llmUsagePolicyDecision = :prevDecision");
+      values[":prevDecision"] = previous.llmUsagePolicyDecision;
+    } else {
+      removes.push("llmUsagePolicyDecision");
+    }
+    sets.push("adminListPartition = :adminListPartition");
+    values[":adminListPartition"] = "all";
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: `SET ${sets.join(", ")}${removes.length ? ` REMOVE ${removes.join(", ")}` : ""}`,
+      ConditionExpression: "llmModel = :planModel",
+      ExpressionAttributeValues: values,
+    };
+    try {
+      await dynamodb.update(params).promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === "ConditionalCheckFailedException" || error?.name === "ConditionalCheckFailedException") {
+        return false;
+      }
+      console.error("Error restoring session LLM model:", error);
       throw error;
     }
   }
