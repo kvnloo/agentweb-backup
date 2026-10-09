@@ -320,15 +320,15 @@ function parseCount(raw: string, hedged: boolean): CountRange | null {
 const HEDGE = '(?:(?:about|around|roughly|approximately|approx\\.?|nearly|almost|over|some)\\s+)?';
 // pluralOnly: the pattern is only grammatical for a count above one ("N lists", "N leads"), so a claim of 1 there is a verb
 // ("No one lists the prices"), not a count.
-interface InventoryPattern { re: RegExp; needsCrmContext: boolean; pluralOnly: boolean; /** also reads as a per-category row in a breakdown: skipped inside parentheses or after a row label */ subsetProne?: boolean }
+interface InventoryPattern { re: RegExp; needsCrmContext: boolean; pluralOnly: boolean; /** also reads as a per-category row in a breakdown: skipped inside parentheses or after a row label */ subsetProne?: boolean; /** 'Some Qualifier Lead Lists: N' is a category row when a qualifier word precedes the label */ rowLabelProne?: boolean }
 const INVENTORY_PATTERNS: InventoryPattern[] = [
   { pluralOnly: true, needsCrmContext: false, subsetProne: true, re: new RegExp(`\\b${NUM}\\s+(?:total\\s+)?(?:lead\\s+)?lists\\b`, 'gi') },
   { pluralOnly: false, needsCrmContext: true, re: new RegExp(`\\b(?:total|overall)\\s+(?:number\\s+of\\s+)?(?:lead\\s+)?(?:leads|lists|contacts)(?:\\s+across\\s+all\\s+(?:your\\s+)?(?:lead\\s+)?lists)?[ \\t:*\\-\u2013\u2014]{0,12}${NUM}\\b(?![.)]\\s)`, 'gi') },
   { pluralOnly: true, needsCrmContext: true, re: new RegExp(`\\b${NUM}\\s+(?:total\\s+)?leads\\s+(?:in\\s+total|total|in\\s+your\\s+(?:entire\\s+|whole\\s+)?crm)\\b`, 'gi') },
-  { pluralOnly: false, needsCrmContext: false, re: new RegExp(`\\b(?:total |overall )?(?:number of )?lead lists[ \\t:*\\-\u2013\u2014]{1,12}${NUM}\\b(?![.)]\\s)`, 'gi') },
+  { pluralOnly: false, needsCrmContext: false, rowLabelProne: true, re: new RegExp(`\\b(?:total |overall )?(?:number of )?lead lists[ \\t:*\\-\u2013\u2014]{1,12}${NUM}\\b(?![.)]\\s)`, 'gi') },
   { pluralOnly: true, needsCrmContext: false, subsetProne: true, re: new RegExp(`\\b${NUM}\\s+leads\\s+(?:across|in)\\s+(?:${NUM}\\s+(?:\\w+\\s+)?lists|your\\s+(?:entire\\s+|whole\\s+)?crm)`, 'gi') },
   // "Your CRM currently has / contains / holds about 1.2k leads"
-  { pluralOnly: true, needsCrmContext: false, re: new RegExp(`\\b(?:crm|account|database|pipeline)\\b[^.\\n]{0,40}?\\b(?:has|have|contains?|holds?|includes?|stands at|totals?|is at|comes? to)\\s+${HEDGE}${NUM}\\s+(?:total\\s+)?(?:leads|contacts|records|lists)\\b`, 'gi') },
+  { pluralOnly: true, needsCrmContext: false, re: new RegExp(`\\b(?:crm|account|database|pipeline)\\b(?:\\s+(?:currently|now|account|database|data|total|overall|also|still|right\\s+now|as\\s+a\\s+whole))*\\s+(?:has|have|contains?|holds?|includes?|stands at|totals?|is at|comes? to)\\s+${HEDGE}${NUM}\\s+(?:total\\s+)?(?:leads|contacts|records|lists)\\b`, 'gi') },
   // "a total of 4,999 leads", "with a total of twelve lead lists"
   { pluralOnly: true, needsCrmContext: true, re: new RegExp(`\\btotal\\s+of\\s+${HEDGE}${NUM}\\s+(?:lead\\s+)?(?:leads|contacts|records|lists)\\b`, 'gi') },
   // "You have 47 leads." (a bare statement, not "5 leads named Test" / "3 leads needing follow-up")
@@ -356,6 +356,12 @@ function paragraphAround(text: string, at: number, maxEachSide = 300): string {
 const WHOLE_ACCOUNT_LABEL = /\b(total|overall|crm|your|account|all|entire|summary|snapshot|overview|status|current|now|result|inventory)\b/i;
 // "Six lists account for 14,829 of your contacts": the lists the sentence goes on to single out, not how many there are.
 const SUBSET_AFTER = /^\s*(?:account(?:s|ed)?\s+for|make\s+up|represent|together|combined|each|alone)\b/i;
+// "Landing Page Lead Lists: 15+ ...": a qualifier word in front of the label makes it a category row. Bare / Total / Overall / Number of keep the claim.
+const LABEL_FILLER = new Set(['your', 'the', 'our', 'my', 'a', 'an', 'of', 'all', 'in', 'is', 'are', 'and', 'now', 'currently', 'with', 'total', 'overall', 'number', 'by', 'for', 'to', 'has', 'have', 'show', 'shows', 'showing']);
+const QUALIFIED_LABEL_BEFORE = { test(before: string): boolean {
+  const w = /([A-Za-z][A-Za-z&-]*)[ \t]+$/.exec(before);
+  return !!w && !LABEL_FILLER.has(w[1].toLowerCase());
+} };
 function inBreakdownRow(text: string, at: number): boolean {
   const lineStart = text.lastIndexOf('\n', at - 1) + 1;
   const before = text.slice(Math.max(lineStart, at - 200), at);
@@ -368,7 +374,7 @@ function inBreakdownRow(text: string, at: number): boolean {
 
 function findInventoryClaims(text: string): Array<CountRange & { at: number }> {
   const out: Array<CountRange & { at: number }> = [];
-  for (const { re, needsCrmContext, pluralOnly, subsetProne } of INVENTORY_PATTERNS) {
+  for (const { re, needsCrmContext, pluralOnly, subsetProne, rowLabelProne } of INVENTORY_PATTERNS) {
     re.lastIndex = 0;
     for (const m of text.matchAll(re)) {
       if (out.length >= MAX_CLAIMS) return out;
@@ -376,6 +382,7 @@ function findInventoryClaims(text: string): Array<CountRange & { at: number }> {
       if (needsCrmContext && !(CRM_CONTEXT.test(sentenceAround(text, at)) || CRM_CONTEXT.test(paragraphAround(text, at)))) continue;
       // "Remaining 15 lists: 0 leads" / "the other 4 lists" is a breakdown of a subset, not the account total.
       if (SUBSET_BEFORE.test(text.slice(Math.max(0, at - 24), at))) continue;
+      if (rowLabelProne && QUALIFIED_LABEL_BEFORE.test(text.slice(Math.max(0, at - 40), at))) continue;
       if (subsetProne && /\blists\b/i.test(m[0]) && (inBreakdownRow(text, at) || SUBSET_AFTER.test(text.slice(at + m[0].length, at + m[0].length + 24)))) continue;
       for (const g of m.slice(1)) {
         if (!g) continue;
