@@ -539,11 +539,61 @@ describe('createSession (fail-loud)', () => {
     expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, expect.anything());
   });
 
-  it('an explicit llmModel on an emma-sidebar creation is intentionally ignored (admin-configured model stamped, 201)', async () => {
+  // ENG-903: these session types run on a fixed, admin-configured model; a chat-model
+  // choice is meaningless there and must be refused, never silently ignored.
+  const FIXED_BODY_CODE = 'model_not_selectable_for_session_type';
+
+  it.each([
+    ['emma-sidebar portal', { portalType: 'emma-sidebar' }],
+    ['report_generation', { portalType: 'agent', sessionType: 'report_generation' }],
+    ['image-generation', { portalType: 'agent', sessionType: 'image-generation' }],
+    ['video-generation', { portalType: 'agent', sessionType: 'video-generation' }],
+    ['book-generation', { portalType: 'agent', sessionType: 'book-generation' }],
+    ['scheduled', { portalType: 'agent', sessionType: 'scheduled' }],
+  ])('422s an explicit llmModel for a %s session and writes nothing', async (_n, extra) => {
+    for (const llmModel of ['gpt-5.5', UNSERVED]) {
+      const res = makeRes();
+      await agentModeController.createSession(createReq({ ...extra, llmModel }), res);
+      expect(res.statusCode).toBe(422);
+      expect(res.body).toMatchObject({
+        code: FIXED_BODY_CODE,
+        error: 'This kind of session uses a fixed model and does not accept a model choice.',
+      });
+    }
+    expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+  });
+
+  it('422s an explicit llmModel on a skill session (before the skill is even loaded)', async () => {
     const res = makeRes();
-    await agentModeController.createSession(createReq({ portalType: 'emma-sidebar', llmModel: UNSERVED }), res);
+    await agentModeController.createSession(
+      { user: { userId: OWNER }, params: { skillId: 'skill-1' }, body: { llmModel: 'gpt-5.5' } } as unknown as Request,
+      res,
+    );
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toMatchObject({ code: FIXED_BODY_CODE });
+    expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['emma-sidebar portal', { portalType: 'emma-sidebar' }],
+    ['report_generation', { portalType: 'agent', sessionType: 'report_generation' }],
+    ['image-generation', { portalType: 'agent', sessionType: 'image-generation' }],
+  ])('a %s session with no / blank model still creates on the admin-configured model', async (_n, extra) => {
+    for (const body of [{ ...extra }, { ...extra, llmModel: '' }, { ...extra, llmModel: '   ' }]) {
+      mockChatbotDb.updateSessionLlmModel.mockClear();
+      const res = makeRes();
+      await agentModeController.createSession(createReq(body), res);
+      expect(res.statusCode).toBe(201);
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, undefined);
+    }
+  });
+
+  it('an explicit sessionType "regular" with a served model is still an ordinary chat session', async () => {
+    const res = makeRes();
+    await agentModeController.createSession(createReq({ portalType: 'agent', sessionType: 'regular', llmModel: 'gpt-5.5' }), res);
     expect(res.statusCode).toBe(201);
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, undefined);
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'gpt-5.5', expect.anything());
   });
 });
 
