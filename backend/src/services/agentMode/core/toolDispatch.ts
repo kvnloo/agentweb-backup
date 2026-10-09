@@ -357,6 +357,12 @@ export interface ToolDispatchPorts {
   recordDuplicateSuppression?: (
     entries: Array<{ toolCall: any; functionArgs: any; duplicateOfId: string }>,
   ) => void;
+  /**
+   * ENG-2263: observe the FULL (pre-minimisation) result of a successful tool call. Optional and
+   * observability-only - the ledger stores a minimised result, so anything that needs the real numbers
+   * must take them here. Must not throw; a throw is swallowed.
+   */
+  observeFullToolResult?: (toolName: string, fullResult: any) => void;
   /** extract the minimal result stored on the toolCalls ledger entry */
   extractMinimalToolResult: (result: any, toolName: string) => any;
   /** extract the string content fed back to the model as the tool message */
@@ -1362,6 +1368,7 @@ export async function executePreparedTools(
       }
 
       const minimalResult = ports.extractMinimalToolResult(processedResult, toolCall.function.name);
+      try { ports.observeFullToolResult?.(toolCall.function.name, processedResult); } catch { /* observability only */ }
 
       toolCalls.push({
         id: toolCall.id,
