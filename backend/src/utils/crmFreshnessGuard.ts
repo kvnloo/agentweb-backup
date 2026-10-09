@@ -320,13 +320,13 @@ function parseCount(raw: string, hedged: boolean): CountRange | null {
 const HEDGE = '(?:(?:about|around|roughly|approximately|approx\\.?|nearly|almost|over|some)\\s+)?';
 // pluralOnly: the pattern is only grammatical for a count above one ("N lists", "N leads"), so a claim of 1 there is a verb
 // ("No one lists the prices"), not a count.
-interface InventoryPattern { re: RegExp; needsCrmContext: boolean; pluralOnly: boolean }
+interface InventoryPattern { re: RegExp; needsCrmContext: boolean; pluralOnly: boolean; /** also reads as a per-category row in a breakdown: skipped inside parentheses or after a row label */ subsetProne?: boolean }
 const INVENTORY_PATTERNS: InventoryPattern[] = [
-  { pluralOnly: true, needsCrmContext: false, re: new RegExp(`\\b${NUM}\\s+(?:total\\s+)?(?:lead\\s+)?lists\\b`, 'gi') },
+  { pluralOnly: true, needsCrmContext: false, subsetProne: true, re: new RegExp(`\\b${NUM}\\s+(?:total\\s+)?(?:lead\\s+)?lists\\b`, 'gi') },
   { pluralOnly: false, needsCrmContext: true, re: new RegExp(`\\b(?:total|overall)\\s+(?:number\\s+of\\s+)?(?:lead\\s+)?(?:leads|lists|contacts)(?:\\s+across\\s+all\\s+(?:your\\s+)?(?:lead\\s+)?lists)?[ \\t:*\\-\u2013\u2014]{0,12}${NUM}\\b(?![.)]\\s)`, 'gi') },
   { pluralOnly: true, needsCrmContext: true, re: new RegExp(`\\b${NUM}\\s+(?:total\\s+)?leads\\s+(?:in\\s+total|total|in\\s+your\\s+(?:entire\\s+|whole\\s+)?crm)\\b`, 'gi') },
   { pluralOnly: false, needsCrmContext: false, re: new RegExp(`\\b(?:total |overall )?(?:number of )?lead lists[ \\t:*\\-\u2013\u2014]{1,12}${NUM}\\b(?![.)]\\s)`, 'gi') },
-  { pluralOnly: true, needsCrmContext: false, re: new RegExp(`\\b${NUM}\\s+leads\\s+(?:across|in)\\s+(?:${NUM}\\s+(?:\\w+\\s+)?lists|your\\s+(?:entire\\s+|whole\\s+)?crm)`, 'gi') },
+  { pluralOnly: true, needsCrmContext: false, subsetProne: true, re: new RegExp(`\\b${NUM}\\s+leads\\s+(?:across|in)\\s+(?:${NUM}\\s+(?:\\w+\\s+)?lists|your\\s+(?:entire\\s+|whole\\s+)?crm)`, 'gi') },
   // "Your CRM currently has / contains / holds about 1.2k leads"
   { pluralOnly: true, needsCrmContext: false, re: new RegExp(`\\b(?:crm|account|database|pipeline)\\b[^.\\n]{0,40}?\\b(?:has|have|contains?|holds?|includes?|stands at|totals?|is at|comes? to)\\s+${HEDGE}${NUM}\\s+(?:total\\s+)?(?:leads|contacts|records|lists)\\b`, 'gi') },
   // "a total of 4,999 leads", "with a total of twelve lead lists"
@@ -335,7 +335,7 @@ const INVENTORY_PATTERNS: InventoryPattern[] = [
   { pluralOnly: true, needsCrmContext: true, re: new RegExp(`\\byou\\s+(?:currently\\s+|now\\s+)?(?:have|hold|manage)\\s+${HEDGE}${NUM}\\s+(?:total\\s+)?(?:leads|contacts|records)\\b(?=\\s*(?:[.,;:!)\\]]|$|in\\s+total|overall|altogether|in\\s+your|across\\s+(?:all\\s+)?(?:your\\s+)?(?:\\d+\\s+|\\w+\\s+)?(?:lists|the\\s+crm)))`, 'gi') },
 ];
 
-const SUBSET_BEFORE = /\b(remaining|other|another|rest of(?: the)?|empty|those|these|all but|except(?: for)?|plus|new|created|added|imported|built|made|found|[\d,]+(?:\.\d+)?k?\s+across)\s+$/i;
+const SUBSET_BEFORE = /\b(remaining|other|another|rest of(?: the)?|empty|those|these|all but|except(?: for)?|plus|new|created|added|imported|built|made|found|[\d,]+(?:\.\d+)?k?\s+(?:total\s+)?(?:leads?\s+|contacts?\s+)?across)\s+$/i;
 // "N leads in total" / "Total leads: N" also describe a Apollo search, an import, a pasted list. Count them as an account
 // total only when CRM wording is in the same sentence.
 const CRM_CONTEXT = /\b(crm|lead lists?|your lists?|all (?:of )?(?:your )?lists|across (?:all )?(?:your |the )?(?:\d+ )?(?:lead )?lists|pipeline|contacts? database)\b/i;
@@ -351,9 +351,22 @@ function paragraphAround(text: string, at: number, maxEachSide = 300): string {
   return win.slice(before === -1 ? 0 : before, after === -1 ? win.length : after);
 }
 
+// A label that introduces the whole account ("Summary:", "Your CRM:", "Total:") keeps its claim; any other "Label: 23 leads across 2 lists" row
+// ("Calendly Bookings: ...") describes one group.
+const WHOLE_ACCOUNT_LABEL = /\b(total|overall|crm|your|account|all|entire|summary|snapshot|overview|status|current|now|result|inventory)\b/i;
+function inBreakdownRow(text: string, at: number): boolean {
+  const lineStart = text.lastIndexOf('\n', at - 1) + 1;
+  const before = text.slice(Math.max(lineStart, at - 200), at);
+  let depth = 0;
+  for (const ch of before) { if (ch === '(') depth++; else if (ch === ')' && depth > 0) depth--; }
+  if (depth > 0) return true; // "Test & QA (~110 leads across 25 lists)"
+  const label = /^[\s\-*\u2022\d.)]*([^:()\n]{1,60}):\s*$/.exec(before);
+  return !!label && !WHOLE_ACCOUNT_LABEL.test(label[1]);
+}
+
 function findInventoryClaims(text: string): Array<CountRange & { at: number }> {
   const out: Array<CountRange & { at: number }> = [];
-  for (const { re, needsCrmContext, pluralOnly } of INVENTORY_PATTERNS) {
+  for (const { re, needsCrmContext, pluralOnly, subsetProne } of INVENTORY_PATTERNS) {
     re.lastIndex = 0;
     for (const m of text.matchAll(re)) {
       if (out.length >= MAX_CLAIMS) return out;
@@ -361,6 +374,7 @@ function findInventoryClaims(text: string): Array<CountRange & { at: number }> {
       if (needsCrmContext && !(CRM_CONTEXT.test(sentenceAround(text, at)) || CRM_CONTEXT.test(paragraphAround(text, at)))) continue;
       // "Remaining 15 lists: 0 leads" / "the other 4 lists" is a breakdown of a subset, not the account total.
       if (SUBSET_BEFORE.test(text.slice(Math.max(0, at - 24), at))) continue;
+      if (subsetProne && /\blists\b/i.test(m[0]) && inBreakdownRow(text, at)) continue;
       for (const g of m.slice(1)) {
         if (!g) continue;
         const gAt = m[0].indexOf(g);
