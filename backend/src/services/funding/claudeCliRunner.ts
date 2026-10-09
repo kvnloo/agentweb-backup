@@ -158,6 +158,12 @@ export class ClaudeCliRunner {
         .catch(() => undefined);
     }
     await inFlight;
+    // This call may have joined a spawn started by an earlier one (a prewarm) with
+    // other options. The process then holds that call's MCP config, not this one's.
+    const spawned = this.pool.get(conversationId);
+    if (opts.mcpServer && spawned && !spawned.closed && !sameMcpServer(spawned.mcpServer, opts.mcpServer)) {
+      throw new Error("claudeCliRunner: a session is already open for this conversation with a different MCP server; close it first");
+    }
     return { conversationId };
   }
 

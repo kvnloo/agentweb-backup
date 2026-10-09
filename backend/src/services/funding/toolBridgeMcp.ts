@@ -34,14 +34,16 @@ const EMPTY_INPUT_SCHEMA = { type: "object", properties: {} };
 interface McpSession {
   server: Server;
   transport: StreamableHTTPServerTransport;
-  /** Settled the next time this session fetches its tool list. */
-  relistWaiters: Set<() => void>;
+  /** Set when the run closed while this session was being set up; closed once its response is out. */
+  orphaned?: boolean;
 }
 
 type BridgeRequest = IncomingMessage & { body?: unknown };
 
 export class ToolBridgeMcpAdapter {
   private readonly sessionsByRun = new Map<string, Map<string, McpSession>>();
+  /** Per run: settled the next time any of its sessions fetches the tool list. */
+  private readonly relistWaiters = new Map<string, Set<() => void>>();
 
   constructor(private readonly bridge: ToolBridge) {}
 
@@ -108,6 +110,7 @@ export class ToolBridgeMcpAdapter {
     }
 
     await session.transport.handleRequest(req, res, req.body);
+    if (session.orphaned) session.transport.close().catch(() => undefined);
     return true;
   }
 
@@ -121,7 +124,7 @@ export class ToolBridgeMcpAdapter {
       } catch (err) {
         throw new Error(err instanceof ToolBridgeAuthError ? "This run has ended." : "The tool list is unavailable.");
       }
-      for (const wake of [...session.relistWaiters]) wake();
+      this.wakeRelistWaiters(runId);
       return {
         tools: tools.map((tool) => ({
           name: tool.name,
@@ -166,8 +169,9 @@ export class ToolBridgeMcpAdapter {
         try {
           this.bridge.verify(token, runId);
         } catch {
-          // The run closed while this session was being set up.
-          transport.close().catch(() => undefined);
+          // The run closed while this session was being set up. Closing here would cut
+          // the initialize response off mid-flight; handle() closes it once that is out.
+          session.orphaned = true;
           return;
         }
         let sessions = this.sessionsByRun.get(runId);
@@ -187,41 +191,52 @@ export class ToolBridgeMcpAdapter {
       }
     };
 
-    const session: McpSession = { server, transport, relistWaiters: new Set() };
+    const session: McpSession = { server, transport };
     await server.connect(transport);
     return session;
   }
 
+  /**
+   * Tells every session of the run to re-read its tools, then waits for the first one
+   * that does. A harness that reconnected leaves its old session registered and silent;
+   * waiting for all of them would hold every list change for the full timeout.
+   */
   private async notifyToolsChanged(runId: string): Promise<void> {
     const sessions = [...(this.sessionsByRun.get(runId)?.values() ?? [])];
-    await Promise.all(
-      sessions.map(async (session) => {
-        const relisted = new Promise<void>((resolve) => {
-          const settle = () => {
-            clearTimeout(timer);
-            session.relistWaiters.delete(settle);
-            resolve();
-          };
-          const timer = setTimeout(settle, RELIST_WAIT_MS);
-          session.relistWaiters.add(settle);
-        });
-        try {
-          await session.server.sendToolListChanged();
-        } catch (err) {
-          console.error("[tool-bridge] list_changed not delivered:", err instanceof Error ? err.message : String(err));
-          for (const wake of [...session.relistWaiters]) wake();
-        }
-        await relisted;
-      }),
-    );
+    if (sessions.length === 0) return;
+    const relisted = new Promise<void>((resolve) => {
+      let waiters = this.relistWaiters.get(runId);
+      if (!waiters) {
+        waiters = new Set();
+        this.relistWaiters.set(runId, waiters);
+      }
+      const settle = () => {
+        clearTimeout(timer);
+        waiters.delete(settle);
+        if (waiters.size === 0 && this.relistWaiters.get(runId) === waiters) this.relistWaiters.delete(runId);
+        resolve();
+      };
+      const timer = setTimeout(settle, RELIST_WAIT_MS);
+      waiters.add(settle);
+    });
+    for (const session of sessions) {
+      session.server.sendToolListChanged().catch((err: unknown) => {
+        console.error("[tool-bridge] list_changed not delivered:", err instanceof Error ? err.message : String(err));
+      });
+    }
+    await relisted;
+  }
+
+  private wakeRelistWaiters(runId: string): void {
+    for (const wake of [...(this.relistWaiters.get(runId) ?? [])]) wake();
   }
 
   private closeSessions(runId: string): void {
     const sessions = this.sessionsByRun.get(runId);
     if (!sessions) return;
     this.sessionsByRun.delete(runId);
+    this.wakeRelistWaiters(runId);
     for (const session of sessions.values()) {
-      for (const wake of [...session.relistWaiters]) wake();
       session.transport.close().catch(() => undefined);
     }
   }

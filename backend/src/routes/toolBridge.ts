@@ -28,16 +28,30 @@ export function isLocalOnlyRequest(req: Pick<Request, "headers" | "socket">): bo
   return LOOPBACK_ADDRESSES.has(req.socket?.remoteAddress ?? "");
 }
 
+function runIdFromPath(path: string): string | null {
+  const match = /^\/([^/]+)\/mcp\/?$/.exec(path);
+  if (!match) return null;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
+}
+
 export function createToolBridgeRouter(adapter: ToolBridgeMcpAdapter): express.Router {
   const router = express.Router();
 
-  router.all("/:runId/mcp", async (req: Request, res: Response, next: NextFunction) => {
-    if (!isLocalOnlyRequest(req)) {
+  // Matched by hand rather than with a `:runId` pattern: Express answers an undecodable
+  // path parameter with its own error before any handler runs, which would tell this
+  // route apart from a missing path.
+  router.use(async (req: Request, res: Response, next: NextFunction) => {
+    const runId = runIdFromPath(req.path);
+    if (runId === null || !isLocalOnlyRequest(req)) {
       next();
       return;
     }
     try {
-      if (!(await adapter.handle(req, res, req.params.runId))) next();
+      if (!(await adapter.handle(req, res, runId))) next();
     } catch (err) {
       console.error("[tool-bridge] request failed:", err instanceof Error ? err.message : String(err));
       if (!res.headersSent) res.status(500).json({ error: "internal error" });
