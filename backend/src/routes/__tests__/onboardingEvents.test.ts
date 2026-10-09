@@ -119,6 +119,21 @@ describe("POST /api/onboarding/events", () => {
     expect(mockOnOnboardingStageChanged).not.toHaveBeenCalled();
   });
 
+  it("a review-screen click does not move an existing lifecycle stage or fire contact automation", async () => {
+    mockGetUserById.mockResolvedValueOnce({
+      userId: "user-123",
+      email: "user@example.com",
+      onboardingStage: "brand_submitted",
+      onboardingEvents: [{ event: "brand_submitted", ts: "2026-04-18T10:00:00Z" }],
+    });
+    const res = await request(makeApp())
+      .post("/api/onboarding/events")
+      .send({ event: "brand_review_icp_regenerate", data: { icpId: "icp_1" } });
+    expect(res.status).toBe(200);
+    expect(res.body.onboardingStage).toBe("brand_submitted");
+    expect(mockOnOnboardingStageChanged).not.toHaveBeenCalled();
+  });
+
   it("keeps the existing lifecycle stage unchanged for later voice events", async () => {
     mockGetUserById.mockResolvedValueOnce({
       userId: "user-123",
@@ -357,6 +372,18 @@ describe("POST /api/onboarding/events", () => {
     "voice_onboarding_presented",
     "voice_onboarding_started",
     "voice_onboarding_text_fallback",
+    // ENG-2308: the portal sent these on every review-screen click and got a
+    // 400 because they were never declared.
+    "brand_review_brand_edit",
+    "brand_review_confirmed",
+    "brand_review_icp_edit",
+    "brand_review_icp_regenerate",
+    "brand_review_icp_remove",
+    "brand_review_valueprop_edit",
+    "phase3_generate_ads",
+    "phase3_icp_selected",
+    "phase3_pick_for_me",
+    "phase3_summary_confirmed",
   ])(
     "records %s without initializing lifecycle stage or firing contact automation",
     async (event) => {
