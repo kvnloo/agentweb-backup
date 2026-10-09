@@ -87,8 +87,9 @@ const REGENERATED = {
   meta_targeting_brief: "new brief",
 };
 
+let lastSeed: any;
 function seedUser(overrides: Record<string, unknown> = {}) {
-  return {
+  lastSeed = {
     userId: "u1",
     email: "founder@acme.com",
     companyName: "Acme",
@@ -98,15 +99,33 @@ function seedUser(overrides: Record<string, unknown> = {}) {
     icpResult: FIVE.map((p) => ({ ...p })),
     ...overrides,
   };
+  return lastSeed;
 }
 
-/** Last `icpResult` written to the DB across all updateUser calls. */
+/**
+ * The persona list after every write, in order. A card is saved by replacing
+ * ONE slot (`elementSets`), not by sending the whole list, so the result is the
+ * last record the code read with those slots applied. (The concurrency suite
+ * below uses a stateful fake that also enforces the slot conditions.)
+ */
 function lastWrittenIcps(): any[] | undefined {
-  const calls = userDb.updateUser.mock.calls;
-  for (let i = calls.length - 1; i >= 0; i--) {
-    if (calls[i][1] && calls[i][1].icpResult) return calls[i][1].icpResult;
+  let list: any[] | undefined = lastSeed?.icpResult ? lastSeed.icpResult.map((p: any) => ({ ...p })) : undefined;
+  let wrote = false;
+  for (const call of userDb.updateUser.mock.calls) {
+    const patch = call[1] ?? {};
+    if (patch.icpResult) {
+      list = patch.icpResult;
+      wrote = true;
+    }
+    for (const el of call[2]?.elementSets ?? []) {
+      if (el.path.length === 1 && el.path[0] === "icpResult" && list) {
+        list = [...list];
+        list[el.index] = el.value;
+        wrote = true;
+      }
+    }
   }
-  return undefined;
+  return wrote ? list : undefined;
 }
 
 beforeEach(() => {
@@ -383,19 +402,30 @@ describe("regenerateSingleIcpForUser — joined a full run (deferStatusToFullRun
     await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), deferStatusToFullRun: true });
 
     expect(userDb.updateUser).toHaveBeenCalledTimes(1);
-    const patch = userDb.updateUser.mock.calls[0][1];
-    expect(Object.keys(patch)).toEqual(["icpResult"]);
-    expect(patch.icpResult[1].name).toBe(REGENERATED.name);
+    const [, patch, opts] = userDb.updateUser.mock.calls[0];
+    // No status, no whole list: just the one slot.
+    expect(patch).toEqual({});
+    expect(opts.elementSets).toHaveLength(1);
+    expect(opts.elementSets[0]).toMatchObject({ path: ["icpResult"], index: 1 });
+    expect(opts.elementSets[0].value.name).toBe(REGENERATED.name);
   });
 
   it("conditions the card save on the joined run still being in flight", async () => {
     const startedAt = "2026-04-24T11:59:00.000Z";
-    userDb.getUserById.mockResolvedValue(seedUser({ icpStartedAt: startedAt }));
+    userDb.getUserById.mockResolvedValue(
+      seedUser({ icpStartedAt: startedAt, icpResult: FIVE.map((p, i) => ({ ...p, id: `icp_x_${i}` })) }),
+    );
     userDb.updateUser.mockResolvedValue({});
     await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), deferStatusToFullRun: true });
     const opts = userDb.updateUser.mock.calls[0][2];
-    expect(opts.condition.expression).toBe("#icpStatus = :icpDeferRunning AND #icpStartedAt = :icpDeferStartedAt");
-    expect(opts.condition.values).toEqual({ ":icpDeferRunning": "running", ":icpDeferStartedAt": startedAt });
+    expect(opts.condition.expression).toBe(
+      "#icpStatus = :icpDeferRunning AND #icpStartedAt = :icpDeferStartedAt AND #icpResult[1].#icpCardId = :icpCardId",
+    );
+    expect(opts.condition.values).toEqual({
+      ":icpCardId": "icp_x_1",
+      ":icpDeferRunning": "running",
+      ":icpDeferStartedAt": startedAt,
+    });
   });
 
   it("drops the card save without error when the full run landed first (condition fails)", async () => {
@@ -424,7 +454,9 @@ describe("regenerateSingleIcpForUser — joined a full run (deferStatusToFullRun
     userDb.getUserById.mockResolvedValue(seedUser({ icpStatus: "ready" }));
     userDb.updateUser.mockResolvedValue({});
     await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), deferStatusToFullRun: true });
-    expect(userDb.updateUser.mock.calls[0][1].icpResult[1].name).toBe(REGENERATED.name);
+    // Status already left `running`: the card is still saved, in its own slot.
+    expect(userDb.updateUser.mock.calls[0][2].elementSets[0].value.name).toBe(REGENERATED.name);
+    expect(lastWrittenIcps()![1].name).toBe(REGENERATED.name);
   });
 
   it("without the flag it still flips running -> ready as before", async () => {
@@ -532,12 +564,20 @@ describe("regenerateSingleIcpForUser — competitor entry follows the persona", 
 
     await regenerateSingleIcpForUser("u1", 2, { llm: new FakeLlm({ icp: REGENERATED }) });
 
-    const calls = userDb.updateUser.mock.calls;
-    const compWrite = calls.map((c: any[]) => c[1]).filter((p: any) => p?.competitorResult).pop();
-    expect(compWrite).toBeDefined();
-    expect(compWrite.competitorResult.per_icp[2].icp_id).toBe(REGENERATED.name);
-    expect(compWrite.competitorResult.per_icp[0]).toEqual(per_icp[0]);
-    expect(compWrite.competitorResult.per_icp[4]).toEqual(per_icp[4]);
+    const compCall = userDb.updateUser.mock.calls.find((c: any[]) =>
+      c[2]?.elementSets?.some((e: any) => e.path[0] === "competitorResult"),
+    );
+    expect(compCall).toBeDefined();
+    const [, patch, opts] = compCall;
+    // Only this persona's slot is written, so the other four entries cannot be
+    // clobbered by (or clobber) a concurrent regeneration.
+    expect(patch).toEqual({});
+    expect(opts.elementSets).toHaveLength(1);
+    expect(opts.elementSets[0]).toMatchObject({ path: ["competitorResult", "per_icp"], index: 2 });
+    expect(opts.elementSets[0].value.icp_id).toBe(REGENERATED.name);
+    // ...and only if that slot still holds the entry generated for this card.
+    expect(opts.condition.expression).toBe("#competitorResult.#perIcp[2].#icpId = :slotIcpId");
+    expect(opts.condition.values).toEqual({ ":slotIcpId": FIVE[2].name });
   });
 });
 
