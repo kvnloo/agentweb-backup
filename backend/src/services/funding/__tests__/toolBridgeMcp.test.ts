@@ -246,6 +246,63 @@ describe('tool bridge MCP endpoint', () => {
     expect(Date.now() - started).toBeLessThan(4_000);
   });
 
+  it('does not hold a tool-list change for a session the harness abandoned', async () => {
+    const token = adapter.openRun(RUN);
+    const abandoned = await connect(token);
+    await abandoned.listTools();
+    // Gone without a DELETE: the session stays registered and will never re-read its tools.
+    await (abandoned.transport as StreamableHTTPClientTransport).close();
+    const live = await connect(token);
+    live.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
+      await live.listTools();
+    });
+
+    deps.execute.mockResolvedValueOnce(ok('installed', { toolsChanged: true }));
+    const started = Date.now();
+    await live.callTool({ name: 'install_skills', arguments: {} });
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  it('answers an initialize whose run closed mid-setup instead of leaving it hanging, and registers nothing', async () => {
+    const token = adapter.openRun(RUN);
+    const realVerify = bridge.verify.bind(bridge);
+    let calls = 0;
+    jest.spyOn(bridge, 'verify').mockImplementation((t, id) => {
+      calls += 1;
+      const claims = realVerify(t, id);
+      if (calls === 1) adapter.closeRun(RUN.runId); // closes right after the request was let in
+      return claims;
+    });
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3_000);
+    const res = await fetch(`${baseUrl}/internal/tool-bridge/${RUN.runId}/mcp`, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 't', version: '1' } },
+      }),
+    });
+    await res.text(); // must end; a hanging stream aborts and fails the test
+    clearTimeout(timer);
+    expect((adapter as any).sessionsByRun.size).toBe(0);
+  });
+
+  it('answers an undecodable run id exactly as it answers a missing path', async () => {
+    adapter.openRun(RUN);
+    const post = async (path: string) => {
+      const res = await fetch(`${baseUrl}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+      return { status: res.status, body: (await res.text()).replace(path, 'PATH') };
+    };
+    const bridgePath = await post('/internal/tool-bridge/%FF/mcp');
+    expect(bridgePath).toEqual(await post('/internal/tool-bridge/%FF/nothing-here'));
+    expect(bridgePath.status).toBe(404);
+  });
+
   it('returns the halt refusal to the client once a result requires confirmation', async () => {
     deps.execute.mockResolvedValueOnce(ok('{"previewToken":"abc"}', { requiresConfirmation: true }));
     const token = adapter.openRun(RUN);

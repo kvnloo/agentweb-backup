@@ -708,5 +708,22 @@ describe('ClaudeCliRunner', () => {
     expect(mockRmSync).toHaveBeenCalledTimes(2);
   });
 
+  it('refuses a spawn that joined an in-flight one started with a different MCP server', async () => {
+    const runner = trackedRunner();
+    // A prewarm with no tools and the real turn's spawn, issued before the first lands.
+    const prewarm = runner.prewarm('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    const real = runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP });
+    await expect(prewarm).resolves.toEqual({ conversationId: 'conv-1' });
+    await expect(real).rejects.toThrow(/different MCP server/);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+
+    const a = runner.spawn('conv-2', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP });
+    const b = runner.spawn('conv-2', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: { ...MCP, bearerToken: 'other' } });
+    const c = runner.spawn('conv-2', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP });
+    await expect(a).resolves.toEqual({ conversationId: 'conv-2' });
+    await expect(b).rejects.toThrow(/different MCP server/);
+    await expect(c).resolves.toEqual({ conversationId: 'conv-2' });
+  });
+
   void mkdtempSync; // referenced only via the module under test; keeps the fs mock import used
 });
