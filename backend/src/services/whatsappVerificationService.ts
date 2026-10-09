@@ -380,3 +380,40 @@ export async function handleVerificationMessage(text: string, phone: string): Pr
   }
   return true;
 }
+
+// ── Disconnecting ──────────────────────────────────────────────────────────
+
+/**
+ * Remove an account's WhatsApp number. One implementation for both ways it can happen:
+ * the customer removing it in their own Settings, and an admin removing it for them.
+ *
+ * Writes back EXPLICIT channel entries only, so removing WhatsApp cannot pin the
+ * account's Slack destination as a side effect. The phone -> user index is cleared
+ * after the record, so a disconnected number stops resolving to this account; if that
+ * clear fails the index self-heals on its next read, so it never fails the disconnect.
+ *
+ * The platform-level STOP list is deliberately left alone: opting out is the
+ * customer's instruction to us and outlives which account the number was attached to.
+ *
+ * Returns the number that was removed, or null if there was none.
+ */
+export async function disconnectWhatsApp(
+  userId: string,
+): Promise<{ removed: string | null; channels: UserMessagingChannelConfig[] } | null> {
+  const user = await userDb.getUserById(userId);
+  if (!user) return null;
+
+  const existing = explicitChannels(user as any);
+  const removed = existing.find((c) => c.channel === 'whatsapp')?.destination ?? null;
+  const channels = existing.filter((c) => c.channel !== 'whatsapp');
+  await userDb.updateUser(userId, { messagingChannels: channels } as any);
+
+  if (removed) {
+    try {
+      await unbindPhone(removed);
+    } catch (e: any) {
+      console.warn('[whatsapp] could not clear phone index on disconnect:', e?.message || e);
+    }
+  }
+  return { removed, channels };
+}

@@ -24,8 +24,11 @@ import { authenticateToken } from '../middleware/auth';
 import { userDb } from '../services/db';
 import { explicitChannels, normalizeUserChannels } from '../services/messagingChannelService';
 import { getDisplayPhoneNumber, isOptedOut } from '../services/whatsappService';
-import { getVerificationStatus, startVerification } from '../services/whatsappVerificationService';
-import { unbindPhone } from '../services/whatsappService';
+import {
+  disconnectWhatsApp,
+  getVerificationStatus,
+  startVerification,
+} from '../services/whatsappVerificationService';
 import {
   assertCanConnect,
   getPlatformSummary,
@@ -152,28 +155,9 @@ router.get('/whatsapp/verification', authenticateToken, async (req: any, res: an
  */
 router.delete('/whatsapp', authenticateToken, async (req: any, res: any) => {
   try {
-    const user = await userDb.getUserById(req.user.userId);
-    if (!user) return res.status(404).json({ error: 'User not found' });
-
-    // Explicit entries only — see explicitChannels. Removing WhatsApp must not have
-    // the side effect of pinning the user's Slack destination.
-    const existing = explicitChannels(user);
-    const removed = existing.find((c) => c.channel === 'whatsapp')?.destination;
-    const messagingChannels = existing.filter((c) => c.channel !== 'whatsapp');
-    await userDb.updateUser(req.user.userId, { messagingChannels } as any);
-
-    // Clear the phone -> user index too, AFTER the record is gone. Leaving it would let
-    // a disconnected number keep answering this account's inbound actions. Not fatal if
-    // it fails — resolveUserIdByPhone re-checks the user record and self-heals — so it
-    // must not turn a successful disconnect into an error.
-    if (removed) {
-      try {
-        await unbindPhone(removed);
-      } catch (e: any) {
-        console.warn('[messaging-channels] could not clear phone index:', e?.message || e);
-      }
-    }
-    res.json({ success: true, channels: messagingChannels });
+    const result = await disconnectWhatsApp(req.user.userId);
+    if (!result) return res.status(404).json({ error: 'User not found' });
+    res.json({ success: true, channels: result.channels });
   } catch (error: any) {
     console.error('[messaging-channels] whatsapp delete failed:', error);
     res.status(500).json({ error: 'Failed to remove WhatsApp number' });

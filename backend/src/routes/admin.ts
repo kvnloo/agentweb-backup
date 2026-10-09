@@ -1399,6 +1399,54 @@ router.get("/slack/channel-info", async (req, res) => {
 });
 
 // Update user slack channels (accepts an array)
+/**
+ * Disconnect a customer's WhatsApp number on their behalf (ENG-273).
+ *
+ * A customer is on one messaging platform, and only they could remove WhatsApp — so one
+ * who wanted to move to Slack and did not do it themselves left support with no way to
+ * help. This is the same disconnect the customer's own Settings performs.
+ *
+ * It removes a number the customer verified and consented with, so it is recorded with
+ * who did it, and the customer is told on WhatsApp when the 24-hour window allows.
+ */
+router.delete("/users/:userId/whatsapp", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const adminId = (req as any).user?.userId || 'unknown-admin';
+    const { disconnectWhatsApp } = await import('../services/whatsappVerificationService');
+
+    const result = await disconnectWhatsApp(userId);
+    if (!result) return res.status(404).json({ message: "User not found" });
+    if (!result.removed) {
+      return res.status(409).json({ message: "This account has no WhatsApp number connected." });
+    }
+
+    const { redactPhone, sendText } = await import('../services/whatsappService');
+    console.log(
+      `[admin] WhatsApp ${redactPhone(result.removed)} disconnected from user ${userId} by admin ${adminId}`,
+    );
+
+    // Best-effort courtesy notice. Outside the 24h window nothing but a template can be
+    // sent, and there is no template for this — so it may not arrive, and must never
+    // fail a disconnect that has already happened.
+    let customerNotified = false;
+    try {
+      await sendText(
+        result.removed,
+        'Your WhatsApp number has been disconnected from AgentWeb by our support team, so you will no longer receive notifications here. You can reconnect it any time from AgentWeb Settings.',
+      );
+      customerNotified = true;
+    } catch {
+      /* window closed, opted out, or Meta unavailable */
+    }
+
+    res.json({ success: true, customerNotified });
+  } catch (error: any) {
+    console.error("Error disconnecting WhatsApp:", error?.message || error);
+    res.status(500).json({ message: "Failed to disconnect WhatsApp" });
+  }
+});
+
 router.put("/users/:userId/slack-channel", async (req, res) => {
   try {
     const { userId } = req.params;

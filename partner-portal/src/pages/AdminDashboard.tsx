@@ -2707,6 +2707,43 @@ export default function AdminDashboard() {
     }
   };
 
+  // ENG-273: disconnect a customer's WhatsApp on their behalf. A customer is on one
+  // messaging platform, so this is also the only way support can move one to Slack.
+  const handleDisconnectWhatsApp = async (userId: string, maskedNumber?: string | null) => {
+    const which = maskedNumber ? ` (${maskedNumber})` : "";
+    if (!window.confirm(
+      `Disconnect this customer's WhatsApp number${which}?\n\n` +
+      "They will stop receiving AgentWeb notifications and approval requests on WhatsApp. " +
+      "They can reconnect from their own Settings, or you can then assign a Slack channel."
+    )) {
+      return;
+    }
+    try {
+      const response = await axios.delete(
+        buildApiUrl(`/api/admin/users/${userId}/whatsapp`),
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (response.status === 200) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === userId
+              ? { ...user, messagingPlatform: null, messagingPlatformSource: null, whatsappNumberMasked: null }
+              : user
+          )
+        );
+        setSuccess(
+          response.data?.customerNotified
+            ? "WhatsApp disconnected. The customer was told on WhatsApp."
+            : "WhatsApp disconnected. The customer could not be told on WhatsApp (outside the 24-hour window)."
+        );
+      }
+    } catch (error: unknown) {
+      console.error("Error disconnecting WhatsApp:", error);
+      const message = axios.isAxiosError(error) ? error.response?.data?.message : undefined;
+      setError(typeof message === "string" && message ? message : "Failed to disconnect WhatsApp");
+    }
+  };
+
   const handleSaveAdminSlackChannel = async () => {
     try {
       setAdminSlackChannelLoading(true);
@@ -4878,9 +4915,17 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                       <Typography variant="body2">
                                         WhatsApp{user.whatsappNumberMasked ? ` (${user.whatsappNumberMasked})` : ""}
                                       </Typography>
-                                      <Typography variant="caption" color="text.secondary">
+                                      <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
                                         Slack can't be added while WhatsApp is connected.
                                       </Typography>
+                                      <Button
+                                        size="small"
+                                        color="error"
+                                        sx={{ mt: 0.5, p: 0, minWidth: 0, textTransform: "none" }}
+                                        onClick={() => handleDisconnectWhatsApp(user.userId, user.whatsappNumberMasked)}
+                                      >
+                                        Disconnect WhatsApp
+                                      </Button>
                                     </Box>
                                   ) : (
                                     <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, flexWrap: "wrap" }}>

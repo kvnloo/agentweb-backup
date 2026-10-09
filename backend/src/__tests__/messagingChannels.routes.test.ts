@@ -30,6 +30,8 @@ jest.mock('../services/whatsappService', () => ({
 jest.mock('../services/whatsappVerificationService', () => ({
   startVerification: jest.fn(),
   getVerificationStatus: jest.fn(),
+  // The real disconnect: the DELETE tests below assert on what it writes.
+  disconnectWhatsApp: jest.requireActual('../services/whatsappVerificationService').disconnectWhatsApp,
 }));
 
 const { userDb } = require('../services/db');
