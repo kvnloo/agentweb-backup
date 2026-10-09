@@ -17,14 +17,16 @@ const mockRmSync = rmSync as jest.Mock;
 
 interface FakeChild extends EventEmitter {
   stdout: Readable;
-  stdin: { write: jest.Mock };
+  stderr: Readable;
+  stdin: { write: jest.Mock; on: jest.Mock };
   kill: jest.Mock;
 }
 
 function createFakeChild(): FakeChild {
   const child = new EventEmitter() as FakeChild;
   child.stdout = new Readable({ read() {} });
-  child.stdin = { write: jest.fn() };
+  child.stderr = new Readable({ read() {} });
+  child.stdin = { write: jest.fn(), on: jest.fn() };
   child.kill = jest.fn();
   return child;
 }
@@ -189,6 +191,36 @@ describe('ClaudeCliRunner', () => {
     expect(second).toEqual(first);
   });
 
+  it('serializes concurrent spawn() calls for the same conversationId onto one real process', async () => {
+    const runner = trackedRunner();
+    const [first, second] = await Promise.all([
+      runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE),
+      runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE),
+    ]);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    expect(second).toEqual(first);
+  });
+
+  it('closeSessionInternal deletes by identity, not by key — a stale session cannot erase a different live one at the same key', async () => {
+    // Regression for the fixed TOCTOU race: without the identity check, closing a
+    // stale session object could delete a different, live session that has since
+    // taken its old pool slot. spawn() itself now serializes concurrent calls so this
+    // race can no longer arise through the public API — this exercises the guard directly.
+    const runner = trackedRunner();
+    const handleA = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    const childA = spawnedChildren[0];
+    const pool: Map<string, any> = (runner as any).pool;
+    const sessionA = pool.get('conv-1');
+    expect(sessionA).toBeDefined();
+
+    const sessionB = { ...sessionA, closed: false };
+    pool.set('conv-1', sessionB); // simulate B having since taken A's old slot
+
+    childA.emit('exit', 0); // A's own process exiting late must not erase B
+    expect(pool.get('conv-1')).toBe(sessionB);
+    void handleA;
+  });
+
   // ─── Pre-warm — spawn ahead of the first real turn, same pool, no double-spawn ──
 
   it('prewarm() opens a session with no turn in flight, reused by a later send()', async () => {
@@ -225,6 +257,167 @@ describe('ClaudeCliRunner', () => {
     expect(mockSpawn).toHaveBeenCalledTimes(2);
   });
 
+  it('enforces the cap across DIFFERENT conversationIds fired without awaiting between them', async () => {
+    // Regression: the cap check used to read pool.size, which only grows after a spawn's
+    // own async gap. Firing spawn() for several different conversationIds back-to-back,
+    // with no await between them, let every one of them see the same stale pool.size (0)
+    // before any had actually incremented it -- all bypassing the cap. Found live against
+    // the real binary: cap=2, three real `claude -p` processes ended up running at once.
+    // The existing cap test above never caught this because it awaits conv-a before
+    // spawning conv-b, so pool.size was already correctly incremented by then.
+    const runner = trackedRunner({ maxConcurrentProcesses: 2 });
+
+    let cSpawned = false;
+    const pA = runner.spawn('conv-a', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    const pB = runner.spawn('conv-b', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    const pC = runner.spawn('conv-c', CONFIG_DIR, SYSTEM_PROMPT_FILE).then((h) => {
+      cSpawned = true;
+      return h;
+    });
+
+    await flush();
+    expect(mockSpawn).toHaveBeenCalledTimes(2); // only conv-a and conv-b may have actually spawned
+    expect(cSpawned).toBe(false); // conv-c must be queued, not a third real process
+
+    const handleA = await pA;
+    runner.close(handleA);
+    await pC;
+    expect(cSpawned).toBe(true);
+    expect(mockSpawn).toHaveBeenCalledTimes(3);
+    expect(runner.activeProcessCount).toBe(2);
+
+    await pB;
+  });
+
+  it('releasing a slot abandoned by an aborted queued spawn does not leak capacity', async () => {
+    // A queued spawn that gets cancelled via close() while still queued never creates a
+    // session, so nothing but its own doSpawn's cleanup can release the slot it was handed.
+    const runner = trackedRunner({ maxConcurrentProcesses: 1 });
+    const handleA = await runner.spawn('conv-a', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+
+    const spawnBPromise = runner.spawn('conv-b', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    await flush();
+    runner.close({ conversationId: 'conv-b' }); // cancel conv-b while still queued
+    runner.close(handleA); // free conv-a's slot -- conv-b's doSpawn wakes, sees pendingCloseRequests, aborts
+    await spawnBPromise;
+    await flush();
+
+    // The slot conv-b aborted with must still be usable -- not leaked.
+    const handleD = await runner.spawn('conv-d', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    expect(mockSpawn).toHaveBeenCalledTimes(2); // conv-a and conv-d; conv-b never actually spawned
+    expect(runner.activeProcessCount).toBe(1);
+    void handleD;
+  });
+
+  it('cancelling a queued spawn via close() does not corrupt the slot count and reopen the cap', async () => {
+    // Regression: close()/closeAll() used to resolve a cancelled queued entry directly,
+    // without going through releaseSlotToQueue() -- but doSpawn's own cleanup had no way
+    // to tell that apart from a real slot handoff, so it released a slot that was never
+    // granted, driving the internal slot count negative. The previous test's single
+    // follow-up spawn couldn't reveal this (pool.size looks correct either way with only
+    // one more spawn) -- it only shows up once a SECOND un-awaited spawn exploits the
+    // corrupted count to bypass the cap again, exactly as found live against the real binary.
+    const runner = trackedRunner({ maxConcurrentProcesses: 1 });
+    const handleA = await runner.spawn('conv-a', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+
+    const spawnBPromise = runner.spawn('conv-b', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    await flush();
+    runner.close({ conversationId: 'conv-b' }); // cancel while queued -- never held a slot
+    runner.close(handleA); // free conv-a's slot
+    await spawnBPromise;
+    await flush();
+
+    let eSpawned = false;
+    const pD = runner.spawn('conv-d', CONFIG_DIR, SYSTEM_PROMPT_FILE); // not awaited
+    const pE = runner.spawn('conv-e', CONFIG_DIR, SYSTEM_PROMPT_FILE).then((h) => { // not awaited either
+      eSpawned = true;
+      return h;
+    });
+    await flush();
+
+    // With the cap genuinely still at 1, conv-e must queue behind conv-d, not spawn
+    // concurrently with it.
+    expect(mockSpawn).toHaveBeenCalledTimes(2); // conv-a and conv-d only; conv-e must still be queued
+    expect(eSpawned).toBe(false);
+    expect(runner.activeProcessCount).toBe(1);
+
+    await pD; // conv-d already has its slot (fast path) -- resolves immediately.
+    // conv-e stays queued by design (nothing closes conv-d here) -- afterEach's
+    // closeAll() cleans it up; asserting eSpawned === false above is the real check.
+    void pE;
+  });
+
+  it('close() on a conversationId still queued behind the cap cancels it — it never spawns a process', async () => {
+    const runner = trackedRunner({ maxConcurrentProcesses: 1 });
+    const handleA = await runner.spawn('conv-a', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+
+    const spawnBPromise = runner.spawn('conv-b', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    await flush();
+    expect(mockSpawn).toHaveBeenCalledTimes(1); // conv-b is queued, not yet spawned
+
+    runner.close({ conversationId: 'conv-b' }); // cancel it while still queued
+    runner.close(handleA); // free the slot conv-b was waiting on
+    await spawnBPromise;
+    await flush();
+
+    expect(mockSpawn).toHaveBeenCalledTimes(1); // conv-b must never have spawned a real process
+    expect(runner.activeProcessCount).toBe(0);
+  });
+
+  it('closeAll() guarantees nothing still queued spawns afterward, even asynchronously', async () => {
+    const runner = trackedRunner({ maxConcurrentProcesses: 1 });
+    await runner.spawn('conv-a', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+
+    const spawnBPromise = runner.spawn('conv-b', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    await flush();
+    expect(mockSpawn).toHaveBeenCalledTimes(1); // conv-b still queued
+
+    runner.closeAll();
+    await spawnBPromise;
+    await flush();
+
+    // conv-b's queued spawn must self-abort, not spawn a process "after shutdown".
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    expect(runner.activeProcessCount).toBe(0);
+  });
+
+  it('closeAll() also prevents a fast-path spawn (never queued — a slot was free) from completing afterward', async () => {
+    // Regression: closeAll() used to mark only spawnQueue entries as pending-close.
+    // When the pool isn't at the cap, waitForFreeSlot never queues the call at all — it
+    // still doesn't resume past its own `await` until the next microtask tick, so a
+    // closeAll() running synchronously right after an un-awaited spawn() used to miss it
+    // entirely, letting a real process spawn asynchronously right after "shutdown" returned.
+    const runner = trackedRunner(); // default cap (8) — well above 1, so this is the fast path
+    const spawnPromise = runner.spawn('conv-fast', CONFIG_DIR, SYSTEM_PROMPT_FILE); // not awaited
+    runner.closeAll(); // synchronous, in the same tick — before doSpawn can resume past its await
+
+    await spawnPromise;
+    await flush();
+
+    expect(mockSpawn).toHaveBeenCalledTimes(0); // must never have actually spawned a process
+    expect(runner.activeProcessCount).toBe(0);
+  });
+
+  it('close() on a conversationId with nothing live or in flight is a no-op — it does not poison a later spawn()', async () => {
+    // Regression: close() used to unconditionally plant a pendingCloseRequests marker
+    // even when there was nothing live or queued to cancel. That marker then silently
+    // consumed the NEXT unrelated spawn() call for the same id, which would resolve with
+    // a fake-successful handle pointing at no real session.
+    const runner = trackedRunner();
+    runner.close({ conversationId: 'ghost' }); // nothing live, nothing in flight for 'ghost'
+
+    const handle = await runner.spawn('ghost', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    expect(mockSpawn).toHaveBeenCalledTimes(1); // must have actually spawned, not silently no-op'd
+    expect(runner.activeProcessCount).toBe(1);
+
+    const child = spawnedChildren[0];
+    const turn = runner.send(handle, 'hi');
+    emitResult(child, { type: 'result', is_error: false, result: 'ok' });
+    await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
+  });
+
   // ─── Idle close ─────────────────────────────────────────────────────────────
 
   it('closes an idle session after the idle timeout and cleans up its scratch HOME dir', async () => {
@@ -255,6 +448,22 @@ describe('ClaudeCliRunner', () => {
 
     emitResult(child, { type: 'result', is_error: false, result: 'ok' });
     await turn;
+    jest.useRealTimers();
+  });
+
+  it('the idle timer firing mid-turn does not kill a session with a genuinely in-flight turn', async () => {
+    jest.useFakeTimers();
+    const runner = trackedRunner({ idleCloseMs: 1000 });
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    const child = spawnedChildren[0];
+
+    const turn = runner.send(handle, 'a turn that runs long');
+    jest.advanceTimersByTime(1001); // the idle timer armed at send() fires while the turn is still pending
+    expect(child.kill).not.toHaveBeenCalled();
+    expect(runner.activeProcessCount).toBe(1); // must still be open, not closed as "idle"
+
+    emitResult(child, { type: 'result', is_error: false, result: 'finally done' });
+    await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'finally done' }));
     jest.useRealTimers();
   });
 
@@ -289,6 +498,35 @@ describe('ClaudeCliRunner', () => {
     const turn = runner.send(handle, 'hi');
     child.stdout.push('not json at all\n');
     await flush();
+    emitResult(child, { type: 'result', is_error: false, result: 'ok' });
+    await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
+  });
+
+  it('a synchronous stdin.write() throw rejects that turn and clears pending — the session is not permanently wedged', async () => {
+    const runner = trackedRunner();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    const child = spawnedChildren[0];
+    child.stdin.write.mockImplementationOnce(() => {
+      throw new Error('EPIPE');
+    });
+
+    await expect(runner.send(handle, 'first, fails to even write')).rejects.toThrow('EPIPE');
+
+    // A second send() must be accepted, not rejected by a stale "already in flight" guard.
+    const secondTurn = runner.send(handle, 'second, should be able to proceed');
+    emitResult(child, { type: 'result', is_error: false, result: 'ok' });
+    await expect(secondTurn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
+  });
+
+  it('drains stderr without crashing the session (prevents an OS pipe-buffer deadlock on this long-lived, --verbose child)', async () => {
+    const runner = trackedRunner();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    const child = spawnedChildren[0];
+
+    child.stderr.push('some diagnostic --verbose output\n'.repeat(500));
+    await flush();
+
+    const turn = runner.send(handle, 'hi');
     emitResult(child, { type: 'result', is_error: false, result: 'ok' });
     await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
   });
