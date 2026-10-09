@@ -1,0 +1,84 @@
+/**
+ * ENG-2105 (A1): store-level guards that hold even when two requests race, which the
+ * service's own checks cannot cover.
+ */
+import type { LlmConnectionRecord } from '../llmConnectionDb';
+import { makeDb } from './llmConnectionTestKit';
+
+const NOW = '2026-10-09T00:00:00.000Z';
+const LATER = '2026-10-09T00:05:00.000Z';
+
+function record(overrides: Partial<LlmConnectionRecord> = {}): LlmConnectionRecord {
+  return {
+    connectionId: 'conn-1',
+    ownerUserId: 'user-1',
+    kind: 'api_key',
+    provider: 'anthropic',
+    status: 'active',
+    keyLast4: 'abcd',
+    createdAt: NOW,
+    updatedAt: NOW,
+    orgId: 'org-1',
+    sealed: { v: 1, wrappedDataKey: 'w', iv: 'i', ciphertext: 'c', tag: 't' },
+    ...overrides,
+  };
+}
+
+describe('LlmConnectionDb', () => {
+  it('refuses to overwrite an existing connection id', async () => {
+    const { db } = makeDb();
+    await db.create(record());
+    await expect(db.create(record({ ownerUserId: 'user-2' }))).rejects.toMatchObject({ code: 'ConditionalCheckFailedException' });
+    expect((await db.get('conn-1'))?.ownerUserId).toBe('user-1');
+  });
+
+  it('revokes once: the key and the org share go in that write, and a second revoke changes nothing', async () => {
+    const { db } = makeDb();
+    await db.create(record());
+    expect(await db.revoke('conn-1', { userId: 'user-1' }, LATER)).toBe(true);
+    const row = await db.get('conn-1');
+    expect(row).toMatchObject({ status: 'revoked', revokedAt: LATER, revokedByUserId: 'user-1' });
+    expect(row?.sealed).toBeUndefined();
+    expect(row?.orgId).toBeUndefined();
+
+    expect(await db.revoke('conn-1', { userId: 'user-9' }, '2026-10-10T00:00:00.000Z')).toBe(false);
+    expect((await db.get('conn-1'))?.revokedByUserId).toBe('user-1');
+    expect(await db.revoke('no-such-id', { userId: 'user-1' }, LATER)).toBe(false);
+    expect(await db.get('no-such-id')).toBeNull();
+  });
+
+  it('a check that finishes after a revoke cannot bring the connection back', async () => {
+    const { db } = makeDb();
+    await db.create(record());
+    await db.revoke('conn-1', { userId: 'user-1' }, LATER);
+    expect(await db.recordCheck('conn-1', { result: 'ok', status: 'active', ok: true }, LATER)).toBe(false);
+    expect((await db.get('conn-1'))?.status).toBe('revoked');
+  });
+
+  it('a share that lands after a revoke does not re-share it', async () => {
+    const { db } = makeDb();
+    await db.create(record({ orgId: undefined }));
+    await db.revoke('conn-1', { userId: 'user-1' }, LATER);
+    expect(await db.setSharedOrg('conn-1', 'org-1', LATER)).toBe(false);
+    expect(await db.listSharedWithOrg('org-1')).toEqual([]);
+  });
+
+  it('lists an owner\'s connections oldest first, and an org\'s shared ones only', async () => {
+    const { db } = makeDb();
+    await db.create(record({ connectionId: 'b', createdAt: '2026-10-09T00:00:02.000Z', orgId: undefined }));
+    await db.create(record({ connectionId: 'a', createdAt: '2026-10-09T00:00:01.000Z' }));
+    await db.create(record({ connectionId: 'c', ownerUserId: 'user-2', createdAt: '2026-10-09T00:00:03.000Z', orgId: 'org-2' }));
+    expect((await db.listByOwner('user-1')).map((r) => r.connectionId)).toEqual(['a', 'b']);
+    expect((await db.listSharedWithOrg('org-1')).map((r) => r.connectionId)).toEqual(['a']);
+
+    expect(await db.setSharedOrg('a', null, LATER)).toBe(true);
+    expect(await db.listSharedWithOrg('org-1')).toEqual([]);
+  });
+
+  it('records a failed check without touching the last-ok time', async () => {
+    const { db } = makeDb();
+    await db.create(record({ lastOkAt: NOW }));
+    expect(await db.recordCheck('conn-1', { result: 'invalid_key', status: 'invalid', ok: false }, LATER)).toBe(true);
+    expect(await db.get('conn-1')).toMatchObject({ status: 'invalid', lastCheckResult: 'invalid_key', lastCheckedAt: LATER, lastOkAt: NOW });
+  });
+});

@@ -23,6 +23,8 @@
 export interface TableKeySchema {
   hash: string;
   range?: string;
+  /** Global secondary indexes, by IndexName. Items lacking the index's hash attribute are not in it. */
+  indexes?: Record<string, { hash: string; range?: string }>;
 }
 
 /**
@@ -273,7 +275,11 @@ export class InMemoryDynamo {
       query(params: any) {
         return {
           promise: async () => {
-            const schema = self.schema(params.TableName);
+            const tableSchema = self.schema(params.TableName);
+            const schema = params.IndexName ? tableSchema.indexes?.[params.IndexName] : tableSchema;
+            if (!schema) {
+              throw new Error(`inMemoryDynamo: no index ${params.IndexName} registered for ${params.TableName}`);
+            }
             const values = params.ExpressionAttributeValues || {};
             const names = params.ExpressionAttributeNames || {};
             assertPlaceholdersResolved(params.KeyConditionExpression, values);
