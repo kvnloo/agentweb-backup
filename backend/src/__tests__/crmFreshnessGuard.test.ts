@@ -913,3 +913,18 @@ describe('review findings on the continuation + parsing paths (ENG-2263)', () =>
     expect(Date.now() - t0).toBeLessThan(400);
   });
 });
+
+describe('sub-breakdown phrasing is not an inventory claim (ENG-2263)', () => {
+  const calls = [ok('get_lead_lists')];
+  it('"Calendly Bookings (23 across 2 lists)" inside a CRM breakdown does not claim 2 lists', () => {
+    const text = 'Your CRM breakdown: Targeted Outreach & Events: SF B2C Exec Event (600), Calendly Bookings (23 across 2 lists).';
+    const c = createCrmEvidenceCollector();
+    c.record('get_lead_lists', { success: true, totalLists: 96, lists: [{ listId: 'a', leadCount: 600 }, { listId: 'b', leadCount: 23 }, { listId: 'c', leadCount: 9 }] });
+    expect(detectCrmFreshnessMismatch(text, calls, c.snapshot()).findings).toEqual([]);
+  });
+  it('a real stale total phrased "N leads across K lists" is still flagged', () => {
+    const c = createCrmEvidenceCollector();
+    c.record('get_lead_lists', { success: true, totalLists: 96, lists: [{ listId: 'a', leadCount: 600 }] });
+    expect(detectCrmFreshnessMismatch('Your CRM has 15,490 leads across 97 lists.', calls, c.snapshot()).findings.length).toBeGreaterThan(0);
+  });
+});
