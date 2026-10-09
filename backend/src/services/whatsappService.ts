@@ -131,6 +131,7 @@ export function toE164(raw: string, defaultCountry?: CountryCode): string | null
 const WINDOW_MS = 24 * 60 * 60 * 1000;
 const windowKey = (phone: string) => `whatsapp:window:${phone}`;
 const optOutKey = (phone: string) => `whatsapp:optout:${phone}`;
+const phoneUserKey = (phone: string) => `whatsapp:phone-user:${phone}`;
 
 /**
  * Record an inbound message, opening (or extending) the 24-hour service window.
@@ -188,6 +189,75 @@ export async function recordOptIn(phone: string, source: string): Promise<void> 
 export async function isOptedOut(phone: string): Promise<boolean> {
   const row = await settingsService.getSetting(optOutKey(phone));
   return !!row?.settingValue;
+}
+
+// ── Sender identity ────────────────────────────────────────────────────────
+
+/**
+ * Phone -> user, the reverse of the binding `messagingChannels` already stores.
+ *
+ * Verification runs the other way round: a code identifies the user, and the sender's
+ * number is written onto that user's record. That is enough to SEND, which is all the
+ * channel did at first. Anything the customer initiates — tapping an approval button,
+ * answering a form — arrives identified only by a phone number, and there is no index
+ * from a number back to an account. Scanning every user per inbound message is not an
+ * option on the webhook's latency budget.
+ *
+ * So the inverse row is written at bind time, next to the window and opt-out rows that
+ * are already keyed this way. It is a cache of a fact the user record owns, never the
+ * source of truth: `resolveUserIdByPhone` re-reads the user and confirms the number is
+ * still their verified destination before trusting it, so a stale row resolves to
+ * nothing rather than to the wrong account.
+ */
+export async function bindPhoneToUser(phone: string, userId: string): Promise<void> {
+  await settingsService.setSetting(
+    phoneUserKey(phone),
+    userId,
+    'WhatsApp sender identity (phone -> user)',
+    'system',
+  );
+}
+
+export async function unbindPhone(phone: string): Promise<void> {
+  await settingsService.deleteSetting(phoneUserKey(phone));
+}
+
+/**
+ * The user who has verified this number, or null.
+ *
+ * Deliberately re-reads and re-checks the user record rather than trusting the index.
+ * The row is written at bind time and cleared on disconnect, but a crash between those
+ * two writes, or a number that moved to another account, would otherwise resolve an
+ * inbound action to someone who no longer owns the number — which, for an approval
+ * button, means one customer answering another customer's decision.
+ */
+export async function resolveUserIdByPhone(phone: string): Promise<string | null> {
+  const row = await settingsService.getSetting(phoneUserKey(phone));
+  const userId = row?.settingValue;
+  if (!userId) return null;
+
+  const { userDb } = await import('./db');
+  const user = await userDb.getUserById(userId);
+  const stillBound = (Array.isArray((user as any)?.messagingChannels)
+    ? (user as any).messagingChannels
+    : []
+  ).some(
+    (c: any) =>
+      c?.channel === 'whatsapp' &&
+      c?.destination === phone &&
+      c?.enabled &&
+      c?.optIn?.verifiedAt,
+  );
+
+  if (!stillBound) {
+    // Self-healing: the index outlived the binding it describes.
+    console.warn(
+      `[whatsapp] stale phone->user row for ${redactPhone(phone)} — clearing`,
+    );
+    await unbindPhone(phone).catch(() => {});
+    return null;
+  }
+  return userId;
 }
 
 /**

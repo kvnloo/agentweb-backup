@@ -25,6 +25,7 @@ jest.mock('../services/db', () => ({
 jest.mock('../services/whatsappService', () => ({
   isOptedOut: jest.fn(),
   getDisplayPhoneNumber: jest.fn(),
+  unbindPhone: jest.fn(),
 }));
 jest.mock('../services/whatsappVerificationService', () => ({
   startVerification: jest.fn(),
@@ -33,6 +34,7 @@ jest.mock('../services/whatsappVerificationService', () => ({
 
 const { userDb } = require('../services/db');
 const { isOptedOut, getDisplayPhoneNumber } = require('../services/whatsappService');
+const whatsapp = require('../services/whatsappService');
 const { startVerification, getVerificationStatus } = require('../services/whatsappVerificationService');
 
 import messagingChannelsRouter from '../routes/messagingChannels';
@@ -240,5 +242,34 @@ describe('DELETE /whatsapp', () => {
   it('is a no-op-shaped success when no WhatsApp entry exists', async () => {
     userDb.getUserById.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
     expect((await request(app).delete('/api/messaging-channels/whatsapp')).status).toBe(200);
+  });
+
+  it('clears the phone -> user index for the removed number', async () => {
+    // Left behind, a disconnected number keeps resolving to this account and could
+    // still answer its inbound actions.
+    userDb.getUserById.mockResolvedValue({
+      userId: 'u1',
+      messagingChannels: [{ channel: 'whatsapp', destination: '+14155550123', enabled: true }],
+    });
+    await request(app).delete('/api/messaging-channels/whatsapp');
+    expect(whatsapp.unbindPhone).toHaveBeenCalledWith('+14155550123');
+  });
+
+  it('does not try to clear an index when there was no number', async () => {
+    userDb.getUserById.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
+    await request(app).delete('/api/messaging-channels/whatsapp');
+    expect(whatsapp.unbindPhone).not.toHaveBeenCalled();
+  });
+
+  it('still reports success when clearing the index fails', async () => {
+    // The index self-heals on read, so a failure here must not turn a disconnect the
+    // user already completed into an error.
+    whatsapp.unbindPhone.mockRejectedValueOnce(new Error('dynamo down'));
+    userDb.getUserById.mockResolvedValue({
+      userId: 'u1',
+      messagingChannels: [{ channel: 'whatsapp', destination: '+14155550123', enabled: true }],
+    });
+    const res = await request(app).delete('/api/messaging-channels/whatsapp');
+    expect(res.status).toBe(200);
   });
 });

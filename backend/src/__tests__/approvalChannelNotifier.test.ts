@@ -19,6 +19,11 @@ jest.mock('../services/messagingChannelService', () => ({
 jest.mock('../services/db', () => ({
   userDb: { getUserById: jest.fn() },
 }));
+// Without this the correlation row below hits real DynamoDB from a unit test — the
+// write is inside a try/catch, so the suite would pass while quietly calling AWS.
+jest.mock('../services/settingsService', () => ({
+  settingsService: { setSetting: jest.fn(), getSetting: jest.fn(), deleteSetting: jest.fn() },
+}));
 
 const {
   bootstrapMessagingChannels,
@@ -26,8 +31,12 @@ const {
   resolveDestination,
 } = require('../services/messagingChannelService');
 const { userDb } = require('../services/db');
+const { settingsService } = require('../services/settingsService');
 
-import { notifyApprovalOnWhatsApp } from '../services/approvalChannelNotifier';
+import {
+  notifyApprovalOnWhatsApp,
+  lookupApprovalMessage,
+} from '../services/approvalChannelNotifier';
 import { TEMPLATES } from '../services/whatsappService';
 
 const APPROVAL_CHANNEL = 'C0APPROVALS';
@@ -58,6 +67,7 @@ describe('notifyApprovalOnWhatsApp', () => {
     (getMessagingChannel as jest.Mock).mockReturnValue({ sendMessage: send });
     (userDb.getUserById as jest.Mock).mockResolvedValue(USER);
     (resolveDestination as jest.Mock).mockResolvedValue('+918005326946');
+    (settingsService.setSetting as jest.Mock).mockResolvedValue(undefined);
     jest.spyOn(console, 'warn').mockImplementation(() => {});
   });
 
@@ -171,5 +181,73 @@ describe('notifyApprovalOnWhatsApp', () => {
     const vars = send.mock.calls[0][0].template.variables;
     expect(vars[0]).toBeTruthy();
     expect(vars[1]).toBeTruthy();
+  });
+});
+
+describe('correlating an inbound button tap back to the approval', () => {
+  beforeEach(() => {
+    jest.resetAllMocks();
+    (bootstrapMessagingChannels as jest.Mock).mockResolvedValue(undefined);
+    (getMessagingChannel as jest.Mock).mockReturnValue({
+      sendMessage: jest.fn().mockResolvedValue({ messageId: 'wamid.ABC' }),
+    });
+    (userDb.getUserById as jest.Mock).mockResolvedValue(USER);
+    (resolveDestination as jest.Mock).mockResolvedValue('+918005326946');
+    (settingsService.setSetting as jest.Mock).mockResolvedValue(undefined);
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  it('records the sent message id against the asset', async () => {
+    // Meta sets button.payload to the button's own LABEL, so a decision id cannot ride
+    // on the button. The tap arrives carrying only context.id — the id of the message
+    // the button sat on — which makes this row the only route back to what was approved.
+    await notifyApprovalOnWhatsApp(params);
+
+    const [key, value] = (settingsService.setSetting as jest.Mock).mock.calls[0];
+    expect(key).toBe('whatsapp:approval-msg:wamid.ABC');
+    expect(JSON.parse(value)).toEqual({ assetUrl: params.assetUrl, userId: 'user-1' });
+  });
+
+  it('gives the row a TTL in epoch SECONDS, not milliseconds', async () => {
+    await notifyApprovalOnWhatsApp(params);
+    const ttl = (settingsService.setSetting as jest.Mock).mock.calls[0][4];
+
+    // Milliseconds here would park the row roughly 50,000 years out.
+    const days = (ttl - Math.floor(Date.now() / 1000)) / 86400;
+    expect(days).toBeGreaterThan(29);
+    expect(days).toBeLessThan(31);
+  });
+
+  it('does not record anything when the provider returned no id', async () => {
+    (getMessagingChannel as jest.Mock).mockReturnValue({
+      sendMessage: jest.fn().mockResolvedValue({ messageId: null }),
+    });
+    await notifyApprovalOnWhatsApp(params);
+    expect(settingsService.setSetting).not.toHaveBeenCalled();
+  });
+
+  it('still delivers the notification when recording the id fails', async () => {
+    (settingsService.setSetting as jest.Mock).mockRejectedValue(new Error('dynamo down'));
+    await expect(notifyApprovalOnWhatsApp(params)).resolves.toBeUndefined();
+  });
+
+  it('reads the reference back', async () => {
+    (settingsService.getSetting as jest.Mock).mockResolvedValue({
+      settingValue: JSON.stringify({ assetUrl: 'https://a/x.png', userId: 'user-1' }),
+    });
+    await expect(lookupApprovalMessage('wamid.ABC')).resolves.toEqual({
+      assetUrl: 'https://a/x.png',
+      userId: 'user-1',
+    });
+  });
+
+  it('returns null for an unknown or expired message id', async () => {
+    (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
+    await expect(lookupApprovalMessage('wamid.GONE')).resolves.toBeNull();
+  });
+
+  it('returns null rather than throwing on a corrupt row', async () => {
+    (settingsService.getSetting as jest.Mock).mockResolvedValue({ settingValue: 'not json' });
+    await expect(lookupApprovalMessage('wamid.BAD')).resolves.toBeNull();
   });
 });

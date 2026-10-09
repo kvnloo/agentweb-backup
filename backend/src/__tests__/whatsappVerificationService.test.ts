@@ -44,6 +44,8 @@ jest.mock('../services/whatsappService', () => ({
   redactPhone: jest.requireActual('../services/whatsappService').redactPhone,
   isOptedOut: jest.fn(),
   sendMessage: jest.fn(),
+  bindPhoneToUser: jest.fn(),
+  unbindPhone: jest.fn(),
 }));
 
 const { settingsService } = require('../services/settingsService');
@@ -457,6 +459,60 @@ describe('completeVerification — a STOPped number', () => {
 });
 
 // ── Status ─────────────────────────────────────────────────────────────────
+
+describe('completeVerification — the phone -> user index', () => {
+  it('writes the index so an inbound tap from this number resolves to its owner', async () => {
+    const code = await begin();
+    await completeVerification(code, PHONE);
+    expect(whatsapp.bindPhoneToUser).toHaveBeenCalledWith(PHONE, 'u1');
+  });
+
+  it('clears the previous number when a user re-verifies with a different one', async () => {
+    // Otherwise the old number keeps resolving to this account and could answer
+    // approvals for a number the user no longer holds.
+    users.set('u1', {
+      userId: 'u1',
+      messagingChannels: [
+        {
+          channel: 'whatsapp',
+          destination: OTHER,
+          enabled: true,
+          optIn: { at: ACK, source: 'inbound_verification', verifiedAt: ACK },
+        },
+      ],
+    });
+    const code = await begin();
+    await completeVerification(code, PHONE);
+
+    expect(whatsapp.unbindPhone).toHaveBeenCalledWith(OTHER);
+    expect(whatsapp.bindPhoneToUser).toHaveBeenCalledWith(PHONE, 'u1');
+  });
+
+  it('does not clear the index when the same number re-verifies', async () => {
+    users.set('u1', {
+      userId: 'u1',
+      messagingChannels: [
+        {
+          channel: 'whatsapp',
+          destination: PHONE,
+          enabled: true,
+          optIn: { at: ACK, source: 'inbound_verification', verifiedAt: ACK },
+        },
+      ],
+    });
+    const code = await begin();
+    await completeVerification(code, PHONE);
+    expect(whatsapp.unbindPhone).not.toHaveBeenCalled();
+  });
+
+  it('still verifies when the index write fails', async () => {
+    // The index is a cache. Losing it degrades inbound actions; it must not fail a
+    // verification the customer already completed.
+    whatsapp.bindPhoneToUser.mockRejectedValueOnce(new Error('dynamo down'));
+    const code = await begin();
+    await expect(completeVerification(code, PHONE)).resolves.toBe('verified');
+  });
+});
 
 describe('getVerificationStatus', () => {
   it('is none for a user who never started', async () => {

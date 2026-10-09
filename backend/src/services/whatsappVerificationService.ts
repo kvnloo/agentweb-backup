@@ -36,7 +36,14 @@ import crypto from 'crypto';
 import { settingsService } from './settingsService';
 import { userDb } from './db';
 import { explicitChannels, type UserMessagingChannelConfig } from './messagingChannelService';
-import { isOptedOut, redactPhone, sendMessage, toE164 } from './whatsappService';
+import {
+  bindPhoneToUser,
+  isOptedOut,
+  redactPhone,
+  sendMessage,
+  toE164,
+  unbindPhone,
+} from './whatsappService';
 
 // ── Tunables ───────────────────────────────────────────────────────────────
 
@@ -207,7 +214,9 @@ async function saveVerifiedChannel(row: VerificationRow, phone: string): Promise
   if (!user) return false;
 
   // Start from EXPLICIT entries only — see explicitChannels.
-  const others = explicitChannels(user as any).filter((c) => c.channel !== 'whatsapp');
+  const existing = explicitChannels(user as any);
+  const previousPhone = existing.find((c) => c.channel === 'whatsapp')?.destination;
+  const others = existing.filter((c) => c.channel !== 'whatsapp');
   const entry: UserMessagingChannelConfig = {
     channel: 'whatsapp',
     destination: phone,
@@ -219,6 +228,24 @@ async function saveVerifiedChannel(row: VerificationRow, phone: string): Promise
     },
   };
   await userDb.updateUser(row.userId, { messagingChannels: [...others, entry] } as any);
+
+  // Maintain the phone -> user index that inbound actions resolve through. Written
+  // AFTER the user record, so the index can never point at a binding that does not yet
+  // exist; the reverse order would briefly resolve an inbound tap to an account that
+  // has not been given the number.
+  try {
+    if (previousPhone && previousPhone !== phone) {
+      // The user replaced their number. Without this, the old number keeps resolving to
+      // them and could answer their approvals.
+      await unbindPhone(previousPhone);
+    }
+    await bindPhoneToUser(phone, row.userId);
+  } catch (e: any) {
+    // Non-fatal: sending still works, only inbound actions degrade, and
+    // resolveUserIdByPhone fails closed when the row is missing. try/catch rather than
+    // .catch() so this cannot itself throw on a non-promise return.
+    console.warn('[whatsapp-verify] could not maintain phone index:', e?.message || e);
+  }
   return true;
 }
 

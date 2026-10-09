@@ -39,6 +39,9 @@ import {
   TEMPLATES,
   sendOptOutConfirmation,
   OPT_OUT_CONFIRMATION,
+  bindPhoneToUser,
+  unbindPhone,
+  resolveUserIdByPhone,
 } from '../services/whatsappService';
 import { MessagingChannelError } from '../services/messagingChannelService';
 
@@ -52,9 +55,13 @@ jest.mock('../services/settingsService', () => ({
 jest.mock('../utils/secretsManager', () => ({
   getWhatsAppCredentials: jest.fn(),
 }));
+jest.mock('../services/db', () => ({
+  userDb: { getUserById: jest.fn() },
+}));
 
 const { settingsService } = require('../services/settingsService');
 const { getWhatsAppCredentials } = require('../utils/secretsManager');
+const { userDb } = require('../services/db');
 
 const OK_RESPONSE = { messages: [{ id: 'wamid.TEST1' }] };
 
@@ -658,5 +665,91 @@ describe('sendOptOutConfirmation', () => {
     // Guards the design: the moment this takes a caller-supplied body it stops being an
     // acknowledgement and becomes a way to message people who opted out.
     expect(sendOptOutConfirmation).toHaveLength(1);
+  });
+});
+
+// ── Sender identity (phone -> user) ────────────────────────────────────────
+
+describe('phone -> user index', () => {
+  const PHONE = '+918005326946';
+  const KEY = `whatsapp:phone-user:${PHONE}`;
+
+  const boundUser = (destination: string = PHONE) => ({
+    userId: 'user-1',
+    messagingChannels: [
+      {
+        channel: 'whatsapp',
+        destination,
+        enabled: true,
+        optIn: { at: 'x', source: 'inbound_verification', verifiedAt: 'y' },
+      },
+    ],
+  });
+
+  it('writes the index under a phone-keyed setting', async () => {
+    await bindPhoneToUser(PHONE, 'user-1');
+    expect(settingsService.setSetting).toHaveBeenCalledWith(
+      KEY,
+      'user-1',
+      expect.any(String),
+      'system',
+    );
+  });
+
+  it('clears the index', async () => {
+    await unbindPhone(PHONE);
+    expect(settingsService.deleteSetting).toHaveBeenCalledWith(KEY);
+  });
+
+  it('resolves a bound number to its user', async () => {
+    settingsService.getSetting.mockResolvedValue({ settingValue: 'user-1' });
+    userDb.getUserById.mockResolvedValue(boundUser());
+    await expect(resolveUserIdByPhone(PHONE)).resolves.toBe('user-1');
+  });
+
+  it('resolves to nothing when no index row exists', async () => {
+    settingsService.getSetting.mockResolvedValue(null);
+    await expect(resolveUserIdByPhone(PHONE)).resolves.toBeNull();
+    expect(userDb.getUserById).not.toHaveBeenCalled();
+  });
+
+  it('refuses a number the user no longer holds, and self-heals', async () => {
+    // The index outlived its binding — a crash between two writes, or a number that
+    // moved to another account. Trusting the row here would let one customer answer
+    // another customer's approval, so the user record is the authority and the stale
+    // row is cleared on the way out.
+    settingsService.getSetting.mockResolvedValue({ settingValue: 'user-1' });
+    userDb.getUserById.mockResolvedValue(boundUser('+14155550000'));
+
+    await expect(resolveUserIdByPhone(PHONE)).resolves.toBeNull();
+    expect(settingsService.deleteSetting).toHaveBeenCalledWith(KEY);
+  });
+
+  it('refuses a number whose entry is not yet verified', async () => {
+    settingsService.getSetting.mockResolvedValue({ settingValue: 'user-1' });
+    userDb.getUserById.mockResolvedValue({
+      userId: 'user-1',
+      messagingChannels: [
+        { channel: 'whatsapp', destination: PHONE, enabled: true, optIn: { at: 'x', source: 's' } },
+      ],
+    });
+    await expect(resolveUserIdByPhone(PHONE)).resolves.toBeNull();
+  });
+
+  it('refuses a number whose entry is disabled', async () => {
+    settingsService.getSetting.mockResolvedValue({ settingValue: 'user-1' });
+    userDb.getUserById.mockResolvedValue({
+      userId: 'user-1',
+      messagingChannels: [
+        { channel: 'whatsapp', destination: PHONE, enabled: false, optIn: { verifiedAt: 'y' } },
+      ],
+    });
+    await expect(resolveUserIdByPhone(PHONE)).resolves.toBeNull();
+  });
+
+  it('resolves to nothing when the user record has vanished', async () => {
+    settingsService.getSetting.mockResolvedValue({ settingValue: 'user-1' });
+    userDb.getUserById.mockResolvedValue(null);
+    await expect(resolveUserIdByPhone(PHONE)).resolves.toBeNull();
   });
 });
