@@ -362,7 +362,7 @@ function inBreakdownRow(text: string, at: number): boolean {
   let depth = 0;
   for (const ch of before) { if (ch === '(') depth++; else if (ch === ')' && depth > 0) depth--; }
   if (depth > 0) return true; // "Test & QA (~110 leads across 25 lists)"
-  const label = /^[\s\-*\u2022\d.)]*([^:()\n]{1,60}):\s*$/.exec(before);
+  const label = /^[\s\-*\u2022\d.)]*([^:\n]{1,80}):\s*$/.exec(before);
   return !!label && !WHOLE_ACCOUNT_LABEL.test(label[1]);
 }
 
