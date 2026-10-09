@@ -62,6 +62,12 @@ invites restating the old totals; ground truth read from the API, not from the d
 - Over 9 + 8 `gemini-3.8-flash` runs, 4 flags landed on replies not stale by my ground truth: 3 had re-queried (the log marks those `drift`,
   off by about one: the account's test list reports `leadCount: -1`, and the three runs shared one account so each other's scratch lead moved
   the totals) and one was a `[verified: get_lead_lists]` tag with no call that turn, which is a true tag finding.
+- With `echoesEarlier` (final code, fresh preview, a separate real turn 1 per run): `gemini-3.1-flash-lite` 5/5 stale flagged, 4/5 marked
+  (the fifth invented 11,847 leads, a number no earlier turn returned, so it is correctly unmarked); `gemini-3.8-flash` 2/2 stale flagged and
+  marked, 6/6 correct or honestly-labelled replies unflagged. The shadow log lines carry only the documented keys, no reply text and no `@`.
+- Before the final code, breakdown-heavy `gemini-3.8-flash` replies were flagged 5 of 11 and 5 of 12 times while correct, on group subtotals
+  ("44 lists currently have 0 leads", "8,510 leads total across: ...", "held in four lists"). The pattern fixes removed the ones seen; the
+  rest are not suppressed - `echoesEarlier` is what separates them in the summary (a subtotal matches no earlier turn's number).
 - Caveats: n is small (8-10 per model); the runs shared one account, which adds drift noise; recall is measured on the wordings the
   patterns cover and real traffic will phrase it more widely, so treat it as an upper bound. Two earlier attempts crashed mid-run when the
   turn-2 list read returned nothing (the harness now retries), so they stopped short of the planned count.
