@@ -53,6 +53,12 @@ describe('tool bridge MCP endpoint', () => {
   let adapter: ToolBridgeMcpAdapter;
   const clients: Client[] = [];
 
+  /** What the app answers for a path that has no route at all. */
+  async function unknownPathResponse(): Promise<{ status: number; body: string }> {
+    const res = await fetch(`${baseUrl}/internal/tool-bridge/${RUN.runId}/nothing-here`, { method: 'POST' });
+    return { status: res.status, body: (await res.text()).replace('/nothing-here', '/mcp') };
+  }
+
   async function connect(token: string, runId = RUN.runId, headers: Record<string, string> = {}): Promise<Client> {
     const client = new Client({ name: 'test-harness', version: '0.0.1' });
     const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/internal/tool-bridge/${runId}/mcp`), {
@@ -113,7 +119,7 @@ describe('tool bridge MCP endpoint', () => {
     expect(deps.execute).toHaveBeenCalledWith(RUN, { name: 'get_leads', args: { q: 'acme' }, callId: 'toolu_abc123' });
   });
 
-  it('answers a forged token with the same bare 404 as an unknown path, and never reaches the bridge', async () => {
+  it('answers a forged token exactly as it answers a path that does not exist, and never reaches the bridge', async () => {
     adapter.openRun(RUN);
     await expect(connect('forged-token')).rejects.toThrow();
 
@@ -122,8 +128,8 @@ describe('tool bridge MCP endpoint', () => {
       headers: { 'content-type': 'application/json', authorization: 'Bearer forged-token' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
     });
+    expect({ status: res.status, body: await res.text() }).toEqual(await unknownPathResponse());
     expect(res.status).toBe(404);
-    expect(await res.text()).toBe('');
     expect(deps.resolveTools).not.toHaveBeenCalled();
     expect(deps.execute).not.toHaveBeenCalled();
   });
@@ -137,8 +143,8 @@ describe('tool bridge MCP endpoint', () => {
       headers: { 'content-type': 'application/json', authorization: `Bearer ${tokenA}` },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
     });
+    expect({ status: res.status, body: await res.text() }).toEqual({ ...(await unknownPathResponse()), body: expect.any(String) });
     expect(res.status).toBe(404);
-    expect(await res.text()).toBe('');
 
     // A's token on A's URL, naming a session that belongs to run 2.
     const tokenB = adapter.openRun({ runId: 'run-2', userId: 'user-2', sessionId: 'session-2' });
@@ -181,13 +187,14 @@ describe('tool bridge MCP endpoint', () => {
     expect(adapter.isHalted(RUN.sessionId)).toBe(false);
   });
 
-  it('answers a request that came through a proxy with a plain 404, even with a valid token', async () => {
+  it('answers a request that came through a proxy as if the path did not exist, even with a valid token', async () => {
     const token = adapter.openRun(RUN);
     const res = await fetch(`${baseUrl}/internal/tool-bridge/${RUN.runId}/mcp`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${token}`, 'x-forwarded-for': '203.0.113.9' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
     });
+    expect({ status: res.status, body: await res.text() }).toEqual(await unknownPathResponse());
     expect(res.status).toBe(404);
     expect(deps.resolveTools).not.toHaveBeenCalled();
   });
