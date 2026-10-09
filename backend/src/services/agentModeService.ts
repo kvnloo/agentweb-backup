@@ -1,4 +1,5 @@
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
+import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
 import { classifyMetaBudgetChange } from './agentMode/metaBudgetAnomaly';
 import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
 import { budgetVerdictFields, hasBudgetField, verifyMetaBudget, type BudgetVerifyOptions } from './agentMode/metaBudgetReadBack';
@@ -1045,6 +1046,11 @@ interface LLMCallOptions {
   timeoutMs?: number;
   /** Ordered logical model fallbacks executed by OpenRouter, never by AgentWeb. */
   fallbackModels?: string[];
+  /**
+   * ENG-55: Compare-only OpenRouter provider policy (`data_collection: 'deny'`), merged into
+   * `provider` next to the shared order/fallback preferences. Normal chat never sets it.
+   */
+  providerPolicy?: CompareProviderPolicy | null;
 }
 
 function nonNegativeTokenCount(value: unknown): number {
@@ -2550,6 +2556,7 @@ export class AgentModeService {
       timeoutMs,
       fallbackModels,
       taskClass,
+      providerPolicy,
     } = options || {};
 
     // AgentWeb owns model selection; OpenRouter owns transport, provider
@@ -2589,6 +2596,9 @@ export class AgentModeService {
       // proposed the slug form once already and was reverted for this reason
       // — verify empirically against live traffic before changing this line.
       params.provider.ignore = ignoredProviders;
+    }
+    if (providerPolicy) {
+      params.provider = applyProviderPolicy(params.provider, providerPolicy);
     }
     // OpenRouter reports its own billed amount as zero for BYOK requests even
     // though the upstream provider still bills the inference. Request the
