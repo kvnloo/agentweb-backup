@@ -368,6 +368,52 @@ describe("generateSingleIcpForUser — model drops a required field", () => {
   });
 });
 
+// ─────────────── joined a full /icp/start run (ENG-2308 live finding) ───────────────
+//
+// The UI stops polling at the first terminal status. A regenerate that flipped
+// the record to `ready` while the full run was still going hid that run's
+// result until a reload.
+
+describe("regenerateSingleIcpForUser — joined a full run (deferStatusToFullRun)", () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it("saves the card but writes no status while the full run is still running", async () => {
+    userDb.getUserById.mockResolvedValue(seedUser());
+    userDb.updateUser.mockResolvedValue({});
+    await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), deferStatusToFullRun: true });
+
+    expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    const patch = userDb.updateUser.mock.calls[0][1];
+    expect(Object.keys(patch)).toEqual(["icpResult"]);
+    expect(patch.icpResult[1].name).toBe(REGENERATED.name);
+  });
+
+  it("does not mark the axis failed on an LLM miss while the full run is still running", async () => {
+    userDb.getUserById.mockResolvedValue(seedUser());
+    userDb.updateUser.mockResolvedValue({});
+    const err = jest.spyOn(console, "error").mockImplementation(() => {});
+    await expect(
+      regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: { name: "x" } }), deferStatusToFullRun: true }),
+    ).rejects.toThrow("LLM returned no icp");
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+    err.mockRestore();
+  });
+
+  it("behaves normally (flips to ready) when the full run has already finished", async () => {
+    userDb.getUserById.mockResolvedValue(seedUser({ icpStatus: "ready" }));
+    userDb.updateUser.mockResolvedValue({});
+    await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), deferStatusToFullRun: true });
+    expect(userDb.updateUser.mock.calls[0][1].icpResult[1].name).toBe(REGENERATED.name);
+  });
+
+  it("without the flag it still flips running -> ready as before", async () => {
+    userDb.getUserById.mockResolvedValue(seedUser());
+    userDb.updateUser.mockResolvedValue({});
+    await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }) });
+    expect(userDb.updateUser.mock.calls.some((c: any[]) => c[1]?.icpStatus === "ready")).toBe(true);
+  });
+});
+
 // ───────────────────────── prompt construction ─────────────────────────
 
 describe("regenerateSingleIcpForUser — what the model is sent", () => {

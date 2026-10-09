@@ -1014,6 +1014,23 @@ describe("POST /api/onboarding/icp/regenerate-one", () => {
     expect(userDb.updateUser.mock.calls[0][1].icpError).toBeNull();
   });
 
+  it("tells regenerate-one to leave the status to the full run only when it joined one", async () => {
+    const { regenerateSingleIcpForUser } = require("../services/onboardingIcpService");
+    userDb.getUserById.mockResolvedValue({ userId: "user-1", icpStatus: "ready", icpResult: goodPersonas });
+    userDb.updateUser.mockResolvedValue({});
+    await request(app).post("/api/onboarding/icp/regenerate-one").send({ icpId: "icp-1" });
+    expect(regenerateSingleIcpForUser).toHaveBeenLastCalledWith("user-1", 1);
+
+    userDb.getUserByIdConsistent.mockResolvedValueOnce({
+      userId: "user-1",
+      icpStatus: "running",
+      icpStartedAt: new Date(Date.now() - 3_000).toISOString(),
+      icpResult: goodPersonas,
+    });
+    await request(app).post("/api/onboarding/icp/regenerate-one").send({ icpId: "icp-1" });
+    expect(regenerateSingleIcpForUser).toHaveBeenLastCalledWith("user-1", 1, { deferStatusToFullRun: true });
+  });
+
   it("stamps a fresh icpStartedAt when the previous run is past its timeout", async () => {
     const stale = new Date(Date.now() - 10 * 60_000).toISOString();
     userDb.getUserById.mockResolvedValue({
