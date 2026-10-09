@@ -3,6 +3,10 @@
  * bridge. One live token per run, bound to that run's user and session, dead the
  * moment the run ends.
  *
+ * A harness fixes its MCP config, and so this token, when its process is spawned, and
+ * the process stays open across a conversation's turns. Expiry is therefore idle-based:
+ * each successful verify extends it, and a token unused for the TTL dies.
+ *
  * Opaque and server-side on purpose: there is nothing in the token to forge, and
  * revocation is immediate. The record lives in this process, which is correct only
  * while one backend instance serves the bridge; the worker host (ENG-2114) needs a
@@ -28,7 +32,7 @@ interface TokenRecord {
   expiresAtMs: number;
 }
 
-const DEFAULT_TTL_MS = 60 * 60 * 1000;
+const DEFAULT_IDLE_TTL_MS = 60 * 60 * 1000;
 
 export class RunToolTokenStore {
   // Keyed by the token's hash so the raw value never sits in memory after mint().
@@ -38,7 +42,7 @@ export class RunToolTokenStore {
   private readonly now: () => number;
 
   constructor(opts: { ttlMs?: number; now?: () => number } = {}) {
-    this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
+    this.ttlMs = opts.ttlMs ?? DEFAULT_IDLE_TTL_MS;
     this.now = opts.now ?? Date.now;
   }
 
@@ -69,6 +73,7 @@ export class RunToolTokenStore {
     if (expectedRunId !== undefined && expectedRunId !== record.claims.runId) {
       return { ok: false, reason: "wrong_run" };
     }
+    record.expiresAtMs = this.now() + this.ttlMs;
     return { ok: true, claims: { ...record.claims } };
   }
 
