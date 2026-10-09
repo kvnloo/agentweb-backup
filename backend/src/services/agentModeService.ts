@@ -1140,6 +1140,11 @@ const LEGACY_MODEL_ALIASES: Record<string, string> = {
   // ENG-2178: schedules created before the OpenRouter migration pin the bare
   // "gpt-4o-mini" id; the same model is now served via OpenRouter.
   'gpt-4o-mini': 'openrouter/openai/gpt-4o-mini',
+  // OpenRouter retired the bare `qwen/qwen3.8-max` catalog id in favour of the
+  // dated snapshot `qwen/qwen3.8-max-0902` (same price). Compare's served-model
+  // check rightly refuses the snapshot slug for the bare id, so pins move forward.
+  // Mirrored in the portal's LEGACY_MODEL_ALIAS_IDS (src/lib/modelUnavailable.ts).
+  'openrouter/qwen/qwen3.8-max': 'openrouter/qwen/qwen3.8-max-0902',
 };
 
 // Context passed to the diagnosis agent when the main agent fails

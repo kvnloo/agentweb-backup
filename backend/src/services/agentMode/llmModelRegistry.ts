@@ -235,7 +235,7 @@ export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig
   // behind), llama-3.1-8b-instruct (older sibling of the same superseded
   // family), qwen3.7-flash (no coding-benchmark coverage — it's vision-language,
   // not a coding model — and its pricing tiers up sharply past 32K-token
-  // prompts). qwen3.8-max is KEPT despite losing head-to-head to grok-4.6 at
+  // prompts). qwen3.8-max (now its -0902 snapshot, see below) is KEPT despite losing head-to-head to grok-4.6 at
   // the same $2/$6 price — it's Alibaba's only current non-deprecated entrant
   // (Qwen3.7 Max is independently confirmed deprecated too), so it stays for
   // lab/family redundancy, not because it's the top pick in its tier.
@@ -308,7 +308,10 @@ export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig
   // Reasoning, Max Effort variant. The prior 2026-08-19 source used 0423;
   // this benchmark snapshot does not change the OpenRouter id or pricing.
   'openrouter/deepseek/deepseek-v4-flash': {"name":"DeepSeek V4 Flash","provider":"deepseek","tier":"ultra_cheap","description":"Maximum efficiency for high-volume work","client":null,"supportsTemperature":true,"qualityScore":34.3,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, deepseek-v4-flash (https://artificialanalysis.ai/)","family":"deepseek-flash"},
-  'openrouter/qwen/qwen3.8-max': {"name":"Qwen3.8 Max","provider":"qwen","tier":"pro","description":"Alibaba's flagship model","client":null,"supportsTemperature":true,"qualityScore":40,"qualityScoreSource":"Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Qwen3.8 Max, reasoning","family":"qwen-max"},
+  // Renamed 2026-10-09: OpenRouter dropped the bare `qwen/qwen3.8-max` id from its catalog and now
+  // lists only the snapshot `qwen/qwen3.8-max-0902` (canonical qwen/qwen3.8-max-20260902), same
+  // $2/$6 price. The old id lives on as a LEGACY_MODEL_ALIASES entry so existing pins keep working.
+  'openrouter/qwen/qwen3.8-max-0902': {"name":"Qwen3.8 Max","provider":"qwen","tier":"pro","description":"Alibaba's flagship model","client":null,"supportsTemperature":true,"qualityScore":40,"qualityScoreSource":"Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Qwen3.8 Max, reasoning","family":"qwen-max"},
   // 2026-08-26 (ENG-1604): added after live cost+quality research — AA
   // Intelligence Index 52 (v4.1.1, measured, not estimated), #1 of 138
   // models in its size class, roughly matching DeepSeek V4 Pro's quality

@@ -309,7 +309,7 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'openrouter/x-ai/grok-4.6': withDerivedCache(2.0, 6.0), // was $3/$15 — stale, ~2x over live
   'openrouter/deepseek/deepseek-v4-pro': withDerivedCache(0.657, 1.315), // live "62% off" promo; lowest-confidence entry in this batch — the promo makes list price hard to reconstruct cleanly, re-verify if this model becomes cost-sensitive
   'openrouter/deepseek/deepseek-v4-flash': withDerivedCache(0.068, 0.168), // was ~2x over live
-  'openrouter/qwen/qwen3.8-max': withDerivedCache(2.0, 6.0),
+  'openrouter/qwen/qwen3.8-max-0902': withDerivedCache(2.0, 6.0),
   // 2026-08-26: NOT the $0.35/$2.75 headline listing price — OpenRouter
   // aggregates 10 upstream providers for this model ($0.35-$0.48 in,
   // $2.55-$3.40 out; cheapest = Chutes, priciest = Io Net) and our
