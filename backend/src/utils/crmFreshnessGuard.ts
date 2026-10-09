@@ -353,8 +353,8 @@ const INVENTORY_PATTERNS: InventoryPattern[] = [
   { pluralOnly: true, needsCrmContext: false, subsetProne: true, re: new RegExp(`\\b${NUM}\\s+leads\\s+(?:across|in)\\s+(?:${NUM}\\s+(?:\\w+\\s+)?lists|your\\s+(?:entire\\s+|whole\\s+)?crm)`, 'gi') },
   // "Your CRM currently has / contains / holds about 1.2k leads"
   { pluralOnly: true, needsCrmContext: false, re: new RegExp(`\\b(?:crm|account|database|pipeline)\\b(?:\\s+(?:currently|now|account|database|data|total|overall|also|still|right\\s+now|as\\s+a\\s+whole))*\\s+(?:size\\s+(?:is|remains?|stays?|stands at)|has|have|contains?|holds?|includes?|stands at|totals?|is at|comes? to)\\s+${HEDGE}${NUM}\\s+(?:total\\s+)?(?:leads|contacts|records|lists)\\b`, 'gi') },
-  // "a total of 4,999 leads", "with a total of twelve lead lists"
-  { pluralOnly: true, needsCrmContext: true, re: new RegExp(`\\btotal\\s+of\\s+${HEDGE}${NUM}\\s+(?:lead\\s+)?(?:leads|contacts|records|lists)\\b`, 'gi') },
+  // "a total of 4,999 leads", "with a total of twelve lead lists", "a combined count of 12,746 leads" (seen from a scheduled run)
+  { pluralOnly: true, needsCrmContext: true, re: new RegExp(`\\b(?:total|(?:combined|overall|aggregate)\\s+(?:count|total|number))\\s+of\\s+${HEDGE}${NUM}\\s+(?:lead\\s+)?(?:leads|contacts|records|lists)\\b`, 'gi') },
   // "You have 47 leads." (a bare statement, not "5 leads named Test" / "3 leads needing follow-up")
   { pluralOnly: true, needsCrmContext: true, re: new RegExp(`\\byou\\s+(?:currently\\s+|now\\s+)?(?:have|hold|manage)\\s+${HEDGE}${NUM}\\s+(?:total\\s+)?(?:leads|contacts|records)\\b(?=\\s*(?:[.,;:!)\\]]|$|in\\s+total|overall|altogether|in\\s+your|across\\s+(?:all\\s+)?(?:your\\s+)?(?:\\d+\\s+|\\w+\\s+)?(?:lists|the\\s+crm)))`, 'gi') },
 ];
