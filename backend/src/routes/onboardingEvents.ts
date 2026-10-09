@@ -21,6 +21,7 @@ import {
   ALL_ONBOARDING_STAGES,
   deriveOnboardingStage,
   isOnboardingStage,
+  LIFECYCLE_NEUTRAL_ONBOARDING_EVENTS,
   OnboardingEvent,
 } from "../utils/onboardingStage";
 import { onOnboardingStageChanged } from "../services/contactCaptureHooks";
@@ -33,13 +34,11 @@ const MAX_EVENTS_PER_USER = 50;
 // Cap per-event payload to prevent abuse / runaway DynamoDB item size.
 const MAX_DATA_BYTES = 2048;
 
-// These beta funnel signals are analytics-only. They are persisted in the
-// event log, but must never create a lifecycle transition or timeline entry.
-const LATERAL_ONBOARDING_EVENTS = new Set([
-  "voice_onboarding_presented",
-  "voice_onboarding_started",
-  "voice_onboarding_text_fallback",
-]);
+// Analytics-only signals (voice beta funnel, onboarding review screens): they
+// are persisted in the event log but must never create a lifecycle transition
+// or timeline entry. The set lives next to the allow-list so a new event is
+// declared in one place.
+const LATERAL_ONBOARDING_EVENTS = LIFECYCLE_NEUTRAL_ONBOARDING_EVENTS;
 
 /**
  * POST /api/onboarding/events

@@ -82,6 +82,18 @@ export const ALLOWED_ONBOARDING_EVENTS = new Set<string>([
   "voice_onboarding_presented",
   "voice_onboarding_started",
   "voice_onboarding_text_fallback",
+  // Brand/ICP review screens: click-level analytics the portal emits. They
+  // were rejected with a 400 on every click before being declared here.
+  "brand_review_brand_edit",
+  "brand_review_confirmed",
+  "brand_review_icp_edit",
+  "brand_review_icp_regenerate",
+  "brand_review_icp_remove",
+  "brand_review_valueprop_edit",
+  "phase3_generate_ads",
+  "phase3_icp_selected",
+  "phase3_pick_for_me",
+  "phase3_summary_confirmed",
   // Outreach (test-env re-enable — not committed to harsha/dev)
   "outreach_channel_connect_already_connected",
   "outreach_channel_connect_clicked",
@@ -118,6 +130,16 @@ export const LIFECYCLE_NEUTRAL_ONBOARDING_EVENTS = new Set<string>([
   "voice_onboarding_presented",
   "voice_onboarding_started",
   "voice_onboarding_text_fallback",
+  "brand_review_brand_edit",
+  "brand_review_confirmed",
+  "brand_review_icp_edit",
+  "brand_review_icp_regenerate",
+  "brand_review_icp_remove",
+  "brand_review_valueprop_edit",
+  "phase3_generate_ads",
+  "phase3_icp_selected",
+  "phase3_pick_for_me",
+  "phase3_summary_confirmed",
 ]);
 
 export function isLifecycleNeutralOnboardingEvent(event: string): boolean {
