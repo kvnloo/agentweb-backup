@@ -35,6 +35,7 @@
  */
 
 import { withClearedError } from "../utils/clearErrorOnClaim";
+import { readUserForOwnership } from "../utils/readUserForOwnership";
 import { imageService as defaultImageService } from "./imageGeneration";
 import { reportUIError } from "../utils/errorReporter";
 import { userDb } from "./db";
@@ -782,31 +783,6 @@ export async function isBrandLogoFetchable(
 interface AdImageRunIdentity {
   runId?: unknown;
   startedAt?: unknown;
-}
-
-/**
- * Read the user for an ownership decision.
- *
- * `getUserById` queries the UserIdIndex GSI, which is eventually consistent: for
- * a moment after the claim it can still return the PREVIOUS run's row. A run
- * that reads it back milliseconds after claiming would then see someone else's
- * `adImageRunId`, conclude "a newer run owns the axis" and silently stop,
- * leaving the axis `running` until its timeout (seen in production on a restart
- * after a failed run). The base-table read behind `getUserByIdConsistent` always
- * reflects the claim this run just wrote. Falls back to the index read only if
- * the consistent read is unavailable or throws.
- */
-async function readUserForOwnership(userId: string): Promise<any> {
-  const consistent = (userDb as any).getUserByIdConsistent;
-  if (typeof consistent === "function") {
-    try {
-      const fresh = await consistent.call(userDb, userId);
-      if (fresh) return fresh;
-    } catch {
-      /* fall back to the indexed read */
-    }
-  }
-  return userDb.getUserById(userId);
 }
 
 function readAxisIdentity(record: unknown): AdImageRunIdentity {
