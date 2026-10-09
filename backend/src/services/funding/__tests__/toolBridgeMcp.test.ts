@@ -216,6 +216,36 @@ describe('tool bridge MCP endpoint', () => {
     expect((await client.listTools()).tools.map((t) => t.name)).toContain('send_email');
   });
 
+  it('holds the answer to the call that changed the tool list until the client has fetched the new list', async () => {
+    deps.execute.mockResolvedValueOnce(ok('installed', { toolsChanged: true }));
+    const token = adapter.openRun(RUN);
+    const client = await connect(token);
+    await client.listTools();
+    const order: string[] = [];
+    deps.resolveTools.mockImplementation(async () => {
+      order.push('list fetched');
+      return [READ_TOOL, WRITE_TOOL, INSTALL_TOOL, { name: 'send_email' }];
+    });
+    // What a harness does on the notification: fetch the list again.
+    client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
+      await client.listTools();
+    });
+
+    await client.callTool({ name: 'install_skills', arguments: {} });
+    order.push('install answered');
+    expect(order).toEqual(['list fetched', 'install answered']);
+  });
+
+  it('still answers the call when the client never fetches the new list', async () => {
+    deps.execute.mockResolvedValueOnce(ok('installed', { toolsChanged: true }));
+    const token = adapter.openRun(RUN);
+    const client = await connect(token);
+    const started = Date.now();
+    const result = await client.callTool({ name: 'install_skills', arguments: {} });
+    expect(result.isError).toBe(false);
+    expect(Date.now() - started).toBeLessThan(4_000);
+  });
+
   it('returns the halt refusal to the client once a result requires confirmation', async () => {
     deps.execute.mockResolvedValueOnce(ok('{"previewToken":"abc"}', { requiresConfirmation: true }));
     const token = adapter.openRun(RUN);

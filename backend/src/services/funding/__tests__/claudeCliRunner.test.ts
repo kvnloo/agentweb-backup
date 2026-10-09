@@ -695,5 +695,18 @@ describe('ClaudeCliRunner', () => {
     expect(runner.activeProcessCount).toBe(0);
   });
 
+  it('removes the scratch dir again once a killed process has really exited', async () => {
+    const runner = trackedRunner();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP });
+    const child = spawnedChildren[0] as any;
+    child.exitCode = null;
+    child.signalCode = null;
+
+    runner.close(handle);
+    expect(mockRmSync).toHaveBeenCalledTimes(1);
+    child.emit('exit', null, 'SIGTERM');
+    expect(mockRmSync).toHaveBeenCalledTimes(2);
+  });
+
   void mkdtempSync; // referenced only via the module under test; keeps the fs mock import used
 });
