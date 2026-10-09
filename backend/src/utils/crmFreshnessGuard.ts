@@ -344,9 +344,11 @@ const CRM_CONTEXT = /\b(crm|lead lists?|your lists?|all (?:of )?(?:your )?lists|
 function paragraphAround(text: string, at: number, maxEachSide = 300): string {
   const lo = Math.max(0, at - maxEachSide);
   const hi = Math.min(text.length, at + maxEachSide);
-  const before = text.lastIndexOf('\n\n', at);
-  const after = text.indexOf('\n\n', at);
-  return text.slice(Math.max(lo, before === -1 ? 0 : before), after === -1 ? hi : Math.min(hi, after));
+  const win = text.slice(lo, hi); // search inside the window: an unbounded lastIndexOf/indexOf per claim is quadratic on long unbroken text
+  const rel = at - lo;
+  const before = win.lastIndexOf('\n\n', rel);
+  const after = win.indexOf('\n\n', rel);
+  return win.slice(before === -1 ? 0 : before, after === -1 ? win.length : after);
 }
 
 function findInventoryClaims(text: string): Array<CountRange & { at: number }> {
@@ -410,7 +412,7 @@ function isRecord(v: unknown): v is Record<string, any> {
 }
 
 // What a person types to resume: "continue", "go on", "keep going", "ok proceed" ... and nothing else of substance.
-const CONTINUE_REQUEST = /^(?:(?:ok(?:ay)?|yes|yep|sure|please|pls|thanks?|great)[\s,.!-]+){0,2}(?:continue|go on|keep going|carry on|proceed|resume|go ahead|pick (?:it )?up|keep at it)\b[\s\S]{0,40}$/i;
+const CONTINUE_REQUEST = /^(?:(?:ok(?:ay)?|yes|yep|sure|please|pls|thanks?|great)[\s,.!-]+){0,2}(?:continue|go on|keep going|carry on|proceed|resume|go ahead|pick (?:it )?up|keep at it)(?:[\s,]+(?:please|pls|thanks?|thank you|now|then|again|with (?:that|it|this|the rest(?: of (?:it|that|this))?)|from there|on that|where you (?:left off|stopped)|from where you (?:left off|stopped)))*[\s,.!]*$/i;
 
 /** A typed "continue" (short, and says nothing else). Anything longer is a new request that happens to start that way. */
 export function looksLikeContinueRequest(content: unknown): boolean {
@@ -511,7 +513,7 @@ export function crmToolsFromEarlierInvocations(history: unknown): string[] {
 //    the run, except between the lead-in and its first bullet);
 //  - a claim on a plain line is covered only if the lead-in is the line directly above it.
 const BULLET_LINE = /^(?:[-*\u2022]|\d{1,3}[.)])\s/;
-const LEAD_IN_END = /:\s*(?:\*\*|__)?\s*$/;
+const LEAD_IN_END = /:\s*(?:\*\*|__)?$/; // callers pass a trimmed line, so no trailing \s* (two adjacent \s* backtrack quadratically)
 function leadInLine(text: string, at: number): string {
   const lineStart = text.lastIndexOf('\n', at - 1) + 1;
   const lineEndIdx = text.indexOf('\n', at);
@@ -533,7 +535,7 @@ function leadInLine(text: string, at: number): string {
       continue;
     }
     // A non-bullet line: it must be the lead-in. Blank lines directly between it and what follows are fine.
-    return LEAD_IN_END.test(line) ? line : '';
+    return LEAD_IN_END.test(line.slice(-300)) ? line : '';
   }
   return '';
 }
@@ -592,7 +594,7 @@ export function detectCrmFreshnessMismatch(
   if (claims.length > 0) {
     // null = a CRM tool ran but its numbers are unavailable: abstain rather than guess. For a continued task that means an
     // earlier invocation has no persisted evidence (saved before it existed, truncated, or a CRM write changed the totals).
-    const current = earlier.tools.length > 0 && !earlier.complete ? null : allowedNumbers(calls, succeeded, evidence);
+    const current = !earlier.complete ? null : allowedNumbers(calls, succeeded, evidence);
     if (current) {
       const allowed = earlier.numbers.size > 0 ? new Set<number>([...current, ...earlier.numbers]) : current;
       const seen = new Set<number>();
