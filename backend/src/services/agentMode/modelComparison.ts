@@ -19,6 +19,11 @@
  * Everything with side effects (LLM, DB, lock, clock, secret) is injected so the
  * flow is unit-testable; controllers/modelCompareController.ts wires the real ones.
  */
+import {
+  COMPARE_PROVIDER_POLICY_UNAVAILABLE_CODE,
+  CompareProviderPolicy,
+  isProviderPolicyUnavailableError,
+} from './compareProviderPolicy';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import type { ChatMessage } from '../chatbotService';
 import { classifyToolErrorClass } from '../../utils/toolErrorClassifier';
@@ -80,7 +85,8 @@ export type CompareErrorCode =
   | 'model_live_unsupported'
   | 'output_limit'
   | 'model_mismatch'
-  | 'empty_response';
+  | 'empty_response'
+  | 'provider_policy_unavailable';
 
 export interface CompareResult {
   model: string;
@@ -161,6 +167,11 @@ export interface CompareDeps {
   /** Resolves a billing owner id for metering (org members pool onto the owner). */
   resolveBillingUserId(userId: string): Promise<string>;
   callLLM(model: string, messages: Array<{ role: string; content: string }>, options: CompareCallOptions): Promise<unknown>;
+  /**
+   * ENG-55: provider data-collection policy (AW-Settings `model_compare_deny_data_collection`).
+   * Omitted or null => no policy, i.e. the request is exactly what it was before. Must not throw.
+   */
+  getProviderPolicy?(): Promise<CompareProviderPolicy | null>;
   /** Throws when the server secret is unavailable. */
   getSecret(): string;
   now(): number;
@@ -174,6 +185,8 @@ export interface CompareCallOptions {
   timeoutMs: number;
   taskClass: 'interactive_chat';
   usageContext: { userId: string; billingUserId: string; feature: string; sessionId: string };
+  /** ENG-55: present only when the data-collection switch is on; merged into the OpenRouter `provider` object. */
+  providerPolicy?: CompareProviderPolicy;
 }
 
 export interface SelectDeps {
@@ -471,13 +484,16 @@ function splitServedModel(id: string): { vendor: string; tokens: string[]; date:
   return { vendor, tokens, date: dated ? `${dated[1]}${dated[2]}${dated[3]}` : null };
 }
 
-function mapCallError(error: unknown): { errorCode: CompareErrorCode; errorClass: string } {
+function mapCallError(error: unknown, policy?: CompareProviderPolicy | null): { errorCode: CompareErrorCode; errorClass: string } {
   let errorClass = 'unknown';
   try {
     // classifyToolErrorClass tolerates non-Error values, but never let classification itself throw.
     errorClass = classifyToolErrorClass(error);
   } catch {
     /* keep 'unknown' */
+  }
+  if (isProviderPolicyUnavailableError(error, policy)) {
+    return { errorCode: COMPARE_PROVIDER_POLICY_UNAVAILABLE_CODE, errorClass };
   }
   return { errorCode: errorClass === 'timeout' ? 'timeout' : 'upstream_error', errorClass };
 }
@@ -679,6 +695,12 @@ async function runOne(
     return { status: 'rejected', errorCode: candidate.rejection, latencyMs: 0 };
   }
   const started = deps.now();
+  let policy: CompareProviderPolicy | null = null;
+  try {
+    policy = (await deps.getProviderPolicy?.()) ?? null;
+  } catch {
+    policy = null; // never let the privacy switch read break a column
+  }
   try {
     const options: CompareCallOptions = {
       max_completion_tokens: COMPARE_MAX_OUTPUT_TOKENS,
@@ -690,6 +712,7 @@ async function runOne(
         feature: COMPARE_FEATURE,
         sessionId: ctx.sessionId,
       },
+      ...(policy ? { providerPolicy: policy } : {}),
     };
     const response = await deps.callLLM(candidate.canonical, messages, options);
     const latencyMs = Math.max(0, deps.now() - started);
@@ -713,7 +736,7 @@ async function runOne(
     return { status: 'ok', content: text, latencyMs };
   } catch (error) {
     const latencyMs = Math.max(0, deps.now() - started);
-    const { errorCode, errorClass } = mapCallError(error);
+    const { errorCode, errorClass } = mapCallError(error, policy);
     // Class only: provider error text can echo the prompt or carry provider internals.
     deps.log('ModelCompare: model call failed', { model: candidate.canonical, errorClass });
     return { status: 'error', errorCode, latencyMs };

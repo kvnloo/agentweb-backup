@@ -1309,3 +1309,67 @@ describe('only the selected model may answer (served-model verification)', () =>
     expect(res(out).results.map((r: any) => r.status)).toEqual(['ok', 'ok']);
   });
 });
+
+describe('ENG-55 data-collection policy (provider_policy_unavailable)', () => {
+  const noEndpoints = () => Object.assign(new Error('404 No endpoints found matching your data policy'), { status: 404 });
+  const DENY = { data_collection: 'deny' as const };
+  const optionsOf = (callLLM: jest.Mock) => callLLM.mock.calls.map((c) => c[2] as Record<string, unknown>);
+
+  it('no getProviderPolicy dep => options carry no providerPolicy key at all', async () => {
+    const { deps, callLLM } = makeDeps();
+    await run(deps, body());
+    for (const o of optionsOf(callLLM)) expect(o).not.toHaveProperty('providerPolicy');
+  });
+
+  it('switch off (null) => options unchanged: no providerPolicy key', async () => {
+    const { deps, callLLM } = makeDeps({ getProviderPolicy: async () => null });
+    await run(deps, body());
+    for (const o of optionsOf(callLLM)) expect(Object.keys(o).sort()).toEqual(['max_completion_tokens', 'taskClass', 'timeoutMs', 'usageContext']);
+  });
+
+  it('switch on => every column call carries providerPolicy deny', async () => {
+    const { deps, callLLM } = makeDeps({ getProviderPolicy: async () => DENY });
+    await run(deps, body());
+    expect(optionsOf(callLLM)).toHaveLength(2);
+    for (const o of optionsOf(callLLM)) expect(o.providerPolicy).toEqual({ data_collection: 'deny' });
+  });
+
+  it('a throwing policy read never breaks a column (treated as off)', async () => {
+    const { deps, callLLM } = makeDeps({ getProviderPolicy: async () => { throw new Error('x'); } });
+    const out = await run(deps, body());
+    expect(res(out).results.map((r: any) => r.status)).toEqual(['ok', 'ok']);
+    for (const o of optionsOf(callLLM)) expect(o).not.toHaveProperty('providerPolicy');
+  });
+
+  it('policy on + no-endpoints 404 for one column => that column provider_policy_unavailable, the other still answers', async () => {
+    const callLLM = jest.fn(async (m: string) => {
+      if (m === 'gemini-3.5-flash') throw noEndpoints();
+      return ok(`answer from ${m}`, m);
+    });
+    const { deps } = makeDeps({ callLLM: callLLM as any, getProviderPolicy: async () => DENY });
+    const out = await run(deps, body());
+    const results = res(out).results;
+    expect(results[0]).toMatchObject({ model: 'gpt-5.5', status: 'ok' });
+    expect(results[1]).toMatchObject({ model: 'gemini-3.5-flash', status: 'error', errorCode: 'provider_policy_unavailable' });
+  });
+
+  it('policy off + the same 404 => unchanged upstream_error', async () => {
+    const callLLM = jest.fn(async (m: string) => {
+      if (m === 'gemini-3.5-flash') throw noEndpoints();
+      return ok(`answer from ${m}`, m);
+    });
+    const { deps } = makeDeps({ callLLM: callLLM as any, getProviderPolicy: async () => null });
+    const out = await run(deps, body());
+    expect(res(out).results[1]).toMatchObject({ status: 'error', errorCode: 'upstream_error' });
+  });
+
+  it('policy on + an unrelated error stays upstream_error', async () => {
+    const callLLM = jest.fn(async (m: string) => {
+      if (m === 'gemini-3.5-flash') throw new Error('socket hang up');
+      return ok(`answer from ${m}`, m);
+    });
+    const { deps } = makeDeps({ callLLM: callLLM as any, getProviderPolicy: async () => DENY });
+    const out = await run(deps, body());
+    expect(res(out).results[1]).toMatchObject({ errorCode: 'upstream_error' });
+  });
+});
