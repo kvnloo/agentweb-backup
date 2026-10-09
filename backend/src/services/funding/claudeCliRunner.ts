@@ -415,12 +415,20 @@ export class ClaudeCliRunner {
       this.pool.delete(session.conversationId);
     }
     session.rl.close();
-    session.child.kill();
-    try {
-      rmSync(session.scratchHomeDir, { recursive: true, force: true });
-    } catch {
-      // best-effort cleanup of a throwaway scratch dir; nothing sensitive survives it anyway
+    const removeScratch = () => {
+      try {
+        rmSync(session.scratchHomeDir, { recursive: true, force: true });
+      } catch {
+        // best-effort cleanup of a throwaway scratch dir
+      }
+    };
+    // Removed now so the run token file is gone at once, and again when the process has
+    // really exited: a CLI that is still shutting down re-creates its HOME (a cache dir).
+    if (session.child.exitCode === null && session.child.signalCode === null) {
+      session.child.once("exit", removeScratch);
     }
+    session.child.kill();
+    removeScratch();
     if (session.pending) {
       session.pending.reject(new Error(`claudeCliRunner: session closed (${reason}) with a turn still in flight`));
       session.pending = null;
