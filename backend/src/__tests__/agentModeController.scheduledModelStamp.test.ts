@@ -55,6 +55,11 @@ jest.mock('../services/agentModeService', () => ({
   },
 }));
 
+const mockGetSetting = jest.fn();
+jest.mock('../services/settingsService', () => ({
+  settingsService: { getSetting: (...a: unknown[]) => mockGetSetting(...a) },
+}));
+
 jest.mock('../services/generateMarketingResponseWorkerService', () => ({
   generateMarketingResponseWorkerService: { runInWorker: jest.fn(), releaseSessionClients: jest.fn() },
 }));
@@ -348,6 +353,41 @@ describe('getModelOptions — authoritative model discovery', () => {
       allModels: ['anthropic.claude-opus-5', 'openrouter/x-ai/grok-4.6', 'openrouter/x-ai/grok-4.7'],
       scheduleBackupModels: ['openrouter/x-ai/grok-4.7'],
     }));
+  });
+
+  // ENG-112: additive capability hint for "Branch from here". Default OFF; only the exact value "true" turns it on.
+  describe('chatBranchingEnabled hint (ENG-112)', () => {
+    const optionsBody = async () => {
+      mockAgentModeService.getSupportedModels.mockResolvedValue(['gpt-a'] as any);
+      mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+        billingUserId: 'test-user-123', policy: null, costUsedMicroUsd: 0, creditsApplied: false,
+        mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' },
+      });
+      const json = jest.fn();
+      await agentModeController.getModelOptions(
+        { user: { userId: 'test-user-123', isAdmin: false } } as any,
+        { json, status: jest.fn(() => ({ json })) } as any,
+      );
+      return json.mock.calls[0][0];
+    };
+
+    it.each([[null], [{ settingValue: 'false' }], [{ settingValue: '' }], [{ settingValue: 'yes' }]])('is false when the setting is %j', async (row) => {
+      mockGetSetting.mockResolvedValue(row);
+      expect((await optionsBody()).chatBranchingEnabled).toBe(false);
+    });
+
+    it('is true only for "true"', async () => {
+      mockGetSetting.mockResolvedValue({ settingValue: 'true' });
+      expect((await optionsBody()).chatBranchingEnabled).toBe(true);
+      expect(mockGetSetting).toHaveBeenCalledWith('chat_branching_enabled');
+    });
+
+    it('fails closed (false) when the settings read throws, without failing the model options', async () => {
+      mockGetSetting.mockRejectedValue(new Error('ddb down'));
+      const body = await optionsBody();
+      expect(body.chatBranchingEnabled).toBe(false);
+      expect(body.allModels).toEqual(['gpt-a']);
+    });
   });
 
   it('never offers a live-voice model: every consumer is a text-chat picker and an explicit live pick now 422s', async () => {

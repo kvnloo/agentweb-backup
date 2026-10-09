@@ -44,6 +44,7 @@ import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/age
 import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/finalAnswer';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
+import { CHAT_BRANCHING_ENABLED_SETTING, isChatBranchingSettingEnabled } from '../services/agentMode/chatBranching';
 import { resolveRunFunding } from '../services/funding/runFunding';
 import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
@@ -333,7 +334,7 @@ type EffectiveModelPolicyDecision = PolicyModelDecision & {
   usagePolicyVersion: string | null;
 };
 
-function toStoredModelPolicyDecision(decision: EffectiveModelPolicyDecision) {
+export function toStoredModelPolicyDecision(decision: EffectiveModelPolicyDecision) {
   return {
     requestedModel: decision.requestedModel,
     effectiveModel: decision.effectiveModel,
@@ -496,7 +497,7 @@ async function deleteNewSessionBestEffort(sessionId: string): Promise<void> {
 }
 
 /** The one 422 body for a ModelUnavailableError (display name from the registry when the id is one). */
-function modelUnavailableBody(err: ModelUnavailableError) {
+export function modelUnavailableBody(err: ModelUnavailableError) {
   const displayName = typeof agentModeService.getModelDisplayName === 'function'
     ? agentModeService.getModelDisplayName(err.requestedModel)
     : undefined;
@@ -2607,8 +2608,8 @@ function evaluateScheduleResponse(
 // ENG-2163: thin wrapper over the pure, unit-tested util (src/utils/adminOnlyMessageFilter).
 // The util takes the admin-tool name set as a param so it stays dependency-free; the controller
 // supplies the real ADMIN_SKILL_TOOL_NAMES here. Default viewerIsAdmin=false fails CLOSED.
-const filterMessagesForClient = (messages: any[], opts: { viewerIsAdmin?: boolean } = {}) =>
-  filterMessagesForClientPure(messages, { viewerIsAdmin: opts.viewerIsAdmin, adminToolNames: ADMIN_SKILL_TOOL_NAMES });
+const filterMessagesForClient = (messages: any[], opts: { viewerIsAdmin?: boolean; omitBranchOrigin?: boolean } = {}) =>
+  filterMessagesForClientPure(messages, { viewerIsAdmin: opts.viewerIsAdmin, adminToolNames: ADMIN_SKILL_TOOL_NAMES, omitBranchOrigin: opts.omitBranchOrigin });
 
 // Helper function to check if this is the last run of the day for an hourly schedule
 function isLastRunOfDayForHourlySchedule(currentTime: Date, nextRunTime: Date): boolean {
@@ -10630,9 +10631,18 @@ export const agentModeController = {
   async getModelOptions(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const [usage, entitledModels] = await Promise.all([
+      const [usage, entitledModels, chatBranchingEnabled] = await Promise.all([
         getEffectiveLlmUsagePolicy(user.userId),
         agentModeService.getSupportedModels(user.isAdmin === true),
+        // ENG-112 capability hint so the portal only offers "Branch from here" when the endpoint will
+        // accept it. A hint, not the gate: the endpoint re-checks the flag. Unreadable flag = off.
+        (async () => {
+          try {
+            return isChatBranchingSettingEnabled((await settingsService.getSetting(CHAT_BRANCHING_ENABLED_SETTING))?.settingValue);
+          } catch {
+            return false;
+          }
+        })(),
       ]);
       // Every consumer (chat composer, schedule form, MCP) is a text-chat picker, and an
       // explicit live-voice pick is refused (422 not_selectable), so never offer one.
@@ -10655,6 +10665,7 @@ export const agentModeController = {
         scheduleBackupModels: optimizedModels,
         optimizedDefaultModel: usage.policy?.optimizedDefaultModel || null,
         usagePolicyVersion: usage.policy?.version || null,
+        chatBranchingEnabled,
       });
     } catch (error) {
       console.error('AgentMode: Get model options error:', error);
@@ -11034,7 +11045,8 @@ export const agentModeController = {
         session: {
           sessionId: session.sessionId,
           title: session.title,
-          messages: filterMessagesForClient(session.messages),
+          // ENG-112: a share viewer is not the owner: no branch provenance (source session id/title).
+          messages: filterMessagesForClient(session.messages, { omitBranchOrigin: true }),
           createdAt: session.createdAt,
           updatedAt: session.updatedAt,
           shareMetadata: session.shareMetadata,
@@ -14710,7 +14722,7 @@ export const agentModeController = {
       res.json({
         sessionId: session.sessionId,
         title: session.title,
-        messages: filterMessagesForClient(session.messages),
+        messages: filterMessagesForClient(session.messages, { omitBranchOrigin: true }),
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
         workPlan: session.workPlan,

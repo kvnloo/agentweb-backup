@@ -3,6 +3,7 @@ import { authenticateToken, AuthenticatedRequest, requireAdmin } from '../middle
 import { requireScheduledChatsServiceSecret } from '../middleware/serviceAuth';
 import { agentModeController } from '../controllers/agentModeController';
 import { compareModelsHandler, selectCompareResultHandler } from '../controllers/modelCompareController';
+import { branchSessionHandler } from '../controllers/chatBranchController';
 import { chatbotDb } from '../services/chatbotService';
 import { synthesizeSpeech } from '../services/voiceService';
 import multer from 'multer';
@@ -223,6 +224,10 @@ router.post('/compare', asyncHandlerAuth(compareModelsHandler));
 // POST /api/agent-mode/compare/select
 // ENG-55: "Continue with this answer" — persists the chosen answer as a normal turn.
 router.post('/compare/select', asyncHandlerAuth(selectCompareResultHandler));
+
+// POST /api/agent-mode/session/:sessionId/branch
+// ENG-112: branch a chat from an assistant message into a new, independent session (flag chat_branching_enabled, default off).
+router.post('/session/:sessionId/branch', asyncHandlerAuth(branchSessionHandler));
 
 // POST /api/agent-mode/verified-generate
 // Generate response with verification that required functions are called minimum number of times

@@ -133,6 +133,15 @@ export interface ChatMessage {
     imageFilename?: string;             // Filename when kind === 'image-generated'
     imageUrl?: string;                  // ENG-510: image URL on the immediate marker so a completed image survives a whole-turn-cap kill
     citations?: Citation[];             // ENG-351: de-duplicated web sources this message consulted (ChatGPT-style Sources UI)
+    // ENG-112: provenance of a branched chat. Stamped ONLY on row 0 (the stored system prompt, which
+    // is never sent to the model) of a session created by "Branch from here". Free-form metadata, not a
+    // session field: see services/agentMode/chatBranching.ts.
+    branchOrigin?: {
+      sourceSessionId: string;
+      sourceTitle?: string;
+      sourceMessageIndex: number;       // RAW row index in the source session
+      branchedAt: string;
+    };
     mediaBudgetDeferred?: boolean;      // ENG-1239: set on the tool-role deferral marker AND on the whole-turn-timeout partial-delivery message that reports it, so an unresolved media-batch pause is detectable from the tail of session history alone
   };
 }
@@ -733,7 +742,7 @@ export class ChatbotDB {
     emailCampaignTaskId?: string,
     sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email" | "meeting-intake",
     delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean },
-    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages">>
+    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages" | "archived">>
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -2656,6 +2665,34 @@ export class ChatbotDB {
       await dynamodb.update(params).promise();
     } catch (error) {
       console.error("Error archiving chat session:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-112: inverse of archiveSession. REMOVES the `archived` attribute (an ordinary session never has
+   * one: every reader treats absent as live, `!session.archived` and `attribute_not_exists(archived) OR
+   * archived = :false`), so a revealed branch carries no stored shape an ordinary session lacks.
+   * Conditional on the row existing: an update on a deleted id would otherwise upsert a ghost row;
+   * that case rejects with `code: 'ConditionalCheckFailedException'`. Used only by chat branching.
+   */
+  async unarchiveSession(sessionId: string): Promise<void> {
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression: "SET adminListPartition = :adminListPartition REMOVE archived",
+      ConditionExpression: "attribute_exists(sessionId)",
+      ExpressionAttributeValues: {
+        ":adminListPartition": "all",
+      },
+    };
+
+    try {
+      await dynamodb.update(params).promise();
+    } catch (error) {
+      console.error("Error unarchiving chat session:", error);
       throw error;
     }
   }
