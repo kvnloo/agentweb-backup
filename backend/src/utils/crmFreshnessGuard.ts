@@ -335,7 +335,7 @@ const INVENTORY_PATTERNS: InventoryPattern[] = [
   { pluralOnly: true, needsCrmContext: true, re: new RegExp(`\\byou\\s+(?:currently\\s+|now\\s+)?(?:have|hold|manage)\\s+${HEDGE}${NUM}\\s+(?:total\\s+)?(?:leads|contacts|records)\\b(?=\\s*(?:[.,;:!)\\]]|$|in\\s+total|overall|altogether|in\\s+your|across\\s+(?:all\\s+)?(?:your\\s+)?(?:\\d+\\s+|\\w+\\s+)?(?:lists|the\\s+crm)))`, 'gi') },
 ];
 
-const SUBSET_BEFORE = /\b(remaining|other|another|rest of(?: the)?|empty|those|these|all but|except(?: for)?|plus|new|created|added|imported|built|made|found)\s+$/i;
+const SUBSET_BEFORE = /\b(remaining|other|another|rest of(?: the)?|empty|those|these|all but|except(?: for)?|plus|new|created|added|imported|built|made|found|[\d,]+(?:\.\d+)?k?\s+across)\s+$/i;
 // "N leads in total" / "Total leads: N" also describe a Apollo search, an import, a pasted list. Count them as an account
 // total only when CRM wording is in the same sentence.
 const CRM_CONTEXT = /\b(crm|lead lists?|your lists?|all (?:of )?(?:your )?lists|across (?:all )?(?:your |the )?(?:\d+ )?(?:lead )?lists|pipeline|contacts? database)\b/i;
