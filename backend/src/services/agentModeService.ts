@@ -7291,7 +7291,8 @@ export class AgentModeService {
    * discovery -> getFilteredTools -> voice augment -> excludeTools) by calling the same
    * helpers. The loop's turn-history-dependent filter (the ENG-763 loop breaker, which
    * drops install_skills while a repetition loop is active) is not applied here.
-   * `toolBridge.parity.test.ts` fails if this ever disagrees with what the loop sends.
+   * `funding/__tests__/emmaToolBridgeExecutor.integration.test.ts` compares this with
+   * what the loop sends, for a legacy and a skill-gated session.
    */
   public async resolveRunToolAccess(input: {
     userId: string;

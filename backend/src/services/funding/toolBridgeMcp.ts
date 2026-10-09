@@ -53,13 +53,27 @@ export class ToolBridgeMcpAdapter {
     this.bridge.closeRun(runId);
   }
 
-  /** Handles one HTTP request addressed to `runId`. Never reveals why a token was rejected. */
+  /** Lifts the session's confirmation halt. Only a new turn from the user may trigger this. */
+  clearHalt(sessionId: string): void {
+    this.bridge.clearHalt(sessionId);
+  }
+
+  isHalted(sessionId: string): boolean {
+    return this.bridge.isHalted(sessionId);
+  }
+
+  /**
+   * Handles one HTTP request addressed to `runId`. A rejected token gets the same bare
+   * 404 an unknown path gets, so the response shows neither why it was rejected nor
+   * that the endpoint exists.
+   */
   async handle(req: BridgeRequest, res: ServerResponse, runId: string): Promise<void> {
     const token = bearerToken(req);
     try {
       this.bridge.verify(token, runId);
     } catch {
-      respondJson(res, 401, { error: "unauthorized" });
+      res.writeHead(404);
+      res.end();
       return;
     }
 
@@ -76,9 +90,12 @@ export class ToolBridgeMcpAdapter {
         respondJson(res, 400, rpcError("Bad Request: no session"));
         return;
       }
-      if ((sessions?.size ?? 0) >= MAX_SESSIONS_PER_RUN) {
-        respondJson(res, 429, rpcError("Too many sessions for this run"));
-        return;
+      // A harness that reconnects abandons its old session without closing it; drop the
+      // oldest rather than lock the run out.
+      while (sessions && sessions.size >= MAX_SESSIONS_PER_RUN) {
+        const [oldestId, oldest] = sessions.entries().next().value as [string, McpSession];
+        sessions.delete(oldestId);
+        oldest.transport.close().catch(() => undefined);
       }
       session = await this.createSession(runId, token as string);
     }
@@ -119,7 +136,13 @@ export class ToolBridgeMcpAdapter {
           },
           runId,
         );
-        return { content: [{ type: "text", text: result.content }], isError: result.isError };
+        return {
+          content: [
+            { type: "text" as const, text: result.content },
+            ...(result.images ?? []).map((image) => ({ type: "image" as const, data: image.data, mimeType: image.mimeType })),
+          ],
+          isError: result.isError,
+        };
       } catch (err) {
         if (!(err instanceof ToolBridgeAuthError)) {
           console.error("[tool-bridge] MCP call failed:", err instanceof Error ? err.message : String(err));
@@ -131,6 +154,13 @@ export class ToolBridgeMcpAdapter {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (newSessionId: string) => {
+        try {
+          this.bridge.verify(token, runId);
+        } catch {
+          // The run closed while this session was being set up.
+          transport.close().catch(() => undefined);
+          return;
+        }
         let sessions = this.sessionsByRun.get(runId);
         if (!sessions) {
           sessions = new Map();

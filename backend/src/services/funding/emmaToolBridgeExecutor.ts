@@ -10,10 +10,16 @@
  * loop does after its own dispatch.
  *
  * Not replicated here, because they live in the loop around the dispatch and need the
- * turn itself: posting the approval deck, the step budget, cancellation and the
- * repetition loop-breaker. ENG-2113 owns those. The caller must give each turn's time
- * budgets through `beginTurn`; without them a media call is bounded only by the tool's
- * own timeout.
+ * turn itself: posting the approval deck, the step budget, cancellation, the
+ * repetition loop-breaker, the citation registry and open-research tracking. ENG-2113
+ * owns those. The caller must call `beginTurn` for every turn with that turn's run id,
+ * time budgets and the session's prior web-search count; without it a media call is
+ * bounded only by the tool's own timeout, the search cap starts from zero, and the
+ * gateway's failure breaker accumulates across turns under the bridge run id.
+ *
+ * Known difference from the loop: after a skill install the loop keeps the turn's
+ * original legacy-session and allowed-skill values until the next turn; this resolves
+ * them fresh, so a legacy session becomes skill-gated one turn earlier.
  */
 
 import {
@@ -24,9 +30,10 @@ import {
 } from "../agentModeService";
 import { executePreparedTools, NON_DEDUPABLE_TOOLS, type ToolDispatchPorts } from "../agentMode/core/toolDispatch";
 import { evaluateAgentToolPolicy } from "../agentToolGatewayService";
+import { WEB_SEARCH_TOOL_NAMES } from "../../utils/citations";
 import { chatbotDb } from "../chatbotService";
 import type { RunToolTokenClaims } from "./runToolToken";
-import type { BridgeExecuteOutcome, BridgeTool, BridgeToolCall, ToolBridgeDeps } from "./toolBridge";
+import type { BridgeExecuteOutcome, BridgeImage, BridgeTool, BridgeToolCall, ToolBridgeDeps } from "./toolBridge";
 
 export interface EmmaBridgeRunContext {
   llmModel: string;
@@ -56,8 +63,12 @@ interface EmmaRunState {
   context: EmmaBridgeRunContext;
   turn: EmmaBridgeTurn;
   access: ToolAccess | null;
+  /** Bumped per lookup so a slower, older lookup cannot overwrite a newer one's result. */
+  accessSeq: number;
   callSeq: number;
   searchCallCount: number;
+  /** Web-search calls dispatched but not yet counted, so concurrent ones each see the others. */
+  searchCallsInFlight: number;
   mediaAssetsProduced: number;
   longestMediaCallMs: number;
   mediaCallKeys: Map<string, string>;
@@ -72,8 +83,10 @@ export class EmmaToolBridgeExecutor implements ToolBridgeDeps {
       context,
       turn: {},
       access: null,
+      accessSeq: 0,
       callSeq: 0,
       searchCallCount: 0,
+      searchCallsInFlight: 0,
       mediaAssetsProduced: 0,
       longestMediaCallMs: 0,
       mediaCallKeys: new Map(),
@@ -97,6 +110,7 @@ export class EmmaToolBridgeExecutor implements ToolBridgeDeps {
 
   async resolveTools(run: RunToolTokenClaims): Promise<BridgeTool[]> {
     const state = this.requireRun(run.runId);
+    const seq = ++state.accessSeq;
     const access = await agentModeService.resolveRunToolAccess({
       userId: run.userId,
       sessionId: run.sessionId,
@@ -104,17 +118,18 @@ export class EmmaToolBridgeExecutor implements ToolBridgeDeps {
       isInteractiveShare: state.context.isInteractiveShare,
       excludeTools: state.context.excludeTools,
     });
-    state.access = access;
+    if (seq === state.accessSeq) state.access = access;
     return access.tools.map(toBridgeTool).filter((tool): tool is BridgeTool => tool !== null);
   }
 
   /**
    * Read-only only when Emma's own policy classifies the tool as a read whatever its
    * arguments. The `call_*` API tools are excluded because their effect depends on the
-   * action argument, which a static annotation cannot express.
+   * action argument, which a static annotation cannot express. The `ask_*` tools read
+   * nothing but stop the turn for the user, so they keep their place in the order.
    */
   isReadOnly(toolName: string): boolean {
-    if (toolName.startsWith("call_")) return false;
+    if (toolName.startsWith("call_") || toolName.startsWith("ask_")) return false;
     return evaluateAgentToolPolicy({ toolName, args: {} }).effect === "read";
   }
 
@@ -135,7 +150,16 @@ export class EmmaToolBridgeExecutor implements ToolBridgeDeps {
     const messages: any[] = [];
     const ledger: any[] = [];
 
-    const dispatched = await executePreparedTools({
+    // Read-only calls run concurrently, and web search is read-only. The loop counts a
+    // batch's searches as it prepares them, so each concurrent search here must see the
+    // ones dispatched just before it, or they would all pass the session cap together.
+    const isSearch = WEB_SEARCH_TOOL_NAMES.has(call.name);
+    const priorSearchCallCount = state.searchCallCount + state.searchCallsInFlight;
+    if (isSearch) state.searchCallsInFlight += 1;
+
+    let dispatched: Awaited<ReturnType<typeof executePreparedTools>>;
+    try {
+      dispatched = await executePreparedTools({
       toolCalls: [{ id: toolCallId, type: "function", function: { name: call.name, arguments: JSON.stringify(call.args) } }],
       messages,
       toolCallsLedger: ledger,
@@ -164,7 +188,7 @@ export class EmmaToolBridgeExecutor implements ToolBridgeDeps {
       longestMediaCallMsThisRun: state.longestMediaCallMs,
       priorMediaCallKeys: state.mediaCallKeys,
       approvedRevisionImageSources: turn.approvedRevisionImageSources,
-      priorSearchCallCount: state.searchCallCount,
+      priorSearchCallCount,
       ports: agentModeService.buildToolDispatchPorts({
         agentRuntimeRunId,
         sessionId: run.sessionId,
@@ -174,7 +198,10 @@ export class EmmaToolBridgeExecutor implements ToolBridgeDeps {
         mediaGenerationDeadlineMs: turn.mediaGenerationDeadlineMs,
         socketEmit: context.socketEmit,
       }),
-    });
+      });
+    } finally {
+      if (isSearch) state.searchCallsInFlight -= 1;
+    }
 
     // Fold the result back in exactly as Emma's loop does after its own dispatch.
     state.mediaAssetsProduced += dispatched.mediaAssetsProduced;
@@ -189,11 +216,13 @@ export class EmmaToolBridgeExecutor implements ToolBridgeDeps {
     const entry = ledger.find((item) => item?.id === toolCallId);
     if (!toolMessage || !entry) throw new Error("dispatcher produced no result for the call");
 
-    const result = entry.result;
+    const isError = entry.error !== undefined;
     return {
-      content: typeof toolMessage.content === "string" ? toolMessage.content : JSON.stringify(toolMessage.content ?? ""),
-      isError: entry.error !== undefined,
-      requiresConfirmation: result?.awaitingUserConfirmation === true || result?.requiresConfirmation === true,
+      ...toBridgeContent(toolMessage.content),
+      isError,
+      // The loop's own rule (collectConfirmationPrompt): a successful result carrying
+      // awaitingUserConfirmation. `requiresConfirmation` alone does not stop the turn.
+      requiresConfirmation: !isError && entry.result?.awaitingUserConfirmation === true,
       toolsChanged: dispatched.skillsUpdated === true,
     };
   }
@@ -203,6 +232,27 @@ export class EmmaToolBridgeExecutor implements ToolBridgeDeps {
     if (!state) throw new Error("run is not registered with the executor");
     return state;
   }
+}
+
+/**
+ * A tool message is a string, or for a screenshot on a vision model a list of text and
+ * image parts. The image goes to the harness as an image, not as base64 inside text.
+ */
+function toBridgeContent(content: unknown): { content: string; images?: BridgeImage[] } {
+  if (typeof content === "string") return { content };
+  if (!Array.isArray(content)) return { content: JSON.stringify(content ?? "") };
+  const text: string[] = [];
+  const images: BridgeImage[] = [];
+  for (const part of content) {
+    if (part?.type === "text" && typeof part.text === "string") {
+      text.push(part.text);
+    } else if (part?.type === "image_url") {
+      const match = /^data:([^;,]+);base64,(.+)$/s.exec(String(part.image_url?.url ?? ""));
+      if (match) images.push({ mimeType: match[1], data: match[2] });
+      else text.push("[image omitted]");
+    }
+  }
+  return { content: text.join("\n"), ...(images.length ? { images } : {}) };
 }
 
 function toBridgeTool(definition: any): BridgeTool | null {

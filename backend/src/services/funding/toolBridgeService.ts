@@ -8,5 +8,5 @@ import { ToolBridge } from "./toolBridge";
 import { ToolBridgeMcpAdapter } from "./toolBridgeMcp";
 
 export const emmaToolBridgeExecutor = new EmmaToolBridgeExecutor();
-export const toolBridge = new ToolBridge(emmaToolBridgeExecutor);
-export const toolBridgeMcp = new ToolBridgeMcpAdapter(toolBridge);
+// Reached only through the adapter, so closing a run always closes its MCP sessions too.
+export const toolBridgeMcp = new ToolBridgeMcpAdapter(new ToolBridge(emmaToolBridgeExecutor));

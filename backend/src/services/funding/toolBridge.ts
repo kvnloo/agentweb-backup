@@ -48,8 +48,16 @@ export interface BridgeToolCall {
   callId?: string;
 }
 
+export interface BridgeImage {
+  mimeType: string;
+  /** Base64, no data-URL prefix. */
+  data: string;
+}
+
 export interface BridgeExecuteOutcome {
   content: string;
+  /** Images the tool returned for the model to look at (a screenshot). */
+  images?: BridgeImage[];
   isError: boolean;
   /** The tool did not act and is waiting for the user to confirm. Halts the session. */
   requiresConfirmation: boolean;
@@ -59,6 +67,7 @@ export interface BridgeExecuteOutcome {
 
 export interface BridgeCallResult {
   content: string;
+  images?: BridgeImage[];
   isError: boolean;
 }
 
@@ -143,7 +152,9 @@ export class ToolBridge {
 
   /** Opens a run and returns its token. A run already open under this id is closed first. */
   openRun(claims: RunToolTokenClaims, opts: OpenRunOptions = {}): string {
-    this.closeRun(claims.runId);
+    // The executor's state for this id was set up by the caller just before this, so
+    // replacing a run that is still open must not release it.
+    this.endRun(claims.runId, false);
     if (opts.halted) this.haltedSessions.add(claims.sessionId);
     this.runs.set(claims.runId, {
       claims: { ...claims },
@@ -164,6 +175,10 @@ export class ToolBridge {
 
   /** Ends the run: the token stops working and everything waiting on the run is refused. */
   closeRun(runId: string): void {
+    this.endRun(runId, true);
+  }
+
+  private endRun(runId: string, releaseExecutor: boolean): void {
     const state = this.runs.get(runId);
     this.tokens.revokeRun(runId);
     if (!state) return;
@@ -171,7 +186,7 @@ export class ToolBridge {
     this.runs.delete(runId);
     for (const release of [...state.waiters]) release();
     state.waiters.clear();
-    this.deps.releaseRun?.(runId);
+    if (releaseExecutor) this.deps.releaseRun?.(runId);
   }
 
   /**
@@ -381,7 +396,11 @@ export class ToolBridge {
       state.toolsGeneration++;
       if (!state.closed) notify(state.onToolsChanged, "onToolsChanged");
     }
-    return { content: outcome.content, isError: outcome.isError === true };
+    return {
+      content: outcome.content,
+      isError: outcome.isError === true,
+      ...(outcome.images?.length ? { images: outcome.images } : {}),
+    };
   }
 }
 
