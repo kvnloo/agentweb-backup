@@ -79,7 +79,9 @@ import {
   markRunTerminal,
   IDEM_TTL_INTERACTIVE_S,
 } from '../services/agentMode/runStore';
-import { ModelUnavailableError, buildModelUnavailableBody, isModelUnavailableError, sanitizeModelLabel } from '../services/agentMode/modelUnavailable';
+import { assertSequentialStepCounts } from '../services/workPlanSteps';
+import { validateModelPin, normalizeRequestedLlmModel, resolvePlanLaunchModel, canonicalPinId } from '../services/agentMode/modelPin';
+import { ModelUnavailableError, MODEL_SAVE_FAILED_MESSAGE, buildAnonymousModelUnavailableBody, buildModelUnavailableBody, isModelUnavailableError, sanitizeModelLabel } from '../services/agentMode/modelUnavailable';
 import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
 // ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
 // on existing report/run envelopes. No surface parses or re-ranks on its own.
@@ -484,20 +486,12 @@ export async function resolveEffectiveModelForUser(input: {
   };
 }
 
-/**
- * A request-body llmModel that is not a string (array, number, object...) is still an
- * explicit selection, but it must never reach the registry lookups, which coerce keys
- * (['gpt-5.5'] would match 'gpt-5.5' and then blow up later as a 500). Give it a
- * stable string form so it is refused like any other unserved id. null/undefined/blank
- * stay "no selection".
- */
-function normalizeRequestedLlmModel(raw: unknown): string | undefined {
-  if (raw === null || raw === undefined) return undefined;
-  if (typeof raw === 'string') return raw.trim() || undefined;
+/** Remove a session this request just created after a refused launch; failure is logged, never thrown. */
+async function deleteNewSessionBestEffort(sessionId: string): Promise<void> {
   try {
-    return JSON.stringify(raw) ?? String(raw);
-  } catch {
-    return String(typeof raw);
+    await chatbotDb.deleteSession(sessionId);
+  } catch (deleteErr) {
+    console.error(`AgentMode: failed to delete session ${sessionId} after a refused plan launch (orphaned empty session):`, deleteErr);
   }
 }
 
@@ -515,31 +509,15 @@ function modelUnavailableBody(err: ModelUnavailableError) {
  * bad pin is refused with the portal's existing `model_unavailable` 422 instead of
  * surviving until it fails the run.
  *
- * Returns the trimmed id to store ('' = no pin). Throws ModelUnavailableError when the
+ * Returns the CANONICAL registry id to store (the trimmed id for partial doubles; '' = no pin). Throws ModelUnavailableError when the
  * id is not a string, not served (registry key or honoured alias), or not selectable by
  * this user (internalOnly, live-voice, adminOnly for a non-admin). Does not change the
  * run-time resolver. Partial service doubles (older unit tests) skip the registry checks,
  * exactly like the resolver above.
  */
 async function validateScheduleModelPin(userId: string, raw: unknown): Promise<string> {
-  const requested = normalizeRequestedLlmModel(raw);
-  if (!requested) return '';
-  if (typeof raw !== 'string') throw new ModelUnavailableError(requested, 'not_served');
-  if (
-    typeof agentModeService.resolveGenerationModel !== 'function'
-    || typeof agentModeService.isModelSelectableBy !== 'function'
-  ) {
-    return requested;
-  }
-  const resolution = agentModeService.resolveGenerationModel(requested);
-  if (resolution.fellBack) throw new ModelUnavailableError(requested, 'not_served');
-  if (!agentModeService.isModelSelectableBy(resolution.model, false)) {
-    // adminOnly is the only gate an admin can clear; internalOnly/live fail for everyone.
-    const adminCanSelect = agentModeService.isModelSelectableBy(resolution.model, true)
-      && await isUserAdmin(userId);
-    if (!adminCanSelect) throw new ModelUnavailableError(requested, 'not_selectable');
-  }
-  return requested;
+  // Shared rule set (services/agentMode/modelPin.ts) - also used by Work Plan writes and launches.
+  return validateModelPin(agentModeService, () => isUserAdmin(userId), raw);
 }
 
 async function resolveScheduleBackup(input: {
@@ -12043,6 +12021,14 @@ export const agentModeController = {
       // hands-off work-plan autocomplete, even if this session is scheduled.
       const result = await agentModeService.applyPredefinedWorkPlan(planId, sessionId, user.userId, { isUnattendedRun: false });
       if (!result.success) {
+        // ENG-903: the plan's pinned model cannot be served for this user: 422, nothing launched.
+        if (result.errorType === 'model_unavailable' && result.modelUnavailable) {
+          return res.status(422).json(result.modelUnavailable);
+        }
+        // The model could not be saved to the session (storage): transient, nothing launched.
+        if (result.errorType === 'model_save_failed') {
+          return res.status(503).json({ error: MODEL_SAVE_FAILED_MESSAGE, code: 'model_save_failed' });
+        }
         return res.status(result.requiresConfirmation ? 409 : 404).json({
           error: result.requiresConfirmation ? 'ACTIVE_WORK_PLAN' : 'WORKPLAN_UNAVAILABLE',
           code: result.requiresConfirmation ? 'ACTIVE_WORK_PLAN' : 'WORKPLAN_UNAVAILABLE',
@@ -12146,6 +12132,14 @@ export const agentModeController = {
       // hands-off work-plan autocomplete, even if this session is scheduled.
       const result = await agentModeService.applyPredefinedWorkPlan(planId, sessionId, user.userId, { skipDeclineGate: true, isUnattendedRun: false });
       if (!result.success) {
+        // ENG-903: the plan's pinned model cannot be served for this user: 422, nothing launched.
+        if (result.errorType === 'model_unavailable' && result.modelUnavailable) {
+          return res.status(422).json(result.modelUnavailable);
+        }
+        // The model could not be saved to the session (storage): transient, nothing launched.
+        if (result.errorType === 'model_save_failed') {
+          return res.status(503).json({ error: MODEL_SAVE_FAILED_MESSAGE, code: 'model_save_failed' });
+        }
         // Defensive backstop for a race between our pre-check above and this
         // call (e.g. a concurrent accept/launch landed in between) — never a
         // silent partial: chat/session state is left exactly as applyPredefinedWorkPlan
@@ -13083,7 +13077,8 @@ export const agentModeController = {
       const llmModelProvided = llmModel !== undefined && llmModel !== null;
       const incomingLlmModel: unknown = typeof llmModel === 'string' ? llmModel.trim() : llmModel;
       const llmModelClearing = llmModelProvided && incomingLlmModel === '';
-      const llmModelChanging = llmModelProvided && !llmModelClearing && incomingLlmModel !== storedLlmModel;
+      const llmModelChanging = llmModelProvided && !llmModelClearing && incomingLlmModel !== storedLlmModel
+        && !(storedLlmModel && incomingLlmModel === canonicalPinId(agentModeService, storedLlmModel));
       const validatedLlmModel = llmModelChanging ? await validateScheduleModelPin(user.userId, incomingLlmModel) : undefined;
 
       const existingBackupFields = {
@@ -15063,6 +15058,35 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Not authorized to use this private work plan' });
       }
 
+      // ENG-903 FAIL-LOUD: a plan's non-empty `defaultModel` is an explicit pin set by its
+      // author. Resolve it against the LAUNCHING user (anonymous = non-admin) BEFORE the
+      // session or any side effect exists; an unserved/unselectable pin is a 422, never a
+      // silent swap to the account default. Empty = account default (unchanged).
+      let planPinnedModel: string | undefined;
+      try {
+        planPinnedModel = await resolvePlanLaunchModel(
+          agentModeService,
+          () => (result.user ? isUserAdmin(result.user.userId) : Promise.resolve(false)),
+          predefinedPlan.defaultModel,
+        );
+      } catch (modelError) {
+        if (!isModelUnavailableError(modelError)) throw modelError;
+        console.warn(`AgentMode: createSessionWithPlan "${predefinedPlan.title}" refused — plan model "${sanitizeModelLabel(modelError.requestedModel)}" is ${modelError.reason}.`);
+        // An anonymous visitor learns nothing about which models exist or why.
+        return res.status(422).json(result.user
+          ? buildModelUnavailableBody(modelError, agentModeService.getModelDisplayName?.(modelError.requestedModel), 'work_plan_pin')
+          : buildAnonymousModelUnavailableBody());
+      }
+
+      // Same structure check updateSessionWorkPlan performs, run BEFORE any session or model
+      // write exists: a malformed plan (non-sequential stepCount) is refused with no state change.
+      try {
+        assertSequentialStepCounts(predefinedPlan.steps || []);
+      } catch (planErr) {
+        console.error(`AgentMode: createSessionWithPlan "${predefinedPlan.title}" refused — invalid plan structure:`, (planErr as Error).message);
+        return res.status(422).json({ error: 'This work plan is misconfigured and cannot be started right now.', code: 'workplan_invalid' });
+      }
+
       // Create session with userId (authenticated or anonymous)
       const session = await chatbotDb.createChatSession(
         userId,
@@ -15076,110 +15100,122 @@ export const agentModeController = {
         'predefined-work-plan' // sessionType
       );
 
-      // Convert predefined plan to session work plan format
-      const workPlan = {
-        title: predefinedPlan.title,
-        steps: predefinedPlan.steps.map((step: any) => ({
-          stepCount: step.stepCount,
-          title: step.title,
-          description: step.description,
-          // Carry the user-facing instructions through to the session so
-          // <HorizontalPlanProgress> can render them in the expanded-step
-          // panel. Without this, the field set in the partner-portal
-          // editor never reaches the customer portal.
-          ...(step.userInstructions !== undefined && { userInstructions: step.userInstructions }),
-          ...(step.inputRequest !== undefined && { inputRequest: step.inputRequest }),
-          status: 'pending' as const,
-          completedAt: undefined,
-          notes: undefined,
-          requiredFunctionCalls: step.requiredFunctionCalls,
-          skillIds: step.skillIds,
-          // ENG-1331: this route never carried expectedAssetCount from the template
-          // into the session, unlike its sibling instantiation path
-          // (agentModeService.ts applyPredefinedWorkPlan) — so the step-completion
-          // gate had nothing to enforce even once the template had it set. This is
-          // the exact route the production incident session was created through
-          // (its pageIdentifier `plan-${planTitle}` matches only this path).
-          ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
-          ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools }),
-        })),
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      };
-
-      // Create work plan in session (include welcome message and autocomplete if defined)
-      const workPlanWithWelcome = {
-        ...workPlan,
-        welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
-        autocomplete: predefinedPlan.autocomplete || false,
-        showLoginSignup: predefinedPlan.showLoginSignup || 'after_plan_completed',
-        requireLogin: predefinedPlan.requireLogin || false,
-        // ENG-1472: stamp which template this session's plan came from — the
-        // same field applyPredefinedWorkPlan stamps on its own instantiation
-        // path — so every predefined-plan session is traceable back to its
-        // template regardless of which route created it.
-        templatePlanId: predefinedPlan.planId,
-      };
-      await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
-      const firstInput = predefinedPlan.steps[0]?.inputRequest;
-      if (firstInput) {
-        await chatbotDb.updateSessionWorkPlanInputRequest(session.sessionId, buildWorkPlanInputRequest({
-          ...firstInput,
-          requestId: uuidv4(),
-          stepCount: 1,
-        }), { failIfAwaitingExists: true });
-      }
-
-      // Auto-install ALL skills from ALL work plan steps upfront.
-      // Skills need to be available from the start because tool filtering is computed
-      // at the beginning of each message — installing mid-conversation (on step completion)
-      // doesn't take effect until the next message, causing tools to be unavailable.
-      // The work plan's requiredFunctionCalls still enforce step ordering.
-      const allSkillIds = new Set<string>();
-      for (const step of predefinedPlan.steps) {
-        if (step.skillIds?.length) {
-          step.skillIds.forEach((id: string) => allSkillIds.add(id));
-        }
-      }
-      if (allSkillIds.size > 0) {
+      // Every write below runs on the session this request just created. ANY failure removes
+      // exactly that session (best effort) so a failed launch never leaves a half-built one behind,
+      // then either maps to the 503 model_save_failed body or rethrows to the generic 500.
+      let modelSaveFailed = false;
+      let selectedModel: string;
+      let workPlanWithWelcome: any;
+      let conversableToken: string;
+      try {
+        // Set the session model FIRST: the plan's validated pin, else the account default.
+        // If the write fails nothing else has been written, so the plan is never started on
+        // a model other than the one it pins; the empty session is removed best-effort.
+        selectedModel = planPinnedModel || await agentModeService.getDefaultModel();
         try {
-          await chatbotDb.addAssociatedSkills(session.sessionId, Array.from(allSkillIds));
-          console.log(`AgentMode: Auto-installed all plan skills for "${predefinedPlan.title}": ${Array.from(allSkillIds).join(', ')}`);
-        } catch (skillErr) {
-          console.error('AgentMode: Error auto-installing plan skills:', skillErr);
+          await chatbotDb.updateSessionLlmModel(session.sessionId, selectedModel);
+        } catch (modelErr) {
+          console.error(`AgentMode: createSessionWithPlan failed to save model for ${session.sessionId}; launch refused:`, modelErr);
+          modelSaveFailed = true;
+          throw modelErr;
         }
-      }
 
-      // Set default model for new sessions
-      // Use work plan's default model if specified, otherwise use global default
-      let selectedModel = predefinedPlan.defaultModel;
+        // Convert predefined plan to session work plan format
+        const workPlan = {
+          title: predefinedPlan.title,
+          steps: predefinedPlan.steps.map((step: any) => ({
+            stepCount: step.stepCount,
+            title: step.title,
+            description: step.description,
+            // Carry the user-facing instructions through to the session so
+            // <HorizontalPlanProgress> can render them in the expanded-step
+            // panel. Without this, the field set in the partner-portal
+            // editor never reaches the customer portal.
+            ...(step.userInstructions !== undefined && { userInstructions: step.userInstructions }),
+            ...(step.inputRequest !== undefined && { inputRequest: step.inputRequest }),
+            status: 'pending' as const,
+            completedAt: undefined,
+            notes: undefined,
+            requiredFunctionCalls: step.requiredFunctionCalls,
+            skillIds: step.skillIds,
+            // ENG-1331: this route never carried expectedAssetCount from the template
+            // into the session, unlike its sibling instantiation path
+            // (agentModeService.ts applyPredefinedWorkPlan) — so the step-completion
+            // gate had nothing to enforce even once the template had it set. This is
+            // the exact route the production incident session was created through
+            // (its pageIdentifier `plan-${planTitle}` matches only this path).
+            ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
+            ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools }),
+          })),
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        };
 
-      // Validate work plan's default model
-      if (selectedModel) {
-        const supportedModels = await agentModeService.getSupportedModels();
-        if (!supportedModels.includes(selectedModel)) {
-          console.warn(`AgentMode: Work plan default model "${selectedModel}" not supported, using global default`);
-          selectedModel = undefined;
-        } else {
-          console.log(`AgentMode: Using work plan default model: ${selectedModel}`);
+        // Create work plan in session (include welcome message and autocomplete if defined)
+        workPlanWithWelcome = {
+          ...workPlan,
+          welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
+          autocomplete: predefinedPlan.autocomplete || false,
+          showLoginSignup: predefinedPlan.showLoginSignup || 'after_plan_completed',
+          requireLogin: predefinedPlan.requireLogin || false,
+          // ENG-1472: stamp which template this session's plan came from — the
+          // same field applyPredefinedWorkPlan stamps on its own instantiation
+          // path — so every predefined-plan session is traceable back to its
+          // template regardless of which route created it.
+          templatePlanId: predefinedPlan.planId,
+        };
+        try {
+          await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
+        } catch (planWriteErr) {
+          // Nothing has been shown to the user yet: drop the half-built session (it already holds
+          // the plan's model but no plan) and fail loudly.
+          console.error(`AgentMode: createSessionWithPlan failed to save the plan for ${session.sessionId}; launch refused:`, planWriteErr);
+          throw planWriteErr;
         }
+        const firstInput = predefinedPlan.steps[0]?.inputRequest;
+        if (firstInput) {
+          await chatbotDb.updateSessionWorkPlanInputRequest(session.sessionId, buildWorkPlanInputRequest({
+            ...firstInput,
+            requestId: uuidv4(),
+            stepCount: 1,
+          }), { failIfAwaitingExists: true });
+        }
+
+        // Auto-install ALL skills from ALL work plan steps upfront.
+        // Skills need to be available from the start because tool filtering is computed
+        // at the beginning of each message — installing mid-conversation (on step completion)
+        // doesn't take effect until the next message, causing tools to be unavailable.
+        // The work plan's requiredFunctionCalls still enforce step ordering.
+        const allSkillIds = new Set<string>();
+        for (const step of predefinedPlan.steps) {
+          if (step.skillIds?.length) {
+            step.skillIds.forEach((id: string) => allSkillIds.add(id));
+          }
+        }
+        if (allSkillIds.size > 0) {
+          try {
+            await chatbotDb.addAssociatedSkills(session.sessionId, Array.from(allSkillIds));
+            console.log(`AgentMode: Auto-installed all plan skills for "${predefinedPlan.title}": ${Array.from(allSkillIds).join(', ')}`);
+          } catch (skillErr) {
+            console.error('AgentMode: Error auto-installing plan skills:', skillErr);
+          }
+        }
+
+        // Enable interactive sharing for the session
+        conversableToken = crypto.randomBytes(32).toString('hex');
+        const interactiveShareMetadata = {
+          isActive: true,
+          token: conversableToken,
+          sharedAt: new Date().toISOString()
+        };
+        await chatbotDb.updateSessionInteractiveShareMetadata(session.sessionId, interactiveShareMetadata);
+      } catch (launchErr) {
+        await deleteNewSessionBestEffort(session.sessionId);
+        if (modelSaveFailed) {
+          return res.status(503).json({ error: MODEL_SAVE_FAILED_MESSAGE, code: 'model_save_failed' });
+        }
+        throw launchErr;
       }
-
-      // Fall back to global default if no valid work plan model
-      if (!selectedModel) {
-        selectedModel = await agentModeService.getDefaultModel();
-      }
-
-      await chatbotDb.updateSessionLlmModel(session.sessionId, selectedModel);
-
-      // Enable interactive sharing for the session
-      const conversableToken = crypto.randomBytes(32).toString('hex');
-      const interactiveShareMetadata = {
-        isActive: true,
-        token: conversableToken,
-        sharedAt: new Date().toISOString()
-      };
-      await chatbotDb.updateSessionInteractiveShareMetadata(session.sessionId, interactiveShareMetadata);
 
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
       const redirectUrl = `${customerFrontendUrl}/plan/${encodeURIComponent(planTitle)}/${session.sessionId}?conversable=${conversableToken}`;

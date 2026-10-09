@@ -472,3 +472,21 @@ export function summarizeStepChange(before: any[], after: any[], mode: 'merge' |
     ...(contentLoss.length > 0 && { stepContentLoss: contentLoss }),
   };
 }
+
+/**
+ * The stepCount rule `chatbotDb.updateSessionWorkPlan` enforces on write: steps must be
+ * numbered sequentially from 1 (stepCount === index + 1). Exported so a launch can run the
+ * SAME check BEFORE it writes anything else (e.g. the session model) and fail with no state
+ * change instead of discovering a malformed plan only at the final write (ENG-903).
+ */
+export function assertSequentialStepCounts(steps: ReadonlyArray<{ stepCount: number }>): void {
+  for (let i = 0; i < steps.length; i++) {
+    const expectedStepCount = i + 1;
+    if (steps[i].stepCount !== expectedStepCount) {
+      throw new Error(
+        `Invalid stepCount at index ${i}: expected ${expectedStepCount} but got ${steps[i].stepCount}. ` +
+        `Steps must be numbered sequentially starting from 1 (stepCount must equal index+1).`
+      );
+    }
+  }
+}
