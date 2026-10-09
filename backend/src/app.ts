@@ -80,6 +80,7 @@ import crmWebhookRoutes from "./routes/crmWebhook";
 import mcpServersRoutes, { mcpOAuthPublicRouter } from "./routes/mcpServers";
 import metaToolkitRoutes from "./routes/metaToolkit";
 import { createToolBridgeRouter } from "./routes/toolBridge";
+import { createLlmConnectionsRouter } from "./routes/llmConnections";
 import { toolBridgeMcp } from "./services/funding/toolBridgeService";
 import skillRoutes from "./routes/skillRoutes";
 import userSkillRoutes from "./routes/userSkillRoutes";
@@ -414,6 +415,8 @@ app.use("/api/admin", adminV0CreditsRoutes);
 app.use("/api/internal", internalUsageRoutes);
 // ENG-2109: MCP endpoint for claude -p sessions this backend spawned. Local-only; see routes/toolBridge.ts.
 app.use("/internal/tool-bridge", createToolBridgeRouter(toolBridgeMcp));
+// ENG-2105: a customer's own LLM provider keys (BYOK). Gated by the eng1816_funding_flags row.
+app.use("/api/llm-connections", createLlmConnectionsRouter());
 app.use("/api/config", configRouter);
 app.use("/api/browser-cookies", browserCookiesRouter);
 app.use("/api/workflows", workflowRoutes);
