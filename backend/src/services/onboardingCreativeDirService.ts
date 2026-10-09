@@ -21,6 +21,7 @@
  * prompt contains BRICK 4 markers from the prod copy.
  */
 
+import { withClearedError } from "../utils/clearErrorOnClaim";
 import { LLMService } from "../utils/llmService";
 import type { LLMUsageContext } from "../utils/llmService";
 import { reportUIError } from "../utils/errorReporter";
@@ -376,7 +377,7 @@ export async function claimCreativeDirRun(
 ): Promise<CreativeDirStatusFields | null> {
   const patch = creativeDirStartPatch();
   try {
-    await userDb.updateUser(userId, patch as any, {
+    await userDb.updateUser(userId, withClearedError(patch, "creativeDirError") as any, {
       condition: creativeDirStartClaimCondition(),
     });
   } catch (err: any) {
