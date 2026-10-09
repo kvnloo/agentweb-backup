@@ -33,6 +33,8 @@ interface ResendSendParams {
   cc?: string | string[];
   inReplyTo?: string;
   replyTo?: string;
+  /** ENG-2367: extra headers (e.g. List-Unsubscribe). */
+  headers?: Record<string, string>;
 }
 
 interface QueuedEmailSend {
@@ -237,7 +239,8 @@ class ResendService {
     text,
     cc,
     inReplyTo,
-    replyTo
+    replyTo,
+    headers
   }: ResendSendParams) {
     await this.initializeResend();
 
@@ -272,8 +275,12 @@ class ResendService {
     }
 
     // Add reply headers if replying to an email
+    if (headers && Object.keys(headers).length > 0) {
+      emailOptions.headers = { ...headers };
+    }
     if (inReplyTo) {
       emailOptions.headers = {
+        ...(emailOptions.headers || {}),
         'In-Reply-To': inReplyTo
       };
     }

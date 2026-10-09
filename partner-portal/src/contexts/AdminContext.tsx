@@ -26,6 +26,8 @@ interface User {
   createdAt: string;
   lastLoginTime?: string;
   lastActiveAt?: string;
+  /** ENG-1271: derived customer-vs-staff activity signal from GET /api/admin/users. */
+  selfActivity?: { selfActiveRecently: boolean; lastSelfActiveAt: string | null; staffOperatedSuspect: boolean } | null;
   displayName?: string;
   funnelStatus?: string | null;
   supportNote?: string;

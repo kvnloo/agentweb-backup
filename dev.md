@@ -1,3 +1,204 @@
+## ENG-0000: Migrate video generation to gemini-omni-1.1-flash (2026-10-08)
+
+**Why:** Google shuts down `veo-3.1-generate-preview`, `veo-3.1-fast-generate-preview`
+(and the older `veo-3-generate-preview` / `veo-3.0-generate-preview`) on 2026-10-22.
+The replacement is `gemini-omni-1.1-flash`.
+
+**API facts (live-tested 2026-10-08 with the dev key):**
+- The model accepts ONLY the Gemini Interactions API. `generateContent` and
+  `predictLongRunning` are rejected ("only supports Interactions API").
+- `POST https://generativelanguage.googleapis.com/v1beta/interactions?key=KEY` with
+  `{model, input, response_format: {type:"video", aspect_ratio:"16:9"|"9:16", resolution:"360p"|"720p"|"1080p"|"4k"}}`.
+  `input` is the prompt string, or `[image parts..., {type:"text", text}]`. One image =
+  image-to-video; two images (first, then last) = first/last-frame interpolation.
+- Synchronous: the response has `status:"completed"` and the clip as base64 in
+  `steps[].content[]` (`{type:"video", mime_type:"video/mp4", data}`). No polling,
+  no file download. A 360p request took 25s and returned a 10.0s clip.
+- Duration (live-verified 2026-10-08): `response_format.duration` is a STRING such as
+  `"5s"` (integer 3–10). `{"duration":5}` → 400 Invalid input; `"duration_seconds"` →
+  unknown parameter; `{"duration":"5s"}` returned a 5.01s clip. We always send each
+  clip's exact length (default 8s). Requests >10s split into <=10s clips that sum to the
+  request (14s → 10+4; a <3s remainder borrows from the previous clip: 21s → 10+8+3),
+  generated in parallel and stitched in Remotion (`maxClipSeconds: 10`).
+- Same secret as Veo: `{dev,prod}/AgentWeb/Google/Video`.
+
+**Pricing:** $17.50/M video output tokens (5,792 tokens/s at 720p ≈ $0.1014/s),
+$9/M text output, $1.50/M input. `omniVideoUsageCostUsd` bills the response `usage`;
+when absent we estimate $0.1014 x the actual requested seconds. Legacy Veo price entries stay so
+historical spend events still re-derive. The price-book version stays `2026-10-08`
+(the addition is a new key only; no existing price moved) and the fingerprint pin was
+updated.
+
+**Behavior changes:**
+- Seedance 2.0 stays the default; its automatic fallback is now gemini-omni-1.1-flash
+  (was Veo 3.1). The Veo quota fallback to `veo-3.1-fast-generate-preview` is gone —
+  there is one Google model, and a 429 fails clearly with a quota message.
+- Retired Veo ids are accepted as input aliases for gemini-omni-1.1-flash everywhere
+  (video service, `agent_mode_video_api_default_model` setting, admin dropdown, agent
+  engine `video_model`). Read-time only; no stored data is rewritten.
+- `VideoService.generateVideo` now returns `model` (the model that actually produced the
+  clip, after any fallback) and `costUsd`; Emma's session cost uses them, so a
+  Seedance→Omni fallback is no longer costed as the requested model.
+- The agent engine's `generate_short_video` default branch calls the Interactions API
+  over REST (`requests`) instead of `client.models.generate_videos`.
+
+**Not changed:** `docs/model-roles-inventory.md` is a generated snapshot (its line
+references were already stale) and `agent-engine/examples/Get_started_Veo.ipynb` is an
+example notebook; neither is a runtime path.
+
+## ENG-903: Work Plan launch and save fail loudly on an unavailable pinned model (2026-10-08)
+
+A Work Plan's non-empty `defaultModel` is an explicit pin. Before this change, launching a plan whose pin was retired, internal-only, live-voice or admin-only (for a non-admin) silently dropped it for the account default (`createSessionWithPlan`, and `applyPredefinedWorkPlan` behind the launch route, the accept-recommendation route and Emma's `launch_predefined_work_plan`), with only a console warning.
+
+- New `services/agentMode/modelPin.ts` holds the single pin rule set (extracted verbatim from the schedule `validateScheduleModelPin` merged in #3365): served registry key or honoured alias, selectable by the user (adminOnly clears only for an admin). The schedule validator now delegates to it.
+- Launch: `createSessionWithPlan` (public/anonymous, caller's admin status; anonymous = non-admin) and `applyPredefinedWorkPlan` (session owner's admin status) resolve the pin BEFORE any session or session mutation and refuse with HTTP 422 `model_unavailable` (shared `buildModelUnavailableBody`). `launchWorkPlan` and `acceptWorkPlanRecommendation` map the refusal to 422; the Emma tool returns `success:false, errorType:'model_unavailable'` with the same sentence. An unattended (scheduled) launch is refused the same way and pages oncall (deduped). Empty `defaultModel` = account default, unchanged. An accepted alias is stored as the canonical id.
+- Write: user and admin plan create/update routes validate `defaultModel` like schedule pins (422; unchanged stored value tolerated on update; blank clears; trimmed; non-string refused). No new persisted field, table or index.
+- Write ordering and compensation: the model is written FIRST (`updateSessionLlmModel` is a single UpdateItem `SET llmModel REMOVE llmUsagePolicyDecision`: no message, audit or SSE). Before it, the plan structure is validated with the same `assertSequentialStepCounts` rule `updateSessionWorkPlan` enforces (so a non-sequential `stepCount` fails with NO state change). The previous `llmModel` and `llmUsagePolicyDecision` are captured; if the plan write then throws, they are restored through `chatbotDb.restoreSessionLlmModelIfUnchanged`: a single UpdateItem with `ConditionExpression llmModel = :planModel` (the value this launch wrote), so a model the user PATCHed in the window is never overwritten (ConditionalCheckFailed = 'someone changed it, leave it', logged at info, not an error). A session that had NO explicit model gets `REMOVE llmModel` (and the decision removed/restored), returning to exactly its prior state rather than a stored default. This is NOT a schema change: existing attributes and a conditional write only. A failed restore (any other error) is logged as CRITICAL with the session id and the caller still gets the failure; the launch success path is unchanged. `createSessionWithPlan` validates the structure before `createChatSession` and, once the session exists, ANY later failure (model, plan, input-request or interactive-share write, default-model lookup) removes exactly the session it just created (best effort, logged with the id on failure), returning 503 `model_save_failed` for the model write and the generic 500 otherwise; a refused launch creates no session at all.
+- Failure mapping: a failed model save is HTTP 503 `model_save_failed` (transient, nothing started) from the launch and accept routes and `createSessionWithPlan`; the Emma tool returns `errorType:'model_save_failed'`.
+- Anonymous Emma tool: public plan sessions run as `anon_*` users and can call `launch_predefined_work_plan`, so for an anonymous caller both the tool message and `modelUnavailable` use the anonymous-safe wording (no model id, name or reason).
+- Admin-status scope on plan writes: an adminOnly pin is accepted only on a private plan owned by an admin that is NOT org-scoped (`orgId` unset); org-shared private plans are launched by org members, so they are validated as non-admin (user and admin POST/PUT). When an admin PUT widens a plan out of that scope (e.g. private -> system/public), the stored/new model is re-validated as a non-admin and refused with the shared 422 even if the model field is not part of the edit.
+- Portal surfacing: the 422 body carries both `error` and `message`. The customer-portal Work Plans settings editor currently reads `message`; a companion portal PR makes it read `error` (falling back to `message`). Either way the text is shown whichever PR merges first.
+- Canonical-id storage: pin writes (work-plan user/admin create+update, and schedule llmModel/llmBackupModel via the shared `validateModelPin`) persist the CANONICAL registry id, never a legacy alias that could later stop resolving. Blank clears, non-strings 422, and a value unchanged from the stored one (or equal to the stored value's canonical form) is tolerated without re-validation and, when it equals the stored text, not rewritten. A registry double without `resolveGenerationModel` stores the requested value as before. Launches resolve the stored value through `resolvePlanLaunchModel`, so alias or canonical both launch. No new persisted field.
+- User plan PUT (`userWorkPlanRoutes`): the adminOnly check uses the plan OWNER's admin status (`isUserAdminSafe(plan.ownerId)`, as the admin PUT does), not the editing user's, because the owner is the launcher; the org-scope rule is unchanged.
+
+## ENG-2363: LinkedIn disconnect oncall alerts carry a per-account Alert Class (2026-10-08)
+
+First and reminder disconnect alerts now set `Alert Class: unipile-disconnected:<accountId>` so intake folds every occurrence onto one open canonical instead of filing a new issue per reminder. Owner email and 12h oncall dedupe unchanged.
+
+## ENG-2359: backend staging env-override script for post-merge proofs (2026-10-08)
+
+Added `.github/scripts/staging-env-override.sh` (+ test, wired into tests.yml) and `docs/staging-env-overrides.md`: set/restore allowlisted env vars on the staging EB env only, with an ENG-2353 proof recipe.
+
+## ENG-2351: exact-sha jest runner for post-merge verification (2026-10-08)
+
+Added `.github/scripts/sha-jest.sh` (+ test, wired into tests.yml script tests) and `docs/sha-jest.md`: detached worktree at a sha with a lockfile-keyed `npm ci` node_modules cache so the verifier can run `jest <file>` at the merge sha. Proven on #3354 toolDispatch.test.ts (124/124).
+
+## ENG-2267: Meta tracking alerts file one canonical per ad account (2026-10-08)
+
+Per-account Meta tracking-monitor alerts now carry `Alert Scope: meta-ad-account:<id>`; intake clusters on class AND scope, so different customers' accounts no longer fold onto one Linear issue. Unscoped alert classes are unchanged.
+
+## ENG-1271: Staff-operated badge in partner-portal admin users list (2026-10-08)
+
+Partner-portal admin Users table shows a "Staff-operated?" chip under Last seen when `selfActivity.staffOperatedSuspect` is true. The flag comes from GET /api/admin/users (#3038). Frontend only, with no persistence change.
+
+## ENG-112: Chat branching ("Branch from here") with no new persisted field (2026-10-08)
+
+**What it does.** `POST /api/agent-mode/session/:sessionId/branch {messageIndex, llmModel?, idempotencyKey?}`
+creates an ordinary new session whose history is the source's rows `[0..k]`, so the user can continue on a
+different model and compare. Behind the AW-Settings flag `chat_branching_enabled` (default OFF; only the exact
+value `true` enables it; an unreadable row is OFF). Logic: `backend/src/services/agentMode/chatBranching.ts`
+(pure, injected deps, same shape as `modelComparison.ts`); wiring: `controllers/chatBranchController.ts`.
+`GET /model-options` carries an additive `chatBranchingEnabled` hint for the portal.
+
+**Why no schema change.** The branch is built with `createChatSession` from an allowlist (llmModel,
+associatedSkills, portalType `agent`, pageIdentifier only if `agent-mode` or `skill-*`, selectedStartupId,
+sessionType forced `regular`, the *request's* delegateInfo) and its rows go through `addMessagesToSession`.
+Provenance is one free-form key, `metadata.branchOrigin`, on row 0 (the stored system prompt). Row 0 is never
+sent to the model (`buildMarketingContext` slices at index 1), model comparison reads only user/assistant rows
+and the portal renders no bubble for role `system`. A separate provenance *row* was rejected: a second
+`system` row would land at index 1, i.e. in the model's context, and break every "row 0 is the system prompt"
+assumption.
+
+**Hazards found while proving it (each has a test).**
+- `addMessagesToSession` runs `incrementTokenUsage`; copying `usage` would bill the branch for turns it never ran.
+  `usage`, `metadata.feedback`, `clientId` and the stale `messageIndex` are stripped; everything else is copied.
+- `addMessagesToMessagesTable` logs and swallows batch items still unprocessed after 3 retries (silent partial
+  copy). The service re-reads the new session consistently and fails (the half-built branch stays hidden) unless
+  rows are dense `0..n-1`, `messageCount` matches and row 0 carries the provenance.
+- Raw `messageIndex` values are sparse in the client view (tool rows and tool_calls-only assistants are hidden).
+  The index is resolved against the raw rows, must be visible to the viewer and must be a non-error assistant
+  reply; contiguous following tool rows are copied with it.
+- ENG-2163: admin-taint is computed from tool-result rows in the turn. For an admin branching inside a tainted
+  turn the whole turn is copied so the customer-facing filter still redacts the narration and the prompt.
+- `messages[0]` is assumed to be the system prompt in `buildMarketingContext` (`startIdx = 1`).
+- A prefix must leave 10 messages of headroom under `MAX_MESSAGE_SIZE_PER_SESSION`.
+- `tryClaimSessionGeneration` is an in-process Set (as is `withKeyedMutex`): single-instance assumption, same as
+  /generate and compare/select. Idempotency: in-process in-flight/replay map plus the `AGENT_RUN_STORE` `idem#`
+  lane createSession uses (so with the store off, only same-instance retries are deduped).
+
+**Review hardening (follow-up commit).**
+- Continuation triggers: getSession re-fires a billed `scheduleAutoMediaContinuation` for an owner view whose tail is
+  an unresolved media deferral < 1h old (`hasUnresolvedMediaDeferral`). Copied rows therefore lose
+  `metadata.mediaBudgetDeferred` and the `deferred` flag of `media_generation_time_budget` entries in `toolCalls`.
+- Hidden until verified: the session is BORN archived (`createChatSession` initialState `archived: true`, the
+  existing field, excluded by every list), filled, verified, then revealed by `ChatbotDB.unarchiveSession`, which
+  REMOVES the `archived` attribute (no new stored shape; every reader treats absent as live) and is conditional on
+  the row existing (a vanished id is not upserted; it is logged as vanished, not retried, and answers 500). Reveal
+  retries 3x. The new id is logged at creation, so a death mid-copy leaves a hidden, greppable session, never an
+  empty visible one.
+- Idempotency: scope is `JSON.stringify([...])` (injective). A concurrent request with the same key waits for the
+  first and answers 200 with the same branch (replay); replay also checks source session + message index. A
+  cross-instance in-flight claim (run store) is still 409 DUPLICATE_SUBMIT.
+- Idempotency scope = `branch|source|messageIndex|llmModel|key`. Owner-only (a delegated admin arrives as the
+  target). `(branch)` suffix is not stacked. A target with no preceding user row is a 400 `no_user_message`.
+- Per-user cap: AW-Settings `chat_branching_max_per_hour` (cached ~60s, last-known fallback; absent/invalid = 30,
+  `0` = unlimited), in-memory sliding window per instance, 429 `TOO_MANY_BRANCHES`; counted once the request holds
+  the source lock and refunded unless a session was created.
+- Share/conversable views drop `metadata.branchOrigin` (`filterMessagesForClient({omitBranchOrigin})`).
+
+**Residual risks.** Analytics that count sessions/user messages (satisfaction scoring, summaries, asset cache,
+`engagement.emma_session` CRM event) see a branch as a new session with copied history; assets generated in the
+prefix appear in the branch's Images/Videos lists. Only `regular` agent-portal chats are branchable (others carry
+session-level state a branch deliberately does not copy).
+
+**Archived sessions and operators.** Admin-only readers (the admin recent-sessions list, the reliability snapshot
+cron) can see archived sessions, including a born-archived branch mid-copy and an archived orphan left by a process
+death. This is pre-existing behaviour of archived sessions, not new to branching. To find an orphan, grep the
+backend log for `ChatBranching: branch session created (hidden until verified)` (it carries `sessionId`,
+`sourceSessionId`, `userId`); every later failure line (`unexpected failure`, `could not be revealed`, `vanished`,
+`idempotency bookkeeping failed`) carries the same `sessionId`. A branch whose reveal succeeded but whose idempotency
+bookkeeping failed still answers 201 and keeps its claim (never released once visible). Exactly what a failed stamp
+means: the branch is visible; a retry on the SAME instance replays it via the in-process record (200); with the run
+store ON, a retry on ANOTHER instance sees the claim without a session id and gets 409 DUPLICATE_SUBMIT until the
+claim TTL expires (no duplicate is created). The run store is OFF in production today (`AGENT_RUN_STORE` unset), so
+only the in-process layer is live there.
+
+**Rollback.** Set `chat_branching_enabled` to anything but the exact string `true` (`TRUE`, `True`, ` true ` are all OFF); the endpoint answers 404 and the portal hides
+the action. Branches already created are ordinary sessions and need no cleanup.
+
+## ENG-2205: LinkedIn account resolution after the Unipile outage fix (2026-10-07)
+
+- **Root cause (#3275):** a 4-day Unipile outage (502 for every account) made the binary `isAccountConnected` probe
+  fail for the whole pool, so `resolveAccountId*` returned null and users were told to connect an account they
+  already had. Fix: the resolvers use the tri-state `probeAccountSession`; only a PROVEN `disconnected` is skipped,
+  an `unknown` account is returned as a last resort (own before pool).
+- **Side effects handled in #3341:** a caller that then makes a real call can throw an infrastructure error.
+  `isLinkedInInfraError` (utils/linkedInInfraError.ts: credential fetch, gateway html, transport errors, timeouts,
+  and SERVER_ERROR only for gateway statuses 502/503/504 and Cloudflare-style 520-524 - a plain 500 can be
+  request-specific) maps these to a handled 503 on
+  send-linkedin-message, send-linkedin-invite, sync-linkedin-connections and the prospect preview.
+  `import_leads_from_search` hands the agent the generic text and, on a PROVEN dead session only
+  (`isProvenDisconnectError`, which excludes a bare 403), clears the probe cache and records account health with
+  `ownerUserId` omitted for a shared-pool account.
+- **Enrichment is deliberately unchanged from before #3275:** CRM enrichment uses
+  `resolveAccountId(userId, { verifiedOnly: true })` (null unless an account is proven live => LinkedIn skipped);
+  `resolveAccountIdForEnrichment` is restored byte-for-byte. The skip warning now says "temporarily unreachable"
+  when an account exists but could not be verified, and keeps "No LinkedIn (Unipile) account connected" otherwise.
+- **Authorization (pre-existing hole):** a client-supplied `accountId` on send-linkedin-message / send-linkedin-invite
+  and a sequence step's pinned `linkedInAccountId` were never checked. They now require
+  `resolveLinkedInAccountForWrite` (caller's own or org-shared) => 403 with `code: linkedin_account_not_connected`.
+  Only LinkedIn-channel steps are checked (a pin left on an email step is inert), and on PUT pins already stored on the
+  caller's own LinkedIn steps are exempt so an unrelated edit still saves after an account is disconnected. The drip
+  worker re-checks the pin at send time and snoozes that enrollment 30 minutes (typed
+  `PinnedLinkedInAccountNotConnectedError`); a failed ownership lookup keeps the normal retry.
+- **send-linkedin-message:** the engagement write after a successful send is retried twice (keyed put with a fixed
+  event id, so a retry overwrites rather than duplicates); if it still fails the route returns success with
+  `engagementRecorded: false` instead of a failure that invites a duplicate message.
+- **Ownership gate** (`resolveLinkedInAccountFromList`) accepts either of a row's two ids (`account_id` or Unipile's
+  `config.unipile_account_id`; they differ on legacy rows, as `scheduledRunAccountGate` already assumes). Both ids belong
+  to a row already scoped to the caller's own/org-shared accounts, so this widens naming, not access.
+- **import_leads_from_search** records an account as disconnected immediately only for Unipile's explicit
+  `errors/disconnected_account`; a bare 401 needs a fresh probe to confirm first (recording pauses scheduled runs and
+  emails the owner).
+- **Still true, by design (tracked in ENG-2347):** read/search tools, send-linkedin-message auto-resolve, the full
+  resync route and the drip worker's auto-resolved account may use the site-wide pool.
+
+## ENG-1083: Enforce API key scopes at the MCP boundary (2026-10-07)
+
+- `aw_` API keys: `tools:read` permits only `readOnly` tools; `tools:execute` permits all tools. Unknown/non-readOnly tools need `tools:execute` (fail closed). Denials return HTTP 403 JSON-RPC error -32003 naming the missing scope.
+- Grandfathering: legacy records with no `scopes` array get both scopes; default key creation already grants both, so existing integrations are unaffected. No stored data changed.
+- Rollback: revert this commit. Post-deploy smoke: create a `["tools:read"]` key, confirm a write tool returns 403 and a read tool succeeds.
+
 ## ENG-903: Validate scheduled-chat model pins at write time (2026-10-08)
 
 `createScheduledChat`, `updateScheduledChat` and `createScheduleFromTemplate` (per-use override) stored `llmModel` / `llmBackupModel` with no served/selectable check, so a bad pin only surfaced as a failed run plus an oncall alert. They now call `validateScheduleModelPin` (agentModeController.ts), which trims, resolves aliases via `agentModeService.resolveGenerationModel`, and requires `isModelSelectableBy(canonical, isAdmin)`; failure is HTTP 422 with the shared `buildModelUnavailableBody` (`code: 'model_unavailable'`, reason `not_served` | `not_selectable`). Non-strings are 422. Empty/absent = no pin.

@@ -151,6 +151,7 @@ describe("onboarding background runs are tracked for graceful shutdown", () => {
       "services/onboardingAdCopyService.ts",
       "services/onboardingAdImageService.ts",
       "routes/brandBuild.ts",
+      "routes/onboardingSteps.ts",
     ];
     for (const f of files) {
       const src = fs.readFileSync(path.join(root, f), "utf8");

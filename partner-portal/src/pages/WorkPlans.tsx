@@ -153,6 +153,8 @@ const visibilityColor = (v: string) => {
  */
 interface StepLossRefusal {
   message?: string;
+  /** The 422 model_unavailable body (shared with the launch routes) uses `error`. */
+  error?: string;
   stepsWouldBeRemoved?: number;
   removedStepTitles?: string[];
   stepContentLoss?: { stepCount?: number; title?: string; fields?: string[]; kind?: "blanked" | "unpaired" }[];
@@ -528,7 +530,8 @@ export default function WorkPlans() {
         );
         return;
       }
-      setError(data?.message || "Failed to save work plan");
+      // A 422 model_unavailable body carries `error` (not `message`).
+      setError(data?.error || data?.message || "Failed to save work plan");
     } finally {
       setSaving(false);
     }

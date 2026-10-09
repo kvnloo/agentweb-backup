@@ -116,6 +116,7 @@ import {
   ReceiptLong as ReceiptLongIcon,
   ContentCopy as ContentCopyIcon,
 } from "@mui/icons-material";
+import { staffOperatedBadge, type SelfActivitySignal } from "../utils/selfActivityBadge";
 
 interface TabPanelProps {
   children?: React.ReactNode;
@@ -293,6 +294,8 @@ interface User {
   subscriptionType?: string; // Subscription type for customer portal users
   /** Settled spend this month from the spend ledger (ENG-1250 AC7); absent if the lookup failed. */
   spendThisMonthUsd?: number;
+  /** ENG-1271: derived customer-vs-staff activity signal; absent on older backends. */
+  selfActivity?: SelfActivitySignal | null;
   tokenUsage?: {
     month: string;
     totalTokens: number;
@@ -4549,6 +4552,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                       return format(d, "MMM d");
                     })() : "Never";
                     const spendUsd = user.spendThisMonthUsd;
+                    const staffBadge = staffOperatedBadge(user);
 
                     return (
                       <React.Fragment key={user.userId}>
@@ -4656,6 +4660,11 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                         </TableCell>
                         <TableCell>
                           <Typography variant="body2" color="text.secondary">{lastSeen}</Typography>
+                          {staffBadge && (
+                            <Tooltip title={staffBadge.tooltip}>
+                              <Chip size="small" color="warning" variant="outlined" label={staffBadge.label} sx={{ mt: 0.5, height: 20, fontSize: "0.7rem" }} />
+                            </Tooltip>
+                          )}
                         </TableCell>
                         <TableCell>
                           <Typography variant="body2" sx={{ fontVariantNumeric: "tabular-nums" }}>
