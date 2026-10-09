@@ -34,6 +34,9 @@ jest.mock('../services/whatsappVerificationService', () => ({
 jest.mock('../services/approvalChannelNotifier', () => ({
   handleApprovalButtonTap: jest.fn(),
 }));
+jest.mock('../services/whatsappInboundSupport', () => ({
+  handleUnrecognizedMessage: jest.fn(),
+}));
 jest.mock('../utils/secretsManager', () => ({
   getWhatsAppCredentials: jest.fn(),
 }));
@@ -47,6 +50,7 @@ const {
 } = require('../services/whatsappService');
 const { handleVerificationMessage } = require('../services/whatsappVerificationService');
 const { handleApprovalButtonTap } = require('../services/approvalChannelNotifier');
+const { handleUnrecognizedMessage } = require('../services/whatsappInboundSupport');
 const { getWhatsAppCredentials } = require('../utils/secretsManager');
 
 import whatsappWebhookRouter from '../routes/whatsappWebhook';
@@ -520,5 +524,31 @@ describe('POST — tapped buttons', () => {
     await post(inboundPayload('hello there'));
     expect(handleApprovalButtonTap).not.toHaveBeenCalled();
     expect(handleVerificationMessage).toHaveBeenCalled();
+  });
+});
+
+describe('POST — messages that are not commands', () => {
+  const post = (body: string) =>
+    request(app)
+      .post('/api/webhooks/whatsapp')
+      .set('X-Hub-Signature-256', sign(body))
+      .set('Content-Type', 'application/json')
+      .send(body);
+
+  it('hands an ordinary message to the support hand-off', async () => {
+    (handleVerificationMessage as jest.Mock).mockResolvedValue(false);
+    await post(inboundPayload('hi'));
+    expect(handleUnrecognizedMessage).toHaveBeenCalledWith('+14155550123', 'hi', 'text');
+  });
+
+  it('does not greet someone who just sent a verification code', async () => {
+    (handleVerificationMessage as jest.Mock).mockResolvedValue(true);
+    await post(inboundPayload('Verify ABCD2345'));
+    expect(handleUnrecognizedMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(['STOP', 'UNSTOP'])('does not greet on %s', async (kw) => {
+    await post(inboundPayload(kw));
+    expect(handleUnrecognizedMessage).not.toHaveBeenCalled();
   });
 });

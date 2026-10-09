@@ -35,6 +35,7 @@ import {
 } from '../services/whatsappService';
 import { handleVerificationMessage } from '../services/whatsappVerificationService';
 import { handleApprovalButtonTap } from '../services/approvalChannelNotifier';
+import { handleUnrecognizedMessage } from '../services/whatsappInboundSupport';
 
 const router = express.Router();
 
@@ -219,7 +220,12 @@ async function handleInboundMessage(message: any): Promise<void> {
     // "Verify <CODE>" binds this sender's number to the portal user who holds the code.
     // A fixed command only — anything that is not exactly that shape is ignored, so this
     // stays a notification channel and never becomes a conversation.
-    await handleVerificationMessage(text, phone);
+    const wasVerification = await handleVerificationMessage(text, phone);
+    if (!wasVerification) {
+      // Not a command at all. Greet, and pass the message to the team — a fixed reply
+      // and an email, never a model, so this stays a support hand-off and not a chat.
+      await handleUnrecognizedMessage(phone, text, message?.type ?? 'text');
+    }
   }
 }
 
