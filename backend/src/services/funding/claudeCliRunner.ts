@@ -135,9 +135,13 @@ export class ClaudeCliRunner {
     if (!inFlight) {
       inFlight = this.doSpawn(conversationId, configDir, systemPromptFile, opts);
       this.spawning.set(conversationId, inFlight);
-      void inFlight.finally(() => {
-        if (this.spawning.get(conversationId) === inFlight) this.spawning.delete(conversationId);
-      });
+      // The cleanup chain is its own promise: without a handler a failed spawn would
+      // surface there as an unhandled rejection, on top of the one the caller awaits.
+      inFlight
+        .finally(() => {
+          if (this.spawning.get(conversationId) === inFlight) this.spawning.delete(conversationId);
+        })
+        .catch(() => undefined);
     }
     await inFlight;
     return { conversationId };
