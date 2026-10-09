@@ -388,6 +388,27 @@ describe("regenerateSingleIcpForUser — joined a full run (deferStatusToFullRun
     expect(patch.icpResult[1].name).toBe(REGENERATED.name);
   });
 
+  it("conditions the card save on the joined run still being in flight", async () => {
+    const startedAt = "2026-04-24T11:59:00.000Z";
+    userDb.getUserById.mockResolvedValue(seedUser({ icpStartedAt: startedAt }));
+    userDb.updateUser.mockResolvedValue({});
+    await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), deferStatusToFullRun: true });
+    const opts = userDb.updateUser.mock.calls[0][2];
+    expect(opts.condition.expression).toBe("#icpStatus = :icpDeferRunning AND #icpStartedAt = :icpDeferStartedAt");
+    expect(opts.condition.values).toEqual({ ":icpDeferRunning": "running", ":icpDeferStartedAt": startedAt });
+  });
+
+  it("drops the card save without error when the full run landed first (condition fails)", async () => {
+    userDb.getUserById.mockResolvedValue(seedUser());
+    userDb.updateUser.mockRejectedValueOnce(Object.assign(new Error("cond"), { code: "ConditionalCheckFailedException" }));
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    await expect(
+      regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), deferStatusToFullRun: true }),
+    ).resolves.toBeUndefined();
+    expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+
   it("does not mark the axis failed on an LLM miss while the full run is still running", async () => {
     userDb.getUserById.mockResolvedValue(seedUser());
     userDb.updateUser.mockResolvedValue({});

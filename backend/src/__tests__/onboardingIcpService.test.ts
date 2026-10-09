@@ -458,6 +458,16 @@ describe("onboardingIcpService", () => {
       },
     );
 
+    it("clears the failed attempt's error when it lands over a failed status", async () => {
+      const claim = "2026-04-24T11:59:00.000Z";
+      userDb.getUserById
+        .mockResolvedValueOnce({ userId: "user-1" })
+        .mockResolvedValueOnce({ userId: "user-1", icpStatus: "failed", icpStartedAt: claim, icpError: "icp generation timed out" });
+      userDb.updateUser.mockResolvedValue({});
+      await triggerIcpDiscoveryForUser("user-1", { llm: new FakeLlm({ icps: fivePersonas }) as any, expectedStartedAt: claim });
+      expect(userDb.updateUser.mock.calls[0][1].icpError).toBeNull();
+    });
+
     it("does NOT land the result when the non-running record belongs to a different claim", async () => {
       userDb.getUserById
         .mockResolvedValueOnce({ userId: "user-1" })

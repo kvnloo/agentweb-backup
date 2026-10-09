@@ -1031,6 +1031,36 @@ describe("POST /api/onboarding/icp/regenerate-one", () => {
     expect(regenerateSingleIcpForUser).toHaveBeenLastCalledWith("user-1", 1, { deferStatusToFullRun: true });
   });
 
+  it("conditions the join write on that run still being in flight", async () => {
+    const inFlight = new Date(Date.now() - 3_000).toISOString();
+    userDb.getUserById.mockResolvedValue({ userId: "user-1", icpStatus: "ready", icpResult: goodPersonas });
+    userDb.getUserByIdConsistent.mockResolvedValueOnce({ userId: "user-1", icpStatus: "running", icpStartedAt: inFlight, icpResult: goodPersonas });
+    userDb.updateUser.mockResolvedValue({});
+    await request(app).post("/api/onboarding/icp/regenerate-one").send({ icpId: "icp-1" });
+    const opts = userDb.updateUser.mock.calls[0][2];
+    expect(opts.condition.expression).toBe("#icpStatus = :icpJoinRunning AND #icpStartedAt = :icpJoinStartedAt");
+    expect(opts.condition.values[":icpJoinStartedAt"]).toBe(inFlight);
+  });
+
+  it("falls back to a fresh claim, with no defer flag, when the run finished between the read and the write", async () => {
+    const { regenerateSingleIcpForUser } = require("../services/onboardingIcpService");
+    const inFlight = new Date(Date.now() - 3_000).toISOString();
+    userDb.getUserById.mockResolvedValue({ userId: "user-1", icpStatus: "ready", icpResult: goodPersonas });
+    userDb.getUserByIdConsistent.mockResolvedValueOnce({ userId: "user-1", icpStatus: "running", icpStartedAt: inFlight, icpResult: goodPersonas });
+    userDb.updateUser
+      .mockRejectedValueOnce(Object.assign(new Error("cond"), { code: "ConditionalCheckFailedException" }))
+      .mockResolvedValue({});
+    const res = await request(app).post("/api/onboarding/icp/regenerate-one").send({ icpId: "icp-1" });
+    expect(res.status).toBe(200);
+    // call 0 = the lost conditional join write, call 1 = the fresh claim (any
+    // later call is the mocked regeneration's own start write).
+    expect(userDb.updateUser.mock.calls[0][2]).toBeDefined();
+    expect(userDb.updateUser.mock.calls[1][2]).toBeUndefined();
+    expect(userDb.updateUser.mock.calls[1][1].icpStartedAt).not.toBe(inFlight);
+    expect(regenerateSingleIcpForUser).toHaveBeenLastCalledWith("user-1", 1);
+    expect(res.body.status.icpStartedAt).toBe(userDb.updateUser.mock.calls[1][1].icpStartedAt);
+  });
+
   it("stamps a fresh icpStartedAt when the previous run is past its timeout", async () => {
     const stale = new Date(Date.now() - 10 * 60_000).toISOString();
     userDb.getUserById.mockResolvedValue({
