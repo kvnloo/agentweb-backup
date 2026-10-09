@@ -1,0 +1,54 @@
+/**
+ * Channel-neutral approval requests (ENG-273).
+ *
+ * `POST /api/slack/send-approval` requires a Slack channel, which made having one a
+ * precondition for being asked to approve anything. This is the same request without
+ * that assumption: the customer is asked on whichever channel they have connected.
+ * The Slack route stays as it is for callers that already use it.
+ */
+import express from 'express';
+import { authenticateToken } from '../middleware/auth';
+import { getAssetTypeFromFilename } from '../services/approvalDb';
+import { requestApproval, ApprovalNotDeliveredError } from '../services/approvalRequestService';
+
+const router = express.Router();
+
+router.post('/', authenticateToken, async (req: any, res: any) => {
+  try {
+    const { assetUrl, filename, executionId, note, channel, channelName } = req.body || {};
+    const userId = req.user?.userId;
+
+    if (!assetUrl || !filename) {
+      return res.status(400).json({ error: 'Missing required fields: assetUrl, filename' });
+    }
+    if (!userId) return res.status(401).json({ error: 'User not authenticated' });
+
+    const result = await requestApproval({
+      executionId: executionId || '',
+      imageUrl: assetUrl,
+      filename,
+      assetType: getAssetTypeFromFilename(filename),
+      userId,
+      channel: channel || null,
+      channelName,
+      note,
+    });
+
+    res.json({
+      success: true,
+      message: 'Approval request sent successfully',
+      approvalId: result.approvalId,
+      deliveredVia: result.deliveredVia,
+    });
+  } catch (error: any) {
+    if (error instanceof ApprovalNotDeliveredError) {
+      // Not a server fault: the account simply has nowhere to be asked. The task engine
+      // relies on telling this apart from a 500 to fall back to its no-approval path.
+      return res.status(409).json({ success: false, error: error.message, code: 'no_channel' });
+    }
+    console.error('[approval-requests] failed:', error?.message || error);
+    res.status(500).json({ success: false, error: 'Failed to send approval request' });
+  }
+});
+
+export default router;

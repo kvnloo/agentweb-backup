@@ -26,6 +26,7 @@ process.env.SLACK_BOT_TOKEN = 'xoxb-test';
 const { notifyApprovalOnWhatsApp } = require('../services/approvalChannelNotifier');
 const { approvalDb } = require('../services/approvalDb');
 const { sendApprovalRequestWithTracking } = require('../services/slackService');
+const { requestApproval, ApprovalNotDeliveredError } = require('../services/approvalRequestService');
 
 const request = {
   executionId: 'exec-1',
@@ -94,4 +95,43 @@ describe('sendApprovalRequestWithTracking — peer channels', () => {
     expect(approvalDb.createApproval).toHaveBeenCalled();
   });
 });
+describe('requestApproval — a customer who is not on Slack', () => {
+  const noSlack = { ...request, channel: undefined };
+
+  it('never touches Slack when there is no Slack channel', async () => {
+    notifyApprovalOnWhatsApp.mockResolvedValue(true);
+    await requestApproval(noSlack);
+    expect(mockPostMessage).not.toHaveBeenCalled();
+  });
+
+  it('delivers on WhatsApp alone and tracks the approval', async () => {
+    notifyApprovalOnWhatsApp.mockResolvedValue(true);
+    const result = await requestApproval(noSlack);
+
+    expect(result.deliveredVia).toEqual(['whatsapp']);
+    expect(approvalDb.createApproval).toHaveBeenCalledWith(
+      expect.objectContaining({ slackChannel: '', slackMessageTs: null, userId: 'user-1' }),
+    );
+  });
+
+  it('does not ask WhatsApp about Slack', async () => {
+    notifyApprovalOnWhatsApp.mockResolvedValue(true);
+    await requestApproval(noSlack);
+    const arg = notifyApprovalOnWhatsApp.mock.calls[0][0];
+    expect(Object.keys(arg).sort()).toEqual(['assetType', 'assetUrl', 'filename', 'userId']);
+  });
+
+  it('fails distinctly, and tracks nothing, when the customer has no channel at all', async () => {
+    notifyApprovalOnWhatsApp.mockResolvedValue(false);
+    await expect(requestApproval(noSlack)).rejects.toBeInstanceOf(ApprovalNotDeliveredError);
+    expect(approvalDb.createApproval).not.toHaveBeenCalled();
+  });
+
+  it('reports both channels for a customer who somehow has both', async () => {
+    notifyApprovalOnWhatsApp.mockResolvedValue(true);
+    const result = await requestApproval(request);
+    expect(result.deliveredVia).toEqual(['slack', 'whatsapp']);
+  });
+});
+
 export {};

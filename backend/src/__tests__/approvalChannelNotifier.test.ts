@@ -71,7 +71,6 @@ const USER = {
 
 const params = {
   userId: 'user-1',
-  approvalChannel: APPROVAL_CHANNEL,
   assetType: 'image',
   filename: 'q4-launch-hero.png',
   assetUrl: 'https://assets.example.com/q4-launch-hero.png',
@@ -131,30 +130,12 @@ describe('notifyApprovalOnWhatsApp', () => {
     expect(sent.text).toContain(params.assetUrl);
   });
 
-  it('does not notify a requester who does not watch the approval channel', async () => {
-    // userId on POST /send-approval is the authenticated CALLER, not the reviewer.
-    // Notifying on userId alone pings the requester about a decision nobody asked them
-    // to make — and, worse, about an asset that may not be theirs.
-    (userDb.getUserById as jest.Mock).mockResolvedValue({
-      ...USER,
-      slackChannel: 'C0SOMETHING-ELSE',
-    });
-    await notifyApprovalOnWhatsApp(params);
-    expect(resolveDestination).not.toHaveBeenCalled();
-    expect(send).not.toHaveBeenCalled();
-  });
-
-  it('fails closed when the approval carries no channel', async () => {
-    await notifyApprovalOnWhatsApp({ ...params, approvalChannel: '' });
-    expect(send).not.toHaveBeenCalled();
-  });
-
-  it('notifies a reviewer whose channel is held in the slackChannels list', async () => {
-    (userDb.getUserById as jest.Mock).mockResolvedValue({
-      userId: 'user-1',
-      slackChannels: ['C0OTHER', APPROVAL_CHANNEL],
-    });
-    await notifyApprovalOnWhatsApp(params);
+  it('notifies a customer who has no Slack channel at all', async () => {
+    // Slack and WhatsApp are separate features; a customer connects one. An earlier
+    // version required a matching Slack channel here, which meant a WhatsApp-only
+    // customer could never be asked to approve anything.
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user-1' });
+    await expect(notifyApprovalOnWhatsApp(params)).resolves.toBe(true);
     expect(send).toHaveBeenCalled();
   });
 

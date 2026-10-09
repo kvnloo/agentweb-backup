@@ -21,7 +21,7 @@ def send_task_approval_request(task_id, task_name, execution_id, asset_url, file
         asset_url: The URL of the asset (HTML report or image)
         filename: The filename of the asset
         asset_type: The type of asset ('html' or 'image')
-        slack_channel: The Slack channel ID to send to
+        slack_channel: The Slack channel ID to send to, or None for a customer who is not on Slack
         user_id: The ID of the user who owns the task
     """
     try:
@@ -41,18 +41,28 @@ def send_task_approval_request(task_id, task_name, execution_id, asset_url, file
             note = f'A {asset_type} has been generated. Please review and approve. Once approved, results will be automatically sent to all task subscribers. You can manage subscribers at: {os.getenv("CUSTOMER_FRONTEND_URL", "http://localhost:5174")}/tasks/{task_id}#subscribers'
         
         approval_data = {
-            'channel': slack_channel,
-            'channelName': slack_channel,  # Will be updated by backend
             'assetUrl': asset_url,
             'filename': filename,
             'assetType': asset_type,
             'executionId': execution_id,
             'note': note
         }
-        
+
+        # ENG-273: Slack and WhatsApp are separate features and a customer connects one of
+        # them. A task with a Slack channel goes to the Slack endpoint exactly as before.
+        # A task WITHOUT one goes to the channel-neutral endpoint, which asks the customer
+        # on whatever they have connected (e.g. WhatsApp) and answers 409 if they have
+        # nothing — the caller then falls back to its no-approval path.
+        if slack_channel:
+            approval_data['channel'] = slack_channel
+            approval_data['channelName'] = slack_channel  # Will be updated by backend
+            endpoint = f'{backend_url}/api/slack/send-approval'
+        else:
+            endpoint = f'{backend_url}/api/approval-requests'
+
         # Send the approval request to the backend using JWT authentication
         response = requests.post(
-            f'{backend_url}/api/slack/send-approval',
+            endpoint,
             json=approval_data,
             headers={
                 'Authorization': f'Bearer {jwt_token}',
@@ -69,6 +79,10 @@ def send_task_approval_request(task_id, task_name, execution_id, asset_url, file
             else:
                 logger.error(f"Backend returned error for Slack approval request: {result.get('message', 'Unknown error')}")
                 return False
+        elif response.status_code == 409 and not slack_channel:
+            # The account has no channel to be asked on. Expected, not an error.
+            logger.info(f"No approval channel connected for task {task_id}; continuing without approval")
+            return False
         else:
             logger.error(f"Failed to send Slack approval request. Status: {response.status_code}, Response: {response.text}")
             return False

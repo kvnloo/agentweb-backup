@@ -698,70 +698,11 @@ export async function openRejectModal(
 export async function sendApprovalRequestWithTracking(
   request: ApprovalRequest & { channelName?: string }
 ): Promise<{ messageTs: string | null; approvalId: string }> {
-  // ENG-273: Slack and WhatsApp are PEERS here — neither send depends on the other.
-  // The WhatsApp notice used to sit behind the Slack post, so a bot that was not in the
-  // channel (or a Slack outage) silently cost a reviewer their WhatsApp message too, even
-  // though their number was verified and reachable. An approval now counts as delivered
-  // if it reached the reviewer on EITHER channel; it fails only when it reached nobody.
-  let slackMessageTs: string | null = null;
-  let slackError: unknown = null;
-  try {
-    slackMessageTs = (await sendApprovalRequest(request)).messageTs;
-  } catch (error) {
-    slackError = error;
-  }
-
-  // The import sits inside the guard as well as the call: a module-load failure rejects
-  // before any of the notifier's own error handling runs.
-  let whatsappDelivered = false;
-  try {
-    const { notifyApprovalOnWhatsApp } = await import('./approvalChannelNotifier');
-    whatsappDelivered = await notifyApprovalOnWhatsApp({
-      userId: request.userId,
-      approvalChannel: request.channel,
-      assetType: request.assetType,
-      filename: request.filename,
-      assetUrl: request.imageUrl,
-    });
-  } catch (notifyError: any) {
-    console.warn(
-      '[slackService] WhatsApp approval notification could not be dispatched:',
-      notifyError?.message || notifyError,
-    );
-  }
-
-  if (slackError && !whatsappDelivered) {
-    // Reached nobody. Surface the original Slack failure unchanged, and write no record:
-    // a tracked approval that no reviewer was ever shown can never be answered.
-    throw slackError;
-  }
-  if (slackError) {
-    console.warn(
-      '[slackService] Slack approval post failed but WhatsApp delivered — approval is tracked:',
-      (slackError as any)?.message || slackError,
-    );
-  }
-
-  // Store in database for tracking
-  const { approvalDb } = await import('./approvalDb');
-  const approval = await approvalDb.createApproval({
-    assetUrl: request.imageUrl,
-    filename: request.filename,
-    assetType: request.assetType as any, // Cast to any to handle string to AssetType
-    executionId: request.executionId || '',
-    userId: request.userId,
-    slackChannel: request.channel,
-    slackChannelName: request.channelName || request.channel,
-    slackMessageTs,
-    note: request.note,
-  });
-
-  console.log("\u2705 Approval request delivered and stored in database");
-
-  return {
-    messageTs: slackMessageTs,
-    approvalId: approval.assetUrl // Use assetUrl as the ID since that's the primary key
-  };
+  // ENG-273: the orchestration lives in approvalRequestService, which is channel-neutral.
+  // This name is kept so the existing Slack-side callers do not have to change.
+  const { requestApproval } = await import('./approvalRequestService');
+  const { messageTs, approvalId } = await requestApproval(request);
+  return { messageTs, approvalId };
 }
 
 /**

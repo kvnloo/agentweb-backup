@@ -611,6 +611,7 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                     slack_channel = execution.get('slack_channel') or task.get('slackChannel')
                     # Use execution-level requireApproval if available (for revisions), otherwise use task-level
                     requires_approval = execution.get('requireApproval') if execution.get('requireApproval') is not None else task.get('requireApproval')
+                    approval_sent_without_slack = False
                     if requires_approval and slack_channel and asset_file:
                         # Send Slack approval request instead of emails
                         logger.info(f"Task {execution['taskId']} requires approval. Sending Slack approval request.")
@@ -632,14 +633,37 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                         except Exception as e:
                             logger.error(f"Failed to send Slack approval request for task {execution['taskId']}: {e}")
                     else:
-                        if requires_approval and not slack_channel:
-                            logger.warning(f"Task {execution['taskId']} requires approval but no Slack channel configured")
+                        if requires_approval and not slack_channel and asset_file:
+                            # ENG-273: no Slack channel does not mean no way to ask. The
+                            # customer may be on WhatsApp instead — the two are separate
+                            # features and they connect one. Ask on whatever they have.
+                            try:
+                                if not revisionDone:
+                                    from slack_utils import send_task_approval_request
+                                    approval_sent_without_slack = bool(send_task_approval_request(
+                                        task_id=execution['taskId'],
+                                        task_name=task['name'],
+                                        execution_id=execution_id,
+                                        asset_url=asset_file['url'],
+                                        filename=asset_file['filename'],
+                                        asset_type=asset_type,
+                                        slack_channel=None,
+                                        user_id=task['userId']
+                                    ))
+                            except Exception as e:
+                                logger.error(f"Failed to send approval request for task {execution['taskId']}: {e}")
+                            if approval_sent_without_slack:
+                                logger.info(f"📤 APPROVAL SENT: For task {execution['taskId']} on the customer's connected channel")
+                            else:
+                                logger.warning(f"Task {execution['taskId']} requires approval but the customer has no channel connected to ask on")
                         elif requires_approval and not asset_file:
                             expected_msg = f" (expected: {expected_asset_type})" if expected_asset_type else ""
                             logger.warning(f"No {expected_asset_type or 'HTML report'} found for task {execution['taskId']} that requires approval{expected_msg}")
                     
                     # Send detailed results to all subscribers (if any and not requiring approval)
-                    if has_subscribers and not (requires_approval and slack_channel):
+                    # Results are held back while an approval is pending — on Slack as before,
+                    # or on another channel when the request was delivered there.
+                    if has_subscribers and not (requires_approval and (slack_channel or approval_sent_without_slack)):
                         # If an email-friendly revision was created, send only that asset file
                         files_for_email = [asset_file] if (asset_file and asset_type == 'html' and revisionDone) else (execution.get('result_files', []) or [])
 
