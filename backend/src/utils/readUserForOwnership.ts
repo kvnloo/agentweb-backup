@@ -1,8 +1,9 @@
 import { userDb } from "../services/db";
 
 /**
- * Read the user for a decision that depends on what THIS process just wrote
- * (who owns an onboarding axis, whether a run it just finished failed).
+ * Read the user for a decision that depends on what THIS process (or the step
+ * just before it) wrote moments ago: who owns an onboarding axis, whether a run
+ * it just finished failed, what results the upstream step produced.
  *
  * `userDb.getUserById` queries the UserIdIndex GSI, which is eventually
  * consistent: for a moment after a write it still returns the PREVIOUS row. A

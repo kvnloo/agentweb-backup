@@ -158,12 +158,17 @@ async function settleAxis(
   startedAtMs: number,
 ): Promise<unknown> {
   const deadline = Date.now() + spec.timeoutMs + JOIN_GRACE_MS;
-  for (;;) {
-    // Read the base table, not the index: this runs right after the runner's own
-    // trigger returned, and an index row from before that run would show its
-    // previous outcome, so a run that failed in milliseconds would be recorded
-    // as a successful step.
-    const user = (await readUserForOwnership(userId)) as Record<string, unknown> | null;
+  for (let pass = 0; ; pass++) {
+    // The FIRST read runs right after the runner's own trigger returned (or its
+    // claim was lost), so an index row from before that run would show its
+    // previous outcome and a run that failed in milliseconds would be recorded
+    // as a successful step: read the base table. Later passes only wait for
+    // another run to leave the in-flight state, where a lagging index merely
+    // delays us by one poll, so they use the cheaper index read (this loop
+    // polls every few seconds for up to the axis timeout).
+    const user = (pass === 0
+      ? await readUserForOwnership(userId)
+      : await userDb.getUserById(userId)) as Record<string, unknown> | null;
     const heldByAnother =
       user?.[`${spec.prefix}Status`] === spec.inFlight &&
       // `ownStartedAt === undefined` means we hold no claim (lost it), so any

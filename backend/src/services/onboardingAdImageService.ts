@@ -1168,6 +1168,9 @@ export async function triggerAdImageGenerationForUser(
 
   // Read only now: the failure path above does its own owning-run read, and
   // hoisting this above it would cost every failed run a redundant fetch.
+  // Left on the index on purpose: this is tens of seconds after the claim, long
+  // past any index lag, and the write below is conditioned on this run's own
+  // identity regardless of what this read shows.
   const current = await userDb.getUserById(userId);
   const patch = adImageReadyPatch(((current as any) || {}) as AdImageStatusFields, result);
   if (!patch) {
