@@ -350,6 +350,10 @@ function applyAwaitingReplyGuard(
  * DEFAULT_SCORING_SYSTEM_PROMPT would leave whatever prompt is actually
  * configured blind to it (ENG-392).
  */
+const JUDGE_STRICT_JSON_CLAUSE = `
+
+Your previous reply was not valid JSON. Return ONLY one JSON object. Inside every string value, escape double quotes as \\" and write newlines as \\n, never as raw line breaks.`;
+
 export const AWAITING_USER_REPLY_CLAUSE = `
 
 IMPORTANT: A conversation that ends on the assistant's own well-formed clarifying question:
@@ -1825,50 +1829,48 @@ export async function scoreSessionWithJudge(
     ? { sessionId: usageContext?.sessionId, feature: OUTCOME_JUDGE_SHADOW_FEATURE }
     : { ...usageContext, feature: usageContext?.feature || "agent_task" };
 
-  const llmPromise = llm(
-    judgeModel,
-    [
-      // Same appended clauses as the general scorer, so a custom judge cannot
-      // disagree with it about whether a zero-task session is in the cohort
-      // (the Matt-5 vs Fangfang-3 split in ENG-830), go blind to the
-      // ENG-1312 verbosity/permission dimensions, score a real publish-approval
-      // hold as fabricated (ENG-1245), credit a fabricated simulation as
-      // success (ENG-1223 — this is literally how Fangfang Judge produced this
-      // bug), penalize declining a guard-blocked punctuation-only reply
-      // (ENG-1164 — Fangfang and Matt Judge both did this), or dock
-      // goalCompletion purely because the conversation ended before the user
-      // replied (ENG-1296 — the same two judges also did this) just because
-      // its own prompt predates these rules.
-      {
-        role: "system",
-        content:
-          judge.systemPrompt +
-          NO_TASK_JUDGMENT_CLAUSE +
-          VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE +
-          PUBLISH_APPROVAL_WITHHOLDING_CLAUSE +
-          FABRICATION_GROUNDING_CLAUSE +
-          OUTPUT_INTEGRITY_GUARD_CLAUSE +
-          AWAITING_USER_REPLY_CLAUSE,
-      },
-      { role: "user", content: `Evaluate this conversation:\n\n${conversationText}` },
-    ],
-    {
-      temperature: 0,
-      max_completion_tokens: SCORING_MAX_COMPLETION_TOKENS,
-      response_format: { type: "json_object" },
-      taskClass: 'nonstandard_consumer',
-      usageContext: judgeUsage,
-    }
-  );
+  const judgeSystemPrompt =
+    judge.systemPrompt +
+    NO_TASK_JUDGMENT_CLAUSE +
+    VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE +
+    PUBLISH_APPROVAL_WITHHOLDING_CLAUSE +
+    FABRICATION_GROUNDING_CLAUSE +
+    OUTPUT_INTEGRITY_GUARD_CLAUSE +
+    AWAITING_USER_REPLY_CLAUSE;
+  const requestJudge = (strictJson: boolean) =>
+    raceWithScoringTimeout(
+      llm(
+        judgeModel,
+        [
+          {
+            role: "system",
+            content: strictJson ? judgeSystemPrompt + JUDGE_STRICT_JSON_CLAUSE : judgeSystemPrompt,
+          },
+          { role: "user", content: `Evaluate this conversation:\n\n${conversationText}` },
+        ],
+        {
+          temperature: 0,
+          max_completion_tokens: SCORING_MAX_COMPLETION_TOKENS,
+          response_format: { type: "json_object" },
+          taskClass: 'nonstandard_consumer',
+          usageContext: judgeUsage,
+        }
+      ),
+      conversationText
+    );
 
-  const res = await raceWithScoringTimeout(llmPromise, conversationText);
-
-  const raw = res.choices?.[0]?.message?.content ?? "{}";
-  // ENG-2216: Bedrock doesn't always honor response_format: json_object strictly.
-  const parsed = parseJudgeJson(raw);
-  // ENG-1669: see scoreSession's identical guard — a missing/non-numeric
-  // "score" here previously reached chatbotDb.updateSessionJudgeScore as NaN
-  // and failed opaquely inside the DynamoDB SDK instead of at the source.
+  // Bedrock Claude ignores response_format (agentModeService.ts), so a reply can be malformed
+  // JSON. One stricter retry recovers it; a second malformed reply still throws with its reason.
+  let res = await requestJudge(false);
+  let parsed: any;
+  try {
+    parsed = parseJudgeJson(res.choices?.[0]?.message?.content ?? "{}");
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    console.warn(`[judge] malformed JSON reply, retrying once: ${error.message}`);
+    res = await requestJudge(true);
+    parsed = parseJudgeJson(res.choices?.[0]?.message?.content ?? "{}");
+  }
   const rawScore = finiteNumber(parsed.score);
   if (rawScore === undefined) {
     throw new Error(

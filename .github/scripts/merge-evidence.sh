@@ -127,6 +127,9 @@
 #                   class. Distinct from FAIL because the remedy differs:
 #                   resolve the conflict / flip ready / push, do not debug.
 #   4  ERROR        the evidence surface itself is unreadable. Never a pass.
+#   5  FOREIGN_OWNER the PR belongs to an Argusoft engineer (ENG-2116). Not a
+#                   verdict on the code: those owners merge their own work, so
+#                   an agent must never treat this PR as merge-eligible.
 #
 # Environment:
 #   REPO                        owner/repo
@@ -177,6 +180,20 @@ BACKEND_JOBS="${MERGE_EVIDENCE_BACKEND_JOBS:-Backend build}"
 # first-party Actions job and the third-party integration, which can still emit
 # pending runs on ready PRs. Exact names only; active checks remain fail-closed.
 # Retired successes must not count as positive execution evidence either.
+# ENG-2116: PRs owned by Argusoft engineers are read-and-propose only for
+# agents. On 2026-09-22 the swarm (GitHub `harshmoney123`) auto-merged several
+# of Manan's and Anurag's PRs because this gate PASSed them on CI evidence
+# alone. Ownership is read from BOTH the author login and the head-branch
+# prefix: an agent pushing a fix onto `anurag/...` still leaves it Anurag's PR.
+# Newline separated, exact login / exact prefix (a prefix includes its `/`).
+FOREIGN_AUTHORS="${MERGE_EVIDENCE_FOREIGN_AUTHORS:-anurag-seth
+mananv-argusoft}"
+FOREIGN_BRANCH_PREFIXES="${MERGE_EVIDENCE_FOREIGN_BRANCH_PREFIXES:-anurag/
+aseth/
+manan/
+mvarma/
+harshit/}"
+
 RETIRED_CHECKS="${MERGE_EVIDENCE_RETIRED_CHECKS:-Require Greptile Review
 Greptile Review}"
 
@@ -214,7 +231,7 @@ trap 'rm -f "${stderr_file}"' EXIT
 # ---------------------------------------------------------------------------
 
 pr_json="$(gh pr view "${PR_NUMBER}" --repo "${REPO}" \
-  --json number,state,isDraft,mergeable,headRefOid,baseRefName \
+  --json number,state,isDraft,mergeable,headRefOid,baseRefName,author,headRefName \
   2>"${stderr_file}")"
 gh_exit=$?
 
@@ -255,6 +272,27 @@ log "evaluating ${REPO}#${PR_NUMBER} at head ${head_sha}"
 if [ "${pr_state}" != "OPEN" ]; then
   verdict 'NO_EVIDENCE' "${REPO}#${PR_NUMBER} is ${pr_state}, not OPEN — there is no current merge evidence to evaluate."
   exit 3
+fi
+
+# ENG-2116: ownership is checked before any CI evidence, so a fully green
+# Argusoft PR can never come back PASS to an agent's merge step.
+pr_author="$(printf '%s' "${pr_json}" | jq -r '.author.login // ""' 2>/dev/null)"
+pr_head_ref="$(printf '%s' "${pr_json}" | jq -r '.headRefName // ""' 2>/dev/null)"
+foreign_reason=''
+if [ -n "${pr_author}" ] && grep -qxF -- "${pr_author}" <<<"${FOREIGN_AUTHORS}"; then
+  foreign_reason="author '${pr_author}'"
+fi
+if [ -z "${foreign_reason}" ] && [ -n "${pr_head_ref}" ]; then
+  while IFS= read -r prefix; do
+    [ -z "${prefix}" ] && continue
+    case "${pr_head_ref}" in
+      "${prefix}"*) foreign_reason="head branch '${pr_head_ref}'"; break ;;
+    esac
+  done <<<"${FOREIGN_BRANCH_PREFIXES}"
+fi
+if [ -n "${foreign_reason}" ]; then
+  verdict 'FOREIGN_OWNER' "${REPO}#${PR_NUMBER} is owned by an Argusoft engineer (${foreign_reason}). Agents must not merge, auto-merge, push to, or close it; its owner merges it (ENG-2116)."
+  exit 5
 fi
 
 # Draft PRs do not run the draft-gated jobs at all, by design. Saying so plainly

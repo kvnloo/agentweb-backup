@@ -52,7 +52,13 @@ export interface TokenUsageStatus {
  * `costUsed` and `costAllowance` are dropped. `hasCostAllowance` replaces the
  * only thing the client ever did with the latter — a null check.
  */
-export type CustomerTokenUsageStatus = Omit<TokenUsageStatus, 'costUsed' | 'costAllowance'> & {
+export type CustomerTokenUsageStatus = Omit<TokenUsageStatus, 'costUsed' | 'costAllowance' | 'used'> & {
+  /**
+   * Token volume used this month. ABSENT when no token limit applies (ENG-1250 AC7: token volume is no
+   * longer measured), so the portal's `typeof used === "number"` check hides its token meter instead of
+   * rendering a false "0 tokens used this month".
+   */
+  used?: number;
   /**
    * Whether a dollar ceiling exists at all, without saying what it is.
    *
@@ -92,9 +98,10 @@ export type CustomerTokenUsageStatus = Omit<TokenUsageStatus, 'costUsed' | 'cost
  * emailService and the policy services keep the figures they need.
  */
 export function toCustomerTokenUsage(status: TokenUsageStatus): CustomerTokenUsageStatus {
-  const { costUsed: _costUsed, costAllowance, ...customerSafe } = status;
+  const { costUsed: _costUsed, costAllowance, used, ...customerSafe } = status;
   return {
     ...customerSafe,
+    ...(status.effectiveAllowance === null ? {} : { used }),
     hasCostAllowance: costAllowance != null,
     usageBlock: buildUsageBlockCopy({ month: status.month }),
   };
@@ -151,7 +158,7 @@ export async function resolveBillingUserId(userId: string): Promise<string> {
   return org.ownerUserId;
 }
 
-function getCurrentMonth(): string {
+export function getCurrentMonth(): string {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
 }
@@ -322,8 +329,11 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
   }
 
   const billingUserId = await resolveBillingUserId(userId);
-  const usage = await getUserTokenUsage(billingUserId);
-  const [{ allowance, bonus, effectiveAllowance, costAllowance, llmUsagePolicy, subscriptionType }, billingUser] = await Promise.all([
+  // ENG-1250 AC7: the gate no longer reads the legacy per-user counter. The month is the clock's,
+  // and spend comes from the ledger (below); the counter is consulted only if the rollback path
+  // falls back to the legacy basis.
+  const month = getCurrentMonth();
+  const [{ bonus, costAllowance, llmUsagePolicy, subscriptionType }, billingUser] = await Promise.all([
     getUserTokenAllowance(billingUserId),
     userDb.getUserById(billingUserId),
   ]);
@@ -354,17 +364,19 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
   const versionedCostPolicyEnforced = !!llmUsagePolicy && llmUsagePolicy.enforcementState !== "observe";
   const enforceCostCap = versionedCostPolicyEnforced || process.env.ENFORCE_COST_CAP === "true";
 
-  const legacyRawCostUsedMicroUsd = Math.max(0, Math.round((usage.totalCost || 0) * 1_000_000));
+  // Lazy: read only if the basis falls back to legacy (rollback path), never on the live ledger path.
+  const legacyRawCostUsedMicroUsd = async (): Promise<number> =>
+    Math.max(0, Math.round(((await getUserTokenUsage(billingUserId)).totalCost || 0) * 1_000_000));
   // ENG-1250 §9.6 enforcement cutover (dark by default): swap the raw spend basis
   // onto the vendor-inclusive spend ledger; the credit/threshold/predicate path
   // below is reused unchanged so the only divergence is vendor inclusion.
   const { rawCostUsedMicroUsd } = await resolveEnforcementCostBasisMicroUsd({
     billingUserId,
-    billingMonth: usage.month,
+    billingMonth: month,
     legacyRawCostUsedMicroUsd,
     tier: subscriptionType,
   });
-  const creditAdjustment = getLlmUsageCreditAdjustment(billingUser?.llmUsageCredits, usage.month);
+  const creditAdjustment = getLlmUsageCreditAdjustment(billingUser?.llmUsageCredits, month);
   const adjustedUsage = llmUsagePolicy
     ? applyLlmUsageCredits({
         rawCostUsedMicroUsd,
@@ -378,52 +390,50 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
   const costUsedMicroUsd = adjustedUsage.policyCostUsedMicroUsd;
   const usageDecision = evaluateLlmUsageMode({
     costUsedMicroUsd,
-    tokenUsed: usage.totalTokens,
     policy: effectiveLlmUsagePolicy,
   });
   const effectiveCostAllowance = versionedCostPolicyEnforced
     ? effectiveLlmUsagePolicy!.hardCostThresholdMicroUsd / 1_000_000
     : costAllowance;
 
-  const tokenPercentUsed = computePercentUsed(usage.totalTokens, effectiveAllowance);
   const policyCostUsed = costUsedMicroUsd / 1_000_000;
   const costPercentUsed = computePercentUsed(policyCostUsed, effectiveCostAllowance);
 
-  // A tier with no configured dollar allowance would become completely ungated the
-  // moment the flag flips — a strictly worse failure than the cap being replaced.
-  // Such tiers keep their token cap until someone prices them. That guard is also
-  // what makes the rollout order-independent: this code can ship to prod, where
-  // every tier is currently unpriced, and change nothing until the allowances land.
+  // A tier with no configured dollar allowance has no cost gate. It used to fall back to its token
+  // cap here; the token counter is retired (ENG-1250 AC7), so such a tier is now uncapped until
+  // someone prices it. Accepted deliberately for the accounts on those tiers.
   const costIsGate = enforceCostCap && effectiveCostAllowance !== null;
 
-  const tokenAllowed = effectiveAllowance === null || tokenPercentUsed < 100;
   const costAllowed = effectiveCostAllowance === null || costPercentUsed < 100;
   // Once a versioned cost policy is enforced, raw token volume is observe-only:
   // admission is governed exclusively by provider/model cost. Legacy rows retain
   // the old token gate until an admin explicitly saves a versioned policy.
+  // ENG-1250 AC7: there is no token-count gate any more — it needed the retiring counter, and
+  // dollars are the unit that actually bounds spend. A tier with neither an enforced policy nor a
+  // cost gate is therefore uncapped, deliberately (25 such accounts were identified and accepted).
   const allowed = versionedCostPolicyEnforced
     ? usageDecision.admissionAllowed
     : costIsGate
       ? costAllowed
-      : tokenAllowed;
+      : true;
 
   // Warn only on the dimension that can actually block. Warning about an
   // observe-only cap is the same stale nag ENG-951 removed from customer surfaces.
-  const tokenWarning =
-    !costIsGate && effectiveAllowance !== null && tokenPercentUsed >= 80 && tokenPercentUsed < 100;
   const costWarning =
     costIsGate && costPercentUsed >= 80 && costPercentUsed < 100;
 
   return {
     allowed,
-    warning: allowed && (tokenWarning || costWarning),
-    used: usage.totalTokens,
-    allowance,
+    warning: allowed && costWarning,
+    // Token volume is no longer measured (see `allowed` above): null allowance reads as "no token
+    // limit" everywhere, which is also what hides the customer usage meter for such tiers.
+    used: 0,
+    allowance: null,
     bonus,
-    effectiveAllowance,
-    percentUsed: effectiveAllowance === null ? 0 : tokenPercentUsed,
-    month: usage.month,
-    costUsed: versionedCostPolicyEnforced ? policyCostUsed : usage.totalCost,
+    effectiveAllowance: null,
+    percentUsed: 0,
+    month,
+    costUsed: policyCostUsed,
     costAllowance: effectiveCostAllowance,
     costPercentUsed: effectiveCostAllowance === null ? 0 : costPercentUsed,
     costEnforced: costIsGate,
@@ -477,6 +487,23 @@ export function deriveBlockedByCost(status: {
  * For org members, usage is recorded on the org owner's account.
  * Performs lazy monthly reset if the stored month differs from current.
  */
+/**
+ * ENG-1250 AC7 / ENG-2286 stage 3: the legacy per-user counter (`AW-Users.tokenUsage`, plus the
+ * `AW-LlmChargeEvents` audit rows written with it) is no longer maintained. Admission, the usage views,
+ * the admin surfaces and itemization all read the spend ledger now, and `recordUsage` writes every call
+ * to it independently of this function. Set to `true` to resume the legacy writes (rollback).
+ */
+export const LEGACY_COUNTER_WRITES_ENV = "AW_LEGACY_TOKEN_COUNTER_WRITES";
+
+export function isLegacyCounterWriteEnabled(): boolean {
+  return process.env[LEGACY_COUNTER_WRITES_ENV] === "true";
+}
+
+/**
+ * Charge a call to the legacy monthly counter. A NO-OP unless `AW_LEGACY_TOKEN_COUNTER_WRITES=true`; the
+ * ledger, not this counter, is the record of spend. Retained (not deleted) for one rollback window and
+ * removed in stage 4.
+ */
 export async function incrementUserTokenUsage(
   userId: string,
   tokens: number,
@@ -512,6 +539,7 @@ export async function incrementUserTokenUsage(
   }
 ): Promise<void> {
   if (tokens <= 0 && cost <= 0) return;
+  if (!isLegacyCounterWriteEnabled()) return;
 
   const currentMonth = getCurrentMonth();
 
@@ -629,77 +657,6 @@ export async function incrementUserTokenUsage(
   } catch (error) {
     // Don't block message flow on usage tracking failures
     console.error(`[tokenUsageService] Failed to increment usage for ${userId}:`, error);
-  }
-}
-
-// ─── Extra Cost Usage ─────────────────────────────────────────────────────────
-// Tracks non-token API costs (Google Search, enrichment, image gen, etc.) per
-// user per month. Uses the same lazy-reset + 24-month history pattern as tokens.
-
-// ENG-1250 / ENG-2286: the extraCostUsage READ/GATE path (ExtraCostUsageStatus,
-// getUserExtraCostUsage, checkExtraCostUsage) is retired as dead code — it had
-// zero callers (the enrichment-cost gate was never wired to a live request path),
-// and paid vendor spend is now enforced through the ledger rail. The write
-// (incrementExtraCostUsage, below) stays until its admin-display + per-lead markup
-// are retired under ENG-2286.
-
-/**
- * Atomically increment extra cost usage for the current month.
- * For org members, usage is recorded on the org owner's account.
- * @param breakdown - keyed costs to add (e.g. { enrichment: 0.52 })
- */
-export async function incrementExtraCostUsage(
-  userId: string,
-  breakdown: Record<string, number>
-): Promise<void> {
-  const totalNew = Object.values(breakdown).reduce((s, v) => s + v, 0);
-  if (totalNew <= 0) return;
-
-  const currentMonth = getCurrentMonth();
-
-  try {
-    const billingUserId = await resolveBillingUserId(userId);
-    const user = await userDb.getUserById(billingUserId);
-    if (!user) return;
-
-    const existingMonth = user.extraCostUsage?.month;
-
-    if (existingMonth !== currentMonth) {
-      // New month — archive previous, reset
-      const prevUsage = user.extraCostUsage;
-      const existingHistory = user.extraCostUsageHistory || [];
-      let newHistory = existingHistory;
-      if (prevUsage && prevUsage.month) {
-        const entry = { month: prevUsage.month, totalCost: prevUsage.totalCost, breakdown: prevUsage.breakdown };
-        newHistory = [...existingHistory, entry].slice(-24);
-      }
-      await userDb.updateUser(billingUserId, {
-        extraCostUsage: {
-          month: currentMonth,
-          totalCost: totalNew,
-          breakdown: { ...breakdown },
-          resetDate: getNextResetDate(),
-        },
-        extraCostUsageHistory: newHistory,
-      });
-    } else {
-      // Same month — merge breakdown and increment total
-      const prevBreakdown = user.extraCostUsage?.breakdown || {};
-      const mergedBreakdown: Record<string, number> = { ...prevBreakdown };
-      for (const [key, val] of Object.entries(breakdown)) {
-        mergedBreakdown[key] = (mergedBreakdown[key] || 0) + val;
-      }
-      await userDb.updateUser(billingUserId, {
-        extraCostUsage: {
-          month: currentMonth,
-          totalCost: (user.extraCostUsage?.totalCost || 0) + totalNew,
-          breakdown: mergedBreakdown,
-          resetDate: user.extraCostUsage?.resetDate || getNextResetDate(),
-        },
-      });
-    }
-  } catch (error) {
-    console.error(`[tokenUsageService] Failed to increment extra cost for ${userId}:`, error);
   }
 }
 

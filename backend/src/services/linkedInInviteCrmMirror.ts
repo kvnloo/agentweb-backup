@@ -315,7 +315,7 @@ export async function mirrorLinkedInInviteToCrm(
         userId: params.userId,
         leadId: deterministicLeadId,
         failIfExists: true,
-      });
+      }, 'linkedin');
       leadId = (newLead as any)?.leadId as string;
       existing = newLead;
       created = true;

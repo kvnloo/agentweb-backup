@@ -22,7 +22,6 @@ export interface SubscriptionType {
   allowedSkillsDefaulted?: boolean;
   monthlyTokenAllowance?: number | null; // Monthly token limit; null/undefined = unlimited
   monthlyCostAllowance?: number | null; // Monthly LLM spend limit in USD (cost-based cap; guards higher-cost models); null/undefined = unlimited
-  monthlyExtraCostAllowance?: number | null; // Monthly extra API cost limit in USD (enrichment, etc.); null/undefined = unlimited
   llmUsagePolicy?: LlmUsagePolicy; // Versioned admin-managed full-choice/optimized/paused policy
   llmUsageTopUp?: LlmUsageTopUpConfig; // Admin-priced packages that extend this month's hard ceiling
   /**
@@ -61,6 +60,7 @@ const FREE_TIER_FALLBACK: SubscriptionType = {
 
 export const SUBSCRIPTION_FEATURES = {
   SCHEDULED_CHATS: "scheduled_chats",
+  MODEL_COMPARE: "model_compare",
 } as const;
 
 /**
@@ -259,6 +259,10 @@ const AVAILABLE_SUBSCRIPTION_FEATURES: ReadonlyArray<{
   id: SUBSCRIPTION_FEATURES.SCHEDULED_CHATS,
   label: "Scheduled chats",
   description: "Create, edit, test, resume, and execute recurring Agent Mode chats.",
+}, {
+  id: SUBSCRIPTION_FEATURES.MODEL_COMPARE,
+  label: "Compare models",
+  description: "Send one prompt to several models and compare their answers side by side.",
 }];
 
 export function getAllAvailableSubscriptionFeatures() {

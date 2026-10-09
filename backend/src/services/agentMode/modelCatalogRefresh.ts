@@ -2,6 +2,7 @@ import { LLM_MODEL_REGISTRY, LLMModelConfig, ModelProvider } from './llmModelReg
 import { MODEL_PRICING, ModelPrice, costScoreFromPrice } from '../../utils/llmPricing';
 import { resolveOpenRouterUpstreamModelId } from '../../utils/openRouterGatewayContract';
 import { blendedPrice, inferFamily, supersession } from './modelSupersession';
+import { PriceOverride, priceOverrideReports, summarizePriceOverrides } from './catalogReview';
 
 type Registry = Readonly<Record<string, Readonly<LLMModelConfig>>>;
 const PROVIDERS: Record<string, ModelProvider> = {
@@ -24,7 +25,23 @@ function rate(value: unknown): number | undefined {
   const n = Number((Number(value) * 1e6).toPrecision(15));
   return Number.isFinite(n) && n >= 0 ? n : undefined;
 }
-export interface CatalogCandidate { id: string; config: LLMModelConfig; price: ModelPrice }
+export interface CatalogCandidate {
+  id: string; config: LLMModelConfig; price: ModelPrice;
+  /** Review-time facts about the OpenRouter listing; never written into the registry. */
+  listing: { priceOverrides: PriceOverride[]; acceptsImages: boolean; supportsReasoningEffort: boolean };
+}
+
+/** OpenRouter names are "<Vendor>: <Model>"; the registry's house style is just the model. */
+export function cleanModelName(name: string): string {
+  return name.replace(/^[^:]{1,30}:\s+(?=\S)/, '').trim() || name;
+}
+
+/** A new addition priced MORE than 3x above its CLOSEST existing family sibling gets a
+ * loud review-time warning (ENG-2293 follow-up) — e.g. a transient OpenRouter
+ * promo/glitch quote, not a hard gate. A model that is much CHEAPER than its sibling
+ * (a normal generation-over-generation drop) carries no spend risk and is reported
+ * as information only; a free ($0) quote against paid siblings still warns. */
+const PRICE_OUTLIER_RATIO = 3;
 
 /** OpenRouter prices are per token. Only supported text/tool product lines enter this catalog.
  * Source: https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties
@@ -60,9 +77,18 @@ export function parseOpenRouter(payload: unknown): CatalogCandidate[] {
     }
     if (invalidCache) continue;
     const id = `openrouter/${row.id}`;
-    result.set(id, { id, price, config: {
-      client: null, name: typeof row.name === 'string' ? row.name : row.id,
+    const inputs = architecture?.input_modalities;
+    result.set(id, { id, price, listing: {
+      priceOverrides: summarizePriceOverrides(p),
+      acceptsImages: Array.isArray(inputs) && inputs.includes('image'),
+      supportsReasoningEffort: params.includes('reasoning_effort'),
+    }, config: {
+      client: null, name: typeof row.name === 'string' ? cleanModelName(row.name) : row.id,
       description: 'Auto-added from OpenRouter; benchmark score shown when available.',
+      // Unreviewed pricing/capabilities must never reach customers on their own:
+      // adminOnly drops the entry from every customer-facing model list and from
+      // the session model switch. A human removes the flag after review.
+      adminOnly: true,
       provider, family: inferFamily(id), supportsTemperature: params.includes('temperature'),
       supportsTools: true, supportsToolChoice: params.includes('tool_choice'),
       // Vision stays opt-in until the describe_image path is verified.
@@ -71,6 +97,20 @@ export function parseOpenRouter(payload: unknown): CatalogCandidate[] {
   }
   return [...result.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
+
+/**
+ * Registry id -> the Artificial Analysis slug that is actually that model. Needed
+ * only where the two catalogs disagree on which release a bare name means:
+ * OpenRouter's `deepseek/deepseek-v4-pro` is the 0423 release, but AA's
+ * `deepseek-v4-pro` slug now names the newer 0813 release (the 0423 one is
+ * `deepseek-v4-pro-0424`). Without this the daily refresh matched the 0423 entry
+ * to the 0813 row and wrote 0813's score onto it (36 instead of 30). A slug that
+ * is absent from the payload simply reports "unmatched; score unchanged".
+ */
+const AA_SLUG_OVERRIDES: Readonly<Record<string, string>> = {
+  'openrouter/deepseek/deepseek-v4-pro': 'deepseek-v4-pro-0424',
+  'openrouter/deepseek/deepseek-v4-pro-0813': 'deepseek-v4-pro',
+};
 
 /** Exact model-version matching only. Ambiguous effort variants are reported, never guessed.
  * Source: https://artificialanalysis.ai/api-reference
@@ -93,8 +133,10 @@ export function refreshScores(registry: Registry, payload: unknown | undefined, 
     const [provider, model] = upstream(id).split('/');
     if (!model) continue;
     const source = normalize((config.qualityScoreSource ?? '').replace(/\(https?:.*$/, ''));
+    const slugOverride = AA_SLUG_OVERRIDES[id];
     const matches = scores.filter(s => (s.provider === normalize(provider) || s.provider === normalize(config.provider ?? ''))
-      && (normalize(s.slug) === normalize(model) || normalize(s.name) === normalize(model)
+      && (slugOverride ? normalize(s.slug) === normalize(slugOverride)
+        : normalize(s.slug) === normalize(model) || normalize(s.name) === normalize(model)
         // An existing AA source can explicitly identify a benchmark effort variant.
         // Do not pick the highest scoring variant or strip arbitrary effort suffixes.
         || ([s.slug, s.name].some(name => normalize(name).startsWith(normalize(model))
@@ -132,23 +174,73 @@ export async function refreshModelCatalog(options: {
   const pricingChanges: Record<string, ModelPrice> = {};
   for (const model of additions) { next[model.id] = model.config; registryChanges[model.id] = model.config; pricingChanges[model.id] = model.price; }
   const { changes, reports } = refreshScores(next, aa, date);
+  // A new model's own "no Artificial Analysis match" line is information a reviewer needs
+  // (it ships without a quality score); the other ~150 are daily noise.
+  const addedIds = new Set(additions.map(m => m.id));
+  reports.forEach((line, i) => {
+    const m = /^(.*): AA (unmatched|ambiguous); score unchanged$/.exec(line);
+    if (m && addedIds.has(m[1])) reports[i] = `ℹ️ AA SCORE: ${m[1]} has no unique Artificial Analysis match (${m[2]}) yet, so it ships without a quality score.`;
+  });
+  // Flag a wildly mispriced addition loudly — never block on it. A hard gate here
+  // would recreate the exact deadlock ENG-2293 fixed (one bad quote blocking every
+  // future model forever); a report a reviewer can't miss is the safer trade-off.
+  // Symmetric ratio distance between two non-negative prices. Both zero is a
+  // match (free addition into a free family); exactly one zero is an extreme
+  // mismatch, never Infinity-by-default on an unrelated zero baseline.
+  const priceRatio = (a: number, b: number): number =>
+    a > 0 && b > 0 ? Math.max(a / b, b / a) : a === 0 && b === 0 ? 1 : Infinity;
+  for (const model of additions) {
+    const siblingPrices = Object.entries(registry)
+      .filter(([id, config]) => (config.family ?? inferFamily(id)) === model.config.family && prices[id])
+      .map(([id]) => blendedPrice(prices[id]));
+    if (!siblingPrices.length) continue;
+    const addedPrice = blendedPrice(model.price);
+    // Compare against the CLOSEST existing sibling, not the family average — a
+    // family can legitimately span several price tiers under one family name
+    // (verified: gpt-sol's two real, correctly-priced members alone span 2.8x),
+    // so a plain average is already near the outlier cutoff before any new
+    // addition even arrives, and would false-flag a normal new tier member.
+    let nearest = siblingPrices[0], bestRatio = priceRatio(addedPrice, nearest);
+    for (const p of siblingPrices.slice(1)) {
+      const r = priceRatio(addedPrice, p);
+      if (r < bestRatio) { bestRatio = r; nearest = p; }
+    }
+    if (bestRatio > PRICE_OUTLIER_RATIO) {
+      const cheaper = addedPrice > 0 && addedPrice < nearest;
+      reports.push(cheaper
+        ? `ℹ️ PRICE DROP: ${model.id} blended $${addedPrice.toFixed(3)}/M is ${bestRatio.toFixed(1)}x cheaper than its closest "${model.config.family}" family sibling ($${nearest.toFixed(3)}/M) — no spend risk; the quote is cross-checked against endpoint prices.`
+        : `⚠️ PRICE OUTLIER: ${model.id} blended $${addedPrice.toFixed(3)}/M is ${bestRatio.toFixed(1)}x its closest "${model.config.family}" family sibling ($${nearest.toFixed(3)}/M) — verify before merging.`);
+    }
+  }
+  for (const model of additions) {
+    reports.push(...priceOverrideReports(model.id, model.listing.priceOverrides));
+    const todo = ['description and tier (placeholders now)'];
+    if (model.listing.acceptsImages) todo.push('accepts images (supportsVision left opt-in)');
+    if (model.listing.supportsReasoningEffort) todo.push('supports reasoning_effort (supportedReasoningEfforts not set; its Artificial Analysis score may be measured at a higher effort than the default)');
+    reports.push(`ℹ️ BEFORE CUSTOMER EXPOSURE: ${model.id} — set ${todo.join('; ')}.`);
+  }
   for (const [id, config] of Object.entries(next)) {
     const patch = { ...(!config.family ? { family: inferFamily(id) } : {}), ...changes[id] };
     if (Object.keys(patch).length) registryChanges[id] = { ...registryChanges[id], ...patch };
     next[id] = { ...config, ...patch };
   }
-  const quotes = new Map(parseOpenRouter(catalog).map(m => [upstream(m.id), m.price]));
+  // Every existing price is a human decision (see withDerivedCache usage and inline
+  // confidence/promo commentary in llmPricing.ts) — a live quote never silently
+  // overwrites it, for any upstream. Only report the drift for human review; only
+  // brand-new additions (above) get priced directly from the quote.
+  const quotes = new Map(parseOpenRouter(catalog).map(m => [upstream(m.id), m]));
+  const additionIds = new Set(additions.map(m => m.id));
   for (const id of Object.keys(registry)) {
-    const quote = quotes.get(upstream(id));
-    // Existing OpenAI logical IDs use Azure BYOK list prices (llmPricing.ts).
-    if (!quote) continue;
-    if (!id.startsWith('openrouter/') || upstream(id).startsWith('openai/')) {
-      if (prices[id] && (prices[id].inPerM !== quote.inPerM || prices[id].outPerM !== quote.outPerM))
-        reports.push(`${id}: retained native/BYOK billing rates; marketplace quote not applied`);
-      continue;
+    if (additionIds.has(id)) continue;
+    const listed = quotes.get(upstream(id));
+    if (!listed || !prices[id]) continue;
+    const quote = listed.price;
+    if (prices[id].inPerM !== quote.inPerM || prices[id].outPerM !== quote.outPerM) {
+      // A model with UTC price windows legitimately has no single "live" price, so a
+      // gap to the curated (usually peak) rate is expected, not drift.
+      const windows = listed.listing.priceOverrides.some(o => o.kind === 'time_of_day') ? ' (listing has time-of-day price windows)' : '';
+      reports.push(`${id}: live quote ($${quote.inPerM}/$${quote.outPerM} in/out) diverges from curated price ($${prices[id].inPerM}/$${prices[id].outPerM})${windows}; not applied`);
     }
-    const price = { ...prices[id], ...quote }; // absent cache quotes preserve explicit overrides
-    if (JSON.stringify(price) !== JSON.stringify(prices[id])) pricingChanges[id] = price;
   }
   const nextPrices = { ...prices, ...pricingChanges };
   const candidates = Object.entries(next).filter(([, m]) => !m.isLive && !m.internalOnly)

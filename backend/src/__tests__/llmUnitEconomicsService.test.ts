@@ -178,42 +178,8 @@ describe('credit ledger and the cap arithmetic', () => {
   });
 });
 
-describe('AC2 — discrepancies are visible, not hidden', () => {
-  it('surfaces a ledger/counter drift instead of silently trusting one', async () => {
-    mockScanByDateRange.mockResolvedValue([llmRow('u1', 100_000_000)]);
-    mockGetAllUsers.mockResolvedValue([{
-      userId: 'u1', email: 'drift@x.com', subscriptionType: 'Pro',
-      tokenUsage: { month: '2026-09', totalCost: 92.7 },
-    }]);
-    const r = await buildUnitEconomicsReport('2026-09');
-    expect(r.rows[0].reconciled).toBe(false);
-    expect(r.rows[0].ledgerVsCounterDeltaUsd).toBeCloseTo(7.3, 2);
-    expect(r.unreconciled).toHaveLength(1);
-    expect(r.alerts.find((a) => a.kind === 'ledger_counter_drift')?.count).toBe(1);
-  });
-
-  it('does not flag sub-cent rounding as drift', async () => {
-    mockScanByDateRange.mockResolvedValue([llmRow('u1', 100_000_000)]);
-    mockGetAllUsers.mockResolvedValue([{
-      userId: 'u1', email: 'ok@x.com', subscriptionType: 'Pro',
-      tokenUsage: { month: '2026-09', totalCost: 100.004 },
-    }]);
-    const r = await buildUnitEconomicsReport('2026-09');
-    expect(r.rows[0].reconciled).toBe(true);
-    expect(r.unreconciled).toHaveLength(0);
-  });
-
-  it('does not compare against a counter describing a different month', async () => {
-    mockScanByDateRange.mockResolvedValue([llmRow('u1', 100_000_000)]);
-    mockGetAllUsers.mockResolvedValue([{
-      userId: 'u1', email: 'ok@x.com', subscriptionType: 'Pro',
-      tokenUsage: { month: '2026-08', totalCost: 5 },
-    }]);
-    const r = await buildUnitEconomicsReport('2026-09');
-    expect(r.rows[0].counterCostUsd).toBeNull();
-    expect(r.rows[0].reconciled).toBe(true);
-  });
-});
+// AC2 (ledger vs the legacy counter) was retired with the counter: ENG-1250 AC7. The cap
+// enforces on the ledger itself, so there is nothing left to reconcile against.
 
 describe('AC1 — filters', () => {
   const seed = () => {

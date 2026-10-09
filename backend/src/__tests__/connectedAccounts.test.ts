@@ -1216,6 +1216,60 @@ describe('Connected Accounts Routes', () => {
         });
     });
 
+    describe('PATCH /connected-accounts/unipile/:accountId/daily-invite-cap (ENG-1574)', () => {
+        it.each([0, 10, 30])('persists dailyInviteCap=%i', async (cap) => {
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockResolvedValue(undefined);
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/unipile/uni-1/daily-invite-cap')
+                .send({ dailyInviteCap: cap });
+            expect(response.status).toBe(200);
+            expect(response.body).toEqual(expect.objectContaining({ success: true, daily_invite_cap: cap }));
+            // Only the cap is written: the Premium flag is untouched (AC4).
+            expect(connectedAccountsDb.updateAccountConfig).toHaveBeenCalledWith(
+                'test_user_id', 'unipile', 'uni-1', { daily_invite_cap: cap }
+            );
+        });
+
+        it.each([[-1], [31], [2.5], ['10'], [null], [undefined]])('rejects invalid dailyInviteCap %p', async (cap) => {
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/unipile/uni-1/daily-invite-cap')
+                .send({ dailyInviteCap: cap });
+            expect(response.status).toBe(400);
+            expect(connectedAccountsDb.updateAccountConfig).not.toHaveBeenCalled();
+        });
+
+        it('returns 404 when the account is not connected to the user', async () => {
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockRejectedValue(
+                new Error('No unipile account with id "uni-x" connected')
+            );
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/unipile/uni-x/daily-invite-cap')
+                .send({ dailyInviteCap: 5 });
+            expect(response.status).toBe(404);
+        });
+    });
+
+    describe('daily_invite_cap on GET /connected-accounts (ENG-1574)', () => {
+        const unipile = (config: Record<string, unknown>) => ({
+            platform: 'unipile', account_id: 'uni-c', account_name: 'LI',
+            created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+            config: { account_type: 'personal', unipile_account_id: 'uni-c', access_token: 'tok', token_expires_at: 9999999999999, ...config },
+        });
+        it.each([
+            [{}, 10],
+            [{ daily_invite_cap: 0 }, 0],
+            [{ daily_invite_cap: 25, is_premium: true }, 25],
+            [{ daily_invite_cap: 99 }, 30],
+        ])('config %p surfaces daily_invite_cap=%i', async (config, expected) => {
+            (connectedAccountsDb.getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([unipile(config)]);
+            const { linkedInOutreachService } = require('../services/linkedInOutreachService');
+            linkedInOutreachService.getStatusesForAccounts.mockResolvedValue(new Map([['uni-c', 'OK']]));
+            const response = await request(app).get('/api/oauth/connected-accounts');
+            expect(response.status).toBe(200);
+            expect(response.body.accounts[0].daily_invite_cap).toBe(expected);
+        });
+    });
+
     describe('PATCH /connected-accounts/unipile/:accountId/premium', () => {
         it('sets is_premium=true and returns success', async () => {
             (connectedAccountsDb.updateAccountConfig as jest.Mock).mockResolvedValue(undefined);

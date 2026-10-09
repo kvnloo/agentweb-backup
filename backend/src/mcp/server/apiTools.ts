@@ -12,6 +12,7 @@ import { findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContent
 
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
+import './adminLookupTools';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 
@@ -1026,7 +1027,7 @@ mcpToolRegistry.register({
         list_id: { type: 'string', description: 'List ID (required for get/update/delete)' },
         name: { type: 'string', description: 'List name (create/update)' },
         description: { type: 'string', description: 'List description (create/update)' },
-        list_type: { type: 'string', description: 'List type (create only)' }
+        list_type: { type: 'string', description: 'List type: sales | customers | session (create only; validated by the API)' }
       },
       required: ['action']
     }
@@ -1060,15 +1061,14 @@ mcpToolRegistry.register({
 //
 // `get_leads_by_crm_criteria` scopes WHO a campaign targets; this tool inspects
 // the campaign itself. Read-only by construction: list + inspect + enrollment
-// counts only. Create/activate/pause live in the sibling ENG-442 work
-// (manage_crm_sequence, ENG-963/964) behind the send-safety gate and must
-// never be added here.
+// counts only. Create/activate/pause live in manage_crm_sequence (ENG-964,
+// below) behind the activation gate and must never be added here.
 
 mcpToolRegistry.register({
   name: 'list_crm_sequences',
   definition: {
     name: 'list_crm_sequences',
-    description: `List the CRM email drip / nurture sequences on the caller's account, and inspect one with enrollment counts. Read-only — safe to call any time, including in a scheduled run. It cannot create, start, pause, or otherwise change a sequence; to change one, use the CRM UI.
+    description: `List the CRM email drip / nurture sequences on the caller's account, and inspect one with enrollment counts. Read-only — safe to call any time, including in a scheduled run. It cannot create, start, pause, or otherwise change a sequence; to change one, use manage_crm_sequence.
 
 Use this to answer "are any email campaigns running for our CRM leads?". Each entry reports \`name\`, \`status\` (draft | active | paused | archived), \`audience\` (who the drip worker actually enrolls — auto-enroll lists, never the aspirational trigger), \`step_count\`, \`is_sending\` (true ONLY for \`active\` sequences, because the drip worker mails nothing for a draft/paused/archived sequence), and \`enrollment_count\` when a single sequence is inspected.
 
@@ -1154,6 +1154,272 @@ An account with no sequences returns \`{ total: 0, sequences: [] }\` with a summ
       });
     } catch (err: any) {
       return jsonResult({ success: false, error: err?.message || String(err) });
+    }
+  },
+});
+
+// ─── CRM drip sequences, write side (ENG-964) ───────────────────────────────
+//
+// create / update / pause are ordinary reversible writes on a DRAFT (or paused)
+// sequence. `activate` is the only path from this tool that ever sets
+// status 'active', and it sits behind the ENG-587 A1+A2 boundary in
+// crmSequenceActivationGate: attended sessions only, and only after the exact
+// content/audience/cadence was previewed and a human picked "Activate" on the
+// approval card. create/update never forward a `status`.
+
+function mapSequenceSteps(steps: unknown): { steps?: any[]; error?: string } {
+  if (steps === undefined) return {};
+  if (!Array.isArray(steps) || steps.length === 0) return { error: 'steps must be a non-empty array' };
+  const mapped: any[] = [];
+  for (const [i, raw] of steps.entries()) {
+    const s: any = raw ?? {};
+    const channel = s.channel ?? 'email';
+    const delayDays = Number(s.delay_days ?? 0);
+    if (!Number.isFinite(delayDays) || delayDays < 0) return { error: `steps[${i}].delay_days must be a non-negative number` };
+    if (channel === 'email' && (!s.subject || !s.body_html)) {
+      return { error: `steps[${i}] is an email step and needs both subject and body_html` };
+    }
+    if (channel === 'linkedin' && !s.message_text) return { error: `steps[${i}] is a LinkedIn step and needs message_text` };
+    if (channel !== 'email' && channel !== 'linkedin') return { error: `steps[${i}].channel must be "email" or "linkedin"` };
+    mapped.push({
+      name: typeof s.name === 'string' && s.name.trim() ? s.name.trim() : `Step ${i + 1}`,
+      delayDays,
+      channel,
+      ...(s.subject !== undefined ? { subject: s.subject } : {}),
+      ...(s.body_html !== undefined ? { bodyHtml: s.body_html } : {}),
+      ...(s.message_text !== undefined ? { messageText: s.message_text } : {}),
+      ...(s.sender_id !== undefined ? { senderId: s.sender_id } : {}),
+    });
+  }
+  return { steps: mapped };
+}
+
+function mapAudienceListIds(ids: unknown): { ids?: string[]; error?: string } {
+  if (ids === undefined) return {};
+  if (!Array.isArray(ids) || ids.some((id) => typeof id !== 'string' || !id.trim())) {
+    return { error: 'audience_list_ids must be an array of lead list ids' };
+  }
+  return { ids: ids.map((id: string) => id.trim()) };
+}
+
+mcpToolRegistry.register({
+  name: 'manage_crm_sequence',
+  definition: {
+    name: 'manage_crm_sequence',
+    description: `Create, edit, preview, activate, or pause a CRM email drip sequence on the caller's account.
+
+- "create": builds a new sequence as a DRAFT (nothing is sent). \`audience_list_ids\` are the lead lists whose new leads auto-enroll once it is active.
+- "update": edits a draft or paused sequence. An active sequence must be paused first.
+- "preview_activation": shows the user the exact steps, audience and timing and asks them to approve. Always do this before "activate".
+- "activate": starts sending. Only works in a live chat, after "preview_activation", once the user has picked "Activate" on the approval card, and only if the sequence has not changed since the preview. Never call it in the same turn as the preview — wait for the user's choice.
+- "pause": stops sending. Always allowed.
+
+Use list_crm_sequences to find sequence ids.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'update', 'preview_activation', 'activate', 'pause'] },
+        sequence_id: { type: 'string', description: 'Required for every action except create.' },
+        name: { type: 'string', description: 'Sequence name (create; optional on update).' },
+        description: { type: 'string' },
+        campaign_type: { type: 'string', enum: ['conversion', 'onboarding', 'reengagement', 'nurture', 'upsell', 'custom'] },
+        audience_list_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Lead list ids whose new leads auto-enroll while the sequence is active.',
+        },
+        steps: {
+          type: 'array',
+          description: 'Ordered steps. Replaces all steps on update.',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              delay_days: { type: 'number', description: 'Days after the previous step (or enrollment, for step 1).' },
+              channel: { type: 'string', enum: ['email', 'linkedin'] },
+              subject: { type: 'string' },
+              body_html: { type: 'string' },
+              message_text: { type: 'string', description: 'LinkedIn steps only.' },
+              sender_id: { type: 'string' },
+            },
+          },
+        },
+        preview_token: { type: 'string', description: 'activate only: the preview_token returned by preview_activation.' },
+      },
+      required: ['action'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const gate = await import('../../services/crmSequenceActivationGate');
+    const { describeSequenceAudience } = await import('../../services/crmSequenceRead');
+    const action = args?.action;
+    const sequenceId = typeof args?.sequence_id === 'string' ? args.sequence_id.trim() : '';
+    const refuse = (code: string, error: string) => ({ success: false, blocked: true, code, error });
+    const isSequenceConflict = (err: any) => /API error \(409\)/.test(String(err?.message ?? ''));
+    const path = `/api/crm/sequences/${encodeURIComponent(sequenceId)}`;
+    const loadSequence = async () => {
+      const data = await mcpFetch({ method: 'GET', path, context: ctx(context) });
+      if (!data?.sequence) throw new Error(`Sequence not found: ${sequenceId}`);
+      return data.sequence;
+    };
+
+    try {
+      if (action !== 'create' && !sequenceId) return { success: false, error: 'sequence_id is required' };
+
+      switch (action) {
+        case 'create': {
+          const name = typeof args?.name === 'string' ? args.name.trim() : '';
+          if (!name) return { success: false, error: 'name is required' };
+          const steps = mapSequenceSteps(args?.steps);
+          if (steps.error) return { success: false, error: steps.error };
+          const audience = mapAudienceListIds(args?.audience_list_ids);
+          if (audience.error) return { success: false, error: audience.error };
+          // No status, no enrollmentTrigger: the route defaults to draft, and the
+          // drip worker enrolls from autoEnrollListIds, not the trigger.
+          const created = await mcpFetch({
+            method: 'POST',
+            path: '/api/crm/sequences',
+            context: ctx(context),
+            body: { name, description: args?.description, campaignType: args?.campaign_type, steps: steps.steps },
+          });
+          let sequence = created?.sequence;
+          if (!sequence?.sequenceId) return { success: false, error: 'Sequence creation returned no sequence' };
+          if (audience.ids?.length) {
+            // PUT is the audience writer that refuses session lists (ENG-2311).
+            try {
+              const updated = await mcpFetch({
+                method: 'PUT',
+                path: `/api/crm/sequences/${encodeURIComponent(sequence.sequenceId)}`,
+                context: ctx(context),
+                body: { autoEnrollListIds: audience.ids },
+              });
+              sequence = updated?.sequence ?? sequence;
+            } catch (err: any) {
+              return {
+                success: false,
+                sequence_id: sequence.sequenceId,
+                error: `Draft sequence ${sequence.sequenceId} was created, but setting its audience failed: ${err?.message || String(err)}. It has no audience and sends nothing.`,
+              };
+            }
+          }
+          return { success: true, sequence_id: sequence.sequenceId, status: sequence.status, audience: describeSequenceAudience(sequence) };
+        }
+
+        case 'update': {
+          const existing = await loadSequence();
+          if (existing.status === 'active') {
+            return refuse('active_sequence', 'This sequence is active. Pause it before editing, then preview and activate it again.');
+          }
+          const steps = mapSequenceSteps(args?.steps);
+          if (steps.error) return { success: false, error: steps.error };
+          const audience = mapAudienceListIds(args?.audience_list_ids);
+          if (audience.error) return { success: false, error: audience.error };
+          const body: Record<string, unknown> = {};
+          if (typeof args?.name === 'string' && args.name.trim()) body.name = args.name.trim();
+          if (args?.description !== undefined) body.description = args.description;
+          if (args?.campaign_type !== undefined) body.campaignType = args.campaign_type;
+          if (steps.steps) body.steps = steps.steps;
+          if (audience.ids) body.autoEnrollListIds = audience.ids;
+          if (Object.keys(body).length === 0) return { success: false, error: 'Nothing to update' };
+          // Atomic: the route refuses (409) if the sequence went active after the check above.
+          body.requireStatusNot = 'active';
+          let data: any;
+          try {
+            data = await mcpFetch({ method: 'PUT', path, context: ctx(context), body });
+          } catch (err: any) {
+            if (isSequenceConflict(err)) return refuse('active_sequence', 'This sequence became active while editing. Pause it before editing, then preview and activate it again.');
+            throw err;
+          }
+          return { success: true, sequence_id: sequenceId, status: data?.sequence?.status, audience: describeSequenceAudience(data?.sequence ?? {}) };
+        }
+
+        case 'pause': {
+          const data = await mcpFetch({ method: 'PUT', path, context: ctx(context), body: { status: 'paused' } });
+          return { success: true, sequence_id: sequenceId, status: data?.sequence?.status ?? 'paused' };
+        }
+
+        case 'preview_activation':
+        case 'activate': {
+          // A1 first: an unattended/external caller learns nothing more than "no".
+          let session: any = null;
+          if (context?.externalMcp !== true && context?.unattended !== true && context?.sessionId) {
+            const { chatbotDb } = await import('../../services/chatbotService');
+            session = await chatbotDb.getChatSession(context.sessionId).catch(() => null);
+          }
+          const attended = gate.checkAttendedSession({
+            externalMcp: context?.externalMcp,
+            unattended: context?.unattended,
+            sessionId: context?.sessionId,
+            session,
+          });
+          if (!attended.allowed) return refuse(attended.code, attended.reason);
+
+          const sequence = await loadSequence();
+          if (sequence.status === 'active') return { success: true, sequence_id: sequenceId, status: 'active', note: 'Already active.' };
+          if (!Array.isArray(sequence.steps) || sequence.steps.length === 0) {
+            return { success: false, error: 'This sequence has no steps, so there is nothing to send.' };
+          }
+          const token = gate.computeSequencePreviewToken(sequence);
+
+          if (action === 'preview_activation') {
+            const audience = describeSequenceAudience(sequence);
+            const question = gate.buildActivationQuestion(sequence, token, audience);
+            return {
+              success: true,
+              awaitingUserConfirmation: true,
+              type: 'ask_user_question',
+              sessionId: context.sessionId,
+              questionDeckPayload: [question],
+              confirmationPrompt: question.question,
+              summary: question.question,
+              preview_token: token,
+              preview: {
+                sequence_id: sequenceId,
+                name: sequence.name,
+                audience,
+                steps: sequence.steps.map((s: any) => ({
+                  name: s.name,
+                  delay_days: s.delayDays,
+                  channel: s.channel ?? 'email',
+                  subject: s.subject,
+                  body_html: s.bodyHtml,
+                  message_text: s.messageText,
+                })),
+              },
+              message: 'The run halts here until the user picks an option. Do NOT call activate yourself in this turn.',
+            };
+          }
+
+          const { chatbotDb } = await import('../../services/chatbotService');
+          const messages = await chatbotDb.getMessagesFromMessagesTable(context.sessionId);
+          const approval = gate.checkActivationApproval(messages as any, sequenceId, token);
+          if (!approval.allowed) return refuse(approval.code, approval.reason);
+          if (typeof args?.preview_token !== 'string' || args.preview_token !== token) {
+            return refuse('stale_preview', 'preview_token does not match the sequence as it is now. Preview it again.');
+          }
+
+          // Atomic: activate only the exact version the user approved. If anything edited the
+          // sequence after the read that produced `token`, the route returns 409 and nothing goes live.
+          let data: any;
+          try {
+            data = await mcpFetch({
+              method: 'PUT',
+              path,
+              context: ctx(context),
+              body: { status: 'active', expectedUpdatedAt: sequence.updatedAt, requireStatusNot: 'active' },
+            });
+          } catch (err: any) {
+            if (isSequenceConflict(err)) return refuse('stale_preview', 'The sequence changed after the preview was approved. Preview it again.');
+            throw err;
+          }
+          return { success: true, sequence_id: sequenceId, status: data?.sequence?.status ?? 'active' };
+        }
+
+        default:
+          return { success: false, error: `Unknown action: ${action}` };
+      }
+    } catch (err: any) {
+      return { success: false, error: err?.message || String(err) };
     }
   },
 });
@@ -1714,7 +1980,8 @@ mcpToolRegistry.register({
       properties: {
         account_id: { type: 'string', description: 'Connected account ID' },
         content: { type: 'string', description: 'Post content' },
-        media_urls: { type: 'array', items: { type: 'string' }, description: 'Optional media URLs' }
+        media_urls: { type: 'array', items: { type: 'string' }, description: 'Optional media URLs' },
+        in_reply_to_post_id: { type: 'string', description: 'X (Twitter) only. ID of an existing post to reply to. Omit for a new post.' }
       },
       required: ['account_id', 'content']
     }
@@ -1725,7 +1992,7 @@ mcpToolRegistry.register({
     if (withdrawn) return jsonResult({ success: false, message: withdrawn.error });
     const data = await mcpFetch({
       method: 'POST', path: '/api/emma/post-on-account', context: ctx(context),
-      body: { account_id: args.account_id, content: args.content, media_urls: args.media_urls || [] }
+      body: { account_id: args.account_id, content: args.content, media_urls: args.media_urls || [], ...(args.in_reply_to_post_id ? { in_reply_to_post_id: args.in_reply_to_post_id } : {}) }
     });
     return jsonResult(data);
   }
@@ -1976,6 +2243,57 @@ mcpToolRegistry.register({
     const data = await mcpFetch({
       method: 'PATCH', path: `/api/landing-pages/v0/generated/${args.page_id}/context`, context: ctx(context),
       body: { context: args.context }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'enable_session_tracking',
+  definition: {
+    name: 'enable_session_tracking',
+    description: 'Turn on organic and paid visitor SESSION tracking for a landing page: creates (or reuses) a session list named "LP Sessions - {page name}" and adds the AgentWeb tracking tag to the page\'s own repo in one commit (the site redeploys in about a minute). Safe to call again: it never duplicates the tag or the list. Use it for a deployed landing page that has no session tracking yet, or after the page gains a new domain (re-running adds the new address to the list). Returns listId, embedSnippet, installed and alreadyInstalled. If the page already has its own tracker the tool refuses with an explanation instead of double-counting visits; report that to the user rather than retrying.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID (from list_landing_pages or get_landing_page)' },
+        html_path: { type: 'string', description: 'Only for a static-HTML page whose file is not public/<slug>.html or public/index.html: the file to tag, e.g. "public/offer.html"' }
+      },
+      required: ['page_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    // ENG-827: this commits to a customer's live repo, so it honours the same last-moment consent re-check
+    // as publish_landing_page_changes (an unattended schedule whose consent was withdrawn mid-run stops here).
+    const withdrawn = await publishWithdrawnMidFlight(context);
+    if (withdrawn) return jsonResult({ success: false, message: withdrawn.error });
+    const data = await mcpFetch({
+      method: 'POST', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/session-tracking`, context: ctx(context),
+      body: { ...(args.html_path ? { htmlPath: args.html_path } : {}) }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'set_landing_page_lead_list',
+  definition: {
+    name: 'set_landing_page_lead_list',
+    description: 'Attach, change, or clear the CRM lead list on an existing landing page (including imported externally-deployed pages) without regenerating it. Pass lead_list_id=null to clear. Enables public submissions on the list and syncs the page capture route where the page has a repo.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' },
+        lead_list_id: { type: ['string', 'null'], description: 'Lead list ID to associate, or null to clear' }
+      },
+      required: ['page_id', 'lead_list_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const leadListId = typeof args.lead_list_id === 'string' && args.lead_list_id.trim() ? args.lead_list_id.trim() : null;
+    const data = await mcpFetch({
+      method: 'PATCH', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/lead-list`, context: ctx(context),
+      body: { leadListId }
     });
     return jsonResult(data);
   }
@@ -2840,7 +3158,9 @@ The two underlying fields are also returned, and they are NOT interchangeable:
 - llmModel: the model *selected* in the picker. A client-side selection only — the session may never have run on it (it can name a model outside the registry, or a live voice model that cannot generate text at all).
 - generationModels: the models that actually generated the assistant turns, derived from the transcript. Null when no message recorded one.
 
-TOKEN vs COST — they are not on the same basis. totalTokens EXCLUDES prompt-cache tokens, but totalCost/estimated_cost BILLS them. cacheTokens ({creation, read}, null when none) reports what was cached. A cache-heavy scheduled run can show 371 totalTokens against $2.94 of real spend, so a cost-per-token or "cheap because few tokens" claim computed from totalTokens alone is wrong by orders of magnitude. When reporting spend, use totalCost directly; when reporting volume, add cacheTokens to totalTokens and say you did.
+TOKEN vs COST — they are not on the same basis. totalTokens EXCLUDES prompt-cache tokens, but totalCost/estimated_cost BILLS them. cacheTokens ({creation, read}, null when none) reports what was cached. A cache-heavy scheduled run can show 371 totalTokens against $2.94 of real spend, so a cost-per-token or "cheap because few tokens" claim computed from totalTokens alone is wrong by orders of magnitude. When reporting spend, use totalCost directly for lifetime spend; when reporting volume, add cacheTokens to totalTokens and say you did.
+
+IN-WINDOW COST — sessions match the range on last activity, so a long-lived session carries its LIFETIME totalCost into a daily window. inWindowCost is the spend from assistant turns timestamped inside [start_time, end_time); use it for "spend in this period" (e.g. true 24h burn) and totalCost for lifetime. inWindowCost is null when no assistant turn recorded a timestamp — then the in-window share is unknown; say so rather than using totalCost as the period's spend.
 
 PER-MODEL COST — use costByModel, never attributedModels. attributedModels says WHICH models ran; it does not say how the money split. costByModel ({model: usd}, null when no turn recorded cost) is the actual per-turn allocation, so a session that ran two models contributes correctly to each rather than being double-counted or dropped. unattributedCost is the residual, on the same micro-USD basis as costByModel and totalCost: sum(costByModel) + unattributedCost reconciles to totalCost, exactly whenever there is spend left to attribute. It is null when the residual is not positive — in that case the per-model buckets already account for the whole session and may exceed totalCost by a few micro-dollars of per-turn rounding, which is noise, not missing money. Never treat a null as licence to rescale the buckets. It covers both spend on turns that recorded no model AND cost that never lands on a turn at all (tool/image spend counts toward totalCost but belongs to no model). When it is non-null the per-model split does NOT account for all of this session's cost — report it as its own line rather than folding it into a model, or your model percentages will not sum to the total.
 
@@ -2890,6 +3210,8 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
 
     // Format response — return all metadata shown in the admin Chat History tab, but exclude raw messages
     const sessions = (data as any)?.sessions || [];
+    const windowStartMs = Date.parse(args.start_time);
+    const windowEndMs = Date.parse(args.end_time);
     const formattedSessions = sessions.map((session: any) => {
       const messages: any[] = session.messages || [];
 
@@ -2925,10 +3247,22 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       // Greptile P1 (ENG-1313): the denominator for unlabelledAssistantTurns, so
       // "partial" can be quantified (N of M) rather than just flagged.
       let assistantTurnCount = 0;
+      // ENG-972: the range filter matches on last activity, so a long-lived
+      // session enters the window carrying its lifetime totalCost. Sum only the
+      // spend from assistant turns timestamped inside [start_time, end_time).
+      let inWindowCostMicro = 0;
+      let timestampedAssistantTurns = 0;
       for (const msg of messages) {
         if (msg?.role !== 'assistant') continue;
         assistantTurnCount++;
         const turnCost = msg?.usage?.estimated_cost || 0;
+        const turnMs = msg?.timestamp ? Date.parse(msg.timestamp) : NaN;
+        if (!Number.isNaN(turnMs)) {
+          timestampedAssistantTurns++;
+          if (turnMs >= windowStartMs && turnMs < windowEndMs && turnCost) {
+            inWindowCostMicro += Math.round(turnCost * 1e6);
+          }
+        }
         if (typeof msg?.llm === 'string' && msg.llm) {
           generationModels.add(msg.llm);
           if (turnCost) {
@@ -3058,6 +3392,9 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
         // Same micro-USD basis as costByModel/unattributedCost below, so the three
         // reconcile exactly rather than each being rounded independently.
         totalCost: session.totalCost != null ? Math.round(Number(session.totalCost) * 1e6) / 1e6 : null,
+        // ENG-972: spend from assistant turns inside the requested window only.
+        // Null when no assistant turn carries a timestamp (unknown, not zero).
+        inWindowCost: timestampedAssistantTurns > 0 ? inWindowCostMicro / 1e6 : null,
         satisfactionScore: session.satisfactionScore || null,
         judgeScores: session.judgeScores || null,
         // ENG-929: under sync=true, why this session does or does not have a
@@ -3308,6 +3645,25 @@ Returns one diagnosis per connected Meta ad account, each with: outcome ('determ
   }
 });
 
+// ENG-1994: the /api/lead-volume-monitor route accepts only YYYY-MM-DD. Models routinely send a
+// full ISO-8601 datetime for a schema field described as a date, which the route rejected as
+// invalid_args. Truncate a well-formed datetime to its date; anything else passes through
+// untouched so the route still fails closed with a 400 instead of being silently coerced.
+const LEAD_VOLUME_DATE_PATTERN = '^\\d{4}-\\d{2}-\\d{2}(T[0-9:.]+(Z|[+-]\\d{2}:?\\d{2})?)?$';
+const ISO_DATETIME_RE = /^(\d{4}-\d{2}-\d{2})T([01]\d|2[0-3]):[0-5]\d(:[0-5]\d(\.\d+)?)?(Z|[+-]([01]\d|2[0-3]):?[0-5]\d)?$/;
+export function normalizeLeadVolumeDate(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const str = String(value).trim();
+  const m = ISO_DATETIME_RE.exec(str);
+  if (!m) return str;
+  // Only truncate a real calendar date; otherwise pass the raw value through so the route's
+  // YYYY-MM-DD check rejects it with a 400 instead of forwarding e.g. 2025-02-31.
+  const [y, mo, d] = m[1].split('-').map(Number);
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  const real = dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
+  return real ? m[1] : str;
+}
+
 mcpToolRegistry.register({
   name: 'monitor_lead_volume',
   definition: {
@@ -3332,11 +3688,13 @@ Returns one report per connected Meta ad account for the client.
         },
         since: {
           type: 'string',
-          description: 'Optional window start, YYYY-MM-DD. Defaults to 60 days before `until`.'
+          pattern: LEAD_VOLUME_DATE_PATTERN,
+          description: 'Optional window start, YYYY-MM-DD (a full ISO-8601 datetime is truncated to its date). Must not be after `until`; the since..until window must not exceed 366 days. Defaults to 60 days before `until`.'
         },
         until: {
           type: 'string',
-          description: 'Optional window end, YYYY-MM-DD. Defaults to today.'
+          pattern: LEAD_VOLUME_DATE_PATTERN,
+          description: 'Optional window end, YYYY-MM-DD (a full ISO-8601 datetime is truncated to its date). Defaults to today.'
         }
       },
       required: ['client_name_or_email']
@@ -3344,8 +3702,10 @@ Returns one report per connected Meta ad account for the client.
   },
   execute: async (args: any, context: any) => {
     const query = new URLSearchParams();
-    if (args.since) query.set('since', args.since);
-    if (args.until) query.set('until', args.until);
+    const since = normalizeLeadVolumeDate(args.since);
+    const until = normalizeLeadVolumeDate(args.until);
+    if (since) query.set('since', since);
+    if (until) query.set('until', until);
     const qs = query.toString();
     const data = await mcpFetch({
       method: 'GET',

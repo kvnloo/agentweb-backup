@@ -2122,6 +2122,36 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
     });
 
+    it('rejects a manual test run with 503 before any claim when the instance is draining (ENG-1805)', async () => {
+      const instanceState = require('../utils/instanceState');
+      const spy = jest.spyOn(instanceState, 'isCronEnabled').mockReturnValue(false);
+      try {
+        const mockReq = {
+          user: { userId: mockUserId },
+          params: { scheduleId: mockScheduleId },
+          body: {},
+        } as unknown as Request;
+        const mockRes = {
+          json: jest.fn(),
+          status: jest.fn().mockReturnThis(),
+        } as unknown as Response;
+
+        await agentModeController.testScheduledChat(mockReq, mockRes);
+        await new Promise(resolve => setTimeout(resolve, 50));
+
+        expect(mockRes.status).toHaveBeenCalledWith(503);
+        expect(mockRes.json).toHaveBeenCalledWith(
+          expect.objectContaining({ error: expect.stringMatching(/draining/i) })
+        );
+        // Rejected before claim: no session, no worker dispatch, no failure record.
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+        expect(mockScheduleDb.addRunResult).not.toHaveBeenCalled();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
     it('should send notification email when sendNotificationEmail is true and schedule has email notifications', async () => {
       const scheduleWithEmails = {
         ...baseSchedule,

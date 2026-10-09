@@ -788,6 +788,21 @@ createTestAccount().then(async () => {
         console.error('[DomainReachability] Failed to initialize:', error);
       }
 
+      // ENG-2156: warn oncall at 80%/95% of the OpenRouter key's own monthly limit, before
+      // the cap starts 402'ing every Agent Mode call. Read-only; hourly from boot.
+      try {
+        const { runOpenRouterKeyBudgetCheck, KEY_BUDGET_INTERVAL_MS } =
+          await import('./cron/openRouterKeyBudgetCron');
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('OpenRouterKeyBudget', runOpenRouterKeyBudgetCheck())
+            .catch(e => console.error('[OpenRouterKeyBudget] Error:', e));
+        }, KEY_BUDGET_INTERVAL_MS);
+        console.log('[OpenRouterKeyBudget] Initialized — hourly');
+      } catch (error) {
+        console.error('[OpenRouterKeyBudget] Failed to initialize:', error);
+      }
+
 
       // ENG-1967: one bounded due-record page per tick. Registry drains in-flight work at shutdown.
       const { runAdsLearningEvaluation } = await import('./cron/adsLearningCron');
@@ -1502,6 +1517,41 @@ createTestAccount().then(async () => {
           }, msUntilEvalV2);
         } catch (error) {
           console.error('[EvalV2Sampler] Failed to initialize:', error);
+        }
+      }
+
+      // Shadow-judge online sampler (ENG-2128, ENG-2189, ENG-2138, ENG-2146) — daily at 18:15
+      // UTC: a seeded uniform random sample of the previous day's sessions, scored by every
+      // shadow:true custom judge in AW-Settings scoring-judges via scoreSessionWithJudgeIfNeeded.
+      // Off unless SHADOW_JUDGE_SAMPLER_ENABLED=true (enabling it in prod is an OPS decision); the
+      // run itself refuses to write without the flag. No grader this writes is validated, so it
+      // raises no alert.
+      if (process.env.SHADOW_JUDGE_SAMPLER_ENABLED === 'true') {
+        try {
+          const SHADOW_JUDGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+          const { runShadowJudgeSamplerCron } = await import('./cron/shadowJudgeSamplerCron');
+          const nowForShadowJudge = new Date();
+          const nextShadowJudgeRun = new Date(nowForShadowJudge);
+          nextShadowJudgeRun.setUTCHours(18, 15, 0, 0);
+          if (nextShadowJudgeRun <= nowForShadowJudge) {
+            nextShadowJudgeRun.setUTCDate(nextShadowJudgeRun.getUTCDate() + 1);
+          }
+          const msUntilShadowJudge = nextShadowJudgeRun.getTime() - nowForShadowJudge.getTime();
+          console.log(
+            `[ShadowJudgeSampler] Initialized — first run at 18:15 UTC (in ${Math.round(msUntilShadowJudge / 60000)} min)`,
+          );
+          setTimeout(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('ShadowJudgeSampler', runShadowJudgeSamplerCron())
+              .catch(e => console.error('[ShadowJudgeSampler] Error:', e));
+            setInterval(() => {
+              if (!isCronEnabled()) return;
+              cronJobRegistry.track('ShadowJudgeSampler', runShadowJudgeSamplerCron())
+                .catch(e => console.error('[ShadowJudgeSampler] Error:', e));
+            }, SHADOW_JUDGE_INTERVAL_MS);
+          }, msUntilShadowJudge);
+        } catch (error) {
+          console.error('[ShadowJudgeSampler] Failed to initialize:', error);
         }
       }
 

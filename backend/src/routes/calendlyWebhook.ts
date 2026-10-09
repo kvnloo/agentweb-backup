@@ -443,14 +443,31 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
             },
             leadId: deterministicLeadId,
             failIfExists: true,
-          });
+          }, 'booking');
           eventType = 'created';
         } catch (err: any) {
-          if (!err?.leadAlreadyExists) throw err;
-          const winningLead = await crmDb.getLeadById(listId, deterministicLeadId);
-          if (!winningLead) throw err;
-          lead = await stampBookedFields(winningLead);
-          eventType = 'updated';
+          if (err?.duplicateEmail && err.existingLead) {
+            // createLead's own email-index pre-check (we did not pass skipEmailDuplicateCheck, on
+            // purpose: a row under a DIFFERENT leadId must be adopted, not duplicated by a second
+            // deterministic-id row) found a lead our first lookup missed — the GSI is eventually
+            // consistent, or a concurrent create landed. That error has no `leadAlreadyExists`, so
+            // it used to be rethrown and fail the booking job. Adopt it exactly as the
+            // existing-lead branch above does, honouring the same per-booking idempotency.
+            const dupLead = err.existingLead;
+            if (dupLead.customFields?.lastBookingUri === payload.uri || dupLead.customFields?.bookingUri === payload.uri) {
+              lead = dupLead;
+              eventType = dupLead.customFields?.bookingUri === payload.uri ? 'created' : 'updated';
+            } else {
+              lead = await stampBookedFields(dupLead);
+              eventType = 'updated';
+            }
+          } else {
+            if (!err?.leadAlreadyExists) throw err;
+            const winningLead = await crmDb.getLeadById(listId, deterministicLeadId);
+            if (!winningLead) throw err;
+            lead = await stampBookedFields(winningLead);
+            eventType = 'updated';
+          }
         }
       }
 

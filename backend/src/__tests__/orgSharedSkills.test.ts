@@ -387,7 +387,7 @@ describe("DELETE /api/user-skills/:skillId — owner or org-owner may delete; ed
     const res = await request(orgOwnerApp).delete("/api/user-skills/skill-2");
 
     expect(res.status).toBe(200);
-    expect(mockDeleteSkill).toHaveBeenCalledWith("skill-2");
+    expect(mockDeleteSkill).toHaveBeenCalledWith("skill-2", expect.objectContaining({ ownerId: expect.any(String) }));
   });
 
   it("skill owner can delete their own skill", async () => {
@@ -397,7 +397,7 @@ describe("DELETE /api/user-skills/:skillId — owner or org-owner may delete; ed
     const res = await request(app).delete("/api/user-skills/skill-1");
 
     expect(res.status).toBe(200);
-    expect(mockDeleteSkill).toHaveBeenCalledWith("skill-1");
+    expect(mockDeleteSkill).toHaveBeenCalledWith("skill-1", expect.objectContaining({ ownerId: expect.any(String) }));
   });
 });
 

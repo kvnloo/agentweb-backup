@@ -2,9 +2,10 @@
  * ENG-2282 — Meta Toolkit v1 manifest for external agents (ENG-2268 child 2).
  *
  * Exposes ONLY the v1 Meta tools defined in docs/integrations/meta-toolkit-product.md §4
- * (ENG-2281) as MCP-compatible tool definitions. It is a pure filter over the Emma tool
- * registry. It never re-implements a handler, so a call goes through the same
- * `registry.execute` → `agentModeService.callMetaMarketingApi` path that Emma uses,
+ * (ENG-2281) as MCP-compatible tool definitions. It is a pure filter over the Meta-only
+ * registry in emma/metaTools, which holds the same handler objects Emma registers, so the
+ * full Emma registry is never imported. It never re-implements a handler, so a call goes
+ * through the same `registry.execute` → `agentModeService.callMetaMarketingApi` path that Emma uses,
  * and every ENG-2046-family write guard (approval deck, money normalization, anomaly
  * gate, rate shaper, tracking pre-flight) stays in the path. There is no bypass.
  *
@@ -12,7 +13,7 @@
  * they are refused at call time. A caller that ignores the schema still cannot reach an
  * excluded action.
  */
-import { emmaToolRegistry } from '../emma/registry';
+import { metaToolRegistry } from '../emma/metaTools';
 import type { McpToolRegistry } from './server/registry';
 
 export const META_TOOLKIT_V1_TOOL_NAMES = [
@@ -24,12 +25,10 @@ export const META_TOOLKIT_V1_TOOL_NAMES = [
 
 export type MetaToolkitToolName = (typeof META_TOOLKIT_V1_TOOL_NAMES)[number];
 
-/** call_meta_marketing_api actions allowed in v1 (§4). DELETE, uploads, COPY_AD, RETAG_UTM are excluded. */
-export const META_TOOLKIT_V1_ACTIONS = ['LIST', 'GET', 'PREVIEW', 'CREATE', 'UPDATE', 'SEARCH', 'GET_MATCH_QUALITY'] as const;
+/** ENG-2268 D2: external v1 is reads-only, regardless of plan or granted Meta scopes. */
+export const META_TOOLKIT_V1_ACTIONS = ['LIST', 'GET', 'PREVIEW', 'SEARCH', 'GET_MATCH_QUALITY'] as const;
 
-const READ_ACTIONS = new Set(['LIST', 'GET', 'PREVIEW', 'SEARCH', 'GET_MATCH_QUALITY']);
-/** Guarded writes in v1: only CAMPAIGN / AD_SET / AD CREATE + UPDATE (deck-gated path). */
-const GUARDED_WRITE_ENTITIES = new Set(['CAMPAIGN', 'AD_SET', 'AD']);
+const READ_ACTIONS = new Set<string>(META_TOOLKIT_V1_ACTIONS);
 
 export class MetaToolkitRefusal extends Error {
   constructor(message: string) {
@@ -49,6 +48,7 @@ function narrowDefinition(definition: any): any {
     // client_id is admin-only cross-client access: internal only (§4).
     delete props.client_id;
     if (def.name === 'call_meta_marketing_api') {
+      def.description = "Read-only Meta Marketing API for external agents. Actions: LIST, GET, PREVIEW, SEARCH, GET_MATCH_QUALITY. All writes are excluded from v1.";
       if (props.action?.enum) props.action.enum = [...META_TOOLKIT_V1_ACTIONS];
       // The waiver replay is not wired through the deck flow (§4).
       if (props.params?.properties) delete props.params.properties.override_tracking_check;
@@ -65,7 +65,7 @@ function narrowDefinition(definition: any): any {
  * Fails loudly when a v1 tool is missing from the registry. A silently shorter
  * manifest would read as a product change.
  */
-export function getMetaToolkitManifest(registry: McpToolRegistry = emmaToolRegistry) {
+export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegistry) {
   return META_TOOLKIT_V1_TOOL_NAMES.map((name) => {
     const tool = registry.getTool(name);
     if (!tool) throw new Error(`Meta Toolkit manifest: tool ${name} is not registered`);
@@ -89,7 +89,6 @@ export function assertMetaToolkitV1Call(name: string, args: any): void {
     throw new MetaToolkitRefusal('override_tracking_check is not available to external Meta Toolkit callers.');
   }
   if (READ_ACTIONS.has(action)) return;
-  if ((action === 'CREATE' || action === 'UPDATE') && GUARDED_WRITE_ENTITIES.has(entity)) return;
   throw new MetaToolkitRefusal(`${entity} ${action} is not part of the Meta Toolkit v1 surface.`);
 }
 
@@ -103,7 +102,7 @@ export async function executeMetaToolkitCall(
   name: string,
   args: any,
   context: { userId: string; sessionId?: string; [k: string]: unknown },
-  registry: McpToolRegistry = emmaToolRegistry,
+  registry: McpToolRegistry = metaToolRegistry,
 ) {
   if (!context?.userId) throw new MetaToolkitRefusal('Meta Toolkit calls require an authenticated user.');
   assertMetaToolkitV1Call(name, args);

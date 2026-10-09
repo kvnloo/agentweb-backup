@@ -55,6 +55,10 @@ import { emmaToolRegistry } from '../emma/registry';
 import '../emma/tools'; // side-effect: registers call_meta_marketing_api + generate_image
 import { metaService } from '../services/metaService';
 import { agentModeService } from '../services/agentModeService';
+// ENG-2103 (F2 design-decision-list follow-up, Pattern A): generate_image's
+// tool handler now calls emma/impl/mediaVideo.ts's generateImage directly,
+// not agentModeService.generateImage.
+import * as mediaVideoImpl from '../emma/impl/mediaVideo';
 
 const ctx = { userId: 'user123', sessionId: 'sess1' } as any;
 
@@ -156,8 +160,11 @@ describe('emma tool handlers wire args into the confirmation gate', () => {
     const defaultSpy = jest
       .spyOn(agentModeService, 'getImageApiDefaultModel')
       .mockResolvedValue('gemini-3.1-flash-image-preview');
+    // ENG-2103 (F2 design-decision-list follow-up, Pattern A): the tool now
+    // calls emma/impl/mediaVideo.ts's generateImage directly, not
+    // agentModeService.generateImage.
     const genSpy = jest
-      .spyOn(agentModeService, 'generateImage')
+      .spyOn(mediaVideoImpl, 'generateImage')
       .mockResolvedValue({ success: true } as any);
 
     await emmaToolRegistry.execute('generate_image', {
@@ -195,8 +202,11 @@ describe('emma tool handlers wire args into the confirmation gate', () => {
   });
 
   it('generate_image: threads the declared category through to the service', async () => {
+    // ENG-2103 (F2 design-decision-list follow-up, Pattern A): the tool now
+    // calls emma/impl/mediaVideo.ts's generateImage directly, not
+    // agentModeService.generateImage.
     const genSpy = jest
-      .spyOn(agentModeService as any, 'generateImage')
+      .spyOn(mediaVideoImpl as any, 'generateImage')
       .mockResolvedValue({ success: true, imageUrl: 'https://cdn.example.com/x.png' });
 
     await emmaToolRegistry.execute('generate_image', {

@@ -1,58 +1,57 @@
 #!/usr/bin/env python3
-"""Behavioral + guard tests for retiring the stale Veo video model ID from web_agent.py,
-and for a related scoping bug (ENG-1122) it unmasked.
+"""Behavioral + guard tests for the Google video model used by web_agent.py,
+and for a related scoping bug (ENG-1122).
 
-web_agent.py hardcoded model="veo-3.0-generate-preview" for Google Veo video
-generation. That model ID is retired -- a live video-gen task hit an
-uncaught 404 NOT_FOUND from the Veo API (ENG-1070), never reproduced
-earlier because prior manual testing exercised the kling-v2.1-std path
-instead of this Veo default. The backend (videoGeneration.ts,
-agentModeService.ts, llmPricing.ts, emma/tools.ts) had already migrated to
-veo-3.1-generate-preview; web_agent.py was the only place still on the
-retired ID.
+History: web_agent.py once hardcoded the retired "veo-3.0-generate-preview"
+(404 NOT_FOUND, ENG-1070) and was moved to veo-3.1-generate-preview behind a
+single constant. Google then shut down every Veo preview model on 2026-10-22;
+the replacement, gemini-omni-1.1-flash, is served ONLY by the Gemini
+Interactions API (POST /v1beta/interactions), synchronously returning the clip
+as base64 in steps[].content[]. web_agent.py now builds that request with the
+pure helper build_omni_interaction_body() and parses the response with
+extract_omni_video_base64(). Retired Veo ids stored on old tasks are accepted
+and resolve to the Omni model.
 
-The fix also extracted the previously-duplicated model ID and config-dict
-construction (repeated once per branch: image-to-video, text-to-video) into
-a single VEO_MODEL_ID constant and a pure build_veo_config_params() helper,
-so a future Google retirement only needs updating in one place. Both are
-dependency-free (no browser_use/langchain/pydantic/boto3 import needed),
-which is what makes them directly unit-testable here: web_agent.py's
-top-level imports pull in the full agent-engine conda environment
-(browser-use, langchain-aws, playwright deps, ...), none of which is
-installed in this stripped-down CI/dev box (no conda, no pip even).
-Rather than hand-mock that whole chain -- fragile, and liable to pass for
-the wrong reasons -- these tests extract just the two new definitions via
-a line-range slice of the real source and exec it in isolation.
+The helpers are dependency-free (no browser_use/langchain/pydantic/boto3
+import needed), which is what makes them directly unit-testable here:
+web_agent.py's top-level imports pull in the full agent-engine conda
+environment, none of which is installed in this stripped-down box. Rather
+than hand-mock that whole chain, these tests extract just the helper block
+via a line-range slice of the real source and exec it in isolation.
 
-ENG-1122: fixing the 404 let a live task execute further into
-generate_short_video and immediately hit a second, previously-masked bug --
-UnboundLocalError on 'time'. The kling-v2.1-std branch had a redundant
-`import time` (plus `requests`/`json`/`uuid`) that, despite never executing
-on the Veo path, statically made those names local to the *entire*
-enclosing closure per Python's scoping rules -- breaking every reference to
-them elsewhere in the same function, including the Veo branch's
-`time.sleep()` polling loop. All four are unambiguous stdlib names already
-imported at module level, so the fix is to delete the redundant locals.
+ENG-1122: a redundant `import time` inside one branch of
+generate_short_video statically made `time` local to the *entire* enclosing
+closure per Python's scoping rules, breaking every other branch's use of it.
+The guard below keeps any such local re-binding from coming back.
 """
+import base64
 import os
 import unittest
 from typing import Optional
 
 AGENT_ENGINE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STALE_MODEL = "veo-3.0-generate-preview"
-CURRENT_MODEL = "veo-3.1-generate-preview"
+CURRENT_MODEL = "gemini-omni-1.1-flash"
+RETIRED_MODELS = (
+    "veo-3.1-generate-preview",
+    "veo-3.1-fast-generate-preview",
+    "veo-3-generate-preview",
+    "veo-3.0-generate-preview",
+)
 
-# web_agent.py as a whole requires Python 3.12+ (an unrelated pre-existing
-# f-string uses a backslash in the expression part, invalid before 3.12) and
-# a full conda environment (browser-use, langchain-aws, boto3, ...) neither
-# of which is available in this stripped-down box. VEO_MODEL_ID and
-# build_veo_config_params are self-contained and 3.9-compatible, so rather
-# than parse/import the whole module, extract just this line range (the
-# block runs from the VEO_MODEL_ID assignment up to, but not including, the
-# next top-level definition) and exec it in isolation -- tests the actual
-# source text of the fix, not a reimplementation of it.
-_START_MARKER = 'VEO_MODEL_ID = "veo-3.1-generate-preview"'
+# web_agent.py as a whole requires Python 3.12+ and a full conda environment.
+# The helper block is self-contained, so extract just this line range (from
+# the OMNI_VIDEO_MODEL_ID assignment up to, but not including, the next
+# top-level definition) and exec it in isolation -- tests the actual source
+# text, not a reimplementation of it.
+_START_MARKER = 'OMNI_VIDEO_MODEL_ID = "gemini-omni-1.1-flash"'
 _END_MARKER = "class LogFilterThread(threading.Thread):"
+_HELPERS = (
+    "OMNI_VIDEO_MODEL_ID",
+    "GEMINI_INTERACTIONS_URL",
+    "LEGACY_GOOGLE_VIDEO_MODEL_IDS",
+    "build_omni_interaction_body",
+    "extract_omni_video_base64",
+)
 
 
 def _load_web_agent_video_helpers():
@@ -64,16 +63,15 @@ def _load_web_agent_video_helpers():
     end = source.find(_END_MARKER)
     if start == -1 or end == -1 or end <= start:
         raise AssertionError(
-            "web_agent.py no longer has the expected VEO_MODEL_ID / "
-            "build_veo_config_params block in its usual location "
-            "(ENG-1070 extraction refactor was reverted, renamed, or moved)"
+            "web_agent.py no longer has the expected OMNI_VIDEO_MODEL_ID helper "
+            "block in its usual location (renamed or moved)"
         )
 
     snippet = source[start:end]
     namespace = {"Optional": Optional}
-    exec(compile(snippet, filename=f"{path} (VEO_MODEL_ID slice)", mode="exec"), namespace)
+    exec(compile(snippet, filename=f"{path} (OMNI_VIDEO_MODEL_ID slice)", mode="exec"), namespace)
 
-    for name in ("VEO_MODEL_ID", "build_veo_config_params"):
+    for name in _HELPERS:
         if name not in namespace:
             raise AssertionError(f"web_agent.py no longer defines {name} in the expected location")
     return namespace
@@ -104,94 +102,92 @@ def _read_generate_short_video_closure():
     return "".join(lines[start_idx:end_idx])
 
 
-class TestVeoConfigParamsBehavior(unittest.TestCase):
-    """Behavioral coverage for build_veo_config_params(), extracted from the real source."""
+class TestOmniInteractionBody(unittest.TestCase):
+    """Behavioral coverage for the Interactions API request built by web_agent.py."""
 
     @classmethod
     def setUpClass(cls):
         ns = _load_web_agent_video_helpers()
-        cls.VEO_MODEL_ID = ns["VEO_MODEL_ID"]
-        cls.build_veo_config_params = staticmethod(ns["build_veo_config_params"])
+        cls.ns = ns
+        cls.build = staticmethod(ns["build_omni_interaction_body"])
+        cls.extract = staticmethod(ns["extract_omni_video_base64"])
 
-    def test_uses_the_live_model_id_not_the_retired_one(self):
-        """Successful-path fact: the constant must be the live ID."""
-        self.assertEqual(self.VEO_MODEL_ID, CURRENT_MODEL)
-        self.assertNotEqual(self.VEO_MODEL_ID, STALE_MODEL)
-
-    def test_default_call_with_no_negative_prompt(self):
-        """Successful generation path: no negative_prompt -> just aspect_ratio + count."""
-        params = self.build_veo_config_params()
-        self.assertEqual(params, {"aspect_ratio": "16:9", "number_of_videos": 1})
-
-    def test_with_a_real_negative_prompt(self):
-        """Boundary: a truthy negative_prompt is included verbatim."""
-        params = self.build_veo_config_params("no text overlays")
+    def test_model_and_endpoint_are_the_live_omni_interactions_api(self):
+        self.assertEqual(self.ns["OMNI_VIDEO_MODEL_ID"], CURRENT_MODEL)
         self.assertEqual(
-            params,
-            {"aspect_ratio": "16:9", "number_of_videos": 1, "negative_prompt": "no text overlays"},
+            self.ns["GEMINI_INTERACTIONS_URL"],
+            "https://generativelanguage.googleapis.com/v1beta/interactions",
         )
 
-    def test_explicit_none_negative_prompt_is_omitted(self):
-        """Invalid/edge input: explicit None must not add a None-valued key."""
-        params = self.build_veo_config_params(None)
-        self.assertNotIn("negative_prompt", params)
+    def test_retired_veo_ids_are_listed_as_legacy_aliases(self):
+        self.assertEqual(set(self.ns["LEGACY_GOOGLE_VIDEO_MODEL_IDS"]), set(RETIRED_MODELS))
 
-    def test_empty_string_negative_prompt_is_omitted(self):
-        """Boundary: an empty string is falsy and must not add an empty key
-        (this mirrors the source's `if params.negative_prompt:` truthy check --
-        an empty string would otherwise silently pass a blank constraint to the API)."""
-        params = self.build_veo_config_params("")
-        self.assertNotIn("negative_prompt", params)
+    def test_text_to_video_sends_the_prompt_as_a_plain_string(self):
+        body = self.build("a cat surfing")
+        self.assertEqual(body, {
+            "model": CURRENT_MODEL,
+            "input": "a cat surfing",
+            "response_format": {"type": "video", "aspect_ratio": "16:9", "resolution": "720p"},
+        })
 
-    def test_whitespace_only_negative_prompt_is_included(self):
-        """Boundary: whitespace-only is truthy in Python, so (matching the
-        source's exact truthy check, not stricter validation this fix doesn't
-        add) it is passed through rather than silently dropped."""
-        params = self.build_veo_config_params("   ")
-        self.assertEqual(params.get("negative_prompt"), "   ")
+    def test_image_to_video_sends_the_image_part_before_the_text_part(self):
+        body = self.build("animate it", image_b64="QUJD", image_mime_type="image/png")
+        self.assertEqual(body["input"], [
+            {"type": "image", "data": "QUJD", "mime_type": "image/png"},
+            {"type": "text", "text": "animate it"},
+        ])
 
-    def test_aspect_ratio_and_count_are_always_present_and_fixed(self):
-        """Aspect ratio and video count are Veo 3's fixed constraints, not
-        caller-configurable -- must hold regardless of negative_prompt."""
-        for negative_prompt in (None, "", "avoid X"):
-            params = self.build_veo_config_params(negative_prompt)
-            self.assertEqual(params["aspect_ratio"], "16:9")
-            self.assertEqual(params["number_of_videos"], 1)
+    def test_image_without_mime_type_defaults_to_jpeg(self):
+        body = self.build("x", image_b64="QUJD")
+        self.assertEqual(body["input"][0]["mime_type"], "image/jpeg")
+
+    def test_negative_prompt_is_folded_into_the_text(self):
+        self.assertEqual(self.build("a beach", negative_prompt="no people")["input"],
+                         "a beach\n\nAvoid: no people")
+
+    def test_empty_negative_prompt_is_ignored(self):
+        self.assertEqual(self.build("a beach", negative_prompt="")["input"], "a beach")
+
+    def test_extracts_base64_video_from_completed_steps(self):
+        data = base64.b64encode(b"mp4-bytes").decode()
+        response = {
+            "id": "i1", "status": "completed",
+            "steps": [
+                {"type": "thought", "content": [{"type": "text", "text": "planning"}]},
+                {"type": "model_output", "content": [{"type": "video", "mime_type": "video/mp4", "data": data}]},
+            ],
+        }
+        self.assertEqual(self.extract(response), data)
+
+    def test_returns_none_when_not_completed_or_no_video(self):
+        self.assertIsNone(self.extract({"status": "failed", "steps": []}))
+        self.assertIsNone(self.extract({"status": "completed", "steps": [{"content": [{"type": "text", "text": "no"}]}]}))
+        self.assertIsNone(self.extract({"status": "completed"}))
+        self.assertIsNone(self.extract(None))
 
 
-class TestNoStaleVeoModelReferences(unittest.TestCase):
-    """Source guards: the retired Veo model ID must not come back, and both
-    generate_videos() call sites and the default fallback must reference the
-    single VEO_MODEL_ID constant rather than duplicating the literal."""
+class TestNoRetiredGoogleVideoModelCalls(unittest.TestCase):
+    """Source guards: no retired Veo id may be called, the SDK generate_videos
+    path must not come back, and the default resolves to the Omni constant."""
 
     def _read(self, rel_path):
         with open(os.path.join(AGENT_ENGINE_DIR, rel_path), "r") as f:
             return f.read()
 
-    def test_web_agent_has_no_stale_veo_model_string(self):
+    def test_retired_ids_appear_only_in_the_legacy_alias_tuple(self):
         src = self._read("web_agent.py")
-        self.assertNotIn(
-            STALE_MODEL, src,
-            "web_agent.py regressed to the retired Veo model ID "
-            f"'{STALE_MODEL}' (404 NOT_FOUND on the live API, ENG-1070)",
-        )
+        for model in RETIRED_MODELS:
+            with self.subTest(model=model):
+                self.assertEqual(src.count(f'"{model}"'), 1,
+                                 f"{model} must only appear in LEGACY_GOOGLE_VIDEO_MODEL_IDS")
 
-    def test_web_agent_generate_videos_calls_use_the_shared_constant(self):
-        src = self._read("web_agent.py")
-        occurrences = src.count("model=VEO_MODEL_ID")
-        self.assertEqual(
-            occurrences, 2,
-            "expected both generate_videos() calls (image-to-video and "
-            f"text-to-video branches) to pass model=VEO_MODEL_ID, found {occurrences}",
-        )
+    def test_sdk_generate_videos_path_is_gone(self):
+        self.assertNotIn("generate_videos(", self._read("web_agent.py"))
 
-    def test_web_agent_default_video_model_fallback_uses_the_shared_constant(self):
+    def test_default_and_legacy_ids_resolve_to_the_omni_constant(self):
         src = self._read("web_agent.py")
-        self.assertIn(
-            "self.video_model or VEO_MODEL_ID", src,
-            "the default video_model fallback must reference VEO_MODEL_ID, "
-            "not a duplicated literal",
-        )
+        self.assertIn("self.video_model or OMNI_VIDEO_MODEL_ID", src)
+        self.assertIn("if video_model in LEGACY_GOOGLE_VIDEO_MODEL_IDS:", src)
 
 
 def _find_locally_bound_names(closure_src):
@@ -237,7 +233,7 @@ class TestNoRedundantLocalImportsInVideoClosure(unittest.TestCase):
     its body -- even in a branch that never executes on a given code path --
     so a redundant local import here silently breaks every other branch's
     use of the same name. This regressed once already (time, inside the
-    unrelated kling-v2.1-std branch, broke the Veo branch's time.sleep()
+    unrelated kling-v2.1-std branch, broke the then-Veo branch's time.sleep()
     polling loop)."""
 
     # Names already available module-wide in web_agent.py (see its top-level
@@ -297,11 +293,10 @@ class TestNoRedundantLocalImportsInVideoClosure(unittest.TestCase):
         )
         self.assertIn("time", _find_locally_bound_names(fake_closure))
 
-    def test_time_sleep_is_still_called_in_the_veo_polling_loop(self):
+    def test_time_sleep_is_still_called_in_the_closure(self):
         """Guard the guard: confirm the assertion above isn't vacuously true
-        because the polling loop itself was removed."""
-        self.assertIn("time.sleep(20)", self.closure_src)
-
+        because every polling loop using `time` was removed."""
+        self.assertIn("time.sleep(", self.closure_src)
 
 if __name__ == "__main__":
     unittest.main()

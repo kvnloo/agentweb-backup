@@ -209,7 +209,7 @@ export async function enrollSignupIntoFoundersList(
       tenantId: FOUNDERS_USERID,
       accountOwnerUserId: FOUNDERS_USERID,
       ...(Object.keys(attributionFields).length > 0 && { customFields: attributionFields }),
-    });
+    }, 'integration');
 
     return {
       enrolled: true,
@@ -218,6 +218,17 @@ export async function enrollSignupIntoFoundersList(
       leadId: (lead as any).leadId,
     };
   } catch (err: any) {
+    // Lost a race to a concurrent enrolment of the same address (createLead's pre-check found
+    // the row after our own lookup missed): the signup IS in the list, which is exactly what
+    // 'already_in_list' reports — not an error.
+    if (err?.duplicateEmail && err.existingLead?.leadId) {
+      return {
+        enrolled: false,
+        reason: 'already_in_list',
+        leadId: err.existingLead.leadId,
+        ...(err.existingLead.listId ? { listId: err.existingLead.listId } : {}),
+      };
+    }
     logger.error(
       '[signupAutoEnroll] failed to enrol signup into founders list:',
       err?.message || err

@@ -109,6 +109,15 @@ const ALLOWLIST = new Set<string>([
   // agentModeService: every client funnels through callLLM, which has a
   // recordUsage hook — constructions here are metered without the factory.
   'services/agentModeService.ts',
+  // emma/impl/searchResearch.ts (ENG-2103 F2 extraction, pre-existing capability
+  // unchanged by the move): performDataAnalysis's Gemini code-execution client
+  // is not a text/chat call routable through the OpenRouter gateway — it needs
+  // Gemini's own sandboxed code-execution tool to analyze uploaded CSV/data
+  // files. Independently metered via meterUsageFromResponse (utils/llmClients.ts),
+  // same non-factory-but-still-metered shape as videoGeneration.ts below. This
+  // call site used to be covered by the broad agentModeService.ts entry above
+  // before the extraction; scoping it to this file is narrower, not new.
+  'emma/impl/searchResearch.ts',
   // liveVoiceService: Gemini Live WebSocket (ai.live.connect) — not wrapped by
   // the factory; usage recorded directly from usageMetadata in
   // handleIncomingMessage. Module-level singleton is intentional.
@@ -272,6 +281,17 @@ describe('SDK construction guard', () => {
       }
     }
     expect(stale).toEqual([]);
+  });
+
+  it('does not retain unreachable AgentMode text-provider adapter remnants after gateway cutover', () => {
+    const agentModeSource = fs.readFileSync(path.join(SRC_ROOT, 'services/agentModeService.ts'), 'utf8');
+
+    // These only supported the deleted Vertex Claude text adapter. Keeping them
+    // makes a future direct-provider revival look supported even though every
+    // text/tool request now crosses the OpenRouter gateway.
+    expect(agentModeSource).not.toContain('vertex_client');
+    expect(agentModeSource).not.toContain('vertex_client_promise');
+    expect(agentModeSource).not.toContain('convertContentToAnthropicBlocks');
   });
 });
 

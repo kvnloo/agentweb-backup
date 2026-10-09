@@ -4,6 +4,8 @@
  */
 
 import { usageRecordDb, UsageRecordRow, isVendorEntry } from "./usageRecordDb";
+import { listSpendEventsBounded } from "./spendEventDb";
+import { isLlmSpendEvent, LLM_SPEND_LEDGER_STARTED_ON } from "./spendLedgerDualWrite";
 import { userDb, orgDb, User } from "./db";
 import type { OrgRole } from "./orgAuthz";
 import { getAccountById } from "./connectedAccountsDb";
@@ -45,16 +47,6 @@ export interface UserUsageByModelDay {
     costMicroUsd: number;
     costUsd: number;
   };
-}
-
-export interface UsageComparison {
-  userId: string;
-  month: string;
-  /** Totals from the new shadow table (AW-UsageRecords). */
-  shadow: { totalTokens: number; costUsd: number; callCount: number };
-  /** Totals from the legacy AW-Users.tokenUsage monthly counter. */
-  legacy: { totalTokens: number; costUsd: number; source: "current" | "history" | "none" };
-  delta: { totalTokens: number; costUsd: number };
 }
 
 function toRow(item: UsageRecordRow): ModelDayUsageRow {
@@ -120,64 +112,6 @@ export async function getUserUsageByModelDay(
   totals.costUsd = totals.costMicroUsd / 1_000_000;
 
   return { userId, start, end, rows, totals };
-}
-
-/**
- * Compare the shadow table's monthly totals against the legacy
- * AW-Users.tokenUsage monthly counter, for one user and one YYYY-MM month.
- */
-export async function getUsageComparison(
-  userId: string,
-  month: string
-): Promise<UsageComparison> {
-  if (!MONTH_RE.test(month)) {
-    throw new Error("month must be YYYY-MM");
-  }
-
-  const items = await usageRecordDb.queryByUserDateRange(userId, `${month}-01`, `${month}-31`);
-  const shadow = items.reduce(
-    (acc, item) => {
-      acc.totalTokens += item.totalTokens || 0;
-      acc.costMicroUsd += item.costMicroUsd || 0;
-      acc.callCount += item.callCount || 0;
-      return acc;
-    },
-    { totalTokens: 0, costMicroUsd: 0, callCount: 0 }
-  );
-
-  // Legacy counter: current month lives on tokenUsage; past months in history.
-  let legacy: UsageComparison["legacy"] = { totalTokens: 0, costUsd: 0, source: "none" };
-  const user = await userDb.getUserById(userId);
-  if (user?.tokenUsage?.month === month) {
-    legacy = {
-      totalTokens: user.tokenUsage.totalTokens || 0,
-      costUsd: user.tokenUsage.totalCost || 0,
-      source: "current",
-    };
-  } else {
-    const hist = (user?.tokenUsageHistory || []).find(
-      (h: { month: string; totalTokens: number; totalCost: number }) => h.month === month
-    );
-    if (hist) {
-      legacy = {
-        totalTokens: hist.totalTokens || 0,
-        costUsd: hist.totalCost || 0,
-        source: "history",
-      };
-    }
-  }
-
-  const shadowCostUsd = shadow.costMicroUsd / 1_000_000;
-  return {
-    userId,
-    month,
-    shadow: { totalTokens: shadow.totalTokens, costUsd: shadowCostUsd, callCount: shadow.callCount },
-    legacy,
-    delta: {
-      totalTokens: shadow.totalTokens - legacy.totalTokens,
-      costUsd: shadowCostUsd - legacy.costUsd,
-    },
-  };
 }
 
 // ── ENG-366: cross-user cost aggregation (backend slice of ENG-353) ──────────
@@ -723,12 +657,12 @@ export interface OrgUsageRollup {
   selectedRole: OrgRole | null;
   /** Total real burn across all members (shadow table). */
   grossBurnUsd: number;
-  /** Amount charged to the org quota = the OWNER's monthly counter. */
+  /** Amount charged to the org's cap: the OWNER's LLM spend from the ledger (archived counter history for months before the ledger). */
   countedUsd: number;
   countedSource: "current" | "history" | "none";
   /** Burn not charged to quota: burn-only features + usage predating per-call tracking. */
   unchargedUsd: number;
-  /** counted / gross * 100 (0 when gross is 0). Can exceed 100 when the counter runs ahead. */
+  /** counted / gross * 100 (0 when gross is 0). Can exceed 100 when the ledger runs ahead of the usage records. */
   coveragePct: number;
   /** Per-member burn, sorted by burn desc. */
   members: OrgRollupMember[];
@@ -772,16 +706,54 @@ function aggregateBurn(rows: UsageRecordRow[]): {
   return { costMicroUsd, callCount, totalTokens, byModel: models };
 }
 
-/** The dollar amount charged to a user's quota counter for a month (current or history). */
-function counterForMonth(
-  user: User | null,
-  month: string
-): { costUsd: number; source: "current" | "history" | "none" } {
-  if (user?.tokenUsage?.month === month) {
-    return { costUsd: user.tokenUsage.totalCost || 0, source: "current" };
+/**
+ * A month's ledger read is bounded so the admin modal can never page through an
+ * unbounded range, and it FAILS rather than report a truncated total (a truncated
+ * aggregate is a wrong aggregate).
+ */
+const ROLLUP_LEDGER_MAX_EVENTS = 50_000;
+
+/**
+ * The LLM dollars charged to the org's cap for a month: the OWNER's spend ledger.
+ *
+ * This used to read the owner's legacy `AW-Users.tokenUsage` counter. ENG-1250 AC7
+ * retires that counter and the cap now enforces on the ledger, so the number that
+ * "counted against the cap" is read from where it is now produced. It stays LLM-only
+ * (token + per-generation units) because this rollup's gross burn is LLM-only, so
+ * both sides of the coverage ratio measure the same thing.
+ *
+ * Months up to and including the one the LLM ledger started in (2026-09) are not fully
+ * covered by it, so they keep reading the archived counter history: frozen, complete
+ * pre-retirement data, and exactly what this modal showed for them before.
+ */
+async function countedForMonth(
+  owner: User,
+  month: string,
+  start: string,
+  end: string,
+): Promise<{ costUsd: number; source: "current" | "history" | "none" }> {
+  const fullyCoveredByLedger = month > LLM_SPEND_LEDGER_STARTED_ON.slice(0, 7);
+  if (fullyCoveredByLedger) {
+    const read = await listSpendEventsBounded(owner.userId, start, end, ROLLUP_LEDGER_MAX_EVENTS);
+    if (read.exceeded) {
+      throw new Error(
+        `ledger for ${owner.userId} ${month} has more than ${ROLLUP_LEDGER_MAX_EVENTS} events; refusing to report a truncated total`,
+      );
+    }
+    const llm = read.events.filter((e) => e.lifecycle === "settled" && isLlmSpendEvent(e));
+    // The ledger is authoritative for these months, so no settled events means $0, not "fall back
+    // to the archived counter" (which can hold charges the ledger never saw if dual-write was off).
+    return {
+      costUsd: llm.reduce((sum, e) => sum + Math.max(0, e.costMicroUsd || 0), 0) / 1_000_000,
+      source: "current",
+    };
   }
-  const hist = (user?.tokenUsageHistory || []).find((h) => h.month === month);
+  const hist = (owner.tokenUsageHistory || []).find((h) => h.month === month);
   if (hist) return { costUsd: hist.totalCost || 0, source: "history" };
+  // A month is archived into tokenUsageHistory only by the first counter write of the NEXT month. The
+  // counter writes have stopped (ENG-1250 AC7), so an account with no activity in between still holds
+  // that month as its current, frozen counter: use it rather than report nothing.
+  if (owner.tokenUsage?.month === month) return { costUsd: owner.tokenUsage.totalCost || 0, source: "history" };
   return { costUsd: 0, source: "none" };
 }
 
@@ -843,7 +815,7 @@ export async function getUserOrgUsageRollup(
   const orgAgg = aggregateBurn(perMember.flatMap((pm) => pm.rows));
   const grossBurnUsd = orgAgg.costMicroUsd / 1_000_000;
 
-  const counted = counterForMonth(ownerUser, month);
+  const counted = await countedForMonth(ownerUser, month, start, end);
   const unchargedUsd = Math.max(0, grossBurnUsd - counted.costUsd);
   const coveragePct = grossBurnUsd > 0 ? (counted.costUsd / grossBurnUsd) * 100 : 0;
 

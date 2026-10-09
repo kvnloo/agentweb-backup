@@ -26,6 +26,8 @@ interface User {
   createdAt: string;
   lastLoginTime?: string;
   lastActiveAt?: string;
+  /** ENG-1271: derived customer-vs-staff activity signal from GET /api/admin/users. */
+  selfActivity?: { selfActiveRecently: boolean; lastSelfActiveAt: string | null; staffOperatedSuspect: boolean } | null;
   displayName?: string;
   funnelStatus?: string | null;
   supportNote?: string;
@@ -57,6 +59,8 @@ interface User {
   productDomain?: string; // Product site domain for feature usage tracking
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   subscriptionType?: string; // Subscription type for customer portal users
+  /** Settled spend this month from the spend ledger (ENG-1250 AC7); absent if the lookup failed. */
+  spendThisMonthUsd?: number;
   tokenUsage?: {
     month: string;
     totalTokens: number;
@@ -75,17 +79,6 @@ interface User {
     totalAdminGrantedMicroUsd?: number;
     totalMigrationOffsetMicroUsd?: number;
   };
-  extraCostUsage?: {
-    month: string;
-    totalCost: number;
-    breakdown: Record<string, number>;
-    resetDate: string;
-  };
-  extraCostUsageHistory?: Array<{
-    month: string;
-    totalCost: number;
-    breakdown: Record<string, number>;
-  }>;
   introductionEmailSent?: string; // ISO date when the team introduction email was last sent
   replayUrl?: string; // Microsoft Clarity replay session URL
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders

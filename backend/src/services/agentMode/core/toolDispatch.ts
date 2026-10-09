@@ -27,6 +27,7 @@
 
 import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
 import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
+import { isReadOnlyToolName } from '../../../utils/toolWriteClassification';
 import { ToolResultPolicyBlockedError } from '../../../utils/toolResultError';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../../../utils/citations';
 import { appendRetryabilityGuidance } from './errorRetryability';
@@ -253,6 +254,20 @@ export function seedSearchCallCountFromHistory(
 }
 
 /** A tool-result outcome from the gateway, normalized into the loop's union shape. */
+/**
+ * Owner-scoped tools a share-link visitor (who runs as the owner's userId) must never reach:
+ * org settings reads/writes and org/personal memory writes. Memory written here is injected
+ * into later owner/org sessions, so a visitor could otherwise poison or delete it.
+ */
+export const SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS: ReadonlySet<string> = new Set([
+  'get_lead_notification_settings',
+  'update_lead_notification_settings',
+  'save_org_memory',
+  'delete_org_memory',
+  'save_memory',
+  'delete_memory',
+]);
+
 export interface ToolExecOutcome {
   status: 'success' | 'error';
   result?: any;
@@ -400,6 +415,14 @@ export interface ExecutePreparedToolsInput {
   // ---- skill/tool gating (read-only) ----
   adminSkillToolNames: string[];
   excludeTools?: string[];
+  /**
+   * ENG-1337: true while the ENG-763 anti-loop directive is active for this turn.
+   * The directive forbids write/publish/send tools in prose; this makes it a hard
+   * execution-layer deny: any tool not classified read-only (fail-safe allowlist in
+   * utils/toolWriteClassification) — including install_skills — is refused before
+   * it reaches the gateway. Read-only/verification tools still execute.
+   */
+  loopBreakerActive?: boolean;
   publishedSkillsCount: number;
   sessionAssociatedSkillIdsCount: number;
   allowedToolNames: Set<string>;
@@ -620,6 +643,7 @@ export async function executePreparedTools(
     isUnattendedRun,
     adminSkillToolNames,
     excludeTools,
+    loopBreakerActive = false,
     publishedSkillsCount,
     sessionAssociatedSkillIdsCount,
     allowedToolNames,
@@ -754,9 +778,27 @@ export async function executePreparedTools(
         continue;
       }
 
+      // A share-link visitor runs under the owner's userId, so owner-only org-settings
+      // writes must be refused here rather than by the tool's own role check.
+      if (isInteractiveShare && SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS.has(toolCall.function.name)) {
+        const errorMsg = `Tool "${toolCall.function.name}" acts on the owner's organization settings or memory and is not available in shared sessions. The owner can use it in Agent Mode in their own session.`;
+        appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
+        continue;
+      }
+
       if (isInteractiveShare && toolCall.function.name === 'connect_account') {
         const errorMsg = 'Account connections are not available in shared sessions. Tell the user they need to open Agent Mode in their own account to connect this account, then come back here.';
         appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
+        continue;
+      }
+
+      // ask_user_question passes the ask_ read classifier but halts the run for a question deck.
+      if (loopBreakerActive && (
+        toolCall.function.name === 'ask_user_question'
+        || !isReadOnlyToolName(toolCall.function.name)
+      )) {
+        const errorMsg = `Tool "${toolCall.function.name}" was not run: the same request has repeated several times, so only read-only or verification tools may run this turn. Do not retry it; use a read-only tool or answer the user directly.`;
+        appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg, deniedBy: 'loop_breaker' }));
         continue;
       }
 
