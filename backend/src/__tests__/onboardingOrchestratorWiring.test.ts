@@ -396,6 +396,132 @@ describe("reconcileForUser", () => {
     });
   });
 
+  it("records adImage as FAILED even when the index still serves the row from before the run (ENG-2308)", async () => {
+    // The ad-image service signals business failures by patching
+    // adImageStatus, never by throwing. The orchestrator only marks a step
+    // failed when its runner throws, so without the re-raise in runAdImage
+    // this was recorded as "ready" with a null output.
+    delete process.env.EAGER_ONBOARDING_PIPELINE_ENABLED;
+
+    await jest.isolateModulesAsync(async () => {
+      const persisted: Record<string, any> = {
+        userId: "u-eng792",
+        useEagerPipeline: true,
+        companyUrl: "https://acme.test",
+        companyName: "Acme",
+        goal: "growth",
+      };
+
+      const triggerBrandBuild = jest.fn(async () => {
+        persisted.brandGuidelines = { tone: "punchy" };
+      });
+      const triggerIcp = jest.fn(async () => {
+        persisted.icpResult = [{ name: "P1" }];
+      });
+      const triggerCompetitor = jest.fn(async () => {
+        persisted.competitorResult = { per_icp: [] };
+      });
+      const triggerCreativeDir = jest.fn(async () => {
+        persisted.creativeDirResult = { concepts: [] };
+      });
+      // Mirrors the real service on a total-variant failure: adImageFailedPatch
+      // writes status + error + completedAt, and no adImageResult.
+      // The UserIdIndex lags: its copy of the ad-image axis fields is still the
+      // one from BEFORE the run, with no failure on it. (Only those fields are
+      // stale here, so the orchestrator's own step bookkeeping is unaffected.)
+      let staleAxis: Record<string, any> | null = null;
+      const triggerAdImage = jest.fn(async () => {
+        staleAxis = {
+          adImageStatus: persisted.adImageStatus,
+          adImageError: persisted.adImageError,
+          adImageCompletedAt: persisted.adImageCompletedAt,
+        };
+        persisted.adImageStatus = "failed";
+        persisted.adImageError = "all 3 variants failed";
+        persisted.adImageCompletedAt = new Date().toISOString();
+      });
+      const triggerAdCopy = jest.fn(async () => {
+        persisted.adCopyResult = { copies: [] };
+      });
+
+      jest.doMock("../services/db", () => ({
+        userDb: {
+          getUserById: jest.fn(async () => ({ ...persisted, ...(staleAxis ?? {}) })),
+          getUserByIdConsistent: jest.fn(async () => ({ ...persisted })),
+          updateUser: jest.fn(async (_id: string, patch: any) => {
+            if (patch && patch.steps) {
+              persisted.steps = patch.steps;
+            } else if (patch) {
+              Object.assign(persisted, patch);
+            }
+          }),
+        },
+      }));
+      jest.doMock("../services/onboardingIcpService", () => ({
+        // ENG-2308 follow-up: runIcp claims its own axis before triggering
+        // (same reasoning as adImage's claim below) — the mock must supply
+        // a truthy claim or the runner never reaches triggerIcp at all.
+        claimIcpRun: jest.fn(async () => ({})),
+        triggerIcpDiscoveryForUser: triggerIcp,
+      }));
+      jest.doMock("../services/onboardingCompetitorService", () => ({
+        claimCompetitorRun: jest.fn(async () => ({})),
+        triggerCompetitorStrategyForUser: triggerCompetitor,
+      }));
+      jest.doMock("../services/onboardingCreativeDirService", () => ({
+        claimCreativeDirRun: jest.fn(async () => ({})),
+        triggerCreativeDirForUser: triggerCreativeDir,
+      }));
+      const claimAdImageRunMock = jest.fn(async () => ({
+        runId: "adimg_test-run",
+        startedAt: "2026-08-04T00:00:00.000Z",
+      }));
+      jest.doMock("../services/onboardingAdImageService", () => ({
+        // The eager runner claims the axis for ITS OWN invocation and hands
+        // that identity to the worker — a worker that re-reads identity from
+        // the shared record cannot tell two overlapping runs apart (ENG-792).
+        claimAdImageRun: claimAdImageRunMock,
+        triggerAdImageGenerationForUser: triggerAdImage,
+      }));
+      jest.doMock("../services/onboardingAdCopyService", () => ({
+        claimAdCopyRun: jest.fn(async () => ({})),
+        triggerAdCopyForUser: triggerAdCopy,
+      }));
+      jest.doMock("../services/onboardingBrandBuildService", () => ({
+        claimBrandBuildRun: jest.fn(async () => ({})),
+        triggerBrandBuildForUser: triggerBrandBuild,
+      }));
+
+      const {
+        reconcileForUser,
+        _resetOrchestratorForTests,
+      } = require("../services/onboardingOrchestratorWiring");
+      _resetOrchestratorForTests();
+      const {
+        _resetRateLimitState,
+      } = require("../services/onboardingPipelineOrchestrator");
+      _resetRateLimitState();
+      const report = await reconcileForUser("u-eng792");
+
+      expect(triggerAdImage).toHaveBeenCalledWith("u-eng792", {
+        run: { runId: "adimg_test-run", startedAt: "2026-08-04T00:00:00.000Z" },
+      });
+      expect(persisted.steps?.adImage?.status).toBe("failed");
+      expect(persisted.steps?.adImage?.failedReason).toMatch(/all 3 variants failed/);
+      const fired = (report.fired as Array<{ step: string; status: string }>);
+      expect(fired.find((f) => f.step === "adImage")?.status).toBe("failed");
+      // Ad copy is a SIBLING of ad images (both dep on creativeDir), not a
+      // dependent — the Epic deliberately splits image and copy into
+      // independent axes so one failing does not block the other. It must
+      // still run and still succeed.
+      expect(triggerAdCopy).toHaveBeenCalledWith(
+        "u-eng792",
+        expect.objectContaining({ expectedStartedAt: undefined }),
+      );
+      expect(fired.find((f) => f.step === "adCopy")?.status).toBe("ready");
+    });
+  });
+
   it("fails creativeDir and gates its real dependents (ENG-792 sibling runners)", async () => {
     // Unlike adImage (which has no dependents), creativeDir is a real
     // upstream of both adImage and adCopy — so re-raising its failure does
