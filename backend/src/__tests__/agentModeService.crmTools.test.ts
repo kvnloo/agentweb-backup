@@ -577,10 +577,10 @@ describe('AgentModeService - CRM Tools', () => {
       expect(notEmptyResult.leads[0].leadId).toBe(leadId);
     });
 
-    it('should return error when no filters provided', async () => {
+    it('should return error when no filters, search, or list scope provided (ENG-2360)', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
 
-      const result = await service.searchLeads(listId, [], userId);
+      const result = await service.searchLeads(undefined as any, [], userId);
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('filter');

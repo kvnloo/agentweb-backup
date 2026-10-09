@@ -429,6 +429,63 @@ describe("onboardingIcpService", () => {
       );
     });
 
+    // ENG-2308 live finding: a /icp/regenerate-one that overlapped this run
+    // keeps our icpStartedAt but sets `ready` (~6s) before we finish (~12-22s).
+    // That used to make icpReadyPatch return null and silently drop the
+    // whole-set result. The write is conditioned on our own claim, so it is safe.
+    it.each(["ready", "failed"])(
+      "still lands the whole-set result when a regenerate-one left status %s but the claim is still ours",
+      async (status) => {
+        const claim = "2026-04-24T11:59:00.000Z";
+        userDb.getUserById
+          .mockResolvedValueOnce({ userId: "user-1" })
+          .mockResolvedValueOnce({
+            userId: "user-1",
+            icpStatus: status,
+            icpStartedAt: claim,
+          });
+        userDb.updateUser.mockResolvedValue({});
+
+        await triggerIcpDiscoveryForUser("user-1", {
+          llm: new FakeLlm({ icps: fivePersonas }) as any,
+          expectedStartedAt: claim,
+        });
+
+        const [, patch, options] = userDb.updateUser.mock.calls[0];
+        expect(patch.icpStatus).toBe("ready");
+        expect(patch.icpResult).toHaveLength(5);
+        expect(options.condition.values[":icpOwnerStartedAt"]).toBe(claim);
+      },
+    );
+
+    it("clears the failed attempt's error when it lands over a failed status", async () => {
+      const claim = "2026-04-24T11:59:00.000Z";
+      userDb.getUserById
+        .mockResolvedValueOnce({ userId: "user-1" })
+        .mockResolvedValueOnce({ userId: "user-1", icpStatus: "failed", icpStartedAt: claim, icpError: "icp generation timed out" });
+      userDb.updateUser.mockResolvedValue({});
+      await triggerIcpDiscoveryForUser("user-1", { llm: new FakeLlm({ icps: fivePersonas }) as any, expectedStartedAt: claim });
+      expect(userDb.updateUser.mock.calls[0][1].icpError).toBeNull();
+    });
+
+    it("does NOT land the result when the non-running record belongs to a different claim", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({ userId: "user-1" })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "ready",
+          icpStartedAt: "2026-04-24T12:05:00.000Z",
+        });
+      userDb.updateUser.mockResolvedValue({});
+
+      await triggerIcpDiscoveryForUser("user-1", {
+        llm: new FakeLlm({ icps: fivePersonas }) as any,
+        expectedStartedAt: "2026-04-24T11:59:00.000Z",
+      });
+
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
     it("drops the completion silently when a reclaim has superseded this run (ConditionalCheckFailedException), without mirroring or cascading", async () => {
       userDb.getUserById
         .mockResolvedValueOnce({ userId: "user-1" })
@@ -775,7 +832,10 @@ describe("onboardingIcpService", () => {
       const startPatch = userDb.updateUser.mock.calls[0][1];
       expect(startPatch.icpStatus).toBe("running");
       expect(startPatch.icpStartedAt).toBeTruthy();
-      expect(result).toBe(startPatch);
+      // The claim also clears the previous attempt's error (REMOVE, via null);
+      // the returned patch is the same run without that storage-only marker.
+      expect(startPatch.icpError).toBeNull();
+      expect(result).toEqual({ ...startPatch, icpError: undefined });
     });
 
     // ENG-2308: OutreachIcpPick's 8s watchdog re-fires /icp/start whenever

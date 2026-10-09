@@ -514,7 +514,10 @@ describe("onboardingCreativeDirService", () => {
       const startPatch = userDb.updateUser.mock.calls[0][1];
       expect(startPatch.creativeDirStatus).toBe("running");
       expect(startPatch.creativeDirStartedAt).toBeTruthy();
-      expect(result).toBe(startPatch);
+      // The claim also clears the previous attempt's error (REMOVE, via null);
+      // the returned patch is the same run without that storage-only marker.
+      expect(startPatch.creativeDirError).toBeNull();
+      expect(result).toEqual({ ...startPatch, creativeDirError: undefined });
     });
 
     // ENG-2308: same unconditional-write race as icp/competitor — two

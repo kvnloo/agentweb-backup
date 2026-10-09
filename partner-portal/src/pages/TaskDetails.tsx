@@ -3112,11 +3112,11 @@ export default function TaskDetails() {
               onChange={(e) => setSelectedVideoModel(e.target.value)}
               label="Video Model"
             >
-              <MenuItem value="veo-3.0-generate-preview">
+              <MenuItem value="gemini-omni-1.1-flash">
                 <Box>
-                  <Typography>veo-3.0-generate-preview (Google)</Typography>
+                  <Typography>gemini-omni-1.1-flash (Google)</Typography>
                   <Typography variant="caption" color="text.secondary">
-                    8s video with audio supported
+                    ~10s video with audio supported
                   </Typography>
                 </Box>
               </MenuItem>

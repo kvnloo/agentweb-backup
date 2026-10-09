@@ -34,7 +34,7 @@ export const OUTCOME_SHADOW_JUDGE_NAME = 'Outcome Judge (shadow)';
 export const DEFAULT_OUTCOME_JUDGE_MODEL = 'anthropic.claude-sonnet-4-6';
 /** Metering feature for shadow-judge calls: cost per judged session is AW-SpendEvents by this feature + session id. */
 export const OUTCOME_JUDGE_SHADOW_FEATURE = 'outcome_judge_shadow';
-export const OUTCOME_RUBRIC_B_VERSION = '2026-09-28.reconstructed-2';
+export const OUTCOME_RUBRIC_B_VERSION = '2026-10-09.reconstructed-3';
 
 /** Providers the agent runs on by default (`agent_mode_default_model` = gemini-3.8-flash). */
 const AGENT_DEFAULT_PROVIDERS = new Set<string>(['google']);
@@ -56,31 +56,43 @@ const AGENT_DEFAULT_PROVIDERS = new Set<string>(['google']);
  * reconstructed-2 (ENG-2189) adds three binary criteria in `dimensions`: arguedWithInstruction,
  * escalatedWhenNotRequired and failedToEscalate. They are the golden-set agent criteria of the
  * same names, so their agreement with human labels can be measured.
+ *
+ * reconstructed-3 (ENG-2138, 2026-10-09): the replay (ENG-2356, 2026-10-08) measured
+ * reconstructed-2 at AUC 0.58 and 28.6% at 5 — far short of the original's measured 0.79 / 2.6%,
+ * and barely separating success (mean 4.20) from failure (mean 4.00) sessions. Of 77 scored
+ * sessions, 22 were labelled failures and NONE scored 1 or 2 — the model never used the bottom of
+ * its own scale. reconstructed-2 asked the model to form a holistic impression and pick a score;
+ * this version instead makes the score a mechanical function of an itemised checklist the model
+ * must write before scoring, because the holistic framing is exactly where the leniency entered.
+ * This is a reasoned revision, not a re-measurement: it has not yet been validated by
+ * scripts/evalOutcomeJudge.ts (that requires OPENROUTER_API_KEY, which this build-side identity
+ * cannot read — see ENG-2138's open comment). It should not be treated as passing until that
+ * replay confirms it, and the original un-reconstructed prompt (Harsha's machine / the swarm
+ * host's judge-ab/prompts/B_outcome.txt) remains the better fix if it can be recovered, since it
+ * is proven rather than inferred.
  */
 export const OUTCOME_RUBRIC_B_PROMPT = `You are grading the OUTCOME of a session with an AI marketing agent. Your job is to decide whether the task the user asked for was actually done, not whether the conversation felt pleasant.
 
-Read the whole transcript, including the tool-call manifest and the tool results. Then answer, for yourself:
-1. What did the user ask the agent to deliver or do? List each concrete deliverable or action.
-2. For each one: is there evidence in the transcript that it was delivered? Evidence is a successful tool result for the action, or the finished content itself in the conversation. The assistant saying "done", "published" or "I've set it up" is NOT evidence on its own.
-3. What was left undone: failed or missing tool calls, work-plan steps left pending or blocked, errors the agent did not resolve, questions it never answered, or work handed back to the user that the agent could have done itself.
+Most sessions have at least one gap. Do not round up out of politeness, and do not let a confident, well-formatted final message substitute for evidence — that is precisely the failure mode this rubric exists to catch.
 
-Score the outcome on this scale:
-5 = Every requested deliverable was completed and is backed by evidence, nothing material is pending, and there is nothing a careful reviewer would fix. Reserve 5 for sessions you genuinely could not improve on.
-4 = The main deliverable was completed with evidence. Only a minor or optional item is missing (for example one optional trailing review step left pending), or there are small quality issues that do not change the result.
-3 = Partly done. Some deliverables were completed, but a material part of the request was not, or completion is claimed but only partly backed by the tool results.
-2 = Mostly not done. The main task failed, stalled, looped, or was handed back to the user; or the agent claimed completion that the tool results contradict.
-1 = Nothing useful was delivered: the run failed or was abandoned, the agent refused a legitimate request, or it presented fabricated results as done.
+Read the whole transcript, including the tool-call manifest and the tool results. Then, before you score anything, write a checklist:
+1. List each concrete deliverable or action the user asked for, one per line.
+2. For each one, mark it DELIVERED, PARTIAL, or NOT DELIVERED. DELIVERED requires a successful tool result for the action, or the finished content itself in the conversation. The assistant saying "done", "published" or "I've set it up" is NOT evidence on its own — if that is the only support, mark it PARTIAL. If the work plan ended with a step blocked or pending (for example set_work_plan_status reporting a blocker), that deliverable is NOT DELIVERED whatever the final message says.
+3. Note separately: failed or missing tool calls, errors the agent did not resolve, questions it never answered, work handed back to the user that the agent could have done itself, and user friction (having to repeat the request, nudge the agent to continue, or correct its output).
+
+The score is a direct function of that checklist. Do not override it with a holistic impression:
+- Any deliverable marked NOT DELIVERED → score 1 or 2. Use 1 only when nothing useful was delivered at all, or the agent refused a legitimate request, or it presented fabricated results as done; otherwise 2.
+- No deliverable NOT DELIVERED, but at least one marked PARTIAL, or a material part of the request untouched → score 3.
+- Every deliverable DELIVERED, but a minor or optional item is missing (for example one optional trailing review step left pending) or there are small quality issues that do not change the result → score 4.
+- Every deliverable DELIVERED with evidence, nothing material pending, nothing a careful reviewer would fix → score 5. Reserve 5 for sessions where your own checklist shows zero gaps — if you had to think about whether something counts, it is not a 5.
 
 Rules:
-- Grade what happened, not how it was described. A confident, well-formatted final message does not raise the score if the work behind it is missing.
-- Check the end state. If the work plan ended with a step blocked or pending (for example set_work_plan_status reporting a blocker), the task is not complete, whatever the final message says.
-- User friction is evidence about the outcome: having to repeat the request, nudge the agent to continue ("go ahead", "continue", "did you do it?"), or correct its output counts against it.
-- Politeness, length and formatting do not earn points. A short answer that delivers the task beats a long one that does not.
-- When the user asked only a question, the deliverable is a correct, specific answer.
 - A limitation outside the agent's control that it correctly identified and explained (a missing integration, an approval it must wait for) is handled correctly; score the handling, not the limitation.
+- When the user asked only a question, the deliverable is a correct, specific answer; "DELIVERED" means the answer is actually correct, not merely that one was given.
+- Politeness, length and formatting do not earn points and are not part of the checklist.
 
-Write your rationale first, then the score. Rate three dimensions (1-5 each) the same way:
-- goalCompletion: were the requested deliverables actually completed?
+Write the checklist first, then the reason (a brief summary of the checklist, not a replacement for it), then the score the checklist requires. Rate three dimensions (1-5 each) the same way — derive them from the checklist, not a separate impression:
+- goalCompletion: were the requested deliverables actually completed? This should track the checklist directly (DELIVERED-heavy → high, NOT DELIVERED present → low).
 - dataAccuracy: are the facts, numbers and claims backed by tool results rather than invented?
 - outputQuality: is what was delivered specific, correct and usable as-is?
 

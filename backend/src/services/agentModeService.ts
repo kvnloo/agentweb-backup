@@ -1,4 +1,5 @@
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
+import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
 import { classifyMetaBudgetChange } from './agentMode/metaBudgetAnomaly';
 import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
 import { budgetVerdictFields, hasBudgetField, verifyMetaBudget, type BudgetVerifyOptions } from './agentMode/metaBudgetReadBack';
@@ -42,6 +43,7 @@ import {
 } from './agentMode/metaImageSwapCheck';
 import { readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
+import { createCrmEvidenceCollector, crmEvidenceFromEarlierInvocations, crmNumbersFromSessionHistory, runCrmFreshnessShadow, serializeCrmEvidence } from '../utils/crmFreshnessGuard';
 import {
   evaluateTurnTimeBudget,
   buildTurnTimeBudgetNudge,
@@ -76,7 +78,7 @@ import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActions
 // ENG-2103 (F2 design-decision-list follow-up, Pattern A): agentMode/brandLogo's
 // 4 exports and agentMode/dataFabricationGuard's 5 exports were used only by
 // generateImage, which moved to emma/impl/mediaVideo.ts (imports them there directly).
-import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory } from './agentMode/core/toolDispatch';
+import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory, type ToolDispatchPorts } from './agentMode/core/toolDispatch';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
@@ -360,7 +362,7 @@ export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
-const MAX_TOOL_CONTENT_SIZE = 300_000;
+export const MAX_TOOL_CONTENT_SIZE = 300_000;
 
 // Floor above which trimToolMessagesForContext compresses an OLD tool result down to a
 // 200-char preview (per-tool allowances in LARGE_TOOL_RESULT_LIMIT may raise it, never lower it).
@@ -1045,6 +1047,11 @@ interface LLMCallOptions {
   timeoutMs?: number;
   /** Ordered logical model fallbacks executed by OpenRouter, never by AgentWeb. */
   fallbackModels?: string[];
+  /**
+   * ENG-55: Compare-only OpenRouter provider policy (`data_collection: 'deny'`), merged into
+   * `provider` next to the shared order/fallback preferences. Normal chat never sets it.
+   */
+  providerPolicy?: CompareProviderPolicy | null;
 }
 
 function nonNegativeTokenCount(value: unknown): number {
@@ -2550,6 +2557,7 @@ export class AgentModeService {
       timeoutMs,
       fallbackModels,
       taskClass,
+      providerPolicy,
     } = options || {};
 
     // AgentWeb owns model selection; OpenRouter owns transport, provider
@@ -2589,6 +2597,9 @@ export class AgentModeService {
       // proposed the slug form once already and was reverted for this reason
       // — verify empirically against live traffic before changing this line.
       params.provider.ignore = ignoredProviders;
+    }
+    if (providerPolicy) {
+      params.provider = applyProviderPolicy(params.provider, providerPolicy);
     }
     // OpenRouter reports its own billed amount as zero for BYOK requests even
     // though the upstream provider still bills the inference. Request the
@@ -3471,6 +3482,12 @@ export class AgentModeService {
       let content = '';
       const toolCalls: any[] = [];
       _toolCallsForTelemetry = toolCalls;
+      // ENG-2263: numbers the CRM tools actually returned this turn (the ledger above stores minimised results).
+      const crmEvidence = createCrmEvidenceCollector();
+      // ENG-2263: CRM tools that ran in earlier invocations of the task this one continues (auto-continuation, an answered
+      // question/approval card, "continue" after a time-limit partial). Their numbers are unrecoverable, so the check abstains.
+      const crmEarlier = crmEvidenceFromEarlierInvocations(sessionHistory);
+      const crmSessionNumbers = crmNumbersFromSessionHistory(sessionHistory);
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
       // ENG-351: accumulates the web sources this message consults across all its search
@@ -4716,37 +4733,16 @@ export class AgentModeService {
           priorMediaCallKeys: mediaCallKeysThisRun,
           approvedRevisionImageSources,
           priorSearchCallCount: searchCallCountThisRun,
-          ports: {
-            evaluateAgentToolPolicy,
-            validateAndRepairToolArgs,
-            getToolInputSchema: (toolName: string) => {
-              const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
-              return toolDefinition?.function?.parameters || toolDefinition?.inputSchema;
-            },
-            executeAgentToolThroughGateway,
-            executePreparedAgentTool: (toolInput: any) => this.executePreparedAgentTool(toolInput),
-            toolResultError,
-            // ENG-105: validate tool output against the minimum-output contract so
-            // an empty/undefined/invalid "success" becomes a structured tool
-            // failure (errorClass invalid_output) instead of feeding garbage to
-            // the model and counting as success.
-            validateToolOutput: (result: any) => validateToolOutputContract(result, extractToolContent),
-            recordToolTelemetry: (telemetryToolResults) =>
-              recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults as any, {
-                mediaAssetsProducedThisRun,
-                mediaGenerationDeadlineMs,
-              }, userId),
-            recordDuplicateSuppression: (entries) =>
-              recordAgentModeDuplicateSuppression(agentRuntimeRunId, sessionId, iteration, entries),
-            extractMinimalToolResult: (result: any, toolName: string) => this.extractMinimalToolResult(result, toolName),
-            extractToolContent,
-            formatToolError: (toolName: string, errorMessage: string) => this.formatToolError(toolName, errorMessage),
-            uploadScreenshotToS3,
-            uploadFileToS3WithPath,
-            buildCrmDataChangedPayload,
-            crmDataChangedEvent: CRM_DATA_CHANGED_EVENT,
+          ports: this.buildToolDispatchPorts({
+            agentRuntimeRunId,
+            sessionId,
+            userId,
+            iteration,
+            mediaAssetsProducedThisRun,
+            mediaGenerationDeadlineMs,
+            observeFullToolResult: (toolName: string, fullResult: any) => crmEvidence.record(toolName, fullResult),
             socketEmit,
-          },
+          }),
         });
         const toolDispatchDurationMs = Date.now() - toolDispatchStart;
         if (toolDispatchDurationMs > longestToolDispatchMsThisRun) {
@@ -5222,6 +5218,13 @@ export class AgentModeService {
         }
       }
 
+      // ENG-2263 (log-only): a `[verified: <CRM tool>]` tag that no CRM call this turn can back —
+      // a carried-over number dressed as fresh. Measures how often it happens, per model, before
+      // anyone decides to enforce. Never edits `content`; kill switch AGENT_CRM_FRESHNESS_GUARD=off.
+      if (content && !wasCancelled && !mockMode) {
+        runCrmFreshnessShadow({ finalText: content, toolCalls, evidence: crmEvidence.snapshot(), earlier: crmEarlier, sessionNumbers: crmSessionNumbers, sessionId, model: llmModel });
+      }
+
       // ENG-1207 AC3: a run must not finish silently on an unread page.
       //
       // Same shape as the two reconcilers above and placed alongside them
@@ -5379,6 +5382,12 @@ export class AgentModeService {
             memoryUsage,
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
             ...(citations.length > 0 ? { citations } : {}),
+            // ENG-2263: the numbers (never text) this invocation's CRM tools returned, so a continuation of this task can check
+            // its totals against them. Additive and optional; bounded to 64 numbers + tool names. Off with the guard's kill switch.
+            ...(process.env.AGENT_CRM_FRESHNESS_GUARD === 'off' ? {} : (() => {
+              const ev = serializeCrmEvidence(crmEvidence.snapshot());
+              return ev ? { crmEvidence: ev } : {};
+            })()),
           };
         }
       }
@@ -7223,6 +7232,145 @@ export class AgentModeService {
       console.error('AgentMode: Error in installSkills:', error);
       return { success: false, message: "An error occurred while installing skills." };
     }
+  }
+
+  /**
+   * ENG-2109: the ports `executePreparedTools` needs, built in one place so Emma's own
+   * loop and the tool bridge (a `claude -p` session calling tools one at a time) hand
+   * the dispatcher exactly the same ones.
+   */
+  public buildToolDispatchPorts(ctx: {
+    agentRuntimeRunId: string;
+    sessionId: string;
+    userId: string;
+    iteration: number;
+    mediaAssetsProducedThisRun: number;
+    mediaGenerationDeadlineMs?: number;
+    observeFullToolResult?: ToolDispatchPorts['observeFullToolResult'];
+    socketEmit?: ToolDispatchPorts['socketEmit'];
+  }): ToolDispatchPorts {
+    return {
+      evaluateAgentToolPolicy,
+      validateAndRepairToolArgs,
+      getToolInputSchema: (toolName: string) => {
+        const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
+        return toolDefinition?.function?.parameters || toolDefinition?.inputSchema;
+      },
+      executeAgentToolThroughGateway,
+      executePreparedAgentTool: (toolInput: any) => this.executePreparedAgentTool(toolInput),
+      toolResultError,
+      // ENG-105: validate tool output against the minimum-output contract so
+      // an empty/undefined/invalid "success" becomes a structured tool
+      // failure (errorClass invalid_output) instead of feeding garbage to
+      // the model and counting as success.
+      validateToolOutput: (result: any) => validateToolOutputContract(result, extractToolContent),
+      recordToolTelemetry: (telemetryToolResults) =>
+        recordAgentModeToolTelemetry(ctx.agentRuntimeRunId, ctx.sessionId, ctx.iteration, telemetryToolResults as any, {
+          mediaAssetsProducedThisRun: ctx.mediaAssetsProducedThisRun,
+          mediaGenerationDeadlineMs: ctx.mediaGenerationDeadlineMs,
+        }, ctx.userId),
+      recordDuplicateSuppression: (entries) =>
+        recordAgentModeDuplicateSuppression(ctx.agentRuntimeRunId, ctx.sessionId, ctx.iteration, entries),
+      observeFullToolResult: ctx.observeFullToolResult,
+      extractMinimalToolResult: (result: any, toolName: string) => this.extractMinimalToolResult(result, toolName),
+      extractToolContent,
+      formatToolError: (toolName: string, errorMessage: string) => this.formatToolError(toolName, errorMessage),
+      uploadScreenshotToS3,
+      uploadFileToS3WithPath,
+      buildCrmDataChangedPayload,
+      crmDataChangedEvent: CRM_DATA_CHANGED_EVENT,
+      socketEmit: ctx.socketEmit,
+    };
+  }
+
+  /**
+   * ENG-2109: the tool access Emma's loop would give this session right now — the
+   * skill-gated tool names and the filtered tool definitions sent to the model.
+   *
+   * Mirrors the loop's own steps (session skills -> buildSkillContext -> per-user MCP
+   * discovery -> getFilteredTools -> voice augment -> excludeTools) by calling the same
+   * helpers. The loop's turn-history-dependent filter (the ENG-763 loop breaker, which
+   * drops install_skills while a repetition loop is active) is not applied here.
+   * `funding/__tests__/emmaToolBridgeExecutor.integration.test.ts` compares this with
+   * what the loop sends, for a legacy and a skill-gated session.
+   */
+  public async resolveRunToolAccess(input: {
+    userId: string;
+    sessionId: string;
+    isDelegatedAccess?: boolean;
+    isInteractiveShare?: boolean;
+    excludeTools?: string[];
+  }): Promise<{
+    tools: any[];
+    allowedToolNames: Set<string>;
+    hasAdminAccess: boolean;
+    publishedSkillsCount: number;
+    sessionAssociatedSkillIdsCount: number;
+  }> {
+    const { userId, sessionId } = input;
+    const { userDb } = await import('./db');
+    const [currentSession, userAllowedSkillIds, publishedSkills, currentUser] = await Promise.all([
+      chatbotDb.getChatSession(sessionId),
+      getAllowedSkills(userId),
+      skillService.getPublishedSkills(),
+      userDb.getUserById(userId).catch((err) => {
+        console.error(`[AgentMode] Failed to fetch user ${userId} for admin check:`, err);
+        return null;
+      }),
+    ]);
+
+    const isAdmin = currentUser?.isAdmin === true;
+    const hasAdminAccess = (isAdmin || input.isDelegatedAccess === true) && input.isInteractiveShare !== true;
+
+    const rawAssociatedSkills = currentSession?.associatedSkills;
+    const isLegacySession = rawAssociatedSkills === undefined || rawAssociatedSkills === null;
+    const sessionAssociatedSkillIds: string[] = Array.isArray(rawAssociatedSkills) ? rawAssociatedSkills : [];
+    const associatedSkills = sessionAssociatedSkillIds.length
+      ? await skillService.getSkillsByIds(sessionAssociatedSkillIds)
+      : [];
+    const { allowedToolNames } = this.buildSkillContext(
+      associatedSkills,
+      userAllowedSkillIds,
+      publishedSkills,
+      sessionAssociatedSkillIds,
+      hasAdminAccess,
+    );
+
+    try {
+      const discovered = await this.mcpClientService.discoverToolsForUser(userId, sessionId);
+      if (discovered > 0) {
+        for (const tool of this.mcpClientService.getTools()) {
+          if (!this.toolRegistry.getTool(tool.name)) this.toolRegistry.register(tool);
+        }
+      }
+    } catch (e) {
+      console.warn('[MCP-DISCOVER] Error discovering per-user MCP tools:', (e as Error).message);
+    }
+
+    const skillFilter = isLegacySession ? undefined : allowedToolNames;
+    let tools = await this.getFilteredTools(userId, skillFilter, userAllowedSkillIds);
+
+    if (currentSession?.sessionVoiceProfile?.voiceCard?.trim()) {
+      try {
+        const { augmentPublishToolDefinitions } = await import('./voiceProfileHooks');
+        tools = augmentPublishToolDefinitions(tools, currentSession.sessionVoiceProfile);
+      } catch (voiceToolErr) {
+        console.warn('[AgentMode] H-VOICE publish tool augment skipped (non-fatal):', voiceToolErr);
+      }
+    }
+
+    if (input.excludeTools?.length) {
+      const excludeSet = new Set(input.excludeTools);
+      tools = tools.filter((t: any) => !excludeSet.has(t.function?.name));
+    }
+
+    return {
+      tools,
+      allowedToolNames,
+      hasAdminAccess,
+      publishedSkillsCount: publishedSkills.length,
+      sessionAssociatedSkillIdsCount: sessionAssociatedSkillIds.length,
+    };
   }
 
   /**

@@ -37,6 +37,7 @@ import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
 import { PendingApprovalDeck } from './agentMode/core/approvalDeck';
 import { WorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import { WorkflowRunState } from './agentMode/core/workflow';
+import { assertSequentialStepCounts } from './workPlanSteps';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -131,7 +132,17 @@ export interface ChatMessage {
     kind?: string;                      // Stable marker for system messages (e.g. 'image-generated')
     imageFilename?: string;             // Filename when kind === 'image-generated'
     imageUrl?: string;                  // ENG-510: image URL on the immediate marker so a completed image survives a whole-turn-cap kill
+    crmEvidence?: { tools: string[]; numbers: number[]; truncated?: true }; // ENG-2263: numbers (never text) this turn's CRM tools returned, so a continuation can check its totals
     citations?: Citation[];             // ENG-351: de-duplicated web sources this message consulted (ChatGPT-style Sources UI)
+    // ENG-112: provenance of a branched chat. Stamped ONLY on row 0 (the stored system prompt, which
+    // is never sent to the model) of a session created by "Branch from here". Free-form metadata, not a
+    // session field: see services/agentMode/chatBranching.ts.
+    branchOrigin?: {
+      sourceSessionId: string;
+      sourceTitle?: string;
+      sourceMessageIndex: number;       // RAW row index in the source session
+      branchedAt: string;
+    };
     mediaBudgetDeferred?: boolean;      // ENG-1239: set on the tool-role deferral marker AND on the whole-turn-timeout partial-delivery message that reports it, so an unresolved media-batch pause is detectable from the tail of session history alone
   };
 }
@@ -732,7 +743,7 @@ export class ChatbotDB {
     emailCampaignTaskId?: string,
     sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email" | "meeting-intake",
     delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean },
-    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages">>
+    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages" | "archived">>
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -2659,6 +2670,34 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * ENG-112: inverse of archiveSession. REMOVES the `archived` attribute (an ordinary session never has
+   * one: every reader treats absent as live, `!session.archived` and `attribute_not_exists(archived) OR
+   * archived = :false`), so a revealed branch carries no stored shape an ordinary session lacks.
+   * Conditional on the row existing: an update on a deleted id would otherwise upsert a ghost row;
+   * that case rejects with `code: 'ConditionalCheckFailedException'`. Used only by chat branching.
+   */
+  async unarchiveSession(sessionId: string): Promise<void> {
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression: "SET adminListPartition = :adminListPartition REMOVE archived",
+      ConditionExpression: "attribute_exists(sessionId)",
+      ExpressionAttributeValues: {
+        ":adminListPartition": "all",
+      },
+    };
+
+    try {
+      await dynamodb.update(params).promise();
+    } catch (error) {
+      console.error("Error unarchiving chat session:", error);
+      throw error;
+    }
+  }
+
   async deleteSession(sessionId: string): Promise<void> {
     const params = {
       TableName: this.tableName,
@@ -3728,15 +3767,7 @@ export class ChatbotDB {
     const timestamp = new Date().toISOString();
 
     // Validate stepCount - must be sequential starting from 1 (index+1)
-    for (let i = 0; i < workPlan.steps.length; i++) {
-      const expectedStepCount = i + 1;
-      if (workPlan.steps[i].stepCount !== expectedStepCount) {
-        throw new Error(
-          `Invalid stepCount at index ${i}: expected ${expectedStepCount} but got ${workPlan.steps[i].stepCount}. ` +
-          `Steps must be numbered sequentially starting from 1 (stepCount must equal index+1).`
-        );
-      }
-    }
+    assertSequentialStepCounts(workPlan.steps);
 
     const validatedWorkPlan = {
       ...workPlan,
@@ -3826,6 +3857,55 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session LLM model:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-903: undo a plan-launch model write, but only if the session still holds the model
+   * that launch wrote. A plain conditional UpdateItem on EXISTING attributes (no schema
+   * change). If a user changed the model after the launch's write, the condition fails and
+   * their choice is left alone (resolves false). A session that had NO explicit model gets
+   * `REMOVE llmModel`, returning it to exactly its prior state instead of a stored default.
+   * Resolves true when restored; rethrows any other failure.
+   */
+  async restoreSessionLlmModelIfUnchanged(
+    sessionId: string,
+    expectedModel: string,
+    previous: { llmModel?: string; llmUsagePolicyDecision?: NonNullable<ChatSession['llmUsagePolicyDecision']> },
+  ): Promise<boolean> {
+    const sets: string[] = [];
+    const removes: string[] = [];
+    const values: Record<string, any> = { ":planModel": expectedModel };
+    if (previous.llmModel) {
+      sets.push("llmModel = :prevModel");
+      values[":prevModel"] = previous.llmModel;
+    } else {
+      removes.push("llmModel");
+    }
+    if (previous.llmUsagePolicyDecision) {
+      sets.push("llmUsagePolicyDecision = :prevDecision");
+      values[":prevDecision"] = previous.llmUsagePolicyDecision;
+    } else {
+      removes.push("llmUsagePolicyDecision");
+    }
+    sets.push("adminListPartition = :adminListPartition");
+    values[":adminListPartition"] = "all";
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: `SET ${sets.join(", ")}${removes.length ? ` REMOVE ${removes.join(", ")}` : ""}`,
+      ConditionExpression: "llmModel = :planModel",
+      ExpressionAttributeValues: values,
+    };
+    try {
+      await dynamodb.update(params).promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === "ConditionalCheckFailedException" || error?.name === "ConditionalCheckFailedException") {
+        return false;
+      }
+      console.error("Error restoring session LLM model:", error);
       throw error;
     }
   }
