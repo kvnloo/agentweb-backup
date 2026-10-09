@@ -1516,9 +1516,9 @@ export async function executePreparedTools(
       // gate is unaffected) nor a failure (no error, no failed counter, does not feed
       // the gateway's repeated-failure breaker). We still MUST append a tool-role
       // message for this tool_call_id, or the next LLM turn rejects the orphaned call.
-      // The content tells the model to stop generating now, summarize what's done, and
-      // ask the user to reply "continue" — the asset-awareness block then resumes the
-      // batch on the next turn without regenerating the already-saved images.
+      // The content tells the model to stop generating now and summarize what's done;
+      // the server's automatic continuation (ENG-1239/ENG-2371) resumes the batch without
+      // asking the customer to reply "continue" and without regenerating saved images.
       const { toolCall, functionArgs } = toolResult;
       // A handler-supplied deferral (ENG-822) carries its own instruction and
       // reason; only the media-budget deferral gets the media prose below.
@@ -1529,8 +1529,8 @@ export async function executePreparedTools(
         ? String(handlerDeferral.message)
         : `⚠️ Media generation paused for this turn — the assistant has been working on this batch for a while and is approaching the per-response time limit. `
         + `The image(s) already generated this session are saved. `
-        + `Do NOT call ${toolCall.function.name} again right now. Instead: briefly tell the user how many assets are done versus still remaining, then ask them to reply "continue" to generate the rest. `
-        + `When they continue, generate ONLY the still-missing assets (see the already-generated assets list), then mark the step complete.`;
+        + `Do NOT call ${toolCall.function.name} again right now. Instead: briefly tell the user how many assets are done versus still remaining and that the rest will continue automatically. `
+        + `Do NOT ask the user to reply "continue" — the server resumes the batch automatically (ENG-2371) and generates ONLY the still-missing assets.`;
       toolCalls.push({
         id: toolCall.id,
         name: toolCall.function.name,
