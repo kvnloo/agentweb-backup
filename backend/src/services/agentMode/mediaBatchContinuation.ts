@@ -87,7 +87,25 @@ export async function startMediaBatch(
  * Runs runnable units until the batch is terminal or `deadlineAt` passes. On deadline,
  * schedules an automatic continuation; never asks the customer to reply.
  */
-export async function runMediaBatch(
+const inFlight = new Map<string, Promise<unknown>>();
+
+/** Serializes runs per batchId within this process so two continuations never lease the same unit. */
+export function runMediaBatch(
+  batchId: string,
+  deadlineAt: number,
+  deps: RunDeps,
+): Promise<'complete' | 'continuing' | 'missing'> {
+  const prev = inFlight.get(batchId) ?? Promise.resolve();
+  const run = prev.catch(() => undefined).then(() => runMediaBatchUnlocked(batchId, deadlineAt, deps));
+  const tail = run.catch(() => undefined);
+  inFlight.set(batchId, tail);
+  void tail.then(() => {
+    if (inFlight.get(batchId) === tail) inFlight.delete(batchId);
+  });
+  return run;
+}
+
+async function runMediaBatchUnlocked(
   batchId: string,
   deadlineAt: number,
   deps: RunDeps,
@@ -110,10 +128,18 @@ export async function runMediaBatch(
     const started = deps.now();
     batch = markRunning(batch, unit.index, started);
     await deps.store.put({ ...record, batch }); // lease persisted before the provider call
-    const result = await deps.generate(unit.input, unit.key);
+    let result: UnitResult;
+    try {
+      result = await deps.generate(unit.input, unit.key);
+    } catch (err) {
+      // A rejected provider call must not strand the lease: record a retryable failure.
+      result = { ok: false, retryable: true, reason: err instanceof Error ? err.message : String(err) };
+    }
     const applied = submitUnitResult(batch, unit.key, deps.now(), result);
     batch = applied.batch;
     const after = batch.units[unit.index];
+    // Persist the generation result before attaching so an attach failure never re-generates.
+    await deps.store.put({ ...record, batch });
     if (applied.applied && after.state === 'succeeded' && after.assetId) {
       await deps.attachAsset(sessionId, after.assetId, unit.index);
     }
@@ -127,7 +153,6 @@ export async function runMediaBatch(
       retryCount: Math.max(0, after.attempts - 1),
       outcome: after.state as 'succeeded' | 'failed_retryable' | 'failed_terminal',
     });
-    await deps.store.put({ ...record, batch });
   }
 
   const latest = (await deps.store.get(batchId)) ?? { ...record, batch };
@@ -141,8 +166,9 @@ export async function runMediaBatch(
       failed: batch.units.length - succeeded,
       total: batch.units.length,
     });
-    await deps.store.put({ sessionId, batch, completionNotified: true });
+    // Notify first; only record delivery after it succeeds so a failed notice is retried.
     await deps.notifyComplete(sessionId, batch);
+    await deps.store.put({ sessionId, batch, completionNotified: true });
   }
   return 'complete';
 }

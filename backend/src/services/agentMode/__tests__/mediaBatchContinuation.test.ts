@@ -99,4 +99,51 @@ describe('ENG-2371 automatic media-batch continuation', () => {
       { event: 'media_batch_complete', batchId: 'batch-2', sessionId: 'sess-2', succeeded: 2, failed: 0, total: 2 },
     ]);
   });
+
+  it('records a rejected provider call as retryable instead of stranding the lease', async () => {
+    const store = new InMemoryMediaBatchStore();
+    const clock = { t: 0 };
+    await startMediaBatch(store, 'sess-r', 'batch-r', [{ prompt: 'x' }]);
+    const h = harness(store, clock);
+    let first = true;
+    h.deps.generate = async () => {
+      clock.t += 1_000;
+      if (first) {
+        first = false;
+        throw new Error('provider 500');
+      }
+      return { ok: true, assetId: 'asset-x' };
+    };
+    const r = await runMediaBatch('batch-r', 1_500, h.deps);
+    expect(r).toBe('continuing');
+    const rec = await store.get('batch-r');
+    expect(rec?.batch.units[0].state).not.toBe('running');
+  });
+
+  it('retries the completion notice when notification fails, and sends it once after success', async () => {
+    const store = new InMemoryMediaBatchStore();
+    const clock = { t: 0 };
+    await startMediaBatch(store, 'sess-n', 'batch-n', [{ prompt: 'y' }]);
+    const h = harness(store, clock);
+    h.deps.notifyComplete = async () => {
+      throw new Error('slack down');
+    };
+    await expect(runMediaBatch('batch-n', 60_000, h.deps)).rejects.toThrow('slack down');
+    expect((await store.get('batch-n'))?.completionNotified).toBe(false);
+    const h2 = harness(store, clock);
+    expect(await runMediaBatch('batch-n', 60_000, h2.deps)).toBe('complete');
+    expect(h2.notices).toEqual(['sess-n']);
+    expect(h2.generated).toHaveLength(0);
+  });
+
+  it('serializes concurrent continuations of the same batch (no duplicate generation)', async () => {
+    const store = new InMemoryMediaBatchStore();
+    const clock = { t: 0 };
+    await startMediaBatch(store, 'sess-c', 'batch-c', [{ prompt: 'z' }]);
+    const a = harness(store, clock);
+    const b = harness(store, clock);
+    await Promise.all([runMediaBatch('batch-c', 60_000, a.deps), runMediaBatch('batch-c', 60_000, b.deps)]);
+    expect(a.generated.length + b.generated.length).toBe(1);
+    expect(a.notices.length + b.notices.length).toBe(1);
+  });
 });
