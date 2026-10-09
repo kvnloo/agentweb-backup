@@ -928,3 +928,27 @@ describe('sub-breakdown phrasing is not an inventory claim (ENG-2263)', () => {
     expect(detectCrmFreshnessMismatch('Your CRM has 15,490 leads across 97 lists.', calls, c.snapshot()).findings.length).toBeGreaterThan(0);
   });
 });
+
+describe('per-category breakdown rows are not account totals (ENG-2263, seen live on the default model)', () => {
+  const calls = [ok('get_lead_lists')];
+  const ev = () => {
+    const c = createCrmEvidenceCollector();
+    c.record('get_lead_lists', { success: true, totalLists: 96, lists: [{ listId: 'a', leadCount: 600 }, { listId: 'b', leadCount: 23 }, { listId: 'c', leadCount: 9 }] });
+    return c.snapshot();
+  };
+  const flagged = (text: string) => detectCrmFreshnessMismatch(text, calls, ev()).findings.map((f) => f.kind);
+
+  it.each([
+    '3. Test & QA Verifications (~110 leads across 25 lists) Small operational lists.',
+    '4. Landing Page Capture & Inactive (51 lists)',
+    'Calendly Bookings: 23 leads across 2 lists (17 and 6)',
+    '- Calendly Bookings: 23 leads across 2 lists',
+  ])('%p is not a total', (t) => { expect(flagged(`Your CRM has 96 lists.\n${t}`)).toEqual([]); });
+
+  it.each([
+    'Your CRM: 15,490 leads across 97 lists',
+    'Summary: 15,490 leads across 97 lists',
+    'You have 97 lead lists (15,490 leads in total).',
+    'Your CRM has 15,490 leads across 97 lists.',
+  ])('%p is still a total claim', (t) => { expect(flagged(t)).toContain('inventory_total_not_in_tool_results'); });
+});
