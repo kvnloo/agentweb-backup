@@ -1028,7 +1028,7 @@ describe("POST /api/onboarding/icp/regenerate-one", () => {
       icpResult: goodPersonas,
     });
     await request(app).post("/api/onboarding/icp/regenerate-one").send({ icpId: "icp-1" });
-    expect(regenerateSingleIcpForUser).toHaveBeenLastCalledWith("user-1", 1, { deferStatusToFullRun: true });
+    expect(regenerateSingleIcpForUser).toHaveBeenLastCalledWith("user-1", 1, { statusOwnedElsewhere: true });
   });
 
   it("conditions the join write on that run still being in flight", async () => {

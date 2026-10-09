@@ -299,7 +299,7 @@ describe("regenerate-one edge cases found in review", () => {
 
   it("a card deleted while joined to a full run leaves the status to that run", async () => {
     const { release, llmFor } = gatedLlm({ a: fresh("A") });
-    const run = regenerateSingleIcpForUser("u1", 2, { ...deps(llmFor("a")), deferStatusToFullRun: true });
+    const run = regenerateSingleIcpForUser("u1", 2, { ...deps(llmFor("a")), statusOwnedElsewhere: true });
     // Deleted while the LLM call is in flight, i.e. before the regeneration re-reads.
     setTimeout(() => {
       table().row = { ...table().row, icpResult: table().row.icpResult.filter((p: any) => p.id !== "icp_2") };
@@ -314,11 +314,38 @@ describe("regenerate-one edge cases found in review", () => {
   });
 });
 
+describe("a regeneration that joined another card's claim", () => {
+  beforeEach(() => seed());
+
+  // Review finding: card B's click lands ~50ms after card A's, so B joins A's
+  // claim and leaves the status to it. When B's write lands FIRST, B used to
+  // return early and never refresh its competitor entry (A's cascade does not
+  // cover B), leaving per_icp[B] describing B's previous persona.
+  it("still refreshes its competitor entry and the mirror when its card lands before the claim owner finishes", async () => {
+    let releaseB!: () => void;
+    const gateB = new Promise<void>((r) => (releaseB = r));
+    const llmA = { generateJsonRobust: async () => { await gateB; await new Promise((r) => setTimeout(r, 80)); return { icp: fresh("A") }; } };
+    const llmB = { generateJsonRobust: async () => { await gateB; return { icp: fresh("B") }; } };
+
+    const a = regenerateSingleIcpForUser("u1", 0, deps(llmA));
+    const b = regenerateSingleIcpForUser("u1", 2, { ...deps(llmB), statusOwnedElsewhere: true });
+    setTimeout(releaseB, 5);
+    await Promise.all([a, b]);
+
+    expect(names()).toEqual(["Regenerated A", "Original 1", "Regenerated B", "Original 3", "Original 4"]);
+    expect(table().row.competitorResult.per_icp.map((e: any) => e.icp_id)).toEqual([
+      "Regenerated A", "Original 1", "Regenerated B", "Original 3", "Original 4",
+    ]);
+    expect(table().row.marketStrategy.icp.map((i: any) => i.title)).toEqual(names());
+    expect(table().row.icpStatus).toBe("ready");
+  });
+});
+
 describe("regenerate-one that joined a full /icp/start run", () => {
   it("saves only its card and leaves the status to the full run", async () => {
     seed();
     const { release, llmFor } = gatedLlm({ a: fresh("A") });
-    const run = regenerateSingleIcpForUser("u1", 2, { ...deps(llmFor("a")), deferStatusToFullRun: true });
+    const run = regenerateSingleIcpForUser("u1", 2, { ...deps(llmFor("a")), statusOwnedElsewhere: true });
     setTimeout(release, 5);
     await run;
 
@@ -337,7 +364,7 @@ describe("regenerate-one that joined a full /icp/start run", () => {
     };
     const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
     const { release, llmFor } = gatedLlm({ a: fresh("A") });
-    const run = regenerateSingleIcpForUser("u1", 2, { ...deps(llmFor("a")), deferStatusToFullRun: true });
+    const run = regenerateSingleIcpForUser("u1", 2, { ...deps(llmFor("a")), statusOwnedElsewhere: true });
     setTimeout(release, 5);
     await run;
     warn.mockRestore();
@@ -359,7 +386,7 @@ describe("regenerate-one that joined a full /icp/start run", () => {
       t.beforeUpdate = undefined;
     };
     const { release, llmFor } = gatedLlm({ a: fresh("A") });
-    const run = regenerateSingleIcpForUser("u1", 2, { ...deps(llmFor("a")), deferStatusToFullRun: true });
+    const run = regenerateSingleIcpForUser("u1", 2, { ...deps(llmFor("a")), statusOwnedElsewhere: true });
     setTimeout(release, 5);
     await run;
 

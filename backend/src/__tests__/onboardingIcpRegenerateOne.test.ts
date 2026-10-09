@@ -396,15 +396,17 @@ describe("generateSingleIcpForUser — model drops a required field", () => {
 // the record to `ready` while the full run was still going hid that run's
 // result until a reload.
 
-describe("regenerateSingleIcpForUser — joined a full run (deferStatusToFullRun)", () => {
+describe("regenerateSingleIcpForUser — joined a full run (statusOwnedElsewhere)", () => {
   beforeEach(() => jest.clearAllMocks());
 
   it("saves the card but writes no status while the full run is still running", async () => {
     userDb.getUserById.mockResolvedValue(seedUser());
     userDb.updateUser.mockResolvedValue({});
-    await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), deferStatusToFullRun: true });
+    await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), statusOwnedElsewhere: true });
 
-    expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    // No call changes the status (the claim's owner settles it); the card is
+    // saved by its slot, and the follow-up mirror/competitor writes still run.
+    expect(userDb.updateUser.mock.calls.some((c: any[]) => c[1]?.icpStatus !== undefined)).toBe(false);
     const [, patch, opts] = userDb.updateUser.mock.calls[0];
     // No status, no whole list: just the one slot.
     expect(patch).toEqual({});
@@ -419,7 +421,7 @@ describe("regenerateSingleIcpForUser — joined a full run (deferStatusToFullRun
       seedUser({ icpStartedAt: startedAt, icpResult: FIVE.map((p, i) => ({ ...p, id: `icp_x_${i}` })) }),
     );
     userDb.updateUser.mockResolvedValue({});
-    await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), deferStatusToFullRun: true });
+    await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), statusOwnedElsewhere: true });
     const opts = userDb.updateUser.mock.calls[0][2];
     expect(opts.condition.expression).toBe(
       "#icpStatus = :icpDeferRunning AND #icpStartedAt = :icpDeferStartedAt AND #icpResult[1].#icpCardId = :icpCardId",
@@ -437,7 +439,7 @@ describe("regenerateSingleIcpForUser — joined a full run (deferStatusToFullRun
       .mockRejectedValueOnce(Object.assign(new Error("cond"), { code: "ConditionalCheckFailedException" }))
       .mockResolvedValue({});
     await expect(
-      regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), deferStatusToFullRun: true }),
+      regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), statusOwnedElsewhere: true }),
     ).resolves.toBeUndefined();
     const withCard = userDb.updateUser.mock.calls.filter((c: any[]) => c[2]?.elementSets?.length);
     expect(withCard).toHaveLength(2);
@@ -449,7 +451,7 @@ describe("regenerateSingleIcpForUser — joined a full run (deferStatusToFullRun
     userDb.updateUser.mockResolvedValue({});
     const err = jest.spyOn(console, "error").mockImplementation(() => {});
     await expect(
-      regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: { name: "x" } }), deferStatusToFullRun: true }),
+      regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: { name: "x" } }), statusOwnedElsewhere: true }),
     ).rejects.toThrow("LLM returned no icp");
     expect(userDb.updateUser).not.toHaveBeenCalled();
     err.mockRestore();
@@ -458,7 +460,7 @@ describe("regenerateSingleIcpForUser — joined a full run (deferStatusToFullRun
   it("behaves normally (flips to ready) when the full run has already finished", async () => {
     userDb.getUserById.mockResolvedValue(seedUser({ icpStatus: "ready" }));
     userDb.updateUser.mockResolvedValue({});
-    await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), deferStatusToFullRun: true });
+    await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), statusOwnedElsewhere: true });
     // Status already left `running`: the card is still saved, in its own slot.
     expect(userDb.updateUser.mock.calls[0][2].elementSets[0].value.name).toBe(REGENERATED.name);
     expect(lastWrittenIcps()![1].name).toBe(REGENERATED.name);
