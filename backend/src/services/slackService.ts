@@ -698,37 +698,25 @@ export async function openRejectModal(
 export async function sendApprovalRequestWithTracking(
   request: ApprovalRequest & { channelName?: string }
 ): Promise<{ messageTs: string | null; approvalId: string }> {
-  // Send to Slack
-  const result = await sendApprovalRequest(request);
+  // ENG-273: Slack and WhatsApp are PEERS here — neither send depends on the other.
+  // The WhatsApp notice used to sit behind the Slack post, so a bot that was not in the
+  // channel (or a Slack outage) silently cost a reviewer their WhatsApp message too, even
+  // though their number was verified and reachable. An approval now counts as delivered
+  // if it reached the reviewer on EITHER channel; it fails only when it reached nobody.
+  let slackMessageTs: string | null = null;
+  let slackError: unknown = null;
+  try {
+    slackMessageTs = (await sendApprovalRequest(request)).messageTs;
+  } catch (error) {
+    slackError = error;
+  }
 
-  // Store in database for tracking
-  const { approvalDb } = await import('./approvalDb');
-  const approval = await approvalDb.createApproval({
-    assetUrl: request.imageUrl,
-    filename: request.filename,
-    assetType: request.assetType as any, // Cast to any to handle string to AssetType
-    executionId: request.executionId || '',
-    userId: request.userId,
-    slackChannel: request.channel,
-    slackChannelName: request.channelName || request.channel,
-    slackMessageTs: result.messageTs,
-    note: request.note,
-  });
-
-  console.log("✅ Approval request sent to Slack and stored in database");
-
-  // ENG-273: WhatsApp is a peer notification channel, not a second place to approve
-  // from. Deliberately placed here rather than at the four call sites: this is the one
-  // choke point every approval already passes through, so a new caller cannot forget it.
-  //
-  // The IMPORT is inside the guard, not just the call. notifyApprovalOnWhatsApp handles
-  // its own errors, but a module-load failure rejects before any of that code runs — and
-  // by this point Slack has already sent and the approval record already exists, so
-  // throwing here would fail an approval that actually succeeded and invite a duplicate
-  // on retry.
+  // The import sits inside the guard as well as the call: a module-load failure rejects
+  // before any of the notifier's own error handling runs.
+  let whatsappDelivered = false;
   try {
     const { notifyApprovalOnWhatsApp } = await import('./approvalChannelNotifier');
-    await notifyApprovalOnWhatsApp({
+    whatsappDelivered = await notifyApprovalOnWhatsApp({
       userId: request.userId,
       approvalChannel: request.channel,
       assetType: request.assetType,
@@ -742,8 +730,36 @@ export async function sendApprovalRequestWithTracking(
     );
   }
 
+  if (slackError && !whatsappDelivered) {
+    // Reached nobody. Surface the original Slack failure unchanged, and write no record:
+    // a tracked approval that no reviewer was ever shown can never be answered.
+    throw slackError;
+  }
+  if (slackError) {
+    console.warn(
+      '[slackService] Slack approval post failed but WhatsApp delivered — approval is tracked:',
+      (slackError as any)?.message || slackError,
+    );
+  }
+
+  // Store in database for tracking
+  const { approvalDb } = await import('./approvalDb');
+  const approval = await approvalDb.createApproval({
+    assetUrl: request.imageUrl,
+    filename: request.filename,
+    assetType: request.assetType as any, // Cast to any to handle string to AssetType
+    executionId: request.executionId || '',
+    userId: request.userId,
+    slackChannel: request.channel,
+    slackChannelName: request.channelName || request.channel,
+    slackMessageTs,
+    note: request.note,
+  });
+
+  console.log("\u2705 Approval request delivered and stored in database");
+
   return {
-    messageTs: result.messageTs,
+    messageTs: slackMessageTs,
     approvalId: approval.assetUrl // Use assetUrl as the ID since that's the primary key
   };
 }

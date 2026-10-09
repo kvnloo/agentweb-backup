@@ -49,18 +49,18 @@ export interface ApprovalChannelNotification {
 /**
  * Notify the requesting user's WhatsApp number, if they have connected and verified one.
  *
- * Never throws. A reviewer missing a WhatsApp ping is an inconvenience; an approval that
- * fails to send because a secondary channel was unreachable is a broken feature.
+ * Never throws. Resolves true only when the message was actually handed to WhatsApp, so
+ * the caller can tell "reached the reviewer here" from "nothing to send / send failed".
  */
 export async function notifyApprovalOnWhatsApp(
   params: ApprovalChannelNotification,
-): Promise<void> {
+): Promise<boolean> {
   try {
-    if (!params.userId) return;
+    if (!params.userId) return false;
 
     const { userDb } = await import('./db');
     const user = await userDb.getUserById(params.userId);
-    if (!user) return;
+    if (!user) return false;
 
     // Only notify someone who is genuinely an audience of THIS approval. `userId` is
     // the requester, and the reviewers are whoever watches the Slack channel the
@@ -78,11 +78,11 @@ export async function notifyApprovalOnWhatsApp(
     const watchesApprovalChannel = normalizeUserChannels(user as any).some(
       (c) => c.channel === 'slack' && c.enabled && c.destination === params.approvalChannel,
     );
-    if (!params.approvalChannel || !watchesApprovalChannel) return;
+    if (!params.approvalChannel || !watchesApprovalChannel) return false;
 
     await bootstrapMessagingChannels();
     const destination = await resolveDestination(user as any, 'whatsapp');
-    if (!destination) return;
+    if (!destination) return false;
 
     const assetType = params.assetType || 'Asset';
     const filename = params.filename || 'Untitled';
@@ -124,6 +124,7 @@ export async function notifyApprovalOnWhatsApp(
         userId: params.userId,
       });
     }
+    return true;
   } catch (error) {
     // Logged against the user id, never the phone number (CWE-532): the id is enough
     // to correlate this with the approval it belongs to.
@@ -131,6 +132,7 @@ export async function notifyApprovalOnWhatsApp(
       `[approval-notify] WhatsApp approval notice for user ${params.userId} failed:`,
       error instanceof Error ? error.message : error,
     );
+    return false;
   }
 }
 

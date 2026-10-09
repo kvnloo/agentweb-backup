@@ -175,12 +175,12 @@ describe('notifyApprovalOnWhatsApp', () => {
 
   it('never throws when the send fails', async () => {
     send.mockRejectedValue(new Error('131047 outside service window'));
-    await expect(notifyApprovalOnWhatsApp(params)).resolves.toBeUndefined();
+    await expect(notifyApprovalOnWhatsApp(params)).resolves.toBe(false);
   });
 
   it('never throws when the user lookup fails', async () => {
     (userDb.getUserById as jest.Mock).mockRejectedValue(new Error('dynamo down'));
-    await expect(notifyApprovalOnWhatsApp(params)).resolves.toBeUndefined();
+    await expect(notifyApprovalOnWhatsApp(params)).resolves.toBe(false);
   });
 
   it('keeps the phone number out of the failure log (CWE-532)', async () => {
@@ -247,7 +247,7 @@ describe('correlating an inbound button tap back to the approval', () => {
 
   it('still delivers the notification when recording the id fails', async () => {
     (settingsService.setSetting as jest.Mock).mockRejectedValue(new Error('dynamo down'));
-    await expect(notifyApprovalOnWhatsApp(params)).resolves.toBeUndefined();
+    await expect(notifyApprovalOnWhatsApp(params)).resolves.toBe(true);
   });
 
   it('reads the reference back', async () => {
