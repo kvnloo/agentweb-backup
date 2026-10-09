@@ -160,6 +160,11 @@ export class ToolBridge {
     return this.haltedSessions.has(sessionId);
   }
 
+  /** Checks a token without doing anything else. Throws ToolBridgeAuthError when it is not valid for the run. */
+  verify(token: string | undefined | null, expectedRunId?: string): RunToolTokenClaims {
+    return { ...this.authenticate(token, expectedRunId).claims };
+  }
+
   async listTools(token: string | undefined | null, expectedRunId?: string): Promise<BridgeListedTool[]> {
     const state = this.authenticate(token, expectedRunId);
     try {
