@@ -11,6 +11,10 @@ export interface WithImagesQuery {
 
 export const WITH_IMAGES_MAX_LIMIT = 200;
 
+interface AssetFile { url?: string; is_favorited?: boolean; [k: string]: unknown }
+interface AssetExecution { result_files?: AssetFile[]; [k: string]: unknown }
+export interface AssetTask { executions?: AssetExecution[]; latestExecutionTime?: string | null; [k: string]: unknown }
+
 function truthy(v: unknown): boolean {
   return v === 'true' || v === '1' || v === true;
 }
@@ -44,26 +48,26 @@ export function parseWithImagesQuery(query: Record<string, unknown>): WithImages
  * cursor (null when exhausted).
  */
 export function applyWithImagesQuery(
-  result: Record<string, any>,
+  result: Record<string, AssetTask>,
   q: WithImagesQuery,
   approvalStatusByUrl: Record<string, string | undefined> = {},
-): { tasks: Record<string, any>; nextCursor: number | null; total: number } {
-  const keepFile = (file: any): boolean => {
+): { tasks: Record<string, AssetTask>; nextCursor: number | null; total: number } {
+  const keepFile = (file: AssetFile): boolean => {
     if (q.favorites && !file?.is_favorited) return false;
-    if (q.approved && approvalStatusByUrl[file?.url] !== 'approved') return false;
+    if (q.approved && approvalStatusByUrl[file?.url ?? ''] !== 'approved') return false;
     return true;
   };
   const filtering = q.favorites || q.approved;
 
-  const entries: Array<[string, any]> = [];
+  const entries: Array<[string, AssetTask]> = [];
   for (const [taskId, task] of Object.entries(result)) {
     if (!filtering) {
       entries.push([taskId, task]);
       continue;
     }
     const executions = (task.executions || [])
-      .map((exec: any) => ({ ...exec, result_files: (exec.result_files || []).filter(keepFile) }))
-      .filter((exec: any) => exec.result_files.length > 0);
+      .map((exec) => ({ ...exec, result_files: (exec.result_files || []).filter(keepFile) }))
+      .filter((exec) => exec.result_files.length > 0);
     if (executions.length > 0) entries.push([taskId, { ...task, executions }]);
   }
 

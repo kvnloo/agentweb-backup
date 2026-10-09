@@ -28,7 +28,7 @@ describe('applyWithImagesQuery (ENG-2386)', () => {
   it('favorites keeps only favorited files and drops empty tasks', () => {
     const r = applyWithImagesQuery(result, { favorites: true, approved: false, cursor: 0 });
     expect(Object.keys(r.tasks)).toEqual(['c', 'a']);
-    expect(r.tasks.a.executions[0].result_files.map((f: any) => f.url)).toEqual(['u/a1.png']);
+    expect(r.tasks.a.executions?.[0].result_files?.map((f) => f.url)).toEqual(['u/a1.png']);
     expect(r.nextCursor).toBeNull();
   });
   it('approved uses approval status map', () => {

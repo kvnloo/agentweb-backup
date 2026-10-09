@@ -2652,7 +2652,7 @@ router.get('/executions/with-images', authenticateToken, async (req: Request, re
     let approvalStatusByUrl: Record<string, string | undefined> = {};
     if (parsed.approved) {
       const approvals = await approvalDb.getApprovalsByUserId(userId);
-      approvalStatusByUrl = Object.fromEntries(approvals.map((a: any) => [a.assetUrl, a.status]));
+      approvalStatusByUrl = Object.fromEntries(approvals.map((a) => [a.assetUrl, a.status]));
     }
     const { tasks, nextCursor, total } = applyWithImagesQuery(result, parsed, approvalStatusByUrl);
     // Paging metadata travels in headers so the body shape stays Record<taskId, task>.
