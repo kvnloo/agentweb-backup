@@ -166,4 +166,10 @@ describe('fathomOnboardingAdminRoutes', () => {
     expect(res.status).toBe(403);
     expect(applyFathomOnboardingReviewAction).not.toHaveBeenCalled();
   });
+
+  it('rejects malformed path ids before calling the review service', async () => {
+    const res = await request(app).post(`/api/admin/fathom-onboarding/users/${'x'.repeat(200)}/ingestions/rec-1/discard`);
+    expect(res.status).toBe(400);
+    expect(applyFathomOnboardingReviewAction).not.toHaveBeenCalled();
+  });
 });

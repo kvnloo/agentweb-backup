@@ -109,4 +109,33 @@ describe('applyFathomOnboardingReviewAction (ENG-270)', () => {
     await expect(applyFathomOnboardingReviewAction({ userId: 'u', recordingId: 'rec-1', action: 'discard', actorUserId: 'a' }, deps))
       .rejects.toMatchObject({ statusCode: 404 });
   });
+
+  it('refuses to discard a re-ingested needs_review item that still holds approved memories', async () => {
+    const users: Record<string, any> = { u: { userId: 'u', fathomOnboardingIngestions: [entry({ memoryIds: ['m1'] })] } };
+    await expect(applyFathomOnboardingReviewAction(
+      { userId: 'u', recordingId: 'rec-1', action: 'discard', actorUserId: 'admin' }, setup(users)))
+      .rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it('rolls back approved memories left on a re-ingested needs_review item', async () => {
+    const users: Record<string, any> = {
+      cust: { userId: 'cust', orgId: 'org-1', fathomOnboardingIngestions: [entry({ targetUserId: 'cust', memoryIds: ['m1'], orgMemoryIds: ['o1'] })] },
+    };
+    const deps = setup(users);
+    const out = await applyFathomOnboardingReviewAction({ userId: 'cust', recordingId: 'rec-1', action: 'rollback', actorUserId: 'admin' }, deps);
+    expect(deps.accountMemoryDb.deleteMemory).toHaveBeenCalledWith('cust', 'm1');
+    expect(deps.orgMemoryDb.deleteMemory).toHaveBeenCalledWith('org-1', 'o1');
+    expect(out.memoryIds).toEqual([]);
+    expect(out.orgMemoryIds).toEqual([]);
+  });
+
+  it('deletes org memories from the org they were written under, not the user\'s current org', async () => {
+    const users: Record<string, any> = {
+      cust: { userId: 'cust', orgId: 'org-new', fathomOnboardingIngestions: [entry({ status: 'reviewed', targetUserId: 'cust', orgMemoryIds: ['o1'], orgMemoryOrgId: 'org-old' })] },
+    };
+    const deps = setup(users);
+    await applyFathomOnboardingReviewAction({ userId: 'cust', recordingId: 'rec-1', action: 'rollback', actorUserId: 'admin' }, deps);
+    expect(deps.orgMemoryDb.deleteMemory).toHaveBeenCalledWith('org-old', 'o1');
+    expect(deps.orgMemoryDb.deleteMemory).not.toHaveBeenCalledWith('org-new', 'o1');
+  });
 });

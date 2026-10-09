@@ -97,8 +97,14 @@ router.get('/users/:userId', async (req, res) => {
   }
 });
 
+const VALID_PATH_ID = /^[A-Za-z0-9_.:@-]{1,128}$/;
+
 for (const action of ['discard', 'rollback'] as const) {
   router.post(`/users/:userId/ingestions/:recordingId/${action}`, async (req: any, res) => {
+    const { userId, recordingId } = req.params;
+    if (!VALID_PATH_ID.test(userId) || !VALID_PATH_ID.test(recordingId)) {
+      return res.status(400).json({ error: 'Invalid userId or recordingId' });
+    }
     try {
       const ingestion = await applyFathomOnboardingReviewAction({
         userId: req.params.userId,

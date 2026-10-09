@@ -68,6 +68,8 @@ export interface FathomOnboardingIngestion {
   featureRequestDrafts?: string[];
   memoryIds: string[];
   orgMemoryIds: string[];
+  /** Org the orgMemoryIds were written under (rollback deletes from here, not the user's current org). */
+  orgMemoryOrgId?: string | null;
   reviewOwnerUserId: string;
   error?: string | null;
   createdAt: string;
@@ -515,6 +517,7 @@ export async function ingestFathomOnboardingRecording(
   const now = deps.now();
   let memoryIds = previous?.memoryIds || [];
   let orgMemoryIds = previous?.orgMemoryIds || [];
+  let orgMemoryOrgId = previous?.orgMemoryOrgId || null;
 
   if (reviewed && target.userId) {
     const memoryContent = buildFathomOnboardingMemoryContent(context, { recordingUrl: input.recordingUrl });
@@ -528,6 +531,7 @@ export async function ingestFathomOnboardingRecording(
       try {
         const orgMemory = await deps.orgMemoryDb.addMemory(targetUser.orgId, 'insight', memoryContent, input.reviewOwnerUserId, undefined);
         orgMemoryIds = [orgMemory.memoryId];
+        orgMemoryOrgId = targetUser.orgId;
       } catch (error: any) {
         console.warn('[FathomOnboarding] Failed to write org memory; preserving account memory ledger:', error?.message);
       }
@@ -551,6 +555,7 @@ export async function ingestFathomOnboardingRecording(
     featureRequestDrafts: context.featureRequestDrafts || [],
     memoryIds,
     orgMemoryIds,
+    orgMemoryOrgId,
     reviewOwnerUserId: input.reviewOwnerUserId,
     error: null,
     createdAt: previous?.createdAt || now,
@@ -623,7 +628,8 @@ export async function applyFathomOnboardingReviewAction(
 
   if (input.action === 'discard') {
     if (item.status === 'discarded') return item;
-    if (item.status === 'reviewed') {
+    const hasApprovedMemories = (item.memoryIds || []).length > 0 || (item.orgMemoryIds || []).length > 0;
+    if (item.status === 'reviewed' || hasApprovedMemories) {
       throw new FathomOnboardingReviewError(409, 'Reviewed ingestion must be rolled back before it can be discarded.');
     }
     next = { ...item, status: 'discarded', updatedAt: now };
@@ -634,16 +640,23 @@ export async function applyFathomOnboardingReviewAction(
       }
     }
   } else {
-    if (item.status !== 'reviewed') return item;
+    // A reviewed item re-ingested with reviewed:false becomes needs_review but keeps its
+    // memory ids; rollback must still remove those approved memories.
+    const hasApprovedMemories = (item.memoryIds || []).length > 0 || (item.orgMemoryIds || []).length > 0;
+    if (item.status !== 'reviewed' && !hasApprovedMemories) return item;
     const targetUserId = item.targetUserId || input.userId;
     for (const memoryId of item.memoryIds || []) {
       await deps.accountMemoryDb.deleteMemory(targetUserId, memoryId);
     }
     if ((item.orgMemoryIds || []).length > 0) {
-      const target = targetUserId === input.userId ? user : await deps.userDb.getUserById(targetUserId);
-      if (target?.orgId) {
+      let orgId = item.orgMemoryOrgId || null;
+      if (!orgId) {
+        const target = targetUserId === input.userId ? user : await deps.userDb.getUserById(targetUserId);
+        orgId = target?.orgId || null;
+      }
+      if (orgId) {
         for (const memoryId of item.orgMemoryIds) {
-          await deps.orgMemoryDb.deleteMemory(target.orgId, memoryId);
+          await deps.orgMemoryDb.deleteMemory(orgId, memoryId);
         }
       }
     }
@@ -653,6 +666,7 @@ export async function applyFathomOnboardingReviewAction(
       extractionState: 'auto_extracted',
       memoryIds: [],
       orgMemoryIds: [],
+      orgMemoryOrgId: null,
       updatedAt: now,
     };
   }
