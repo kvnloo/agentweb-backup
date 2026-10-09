@@ -419,6 +419,29 @@ async function mirrorIcpsToMarketStrategy(
 }
 
 /**
+ * Mirror the AUTHORITATIVE persona list to marketStrategy, re-checking after
+ * the write. The mirror is a whole-list write, so two regenerations finishing
+ * together could each mirror a list lacking the other's card, the last one
+ * winning. Re-reading `icpResult` consistently and re-mirroring until the list
+ * is unchanged across a write makes the final mirror always match it: whichever
+ * regeneration finishes last sees the final list and corrects an older mirror.
+ */
+async function mirrorIcpsUntilStable(userId: string, completedAt: string): Promise<void> {
+  const MAX_MIRROR_PASSES = 3;
+  const listOf = async (): Promise<ICPPersona[] | null> => {
+    const u: any = await readUserForRegeneration(userId);
+    return u && Array.isArray(u.icpResult) ? (u.icpResult as ICPPersona[]) : null;
+  };
+  for (let pass = 0; pass < MAX_MIRROR_PASSES; pass++) {
+    const before = await listOf();
+    if (!before) return;
+    await mirrorIcpsToMarketStrategy(userId, before, completedAt);
+    const after = await listOf();
+    if (!after || JSON.stringify(after) === JSON.stringify(before)) return;
+  }
+}
+
+/**
  * Pure LLM call — exported for unit-testing with an injected LLMService.
  *
  * Uses `generateJsonRobust` (not `generateJSONContent`) so a stray prose
@@ -714,79 +737,109 @@ export async function regenerateSingleIcpForUser(
       target,
     );
 
-    // Re-read: the LLM call took ~20s and the user may have edited another
-    // card meanwhile. Splice into the CURRENT list, not the one we started
-    // from, or we silently revert their edit.
-    const current: any = (await readUserForRegeneration(userId)) ?? user;
-    const currentList: ICPPersona[] = Array.isArray(current.icpResult)
-      ? [...current.icpResult]
-      : [...personas];
+    // The LLM call took seconds, and the user may have edited, deleted or
+    // regenerated ANOTHER card meanwhile. Writing back a whole list built from a
+    // read taken before the write silently reverts those (a lost update: two
+    // regenerations finishing together each wrote a list lacking the other's
+    // card). Instead the write replaces ONLY this card's slot, conditioned on
+    // the slot still holding this card; if the condition fails (the list shifted
+    // or the card changed) re-read and retry.
+    const MAX_CARD_WRITE_ATTEMPTS = 4;
+    let current: any = (await readUserForRegeneration(userId)) ?? user;
+    let patch: ICPStatusFields | null = null;
+    let wrote = false;
+    let writtenAt = -1;
+    let deferred = false;
+    for (let attempt = 0; attempt < MAX_CARD_WRITE_ATTEMPTS && !wrote; attempt++) {
+      if (attempt > 0) current = (await readUserForRegeneration(userId)) ?? current;
+      const currentList: ICPPersona[] = Array.isArray(current.icpResult)
+        ? [...current.icpResult]
+        : [...personas];
 
-    // Re-resolve the target by its stable id, NOT by the index we started with.
-    // A concurrent /icp/delete-one during the ~20s LLM call shifts every later
-    // persona down a slot, so the original index now names a different card —
-    // splicing there would overwrite a persona the user never touched.
-    // (Records predating stable ids fall back to the bounded index.)
-    const spliceAt = target.id
-      ? currentList.findIndex((p) => p?.id === target.id)
-      : index < currentList.length
-        ? index
-        : -1;
+      // Re-resolve the target by its stable id, NOT by the index we started with.
+      // A concurrent /icp/delete-one shifts every later persona down a slot, so
+      // the original index now names a different card. (Records predating
+      // stable ids fall back to the bounded index.)
+      const spliceAt = target.id
+        ? currentList.findIndex((p) => p?.id === target.id)
+        : index < currentList.length
+          ? index
+          : -1;
 
-    if (spliceAt < 0) {
-      // The card was deleted while we were regenerating it. Nothing to write —
-      // but the status must still leave `running`, or the FE spins until it
-      // times out.
-      console.warn("[onboardingIcpService] regenerated persona no longer exists", {
-        userId,
-        icpId: target.id,
-      });
-      const gonePatch = icpReadyPatch(current, currentList);
-      if (gonePatch) await userDb.updateUser(userId, gonePatch as any);
-      return;
-    }
+      if (spliceAt < 0) {
+        // The card was deleted while we were regenerating it. Nothing to write —
+        // but the status must still leave `running`, or the FE spins until it
+        // times out.
+        console.warn("[onboardingIcpService] regenerated persona no longer exists", {
+          userId,
+          icpId: target.id,
+        });
+        const gonePatch = icpReadyPatch(current, currentList);
+        if (gonePatch) await userDb.updateUser(userId, gonePatch as any);
+        return;
+      }
 
-    currentList[spliceAt] = fresh;
+      const [card] = sanitizeICPPersonas([fresh]);
+      // The slot must still hold the card we are replacing. A record without
+      // stable ids can only assert that the slot exists (DynamoDB would append
+      // past the end of the list otherwise).
+      const slot: Record<string, string> = target.id
+        ? { "#icpResult": "icpResult", "#icpCardId": "id" }
+        : { "#icpResult": "icpResult" };
+      const slotIsOurs = target.id
+        ? "#icpResult[" + spliceAt + "].#icpCardId = :icpCardId"
+        : "attribute_exists(#icpResult[" + spliceAt + "])";
+      const slotValues: Record<string, unknown> = target.id ? { ":icpCardId": target.id } : {};
 
-    if (deps.deferStatusToFullRun && current.icpStatus === "running") {
-      // The full run replaces every non-anchored card when it lands, and its
-      // cascade re-derives the mirror and competitors, so only the card is saved.
-      // Conditioned on the run we joined still being in flight: if its result
-      // landed while this card was being read-modify-written, that newer full
-      // set must not be overwritten by the old list plus this card.
+      const joinedFullRun = Boolean(deps.deferStatusToFullRun) && current.icpStatus === "running";
+      // Joined a full run: save the card only. It replaces every non-anchored
+      // card when it lands and its cascade re-derives the mirror and competitors,
+      // and the write is conditioned on that run still being in flight so a
+      // newer full set is never overwritten by this one.
+      patch = joinedFullRun ? null : icpReadyPatch(current, currentList);
+      const { icpResult: _wholeList, ...statusOnly } = (patch ?? {}) as Record<string, unknown>;
       try {
-        await userDb.updateUser(userId, { icpResult: sanitizeICPPersonas(currentList) } as any, {
+        await userDb.updateUser(userId, statusOnly as any, {
+          elementSets: [{ path: ["icpResult"], index: spliceAt, value: card }],
           condition: {
-            expression: "#icpStatus = :icpDeferRunning AND #icpStartedAt = :icpDeferStartedAt",
-            names: { "#icpStatus": "icpStatus", "#icpStartedAt": "icpStartedAt" },
-            values: { ":icpDeferRunning": "running", ":icpDeferStartedAt": current.icpStartedAt },
+            expression: joinedFullRun
+              ? `#icpStatus = :icpDeferRunning AND #icpStartedAt = :icpDeferStartedAt AND ${slotIsOurs}`
+              : slotIsOurs,
+            names: joinedFullRun
+              ? { ...slot, "#icpStatus": "icpStatus", "#icpStartedAt": "icpStartedAt" }
+              : slot,
+            values: joinedFullRun
+              ? { ...slotValues, ":icpDeferRunning": "running", ":icpDeferStartedAt": current.icpStartedAt }
+              : slotValues,
           },
         });
+        wrote = true;
+        writtenAt = spliceAt;
+        deferred = joinedFullRun;
       } catch (err: any) {
         if (err?.code !== "ConditionalCheckFailedException") throw err;
-        console.warn("[onboardingIcpService] full run landed first — dropping deferred card save", { userId });
+        if (joinedFullRun) {
+          // The run we joined finished (or was replaced) while this card was
+          // being written; its set stands, ours is dropped.
+          console.warn("[onboardingIcpService] full run landed first — dropping deferred card save", { userId });
+          return;
+        }
+        // Slot moved or changed under us: loop to re-read and re-resolve.
       }
-      return;
     }
+    if (!wrote) {
+      throw new Error("could not save the regenerated persona: the ICP list kept changing");
+    }
+    if (deferred) return;
 
-    const patch = icpReadyPatch(current, currentList);
-    if (patch) {
-      await userDb.updateUser(userId, patch as any);
-    } else {
-      // Not `running` any more: a concurrently-started regeneration of another
-      // card already completed and flipped the record to `ready`. Persist the
-      // persona anyway — dropping it loses the card the user asked for and
-      // leaves its spinner stuck. Status belongs to whoever owns it now.
-      await userDb.updateUser(userId, { icpResult: sanitizeICPPersonas(currentList) } as any);
-    }
     // Use whichever icpCompletedAt this write actually landed under — the
     // patch's freshly-stamped one, or (when another regeneration already
     // owned the `ready` transition) the one already on the record.
     const mirroredCompletedAt =
       patch?.icpCompletedAt ?? current.icpCompletedAt ?? new Date().toISOString();
-    await mirrorIcpsToMarketStrategy(userId, currentList, mirroredCompletedAt);
+    await mirrorIcpsUntilStable(userId, mirroredCompletedAt);
 
-    await regenerateCompetitorEntry(userId, current, brand, fresh, spliceAt, deps);
+    await regenerateCompetitorEntry(userId, current, brand, fresh, writtenAt, deps);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const current = await userDb.getUserById(userId);
@@ -839,10 +892,33 @@ async function regenerateCompetitorEntry(
     const result = await competitor.generateCompetitorStrategyForUser(brand, [persona], undefined, usageContext);
     const entry = result?.per_icp?.[0];
     if (!entry) return;
-    const next = [...existing];
-    next[index] = entry;
-    await userDb.updateUser(userId, { competitorResult: { per_icp: next } } as any);
-  } catch (err) {
+    // Replace only this persona's entry. The LLM and web-search calls above
+    // take long enough for another regeneration to finish meanwhile, and
+    // writing back the whole `per_icp` read before them would erase its entry.
+    // `icp_id` is the persona name the slot was generated for, so a list that
+    // shifted under us (a delete) fails the condition instead of corrupting a
+    // neighbour's entry.
+    const slotIcpId = (existing[index] as { icp_id?: unknown } | undefined)?.icp_id;
+    const slot = "#competitorResult.#perIcp[" + index + "]";
+    await userDb.updateUser(userId, {} as any, {
+      elementSets: [{ path: ["competitorResult", "per_icp"], index, value: entry }],
+      condition: {
+        expression: typeof slotIcpId === "string" ? `${slot}.#icpId = :slotIcpId` : `attribute_exists(${slot})`,
+        names:
+          typeof slotIcpId === "string"
+            ? { "#competitorResult": "competitorResult", "#perIcp": "per_icp", "#icpId": "icp_id" }
+            : { "#competitorResult": "competitorResult", "#perIcp": "per_icp" },
+        values: typeof slotIcpId === "string" ? { ":slotIcpId": slotIcpId } : {},
+      },
+    });
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") {
+      console.warn("[onboardingIcpService] competitor slot changed under the refresh — skipped", {
+        userId,
+        index,
+      });
+      return;
+    }
     const msg = err instanceof Error ? err.message : String(err);
     console.error("[onboardingIcpService] competitor entry refresh failed", {
       userId,
