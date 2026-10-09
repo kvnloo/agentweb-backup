@@ -1394,6 +1394,20 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
       ? slackChannels.map((c: any) => String(c).trim()).filter(Boolean)
       : [];
 
+    // One platform per customer (ENG-273): an account on WhatsApp cannot also be given a
+    // Slack channel. Clearing channels is always allowed — that is how Slack is removed.
+    if (channels.length > 0) {
+      const { hasWhatsApp } = await import('../services/customerChannelPolicy');
+      if (hasWhatsApp(user)) {
+        return res.status(409).json({
+          message:
+            'This account is already connected to WhatsApp. An account can use one messaging platform, so disconnect WhatsApp before assigning a Slack channel.',
+          code: 'platform_conflict',
+          connected: 'whatsapp',
+        });
+      }
+    }
+
     const { settingsService } = await import('../services/settingsService');
     // Invalidate by userId (old assignments) AND by channel ID (channels that may be cached under a different user)
     const oldChannels: string[] = (user.slackChannels ?? []).concat(user.slackChannel ? [user.slackChannel] : []);

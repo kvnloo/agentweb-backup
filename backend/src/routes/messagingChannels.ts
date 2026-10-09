@@ -26,6 +26,7 @@ import { explicitChannels, normalizeUserChannels } from '../services/messagingCh
 import { getDisplayPhoneNumber, isOptedOut } from '../services/whatsappService';
 import { getVerificationStatus, startVerification } from '../services/whatsappVerificationService';
 import { unbindPhone } from '../services/whatsappService';
+import { assertCanConnect, PlatformConflictError } from '../services/customerChannelPolicy';
 
 const router = express.Router();
 
@@ -72,6 +73,19 @@ router.post('/whatsapp/verification', authenticateToken, async (req: any, res: a
         error:
           'Explicit opt-in is required before WhatsApp messages can be sent to this number.',
       });
+    }
+
+    // One platform per customer: an account already on Slack cannot also connect
+    // WhatsApp. Checked before a code is issued, so they are told now rather than after
+    // texting a code that would then be refused.
+    const account = await userDb.getUserById(req.user.userId);
+    try {
+      await assertCanConnect(account, 'whatsapp');
+    } catch (conflict: any) {
+      if (conflict instanceof PlatformConflictError) {
+        return res.status(409).json({ error: conflict.message, code: 'platform_conflict', connected: conflict.connected });
+      }
+      throw conflict;
     }
 
     // Resolve the business number BEFORE issuing a code, so a failure here does not

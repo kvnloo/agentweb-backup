@@ -79,7 +79,7 @@ beforeEach(() => {
   jest.resetAllMocks();
   store.clear();
   users.clear();
-  users.set('u1', { userId: 'u1', slackChannels: ['C1'] });
+  users.set('u1', { userId: 'u1' });
   clock = Date.parse('2026-09-21T12:00:00.000Z');
   jest.spyOn(Date, 'now').mockImplementation(() => clock);
 
@@ -233,31 +233,53 @@ describe('completeVerification — the happy path', () => {
   });
 });
 
-describe('completeVerification — does not disturb other channels (Greptile P1 invariants)', () => {
-  it('does NOT copy a legacy Slack channel into messagingChannels', async () => {
-    // Persisting the normalized list would write the user's CURRENT Slack destination in
-    // as an explicit entry, and an explicit entry outranks the legacy field — so a later
-    // admin re-mapping would be silently ignored. Connecting WhatsApp must not freeze Slack.
+describe('completeVerification — one platform per customer', () => {
+  it('writes only the WhatsApp entry for an account with no Slack', async () => {
     await completeVerification(await begin(), PHONE);
     const saved = users.get('u1').messagingChannels;
-    expect(saved.some((c: any) => c.channel === 'slack')).toBe(false);
     expect(saved).toHaveLength(1);
+    expect(saved[0].channel).toBe('whatsapp');
   });
 
-  it('leaves the Slack user still resolvable on Slack, following an admin re-map', async () => {
-    await completeVerification(await begin(), PHONE);
-    const remapped = { ...users.get('u1'), slackChannels: ['C-remapped-by-admin'] };
-    expect(await resolveDestination(remapped, 'slack')).toBe('C-remapped-by-admin');
+  it('refuses to connect WhatsApp for an account that was given a Slack channel', async () => {
+    // The portal checks when the code is issued, but a Slack channel can be assigned
+    // during the ten minutes the code stays live — so the bind checks again.
+    const code = await begin();
+    users.set('u1', { userId: 'u1', slackChannels: ['C1'] });
+
+    await expect(completeVerification(code, PHONE)).resolves.toBe('other_platform');
+    expect(users.get('u1').messagingChannels).toBeUndefined();
+    expect(whatsapp.bindPhoneToUser).not.toHaveBeenCalled();
   });
 
-  it('preserves an explicitly-configured non-WhatsApp entry', async () => {
+  it('refuses for an explicitly-configured Slack entry too, and leaves it untouched', async () => {
+    const code = await begin();
     users.set('u1', {
       userId: 'u1',
       messagingChannels: [{ channel: 'slack', destination: 'C-explicit', enabled: true }],
     });
-    await completeVerification(await begin(), PHONE);
-    const saved = users.get('u1').messagingChannels;
-    expect(saved.find((c: any) => c.channel === 'slack')?.destination).toBe('C-explicit');
+
+    await expect(completeVerification(code, PHONE)).resolves.toBe('other_platform');
+    expect(users.get('u1').messagingChannels).toEqual([
+      { channel: 'slack', destination: 'C-explicit', enabled: true },
+    ]);
+  });
+
+  it('refuses for an account whose onboarding provisioned a Slack Connect channel', async () => {
+    const code = await begin();
+    users.set('u1', { userId: 'u1', slackConnectChannelId: 'C0CONNECT', slackConnectStatus: 'created' });
+    await expect(completeVerification(code, PHONE)).resolves.toBe('other_platform');
+  });
+
+  it('tells the customer why their number was not connected', async () => {
+    const code = await begin();
+    users.set('u1', { userId: 'u1', slackChannels: ['C1'] });
+    whatsapp.sendMessage.mockResolvedValue({ messageId: 'x' });
+
+    await handleVerificationMessage(`Verify ${code}`, PHONE);
+    expect(whatsapp.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ text: expect.stringMatching(/already connected to Slack/) }),
+    );
   });
 
   it('replaces an existing WhatsApp entry rather than adding a second', async () => {

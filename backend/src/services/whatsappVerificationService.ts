@@ -36,6 +36,7 @@ import crypto from 'crypto';
 import { settingsService } from './settingsService';
 import { userDb } from './db';
 import { explicitChannels, type UserMessagingChannelConfig } from './messagingChannelService';
+import { hasSlack } from './customerChannelPolicy';
 import {
   bindPhoneToUser,
   isOptedOut,
@@ -188,6 +189,8 @@ export type VerificationOutcome =
   | 'already_verified'
   | 'invalid'
   | 'opted_out'
+  /** The account connected Slack after this code was issued; one platform per customer. */
+  | 'other_platform'
   | 'rate_limited';
 
 async function failureCount(phone: string): Promise<number> {
@@ -311,6 +314,12 @@ export async function completeVerification(rawCode: string, sender: string): Pro
 
   // We hold the claim (fresh, or resumed after a crash). Save the channel, THEN mark the
   // code verified — so a failure in between is retried rather than lost.
+  // One platform per customer, re-checked at the moment of binding: the portal checks
+  // when the code is issued, but a Slack channel can be assigned in the ten minutes the
+  // code stays live.
+  const account = await userDb.getUserById(row.userId);
+  if (account && (await hasSlack(account))) return 'other_platform';
+
   if (!(await saveVerifiedChannel(row, phone))) return 'invalid';
 
   const verifiedAt = new Date().toISOString();
@@ -333,6 +342,9 @@ const REPLIES: Partial<Record<VerificationOutcome, string>> = {
   verified:
     "You're connected. AgentWeb will send your notifications to this WhatsApp number. " +
     'Reply STOP at any time to opt out.',
+  other_platform:
+    'This AgentWeb account is already connected to Slack. An account can use one messaging ' +
+    'platform, so this number was not connected.',
   invalid:
     "That verification code isn't valid or has expired. " +
     'Start again from AgentWeb Settings → Notifications to get a new one.',

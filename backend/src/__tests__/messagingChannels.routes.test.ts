@@ -122,6 +122,34 @@ describe('POST /whatsapp/verification', () => {
   beforeEach(() => {
     getDisplayPhoneNumber.mockResolvedValue('14155550100');
     startVerification.mockResolvedValue({ code: 'K7Q2M9XA', expiresAt: '2026-09-21T12:10:00.000Z' });
+    userDb.getUserById.mockResolvedValue({ userId: 'u1' });
+  });
+
+  it('refuses an account that is already on Slack — one platform per customer', async () => {
+    userDb.getUserById.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
+    const res = await request(app)
+      .post('/api/messaging-channels/whatsapp/verification')
+      .send({ optIn: true });
+
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe('platform_conflict');
+    expect(res.body.connected).toBe('slack');
+    expect(res.body.error).toMatch(/already connected to Slack/);
+    // No code is issued for a connection that would be refused at the other end.
+    expect(startVerification).not.toHaveBeenCalled();
+  });
+
+  it('allows re-verifying for an account already on WhatsApp', async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: 'u1',
+      messagingChannels: [
+        { channel: 'whatsapp', destination: '+14155550123', enabled: true, optIn: { verifiedAt: 'y' } },
+      ],
+    });
+    const res = await request(app)
+      .post('/api/messaging-channels/whatsapp/verification')
+      .send({ optIn: true });
+    expect(res.status).toBe(200);
   });
 
   it('starts a verification and returns the code with a ready-to-tap WhatsApp link', async () => {

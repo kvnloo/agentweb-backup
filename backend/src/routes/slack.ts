@@ -33,6 +33,7 @@ import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
 import { taskDb, subscriberDb } from "../services/db";
 import { emailService } from "../services/emailService";
 import { notifySubscribersOfApproval } from "../services/approvalSubscriberNotify";
+import { hasWhatsApp } from "../services/customerChannelPolicy";
 import { createRevisionExecutionFromSlack } from "../controllers/tasks";
 import { isSessionLimitError } from "../utils/agentModeErrors";
 import { sendAgentModeOncallAlert } from "../utils/agentModeAlerts";
@@ -612,6 +613,17 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
               await slackClient.chat.postMessage({
                 channel,
                 text: `User not found: ${targetEmail}`,
+                thread_ts: responseThreadTs
+              });
+              return;
+            }
+
+            // One platform per customer: an account on WhatsApp cannot also be linked
+            // to a Slack channel.
+            if (hasWhatsApp(targetUser)) {
+              await slackClient.chat.postMessage({
+                channel,
+                text: `${targetEmail} is already connected to WhatsApp. An account can use one messaging platform, so disconnect WhatsApp before linking a Slack channel.`,
                 thread_ts: responseThreadTs
               });
               return;
