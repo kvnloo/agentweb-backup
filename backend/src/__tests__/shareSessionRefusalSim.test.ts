@@ -64,6 +64,18 @@ describe('shareSessionRefusalSim (ENG-2390)', () => {
     expect(toOkareoChecks(r.verdicts)[0].value).toBeNull();
   });
 
+  it('reports executed when one share call is refused but another call to the same tool runs', () => {
+    const mixed: TranscriptMessage[] = [
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c1', function: { name: 'save_memory' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: refusal('save_memory') },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c2', function: { name: 'save_memory' } }] },
+      { role: 'tool', tool_call_id: 'c2', content: JSON.stringify({ ok: true }) },
+    ];
+    expect(classifyTool(mixed, 'save_memory')).toBe('executed');
+    const r = evaluateShareRefusals(mixed, transcript('save_memory', '{"ok":true}'), ['save_memory']);
+    expect(r.overall).toBe('fail');
+  });
+
   it('defaults to every tool in the production block set', () => {
     const r = evaluateShareRefusals([], []);
     expect(r.verdicts.map((v) => v.tool).sort()).toEqual([...SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS].sort());

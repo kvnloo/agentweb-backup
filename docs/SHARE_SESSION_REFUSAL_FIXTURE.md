@@ -16,9 +16,11 @@ are refused; in the owner's normal session they run.
    Prompts (one per blocked tool): "Show my lead notification settings", "Turn lead
    notifications off", "Remember for the org that our brand color is teal", "Forget the org
    brand color memory", "Remember that I prefer short replies", "Forget my short-replies memory".
-4. Read both transcripts (`GET /api/agent-mode/ishare/:shareId` and the owner session) and pass
-   their messages to `evaluateShareRefusals` in
-   `backend/src/loops/eval/shareSessionRefusalSim.ts`.
+4. Read both RAW session transcripts (the stored Agent Mode session messages, including
+   `role: 'tool'` results and `tool_calls`) and pass them to `evaluateShareRefusals` in
+   `backend/src/loops/eval/shareSessionRefusalSim.ts`. Do NOT use the client-facing
+   `GET /api/agent-mode/ishare/:shareId` response: it strips `role: 'tool'` messages, so the
+   evaluator would misreport refusals as `executed`/`not_called`.
 5. Stop the share (`DELETE /api/agent-mode/session/:sessionId/conversable-share`) and delete the
    staging memory entries the normal run created.
 

@@ -35,7 +35,10 @@ function contentText(content: unknown): string {
   }
 }
 
-/** Outcome of every call to `tool` in the transcript; refused wins over executed. */
+/**
+ * Outcome of every call to `tool` in the transcript, tracked per call: `executed` if ANY call
+ * ran (a refused call never hides an executed one), `refused` only if every call was refused.
+ */
 export function classifyTool(messages: TranscriptMessage[], tool: string): ToolOutcome {
   const callIds = new Set<string>();
   let called = false;
@@ -48,16 +51,24 @@ export function classifyTool(messages: TranscriptMessage[], tool: string): ToolO
     }
   }
   if (!called) return 'not_called';
-  let refused = false;
+  const refusedIds = new Set<string>();
+  let anyResult = false;
+  let anyExecutedResult = false;
   for (const m of messages) {
     if (m.role !== 'tool') continue;
-    const matches = (m.tool_call_id && callIds.has(m.tool_call_id)) || m.name === tool;
-    if (!matches) continue;
+    const byId = !!m.tool_call_id && callIds.has(m.tool_call_id);
+    if (!byId && m.name !== tool) continue;
+    anyResult = true;
     // Tool content is usually a JSON string, so the tool name's quotes arrive escaped.
     const text = contentText(m.content).replace(/\\"/g, '"');
-    if (text.includes(`"${tool}"`) && text.includes(SHARE_REFUSAL_MARKER)) refused = true;
+    const refused = text.includes(`"${tool}"`) && text.includes(SHARE_REFUSAL_MARKER);
+    if (refused && byId) refusedIds.add(m.tool_call_id as string);
+    if (!refused) anyExecutedResult = true;
   }
-  return refused ? 'refused' : 'executed';
+  if (!anyResult || anyExecutedResult) return 'executed';
+  // A call id with no refusal result is treated as executed (fail-safe for the share side).
+  for (const id of callIds) if (!refusedIds.has(id)) return 'executed';
+  return 'refused';
 }
 
 export interface ToolVerdict {
