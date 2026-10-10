@@ -2504,6 +2504,7 @@ function extractFileAttachmentsFromVariables(
 
 // ENG-1379: re-remind a schedule blocked on missing variables at most once per window.
 export const SCHEDULED_CHAT_VARIABLE_REMINDER_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+export const SCHEDULED_CHAT_VARIABLE_LINK_GRACE_MS = 60 * 60 * 1000;
 
 /**
  * PURE. True when a still-outstanding variable request (token issued, not yet
@@ -14493,7 +14494,10 @@ export const agentModeController = {
             const requestedVariableNames = missingVariableNames.length > 0
               ? missingVariableNames
               : scheduleVariables.map(variable => variable.name);
-            const variableAccessTokenExpiresAtDate = new Date(nextRunTime.getTime() - (30 * 60 * 1000));
+            // ENG-1379: an outstanding link is retained across suppressed runs and
+            // only extended when the next run becomes due, so it must stay valid
+            // past that run (grace for the dispatcher to reach it), never lapse before.
+            const variableAccessTokenExpiresAtDate = new Date(nextRunTime.getTime() + SCHEDULED_CHAT_VARIABLE_LINK_GRACE_MS);
             const variableAccessTokenExpiresAt = variableAccessTokenExpiresAtDate.toISOString();
 
             // ENG-1379: a schedule stuck on missing variables used to mint a new
@@ -14566,6 +14570,17 @@ export const agentModeController = {
               }
             } catch (error) {
               console.error(`Error sending variable request email for schedule ${schedule.scheduleName}:`, error);
+              // ENG-1379: the request was never delivered, so it must not count as
+              // outstanding. Drop the token so the next due run re-sends instead of
+              // suppressing for the whole reminder window.
+              try {
+                await scheduleDb.updateSchedule(schedule.scheduleId, {
+                  updatedAt: new Date().toISOString(),
+                  variableRequestAccessTokenHash: ''
+                });
+              } catch (clearError) {
+                console.error(`Error clearing undelivered variable request token for schedule ${schedule.scheduleName}:`, clearError);
+              }
             }
 
             results.push({
