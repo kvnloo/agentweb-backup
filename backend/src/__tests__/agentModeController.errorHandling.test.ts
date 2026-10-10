@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import { PROVIDER_UNAVAILABLE_USER_MESSAGE } from '../utils/agentModeErrors';
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { emailService } from '../services/emailService';
@@ -302,6 +303,35 @@ describe('AgentModeController - Error Handling', () => {
       expect(mockRes.status).toHaveBeenCalledWith(500);
 
       consoleErrorSpy.mockRestore();
+    });
+  });
+
+  describe('generateResponse - provider unavailable (ENG-2381)', () => {
+    it('answers 503 PROVIDER_UNAVAILABLE and does not page oncall as an unknown error', async () => {
+      const wrapped: any = new Error(PROVIDER_UNAVAILABLE_USER_MESSAGE);
+      wrapped.originalMessage = '503 Provider returned error';
+      wrapped.status = 503;
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(wrapped);
+
+      const mockReq = {
+        user: { userId: mockUserId, email: 'test@example.com' },
+        body: { sessionId: mockSessionId, userMessage: 'How many lead lists?' },
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
+      } as unknown as Request;
+      const mockRes = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+
+      await agentModeController.generateResponse(mockReq, mockRes);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(mockRes.status).toHaveBeenCalledWith(503);
+      expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'PROVIDER_UNAVAILABLE' }));
+      expect(mockEmailService.sendOncallAlert).not.toHaveBeenCalledWith(
+        'Agent Mode: Unknown Error in Generate Response', expect.anything(), expect.anything(),
+      );
     });
   });
 

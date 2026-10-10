@@ -183,3 +183,15 @@ export function isTransientLLMError(error: unknown): boolean {
 
   return TRANSIENT_MESSAGE_PATTERNS.some((pattern) => pattern.test(message) || pattern.test(originalMessage));
 }
+
+/**
+ * ENG-2381: user-facing message for a final upstream 5xx from the LLM provider.
+ * agentModeService wraps such errors with this message; the controller matches it
+ * via isProviderUnavailableError to answer 503 instead of an "Unknown Error" page.
+ */
+export const PROVIDER_UNAVAILABLE_USER_MESSAGE =
+  'The AI provider is temporarily unavailable. Please try again in a moment.';
+
+export function isProviderUnavailableError(error: unknown): boolean {
+  return error instanceof Error && error.message === PROVIDER_UNAVAILABLE_USER_MESSAGE;
+}

@@ -904,6 +904,30 @@ export interface LeadNotificationPayload {
   crmUrl?: string;
   eventType?: string;
   timestamp?: string;
+  /** Compact format (ENG-2391): render only name, phone, email; missing values shown as "—". */
+  compact?: boolean;
+}
+
+function formatCompactLeadNotificationPayload(lead: LeadNotificationPayload): {
+  text: string;
+  blocks: any[];
+} {
+  const dash = '—';
+  const value = (v?: string) => (typeof v === 'string' && v.trim() ? v.trim() : dash);
+  const name = [lead.firstName, lead.lastName].filter((v) => typeof v === 'string' && v.trim()).join(' ').trim() || dash;
+  const phone = value(lead.phone);
+  const email = value(lead.email);
+  const blocks = [
+    {
+      type: 'section',
+      fields: [
+        { type: 'mrkdwn', text: `*Name:*\n${name}` },
+        { type: 'mrkdwn', text: `*Phone:*\n${phone}` },
+        { type: 'mrkdwn', text: `*Email:*\n${email}` },
+      ],
+    },
+  ];
+  return { text: `Name: ${name} | Phone: ${phone} | Email: ${email}`, blocks };
 }
 
 /**
@@ -914,6 +938,9 @@ export function formatLeadNotificationPayload(lead: LeadNotificationPayload): {
   text: string;
   blocks: any[];
 } {
+  if (lead.compact) {
+    return formatCompactLeadNotificationPayload(lead);
+  }
   const fullName = [lead.firstName, lead.lastName].filter(Boolean).join(' ') || 'Unknown';
   const timestamp = lead.timestamp || new Date().toISOString();
   const eventLabel = lead.eventType || 'New lead added';
