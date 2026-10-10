@@ -13,8 +13,11 @@
 //   2. POST /api/batch-review/create with one asset, executionId `<session>-images`.
 //   3. POST /batch-review/:id/review decision=needs_changes -> triggerAutoRevision.
 //   4. Poll GET /batch-review/:id until a NEW asset URL appears (bounded timeout), then
-//      assert the source approval moved to revision_submitted and the new asset has its
-//      own persisted approval row (read back from the same endpoint).
+//      assert the source approval moved to revision_submitted and the new asset reports
+//      approval status pending. Approval states are retried until the deadline because
+//      revisionService appends the new asset before it updates the source approval.
+//      Note: GET /batch-review defaults a missing approval row to pending, so this
+//      endpoint cannot prove the new asset's approval row was persisted.
 //
 // The negative case (an unconfirmed image edit is classified "Agent Mode Revision:
 // Blocked on Image-Edit Confirmation") is a pure classification and is asserted
@@ -95,24 +98,30 @@ export async function run({
 
   const deadline = now() + timeoutMs;
   let last = null;
+  let pendingFailures = null;
   while (now() < deadline) {
     await sleep(pollMs);
     const r = await call("GET", `/batch-review/${batchId}`, null);
     if (r.status !== 200) throw new Error(`batch read failed: ${r.status}`);
     last = classifyOutcome(r.json, sourceUrl);
     if (last.state === "REVISED") {
-      const failures = [];
-      if (!/^https:\/\//.test(last.newAsset.assetUrl)) failures.push("new asset URL is not https");
-      if (last.newAsset.assetType !== "image") failures.push(`new asset type ${last.newAsset.assetType}`);
+      const fixed = [];
+      if (!/^https:\/\//.test(last.newAsset.assetUrl)) fixed.push("new asset URL is not https");
+      if (last.newAsset.assetType !== "image") fixed.push(`new asset type ${last.newAsset.assetType}`);
+      if (fixed.length) throw new Error(`FAIL: ${fixed.join("; ")}`);
+      const mutable = [];
       if (last.source?.approval?.status !== "revision_submitted") {
-        failures.push(`source approval ${last.source?.approval?.status ?? "missing"}, expected revision_submitted`);
+        mutable.push(`source approval ${last.source?.approval?.status ?? "missing"}, expected revision_submitted`);
       }
-      if (last.newAsset.approval?.status !== "pending") failures.push("new asset approval row not persisted");
-      if (failures.length) throw new Error(`FAIL: ${failures.join("; ")}`);
+      if (last.newAsset.approval?.status !== "pending") {
+        mutable.push(`new asset approval ${last.newAsset.approval?.status ?? "missing"}, expected pending`);
+      }
+      if (mutable.length) { pendingFailures = mutable; continue; }
       log(`PASS: batch ${batchId} revised -> ${last.newAsset.assetUrl}`);
       return { batchId, newAssetUrl: last.newAsset.assetUrl };
     }
   }
+  if (pendingFailures) throw new Error(`FAIL: ${pendingFailures.join("; ")}`);
   // No asset: the service alerted oncall with its classified reason; the verifier cannot
   // read that channel, so name the likely classes instead of a bare timeout.
   throw new Error(`FAIL: no revised asset within ${timeoutMs}ms for batch ${batchId} ` +

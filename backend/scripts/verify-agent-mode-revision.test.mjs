@@ -59,3 +59,25 @@ test("refuses non-QA accounts and missing fixture env", async () => {
 test("classifyOutcome reports PENDING when only the source exists", () => {
   assert.equal(classifyOutcome({ assets: [{ assetUrl: SRC }] }, SRC).state, "PENDING");
 });
+
+test("retries an intermediate state where the source approval has not updated yet", async () => {
+  const { opts, fetchImpl } = mk();
+  let reads = 0;
+  const flaky = async (url, init) => {
+    if (new URL(url).pathname === "/batch-review/b1" && init.method === "GET" && reads++ === 0) {
+      return reply(200, { assets: [
+        { assetUrl: SRC, assetType: "image", approval: { status: "needs_changes" } },
+        { assetUrl: NEW, assetType: "image", approval: { status: "pending" } },
+      ] });
+    }
+    return fetchImpl(url, init);
+  };
+  const out = await run({ ...opts, fetchImpl: flaky });
+  assert.equal(out.newAssetUrl, NEW);
+  assert.equal(reads, 2);
+});
+
+test("fails immediately on a non-image revised asset", async () => {
+  const { opts } = mk({ newType: "video" });
+  await assert.rejects(run(opts), /new asset type video/);
+});
