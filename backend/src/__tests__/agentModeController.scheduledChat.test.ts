@@ -2543,6 +2543,65 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
     });
 
+    // ENG-1379 AC1: an outstanding, unconsumed request from the last week must not re-email daily.
+    it('ENG-1379: skips the run but does not re-email while a recent unconsumed request is outstanding', async () => {
+      const sentAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([{
+        ...baseSchedule,
+        frequency: 'daily',
+        variables: [{ name: 'company_name', description: 'Company name' }],
+        variableValues: {},
+        variableRequestStatus: 'pending',
+        variableRequestSentAt: sentAt,
+        variableRequestAccessTokenHash: 'existing-hash',
+        variableRequestAccessTokenConsumedAt: '',
+        emailNotifications: ['notify@example.com'],
+      }] as any);
+      const mockRes = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+
+      await agentModeController.runScheduledChats({} as Request, mockRes);
+
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(response.results[0]).toEqual(expect.objectContaining({
+        status: 'waiting_for_variables',
+        reminderSuppressed: true,
+        missingVariables: ['company_name'],
+      }));
+      expect(mockEmailService.sendScheduledChatVariableRequestEmail).not.toHaveBeenCalled();
+      const update = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(c => c[0] === mockScheduleId)[1];
+      // Token preserved (link in the earlier email keeps working), only expiry extended.
+      expect(update.variableRequestAccessTokenHash).toBeUndefined();
+      expect(update.variableRequestSentAt).toBeUndefined();
+      expect(update.variableRequestAccessTokenExpiresAt).toBe(response.results[0].variableRequestExpiresAt);
+      expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    });
+
+    // ENG-1379 AC2: weekly reminder once the window elapses.
+    it('ENG-1379: re-sends the request once the reminder window has elapsed', async () => {
+      const sentAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([{
+        ...baseSchedule,
+        frequency: 'daily',
+        variables: [{ name: 'company_name', description: 'Company name' }],
+        variableValues: {},
+        variableRequestStatus: 'pending',
+        variableRequestSentAt: sentAt,
+        variableRequestAccessTokenHash: 'existing-hash',
+        variableRequestAccessTokenConsumedAt: '',
+        emailNotifications: ['notify@example.com'],
+      }] as any);
+      const mockRes = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+
+      await agentModeController.runScheduledChats({} as Request, mockRes);
+
+      expect(mockEmailService.sendScheduledChatVariableRequestEmail).toHaveBeenCalledTimes(1);
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(mockScheduleId, expect.objectContaining({
+        variableRequestStatus: 'pending',
+        variableRequestAccessTokenHash: expect.any(String),
+      }));
+    });
+
     it('should default to max 5 concurrent runs when MAX_CONCURRENT_RUNS is not set', async () => {
       delete process.env.MAX_CONCURRENT_RUNS;
       
