@@ -2445,7 +2445,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           variableRequestExpiresAt: expect.any(String),
         })
       );
-      expect(nextRunTime - variableRequestExpiresAt).toBe(30 * 60 * 1000);
+      // ENG-1379: link is retained across suppressed runs, so it must outlive the next run.
+      expect(variableRequestExpiresAt - nextRunTime).toBe(60 * 60 * 1000);
       expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
         mockScheduleId,
         expect.objectContaining({
@@ -2541,6 +2542,104 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect.any(String)
       );
       expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    });
+
+    // ENG-1379 AC1: an outstanding, unconsumed request from the last week must not re-email daily.
+    it('ENG-1379: skips the run but does not re-email while a recent unconsumed request is outstanding', async () => {
+      const sentAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([{
+        ...baseSchedule,
+        frequency: 'daily',
+        variables: [{ name: 'company_name', description: 'Company name' }],
+        variableValues: {},
+        variableRequestStatus: 'pending',
+        variableRequestSentAt: sentAt,
+        variableRequestAccessTokenHash: 'existing-hash',
+        variableRequestAccessTokenConsumedAt: '',
+        emailNotifications: ['notify@example.com'],
+      }] as any);
+      const mockRes = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+
+      await agentModeController.runScheduledChats({} as Request, mockRes);
+
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(response.results[0]).toEqual(expect.objectContaining({
+        status: 'waiting_for_variables',
+        reminderSuppressed: true,
+        missingVariables: ['company_name'],
+      }));
+      expect(mockEmailService.sendScheduledChatVariableRequestEmail).not.toHaveBeenCalled();
+      const update = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(c => c[0] === mockScheduleId)[1];
+      // Token preserved (link in the earlier email keeps working), only expiry extended.
+      expect(update.variableRequestAccessTokenHash).toBeUndefined();
+      expect(update.variableRequestSentAt).toBeUndefined();
+      expect(update.variableRequestAccessTokenExpiresAt).toBe(response.results[0].variableRequestExpiresAt);
+      expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    });
+
+    // ENG-1379 AC2: weekly reminder once the window elapses.
+    it('ENG-1379: re-sends the request once the reminder window has elapsed', async () => {
+      const sentAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([{
+        ...baseSchedule,
+        frequency: 'daily',
+        variables: [{ name: 'company_name', description: 'Company name' }],
+        variableValues: {},
+        variableRequestStatus: 'pending',
+        variableRequestSentAt: sentAt,
+        variableRequestAccessTokenHash: 'existing-hash',
+        variableRequestAccessTokenConsumedAt: '',
+        emailNotifications: ['notify@example.com'],
+      }] as any);
+      const mockRes = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+
+      await agentModeController.runScheduledChats({} as Request, mockRes);
+
+      expect(mockEmailService.sendScheduledChatVariableRequestEmail).toHaveBeenCalledTimes(1);
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(mockScheduleId, expect.objectContaining({
+        variableRequestStatus: 'pending',
+        variableRequestAccessTokenHash: expect.any(String),
+      }));
+    });
+
+    // ENG-1379 (CodeRabbit): a failed delivery must not suppress the next reminder.
+    it('ENG-1379: drops the token when the request email fails so the next run re-sends', async () => {
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([{
+        ...baseSchedule,
+        frequency: 'daily',
+        variables: [{ name: 'company_name', description: 'Company name' }],
+        variableValues: {},
+        emailNotifications: ['notify@example.com'],
+      }] as any);
+      (mockEmailService.sendScheduledChatVariableRequestEmail as jest.Mock).mockRejectedValueOnce(new Error('ses down'));
+      const mockRes = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+
+      await agentModeController.runScheduledChats({} as Request, mockRes);
+
+      const updates = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.filter(c => c[0] === mockScheduleId).map(c => c[1]);
+      expect(updates[updates.length - 1]).toEqual(expect.objectContaining({ variableRequestAccessTokenHash: '' }));
+    });
+
+    // ENG-1379 (CodeRabbit): the retained link must outlive the next due run.
+    it('ENG-1379: link expiry extends past the next run so a retained link never lapses first', async () => {
+      const sentAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([{
+        ...baseSchedule,
+        frequency: 'daily',
+        variables: [{ name: 'company_name', description: 'Company name' }],
+        variableValues: {},
+        variableRequestStatus: 'pending',
+        variableRequestSentAt: sentAt,
+        variableRequestAccessTokenHash: 'existing-hash',
+        variableRequestAccessTokenConsumedAt: '',
+      }] as any);
+      const mockRes = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+
+      await agentModeController.runScheduledChats({} as Request, mockRes);
+
+      const r = (mockRes.json as jest.Mock).mock.calls[0][0].results[0];
+      expect(new Date(r.variableRequestExpiresAt).getTime()).toBeGreaterThan(new Date(r.nextRunTime).getTime());
     });
 
     it('should default to max 5 concurrent runs when MAX_CONCURRENT_RUNS is not set', async () => {
