@@ -1084,6 +1084,56 @@ export class GoogleAdsService {
 
   // ── Campaigns ────────────────────────────────────────────────────────────
 
+  /**
+   * ENG-1913: read-only per-campaign delivery input for the account-health zero-delivery check.
+   * Status + approved daily budget + start time, joined with impressions/clicks over the last
+   * 7 days. Throws on any incomplete read: a partial read must never become "zero delivery".
+   * A campaign absent from the metrics rows had no delivery in the window (Google omits
+   * all-zero metric rows), which is only trusted because both reads completed.
+   * `liveSince` is the campaign start in the account timezone read as UTC — at most a few
+   * hours off, well inside the 24h grace window.
+   */
+  async getCampaignDelivery(userId: string, customerId: string, _nowMs: number = Date.now()): Promise<Array<{
+    campaignId: string; status: string; approvedDailyBudget: number; liveSince: string; impressions: number; clicks: number;
+  }>> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const read = async (query: string): Promise<any[]> => {
+      const completeness: { truncated?: boolean } = {};
+      const rows = await this.search(customerId, accessToken, query, loginCustomerId, completeness);
+      if (completeness.truncated) throw new Error('Incomplete Google Ads read');
+      return rows;
+    };
+    const config = await read("SELECT campaign.id, campaign.status, campaign.start_date_time, campaign_budget.amount_micros, campaign_budget.status FROM campaign WHERE campaign.status != 'REMOVED'");
+    const metrics = await read("SELECT campaign.id, metrics.impressions, metrics.clicks FROM campaign WHERE campaign.status != 'REMOVED' AND segments.date DURING LAST_7_DAYS");
+    const delivered = new Map<string, { impressions: number; clicks: number }>();
+    for (const row of metrics) {
+      const id = String(row.campaign?.id ?? '');
+      if (!id) throw new Error('Malformed Google Ads metrics row');
+      const prev = delivered.get(id) ?? { impressions: 0, clicks: 0 };
+      delivered.set(id, {
+        impressions: prev.impressions + Number(row.metrics?.impressions ?? 0),
+        clicks: prev.clicks + Number(row.metrics?.clicks ?? 0),
+      });
+    }
+    return config.map((row: any) => {
+      const id = String(row.campaign?.id ?? '');
+      if (!id) throw new Error('Malformed Google Ads campaign row');
+      const start = typeof row.campaign?.startDateTime === 'string' ? row.campaign.startDateTime : '';
+      const liveSince = /^\d{4}-\d{2}-\d{2}/.test(start) ? `${start.slice(0, 10)}T${start.slice(11, 19) || '00:00:00'}Z` : '';
+      const budgetEnabled = row.campaignBudget?.status === undefined || row.campaignBudget.status === 'ENABLED';
+      const amount = Number(row.campaignBudget?.amountMicros ?? 0);
+      const d = delivered.get(id) ?? { impressions: 0, clicks: 0 };
+      return {
+        campaignId: id,
+        status: String(row.campaign?.status ?? 'UNKNOWN'),
+        approvedDailyBudget: budgetEnabled && Number.isFinite(amount) ? amount / 1_000_000 : 0,
+        liveSince,
+        impressions: d.impressions,
+        clicks: d.clicks,
+      };
+    });
+  }
+
   /** @param completeness Optional out-param — see `search`. Set when the page cap truncated the read. */
   async listCampaigns(userId: string, customerId: string, completeness?: { truncated?: boolean }): Promise<{ resourceName: string; id: string; name: string; status: string; type: string }[]> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
