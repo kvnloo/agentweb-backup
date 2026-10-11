@@ -65,6 +65,19 @@ describe('list_meta_ads_campaigns failure classes (ENG-1890)', () => {
     expect(r.campaigns).toHaveLength(1);
   });
 
+  it('OAuthException is not token evidence by type alone (code 100 / 80004)', () => {
+    const throttled: any = new Error('User request limit reached');
+    throttled.structuredError = { type: 'OAuthException', code: 80004 };
+    expect(classifyMetaReadFailure(throttled)).toEqual({ kind: 'transient', errorClass: 'rate_limit' });
+    const badField: any = new Error('(#100) Tried accessing nonexisting field');
+    badField.structuredError = { type: 'OAuthException', code: 100 };
+    expect(classifyMetaReadFailure(badField).tokenInvalid).toBeUndefined();
+    expect(classifyMetaReadFailure(badField).kind).toBe('handler');
+    const expired: any = new Error('Error validating access token');
+    expired.structuredError = { type: 'OAuthException', code: 190 };
+    expect(classifyMetaReadFailure(expired).tokenInvalid).toBe(true);
+  });
+
   it('HTTP 5xx and read timeouts are transient', async () => {
     const e5xx: any = new Error('Meta API Error: boom'); e5xx.status = 503;
     expect(classifyMetaReadFailure(e5xx)).toEqual({ kind: 'transient', errorClass: 'upstream_5xx' });

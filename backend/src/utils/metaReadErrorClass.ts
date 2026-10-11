@@ -18,7 +18,11 @@ export interface MetaReadFailure {
 }
 
 /** Graph codes Meta documents as throttling. */
-const RATE_LIMIT_CODES = new Set([4, 17, 32, 341, 613]);
+const RATE_LIMIT_CODES = new Set([
+  4, 17, 32, 341, 613,
+  // Marketing API business-use-case throttles (Ads Management, Insights, etc.).
+  80000, 80001, 80002, 80003, 80004, 80005, 80006, 80008, 80009, 80014,
+]);
 /** Graph codes Meta documents as transient/unknown server errors. */
 const TRANSIENT_CODES = new Set([1, 2]);
 /** Permission subcodes that ride code 10/200 but also appear alone. */
@@ -56,10 +60,12 @@ export function classifyMetaReadFailure(error: any): MetaReadFailure {
     return { kind: 'credential', errorClass: 'auth' };
   }
   if (error?.name === 'OAuthException' || error?.structuredError?.type === 'OAuthException') {
-    // OAuthException without a transient code is a token/permission problem.
-    if (code === undefined || !(RATE_LIMIT_CODES.has(code) || TRANSIENT_CODES.has(code))) {
-      return { kind: 'credential', errorClass: 'auth', tokenInvalid: true };
-    }
+    // Meta reuses OAuthException for invalid params (100) and ads throttles
+    // (80000-80014), so the type alone is not token evidence. Only a codeless
+    // OAuthException is treated as a credential problem — and even then a
+    // reconnect is not claimed to fix it (token-specific evidence is code 190
+    // or the access-token message, handled above).
+    if (code === undefined) return { kind: 'credential', errorClass: 'auth' };
   }
   if (status === 403 || /permission denied/.test(message)) {
     return { kind: 'credential', errorClass: 'auth' };
