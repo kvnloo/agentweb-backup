@@ -1222,7 +1222,10 @@ export async function executePreparedTools(
   // orphaned images/creatives on an ad account. Read-only lookups cannot publish or
   // orphan anything, so they still run. An unclassified effect fails CLOSED.
   const isStateChangingDependent = (toolCall: any, policyDecision: AgentToolPolicyDecision | undefined): boolean =>
-    !isDeferrableAssetTool(toolCall) && (policyDecision?.effect ?? 'unknown') !== 'read';
+    !isDeferrableAssetTool(toolCall)
+    // Already executed in Phase 1 (e.g. install_skills): replay the real cached outcome.
+    && !eagerToolOutcomes.has(toolCall.id)
+    && (policyDecision?.effect ?? 'unknown') !== 'read';
   let mediaDeferredThisTurn = priorMediaBudgetDeferred;
   // A genuine media asset: a gateway success that isn't an encoded {success:false}
   // AND actually produced an asset (not a confirmation-gate pause — see
