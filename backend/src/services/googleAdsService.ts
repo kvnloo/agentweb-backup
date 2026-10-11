@@ -233,6 +233,18 @@ export interface GoogleAdsServingReport {
   blockers: GoogleAdsServingBlocker[];
 }
 
+/**
+ * ENG-592: a mutate reported success but read-back shows the requested field(s) unchanged.
+ * Never convert this into a success response.
+ */
+export class GoogleAdsReadBackError extends Error {
+  readonly code = 'unsupported_field' as const;
+  constructor(readonly resourceName: string, readonly fields: string[]) {
+    super(`unsupported_field: Google Ads accepted the update for ${resourceName} but read-back shows these field(s) did not change: ${fields.join(', ')}. The change was NOT applied; do not report it as done.`);
+    this.name = 'GoogleAdsReadBackError';
+  }
+}
+
 export class GoogleAdsService {
   /** ENG-1922: Search-only readback. Configuration and account-local TODAY metrics
    * are independent evidence. Historical delivery never overrides a blocked path.
@@ -1426,7 +1438,53 @@ export class GoogleAdsService {
     }
     if (updateMask.length === 0) return false;
     await this.mutate(customerId, accessToken, 'campaigns', [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
+    await this.verifyCampaignUpdate(customerId, accessToken, campaignResourceName, params, loginCustomerId);
     return true;
+  }
+
+  /**
+   * ENG-592 / ENG-286 / ENG-312: Google can answer a campaign `:mutate` with success while a
+   * masked field is left unchanged. A success built on our own request is not evidence, so
+   * read the campaign back and fail loudly (code `unsupported_field`) on any field that did
+   * not land. The error reaches the tool caller and is logged for telemetry.
+   */
+  private async verifyCampaignUpdate(
+    customerId: string,
+    accessToken: string,
+    campaignResourceName: string,
+    params: Parameters<GoogleAdsService['updateCampaign']>[3],
+    loginCustomerId?: string,
+  ): Promise<void> {
+    const rows = await this.search(
+      customerId,
+      accessToken,
+      'SELECT campaign.resource_name, campaign.name, campaign.status, campaign.final_url_suffix, ' +
+        'campaign.campaign_budget, campaign.bidding_strategy, campaign.bidding_strategy_type, ' +
+        'campaign.network_settings.target_google_search, campaign.network_settings.target_search_network, ' +
+        'campaign.network_settings.target_content_network, campaign.network_settings.target_partner_search_network ' +
+        `FROM campaign WHERE campaign.resource_name = '${campaignResourceName}'`,
+      loginCustomerId,
+    );
+    const c = rows[0]?.campaign;
+    if (!c) {
+      throw new GoogleAdsReadBackError(campaignResourceName, ['<campaign not found on read-back>']);
+    }
+    const unchanged: string[] = [];
+    if (params.name && c.name !== params.name) unchanged.push('name');
+    if (params.status && c.status !== params.status) unchanged.push('status');
+    if (params.finalUrlSuffix !== undefined && (c.finalUrlSuffix ?? '') !== params.finalUrlSuffix) unchanged.push('final_url_suffix');
+    if (params.budgetResourceName && c.campaignBudget !== params.budgetResourceName) unchanged.push('campaign_budget');
+    if (params.biddingStrategyResourceName && c.biddingStrategy !== params.biddingStrategyResourceName) unchanged.push('bidding_strategy');
+    if (params.biddingStrategy && c.biddingStrategyType !== params.biddingStrategy) unchanged.push('bidding_strategy_type');
+    const ns = c.networkSettings ?? {};
+    for (const key of ['targetGoogleSearch', 'targetSearchNetwork', 'targetContentNetwork', 'targetPartnerSearchNetwork'] as const) {
+      if (params[key] !== undefined && Boolean(ns[key]) !== params[key]) unchanged.push(`network_settings.${key}`);
+    }
+    if (unchanged.length > 0) {
+      const err = new GoogleAdsReadBackError(campaignResourceName, unchanged);
+      console.error('[GoogleAds] read-back mismatch', { code: err.code, resource: campaignResourceName, fields: unchanged });
+      throw err;
+    }
   }
 
   async pauseCampaign(userId: string, customerId: string, campaignResourceName: string): Promise<void> {

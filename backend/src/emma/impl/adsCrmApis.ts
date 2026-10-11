@@ -1257,6 +1257,10 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
         code,
       };
     }
+    if (error?.name === 'GoogleAdsReadBackError' && error?.code === 'unsupported_field') {
+      // ENG-592: mutate said success, read-back says unchanged. Never relay as success.
+      return { success: false, errorType: error.code, errorCode: error.code, fields: error.fields, error: error.message };
+    }
     if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true, code };
     console.error('[AgentMode] handleCallGoogleAdsApi error:', error);
     const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
