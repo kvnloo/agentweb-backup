@@ -28,6 +28,8 @@ export function classifyCodingAgentFailure(result: CodingAgentFailureInput): str
     return KNOWN_TOOL_ERROR_CLASSES.has(cls) ? cls : 'upstream_5xx';
   }
   if (message.startsWith('Cannot prepare preview branch:')) {
+    // Permanent page-configuration errors: retrying can never succeed.
+    if (/has no GitHub repository|invalid GitHub repo URL/i.test(message)) return 'upstream_rejected';
     const cls = classifyToolErrorClass(new Error(message));
     return KNOWN_TOOL_ERROR_CLASSES.has(cls) ? cls : 'upstream_5xx';
   }

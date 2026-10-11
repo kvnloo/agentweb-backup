@@ -41,6 +41,11 @@ describe('ENG-1949 coding_agent failure classification', () => {
     expect(telemetryClass(r)).toBe('not_found');
   });
 
+  it('permanent preview setup errors -> upstream_rejected (non-retryable)', () => {
+    expect(telemetryClass(failed({ message: 'Cannot prepare preview branch: landing page has no GitHub repository' }))).toBe('upstream_rejected');
+    expect(telemetryClass(failed({ message: 'Cannot prepare preview branch: invalid GitHub repo URL' }))).toBe('upstream_rejected');
+  });
+
   it('not authorized -> auth; timeout -> timeout', () => {
     expect(telemetryClass(failed({ message: 'Not authorized to edit this landing page.', notAuthorized: true }))).toBe('auth');
     expect(telemetryClass(failed({ message: 'Coding agent timed out after 15 minutes.', state: 'timed_out' }))).toBe('timeout');
