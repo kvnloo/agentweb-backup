@@ -1,3 +1,175 @@
+## ENG-1888: create_html_from_template structured TEMPLATE_NOT_FOUND error (2026-10-11)
+
+Missing template_id now returns error_code TEMPLATE_NOT_FOUND, missing_template_id, and available_templates (cap 25); tool description requires list_html_templates first.
+
+## ENG-2396: Agent Mode image-revision post-merge verifier (2026-10-10)
+
+`backend/scripts/verify-agent-mode-revision.mjs` drives revisionService image revision end to end via
+batch-review (create -> needs_changes -> poll readback) on a verifier-owned fixture only: QA account
+(`qa-*@agentweb.pro`), a QA-owned Agent Mode session (`VERIFY_SESSION_ID`), a QA-generated source image
+(`VERIFY_SOURCE_IMAGE_URL`), and an internal QA Slack channel (`VERIFY_SLACK_CHANNEL`). One revision
+(one image-provider call) per run. Offline test: `node --test backend/scripts/verify-agent-mode-revision.test.mjs`.
+Negative confirmation-gate classification stays covered by `revisionService.confirmGate.test.ts`.
+Approval-state checks retry until the deadline (the new asset lands before the source approval
+updates). The new asset's `pending` status is a status check only: GET /batch-review defaults a missing
+approval row to pending, so it cannot prove row persistence. No new persisted fields.
+
+## ENG-1778: model registry characterization fixture (2026-10-10)
+
+Added a byte-for-byte characterization test of `getSupportedModelsWithMetadata()` (admin: 44 models, non-admin: 36) with a committed JSON fixture, before any AW-ModelRegistry read-path change. Test-only; no runtime change. AC2-4 (backfill and table read path) remain data-plane gated on ENG-1776.
+
+## ENG-1379: Dedupe scheduled-chat variable-request emails (2026-10-10)
+
+A schedule blocked on missing variables no longer mints a new link and re-emails on every due run. While an unconsumed request sent within 7 days is outstanding, the run is skipped silently, the existing token is kept and its expiry extended; a reminder goes out at most weekly. No new schedule fields. Auto-pause after N blocked runs is deferred (needs new durable state).
+
+## ENG-903: An explicit model on a fixed-model session type is refused, not ignored (2026-10-09)
+
+`POST /api/agent-mode/sessions` and `POST /api/agent-mode/skill/:skillId/session` used to silently ignore a
+request `llmModel` for skill, emma-sidebar and every non-`regular` session type (report, image, video,
+book, scheduled, ...): those sessions run on an admin-configured model. They now answer HTTP 422
+`{ error: 'This kind of session uses a fixed model and does not accept a model choice.', code: 'model_not_selectable_for_session_type' }`
+before the skill lookup, the idempotency claim and any write. Absent or blank `llmModel` is unchanged, as are
+ordinary chat sessions (still `model_unavailable` 422 for an unserved/unselectable model).
+
+Evidence no known caller sends it: the customer portal creation payloads (ChatSupport/Emma sidebar, Reports,
+Images, Videos, Books, CRM, voice lab) carry no `llmModel`; the MCP `emma_create_session` sends only
+`llmModel` with no `sessionType` (an ordinary chat session). Not changed here: `runVerifiedChat` still
+overwrites the stored model with the task-type model when `requiredFunctions` include
+update_html_file/read_file_content/create_blog_article/generate_image/generate_video and no `params.llmModel`
+is passed (interactive /verified-generate passes none).
+
+## ENG-55: Compare asks OpenRouter for no-data-collection providers (2026-10-09)
+
+Compare sends the prompt plus up to ~24k chars of history to several vendors via OpenRouter, and the code set no
+data policy. Now, behind AW-Settings `model_compare_deny_data_collection` (exact string `true` only: no trim, no case folding;
+absent or anything else = OFF = byte-identical request), Compare calls add `provider.data_collection = "deny"`
+next to the shared `order` / `allow_fallbacks` / `require_parameters` (and `ignore` for Gemini).
+
+- Where: `services/agentMode/compareProviderPolicy.ts` (pure; 60s cache, last-known on read error, cold-start error = off).
+  `CompareDeps.getProviderPolicy` -> `CompareCallOptions.providerPolicy` -> `callLLM` `options.providerPolicy`.
+  Only the Compare path passes it; normal chat, loops, coding agent never do. No new persisted field/table/index.
+- Verified against the OpenRouter docs (https://openrouter.ai/docs/features/provider-routing): request-level `provider.data_collection`
+  is `"allow" | "deny"`, default `"allow"`; when nothing satisfies the provider constraints the request fails with a 404.
+  NOT verified from the repo (it has no reference for `data_collection`) or live (no credentials): the exact 404 wording for the
+  data-policy case, and that every Compare model has a deny-compliant endpoint. Owner should run one live Compare after enabling.
+- Failure mapping (conservative): `errorCode: "provider_policy_unavailable"` (status `error`; other columns still answer) ONLY when
+  the policy is ON, the model is a registry id, and the failure is the generic `isProviderNoEndpointsError` 404 whose text does NOT
+  mention "parameter" (Compare always sends `require_parameters: true`, whose own 404 "No endpoints found that can handle the
+  requested parameters" must stay `upstream_error`) and is not the model-specific "No endpoints found for <slug>" (unknown/retired
+  model). Everything else, and everything with the policy OFF, stays `upstream_error`. No data-policy keyword is used as evidence: we
+  could not cite an OpenRouter docs sentence for the data-policy 404 wording, so the code does not guess it.
+- Portal contract: new `errorCode` `provider_policy_unavailable`. The code is a best guess, not a certainty, so copy should not
+  assert a cause. Suggested: "No provider for this model was available with the current privacy setting. Try again later or pick
+  another model." Current portal `describeResultError` (CompareResultCard.tsx) has no entry, so it shows the generic
+  "This model could not answer this time." until a copy entry is added.
+- Rollout: deploy with switch absent (no change); owner sets the AW-Settings row to `true` after a live check. Rollback: set it to
+  `false` (or delete the row); effective within ~60s per instance.
+
+## ENG-2386: with-images server-side favorites/approved/limit/cursor (2026-10-09)
+
+Optional query params on GET /api/tasks/executions/with-images; no params = unchanged. Paging via X-Next-Cursor / X-Total-Tasks headers.
+
+## ENG-2371: automatic media-batch continuation, no customer "reply continue" (2026-10-09)
+
+Adds `services/agentMode/mediaBatchContinuation.ts` (in-memory store, runner over the ENG-2370 state machine, structured unit/completion logs) and stops the media-budget deferral prompt from asking customers to reply "continue". No schema changes; durable store is slice C.
+
+## ENG-2370: Pure media-batch unit state machine (2026-10-09)
+
+ENG-1240 slice A. `backend/src/utils/mediaBatchStateMachine.ts`: I/O-free per-unit states, deterministic idempotency keys, capped exponential backoff, lease-expiry resume. Not wired in yet (slice B, ENG-2371).
+
+## ENG-2263: CRM freshness detector reads "a combined count of N leads" as a total claim (2026-10-09)
+
+A scheduled-run test on the preview showed the log-only detector (PR #3351) missing a wrong sum phrased "97 lead lists in total, containing a
+combined count of 12,746 leads" (real sum 15,486): only "a total of N leads" was a covered wording. The pattern now also accepts
+"combined / overall / aggregate count|total|number of N leads", still requiring CRM wording nearby and still backed by the turn's tool numbers.
+Replaying the ~270 saved A/B replies shows no change (110/129 failing flagged before and after; 6/82 correct flagged before and after), so no new
+false alarms there. Log-only; the reply is never edited.
+
+## ENG-2361: update_lead_status can save the drafted message on the lead (2026-10-08)
+
+`update_lead_status` accepts optional `message_draft` (LinkedIn text -> `messageDraft.content`) and `email_subject` + `email_body` (-> `emailDraft {subject, textContent}`, format `text`), written in the same update as the status. Lets scheduled drafting agents (Opiner) populate the cross-list Pending Review queue with the exact text they wrote instead of only a daily HTML report. Empty values are ignored and never clear existing drafts; a half email draft is rejected without writing.
+
+## ENG-2263: log-only detector for stale CRM numbers presented as fresh (2026-10-08)
+
+PR #3185 added a prompt rule ("`[verified]` on a CRM number means a tool call happened in THIS turn"). A scripted A/B replay (old vs new
+prompt, one-line difference, ~400 runs, 8 models) showed the rule has no consistent effect: on cheaper, user-selectable models Emma
+restates a stale account-wide CRM total about half the time, often tagged `[verified: get_lead_lists]` with no such call that turn. The
+production default model (`gemini-3.8-flash`, verified on a fresh session) and the strong models (`claude-sonnet-5.5`, `gpt-5.5`) did not
+(0 of ~80 runs). `gemini-3.1-flash-lite` is the cost-policy fallback (`optimizedDefaultModel`), not the default.
+
+`utils/crmFreshnessGuard.ts` detects it deterministically (no LLM), log-only, two kinds:
+- `cited_tool_not_run`: a `[verified: <CRM tool>]` tag whose cited tool did not run and succeed this turn (`toolCallSucceeded`: not errored,
+  not `success:false`, not a duplicate, not deferred). Skipped: tags that say earlier/previous/stale, and a tag the model is only
+  *discussing* ("I can't include the [verified] tag because no tool ran"). A bare `[verified]` naming no tool is not judged.
+- `inventory_total_not_in_tool_results`: an account-wide total ("N lead lists", "N leads in total", "Total leads across all lists: N",
+  "N leads across K lists") whose number is in none of this turn's CRM tool results. `get_lead_lists` returns per-list `leadCount` and
+  `totalLists` but no total-leads field, so the model sums it; the check therefore accepts any number in the results, array lengths, the
+  sum of `leadCount`, and the sum of per-call match counts. Skipped: honest wording ("earlier", "as of", "previous") within 140 chars.
+  "N leads across all lists" is deliberately NOT an inventory claim - that is how a filtered search total reads.
+
+It never edits the reply. Always on, try/catch-wrapped, kill switch `AGENT_CRM_FRESHNESS_GUARD=off`. Every scan is bounded (tag regex
+{0,300}, input capped at 200KB, <=200 tags, <=20 claims, linear tag stripper): unbounded `[^\]]*`/`[^>]*` were quadratic (100KB of
+unclosed `[verified ` blocked the event loop 1.5s, 500KB 37s).
+
+Replay of the ~270 saved A/B replies with the harness's simulated tool results supplied as evidence (the earlier snapshot was 18 lists / 47
+leads; the fresh one 17 / 43): 110 of 129 failing replies flagged (85%). The 19 misses are 9 honest "down from 18/47 earlier" comparisons
+(the model re-queried; the harness labels them failures), 9 that label themselves "earlier"/"previous turn" (skipped by design) and 1 hedged
+reply - none is an unlabelled stale restatement. This is IN-SAMPLE: the wordings were tuned on this corpus, so it is an upper bound, not a
+forecast for production traffic. 6 of 82 correct replies were flagged: 3 short "searched 4 of your 17 lists" subset phrasings and 3
+gpt-4o-mini mis-added totals (44/45/46 for a real 43 - correct flags, wrong numbers, not "stale").
+
+`echoesEarlier`: a flag only means "not backed this turn", and a correct breakdown subtotal looks like a stale grand total. Each flagged claim
+is also compared with the CRM numbers earlier turns of the SAME session persisted (`metadata.crmEvidence`, numbers only, bounded to 120
+messages / 2000 numbers). Equal to one of them and unbacked now means the reply restated an old value; the log line carries an
+`echoesEarlier` count and the summarizer reports those lines separately. Nothing is suppressed. Absence means UNKNOWN (a session saved before
+evidence was persisted, or a number outside the 64 kept per message), not "not stale". On the replay all 104 number-flagged failing replies
+carry the mark and none of the 82 correct ones do.
+
+Reading it: one JSON line per flagged reply, `[crm-freshness-shadow] ... {"sessionId","model","kinds","findingCount","tagsSeen",
+"crmToolsSucceeded","claimed":[numbers],"cited":[tool names]}`. It carries NO reply text - only numbers and tool names (an earlier
+revision logged a 60-120 char slice of the reply, which can contain names and emails; the PR #3351 review caught it and a test now
+asserts the exact key set and that PII in the reply never reaches the line). Summarise with
+`node backend/scripts/summarize-crm-freshness-shadow.mjs web.stdout.log` (counts per model/kind, most-claimed numbers, cited tools).
+Counts are flagged replies, not rates - the denominator comes from request logs. "Not backed this turn" is not the same as "stale": a
+legitimate follow-up that restates an earlier number is flagged too. Decide enforcement only after reading production output.
+
+Continuations: a task that spans several generateMarketingResponse invocations (auto-continuation, an answered question/approval card, a
+`generation-timeout-continuation` partial followed by an actual "continue" request - at most 8 words / 60 chars) is read back from persisted
+message markers to the request that opened the task. CRM tools run earlier count as run for the tag check, and the numbers they returned
+(`PersistedCrmEvidence`, numbers only) back the total check, so a continuation that restates a stale total IS caught. A message saved before
+this existed has no evidence and the total check abstains. A plain follow-up question is deliberately NOT a continuation - that is the
+failure this detector exists to see. The log line carries `continuation: true|false` and `drift`.
+
+Claim parsing: "1.2k", "12 thousand" and word numbers ("twelve") count; a claim of exactly 1 is ignored in plural-only patterns. Emma
+replies are HTML, so block tags become line breaks and `<li>` a bullet; a lead-in line ending in ":" ("From our check earlier, not
+re-queried:") labels only the bullet run directly under it.
+
+`drift`: a claim within 0.5% (min 1, >=10) of a number the tools really returned. It is an arithmetic slip (a mis-added column, a concurrent
+write between two calls), not a stale or invented total; the summarizer reports it on its own line so it does not inflate the stale count.
+
+Evidence on the preview, real pipeline (turn 1 really calls get_lead_lists, the account then really changes, turn 2 asks a follow-up that
+invites restating the old totals; ground truth read from the API, not from the detector):
+- `gemini-3.1-flash-lite` 10/10 and `gpt-4o-mini` 9/9 unlabelled stale answers flagged; `gemini-3.8-flash` (the default) 4/4 stale flagged.
+- Over 9 + 8 `gemini-3.8-flash` runs, 4 flags landed on replies not stale by my ground truth: 3 had re-queried (the log marks those `drift`,
+  off by about one: the account's test list reports `leadCount: -1`, and the three runs shared one account so each other's scratch lead moved
+  the totals) and one was a `[verified: get_lead_lists]` tag with no call that turn, which is a true tag finding.
+- With `echoesEarlier` (final code, fresh preview, a separate real turn 1 per run): `gemini-3.1-flash-lite` 5/5 stale flagged, 4/5 marked
+  (the fifth invented 11,847 leads, a number no earlier turn returned, so it is correctly unmarked); `gemini-3.8-flash` 2/2 stale flagged and
+  marked, 6/6 correct or honestly-labelled replies unflagged. The shadow log lines carry only the documented keys, no reply text and no `@`.
+- Before the final code, breakdown-heavy `gemini-3.8-flash` replies were flagged 5 of 11 and 5 of 12 times while correct, on group subtotals
+  ("44 lists currently have 0 leads", "8,510 leads total across: ...", "held in four lists"). The pattern fixes removed the ones seen; the
+  rest are not suppressed - `echoesEarlier` is what separates them in the summary (a subtotal matches no earlier turn's number).
+- Caveats: n is small (8-10 per model); the runs shared one account, which adds drift noise; recall is measured on the wordings the
+  patterns cover and real traffic will phrase it more widely, so treat it as an upper bound. Two earlier attempts crashed mid-run when the
+  turn-2 list read returned nothing (the harness now retries), so they stopped short of the planned count.
+
+Known limits: a total phrased outside the patterns is not seen; after a CRM write the check abstains; only count-like fields (count, total,
+totalLists, leadCount, ...) and array lengths back a number - not arbitrary numbers inside lead rows. A flag means "not backed this turn".
+
+## ENG-1094: marketing-action producer slice 1 (2026-10-07)
+
+Added `marketingActionProducer.ts`, which maps pending ENG-502 outcome-ledger recommendations to `MarketingActionCandidate[]` for the ENG-445 selector. It does no prose parsing and no I/O. Persisting via `attachMarketingActions` before `addRunResult` is slice 2 (data-plane gated).
+
 ## ENG-0000: Migrate video generation to gemini-omni-1.1-flash (2026-10-08)
 
 **Why:** Google shuts down `veo-3.1-generate-preview`, `veo-3.1-fast-generate-preview`

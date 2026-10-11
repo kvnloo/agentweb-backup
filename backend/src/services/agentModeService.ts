@@ -3545,6 +3545,8 @@ export class AgentModeService {
       const mediaBudgetMs = parseInt(process.env.AGENT_MODE_MEDIA_BUDGET_MS || '420000', 10);
       const mediaGenerationDeadlineMs = mediaBudgetMs > 0 ? Date.now() + mediaBudgetMs : undefined;
       let mediaAssetsProducedThisRun = 0;
+      // ENG-922: sticky per-run flag — see priorMediaBudgetDeferred in toolDispatch.
+      let mediaBudgetDeferredThisRun = false;
       // ENG-510: the fixed soft budget above assumed fast images and leaves only ~3 min
       // of headroom below the controller's 10-min whole-turn hard cap. A single slow
       // high-quality image can take ~6–7 min, so the next variant slips past the fixed
@@ -4734,6 +4736,7 @@ export class AgentModeService {
           priorMediaCallKeys: mediaCallKeysThisRun,
           approvedRevisionImageSources,
           priorSearchCallCount: searchCallCountThisRun,
+          priorMediaBudgetDeferred: mediaBudgetDeferredThisRun,
           ports: this.buildToolDispatchPorts({
             agentRuntimeRunId,
             sessionId,
@@ -4756,6 +4759,10 @@ export class AgentModeService {
         // Carry the running per-run media-asset total forward so the next iteration's
         // budget decision knows whether this run has already produced ≥1 asset.
         mediaAssetsProducedThisRun += dispatchResult.mediaAssetsProduced;
+        // ENG-922: once any iteration defers media on the time budget, the batch is
+        // incomplete for the rest of this run — later iterations must not perform
+        // state-changing (Graph upload/creative/ad) calls against it.
+        if (dispatchResult.mediaBudgetDeferred) mediaBudgetDeferredThisRun = true;
         // ENG-426: carry the run-wide search-call count forward so the next iteration's
         // budget check sees calls made earlier THIS turn, on top of prior-turn history.
         searchCallCountThisRun += dispatchResult.searchCallsThisIteration;
