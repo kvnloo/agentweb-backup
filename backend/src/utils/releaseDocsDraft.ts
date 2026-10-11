@@ -64,8 +64,8 @@ function norm(labels?: string[]): string[] {
 export function isCustomerFacing(pr: MergedPrPayload, issue: LinearIssuePayload): boolean {
   const labels = [...norm(pr.labels), ...norm(issue.labels)];
   if (!labels.some((l) => CUSTOMER_FACING_LABELS.has(l))) return false;
-  if (labels.some((l) => l === 'customer-facing' || l === 'customer facing')) return true;
   if (labels.some((l) => INTERNAL_LABELS.has(l))) return false;
+  if (labels.some((l) => l === 'customer-facing' || l === 'customer facing')) return true;
   const files = pr.changedFiles ?? [];
   if (files.length > 0 && files.every((f) => INTERNAL_PATH.test(f))) return false;
   return true;

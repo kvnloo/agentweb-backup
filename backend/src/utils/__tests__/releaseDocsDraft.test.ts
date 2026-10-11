@@ -46,6 +46,16 @@ describe('buildReleaseDocsDraft (ENG-131)', () => {
     expect(isCustomerFacing({ ...pr, changedFiles: ['.github/workflows/deploy.yml', 'backend/src/x.test.ts'] }, issue)).toBe(false);
   });
 
+  it('internal/infra labels win over an explicit customer-facing label', () => {
+    expect(isCustomerFacing(pr, { ...issue, labels: ['customer-facing', 'internal'] })).toBe(false);
+    expect(isCustomerFacing({ ...pr, labels: ['Infra'] }, { ...issue, labels: ['Customer Facing'] })).toBe(false);
+    expect(isCustomerFacing(pr, { ...issue, labels: ['customer-facing'] })).toBe(true);
+  });
+
+  it('treats nested __tests__ directories as internal', () => {
+    expect(isCustomerFacing({ ...pr, changedFiles: ['backend/src/utils/__tests__/fixture.ts'] }, issue)).toBe(false);
+  });
+
   it('omits the CSM note when no requester is linked', () => {
     const r = buildReleaseDocsDraft(pr, { ...issue, requester: null });
     expect(r.docsEntry).toBeDefined();
