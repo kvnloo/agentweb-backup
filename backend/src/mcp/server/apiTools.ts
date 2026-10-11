@@ -2992,6 +2992,9 @@ async function runManagePredefinedWorkPlan(args: any, c: any): Promise<any> {
             // that judgement wrong (ENG-890).
             body.expectedStepsRev = current?.steps_rev ?? null;
           } catch (error: any) {
+            // A 404 means the plan_id itself is wrong: let it reach execute()'s
+            // title/candidate resolution (ENG-1992) instead of masking it here.
+            if (/API error \(404\)/.test(String(error?.message || ''))) throw error;
             // Fail closed in both modes: without the current steps we can
             // neither merge nor tell whether a replace would delete steps, and
             // writing blind is exactly the silent deletion this guards against.

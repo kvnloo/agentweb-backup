@@ -1341,6 +1341,22 @@ describe('Admin tools are NOT in chatbotService', () => {
       expect(mockMcpFetch).toHaveBeenCalledTimes(1);
     });
 
+    it('resolves a title for a steps update instead of failing the pre-read', async () => {
+      mockMcpFetch.mockImplementation(async (o: any) => {
+        if (o.path === '/api/admin/work-plans') return plans as any;
+        if (o.method === 'GET' && o.path === '/api/admin/work-plans/wp-1') {
+          return { planId: 'wp-1', title: 'Weekly Report', steps: [{ stepCount: 1, description: 'a' }], steps_rev: 1 } as any;
+        }
+        if (o.method === 'PUT' && o.path === '/api/admin/work-plans/wp-1') return { planId: 'wp-1' } as any;
+        throw notFound();
+      });
+      const r = parse(await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update', plan_id: 'Weekly Report', steps: [{ stepCount: 1, description: 'b' }], steps_mode: 'merge',
+      }, context));
+      expect(JSON.stringify(r)).not.toContain('Cannot safely update');
+      expect(mockMcpFetch.mock.calls.some((c: any) => c[0].method === 'PUT' && c[0].path === '/api/admin/work-plans/wp-1')).toBe(true);
+    });
+
     it('rethrows non-404 errors unchanged', async () => {
       mockMcpFetch.mockRejectedValue(new Error('API error (500): boom'));
       await expect(mcpToolRegistry.execute('manage_predefined_work_plan', { action: 'get', plan_id: 'wp-1' }, context))
