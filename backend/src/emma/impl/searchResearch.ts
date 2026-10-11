@@ -279,14 +279,15 @@ async function extractAndUploadAnalysisFiles(
 export function classifyDataAnalysisFailure(result: { message?: unknown; error?: unknown }): string {
   const code = typeof result.error === 'string' ? result.error : '';
   if (code === 'invalid_argument') return 'invalid_args';
-  if (code === 'execution_failed') return 'invalid_output';
+  if (code === 'execution_failed' || code === 'inconsistent_result') return 'invalid_output';
   const m = (typeof result.message === 'string' ? result.message : '').toLowerCase();
   // Timeout first: its guidance text also says "too large".
   if (/timed out/.test(m)) return 'timeout';
+  // Before the broad "is empty" pattern: "Gemini API key is empty" is a config fault.
+  if (/gemini api key/.test(m)) return 'tool_unavailable';
   if (/too large|exceeds the .* limit|is required|must be|local file paths|cannot parse s3 url/.test(m)) return 'invalid_args';
   if (/could not be read|no longer available|cannot read tool-response|is empty|failed to download or process file/.test(m)) return 'not_found';
   if (/did not return any results/.test(m)) return 'empty_result';
-  if (/gemini api key/.test(m)) return 'tool_unavailable';
   return 'upstream_5xx';
 }
 
@@ -299,7 +300,7 @@ export function classifyDataAnalysisFailure(result: { message?: unknown; error?:
  */
 export async function performDataAnalysis(fileUrls: string[], analysisInstruction: string, userId: string): Promise<any> {
   if (fileUrls !== undefined && fileUrls !== null
-    && (!Array.isArray(fileUrls) || fileUrls.some(u => u !== null && u !== undefined && typeof u !== 'string'))) {
+    && (!Array.isArray(fileUrls) || fileUrls.some(u => typeof u !== 'string'))) {
     return {
       success: false,
       message: 'file_urls must be an array of S3 or HTTPS URL strings. Pass an empty array when all data is inline in analysis_instruction.',

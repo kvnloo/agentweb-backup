@@ -86,6 +86,8 @@ describe('ENG-1889 perform_data_analysis structured failures', () => {
     expect(a).toEqual(expect.objectContaining({ success: false, errorClass: 'invalid_args' }));
     const b = await performDataAnalysis([], { task: 'sum' } as any, 'u1');
     expect(b).toEqual(expect.objectContaining({ success: false, errorClass: 'invalid_args' }));
+    const c = await performDataAnalysis([null] as any, 'sum', 'u1');
+    expect(c).toEqual(expect.objectContaining({ success: false, errorClass: 'invalid_args' }));
     // No stricter handler-only constraints: an empty array is schema-valid.
     expect(get).not.toHaveBeenCalled();
   });
@@ -96,6 +98,8 @@ describe('ENG-1889 perform_data_analysis structured failures', () => {
     expect(classifyDataAnalysisFailure({ message: 'The data analysis did not return any results — x' })).toBe('empty_result');
     expect(classifyDataAnalysisFailure({ message: 'x', error: 'execution_failed' })).toBe('invalid_output');
     expect(classifyDataAnalysisFailure({ message: 'something unexpected' })).toBe('upstream_5xx');
+    expect(classifyDataAnalysisFailure({ message: 'Gemini API key is empty' })).toBe('tool_unavailable');
+    expect(classifyDataAnalysisFailure({ message: 'x', error: 'inconsistent_result' })).toBe('invalid_output');
   });
 
   it('control: a valid analysis keeps its existing success shape with no errorClass', async () => {
