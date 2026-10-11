@@ -1,3 +1,19 @@
+## ENG-1888: create_html_from_template structured TEMPLATE_NOT_FOUND error (2026-10-11)
+
+Missing template_id now returns error_code TEMPLATE_NOT_FOUND, missing_template_id, and available_templates (cap 25); tool description requires list_html_templates first.
+
+## ENG-2396: Agent Mode image-revision post-merge verifier (2026-10-10)
+
+`backend/scripts/verify-agent-mode-revision.mjs` drives revisionService image revision end to end via
+batch-review (create -> needs_changes -> poll readback) on a verifier-owned fixture only: QA account
+(`qa-*@agentweb.pro`), a QA-owned Agent Mode session (`VERIFY_SESSION_ID`), a QA-generated source image
+(`VERIFY_SOURCE_IMAGE_URL`), and an internal QA Slack channel (`VERIFY_SLACK_CHANNEL`). One revision
+(one image-provider call) per run. Offline test: `node --test backend/scripts/verify-agent-mode-revision.test.mjs`.
+Negative confirmation-gate classification stays covered by `revisionService.confirmGate.test.ts`.
+Approval-state checks retry until the deadline (the new asset lands before the source approval
+updates). The new asset's `pending` status is a status check only: GET /batch-review defaults a missing
+approval row to pending, so it cannot prove row persistence. No new persisted fields.
+
 ## ENG-1778: model registry characterization fixture (2026-10-10)
 
 Added a byte-for-byte characterization test of `getSupportedModelsWithMetadata()` (admin: 44 models, non-admin: 36) with a committed JSON fixture, before any AW-ModelRegistry read-path change. Test-only; no runtime change. AC2-4 (backfill and table read path) remain data-plane gated on ENG-1776.
