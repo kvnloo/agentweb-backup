@@ -1508,6 +1508,9 @@ export class GoogleAdsService {
   ): Promise<void> {
     const keys = Object.keys(expected);
     if (keys.length === 0) return;
+    if (!this.isValidGoogleAdsResourceName(resourceName)) {
+      throw new GoogleAdsReadBackError(resourceName, ['<invalid resource name>']);
+    }
     const rowKey = entity.replace(/_([a-z])/g, (_m, c: string) => c.toUpperCase());
     const select = [`${entity}.resource_name`, ...keys.map((k) => `${entity}.${expected[k].gaql}`)].join(', ');
     const rows = await this.search(
@@ -1536,6 +1539,9 @@ export class GoogleAdsService {
     resourceName: string,
     loginCustomerId?: string,
   ): Promise<void> {
+    if (!this.isValidGoogleAdsResourceName(resourceName)) {
+      throw new GoogleAdsReadBackError(resourceName, ['<invalid resource name>']);
+    }
     const rowKey = entity.replace(/_([a-z])/g, (_m, c: string) => c.toUpperCase());
     const rows = await this.search(
       customerId, accessToken,

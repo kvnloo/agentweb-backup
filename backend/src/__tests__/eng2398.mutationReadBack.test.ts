@@ -105,6 +105,15 @@ describe('update read-back', () => {
   });
 });
 
+describe('read-back resource-name guard', () => {
+  it('a quoted resource name never reaches GAQL and cannot pass a remove as "gone"', async () => {
+    const { svc, search } = setup(null, 'adGroup');
+    await expect(svc.removeAdGroup('u', '123', "customers/123/adGroups/7' OR ''='"))
+      .rejects.toBeInstanceOf(GoogleAdsReadBackError);
+    expect(search).not.toHaveBeenCalled();
+  });
+});
+
 describe('remove read-back (AC3)', () => {
   it.each([
     ['removeAdGroup', AG, 'adGroup'],
