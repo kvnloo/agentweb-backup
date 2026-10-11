@@ -617,6 +617,12 @@ export class ImageService {
           this.IMAGE_GENERATION_TIMEOUT_MS,
           `Image generation with ${modelToUse}`
         );
+
+        // ENG-1535: provider methods (Gemini, Runway) catch their own errors and return
+        // { success: false, error } — classify those too so the failure stays typed.
+        if (!result.success && !result.errorClass) {
+          result = { ...result, errorClass: classifyImageProviderError(result.error ?? "") };
+        }
         
         // If generation was successful, upload to S3
         if (result.success && result.imageUrl) {

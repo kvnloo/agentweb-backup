@@ -83,6 +83,13 @@ describe('ImageService.generateImage typed failures (ENG-1535)', () => {
     expect(r.errorClass).toBe('invalid_args');
   });
 
+  it('a provider failure returned as a result (not thrown) is still classified', async () => {
+    jest.spyOn(svc as any, 'generateWithGoogleGemini').mockResolvedValue({ success: false, error: 'Gemini: 429 Too Many Requests' });
+    const r = await svc.generateImage({ ...base, imageModel: 'gemini-2.5-flash-image' });
+    expect(r.success).toBe(false);
+    expect(r.errorClass).toBe('rate_limited');
+  });
+
   it('happy path has no errorClass', async () => {
     (axios.post as jest.Mock).mockResolvedValue({ status: 200, data: { data: [{ b64_json: Buffer.from('png').toString('base64') }] } });
     jest.spyOn(svc as any, 'removeC2PAMetadata').mockImplementation(async (b: any) => b);

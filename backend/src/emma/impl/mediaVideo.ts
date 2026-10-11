@@ -878,7 +878,8 @@ export async function generateImage(
           success: false,
           message: `Image generation failed after primary and fallback attempts: ${result.error || 'Fallback image generation failed'}`,
           error: result.error,
-          primaryError
+          primaryError,
+          ...(result.errorClass ? { errorClass: result.errorClass } : {})
         };
       }
       return {
