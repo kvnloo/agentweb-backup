@@ -1,5 +1,6 @@
 const mockAxiosPost = jest.fn();
 const mockAxiosGet = jest.fn();
+import { echoCampaignReadBack } from './helpers/googleAdsCampaignReadBack';
 jest.mock('axios', () => ({
   post: (...args: any[]) => mockAxiosPost(...args),
   get: (...args: any[]) => mockAxiosGet(...args),
@@ -68,6 +69,7 @@ let service: GoogleAdsService;
 beforeEach(() => {
   jest.clearAllMocks();
   mockAssertPublicHostname.mockResolvedValue(undefined);
+  echoCampaignReadBack(mockAxiosPost);
   service = new GoogleAdsService();
 });
 describe('API version', () => {
