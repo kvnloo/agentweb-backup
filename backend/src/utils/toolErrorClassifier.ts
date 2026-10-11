@@ -290,8 +290,8 @@ function classFromMessage(message: string): string | null {
   if (/arguments failed schema validation|has the wrong type|missing required (argument|variable)|invalid parameters?|invalid argument|validation (failed|error)|(is|are) required|must be|is too long|too long \(|is too short|too large to save|is too large/.test(m)) return 'invalid_args';
 
   if (/unauthorized|forbidden|invalid (access |api )?token|invalid api key|authentication|missing credentials|not authorized|do not have permission|permission to|no secrets configured|not a member of channel|account connected|account not configured|not configured to access/.test(m)) return 'auth';
-  if (/enotfound|econnrefused|econnreset|eai_again|socket hang up|network error|fetch failed/.test(m)) return 'network';
-  if (/does not exist|not found/.test(m)) return 'not_found';
+  if (/enotfound|econnrefused|econnreset|eai_again|socket hang up|network error|fetch failed|connection error/.test(m)) return 'network';
+  if (/does not exist|not found|no landing page found/.test(m)) return 'not_found';
   if (/internal server error|bad gateway|service unavailable|upstream/.test(m)) return 'upstream_5xx';
   // Meta Graph transient (codes 1/2): the SDK/campaign path surfaces Meta's generic
   // body verbatim with NO HTTP status in the string, so the status-regex above misses
@@ -321,8 +321,26 @@ function legacyNameClass(error: unknown): string {
   return 'UnknownError';
 }
 
+/**
+ * ENG-1949 — semantic classes a tool may stamp on its own structured failure
+ * result (`{ success: false, errorClass }`). coding_agent's failures are
+ * returned, not thrown, and the message is often the sub-agent's own prose
+ * summary ("Done! ..."), so message matching cannot classify them; the tool
+ * knows the class and says so. Only names from this taxonomy are honoured —
+ * an arbitrary string never becomes a new cluster.
+ */
+export const KNOWN_TOOL_ERROR_CLASSES: ReadonlySet<string> = new Set([
+  'timeout', 'auth', 'rate_limit', 'quota_exceeded', 'payment_required', 'invalid_args',
+  'not_found', 'network', 'upstream_5xx', 'policy_blocked', 'repeated_failure',
+  'tool_unavailable', 'upstream_rejected', 'empty_result', 'invalid_output',
+  'truncated_response',
+]);
+
 export function classifyToolErrorClass(error: unknown): string {
   if (error instanceof Error) {
+    const declared = (error as { toolErrorClass?: unknown }).toolErrorClass;
+    if (typeof declared === 'string' && KNOWN_TOOL_ERROR_CLASSES.has(declared)) return declared;
+
     // Check both the explicit .name and the constructor name — `class
     // TimeoutError extends Error {}` inherits .name === 'Error'.
     const byName = GATEWAY_NAME_CLASSES[error.name]

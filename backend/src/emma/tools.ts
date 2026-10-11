@@ -7629,6 +7629,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     const { LANDING_PAGE_PREVIEW_BRANCH, runCodingAgent } = await import('../services/codingAgentService');
+    const { classifyCodingAgentFailure } = await import('../services/codingAgentFailureClass');
     const executeMcpTool = context?.service
       ? async (toolName: string, toolArgs: any) => {
         return context.service.executeTool(
@@ -7694,6 +7695,9 @@ emmaToolRegistry.register({
       return {
         success: false,
         error: result.message,
+        // ENG-1949: semantic class for telemetry/retry guidance; the message is
+        // often the sub-agent's own prose and cannot be classified by text.
+        errorClass: classifyCodingAgentFailure(result),
         iterations: result.iterations,
         previewUrl: result.previewUrl,
         branch: result.branch,
