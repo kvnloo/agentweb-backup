@@ -1279,4 +1279,72 @@ describe('Admin tools are NOT in chatbotService', () => {
     expect(names).toContain('list_predefined_work_plans');
     expect(names).toContain('manage_predefined_work_plan');
   });
+
+  // ENG-1992: not_found configuration cluster — plan_id given as a title, stale, or missing.
+  describe('manage_predefined_work_plan - plan_id resolution (ENG-1992)', () => {
+    const context = { userId: 'user-123', agentUserId: 'user-123' };
+    beforeEach(() => jest.clearAllMocks());
+    const plans = [
+      { planId: 'wp-1', title: 'Weekly Report' },
+      { planId: 'wp-2', title: 'Ad Launch' },
+      { planId: 'wp-3', title: 'Ad Launch' },
+    ];
+    const notFound = () => new Error('API error (404): Work plan not found');
+    const parse = (r: any) => JSON.parse(r.content[0].text);
+
+    it('resolves a unique exact title to its id for get after a 404', async () => {
+      mockMcpFetch.mockImplementation(async (o: any) => {
+        if (o.path === '/api/admin/work-plans') return plans as any;
+        if (o.path === '/api/admin/work-plans/wp-1') return { planId: 'wp-1', title: 'Weekly Report' } as any;
+        throw notFound();
+      });
+      const r = await mcpToolRegistry.execute('manage_predefined_work_plan', { action: 'get', plan_id: 'weekly report' }, context);
+      expect(parse(r)).toMatchObject({ planId: 'wp-1' });
+    });
+
+    it('returns valid plan ids instead of a bare 404 for an unknown id', async () => {
+      mockMcpFetch.mockImplementation(async (o: any) => {
+        if (o.path === '/api/admin/work-plans') return plans as any;
+        throw notFound();
+      });
+      const r = parse(await mcpToolRegistry.execute('manage_predefined_work_plan', { action: 'get', plan_id: 'nope' }, context));
+      expect(r.error).toContain('No work plan with id "nope"');
+      expect(r.availablePlans.map((p: any) => p.id)).toEqual(['wp-1', 'wp-2', 'wp-3']);
+    });
+
+    it('never deletes by title', async () => {
+      mockMcpFetch.mockImplementation(async (o: any) => {
+        if (o.method === 'GET' && o.path === '/api/admin/work-plans') return plans as any;
+        throw notFound();
+      });
+      const r = parse(await mcpToolRegistry.execute('manage_predefined_work_plan', { action: 'delete', plan_id: 'Weekly Report' }, context));
+      expect(r.error).toContain('delete requires the exact plan id');
+      expect(mockMcpFetch.mock.calls.filter((c: any) => c[0].method === 'DELETE')).toHaveLength(1);
+    });
+
+    it('refuses an ambiguous title and lists the matches', async () => {
+      mockMcpFetch.mockImplementation(async (o: any) => {
+        if (o.path === '/api/admin/work-plans') return plans as any;
+        throw notFound();
+      });
+      const r = parse(await mcpToolRegistry.execute('manage_predefined_work_plan', { action: 'update', plan_id: 'Ad Launch', title: 'x' }, context));
+      expect(r.error).toContain('matches 2 work plans');
+      expect(r.matchingPlans.map((p: any) => p.id)).toEqual(['wp-2', 'wp-3']);
+      expect(mockMcpFetch.mock.calls.filter((c: any) => c[0].method === 'PUT')).toHaveLength(1);
+    });
+
+    it('missing plan_id lists valid plans without calling the plan route', async () => {
+      mockMcpFetch.mockResolvedValue(plans as any);
+      const r = parse(await mcpToolRegistry.execute('manage_predefined_work_plan', { action: 'get' }, context));
+      expect(r.error).toContain('plan_id is required');
+      expect(r.availablePlans).toHaveLength(3);
+      expect(mockMcpFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('rethrows non-404 errors unchanged', async () => {
+      mockMcpFetch.mockRejectedValue(new Error('API error (500): boom'));
+      await expect(mcpToolRegistry.execute('manage_predefined_work_plan', { action: 'get', plan_id: 'wp-1' }, context))
+        .rejects.toThrow('API error (500): boom');
+    });
+  });
 });
