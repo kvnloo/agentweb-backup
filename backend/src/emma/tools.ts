@@ -2786,7 +2786,7 @@ emmaToolRegistry.register({
   name: 'create_html_from_template',
   definition: {
     name: 'create_html_from_template',
-    description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3. If the user refers to a template by name and multiple templates share that name, you MUST ask which template_id to use before calling this tool. IMPORTANT: every variable value is inserted into the template as literal text, exactly as you write it — do NOT format values with HTML tags (e.g. <ul>, <li>, <strong>) or Markdown syntax (e.g. **bold**, "- " bullets, # headers). Write plain sentences only; for multiple points within one variable, separate them with periods, not a list.',
+    description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3. Always call list_html_templates first and pass a template_id exactly as returned; never guess or invent a template_id. If this tool returns error_code TEMPLATE_NOT_FOUND, pick from its available_templates instead of retrying the same id. If the user refers to a template by name and multiple templates share that name, you MUST ask which template_id to use before calling this tool. IMPORTANT: every variable value is inserted into the template as literal text, exactly as you write it — do NOT format values with HTML tags (e.g. <ul>, <li>, <strong>) or Markdown syntax (e.g. **bold**, "- " bullets, # headers). Write plain sentences only; for multiple points within one variable, separate them with periods, not a list.',
     inputSchema: {
       type: 'object',
       properties: {
