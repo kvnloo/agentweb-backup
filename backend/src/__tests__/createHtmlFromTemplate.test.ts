@@ -742,6 +742,22 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(result.message).toContain('Template \'nonexistent-template-id\' not found');
     });
 
+    it('ENG-1888: not_found names the missing id and lists available templates', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([{ template_id: 'real-tpl', template_name: 'Real', html_content: '<p/>', subject: 's' }])
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model, 'nonexistent-template-id', {}, {}, 'user123', 'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error_code).toBe('TEMPLATE_NOT_FOUND');
+      expect(result.missing_template_id).toBe('nonexistent-template-id');
+      expect(result.available_templates).toEqual(expect.arrayContaining([{ template_id: 'real-tpl', template_name: 'Real' }]));
+      expect(result.message).toContain('list_html_templates');
+    });
+
     it('should handle LLM API errors', async () => {
       jest.spyOn(agentModeService as any, 'callLLM').mockRejectedValue(new Error('OpenAI API error'));
 
