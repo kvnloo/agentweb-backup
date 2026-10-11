@@ -15,6 +15,20 @@ export function echoCampaignReadBack(mockPost: jest.Mock, fallback: unknown = { 
       const biddingStrategyType = strategyKey?.replace(/([A-Z])/g, '_$1').toUpperCase();
       return { data: { results: [{ campaign: { ...u, ...(biddingStrategyType ? { biddingStrategyType } : {}) } }] } };
     }
+    // ENG-2398: generic echo for the other verified entities. Update read-backs see the
+    // last write to that resource; remove read-backs see nothing (resource gone).
+    const m = typeof body?.query === 'string'
+      ? /FROM (\w+) WHERE \1\.resource_name = '([^']+)'/.exec(body.query)
+      : null;
+    if (m && m[1] !== 'campaign') {
+      const [, entity, rn] = m;
+      const rowKey = entity.replace(/_([a-z])/g, (_x, c: string) => c.toUpperCase());
+      const writes = mockPost.mock.calls
+        .map((c: any[]) => c[1]?.operations?.[0]?.update)
+        .filter((u: any) => u && u.resourceName === rn);
+      const u = writes[writes.length - 1];
+      return { data: { results: u ? [{ [rowKey]: u }] : [] } };
+    }
     return fallback;
   });
 }
