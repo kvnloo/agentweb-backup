@@ -368,6 +368,50 @@ export function getUnassociatedToolNames(
 // `() => this.cleanupFileCache()`) rather than owned here — see this module's
 // header comment for why this cache stays instance-scoped instead of being
 // promoted to a module-level singleton like this series' other pure caches.
+// ENG-1608: save_file structured error contract.
+export const SAVE_FILE_MAX_BYTES = 10 * 1024 * 1024;
+export const SAVE_FILE_MAX_NAME_LENGTH = 200;
+export type SaveFileErrorCode =
+  | 'MISSING_FILE_NAME'
+  | 'INVALID_FILE_NAME'
+  | 'MISSING_FILE_CONTENT'
+  | 'INVALID_FILE_CONTENT'
+  | 'EMPTY_FILE_CONTENT'
+  | 'FILE_TOO_LARGE'
+  | 'STORAGE_WRITE_FAILED';
+
+function saveFileError(error_code: SaveFileErrorCode, message: string) {
+  return { success: false, error_code, message, error: message };
+}
+
+export function validateSaveFileArgs(fileName: unknown, fileContent: unknown) {
+  if (typeof fileName !== 'string' || fileName.trim().length === 0) {
+    return saveFileError('MISSING_FILE_NAME', 'file_name is required and must be a non-empty string with an extension (e.g. "report.html").');
+  }
+  if (
+    fileName.length > SAVE_FILE_MAX_NAME_LENGTH ||
+    /[\\/]/.test(fileName) ||
+    fileName.includes('..') ||
+    /[\x00-\x1f]/.test(fileName)
+  ) {
+    return saveFileError('INVALID_FILE_NAME', `file_name "${fileName.slice(0, 80)}" is invalid: use a plain name with no slashes, "..", or control characters, at most ${SAVE_FILE_MAX_NAME_LENGTH} characters (e.g. "report.html").`);
+  }
+  if (fileContent === undefined || fileContent === null) {
+    return saveFileError('MISSING_FILE_CONTENT', 'file_content is required: pass the COMPLETE file content as a string in this call.');
+  }
+  if (typeof fileContent !== 'string') {
+    return saveFileError('INVALID_FILE_CONTENT', `file_content must be a string, received ${Array.isArray(fileContent) ? 'array' : typeof fileContent}. Serialize objects (e.g. JSON.stringify) before saving.`);
+  }
+  if (fileContent.trim().length === 0) {
+    return saveFileError('EMPTY_FILE_CONTENT', 'file_content is empty: generate the full content first, then call save_file with it.');
+  }
+  const bytes = Buffer.byteLength(fileContent, 'utf8');
+  if (bytes > SAVE_FILE_MAX_BYTES) {
+    return saveFileError('FILE_TOO_LARGE', `file_content is ${bytes} bytes, above the ${SAVE_FILE_MAX_BYTES}-byte save_file limit. Split it into smaller files.`);
+  }
+  return null;
+}
+
 export async function saveFile(
   fileName: string,
   fileContent: string,
@@ -379,22 +423,10 @@ export async function saveFile(
   try {
     console.log('AgentMode: Saving file:', fileName, 'for user:', userId, 'session:', sessionId);
 
-    // Validate inputs
-    if (!fileName || typeof fileName !== 'string') {
-      throw new Error('file_name is required and must be a non-empty string (e.g. "report.html")');
-    }
-
-    if (fileContent === undefined || fileContent === null) {
-      throw new Error('file_content is required and cannot be undefined or null');
-    }
-
-    if (typeof fileContent !== 'string') {
-      throw new Error(`file_content must be a string, received: ${typeof fileContent}`);
-    }
-
-    if (fileContent.trim().length === 0) {
-      throw new Error('file_content cannot be empty');
-    }
+    // ENG-1608: validate before any storage write and return a structured,
+    // actionable error (error_code + message) instead of a generic Error.
+    const invalid = validateSaveFileArgs(fileName, fileContent);
+    if (invalid) return invalid;
 
     // Generate content hash for deduplication
     const contentHash = createHash('sha256').update(fileContent).digest('hex');
@@ -475,19 +507,18 @@ export async function saveFile(
         formattedContent
       };
     } else {
-      return {
-        success: false,
-        message: 'Failed to save file to S3. Please try again.',
-        error: uploadResult.error
-      };
+      return saveFileError(
+        'STORAGE_WRITE_FAILED',
+        `Storage rejected the write for "${fileName}": ${uploadResult.error || 'unknown storage error'}. Retry once; if it fails again, report the error instead of retrying.`,
+      );
     }
   } catch (error) {
     console.error('AgentMode: Error saving file:', error);
-    return {
-      success: false,
-      message: 'Failed to save file. Please try again.',
-      error: error instanceof Error ? error.message : 'Unknown error'
-    };
+    const detail = error instanceof Error ? error.message : 'Unknown error';
+    return saveFileError(
+      'STORAGE_WRITE_FAILED',
+      `Saving "${fileName}" failed: ${detail}. Retry once; if it fails again, report the error instead of retrying.`,
+    );
   }
 }
 
