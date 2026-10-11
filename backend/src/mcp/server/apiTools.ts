@@ -3815,14 +3815,51 @@ Returns matches with the page record (id, status, lead list), the owner (userId,
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({
-      method: 'GET',
-      path: `/api/admin/landing-pages/resolve?url=${encodeURIComponent(args.url)}`,
-      context: ctx(context)
-    });
-    return jsonResult(data);
+    // ENG-1628: the route answers "no match" with 404 and a bad url with 400, and
+    // mcpFetch turns both into a bare `Error` — so ordinary lookups were counted as
+    // bug-class runtime failures (4/4). Return typed results for those outcomes and
+    // reserve a thrown, specifically-named error for genuine faults.
+    const url = typeof args?.url === 'string' ? args.url.trim() : '';
+    if (!url) return jsonResult({ status: 'invalid_url', error: "'url' is required: pass a live page URL or bare hostname." });
+    let data: any;
+    try {
+      data = await mcpFetch({
+        method: 'GET',
+        path: `/api/admin/landing-pages/resolve?url=${encodeURIComponent(url)}`,
+        context: ctx(context)
+      });
+    } catch (error: any) {
+      const message = String(error?.message || error);
+      const status = Number(/API error \((\d{3})\)/.exec(message)?.[1]);
+      if (status === 404) {
+        const scannedAll = !/"scannedAll"\s*:\s*false/.test(message);
+        return jsonResult({
+          status: 'not_found',
+          matches: [],
+          scannedAll,
+          message: scannedAll
+            ? `No landing page matches "${url}".`
+            : `No landing page matched "${url}" within the scan cap; the result is inconclusive.`,
+        });
+      }
+      if (status === 400) {
+        return jsonResult({ status: 'invalid_url', error: `"${url}" is not a valid URL or hostname.` });
+      }
+      throw new LandingPageResolveError(message, Number.isFinite(status) ? status : undefined);
+    }
+    return jsonResult({ status: 'found', ...(data && typeof data === 'object' ? data : { data }) });
   }
 });
+
+/** ENG-1628: a genuine (non-404/400) failure of resolve_landing_page_by_url. */
+export class LandingPageResolveError extends Error {
+  readonly httpStatus?: number;
+  constructor(cause: string, httpStatus?: number) {
+    super(`resolve_landing_page_by_url failed${httpStatus ? ` (HTTP ${httpStatus})` : ''}: ${cause}`);
+    this.name = 'LandingPageResolveError';
+    this.httpStatus = httpStatus;
+  }
+}
 
 mcpToolRegistry.register({
   name: 'share_landing_page_with_org',
