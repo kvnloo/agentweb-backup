@@ -884,7 +884,9 @@ export async function generateImage(
       return {
         success: false,
         message: result.error || 'Failed to generate image',
-        error: result.error
+        error: result.error,
+        // ENG-1535: typed class (transient/rate_limited/policy/config/...) for the gateway.
+        ...(result.errorClass ? { errorClass: result.errorClass } : {})
       };
     }
 
