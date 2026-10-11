@@ -522,7 +522,8 @@ import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } fro
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
-import { isTransientLLMError, extractAffordableTokens } from '../utils/agentModeErrors';
+import { isTransientLLMError, extractAffordableTokens, PROVIDER_UNAVAILABLE_USER_MESSAGE } from '../utils/agentModeErrors';
+import { isLLMProviderOutage } from './agentMode/providerOutage';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
 import { computeRunVerdict, type RunTerminalInfo } from '../loops/instances/agent-mode/runRecorder';
 // OTel spine (ENG-141) — inert no-ops unless exporter env config is present.
@@ -5467,6 +5468,12 @@ export class AgentModeService {
         userMessage = 'Your request took longer than expected. Please try again.';
       } else if (isContextLimit || httpStatus === 400) {
         userMessage = 'I encountered an issue processing your request. Please try rephrasing your question.';
+      } else if (isLLMProviderOutage(error)) {
+        // ENG-2381: a final upstream 5xx (e.g. OpenRouter "503 Provider returned error"
+        // after its own provider failover and callLLM's transient retry) is a provider
+        // outage, not an unknown bug. Name it so the controller answers 503 instead of
+        // paging oncall as an "Unknown Error".
+        userMessage = PROVIDER_UNAVAILABLE_USER_MESSAGE;
       } else {
         userMessage = 'I apologize, but I encountered an error processing your request. Please try again.';
       }

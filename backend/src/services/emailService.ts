@@ -417,7 +417,7 @@ You're receiving this because you just signed up for AgentWeb.
       subject: 'A personal note from the AgentWeb founders',
       html,
       text,
-      cc: 'founders@agentweb.pro',
+      cc: ['founders@agentweb.pro', 'francisco@agentweb.pro'],
       replyTo: 'founders@agentweb.pro',
     });
     console.log(`Team introduction email sent to: ${email}`);
