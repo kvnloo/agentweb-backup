@@ -120,6 +120,19 @@ function classFromMessage(message: string): string | null {
   if (/could not resolve these skill ids to any known skill/.test(m)) return 'invalid_args';
   if (/these skills are currently unavailable to install/.test(m)) return 'skill_install_refused';
   /*
+   * ENG-1627 — create_html_file's remaining generic `Error` cluster. Matched
+   * early because these messages embed JSON positions and S3 URLs whose digits
+   * can trip the embedded-status patterns below.
+   *  - "Failed to parse arguments: … cut off …" is a mid-generation cutoff
+   *    (retryable), anything else from the arg parser is malformed JSON.
+   *  - Private-image size limits (inlineS3Images.ts) are oversized input, not
+   *    a runtime bug; access failures keep falling through (e.g. not_found).
+   */
+  if (/^failed to parse arguments:/.test(m)) {
+    return /were cut off before the json object was complete/.test(m) ? 'truncated_response' : 'invalid_args';
+  }
+  if (/decoded image exceeds the \d+ mb limit|exceeds? the \d+ mb (aggregate )?decoded limit/.test(m)) return 'invalid_args';
+  /*
    * The entitlement sentence needs the same protection, and for the same reason: a published
    * skillId beginning with a "500"/"404"/"403"-shaped token would otherwise be caught by the
    * embedded-status regex below and classified `upstream_5xx` / `not_found` / `auth`.
