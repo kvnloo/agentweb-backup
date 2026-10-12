@@ -4,6 +4,7 @@ import { createAccount, LumaConfig } from '../services/connectedAccountsDb';
 import { LumaApiService, LumaApiError } from '../services/lumaApiService';
 import { redactAccountSecrets } from '../utils/accountSecretRedaction';
 import { encryptPassword } from '../utils/crypto';
+import { NON_EXPIRING_TOKEN_TIMESTAMP } from '../utils/tokenUtils';
 
 const router = express.Router();
 
@@ -36,7 +37,7 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     const config: LumaConfig = {
       account_type: 'api_key',
       access_token: encryptPassword(apiKey, userId),
-      token_expires_at: Number.MAX_SAFE_INTEGER,
+      token_expires_at: NON_EXPIRING_TOKEN_TIMESTAMP,
       ...(calendar.url ? { calendar_url: calendar.url } : {}),
     };
     const account = await createAccount(userId, 'luma', {

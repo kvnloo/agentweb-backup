@@ -15,11 +15,26 @@ import {
   getAccountsWithOwnerIncludingOrgShared,
   updateAccountConfig,
 } from '../services/connectedAccountsDb';
-import { LumaApiService, LumaApiError, parseLumaEventId } from '../services/lumaApiService';
+import { LumaApiService, LumaApiError, LumaGuest, parseLumaEventId, normalizeIsoUtc } from '../services/lumaApiService';
 import { decryptPassword } from '../utils/crypto';
 
 const DEFAULT_MAX_GUESTS = 100;
 const HARD_MAX_GUESTS = 2000;
+/**
+ * Drops null fields and, unless asked for, registration answers. A result over 8,000 chars is
+ * offloaded to S3 and the model is shown only its first 20,000, so a guest list padded with
+ * nulls and long free-text answers would be cut off mid-list.
+ */
+function compactGuest(guest: LumaGuest, includeAnswers: boolean): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(guest)) {
+    if (value === null || value === undefined) continue;
+    if (key === 'registration_answers' && (!includeAnswers || (Array.isArray(value) && value.length === 0))) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
 const GUEST_STATUSES = ['approved', 'session', 'pending_approval', 'invited', 'declined', 'waitlist'];
 
 const NOT_CONNECTED_MESSAGE =
@@ -116,8 +131,8 @@ emmaToolRegistry.register({
     inputSchema: {
       type: 'object',
       properties: {
-        after: { type: 'string', description: 'ISO 8601 datetime — only events starting after this.' },
-        before: { type: 'string', description: 'ISO 8601 datetime — only events starting before this.' },
+        after: { type: 'string', description: 'ISO 8601 date or datetime (no offset = UTC) — only events starting after this.' },
+        before: { type: 'string', description: 'ISO 8601 date or datetime (no offset = UTC) — only events starting before this.' },
         limit: { type: 'number', description: 'Max events to return (default 25, max 100).' },
         cursor: { type: 'string', description: 'next_cursor from a previous call, to get the next page.' },
         calendar_id: { type: 'string', description: 'Only needed when several Luma calendars are connected.' },
@@ -129,10 +144,12 @@ emmaToolRegistry.register({
     const userId = context?.userId;
     if (!userId) return { success: false, message: 'Authentication required: no user context.' };
 
+    const bounds: { after?: string; before?: string } = {};
     for (const key of ['after', 'before'] as const) {
-      if (args?.[key] && Number.isNaN(Date.parse(args[key]))) {
-        return { success: false, message: `${key} must be an ISO 8601 datetime.` };
-      }
+      if (!args?.[key]) continue;
+      const iso = normalizeIsoUtc(args[key]);
+      if (!iso) return { success: false, message: `${key} must be an ISO 8601 date or datetime.` };
+      bounds[key] = iso;
     }
     const limit = args?.limit === undefined ? undefined : Number(args.limit);
     if (limit !== undefined && (!Number.isFinite(limit) || limit < 1)) {
@@ -144,8 +161,8 @@ emmaToolRegistry.register({
 
     try {
       const page = await resolved.client.listEvents({
-        after: args?.after,
-        before: args?.before,
+        after: bounds.after,
+        before: bounds.before,
         cursor: args?.cursor,
         limit,
       });
@@ -170,7 +187,7 @@ emmaToolRegistry.register({
     description:
       'Get the registered guests of one Luma event via the Luma API, newest registration first. `event` accepts the ' +
       'event id (evt-…) or a luma.com manage URL containing it (public slug links do not — find the id with luma_list_events). Returns guest_id, email, name, ' +
-      'approval_status, registered_at, phone_number and registration_answers. Use registered_after to pull only recent ' +
+      'approval_status, registered_at and phone_number when present; registration answers only with include_registration_answers. Use registered_after to pull only recent ' +
       'registrants (e.g. a lookback window); de-duplicate on guest_id across calls. Invited-but-never-registered ' +
       'records are omitted unless approval_status is "invited". If has_more is true, call again with next_cursor. ' +
       'This is the reliable path — prefer it over scraping the guest table in a browser. Requires a connected Luma API key.',
@@ -183,10 +200,17 @@ emmaToolRegistry.register({
           enum: GUEST_STATUSES,
           description: 'Which guests to return. Default "approved" (going). Use "pending_approval" for the approval queue.',
         },
-        registered_after: { type: 'string', description: 'ISO 8601 datetime — only guests who registered after this.' },
+        registered_after: {
+          type: 'string',
+          description: 'ISO 8601 date or datetime (no offset = UTC) — only guests who registered after this. Ignored for approval_status "invited", whose records have no registration time.',
+        },
+        include_registration_answers: {
+          type: 'boolean',
+          description: 'Include each guest\'s registration-question answers (default false). They are long; use a small max_guests (e.g. 25) when you need them.',
+        },
         max_guests: {
           type: 'number',
-          description: `Soft cap per call (default ${DEFAULT_MAX_GUESTS}, max ${HARD_MAX_GUESTS}); whole 100-guest pages are returned, so it can overshoot slightly. Results include registration answers, so keep it small and page with next_cursor.`,
+          description: `Soft cap per call (default ${DEFAULT_MAX_GUESTS}, max ${HARD_MAX_GUESTS}). Luma pages are 100 guests, so a cap below 100 shrinks the page itself. Page with next_cursor.`,
         },
         cursor: { type: 'string', description: 'next_cursor from a previous call, to continue.' },
         calendar_id: { type: 'string', description: 'Only needed when several Luma calendars are connected.' },
@@ -211,9 +235,12 @@ emmaToolRegistry.register({
     if (!GUEST_STATUSES.includes(status)) {
       return { success: false, message: `approval_status must be one of: ${GUEST_STATUSES.join(', ')}.` };
     }
-    if (args?.registered_after && Number.isNaN(Date.parse(args.registered_after))) {
-      return { success: false, message: 'registered_after must be an ISO 8601 datetime.' };
+    let registeredAfter: string | undefined;
+    if (args?.registered_after) {
+      registeredAfter = normalizeIsoUtc(args.registered_after) ?? undefined;
+      if (!registeredAfter) return { success: false, message: 'registered_after must be an ISO 8601 date or datetime.' };
     }
+    const includeAnswers = args?.include_registration_answers === true;
 
     const resolved = await resolveLuma(userId, args?.calendar_id);
     if ('error' in resolved) return { success: false, message: resolved.error };
@@ -223,7 +250,7 @@ emmaToolRegistry.register({
       const page = await resolved.client.listGuests({
         eventId,
         approvalStatus: status,
-        registeredAfter: args?.registered_after,
+        registeredAfter,
         cursor: args?.cursor,
         maxGuests,
       });
@@ -233,7 +260,7 @@ emmaToolRegistry.register({
         event_id: eventId,
         approval_status: status,
         count: page.guests.length,
-        guests: page.guests,
+        guests: page.guests.map((g) => compactGuest(g, includeAnswers)),
         has_more: page.has_more,
         ...(page.next_cursor ? { next_cursor: page.next_cursor } : {}),
         ...(page.interrupted

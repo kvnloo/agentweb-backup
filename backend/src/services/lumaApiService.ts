@@ -68,6 +68,21 @@ export interface LumaGuestPage {
   interrupted?: string;
 }
 
+/**
+ * Normalises a user/model-supplied date to the full ISO 8601 UTC form Luma documents.
+ * A bare date or an offset-less datetime is read as UTC: `Date.parse` would read the
+ * latter in the server's local zone, so the same input could mean different instants.
+ */
+export function normalizeIsoUtc(input: string): string | null {
+  const raw = String(input ?? '').trim();
+  if (!raw) return null;
+  let candidate = raw;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) candidate = `${raw}T00:00:00Z`;
+  else if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(raw)) candidate = `${raw}Z`;
+  const ms = Date.parse(candidate);
+  return Number.isNaN(ms) ? null : new Date(ms).toISOString();
+}
+
 /** Pulls the `evt-...` id out of a bare id or any Luma event/manage URL. */
 export function parseLumaEventId(input: string): string | null {
   const match = /evt-[A-Za-z0-9]+/.exec(input || '');
@@ -151,9 +166,9 @@ export class LumaApiService {
    * Entries with no `registered_at` are invited-but-never-registered records that
    * carry no real identity, so they are dropped unless the caller explicitly asks
    * for the `invited` status. Paging stops once a page crosses `registeredAfter`
-   * (the list is sorted newest-first, so everything beyond it is older). `maxGuests`
-   * is checked between pages and a page is never split, so the returned cursor
-   * always resumes exactly where this read stopped.
+   * (the list is sorted newest-first, so everything beyond it is older). The page size
+   * is capped at `maxGuests`, so a small cap really does bound the result; a page is
+   * never split, so the returned cursor always resumes exactly where this read stopped.
    */
   async listGuests(opts: {
     eventId: string;
@@ -180,7 +195,7 @@ export class LumaApiService {
           event_id: opts.eventId,
           approval_status: opts.approvalStatus,
           pagination_cursor: cursor,
-          pagination_limit: PAGE_SIZE,
+          pagination_limit: Math.min(PAGE_SIZE, Math.max(1, opts.maxGuests)),
           sort_column: 'registered_at',
           sort_direction: 'desc nulls last',
         });
