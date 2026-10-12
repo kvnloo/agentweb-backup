@@ -88,6 +88,7 @@ describe('Agent Mode Controller - Session Loading', () => {
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
         hasActiveProgress: false,
+        isGenerating: false,
         skills: [],
         // ENG-1579: no fixture message carries `.llm` and the fixture has no
         // `llmModel`, so there is nothing to attribute — all null.
@@ -235,6 +236,7 @@ describe('Agent Mode Controller - Session Loading', () => {
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
         hasActiveProgress: false,
+        isGenerating: false,
         skills: [],
         generationModels: null,
         attributedModels: null,
@@ -275,6 +277,7 @@ describe('Agent Mode Controller - Session Loading', () => {
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
         hasActiveProgress: false,
+        isGenerating: false,
         skills: [],
         generationModels: null,
         attributedModels: null,

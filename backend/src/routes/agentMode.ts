@@ -196,6 +196,10 @@ router.get('/function-calls', asyncHandler(agentModeController.getAvailableFunct
 // SSE endpoint for progress updates
 router.get('/session/:sessionId/progress', authenticateToken, asyncHandlerAuth(agentModeController.getProgress));
 
+// GET /api/agent-mode/generating
+// ENG-110: the caller's own sessions currently generating on this instance (reload-survival re-attach).
+router.get('/generating', authenticateToken, asyncHandlerAuth(agentModeController.getGeneratingSessions));
+
 // POST /api/agent-mode/session/:sessionId/stop
 // Stop generation for a session
 router.post('/session/:sessionId/stop', asyncHandlerAuth(agentModeController.stopGeneration));
