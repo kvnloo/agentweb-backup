@@ -124,8 +124,11 @@ describe('Partner Portal route catalog', () => {
       ['/marketing/creative-generation', 'placeholder'],
       ['/marketing/report/:id', 'placeholder'],
       ['/marketing/blog', 'placeholder'],
-      ['/workflows/builder/:id', 'dead-end'],
     ]));
+  });
+
+  it('no longer records the workflow builder post-save dead-end (ENG-2401)', () => {
+    expect(portalRouteCatalog.some(({ routePattern }) => routePattern === '/workflows/builder/:id')).toBe(false);
   });
 
   it('contains no duplicate route inventory entries', () => {
