@@ -112,6 +112,32 @@ describe('LlmConnectionService', () => {
       expect(await code(service.add({ userId: 'solo' }, { provider: 'google', apiKey: KEY_B }))).toBe('resolved');
     });
 
+    it('enforces the cap atomically: concurrent adds past it cannot all succeed', async () => {
+      const { service } = setup();
+      for (let i = 0; i < MAX_ACTIVE_CONNECTIONS_PER_OWNER - 1; i++) {
+        await service.add({ userId: 'solo' }, { provider: 'anthropic', apiKey: `${KEY_A}-${i}` });
+      }
+      const attempts = await Promise.all(
+        [0, 1, 2].map((i) => code(service.add({ userId: 'solo' }, { provider: 'openai', apiKey: `${KEY_B}-${i}` }))),
+      );
+      expect(attempts.filter((r) => r === 'resolved')).toHaveLength(1);
+      expect(attempts.filter((r) => r === 'limit_reached')).toHaveLength(2);
+      expect((await service.list('solo')).connections).toHaveLength(MAX_ACTIVE_CONNECTIONS_PER_OWNER);
+    });
+
+    it('frees a slot on revoke so a later add can use it, and a double revoke frees only one slot', async () => {
+      const { service } = setup();
+      for (let i = 0; i < MAX_ACTIVE_CONNECTIONS_PER_OWNER; i++) {
+        await service.add({ userId: 'solo' }, { provider: 'anthropic', apiKey: `${KEY_A}-${i}` });
+      }
+      const first = (await service.list('solo')).connections[0];
+      await service.revoke({ userId: 'solo' }, first.connectionId);
+      await service.revoke({ userId: 'solo' }, first.connectionId); // idempotent; must not double-free
+
+      expect(await code(service.add({ userId: 'solo' }, { provider: 'openai', apiKey: KEY_B }))).toBe('resolved');
+      expect(await code(service.add({ userId: 'solo' }, { provider: 'google', apiKey: KEY_B }))).toBe('limit_reached');
+    });
+
     it('records the admin when the key was added in a delegated session', async () => {
       const { service, store } = setup();
       await service.add({ userId: 'solo', adminId: 'admin-9' }, { provider: 'anthropic', apiKey: KEY_A });
@@ -132,6 +158,14 @@ describe('LlmConnectionService', () => {
       expect(await code(service.add({ userId: 'owner-1' }, { provider: 'anthropic', apiKey: KEY_A }))).toBe('resolved');
       expect(await code(service.add({ userId: 'admin' }, { provider: 'anthropic', apiKey: KEY_A }))).toBe('forbidden');
       expect(await code(service.add({ userId: 'member' }, { provider: 'anthropic', apiKey: KEY_A }))).toBe('forbidden');
+    });
+
+    it('stops showing a shared key once the person who shared it is no longer an owner of that org', async () => {
+      const { service, users } = setup();
+      const { connectionId } = await service.add({ userId: 'owner-1' }, { provider: 'anthropic', apiKey: KEY_A, shareWithOrg: true });
+      users['owner-1'] = { userId: 'owner-1', orgId: 'org-9', orgRole: 'owner' };
+      expect((await service.list('member')).connections).toHaveLength(0);
+      void connectionId;
     });
 
     it('shows a shared key to members, masked and marked as not theirs', async () => {
@@ -226,6 +260,47 @@ describe('LlmConnectionService', () => {
   });
 
   describe('re-checking a stored key', () => {
+    it('does not report a connection as active when it was revoked while the provider call was in flight', async () => {
+      const { service, validateKey } = setup();
+      const { connectionId } = await service.add({ userId: 'solo' }, { provider: 'anthropic', apiKey: KEY_A });
+      validateKey.mockImplementationOnce(async () => {
+        await service.revoke({ userId: 'solo' }, connectionId);
+        return 'ok';
+      });
+      expect(await code(service.validate({ userId: 'solo' }, connectionId))).toBe('not_found');
+    });
+
+    it('does not report a connection as active when it was revoked while an unreachable provider call was in flight', async () => {
+      const { service, validateKey } = setup();
+      const { connectionId } = await service.add({ userId: 'solo' }, { provider: 'anthropic', apiKey: KEY_A });
+      validateKey.mockImplementationOnce(async () => {
+        await service.revoke({ userId: 'solo' }, connectionId);
+        return 'provider_unreachable';
+      });
+      expect(await code(service.validate({ userId: 'solo' }, connectionId))).toBe('not_found');
+    });
+
+    it('does not report a connection as active when it is revoked between the fresh re-read and the final write', async () => {
+      const { service, store } = setup();
+      const { connectionId } = await service.add({ userId: 'solo' }, { provider: 'anthropic', apiKey: KEY_A });
+      // visible()'s own db.get is the FIRST call (authorization + snapshot); the fresh
+      // re-read validate() does after the provider call is the SECOND. Only that second
+      // call is this window: the re-read still sees "active" (its own call already
+      // captured the snapshot), but the connection is gone by the time recordCheck's own
+      // conditional write runs. recordCheck's returned false is what must stop this, not
+      // the re-read, which has already passed by then.
+      const realGet = store.db.get.bind(store.db);
+      let getCalls = 0;
+      jest.spyOn(store.db, 'get').mockImplementation(async (id: string) => {
+        getCalls += 1;
+        if (getCalls !== 2) return realGet(id);
+        const snapshot = await realGet(id);
+        await service.revoke({ userId: 'solo' }, id);
+        return snapshot; // stale: returned AFTER the real revoke, but captured before it
+      });
+      expect(await code(service.validate({ userId: 'solo' }, connectionId))).toBe('not_found');
+    });
+
     it('marks the connection invalid when the provider now refuses the key, and it stops being usable', async () => {
       const { service, validateKey, store } = setup();
       const { connectionId } = await service.add({ userId: 'solo' }, { provider: 'anthropic', apiKey: KEY_A });
@@ -312,6 +387,14 @@ describe('LlmConnectionService', () => {
       store.dynamo.seed(require('../llmConnectionDb').LLM_CONNECTIONS_TABLE, { ...rowB, sealed: rowA.sealed });
       await expect(service.getKeyMaterial(b.connectionId, 'outsider')).rejects.toThrow();
     });
+  });
+
+  it('grants nothing when the org a user belongs to cannot be loaded, failing closed rather than open', async () => {
+    const { service, users } = setup();
+    users['owner-1'].orgId = 'org-missing';
+    expect(await code(service.add({ userId: 'owner-1' }, { provider: 'anthropic', apiKey: KEY_A }))).toBe('forbidden');
+    const list = await service.list('owner-1');
+    expect(list).toMatchObject({ canManage: false, inOrg: false });
   });
 
   it('refuses everything for an unknown user', async () => {

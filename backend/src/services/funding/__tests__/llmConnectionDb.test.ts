@@ -94,4 +94,42 @@ describe('LlmConnectionDb', () => {
     expect(await db.recordCheck('conn-1', { result: 'invalid_key', status: 'invalid', ok: false }, LATER)).toBe(true);
     expect(await db.get('conn-1')).toMatchObject({ status: 'invalid', lastCheckResult: 'invalid_key', lastCheckedAt: LATER, lastOkAt: NOW });
   });
+
+  describe('the per-owner slot counter', () => {
+    const LLM_CONNECTIONS_TABLE = require('../llmConnectionDb').LLM_CONNECTIONS_TABLE;
+    const counterRow = (dynamo: any, ownerUserId: string) =>
+      dynamo.items(LLM_CONNECTIONS_TABLE).find((r: any) => r.connectionId === `limit#${ownerUserId}`);
+
+    it('enforces the cap atomically and releases a slot on revoke', async () => {
+      const { db, dynamo } = makeDb();
+      for (let i = 0; i < 3; i++) {
+        expect(await db.createWithinLimit(record({ connectionId: `c${i}` }), 3)).toBe(true);
+      }
+      expect(await db.createWithinLimit(record({ connectionId: 'c-over' }), 3)).toBe(false);
+      expect(counterRow(dynamo, 'user-1').activeCount).toBe(3);
+
+      await db.revoke('c0', { userId: 'user-1' }, LATER);
+      await db.releaseSlot('user-1');
+      expect(counterRow(dynamo, 'user-1').activeCount).toBe(2);
+      expect(await db.createWithinLimit(record({ connectionId: 'c-fits-now' }), 3)).toBe(true);
+    });
+
+    it('never goes negative, which would otherwise let more than the cap through', async () => {
+      const { db, dynamo } = makeDb();
+      await db.releaseSlot('owner-x'); // nothing created yet -- must be a harmless no-op
+      expect(counterRow(dynamo, 'owner-x')).toBeUndefined();
+
+      expect(await db.createWithinLimit(record({ connectionId: 'c1', ownerUserId: 'owner-x' }), 5)).toBe(true);
+      await db.revoke('c1', { userId: 'owner-x' }, LATER);
+      await db.releaseSlot('owner-x'); // back to 0
+      await db.releaseSlot('owner-x'); // already 0 -- must stay 0, not go negative
+      expect(counterRow(dynamo, 'owner-x').activeCount).toBe(0);
+
+      for (let i = 0; i < 5; i++) {
+        expect(await db.createWithinLimit(record({ connectionId: `c${i + 2}`, ownerUserId: 'owner-x' }), 5)).toBe(true);
+      }
+      // A counter that went negative would still read as "< cap" here and wrongly admit one more.
+      expect(await db.createWithinLimit(record({ connectionId: 'one-too-many', ownerUserId: 'owner-x' }), 5)).toBe(false);
+    });
+  });
 });

@@ -41,5 +41,12 @@ export function makeDb() {
     },
   });
   const Client = dynamo.documentClient;
-  return { dynamo, db: new LlmConnectionDb(new Client() as any), rows: () => dynamo.items(LLM_CONNECTIONS_TABLE) };
+  // listByOwner/listSharedWithOrg/listByProvider all query a GSI, so a slot-counter row
+  // (which carries none of those indexes' key attributes) is naturally excluded --
+  // `rows()` goes straight at the table and would otherwise show it as a phantom row.
+  return {
+    dynamo,
+    db: new LlmConnectionDb(new Client() as any),
+    rows: () => dynamo.items(LLM_CONNECTIONS_TABLE).filter((r) => r.connectionId !== undefined && !r.connectionId.startsWith('limit#')),
+  };
 }
