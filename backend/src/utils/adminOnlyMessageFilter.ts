@@ -92,7 +92,10 @@ export function filterMessagesForClient(messages: any[], opts: AdminRedactionOpt
   const adminToolNameSet = new Set<string>(opts.adminToolNames ?? []);
   const adminTainted = computeAdminTaintedTurns(messages, viewerIsAdmin, adminToolNameSet);
 
-  const stripOrigin = (message: any) => {
+  // `omitBranchOrigin` is the legacy flag name for "this viewer is not the session owner": it strips BOTH owner-only
+  // metadata keys (ENG-112 branchOrigin and ENG-113 compareAlternatives). Both share the one call-site rule on purpose
+  // (every non-owner view must hide both); the adminOnlyMessageFilter tripwire tests pin each key.
+  const stripOwnerOnlyMetadata = (message: any) => {
     if (!opts.omitBranchOrigin || !message?.metadata) return message;
     if (!('branchOrigin' in message.metadata) && !('compareAlternatives' in message.metadata)) return message;
     const { branchOrigin: _origin, compareAlternatives: _alternatives, ...metadata } = message.metadata;
@@ -124,7 +127,7 @@ export function filterMessagesForClient(messages: any[], opts: AdminRedactionOpt
     }
 
     return true;
-  }).map(stripOrigin);
+  }).map(stripOwnerOnlyMetadata);
 }
 
 /**

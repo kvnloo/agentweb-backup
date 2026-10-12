@@ -34,6 +34,8 @@ import {
   __resetBranchIdempotencyForTests,
 } from '../services/agentMode/chatBranching';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
+import { COMPARE_ROW_CAP_BYTES, serializedBytes, withSavedAlternatives } from '../services/agentMode/compareSaveAlternatives';
+import { MAX_MESSAGE_CONTENT_SIZE } from '../services/chatbotService';
 
 const OWNER = 'user-owner';
 const SRC = 'src-session-1';
@@ -258,5 +260,66 @@ describe('Branch with this answer (alternativeModel)', () => {
     expect(mockFake.session(out(res).sessionId)!.archived).toBeUndefined();
     const stranger = await branchChatSession(makeDeps(), { user: { userId: 'someone-else' }, viewerIsAdmin: false, sessionId: SRC, body: { messageIndex: 2, alternativeModel: 'claude-sonnet-4-6' } });
     expect(stranger.status).toBe(403);
+  });
+});
+
+describe('Branch with this answer keeps the family link (ENG-112 branchedFrom, root preserved)', () => {
+  it('writes branchedFrom on the new session and the family endpoint helper lists it', async () => {
+    seed();
+    const first = out(await run({ messageIndex: 2, alternativeModel: 'claude-sonnet-4-6' }));
+    expect(mockFake.session(first.sessionId)!.branchedFrom).toEqual({
+      sessionId: SRC, rootSessionId: SRC, messageIndex: 2, branchedAt: '2026-10-08T12:00:00.000Z',
+    });
+    expect(mockFake.session(SRC)!.branchedFrom).toBeUndefined();
+    // a branch-with-alternative OF that branch keeps the ORIGINAL root
+    mockFake.seedMessages(first.sessionId, rows()); // give the branch enough rows to branch from again
+    const second = out(
+      await branchChatSession(makeDeps(), { user: { userId: OWNER }, viewerIsAdmin: false, sessionId: first.sessionId, body: { messageIndex: 2, alternativeModel: 'claude-sonnet-4-6' } }),
+    );
+    expect(second.sessionId).toBeDefined();
+    expect(mockFake.session(second.sessionId)!.branchedFrom).toMatchObject({ sessionId: first.sessionId, rootSessionId: SRC });
+  });
+});
+
+describe('a later feedback write never damages an accepted Compare row', () => {
+  const alts = ALTS.map((a) => ({ ...a }));
+  const rowAt = (bytes: number): ChatMessage => {
+    const mk = (n: number) =>
+      withSavedAlternatives(
+        { role: 'assistant', content: 'x'.repeat(n), timestamp: ts, llm: 'gpt-5.5', metadata: { timestamp: ts, portalType: 'agent' } } as ChatMessage,
+        'cmp-1',
+        alts,
+      );
+    return mk(bytes - serializedBytes(mk(0)));
+  };
+
+  it('the accepted-row cap leaves headroom under the real persistence cap', () => {
+    expect(COMPARE_ROW_CAP_BYTES).toBeLessThanOrEqual(MAX_MESSAGE_CONTENT_SIZE - 8_192);
+  });
+
+  it('a row accepted at exactly the cap survives updateMessageFeedback with content AND alternatives unchanged', async () => {
+    const row = rowAt(COMPARE_ROW_CAP_BYTES);
+    expect(serializedBytes(row)).toBe(COMPARE_ROW_CAP_BYTES);
+    expect(row.metadata!.compareAlternatives).toHaveLength(2);
+    mockFake.seedSession({ sessionId: 'fb', userId: OWNER, title: 't', createdAt: ts, updatedAt: ts, messageCount: 1, messages: [] });
+    mockFake.seedMessages('fb', [row]);
+    const updated = await chatbotDb.updateMessageFeedback('fb', 0, {
+      type: 'like', comment: 'great answer, thanks '.repeat(20), timestamp: ts, userId: OWNER,
+    } as any);
+    expect(updated.content).toBe(row.content);
+    expect(updated.metadata!.compareAlternatives).toEqual(alts);
+    expect(updated.metadata!.compareId).toBe('cmp-1');
+    expect((updated.metadata as any).feedback.type).toBe('like');
+    const stored = msgs('fb')[0];
+    expect(stored.content).toBe(row.content);
+    expect(stored.metadata.compareAlternatives).toEqual(alts);
+  });
+
+  it('one byte over the cap => alternatives omitted with the size marker, chosen answer intact', () => {
+    const chars = COMPARE_ROW_CAP_BYTES + 1 - (serializedBytes(rowAt(COMPARE_ROW_CAP_BYTES)) - rowAt(COMPARE_ROW_CAP_BYTES).content.length);
+    const over = rowAt(COMPARE_ROW_CAP_BYTES + 1);
+    expect(over.content).toBe('x'.repeat(chars));
+    expect(over.metadata).not.toHaveProperty('compareAlternatives');
+    expect(over.metadata!.compareAlternativesOmitted).toBe('size');
   });
 });

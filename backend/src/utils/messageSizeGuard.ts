@@ -59,6 +59,9 @@ function fitContent(message: any, maxBytes: number, originalSize: number): any {
   return { ...message, content: notice.trim() };
 }
 
+/** Per-item persistence ceiling (UTF-8 bytes of the serialized message); chatbotService's MAX_MESSAGE_CONTENT_SIZE. */
+export const MAX_PERSISTED_MESSAGE_BYTES = 350_000;
+
 /**
  * Return a copy of `message` that serializes to at most `maxBytes` bytes, shedding the
  * least valuable parts first. Returns the ORIGINAL reference when it already fits.

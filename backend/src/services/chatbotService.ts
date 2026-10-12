@@ -26,7 +26,7 @@ import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService, agentModeService as agentModeServiceSingleton } from './agentModeService';
 import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../utils/citations';
-import { shrinkMessageForPersistence } from '../utils/messageSizeGuard';
+import { MAX_PERSISTED_MESSAGE_BYTES, shrinkMessageForPersistence } from '../utils/messageSizeGuard';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
 import { withKeyedMutex } from '../utils/keyedMutex';
@@ -46,7 +46,7 @@ const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
 // Max serialized message size for DynamoDB persistence (400KB item limit).
 // Safety net in addMessagesToMessagesTable; primary truncation happens in agentModeService.
-export const MAX_MESSAGE_CONTENT_SIZE = 350_000;
+export const MAX_MESSAGE_CONTENT_SIZE = MAX_PERSISTED_MESSAGE_BYTES;
 
 // Tool calls that require repair for empty results (MCP PR #433 bug)
 const REPAIRABLE_TOOL_CALLS = [

@@ -18,8 +18,10 @@ Now, with AW-Settings `compare_save_alternatives` = exactly `true` (absent / any
   logged (reason only), select still succeeds for the chosen answer. Replay returns the existing pair and never rewrites;
   409 `compare_already_selected` unchanged; select makes no model call, so usage/cost are unchanged.
 - Size (fail closed): the serialized alternatives array must be <= 120,000 UTF-8 bytes AND the whole assistant row must
-  be <= 350,000 bytes (`MAX_MESSAGE_CONTENT_SIZE`, the cap `shrinkMessageForPersistence` enforces by dropping metadata).
-  A row accepted this way is returned untouched by the guard (tested). Otherwise NONE are stored (never a partial set)
+  be <= 341,808 bytes (`MAX_MESSAGE_CONTENT_SIZE` 350,000 minus 8,192 headroom, `COMPARE_ROW_CAP_BYTES`). The headroom exists
+  because a later like/dislike/edit re-runs `shrinkMessageForPersistence`, which truncates the chosen ANSWER before it
+  drops metadata; a row accepted right at 350,000 lost answer characters after a feedback write. A row accepted this way
+  is returned untouched by the guard, now and after a feedback write (both tested). Otherwise NONE are stored (never a partial set)
   and the row gets `metadata.compareAlternativesOmitted:'size'`; if even the marker would not fit under the cap the
   message is stored exactly as today (the chosen answer is never put at risk for a marker). Bytes are measured as
   JSON-escaped UTF-8 (CJK/emoji/control chars), not characters.

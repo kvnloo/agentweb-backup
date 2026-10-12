@@ -317,6 +317,15 @@ describe('POST /compare/select with alternatives', () => {
     expect(deps.log).toHaveBeenCalledWith('ModelCompare: ignoring saved alternatives', expect.any(Object));
   });
 
+  it('domain separation, the other direction: a set token passed as the selectToken is rejected and writes nothing', async () => {
+    const { deps, appendMessages } = makeSelect();
+    const p: any = payload();
+    const out = await go(deps, { ...p, selectToken: p.alternativesToken });
+    expect(out.status).toBe(400);
+    expect((out.body as any).code).toBe('invalid_select_token');
+    expect(appendMessages).not.toHaveBeenCalled();
+  });
+
   it('a chosen answer outside the signed set cannot be saved with alternatives (select token still guards the chosen)', async () => {
     const { deps, appendMessages } = makeSelect();
     // chosen answer swapped for another signed select token: set no longer matches
@@ -414,9 +423,9 @@ describe('size budget by construction (withSavedAlternatives + messageSizeGuard)
     metadata: { timestamp: '2026-10-12T00:00:00.000Z', portalType: 'agent' },
   });
 
-  it('the cap constant is the real persistence cap, and the alternatives budget leaves >= 200KB for the chosen answer', async () => {
+  it('the cap is the real persistence cap minus 8 KiB headroom, and the alternatives budget leaves >= 200KB for the chosen answer', async () => {
     const { MAX_MESSAGE_CONTENT_SIZE } = await import('../services/chatbotService');
-    expect(COMPARE_ROW_CAP_BYTES).toBe(MAX_MESSAGE_CONTENT_SIZE);
+    expect(COMPARE_ROW_CAP_BYTES).toBe(MAX_MESSAGE_CONTENT_SIZE - 8_192);
     expect(COMPARE_ROW_CAP_BYTES - COMPARE_ALTERNATIVES_BUDGET_BYTES).toBeGreaterThanOrEqual(200_000);
   });
 

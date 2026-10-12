@@ -14,6 +14,7 @@
  * Pure module apart from the injected settings reader (and constants shared with the size-guard test).
  */
 import type { ChatMessage } from '../chatbotService';
+import { MAX_PERSISTED_MESSAGE_BYTES } from '../../utils/messageSizeGuard';
 
 export const COMPARE_SAVE_ALTERNATIVES_SETTING = 'compare_save_alternatives';
 
@@ -23,10 +24,17 @@ export const MAX_COMPARE_ALTERNATIVES = 3;
  * Hard budget for the serialized `compareAlternatives` array (UTF-8 bytes of its JSON, i.e. what DynamoDB counts).
  * The per-row persistence cap is 350,000 bytes (chatbotService MAX_MESSAGE_CONTENT_SIZE, enforced by
  * messageSizeGuard.shrinkMessageForPersistence, which drops `metadata` once it is exceeded). The row is
- * accepted ONLY when its whole serialization is <= COMPARE_ROW_CAP_BYTES, so the guard returns it untouched.
+ * accepted ONLY when its whole serialization is <= COMPARE_ROW_CAP_BYTES (cap minus 8 KiB headroom), so the guard
+ * returns it untouched now AND after a later feedback/edit write.
  */
 export const COMPARE_ALTERNATIVES_BUDGET_BYTES = 120_000;
-export const COMPARE_ROW_CAP_BYTES = 350_000;
+/**
+ * Headroom under the persistence cap. A later like/dislike/edit rewrites the row through the same guard, and that
+ * guard truncates the CHOSEN ANSWER (step 3) before it sheds metadata (step 4): a row accepted right at the cap
+ * lost characters of the answer after a feedback write. Rows accepted here therefore stay >= 8 KiB below the cap.
+ */
+export const COMPARE_ROW_HEADROOM_BYTES = 8_192;
+export const COMPARE_ROW_CAP_BYTES = MAX_PERSISTED_MESSAGE_BYTES - COMPARE_ROW_HEADROOM_BYTES;
 export const COMPARE_ALTERNATIVES_OMITTED_SIZE = 'size';
 /** Display-only latency is clamped to something a 60s deadline could never exceed by much. */
 export const MAX_ALTERNATIVE_LATENCY_MS = 3_600_000;
