@@ -638,20 +638,20 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                             # ENG-273: no Slack channel does not mean no way to ask. The
                             # customer may be on WhatsApp instead — the two are separate
                             # features and a customer connects one. Ask on whatever they have.
-                            if revisionDone:
-                                # The email-friendly revision already sent its approval request
-                                # through the backend, which asks on the customer's connected
-                                # channel. Do not ask twice; hold the results as the Slack path does.
-                                approval_outcome_without_slack = APPROVAL_SENT
-                            else:
-                                approval_outcome_without_slack = request_task_approval_without_slack(
-                                    task_id=execution['taskId'],
-                                    execution_id=execution_id,
-                                    asset_url=asset_file['url'],
-                                    filename=asset_file['filename'],
-                                    asset_type=asset_type,
-                                    user_id=task['userId']
-                                )
+                            # Asked for even when an email-friendly revision was made
+                            # (asset_file already points at the revised asset). The Slack path
+                            # skips asking then because the revision flow posts its own approval
+                            # — but that flow only does so when the execution has a Slack
+                            # channel, so for any other customer nobody would have asked, and
+                            # holding the results would leave them with nothing to release them.
+                            approval_outcome_without_slack = request_task_approval_without_slack(
+                                task_id=execution['taskId'],
+                                execution_id=execution_id,
+                                asset_url=asset_file['url'],
+                                filename=asset_file['filename'],
+                                asset_type=asset_type,
+                                user_id=task['userId']
+                            )
                             if approval_outcome_without_slack == APPROVAL_SENT:
                                 logger.info(f"📤 APPROVAL SENT: For task {execution['taskId']} on the customer's connected channel")
                             elif approval_outcome_without_slack == APPROVAL_FAILED:
