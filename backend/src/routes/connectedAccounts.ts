@@ -338,7 +338,7 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         expiryMessage = 'Reconnect required — HubSpot revoked the token';
       } else if (acc.platform === 'luma' && (acc.config as any).needs_reconnect) {
         // Luma rejected the calendar API key (revoked, or the Plus plan lapsed) — see
-        // emma/lumaTools.ts, which sets this flag when a call comes back 401/403.
+        // emma/lumaTools.ts, which sets this flag when a call comes back 401.
         status = 'disconnected';
         expiryMessage = 'Reconnect required — Luma rejected the API key';
       } else if (adsCapability.ads_capable === false) {

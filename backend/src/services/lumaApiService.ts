@@ -66,8 +66,8 @@ export interface LumaGuestPage {
   guests: LumaGuest[];
   has_more: boolean;
   next_cursor?: string;
-  /** Raw entries scanned, including ones skipped for having no registered_at. */
-  scanned: number;
+  /** Entries dropped for having no registered_at (shown to the model so the omission is never silent). */
+  skippedWithoutRegistration: number;
   /** Set when a later page failed after earlier ones succeeded; next_cursor resumes at the failed page. */
   interrupted?: string;
 }
@@ -89,7 +89,8 @@ export function normalizeIsoUtc(input: string): string | null {
 
 /** Pulls the `evt-...` id out of a bare id or any Luma event/manage URL. */
 export function parseLumaEventId(input: string): string | null {
-  const match = /evt-[A-Za-z0-9]+/.exec(input || '');
+  // Not preceded by a word char, so a slug like "my-evt-launch" is not mistaken for an id.
+  const match = /(?<![A-Za-z0-9-])evt-[A-Za-z0-9]+/.exec(input || '');
   return match ? match[0] : null;
 }
 
@@ -187,7 +188,7 @@ export class LumaApiService {
     const guests: LumaGuest[] = [];
     let cursor = opts.cursor;
     let hasMore = true;
-    let scanned = 0;
+    let skipped = 0;
     let pages = 0;
     let crossedCutoff = false;
     let interrupted: string | undefined;
@@ -218,8 +219,10 @@ export class LumaApiService {
       if (hasMore && !cursor) hasMore = false;
 
       for (const g of data.entries || []) {
-        scanned += 1;
-        if (!g.registered_at && !keepUnregistered) continue;
+        if (!g.registered_at && !keepUnregistered) {
+          skipped += 1;
+          continue;
+        }
         if (g.registered_at && Number.isFinite(cutoff) && Date.parse(g.registered_at) < cutoff) {
           crossedCutoff = true;
           continue;
@@ -243,7 +246,7 @@ export class LumaApiService {
       guests,
       has_more: !exhausted,
       next_cursor: exhausted ? undefined : cursor,
-      scanned,
+      skippedWithoutRegistration: skipped,
       ...(interrupted ? { interrupted } : {}),
     };
   }

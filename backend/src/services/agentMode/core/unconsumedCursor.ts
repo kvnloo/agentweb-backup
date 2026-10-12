@@ -43,7 +43,7 @@ export interface UnconsumedCursor {
 const CURSOR_RESULT_KEYS = ['next_cursor', 'nextCursor'] as const;
 
 /** Row-bearing keys, so "how much did we actually read" is answerable. */
-const ROW_KEYS = ['leads', 'engagements', 'results', 'items', 'rows'] as const;
+const ROW_KEYS = ['leads', 'engagements', 'results', 'items', 'rows', 'guests'] as const;
 
 /**
  * The tool's name, or null when the entry does not carry one.

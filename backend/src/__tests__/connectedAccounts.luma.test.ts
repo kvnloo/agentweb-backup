@@ -38,10 +38,6 @@ jest.mock('../middleware/auth', () => ({
     next();
   },
 }));
-jest.mock('../utils/tokenUtils', () => ({
-  getTokenStatus: jest.fn().mockReturnValue('active'),
-  formatExpiryMessage: jest.fn().mockReturnValue('Expires in 30 days'),
-}));
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     getStatusesForAccounts: jest.fn().mockResolvedValue(new Map()),
@@ -104,10 +100,11 @@ describe('GET /connected-accounts — Luma API key (ENG-2338)', () => {
     expect(account.expiry_message).toMatch(/luma/i);
   });
 
-  it('reports a healthy key as connected', async () => {
+  it('reports a healthy key as connected (real token utils: the non-expiring sentinel must read as active, not expired)', async () => {
     (connectedAccountsDb.getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([lumaAccount({})]);
     const account = await listAccounts();
     expect(account.status).toBe('active');
+    expect(account.expiry_message).toBe('Connected');
   });
 
   it('never puts the stored key in the response', async () => {

@@ -77,6 +77,7 @@ describe('parseLumaEventId', () => {
     expect(parseLumaEventId('evt-oxHprLhYPH3C7HS')).toBe('evt-oxHprLhYPH3C7HS');
     expect(parseLumaEventId('https://luma.com/event/manage/evt-oxHprLhYPH3C7HS/guests')).toBe('evt-oxHprLhYPH3C7HS');
     expect(parseLumaEventId('https://luma.com/some-slug')).toBeNull();
+    expect(parseLumaEventId('https://luma.com/my-evt-launch')).toBeNull();
   });
 });
 
@@ -262,6 +263,54 @@ describe('luma tools', () => {
     expect(r.success).toBe(true);
     expect(r.guests).toHaveLength(1);
     expect(JSON.stringify(r)).not.toContain('secret-key');
+  });
+
+  it('puts the paging fields BEFORE the guest list, so a size cut can only ever remove guests', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ entries: [guest('a', '2026-10-06T00:00:00Z')], has_more: true, next_cursor: 'c2' }),
+    );
+    const r: any = await tool('luma_get_guests')({ event: 'evt-1' }, { userId: 'user-1' });
+    const keys = Object.keys(r);
+    expect(keys.indexOf('has_more')).toBeLessThan(keys.indexOf('guests'));
+    expect(keys.indexOf('next_cursor')).toBeLessThan(keys.indexOf('guests'));
+  });
+
+  it('keeps a full default read of realistic guests inside the 20,000 chars the model is shown', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    const real = (i: number) => ({
+      ...guest(`gst-Ab12Cd34Ef56Gh${i}`, '2026-10-11T18:22:41.123Z'),
+      user_email: `jonathan.fitzgerald${i}@acmecorp-industries.com`,
+      user_name: 'Jonathan Fitzgerald',
+      user_first_name: 'Jonathan',
+      user_last_name: 'Fitzgerald',
+      phone_number: '+14155550123',
+    });
+    fetchMock.mockImplementation(async (url: any) => {
+      const limit = Number(new URL(String(url)).searchParams.get('pagination_limit'));
+      return jsonResponse({ entries: Array.from({ length: limit }, (_, i) => real(i)), has_more: true, next_cursor: 'c2' });
+    });
+    for (const args of [{}, { max_guests: 5000 }]) {
+      const r: any = await tool('luma_get_guests')({ event: 'evt-1', ...args }, { userId: 'user-1' });
+      expect(JSON.stringify(r).length).toBeLessThan(20000);
+      expect(r.has_more).toBe(true);
+    }
+    fetchMock.mockReset();
+  });
+
+  it('tells the model how many registration-less guests were dropped instead of dropping them silently', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    fetchMock.mockResolvedValueOnce(jsonResponse({ entries: [guest('a', '2026-10-06T00:00:00Z'), guest('host-added', null)], has_more: false }));
+    const r: any = await tool('luma_get_guests')({ event: 'evt-1' }, { userId: 'user-1' });
+    expect(r.guests).toHaveLength(1);
+    expect(r.skipped_without_registration).toBe(1);
+  });
+
+  it('rounds fractional limits down before they reach Luma', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    fetchMock.mockResolvedValue(jsonResponse({ entries: [], has_more: false }));
+    await tool('luma_list_events')({ limit: 2.7 }, { userId: 'user-1' });
+    expect(String(fetchMock.mock.calls.pop()![0])).toContain('pagination_limit=2&');
   });
 
   it('omits null fields and registration answers by default, includes answers when asked', async () => {

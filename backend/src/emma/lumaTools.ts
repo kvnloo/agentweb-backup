@@ -18,8 +18,12 @@ import {
 import { LumaApiService, LumaApiError, LumaGuest, parseLumaEventId, normalizeIsoUtc } from '../services/lumaApiService';
 import { decryptPassword } from '../utils/crypto';
 
-const DEFAULT_MAX_GUESTS = 100;
-const HARD_MAX_GUESTS = 2000;
+// A compact guest is ~270 chars of JSON. A tool result over 8,000 chars is offloaded to S3 and the model
+// is shown only the first 20,000, so one call is capped to what fits (60 x 270 = ~16k) and anything
+// more is read by following next_cursor.
+const DEFAULT_MAX_GUESTS = 40;
+const HARD_MAX_GUESTS = 60;
+const MAX_GUESTS_WITH_ANSWERS = 20;
 /**
  * Drops null fields and, unless asked for, registration answers. A result over 8,000 chars is
  * offloaded to S3 and the model is shown only its first 20,000, so a guest list padded with
@@ -151,7 +155,7 @@ emmaToolRegistry.register({
       if (!iso) return { success: false, message: `${key} must be an ISO 8601 date or datetime.` };
       bounds[key] = iso;
     }
-    const limit = args?.limit === undefined ? undefined : Number(args.limit);
+    const limit = args?.limit === undefined ? undefined : Math.floor(Number(args.limit));
     if (limit !== undefined && (!Number.isFinite(limit) || limit < 1)) {
       return { success: false, message: 'limit must be a positive number.' };
     }
@@ -210,7 +214,7 @@ emmaToolRegistry.register({
         },
         max_guests: {
           type: 'number',
-          description: `Soft cap per call (default ${DEFAULT_MAX_GUESTS}, max ${HARD_MAX_GUESTS}). Luma pages are 100 guests, so a cap below 100 shrinks the page itself. Page with next_cursor.`,
+          description: `Soft cap per call (default ${DEFAULT_MAX_GUESTS}, max ${HARD_MAX_GUESTS}, ${MAX_GUESTS_WITH_ANSWERS} with registration answers). Larger lists are read by calling again with next_cursor until has_more is false.`,
         },
         cursor: { type: 'string', description: 'next_cursor from a previous call, to continue.' },
         calendar_id: { type: 'string', description: 'Only needed when several Luma calendars are connected.' },
@@ -245,7 +249,8 @@ emmaToolRegistry.register({
     const resolved = await resolveLuma(userId, args?.calendar_id);
     if ('error' in resolved) return { success: false, message: resolved.error };
 
-    const maxGuests = Math.min(Math.max(Number(args?.max_guests) || DEFAULT_MAX_GUESTS, 1), HARD_MAX_GUESTS);
+    const cap = includeAnswers ? MAX_GUESTS_WITH_ANSWERS : HARD_MAX_GUESTS;
+    const maxGuests = Math.min(Math.max(Math.floor(Number(args?.max_guests)) || Math.min(DEFAULT_MAX_GUESTS, cap), 1), cap);
     try {
       const page = await resolved.client.listGuests({
         eventId,
@@ -260,12 +265,17 @@ emmaToolRegistry.register({
         event_id: eventId,
         approval_status: status,
         count: page.guests.length,
-        guests: page.guests.map((g) => compactGuest(g, includeAnswers)),
+        // Paging fields BEFORE the guest list: if a result is ever cut for size, the tail goes, so these
+        // must never be what is lost.
         has_more: page.has_more,
         ...(page.next_cursor ? { next_cursor: page.next_cursor } : {}),
         ...(page.interrupted
           ? { interrupted: `Stopped early (${page.interrupted}). These guests are valid; call again with next_cursor to continue.` }
           : {}),
+        ...(page.skippedWithoutRegistration
+          ? { skipped_without_registration: page.skippedWithoutRegistration }
+          : {}),
+        guests: page.guests.map((g) => compactGuest(g, includeAnswers)),
       };
     } catch (error) {
       return lumaFailure(error, resolved);
