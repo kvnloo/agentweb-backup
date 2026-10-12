@@ -91,7 +91,7 @@ export interface LlmConnectionRecord {
   lastOkAt?: string;
 }
 
-type DocClient = Pick<AWS.DynamoDB.DocumentClient, "put" | "get" | "update" | "query">;
+type DocClient = Pick<AWS.DynamoDB.DocumentClient, "put" | "get" | "update" | "query" | "transactWrite">;
 
 let defaultClient: DocClient | null = null;
 function docClient(): DocClient {
@@ -117,6 +117,13 @@ function isConditionFailure(err: unknown): boolean {
   return (err as { code?: string })?.code === "ConditionalCheckFailedException";
 }
 
+/** The owner's per-owner slot counter lives as its own item, invisible to every GSI
+ * (it carries none of their key attributes), so it never surfaces as a phantom
+ * connection in `listByOwner`/`listSharedWithOrg`/`listByProvider`. */
+function slotCounterKey(ownerUserId: string): string {
+  return `limit#${ownerUserId}`;
+}
+
 export class LlmConnectionDb {
   constructor(private readonly client: DocClient = docClient()) {}
 
@@ -124,6 +131,77 @@ export class LlmConnectionDb {
     await this.client
       .put({ TableName: LLM_CONNECTIONS_TABLE, Item: record, ConditionExpression: "attribute_not_exists(connectionId)" })
       .promise();
+  }
+
+  /**
+   * Creates the connection only if doing so keeps the owner's active count at or under
+   * `cap`, both checked and applied in one DynamoDB transaction. A plain
+   * read-then-write (count the owner's rows, then `create`) has a window between the
+   * two where concurrent calls each see a count under the cap and all succeed; this
+   * closes it by making the count itself a conditional write in the same transaction
+   * as the create, which DynamoDB evaluates and applies atomically.
+   *
+   * Returns false when the cap was reached. Throws on any other failure, including
+   * the astronomically unlikely case of a `connectionId` collision, which is a bug to
+   * surface rather than a limit to report.
+   */
+  async createWithinLimit(record: LlmConnectionRecord, cap: number): Promise<boolean> {
+    try {
+      await this.client
+        .transactWrite({
+          TransactItems: [
+            {
+              Update: {
+                TableName: LLM_CONNECTIONS_TABLE,
+                Key: { connectionId: slotCounterKey(record.ownerUserId) },
+                UpdateExpression: "SET activeCount = if_not_exists(activeCount, :zero) + :one",
+                ConditionExpression: "attribute_not_exists(activeCount) OR activeCount < :cap",
+                ExpressionAttributeValues: { ":zero": 0, ":one": 1, ":cap": cap },
+              },
+            },
+            {
+              Put: {
+                TableName: LLM_CONNECTIONS_TABLE,
+                Item: record,
+                ConditionExpression: "attribute_not_exists(connectionId)",
+              },
+            },
+          ],
+        })
+        .promise();
+      return true;
+    } catch (err) {
+      const reasons = (err as { code?: string; CancellationReasons?: { Code?: string }[] })?.CancellationReasons;
+      if ((err as { code?: string })?.code === "TransactionCanceledException" && Array.isArray(reasons)) {
+        // Items are positional: index 0 is the slot counter, index 1 is the create.
+        // Only a counter failure is the cap; a create failure is a real id collision.
+        if (reasons[0]?.Code === "ConditionalCheckFailed") return false;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Gives back the slot a revoked connection held. Best-effort by design: the revoke
+   * itself has already succeeded by the time this runs, and a bookkeeping miss here
+   * must never be mistaken for the revoke having failed. Floors at zero so a missing
+   * or already-zero counter is a no-op, not an error.
+   */
+  async releaseSlot(ownerUserId: string): Promise<void> {
+    try {
+      await this.client
+        .update({
+          TableName: LLM_CONNECTIONS_TABLE,
+          Key: { connectionId: slotCounterKey(ownerUserId) },
+          UpdateExpression: "SET activeCount = activeCount - :one",
+          ConditionExpression: "attribute_exists(activeCount) AND activeCount > :zero",
+          ExpressionAttributeValues: { ":one": 1, ":zero": 0 },
+        })
+        .promise();
+    } catch (err) {
+      if (isConditionFailure(err)) return;
+      throw err;
+    }
   }
 
   /** Strongly consistent: a revoke must be visible to the very next read. */
