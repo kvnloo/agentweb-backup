@@ -1842,7 +1842,16 @@ export async function modifyWorkPlan(
       };
     }
 
-    const workPlan = { ...session.workPlan };
+    // ENG-2400: deep-copy the steps (and the pending ledger) so a failed or
+    // rejected modify never mutates the session object that was read; the
+    // stored plan only changes through the single write at the end.
+    const workPlan = {
+      ...session.workPlan,
+      steps: session.workPlan.steps.map((s: any) => ({ ...s })),
+      ...(session.workPlan.pendingRequiredFunctionCalls && {
+        pendingRequiredFunctionCalls: [...session.workPlan.pendingRequiredFunctionCalls],
+      }),
+    };
 
     // Snapshot of every step as it existed before this call's removeStepCounts
     // filtering runs below, keyed by stepCount. Still used further down for
@@ -2112,7 +2121,9 @@ export async function modifyWorkPlan(
         workPlan.steps[existingIndex] = {
           ...workPlan.steps[existingIndex],
           title: newStep.title,
-          description: newStep.description,
+          // ENG-2400: omitting description preserves the stored one (same
+          // contract as userInstructions/skillIds); it used to be wiped.
+          ...(newStep.description !== undefined && { description: newStep.description }),
           ...(newStep.userInstructions !== undefined && { userInstructions: newStep.userInstructions }),
           requiredFunctionCalls: mergeRequiredFunctionCalls(
             workPlan.steps[existingIndex].requiredFunctionCalls,
@@ -2186,6 +2197,18 @@ export async function modifyWorkPlan(
     };
   } catch (error) {
     console.error('AgentMode: Error modifying work plan:', error);
+    // ENG-2400: the store rejects a non-sequential result before writing
+    // (assertSequentialStepCounts). Surface that as an actionable, retryable
+    // message instead of the opaque generic failure.
+    if (error instanceof Error && /Invalid stepCount/.test(error.message)) {
+      return {
+        success: false,
+        message:
+          'Work plan not modified: stepCounts must be sequential from 1. When removing steps, renumber the ' +
+          'remaining steps in the same call (send them in steps with their new stepCount). The stored plan is unchanged.',
+        error: error.message,
+      };
+    }
     return {
       success: false,
       message: 'Failed to modify work plan',

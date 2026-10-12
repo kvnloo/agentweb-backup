@@ -34,6 +34,7 @@
  *   then read steps[4].description.
  */
 
+import { withClearedError } from "../utils/clearErrorOnClaim";
 import { imageService as defaultImageService } from "./imageGeneration";
 import { reportUIError } from "../utils/errorReporter";
 import { userDb } from "./db";
@@ -1296,7 +1297,7 @@ export async function claimAdImageRun(
 ): Promise<AdImageRunIdentity | null> {
   const startPatch = adImageStartPatch();
   try {
-    await userDb.updateUser(userId, startPatch as any, {
+    await userDb.updateUser(userId, withClearedError(startPatch, "adImageError") as any, {
       condition: adImageStartClaimCondition(),
     });
   } catch (err: any) {

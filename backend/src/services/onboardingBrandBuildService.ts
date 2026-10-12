@@ -35,6 +35,7 @@ import {
   logCompletionMetric,
 } from "./brandBuildStatusService";
 import { logStepMetric } from "./onboardingMetricsService";
+import { withClearedError } from "../utils/clearErrorOnClaim";
 import {
   BRAND_BUILD_PROMPT_SENTINEL,
   brandBuildOwnershipCondition,
@@ -377,7 +378,7 @@ export async function claimBrandBuildRun(
 ): Promise<ReturnType<typeof buildStartPatch> | null> {
   const patch = buildStartPatch();
   try {
-    await userDb.updateUser(userId, patch as any, {
+    await userDb.updateUser(userId, withClearedError(patch, "brandBuildError") as any, {
       condition: brandBuildStartClaimCondition(),
     });
   } catch (err: any) {

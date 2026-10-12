@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import { MODIFY_WORK_PLAN_INPUT_SCHEMA, validateModifyWorkPlanArgs } from './impl/modifyWorkPlanArgs';
 import { agentModeService } from '../services/agentModeService';
 import { getAccessToken as getClickUpAccessToken, createTaskInList as createClickUpTaskInList, getListCustomFields as getClickUpListCustomFields, ClickUpTaskError } from '../services/clickupService';
 import { emmaToolRegistry } from './registry';
@@ -2786,7 +2787,7 @@ emmaToolRegistry.register({
   name: 'create_html_from_template',
   definition: {
     name: 'create_html_from_template',
-    description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3. If the user refers to a template by name and multiple templates share that name, you MUST ask which template_id to use before calling this tool. IMPORTANT: every variable value is inserted into the template as literal text, exactly as you write it — do NOT format values with HTML tags (e.g. <ul>, <li>, <strong>) or Markdown syntax (e.g. **bold**, "- " bullets, # headers). Write plain sentences only; for multiple points within one variable, separate them with periods, not a list.',
+    description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3. Always call list_html_templates first and pass a template_id exactly as returned; never guess or invent a template_id. If this tool returns error_code TEMPLATE_NOT_FOUND, pick from its available_templates instead of retrying the same id. If the user refers to a template by name and multiple templates share that name, you MUST ask which template_id to use before calling this tool. IMPORTANT: every variable value is inserted into the template as literal text, exactly as you write it — do NOT format values with HTML tags (e.g. <ul>, <li>, <strong>) or Markdown syntax (e.g. **bold**, "- " bullets, # headers). Write plain sentences only; for multiple points within one variable, separate them with periods, not a list.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4121,6 +4122,18 @@ emmaToolRegistry.register({
         notes: {
           type: 'string',
           description: 'Optional notes about this status change'
+        },
+        message_draft: {
+          type: 'string',
+          description: 'Optional. The exact LinkedIn message text you drafted for this lead. Saved verbatim on the lead (messageDraft) so it appears in the CRM lead panel and the Pending Review queue for human approval. Pass it whenever you set status to pending_review for a LinkedIn draft.'
+        },
+        email_subject: {
+          type: 'string',
+          description: 'Optional. Subject of the email you drafted for this lead. Must be passed together with email_body. Saved verbatim on the lead (emailDraft).'
+        },
+        email_body: {
+          type: 'string',
+          description: 'Optional. Plain-text body of the email you drafted for this lead. Must be passed together with email_subject. Saved verbatim on the lead (emailDraft).'
         }
       },
       required: ['list_id', 'lead_id', 'status']
@@ -4129,7 +4142,8 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     return await leadsImpl.updateLeadStatus(
       args.list_id, args.lead_id, args.status, context?.userId,
-      args.deal_value, args.deal_currency, args.notes
+      args.deal_value, args.deal_currency, args.notes,
+      { messageDraft: args.message_draft, emailSubject: args.email_subject, emailBody: args.email_body, sessionId: context?.sessionId }
     );
   }
 });
@@ -6453,59 +6467,12 @@ emmaToolRegistry.register({
   definition: {
     name: 'modify_work_plan',
     description: 'Add new steps or modify existing step details in the current work plan. Does not change step status - use set_work_plan_status for that.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        steps: {
-          type: 'array',
-          description: 'Array of steps to add or update',
-          items: {
-            type: 'object',
-            properties: {
-              stepCount: {
-                type: 'number',
-                description: 'Step number'
-              },
-              title: {
-                type: 'string',
-                description: 'Step title'
-              },
-              description: {
-                type: 'string',
-                description: 'Optional detailed description'
-              },
-              requiredFunctionCalls: {
-                type: 'array',
-                description: 'Optional array of function names that must be called before marking this step as completed',
-                items: {
-                  type: 'string'
-                }
-              },
-              expectedAssetCount: {
-                type: 'number',
-                description: 'Optional. Number of media assets the step must produce before it can be completed. Set to a lower number (or 0 to remove the requirement entirely) when the user explicitly approves generating fewer assets than originally planned. Omitting it leaves the existing value unchanged.'
-              }
-            },
-            required: ['stepCount', 'title']
-          }
-        },
-        removeStepCounts: {
-          type: 'array',
-          description: 'Optional array of step numbers to remove',
-          items: {
-            type: 'number'
-          }
-        },
-        autocomplete: {
-          type: 'boolean',
-          description: 'Optional. Update the autocomplete setting. When true, Emma runs all steps automatically without asking for user confirmation between steps.'
-        }
-      },
-      required: ['steps']
-    }
+    inputSchema: MODIFY_WORK_PLAN_INPUT_SCHEMA
   },
   execute: async (args: any, context?: any) => {
-    return await workPlansImpl.modifyWorkPlan(args.steps, args.removeStepCounts || [], context?.sessionId, args.autocomplete, context?.isUnattendedRun, agentModeService.callLLM.bind(agentModeService));
+    const argsError = validateModifyWorkPlanArgs(args);
+    if (argsError) return argsError;
+    return await workPlansImpl.modifyWorkPlan(args.steps || [], args.removeStepCounts || [], context?.sessionId, args.autocomplete, context?.isUnattendedRun, agentModeService.callLLM.bind(agentModeService));
   }
 });
 
@@ -7616,6 +7583,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     const { LANDING_PAGE_PREVIEW_BRANCH, runCodingAgent } = await import('../services/codingAgentService');
+    const { classifyCodingAgentFailure } = await import('../services/codingAgentFailureClass');
     const executeMcpTool = context?.service
       ? async (toolName: string, toolArgs: any) => {
         return context.service.executeTool(
@@ -7681,6 +7649,9 @@ emmaToolRegistry.register({
       return {
         success: false,
         error: result.message,
+        // ENG-1949: semantic class for telemetry/retry guidance; the message is
+        // often the sub-agent's own prose and cannot be classified by text.
+        errorClass: classifyCodingAgentFailure(result),
         iterations: result.iterations,
         previewUrl: result.previewUrl,
         branch: result.branch,

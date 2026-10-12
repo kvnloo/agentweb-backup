@@ -46,7 +46,7 @@ import { emitProgress, registerProgressCallback, getLatestProgress, progressStor
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { CHAT_BRANCHING_ENABLED_SETTING, isChatBranchingSettingEnabled } from '../services/agentMode/chatBranching';
 import { resolveRunFunding } from '../services/funding/runFunding';
-import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
+import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError, isProviderUnavailableError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
@@ -2500,6 +2500,33 @@ function extractFileAttachmentsFromVariables(
     }
   }
   return attachments;
+}
+
+// ENG-1379: re-remind a schedule blocked on missing variables at most once per window.
+export const SCHEDULED_CHAT_VARIABLE_REMINDER_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+export const SCHEDULED_CHAT_VARIABLE_LINK_GRACE_MS = 60 * 60 * 1000;
+
+/**
+ * PURE. True when a still-outstanding variable request (token issued, not yet
+ * consumed, email sent within the reminder window) already covers this blocked
+ * run, so no new token/email should be issued.
+ */
+export function shouldSuppressScheduledChatVariableReminder(
+  schedule: {
+    variableRequestStatus?: string;
+    variableRequestSentAt?: string;
+    variableRequestAccessTokenHash?: string;
+    variableRequestAccessTokenConsumedAt?: string;
+  },
+  now: Date
+): boolean {
+  if (schedule.variableRequestStatus !== 'pending') return false;
+  if (!schedule.variableRequestAccessTokenHash) return false;
+  if (schedule.variableRequestAccessTokenConsumedAt) return false;
+  const sentAtMs = schedule.variableRequestSentAt ? new Date(schedule.variableRequestSentAt).getTime() : NaN;
+  if (!Number.isFinite(sentAtMs)) return false;
+  const ageMs = now.getTime() - sentAtMs;
+  return ageMs >= 0 && ageMs < SCHEDULED_CHAT_VARIABLE_REMINDER_WINDOW_MS;
 }
 
 function hashScheduledChatVariableAccessToken(token: string): string {
@@ -10575,6 +10602,17 @@ export const agentModeController = {
           return;
         }
 
+        // ENG-2381: a final upstream provider 5xx is an outage, not an unknown error.
+        if (isProviderUnavailableError(error)) {
+          res.status(503).json({
+            error: 'AI provider unavailable',
+            message: error.message,
+            code: 'PROVIDER_UNAVAILABLE',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
         if (error.message.includes('Generation timed out')) {
           res.status(504).json({
             error: 'Generation timed out',
@@ -11670,6 +11708,17 @@ export const agentModeController = {
             error: 'Rate limit exceeded',
             message: error.message,
             code: 'RATE_LIMIT',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
+        // ENG-2381: a final upstream provider 5xx is an outage, not an unknown error.
+        if (isProviderUnavailableError(error)) {
+          res.status(503).json({
+            error: 'AI provider unavailable',
+            message: error.message,
+            code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
           });
           return;
@@ -14445,10 +14494,43 @@ export const agentModeController = {
             const requestedVariableNames = missingVariableNames.length > 0
               ? missingVariableNames
               : scheduleVariables.map(variable => variable.name);
+            // ENG-1379: an outstanding link is retained across suppressed runs and
+            // only extended when the next run becomes due, so it must stay valid
+            // past that run (grace for the dispatcher to reach it), never lapse before.
+            const variableAccessTokenExpiresAtDate = new Date(nextRunTime.getTime() + SCHEDULED_CHAT_VARIABLE_LINK_GRACE_MS);
+            const variableAccessTokenExpiresAt = variableAccessTokenExpiresAtDate.toISOString();
+
+            // ENG-1379: a schedule stuck on missing variables used to mint a new
+            // link and re-email the owner on EVERY due run (daily mail forever).
+            // While an unconsumed request from the last reminder window is still
+            // outstanding, keep its token (extend expiry so the emailed link stays
+            // valid) and skip the email; re-remind at most once per window.
+            if (shouldSuppressScheduledChatVariableReminder(schedule, now)) {
+              await scheduleDb.updateScheduleAfterRun(
+                schedule.scheduleId,
+                now.toISOString(),
+                nextRunTime.toISOString(),
+                true
+              );
+              await scheduleDb.updateSchedule(schedule.scheduleId, {
+                updatedAt: now.toISOString(),
+                variableRequestStatus: 'pending',
+                variableRequestAccessTokenExpiresAt: variableAccessTokenExpiresAt
+              });
+              results.push({
+                scheduleId: schedule.scheduleId,
+                scheduleName: schedule.scheduleName,
+                status: 'waiting_for_variables',
+                nextRunTime: nextRunTime.toISOString(),
+                variableRequestExpiresAt: variableAccessTokenExpiresAt,
+                missingVariables: requestedVariableNames,
+                reminderSuppressed: true
+              });
+              continue;
+            }
+
             const variableAccessToken = crypto.randomBytes(32).toString('hex');
             const variableAccessTokenHash = hashScheduledChatVariableAccessToken(variableAccessToken);
-            const variableAccessTokenExpiresAtDate = new Date(nextRunTime.getTime() - (30 * 60 * 1000));
-            const variableAccessTokenExpiresAt = variableAccessTokenExpiresAtDate.toISOString();
             const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
             const variableInputUrl = `${customerFrontendUrl}/scheduled-chat/variables/${variableAccessToken}`;
 
@@ -14488,6 +14570,17 @@ export const agentModeController = {
               }
             } catch (error) {
               console.error(`Error sending variable request email for schedule ${schedule.scheduleName}:`, error);
+              // ENG-1379: the request was never delivered, so it must not count as
+              // outstanding. Drop the token so the next due run re-sends instead of
+              // suppressing for the whole reminder window.
+              try {
+                await scheduleDb.updateSchedule(schedule.scheduleId, {
+                  updatedAt: new Date().toISOString(),
+                  variableRequestAccessTokenHash: ''
+                });
+              } catch (clearError) {
+                console.error(`Error clearing undelivered variable request token for schedule ${schedule.scheduleName}:`, clearError);
+              }
             }
 
             results.push({
@@ -14846,6 +14939,17 @@ export const agentModeController = {
             error: 'Rate limit exceeded',
             message: error.message,
             code: 'RATE_LIMIT',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
+        // ENG-2381: a final upstream provider 5xx is an outage, not an unknown error.
+        if (isProviderUnavailableError(error)) {
+          res.status(503).json({
+            error: 'AI provider unavailable',
+            message: error.message,
+            code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
           });
           return;

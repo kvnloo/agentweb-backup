@@ -235,19 +235,6 @@ export const portalRouteCatalog: readonly PortalRouteCatalogEntry[] = [
   route('marketing-not-found', 'Marketing not found', '/marketing/*', 'Recover from an unknown marketing URL', 'customer', 'Return to marketing', 'Renders Not Found', {
     availability: 'placeholder',
   }),
-  route(
-    'workflow-builder-save-dead-end',
-    'Saved workflow builder',
-    '/workflows/builder/:id',
-    'Continue editing a newly saved workflow',
-    'partner',
-    'Continue editing',
-    'Reachable after save, but no matching route is registered',
-    {
-      availability: 'dead-end',
-      routeRegistered: false,
-    },
-  ),
 ];
 
 function audienceIsVisible(

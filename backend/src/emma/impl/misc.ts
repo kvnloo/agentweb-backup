@@ -368,6 +368,50 @@ export function getUnassociatedToolNames(
 // `() => this.cleanupFileCache()`) rather than owned here — see this module's
 // header comment for why this cache stays instance-scoped instead of being
 // promoted to a module-level singleton like this series' other pure caches.
+// ENG-1608: save_file structured error contract.
+export const SAVE_FILE_MAX_BYTES = 10 * 1024 * 1024;
+export const SAVE_FILE_MAX_NAME_LENGTH = 200;
+export type SaveFileErrorCode =
+  | 'MISSING_FILE_NAME'
+  | 'INVALID_FILE_NAME'
+  | 'MISSING_FILE_CONTENT'
+  | 'INVALID_FILE_CONTENT'
+  | 'EMPTY_FILE_CONTENT'
+  | 'FILE_TOO_LARGE'
+  | 'STORAGE_WRITE_FAILED';
+
+function saveFileError(error_code: SaveFileErrorCode, message: string) {
+  return { success: false, error_code, message, error: message };
+}
+
+export function validateSaveFileArgs(fileName: unknown, fileContent: unknown) {
+  if (typeof fileName !== 'string' || fileName.trim().length === 0) {
+    return saveFileError('MISSING_FILE_NAME', 'file_name is required and must be a non-empty string with an extension (e.g. "report.html").');
+  }
+  if (
+    fileName.length > SAVE_FILE_MAX_NAME_LENGTH ||
+    /[\\/]/.test(fileName) ||
+    fileName.includes('..') ||
+    /[\x00-\x1f]/.test(fileName)
+  ) {
+    return saveFileError('INVALID_FILE_NAME', `file_name "${fileName.slice(0, 80)}" is invalid: use a plain name with no slashes, "..", or control characters, at most ${SAVE_FILE_MAX_NAME_LENGTH} characters (e.g. "report.html").`);
+  }
+  if (fileContent === undefined || fileContent === null) {
+    return saveFileError('MISSING_FILE_CONTENT', 'file_content is required: pass the COMPLETE file content as a string in this call.');
+  }
+  if (typeof fileContent !== 'string') {
+    return saveFileError('INVALID_FILE_CONTENT', `file_content must be a string, received ${Array.isArray(fileContent) ? 'array' : typeof fileContent}. Serialize objects (e.g. JSON.stringify) before saving.`);
+  }
+  if (fileContent.trim().length === 0) {
+    return saveFileError('EMPTY_FILE_CONTENT', 'file_content is empty: generate the full content first, then call save_file with it.');
+  }
+  const bytes = Buffer.byteLength(fileContent, 'utf8');
+  if (bytes > SAVE_FILE_MAX_BYTES) {
+    return saveFileError('FILE_TOO_LARGE', `file_content is ${bytes} bytes, above the ${SAVE_FILE_MAX_BYTES}-byte save_file limit. Split it into smaller files.`);
+  }
+  return null;
+}
+
 export async function saveFile(
   fileName: string,
   fileContent: string,
@@ -379,22 +423,10 @@ export async function saveFile(
   try {
     console.log('AgentMode: Saving file:', fileName, 'for user:', userId, 'session:', sessionId);
 
-    // Validate inputs
-    if (!fileName || typeof fileName !== 'string') {
-      throw new Error('file_name is required and must be a non-empty string (e.g. "report.html")');
-    }
-
-    if (fileContent === undefined || fileContent === null) {
-      throw new Error('file_content is required and cannot be undefined or null');
-    }
-
-    if (typeof fileContent !== 'string') {
-      throw new Error(`file_content must be a string, received: ${typeof fileContent}`);
-    }
-
-    if (fileContent.trim().length === 0) {
-      throw new Error('file_content cannot be empty');
-    }
+    // ENG-1608: validate before any storage write and return a structured,
+    // actionable error (error_code + message) instead of a generic Error.
+    const invalid = validateSaveFileArgs(fileName, fileContent);
+    if (invalid) return invalid;
 
     // Generate content hash for deduplication
     const contentHash = createHash('sha256').update(fileContent).digest('hex');
@@ -475,19 +507,18 @@ export async function saveFile(
         formattedContent
       };
     } else {
-      return {
-        success: false,
-        message: 'Failed to save file to S3. Please try again.',
-        error: uploadResult.error
-      };
+      return saveFileError(
+        'STORAGE_WRITE_FAILED',
+        `Storage rejected the write for "${fileName}": ${uploadResult.error || 'unknown storage error'}. Retry once; if it fails again, report the error instead of retrying.`,
+      );
     }
   } catch (error) {
     console.error('AgentMode: Error saving file:', error);
-    return {
-      success: false,
-      message: 'Failed to save file. Please try again.',
-      error: error instanceof Error ? error.message : 'Unknown error'
-    };
+    const detail = error instanceof Error ? error.message : 'Unknown error';
+    return saveFileError(
+      'STORAGE_WRITE_FAILED',
+      `Saving "${fileName}" failed: ${detail}. Retry once; if it fails again, report the error instead of retrying.`,
+    );
   }
 }
 
@@ -793,7 +824,7 @@ export async function sendEmailFromConfiguredSender(
   try {
     const to = (params.to || '').trim();
     if (!to) {
-      return { success: false, message: 'Recipient required', error: 'A recipient email address ("to") is required' };
+      return { success: false, reason: 'missing_field', code: 400, message: 'Recipient required', error: 'A recipient email address ("to") is required' };
     }
     // Reject clearly malformed recipients up front so the user gets an
     // actionable "check the address" message instead of a generic provider
@@ -802,10 +833,10 @@ export async function sendEmailFromConfiguredSender(
     // that bounce is asynchronous and outside this tool's control.
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(to)) {
-      return { success: false, message: 'Invalid recipient', error: `The recipient address "${to}" is not a valid email address. Please check it and try again.` };
+      return { success: false, reason: 'invalid_recipient', code: 400, message: 'Invalid recipient', error: `The recipient address "${to}" is not a valid email address. Please check it and try again.` };
     }
     if (!params.subject || !params.subject.trim()) {
-      return { success: false, message: 'Subject required', error: 'An email subject is required' };
+      return { success: false, reason: 'missing_field', code: 400, message: 'Subject required', error: 'An email subject is required' };
     }
 
     // Normalize the body. Accept `body` as an alias for `text` (the generic
@@ -818,13 +849,13 @@ export async function sendEmailFromConfiguredSender(
       return params.body && params.body.trim() ? params.body : undefined;
     })();
     if (!htmlBody && !textBody) {
-      return { success: false, message: 'Email body required', error: 'The email body (html or text) is required and cannot be empty' };
+      return { success: false, reason: 'missing_field', code: 400, message: 'Email body required', error: 'The email body (html or text) is required and cannot be empty' };
     }
 
     // Resolve sender from the user's configured CRM senders.
     const sendersResult = await getCrmSendersFn(userId);
     if (!sendersResult.success || sendersResult.senders.length === 0) {
-      return { success: false, message: 'No senders configured', error: 'No sender email is configured for your account. To set one up, open CRM, select a lead list, and click "Senders".' };
+      return { success: false, reason: 'no_sender', code: 404, message: 'No senders configured', error: 'No sender email is configured for your account. To set one up, open CRM, select a lead list, and click "Senders".' };
     }
 
     let sender: any = null;
@@ -854,6 +885,8 @@ export async function sendEmailFromConfiguredSender(
             const list = matches.map((s: any) => `${s.fromName} <${s.email}>`).join(', ');
             return {
               success: false,
+              reason: 'ambiguous_sender',
+              code: 400,
               message: `Multiple ${wantedProvider} senders`,
               error: `You have more than one ${wantedProvider} sender: ${list}. Tell me which one to use by its email address.`,
               availableSenders: matches.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: wantedProvider })),
@@ -867,6 +900,8 @@ export async function sendEmailFromConfiguredSender(
         const list = available.map((s: any) => `${s.fromName} <${s.email}> [${s.senderType}]`).join(', ');
         return {
           success: false,
+          reason: 'sender_not_found',
+          code: 404,
           message: 'Sender not found',
           error: `No configured sender matches "${params.senderId}". Available senders: ${list}. Pass one of their email addresses as sender_id, or omit sender_id to use the default sender.`,
           availableSenders: available,
@@ -883,7 +918,7 @@ export async function sendEmailFromConfiguredSender(
     }
 
     if (!sender) {
-      return { success: false, message: 'No valid sender', error: 'Could not resolve a valid sender email' };
+      return { success: false, reason: 'no_sender', code: 404, message: 'No valid sender', error: 'Could not resolve a valid sender email' };
     }
 
     let emailId: string;
@@ -896,6 +931,8 @@ export async function sendEmailFromConfiguredSender(
     if (senderProvider !== 'resend' && !connectedAccountId) {
       return {
         success: false,
+        reason: 'sender_misconfigured',
+        code: 401,
         message: `${providerLabel(senderProvider)} sender misconfigured`,
         error: `The ${providerLabel(senderProvider)} sender is missing its connected account id`,
       };
@@ -912,6 +949,8 @@ export async function sendEmailFromConfiguredSender(
     if (!crmSender) {
       return {
         success: false,
+        reason: 'sender_not_found',
+        code: 404,
         message: 'Sender no longer available',
         error: 'This sender was removed or changed just now. Please pick a sender again and retry.',
       };
@@ -927,7 +966,7 @@ export async function sendEmailFromConfiguredSender(
       emailId = sendResult.messageId;
     } catch (error: any) {
       if (error instanceof SenderDailyLimitExceededError) {
-        return { success: false, message: 'Daily sending limit reached', error: error.message };
+        return { success: false, reason: 'daily_limit', code: 429, message: 'Daily sending limit reached', error: error.message };
       }
       // Translate OAuth failures into an actionable message that names the
       // affected sender. Raw errors like "unauthorized_client" / "invalid_grant"
@@ -943,16 +982,27 @@ export async function sendEmailFromConfiguredSender(
       if (needsReconnect) {
         return {
           success: false,
+          reason: 'needs_reconnect',
           message: `${label} sender needs reconnecting`,
           error: `Could not send from the ${label} sender ${sender.email} (${connectedAccountId}): ${raw}. Please reconnect this account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
-          code,
+          // ENG-2064: never leave a reconnect failure without an HTTP-range code —
+          // without one, toolResultError's rebuilt Error classifies as generic 'Error'.
+          code: code ?? 401,
         };
       }
+      // ENG-2064: provider-side failure. A typed provider status (EmailProviderError)
+      // or an HTTP status on the thrown error is kept verbatim; otherwise the send was
+      // submitted and the provider failed it, so surface it as an upstream failure
+      // (502) instead of an unclassified generic Error.
+      const thrownStatus = [(error as any)?.statusCode, (error as any)?.status, (error as any)?.code]
+        .find((n) => typeof n === 'number' && n >= 100 && n <= 599) as number | undefined;
+      const providerCode = code ?? thrownStatus ?? 502;
       return {
         success: false,
+        reason: providerCode >= 500 ? 'provider_unavailable' : 'provider_rejected',
         message: `${label} send failed`,
         error: `Could not send from the ${label} sender ${sender.email}: ${raw}`,
-        code,
+        code: providerCode,
       };
     }
 
@@ -969,6 +1019,7 @@ export async function sendEmailFromConfiguredSender(
     const { emailProviderErrorStatus } = await import('../../services/emailProviderService');
     return {
       success: false,
+      reason: 'internal_error',
       message: 'Failed to send email',
       error: error instanceof Error ? error.message : 'Unknown error',
       code: emailProviderErrorStatus(error)

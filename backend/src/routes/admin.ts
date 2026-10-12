@@ -45,6 +45,7 @@ import { readAnalyticsConfig, writeAnalyticsConfig } from "../services/analytics
 import { validateAnalyticsConfig } from "../services/analyticsConfigValidator";
 import { sweepUndeliverableDomains } from "../services/emailDeliverabilityService";
 import { isSessionList } from "../utils/sessionList";
+import { TABLE_PREFIX } from "../config/constants";
 
 const router = express.Router();
 
@@ -3609,7 +3610,6 @@ router.put("/users/:userId/role", async (req, res) => {
 router.delete("/configs/:configId", async (req, res) => {
   const { configId } = req.params;
   const dynamodb = new DynamoDB.DocumentClient(); // Ensure dynamodb client is available
-  const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
   const tableName = `${TABLE_PREFIX}AW-Configs`;
 
   try {
@@ -3933,7 +3933,6 @@ router.get("/analytics/gtm", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     const plans = await paginatedScan(dynamodb, {
@@ -4004,7 +4003,6 @@ router.get("/analytics/crm", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
     const scanAll = async (tableName: string) => {
       const items: any[] = [];
@@ -4079,7 +4077,6 @@ router.get("/gtm-plans", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Scan all GTM plans (admin can see all)
@@ -4139,7 +4136,6 @@ router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (r
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4338,7 +4334,6 @@ router.put("/gtm-plans/:planId", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4422,7 +4417,6 @@ router.put("/gtm-plans/:planId/phases/:phaseId", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4519,7 +4513,6 @@ router.post("/gtm-plans/:planId/phases/:phaseId/send-status-report", async (req,
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4588,7 +4581,6 @@ router.post("/gtm-plans/:planId/send-status-report", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4651,7 +4643,6 @@ router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/attachmen
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     const getResult = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
@@ -4725,7 +4716,6 @@ router.delete("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/attachm
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     const getResult = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
@@ -4788,7 +4778,6 @@ router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/start-ses
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     const getResult = await dynamodb

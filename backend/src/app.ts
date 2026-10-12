@@ -80,6 +80,8 @@ import outcomeLedgerRoutes from "./routes/outcomeLedger";
 import crmWebhookRoutes from "./routes/crmWebhook";
 import mcpServersRoutes, { mcpOAuthPublicRouter } from "./routes/mcpServers";
 import metaToolkitRoutes from "./routes/metaToolkit";
+import { createToolBridgeRouter } from "./routes/toolBridge";
+import { toolBridgeMcp } from "./services/funding/toolBridgeService";
 import skillRoutes from "./routes/skillRoutes";
 import userSkillRoutes from "./routes/userSkillRoutes";
 import userWorkPlanRoutes from "./routes/userWorkPlanRoutes";
@@ -408,6 +410,8 @@ app.use("/api/admin", adminUsageRoutes);
 app.use("/api/admin", mcpUsageAdminRoutes);
 app.use("/api/admin", adminV0CreditsRoutes);
 app.use("/api/internal", internalUsageRoutes);
+// ENG-2109: MCP endpoint for claude -p sessions this backend spawned. Local-only; see routes/toolBridge.ts.
+app.use("/internal/tool-bridge", createToolBridgeRouter(toolBridgeMcp));
 app.use("/api/config", configRouter);
 app.use("/api/browser-cookies", browserCookiesRouter);
 app.use("/api/workflows", workflowRoutes);

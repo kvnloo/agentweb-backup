@@ -13,7 +13,8 @@ import {
   setPageSubdomain,
   removePageSubdomainFromVercel,
 } from "../services/customDomainService";
-import { updateSubdomainMiddleware } from "../services/v0Service";
+import { updateSubdomainMiddleware, canUserEditLandingPage } from "../services/v0Service";
+import { userDb, orgDb } from "../services/db";
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || "us-west-2",
@@ -22,6 +23,55 @@ const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 const LANDING_PAGES_TABLE = `${TABLE_PREFIX}AW-LandingPages`;
 
 const router = Router();
+
+/**
+ * ENG-2403: the domain-attach writes call Vercel with AgentWeb's team token, so
+ * a body-supplied vercelProjectId must belong to a landing page the caller may
+ * edit (own page, or an org-shared page per canUserEditLandingPage). Fails
+ * closed: any lookup error denies.
+ */
+async function queryPagesForProject(ownerId: string, vercelProjectId: string): Promise<any[]> {
+  const items: any[] = [];
+  let ExclusiveStartKey: any = undefined;
+  do {
+    const out: any = await dynamodb
+      .query({
+        TableName: LANDING_PAGES_TABLE,
+        IndexName: "UserIdIndex",
+        KeyConditionExpression: "userId = :uid",
+        FilterExpression: "vercelProjectId = :pid",
+        ExpressionAttributeValues: { ":uid": ownerId, ":pid": vercelProjectId },
+        ExclusiveStartKey,
+      })
+      .promise();
+    items.push(...((out?.Items as any[]) || []));
+    ExclusiveStartKey = out?.LastEvaluatedKey;
+  } while (ExclusiveStartKey && items.length === 0);
+  return items;
+}
+
+export async function callerCanManageVercelProject(
+  userId: string,
+  vercelProjectId: string,
+): Promise<boolean> {
+  try {
+    if ((await queryPagesForProject(userId, vercelProjectId)).length > 0) return true;
+    const user = await userDb.getUserById(userId);
+    if (!user?.orgId) return false;
+    const members = await orgDb.getOrgMembers(user.orgId);
+    for (const m of members || []) {
+      if (!m?.userId || m.userId === userId) continue;
+      const pages = await queryPagesForProject(m.userId, vercelProjectId);
+      for (const page of pages) {
+        if (await canUserEditLandingPage(page, userId)) return true;
+      }
+    }
+    return false;
+  } catch (e: any) {
+    console.warn("[DOMAINS] project ownership check failed; denying:", e?.message);
+    return false;
+  }
+}
 
 router.use(authenticateToken);
 
@@ -153,6 +203,10 @@ router.post("/subdomain", async (req, res: Response) => {
       return res.status(400).json({ error: "subdomain is required" });
     }
 
+    if (!(await callerCanManageVercelProject(userId, vercelProjectId))) {
+      return res.status(403).json({ error: "You do not have access to this project" });
+    }
+
     const result = await addSubdomain(userId, vercelProjectId, subdomain);
 
     // If a landing page ID was provided, persist customDomainUrl on the record.
@@ -243,6 +297,10 @@ router.post("/custom", async (req, res: Response) => {
     }
     if (!domain || typeof domain !== "string") {
       return res.status(400).json({ error: "domain is required" });
+    }
+
+    if (!(await callerCanManageVercelProject(userId, vercelProjectId))) {
+      return res.status(403).json({ error: "You do not have access to this project" });
     }
 
     const result = await addCustomDomain(userId, vercelProjectId, domain);

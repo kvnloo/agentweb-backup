@@ -48,6 +48,12 @@ describe("onboardingBrandBuildService", () => {
       expect(options?.condition?.expression).toContain("brandBuildStatus");
     });
 
+    it("clears the previous attempt's error (null REMOVEs it; undefined is skipped by updateUser)", async () => {
+      userDb.updateUser.mockResolvedValue({});
+      await claimBrandBuildRun("user-1");
+      expect(userDb.updateUser.mock.calls[0][1].brandBuildError).toBeNull();
+    });
+
     it("returns null without throwing when it loses the claim", async () => {
       const conditionalFailure = Object.assign(
         new Error("The conditional request failed"),

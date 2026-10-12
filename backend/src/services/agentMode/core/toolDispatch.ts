@@ -507,6 +507,14 @@ export interface ExecutePreparedToolsInput {
    * so cross-iteration/cross-turn accumulation requires wiring it, as agentModeService.ts does.
    */
   priorSearchCallCount?: number;
+  /**
+   * ENG-922: true once an EARLIER iteration of this same run deferred a media-gen call on
+   * the time budget. The media set is then incomplete for the rest of the turn, so any
+   * state-changing call (Meta Graph upload/creative/ad, send, publish, ...) the model emits
+   * afterwards is deferred instead of acting on the half-finished batch. Read-only calls
+   * still run. Undefined/false preserves prior behaviour.
+   */
+  priorMediaBudgetDeferred?: boolean;
   // ---- ports ----
   ports: ToolDispatchPorts;
 }
@@ -663,6 +671,7 @@ export async function executePreparedTools(
     priorMediaCallKeys,
     approvedRevisionImageSources,
     priorSearchCallCount = 0,
+    priorMediaBudgetDeferred = false,
     ports,
   } = input;
   // ENG-510: keys of media-gen assets successfully produced this iteration, returned to the
@@ -1207,6 +1216,17 @@ export async function executePreparedTools(
     mediaBudgetDeferred = true;
     return { status: 'deferred', toolCall, functionArgs, duration: 0, policyDecision };
   };
+  // ENG-922: once a media call defers, the media set is INCOMPLETE for this turn. A
+  // state-changing non-media call (a Meta Graph upload/creative/ad write, a send, a
+  // publish) must not run against it — that is how a half-finished batch leaves
+  // orphaned images/creatives on an ad account. Read-only lookups cannot publish or
+  // orphan anything, so they still run. An unclassified effect fails CLOSED.
+  const isStateChangingDependent = (toolCall: any, policyDecision: AgentToolPolicyDecision | undefined): boolean =>
+    !isDeferrableAssetTool(toolCall)
+    // Already executed in Phase 1 (e.g. install_skills): replay the real cached outcome.
+    && !eagerToolOutcomes.has(toolCall.id)
+    && (policyDecision?.effect ?? 'unknown') !== 'read';
+  let mediaDeferredThisTurn = priorMediaBudgetDeferred;
   // A genuine media asset: a gateway success that isn't an encoded {success:false}
   // AND actually produced an asset (not a confirmation-gate pause — see
   // mediaGenProducedAsset). Keeps the deferral budget's notion of "an asset exists
@@ -1232,6 +1252,11 @@ export async function executePreparedTools(
     toolResults = [];
     for (const { toolCall, functionArgs, policyDecision } of preparedCalls) {
       if (shouldDeferMedia(toolCall)) {
+        mediaDeferredThisTurn = true;
+        toolResults.push(makeDeferred(toolCall, functionArgs, policyDecision));
+        continue;
+      }
+      if (mediaDeferredThisTurn && isStateChangingDependent(toolCall, policyDecision)) {
         toolResults.push(makeDeferred(toolCall, functionArgs, policyDecision));
         continue;
       }
@@ -1249,11 +1274,19 @@ export async function executePreparedTools(
     // (and the >=1-asset forward-progress gate) is made per batch, race-free. Results are
     // written by index so emission order is preserved regardless of completion order.
     toolResults = new Array(preparedCalls.length);
-    for (let start = 0; start < preparedCalls.length; start += MEDIA_GEN_MAX_CONCURRENCY) {
-      const batch = preparedCalls.slice(start, start + MEDIA_GEN_MAX_CONCURRENCY);
+    // ENG-922: media calls run FIRST (bounded batches), non-media calls after. A
+    // same-iteration Graph write otherwise races the final image and can publish an
+    // incomplete creative set. Results are still written by original index, so the
+    // model-visible emission order is preserved.
+    const indexed = preparedCalls.map((preparedCall, index) => ({ preparedCall, index }));
+    const mediaCalls = indexed.filter(({ preparedCall }) => isDeferrableAssetTool(preparedCall.toolCall));
+    const otherCalls = indexed.filter(({ preparedCall }) => !isDeferrableAssetTool(preparedCall.toolCall));
+    for (let start = 0; start < mediaCalls.length; start += MEDIA_GEN_MAX_CONCURRENCY) {
+      const batch = mediaCalls.slice(start, start + MEDIA_GEN_MAX_CONCURRENCY);
       const batchResults = await Promise.all(
-        batch.map(async ({ toolCall, functionArgs, policyDecision }) => {
+        batch.map(async ({ preparedCall: { toolCall, functionArgs, policyDecision } }) => {
           if (shouldDeferMedia(toolCall)) {
+            mediaDeferredThisTurn = true;
             return makeDeferred(toolCall, functionArgs, policyDecision);
           }
           const outcome = await runOne(toolCall, functionArgs, policyDecision);
@@ -1263,9 +1296,21 @@ export async function executePreparedTools(
       batchResults.forEach((dr, i) => {
         if (countsAsAsset(dr)) assetsThisBatch++;
         recordMediaDuration(dr);
-        toolResults[start + i] = dr;
+        toolResults[batch[i].index] = dr;
       });
     }
+    const otherResults = await Promise.all(
+      otherCalls.map(async ({ preparedCall: { toolCall, functionArgs, policyDecision } }) => {
+        if (mediaDeferredThisTurn && isStateChangingDependent(toolCall, policyDecision)) {
+          return makeDeferred(toolCall, functionArgs, policyDecision);
+        }
+        const outcome = await runOne(toolCall, functionArgs, policyDecision);
+        return toDispatchResult(outcome, toolCall, functionArgs);
+      }),
+    );
+    otherResults.forEach((dr, i) => {
+      toolResults[otherCalls[i].index] = dr;
+    });
   } else {
     // Parallel path carries at most one deferrable-asset call (a solo call; a media-gen
     // call batched with other tools forces the bounded-concurrency path above, and 2+
@@ -1273,6 +1318,11 @@ export async function executePreparedTools(
     // deferral check is race-free.
     const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs, policyDecision }) => {
       if (shouldDeferMedia(toolCall)) {
+        return makeDeferred(toolCall, functionArgs, policyDecision);
+      }
+      // ENG-922: an earlier iteration already deferred media this turn — hold back
+      // state-changing calls so they never act on the incomplete set.
+      if (mediaDeferredThisTurn && isStateChangingDependent(toolCall, policyDecision)) {
         return makeDeferred(toolCall, functionArgs, policyDecision);
       }
       const outcome = await runOne(toolCall, functionArgs, policyDecision);
@@ -1516,9 +1566,9 @@ export async function executePreparedTools(
       // gate is unaffected) nor a failure (no error, no failed counter, does not feed
       // the gateway's repeated-failure breaker). We still MUST append a tool-role
       // message for this tool_call_id, or the next LLM turn rejects the orphaned call.
-      // The content tells the model to stop generating now, summarize what's done, and
-      // ask the user to reply "continue" — the asset-awareness block then resumes the
-      // batch on the next turn without regenerating the already-saved images.
+      // The content tells the model to stop generating now and summarize what's done;
+      // the server's automatic continuation (ENG-1239/ENG-2371) resumes the batch without
+      // asking the customer to reply "continue" and without regenerating saved images.
       const { toolCall, functionArgs } = toolResult;
       // A handler-supplied deferral (ENG-822) carries its own instruction and
       // reason; only the media-budget deferral gets the media prose below.
@@ -1529,8 +1579,8 @@ export async function executePreparedTools(
         ? String(handlerDeferral.message)
         : `⚠️ Media generation paused for this turn — the assistant has been working on this batch for a while and is approaching the per-response time limit. `
         + `The image(s) already generated this session are saved. `
-        + `Do NOT call ${toolCall.function.name} again right now. Instead: briefly tell the user how many assets are done versus still remaining, then ask them to reply "continue" to generate the rest. `
-        + `When they continue, generate ONLY the still-missing assets (see the already-generated assets list), then mark the step complete.`;
+        + `Do NOT call ${toolCall.function.name} again right now. Instead: briefly tell the user how many assets are done versus still remaining and that the rest will continue automatically. `
+        + `Do NOT ask the user to reply "continue" — the server resumes the batch automatically (ENG-2371) and generates ONLY the still-missing assets.`;
       toolCalls.push({
         id: toolCall.id,
         name: toolCall.function.name,

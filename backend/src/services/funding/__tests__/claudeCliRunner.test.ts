@@ -6,14 +6,16 @@ jest.mock('fs', () => ({
   ...jest.requireActual('fs'),
   mkdtempSync: jest.fn((prefix: string) => `${prefix}fake`),
   rmSync: jest.fn(),
+  writeFileSync: jest.fn(),
 }));
 
 import { spawn as mockSpawnFn } from 'child_process';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { ClaudeCliRunner } from '../claudeCliRunner';
 
 const mockSpawn = mockSpawnFn as jest.Mock;
 const mockRmSync = rmSync as jest.Mock;
+const mockWriteFileSync = writeFileSync as jest.Mock;
 
 interface FakeChild extends EventEmitter {
   stdout: Readable;
@@ -529,6 +531,198 @@ describe('ClaudeCliRunner', () => {
     const turn = runner.send(handle, 'hi');
     emitResult(child, { type: 'result', is_error: false, result: 'ok' });
     await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
+  });
+
+  // ─── MCP server: the tool bridge (ENG-2109) ─────────────────────────────────
+
+  const MCP = {
+    name: 'emma',
+    url: 'http://127.0.0.1:8080/internal/tool-bridge/run-1/mcp',
+    bearerToken: 'run-token-secret',
+  };
+
+  it('gives the session its MCP server through a 0600 config file, never on the command line', async () => {
+    const runner = trackedRunner();
+    await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP });
+
+    const [, args] = mockSpawn.mock.calls[0];
+    const flagIndex = args.indexOf('--mcp-config');
+    expect(flagIndex).toBeGreaterThan(-1);
+    const file = args[flagIndex + 1];
+    expect(file).toMatch(/claude-cli-home-.*mcp\.json$/);
+    expect(args.join(' ')).not.toContain('run-token-secret');
+    expect(args).toContain('--strict-mcp-config');
+
+    expect(mockWriteFileSync).toHaveBeenCalledWith(file, expect.any(String), { mode: 0o600 });
+    expect(JSON.parse(mockWriteFileSync.mock.calls[0][1])).toEqual({
+      mcpServers: { emma: { type: 'http', url: MCP.url, headers: { Authorization: 'Bearer run-token-secret' } } },
+    });
+  });
+
+  it('passes no MCP config when the session has no MCP server', async () => {
+    const runner = trackedRunner();
+    await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+
+    expect(mockSpawn.mock.calls[0][1]).not.toContain('--mcp-config');
+    expect(mockWriteFileSync).not.toHaveBeenCalled();
+  });
+
+  it('fails the turn and closes the session when the MCP server did not connect', async () => {
+    const runner = trackedRunner();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP });
+    const child = spawnedChildren[0];
+
+    const turn = runner.send(handle, 'hi');
+    child.stdout.push(
+      JSON.stringify({ type: 'system', subtype: 'init', apiKeySource: 'none', mcp_servers: [{ name: 'emma', status: 'failed' }] }) + '\n',
+    );
+    await expect(turn).rejects.toThrow(/MCP server "emma" is not connected \(failed\)/);
+    expect(child.kill).toHaveBeenCalled();
+    expect(runner.activeProcessCount).toBe(0);
+  });
+
+  it('fails the turn when the init event does not list the MCP server at all', async () => {
+    const runner = trackedRunner();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP });
+    const child = spawnedChildren[0];
+
+    const turn = runner.send(handle, 'hi');
+    child.stdout.push(JSON.stringify({ type: 'system', subtype: 'init', apiKeySource: 'none', mcp_servers: [] }) + '\n');
+    await expect(turn).rejects.toThrow(/not connected \(missing\)/);
+  });
+
+  it('lets the turn proceed and reports the status when the MCP server is connected', async () => {
+    const runner = trackedRunner();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP });
+    const child = spawnedChildren[0];
+
+    const turn = runner.send(handle, 'hi');
+    child.stdout.push(
+      JSON.stringify({ type: 'system', subtype: 'init', apiKeySource: 'none', mcp_servers: [{ name: 'emma', status: 'connected' }] }) + '\n',
+    );
+    await flush();
+    expect(runner.mcpServerStatusFor(handle)).toBe('connected');
+    emitResult(child, { type: 'result', is_error: false, result: 'ok' });
+    await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
+  });
+
+  it('does not check MCP status for a session that was given no MCP server', async () => {
+    const runner = trackedRunner();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    const child = spawnedChildren[0];
+
+    const turn = runner.send(handle, 'hi');
+    child.stdout.push(JSON.stringify({ type: 'system', subtype: 'init', apiKeySource: 'none', mcp_servers: [] }) + '\n');
+    await flush();
+    emitResult(child, { type: 'result', is_error: false, result: 'ok' });
+    await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
+  });
+
+  it('reports each tool call the model emits with the id of its model message', async () => {
+    const runner = trackedRunner();
+    const onToolUse = jest.fn();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { onToolUse });
+    const child = spawnedChildren[0];
+    const turn = runner.send(handle, 'hi');
+
+    const assistant = (content: unknown[]) => JSON.stringify({ type: 'assistant', message: { id: 'msg_1', content } }) + '\n';
+    child.stdout.push(assistant([{ type: 'text', text: 'working' }]));
+    child.stdout.push(assistant([{ type: 'tool_use', id: 'toolu_a', name: 'mcp__emma__get_leads', input: {} }]));
+    child.stdout.push(assistant([{ type: 'tool_use', id: 'toolu_b', name: 'mcp__emma__get_leads', input: {} }]));
+    await flush();
+
+    expect(onToolUse.mock.calls.map((c) => c[0])).toEqual([
+      { messageId: 'msg_1', toolUseId: 'toolu_a', name: 'mcp__emma__get_leads' },
+      { messageId: 'msg_1', toolUseId: 'toolu_b', name: 'mcp__emma__get_leads' },
+    ]);
+    emitResult(child, { type: 'result', is_error: false, result: 'ok' });
+    await turn;
+  });
+
+  it('keeps the turn alive when the tool-use callback throws', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    const runner = trackedRunner();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, {
+      onToolUse: () => {
+        throw new Error('boom');
+      },
+    });
+    const child = spawnedChildren[0];
+    const turn = runner.send(handle, 'hi');
+    child.stdout.push(
+      JSON.stringify({ type: 'assistant', message: { id: 'm', content: [{ type: 'tool_use', id: 't', name: 'x' }] } }) + '\n',
+    );
+    await flush();
+    emitResult(child, { type: 'result', is_error: false, result: 'ok' });
+    await expect(turn).resolves.toEqual(expect.objectContaining({ resultText: 'ok' }));
+  });
+
+  it('tells the caller when a session closes, whatever closed it', async () => {
+    const runner = trackedRunner();
+    const onClose = jest.fn();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP, onClose });
+    const turn = runner.send(handle, 'hi');
+    spawnedChildren[0].stdout.push(
+      JSON.stringify({ type: 'system', subtype: 'init', mcp_servers: [{ name: 'emma', status: 'failed' }] }) + '\n',
+    );
+    await expect(turn).rejects.toThrow();
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onClose).toHaveBeenCalledWith('mcp-not-connected');
+
+    const onClose2 = jest.fn();
+    const handle2 = await runner.spawn('conv-2', CONFIG_DIR, SYSTEM_PROMPT_FILE, { onClose: onClose2 });
+    runner.close(handle2);
+    expect(onClose2).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses to hand back an open session when asked for a different MCP server', async () => {
+    const runner = trackedRunner();
+    await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP });
+    await expect(
+      runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: { ...MCP, bearerToken: 'a-newer-token' } }),
+    ).rejects.toThrow(/different MCP server/);
+    await expect(runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP })).resolves.toEqual({ conversationId: 'conv-1' });
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+  });
+
+  it('removes the scratch dir, token file included, when the process cannot be started', async () => {
+    const runner = trackedRunner();
+    mockSpawn.mockImplementationOnce(() => {
+      throw new Error('spawn failed');
+    });
+    await expect(runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP })).rejects.toThrow('spawn failed');
+    expect(mockRmSync).toHaveBeenCalledWith(expect.stringMatching(/claude-cli-home-/), { recursive: true, force: true });
+    expect(runner.activeProcessCount).toBe(0);
+  });
+
+  it('removes the scratch dir again once a killed process has really exited', async () => {
+    const runner = trackedRunner();
+    const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP });
+    const child = spawnedChildren[0] as any;
+    child.exitCode = null;
+    child.signalCode = null;
+
+    runner.close(handle);
+    expect(mockRmSync).toHaveBeenCalledTimes(1);
+    child.emit('exit', null, 'SIGTERM');
+    expect(mockRmSync).toHaveBeenCalledTimes(2);
+  });
+
+  it('refuses a spawn that joined an in-flight one started with a different MCP server', async () => {
+    const runner = trackedRunner();
+    // A prewarm with no tools and the real turn's spawn, issued before the first lands.
+    const prewarm = runner.prewarm('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    const real = runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP });
+    await expect(prewarm).resolves.toEqual({ conversationId: 'conv-1' });
+    await expect(real).rejects.toThrow(/different MCP server/);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+
+    const a = runner.spawn('conv-2', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP });
+    const b = runner.spawn('conv-2', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: { ...MCP, bearerToken: 'other' } });
+    const c = runner.spawn('conv-2', CONFIG_DIR, SYSTEM_PROMPT_FILE, { mcpServer: MCP });
+    await expect(a).resolves.toEqual({ conversationId: 'conv-2' });
+    await expect(b).rejects.toThrow(/different MCP server/);
+    await expect(c).resolves.toEqual({ conversationId: 'conv-2' });
   });
 
   void mkdtempSync; // referenced only via the module under test; keeps the fs mock import used

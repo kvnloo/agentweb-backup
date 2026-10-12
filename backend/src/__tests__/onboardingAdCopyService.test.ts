@@ -805,7 +805,10 @@ describe("onboardingAdCopyService", () => {
       const startPatch = userDb.updateUser.mock.calls[0][1];
       expect(startPatch.adCopyStatus).toBe("running");
       expect(startPatch.adCopyStartedAt).toBeTruthy();
-      expect(result).toBe(startPatch);
+      // The claim also clears the previous attempt's error (REMOVE, via null);
+      // the returned patch is the same run without that storage-only marker.
+      expect(startPatch.adCopyError).toBeNull();
+      expect(result).toEqual({ ...startPatch, adCopyError: undefined });
     });
 
     // ENG-2308: same unconditional-write race as icp/competitor — two
