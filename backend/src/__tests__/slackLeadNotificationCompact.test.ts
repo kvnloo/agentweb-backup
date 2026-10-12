@@ -33,6 +33,17 @@ const lead: LeadNotificationPayload = {
 const allText = (p: { text: string; blocks: any[] }) => JSON.stringify(p);
 
 describe('compact lead notification (ENG-2391)', () => {
+  // The payload carries "Received at <timestamp to the millisecond>". The default-format
+  // test formats the same lead twice and requires the results to be identical, so on a
+  // real clock it failed whenever the two calls landed in different milliseconds.
+  beforeAll(() => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-10-12T00:00:00.000Z'));
+  });
+  afterAll(() => {
+    jest.useRealTimers();
+  });
+
   it('renders only name, phone, email', () => {
     const p = formatLeadNotificationPayload({ ...lead, compact: true });
     expect(p.blocks).toHaveLength(1);
