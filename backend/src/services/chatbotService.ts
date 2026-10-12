@@ -2252,7 +2252,7 @@ export class ChatbotDB {
    * Cost: ONE query over the existing UserIdIndex (no scan, no new GSI). DynamoDB bills a GSI query by the
    * items it reads, not by what survives the projection, so this reads the owner's whole index once, in
    * 1 MB pages; a typical user has <1000 sessions (a handful of pages). `maxPages` bounds the worst case and
-   * `truncated` reports when that bound (or `maxBranches`) stopped the walk before the index was exhausted.
+   * `truncated` is exact: true only if a further matching branch exists beyond `maxBranches`, or `maxPages` stopped the walk with index left. The walk is newest-first, so a capped walk drops the OLDEST sessions.
    * The root session itself is NOT returned here (the caller already loads it).
    */
   async getBranchFamilySessions(
@@ -2269,6 +2269,7 @@ export class ChatbotDB {
         TableName: this.tableName,
         IndexName: "UserIdIndex",
         KeyConditionExpression: "userId = :userId",
+        ScanIndexForward: false, // newest first (like getUserSessions): a capped walk must keep the branches just made
         ExpressionAttributeValues: { ":userId": userId },
         ExpressionAttributeNames: { "#title": "title", "#archived": "archived" },
         ProjectionExpression: "sessionId, userId, #title, llmModel, messageCount, updatedAt, createdAt, branchedFrom, #archived",
@@ -2288,11 +2289,12 @@ export class ChatbotDB {
           branchedFrom: item.branchedFrom,
         });
       }
+      // One match beyond the cap proves there is more; otherwise keep walking until the index is exhausted.
+      if (branches.length > maxBranches) return { branches: branches.slice(0, maxBranches), truncated: true };
       lastKey = result.LastEvaluatedKey;
       if (!lastKey) return { branches, truncated: false };
-      if (branches.length >= maxBranches) return { branches, truncated: true };
     }
-    return { branches, truncated: true };
+    return { branches, truncated: true }; // page cap hit with LastEvaluatedKey still pending
   }
 
   /**

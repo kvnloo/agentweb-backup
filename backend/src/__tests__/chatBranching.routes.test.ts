@@ -71,8 +71,8 @@ jest.mock('../controllers/release', () => ({ getReleases: jest.fn() }));
 jest.mock('../controllers/docsController', () => ({ getUserReleaseNotes: jest.fn() }));
 
 import agentModeRoutes from '../routes/agentMode';
-import { __resetBranchRateLimitCacheForTests } from '../controllers/chatBranchController';
-import { __resetBranchIdempotencyForTests } from '../services/agentMode/chatBranching';
+import { __resetBranchRateLimitCacheForTests, __resetBranchLookupCacheForTests } from '../controllers/chatBranchController';
+import { __resetBranchIdempotencyForTests, __lookupWindowUsersForTests } from '../services/agentMode/chatBranching';
 
 const SECRET = 'route-test-secret';
 const bearer = (userId: string, extra: Record<string, unknown> = {}) =>
@@ -91,6 +91,7 @@ beforeEach(() => {
   mockFake.tables.clear();
   mockClaimed.clear();
   __resetBranchRateLimitCacheForTests();
+  __resetBranchLookupCacheForTests();
   __resetBranchIdempotencyForTests();
   mockGetSetting.mockReset();
   mockGetSetting.mockImplementation(async (name: string) => (name === 'chat_branching_enabled' ? { settingName: name, settingValue: 'true' } : null));
@@ -404,5 +405,117 @@ describe('GET /session/:id/branches (ENG-112 family listing)', () => {
     expect(mockFake.indexQueries).toHaveLength(20);
     expect(out.body.truncated).toBe(true);
     expect(out.body.sessions.map((s: any) => s.sessionId)).toEqual(['R']);
+  });
+
+  it('queries the index newest-first (ScanIndexForward=false) so truncation drops the OLDEST sessions, and still returns createdAt ascending', async () => {
+    seed('R', { createdAt: at(1), updatedAt: at(1) });
+    for (let i = 0; i < 30; i++) seed(`N${i}`, { createdAt: at(10 + i), updatedAt: at(10 + i) });
+    seed('NEWEST', { createdAt: at(200), updatedAt: at(200), branchedFrom: link('R', 'R', at(200)) });
+    seed('MID', { createdAt: at(100), updatedAt: at(100), branchedFrom: link('R', 'R', at(100)) });
+    mockFake.indexPageSize = 1;
+    const out = await get('R');
+    expect(mockFake.indexQueries[0].ScanIndexForward).toBe(false);
+    expect(out.body.truncated).toBe(true); // 20-page cap hit with more index left
+    expect(out.body.sessions.map((s: any) => s.sessionId)).toEqual(['R', 'MID', 'NEWEST']);
+  });
+
+  it('exactly 49 branches with more (non-matching) pages left is NOT truncated; 50 branches is', async () => {
+    seed('R');
+    for (let i = 0; i < 49; i++) seed(`B${String(i).padStart(2, '0')}`, { createdAt: at(10 + i), updatedAt: at(100 + i), branchedFrom: link('R', 'R') });
+    for (let i = 0; i < 25; i++) seed(`N${i}`, { updatedAt: at(300 + i) });
+    mockFake.indexPageSize = 7;
+    const exact = await get('R');
+    expect(exact.body.sessions).toHaveLength(50);
+    expect(exact.body.truncated).toBeUndefined();
+    seed('B49', { createdAt: at(60), updatedAt: at(160), branchedFrom: link('R', 'R') });
+    const over = await get('R');
+    expect(over.body.sessions).toHaveLength(50);
+    expect(over.body.truncated).toBe(true);
+  });
+
+  describe('per-user lookup rate limit', () => {
+    const lookupReads = () => mockGetSetting.mock.calls.filter((c) => c[0] === 'branch_family_max_per_minute').length;
+    beforeEach(() => {
+      seed('R');
+      seed('Rb', { userId: 'other' });
+    });
+
+    it('allows 20 per minute, 429 TOO_MANY_BRANCH_LOOKUPS on the 21st with a neutral message, and does no index work for it', async () => {
+      for (let i = 0; i < 20; i++) expect((await get('R')).status).toBe(200);
+      const queriesBefore = mockFake.indexQueries.length;
+      const out = await get('R');
+      expect(out.status).toBe(429);
+      expect(out.body.code).toBe('TOO_MANY_BRANCH_LOOKUPS');
+      expect(out.body.message).toBe('Too many requests. Please try again in a moment.');
+      expect(mockFake.indexQueries.length).toBe(queriesBefore);
+    });
+
+    it('the window slides: allowed again a minute later', async () => {
+      const spy = jest.spyOn(Date, 'now');
+      try {
+        const t0 = 1_800_000_000_000;
+        spy.mockReturnValue(t0);
+        for (let i = 0; i < 20; i++) await get('R');
+        expect((await get('R')).status).toBe(429);
+        spy.mockReturnValue(t0 + 60_001);
+        expect((await get('R')).status).toBe(200);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('is per user: one user exhausting the limit does not affect another', async () => {
+      seed('S2', { userId: 'other' });
+      for (let i = 0; i < 21; i++) await get('R');
+      expect((await get('R')).status).toBe(429);
+      expect((await get('S2', 'other')).status).toBe(200);
+    });
+
+    it('setting 0 = unlimited; a custom value is honoured; settings are cached ~60s', async () => {
+      mockGetSetting.mockImplementation(async (name: string) =>
+        name === 'chat_branching_enabled' ? { settingValue: 'true' } : name === 'branch_family_max_per_minute' ? { settingValue: '0' } : null);
+      for (let i = 0; i < 30; i++) expect((await get('R')).status).toBe(200);
+      expect(lookupReads()).toBe(1);
+      __resetBranchLookupCacheForTests();
+      mockGetSetting.mockImplementation(async (name: string) =>
+        name === 'chat_branching_enabled' ? { settingValue: 'true' } : name === 'branch_family_max_per_minute' ? { settingValue: '2' } : null);
+      expect((await get('R')).status).toBe(200);
+      expect((await get('R')).status).toBe(200);
+      expect((await get('R')).status).toBe(429);
+    });
+
+    it.each(['abc', '-1', '1.5', ''])('garbage setting %j falls back to the default of 20', async (garbage) => {
+      mockGetSetting.mockImplementation(async (name: string) =>
+        name === 'chat_branching_enabled' ? { settingValue: 'true' } : name === 'branch_family_max_per_minute' ? { settingValue: garbage } : null);
+      for (let i = 0; i < 20; i++) expect((await get('R')).status).toBe(200);
+      expect((await get('R')).status).toBe(429);
+    });
+
+    it('an unreadable setting row uses the default (never blocks reads)', async () => {
+      mockGetSetting.mockImplementation(async (name: string) => {
+        if (name === 'branch_family_max_per_minute') throw new Error('settings down');
+        return { settingValue: 'true' };
+      });
+      const err = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      try {
+        expect((await get('R')).status).toBe(200);
+      } finally {
+        err.mockRestore();
+      }
+    });
+
+    it('leaks no memory: expired windows are swept', async () => {
+      const spy = jest.spyOn(Date, 'now');
+      try {
+        spy.mockReturnValue(1_800_000_000_000);
+        for (let u = 0; u < 10; u++) { seed(`X${u}`, { userId: `u${u}` }); await get(`X${u}`, `u${u}`); }
+        expect(__lookupWindowUsersForTests()).toBe(10);
+        spy.mockReturnValue(1_800_000_000_000 + 120_000);
+        for (let i = 0; i < 60; i++) await get('R'); // crosses a sweep boundary
+        expect(__lookupWindowUsersForTests()).toBeLessThanOrEqual(1);
+      } finally {
+        spy.mockRestore();
+      }
+    });
   });
 });

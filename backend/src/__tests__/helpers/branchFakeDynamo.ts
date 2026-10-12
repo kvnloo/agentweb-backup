@@ -151,6 +151,7 @@ export class BranchFakeDynamo {
     const all = [...this.table('AW-ChatSessions').values()]
       .filter((i) => this.indexLeaksOtherUsers || i.userId === userId)
       .sort((a, b) => String(a.updatedAt).localeCompare(String(b.updatedAt)) || String(a.sessionId).localeCompare(String(b.sessionId)));
+    if (p.ScanIndexForward === false) all.reverse(); // DynamoDB: ascending by range key unless ScanIndexForward=false
     const start = p.ExclusiveStartKey ? all.findIndex((i) => i.sessionId === p.ExclusiveStartKey.sessionId) + 1 : 0;
     const size = this.indexPageSize ?? all.length;
     const page = all.slice(start, start + size);
