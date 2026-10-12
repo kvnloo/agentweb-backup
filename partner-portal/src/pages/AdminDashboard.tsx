@@ -284,7 +284,7 @@ interface User {
   // ENG-273: one messaging platform per customer. Derived by the backend from the same
   // policy that enforces the rule, so this never disagrees with what an edit will allow.
   messagingPlatform?: "slack" | "whatsapp" | null;
-  messagingPlatformSource?: "account" | "organisation" | "slack_connect" | null;
+  messagingPlatformSource?: "account" | "organisation" | null;
   whatsappNumberMasked?: string | null; // last four digits only
   secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
@@ -4936,7 +4936,6 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                             : user.slackChannel ? [user.slackChannel] : [];
                                           if (ids.length === 0) {
                                             if (user.messagingPlatformSource === "organisation") return "Slack (via organisation)";
-                                            if (user.messagingPlatformSource === "slack_connect") return "Slack (Slack Connect)";
                                             return "Not connected";
                                           }
                                           return "Slack: " + ids.map((id) =>

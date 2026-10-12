@@ -50,7 +50,7 @@ interface User {
   slackChannels?: string[]; // Slack channels configured for this user
   // ENG-273: one messaging platform per customer, derived by the backend policy.
   messagingPlatform?: "slack" | "whatsapp" | null;
-  messagingPlatformSource?: "account" | "organisation" | "slack_connect" | null;
+  messagingPlatformSource?: "account" | "organisation" | null;
   whatsappNumberMasked?: string | null; // last four digits only
   secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
