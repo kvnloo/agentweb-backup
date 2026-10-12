@@ -21,6 +21,8 @@ export class BranchFakeDynamo {
   indexPageSize: number | undefined = undefined;
   indexLeaksOtherUsers = false;
   readonly indexQueries: any[] = [];
+  /** Queries against the messages table (a record-only lookup must never issue one). */
+  readonly messageQueries: any[] = [];
   /** Every write call, in order: [op, table, key-ish]. */
   readonly writeLog: Array<{ op: string; table: string; key: string }> = [];
 
@@ -116,6 +118,7 @@ export class BranchFakeDynamo {
       query: (p: any) =>
         BranchFakeDynamo.wrap(() => {
           if (p.IndexName === 'UserIdIndex') return this.queryUserIdIndex(p);
+          this.messageQueries.push(p);
           const sessionId = p.ExpressionAttributeValues[':sessionId'];
           const items = [...this.table(p.TableName).values()]
             .filter((i) => i.sessionId === sessionId)

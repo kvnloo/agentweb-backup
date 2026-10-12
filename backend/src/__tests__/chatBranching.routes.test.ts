@@ -273,6 +273,17 @@ describe('GET /session/:id/branches (ENG-112 family listing)', () => {
     mockFake.indexPageSize = undefined;
     mockFake.indexLeaksOtherUsers = false;
     mockFake.indexQueries.length = 0;
+    mockFake.messageQueries.length = 0;
+  });
+
+  it('listing authorises on the session RECORD only: never reads (or migrates) messages, even for a foreign session', async () => {
+    seed('s-rec', { messageCount: 7 });
+    expect((await get('s-rec', 'stranger')).status).toBe(403);
+    expect(mockFake.messageQueries).toHaveLength(0);
+    const own = await get('s-rec');
+    expect(own.status).toBe(200);
+    expect(own.body.sessions[0].messageCount).toBe(7);
+    expect(mockFake.messageQueries).toHaveLength(0);
   });
 
   it('401 without a token, and no work is done', async () => {

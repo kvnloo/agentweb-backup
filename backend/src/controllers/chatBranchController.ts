@@ -173,7 +173,8 @@ export async function listBranchesHandler(req: AuthenticatedRequest, res: Respon
     {
       isAcceptingWork: isCronEnabled,
       isFeatureEnabled: isChatBranchingEnabled,
-      getSession: (sessionId) => chatbotDb.getChatSession(sessionId),
+      // Record only: authorisation must not read or migrate a (possibly foreign) session's messages.
+      getSession: (sessionId) => chatbotDb.getChatSessionRecord(sessionId),
       listBranches: (userId, rootSessionId, opts) => chatbotDb.getBranchFamilySessions(userId, rootSessionId, opts),
       getMaxLookupsPerMinute: () => getBranchFamilyMaxPerMinute(),
     },
