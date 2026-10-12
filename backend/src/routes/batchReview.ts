@@ -27,6 +27,10 @@ router.post("/create", authenticateToken, async (req: Request, res: Response) =>
     return res.status(400).json({ error: "Missing required fields: channel, assets (non-empty array)" });
   }
 
+  if (typeof channel !== "string") {
+    return res.status(400).json({ error: "channel must be a string" });
+  }
+
   // ENG-2407: the bot posts with the workspace token, so the caller may only target a
   // channel configured for their user/org (or be a real, non-delegated admin). Checked
   // before any DB write or Slack call.
@@ -39,7 +43,7 @@ router.post("/create", authenticateToken, async (req: Request, res: Response) =>
       console.error("Error resolving allowed Slack channels:", error.message);
       return res.status(500).json({ error: "Failed to create batch review" });
     }
-    if (!allowed.includes(String(channel))) {
+    if (!allowed.includes(channel)) {
       return res.status(403).json({ error: "Not allowed to post to this Slack channel" });
     }
   }

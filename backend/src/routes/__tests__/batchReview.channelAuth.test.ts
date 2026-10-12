@@ -76,6 +76,11 @@ describe('POST /api/batch-review/create channel entitlement (ENG-2407)', () => {
     expectNoSideEffects();
   });
 
+  it('400s a non-string channel (array would stringify into an allowed ID), with no side effects', async () => {
+    await request(app).post('/api/batch-review/create').send(body(['C_OWN'] as any)).expect(400);
+    expectNoSideEffects();
+  });
+
   it('allows the caller\'s configured channel', async () => {
     const res = await request(app).post('/api/batch-review/create').send(body('C_OWN')).expect(200);
     expect(res.body.batchId).toBe('b1');
