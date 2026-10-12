@@ -21,6 +21,8 @@ jest.mock('../services/emailService', () => ({ emailService: {
 } }));
 jest.mock('../services/messagingChannelService', () => ({
   bootstrapMessagingChannels: jest.fn(), resolveDestination: jest.fn(),
+  // These accounts are Slack customers; a real answer to "is this one on WhatsApp" is false.
+  hasVerifiedWhatsApp: jest.fn().mockReturnValue(false),
 }));
 jest.mock('../services/whatsappService', () => ({ TEMPLATES: {} }));
 import { WebClient } from '@slack/web-api';
