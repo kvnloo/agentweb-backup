@@ -59,10 +59,11 @@ describe('price book version (ENG-1250 §5, ENG-1934)', () => {
 
   it('matches the prices it versions — bump LLM_PRICE_BOOK_VERSION and this pin together', () => {
     expect({ version: LLM_PRICE_BOOK_VERSION, fingerprint: fingerprint() }).toEqual({
-      version: '2026-10-08',
+      version: '2026-10-12',
       // + gemini-omni-1.1-flash video entry: additive only (no existing price moved),
       // so events already stamped 2026-10-08 still re-derive exactly.
-      fingerprint: '8af6c4bc8ace9a99',
+      // + deprecated alias key openrouter/qwen/qwen3.8-max (same $2/$6 as -0902): additive.
+      fingerprint: '65453682d3ff3985',
     });
   });
 });
@@ -81,6 +82,15 @@ describe('llmPricing', () => {
 
       const missing = registryKeys.filter((model) => !MODEL_PRICING[model]);
       expect(missing).toEqual([]);
+    });
+
+    it('tolerates documented deprecated alias price keys that are not registry models', () => {
+      // Pre-rename ids kept priced so late usage rows still meter (see LEGACY_MODEL_ALIASES).
+      const DEPRECATED_ALIAS_PRICE_KEYS = ['openrouter/qwen/qwen3.8-max'];
+      for (const key of DEPRECATED_ALIAS_PRICE_KEYS) {
+        expect(parseLlmModelsRegistryKeys()).not.toContain(key);
+        expect(MODEL_PRICING[key]).toEqual(MODEL_PRICING['openrouter/qwen/qwen3.8-max-0902']);
+      }
     });
 
     it('covers the chatbot + embedding models from the provider report', () => {
