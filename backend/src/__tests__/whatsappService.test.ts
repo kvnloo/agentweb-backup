@@ -702,6 +702,25 @@ describe('phone -> user index', () => {
     expect(settingsService.deleteSetting).toHaveBeenCalledWith(KEY);
   });
 
+  it('clears the index only if it still points at the account asking', async () => {
+    settingsService.getSetting.mockResolvedValue({ settingValue: 'user-1' });
+    await unbindPhone(PHONE, 'user-1');
+    expect(settingsService.deleteSetting).toHaveBeenCalledWith(KEY);
+  });
+
+  it('leaves the index alone when the number has been re-bound to someone else', async () => {
+    // An old account disconnecting must not break the new owner's inbound taps.
+    settingsService.getSetting.mockResolvedValue({ settingValue: 'user-2' });
+    await unbindPhone(PHONE, 'user-1');
+    expect(settingsService.deleteSetting).not.toHaveBeenCalled();
+  });
+
+  it('leaves the index alone when there is no row', async () => {
+    settingsService.getSetting.mockResolvedValue(null);
+    await unbindPhone(PHONE, 'user-1');
+    expect(settingsService.deleteSetting).not.toHaveBeenCalled();
+  });
+
   it('resolves a bound number to its user', async () => {
     settingsService.getSetting.mockResolvedValue({ settingValue: 'user-1' });
     userDb.getUserById.mockResolvedValue(boundUser());

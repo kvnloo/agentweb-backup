@@ -12,16 +12,15 @@ const { userDb, orgDb } = require('../services/db');
 
 import {
   assertCanConnect,
-  getConnectedPlatform,
   getPlatformSummary,
-  hasSlack,
+  hasOwnSlack,
   hasWhatsApp,
   PlatformConflictError,
 } from '../services/customerChannelPolicy';
 import { resolveDestination } from '../services/messagingChannelService';
 
 const verifiedWhatsApp = {
-  channel: 'whatsapp',
+  channel: 'whatsapp' as const,
   destination: '+918005326946',
   enabled: true,
   optIn: { at: 'x', source: 'inbound_verification', verifiedAt: 'y' },
@@ -54,24 +53,22 @@ describe('which platform a customer is on', () => {
   });
 
   it('never exposes the full WhatsApp number', async () => {
-    const summary = await getPlatformSummary(onWhatsApp);
-    expect(JSON.stringify(summary)).not.toContain('918005326946');
+    expect(JSON.stringify(await getPlatformSummary(onWhatsApp))).not.toContain('918005326946');
   });
 
   it('does not count an unverified WhatsApp entry', () => {
-    const unverified = { ...verifiedWhatsApp, optIn: { at: 'x', source: 's' } };
+    const unverified = { ...verifiedWhatsApp, optIn: { at: 'x', source: 's' } } as any;
     expect(hasWhatsApp({ messagingChannels: [unverified] })).toBe(false);
   });
 
   it('is Slack for an assigned or linked channel', async () => {
-    await expect(getPlatformSummary(onSlack)).resolves.toMatchObject({
-      platform: 'slack',
-      source: 'account',
-    });
+    await expect(getPlatformSummary(onSlack)).resolves.toMatchObject({ platform: 'slack', source: 'account' });
   });
 
   it('is Slack for the deprecated single-channel field too', async () => {
-    await expect(getConnectedPlatform({ userId: 'u', slackChannel: 'C0OLD' })).resolves.toBe('slack');
+    await expect(getPlatformSummary({ userId: 'u', slackChannel: 'C0OLD' })).resolves.toMatchObject({
+      platform: 'slack',
+    });
   });
 
   it('is Slack, via the organisation, for a member who inherits its channel', async () => {
@@ -85,24 +82,19 @@ describe('which platform a customer is on', () => {
   it('is Slack, via the organisation, when only the owner has a channel', async () => {
     orgDb.getOrgById.mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner' });
     userDb.getUserById.mockResolvedValue({ userId: 'owner', slackChannels: ['C0OWNER'] });
-    await expect(getConnectedPlatform(inSlackOrg)).resolves.toBe('slack');
+    await expect(getPlatformSummary(inSlackOrg)).resolves.toMatchObject({ source: 'organisation' });
   });
 
   it('is neither for a member of an organisation with no Slack', async () => {
     orgDb.getOrgById.mockResolvedValue({ orgId: 'org-1' });
-    await expect(getConnectedPlatform(inSlackOrg)).resolves.toBeNull();
+    await expect(getPlatformSummary(inSlackOrg)).resolves.toMatchObject({ platform: null });
   });
 
-  it('is Slack when onboarding provisioned a Slack Connect channel', async () => {
-    await expect(
-      getPlatformSummary({ slackConnectChannelId: 'C0CONNECT', slackConnectStatus: 'created' }),
-    ).resolves.toMatchObject({ platform: 'slack', source: 'slack_connect' });
-  });
-
-  it('does not count a Slack Connect attempt that failed', async () => {
-    await expect(
-      hasSlack({ slackConnectChannelId: 'C0CONNECT', slackConnectStatus: 'failed' }),
-    ).resolves.toBe(false);
+  it('does NOT treat a Slack Connect support room as a platform', async () => {
+    // Nothing delivers notifications to it, so counting it only ever blocked WhatsApp.
+    const account = { userId: 'u', slackConnectChannelId: 'C0CONNECT', slackConnectStatus: 'created' };
+    await expect(getPlatformSummary(account)).resolves.toMatchObject({ platform: null });
+    expect(hasOwnSlack(account)).toBe(false);
   });
 
   it('resolves each organisation once when listing many accounts', async () => {
@@ -115,33 +107,35 @@ describe('which platform a customer is on', () => {
   });
 });
 
-describe('a WhatsApp member of a Slack organisation', () => {
-  const both = { ...onWhatsApp, orgId: 'org-1' };
+describe('an account that has both a verified WhatsApp number and Slack', () => {
+  // However the two came to coexist — an organisation gaining a channel, its owner being
+  // assigned one, a WhatsApp user joining it, or an account that predates the rule — it is
+  // on WhatsApp everywhere: the screen says so and the sends follow.
+  const bothOwn = { ...onWhatsApp, slackChannels: ['C0OWN'] };
+  const bothViaOrg = { ...onWhatsApp, orgId: 'org-1' };
   beforeEach(() => orgDb.getOrgById.mockResolvedValue({ orgId: 'org-1', slackChannel: 'C0ORG' }));
 
-  it('is on WhatsApp — their own choice beats the inherited default', async () => {
-    await expect(getConnectedPlatform(both)).resolves.toBe('whatsapp');
+  it('is reported as WhatsApp', async () => {
+    await expect(getPlatformSummary(bothOwn)).resolves.toMatchObject({ platform: 'whatsapp' });
+    await expect(getPlatformSummary(bothViaOrg)).resolves.toMatchObject({ platform: 'whatsapp' });
   });
 
-  it('does not inherit the organisation Slack channel, so nothing is delivered twice', async () => {
-    // This is what makes the rule hold however the two came to coexist: an org gaining
-    // a channel later, the owner being assigned one, or a WhatsApp user joining.
-    await expect(resolveDestination(both as any, 'slack')).resolves.toBeNull();
-    await expect(resolveDestination(both as any, 'whatsapp')).resolves.toBe('+918005326946');
+  it('is not delivered to on its own Slack channel', async () => {
+    await expect(resolveDestination(bothOwn as any, 'slack')).resolves.toBeNull();
+    await expect(resolveDestination(bothOwn as any, 'whatsapp')).resolves.toBe('+918005326946');
   });
 
-  it('leaves every other member of that organisation on Slack', async () => {
-    await expect(resolveDestination(inSlackOrg, 'slack')).resolves.toBe('C0ORG');
+  it('is not delivered to on its organisation Slack channel', async () => {
+    await expect(resolveDestination(bothViaOrg as any, 'slack')).resolves.toBeNull();
   });
 
-  it('still sees the Slack side when asked whether WhatsApp may be connected', async () => {
-    // hasSlack is asked precisely to decide that, so an existing number must not hide it.
-    await expect(hasSlack(both)).resolves.toBe(true);
+  it('leaves every other member of the organisation on Slack', async () => {
+    await expect(resolveDestination(inSlackOrg as any, 'slack')).resolves.toBe('C0ORG');
   });
 });
 
 describe('connecting a second platform', () => {
-  it('refuses WhatsApp for a customer on Slack', async () => {
+  it('refuses WhatsApp for an account with a Slack channel of its own', async () => {
     await expect(assertCanConnect(onSlack, 'whatsapp')).rejects.toMatchObject({
       name: 'PlatformConflictError',
       connected: 'slack',
@@ -149,17 +143,27 @@ describe('connecting a second platform', () => {
     });
   });
 
-  it('refuses WhatsApp for a member whose organisation is on Slack', async () => {
-    orgDb.getOrgById.mockResolvedValue({ orgId: 'org-1', slackChannel: 'C0ORG' });
-    await expect(assertCanConnect(inSlackOrg, 'whatsapp')).rejects.toBeInstanceOf(
+  it('refuses WhatsApp for an account on the deprecated single channel', async () => {
+    await expect(assertCanConnect({ userId: 'u', slackChannel: 'C0OLD' }, 'whatsapp')).rejects.toBeInstanceOf(
       PlatformConflictError,
     );
   });
 
-  it('refuses Slack for a customer on WhatsApp', async () => {
-    await expect(assertCanConnect(onWhatsApp, 'slack')).rejects.toBeInstanceOf(
-      PlatformConflictError,
-    );
+  it('ALLOWS WhatsApp for a member whose only Slack is the organisation channel', async () => {
+    // That channel is a default they inherited, and their verified number beats it — so
+    // refusing would only trap them, with no control anywhere to remove an organisation's
+    // channel from one member.
+    orgDb.getOrgById.mockResolvedValue({ orgId: 'org-1', slackChannel: 'C0ORG' });
+    await expect(assertCanConnect(inSlackOrg, 'whatsapp')).resolves.toBeUndefined();
+  });
+
+  it('ALLOWS WhatsApp when onboarding provisioned a Slack Connect support room', async () => {
+    const account = { userId: 'u', slackConnectChannelId: 'C0CONNECT', slackConnectStatus: 'created' };
+    await expect(assertCanConnect(account, 'whatsapp')).resolves.toBeUndefined();
+  });
+
+  it('refuses Slack for an account on WhatsApp', async () => {
+    await expect(assertCanConnect(onWhatsApp, 'slack')).rejects.toBeInstanceOf(PlatformConflictError);
   });
 
   it('tells the customer what to do about it', async () => {

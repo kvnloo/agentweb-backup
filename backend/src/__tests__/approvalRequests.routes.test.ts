@@ -12,7 +12,8 @@ jest.mock('../middleware/auth', () => ({
 }));
 jest.mock('../services/approvalRequestService', () => {
   class ApprovalNotDeliveredError extends Error {}
-  return { requestApproval: jest.fn(), ApprovalNotDeliveredError };
+  class ApprovalDeliveryFailedError extends Error {}
+  return { requestApproval: jest.fn(), ApprovalNotDeliveredError, ApprovalDeliveryFailedError };
 });
 
 const svc = require('../services/approvalRequestService');
@@ -65,6 +66,17 @@ it('answers 409 no_channel when the account has nowhere to be asked', async () =
     .send({ assetUrl: 'https://a/x.png', filename: 'x.png' });
   expect(res.status).toBe(409);
   expect(res.body.code).toBe('no_channel');
+});
+
+it('answers 502 delivery_failed when the account has a channel and the send failed', async () => {
+  // Not the same answer as no_channel: the task engine carries on past "nobody to ask" but
+  // must HOLD its output for a customer who can be reached and was not.
+  svc.requestApproval.mockRejectedValue(new svc.ApprovalDeliveryFailedError('send failed'));
+  const res = await request(app)
+    .post('/api/approval-requests')
+    .send({ assetUrl: 'https://a/x.png', filename: 'x.png' });
+  expect(res.status).toBe(502);
+  expect(res.body.code).toBe('delivery_failed');
 });
 
 it('answers 500 for a real failure', async () => {

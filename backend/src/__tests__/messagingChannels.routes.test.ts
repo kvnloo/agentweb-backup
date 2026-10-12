@@ -309,7 +309,8 @@ describe('DELETE /whatsapp', () => {
       messagingChannels: [{ channel: 'whatsapp', destination: '+14155550123', enabled: true }],
     });
     await request(app).delete('/api/messaging-channels/whatsapp');
-    expect(whatsapp.unbindPhone).toHaveBeenCalledWith('+14155550123');
+    // Conditional on the account still owning the row, so a number re-bound elsewhere is left alone.
+    expect(whatsapp.unbindPhone).toHaveBeenCalledWith('+14155550123', 'u1');
   });
 
   it('does not try to clear an index when there was no number', async () => {

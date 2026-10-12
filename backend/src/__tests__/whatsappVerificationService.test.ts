@@ -46,6 +46,7 @@ jest.mock('../services/whatsappService', () => ({
   sendMessage: jest.fn(),
   bindPhoneToUser: jest.fn(),
   unbindPhone: jest.fn(),
+  resolveUserIdByPhone: jest.fn(),
 }));
 
 const { settingsService } = require('../services/settingsService');
@@ -108,6 +109,7 @@ beforeEach(() => {
     users.set(id, { ...users.get(id), ...patch });
   });
   whatsapp.isOptedOut.mockResolvedValue(false);
+  whatsapp.resolveUserIdByPhone.mockResolvedValue(null);
   whatsapp.sendMessage.mockResolvedValue({ messageId: 'wamid.OUT' });
 
   logSpies = (['log', 'warn', 'error', 'info'] as const).map((m) =>
@@ -265,10 +267,31 @@ describe('completeVerification — one platform per customer', () => {
     ]);
   });
 
-  it('refuses for an account whose onboarding provisioned a Slack Connect channel', async () => {
+  it('does NOT refuse for an account whose onboarding provisioned a Slack Connect channel', async () => {
+    // A support room for talking to the team — nothing delivers notifications to it, so it
+    // is not a platform, and counting it blocked WhatsApp for every onboarded account.
     const code = await begin();
     users.set('u1', { userId: 'u1', slackConnectChannelId: 'C0CONNECT', slackConnectStatus: 'created' });
+    await expect(completeVerification(code, PHONE)).resolves.toBe('verified');
+  });
+
+  it('does NOT refuse for a member whose only Slack is inherited from the organisation', async () => {
+    const code = await begin();
+    users.set('u1', { userId: 'u1', orgId: 'org-1' });
+    await expect(completeVerification(code, PHONE)).resolves.toBe('verified');
+  });
+
+  it('leaves the code unclaimed when it refuses, so it is not stranded', async () => {
+    // Refusing AFTER claiming left the row "claimed": it could not be retried and the
+    // portal kept polling a verification that would never finish.
+    const code = await begin();
+    users.set('u1', { userId: 'u1', slackChannels: ['C1'] });
     await expect(completeVerification(code, PHONE)).resolves.toBe('other_platform');
+    expect(rowFor(code).status).toBe('pending');
+
+    // Once the Slack channel is removed, the same code works.
+    users.set('u1', { userId: 'u1' });
+    await expect(completeVerification(code, PHONE)).resolves.toBe('verified');
   });
 
   it('tells the customer why their number was not connected', async () => {
@@ -482,6 +505,37 @@ describe('completeVerification — a STOPped number', () => {
 
 // ── Status ─────────────────────────────────────────────────────────────────
 
+describe('completeVerification — one number, one account', () => {
+  it('refuses a number another account already holds', async () => {
+    // Two accounts on one number would leave the phone -> user lookup pointing at only one
+    // of them: the other's taps would be ignored while its sends kept reaching the handset.
+    const code = await begin();
+    whatsapp.resolveUserIdByPhone.mockResolvedValue('someone-else');
+
+    await expect(completeVerification(code, PHONE)).resolves.toBe('number_in_use');
+    expect(users.get('u1').messagingChannels).toBeUndefined();
+    expect(whatsapp.bindPhoneToUser).not.toHaveBeenCalled();
+    expect(rowFor(code).status).toBe('pending');
+  });
+
+  it('lets the account that already holds the number verify it again', async () => {
+    const code = await begin();
+    whatsapp.resolveUserIdByPhone.mockResolvedValue('u1');
+    await expect(completeVerification(code, PHONE)).resolves.toBe('verified');
+  });
+
+  it('tells the customer why, without naming the other account', async () => {
+    const code = await begin();
+    whatsapp.resolveUserIdByPhone.mockResolvedValue('someone-else');
+    whatsapp.sendMessage.mockResolvedValue({ messageId: 'x' });
+
+    await handleVerificationMessage(`Verify ${code}`, PHONE);
+    const sent = whatsapp.sendMessage.mock.calls[0][0].text;
+    expect(sent).toMatch(/already connected to a different AgentWeb account/);
+    expect(sent).not.toContain('someone-else');
+  });
+});
+
 describe('completeVerification — the phone -> user index', () => {
   it('writes the index so an inbound tap from this number resolves to its owner', async () => {
     const code = await begin();
@@ -506,7 +560,7 @@ describe('completeVerification — the phone -> user index', () => {
     const code = await begin();
     await completeVerification(code, PHONE);
 
-    expect(whatsapp.unbindPhone).toHaveBeenCalledWith(OTHER);
+    expect(whatsapp.unbindPhone).toHaveBeenCalledWith(OTHER, 'u1');
     expect(whatsapp.bindPhoneToUser).toHaveBeenCalledWith(PHONE, 'u1');
   });
 

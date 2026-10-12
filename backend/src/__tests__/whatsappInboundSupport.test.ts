@@ -156,11 +156,32 @@ describe('forwarding to the team', () => {
     expect(whatsapp.sendText).not.toHaveBeenCalled();
   });
 
-  it('still greets when forwarding fails, and never throws', async () => {
+  it('still greets when sending the forward fails, and never throws', async () => {
     process.env.WHATSAPP_SUPPORT_INBOX = 'support@example.com';
     emailService.sendEmail.mockRejectedValue(new Error('ses down'));
     await expect(handleUnrecognizedMessage(PHONE, 'hi')).resolves.toBeUndefined();
     expect(whatsapp.sendText).toHaveBeenCalled();
+  });
+
+  it('logs — without the number — when the mailer reports a failed forward', async () => {
+    // sendEmail never throws; it RETURNS 'failed'. The customer was promised a reply, so
+    // a lost forward must not be silent.
+    process.env.WHATSAPP_SUPPORT_INBOX = 'support@example.com';
+    emailService.sendEmail.mockResolvedValue('failed');
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    await handleUnrecognizedMessage(PHONE, 'hi');
+    const logged = (console.error as jest.Mock).mock.calls.flat().join(' ');
+    expect(logged).toMatch(/could not forward/);
+    expect(logged).not.toContain('918005326946');
+  });
+
+  it('does not log an error when the non-prod guard suppresses the forward', async () => {
+    process.env.WHATSAPP_SUPPORT_INBOX = 'support@example.com';
+    emailService.sendEmail.mockResolvedValue('suppressed');
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    await handleUnrecognizedMessage(PHONE, 'hi');
+    expect(console.error).not.toHaveBeenCalled();
   });
 
   it('keeps the phone number out of its logs', async () => {
@@ -168,5 +189,68 @@ describe('forwarding to the team', () => {
     await handleUnrecognizedMessage(PHONE, 'hi');
     const logged = (console.warn as jest.Mock).mock.calls.flat().join(' ');
     expect(logged).not.toContain('918005326946');
+  });
+});
+
+describe('the hourly forward limit', () => {
+  beforeEach(() => {
+    process.env.WHATSAPP_SUPPORT_INBOX = 'support@example.com';
+  });
+
+  const counter = (used: number) =>
+    settingsService.getSetting.mockImplementation(async (k: string) =>
+      k.startsWith('whatsapp:forwards:') ? { settingValue: String(used) } : null,
+    );
+
+  it('forwards while the number is under its allowance and counts each one', async () => {
+    counter(3);
+    await handleUnrecognizedMessage(PHONE, 'hello');
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+    const [key, value] = settingsService.setSetting.mock.calls.find((c: any[]) =>
+      String(c[0]).startsWith('whatsapp:forwards:'),
+    );
+    expect(key).toMatch(/^whatsapp:forwards:\+918005326946:\d{4}-\d{2}-\d{2}T\d{2}$/);
+    expect(value).toBe('4');
+  });
+
+  it('stops forwarding once the allowance is used up, so one number cannot flood the inbox', async () => {
+    counter(20);
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    await handleUnrecognizedMessage(PHONE, 'spam');
+    expect(emailService.sendEmail).not.toHaveBeenCalled();
+  });
+
+  it('still greets a number that is over its allowance', async () => {
+    counter(20);
+    await handleUnrecognizedMessage(PHONE, 'spam');
+    expect(whatsapp.sendText).toHaveBeenCalled();
+  });
+
+  it('keeps the number out of the over-limit log', async () => {
+    counter(20);
+    await handleUnrecognizedMessage(PHONE, 'spam');
+    const logged = (console.warn as jest.Mock).mock.calls.flat().join(' ');
+    expect(logged).toMatch(/exceeded/);
+    expect(logged).not.toContain('918005326946');
+  });
+
+  it('expires the counter in epoch SECONDS', async () => {
+    counter(0);
+    await handleUnrecognizedMessage(PHONE, 'hello');
+    const call = settingsService.setSetting.mock.calls.find((c: any[]) =>
+      String(c[0]).startsWith('whatsapp:forwards:'),
+    );
+    const hours = (call[4] - Date.now() / 1000) / 3600;
+    expect(hours).toBeGreaterThan(1.9);
+    expect(hours).toBeLessThan(2.1);
+  });
+
+  it('fails OPEN: a limiter fault never costs a customer their message', async () => {
+    settingsService.getSetting.mockImplementation(async (k: string) => {
+      if (k.startsWith('whatsapp:forwards:')) throw new Error('dynamo down');
+      return null;
+    });
+    await handleUnrecognizedMessage(PHONE, 'hello');
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
   });
 });
