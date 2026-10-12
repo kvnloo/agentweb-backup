@@ -512,6 +512,52 @@ describe("Domain API Routes", () => {
           }),
       });
       mockDynamoInstance.update.mockReturnValue({ promise: () => Promise.resolve() });
+      mockListDomains.mockResolvedValue([
+        { id: "dom-own", userId: "test-user-123", domain: "mysite.com", type: "custom", status: "active", vercelProjectId: "proj-1" },
+      ]);
+    });
+
+    afterEach(() => {
+      mockListDomains.mockReset();
+    });
+
+    describe("ENG-2412: authorize before any Vercel side effect", () => {
+      it("foreign landingPageId -> 404 and no Vercel call", async () => {
+        mockDynamoInstance.get.mockReturnValueOnce({
+          promise: () =>
+            Promise.resolve({ Item: { id: "lp-1", userId: "someone-else", vercelProjectId: "proj-1" } }),
+        });
+        const res = await request(app).post("/api/domains/page-subdomain").send(VALID_BODY);
+        expect(res.status).toBe(404);
+        expect(mockSetPageSubdomain).not.toHaveBeenCalled();
+        expect(mockUpdateSubdomainMiddleware).not.toHaveBeenCalled();
+      });
+
+      it("mismatched vercelProjectId -> 403 and no Vercel call", async () => {
+        const res = await request(app)
+          .post("/api/domains/page-subdomain")
+          .send({ ...VALID_BODY, vercelProjectId: "victim-proj" });
+        expect(res.status).toBe(403);
+        expect(mockSetPageSubdomain).not.toHaveBeenCalled();
+        expect(mockDynamoInstance.update).not.toHaveBeenCalled();
+      });
+
+      it("unowned mainDomain -> 403 and no Vercel call", async () => {
+        const res = await request(app)
+          .post("/api/domains/page-subdomain")
+          .send({ ...VALID_BODY, mainDomain: "victim.com" });
+        expect(res.status).toBe(403);
+        expect(mockListDomains).toHaveBeenCalledWith("test-user-123", "proj-1");
+        expect(mockSetPageSubdomain).not.toHaveBeenCalled();
+      });
+
+      it("mainDomain match is case-insensitive for the owner", async () => {
+        const res = await request(app)
+          .post("/api/domains/page-subdomain")
+          .send({ ...VALID_BODY, mainDomain: "MySite.com" });
+        expect(res.status).toBe(201);
+        expect(mockSetPageSubdomain).toHaveBeenCalled();
+      });
     });
 
     it("returns 201 with fullDomain and customDomainUrl on success", async () => {
