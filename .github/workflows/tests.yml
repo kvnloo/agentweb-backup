@@ -151,6 +151,7 @@ jobs:
           bash .github/scripts/sha-jest.test.sh
           bash .github/scripts/pipefail-hygiene.test.sh
           bash .github/scripts/paths-filter-hygiene.test.sh
+          bash .github/scripts/idor-probe.test.sh
           bash .github/scripts/offline-eval-report.test.sh
           bash .github/scripts/dev-md-fragments.test.sh
 
