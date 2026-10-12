@@ -56,7 +56,7 @@ jest.mock('axios', () => {
 jest.mock('../utils/s3Utils', () => ({
   extractS3KeyFromUrl: jest.fn((url: string) => {
     if (url.includes('agentweb-user-files.s3')) {
-      return 'test-s3-key';
+      return new URL(url).pathname.replace(/^\/+/, '');
     }
     return null;
   }),
@@ -82,6 +82,25 @@ jest.mock('crypto', () => ({
 
 // Mock pdf-parse
 jest.mock('pdf-parse', () => jest.fn());
+
+// ENG-2420: no real DNS in unit tests. IP literals go through the real guard
+// (so 169.254.169.254 / 127.0.0.1 are refused by production logic); hostnames
+// resolve to a fixed public address unless listed as resolving private.
+const PRIVATE_DNS: Record<string, string> = { 'internal.rebind.test': '10.0.0.5' };
+jest.mock('../utils/ssrfGuard', () => {
+  const actual = jest.requireActual('../utils/ssrfGuard');
+  return {
+    ...actual,
+    resolvePinnedPublicAddress: jest.fn(async (rawUrl: string) => {
+      const host = new URL(rawUrl).hostname.toLowerCase();
+      const { isIP } = require('net');
+      if (isIP(host) || host === 'localhost') return actual.resolvePinnedPublicAddress(rawUrl);
+      const priv = PRIVATE_DNS[host];
+      if (priv) return actual.resolvePinnedPublicAddress(rawUrl.replace(host, priv));
+      return { hostname: host, address: '93.184.216.34', family: 4 };
+    }),
+  };
+});
 
 // Mock xlsx
 jest.mock('xlsx', () => ({
@@ -754,17 +773,18 @@ describe('readFileContent', () => {
   });
 
   describe('S3, Google Drive, and Timeout handling', () => {
-    it('should fetch files from private S3 bucket using the SDK stream', async () => {
+    it('should fetch the caller\'s own files from private S3 bucket using the SDK stream', async () => {
       const { getS3ObjectStream, getS3ObjectMetadata } = require('../utils/s3Utils');
-      const s3Url = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/test-s3-key';
+      const key = 'users/user-a/files/1700000000/tok/notes.txt';
+      const s3Url = `https://agentweb-user-files.s3.us-west-2.amazonaws.com/${key}`;
 
-      const result = await (agentModeService as any).readFileContent(s3Url);
+      const result = await (agentModeService as any).readFileContent(s3Url, { userId: 'user-a' });
 
       expect(result.success).toBe(true);
       expect(result.content).toBe('S3 file content');
       expect(result.file_type).toBe('text');
-      expect(getS3ObjectStream).toHaveBeenCalledWith('test-s3-key');
-      expect(getS3ObjectMetadata).toHaveBeenCalledWith('test-s3-key');
+      expect(getS3ObjectStream).toHaveBeenCalledWith(key);
+      expect(getS3ObjectMetadata).toHaveBeenCalledWith(key);
     });
 
     it('should reject Google Drive and Docs URLs with authorization message', async () => {
@@ -802,6 +822,83 @@ describe('readFileContent', () => {
       expect(result.success).toBe(false);
       expect(result.message).toContain('Failed to parse PDF file');
       expect(result.error).toBe('PDF parse timed out');
+    });
+  });
+
+  // ENG-2420: tenant isolation + SSRF on the shared impl (both HTTP routes and the
+  // Emma tool call this same function).
+  describe('ENG-2420 tenant isolation and SSRF guard', () => {
+    const { getS3ObjectStream, getS3ObjectMetadata } = require('../utils/s3Utils');
+
+    it('refuses another tenant\'s S3 key without touching S3', async () => {
+      const url = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user-b/files/1/t/secret.txt';
+      const result = await (agentModeService as any).readFileContent(url, { userId: 'user-a' });
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('File not found or you do not have access to it.');
+      expect(JSON.stringify(result)).not.toContain('user-b');
+      expect(getS3ObjectStream).not.toHaveBeenCalled();
+      expect(getS3ObjectMetadata).not.toHaveBeenCalled();
+    });
+
+    it('refuses S3 reads with no caller identity, keys outside user prefixes, and traversal', async () => {
+      const base = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/';
+      const cases: Array<[string, any]> = [
+        [`${base}users/user-a/files/x.txt`, undefined],
+        [`${base}tasks/t1/attachments/x.txt`, { userId: 'user-a' }],
+        [`${base}users/user-a/../user-b/files/x.txt`, { userId: 'user-a' }],
+        [`${base}users/user-ab/files/x.txt`, { userId: 'user-a' }],
+      ];
+      for (const [url, caller] of cases) {
+        const result = await (agentModeService as any).readFileContent(url, caller);
+        expect(result.success).toBe(false);
+      }
+      expect(getS3ObjectStream).not.toHaveBeenCalled();
+    });
+
+    it('allows the caller\'s sandbox prefix', async () => {
+      const url = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/sandbox/user-a/run/out.txt';
+      const result = await (agentModeService as any).readFileContent(url, { userId: 'user-a' });
+      expect(result.success).toBe(true);
+      expect(getS3ObjectStream).toHaveBeenCalledWith('sandbox/user-a/run/out.txt');
+    });
+
+    it.each([
+      'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
+      'http://127.0.0.1:3000/admin',
+      'http://localhost/secret.txt',
+      'http://internal.rebind.test/x.txt',
+    ])('refuses internal address %s without fetching', async (url) => {
+      const result = await (agentModeService as any).readFileContent(url, { userId: 'user-a' });
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('URL blocked: private or internal address');
+      expect(axios.get).not.toHaveBeenCalled();
+    });
+
+    it('refuses a public URL that redirects to a private IP', async () => {
+      (axios.get as jest.Mock).mockResolvedValueOnce({
+        status: 302,
+        headers: { location: 'http://169.254.169.254/latest/meta-data/' },
+        data: Buffer.from(''),
+      });
+      const result = await (agentModeService as any).readFileContent('https://example.com/r.txt', { userId: 'user-a' });
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('URL blocked: private or internal address');
+      expect(axios.get).toHaveBeenCalledTimes(1);
+    });
+
+    it('follows a public redirect and pins the connection to the validated address', async () => {
+      (axios.get as jest.Mock)
+        .mockResolvedValueOnce({ status: 301, headers: { location: '/final.txt' }, data: Buffer.from('') })
+        .mockResolvedValueOnce({ status: 200, headers: { 'content-type': 'text/plain' }, data: Buffer.from('public body') });
+      const result = await (agentModeService as any).readFileContent('https://example.com/start.txt', { userId: 'user-a' });
+      expect(result.success).toBe(true);
+      expect(result.content).toBe('public body');
+      const [secondUrl, opts] = (axios.get as jest.Mock).mock.calls[1];
+      expect(secondUrl).toBe('https://example.com/final.txt');
+      expect(opts.maxRedirects).toBe(0);
+      const cb = jest.fn();
+      opts.lookup('example.com', {}, cb);
+      expect(cb).toHaveBeenCalledWith(null, '93.184.216.34', 4);
     });
   });
 });

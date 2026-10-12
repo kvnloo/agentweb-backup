@@ -17,7 +17,7 @@
  * Pure logic with injected dependencies (same shape as modelComparison.ts); the controller only
  * supplies the real dependencies. Nothing here imports the 15k-line agentModeController.
  */
-import type { ChatMessage, ChatSession } from '../chatbotService';
+import type { BranchFamilyMember, ChatMessage, ChatSession } from '../chatbotService';
 import { computeAdminTaintedTurns, filterMessagesForClient } from '../../utils/adminOnlyMessageFilter';
 
 /** AW-Settings row. Only the exact value "true" enables the feature; default OFF. */
@@ -41,6 +41,16 @@ const RATE_WINDOW_MS = 60 * 60 * 1000;
 /** AW-Settings row: max branches one user may create per rolling hour. Absent/invalid => default; 0 => unlimited. */
 export const CHAT_BRANCHING_MAX_PER_HOUR_SETTING = 'chat_branching_max_per_hour';
 export const DEFAULT_MAX_BRANCHES_PER_HOUR = 30;
+
+/** AW-Settings row: max branch-family lookups one user may make per minute. Absent/invalid => default; 0 => unlimited. */
+export const BRANCH_FAMILY_MAX_PER_MINUTE_SETTING = 'branch_family_max_per_minute';
+export const DEFAULT_BRANCH_FAMILY_MAX_PER_MINUTE = 20;
+
+export function parseBranchFamilyRateLimit(value: unknown): number {
+  const text = String(value ?? '').trim();
+  if (!/^\d{1,9}$/.test(text)) return DEFAULT_BRANCH_FAMILY_MAX_PER_MINUTE;
+  return Number(text);
+}
 
 export function parseBranchRateLimit(value: unknown): number {
   const text = String(value ?? '').trim();
@@ -120,7 +130,7 @@ export interface BranchDeps {
     pageIdentifier: string;
     selectedStartupId?: string;
     delegateInfo?: DelegateInfo;
-    initialState: Partial<Pick<ChatSession, 'llmModel' | 'associatedSkills' | 'archived'>>;
+    initialState: Partial<Pick<ChatSession, 'llmModel' | 'associatedSkills' | 'archived' | 'branchedFrom'>>;
   }): Promise<ChatSession>;
   setModel(sessionId: string, model: string, policy: PolicyDecision): Promise<unknown>;
   setTitle(sessionId: string, title: string): Promise<unknown>;
@@ -319,6 +329,12 @@ export function buildBranchRows(
   return rows;
 }
 
+/** The first chat of the family `session` belongs to (itself when it is not a branch). */
+export function familyRootOf(session: Pick<ChatSession, 'sessionId' | 'branchedFrom'>): string {
+  const root = session.branchedFrom?.rootSessionId;
+  return typeof root === 'string' && root.length > 0 ? root : session.sessionId;
+}
+
 function branchTitle(source: ChatSession): string {
   let base = (source.title ?? '').trim() || 'Chat';
   // Branching a branch must not stack the suffix ("X (branch) (branch)").
@@ -341,14 +357,19 @@ const inflightKeys = new Map<string, Promise<ServiceOutcome>>();
 const recentBranches = new Map<string, { sessionId: string; at: number }>();
 
 const branchWindows = new Map<string, number[]>();
+/** Family-lookup (GET .../branches) sliding windows, same shape and sweep as branchWindows. */
+const lookupWindows = new Map<string, number[]>();
+const LOOKUP_WINDOW_MS = 60 * 1000;
 
 export function __resetBranchIdempotencyForTests(): void {
   inflightKeys.clear();
   recentBranches.clear();
   branchWindows.clear();
+  lookupWindows.clear();
   rateCallCount = 0;
 }
 export const __branchWindowUsersForTests = (): number => branchWindows.size;
+export const __lookupWindowUsersForTests = (): number => lookupWindows.size;
 
 /** Every this-many cap checks, users whose whole window has expired are dropped from the map. */
 export const RATE_SWEEP_EVERY = 50;
@@ -358,6 +379,24 @@ function sweepExpiredWindows(now: number): void {
   for (const [userId, list] of branchWindows) {
     if (list.length === 0 || list.every((t) => now - t >= RATE_WINDOW_MS)) branchWindows.delete(userId);
   }
+  for (const [userId, list] of lookupWindows) {
+    if (list.length === 0 || list.every((t) => now - t >= LOOKUP_WINDOW_MS)) lookupWindows.delete(userId);
+  }
+}
+
+/** Sliding one-minute window per user for family lookups. True = allowed (and counted). max 0 = unlimited. */
+function takeLookupSlot(userId: string, max: number, now: number): boolean {
+  if (++rateCallCount % RATE_SWEEP_EVERY === 0) sweepExpiredWindows(now);
+  if (max === 0) return true;
+  const recent = (lookupWindows.get(userId) ?? []).filter((t) => now - t < LOOKUP_WINDOW_MS);
+  if (recent.length >= max) {
+    if (recent.length === 0) lookupWindows.delete(userId);
+    else lookupWindows.set(userId, recent);
+    return false;
+  }
+  recent.push(now);
+  lookupWindows.set(userId, recent);
+  return true;
 }
 
 interface RateSlot { userId: string; at: number }
@@ -654,6 +693,13 @@ async function createBranch(
       initialState: {
         llmModel: resolved.model,
         archived: true,
+        // Computed here, never copied from the source: root = the source's root, or the source itself.
+        branchedFrom: {
+          sessionId: source.sessionId,
+          rootSessionId: familyRootOf(source),
+          messageIndex: req.messageIndex,
+          branchedAt: nowIso,
+        },
         ...(Array.isArray(source.associatedSkills) ? { associatedSkills: [...source.associatedSkills] } : {}),
       },
     });
@@ -693,5 +739,86 @@ async function createBranch(
     // A request that created nothing must not use up the user's allowance.
     if (slot && slot !== 'unlimited' && !createdId) refundRateSlot(slot);
     deps.release(input.sessionId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/agent-mode/session/:sessionId/branches: the chats of one family.
+// ---------------------------------------------------------------------------
+export const BRANCH_FAMILY_MAX_SESSIONS = 50;
+export const BRANCH_FAMILY_MAX_PAGES = 20;
+
+export interface BranchFamilyDeps {
+  isAcceptingWork(): boolean;
+  isFeatureEnabled(): Promise<boolean>;
+  getSession(sessionId: string): Promise<ChatSession | null>;
+  /** ONE UserIdIndex query walk (see ChatbotDB.getBranchFamilySessions). */
+  listBranches(userId: string, rootSessionId: string, opts: { maxBranches: number; maxPages: number }): Promise<{ branches: BranchFamilyMember[]; truncated: boolean }>;
+  /** Per-user lookups per minute (0 = unlimited). Optional: absent => the default. */
+  getMaxLookupsPerMinute?(): Promise<number>;
+  now?(): number;
+}
+
+const familyMember = (s: ChatSession): BranchFamilyMember => ({
+  sessionId: s.sessionId,
+  title: s.title,
+  llmModel: s.llmModel,
+  messageCount: s.messageCount ?? s.messages?.length ?? 0,
+  updatedAt: s.updatedAt,
+  createdAt: s.createdAt,
+  ...(s.branchedFrom ? { branchedFrom: s.branchedFrom } : {}),
+});
+
+/**
+ * Owner-only. The family root is the requested session's `branchedFrom.rootSessionId` (or itself); the answer is
+ * the root plus every non-archived session of the same owner whose `branchedFrom.rootSessionId` is that root,
+ * createdAt ascending, at most 50. Legacy branches made before `branchedFrom` existed carry only the row-0
+ * `branchOrigin` marker; finding them would mean reading message rows for every session, so they are NOT grouped.
+ */
+export async function listBranchFamily(deps: BranchFamilyDeps, input: { user: BranchUser; sessionId: string }): Promise<ServiceOutcome> {
+  try {
+    if (!deps.isAcceptingWork()) return { status: 503, body: { message: 'Instance draining — retry on new instance' } };
+    if (!(await deps.isFeatureEnabled())) return fail(404, 'Not found', 'chat_branching_disabled');
+    if (!isAcceptableSessionId(input.sessionId)) return fail(400, 'Invalid session id', 'invalid_session_id');
+
+    let maxPerMinute = DEFAULT_BRANCH_FAMILY_MAX_PER_MINUTE;
+    try {
+      const configured = await deps.getMaxLookupsPerMinute?.();
+      if (configured !== undefined && Number.isInteger(configured) && configured >= 0) maxPerMinute = configured;
+    } catch {
+      // a settings outage must not block reads: use the default
+    }
+    if (!takeLookupSlot(input.user.userId, maxPerMinute, (deps.now ?? Date.now)())) {
+      const message = 'Too many requests. Please try again in a moment.';
+      return fail(429, message, 'TOO_MANY_BRANCH_LOOKUPS', { message });
+    }
+
+    const requested = await deps.getSession(input.sessionId);
+    if (!requested) return fail(404, 'Session not found', 'session_not_found');
+    if (requested.userId !== input.user.userId) return fail(403, 'Unauthorized access to session', 'forbidden');
+    if (requested.archived === true) return fail(404, 'Session not found', 'session_not_found');
+
+    const rootSessionId = familyRootOf(requested);
+    const root = rootSessionId === requested.sessionId ? requested : await deps.getSession(rootSessionId);
+    const rootVisible = !!root && root.userId === input.user.userId && root.archived !== true;
+
+    const found = await deps.listBranches(input.user.userId, rootSessionId, {
+      maxBranches: BRANCH_FAMILY_MAX_SESSIONS - 1,
+      maxPages: BRANCH_FAMILY_MAX_PAGES,
+    });
+    const members = [...(rootVisible && root ? [familyMember(root)] : []), ...found.branches]
+      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
+    const capped = members.length > BRANCH_FAMILY_MAX_SESSIONS;
+    return {
+      status: 200,
+      body: {
+        rootSessionId,
+        sessions: members.slice(0, BRANCH_FAMILY_MAX_SESSIONS),
+        ...(found.truncated || capped ? { truncated: true } : {}),
+      },
+    };
+  } catch (error) {
+    console.error('ChatBranching: listing the branch family failed', { errorClass: (error as Error)?.name, message: String((error as Error)?.message ?? '').slice(0, 200) });
+    return fail(500, 'Failed to list branches', 'branches_failed');
   }
 }
