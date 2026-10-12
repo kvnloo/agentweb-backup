@@ -1,17 +1,18 @@
 /**
- * Approval requests on peer messaging channels (ENG-273).
+ * Approval requests on WhatsApp (ENG-273): the request, and the taps that answer it.
  *
- * Approvals began life as a Slack-only flow: an interactive message with Approve and
- * Reject buttons. WhatsApp cannot reproduce that — it has no Block Kit, and reply
- * buttons need a pre-approved interactive template plus inbound button handling, which
- * the registry deliberately does not have yet. So this is a NOTIFICATION, not a second
- * place to approve from: it tells the reviewer something is waiting and links them to
- * the asset. Approving still happens in Slack or the portal, which keeps exactly one
- * surface authoritative and avoids two half-implemented approval paths disagreeing.
+ * Slack and WhatsApp are separate features and a customer connects one of them. An
+ * approval reaches a WhatsApp customer as a message with Approve / Reject reply buttons
+ * while their 24-hour window is open (a service message, so no template), or as the
+ * approval template with a link when it is not. A tap comes back through the webhook and
+ * is recorded by `handleApprovalButtonTap`.
  *
- * Additive by construction. The Slack send and the approval record both happen before
- * this runs, and nothing here can change or fail either one — same contract as the
- * WhatsApp block in leadListAlertService.
+ * Unlike Slack, WhatsApp cannot remove or disable a button once a message is sent, so a
+ * tap has to be safe to repeat: the verdict is written with a single conditional update
+ * that only succeeds while the approval is still open (see approvalDb.answerIfOpen).
+ *
+ * Nothing here throws into its caller. A WhatsApp problem must never fail the approval
+ * request that triggered it, nor a webhook delivery that Meta would then retry.
  */
 import {
   bootstrapMessagingChannels,
@@ -31,6 +32,8 @@ import { settingsService } from './settingsService';
 export interface ApprovalChannelNotification {
   /** The customer account that owns the asset and is being asked to approve it. */
   userId: string;
+  /** The account's record, if the caller already loaded it — saves a second read. */
+  user?: unknown;
   /** Asset kind, e.g. "image" or "video" — becomes the template's {{1}}. */
   assetType: string;
   /** Human-readable asset name — the template's {{2}}. */
@@ -40,47 +43,72 @@ export interface ApprovalChannelNotification {
 }
 
 /**
- * Notify the requesting user's WhatsApp number, if they have connected and verified one.
- *
- * Never throws. Resolves true only when the message was actually handed to WhatsApp, so
- * the caller can tell "reached the reviewer here" from "nothing to send / send failed".
+ * What happened to a WhatsApp approval notice:
+ *  - delivered:      handed to WhatsApp.
+ *  - not_applicable: the account has no WhatsApp number to send to. Nothing went wrong.
+ *  - failed:         the account HAS a number and the send failed. Distinct from the
+ *                    above because the caller must not read it as "no channel": a
+ *                    customer who can be reached but was not must not have their
+ *                    approval gate quietly opened.
+ */
+export type WhatsAppNotifyOutcome = 'delivered' | 'not_applicable' | 'failed';
+
+const BODY_BUDGET = 1000; // interactive body limit is 1024; leave headroom
+
+/**
+ * The text of the approval message, shaped so the asset link is never cut off. A body
+ * that is simply truncated at the limit can slice the URL mid-way, which leaves a link
+ * that opens the wrong thing or nothing — worse than no link. The filename is capped
+ * first; if the URL alone still will not fit, the link is dropped and the customer is
+ * pointed at AgentWeb instead.
+ */
+export function approvalMessageText(assetType: string, filename: string, assetUrl: string): string {
+  const name = filename.length > 80 ? `${filename.slice(0, 79)}…` : filename;
+  const head = `${assetType} "${name}" is waiting for your approval.`;
+  const full = `${head} ${assetUrl}`;
+  return full.length <= BODY_BUDGET ? full : `${head} Open AgentWeb to review it.`;
+}
+
+/**
+ * Notify the owning account on WhatsApp, if it has connected and verified a number.
+ * Never throws.
  */
 export async function notifyApprovalOnWhatsApp(
   params: ApprovalChannelNotification,
-): Promise<boolean> {
+): Promise<WhatsAppNotifyOutcome> {
   try {
-    if (!params.userId) return false;
+    if (!params.userId) return 'not_applicable';
 
-    const { userDb } = await import('./db');
-    const user = await userDb.getUserById(params.userId);
-    if (!user) return false;
+    let user: any = params.user;
+    if (!user) {
+      const { userDb } = await import('./db');
+      user = await userDb.getUserById(params.userId);
+    }
+    if (!user) return 'not_applicable';
 
     // No Slack check here, deliberately. Slack and WhatsApp are separate features and a
-    // customer connects one of them — requiring a matching Slack channel (as an earlier
-    // version did) meant a WhatsApp-only customer could never be asked to approve
-    // anything. The recipient is the account that owns the asset, on a number that
-    // account personally verified; phone numbers are never inherited from an org, so
-    // this cannot reach anyone but that account's own handset.
+    // customer connects one of them. The recipient is the account that owns the asset,
+    // on a number that account personally verified; phone numbers are never inherited
+    // from an org, so this cannot reach anyone but that account's own handset.
     await bootstrapMessagingChannels();
-    const destination = await resolveDestination(user as any, 'whatsapp');
-    if (!destination) return false;
+    const destination = await resolveDestination(user, 'whatsapp');
+    if (!destination) return 'not_applicable';
 
     const assetType = params.assetType || 'Asset';
     const filename = params.filename || 'Untitled';
-    const summary = `${assetType} "${filename}" is waiting for your approval. ${params.assetUrl}`;
+    const summary = approvalMessageText(assetType, filename, params.assetUrl);
 
     // Two shapes, chosen by the window, because Meta allows very different things
     // either side of it.
     //
-    // INSIDE: real Approve/Reject buttons. Interactive messages are service messages,
-    // so they need no pre-approved template — which also means this path is testable
-    // the moment a customer has written to us, with no Meta review in the loop.
+    // INSIDE: real Approve/Reject buttons. Interactive messages are service messages, so
+    // they need no pre-approved template.
     //
-    // OUTSIDE: only a template can be delivered at all, so the reviewer gets the text
-    // and a link and answers in Slack or the portal. Putting quick-reply buttons on the
-    // template would work, but Meta returns a template button's own LABEL rather than
-    // an id, and more than three buttons (or mixing button types) breaks WhatsApp
-    // Desktop — so that variant is worth its own change, not a silent upgrade here.
+    // OUTSIDE: only a template can be delivered at all, so the customer gets the text and
+    // a link and answers in the portal. Quick-reply buttons on the template would work,
+    // but Meta returns a template button's own LABEL rather than an id, and four or more
+    // buttons (or mixing button types) cannot be viewed on WhatsApp Desktop — so that
+    // variant is its own change, not a silent upgrade here.
     const sent = (await isServiceWindowOpen(destination))
       ? await sendInteractiveButtons(destination, summary, [
           { id: 'approve', title: 'Approve' },
@@ -105,7 +133,7 @@ export async function notifyApprovalOnWhatsApp(
         userId: params.userId,
       });
     }
-    return true;
+    return 'delivered';
   } catch (error) {
     // Logged against the user id, never the phone number (CWE-532): the id is enough
     // to correlate this with the approval it belongs to.
@@ -113,7 +141,7 @@ export async function notifyApprovalOnWhatsApp(
       `[approval-notify] WhatsApp approval notice for user ${params.userId} failed:`,
       error instanceof Error ? error.message : error,
     );
-    return false;
+    return 'failed';
   }
 }
 
@@ -179,38 +207,48 @@ const VERDICTS: Record<string, 'approved' | 'rejected'> = {
   rejected: 'rejected',
 };
 
-const claimKey = (assetUrl: string) => `whatsapp:approval-claim:${assetUrl}`;
-
 /**
- * WhatsApp cannot lock or remove buttons once a message is sent — the client greys out
- * only the one that was tapped, and the other stays live forever. So the answer to a
- * later tap has to do the locking in words: say what was recorded and that it is final.
+ * What to say to a tap that arrives after the approval was already answered. WhatsApp
+ * greys out only the button that was tapped, so the other one stays live forever — the
+ * reply has to do in words the locking the client will not do.
  */
-function alreadyAnsweredReply(status?: string): string {
-  if (status === 'approved') {
+function alreadyAnsweredReply(current: string | null): string {
+  if (current === 'approved') {
     return 'This was already approved, so the buttons no longer do anything. Nothing has changed.';
   }
-  if (status === 'rejected') {
+  if (current === 'rejected') {
     return 'This was already rejected, so the buttons no longer do anything. Nothing has changed.';
+  }
+  if (current === 'revision_submitted') {
+    return 'A revision of this has already been requested, so the buttons no longer do anything. Nothing has changed.';
+  }
+  if (current === null) {
+    return 'This approval request is no longer available, so nothing was changed.';
   }
   return 'This one is already answered, so the buttons no longer do anything. Nothing has changed.';
 }
 
+const COULD_NOT_RECORD =
+  "Sorry, we couldn't record that just now. Please tap the button again in a moment.";
+
 /**
  * Record an approval verdict tapped on WhatsApp.
  *
- * Idempotency is not optional here, and this is the part that differs sharply from
- * Slack. Slack strips an approval's buttons the moment it is answered, so a second
- * click is impossible. WhatsApp has no edit operation: the buttons stay on the
- * customer's screen forever, and every tap arrives as a fresh inbound message. Since
- * approving fans out email to every task subscriber, an un-claimed handler would turn
- * an idle double-tap into duplicate mail. The claim is taken BEFORE the status write
- * so a repeat loses the race rather than re-running the work.
+ * Idempotency is the whole point of this function. The buttons can never be removed, so
+ * every tap — a double tap, a tap on the other button, a tap a week later — arrives as a
+ * fresh message, and the customer may also have answered on another surface. Approving
+ * emails the task's subscribers, so a handler that could run twice would send that twice.
  *
- * Attribution is checked, not assumed: the tapping number must resolve to the very
- * user the approval belongs to. A number that has since moved accounts, or simply
- * isn't this approval's owner, is ignored rather than allowed to answer someone
- * else's decision.
+ * The verdict is therefore written by one atomic conditional update that succeeds only
+ * while the approval is still open. Exactly one tap can win it; the subscriber email is
+ * sent only by the winner. An earlier version took a separate claim row first, which
+ * guarded only WhatsApp taps (the portal and Slack write the same status), never expired,
+ * and survived a re-requested approval so its buttons answered "already done" while the
+ * record said pending.
+ *
+ * Attribution is checked, not assumed: the tapping number must resolve to the user the
+ * approval belongs to. A number that has moved accounts, or simply is not this approval's
+ * owner, is ignored rather than allowed to answer someone else's decision.
  */
 export async function handleApprovalButtonTap(params: {
   phone: string;
@@ -238,54 +276,45 @@ export async function handleApprovalButtonTap(params: {
       return;
     }
 
-    const { settingsService: settings } = await import('./settingsService');
-    const claimed = await settings.claimSetMember(claimKey(ref.assetUrl), 'answered');
-    if (!claimed) {
-      // Already answered. Say so rather than going quiet: with no way to grey the
-      // button out, silence is indistinguishable from a failure.
-      let recorded: string | undefined;
-      try {
-        const { approvalDb } = await import('./approvalDb');
-        recorded = (await approvalDb.getApproval(ref.assetUrl))?.status;
-      } catch {
-        // The generic wording is fine if the record cannot be read.
-      }
-      await sendText(params.phone, alreadyAnsweredReply(recorded)).catch(() => {});
+    const { approvalDb } = await import('./approvalDb');
+    let outcome;
+    try {
+      outcome = await approvalDb.answerIfOpen(ref.assetUrl, verdict, `whatsapp:${ref.userId}`);
+    } catch (error) {
+      // A real failure, not "already answered". Say so rather than staying silent: with
+      // no visible state on a WhatsApp button, silence reads as success.
+      console.error(
+        '[approval-notify] could not record an approval tap:',
+        error instanceof Error ? error.message : error,
+      );
+      await sendText(params.phone, COULD_NOT_RECORD).catch(() => {});
       return;
     }
 
-    let recordedApproval: { executionId?: string } | null = null;
-    try {
-      const { approvalDb } = await import('./approvalDb');
-      recordedApproval = await approvalDb.updateApprovalStatus(
-        ref.assetUrl,
-        verdict,
-        `whatsapp:${ref.userId}`,
-      );
-    } catch (error) {
-      // Release so the customer can retry; a consumed claim with no recorded verdict
-      // would leave the approval permanently unanswerable from WhatsApp.
-      await settings.releaseSetMember(claimKey(ref.assetUrl), 'answered').catch(() => {});
-      throw error;
+    if (!outcome.answered) {
+      await sendText(params.phone, alreadyAnsweredReply(outcome.current)).catch(() => {});
+      return;
     }
 
     if (verdict === 'approved') {
-      // Same consequence as approving on Slack: the task's subscribers are emailed.
-      // Safe to run here because the claim above guarantees it happens once per
-      // approval, however many times the button is tapped. Never throws.
+      // Same consequence as approving on Slack: the task's subscribers are emailed. Only
+      // the tap that won the conditional write reaches here, so this runs once per
+      // approval however many times the button is tapped. Never throws.
       const { notifySubscribersOfApproval } = await import('./approvalSubscriberNotify');
-      await notifySubscribersOfApproval(recordedApproval);
+      await notifySubscribersOfApproval(outcome.approval);
     }
 
     await sendText(
       params.phone,
-      verdict === 'approved' ? 'Approved — thanks, that is recorded.' : 'Rejected — thanks, that is recorded.',
+      verdict === 'approved'
+        ? 'Approved — thanks, that is recorded.'
+        : 'Rejected — thanks, that is recorded.',
     ).catch((e) =>
       console.warn('[approval-notify] verdict confirmation failed to send:', e?.message || e),
     );
   } catch (error) {
-    // Never throw into the webhook: a 500 makes Meta retry, and a retried tap would
-    // hit the claim and be reported to the customer as "already recorded".
+    // Never throw into the webhook: a 500 makes Meta retry, and a retried tap would then
+    // be told the approval is already answered — a confusing reply to a tap that failed.
     console.error(
       '[approval-notify] handling an approval button tap failed:',
       error instanceof Error ? error.message : error,

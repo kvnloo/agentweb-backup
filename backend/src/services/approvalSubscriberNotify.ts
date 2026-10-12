@@ -1,10 +1,11 @@
 /**
  * Emailing a task's subscribers when its asset is approved.
  *
- * Lifted verbatim out of the Slack `approve_asset` handler (ENG-273) so that an approval
- * given on WhatsApp has the same consequence as one given on Slack. It used to live
- * inline in routes/slack.ts, which made "approved" mean two different things depending
- * on which button was pressed.
+ * Moved out of the Slack `approve_asset` handler (ENG-273) so that an approval given on
+ * WhatsApp has the same consequence as one given on Slack. It used to live inline in
+ * routes/slack.ts, which made "approved" mean two different things depending on which
+ * button was pressed. The logic, log lines and limits are unchanged; only the parameter
+ * is now typed on its own rather than read off the surrounding handler.
  *
  * Never throws: an approval that has been recorded must not be failed by a mail problem.
  */

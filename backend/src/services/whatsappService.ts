@@ -218,7 +218,20 @@ export async function bindPhoneToUser(phone: string, userId: string): Promise<vo
   );
 }
 
-export async function unbindPhone(phone: string): Promise<void> {
+/**
+ * Remove the phone -> user row.
+ *
+ * With `onlyIfUserId`, the row is removed only if it still points at that account. One
+ * number can have been re-bound to a different account since the caller last looked, and
+ * an unconditional delete from the old account's disconnect would silently break the new
+ * owner's inbound taps. (Read-then-delete, not atomic; the window is a pair of writes by
+ * different people on the same number, and the index re-validates itself on every read.)
+ */
+export async function unbindPhone(phone: string, onlyIfUserId?: string): Promise<void> {
+  if (onlyIfUserId) {
+    const row = await settingsService.getSetting(phoneUserKey(phone));
+    if (row?.settingValue !== onlyIfUserId) return;
+  }
   await settingsService.deleteSetting(phoneUserKey(phone));
 }
 
@@ -254,7 +267,7 @@ export async function resolveUserIdByPhone(phone: string): Promise<string | null
     console.warn(
       `[whatsapp] stale phone->user row for ${redactPhone(phone)} — clearing`,
     );
-    await unbindPhone(phone).catch(() => {});
+    await unbindPhone(phone, userId).catch(() => {});
     return null;
   }
   return userId;

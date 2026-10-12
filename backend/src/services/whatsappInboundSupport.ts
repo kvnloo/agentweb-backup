@@ -48,6 +48,43 @@ export async function supportInbox(): Promise<string | null> {
   return process.env.NODE_ENV === 'production' ? 'founders@agentweb.pro' : null;
 }
 
+/**
+ * Forwards per number per hour. Every non-command message becomes an email, so without a
+ * cap one number can fill the team's inbox. The greeting already has a cooldown; this is
+ * the same idea for the forward. Generous, because a real customer describing a problem
+ * can send many short lines, and past it the messages are dropped from the inbox (they
+ * are still in the customer's WhatsApp thread).
+ */
+const FORWARDS_PER_HOUR = 20;
+const forwardCountKey = (phone: string) =>
+  `whatsapp:forwards:${phone}:${new Date().toISOString().slice(0, 13)}`;
+
+/**
+ * Count this forward against the number's hourly allowance. A read-then-write, so two
+ * simultaneous messages can both pass at the boundary and the cap can be exceeded by a
+ * message or two — acceptable for an abuse limit. Fails OPEN: a fault in the limiter must
+ * never cost a customer their message.
+ */
+async function withinForwardLimit(phone: string): Promise<boolean> {
+  try {
+    const key = forwardCountKey(phone);
+    const row = await settingsService.getSetting(key);
+    const used = Number.parseInt(row?.settingValue ?? '0', 10) || 0;
+    if (used >= FORWARDS_PER_HOUR) return false;
+    await settingsService.setSetting(
+      key,
+      String(used + 1),
+      'WhatsApp support forwards this hour',
+      'system',
+      // Epoch SECONDS, and past the hour the key names so it cannot expire mid-window.
+      Math.floor(Date.now() / 1000) + 2 * 60 * 60,
+    );
+    return true;
+  } catch {
+    return true;
+  }
+}
+
 const escapeHtml = (s: string) =>
   s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
@@ -74,6 +111,13 @@ async function forwardToTeam(phone: string, text: string, messageType: string): 
   const inbox = await supportInbox();
   if (!inbox) return;
 
+  if (!(await withinForwardLimit(phone))) {
+    console.warn(
+      `[whatsapp-support] ${redactPhone(phone)} exceeded ${FORWARDS_PER_HOUR} forwarded messages this hour — not forwarding`,
+    );
+    return;
+  }
+
   let account = 'not a connected AgentWeb number';
   try {
     const userId = await resolveUserIdByPhone(phone);
@@ -88,7 +132,9 @@ async function forwardToTeam(phone: string, text: string, messageType: string): 
 
   const body = text.trim() || `[${messageType} message — no text]`;
   const { emailService } = await import('./emailService');
-  await emailService.sendEmail(
+  // sendEmail is best-effort and never throws: it RETURNS 'failed'. Catching around it, as
+  // an earlier version did, meant a failed forward was completely silent.
+  const outcome = await emailService.sendEmail(
     inbox,
     // Masked in the SUBJECT, full in the body. Subjects are logged by the mail layer
     // (the non-prod guard prints every suppressed one), and a customer's phone number
@@ -99,6 +145,14 @@ async function forwardToTeam(phone: string, text: string, messageType: string): 
     `<p><strong>From:</strong> ${escapeHtml(phone)}<br><strong>Account:</strong> ${escapeHtml(account)}</p>` +
       `<blockquote>${escapeHtml(body).replace(/\n/g, '<br>')}</blockquote>`,
   );
+
+  if (outcome === 'failed') {
+    // The customer has been told the team will get back to them, so a lost forward is not
+    // a quiet event. Redacted: the log must not carry the number (CWE-532).
+    console.error(
+      `[whatsapp-support] could not forward a message from ${redactPhone(phone)} to the support inbox`,
+    );
+  }
 }
 
 /**

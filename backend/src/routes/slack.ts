@@ -30,7 +30,7 @@ import {
 } from "../services/approvalInboxSlack";
 import { approvalInboxService } from "../services/approvalInboxService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
-import { taskDb, subscriberDb } from "../services/db";
+import { taskDb } from "../services/db";
 import { emailService } from "../services/emailService";
 import { notifySubscribersOfApproval } from "../services/approvalSubscriberNotify";
 import { hasWhatsApp } from "../services/customerChannelPolicy";

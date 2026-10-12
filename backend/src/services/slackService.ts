@@ -1583,6 +1583,11 @@ export function getUserAllowedChannels(user: { slackChannels?: string[]; slackCh
 export async function getEffectiveAllowedChannels(
   user: { slackChannels?: string[]; slackChannel?: string; orgId?: string } | null | undefined,
 ): Promise<string[]> {
+  // One platform per customer (ENG-273): an account on WhatsApp has no Slack channels, so
+  // none of Emma's Slack tools may reach one on its behalf — own or inherited.
+  const { hasVerifiedWhatsApp } = await import('./messagingChannelService');
+  if (hasVerifiedWhatsApp(user as any)) return [];
+
   const { userDb, orgDb } = await import('./db');
   const personal = getUserAllowedChannels(user ?? {});
   if (personal.length > 0) return personal;

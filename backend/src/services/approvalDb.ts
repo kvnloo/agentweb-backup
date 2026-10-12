@@ -165,6 +165,62 @@ export class ApprovalDB {
   /**
    * Get approval by asset URL
    */
+  /**
+   * Record a verdict only if the approval is still open, atomically (ENG-273).
+   *
+   * `updateApprovalStatus` is an unconditional SET: it will overwrite any status, and it
+   * upserts — a row that does not exist is created as a stub holding only the verdict.
+   * That is tolerable behind Slack, where answering strips the buttons so nothing is left
+   * to click. WhatsApp cannot remove buttons: every tap, however late, arrives as a fresh
+   * message, and the customer may also have answered on another surface. So the check and
+   * the write have to be one operation, or two taps (or a tap and a portal click) can
+   * each pass a separate check and both write.
+   *
+   * "Open" is pending or needs_changes — Slack deliberately keeps its buttons live after
+   * "Request changes" so a reviewer can still approve later, and that transition is
+   * legitimate. Anything else (approved, rejected, revision_submitted) is final here.
+   *
+   * Never creates a row: a verdict for an approval that does not exist is refused.
+   */
+  async answerIfOpen(
+    assetUrl: string,
+    status: 'approved' | 'rejected',
+    reviewedBy: string,
+  ): Promise<
+    | { answered: true; approval: AssetApproval }
+    | { answered: false; current: AssetApproval['status'] | null }
+  > {
+    try {
+      const result = await dynamodb
+        .update({
+          TableName: ASSET_APPROVALS_TABLE,
+          Key: { assetUrl },
+          UpdateExpression: 'SET #status = :status, reviewedBy = :reviewedBy, updatedAt = :updatedAt',
+          ConditionExpression:
+            'attribute_exists(assetUrl) AND (#status = :pending OR #status = :needsChanges)',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: {
+            ':status': status,
+            ':reviewedBy': reviewedBy,
+            ':updatedAt': new Date().toISOString(),
+            ':pending': 'pending',
+            ':needsChanges': 'needs_changes',
+          },
+          ReturnValues: 'ALL_NEW',
+        })
+        .promise();
+      return { answered: true, approval: result.Attributes as AssetApproval };
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') {
+        // Report what stands, so the caller can say it rather than guess.
+        const existing = await this.getApproval(assetUrl).catch(() => null);
+        return { answered: false, current: existing?.status ?? null };
+      }
+      console.error('❌ Error answering approval:', error);
+      throw new Error('Failed to answer approval');
+    }
+  }
+
   async getApproval(assetUrl: string): Promise<AssetApproval | null> {
     const params = {
       TableName: ASSET_APPROVALS_TABLE,

@@ -9,7 +9,11 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { getAssetTypeFromFilename } from '../services/approvalDb';
-import { requestApproval, ApprovalNotDeliveredError } from '../services/approvalRequestService';
+import {
+  requestApproval,
+  ApprovalDeliveryFailedError,
+  ApprovalNotDeliveredError,
+} from '../services/approvalRequestService';
 
 const router = express.Router();
 
@@ -45,6 +49,12 @@ router.post('/', authenticateToken, async (req: any, res: any) => {
       // Not a server fault: the account simply has nowhere to be asked. The task engine
       // relies on telling this apart from a 500 to fall back to its no-approval path.
       return res.status(409).json({ success: false, error: error.message, code: 'no_channel' });
+    }
+    if (error instanceof ApprovalDeliveryFailedError) {
+      // The account HAS a channel and the send failed. A different answer from no_channel,
+      // on purpose: the task engine treats no_channel as "nobody to ask" and carries on,
+      // but a customer who can be reached and was not must have their output held.
+      return res.status(502).json({ success: false, error: error.message, code: 'delivery_failed' });
     }
     console.error('[approval-requests] failed:', error?.message || error);
     res.status(500).json({ success: false, error: 'Failed to send approval request' });

@@ -36,11 +36,12 @@ import crypto from 'crypto';
 import { settingsService } from './settingsService';
 import { userDb } from './db';
 import { explicitChannels, type UserMessagingChannelConfig } from './messagingChannelService';
-import { hasSlack } from './customerChannelPolicy';
+import { hasOwnSlack } from './customerChannelPolicy';
 import {
   bindPhoneToUser,
   isOptedOut,
   redactPhone,
+  resolveUserIdByPhone,
   sendMessage,
   toE164,
   unbindPhone,
@@ -191,6 +192,8 @@ export type VerificationOutcome =
   | 'opted_out'
   /** The account connected Slack after this code was issued; one platform per customer. */
   | 'other_platform'
+  /** This number is already connected to a different account; one number, one account. */
+  | 'number_in_use'
   | 'rate_limited';
 
 async function failureCount(phone: string): Promise<number> {
@@ -240,7 +243,7 @@ async function saveVerifiedChannel(row: VerificationRow, phone: string): Promise
     if (previousPhone && previousPhone !== phone) {
       // The user replaced their number. Without this, the old number keeps resolving to
       // them and could answer their approvals.
-      await unbindPhone(previousPhone);
+      await unbindPhone(previousPhone, row.userId);
     }
     await bindPhoneToUser(phone, row.userId);
   } catch (e: any) {
@@ -280,6 +283,21 @@ export async function completeVerification(rawCode: string, sender: string): Pro
   // Someone else already holds this claim; only the same number may resume it.
   if (row.status === 'claimed' && row.phone !== phone) return recordFailure(phone);
 
+  // Refusals that depend on the account, decided BEFORE the code is claimed. Claiming
+  // first left a refused code stuck in "claimed" — it could not be retried, and the
+  // portal kept polling a verification that would never finish.
+  //
+  // One platform per customer, re-checked here because the portal only checks when the
+  // code is issued and a Slack channel can be assigned in the ten minutes it stays live.
+  const account = await userDb.getUserById(row.userId);
+  if (account && hasOwnSlack(account)) return 'other_platform';
+
+  // One number, one account. Two accounts holding the same number would leave the
+  // phone -> user lookup pointing at only one of them, so the other's taps would be
+  // ignored while its sends kept going to the same handset.
+  const holder = await resolveUserIdByPhone(phone);
+  if (holder && holder !== row.userId) return 'number_in_use';
+
   if (row.status !== 'claimed') {
     // A STOPped number is not connected by messaging us — it must send START first.
     // (We cannot even reply to it: sends to an opted-out number are refused.) Recorded
@@ -314,12 +332,6 @@ export async function completeVerification(rawCode: string, sender: string): Pro
 
   // We hold the claim (fresh, or resumed after a crash). Save the channel, THEN mark the
   // code verified — so a failure in between is retried rather than lost.
-  // One platform per customer, re-checked at the moment of binding: the portal checks
-  // when the code is issued, but a Slack channel can be assigned in the ten minutes the
-  // code stays live.
-  const account = await userDb.getUserById(row.userId);
-  if (account && (await hasSlack(account))) return 'other_platform';
-
   if (!(await saveVerifiedChannel(row, phone))) return 'invalid';
 
   const verifiedAt = new Date().toISOString();
@@ -345,6 +357,9 @@ const REPLIES: Partial<Record<VerificationOutcome, string>> = {
   other_platform:
     'This AgentWeb account is already connected to Slack. An account can use one messaging ' +
     'platform, so this number was not connected.',
+  number_in_use:
+    'This number is already connected to a different AgentWeb account, so it was not ' +
+    'connected here. Disconnect it from that account first, or use a different number.',
   invalid:
     "That verification code isn't valid or has expired. " +
     'Start again from AgentWeb Settings → Notifications to get a new one.',
@@ -410,7 +425,7 @@ export async function disconnectWhatsApp(
 
   if (removed) {
     try {
-      await unbindPhone(removed);
+      await unbindPhone(removed, userId);
     } catch (e: any) {
       console.warn('[whatsapp] could not clear phone index on disconnect:', e?.message || e);
     }

@@ -2,17 +2,27 @@
  * One messaging platform per customer (ENG-273).
  *
  * A customer is onboarded on Slack OR on WhatsApp — never both. The two are separate
- * features, and running both for one account means every notification and every
- * approval arrives twice, in two places that cannot see each other's answers.
+ * features, and running both for one account means every notification and every approval
+ * arrives twice, in two places that cannot see each other's answers.
  *
- * This file is the single definition of "which platform is this customer on". Every
- * path that connects a customer to a platform asks it first:
+ * This file is the single definition of "which platform is this customer on". Every path
+ * that connects a customer to a platform asks it first, and the screens that display the
+ * platform read the same answer, so what is shown can never disagree with what is allowed:
  *
- *   Slack     — admin assigns a channel, the `link this channel` command, Slack Connect
- *               provisioning at onboarding, or membership of an org that has a channel
+ *   Slack     — an admin assigns a channel, or the `link this channel` command
  *   WhatsApp  — the customer verifies a number
  *
- * Fails toward refusing a second connection, not toward allowing it.
+ * What counts, and what deliberately does not:
+ *  - A WhatsApp number counts only once the customer has proven they control it.
+ *  - Slack counts when the account has a channel OF ITS OWN (assigned, linked, or the
+ *    deprecated single field).
+ *  - An organisation's shared Slack channel is a default the account inherits, not a
+ *    choice it made. It is reported as Slack, but it does NOT stop the account connecting
+ *    WhatsApp: a verified number wins over an inherited channel in `resolveDestination`,
+ *    so refusing would only trap someone in a platform they never picked — with no
+ *    control anywhere to disconnect an organisation's channel from one member.
+ *  - A Slack Connect channel provisioned at onboarding is a support room for talking to
+ *    the team. Nothing delivers notifications to it, so it is not a platform at all.
  */
 import {
   hasVerifiedWhatsApp,
@@ -39,7 +49,7 @@ export class PlatformConflictError extends Error {
 }
 
 /** How the customer came to be on their platform — shown to admins. */
-export type PlatformSource = 'account' | 'organisation' | 'slack_connect';
+export type PlatformSource = 'account' | 'organisation';
 
 export interface PlatformSummary {
   platform: CustomerPlatform | null;
@@ -51,8 +61,11 @@ export interface PlatformSummary {
 const NONE: PlatformSummary = { platform: null, source: null, whatsappNumberMasked: null };
 
 /** A WhatsApp number counts only once the customer has proven they control it. */
-export function hasWhatsApp(user: any): boolean {
-  return hasVerifiedWhatsApp(user);
+export const hasWhatsApp = hasVerifiedWhatsApp;
+
+/** A Slack channel the account has of its own — assigned, linked, or the deprecated field. */
+export function hasOwnSlack(user: any): boolean {
+  return normalizeUserChannels(user).some((c) => c.channel === 'slack' && c.enabled);
 }
 
 function maskNumber(phone: string): string {
@@ -63,11 +76,12 @@ function maskNumber(phone: string): string {
 /**
  * The single answer to "which platform is this customer on, and why".
  *
- * Enforcement (assertCanConnect) and display (the admin list, the customer's Settings)
- * both read this, so what a screen shows can never disagree with what the rule allows.
- * Derived from the connection records every time rather than stored as its own field:
- * a stored "platform" would be a second copy of the truth, free to drift the first time
- * a channel was assigned or removed by a path that forgot to update it.
+ * Derived from the connection records every time rather than stored as its own field: a
+ * stored "platform" would be a second copy of the truth, free to drift the first time a
+ * channel was assigned or removed by a path that forgot to update it.
+ *
+ * WhatsApp is checked first because it is the platform that wins when two are present —
+ * the same order `resolveDestination` applies when it decides where to deliver.
  *
  * `orgSlackCache` lets a caller listing many accounts resolve each organisation once.
  */
@@ -88,12 +102,7 @@ export async function getPlatformSummary(
     };
   }
 
-  if (normalizeUserChannels(user).some((c) => c.channel === 'slack' && c.enabled)) {
-    return { platform: 'slack', source: 'account', whatsappNumberMasked: null };
-  }
-  if (user.slackConnectChannelId && user.slackConnectStatus === 'created') {
-    return { platform: 'slack', source: 'slack_connect', whatsappNumberMasked: null };
-  }
+  if (hasOwnSlack(user)) return { platform: 'slack', source: 'account', whatsappNumberMasked: null };
 
   if (user.orgId) {
     // Ask the real resolver, with only the org on the record, whether membership alone
@@ -110,32 +119,15 @@ export async function getPlatformSummary(
   return NONE;
 }
 
-/** Slack in any form: assigned or linked, inherited from the org, or Slack Connect. */
-export async function hasSlack(user: any): Promise<boolean> {
-  if (!user) return false;
-  // Judged as if the WhatsApp entry were absent: this is asked precisely when deciding
-  // whether WhatsApp may be connected, and a number already on the record must not hide
-  // the Slack connection it would conflict with.
-  const withoutWhatsApp = {
-    ...user,
-    messagingChannels: (Array.isArray(user.messagingChannels) ? user.messagingChannels : []).filter(
-      (c: any) => c?.channel !== 'whatsapp',
-    ),
-  };
-  return (await getPlatformSummary(withoutWhatsApp)).platform === 'slack';
-}
-
-/** The platform this customer is on, or null if they have not connected either. */
-export async function getConnectedPlatform(user: any): Promise<CustomerPlatform | null> {
-  return (await getPlatformSummary(user)).platform;
-}
-
 /**
  * Throws PlatformConflictError if connecting `requested` would put the customer on two
  * platforms. Re-connecting the platform they are already on is always allowed.
  */
 export async function assertCanConnect(user: any, requested: CustomerPlatform): Promise<void> {
-  const other: CustomerPlatform = requested === 'slack' ? 'whatsapp' : 'slack';
-  const onOther = other === 'whatsapp' ? hasWhatsApp(user) : await hasSlack(user);
-  if (onOther) throw new PlatformConflictError(other, requested);
+  if (requested === 'whatsapp' && hasOwnSlack(user)) {
+    throw new PlatformConflictError('slack', 'whatsapp');
+  }
+  if (requested === 'slack' && hasWhatsApp(user)) {
+    throw new PlatformConflictError('whatsapp', 'slack');
+  }
 }
