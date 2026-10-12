@@ -130,7 +130,18 @@ export interface DagNode {
  */
 export interface OrchestratorDeps {
   getUser: (userId: string) => Promise<OrchestratorUser | null>;
-  updateUserSteps: (userId: string, steps: UserSteps) => Promise<void>;
+  /**
+   * Persist the whole `steps` map. With `expected`, the write is a
+   * compare-and-swap: it must only apply while the stored map is still exactly
+   * `expected` (`null` = no map stored yet), and otherwise reject with
+   * `code: "ConditionalCheckFailedException"`. `reconcile` claims a step that way
+   * so two passes (here, or on another backend instance) cannot both start it.
+   */
+  updateUserSteps: (
+    userId: string,
+    steps: UserSteps,
+    expected?: { steps: UserSteps | null },
+  ) => Promise<void>;
   /**
    * Optional override for the canonical DAG. Tests pass a synthetic DAG
    * to exercise topo-sort + dependency gating without invoking real
@@ -447,6 +458,8 @@ export function _resetRateLimitState(): void {
 // Orchestrator
 // ──────────────────────────────────────────────────────────────────────
 
+const MAX_CLAIM_ATTEMPTS = 4;
+
 export class OnboardingPipelineOrchestrator {
   private readonly deps: Required<OrchestratorDeps>;
 
@@ -506,10 +519,13 @@ export class OnboardingPipelineOrchestrator {
     // Mutable copy of the user's step state so subsequent steps in this
     // pass see updates from earlier ones in the same reconcile() call.
     let workingSteps: UserSteps = { ...(user.steps ?? {}) };
-    const workingUser: OrchestratorUser = { ...user, steps: workingSteps };
+    let workingUser: OrchestratorUser = { ...user, steps: workingSteps };
+    // The map as stored, as of our last read or write of it: what a claim must
+    // still find in place.
+    let persisted: UserSteps | undefined = user.steps;
 
     for (const step of order) {
-      const decision = shouldFire(
+      let decision = shouldFire(
         step,
         workingUser,
         this.deps.dag,
@@ -520,23 +536,61 @@ export class OnboardingPipelineOrchestrator {
         continue;
       }
       const node = this.deps.dag[step];
-      const inputs = node.gatherInputs(workingUser);
-      const inputsHash = decision.inputsHash;
 
-      const prev = workingSteps[step];
-      const generation = (prev?.generation ?? 0) + 1;
-
-      const startRecord: StepRecord<unknown> = {
-        output: prev?.output ?? null,
-        inputsHash,
-        generation,
-        provenance: prev?.provenance ?? "anticipated",
-        status: "running",
-        ranAt: this.deps.now(),
-      };
-      workingSteps = { ...workingSteps, [step]: startRecord };
-      workingUser.steps = workingSteps;
-      await this.deps.updateUserSteps(userId, workingSteps);
+      // Claim the step. Another pass may have read the same state and decided to
+      // fire it too; the claim is a compare-and-swap on the stored map, so only
+      // one of us starts it. A pass that loses re-reads and re-decides: usually
+      // the step is now running with these exact inputs and there is nothing
+      // left to do, but a conflict caused by an unrelated step's write must not
+      // leave THIS step unfired, so the decision is made again, not assumed.
+      let claimed: {
+        inputs: unknown;
+        inputsHash: string;
+        generation: number;
+        prev: StepRecord<unknown> | undefined;
+      } | null = null;
+      for (let attempt = 0; attempt < MAX_CLAIM_ATTEMPTS && !claimed; attempt++) {
+        if (attempt > 0) {
+          const latest = await this.deps.getUser(userId);
+          if (!latest) break;
+          persisted = latest.steps;
+          workingSteps = { ...(latest.steps ?? {}) };
+          workingUser = { ...latest, steps: workingSteps };
+          decision = shouldFire(step, workingUser, this.deps.dag, this.deps.hash);
+          if (!decision.fire) break;
+        }
+        if (!decision.fire) break;
+        const inputs = node.gatherInputs(workingUser);
+        const prev = workingSteps[step];
+        const generation = (prev?.generation ?? 0) + 1;
+        const startRecord: StepRecord<unknown> = {
+          output: prev?.output ?? null,
+          inputsHash: decision.inputsHash,
+          generation,
+          provenance: prev?.provenance ?? "anticipated",
+          status: "running",
+          ranAt: this.deps.now(),
+        };
+        const next = { ...workingSteps, [step]: startRecord };
+        try {
+          await this.deps.updateUserSteps(userId, next, { steps: persisted ?? null });
+        } catch (err) {
+          if ((err as { code?: string })?.code === "ConditionalCheckFailedException") continue;
+          throw err;
+        }
+        workingSteps = next;
+        workingUser.steps = workingSteps;
+        persisted = next;
+        claimed = { inputs, inputsHash: decision.inputsHash, generation, prev };
+      }
+      if (!claimed) {
+        report.skipped.push({
+          step,
+          reason: decision.fire ? "claim kept losing to concurrent writes" : "claimed by another pass",
+        });
+        continue;
+      }
+      const { inputs, inputsHash, generation, prev } = claimed;
 
       try {
         const output = await node.runner({
@@ -574,6 +628,7 @@ export class OnboardingPipelineOrchestrator {
         };
         workingUser.steps = workingSteps;
         await this.deps.updateUserSteps(userId, workingSteps);
+        persisted = workingSteps;
         report.fired.push({ step, generation, status: "ready" });
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
@@ -589,6 +644,7 @@ export class OnboardingPipelineOrchestrator {
         workingSteps = { ...workingSteps, [step]: failedRecord };
         workingUser.steps = workingSteps;
         await this.deps.updateUserSteps(userId, workingSteps);
+        persisted = workingSteps;
         report.fired.push({ step, generation, status: "failed", reason });
         // On failure, downstream steps will be gated by the
         // upstream-not-ready check above; no need to break out of the
