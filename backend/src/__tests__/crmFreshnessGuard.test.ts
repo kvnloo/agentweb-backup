@@ -1052,3 +1052,48 @@ describe('"combined count of N leads" phrasing (ENG-2263, seen from a scheduled 
     expect(detectCrmFreshnessMismatch('The campaign reached a combined count of 12,746 leads from three sources.', calls, fresh()).findings).toEqual([]);
   });
 });
+
+describe('a REAL time-limit partial persists no evidence, so a "continue" after it abstains on totals (ENG-2263)', () => {
+  const calls = [ok('get_lead_lists')];
+  const fresh = () => {
+    const c = createCrmEvidenceCollector();
+    c.record('get_lead_lists', { success: true, totalLists: 97, lists: [{ listId: 'a', leadCount: 15400 }, ...Array.from({ length: 96 }, (_, i) => ({ listId: 'l' + i, leadCount: 1 }))] });
+    return c.snapshot();
+  };
+  const marker = (extra: any = {}) => ({ role: 'assistant', content: 'Partial results', metadata: { kind: 'generation-timeout-continuation', ...extra } });
+  const realTimeout = [{ role: 'user', content: 'analyse my CRM' }, marker(), { role: 'user', content: 'continue' }];
+  const total = 'Your CRM has 97 lead lists holding 15,497 leads in total.';
+
+  it('abstains: the earlier turn ran CRM tools whose results were never persisted', () => {
+    const e = crmEvidenceFromEarlierInvocations(realTimeout);
+    expect(e.complete).toBe(false);
+    expect(detectCrmFreshnessMismatch(total, [ok('get_leads')], undefined, e).findings).toEqual([]);
+  });
+
+  it('still flags the same claim on a plain follow-up after a timeout (not a continue request)', () => {
+    const h = [{ role: 'user', content: 'analyse my CRM' }, marker(), { role: 'user', content: 'how many lead lists do I have now?' }];
+    const e = crmEvidenceFromEarlierInvocations(h);
+    expect(e.complete).toBe(true);
+    expect(detectCrmFreshnessMismatch(total, calls, fresh(), e).findings.map((f) => f.kind)).toEqual(['inventory_total_not_in_tool_results']);
+  });
+
+  it('a timeout message that DID persist evidence is still credited and checked (no abstain)', () => {
+    const h = [{ role: 'user', content: 'x' }, marker({ toolCalls: [ok('get_lead_lists')], crmEvidence: { tools: ['get_lead_lists'], numbers: [97, 15497] } }), { role: 'user', content: 'continue' }];
+    const e = crmEvidenceFromEarlierInvocations(h);
+    expect(e.complete).toBe(true);
+    const c = createCrmEvidenceCollector();
+    c.record('get_leads', { success: true, leads: [{ firstName: 'a' }], count: 1 });
+    expect(detectCrmFreshnessMismatch(total, [ok('get_leads')], c.snapshot(), e).findings).toEqual([]);
+    expect(detectCrmFreshnessMismatch('Your CRM has 55 lead lists.', [ok('get_leads')], c.snapshot(), e).findings).toHaveLength(1);
+  });
+
+  it('the tag check is unaffected by the abstain', () => {
+    const e = crmEvidenceFromEarlierInvocations(realTimeout);
+    expect(detectCrmFreshnessMismatch('97 lists [verified: get_lead_lists]', [], undefined, e).findings.map((f) => f.kind)).toEqual(['cited_tool_not_run']);
+  });
+
+  it('an unrelated assistant message with no marker does not trigger it', () => {
+    const h = [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'hello' }, { role: 'user', content: 'continue' }];
+    expect(crmEvidenceFromEarlierInvocations(h).complete).toBe(true);
+  });
+});
