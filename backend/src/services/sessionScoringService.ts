@@ -31,6 +31,18 @@ const MAX_TOOL_CONTENT_FOR_SCORING = 500; // chars per tool result in scoring co
  * the judge can see that tools were actually invoked rather than treating the turn
  * as a silent/empty response.
  */
+/**
+ * Message content as plain text. `null`/`undefined` (a tool-calls-only turn persists with the
+ * field absent) is empty text, NOT a JSON value: `JSON.stringify(undefined ?? "")` is the
+ * two-character string `""`, which is truthy, so it would print a literal `""` into the judge's
+ * transcript and stop empty assistant turns being skipped.
+ */
+function textOf(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (content == null) return "";
+  return JSON.stringify(content);
+}
+
 function serializeMessagesForScoring(messages: ChatMessage[]): string {
   const lines: string[] = [];
 
@@ -38,13 +50,7 @@ function serializeMessagesForScoring(messages: ChatMessage[]): string {
     if (m.role === "system") continue;
 
     if (m.role === "user") {
-      // `m.content` is `undefined` on some persisted messages (not `null`, not `""`) —
-      // JSON.stringify(undefined) returns the JS value `undefined`, not the string
-      // "undefined", so the bare ternary silently produced literal "undefined" text here
-      // and threw TypeError on .trim()/.length below. Found via three outcome-judge
-      // replays (ENG-2356, ENG-2138, ENG-2380) that all lost the same ~40 of 138 sampled
-      // sessions to this exact crash, undercounting the AUC/share-at-5 denominator.
-      const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "");
+      const text = textOf(m.content);
       lines.push(`user: ${text}`);
 
     } else if (m.role === "assistant") {
@@ -54,7 +60,7 @@ function serializeMessagesForScoring(messages: ChatMessage[]): string {
       // interactive run that crashed and the user retried in the same session), the
       // judge would otherwise read the note verbatim and score against it (ENG-479).
       if (isRunFailurePlaceholder(m)) continue;
-      const text = (typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")).trim();
+      const text = textOf(m.content).trim();
       const toolCalls: Array<{ name: string; arguments?: any }> = (m as any).metadata?.toolCalls || [];
 
       if (text && toolCalls.length > 0) {
@@ -71,7 +77,7 @@ function serializeMessagesForScoring(messages: ChatMessage[]): string {
 
     } else if (m.role === "tool") {
       const name = (m as any).name || "tool";
-      const raw = typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "");
+      const raw = textOf(m.content);
       const preview = raw.length > MAX_TOOL_CONTENT_FOR_SCORING
         ? raw.slice(0, MAX_TOOL_CONTENT_FOR_SCORING) + "…"
         : raw;
