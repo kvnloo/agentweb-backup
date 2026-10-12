@@ -847,11 +847,11 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
     const loserId = li.id || after.find((i) => i.identifier === li.identifier)?.issueId;
     if (winner && winner.identifier !== li.identifier && loserId) {
       const { markIssueDuplicateOf } = await import('./linearService');
+      await markIssueDuplicateOf(loserId, winner.issueId);
       await addIssueComment(
         loserId,
         `Duplicate of ${winner.identifier}: filed concurrently with it by a racing filer (ENG-2426). Occurrence recorded there.`,
       );
-      await markIssueDuplicateOf(loserId, winner.issueId);
       try {
         await addIssueComment(winner.issueId, [`Recurred on ${new Date().toISOString().slice(0, 10)} (concurrent filing ${li.identifier} folded in).`, ...contextLines(p.notionContext)].join('\n'));
       } catch (e) {
