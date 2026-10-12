@@ -59,6 +59,6 @@ describe('finalize-guard judge accuracy eval (ENG-185)', () => {
     // Pin current numbers so a matcher/lexicon change that moves them is visible in review.
     expect(fixturePorts.judgeErrors).toBe(0);
     expect(fixturePorts.overall.fp).toBe(0);
-    expect(fixturePorts.failures.map((f) => f.id)).toEqual(['adv-lexicon-miss']);
+    expect(fixturePorts.failures.map((f) => f.id)).toEqual(['multi-email-and-draft-post', 'adv-lexicon-miss']);
   });
 });

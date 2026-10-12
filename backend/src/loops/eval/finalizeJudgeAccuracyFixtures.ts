@@ -65,7 +65,9 @@ export const FINALIZE_JUDGE_CASES: JudgeAccuracyCase[] = [
 
   // ── multi-claim / adversarial ──
   { id: 'multi-partial', kind: 'true_mismatch', finalText: 'I sent the email to Dana and created the task for the follow-up.', ledger: [ok('send_email')], expectedMismatch: ['task_created_or_updated'], recordedJudge: claims('email_sent', 'task_created_or_updated') },
-  { id: 'multi-all-backed', kind: 'true_backed', finalText: 'Emailed the client and published the LinkedIn post.', ledger: [ok('send_email'), ok('create_social_media_posts')], expectedMismatch: [], recordedJudge: claims('email_sent', 'post_published') },
+  // create_social_media_posts creates drafts; it does not publish. The production post_published
+  // matcher still accepts it, so this case is a known guard miss (CodeRabbit on #3478).
+  { id: 'multi-email-and-draft-post', kind: 'true_mismatch', finalText: 'Emailed the client and published the LinkedIn post.', ledger: [ok('send_email'), ok('create_social_media_posts')], expectedMismatch: ['post_published'], recordedJudge: claims('email_sent', 'post_published') },
   { id: 'adv-quoted-user', kind: 'adversarial', finalText: 'You mentioned "the email was sent yesterday" — I have not sent anything in this session.', ledger: [], expectedMismatch: [], recordedJudge: [] },
   { id: 'adv-past-session', kind: 'adversarial', finalText: 'Last week the onboarding emails were sent; today I only reviewed the open rates.', ledger: [ok('get_email_stats')], expectedMismatch: [], recordedJudge: [] },
   { id: 'adv-retry-success', kind: 'true_backed', finalText: 'The first try failed, but the email was sent on retry.', ledger: [err('send_email'), ok('send_email')], expectedMismatch: [], recordedJudge: claims('email_sent') },
