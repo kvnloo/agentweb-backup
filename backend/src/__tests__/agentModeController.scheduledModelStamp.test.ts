@@ -390,6 +390,49 @@ describe('getModelOptions — authoritative model discovery', () => {
     });
   });
 
+  // ENG-113: additive capability hint for saving the unchosen Compare answers. Default OFF; only the exact value "true" turns it on.
+  describe('compareSaveAlternatives hint (ENG-113)', () => {
+    let clock = Date.now() + 1_000 * 60_000;
+    beforeEach(() => {
+      clock += 10 * 60_000; // the reader caches for ~60s at module level
+      jest.spyOn(Date, 'now').mockImplementation(() => clock);
+    });
+    afterEach(() => jest.restoreAllMocks());
+    const optionsBody = async () => {
+      mockAgentModeService.getSupportedModels.mockResolvedValue(['gpt-a'] as any);
+      mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+        billingUserId: 'test-user-123', policy: null, costUsedMicroUsd: 0, creditsApplied: false,
+        mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' },
+      });
+      const json = jest.fn();
+      await agentModeController.getModelOptions(
+        { user: { userId: 'test-user-123', isAdmin: false } } as any,
+        { json, status: jest.fn(() => ({ json })) } as any,
+      );
+      return json.mock.calls[0][0];
+    };
+    const row = (value: unknown) =>
+      mockGetSetting.mockImplementation(async (name: string) => (name === 'compare_save_alternatives' && value !== null ? { settingValue: value } : null));
+
+    it.each([[null], ['false'], [''], ['yes'], ['TRUE']])('is false when the setting is %j', async (value) => {
+      row(value);
+      expect((await optionsBody()).compareSaveAlternatives).toBe(false);
+    });
+    it('is true only for exactly "true"', async () => {
+      row('true');
+      expect((await optionsBody()).compareSaveAlternatives).toBe(true);
+    });
+    it('a settings outage keeps the last-known value and never fails the model options (cold start => off is unit-tested)', async () => {
+      row('true');
+      expect((await optionsBody()).compareSaveAlternatives).toBe(true);
+      clock += 10 * 60_000;
+      mockGetSetting.mockRejectedValue(new Error('ddb down'));
+      const body = await optionsBody();
+      expect(body.compareSaveAlternatives).toBe(true);
+      expect(body.allModels).toEqual(['gpt-a']);
+    });
+  });
+
   it('never offers a live-voice model: every consumer is a text-chat picker and an explicit live pick now 422s', async () => {
     mockAgentModeService.getSupportedModels.mockResolvedValue(['gpt-a', 'live-voice-1', 'gpt-b'] as any);
     (mockAgentModeService as any).isLiveModel = jest.fn((id: string) => id === 'live-voice-1');

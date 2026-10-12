@@ -45,6 +45,7 @@ import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/fi
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { CHAT_BRANCHING_ENABLED_SETTING, isChatBranchingSettingEnabled } from '../services/agentMode/chatBranching';
+import { compareSaveAlternatives } from '../services/agentMode/compareSaveAlternativesInstance';
 import { resolveRunFunding } from '../services/funding/runFunding';
 import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError, isProviderUnavailableError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
@@ -10680,7 +10681,7 @@ export const agentModeController = {
   async getModelOptions(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const [usage, entitledModels, chatBranchingEnabled] = await Promise.all([
+      const [usage, entitledModels, chatBranchingEnabled, compareSaveAlternativesEnabled] = await Promise.all([
         getEffectiveLlmUsagePolicy(user.userId),
         agentModeService.getSupportedModels(user.isAdmin === true),
         // ENG-112 capability hint so the portal only offers "Branch from here" when the endpoint will
@@ -10692,6 +10693,9 @@ export const agentModeController = {
             return false;
           }
         })(),
+        // ENG-113 capability hint: the Compare dialog only sends the unchosen answers (and the set token) when
+        // saving is on. A hint, not the gate (select re-checks). Unreadable flag = off.
+        compareSaveAlternatives.isEnabled().catch(() => false),
       ]);
       // Every consumer (chat composer, schedule form, MCP) is a text-chat picker, and an
       // explicit live-voice pick is refused (422 not_selectable), so never offer one.
@@ -10715,6 +10719,7 @@ export const agentModeController = {
         optimizedDefaultModel: usage.policy?.optimizedDefaultModel || null,
         usagePolicyVersion: usage.policy?.version || null,
         chatBranchingEnabled,
+        compareSaveAlternatives: compareSaveAlternativesEnabled,
       });
     } catch (error) {
       console.error('AgentMode: Get model options error:', error);
