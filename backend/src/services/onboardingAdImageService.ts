@@ -34,6 +34,8 @@
  *   then read steps[4].description.
  */
 
+import { withClearedError } from "../utils/clearErrorOnClaim";
+import { readUserForOwnership } from "../utils/readUserForOwnership";
 import { imageService as defaultImageService } from "./imageGeneration";
 import { reportUIError } from "../utils/errorReporter";
 import { userDb } from "./db";
@@ -891,7 +893,7 @@ async function failAdImageRunIfOwned(
   logMessage: string,
   logContext: Record<string, unknown> = {}
 ): Promise<boolean> {
-  const current = await userDb.getUserById(userId);
+  const current = await readUserForOwnership(userId);
   const axis = readAxisIdentity(current);
   if (axisIsNotOurs(axis, ours)) {
     // eslint-disable-next-line no-console
@@ -966,7 +968,7 @@ export async function triggerAdImageGenerationForUser(
     run?: AdImageRunIdentity;
   } = {}
 ): Promise<void> {
-  const user = await userDb.getUserById(userId);
+  const user = await readUserForOwnership(userId);
   if (!user) return;
 
   const u = user as any;
@@ -1166,6 +1168,9 @@ export async function triggerAdImageGenerationForUser(
 
   // Read only now: the failure path above does its own owning-run read, and
   // hoisting this above it would cost every failed run a redundant fetch.
+  // Left on the index on purpose: this is tens of seconds after the claim, long
+  // past any index lag, and the write below is conditioned on this run's own
+  // identity regardless of what this read shows.
   const current = await userDb.getUserById(userId);
   const patch = adImageReadyPatch(((current as any) || {}) as AdImageStatusFields, result);
   if (!patch) {
@@ -1296,7 +1301,7 @@ export async function claimAdImageRun(
 ): Promise<AdImageRunIdentity | null> {
   const startPatch = adImageStartPatch();
   try {
-    await userDb.updateUser(userId, startPatch as any, {
+    await userDb.updateUser(userId, withClearedError(startPatch, "adImageError") as any, {
       condition: adImageStartClaimCondition(),
     });
   } catch (err: any) {

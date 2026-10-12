@@ -1185,21 +1185,29 @@ async function computeSafeTextRanges(html: string): Promise<Array<{ start: numbe
  * `createHtmlFromTemplate` (confirmed by a whole-backend grep), so it's a
  * local, non-exported helper here rather than a public export.
  */
-async function findTemplateById(templateId: string, userId: string): Promise<{ template: any | null, isPublic: boolean }> {
+async function findTemplateById(templateId: string, userId: string): Promise<{ template: any | null, isPublic: boolean, available: Array<{ template_id: string, template_name?: string }> }> {
   const { userTemplates, publicTemplates } = await getTemplatesForUser(userId);
+  // ENG-1888: on a miss the caller returns these so the model can self-correct
+  // instead of retrying an invalid id (the dominant prod failure class).
+  const available = [...userTemplates, ...publicTemplates]
+    .filter((t: any) => t && typeof t.template_id === 'string')
+    .slice(0, MAX_AVAILABLE_TEMPLATES_IN_ERROR)
+    .map((t: any) => ({ template_id: t.template_id, template_name: t.template_name }));
 
   const userMatch = userTemplates.find((t: any) => t.template_id === templateId);
   if (userMatch) {
-    return { template: userMatch, isPublic: false };
+    return { template: userMatch, isPublic: false, available };
   }
 
   const publicMatch = publicTemplates.find((t: any) => t.template_id === templateId);
   if (publicMatch) {
-    return { template: publicMatch, isPublic: true };
+    return { template: publicMatch, isPublic: true, available };
   }
 
-  return { template: null, isPublic: false };
+  return { template: null, isPublic: false, available };
 }
+
+const MAX_AVAILABLE_TEMPLATES_IN_ERROR = 25;
 
 /**
  * ENG-46: structured, greppable, observability-only signal for a model
@@ -1322,12 +1330,16 @@ export async function createHtmlFromTemplate(
   ): Promise<any> {
     try {
       // Get the template from user or public store
-      const { template } = await findTemplateById(templateId, userId);
+      const { template, available } = await findTemplateById(templateId, userId);
 
       if (!template) {
+        // ENG-1888: structured, actionable not_found instead of a bare message.
         return {
           success: false,
-          message: `Template '${templateId}' not found`
+          error_code: 'TEMPLATE_NOT_FOUND',
+          missing_template_id: templateId,
+          available_templates: available,
+          message: `Template '${templateId}' not found. Call list_html_templates and retry with one of the available template_id values${available.length ? ` (e.g. ${available.slice(0, 5).map((t) => t.template_id).join(', ')})` : '; no templates are available for this user'}.`
         };
       }
 

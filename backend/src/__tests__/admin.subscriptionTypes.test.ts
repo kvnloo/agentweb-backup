@@ -53,7 +53,11 @@ jest.mock('../services/agentModeService', () => ({
       'gemini-3.1-flash-lite',
       'anthropic.claude-haiku-4-5-20251001-v1:0',
       'anthropic.claude-opus-5',
+      'openrouter/qwen/qwen3.8-max-0902',
     ]),
+    // Same alias map as the real service (single source: llmModelRegistry).
+    normalizeModelId: jest.fn((model: string) =>
+      require('../services/agentMode/llmModelRegistry').LEGACY_MODEL_ALIASES[model] ?? model),
   },
 }));
 
@@ -316,6 +320,24 @@ describe('Admin subscription types routes', () => {
 
     const saved = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
     expect(saved[0].llmUsagePolicy).toEqual(llmUsagePolicy);
+  });
+
+  it('POST /api/admin/subscription-types canonicalises a renamed model id in a stored policy and saves the new id', async () => {
+    const llmUsagePolicy = {
+      version: 'starter-v1', enforcementState: 'enforce',
+      optimizationCostThresholdMicroUsd: 30_000_000,
+      hardCostThresholdMicroUsd: 60_000_000,
+      optimizedModelIds: ['gemini-3.1-flash-lite', 'openrouter/qwen/qwen3.8-max'],
+      optimizedDefaultModel: 'openrouter/qwen/qwen3.8-max',
+    };
+
+    await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{ name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], llmUsagePolicy }],
+    }).expect(200);
+
+    const saved = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
+    expect(saved[0].llmUsagePolicy.optimizedModelIds).toEqual(['gemini-3.1-flash-lite', 'openrouter/qwen/qwen3.8-max-0902']);
+    expect(saved[0].llmUsagePolicy.optimizedDefaultModel).toBe('openrouter/qwen/qwen3.8-max-0902');
   });
 
   // ENG-1214 AC5: the alert thresholds are only "admin-configurable" if the

@@ -120,6 +120,10 @@ export function toolResultError(result: unknown): Error | null {
       : isHttpRange(obj.status) ? obj.status
       : undefined;
     if (code !== undefined) (err as { code?: number }).code = code;
+    // ENG-1949: a tool-declared semantic class (validated by the classifier).
+    if (typeof obj.errorClass === 'string' && obj.errorClass) {
+      (err as { toolErrorClass?: string }).toolErrorClass = obj.errorClass;
+    }
     return err;
   };
 

@@ -309,16 +309,17 @@ describe('leads/CRM cluster delegates to emma/impl/leads.ts (ENG-2103 F2)', () =
     expect(result).toBe(expected);
   });
 
-  it('update_lead_status forwards list_id/lead_id/status/userId/deal_value/deal_currency/notes', async () => {
+  it('update_lead_status forwards list_id/lead_id/status/userId/deal_value/deal_currency/notes and drafts', async () => {
     const expected = { success: true };
     mockLeads.updateLeadStatus.mockResolvedValue(expected);
 
     const result = await emmaToolRegistry.getTool('update_lead_status')!.execute(
-      { list_id: 'L1', lead_id: 'LD1', status: 'won', deal_value: 5000, deal_currency: 'USD', notes: 'closed' },
-      { userId: 'u1' }
+      { list_id: 'L1', lead_id: 'LD1', status: 'won', deal_value: 5000, deal_currency: 'USD', notes: 'closed', message_draft: 'Hola', email_subject: 'S', email_body: 'B' },
+      { userId: 'u1', sessionId: 's1' }
     );
 
-    expect(mockLeads.updateLeadStatus).toHaveBeenCalledWith('L1', 'LD1', 'won', 'u1', 5000, 'USD', 'closed');
+    expect(mockLeads.updateLeadStatus).toHaveBeenCalledWith('L1', 'LD1', 'won', 'u1', 5000, 'USD', 'closed',
+      { messageDraft: 'Hola', emailSubject: 'S', emailBody: 'B', sessionId: 's1' });
     expect(result).toBe(expected);
   });
 

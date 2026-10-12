@@ -724,7 +724,10 @@ describe("onboardingCompetitorService", () => {
       const startPatch = userDb.updateUser.mock.calls[0][1];
       expect(startPatch.competitorStatus).toBe("running");
       expect(startPatch.competitorStartedAt).toBeTruthy();
-      expect(result).toBe(startPatch);
+      // The claim also clears the previous attempt's error (REMOVE, via null);
+      // the returned patch is the same run without that storage-only marker.
+      expect(startPatch.competitorError).toBeNull();
+      expect(result).toEqual({ ...startPatch, competitorError: undefined });
     });
 
     // ENG-2308: this function has two callers that can race each other — the

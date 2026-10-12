@@ -20,6 +20,7 @@
  * "If no competitive data is available, state assumptions clearly".
  */
 
+import { withClearedError } from "../utils/clearErrorOnClaim";
 import { LLMService } from "../utils/llmService";
 import type { LLMUsageContext } from "../utils/llmService";
 import { reportUIError } from "../utils/errorReporter";
@@ -682,7 +683,7 @@ export async function claimCompetitorRun(
 ): Promise<CompetitorStatusFields | null> {
   const patch = competitorStartPatch();
   try {
-    await userDb.updateUser(userId, patch as any, {
+    await userDb.updateUser(userId, withClearedError(patch, "competitorError") as any, {
       condition: competitorStartClaimCondition(),
     });
   } catch (err: any) {

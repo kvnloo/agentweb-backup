@@ -251,6 +251,9 @@ import { extractProducedAssetCount } from '../../services/agentMode/core/synthes
 import { extractGeneratedImageFilenames } from './shared/generatedAssets';
 import { currentRunFunding } from '../../services/funding/runFunding';
 import { isNonConsumableRequiredFunctionCall } from '../../services/agentMode/workPlanRequiredCallsPolicy';
+import { resolvePlanLaunchModel, isUserAdminSafe, type ModelPinRegistry } from '../../services/agentMode/modelPin';
+import { assertSequentialStepCounts } from '../../services/workPlanSteps';
+import { buildAnonymousModelUnavailableBody, buildAnonymousPlanModelToolMessage, buildModelUnavailableBody, buildPlanModelToolMessage, isModelUnavailableError, MODEL_SAVE_FAILED_MESSAGE } from '../../services/agentMode/modelUnavailable';
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
 
@@ -293,8 +296,9 @@ function logMissingWorkPlanForDiagnosis(
  * `agentModeService.ts`'s type for no real benefit, since only this one
  * method is ever used.
  */
-export interface WorkPlanModelRegistry {
+export interface WorkPlanModelRegistry extends ModelPinRegistry {
   getSupportedModels(isAdmin?: boolean): Promise<string[]>;
+  getDefaultModel?: () => Promise<string>;
 }
 
 
@@ -517,6 +521,49 @@ export async function applyPredefinedWorkPlan(
       return { success: false, message: 'Not authorized to use this private work plan' };
     }
 
+    // ENG-903 FAIL-LOUD: a plan's non-empty `defaultModel` is an explicit pin. Resolve it
+    // for the LAUNCHING (session-owner) user BEFORE any session mutation; an unserved or
+    // unselectable pin refuses the launch with the shared model_unavailable sentence
+    // instead of launching on another model. Empty = account default (unchanged).
+    let planPinnedModel: string | undefined;
+    try {
+      planPinnedModel = await resolvePlanLaunchModel(
+        modelRegistry,
+        () => isUserAdminSafe(userId),
+        predefinedPlan.defaultModel,
+      );
+    } catch (modelError) {
+      if (!isModelUnavailableError(modelError)) throw modelError;
+      const body = buildModelUnavailableBody(
+        modelError,
+        typeof modelRegistry.getModelDisplayName === 'function' ? modelRegistry.getModelDisplayName(modelError.requestedModel) : undefined,
+        'work_plan_pin',
+      );
+      // An anonymous/visitor session can reach this tool (public plan sessions): the visitor
+      // sees the model's reply, so they learn no model id, name or reason. Server logs and the
+      // oncall alert below still carry the details.
+      const isAnonymousCaller = !userId || userId.startsWith('anon_');
+      console.warn(`[applyPredefinedWorkPlan] "${predefinedPlan.title}" not launched — plan model "${body.requestedModel}" is ${modelError.reason}.`);
+      if (options?.isUnattendedRun) {
+        void import('../../utils/agentModeAlerts')
+          .then(({ sendAgentModeOncallAlert }) => sendAgentModeOncallAlert({
+            subject: 'AgentMode: unavailable model pinned on a Work Plan launched by an unattended run',
+            message: `Work plan "${predefinedPlan.title}" (${predefinedPlan.planId}) pins model "${body.requestedModel}", which is not available (${modelError.reason}). The unattended launch was refused and nothing ran on another model. Choose a served model for the plan.`,
+            context: { Plan: String(predefinedPlan.planId), 'Pinned Model': body.requestedModel },
+            dedupeKey: `workplan_model_invalid:${predefinedPlan.planId}:${body.requestedModel}`,
+            dedupeWindowMs: 60 * 60 * 1000,
+          }))
+          .catch((alertError) => console.error('[applyPredefinedWorkPlan] Failed to send unavailable plan-model alert:', alertError));
+      }
+      return {
+        success: false,
+        errorType: 'model_unavailable',
+        code: 'model_unavailable',
+        modelUnavailable: isAnonymousCaller ? buildAnonymousModelUnavailableBody() : body,
+        message: isAnonymousCaller ? buildAnonymousPlanModelToolMessage() : buildPlanModelToolMessage(body),
+      };
+    }
+
     // ENG-1814: a title-based match (not a stable planId) that has a near-duplicate
     // sibling in the accessible set is exactly the shape of two real, live-confirmed
     // incidents (Founder_Linkedin_Sales_Readiness_Eval/_Audit) where the model picked
@@ -615,7 +662,56 @@ export async function applyPredefinedWorkPlan(
       // detect "this recommendation was already applied".
       templatePlanId: predefinedPlan.planId,
     };
-    await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+    // Validate the plan structure BEFORE the model write: updateSessionWorkPlan rejects a
+    // non-sequential stepCount, and by then the model would already have been changed.
+    // A malformed plan must fail with no state change at all.
+    assertSequentialStepCounts(workPlan.steps);
+
+    // Apply the plan's pinned model FIRST (already validated above): it is the one write
+    // that may not fail silently. If it fails nothing else has been written, so the plan
+    // is not started rather than running on the session's previous model. Capture what the
+    // write replaces (updateSessionLlmModel also clears llmUsagePolicyDecision) so a LATER
+    // failure can put the session back exactly as it was.
+    const previousModel = session.llmModel;
+    const previousPolicyDecision = session.llmUsagePolicyDecision;
+    if (planPinnedModel) {
+      try {
+        await chatbotDb.updateSessionLlmModel(sessionId, planPinnedModel);
+      } catch (modelErr) {
+        console.error('[applyPredefinedWorkPlan] Failed to save plan model; launch refused:', (modelErr as Error).message);
+        return {
+          success: false,
+          errorType: 'model_save_failed',
+          code: 'model_save_failed',
+          retryable: true,
+          message: `${MODEL_SAVE_FAILED_MESSAGE} Do not retry automatically; tell the user it failed to start.`,
+        };
+      }
+    }
+    try {
+      await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+    } catch (planWriteErr) {
+      // The plan did not start, so the session must not keep the plan's model (with force=true
+      // the OLD plan would otherwise keep running on the NEW model). Restore, then fail.
+      if (planPinnedModel) {
+        try {
+          // Conditional on the model THIS launch wrote: if a user changed it since, keep theirs.
+          const restored = await chatbotDb.restoreSessionLlmModelIfUnchanged(sessionId, planPinnedModel, {
+            llmModel: previousModel,
+            llmUsagePolicyDecision: previousPolicyDecision,
+          });
+          if (!restored) {
+            console.info(`[applyPredefinedWorkPlan] plan write failed for session ${sessionId}; model no longer "${planPinnedModel}" (changed since the launch's write), so the previous model was NOT restored over it.`);
+          }
+        } catch (restoreErr) {
+          console.error(
+            `[applyPredefinedWorkPlan] CRITICAL: plan write failed for session ${sessionId} AND restoring the previous model "${previousModel}" failed; the session is left on "${planPinnedModel}":`,
+            restoreErr,
+          );
+        }
+      }
+      throw planWriteErr;
+    }
 
     // ENG-1765: the reactive "surface the next pending step's inputRequest"
     // check in setWorkPlanStatusAttempt only runs after a set_work_plan_status
@@ -690,20 +786,6 @@ export async function applyPredefinedWorkPlan(
         await chatbotDb.addAssociatedSkills(sessionId, Array.from(allSkillIds));
       } catch (skillErr) {
         console.error('[applyPredefinedWorkPlan] Error auto-installing plan skills:', skillErr);
-      }
-    }
-
-    // Apply the plan's default model when it is supported.
-    if (predefinedPlan.defaultModel) {
-      try {
-        const supportedModels = await modelRegistry.getSupportedModels();
-        if (supportedModels.includes(predefinedPlan.defaultModel)) {
-          await chatbotDb.updateSessionLlmModel(sessionId, predefinedPlan.defaultModel);
-        } else {
-          console.warn(`[applyPredefinedWorkPlan] Plan model "${predefinedPlan.defaultModel}" not supported; leaving session model unchanged`);
-        }
-      } catch (modelErr) {
-        console.warn('[applyPredefinedWorkPlan] Error applying plan model:', (modelErr as Error).message);
       }
     }
 
@@ -1760,7 +1842,16 @@ export async function modifyWorkPlan(
       };
     }
 
-    const workPlan = { ...session.workPlan };
+    // ENG-2400: deep-copy the steps (and the pending ledger) so a failed or
+    // rejected modify never mutates the session object that was read; the
+    // stored plan only changes through the single write at the end.
+    const workPlan = {
+      ...session.workPlan,
+      steps: session.workPlan.steps.map((s: any) => ({ ...s })),
+      ...(session.workPlan.pendingRequiredFunctionCalls && {
+        pendingRequiredFunctionCalls: [...session.workPlan.pendingRequiredFunctionCalls],
+      }),
+    };
 
     // Snapshot of every step as it existed before this call's removeStepCounts
     // filtering runs below, keyed by stepCount. Still used further down for
@@ -2030,7 +2121,9 @@ export async function modifyWorkPlan(
         workPlan.steps[existingIndex] = {
           ...workPlan.steps[existingIndex],
           title: newStep.title,
-          description: newStep.description,
+          // ENG-2400: omitting description preserves the stored one (same
+          // contract as userInstructions/skillIds); it used to be wiped.
+          ...(newStep.description !== undefined && { description: newStep.description }),
           ...(newStep.userInstructions !== undefined && { userInstructions: newStep.userInstructions }),
           requiredFunctionCalls: mergeRequiredFunctionCalls(
             workPlan.steps[existingIndex].requiredFunctionCalls,
@@ -2104,6 +2197,18 @@ export async function modifyWorkPlan(
     };
   } catch (error) {
     console.error('AgentMode: Error modifying work plan:', error);
+    // ENG-2400: the store rejects a non-sequential result before writing
+    // (assertSequentialStepCounts). Surface that as an actionable, retryable
+    // message instead of the opaque generic failure.
+    if (error instanceof Error && /Invalid stepCount/.test(error.message)) {
+      return {
+        success: false,
+        message:
+          'Work plan not modified: stepCounts must be sequential from 1. When removing steps, renumber the ' +
+          'remaining steps in the same call (send them in steps with their new stepCount). The stored plan is unchanged.',
+        error: error.message,
+      };
+    }
     return {
       success: false,
       message: 'Failed to modify work plan',

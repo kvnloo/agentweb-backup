@@ -2813,6 +2813,56 @@ mcpToolRegistry.register({
   }
 });
 
+
+/** ENG-1992: summary of valid plans for an actionable not-found error. */
+function summarizeWorkPlans(plans: any[]): Array<{ id: string; title: string }> {
+  return plans
+    .map((p: any) => ({ id: p?.planId ?? p?.id, title: p?.title }))
+    .filter((p) => typeof p.id === 'string')
+    .slice(0, 50);
+}
+
+/**
+ * ENG-1992: resolve `plan_id` for get/update/delete. An id that matches a plan is
+ * used as-is. For get/update, a value matching exactly one plan TITLE
+ * (case-insensitive) resolves to that plan's id. Anything else — missing, unknown,
+ * or an ambiguous title — returns an actionable error listing the valid plans.
+ * If the plan list itself cannot be read, the original plan_id is passed through
+ * unchanged so the route's own answer (and error) stands.
+ */
+async function resolveWorkPlanTarget(args: any, c: any): Promise<{ planId: string } | { error: Record<string, unknown> }> {
+  const raw = typeof args.plan_id === 'string' ? args.plan_id.trim() : '';
+  let plans: any[] | undefined;
+  try {
+    const data = await mcpFetch({ method: 'GET', path: '/api/admin/work-plans', context: c });
+    plans = Array.isArray(data) ? data : undefined;
+  } catch {
+    plans = undefined;
+  }
+  if (!plans) {
+    if (raw) return { planId: raw };
+    return { error: { error: `plan_id is required for action=${args.action}. Call list_predefined_work_plans to find it.` } };
+  }
+  if (raw && plans.some((p: any) => p?.planId === raw || p?.id === raw)) return { planId: raw };
+  if (raw && args.action !== 'delete') {
+    const needle = raw.toLowerCase();
+    const byTitle = plans.filter((p: any) => typeof p?.title === 'string' && p.title.trim().toLowerCase() === needle);
+    if (byTitle.length === 1) return { planId: byTitle[0].planId ?? byTitle[0].id };
+    if (byTitle.length > 1) {
+      return { error: {
+        error: `plan_id "${raw}" matches ${byTitle.length} work plans by title; pass the exact plan id.`,
+        matchingPlans: summarizeWorkPlans(byTitle),
+      } };
+    }
+  }
+  return { error: {
+    error: raw
+      ? `No work plan with id "${raw}"${args.action === 'delete' ? ' (delete requires the exact plan id, not a title)' : ''}. Use one of the ids below.`
+      : `plan_id is required for action=${args.action}. Use one of the ids below.`,
+    availablePlans: summarizeWorkPlans(plans),
+  } };
+}
+
 mcpToolRegistry.register({
   name: 'manage_predefined_work_plan',
   definition: {
@@ -2822,7 +2872,7 @@ mcpToolRegistry.register({
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['create', 'update', 'delete', 'get'], description: 'CRUD action' },
-        plan_id: { type: 'string', description: 'Plan ID (required for update/delete/get)' },
+        plan_id: { type: 'string', description: 'Plan ID from list_predefined_work_plans (required for update/delete/get). For get/update an exact, unique plan title is also accepted. An unknown value returns the list of valid plan ids.' },
         title: { type: 'string', description: 'Plan title (create/update)' },
         description: { type: 'string', description: 'Plan description (create/update)' },
         welcome_message: { type: 'string', description: 'Welcome message shown to users (create/update)' },
@@ -2869,6 +2919,30 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const c = ctx(context);
+    // ENG-1992: the dominant failure cluster (18/28) was `not_found` — the model
+    // passed a plan TITLE, a stale id, or nothing as plan_id, and the route's bare
+    // "Work plan not found" 404 gave it nothing to recover with. Resolve a unique
+    // exact title match to its real id (get/update only — never a destructive delete
+    // by title), and otherwise return the valid plans instead of an opaque 404.
+    // Resolution runs only on a missing plan_id or a 404, so the happy path is unchanged.
+    const targetsPlan = args.action === 'update' || args.action === 'delete' || args.action === 'get';
+    if (targetsPlan && !(typeof args.plan_id === 'string' && args.plan_id.trim())) {
+      const resolved = await resolveWorkPlanTarget(args, c);
+      return jsonResult('error' in resolved ? resolved.error : { error: 'plan_id is required' });
+    }
+    try {
+      return await runManagePredefinedWorkPlan(args, c);
+    } catch (error: any) {
+      if (!targetsPlan || !/API error \(404\)/.test(String(error?.message || ''))) throw error;
+      const resolved = await resolveWorkPlanTarget(args, c);
+      if ('error' in resolved) return jsonResult(resolved.error);
+      if (resolved.planId === args.plan_id) throw error;
+      return await runManagePredefinedWorkPlan({ ...args, plan_id: resolved.planId }, c);
+    }
+  }
+});
+
+async function runManagePredefinedWorkPlan(args: any, c: any): Promise<any> {
     switch (args.action) {
       case 'create': {
         const body: any = { title: args.title, steps: normalizeWorkPlanSteps(args.steps) };
@@ -2918,6 +2992,9 @@ mcpToolRegistry.register({
             // that judgement wrong (ENG-890).
             body.expectedStepsRev = current?.steps_rev ?? null;
           } catch (error: any) {
+            // A 404 means the plan_id itself is wrong: let it reach execute()'s
+            // title/candidate resolution (ENG-1992) instead of masking it here.
+            if (/API error \(404\)/.test(String(error?.message || ''))) throw error;
             // Fail closed in both modes: without the current steps we can
             // neither merge nor tell whether a replace would delete steps, and
             // writing blind is exactly the silent deletion this guards against.
@@ -3015,8 +3092,7 @@ mcpToolRegistry.register({
       default:
         return jsonResult({ error: `Unknown action: ${args.action}` });
     }
-  }
-});
+}
 
 // ─── Skill Management (admin-only) ──────────────────────────────────────────
 
@@ -3739,14 +3815,51 @@ Returns matches with the page record (id, status, lead list), the owner (userId,
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({
-      method: 'GET',
-      path: `/api/admin/landing-pages/resolve?url=${encodeURIComponent(args.url)}`,
-      context: ctx(context)
-    });
-    return jsonResult(data);
+    // ENG-1628: the route answers "no match" with 404 and a bad url with 400, and
+    // mcpFetch turns both into a bare `Error` — so ordinary lookups were counted as
+    // bug-class runtime failures (4/4). Return typed results for those outcomes and
+    // reserve a thrown, specifically-named error for genuine faults.
+    const url = typeof args?.url === 'string' ? args.url.trim() : '';
+    if (!url) return jsonResult({ status: 'invalid_url', error: "'url' is required: pass a live page URL or bare hostname." });
+    let data: any;
+    try {
+      data = await mcpFetch({
+        method: 'GET',
+        path: `/api/admin/landing-pages/resolve?url=${encodeURIComponent(url)}`,
+        context: ctx(context)
+      });
+    } catch (error: any) {
+      const message = String(error?.message || error);
+      const status = Number(/API error \((\d{3})\)/.exec(message)?.[1]);
+      if (status === 404) {
+        const scannedAll = !/"scannedAll"\s*:\s*false/.test(message);
+        return jsonResult({
+          status: 'not_found',
+          matches: [],
+          scannedAll,
+          message: scannedAll
+            ? `No landing page matches "${url}".`
+            : `No landing page matched "${url}" within the scan cap; the result is inconclusive.`,
+        });
+      }
+      if (status === 400) {
+        return jsonResult({ status: 'invalid_url', error: `"${url}" is not a valid URL or hostname.` });
+      }
+      throw new LandingPageResolveError(message, Number.isFinite(status) ? status : undefined);
+    }
+    return jsonResult({ status: 'found', ...(data && typeof data === 'object' ? data : { data }) });
   }
 });
+
+/** ENG-1628: a genuine (non-404/400) failure of resolve_landing_page_by_url. */
+export class LandingPageResolveError extends Error {
+  readonly httpStatus?: number;
+  constructor(cause: string, httpStatus?: number) {
+    super(`resolve_landing_page_by_url failed${httpStatus ? ` (HTTP ${httpStatus})` : ''}: ${cause}`);
+    this.name = 'LandingPageResolveError';
+    this.httpStatus = httpStatus;
+  }
+}
 
 mcpToolRegistry.register({
   name: 'share_landing_page_with_org',

@@ -8,6 +8,7 @@
 jest.mock("../services/db", () => ({
   userDb: {
     getUserById: jest.fn(),
+    getUserByIdConsistent: jest.fn(),
     updateUser: jest.fn(),
   },
 }));
@@ -298,6 +299,32 @@ describe("onboardingCreativeDirService", () => {
       expect(writtenPatch.creativeDirResult.concepts).toHaveLength(6);
     });
 
+    // It runs moments after the upstream steps wrote their results, when the
+    // UserIdIndex can still serve the row from before them. Generating on that row
+    // would run on an empty persona/competitor set and record the step ready.
+    it("generates from the base-table row when the index still lacks the upstream results (ENG-2308)", async () => {
+      userDb.getUserByIdConsistent.mockResolvedValueOnce({
+        userId: "user-1",
+        brandGuidelines: { brandData: { brandName: "Linear" } },
+        icpResult: [onePersona],
+        competitorResult,
+      });
+      // The index row has no upstream results yet. The first index read this
+      // function makes (if it made the start read through the index) would get it.
+      userDb.getUserById.mockResolvedValueOnce({
+        userId: "user-1",
+        creativeDirStatus: "running",
+        creativeDirStartedAt: "2026-04-24T11:59:00.000Z",
+      });
+      userDb.updateUser.mockResolvedValue({});
+
+      const llm = new FakeLlm(fullResponse);
+      await triggerCreativeDirForUser("user-1", { llm: llm as any });
+
+      expect(llm.lastUserPrompt).toContain(onePersona.name);
+      expect(userDb.getUserById).toHaveBeenCalledTimes(1); // the completion read only
+    });
+
     // ENG-2308 review follow-up, confirmed by direct reproduction (same
     // reasoning as onboardingIcpService's icpOwnershipCondition tests).
     it("conditions the completion write on this run's own creativeDirStartedAt when expectedStartedAt is provided", async () => {
@@ -514,7 +541,10 @@ describe("onboardingCreativeDirService", () => {
       const startPatch = userDb.updateUser.mock.calls[0][1];
       expect(startPatch.creativeDirStatus).toBe("running");
       expect(startPatch.creativeDirStartedAt).toBeTruthy();
-      expect(result).toBe(startPatch);
+      // The claim also clears the previous attempt's error (REMOVE, via null);
+      // the returned patch is the same run without that storage-only marker.
+      expect(startPatch.creativeDirError).toBeNull();
+      expect(result).toEqual({ ...startPatch, creativeDirError: undefined });
     });
 
     // ENG-2308: same unconditional-write race as icp/competitor — two

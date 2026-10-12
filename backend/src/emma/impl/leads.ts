@@ -806,9 +806,18 @@ export async function searchLeads(
       const hideCardRevenueForCaller = shouldHideCardRevenueForViewer(userId);
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
 
-      if ((!filters || filters.length === 0) && !options?.search?.trim()) {
-        return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion' };
+      // ENG-2360: a list-scoped read (non-empty list_id or list_ids) with no
+      // filters/search is a valid "page through these lists" intent. Only a
+      // call with no filters, no search AND no list scope is rejected.
+      const hasListScope = Boolean(listId) || Boolean(options?.listIds && options.listIds.length > 0);
+      if ((!filters || filters.length === 0) && !options?.search?.trim() && !hasListScope) {
+        return {
+          success: false,
+          message: 'At least one filter, a search query, or a list_id/list_ids is required',
+          error: 'Provide at least one filter criterion, a search query, or list_id/list_ids to scope the read',
+        };
       }
+      filters = Array.isArray(filters) ? filters : [];
 
       // Resolve target list set. list_ids takes precedence over single list_id.
       let targetListIds: string[];
@@ -1891,7 +1900,8 @@ export async function updateLeadStatus(
     userId: string,
     dealValue?: number | null,
     dealCurrency?: string,
-    notes?: string
+    notes?: string,
+    drafts?: { messageDraft?: string; emailSubject?: string; emailBody?: string; sessionId?: string }
   ): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
@@ -1918,6 +1928,40 @@ export async function updateLeadStatus(
       if (dealValue !== undefined) updates.dealValue = dealValue;
       if (dealCurrency !== undefined) updates.dealCurrency = dealCurrency;
 
+      // ENG-2361: a drafting agent that moves a lead to review must be able to put the
+      // exact text it wrote on the lead in the same write — otherwise the Pending Review
+      // queue lists the lead with nothing to approve. Stored in the same shapes the
+      // portal's lead panel and queue already read. Empty strings are ignored, never
+      // used to clear an existing draft.
+      const now = new Date().toISOString();
+      const savedDrafts: string[] = [];
+      const dm = typeof drafts?.messageDraft === 'string' ? drafts.messageDraft.trim() : '';
+      if (dm) {
+        updates.messageDraft = {
+          content: dm,
+          createdAt: existingLead.messageDraft?.createdAt || now,
+          updatedAt: now,
+          ...(drafts?.sessionId ? { sessionId: drafts.sessionId } : {}),
+        };
+        savedDrafts.push('messageDraft');
+      }
+      const subj = typeof drafts?.emailSubject === 'string' ? drafts.emailSubject.trim() : '';
+      const body = typeof drafts?.emailBody === 'string' ? drafts.emailBody.trim() : '';
+      if (subj || body) {
+        if (!subj || !body) {
+          return { success: false, message: 'Email draft needs both email_subject and email_body', error: 'Provide both email_subject and email_body, or neither' };
+        }
+        updates.emailDraft = {
+          subject: subj,
+          textContent: body,
+          createdAt: existingLead.emailDraft?.createdAt || now,
+          updatedAt: now,
+          ...(drafts?.sessionId ? { sessionId: drafts.sessionId } : {}),
+        };
+        updates.emailDraftFormat = 'text';
+        savedDrafts.push('emailDraft');
+      }
+
       await crmDb.updateLead(listId, leadId, updates);
 
       // Auto-create status change engagement
@@ -1942,6 +1986,7 @@ export async function updateLeadStatus(
         previousStatus,
         newStatus: status,
         leadName,
+        ...(savedDrafts.length ? { savedDrafts } : {}),
       };
     } catch (error) {
       console.error('AgentMode: Error updating lead status:', error);

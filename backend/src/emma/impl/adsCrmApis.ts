@@ -152,6 +152,7 @@
  * four names; none matched.
  */
 import { googleAdsService } from '../../services/googleAdsService';
+import { stampGoogleAssetUpload, stampGoogleAdCreated } from '../../services/creativeLineage';
 import {
   NegativeCampaignCriteriaValidationError,
   validateDeviceBidAdjustments,
@@ -1125,6 +1126,10 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
           // moment its campaign is enabled.
           status: args.status || 'PAUSED',
         });
+        // ENG-2235: fire-and-forget lineage stamp (inert unless CREATIVE_LINEAGE_ENABLED).
+        if (ad?.resourceName && Array.isArray(args.image_asset_resource_names)) {
+          void stampGoogleAdCreated({ userId, customerId: String(customer_id), adResourceName: ad.resourceName, assetResourceNames: args.image_asset_resource_names });
+        }
         return { success: true, adResourceName: ad.resourceName, ...(creativeTrackingWarning ? { trackingWarning: creativeTrackingWarning } : {}) };
       }
       if (action === 'UPDATE') {
@@ -1171,6 +1176,10 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
         name: args.name,
         data: args.data,
       });
+      // ENG-2235: only a URL upload can resolve to a generated creative.
+      if (resourceName && typeof args.data === 'string' && args.data.startsWith('https://')) {
+        void stampGoogleAssetUpload({ userId, imageUrl: args.data, assetResourceName: resourceName });
+      }
       return { success: true, assetResourceName: resourceName };
     }
 
@@ -1247,6 +1256,10 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
         error: error.message,
         code,
       };
+    }
+    if (error?.name === 'GoogleAdsReadBackError' && error?.code === 'unsupported_field') {
+      // ENG-592: mutate said success, read-back says unchanged. Never relay as success.
+      return { success: false, errorType: error.code, errorCode: error.code, fields: error.fields, error: error.message };
     }
     if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true, code };
     console.error('[AgentMode] handleCallGoogleAdsApi error:', error);

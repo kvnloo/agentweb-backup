@@ -199,6 +199,32 @@ describe('POST /compare', () => {
   });
 });
 
+describe('ENG-55 real controller wiring: data-collection switch reaches the model call', () => {
+  let clock = Date.now();
+  beforeEach(() => {
+    clock += 10 * 60_000; // expire the controller's module-level 60s policy cache between tests
+    jest.spyOn(Date, 'now').mockImplementation(() => clock);
+  });
+  const settingRow = (value: string | null) =>
+    mockGetSetting.mockImplementation(async (name: string) =>
+      name === 'model_compare_deny_data_collection' && value !== null ? { settingValue: value } : null);
+
+  it("row 'true' => every callLLM receives providerPolicy {data_collection:'deny'}", async () => {
+    settingRow('true');
+    const out = await request(app).post('/api/agent-mode/compare').set('Authorization', bearer('owner')).send(validBody);
+    expect(out.status).toBe(200);
+    expect(mockCallLLM).toHaveBeenCalledTimes(2);
+    for (const call of mockCallLLM.mock.calls) expect(call[2].providerPolicy).toEqual({ data_collection: 'deny' });
+  });
+  it.each([[null], ['false']])('row %j => providerPolicy is absent', async (value) => {
+    settingRow(value);
+    const out = await request(app).post('/api/agent-mode/compare').set('Authorization', bearer('owner')).send(validBody);
+    expect(out.status).toBe(200);
+    expect(mockCallLLM).toHaveBeenCalledTimes(2);
+    for (const call of mockCallLLM.mock.calls) expect(call[2]).not.toHaveProperty('providerPolicy');
+  });
+});
+
 describe('compare -> select round trip over HTTP', () => {
   it('a token issued by /compare is accepted by /compare/select and persists a normal turn', async () => {
     const compare = await request(app).post('/api/agent-mode/compare').set('Authorization', bearer('owner')).send(validBody);
