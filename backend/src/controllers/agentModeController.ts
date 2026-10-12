@@ -4,6 +4,7 @@ import {
   buildTooManyRunsBody,
   TooManyConcurrentRunsError,
   isTooManyConcurrentRunsError,
+  getGeneratingSessionIdsForUser,
 } from '../services/agentMode/concurrentGenerationCap';
 import { isEvaluationUser, EvaluationDenied } from '../services/evaluationPolicy';
 import { Request, Response } from 'express';
@@ -9459,6 +9460,9 @@ export const agentModeController = {
         ...session,
         messages: filterMessagesForClient(session.messages, { viewerIsAdmin }),
         hasActiveProgress: progressActive,
+        // ENG-110: additive, owner-only. In-memory on THIS instance (an Immutable deploy overlap hides the
+        // other instance's runs). Admins/delegates viewing someone else's session never get it.
+        ...(genuineOwnerView ? { isGenerating: activeSessionGenerations.has(session.sessionId) } : {}),
         skills,
         ...modelAttribution,
       };
@@ -9917,6 +9921,13 @@ export const agentModeController = {
       // This fires before /stop reaches the backend and ensures the worker receives the cancel signal
       // while it still has a live sessionToRequestId mapping. Also emit SSE 'complete' so the frontend
       // SSE stream clears the "Thinking..." state on reload instead of showing it indefinitely.
+      //
+      // ENG-110 FACT: on Node >= 16 this listener NEVER fires for a client abort of this POST. express.json()
+      // has already consumed the body, so the request stream is already destroyed/closed by the time we get
+      // here; only `res.on('close')` and the socket fire on an abort (verified on Node 20.19.2 and 22.23.3 with a
+      // real http server). So a tab close / reload does NOT cancel a running chat today; explicit Stop
+      // (POST /session/:id/stop) is what cancels. Do not "fix" this to res.on('close') without a product decision:
+      // that would make every reload kill the run.
       req.on('close', () => {
         if (!res.headersSent) {
           console.log(`AgentMode: Client disconnected for session ${sessionId} — signalling cancellation`);
@@ -11804,6 +11815,21 @@ export const agentModeController = {
   },
 
   // Stop generation for a session
+  /**
+   * ENG-110: GET /api/agent-mode/generating — ids of the CALLER's sessions that currently hold the generation
+   * claim on this instance. Derived from the cap module's per-user map (only the caller's entry is read),
+   * intersected with the session lock Set so a stale slot can never be reported as running.
+   */
+  async getGeneratingSessions(req: AuthenticatedRequest, res: Response) {
+    const user = req.user as User | undefined;
+    if (!user?.userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    const sessionIds = getGeneratingSessionIdsForUser(user.userId).filter((id) => activeSessionGenerations.has(id));
+    res.setHeader?.('Cache-Control', 'no-store');
+    return res.json({ sessionIds });
+  },
+
   async stopGeneration(req: AuthenticatedRequest, res: Response) {
     try {
       const { sessionId } = req.params;
