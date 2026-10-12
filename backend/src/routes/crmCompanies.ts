@@ -17,7 +17,7 @@ router.use(authenticateToken);
 // other CRM list surfaces) — owning the company alone is not enough. Returns 404
 // for both missing and foreign lists so the route is not an existence oracle.
 async function canEditLeadList(userId: string, listId: string): Promise<boolean> {
-  const list = await crmDb.getLeadListById(listId);
+  const list = await crmDb.getLeadListById(listId, { consistentRead: true });
   if (!list) return false;
   return canAccessCrmList(userId, list as any);
 }
@@ -147,7 +147,7 @@ router.post('/:companyId/leads', async (req: Request, res: Response) => {
     const { listId, leadId } = req.body;
     const userId = authReq.user!.userId;
 
-    if (!listId || !leadId) { res.status(400).json({ error: 'listId and leadId required' }); return; }
+    if (typeof listId !== 'string' || !listId || typeof leadId !== 'string' || !leadId) { res.status(400).json({ error: 'listId and leadId required' }); return; }
 
     const company = await companyDb.getCompany(companyId);
     if (!company) { res.status(404).json({ error: 'Company not found' }); return; }
@@ -171,10 +171,10 @@ router.delete('/:companyId/leads/:leadId', async (req: Request, res: Response) =
   const authReq = req as AuthenticatedRequest;
   try {
     const { companyId, leadId } = req.params;
-    const listId = req.query.listId as string;
+    const listId = req.query.listId;
     const userId = authReq.user!.userId;
 
-    if (!listId) { res.status(400).json({ error: 'listId query param required' }); return; }
+    if (typeof listId !== 'string' || !listId) { res.status(400).json({ error: 'listId query param required' }); return; }
 
     const company = await companyDb.getCompany(companyId);
     if (!company) { res.status(404).json({ error: 'Company not found' }); return; }
