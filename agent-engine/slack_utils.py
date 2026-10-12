@@ -141,6 +141,16 @@ def request_task_approval_without_slack(task_id, execution_id, asset_url, filena
             logger.error(f"Backend reported failure sending approval request for task {task_id}")
             return APPROVAL_FAILED
 
+        if response.status_code == 404:
+            # The backend does not have this endpoint yet: the engine was deployed ahead of
+            # it. An older backend cannot ask on any channel but Slack and has no WhatsApp
+            # customers, so there is nobody this could be holding output for. Treat it as no
+            # channel — what happened before this existed — rather than as a failed send,
+            # which would hold the results of every task that requires approval and has no
+            # Slack channel until the backend catches up.
+            logger.warning(f"Approval endpoint not found (backend not yet deployed?); continuing without approval for task {task_id}")
+            return APPROVAL_NO_CHANNEL
+
         if response.status_code == 409:
             try:
                 code = response.json().get('code')
