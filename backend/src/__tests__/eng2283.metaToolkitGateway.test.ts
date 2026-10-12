@@ -132,4 +132,33 @@ describe('ENG-2283 Meta Toolkit gateway', () => {
     await expect(call(deps)).rejects.toThrow('boom');
     expect(deps.recordUsage).not.toHaveBeenCalled();
   });
+
+  it('enforces the API key rateLimitPerMin per credential (429 + retry-after), independent of IP', async () => {
+    const { RateLimiter } = jest.requireActual('../middleware/rateLimiter');
+    const limiter = new RateLimiter();
+    const deps = makeDeps({
+      rateLimiter: limiter,
+      validateApiKey: jest.fn().mockResolvedValue({ userId: 'user-1', keyId: 'key-rl', rateLimitPerMin: 2 }),
+    });
+    await call(deps);
+    await call(deps);
+    const err = await call(deps).catch((e) => e);
+    expect(err).toBeInstanceOf(MetaToolkitAuthError);
+    expect(err.status).toBe(429);
+    expect(err.retryAfterSeconds).toBeGreaterThan(0);
+    expect(deps.execute).toHaveBeenCalledTimes(2);
+    limiter.destroy?.();
+  });
+
+  it('enforces the 60/min OAuth per-user limit', async () => {
+    const limiter = { check: jest.fn().mockReturnValue({ allowed: false, remaining: 0, resetInMs: 30000 }) };
+    const deps = makeDeps({
+      rateLimiter: limiter,
+      validateOAuthToken: jest.fn().mockResolvedValue({ userId: 'user-2', clientId: 'claude' }),
+    });
+    const err = await handleMetaToolkitCall({ authorization: 'Bearer oauth-token', toolName: 'list_campaigns', args: {} }, deps).catch((e) => e);
+    expect(err.status).toBe(429);
+    expect(limiter.check).toHaveBeenCalledWith('meta-toolkit:oauth:user-2', 60);
+    expect(deps.execute).not.toHaveBeenCalled();
+  });
 });

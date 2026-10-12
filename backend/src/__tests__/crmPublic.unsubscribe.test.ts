@@ -51,6 +51,7 @@ import { signUnsubscribeUrl } from '../utils/unsubscribeUrl';
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 app.use('/api/crm/public', publicRouter);
 
 beforeEach(() => {
@@ -73,6 +74,29 @@ function getSig(listId: string, leadId: string, email: string): string {
   });
   return new URL(url).searchParams.get('sig')!;
 }
+
+describe('ENG-2367: RFC 8058 one-click POST to the List-Unsubscribe header URL', () => {
+  it('unsubscribes from a form-encoded List-Unsubscribe=One-Click body with signed query params', async () => {
+    const { signOneClickUnsubscribeUrl } = await import('../utils/unsubscribeUrl');
+    const u = new URL(signOneClickUnsubscribeUrl({ baseUrl: 'https://api.agentweb.pro', listId: 'list-1', leadId: 'lead-1', email: 'user@test.com' }));
+    expect(u.pathname).toBe(path);
+    const res = await request(app)
+      .post(u.pathname + u.search)
+      .type('form')
+      .send('List-Unsubscribe=One-Click');
+    expect(res.status).toBe(200);
+    expect(crmDb.updateLead).toHaveBeenCalledWith('list-1', 'lead-1', expect.objectContaining({ unsubscribedFromGroupEmail: true }));
+  });
+
+  it('rejects a one-click POST whose query sig is forged', async () => {
+    const res = await request(app)
+      .post(`${path}?email=user%40test.com&sig=${'0'.repeat(64)}`)
+      .type('form')
+      .send('List-Unsubscribe=One-Click');
+    expect(res.status).toBe(403);
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
+  });
+});
 
 describe('POST /api/crm/public/.../group-email-unsubscribe (HMAC fix)', () => {
   it('accepts a valid signature regardless of the email-match check', async () => {

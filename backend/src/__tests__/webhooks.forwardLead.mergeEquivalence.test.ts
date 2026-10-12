@@ -1,0 +1,249 @@
+/**
+ * ENG-2320 — forward-lead's existing-lead merge: SEQUENTIAL behaviour is pinned byte-for-byte.
+ *
+ * The fix for the lost-keys race changes HOW the merged customFields reach DynamoDB (one atomic
+ * document-path SET per key instead of one full-map overwrite). It must not change WHAT a
+ * non-racing request produces. This suite drives the real route and the real crmDb against an
+ * executing in-memory table (helpers/leadTableFake.ts) over a matrix of
+ * (existing row x incoming payload) and compares, per case, with a golden file that was
+ * CAPTURED FROM origin/main BEFORE the change (fail-first discipline: the golden is the old
+ * implementation's output, never regenerated to bless new behaviour):
+ *
+ *   - the HTTP status + `event` (lead.updated / lead.unchanged) -> `isUpdated`
+ *   - the stored AW-Leads row, every attribute, `updatedAt` masked
+ *   - the stored AW-LeadLists fieldNames (as the SET of names a reader sees) and leadCount
+ *   - the side effects `isUpdated` gates: CRM sync, drip enrolment, and the `lead` object
+ *     handed to them (its customFields is the merged map the cascade renders)
+ *
+ * A second block drives N concurrent repeat submissions with distinct keys and asserts NO key
+ * is lost — that is the regression this ticket fixes (it fails on origin/main).
+ *
+ * Regenerate the golden ONLY from a known-good baseline:
+ *   GOLDEN_WRITE=1 npx jest src/__tests__/webhooks.forwardLead.mergeEquivalence.test.ts
+ */
+
+import * as fs from 'fs';
+import * as path from 'path';
+import * as crypto from 'crypto';
+import request from 'supertest';
+import express from 'express';
+import { LeadTableFake } from './helpers/leadTableFake';
+import { ADOPT_EXISTING, ADOPT_PAYLOADS, BROWSER_UA, CASES, EMAIL, EXISTING, LISTS, PAYLOADS, PHONE, Payload, REDUCED_KEYS, TOUCH, norm } from './helpers/forwardLeadMergeMatrix';
+
+jest.mock('aws-sdk', () => {
+  const { LeadTableFake: Fake } = require('./helpers/leadTableFake');
+  const fake = new Fake();
+  (globalThis as any).__leadTableFake = fake;
+  const base: any = {
+    config: { update: jest.fn() },
+    DynamoDB: { DocumentClient: jest.fn(() => fake.client()) },
+    S3: jest.fn(() => ({})),
+    SecretsManager: jest.fn(() => ({})),
+  };
+  const proxy: any = new Proxy(base, { get: (t, p) => (p === 'default' ? proxy : p in t ? t[p] : jest.fn(() => ({}))) });
+  return proxy;
+});
+jest.mock('../services/orgLeadNotificationService', () => ({ dispatchLeadCreated: jest.fn().mockResolvedValue(undefined) }));
+jest.mock('../services/metaAccountCredentials', () => ({ getMetaAccountCredentials: jest.fn() }));
+jest.mock('../services/dripSequenceDb', () => ({
+  dripSequenceDb: { getSequencesByAutoEnrollList: jest.fn().mockResolvedValue([]), bulkEnroll: jest.fn() },
+}));
+jest.mock('../services/externalCrmSyncService', () => ({
+  externalCrmSyncService: { autoSyncLead: jest.fn().mockResolvedValue(undefined) },
+}));
+jest.mock('../services/leadListAlertService', () => ({
+  leadListAlertService: { notifyLeadListOwnerIfConfigured: jest.fn() },
+}));
+jest.mock('../services/leadCaptureFailureService', () => ({ recordLeadCaptureFailure: jest.fn() }));
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: { updateEmailDraftForLead: jest.fn(), getCrmSenders: jest.fn() },
+}));
+jest.mock('../services/resendService', () => ({
+  resendService: { sendEmail: jest.fn(), sendSystemEmail: jest.fn().mockResolvedValue({ id: 'email_1' }) },
+}));
+jest.mock('../services/webhookService', () => ({
+  webhookService: { initialize: jest.fn(), verifyWebhook: jest.fn(), extractEmailDomain: jest.fn(), generateEventId: jest.fn() },
+}));
+jest.mock('../services/emailEventsDb', () => ({ emailEventsDb: { eventExists: jest.fn(), addEmailEvent: jest.fn() } }));
+
+import webhookRouter from '../routes/webhooks';
+import { externalCrmSyncService } from '../services/externalCrmSyncService';
+import { dripSequenceDb } from '../services/dripSequenceDb';
+import { dispatchLeadCreated } from '../services/orgLeadNotificationService';
+
+const fake: LeadTableFake = (globalThis as any).__leadTableFake;
+const app = express();
+app.use(express.json());
+app.use('/api/webhooks', webhookRouter);
+
+// Default: the reduced golden committed to the repo. FULL=1 runs the whole matrix (the one-off
+// migration proof) and GOLDEN_FILE points it at a golden kept outside the repo.
+const FULL = process.env.FULL === '1';
+const GOLDEN_PATH = process.env.GOLDEN_FILE || path.join(__dirname, 'fixtures', 'forwardLeadMergeEquivalence.reduced.golden.json');
+const keyOf = ([e, p, l]: [string, string, string]) => `${e} x ${p} @ ${l}`;
+const SELECTED = FULL ? CASES : CASES.filter((c) => REDUCED_KEYS.includes(keyOf(c)));
+const digest = (v: any) => crypto.createHash('sha1').update(JSON.stringify(v)).digest('hex').slice(0, 16);
+const settle = () => new Promise((r) => setTimeout(r, 25));
+
+async function runCase(existing: any, list: any, payload: Payload, adopt = false) {
+  fake.reset();
+  jest.clearAllMocks();
+  fake.seedList(list);
+  fake.seedLead(existing);
+  let req = request(app).post('/api/webhooks/forward-lead');
+  for (const [k, v] of Object.entries(payload.headers ?? {})) req = req.set(k, v);
+  // the adopt branch is the phone-only one: no email, a synthetic smoke-test number
+  const res = await req.send(adopt ? { listId: 'L0', phone: PHONE, ...payload.body } : { listId: 'L0', email: EMAIL, ...payload.body });
+  await settle();
+  const storedList = fake.list('L0');
+  const syncCalls = (externalCrmSyncService.autoSyncLead as jest.Mock).mock.calls;
+  return norm({
+    status: res.status,
+    event: res.body?.event,
+    leads: fake.leadsIn('L0'),
+    listFieldNames: Array.from(new Set((storedList.fieldNames as string[]) ?? [])).sort(),
+    listHasFieldNamesAttr: storedList.fieldNames !== undefined,
+    leadCount: storedList.leadCount,
+    sideEffects: {
+      // The `lead` object handed to the cascade (its customFields is what the owner alert and
+      // CRM push render). Stored as a digest of its canonical JSON to keep the golden readable;
+      // GOLDEN_DEBUG=1 prints the full object per case when a digest differs.
+      crmSync: syncCalls.map((c) => ({ crm: c[3], event: c[4], leadDigest: digest(norm(JSON.parse(JSON.stringify(c[2])))), leadCustomFieldKeys: Object.keys(c[2].customFields ?? {}) })),
+      enrol: (dripSequenceDb.getSequencesByAutoEnrollList as jest.Mock).mock.calls.length,
+      ownerNotifyHook: (dispatchLeadCreated as jest.Mock).mock.calls.length,
+    },
+  });
+}
+
+describe('forward-lead existing-lead merge — sequential equivalence with origin/main', () => {
+  const writing = process.env.GOLDEN_WRITE === '1';
+  const golden: Record<string, any> = writing ? {} : JSON.parse(fs.readFileSync(GOLDEN_PATH, 'utf8'));
+
+  afterAll(() => {
+    if (writing) fs.writeFileSync(GOLDEN_PATH, JSON.stringify(golden, null, 1) + '\n');
+  });
+
+  it('covers the whole matrix (golden has exactly these cases)', () => {
+    if (writing) return;
+    expect(Object.keys(golden).sort()).toEqual(SELECTED.map(keyOf).sort());
+    expect(SELECTED.map(keyOf).sort()).toEqual((FULL ? CASES.map(keyOf) : REDUCED_KEYS).sort());
+  });
+
+  it.each(SELECTED)('%s x %s @ %s', async (e, p, l) => {
+    const adopt = e in ADOPT_EXISTING;
+    const got = await runCase(adopt ? ADOPT_EXISTING[e] : EXISTING[e], LISTS[l], adopt ? ADOPT_PAYLOADS[p] : PAYLOADS[p], adopt);
+    const key = keyOf([e, p, l]);
+    if (writing) { golden[key] = got; return; }
+    expect(got).toEqual(golden[key]);
+  });
+});
+
+describe('forward-lead existing-lead merge — concurrent repeat submissions lose no customFields keys (ENG-2320)', () => {
+  const N = 12;
+  const fire = async (extra: (i: number) => Record<string, any> = () => ({})) => {
+    fake.reset();
+    fake.jitterMs = 4;
+    fake.seedList({ ...LISTS.normal, fieldNames: [] });
+    fake.seedLead({ ...EXISTING.bare, customFields: { source: 'lp', seed: 1 } });
+    const res = await Promise.all(
+      Array.from({ length: N }, (_, i) =>
+        request(app).post('/api/webhooks/forward-lead').send({ listId: 'L0', email: EMAIL, source: 'lp', customFields: { [`k_${i}`]: i + 1 }, ...extra(i) }),
+      ),
+    );
+    await settle();
+    return res;
+  };
+
+  it.each([1, 2, 3])('run %i: all 12 distinct keys survive, no 5xx, one row', async () => {
+    const res = await fire();
+    expect(res.map((r) => r.status).filter((s) => s >= 500)).toEqual([]);
+    const rows = fake.leadsIn('L0');
+    expect(rows).toHaveLength(1);
+    const cf = rows[0].customFields;
+    for (let i = 0; i < N; i++) expect(cf[`k_${i}`]).toBe(i + 1);
+    expect(cf.seed).toBe(1);
+    expect(cf.source).toBe('lp');
+    // every key is in the list's field names, and no request lost another's name (values are
+    // i+1: a falsy value is deliberately never offered as a field name)
+    const fn = new Set<string>(fake.list('L0').fieldNames);
+    for (let i = 0; i < N; i++) expect(fn.has(`k_${i}`)).toBe(true);
+    expect(fake.list('L0').leadCount).toBe(1);
+  });
+
+  it('attribution + match-quality under concurrency: firstTouch/utm immutable, lastTouch refreshed, clientIp written once', async () => {
+    fake.reset();
+    fake.jitterMs = 4;
+    fake.seedList({ ...LISTS.normal, fieldNames: [] });
+    fake.seedLead({ ...EXISTING.firstTouchOnly, customFields: { source: 'lp' } });
+    await Promise.all(
+      Array.from({ length: N }, (_, i) =>
+        request(app).post('/api/webhooks/forward-lead')
+          .set('User-Agent', BROWSER_UA).set('X-Forwarded-For', `203.0.113.${10 + i}`)
+          .send({ listId: 'L0', email: EMAIL, customFields: { [`k_${i}`]: i + 1 }, attribution: { ...TOUCH, utm: { source: `s${i}` } }, fbp: `fb.${i}` }),
+      ),
+    );
+    await settle();
+    const row = fake.leadsIn('L0')[0];
+    for (let i = 0; i < N; i++) expect(row.customFields[`k_${i}`]).toBe(i + 1);
+    expect(row.firstTouch.utm.source).toBe('seed'); // immutable
+    expect(row.lastTouch.utm.source).toMatch(/^s\d+$/); // refreshed by SOME request
+    expect(row.clientIp).toMatch(/^203\.0\.113\.\d+$/);
+    // write-once: the stored value is one of the 12 and every later write was an if_not_exists no-op
+    const ipSets = fake.updates.filter((u) => /clientIp/.test(JSON.stringify(u.UpdateExpression)));
+    for (const u of ipSets) expect(u.UpdateExpression).toMatch(/clientIp = if_not_exists\(clientIp, :clientIp\)/);
+  });
+});
+
+describe('forward-lead — the roadmap marker and the phone adopt branch are per-key too (ENG-2320)', () => {
+  it('concurrent AI-readiness repeats: every key AND the roadmap marker survive (the marker used to rewrite the whole snapshot)', async () => {
+    fake.reset();
+    fake.jitterMs = 4;
+    fake.seedList({ ...LISTS.normal, fieldNames: [] });
+    fake.seedLead({ ...EXISTING.bare, customFields: { source: 'ai-readiness-popup', seed: 1 } });
+    const N = 12;
+    const res = await Promise.all(
+      Array.from({ length: N }, (_, i) =>
+        request(app).post('/api/webhooks/forward-lead').send({
+          listId: 'L0', email: EMAIL, source: 'ai-readiness-popup', customFields: { stage: 2, [`k_${i}`]: i + 1 },
+        }),
+      ),
+    );
+    await settle();
+    await settle();
+    expect(res.map((r) => r.status).filter((s) => s >= 500)).toEqual([]);
+    const cf = fake.leadsIn('L0')[0].customFields;
+    for (let i = 0; i < N; i++) expect(cf[`k_${i}`]).toBe(i + 1);
+    expect(cf.seed).toBe(1);
+    expect(typeof cf.roadmapEmailSentAt).toBe('string');
+    expect(cf.roadmapEmailStage).toBe(2);
+  });
+
+  it('the marker write carries ONLY the two keys it owns, flagged per key', async () => {
+    fake.reset();
+    fake.seedList(LISTS.normal);
+    fake.seedLead(EXISTING.full);
+    await request(app).post('/api/webhooks/forward-lead').send({ listId: 'L0', email: EMAIL, source: 'ai-readiness-popup', customFields: { stage: 3 } });
+    await settle();
+    const marker = fake.updates.filter((u) => u.TableName === 'AW-Leads').find((u) => Object.values(u.ExpressionAttributeNames ?? {}).includes('roadmapEmailSentAt'));
+    expect(marker).toBeTruthy();
+    expect(marker!.UpdateExpression).not.toMatch(/customFields = :customFields/);
+    expect(Object.values(marker!.ExpressionAttributeNames).sort()).toEqual(['customFields', 'roadmapEmailSentAt', 'roadmapEmailStage']);
+  });
+
+  it('concurrent phone-only adopts lose no keys', async () => {
+    fake.reset();
+    fake.jitterMs = 4;
+    fake.seedList({ ...LISTS.normal, fieldNames: [] });
+    fake.seedLead(ADOPT_EXISTING.adoptFull);
+    const N = 12;
+    await Promise.all(
+      Array.from({ length: N }, (_, i) =>
+        request(app).post('/api/webhooks/forward-lead').send({ listId: 'L0', phone: PHONE, source: 'phone-lp', customFields: { [`k_${i}`]: i + 1 } }),
+      ),
+    );
+    await settle();
+    const cf = fake.leadsIn('L0')[0].customFields;
+    for (let i = 0; i < N; i++) expect(cf[`k_${i}`]).toBe(i + 1);
+    expect(cf.a).toBe(1);
+  });
+});

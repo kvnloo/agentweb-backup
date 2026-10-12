@@ -704,7 +704,7 @@ describe('CRM Routes', () => {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
-      expect(crmDb.createLead).toHaveBeenCalledWith('list1', mockRequest.body);
+      expect(crmDb.createLead).toHaveBeenCalledWith('list1', mockRequest.body, 'manual');
       expect(mockResponse.status).toHaveBeenCalledWith(201);
       expect(mockResponse.json).toHaveBeenCalledWith(mockLead);
     });
@@ -781,7 +781,7 @@ describe('CRM Routes', () => {
           lastTouch: expect.objectContaining({
             utm: expect.objectContaining({ source: 'meta' }),
           }),
-        })
+        }), 'manual'
       );
       // Envelope stripped so createLead doesn't see an unknown `attribution` key
       const call = (crmDb.createLead as jest.Mock).mock.calls[0][1];
@@ -811,6 +811,42 @@ describe('CRM Routes', () => {
       const call = (crmDb.createLead as jest.Mock).mock.calls[0][1];
       expect(call.firstTouch).toBeUndefined();
       expect(call.lastTouch).toBeUndefined();
+    });
+
+    // ENG-2322: createLead's duplicate-email pre-check throws a typed error. For the owner's own
+    // create that is a conflict (409 + the existing leadId), not a 500 server failure.
+    const postCreate = async () => {
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads' && r.route?.methods?.post
+      );
+      await handler!.route!.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+    };
+
+    it('returns 409 with the existing leadId and the unchanged message on a duplicate email', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', name: 'L', userId: 'test-user-id' });
+      const message = 'Lead with email "dup@example.com" already exists in this list';
+      (crmDb.createLead as jest.Mock).mockRejectedValue(
+        Object.assign(new Error(message), { duplicateEmail: true, existingLead: { leadId: 'lead_existing', email: 'dup@example.com' } }),
+      );
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { email: 'dup@example.com' };
+
+      await postCreate();
+
+      expect(mockResponse.status).toHaveBeenCalledWith(409);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message, duplicate: true, leadId: 'lead_existing' });
+    });
+
+    it('still returns 500 for a non-duplicate createLead failure', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', name: 'L', userId: 'test-user-id' });
+      (crmDb.createLead as jest.Mock).mockRejectedValue(new Error('dynamo down'));
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { email: 'x@example.com' };
+
+      await postCreate();
+
+      expect(mockResponse.status).toHaveBeenCalledWith(500);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'dynamo down' });
     });
   });
 
@@ -1704,6 +1740,8 @@ describe('CRM Routes', () => {
         subject: 'Test Subject',
         html: '<p>Test content</p>',
       });
+      // ENG-2367: one-off sends never carry bulk-mail List-Unsubscribe headers.
+      expect((resendService.sendEmail as jest.Mock).mock.calls[0][0].headers).toBeUndefined();
       expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', { emailDraft: null });
       expect(mockResponse.json).toHaveBeenCalled();
     });
@@ -2272,7 +2310,7 @@ describe('CRM Routes', () => {
       }
 
       expect(crmDb.createLeadList).not.toHaveBeenCalled();
-      expect(crmDb.batchCreateLeads).toHaveBeenCalledWith('existing-list', expect.any(Array));
+      expect(crmDb.batchCreateLeads).toHaveBeenCalledWith('existing-list', expect.any(Array), { origin: 'integration' });
     });
 
     it('should return 400 if no subscribers to sync', async () => {
@@ -2923,7 +2961,41 @@ describe('CRM Routes', () => {
       }
 
       expect(mockResponse.status).toHaveBeenCalledWith(400);
-      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'listType must be "sales" or "customers"' });
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'listType must be "sales", "customers" or "session"' });
+    });
+
+    // ENG-2311: 'session' is a valid set-once type; the contract is the vocabulary + set-once.
+    it('should accept "session" when listType is not yet set', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.updateLeadList as jest.Mock).mockResolvedValue({ ...mockList, listType: 'session' });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { listType: 'session' };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.updateLeadList).toHaveBeenCalledWith('list1', { listType: 'session' });
+    });
+
+    it.each(['session', 'sales', 'customers'])('set-once: refuses to change a list already typed "%s"', async (existing) => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id', listType: existing };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { listType: existing === 'session' ? 'sales' : 'session' };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'listType is already set and cannot be changed' });
+      expect(crmDb.updateLeadList).not.toHaveBeenCalled();
     });
   });
 

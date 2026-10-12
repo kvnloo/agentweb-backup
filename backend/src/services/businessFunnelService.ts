@@ -5,6 +5,7 @@ import { getAccountByPlatform } from "./connectedAccountsDb";
 import { getProspectMeetingMetrics, ProspectMeetingMetrics } from "./prospectMeetingService";
 import { getSmartLeadMetrics, SmartLeadMetrics } from "./smartleadService";
 import { getUnipileOutreachMetrics, UnipileOutreachMetrics } from "./unipileOutreachService";
+import { excludeSessionLists } from '../utils/sessionList';
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -411,7 +412,7 @@ interface LeadData {
 
 async function fetchLeadCount(periodStart: Date): Promise<LeadData> {
   try {
-    const leadLists = await crmDb.getLeadListsByUserId(FOUNDER_USER_ID);
+    const leadLists = excludeSessionLists(await crmDb.getLeadListsByUserId(FOUNDER_USER_ID)); // ENG-2311: session rows are not leads
     let total = 0;
     let thisMonth = 0;
 
@@ -456,7 +457,6 @@ async function fetchUserAndSubscriptionData(
   try {
     const allUsers = await userDb.scanWithFilter("attribute_exists(userId)", {});
 
-    const currentMonth = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}`;
 
     let totalUsers = allUsers.length;
     let newUsers = 0;
@@ -488,10 +488,11 @@ async function fetchUserAndSubscriptionData(
         churnedUsers++;
       }
 
-      // Prefer lastActiveAt (set on session creation, non-delegated) over token usage for active user count.
-      // lastActiveAt is more accurate — it reflects real user interactions regardless of token consumption.
-      // Fall back to tokenUsage for users who were active before lastActiveAt was introduced.
-      const lastActive = user.lastActiveAt || (user.tokenUsage?.month === currentMonth && user.tokenUsage?.totalTokens > 0 ? new Date().toISOString() : null);
+      // lastActiveAt (set on session creation, non-delegated) reflects real user interactions
+      // regardless of token consumption. It used to fall back to the legacy tokenUsage counter
+      // for users active before lastActiveAt existed; ENG-1250 AC7 retires the counter, and
+      // verified 2026-10-05 that none of the 24 users with counter activity lacks lastActiveAt.
+      const lastActive = user.lastActiveAt || null;
       if (lastActive && new Date(lastActive) >= periodStart) {
         activeUsers++;
       }
@@ -555,8 +556,8 @@ function buildSEOPipeline(
 
   // 4. Active
   const activeSources = userData.status === "ok"
-    ? [safeSource("Token Usage (current month)", userData.data.activeUsers)]
-    : [errorSource("Token Usage", "Failed to fetch usage data")];
+    ? [safeSource("Active Users (last activity in period)", userData.data.activeUsers)]
+    : [errorSource("Active Users", "Failed to fetch user data")];
   stages.push(makeStage("Active", userData.data.activeUsers, userData.previousData.activeUsers, userData.data.newUsers, activeSources));
 
   // 5. Paid

@@ -54,7 +54,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockUsers = {};
   mockOrgMembers = [];
-  mockListCampaigns.mockResolvedValue([]);
+  mockListCampaigns.mockResolvedValue({ campaigns: [], truncated: false, pagesFetched: 1 });
   service = new AgentModeService();
 });
 

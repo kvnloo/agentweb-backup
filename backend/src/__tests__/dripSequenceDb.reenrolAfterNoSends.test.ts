@@ -15,8 +15,14 @@
  */
 const mockQuery = jest.fn();
 const mockPut = jest.fn();
+const mockTransactWrite = jest.fn();
 jest.mock('aws-sdk', () => {
-  const client = () => ({ query: mockQuery, put: mockPut, update: jest.fn(() => ({ promise: () => Promise.resolve({}) })) });
+  const client = () => ({
+    query: mockQuery,
+    put: mockPut,
+    transactWrite: mockTransactWrite,
+    update: jest.fn(() => ({ promise: () => Promise.resolve({}) })),
+  });
   return {
     __esModule: true,
     default: { DynamoDB: { DocumentClient: jest.fn().mockImplementation(client) }, config: { update: jest.fn() } },
@@ -29,10 +35,22 @@ import { dripSequenceDb } from '../services/dripSequenceDb';
 
 const rows = (items: any[]) => ({ promise: () => Promise.resolve({ Items: items }) });
 
+/** ENG-2127: enrollLead writes via a transaction (the real enrollment Put plus one
+ * claim-item Put per identity candidate), not a bare `put`. Pull the actual enrollment
+ * item back out — distinguishable from a claim item by its `enr_` id prefix — so these
+ * tests can keep asserting on "what got written" the same way they did before. */
+const enrollmentPuts = () =>
+  mockTransactWrite.mock.calls
+    .map(([params]) => params.TransactItems.find((t: any) => t.Put?.Item?.enrollmentId?.startsWith('enr_')))
+    .filter(Boolean)
+    .map((t: any) => t.Put.Item);
+
 beforeEach(() => {
   mockQuery.mockReset();
   mockPut.mockReset();
   mockPut.mockImplementation(() => ({ promise: () => Promise.resolve({}) }));
+  mockTransactWrite.mockReset();
+  mockTransactWrite.mockImplementation(() => ({ promise: () => Promise.resolve({}) }));
 });
 
 const enrollment = (over: Record<string, unknown> = {}) => ({
@@ -52,7 +70,7 @@ describe('bulkEnroll and a prior enrollment', () => {
 
     const result = await dripSequenceDb.bulkEnroll([input as any]);
 
-    expect(mockPut).toHaveBeenCalled();
+    expect(enrollmentPuts()).toHaveLength(1);
     expect(result.enrolled).toBe(1);
   });
 
@@ -61,7 +79,7 @@ describe('bulkEnroll and a prior enrollment', () => {
 
     const result = await dripSequenceDb.bulkEnroll([input as any]);
 
-    expect(mockPut).not.toHaveBeenCalled();
+    expect(mockTransactWrite).not.toHaveBeenCalled();
     expect(result.enrolled).toBe(0);
   });
 
@@ -70,7 +88,7 @@ describe('bulkEnroll and a prior enrollment', () => {
 
     const result = await dripSequenceDb.bulkEnroll([input as any]);
 
-    expect(mockPut).not.toHaveBeenCalled();
+    expect(mockTransactWrite).not.toHaveBeenCalled();
     expect(result.enrolled).toBe(0);
   });
 
@@ -79,7 +97,7 @@ describe('bulkEnroll and a prior enrollment', () => {
 
     const result = await dripSequenceDb.bulkEnroll([input as any]);
 
-    expect(mockPut).toHaveBeenCalled();
+    expect(enrollmentPuts()).toHaveLength(1);
     expect(result.enrolled).toBe(1);
   });
 });
@@ -115,7 +133,7 @@ describe('dedup survives the identity moving under an enrolled lead', () => {
 
     expect(result.skipped).toBe(1);
     expect(result.enrolled).toBe(0);
-    expect(mockPut).not.toHaveBeenCalled();
+    expect(mockTransactWrite).not.toHaveBeenCalled();
   });
 
   it('finds the old email-keyed row when the address was since removed', async () => {
@@ -132,7 +150,7 @@ describe('dedup survives the identity moving under an enrolled lead', () => {
     } as any]);
 
     expect(result.skipped).toBe(1);
-    expect(mockPut).not.toHaveBeenCalled();
+    expect(mockTransactWrite).not.toHaveBeenCalled();
   });
 
   it('still enrols when NO candidate matches', async () => {
@@ -143,7 +161,7 @@ describe('dedup survives the identity moving under an enrolled lead', () => {
     } as any]);
 
     expect(result.enrolled).toBe(1);
-    expect(mockPut).toHaveBeenCalledTimes(1);
+    expect(enrollmentPuts()).toHaveLength(1);
   });
 
   it('writes only leadEmail — identityCandidates is a lookup aid, never persisted', async () => {
@@ -153,7 +171,7 @@ describe('dedup survives the identity moving under an enrolled lead', () => {
       ...input, leadEmail: 'ada@acme.io', identityCandidates: ['ada@acme.io', profile],
     } as any]);
 
-    const item = mockPut.mock.calls[0][0].Item;
+    const item = enrollmentPuts()[0];
     expect(item.leadEmail).toBe('ada@acme.io');
     expect(item.identityCandidates).toBeUndefined();
   });

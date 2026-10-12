@@ -132,6 +132,9 @@ router.put('/:orgId/memory/:memoryId', async (req, res) => {
     const memory = await orgMemoryDb.updateMemory(orgId, memoryId, updates);
     res.json({ memory });
   } catch (error: any) {
+    if (error?.code === 'MEMORY_NOT_FOUND') {
+      return res.status(404).json({ error: 'Memory not found' });
+    }
     const status = error.message?.includes('Invalid category') || error.message?.includes('Content') ? 400 : 500;
     res.status(status).json({ error: error.message || 'Failed to update org memory' });
   }

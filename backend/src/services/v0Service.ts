@@ -6,6 +6,9 @@ import path from "path";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken, getLandingPagesConfig } from "../utils/secretsManager";
 import { resolveLandingPageGa4 } from "../utils/landingPageGa4";
 import { injectGtmIntoLayoutFiles } from "../utils/gtmInjection";
+import { injectUtmDecorationIntoLayoutFiles, type LanderUtmLayers } from "../utils/landerUtmDecoration";
+import { getCustomerUtmDefault, getLanderUtmOverride } from "./landerUtmStore";
+import { isAutoSessionTrackingEnabled } from "../utils/sessionTrackingInjection";
 import { injectPixelIntoLayoutFiles, injectPixelIntoLayout, verifyPixelInjection } from "../utils/pixelInjection";
 import { injectGoogleAdsIntoLayoutFiles, injectGoogleAdsIntoLayout, verifyGoogleAdsInjection } from "../utils/googleAdsInjection";
 import { metaService } from "./metaService";
@@ -528,6 +531,12 @@ export interface PendingIteration {
   baseVersionId: string;
   messageHash: string;
   startedAt: string;
+  /**
+   * ENG-1728: true only between the pre-send write and v0 accepting the message. Absent
+   * means the send is known to have reached v0 (including records written before this
+   * field existed, which were only ever written after the send).
+   */
+  unsent?: boolean;
 }
 
 export interface GeneratedLandingPage {
@@ -656,6 +665,18 @@ export interface GeneratedLandingPage {
    * exists to refuse a launch over.
    */
   googleAdsTrackingInstalled?: boolean;
+  /**
+   * ENG-2327: the `listType:'session'` list the AgentWeb SDK tag on this page writes visitor
+   * sessions into. Site-level in effect, like gtmContainerId: the tag lives in the shared root
+   * layout, so every page of one repo carries the same id (kept in sync across siblings).
+   * Written ONLY by sessionTrackingService; set once the list exists, even if the tag commit
+   * failed, so a retry reuses the list instead of creating a second one.
+   */
+  sessionTrackingListId?: string;
+  /** True once the SDK tag is committed to the repo's main branch (false/absent = not installed). */
+  sessionTrackingInstalled?: boolean;
+  /** Last enablement failure, for the portal/Emma to surface; cleared by the next success. */
+  sessionTrackingError?: string;
   /**
    * Per-page (not site-level) — whether the generated form component was confirmed,
    * via the validation-retry check, to actually call fbq('track','Lead') on submit. v0 authors
@@ -2145,166 +2166,119 @@ async function addPageToExistingRepo(
           }
         }
 
-        // Same verify-and-retry as deployLandingPage — a sub-page has its OWN form
-        // component, so the Lead event must be checked here too, not just on the first page.
-        if (effectivePixelId) {
-          // ENG-482: validate against the file set that ACTUALLY ships (post-remap), not
-          // previewFiles (v0's raw, unfiltered zip). remapFilesForSubPage's skip-list drops
-          // files like app/layout.tsx — v0's own scaffold layout.tsx can independently
-          // contain something matching the fbq('track','Lead') regex, which used to make
-          // this check pass against code that never reaches the deployed site at all.
-          const pixelCheck = validatePixelLeadEvent(remapFilesForSubPage(previewFiles, slug, name));
-          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead) {
-            console.warn(`[V0 SERVICE] Meta Pixel Lead event missing for /${slug} (attempt ${validationAttempt + 1}): ${pixelCheck.reason}`);
+        // ENG-2099: all three enhancement checks run up front, and whichever ones still
+        // fail are batched into ONE v0 message + ONE wait this attempt, instead of each
+        // check sending its own correction and `continue`-ing on success. The old
+        // per-check continue consumed a whole loop iteration each — on a page needing
+        // all three, bridge-out's own guard (validationAttempt < V0_VALIDATION_MAX_RETRIES)
+        // was already false by the time pixel and ads had each taken a turn, so it was
+        // structurally unreachable, not merely unlucky (ENG-2099). Batching means no
+        // correction can consume another's turn: every configured one is evaluated, and
+        // gets a correction attempt, every round.
+        //
+        // Same file-set rationale as before (ENG-482): validate against what ACTUALLY
+        // ships (post-remap), not previewFiles (v0's raw zip, whose scaffold layout.tsx
+        // can independently satisfy an inline-pattern check against code the site never
+        // serves).
+        const pixelCheck = effectivePixelId
+          ? validatePixelLeadEvent(remapFilesForSubPage(previewFiles, slug, name))
+          : undefined;
+        const adsCheck = subPageGoogleAds
+          ? validateGoogleAdsConversion(remapFilesForSubPage(previewFiles, slug, name))
+          : undefined;
+        const bridgeCheck = (leadListId && bridgeOutUrl)
+          ? validateBridgeOutRedirect(remapFilesForSubPage(previewFiles, slug, name), bridgeOutUrl)
+          : undefined;
 
-            await guardedV0CorrectionMessage({
-              userId,
-              scopeId: existingPage.siteId ?? existingPage.id,
-              chatId,
-              attempt: validationAttempt,
-              send: (meteringKey) => withRetry(
-                meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
-                  chatId,
-                  message:
-                    "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
-                    "generate `const eventId = crypto.randomUUID();`, include it as an \"eventId\" field in the " +
-                    "fetch('/api/capture', ...) JSON body, and on a successful response call " +
-                    "`window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });`. " +
-                    `Issue: ${pixelCheck.reason}`,
-                })),
-                "v0 correction message (pixel lead event, additional page)",
-                undefined, undefined, undefined,
-                { retryOnTimeout: false }
-              ),
-            });
+        const canCorrectThisAttempt =
+          validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead;
+        const needsPixelCorrection = !!pixelCheck && !pixelCheck.ok && canCorrectThisAttempt;
+        const needsAdsCorrection = !!adsCheck && !adsCheck.ok && canCorrectThisAttempt;
+        const needsBridgeCorrection = !!bridgeCheck && !bridgeCheck.ok && canCorrectThisAttempt;
 
-            const correctedVersionId = await awaitOptionalV0Correction(
-              `v0 correction (pixel lead event) for /${slug}`,
-              () =>
-                waitForCompletedV0Version(v0, chatId, `v0 correction (pixel lead event) for /${slug}`, {
-                  heartbeat: () => touchLandingPageRecord(id),
-                  deadline: buildDeadline,
-                  afterVersionId: versionId,
-                })
-            ,
-      correctionState
-    );
-            // undefined = v0 never produced a corrected version. Fall through to the
-            // `proceeding without it` path below instead of failing the whole page.
-            if (correctedVersionId) {
-              versionId = correctedVersionId;
-              continue;
-            }
+        if (needsPixelCorrection || needsAdsCorrection || needsBridgeCorrection) {
+          const messageParts: string[] = [];
+          const labelParts: string[] = [];
+          if (needsPixelCorrection) {
+            console.warn(`[V0 SERVICE] Meta Pixel Lead event missing for /${slug} (attempt ${validationAttempt + 1}): ${pixelCheck!.reason}`);
+            messageParts.push(
+              "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
+              "generate `const eventId = crypto.randomUUID();`, include it as an \"eventId\" field in the " +
+              "fetch('/api/capture', ...) JSON body, and on a successful response call " +
+              "`window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });`. " +
+              `Issue: ${pixelCheck!.reason}`
+            );
+            labelParts.push("pixel lead event");
           }
+          if (needsAdsCorrection) {
+            console.warn(`[V0 SERVICE] Google Ads conversion call missing for /${slug} (attempt ${validationAttempt + 1}): ${adsCheck!.reason}`);
+            messageParts.push(
+              "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
+              "ON A SUCCESSFUL submission response only, call the platform-owned helper with the googleAds " +
+              "argument included: `await fireLeadTracking({ email, eventId, googleAds })`. Do NOT hand-author " +
+              "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
+              "shared root layout. " +
+              `Issue: ${adsCheck!.reason}`
+            );
+            labelParts.push("google ads conversion");
+          }
+          if (needsBridgeCorrection) {
+            console.warn(`[V0 SERVICE] Bridge-out redirect missing for /${slug} (attempt ${validationAttempt + 1}): ${bridgeCheck!.reason}`);
+            messageParts.push(
+              "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
+              `redirect the visitor via window.location.href to ${bridgeOutUrl} with the submitted email ` +
+              "appended as an email= query param (URL-encoded). " +
+              `Issue: ${bridgeCheck!.reason}`
+            );
+            labelParts.push("bridge-out redirect");
+          }
+          const correctionLabel = labelParts.join(", ");
+
+          await guardedV0CorrectionMessage({
+            userId,
+            scopeId: existingPage.siteId ?? existingPage.id,
+            chatId,
+            attempt: validationAttempt,
+            send: (meteringKey) => withRetry(
+              meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
+                chatId,
+                message: messageParts.join("\n\n"),
+              })),
+              `v0 correction message (${correctionLabel}, additional page)`,
+              undefined, undefined, undefined,
+              { retryOnTimeout: false }
+            ),
+          });
+
+          const correctedVersionId = await awaitOptionalV0Correction(
+            `v0 correction (${correctionLabel}) for /${slug}`,
+            () =>
+              waitForCompletedV0Version(v0, chatId, `v0 correction (${correctionLabel}) for /${slug}`, {
+                heartbeat: () => touchLandingPageRecord(id),
+                deadline: buildDeadline,
+                afterVersionId: versionId,
+              }),
+            correctionState
+          );
+          // undefined = v0 never produced a corrected version for any of the batched
+          // corrections. Fall through to the per-check `proceeding without it` reporting
+          // below instead of failing the whole page.
+          if (correctedVersionId) {
+            versionId = correctedVersionId;
+            continue;
+          }
+        }
+
+        if (pixelCheck) {
           pixelLeadEventVerified = pixelCheck.ok;
           if (!pixelCheck.ok) {
             console.warn(`[V0 SERVICE] Meta Pixel Lead event still missing for /${slug} after retries — proceeding without it: ${pixelCheck.reason}`);
           }
         }
-
-        // ENG-1524. Sibling of the deployLandingPage check, and it has to exist in BOTH
-        // places for the same reason the pixel check does: a sub-page has its own form
-        // component, and `subPageGoogleAds` above inherits the site's conversion pair, so
-        // the generated handler is expected to fire it. Adding this on one branch only is
-        // how the original gap happened.
-        //
-        // Post-remap file set (ENG-482), like the pixel check: previewFiles is v0's raw
-        // zip, and its scaffold layout.tsx can carry a gtag conversion that never ships —
-        // which would satisfy the inline-pattern arm against code the site never sees.
-        if (subPageGoogleAds) {
-          const adsCheck = validateGoogleAdsConversion(remapFilesForSubPage(previewFiles, slug, name));
-          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead) {
-            console.warn(`[V0 SERVICE] Google Ads conversion call missing for /${slug} (attempt ${validationAttempt + 1}): ${adsCheck.reason}`);
-
-            await guardedV0CorrectionMessage({
-              userId,
-              scopeId: existingPage.siteId ?? existingPage.id,
-              chatId: chatId!,
-              attempt: validationAttempt,
-              send: (meteringKey) => withRetry(
-                meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
-                  chatId: chatId!,
-                  message:
-                    "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
-                    "ON A SUCCESSFUL submission response only, call the platform-owned helper with the googleAds " +
-                    "argument included: `await fireLeadTracking({ email, eventId, googleAds })`. Do NOT hand-author " +
-                    "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
-                    "shared root layout. " +
-                    `Issue: ${adsCheck.reason}`,
-                })),
-                "v0 correction message (google ads conversion, sub-page)",
-                undefined, undefined, undefined,
-                { retryOnTimeout: false }
-              ),
-            });
-
-            const correctedVersionId = await awaitOptionalV0Correction(
-              "v0 correction (google ads conversion, sub-page)",
-              () =>
-                waitForCompletedV0Version(v0, chatId!, "v0 correction (google ads conversion, sub-page)", {
-                  heartbeat: () => touchLandingPageRecord(id),
-                  deadline: buildDeadline,
-                  afterVersionId: versionId,
-                })
-            ,
-      correctionState
-    );
-            // undefined = v0 never produced a corrected version. Fall through to the
-            // `proceeding without it` path below instead of failing the whole page.
-            if (correctedVersionId) {
-              versionId = correctedVersionId;
-              continue;
-            }
-          }
-          if (!adsCheck.ok) {
-            console.warn(`[V0 SERVICE] Google Ads conversion call still missing for /${slug} after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
-          }
+        if (adsCheck && !adsCheck.ok) {
+          console.warn(`[V0 SERVICE] Google Ads conversion call still missing for /${slug} after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
         }
-
-        if (leadListId && bridgeOutUrl) {
-          // Same post-remap file set rationale as the pixel check above (ENG-482).
-          const bridgeCheck = validateBridgeOutRedirect(remapFilesForSubPage(previewFiles, slug, name), bridgeOutUrl);
-          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead) {
-            console.warn(`[V0 SERVICE] Bridge-out redirect missing for /${slug} (attempt ${validationAttempt + 1}): ${bridgeCheck.reason}`);
-
-            await guardedV0CorrectionMessage({
-              userId,
-              scopeId: existingPage.siteId ?? existingPage.id,
-              chatId,
-              attempt: validationAttempt,
-              send: (meteringKey) => withRetry(
-                meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
-                  chatId,
-                  message:
-                    "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
-                    `redirect the visitor via window.location.href to ${bridgeOutUrl} with the submitted email ` +
-                    "appended as an email= query param (URL-encoded). " +
-                    `Issue: ${bridgeCheck.reason}`,
-                })),
-                "v0 correction message (bridge-out redirect, additional page)",
-                undefined, undefined, undefined,
-                { retryOnTimeout: false }
-              ),
-            });
-
-            const correctedVersionId = await awaitOptionalV0Correction(
-              `v0 correction (bridge-out redirect) for /${slug}`,
-              () =>
-                waitForCompletedV0Version(v0, chatId, `v0 correction (bridge-out redirect) for /${slug}`, {
-                  heartbeat: () => touchLandingPageRecord(id),
-                  deadline: buildDeadline,
-                  afterVersionId: versionId,
-                })
-            ,
-      correctionState
-    );
-            // undefined = v0 never produced a corrected version. Fall through to the
-            // `proceeding without it` path below instead of failing the whole page.
-            if (correctedVersionId) {
-              versionId = correctedVersionId;
-              continue;
-            }
-          }
+        if (bridgeCheck) {
           bridgeOutVerified = bridgeCheck.ok;
           if (!bridgeCheck.ok) {
             console.warn(`[V0 SERVICE] Bridge-out redirect still missing for /${slug} after retries — proceeding without it: ${bridgeCheck.reason}`);
@@ -2843,6 +2817,20 @@ async function addPageToExistingRepo(
         },
       })
       .promise();
+
+    // ENG-2327: the session tag lives in the shared root layout, so a sub-page of a tracked site inherits the
+    // site's list with no repo work. Flag-gated and never throws (see the same call in deployLandingPage).
+    if (isAutoSessionTrackingEnabled()) {
+      try {
+        const tracking = await import("./sessionTrackingService").then((m) => m.autoEnableSessionTracking(deployedSubPage, existingPage));
+        if (tracking) {
+          deployedSubPage.sessionTrackingListId = tracking.listId;
+          deployedSubPage.sessionTrackingInstalled = tracking.installed;
+        }
+      } catch (trackingErr: any) {
+        console.warn(`[V0 SERVICE] Session tracking inheritance could not run (generation unaffected): ${trackingErr?.message}`);
+      }
+    }
 
     void enqueueLandingPageHumanEval(deployedSubPage, async () => allFiles);
     // Dynamic import: landingPageSmokeTest.ts imports FROM this module (GeneratedLandingPage,
@@ -3402,156 +3390,111 @@ export async function deployLandingPage(
         // to guarantee the Lead event the way layout.tsx injection guarantees the base pixel.
         // Verify it, and retry (same correction-message mechanism as validateV0Output) if
         // missing. Exhausted retries must NOT fail generation — just record the miss.
-        if (record.metaPixelId) {
-          const pixelCheck = validatePixelLeadEvent(previewFiles);
-          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead) {
-            console.warn(`[V0 SERVICE] Meta Pixel Lead event missing (attempt ${validationAttempt + 1}): ${pixelCheck.reason}`);
+        // ENG-2099: all three enhancement checks run up front, and whichever ones still
+        // fail are batched into ONE v0 message + ONE wait this attempt — see the matching
+        // comment in addPageToExistingRepo (sub-page path) for why the old per-check
+        // continue made bridge-out structurally unreachable whenever pixel and ads both
+        // needed a correction.
+        const pixelCheck = record.metaPixelId ? validatePixelLeadEvent(previewFiles) : undefined;
+        const adsCheck = (record.googleAdsConversionId && record.googleAdsConversionLabel)
+          ? validateGoogleAdsConversion(previewFiles)
+          : undefined;
+        const bridgeCheck = (record.leadListId && record.bridgeOutUrl)
+          ? validateBridgeOutRedirect(previewFiles, record.bridgeOutUrl)
+          : undefined;
 
-            await guardedV0CorrectionMessage({
-              userId,
-              scopeId: record.siteId ?? record.id,
-              chatId: record.v0ChatId!,
-              attempt: validationAttempt,
-              send: (meteringKey) => withRetry(
-                meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
-                  chatId: record.v0ChatId!,
-                  message:
-                    "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
-                    "generate `const eventId = crypto.randomUUID();`, include it as an \"eventId\" field in the " +
-                    "fetch('/api/capture', ...) JSON body, and on a successful response call " +
-                    "`window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });`. " +
-                    `Issue: ${pixelCheck.reason}`,
-                })),
-                "v0 correction message (pixel lead event)",
-                undefined, undefined, undefined,
-                { retryOnTimeout: false }
-              ),
-            });
+        const canCorrectThisAttempt =
+          validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead;
+        const needsPixelCorrection = !!pixelCheck && !pixelCheck.ok && canCorrectThisAttempt;
+        const needsAdsCorrection = !!adsCheck && !adsCheck.ok && canCorrectThisAttempt;
+        const needsBridgeCorrection = !!bridgeCheck && !bridgeCheck.ok && canCorrectThisAttempt;
 
-            const correctedVersionId = await awaitOptionalV0Correction(
-              "v0 correction (pixel lead event)",
-              () =>
-                waitForCompletedV0Version(v0, record.v0ChatId!, "v0 correction (pixel lead event)", {
-                  heartbeat: () => touchLandingPageRecord(id),
-                  deadline: buildDeadline,
-                  afterVersionId: versionId,
-                })
-            ,
-      correctionState
-    );
-            // undefined = v0 never produced a corrected version. Fall through to the
-            // `proceeding without it` path below instead of failing the whole page.
-            if (correctedVersionId) {
-              versionId = correctedVersionId;
-              continue;
-            }
+        if (needsPixelCorrection || needsAdsCorrection || needsBridgeCorrection) {
+          const messageParts: string[] = [];
+          const labelParts: string[] = [];
+          if (needsPixelCorrection) {
+            console.warn(`[V0 SERVICE] Meta Pixel Lead event missing (attempt ${validationAttempt + 1}): ${pixelCheck!.reason}`);
+            messageParts.push(
+              "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
+              "generate `const eventId = crypto.randomUUID();`, include it as an \"eventId\" field in the " +
+              "fetch('/api/capture', ...) JSON body, and on a successful response call " +
+              "`window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });`. " +
+              `Issue: ${pixelCheck!.reason}`
+            );
+            labelParts.push("pixel lead event");
           }
+          if (needsAdsCorrection) {
+            console.warn(`[V0 SERVICE] Google Ads conversion call missing (attempt ${validationAttempt + 1}): ${adsCheck!.reason}`);
+            messageParts.push(
+              "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
+              "ON A SUCCESSFUL submission response only, call the platform-owned helper with the googleAds " +
+              "argument included: `await fireLeadTracking({ email, eventId, googleAds })`. Do NOT hand-author " +
+              "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
+              "root layout. " +
+              `Issue: ${adsCheck!.reason}`
+            );
+            labelParts.push("google ads conversion");
+          }
+          if (needsBridgeCorrection) {
+            console.warn(`[V0 SERVICE] Bridge-out redirect missing (attempt ${validationAttempt + 1}): ${bridgeCheck!.reason}`);
+            messageParts.push(
+              "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
+              `redirect the visitor via window.location.href to ${record.bridgeOutUrl} with the submitted email ` +
+              "appended as an email= query param (URL-encoded). " +
+              `Issue: ${bridgeCheck!.reason}`
+            );
+            labelParts.push("bridge-out redirect");
+          }
+          const correctionLabel = labelParts.join(", ");
+
+          await guardedV0CorrectionMessage({
+            userId,
+            scopeId: record.siteId ?? record.id,
+            chatId: record.v0ChatId!,
+            attempt: validationAttempt,
+            send: (meteringKey) => withRetry(
+              meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
+                chatId: record.v0ChatId!,
+                message: messageParts.join("\n\n"),
+              })),
+              `v0 correction message (${correctionLabel})`,
+              undefined, undefined, undefined,
+              { retryOnTimeout: false }
+            ),
+          });
+
+          const correctedVersionId = await awaitOptionalV0Correction(
+            `v0 correction (${correctionLabel})`,
+            () =>
+              waitForCompletedV0Version(v0, record.v0ChatId!, `v0 correction (${correctionLabel})`, {
+                heartbeat: () => touchLandingPageRecord(id),
+                deadline: buildDeadline,
+                afterVersionId: versionId,
+              }),
+            correctionState
+          );
+          // undefined = v0 never produced a corrected version for any of the batched
+          // corrections. Fall through to the per-check `proceeding without it` reporting
+          // below instead of failing the whole page.
+          if (correctedVersionId) {
+            versionId = correctedVersionId;
+            continue;
+          }
+        }
+
+        if (pixelCheck) {
           pixelLeadEventVerified = pixelCheck.ok;
           if (!pixelCheck.ok) {
             console.warn(`[V0 SERVICE] Meta Pixel Lead event still missing after retries — proceeding without it (never fails generation): ${pixelCheck.reason}`);
           }
         }
-
-        // ENG-1524. Same contract as the pixel check above, for the platform that had none.
-        // Gated on the conversion PAIR, not just the id: without a label the helper cannot
-        // fire anyway (ENG-1328), so demanding the call would be asking v0 to write
-        // something that does nothing.
-        if (record.googleAdsConversionId && record.googleAdsConversionLabel) {
-          const adsCheck = validateGoogleAdsConversion(previewFiles);
-          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead) {
-            console.warn(`[V0 SERVICE] Google Ads conversion call missing (attempt ${validationAttempt + 1}): ${adsCheck.reason}`);
-
-            await guardedV0CorrectionMessage({
-              userId,
-              scopeId: record.siteId ?? record.id,
-              chatId: record.v0ChatId!,
-              attempt: validationAttempt,
-              send: (meteringKey) => withRetry(
-                meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
-                  chatId: record.v0ChatId!,
-                  message:
-                    "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
-                    "ON A SUCCESSFUL submission response only, call the platform-owned helper with the googleAds " +
-                    "argument included: `await fireLeadTracking({ email, eventId, googleAds })`. Do NOT hand-author " +
-                    "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
-                    "root layout. " +
-                    `Issue: ${adsCheck.reason}`,
-                })),
-                "v0 correction message (google ads conversion)",
-                undefined, undefined, undefined,
-                { retryOnTimeout: false }
-              ),
-            });
-
-            const correctedVersionId = await awaitOptionalV0Correction(
-              "v0 correction (google ads conversion)",
-              () =>
-                waitForCompletedV0Version(v0, record.v0ChatId!, "v0 correction (google ads conversion)", {
-                  heartbeat: () => touchLandingPageRecord(id),
-                  deadline: buildDeadline,
-                  afterVersionId: versionId,
-                })
-            ,
-      correctionState
-    );
-            // undefined = v0 never produced a corrected version. Fall through to the
-            // `proceeding without it` path below instead of failing the whole page.
-            if (correctedVersionId) {
-              versionId = correctedVersionId;
-              continue;
-            }
-          }
-          if (!adsCheck.ok) {
-            // Never fails generation, same as the pixel path: a lander that captures leads
-            // is worth more than one that refuses to exist. But this is the line that turns
-            // an invisible miss into a visible one.
-            console.warn(`[V0 SERVICE] Google Ads conversion call still missing after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
-          }
+        if (adsCheck && !adsCheck.ok) {
+          // Never fails generation, same as the pixel path: a lander that captures leads
+          // is worth more than one that refuses to exist. But this is the line that turns
+          // an invisible miss into a visible one.
+          console.warn(`[V0 SERVICE] Google Ads conversion call still missing after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
         }
-
-        if (record.leadListId && record.bridgeOutUrl) {
-          const bridgeCheck = validateBridgeOutRedirect(previewFiles, record.bridgeOutUrl);
-          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead) {
-            console.warn(`[V0 SERVICE] Bridge-out redirect missing (attempt ${validationAttempt + 1}): ${bridgeCheck.reason}`);
-
-            await guardedV0CorrectionMessage({
-              userId,
-              scopeId: record.siteId ?? record.id,
-              chatId: record.v0ChatId!,
-              attempt: validationAttempt,
-              send: (meteringKey) => withRetry(
-                meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
-                  chatId: record.v0ChatId!,
-                  message:
-                    "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
-                    `redirect the visitor via window.location.href to ${record.bridgeOutUrl} with the submitted email ` +
-                    "appended as an email= query param (URL-encoded). " +
-                    `Issue: ${bridgeCheck.reason}`,
-                })),
-                "v0 correction message (bridge-out redirect)",
-                undefined, undefined, undefined,
-                { retryOnTimeout: false }
-              ),
-            });
-
-            const correctedVersionId = await awaitOptionalV0Correction(
-              "v0 correction (bridge-out redirect)",
-              () =>
-                waitForCompletedV0Version(v0, record.v0ChatId!, "v0 correction (bridge-out redirect)", {
-                  heartbeat: () => touchLandingPageRecord(id),
-                  deadline: buildDeadline,
-                  afterVersionId: versionId,
-                })
-            ,
-      correctionState
-    );
-            // undefined = v0 never produced a corrected version. Fall through to the
-            // `proceeding without it` path below instead of failing the whole page.
-            if (correctedVersionId) {
-              versionId = correctedVersionId;
-              continue;
-            }
-          }
+        if (bridgeCheck) {
           bridgeOutVerified = bridgeCheck.ok;
           if (!bridgeCheck.ok) {
             console.warn(`[V0 SERVICE] Bridge-out redirect still missing after retries — proceeding without it (never fails generation): ${bridgeCheck.reason}`);
@@ -3664,6 +3607,7 @@ export async function deployLandingPage(
       metaPixelId,
       metaAdAccountId,
       record.googleAdsConversionId,
+      await loadLanderUtmLayers(id, userId),
     );
     // Reflect the tracking signals on the in-memory record so every downstream return
     // (deployed or build-failed) carries them consistently with what we persisted.
@@ -3809,6 +3753,24 @@ export async function deployLandingPage(
       githubRepoUrl,
       updatedAt: now,
     };
+
+    // ENG-2327: automatic session tracking (flag AUTO_SESSION_TRACKING, default OFF). It runs AFTER the
+    // GTM / Meta / Google Ads injection and the deploy because the list's allowed origins are the page's
+    // own domains, which only exist now; the tag therefore goes in as one extra commit (one extra Vercel
+    // build). It never throws and never fails generation: a failure is logged and recorded on the page.
+    // The flag is read synchronously first, so with it OFF (the default) nothing below is even imported.
+    // Dynamic import: sessionTrackingService imports FROM this module, so a static import would be circular.
+    if (isAutoSessionTrackingEnabled()) {
+      try {
+        const tracking = await import("./sessionTrackingService").then((m) => m.autoEnableSessionTracking(deployedRecord));
+        if (tracking) {
+          deployedRecord.sessionTrackingListId = tracking.listId;
+          deployedRecord.sessionTrackingInstalled = tracking.installed;
+        }
+      } catch (trackingErr: any) {
+        console.warn(`[V0 SERVICE] Session tracking auto-enable could not run (generation unaffected): ${trackingErr?.message}`);
+      }
+    }
 
     const deployedZip = zipBuffer;
     void enqueueLandingPageHumanEval(deployedRecord, () => unzipBuffer(deployedZip));
@@ -5373,6 +5335,25 @@ export function injectLeadCaptureAttribution(
 }
 
 /**
+ * ENG-726: read the two stored UTM layers fresh at push time. Read failures degrade
+ * to "no layer" so a storage hiccup never fails generation (the lander simply ships
+ * undecorated, which is today's behavior).
+ */
+async function loadLanderUtmLayers(pageId: string, userId: string): Promise<LanderUtmLayers> {
+  const [override, customerDefault] = await Promise.all([
+    getLanderUtmOverride(pageId, userId).catch((err: any) => {
+      console.warn(`[V0 SERVICE] UTM override read failed for ${pageId}: ${err?.message}`);
+      return null;
+    }),
+    getCustomerUtmDefault(userId).catch((err: any) => {
+      console.warn(`[V0 SERVICE] UTM default read failed for ${userId}: ${err?.message}`);
+      return null;
+    }),
+  ]);
+  return { override, customerDefault };
+}
+
+/**
  * Create a GitHub repo under the AgentWebPro org and push all files via the Contents API.
  */
 async function createGitHubRepoAndPush(
@@ -5408,6 +5389,12 @@ async function createGitHubRepoAndPush(
    * When absent, NOTHING is injected — no fallback tag on a customer page.
    */
   googleAdsConversionId?: string,
+  /**
+   * ENG-726: the stored UTM layers (per-lander override + customer default). When
+   * either is configured, an outbound-link decoration script resolved by the shared
+   * ENG-723 resolver is injected into the root layout. Neither set: nothing injected.
+   */
+  utmLayers: LanderUtmLayers = {},
 ): Promise<{ githubRepoUrl: string; repoFullName: string; commitSha: string; gtmInjected: boolean; pixelInjected: boolean; googleAdsInjected: boolean }> {
   const { token, org } = await getGitHubOrgToken();
   const headers = {
@@ -5562,6 +5549,15 @@ async function createGitHubRepoAndPush(
   // measurable from the first deploy — no manual "Add GTM" step. Absent a container id,
   // nothing is injected and the caller records a "no tracking installed" signal.
   const gtmInjected = injectGtmIntoLayoutFiles(finalFiles, gtmContainerId);
+  // ENG-726: decorate outbound links with the resolved UTMs. A malformed stored
+  // config must not fail generation — log and ship undecorated, as before this slice.
+  try {
+    if (injectUtmDecorationIntoLayoutFiles(finalFiles, utmLayers)) {
+      console.log(`[V0 SERVICE] Injected UTM outbound-link decoration into app/layout.tsx`);
+    }
+  } catch (err: any) {
+    console.error(`[V0 SERVICE] UTM decoration skipped (invalid stored UTM config): ${err?.message}`);
+  }
   console.log(
     gtmInjected
       ? `[V0 SERVICE] Injected GTM container ${gtmContainerId} into app/layout.tsx`
@@ -6407,13 +6403,40 @@ export async function iterateLandingPage(
       return await finishIteration(id, record, baseVersionId);
     }
 
+    // ENG-1728: the base this edit is anchored to. For a retry of a recorded edit it is the
+    // ORIGINAL pre-send base, never the version we just read — v0 may already be past it.
+    const anchorBaseVersionId = isSameEdit ? pending!.baseVersionId : baseVersionId;
+
     if (!isSameEdit) {
+      // Persist the pre-send base BEFORE v0 is called (ENG-1728). Recording it only after
+      // the send left a crash window: v0 had the message, the record did not, so the retry
+      // read the post-edit version as its base, the usage guard skipped the already-sent
+      // message, and the retry waited for a version no send would ever create.
+      const nowIso = new Date().toISOString();
+      await dynamodb
+        .update({
+          TableName: TABLE_NAME,
+          Key: { id },
+          UpdateExpression: "SET pendingIteration = :p, updatedAt = :now",
+          ExpressionAttributeValues: {
+            ":p": { baseVersionId, messageHash, startedAt: nowIso, unsent: true },
+            ":now": nowIso,
+          },
+        })
+        .promise();
+    }
+
+    // A recorded edit without `unsent` is known to be with v0: resume the wait, never re-send.
+    // With `unsent` the process died between the pre-send write above and v0 accepting,
+    // so route through the usage guard: keyed on (chat, content hash), it returns
+    // `{skipped: true}` if a send did reach v0 (no second call or charge) and sends otherwise.
+    // Either way the wait below is anchored to the ORIGINAL base.
+    if (isSameEdit && !pending!.unsent) {
+      console.log(`[V0 SERVICE] iterate: message already sent and still generating — resuming the wait, not re-sending`);
+    } else {
       // responseMode async: sync mode blocks the HTTP call for the whole edit, which is the
-      // 300s race that made a slow iteration fail while v0 applied and CHARGED for it anyway
-      // — leaving the edit stranded (the record stayed `deployed`, which deployLandingPage
-      // refuses). Async returns in seconds; the version wait below absorbs the real time.
-      // Safe now only because that wait is anchored to `afterVersionId` — without it, a deploy
-      // could grab the PRE-iteration version and silently ship the page without the edit.
+      // 300s race that made a slow iteration fail while v0 applied and CHARGED for it anyway.
+      // Async is safe only because the version wait below is anchored to the pre-send base.
       await guardedV0IterateMessage({
         userId: iterateActorUserId,
         scopeId: id,
@@ -6427,22 +6450,20 @@ export async function iterateLandingPage(
         ),
       });
 
-      // Record it the instant v0 accepts, BEFORE the wait — if the wait dies (timeout, crash,
-      // lost response), the retry must know the message is already with v0.
-      const nowIso = new Date().toISOString();
+      // Stamp the send the instant v0 accepts (or the guard confirms a prior send), BEFORE
+      // the wait — if the wait dies, the retry must know the message is already with v0.
+      const sentIso = new Date().toISOString();
       await dynamodb
         .update({
           TableName: TABLE_NAME,
           Key: { id },
           UpdateExpression: "SET pendingIteration = :p, updatedAt = :now",
           ExpressionAttributeValues: {
-            ":p": { baseVersionId, messageHash, startedAt: nowIso },
-            ":now": nowIso,
+            ":p": { baseVersionId: anchorBaseVersionId, messageHash, startedAt: isSameEdit ? pending!.startedAt : sentIso },
+            ":now": sentIso,
           },
         })
         .promise();
-    } else {
-      console.log(`[V0 SERVICE] iterate: message already sent and still generating — resuming the wait, not re-sending`);
     }
 
     // Do not return until v0 publishes a version that is NOT the one we started from. This is
@@ -6452,7 +6473,7 @@ export async function iterateLandingPage(
       v0,
       chatId,
       "v0 iterate",
-      { deadline, afterVersionId: pending && isSameEdit ? pending.baseVersionId : baseVersionId }
+      { deadline, afterVersionId: anchorBaseVersionId }
     );
 
     return await finishIteration(id, record, newVersionId);
@@ -7022,16 +7043,25 @@ export async function updateLandingPageMetaPixel(
   if (!record) throw new Error("Landing page not found");
 
   if (pixelId) {
+    const sets = ["metaPixelId = :px", "updatedAt = :now"];
+    const values: Record<string, any> = { ":px": pixelId, ":now": new Date().toISOString() };
+    const removes: string[] = [];
+    // Mirrors updateLandingPageGoogleAds's conversionLabel/customerId handling: `undefined`
+    // means the caller didn't mention an account (leave whatever is stored — a standalone
+    // page can carry a pixel with no ad account tied to it), `""` means explicitly clear
+    // it. Previously this always referenced `:acc` even when `accountId` was undefined,
+    // and the SDK silently drops an undefined value from ExpressionAttributeValues — so
+    // DynamoDB rejected the whole update as referencing an undefined placeholder.
+    if (accountId === undefined) { /* not mentioned — leave whatever is stored */ }
+    else if (accountId === "") { removes.push("metaAdAccountId"); }
+    else { sets.push("metaAdAccountId = :acc"); values[":acc"] = accountId; }
+
     await dynamodb
       .update({
         TableName: TABLE_NAME,
         Key: { id },
-        UpdateExpression: "SET metaPixelId = :px, metaAdAccountId = :acc, updatedAt = :now",
-        ExpressionAttributeValues: {
-          ":px": pixelId,
-          ":acc": accountId,
-          ":now": new Date().toISOString(),
-        },
+        UpdateExpression: `SET ${sets.join(", ")}` + (removes.length ? ` REMOVE ${removes.join(", ")}` : ""),
+        ExpressionAttributeValues: values,
       })
       .promise();
   } else {
@@ -7127,6 +7157,75 @@ export async function updateLandingPageMetaTrackingInstalled(
       ExpressionAttributeValues: {
         ":t": metaTrackingInstalled,
         ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
+}
+
+/**
+ * ENG-2327: record the session-tracking list on a page. DATA-PLANE: writes the new persisted
+ * attributes sessionTrackingListId / sessionTrackingInstalled / sessionTrackingError.
+ *
+ * Conditional: it only claims the page when no list is recorded yet (or the recorded one is the
+ * `replacing` id the caller found dead), so two concurrent enables can never leave a page pointing
+ * at a list the other one then orphans. Returns false when another caller already holds the claim.
+ */
+export async function claimLandingPageSessionTrackingList(
+  id: string,
+  listId: string,
+  replacing?: string,
+): Promise<boolean> {
+  try {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression:
+          "SET sessionTrackingListId = :l, sessionTrackingInstalled = :f, updatedAt = :now REMOVE sessionTrackingError",
+        ConditionExpression: replacing
+          ? "attribute_exists(id) AND (attribute_not_exists(sessionTrackingListId) OR sessionTrackingListId = :replacing)"
+          : "attribute_exists(id) AND attribute_not_exists(sessionTrackingListId)",
+        ExpressionAttributeValues: {
+          ":l": listId,
+          ":f": false,
+          ":now": new Date().toISOString(),
+          ...(replacing ? { ":replacing": replacing } : {}),
+        },
+      })
+      .promise();
+    return true;
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
+ * ENG-2327: set the session-tracking install state on a page (and the list id, when given).
+ * Mirrors updateLandingPageMetaTrackingInstalled; split out because the tag lives in the SHARED
+ * root layout, so callers loop it across the siblings sharing that repo. `error` records the last
+ * failure on the page (cleared when absent), the same "fail loud" signal the other injectors keep.
+ */
+export async function updateLandingPageSessionTracking(
+  id: string,
+  state: { installed: boolean; listId?: string; error?: string },
+): Promise<void> {
+  const error = state.error ? state.error.slice(0, 500) : undefined;
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      ConditionExpression: "attribute_exists(id)", // never upsert a ghost record for a page deleted meanwhile
+      UpdateExpression:
+        "SET sessionTrackingInstalled = :i, updatedAt = :now" +
+        (state.listId ? ", sessionTrackingListId = :l" : "") +
+        (error ? ", sessionTrackingError = :e" : "") +
+        (error ? "" : " REMOVE sessionTrackingError"),
+      ExpressionAttributeValues: {
+        ":i": state.installed,
+        ":now": new Date().toISOString(),
+        ...(state.listId ? { ":l": state.listId } : {}),
+        ...(error ? { ":e": error } : {}),
       },
     })
     .promise();

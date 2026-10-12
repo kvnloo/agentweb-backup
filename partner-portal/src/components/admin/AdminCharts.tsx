@@ -1,6 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import { Box, Paper } from '@mui/material';
 import { Chart, ChartConfiguration, registerables } from 'chart.js';
+import { CHART_SERIES } from './chartPalette';
 
 // Register Chart.js components
 Chart.register(...registerables);
@@ -85,7 +86,7 @@ export const UserGrowthChart: React.FC<UserGrowthChartProps> = ({ data, startDat
             {
               label: 'Total Users',
               data: timeSeriesData.data,
-              borderColor: '#1976d2',
+              borderColor: CHART_SERIES.blue,
               backgroundColor: 'rgba(25, 118, 210, 0.1)',
               fill: true,
               tension: 0.4,
@@ -93,7 +94,7 @@ export const UserGrowthChart: React.FC<UserGrowthChartProps> = ({ data, startDat
             {
               label: 'OAuth Users',
               data: generateTimeSeriesData(startDate, endDate, data.oauthUsers, data.newOauthUsers).data,
-              borderColor: '#4caf50',
+              borderColor: CHART_SERIES.green,
               backgroundColor: 'rgba(76, 175, 80, 0.1)',
               fill: false,
               tension: 0.4,
@@ -168,7 +169,7 @@ export const TaskGrowthChart: React.FC<TaskGrowthChartProps> = ({ data, startDat
             {
               label: 'Total Tasks',
               data: timeSeriesData.data,
-              borderColor: '#ff9800',
+              borderColor: CHART_SERIES.orange,
               backgroundColor: 'rgba(255, 152, 0, 0.1)',
               fill: true,
               tension: 0.4,
@@ -243,7 +244,7 @@ export const ExecutionTrendsChart: React.FC<ExecutionTrendsChartProps> = ({ data
             {
               label: 'Total Executions',
               data: timeSeriesData.data,
-              borderColor: '#9c27b0',
+              borderColor: CHART_SERIES.purple,
               backgroundColor: 'rgba(156, 39, 176, 0.1)',
               fill: true,
               tension: 0.4,
@@ -251,7 +252,7 @@ export const ExecutionTrendsChart: React.FC<ExecutionTrendsChartProps> = ({ data
             {
               label: 'Successful Executions',
               data: generateTimeSeriesData(startDate, endDate, data.successfulExecutions, Math.round(data.newExecutions * 0.8)).data,
-              borderColor: '#4caf50',
+              borderColor: CHART_SERIES.green,
               backgroundColor: 'rgba(76, 175, 80, 0.1)',
               fill: false,
               tension: 0.4,
@@ -259,7 +260,7 @@ export const ExecutionTrendsChart: React.FC<ExecutionTrendsChartProps> = ({ data
             {
               label: 'Failed Executions',
               data: generateTimeSeriesData(startDate, endDate, data.failedExecutions, Math.round(data.newExecutions * 0.2)).data,
-              borderColor: '#f44336',
+              borderColor: CHART_SERIES.red,
               backgroundColor: 'rgba(244, 67, 54, 0.1)',
               fill: false,
               tension: 0.4,
@@ -336,7 +337,7 @@ export const ExecutionStatusChart: React.FC<{ data: any }> = ({ data }) => {
           datasets: [
             {
               data: [successfulExecutions, failedExecutions, pendingExecutions],
-              backgroundColor: ['#4caf50', '#f44336', '#ff9800'],
+              backgroundColor: [CHART_SERIES.green, CHART_SERIES.red, CHART_SERIES.orange],
               borderWidth: 2,
               borderColor: '#fff'
             }
@@ -398,7 +399,7 @@ export const UserTypeChart: React.FC<{ data: any }> = ({ data }) => {
           datasets: [
             {
               data: [regularUsers, oauthUsers, adminUsers],
-              backgroundColor: ['#2196f3', '#4caf50', '#ff9800'],
+              backgroundColor: [CHART_SERIES.lightBlue, CHART_SERIES.green, CHART_SERIES.orange],
               borderWidth: 2,
               borderColor: '#fff'
             }
@@ -516,7 +517,7 @@ export const AgentModeSessionGrowthChart: React.FC<AgentModeSessionGrowthChartPr
             {
               label: 'Non-Scheduled Sessions',
               data: nonScheduledData,
-              borderColor: '#2196f3',
+              borderColor: CHART_SERIES.lightBlue,
               backgroundColor: 'rgba(33, 150, 243, 0.1)',
               fill: true,
               tension: 0.4,
@@ -524,7 +525,7 @@ export const AgentModeSessionGrowthChart: React.FC<AgentModeSessionGrowthChartPr
             {
               label: 'Scheduled Sessions',
               data: scheduledData,
-              borderColor: '#ff9800',
+              borderColor: CHART_SERIES.orange,
               backgroundColor: 'rgba(255, 152, 0, 0.1)',
               fill: true,
               tension: 0.4,
@@ -612,12 +613,12 @@ export const AgentModeSessionTypesChart: React.FC<AgentModeSessionTypesChartProp
             {
               data: values,
               backgroundColor: [
-                '#2196f3',
-                '#4caf50',
-                '#ff9800',
-                '#f44336',
-                '#9c27b0',
-                '#00bcd4',
+                CHART_SERIES.lightBlue,
+                CHART_SERIES.green,
+                CHART_SERIES.orange,
+                CHART_SERIES.red,
+                CHART_SERIES.purple,
+                CHART_SERIES.cyan,
               ],
               borderWidth: 2,
               borderColor: '#fff'

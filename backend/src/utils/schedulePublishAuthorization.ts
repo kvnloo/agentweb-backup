@@ -135,6 +135,8 @@ export function isPublishCapableTool(name: string): boolean {
  * non-publishing actions (fail-closed on an unknown or missing action).
  */
 export function isPublishCall(name: string, args?: any): boolean {
+  // ENG-1005: workflow drafts are local previews; only an explicit publish commits.
+  if (name === 'emma_publish_social_post' || name === 'emma_publish_blog_post') return args?.publish === true;
   if (isPublishName(name)) return true;
   const spec = ACTION_SCOPED_PUBLISH_TOOLS[name];
   if (!spec) return false;

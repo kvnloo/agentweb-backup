@@ -173,8 +173,26 @@ describe('mirrorOnboardingEventToLead', () => {
     expect(mockCreateLead).toHaveBeenCalledWith(
       FOUNDERS_LIST.listId,
       expect.objectContaining({ email: 'newuser@example.com' }),
+      'integration',
     );
     expect(mockUpdateLeadOnboarding).toHaveBeenCalled();
+  });
+
+  // ENG-2322: the lookup missed but createLead's own pre-check found the row (a concurrent signup
+  // enrolment won). The analytics must land on that row, not be dropped as an 'error'.
+  it('mirrors onto the existing Lead when createLead loses a duplicate-email race', async () => {
+    mockGetLeadByEmail.mockResolvedValueOnce(null);
+    mockCreateLead.mockRejectedValueOnce(Object.assign(
+      new Error('Lead with email "newuser@example.com" already exists in this list'),
+      { duplicateEmail: true, existingLead: { leadId: 'lead-won', listId: FOUNDERS_LIST.listId } },
+    ));
+    const allEvents = [{ event: 'goal_selected', ts: '2026-04-23T00:00:00Z' }];
+    const result = await mirrorOnboardingEventToLead(
+      { userId: 'u-1', email: 'newuser@example.com', event: allEvents[0], allEvents, onboardingStage: 'goal_selected' },
+      { crmDb: mockCrmDb as any, logger: silentLogger },
+    );
+    expect(result).toEqual({ mirrored: true, reason: 'updated', listId: FOUNDERS_LIST.listId, leadId: 'lead-won' });
+    expect(mockUpdateLeadOnboarding).toHaveBeenCalledWith(FOUNDERS_LIST.listId, 'lead-won', expect.any(Object));
   });
 
   it('increments deviation count when the event is "deviation"', async () => {

@@ -116,6 +116,7 @@ import {
   ReceiptLong as ReceiptLongIcon,
   ContentCopy as ContentCopyIcon,
 } from "@mui/icons-material";
+import { staffOperatedBadge, type SelfActivitySignal } from "../utils/selfActivityBadge";
 
 interface TabPanelProps {
   children?: React.ReactNode;
@@ -291,6 +292,10 @@ interface User {
   productDomain?: string; // Product site domain for feature usage tracking
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   subscriptionType?: string; // Subscription type for customer portal users
+  /** Settled spend this month from the spend ledger (ENG-1250 AC7); absent if the lookup failed. */
+  spendThisMonthUsd?: number;
+  /** ENG-1271: derived customer-vs-staff activity signal; absent on older backends. */
+  selfActivity?: SelfActivitySignal | null;
   tokenUsage?: {
     month: string;
     totalTokens: number;
@@ -309,17 +314,6 @@ interface User {
     totalAdminGrantedMicroUsd?: number;
     totalMigrationOffsetMicroUsd?: number;
   };
-  extraCostUsage?: {
-    month: string;
-    totalCost: number;
-    breakdown: Record<string, number>;
-    resetDate: string;
-  };
-  extraCostUsageHistory?: Array<{
-    month: string;
-    totalCost: number;
-    breakdown: Record<string, number>;
-  }>;
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders
   introductionEmailSent?: string; // ISO date when team introduction email was sent
   utmSource?: string;
@@ -916,7 +910,6 @@ export default function AdminDashboard() {
   const [currentSubscriptionType, setCurrentSubscriptionType] = useState<string>("");
   const [subscriptionTypeEditLoading, setSubscriptionTypeEditLoading] = useState(false);
   const [availableSubscriptionTypes, setAvailableSubscriptionTypes] = useState<string[]>([]);
-  const [subscriptionTypeAllowanceMap, setSubscriptionTypeAllowanceMap] = useState<Record<string, number | null>>({});
   const [subscriptionTypeCostAllowanceMap, setSubscriptionTypeCostAllowanceMap] = useState<Record<string, number | null>>({});
   // Per-user LLM cost breakdown modal (burn, from the shadow-usage table)
   const [costBreakdownUser, setCostBreakdownUser] = useState<User | null>(null);
@@ -1071,15 +1064,12 @@ export default function AdminDashboard() {
         ? types.map((t: any) => t.name)
         : ['Basic'];
       setAvailableSubscriptionTypes(typeNames);
-      const allowanceMap: Record<string, number | null> = {};
       const costAllowanceMap: Record<string, number | null> = {};
       types.forEach((t: any) => {
-        allowanceMap[t.name] = t.monthlyTokenAllowance ?? null;
         costAllowanceMap[t.name] = t.llmUsagePolicy?.hardCostThresholdMicroUsd != null
           ? t.llmUsagePolicy.hardCostThresholdMicroUsd / 1_000_000
           : (t.monthlyCostAllowance ?? null);
       });
-      setSubscriptionTypeAllowanceMap(allowanceMap);
       setSubscriptionTypeCostAllowanceMap(costAllowanceMap);
     } catch (error) {
       console.error('Error loading subscription types:', error);
@@ -1823,8 +1813,7 @@ export default function AdminDashboard() {
       case "isActive":
         return user.isActive === false ? 0 : 1;
       case "tokenUsage":
-        return user.tokenUsage?.month === new Date().toISOString().slice(0, 7)
-          ? (user.tokenUsage?.totalTokens || 0) : 0;
+        return user.spendThisMonthUsd ?? 0;
       default:
         return (user as unknown as Record<string, unknown>)[property] ?? "";
     }
@@ -1853,11 +1842,9 @@ export default function AdminDashboard() {
       if (userFilterPaid === "paid" && user.subscription_status !== "active") return false;
       if (userFilterPaid === "unpaid" && user.subscription_status === "active") return false;
       if (userFilterPaid === "bounced" && !(user.stripe_customer_id && !user.subscription_status && !user.subscription_amount)) return false;
-      // Has-usage filter — match the display logic: current-month tokens only
+      // Has-usage filter — match the display logic: settled spend this month (ledger)
       if (userFilterHasUsage) {
-        const currentMonth = new Date().toISOString().slice(0, 7);
-        const used = user.tokenUsage?.month === currentMonth ? (user.tokenUsage?.totalTokens || 0) : 0;
-        if (used <= 0) return false;
+        if ((user.spendThisMonthUsd ?? 0) <= 0) return false;
       }
       return true;
     });
@@ -4525,7 +4512,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                     <UserSortLabel property="lastLoginTime" label="Last Active" />
                   </TableCell>
                   <TableCell>
-                    <UserSortLabel property={"tokenUsage" as keyof User} label="Usage" />
+                    <UserSortLabel property={"tokenUsage" as keyof User} label="Spend (mo)" />
                   </TableCell>
                   <TableCell>Intro Email</TableCell>
                   <TableCell sx={{ width: 100 }}>Actions</TableCell>
@@ -4564,8 +4551,8 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                       if (diffD < 7) return `${diffD}d ago`;
                       return format(d, "MMM d");
                     })() : "Never";
-                    const used = user.tokenUsage?.month === new Date().toISOString().slice(0, 7)
-                      ? (user.tokenUsage?.totalTokens || 0) : 0;
+                    const spendUsd = user.spendThisMonthUsd;
+                    const staffBadge = staffOperatedBadge(user);
 
                     return (
                       <React.Fragment key={user.userId}>
@@ -4673,10 +4660,15 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                         </TableCell>
                         <TableCell>
                           <Typography variant="body2" color="text.secondary">{lastSeen}</Typography>
+                          {staffBadge && (
+                            <Tooltip title={staffBadge.tooltip}>
+                              <Chip size="small" color="warning" variant="outlined" label={staffBadge.label} sx={{ mt: 0.5, height: 20, fontSize: "0.7rem" }} />
+                            </Tooltip>
+                          )}
                         </TableCell>
                         <TableCell>
                           <Typography variant="body2" sx={{ fontVariantNumeric: "tabular-nums" }}>
-                            {used > 0 ? used.toLocaleString() : "—"}
+                            {spendUsd != null ? `$${spendUsd.toFixed(2)}` : "—"}
                           </Typography>
                         </TableCell>
                         <TableCell>
@@ -5028,20 +5020,10 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                 </Grid>
                                 {/* Usage + actions row */}
                                 <Grid item xs={6}>
-                                  <Typography variant="caption" color="text.secondary">Token Usage</Typography>
-                                  <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
-                                    {user.roles?.includes("customer") ? (() => {
-                                      const baseAllowance = subscriptionTypeAllowanceMap[user.subscriptionType || "Basic"] ?? null;
-                                      const bonus = user.tokenAllowanceBonus || 0;
-                                      const effectiveAllowance = baseAllowance != null ? baseAllowance + bonus : null;
-                                      return (
-                                        <Typography variant="body2">
-                                          {used.toLocaleString()} / {effectiveAllowance != null ? effectiveAllowance.toLocaleString() : "∞"}
-                                          {bonus > 0 && <Typography component="span" variant="caption" color="text.secondary"> (+{bonus.toLocaleString()} bonus)</Typography>}
-                                        </Typography>
-                                      );
-                                    })() : <Typography variant="body2" color="text.disabled">—</Typography>}
-                                  </Box>
+                                  <Typography variant="caption" color="text.secondary">Token usage (archived)</Typography>
+                                  <Typography variant="body2" color="text.disabled" sx={{ mt: 0.5 }}>
+                                    Live token counting is retired — spend is metered in dollars (see LLM Cost).
+                                  </Typography>
                                   {user.roles?.includes("customer") && user.tokenUsageHistory && user.tokenUsageHistory.length > 0 && (
                                     <Box sx={{ mt: 0.5 }}>
                                       <Typography variant="caption" color="text.secondary">History: </Typography>
@@ -5057,19 +5039,19 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                 <Grid item xs={6}>
                                   <HelpCaption
                                     label="LLM Cost"
-                                    help="Dollars deducted from this user's monthly cost cap so far this month, vs the cap (∞ = no cap). This is the counted/deducted figure — open the breakdown for gross burn per model, including platform-absorbed cost."
+                                    help="Settled spend this month from the spend ledger, vs the cap (∞ = no cap). Accounts on ledger enforcement (every tier at present) are capped on this figure; a rollback to the legacy basis would count LLM spend only. A dash means the ledger lookup failed. Open the breakdown for gross burn per model, including platform-absorbed cost."
                                   />
                                   <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
                                     {user.roles?.includes("customer") ? (() => {
                                       const currentMonth = new Date().toISOString().slice(0, 7);
-                                      const costUsed = user.tokenUsage?.month === currentMonth ? (user.tokenUsage?.totalCost ?? 0) : 0;
+                                      const costUsed = user.spendThisMonthUsd;
                                       const costAllowance = subscriptionTypeCostAllowanceMap[user.subscriptionType || "Basic"] ?? null;
                                       const credits = user.llmUsageCredits?.month === currentMonth
                                         ? ((user.llmUsageCredits.totalPurchasedMicroUsd || 0) + (user.llmUsageCredits.totalAdminGrantedMicroUsd || 0)) / 1_000_000
                                         : 0;
                                       return (
                                         <Typography variant="body2">
-                                          ${costUsed.toFixed(2)} / {costAllowance != null ? `$${(costAllowance + credits).toFixed(2)}` : "∞"}
+                                          {costUsed != null ? `$${costUsed.toFixed(2)}` : "—"} / {costAllowance != null ? `$${(costAllowance + credits).toFixed(2)}` : "∞"}
                                           {credits > 0 && <Typography component="span" variant="caption" color="text.secondary"> (+${credits.toFixed(2)} credits)</Typography>}
                                           <Typography component="span" variant="caption" color="text.secondary"> deducted</Typography>
                                         </Typography>
@@ -5139,47 +5121,6 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                         </IconButton>
                                       </Tooltip>
                                     </Box>
-                                  </Grid>
-                                )}
-                                {/* Extra Cost Usage (enrichment, image gen, etc.) */}
-                                {user.roles?.includes("customer") && (
-                                  <Grid item xs={6}>
-                                    <Typography variant="caption" color="text.secondary">Extra Cost Usage</Typography>
-                                    <Box sx={{ mt: 0.5 }}>
-                                      {(() => {
-                                        const currentMonth = new Date().toISOString().slice(0, 7);
-                                        const extraUsage = user.extraCostUsage?.month === currentMonth ? user.extraCostUsage : null;
-                                        const totalCost = extraUsage?.totalCost ?? 0;
-                                        const breakdown = (extraUsage?.breakdown ?? {}) as Record<string, number>;
-                                        const breakdownEntries = Object.entries(breakdown).filter(([, v]) => v > 0);
-                                        return (
-                                          <>
-                                            <Typography variant="body2">
-                                              ${totalCost.toFixed(4)} this month
-                                            </Typography>
-                                            {breakdownEntries.length > 0 && (
-                                              <Box sx={{ mt: 0.25 }}>
-                                                {breakdownEntries.map(([key, val]) => (
-                                                  <Typography key={key} component="span" variant="caption" color="text.secondary" sx={{ mr: 1 }}>
-                                                    {key}: ${(val as number).toFixed(4)}
-                                                  </Typography>
-                                                ))}
-                                              </Box>
-                                            )}
-                                          </>
-                                        );
-                                      })()}
-                                    </Box>
-                                    {user.extraCostUsageHistory && user.extraCostUsageHistory.length > 0 && (
-                                      <Box sx={{ mt: 0.5 }}>
-                                        <Typography variant="caption" color="text.secondary">History: </Typography>
-                                        {[...user.extraCostUsageHistory].reverse().slice(0, 6).map((h) => (
-                                          <Typography key={h.month} component="span" variant="caption" color="text.secondary" sx={{ mr: 1 }}>
-                                            {h.month}: ${h.totalCost.toFixed(4)}
-                                          </Typography>
-                                        ))}
-                                      </Box>
-                                    )}
                                   </Grid>
                                 )}
                                 <Grid item xs={6}>
@@ -9051,7 +8992,10 @@ const AgentModeSettings = () => {
     }
   };
 
-  const VIDEO_API_MODELS = ['veo-3.1-generate-preview', 'veo-3-generate-preview'];
+  const VIDEO_API_MODELS = ['gemini-omni-1.1-flash', 'seedance-2.0'];
+  // Retired Veo ids (Google shutdown 2026-10-22) may still be stored in the setting;
+  // the backend resolves them to gemini-omni-1.1-flash, so show them that way.
+  const LEGACY_VIDEO_API_MODELS = ['veo-3.1-generate-preview', 'veo-3.1-fast-generate-preview', 'veo-3-generate-preview', 'veo-3.0-generate-preview'];
 
   const loadVideoApiDefaultModel = async () => {
     try {
@@ -9059,7 +9003,8 @@ const AgentModeSettings = () => {
         headers: { Authorization: `Bearer ${token}` }
       });
       if (response.data && response.data.settingValue) {
-        const configuredModel = response.data.settingValue.trim();
+        const storedModel = response.data.settingValue.trim();
+        const configuredModel = LEGACY_VIDEO_API_MODELS.includes(storedModel) ? 'gemini-omni-1.1-flash' : storedModel;
         if (configuredModel && VIDEO_API_MODELS.includes(configuredModel)) {
           setVideoApiDefaultModel(configuredModel);
           return;
@@ -9082,7 +9027,7 @@ const AgentModeSettings = () => {
       if (videoApiDefaultModel) {
         await axios.put(buildApiUrl('/api/settings/agent_mode_video_api_default_model'), {
           settingValue: videoApiDefaultModel,
-          description: 'Default video API model for generate_video tool (e.g. veo-3.1-generate-preview)'
+          description: 'Default video API model for generate_video tool (e.g. seedance-2.0 or gemini-omni-1.1-flash)'
         }, {
           headers: { Authorization: `Bearer ${token}` }
         });
@@ -10046,7 +9991,7 @@ const AgentModeSettings = () => {
               onChange={(e) => setVideoApiDefaultModel(e.target.value as string)}
             >
               <MenuItem value="">
-                <em>Use hardcoded default (veo-3.1-generate-preview)</em>
+                <em>Use hardcoded default (seedance-2.0, falls back to gemini-omni-1.1-flash)</em>
               </MenuItem>
               {VIDEO_API_MODELS.map((model) => (
                 <MenuItem key={model} value={model}>

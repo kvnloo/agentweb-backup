@@ -3,7 +3,6 @@ import { matchLifecyclePresenceFilter } from '../utils/lifecycleFilterSemantics'
 import { usablePublicIdentifier, usableProfileUrl, withoutFabricatedProfileFields } from '../utils/linkedInAnonymizedProfile';
 import { agentModeService } from './agentModeService';
 import { settingsService } from './settingsService';
-import { incrementExtraCostUsage } from './tokenUsageService';
 import { v4 as uuidv4 } from 'uuid';
 import {
   getRawDataFromCache,
@@ -52,8 +51,6 @@ function isLinkedInIdResolutionEnabled(): boolean {
 const PARALLELISM_WITH_LINKEDIN = 5;
 /** Web-only enrichment can be more aggressive */
 const PARALLELISM_WEB_ONLY = 20;
-// Estimated cost per enriched lead in USD (Google Custom Search dominates at $0.005/query)
-const ENRICHMENT_COST_PER_LEAD = 0.0052;
 
 // Callback type for emitting Socket.IO events.
 // In the main process this uses the real `io` instance directly;
@@ -272,9 +269,22 @@ export class CrmEnrichmentService {
     return { allLeads, leadsToProcess, alreadyEnriched, filteredTotal: filtered.length, storedSourcesPerField, storedWebSearchTemplate, storedLinkedinSearchTemplate };
   }
 
+  private async linkedInAccountExistsButUnverified(userId: string): Promise<boolean> {
+    try {
+      const { linkedInOutreachService } = await import('./linkedInOutreachService');
+      return !!(await linkedInOutreachService.resolveAccountId(userId));
+    } catch {
+      return false;
+    }
+  }
+
   private async resolveLinkedInAccountId(userId: string): Promise<string | null> {
     const { linkedInOutreachService } = await import('./linkedInOutreachService');
-    return linkedInOutreachService.resolveAccountId(userId);
+    // verifiedOnly: an account that was only indeterminate (e.g. a Unipile outage) must come
+    // back null so enrichment skips the LinkedIn source with its warning and keeps its
+    // normal parallelism — exactly as before ENG-2205 — instead of running every lead's
+    // lookup against an unproven account.
+    return linkedInOutreachService.resolveAccountId(userId, { verifiedOnly: true });
   }
 
   // Logical models are resolved by AgentMode and sent through OpenRouter, which
@@ -1747,7 +1757,13 @@ export class CrmEnrichmentService {
     if (hasLinkedin) {
       linkedInAccountId = await this.resolveLinkedInAccountId(spec.userId);
       if (!linkedInAccountId) {
-        warnings.push('No LinkedIn (Unipile) account connected — linkedin source skipped');
+        // verifiedOnly returns null both when there is no account AND when one exists but its session
+        // could not be verified (e.g. a Unipile outage). Tell the user which, so an outage is not
+        // reported as a missing connection. (Probe results are cached, so this costs no extra call.)
+        const unverifiedExists = await this.linkedInAccountExistsButUnverified(spec.userId);
+        warnings.push(unverifiedExists
+          ? 'LinkedIn (Unipile) is temporarily unreachable — linkedin source skipped'
+          : 'No LinkedIn (Unipile) account connected — linkedin source skipped');
         // Remove linkedin from effective sources
         spec = { ...spec, sources: spec.sources.filter(s => s !== 'linkedin') };
       }
@@ -1971,13 +1987,6 @@ export class CrmEnrichmentService {
         emit(socketId, completeEvent, completionPayload);
       }
       emit(userRoom, completeEvent, completionPayload);
-    }
-
-    // Record extra cost for this job (fire-and-forget — never block the response)
-    if (counters.processed > 0) {
-      incrementExtraCostUsage(spec.userId, {
-        enrichment: Math.round(counters.processed * ENRICHMENT_COST_PER_LEAD * 10000) / 10000,
-      }).catch((err) => console.error('[CrmEnrichment] Failed to record extra cost:', err));
     }
 
     return {

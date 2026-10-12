@@ -40,6 +40,7 @@ import {
 import axios from 'axios';
 import { buildApiUrl } from '../../config';
 import { useAuth } from '../../contexts/AuthContext';
+import { ENRICHMENT_PROVIDER_PALETTE } from './chartPalette';
 
 interface SourceCount { live: number; cached: number }
 interface SourceBreakdown {
@@ -81,10 +82,7 @@ const PROVIDER_COLORS: Record<string, 'primary' | 'secondary' | 'success' | 'war
   apollo: 'primary', unipile: 'info', enrichSo: 'secondary',
   webSearch: 'warning', sibling: 'default', llm: 'success',
 };
-const PROVIDER_HEX: Record<string, string> = {
-  sibling: '#999999', apollo: '#0072B2', enrichSo: '#CC79A7',
-  unipile: '#56B4E9', webSearch: '#E69F00', llm: '#009E73',
-};
+const PROVIDER_HEX: Record<string, string> = ENRICHMENT_PROVIDER_PALETTE;
 
 function totalFailed(job: EnrichmentJob): number {
   if (job.failedCount !== undefined) return job.failedCount;

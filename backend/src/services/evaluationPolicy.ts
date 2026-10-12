@@ -33,7 +33,7 @@ export const SANDBOX_TOOL_CLASSES: Record<string, ToolMatcher> = {
   sends: exact(
     'send_email', 'send_email_to_lead', 'send_email_from_sender', 'notify_session', 'send_for_review',
     'send_gtm_status_report', 'report_product_issues', 'email', 'slack_send_message', 'enqueue_human_eval',
-    'fathom_route_action_items', 'emma_send_message',
+    'fathom_route_action_items', 'emma_send_message', 'manage_crm_sequence',
   ),
   social: anyOf(
     prefix('linkedin_', 'twitter_', 'google_calendar_'),
@@ -42,7 +42,7 @@ export const SANDBOX_TOOL_CLASSES: Record<string, ToolMatcher> = {
   publish: anyOf(
     prefix('publish_'),
     exact('deploy_landing_page', 'configure_landing_page_subdomain', 'enable_lead_list_public_access',
-      'revert_landing_page_publish', 'share_landing_page_with_org'),
+      'revert_landing_page_publish', 'share_landing_page_with_org', 'enable_session_tracking'),
   ),
   third_party_writes: anyOf(
     exact('call_google_ads_api', 'call_google_ads_reporting_api', 'call_hubspot_api', 'call_attio_api',

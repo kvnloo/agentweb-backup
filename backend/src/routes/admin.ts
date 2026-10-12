@@ -26,8 +26,9 @@ import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
 import { deriveSelfActivity } from "../utils/selfActivity";
+import { getProjectionsBatch } from "../services/spendProjectionDb";
 import { generateSecurePassword, getInitialPasswordExpiry } from "../utils/secureRandom";
-import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance, resolveBillingUserId } from "../services/tokenUsageService";
+import { grantTokenBonus, resolveBillingUserId } from "../services/tokenUsageService";
 import { grantMonthlyLlmUsageCredit } from "../services/llmUsageCreditService";
 import { getRevenueMetrics } from "../services/revenueService";
 import { detectMrrCollectionGaps } from "../services/mrrCollectionGapService";
@@ -43,6 +44,8 @@ import { resolveConfigTarget } from "../services/analyticsConfigResolver";
 import { readAnalyticsConfig, writeAnalyticsConfig } from "../services/analyticsConfigStore";
 import { validateAnalyticsConfig } from "../services/analyticsConfigValidator";
 import { sweepUndeliverableDomains } from "../services/emailDeliverabilityService";
+import { isSessionList } from "../utils/sessionList";
+import { TABLE_PREFIX } from "../config/constants";
 
 const router = express.Router();
 
@@ -206,12 +209,9 @@ const ADMIN_USER_LIST_FIELDS = [
   "productDomain",
   "cmsType",
   "subscriptionType",
-  "tokenUsage",
   "tokenUsageHistory",
   "tokenAllowanceBonus",
   "llmUsageCredits",
-  "extraCostUsage",
-  "extraCostUsageHistory",
   "googleDriveFolders",
   "introductionEmailSent",
   "utmSource",
@@ -230,7 +230,7 @@ const ADMIN_USER_LIST_FIELDS = [
   "orgRole",
 ] as const;
 
-const compactAdminUserForList = (user: any): Record<string, any> => {
+const compactAdminUserForList = (user: any, hasUsageThisMonth = false, spendThisMonthUsd?: number): Record<string, any> => {
   const compact: Record<string, any> = {};
   for (const field of ADMIN_USER_LIST_FIELDS) {
     if (user[field] !== undefined) {
@@ -239,7 +239,9 @@ const compactAdminUserForList = (user: any): Record<string, any> => {
   }
   compact.secretNames = user.secrets ? Object.keys(user.secrets) : [];
   // ENG-1271: per-account customer self-activity vs staff-operated signal.
-  compact.selfActivity = deriveSelfActivity(user);
+  compact.selfActivity = deriveSelfActivity(user, hasUsageThisMonth);
+  // Settled spend this month from the ledger (ENG-1250 AC7); omitted when the lookup failed so the UI shows "—", not a false $0.
+  if (spendThisMonthUsd !== undefined) compact.spendThisMonthUsd = spendThisMonthUsd;
   return compact;
 };
 
@@ -720,7 +722,7 @@ router.post("/crm-sync/:source/start", async (req, res) => {
 
     const syncStartedAt = new Date().toISOString();
     const results = leads.length > 0
-      ? await crmDb.batchCreateLeads(parsed.listId, leads)
+      ? await crmDb.batchCreateLeads(parsed.listId, leads, { origin: 'integration' })
       : { successCount: 0, newCount: 0, mergedCount: 0, errorCount: 0, errors: [] as string[], anonymizedSkipped: 0 };
 
     let updatedLastSyncAt: string | null = parsed.lastSyncAt || null;
@@ -794,7 +796,30 @@ router.get("/users", async (req, res) => {
     // The partner-portal roster is where Access Portal lives; sandbox (eval_)
     // accounts must stay reachable here even though every fleet sweep excludes them.
     const users = await userDb.getAllUsers(hideBotLike, { includeSandbox: true });
-    const sanitized = users.map(compactAdminUserForList);
+    // ENG-1271 / ENG-1250 AC7: "has spend this month" for the self-activity signal comes
+    // from the spend ledger in one batched read, not the retired legacy counter. It is a
+    // secondary signal, so a failed read must not take the whole roster down: log it and
+    // treat usage as unknown (staffOperatedSuspect false) rather than silently inventing it.
+    // Keyed by each ACCOUNT's own id, deliberately not its billing owner: the counter this replaces was
+    // per-account, and pooled usage was charged to the owner's counter only, so a member's own was always
+    // empty. Resolving to the owner would flag every member of an org because the owner spent.
+    let spendingThisMonth: Map<string, { settledMicroUsd: number }> | null = null;
+    try {
+      spendingThisMonth = await getProjectionsBatch(
+        users.map((u: any) => u.userId),
+        new Date().toISOString().slice(0, 7),
+      );
+    } catch (error) {
+      console.error("[admin/users] spend lookup for the self-activity signal failed; leaving it unset:", error);
+    }
+    const sanitized = users.map((u: any) => {
+      const settledMicroUsd = spendingThisMonth ? (spendingThisMonth.get(u.userId)?.settledMicroUsd ?? 0) : undefined;
+      return compactAdminUserForList(
+        u,
+        (settledMicroUsd ?? 0) > 0,
+        settledMicroUsd === undefined ? undefined : settledMicroUsd / 1_000_000,
+      );
+    });
 
     // Batch-fetch org name + owner + analytics-sharing flag for users in an org.
     // Also capture the owner's subscription tier so org members can inherit it
@@ -3502,7 +3527,6 @@ router.put("/users/:userId/role", async (req, res) => {
 router.delete("/configs/:configId", async (req, res) => {
   const { configId } = req.params;
   const dynamodb = new DynamoDB.DocumentClient(); // Ensure dynamodb client is available
-  const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
   const tableName = `${TABLE_PREFIX}AW-Configs`;
 
   try {
@@ -3826,7 +3850,6 @@ router.get("/analytics/gtm", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     const plans = await paginatedScan(dynamodb, {
@@ -3897,7 +3920,6 @@ router.get("/analytics/crm", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
     const scanAll = async (tableName: string) => {
       const items: any[] = [];
@@ -3913,10 +3935,17 @@ router.get("/analytics/crm", async (req, res) => {
       return items;
     };
 
-    const [leadLists, leads] = await Promise.all([
+    const [allLeadLists, allLeads] = await Promise.all([
       scanAll(`${TABLE_PREFIX}AW-LeadLists`),
       scanAll(`${TABLE_PREFIX}AW-Leads`),
     ]);
+
+    // ENG-2311: session lists hold one telemetry row per landing-page visit; counting them
+    // as lists/leads would swamp every platform total. Leads carry no listType, so exclude
+    // by the set of session listIds. Non-session lists pass through unchanged.
+    const sessionListIds = new Set(allLeadLists.filter((l) => isSessionList(l)).map((l) => l.listId));
+    const leadLists = allLeadLists.filter((l) => !sessionListIds.has(l.listId));
+    const leads = sessionListIds.size ? allLeads.filter((l) => !sessionListIds.has(l.listId)) : allLeads;
 
     const totalLists = leadLists.length;
     const totalLeads = leads.length;
@@ -3965,7 +3994,6 @@ router.get("/gtm-plans", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Scan all GTM plans (admin can see all)
@@ -4025,7 +4053,6 @@ router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (r
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4224,7 +4251,6 @@ router.put("/gtm-plans/:planId", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4308,7 +4334,6 @@ router.put("/gtm-plans/:planId/phases/:phaseId", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4405,7 +4430,6 @@ router.post("/gtm-plans/:planId/phases/:phaseId/send-status-report", async (req,
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4474,7 +4498,6 @@ router.post("/gtm-plans/:planId/send-status-report", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4537,7 +4560,6 @@ router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/attachmen
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     const getResult = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
@@ -4611,7 +4633,6 @@ router.delete("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/attachm
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     const getResult = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
@@ -4674,7 +4695,6 @@ router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/start-ses
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     const getResult = await dynamodb
@@ -5432,19 +5452,6 @@ router.post("/users/:userId/send-intro-email", async (req, res) => {
   } catch (error) {
     console.error("Error sending team introduction email:", error);
     res.status(500).json({ message: "Error sending team introduction email" });
-  }
-});
-
-// Get token usage for a specific user
-router.get("/users/:userId/token-usage", async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const usage = await getUserTokenUsage(userId);
-    const { allowance, bonus, effectiveAllowance } = await getUserTokenAllowance(userId);
-    res.json({ ...usage, allowance, effectiveAllowance });
-  } catch (error) {
-    console.error("Error getting user token usage:", error);
-    res.status(500).json({ message: "Error getting token usage" });
   }
 });
 

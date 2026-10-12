@@ -37,8 +37,13 @@ jest.mock('@aws-sdk/client-bedrock-runtime', () => ({
 }));
 
 jest.mock('openai', () => jest.fn().mockImplementation((config: any) => ({ _config: config })));
+jest.mock('../services/funding/recordLlmUsage', () => ({
+  ...jest.requireActual('../services/funding/recordLlmUsage'),
+  recordLlmUsage: jest.fn(),
+}));
 
 import { AgentModeService } from '../services/agentModeService';
+import { recordLlmUsage } from '../services/funding/recordLlmUsage';
 import { getSecret } from '../utils/secretsManager';
 import { resolveOpenRouterUpstreamModelId } from '../utils/openRouterGatewayContract';
 import type OpenAI from 'openai';
@@ -543,6 +548,58 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(create).toHaveBeenCalledTimes(1);
   });
 
+  describe('ENG-1345: metering attributes a served fallback, not the primary', () => {
+    const meterCalls = () => (recordLlmUsage as jest.Mock).mock.calls.map((c: any[]) => c[1]);
+    beforeEach(() => (recordLlmUsage as jest.Mock).mockClear());
+
+    const callWith = async (servedModel: string | undefined) => {
+      const service = new AgentModeService();
+      const create = jest.fn().mockResolvedValue({
+        id: 'gen-1',
+        ...(servedModel !== undefined ? { model: servedModel } : {}),
+        choices: [],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      });
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
+      await service.callLLM(
+        'openrouter/perplexity/sonar-deep-research',
+        [{ role: 'user', content: 'Research' }],
+        { fallbackModels: ['openrouter/perplexity/sonar-pro-search'] } as any,
+      );
+    };
+
+    it('records the fallback model when OpenRouter served the fallback', async () => {
+      await callWith('perplexity/sonar-pro-search');
+      expect(meterCalls()).toHaveLength(1);
+      expect(meterCalls()[0]).toEqual(expect.objectContaining({
+        model: 'openrouter/perplexity/sonar-pro-search',
+        provider: 'openrouter',
+      }));
+    });
+
+    it('records the fallback model when OpenRouter returns a dated variant of it', async () => {
+      await callWith('perplexity/sonar-pro-search-20260901');
+      expect(meterCalls()[0].model).toBe('openrouter/perplexity/sonar-pro-search');
+    });
+
+    it('keeps primary-path metering unchanged when the primary served the call', async () => {
+      await callWith('perplexity/sonar-deep-research');
+      expect(meterCalls()[0].model).toBe('openrouter/perplexity/sonar-deep-research');
+    });
+
+    it('keeps the primary when the response does not name a served model', async () => {
+      await callWith(undefined);
+      expect(meterCalls()[0].model).toBe('openrouter/perplexity/sonar-deep-research');
+    });
+
+    it('never attributes to a model outside the requested chain', async () => {
+      await callWith('openai/gpt-5.4');
+      expect(meterCalls()[0].model).toBe('openrouter/perplexity/sonar-deep-research');
+    });
+  });
+
   it('ENG-1831: refuses tools for a tool-less model before sending, instead of a routing 404', async () => {
     const service = new AgentModeService();
     const create = jest.fn();
@@ -656,6 +713,40 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
       ...OPENROUTER_PROVIDER_PREFERENCES,
       require_parameters: true,
       ignore: ['Google'],
+    });
+  });
+
+  describe('ENG-55 Compare data-collection policy', () => {
+    async function providerFor(options: any, model = 'gemini-3.7-flash') {
+      const service = new AgentModeService();
+      const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({ chat: { completions: { create } } } as any);
+      await service.callLLM(model, [{ role: 'user', content: 'Hello' }], options);
+      return create.mock.calls[0][0].provider;
+    }
+
+    it('without providerPolicy the provider object is exactly today\'s (no data_collection)', async () => {
+      expect(await providerFor({ taskClass: 'interactive_chat' }, 'gpt-5.4')).toEqual({
+        order: ['amazon-bedrock', 'azure', 'google-vertex', 'anthropic', 'openai'],
+        allow_fallbacks: true,
+        require_parameters: true,
+      });
+    });
+
+    it('with providerPolicy deny, data_collection is merged and order/allow_fallbacks/require_parameters/ignore survive', async () => {
+      expect(await providerFor({ taskClass: 'interactive_chat', providerPolicy: { data_collection: 'deny' } })).toEqual({
+        ...OPENROUTER_PROVIDER_PREFERENCES,
+        require_parameters: true,
+        ignore: ['Google'],
+        data_collection: 'deny',
+      });
+    });
+
+    it('a normal chat call never carries data_collection (guards against applying it to every call)', async () => {
+      for (const model of ['gpt-5.4', 'gemini-3.7-flash', 'anthropic.claude-sonnet-5']) {
+        expect(await providerFor({ taskClass: 'interactive_chat' }, model)).not.toHaveProperty('data_collection');
+        expect(await providerFor(undefined, model)).not.toHaveProperty('data_collection');
+      }
     });
   });
 

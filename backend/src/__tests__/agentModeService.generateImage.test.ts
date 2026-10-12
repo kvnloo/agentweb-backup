@@ -5,6 +5,10 @@ import * as autoHumanEvalService from '../services/autoHumanEvalService';
 import * as imageGeneration from '../services/imageGeneration';
 import { evaluateCreativeGates } from '../services/creativeGates';
 import { resolveModelForUser } from '../services/modelRoles';
+// ENG-2103 (F2 design-decision-list follow-up, Pattern A): generateImage's
+// body now lives here; AgentModeService.prototype.generateImage is a thin
+// delegating wrapper.
+import * as mediaVideoImpl from '../emma/impl/mediaVideo';
 
 // Mock dependencies
 jest.mock('../services/imageGeneration');
@@ -1173,7 +1177,14 @@ describe('Data-fabrication backstop wiring (ENG-1027)', () => {
     (imageGeneration.imageService as any).generateImage = mockImageService.generateImage;
 
     agentModeService = new AgentModeService();
-    describeImageSpy = jest.spyOn(agentModeService, 'describeImage');
+    // ENG-2103 (F2 design-decision-list follow-up, Pattern A): generateImage's
+    // internal call to describeImage now lives inside emma/impl/mediaVideo.ts
+    // (both moved together) and reaches it via a same-module self-import
+    // (`self.describeImage(...)`), not `this.describeImage`/
+    // `agentModeService.describeImage` — so the spy has to target the module
+    // export, not the class instance, or it would silently stop being
+    // observed (the cluster-10 sibling-function-spy failure mode).
+    describeImageSpy = jest.spyOn(mediaVideoImpl, 'describeImage');
   });
 
   const DASHBOARD_PROMPT = 'A status tracker dashboard graphic with a metrics preview panel.';
@@ -1195,7 +1206,12 @@ describe('Data-fabrication backstop wiring (ENG-1027)', () => {
       'https://example.com/dashboard.png',
       expect.stringContaining('NUMBERS_FOUND'),
       // ENG-1858: the check is metered to the generating user, not "system".
-      { userId: 'user123', sessionId: 'session123', feature: 'describe_image' }
+      { userId: 'user123', sessionId: 'session123', feature: 'describe_image' },
+      // ENG-2103 (F2): generateImage forwards its own injected callLLM/getVisionModel
+      // through to describeImage as a plain same-module call — not a second,
+      // redundant injection point for the same underlying capability.
+      expect.any(Function),
+      expect.any(Function),
     );
   });
 
@@ -1250,5 +1266,30 @@ describe('Data-fabrication backstop wiring (ENG-1027)', () => {
 
     expect(result.success).toBe(true);
     expect(result.dataReliabilityWarning).toBeUndefined();
+  });
+
+  // ENG-1535 AC3: the generate_image handler contract forwards the typed provider
+  // errorClass so the gateway/agent can distinguish retryable from terminal failures.
+  describe('typed errorClass contract (ENG-1535)', () => {
+    const call = () =>
+      (agentModeService as unknown as {
+        generateImage: (...args: unknown[]) => Promise<Record<string, unknown>>;
+      }).generateImage(
+        'Ad prompt', 'ad.png', '1:1', 'medium', [], 'user123', 'session123',
+        'gemini-3-pro-image-preview', undefined, undefined, 'ad', undefined, undefined,
+      );
+
+    it.each(['transient', 'rate_limited', 'policy', 'config'])('forwards errorClass=%s on failure', async (errorClass) => {
+      mockImageService.generateImage.mockResolvedValue({ success: false, error: `boom ${errorClass}`, errorClass });
+      const result = await call();
+      expect(result).toMatchObject({ success: false, error: `boom ${errorClass}`, errorClass });
+    });
+
+    it('omits errorClass when the provider did not classify the failure', async () => {
+      mockImageService.generateImage.mockResolvedValue({ success: false, error: 'unknown' });
+      const result = await call();
+      expect(result.success).toBe(false);
+      expect(result).not.toHaveProperty('errorClass');
+    });
   });
 });

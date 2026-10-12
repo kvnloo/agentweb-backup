@@ -6,6 +6,7 @@ import {
 } from '../services/contactCaptureHooks';
 import { PUBLIC_LOGGABLE_EVENT_TYPES } from '../services/contactEventsDb';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
+import { suppressLeadSideEffects } from '../utils/sessionList';
 
 const router = express.Router();
 
@@ -194,16 +195,34 @@ router.post('/leads/:listId', async (req: Request, res: Response) => {
       }
     }
 
-    const lead = await crmDb.createLead(listId, leadData as any);
+    // ENG-2311: no HubSpot/Attio push for a session list (leadData is whitelisted above, so
+    // the flag below is server-set, never body-controlled).
+    const suppressSideEffects = suppressLeadSideEffects(list);
+    let lead: any;
+    try {
+      // ENG-2321: concurrent same-email posts resolve to one row (an ordinary list; session lists are untouched).
+      lead = await crmDb.createLead(listId, (suppressSideEffects ? { ...leadData, suppressSideEffects: true } : { ...leadData, emailUniqueCreate: true }) as any, 'form_fill');
+    } catch (createErr: any) {
+      if (!createErr?.duplicateEmail) throw createErr;
+      // The email is already on this list (a repeat submission, or a concurrent one that won
+      // the race). That is a visitor re-submitting a form, not a server fault: the generic
+      // catch below turned it into a 500 for EVERY repeat. Report success without merging and
+      // without echoing the existing leadId — this endpoint is unauthenticated, so letting a
+      // caller overwrite an existing lead's fields (or learn its id) by guessing its email
+      // would be a data-poisoning / enumeration vector the create-only contract never had.
+      return res.status(200).json({ success: true, duplicate: true });
+    }
 
     // Real-time push to any connected external CRM (HubSpot / Attio). Without
     // this, public-form leads only reached HubSpot on a manual push. Uses the
     // list owner's userId since this endpoint is unauthenticated. Fire-and-forget
     // — autoSyncLead swallows its own errors and no-ops when sync is off.
-    void externalCrmSyncService.autoSyncLead(list.userId, listId, lead, 'hubspot', 'created')
-      .catch((err) => console.error('[crmPublic] HubSpot auto-sync error:', err?.message ?? err));
-    void externalCrmSyncService.autoSyncLead(list.userId, listId, lead, 'attio', 'created')
-      .catch((err) => console.error('[crmPublic] Attio auto-sync error:', err?.message ?? err));
+    if (!suppressSideEffects) {
+      void externalCrmSyncService.autoSyncLead(list.userId, listId, lead, 'hubspot', 'created')
+        .catch((err) => console.error('[crmPublic] HubSpot auto-sync error:', err?.message ?? err));
+      void externalCrmSyncService.autoSyncLead(list.userId, listId, lead, 'attio', 'created')
+        .catch((err) => console.error('[crmPublic] Attio auto-sync error:', err?.message ?? err));
+    }
 
     return res.status(201).json({ leadId: (lead as any).leadId, success: true });
   } catch (error) {
@@ -216,7 +235,13 @@ router.post('/leads/:listId', async (req: Request, res: Response) => {
 router.post('/lists/:listId/leads/:leadId/group-email-unsubscribe', async (req: Request, res: Response) => {
   try {
     const { listId, leadId } = req.params;
-    const { email, feedback, sig } = req.body;
+    // ENG-2367: RFC 8058 one-click POSTs carry only `List-Unsubscribe=One-Click` in a
+    // form-encoded body, so email/sig come from the signed header URL's query string.
+    const body = req.body || {};
+    const queryStr = (v: unknown) => (typeof v === 'string' ? v : undefined);
+    const email = body.email ?? queryStr(req.query.email);
+    const sig = body.sig ?? queryStr(req.query.sig);
+    const { feedback } = body;
 
     if (!email) {
       return res.status(400).json({ message: 'Email is required' });

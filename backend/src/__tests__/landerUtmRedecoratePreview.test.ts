@@ -118,6 +118,20 @@ describe("UTM redecorate dry-run preview (ENG-728)", () => {
     expect(inherited.rows[0]).toMatchObject({ status: "changed" });
   });
 
+  it.each([
+    { utm_source: "" },
+    { gclid: "forbidden" },
+    ["not-a-config"],
+  ])("reports corrupt overrides as errors instead of skipping them: %p", async (utmOverride) => {
+    const deps = dependencies({
+      listLanders: jest.fn().mockResolvedValue([deployed({ utmOverride })]),
+    });
+    const result = await previewLanderUtmRedecoration({ userId: "user-1" }, deps);
+    expect(result.rows[0]).toMatchObject({ landerId: "lander-1", status: "error" });
+    expect(result.summary).toMatchObject({ skipped: 0, errors: 1, noChange: 0 });
+    expect(deps.readDeployedLinks).not.toHaveBeenCalled();
+  });
+
   it("never proposes removing gclid or fbclid", async () => {
     const deps = dependencies({
       getCustomerDefault: jest.fn().mockResolvedValue(null),

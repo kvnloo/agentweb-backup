@@ -26,11 +26,13 @@ import { judgeOnboardingAdCopy } from "../services/creativeRubricOnboarding";
 import {
   AD_COPY_SYSTEM_PROMPT,
   BRICK_10_VARIETIES,
+  claimAdCopyRun,
   generateAdCopyForUser,
   pickDistinctVarieties,
   startAdCopyForUser,
   triggerAdCopyForUser,
 } from "../services/onboardingAdCopyService";
+import { AD_COPY_TIMEOUT_MS } from "../services/adCopyStatusService";
 const { userDb } = require("../services/db");
 
 class FakeLlm {
@@ -595,6 +597,70 @@ describe("onboardingAdCopyService", () => {
       expect(written.adCopyResult.variants).toHaveLength(3);
     });
 
+    // ENG-2308 review follow-up, confirmed by direct reproduction (same
+    // reasoning as onboardingIcpService's icpOwnershipCondition tests).
+    it("conditions the completion write on this run's own adCopyStartedAt when expectedStartedAt is provided", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          adImageStatus: "ready",
+          adImageResult: { variants: threeImages },
+          icpResult: [onePersona],
+          creativeDirResult: creativeDir,
+        })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          adCopyStatus: "running",
+          adCopyStartedAt: "2026-04-24T11:59:00.000Z",
+        });
+      userDb.updateUser.mockResolvedValue({});
+
+      const llm = new FakeLlm(buildVariantResponse);
+      await triggerAdCopyForUser("user-1", {
+        llm: llm as any,
+        expectedStartedAt: "2026-04-24T11:59:00.000Z",
+      });
+
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toBe(
+        "#adCopyStartedAt = :adCopyOwnerStartedAt",
+      );
+      expect(options?.condition?.values?.[":adCopyOwnerStartedAt"]).toBe(
+        "2026-04-24T11:59:00.000Z",
+      );
+    });
+
+    it("drops the completion silently when a reclaim has superseded this run (ConditionalCheckFailedException)", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          adImageStatus: "ready",
+          adImageResult: { variants: threeImages },
+          icpResult: [onePersona],
+          creativeDirResult: creativeDir,
+        })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          adCopyStatus: "running",
+          adCopyStartedAt: "2026-04-24T12:05:00.000Z",
+        });
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+      const llm = new FakeLlm(buildVariantResponse);
+
+      await expect(
+        triggerAdCopyForUser("user-1", {
+          llm: llm as any,
+          expectedStartedAt: "2026-04-24T11:59:00.000Z",
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    });
+
     it("drops the ready patch silently when user is no longer running", async () => {
       userDb.getUserById
         .mockResolvedValueOnce({
@@ -696,6 +762,34 @@ describe("onboardingAdCopyService", () => {
     });
   });
 
+  // ENG-2308 follow-up, caught live: the orchestrator's runAdCopy used to
+  // call triggerAdCopyForUser directly with nothing ever flipping
+  // adCopyStatus to running first — the trigger silently dropped its
+  // result. claimAdCopyRun is the extracted, reusable claim both
+  // startAdCopyForUser and runAdCopy go through.
+  describe("claimAdCopyRun", () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it("claims the axis and returns the persisted patch", async () => {
+      userDb.updateUser.mockResolvedValue({});
+      const patch = await claimAdCopyRun("user-1");
+      expect(patch).not.toBeNull();
+      expect(patch?.adCopyStatus).toBe("running");
+    });
+
+    it("returns null without throwing when it loses the claim", async () => {
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+      const patch = await claimAdCopyRun("user-1");
+      expect(patch).toBeNull();
+    });
+  });
+
   describe("startAdCopyForUser", () => {
     beforeEach(() => {
       jest.clearAllMocks();
@@ -705,12 +799,95 @@ describe("onboardingAdCopyService", () => {
       userDb.updateUser.mockResolvedValue({});
       userDb.getUserById.mockResolvedValue(null);
 
-      await startAdCopyForUser("user-1");
+      const result = await startAdCopyForUser("user-1");
 
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
       const startPatch = userDb.updateUser.mock.calls[0][1];
       expect(startPatch.adCopyStatus).toBe("running");
       expect(startPatch.adCopyStartedAt).toBeTruthy();
+      // The claim also clears the previous attempt's error (REMOVE, via null);
+      // the returned patch is the same run without that storage-only marker.
+      expect(startPatch.adCopyError).toBeNull();
+      expect(result).toEqual({ ...startPatch, adCopyError: undefined });
+    });
+
+    // ENG-2308: same unconditional-write race as icp/competitor — two
+    // concurrent callers could each observe a non-running status and both
+    // launch a real LLM call. Guard the claim with a ConditionExpression.
+    it("claims the running transition with a ConditionExpression guarding against a concurrent in-flight run", async () => {
+      userDb.updateUser.mockResolvedValue({});
+      userDb.getUserById.mockResolvedValue(null);
+
+      const before = Date.now();
+      await startAdCopyForUser("user-1");
+
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toBe(
+        "attribute_not_exists(#adCopyStatus) OR #adCopyStatus <> :adCopyRunning OR #adCopyStartedAt <= :adCopyStaleBefore",
+      );
+      expect(options?.condition?.names).toEqual({
+        "#adCopyStatus": "adCopyStatus",
+        "#adCopyStartedAt": "adCopyStartedAt",
+      });
+      expect(options?.condition?.values?.[":adCopyRunning"]).toBe("running");
+      // ENG-2308 fix-of-a-fix: stale-claim escape hatch (see icpStartClaimCondition).
+      const staleBefore = Date.parse(options?.condition?.values?.[":adCopyStaleBefore"]);
+      expect(staleBefore).toBeGreaterThanOrEqual(before - AD_COPY_TIMEOUT_MS - 1000);
+      expect(staleBefore).toBeLessThanOrEqual(Date.now() - AD_COPY_TIMEOUT_MS + 1000);
+    });
+
+    it("returns null and launches no background work when it loses the race to a concurrent caller", async () => {
+      userDb.getUserById.mockResolvedValue({ userId: "user-1" });
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValue(conditionalFailure);
+
+      const result = await startAdCopyForUser("user-1");
+
+      expect(result).toBeNull();
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      // getUserById IS called once (to check eager status before claiming
+      // — ENG-2308 fix-of-a-fix).
+      expect(userDb.getUserById).toHaveBeenCalledTimes(1);
+    });
+
+    // ENG-2308 fix-of-a-fix, caught live: runAdCopy claims this SAME axis
+    // itself when the orchestrator fires the step, inside the SAME
+    // reconcile pass this function delegates to. Must check eager status
+    // and skip claiming entirely in that case.
+    it("does not claim the axis itself on the eager pipeline — leaves the claim to runAdCopy", async () => {
+      userDb.getUserById.mockResolvedValue({ userId: "user-1", useEagerPipeline: true });
+      const orchestratorWiring = require("../services/onboardingOrchestratorWiring");
+      const reconcileSpy = jest
+        .spyOn(orchestratorWiring, "reconcileForUser")
+        .mockImplementation(async () => {});
+      try {
+        const result = await startAdCopyForUser("user-1");
+
+        expect(result).toBeNull();
+        expect(userDb.updateUser).not.toHaveBeenCalled();
+        expect(reconcileSpy).toHaveBeenCalledWith("user-1");
+      } finally {
+        reconcileSpy.mockRestore();
+      }
+    });
+
+    it("re-throws a non-conditional DynamoDB error", async () => {
+      // jest.clearAllMocks() (beforeEach) does not reset the previous test's
+      // mockResolvedValue — without this, the prior eager-pipeline test's
+      // `useEagerPipeline: true` leaks in, and since the eager check now
+      // runs BEFORE the claim write, this test would short-circuit to the
+      // reconcile branch and never reach updateUser at all.
+      userDb.getUserById.mockResolvedValue({ userId: "user-1" });
+      userDb.updateUser.mockRejectedValue(
+        Object.assign(new Error("boom"), {
+          code: "ProvisionedThroughputExceededException",
+        }),
+      );
+
+      await expect(startAdCopyForUser("user-1")).rejects.toThrow("boom");
     });
   });
 });

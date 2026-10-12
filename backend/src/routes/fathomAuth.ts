@@ -26,7 +26,6 @@ export function buildFathomWebhookDestinationUrl(baseUrl: string): string {
 
 const STATE_EXPIRATION = '15m';
 const TOKEN_SESSION_TTL_MS = OAUTH_FLOW_SESSION_TTL_MS;
-const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 interface StatePayload {
@@ -58,15 +57,6 @@ interface TokenSession extends LocalOAuthFlowSession {
   userId: string;
   expires: number;
 }
-
-const tokenSessions = new Map<string, TokenSession>();
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of tokenSessions.entries()) {
-    if (now > session.expires) tokenSessions.delete(id);
-  }
-}, SESSION_CLEANUP_INTERVAL_MS).unref();
 
 // GET /init
 router.get('/init', authenticateToken, async (req: any, res) => {
@@ -143,7 +133,7 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
       expires_in: number;
     };
 
-    const tokenSessionId = await storeOAuthFlowSession('fathom', tokenSessions, {
+    const tokenSessionId = await storeOAuthFlowSession('fathom', {
       userId,
       tokens: { access_token, refresh_token, expires_in },
       expires: Date.now() + TOKEN_SESSION_TTL_MS,
@@ -167,7 +157,7 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
   }
 
   try {
-    const session = await consumeOAuthFlowSession('fathom', tokenSessions, tokenSessionId, userId);
+    const session = await consumeOAuthFlowSession<TokenSession>('fathom', tokenSessionId, userId);
     if (!session) {
       return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
     }

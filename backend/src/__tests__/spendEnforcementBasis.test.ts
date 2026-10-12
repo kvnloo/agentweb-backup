@@ -19,6 +19,8 @@ import {
   SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV,
   SPEND_LEDGER_ENFORCEMENT_EXCLUDE_TIERS_ENV,
   SPEND_PROJECTION_MAX_STALENESS_MIN_ENV,
+  SPEND_LEDGER_LEGACY_FALLBACK_ENV,
+  __resetMissingProjectionLogForTests,
 } from "../services/spendEnforcementBasis";
 
 const ACCT = "bb07579b-2d82-4d45-894f-ec74ec7e78c2";
@@ -58,6 +60,8 @@ describe("spendEnforcementBasis", () => {
     delete process.env[SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV];
     delete process.env[SPEND_LEDGER_ENFORCEMENT_EXCLUDE_TIERS_ENV];
     delete process.env[SPEND_PROJECTION_MAX_STALENESS_MIN_ENV];
+    delete process.env[SPEND_LEDGER_LEGACY_FALLBACK_ENV];
+    __resetMissingProjectionLogForTests();
   });
 
   afterAll(() => {
@@ -170,28 +174,80 @@ describe("spendEnforcementBasis", () => {
       expect(getProjectionMock).toHaveBeenCalledWith(ACCT, MONTH);
     });
 
-    it("fails OPEN to the legacy figure when no projection is persisted", async () => {
-      process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
-      getProjectionMock.mockResolvedValue(null);
-      const res = await resolveEnforcementCostBasisMicroUsd({
-        billingUserId: ACCT,
-        billingMonth: MONTH,
-        legacyRawCostUsedMicroUsd: 115_740_000,
+    describe("no legacy fallback by default (ENG-1250 AC7)", () => {
+      const input = { billingUserId: ACCT, billingMonth: MONTH, legacyRawCostUsedMicroUsd: 115_740_000 };
+
+      it("a MISSING projection counts as $0 spend — never the legacy figure", async () => {
+        process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+        getProjectionMock.mockResolvedValue(null);
+        const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
+
+        const res = await resolveEnforcementCostBasisMicroUsd(input);
+
+        expect(res).toEqual({ rawCostUsedMicroUsd: 0, basis: "spend_ledger", projectionMissing: true, stale: false });
+        logSpy.mockRestore();
       });
-      expect(res).toEqual({ rawCostUsedMicroUsd: 115_740_000, basis: "legacy", projectionMissing: true, stale: false });
+
+      it("logs a missing projection once per subject+month, not on every request", async () => {
+        process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+        getProjectionMock.mockResolvedValue(null);
+        const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
+
+        await resolveEnforcementCostBasisMicroUsd(input);
+        await resolveEnforcementCostBasisMicroUsd(input);
+        await resolveEnforcementCostBasisMicroUsd({ ...input, billingMonth: "2026-10" });
+
+        const lines = logSpy.mock.calls.filter((c) => String(c[0]).includes("no projection yet"));
+        expect(lines).toHaveLength(2); // one per distinct subject+month
+        logSpy.mockRestore();
+      });
+
+      it("a read ERROR fails OPEN: counts $0, admits, and logs loudly", async () => {
+        process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+        getProjectionMock.mockRejectedValue(new Error("dynamo unavailable"));
+        const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+        const res = await resolveEnforcementCostBasisMicroUsd(input);
+
+        expect(res).toEqual({ rawCostUsedMicroUsd: 0, basis: "spend_ledger", projectionMissing: true, stale: false });
+        expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("failing OPEN"), expect.any(Error));
+        errSpy.mockRestore();
+      });
+
+      it("a projection that EXISTS is still used exactly as before", async () => {
+        process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+        getProjectionMock.mockResolvedValue(projection(218_240_000));
+        const res = await resolveEnforcementCostBasisMicroUsd(input);
+        expect(res).toEqual({ rawCostUsedMicroUsd: 218_240_000, basis: "spend_ledger", projectionMissing: false, stale: false });
+      });
     });
 
-    it("fails OPEN to the legacy figure when the ledger read throws", async () => {
-      process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
-      getProjectionMock.mockRejectedValue(new Error("dynamo unavailable"));
-      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
-      const res = await resolveEnforcementCostBasisMicroUsd({
-        billingUserId: ACCT,
-        billingMonth: MONTH,
-        legacyRawCostUsedMicroUsd: 115_740_000,
+    describe("AW_SPEND_LEDGER_LEGACY_FALLBACK=true restores the old fallback (rollback lever)", () => {
+      const input = { billingUserId: ACCT, billingMonth: MONTH, legacyRawCostUsedMicroUsd: 115_740_000 };
+
+      it("a MISSING projection falls back to the legacy figure", async () => {
+        process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+        process.env[SPEND_LEDGER_LEGACY_FALLBACK_ENV] = "true";
+        getProjectionMock.mockResolvedValue(null);
+        const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
+
+        const res = await resolveEnforcementCostBasisMicroUsd(input);
+
+        expect(res).toEqual({ rawCostUsedMicroUsd: 115_740_000, basis: "legacy", projectionMissing: true, stale: false });
+        logSpy.mockRestore();
       });
-      expect(res).toEqual({ rawCostUsedMicroUsd: 115_740_000, basis: "legacy", projectionMissing: true, stale: false });
-      errSpy.mockRestore();
+
+      it("a read ERROR falls back to the legacy figure", async () => {
+        process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+        process.env[SPEND_LEDGER_LEGACY_FALLBACK_ENV] = "true";
+        getProjectionMock.mockRejectedValue(new Error("dynamo unavailable"));
+        const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+        const res = await resolveEnforcementCostBasisMicroUsd(input);
+
+        expect(res).toEqual({ rawCostUsedMicroUsd: 115_740_000, basis: "legacy", projectionMissing: true, stale: false });
+        errSpy.mockRestore();
+      });
     });
 
     it("reads the ledger only for allowlisted accounts", async () => {
@@ -260,9 +316,11 @@ describe("spendEnforcementBasis", () => {
       expect(lastMonth.basis).toBe("spend_ledger");
       expect(lastMonth.rawCostUsedMicroUsd).toBe(500_000_000);
 
-      // New month: no row yet → fails open to legacy (fresh), NOT the $500 over-cap total.
+      // New month: no row yet → counts $0 (a fresh month), NOT the $500 over-cap total.
+      const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
       const newMonth = await resolveEnforcementCostBasisMicroUsd({ billingUserId: ACCT, billingMonth: "2026-10", legacyRawCostUsedMicroUsd: 0 });
-      expect(newMonth.basis).toBe("legacy");
+      logSpy.mockRestore();
+      expect(newMonth.basis).toBe("spend_ledger");
       expect(newMonth.projectionMissing).toBe(true);
       expect(newMonth.rawCostUsedMicroUsd).toBe(0);
     });
@@ -323,6 +381,80 @@ describe("spendEnforcementBasis", () => {
       expect(res.basis).toBe("legacy");
       expect(res.stale).toBe(true);
       warn.mockRestore();
+    });
+  });
+  // ENG-1250 AC7: the legacy counter is retiring, so it must not be read unless a legacy path is
+  // actually taken. Passing a function makes that observable.
+  describe("lazy legacy counter (never read on the live ledger path)", () => {
+    const base = { billingUserId: ACCT, billingMonth: MONTH };
+
+    it("is NOT invoked when the ledger basis is used", async () => {
+      process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+      process.env[SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV] = "*";
+      getProjectionMock.mockResolvedValue(projection(5_000_000));
+      const legacy = jest.fn().mockResolvedValue(999);
+
+      const res = await resolveEnforcementCostBasisMicroUsd({ ...base, legacyRawCostUsedMicroUsd: legacy });
+
+      expect(res).toMatchObject({ basis: "spend_ledger", rawCostUsedMicroUsd: 5_000_000 });
+      expect(legacy).not.toHaveBeenCalled();
+    });
+
+    it("is NOT invoked when the projection is missing or the read fails (counts $0 / fails open)", async () => {
+      process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+      process.env[SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV] = "*";
+      const legacy = jest.fn().mockResolvedValue(999);
+      jest.spyOn(console, "log").mockImplementation(() => {});
+      jest.spyOn(console, "error").mockImplementation(() => {});
+
+      getProjectionMock.mockResolvedValueOnce(null);
+      expect((await resolveEnforcementCostBasisMicroUsd({ ...base, legacyRawCostUsedMicroUsd: legacy })).rawCostUsedMicroUsd).toBe(0);
+      getProjectionMock.mockRejectedValueOnce(new Error("boom"));
+      expect((await resolveEnforcementCostBasisMicroUsd({ ...base, legacyRawCostUsedMicroUsd: legacy })).rawCostUsedMicroUsd).toBe(0);
+
+      expect(legacy).not.toHaveBeenCalled();
+      jest.restoreAllMocks();
+    });
+
+    it("IS invoked (and its value used) when enforcement is off for the subject", async () => {
+      const legacy = jest.fn().mockResolvedValue(7_000_000);
+
+      const res = await resolveEnforcementCostBasisMicroUsd({ ...base, legacyRawCostUsedMicroUsd: legacy });
+
+      expect(res).toMatchObject({ basis: "legacy", rawCostUsedMicroUsd: 7_000_000 });
+      expect(legacy).toHaveBeenCalledTimes(1);
+    });
+
+    it("IS invoked on the opt-in legacy fallback for a missing projection and a failed read", async () => {
+      process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+      process.env[SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV] = "*";
+      process.env[SPEND_LEDGER_LEGACY_FALLBACK_ENV] = "true";
+      jest.spyOn(console, "log").mockImplementation(() => {});
+      jest.spyOn(console, "error").mockImplementation(() => {});
+      const legacy = jest.fn().mockResolvedValue(3_000_000);
+
+      getProjectionMock.mockResolvedValueOnce(null);
+      expect((await resolveEnforcementCostBasisMicroUsd({ ...base, legacyRawCostUsedMicroUsd: legacy })).rawCostUsedMicroUsd).toBe(3_000_000);
+      getProjectionMock.mockRejectedValueOnce(new Error("boom"));
+      expect((await resolveEnforcementCostBasisMicroUsd({ ...base, legacyRawCostUsedMicroUsd: legacy })).rawCostUsedMicroUsd).toBe(3_000_000);
+
+      expect(legacy).toHaveBeenCalledTimes(2);
+      jest.restoreAllMocks();
+    });
+
+    it("IS invoked on the staleness fallback", async () => {
+      process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+      process.env[SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV] = "*";
+      process.env[SPEND_PROJECTION_MAX_STALENESS_MIN_ENV] = "5";
+      jest.spyOn(console, "warn").mockImplementation(() => {});
+      getProjectionMock.mockResolvedValue(projection(218_240_000, "2020-01-01T00:00:00.000Z"));
+      const legacy = jest.fn().mockResolvedValue(4_000_000);
+
+      const res = await resolveEnforcementCostBasisMicroUsd({ ...base, legacyRawCostUsedMicroUsd: legacy });
+
+      expect(res).toMatchObject({ basis: "legacy", stale: true, rawCostUsedMicroUsd: 4_000_000 });
+      expect(legacy).toHaveBeenCalledTimes(1);
+      jest.restoreAllMocks();
     });
   });
 });

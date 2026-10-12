@@ -34,6 +34,8 @@ import { handleHardBounceRecipients } from '../services/emailDeliverabilityServi
 // module-private state. Extracted so the CRM → Meta conversion relay throttles against the
 // same counters instead of a second set that drifts out of step with this one.
 import { shouldAttemptCapiSend, isCapiAccountPaused, recordCapiUsage } from '../services/capiSendBudget';
+import { suppressLeadSideEffects, isSessionList, resolveSessionIdentity } from '../utils/sessionList';
+import { upsertSessionLead } from '../services/sessionUpsertService';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -106,6 +108,30 @@ function validatedEventTimeSeconds(capturedAtMs: unknown): number | undefined {
   return Math.floor(capturedAtMs / 1000);
 }
 
+
+/**
+ * ENG-2320: turn an `updateLead` payload that carries the WHOLE merged customFields map into one
+ * that carries only the keys this write adds or changes, flagged for per-key atomic writes.
+ *
+ * A full-map `SET customFields = :map` overwrites every key a concurrent request stored since the
+ * snapshot `existingCustomFields` was read (12 concurrent multi-step / double submits kept 1 of
+ * 12). A key is picked when it is absent from the snapshot or its value differs by JSON
+ * comparison, the same comparison the merges use to decide `changed`, so an unchanged value (and a
+ * `source` restored from the stored row) is never rewritten: a stale snapshot cannot revert a key
+ * this write does not own. Updates without customFields pass through untouched.
+ */
+function toKeyMergeUpdate(updates: any, existingCustomFields: Record<string, any>): any {
+  if (!updates.customFields) return updates;
+  const { customFields: mergedMap, ...rest } = updates;
+  const patch = Object.fromEntries(
+    Object.entries(mergedMap).filter(
+      ([k, v]) =>
+        !Object.prototype.hasOwnProperty.call(existingCustomFields, k) ||
+        JSON.stringify(existingCustomFields[k]) !== JSON.stringify(v),
+    ),
+  );
+  return { ...rest, customFields: patch, customFieldsKeyMerge: true };
+}
 
 /**
  * Fire-and-forget: enroll a single lead into any sequences that have
@@ -496,6 +522,10 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
   try {
 
+    // ENG-2311: read from the list row the DATABASE returned, never from the body. One
+    // decision, made once, consumed by every side-effect gate below.
+    const suppressSideEffects = suppressLeadSideEffects(leadList);
+
     // Extract lead data from request body
     const {
       email,
@@ -653,6 +683,11 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // (`clientIp`/`clientUserAgent` are deliberately NOT handled — see the destructure.)
       'visitorIp', 'visitorUserAgent',
       'allowAnonymousLead',
+      // ENG-2312. The session's start time, consumed below as part of the session identity
+      // (it becomes the leadId's time prefix). Absent from this set it would be written into
+      // customFields as junk on every event. `sessionId` is deliberately NOT added: LPs
+      // already post it (flat or in customFields) and read it back out of customFields.
+      'sessionStartMs',
     ]);
     const PASSTHROUGH_MAX_KEYS = 50;
     const PASSTHROUGH_MAX_VALUE_LENGTH = 1000;
@@ -721,22 +756,35 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // so two submissions of the same number collapse onto one row without needing a second
     // GSI. A phone-only lead that later submits WITH an email becomes its own row, which is
     // the same thing that already happens for two different emails.
-    const existingLead = normalizedEmail
+    //
+    // ENG-2312: a SESSION list with a valid session identity skips this lookup entirely.
+    // email-index is an eventually-consistent GSI, so events 3–128 ms apart for one session
+    // all missed each other here and each created its own row. Such a request instead targets
+    // one deterministic (listId, leadId) item and lets a conditional put decide (see the
+    // sessionIdentity branch below). Gated on the list row the DB returned, never on the body:
+    // the body only supplies the identity to use, and an invalid or missing identity falls back
+    // to exactly the behaviour below, so LPs that do not send sessionStartMs yet are unchanged.
+    const sessionIdentity = isSessionList(leadList) ? resolveSessionIdentity(req.body) : null;
+    const existingLead = normalizedEmail && !sessionIdentity
       ? await crmDb.getLeadByEmail(leadList.listId, normalizedEmail.toLowerCase())
       : null;
 
     // Only stamp forwardedAt for new leads; for existing leads, preserve the original timestamp
-    const mergedCustomFields: Record<string, any> = existingLead
+    let mergedCustomFields: Record<string, any> = existingLead
       ? incomingCustomFields
       : { ...incomingCustomFields, forwardedAt: new Date().toISOString() };
-
     leadData.customFields = mergedCustomFields;
 
     let lead: any;
     let isNew = false;
     let isUpdated = false;
 
-    if (existingLead) {
+    // The one merge routine for an EXISTING lead. Two entry points reach it: the
+    // getLeadByEmail hit at the top of this handler, and a createLead that lost a race to a
+    // concurrent submission of the same email (the adopt in the create branch below). Sharing
+    // it keeps both on identical merge / attribution / isUpdated semantics. Assigns the
+    // enclosing `lead` and `isUpdated`.
+    const mergeIntoExistingLead = async (existingLead: any): Promise<void> => {
       // Merge new data into existing lead (only overwrite with non-empty values)
       const normalize = (value: any): string => {
         if (value === null || value === undefined) return '';
@@ -839,7 +887,10 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       }
 
       if (changed || matchQualityBackfilled) {
-        await crmDb.updateLead(leadList.listId, existingLead.leadId, updates);
+        // ENG-2320: customFields goes to DynamoDB PER KEY (see toKeyMergeUpdate). `updates` keeps
+        // the full merged map because `lead` below (what the response cascade renders) is built
+        // from it.
+        await crmDb.updateLead(leadList.listId, existingLead.leadId, toKeyMergeUpdate(updates, existingCustomFields));
         // Only a user-visible change makes this an "update". See the ENG-926 §B note above:
         // isUpdated drives sequence enrolment, CRM sync and owner alerts, so a silent
         // metadata backfill deliberately does not set it.
@@ -847,6 +898,21 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       }
 
       lead = { ...existingLead, ...updates };
+    };
+
+    if (sessionIdentity) {
+      // ENG-2312. Exactly-once create + atomic merge for one (list, session): the shared
+      // implementation (also used by the tracker ingest) lives in sessionUpsertService.
+      ({ lead, isNew, isUpdated } = await upsertSessionLead({
+        listId: leadList.listId,
+        identity: sessionIdentity,
+        leadData,
+        customFields: mergedCustomFields,
+        callerSuppliedSource,
+        touch,
+      }));
+    } else if (existingLead) {
+      await mergeIntoExistingLead(existingLead);
     } else {
       // Create a new lead.
       // ENG-2082: with no email there is nothing to query on beforehand, so a phone-only
@@ -883,9 +949,14 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       try {
         lead = await crmDb.createLead(
           leadList.listId,
-          deterministicLeadId
-            ? { ...leadData, leadId: deterministicLeadId, failIfExists: true }
-            : leadData
+          {
+            ...(deterministicLeadId ? { ...leadData, leadId: deterministicLeadId, failIfExists: true } : leadData),
+            // Only added when true, so every non-session list passes byte-identical input.
+            ...(suppressSideEffects ? { suppressSideEffects: true } : {}),
+            // ENG-2321: an email lead on an ordinary list takes the exactly-once create (db.createLead).
+            ...(normalizedEmail && !isSessionList(leadList) ? { emailUniqueCreate: true } : {}),
+          },
+          'form_fill'
         );
         isNew = true;
       } catch (createErr: any) {
@@ -894,95 +965,117 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         // report it as a duplicate. isNew stays false, so none of the new-lead side effects
         // (sequence enrolment, auto-draft/auto-send, owner notify, CAPI) fire a second time
         // for one person — which is the whole reason the number is keyed deterministically.
-        if (!createErr?.leadAlreadyExists) throw createErr;
-        // Consistent read: the conditional write just told us this exact key exists, so an
-        // eventually-consistent miss here would be a lie, not an answer.
-        lead = await crmDb.getLeadById(leadList.listId, deterministicLeadId, { consistentRead: true });
-        if (!lead) {
-          // Still nothing — the winner's row was deleted between its write and this read, or
-          // the read failed in a way that returned empty. Do NOT throw: throwing reaches the
-          // handler's catch and returns 500 to the lander for a submission that was, from
-          // the visitor's point of view, accepted. Degrade to the id we know, the same way
-          // linkedInInviteCrmMirror does on this identical race.
-          console.warn(
-            `[webhooks] ENG-2082: adopted lead ${deterministicLeadId} not readable after a ` +
-              `losing conditional create in ${leadList.listId} — reporting the duplicate anyway.`
-          );
-          lead = { leadId: deterministicLeadId, listId: leadList.listId, ...leadData };
-        }
+        if (createErr?.duplicateEmail && createErr.existingLead) {
+          // The email twin of the case below: getLeadByEmail (eventually-consistent GSI) missed
+          // above, but createLead's own pre-check found a row a concurrent submission wrote in
+          // between. That is a REPEAT submission of an existing lead, not a failure — throwing
+          // here returned 500 plus an api.lead_failed owner alert and dropped the visitor's
+          // data. Adopt the carried row through the same merge an existing lead gets from the
+          // start. forwardedAt was minted for a create; an existing lead keeps its original, so
+          // drop it exactly as the existing-lead stamp above does.
+          mergedCustomFields = incomingCustomFields;
+          leadData.customFields = mergedCustomFields;
+          // The carried row came off the eventually-consistent email-index GSI, so it can be
+          // OLDER than what the race winner is still writing. The merge below writes per key
+          // (ENG-2320), so a stale snapshot no longer drops the winner's keys, but it still
+          // decides `changed` and the write-once backfills — so re-read by primary key,
+          // consistently (one GetItem, race path only); fall back to the carried row only if
+          // that read comes back empty.
+          const fresh = await crmDb.getLeadById(leadList.listId, createErr.existingLead.leadId, { consistentRead: true });
+          await mergeIntoExistingLead(fresh || createErr.existingLead);
+        } else if (!createErr?.leadAlreadyExists) {
+          throw createErr;
+        } else {
+          // Consistent read: the conditional write just told us this exact key exists, so an
+          // eventually-consistent miss here would be a lie, not an answer.
+          lead = await crmDb.getLeadById(leadList.listId, deterministicLeadId, { consistentRead: true });
+          if (!lead) {
+            // Still nothing — the winner's row was deleted between its write and this read, or
+            // the read failed in a way that returned empty. Do NOT throw: throwing reaches the
+            // handler's catch and returns 500 to the lander for a submission that was, from
+            // the visitor's point of view, accepted. Degrade to the id we know, the same way
+            // linkedInInviteCrmMirror does on this identical race.
+            console.warn(
+              `[webhooks] ENG-2082: adopted lead ${deterministicLeadId} not readable after a ` +
+                `losing conditional create in ${leadList.listId} — reporting the duplicate anyway.`
+            );
+            lead = { leadId: deterministicLeadId, listId: leadList.listId, ...leadData };
+          }
 
-        // ENG-2082 follow-up: this path is not only the concurrent race. A deterministic id
-        // plus failIfExists means EVERY repeat submission from the same number lands here,
-        // forever. Without a merge the second submission returns success and silently drops
-        // whatever it carried — the exact failure this file documents for flat custom fields
-        // ("a 201 and a visible lead row with the data gone"), reproduced for a multi-step
-        // phone-only lander whose step 2 posts the qualification answers.
-        //
-        // Mirrors the existingLead branch's rules deliberately rather than sharing them:
-        // that branch is the well-trodden email path and is not worth destabilising here.
-        const normalizeAdopted = (value: any): string =>
-          value === null || value === undefined ? '' : String(value).trim();
-        const adoptedUpdates: any = {};
-        let adoptedChanged = false;
+          // ENG-2082 follow-up: this path is not only the concurrent race. A deterministic id
+          // plus failIfExists means EVERY repeat submission from the same number lands here,
+          // forever. Without a merge the second submission returns success and silently drops
+          // whatever it carried — the exact failure this file documents for flat custom fields
+          // ("a 201 and a visible lead row with the data gone"), reproduced for a multi-step
+          // phone-only lander whose step 2 posts the qualification answers.
+          //
+          // Mirrors the existingLead branch's rules deliberately rather than sharing them:
+          // that branch is the well-trodden email path and is not worth destabilising here.
+          const normalizeAdopted = (value: any): string =>
+            value === null || value === undefined ? '' : String(value).trim();
+          const adoptedUpdates: any = {};
+          let adoptedChanged = false;
 
-        for (const field of ['firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'] as const) {
-          const newValue = normalizeAdopted(leadData[field]);
-          if (newValue && normalizeAdopted(lead[field]) !== newValue) {
-            adoptedUpdates[field] = newValue;
+          for (const field of ['firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'] as const) {
+            const newValue = normalizeAdopted(leadData[field]);
+            if (newValue && normalizeAdopted(lead[field]) !== newValue) {
+              adoptedUpdates[field] = newValue;
+              adoptedChanged = true;
+            }
+          }
+
+          const adoptedExistingCustom = lead.customFields || {};
+          const adoptedIncomingCustom = leadData.customFields || {};
+          const adoptedMergedCustom: Record<string, any> = { ...adoptedExistingCustom };
+          let customChanged = false;
+          // Stamped by this handler rather than sent by the visitor: `forwardedAt` is minted
+          // fresh on every submission because this branch builds leadData as if creating, and
+          // `source` defaults to 'api' when the caller sends none (see the destructure above).
+          // Neither is visitor data, and letting either mark a resubmission as a real update
+          // would drive CRM sync and owner alerts off a duplicate that carried nothing new.
+          // They are still merged through — they just do not, alone, constitute a change.
+          const SYSTEM_CUSTOM_KEYS = new Set(['forwardedAt', 'source']);
+          for (const [key, value] of Object.entries(adoptedIncomingCustom)) {
+            if (value === undefined || value === null || value === '') continue;
+            if (normalizeAdopted(adoptedExistingCustom[key]) !== normalizeAdopted(value)) {
+              adoptedMergedCustom[key] = value;
+              if (!SYSTEM_CUSTOM_KEYS.has(key)) customChanged = true;
+            }
+          }
+          if (customChanged) {
+            // Put the STORED system values back before writing. `forwardedAt` is minted fresh
+            // on this branch (existingLead is null, so line ~700 stamps a new one), and the
+            // merged object would otherwise carry it — overwriting the lead's real capture
+            // time whenever anything else changed. That contradicts the invariant stated at
+            // the stamp site ("for existing leads, preserve the original timestamp") and is
+            // customer-visible: forwardedAt is what the owner alert renders as the received
+            // time. The email branch avoids this by omitting the key entirely; this branch
+            // cannot, so it restores it.
+            // forwardedAt unconditionally: it is minted by THIS handler on every submission
+            // (existingLead is null on this branch), so the merged copy is never the
+            // visitor's data and the stored capture time must win. `source` is handled by
+            // provenance just below, exactly as the email branch now does — a caller-supplied
+            // source wins, a defaulted one never overwrites.
+            if ('forwardedAt' in adoptedExistingCustom) {
+              adoptedMergedCustom.forwardedAt = adoptedExistingCustom.forwardedAt;
+            }
+            // Restore `source` ONLY when this submission did not name one. A caller-supplied
+            // source is real data and must win (that is the multi-step case); a defaulted one
+            // must never overwrite what is already stored.
+            if (!callerSuppliedSource && 'source' in adoptedExistingCustom) {
+              adoptedMergedCustom.source = adoptedExistingCustom.source;
+            }
+            adoptedUpdates.customFields = adoptedMergedCustom;
             adoptedChanged = true;
           }
-        }
 
-        const adoptedExistingCustom = lead.customFields || {};
-        const adoptedIncomingCustom = leadData.customFields || {};
-        const adoptedMergedCustom: Record<string, any> = { ...adoptedExistingCustom };
-        let customChanged = false;
-        // Stamped by this handler rather than sent by the visitor: `forwardedAt` is minted
-        // fresh on every submission because this branch builds leadData as if creating, and
-        // `source` defaults to 'api' when the caller sends none (see the destructure above).
-        // Neither is visitor data, and letting either mark a resubmission as a real update
-        // would drive CRM sync and owner alerts off a duplicate that carried nothing new.
-        // They are still merged through — they just do not, alone, constitute a change.
-        const SYSTEM_CUSTOM_KEYS = new Set(['forwardedAt', 'source']);
-        for (const [key, value] of Object.entries(adoptedIncomingCustom)) {
-          if (value === undefined || value === null || value === '') continue;
-          if (normalizeAdopted(adoptedExistingCustom[key]) !== normalizeAdopted(value)) {
-            adoptedMergedCustom[key] = value;
-            if (!SYSTEM_CUSTOM_KEYS.has(key)) customChanged = true;
+          if (adoptedChanged) {
+            // ENG-2320: per key, like the email branch (only the keys this adopt adds or changes).
+            await crmDb.updateLead(leadList.listId, lead.leadId, toKeyMergeUpdate(adoptedUpdates, adoptedExistingCustom));
+            lead = { ...lead, ...adoptedUpdates };
+            // A real, user-visible change — same meaning the email branch gives isUpdated.
+            isUpdated = true;
           }
-        }
-        if (customChanged) {
-          // Put the STORED system values back before writing. `forwardedAt` is minted fresh
-          // on this branch (existingLead is null, so line ~700 stamps a new one), and the
-          // merged object would otherwise carry it — overwriting the lead's real capture
-          // time whenever anything else changed. That contradicts the invariant stated at
-          // the stamp site ("for existing leads, preserve the original timestamp") and is
-          // customer-visible: forwardedAt is what the owner alert renders as the received
-          // time. The email branch avoids this by omitting the key entirely; this branch
-          // cannot, so it restores it.
-          // forwardedAt unconditionally: it is minted by THIS handler on every submission
-          // (existingLead is null on this branch), so the merged copy is never the
-          // visitor's data and the stored capture time must win. `source` is handled by
-          // provenance just below, exactly as the email branch now does — a caller-supplied
-          // source wins, a defaulted one never overwrites.
-          if ('forwardedAt' in adoptedExistingCustom) {
-            adoptedMergedCustom.forwardedAt = adoptedExistingCustom.forwardedAt;
-          }
-          // Restore `source` ONLY when this submission did not name one. A caller-supplied
-          // source is real data and must win (that is the multi-step case); a defaulted one
-          // must never overwrite what is already stored.
-          if (!callerSuppliedSource && 'source' in adoptedExistingCustom) {
-            adoptedMergedCustom.source = adoptedExistingCustom.source;
-          }
-          adoptedUpdates.customFields = adoptedMergedCustom;
-          adoptedChanged = true;
-        }
-
-        if (adoptedChanged) {
-          await crmDb.updateLead(leadList.listId, lead.leadId, adoptedUpdates);
-          lead = { ...lead, ...adoptedUpdates };
-          // A real, user-visible change — same meaning the email branch gives isUpdated.
-          isUpdated = true;
         }
       }
     }
@@ -999,10 +1092,10 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // numbers at random, so collisions are routine by construction and every colliding
     // resubmission notified a real human about a fake lead. The gate's own comment claims
     // it skips "the whole cascade"; this is the part that escaped it.
-    if (!isNew && !isSmokeTestLead(lead) && !isSmokeTestLead(leadData)) {
+    if (!suppressSideEffects && !isNew && !isSmokeTestLead(lead) && !isSmokeTestLead(leadData)) {
       const submission = { submissionId: crypto.randomUUID(), submittedAt: new Date().toISOString() };
       void import('../services/orgLeadNotificationService')
-        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, submission))
+        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, 'form_fill', submission))
         .catch(() => console.warn('[leadNotifications] submission hook failed', { listId: leadList.listId, leadId: lead.leadId }));
     }
 
@@ -1041,7 +1134,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // synthetic lead — CAPI's correctness is already covered by unit tests (metaService.capi
     // .test.ts) and doesn't depend on v0-authored code, so there's nothing extra to verify
     // live here, only real-ad-account conversion data to needlessly pollute.
-    if (pixelId && metaAccountId && eventId && !isSmokeTestLead(leadData) && shouldAttemptCapiSend(leadList.listId) && !isCapiAccountPaused(metaAccountId)) {
+    if (!suppressSideEffects && pixelId && metaAccountId && eventId && !isSmokeTestLead(leadData) && shouldAttemptCapiSend(leadList.listId) && !isCapiAccountPaused(metaAccountId)) {
       void (async () => {
         try {
           const owner = await userDb.getUserById(leadList.userId);
@@ -1085,7 +1178,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // only on `isNew`: popup partials / AI Eval pretriggers can create the lead
     // before the final roadmap submit arrives with a valid stage.
     const roadmapCustomFields = lead.customFields || mergedCustomFields || {};
-    if (!roadmapCustomFields.roadmapEmailSentAt) {
+    if (!suppressSideEffects && !roadmapCustomFields.roadmapEmailSentAt) {
       void (async () => {
         const sent = await sendRoadmapDeliveryEmail({
           to: lead.email,
@@ -1097,12 +1190,16 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         if (!sent) return;
 
         try {
+          // ENG-2320: write ONLY the two keys this marker owns, per key. It runs seconds after
+          // the merge, from an in-memory snapshot; spreading that snapshot back as the whole map
+          // overwrote every key a concurrent submission stored in the meantime (it could undo
+          // the merge's own per-key writes).
           await crmDb.updateLead(leadList.listId, lead.leadId, {
             customFields: {
-              ...roadmapCustomFields,
               roadmapEmailSentAt: new Date().toISOString(),
               roadmapEmailStage: Number(roadmapCustomFields.stage),
             },
+            customFieldsKeyMerge: true,
           });
         } catch (markError) {
           console.error('[roadmapDelivery] sent but failed to mark lead:', markError);
@@ -1127,7 +1224,11 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // lead; the lead row itself is still created/returned normally above so the smoke
       // test's CRM-landing check still works.
       console.log(`[webhooks] Synthetic smoke-test lead (${lead.email || lead.phone || lead.leadId}) — skipping CRM sync/sequence enrollment/auto-draft/auto-send/owner-notify side effects`);
-    } else if (isNew || isUpdated) {
+    } else if ((isNew || isUpdated) && !suppressSideEffects) {
+      // ENG-2311: a session list is skipped here (HubSpot/Attio sync, sequence enrolment,
+      // auto-draft/auto-send, owner alert) — see utils/sessionList.ts. The lead row itself
+      // is still created/updated and the response is unchanged.
+      //
       // Real-time push to any connected external CRM (HubSpot / Attio). The
       // authenticated UI create/update routes do this inline; inbound capture
       // (landing pages, lead-forward webhooks) did not, so form leads only ever
@@ -1811,9 +1912,19 @@ export async function processHubspotWebhookJob(payload: HubspotJobPayload): Prom
             if (!data.isCreation) continue;
             const newLead: any = { email: email.toLowerCase(), ...fields, syncMetadata: { hubspot_contact_id: objectId } };
             if (Object.keys(customFieldUpdates).length > 0) newLead.customFields = customFieldUpdates;
-            await crmDb.createLead(list.listId, newLead);
-            console.log(`[HubSpot Webhook] Created lead for ${email} in list ${list.listId}`);
-            continue;
+            try {
+              await crmDb.createLead(list.listId, newLead, 'integration');
+              console.log(`[HubSpot Webhook] Created lead for ${email} in list ${list.listId}`);
+              continue;
+            } catch (createErr: any) {
+              // The lookups above said "absent" but createLead's own email pre-check found the
+              // row (a concurrent create won). Throwing would abandon every remaining list and
+              // contact in this job; adopt the row and apply the event as an update below.
+              if (!createErr?.duplicateEmail || !createErr.existingLead) throw createErr;
+              lead = createErr.existingLead as Record<string, any>;
+              if (lead.email) delete fields.email;
+              console.log(`[HubSpot Webhook] Lead for ${email} already existed in list ${list.listId} (lost create race) — updating ${lead.leadId}`);
+            }
           }
 
           const updates: any = { ...fields };

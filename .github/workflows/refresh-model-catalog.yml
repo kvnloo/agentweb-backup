@@ -29,6 +29,7 @@ jobs:
         env:
           ARTIFICIAL_ANALYSIS_API_KEY: ${{ secrets.ARTIFICIAL_ANALYSIS_API_KEY }}
           SLACK_MODEL_ALERTS_WEBHOOK: ${{ secrets.SLACK_MODEL_ALERTS_WEBHOOK }}
+          PR_BODY_PATH: /tmp/model-catalog-pr-body.md
         run: npx ts-node --transpile-only src/scripts/frontierMonitor.ts --write --notify > /tmp/model-catalog-plan.json
       - name: Refresh capability evidence for added models
         working-directory: backend
@@ -36,9 +37,29 @@ jobs:
           if node -e 'process.exit(require("/tmp/model-catalog-plan.json").additions.length ? 0 : 1)'; then
             npm run refresh:openrouter-params
           fi
+      # Registry-vs-endpoint capability test: catches a supports* flag some provider lacks
+      # (require_parameters then returns "no endpoints found"). Non-blocking on purpose: a
+      # failing test must not stop the PR from opening (ENG-2293); its result feeds the
+      # PR's auto-merge verdict instead.
+      - name: Capability guard (result feeds the verdict)
+        working-directory: backend
+        continue-on-error: true
+        run: npx jest --runInBand --runTestsByPath src/services/agentMode/__tests__/openRouterRequestParams.registryGuard.test.ts --json --outputFile=/tmp/guard-result.json
+      # Live check that each NEW model actually routes with the backend's request shape
+      # (tools + tool_choice + require_parameters). Needs a repo secret; without it the PR
+      # says "smoke test skipped" and is NOT eligible for auto-merge. Must never fail the job.
+      - name: Live smoke test of new models
+        working-directory: backend
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_SMOKE_API_KEY }}
+          PR_BODY_PATH: /tmp/model-catalog-pr-body.md
+          GUARD_RESULT_PATH: /tmp/guard-result.json
+        run: npx ts-node --transpile-only src/scripts/smokeTestAdditions.ts /tmp/model-catalog-plan.json
       - name: Verify critical catalog and price-book invariants
         working-directory: backend
-        run: npx jest --runInBand --runTestsByPath src/services/agentMode/__tests__/modelCatalogRefresh.test.ts src/services/agentMode/__tests__/frontierMonitor.test.ts src/__tests__/llmPricing.test.ts
+        run: npx jest --runInBand --runTestsByPath src/services/agentMode/__tests__/modelCatalogRefresh.test.ts src/services/agentMode/__tests__/frontierMonitor.test.ts src/services/agentMode/__tests__/catalogReview.test.ts src/__tests__/llmPricing.test.ts
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -47,6 +68,7 @@ jobs:
             /tmp/model-catalog-plan.json
             docs/openrouter-byok-coverage.md
       - uses: peter-evans/create-pull-request@v8
+        id: open_pr
         with:
           branch: automation/model-catalog-refresh
           base: main
@@ -55,20 +77,41 @@ jobs:
           draft: true
           title: 'Refresh frontier models and OpenRouter BYOK coverage'
           commit-message: 'chore: refresh model catalog from OpenRouter and Artificial Analysis'
-          body: |
-            Daily frontier detection using OpenRouter release dates and the Artificial Analysis top 10.
-            Auto-add validated text/tool models in tracked families or top-N models from tracked providers.
-            Include advertised cloud BYOK endpoint coverage; credentials and quota are not verified.
-            Missing AA credentials preserve existing scores. Inspect the model-catalog-plan artifact for unmatched scores, proposed prices, and supersession.
-
-            New entries are marked auto-added. Review capabilities and customer-facing descriptions before marking ready. Existing Azure BYOK pricing is preserved.
-            No database writes or changes to saved model selections. Rollback: revert this PR.
-            Complexity: extends the existing registry and price book; no new runtime service or storage.
+          body-path: /tmp/model-catalog-pr-body.md
           add-paths: |
             backend/src/services/agentMode/llmModelRegistry.ts
             backend/src/utils/llmPricing.ts
             backend/src/__tests__/llmPricing.test.ts
             backend/src/services/agentMode/__tests__/fixtures/openRouterSupportedParameters.json
             docs/openrouter-byok-coverage.md
+      # ENG-2293 follow-up: the job previously only alerted on detected frontier lag,
+      # never on its own outcome — a human had no way to learn a PR landed (or that
+      # the job died) short of checking GitHub Actions by hand.
+      - name: Notify Slack the draft PR was opened or updated
+        if: steps.open_pr.outputs.pull-request-operation == 'created' || steps.open_pr.outputs.pull-request-operation == 'updated'
+        env:
+          SLACK_MODEL_ALERTS_WEBHOOK: ${{ secrets.SLACK_MODEL_ALERTS_WEBHOOK }}
+        run: |
+          if [ -z "$SLACK_MODEL_ALERTS_WEBHOOK" ]; then exit 0; fi
+          OP="${{ steps.open_pr.outputs.pull-request-operation }}"
+          VERB="opened"; [ "$OP" = "updated" ] && VERB="updated"
+          curl -sf -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"Model catalog refresh PR ${VERB}: ${{ steps.open_pr.outputs.pull-request-url }}\"}" \
+            "$SLACK_MODEL_ALERTS_WEBHOOK" || echo "::warning::Slack notification failed — check SLACK_MODEL_ALERTS_WEBHOOK (rotated/revoked?)"
       - name: Surface incomplete upstream observations
         run: node -e 'if (require("/tmp/model-catalog-plan.json").degraded) { console.error("Upstream observation incomplete; inspect monitor report"); process.exit(1); }'
+      - name: Notify Slack on any job failure
+        # cancelled(), not just failure(): this job's concurrency group is
+        # cancel-in-progress: false, so unlike deploy.yml there's no routine
+        # queue-induced cancellation to stay silent for — the only way this
+        # job gets cancelled is a human doing it on purpose (rare, harmless to
+        # notify about) or the 15-minute timeout firing, which is exactly the
+        # "it hung and died" case this step exists to catch.
+        if: failure() || cancelled()
+        env:
+          SLACK_MODEL_ALERTS_WEBHOOK: ${{ secrets.SLACK_MODEL_ALERTS_WEBHOOK }}
+        run: |
+          if [ -z "$SLACK_MODEL_ALERTS_WEBHOOK" ]; then exit 0; fi
+          curl -sf -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"Model catalog refresh job FAILED: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$SLACK_MODEL_ALERTS_WEBHOOK" || echo "::warning::Slack notification failed — check SLACK_MODEL_ALERTS_WEBHOOK (rotated/revoked?)"

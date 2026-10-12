@@ -240,6 +240,98 @@ function logRecorderFailure(error: unknown): void {
   }
 }
 
+// ── Billing-owner resolution (ENG-2286) ──────────────────────────────────────────
+//
+// A spend record's `billingUserId` is the account whose cap it counts against. The
+// enforcement gate resolves it through `resolveBillingUserId` — an org member's
+// usage pools onto the org's billing root — so a record that names the MEMBER is
+// invisible to the gate, which never looks at that id.
+//
+// Callers were expected to supply `billingUserId`, and many vendor call sites do
+// not (Apollo, enrich.so, Enigma, voiceover, Remotion, You.com, Google CSE,
+// reCAPTCHA pass only `userId`). The old fallback — `ctx.billingUserId || userId` —
+// then billed the member: 7 org members, $301.64 (97% vendor) outside any owner's
+// pool as of 2026-10-05. The recorder is the one place every record passes
+// through, so the owner is resolved here once instead of at ~15 call sites.
+//
+// It is resolved ONCE per call, at the public entry points, and written back into
+// the context. Everything downstream — the aggregate row, the spend event, the
+// legacy fallback, the dropped-write alert — then reads the same id. Resolving
+// separately at each of those sites could split one call across two owners.
+//
+// FORWARD-ONLY. Spend events are immutable and already-written records keep the id
+// they were written with; this changes new records, not history.
+const BILLING_OWNER_CACHE_TTL_MS = 60_000;
+const BILLING_OWNER_CACHE_MAX = 2_000;
+const billingOwnerCache = new Map<string, { id: string; expiresAt: number }>();
+
+type BillingOwnerResolver = (userId: string) => Promise<string>;
+let billingOwnerResolverOverride: BillingOwnerResolver | null = null;
+
+/** Test seam: install a resolver (or null to clear it) and drop cached results. */
+export function __setBillingOwnerResolverForTests(resolver: BillingOwnerResolver | null): void {
+  billingOwnerResolverOverride = resolver;
+  billingOwnerCache.clear();
+}
+
+/**
+ * Kill switch, default ON. Set SPEND_RECORDER_RESOLVE_ORG_OWNER=false to return to
+ * billing the acting user, without a deploy.
+ */
+export const SPEND_RECORDER_RESOLVE_ORG_OWNER_ENV = "SPEND_RECORDER_RESOLVE_ORG_OWNER";
+
+let lastBillingResolveErrorLogAt = 0;
+
+/**
+ * The billing subject for a record: the caller's explicit `billingUserId` when
+ * given, otherwise the acting user's org billing root (their own id when they are
+ * not an org member, or inherit nothing from the org).
+ *
+ * Never throws. If the owner cannot be resolved it falls back to the acting user,
+ * which is exactly the pre-ENG-2286 behaviour — a record is never lost over this.
+ */
+async function resolveRecordBillingUserId(supplied: string | undefined, userId: string): Promise<string> {
+  // A SUPPLIED id is resolved too, not trusted as the payer. Callers name the owner of a connected
+  // resource (e.g. the X account's owner), which for an org member is the member, not the org's
+  // billing root: honouring it verbatim kept that spend outside the owner's cap. Resolving is
+  // idempotent for an id that is already a billing root (an owner, a solo user, a member holding their
+  // own subscription), so callers that pass a resolved payer are unaffected.
+  const subject = supplied || userId;
+  if (process.env[SPEND_RECORDER_RESOLVE_ORG_OWNER_ENV] === "false") return subject;
+  // No AW-Users row to pool from, so there is nothing to resolve.
+  if (!subject || subject === "system" || subject.startsWith("anon_")) return subject;
+  // Unit tests that run the recorder over an unmocked data layer must never reach
+  // a live DynamoDB (same precedent as llmUsagePolicyResolverService). They keep
+  // the old behaviour unless a test installs a resolver explicitly.
+  if (!billingOwnerResolverOverride && process.env.NODE_ENV === "test") return subject;
+
+  const now = Date.now();
+  const hit = billingOwnerCache.get(subject);
+  if (hit && hit.expiresAt > now) return hit.id;
+
+  try {
+    const resolve: BillingOwnerResolver =
+      billingOwnerResolverOverride ??
+      // Lazy-required, not imported: see the note on tokenUsageService above.
+      (require("./tokenUsageService") as typeof import("./tokenUsageService")).resolveBillingUserId;
+    const id = await resolve(subject);
+    if (billingOwnerCache.size >= BILLING_OWNER_CACHE_MAX) billingOwnerCache.clear();
+    billingOwnerCache.set(subject, { id, expiresAt: now + BILLING_OWNER_CACHE_TTL_MS });
+    return id;
+  } catch (error) {
+    // Not cached: the next call retries. Logged (throttled) because silently
+    // reverting to the member re-opens the very gap this closes.
+    if (now - lastBillingResolveErrorLogAt >= ERROR_LOG_INTERVAL_MS) {
+      lastBillingResolveErrorLogAt = now;
+      console.error(
+        "[usageRecorder] Could not resolve the org billing owner; billing the acting user (further failures suppressed for 60s):",
+        error instanceof Error ? error.message : error,
+      );
+    }
+    return subject;
+  }
+}
+
 /**
  * Compute cost in INTEGER microdollars for a call.
  * USD-per-1M-token prices mean: microUsd = tokens * pricePerM (since 1e6/1e6 cancels).
@@ -303,7 +395,8 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
     }
 
     const userId = ctx.userId || "system";
-    const billingUserId = ctx.billingUserId || userId;
+    // ENG-2286: resolved ONCE, then used for both the aggregate and the spend event.
+    const billingUserId = await resolveRecordBillingUserId(ctx.billingUserId, userId);
     // One clock read for both rails (ENG-1934): the aggregate's date and the
     // spend event's instant must never straddle UTC midnight.
     const occurredAt = ctx.occurredAt || new Date().toISOString();
@@ -590,6 +683,14 @@ export async function recordVendorUsage(ctx: RecordVendorUsageContext): Promise<
     logRecorderFailure(error);
     return;
   }
+
+  // ENG-2286: resolve the billing owner ONCE and write it back, so the atomic path,
+  // its legacy fallback, and the dropped-write alert below all agree on one id.
+  // Never throws (falls back to the acting user), so this cannot lose a record.
+  resolved = {
+    ...resolved,
+    billingUserId: await resolveRecordBillingUserId(resolved.billingUserId, resolved.userId || "system"),
+  };
 
   // ENG-702 AC1 / ENG-1250 §6. EVERY vendor call takes the atomic path now, not
   // only the ones whose call site supplies a token.

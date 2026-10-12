@@ -308,14 +308,17 @@ describe('AgentModeService - predefined work plan templates', () => {
       expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(sessionId, {});
     });
 
-    it('does not change the model when the plan default is unsupported', async () => {
+    it('ENG-903: refuses the launch (nothing applied) when the plan default is unsupported', async () => {
       const planWithBadModel = { ...systemTemplate, defaultModel: 'not-a-real-model' };
       mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
         v === 'system' ? [planWithBadModel] : []
       );
 
-      await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
+      const result = await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
 
+      expect(result.success).toBe(false);
+      expect(result.errorType).toBe('model_unavailable');
+      expect(chatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
       expect(chatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
     });
 
@@ -325,6 +328,32 @@ describe('AgentModeService - predefined work plan templates', () => {
       expect(result.success).toBe(false);
       expect(result.message).toContain('not found');
       expect(chatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
+    });
+
+    // ENG-1993: not-found must be recoverable (suggestions + list tool pointer)
+    // and must never auto-launch a guessed template.
+    it('returns planId suggestions for a near-miss name without launching anything', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [systemTemplate] : []
+      );
+      const result = await service.applyPredefinedWorkPlan('Onboarding for new client', sessionId, 'user-1');
+
+      expect(result.success).toBe(false);
+      expect(result.errorType).toBe('not_found');
+      expect(result.suggestions).toEqual([{ planId: 'plan-onboard', title: 'Client Onboarding' }]);
+      expect(result.message).toContain('plan-onboard');
+      expect(result.message).toContain('Do not retry with the same name');
+      expect(chatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
+    });
+
+    it('points at list_predefined_work_plans when nothing is similar', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [systemTemplate] : []
+      );
+      const result = await service.applyPredefinedWorkPlan('Zzz Qqq', sessionId, 'user-1');
+
+      expect(result.suggestions).toEqual([]);
+      expect(result.message).toContain('list_predefined_work_plans');
     });
 
     it('refuses to overwrite an active work plan without force', async () => {

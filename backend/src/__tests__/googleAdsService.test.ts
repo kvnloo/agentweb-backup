@@ -1,5 +1,6 @@
 const mockAxiosPost = jest.fn();
 const mockAxiosGet = jest.fn();
+import { echoCampaignReadBack } from './helpers/googleAdsCampaignReadBack';
 jest.mock('axios', () => ({
   post: (...args: any[]) => mockAxiosPost(...args),
   get: (...args: any[]) => mockAxiosGet(...args),
@@ -68,6 +69,7 @@ let service: GoogleAdsService;
 beforeEach(() => {
   jest.clearAllMocks();
   mockAssertPublicHostname.mockResolvedValue(undefined);
+  echoCampaignReadBack(mockAxiosPost);
   service = new GoogleAdsService();
 });
 describe('API version', () => {
@@ -705,6 +707,44 @@ describe('addProximityCriterion / removeCampaignCriterion (ENG-487)', () => {
     expect(body.operations[0].create.proximity.address).toEqual({ postalCode: '99201' });
   });
 
+  it('creates a PROXIMITY criterion centered on lat/long in micro-degrees (ENG-486)', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/campaignCriteria/1~3' }] } });
+    await service.addProximityCriterion('user-123', '1234567890', 'customers/123/campaigns/2', {
+      radius: 25, radiusUnits: 'KILOMETERS', address: {},
+      geoPoint: { latitude: 47.4668, longitude: -122.2668 },
+    });
+    const create = mockAxiosPost.mock.calls[0][1].operations[0].create;
+    expect(create.proximity).toEqual({
+      radius: 25, radiusUnits: 'KILOMETERS',
+      geoPoint: { latitudeInMicroDegrees: 47466800, longitudeInMicroDegrees: -122266800 },
+    });
+  });
+
+  it('rejects out-of-range coordinates before any API call (ENG-486)', async () => {
+    await expect(service.addProximityCriterion('user-123', '1234567890', 'customers/123/campaigns/2', {
+      radius: 25, address: {}, geoPoint: { latitude: 120, longitude: 0 },
+    })).rejects.toThrow('latitude');
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, null, NaN, Infinity, 0, -1])('rejects invalid radius %s before credential lookup (ENG-486)', async (radius) => {
+    const credentials = jest.spyOn(service as any, 'getAccountCredentials');
+    await expect(service.addProximityCriterion('user-123', '1234567890', 'customers/123/campaigns/2', {
+      radius: radius as number, address: { postalCode: '99201' },
+    })).rejects.toThrow('radius must be a positive finite number');
+    expect(credentials).not.toHaveBeenCalled();
+    credentials.mockRestore();
+  });
+
+  it('rejects a missing center before credential lookup (ENG-486)', async () => {
+    const credentials = jest.spyOn(service as any, 'getAccountCredentials');
+    await expect(service.addProximityCriterion('user-123', '1234567890', 'customers/123/campaigns/2', {
+      radius: 25, address: {},
+    })).rejects.toThrow('at least one address field');
+    expect(credentials).not.toHaveBeenCalled();
+    credentials.mockRestore();
+  });
+
   it('rejects an address with no fields set', async () => {
     await expect(service.addProximityCriterion('user-123', '1234567890', 'customers/123/campaigns/2', {
       radius: 25,
@@ -731,7 +771,8 @@ describe('addProximityCriterion / removeCampaignCriterion (ENG-487)', () => {
       .mockResolvedValueOnce({ data: { results: [{ campaignCriterion: { type: 'PROXIMITY' } }] } })
       .mockResolvedValueOnce({ data: { results: [{}] } });
     await service.removeCampaignCriterion('user-123', '1234567890', 'customers/123/campaignCriteria/2~1', ['PROXIMITY']);
-    expect(mockAxiosPost).toHaveBeenCalledTimes(2);
+    // type check, remove, then ENG-2398 remove read-back
+    expect(mockAxiosPost).toHaveBeenCalledTimes(3);
     const removeBody = mockAxiosPost.mock.calls[1][1];
     expect(removeBody.operations[0].remove).toBe('customers/123/campaignCriteria/2~1');
   });
@@ -1801,5 +1842,61 @@ describe('every Google Ads call is bounded by a timeout (CodeRabbit, #2519)', ()
     const calls = src.match(/await axios\.(get|post)\(/g) || [];
     const bounded = src.match(/timeout: (GOOGLE_ADS_HTTP_TIMEOUT_MS|15000)/g) || [];
     expect(bounded.length).toBeGreaterThanOrEqual(calls.length);
+  });
+});
+
+describe('setDeviceBidAdjustments (ENG-2036)', () => {
+  it('updates the campaign device criteria bid_modifier in one atomic mutation', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}, {}] } });
+    await service.setDeviceBidAdjustments('user-123', {
+      scope: 'CAMPAIGN',
+      customerId: '1234567890',
+      campaignId: '555',
+      adjustments: [
+        { device: 'MOBILE', bidModifier: 0 },
+        { device: 'TABLET', bidModifier: 0 },
+      ],
+    });
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+    const [url, body] = mockAxiosPost.mock.calls[0];
+    expect(url).toMatch(/campaignCriteria:mutate$/);
+    expect(body.operations).toEqual([
+      { update: { resourceName: 'customers/1234567890/campaignCriteria/555~30001', bidModifier: 0 }, updateMask: 'bid_modifier' },
+      { update: { resourceName: 'customers/1234567890/campaignCriteria/555~30002', bidModifier: 0 }, updateMask: 'bid_modifier' },
+    ]);
+  });
+
+  it('creates ad-group device bid modifiers', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.setDeviceBidAdjustments('user-123', {
+      scope: 'AD_GROUP',
+      customerId: '1234567890',
+      adGroupResourceName: 'customers/1234567890/adGroups/77',
+      adjustments: [{ device: 'DESKTOP', bidModifier: 1.25 }],
+    });
+    const [url, body] = mockAxiosPost.mock.calls[1];
+    expect(url).toMatch(/adGroupBidModifiers:mutate$/);
+    expect(body.operations).toEqual([
+      { create: { adGroup: 'customers/1234567890/adGroups/77', bidModifier: 1.25, device: { type: 'DESKTOP' } } },
+    ]);
+  });
+
+  it('updates ad-group device modifiers that already exist and creates the rest', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [
+      { adGroupBidModifier: { resourceName: 'customers/1234567890/adGroupBidModifiers/77~30001', device: { type: 'MOBILE' } } },
+    ] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}, {}] } });
+    await service.setDeviceBidAdjustments('user-123', {
+      scope: 'AD_GROUP',
+      customerId: '1234567890',
+      adGroupResourceName: 'customers/1234567890/adGroups/77',
+      adjustments: [{ device: 'MOBILE', bidModifier: 0.5 }, { device: 'TABLET', bidModifier: 1.1 }],
+    });
+    expect(mockAxiosPost.mock.calls[0][1].query).toContain("ad_group_bid_modifier.ad_group = 'customers/1234567890/adGroups/77'");
+    expect(mockAxiosPost.mock.calls[1][1].operations).toEqual([
+      { update: { resourceName: 'customers/1234567890/adGroupBidModifiers/77~30001', bidModifier: 0.5 }, updateMask: 'bid_modifier' },
+      { create: { adGroup: 'customers/1234567890/adGroups/77', bidModifier: 1.1, device: { type: 'TABLET' } } },
+    ]);
   });
 });

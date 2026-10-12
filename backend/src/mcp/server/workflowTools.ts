@@ -265,7 +265,11 @@ mcpToolRegistry.register({
   },
   /** Reports the caller's own account status, or (admin-only) `args.client_id`'s. */
   execute: async (args: any, context: any) => {
-    const me: any = await mcpFetch({ method: 'GET', path: '/api/auth/me', context: await resolveClientScopedContext(context, args?.client_id, 'emma_get_account_status') });
+    const scoped = await resolveClientScopedContext(context, args?.client_id, 'emma_get_account_status');
+    const me: any = await mcpFetch({ method: 'GET', path: '/api/auth/me', context: scoped });
+    // Usage comes from the same customer-safe view the product shows (ENG-1250 AC7), not the raw
+    // user record's legacy counter. It is secondary: if it fails, report the account without it.
+    const usage: any = await mcpFetch({ method: 'GET', path: '/api/subscription/usage', context: scoped }).catch(() => null);
     return jsonResult({
       email: me?.email,
       plan: me?.subscriptionType ?? me?.plan ?? null,
@@ -274,7 +278,7 @@ mcpToolRegistry.register({
       // would otherwise report is_onboarded:false despite being fully
       // onboarded under the rules that applied when they signed up.
       is_onboarded: me?.hasBrandGuidelines ?? null,
-      usage: me?.tokenUsage ?? null,
+      usage: usage ?? null,
     });
   },
 });
