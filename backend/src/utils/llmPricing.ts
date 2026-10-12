@@ -28,7 +28,7 @@ import { GEMINI_OMNI_VIDEO_MODEL, omniClipDurations } from '../services/videoMod
  * pins a fingerprint of the tables to this version, so a price change that
  * forgets the bump fails the build instead of silently sharing a version.
  */
-export const LLM_PRICE_BOOK_VERSION = "2026-10-08";
+export const LLM_PRICE_BOOK_VERSION = "2026-10-12";
 
 /** The rate provenance a spend event carries when this book priced it. */
 export const LLM_PRICE_BOOK_PROVENANCE = `llm-price-book:${LLM_PRICE_BOOK_VERSION}`;
@@ -309,6 +309,10 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'openrouter/x-ai/grok-4.6': withDerivedCache(2.0, 6.0), // was $3/$15 — stale, ~2x over live
   'openrouter/deepseek/deepseek-v4-pro': withDerivedCache(0.657, 1.315), // live "62% off" promo; lowest-confidence entry in this batch — the promo makes list price hard to reconstruct cleanly, re-verify if this model becomes cost-sensitive
   'openrouter/deepseek/deepseek-v4-flash': withDerivedCache(0.068, 0.168), // was ~2x over live
+  'openrouter/qwen/qwen3.8-max-0902': withDerivedCache(2.0, 6.0),
+  // DEPRECATED ALIAS, not a registry model: the pre-rename id (LEGACY_MODEL_ALIASES maps it to
+  // -0902). Kept, same $2/$6, so late/in-flight/engine-posted usage rows still stamped with the
+  // old id meter at the real rate instead of $0. Safe to drop once no usage rows carry it.
   'openrouter/qwen/qwen3.8-max': withDerivedCache(2.0, 6.0),
   // 2026-08-26: NOT the $0.35/$2.75 headline listing price — OpenRouter
   // aggregates 10 upstream providers for this model ($0.35-$0.48 in,
