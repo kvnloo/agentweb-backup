@@ -1,3 +1,8 @@
+## ENG-2403: domain-attach writes require project ownership (2026-10-12)
+
+- `POST /api/domains/custom` and `/subdomain` now 403 (before any Vercel call) unless the caller owns, or has org edit rights (`canUserEditLandingPage`) to, a landing page whose `vercelProjectId` matches the body. Lookup errors fail closed.
+- Test: `backend/src/__tests__/routes.domains.test.ts` (ENG-2403 block).
+
 ## ENG-2400: modify_work_plan preserves work-plan data on partial/failed modifies (2026-10-11)
 
 - Omitting `description` on an existing step no longer wipes the stored description (same contract as userInstructions/skillIds).
