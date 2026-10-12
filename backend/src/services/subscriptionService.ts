@@ -64,20 +64,22 @@ export const SUBSCRIPTION_FEATURES = {
 } as const;
 
 /**
- * ENG-1978 — observation only, no behaviour change.
+ * ENG-1978 — fail-closed.
  *
- * Several paths through this file resolve to `["*"]`, which grants every registered tool: an
- * unknown tier name, a malformed `subscription_types` row, an empty allowedSkills list, and any
- * thrown error. Only the explicit `["*"]` in a tier config is deliberate.
+ * Several paths through this file used to resolve to `["*"]`, which grants every registered
+ * tool: an unknown tier name, a malformed `subscription_types` row, an empty allowedSkills list,
+ * and any thrown error. Only the explicit `["*"]` in a well-formed tier config is deliberate —
+ * every other path now returns `null` (unresolved) instead, and callers fail closed on it.
  *
- * Whether those paths ever actually fire in production is unknown, because nothing has ever
- * recorded them — the error cases log a bare `console.error` with no user and no marker, and the
- * non-error cases log nothing at all. "We have never had a problem" is therefore not evidence:
- * a silent over-grant looks exactly like normal operation from the outside.
- *
- * This records them so the question can be answered with data before anyone changes the
- * behaviour. Deliberately NOT a fix — see the PR for the fail-closed change this is meant to
- * de-risk, and why shipping that blind was judged too risky.
+ * This shipped in two stages. PR #2947 (observation only, merged 2026-09-16) added this same
+ * instrumentation with zero behaviour change, specifically to answer whether these paths fire in
+ * production before anyone changed what they return — "we have never had a problem" was not
+ * evidence, since a silent over-grant looks identical to normal operation from the outside. 14
+ * days of production logs (through 2026-10-12) showed `wildcard-grant` firing only from one
+ * internal verification account, never from real customer traffic, and `unconfirmed-tier` firing
+ * once for a real user — the "effectively never fires" case the parked fail-closed branch's own
+ * decision record called the free-win trigger. This change is that cherry-pick, re-ported onto
+ * current main (the original branch was ~2970 commits stale).
  *
  * Sink is injectable so this can be routed at a real alerting surface without this module
  * reaching for one (same shape as usageWriteFailureMonitor's `setDroppedWriteAlertSink`). There
@@ -86,16 +88,19 @@ export const SUBSCRIPTION_FEATURES = {
 /**
  * Two DISTINCT kinds, deliberately not summable:
  *
- *  - `wildcard-grant`   every registered tool was just granted because something failed.
- *                       This is the number that answers "how risky is the current fail-open?"
+ *  - `wildcard-grant`   a case that used to silently grant every registered tool now instead
+ *                       fails CLOSED (ENG-1978) — this is the number that answers "how often
+ *                       does the fail-closed gate actually fire, now that it's live?"
  *  - `unconfirmed-tier` the tier could not be CONFIRMED for this user, but the grant that
- *                       followed may have been perfectly normal and restricted.
+ *                       followed may have been perfectly normal and restricted — this path's
+ *                       behaviour is deliberately unchanged, see getAllowedSkills.
  *
  * Keeping them apart matters more than it looks. `unconfirmed-tier` is expected to be the
  * highest-volume reason, and it frequently accompanies a *restricted* result — an unreadable
  * user row still resolves to a real Free tier with a real skill list. Counting those as
- * over-grants would oversize the risk and argue for the fail-closed change on false evidence,
- * which is the opposite of what this instrumentation is for.
+ * over-grants would oversize the risk and argue against the fail-closed change on false
+ * evidence, which is the opposite of what this instrumentation is for. Pre-flip (PR #2947),
+ * `wildcard-grant` measured over-grant risk; post-flip it measures how often the gate denies.
  */
 // Round-2 review: grep both markers, not just WILDCARD-GRANT, and break down by `kind` — do not
 // sum them. `[entitlement]` is the shared prefix precisely so one grep catches both.
@@ -113,9 +118,13 @@ export type WildcardGrantSink = (event: EntitlementObservationEvent) => void;
 const DEFAULT_ENTITLEMENT_SINK: WildcardGrantSink = (event) => {
   // Both markers share the `[entitlement]` prefix on purpose — `grep '\[entitlement\]'` catches
   // both kinds; then break down by the `kind` field in each JSON line rather than summing them.
+  // ENG-1978 fail-closed: WILDCARD-GRANT no longer grants anything — the marker name (and the
+  // `reason` strings at each call site) is kept stable for grep/dashboard continuity with the
+  // PR #2947 telemetry this instrumentation shipped as; only the message text changed to stop
+  // describing a grant that no longer happens.
   const marker =
     event.kind === "wildcard-grant"
-      ? "[entitlement] WILDCARD-GRANT granting all tools without a confirmed entitlement:"
+      ? "[entitlement] WILDCARD-GRANT failing closed, denying tools for an unconfirmed entitlement:"
       : "[entitlement] UNCONFIRMED-TIER entitlement resolved from an unconfirmed tier:";
   console.warn(marker, JSON.stringify(event));
 };
@@ -495,8 +504,14 @@ export async function getSubscriptionTypeConfig(
  * in that user's subscription tier's `allowedSkills` — so a skill published without
  * being added to any tier's allow-list is entitled to nobody. This reads the same
  * `subscription_types` setting the runtime filter uses and reports which tiers (if any)
- * allow the skill. Fails OPEN (reachable=true) when no tier config exists, mirroring
- * getAllowedSkills' default-allow behavior so absent config never raises a false alarm.
+ * allow the skill. Fails OPEN (reachable=true) when no tier config exists, so absent config never
+ * raises a false alarm.
+ *
+ * Deliberately the opposite polarity from `getAllowedSkills`, which fails CLOSED (ENG-1978). Both
+ * are correct: there, failing open would GRANT access; here, it only weakens a warning shown to an
+ * admin about to publish. This comment previously described the two as mirroring each other — they
+ * no longer do, and should not be "made consistent" without re-reading which direction each one's
+ * failure actually points.
  */
 export async function findTiersAllowingSkill(
   skillId: string
@@ -575,25 +590,27 @@ export async function getAllAvailableSkills(): Promise<string[]> {
  * Anonymous users (anon_*) use the public allowed skills config.
  * Returns the actual list of skill IDs or ["*"] for all.
  */
-export async function getAllowedSkills(userId: string): Promise<string[]> {
+export async function getAllowedSkills(userId: string): Promise<string[] | null> {
   try {
     // Anonymous/public users use the public skills config
     if (userId.startsWith("anon_")) {
       return getPublicAllowedSkills();
     }
 
-    // ENG-1978 (observation only): `resolved: false` means the tier could not be confirmed —
-    // a missing user row, an unreadable org owner, or an org-lookup blip. Behaviour is unchanged;
-    // we still use the tier name exactly as before. This only records that the grant below rests
-    // on an unconfirmed tier.
+    // ENG-1978: use the RESOLUTION, not the bare name. `resolveUserSubscriptionType` already
+    // distinguishes "this user is on Free" from "I could not read this user and am defaulting to
+    // Free" — but `getUserSubscriptionType` discards that flag and returns only the string.
+    //
+    // Deliberately NOT gating on `resolved: false` here (ENG-1978 fail-closed, corrected before
+    // merge). The flag is overloaded across four cases, and two of them (unreadable org owner,
+    // org-lookup blip) still carry a real, usable tier — the subscriptionTypeName below. Denying
+    // on the flag would strip every tool from a paying org member during a routine blip, strictly
+    // worse than the downgrade this function's own comment above exists to prevent. Record it as
+    // an unconfirmed tier (not a wildcard-grant: the assumed tier below is frequently real and
+    // restricted) and keep going with the assumed name.
     const { subscriptionType: subscriptionTypeName, resolved } =
       await getUserSubscriptionResolution(userId);
     if (!resolved) {
-      // NOT a wildcard-grant: the assumed tier below is frequently a real, restricted one, so
-      // this is recorded under its own kind and must not be summed with the over-grants.
-      // Windowed (not per-event): expected to be the highest-volume reason, and unlike
-      // wildcard-grant it is not itself a security-relevant over-grant, so a summary with a
-      // count/distinct-user-count is a better 2-week signal than one line per occurrence.
       reportUnconfirmedTier("subscription-type-unresolved", userId, {
         assumedSubscriptionType: subscriptionTypeName,
       });
@@ -602,11 +619,14 @@ export async function getAllowedSkills(userId: string): Promise<string[]> {
     const subscriptionType = await getSubscriptionTypeConfig(subscriptionTypeName);
 
     if (!subscriptionType) {
-      // If subscription type not found, return wildcard for all
+      // ENG-1978: unresolved, NOT grant-all. getSubscriptionTypeConfig returns null for an
+      // unknown tier name, a malformed `subscription_types` setting, or a failed read — none of
+      // which is evidence that this user is entitled to everything. Callers distinguish null
+      // (couldn't resolve) from [] (resolved: no skills); see the doc comment above.
       reportWildcardGrant("subscription-type-config-unavailable", userId, {
         subscriptionTypeName,
       });
-      return ["*"];
+      return null;
     }
 
     // If all skills are allowed, return wildcard
@@ -614,6 +634,8 @@ export async function getAllowedSkills(userId: string): Promise<string[]> {
       // Distinguish "an admin deliberately typed ["*"]" from "the row carried no allowedSkills at
       // all and was defaulted to ["*"] on read" — the latter is a silent full-registry grant and
       // the likeliest real malformation, being the documented pre-`allowedSkills` config shape.
+      // ENG-1978: that silent default is no longer granted — it fails closed like every other
+      // unresolvable case above.
       if (subscriptionType.allowedSkillsDefaulted) {
         // Two distinct causes share the flag; kept separable in the data by name rather than
         // subscriptionTypeName alone ("Basic" is itself a real tier name a config could also use).
@@ -622,28 +644,28 @@ export async function getAllowedSkills(userId: string): Promise<string[]> {
             ? "legacy-basic-fallback-no-tier-config"
             : "tier-config-missing-allowed-skills";
         reportWildcardGrant(reason, userId, { subscriptionTypeName });
+        return null;
       }
       return ["*"];
     }
 
-    // An empty list currently means "everything", not "nothing". That is almost certainly
-    // inverted (FREE_TIER_FALLBACK is `allowedSkills: []`, commented "No premium skills on Free
-    // tier"), but no live tier is empty today, so this records the case instead of changing it.
-    if (subscriptionType.allowedSkills.length === 0) {
-      reportWildcardGrant("empty-allowed-skills-treated-as-wildcard", userId, {
-        subscriptionTypeName,
-      });
-      return ["*"];
-    }
-
+    // ENG-1978: an empty list means NO skills, not all of them. This previously returned ["*"],
+    // which inverted the intent of every tier that lists nothing -- most visibly FREE_TIER_FALLBACK
+    // above, whose `allowedSkills: []` is commented "No premium skills on Free tier" and which
+    // therefore granted every registered tool whenever the DB config was unreachable. 14 days of
+    // production telemetry (round-2's windowed/per-event observation) never once saw a live tier
+    // hit this path, so there is no observed behaviour this flip can be regressing.
     return subscriptionType.allowedSkills;
   } catch (error: any) {
+    // Deliberately fail closed. An error must never grant more access than success does, and the
+    // assembler that consumes this already declares the same policy for itself
+    // (agentModeService.getFilteredTools: "DO NOT return all tools on error as it's a security
+    // risk"). Returning ["*"] here silently defeated that.
     console.error("Error getting allowed skills:", error);
-    // Default to allowing all skills on error
     reportWildcardGrant("allowed-skills-lookup-failed", userId, {
       error: error?.message || String(error),
     });
-    return ["*"];
+    return null;
   }
 }
 
@@ -653,11 +675,15 @@ export async function getAllowedSkills(userId: string): Promise<string[]> {
  * Returns ["*"] if input contains "*"
  */
 export async function resolveSkillsToToolNames(
-  skillIds: string[],
+  skillIds: string[] | null,
   /** ENG-1978 observation only — attributes the event below. Optional so no caller is forced to
    *  change; when absent the event is still emitted, just unattributed. */
   userIdForObservation?: string
-): Promise<string[]> {
+): Promise<string[] | null> {
+  // ENG-1978: an unresolved entitlement stays unresolved. Previously the null/error paths
+  // upstream arrived here as ["*"], which expanded to every tool.
+  if (skillIds === null) return null;
+
   try {
     if (skillIds.includes("*")) {
       return ["*"];
@@ -682,12 +708,14 @@ export async function resolveSkillsToToolNames(
 
     return Array.from(toolNames);
   } catch (error: any) {
+    // Fail closed (ENG-1978). getPublishedSkills rethrows on a DynamoDB error, and converting that
+    // into ["*"] granted every registered tool on a transient blip.
     console.error("Error resolving skills to tool names:", error);
     reportWildcardGrant("skill-to-tool-resolution-failed", userIdForObservation || "(unattributed)", {
       skillIds,
       error: error?.message || String(error),
     });
-    return ["*"];
+    return null;
   }
 }
 
@@ -784,19 +812,25 @@ export async function getHiddenPages(userId: string): Promise<string[]> {
  */
 export async function getAllowedFunctionCalls(
   userId: string
-): Promise<string[]> {
+): Promise<string[] | null> {
   try {
     const allowedSkillIds = await getAllowedSkills(userId);
     // `return await`, not bare `return`: a returned rejected promise is adopted OUTSIDE the try
     // block, so the catch below could never see it (pre-existing, unrelated to the observation).
     return await resolveSkillsToToolNames(allowedSkillIds, userId);
   } catch (error: any) {
+    // Fail closed (ENG-1978) — see getAllowedSkills' own catch for the reasoning.
+    //
+    // Honest note: this catch is defence in depth and is NOT reachable today — both calls above
+    // now swallow their own errors and return null rather than throwing. Hand-verified by
+    // temporarily flipping this to ["*"]: no test goes red, because nothing reaches it. It is
+    // kept so a future change that makes either call throw cannot silently reintroduce a
+    // grant-all, but do not mistake it for a tested path.
     console.error("Error getting allowed function calls:", error);
-    // Default to allowing all functions on error
     reportWildcardGrant("allowed-function-calls-failed", userId, {
       error: error?.message || String(error),
     });
-    return ["*"];
+    return null;
   }
 }
 

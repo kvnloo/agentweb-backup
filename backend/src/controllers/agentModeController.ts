@@ -4231,10 +4231,14 @@ async function runVerifiedChatInner(
   // access to them from the start (avoids relying on the LLM to call install_skills).
   if (requiredFunctions.length > 0) {
     try {
-      const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+      const [publishedSkills, rawAllowedSkillIds] = await Promise.all([
         skillService.getPublishedSkills(),
         getAllowedSkills(userId)
       ]);
+      // ENG-1978: null = entitlement unresolved. Auto-install nothing rather than everything —
+      // this pre-installs skills onto a session on the user's behalf, so an unproven entitlement
+      // must not be the reason a skill gets installed.
+      const userAllowedSkillIds: string[] = rawAllowedSkillIds ?? [];
       const isWildcard = userAllowedSkillIds.includes('*');
       const requiredToolNames = new Set(requiredFunctions.map(rf => rf.functionName));
 
@@ -5974,6 +5978,32 @@ export async function runScheduledChat(
     if (expectedFunctionCalls.length > 0) {
       const { getAllowedFunctionCalls } = await import('../services/subscriptionService');
       const allowedFunctionCalls = await getAllowedFunctionCalls(userId);
+
+      // ENG-1978: null = entitlement unresolved, which is neither "allowed" nor "denied". This is
+      // a background path, so it defers rather than deciding — the same shape the scheduled-chat
+      // feature check above uses for its own null. Previously this resolved to ["*"] and the
+      // schedule ran with every required function treated as permitted.
+      if (allowedFunctionCalls === null) {
+        const unresolvedResult = {
+          scheduleId: schedule.scheduleId,
+          runId: require('uuid').v4(),
+          status: 'failure' as const,
+          passed: false,
+          actualResponse: 'Scheduled chat was not run because subscription entitlements are temporarily unavailable. It will remain active and retry on the next scheduled run.',
+          actualFunctionCalls: [],
+          keywordMatches: [],
+          keywordMisses: schedule.keywords || [],
+          functionCallMatches: [],
+          functionCallMisses: expectedFunctionCalls,
+          executionTime: 0,
+          sessionId: '',
+          attempt: 0,
+          createdAt: new Date().toISOString(),
+        };
+        await scheduleDb.addRunResult(schedule.scheduleId, unresolvedResult)
+          .catch((error) => console.error('Error saving unresolved scheduled-chat entitlement result:', error));
+        return unresolvedResult;
+      }
 
       // If wildcard is present, all function calls are allowed — skip filtering
       const allAllowed = allowedFunctionCalls.includes("*");
@@ -9486,8 +9516,11 @@ export const agentModeController = {
       let toolsToReturn = tools;
       if (!user.isAdmin) {
         const { getAllowedFunctionCalls, filterFunctionCalls } = await import('../services/subscriptionService');
-        const allowedFunctionCalls = await getAllowedFunctionCalls(user.userId);
-        // getAllowedFunctionCalls now always returns an array (never null)
+        const resolvedFunctionCalls = await getAllowedFunctionCalls(user.userId);
+        // ENG-1978: null = entitlement unresolved (was ["*"], i.e. "advertise every tool").
+        // This endpoint tells a client what it may call, so an unresolved entitlement advertises
+        // only the foundation primitives rather than the full registry.
+        const allowedFunctionCalls: string[] = resolvedFunctionCalls ?? [];
         // Ensure foundation tools are always allowed
         const foundationTools = agentModeService.getFoundationToolNames();
         foundationTools.forEach(name => {

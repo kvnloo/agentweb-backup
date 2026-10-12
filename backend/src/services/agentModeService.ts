@@ -3089,6 +3089,15 @@ export class AgentModeService {
         console.warn(`[AgentMode] User ${userId} not found for admin check (orphaned schedule or deleted user)`);
       }
 
+      // ENG-1978: getAllowedSkills returns null when the tier could not be read or recognised.
+      // The RAW value (possibly null) is what reaches getFilteredTools below, which fails closed
+      // on it — that is the actual gate. The skill-catalog/context helpers further down only need
+      // a list to filter a catalog against, and for them an unresolved entitlement should show
+      // nothing extra rather than everything, so they get [] instead. Keeping the two separate
+      // matters: collapsing null to [] here would silently downgrade the gate to "no skills, but
+      // still hand over every foundation tool."
+      const userAllowedSkillIdsForDisplay: string[] = userAllowedSkillIds ?? [];
+
       const isAdmin = currentUser?.isAdmin === true;
 
       // ENG-1205: the correction this turn was admitted under, stamped onto the
@@ -3122,7 +3131,7 @@ export class AgentModeService {
       }
 
       // Build initial skill context
-      let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
+      let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIdsForDisplay, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
 
       // 3. Build Initial Messages
       let effectiveMessageContent = messageContent;
@@ -3137,7 +3146,7 @@ export class AgentModeService {
       const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations, openResearchRequests);
 
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
-      let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
+      let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIdsForDisplay, hasAdminAccess);
 
       const today = new Date().toISOString().split('T')[0];
       // ENG-803: resolve this scheduled run's publish authorization from the schedule
@@ -3753,7 +3762,7 @@ export class AgentModeService {
             }
 
             // Re-build context using helper
-            const skillContext = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, updatedAssociatedSkillIds, hasAdminAccess);
+            const skillContext = this.buildSkillContext(associatedSkills, userAllowedSkillIdsForDisplay, publishedSkills, updatedAssociatedSkillIds, hasAdminAccess);
             // ENG-893: a skill install that ADDS tools changes `toolConfig`, and
             // Bedrock chains its cache checkpoints tools -> system -> messages —
             // so the whole cached prefix dies and the next call re-writes it in
@@ -3783,7 +3792,7 @@ export class AgentModeService {
             installedSkillContextMsg = skillContext.installedSkillContextMsg;
 
             // Rebuild available skills (excluding newly associated ones, filtered by subscription)
-            availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, updatedAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
+            availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, updatedAssociatedSkillIds, userAllowedSkillIdsForDisplay, hasAdminAccess);
 
             // Update messages using helper — track length change to keep initialMessageCount accurate
             const preUpdateLen = messages.length;
@@ -6698,10 +6707,14 @@ export class AgentModeService {
    */
   private async loadAuthorizedSkillCatalog(userId?: string): Promise<{ skills: Skill[]; allowedIds: string[] }> {
     const userOrgId = userId ? (await resolveUserSkillAccess(userId)).sharedOrgId : undefined;
-    const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+    const [publishedSkills, rawAllowedSkillIds] = await Promise.all([
       userId ? skillService.getSkillsAvailableToUser(userId, userOrgId) : skillService.getPublishedSkills(),
       userId ? getAllowedSkills(userId) : getPublicAllowedSkills()
     ]);
+    // ENG-1978: this is a catalog read (what may this user see/install?), not the execution gate.
+    // An unresolved entitlement lists nothing extra — the user still sees skills they own or that
+    // their org shares, which is correct: those grants do not come from the subscription tier.
+    const userAllowedSkillIds: string[] = rawAllowedSkillIds ?? [];
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSet = new Set(userAllowedSkillIds);
     return { skills: publishedSkills.filter(s => (s.visibility !== 'pending_review' || s.ownerId === userId) && (isWildcard || allowedSet.has(s.skillId) || (userId !== undefined && s.ownerId === userId) || (userOrgId !== undefined && s.orgId === userOrgId))), allowedIds: userAllowedSkillIds };
@@ -6934,6 +6947,12 @@ export class AgentModeService {
         getAllowedSkills(userId),
         skillService.getPublishedSkills(),
       ]);
+      // ENG-1978: null = entitlement unresolved. This is refusal-*messaging* only; treating it as
+      // "no skills allowed" here would claim the customer's plan excludes the skill, which is
+      // exactly the unproven claim the catch below exists to avoid. Throw into that branch instead.
+      if (allowed === null) {
+        throw new Error('entitlement unresolved; cannot classify skill rejection');
+      }
       allowedIds = allowed;
       existingIds = new Set(published.map(s => s.skillId));
       // The virtual bundles are real ids with no catalog row; entitlement still governs them.
@@ -7279,6 +7298,10 @@ export class AgentModeService {
     const isAdmin = currentUser?.isAdmin === true;
     const hasAdminAccess = (isAdmin || input.isDelegatedAccess === true) && input.isInteractiveShare !== true;
 
+    // ENG-1978: see the main turn handler's comment on the same split — this helper mirrors it,
+    // not `getFilteredTools` below, which gets the RAW (possibly null) value so it can fail closed.
+    const userAllowedSkillIdsForDisplay: string[] = userAllowedSkillIds ?? [];
+
     const rawAssociatedSkills = currentSession?.associatedSkills;
     const isLegacySession = rawAssociatedSkills === undefined || rawAssociatedSkills === null;
     const sessionAssociatedSkillIds: string[] = Array.isArray(rawAssociatedSkills) ? rawAssociatedSkills : [];
@@ -7287,7 +7310,7 @@ export class AgentModeService {
       : [];
     const { allowedToolNames } = this.buildSkillContext(
       associatedSkills,
-      userAllowedSkillIds,
+      userAllowedSkillIdsForDisplay,
       publishedSkills,
       sessionAssociatedSkillIds,
       hasAdminAccess,
@@ -7452,10 +7475,21 @@ export class AgentModeService {
     return { added, removed, changed: added > 0 || removed > 0 };
   }
 
+  /**
+   * ENG-1978: the one fail-closed toolset. A session that cannot prove its entitlement gets
+   * `install_skills` and nothing else — enough to recover, not enough to act. Extracted so the
+   * error path and the unresolved-entitlement path cannot drift apart.
+   */
+  private installSkillsOnlyToolset(reason: string): any[] {
+    console.error('[entitlement] withholding tools, failing closed:', JSON.stringify({ reason }));
+    const installSkillsTool = this.toolRegistry.getTool('install_skills');
+    return installSkillsTool ? [installSkillsTool.definition] : [];
+  }
+
   public async getFilteredTools(
     userId: string,
     precomputedAllowedSkillToolNames?: Set<string>,
-    precomputedAllowedSkillIds?: string[]  // Skill IDs from subscription, to avoid duplicate getAllowedSkills call
+    precomputedAllowedSkillIds?: string[] | null  // Skill IDs from subscription, to avoid duplicate getAllowedSkills call. null = unresolved (ENG-1978)
   ): Promise<any[]> {
     try {
 
@@ -7472,13 +7506,24 @@ export class AgentModeService {
       const definitions = contextAwareTools.map(t => t.definition);
 
       // 4. Apply Subscription Filtering
-      // Resolve skill IDs to tool names for the subscription filter step
-      const skillIds = precomputedAllowedSkillIds || await getAllowedSkills(userId);
+      // Resolve skill IDs to tool names for the subscription filter step.
+      // `??`, not `||`: a precomputed `null` (ENG-1978 — the caller already knows the entitlement
+      // is unresolved) must stay null, not silently re-fetch and double-report the telemetry.
+      const skillIds = precomputedAllowedSkillIds ?? await getAllowedSkills(userId);
       // ENG-1978 (observation only): userId attributes `skill-to-tool-resolution-failed` — this
       // is the highest-frequency route to it (inside the agent iteration loop), and it is the one
       // reason that is ALWAYS a genuine full-registry grant, so leaving it unattributed here would
       // make the single most important signal in the 2-week analysis the one nobody can act on.
       const allowedFunctionCalls = await resolveSkillsToToolNames(skillIds, userId);
+
+      // ENG-1978: null means the entitlement could not be resolved — an unknown/malformed tier or
+      // a failed settings read. Fall into the same fail-closed toolset this function's own catch
+      // uses. Its comment below has always stated the policy ("DO NOT return all tools on error as
+      // it's a security risk"); until now the inner lookups returned ["*"] on exactly these
+      // failures and silently defeated it.
+      if (allowedFunctionCalls === null) {
+        return this.installSkillsOnlyToolset('entitlement-unresolved');
+      }
 
       // Foundation tools must always bypass subscription filtering — they are
       // core primitives (work plan, search, save) needed by every session.
@@ -7505,8 +7550,7 @@ export class AgentModeService {
       console.error('Error filtering tools:', error);
       // Fallback: return only install_skills to be safe, or empty array
       // DO NOT return all tools on error as it's a security risk
-      const installSkillsTool = this.toolRegistry.getTool('install_skills');
-      return installSkillsTool ? [installSkillsTool.definition] : [];
+      return this.installSkillsOnlyToolset('tool-filtering-threw');
     }
   }
 

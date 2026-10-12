@@ -1226,6 +1226,9 @@ describe('AgentModeService - Skills', () => {
         { name: 'you_search_news', definition: { function: { name: 'you_search_news', description: 'Search news with You.com' } } },
       ];
       jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+      jest.spyOn(agentModeService['toolRegistry'], 'getTool').mockImplementation(
+        (name: string) => mockTools.find((t) => t.name === name) as any
+      );
 
       await agentModeService.initialize();
     });
@@ -1260,6 +1263,26 @@ describe('AgentModeService - Skills', () => {
 
       // Should fallback to just install_skills
       expect(result.length).toBeGreaterThanOrEqual(0);
+    });
+
+    /*
+     * ENG-1978: resolveSkillsToToolNames now returns null when the entitlement could not be
+     * resolved (an unknown/malformed tier or a failed settings read), where it previously
+     * returned ["*"] and silently granted every tool. getFilteredTools must fail closed to the
+     * same install_skills-only toolset its own error catch has always used — not fall through to
+     * the foundation-tools bypass below, which would hand back create_work_plan/you_search_web
+     * etc. even though the entitlement check never actually succeeded.
+     */
+    it('should fail closed to install_skills-only when the entitlement is unresolved', async () => {
+      const { resolveSkillsToToolNames } = require('../services/subscriptionService');
+      (resolveSkillsToToolNames as jest.Mock).mockResolvedValueOnce(null);
+
+      const result = await agentModeService.getFilteredTools('user-123', undefined);
+
+      const toolNames = result.map((t: any) => t.function?.name || t.name);
+      expect(toolNames).toEqual(['install_skills']);
+      expect(toolNames).not.toContain('create_work_plan');
+      expect(toolNames).not.toContain('you_search_web');
     });
 
     it('should use precomputed allowed names when provided', async () => {
