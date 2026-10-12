@@ -98,6 +98,15 @@ const handleDynamoDbError = (error: any, operation: string) => {
  * other error here is either permanent or the caller's own guard
  * (e.g. ConditionalCheckFailedException) firing correctly.
  */
+/** Thrown when updating a memory that does not exist (ENG-2404). */
+export class MemoryNotFoundError extends Error {
+  readonly code = 'MEMORY_NOT_FOUND';
+  constructor(memoryId: string) {
+    super(`Memory not found: ${memoryId}`);
+    this.name = 'MemoryNotFoundError';
+  }
+}
+
 const withTransactionConflictRetry = async <T>(
   fn: () => Promise<T>,
   maxAttempts = 4,
@@ -11223,10 +11232,16 @@ export const accountMemoryDb = {
         UpdateExpression: `SET ${expressions.join(', ')}`,
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: values,
+        // UpdateItem upserts: without this, editing a memory deleted
+        // elsewhere silently re-creates it (ENG-2404).
+        ConditionExpression: 'attribute_exists(memoryId)',
         ReturnValues: 'ALL_NEW',
       }).promise();
       return result.Attributes;
-    } catch (error) {
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') {
+        throw new MemoryNotFoundError(memoryId);
+      }
       handleDynamoDbError(error, 'updateMemory');
       throw error;
     }
@@ -11388,10 +11403,16 @@ export const orgMemoryDb = {
         UpdateExpression: `SET ${expressions.join(', ')}`,
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: values,
+        // UpdateItem upserts: without this, editing a memory deleted
+        // elsewhere silently re-creates it (ENG-2404).
+        ConditionExpression: 'attribute_exists(memoryId)',
         ReturnValues: 'ALL_NEW',
       }).promise();
       return result.Attributes;
-    } catch (error) {
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') {
+        throw new MemoryNotFoundError(memoryId);
+      }
       handleDynamoDbError(error, 'updateOrgMemory');
       throw error;
     }
