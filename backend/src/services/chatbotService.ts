@@ -26,7 +26,7 @@ import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService, agentModeService as agentModeServiceSingleton } from './agentModeService';
 import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../utils/citations';
-import { shrinkMessageForPersistence } from '../utils/messageSizeGuard';
+import { MAX_PERSISTED_MESSAGE_BYTES, shrinkMessageForPersistence } from '../utils/messageSizeGuard';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
 import { withKeyedMutex } from '../utils/keyedMutex';
@@ -46,7 +46,7 @@ const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
 // Max serialized message size for DynamoDB persistence (400KB item limit).
 // Safety net in addMessagesToMessagesTable; primary truncation happens in agentModeService.
-const MAX_MESSAGE_CONTENT_SIZE = 350_000;
+export const MAX_MESSAGE_CONTENT_SIZE = MAX_PERSISTED_MESSAGE_BYTES;
 
 // Tool calls that require repair for empty results (MCP PR #433 bug)
 const REPAIRABLE_TOOL_CALLS = [
@@ -143,6 +143,15 @@ export interface ChatMessage {
       sourceMessageIndex: number;       // RAW row index in the source session
       branchedAt: string;
     };
+    // ENG-113: saved "Compare models" alternatives (the unchosen answers), stamped on the chosen assistant row by
+    // /compare/select when AW-Settings `compare_save_alternatives` is 'true'. Free-form metadata, owner-approved
+    // additive key (no schema/index/table change). Owner views only: stripped from every non-owner serializer and
+    // never part of any LLM context. See services/agentMode/compareSaveAlternatives.ts.
+    compareId?: string;
+    compareAlternatives?: Array<{ model: string; name: string; provider: string; content: string; latencyMs: number }>;
+    compareAlternativesOmitted?: 'size';
+    /** ENG-113: set on the copied row of a branch created with "Branch with this answer". */
+    branchedFromAlternative?: { model: string };
     mediaBudgetDeferred?: boolean;      // ENG-1239: set on the tool-role deferral marker AND on the whole-turn-timeout partial-delivery message that reports it, so an unresolved media-batch pause is detectable from the tail of session history alone
   };
 }
