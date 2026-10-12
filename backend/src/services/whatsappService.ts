@@ -221,16 +221,21 @@ export async function bindPhoneToUser(phone: string, userId: string): Promise<vo
 /**
  * Remove the phone -> user row.
  *
- * With `onlyIfUserId`, the row is removed only if it still points at that account. One
- * number can have been re-bound to a different account since the caller last looked, and
- * an unconditional delete from the old account's disconnect would silently break the new
- * owner's inbound taps. (Read-then-delete, not atomic; the window is a pair of writes by
- * different people on the same number, and the index re-validates itself on every read.)
+ * With `onlyIfUserId`, the row is removed only if it still points at that account, in one
+ * atomic conditional delete. One number can have been re-bound to a different account since
+ * the caller last looked, and an unconditional delete from the old account's disconnect
+ * would silently break the new owner's inbound taps.
  */
 export async function unbindPhone(phone: string, onlyIfUserId?: string): Promise<void> {
   if (onlyIfUserId) {
-    const row = await settingsService.getSetting(phoneUserKey(phone));
-    if (row?.settingValue !== onlyIfUserId) return;
+    try {
+      await settingsService.deleteSettingIfValueMatches(phoneUserKey(phone), onlyIfUserId);
+    } catch (error: any) {
+      // The row already points elsewhere, or is gone: nothing of this account's to remove.
+      if (error?.code === 'ConditionalCheckFailedException') return;
+      throw error;
+    }
+    return;
   }
   await settingsService.deleteSetting(phoneUserKey(phone));
 }

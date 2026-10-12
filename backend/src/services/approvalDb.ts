@@ -188,7 +188,7 @@ export class ApprovalDB {
     reviewedBy: string,
   ): Promise<
     | { answered: true; approval: AssetApproval }
-    | { answered: false; current: AssetApproval['status'] | null }
+    | { answered: false; current: AssetApproval['status'] | null | 'unknown' }
   > {
     try {
       const result = await dynamodb
@@ -212,9 +212,15 @@ export class ApprovalDB {
       return { answered: true, approval: result.Attributes as AssetApproval };
     } catch (error: any) {
       if (error?.code === 'ConditionalCheckFailedException') {
-        // Report what stands, so the caller can say it rather than guess.
-        const existing = await this.getApproval(assetUrl).catch(() => null);
-        return { answered: false, current: existing?.status ?? null };
+        // Report what stands, so the caller can say it rather than guess. A failed read is
+        // 'unknown', NOT null: null means the approval does not exist, and telling someone
+        // their request is gone because a read blipped would be wrong.
+        try {
+          const existing = await this.getApproval(assetUrl);
+          return { answered: false, current: existing?.status ?? null };
+        } catch {
+          return { answered: false, current: 'unknown' };
+        }
       }
       console.error('❌ Error answering approval:', error);
       throw new Error('Failed to answer approval');

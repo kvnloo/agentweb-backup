@@ -152,6 +152,14 @@ export async function requestApproval(
     // A Slack failure is surfaced unchanged so existing callers see the error they always saw.
     if (slackError) throw slackError;
     if (whatsappFailed) {
+      // The caller will hold the customer's output until this is resolved, and nothing here
+      // retries. Say so where an operator can see it (user id and asset only — never the
+      // number), so a customer who has opted out or has a standing Meta error is not held
+      // silently and indefinitely.
+      console.error(
+        `[approval-request] could not deliver an approval to user ${request.userId} on WhatsApp; ` +
+          `their output for ${request.imageUrl} is being held until this is resolved`,
+      );
       throw new ApprovalDeliveryFailedError(
         'The approval request could not be delivered to the connected WhatsApp number.',
       );
