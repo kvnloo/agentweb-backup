@@ -163,3 +163,12 @@ describe('ENG-2338 bot-gate handoff', () => {
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('DevTools → Network');
   });
 });
+
+// ENG-2338: Luma's API is the reliable path; the browser is the fallback.
+describe('ENG-2338 Luma API-first guidance', () => {
+  it('tells the agent to try the Luma API tools before a browser, and never to take a key in chat', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('luma_get_guests');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('before opening a browser');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('Never ask the user to paste an API key into the chat');
+  });
+});
