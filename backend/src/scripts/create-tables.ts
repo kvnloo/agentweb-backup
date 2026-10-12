@@ -2062,6 +2062,57 @@ const createSpendProjectionTable = async () => {
 // on the `ttl` attribute MANUALLY -- CreateTable does not configure it, and
 // nothing at runtime will report that it is missing. Same manual step as the
 // UsageRecords/LoopEvents/AgentRuns tables.
+// Create LLM Connections table (ENG-2105 — customer LLM provider keys, KMS
+// envelope-encrypted). Must stay identical to LLM_CONNECTIONS_TABLE_SPEC in
+// services/funding/llmConnectionDb.ts, which is what the boot-time
+// ensureCriticalTables creates; llmConnectionTable.test.ts fails if they differ.
+// Delete-protected. Point-in-time recovery is deliberately left off: revoking a
+// connection deletes its encrypted key, and a recovery window would keep that
+// ciphertext restorable for up to 35 days after the customer revoked it.
+export const createLlmConnectionsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-LlmConnections`,
+    AttributeDefinitions: [
+      { AttributeName: 'connectionId', AttributeType: 'S' },
+      { AttributeName: 'ownerUserId', AttributeType: 'S' },
+      { AttributeName: 'orgId', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' },
+      { AttributeName: 'provider', AttributeType: 'S' },
+    ],
+    KeySchema: [{ AttributeName: 'connectionId', KeyType: 'HASH' }],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'OwnerIndex',
+        KeySchema: [
+          { AttributeName: 'ownerUserId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'OrgIndex',
+        KeySchema: [
+          { AttributeName: 'orgId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'ProviderIndex',
+        KeySchema: [
+          { AttributeName: 'provider', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+    DeletionProtectionEnabled: true,
+  };
+  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
+  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+};
+
 export const createModelChangeAuditTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: `${TABLE_PREFIX}AW-ModelChangeAudit`,
@@ -2697,6 +2748,7 @@ const main = async () => {
     await createSpendEventsTable();
     await createSpendProjectionTable();
     await createModelChangeAuditTable();
+    await createLlmConnectionsTable();
     await createLandingPagesTable();
     await createAccountMemoryTable();
     await createOrgMemoryTable();

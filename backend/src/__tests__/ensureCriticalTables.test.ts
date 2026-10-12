@@ -89,8 +89,10 @@ describe('ensureCriticalTables', () => {
     it('only reconciles tables whose spec requests protection', async () => {
       // The two money tables carry DeletionProtectionEnabled: the event ledger
       // and the §3b projection. Both are authoritative and hard to rebuild.
+      // ENG-2105 adds the customer LLM key store: losing it makes every customer
+      // re-enter their provider keys.
       const guarded = CRITICAL_TABLE_SPECS.filter((s) => (s as any).DeletionProtectionEnabled);
-      expect(guarded.map((s) => s.TableName).sort()).toEqual(['AW-SpendEvents', 'AW-SpendProjection']);
+      expect(guarded.map((s) => s.TableName).sort()).toEqual(['AW-LlmConnections', 'AW-SpendEvents', 'AW-SpendProjection']);
     });
   });
 
