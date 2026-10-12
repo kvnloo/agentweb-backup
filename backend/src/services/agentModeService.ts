@@ -1716,6 +1716,7 @@ export class AgentModeService {
         await import('../mcp/server/evaluationTools');
         await import('../emma/tools');
         await import('../emma/fathomTools');
+        await import('../emma/lumaTools');
         await import('../emma/meetingActionRouter');
         await import('../emma/notionGuideTools');
         await import('../emma/slackMessageTools');
@@ -6393,6 +6394,10 @@ export class AgentModeService {
     'fathom_get_transcript',
     'fathom_get_onboarding_context',
 
+    // Luma API (ENG-2338): guest lists without a browser login
+    'luma_list_events',
+    'luma_get_guests',
+
     // Coding Agent (sub-agent for code editing tasks)
     'coding_agent',
 
@@ -6507,6 +6512,12 @@ export class AgentModeService {
     'fathom_get_meetings',
     'fathom_get_transcript',
     'fathom_get_onboarding_context',
+    // Luma API (ENG-2338). Force-merged for the same reason as the Fathom tools: a
+    // stale prod `foundation_tools` override would otherwise strip them. Like Fathom,
+    // they stay reachable with no key connected so the model gets the "connect Luma /
+    // fall back to the browser path" guidance instead of a generic not-available error.
+    'luma_list_events',
+    'luma_get_guests',
     // ENG-396/400: re-exposed after being found dormant-only in practice (a
     // user asking Emma to "confirm settings via a card before building"
     // couldn't get one at all — she has no way to render a real card and was
