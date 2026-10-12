@@ -254,3 +254,37 @@ describe('the hourly forward limit', () => {
     expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('media messages', () => {
+  beforeEach(() => {
+    process.env.WHATSAPP_SUPPORT_INBOX = 'support@example.com';
+  });
+
+  it('tells the team what the attachment is and where to find it', async () => {
+    await handleUnrecognizedMessage(PHONE, 'my dashboard is broken', 'image', 'image, media id MEDIA-123');
+    const [, , textBody, html] = emailService.sendEmail.mock.calls[0];
+    expect(textBody).toContain('my dashboard is broken');
+    expect(textBody).toContain('Attachment: image, media id MEDIA-123');
+    expect(textBody).toMatch(/not attached to this email.*WhatsApp Manager/);
+    expect(html).toContain('media id MEDIA-123');
+  });
+
+  it('still forwards a media message with no caption, and says so', async () => {
+    await handleUnrecognizedMessage(PHONE, '', 'document', 'document, file "invoice.pdf", media id M9');
+    const textBody = emailService.sendEmail.mock.calls[0][2];
+    expect(textBody).toContain('[document message — no text]');
+    expect(textBody).toContain('invoice.pdf');
+  });
+
+  it('escapes a hostile filename in the HTML body', async () => {
+    await handleUnrecognizedMessage(PHONE, '', 'document', 'document, file "<img src=x onerror=1>.pdf"');
+    const html = emailService.sendEmail.mock.calls[0][3];
+    expect(html).not.toContain('<img src=x');
+    expect(html).toContain('&lt;img');
+  });
+
+  it('adds no attachment line to a plain text message', async () => {
+    await handleUnrecognizedMessage(PHONE, 'hello');
+    expect(emailService.sendEmail.mock.calls[0][2]).not.toContain('Attachment:');
+  });
+});

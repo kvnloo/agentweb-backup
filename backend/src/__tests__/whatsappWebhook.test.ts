@@ -538,7 +538,45 @@ describe('POST — messages that are not commands', () => {
   it('hands an ordinary message to the support hand-off', async () => {
     (handleVerificationMessage as jest.Mock).mockResolvedValue(false);
     await post(inboundPayload('hi'));
-    expect(handleUnrecognizedMessage).toHaveBeenCalledWith('+14155550123', 'hi', 'text');
+    // replaced below with the media-aware assertion
+  });
+
+  it('passes a media message\'s caption and where to find the file to the hand-off', async () => {
+    (handleVerificationMessage as jest.Mock).mockResolvedValue(false);
+    await post(
+      JSON.stringify({
+        object: 'whatsapp_business_account',
+        entry: [{ id: 'W', changes: [{ field: 'messages', value: { messaging_product: 'whatsapp', messages: [{
+          from: '14155550123', id: 'wamid.M', timestamp: '1', type: 'image',
+          image: { id: 'MEDIA-123', caption: 'my dashboard is broken', mime_type: 'image/jpeg' },
+        }] } }] }],
+      }),
+    );
+    expect(handleUnrecognizedMessage).toHaveBeenCalledWith(
+      '+14155550123', 'my dashboard is broken', 'image', 'image, media id MEDIA-123',
+    );
+  });
+
+  it('names a document by its filename', async () => {
+    (handleVerificationMessage as jest.Mock).mockResolvedValue(false);
+    await post(
+      JSON.stringify({
+        object: 'whatsapp_business_account',
+        entry: [{ id: 'W', changes: [{ field: 'messages', value: { messaging_product: 'whatsapp', messages: [{
+          from: '14155550123', id: 'wamid.D', timestamp: '1', type: 'document',
+          document: { id: 'MEDIA-9', filename: 'invoice.pdf' },
+        }] } }] }],
+      }),
+    );
+    expect(handleUnrecognizedMessage).toHaveBeenCalledWith(
+      '+14155550123', '', 'document', 'document, file "invoice.pdf", media id MEDIA-9',
+    );
+  });
+
+  it('gives plain text no media detail', async () => {
+    (handleVerificationMessage as jest.Mock).mockResolvedValue(false);
+    await post(inboundPayload('hi'));
+    expect(handleUnrecognizedMessage).toHaveBeenCalledWith('+14155550123', 'hi', 'text', '');
   });
 
   it('does not greet someone who just sent a verification code', async () => {
