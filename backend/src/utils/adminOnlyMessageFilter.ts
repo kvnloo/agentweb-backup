@@ -33,6 +33,8 @@ export interface AdminRedactionOptions {
   /**
    * ENG-112: drop `metadata.branchOrigin` (chat-branching provenance: the source session id/title) from the
    * returned rows. Set for viewers who are not the session owner (share / conversable links). Default false.
+   * ENG-113: the same flag also drops `metadata.compareAlternatives` (the saved unchosen Compare answers are
+   * owner-only) via the same mechanism. `compareAlternativesOmitted`/`compareId` carry no answer text and stay.
    */
   omitBranchOrigin?: boolean;
 }
@@ -90,9 +92,13 @@ export function filterMessagesForClient(messages: any[], opts: AdminRedactionOpt
   const adminToolNameSet = new Set<string>(opts.adminToolNames ?? []);
   const adminTainted = computeAdminTaintedTurns(messages, viewerIsAdmin, adminToolNameSet);
 
-  const stripOrigin = (message: any) => {
-    if (!opts.omitBranchOrigin || !message?.metadata || !('branchOrigin' in message.metadata)) return message;
-    const { branchOrigin: _origin, ...metadata } = message.metadata;
+  // `omitBranchOrigin` is the legacy flag name for "this viewer is not the session owner": it strips BOTH owner-only
+  // metadata keys (ENG-112 branchOrigin and ENG-113 compareAlternatives). Both share the one call-site rule on purpose
+  // (every non-owner view must hide both); the adminOnlyMessageFilter tripwire tests pin each key.
+  const stripOwnerOnlyMetadata = (message: any) => {
+    if (!opts.omitBranchOrigin || !message?.metadata) return message;
+    if (!('branchOrigin' in message.metadata) && !('compareAlternatives' in message.metadata)) return message;
+    const { branchOrigin: _origin, compareAlternatives: _alternatives, ...metadata } = message.metadata;
     return { ...message, metadata };
   };
 
@@ -121,7 +127,7 @@ export function filterMessagesForClient(messages: any[], opts: AdminRedactionOpt
     }
 
     return true;
-  }).map(stripOrigin);
+  }).map(stripOwnerOnlyMetadata);
 }
 
 /**
@@ -157,4 +163,20 @@ export function redactAdminActivity(messages: any[], opts: AdminRedactionOptions
     }
     return true;
   });
+}
+
+/**
+ * Owner-only attribute: remove `branchedFrom` from a session-level object before it is shown to anyone but
+ * the owner's own portal (MCP tools and any other external view). Works on one session or `{sessions: []}`.
+ */
+export function omitBranchedFrom<T>(value: T): T {
+  if (!value || typeof value !== 'object') return value;
+  const strip = (s: any) => {
+    if (!s || typeof s !== 'object' || !('branchedFrom' in s)) return s;
+    const { branchedFrom: _b, ...rest } = s;
+    return rest;
+  };
+  const v: any = value;
+  if (Array.isArray(v.sessions)) return { ...strip(v), sessions: v.sessions.map(strip) } as T;
+  return strip(v) as T;
 }

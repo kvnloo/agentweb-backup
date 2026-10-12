@@ -17,6 +17,12 @@ export class BranchFakeDynamo {
   readonly tables = new Map<string, Map<string, Item>>();
   /** When set, batchWrite reports these message indexes as UnprocessedItems forever (silent partial write). */
   dropMessageIndexes = new Set<number>();
+  /** UserIdIndex queries: items per page (undefined = one page) and a switch that ignores the key condition. */
+  indexPageSize: number | undefined = undefined;
+  indexLeaksOtherUsers = false;
+  readonly indexQueries: any[] = [];
+  /** Queries against the messages table (a record-only lookup must never issue one). */
+  readonly messageQueries: any[] = [];
   /** Every write call, in order: [op, table, key-ish]. */
   readonly writeLog: Array<{ op: string; table: string; key: string }> = [];
 
@@ -111,6 +117,8 @@ export class BranchFakeDynamo {
         }),
       query: (p: any) =>
         BranchFakeDynamo.wrap(() => {
+          if (p.IndexName === 'UserIdIndex') return this.queryUserIdIndex(p);
+          this.messageQueries.push(p);
           const sessionId = p.ExpressionAttributeValues[':sessionId'];
           const items = [...this.table(p.TableName).values()]
             .filter((i) => i.sessionId === sessionId)
@@ -133,6 +141,32 @@ export class BranchFakeDynamo {
           }
           return { UnprocessedItems: unprocessed };
         }),
+    };
+  }
+
+  /** UserIdIndex (userId, updatedAt): only the plain `userId = :userId` key condition, paged by `indexPageSize`. */
+  private queryUserIdIndex(p: any) {
+    if (p.KeyConditionExpression !== 'userId = :userId' || p.FilterExpression !== undefined) {
+      throw new Error(`BranchFakeDynamo: unsupported UserIdIndex query: ${p.KeyConditionExpression} / ${p.FilterExpression}`);
+    }
+    this.indexQueries.push(clone(p));
+    const userId = p.ExpressionAttributeValues[':userId'];
+    const all = [...this.table('AW-ChatSessions').values()]
+      .filter((i) => this.indexLeaksOtherUsers || i.userId === userId)
+      .sort((a, b) => String(a.updatedAt).localeCompare(String(b.updatedAt)) || String(a.sessionId).localeCompare(String(b.sessionId)));
+    if (p.ScanIndexForward === false) all.reverse(); // DynamoDB: ascending by range key unless ScanIndexForward=false
+    const start = p.ExclusiveStartKey ? all.findIndex((i) => i.sessionId === p.ExclusiveStartKey.sessionId) + 1 : 0;
+    const size = this.indexPageSize ?? all.length;
+    const page = all.slice(start, start + size);
+    const more = start + size < all.length;
+    const names: Record<string, string> = p.ExpressionAttributeNames ?? {};
+    const attrs = p.ProjectionExpression
+      ? String(p.ProjectionExpression).split(',').map((a) => a.trim()).map((a) => (a.startsWith('#') ? names[a] : a))
+      : undefined;
+    const project = (i: Item) => (attrs ? Object.fromEntries(attrs.filter((a) => a in i).map((a) => [a, i[a]])) : i);
+    return {
+      Items: clone(page.map(project)),
+      ...(more ? { LastEvaluatedKey: { sessionId: page[page.length - 1].sessionId } } : {}),
     };
   }
 

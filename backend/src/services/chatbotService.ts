@@ -26,7 +26,7 @@ import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService, agentModeService as agentModeServiceSingleton } from './agentModeService';
 import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../utils/citations';
-import { shrinkMessageForPersistence } from '../utils/messageSizeGuard';
+import { MAX_PERSISTED_MESSAGE_BYTES, shrinkMessageForPersistence } from '../utils/messageSizeGuard';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
 import { withKeyedMutex } from '../utils/keyedMutex';
@@ -46,7 +46,7 @@ const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
 // Max serialized message size for DynamoDB persistence (400KB item limit).
 // Safety net in addMessagesToMessagesTable; primary truncation happens in agentModeService.
-const MAX_MESSAGE_CONTENT_SIZE = 350_000;
+export const MAX_MESSAGE_CONTENT_SIZE = MAX_PERSISTED_MESSAGE_BYTES;
 
 // Tool calls that require repair for empty results (MCP PR #433 bug)
 const REPAIRABLE_TOOL_CALLS = [
@@ -143,6 +143,15 @@ export interface ChatMessage {
       sourceMessageIndex: number;       // RAW row index in the source session
       branchedAt: string;
     };
+    // ENG-113: saved "Compare models" alternatives (the unchosen answers), stamped on the chosen assistant row by
+    // /compare/select when AW-Settings `compare_save_alternatives` is 'true'. Free-form metadata, owner-approved
+    // additive key (no schema/index/table change). Owner views only: stripped from every non-owner serializer and
+    // never part of any LLM context. See services/agentMode/compareSaveAlternatives.ts.
+    compareId?: string;
+    compareAlternatives?: Array<{ model: string; name: string; provider: string; content: string; latencyMs: number }>;
+    compareAlternativesOmitted?: 'size';
+    /** ENG-113: set on the copied row of a branch created with "Branch with this answer". */
+    branchedFromAlternative?: { model: string };
     mediaBudgetDeferred?: boolean;      // ENG-1239: set on the tool-role deferral marker AND on the whole-turn-timeout partial-delivery message that reports it, so an unresolved media-batch pause is detectable from the tail of session history alone
   };
 }
@@ -156,6 +165,24 @@ export interface OpenResearchRequest {
   topic: string;
   failedAt: string; // ISO timestamp
   errorSummary: string;
+}
+
+export interface BranchedFrom {
+  sessionId: string;
+  rootSessionId: string;
+  messageIndex: number;
+  branchedAt: string;
+}
+
+/** The slim projection of a session returned by getBranchFamilySessions. */
+export interface BranchFamilyMember {
+  sessionId: string;
+  title?: string;
+  llmModel?: string;
+  messageCount: number;
+  updatedAt: string;
+  createdAt: string;
+  branchedFrom?: BranchedFrom;
 }
 
 // Interface for chat sessions
@@ -172,6 +199,13 @@ export interface ChatSession {
   portalType?: "customer" | "partner" | "genius" | "agent" | "emma-sidebar"; // Added portalType to session
   pageIdentifier?: string; // Added pageIdentifier for page-specific sessions
   archived?: boolean; // Archive status for soft deletion
+  /**
+   * ENG-112 (owner-approved additive optional attribute): set ONLY on a chat created by "Branch from here".
+   * `sessionId` = the immediate source, `rootSessionId` = the first chat of the family (a branch of a branch
+   * keeps the original root), `messageIndex` = the raw fork index sent to the branch endpoint. Owner-only:
+   * never serialised on share / conversable / MCP views. No GSI, no backfill; rollback = stop writing/reading.
+   */
+  branchedFrom?: BranchedFrom;
   selectedStartupId?: string; // Selected startup profile for context
   workflowId?: string; // Added workflowId for agent mode sessions
   executionId?: string; // Added executionId for agent mode sessions
@@ -743,7 +777,7 @@ export class ChatbotDB {
     emailCampaignTaskId?: string,
     sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email" | "meeting-intake",
     delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean },
-    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages" | "archived">>
+    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages" | "archived" | "branchedFrom">>
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -2219,6 +2253,57 @@ export class ChatbotDB {
     );
 
     return sessionsWithPreview;
+  }
+
+  /**
+   * ENG-112: the NON-ARCHIVED branches of one chat family for one owner.
+   *
+   * Cost: ONE query over the existing UserIdIndex (no scan, no new GSI). DynamoDB bills a GSI query by the
+   * items it reads, not by what survives the projection, so this reads the owner's whole index once, in
+   * 1 MB pages; a typical user has <1000 sessions (a handful of pages). `maxPages` bounds the worst case and
+   * `truncated` is exact: true only if a further matching branch exists beyond `maxBranches`, or `maxPages` stopped the walk with index left. The walk is newest-first, so a capped walk drops the OLDEST sessions.
+   * The root session itself is NOT returned here (the caller already loads it).
+   */
+  async getBranchFamilySessions(
+    userId: string,
+    rootSessionId: string,
+    opts: { maxBranches?: number; maxPages?: number } = {},
+  ): Promise<{ branches: BranchFamilyMember[]; truncated: boolean }> {
+    const maxBranches = opts.maxBranches ?? 49;
+    const maxPages = opts.maxPages ?? 20;
+    const branches: BranchFamilyMember[] = [];
+    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    for (let page = 0; page < maxPages; page++) {
+      const result = await dynamodb.query({
+        TableName: this.tableName,
+        IndexName: "UserIdIndex",
+        KeyConditionExpression: "userId = :userId",
+        ScanIndexForward: false, // newest first (like getUserSessions): a capped walk must keep the branches just made
+        ExpressionAttributeValues: { ":userId": userId },
+        ExpressionAttributeNames: { "#title": "title", "#archived": "archived" },
+        ProjectionExpression: "sessionId, userId, #title, llmModel, messageCount, updatedAt, createdAt, branchedFrom, #archived",
+        ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+      }).promise();
+      for (const item of (result.Items ?? []) as Array<ChatSession>) {
+        if (item.userId !== userId) continue; // defence in depth: never another owner's row
+        if (item.archived) continue; // includes a branch still being copied (born archived)
+        if (item.branchedFrom?.rootSessionId !== rootSessionId || item.sessionId === rootSessionId) continue;
+        branches.push({
+          sessionId: item.sessionId,
+          title: item.title,
+          llmModel: item.llmModel,
+          messageCount: item.messageCount ?? 0,
+          updatedAt: item.updatedAt,
+          createdAt: item.createdAt,
+          branchedFrom: item.branchedFrom,
+        });
+      }
+      // One match beyond the cap proves there is more; otherwise keep walking until the index is exhausted.
+      if (branches.length > maxBranches) return { branches: branches.slice(0, maxBranches), truncated: true };
+      lastKey = result.LastEvaluatedKey;
+      if (!lastKey) return { branches, truncated: false };
+    }
+    return { branches, truncated: true }; // page cap hit with LastEvaluatedKey still pending
   }
 
   /**
