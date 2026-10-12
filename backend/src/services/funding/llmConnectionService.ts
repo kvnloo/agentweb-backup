@@ -156,7 +156,15 @@ export class LlmConnectionService {
   async list(userId: string): Promise<{ connections: LlmConnectionView[]; canManage: boolean; inOrg: boolean }> {
     const access = await this.access(userId);
     const own = await this.deps.db.listByOwner(userId);
-    const shared = access.org ? await this.deps.db.listSharedWithOrg(access.org.orgId) : [];
+    // A revoked share, or one whose sharer has since left ownership, is already
+    // unusable (`usableBy` would refuse it) — leaving it in would show a "shared" key
+    // that silently fails the moment anyone tried to use it.
+    const shared: LlmConnectionRecord[] = [];
+    if (access.org) {
+      for (const record of await this.deps.db.listSharedWithOrg(access.org.orgId)) {
+        if (record.status !== "revoked" && (await this.sharerStillOwns(record, access.org))) shared.push(record);
+      }
+    }
     const seen = new Set(own.map((record) => record.connectionId));
     const all = [...own, ...shared.filter((record) => !seen.has(record.connectionId))];
     return {
@@ -174,11 +182,6 @@ export class LlmConnectionService {
     const apiKey = normalizeApiKey(input.apiKey);
     if (!apiKey) throw new LlmConnectionError("invalid_key_format");
     if (input.shareWithOrg && !access.org) throw new LlmConnectionError("not_in_org");
-
-    const existing = await this.deps.db.listByOwner(actor.userId);
-    if (existing.filter((record) => record.status !== "revoked").length >= MAX_ACTIVE_CONNECTIONS_PER_OWNER) {
-      throw new LlmConnectionError("limit_reached");
-    }
 
     const result = await this.deps.validateKey(input.provider, apiKey);
     if (result === "provider_unreachable") throw new LlmConnectionError("provider_unreachable");
@@ -207,7 +210,11 @@ export class LlmConnectionService {
       ...(input.shareWithOrg && access.org ? { orgId: access.org.orgId } : {}),
       ...(actor.adminId ? { addedByAdminId: actor.adminId } : {}),
     };
-    await this.deps.db.create(record);
+    // Checked and created in one transaction: a plain count-then-create has a window
+    // where concurrent adds each see a fresh count under the cap and all go through.
+    if (!(await this.deps.db.createWithinLimit(record, MAX_ACTIVE_CONNECTIONS_PER_OWNER))) {
+      throw new LlmConnectionError("limit_reached");
+    }
     return toView(record, actor.userId);
   }
 
@@ -226,7 +233,10 @@ export class LlmConnectionService {
     const own = record.ownerUserId === actor.userId;
     if (!own && !access.canManage) throw new LlmConnectionError("forbidden");
     // Already revoked is success: the caller wanted it gone and it is.
-    await this.deps.db.revoke(connectionId, { userId: actor.userId, adminId: actor.adminId }, this.deps.now());
+    const didRevoke = await this.deps.db.revoke(connectionId, { userId: actor.userId, adminId: actor.adminId }, this.deps.now());
+    // Only the call that actually revoked it owned that slot; a second revoke of an
+    // already-revoked connection must not release a slot that was already freed.
+    if (didRevoke) await this.deps.db.releaseSlot(record.ownerUserId);
   }
 
   async setShared(actor: Actor, connectionId: string, shared: boolean): Promise<LlmConnectionView> {
@@ -259,16 +269,26 @@ export class LlmConnectionService {
       provider: record.provider,
     });
     const result = await this.deps.validateKey(record.provider, apiKey);
+
+    // The provider round-trip can take seconds; re-read so a revoke that lands during
+    // it is never papered over by the record captured before the call started.
+    const current = await this.deps.db.get(connectionId);
+    if (!current || current.status === "revoked") throw new LlmConnectionError("not_found");
+
     // An unreachable provider says nothing about the key, so the stored status is left alone.
-    if (result === "provider_unreachable" || result === "unknown") return { result, connection: toView(record, actor.userId) };
+    if (result === "provider_unreachable" || result === "unknown") return { result, connection: toView(current, actor.userId) };
     const ok = keyCheckAccepted(result);
     // Out of quota is a state of the customer's provider account, not a bad key.
     const status = ok || result === "quota_exhausted" ? "active" : "invalid";
     const now = this.deps.now();
-    await this.deps.db.recordCheck(connectionId, { result, status, ok }, now);
+    // A revoke landing in this exact instant is still possible; recordCheck's own
+    // conditional write is the final word, not the re-read above.
+    if (!(await this.deps.db.recordCheck(connectionId, { result, status, ok }, now))) {
+      throw new LlmConnectionError("not_found");
+    }
     return {
       result,
-      connection: toView({ ...record, status, ...(ok ? { lastOkAt: now } : {}) }, actor.userId),
+      connection: toView({ ...current, status, ...(ok ? { lastOkAt: now } : {}) }, actor.userId),
     };
   }
 
@@ -279,9 +299,15 @@ export class LlmConnectionService {
   private async usableBy(record: LlmConnectionRecord, access: Access): Promise<boolean> {
     if (record.status !== "active" || !record.sealed) return false;
     if (record.ownerUserId === access.user.userId) return true;
-    if (!record.orgId || !access.org || access.org.orgId !== record.orgId) return false;
+    if (!access.org) return false;
+    return this.sharerStillOwns(record, access.org);
+  }
+
+  /** Whether the person who shared `record` with an org is still an owner of it. */
+  private async sharerStillOwns(record: LlmConnectionRecord, org: AuthzOrg): Promise<boolean> {
+    if (!record.orgId || record.orgId !== org.orgId) return false;
     const sharer = await this.deps.getUser(record.ownerUserId);
-    return !!sharer && sharer.orgId === record.orgId && isOrgOwner(sharer, access.org);
+    return !!sharer && sharer.orgId === org.orgId && isOrgOwner(sharer, org);
   }
 
   /** Connections this user's runs may spend, in the order to try them: own first, then the org's. */
