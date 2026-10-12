@@ -2689,7 +2689,15 @@ export default function AdminDashboard() {
         setUsers((prevUsers: User[]) =>
           prevUsers.map((user: User) =>
             user.userId === editingSlackChannelUserId
-              ? { ...user, slackChannels: response.data.slackChannels ?? [] }
+              ? {
+                  ...user,
+                  slackChannels: response.data.slackChannels ?? [],
+                  // Clearing an account's own channels can leave an organisation member on the
+                  // organisation's channel, so take the platform the server worked out.
+                  messagingPlatform: response.data.messagingPlatform ?? null,
+                  messagingPlatformSource: response.data.messagingPlatformSource ?? null,
+                  whatsappNumberMasked: response.data.whatsappNumberMasked ?? null,
+                }
               : user
           )
         );
