@@ -880,10 +880,20 @@ router.get("/users", async (req, res) => {
       const orgSlackCache = new Map<string, Promise<boolean>>();
       await Promise.all(
         sanitized.map(async (user: any) => {
-          const summary = await getPlatformSummary(fullRecordById.get(user.userId), orgSlackCache);
-          user.messagingPlatform = summary.platform;
-          user.messagingPlatformSource = summary.source;
-          user.whatsappNumberMasked = summary.whatsappNumberMasked;
+          // Each account settles on its own. One failing summary must not reject the whole
+          // batch and send the roster while other accounts' summaries are still pending,
+          // which would leave them without platform fields and shown as "Not connected".
+          try {
+            const summary = await getPlatformSummary(fullRecordById.get(user.userId), orgSlackCache);
+            user.messagingPlatform = summary.platform;
+            user.messagingPlatformSource = summary.source;
+            user.whatsappNumberMasked = summary.whatsappNumberMasked;
+          } catch (error) {
+            console.error(
+              `[admin/users] messaging platform lookup failed for user ${user.userId}; leaving it unset:`,
+              error instanceof Error ? error.message : error,
+            );
+          }
         }),
       );
     } catch (error) {
@@ -1413,6 +1423,11 @@ router.get("/slack/channel-info", async (req, res) => {
 router.delete("/users/:userId/whatsapp", async (req, res) => {
   try {
     const { userId } = req.params;
+    // User ids are UUIDs or numeric strings. Reject anything else as bad input rather than
+    // letting it reach the database and come back as "not found" or a server error.
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(userId)) {
+      return res.status(400).json({ message: "Invalid user id." });
+    }
     const adminId = (req as any).user?.userId || 'unknown-admin';
     const { disconnectWhatsApp } = await import('../services/whatsappVerificationService');
 
@@ -1441,7 +1456,29 @@ router.delete("/users/:userId/whatsapp", async (req, res) => {
       /* window closed, opted out, or Meta unavailable */
     }
 
-    res.json({ success: true, customerNotified });
+    // The platform the account is on NOW. Removing WhatsApp can leave an account on Slack —
+    // an organisation member inherits the organisation's channel — so the dashboard must
+    // show what is true rather than assume "not connected".
+    let summary: { platform: string | null; source: string | null; whatsappNumberMasked: string | null } = {
+      platform: null,
+      source: null,
+      whatsappNumberMasked: null,
+    };
+    try {
+      const { getPlatformSummary } = await import('../services/customerChannelPolicy');
+      const { userDb } = await import('../services/db');
+      summary = await getPlatformSummary(await userDb.getUserById(userId));
+    } catch (error) {
+      console.error('[admin] could not recalculate the platform after disconnecting WhatsApp:', error);
+    }
+
+    res.json({
+      success: true,
+      customerNotified,
+      messagingPlatform: summary.platform,
+      messagingPlatformSource: summary.source,
+      whatsappNumberMasked: summary.whatsappNumberMasked,
+    });
   } catch (error: any) {
     console.error("Error disconnecting WhatsApp:", error?.message || error);
     res.status(500).json({ message: "Failed to disconnect WhatsApp" });

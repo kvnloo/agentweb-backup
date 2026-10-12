@@ -107,7 +107,12 @@ async function greetOncePerCooldown(phone: string): Promise<void> {
   );
 }
 
-async function forwardToTeam(phone: string, text: string, messageType: string): Promise<void> {
+async function forwardToTeam(
+  phone: string,
+  text: string,
+  messageType: string,
+  mediaDetail: string,
+): Promise<void> {
   const inbox = await supportInbox();
   if (!inbox) return;
 
@@ -131,6 +136,10 @@ async function forwardToTeam(phone: string, text: string, messageType: string): 
   }
 
   const body = text.trim() || `[${messageType} message — no text]`;
+  // Media is not attached to the email, so say what it is and where to find it.
+  const attachment = mediaDetail
+    ? `Attachment: ${mediaDetail}. The file is not attached to this email; open the conversation in WhatsApp Manager to view it.`
+    : '';
   const { emailService } = await import('./emailService');
   // sendEmail is best-effort and never throws: it RETURNS 'failed'. Catching around it, as
   // an earlier version did, meant a failed forward was completely silent.
@@ -141,9 +150,10 @@ async function forwardToTeam(phone: string, text: string, messageType: string): 
     // must not reach application logs (CWE-532). The team still gets the full number
     // where they need it — inside the message.
     `WhatsApp message from ${redactPhone(phone)}`,
-    `From: ${phone}\nAccount: ${account}\n\n${body}`,
+    `From: ${phone}\nAccount: ${account}\n\n${body}${attachment ? `\n\n${attachment}` : ''}`,
     `<p><strong>From:</strong> ${escapeHtml(phone)}<br><strong>Account:</strong> ${escapeHtml(account)}</p>` +
-      `<blockquote>${escapeHtml(body).replace(/\n/g, '<br>')}</blockquote>`,
+      `<blockquote>${escapeHtml(body).replace(/\n/g, '<br>')}</blockquote>` +
+      (attachment ? `<p>${escapeHtml(attachment)}</p>` : ''),
   );
 
   if (outcome === 'failed') {
@@ -164,11 +174,12 @@ export async function handleUnrecognizedMessage(
   phone: string,
   text: string,
   messageType: string = 'text',
+  mediaDetail: string = '',
 ): Promise<void> {
   // A reaction or a delivery artefact is not someone asking for help.
   if (!['text', 'image', 'document', 'audio', 'video'].includes(messageType)) return;
 
-  await forwardToTeam(phone, text, messageType).catch((e) =>
+  await forwardToTeam(phone, text, messageType, mediaDetail).catch((e) =>
     console.warn(
       `[whatsapp-support] forwarding a message from ${redactPhone(phone)} failed:`,
       e instanceof Error ? e.message : e,

@@ -2727,7 +2727,14 @@ export default function AdminDashboard() {
         setUsers((prevUsers: User[]) =>
           prevUsers.map((user: User) =>
             user.userId === userId
-              ? { ...user, messagingPlatform: null, messagingPlatformSource: null, whatsappNumberMasked: null }
+              // The server says what the account is on now. Removing WhatsApp can leave a member
+              // of an organisation on the organisation's Slack channel, not on nothing.
+              ? {
+                  ...user,
+                  messagingPlatform: response.data?.messagingPlatform ?? null,
+                  messagingPlatformSource: response.data?.messagingPlatformSource ?? null,
+                  whatsappNumberMasked: response.data?.whatsappNumberMasked ?? null,
+                }
               : user
           )
         );

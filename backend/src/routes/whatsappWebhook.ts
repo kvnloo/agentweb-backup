@@ -170,6 +170,28 @@ function readButtonTap(
   return null;
 }
 
+/**
+ * What a media message carries that the team needs to act on it: its caption, and enough
+ * to find the file (its type, filename and Meta's media id). The file itself is not
+ * fetched or attached — downloading needs the Graph token and would put customer media in
+ * email — so the hand-off says where to look instead of just "[image message]".
+ */
+const MEDIA_KINDS = new Set(['image', 'document', 'audio', 'video']);
+
+function readMediaDetails(message: any): { caption: string; detail: string } {
+  const kind = message?.type;
+  // Text messages also carry an object under their own type (`text: { body }`), so the
+  // kind has to be a media one — otherwise plain text is described as an attachment.
+  if (typeof kind !== 'string' || !MEDIA_KINDS.has(kind)) return { caption: '', detail: '' };
+  const media = message?.[kind];
+  if (!media || typeof media !== 'object') return { caption: '', detail: '' };
+  const caption = typeof media.caption === 'string' ? media.caption : '';
+  const parts: string[] = [String(kind)];
+  if (typeof media.filename === 'string' && media.filename) parts.push(`file "${media.filename}"`);
+  if (typeof media.id === 'string' && media.id) parts.push(`media id ${media.id}`);
+  return { caption, detail: parts.join(', ') };
+}
+
 async function handleInboundMessage(message: any): Promise<void> {
   const from = message?.from;
   if (typeof from !== 'string' || !from) return;
@@ -224,7 +246,8 @@ async function handleInboundMessage(message: any): Promise<void> {
     if (!wasVerification) {
       // Not a command at all. Greet, and pass the message to the team — a fixed reply
       // and an email, never a model, so this stays a support hand-off and not a chat.
-      await handleUnrecognizedMessage(phone, text, message?.type ?? 'text');
+      const media = readMediaDetails(message);
+      await handleUnrecognizedMessage(phone, text || media.caption, message?.type ?? 'text', media.detail);
     }
   }
 }
