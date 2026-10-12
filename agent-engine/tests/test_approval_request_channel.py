@@ -161,6 +161,17 @@ class MonitorWiringTest(unittest.TestCase):
         self.assertIn("should_hold_results_for_approval(requires_approval, slack_channel, approval_outcome_without_slack)", src)
         self.assertNotIn("approval_sent_without_slack", src)
 
+    def test_never_assumes_an_approval_was_sent(self):
+        # The email-friendly revision only posts its own approval when the execution has a
+        # Slack channel. Assuming it asked for everyone else held results with no approval
+        # request in existence and nobody able to release them.
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "task_monitor.py")
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        # An ASSIGNMENT of APPROVAL_SENT (not the comparison `== APPROVAL_SENT`) would mean the
+        # monitor decided an approval existed without asking.
+        self.assertIsNone(re.search(r"(?<![=!<>])=\s*APPROVAL_SENT\b", src))
+
 
 if __name__ == "__main__":
     unittest.main()
