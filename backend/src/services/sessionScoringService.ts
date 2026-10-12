@@ -38,7 +38,13 @@ function serializeMessagesForScoring(messages: ChatMessage[]): string {
     if (m.role === "system") continue;
 
     if (m.role === "user") {
-      const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      // `m.content` is `undefined` on some persisted messages (not `null`, not `""`) —
+      // JSON.stringify(undefined) returns the JS value `undefined`, not the string
+      // "undefined", so the bare ternary silently produced literal "undefined" text here
+      // and threw TypeError on .trim()/.length below. Found via three outcome-judge
+      // replays (ENG-2356, ENG-2138, ENG-2380) that all lost the same ~40 of 138 sampled
+      // sessions to this exact crash, undercounting the AUC/share-at-5 denominator.
+      const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "");
       lines.push(`user: ${text}`);
 
     } else if (m.role === "assistant") {
@@ -48,7 +54,7 @@ function serializeMessagesForScoring(messages: ChatMessage[]): string {
       // interactive run that crashed and the user retried in the same session), the
       // judge would otherwise read the note verbatim and score against it (ENG-479).
       if (isRunFailurePlaceholder(m)) continue;
-      const text = (typeof m.content === "string" ? m.content : JSON.stringify(m.content)).trim();
+      const text = (typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")).trim();
       const toolCalls: Array<{ name: string; arguments?: any }> = (m as any).metadata?.toolCalls || [];
 
       if (text && toolCalls.length > 0) {
@@ -65,7 +71,7 @@ function serializeMessagesForScoring(messages: ChatMessage[]): string {
 
     } else if (m.role === "tool") {
       const name = (m as any).name || "tool";
-      const raw = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      const raw = typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "");
       const preview = raw.length > MAX_TOOL_CONTENT_FOR_SCORING
         ? raw.slice(0, MAX_TOOL_CONTENT_FOR_SCORING) + "…"
         : raw;
