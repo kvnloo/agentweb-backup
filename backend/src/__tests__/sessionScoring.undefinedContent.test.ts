@@ -71,6 +71,8 @@ describe('serializeMessagesForScoring: content is undefined, not an empty string
     const result = await scoreSession(messages, messages.length);
 
     expect(result.score).toBe(4);
+    expect(promptTextOf()).toContain('assistant: [called tools: search_web]');
+    expect(promptTextOf()).not.toContain('""');
   });
 
   it('an assistant turn with content undefined and no tool calls is skipped, not rendered as "undefined"', async () => {
@@ -126,6 +128,42 @@ describe('serializeMessagesForScoring: content is undefined, not an empty string
 
     expect(promptTextOf()).toContain('user: \n');
     expect(promptTextOf()).not.toContain('null');
+  });
+
+  it('non-string, non-null content (content blocks, objects) is still JSON-stringified exactly as before', async () => {
+    const blocks = [{ type: 'text', text: 'hi' }];
+    const messages: ChatMessage[] = [
+      { role: 'user', content: blocks as any },
+      { role: 'assistant', content: { note: 'structured' } as any },
+      { role: 'tool', content: { ok: true } as any, name: 'search_web' } as any,
+    ];
+
+    await scoreSessionWithJudge(messages, messages.length, judge);
+
+    expect(promptTextOf()).toContain(`user: ${JSON.stringify(blocks)}`);
+    expect(promptTextOf()).toContain('assistant: {"note":"structured"}');
+    expect(promptTextOf()).toContain('tool result (search_web): {"ok":true}');
+  });
+
+  it('an empty-string assistant turn and an undefined one render identically (both skipped)', async () => {
+    const withEmpty: ChatMessage[] = [
+      { role: 'user', content: 'Go.' },
+      { role: 'assistant', content: '' },
+      { role: 'assistant', content: 'Done.' },
+    ];
+    const withUndefined: ChatMessage[] = [
+      { role: 'user', content: 'Go.' },
+      { role: 'assistant', content: undefined as any },
+      { role: 'assistant', content: 'Done.' },
+    ];
+
+    await scoreSessionWithJudge(withEmpty, withEmpty.length, judge);
+    const emptyPrompt = promptTextOf();
+    mockCallLLM.mockClear();
+    mockCallLLM.mockResolvedValue(llmWith(JSON.stringify({ score: 4, reason: 'fine' })));
+    await scoreSessionWithJudge(withUndefined, withUndefined.length, judge);
+
+    expect(promptTextOf()).toBe(emptyPrompt);
   });
 
   it('string content still works exactly as before (no regression)', async () => {
