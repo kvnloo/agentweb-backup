@@ -10,7 +10,7 @@ const mockDb = { createCharacter: jest.fn(), getCharacterById: jest.fn(), delete
 jest.mock('../../services/characterDb', () => ({ characterDb: mockDb }));
 jest.mock('../../utils/s3Utils', () => ({ uploadFileToS3: jest.fn() }));
 
-import router from '../characters';
+import router, { isOwnUploadKey } from '../characters';
 
 const app = express();
 app.use(express.json());
@@ -28,6 +28,11 @@ describe('ENG-2408 character reference image key scoping', () => {
     const r = await request(app).post('/api/characters').send(body(OWN));
     expect(r.status).toBe(201);
     expect(mockDb.createCharacter).toHaveBeenCalledWith('u1', expect.objectContaining({ referenceImageKey: OWN }));
+  });
+
+  it('accepts own keys whose filename contains two dots (Opslane P2)', () => {
+    expect(isOwnUploadKey('users/u1/files/photo..final.png', 'u1')).toBe(true);
+    expect(isOwnUploadKey('users/u1/files/./x', 'u1')).toBe(false);
   });
 
   it.each([FOREIGN, 'users/u1/files/../../u2/files/x', 'users/u10/files/x', 'other/key'])('rejects foreign key %s on create', async (key) => {

@@ -19,7 +19,9 @@ router.use(authenticateToken);
 export function isOwnUploadKey(key: unknown, userId: string): key is string {
   if (typeof key !== 'string' || !userId) return false;
   const prefix = `users/${userId}/files/`;
-  return key.startsWith(prefix) && !key.includes('..') && key.length > prefix.length;
+  if (!key.startsWith(prefix) || key.length <= prefix.length) return false;
+  // Reject traversal segments only; filenames containing '..' (e.g. a..b.png) are legitimate.
+  return !key.split(/[\\/]/).some((seg) => seg === '..' || seg === '.');
 }
 
 // GET /api/characters — list all characters for the authenticated user
