@@ -47,7 +47,7 @@ const ADMIN_TOOLS = ['get_pr_digest'];
 const ALLOWED_SESSION_KEYS = new Set([
   'sessionId', 'userId', 'title', 'createdAt', 'updatedAt', 'adminListPartition', 'portalType',
   'pageIdentifier', 'selectedStartupId', 'sessionType', 'delegateInfo', 'associatedSkills',
-  'llmModel', 'llmUsagePolicyDecision', 'messageCount', 'messages',
+  'llmModel', 'llmUsagePolicyDecision', 'messageCount', 'messages', 'branchedFrom',
 ]);
 
 // Every session-level field the source carries that must NOT reach a branch.
@@ -479,6 +479,53 @@ describe('branch titles', () => {
     seedSource({ title: '(branch) notes' });
     const out = await run({ messageIndex: 4 });
     expect((out.body as any).title).toBe('(branch) notes (branch)');
+  });
+});
+
+describe('ENG-112 branchedFrom (session-level family link)', () => {
+  const NOW_ISO = '2026-10-08T12:00:00.000Z';
+
+  it('is written on a branch: sessionId = source, rootSessionId = source (not itself a branch), raw index, ISO time', async () => {
+    seedSource();
+    const out = await run({ messageIndex: 8 });
+    const item = mockFake.session((out.body as any).sessionId)!;
+    expect(item.branchedFrom).toEqual({ sessionId: SRC, rootSessionId: SRC, messageIndex: 8, branchedAt: NOW_ISO });
+    // the source is untouched: it never gains a link
+    expect(mockFake.session(SRC)!.branchedFrom).toBeUndefined();
+  });
+
+  it('a branch of a branch keeps the ORIGINAL root while sessionId is the immediate source', async () => {
+    seedSource();
+    const first = (await run({ messageIndex: 8 })).body as any;
+    const second = (await run({ messageIndex: 4 }, { sessionId: first.sessionId })).body as any;
+    expect(mockFake.session(second.sessionId)!.branchedFrom).toEqual({
+      sessionId: first.sessionId, rootSessionId: SRC, messageIndex: 4, branchedAt: NOW_ISO,
+    });
+  });
+
+  it('is never copied from the source: a new branch computes its own', async () => {
+    seedSource({ branchedFrom: { sessionId: 'some-parent', rootSessionId: 'some-root', messageIndex: 99, branchedAt: '2020-01-01T00:00:00.000Z' } });
+    const out = await run({ messageIndex: 8 });
+    expect(mockFake.session((out.body as any).sessionId)!.branchedFrom).toEqual({
+      sessionId: SRC, rootSessionId: 'some-root', messageIndex: 8, branchedAt: NOW_ISO,
+    });
+  });
+
+  it.each([[{ sessionId: 'p', rootSessionId: 7 }], [{ sessionId: 'p' }], ['garbage']])('a malformed source link %j falls back to the source as root', async (bad) => {
+    seedSource({ branchedFrom: bad });
+    const out = await run({ messageIndex: 8 });
+    expect(mockFake.session((out.body as any).sessionId)!.branchedFrom?.rootSessionId).toBe(SRC);
+  });
+
+  it('the hidden (born archived) branch already carries the link, so an orphan can be recognised and excluded', async () => {
+    seedSource();
+    let seenAtCreate: any;
+    const base = makeDeps();
+    await run({ messageIndex: 8 }, {}, makeDeps({
+      createSession: async (a) => { const s = await base.createSession(a); seenAtCreate = mockFake.session(s.sessionId); return s; },
+    }));
+    expect(seenAtCreate.archived).toBe(true);
+    expect(seenAtCreate.branchedFrom.rootSessionId).toBe(SRC);
   });
 });
 

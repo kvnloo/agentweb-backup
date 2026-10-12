@@ -158,3 +158,19 @@ export function redactAdminActivity(messages: any[], opts: AdminRedactionOptions
     return true;
   });
 }
+
+/**
+ * Owner-only attribute: remove `branchedFrom` from a session-level object before it is shown to anyone but
+ * the owner's own portal (MCP tools and any other external view). Works on one session or `{sessions: []}`.
+ */
+export function omitBranchedFrom<T>(value: T): T {
+  if (!value || typeof value !== 'object') return value;
+  const strip = (s: any) => {
+    if (!s || typeof s !== 'object' || !('branchedFrom' in s)) return s;
+    const { branchedFrom: _b, ...rest } = s;
+    return rest;
+  };
+  const v: any = value;
+  if (Array.isArray(v.sessions)) return { ...strip(v), sessions: v.sessions.map(strip) } as T;
+  return strip(v) as T;
+}

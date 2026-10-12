@@ -30,9 +30,13 @@ import {
 import {
   BranchDeps,
   branchChatSession,
+  listBranchFamily,
   CHAT_BRANCHING_ENABLED_SETTING,
   CHAT_BRANCHING_MAX_PER_HOUR_SETTING,
   DEFAULT_MAX_BRANCHES_PER_HOUR,
+  BRANCH_FAMILY_MAX_PER_MINUTE_SETTING,
+  DEFAULT_BRANCH_FAMILY_MAX_PER_MINUTE,
+  parseBranchFamilyRateLimit,
   isChatBranchingSettingEnabled,
   parseBranchRateLimit,
 } from '../services/agentMode/chatBranching';
@@ -75,6 +79,25 @@ export async function getChatBranchingMaxPerHour(now: number = Date.now()): Prom
     rateSettingCache = { value: rateSettingCache?.value ?? DEFAULT_MAX_BRANCHES_PER_HOUR, at: now };
   }
   return rateSettingCache.value;
+}
+
+let lookupSettingCache: { value: number; at: number } | undefined;
+
+export function __resetBranchLookupCacheForTests(): void {
+  lookupSettingCache = undefined;
+}
+
+/** Per-user family lookups per minute, AW-Settings `branch_family_max_per_minute`. Cached ~60s, last-known fallback; 0 = unlimited. */
+export async function getBranchFamilyMaxPerMinute(now: number = Date.now()): Promise<number> {
+  if (lookupSettingCache && now - lookupSettingCache.at < RATE_SETTING_CACHE_MS) return lookupSettingCache.value;
+  try {
+    const setting = await settingsService.getSetting(BRANCH_FAMILY_MAX_PER_MINUTE_SETTING);
+    lookupSettingCache = { value: parseBranchFamilyRateLimit(setting?.settingValue), at: now };
+  } catch (error) {
+    console.error('ChatBranching: failed to read the lookup-limit setting; using the last known value:', error);
+    lookupSettingCache = { value: lookupSettingCache?.value ?? DEFAULT_BRANCH_FAMILY_MAX_PER_MINUTE, at: now };
+  }
+  return lookupSettingCache.value;
 }
 
 function branchDeps(): BranchDeps {
@@ -141,6 +164,22 @@ export async function branchSessionHandler(req: AuthenticatedRequest, res: Respo
       ? { delegateInfo: { adminUserId: req.delegateInfo.adminUserId, adminEmail: req.delegateInfo.adminEmail, isDelegated: true } }
       : {}),
   });
+  res.set('Cache-Control', 'no-store');
+  return res.status(outcome.status).json(outcome.body);
+}
+
+export async function listBranchesHandler(req: AuthenticatedRequest, res: Response): Promise<Response> {
+  const outcome = await listBranchFamily(
+    {
+      isAcceptingWork: isCronEnabled,
+      isFeatureEnabled: isChatBranchingEnabled,
+      // Record only: authorisation must not read or migrate a (possibly foreign) session's messages.
+      getSession: (sessionId) => chatbotDb.getChatSessionRecord(sessionId),
+      listBranches: (userId, rootSessionId, opts) => chatbotDb.getBranchFamilySessions(userId, rootSessionId, opts),
+      getMaxLookupsPerMinute: () => getBranchFamilyMaxPerMinute(),
+    },
+    { user: { userId: req.user.userId, isAdmin: req.user.isAdmin === true }, sessionId: req.params.sessionId },
+  );
   res.set('Cache-Control', 'no-store');
   return res.status(outcome.status).json(outcome.body);
 }
