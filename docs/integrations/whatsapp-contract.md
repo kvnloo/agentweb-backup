@@ -219,8 +219,21 @@ Rules:
   **`502 delivery_failed` when it has a channel and the send failed** — the task engine
   carries on past the first but must hold its output for the second, as it does when a
   Slack send fails.
+- A caller may only request approval for an asset, and point at an execution, that is
+  theirs: `assetUrl` is the approvals table's primary key and the record is written with a
+  put, so without the check a caller could replace — and, on a failed WhatsApp send, delete —
+  another account's approval, or have approving email another account's subscribers. It is
+  enforced on `POST /api/approval-requests` for everyone (`403 forbidden`) and for any
+  WhatsApp customer through `requestApproval`. The legacy `POST /api/slack/send-approval`
+  has the same exposure for a Slack customer and is left unchanged here, deliberately: who
+  may re-request an approval there is part of flows that were not traced for this change.
+- If the account cannot be read and no Slack channel was supplied, the request fails closed
+  (`502 delivery_failed`) rather than being reported as `no_channel`, so a transient read
+  failure holds a reachable customer's output instead of releasing it.
 - Admins see the platform (WhatsApp number masked to four digits) on each customer row
-  and can disconnect WhatsApp on a customer's behalf.
+  and can disconnect WhatsApp on a customer's behalf. Saving or clearing Slack channels
+  and disconnecting WhatsApp both return the recalculated platform, so the dashboard shows
+  an organisation member as Slack-via-organisation rather than "not connected".
 
 ## Approval Taps
 
