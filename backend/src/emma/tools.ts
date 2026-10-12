@@ -6020,7 +6020,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    const result = await miscImpl.readFileContent(args.file_url);
+    const result = await miscImpl.readFileContent(args.file_url, { userId: context?.userId || context?.agentUserId });
     if (result.success === false) {
       return {
         content: [
@@ -6070,7 +6070,7 @@ emmaToolRegistry.register({
     }
 
     // Default: read raw HTML
-    const result = await miscImpl.readFileContent(args.url);
+    const result = await miscImpl.readFileContent(args.url, { userId: context?.userId || context?.agentUserId });
     if (result.success === false) {
       return {
         content: [
