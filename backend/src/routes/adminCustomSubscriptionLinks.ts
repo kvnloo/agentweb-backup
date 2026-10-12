@@ -109,7 +109,6 @@ router.post(
       console.error("[adminCustomSubscriptionLinks] failed to create custom link:", error);
       return res.status(502).json({
         message: "Failed to create custom subscription link",
-        error: error instanceof Error ? error.message : "Unknown error",
       });
     }
   }
