@@ -75,11 +75,19 @@ export const SUBSCRIPTION_FEATURES = {
  * instrumentation with zero behaviour change, specifically to answer whether these paths fire in
  * production before anyone changed what they return — "we have never had a problem" was not
  * evidence, since a silent over-grant looks identical to normal operation from the outside. 14
- * days of production logs (through 2026-10-12) showed `wildcard-grant` firing only from one
- * internal verification account, never from real customer traffic, and `unconfirmed-tier` firing
- * once for a real user — the "effectively never fires" case the parked fail-closed branch's own
- * decision record called the free-win trigger. This change is that cherry-pick, re-ported onto
- * current main (the original branch was ~2970 commits stale).
+ * days of production logs (through 2026-10-12) showed the over-grant path (then still called
+ * `wildcard-grant`, PR #2947's name for it) firing only from one internal verification account,
+ * never from real customer traffic, and `unconfirmed-tier` firing once for a real user — the
+ * "effectively never fires" case the parked fail-closed branch's own decision record called the
+ * free-win trigger. This change is that cherry-pick, re-ported onto current main (the original
+ * branch was ~2970 commits stale).
+ *
+ * Renamed `wildcard-grant` -> `entitlement-denied` here, same flip as the behaviour: the old name
+ * described what the path USED to do (grant everything); after this change it denies. Keeping the
+ * old name would have made a dashboard built on "WILDCARD-GRANT count" silently start meaning the
+ * opposite of what it meant when PR #2947 shipped it, with no signal that the meaning had flipped.
+ * Any saved grep/dashboard against the literal string `WILDCARD-GRANT` breaks here, on purpose —
+ * update it to `ENTITLEMENT-DENIED`.
  *
  * Sink is injectable so this can be routed at a real alerting surface without this module
  * reaching for one (same shape as usageWriteFailureMonitor's `setDroppedWriteAlertSink`). There
@@ -88,7 +96,7 @@ export const SUBSCRIPTION_FEATURES = {
 /**
  * Two DISTINCT kinds, deliberately not summable:
  *
- *  - `wildcard-grant`   a case that used to silently grant every registered tool now instead
+ *  - `entitlement-denied` a case that used to silently grant every registered tool now instead
  *                       fails CLOSED (ENG-1978) — this is the number that answers "how often
  *                       does the fail-closed gate actually fire, now that it's live?"
  *  - `unconfirmed-tier` the tier could not be CONFIRMED for this user, but the grant that
@@ -99,12 +107,12 @@ export const SUBSCRIPTION_FEATURES = {
  * highest-volume reason, and it frequently accompanies a *restricted* result — an unreadable
  * user row still resolves to a real Free tier with a real skill list. Counting those as
  * over-grants would oversize the risk and argue against the fail-closed change on false
- * evidence, which is the opposite of what this instrumentation is for. Pre-flip (PR #2947),
- * `wildcard-grant` measured over-grant risk; post-flip it measures how often the gate denies.
+ * evidence, which is the opposite of what this instrumentation is for. Pre-flip (PR #2947, as
+ * `wildcard-grant`) this counted over-grants; post-flip (`entitlement-denied`) it counts denials.
  */
-// Round-2 review: grep both markers, not just WILDCARD-GRANT, and break down by `kind` — do not
+// Round-2 review: grep both markers, not just ENTITLEMENT-DENIED, and break down by `kind` — do not
 // sum them. `[entitlement]` is the shared prefix precisely so one grep catches both.
-export type EntitlementObservationKind = "wildcard-grant" | "unconfirmed-tier";
+export type EntitlementObservationKind = "entitlement-denied" | "unconfirmed-tier";
 
 export interface EntitlementObservationEvent {
   kind: EntitlementObservationKind;
@@ -113,33 +121,33 @@ export interface EntitlementObservationEvent {
   detail: Record<string, unknown>;
 }
 
-export type WildcardGrantSink = (event: EntitlementObservationEvent) => void;
+export type EntitlementDeniedSink = (event: EntitlementObservationEvent) => void;
 
-const DEFAULT_ENTITLEMENT_SINK: WildcardGrantSink = (event) => {
+const DEFAULT_ENTITLEMENT_SINK: EntitlementDeniedSink = (event) => {
   // Both markers share the `[entitlement]` prefix on purpose — `grep '\[entitlement\]'` catches
   // both kinds; then break down by the `kind` field in each JSON line rather than summing them.
-  // ENG-1978 fail-closed: WILDCARD-GRANT no longer grants anything — the marker name (and the
-  // `reason` strings at each call site) is kept stable for grep/dashboard continuity with the
-  // PR #2947 telemetry this instrumentation shipped as; only the message text changed to stop
-  // describing a grant that no longer happens.
+  // ENG-1978 fail-closed: this marker was WILDCARD-GRANT under PR #2947 (observation only, meant
+  // "granted everything"). Renamed to ENTITLEMENT-DENIED because the behaviour it describes
+  // flipped — keeping the old name would have left a grep/dashboard built against "WILDCARD-GRANT"
+  // silently reporting the opposite of what it used to mean, with nothing to signal the flip.
   const marker =
-    event.kind === "wildcard-grant"
-      ? "[entitlement] WILDCARD-GRANT failing closed, denying tools for an unconfirmed entitlement:"
+    event.kind === "entitlement-denied"
+      ? "[entitlement] ENTITLEMENT-DENIED entitlement unresolved, withholding tools:"
       : "[entitlement] UNCONFIRMED-TIER entitlement resolved from an unconfirmed tier:";
   console.warn(marker, JSON.stringify(event));
 };
 
-let emitWildcardGrant: WildcardGrantSink = DEFAULT_ENTITLEMENT_SINK;
+let emitEntitlementDenied: EntitlementDeniedSink = DEFAULT_ENTITLEMENT_SINK;
 
 /** Route entitlement observations somewhere other than the console (tests, alerting). */
-export function setWildcardGrantSink(sink: WildcardGrantSink): void {
-  emitWildcardGrant = sink;
+export function setEntitlementDeniedSink(sink: EntitlementDeniedSink): void {
+  emitEntitlementDenied = sink;
 }
 
 /** Restore the console sink. Tests must call this rather than installing a silent stub, or every
  *  test declared after theirs runs with observation disabled. */
-export function resetWildcardGrantSink(): void {
-  emitWildcardGrant = DEFAULT_ENTITLEMENT_SINK;
+export function resetEntitlementDeniedSink(): void {
+  emitEntitlementDenied = DEFAULT_ENTITLEMENT_SINK;
   unconfirmedTierWindow = null;
 }
 
@@ -150,7 +158,7 @@ function emitEntitlementObservation(event: EntitlementObservationEvent): void {
     // catch entirely — surfacing as an unhandled rejection, which under Node's default in EB
     // terminates the process. Observation must never be the reason the SERVER fails, not just
     // the reason a check fails.
-    void Promise.resolve(emitWildcardGrant(event)).catch(() => {});
+    void Promise.resolve(emitEntitlementDenied(event)).catch(() => {});
   } catch {
     // A synchronous throw from the sink.
   }
@@ -168,7 +176,7 @@ function emitEntitlementObservation(event: EntitlementObservationEvent): void {
  * those caps: "the app fix removes the source; these bound the blast radius regardless" — i.e.
  * the house rule is fix the source, not lean on the caps.
  *
- * `wildcard-grant` stays per-event: it is low-volume by construction (a genuine full-registry
+ * `entitlement-denied` stays per-event: it is low-volume by construction (a genuine full-registry
  * grant, not a routine unresolved lookup) and per-user attribution is load-bearing there — the
  * PR's whole point is knowing whether an over-grant hit one user or four hundred.
  */
@@ -250,12 +258,12 @@ function reportUnconfirmedTier(
 
 /** Every registered tool was just granted because something could not be resolved. Per-event,
  *  not windowed — see the comment on UNCONFIRMED_TIER_WINDOW_MS for why the two kinds differ. */
-function reportWildcardGrant(
+function reportEntitlementDenied(
   reason: string,
   userId: string,
   detail: Record<string, unknown> = {}
 ): void {
-  emitEntitlementObservation({ kind: "wildcard-grant", reason, userId, detail });
+  emitEntitlementObservation({ kind: "entitlement-denied", reason, userId, detail });
 }
 
 export type SubscriptionFeatureId = typeof SUBSCRIPTION_FEATURES[keyof typeof SUBSCRIPTION_FEATURES];
@@ -606,7 +614,7 @@ export async function getAllowedSkills(userId: string): Promise<string[] | null>
     // org-lookup blip) still carry a real, usable tier — the subscriptionTypeName below. Denying
     // on the flag would strip every tool from a paying org member during a routine blip, strictly
     // worse than the downgrade this function's own comment above exists to prevent. Record it as
-    // an unconfirmed tier (not a wildcard-grant: the assumed tier below is frequently real and
+    // an unconfirmed tier (not an entitlement-denied: the assumed tier below is frequently real and
     // restricted) and keep going with the assumed name.
     const { subscriptionType: subscriptionTypeName, resolved } =
       await getUserSubscriptionResolution(userId);
@@ -623,7 +631,7 @@ export async function getAllowedSkills(userId: string): Promise<string[] | null>
       // unknown tier name, a malformed `subscription_types` setting, or a failed read — none of
       // which is evidence that this user is entitled to everything. Callers distinguish null
       // (couldn't resolve) from [] (resolved: no skills); see the doc comment above.
-      reportWildcardGrant("subscription-type-config-unavailable", userId, {
+      reportEntitlementDenied("subscription-type-config-unavailable", userId, {
         subscriptionTypeName,
       });
       return null;
@@ -643,7 +651,7 @@ export async function getAllowedSkills(userId: string): Promise<string[] | null>
           subscriptionTypeName === "Basic"
             ? "legacy-basic-fallback-no-tier-config"
             : "tier-config-missing-allowed-skills";
-        reportWildcardGrant(reason, userId, { subscriptionTypeName });
+        reportEntitlementDenied(reason, userId, { subscriptionTypeName });
         return null;
       }
       return ["*"];
@@ -662,7 +670,7 @@ export async function getAllowedSkills(userId: string): Promise<string[] | null>
     // (agentModeService.getFilteredTools: "DO NOT return all tools on error as it's a security
     // risk"). Returning ["*"] here silently defeated that.
     console.error("Error getting allowed skills:", error);
-    reportWildcardGrant("allowed-skills-lookup-failed", userId, {
+    reportEntitlementDenied("allowed-skills-lookup-failed", userId, {
       error: error?.message || String(error),
     });
     return null;
@@ -711,7 +719,7 @@ export async function resolveSkillsToToolNames(
     // Fail closed (ENG-1978). getPublishedSkills rethrows on a DynamoDB error, and converting that
     // into ["*"] granted every registered tool on a transient blip.
     console.error("Error resolving skills to tool names:", error);
-    reportWildcardGrant("skill-to-tool-resolution-failed", userIdForObservation || "(unattributed)", {
+    reportEntitlementDenied("skill-to-tool-resolution-failed", userIdForObservation || "(unattributed)", {
       skillIds,
       error: error?.message || String(error),
     });
@@ -827,7 +835,7 @@ export async function getAllowedFunctionCalls(
     // kept so a future change that makes either call throw cannot silently reintroduce a
     // grant-all, but do not mistake it for a tested path.
     console.error("Error getting allowed function calls:", error);
-    reportWildcardGrant("allowed-function-calls-failed", userId, {
+    reportEntitlementDenied("allowed-function-calls-failed", userId, {
       error: error?.message || String(error),
     });
     return null;

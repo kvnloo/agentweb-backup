@@ -19,8 +19,8 @@ import {
   findTiersAllowingSkill,
   getAllowedFeatures,
   isSubscriptionFeatureEnabled,
-  setWildcardGrantSink,
-  resetWildcardGrantSink,
+  setEntitlementDeniedSink,
+  resetEntitlementDeniedSink,
   flushUnconfirmedTierObservations,
 } from '../services/subscriptionService';
 
@@ -564,16 +564,17 @@ describe('subscriptionService', () => {
 
   /*
    * ENG-1978 fail-closed. These assert that a case which used to silently grant everything now
-   * returns null and is still recorded under the same wildcard-grant telemetry PR #2947 shipped.
+   * returns null and is recorded under `entitlement-denied` — PR #2947 shipped this same
+   * instrumentation as `wildcard-grant`; renamed here because the behaviour it describes flipped.
    */
-  describe('wildcard-grant fail-closed (ENG-1978)', () => {
-    // resetWildcardGrantSink, not a silent stub: installing `() => {}` here would leave every
+  describe('entitlement-denied fail-closed (ENG-1978)', () => {
+    // resetEntitlementDeniedSink, not a silent stub: installing `() => {}` here would leave every
     // test declared after this block running with observation disabled.
-    afterEach(() => resetWildcardGrantSink());
+    afterEach(() => resetEntitlementDeniedSink());
 
     it('fails closed and records when the tier name is not in the config', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u1', subscriptionType: 'NoSuchTier' } as any);
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'subscription_types',
@@ -586,7 +587,7 @@ describe('subscriptionService', () => {
 
     it('resolves an empty-list tier to [] without reporting anything (no longer a wildcard case)', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u2', subscriptionType: 'Pro' } as any);
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'subscription_types',
@@ -600,12 +601,12 @@ describe('subscriptionService', () => {
     /*
      * Review finding: an unconfirmed tier frequently produces a RESTRICTED result, not a wildcard
      * — an unreadable user row still resolves to a real Free tier with a real skill list. If that
-     * were recorded as a wildcard-grant it would inflate the over-grant count and argue for the
+     * were recorded as an entitlement-denied it would inflate the over-grant count and argue for the
      * fail-closed change on false evidence. Hence the separate `kind`, asserted here.
      */
-    it('records an unconfirmed tier as its OWN kind, not as a wildcard grant', async () => {
+    it('records an unconfirmed tier as its OWN kind, not as an entitlement-denied', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValueOnce(null as any);
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'subscription_types',
@@ -621,13 +622,14 @@ describe('subscriptionService', () => {
       expect(events).toHaveLength(1);
       expect(events[0].kind).toBe('unconfirmed-tier');
       expect(events[0].detail.byReason).toEqual({ 'subscription-type-unresolved': 1 });
-      expect(events.filter((e) => e.kind === 'wildcard-grant')).toHaveLength(0);
+      expect(events.filter((e) => e.kind === 'entitlement-denied')).toHaveLength(0);
     });
 
     /*
-     * Round-2 review, finding #1: the PR's documented "grep WILDCARD-GRANT" instruction cannot
-     * see unconfirmed-tier events at all, since they use a different marker string. Both must
-     * share the `[entitlement]` prefix so a broader grep catches both kinds.
+     * Round-2 review, finding #1: PR #2947's documented "grep WILDCARD-GRANT" instruction (now
+     * "grep ENTITLEMENT-DENIED") cannot see unconfirmed-tier events at all, since they use a
+     * different marker string. Both must share the `[entitlement]` prefix so a broader grep
+     * catches both kinds.
      */
     it('both kinds share the [entitlement] prefix so one grep catches both', async () => {
       const lines: string[] = [];
@@ -654,7 +656,7 @@ describe('subscriptionService', () => {
      */
     it('fails closed on the legacy Basic fallback, distinctly from a malformed real-tier row', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u10', subscriptionType: 'Basic' } as any);
       mockedSettingsService.getSetting.mockResolvedValue(null as any); // setting entirely absent
 
@@ -670,7 +672,7 @@ describe('subscriptionService', () => {
      */
     it('resolveSkillsToToolNames fails closed and attributes skill-to-tool-resolution-failed to the given userId', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       const skillSvc = jest.requireMock('../services/skillService').skillService;
       skillSvc.getPublishedSkills.mockImplementationOnce(() => { throw new Error('dynamo scan failed'); });
 
@@ -687,23 +689,23 @@ describe('subscriptionService', () => {
      */
     it('fails closed on config-unavailable (not the outer catch) when the settings lookup throws', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u3', subscriptionType: 'Pro' } as any);
       mockedSettingsService.getSetting.mockRejectedValue(new Error('dynamo down'));
 
       expect(await getAllowedSkills('u3')).toBeNull();
       const ev = events.find((e) => e.reason === 'subscription-type-config-unavailable');
       expect(ev).toBeDefined();
-      // A genuine full-registry over-grant that now fails closed — must be kind 'wildcard-grant',
+      // A genuine full-registry over-grant that now fails closed — must be kind 'entitlement-denied',
       // not 'unconfirmed-tier'.
-      expect(ev.kind).toBe('wildcard-grant');
+      expect(ev.kind).toBe('entitlement-denied');
     });
 
     /* The genuine trigger for getAllowedSkills' own catch: a non-array allowedSkills makes
      * `.includes` throw. Previously uncovered entirely. */
     it('fails closed when allowedSkills is not an array', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u4', subscriptionType: 'Pro' } as any);
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'subscription_types',
@@ -723,7 +725,7 @@ describe('subscriptionService', () => {
      */
     it('does NOT emit for a tier that explicitly authored allowedSkills: ["*"]', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u12', subscriptionType: 'Pro' } as any);
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'subscription_types',
@@ -739,7 +741,7 @@ describe('subscriptionService', () => {
      * malformation. ENG-1978: that silent default is no longer granted either. */
     it('fails closed on a tier row that omits allowedSkills, which silently defaults to wildcard', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u5', subscriptionType: 'Legacy' } as any);
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'subscription_types',
@@ -759,7 +761,7 @@ describe('subscriptionService', () => {
      */
     it('does not emit for a malformed tier row when resolving something other than skills', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValue({ userId: 'u8', subscriptionType: 'Legacy' } as any);
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'subscription_types',
@@ -775,7 +777,7 @@ describe('subscriptionService', () => {
     /* Observation must never be the reason the SERVER fails. An async sink is assignable to a
      * `=> void` type, and its rejection would otherwise escape as an unhandled rejection. */
     it('survives a sink that rejects asynchronously', async () => {
-      setWildcardGrantSink((() => Promise.reject(new Error('sink blew up'))) as any);
+      setEntitlementDeniedSink((() => Promise.reject(new Error('sink blew up'))) as any);
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u6', subscriptionType: 'NoSuchTier' } as any);
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'subscription_types',
@@ -787,7 +789,7 @@ describe('subscriptionService', () => {
     });
 
     it('survives a sink that throws synchronously', async () => {
-      setWildcardGrantSink(() => { throw new Error('sync boom'); });
+      setEntitlementDeniedSink(() => { throw new Error('sync boom'); });
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u7', subscriptionType: 'NoSuchTier' } as any);
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'subscription_types',
