@@ -213,8 +213,12 @@ Rules:
 - One number belongs to one account. A second account cannot verify a number that is
   already connected, and unbinding an account only removes the lookup row if it still
   points at that account.
-- Approvals do not require Slack. `POST /api/approval-requests` asks on whichever channel
-  the account has. A task's Slack channel is ignored for a WhatsApp customer.
+- Approvals the agent engine creates do not require Slack. `POST /api/approval-requests`
+  asks on whichever channel the account has. **Approvals a person starts from the customer
+  portal (Images, Videos, Research Reports) still require choosing a Slack channel** and call
+  `/api/slack/send-approval`, so a WhatsApp-only customer cannot start one there yet. An
+  engine deployed ahead of the backend gets a 404 and treats it as no channel, not as a
+  failed send. A task's Slack channel is ignored for a WhatsApp customer.
   It answers `409 no_channel` when the account has nowhere to be asked, and
   **`502 delivery_failed` when it has a channel and the send failed** — the task engine
   carries on past the first but must hold its output for the second, as it does when a
