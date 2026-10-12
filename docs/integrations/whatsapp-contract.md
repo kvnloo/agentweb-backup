@@ -59,7 +59,7 @@ phone. Multi-tenant onboarding was evaluated and deferred — see "Deferred" bel
 | Webhooks | Yes | `routes/whatsappWebhook.ts` | Inbound messages and STOP/UNSTOP. Delivery-status events are acknowledged but ignored and not persisted. |
 | Consent acknowledgement | Yes | `services/whatsappService.ts` `sendOptOutConfirmation` | The one message an opted-out number may receive. Sent AFTER the opt-out is recorded, and bypasses only the opt-out check — never the service window. |
 | Approval requests | **Yes, interactive** | `services/approvalRequestService.ts`, `services/approvalChannelNotifier.ts` | Inside the 24h window the customer gets Approve / Reject reply buttons (a service message — no template). Outside it, the `agentweb_approval_request` template with a link. A tap is correlated through `context.id` → `whatsapp:approval-msg:<wamid>`, because Meta returns a template button's LABEL as its payload. First tap wins (claim before write); later taps are answered, not acted on, since buttons can never be removed. Approving emails the task's subscribers exactly as a Slack approval does. |
-| Customer writes in | Yes | `services/whatsappInboundSupport.ts` | A non-command message gets a fixed greeting (once per 12h per number) and is forwarded to the team by email — `WHATSAPP_SUPPORT_INBOX`, else the `whatsapp:support-inbox` setting, else founders@ in production only. No model is involved. |
+| Customer writes in | Yes | `services/whatsappInboundSupport.ts` | A non-command message gets a fixed greeting (once per 12h per number) and is forwarded to the team by email — `WHATSAPP_SUPPORT_INBOX`, else the `whatsapp:support-inbox` setting, else founders@ in production only — at most 20 forwards per number per hour. A failed forward is logged. No model is involved. |
 | Read history | **No** | — | Cloud API has no history endpoint. We know only what the webhook delivered. |
 | Edit / delete a sent message | **No** | — | Not supported by the API at all. Callers send a follow-up. |
 | Threads | **No** | — | Quoted replies only. |
@@ -188,20 +188,53 @@ A customer is onboarded on Slack **or** WhatsApp, never both, and neither featur
 depends on the other. `services/customerChannelPolicy.ts` is the single definition of
 which platform an account is on; enforcement and every screen read it.
 
+What counts:
+
+- **WhatsApp:** a number the customer has verified.
+- **Slack:** a channel the account has of its own (assigned, linked, or the deprecated
+  single field). An organisation's shared channel is reported as Slack but is only a
+  default the account inherited, so it does **not** stop a member connecting WhatsApp.
+  A Slack Connect channel provisioned at onboarding is a support room, not a delivery
+  destination, so it is not a platform at all.
+
+Rules:
+
 - Connecting a second platform is refused wherever it can be asked for: starting or
-  completing WhatsApp verification for an account on Slack; an admin assigning a Slack
-  channel, the `link this channel` command, or Slack Connect provisioning for an account
-  on WhatsApp.
-- "On Slack" counts an assigned or linked channel, an organisation's channel the account
-  inherits, and a Slack Connect channel. "On WhatsApp" counts only a verified number.
-- An organisation can gain Slack after a member connected WhatsApp (three routes). That
-  is settled in the resolver rather than guarded at each route: a member who personally
-  verified WhatsApp does not also inherit the organisation's Slack channel.
+  completing WhatsApp verification for an account with its own Slack channel; an admin
+  assigning a Slack channel, the `link this channel` command, or Slack Connect
+  provisioning for an account on WhatsApp. The completion check runs before the code is
+  claimed so a refused code is not stranded.
+- **An account with a verified WhatsApp number is on WhatsApp everywhere.**
+  `resolveDestination` returns no Slack destination for it — own channel or inherited —
+  and the same applies to Emma's Slack allow-list and the legacy lead alert, which read
+  Slack directly. This settles every way the two can come to coexist (an organisation
+  gaining a channel, its owner being assigned one, a WhatsApp user joining it, or an
+  account that predates the rule) in one place, and matches what the admin screens report.
+- One number belongs to one account. A second account cannot verify a number that is
+  already connected, and unbinding an account only removes the lookup row if it still
+  points at that account.
 - Approvals do not require Slack. `POST /api/approval-requests` asks on whichever channel
-  the account has and answers `409 no_channel` when it has none; the task engine uses it
-  for tasks with no Slack channel and keeps the Slack endpoint, unchanged, for the rest.
+  the account has. A task's Slack channel is ignored for a WhatsApp customer.
+  It answers `409 no_channel` when the account has nowhere to be asked, and
+  **`502 delivery_failed` when it has a channel and the send failed** — the task engine
+  carries on past the first but must hold its output for the second, as it does when a
+  Slack send fails.
 - Admins see the platform (WhatsApp number masked to four digits) on each customer row
   and can disconnect WhatsApp on a customer's behalf.
+
+## Approval Taps
+
+Interactive buttons cannot be removed or disabled once sent, so a tap has to be safe to
+repeat and may arrive from a customer who already answered somewhere else. The verdict is
+one atomic conditional update (`approvalDb.answerIfOpen`) that succeeds only while the
+approval is `pending` or `needs_changes` and never creates a row. Exactly one tap wins,
+whichever surface it came from; only the winner emails the task's subscribers; every other
+tap is told what stands. The approval record is written before the message carrying the
+buttons goes out, and removed again if nothing was delivered.
+
+Meta returns a template quick-reply's LABEL as its payload, so an id cannot ride on a
+button: a tap is correlated only through `context.id` against the outbound message id
+(`whatsapp:approval-msg:<wamid>`, 30-day TTL in epoch seconds).
 
 ## Deferred (documented decisions, not oversights)
 
