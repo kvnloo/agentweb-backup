@@ -33,6 +33,8 @@ export interface AdminRedactionOptions {
   /**
    * ENG-112: drop `metadata.branchOrigin` (chat-branching provenance: the source session id/title) from the
    * returned rows. Set for viewers who are not the session owner (share / conversable links). Default false.
+   * ENG-113: the same flag also drops `metadata.compareAlternatives` (the saved unchosen Compare answers are
+   * owner-only) via the same mechanism. `compareAlternativesOmitted`/`compareId` carry no answer text and stay.
    */
   omitBranchOrigin?: boolean;
 }
@@ -91,8 +93,9 @@ export function filterMessagesForClient(messages: any[], opts: AdminRedactionOpt
   const adminTainted = computeAdminTaintedTurns(messages, viewerIsAdmin, adminToolNameSet);
 
   const stripOrigin = (message: any) => {
-    if (!opts.omitBranchOrigin || !message?.metadata || !('branchOrigin' in message.metadata)) return message;
-    const { branchOrigin: _origin, ...metadata } = message.metadata;
+    if (!opts.omitBranchOrigin || !message?.metadata) return message;
+    if (!('branchOrigin' in message.metadata) && !('compareAlternatives' in message.metadata)) return message;
+    const { branchOrigin: _origin, compareAlternatives: _alternatives, ...metadata } = message.metadata;
     return { ...message, metadata };
   };
 

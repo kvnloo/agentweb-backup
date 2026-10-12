@@ -28,6 +28,7 @@ import {
   tryClaimSessionGeneration,
 } from './agentModeController';
 import { createCompareProviderPolicy } from '../services/agentMode/compareProviderPolicy';
+import { compareSaveAlternatives } from '../services/agentMode/compareSaveAlternativesInstance';
 import {
   compareModels,
   CompareDeps,
@@ -152,6 +153,8 @@ function selectDeps(): SelectDeps {
     getSecret: getJwtSecret,
     now: () => Date.now(),
     log,
+    isSaveAlternativesEnabled: () => compareSaveAlternatives.isEnabled(),
+    getModelInfo: (model) => agentModeService.getModelCompareInfo(model),
   };
 }
 

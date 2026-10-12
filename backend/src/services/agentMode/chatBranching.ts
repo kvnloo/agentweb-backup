@@ -170,12 +170,14 @@ interface ParsedBranchRequest {
   messageIndex: number;
   llmModel?: string;
   idempotencyKey?: string;
+  /** ENG-113 "Branch with this answer": the saved Compare alternative (by model id) the branch continues from. */
+  alternativeModel?: string;
 }
 
 function parseBody(body: unknown): { ok: true; value: ParsedBranchRequest } | { ok: false; outcome: ServiceOutcome } {
   const bad = (msg: string) => ({ ok: false as const, outcome: fail(400, msg, 'invalid_request') });
   if (!isPlainObject(body)) return bad('Request body must be a JSON object');
-  const { messageIndex, llmModel, idempotencyKey } = body;
+  const { messageIndex, llmModel, idempotencyKey, alternativeModel } = body;
   if (typeof messageIndex !== 'number' || !Number.isInteger(messageIndex) || messageIndex < 0) {
     return bad('messageIndex must be a non-negative integer');
   }
@@ -185,6 +187,14 @@ function parseBody(body: unknown): { ok: true; value: ParsedBranchRequest } | { 
     model = llmModel.trim() || undefined;
     if (model && model.length > MAX_MODEL_ID_CHARS) return bad('llmModel is too long');
   }
+  let altModel: string | undefined;
+  if (alternativeModel !== undefined && alternativeModel !== null) {
+    if (typeof alternativeModel !== 'string') return bad('alternativeModel must be a string');
+    altModel = alternativeModel.trim() || undefined;
+    if (altModel && altModel.length > MAX_MODEL_ID_CHARS) return bad('alternativeModel is too long');
+    // The alternative's model IS the branch's model: a different explicit llmModel is a contradiction, not a choice.
+    if (altModel && model && model !== altModel) return bad('llmModel must match alternativeModel when both are sent');
+  }
   let key: string | undefined;
   if (idempotencyKey !== undefined && idempotencyKey !== null) {
     if (typeof idempotencyKey !== 'string' || idempotencyKey.length > MAX_IDEMPOTENCY_KEY_CHARS) {
@@ -192,7 +202,7 @@ function parseBody(body: unknown): { ok: true; value: ParsedBranchRequest } | { 
     }
     key = idempotencyKey.length > 0 ? idempotencyKey : undefined;
   }
-  return { ok: true, value: { messageIndex, llmModel: model, idempotencyKey: key } };
+  return { ok: true, value: { messageIndex, llmModel: model, idempotencyKey: key, ...(altModel ? { alternativeModel: altModel } : {}) } };
 }
 
 /**
@@ -216,7 +226,7 @@ function withIndexes(history: readonly ChatMessage[]): ChatMessage[] {
   return history.map((m, i) => (typeof m.messageIndex === 'number' ? m : { ...m, messageIndex: i }));
 }
 
-export type PrefixPlan = { ok: true; endInclusive: number } | { ok: false; outcome: ServiceOutcome };
+export type PrefixPlan = { ok: true; endInclusive: number; /** position (in the raw history) of the named message */ targetPos: number } | { ok: false; outcome: ServiceOutcome };
 
 /**
  * Resolve the client's index (the RAW `messageIndex` of a message it can see) to the prefix to copy.
@@ -270,7 +280,7 @@ export function planBranchPrefix(
       }),
     };
   }
-  return { ok: true, endInclusive: end };
+  return { ok: true, endInclusive: end, targetPos: pos };
 }
 
 /**
@@ -305,17 +315,42 @@ function stripContinuationTriggers(m: ChatMessage): ChatMessage {
   return { ...m, metadata } as ChatMessage;
 }
 
+export interface AlternativeReplacement {
+  /** Position of the row that carries the saved alternatives. */
+  pos: number;
+  alternative: { model: string; content: string };
+}
+
 export function buildBranchRows(
   history: readonly ChatMessage[],
   endInclusive: number,
   origin: BranchOrigin,
   nowIso: string,
+  replacement?: AlternativeReplacement,
 ): ChatMessage[] {
-  const rows = withIndexes(history).slice(0, endInclusive + 1).map((m) => {
+  const rows = withIndexes(history).slice(0, endInclusive + 1).map((m, i) => {
     const { messageIndex: _i, usage: _u, clientId: _c, ...rest } = m as ChatMessage & { clientId?: string };
     if (!rest.metadata) return rest as ChatMessage;
-    const { feedback: _f, ...metadata } = rest.metadata;
-    return stripContinuationTriggers({ ...rest, metadata } as ChatMessage);
+    // ENG-113: the saved Compare alternatives (and their marker/compareId) never travel: a branch is lean and
+    // is not a second copy of answers the new chat's owner did not choose from.
+    const {
+      feedback: _f,
+      compareAlternatives: _ca,
+      compareAlternativesOmitted: _co,
+      compareId: _ci,
+      ...metadata
+    } = rest.metadata;
+    const copied = stripContinuationTriggers({ ...rest, metadata } as ChatMessage);
+    if (replacement && i === replacement.pos) {
+      // "Branch with this answer": this row becomes the chosen alternative (text + attribution).
+      return {
+        ...copied,
+        content: replacement.alternative.content,
+        llm: replacement.alternative.model,
+        metadata: { ...copied.metadata, branchedFromAlternative: { model: replacement.alternative.model } },
+      } as ChatMessage;
+    }
+    return copied;
   });
   const first = rows[0];
   rows[0] = {
@@ -508,7 +543,7 @@ async function branchInner(deps: BranchDeps, input: BranchInput, ctx: BranchRunC
   // branch from a different message or model.
   // JSON-encoded so no value (a model id or key containing the old `|` delimiter) can masquerade as another.
   const scope = req.idempotencyKey
-    ? JSON.stringify(['branch', input.sessionId, req.messageIndex, req.llmModel ?? '', req.idempotencyKey])
+    ? JSON.stringify(['branch', input.sessionId, req.messageIndex, req.llmModel ?? '', req.idempotencyKey, ...(req.alternativeModel ? [req.alternativeModel] : [])])
     : undefined;
   const localKey = scope ? JSON.stringify([input.user.userId, scope]) : undefined;
   let runStoreHeld = false;
@@ -633,8 +668,8 @@ async function createBranch(
   // 1. Decide the model for the BRANCH OWNER before anything is written (entitlements, usage policy).
   const resolved = await deps.resolveModel({
     userId: firstRead.userId,
-    requestedModel: req.llmModel ?? firstRead.llmModel,
-    explicit: req.llmModel !== undefined,
+    requestedModel: req.alternativeModel ?? req.llmModel ?? firstRead.llmModel,
+    explicit: req.alternativeModel !== undefined || req.llmModel !== undefined,
   });
   if (!resolved.ok) return resolved.outcome;
 
@@ -678,7 +713,21 @@ async function createBranch(
       sourceMessageIndex: req.messageIndex,
       branchedAt: nowIso,
     };
-    const rows = buildBranchRows(history, plan.endInclusive, origin, nowIso);
+    let replacement: AlternativeReplacement | undefined;
+    if (req.alternativeModel) {
+      const saved = (history[plan.targetPos]?.metadata as { compareAlternatives?: unknown } | undefined)?.compareAlternatives;
+      if (!Array.isArray(saved) || saved.length === 0) {
+        return fail(400, 'That message has no saved alternative answers', 'no_saved_alternatives');
+      }
+      const match = saved.find(
+        (a): a is { model: string; content: string } =>
+          !!a && typeof a === 'object' && (a as { model?: unknown }).model === req.alternativeModel
+          && typeof (a as { content?: unknown }).content === 'string' && (a as { content: string }).content.length > 0,
+      );
+      if (!match) return fail(400, 'That alternative answer was not found on this message', 'alternative_not_found');
+      replacement = { pos: plan.targetPos, alternative: { model: match.model, content: match.content } };
+    }
+    const rows = buildBranchRows(history, plan.endInclusive, origin, nowIso, replacement);
 
     // 4. A normal new session from an ALLOWLIST. Nothing else on the source is read into it. It is BORN
     //    archived (hidden): until the copy is verified it must not show in any list, and a process
