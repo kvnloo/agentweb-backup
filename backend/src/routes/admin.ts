@@ -4,7 +4,7 @@ import { disconnectStaleUserSockets } from "../services/sessionSockets";
 import jwt from "jsonwebtoken";
 import { getJwtSecret } from "../config/jwt";
 import bcrypt from "bcryptjs";
-import axios from "axios";
+import { fetchPublicHtml, SsrfBlockedError } from "../utils/ssrfGuard";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { userDb, taskDb, subscriberDb, crmDb, orgDb } from "../services/db";
@@ -3052,15 +3052,18 @@ router.post("/announcements/load-from-url", async (req, res) => {
     console.log(`🔽 Fetching HTML content from: ${url}`);
 
     // Fetch the HTML content
-    const response = await axios.get(url, {
-      timeout: 15000, // 15 seconds timeout
-      responseType: "text",
-      headers: {
-        "User-Agent": "AgentWeb-Backend/1.0",
-      },
-    });
-
-    const html = response.data as string;
+    // ENG-2425: SSRF-safe (DNS-pinned, per-hop re-validated, size-capped).
+    let html: string;
+    try {
+      html = await fetchPublicHtml(url);
+    } catch (fetchErr) {
+      if (fetchErr instanceof SsrfBlockedError) {
+        return res
+          .status(400)
+          .json({ success: false, message: "URL must point to a public internet address" });
+      }
+      throw fetchErr;
+    }
     console.log(`✅ Successfully fetched HTML, length: ${html.length}`);
 
     // Extract title from <title> tag
