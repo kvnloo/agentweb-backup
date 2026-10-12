@@ -158,6 +158,24 @@ export interface OpenResearchRequest {
   errorSummary: string;
 }
 
+export interface BranchedFrom {
+  sessionId: string;
+  rootSessionId: string;
+  messageIndex: number;
+  branchedAt: string;
+}
+
+/** The slim projection of a session returned by getBranchFamilySessions. */
+export interface BranchFamilyMember {
+  sessionId: string;
+  title?: string;
+  llmModel?: string;
+  messageCount: number;
+  updatedAt: string;
+  createdAt: string;
+  branchedFrom?: BranchedFrom;
+}
+
 // Interface for chat sessions
 export interface ChatSession {
   sessionId: string;
@@ -172,6 +190,13 @@ export interface ChatSession {
   portalType?: "customer" | "partner" | "genius" | "agent" | "emma-sidebar"; // Added portalType to session
   pageIdentifier?: string; // Added pageIdentifier for page-specific sessions
   archived?: boolean; // Archive status for soft deletion
+  /**
+   * ENG-112 (owner-approved additive optional attribute): set ONLY on a chat created by "Branch from here".
+   * `sessionId` = the immediate source, `rootSessionId` = the first chat of the family (a branch of a branch
+   * keeps the original root), `messageIndex` = the raw fork index sent to the branch endpoint. Owner-only:
+   * never serialised on share / conversable / MCP views. No GSI, no backfill; rollback = stop writing/reading.
+   */
+  branchedFrom?: BranchedFrom;
   selectedStartupId?: string; // Selected startup profile for context
   workflowId?: string; // Added workflowId for agent mode sessions
   executionId?: string; // Added executionId for agent mode sessions
@@ -743,7 +768,7 @@ export class ChatbotDB {
     emailCampaignTaskId?: string,
     sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email" | "meeting-intake",
     delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean },
-    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages" | "archived">>
+    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages" | "archived" | "branchedFrom">>
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -2219,6 +2244,55 @@ export class ChatbotDB {
     );
 
     return sessionsWithPreview;
+  }
+
+  /**
+   * ENG-112: the NON-ARCHIVED branches of one chat family for one owner.
+   *
+   * Cost: ONE query over the existing UserIdIndex (no scan, no new GSI). DynamoDB bills a GSI query by the
+   * items it reads, not by what survives the projection, so this reads the owner's whole index once, in
+   * 1 MB pages; a typical user has <1000 sessions (a handful of pages). `maxPages` bounds the worst case and
+   * `truncated` reports when that bound (or `maxBranches`) stopped the walk before the index was exhausted.
+   * The root session itself is NOT returned here (the caller already loads it).
+   */
+  async getBranchFamilySessions(
+    userId: string,
+    rootSessionId: string,
+    opts: { maxBranches?: number; maxPages?: number } = {},
+  ): Promise<{ branches: BranchFamilyMember[]; truncated: boolean }> {
+    const maxBranches = opts.maxBranches ?? 49;
+    const maxPages = opts.maxPages ?? 20;
+    const branches: BranchFamilyMember[] = [];
+    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    for (let page = 0; page < maxPages; page++) {
+      const result = await dynamodb.query({
+        TableName: this.tableName,
+        IndexName: "UserIdIndex",
+        KeyConditionExpression: "userId = :userId",
+        ExpressionAttributeValues: { ":userId": userId },
+        ExpressionAttributeNames: { "#title": "title", "#archived": "archived" },
+        ProjectionExpression: "sessionId, userId, #title, llmModel, messageCount, updatedAt, createdAt, branchedFrom, #archived",
+        ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+      }).promise();
+      for (const item of (result.Items ?? []) as Array<ChatSession>) {
+        if (item.userId !== userId) continue; // defence in depth: never another owner's row
+        if (item.archived) continue; // includes a branch still being copied (born archived)
+        if (item.branchedFrom?.rootSessionId !== rootSessionId || item.sessionId === rootSessionId) continue;
+        branches.push({
+          sessionId: item.sessionId,
+          title: item.title,
+          llmModel: item.llmModel,
+          messageCount: item.messageCount ?? 0,
+          updatedAt: item.updatedAt,
+          createdAt: item.createdAt,
+          branchedFrom: item.branchedFrom,
+        });
+      }
+      lastKey = result.LastEvaluatedKey;
+      if (!lastKey) return { branches, truncated: false };
+      if (branches.length >= maxBranches) return { branches, truncated: true };
+    }
+    return { branches, truncated: true };
   }
 
   /**

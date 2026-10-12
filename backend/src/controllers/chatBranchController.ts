@@ -30,6 +30,7 @@ import {
 import {
   BranchDeps,
   branchChatSession,
+  listBranchFamily,
   CHAT_BRANCHING_ENABLED_SETTING,
   CHAT_BRANCHING_MAX_PER_HOUR_SETTING,
   DEFAULT_MAX_BRANCHES_PER_HOUR,
@@ -141,6 +142,20 @@ export async function branchSessionHandler(req: AuthenticatedRequest, res: Respo
       ? { delegateInfo: { adminUserId: req.delegateInfo.adminUserId, adminEmail: req.delegateInfo.adminEmail, isDelegated: true } }
       : {}),
   });
+  res.set('Cache-Control', 'no-store');
+  return res.status(outcome.status).json(outcome.body);
+}
+
+export async function listBranchesHandler(req: AuthenticatedRequest, res: Response): Promise<Response> {
+  const outcome = await listBranchFamily(
+    {
+      isAcceptingWork: isCronEnabled,
+      isFeatureEnabled: isChatBranchingEnabled,
+      getSession: (sessionId) => chatbotDb.getChatSession(sessionId),
+      listBranches: (userId, rootSessionId, opts) => chatbotDb.getBranchFamilySessions(userId, rootSessionId, opts),
+    },
+    { user: { userId: req.user.userId, isAdmin: req.user.isAdmin === true }, sessionId: req.params.sessionId },
+  );
   res.set('Cache-Control', 'no-store');
   return res.status(outcome.status).json(outcome.body);
 }
