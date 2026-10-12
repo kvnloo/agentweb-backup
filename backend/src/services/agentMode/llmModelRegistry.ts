@@ -413,6 +413,30 @@ export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig
   'anthropic.claude-haiku-4-5-20251001-v1:0': {"name":"Claude Haiku 4.5","provider":"anthropic","tier":"cheap","description":"Fastest for quick answers","client":null,"supportsTemperature":true,"supportsVision":true,"qualityScore":15,"qualityScoreSource":"Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Claude Haiku 4.5, Non-reasoning","family":"claude-haiku"},
 };
 
+// Legacy model ids persisted by sessions/schedules created before a model was
+// renamed or fully retired. Maps the old id to its current registry key so old
+// sessions/schedules keep working instead of throwing "Invalid model". Opus 4.8
+// was renamed from the bare Vertex id "claude-opus-4-8" to the Bedrock id
+// "anthropic.claude-opus-4-8" in commit c86c8ec1. gpt-5-chat-2 and gpt-5.2-chat
+// were removed from the registry 2026-08-19 (Azure deployment retired/deprecated
+// during the migration off the Rui-owned Azure resource — see the registry
+// comment above the gpt-5.4 entry) and redirected to gpt-5.5, the current
+// non-legacy top of the same gpt5-chat family.
+export const LEGACY_MODEL_ALIASES: Record<string, string> = {
+  'claude-opus-4-8': 'anthropic.claude-opus-4-8',
+  'gpt-5-chat-2': 'gpt-5.5',
+  'gpt-5.2-chat': 'gpt-5.5',
+  'gemini-2.5-flash': 'gemini-3.1-flash-lite',
+  // ENG-2178: schedules created before the OpenRouter migration pin the bare
+  // "gpt-4o-mini" id; the same model is now served via OpenRouter.
+  'gpt-4o-mini': 'openrouter/openai/gpt-4o-mini',
+  // OpenRouter retired the bare `qwen/qwen3.8-max` catalog id in favour of the
+  // dated snapshot `qwen/qwen3.8-max-0902` (same price). Compare's served-model
+  // check rightly refuses the snapshot slug for the bare id, so pins move forward.
+  // Mirrored in the portal's LEGACY_MODEL_ALIAS_IDS (src/lib/modelUnavailable.ts).
+  'openrouter/qwen/qwen3.8-max': 'openrouter/qwen/qwen3.8-max-0902',
+};
+
 /**
  * A per-instance copy of the registry. AgentModeService instances (and the
  * tests that swap a model's client or add an entry on one instance) must not

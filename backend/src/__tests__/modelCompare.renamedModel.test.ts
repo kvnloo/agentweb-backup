@@ -72,11 +72,12 @@ describe('renamed OpenRouter model: qwen3.8-max -> qwen3.8-max-0902', () => {
     try { return [resolveOpenRouterUpstreamModelId(id)]; } catch { return []; }
   });
 
-  it('the registry holds the id OpenRouter actually lists, priced, and not the retired one', () => {
+  it('the registry holds the id OpenRouter actually lists, priced; the retired id is only a priced deprecated alias', () => {
     expect(registry[STALE_ID]).toBeUndefined();
     expect(registry[CURRENT_ID]).toBeDefined();
     expect(getModelPrice(CURRENT_ID)).not.toBeNull();
-    expect(getModelPrice(STALE_ID)).toBeNull();
+    // Deprecated alias stays priced (same $2/$6) so late usage rows still meter.
+    expect(getModelPrice(STALE_ID)).toEqual(getModelPrice(CURRENT_ID));
   });
 
   it('existing pins (sessions, schedules, settings) resolve forward to the current id without falling back', () => {
