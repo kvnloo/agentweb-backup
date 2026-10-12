@@ -31,7 +31,7 @@ jest.mock('../middleware/auth', () => ({
 import lumaAuthRouter from '../routes/lumaAuth';
 import { emmaToolRegistry } from '../emma/registry';
 import '../emma/lumaTools';
-import { LumaApiService, parseLumaEventId } from '../services/lumaApiService';
+import { LumaApiService, parseLumaEventId, normalizeIsoUtc } from '../services/lumaApiService';
 
 const fetchMock = jest.fn();
 (global as any).fetch = fetchMock;
@@ -94,6 +94,8 @@ describe('POST /connect', () => {
     const stored = mockCreateAccount.mock.calls[0][2];
     expect(stored.account_id).toBe('cal-1');
     expect(stored.config.access_token).toBe('enc(user-1):secret-key');
+    expect(stored.config.token_expires_at).toBe(9999999999999);
+    expect(stored.config.needs_reconnect).toBeUndefined();
     expect(JSON.stringify(res.body)).not.toContain('secret-key');
   });
 
@@ -117,7 +119,7 @@ describe('LumaApiService.listGuests', () => {
   it('drops invited-but-unregistered records and stops paging at the lookback cutoff', async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({
-        entries: [guest('a', '2026-10-06T00:00:00Z'), guest('ghost', null), guest('old', '2026-09-01T00:00:00Z')],
+        entries: [guest('a', '2026-10-06T00:00:00Z'), guest('old', '2026-09-01T00:00:00Z'), guest('ghost', null)],
         has_more: true,
         next_cursor: 'c2',
       }),
@@ -139,6 +141,7 @@ describe('LumaApiService.listGuests', () => {
     expect(page.has_more).toBe(true);
     expect(page.next_cursor).toBe('c2');
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0][0])).toContain('pagination_limit=10');
   });
 
   it('keeps unregistered records only when the invited status is requested', async () => {
@@ -197,6 +200,43 @@ describe('LumaApiService.listGuests — paging and failure edges', () => {
   });
 });
 
+describe('normalizeIsoUtc', () => {
+  it('reads bare dates and offset-less datetimes as UTC, and keeps explicit offsets', () => {
+    expect(normalizeIsoUtc('2026-10-01')).toBe('2026-10-01T00:00:00.000Z');
+    expect(normalizeIsoUtc('2026-10-01T12:30')).toBe('2026-10-01T12:30:00.000Z');
+    expect(normalizeIsoUtc('2026-10-01T12:30:00+02:00')).toBe('2026-10-01T10:30:00.000Z');
+    expect(normalizeIsoUtc('yesterday')).toBeNull();
+    expect(normalizeIsoUtc('')).toBeNull();
+  });
+});
+
+describe('LumaApiService — events and the page ceiling', () => {
+  const svc = new LumaApiService('k');
+
+  it('maps events to flat summaries', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        entries: [{ id: 'evt-1', name: 'Launch', start_at: '2026-10-10T00:00:00Z', end_at: null, timezone: 'UTC', url: 'https://luma.com/launch', extra: 'x' }],
+        has_more: false,
+      }),
+    );
+    const r = await svc.listEvents({ limit: 500 });
+    expect(r.events).toEqual([{ event_id: 'evt-1', name: 'Launch', start_at: '2026-10-10T00:00:00Z', end_at: null, timezone: 'UTC', url: 'https://luma.com/launch' }]);
+    expect(String(fetchMock.mock.calls[0][0])).toContain('pagination_limit=100');
+  });
+
+  it('stops at the page ceiling and reports there is more, with a cursor to resume', async () => {
+    fetchMock.mockImplementation(async () =>
+      jsonResponse({ entries: [guest(`g${fetchMock.mock.calls.length}`, '2026-10-06T00:00:00Z')], has_more: true, next_cursor: `c${fetchMock.mock.calls.length}` }),
+    );
+    const r = await svc.listGuests({ eventId: 'evt-1', maxGuests: 100000 });
+    expect(fetchMock).toHaveBeenCalledTimes(25);
+    expect(r.has_more).toBe(true);
+    expect(r.next_cursor).toBe('c25');
+    fetchMock.mockReset();
+  });
+});
+
 describe('luma tools', () => {
   it('say so, with the fallback, when no key is connected', async () => {
     mockGetAccounts.mockResolvedValue([]);
@@ -222,6 +262,33 @@ describe('luma tools', () => {
     expect(r.success).toBe(true);
     expect(r.guests).toHaveLength(1);
     expect(JSON.stringify(r)).not.toContain('secret-key');
+  });
+
+  it('omits null fields and registration answers by default, includes answers when asked', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    const entry = { ...guest('a', '2026-10-06T00:00:00Z'), registration_answers: [{ label: 'Role', answer: 'CMO' }] };
+    fetchMock.mockResolvedValue(jsonResponse({ entries: [entry], has_more: false }));
+
+    const lean: any = await tool('luma_get_guests')({ event: 'evt-1' }, { userId: 'user-1' });
+    expect(Object.keys(lean.guests[0]).sort()).toEqual(['approval_status', 'email', 'first_name', 'guest_id', 'name', 'registered_at']);
+
+    const full: any = await tool('luma_get_guests')({ event: 'evt-1', include_registration_answers: true }, { userId: 'user-1' });
+    expect(full.guests[0].registration_answers).toEqual([{ label: 'Role', answer: 'CMO' }]);
+  });
+
+  it('sends a bare registered_after date to Luma-side logic as an explicit UTC instant', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    fetchMock.mockResolvedValue(jsonResponse({ entries: [guest('new', '2026-10-06T00:00:00Z'), guest('old', '2026-09-30T23:59:59Z')], has_more: true, next_cursor: 'c2' }));
+    const r: any = await tool('luma_get_guests')({ event: 'evt-1', registered_after: '2026-10-01' }, { userId: 'user-1' });
+    expect(r.guests.map((g: any) => g.guest_id)).toEqual(['new']);
+    expect(r.has_more).toBe(false);
+  });
+
+  it('normalises list_events bounds before sending them to Luma', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    fetchMock.mockResolvedValue(jsonResponse({ entries: [], has_more: false }));
+    await tool('luma_list_events')({ after: '2026-10-01' }, { userId: 'user-1' });
+    expect(decodeURIComponent(String(fetchMock.mock.calls[0][0]))).toContain('after=2026-10-01T00:00:00.000Z');
   });
 
   it('refuses to guess between several connected calendars', async () => {
