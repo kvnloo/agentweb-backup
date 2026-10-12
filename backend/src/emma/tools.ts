@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import { MODIFY_WORK_PLAN_INPUT_SCHEMA, validateModifyWorkPlanArgs } from './impl/modifyWorkPlanArgs';
 import { agentModeService } from '../services/agentModeService';
 import { getAccessToken as getClickUpAccessToken, createTaskInList as createClickUpTaskInList, getListCustomFields as getClickUpListCustomFields, ClickUpTaskError } from '../services/clickupService';
 import { emmaToolRegistry } from './registry';
@@ -6466,59 +6467,12 @@ emmaToolRegistry.register({
   definition: {
     name: 'modify_work_plan',
     description: 'Add new steps or modify existing step details in the current work plan. Does not change step status - use set_work_plan_status for that.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        steps: {
-          type: 'array',
-          description: 'Array of steps to add or update',
-          items: {
-            type: 'object',
-            properties: {
-              stepCount: {
-                type: 'number',
-                description: 'Step number'
-              },
-              title: {
-                type: 'string',
-                description: 'Step title'
-              },
-              description: {
-                type: 'string',
-                description: 'Optional detailed description'
-              },
-              requiredFunctionCalls: {
-                type: 'array',
-                description: 'Optional array of function names that must be called before marking this step as completed',
-                items: {
-                  type: 'string'
-                }
-              },
-              expectedAssetCount: {
-                type: 'number',
-                description: 'Optional. Number of media assets the step must produce before it can be completed. Set to a lower number (or 0 to remove the requirement entirely) when the user explicitly approves generating fewer assets than originally planned. Omitting it leaves the existing value unchanged.'
-              }
-            },
-            required: ['stepCount', 'title']
-          }
-        },
-        removeStepCounts: {
-          type: 'array',
-          description: 'Optional array of step numbers to remove',
-          items: {
-            type: 'number'
-          }
-        },
-        autocomplete: {
-          type: 'boolean',
-          description: 'Optional. Update the autocomplete setting. When true, Emma runs all steps automatically without asking for user confirmation between steps.'
-        }
-      },
-      required: ['steps']
-    }
+    inputSchema: MODIFY_WORK_PLAN_INPUT_SCHEMA
   },
   execute: async (args: any, context?: any) => {
-    return await workPlansImpl.modifyWorkPlan(args.steps, args.removeStepCounts || [], context?.sessionId, args.autocomplete, context?.isUnattendedRun, agentModeService.callLLM.bind(agentModeService));
+    const argsError = validateModifyWorkPlanArgs(args);
+    if (argsError) return argsError;
+    return await workPlansImpl.modifyWorkPlan(args.steps || [], args.removeStepCounts || [], context?.sessionId, args.autocomplete, context?.isUnattendedRun, agentModeService.callLLM.bind(agentModeService));
   }
 });
 

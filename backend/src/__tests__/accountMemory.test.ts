@@ -39,7 +39,7 @@ jest.mock('../services/resendService', () => ({
   },
 }));
 
-import { accountMemoryDb } from '../services/db';
+import { accountMemoryDb, orgMemoryDb } from '../services/db';
 
 describe('Account Memory Database Service', () => {
   beforeEach(() => {
@@ -202,6 +202,27 @@ describe('Account Memory Database Service', () => {
       expect(updateCall.Key.userId).toBe('user1');
       expect(updateCall.Key.memoryId).toBe('mem1');
       expect(result).toBeDefined();
+    });
+
+    it('conditions the update on the memory existing (ENG-2404)', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: { memoryId: 'mem1' } }),
+      });
+      await accountMemoryDb.updateMemory('user1', 'mem1', { content: 'x' });
+      await orgMemoryDb.updateMemory('org1', 'mem1', { content: 'x' });
+      for (const [call] of mockDocumentClientMethods.update.mock.calls) {
+        expect(call.ConditionExpression).toBe('attribute_exists(memoryId)');
+      }
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+    });
+
+    it('maps ConditionalCheckFailedException to MEMORY_NOT_FOUND for account and org (ENG-2404)', async () => {
+      const ccf = Object.assign(new Error('The conditional request failed'), { code: 'ConditionalCheckFailedException' });
+      mockDocumentClientMethods.update.mockReturnValue({ promise: jest.fn().mockRejectedValue(ccf) });
+      await expect(accountMemoryDb.updateMemory('user1', 'gone', { content: 'x' }))
+        .rejects.toMatchObject({ code: 'MEMORY_NOT_FOUND' });
+      await expect(orgMemoryDb.updateMemory('org1', 'gone', { content: 'x' }))
+        .rejects.toMatchObject({ code: 'MEMORY_NOT_FOUND' });
     });
 
     it('should reject invalid category on update', async () => {
@@ -376,6 +397,16 @@ describe('Memory API Routes', () => {
       content: 'updated fact',
       category: 'insight',
     });
+  });
+
+  it('PUT /api/memory/:memoryId returns 404 for an unknown/deleted memory (ENG-2404)', async () => {
+    const { accountMemoryDb: mockDb } = require('../services/db');
+    mockDb.updateMemory.mockRejectedValue(Object.assign(new Error('Memory not found: gone'), { code: 'MEMORY_NOT_FOUND' }));
+
+    const res = await request.put('/api/memory/gone').send({ content: 'edit' });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe('Memory not found');
   });
 
   it('DELETE /api/memory/:memoryId should delete a memory', async () => {

@@ -1,3 +1,31 @@
+## ENG-2403: domain-attach writes require project ownership (2026-10-12)
+
+- `POST /api/domains/custom` and `/subdomain` now 403 (before any Vercel call) unless the caller owns, or has org edit rights (`canUserEditLandingPage`) to, a landing page whose `vercelProjectId` matches the body. Lookup errors fail closed.
+- Test: `backend/src/__tests__/routes.domains.test.ts` (ENG-2403 block).
+
+## ENG-2400: modify_work_plan preserves work-plan data on partial/failed modifies (2026-10-11)
+
+- Omitting `description` on an existing step no longer wipes the stored description (same contract as userInstructions/skillIds).
+- Steps are deep-copied before mutation, so a failed modify never mutates the read session plan.
+- A non-sequential stepCount result (e.g. removing step 2 of 3 without renumbering) now returns an actionable "renumber the remaining steps" message instead of the generic "Failed to modify work plan". The store already rejects it before writing.
+- Test: `backend/src/__tests__/modifyWorkPlan.preservation.test.ts`.
+
+## ENG-2399: modify_work_plan schema/handler argument parity (2026-10-11)
+
+- `modify_work_plan` schema and handler validation now share `MODIFY_WORK_PLAN_INPUT_SCHEMA` (backend/src/emma/impl/modifyWorkPlanArgs.ts). `steps` is optional (remove-only / autocomplete-only calls valid), step numbers are positive integers, and rejections return `{errorClass: invalid_args, field, expected}`. No persistence changes.
+
+## ENG-2398: Google Ads read-back for remaining mutation paths (2026-10-11)
+
+updateBudget/updateAdGroup/updateKeyword/updateAd verify requested fields by read-back; all removes (budget, campaign, criterion, ad group, keyword, ad, conversion action) verify REMOVED-or-gone. Mismatch throws GoogleAdsReadBackError (unsupported_field) -> tool success:false. Coverage test enumerates mutation methods; pattern doc docs/ad-api-read-back-pattern.md.
+
+## ENG-1608: save_file structured handler errors (2026-10-11)
+
+save_file validates file_name/file_content before any storage write and returns `error_code` (MISSING_FILE_NAME, INVALID_FILE_NAME, MISSING_FILE_CONTENT, INVALID_FILE_CONTENT, EMPTY_FILE_CONTENT, FILE_TOO_LARGE, STORAGE_WRITE_FAILED) plus an actionable message. Success payload unchanged.
+
+## ENG-1535: typed generate_image provider failures (2026-10-11)
+
+- `classifyImageProviderError` maps image-provider failures to transient/rate_limited/quota_exceeded/policy/config/invalid_args; `generateImage` returns `errorClass` + an actionable message, and agent-mode `generate_image` forwards it.
+
 ## ENG-1888: create_html_from_template structured TEMPLATE_NOT_FOUND error (2026-10-11)
 
 Missing template_id now returns error_code TEMPLATE_NOT_FOUND, missing_template_id, and available_templates (cap 25); tool description requires list_html_templates first.
