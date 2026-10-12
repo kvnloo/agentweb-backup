@@ -20,8 +20,8 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
   try {
     calendar = await new LumaApiService(apiKey).getCalendar();
   } catch (error) {
-    if (error instanceof LumaApiError && error.isAuthFailure) {
-      return res.status(401).json({
+    if (error instanceof LumaApiError && (error.isAuthFailure || error.isForbidden)) {
+      return res.status(422).json({
         error: 'Luma rejected this API key. Check that it is a calendar API key from a Luma Plus calendar.',
       });
     }

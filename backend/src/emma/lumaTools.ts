@@ -18,7 +18,7 @@ import {
 import { LumaApiService, LumaApiError, parseLumaEventId } from '../services/lumaApiService';
 import { decryptPassword } from '../utils/crypto';
 
-const DEFAULT_MAX_GUESTS = 200;
+const DEFAULT_MAX_GUESTS = 100;
 const HARD_MAX_GUESTS = 2000;
 const GUEST_STATUSES = ['approved', 'session', 'pending_approval', 'invited', 'declined', 'waitlist'];
 
@@ -89,6 +89,14 @@ async function lumaFailure(error: unknown, resolved: Extract<ResolvedLuma, { cli
         'Fall back to the browser session-cookie path or a CSV export meanwhile.',
     };
   }
+  if (error instanceof LumaApiError && error.isForbidden) {
+    return {
+      success: false,
+      message:
+        `Luma says the key for "${resolved.calendarName}" cannot access that event — it probably belongs to a different ` +
+        'calendar. The key itself is fine. Check the event id with luma_list_events, or ask the user for a key from the calendar that hosts it.',
+    };
+  }
   if (error instanceof LumaApiError && error.status === 429) {
     const wait = error.retryAfterSeconds ? ` Retry after ${error.retryAfterSeconds}s.` : '';
     return { success: false, message: `Luma is rate-limiting this calendar (200 requests/minute).${wait}` };
@@ -121,6 +129,16 @@ emmaToolRegistry.register({
     const userId = context?.userId;
     if (!userId) return { success: false, message: 'Authentication required: no user context.' };
 
+    for (const key of ['after', 'before'] as const) {
+      if (args?.[key] && Number.isNaN(Date.parse(args[key]))) {
+        return { success: false, message: `${key} must be an ISO 8601 datetime.` };
+      }
+    }
+    const limit = args?.limit === undefined ? undefined : Number(args.limit);
+    if (limit !== undefined && (!Number.isFinite(limit) || limit < 1)) {
+      return { success: false, message: 'limit must be a positive number.' };
+    }
+
     const resolved = await resolveLuma(userId, args?.calendar_id);
     if ('error' in resolved) return { success: false, message: resolved.error };
 
@@ -129,7 +147,7 @@ emmaToolRegistry.register({
         after: args?.after,
         before: args?.before,
         cursor: args?.cursor,
-        limit: args?.limit,
+        limit,
       });
       return {
         success: true,
@@ -151,7 +169,7 @@ emmaToolRegistry.register({
     name: 'luma_get_guests',
     description:
       'Get the registered guests of one Luma event via the Luma API, newest registration first. `event` accepts the ' +
-      'event id (evt-…) or any luma.com event / manage URL containing it. Returns guest_id, email, name, ' +
+      'event id (evt-…) or a luma.com manage URL containing it (public slug links do not — find the id with luma_list_events). Returns guest_id, email, name, ' +
       'approval_status, registered_at, phone_number and registration_answers. Use registered_after to pull only recent ' +
       'registrants (e.g. a lookback window); de-duplicate on guest_id across calls. Invited-but-never-registered ' +
       'records are omitted unless approval_status is "invited". If has_more is true, call again with next_cursor. ' +
@@ -159,7 +177,7 @@ emmaToolRegistry.register({
     inputSchema: {
       type: 'object',
       properties: {
-        event: { type: 'string', description: 'Event id (evt-…) or a luma.com URL for the event.' },
+        event: { type: 'string', description: 'Event id (evt-…), or a luma.com/event/manage/evt-… URL. Not a public slug link.' },
         approval_status: {
           type: 'string',
           enum: GUEST_STATUSES,
@@ -168,7 +186,7 @@ emmaToolRegistry.register({
         registered_after: { type: 'string', description: 'ISO 8601 datetime — only guests who registered after this.' },
         max_guests: {
           type: 'number',
-          description: `Soft cap per call (default ${DEFAULT_MAX_GUESTS}, max ${HARD_MAX_GUESTS}); whole 100-guest pages are returned, so it can overshoot slightly.`,
+          description: `Soft cap per call (default ${DEFAULT_MAX_GUESTS}, max ${HARD_MAX_GUESTS}); whole 100-guest pages are returned, so it can overshoot slightly. Results include registration answers, so keep it small and page with next_cursor.`,
         },
         cursor: { type: 'string', description: 'next_cursor from a previous call, to continue.' },
         calendar_id: { type: 'string', description: 'Only needed when several Luma calendars are connected.' },
@@ -182,7 +200,12 @@ emmaToolRegistry.register({
 
     const eventId = parseLumaEventId(String(args?.event ?? ''));
     if (!eventId) {
-      return { success: false, message: 'Could not find an event id (evt-…) in `event`. Pass the id or the event URL.' };
+      return {
+        success: false,
+        message:
+          'No event id (evt-…) found in `event`. Public links like luma.com/<slug> do not contain it. Call luma_list_events ' +
+          'and use the event_id of the event whose url or name matches, or pass a luma.com/event/manage/evt-… link.',
+      };
     }
     const status = args?.approval_status ?? 'approved';
     if (!GUEST_STATUSES.includes(status)) {
@@ -213,6 +236,9 @@ emmaToolRegistry.register({
         guests: page.guests,
         has_more: page.has_more,
         ...(page.next_cursor ? { next_cursor: page.next_cursor } : {}),
+        ...(page.interrupted
+          ? { interrupted: `Stopped early (${page.interrupted}). These guests are valid; call again with next_cursor to continue.` }
+          : {}),
       };
     } catch (error) {
       return lumaFailure(error, resolved);

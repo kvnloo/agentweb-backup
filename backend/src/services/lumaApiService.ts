@@ -20,9 +20,14 @@ export class LumaApiError extends Error {
     this.name = 'LumaApiError';
   }
 
-  /** The key was rejected: revoked, wrong calendar, or the Plus subscription lapsed. */
+  /** The key itself was rejected (revoked, or the Plus subscription lapsed). */
   get isAuthFailure(): boolean {
-    return this.status === 401 || this.status === 403;
+    return this.status === 401;
+  }
+
+  /** The key is valid but not allowed to see this resource, e.g. an event on another calendar. */
+  get isForbidden(): boolean {
+    return this.status === 403;
   }
 }
 
@@ -59,6 +64,8 @@ export interface LumaGuestPage {
   next_cursor?: string;
   /** Raw entries scanned, including ones skipped for having no registered_at. */
   scanned: number;
+  /** Set when a later page failed after earlier ones succeeded; next_cursor resumes at the failed page. */
+  interrupted?: string;
 }
 
 /** Pulls the `evt-...` id out of a bare id or any Luma event/manage URL. */
@@ -78,28 +85,34 @@ export class LumaApiService {
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-    let response: Response;
     try {
-      response = await fetch(url, {
-        headers: { 'x-luma-api-key': this.apiKey, Accept: 'application/json' },
-        signal: controller.signal,
-      });
-    } catch (error) {
-      const aborted = error instanceof Error && error.name === 'AbortError';
-      throw new LumaApiError(aborted ? 'Luma did not respond in time' : 'Could not reach Luma', 0);
+      let response: Response;
+      try {
+        response = await fetch(url, {
+          headers: { 'x-luma-api-key': this.apiKey, Accept: 'application/json' },
+          signal: controller.signal,
+        });
+      } catch (error) {
+        const aborted = error instanceof Error && error.name === 'AbortError';
+        throw new LumaApiError(aborted ? 'Luma did not respond in time' : 'Could not reach Luma', 0);
+      }
+
+      if (!response.ok) {
+        const retryAfter = Number(response.headers.get('retry-after'));
+        throw new LumaApiError(
+          `Luma API returned ${response.status}`,
+          response.status,
+          Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined,
+        );
+      }
+      try {
+        return await response.json();
+      } catch {
+        throw new LumaApiError('Luma returned an unreadable response', 0);
+      }
     } finally {
       clearTimeout(timer);
     }
-
-    if (!response.ok) {
-      const retryAfter = Number(response.headers.get('retry-after'));
-      throw new LumaApiError(
-        `Luma API returned ${response.status}`,
-        response.status,
-        Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined,
-      );
-    }
-    return response.json();
   }
 
   async getCalendar(): Promise<LumaCalendar> {
@@ -149,27 +162,41 @@ export class LumaApiService {
     cursor?: string;
     maxGuests: number;
   }): Promise<LumaGuestPage> {
-    const cutoff = opts.registeredAfter ? Date.parse(opts.registeredAfter) : NaN;
     const keepUnregistered = opts.approvalStatus === 'invited';
+    // Invited rows have no registration time to compare against, so the cutoff cannot apply to them.
+    const cutoff = opts.registeredAfter && !keepUnregistered ? Date.parse(opts.registeredAfter) : NaN;
     const guests: LumaGuest[] = [];
     let cursor = opts.cursor;
     let hasMore = true;
     let scanned = 0;
     let pages = 0;
     let crossedCutoff = false;
+    let interrupted: string | undefined;
 
     while (hasMore && !crossedCutoff && guests.length < opts.maxGuests && pages < MAX_PAGES) {
-      const data = await this.get('/v1/events/guests/list', {
-        event_id: opts.eventId,
-        approval_status: opts.approvalStatus,
-        pagination_cursor: cursor,
-        pagination_limit: PAGE_SIZE,
-        sort_column: 'registered_at',
-        sort_direction: 'desc nulls last',
-      });
+      let data: any;
+      try {
+        data = await this.get('/v1/events/guests/list', {
+          event_id: opts.eventId,
+          approval_status: opts.approvalStatus,
+          pagination_cursor: cursor,
+          pagination_limit: PAGE_SIZE,
+          sort_column: 'registered_at',
+          sort_direction: 'desc nulls last',
+        });
+      } catch (error) {
+        // Keep what earlier pages already returned: throwing would discard them and make the
+        // caller restart from page one against a 200 req/min budget. `cursor` still points at
+        // the page that failed, so resuming from it loses and repeats nothing.
+        if (pages === 0 || (error instanceof LumaApiError && (error.isAuthFailure || error.isForbidden))) throw error;
+        interrupted = error instanceof Error ? error.message : 'request failed';
+        break;
+      }
       pages += 1;
       hasMore = !!data.has_more;
       cursor = data.next_cursor;
+      // has_more without a cursor cannot be resumed; re-reading page one would return duplicates.
+      if (hasMore && !cursor) hasMore = false;
 
       for (const g of data.entries || []) {
         scanned += 1;
@@ -192,7 +219,13 @@ export class LumaApiService {
       }
     }
 
-    const exhausted = crossedCutoff || !hasMore;
-    return { guests, has_more: !exhausted, next_cursor: exhausted ? undefined : cursor, scanned };
+    const exhausted = !interrupted && (crossedCutoff || !hasMore);
+    return {
+      guests,
+      has_more: !exhausted,
+      next_cursor: exhausted ? undefined : cursor,
+      scanned,
+      ...(interrupted ? { interrupted } : {}),
+    };
   }
 }
