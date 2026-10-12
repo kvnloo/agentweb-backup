@@ -82,7 +82,7 @@ import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActions
 import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory, type ToolDispatchPorts } from './agentMode/core/toolDispatch';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
-import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
+import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, buildFinalizeJudgePrompt, parseFinalizeJudgeOutput } from './agentMode/core/finalizeGuard';
 import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
 import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
 import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionIndex } from '../utils/modelMentionRequest';
@@ -10746,14 +10746,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     const response = await this.callLLM(FINALIZE_GUARD_JUDGE_MODEL, [
       {
         role: 'user',
-        content:
-          'You are auditing an AI assistant\'s reply for COMPLETED-ACTION claims — statements that an action already happened '
-          + '(not offers, plans, or suggestions). The possible claim classes are: '
-          + `${CLAIM_CLASSES.join(', ')}. Candidate classes detected in this reply: ${candidateClasses.join(', ')}.\n\n`
-          + 'Return ONLY a JSON array, one element per claimed completed action, each shaped '
-          + '{"claimClass":"<class>","statement":"<short quote from the reply>"}. '
-          + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
-          + finalText,
+        content: buildFinalizeJudgePrompt(finalText, candidateClasses),
       },
     ], {
       max_completion_tokens: 500,
@@ -10763,19 +10756,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       usageContext: usageContext ?? { feature: 'finalize_guard_judge' },
     });
 
-    const text = (response as any)?.choices?.[0]?.message?.content;
-    if (typeof text !== 'string' || !text.trim()) {
-      throw new Error('finalize-guard judge returned no content');
-    }
-    const match = text.match(/\[[\s\S]*\]/);
-    if (!match) {
-      throw new Error(`finalize-guard judge returned unparseable output: ${text.slice(0, 200)}`);
-    }
-    const parsed = JSON.parse(match[0]); // throws on invalid JSON → judge_error path
-    if (!Array.isArray(parsed)) {
-      throw new Error('finalize-guard judge output is not an array');
-    }
-    return (parsed as any[]).filter((c) => c && typeof c.claimClass === 'string');
+    return parseFinalizeJudgeOutput((response as any)?.choices?.[0]?.message?.content);
   }
 
   /**

@@ -400,3 +400,39 @@ export async function runFinalizeGuard(input: FinalizeGuardInput): Promise<Final
     claimMismatch: true,
   };
 }
+
+/**
+ * The judge prompt (ENG-185: extracted verbatim from
+ * AgentModeService.judgeFinalizeClaims so the offline judge-accuracy eval
+ * exercises exactly the production prompt).
+ */
+export function buildFinalizeJudgePrompt(finalText: string, candidateClasses: readonly ClaimClass[]): string {
+  return (
+    'You are auditing an AI assistant\'s reply for COMPLETED-ACTION claims — statements that an action already happened '
+    + '(not offers, plans, or suggestions). The possible claim classes are: '
+    + `${CLAIM_CLASSES.join(', ')}. Candidate classes detected in this reply: ${candidateClasses.join(', ')}.\n\n`
+    + 'Return ONLY a JSON array, one element per claimed completed action, each shaped '
+    + '{"claimClass":"<class>","statement":"<short quote from the reply>"}. '
+    + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
+    + finalText
+  );
+}
+
+/**
+ * Parse the judge's raw text. THROWS on empty/unparseable output — the guard
+ * maps that to the judge_error path (ENG-185: extracted verbatim).
+ */
+export function parseFinalizeJudgeOutput(text: unknown): JudgedClaim[] {
+  if (typeof text !== 'string' || !text.trim()) {
+    throw new Error('finalize-guard judge returned no content');
+  }
+  const match = text.match(/\[[\s\S]*\]/);
+  if (!match) {
+    throw new Error(`finalize-guard judge returned unparseable output: ${text.slice(0, 200)}`);
+  }
+  const parsed = JSON.parse(match[0]); // throws on invalid JSON → judge_error path
+  if (!Array.isArray(parsed)) {
+    throw new Error('finalize-guard judge output is not an array');
+  }
+  return (parsed as any[]).filter((c) => c && typeof c.claimClass === 'string');
+}
