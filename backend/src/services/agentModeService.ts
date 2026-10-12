@@ -70,6 +70,7 @@ import {
   type LLMModelConfig,
   type ModelProvider,
   type ModelTier,
+  LEGACY_MODEL_ALIASES,
 } from './agentMode/llmModelRegistry';
 import {
   isMalformedOpenRouterResponseError,
@@ -522,7 +523,8 @@ import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } fro
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
-import { isTransientLLMError, extractAffordableTokens } from '../utils/agentModeErrors';
+import { isTransientLLMError, extractAffordableTokens, PROVIDER_UNAVAILABLE_USER_MESSAGE } from '../utils/agentModeErrors';
+import { isLLMProviderOutage } from './agentMode/providerOutage';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
 import { computeRunVerdict, type RunTerminalInfo } from '../loops/instances/agent-mode/runRecorder';
 // OTel spine (ENG-141) — inert no-ops unless exporter env config is present.
@@ -1122,24 +1124,6 @@ const FINALIZE_GUARD_JUDGE_MODEL = DIAGNOSIS_MODEL;
 // readFileContent, moved in the same cluster (describeVideo, cluster 21,
 // already carries its own separately-duplicated copy of IMAGE_EXTENSIONS).
 
-// Legacy model ids persisted by sessions/schedules created before a model was
-// renamed or fully retired. Maps the old id to its current registry key so old
-// sessions/schedules keep working instead of throwing "Invalid model". Opus 4.8
-// was renamed from the bare Vertex id "claude-opus-4-8" to the Bedrock id
-// "anthropic.claude-opus-4-8" in commit c86c8ec1. gpt-5-chat-2 and gpt-5.2-chat
-// were removed from the registry 2026-08-19 (Azure deployment retired/deprecated
-// during the migration off the Rui-owned Azure resource — see the registry
-// comment above the gpt-5.4 entry) and redirected to gpt-5.5, the current
-// non-legacy top of the same gpt5-chat family.
-const LEGACY_MODEL_ALIASES: Record<string, string> = {
-  'claude-opus-4-8': 'anthropic.claude-opus-4-8',
-  'gpt-5-chat-2': 'gpt-5.5',
-  'gpt-5.2-chat': 'gpt-5.5',
-  'gemini-2.5-flash': 'gemini-3.1-flash-lite',
-  // ENG-2178: schedules created before the OpenRouter migration pin the bare
-  // "gpt-4o-mini" id; the same model is now served via OpenRouter.
-  'gpt-4o-mini': 'openrouter/openai/gpt-4o-mini',
-};
 
 // Context passed to the diagnosis agent when the main agent fails
 export interface DiagnosisContext {
@@ -2136,53 +2120,23 @@ export class AgentModeService {
   // directly. No test spies on it directly.
 
   async getVideoGenerationDefaultModel(): Promise<string> {
-    try {
-      const setting = await settingsService.getSetting(this.videoGenerationDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported video generation default model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting video generation default model setting:', error);
-    }
+    const configured = await this.resolveConfiguredModel(this.videoGenerationDefaultModelSettingName, 'video generation default');
+    if (configured) return configured;
     // Fall back to the general default model
     return this.getDefaultModel();
   }
 
   async getCustomerSupportDefaultModel(): Promise<string> {
-    try {
-      const setting = await settingsService.getSetting(this.customerSupportDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported customer support default model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting customer support default model setting:', error);
-    }
+    const configured = await this.resolveConfiguredModel(this.customerSupportDefaultModelSettingName, 'customer support default');
+    if (configured) return configured;
     // Fall back to the general default model
     return this.getDefaultModel();
   }
 
   async getCodingAgentDefaultModel(): Promise<string> {
     const fallbackModel = 'anthropic.claude-sonnet-4-6';
-    try {
-      const setting = await settingsService.getSetting(this.codingAgentDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported coding agent default model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting coding agent default model setting:', error);
-    }
+    const configured = await this.resolveConfiguredModel(this.codingAgentDefaultModelSettingName, 'coding agent default');
+    if (configured) return configured;
     // Fall back to Sonnet 4.6
     return fallbackModel;
   }
@@ -2195,18 +2149,8 @@ export class AgentModeService {
    */
   async getVisionModel(): Promise<string> {
     const fallbackModel = this.llmModels['anthropic.claude-opus-4-8'] ? 'anthropic.claude-opus-4-8' : this.default_model;
-    try {
-      const setting = await settingsService.getSetting(this.visionModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported vision model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting vision model setting:', error);
-    }
+    const configured = await this.resolveConfiguredModel(this.visionModelSettingName, 'vision');
+    if (configured) return configured;
     return fallbackModel;
   }
 
@@ -3544,6 +3488,8 @@ export class AgentModeService {
       const mediaBudgetMs = parseInt(process.env.AGENT_MODE_MEDIA_BUDGET_MS || '420000', 10);
       const mediaGenerationDeadlineMs = mediaBudgetMs > 0 ? Date.now() + mediaBudgetMs : undefined;
       let mediaAssetsProducedThisRun = 0;
+      // ENG-922: sticky per-run flag — see priorMediaBudgetDeferred in toolDispatch.
+      let mediaBudgetDeferredThisRun = false;
       // ENG-510: the fixed soft budget above assumed fast images and leaves only ~3 min
       // of headroom below the controller's 10-min whole-turn hard cap. A single slow
       // high-quality image can take ~6–7 min, so the next variant slips past the fixed
@@ -4733,6 +4679,7 @@ export class AgentModeService {
           priorMediaCallKeys: mediaCallKeysThisRun,
           approvedRevisionImageSources,
           priorSearchCallCount: searchCallCountThisRun,
+          priorMediaBudgetDeferred: mediaBudgetDeferredThisRun,
           ports: this.buildToolDispatchPorts({
             agentRuntimeRunId,
             sessionId,
@@ -4755,6 +4702,10 @@ export class AgentModeService {
         // Carry the running per-run media-asset total forward so the next iteration's
         // budget decision knows whether this run has already produced ≥1 asset.
         mediaAssetsProducedThisRun += dispatchResult.mediaAssetsProduced;
+        // ENG-922: once any iteration defers media on the time budget, the batch is
+        // incomplete for the rest of this run — later iterations must not perform
+        // state-changing (Graph upload/creative/ad) calls against it.
+        if (dispatchResult.mediaBudgetDeferred) mediaBudgetDeferredThisRun = true;
         // ENG-426: carry the run-wide search-call count forward so the next iteration's
         // budget check sees calls made earlier THIS turn, on top of prior-turn history.
         searchCallCountThisRun += dispatchResult.searchCallsThisIteration;
@@ -5467,6 +5418,12 @@ export class AgentModeService {
         userMessage = 'Your request took longer than expected. Please try again.';
       } else if (isContextLimit || httpStatus === 400) {
         userMessage = 'I encountered an issue processing your request. Please try rephrasing your question.';
+      } else if (isLLMProviderOutage(error)) {
+        // ENG-2381: a final upstream 5xx (e.g. OpenRouter "503 Provider returned error"
+        // after its own provider failover and callLLM's transient retry) is a provider
+        // outage, not an unknown bug. Name it so the controller answers 503 instead of
+        // paging oncall as an "Unknown Error".
+        userMessage = PROVIDER_UNAVAILABLE_USER_MESSAGE;
       } else {
         userMessage = 'I apologize, but I encountered an error processing your request. Please try again.';
       }

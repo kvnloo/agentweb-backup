@@ -86,6 +86,18 @@ describe('model registry vs OpenRouter supported_parameters (ENG-1831)', () => {
     expect(routingViolation(modelId, config)).toBeNull();
   });
 
+  // The snapshot comes from /models/{id}/endpoints, which FOLLOWS aliases, so a registry id that
+  // OpenRouter has since dropped from its catalog still "passes" the parameter check above while
+  // resolving to a different snapshot. That is how `qwen/qwen3.8-max` (now an alias of
+  // `qwen/qwen3.8-max-0902`) survived: Compare then saw a served slug that belongs to a
+  // registered sibling and refused it (model_mismatch). A registry id must be the id OpenRouter
+  // lists, i.e. resolve to itself; renamed ids go through LEGACY_MODEL_ALIASES instead.
+  it.each(registry)('%s is the id OpenRouter lists, not an alias of another id', (modelId) => {
+    const upstreamModel = resolveOpenRouterUpstreamModelId(modelId);
+    expect({ upstreamModel, resolvedId: SNAPSHOT_MODELS[upstreamModel]?.resolvedId })
+      .toEqual({ upstreamModel, resolvedId: upstreamModel });
+  });
+
   it('only internal models may be tool-less (agent mode always sends tools)', () => {
     const toollessPickable = registry
       .filter(([, config]) => config.supportsTools === false && !config.internalOnly)

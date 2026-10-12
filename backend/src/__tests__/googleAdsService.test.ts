@@ -1,5 +1,6 @@
 const mockAxiosPost = jest.fn();
 const mockAxiosGet = jest.fn();
+import { echoCampaignReadBack } from './helpers/googleAdsCampaignReadBack';
 jest.mock('axios', () => ({
   post: (...args: any[]) => mockAxiosPost(...args),
   get: (...args: any[]) => mockAxiosGet(...args),
@@ -68,6 +69,7 @@ let service: GoogleAdsService;
 beforeEach(() => {
   jest.clearAllMocks();
   mockAssertPublicHostname.mockResolvedValue(undefined);
+  echoCampaignReadBack(mockAxiosPost);
   service = new GoogleAdsService();
 });
 describe('API version', () => {
@@ -769,7 +771,8 @@ describe('addProximityCriterion / removeCampaignCriterion (ENG-487)', () => {
       .mockResolvedValueOnce({ data: { results: [{ campaignCriterion: { type: 'PROXIMITY' } }] } })
       .mockResolvedValueOnce({ data: { results: [{}] } });
     await service.removeCampaignCriterion('user-123', '1234567890', 'customers/123/campaignCriteria/2~1', ['PROXIMITY']);
-    expect(mockAxiosPost).toHaveBeenCalledTimes(2);
+    // type check, remove, then ENG-2398 remove read-back
+    expect(mockAxiosPost).toHaveBeenCalledTimes(3);
     const removeBody = mockAxiosPost.mock.calls[1][1];
     expect(removeBody.operations[0].remove).toBe('customers/123/campaignCriteria/2~1');
   });

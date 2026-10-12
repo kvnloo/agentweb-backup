@@ -878,13 +878,16 @@ export async function generateImage(
           success: false,
           message: `Image generation failed after primary and fallback attempts: ${result.error || 'Fallback image generation failed'}`,
           error: result.error,
-          primaryError
+          primaryError,
+          ...(result.errorClass ? { errorClass: result.errorClass } : {})
         };
       }
       return {
         success: false,
         message: result.error || 'Failed to generate image',
-        error: result.error
+        error: result.error,
+        // ENG-1535: typed class (transient/rate_limited/policy/config/...) for the gateway.
+        ...(result.errorClass ? { errorClass: result.errorClass } : {})
       };
     }
 
