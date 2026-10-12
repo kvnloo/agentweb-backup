@@ -823,6 +823,45 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
     // issue id, so an alert email links nowhere instead of linking somewhere wrong.
     return { pageId: '', deduped: false, tracker: 'Linear', suppressed: true };
   }
+
+  // Race reconciliation (ENG-2426). The gate above is list-then-create, so two concurrent filers
+  // (two processes, or two sweeps whose in-memory suppression maps are not shared) can both see no
+  // canonical and both create — ENG-2416/2417 were filed 0.3s apart. After creating, re-list with
+  // the SAME matcher; if an older open match exists, the oldest (lowest issue number) is the
+  // canonical. "Oldest wins" is deterministic, so every racer converges on one issue. Best-effort:
+  // any failure here returns the created issue exactly as before.
+  try {
+    const issueNumber = (identifier: string) => Number(String(identifier).split('-').pop()) || Number.MAX_SAFE_INTEGER;
+    const after = await listOpenIssuesByLabel('Auto', 50);
+    const matches = after.filter(
+      (i) =>
+        i.identifier === li.identifier ||
+        (classNeedle ? classNeedle.test(i.description || '') : false) ||
+        (idKeys.length ? idKeys.some((k) => (i.description || '').includes(k)) : false) ||
+        norm(i.title) === norm(p.title),
+    );
+    const winner = matches.reduce<(typeof matches)[number] | undefined>(
+      (best, i) => (!best || issueNumber(i.identifier) < issueNumber(best.identifier) ? i : best),
+      undefined,
+    );
+    const loserId = li.id || after.find((i) => i.identifier === li.identifier)?.issueId;
+    if (winner && winner.identifier !== li.identifier && loserId) {
+      const { markIssueDuplicateOf } = await import('./linearService');
+      await addIssueComment(
+        loserId,
+        `Duplicate of ${winner.identifier}: filed concurrently with it by a racing filer (ENG-2426). Occurrence recorded there.`,
+      );
+      await markIssueDuplicateOf(loserId, winner.issueId);
+      try {
+        await addIssueComment(winner.issueId, [`Recurred on ${new Date().toISOString().slice(0, 10)} (concurrent filing ${li.identifier} folded in).`, ...contextLines(p.notionContext)].join('\n'));
+      } catch (e) {
+        console.warn('[intake] race recur-comment failed:', e instanceof Error ? e.message : e);
+      }
+      return { pageId: winner.identifier, url: `${LINEAR_ISSUE_BASE}/${winner.identifier}`, deduped: true, tracker: 'Linear' };
+    }
+  } catch (e) {
+    console.warn('[intake] auto race reconciliation failed:', e instanceof Error ? e.message : e);
+  }
   return { pageId: li.identifier, url: li.url, deduped: false, tracker: 'Linear' };
 }
 
