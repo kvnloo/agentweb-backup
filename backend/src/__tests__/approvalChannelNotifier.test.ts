@@ -338,13 +338,21 @@ describe('handleApprovalButtonTap', () => {
       expect(notifySubscribersOfApproval).not.toHaveBeenCalled();
     });
 
+    it('does NOT say the request is gone when the standing verdict simply could not be read', async () => {
+      (approvalDb.answerIfOpen as jest.Mock).mockResolvedValue({ answered: false, current: 'unknown' });
+      await tap();
+      const sent = (whatsapp.sendText as jest.Mock).mock.calls[0][1];
+      expect(sent).not.toMatch(/no longer available/i);
+      expect(sent).toMatch(/already answered/i);
+    });
+
     it('says the request is gone when there is no such approval', async () => {
       (approvalDb.answerIfOpen as jest.Mock).mockResolvedValue({ answered: false, current: null });
       await tap();
       expect(whatsapp.sendText).toHaveBeenCalledWith(PHONE, expect.stringMatching(/no longer available/i));
     });
 
-    it('lets two concurrent taps produce exactly one winner', async () => {
+    it('emails subscribers only for the tap the database says won', async () => {
       // The database gives the condition to one writer and refuses the other; model that.
       let open = true;
       (approvalDb.answerIfOpen as jest.Mock).mockImplementation(async () => {

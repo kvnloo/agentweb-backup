@@ -40,6 +40,7 @@ describe('answerIfOpen', () => {
     expect(params.ConditionExpression).toContain('attribute_exists(assetUrl)');
     expect(params.ConditionExpression).toContain('#status = :pending');
     expect(params.ExpressionAttributeValues[':status']).toBe('rejected');
+    expect(params.ExpressionAttributeValues[':pending']).toBe('pending');
   });
 
   it('treats needs_changes as still open, as Slack does', async () => {
@@ -68,12 +69,13 @@ describe('answerIfOpen', () => {
     });
   });
 
-  it('still reports not-answered when the follow-up read fails', async () => {
+  it('reports the standing verdict as UNKNOWN, not gone, when the follow-up read fails', async () => {
+    // null means the approval does not exist; a failed read must not be reported as that.
     mockUpdate.mockRejectedValue(conditionalFailure());
     mockGet.mockRejectedValue(new Error('dynamo down'));
     await expect(approvalDb.answerIfOpen(ASSET, 'approved', 'whatsapp:u1')).resolves.toEqual({
       answered: false,
-      current: null,
+      current: 'unknown',
     });
   });
 

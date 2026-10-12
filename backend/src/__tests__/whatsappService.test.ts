@@ -51,6 +51,7 @@ jest.mock('../services/settingsService', () => ({
     getSetting: jest.fn(),
     setSetting: jest.fn(),
     deleteSetting: jest.fn(),
+    deleteSettingIfValueMatches: jest.fn(),
   },
 }));
 jest.mock('../utils/secretsManager', () => ({
@@ -702,23 +703,27 @@ describe('phone -> user index', () => {
     expect(settingsService.deleteSetting).toHaveBeenCalledWith(KEY);
   });
 
-  it('clears the index only if it still points at the account asking', async () => {
-    settingsService.getSetting.mockResolvedValue({ settingValue: 'user-1' });
+  it('clears the index only if it still points at the account asking, atomically', async () => {
+    settingsService.deleteSettingIfValueMatches.mockResolvedValue(undefined);
     await unbindPhone(PHONE, 'user-1');
-    expect(settingsService.deleteSetting).toHaveBeenCalledWith(KEY);
+    expect(settingsService.deleteSettingIfValueMatches).toHaveBeenCalledWith(KEY, 'user-1');
+    expect(settingsService.deleteSetting).not.toHaveBeenCalled();
   });
 
   it('leaves the index alone when the number has been re-bound to someone else', async () => {
     // An old account disconnecting must not break the new owner's inbound taps.
-    settingsService.getSetting.mockResolvedValue({ settingValue: 'user-2' });
-    await unbindPhone(PHONE, 'user-1');
+    settingsService.deleteSettingIfValueMatches.mockRejectedValue(
+      Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' }),
+    );
+    await expect(unbindPhone(PHONE, 'user-1')).resolves.toBeUndefined();
     expect(settingsService.deleteSetting).not.toHaveBeenCalled();
   });
 
-  it('leaves the index alone when there is no row', async () => {
-    settingsService.getSetting.mockResolvedValue(null);
-    await unbindPhone(PHONE, 'user-1');
-    expect(settingsService.deleteSetting).not.toHaveBeenCalled();
+  it('surfaces a real failure rather than swallowing it', async () => {
+    settingsService.deleteSettingIfValueMatches.mockRejectedValue(
+      Object.assign(new Error('x'), { code: 'ProvisionedThroughputExceededException' }),
+    );
+    await expect(unbindPhone(PHONE, 'user-1')).rejects.toThrow('x');
   });
 
   it('resolves a bound number to its user', async () => {
@@ -742,7 +747,8 @@ describe('phone -> user index', () => {
     userDb.getUserById.mockResolvedValue(boundUser('+14155550000'));
 
     await expect(resolveUserIdByPhone(PHONE)).resolves.toBeNull();
-    expect(settingsService.deleteSetting).toHaveBeenCalledWith(KEY);
+    // Atomic and scoped to the stale value it saw: a number re-bound since is left alone.
+    expect(settingsService.deleteSettingIfValueMatches).toHaveBeenCalledWith(KEY, 'user-1');
   });
 
   it('refuses a number whose entry is not yet verified', async () => {
