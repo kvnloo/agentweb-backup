@@ -1,6 +1,7 @@
 import { resolveModelForUser } from './modelRoles';
 import { OUTCOME_JUDGE_SHADOW_FEATURE, assertOutcomeJudgeModelAllowed, DEFAULT_OUTCOME_JUDGE_MODEL, isInShadowSample } from './outcomeJudge';
 import { chatbotDb, ChatSession, ChatMessage } from "./chatbotService";
+import { summarizeAiStyleTells } from "./aiStyleGuard";
 import {
   appendConfirmedPublishNotice,
   ledgerFromSucceededFunctions,
@@ -1825,6 +1826,18 @@ export async function scoreSessionWithJudge(
   // recentMessages, so the manifest's "anywhere in this session" claim is
   // actually true and applyFabricationGuard isn't fooled by an out-of-window
   // tool call.
+  // ENG-2429: eval-only telemetry for AI-tell phrasing in Emma's output.
+  // Logged, never persisted; never affects the score or throws.
+  try {
+    const styleTells = summarizeAiStyleTells(messages);
+    if (styleTells.total > 0) {
+      console.log(
+        JSON.stringify({ event: "ai_style_tells", sessionId: usageContext?.sessionId, ...styleTells })
+      );
+    }
+  } catch {
+    // telemetry must not break scoring
+  }
   const manifest = buildToolCallManifest(messages);
   const conversationText = header
     ? `${header}\n${manifest.text}\n\n${capped.text}`
