@@ -2983,6 +2983,7 @@ const updateLeadHandler = async (req: Request, res: Response) => {
   }
 };
 router.put('/lists/:listId/leads/:leadId', updateLeadHandler);
+router.patch('/lists/:listId/leads/:leadId', updateLeadHandler);
 
 /**
  * @route DELETE /api/crm/lists/:listId/leads/:leadId
