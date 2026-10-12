@@ -109,4 +109,38 @@ describe("concurrent reconcile passes over one user", () => {
     expect(store.user.steps?.a?.status).toBe("ready");
     expect(store.user.steps?.z?.status).toBe("ready");
   });
+
+  it("does not erase a sibling step another pass recorded while this step was running", async () => {
+    const { store, deps } = sharedStore();
+    const slow = jest.fn(async () => {
+      // While `a` runs, another pass records an unrelated step.
+      store.user = {
+        ...store.user,
+        steps: { ...store.user.steps, z: { output: "kept", inputsHash: "h", generation: 1, provenance: "anticipated", status: "ready", ranAt: "t" } } as any,
+      };
+      return { made: "by-a" };
+    });
+    const dag = { a: { deps: [], gatherInputs: () => ({ x: 1 }), runner: slow } } as any;
+    await new OnboardingPipelineOrchestrator({ dag, isEnabledGlobally: () => true, ...deps }).reconcile("u1");
+
+    expect(store.user.steps?.a?.status).toBe("ready");
+    expect(store.user.steps?.z?.output).toBe("kept");
+  });
+
+  it("does not erase a sibling step when the step it ran FAILED", async () => {
+    const { store, deps } = sharedStore();
+    const boom = jest.fn(async () => {
+      store.user = {
+        ...store.user,
+        steps: { ...store.user.steps, z: { output: "kept", inputsHash: "h", generation: 1, provenance: "anticipated", status: "ready", ranAt: "t" } } as any,
+      };
+      throw new Error("runner blew up");
+    });
+    const dag = { a: { deps: [], gatherInputs: () => ({ x: 1 }), runner: boom } } as any;
+    const report = await new OnboardingPipelineOrchestrator({ dag, isEnabledGlobally: () => true, ...deps }).reconcile("u1");
+
+    expect(report.fired[0]).toMatchObject({ step: "a", status: "failed" });
+    expect(store.user.steps?.a?.status).toBe("failed");
+    expect(store.user.steps?.z?.output).toBe("kept");
+  });
 });

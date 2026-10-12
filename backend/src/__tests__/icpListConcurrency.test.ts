@@ -212,4 +212,31 @@ describe("edit made while the card is being regenerated", () => {
     expect(card.userIntent).toEqual({ name: "MY OWN NAME" });
     expect(card.id).toBe("icp_0");
   });
+
+  it("re-anchors and retries when the edit lands between the card read and the card write", async () => {
+    // The race the whole-card condition exists for: the model has returned and the
+    // write is about to go out when the user's edit is stored. An id-only slot
+    // check lets the model's text overwrite it; the whole-card check fails the
+    // write and the retry re-anchors from the edited card.
+    let injected = false;
+    table().beforeUpdate = async (params, t) => {
+      const touchesCard = Object.values(params.ExpressionAttributeNames ?? {}).includes("icpResult") && /icpCardNow/.test(params.ConditionExpression ?? "");
+      if (!touchesCard || injected) return;
+      injected = true;
+      t.row = {
+        ...t.row,
+        icpResult: t.row.icpResult.map((p: any, i: number) =>
+          i === 0 ? { ...p, name: "LATE USER EDIT", userIntent: { name: "LATE USER EDIT" } } : p,
+        ),
+      };
+    };
+    const llm = { generateJsonRobust: async () => ({ icp: modelOutput }) };
+    await regenerateSingleIcpForUser("u1", 0, regenDeps(llm));
+
+    expect(injected).toBe(true);
+    const card = table().row.icpResult[0];
+    expect(card.name).toBe("LATE USER EDIT");
+    expect(card.pain).toBe("MODEL PAIN");
+    expect(card.userIntent).toEqual({ name: "LATE USER EDIT" });
+  });
 });
