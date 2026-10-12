@@ -118,6 +118,45 @@ describe('subscriptionService', () => {
     expect(await getAllowedFeatures('u1')).toEqual(['scheduled_chats']);
   });
 
+  describe('model_compare add-on feature', () => {
+    const tiers = (rows: unknown[]) =>
+      mockedSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(rows) } as any);
+
+    it('is enabled for a tier that lists it and disabled for an explicit list without it', async () => {
+      mockedUserDb.getUserById.mockResolvedValue({ userId: 'u1', subscriptionType: 'Pro' } as any);
+      tiers([{ name: 'Pro', allowedPages: ['/'], allowedSkills: [], allowedFeatures: ['model_compare'] }]);
+      expect(await isSubscriptionFeatureEnabled('u1', 'model_compare')).toBe(true);
+      tiers([{ name: 'Pro', allowedPages: ['/'], allowedSkills: [], allowedFeatures: ['scheduled_chats'] }]);
+      expect(await isSubscriptionFeatureEnabled('u1', 'model_compare')).toBe(false);
+    });
+
+    it('stays enabled for a legacy tier with no allowedFeatures list', async () => {
+      mockedUserDb.getUserById.mockResolvedValue({ userId: 'u1', subscriptionType: 'Legacy' } as any);
+      tiers([{ name: 'Legacy', allowedPages: ['/'], allowedSkills: [] }]);
+      expect(await isSubscriptionFeatureEnabled('u1', 'model_compare')).toBe(true);
+    });
+
+    it('an org member inherits the org owner tier', async () => {
+      const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+      mockedUserDb.getUserById.mockImplementation(async (id: string) => {
+        if (id === 'member-1') return { userId: 'member-1', orgId: 'org-1', orgRole: 'member', subscriptionType: 'Free' } as any;
+        if (id === 'owner-1') return { userId: 'owner-1', subscriptionType: 'Pro' } as any;
+        return null as any;
+      });
+      mockedOrgDb.getOrgById.mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1' } as any);
+      tiers([
+        { name: 'Free', allowedPages: ['/'], allowedSkills: [], allowedFeatures: [] },
+        { name: 'Pro', allowedPages: ['/'], allowedSkills: [], allowedFeatures: ['model_compare'] },
+      ]);
+      expect(await isSubscriptionFeatureEnabled('member-1', 'model_compare')).toBe(true);
+    });
+
+    it('returns null (callers fail closed) when the tier cannot be read', async () => {
+      mockedUserDb.getUserById.mockResolvedValue(null as any);
+      expect(await isSubscriptionFeatureEnabled('ghost', 'model_compare')).toBeNull();
+    });
+  });
+
   it('denies a feature when an admin explicitly omits it', async () => {
     mockedUserDb.getUserById.mockResolvedValue({ userId: 'u1', subscriptionType: 'Community' } as any);
     mockedSettingsService.getSetting.mockResolvedValue({
@@ -135,7 +174,7 @@ describe('subscriptionService', () => {
       settingValue: JSON.stringify([{ name: 'Legacy', allowedPages: ['/'], allowedSkills: [] }]),
     } as any);
 
-    expect(await getAllowedFeatures('u1')).toEqual(['scheduled_chats']);
+    expect(await getAllowedFeatures('u1')).toEqual(['scheduled_chats', 'model_compare']);
   });
 
   it('getUserSubscriptionType resolves an org member to the owner tier dynamically (ENG-288)', async () => {

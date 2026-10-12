@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import { isNewWorkflowRoute, savedWorkflowEditPath } from '../utils/workflowBuilderRoutes';
 import ReactFlow, { 
   Node,
   Edge,
@@ -394,8 +395,11 @@ What would you like to do?`
 
       const savedWorkflow = await response.json();
       
-      if (id === 'new') {
-        navigate(`/workflows/builder/${savedWorkflow.id}`);
+      if (isNewWorkflowRoute(id)) {
+        const editPath = savedWorkflowEditPath(savedWorkflow);
+        if (editPath) {
+          navigate(editPath, { replace: true });
+        }
       }
 
       setSnackbarMessage('Workflow saved successfully');

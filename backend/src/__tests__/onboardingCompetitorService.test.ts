@@ -13,6 +13,7 @@ jest.mock("../services/db", () => ({
 }));
 
 import {
+  claimCompetitorRun,
   generateCompetitorStrategyForUser,
   COMPETITOR_STRATEGY_SYSTEM_PROMPT,
   mapCompetitorResultToMarketStrategy,
@@ -20,6 +21,7 @@ import {
   triggerCompetitorStrategyForUser,
 } from "../services/onboardingCompetitorService";
 import type { ICPPersona } from "../services/icpStatusService";
+import { COMPETITOR_TIMEOUT_MS } from "../services/competitorStatusService";
 const { userDb } = require("../services/db");
 
 class FakeLlm {
@@ -351,6 +353,74 @@ describe("onboardingCompetitorService", () => {
       expect(patch.competitorResult.per_icp).toHaveLength(2);
     });
 
+    // ENG-2308 review follow-up, confirmed by direct reproduction (same
+    // reasoning as onboardingIcpService's icpOwnershipCondition tests): the
+    // stale-claim escape hatch lets a reclaim supersede a merely-slow run;
+    // competitorReadyPatch's own guard only checks status, not WHICH run's
+    // "running" it is, so the completion WRITE itself must be conditioned
+    // on this run's own competitorStartedAt.
+    it("conditions the completion write on this run's own competitorStartedAt when expectedStartedAt is provided", async () => {
+      const personas = [samplePersona(1), samplePersona(2)];
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "ready",
+          icpResult: personas,
+        })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          competitorStatus: "running",
+          competitorStartedAt: "2026-04-24T11:59:00.000Z",
+        });
+      userDb.updateUser.mockResolvedValue({});
+      const llm = new FakeLlm([
+        sampleCompetitorResp(1),
+        sampleCompetitorResp(2),
+      ]);
+      await triggerCompetitorStrategyForUser("user-1", {
+        llm: llm as any,
+        expectedStartedAt: "2026-04-24T11:59:00.000Z",
+      } as any);
+
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toBe(
+        "#competitorStartedAt = :competitorOwnerStartedAt",
+      );
+      expect(options?.condition?.values?.[":competitorOwnerStartedAt"]).toBe(
+        "2026-04-24T11:59:00.000Z",
+      );
+    });
+
+    it("drops the completion silently when a reclaim has superseded this run (ConditionalCheckFailedException)", async () => {
+      const personas = [samplePersona(1)];
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "ready",
+          icpResult: personas,
+        })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          competitorStatus: "running",
+          competitorStartedAt: "2026-04-24T12:05:00.000Z",
+        });
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+      const llm = new FakeLlm([sampleCompetitorResp(1)]);
+
+      await expect(
+        triggerCompetitorStrategyForUser("user-1", {
+          llm: llm as any,
+          expectedStartedAt: "2026-04-24T11:59:00.000Z",
+        } as any),
+      ).resolves.toBeUndefined();
+
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    });
+
     it("no-ops (does NOT mark failed) when icpStatus is 'running' — gated by icp step", async () => {
       const personas = [samplePersona(1)];
       userDb.getUserById.mockResolvedValueOnce({
@@ -393,6 +463,62 @@ describe("onboardingCompetitorService", () => {
       logSpy.mockRestore();
 
       expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    it("runs when the indexed read lags but a consistent read shows icp ready", async () => {
+      const personas = [samplePersona(1)];
+      userDb.getUserById
+        .mockResolvedValueOnce({ userId: "user-1", icpStatus: "running" })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          competitorStatus: "running",
+          competitorStartedAt: "2026-04-24T11:59:00.000Z",
+        });
+      userDb.getUserByIdConsistent = jest.fn().mockResolvedValueOnce({
+        userId: "user-1",
+        icpStatus: "ready",
+        icpResult: personas,
+        brandGuidelines: { brandData: { brandName: "Acme" } },
+      });
+      userDb.updateUser.mockResolvedValue({});
+      const llm = new FakeLlm([sampleCompetitorResp(1)]);
+      try {
+        await triggerCompetitorStrategyForUser("user-1", { llm: llm as any });
+      } finally {
+        delete userDb.getUserByIdConsistent;
+      }
+      expect(llm.calls.length).toBeGreaterThan(0);
+      expect(userDb.updateUser.mock.calls[0][1].competitorStatus).toBe("ready");
+    });
+
+    it("releases its own claim (idle, conditioned on its startedAt) when gated by icp, so a retry is not blocked until timeout", async () => {
+      userDb.getUserById.mockResolvedValueOnce({ userId: "user-1", icpStatus: "running" });
+      userDb.updateUser.mockResolvedValue({});
+      const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
+      await triggerCompetitorStrategyForUser("user-1", {
+        expectedStartedAt: "2026-04-24T11:59:00.000Z",
+      } as any);
+      logSpy.mockRestore();
+
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      const [, patch, opts] = userDb.updateUser.mock.calls[0];
+      expect(patch).toEqual({ competitorStatus: "idle" });
+      expect(opts.condition).toBeDefined();
+      expect(JSON.stringify(opts)).toContain("2026-04-24T11:59:00.000Z");
+    });
+
+    it("does not throw when releasing the gated claim loses to a newer run", async () => {
+      userDb.getUserById.mockResolvedValueOnce({ userId: "user-1", icpStatus: "running" });
+      userDb.updateUser.mockRejectedValueOnce(
+        Object.assign(new Error("cond"), { code: "ConditionalCheckFailedException" }),
+      );
+      const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
+      await expect(
+        triggerCompetitorStrategyForUser("user-1", {
+          expectedStartedAt: "2026-04-24T11:59:00.000Z",
+        } as any),
+      ).resolves.toBeUndefined();
+      logSpy.mockRestore();
     });
 
     it("no-ops when icpStatus is 'idle' or missing — gated by icp step", async () => {
@@ -555,6 +681,34 @@ describe("onboardingCompetitorService", () => {
     });
   });
 
+  // ENG-2308 follow-up, caught live: the orchestrator's runCompetitor used
+  // to call triggerCompetitorStrategyForUser directly with nothing ever
+  // flipping competitorStatus to running first — the trigger silently
+  // dropped its result. claimCompetitorRun is the extracted, reusable
+  // claim both startCompetitorStrategyForUser and runCompetitor go through.
+  describe("claimCompetitorRun", () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it("claims the axis and returns the persisted patch", async () => {
+      userDb.updateUser.mockResolvedValue({});
+      const patch = await claimCompetitorRun("user-1");
+      expect(patch).not.toBeNull();
+      expect(patch?.competitorStatus).toBe("running");
+    });
+
+    it("returns null without throwing when it loses the claim", async () => {
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+      const patch = await claimCompetitorRun("user-1");
+      expect(patch).toBeNull();
+    });
+  });
+
   describe("startCompetitorStrategyForUser", () => {
     beforeEach(() => {
       jest.clearAllMocks();
@@ -564,12 +718,102 @@ describe("onboardingCompetitorService", () => {
       userDb.updateUser.mockResolvedValue({});
       userDb.getUserById.mockResolvedValue(null); // background returns silently
 
-      await startCompetitorStrategyForUser("user-1");
+      const result = await startCompetitorStrategyForUser("user-1");
 
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
       const startPatch = userDb.updateUser.mock.calls[0][1];
       expect(startPatch.competitorStatus).toBe("running");
       expect(startPatch.competitorStartedAt).toBeTruthy();
+      // The claim also clears the previous attempt's error (REMOVE, via null);
+      // the returned patch is the same run without that storage-only marker.
+      expect(startPatch.competitorError).toBeNull();
+      expect(result).toEqual({ ...startPatch, competitorError: undefined });
+    });
+
+    // ENG-2308: this function has two callers that can race each other — the
+    // `/competitor/start` route AND the icp-ready cascade kickoff in
+    // onboardingIcpService.ts. Without an atomic claim, a manual retry
+    // landing while the cascade is already mid-flight launches a second,
+    // fully parallel per-ICP LLM loop (confirmed live during ENG-2276
+    // production testing).
+    it("claims the running transition with a ConditionExpression guarding against a concurrent in-flight run", async () => {
+      userDb.updateUser.mockResolvedValue({});
+      userDb.getUserById.mockResolvedValue(null);
+
+      const before = Date.now();
+      await startCompetitorStrategyForUser("user-1");
+
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toBe(
+        "attribute_not_exists(#competitorStatus) OR #competitorStatus <> :competitorRunning OR #competitorStartedAt <= :competitorStaleBefore",
+      );
+      expect(options?.condition?.names).toEqual({
+        "#competitorStatus": "competitorStatus",
+        "#competitorStartedAt": "competitorStartedAt",
+      });
+      expect(options?.condition?.values?.[":competitorRunning"]).toBe("running");
+      // ENG-2308 fix-of-a-fix: stale-claim escape hatch (see icpStartClaimCondition).
+      const staleBefore = Date.parse(
+        options?.condition?.values?.[":competitorStaleBefore"],
+      );
+      expect(staleBefore).toBeGreaterThanOrEqual(before - COMPETITOR_TIMEOUT_MS - 1000);
+      expect(staleBefore).toBeLessThanOrEqual(Date.now() - COMPETITOR_TIMEOUT_MS + 1000);
+    });
+
+    it("returns null and launches no background work when it loses the race to a concurrent caller", async () => {
+      userDb.getUserById.mockResolvedValue({ userId: "user-1" });
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValue(conditionalFailure);
+
+      const result = await startCompetitorStrategyForUser("user-1");
+
+      expect(result).toBeNull();
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      // getUserById IS called once (to check eager status before claiming
+      // — ENG-2308 fix-of-a-fix).
+      expect(userDb.getUserById).toHaveBeenCalledTimes(1);
+    });
+
+    // ENG-2308 fix-of-a-fix, caught live: runCompetitor claims this SAME
+    // axis itself when the orchestrator fires the step, inside the SAME
+    // reconcile pass this function delegates to. Must check eager status
+    // and skip claiming entirely in that case.
+    it("does not claim the axis itself on the eager pipeline — leaves the claim to runCompetitor", async () => {
+      userDb.getUserById.mockResolvedValue({ userId: "user-1", useEagerPipeline: true });
+      const orchestratorWiring = require("../services/onboardingOrchestratorWiring");
+      const reconcileSpy = jest
+        .spyOn(orchestratorWiring, "reconcileForUser")
+        .mockImplementation(async () => {});
+      try {
+        const result = await startCompetitorStrategyForUser("user-1");
+
+        expect(result).toBeNull();
+        expect(userDb.updateUser).not.toHaveBeenCalled();
+        expect(reconcileSpy).toHaveBeenCalledWith("user-1");
+      } finally {
+        reconcileSpy.mockRestore();
+      }
+    });
+
+    it("re-throws a non-conditional DynamoDB error", async () => {
+      // jest.clearAllMocks() (beforeEach) does not reset the previous test's
+      // mockResolvedValue — without this, a prior eager-pipeline test's
+      // `useEagerPipeline: true` leaks in, and since the eager check now
+      // runs BEFORE the claim write, this test would short-circuit to the
+      // reconcile branch and never reach updateUser at all.
+      userDb.getUserById.mockResolvedValue({ userId: "user-1" });
+      userDb.updateUser.mockRejectedValue(
+        Object.assign(new Error("boom"), {
+          code: "ProvisionedThroughputExceededException",
+        }),
+      );
+
+      await expect(startCompetitorStrategyForUser("user-1")).rejects.toThrow(
+        "boom",
+      );
     });
   });
 

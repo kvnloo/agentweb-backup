@@ -20,6 +20,29 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const MAX_PER_EMAIL_PER_DAY = 1;
 const MAX_PER_IP_PER_DAY = 5;
+const DEFAULT_MAX_EXECUTIONS_PER_DAY = 50;
+
+// ENG-2353: aggregate ceiling independent of IP/email, so IP rotation cannot
+// produce unbounded browser/LLM spend on an instance. Per-process only; the
+// durable cross-instance store is tracked on ENG-1755 (data-plane gate).
+const globalExecutionTimestamps: number[] = [];
+
+function maxExecutionsPerDay(): number {
+  const raw = Number(process.env.LEAD_MAGNET_MAX_EXECUTIONS_PER_DAY);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : DEFAULT_MAX_EXECUTIONS_PER_DAY;
+}
+
+function isExecuteDisabled(): boolean {
+  return process.env.LEAD_MAGNET_EXECUTE_DISABLED === 'true';
+}
+
+function isGlobalCeilingReached(now = Date.now()): boolean {
+  const cutoff = now - DAY_MS;
+  while (globalExecutionTimestamps.length && globalExecutionTimestamps[0] <= cutoff) {
+    globalExecutionTimestamps.shift();
+  }
+  return globalExecutionTimestamps.length >= maxExecutionsPerDay();
+}
 
 // Periodic cleanup to prevent unbounded Map growth
 setInterval(() => {
@@ -74,6 +97,10 @@ function isValidEmail(email: string): boolean {
  */
 router.post('/execute', async (req, res) => {
   try {
+    if (isExecuteDisabled()) {
+      return res.status(503).json({ message: 'Free tasks are temporarily unavailable.' });
+    }
+
     const { email, taskInput, skillId } = req.body;
 
     // Validate required fields
@@ -103,6 +130,12 @@ router.post('/execute', async (req, res) => {
     if (isIpRateLimited(clientIp)) {
       return res.status(429).json({
         message: 'Too many requests from this address. Please try again later.',
+      });
+    }
+
+    if (isGlobalCeilingReached()) {
+      return res.status(429).json({
+        message: 'Free task capacity reached for today. Please try again later.',
       });
     }
 
@@ -138,6 +171,7 @@ router.post('/execute', async (req, res) => {
     // Record rate limit usage
     recordEmailUsage(email);
     recordIpUsage(clientIp);
+    globalExecutionTimestamps.push(Date.now());
 
     return res.status(200).json({ executionId });
   } catch (error: any) {
@@ -194,4 +228,4 @@ router.get('/status/:executionId', async (req, res) => {
 export default router;
 
 // Export for testing
-export { dailyEmailTracker, dailyIpTracker };
+export { dailyEmailTracker, dailyIpTracker, globalExecutionTimestamps };

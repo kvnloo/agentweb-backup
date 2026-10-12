@@ -1,8 +1,8 @@
 # Meta Toolkit — product boundary and tool inventory (ENG-2281)
 
 Parent: ENG-2268, "Productize the Meta toolkit as standalone agent-callable tools".
-This is a docs-only slice. Nothing at runtime changes. The product-boundary choices
-below are PROPOSALS. Open decisions are recorded on ENG-2268 for Harsha.
+The inventory originated as a docs-only slice (ENG-2281). Sections 4/5 now record
+Harsha’s approved 2026-10-06 decisions, enforced by ENG-2268 at the external boundary.
 
 Line numbers refer to `origin/main` at 720f74de9.
 
@@ -79,7 +79,8 @@ capability check reads ONLY Meta's `debug_token` `granted_scopes`
 Inferred, not verified by a live call: `ads_management` as the write minimum is Meta's
 documented model. The code does not separately gate writes on `ads_management` vs
 `ads_read`. A token that has only `ads_read` passes the capability check and then
-fails at Meta with (#200). This is recorded as open decision D4.
+fails at Meta with (#200) internally. External toolkit v1 refuses every write
+locally under D2/D4 (sections 4/5), before reaching that path.
 
 ## 3. Write-safety guards (ENG-2046 family) by tool
 
@@ -101,41 +102,33 @@ Known gap: tools 5 and 6 build their ad sets outside `callMetaMarketingApi`. Thi
 needs verification in a follow-up slice. If the gap is real, the ENG-2279 anomaly gate
 and the ENG-2280 shaper do NOT cover them. See D3.
 
-## 4. Proposed v1 external surface
+## 4. DECIDED v1 external surface
 
-The proposal is read tools plus guarded writes only. A write is in v1 only if it
-goes through the deck, money normalization, the anomaly gate and the rate shaper.
+Harsha approved D1–D5 on 2026-10-06. External v1 is **reads-only**.
+The manifest narrows the advertised action enum and `assertMetaToolkitV1Call`
+refuses every write with `MetaToolkitRefusal` before shared handler dispatch.
+REST and MCP use this same toolkit path; internal Emma behavior is unchanged.
 
-Included (proposed):
+Included:
 - `list_meta_ads_campaigns`, `get_meta_ads_metrics`, `call_meta_ads_insights_api`
-- `call_meta_marketing_api` read actions: every LIST/GET/PREVIEW/SEARCH/GET_MATCH_QUALITY
-- `call_meta_marketing_api` guarded writes: CAMPAIGN/AD_SET/AD UPDATE (status, budget,
-  bid) and AD_SET/AD/CAMPAIGN CREATE, with the approval deck and every section-3 guard
-  intact. The external caller cannot bypass the human approval surface.
+- `call_meta_marketing_api` read actions: LIST/GET/PREVIEW/SEARCH/GET_MATCH_QUALITY
 
-Excluded from v1 (proposed):
-- `launch_targeted_audience_campaign`, `launch_retargeting_campaign`: they use a
-  separate confirm path that is not proven to share the ENG-2279/2280 guards (D3).
-  They also move customer PII.
-- `call_meta_marketing_api` CUSTOM_AUDIENCE CREATE / UPLOAD_USERS: PII export to Meta.
-  This needs a data-handling decision.
-- `call_meta_marketing_api` DELETE on any entity: irreversible.
-- `call_meta_marketing_api` AD_CREATIVE UPLOAD_IMAGE / UPLOAD_VIDEO / CREATE and AD
-  COPY_AD / RETAG_UTM: these depend on AgentWeb's asset pipeline and lander UTM state.
-  They are not standalone-meaningful.
-- `params.override_tracking_check` for external callers: the waiver replay is not wired
-  through the deck flow (`emma/tools.ts:1300-1305`).
-- `client_id` (admin-only cross-client access): internal only.
+Excluded from v1:
+- All CREATE/UPDATE/DELETE actions, even with an approval deck or `ads_management`.
+- `launch_targeted_audience_campaign`, `launch_retargeting_campaign`: stay internal.
+- CUSTOM_AUDIENCE CREATE / UPLOAD_USERS: excluded; no third-party PII upload.
+- AD_CREATIVE UPLOAD_IMAGE / UPLOAD_VIDEO / CREATE and AD COPY_AD / RETAG_UTM.
+- `params.override_tracking_check` and admin-only cross-client `client_id`.
 
-## 5. Open decisions for Harsha (recorded on ENG-2268)
+## 5. DECIDED product choices (ENG-2268)
 
-- D1. Packaging and pricing of the standalone toolkit, and which plan tier exposes
-  writes at all.
-- D2. Approval surface for external callers. Options: the existing Emma deck UI, an
-  API-returned approval token, or reads-only v1.
-- D3. Should the launch_* audience tools be routed through `callMetaMarketingApi`'s
-  guarded path before they become external (an engineering follow-up)? Or should they
-  stay internal permanently?
-- D4. Should writes fail closed locally when `granted_scopes` lacks `ads_management`,
-  instead of failing at Meta with (#200)?
-- D5. PII policy for CUSTOM_AUDIENCE uploads through a third-party agent.
+- **D1 — DECIDED:** Reads on all paid tiers; writes Pro+ in a future write-capable
+  version. Pricing TBD. Documented only; no new billing/tier enforcement here.
+- **D2 — DECIDED:** Reads-only external v1. No external approval-token/deck write
+  flow in v1; CREATE/UPDATE are neither advertised nor allowed.
+- **D3 — DECIDED:** `launch_*` tools stay internal, not in the external manifest.
+- **D4 — DECIDED:** Fail closed locally on writes when `granted_scopes` lacks
+  `ads_management`. Toolkit v1 enforces this through D2: all writes are refused
+  locally regardless of scopes, so no additional token/scope lookup is needed.
+  Any future external write surface must check granted (not requested) scopes.
+- **D5 — DECIDED:** CUSTOM_AUDIENCE CREATE / UPLOAD_USERS remain excluded.

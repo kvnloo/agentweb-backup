@@ -1,5 +1,6 @@
 const mockAxiosPost = jest.fn();
 const mockAxiosGet = jest.fn();
+import { echoCampaignReadBack } from './helpers/googleAdsCampaignReadBack';
 jest.mock('axios', () => ({
   post: (...args: any[]) => mockAxiosPost(...args),
   get: (...args: any[]) => mockAxiosGet(...args),
@@ -68,6 +69,7 @@ let service: GoogleAdsService;
 beforeEach(() => {
   jest.clearAllMocks();
   mockAssertPublicHostname.mockResolvedValue(undefined);
+  echoCampaignReadBack(mockAxiosPost);
   service = new GoogleAdsService();
 });
 describe('API version', () => {
@@ -769,7 +771,8 @@ describe('addProximityCriterion / removeCampaignCriterion (ENG-487)', () => {
       .mockResolvedValueOnce({ data: { results: [{ campaignCriterion: { type: 'PROXIMITY' } }] } })
       .mockResolvedValueOnce({ data: { results: [{}] } });
     await service.removeCampaignCriterion('user-123', '1234567890', 'customers/123/campaignCriteria/2~1', ['PROXIMITY']);
-    expect(mockAxiosPost).toHaveBeenCalledTimes(2);
+    // type check, remove, then ENG-2398 remove read-back
+    expect(mockAxiosPost).toHaveBeenCalledTimes(3);
     const removeBody = mockAxiosPost.mock.calls[1][1];
     expect(removeBody.operations[0].remove).toBe('customers/123/campaignCriteria/2~1');
   });
@@ -1839,5 +1842,61 @@ describe('every Google Ads call is bounded by a timeout (CodeRabbit, #2519)', ()
     const calls = src.match(/await axios\.(get|post)\(/g) || [];
     const bounded = src.match(/timeout: (GOOGLE_ADS_HTTP_TIMEOUT_MS|15000)/g) || [];
     expect(bounded.length).toBeGreaterThanOrEqual(calls.length);
+  });
+});
+
+describe('setDeviceBidAdjustments (ENG-2036)', () => {
+  it('updates the campaign device criteria bid_modifier in one atomic mutation', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}, {}] } });
+    await service.setDeviceBidAdjustments('user-123', {
+      scope: 'CAMPAIGN',
+      customerId: '1234567890',
+      campaignId: '555',
+      adjustments: [
+        { device: 'MOBILE', bidModifier: 0 },
+        { device: 'TABLET', bidModifier: 0 },
+      ],
+    });
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+    const [url, body] = mockAxiosPost.mock.calls[0];
+    expect(url).toMatch(/campaignCriteria:mutate$/);
+    expect(body.operations).toEqual([
+      { update: { resourceName: 'customers/1234567890/campaignCriteria/555~30001', bidModifier: 0 }, updateMask: 'bid_modifier' },
+      { update: { resourceName: 'customers/1234567890/campaignCriteria/555~30002', bidModifier: 0 }, updateMask: 'bid_modifier' },
+    ]);
+  });
+
+  it('creates ad-group device bid modifiers', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.setDeviceBidAdjustments('user-123', {
+      scope: 'AD_GROUP',
+      customerId: '1234567890',
+      adGroupResourceName: 'customers/1234567890/adGroups/77',
+      adjustments: [{ device: 'DESKTOP', bidModifier: 1.25 }],
+    });
+    const [url, body] = mockAxiosPost.mock.calls[1];
+    expect(url).toMatch(/adGroupBidModifiers:mutate$/);
+    expect(body.operations).toEqual([
+      { create: { adGroup: 'customers/1234567890/adGroups/77', bidModifier: 1.25, device: { type: 'DESKTOP' } } },
+    ]);
+  });
+
+  it('updates ad-group device modifiers that already exist and creates the rest', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [
+      { adGroupBidModifier: { resourceName: 'customers/1234567890/adGroupBidModifiers/77~30001', device: { type: 'MOBILE' } } },
+    ] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}, {}] } });
+    await service.setDeviceBidAdjustments('user-123', {
+      scope: 'AD_GROUP',
+      customerId: '1234567890',
+      adGroupResourceName: 'customers/1234567890/adGroups/77',
+      adjustments: [{ device: 'MOBILE', bidModifier: 0.5 }, { device: 'TABLET', bidModifier: 1.1 }],
+    });
+    expect(mockAxiosPost.mock.calls[0][1].query).toContain("ad_group_bid_modifier.ad_group = 'customers/1234567890/adGroups/77'");
+    expect(mockAxiosPost.mock.calls[1][1].operations).toEqual([
+      { update: { resourceName: 'customers/1234567890/adGroupBidModifiers/77~30001', bidModifier: 0.5 }, updateMask: 'bid_modifier' },
+      { create: { adGroup: 'customers/1234567890/adGroups/77', bidModifier: 1.1, device: { type: 'TABLET' } } },
+    ]);
   });
 });

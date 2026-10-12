@@ -1,6 +1,20 @@
 import { crmDb, userDb, orgDb } from './db';
 import { emailService } from './emailService';
 import { sendLeadNotification } from './slackService';
+
+/**
+ * Owner userIds whose Slack lead notifications use the compact name/phone/email
+ * format (ENG-2391). Deploy env LEAD_NOTIFICATION_COMPACT_USER_IDS, comma-separated;
+ * deliberately not a persisted setting (no schema change).
+ */
+export function isCompactLeadNotificationUser(userId: string | undefined): boolean {
+  if (!userId) return false;
+  return (process.env.LEAD_NOTIFICATION_COMPACT_USER_IDS || '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean)
+    .includes(userId);
+}
 import { suppressLeadSideEffects } from '../utils/sessionList';
 import {
   bootstrapMessagingChannels,
@@ -327,6 +341,7 @@ export const leadListAlertService = {
           crmUrl,
           eventType: normalizedEventType,
           timestamp: createdAt || new Date().toISOString(),
+          compact: isCompactLeadNotificationUser(list.userId),
         });
       } catch (slackError) {
         // Log but don't fail — email was already sent successfully

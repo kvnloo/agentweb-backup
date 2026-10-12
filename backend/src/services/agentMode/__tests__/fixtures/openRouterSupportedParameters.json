@@ -1,5 +1,5 @@
 {
-  "fetchedAt": "2026-10-07T09:36:28.844Z",
+  "fetchedAt": "2026-10-08T09:37:43.920Z",
   "source": "https://openrouter.ai/api/v1/models/{id}/endpoints",
   "models": {
     "anthropic/claude-fable-5.1": {
@@ -24,6 +24,21 @@
         {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]}
       ]
     },
+    "anthropic/claude-haiku-5.5": {
+      "resolvedId": "anthropic/claude-haiku-5.5",
+      "endpoints": [
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
+        {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Claude Platform on AWS","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]}
+      ]
+    },
     "anthropic/claude-opus-4.6": {
       "resolvedId": "anthropic/claude-opus-4.6",
       "endpoints": [
@@ -43,8 +58,8 @@
         {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Claude Platform on AWS","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
@@ -59,8 +74,8 @@
         {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Claude Platform on AWS","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
@@ -75,8 +90,8 @@
         {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Claude Platform on AWS","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
@@ -129,8 +144,8 @@
       "endpoints": [
         {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Claude Platform on AWS","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
         {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
@@ -155,7 +170,8 @@
         {"provider":"Relace","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"SiliconFlow","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"StreamLake","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
-        {"provider":"Venice","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]}
+        {"provider":"Venice","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Wafer","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]}
       ]
     },
     "deepseek/deepseek-v4-pro": {
@@ -172,6 +188,7 @@
         {"provider":"Novita","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Parasail","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Reka","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Relace","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"SiliconFlow","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"StreamLake","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"Venice","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]}
@@ -194,6 +211,7 @@
         {"provider":"Novita","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Parasail","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Phala","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Relace","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Sail Research","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Sail Research","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"SiliconFlow","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","temperature","tool_choice","tools","top_k","top_p"]},
@@ -534,7 +552,7 @@
         {"provider":"Wafer","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]}
       ]
     },
-    "qwen/qwen3.8-max": {
+    "qwen/qwen3.8-max-0902": {
       "resolvedId": "qwen/qwen3.8-max-0902",
       "endpoints": [
         {"provider":"Alibaba","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]}
@@ -603,6 +621,7 @@
         {"provider":"StreamLake","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"Together","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Venice","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Wafer","supported_parameters":["include_reasoning","logit_bias","max_tokens","min_p","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","tool_choice","tools","top_k"]},
         {"provider":"Wafer","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Z.AI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","temperature","tool_choice","tools","top_k","top_p"]}
       ]
@@ -630,6 +649,7 @@
         {"provider":"GMICloud","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","temperature","tool_choice","tools","top_p"]},
         {"provider":"Inceptron","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","parallel_tool_calls","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"InferenceNet","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Io Net","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Makora","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Mistral","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"Mistral","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
@@ -664,7 +684,7 @@
         {"provider":"Crusoe","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Decart","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"DeepInfra","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
-        {"provider":"DekaLLM","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tools","top_logprobs","top_p"]},
+        {"provider":"DekaLLM","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"DigitalOcean","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"Fireworks","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Fireworks","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
@@ -677,6 +697,7 @@
         {"provider":"Near AI","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Novita","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"OpenInference","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Parasail","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Parasail","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Phala","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Reka","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},

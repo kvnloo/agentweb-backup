@@ -191,3 +191,18 @@ describe('buildSessionRow: the server owns classification', () => {
     expect(buildSessionRow(legacy, { userAgent: CHROME, nowIso: 'T' }).customFields.firstTouchChannel).toBe('Facebook');
   });
 });
+
+describe('repairEscapedQuery (HTML-escaped share links)', () => {
+  const { repairEscapedQuery } = require('../trackingIngest');
+  it('recovers UTMs from a link whose & became amp;', () => {
+    const fixed = repairEscapedQuery('https://go.dramabreak.ai/x?utm_source=dramabreakamp;utm_medium=socialamp;utm_campaign=gbtm_launchamp;utm_content=sunny');
+    expect(Object.fromEntries(new URL(fixed).searchParams)).toEqual({ utm_source: 'dramabreak', utm_medium: 'social', utm_campaign: 'gbtm_launch', utm_content: 'sunny' });
+  });
+  it('recovers &amp; and keeps the hash', () => {
+    expect(repairEscapedQuery('https://a.b/x?utm_source=a&amp;utm_medium=b#h')).toBe('https://a.b/x?utm_source=a&utm_medium=b#h');
+  });
+  it('leaves clean links and values that only contain "amp" unchanged', () => {
+    expect(repairEscapedQuery('https://a.b/x?utm_source=ok&utm_medium=s')).toBe('https://a.b/x?utm_source=ok&utm_medium=s');
+    expect(repairEscapedQuery('https://a.b/x?utm_source=campamp;x')).toBe('https://a.b/x?utm_source=campamp;x');
+  });
+});

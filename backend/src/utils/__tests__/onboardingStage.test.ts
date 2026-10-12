@@ -195,8 +195,17 @@ describe("isLifecycleNeutralOnboardingEvent", () => {
     "voice_onboarding_presented",
     "voice_onboarding_started",
     "voice_onboarding_text_fallback",
+    "brand_review_icp_regenerate",
+    "phase3_icp_selected",
   ])("marks %s as lifecycle-neutral", (event) => {
     expect(isLifecycleNeutralOnboardingEvent(event)).toBe(true);
+  });
+
+  it("every lifecycle-neutral event is also an accepted event name", () => {
+    const { LIFECYCLE_NEUTRAL_ONBOARDING_EVENTS } = require("../onboardingStage");
+    for (const e of LIFECYCLE_NEUTRAL_ONBOARDING_EVENTS) {
+      expect(ALLOWED_ONBOARDING_EVENTS.has(e)).toBe(true);
+    }
   });
 
   it("does not mark lifecycle progression events as neutral", () => {

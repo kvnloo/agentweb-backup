@@ -114,6 +114,8 @@ export interface LLMModelConfig extends GatewayReasoningConfig {
 }
 
 export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig>>> = {
+  "openrouter/anthropic/claude-haiku-5.5": {"client":null,"name":"Claude Haiku 5.5","description":"Auto-added from OpenRouter; benchmark score shown when available.","adminOnly":true,"provider":"anthropic","family":"claude-haiku","supportsTemperature":false,"supportsTools":true,"supportsToolChoice":true,"qualityScore":43.4,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-08, claude-haiku-5-5 (https://artificialanalysis.ai/)"},
+
   "openrouter/anthropic/claude-sonnet-5.5": {"client":null,"name":"Anthropic: Claude Sonnet 5.5","description":"Auto-added from OpenRouter; benchmark score shown when available.","adminOnly":true,"provider":"anthropic","family":"claude-sonnet","supportsTemperature":false,"supportsTools":true,"supportsToolChoice":true,"qualityScore":56,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-sonnet-5-5 (https://artificialanalysis.ai/)"},
   "openrouter/deepseek/deepseek-v4-pro-0813": {"client":null,"name":"DeepSeek: DeepSeek V4 Pro 0813","description":"Auto-added from OpenRouter; benchmark score shown when available.","adminOnly":true,"provider":"deepseek","family":"deepseek-pro","supportsTemperature":true,"supportsTools":true,"supportsToolChoice":true,"qualityScore":36,"qualityScoreSource":"Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-10-07, DeepSeek V4 Pro 0813 (Max), Reasoning (https://artificialanalysis.ai/models/deepseek-v4-pro)"},
   "openrouter/deepseek/deepseek-v4.1-flash": {"client":null,"name":"DeepSeek: DeepSeek V4.1 Flash","description":"Auto-added from OpenRouter; benchmark score shown when available.","adminOnly":true,"provider":"deepseek","family":"deepseek-flash","supportsTemperature":true,"supportsTools":true,"supportsToolChoice":true,"qualityScore":39.5,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, deepseek-v4-1-flash (https://artificialanalysis.ai/)"},
@@ -212,9 +214,10 @@ export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig
   //   `true` on each, gated as unproven-in-our-stack — Harsha: "i'm fine to
   //   include open source / open router stuff for all users not just
   //   isadmin". Client construction is the same lazy-loaded OpenRouter path
-  //   already used successfully by gpt-4o-mini above.) This does NOT apply
-  //   to non-OpenRouter adminOnly entries elsewhere in this registry (e.g.
-  //   anthropic.claude-opus-4-6-v1), which are gated for unrelated reasons.
+  //   already used successfully by gpt-4o-mini above.) No model is gated by
+  //   name or family (Opus 4.6 was the last such gate, removed in ENG-2028).
+  //   The only adminOnly entries are those auto-added by modelCatalogRefresh,
+  //   which stay adminOnly until a human reviews them.
   'openrouter/openai/gpt-4o-mini': {"name":"GPT-4o Mini","family":"gpt5-nano","provider":"openai","tier":"ultra_cheap","description":"Legacy lightweight model","client":null,"supportsTemperature":true,"qualityScore":6.7,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gpt-4o-mini (https://artificialanalysis.ai/)"},
   // Workload-specific research agent. It is intentionally callable only from
   // DeepResearchService, not exposed as a general chat-picker model.
@@ -232,7 +235,7 @@ export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig
   // behind), llama-3.1-8b-instruct (older sibling of the same superseded
   // family), qwen3.7-flash (no coding-benchmark coverage — it's vision-language,
   // not a coding model — and its pricing tiers up sharply past 32K-token
-  // prompts). qwen3.8-max is KEPT despite losing head-to-head to grok-4.6 at
+  // prompts). qwen3.8-max (now its -0902 snapshot, see below) is KEPT despite losing head-to-head to grok-4.6 at
   // the same $2/$6 price — it's Alibaba's only current non-deprecated entrant
   // (Qwen3.7 Max is independently confirmed deprecated too), so it stays for
   // lab/family redundancy, not because it's the top pick in its tier.
@@ -300,12 +303,15 @@ export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig
   // it runs on OpenRouter credits until an xAI BYOK key is attached.
   'openrouter/x-ai/grok-4.7': {"supportedReasoningEfforts":["xhigh","high","medium","low"],"name":"Grok 4.7","family":"grok","provider":"xai","tier":"pro","description":"SpaceXAI's latest, strong at agentic coding","client":null,"supportsTemperature":true,"supportsVision":true,"qualityScore":46.4,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, grok-4-7 (https://artificialanalysis.ai/)"},
   'openrouter/x-ai/grok-4.6': {"name":"Grok 4.6","family":"grok","provider":"xai","tier":"pro","description":"Near-Opus quality, fastest of the top tier","client":null,"supportsTemperature":true,"qualityScore":44.3,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, grok-4-6 (https://artificialanalysis.ai/)"},
-  'openrouter/deepseek/deepseek-v4-pro': {"name":"DeepSeek V4 Pro","provider":"deepseek","tier":"medium","description":"Strong coding performance at low cost","client":null,"supportsTemperature":true,"qualityScore":30,"qualityScoreSource":"Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-10-07, DeepSeek V4 Pro 0424 (Max), Reasoning (https://artificialanalysis.ai/models/deepseek-v4-pro-0424)","family":"deepseek-pro"},
+  'openrouter/deepseek/deepseek-v4-pro': {"name":"DeepSeek V4 Pro","provider":"deepseek","tier":"medium","description":"Strong coding performance at low cost","client":null,"supportsTemperature":true,"qualityScore":30.4,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, deepseek-v4-pro-0424 (https://artificialanalysis.ai/)","family":"deepseek-pro"},
   // ENG-1786 research uses AA's canonical DeepSeek V4 Flash 0731,
   // Reasoning, Max Effort variant. The prior 2026-08-19 source used 0423;
   // this benchmark snapshot does not change the OpenRouter id or pricing.
   'openrouter/deepseek/deepseek-v4-flash': {"name":"DeepSeek V4 Flash","provider":"deepseek","tier":"ultra_cheap","description":"Maximum efficiency for high-volume work","client":null,"supportsTemperature":true,"qualityScore":34.3,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, deepseek-v4-flash (https://artificialanalysis.ai/)","family":"deepseek-flash"},
-  'openrouter/qwen/qwen3.8-max': {"name":"Qwen3.8 Max","provider":"qwen","tier":"pro","description":"Alibaba's flagship model","client":null,"supportsTemperature":true,"qualityScore":40,"qualityScoreSource":"Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Qwen3.8 Max, reasoning","family":"qwen-max"},
+  // Renamed 2026-10-09: OpenRouter dropped the bare `qwen/qwen3.8-max` id from its catalog and now
+  // lists only the snapshot `qwen/qwen3.8-max-0902` (canonical qwen/qwen3.8-max-20260902), same
+  // $2/$6 price. The old id lives on as a LEGACY_MODEL_ALIASES entry so existing pins keep working.
+  'openrouter/qwen/qwen3.8-max-0902': {"name":"Qwen3.8 Max","provider":"qwen","tier":"pro","description":"Alibaba's flagship model","client":null,"supportsTemperature":true,"qualityScore":40,"qualityScoreSource":"Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Qwen3.8 Max, reasoning","family":"qwen-max"},
   // 2026-08-26 (ENG-1604): added after live cost+quality research — AA
   // Intelligence Index 52 (v4.1.1, measured, not estimated), #1 of 138
   // models in its size class, roughly matching DeepSeek V4 Pro's quality
@@ -392,7 +398,7 @@ export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig
   // "Show more", they're just no longer the default row per tier.
   'anthropic.claude-sonnet-4-5-20250929-v1:0': { name: 'Claude Sonnet 4.5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 19, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Claude Sonnet 4.5, Non-reasoning' },
   'anthropic.claude-sonnet-4-6': {"name":"Claude Sonnet 4.6","family":"claude-sonnet","provider":"anthropic","tier":"medium","description":"Previous-generation Sonnet","client":null,"supportsTemperature":true,"supportsVision":true,"legacy":true,"qualityScore":24.7,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-sonnet-4-6 (https://artificialanalysis.ai/)"},
-  'anthropic.claude-opus-4-6-v1': {"name":"Claude Opus 4.6","family":"claude-opus","provider":"anthropic","tier":"pro","description":"Previous-generation Opus","client":null,"supportsTemperature":true,"adminOnly":true,"supportsVision":true,"legacy":true,"qualityScore":26.4,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-opus-4-6 (https://artificialanalysis.ai/)"},
+  'anthropic.claude-opus-4-6-v1': {"name":"Claude Opus 4.6","family":"claude-opus","provider":"anthropic","tier":"pro","description":"Previous-generation Opus","client":null,"supportsTemperature":true,"supportsVision":true,"legacy":true,"qualityScore":26.4,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-opus-4-6 (https://artificialanalysis.ai/)"},
   // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
   // temperature is deprecated for this model
   'anthropic.claude-opus-4-8': {"name":"Claude Opus 4.8","family":"claude-opus","provider":"anthropic","tier":"pro","description":"Previous-generation Opus","client":null,"supportsTemperature":false,"supportsVision":true,"legacy":true,"qualityScore":41.8,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-opus-4-8 (https://artificialanalysis.ai/)"},
@@ -405,6 +411,30 @@ export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig
   'anthropic.claude-sonnet-5': {"name":"Claude Sonnet 5","family":"claude-sonnet","provider":"anthropic","tier":"medium","description":"Most efficient for everyday tasks","client":null,"supportsTemperature":false,"supportsVision":true,"qualityScore":38.2,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-sonnet-5 (https://artificialanalysis.ai/)"},
   // Haiku 4.5 still accepts temperature (also live-verified).
   'anthropic.claude-haiku-4-5-20251001-v1:0': {"name":"Claude Haiku 4.5","provider":"anthropic","tier":"cheap","description":"Fastest for quick answers","client":null,"supportsTemperature":true,"supportsVision":true,"qualityScore":15,"qualityScoreSource":"Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Claude Haiku 4.5, Non-reasoning","family":"claude-haiku"},
+};
+
+// Legacy model ids persisted by sessions/schedules created before a model was
+// renamed or fully retired. Maps the old id to its current registry key so old
+// sessions/schedules keep working instead of throwing "Invalid model". Opus 4.8
+// was renamed from the bare Vertex id "claude-opus-4-8" to the Bedrock id
+// "anthropic.claude-opus-4-8" in commit c86c8ec1. gpt-5-chat-2 and gpt-5.2-chat
+// were removed from the registry 2026-08-19 (Azure deployment retired/deprecated
+// during the migration off the Rui-owned Azure resource — see the registry
+// comment above the gpt-5.4 entry) and redirected to gpt-5.5, the current
+// non-legacy top of the same gpt5-chat family.
+export const LEGACY_MODEL_ALIASES: Record<string, string> = {
+  'claude-opus-4-8': 'anthropic.claude-opus-4-8',
+  'gpt-5-chat-2': 'gpt-5.5',
+  'gpt-5.2-chat': 'gpt-5.5',
+  'gemini-2.5-flash': 'gemini-3.1-flash-lite',
+  // ENG-2178: schedules created before the OpenRouter migration pin the bare
+  // "gpt-4o-mini" id; the same model is now served via OpenRouter.
+  'gpt-4o-mini': 'openrouter/openai/gpt-4o-mini',
+  // OpenRouter retired the bare `qwen/qwen3.8-max` catalog id in favour of the
+  // dated snapshot `qwen/qwen3.8-max-0902` (same price). Compare's served-model
+  // check rightly refuses the snapshot slug for the bare id, so pins move forward.
+  // Mirrored in the portal's LEGACY_MODEL_ALIAS_IDS (src/lib/modelUnavailable.ts).
+  'openrouter/qwen/qwen3.8-max': 'openrouter/qwen/qwen3.8-max-0902',
 };
 
 /**

@@ -79,6 +79,8 @@ import outcomeLedgerRoutes from "./routes/outcomeLedger";
 import crmWebhookRoutes from "./routes/crmWebhook";
 import mcpServersRoutes, { mcpOAuthPublicRouter } from "./routes/mcpServers";
 import metaToolkitRoutes from "./routes/metaToolkit";
+import { createToolBridgeRouter } from "./routes/toolBridge";
+import { toolBridgeMcp } from "./services/funding/toolBridgeService";
 import skillRoutes from "./routes/skillRoutes";
 import userSkillRoutes from "./routes/userSkillRoutes";
 import userWorkPlanRoutes from "./routes/userWorkPlanRoutes";
@@ -407,6 +409,8 @@ app.use("/api/admin", adminUsageRoutes);
 app.use("/api/admin", mcpUsageAdminRoutes);
 app.use("/api/admin", adminV0CreditsRoutes);
 app.use("/api/internal", internalUsageRoutes);
+// ENG-2109: MCP endpoint for claude -p sessions this backend spawned. Local-only; see routes/toolBridge.ts.
+app.use("/internal/tool-bridge", createToolBridgeRouter(toolBridgeMcp));
 app.use("/api/config", configRouter);
 app.use("/api/browser-cookies", browserCookiesRouter);
 app.use("/api/workflows", workflowRoutes);
@@ -458,6 +462,9 @@ app.use("/api/crm/webhooks/apollo", apolloWebhookRoutes);
 app.use("/api/crm/sequences", sequenceRoutes);
 app.use("/api/crm/companies", crmCompaniesRoutes);
 app.use("/api/crm", crmRoutes);
+// ENG-1100 — caller-scoped, Super Premium-gated recap read paths (ENG-711 consumer).
+import recapRoutes from "./routes/recap";
+app.use("/api/recap", recapRoutes);
 // ENG-918 — per-account ads-detection thresholds. Every route authenticates and re-derives
 // ad-account ownership from the caller's own connected accounts; see the route file's header.
 app.use("/api/ads-thresholds", adsThresholdsRoutes);

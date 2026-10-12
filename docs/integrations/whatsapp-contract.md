@@ -57,6 +57,8 @@ phone. Multi-tenant onboarding was evaluated and deferred — see "Deferred" bel
 | Send template | Yes | `services/whatsappService.ts` `sendTemplate` | Required outside the window. |
 | Window-aware send | Yes | `services/whatsappService.ts` `sendMessage` | Picks text vs template; this is what callers should use. |
 | Webhooks | Yes | `routes/whatsappWebhook.ts` | Inbound messages and STOP/UNSTOP. Delivery-status events are acknowledged but ignored and not persisted. |
+| Consent acknowledgement | Yes | `services/whatsappService.ts` `sendOptOutConfirmation` | The one message an opted-out number may receive. Sent AFTER the opt-out is recorded, and bypasses only the opt-out check — never the service window. |
+| Approval requests | Notify only | `services/approvalChannelNotifier.ts` | Tells the reviewer an approval is waiting and links the asset. Approving still happens in Slack or the portal — WhatsApp has no Block Kit, and reply buttons need an approved interactive template we do not have. |
 | Read history | **No** | — | Cloud API has no history endpoint. We know only what the webhook delivered. |
 | Edit / delete a sent message | **No** | — | Not supported by the API at all. Callers send a follow-up. |
 | Threads | **No** | — | Quoted replies only. |
@@ -184,21 +186,35 @@ future channel's errors are covered without editing every call site — the mist
 | Deferred | Why |
 | --- | --- |
 | Campaign / marketing sends | Meta's US (+1) marketing pause makes the primary use case undeliverable to AgentWeb's customer base. |
-| Multi-tenant Embedded Signup | Needs Meta Tech Provider verification and App Review for advanced access — and its main use case is blocked by the same pause. |
+| Multi-tenant Embedded Signup | Half-unblocked as of 2026-10-08: the business is now **verified as a Tech Provider**, confirmed in the app's Verification page. Still needs App Review for advanced access (the app is Unpublished), and its main use case remains blocked by the same US marketing pause. |
 | Group messaging | Needs an Official Business Account and caps at 8 participants. |
 | Conversational Emma over WhatsApp | Prohibited by the Business Solution Terms since 2026-01-15. |
 
 ## Live Verification
 
-Meta's sandbox test number works before business verification (up to 5 recipients),
-which is how this was exercised without waiting on the production app registration:
-send a template, reply from the handset, confirm the window opens, confirm a free-form
-reply lands, send `STOP`, confirm the next send is refused locally.
+Exercised end to end against Meta's sandbox on 2026-10-08, from `api-stage.agentweb.pro`
+(which runs `NODE_ENV=development` and so reads `dev/AgentWeb/WhatsApp` and the `Dev-`
+tables). Observed, not inferred:
 
-To exercise connecting a number: sign in, `POST /api/messaging-channels/whatsapp/verification`
-with `{"optIn": true}`, open the returned link from the handset and send the prefilled
-message, then poll `GET /api/messaging-channels/whatsapp/verification` until it reports
-`verified`. The confirmation should arrive on the handset. **Not yet confirmed against
-Meta's test number:** whether it accepts a FIRST message from a recipient. The webhook
-and verification logic can be driven without Meta by posting a payload signed with the
-app secret.
+- Meta delivered the inbound message to the staging webhook and the signature verified
+  against the real app secret.
+- `Verify <CODE>` bound the sender's number to the portal user, with
+  `optIn.source: inbound_verification`.
+- The service-window row was written with a TTL exactly 24h ahead, in epoch seconds.
+- The confirmation reply arrived on the handset.
+- `STOP` recorded the opt-out; `UNSTOP` cleared it and service resumed without
+  re-verifying the number — consent and number-ownership are tracked separately.
+
+**Settled by that run:** Meta's test number DOES accept a first inbound message from an
+allowlisted recipient. No outbound priming is needed, and the earlier note that this was
+unconfirmed no longer applies.
+
+To repeat it: sign in, `POST /api/messaging-channels/whatsapp/verification` with
+`{"optIn": true}`, open the returned `wa.me` link from the handset and send the
+prefilled message, then poll `GET /api/messaging-channels/whatsapp/verification` until
+it reports `verified`. The webhook and verification logic can also be driven without
+Meta by posting a payload signed with the app secret.
+
+Note that the test number only ever reaches the (max 5) allowlisted handsets, and
+templates are per-WABA — ones approved against the test account do not carry over to a
+production WABA.

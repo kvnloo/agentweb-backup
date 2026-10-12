@@ -716,7 +716,32 @@ export async function sendApprovalRequestWithTracking(
   });
 
   console.log("✅ Approval request sent to Slack and stored in database");
-  
+
+  // ENG-273: WhatsApp is a peer notification channel, not a second place to approve
+  // from. Deliberately placed here rather than at the four call sites: this is the one
+  // choke point every approval already passes through, so a new caller cannot forget it.
+  //
+  // The IMPORT is inside the guard, not just the call. notifyApprovalOnWhatsApp handles
+  // its own errors, but a module-load failure rejects before any of that code runs — and
+  // by this point Slack has already sent and the approval record already exists, so
+  // throwing here would fail an approval that actually succeeded and invite a duplicate
+  // on retry.
+  try {
+    const { notifyApprovalOnWhatsApp } = await import('./approvalChannelNotifier');
+    await notifyApprovalOnWhatsApp({
+      userId: request.userId,
+      approvalChannel: request.channel,
+      assetType: request.assetType,
+      filename: request.filename,
+      assetUrl: request.imageUrl,
+    });
+  } catch (notifyError: any) {
+    console.warn(
+      '[slackService] WhatsApp approval notification could not be dispatched:',
+      notifyError?.message || notifyError,
+    );
+  }
+
   return {
     messageTs: result.messageTs,
     approvalId: approval.assetUrl // Use assetUrl as the ID since that's the primary key
@@ -879,6 +904,30 @@ export interface LeadNotificationPayload {
   crmUrl?: string;
   eventType?: string;
   timestamp?: string;
+  /** Compact format (ENG-2391): render only name, phone, email; missing values shown as "—". */
+  compact?: boolean;
+}
+
+function formatCompactLeadNotificationPayload(lead: LeadNotificationPayload): {
+  text: string;
+  blocks: any[];
+} {
+  const dash = '—';
+  const value = (v?: string) => (typeof v === 'string' && v.trim() ? v.trim() : dash);
+  const name = [lead.firstName, lead.lastName].filter((v) => typeof v === 'string' && v.trim()).join(' ').trim() || dash;
+  const phone = value(lead.phone);
+  const email = value(lead.email);
+  const blocks = [
+    {
+      type: 'section',
+      fields: [
+        { type: 'mrkdwn', text: `*Name:*\n${name}` },
+        { type: 'mrkdwn', text: `*Phone:*\n${phone}` },
+        { type: 'mrkdwn', text: `*Email:*\n${email}` },
+      ],
+    },
+  ];
+  return { text: `Name: ${name} | Phone: ${phone} | Email: ${email}`, blocks };
 }
 
 /**
@@ -889,6 +938,9 @@ export function formatLeadNotificationPayload(lead: LeadNotificationPayload): {
   text: string;
   blocks: any[];
 } {
+  if (lead.compact) {
+    return formatCompactLeadNotificationPayload(lead);
+  }
   const fullName = [lead.firstName, lead.lastName].filter(Boolean).join(' ') || 'Unknown';
   const timestamp = lead.timestamp || new Date().toISOString();
   const eventLabel = lead.eventType || 'New lead added';

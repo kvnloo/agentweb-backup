@@ -98,6 +98,15 @@ const handleDynamoDbError = (error: any, operation: string) => {
  * other error here is either permanent or the caller's own guard
  * (e.g. ConditionalCheckFailedException) firing correctly.
  */
+/** Thrown when updating a memory that does not exist (ENG-2404). */
+export class MemoryNotFoundError extends Error {
+  readonly code = 'MEMORY_NOT_FOUND';
+  constructor(memoryId: string) {
+    super(`Memory not found: ${memoryId}`);
+    this.name = 'MemoryNotFoundError';
+  }
+}
+
 const withTransactionConflictRetry = async <T>(
   fn: () => Promise<T>,
   maxAttempts = 4,
@@ -1704,6 +1713,17 @@ export class UserDB {
         names?: { [key: string]: string };
         values?: { [key: string]: any };
       };
+      /**
+       * Replace single elements of a list attribute in place
+       * (`SET #a.#b[3] = :v`) instead of rewriting the whole list. Two writers
+       * touching DIFFERENT elements then never overwrite each other, which a
+       * read-modify-write of the full list cannot guarantee. `path` is the
+       * attribute (and optional nested key) holding the list. Pair it with a
+       * `condition` on the element: DynamoDB appends when the index is past the
+       * end of the list, so an index that was valid at read time must be
+       * re-asserted at write time.
+       */
+      elementSets?: Array<{ path: [string] | [string, string]; index: number; value: any }>;
     }
   ) {
     // First, get the user by userId to ensure they exist and to get their email
@@ -1721,7 +1741,7 @@ export class UserDB {
       ...updatableFields
     } = updates;
 
-    if (Object.keys(updatableFields).length === 0) {
+    if (Object.keys(updatableFields).length === 0 && !options?.elementSets?.length) {
       return user; // Return the fetched user object if no updates are needed
     }
 
@@ -1743,6 +1763,19 @@ export class UserDB {
         setExpressions.push(`#${key} = :${key}`);
         expressionAttributeValues[`:${key}`] = value;
       }
+    });
+
+    (options?.elementSets ?? []).forEach((el, n) => {
+      if (!Number.isInteger(el.index) || el.index < 0) {
+        throw new Error(`updateUser elementSets[${n}]: index must be a non-negative integer`);
+      }
+      const pathNames = el.path.map((segment, k) => {
+        const placeholder = `#el${n}p${k}`;
+        expressionAttributeNames[placeholder] = segment;
+        return placeholder;
+      });
+      expressionAttributeValues[`:el${n}`] = el.value;
+      setExpressions.push(`${pathNames.join(".")}[${el.index}] = :el${n}`);
     });
 
     if (setExpressions.length === 0 && removeExpressions.length === 0) {
@@ -7724,12 +7757,14 @@ export const crmDb = {
           }
           // NO lifecycle stamp here, deliberately. An earlier version wrote
           // `lifecycle = if_not_exists(lifecycle, 'inbox')` alongside the domain
-          // derivation. That looked harmless and was not: askCrmService reads
-          // `lead.lifecycle ?? computeLifecycle(...)`, so a STORED value short-circuits the
-          // live computation — and nothing in production advances the stored one
-          // (lifecycleService.applyAndUpdate has no production callers). A lead with an
-          // open deal, once enriched with an email, would answer "inbox" where it had
-          // answered "in_deal".
+          // derivation. That looked harmless and was not: askCrmService only trusts a
+          // live recompute over the stored value when a positive signal justifies it
+          // (ENG-2155's gate in deriveScores) — nothing in production otherwise advances
+          // the stored value on its own (lifecycleService.applyAndUpdate has no
+          // production callers). A lead stamped "inbox" here with no live signal the
+          // gate recognizes yet (e.g. an open deal not reflected in a live
+          // getDealsByOwner read) would keep answering "inbox" where it should answer
+          // "in_deal".
           //
           // The justification for stamping it here was that a missing lifecycle made the
           // row invisible to getLeadsByStatus — which is false; that function reads
@@ -7761,8 +7796,9 @@ export const crmDb = {
           // buildLeadCrmFields and throws; before this handler existed a `lifecycle` key
           // on an update was silently dropped, so nothing had to validate it. Now that it
           // is written, an arbitrary string would become permanent for the lead —
-          // askCrmService reads `lead.lifecycle ?? computeLifecycle(...)`, so a stored
-          // junk value outranks the live computation forever.
+          // askCrmService's deriveScores gate (ENG-2155) only overrides the stored
+          // value when a positive live signal justifies it, so a stored junk value can
+          // still outrank the live computation forever whenever no such signal fires.
           if (!isValidLeadLifecycle(lifecycleValue)) {
             throw new Error(`Invalid lead lifecycle: ${lifecycleValue}`);
           }
@@ -8828,10 +8864,11 @@ export const crmDb = {
           // is a deliberate divergence from createLead (it honours both via
           // buildLeadCrmFields). Neither is in this function's input type, but
           // crm.ts's bulk-import spreads `...rest` from the request body, so both can
-          // arrive at runtime. `lifecycle` is a one-way door — askCrmService reads
-          // `lead.lifecycle ?? computeLifecycle(...)`, so a stored value outranks the
-          // computation for the life of the lead — and accepting an unvalidated one from
-          // a bulk import is not a door worth opening. Pinned by test.
+          // arrive at runtime. `lifecycle` is still mostly a one-way door — askCrmService's
+          // deriveScores gate (ENG-2155) only recomputes it when a positive live signal
+          // justifies the override, so a stored value can still outrank the computation
+          // for the life of the lead whenever no such signal fires — and accepting an
+          // unvalidated one from a bulk import is not a door worth opening. Pinned by test.
           const derivedDomain = emailValue ? extractDomainFromEmail(emailValue) : null;
           if (derivedDomain) {
             item.domain = derivedDomain;
@@ -8840,13 +8877,15 @@ export const crmDb = {
           // which this originally contradicted. An earlier version of this block wrote
           // `lifecycle = 'inbox'` for any contactable lead, and that is worse here than
           // anywhere else: this is the path the HubSpot pull, the Attio pull and CSV import
-          // use, so it creates most leads. askCrmService reads
-          // `lead.lifecycle ?? computeLifecycle(...)`, nothing in production advances a
-          // stored value (lifecycleService.applyAndUpdate has no production callers), and
-          // backfill-crm-scores.ts only writes `if (lead.lifecycle == null)` — so every
-          // bulk-imported lead would have answered "inbox" for the rest of its life, no
-          // matter what it became. Before this PR those rows stored nothing and were
-          // computed correctly; stamping them would have been a regression.
+          // use, so it creates most leads. askCrmService's deriveScores gate (ENG-2155)
+          // only recomputes a stored value when a positive live signal justifies it —
+          // nothing in production otherwise advances a stored value on its own
+          // (lifecycleService.applyAndUpdate has no production callers), and
+          // backfill-crm-scores.ts only writes `if (lead.lifecycle == null)` — so a
+          // bulk-imported lead stamped "inbox" here would answer "inbox" for the rest of
+          // its life unless/until a live signal the gate recognizes (subscription, open
+          // deal, signup, churn) fires. Before this PR those rows stored nothing and were
+          // computed correctly every time; stamping them would have been a regression.
           //
           // `domain` above is different and is kept: it is derived once from the email and
           // nothing recomputes it, so storing it cannot disagree with anything.
@@ -11193,10 +11232,16 @@ export const accountMemoryDb = {
         UpdateExpression: `SET ${expressions.join(', ')}`,
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: values,
+        // UpdateItem upserts: without this, editing a memory deleted
+        // elsewhere silently re-creates it (ENG-2404).
+        ConditionExpression: 'attribute_exists(memoryId)',
         ReturnValues: 'ALL_NEW',
       }).promise();
       return result.Attributes;
-    } catch (error) {
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') {
+        throw new MemoryNotFoundError(memoryId);
+      }
       handleDynamoDbError(error, 'updateMemory');
       throw error;
     }
@@ -11358,10 +11403,16 @@ export const orgMemoryDb = {
         UpdateExpression: `SET ${expressions.join(', ')}`,
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: values,
+        // UpdateItem upserts: without this, editing a memory deleted
+        // elsewhere silently re-creates it (ENG-2404).
+        ConditionExpression: 'attribute_exists(memoryId)',
         ReturnValues: 'ALL_NEW',
       }).promise();
       return result.Attributes;
-    } catch (error) {
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') {
+        throw new MemoryNotFoundError(memoryId);
+      }
       handleDynamoDbError(error, 'updateOrgMemory');
       throw error;
     }

@@ -25,6 +25,7 @@
  * prompt contains "Brick 10" + the 125-character hook rule.
  */
 
+import { withClearedError } from "../utils/clearErrorOnClaim";
 import { LLMService } from "../utils/llmService";
 import type { LLMUsageContext } from "../utils/llmService";
 import { reportUIError } from "../utils/errorReporter";
@@ -34,7 +35,9 @@ import {
   adCopyReadyPatch,
   adCopyStartPatch,
   AdCopyResult,
+  AdCopyStatusFields,
   AdCopyVariant,
+  AD_COPY_TIMEOUT_MS,
 } from "./adCopyStatusService";
 import {
   extractIcpBrandContext,
@@ -47,6 +50,7 @@ import {
   AdVariantRatingFields,
   recentRejectedRatings,
 } from "./adVariantRatingService";
+import { trackBackgroundRun } from "../utils/trackedBackgroundRun";
 
 /** Bedrock model alias. Same family as Steps 2 / 3 / 4. */
 const AD_COPY_MODEL = "anthropic.claude-sonnet-4-6";
@@ -313,9 +317,59 @@ export async function generateAdCopyForUser(
  * If images aren't ready, fails the run with a clear error so the UI can
  * render the "waiting for images" state.
  */
+/**
+ * Restate "the `running` record is still the one THIS run claimed" as a
+ * DynamoDB condition (ENG-2308 review follow-up, confirmed by direct
+ * reproduction — see onboardingIcpService's `icpOwnershipCondition` for
+ * the full reasoning, identical here).
+ */
+function adCopyOwnershipCondition(expectedStartedAt: string) {
+  return {
+    expression: "#adCopyStartedAt = :adCopyOwnerStartedAt",
+    names: { "#adCopyStartedAt": "adCopyStartedAt" },
+    values: { ":adCopyOwnerStartedAt": expectedStartedAt },
+  };
+}
+
+/**
+ * Write a patch on behalf of THIS claimed run only, dropping it silently
+ * (instead of writing) when a later reclaim already owns the axis. No-ops
+ * to a plain unconditional write when the caller has no claim identity
+ * (backward compatible with direct callers/tests that bypass the claim).
+ */
+async function writeIfStillOurs(
+  userId: string,
+  patch: Record<string, unknown>,
+  expectedStartedAt: string | undefined,
+  logLabel: string,
+): Promise<boolean> {
+  if (!expectedStartedAt) {
+    await userDb.updateUser(userId, patch as any);
+    return true;
+  }
+  try {
+    await userDb.updateUser(userId, patch as any, {
+      condition: adCopyOwnershipCondition(expectedStartedAt),
+    });
+    return true;
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") {
+      console.warn(
+        `[onboardingAdCopyService] dropping stale ${logLabel} — a newer claim owns the axis`,
+        { userId },
+      );
+      return false;
+    }
+    throw err;
+  }
+}
+
 export async function triggerAdCopyForUser(
   userId: string,
-  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
+  deps: {
+    llm?: { generateJsonRobust: LLMService["generateJsonRobust"] };
+    expectedStartedAt?: string;
+  } = {}
 ): Promise<void> {
   const user = await userDb.getUserById(userId);
   if (!user) return;
@@ -335,9 +389,11 @@ export async function triggerAdCopyForUser(
         ? `image generation not ready (status=${adImageStatus})`
         : "image generation completed with no variants";
     const current = await userDb.getUserById(userId);
-    await userDb.updateUser(
+    await writeIfStillOurs(
       userId,
-      adCopyFailedPatch((current as any) || {}, reason) as any
+      adCopyFailedPatch((current as any) || {}, reason) as any,
+      deps.expectedStartedAt,
+      "gated-by-image-step failure",
     );
     console.error("[onboardingAdCopyService] gated by image step", {
       userId,
@@ -401,7 +457,13 @@ export async function triggerAdCopyForUser(
       // Stale completion — drop silently.
       return;
     }
-    await userDb.updateUser(userId, patch as any);
+    const wrote = await writeIfStillOurs(
+      userId,
+      patch as any,
+      deps.expectedStartedAt,
+      "completion",
+    );
+    if (!wrote) return;
     // ENG-2192: advisory rubric verdicts on the stored copy, with each variant's image when it
     // has one (inert unless CREATIVE_RUBRIC_JUDGE_ENABLED + sample rate). Not awaited; never throws.
     const { adCopyCompletedAt, adCopyResult } = patch;
@@ -420,9 +482,11 @@ export async function triggerAdCopyForUser(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const current = await userDb.getUserById(userId);
-    await userDb.updateUser(
+    await writeIfStillOurs(
       userId,
-      adCopyFailedPatch((current as any) || {}, msg) as any
+      adCopyFailedPatch((current as any) || {}, msg) as any,
+      deps.expectedStartedAt,
+      "failure",
     );
     console.error("[onboardingAdCopyService] generation failed", {
       userId,
@@ -442,16 +506,75 @@ export async function triggerAdCopyForUser(
 }
 
 /**
+ * Guards the non-running -> `running` transition with a DynamoDB
+ * ConditionExpression (ENG-2308) — same race as the icp/competitor axes: a
+ * plain read-then-write here lets two concurrent callers both observe a
+ * non-running status and both win, launching two fully parallel LLM calls.
+ *
+ * Also allows a fresh claim once the in-flight run has exceeded
+ * `AD_COPY_TIMEOUT_MS` — see `icpStartClaimCondition`'s docstring in
+ * `onboardingIcpService.ts` for why: without this, a run genuinely stuck
+ * in `running` (lost to a deploy/crash) could never be retried again.
+ */
+function adCopyStartClaimCondition(now: Date = new Date()) {
+  const staleBefore = new Date(now.getTime() - AD_COPY_TIMEOUT_MS).toISOString();
+  return {
+    expression:
+      "attribute_not_exists(#adCopyStatus) OR #adCopyStatus <> :adCopyRunning OR #adCopyStartedAt <= :adCopyStaleBefore",
+    names: { "#adCopyStatus": "adCopyStatus", "#adCopyStartedAt": "adCopyStartedAt" },
+    values: { ":adCopyRunning": "running", ":adCopyStaleBefore": staleBefore },
+  };
+}
+
+/**
+ * Claim the ad-copy axis for a new run: atomically flip `adCopyStatus` to
+ * `running` (or no-op, returning `null`, if someone else already holds
+ * the claim). Every entry point that wants to run ad-copy generation must
+ * go through here — both `/ad-copy/start` (via `startAdCopyForUser`) and
+ * the eager-pipeline orchestrator's `runAdCopy`
+ * (`onboardingOrchestratorWiring.ts`).
+ *
+ * `runAdCopy` needed this split out (ENG-2308 follow-up, caught live): it
+ * used to call `triggerAdCopyForUser` directly, with nothing ever flipping
+ * `adCopyStatus` to `running` first on a pure orchestrator-driven cascade.
+ * `adCopyReadyPatch` requires `current.adCopyStatus === 'running'` to
+ * persist a result — without it, the trigger ran for real then silently
+ * dropped its result, and the orchestrator recorded the step `ready` with
+ * a `null` output anyway, since nothing threw.
+ */
+export async function claimAdCopyRun(
+  userId: string,
+): Promise<AdCopyStatusFields | null> {
+  const patch = adCopyStartPatch();
+  try {
+    await userDb.updateUser(userId, withClearedError(patch, "adCopyError") as any, {
+      condition: adCopyStartClaimCondition(),
+    });
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") {
+      return null;
+    }
+    throw err;
+  }
+  return patch;
+}
+
+/**
  * Synchronous entry point for routes — flips status to `running` and
- * launches background work.
+ * launches background work. Returns the persisted start patch, or `null`
+ * if a concurrent caller already claimed this run (ENG-2308) — callers
+ * must NOT launch a second background generation in that case.
+ *
+ * Checks eager-pipeline status BEFORE claiming (ENG-2308 fix-of-a-fix,
+ * caught live) — same reasoning as `startIcpDiscoveryForUser`'s docstring:
+ * the orchestrator's `runAdCopy` claims this SAME axis itself when it
+ * fires the step, inside the SAME reconcile pass this function would hand
+ * off to. Claiming here too would always win first and starve it.
  */
 export async function startAdCopyForUser(
   userId: string,
   deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
-): Promise<void> {
-  await userDb.updateUser(userId, adCopyStartPatch() as any);
-  // Eager DAG sub-task 2: orchestrator owns step ordering for opted-in
-  // users; cheap no-op gated inside the orchestrator for everyone else.
+): Promise<AdCopyStatusFields | null> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const {
     isEagerPipelineActiveFor,
@@ -462,7 +585,19 @@ export async function startAdCopyForUser(
     | null;
   if (isEagerPipelineActiveFor(current)) {
     void reconcileForUser(userId);
-    return;
+    return null;
   }
-  void triggerAdCopyForUser(userId, deps);
+  const patch = await claimAdCopyRun(userId);
+  if (!patch) return null;
+  // Tracked so a deploy's graceful shutdown waits for this run (cronJobRegistry
+  // is drained before the listener closes) instead of killing it mid-flight and
+  // leaving a dead `running` claim that nothing completes until it times out.
+  trackBackgroundRun(
+    "onboardingAdCopy",
+    triggerAdCopyForUser(userId, {
+      ...deps,
+      expectedStartedAt: patch.adCopyStartedAt,
+    }),
+  );
+  return patch;
 }

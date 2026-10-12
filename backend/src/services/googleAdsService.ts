@@ -3,7 +3,12 @@ import { getGoogleAdsCredentials } from '../utils/secretsManager';
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
 import { buildUtmSpec, mergeUtmIntoQueryString, mergeUtmIntoUrl, readUtmKeys, utmKeysInQueryString, utmQueryString } from '../utils/adUtm';
-import { validateNegativeCampaignCriteria } from './googleAdsCampaignCriteria';
+import {
+  BidAdjustmentDevice,
+  buildDeviceBidAdjustmentOperations,
+  NormalizedDeviceBidAdjustments,
+  validateNegativeCampaignCriteria,
+} from './googleAdsCampaignCriteria';
 import {
   assertCountingType,
   assertConversionActionStatus,
@@ -226,6 +231,18 @@ export interface GoogleAdsServingReport {
   state: GoogleAdsServingState;
   campaigns: GoogleAdsServingCampaign[];
   blockers: GoogleAdsServingBlocker[];
+}
+
+/**
+ * ENG-592: a mutate reported success but read-back shows the requested field(s) unchanged.
+ * Never convert this into a success response.
+ */
+export class GoogleAdsReadBackError extends Error {
+  readonly code = 'unsupported_field' as const;
+  constructor(readonly resourceName: string, readonly fields: string[]) {
+    super(`unsupported_field: Google Ads accepted the update for ${resourceName} but read-back shows these field(s) did not change: ${fields.join(', ')}. The change was NOT applied; do not report it as done.`);
+    this.name = 'GoogleAdsReadBackError';
+  }
 }
 
 export class GoogleAdsService {
@@ -773,11 +790,14 @@ export class GoogleAdsService {
       update: { resourceName: budgetResourceName, amountMicros: String(amountMicros) },
       updateMask: 'amount_micros',
     }], loginCustomerId);
+    await this.verifyFieldsReadBack(customerId, accessToken, 'campaign_budget', budgetResourceName,
+      { amountMicros: { gaql: 'amount_micros', value: amountMicros } }, loginCustomerId);
   }
 
   async removeBudget(userId: string, customerId: string, budgetResourceName: string): Promise<void> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     await this.mutate(customerId, accessToken, 'campaignBudgets', [{ remove: budgetResourceName }], loginCustomerId);
+    await this.verifyRemovedReadBack(customerId, accessToken, 'campaign_budget', budgetResourceName, loginCustomerId);
   }
 
   async listBudgets(userId: string, customerId: string): Promise<{ resourceName: string; name: string; amountMicros: string; explicitlyShared: boolean; referenceCount: number }[]> {
@@ -998,6 +1018,7 @@ export class GoogleAdsService {
     if (!resourceName) throw new Error('conversion_action_resource_name is required for CONVERSION_ACTION REMOVE.');
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     await this.mutate(customerId, accessToken, 'conversionActions', [{ remove: resourceName }], loginCustomerId);
+    await this.verifyRemovedReadBack(customerId, accessToken, 'conversion_action', resourceName, loginCustomerId);
   }
 
   /**
@@ -1317,6 +1338,7 @@ export class GoogleAdsService {
       }
     }
     await this.mutate(customerId, accessToken, 'campaignCriteria', [{ remove: criterionResourceName }], loginCustomerId);
+    await this.verifyRemovedReadBack(customerId, accessToken, 'campaign_criterion', criterionResourceName, loginCustomerId);
   }
 
   async updateCampaign(userId: string, customerId: string, campaignResourceName: string, params: {
@@ -1421,7 +1443,117 @@ export class GoogleAdsService {
     }
     if (updateMask.length === 0) return false;
     await this.mutate(customerId, accessToken, 'campaigns', [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
+    await this.verifyCampaignUpdate(customerId, accessToken, campaignResourceName, params, loginCustomerId);
     return true;
+  }
+
+  /**
+   * ENG-592 / ENG-286 / ENG-312: Google can answer a campaign `:mutate` with success while a
+   * masked field is left unchanged. A success built on our own request is not evidence, so
+   * read the campaign back and fail loudly (code `unsupported_field`) on any field that did
+   * not land. The error reaches the tool caller and is logged for telemetry.
+   */
+  private async verifyCampaignUpdate(
+    customerId: string,
+    accessToken: string,
+    campaignResourceName: string,
+    params: Parameters<GoogleAdsService['updateCampaign']>[3],
+    loginCustomerId?: string,
+  ): Promise<void> {
+    const rows = await this.search(
+      customerId,
+      accessToken,
+      'SELECT campaign.resource_name, campaign.name, campaign.status, campaign.final_url_suffix, ' +
+        'campaign.campaign_budget, campaign.bidding_strategy, campaign.bidding_strategy_type, ' +
+        'campaign.network_settings.target_google_search, campaign.network_settings.target_search_network, ' +
+        'campaign.network_settings.target_content_network, campaign.network_settings.target_partner_search_network ' +
+        `FROM campaign WHERE campaign.resource_name = '${campaignResourceName}'`,
+      loginCustomerId,
+    );
+    const c = rows[0]?.campaign;
+    if (!c) {
+      throw new GoogleAdsReadBackError(campaignResourceName, ['<campaign not found on read-back>']);
+    }
+    const unchanged: string[] = [];
+    if (params.name && c.name !== params.name) unchanged.push('name');
+    if (params.status && c.status !== params.status) unchanged.push('status');
+    if (params.finalUrlSuffix !== undefined && (c.finalUrlSuffix ?? '') !== params.finalUrlSuffix) unchanged.push('final_url_suffix');
+    if (params.budgetResourceName && c.campaignBudget !== params.budgetResourceName) unchanged.push('campaign_budget');
+    if (params.biddingStrategyResourceName && c.biddingStrategy !== params.biddingStrategyResourceName) unchanged.push('bidding_strategy');
+    if (params.biddingStrategy && c.biddingStrategyType !== params.biddingStrategy) unchanged.push('bidding_strategy_type');
+    const ns = c.networkSettings ?? {};
+    for (const key of ['targetGoogleSearch', 'targetSearchNetwork', 'targetContentNetwork', 'targetPartnerSearchNetwork'] as const) {
+      if (params[key] !== undefined && Boolean(ns[key]) !== params[key]) unchanged.push(`network_settings.${key}`);
+    }
+    if (unchanged.length > 0) {
+      const err = new GoogleAdsReadBackError(campaignResourceName, unchanged);
+      console.error('[GoogleAds] read-back mismatch', { code: err.code, resource: campaignResourceName, fields: unchanged });
+      throw err;
+    }
+  }
+
+  /**
+   * ENG-2398 (ENG-592 slice 1b): generic read-back for the non-campaign mutation surface.
+   * `expected` maps a camelCase field on the read-back row (e.g. `cpcBidMicros`) to the
+   * snake_case GAQL field name used in the error. Values are compared as strings so that
+   * int64 micros (returned by REST as strings) match the numbers we sent.
+   */
+  private async verifyFieldsReadBack(
+    customerId: string,
+    accessToken: string,
+    entity: 'campaign_budget' | 'ad_group' | 'ad_group_criterion' | 'ad_group_ad',
+    resourceName: string,
+    expected: Record<string, { gaql: string; value: unknown }>,
+    loginCustomerId?: string,
+  ): Promise<void> {
+    const keys = Object.keys(expected);
+    if (keys.length === 0) return;
+    if (!this.isValidGoogleAdsResourceName(resourceName)) {
+      throw new GoogleAdsReadBackError(resourceName, ['<invalid resource name>']);
+    }
+    const rowKey = entity.replace(/_([a-z])/g, (_m, c: string) => c.toUpperCase());
+    const select = [`${entity}.resource_name`, ...keys.map((k) => `${entity}.${expected[k].gaql}`)].join(', ');
+    const rows = await this.search(
+      customerId, accessToken,
+      `SELECT ${select} FROM ${entity} WHERE ${entity}.resource_name = '${resourceName}'`,
+      loginCustomerId,
+    );
+    const row = rows[0]?.[rowKey];
+    if (!row) throw new GoogleAdsReadBackError(resourceName, [`<${entity} not found on read-back>`]);
+    const unchanged = keys.filter((k) => String(row[k] ?? '') !== String(expected[k].value ?? '')).map((k) => expected[k].gaql);
+    if (unchanged.length > 0) {
+      const err = new GoogleAdsReadBackError(resourceName, unchanged);
+      console.error('[GoogleAds] read-back mismatch', { code: err.code, resource: resourceName, fields: unchanged });
+      throw err;
+    }
+  }
+
+  /**
+   * ENG-2398 AC3: a remove is proven when the resource reads back REMOVED or is gone.
+   * Anything else (still ENABLED/PAUSED) is a loud failure, never a silent success.
+   */
+  private async verifyRemovedReadBack(
+    customerId: string,
+    accessToken: string,
+    entity: 'campaign' | 'campaign_budget' | 'ad_group' | 'ad_group_criterion' | 'ad_group_ad' | 'conversion_action' | 'campaign_criterion',
+    resourceName: string,
+    loginCustomerId?: string,
+  ): Promise<void> {
+    if (!this.isValidGoogleAdsResourceName(resourceName)) {
+      throw new GoogleAdsReadBackError(resourceName, ['<invalid resource name>']);
+    }
+    const rowKey = entity.replace(/_([a-z])/g, (_m, c: string) => c.toUpperCase());
+    const rows = await this.search(
+      customerId, accessToken,
+      `SELECT ${entity}.resource_name, ${entity}.status FROM ${entity} WHERE ${entity}.resource_name = '${resourceName}'`,
+      loginCustomerId,
+    );
+    const status = rows[0]?.[rowKey]?.status;
+    if (status !== undefined && status !== 'REMOVED') {
+      const err = new GoogleAdsReadBackError(resourceName, ['status']);
+      console.error('[GoogleAds] remove read-back mismatch', { code: err.code, resource: resourceName, status });
+      throw err;
+    }
   }
 
   async pauseCampaign(userId: string, customerId: string, campaignResourceName: string): Promise<void> {
@@ -1435,6 +1567,7 @@ export class GoogleAdsService {
   async removeCampaign(userId: string, customerId: string, campaignResourceName: string): Promise<void> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     await this.mutate(customerId, accessToken, 'campaigns', [{ remove: campaignResourceName }], loginCustomerId);
+    await this.verifyRemovedReadBack(customerId, accessToken, 'campaign', campaignResourceName, loginCustomerId);
   }
 
   /**
@@ -1597,12 +1730,21 @@ export class GoogleAdsService {
     if (params.targetRoas !== undefined) { update.targetRoas = params.targetRoas; updateMask.push('target_roas'); }
     if (updateMask.length === 0) return false;
     await this.mutate(customerId, accessToken, 'adGroups', [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
+    const expected: Record<string, { gaql: string; value: unknown }> = {};
+    if (params.name) expected.name = { gaql: 'name', value: params.name };
+    if (params.status) expected.status = { gaql: 'status', value: params.status };
+    if (params.cpcBidMicros !== undefined) expected.cpcBidMicros = { gaql: 'cpc_bid_micros', value: params.cpcBidMicros };
+    if (params.adRotationMode) expected.adRotationMode = { gaql: 'ad_rotation_mode', value: params.adRotationMode };
+    if (params.targetCpaMicros !== undefined) expected.targetCpaMicros = { gaql: 'target_cpa_micros', value: params.targetCpaMicros };
+    if (params.targetRoas !== undefined) expected.targetRoas = { gaql: 'target_roas', value: params.targetRoas };
+    await this.verifyFieldsReadBack(customerId, accessToken, 'ad_group', adGroupResourceName, expected, loginCustomerId);
     return true;
   }
 
   async removeAdGroup(userId: string, customerId: string, adGroupResourceName: string): Promise<void> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     await this.mutate(customerId, accessToken, 'adGroups', [{ remove: adGroupResourceName }], loginCustomerId);
+    await this.verifyRemovedReadBack(customerId, accessToken, 'ad_group', adGroupResourceName, loginCustomerId);
   }
 
   // ── Keywords ─────────────────────────────────────────────────────────────
@@ -1699,6 +1841,27 @@ export class GoogleAdsService {
     await this.mutate(customerId, accessToken, 'campaignCriteria', operations, loginCustomerId);
   }
 
+  /** ENG-2036: device bid adjustments (campaign DEVICE criteria or ad-group bid modifiers). */
+  async setDeviceBidAdjustments(userId: string, params: NormalizedDeviceBidAdjustments): Promise<void> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, params.customerId);
+    // Ad-group device modifiers may already exist; those need update, not create.
+    const existing: Partial<Record<BidAdjustmentDevice, string>> = {};
+    if (params.scope === 'AD_GROUP') {
+      const rows = await this.search(
+        params.customerId,
+        accessToken,
+        `SELECT ad_group_bid_modifier.resource_name, ad_group_bid_modifier.device.type FROM ad_group_bid_modifier WHERE ad_group_bid_modifier.ad_group = '${params.adGroupResourceName}'`,
+        loginCustomerId,
+      );
+      for (const r of rows) {
+        const type = r?.adGroupBidModifier?.device?.type as BidAdjustmentDevice | undefined;
+        if (type && r.adGroupBidModifier.resourceName) existing[type] = r.adGroupBidModifier.resourceName;
+      }
+    }
+    const { resource, operations } = buildDeviceBidAdjustmentOperations(params, existing);
+    await this.mutate(params.customerId, accessToken, resource, operations, loginCustomerId);
+  }
+
   async listKeywords(userId: string, customerId: string, adGroupResourceName: string): Promise<any[]> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const query = `SELECT ad_group_criterion.resource_name, ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, ad_group_criterion.status, ad_group_criterion.negative FROM ad_group_criterion WHERE ad_group_criterion.ad_group = '${adGroupResourceName}' AND ad_group_criterion.type = 'KEYWORD'`;
@@ -1723,12 +1886,17 @@ export class GoogleAdsService {
     if (params.cpcBidMicros !== undefined) { update.cpcBidMicros = String(params.cpcBidMicros); updateMask.push('cpc_bid_micros'); }
     if (updateMask.length === 0) return false;
     await this.mutate(customerId, accessToken, 'adGroupCriteria', [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
+    const expected: Record<string, { gaql: string; value: unknown }> = {};
+    if (params.status) expected.status = { gaql: 'status', value: params.status };
+    if (params.cpcBidMicros !== undefined) expected.cpcBidMicros = { gaql: 'cpc_bid_micros', value: params.cpcBidMicros };
+    await this.verifyFieldsReadBack(customerId, accessToken, 'ad_group_criterion', criterionResourceName, expected, loginCustomerId);
     return true;
   }
 
   async removeKeyword(userId: string, customerId: string, criterionResourceName: string): Promise<void> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     await this.mutate(customerId, accessToken, 'adGroupCriteria', [{ remove: criterionResourceName }], loginCustomerId);
+    await this.verifyRemovedReadBack(customerId, accessToken, 'ad_group_criterion', criterionResourceName, loginCustomerId);
   }
 
   // ── Ads ──────────────────────────────────────────────────────────────────
@@ -2025,6 +2193,9 @@ export class GoogleAdsService {
     if (params.status) { update.status = params.status; updateMask.push('status'); }
     if (updateMask.length === 0) return false;
     await this.mutate(customerId, accessToken, 'adGroupAds', [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
+    const expected: Record<string, { gaql: string; value: unknown }> = {};
+    if (params.status) expected.status = { gaql: 'status', value: params.status };
+    await this.verifyFieldsReadBack(customerId, accessToken, 'ad_group_ad', adGroupAdResourceName, expected, loginCustomerId);
     return true;
   }
 
@@ -2166,6 +2337,7 @@ export class GoogleAdsService {
   async removeAd(userId: string, customerId: string, adGroupAdResourceName: string): Promise<void> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     await this.mutate(customerId, accessToken, 'adGroupAds', [{ remove: adGroupAdResourceName }], loginCustomerId);
+    await this.verifyRemovedReadBack(customerId, accessToken, 'ad_group_ad', adGroupAdResourceName, loginCustomerId);
   }
 
   // ── Assets ───────────────────────────────────────────────────────────────

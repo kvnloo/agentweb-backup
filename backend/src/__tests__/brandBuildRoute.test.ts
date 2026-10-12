@@ -4,6 +4,7 @@ import express from "express";
 jest.mock("../services/db", () => ({
   userDb: {
     getUserById: jest.fn(),
+    getUserByIdConsistent: jest.fn(),
     getUserByEmailConsistent: jest.fn(),
     updateUser: jest.fn(),
   },
@@ -46,19 +47,52 @@ describe("POST /api/onboarding/brand-build/start", () => {
     expect(res.status).toBe(401);
   });
 
+  // ENG-2308 review: on the eager branch the route no longer persists `building`
+  // (the orchestrator's runner is the only claimant), but the client still
+  // stops polling on a non-in-flight response, so it must see one.
+  it("reports in-flight for an eager user before the orchestrator has claimed the build", async () => {
+    const wiring = require("../services/onboardingOrchestratorWiring");
+    const reconcile = jest.spyOn(wiring, "reconcileForUser").mockResolvedValue(undefined);
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      useEagerPipeline: true,
+      companyUrl: "https://example.com",
+    });
+    userDb.getUserByIdConsistent.mockResolvedValueOnce({
+      userId: "user-1",
+      useEagerPipeline: true,
+      companyUrl: "https://example.com",
+      brandBuildStatus: "failed",
+    });
+    const res = await request(app)
+      .post("/api/onboarding/brand-build/start")
+      .send({ companyUrl: "https://example.com" });
+    reconcile.mockRestore();
+    expect(res.status).toBe(200);
+    expect(res.body.status.brandBuildStatus).toBe("building");
+    expect(res.body.status.inFlight).toBe(true);
+  });
+
   it("writes a building patch and returns the new snapshot", async () => {
     userDb.updateUser.mockResolvedValue({ userId: "user-1" });
     // First call (idempotency check): user has no brandBuildStatus yet (fresh).
-    // All subsequent calls (post-write snapshot read AND any reads inside the
-    // fire-and-forget triggerBrandBuildForUser microtask): return the
-    // post-buildStartPatch state. Use mockResolvedValueOnce for the first
-    // value, mockResolvedValue as the fallback for everything after.
+    // Second call (eager-pipeline check): still fresh, non-eager.
+    // Any FURTHER call — including a regression re-read on the win path, or
+    // the real (unmocked) fire-and-forget triggerBrandBuildForUser's own
+    // internal read — gets a deliberately CONFLICTING stale snapshot. The
+    // response must be built from the claim patch, not from any getUserById
+    // call after it (ENG-2308 review follow-up — this route used to re-read
+    // via the eventually-consistent UserIdIndex GSI on the win path, same
+    // staleness risk icp/competitor/creative-dir/ad-copy's own routes
+    // already had to fix). If the regression ever comes back, this stale
+    // "failed" value is what the response would wrongly surface.
     userDb.getUserById
+      .mockResolvedValueOnce({ userId: "user-1" })
       .mockResolvedValueOnce({ userId: "user-1" })
       .mockResolvedValue({
         userId: "user-1",
-        brandBuildStatus: "building",
-        brandBuildStartedAt: "2026-04-24T12:00:00.000Z",
+        brandBuildStatus: "failed",
+        brandBuildError: "stale read must never reach the response",
       });
     // A real start supplies a website URL — without one the build is
     // dead-on-arrival (see the needsUrl guard tests below).
@@ -66,12 +100,17 @@ describe("POST /api/onboarding/brand-build/start", () => {
       .post("/api/onboarding/brand-build/start")
       .send({ companyUrl: "https://example.com" });
     expect(res.status).toBe(200);
-    expect(userDb.updateUser).toHaveBeenCalledWith(
-      "user-1",
+    // The claim write (via claimBrandBuildRun) passes a 3rd ConditionExpression
+    // argument now (ENG-2308), so toHaveBeenCalledWith's exact-arity match on
+    // just 2 args no longer applies — assert on the actual claim call instead.
+    // Call order: [0] the inputPatch-only write (productDomain), [1] the claim.
+    expect(userDb.updateUser.mock.calls[1][1]).toEqual(
       expect.objectContaining({ brandBuildStatus: "building" })
     );
+    expect(userDb.updateUser.mock.calls[1][2]?.condition).toBeTruthy();
     expect(res.body.status.brandBuildStatus).toBe("building");
     expect(res.body.status.inFlight).toBe(true);
+    expect(res.body.status.brandBuildError).toBeUndefined();
   });
 
   it("is idempotent: skips re-trigger when status is already building", async () => {
@@ -174,29 +213,39 @@ describe("POST /api/onboarding/brand-build/start", () => {
   it("starts a build using a URL already persisted on the User record even when the body URL is empty", async () => {
     userDb.updateUser.mockResolvedValue({ userId: "user-1" });
     // The guard resolves the URL from the FIRST read (the `existing` fetch),
-    // which carries the persisted productDomain. The fallback reads (used by
-    // the fire-and-forget trigger microtask) intentionally omit the URL so the
-    // background trigger fast-fails at pickCompanyUrl instead of launching a
-    // real scrape — keeping this unit test hermetic, exactly like the
-    // "writes a building patch" case above.
+    // which carries the persisted productDomain. The second read (eager
+    // check) is fresh/non-eager. Any FURTHER read — including a regression
+    // re-read on the win path, or the real (unmocked) fire-and-forget
+    // trigger microtask's own internal read — gets a deliberately
+    // CONFLICTING stale snapshot, so the response can only be proven to
+    // come from the claim patch, not a later getUserById call (same
+    // staleness-risk fix as the "writes a building patch" case above).
     userDb.getUserById
+      .mockResolvedValueOnce({
+        userId: "user-1",
+        productDomain: "https://saved.com",
+      })
       .mockResolvedValueOnce({
         userId: "user-1",
         productDomain: "https://saved.com",
       })
       .mockResolvedValue({
         userId: "user-1",
-        brandBuildStatus: "building",
-        brandBuildStartedAt: "2026-04-24T12:00:00.000Z",
+        brandBuildStatus: "failed",
+        brandBuildError: "stale read must never reach the response",
       });
     const res = await request(app).post("/api/onboarding/brand-build/start");
     expect(res.status).toBe(200);
-    expect(userDb.updateUser).toHaveBeenCalledWith(
-      "user-1",
+    // No companyUrl/companyName/goal in the body, so there's no separate
+    // inputPatch write — the claim (3 args, ConditionExpression) is the
+    // only call. Same arity issue as the test above.
+    expect(userDb.updateUser.mock.calls[0][1]).toEqual(
       expect.objectContaining({ brandBuildStatus: "building" })
     );
+    expect(userDb.updateUser.mock.calls[0][2]?.condition).toBeTruthy();
     expect(res.body.status.brandBuildStatus).toBe("building");
     expect(res.body.status.needsUrl).toBeUndefined();
+    expect(res.body.status.brandBuildError).toBeUndefined();
   });
 });
 

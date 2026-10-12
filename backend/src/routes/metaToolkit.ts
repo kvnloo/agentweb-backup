@@ -4,7 +4,7 @@
  * Mounts the ENG-2283 gateway so an external agent can list and call the ENG-2282 manifest:
  *   GET  /api/meta-toolkit/tools              -> manifest (bearer auth required)
  *   POST /api/meta-toolkit/tools/:name/call   -> handleMetaToolkitCall
- * Auth, account resolution, write guards and metering all live in the gateway; this file only
+ * Auth, account resolution, reads-only enforcement and metering all live in the gateway; this file only
  * maps HTTP <-> gateway and errors -> status codes. No new storage.
  */
 import { Router, type Request, type Response } from 'express';
@@ -70,7 +70,7 @@ router.post('/tools/:name/call', async (req: Request, res: Response) => {
 /**
  * ENG-2295 — stateless MCP (JSON-RPC 2.0) surface so an MCP client such as Claude can add the
  * toolkit as a remote server (`claude mcp add --transport http <base>/api/meta-toolkit/mcp`).
- * Same gateway as the REST routes above: auth, account resolution, write guards and metering are
+ * Same gateway as the REST routes above: auth, account resolution, reads-only enforcement and metering are
  * not re-implemented here. No session state, no storage.
  */
 export const META_TOOLKIT_MCP_PROTOCOL_VERSION = '2025-06-18';
