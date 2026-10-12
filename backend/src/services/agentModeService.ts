@@ -16865,8 +16865,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // readFileContent.test.ts/emma.readFileContentTool.test.ts's direct
   // real-instance calls all call agentModeService.readFileContent(...)
   // directly.
-  public async readFileContent(fileUrl: string): Promise<any> {
-    return miscImpl.readFileContent(fileUrl);
+  public async readFileContent(fileUrl: string, caller?: miscImpl.ReadFileCallerContext): Promise<any> {
+    return miscImpl.readFileContent(fileUrl, caller);
   }
 
   // ENG-2103 (F2 design-decision-list follow-up, Pattern A): body moved

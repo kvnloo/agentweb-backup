@@ -71,8 +71,8 @@ jest.mock('../controllers/release', () => ({ getReleases: jest.fn() }));
 jest.mock('../controllers/docsController', () => ({ getUserReleaseNotes: jest.fn() }));
 
 import agentModeRoutes from '../routes/agentMode';
-import { __resetBranchRateLimitCacheForTests } from '../controllers/chatBranchController';
-import { __resetBranchIdempotencyForTests } from '../services/agentMode/chatBranching';
+import { __resetBranchRateLimitCacheForTests, __resetBranchLookupCacheForTests } from '../controllers/chatBranchController';
+import { __resetBranchIdempotencyForTests, __lookupWindowUsersForTests } from '../services/agentMode/chatBranching';
 
 const SECRET = 'route-test-secret';
 const bearer = (userId: string, extra: Record<string, unknown> = {}) =>
@@ -91,6 +91,7 @@ beforeEach(() => {
   mockFake.tables.clear();
   mockClaimed.clear();
   __resetBranchRateLimitCacheForTests();
+  __resetBranchLookupCacheForTests();
   __resetBranchIdempotencyForTests();
   mockGetSetting.mockReset();
   mockGetSetting.mockImplementation(async (name: string) => (name === 'chat_branching_enabled' ? { settingName: name, settingValue: 'true' } : null));
@@ -254,5 +255,278 @@ describe('per-user cap (AW-Settings chat_branching_max_per_hour)', () => {
     expect((await post()).status).toBe(429);
     const reads = mockGetSetting.mock.calls.filter((c) => c[0] === 'chat_branching_max_per_hour').length;
     expect(reads).toBe(1); // second request served from the ~60s cache
+  });
+});
+
+describe('GET /session/:id/branches (ENG-112 family listing)', () => {
+  const LIST = (id: string) => `/api/agent-mode/session/${id}/branches`;
+  const get = (id: string, user = 'owner') => request(app).get(LIST(id)).set('Authorization', bearer(user));
+  const at = (n: number) => `2026-10-${String(10 + Math.floor(n / 100)).padStart(2, '0')}T00:${String(Math.floor(n / 60) % 60).padStart(2, '0')}:${String(n % 60).padStart(2, '0')}.000Z`;
+  const link = (sessionId: string, rootSessionId: string, branchedAt = at(1)) => ({ sessionId, rootSessionId, messageIndex: 2, branchedAt });
+  const seed = (sessionId: string, over: Record<string, unknown> = {}) =>
+    mockFake.seedSession({
+      sessionId, userId: 'owner', title: `T-${sessionId}`, llmModel: 'gpt-5.5', messageCount: 3, portalType: 'agent',
+      createdAt: at(1), updatedAt: at(1), messages: [], ...over,
+    });
+
+  beforeEach(() => {
+    mockFake.indexPageSize = undefined;
+    mockFake.indexLeaksOtherUsers = false;
+    mockFake.indexQueries.length = 0;
+    mockFake.messageQueries.length = 0;
+  });
+
+  it('listing authorises on the session RECORD only: never reads (or migrates) messages, even for a foreign session', async () => {
+    seed('s-rec', { messageCount: 7 });
+    expect((await get('s-rec', 'stranger')).status).toBe(403);
+    expect(mockFake.messageQueries).toHaveLength(0);
+    const own = await get('s-rec');
+    expect(own.status).toBe(200);
+    expect(own.body.sessions[0].messageCount).toBe(7);
+    expect(mockFake.messageQueries).toHaveLength(0);
+  });
+
+  it('401 without a token, and no work is done', async () => {
+    expect((await request(app).get(LIST('s-1'))).status).toBe(401);
+    expect(mockGetSetting).not.toHaveBeenCalled();
+    expect(mockFake.indexQueries).toHaveLength(0);
+  });
+
+  it.each([[null], [{ settingValue: 'false' }], [{ settingValue: 'TRUE' }]])('flag off (%j) -> 404 chat_branching_disabled, nothing queried', async (row) => {
+    mockGetSetting.mockResolvedValue(row);
+    const out = await get('s-1');
+    expect(out.status).toBe(404);
+    expect(out.body.code).toBe('chat_branching_disabled');
+    expect(mockFake.indexQueries).toHaveLength(0);
+  });
+
+  it('403 for a non-owner (nothing queried), 404 for a missing or archived session, 400 for a garbage id', async () => {
+    expect((await get('s-1', 'stranger')).status).toBe(403);
+    expect((await get('nope')).status).toBe(404);
+    seed('arch', { archived: true });
+    expect((await get('arch')).status).toBe(404);
+    expect((await get('a%20b')).status).toBe(400);
+    expect(mockFake.indexQueries).toHaveLength(0);
+  });
+
+  it('resolves the family from the ROOT and from a LEAF, createdAt ascending, with the documented shape', async () => {
+    seed('R', { createdAt: at(1), updatedAt: at(90) });
+    seed('B1', { createdAt: at(5), updatedAt: at(10), branchedFrom: link('R', 'R', at(5)) });
+    seed('B2', { createdAt: at(3), updatedAt: at(99), branchedFrom: link('B1', 'R', at(3)) });
+    seed('OTHER-ROOT', { createdAt: at(2) });
+    seed('OTHER-BRANCH', { createdAt: at(4), branchedFrom: link('OTHER-ROOT', 'OTHER-ROOT') });
+    for (const id of ['R', 'B1', 'B2']) {
+      const out = await get(id);
+      expect(out.status).toBe(200);
+      expect(out.headers['cache-control']).toBe('no-store');
+      expect(out.body.rootSessionId).toBe('R');
+      expect(out.body.sessions.map((s: any) => s.sessionId)).toEqual(['R', 'B2', 'B1']);
+      expect(out.body.truncated).toBeUndefined();
+    }
+    const out = await get('R');
+    expect(out.body.sessions[0]).toEqual({ sessionId: 'R', title: 'T-R', llmModel: 'gpt-5.5', messageCount: 3, updatedAt: at(90), createdAt: at(1) });
+    expect(out.body.sessions[1].branchedFrom).toEqual(link('B1', 'R', at(3)));
+    expect(Object.keys(out.body.sessions[1]).sort()).toEqual(['branchedFrom', 'createdAt', 'llmModel', 'messageCount', 'sessionId', 'title', 'updatedAt']);
+  });
+
+  it('a chat with no branches answers with just itself', async () => {
+    seed('solo');
+    const out = await get('solo');
+    expect(out.body).toEqual({ rootSessionId: 'solo', sessions: [expect.objectContaining({ sessionId: 'solo' })] });
+  });
+
+  it('uses ONE projected UserIdIndex query walk, never a scan', async () => {
+    seed('R');
+    seed('B1', { branchedFrom: link('R', 'R') });
+    await get('R');
+    expect(mockFake.indexQueries).toHaveLength(1);
+    expect(mockFake.indexQueries[0]).toMatchObject({ IndexName: 'UserIdIndex', KeyConditionExpression: 'userId = :userId' });
+    expect(mockFake.indexQueries[0].ProjectionExpression).toContain('branchedFrom');
+    expect(mockFake.indexQueries[0].ProjectionExpression).not.toContain('messages');
+  });
+
+  it('excludes archived orphans (a branch born archived and never revealed) and an archived root', async () => {
+    seed('R');
+    seed('B1', { branchedFrom: link('R', 'R') });
+    seed('ORPHAN', { archived: true, branchedFrom: link('R', 'R') });
+    expect((await get('R')).body.sessions.map((s: any) => s.sessionId)).toEqual(['R', 'B1']);
+    mockFake.session('R');
+    seed('R', { archived: true });
+    const fromLeaf = await get('B1');
+    expect(fromLeaf.status).toBe(200);
+    expect(fromLeaf.body.rootSessionId).toBe('R');
+    expect(fromLeaf.body.sessions.map((s: any) => s.sessionId)).toEqual(['B1']);
+    expect((await get('R')).status).toBe(404);
+  });
+
+  it("never leaks another user's sessions, even sharing the root id (and even if the index returned them)", async () => {
+    seed('R');
+    seed('MINE', { branchedFrom: link('R', 'R') });
+    seed('THEIRS', { userId: 'someone-else', branchedFrom: link('R', 'R') });
+    expect((await get('R')).body.sessions.map((s: any) => s.sessionId)).toEqual(['R', 'MINE']);
+    mockFake.indexLeaksOtherUsers = true;
+    const leaky = await get('R');
+    expect(leaky.body.sessions.map((s: any) => s.sessionId)).toEqual(['R', 'MINE']);
+    expect(JSON.stringify(leaky.body)).not.toContain('THEIRS');
+  });
+
+  it('legacy branches (row-0 branchOrigin only, no branchedFrom) are not grouped', async () => {
+    seed('R');
+    seed('LEGACY');
+    mockFake.seedMessages('LEGACY', [{ role: 'system', content: 's', metadata: { branchOrigin: { sourceSessionId: 'R', sourceMessageIndex: 2, branchedAt: 'x' } } }]);
+    expect((await get('R')).body.sessions.map((s: any) => s.sessionId)).toEqual(['R']);
+  });
+
+  it('follows LastEvaluatedKey across index pages', async () => {
+    seed('R', { updatedAt: at(1) });
+    for (let i = 0; i < 7; i++) seed(`B${i}`, { createdAt: at(10 + i), updatedAt: at(10 + i), branchedFrom: link('R', 'R') });
+    for (let i = 0; i < 5; i++) seed(`N${i}`, { updatedAt: at(30 + i) });
+    mockFake.indexPageSize = 3;
+    const out = await get('R');
+    expect(out.body.sessions.map((s: any) => s.sessionId)).toEqual(['R', ...Array.from({ length: 7 }, (_, i) => `B${i}`)]);
+    expect(out.body.truncated).toBeUndefined();
+    expect(mockFake.indexQueries).toHaveLength(5); // 13 sessions / 3 per page
+    expect(mockFake.indexQueries[1].ExclusiveStartKey).toBeDefined();
+  });
+
+  it('caps at 50 sessions (root + 49) and stops walking early with truncated:true', async () => {
+    seed('R', { createdAt: at(1), updatedAt: at(1) });
+    for (let i = 0; i < 60; i++) seed(`B${String(i).padStart(2, '0')}`, { createdAt: at(10 + i), updatedAt: at(10 + i), branchedFrom: link('R', 'R') });
+    mockFake.indexPageSize = 10;
+    const out = await get('R');
+    expect(out.body.sessions).toHaveLength(50);
+    expect(out.body.sessions[0].sessionId).toBe('R');
+    expect(out.body.truncated).toBe(true);
+    expect(mockFake.indexQueries.length).toBeLessThan(7); // 61 rows / 10 per page: stopped at the cap
+  });
+
+  it('exactly 49 branches fit without truncation', async () => {
+    seed('R');
+    for (let i = 0; i < 49; i++) seed(`B${i}`, { createdAt: at(10 + i), branchedFrom: link('R', 'R') });
+    const out = await get('R');
+    expect(out.body.sessions).toHaveLength(50);
+    expect(out.body.truncated).toBeUndefined();
+  });
+
+  it('stops after 20 index pages and reports truncated:true', async () => {
+    seed('R');
+    for (let i = 0; i < 30; i++) seed(`N${i}`, { updatedAt: at(10 + i) });
+    mockFake.indexPageSize = 1;
+    const out = await get('R');
+    expect(mockFake.indexQueries).toHaveLength(20);
+    expect(out.body.truncated).toBe(true);
+    expect(out.body.sessions.map((s: any) => s.sessionId)).toEqual(['R']);
+  });
+
+  it('queries the index newest-first (ScanIndexForward=false) so truncation drops the OLDEST sessions, and still returns createdAt ascending', async () => {
+    seed('R', { createdAt: at(1), updatedAt: at(1) });
+    for (let i = 0; i < 30; i++) seed(`N${i}`, { createdAt: at(10 + i), updatedAt: at(10 + i) });
+    seed('NEWEST', { createdAt: at(200), updatedAt: at(200), branchedFrom: link('R', 'R', at(200)) });
+    seed('MID', { createdAt: at(100), updatedAt: at(100), branchedFrom: link('R', 'R', at(100)) });
+    mockFake.indexPageSize = 1;
+    const out = await get('R');
+    expect(mockFake.indexQueries[0].ScanIndexForward).toBe(false);
+    expect(out.body.truncated).toBe(true); // 20-page cap hit with more index left
+    expect(out.body.sessions.map((s: any) => s.sessionId)).toEqual(['R', 'MID', 'NEWEST']);
+  });
+
+  it('exactly 49 branches with more (non-matching) pages left is NOT truncated; 50 branches is', async () => {
+    seed('R');
+    for (let i = 0; i < 49; i++) seed(`B${String(i).padStart(2, '0')}`, { createdAt: at(10 + i), updatedAt: at(100 + i), branchedFrom: link('R', 'R') });
+    for (let i = 0; i < 25; i++) seed(`N${i}`, { updatedAt: at(300 + i) });
+    mockFake.indexPageSize = 7;
+    const exact = await get('R');
+    expect(exact.body.sessions).toHaveLength(50);
+    expect(exact.body.truncated).toBeUndefined();
+    seed('B49', { createdAt: at(60), updatedAt: at(160), branchedFrom: link('R', 'R') });
+    const over = await get('R');
+    expect(over.body.sessions).toHaveLength(50);
+    expect(over.body.truncated).toBe(true);
+  });
+
+  describe('per-user lookup rate limit', () => {
+    const lookupReads = () => mockGetSetting.mock.calls.filter((c) => c[0] === 'branch_family_max_per_minute').length;
+    beforeEach(() => {
+      seed('R');
+      seed('Rb', { userId: 'other' });
+    });
+
+    it('allows 20 per minute, 429 TOO_MANY_BRANCH_LOOKUPS on the 21st with a neutral message, and does no index work for it', async () => {
+      for (let i = 0; i < 20; i++) expect((await get('R')).status).toBe(200);
+      const queriesBefore = mockFake.indexQueries.length;
+      const out = await get('R');
+      expect(out.status).toBe(429);
+      expect(out.body.code).toBe('TOO_MANY_BRANCH_LOOKUPS');
+      expect(out.body.message).toBe('Too many requests. Please try again in a moment.');
+      expect(mockFake.indexQueries.length).toBe(queriesBefore);
+    });
+
+    it('the window slides: allowed again a minute later', async () => {
+      const spy = jest.spyOn(Date, 'now');
+      try {
+        const t0 = 1_800_000_000_000;
+        spy.mockReturnValue(t0);
+        for (let i = 0; i < 20; i++) await get('R');
+        expect((await get('R')).status).toBe(429);
+        spy.mockReturnValue(t0 + 60_001);
+        expect((await get('R')).status).toBe(200);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('is per user: one user exhausting the limit does not affect another', async () => {
+      seed('S2', { userId: 'other' });
+      for (let i = 0; i < 21; i++) await get('R');
+      expect((await get('R')).status).toBe(429);
+      expect((await get('S2', 'other')).status).toBe(200);
+    });
+
+    it('setting 0 = unlimited; a custom value is honoured; settings are cached ~60s', async () => {
+      mockGetSetting.mockImplementation(async (name: string) =>
+        name === 'chat_branching_enabled' ? { settingValue: 'true' } : name === 'branch_family_max_per_minute' ? { settingValue: '0' } : null);
+      for (let i = 0; i < 30; i++) expect((await get('R')).status).toBe(200);
+      expect(lookupReads()).toBe(1);
+      __resetBranchLookupCacheForTests();
+      mockGetSetting.mockImplementation(async (name: string) =>
+        name === 'chat_branching_enabled' ? { settingValue: 'true' } : name === 'branch_family_max_per_minute' ? { settingValue: '2' } : null);
+      expect((await get('R')).status).toBe(200);
+      expect((await get('R')).status).toBe(200);
+      expect((await get('R')).status).toBe(429);
+    });
+
+    it.each(['abc', '-1', '1.5', ''])('garbage setting %j falls back to the default of 20', async (garbage) => {
+      mockGetSetting.mockImplementation(async (name: string) =>
+        name === 'chat_branching_enabled' ? { settingValue: 'true' } : name === 'branch_family_max_per_minute' ? { settingValue: garbage } : null);
+      for (let i = 0; i < 20; i++) expect((await get('R')).status).toBe(200);
+      expect((await get('R')).status).toBe(429);
+    });
+
+    it('an unreadable setting row uses the default (never blocks reads)', async () => {
+      mockGetSetting.mockImplementation(async (name: string) => {
+        if (name === 'branch_family_max_per_minute') throw new Error('settings down');
+        return { settingValue: 'true' };
+      });
+      const err = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      try {
+        expect((await get('R')).status).toBe(200);
+      } finally {
+        err.mockRestore();
+      }
+    });
+
+    it('leaks no memory: expired windows are swept', async () => {
+      const spy = jest.spyOn(Date, 'now');
+      try {
+        spy.mockReturnValue(1_800_000_000_000);
+        for (let u = 0; u < 10; u++) { seed(`X${u}`, { userId: `u${u}` }); await get(`X${u}`, `u${u}`); }
+        expect(__lookupWindowUsersForTests()).toBe(10);
+        spy.mockReturnValue(1_800_000_000_000 + 120_000);
+        for (let i = 0; i < 60; i++) await get('R'); // crosses a sweep boundary
+        expect(__lookupWindowUsersForTests()).toBeLessThanOrEqual(1);
+      } finally {
+        spy.mockRestore();
+      }
+    });
   });
 });
