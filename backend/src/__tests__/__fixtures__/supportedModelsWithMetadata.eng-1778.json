@@ -323,7 +323,7 @@
       "costScoreSource": "AgentWeb blended rate (75% input / 25% output), computed live from the real per-token billing price table (llmPricing.ts MODEL_PRICING) — never a separately hand-typed number"
     },
     {
-      "id": "openrouter/qwen/qwen3.8-max",
+      "id": "openrouter/qwen/qwen3.8-max-0902",
       "name": "Qwen3.8 Max",
       "tier": "medium",
       "qualityTier": "medium",
@@ -775,7 +775,7 @@
       "costScoreSource": "AgentWeb blended rate (75% input / 25% output), computed live from the real per-token billing price table (llmPricing.ts MODEL_PRICING) — never a separately hand-typed number"
     },
     {
-      "id": "openrouter/qwen/qwen3.8-max",
+      "id": "openrouter/qwen/qwen3.8-max-0902",
       "name": "Qwen3.8 Max",
       "tier": "medium",
       "qualityTier": "medium",

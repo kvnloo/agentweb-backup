@@ -103,6 +103,27 @@ const MODEL_GETTERS: Array<{
     settingName: 'agent_mode_image_generation_default_model',
     call: (s) => s.getImageGenerationDefaultModel(),
   },
+  // Previously raw `llmModels[value]` lookups (alias-valued rows silently fell back).
+  {
+    name: 'getVideoGenerationDefaultModel',
+    settingName: 'agent_mode_video_generation_default_model',
+    call: (s) => s.getVideoGenerationDefaultModel(),
+  },
+  {
+    name: 'getCustomerSupportDefaultModel',
+    settingName: 'agent_mode_customer_support_default_model',
+    call: (s) => s.getCustomerSupportDefaultModel(),
+  },
+  {
+    name: 'getCodingAgentDefaultModel',
+    settingName: 'agent_mode_coding_agent_default_model',
+    call: (s) => s.getCodingAgentDefaultModel(),
+  },
+  {
+    name: 'getVisionModel',
+    settingName: 'agent_mode_vision_model',
+    call: (s) => s.getVisionModel(),
+  },
 ];
 
 describe('ENG-806: AW-Settings model getters resolve legacy aliases', () => {
@@ -250,5 +271,21 @@ describe('ENG-2178: bare gpt-4o-mini resolves to the served OpenRouter id', () =
     const resolved = service.normalizeModelId('gpt-4o-mini');
     expect(resolved).toBe('openrouter/openai/gpt-4o-mini');
     expect(registry[resolved as string]).toBeDefined();
+  });
+});
+
+// A row stored before the qwen3.8-max -> qwen3.8-max-0902 rename must keep working
+// in every getter, including the four that used to do a raw registry lookup.
+describe('renamed qwen3.8-max: old id configured resolves to the -0902 id in every getter', () => {
+  const OLD = 'openrouter/qwen/qwen3.8-max';
+  const NEW = 'openrouter/qwen/qwen3.8-max-0902';
+
+  it.each(MODEL_GETTERS)('$name maps the old id to the new id', async ({ call, settingName }) => {
+    const service = new AgentModeService();
+    (settingsService.getSetting as jest.Mock).mockImplementation(async (name: string) =>
+      name === settingName ? { settingValue: OLD } : null
+    );
+
+    await expect(call(service)).resolves.toBe(NEW);
   });
 });

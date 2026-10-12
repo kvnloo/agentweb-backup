@@ -5044,15 +5044,18 @@ router.post("/subscription-types", async (req, res) => {
         const { validateLlmUsagePolicy } = await import('../services/llmUsagePolicyService');
         const { getModelPrice } = await import('../utils/llmPricing');
         const { agentModeService } = await import('../services/agentModeService');
+        // Stored policies may hold a renamed model's legacy id; runtime filters drop it, so
+        // canonicalise before validating (and store the canonical id).
+        const canonicalModelId = (model: unknown): string => agentModeService.normalizeModelId(String(model).trim());
         normalizedLlmUsagePolicy = {
           version: String(type.llmUsagePolicy.version || '').trim(),
           enforcementState: type.llmUsagePolicy.enforcementState,
           optimizationCostThresholdMicroUsd: Number(type.llmUsagePolicy.optimizationCostThresholdMicroUsd),
           hardCostThresholdMicroUsd: Number(type.llmUsagePolicy.hardCostThresholdMicroUsd),
           optimizedModelIds: Array.isArray(type.llmUsagePolicy.optimizedModelIds)
-            ? [...new Set(type.llmUsagePolicy.optimizedModelIds.map((model: unknown) => String(model).trim()).filter(Boolean))]
+            ? [...new Set(type.llmUsagePolicy.optimizedModelIds.map(canonicalModelId).filter(Boolean))]
             : [],
-          optimizedDefaultModel: String(type.llmUsagePolicy.optimizedDefaultModel || '').trim(),
+          optimizedDefaultModel: canonicalModelId(type.llmUsagePolicy.optimizedDefaultModel || ''),
           // ENG-1214 AC5. Carried through RAW and only when present.
           //
           // Raw, because `validateLlmUsagePolicy` rejects a present-but-invalid
