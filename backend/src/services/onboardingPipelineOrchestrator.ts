@@ -459,6 +459,7 @@ export function _resetRateLimitState(): void {
 // ──────────────────────────────────────────────────────────────────────
 
 const MAX_CLAIM_ATTEMPTS = 4;
+const MAX_COMMIT_ATTEMPTS = 6;
 
 export class OnboardingPipelineOrchestrator {
   private readonly deps: Required<OrchestratorDeps>;
@@ -475,6 +476,41 @@ export class OnboardingPipelineOrchestrator {
       getUser: deps.getUser,
       updateUserSteps: deps.updateUserSteps,
     };
+  }
+
+  /**
+   * Record a step's terminal result. Rebuilt from the freshest stored map and
+   * written as a compare-and-swap, so a sibling step another pass claimed or
+   * finished in the meantime is never erased by this write; if the map moved
+   * between the read and the write it is re-read and rebuilt. Returns
+   * `written: false` when a newer generation of this step exists, whose result
+   * this one must not overwrite.
+   */
+  private async commitStepRecord(
+    userId: string,
+    step: string,
+    generation: number,
+    record: StepRecord<unknown>,
+    fallback: UserSteps,
+  ): Promise<{ written: true; steps: UserSteps } | { written: false; latestGen: number }> {
+    for (let attempt = 0; attempt < MAX_COMMIT_ATTEMPTS; attempt++) {
+      const latest = await this.deps.getUser(userId);
+      const latestGen = latest?.steps?.[step]?.generation ?? generation;
+      if (!isResultFresh(generation, latestGen)) return { written: false, latestGen };
+      const next: UserSteps = { ...(latest?.steps ?? fallback), [step]: record };
+      try {
+        await this.deps.updateUserSteps(
+          userId,
+          next,
+          latest ? { steps: latest.steps ?? null } : undefined,
+        );
+        return { written: true, steps: next };
+      } catch (err) {
+        if ((err as { code?: string })?.code !== "ConditionalCheckFailedException") throw err;
+        await new Promise((resolve) => setTimeout(resolve, 15 * (attempt + 1) + Math.random() * 25));
+      }
+    }
+    throw new Error(`could not record the result of step ${step}: the pipeline state kept changing`);
   }
 
   /**
@@ -586,7 +622,7 @@ export class OnboardingPipelineOrchestrator {
       if (!claimed) {
         report.skipped.push({
           step,
-          reason: decision.fire ? "claim kept losing to concurrent writes" : "claimed by another pass",
+          reason: decision.fire ? "claim kept losing to concurrent writes" : decision.reason,
         });
         continue;
       }
@@ -600,20 +636,6 @@ export class OnboardingPipelineOrchestrator {
           generation,
         });
 
-        // Re-read in case some other process bumped the generation while
-        // we were running. We compare against the *latest* persisted
-        // generation, not our local working copy, to catch
-        // cancel-and-replace from concurrent reconcile() calls.
-        const latest = await this.deps.getUser(userId);
-        const latestGen = latest?.steps?.[step]?.generation ?? generation;
-        if (!isResultFresh(generation, latestGen)) {
-          report.skipped.push({
-            step,
-            reason: `stale generation ${generation} < ${latestGen}`,
-          });
-          continue;
-        }
-
         const readyRecord: StepRecord<unknown> = {
           output,
           inputsHash,
@@ -622,12 +644,19 @@ export class OnboardingPipelineOrchestrator {
           status: "ready",
           ranAt: this.deps.now(),
         };
-        workingSteps = {
-          ...(latest?.steps ?? workingSteps),
-          [step]: readyRecord,
-        };
+        // Compare against the *latest* persisted generation, not our local
+        // working copy, to catch cancel-and-replace from concurrent reconcile()
+        // calls (see commitStepRecord).
+        const committed = await this.commitStepRecord(userId, step, generation, readyRecord, workingSteps);
+        if (!committed.written) {
+          report.skipped.push({
+            step,
+            reason: `stale generation ${generation} < ${committed.latestGen}`,
+          });
+          continue;
+        }
+        workingSteps = committed.steps;
         workingUser.steps = workingSteps;
-        await this.deps.updateUserSteps(userId, workingSteps);
         persisted = workingSteps;
         report.fired.push({ step, generation, status: "ready" });
       } catch (err) {
@@ -641,10 +670,12 @@ export class OnboardingPipelineOrchestrator {
           failedReason: reason,
           ranAt: this.deps.now(),
         };
-        workingSteps = { ...workingSteps, [step]: failedRecord };
-        workingUser.steps = workingSteps;
-        await this.deps.updateUserSteps(userId, workingSteps);
-        persisted = workingSteps;
+        const committed = await this.commitStepRecord(userId, step, generation, failedRecord, workingSteps);
+        if (committed.written) {
+          workingSteps = committed.steps;
+          workingUser.steps = workingSteps;
+          persisted = workingSteps;
+        }
         report.fired.push({ step, generation, status: "failed", reason });
         // On failure, downstream steps will be gated by the
         // upstream-not-ready check above; no need to break out of the
