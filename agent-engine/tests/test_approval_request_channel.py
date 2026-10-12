@@ -76,6 +76,18 @@ class WithoutSlackTest(unittest.TestCase):
             with self.assertLogs(slack_utils.logger, level="ERROR"):
                 self.assertEqual(_ask(), slack_utils.APPROVAL_FAILED)
 
+    def test_an_endpoint_that_does_not_exist_yet_is_no_channel_not_failed(self, _jwt):
+        # The engine can be deployed before the backend. A 404 must not hold the results of
+        # every approval-required task that has no Slack channel until the backend catches up.
+        with patch.object(slack_utils.requests, "post", return_value=_response(404, {})):
+            with self.assertLogs(slack_utils.logger, level="WARNING"):
+                self.assertEqual(_ask(), slack_utils.APPROVAL_NO_CHANNEL)
+
+    def test_that_404_is_released_by_the_hold_rule(self, _jwt):
+        with patch.object(slack_utils.requests, "post", return_value=_response(404, {})):
+            outcome = _ask()
+        self.assertFalse(slack_utils.should_hold_results_for_approval(True, None, outcome))
+
     def test_a_409_that_is_not_no_channel_is_failed(self, _jwt):
         with patch.object(slack_utils.requests, "post", return_value=_response(409, {"code": "something_else"})):
             self.assertEqual(_ask(), slack_utils.APPROVAL_FAILED)
