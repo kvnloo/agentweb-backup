@@ -118,10 +118,17 @@ async function lumaFailure(error: unknown, resolved: Extract<ResolvedLuma, { cli
   }
   if (error instanceof LumaApiError && error.status === 429) {
     const wait = error.retryAfterSeconds ? ` Retry after ${error.retryAfterSeconds}s.` : '';
-    return { success: false, message: `Luma is rate-limiting this calendar (200 requests/minute).${wait}` };
+    // Worded so the dispatcher's classifier reads it as `rate_limit` (wait, then retry once) and not as a
+    // permanent failure: it matches "rate limit" / a bare 429, not "rate-limiting".
+    return { success: false, message: `Luma rate limit hit (HTTP 429; 200 requests/minute per calendar).${wait || ' Wait about a minute'}, then retry the same call.` };
   }
   const detail = error instanceof Error ? error.message : 'unknown error';
-  return { success: false, message: `Luma request failed: ${detail}.` };
+  // "timed out" / "network error" so transient failures classify as retryable, not as a dead end.
+  const transient =
+    error instanceof LumaApiError && error.status === 0
+      ? /respond in time/.test(detail) ? 'The request timed out' : 'Network error reaching Luma'
+      : null;
+  return { success: false, message: transient ? `${transient} (${detail}). Retry once.` : `Luma request failed: ${detail}.` };
 }
 
 emmaToolRegistry.register({

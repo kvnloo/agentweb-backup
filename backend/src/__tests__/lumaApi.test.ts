@@ -437,3 +437,24 @@ describe('LUMA_API_BASE_URL override', () => {
     expect(String(fetchMock.mock.calls.pop()![0])).toMatch(/^https:\/\/public-api\.luma\.com\//);
   });
 });
+
+describe('failure messages are classified as retryable where they should be', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { classifyToolErrorClass } = require('../utils/toolErrorClassifier');
+
+  it('429, timeout and network failures read as retryable classes; a rejected key does not', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    const run = async (resp: any) => {
+      fetchMock.mockReset();
+      if (resp instanceof Error) fetchMock.mockRejectedValueOnce(resp);
+      else fetchMock.mockResolvedValueOnce(resp);
+      const r: any = await tool('luma_list_events')({}, { userId: 'user-1' });
+      return classifyToolErrorClass(new Error(r.message));
+    };
+    expect(await run(jsonResponse({}, { status: 429, headers: { 'retry-after': '30' } }))).toBe('rate_limit');
+    const aborted = new Error('aborted'); aborted.name = 'AbortError';
+    expect(await run(aborted)).toBe('timeout');
+    expect(await run(new Error('getaddrinfo ENOTFOUND'))).toBe('network');
+    expect(await run(jsonResponse({}, { status: 401 }))).not.toBe('rate_limit');
+  });
+});
