@@ -1523,7 +1523,23 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
     const updatedUser = await userDb.updateUser(userId, {
       slackChannels: channels.length > 0 ? channels : (null as any),
     });
-    res.json(sanitizeUserForResponse(updatedUser));
+
+    // Clearing an account's own channels can leave a member of an organisation on the
+    // organisation's channel, so report the platform the account is on NOW rather than
+    // letting the dashboard guess.
+    let platformFields: Record<string, unknown> = {};
+    try {
+      const { getPlatformSummary } = await import('../services/customerChannelPolicy');
+      const summary = await getPlatformSummary(updatedUser);
+      platformFields = {
+        messagingPlatform: summary.platform,
+        messagingPlatformSource: summary.source,
+        whatsappNumberMasked: summary.whatsappNumberMasked,
+      };
+    } catch (error) {
+      console.error('[admin] could not recalculate the platform after a Slack channel edit:', error);
+    }
+    res.json({ ...sanitizeUserForResponse(updatedUser), ...platformFields });
   } catch (error) {
     console.error("Error updating user slack channels:", error);
     res.status(500).json({ message: "Error updating slack channels" });

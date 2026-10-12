@@ -32,12 +32,26 @@ export interface ApprovalRequestInput {
   channel?: string | null;
   channelName?: string;
   note?: string;
+  /**
+   * Verify the caller owns the asset's existing approval and the execution before writing
+   * anything. Always applied for a WhatsApp customer (whose record is written ahead of the
+   * send and deleted if it fails); the channel-neutral route sets it for everyone. Not set by
+   * the legacy Slack route, whose behaviour is deliberately unchanged.
+   */
+  enforceOwnership?: boolean;
 }
 
 export class ApprovalNotDeliveredError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'ApprovalNotDeliveredError';
+  }
+}
+
+export class ApprovalForbiddenError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ApprovalForbiddenError';
   }
 }
 
@@ -48,18 +62,43 @@ export class ApprovalDeliveryFailedError extends Error {
   }
 }
 
-async function loadAccount(userId: string): Promise<any | null> {
+async function loadAccount(userId: string): Promise<{ account: any | null; failed: boolean }> {
   try {
     const { userDb } = await import('./db');
-    return (await userDb.getUserById(userId)) ?? null;
+    return { account: (await userDb.getUserById(userId)) ?? null, failed: false };
   } catch (error) {
-    // Falls toward the behaviour before WhatsApp existed: judge the account as having no
-    // WhatsApp number and use the Slack channel the caller supplied.
     console.warn(
-      '[approval-request] could not load the account; treating it as not on WhatsApp:',
+      '[approval-request] could not load the account:',
       error instanceof Error ? error.message : error,
     );
-    return null;
+    return { account: null, failed: true };
+  }
+}
+
+/**
+ * The caller may only touch an approval, and only point at an execution, that is theirs.
+ *
+ * `assetUrl` is the primary key of the approvals table and `createApproval` is a put, so
+ * without this a caller who supplies someone else's asset URL replaces that approval with a
+ * pending one of their own — and, for a customer on WhatsApp, deletes it again if the send
+ * fails. `executionId` decides whose task subscribers are emailed when an approval is
+ * granted, so it must be the caller's too.
+ */
+export async function assertCallerOwnsApprovalTarget(
+  userId: string,
+  assetUrl: string,
+  executionId?: string,
+): Promise<void> {
+  const existing = await approvalDb.getApproval(assetUrl);
+  if (existing && existing.userId !== userId) {
+    throw new ApprovalForbiddenError('That asset belongs to a different account.');
+  }
+  if (executionId) {
+    const { taskDb } = await import('./db');
+    const execution: any = await taskDb.getTaskExecutionById(executionId);
+    if (!execution || execution.userId !== userId) {
+      throw new ApprovalForbiddenError('That execution belongs to a different account.');
+    }
   }
 }
 
@@ -67,8 +106,24 @@ export async function requestApproval(
   request: ApprovalRequestInput,
 ): Promise<{ messageTs: string | null; approvalId: string; deliveredVia: string[] }> {
   const deliveredVia: string[] = [];
-  const account = await loadAccount(request.userId);
+  const { account, failed: accountReadFailed } = await loadAccount(request.userId);
+
+  // Fails CLOSED when the account cannot be read and no Slack channel was supplied. Falling
+  // through would judge a reachable WhatsApp customer as having no channel (409 no_channel),
+  // which the task engine answers by emailing their unreviewed output to subscribers. A
+  // read that blipped must hold the output, not release it. With a Slack channel supplied
+  // the old behaviour stands: that customer is asked on Slack as before.
+  if (accountReadFailed && !request.channel) {
+    throw new ApprovalDeliveryFailedError(
+      'Could not determine how to reach this account, so the approval request was not sent.',
+    );
+  }
+
   const onWhatsApp = !!account && hasVerifiedWhatsApp(account);
+
+  if (onWhatsApp || request.enforceOwnership) {
+    await assertCallerOwnsApprovalTarget(request.userId, request.imageUrl, request.executionId);
+  }
 
   // A customer on WhatsApp is not also posted to in Slack, even when the task they set up
   // names a Slack channel (task-level channels are typed in per task and outlive a switch

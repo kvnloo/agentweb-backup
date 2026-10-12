@@ -12,6 +12,7 @@ import { getAssetTypeFromFilename } from '../services/approvalDb';
 import {
   requestApproval,
   ApprovalDeliveryFailedError,
+  ApprovalForbiddenError,
   ApprovalNotDeliveredError,
 } from '../services/approvalRequestService';
 
@@ -36,6 +37,9 @@ router.post('/', authenticateToken, async (req: any, res: any) => {
       channel: channel || null,
       channelName,
       note,
+      // The new route is strict for everyone: a caller may not replace another account's
+      // approval or point at another account's execution.
+      enforceOwnership: true,
     });
 
     res.json({
@@ -49,6 +53,9 @@ router.post('/', authenticateToken, async (req: any, res: any) => {
       // Not a server fault: the account simply has nowhere to be asked. The task engine
       // relies on telling this apart from a 500 to fall back to its no-approval path.
       return res.status(409).json({ success: false, error: error.message, code: 'no_channel' });
+    }
+    if (error instanceof ApprovalForbiddenError) {
+      return res.status(403).json({ success: false, error: error.message, code: 'forbidden' });
     }
     if (error instanceof ApprovalDeliveryFailedError) {
       // The account HAS a channel and the send failed. A different answer from no_channel,

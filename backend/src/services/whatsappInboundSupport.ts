@@ -59,26 +59,48 @@ const FORWARDS_PER_HOUR = 20;
 const forwardCountKey = (phone: string) =>
   `whatsapp:forwards:${phone}:${new Date().toISOString().slice(0, 13)}`;
 
+const COUNTER_ATTEMPTS = 5;
+
 /**
- * Count this forward against the number's hourly allowance. A read-then-write, so two
- * simultaneous messages can both pass at the boundary and the cap can be exceeded by a
- * message or two — acceptable for an abuse limit. Fails OPEN: a fault in the limiter must
- * never cost a customer their message.
+ * Count this forward against the number's hourly allowance.
+ *
+ * Each increment is a compare-and-swap against the value that was read, so a burst of
+ * simultaneous messages cannot all pass the same read and all write the same count: the
+ * loser of a swap re-reads and tries again. The one gap is the very first message of an
+ * hour, which creates the row with an unconditional write (there is nothing yet to compare
+ * against), so two such messages can both create it — an over-admission of one, bounded.
+ *
+ * Fails OPEN: a fault in the limiter must never cost a customer their message.
  */
 async function withinForwardLimit(phone: string): Promise<boolean> {
+  const key = forwardCountKey(phone);
+  // Epoch SECONDS, and past the hour the key names so it cannot expire mid-window.
+  const ttl = () => Math.floor(Date.now() / 1000) + 2 * 60 * 60;
   try {
-    const key = forwardCountKey(phone);
-    const row = await settingsService.getSetting(key);
-    const used = Number.parseInt(row?.settingValue ?? '0', 10) || 0;
-    if (used >= FORWARDS_PER_HOUR) return false;
-    await settingsService.setSetting(
-      key,
-      String(used + 1),
-      'WhatsApp support forwards this hour',
-      'system',
-      // Epoch SECONDS, and past the hour the key names so it cannot expire mid-window.
-      Math.floor(Date.now() / 1000) + 2 * 60 * 60,
-    );
+    for (let attempt = 0; attempt < COUNTER_ATTEMPTS; attempt++) {
+      const row = await settingsService.getSetting(key);
+      if (!row?.settingValue) {
+        await settingsService.setSetting(key, '1', 'WhatsApp support forwards this hour', 'system', ttl());
+        return true;
+      }
+      const used = Number.parseInt(row.settingValue, 10) || 0;
+      if (used >= FORWARDS_PER_HOUR) return false;
+      try {
+        await settingsService.setSettingIfValueMatches(
+          key,
+          String(used + 1),
+          row.settingValue,
+          'WhatsApp support forwards this hour',
+          'system',
+          ttl(),
+        );
+        return true;
+      } catch (error: any) {
+        // Lost the swap to a concurrent message: re-read and try again.
+        if (error?.code !== 'ConditionalCheckFailedException') throw error;
+      }
+    }
+    // Contended past our patience. Admit it rather than drop a customer's message.
     return true;
   } catch {
     return true;

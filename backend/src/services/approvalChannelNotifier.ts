@@ -261,10 +261,13 @@ export async function handleApprovalButtonTap(params: {
 
     const ref = await lookupApprovalMessage(params.approvalMessageId);
     if (!ref) {
-      // Expired (30-day TTL) or never ours.
+      // Expired (30-day TTL), or the correlation row was never written (it is best-effort).
+      // The button id came from a message of ours, so answer rather than going quiet: with
+      // no visible state on a WhatsApp button, silence reads as "recorded".
       console.warn(
         `[approval-notify] tap from ${redactPhone(params.phone)} referenced an unknown message`,
       );
+      await sendText(params.phone, alreadyAnsweredReply(null)).catch(() => {});
       return;
     }
 
