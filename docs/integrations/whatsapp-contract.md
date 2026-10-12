@@ -58,7 +58,7 @@ phone. Multi-tenant onboarding was evaluated and deferred — see "Deferred" bel
 | Window-aware send | Yes | `services/whatsappService.ts` `sendMessage` | Picks text vs template; this is what callers should use. |
 | Webhooks | Yes | `routes/whatsappWebhook.ts` | Inbound messages and STOP/UNSTOP. Delivery-status events are acknowledged but ignored and not persisted. |
 | Consent acknowledgement | Yes | `services/whatsappService.ts` `sendOptOutConfirmation` | The one message an opted-out number may receive. Sent AFTER the opt-out is recorded, and bypasses only the opt-out check — never the service window. |
-| Approval requests | **Yes, interactive** | `services/approvalRequestService.ts`, `services/approvalChannelNotifier.ts` | Inside the 24h window the customer gets Approve / Reject reply buttons (a service message — no template). Outside it, the `agentweb_approval_request` template with a link. A tap is correlated through `context.id` → `whatsapp:approval-msg:<wamid>`, because Meta returns a template button's LABEL as its payload. First tap wins (claim before write); later taps are answered, not acted on, since buttons can never be removed. Approving emails the task's subscribers exactly as a Slack approval does. |
+| Approval requests | **Yes, interactive** | `services/approvalRequestService.ts`, `services/approvalChannelNotifier.ts` | Inside the 24h window the customer gets Approve / Reject reply buttons (a service message — no template). Outside it, the `agentweb_approval_request` template with a link. A tap is correlated through `context.id` → `whatsapp:approval-msg:<wamid>`, because Meta returns a template button's LABEL as its payload. The verdict is one atomic conditional write, so the first answer wins and later taps are answered, not acted on, since buttons can never be removed. Approving emails the task's subscribers exactly as a Slack approval does. |
 | Customer writes in | Yes | `services/whatsappInboundSupport.ts` | A non-command message gets a fixed greeting (once per 12h per number) and is forwarded to the team by email — `WHATSAPP_SUPPORT_INBOX`, else the `whatsapp:support-inbox` setting, else founders@ in production only — at most 20 forwards per number per hour. A failed forward is logged. No model is involved. |
 | Read history | **No** | — | Cloud API has no history endpoint. We know only what the webhook delivered. |
 | Edit / delete a sent message | **No** | — | Not supported by the API at all. Callers send a follow-up. |
@@ -227,10 +227,21 @@ Rules:
 Interactive buttons cannot be removed or disabled once sent, so a tap has to be safe to
 repeat and may arrive from a customer who already answered somewhere else. The verdict is
 one atomic conditional update (`approvalDb.answerIfOpen`) that succeeds only while the
-approval is `pending` or `needs_changes` and never creates a row. Exactly one tap wins,
-whichever surface it came from; only the winner emails the task's subscribers; every other
-tap is told what stands. The approval record is written before the message carrying the
-buttons goes out, and removed again if nothing was delivered.
+approval is `pending` or `needs_changes` and never creates a row. Exactly one WhatsApp tap
+wins; only the winner emails the task's subscribers; every other tap is told what stands.
+The approval record is written before the message carrying the buttons goes out, and
+removed again if nothing was delivered.
+
+Limits worth knowing:
+
+- A tap cannot overwrite an answer given EARLIER on any surface. Slack, the portal and
+  batch review still write the status with the unconditional `updateApprovalStatus`, so a
+  LATER answer there can overwrite a WhatsApp verdict. That path is outside this change.
+- The correlation row maps a message to an asset, not to a round. If the same asset URL is
+  requested again, buttons from the earlier message answer the new request.
+- A failed send to a customer who is reachable (an opt-out, a standing Meta error) holds
+  their task's output and removes the unsent record, exactly as a failed Slack send does.
+  Nothing retries; it is logged at error level with the user id and asset.
 
 Meta returns a template quick-reply's LABEL as its payload, so an id cannot ride on a
 button: a tap is correlated only through `context.id` against the outbound message id
