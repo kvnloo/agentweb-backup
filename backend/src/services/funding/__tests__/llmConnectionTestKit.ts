@@ -1,7 +1,7 @@
 import { randomBytes } from 'crypto';
 import { InMemoryDynamo } from '../../../__tests__/helpers/inMemoryDynamo';
 import type { KmsPort, SecretContext } from '../llmConnectionCrypto';
-import { LLM_CONNECTIONS_OWNER_INDEX, LLM_CONNECTIONS_ORG_INDEX, LLM_CONNECTIONS_TABLE, LlmConnectionDb } from '../llmConnectionDb';
+import { LLM_CONNECTIONS_OWNER_INDEX, LLM_CONNECTIONS_ORG_INDEX, LLM_CONNECTIONS_PROVIDER_INDEX, LLM_CONNECTIONS_TABLE, LlmConnectionDb } from '../llmConnectionDb';
 
 /** Behaves like KMS for the properties that matter: opaque wrapped keys, bound to their encryption context. */
 export class FakeKms implements KmsPort {
@@ -36,6 +36,7 @@ export function makeDb() {
       indexes: {
         [LLM_CONNECTIONS_OWNER_INDEX]: { hash: 'ownerUserId', range: 'createdAt' },
         [LLM_CONNECTIONS_ORG_INDEX]: { hash: 'orgId', range: 'createdAt' },
+        [LLM_CONNECTIONS_PROVIDER_INDEX]: { hash: 'provider', range: 'createdAt' },
       },
     },
   });

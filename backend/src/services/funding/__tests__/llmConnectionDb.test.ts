@@ -75,6 +75,19 @@ describe('LlmConnectionDb', () => {
     expect(await db.listSharedWithOrg('org-1')).toEqual([]);
   });
 
+  it('finds every connection for a provider, active or revoked, across every user', async () => {
+    const { db } = makeDb();
+    await db.create(record({ connectionId: 'a', provider: 'anthropic', createdAt: '2026-10-09T00:00:01.000Z' }));
+    await db.create(record({ connectionId: 'b', ownerUserId: 'user-2', provider: 'anthropic', createdAt: '2026-10-09T00:00:02.000Z', orgId: undefined }));
+    await db.create(record({ connectionId: 'c', provider: 'openai', createdAt: '2026-10-09T00:00:03.000Z' }));
+    await db.revoke('a', { userId: 'user-1' }, LATER);
+
+    expect((await db.listByProvider('anthropic')).map((r) => r.connectionId)).toEqual(['a', 'b']);
+    expect((await db.listByProvider('anthropic')).find((r) => r.connectionId === 'a')?.status).toBe('revoked');
+    expect((await db.listByProvider('openai')).map((r) => r.connectionId)).toEqual(['c']);
+    expect(await db.listByProvider('google')).toEqual([]);
+  });
+
   it('records a failed check without touching the last-ok time', async () => {
     const { db } = makeDb();
     await db.create(record({ lastOkAt: NOW }));

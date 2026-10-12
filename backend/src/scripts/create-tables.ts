@@ -2077,6 +2077,7 @@ export const createLlmConnectionsTable = async () => {
       { AttributeName: 'ownerUserId', AttributeType: 'S' },
       { AttributeName: 'orgId', AttributeType: 'S' },
       { AttributeName: 'createdAt', AttributeType: 'S' },
+      { AttributeName: 'provider', AttributeType: 'S' },
     ],
     KeySchema: [{ AttributeName: 'connectionId', KeyType: 'HASH' }],
     GlobalSecondaryIndexes: [
@@ -2092,6 +2093,14 @@ export const createLlmConnectionsTable = async () => {
         IndexName: 'OrgIndex',
         KeySchema: [
           { AttributeName: 'orgId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'ProviderIndex',
+        KeySchema: [
+          { AttributeName: 'provider', KeyType: 'HASH' },
           { AttributeName: 'createdAt', KeyType: 'RANGE' },
         ],
         Projection: { ProjectionType: 'ALL' },

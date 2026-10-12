@@ -13,6 +13,7 @@ const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 export const LLM_CONNECTIONS_TABLE = `${TABLE_PREFIX}AW-LlmConnections`;
 export const LLM_CONNECTIONS_OWNER_INDEX = "OwnerIndex";
 export const LLM_CONNECTIONS_ORG_INDEX = "OrgIndex";
+export const LLM_CONNECTIONS_PROVIDER_INDEX = "ProviderIndex";
 
 /**
  * The table definition the boot-time ensureCriticalTables creates. The copy in
@@ -31,6 +32,7 @@ export const LLM_CONNECTIONS_TABLE_SPEC: AWS.DynamoDB.CreateTableInput = {
     { AttributeName: "ownerUserId", AttributeType: "S" },
     { AttributeName: "orgId", AttributeType: "S" },
     { AttributeName: "createdAt", AttributeType: "S" },
+    { AttributeName: "provider", AttributeType: "S" },
   ],
   KeySchema: [{ AttributeName: "connectionId", KeyType: "HASH" }],
   GlobalSecondaryIndexes: [
@@ -47,6 +49,16 @@ export const LLM_CONNECTIONS_TABLE_SPEC: AWS.DynamoDB.CreateTableInput = {
       IndexName: LLM_CONNECTIONS_ORG_INDEX,
       KeySchema: [
         { AttributeName: "orgId", KeyType: "HASH" },
+        { AttributeName: "createdAt", KeyType: "RANGE" },
+      ],
+      Projection: { ProjectionType: "ALL" },
+    },
+    {
+      // Cross-user lookup for incident response: "every connection for provider X",
+      // active or revoked. Not used by the service today — only by an operator.
+      IndexName: LLM_CONNECTIONS_PROVIDER_INDEX,
+      KeySchema: [
+        { AttributeName: "provider", KeyType: "HASH" },
         { AttributeName: "createdAt", KeyType: "RANGE" },
       ],
       Projection: { ProjectionType: "ALL" },
@@ -129,6 +141,17 @@ export class LlmConnectionDb {
       IndexName: LLM_CONNECTIONS_OWNER_INDEX,
       KeyConditionExpression: "ownerUserId = :owner",
       ExpressionAttributeValues: { ":owner": ownerUserId },
+      ScanIndexForward: true,
+    });
+  }
+
+  /** For incident response: every connection for a provider, active or revoked, across every user. */
+  async listByProvider(provider: string): Promise<LlmConnectionRecord[]> {
+    return this.queryAll({
+      TableName: LLM_CONNECTIONS_TABLE,
+      IndexName: LLM_CONNECTIONS_PROVIDER_INDEX,
+      KeyConditionExpression: "provider = :provider",
+      ExpressionAttributeValues: { ":provider": provider },
       ScanIndexForward: true,
     });
   }

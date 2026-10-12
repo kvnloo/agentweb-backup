@@ -18,6 +18,7 @@ import { __resetFundingFlagsCacheForTests, isByokEnabledFor } from '../fundingFl
 import {
   LLM_CONNECTIONS_ORG_INDEX,
   LLM_CONNECTIONS_OWNER_INDEX,
+  LLM_CONNECTIONS_PROVIDER_INDEX,
   LLM_CONNECTIONS_TABLE,
   LLM_CONNECTIONS_TABLE_SPEC as SPEC,
 } from '../llmConnectionDb';
@@ -36,7 +37,7 @@ describe('AW-LlmConnections table definition', () => {
   it('is the table the store reads, with the indexes it queries', () => {
     expect(SPEC.TableName).toBe(LLM_CONNECTIONS_TABLE);
     expect((SPEC.GlobalSecondaryIndexes ?? []).map((g) => g.IndexName).sort()).toEqual(
-      [LLM_CONNECTIONS_ORG_INDEX, LLM_CONNECTIONS_OWNER_INDEX].sort(),
+      [LLM_CONNECTIONS_ORG_INDEX, LLM_CONNECTIONS_OWNER_INDEX, LLM_CONNECTIONS_PROVIDER_INDEX].sort(),
     );
   });
 
