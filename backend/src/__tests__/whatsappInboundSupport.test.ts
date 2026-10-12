@@ -2,7 +2,7 @@
  * Non-command WhatsApp messages: greet once, forward to the team (ENG-273).
  */
 jest.mock('../services/settingsService', () => ({
-  settingsService: { getSetting: jest.fn(), setSetting: jest.fn() },
+  settingsService: { getSetting: jest.fn(), setSetting: jest.fn(), setSettingIfValueMatches: jest.fn() },
 }));
 jest.mock('../services/whatsappService', () => ({
   redactPhone: jest.requireActual('../services/whatsappService').redactPhone,
@@ -193,24 +193,55 @@ describe('forwarding to the team', () => {
 });
 
 describe('the hourly forward limit', () => {
+  const conditionalFailure = () => Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' });
+  const isCounter = (k: string) => k.startsWith('whatsapp:forwards:');
+
   beforeEach(() => {
     process.env.WHATSAPP_SUPPORT_INBOX = 'support@example.com';
+    settingsService.setSettingIfValueMatches.mockResolvedValue(undefined);
   });
 
   const counter = (used: number) =>
     settingsService.getSetting.mockImplementation(async (k: string) =>
-      k.startsWith('whatsapp:forwards:') ? { settingValue: String(used) } : null,
+      isCounter(k) ? { settingValue: String(used) } : null,
     );
 
-  it('forwards while the number is under its allowance and counts each one', async () => {
+  it('creates the counter on the first forward of the hour', async () => {
+    await handleUnrecognizedMessage(PHONE, 'hello');
+    const call = settingsService.setSetting.mock.calls.find((c: any[]) => isCounter(c[0]));
+    expect(call[0]).toMatch(/^whatsapp:forwards:\+918005326946:\d{4}-\d{2}-\d{2}T\d{2}$/);
+    expect(call[1]).toBe('1');
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('increments with a compare-and-swap against the value it read', async () => {
     counter(3);
     await handleUnrecognizedMessage(PHONE, 'hello');
+    // Not an overwrite: a burst of simultaneous messages cannot all pass one read and all
+    // write the same count.
+    const [key, next, expected] = settingsService.setSettingIfValueMatches.mock.calls[0];
+    expect(isCounter(key)).toBe(true);
+    expect(next).toBe('4');
+    expect(expected).toBe('3');
     expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
-    const [key, value] = settingsService.setSetting.mock.calls.find((c: any[]) =>
-      String(c[0]).startsWith('whatsapp:forwards:'),
-    );
-    expect(key).toMatch(/^whatsapp:forwards:\+918005326946:\d{4}-\d{2}-\d{2}T\d{2}$/);
-    expect(value).toBe('4');
+  });
+
+  it('re-reads and retries when it loses the swap to a concurrent message', async () => {
+    let reads = 0;
+    settingsService.getSetting.mockImplementation(async (k: string) => {
+      if (!isCounter(k)) return null;
+      reads += 1;
+      return { settingValue: reads === 1 ? '3' : '4' };
+    });
+    settingsService.setSettingIfValueMatches
+      .mockRejectedValueOnce(conditionalFailure())
+      .mockResolvedValueOnce(undefined);
+
+    await handleUnrecognizedMessage(PHONE, 'hello');
+    const swaps = settingsService.setSettingIfValueMatches.mock.calls;
+    expect(swaps).toHaveLength(2);
+    expect(swaps[1][1]).toBe('5'); // built on the fresh value, not the stale one
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
   });
 
   it('stops forwarding once the allowance is used up, so one number cannot flood the inbox', async () => {
@@ -218,6 +249,7 @@ describe('the hourly forward limit', () => {
     jest.spyOn(console, 'warn').mockImplementation(() => {});
     await handleUnrecognizedMessage(PHONE, 'spam');
     expect(emailService.sendEmail).not.toHaveBeenCalled();
+    expect(settingsService.setSettingIfValueMatches).not.toHaveBeenCalled();
   });
 
   it('still greets a number that is over its allowance', async () => {
@@ -235,21 +267,33 @@ describe('the hourly forward limit', () => {
   });
 
   it('expires the counter in epoch SECONDS', async () => {
-    counter(0);
+    counter(3);
     await handleUnrecognizedMessage(PHONE, 'hello');
-    const call = settingsService.setSetting.mock.calls.find((c: any[]) =>
-      String(c[0]).startsWith('whatsapp:forwards:'),
-    );
-    const hours = (call[4] - Date.now() / 1000) / 3600;
+    const ttl = settingsService.setSettingIfValueMatches.mock.calls[0][5];
+    const hours = (ttl - Date.now() / 1000) / 3600;
     expect(hours).toBeGreaterThan(1.9);
     expect(hours).toBeLessThan(2.1);
   });
 
   it('fails OPEN: a limiter fault never costs a customer their message', async () => {
     settingsService.getSetting.mockImplementation(async (k: string) => {
-      if (k.startsWith('whatsapp:forwards:')) throw new Error('dynamo down');
+      if (isCounter(k)) throw new Error('dynamo down');
       return null;
     });
+    await handleUnrecognizedMessage(PHONE, 'hello');
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails OPEN on a swap error that is not a lost race', async () => {
+    counter(3);
+    settingsService.setSettingIfValueMatches.mockRejectedValue(new Error('throttled'));
+    await handleUnrecognizedMessage(PHONE, 'hello');
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('admits the message rather than dropping it when the swap stays contended', async () => {
+    counter(3);
+    settingsService.setSettingIfValueMatches.mockRejectedValue(conditionalFailure());
     await handleUnrecognizedMessage(PHONE, 'hello');
     expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
   });

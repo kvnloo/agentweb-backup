@@ -13,7 +13,13 @@ jest.mock('../middleware/auth', () => ({
 jest.mock('../services/approvalRequestService', () => {
   class ApprovalNotDeliveredError extends Error {}
   class ApprovalDeliveryFailedError extends Error {}
-  return { requestApproval: jest.fn(), ApprovalNotDeliveredError, ApprovalDeliveryFailedError };
+  class ApprovalForbiddenError extends Error {}
+  return {
+    requestApproval: jest.fn(),
+    ApprovalNotDeliveredError,
+    ApprovalDeliveryFailedError,
+    ApprovalForbiddenError,
+  };
 });
 
 const svc = require('../services/approvalRequestService');
@@ -66,6 +72,20 @@ it('answers 409 no_channel when the account has nowhere to be asked', async () =
     .send({ assetUrl: 'https://a/x.png', filename: 'x.png' });
   expect(res.status).toBe(409);
   expect(res.body.code).toBe('no_channel');
+});
+
+it('always asks the service to enforce ownership', async () => {
+  await request(app).post('/api/approval-requests').send({ assetUrl: 'https://a/x.png', filename: 'x.png' });
+  expect(svc.requestApproval).toHaveBeenCalledWith(expect.objectContaining({ enforceOwnership: true }));
+});
+
+it('answers 403 forbidden when the asset or execution is not the caller\'s', async () => {
+  svc.requestApproval.mockRejectedValue(new svc.ApprovalForbiddenError('not yours'));
+  const res = await request(app)
+    .post('/api/approval-requests')
+    .send({ assetUrl: 'https://a/x.png', filename: 'x.png', executionId: 'someone-elses' });
+  expect(res.status).toBe(403);
+  expect(res.body.code).toBe('forbidden');
 });
 
 it('answers 502 delivery_failed when the account has a channel and the send failed', async () => {

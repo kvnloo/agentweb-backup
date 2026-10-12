@@ -389,10 +389,13 @@ describe('handleApprovalButtonTap', () => {
       expect(approvalDb.answerIfOpen).not.toHaveBeenCalled();
     });
 
-    it('does nothing for a tap on an unknown or expired message', async () => {
+    it('answers a tap on an unknown or expired message instead of going quiet', async () => {
+      // The correlation row is best-effort, so a real approval message can lose it. With no
+      // visible state on a WhatsApp button, silence reads as "recorded".
       (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
       await tap();
       expect(approvalDb.answerIfOpen).not.toHaveBeenCalled();
+      expect(whatsapp.sendText).toHaveBeenCalledWith(PHONE, expect.stringMatching(/no longer available/i));
     });
 
     it('refuses a tap from someone who does not own the approval', async () => {

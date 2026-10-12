@@ -14,19 +14,23 @@ jest.mock('@slack/web-api', () => ({
 }));
 jest.mock('../services/approvalChannelNotifier', () => ({ notifyApprovalOnWhatsApp: jest.fn() }));
 jest.mock('../services/approvalDb', () => ({
-  approvalDb: { createApproval: jest.fn(), deleteApproval: jest.fn() },
+  approvalDb: { createApproval: jest.fn(), deleteApproval: jest.fn(), getApproval: jest.fn() },
 }));
-jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() } }));
+jest.mock('../services/db', () => ({
+  userDb: { getUserById: jest.fn() },
+  taskDb: { getTaskExecutionById: jest.fn() },
+}));
 
 process.env.SLACK_BOT_TOKEN = 'xoxb-test';
 
 const { notifyApprovalOnWhatsApp } = require('../services/approvalChannelNotifier');
 const { approvalDb } = require('../services/approvalDb');
-const { userDb } = require('../services/db');
+const { userDb, taskDb } = require('../services/db');
 const { sendApprovalRequestWithTracking } = require('../services/slackService');
 import {
   requestApproval,
   ApprovalDeliveryFailedError,
+  ApprovalForbiddenError,
   ApprovalNotDeliveredError,
 } from '../services/approvalRequestService';
 
@@ -67,6 +71,8 @@ beforeEach(() => {
     return a;
   });
   approvalDb.deleteApproval.mockResolvedValue(true);
+  approvalDb.getApproval.mockResolvedValue(null);
+  taskDb.getTaskExecutionById.mockResolvedValue({ executionId: 'exec-1', userId: 'user-1' });
   notifyApprovalOnWhatsApp.mockImplementation(async () => {
     calls.push('whatsapp');
     return 'not_applicable';
@@ -209,6 +215,88 @@ describe('a customer with no channel at all', () => {
     userDb.getUserById.mockResolvedValue({ userId: 'user-1' });
     await expect(requestApproval({ ...request, channel: undefined })).rejects.not.toBeInstanceOf(
       ApprovalDeliveryFailedError,
+    );
+  });
+});
+
+describe('a failed account read', () => {
+  it('HOLDS the output when no Slack channel was supplied', async () => {
+    // Falling through would judge a reachable WhatsApp customer as having no channel
+    // (409 no_channel), which the task engine answers by emailing their unreviewed output.
+    userDb.getUserById.mockRejectedValue(new Error('dynamo down'));
+    await expect(requestApproval({ ...request, channel: undefined })).rejects.toBeInstanceOf(
+      ApprovalDeliveryFailedError,
+    );
+    expect(approvalDb.createApproval).not.toHaveBeenCalled();
+  });
+
+  it('is NOT reported as having no channel', async () => {
+    userDb.getUserById.mockRejectedValue(new Error('dynamo down'));
+    await expect(requestApproval({ ...request, channel: undefined })).rejects.not.toBeInstanceOf(
+      ApprovalNotDeliveredError,
+    );
+  });
+});
+
+describe('ownership of what is being approved', () => {
+  // assetUrl is the approvals table's primary key and createApproval is a put: without these
+  // checks, supplying someone else's asset URL replaces their approval — and for a WhatsApp
+  // customer deletes it again if the send fails. executionId decides whose subscribers are
+  // emailed when an approval is granted.
+  const mine = { ...request, channel: undefined };
+
+  beforeEach(() => {
+    userDb.getUserById.mockResolvedValue(onWhatsApp);
+    notifyApprovalOnWhatsApp.mockResolvedValue('delivered');
+  });
+
+  it("refuses to replace another account's approval for the same asset", async () => {
+    approvalDb.getApproval.mockResolvedValue({ assetUrl: request.imageUrl, userId: 'victim', status: 'approved' });
+    await expect(requestApproval(mine)).rejects.toBeInstanceOf(ApprovalForbiddenError);
+    expect(approvalDb.createApproval).not.toHaveBeenCalled();
+    expect(approvalDb.deleteApproval).not.toHaveBeenCalled();
+    expect(notifyApprovalOnWhatsApp).not.toHaveBeenCalled();
+  });
+
+  it("refuses an execution that belongs to another account", async () => {
+    // Otherwise approving would email the subscribers of someone else's task.
+    taskDb.getTaskExecutionById.mockResolvedValue({ executionId: 'exec-1', userId: 'victim' });
+    await expect(requestApproval(mine)).rejects.toBeInstanceOf(ApprovalForbiddenError);
+    expect(approvalDb.createApproval).not.toHaveBeenCalled();
+  });
+
+  it('refuses an execution that does not exist', async () => {
+    taskDb.getTaskExecutionById.mockResolvedValue(undefined);
+    await expect(requestApproval(mine)).rejects.toBeInstanceOf(ApprovalForbiddenError);
+  });
+
+  it('allows re-requesting an approval the same account already owns', async () => {
+    approvalDb.getApproval.mockResolvedValue({ assetUrl: request.imageUrl, userId: 'user-1', status: 'approved' });
+    await expect(requestApproval(mine)).resolves.toMatchObject({ deliveredVia: ['whatsapp'] });
+  });
+
+  it('allows a brand-new asset with no execution', async () => {
+    await expect(requestApproval({ ...mine, executionId: '' })).resolves.toMatchObject({
+      deliveredVia: ['whatsapp'],
+    });
+    expect(taskDb.getTaskExecutionById).not.toHaveBeenCalled();
+  });
+
+  it('writes nothing if the ownership lookup itself fails', async () => {
+    approvalDb.getApproval.mockRejectedValue(new Error('dynamo down'));
+    await expect(requestApproval(mine)).rejects.toThrow('dynamo down');
+    expect(approvalDb.createApproval).not.toHaveBeenCalled();
+  });
+
+  it('is enforced for a Slack customer only when the caller asks for it', async () => {
+    userDb.getUserById.mockResolvedValue(onSlack);
+    approvalDb.getApproval.mockResolvedValue({ assetUrl: request.imageUrl, userId: 'victim' });
+
+    // The legacy Slack route does not ask, and its behaviour is deliberately unchanged.
+    await expect(requestApproval(request)).resolves.toMatchObject({ deliveredVia: ['slack'] });
+    // The new route always does.
+    await expect(requestApproval({ ...request, enforceOwnership: true })).rejects.toBeInstanceOf(
+      ApprovalForbiddenError,
     );
   });
 });
