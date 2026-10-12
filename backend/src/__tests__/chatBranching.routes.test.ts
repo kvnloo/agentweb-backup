@@ -256,3 +256,153 @@ describe('per-user cap (AW-Settings chat_branching_max_per_hour)', () => {
     expect(reads).toBe(1); // second request served from the ~60s cache
   });
 });
+
+describe('GET /session/:id/branches (ENG-112 family listing)', () => {
+  const LIST = (id: string) => `/api/agent-mode/session/${id}/branches`;
+  const get = (id: string, user = 'owner') => request(app).get(LIST(id)).set('Authorization', bearer(user));
+  const at = (n: number) => `2026-10-${String(10 + Math.floor(n / 100)).padStart(2, '0')}T00:${String(Math.floor(n / 60) % 60).padStart(2, '0')}:${String(n % 60).padStart(2, '0')}.000Z`;
+  const link = (sessionId: string, rootSessionId: string, branchedAt = at(1)) => ({ sessionId, rootSessionId, messageIndex: 2, branchedAt });
+  const seed = (sessionId: string, over: Record<string, unknown> = {}) =>
+    mockFake.seedSession({
+      sessionId, userId: 'owner', title: `T-${sessionId}`, llmModel: 'gpt-5.5', messageCount: 3, portalType: 'agent',
+      createdAt: at(1), updatedAt: at(1), messages: [], ...over,
+    });
+
+  beforeEach(() => {
+    mockFake.indexPageSize = undefined;
+    mockFake.indexLeaksOtherUsers = false;
+    mockFake.indexQueries.length = 0;
+  });
+
+  it('401 without a token, and no work is done', async () => {
+    expect((await request(app).get(LIST('s-1'))).status).toBe(401);
+    expect(mockGetSetting).not.toHaveBeenCalled();
+    expect(mockFake.indexQueries).toHaveLength(0);
+  });
+
+  it.each([[null], [{ settingValue: 'false' }], [{ settingValue: 'TRUE' }]])('flag off (%j) -> 404 chat_branching_disabled, nothing queried', async (row) => {
+    mockGetSetting.mockResolvedValue(row);
+    const out = await get('s-1');
+    expect(out.status).toBe(404);
+    expect(out.body.code).toBe('chat_branching_disabled');
+    expect(mockFake.indexQueries).toHaveLength(0);
+  });
+
+  it('403 for a non-owner (nothing queried), 404 for a missing or archived session, 400 for a garbage id', async () => {
+    expect((await get('s-1', 'stranger')).status).toBe(403);
+    expect((await get('nope')).status).toBe(404);
+    seed('arch', { archived: true });
+    expect((await get('arch')).status).toBe(404);
+    expect((await get('a%20b')).status).toBe(400);
+    expect(mockFake.indexQueries).toHaveLength(0);
+  });
+
+  it('resolves the family from the ROOT and from a LEAF, createdAt ascending, with the documented shape', async () => {
+    seed('R', { createdAt: at(1), updatedAt: at(90) });
+    seed('B1', { createdAt: at(5), updatedAt: at(10), branchedFrom: link('R', 'R', at(5)) });
+    seed('B2', { createdAt: at(3), updatedAt: at(99), branchedFrom: link('B1', 'R', at(3)) });
+    seed('OTHER-ROOT', { createdAt: at(2) });
+    seed('OTHER-BRANCH', { createdAt: at(4), branchedFrom: link('OTHER-ROOT', 'OTHER-ROOT') });
+    for (const id of ['R', 'B1', 'B2']) {
+      const out = await get(id);
+      expect(out.status).toBe(200);
+      expect(out.headers['cache-control']).toBe('no-store');
+      expect(out.body.rootSessionId).toBe('R');
+      expect(out.body.sessions.map((s: any) => s.sessionId)).toEqual(['R', 'B2', 'B1']);
+      expect(out.body.truncated).toBeUndefined();
+    }
+    const out = await get('R');
+    expect(out.body.sessions[0]).toEqual({ sessionId: 'R', title: 'T-R', llmModel: 'gpt-5.5', messageCount: 3, updatedAt: at(90), createdAt: at(1) });
+    expect(out.body.sessions[1].branchedFrom).toEqual(link('B1', 'R', at(3)));
+    expect(Object.keys(out.body.sessions[1]).sort()).toEqual(['branchedFrom', 'createdAt', 'llmModel', 'messageCount', 'sessionId', 'title', 'updatedAt']);
+  });
+
+  it('a chat with no branches answers with just itself', async () => {
+    seed('solo');
+    const out = await get('solo');
+    expect(out.body).toEqual({ rootSessionId: 'solo', sessions: [expect.objectContaining({ sessionId: 'solo' })] });
+  });
+
+  it('uses ONE projected UserIdIndex query walk, never a scan', async () => {
+    seed('R');
+    seed('B1', { branchedFrom: link('R', 'R') });
+    await get('R');
+    expect(mockFake.indexQueries).toHaveLength(1);
+    expect(mockFake.indexQueries[0]).toMatchObject({ IndexName: 'UserIdIndex', KeyConditionExpression: 'userId = :userId' });
+    expect(mockFake.indexQueries[0].ProjectionExpression).toContain('branchedFrom');
+    expect(mockFake.indexQueries[0].ProjectionExpression).not.toContain('messages');
+  });
+
+  it('excludes archived orphans (a branch born archived and never revealed) and an archived root', async () => {
+    seed('R');
+    seed('B1', { branchedFrom: link('R', 'R') });
+    seed('ORPHAN', { archived: true, branchedFrom: link('R', 'R') });
+    expect((await get('R')).body.sessions.map((s: any) => s.sessionId)).toEqual(['R', 'B1']);
+    mockFake.session('R');
+    seed('R', { archived: true });
+    const fromLeaf = await get('B1');
+    expect(fromLeaf.status).toBe(200);
+    expect(fromLeaf.body.rootSessionId).toBe('R');
+    expect(fromLeaf.body.sessions.map((s: any) => s.sessionId)).toEqual(['B1']);
+    expect((await get('R')).status).toBe(404);
+  });
+
+  it("never leaks another user's sessions, even sharing the root id (and even if the index returned them)", async () => {
+    seed('R');
+    seed('MINE', { branchedFrom: link('R', 'R') });
+    seed('THEIRS', { userId: 'someone-else', branchedFrom: link('R', 'R') });
+    expect((await get('R')).body.sessions.map((s: any) => s.sessionId)).toEqual(['R', 'MINE']);
+    mockFake.indexLeaksOtherUsers = true;
+    const leaky = await get('R');
+    expect(leaky.body.sessions.map((s: any) => s.sessionId)).toEqual(['R', 'MINE']);
+    expect(JSON.stringify(leaky.body)).not.toContain('THEIRS');
+  });
+
+  it('legacy branches (row-0 branchOrigin only, no branchedFrom) are not grouped', async () => {
+    seed('R');
+    seed('LEGACY');
+    mockFake.seedMessages('LEGACY', [{ role: 'system', content: 's', metadata: { branchOrigin: { sourceSessionId: 'R', sourceMessageIndex: 2, branchedAt: 'x' } } }]);
+    expect((await get('R')).body.sessions.map((s: any) => s.sessionId)).toEqual(['R']);
+  });
+
+  it('follows LastEvaluatedKey across index pages', async () => {
+    seed('R', { updatedAt: at(1) });
+    for (let i = 0; i < 7; i++) seed(`B${i}`, { createdAt: at(10 + i), updatedAt: at(10 + i), branchedFrom: link('R', 'R') });
+    for (let i = 0; i < 5; i++) seed(`N${i}`, { updatedAt: at(30 + i) });
+    mockFake.indexPageSize = 3;
+    const out = await get('R');
+    expect(out.body.sessions.map((s: any) => s.sessionId)).toEqual(['R', ...Array.from({ length: 7 }, (_, i) => `B${i}`)]);
+    expect(out.body.truncated).toBeUndefined();
+    expect(mockFake.indexQueries).toHaveLength(5); // 13 sessions / 3 per page
+    expect(mockFake.indexQueries[1].ExclusiveStartKey).toBeDefined();
+  });
+
+  it('caps at 50 sessions (root + 49) and stops walking early with truncated:true', async () => {
+    seed('R', { createdAt: at(1), updatedAt: at(1) });
+    for (let i = 0; i < 60; i++) seed(`B${String(i).padStart(2, '0')}`, { createdAt: at(10 + i), updatedAt: at(10 + i), branchedFrom: link('R', 'R') });
+    mockFake.indexPageSize = 10;
+    const out = await get('R');
+    expect(out.body.sessions).toHaveLength(50);
+    expect(out.body.sessions[0].sessionId).toBe('R');
+    expect(out.body.truncated).toBe(true);
+    expect(mockFake.indexQueries.length).toBeLessThan(7); // 61 rows / 10 per page: stopped at the cap
+  });
+
+  it('exactly 49 branches fit without truncation', async () => {
+    seed('R');
+    for (let i = 0; i < 49; i++) seed(`B${i}`, { createdAt: at(10 + i), branchedFrom: link('R', 'R') });
+    const out = await get('R');
+    expect(out.body.sessions).toHaveLength(50);
+    expect(out.body.truncated).toBeUndefined();
+  });
+
+  it('stops after 20 index pages and reports truncated:true', async () => {
+    seed('R');
+    for (let i = 0; i < 30; i++) seed(`N${i}`, { updatedAt: at(10 + i) });
+    mockFake.indexPageSize = 1;
+    const out = await get('R');
+    expect(mockFake.indexQueries).toHaveLength(20);
+    expect(out.body.truncated).toBe(true);
+    expect(out.body.sessions.map((s: any) => s.sessionId)).toEqual(['R']);
+  });
+});
