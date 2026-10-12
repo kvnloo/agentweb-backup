@@ -5,7 +5,11 @@
  * @see https://docs.luma.com/reference/getting-started-with-your-api
  */
 
-const LUMA_API_BASE = 'https://public-api.luma.com';
+const LUMA_PUBLIC_API = 'https://public-api.luma.com';
+// Test-only redirect to a fake Luma. Ignored in production so a stray env var can never send
+// customers' API keys to another host.
+const LUMA_API_BASE =
+  process.env.NODE_ENV !== 'production' && process.env.LUMA_API_BASE_URL ? process.env.LUMA_API_BASE_URL : LUMA_PUBLIC_API;
 const REQUEST_TIMEOUT_MS = 20_000;
 const PAGE_SIZE = 100;
 const MAX_PAGES = 25;

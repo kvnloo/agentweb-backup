@@ -359,3 +359,32 @@ describe('luma tools', () => {
     expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
   });
 });
+
+describe('LUMA_API_BASE_URL override', () => {
+  const load = (nodeEnv: string) => {
+    const prevEnv = process.env.NODE_ENV;
+    const prevUrl = process.env.LUMA_API_BASE_URL;
+    process.env.NODE_ENV = nodeEnv;
+    process.env.LUMA_API_BASE_URL = 'http://127.0.0.1:9999';
+    let svc: any;
+    jest.isolateModules(() => {
+      svc = require('../services/lumaApiService');
+    });
+    process.env.NODE_ENV = prevEnv;
+    if (prevUrl === undefined) delete process.env.LUMA_API_BASE_URL;
+    else process.env.LUMA_API_BASE_URL = prevUrl;
+    return svc;
+  };
+
+  it('redirects outside production (so a fake Luma can be used in a preview)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ id: 'cal-1', name: 'x' }));
+    await new (load('development').LumaApiService)('k').getCalendar();
+    expect(String(fetchMock.mock.calls.pop()![0])).toMatch(/^http:\/\/127\.0\.0\.1:9999\//);
+  });
+
+  it('is ignored in production, so keys can only ever go to Luma', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ id: 'cal-1', name: 'x' }));
+    await new (load('production').LumaApiService)('k').getCalendar();
+    expect(String(fetchMock.mock.calls.pop()![0])).toMatch(/^https:\/\/public-api\.luma\.com\//);
+  });
+});
