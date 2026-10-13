@@ -455,6 +455,10 @@ export interface AccountHealthSweepSummary {
   captured?: Array<{ userId: string; state: string; channel: AccountHealthChannel; reason: AccountHealthSignalReason; codes: EvidenceCode[] }>;
 }
 
+/**
+ * NOTE: `dryRun` skips alerts and writes but still reads live Google Ads delivery (read-only GAQL
+ * searches, one set per connected Google account), so a dry run consumes Google API quota.
+ */
 export async function runAccountHealthClassifier(
   opts: { dryRun?: boolean; now?: number } = {},
 ): Promise<AccountHealthSweepSummary> {

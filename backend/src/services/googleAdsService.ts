@@ -1102,16 +1102,27 @@ export class GoogleAdsService {
 
   /**
    * ENG-1913: read-only per-campaign delivery input for the account-health zero-delivery check.
-   * Status + approved daily budget + start time, joined with impressions/clicks over the last
+   * Status + approved daily budget + go-live time, joined with impressions/clicks over the last
    * 7 days. Throws on any incomplete read: a partial read must never become "zero delivery".
    * A campaign absent from the metrics rows had no delivery in the window (Google omits
-   * all-zero metric rows), which is only trusted because both reads completed.
-   * `liveSince` is the campaign start in the account timezone read as UTC — at most a few
-   * hours off, well inside the 24h grace window.
+   * all-zero metric rows), which is only trusted because every read completed.
+   *
+   * Go-live: `campaign.start_date_time` is only the scheduled start, not when the campaign was
+   * last turned on (a campaign paused for weeks and re-enabled an hour ago keeps its old start).
+   * The API has no "enabled since" field, so `liveSince` is the later of the start and the most
+   * recent `change_event` on the campaign in the metrics window; any recent edit restarts the
+   * grace period, which can only suppress a verdict, never create one.
+   *
+   * Ended: an elapsed `campaign.end_date_time` leaves status ENABLED, so it is reported as
+   * `ENDED` (excluded by the classifier). Date-times are in the account timezone and are read
+   * as UTC, so they can be off by the UTC-12..+14 range: an end counts as passed 14h early and
+   * `liveSince` is pushed 12h late, both toward abstaining.
    */
-  async getCampaignDelivery(userId: string, customerId: string, _nowMs: number = Date.now()): Promise<Array<{
+  async getCampaignDelivery(userId: string, customerId: string, nowMs: number = Date.now()): Promise<Array<{
     campaignId: string; status: string; approvedDailyBudget: number; liveSince: string; impressions: number; clicks: number;
   }>> {
+    const HOUR = 3_600_000;
+    const CHANGE_EVENT_LIMIT = 10_000; // GAQL requires a LIMIT (max 10000) on change_event
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const read = async (query: string): Promise<any[]> => {
       const completeness: { truncated?: boolean } = {};
@@ -1119,8 +1130,25 @@ export class GoogleAdsService {
       if (completeness.truncated) throw new Error('Incomplete Google Ads read');
       return rows;
     };
-    const config = await read("SELECT campaign.id, campaign.status, campaign.start_date_time, campaign_budget.amount_micros, campaign_budget.status FROM campaign WHERE campaign.status != 'REMOVED'");
+    // "yyyy-MM-dd HH:mm:ss[.ffffff]" (account timezone) -> epoch ms read as UTC, or NaN.
+    const parseLocal = (value: unknown): number => {
+      if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}/.test(value)) return NaN;
+      return Date.parse(`${value.slice(0, 10)}T${value.slice(11, 19) || '00:00:00'}Z`);
+    };
+    const stamp = (ms: number): string => new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
+    const config = await read("SELECT campaign.id, campaign.status, campaign.start_date_time, campaign.end_date_time, campaign_budget.amount_micros, campaign_budget.status FROM campaign WHERE campaign.status != 'REMOVED'");
     const metrics = await read("SELECT campaign.id, metrics.impressions, metrics.clicks FROM campaign WHERE campaign.status != 'REMOVED' AND segments.date DURING LAST_7_DAYS");
+    const changes = await this.search(customerId, accessToken,
+      `SELECT change_event.campaign, change_event.change_date_time FROM change_event WHERE change_event.change_resource_type = 'CAMPAIGN' AND change_event.change_date_time >= '${stamp(nowMs - 8 * 24 * HOUR)}' AND change_event.change_date_time <= '${stamp(nowMs + 24 * HOUR)}' ORDER BY change_event.change_date_time DESC LIMIT ${CHANGE_EVENT_LIMIT}`,
+      loginCustomerId);
+    if (changes.length >= CHANGE_EVENT_LIMIT) throw new Error('Incomplete Google Ads read');
+    const lastChange = new Map<string, number>();
+    for (const row of changes) {
+      const id = /\/campaigns\/(\d+)$/.exec(String(row.changeEvent?.campaign ?? ''))?.[1];
+      const at = parseLocal(row.changeEvent?.changeDateTime);
+      if (!id || !Number.isFinite(at)) throw new Error('Malformed Google Ads change event row');
+      lastChange.set(id, Math.max(lastChange.get(id) ?? 0, at));
+    }
     const delivered = new Map<string, { impressions: number; clicks: number }>();
     for (const row of metrics) {
       const id = String(row.campaign?.id ?? '');
@@ -1134,16 +1162,19 @@ export class GoogleAdsService {
     return config.map((row: any) => {
       const id = String(row.campaign?.id ?? '');
       if (!id) throw new Error('Malformed Google Ads campaign row');
-      const start = typeof row.campaign?.startDateTime === 'string' ? row.campaign.startDateTime : '';
-      const liveSince = /^\d{4}-\d{2}-\d{2}/.test(start) ? `${start.slice(0, 10)}T${start.slice(11, 19) || '00:00:00'}Z` : '';
+      const startMs = parseLocal(row.campaign?.startDateTime);
+      const liveMs = Number.isFinite(startMs) ? Math.max(startMs, lastChange.get(id) ?? 0) + 12 * HOUR : NaN;
+      const endMs = parseLocal(row.campaign?.endDateTime);
+      const ended = Number.isFinite(endMs) && endMs - 14 * HOUR <= nowMs;
       const budgetEnabled = row.campaignBudget?.status === undefined || row.campaignBudget.status === 'ENABLED';
       const amount = Number(row.campaignBudget?.amountMicros ?? 0);
       const d = delivered.get(id) ?? { impressions: 0, clicks: 0 };
+      const status = String(row.campaign?.status ?? 'UNKNOWN');
       return {
         campaignId: id,
-        status: String(row.campaign?.status ?? 'UNKNOWN'),
+        status: ended && status === 'ENABLED' ? 'ENDED' : status,
         approvedDailyBudget: budgetEnabled && Number.isFinite(amount) ? amount / 1_000_000 : 0,
-        liveSince,
+        liveSince: Number.isFinite(liveMs) ? new Date(liveMs).toISOString() : '',
         impressions: d.impressions,
         clicks: d.clicks,
       };
