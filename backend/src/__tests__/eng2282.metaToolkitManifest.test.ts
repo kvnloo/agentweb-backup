@@ -58,9 +58,14 @@ describe('ENG-2282 Meta Toolkit manifest', () => {
     for (const def of manifest) expect(def.inputSchema.properties.client_id).toBeUndefined();
     const mkt = manifest.find((d: any) => d.name === 'call_meta_marketing_api');
     const actions: string[] = mkt.inputSchema.properties.action.enum;
-    for (const excluded of ['CREATE', 'UPDATE', 'DELETE', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'UPLOAD_USERS', 'COPY_AD', 'RETAG_UTM']) {
+    for (const excluded of ['DELETE', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'UPLOAD_USERS', 'COPY_AD', 'RETAG_UTM']) {
       expect(actions).not.toContain(excluded);
     }
+    // ENG-2303: guarded writes are advertised with the preview→confirm arguments.
+    expect(actions).toEqual(expect.arrayContaining(['CREATE', 'UPDATE']));
+    expect(mkt.inputSchema.properties.confirm.type).toBe('boolean');
+    expect(mkt.inputSchema.properties.preview_token.type).toBe('string');
+    expect(mkt.description).toMatch(/created PAUSED/);
     expect(mkt.inputSchema.properties.params.properties.override_tracking_check).toBeUndefined();
   });
 

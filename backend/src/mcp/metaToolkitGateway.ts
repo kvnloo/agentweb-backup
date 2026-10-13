@@ -23,6 +23,7 @@ import { recordMcpToolUse, type McpAuthMethod } from '../services/mcpUsageEvents
 import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } from './metaToolkitManifest';
 import { RateLimiter } from '../middleware/rateLimiter';
 import { isZomaTool } from './zomaToolDefinitions';
+import { executeMetaToolkitWrite, isGuardedWriteRequest } from './metaToolkitWrites';
 import { metaConnectionIsUsable, runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
 
 export class MetaToolkitAuthError extends Error {
@@ -57,6 +58,8 @@ export interface MetaToolkitGatewayDeps {
   rateLimiter?: Pick<RateLimiter, 'check'>;
   /** ENG-2303 toolkit-local Zoma tools; defaults to runZomaTool. */
   runZomaTool?: typeof runZomaTool;
+  /** ENG-2303 P3 guarded writes; defaults to executeMetaToolkitWrite. */
+  executeWrite?: (userId: string, args: any) => Promise<any>;
 }
 
 /** Per-credential ceiling, so one key/token cannot exceed its limit by spreading calls across IPs. */
@@ -196,10 +199,14 @@ export async function handleMetaToolkitCall(
   const accountId = await resolveMetaToolkitAdAccount(caller.userId, args.account_id, deps);
   if (toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
 
-  const result = await deps.execute(request.toolName, args, {
-    userId: caller.userId,
-    sessionId: request.sessionId,
-  });
+  // ENG-2303 P3: CAMPAIGN/AD_SET/AD CREATE + status/budget UPDATE go through the guarded
+  // preview→confirm path; every other write stays refused by assertMetaToolkitV1Call.
+  const result = isGuardedWriteRequest(request.toolName, args)
+    ? await (deps.executeWrite ?? executeMetaToolkitWrite)(caller.userId, args)
+    : await deps.execute(request.toolName, args, {
+        userId: caller.userId,
+        sessionId: request.sessionId,
+      });
 
   await meter();
   return result;
