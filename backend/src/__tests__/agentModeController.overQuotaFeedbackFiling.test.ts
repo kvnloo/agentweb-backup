@@ -289,4 +289,50 @@ describe('ENG-527 over-quota Emma feedback filing', () => {
     await agentModeController.generateResponse(generateReq({ feedbackIntent: 'bug' }), res);
     expect(mockFile).not.toHaveBeenCalled();
   });
+  it('Opslane P1: with no tracker link, never says "being tracked:" and returns null link', async () => {
+    mockFile.mockResolvedValue({
+      title: 'Bug: z', replayed: false, issueId: 'AGW-9',
+      filed: { pageId: '9', trackerUrl: '', userUrl: '', deduped: false, tracker: 'Featurebase' },
+    });
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ feedbackIntent: 'bug', userMessage: 'export crashes on csv' }), res);
+    expect(res.statusCode).toBe(200);
+    expect(res.body.content).not.toMatch(/being tracked/);
+    expect(res.body.content).toContain('AGW-9');
+    expect(res.body.feedbackFiled).toMatchObject({ trackerUrl: null, issueId: 'AGW-9' });
+  });
+
+  it('Opslane P2: the filed turn is persisted to the session', async () => {
+    mockFile.mockResolvedValue({
+      title: 'Bug: y', replayed: false,
+      filed: { pageId: '2', trackerUrl: 'https://fb/t/2', deduped: false, tracker: 'Featurebase' },
+    });
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ feedbackIntent: 'bug', userMessage: 'dashboard crashes' }), res);
+    expect(res.statusCode).toBe(200);
+    expect(mockChatbotDb.addMessagesToSession).toHaveBeenCalledWith(SESSION_ID, [
+      expect.objectContaining({ role: 'user', content: 'dashboard crashes' }),
+      expect.objectContaining({ role: 'assistant', content: res.body.content }),
+    ]);
+  });
+
+  it('Opslane P2: a transcript write failure does not un-report a successful filing', async () => {
+    mockFile.mockResolvedValue({
+      title: 'Bug: y', replayed: false,
+      filed: { pageId: '2', trackerUrl: 'https://fb/t/2', deduped: false, tracker: 'Featurebase' },
+    });
+    mockChatbotDb.addMessagesToSession.mockRejectedValue(new Error('ddb down'));
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ feedbackIntent: 'bug', userMessage: 'x' }), res);
+    expect(res.statusCode).toBe(200);
+    expect(res.body.feedbackFiled).toMatchObject({ trackerUrl: 'https://fb/t/2' });
+  });
+
+  it('Opslane P2: a blank over-quota report is a 400, nothing filed', async () => {
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ feedbackIntent: 'bug', userMessage: '   ' }), res);
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toMatchObject({ error: 'Description is required', feedbackFiled: null });
+    expect(mockFile).not.toHaveBeenCalled();
+  });
 });

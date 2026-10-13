@@ -10015,6 +10015,11 @@ export const agentModeController = {
         const feedbackIntent = typeof req.body.feedbackIntent === 'string' ? req.body.feedbackIntent : undefined;
         if (feedbackIntent && Object.prototype.hasOwnProperty.call(EMMA_FEEDBACK_INTENTS, feedbackIntent)) {
           const intentConfig = EMMA_FEEDBACK_INTENTS[feedbackIntent];
+          // Same validation as POST /support/report-ui-bug: blank input is a 400, not a filing failure.
+          const feedbackDescription = typeof userMessage === 'string' ? userMessage.trim() : '';
+          if (!feedbackDescription) {
+            return res.status(400).json({ error: 'Description is required', code: 'feedback_description_required', feedbackFiled: null });
+          }
           try {
             // Match /support attribution: reporter details come from the DB user record (the
             // token carries no displayName/funnelStatus), and admin delegation is recorded.
@@ -10033,17 +10038,33 @@ export const agentModeController = {
               reportType: feedbackIntent,
               titlePrefix: intentConfig.titlePrefix,
               tag: intentConfig.tag,
-              description: String(userMessage),
+              description: feedbackDescription,
               pageUrl: typeof currentUrl === 'string' ? currentUrl : undefined,
               sessionId,
             });
-            const link = filing.filed.userUrl || filing.filed.trackerUrl;
+            const link = (filing.filed.userUrl || filing.filed.trackerUrl || '').trim();
             const label = feedbackIntent === 'bug' ? 'bug report' : 'feature request';
+            // Never print "being tracked:" with nothing after it: only promise a link we have.
+            const content = link
+              ? `Your ${label} has been filed and is being tracked: ${link}`
+              : `Your ${label} has been filed${filing.issueId ? ` (${filing.issueId})` : ''}. The team will follow up.`;
+            // Persist the turn like an answered turn so the confirmation survives a reload.
+            const nowIso = new Date().toISOString();
+            try {
+              await chatbotDb.addMessagesToSession(sessionId, [
+                { role: 'user', content: String(userMessage), timestamp: nowIso, metadata: { timestamp: nowIso, feedbackIntent } },
+                { role: 'assistant', content, timestamp: nowIso, metadata: { timestamp: nowIso, feedbackFiled: true } },
+              ] as any);
+            } catch (persistError) {
+              // The filing already succeeded; a transcript write failure must not un-report it.
+              console.error('[agentMode] ENG-527 failed to persist over-quota feedback turn:', persistError);
+            }
             return res.json({
-              content: `Your ${label} has been filed and is being tracked: ${link}`,
+              content,
               feedbackFiled: {
                 type: feedbackIntent,
-                trackerUrl: link,
+                trackerUrl: link || null,
+                issueId: filing.issueId ?? null,
                 deduped: filing.filed.deduped,
                 replayed: filing.replayed,
               },
