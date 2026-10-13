@@ -30,10 +30,10 @@ describe('finalize-guard judge accuracy eval (ENG-185)', () => {
 
   it('scores precision/recall/FPR correctly on a hand-computed set', async () => {
     const cases: JudgeAccuracyCase[] = [
-      { id: 'tp', kind: 'true_mismatch', finalText: 'I emailed Dana.', ledger: [], expectedMismatch: ['email_sent'], recordedJudge: [{ claimClass: 'email_sent' }] },
-      { id: 'fp', kind: 'true_backed', finalText: 'The email was sent.', ledger: [], expectedMismatch: [], recordedJudge: [{ claimClass: 'email_sent' }] },
-      { id: 'fn', kind: 'adversarial', finalText: 'It is in her inbox.', ledger: [], expectedMismatch: ['email_sent'], recordedJudge: [{ claimClass: 'email_sent' }] },
-      { id: 'tn', kind: 'true_backed', finalText: 'Email sent to Bo.', ledger: [{ toolName: 'send_email', status: 'success', result: {} }], expectedMismatch: [], recordedJudge: [{ claimClass: 'email_sent' }] },
+      { id: 'tp', kind: 'true_mismatch', finalText: 'I emailed Dana.', ledger: [], expectedMismatch: ['email_sent'], recordedJudge: [{ claimClass: 'email_sent', statement: 'email sent' }] },
+      { id: 'fp', kind: 'true_backed', finalText: 'The email was sent.', ledger: [], expectedMismatch: [], recordedJudge: [{ claimClass: 'email_sent', statement: 'email sent' }] },
+      { id: 'fn', kind: 'adversarial', finalText: 'It is in her inbox.', ledger: [], expectedMismatch: ['email_sent'], recordedJudge: [{ claimClass: 'email_sent', statement: 'email sent' }] },
+      { id: 'tn', kind: 'true_backed', finalText: 'Email sent to Bo.', ledger: [{ toolName: 'send_email', status: 'success', result: {} }], expectedMismatch: [], recordedJudge: [{ claimClass: 'email_sent', statement: 'email sent' }] },
     ];
     const r = await scoreFinalizeJudge(cases, recordedJudgeFor(cases));
     expect(r.perClass.email_sent).toMatchObject({ tp: 1, fp: 1, fn: 1, tn: 1, precision: 0.5, recall: 0.5, falsePositiveRate: 0.5 });

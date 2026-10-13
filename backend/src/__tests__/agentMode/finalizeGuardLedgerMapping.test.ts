@@ -46,7 +46,7 @@ jest.mock('../../services/subscriptionService', () => ({
 
 const EMAIL_ARGS = '{"to":"client@example.com","subject":"Weekly report"}';
 const UNTRUE_CLAIM = "Done! I've sent the email to the client with the report attached.";
-const JUDGE_VERDICT = '[{"claimClass":"email_sent"}]';
+const JUDGE_VERDICT = '[{"claimClass":"email_sent","statement":"sent the email"}]';
 const CORRECTED =
   'I was not able to send the email — the send_email call failed in this session. Ask me to retry and I will attempt it again.';
 
