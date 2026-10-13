@@ -110,6 +110,15 @@ describe('enrollSkillInTiers (ENG-508)', () => {
     expect(mockSetSetting).not.toHaveBeenCalled();
   });
 
+  it('reports an empty tier list as unreachable (it reaches nothing at runtime)', async () => {
+    setTiers([]);
+
+    const res = await enrollSkillInTiers(SKILL, false);
+
+    expect(res).toEqual({ changed: [], alreadyAllowed: [], reachable: false });
+    expect(mockSetSetting).not.toHaveBeenCalled();
+  });
+
   it('predicates mirror the runtime rule (only an explicit star is a wildcard)', () => {
     expect(tierIsWildcard({ name: 'a' })).toBe(false);
     expect(tierIsWildcard({ name: 'a', allowedSkills: [] })).toBe(false);

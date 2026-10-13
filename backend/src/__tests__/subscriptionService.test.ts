@@ -461,13 +461,14 @@ describe('subscriptionService', () => {
     expect(res.allowingTiers).toContain('Super');
   });
 
-  it('findTiersAllowingSkill: tier missing allowedSkills is treated as wildcard (backward compat)', async () => {
+  it('findTiersAllowingSkill: tier missing allowedSkills reaches nothing (the runtime refuses to resolve it)', async () => {
     mockedSettingsService.getSetting.mockResolvedValueOnce(tiersSetting([
       { name: 'Legacy', allowedPages: [], allowedFunctionCalls: ['x'] },
     ]) as any);
 
     const res = await findTiersAllowingSkill('skill-x');
-    expect(res.reachable).toBe(true);
+    expect(res.reachable).toBe(false);
+    expect(res.allowingTiers).toEqual([]);
   });
 
   it('findTiersAllowingSkill: fail-open (reachable) when no subscription_types setting exists', async () => {

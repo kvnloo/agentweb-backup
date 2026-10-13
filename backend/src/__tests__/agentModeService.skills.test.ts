@@ -1261,8 +1261,9 @@ describe('AgentModeService - Skills', () => {
 
       const result = await agentModeService.getFilteredTools('user-123', new Set());
 
-      // Should fallback to just install_skills
-      expect(result.length).toBeGreaterThanOrEqual(0);
+      // The catch-all error path stays the strictest toolset: install_skills and nothing else
+      // (an unresolved entitlement is deliberately more generous — it keeps the foundation tools).
+      expect(result.map((t: any) => t.function?.name || t.name)).toEqual(['install_skills']);
     });
 
     /*

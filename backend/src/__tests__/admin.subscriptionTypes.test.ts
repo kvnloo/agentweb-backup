@@ -119,7 +119,7 @@ describe('Admin subscription types routes', () => {
     expect(basic.allowedSkills).not.toContain('*');
   });
 
-  it('GET /api/admin/subscription-types backward compat: old format with allowedFunctionCalls gets all skills', async () => {
+  it('GET /api/admin/subscription-types: old format with allowedFunctionCalls shows no skills (runtime refuses to resolve it)', async () => {
     // Old format without allowedSkills
     const storedTypes = [
       {
@@ -145,12 +145,9 @@ describe('Admin subscription types routes', () => {
     expect(res.body).toHaveLength(1);
     const legacy = res.body[0];
 
-    // Missing allowedSkills should be expanded to all available skills
-    expect(legacy.allowedSkills).toEqual(
-      await (subscriptionService.getAllAvailableSkills as jest.Mock).mock.results[0].value,
-    );
-    // Should not have allowedFunctionCalls in the response (replaced by allowedSkills)
-    expect(legacy.allowedSkills).toContain('skill-1');
+    // ENG-1978: missing allowedSkills is no longer expanded to all skills — the runtime denies such
+    // a row, and showing it as "all" would let an admin save it back as a full grant.
+    expect(legacy.allowedSkills).toEqual([]);
     expect(legacy.allowedFeatures).toEqual(['scheduled_chats']);
   });
 
