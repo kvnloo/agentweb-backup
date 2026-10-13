@@ -1,18 +1,14 @@
 /**
  * ENG-508/ENG-867 — tier enrollment semantics for the LinkedIn Profile Reader seed.
  *
- * Enrollment must follow the RUNTIME rule (getAllowedSkills): a tier whose
- * allowedSkills is absent, EMPTY, or contains '*' already grants every skill.
- * Two things must hold:
+ * Enrollment must follow the RUNTIME rule (getAllowedSkills). Since ENG-1978 only an
+ * explicit '*' is a wildcard: an EMPTY allowedSkills list means NO skills and an absent
+ * one is a malformed row the runtime refuses to resolve. Two things must hold:
  *
- *  1. An EMPTY list is never appended to. Appending a skillId there would flip the
- *     tier from "all skills allowed" to "only this one skill allowed" — a severe
- *     entitlement regression for every user on that tier.
- *  2. Reachability is judged by the same rule used to enroll, so the seed cannot
- *     skip a tier as wildcard and then fail claiming the skill is unreachable
- *     (the inconsistency Greptile flagged: findTiersAllowingSkill does
- *     `tier.allowedSkills || ['*']`, and `[]` is truthy, so it reads an empty list
- *     as "allows nothing" while the runtime reads it as wildcard).
+ *  1. Empty and malformed tiers are never appended to. Doing so would widen a deliberate
+ *     zero-skill tier (or "repair" a malformed row) from a seed script.
+ *  2. Reachability is judged by the same rule used to enroll, so the seed cannot skip a
+ *     tier and then claim the skill is reachable through it.
  */
 
 const mockGetSetting = jest.fn();
@@ -37,15 +33,36 @@ describe('enrollSkillInTiers (ENG-508)', () => {
     mockSetSetting.mockResolvedValue(undefined);
   });
 
-  it('treats an EMPTY allowedSkills list as wildcard: never appends, and still reports reachable', async () => {
+  it('leaves an EMPTY allowedSkills list alone (it means no skills) and does not report it reachable', async () => {
     setTiers([{ name: 'Free', allowedSkills: [] }]);
 
     const res = await enrollSkillInTiers(SKILL, false);
 
-    // The dangerous regression: an empty list must not gain a single entry.
     expect(res.changed).toEqual([]);
     expect(mockSetSetting).not.toHaveBeenCalled();
-    // And the seed must NOT then claim the skill is unreachable.
+    expect(res.reachable).toBe(false);
+  });
+
+  it('leaves a tier with no allowedSkills field alone (malformed) and does not report it reachable', async () => {
+    setTiers([{ name: 'Broken' }]);
+
+    const res = await enrollSkillInTiers(SKILL, false);
+
+    expect(res.changed).toEqual([]);
+    expect(mockSetSetting).not.toHaveBeenCalled();
+    expect(res.reachable).toBe(false);
+  });
+
+  it('still reports reachable when a wildcard tier sits next to an empty one', async () => {
+    setTiers([
+      { name: 'Free', allowedSkills: [] },
+      { name: 'Enterprise', allowedSkills: ['*'] },
+    ]);
+
+    const res = await enrollSkillInTiers(SKILL, false);
+
+    expect(res.changed).toEqual([]);
+    expect(res.alreadyAllowed).toEqual(['Enterprise (wildcard)']);
     expect(res.reachable).toBe(true);
   });
 
@@ -84,22 +101,32 @@ describe('enrollSkillInTiers (ENG-508)', () => {
     expect(mockSetSetting).not.toHaveBeenCalled();
   });
 
-  it('handles a missing subscription_types setting as all-wildcard', async () => {
+  it('handles a missing subscription_types setting as unreachable (the runtime resolves no tier)', async () => {
     mockGetSetting.mockResolvedValue(null);
 
     const res = await enrollSkillInTiers(SKILL, false);
 
-    expect(res).toEqual({ changed: [], alreadyAllowed: [], reachable: true });
+    expect(res).toEqual({ changed: [], alreadyAllowed: [], reachable: false });
     expect(mockSetSetting).not.toHaveBeenCalled();
   });
 
-  it('predicates mirror the runtime rule (absent / empty / star are all wildcard)', () => {
-    expect(tierIsWildcard({ name: 'a' })).toBe(true);
-    expect(tierIsWildcard({ name: 'a', allowedSkills: [] })).toBe(true);
+  it('reports an empty tier list as unreachable (it reaches nothing at runtime)', async () => {
+    setTiers([]);
+
+    const res = await enrollSkillInTiers(SKILL, false);
+
+    expect(res).toEqual({ changed: [], alreadyAllowed: [], reachable: false });
+    expect(mockSetSetting).not.toHaveBeenCalled();
+  });
+
+  it('predicates mirror the runtime rule (only an explicit star is a wildcard)', () => {
+    expect(tierIsWildcard({ name: 'a' })).toBe(false);
+    expect(tierIsWildcard({ name: 'a', allowedSkills: [] })).toBe(false);
     expect(tierIsWildcard({ name: 'a', allowedSkills: ['*'] })).toBe(true);
     expect(tierIsWildcard({ name: 'a', allowedSkills: ['x'] })).toBe(false);
 
-    expect(tierAllowsSkill({ allowedSkills: [] }, SKILL)).toBe(true);
+    expect(tierAllowsSkill({ allowedSkills: [] }, SKILL)).toBe(false);
+    expect(tierAllowsSkill({ name: 'a' }, SKILL)).toBe(false);
     expect(tierAllowsSkill({ allowedSkills: ['x'] }, SKILL)).toBe(false);
     expect(tierAllowsSkill({ allowedSkills: ['x', SKILL] }, SKILL)).toBe(true);
   });

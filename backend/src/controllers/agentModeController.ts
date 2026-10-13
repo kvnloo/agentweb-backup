@@ -4278,10 +4278,14 @@ async function runVerifiedChatInner(
   // access to them from the start (avoids relying on the LLM to call install_skills).
   if (requiredFunctions.length > 0) {
     try {
-      const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+      const [publishedSkills, rawAllowedSkillIds] = await Promise.all([
         skillService.getPublishedSkills(),
         getAllowedSkills(userId)
       ]);
+      // ENG-1978: null = entitlement unresolved. Auto-install nothing rather than everything —
+      // this pre-installs skills onto a session on the user's behalf, so an unproven entitlement
+      // must not be the reason a skill gets installed.
+      const userAllowedSkillIds: string[] = rawAllowedSkillIds ?? [];
       const isWildcard = userAllowedSkillIds.includes('*');
       const requiredToolNames = new Set(requiredFunctions.map(rf => rf.functionName));
 
@@ -5711,6 +5715,9 @@ function getZeroAssistantRequeueDelayMs(retryCount: number): number {
   return Math.min(ZERO_ASSISTANT_REQUEUE_MAX_MS, ZERO_ASSISTANT_REQUEUE_BASE_MS * Math.pow(2, exponent));
 }
 
+// ENG-1978: waits between re-checks of an unresolved entitlement before a scheduled run is deferred.
+const ENTITLEMENT_RETRY_DELAYS_MS = [1000, 2000];
+
 // Common function to run a scheduled chat (used by both test and actual execution)
 //
 // ENG-446: the run result IS the run envelope. It carries the canonical
@@ -6020,7 +6027,41 @@ export async function runScheduledChat(
     const expectedFunctionCalls = schedule.requiredFunctionCalls || [];
     if (expectedFunctionCalls.length > 0) {
       const { getAllowedFunctionCalls } = await import('../services/subscriptionService');
-      const allowedFunctionCalls = await getAllowedFunctionCalls(userId);
+      let allowedFunctionCalls = await getAllowedFunctionCalls(userId);
+
+      // ENG-1978: a null can be a brief settings-read failure rather than a permanent problem, and
+      // skipping a whole scheduled run costs the user their slot. Nobody is waiting on a background
+      // run, so give it a couple of short retries before deferring.
+      for (let attempt = 1; allowedFunctionCalls === null && attempt <= ENTITLEMENT_RETRY_DELAYS_MS.length; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, ENTITLEMENT_RETRY_DELAYS_MS[attempt - 1]));
+        allowedFunctionCalls = await getAllowedFunctionCalls(userId);
+      }
+
+      // ENG-1978: null = entitlement unresolved, which is neither "allowed" nor "denied". This is
+      // a background path, so it defers rather than deciding — the same shape the scheduled-chat
+      // feature check above uses for its own null. Previously this resolved to ["*"] and the
+      // schedule ran with every required function treated as permitted.
+      if (allowedFunctionCalls === null) {
+        const unresolvedResult = {
+          scheduleId: schedule.scheduleId,
+          runId: preGeneratedRunId || require('uuid').v4(),
+          status: 'failure' as const,
+          passed: false,
+          actualResponse: 'Scheduled chat was not run because subscription entitlements are temporarily unavailable. It will remain active and retry on the next scheduled run.',
+          actualFunctionCalls: [],
+          keywordMatches: [],
+          keywordMisses: schedule.keywords || [],
+          functionCallMatches: [],
+          functionCallMisses: expectedFunctionCalls,
+          executionTime: 0,
+          sessionId: '',
+          attempt: 0,
+          createdAt: new Date().toISOString(),
+        };
+        await scheduleDb.addRunResult(schedule.scheduleId, unresolvedResult)
+          .catch((error) => console.error('Error saving unresolved scheduled-chat entitlement result:', error));
+        return unresolvedResult;
+      }
 
       // If wildcard is present, all function calls are allowed — skip filtering
       const allAllowed = allowedFunctionCalls.includes("*");
@@ -9533,8 +9574,11 @@ export const agentModeController = {
       let toolsToReturn = tools;
       if (!user.isAdmin) {
         const { getAllowedFunctionCalls, filterFunctionCalls } = await import('../services/subscriptionService');
-        const allowedFunctionCalls = await getAllowedFunctionCalls(user.userId);
-        // getAllowedFunctionCalls now always returns an array (never null)
+        const resolvedFunctionCalls = await getAllowedFunctionCalls(user.userId);
+        // ENG-1978: null = entitlement unresolved (was ["*"], i.e. "advertise every tool").
+        // This endpoint tells a client what it may call, so an unresolved entitlement advertises
+        // only the foundation primitives rather than the full registry.
+        const allowedFunctionCalls: string[] = resolvedFunctionCalls ?? [];
         // Ensure foundation tools are always allowed
         const foundationTools = agentModeService.getFoundationToolNames();
         foundationTools.forEach(name => {
