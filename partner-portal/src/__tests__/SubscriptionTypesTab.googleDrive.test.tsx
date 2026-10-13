@@ -138,29 +138,4 @@ describe('SubscriptionTypesTab — Google Drive in rendered UI', () => {
       expect(screen.getByText('Google Drive')).toBeInTheDocument();
     });
   });
-  // ENG-2338: Luma is offered per tier like every other connected account. This renders the REAL
-  // component, unlike the re-declared constant above, so it fails if the real list drops it.
-  it('shows "Luma" checkbox label in the connected accounts section when editing', async () => {
-    mockedAxiosGet
-      .mockResolvedValueOnce({
-        data: [
-          { name: 'Pro', allowedPages: ['*'], allowedSkills: ['*'], allowedConnectedAccounts: ['*'], monthlyTokenAllowance: null },
-        ],
-      })
-      .mockResolvedValueOnce({ data: [] })
-      .mockResolvedValueOnce({ data: { pages: [] } })
-      .mockResolvedValueOnce({ data: { features: [] } });
-
-    render(<SubscriptionTypesTab />);
-    await waitFor(() => {
-      expect(screen.getByText('Pro')).toBeInTheDocument();
-    });
-    const editButtons = screen.getAllByRole('button');
-    const editButton = editButtons.find((btn) => btn.querySelector('svg') !== null && !btn.textContent?.trim());
-    fireEvent.click(editButton ?? editButtons[0]);
-
-    await waitFor(() => {
-      expect(screen.getByText('Luma')).toBeInTheDocument();
-    });
-  });
 });

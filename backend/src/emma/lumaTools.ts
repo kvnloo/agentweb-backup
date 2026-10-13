@@ -5,7 +5,7 @@
  *   - luma_list_events — events on the connected Luma calendar
  *   - luma_get_guests  — registered guests for one event, newest first
  *
- * Both need a Luma calendar API key connected in Settings -> Connected Accounts
+ * Both need a Luma calendar API key connected in Settings -> Login Credentials -> Luma API key
  * (platform = 'luma'; Luma Plus required). Without one they say so and the agent
  * falls back to the browser/session-cookie path.
  */
@@ -56,7 +56,7 @@ function compactGuest(guest: LumaGuest, includeAnswers: boolean, labels: string[
 const GUEST_STATUSES = ['approved', 'session', 'pending_approval', 'invited', 'declined', 'waitlist'];
 
 const NOT_CONNECTED_MESSAGE =
-  'No Luma API key is connected. Connecting one (Settings → Connected Accounts → Luma; needs a Luma Plus ' +
+  'No Luma API key is connected. Connecting one (Settings → Login Credentials → Luma API key; needs a Luma Plus ' +
   'calendar API key from luma.com/calendar/manage/api-keys) is the reliable way to read guest lists. ' +
   'Without it, fall back to the browser session-cookie path or a CSV export.';
 
@@ -86,7 +86,7 @@ async function resolveLuma(userId: string, calendarId?: string): Promise<Resolve
     return {
       error:
         `The Luma API key for "${account.account_name}" was rejected earlier and needs to be replaced ` +
-        '(Settings → Connected Accounts → Luma). Fall back to the browser session-cookie path or a CSV export meanwhile.',
+        '(Settings → Login Credentials → Luma API key). Fall back to the browser session-cookie path or a CSV export meanwhile.',
     };
   }
 
@@ -118,7 +118,7 @@ async function lumaFailure(error: unknown, resolved: Extract<ResolvedLuma, { cli
       success: false,
       message:
         `Luma rejected the API key for "${resolved.calendarName}" (revoked, the wrong calendar, or the Luma Plus ` +
-        'subscription lapsed). The user needs to replace it in Settings → Connected Accounts → Luma. ' +
+        'subscription lapsed). The user needs to replace it in Settings → Login Credentials → Luma API key. ' +
         'Fall back to the browser session-cookie path or a CSV export meanwhile.',
     };
   }
@@ -152,7 +152,7 @@ emmaToolRegistry.register({
     description:
       'List events on the user\'s connected Luma calendar via the Luma API (newest first). Use this to find an event id ' +
       'before luma_get_guests. Prefer it over browsing luma.com — no browser login or bot check involved. ' +
-      'Requires a Luma API key connected in Settings → Connected Accounts; if none is, the tool says so.',
+      'Requires a Luma API key connected in Settings → Login Credentials (Luma API key card); if none is, the tool says so.',
     inputSchema: {
       type: 'object',
       properties: {

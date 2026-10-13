@@ -106,7 +106,6 @@ const AVAILABLE_CONNECTED_ACCOUNTS = [
   { id: 'google_ads', label: 'Google Ads' },
   { id: 'google_drive', label: 'Google Drive' },
   { id: 'linkedin_ads', label: 'LinkedIn Ads' },
-  { id: 'luma', label: 'Luma' },
 ];
 
 interface AvailableSkill {
