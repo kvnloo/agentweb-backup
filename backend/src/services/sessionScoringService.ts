@@ -830,7 +830,7 @@ function normalizeUserTurn(text: string, stripSenderPrefix: boolean): string {
 export function isNoTaskSession(messages: ChatMessage[] = [], pageIdentifier?: string): boolean {
   const userTexts = (messages || [])
     .filter((m: any) => m.role === "user")
-    .map((m: any) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")));
+    .map((m: any) => textOf(m.content));
 
   if (userTexts.length === 0) return false;
 
@@ -905,7 +905,7 @@ function hasAssistantTurn(messages: ChatMessage[] = []): boolean {
     // NOT a genuine assistant turn, so a session that only carries it must still
     // classify as a failed run (and no note is ever double-added on a later pass).
     if (isRunFailurePlaceholder(m)) return false;
-    const text = (typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")).trim();
+    const text = textOf(m.content).trim();
     const toolCalls = m.metadata?.toolCalls;
     return text.length > 0 || (Array.isArray(toolCalls) && toolCalls.length > 0);
   });
@@ -1192,7 +1192,7 @@ function lastAssistantText(messages: ChatMessage[] = []): string {
   const nonSystem = (messages || []).filter((m: any) => m.role !== "system");
   const last: any = nonSystem[nonSystem.length - 1];
   if (!last || last.role !== "assistant" || isRunFailurePlaceholder(last)) return "";
-  return typeof last.content === "string" ? last.content : JSON.stringify(last.content ?? "");
+  return textOf(last.content);
 }
 
 export function isBlockedExternalSession(messages: ChatMessage[] = []): boolean {
@@ -1308,7 +1308,7 @@ function transcriptEndsMidToolLoop(messages: ChatMessage[]): boolean {
 
   // Pure tool-call assistant turn with no text → mid-loop
   if (last.role === "assistant") {
-    const text = (typeof last.content === "string" ? last.content : JSON.stringify(last.content ?? "")).trim();
+    const text = textOf(last.content).trim();
     const toolCalls = last.metadata?.toolCalls;
     if (!text && Array.isArray(toolCalls) && toolCalls.length > 0) return true;
   }
@@ -1811,6 +1811,8 @@ async function resolveJudgeModel(judge: ScoringJudge, userId: string | undefined
   return judge.llmModel ? resolveScoringModel(judge.llmModel) : resolveModelForUser(userId, 'scoring_judge');
 }
 
+const roundToTenth = (n: number): number => Math.round(n * 10) / 10;
+
 export async function scoreSessionWithJudge(
   messages: ChatMessage[],
   currentMessageCount: number,
@@ -1902,7 +1904,11 @@ export async function scoreSessionWithJudge(
       `Judge response missing or non-numeric "score" field (got ${JSON.stringify(parsed.score)})`
     );
   }
-  const score = Math.max(1, Math.min(5, Math.round(rawScore)));
+  // ENG-2138: a shadow judge keeps the reply's one-decimal score. The original ENG-1710 rubric B asks for a
+  // decimal and was measured on it; rounding discards that signal. A rubric that asks for whole numbers is
+  // unaffected, and customer-facing judges stay whole numbers.
+  const boundedScore = Math.max(1, Math.min(5, rawScore));
+  const score = judge.shadow ? roundToTenth(boundedScore) : Math.round(boundedScore);
   const reason = parsed.reason || "No reason provided";
   const fabricationGuarded = applyFabricationGuard(
     manifest.count,
