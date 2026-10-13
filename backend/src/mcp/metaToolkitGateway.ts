@@ -22,6 +22,8 @@ import { isMetaAdAccount } from '../services/metaTokenRefresh';
 import { recordMcpToolUse, type McpAuthMethod } from '../services/mcpUsageEventsService';
 import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } from './metaToolkitManifest';
 import { RateLimiter } from '../middleware/rateLimiter';
+import { isZomaTool } from './zomaToolDefinitions';
+import { metaConnectionIsUsable, runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
 
 export class MetaToolkitAuthError extends Error {
   readonly status: 401 | 403 | 429;
@@ -53,6 +55,8 @@ export interface MetaToolkitGatewayDeps {
   recordUsage: typeof recordMcpToolUse;
   now: () => number;
   rateLimiter?: Pick<RateLimiter, 'check'>;
+  /** ENG-2303 toolkit-local Zoma tools; defaults to runZomaTool. */
+  runZomaTool?: typeof runZomaTool;
 }
 
 /** Per-credential ceiling, so one key/token cannot exceed its limit by spreading calls across IPs. */
@@ -110,12 +114,7 @@ function normalizeAdAccountId(id: unknown): string {
   return String(id ?? '').trim().replace(/^act_/, '');
 }
 
-function connectionIsUsable(account: ConnectedAccount, now: number): boolean {
-  const config: any = account.config;
-  if (config?.ads_scope_revoked_at) return false;
-  const expiresAt = config?.token_expires_at;
-  return !(typeof expiresAt === 'number' && expiresAt < now);
-}
+const connectionIsUsable = metaConnectionIsUsable;
 
 /**
  * Resolve the Meta ad account this call runs against. A requested account must be one the
@@ -169,6 +168,30 @@ export async function handleMetaToolkitCall(
   deps: MetaToolkitGatewayDeps = defaultDeps,
 ) {
   const caller = await authenticateMetaToolkitCaller(request.authorization, deps);
+  const meter = () =>
+    deps.recordUsage({
+      userId: caller.userId,
+      toolName: request.toolName,
+      authMethod: caller.authMethod,
+      apiKeyId: caller.apiKeyId,
+      clientId: caller.clientId,
+      sessionId: request.sessionId,
+      userAgent: request.userAgent,
+    });
+
+  // ENG-2303: onboarding tools must work before Meta is connected, so they skip account resolution.
+  if (isZomaTool(request.toolName)) {
+    let result;
+    try {
+      result = await (deps.runZomaTool ?? runZomaTool)(request.toolName, request.args ?? {}, { userId: caller.userId });
+    } catch (error) {
+      if (error instanceof ZomaNotReadyError) throw new MetaToolkitRefusal(error.message);
+      throw error;
+    }
+    await meter();
+    return result;
+  }
+
   const args = { ...(request.args ?? {}) };
   const accountId = await resolveMetaToolkitAdAccount(caller.userId, args.account_id, deps);
   if (toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
@@ -178,14 +201,6 @@ export async function handleMetaToolkitCall(
     sessionId: request.sessionId,
   });
 
-  await deps.recordUsage({
-    userId: caller.userId,
-    toolName: request.toolName,
-    authMethod: caller.authMethod,
-    apiKeyId: caller.apiKeyId,
-    clientId: caller.clientId,
-    sessionId: request.sessionId,
-    userAgent: request.userAgent,
-  });
+  await meter();
   return result;
 }
