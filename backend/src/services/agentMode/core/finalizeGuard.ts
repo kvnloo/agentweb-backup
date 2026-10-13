@@ -296,12 +296,18 @@ export function buildVisibleCorrection(mismatched: readonly ClaimClass[]): strin
   );
 }
 
-/** Extract-and-dedupe the claim classes the judge asserted, dropping unknowns. */
-function judgedClasses(claims: JudgedClaim[]): ClaimClass[] {
-  const known = new Set<ClaimClass>(CLAIM_CLASSES);
+/**
+ * Extract-and-dedupe the claim classes the judge asserted. A claim counts only when its class was a
+ * prefilter candidate for this text and it quotes a non-empty statement from the reply: a class the
+ * lexicon never raised, or a claim with nothing to point at, is the judge guessing (ENG-2459).
+ */
+function judgedClasses(claims: JudgedClaim[], candidates: readonly ClaimClass[]): ClaimClass[] {
+  const allowed = new Set<ClaimClass>(candidates);
   const seen = new Set<ClaimClass>();
   for (const claim of claims) {
-    if (claim && known.has(claim.claimClass)) seen.add(claim.claimClass);
+    if (!claim || !allowed.has(claim.claimClass)) continue;
+    if (typeof claim.statement !== 'string' || !claim.statement.trim()) continue;
+    seen.add(claim.claimClass);
   }
   return [...seen];
 }
@@ -314,12 +320,13 @@ function judgedClasses(claims: JudgedClaim[]): ClaimClass[] {
  */
 function splitUnbackedClasses(
   claims: JudgedClaim[],
+  candidates: readonly ClaimClass[],
   ledger: FinalizeLedgerEntry[],
   ports: FinalizeGuardPorts,
 ): { confidentlyUnbacked: ClaimClass[]; ambiguous: ClaimClass[] } {
   const confidentlyUnbacked: ClaimClass[] = [];
   const ambiguous: ClaimClass[] = [];
-  for (const cls of judgedClasses(claims)) {
+  for (const cls of judgedClasses(claims, candidates)) {
     if (claimBackedByLedger(cls, ledger, ports)) continue;
     if (claimLooselyMatchedByLedger(cls, ledger, ports)) ambiguous.push(cls);
     else confidentlyUnbacked.push(cls);
@@ -353,7 +360,7 @@ export async function runFinalizeGuard(input: FinalizeGuardInput): Promise<Final
 
   // 3. Deterministic ledger match, split by confidence (risk reduction):
   //    ambiguous (loose-only) matches are never corrected, only reported.
-  const { confidentlyUnbacked: mismatched, ambiguous } = splitUnbackedClasses(claims, ledger, ports);
+  const { confidentlyUnbacked: mismatched, ambiguous } = splitUnbackedClasses(claims, candidates, ledger, ports);
   if (mismatched.length === 0) {
     return unchanged(ambiguous.length > 0 ? 'ambiguous_unmatched' : 'clean', ambiguous);
   }
@@ -398,7 +405,7 @@ export async function runFinalizeGuard(input: FinalizeGuardInput): Promise<Final
   if (recheckCandidates.length > 0) {
     try {
       const recheckClaims = await ports.judgeExtractClaims(corrected, recheckCandidates);
-      stillMismatched = splitUnbackedClasses(recheckClaims, ledger, ports).confidentlyUnbacked;
+      stillMismatched = splitUnbackedClasses(recheckClaims, recheckCandidates, ledger, ports).confidentlyUnbacked;
     } catch (err) {
       ports.recordClaimCheckError(err);
       stillMismatched = mismatched;
@@ -432,10 +439,13 @@ export async function runFinalizeGuard(input: FinalizeGuardInput): Promise<Final
 export function buildFinalizeJudgePrompt(finalText: string, candidateClasses: readonly ClaimClass[]): string {
   return (
     'You are auditing an AI assistant\'s reply for COMPLETED-ACTION claims — statements that an action already happened '
-    + '(not offers, plans, or suggestions). The possible claim classes are: '
+    + 'in THIS session (not offers, plans, or suggestions). The possible claim classes are: '
     + `${CLAIM_CLASSES.join(', ')}. Candidate classes detected in this reply: ${candidateClasses.join(', ')}.\n\n`
+    + 'Report only classes from the candidate list. Do NOT report a statement that is negated or refused ("I did not send", "could not create"), '
+    + 'withheld or waiting on approval, a draft or proposal, blocked, zero-count ("0 tasks created"), quoted or ad copy, '
+    + 'a description of a schedule, post or setting that already existed, or advice about what the user should do next.\n\n'
     + 'Return ONLY a JSON array, one element per claimed completed action, each shaped '
-    + '{"claimClass":"<class>","statement":"<short quote from the reply>"}. '
+    + '{"claimClass":"<class>","statement":"<short quote from the reply>"}; the statement must be a non-empty quote that makes the claim. '
     + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
     + finalText
   );
