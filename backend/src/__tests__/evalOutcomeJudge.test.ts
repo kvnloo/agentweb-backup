@@ -48,6 +48,14 @@ describe('evalOutcomeJudge parseArgs', () => {
 describe('summarizeReplay', () => {
   const row = (success: boolean, score: number, model = 'm-a'): JudgedSession => ({ success, score, model });
 
+  it('counts a 5 as a score of at least 4.95, so a decimal 4.6 is not a 5', () => {
+    const rows = [row(true, 4.97), row(true, 4.6), row(true, 4.5), row(false, 2.3), row(false, 4.95)];
+    const s = summarizeReplay(rows);
+    expect(s.shareAt5).toBeCloseTo(2 / 5, 10);
+    // The histogram keeps whole-number buckets for display.
+    expect(s.histogram).toEqual({ 1: 0, 2: 1, 3: 0, 4: 0, 5: 4 });
+  });
+
   it('reports AUC, share at 5, histogram, means and per-model rows from n >= 5', () => {
     const rows = [
       row(true, 5), row(true, 4), row(true, 4), row(true, 3), row(true, 4),
