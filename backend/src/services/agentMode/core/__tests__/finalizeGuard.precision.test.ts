@@ -12,6 +12,7 @@ import {
   claimLooselyMatchedByLedger,
   buildFinalizeJudgePrompt,
   parseFinalizeJudgeOutput,
+  FINALIZE_JUDGE_MAX_COMPLETION_TOKENS,
   type ClaimClass,
   type FinalizeGuardPorts,
   type FinalizeLedgerEntry,
@@ -403,5 +404,11 @@ describe('parseFinalizeJudgeOutput', () => {
   });
   it('drops elements without a string claimClass', () => {
     expect(parseFinalizeJudgeOutput('[{"statement":"x"},{"claimClass":5},{"claimClass":"crm_saved","statement":"s"}]')).toEqual([{ claimClass: 'crm_saved', statement: 's' }]);
+  });
+});
+
+describe('judge output cap', () => {
+  it('is sized for { claimClass, statement } objects, not the 500 tokens that fit bare classes', () => {
+    expect(FINALIZE_JUDGE_MAX_COMPLETION_TOKENS).toBeGreaterThanOrEqual(800);
   });
 });
