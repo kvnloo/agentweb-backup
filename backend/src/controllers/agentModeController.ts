@@ -150,6 +150,7 @@ import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 import { DynamoDB } from 'aws-sdk';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
 import { parseScheduledChatsPage, encodeScheduledChatsCursor } from '../utils/scheduledChatsPage';
+import { describeScheduledRunFailureReasons } from '../utils/scheduledRunFailureReasons';
 import {
   selectPolicyModel,
   type ModelBackupSource,
@@ -7398,10 +7399,18 @@ export async function runScheduledChat(
       // distinguishable from a run that exhausted all 20 attempts some other way.
       ...(result.sendPressExhausted ? { sendPressExhausted: true } : {}),
     };
+    // ENG-1735: name the concrete failing check so a failure with no tool/keyword
+    // misses is not reported as "none / none".
+    const scheduledRunFailureReasons = runDelivered
+      ? []
+      : describeScheduledRunFailureReasons(result, { linkedInInviteSendRequirementMissed });
     const scheduledChatFailureDescription =
       `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\n` +
       `Missing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\n` +
       `Keyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}` +
+      (scheduledRunFailureReasons.length
+        ? `\nFailure reason: ${scheduledRunFailureReasons.join('; ')}`
+        : '') +
       (linkedInInviteSendBlock
         ? `\n\nBlocked action: send-invite. ${linkedInInviteSendBlock.notice}`
         : '');
