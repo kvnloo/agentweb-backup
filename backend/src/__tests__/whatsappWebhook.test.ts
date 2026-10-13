@@ -30,9 +30,16 @@ jest.mock('../services/whatsappService', () => ({
 }));
 jest.mock('../services/whatsappVerificationService', () => ({
   handleVerificationMessage: jest.fn(),
+  disconnectWhatsAppForNumber: jest.fn(),
+  resumeVerificationAfterStart: jest.fn(),
 }));
 jest.mock('../services/approvalChannelNotifier', () => ({
   handleApprovalButtonTap: jest.fn(),
+  lookupApprovalMessage: jest.fn(),
+}));
+jest.mock('../services/approvalDb', () => ({ approvalDb: { getApproval: jest.fn() } }));
+jest.mock('../services/whatsappOwnerNotices', () => ({
+  notifyOwnerUnreachable: jest.fn(),
 }));
 jest.mock('../services/whatsappInboundSupport', () => ({
   handleUnrecognizedMessage: jest.fn(),
@@ -48,7 +55,10 @@ const {
   sendText,
   sendOptOutConfirmation,
 } = require('../services/whatsappService');
-const { handleVerificationMessage } = require('../services/whatsappVerificationService');
+const { lookupApprovalMessage } = require('../services/approvalChannelNotifier');
+const { notifyOwnerUnreachable } = require('../services/whatsappOwnerNotices');
+const { approvalDb } = require('../services/approvalDb');
+const { handleVerificationMessage, disconnectWhatsAppForNumber, resumeVerificationAfterStart } = require('../services/whatsappVerificationService');
 const { handleApprovalButtonTap } = require('../services/approvalChannelNotifier');
 const { handleUnrecognizedMessage } = require('../services/whatsappInboundSupport');
 const { getWhatsAppCredentials } = require('../utils/secretsManager');
@@ -225,6 +235,68 @@ describe('POST — inbound messages', () => {
     expect(recordInboundMessage).toHaveBeenCalledWith('+14155550123');
   });
 
+  it('takes WhatsApp off the account that holds the number when it texts STOP', async () => {
+    disconnectWhatsAppForNumber.mockResolvedValue('user-1');
+    await post(inboundPayload('STOP'));
+    expect(disconnectWhatsAppForNumber).toHaveBeenCalledWith('+14155550123');
+  });
+
+  it('records the opt-out BEFORE disconnecting, and disconnects BEFORE confirming', async () => {
+    const order: string[] = [];
+    recordOptOut.mockImplementation(async () => void order.push('opt-out'));
+    disconnectWhatsAppForNumber.mockImplementation(async () => {
+      order.push('disconnect');
+      return 'user-1';
+    });
+    sendOptOutConfirmation.mockImplementation(async () => void order.push('confirm'));
+    await post(inboundPayload('STOP'));
+    expect(order).toEqual(['opt-out', 'disconnect', 'confirm']);
+  });
+
+  it('is fine when no account holds the number', async () => {
+    disconnectWhatsAppForNumber.mockResolvedValue(null);
+    sendOptOutConfirmation.mockResolvedValue(undefined);
+    const res = await post(inboundPayload('STOP'));
+    expect(res.status).toBe(200);
+    expect(sendOptOutConfirmation).toHaveBeenCalled();
+  });
+
+  it('answers 500 (so Meta redelivers) when the disconnect hits a storage error, and confirms nothing yet', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    disconnectWhatsAppForNumber.mockRejectedValue(new Error('dynamo down'));
+    const res = await post(inboundPayload('STOP'));
+    expect(res.status).toBe(500);
+    expect(recordOptOut).toHaveBeenCalled(); // the opt-out itself is already safe
+    expect(sendOptOutConfirmation).not.toHaveBeenCalled();
+  });
+
+  it('START finishes a connection that was waiting on it, and sends the opt-in text only when nothing was waiting', async () => {
+    resumeVerificationAfterStart.mockResolvedValue(true);
+    await post(inboundPayload('START'));
+    expect(resumeVerificationAfterStart).toHaveBeenCalledWith('+14155550123');
+    expect(sendText).not.toHaveBeenCalled(); // the resume already replied "You're connected"
+  });
+
+  it('START with nothing waiting sends the ordinary opt-in confirmation', async () => {
+    resumeVerificationAfterStart.mockResolvedValue(false);
+    sendText.mockResolvedValue(undefined);
+    await post(inboundPayload('START'));
+    expect(sendText).toHaveBeenCalledWith('+14155550123', 'opt-in-confirmation-copy');
+  });
+
+  it('START answers 500 (Meta redelivers) when finishing the waiting connection hits a storage error', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    resumeVerificationAfterStart.mockRejectedValue(new Error('dynamo down'));
+    const res = await post(inboundPayload('START'));
+    expect(res.status).toBe(500);
+    expect(recordOptIn).toHaveBeenCalled(); // the opt-in itself is already safe
+  });
+
+  it('does not disconnect anyone for START / UNSTOP', async () => {
+    await post(inboundPayload('UNSTOP'));
+    expect(disconnectWhatsAppForNumber).not.toHaveBeenCalled();
+  });
+
   it('records an opt-out on STOP', async () => {
     await post(inboundPayload('STOP'));
     expect(recordOptOut).toHaveBeenCalledWith('+14155550123');
@@ -273,6 +345,49 @@ describe('POST — inbound messages', () => {
     expect(errSpy.mock.calls.flat().join(' ')).not.toContain('4155550123');
     expect(recordInboundMessage).not.toHaveBeenCalled();
     errSpy.mockRestore();
+  });
+
+  it('emails the owner when a failed receipt belongs to an approval request', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    lookupApprovalMessage.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-1' });
+    approvalDb.getApproval.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-1', status: 'pending' });
+    await post(statusPayload('failed'));
+    expect(lookupApprovalMessage).toHaveBeenCalledWith('wamid.OUT1');
+    expect(notifyOwnerUnreachable).toHaveBeenCalledWith('user-1');
+  });
+
+  it.each(['approved', 'rejected', 'needs_changes'])(
+    'does NOT email the owner when the approval is already %s (the results are not on hold)',
+    async (status) => {
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+      lookupApprovalMessage.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-1' });
+      approvalDb.getApproval.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-1', status });
+      await post(statusPayload('failed'));
+      expect(notifyOwnerUnreachable).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does NOT email the owner when the record now belongs to someone else', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    lookupApprovalMessage.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-1' });
+    approvalDb.getApproval.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-2', status: 'pending' });
+    await post(statusPayload('failed'));
+    expect(notifyOwnerUnreachable).not.toHaveBeenCalled();
+  });
+
+  it('does not email anyone for a failed receipt that was not an approval request', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    lookupApprovalMessage.mockResolvedValue(null);
+    await post(statusPayload('failed'));
+    expect(notifyOwnerUnreachable).not.toHaveBeenCalled();
+  });
+
+  it('a failure while acting on a receipt never fails the webhook', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    lookupApprovalMessage.mockRejectedValue(new Error('dynamo down'));
+    const res = await post(statusPayload('failed'));
+    expect(res.status).toBe(200);
   });
 
   it('stays quiet for a delivered receipt', async () => {

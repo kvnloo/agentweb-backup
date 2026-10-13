@@ -571,12 +571,13 @@ export async function sendText(
 }
 
 export const OPT_OUT_CONFIRMATION =
-  "You're opted out. AgentWeb won't send any more WhatsApp notifications to this number. " +
-  'Reply UNSTOP to turn them back on.';
+  "You're opted out. AgentWeb won't send any more WhatsApp messages to this number, and it is " +
+  'no longer connected to your AgentWeb account. Reply UNSTOP if you change your mind, then ' +
+  'reconnect it from Settings in AgentWeb.';
 
 export const OPT_IN_CONFIRMATION =
-  "You're opted back in. AgentWeb will send notifications to this WhatsApp number again. " +
-  'Reply STOP at any time to opt out.';
+  "You're opted back in. AgentWeb can message this number again. To receive notifications " +
+  'here, connect it again from Settings in AgentWeb. Reply STOP at any time to opt out.';
 
 /**
  * The one message an opted-out number is allowed to receive: confirmation that the
