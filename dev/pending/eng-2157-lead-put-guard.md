@@ -12,7 +12,7 @@ forge who/when changed a suppression (`contactStatusUpdatedBy/At`, honoured when
   `contact_status.changed` engagement with the authenticated actor (and the delegating admin), a server timestamp and fixed vocabulary only (an unvalidated client string never reaches the event: the
   engagement layer raises `isEngaged` on the words clicked/replied/received). It never blocks or fails the write. `CRM_CONTACT_STATUS_AUDIT=off` disables it.
   The event data is FLAT strings/booleans (`fromStatus`, `toStatus`, `fromGroupEmailUnsubscribed`, `toGroupEmailUnsubscribed`, `reason`, `actorUserId`, `delegatedByUserId`, `channel`, `via`, `note`): the portal's
-  Engagements dialog (CRM.tsx) renders `eventData.from` / `eventData.to` as React children for every event type, so an object there would crash the page (found by the fresh-eyes review; a test pins it).
+  Engagements dialog (CRM.tsx) renders `eventData.from` / `eventData.to` as React children for every event type, so an object there would crash it. That dialog is currently unreachable (no caller since engagements moved into the lead drawer), so this is defensive, not a live crash; a test pins the flat shape.
   The trail is best-effort and PARTIAL: it records changes made through this route only (not bulk-contact-status, Emma's update_lead, the public unsubscribe, webhooks or the bounce cron), and the before-state is read
   before the write with no compare-and-swap, so two concurrent changes can both record the same `from`.
 - `PATCH` on the same path now runs the same handler. The portal's deal editor (`DealSection`) has always sent PATCH here; the route did not exist, the fetch swallowed the 404, and deal edits vanished on reload.
