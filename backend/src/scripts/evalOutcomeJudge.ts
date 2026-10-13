@@ -129,7 +129,10 @@ export interface ReplaySummary {
   successes: number;
   auc: number | null;
   aucCI: Interval | null;
+  /** Share of raw scores >= 4.95 (the target's definition of "at 5"). */
   shareAt5: number | null;
+  /** Share of scores that round to 5, i.e. the histogram's 5 bucket; always >= shareAt5. */
+  shareRoundingTo5: number | null;
   histogram: Record<1 | 2 | 3 | 4 | 5, number>;
   meanScore: { success: number | null; failure: number | null };
   perModel: Array<{ model: string; n: number; successRate: number; meanScore: number }>;
@@ -166,6 +169,7 @@ export function summarizeReplay(rows: readonly JudgedSession[]): ReplaySummary {
     auc,
     aucCI: bothClasses ? bootstrapCI(pairs, rocAuc, { seed: 2138 }) : null,
     shareAt5,
+    shareRoundingTo5: rows.length ? histogram[5] / rows.length : null,
     histogram,
     meanScore: {
       success: mean(rows.filter((r) => r.success).map((r) => r.score)),
@@ -329,7 +333,8 @@ async function replay(args: Extract<Args, { mode: 'replay' }>): Promise<void> {
   const s = summarizeReplay(rows);
   console.log(`\nScored ${s.judged} (${s.successes} success; ${failedRuns} failed runs at production's fixed 1, no model call) on ${args.model}; not scored: ${JSON.stringify(skipped)}; reported cost $${cost.usd.toFixed(2)}.`);
   console.log(`AUC vs deterministic success: ${fixed(s.auc)} ${s.aucCI ? `[95% CI ${fixed(s.aucCI.low)}-${fixed(s.aucCI.high)}]` : ''} (target >= ${TARGET_AUC})`);
-  console.log(`Share at 5: ${pct(s.shareAt5)} (target < ${TARGET_MAX_SHARE_AT_5 * 100}%)   rounded-bucket histogram 1..5: ${JSON.stringify(s.histogram)}`);
+  console.log(`Share of raw scores >= ${SHARE_AT_5_MIN_SCORE}: ${pct(s.shareAt5)} (target < ${TARGET_MAX_SHARE_AT_5 * 100}%)`);
+  console.log(`Share of scores that round to 5: ${pct(s.shareRoundingTo5)} (the histogram's 5 bucket)   rounded-bucket histogram 1..5: ${JSON.stringify(s.histogram)}`);
   console.log(`Mean score: success ${fixed(s.meanScore.success)} / failure ${fixed(s.meanScore.failure)}`);
   console.log(`Per agent model (n >= ${MIN_MODEL_N}), by mean judge score:`);
   for (const m of s.perModel) console.log(`  ${m.model.padEnd(40)} n=${String(m.n).padStart(4)}  success ${pct(m.successRate).padStart(6)}  judge ${m.meanScore.toFixed(2)}`);
