@@ -16311,6 +16311,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
     // manage_scheduled_chat validation errors — guide LLM to the exact fix instead of a generic retry
     if (toolName === 'manage_scheduled_chat') {
+      // ENG-1656: tool-side preflight already names the exact field to fix.
+      if (safeMessage.includes('Invalid manage_scheduled_chat arguments')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: Correct exactly the argument named above and retry immediately. Nothing was sent to the server, so no schedule was created or changed.`;
+      }
+      if (safeMessage.includes('Invalid nextRunTime') || safeMessage.includes('valid IANA timezone') || safeMessage.includes('Invalid status')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: next_run_time must be an ISO 8601 datetime, timezone a valid IANA identifier (e.g. America/Los_Angeles), and toggle status "active" or "paused". Correct the named value and retry immediately.`;
+      }
       if (safeMessage.includes('Missing required fields')) {
         return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: For action "create", schedule_name, starting_message, and schedule_frequency are all required. For action "update", these three fall back to the schedule's existing values if omitted, but at least one must resolve to a non-empty value. Add the missing field(s) named above and retry immediately.`;
       }
