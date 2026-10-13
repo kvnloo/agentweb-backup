@@ -240,6 +240,10 @@ function alreadyAnsweredReply(current: string | null): string {
   return 'This one is already answered, so the buttons no longer do anything. Nothing has changed.';
 }
 
+const NOT_CONNECTED =
+  "This number isn't connected to an AgentWeb account any more, so that answer couldn't be recorded. " +
+  'Open Settings in AgentWeb to connect WhatsApp again.';
+
 const COULD_NOT_RECORD =
   "Sorry, we couldn't record that just now. Please tap the button again in a moment.";
 
@@ -297,7 +301,17 @@ export async function handleApprovalButtonTap(params: {
       return;
     }
 
-    if (!senderUserId || senderUserId !== ref.userId) {
+    if (!senderUserId) {
+      // The number no longer belongs to any account (they sent STOP, or an admin removed
+      // it) but is back to receiving messages. Their buttons cannot be recorded, and
+      // silence reads as "recorded".
+      console.warn(
+        `[approval-notify] tap from ${redactPhone(params.phone)} which is no longer connected to an account`,
+      );
+      await sendText(params.phone, NOT_CONNECTED).catch(() => {});
+      return;
+    }
+    if (senderUserId !== ref.userId) {
       console.warn(
         `[approval-notify] tap from ${redactPhone(params.phone)} does not own that approval — ignored`,
       );

@@ -888,6 +888,18 @@ router.get("/users", async (req, res) => {
             user.messagingPlatform = summary.platform;
             user.messagingPlatformSource = summary.source;
             user.whatsappNumberMasked = summary.whatsappNumberMasked;
+            const full = fullRecordById.get(user.userId);
+            // Why a no-platform account has no WhatsApp (STOP / customer / admin), for support.
+            user.whatsappDisconnect = full?.whatsappDisconnect ?? null;
+            // A number that texted STOP but could not be matched to its account at the time
+            // (verified before the phone index existed) is still bound and unreachable.
+            // Only WhatsApp accounts are checked, so this costs a handful of reads.
+            if (summary.platform === 'whatsapp') {
+              const { explicitChannels } = await import('../services/messagingChannelService');
+              const { isOptedOut } = await import('../services/whatsappService');
+              const destination = explicitChannels(full).find((c: any) => c.channel === 'whatsapp')?.destination;
+              user.whatsappOptedOut = destination ? await isOptedOut(destination) : false;
+            }
           } catch (error) {
             console.error(
               `[admin/users] messaging platform lookup failed for user ${user.userId}; leaving it unset:`,
@@ -1430,7 +1442,7 @@ router.delete("/users/:userId/whatsapp", async (req, res) => {
     const adminId = (req as any).user?.userId || 'unknown-admin';
     const { disconnectWhatsApp } = await import('../services/whatsappVerificationService');
 
-    const result = await disconnectWhatsApp(userId);
+    const result = await disconnectWhatsApp(userId, 'admin');
     if (!result) return res.status(404).json({ message: "User not found" });
     if (!result.removed) {
       return res.status(409).json({ message: "This account has no WhatsApp number connected." });

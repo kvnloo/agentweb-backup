@@ -498,6 +498,83 @@ describe('runFinalizeGuard — ambiguous coverage-gap matches (risk reduction, E
   });
 });
 
+describe('a saved draft does not back a "published" claim (ENG-2459)', () => {
+  const PUBLISHED = 'The LinkedIn post was published.';
+  const post = (extra: Partial<FinalizeLedgerEntry>): FinalizeLedgerEntry => ({
+    toolName: 'post_on_connected_account', status: 'success', result: {}, ...extra,
+  });
+
+  it.each([
+    ['the call asked for save_as_draft', post({ args: { platform: 'linkedin', content: 'Hi', save_as_draft: true } })],
+    ['the stored result is flagged draft', post({ result: { success: true, draft: true } })],
+  ])('is a mismatch when %s', async (_name, entry) => {
+    const { ports, judge } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'post_published', statement: PUBLISHED }]);
+
+    const outcome = await runFinalizeGuard({ finalText: PUBLISHED, ledger: [entry], ports, detectOnly: true });
+
+    // Not 'ambiguous_unmatched': the loose tier must not swallow it either.
+    expect(outcome.action).toBe('detected_mismatch');
+    expect(outcome.mismatchedClaimClasses).toEqual(['post_published']);
+  });
+
+  it.each([
+    ['no status (the tool defaults to draft)', {}],
+    ['status draft', { status: 'draft' }],
+  ])('a publish_blog_article call with %s does not back a "published" claim', async (_name, args) => {
+    const { ports, judge } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'post_published', statement: 'The blog article was published.' }]);
+
+    const outcome = await runFinalizeGuard({
+      finalText: 'The blog article was published.',
+      ledger: [{ toolName: 'publish_blog_article', status: 'success', result: {}, args }],
+      ports,
+      detectOnly: true,
+    });
+
+    expect(outcome.action).toBe('detected_mismatch');
+  });
+
+  it('a publish_blog_article call with status published still backs the claim', async () => {
+    const { ports, judge } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'post_published', statement: 'The blog article was published.' }]);
+
+    const outcome = await runFinalizeGuard({
+      finalText: 'The blog article was published.',
+      ledger: [{ toolName: 'publish_blog_article', status: 'success', result: {}, args: { status: 'published' } }],
+      ports,
+    });
+
+    expect(outcome.action).toBe('clean');
+  });
+
+  it('a normal post call still backs the claim', async () => {
+    const { ports, judge } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'post_published', statement: PUBLISHED }]);
+
+    const outcome = await runFinalizeGuard({
+      finalText: PUBLISHED,
+      ledger: [post({ args: { platform: 'linkedin', content: 'Hi', save_as_draft: false } })],
+      ports,
+    });
+
+    expect(outcome.action).toBe('clean');
+  });
+
+  it('a published call next to a draft call still backs the claim', async () => {
+    const { ports, judge } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'post_published', statement: PUBLISHED }]);
+
+    const outcome = await runFinalizeGuard({
+      finalText: PUBLISHED,
+      ledger: [post({ args: { save_as_draft: true } }), post({ args: { content: 'Hi' } })],
+      ports,
+    });
+
+    expect(outcome.action).toBe('clean');
+  });
+});
+
 describe('buildCorrectionSystemNote', () => {
   it('names every mismatched claim class and demands the true outcome', () => {
     const note = buildCorrectionSystemNote(['email_sent', 'post_published'] as any);

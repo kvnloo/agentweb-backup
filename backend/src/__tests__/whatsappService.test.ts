@@ -655,6 +655,8 @@ describe('sendOptOutConfirmation', () => {
     // The confirmation is the only message they will get after opting out, so it has to
     // carry the re-subscribe keyword the webhook actually honours.
     expect(OPT_OUT_CONFIRMATION).toMatch(/UNSTOP/);
+    // It must not leave the customer believing they are still connected.
+    expect(OPT_OUT_CONFIRMATION).toMatch(/no longer connected/i);
   });
 
   it('still refuses when the service window is shut', async () => {

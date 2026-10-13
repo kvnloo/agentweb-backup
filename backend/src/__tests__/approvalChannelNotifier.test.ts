@@ -365,6 +365,20 @@ describe('handleApprovalButtonTap', () => {
       expect(notifySubscribersOfApproval).not.toHaveBeenCalled();
     });
 
+    it('tells a number that is no longer connected to any account, instead of staying silent', async () => {
+      (whatsapp.resolveUserIdByPhone as jest.Mock).mockResolvedValue(null);
+      await tap();
+      expect(approvalDb.answerIfOpen).not.toHaveBeenCalled();
+      expect((whatsapp.sendText as jest.Mock).mock.calls[0][1]).toMatch(/isn't connected to an AgentWeb account/i);
+    });
+
+    it('stays silent for a number that belongs to a DIFFERENT account (reveals nothing)', async () => {
+      (whatsapp.resolveUserIdByPhone as jest.Mock).mockResolvedValue('someone-else');
+      await tap();
+      expect(whatsapp.sendText).not.toHaveBeenCalled();
+      expect(approvalDb.answerIfOpen).not.toHaveBeenCalled();
+    });
+
     it('says the request is gone when the record now belongs to a different account', async () => {
       // Another account re-requested the same asset: the owner-checked write is refused
       // while the record is still open, so these buttons no longer point at this customer.
