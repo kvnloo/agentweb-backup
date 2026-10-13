@@ -592,4 +592,28 @@ describe('gatherAccountHealthSignals: live Google Ads campaign delivery (ENG-191
     expect(signals.campaigns).toBeNull();
     expect(googleAdsService.getCampaignDelivery).not.toHaveBeenCalled();
   });
+
+  it('regression: a non-Google account still classifies with delivery_not_read and no zero_delivery', async () => {
+    const { signals } = await gatherAccountHealthSignals({ userId: 'u1', connected_accounts: [liveMeta] }, NOW);
+    const result = classifyAccountHealth({ ...signals, requirement: { requirementSource: 'contracted' } } as AccountHealthSignals);
+    expect(result.evidence.find((e) => e.code === 'delivery_not_read')?.kind).toBe('gap');
+    expect(JSON.stringify(result)).not.toContain('zero_delivery');
+  });
+
+  it('an ENDED campaign is excluded, not stuck', async () => {
+    jest.mocked(googleAdsService.getCampaignDelivery).mockResolvedValue([campaign('done', { status: 'ENDED' })]);
+    const { signals } = await gatherAccountHealthSignals({ userId: 'u1', connected_accounts: [liveGoogle] }, NOW);
+    const result = classifyAccountHealth({ ...signals, requirement: { requirementSource: 'contracted' } } as AccountHealthSignals);
+    expect(JSON.stringify(result)).not.toContain('zero_delivery');
+  });
+
+  it('one failing Google account leaves the whole user unread, never a verdict from the others', async () => {
+    const second = { ...liveGoogle, account_id: '999' };
+    jest.mocked(googleAdsService.getCampaignDelivery).mockImplementation(async (_u: string, id: string) => {
+      if (id === '999') throw new Error('429');
+      return [campaign('stuck')] as any;
+    });
+    const { signals } = await gatherAccountHealthSignals({ userId: 'u1', connected_accounts: [liveGoogle, second] }, NOW);
+    expect(signals.campaigns).toBeNull();
+  });
 });
