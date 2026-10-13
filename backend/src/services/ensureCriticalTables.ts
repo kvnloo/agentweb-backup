@@ -257,7 +257,7 @@ async function reconcileTableSettings(
     return;
   }
   if (settings.ttlAttribute) await ensureTimeToLive(dynamo, tableName, settings.ttlAttribute);
-  if (settings.pointInTimeRecovery) await ensurePointInTimeRecovery(dynamo, tableName);
+  if (settings.pointInTimeRecovery) await ensurePointInTimeRecovery(dynamo, tableName, sleep);
 }
 
 /** Describe-first and fail-safe, like ensureDeletionProtection. A table with a `ttl` attribute but TTL off never expires. */
@@ -279,9 +279,22 @@ async function ensureTimeToLive(dynamo: AWS.DynamoDB, tableName: string, attribu
   }
 }
 
-async function ensurePointInTimeRecovery(dynamo: AWS.DynamoDB, tableName: string): Promise<void> {
+async function ensurePointInTimeRecovery(dynamo: AWS.DynamoDB, tableName: string, sleep: (ms: number) => Promise<void>): Promise<void> {
   try {
-    const described = await dynamo.describeContinuousBackups({ TableName: tableName }).promise();
+    // Right after a table turns ACTIVE, DynamoDB can briefly answer that continuous
+    // backups are not available yet; that is transient, so wait it out a little.
+    let described = await dynamo.describeContinuousBackups({ TableName: tableName }).promise().catch(async (err: any) => {
+      if (err?.code !== 'ContinuousBackupsUnavailableException') throw err;
+      for (let i = 0; i < 5; i++) {
+        await sleep(ACTIVE_POLL_MS);
+        try {
+          return await dynamo.describeContinuousBackups({ TableName: tableName }).promise();
+        } catch (again: any) {
+          if (again?.code !== 'ContinuousBackupsUnavailableException') throw again;
+        }
+      }
+      throw err;
+    });
     if (described.ContinuousBackupsDescription?.PointInTimeRecoveryDescription?.PointInTimeRecoveryStatus === 'ENABLED') return;
     await dynamo
       .updateContinuousBackups({ TableName: tableName, PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true } })

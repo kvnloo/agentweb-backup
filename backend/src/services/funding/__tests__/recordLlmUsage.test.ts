@@ -5,6 +5,7 @@ jest.mock('../../agentMode/deferredBillingMetering', () => ({
 import { meterWithResolvedBilling } from '../../agentMode/deferredBillingMetering';
 import {
   recordLlmUsage,
+  customerUpstreamCost,
   type RecordLlmUsageInput,
 } from '../recordLlmUsage';
 import {
@@ -158,6 +159,11 @@ describe('recordLlmUsage (ENG-1816 F1)', () => {
       }
     });
 
+    it('keeps a real charge too small to round to a whole micro-dollar as 1, not 0', async () => {
+      const attempt = await recorded(customerFunding(), { ...pricedCtx, upstreamCostUsd: 1e-9 });
+      expect(attempt.customerEstimateMicroUsd).toBe(1);
+    });
+
     it('does not read AgentWeb\'s own cost override as the customer\'s charge', async () => {
       const attempt = await recorded(customerFunding(), { ...pricedCtx, costUsdOverride: 5 });
       expect(attempt).not.toHaveProperty('customerEstimateMicroUsd');
@@ -174,6 +180,24 @@ describe('recordLlmUsage (ENG-1816 F1)', () => {
       expect(record).not.toHaveBeenCalled();
       expect(mockedMeter).not.toHaveBeenCalled();
       spy.mockRestore();
+    });
+  });
+
+  describe('customerUpstreamCost (what callLLM passes through)', () => {
+    it('reports the upstream cost only on a BYOK response with a positive cost', () => {
+      expect(customerUpstreamCost({ is_byok: true, cost_details: { upstream_inference_cost: 0.02 } })).toEqual({ upstreamCostUsd: 0.02 });
+    });
+    it.each([
+      ['not BYOK', { is_byok: false, cost_details: { upstream_inference_cost: 0.02 } }],
+      ['BYOK flag missing', { cost_details: { upstream_inference_cost: 0.02 } }],
+      ['BYOK without a cost', { is_byok: true }],
+      ['BYOK with null details', { is_byok: true, cost_details: null }],
+      ['zero cost', { is_byok: true, cost_details: { upstream_inference_cost: 0 } }],
+      ['negative cost', { is_byok: true, cost_details: { upstream_inference_cost: -1 } }],
+      ['non-finite cost', { is_byok: true, cost_details: { upstream_inference_cost: Infinity } }],
+      ['string cost', { is_byok: true, cost_details: { upstream_inference_cost: '0.02' } }],
+    ])('reports nothing when %s', (_label, usage) => {
+      expect(customerUpstreamCost(usage as any)).toEqual({});
     });
   });
 

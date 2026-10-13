@@ -314,6 +314,20 @@ describe('ensureCriticalTables', () => {
       expect(calls.updateTimeToLive).toHaveLength(1);
     });
 
+    it('waits out the short window after creation when continuous backups are not available yet', async () => {
+      const { client, calls } = settingsDynamo({});
+      let n = 0;
+      (client as any).describeContinuousBackups = jest.fn(() => ({
+        promise: async () => {
+          if (n++ < 2) throw Object.assign(new Error('not yet'), { code: 'ContinuousBackupsUnavailableException' });
+          return { ContinuousBackupsDescription: { PointInTimeRecoveryDescription: { PointInTimeRecoveryStatus: 'DISABLED' } } };
+        },
+      }));
+      await ensureCriticalTables(client as any, { sleep });
+      expect(calls.updateContinuousBackups).toHaveLength(1);
+      expect((client as any).describeContinuousBackups).toHaveBeenCalledTimes(3);
+    });
+
     it('gives up quietly for this boot, and retries next boot, if the table never becomes ACTIVE', async () => {
       const { client, calls } = settingsDynamo({ statuses: ['CREATING'] });
       await expect(ensureCriticalTables(client as any, { sleep })).resolves.toBeUndefined();

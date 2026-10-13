@@ -2161,6 +2161,8 @@ export const createAttemptUsageTable = async () => {
   };
   try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
   catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+  // TTL and recovery can only be set on an ACTIVE table.
+  await dynamodb.waitFor('tableExists', { TableName: params.TableName }).promise();
 
   try {
     await dynamodb.updateTimeToLive({

@@ -2,11 +2,13 @@
  * ENG-2106 (A3): the AW-AttemptUsage table definition, in both places it is written.
  */
 const createTable = jest.fn((_params: any) => ({ promise: async () => ({}) }));
+const waitFor = jest.fn((_state: string, _params: any) => ({ promise: async () => ({}) }));
 const updateTimeToLive = jest.fn((_params: any) => ({ promise: async () => ({}) }));
 const updateContinuousBackups = jest.fn((_params: any) => ({ promise: async () => ({}) }));
 jest.mock('aws-sdk', () => {
   class DynamoDB {
     createTable = createTable;
+    waitFor = waitFor;
     updateTimeToLive = updateTimeToLive;
     updateContinuousBackups = updateContinuousBackups;
     static DocumentClient = class {};
@@ -56,6 +58,8 @@ describe('AW-AttemptUsage table definition', () => {
     await createAttemptUsageTable();
     expect(createTable).toHaveBeenCalledTimes(1);
     expect(createTable.mock.calls[0][0]).toEqual(SPEC);
+    // TTL and recovery need an ACTIVE table, so the script waits for it first.
+    expect(waitFor).toHaveBeenCalledWith('tableExists', { TableName: SPEC.TableName });
     expect(updateTimeToLive).toHaveBeenCalledWith({
       TableName: SPEC.TableName,
       TimeToLiveSpecification: { Enabled: true, AttributeName: 'ttl' },

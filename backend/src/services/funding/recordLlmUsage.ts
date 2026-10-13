@@ -18,6 +18,23 @@ import { noteRunFundingUnset, type RunFunding } from "./runFunding";
 export type RecordLlmUsageInput = RecordUsageContext;
 
 /**
+ * What the customer's own provider account was charged for one call, in USD, from an
+ * OpenRouter response's usage block: present only when the response says it was served
+ * on the caller's own key (`is_byok === true`) AND reports a positive upstream cost.
+ * Otherwise `{}`, never zero: on a non-BYOK response the cost is AgentWeb's own, and
+ * reading it as the customer's would book AgentWeb's money against their provider.
+ */
+export function customerUpstreamCost(usage: {
+  is_byok?: boolean;
+  cost_details?: { upstream_inference_cost?: unknown } | null;
+}): { upstreamCostUsd?: number } {
+  const cost = usage?.cost_details?.upstream_inference_cost;
+  return usage?.is_byok === true && typeof cost === 'number' && Number.isFinite(cost) && cost > 0
+    ? { upstreamCostUsd: cost }
+    : {};
+}
+
+/**
  * `route === 'agentweb'` (and `undefined`, the pre-F1-wiring default): today's path,
  * byte-identical to before this ticket. The one field A3 added to the context
  * (`upstreamCostUsd`) is removed first, so no AgentWeb rail ever sees it.
@@ -126,7 +143,9 @@ function buildAttempt(runFunding: RunFunding, ctx: RecordLlmUsageInput): Attempt
         }
       : {}),
     ...(hasCustomerCost
-      ? { customerEstimateMicroUsd: Math.round((upstream as number) * 1_000_000), costProvenance: "openrouter:upstream_inference_cost" }
+      ? { // At least 1: a real charge below half a micro-dollar must not round to 0, which
+          // would read as "the customer paid nothing".
+          customerEstimateMicroUsd: Math.max(1, Math.round((upstream as number) * 1_000_000)), costProvenance: "openrouter:upstream_inference_cost" }
       : {}),
     settlementState: "settled",
   };
