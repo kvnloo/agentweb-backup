@@ -60,8 +60,9 @@ const SETTINGS_PERSISTENCE_TOOLS = new Set<string>([
  *
  * Deliberately NOT here: tools that can succeed without doing the claimed thing. The ledger keeps only a
  * minimised result (`{}` for almost every tool, see extractMinimalToolResult), so the guard cannot see
- * `draft`, `duplicate_suppressed` or a silent no-send. Those tools are in CLAIM_TOOL_LOOSE_MATCHERS instead,
- * where a hit means "ambiguous, never corrected":
+ * `draft`, `duplicate_suppressed` or a silent no-send in the result. Those tools are in CLAIM_TOOL_LOOSE_MATCHERS
+ * instead, where a hit means "ambiguous, never corrected". (A tool whose draft state shows in its call arguments,
+ * such as post_on_connected_account, can stay strict: savedAsDraft skips it through `entry.args`.)
  *  - send_gtm_status_report returns success after silent no-ops (no recipients, swallowed send errors);
  *  - create_social_media_posts / create_html_* / update_html_file produce an HTML document, not an image or
  *    video, and update_html_file can succeed with zero operations applied;
