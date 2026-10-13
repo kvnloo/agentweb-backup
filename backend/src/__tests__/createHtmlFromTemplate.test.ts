@@ -977,6 +977,10 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('Invalid template structure');
+      // ENG-1888: config-class, actionable
+      expect(result.errorClass).toBe('not_found');
+      expect(result.error_code).toBe('TEMPLATE_INVALID');
+      expect(result.message).toContain('list_html_templates');
     });
 
     it('should handle complex array variables', async () => {
@@ -1119,6 +1123,8 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(result.success).toBe(false);
       expect(result.message).toContain('Missing required array variables');
       expect(result.message).toContain('features_n');
+      // ENG-1888: argument mismatch, never a tool bug
+      expect(result.errorClass).toBe('invalid_args');
     });
 
     // ENG-46 sibling path: this method is reached with the SESSION's model, so a

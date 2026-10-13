@@ -287,7 +287,7 @@ function classFromMessage(message: string): string | null {
   // reclassifies it to invalid_args too. Accepted: a genuinely oversized input
   // isn't retryable either way, and consistent classification across the app
   // outweighs one error keeping a bespoke class name.
-  if (/arguments failed schema validation|has the wrong type|missing required (argument|variable)|invalid parameters?|invalid argument|validation (failed|error)|(is|are) required|must be|is too long|too long \(|is too short|too large to save|is too large/.test(m)) return 'invalid_args';
+  if (/arguments failed schema validation|has the wrong type|missing required (array )?(argument|variable)|invalid parameters?|invalid argument|validation (failed|error)|(is|are) required|must be|is too long|too long \(|is too short|too large to save|is too large/.test(m)) return 'invalid_args';
 
   if (/unauthorized|forbidden|invalid (access |api )?token|invalid api key|authentication|missing credentials|not authorized|do not have permission|permission to|no secrets configured|not a member of channel|account connected|account not configured|not configured to access/.test(m)) return 'auth';
   if (/enotfound|econnrefused|econnreset|eai_again|socket hang up|network error|fetch failed|connection error|premature close|invalid response body/.test(m)) return 'network';
