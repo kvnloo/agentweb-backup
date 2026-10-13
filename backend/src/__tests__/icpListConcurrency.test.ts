@@ -279,6 +279,90 @@ describe("persona data that a whole-list comparison would trip over", () => {
     extraField: "kept",
   };
 
+  // A positional ref (`icp-2`) names whatever is at position 2 NOW. A retry after a
+  // concurrent delete must still act on the card the user clicked, not on whichever
+  // card has slid into that position.
+  it.each([
+    ["the shifting delete lands first", ["icp-0", "icp-2"]],
+    ["the shifting delete lands second", ["icp-2", "icp-0"]],
+  ])("a retried positional delete still removes the card that was clicked (%s)", async (_label, order) => {
+    seed({ icpResult: [legacy(0), legacy(1), legacy(2), legacy(3), legacy(4)] });
+    holdUntilBothRead();
+    const results = await Promise.all(order.map((icpId) => post("delete-one", { icpId })));
+
+    expect(results.map((r) => r.status)).toEqual([200, 200]);
+    // Legacy 0 and Legacy 2 were clicked; 1, 3 and 4 survive whatever the order.
+    expect(table().row.icpResult.map((p: any) => p.name)).toEqual(["Legacy 1", "Legacy 3", "Legacy 4"]);
+  });
+
+  it("a retried positional edit still lands on the card that was clicked", async () => {
+    seed({ icpResult: [legacy(0), legacy(1), legacy(2), legacy(3)] });
+    holdUntilBothRead();
+    const [del, edit] = await Promise.all([
+      post("delete-one", { icpId: "icp-0" }),
+      post("edit-one", { icpId: "icp-2", patch: { pain: "EDITED L2" } }),
+    ]);
+
+    expect([del.status, edit.status]).toEqual([200, 200]);
+    const byName = Object.fromEntries(table().row.icpResult.map((p: any) => [p.name, p]));
+    expect(byName["Legacy 2"].pain).toBe("EDITED L2");
+    expect(byName["Legacy 3"].pain).toBe("p3");
+  });
+
+  it("answers 404, and changes nothing, when the clicked card was removed before the retry", async () => {
+    seed({ icpResult: [legacy(0), legacy(1), legacy(2)] });
+    holdUntilBothRead();
+    const results = await Promise.all([post("delete-one", { icpId: "icp-1" }), post("delete-one", { icpId: "icp-1" })]);
+
+    expect(results.map((r) => r.status).sort()).toEqual([200, 404]);
+    expect(table().row.icpResult.map((p: any) => p.name)).toEqual(["Legacy 0", "Legacy 2"]);
+  });
+
+  it("finds a legacy card by name when several share it, preferring the one nearest where it was", async () => {
+    seed({ icpResult: [legacy(0), { ...legacy(1), name: "Same name" }, { ...legacy(2), name: "Same name" }, legacy(3)] });
+    holdUntilBothRead();
+    const results = await Promise.all([post("delete-one", { icpId: "icp-0" }), post("delete-one", { icpId: "icp-2" })]);
+
+    expect(results.map((r) => r.status)).toEqual([200, 200]);
+    // The clicked second "Same name" (originally position 2) goes; the first stays.
+    expect(table().row.icpResult.map((p: any) => `${p.name}:${p.pain}`)).toEqual(["Same name:p1", "Legacy 3:p3"]);
+  });
+
+  it.each([
+    ["userIntent: null", { userIntent: null }],
+    ["userIntent as a list", { userIntent: ["not", "a", "map"] }],
+    ["userIntent as a string", { userIntent: "text" }],
+    ["userIntent as an empty map", { userIntent: {} }],
+  ])("edits a card whose stored %s", async (_label, extra) => {
+    seed({ icpResult: [persona(0), { ...persona(1), ...extra }, persona(2)] });
+
+    const res = await post("edit-one", { icpId: "icp_1", patch: { pain: "NEW" } });
+
+    expect(res.status).toBe(200);
+    const card = table().row.icpResult[1];
+    expect(card.pain).toBe("NEW");
+    expect(card.userIntent).toEqual({ pain: "NEW" });
+  });
+
+  it("merges into an anchor that is a real map and keeps what it already holds", async () => {
+    seed({ icpResult: [persona(0), { ...persona(1), userIntent: { name: "kept" } }, persona(2)] });
+
+    expect((await post("edit-one", { icpId: "icp_1", patch: { pain: "NEW" } })).status).toBe(200);
+
+    expect(table().row.icpResult[1].userIntent).toEqual({ name: "kept", pain: "NEW" });
+  });
+
+  it("edits and deletes cards with an id that is not a string, or a null name", async () => {
+    seed({ icpResult: [{ ...persona(0), id: 7 }, { ...legacy(1), name: null }, persona(2)] });
+
+    expect((await post("edit-one", { icpId: "icp-0", patch: { pain: "NEW0" } })).status).toBe(200);
+    expect((await post("edit-one", { icpId: "icp-1", patch: { pain: "NEW1" } })).status).toBe(200);
+    expect(table().row.icpResult[0].pain).toBe("NEW0");
+    expect(table().row.icpResult[1].pain).toBe("NEW1");
+    expect((await post("delete-one", { icpId: "icp-1" })).status).toBe(200);
+    expect(table().row.icpResult).toHaveLength(2);
+  });
+
   it("edits and deletes cards that have no stable id (stored before ids existed)", async () => {
     seed({ icpResult: [legacy(0), legacy(1), legacy(2)] });
 

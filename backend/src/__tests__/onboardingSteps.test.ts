@@ -1120,6 +1120,7 @@ describe("POST /api/onboarding/icp/edit-one records the user's words as an ancho
       { path: ["icpResult", 0, "pain"], value: "second edit" },
       { path: ["icpResult", 0, "userIntent", "pain"], value: "second edit" },
     ]);
-    expect(options.condition.expression).toContain("attribute_exists(#cl[0].#cui)");
+    expect(options.condition.expression).toContain("attribute_type(#cl[0].#cui, :tM)");
+    expect(options.condition.values[":tM"]).toBe("M");
   });
 });

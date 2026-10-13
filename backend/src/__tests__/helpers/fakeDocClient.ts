@@ -12,7 +12,7 @@
  * Supported grammar (all this codebase's onboarding writes need):
  *   Update:    SET a = :v, #a.#b[2] = :v   REMOVE #x, #y, #l[2] (a list element is spliced out)
  *   Condition: OR of AND-groups, parenthesised groups allowed; each clause is `PATH = :v`, `PATH <> :v`,
- *              `PATH <= :v`, `attribute_exists(PATH)` or `attribute_not_exists(PATH)`
+ *              `PATH <= :v`, `attribute_exists(PATH)`, `attribute_not_exists(PATH)` or `attribute_type(PATH, :t)`
  *
  * Eventual consistency: set `table.indexRow` to make `query` (the UserIdIndex
  * GSI) keep returning that older snapshot while `get` (a base-table read)
@@ -112,6 +112,14 @@ function placeholdersIn(expr: string): { names: Set<string>; values: Set<string>
 function evalClause(clause: string, row: any, names: Record<string, string>, values: Record<string, any>): boolean {
   const exists = clause.match(/^attribute_exists\((.+)\)$/);
   if (exists) return readPath(row, parsePath(exists[1], names)).exists;
+  const typed = clause.match(/^attribute_type\((.+?),\s*(:\w+)\)$/);
+  if (typed) {
+    const got = readPath(row, parsePath(typed[1], names));
+    if (!got.exists) return false;
+    const v = got.value;
+    const kind = v === null ? "NULL" : Array.isArray(v) ? "L" : typeof v === "object" ? "M" : typeof v === "string" ? "S" : typeof v === "number" ? "N" : typeof v === "boolean" ? "BOOL" : "?";
+    return kind === values[typed[2]];
+  }
   const notExists = clause.match(/^attribute_not_exists\((.+)\)$/);
   if (notExists) return !readPath(row, parsePath(notExists[1], names)).exists;
   const cmp = clause.match(/^(.+?)\s*(<>|<=|=)\s*(:\w+)$/);
