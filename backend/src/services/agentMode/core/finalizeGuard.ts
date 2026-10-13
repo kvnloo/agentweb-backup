@@ -45,13 +45,30 @@
 import { MEDIA_GEN_TOOLS } from './toolDispatch';
 
 /** Tools that actually persist settings/setup across sessions (settings_saved
- * claim class) — confirmed against backend/src/emma/tools.ts. */
+ * claim class) — confirmed against backend/src/emma/tools.ts. The knowledge-base
+ * tools are how "saved it to the Knowledge Base" is actually done (ENG-2459). */
 const SETTINGS_PERSISTENCE_TOOLS = new Set<string>([
   'save_memory',
   'save_org_memory',
   'update_brand_guidelines',
   'update_market_strategy',
+  'create_knowledge_base',
+  'update_knowledge_base_file',
+  'attach_knowledge_base_files',
 ]);
+
+/** Tools that create or change the deliverable file itself (asset_generated),
+ * as opposed to MEDIA_GEN_TOOLS, which can pause for confirmation without
+ * producing anything. A successful call here IS the asset. (ENG-2459) */
+const ASSET_FILE_TOOLS = new Set<string>([
+  'create_html_file',
+  'update_html_file',
+  'create_html_from_template',
+  'create_social_media_posts',
+]);
+
+/** GTM work-item tools (task_created_or_updated) — their names carry no "task". (ENG-2459) */
+const WORK_ITEM_TOOLS = new Set<string>(['add_gtm_work_items', 'update_gtm_work_item']);
 
 /** The 7 high-harm completed-action claim classes the guard verifies. */
 export type ClaimClass =
@@ -109,12 +126,16 @@ export function prefilterClaimClasses(finalText: string): ClaimClass[] {
  * a matching tool has a successful ledger entry (see claimBackedByLedger).
  */
 const CLAIM_TOOL_MATCHERS: Record<ClaimClass, (toolName: string) => boolean> = {
-  email_sent: (n) => n === 'send_email' || (/email/.test(n) && /^(send_|create_and_send_)/.test(n)),
-  task_created_or_updated: (n) => /task/.test(n) && /^(create_|update_|manage_|add_|execute_)/.test(n),
-  post_published: (n) => n === 'create_social_media_posts' || n === 'post_on_account' || n.startsWith('publish_'),
+  // notify_session sends the session summary by email (agentModeService tool description).
+  email_sent: (n) =>
+    n === 'send_email' || n === 'notify_session' || (/email/.test(n) && /^(send_|create_and_send_)/.test(n)),
+  task_created_or_updated: (n) =>
+    WORK_ITEM_TOOLS.has(n) || (/task/.test(n) && /^(create_|update_|manage_|add_|execute_)/.test(n)),
+  post_published: (n) =>
+    n === 'create_social_media_posts' || n === 'post_on_account' || n === 'post_on_connected_account' || n.startsWith('publish_'),
   schedule_created: (n) => /schedul/.test(n) && /^(create_|manage_|add_|update_)/.test(n),
   crm_saved: (n) => /lead|contact|crm/.test(n) && /^(create_|update_|manage_|add_|save_|import_)/.test(n),
-  asset_generated: (n) => MEDIA_GEN_TOOLS.has(n),
+  asset_generated: (n) => MEDIA_GEN_TOOLS.has(n) || ASSET_FILE_TOOLS.has(n),
   // Grounded in the actual persistence tools Emma has: save_memory,
   // save_org_memory (cross-session "Memory & Lessons"), update_brand_guidelines,
   // update_market_strategy (the "setup" onboarding/brand context tools).
@@ -236,7 +257,9 @@ export function claimBackedByLedger(
       entry.status === 'success'
       && matches(entry.toolName)
       && !ports.toolResultError(entry.result)
-      && (claimClass !== 'asset_generated' || ports.mediaGenProducedAsset(entry.toolName, entry.result)),
+      // A media-gen call can pause for confirmation without producing anything, so it must also
+      // have produced an asset; an asset-file tool call IS the asset.
+      && (claimClass !== 'asset_generated' || !MEDIA_GEN_TOOLS.has(entry.toolName) || ports.mediaGenProducedAsset(entry.toolName, entry.result)),
   );
 }
 
