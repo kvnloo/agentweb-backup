@@ -526,6 +526,13 @@ const SubscriptionTypesTab: React.FC = () => {
         seatPricing = { priceCents, usageCreditMicroUsd, baseSeats };
       }
 
+      // ENG-1978: a NEW tier saved before the skill list loads would store [] (no skills) without the
+      // admin ever seeing a skill to tick, so make them wait instead.
+      if (availableSkills.length === 0 && !editingType) {
+        setError('Skills are still loading — try again in a moment');
+        return;
+      }
+
       // Convert all selected items back to "*" if all are selected
       const dataToSave: SubscriptionType = {
         name: formData.name,

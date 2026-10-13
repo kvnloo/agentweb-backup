@@ -5112,7 +5112,12 @@ router.get("/subscription-types", async (req, res) => {
  * tools only. Before the gate failed closed those users silently kept every tool, which is why
  * nothing ever needed to stop this save. Counted by the user's own `subscriptionType`: that covers
  * org owners (whose tier their members inherit) but not the members themselves, so the count is a
- * floor. `Free` is also the implicit tier of accounts with no `subscriptionType` at all.
+ * floor. `Free` is also the implicit tier of accounts with no `subscriptionType` at all (absent, null
+ * or empty — the runtime reads any falsy value as Free).
+ *
+ * This is a guard rail, not an invariant: it reads the current list, scans, and the caller writes
+ * later with no conditional write, so two concurrent admin saves or a user move racing the save
+ * can slip past it.
  */
 async function findStrandedTiers(nextTierNames: string[]): Promise<Array<{ name: string; userCount: number }>> {
   const current = await settingsService.getSetting("subscription_types");
@@ -5135,8 +5140,13 @@ async function findStrandedTiers(nextTierNames: string[]): Promise<Array<{ name:
   removed.forEach((name, i) => { values[`:t${i}`] = name; });
   const clauses = [`subscriptionType IN (${removed.map((_, i) => `:t${i}`).join(", ")})`];
   if (removed.includes("Free")) {
-    clauses.push("attribute_not_exists(subscriptionType)", "subscriptionType = :emptyTier");
+    clauses.push(
+      "attribute_not_exists(subscriptionType)",
+      "attribute_type(subscriptionType, :nullType)",
+      "subscriptionType = :emptyTier"
+    );
     values[":emptyTier"] = "";
+    values[":nullType"] = "NULL";
   }
   const users = await userDb.scanWithFilter(clauses.join(" OR "), values);
 
@@ -5145,7 +5155,7 @@ async function findStrandedTiers(nextTierNames: string[]): Promise<Array<{ name:
       name,
       userCount: users.filter((u) =>
         u.subscriptionType === name ||
-        (name === "Free" && (u.subscriptionType === undefined || u.subscriptionType === ""))
+        (name === "Free" && !u.subscriptionType)
       ).length,
     }))
     .filter((t) => t.userCount > 0);
@@ -5334,7 +5344,16 @@ router.post("/subscription-types", async (req, res) => {
     // Refuse to strand accounts on a tier that no longer exists. API callers that really mean it
     // (e.g. after reassigning users out of band) can pass `allowStrandedUsers: true`.
     if (req.body.allowStrandedUsers !== true) {
-      const stranded = await findStrandedTiers(normalizedTypes.map((t: any) => t.name));
+      let stranded: Array<{ name: string; userCount: number }>;
+      try {
+        stranded = await findStrandedTiers(normalizedTypes.map((t: any) => t.name));
+      } catch (scanError) {
+        // Not a validation problem and nothing has been saved: tell the admin to retry.
+        console.error("Error checking which accounts are on removed subscription types:", scanError);
+        return res.status(503).json({
+          message: "Could not check which accounts are on the tiers being removed. Nothing was saved; please try again.",
+        });
+      }
       if (stranded.length > 0) {
         const list = stranded
           .map((t) => `"${t.name}" (${t.userCount} account${t.userCount === 1 ? "" : "s"})`)
