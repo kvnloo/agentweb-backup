@@ -23,6 +23,7 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { contactSuppressionAuditEnabled, contactSuppressionAuditEvent, guardLeadPutBody, leadWriteChannel, touchesContactSuppression } from '../utils/leadWriteGuard';
 import { suppressLeadSideEffects } from '../utils/sessionList';
 import { isLinkedInInfraError, LINKEDIN_UNAVAILABLE_MESSAGE } from '../utils/linkedInInfraError';
 import { isValidLeadLifecycle, LEAD_LIFECYCLES, isLeadListType, type LeadListType } from '../utils/leadSchema';
@@ -2861,12 +2862,13 @@ router.delete('/lists/:listId/leads/bulk-delete', async (req: Request, res: Resp
  * @desc Update a lead
  * @access Private
  */
-router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) => {
+// ENG-2157: registered for PATCH as well - the customer portal's deal editor (DealSection) has always sent PATCH here, which 404'd, so deal edits were lost on reload.
+const updateLeadHandler = async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId, leadId } = req.params;
-    const updates = req.body;
+    let updates = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -2881,6 +2883,9 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
     if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
+
+    // ENG-2157: server-owned keys (sync ids, attribution, auto-send marker, write flags). Default mode only reports them.
+    updates = guardLeadPutBody(req.body, { channel: leadWriteChannel(req), userId }).body;
 
     // `lifecycle` became a writable attribute on this route when updateLead grew an
     // explicit handler for it; before that the key was silently dropped. It outranks the
@@ -2927,6 +2932,12 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
 
     const updateData = updates;
 
+    // ENG-2157: who changed a lead's do-not-contact / unsubscribe state is recorded as an engagement event (never blocks the write).
+    const auditSuppression = contactSuppressionAuditEnabled() && touchesContactSuppression(updates);
+    const suppressionBefore = auditSuppression
+      ? await crmDb.getLeadById(listId, leadId).catch((err: any) => { console.error('[contact-status-audit] could not read lead before update:', err?.message || err); return null; })
+      : null;
+
     // Auto-create status change engagement if status changed
     if (updates.status !== undefined) {
       const existingLead = await crmDb.getLeadById(listId, leadId);
@@ -2946,6 +2957,15 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
 
     const updatedLead = await crmDb.updateLead(listId, leadId, updateData);
 
+    if (suppressionBefore) {
+      const delegatedBy = (authReq as any).delegateInfo?.isDelegated ? (authReq as any).delegateInfo?.adminUserId : undefined;
+      const event = contactSuppressionAuditEvent({ before: suppressionBefore, updates, actorUserId: userId, delegatedByUserId: delegatedBy, channel: leadWriteChannel(req) });
+      if (event) {
+        await crmDb.addLeadEngagement(listId, leadId, event)
+          .catch((err: any) => console.error('[contact-status-audit] could not record the change:', err?.message || err));
+      }
+    }
+
     // ENG-2311: no CRM push for a session-list row (see utils/sessionList.ts).
     if (!suppressLeadSideEffects(list)) void Promise.allSettled([
       externalCrmSyncService.autoSyncLead(userId, listId, updatedLead, 'hubspot', 'updated'),
@@ -2961,7 +2981,9 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
     console.error('Error updating lead:', error);
     res.status(500).json({ message: error.message || 'Failed to update lead' });
   }
-});
+};
+router.put('/lists/:listId/leads/:leadId', updateLeadHandler);
+router.patch('/lists/:listId/leads/:leadId', updateLeadHandler);
 
 /**
  * @route DELETE /api/crm/lists/:listId/leads/:leadId
