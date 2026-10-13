@@ -5986,7 +5986,7 @@ export async function runScheduledChat(
       if (allowedFunctionCalls === null) {
         const unresolvedResult = {
           scheduleId: schedule.scheduleId,
-          runId: require('uuid').v4(),
+          runId: preGeneratedRunId || require('uuid').v4(),
           status: 'failure' as const,
           passed: false,
           actualResponse: 'Scheduled chat was not run because subscription entitlements are temporarily unavailable. It will remain active and retry on the next scheduled run.',

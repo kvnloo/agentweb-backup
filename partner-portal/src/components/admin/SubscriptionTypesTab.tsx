@@ -239,10 +239,7 @@ const SubscriptionTypesTab: React.FC = () => {
             allowedFeatures: availableFeatures.map((feature) => feature.id),
           }));
         }
-      } else if (
-        editingType.allowedSkills.includes('*') ||
-        editingType.allowedSkills.length === 0
-      ) {
+      } else if (editingType.allowedSkills.includes('*')) {
         // If editing a type that had "*" and skills just loaded, update formData
         if (availableSkills.length > 0) {
           setFormData((prev) => ({
@@ -298,7 +295,9 @@ const SubscriptionTypesTab: React.FC = () => {
         name: type.name,
         allowedPages: normalizedPages,
         hiddenPages: type.hiddenPages || [],
-        allowedSkills: type.allowedSkills.includes('*') || type.allowedSkills.length === 0
+        // ENG-1978: an empty list means NO skills (the runtime no longer reads [] as wildcard),
+        // so only an explicit '*' expands to every skill here.
+        allowedSkills: type.allowedSkills.includes('*')
           ? availableSkills.map((s) => s.skillId)
           : type.allowedSkills,
         allowedConnectedAccounts: expandedConnectedAccounts,
@@ -821,8 +820,7 @@ const SubscriptionTypesTab: React.FC = () => {
                       )}
                     </TableCell>
                     <TableCell>
-                      {type.allowedSkills.includes('*') ||
-                      type.allowedSkills.length === 0 ? (
+                      {type.allowedSkills.includes('*') ? (
                         <Chip label="All Skills" color="primary" size="small" />
                       ) : (
                         <Typography variant="body2" color="text.secondary">

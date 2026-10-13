@@ -91,25 +91,23 @@ export function buildProfileReaderSkill(skillId: string): Skill {
 /**
  * Enroll the skillId into every subscription tier that uses an explicit
  * allowedSkills list. Without this the skill is published but unreachable.
- * Idempotent: only appends where the ID is missing; wildcard tiers are left alone.
+ * Idempotent: only appends where the ID is missing; wildcard, empty and malformed tiers are left alone.
  */
 /**
  * Does this tier already grant every skill? Mirrors getAllowedSkills — the RUNTIME
- * authority — which returns ['*'] when allowedSkills is absent, EMPTY, or contains
- * '*'. Note findTiersAllowingSkill (used by the admin entitlement warning) differs:
- * it does `tier.allowedSkills || ['*']`, and since `[]` is truthy in JS an empty list
- * there reads as "allows nothing". Enrollment must follow the runtime rule, because
- * appending a skillId to an EMPTY list would flip that tier from "all skills allowed"
- * to "only this one skill allowed" — a severe entitlement regression.
+ * authority. Since ENG-1978 only an explicit '*' is a wildcard: an EMPTY list means
+ * NO skills, and an absent/non-array allowedSkills is a malformed row that the runtime
+ * refuses to resolve. Neither may be read as "all skills".
  */
 export function tierIsWildcard(tier: any): boolean {
-  const allowed: string[] | undefined = tier?.allowedSkills;
-  return !allowed || allowed.length === 0 || allowed.includes('*');
+  const allowed: unknown = tier?.allowedSkills;
+  return Array.isArray(allowed) && allowed.includes('*');
 }
 
 /** Runtime-accurate reachability for a single tier. */
 export function tierAllowsSkill(tier: any, skillId: string): boolean {
-  return tierIsWildcard(tier) || (tier.allowedSkills as string[]).includes(skillId);
+  const allowed: unknown = tier?.allowedSkills;
+  return tierIsWildcard(tier) || (Array.isArray(allowed) && allowed.includes(skillId));
 }
 
 export async function enrollSkillInTiers(
@@ -119,8 +117,8 @@ export async function enrollSkillInTiers(
   const { settingsService } = await import('../services/settingsService');
   const setting = await settingsService.getSetting('subscription_types');
   if (!setting) {
-    console.log('No subscription_types setting — every tier is implicitly wildcard, nothing to enroll.');
-    return { changed: [], alreadyAllowed: [], reachable: true };
+    console.log('No subscription_types setting — the runtime resolves no tier to this skill, nothing to enroll.');
+    return { changed: [], alreadyAllowed: [], reachable: false };
   }
 
   const tiers: any[] = JSON.parse(setting.settingValue);
@@ -132,7 +130,13 @@ export async function enrollSkillInTiers(
       alreadyAllowed.push(`${tier.name} (wildcard)`);
       continue;
     }
-    const allowed: string[] = tier.allowedSkills;
+    const allowed: string[] | undefined = Array.isArray(tier.allowedSkills) ? tier.allowedSkills : undefined;
+    // An empty list is a deliberate "no skills" tier and an absent one is malformed; widening
+    // either from a seed script would grant access nobody asked for, so both are left alone.
+    if (!allowed || allowed.length === 0) {
+      console.warn(`Skipping tier "${tier.name}": allowedSkills is ${allowed ? 'empty' : 'missing/malformed'}, not enrolling.`);
+      continue;
+    }
     if (allowed.includes(skillId)) {
       alreadyAllowed.push(tier.name);
       continue;

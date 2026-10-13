@@ -7478,10 +7478,12 @@ export class AgentModeService {
   /**
    * ENG-1978: the one fail-closed toolset. A session that cannot prove its entitlement gets
    * `install_skills` and nothing else — enough to recover, not enough to act. Extracted so the
-   * error path and the unresolved-entitlement path cannot drift apart.
+   * error path and the unresolved-entitlement path cannot drift apart. Deliberately silent: the
+   * unresolved case was already recorded as a structured `[entitlement] ENTITLEMENT-DENIED` event
+   * where the tier failed to resolve, and the error path logs its own error — a third free-text
+   * `[entitlement]` line per agent turn would only inflate that grep during an outage.
    */
-  private installSkillsOnlyToolset(reason: string): any[] {
-    console.error('[entitlement] withholding tools, failing closed:', JSON.stringify({ reason }));
+  private installSkillsOnlyToolset(): any[] {
     const installSkillsTool = this.toolRegistry.getTool('install_skills');
     return installSkillsTool ? [installSkillsTool.definition] : [];
   }
@@ -7507,9 +7509,11 @@ export class AgentModeService {
 
       // 4. Apply Subscription Filtering
       // Resolve skill IDs to tool names for the subscription filter step.
-      // `??`, not `||`: a precomputed `null` (ENG-1978 — the caller already knows the entitlement
-      // is unresolved) must stay null, not silently re-fetch and double-report the telemetry.
-      const skillIds = precomputedAllowedSkillIds ?? await getAllowedSkills(userId);
+      // `!== undefined`, not `??`: a precomputed `null` (ENG-1978 — the caller already knows the
+      // entitlement is unresolved) must stay null, not silently re-fetch and double-report.
+      const skillIds = precomputedAllowedSkillIds !== undefined
+        ? precomputedAllowedSkillIds
+        : await getAllowedSkills(userId);
       // ENG-1978 (observation only): userId attributes `skill-to-tool-resolution-failed` — this
       // is the highest-frequency route to it (inside the agent iteration loop), and it is the one
       // reason that is ALWAYS a genuine full-registry grant, so leaving it unattributed here would
@@ -7522,7 +7526,7 @@ export class AgentModeService {
       // it's a security risk"); until now the inner lookups returned ["*"] on exactly these
       // failures and silently defeated it.
       if (allowedFunctionCalls === null) {
-        return this.installSkillsOnlyToolset('entitlement-unresolved');
+        return this.installSkillsOnlyToolset();
       }
 
       // Foundation tools must always bypass subscription filtering — they are
@@ -7550,7 +7554,7 @@ export class AgentModeService {
       console.error('Error filtering tools:', error);
       // Fallback: return only install_skills to be safe, or empty array
       // DO NOT return all tools on error as it's a security risk
-      return this.installSkillsOnlyToolset('tool-filtering-threw');
+      return this.installSkillsOnlyToolset();
     }
   }
 
