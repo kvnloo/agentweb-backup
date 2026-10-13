@@ -72,11 +72,14 @@ describe('every usage_paused 429 emits the structured block', () => {
   it('pairs every flat message with usageBlock', () => {
     const flat = source.match(/error: usageBlockCopy\.message,/g) || [];
     const structured = source.match(/usageBlock: usageBlockCopy,/g) || [];
-    expect(flat).toHaveLength(3);
-    expect(structured).toHaveLength(3);
+    // Both interactive refusals (/generate and /verified-generate, with or without a
+    // resolved policy decision) are built by the single shared buildUsagePausedBody,
+    // which has two bodies: the plain one and the decision-carrying one.
+    expect(flat).toHaveLength(2);
+    expect(structured).toHaveLength(2);
   });
 
-  it('composes the copy once, so the three refusals cannot disagree', () => {
+  it('composes the copy once, so the refusals cannot disagree', () => {
     expect(source).toContain('const usageBlockCopy = buildUsageBlockCopy({ month: usageStatus.month });');
     expect(source.match(/const usageBlockCopy = /g) || []).toHaveLength(1);
   });

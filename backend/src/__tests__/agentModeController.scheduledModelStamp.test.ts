@@ -125,6 +125,7 @@ import { agentModeController, runScheduledChat } from '../controllers/agentModeC
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { checkTokenUsage } from '../services/tokenUsageService';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
+import { LEGACY_MODEL_ALIASES, LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
 
 const mockAlert = sendAgentModeOncallAlert as jest.MockedFunction<typeof sendAgentModeOncallAlert>;
 
@@ -387,6 +388,50 @@ describe('getModelOptions — authoritative model discovery', () => {
       const body = await optionsBody();
       expect(body.chatBranchingEnabled).toBe(false);
       expect(body.allModels).toEqual(['gpt-a']);
+    });
+  });
+
+  // ENG-2379: the legacy id -> current id map the server resolves pins with, served so clients stop hand-copying it.
+  describe('legacyModelAliases (ENG-2379)', () => {
+    const optionsBody = async () => {
+      mockAgentModeService.getSupportedModels.mockResolvedValue(['gpt-a'] as any);
+      mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+        billingUserId: 'test-user-123', policy: null, costUsedMicroUsd: 0, creditsApplied: false,
+        mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' },
+      });
+      const json = jest.fn();
+      await agentModeController.getModelOptions(
+        { user: { userId: 'test-user-123', isAdmin: false } } as any,
+        { json, status: jest.fn(() => ({ json })) } as any,
+      );
+      return json.mock.calls[0][0];
+    };
+
+    it('serves exactly the registry map the server resolves legacy ids with, including the Qwen rename', async () => {
+      const body = await optionsBody();
+      expect(body.legacyModelAliases).toEqual(LEGACY_MODEL_ALIASES);
+      expect(body.legacyModelAliases['openrouter/qwen/qwen3.8-max']).toBe('openrouter/qwen/qwen3.8-max-0902');
+    });
+
+    it('is a copy: mutating the response cannot change the server-side map', async () => {
+      const body = await optionsBody();
+      body.legacyModelAliases['gpt-4o-mini'] = 'tampered';
+      expect(LEGACY_MODEL_ALIASES['gpt-4o-mini']).toBe('openrouter/openai/gpt-4o-mini');
+    });
+
+    it('is additive: the existing fields are all still present', async () => {
+      const body = await optionsBody();
+      expect(Object.keys(body)).toEqual(expect.arrayContaining([
+        'usageMode', 'canGenerate', 'allModels', 'selectableModels', 'scheduleBackupModels',
+        'optimizedDefaultModel', 'usagePolicyVersion', 'chatBranchingEnabled', 'compareSaveAlternatives',
+      ]));
+    });
+
+    it('every served alias points at a live registry model and no alias is itself registered (no dead or looping entries)', () => {
+      for (const [legacy, current] of Object.entries(LEGACY_MODEL_ALIASES)) {
+        expect(LLM_MODEL_REGISTRY[current]).toBeDefined();
+        expect(LLM_MODEL_REGISTRY[legacy]).toBeUndefined();
+      }
     });
   });
 

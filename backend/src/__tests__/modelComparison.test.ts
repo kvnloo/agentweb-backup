@@ -1270,6 +1270,26 @@ describe('only the selected model may answer (served-model verification)', () =>
     expect(isSameServedModel('', 'openai/gpt-5.5')).toBe(false);
   });
 
+  describe('catalog sibling ids in non-slug forms still protect the bare id (ENG-2379)', () => {
+    it.each([
+      'deepseek/deepseek-v4-flash-0731',
+      'deepseek/deepseek-v4-flash-0731:free',
+      'deepseek/deepseek-v4-flash-0731:nitro',
+      'deepseek/deepseek-v4-flash-0731/',
+      'openrouter/deepseek/deepseek-v4-flash-0731',
+      'DeepSeek/DeepSeek-V4-Flash-0731',
+      ' openrouter/deepseek/deepseek-v4-flash-0731:free/ ',
+    ])('sibling listed as %j => the bare id refuses its dated slug', (listed) => {
+      expect(isSameServedModel('deepseek/deepseek-v4-flash', 'deepseek/deepseek-v4-flash-20260731')).toBe(true);
+      expect(isSameServedModel('deepseek/deepseek-v4-flash', 'deepseek/deepseek-v4-flash-20260731', [listed])).toBe(false);
+    });
+
+    it('unrelated or differently-dated catalog entries do not block the bare id own snapshot', () => {
+      const known = ['deepseek/deepseek-v4-flash-0801:free', 'deepseek/deepseek-v4-flash', 'openrouter/deepseek/deepseek-v4-pro-0731', 'x'];
+      expect(isSameServedModel('deepseek/deepseek-v4-flash', 'deepseek/deepseek-v4-flash-20260731', known)).toBe(true);
+    });
+  });
+
   describe('MMDD-suffixed ids are part of the model identity (F3)', () => {
     const SIBLINGS = [
       'deepseek/deepseek-v4-pro', 'deepseek/deepseek-v4-pro-0813',
