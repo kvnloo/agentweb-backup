@@ -29,9 +29,20 @@ export interface CatalogIdsSource {
   getIds(): Promise<string[]>;
 }
 
+/** Distinct class names so a log line says WHY a refresh failed without carrying any upstream text. */
+class CatalogHttpError extends Error {
+  override name = 'CatalogHttpError';
+}
+class CatalogShapeError extends Error {
+  override name = 'CatalogShapeError';
+}
+class CatalogEmptyError extends Error {
+  override name = 'CatalogEmptyError';
+}
+
 function parseIds(payload: unknown): string[] {
   const data = (payload as { data?: unknown } | null | undefined)?.data;
-  if (!Array.isArray(data)) throw new Error('catalog response has no data array');
+  if (!Array.isArray(data)) throw new CatalogShapeError('catalog response has no data array');
   return data.flatMap((row) => {
     const id = (row as { id?: unknown } | null | undefined)?.id;
     return typeof id === 'string' && id.includes('/') ? [id] : [];
@@ -50,13 +61,15 @@ export function createCatalogIdsSource(deps: CatalogIdsDeps = {}): CatalogIdsSou
     const timer = setTimeout(() => controller.abort(), CATALOG_IDS_TIMEOUT_MS);
     try {
       const res = await (deps.fetch ?? fetch)(CATALOG_URL, { signal: controller.signal });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) throw new CatalogHttpError('non-OK catalog response');
       const parsed = parseIds(await res.json());
       // An empty list is a broken response, not a catalog with no models: keep what we had.
-      if (parsed.length === 0) throw new Error('catalog response was empty');
+      if (parsed.length === 0) throw new CatalogEmptyError('catalog response was empty');
       ids = parsed;
       nextRefreshAt = now() + CATALOG_IDS_TTL_MS;
-    } catch {
+    } catch (error) {
+      // Class name only: never the message, URL, headers or body, which can carry upstream text.
+      console.error('OpenRouterCatalogIds: refresh failed; keeping last list', error instanceof Error ? error.name : 'unknown');
       nextRefreshAt = now() + CATALOG_IDS_RETRY_MS;
     } finally {
       clearTimeout(timer);

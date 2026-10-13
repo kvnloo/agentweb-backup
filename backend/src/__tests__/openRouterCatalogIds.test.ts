@@ -114,4 +114,42 @@ describe('openRouterCatalogIds', () => {
     const source = createCatalogIdsSource({ fetch: jest.fn(impl) as unknown as typeof fetch });
     expect(await source.getIds()).toEqual([]);
   });
+
+  describe('degraded-check logging', () => {
+    let errorSpy: jest.SpyInstance;
+    beforeEach(() => { errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined); });
+    afterEach(() => errorSpy.mockRestore());
+
+    const SECRET = 'https://openrouter.ai/api/v1/models?key=SECRET-TOKEN body-text-leak';
+    const cases: Array<[string, () => Promise<Response>, string]> = [
+      ['failed fetch', async () => { throw new TypeError(SECRET); }, 'TypeError'],
+      ['non-OK response', async () => ({ ok: false, status: 500, json: async () => ({ data: [{ id: SECRET }] }) }) as unknown as Response, 'CatalogHttpError'],
+      ['empty list', async () => ok([]), 'CatalogEmptyError'],
+      ['response without data array', async () => ({ ok: true, status: 200, json: async () => ({ error: SECRET }) }) as unknown as Response, 'CatalogShapeError'],
+      ['invalid JSON', async () => ({ ok: true, status: 200, json: async () => { throw new SyntaxError(SECRET); } }) as unknown as Response, 'SyntaxError'],
+      ['non-Error rejection', async () => { throw SECRET; }, 'unknown'],
+    ];
+
+    it.each(cases)('%s logs exactly once with the class name only', async (_n, impl, expected) => {
+      const source = createCatalogIdsSource({ fetch: jest.fn(impl) as unknown as typeof fetch });
+      await source.getIds();
+      await source.getIds(); // backed off: no second attempt, no second log
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(errorSpy).toHaveBeenCalledWith('OpenRouterCatalogIds: refresh failed; keeping last list', expected);
+      expect(JSON.stringify(errorSpy.mock.calls)).not.toMatch(/SECRET|openrouter\.ai|body-text-leak|500/);
+    });
+
+    it('logs nothing on success or on a cache hit', async () => {
+      const source = createCatalogIdsSource({ fetch: jest.fn(async () => ok(['a/b'])) as unknown as typeof fetch });
+      await source.getIds();
+      await source.getIds();
+      expect(errorSpy).not.toHaveBeenCalled();
+    });
+
+    it('logs once per failed attempt, not per caller, when parallel callers share a failing refresh', async () => {
+      const source = createCatalogIdsSource({ fetch: jest.fn(async () => { throw new TypeError('x'); }) as unknown as typeof fetch });
+      await Promise.all([source.getIds(), source.getIds(), source.getIds()]);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+    });
+  });
 });
