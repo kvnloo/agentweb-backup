@@ -504,70 +504,102 @@ export async function ingestFathomOnboardingRecording(
   }
 
   const ledgerUserId = target.userId || input.reviewOwnerUserId;
-  const ledgerUser = await deps.userDb.getUserById(ledgerUserId);
-  if (!ledgerUser) {
-    throw new Error(`Target/review user ${ledgerUserId} was not found.`);
-  }
-
-  const existing = (ledgerUser as any).fathomOnboardingIngestions as FathomOnboardingIngestion[] | undefined;
-  const previous = existing?.find((item) => sameLedgerRecording(item, { recordingId, recordingUrl: input.recordingUrl }));
   const reviewed = input.reviewed === true;
-  // ENG-270 (Opslane 357): an admin discard sticks across unreviewed re-ingests, so the
-  // ledger never says needs_review while the draft account stays flagged discarded.
-  const status: IngestionStatus = reviewed
-    ? 'reviewed'
-    : previous?.status === 'discarded' ? 'discarded' : 'needs_review';
-  const extractionState: ExtractionState = reviewed ? 'human_reviewed' : 'auto_extracted';
-  const now = deps.now();
-  let memoryIds = previous?.memoryIds || [];
-  let orgMemoryIds = previous?.orgMemoryIds || [];
-  let orgMemoryOrgId = previous?.orgMemoryOrgId || null;
-
-  if (reviewed && target.userId) {
-    const memoryContent = buildFathomOnboardingMemoryContent(context, { recordingUrl: input.recordingUrl });
-    if (memoryIds.length === 0) {
-      const memory = await deps.accountMemoryDb.addMemory(target.userId, 'insight', memoryContent, undefined, undefined);
-      memoryIds = [memory.memoryId];
+  let createdMemoryIds: string[] = [];
+  let createdOrgMemoryIds: string[] = [];
+  let createdOrgMemoryOrgId: string | null = null;
+  let ledgerUser: any;
+  let existing: FathomOnboardingIngestion[] | undefined;
+  let previous: FathomOnboardingIngestion | undefined;
+  let status: IngestionStatus = 'needs_review';
+  let extractionState: ExtractionState = 'auto_extracted';
+  let now = deps.now();
+  let memoryIds: string[] = [];
+  let orgMemoryIds: string[] = [];
+  let orgMemoryOrgId: string | null = null;
+  let next!: FathomOnboardingIngestion;
+  let written = false;
+  for (let attempt = 0; attempt < 5 && !written; attempt += 1) {
+    ledgerUser = await deps.userDb.getUserById(ledgerUserId);
+    if (!ledgerUser) {
+      throw new Error(`Target/review user ${ledgerUserId} was not found.`);
     }
 
-    const targetUser = target.userId === ledgerUserId ? ledgerUser : await deps.userDb.getUserById(target.userId);
-    if (targetUser?.orgId && orgMemoryIds.length === 0) {
-      try {
-        const orgMemory = await deps.orgMemoryDb.addMemory(targetUser.orgId, 'insight', memoryContent, input.reviewOwnerUserId, undefined);
-        orgMemoryIds = [orgMemory.memoryId];
-        orgMemoryOrgId = targetUser.orgId;
-      } catch (error: any) {
-        console.warn('[FathomOnboarding] Failed to write org memory; preserving account memory ledger:', error?.message);
+    existing = (ledgerUser as any).fathomOnboardingIngestions as FathomOnboardingIngestion[] | undefined;
+    previous = existing?.find((item) => sameLedgerRecording(item, { recordingId, recordingUrl: input.recordingUrl }));
+      // ENG-270 (Opslane 357): an admin discard sticks across unreviewed re-ingests, so the
+    // ledger never says needs_review while the draft account stays flagged discarded.
+    status = reviewed
+      ? 'reviewed'
+      : previous?.status === 'discarded' ? 'discarded' : 'needs_review';
+    extractionState = reviewed ? 'human_reviewed' : 'auto_extracted';
+    now = deps.now();
+    memoryIds = previous?.memoryIds?.length ? previous.memoryIds : createdMemoryIds;
+    orgMemoryIds = previous?.orgMemoryIds?.length ? previous.orgMemoryIds : createdOrgMemoryIds;
+    orgMemoryOrgId = previous?.orgMemoryIds?.length ? (previous?.orgMemoryOrgId || null) : createdOrgMemoryOrgId;
+
+    if (reviewed && target.userId) {
+      const memoryContent = buildFathomOnboardingMemoryContent(context, { recordingUrl: input.recordingUrl });
+      if (memoryIds.length === 0) {
+        const memory = await deps.accountMemoryDb.addMemory(target.userId, 'insight', memoryContent, undefined, undefined);
+        memoryIds = [memory.memoryId];
+        createdMemoryIds = memoryIds;
+      }
+
+      const targetUser = target.userId === ledgerUserId ? ledgerUser : await deps.userDb.getUserById(target.userId);
+      if (targetUser?.orgId && orgMemoryIds.length === 0) {
+        try {
+          const orgMemory = await deps.orgMemoryDb.addMemory(targetUser.orgId, 'insight', memoryContent, input.reviewOwnerUserId, undefined);
+          orgMemoryIds = [orgMemory.memoryId];
+          orgMemoryOrgId = targetUser.orgId;
+          createdOrgMemoryIds = orgMemoryIds;
+          createdOrgMemoryOrgId = orgMemoryOrgId;
+        } catch (error: any) {
+          console.warn('[FathomOnboarding] Failed to write org memory; preserving account memory ledger:', error?.message);
+        }
       }
     }
+
+    next = {
+      recordingId,
+      recordingUrl: input.recordingUrl,
+      status,
+      extractionState,
+      context,
+      targetUserId: target.userId,
+      targetLead: target.lead,
+      matchReason: target.reason,
+      matchConfidence: target.confidence,
+      automationState: automationState || (automationMode === 'manual' ? 'manual_review' : undefined),
+      draftUserId,
+      draftEmail,
+      safetyFlags,
+      featureRequestDrafts: context.featureRequestDrafts || [],
+      memoryIds,
+      orgMemoryIds,
+      orgMemoryOrgId,
+      reviewOwnerUserId: input.reviewOwnerUserId,
+      error: null,
+      createdAt: previous?.createdAt || now,
+      updatedAt: now,
+    };
+
+    const ledger = mergeLedger(existing, next);
+    // ENG-270 (Opslane 422): compare-and-set on the whole ledger read above, so a
+    // concurrent discard or ingest is never overwritten by this stale snapshot.
+    const condition = Array.isArray(existing)
+      ? { expression: '#ing = :prevLedger', names: { '#ing': 'fathomOnboardingIngestions' }, values: { ':prevLedger': existing } }
+      : { expression: 'attribute_not_exists(#ing)', names: { '#ing': 'fathomOnboardingIngestions' }, values: {} };
+    try {
+      await deps.userDb.updateUser(ledgerUserId, { fathomOnboardingIngestions: ledger } as any, { condition } as any);
+      written = true;
+    } catch (error: any) {
+      if (error?.code !== 'ConditionalCheckFailedException' && error?.name !== 'ConditionalCheckFailedException') throw error;
+    }
   }
-
-  const next: FathomOnboardingIngestion = {
-    recordingId,
-    recordingUrl: input.recordingUrl,
-    status,
-    extractionState,
-    context,
-    targetUserId: target.userId,
-    targetLead: target.lead,
-    matchReason: target.reason,
-    matchConfidence: target.confidence,
-    automationState: automationState || (automationMode === 'manual' ? 'manual_review' : undefined),
-    draftUserId,
-    draftEmail,
-    safetyFlags,
-    featureRequestDrafts: context.featureRequestDrafts || [],
-    memoryIds,
-    orgMemoryIds,
-    orgMemoryOrgId,
-    reviewOwnerUserId: input.reviewOwnerUserId,
-    error: null,
-    createdAt: previous?.createdAt || now,
-    updatedAt: now,
-  };
-
-  const ledger = mergeLedger(existing, next);
-  await deps.userDb.updateUser(ledgerUserId, { fathomOnboardingIngestions: ledger } as any);
+  if (!written) {
+    throw new Error('Fathom onboarding ledger changed concurrently; retry the ingest.');
+  }
 
   if (reviewed && target.userId && input.reviewOwnerUserId !== ledgerUserId) {
     const reviewOwner = await deps.userDb.getUserById(input.reviewOwnerUserId);

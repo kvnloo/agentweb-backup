@@ -137,6 +137,7 @@ describe('fathomOnboardingIngestionService', () => {
           }),
         ],
       }),
+      expect.objectContaining({ condition: expect.any(Object) }),
     );
   });
 
@@ -213,6 +214,7 @@ describe('fathomOnboardingIngestionService', () => {
           expect.objectContaining({ recordingId: 'ambiguous-1', status: 'needs_review' }),
         ],
       }),
+      expect.objectContaining({ condition: expect.any(Object) }),
     );
   });
 
@@ -446,6 +448,41 @@ describe('fathomOnboardingIngestionService', () => {
     expect(ledger[0].status).toBe('discarded');
   });
 
+  it('re-reads and re-merges the ledger when a concurrent write lands between read and write (Opslane 422)', async () => {
+    const stamp = '2026-07-08T19:00:00.000Z';
+    const before = [{ recordingId: 'rv3-f', status: 'needs_review', context: baseContext, memoryIds: [], orgMemoryIds: [], createdAt: stamp, updatedAt: stamp }];
+    const after = [
+      { recordingId: 'rv3-h', status: 'needs_review', context: baseContext, memoryIds: [], orgMemoryIds: [], createdAt: stamp, updatedAt: stamp },
+      { ...before[0], status: 'discarded', updatedAt: '2026-07-08T19:00:01.000Z' },
+    ];
+    let reads = 0;
+    const updateUser = jest.fn(async (_userId: string, updates: Record<string, any>, options?: any) => {
+      if (updateUser.mock.calls.length === 1) {
+        expect(options?.condition?.values?.[':prevLedger']).toEqual(before);
+        throw Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' });
+      }
+      return updates;
+    });
+    const deps = makeDeps({
+      userDb: {
+        getUserById: jest.fn(async (userId: string) => ({ userId, email: 'a@agentweb.pro', fathomOnboardingIngestions: (reads++ === 0) ? before : after })),
+        getUserByEmail: jest.fn(async () => null),
+        getUsersByEmailDomain: jest.fn(async () => []),
+        updateUser,
+        createFathomDraftUser: jest.fn(),
+      },
+    });
+
+    await ingestFathomOnboardingRecording({
+      recordingId: 'rv3-g', targetUserId: 'admin-1', reviewOwnerUserId: 'admin-1', reviewed: false, extractedContext: baseContext,
+    }, deps as any);
+
+    expect(updateUser).toHaveBeenCalledTimes(2);
+    const ledger = updateUser.mock.calls[1][1].fathomOnboardingIngestions;
+    expect(ledger.map((i: any) => i.recordingId).sort()).toEqual(['rv3-f', 'rv3-g', 'rv3-h']);
+    expect(ledger.find((i: any) => i.recordingId === 'rv3-f').status).toBe('discarded');
+  });
+
   it('routes existing account matches to review without creating another user', async () => {
     const deps = makeDeps();
 
@@ -502,6 +539,7 @@ describe('fathomOnboardingIngestionService', () => {
           }),
         ],
       }),
+      expect.objectContaining({ condition: expect.any(Object) }),
     );
   });
 
@@ -537,6 +575,7 @@ describe('fathomOnboardingIngestionService', () => {
           }),
         ],
       }),
+      expect.objectContaining({ condition: expect.any(Object) }),
     );
     expect(warn).toHaveBeenCalledWith(
       '[FathomOnboarding] Failed to write org memory; preserving account memory ledger:',
@@ -721,6 +760,7 @@ describe('fathomOnboardingIngestionService', () => {
           }),
         ],
       }),
+      expect.objectContaining({ condition: expect.any(Object) }),
     );
     expect(deps.userDb.updateUser).toHaveBeenNthCalledWith(
       2,
