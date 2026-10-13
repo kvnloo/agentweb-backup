@@ -88,7 +88,7 @@ describe('executeResolvedDecision', () => {
   it('plan_choice approve: actively resumes the origin session (not just a passive note) and records executed', async () => {
     await executeResolvedDecision(baseDecision);
 
-    expect(mockTryClaimSessionGeneration).toHaveBeenCalledWith('sess-1');
+    expect(mockTryClaimSessionGeneration).toHaveBeenCalledWith('sess-1', 'user-1');
     expect(mockGenerateSessionResponse).toHaveBeenCalledWith(
       'sess-1',
       expect.stringContaining('matt approved this decision'),
