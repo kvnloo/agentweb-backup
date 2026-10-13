@@ -22,6 +22,7 @@ import {
   setEntitlementDeniedSink,
   resetEntitlementDeniedSink,
   flushUnconfirmedTierObservations,
+  resetLastKnownSubscriptionTypes,
 } from '../services/subscriptionService';
 
 jest.mock('../services/settingsService', () => ({
@@ -86,6 +87,7 @@ const mockedUserDb = userDb as jest.Mocked<typeof userDb>;
 describe('subscriptionService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    resetLastKnownSubscriptionTypes();
   });
 
   it('getUserSubscriptionType returns user.subscriptionType or Free by default', async () => {
@@ -992,5 +994,89 @@ describe('getAllAvailableConnectedAccounts', () => {
   // Settings page, since this list is what gates that page's card.
   it('includes linkedin_ads, which was missing despite having a full platform integration', () => {
     expect(getAllAvailableConnectedAccounts()).toContain('linkedin_ads');
+  });
+  /*
+   * ENG-1978: a transient DynamoDB error on the subscription_types read must not strip a user's plan.
+   * The last good read is served — bounded in age — only when the live read fails; a successful
+   * read always wins, so admin edits still apply immediately.
+   */
+  describe('last-known subscription_types on a failed read (ENG-1978)', () => {
+    const config = (skills: string[]) => ({
+      settingName: 'subscription_types',
+      settingValue: JSON.stringify([{ name: 'Pro', allowedPages: ['/tasks'], allowedSkills: skills }]),
+    });
+    let warn: jest.SpyInstance;
+
+    beforeEach(() => {
+      resetLastKnownSubscriptionTypes();
+      mockedSettingsService.getSetting.mockReset();
+      mockedUserDb.getUserById.mockReset();
+      mockedUserDb.getUserById.mockResolvedValue({ userId: 'u1', subscriptionType: 'Pro' } as any);
+      warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+    });
+    afterEach(() => {
+      jest.restoreAllMocks();
+      resetEntitlementDeniedSink();
+    });
+
+    it('keeps the user on their plan when the next read fails', async () => {
+      mockedSettingsService.getSetting.mockResolvedValueOnce(config(['skill-1']) as any);
+      expect(await getAllowedSkills('u1')).toEqual(['skill-1']);
+
+      mockedSettingsService.getSetting.mockRejectedValueOnce(new Error('dynamo down'));
+      expect(await getAllowedSkills('u1')).toEqual(['skill-1']);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('STALE-CONFIG'), 'dynamo down');
+    });
+
+    it('fails closed when a read fails and nothing was ever read', async () => {
+      const events: any[] = [];
+      setEntitlementDeniedSink((e) => events.push(e));
+      mockedSettingsService.getSetting.mockRejectedValueOnce(new Error('dynamo down'));
+
+      expect(await getAllowedSkills('u1')).toBeNull();
+      expect(events.map((e) => e.reason)).toContain('subscription-type-config-unavailable');
+    });
+
+    it('a successful read always wins over the remembered one (admin edits apply at once)', async () => {
+      mockedSettingsService.getSetting.mockResolvedValueOnce(config(['skill-1']) as any);
+      expect(await getAllowedSkills('u1')).toEqual(['skill-1']);
+
+      mockedSettingsService.getSetting.mockResolvedValueOnce(config(['skill-2']) as any);
+      expect(await getAllowedSkills('u1')).toEqual(['skill-2']);
+    });
+
+    it('stops serving the remembered config after 15 minutes', async () => {
+      const t0 = 1_800_000_000_000;
+      const now = jest.spyOn(Date, 'now').mockReturnValue(t0);
+      mockedSettingsService.getSetting.mockResolvedValueOnce(config(['skill-1']) as any);
+      expect(await getAllowedSkills('u1')).toEqual(['skill-1']);
+
+      now.mockReturnValue(t0 + 14 * 60_000);
+      mockedSettingsService.getSetting.mockRejectedValueOnce(new Error('dynamo down'));
+      expect(await getAllowedSkills('u1')).toEqual(['skill-1']);
+
+      now.mockReturnValue(t0 + 16 * 60_000);
+      mockedSettingsService.getSetting.mockRejectedValueOnce(new Error('dynamo down'));
+      expect(await getAllowedSkills('u1')).toBeNull();
+    });
+
+    it('warns at most once a minute while serving stale config', async () => {
+      const t0 = 1_800_000_000_000;
+      const now = jest.spyOn(Date, 'now').mockReturnValue(t0);
+      mockedSettingsService.getSetting.mockResolvedValueOnce(config(['skill-1']) as any);
+      await getAllowedSkills('u1');
+
+      mockedSettingsService.getSetting.mockRejectedValue(new Error('dynamo down'));
+      now.mockReturnValue(t0 + 1_000);
+      await getAllowedSkills('u1');
+      now.mockReturnValue(t0 + 20_000);
+      await getAllowedSkills('u1');
+      expect(warn.mock.calls.filter((c) => String(c[0]).includes('STALE-CONFIG'))).toHaveLength(1);
+
+      now.mockReturnValue(t0 + 61_000);
+      await getAllowedSkills('u1');
+      expect(warn.mock.calls.filter((c) => String(c[0]).includes('STALE-CONFIG'))).toHaveLength(2);
+    });
   });
 });

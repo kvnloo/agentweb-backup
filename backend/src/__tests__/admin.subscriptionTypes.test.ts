@@ -63,14 +63,19 @@ jest.mock('../services/agentModeService', () => ({
 
 import { settingsService } from '../services/settingsService';
 import * as subscriptionService from '../services/subscriptionService';
+import { userDb } from '../services/db';
 
 const mockedSettingsService = settingsService as jest.Mocked<typeof settingsService>;
 
 let app: express.Application;
 
 describe('Admin subscription types routes', () => {
+  let scanSpy: jest.SpyInstance;
+
   beforeEach(() => {
     jest.clearAllMocks();
+    // Never reach the real users table from the stranded-tier guard.
+    scanSpy = jest.spyOn(userDb, 'scanWithFilter').mockResolvedValue([]);
 
     app = express();
     app.use(express.json());
@@ -731,5 +736,83 @@ describe('Admin subscription types routes', () => {
     expect(res.body[2].skillId).toBe('__other_skills__');
     expect(res.body[2].name).toBe('Other Skills');
     expect(res.body[2].toolNames).toEqual(['other_tool_1', 'other_tool_2']);
+  });
+  // ENG-1978: a tier is referenced by NAME from each user. Removing or renaming one that accounts
+  // are still on leaves them unresolvable, and the entitlement gate now fails closed on that.
+  describe('stranded-tier guard (ENG-1978)', () => {
+    const tier = (name: string) => ({ name, allowedPages: ['/tasks'], allowedSkills: ['skill-1'] });
+    const stored = (names: string[]) =>
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'subscription_types',
+        settingValue: JSON.stringify(names.map(tier)),
+      } as any);
+    const post = (names: string[], extra: Record<string, unknown> = {}) =>
+      request(app)
+        .post('/api/admin/subscription-types')
+        .set('Authorization', 'Bearer test-token')
+        .send({ subscriptionTypes: names.map(tier), ...extra });
+
+    beforeEach(() => {
+      mockedSettingsService.setSetting.mockResolvedValue(undefined as any);
+    });
+
+    it('rejects removing a tier that accounts are still on, and saves nothing', async () => {
+      stored(['Free', 'Pro']);
+      scanSpy.mockResolvedValue([{ subscriptionType: 'Pro' }, { subscriptionType: 'Pro' }]);
+
+      const res = await post(['Free']).expect(409);
+
+      expect(res.body.strandedTiers).toEqual([{ name: 'Pro', userCount: 2 }]);
+      expect(res.body.message).toContain('"Pro" (2 accounts)');
+      expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
+    });
+
+    it('treats a rename as a removal of the old name', async () => {
+      stored(['Free', 'Pro']);
+      scanSpy.mockResolvedValue([{ subscriptionType: 'Pro' }]);
+
+      const res = await post(['Free', 'Pro-Renamed']).expect(409);
+
+      expect(res.body.strandedTiers).toEqual([{ name: 'Pro', userCount: 1 }]);
+      expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
+    });
+
+    it('allows removing a tier nobody is on', async () => {
+      stored(['Free', 'Pro']);
+      scanSpy.mockResolvedValue([]);
+
+      await post(['Free']).expect(200);
+
+      expect(mockedSettingsService.setSetting).toHaveBeenCalledTimes(1);
+    });
+
+    it('lets an API caller override with allowStrandedUsers and skips the scan', async () => {
+      stored(['Free', 'Pro']);
+      scanSpy.mockResolvedValue([{ subscriptionType: 'Pro' }]);
+
+      await post(['Free'], { allowStrandedUsers: true }).expect(200);
+
+      expect(scanSpy).not.toHaveBeenCalled();
+      expect(mockedSettingsService.setSetting).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not scan users when nothing is removed (edit or add only)', async () => {
+      stored(['Free', 'Pro']);
+
+      await post(['Free', 'Pro', 'Extra']).expect(200);
+
+      expect(scanSpy).not.toHaveBeenCalled();
+    });
+
+    it('counts accounts with no subscriptionType as Free when Free is removed', async () => {
+      stored(['Free', 'Pro']);
+      scanSpy.mockResolvedValue([{ userId: 'a' }, { userId: 'b', subscriptionType: '' }, { subscriptionType: 'Free' }]);
+
+      const res = await post(['Pro']).expect(409);
+
+      expect(res.body.strandedTiers).toEqual([{ name: 'Free', userCount: 3 }]);
+      const [filter] = scanSpy.mock.calls[0];
+      expect(filter).toContain('attribute_not_exists(subscriptionType)');
+    });
   });
 });
