@@ -70,3 +70,19 @@ describe('direct callers of the AgentWeb metering rails', () => {
     expect(stale).toEqual([]);
   });
 });
+
+describe('which callLLM calls may use a customer key (ENG-2108)', () => {
+  const source = fs.readFileSync(path.join(SRC, 'services/agentModeService.ts'), 'utf8');
+
+  it('is only the agent\'s own working loop, and that loop does opt in', () => {
+    const optIns = [...source.matchAll(/customerRoutable:\s*true/g)];
+    expect(optIns).toHaveLength(1);
+    // Same options object as the loop's metering feature, so it cannot drift to a helper.
+    const loopCall = source.indexOf("meteringFeature('agent_task'");
+    expect(loopCall).toBeGreaterThan(-1);
+    const distance = optIns[0].index! - loopCall;
+    expect(distance).toBeGreaterThan(0);
+    expect(distance).toBeLessThan(1500);
+  });
+});
+
