@@ -19,6 +19,7 @@ import { suppressLeadSideEffects } from '../utils/sessionList';
 import {
   bootstrapMessagingChannels,
   getMessagingChannel,
+  hasVerifiedWhatsApp,
   resolveDestination,
 } from './messagingChannelService';
 import { TEMPLATES } from './whatsappService';
@@ -321,7 +322,10 @@ export const leadListAlertService = {
     // `slackChannels` set, which is a delivery change customers did not ask for and
     // is outside ENG-273's scope. ENG-2120 transfers org-enabled new-lead
     // delivery to the CRM insert hook; other legacy events keep this destination.
-    if (user.slackChannel) {
+    // One platform per customer (ENG-273): an account on WhatsApp is not also posted to in
+    // Slack. This block reads the deprecated field directly rather than resolving through
+    // resolveDestination, so the rule has to be applied here too.
+    if (user.slackChannel && !hasVerifiedWhatsApp(user)) {
       try {
         // The org delivery path owns new-lead Slack alerts when enabled. A second
         // legacy send would bypass its masking/filters and create duplicates.
