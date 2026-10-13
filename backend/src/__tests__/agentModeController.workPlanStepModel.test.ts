@@ -339,6 +339,8 @@ describe('automatic work-plan continuation', () => {
       message: expect.objectContaining({ content: expect.stringContaining('Step 2 uses') }),
     }));
     expect(mockAlert).toHaveBeenCalledTimes(1);
+    // the pre-fire check stops the round BEFORE it persists its hidden directive turn
+    expect(db.addMessageToSession.mock.calls.some((c) => (c[1] as any).metadata?.kind === 'auto-continuation')).toBe(false);
     expect(activeSessionGenerations.has(SESSION_ID)).toBe(false);
     expect(autoContinuationSessions.has(SESSION_ID)).toBe(false);
   });
