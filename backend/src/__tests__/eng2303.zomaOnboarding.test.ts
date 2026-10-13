@@ -95,7 +95,7 @@ describe('ENG-2303 zoma_status onboarding', () => {
       getUser: jest.fn().mockResolvedValue({ userId: 'u1', email: 'a@b.co', has_payment_method: true }),
       listAccounts: jest.fn().mockResolvedValue([metaAccount()]),
     });
-    const r = await runZomaTool('zoma_status', {}, { userId: 'u1' }, d);
+    const r: any = await runZomaTool('zoma_status', {}, { userId: 'u1' }, d);
     expect(r.next_step).toBeNull();
     expect(r.writes_enabled).toBe(true);
     expect(r.meta.accounts).toEqual([{ account_id: '111', name: 'Phoenix', currency: 'TWD', ads_management: 'granted' }]);
