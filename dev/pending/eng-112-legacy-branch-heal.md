@@ -13,6 +13,9 @@ Branches created before agentweb#3463 (2026-10-09..10-13; `chat_branching_enable
 ### Known limitation
 A chain of two or more legacy hops (C branched from legacy B branched from A) heals C with root B until B itself is opened and healed; C is then in B's family, not A's. Walking further would need message rows, which this change deliberately never reads.
 
+- Accepted two-hop split (pre-#3463 data only): healing B first and then C puts both in A's family; opening C first (root B) and B later splits them (C in B's family, B in A's). Nothing is rewritten after the fact.
+- A session whose source is missing/foreign/cyclic is remembered in a per-process set (max 500, cleared on restart, nothing written), so repeated opens do not repeat the flag read and source read.
+
 ### Approval / rollout / rollback
 - `branchedFrom` is the additive optional attribute already owner-approved with #3463; no new attribute, index, table or backfill.
 - Rollback = revert this PR. Values already written are harmless (owner-only, optional, read by the same code as #3463 branches).

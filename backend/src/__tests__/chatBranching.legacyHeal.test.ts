@@ -35,6 +35,8 @@ import {
   healLegacyBranchedFrom,
   listBranchFamily,
   LEGACY_HEAL_MAX_HOPS,
+  __resetLegacyHealCacheForTests,
+  __legacyHealCacheSizeForTests,
   LegacyBranchHealDeps,
 } from '../services/agentMode/chatBranching';
 
@@ -77,6 +79,7 @@ const stored = (id: string) => mockFake.session(id)?.branchedFrom;
 
 let warn: jest.SpyInstance;
 beforeEach(() => {
+  __resetLegacyHealCacheForTests();
   mockFake.tables.clear();
   mockFake.writeLog.length = 0;
   mockFake.getLog.length = 0;
@@ -356,5 +359,35 @@ describe('healLegacyBranchedFrom: bounds (store-less)', () => {
     expect(await healLegacyBranchedFrom({ ...deps, isFeatureEnabled: flag }, { ...target, branchedFrom: { sessionId: 'a', rootSessionId: 'a', messageIndex: 0, branchedAt: 'z' } })).toBeNull();
     expect(flag).not.toHaveBeenCalled();
     expect(deps.reads).toHaveLength(0);
+  });
+
+  it('an unhealable session is remembered per process: later opens do no flag read and no source read, and nothing is written', async () => {
+    const deps = makeDeps({});
+    const flag = jest.fn(async () => true);
+    for (let i = 0; i < 3; i++) expect(await healLegacyBranchedFrom({ ...deps, isFeatureEnabled: flag }, target)).toBeNull();
+    expect(flag).toHaveBeenCalledTimes(1);
+    expect(deps.reads).toEqual(['c1']);
+    expect(deps.sets).toHaveLength(0);
+  });
+
+  it('failures and a disabled flag are not remembered (retried on the next open)', async () => {
+    let fail = true;
+    const deps = { ...makeDeps({ c1: rec('c1') }), getSessionRecord: async (id: string) => { if (fail) throw new Error('boom'); return rec(id); } };
+    expect(await healLegacyBranchedFrom(deps, target)).toBeNull();
+    fail = false;
+    expect((await healLegacyBranchedFrom(deps, target))?.rootSessionId).toBe('c1');
+    __resetLegacyHealCacheForTests();
+    expect(await healLegacyBranchedFrom({ ...makeDeps({ c1: rec('c1') }), isFeatureEnabled: async () => false }, target)).toBeNull();
+    expect(__legacyHealCacheSizeForTests()).toBe(0);
+  });
+
+  it('the remembered set is capped (oldest evicted)', async () => {
+    const deps = makeDeps({});
+    for (let i = 0; i < 600; i++) await healLegacyBranchedFrom(deps, { ...target, sessionId: `s${i}` });
+    expect(__legacyHealCacheSizeForTests()).toBe(500);
+    deps.reads.length = 0;
+    await healLegacyBranchedFrom(deps, { ...target, sessionId: 's0' }); // evicted: reads again
+    await healLegacyBranchedFrom(deps, { ...target, sessionId: 's599' }); // still remembered
+    expect(deps.reads).toEqual(['c1']);
   });
 });
