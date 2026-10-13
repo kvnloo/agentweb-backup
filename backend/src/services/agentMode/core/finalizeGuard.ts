@@ -199,10 +199,16 @@ export interface FinalizeLedgerEntry {
   args?: unknown;
 }
 
-/** A LinkedIn post saved with save_as_draft is a draft the user still has to publish, not a published post. */
+/**
+ * A LinkedIn post saved with save_as_draft, or a blog article not sent with status 'published', is a draft the user
+ * still has to publish, not a published post.
+ * The argument is the signal in prod; the result flag is a defensive second check (the stored result is `{}`).
+ */
 function savedAsDraft(entry: FinalizeLedgerEntry): boolean {
-  const args = entry.args as { save_as_draft?: unknown } | null | undefined;
+  const args = entry.args as { save_as_draft?: unknown; status?: unknown } | null | undefined;
   const result = entry.result as { draft?: unknown } | null | undefined;
+  // publish_blog_article saves a CMS draft unless status is exactly 'published' (emma/impl/blog.ts).
+  if (entry.toolName === 'publish_blog_article') return args?.status !== 'published';
   return args?.save_as_draft === true || result?.draft === true;
 }
 
