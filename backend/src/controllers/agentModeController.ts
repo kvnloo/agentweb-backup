@@ -9481,6 +9481,10 @@ export const agentModeController = {
       if (!user?.isAdmin && session.userId !== user?.userId) {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
+      // The body carries live state (messages, llmModel, progress), so a cached copy
+      // would show a stale conversation or a stale model selection. Same header as
+      // getGeneratingSessions.
+      res.setHeader?.('Cache-Control', 'no-store');
 
       // ENG-1239: durability backstop for the in-process media auto-continuation chain —
       // it only fires right after the deferred turn, so a process death in between (a
