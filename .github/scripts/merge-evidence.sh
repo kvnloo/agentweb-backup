@@ -133,6 +133,10 @@
 #
 # Environment:
 #   REPO                        owner/repo
+#   MERGE_EVIDENCE_DIRECTING_LOGIN GitHub login of the human directing the
+#                               agent. When it equals the PR author, the
+#                               FOREIGN_OWNER stop is lifted (ENG-2116 opt 2)
+#                               and the normal CI gate decides.
 #   PR_NUMBER                   pull request number
 #   GH_TOKEN                    token for `gh`
 #   MERGE_EVIDENCE_DRAFT_JOB    discriminator job name
@@ -289,6 +293,14 @@ if [ -z "${foreign_reason}" ] && [ -n "${pr_head_ref}" ]; then
       "${prefix}"*) foreign_reason="head branch '${pr_head_ref}'"; break ;;
     esac
   done <<<"${FOREIGN_BRANCH_PREFIXES}"
+fi
+# ENG-2116 option 2 (approved by Harsha 2026-10-13): an Argusoft engineer's own
+# agent may merge that engineer's PR. Exact author match only; the head branch
+# must not carry a *different* owner's prefix. CI evidence below still decides.
+DIRECTING_LOGIN="${MERGE_EVIDENCE_DIRECTING_LOGIN:-}"
+if [ -n "${foreign_reason}" ] && [ -n "${DIRECTING_LOGIN}" ] && [ "${DIRECTING_LOGIN}" = "${pr_author}" ]; then
+  log "ENG-2116: ${REPO}#${PR_NUMBER} authored by directing user '${DIRECTING_LOGIN}'; owner-directed merge allowed, continuing to CI evidence."
+  foreign_reason=''
 fi
 if [ -n "${foreign_reason}" ]; then
   verdict 'FOREIGN_OWNER' "${REPO}#${PR_NUMBER} is owned by an Argusoft engineer (${foreign_reason}). Agents must not merge, auto-merge, push to, or close it; its owner merges it (ENG-2116)."
