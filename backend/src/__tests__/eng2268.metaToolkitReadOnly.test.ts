@@ -36,30 +36,34 @@ app.use(express.json());
 app.use('/api/meta-toolkit', router);
 const authorization = 'Bearer aw_fixture';
 const toolName = 'call_meta_marketing_api';
-const argsFor = (action: string) => ({ entity_type: 'CAMPAIGN', action, account_id: '123' });
+const argsFor = (action: string, entity_type = 'CAMPAIGN') => ({ entity_type, action, account_id: '123' });
+// ENG-2303 (Harsha, 2026-10-12) superseded D2 for CAMPAIGN/AD_SET/AD CREATE + status/budget
+// UPDATE behind the guarded preview→confirm path (eng2303.metaToolkitWrites.test.ts). Every
+// other write stays refused at the boundary, exactly as D2 required.
+const STILL_EXCLUDED: Array<[string, string]> = [['DELETE', 'CAMPAIGN'], ['CREATE', 'CUSTOM_AUDIENCE'], ['COPY_AD', 'AD'], ['CREATE', 'AD_CREATIVE']];
 
 // Real transport -> gateway -> v1 assertion -> shared registry. Only external dependencies mocked.
-describe('ENG-2268 external reads-only boundary across public entrypoints', () => {
+describe('ENG-2268 external write boundary across public entrypoints (non-guarded writes)', () => {
   beforeEach(() => jest.clearAllMocks());
 
-  it.each(['CREATE', 'UPDATE'])('gateway refuses %s without provider dispatch or metering', async action => {
-    await expect(handleMetaToolkitCall({ authorization, toolName, args: argsFor(action) }))
+  it.each(STILL_EXCLUDED)('gateway refuses %s %s without provider dispatch or metering', async (action, entity) => {
+    await expect(handleMetaToolkitCall({ authorization, toolName, args: argsFor(action, entity) }))
       .rejects.toBeInstanceOf(MetaToolkitRefusal);
     expect(agentModeService.callMetaMarketingApi).not.toHaveBeenCalled();
     expect(recordMcpToolUse).not.toHaveBeenCalled();
   });
 
-  it.each(['CREATE', 'UPDATE'])('REST refuses %s without provider dispatch or metering', async action => {
+  it.each(STILL_EXCLUDED)('REST refuses %s %s without provider dispatch or metering', async (action, entity) => {
     const res = await request(app).post(`/api/meta-toolkit/tools/${toolName}/call`)
-      .set('Authorization', authorization).send({ args: argsFor(action) }).expect(400);
+      .set('Authorization', authorization).send({ args: argsFor(action, entity) }).expect(400);
     expect(res.body.error).toMatch(/not part of the Meta Toolkit v1 surface/);
     expect(agentModeService.callMetaMarketingApi).not.toHaveBeenCalled();
     expect(recordMcpToolUse).not.toHaveBeenCalled();
   });
 
-  it.each(['CREATE', 'UPDATE'])('MCP refuses %s without provider dispatch or metering', async action => {
+  it.each(STILL_EXCLUDED)('MCP refuses %s %s without provider dispatch or metering', async (action, entity) => {
     const res = await request(app).post('/api/meta-toolkit/mcp').set('Authorization', authorization)
-      .send({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: toolName, arguments: argsFor(action) } }).expect(200);
+      .send({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: toolName, arguments: argsFor(action, entity) } }).expect(200);
     expect(res.body.result.isError).toBe(true);
     expect(res.body.result.content[0].text).toMatch(/not part of the Meta Toolkit v1 surface/);
     expect(agentModeService.callMetaMarketingApi).not.toHaveBeenCalled();

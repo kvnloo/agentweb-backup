@@ -29,6 +29,10 @@ import {
   executeMetaToolkitCall,
   getMetaToolkitManifest,
 } from '../mcp/metaToolkitManifest';
+import { ZOMA_TOOL_NAMES } from '../mcp/zomaToolDefinitions';
+
+// ENG-2303: the toolkit also advertises toolkit-local Zoma onboarding tools (not registry tools).
+const EXPECTED_TOOLKIT_NAMES = [...META_TOOLKIT_V1_TOOL_NAMES, ...ZOMA_TOOL_NAMES];
 
 const ctx = { userId: 'user-1', sessionId: 's-1' };
 
@@ -37,9 +41,9 @@ describe('ENG-2282 Meta Toolkit manifest', () => {
 
   it('returns exactly the v1 Meta tools and nothing else from the Emma registry', () => {
     const manifest = getMetaToolkitManifest();
-    expect(manifest.map((d: any) => d.name)).toEqual([...META_TOOLKIT_V1_TOOL_NAMES]);
+    expect(manifest.map((d: any) => d.name)).toEqual(EXPECTED_TOOLKIT_NAMES);
     expect(emmaToolRegistry.getToolNames().length).toBeGreaterThan(manifest.length + 10);
-    for (const def of manifest) {
+    for (const def of manifest.filter((d: any) => !d.name.startsWith('zoma_'))) {
       expect(def.name).toMatch(/meta/);
       expect(typeof def.description).toBe('string');
       expect(def.inputSchema?.type).toBe('object');
@@ -54,9 +58,14 @@ describe('ENG-2282 Meta Toolkit manifest', () => {
     for (const def of manifest) expect(def.inputSchema.properties.client_id).toBeUndefined();
     const mkt = manifest.find((d: any) => d.name === 'call_meta_marketing_api');
     const actions: string[] = mkt.inputSchema.properties.action.enum;
-    for (const excluded of ['CREATE', 'UPDATE', 'DELETE', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'UPLOAD_USERS', 'COPY_AD', 'RETAG_UTM']) {
+    for (const excluded of ['DELETE', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'UPLOAD_USERS', 'COPY_AD', 'RETAG_UTM']) {
       expect(actions).not.toContain(excluded);
     }
+    // ENG-2303: guarded writes are advertised with the preview→confirm arguments.
+    expect(actions).toEqual(expect.arrayContaining(['CREATE', 'UPDATE']));
+    expect(mkt.inputSchema.properties.confirm.type).toBe('boolean');
+    expect(mkt.inputSchema.properties.preview_token.type).toBe('string');
+    expect(mkt.description).toMatch(/created PAUSED/);
     expect(mkt.inputSchema.properties.params.properties.override_tracking_check).toBeUndefined();
   });
 
@@ -115,7 +124,7 @@ describe('ENG-2282 Meta Toolkit manifest', () => {
     });
     expect(emmaRegistryModule.emmaToolRegistry.getToolNames()).toEqual([]);
     expect(metaTools.metaToolRegistry.getToolNames()).toEqual([...META_TOOLKIT_V1_TOOL_NAMES]);
-    expect(isolated.getMetaToolkitManifest().map((d: any) => d.name)).toEqual([...META_TOOLKIT_V1_TOOL_NAMES]);
+    expect(isolated.getMetaToolkitManifest().map((d: any) => d.name)).toEqual(EXPECTED_TOOLKIT_NAMES);
 
     const args = { entity_type: 'CAMPAIGN', action: 'LIST', account_id: 'act_1', params: { name: 'x' } };
     await isolated.executeMetaToolkitCall('call_meta_marketing_api', args, ctx);
