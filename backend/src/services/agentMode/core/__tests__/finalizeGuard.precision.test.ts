@@ -274,6 +274,48 @@ describe('judge output handling: edge cases', () => {
     expect(errors).toHaveLength(1);
   });
 
+  it.each(['Email_Sent', ' email_sent ', 'EMAIL_SENT'])('tolerates class-name drift from the judge: %j', async (cls) => {
+    const { guardPorts } = makeGuardPorts([{ claimClass: cls as any, statement: 'I sent the email' }]);
+    const out = await runFinalizeGuard({ finalText: EMAIL_TEXT, ledger: [], ports: guardPorts, detectOnly: true });
+    expect(out.mismatchedClaimClasses).toEqual(['email_sent']);
+    expect(out.discardedClaims).toBe(0);
+  });
+
+  it('a non-string claimClass is discarded, not thrown on', async () => {
+    const { guardPorts } = makeGuardPorts([{ claimClass: 5 as any, statement: 'x' }, null as any]);
+    const out = await runFinalizeGuard({ finalText: EMAIL_TEXT, ledger: [], ports: guardPorts, detectOnly: true });
+    expect(out.claimMismatch).toBe(false);
+    expect(out.discardedClaims).toBe(2);
+  });
+
+  it('a duplicate-suppressed notify_session entry (success, sent_to: []) still backs the claim: the same recipients were mailed earlier', async () => {
+    const { guardPorts } = makeGuardPorts([{ claimClass: 'email_sent', statement: 'emailed the report' }]);
+    const out = await runFinalizeGuard({
+      finalText: 'I emailed the report to the client.',
+      ledger: [ok('notify_session', { success: true, sent_to: [], duplicate_suppressed: true })],
+      ports: guardPorts,
+      detectOnly: true,
+    });
+    expect(out.claimMismatch).toBe(false);
+  });
+
+  it('discardedClaims is carried on the corrected and appended_correction paths', async () => {
+    const claims: JudgedClaim[] = [
+      { claimClass: 'email_sent', statement: 'I sent the email' },
+      { claimClass: 'email_sent' },
+    ];
+    const corrected = await runFinalizeGuard({ finalText: EMAIL_TEXT, ledger: [], ports: makeGuardPorts(claims).guardPorts });
+    expect(corrected.action).toBe('corrected');
+    expect(corrected.discardedClaims).toBe(1);
+    const stillWrong = await runFinalizeGuard({
+      finalText: EMAIL_TEXT,
+      ledger: [],
+      ports: { ...makeGuardPorts(claims).guardPorts, requestCorrection: async () => 'The email was sent to the client.' },
+    });
+    expect(stillWrong.action).toBe('appended_correction');
+    expect(stillWrong.discardedClaims).toBe(1);
+  });
+
   it('mixed claims: one backed, one unbacked -> only the unbacked class mismatches', async () => {
     const { guardPorts } = makeGuardPorts([
       { claimClass: 'email_sent', statement: 'I sent the email' },
@@ -344,6 +386,13 @@ describe('judge prompt', () => {
 });
 
 describe('parseFinalizeJudgeOutput', () => {
+  it('keeps a statement that contains brackets, escaped quotes and non-ASCII text', () => {
+    const raw = '[{"claimClass":"email_sent","statement":"Envié el correo [adjunto] a \\"Dana\\""}]';
+    expect(parseFinalizeJudgeOutput(raw)).toEqual([{ claimClass: 'email_sent', statement: 'Envié el correo [adjunto] a "Dana"' }]);
+  });
+  it('tolerates a json code fence around the array', () => {
+    expect(parseFinalizeJudgeOutput('```json\n[{"claimClass":"crm_saved","statement":"s"}]\n```')).toEqual([{ claimClass: 'crm_saved', statement: 's' }]);
+  });
   it('keeps statements', () => {
     expect(parseFinalizeJudgeOutput('[{"claimClass":"email_sent","statement":"I sent it"}]')).toEqual([{ claimClass: 'email_sent', statement: 'I sent it' }]);
   });
