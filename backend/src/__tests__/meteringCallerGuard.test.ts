@@ -29,7 +29,7 @@ const STAYS_AGENTWEB_PAID: Record<string, string> = {
   'emma/tools.ts': 'AgentWeb-funded tool-side metering',
   'mcp/metaToolkitGateway.ts': 'AgentWeb-funded MCP gateway metering',
   'routes/internalUsage.ts': 'internal usage ingestion for AgentWeb-paid vendors',
-  'services/codingAgentService.ts': 'coding agent makes its own OpenRouter calls on AgentWeb\'s key; A2 PR 2 decides whether it becomes customer-routable',
+  'services/codingAgentService.ts': 'AgentWeb-funded coding-agent turns meter here; a turn on the customer\'s key is resolved per turn and goes to recordLlmUsage instead (A2 PR 2)',
   'services/codingAgentSubpageService.ts': 'AgentWeb-funded coding agent sub-page',
   'services/apolloQuota.ts': 'Apollo vendor quota (AgentWeb vendor)',
   'services/apolloService.ts': 'Apollo vendor (AgentWeb vendor)',
@@ -78,10 +78,32 @@ describe('which callLLM calls may use a customer key (ENG-2108)', () => {
     .filter(({ text }) => /customerRoutable\s*[:,=]/.test(text.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '')));
 
   it('is read from the call options in callLLM and set nowhere outside the agent service and the resolver', () => {
-    expect(mentions.map((m) => m.file).sort()).toEqual(['services/agentModeService.ts', 'services/funding/callFunding.ts']);
+    expect(mentions.map((m) => m.file).sort()).toEqual([
+      'services/agentModeService.ts',
+      'services/codingAgentService.ts',
+      'services/funding/callFunding.ts',
+    ]);
   });
 
-  it('defaults to off, and only the agent\'s own working loop opts in', () => {
+  it('lets only the coding agent skip the provisioner for Anthropic keys', () => {
+    // Any mention at all (shorthand, computed key, a spread) outside these two files fails,
+    // not just the literal `canCallAnthropicDirect: true`.
+    const files = sourceFiles(SRC)
+      .filter((file) => fs.readFileSync(file, 'utf8').replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').includes('canCallAnthropicDirect'))
+      .map((file) => path.relative(SRC, file).split(path.sep).join('/'))
+      .sort();
+    expect(files).toEqual(['services/codingAgentService.ts', 'services/funding/callFunding.ts']);
+    const caller = fs.readFileSync(path.join(SRC, 'services/codingAgentService.ts'), 'utf8');
+    expect([...caller.matchAll(/canCallAnthropicDirect:\s*true/g)]).toHaveLength(1);
+  });
+
+  it('is opted in by the coding agent exactly once, on its own turns', () => {
+    const source = read('services/codingAgentService.ts');
+    expect([...source.matchAll(/customerRoutable:\s*true/g)]).toHaveLength(1);
+    expect(source).toContain('resolveTurnFunding');
+  });
+
+  it('defaults to off, and only the agent\'s own working loop opts in inside the agent service', () => {
     const source = read('services/agentModeService.ts');
     expect(source).toMatch(/customerRoutable\s*=\s*false/);
     const optIns = [...source.matchAll(/customerRoutable:\s*true/g)];
