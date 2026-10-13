@@ -1,6 +1,7 @@
 import { resolveModelForUser } from './modelRoles';
 import { OUTCOME_JUDGE_SHADOW_FEATURE, assertOutcomeJudgeModelAllowed, DEFAULT_OUTCOME_JUDGE_MODEL, isInShadowSample } from './outcomeJudge';
 import { chatbotDb, ChatSession, ChatMessage } from "./chatbotService";
+import { summarizeAiStyleTells } from "./aiStyleGuard";
 import {
   appendConfirmedPublishNotice,
   ledgerFromSucceededFunctions,
@@ -31,6 +32,18 @@ const MAX_TOOL_CONTENT_FOR_SCORING = 500; // chars per tool result in scoring co
  * the judge can see that tools were actually invoked rather than treating the turn
  * as a silent/empty response.
  */
+/**
+ * Message content as plain text. `null`/`undefined` (a tool-calls-only turn persists with the
+ * field absent) is empty text, NOT a JSON value: `JSON.stringify(undefined ?? "")` is the
+ * two-character string `""`, which is truthy, so it would print a literal `""` into the judge's
+ * transcript and stop empty assistant turns being skipped.
+ */
+function textOf(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (content == null) return "";
+  return JSON.stringify(content);
+}
+
 function serializeMessagesForScoring(messages: ChatMessage[]): string {
   const lines: string[] = [];
 
@@ -38,7 +51,7 @@ function serializeMessagesForScoring(messages: ChatMessage[]): string {
     if (m.role === "system") continue;
 
     if (m.role === "user") {
-      const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      const text = textOf(m.content);
       lines.push(`user: ${text}`);
 
     } else if (m.role === "assistant") {
@@ -48,7 +61,7 @@ function serializeMessagesForScoring(messages: ChatMessage[]): string {
       // interactive run that crashed and the user retried in the same session), the
       // judge would otherwise read the note verbatim and score against it (ENG-479).
       if (isRunFailurePlaceholder(m)) continue;
-      const text = (typeof m.content === "string" ? m.content : JSON.stringify(m.content)).trim();
+      const text = textOf(m.content).trim();
       const toolCalls: Array<{ name: string; arguments?: any }> = (m as any).metadata?.toolCalls || [];
 
       if (text && toolCalls.length > 0) {
@@ -65,7 +78,7 @@ function serializeMessagesForScoring(messages: ChatMessage[]): string {
 
     } else if (m.role === "tool") {
       const name = (m as any).name || "tool";
-      const raw = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      const raw = textOf(m.content);
       const preview = raw.length > MAX_TOOL_CONTENT_FOR_SCORING
         ? raw.slice(0, MAX_TOOL_CONTENT_FOR_SCORING) + "…"
         : raw;
@@ -1813,6 +1826,18 @@ export async function scoreSessionWithJudge(
   // recentMessages, so the manifest's "anywhere in this session" claim is
   // actually true and applyFabricationGuard isn't fooled by an out-of-window
   // tool call.
+  // ENG-2429: eval-only telemetry for AI-tell phrasing in Emma's output.
+  // Logged, never persisted; never affects the score or throws.
+  try {
+    const styleTells = summarizeAiStyleTells(messages);
+    if (styleTells.total > 0) {
+      console.log(
+        JSON.stringify({ event: "ai_style_tells", sessionId: usageContext?.sessionId, ...styleTells })
+      );
+    }
+  } catch {
+    // telemetry must not break scoring
+  }
   const manifest = buildToolCallManifest(messages);
   const conversationText = header
     ? `${header}\n${manifest.text}\n\n${capped.text}`

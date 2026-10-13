@@ -22,6 +22,7 @@
  */
 
 import { withClearedError } from "../utils/clearErrorOnClaim";
+import { readUserForOwnership } from "../utils/readUserForOwnership";
 import { LLMService } from "../utils/llmService";
 import type { LLMUsageContext } from "../utils/llmService";
 import { reportUIError } from "../utils/errorReporter";
@@ -242,7 +243,11 @@ export async function triggerCreativeDirForUser(
     expectedStartedAt?: string;
   } = {}
 ): Promise<void> {
-  const user = await userDb.getUserById(userId);
+  // This runs moments after the ICP and competitor steps wrote their results, so
+  // an index read can still show the row from before them and generate the
+  // creative direction on an empty persona/competitor set (and the step would
+  // then be recorded ready). Read the base table.
+  const user = await readUserForOwnership(userId);
   if (!user) return;
   const personas: ICPPersona[] = Array.isArray((user as any).icpResult)
     ? ((user as any).icpResult as ICPPersona[])

@@ -368,10 +368,31 @@ router.post("/page-subdomain", async (req, res: Response) => {
     if (!mainDomain || typeof mainDomain !== "string")
       return res.status(400).json({ error: "mainDomain is required" });
 
-    // 1. Add the subdomain to Vercel
+    // ENG-2412: authorize BEFORE any Vercel side effect. Load the page, require the caller to
+    // own it, require the body's project to be the page's project, and require mainDomain to be
+    // a domain the caller already has attached to that project.
+    // 1. Fetch current page for slug + githubRepoUrl
+    const pageResult = await dynamodb
+      .get({ TableName: LANDING_PAGES_TABLE, Key: { id: landingPageId } })
+      .promise();
+    const currentPage = pageResult.Item as any;
+    if (!currentPage || currentPage.userId !== userId) {
+      return res.status(404).json({ error: "Landing page not found" });
+    }
+
+    if (currentPage.vercelProjectId !== vercelProjectId) {
+      return res.status(403).json({ error: "Landing page does not belong to this project" });
+    }
+    const normalizedMain = mainDomain.toLowerCase().trim();
+    const ownedDomains = await listDomains(userId, vercelProjectId);
+    if (!ownedDomains.some((d) => d.domain?.toLowerCase() === normalizedMain)) {
+      return res.status(403).json({ error: "mainDomain is not attached to this project" });
+    }
+
+    // 2. Add the subdomain to Vercel
     const { fullDomain } = await setPageSubdomain(userId, vercelProjectId, subdomainPrefix, mainDomain);
 
-    // 2. Fetch other pages that already have a subdomainPrefix for domain map rebuild
+    // 3. Fetch other pages that already have a subdomainPrefix for domain map rebuild
     const pagesResult = await dynamodb
       .query({
         TableName: LANDING_PAGES_TABLE,
@@ -386,15 +407,6 @@ router.post("/page-subdomain", async (req, res: Response) => {
       slug?: string;
       subdomainPrefix?: string;
     }>;
-
-    // 3. Fetch current page for slug + githubRepoUrl
-    const pageResult = await dynamodb
-      .get({ TableName: LANDING_PAGES_TABLE, Key: { id: landingPageId } })
-      .promise();
-    const currentPage = pageResult.Item as any;
-    if (!currentPage || currentPage.userId !== userId) {
-      return res.status(404).json({ error: "Landing page not found" });
-    }
 
     // 4. Build the complete domain map (other pages + current page with new prefix)
     const domainMap: Record<string, string> = {};

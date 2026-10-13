@@ -13,6 +13,7 @@ import adminRoutes from "./routes/admin";
 import adminUsageRoutes from "./routes/adminUsage";
 import mcpUsageAdminRoutes from "./routes/mcpUsageAdmin";
 import adminV0CreditsRoutes from "./routes/adminV0Credits";
+import adminCustomSubscriptionLinksRoutes from "./routes/adminCustomSubscriptionLinks";
 import internalUsageRoutes from "./routes/internalUsage";
 import configRouter from "./routes/config";
 import browserCookiesRouter from "./routes/browserCookies";
@@ -80,6 +81,7 @@ import crmWebhookRoutes from "./routes/crmWebhook";
 import mcpServersRoutes, { mcpOAuthPublicRouter } from "./routes/mcpServers";
 import metaToolkitRoutes from "./routes/metaToolkit";
 import { createToolBridgeRouter } from "./routes/toolBridge";
+import { createLlmConnectionsRouter } from "./routes/llmConnections";
 import { toolBridgeMcp } from "./services/funding/toolBridgeService";
 import skillRoutes from "./routes/skillRoutes";
 import userSkillRoutes from "./routes/userSkillRoutes";
@@ -308,6 +310,9 @@ const corsOptions = {
   // headers; cross-origin (app.agentweb.pro -> api.agentweb.pro) the browser
   // preflights them and, if absent here, blocks the fetch so the meter never loads.
   allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "Pragma"],
+  // ENG-2418: GET /api/tasks/executions/with-images returns paging metadata in
+  // headers; cross-origin the portal can only read them if they are exposed.
+  exposedHeaders: ["X-Total-Tasks", "X-Next-Cursor"],
   credentials: true,
 };
 
@@ -408,9 +413,13 @@ app.use("/api/admin", adminRoutes);
 app.use("/api/admin", adminUsageRoutes);
 app.use("/api/admin", mcpUsageAdminRoutes);
 app.use("/api/admin", adminV0CreditsRoutes);
+app.use("/api/admin", adminCustomSubscriptionLinksRoutes);
 app.use("/api/internal", internalUsageRoutes);
 // ENG-2109: MCP endpoint for claude -p sessions this backend spawned. Local-only; see routes/toolBridge.ts.
 app.use("/internal/tool-bridge", createToolBridgeRouter(toolBridgeMcp));
+// ENG-2105: a customer's own LLM provider keys (BYOK). Adding or re-validating a key
+// is gated by the eng1816_funding_flags row; listing and revoking always work.
+app.use("/api/llm-connections", createLlmConnectionsRouter());
 app.use("/api/config", configRouter);
 app.use("/api/browser-cookies", browserCookiesRouter);
 app.use("/api/workflows", workflowRoutes);

@@ -104,6 +104,16 @@ describe('agentModeController.getSessions', () => {
     mockSummarize.mockResolvedValue(null);
   });
 
+  test('ENG-112: the owner list passes branchedFrom through on each session', async () => {
+    const branchedFrom = { sessionId: 'a', rootSessionId: 'root', messageIndex: 4, branchedAt: '2026-10-12T00:00:00.000Z' };
+    mockGetUserSessions.mockResolvedValue({ sessions: [makeSession({ branchedFrom }), makeSession()], lastEvaluatedKey: null });
+    const res = makeResponse();
+    await agentModeController.getSessions(makeRequest(), res);
+    const body = res.json.mock.calls[0][0];
+    expect(body.sessions[0].branchedFrom).toEqual(branchedFrom);
+    expect(body.sessions[1].branchedFrom).toBeUndefined();
+  });
+
   // --- FAIL CASES ---
 
   test('returns 500 when getUserSessions throws', async () => {

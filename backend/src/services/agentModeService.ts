@@ -70,6 +70,7 @@ import {
   type LLMModelConfig,
   type ModelProvider,
   type ModelTier,
+  LEGACY_MODEL_ALIASES,
 } from './agentMode/llmModelRegistry';
 import {
   isMalformedOpenRouterResponseError,
@@ -81,7 +82,7 @@ import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActions
 import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory, type ToolDispatchPorts } from './agentMode/core/toolDispatch';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
-import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
+import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, buildFinalizeJudgePrompt, parseFinalizeJudgeOutput } from './agentMode/core/finalizeGuard';
 import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
 import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
 import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionIndex } from '../utils/modelMentionRequest';
@@ -1123,24 +1124,6 @@ const FINALIZE_GUARD_JUDGE_MODEL = DIAGNOSIS_MODEL;
 // readFileContent, moved in the same cluster (describeVideo, cluster 21,
 // already carries its own separately-duplicated copy of IMAGE_EXTENSIONS).
 
-// Legacy model ids persisted by sessions/schedules created before a model was
-// renamed or fully retired. Maps the old id to its current registry key so old
-// sessions/schedules keep working instead of throwing "Invalid model". Opus 4.8
-// was renamed from the bare Vertex id "claude-opus-4-8" to the Bedrock id
-// "anthropic.claude-opus-4-8" in commit c86c8ec1. gpt-5-chat-2 and gpt-5.2-chat
-// were removed from the registry 2026-08-19 (Azure deployment retired/deprecated
-// during the migration off the Rui-owned Azure resource — see the registry
-// comment above the gpt-5.4 entry) and redirected to gpt-5.5, the current
-// non-legacy top of the same gpt5-chat family.
-const LEGACY_MODEL_ALIASES: Record<string, string> = {
-  'claude-opus-4-8': 'anthropic.claude-opus-4-8',
-  'gpt-5-chat-2': 'gpt-5.5',
-  'gpt-5.2-chat': 'gpt-5.5',
-  'gemini-2.5-flash': 'gemini-3.1-flash-lite',
-  // ENG-2178: schedules created before the OpenRouter migration pin the bare
-  // "gpt-4o-mini" id; the same model is now served via OpenRouter.
-  'gpt-4o-mini': 'openrouter/openai/gpt-4o-mini',
-};
 
 // Context passed to the diagnosis agent when the main agent fails
 export interface DiagnosisContext {
@@ -2137,53 +2120,23 @@ export class AgentModeService {
   // directly. No test spies on it directly.
 
   async getVideoGenerationDefaultModel(): Promise<string> {
-    try {
-      const setting = await settingsService.getSetting(this.videoGenerationDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported video generation default model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting video generation default model setting:', error);
-    }
+    const configured = await this.resolveConfiguredModel(this.videoGenerationDefaultModelSettingName, 'video generation default');
+    if (configured) return configured;
     // Fall back to the general default model
     return this.getDefaultModel();
   }
 
   async getCustomerSupportDefaultModel(): Promise<string> {
-    try {
-      const setting = await settingsService.getSetting(this.customerSupportDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported customer support default model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting customer support default model setting:', error);
-    }
+    const configured = await this.resolveConfiguredModel(this.customerSupportDefaultModelSettingName, 'customer support default');
+    if (configured) return configured;
     // Fall back to the general default model
     return this.getDefaultModel();
   }
 
   async getCodingAgentDefaultModel(): Promise<string> {
     const fallbackModel = 'anthropic.claude-sonnet-4-6';
-    try {
-      const setting = await settingsService.getSetting(this.codingAgentDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported coding agent default model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting coding agent default model setting:', error);
-    }
+    const configured = await this.resolveConfiguredModel(this.codingAgentDefaultModelSettingName, 'coding agent default');
+    if (configured) return configured;
     // Fall back to Sonnet 4.6
     return fallbackModel;
   }
@@ -2196,18 +2149,8 @@ export class AgentModeService {
    */
   async getVisionModel(): Promise<string> {
     const fallbackModel = this.llmModels['anthropic.claude-opus-4-8'] ? 'anthropic.claude-opus-4-8' : this.default_model;
-    try {
-      const setting = await settingsService.getSetting(this.visionModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported vision model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting vision model setting:', error);
-    }
+    const configured = await this.resolveConfiguredModel(this.visionModelSettingName, 'vision');
+    if (configured) return configured;
     return fallbackModel;
   }
 
@@ -10803,14 +10746,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     const response = await this.callLLM(FINALIZE_GUARD_JUDGE_MODEL, [
       {
         role: 'user',
-        content:
-          'You are auditing an AI assistant\'s reply for COMPLETED-ACTION claims — statements that an action already happened '
-          + '(not offers, plans, or suggestions). The possible claim classes are: '
-          + `${CLAIM_CLASSES.join(', ')}. Candidate classes detected in this reply: ${candidateClasses.join(', ')}.\n\n`
-          + 'Return ONLY a JSON array, one element per claimed completed action, each shaped '
-          + '{"claimClass":"<class>","statement":"<short quote from the reply>"}. '
-          + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
-          + finalText,
+        content: buildFinalizeJudgePrompt(finalText, candidateClasses),
       },
     ], {
       max_completion_tokens: 500,
@@ -10820,19 +10756,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       usageContext: usageContext ?? { feature: 'finalize_guard_judge' },
     });
 
-    const text = (response as any)?.choices?.[0]?.message?.content;
-    if (typeof text !== 'string' || !text.trim()) {
-      throw new Error('finalize-guard judge returned no content');
-    }
-    const match = text.match(/\[[\s\S]*\]/);
-    if (!match) {
-      throw new Error(`finalize-guard judge returned unparseable output: ${text.slice(0, 200)}`);
-    }
-    const parsed = JSON.parse(match[0]); // throws on invalid JSON → judge_error path
-    if (!Array.isArray(parsed)) {
-      throw new Error('finalize-guard judge output is not an array');
-    }
-    return (parsed as any[]).filter((c) => c && typeof c.claimClass === 'string');
+    return parseFinalizeJudgeOutput((response as any)?.choices?.[0]?.message?.content);
   }
 
   /**
@@ -16922,8 +16846,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // readFileContent.test.ts/emma.readFileContentTool.test.ts's direct
   // real-instance calls all call agentModeService.readFileContent(...)
   // directly.
-  public async readFileContent(fileUrl: string): Promise<any> {
-    return miscImpl.readFileContent(fileUrl);
+  public async readFileContent(fileUrl: string, caller?: miscImpl.ReadFileCallerContext): Promise<any> {
+    return miscImpl.readFileContent(fileUrl, caller);
   }
 
   // ENG-2103 (F2 design-decision-list follow-up, Pattern A): body moved

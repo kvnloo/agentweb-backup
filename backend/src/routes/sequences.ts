@@ -19,7 +19,7 @@ import { isSessionList, SESSION_LIST_SEQUENCE_ERROR } from '../utils/sessionList
 import { resolveSenderForSend } from '../services/crmSenderService';
 import { CrmSender } from '../services/crmSenderTypes';
 import { sendAsSender } from '../services/sendAsSender';
-import axios from 'axios';
+import { fetchPublicHtml, SsrfBlockedError } from '../utils/ssrfGuard';
 import { extractVariables, leadHasVariable, isSupportedVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
 import { LEAD_LIFECYCLES, defaultStatusConfigFor } from '../utils/leadSchema';
@@ -1032,13 +1032,16 @@ router.post('/load-from-url', authenticateToken, async (req: Request, res: Respo
       return res.status(400).json({ message: 'Invalid URL format. Must be HTTP or HTTPS.' });
     }
 
-    const response = await axios.get(url, {
-      timeout: 15000,
-      responseType: 'text',
-      headers: { 'User-Agent': 'AgentWeb-Backend/1.0' },
-    });
-
-    const html = response.data as string;
+    // ENG-2425: SSRF-safe (DNS-pinned, per-hop re-validated, size-capped).
+    let html: string;
+    try {
+      html = await fetchPublicHtml(url);
+    } catch (fetchErr) {
+      if (fetchErr instanceof SsrfBlockedError) {
+        return res.status(400).json({ message: 'URL must point to a public internet address' });
+      }
+      throw fetchErr;
+    }
 
     // Extract title
     const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);

@@ -60,6 +60,14 @@ describe('Agent Mode Controller - Session Loading', () => {
   });
 
   describe('getSession', () => {
+    it('ENG-112: the owner view passes branchedFrom through', async () => {
+      const branchedFrom = { sessionId: 'a', rootSessionId: 'root', messageIndex: 4, branchedAt: '2026-10-12T00:00:00.000Z' };
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ ...mockSession, branchedFrom });
+      const res = mockResponse();
+      await agentModeController.getSession(mockRequest(mockUser, 'session-123'), res);
+      expect(res.json.mock.calls[0][0].branchedFrom).toEqual(branchedFrom);
+    });
+
     it('should return session with filtered messages for regular user', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
 
@@ -80,6 +88,7 @@ describe('Agent Mode Controller - Session Loading', () => {
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
         hasActiveProgress: false,
+        isGenerating: false,
         skills: [],
         // ENG-1579: no fixture message carries `.llm` and the fixture has no
         // `llmModel`, so there is nothing to attribute — all null.
@@ -227,6 +236,7 @@ describe('Agent Mode Controller - Session Loading', () => {
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
         hasActiveProgress: false,
+        isGenerating: false,
         skills: [],
         generationModels: null,
         attributedModels: null,
@@ -267,6 +277,7 @@ describe('Agent Mode Controller - Session Loading', () => {
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
         hasActiveProgress: false,
+        isGenerating: false,
         skills: [],
         generationModels: null,
         attributedModels: null,

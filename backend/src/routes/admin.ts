@@ -4,7 +4,7 @@ import { disconnectStaleUserSockets } from "../services/sessionSockets";
 import jwt from "jsonwebtoken";
 import { getJwtSecret } from "../config/jwt";
 import bcrypt from "bcryptjs";
-import axios from "axios";
+import { fetchPublicHtml, SsrfBlockedError } from "../utils/ssrfGuard";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { userDb, taskDb, subscriberDb, crmDb, orgDb } from "../services/db";
@@ -3052,15 +3052,18 @@ router.post("/announcements/load-from-url", async (req, res) => {
     console.log(`🔽 Fetching HTML content from: ${url}`);
 
     // Fetch the HTML content
-    const response = await axios.get(url, {
-      timeout: 15000, // 15 seconds timeout
-      responseType: "text",
-      headers: {
-        "User-Agent": "AgentWeb-Backend/1.0",
-      },
-    });
-
-    const html = response.data as string;
+    // ENG-2425: SSRF-safe (DNS-pinned, per-hop re-validated, size-capped).
+    let html: string;
+    try {
+      html = await fetchPublicHtml(url);
+    } catch (fetchErr) {
+      if (fetchErr instanceof SsrfBlockedError) {
+        return res
+          .status(400)
+          .json({ success: false, message: "URL must point to a public internet address" });
+      }
+      throw fetchErr;
+    }
     console.log(`✅ Successfully fetched HTML, length: ${html.length}`);
 
     // Extract title from <title> tag
@@ -5044,15 +5047,18 @@ router.post("/subscription-types", async (req, res) => {
         const { validateLlmUsagePolicy } = await import('../services/llmUsagePolicyService');
         const { getModelPrice } = await import('../utils/llmPricing');
         const { agentModeService } = await import('../services/agentModeService');
+        // Stored policies may hold a renamed model's legacy id; runtime filters drop it, so
+        // canonicalise before validating (and store the canonical id).
+        const canonicalModelId = (model: unknown): string => agentModeService.normalizeModelId(String(model).trim());
         normalizedLlmUsagePolicy = {
           version: String(type.llmUsagePolicy.version || '').trim(),
           enforcementState: type.llmUsagePolicy.enforcementState,
           optimizationCostThresholdMicroUsd: Number(type.llmUsagePolicy.optimizationCostThresholdMicroUsd),
           hardCostThresholdMicroUsd: Number(type.llmUsagePolicy.hardCostThresholdMicroUsd),
           optimizedModelIds: Array.isArray(type.llmUsagePolicy.optimizedModelIds)
-            ? [...new Set(type.llmUsagePolicy.optimizedModelIds.map((model: unknown) => String(model).trim()).filter(Boolean))]
+            ? [...new Set(type.llmUsagePolicy.optimizedModelIds.map(canonicalModelId).filter(Boolean))]
             : [],
-          optimizedDefaultModel: String(type.llmUsagePolicy.optimizedDefaultModel || '').trim(),
+          optimizedDefaultModel: canonicalModelId(type.llmUsagePolicy.optimizedDefaultModel || ''),
           // ENG-1214 AC5. Carried through RAW and only when present.
           //
           // Raw, because `validateLlmUsagePolicy` rejects a present-but-invalid

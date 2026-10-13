@@ -235,7 +235,7 @@ export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig
   // behind), llama-3.1-8b-instruct (older sibling of the same superseded
   // family), qwen3.7-flash (no coding-benchmark coverage — it's vision-language,
   // not a coding model — and its pricing tiers up sharply past 32K-token
-  // prompts). qwen3.8-max is KEPT despite losing head-to-head to grok-4.6 at
+  // prompts). qwen3.8-max (now its -0902 snapshot, see below) is KEPT despite losing head-to-head to grok-4.6 at
   // the same $2/$6 price — it's Alibaba's only current non-deprecated entrant
   // (Qwen3.7 Max is independently confirmed deprecated too), so it stays for
   // lab/family redundancy, not because it's the top pick in its tier.
@@ -308,7 +308,10 @@ export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig
   // Reasoning, Max Effort variant. The prior 2026-08-19 source used 0423;
   // this benchmark snapshot does not change the OpenRouter id or pricing.
   'openrouter/deepseek/deepseek-v4-flash': {"name":"DeepSeek V4 Flash","provider":"deepseek","tier":"ultra_cheap","description":"Maximum efficiency for high-volume work","client":null,"supportsTemperature":true,"qualityScore":34.3,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, deepseek-v4-flash (https://artificialanalysis.ai/)","family":"deepseek-flash"},
-  'openrouter/qwen/qwen3.8-max': {"name":"Qwen3.8 Max","provider":"qwen","tier":"pro","description":"Alibaba's flagship model","client":null,"supportsTemperature":true,"qualityScore":40,"qualityScoreSource":"Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Qwen3.8 Max, reasoning","family":"qwen-max"},
+  // Renamed 2026-10-09: OpenRouter dropped the bare `qwen/qwen3.8-max` id from its catalog and now
+  // lists only the snapshot `qwen/qwen3.8-max-0902` (canonical qwen/qwen3.8-max-20260902), same
+  // $2/$6 price. The old id lives on as a LEGACY_MODEL_ALIASES entry so existing pins keep working.
+  'openrouter/qwen/qwen3.8-max-0902': {"name":"Qwen3.8 Max","provider":"qwen","tier":"pro","description":"Alibaba's flagship model","client":null,"supportsTemperature":true,"qualityScore":40,"qualityScoreSource":"Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Qwen3.8 Max, reasoning","family":"qwen-max"},
   // 2026-08-26 (ENG-1604): added after live cost+quality research — AA
   // Intelligence Index 52 (v4.1.1, measured, not estimated), #1 of 138
   // models in its size class, roughly matching DeepSeek V4 Pro's quality
@@ -408,6 +411,30 @@ export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig
   'anthropic.claude-sonnet-5': {"name":"Claude Sonnet 5","family":"claude-sonnet","provider":"anthropic","tier":"medium","description":"Most efficient for everyday tasks","client":null,"supportsTemperature":false,"supportsVision":true,"qualityScore":38.2,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-sonnet-5 (https://artificialanalysis.ai/)"},
   // Haiku 4.5 still accepts temperature (also live-verified).
   'anthropic.claude-haiku-4-5-20251001-v1:0': {"name":"Claude Haiku 4.5","provider":"anthropic","tier":"cheap","description":"Fastest for quick answers","client":null,"supportsTemperature":true,"supportsVision":true,"qualityScore":15,"qualityScoreSource":"Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Claude Haiku 4.5, Non-reasoning","family":"claude-haiku"},
+};
+
+// Legacy model ids persisted by sessions/schedules created before a model was
+// renamed or fully retired. Maps the old id to its current registry key so old
+// sessions/schedules keep working instead of throwing "Invalid model". Opus 4.8
+// was renamed from the bare Vertex id "claude-opus-4-8" to the Bedrock id
+// "anthropic.claude-opus-4-8" in commit c86c8ec1. gpt-5-chat-2 and gpt-5.2-chat
+// were removed from the registry 2026-08-19 (Azure deployment retired/deprecated
+// during the migration off the Rui-owned Azure resource — see the registry
+// comment above the gpt-5.4 entry) and redirected to gpt-5.5, the current
+// non-legacy top of the same gpt5-chat family.
+export const LEGACY_MODEL_ALIASES: Record<string, string> = {
+  'claude-opus-4-8': 'anthropic.claude-opus-4-8',
+  'gpt-5-chat-2': 'gpt-5.5',
+  'gpt-5.2-chat': 'gpt-5.5',
+  'gemini-2.5-flash': 'gemini-3.1-flash-lite',
+  // ENG-2178: schedules created before the OpenRouter migration pin the bare
+  // "gpt-4o-mini" id; the same model is now served via OpenRouter.
+  'gpt-4o-mini': 'openrouter/openai/gpt-4o-mini',
+  // OpenRouter retired the bare `qwen/qwen3.8-max` catalog id in favour of the
+  // dated snapshot `qwen/qwen3.8-max-0902` (same price). Compare's served-model
+  // check rightly refuses the snapshot slug for the bare id, so pins move forward.
+  // Mirrored in the portal's LEGACY_MODEL_ALIAS_IDS (src/lib/modelUnavailable.ts).
+  'openrouter/qwen/qwen3.8-max': 'openrouter/qwen/qwen3.8-max-0902',
 };
 
 /**

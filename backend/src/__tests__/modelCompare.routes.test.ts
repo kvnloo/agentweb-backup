@@ -251,3 +251,53 @@ describe('compare -> select round trip over HTTP', () => {
     expect(mockAddMessages).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('ENG-113 real controller wiring: saved alternatives round trip over HTTP', () => {
+  let clock = Date.now() + 100 * 60_000;
+  beforeEach(() => {
+    clock += 10 * 60_000; // expire the module-level 60s switch cache between tests
+    jest.spyOn(Date, 'now').mockImplementation(() => clock);
+    mockAddMessages.mockImplementation(async (_id: string, msgs: any[]) => ({
+      messages: [...ownedSession.messages, ...msgs.map((m, i) => ({ ...m, messageIndex: 3 + i }))],
+    }));
+  });
+  const switchRow = (value: string | null) =>
+    mockGetSetting.mockImplementation(async (name: string) =>
+      name === 'compare_save_alternatives' && value !== null ? { settingValue: value } : null);
+  const select = async (value: string | null, mutate: (b: any) => any = (b) => b) => {
+    switchRow(value);
+    const compare = await request(app).post('/api/agent-mode/compare').set('Authorization', bearer('owner')).send(validBody);
+    expect(typeof compare.body.alternativesToken).toBe('string');
+    const [chosen, other] = compare.body.results;
+    const body = mutate({
+      sessionId: 's-1', compareId: compare.body.compareId, prompt: compare.body.prompt, model: chosen.model,
+      content: chosen.content, issuedAt: compare.body.issuedAt, selectToken: chosen.selectToken,
+      alternatives: [{ model: other.model, content: other.content, latencyMs: other.latencyMs }],
+      alternativesToken: compare.body.alternativesToken,
+    });
+    const out = await request(app).post('/api/agent-mode/compare/select').set('Authorization', bearer('owner')).send(body);
+    return { out, other, compare };
+  };
+
+  it("switch 'true': the unchosen answer is stored on the assistant row with registry name/provider; the response carries it for the owner", async () => {
+    const { out, other } = await select('true');
+    expect(out.status).toBe(200);
+    const stored = mockAddMessages.mock.calls[0][1][1];
+    expect(stored.metadata.compareAlternatives).toEqual([
+      { model: other.model, name: other.model, provider: 'other', content: other.content, latencyMs: expect.any(Number) },
+    ]);
+    expect(stored.metadata.compareId).toBeDefined();
+    expect(out.body.messages[1].metadata.compareAlternatives).toHaveLength(1);
+  });
+  it.each([[null], ['false'], ['TRUE']])("switch %j: nothing is stored, select succeeds", async (value) => {
+    const { out } = await select(value);
+    expect(out.status).toBe(200);
+    expect(mockAddMessages.mock.calls[0][1][1].metadata).not.toHaveProperty('compareAlternatives');
+    expect(mockAddMessages.mock.calls[0][1][1].metadata).not.toHaveProperty('compareId');
+  });
+  it('a tampered alternative over HTTP is ignored, the chosen answer still persists', async () => {
+    const { out } = await select('true', (b) => ({ ...b, alternatives: [{ ...b.alternatives[0], content: 'forged' }] }));
+    expect(out.status).toBe(200);
+    expect(JSON.stringify(mockAddMessages.mock.calls[0][1])).not.toContain('forged');
+  });
+});

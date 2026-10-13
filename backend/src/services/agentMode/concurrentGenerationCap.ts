@@ -92,6 +92,17 @@ export async function acquireInteractiveGenerationSlot(
   };
 }
 
+/**
+ * ENG-110: ids of the CALLER's sessions that currently hold an interactive generation slot on this instance.
+ * Reads only `active.get(userId)`: other users' entries are never iterated or returned. A slot is added on claim
+ * and removed by release() in the handler's `finally`, so this cannot leak past a run (success, throw, timeout).
+ * During an Immutable deploy overlap another instance's runs are invisible (accepted).
+ */
+export function getGeneratingSessionIdsForUser(userId: string): string[] {
+  const sessions = active.get(userId);
+  return sessions ? [...sessions.keys()] : [];
+}
+
 export function buildTooManyRunsBody(current: number, limit: number) {
   return {
     error: 'Too many concurrent runs',

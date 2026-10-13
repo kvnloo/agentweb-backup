@@ -145,6 +145,10 @@ const TRANSIENT_MESSAGE_PATTERNS = [
   /econnreset/i,
   /etimedout/i,
   /socket hang up/i,
+  // ENG-2427: node-fetch/undici stream cut mid-body — "Invalid response body while
+  // trying to fetch <url>: Premature close". Same class as a socket hang up.
+  /premature close/i,
+  /invalid response body/i,
   /aborted.*timeout/i,
   /TimeoutError/i,
   /request aborted/i,
