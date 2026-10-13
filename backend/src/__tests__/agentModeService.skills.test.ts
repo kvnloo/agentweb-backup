@@ -1285,6 +1285,24 @@ describe('AgentModeService - Skills', () => {
       expect(toolNames).not.toContain('you_search_web');
     });
 
+    /*
+     * A caller that already resolved the entitlement to null (unresolved) passes that null as the
+     * third argument. It must be honoured, not treated as "not provided": re-fetching would read
+     * the tier a second time per turn, double-report the telemetry, and could resolve differently
+     * from the value the caller already used to build its own tool context.
+     */
+    it('should not re-fetch the entitlement when the caller passes an explicit null', async () => {
+      const { getAllowedSkills, resolveSkillsToToolNames } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockClear();
+      (resolveSkillsToToolNames as jest.Mock).mockResolvedValueOnce(null);
+
+      const result = await agentModeService.getFilteredTools('user-123', undefined, null);
+
+      expect(getAllowedSkills).not.toHaveBeenCalled();
+      expect(resolveSkillsToToolNames).toHaveBeenLastCalledWith(null, 'user-123');
+      expect(result.map((t: any) => t.function?.name || t.name)).toEqual(['install_skills']);
+    });
+
     it('should use precomputed allowed names when provided', async () => {
       const precomputedNames = new Set(['install_skills', 'read_brand_guidelines']);
 
