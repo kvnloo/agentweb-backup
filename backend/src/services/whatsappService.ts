@@ -238,6 +238,27 @@ export async function bindPhoneToUser(phone: string, userId: string): Promise<vo
 }
 
 /**
+ * Claim a number for an account, atomically. Two accounts racing for one number cannot
+ * both win: the first conditional put takes it. A row left behind by an account that no
+ * longer holds the number (resolveUserIdByPhone heals those) does not block a new owner.
+ */
+export async function claimPhoneForUser(
+  phone: string,
+  userId: string,
+): Promise<'claimed' | 'already_yours' | 'held_by_other'> {
+  const desc = 'WhatsApp sender identity (phone -> user)';
+  const tryClaim = () => settingsService.setSettingIfAbsent(phoneUserKey(phone), userId, desc, 'system');
+  if (await tryClaim()) return 'claimed';
+  const existing = await settingsService.getSetting(phoneUserKey(phone));
+  if (existing?.settingValue === userId) return 'already_yours';
+  // Held by someone else per the row: only if that account really still has the number.
+  const holder = await resolveUserIdByPhone(phone);
+  if (holder && holder !== userId) return 'held_by_other';
+  // Stale row (now healed) or vanished: one more atomic attempt.
+  return (await tryClaim()) ? 'claimed' : 'held_by_other';
+}
+
+/**
  * Remove the phone -> user row.
  *
  * With `onlyIfUserId`, the row is removed only if it still points at that account, in one

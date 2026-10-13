@@ -197,9 +197,32 @@ export async function handleUnrecognizedMessage(
   text: string,
   messageType: string = 'text',
   mediaDetail: string = '',
+  messageId?: string,
 ): Promise<void> {
   // A reaction or a delivery artefact is not someone asking for help.
   if (!['text', 'image', 'document', 'audio', 'video'].includes(messageType)) return;
+
+  // Meta redelivers a whole payload when any message in it fails, and can deliver the
+  // same message twice. Claim the message id first so a redelivery cannot forward it, or
+  // greet the sender, a second time. A failed claim write fails open: better a duplicate
+  // than a lost customer message.
+  if (messageId) {
+    try {
+      const first = await settingsService.setSettingIfAbsent(
+        `whatsapp:inbound-msg:${messageId}`,
+        '1',
+        'WhatsApp inbound message already handled (dedupe)',
+        'system',
+        Math.floor(Date.now() / 1000) + 24 * 60 * 60,
+      );
+      if (!first) return;
+    } catch (e) {
+      console.warn(
+        '[whatsapp-support] could not record the message id; continuing:',
+        e instanceof Error ? e.message : e,
+      );
+    }
+  }
 
   await forwardToTeam(phone, text, messageType, mediaDetail).catch((e) =>
     console.warn(

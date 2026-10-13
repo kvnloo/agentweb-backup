@@ -64,7 +64,9 @@ const BODY_BUDGET = 1000; // interactive body limit is 1024; leave headroom
  * pointed at AgentWeb instead.
  */
 export function approvalMessageText(assetType: string, filename: string, assetUrl: string): string {
-  const name = filename.length > 80 ? `${filename.slice(0, 79)}…` : filename;
+  // By code point, not UTF-16 unit: slicing inside an emoji leaves a lone surrogate Meta may reject.
+  const points = Array.from(filename);
+  const name = points.length > 80 ? `${points.slice(0, 79).join('')}…` : filename;
   const head = `${assetType} "${name}" is waiting for your approval.`;
   const full = `${head} ${assetUrl}`;
   return full.length <= BODY_BUDGET ? full : `${head} Open AgentWeb to review it.`;
@@ -269,7 +271,21 @@ export async function handleApprovalButtonTap(params: {
     const verdict = VERDICTS[params.action.trim().toLowerCase()];
     if (!verdict) return; // Not an approval button — nothing to do.
 
-    const ref = await lookupApprovalMessage(params.approvalMessageId);
+    let ref: Awaited<ReturnType<typeof lookupApprovalMessage>>;
+    let senderUserId: string | null;
+    try {
+      ref = await lookupApprovalMessage(params.approvalMessageId);
+      senderUserId = ref ? await resolveUserIdByPhone(params.phone) : null;
+    } catch (error) {
+      // A storage blip while reading the correlation. Meta gets a 200 either way (this
+      // handler never throws), so say so rather than leave the customer wondering.
+      console.error(
+        '[approval-notify] could not read an approval tap:',
+        error instanceof Error ? error.message : error,
+      );
+      await sendText(params.phone, COULD_NOT_RECORD).catch(() => {});
+      return;
+    }
     if (!ref) {
       // Expired (30-day TTL), or the correlation row was never written (it is best-effort).
       // The button id came from a message of ours, so answer rather than going quiet: with
@@ -281,7 +297,6 @@ export async function handleApprovalButtonTap(params: {
       return;
     }
 
-    const senderUserId = await resolveUserIdByPhone(params.phone);
     if (!senderUserId || senderUserId !== ref.userId) {
       console.warn(
         `[approval-notify] tap from ${redactPhone(params.phone)} does not own that approval — ignored`,
@@ -292,7 +307,7 @@ export async function handleApprovalButtonTap(params: {
     const { approvalDb } = await import('./approvalDb');
     let outcome;
     try {
-      outcome = await approvalDb.answerIfOpen(ref.assetUrl, verdict, `whatsapp:${ref.userId}`);
+      outcome = await approvalDb.answerIfOpen(ref.assetUrl, verdict, `whatsapp:${ref.userId}`, ref.userId);
     } catch (error) {
       // A real failure, not "already answered". Say so rather than staying silent: with
       // no visible state on a WhatsApp button, silence reads as success.
@@ -305,7 +320,11 @@ export async function handleApprovalButtonTap(params: {
     }
 
     if (!outcome.answered) {
-      await sendText(params.phone, alreadyAnsweredReply(outcome.current)).catch(() => {});
+      // Still open but refused: the record now belongs to someone else (another account
+      // re-requested the same asset), so these buttons no longer point at this customer's
+      // approval. Say it is gone rather than "already answered".
+      const stale = outcome.current === 'pending' || outcome.current === 'needs_changes';
+      await sendText(params.phone, alreadyAnsweredReply(stale ? null : outcome.current)).catch(() => {});
       return;
     }
 

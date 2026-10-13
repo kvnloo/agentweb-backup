@@ -44,7 +44,7 @@ jest.mock('../services/whatsappService', () => ({
   redactPhone: jest.requireActual('../services/whatsappService').redactPhone,
   isOptedOut: jest.fn(),
   sendMessage: jest.fn(),
-  bindPhoneToUser: jest.fn(),
+  claimPhoneForUser: jest.fn(),
   unbindPhone: jest.fn(),
   resolveUserIdByPhone: jest.fn(),
 }));
@@ -57,6 +57,7 @@ import {
   startVerification,
   completeVerification,
   getVerificationStatus,
+  disconnectWhatsApp,
   handleVerificationMessage,
   parseVerificationMessage,
 } from '../services/whatsappVerificationService';
@@ -110,6 +111,7 @@ beforeEach(() => {
   });
   whatsapp.isOptedOut.mockResolvedValue(false);
   whatsapp.resolveUserIdByPhone.mockResolvedValue(null);
+  whatsapp.claimPhoneForUser.mockResolvedValue('claimed');
   whatsapp.sendMessage.mockResolvedValue({ messageId: 'wamid.OUT' });
 
   logSpies = (['log', 'warn', 'error', 'info'] as const).map((m) =>
@@ -251,7 +253,7 @@ describe('completeVerification — one platform per customer', () => {
 
     await expect(completeVerification(code, PHONE)).resolves.toBe('other_platform');
     expect(users.get('u1').messagingChannels).toBeUndefined();
-    expect(whatsapp.bindPhoneToUser).not.toHaveBeenCalled();
+    expect(whatsapp.claimPhoneForUser).not.toHaveBeenCalled();
     await expect(getVerificationStatus('u1')).resolves.toEqual({
       state: 'refused',
       reason: 'other_platform',
@@ -518,7 +520,7 @@ describe('completeVerification — one number, one account', () => {
 
     await expect(completeVerification(code, PHONE)).resolves.toBe('number_in_use');
     expect(users.get('u1').messagingChannels).toBeUndefined();
-    expect(whatsapp.bindPhoneToUser).not.toHaveBeenCalled();
+    expect(whatsapp.claimPhoneForUser).not.toHaveBeenCalled();
     expect(rowFor(code).status).toBe('refused');
     // The portal is told why, instead of polling "waiting" until the code expires.
     await expect(getVerificationStatus('u1')).resolves.toEqual({
@@ -558,7 +560,7 @@ describe('completeVerification — the phone -> user index', () => {
   it('writes the index so an inbound tap from this number resolves to its owner', async () => {
     const code = await begin();
     await completeVerification(code, PHONE);
-    expect(whatsapp.bindPhoneToUser).toHaveBeenCalledWith(PHONE, 'u1');
+    expect(whatsapp.claimPhoneForUser).toHaveBeenCalledWith(PHONE, 'u1');
   });
 
   it('clears the previous number when a user re-verifies with a different one', async () => {
@@ -579,7 +581,7 @@ describe('completeVerification — the phone -> user index', () => {
     await completeVerification(code, PHONE);
 
     expect(whatsapp.unbindPhone).toHaveBeenCalledWith(OTHER, 'u1');
-    expect(whatsapp.bindPhoneToUser).toHaveBeenCalledWith(PHONE, 'u1');
+    expect(whatsapp.claimPhoneForUser).toHaveBeenCalledWith(PHONE, 'u1');
   });
 
   it('does not clear the index when the same number re-verifies', async () => {
@@ -599,12 +601,60 @@ describe('completeVerification — the phone -> user index', () => {
     expect(whatsapp.unbindPhone).not.toHaveBeenCalled();
   });
 
-  it('still verifies when the index write fails', async () => {
-    // The index is a cache. Losing it degrades inbound actions; it must not fail a
-    // verification the customer already completed.
-    whatsapp.bindPhoneToUser.mockRejectedValueOnce(new Error('dynamo down'));
+  it('refuses, and saves nothing, when another account wins the number at the moment of the claim', async () => {
+    // The holder check above is a read; two accounts racing for one number can both pass
+    // it. The claim is atomic, so exactly one gets the number.
+    whatsapp.claimPhoneForUser.mockResolvedValueOnce('held_by_other');
+    const code = await begin();
+    await expect(completeVerification(code, PHONE)).resolves.toBe('number_in_use');
+    expect(users.get('u1').messagingChannels).toBeUndefined();
+    await expect(getVerificationStatus('u1')).resolves.toEqual({ state: 'refused', reason: 'number_in_use' });
+  });
+
+  it('claims the number BEFORE writing the user record', async () => {
+    const order: string[] = [];
+    whatsapp.claimPhoneForUser.mockImplementationOnce(async () => {
+      order.push('claim');
+      return 'claimed';
+    });
+    const realUpdate = (userDb.updateUser as jest.Mock).getMockImplementation();
+    (userDb.updateUser as jest.Mock).mockImplementationOnce(async (...a: any[]) => {
+      order.push('save');
+      return realUpdate ? realUpdate(...a) : undefined;
+    });
+    const code = await begin();
+    await completeVerification(code, PHONE);
+    expect(order).toEqual(['claim', 'save']);
+  });
+
+  it('a storage error while claiming surfaces (the webhook 500s and Meta retries)', async () => {
+    whatsapp.claimPhoneForUser.mockRejectedValueOnce(new Error('dynamo down'));
+    const code = await begin();
+    await expect(completeVerification(code, PHONE)).rejects.toThrow('dynamo down');
+    expect(users.get('u1').messagingChannels).toBeUndefined();
+  });
+});
+
+describe('disconnectWhatsApp clears the verification state', () => {
+  it('the portal stops showing the number as connected, and the old code cannot be replayed', async () => {
     const code = await begin();
     await expect(completeVerification(code, PHONE)).resolves.toBe('verified');
+    await expect(getVerificationStatus('u1')).resolves.toMatchObject({ state: 'verified' });
+
+    await disconnectWhatsApp('u1');
+
+    await expect(getVerificationStatus('u1')).resolves.toEqual({ state: 'none' });
+    // Replaying the same code finds nothing: it reads as an unknown code, not "already verified".
+    await expect(completeVerification(code, PHONE)).resolves.toBe('invalid');
+    expect(users.get('u1').messagingChannels).toEqual([]);
+  });
+
+  it('still disconnects when clearing the verification rows fails', async () => {
+    const code = await begin();
+    await completeVerification(code, PHONE);
+    settingsService.deleteSetting.mockRejectedValueOnce(new Error('dynamo down'));
+    await expect(disconnectWhatsApp('u1')).resolves.toMatchObject({ removed: PHONE });
+    expect(users.get('u1').messagingChannels).toEqual([]);
   });
 });
 

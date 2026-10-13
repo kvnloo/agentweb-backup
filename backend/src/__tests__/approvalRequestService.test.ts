@@ -19,6 +19,7 @@ jest.mock('../services/approvalDb', () => ({
     deleteApproval: jest.fn(),
     getApproval: jest.fn(),
     restoreApproval: jest.fn(),
+    deleteApprovalIfUnanswered: jest.fn(),
   },
 }));
 jest.mock('../services/db', () => ({
@@ -73,9 +74,10 @@ beforeEach(() => {
   });
   approvalDb.createApproval.mockImplementation(async (a: any) => {
     calls.push('record');
-    return a;
+    return { ...a, createdAt: 'T-OURS' };
   });
   approvalDb.deleteApproval.mockResolvedValue(true);
+  approvalDb.deleteApprovalIfUnanswered.mockResolvedValue(undefined);
   approvalDb.restoreApproval.mockResolvedValue(undefined);
   approvalDb.getApproval.mockResolvedValue(null);
   taskDb.getTaskExecutionById.mockResolvedValue({ executionId: 'exec-1', userId: 'user-1' });
@@ -115,7 +117,7 @@ describe('a customer on Slack', () => {
     mockPostMessage.mockRejectedValue(new Error('not_in_channel'));
     await expect(requestApproval(request)).rejects.toThrow('not_in_channel');
     expect(approvalDb.createApproval).not.toHaveBeenCalled();
-    expect(approvalDb.deleteApproval).not.toHaveBeenCalled();
+    expect(approvalDb.deleteApprovalIfUnanswered).not.toHaveBeenCalled();
   });
 
   it('reports a failed Slack post as a typed delivery failure when the caller asks for it', async () => {
@@ -190,7 +192,7 @@ describe('a customer on WhatsApp', () => {
       ApprovalDeliveryFailedError,
     );
     // An approval nobody was shown can never be answered.
-    expect(approvalDb.deleteApproval).toHaveBeenCalledWith(request.imageUrl);
+    expect(approvalDb.deleteApprovalIfUnanswered).toHaveBeenCalledWith(request.imageUrl, 'T-OURS');
   });
 
   it('puts an EARLIER verdict back when a re-request reaches nobody', async () => {
@@ -200,8 +202,8 @@ describe('a customer on WhatsApp', () => {
     await expect(requestApproval({ ...request, channel: undefined })).rejects.toBeInstanceOf(
       ApprovalDeliveryFailedError,
     );
-    expect((approvalDb.restoreApproval as jest.Mock).mock.calls[0][0]).toBe(earlier);
-    expect(approvalDb.deleteApproval).not.toHaveBeenCalled();
+    expect((approvalDb.restoreApproval as jest.Mock).mock.calls[0]).toEqual([earlier, 'T-OURS']);
+    expect(approvalDb.deleteApprovalIfUnanswered).not.toHaveBeenCalled();
   });
 
   it('deletes the unsent record when there was no earlier one', async () => {
@@ -221,12 +223,12 @@ describe('a customer on WhatsApp', () => {
 
   it('keeps the approval when it was delivered', async () => {
     await requestApproval({ ...request, channel: undefined });
-    expect(approvalDb.deleteApproval).not.toHaveBeenCalled();
+    expect(approvalDb.deleteApprovalIfUnanswered).not.toHaveBeenCalled();
   });
 
   it('is still failed when removing the unsent record also fails', async () => {
     notifyApprovalOnWhatsApp.mockResolvedValue('failed');
-    approvalDb.deleteApproval.mockRejectedValue(new Error('dynamo down'));
+    approvalDb.deleteApprovalIfUnanswered.mockRejectedValue(new Error('dynamo down'));
     await expect(requestApproval({ ...request, channel: undefined })).rejects.toBeInstanceOf(
       ApprovalDeliveryFailedError,
     );
@@ -286,7 +288,7 @@ describe('ownership of what is being approved', () => {
     approvalDb.getApproval.mockResolvedValue({ assetUrl: request.imageUrl, userId: 'victim', status: 'approved' });
     await expect(requestApproval(mine)).rejects.toBeInstanceOf(ApprovalForbiddenError);
     expect(approvalDb.createApproval).not.toHaveBeenCalled();
-    expect(approvalDb.deleteApproval).not.toHaveBeenCalled();
+    expect(approvalDb.deleteApprovalIfUnanswered).not.toHaveBeenCalled();
     expect(notifyApprovalOnWhatsApp).not.toHaveBeenCalled();
   });
 

@@ -214,7 +214,7 @@ export async function requestApproval(
     if (approval) {
       const undo = previousApproval
         ? approvalDb.restoreApproval(previousApproval, approval.createdAt)
-        : approvalDb.deleteApproval(request.imageUrl).then(() => undefined);
+        : approvalDb.deleteApprovalIfUnanswered(request.imageUrl, approval.createdAt);
       await undo.catch((e) =>
         console.warn('[approval-request] could not undo unsent approval:', e?.message || e),
       );

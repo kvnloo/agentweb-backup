@@ -83,6 +83,14 @@ describe('POST /api/slack/send-approval channel entitlement (ENG-2413)', () => {
     expect(sendApprovalRequestWithTracking).toHaveBeenCalledWith(expect.objectContaining({ channel: '' }));
   });
 
+  it('answers 403, not 500, when the approval belongs to another account', async () => {
+    const err = Object.assign(new Error('That asset belongs to a different account.'), {
+      name: 'ApprovalForbiddenError',
+    });
+    (sendApprovalRequestWithTracking as jest.Mock).mockRejectedValue(err);
+    await request(app).post('/api/slack/send-approval').send(body('C_OWN')).expect(403);
+  });
+
   it('allows a real admin to any channel without resolving the allowlist', async () => {
     mockUser = { userId: 'u1', isAdmin: true };
     await request(app).post('/api/slack/send-approval').send(body('C_OTHER')).expect(200);

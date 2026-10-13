@@ -40,6 +40,7 @@ import {
   sendOptOutConfirmation,
   OPT_OUT_CONFIRMATION,
   bindPhoneToUser,
+  claimPhoneForUser,
   unbindPhone,
   resolveUserIdByPhone,
   sendInteractiveButtons,
@@ -52,6 +53,7 @@ jest.mock('../services/settingsService', () => ({
     setSetting: jest.fn(),
     deleteSetting: jest.fn(),
     deleteSettingIfValueMatches: jest.fn(),
+    setSettingIfAbsent: jest.fn(),
   },
 }));
 jest.mock('../utils/secretsManager', () => ({
@@ -712,6 +714,44 @@ describe('phone -> user index', () => {
       expect.any(String),
       'system',
     );
+  });
+
+  describe('claimPhoneForUser', () => {
+    it('takes a free number with one atomic put-if-absent', async () => {
+      (settingsService.setSettingIfAbsent as jest.Mock).mockResolvedValue(true);
+      await expect(claimPhoneForUser(PHONE, 'user-1')).resolves.toBe('claimed');
+      expect(settingsService.setSettingIfAbsent).toHaveBeenCalledWith(KEY, 'user-1', expect.any(String), 'system');
+    });
+
+    it('recognises its own earlier claim (a retried verification)', async () => {
+      (settingsService.setSettingIfAbsent as jest.Mock).mockResolvedValue(false);
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({ settingValue: 'user-1' });
+      await expect(claimPhoneForUser(PHONE, 'user-1')).resolves.toBe('already_yours');
+    });
+
+    it('refuses a number another account still really holds', async () => {
+      (settingsService.setSettingIfAbsent as jest.Mock).mockResolvedValue(false);
+      (settingsService.getSetting as jest.Mock)
+        .mockResolvedValueOnce({ settingValue: 'user-2' }) // the claim row
+        .mockResolvedValueOnce({ settingValue: 'user-2' }); // resolveUserIdByPhone's read
+      (userDb.getUserById as jest.Mock).mockResolvedValue(boundUser());
+      await expect(claimPhoneForUser(PHONE, 'user-1')).resolves.toBe('held_by_other');
+    });
+
+    it('takes over a stale row whose account no longer has the number, with a second atomic attempt', async () => {
+      (settingsService.setSettingIfAbsent as jest.Mock).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({ settingValue: 'user-2' });
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user-2', messagingChannels: [] });
+      await expect(claimPhoneForUser(PHONE, 'user-1')).resolves.toBe('claimed');
+      expect(settingsService.setSettingIfAbsent).toHaveBeenCalledTimes(2);
+    });
+
+    it('loses cleanly when a racing account wins the second attempt too', async () => {
+      (settingsService.setSettingIfAbsent as jest.Mock).mockResolvedValue(false);
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({ settingValue: 'user-2' });
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user-2', messagingChannels: [] });
+      await expect(claimPhoneForUser(PHONE, 'user-1')).resolves.toBe('held_by_other');
+    });
   });
 
   it('clears the index', async () => {

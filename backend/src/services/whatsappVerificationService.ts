@@ -38,7 +38,7 @@ import { userDb } from './db';
 import { explicitChannels, type UserMessagingChannelConfig } from './messagingChannelService';
 import { hasOwnSlack } from './customerChannelPolicy';
 import {
-  bindPhoneToUser,
+  claimPhoneForUser,
   isOptedOut,
   redactPhone,
   resolveUserIdByPhone,
@@ -221,9 +221,12 @@ async function recordFailure(phone: string): Promise<VerificationOutcome> {
 }
 
 /** Idempotent: safe to run again when a claimed verification is resumed on a retry. */
-async function saveVerifiedChannel(row: VerificationRow, phone: string): Promise<boolean> {
+async function saveVerifiedChannel(
+  row: VerificationRow,
+  phone: string,
+): Promise<'saved' | 'no_user' | 'number_in_use'> {
   const user = await userDb.getUserById(row.userId);
-  if (!user) return false;
+  if (!user) return 'no_user';
 
   // Start from EXPLICIT entries only — see explicitChannels.
   const existing = explicitChannels(user as any);
@@ -239,26 +242,28 @@ async function saveVerifiedChannel(row: VerificationRow, phone: string): Promise
       verifiedAt: new Date().toISOString(),
     },
   };
+  // Take the number in the phone -> user index FIRST, atomically. Checking for a holder
+  // and then writing let two accounts racing for one number both pass. A claim left
+  // behind by a save that then failed is harmless: this same account re-claims it on the
+  // retry, and resolveUserIdByPhone ignores (and heals) a row whose account lacks the number.
+  if ((await claimPhoneForUser(phone, row.userId)) === 'held_by_other') return 'number_in_use';
+
   await userDb.updateUser(row.userId, { messagingChannels: [...others, entry] } as any);
 
-  // Maintain the phone -> user index that inbound actions resolve through. Written
-  // AFTER the user record, so the index can never point at a binding that does not yet
-  // exist; the reverse order would briefly resolve an inbound tap to an account that
-  // has not been given the number.
+  // Release the number the account is replacing. Without this the old number keeps
+  // resolving to them and could answer their approvals.
   try {
     if (previousPhone && previousPhone !== phone) {
       // The user replaced their number. Without this, the old number keeps resolving to
       // them and could answer their approvals.
       await unbindPhone(previousPhone, row.userId);
     }
-    await bindPhoneToUser(phone, row.userId);
   } catch (e: any) {
-    // Non-fatal: sending still works, only inbound actions degrade, and
-    // resolveUserIdByPhone fails closed when the row is missing. try/catch rather than
-    // .catch() so this cannot itself throw on a non-promise return.
-    console.warn('[whatsapp-verify] could not maintain phone index:', e?.message || e);
+    // Non-fatal: the new number is already claimed and saved; a stale old-number row is
+    // ignored by resolveUserIdByPhone, which re-checks the user record.
+    console.warn('[whatsapp-verify] could not release the previous number:', e?.message || e);
   }
-  return true;
+  return 'saved';
 }
 
 /**
@@ -344,7 +349,13 @@ export async function completeVerification(rawCode: string, sender: string): Pro
 
   // We hold the claim (fresh, or resumed after a crash). Save the channel, THEN mark the
   // code verified — so a failure in between is retried rather than lost.
-  if (!(await saveVerifiedChannel(row, phone))) return 'invalid';
+  const saved = await saveVerifiedChannel(row, phone);
+  if (saved === 'no_user') return 'invalid';
+  if (saved === 'number_in_use') {
+    // Lost the race for the number to another account. Retryable, like the other refusals.
+    await writeRow(hash, { ...row, status: 'refused', refusal: 'number_in_use', phone }).catch(() => {});
+    return 'number_in_use';
+  }
 
   const verifiedAt = new Date().toISOString();
   const expiresAt = new Date(Date.now() + CODE_TTL_MS).toISOString();
@@ -441,6 +452,17 @@ export async function disconnectWhatsApp(
     } catch (e: any) {
       console.warn('[whatsapp] could not clear phone index on disconnect:', e?.message || e);
     }
+  }
+
+  // Drop the verification state too. A verified code row stays valid for an hour, and
+  // without this the portal kept showing the old number as connected after a disconnect,
+  // and the customer could re-text the same code. They start a fresh verification instead.
+  try {
+    const pointer = await settingsService.getSetting(userKey(userId));
+    if (pointer?.settingValue) await settingsService.deleteSetting(codeKey(pointer.settingValue));
+    await settingsService.deleteSetting(userKey(userId));
+  } catch (e: any) {
+    console.warn('[whatsapp] could not clear verification state on disconnect:', e?.message || e);
   }
   return { removed, channels };
 }

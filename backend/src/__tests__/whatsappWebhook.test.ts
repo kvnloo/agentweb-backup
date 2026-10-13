@@ -243,6 +243,29 @@ describe('POST — inbound messages', () => {
     },
   );
 
+  it.each([
+    'Stop 🛑',
+    'stop 👋',
+    'ＳＴＯＰ',
+    'stop…',
+    '"stop"',
+    'STOP\u200b',
+    'Stop 。',
+    'stop  all',
+    '  STOP\n  ',
+  ])('treats %j as an opt-out (emoji, quotes, fullwidth and zero-width noise)', async (text) => {
+    await post(inboundPayload(text));
+    expect(recordOptOut).toHaveBeenCalledWith('+14155550123');
+  });
+
+  it.each(['cancel my order', 'please stop by the office tomorrow', "don't stop", 'stop 2 items', 'what is the end date'])(
+    'does NOT treat %j as an opt-out',
+    async (text) => {
+      await post(inboundPayload(text));
+      expect(recordOptOut).not.toHaveBeenCalled();
+    },
+  );
+
   it('logs a FAILED delivery receipt by message id and never opens a window', async () => {
     const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
     await post(statusPayload('failed'));
@@ -577,7 +600,7 @@ describe('POST — messages that are not commands', () => {
       }),
     );
     expect(handleUnrecognizedMessage).toHaveBeenCalledWith(
-      '+14155550123', 'my dashboard is broken', 'image', 'image, media id MEDIA-123',
+      '+14155550123', 'my dashboard is broken', 'image', 'image, media id MEDIA-123', 'wamid.M',
     );
   });
 
@@ -593,14 +616,14 @@ describe('POST — messages that are not commands', () => {
       }),
     );
     expect(handleUnrecognizedMessage).toHaveBeenCalledWith(
-      '+14155550123', '', 'document', 'document, file "invoice.pdf", media id MEDIA-9',
+      '+14155550123', '', 'document', 'document, file "invoice.pdf", media id MEDIA-9', 'wamid.D',
     );
   });
 
   it('gives plain text no media detail', async () => {
     (handleVerificationMessage as jest.Mock).mockResolvedValue(false);
     await post(inboundPayload('hi'));
-    expect(handleUnrecognizedMessage).toHaveBeenCalledWith('+14155550123', 'hi', 'text', '');
+    expect(handleUnrecognizedMessage).toHaveBeenCalledWith('+14155550123', 'hi', 'text', '', 'wamid.IN1');
   });
 
   it('does not greet someone who just sent a verification code', async () => {

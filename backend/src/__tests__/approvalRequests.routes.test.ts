@@ -60,6 +60,14 @@ it('asks for typed delivery failures so a Slack outage answers 502, not 500', as
   );
 });
 
+it('never takes a Slack channel from the body (the bot would post wherever it is pointed)', async () => {
+  await request(app)
+    .post('/api/approval-requests')
+    .send({ assetUrl: 'https://a/x.png', filename: 'x.png', channel: 'C_SOMEONE_ELSES', channelName: 'x' });
+  expect(svc.requestApproval.mock.calls[0][0].channel).toBeNull();
+  expect(svc.requestApproval.mock.calls[0][0]).not.toHaveProperty('channelName');
+});
+
 it('takes the user from the token, never from the body', async () => {
   await request(app)
     .post('/api/approval-requests')

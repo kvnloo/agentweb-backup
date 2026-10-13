@@ -30,11 +30,14 @@ for _name, _attrs in (("dotenv", {"load_dotenv": lambda *a, **k: None}),
 import slack_utils  # noqa: E402
 
 
-def _response(status, body=None):
+_OUR_404 = "<pre>Cannot POST /api/approval-requests</pre>"
+
+
+def _response(status, body=None, text=""):
     r = MagicMock()
     r.status_code = status
     r.json.return_value = body if body is not None else {}
-    r.text = str(body)
+    r.text = text or str(body)
     return r
 
 
@@ -79,12 +82,22 @@ class WithoutSlackTest(unittest.TestCase):
     def test_an_endpoint_that_does_not_exist_yet_is_no_channel_not_failed(self, _jwt):
         # The engine can be deployed before the backend. A 404 must not hold the results of
         # every approval-required task that has no Slack channel until the backend catches up.
-        with patch.object(slack_utils.requests, "post", return_value=_response(404, {})):
+        with patch.object(slack_utils.requests, "post", return_value=_response(404, {}, _OUR_404)):
             with self.assertLogs(slack_utils.logger, level="WARNING"):
                 self.assertEqual(_ask(), slack_utils.APPROVAL_NO_CHANNEL)
 
+    def test_a_404_that_is_not_our_missing_route_is_failed_and_holds(self, _jwt):
+        # A proxy, a wrong BACKEND_URL or a rolled-back route table also answer 404. That is not
+        # the backend saying nobody can be asked, so unreviewed output must not be released.
+        for body in ("", "<html>404 Not Found nginx</html>", '{"error":"Documentation not found"}'):
+            with patch.object(slack_utils.requests, "post", return_value=_response(404, {}, body)):
+                with self.assertLogs(slack_utils.logger, level="ERROR"):
+                    outcome = _ask()
+            self.assertEqual(outcome, slack_utils.APPROVAL_FAILED)
+            self.assertTrue(slack_utils.should_hold_results_for_approval(True, None, outcome))
+
     def test_that_404_is_released_by_the_hold_rule(self, _jwt):
-        with patch.object(slack_utils.requests, "post", return_value=_response(404, {})):
+        with patch.object(slack_utils.requests, "post", return_value=_response(404, {}, _OUR_404)):
             outcome = _ask()
         self.assertFalse(slack_utils.should_hold_results_for_approval(True, None, outcome))
 

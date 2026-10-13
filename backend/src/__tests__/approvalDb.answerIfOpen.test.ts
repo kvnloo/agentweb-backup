@@ -43,6 +43,22 @@ describe('answerIfOpen', () => {
     expect(params.ExpressionAttributeValues[':pending']).toBe('pending');
   });
 
+  it('requires the record to belong to the stated owner when one is given', async () => {
+    mockUpdate.mockResolvedValue({ Attributes: {} });
+    await approvalDb.answerIfOpen(ASSET, 'approved', 'whatsapp:u1', 'u1');
+    const params = mockUpdate.mock.calls[0][0];
+    expect(params.ConditionExpression).toContain('userId = :owner');
+    expect(params.ExpressionAttributeValues[':owner']).toBe('u1');
+  });
+
+  it('adds no owner condition when none is given (portal and Slack paths unchanged)', async () => {
+    mockUpdate.mockResolvedValue({ Attributes: {} });
+    await approvalDb.answerIfOpen(ASSET, 'approved', 'whatsapp:u1');
+    const params = mockUpdate.mock.calls[0][0];
+    expect(params.ConditionExpression).not.toContain('userId');
+    expect(params.ExpressionAttributeValues).not.toHaveProperty(':owner');
+  });
+
   it('treats needs_changes as still open, as Slack does', async () => {
     mockUpdate.mockResolvedValue({ Attributes: {} });
     await approvalDb.answerIfOpen(ASSET, 'approved', 'whatsapp:u1');

@@ -2739,7 +2739,9 @@ export default function AdminDashboard() {
               // of an organisation on the organisation's Slack channel, not on nothing.
               ? {
                   ...user,
-                  messagingPlatform: response.data?.messagingPlatform ?? null,
+                  // null = the server looked and found nothing; absent = it could not work it out,
+                  // which the table shows as "Unknown" rather than claiming "Not connected".
+                  messagingPlatform: response.data?.messagingPlatform,
                   messagingPlatformSource: response.data?.messagingPlatformSource ?? null,
                   whatsappNumberMasked: response.data?.whatsappNumberMasked ?? null,
                 }
@@ -2756,6 +2758,18 @@ export default function AdminDashboard() {
       console.error("Error disconnecting WhatsApp:", error);
       const message = axios.isAxiosError(error) ? error.response?.data?.message : undefined;
       setError(typeof message === "string" && message ? message : "Failed to disconnect WhatsApp");
+      // 404 / 409 mean the account no longer has a number, so the row on screen is stale
+      // (someone else disconnected it, or the customer did). Stop claiming WhatsApp.
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      if (status === 404 || status === 409) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === userId
+              ? { ...user, messagingPlatform: undefined, messagingPlatformSource: null, whatsappNumberMasked: null }
+              : user
+          )
+        );
+      }
     }
   };
 

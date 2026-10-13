@@ -186,6 +186,9 @@ export class ApprovalDB {
     assetUrl: string,
     status: 'approved' | 'rejected',
     reviewedBy: string,
+    /** When given, the record must belong to this user (a stale button must not answer
+     * someone else's approval for the same asset URL). */
+    ownerUserId?: string,
   ): Promise<
     | { answered: true; approval: AssetApproval }
     | { answered: false; current: AssetApproval['status'] | null | 'unknown' }
@@ -197,7 +200,8 @@ export class ApprovalDB {
           Key: { assetUrl },
           UpdateExpression: 'SET #status = :status, reviewedBy = :reviewedBy, updatedAt = :updatedAt',
           ConditionExpression:
-            'attribute_exists(assetUrl) AND (#status = :pending OR #status = :needsChanges)',
+            'attribute_exists(assetUrl) AND (#status = :pending OR #status = :needsChanges)' +
+            (ownerUserId ? ' AND userId = :owner' : ''),
           ExpressionAttributeNames: { '#status': 'status' },
           ExpressionAttributeValues: {
             ':status': status,
@@ -205,6 +209,7 @@ export class ApprovalDB {
             ':updatedAt': new Date().toISOString(),
             ':pending': 'pending',
             ':needsChanges': 'needs_changes',
+            ...(ownerUserId ? { ':owner': ownerUserId } : {}),
           },
           ReturnValues: 'ALL_NEW',
         })
@@ -363,20 +368,45 @@ export class ApprovalDB {
    */
   async restoreApproval(approval: AssetApproval, replacingCreatedAt: string): Promise<void> {
     try {
-      // Only over the record WE wrote: a newer concurrent re-request (or a tap on it) must
-      // not be erased by a failed older one.
+      // Only over the record WE wrote, and only while it is still unanswered: a newer
+      // concurrent re-request, or a customer's tap on our buttons, must not be reverted by
+      // a failed older request.
       await dynamodb
         .put({
           TableName: ASSET_APPROVALS_TABLE,
           Item: approval,
-          ConditionExpression: 'attribute_not_exists(assetUrl) OR createdAt = :ours',
-          ExpressionAttributeValues: { ':ours': replacingCreatedAt },
+          ConditionExpression:
+            'attribute_not_exists(assetUrl) OR (createdAt = :ours AND #status = :pending)',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: { ':ours': replacingCreatedAt, ':pending': 'pending' },
         })
         .promise();
     } catch (error: any) {
       if (error?.code === 'ConditionalCheckFailedException') return;
       console.error('❌ Error restoring approval:', error);
       throw new Error('Failed to restore approval');
+    }
+  }
+
+  /**
+   * Delete a record only if it is still the one this request wrote and is unanswered.
+   * Used to undo an unsent approval without deleting a concurrent request's record.
+   */
+  async deleteApprovalIfUnanswered(assetUrl: string, createdAt: string): Promise<void> {
+    try {
+      await dynamodb
+        .delete({
+          TableName: ASSET_APPROVALS_TABLE,
+          Key: { assetUrl },
+          ConditionExpression: 'createdAt = :ours AND #status = :pending',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: { ':ours': createdAt, ':pending': 'pending' },
+        })
+        .promise();
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return;
+      console.error('❌ Error deleting unsent approval:', error);
+      throw new Error('Failed to delete approval');
     }
   }
 

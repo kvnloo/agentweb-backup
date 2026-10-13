@@ -72,7 +72,15 @@ const START_KEYWORDS = new Set(['unstop', 'start', 'resubscribe']);
  * request as "stop". Still a whole-message match: "please stop by the office" is not.
  */
 const normalizeKeyword = (text: string): string =>
-  text.trim().toLowerCase().replace(/[\s.!?,;:]+$/g, '');
+  text
+    // NFKC folds fullwidth letters ("ＳＴＯＰ") to ASCII.
+    .normalize('NFKC')
+    .toLowerCase()
+    // Anything that is not a letter, digit or space — punctuation, quotes, emoji, zero-width
+    // characters — is noise around the word: "Stop 🛑", "\"stop\"" and "stop…" all mean stop.
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 
 /** Meta reports `from` without a leading '+'. Normalize so window/opt-out keys agree. */
 const toKeyPhone = (from: string): string => (from.startsWith('+') ? from : `+${from}`);
@@ -280,7 +288,7 @@ async function handleInboundMessage(message: any): Promise<void> {
       // Not a command at all. Greet, and pass the message to the team — a fixed reply
       // and an email, never a model, so this stays a support hand-off and not a chat.
       const media = readMediaDetails(message);
-      await handleUnrecognizedMessage(phone, text || media.caption, message?.type ?? 'text', media.detail);
+      await handleUnrecognizedMessage(phone, text || media.caption, message?.type ?? 'text', media.detail, message?.id);
     }
   }
 }

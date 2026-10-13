@@ -239,6 +239,14 @@ describe('approvalMessageText', () => {
   });
 });
 
+describe('approvalMessageText with emoji', () => {
+  it('never splits a surrogate pair when it shortens a long filename', () => {
+    const text = approvalMessageText('image', 'a'.repeat(78) + '😀' + 'b'.repeat(10), 'https://x/y');
+    expect(text).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])/);
+    expect(text).toContain('…');
+  });
+});
+
 describe('lookupApprovalMessage', () => {
   beforeEach(() => {
     jest.resetAllMocks();
@@ -290,18 +298,18 @@ describe('handleApprovalButtonTap', () => {
   describe('recording a verdict', () => {
     it('records an approval', async () => {
       await tap('approve');
-      expect(approvalDb.answerIfOpen).toHaveBeenCalledWith(ASSET, 'approved', 'whatsapp:user-1');
+      expect(approvalDb.answerIfOpen).toHaveBeenCalledWith(ASSET, 'approved', 'whatsapp:user-1', 'user-1');
     });
 
     it('records a rejection', async () => {
       (approvalDb.answerIfOpen as jest.Mock).mockResolvedValue(answered('rejected'));
       await tap('reject');
-      expect(approvalDb.answerIfOpen).toHaveBeenCalledWith(ASSET, 'rejected', 'whatsapp:user-1');
+      expect(approvalDb.answerIfOpen).toHaveBeenCalledWith(ASSET, 'rejected', 'whatsapp:user-1', 'user-1');
     });
 
     it('accepts the LABEL a template quick-reply sends back, in any case', async () => {
       await tap('Approve');
-      expect(approvalDb.answerIfOpen).toHaveBeenCalledWith(ASSET, 'approved', 'whatsapp:user-1');
+      expect(approvalDb.answerIfOpen).toHaveBeenCalledWith(ASSET, 'approved', 'whatsapp:user-1', 'user-1');
     });
 
     it('confirms the verdict back to the customer', async () => {
@@ -353,8 +361,24 @@ describe('handleApprovalButtonTap', () => {
       // verdict given anywhere else is respected — the case a separate claim row missed.
       (approvalDb.answerIfOpen as jest.Mock).mockResolvedValue({ answered: false, current: 'approved' });
       await tap('reject');
-      expect(approvalDb.answerIfOpen).toHaveBeenCalledWith(ASSET, 'rejected', 'whatsapp:user-1');
+      expect(approvalDb.answerIfOpen).toHaveBeenCalledWith(ASSET, 'rejected', 'whatsapp:user-1', 'user-1');
       expect(notifySubscribersOfApproval).not.toHaveBeenCalled();
+    });
+
+    it('says the request is gone when the record now belongs to a different account', async () => {
+      // Another account re-requested the same asset: the owner-checked write is refused
+      // while the record is still open, so these buttons no longer point at this customer.
+      (approvalDb.answerIfOpen as jest.Mock).mockResolvedValue({ answered: false, current: 'pending' });
+      await tap();
+      expect((whatsapp.sendText as jest.Mock).mock.calls[0][1]).toMatch(/no longer available/i);
+      expect(notifySubscribersOfApproval).not.toHaveBeenCalled();
+    });
+
+    it('tells the customer to tap again when the correlation cannot be read', async () => {
+      (settingsService.getSetting as jest.Mock).mockRejectedValue(new Error('dynamo blip'));
+      await tap();
+      expect((whatsapp.sendText as jest.Mock).mock.calls[0][1]).toMatch(/tap again|couldn.t record/i);
+      expect(approvalDb.answerIfOpen).not.toHaveBeenCalled();
     });
 
     it('does NOT say the request is gone when the standing verdict simply could not be read', async () => {

@@ -20,7 +20,10 @@ const router = express.Router();
 
 router.post('/', authenticateToken, async (req: any, res: any) => {
   try {
-    const { assetUrl, filename, executionId, note, channel, channelName } = req.body || {};
+    // No `channel` from the body, on purpose: this route has no Slack-entitlement check, and
+    // the workspace bot would post wherever it was pointed. It serves customers who are
+    // asked on WhatsApp; Slack customers go through /api/slack/send-approval, which checks.
+    const { assetUrl, filename, executionId, note } = req.body || {};
     const userId = req.user?.userId;
 
     if (!assetUrl || !filename) {
@@ -34,8 +37,7 @@ router.post('/', authenticateToken, async (req: any, res: any) => {
       filename,
       assetType: getAssetTypeFromFilename(filename),
       userId,
-      channel: channel || null,
-      channelName,
+      channel: null,
       note,
       // The new route is strict for everyone: a caller may not replace another account's
       // approval or point at another account's execution.

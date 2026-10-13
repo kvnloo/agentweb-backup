@@ -2,7 +2,7 @@
  * Non-command WhatsApp messages: greet once, forward to the team (ENG-273).
  */
 jest.mock('../services/settingsService', () => ({
-  settingsService: { getSetting: jest.fn(), setSetting: jest.fn(), setSettingIfValueMatches: jest.fn() },
+  settingsService: { getSetting: jest.fn(), setSetting: jest.fn(), setSettingIfValueMatches: jest.fn(), setSettingIfAbsent: jest.fn() },
 }));
 jest.mock('../services/whatsappService', () => ({
   redactPhone: jest.requireActual('../services/whatsappService').redactPhone,
@@ -43,6 +43,41 @@ beforeEach(() => {
 });
 afterAll(() => {
   process.env = ENV;
+});
+
+describe('redelivery of the same message', () => {
+  beforeEach(() => {
+    process.env.WHATSAPP_SUPPORT_INBOX = 'support@example.com';
+    settingsService.setSettingIfAbsent.mockResolvedValue(true);
+  });
+
+  it('handles a message the first time it sees its id', async () => {
+    await handleUnrecognizedMessage(PHONE, 'help', 'text', '', 'wamid.M1');
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+    expect(whatsapp.sendText).toHaveBeenCalledTimes(1);
+    expect(settingsService.setSettingIfAbsent.mock.calls[0][0]).toBe('whatsapp:inbound-msg:wamid.M1');
+  });
+
+  it('neither forwards nor greets a second time when Meta redelivers it', async () => {
+    settingsService.setSettingIfAbsent.mockResolvedValue(false);
+    await handleUnrecognizedMessage(PHONE, 'help', 'text', '', 'wamid.M1');
+    expect(emailService.sendEmail).not.toHaveBeenCalled();
+    expect(whatsapp.sendText).not.toHaveBeenCalled();
+  });
+
+  it('still handles the message when the dedupe write fails (better a duplicate than a lost query)', async () => {
+    settingsService.setSettingIfAbsent.mockRejectedValue(new Error('dynamo down'));
+    await handleUnrecognizedMessage(PHONE, 'help', 'text', '', 'wamid.M1');
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the dedupe row for a day, in epoch seconds', async () => {
+    await handleUnrecognizedMessage(PHONE, 'help', 'text', '', 'wamid.M1');
+    const ttl = settingsService.setSettingIfAbsent.mock.calls[0][4];
+    const now = Math.floor(Date.now() / 1000);
+    expect(ttl).toBeGreaterThan(now + 23 * 3600);
+    expect(ttl).toBeLessThan(now + 25 * 3600);
+  });
 });
 
 describe('the greeting', () => {

@@ -440,6 +440,9 @@ router.post("/send-approval", authenticateToken, async (req: Request, res: Respo
   } catch (error: any) {
     console.error("❌ Error sending approval request:", error.message);
     
+    if (error?.name === "ApprovalForbiddenError" || error?.constructor?.name === "ApprovalForbiddenError") {
+      return res.status(403).json({ error: error.message });
+    }
     if (error.message.includes("Slack client not initialized")) {
       res.status(503).json({ 
         error: "Slack integration not configured", 
