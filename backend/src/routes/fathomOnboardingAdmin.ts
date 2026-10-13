@@ -98,11 +98,14 @@ router.get('/users/:userId', async (req, res) => {
 });
 
 const VALID_PATH_ID = /^[A-Za-z0-9_.:@-]{1,128}$/;
+// recordingId is only a ledger lookup key and ingest accepts any non-empty id,
+// so only bound its length here (Opslane run 352, P2).
+const isValidRecordingId = (id: unknown) => typeof id === 'string' && id.length > 0 && id.length <= 512;
 
 for (const action of ['discard', 'rollback'] as const) {
   router.post(`/users/:userId/ingestions/:recordingId/${action}`, async (req: any, res) => {
     const { userId, recordingId } = req.params;
-    if (!VALID_PATH_ID.test(userId) || !VALID_PATH_ID.test(recordingId)) {
+    if (!VALID_PATH_ID.test(userId) || !isValidRecordingId(recordingId)) {
       return res.status(400).json({ error: 'Invalid userId or recordingId' });
     }
     try {

@@ -30,7 +30,18 @@ function entry(overrides: Record<string, any> = {}) {
 function setup(users: Record<string, any>) {
   const userDb = {
     getUserById: jest.fn(async (id: string) => users[id] ?? null),
-    updateUser: jest.fn(async (id: string, patch: any) => {
+    updateUser: jest.fn(async (id: string, patch: any, options?: any) => {
+      for (const set of options?.elementSets || []) {
+        const list = [...(users[id][set.path[0]] || [])];
+        const before = list[set.index];
+        // Mirror the service's slot condition: same recording, status, updatedAt.
+        const v = options?.condition?.values || {};
+        if (!before || before.recordingId !== v[':rid'] || before.status !== v[':st'] || before.updatedAt !== v[':upd']) {
+          throw Object.assign(new Error('conditional'), { code: 'ConditionalCheckFailedException' });
+        }
+        list[set.index] = set.value;
+        users[id] = { ...users[id], [set.path[0]]: list };
+      }
       users[id] = { ...users[id], ...patch };
       return users[id];
     }),
@@ -137,5 +148,37 @@ describe('applyFathomOnboardingReviewAction (ENG-270)', () => {
     await applyFathomOnboardingReviewAction({ userId: 'cust', recordingId: 'rec-1', action: 'rollback', actorUserId: 'admin' }, deps);
     expect(deps.orgMemoryDb.deleteMemory).toHaveBeenCalledWith('org-old', 'o1');
     expect(deps.orgMemoryDb.deleteMemory).not.toHaveBeenCalledWith('org-new', 'o1');
+  });
+
+  it('does not overwrite a concurrent action on a different recording of the same user', async () => {
+    const users: Record<string, any> = {
+      u: { userId: 'u', fathomOnboardingIngestions: [
+        entry({ recordingId: 'a', draftUserId: null }),
+        entry({ recordingId: 'b', draftUserId: null }),
+      ] },
+    };
+    const deps = setup(users);
+    // Both actions read the same snapshot before either writes.
+    const snapshot = JSON.parse(JSON.stringify(users.u));
+    let reads = 0;
+    deps.userDb.getUserById.mockImplementation(async (id: string) => (id === 'u' && reads++ < 2 ? snapshot : users[id] ?? null));
+    await Promise.all([
+      applyFathomOnboardingReviewAction({ userId: 'u', recordingId: 'a', action: 'discard', actorUserId: 'admin' }, deps),
+      applyFathomOnboardingReviewAction({ userId: 'u', recordingId: 'b', action: 'discard', actorUserId: 'admin' }, deps),
+    ]);
+    expect(users.u.fathomOnboardingIngestions.map((e: any) => e.status)).toEqual(['discarded', 'discarded']);
+  });
+
+  it('re-reads and retries when the slot changed under it', async () => {
+    const users: Record<string, any> = {
+      u: { userId: 'u', fathomOnboardingIngestions: [entry({ recordingId: 'a', draftUserId: null })] },
+    };
+    const deps = setup(users);
+    const stale = { userId: 'u', fathomOnboardingIngestions: [entry({ recordingId: 'a', draftUserId: null, updatedAt: 'old' })] };
+    deps.userDb.getUserById.mockImplementationOnce(async () => stale);
+    const out = await applyFathomOnboardingReviewAction({ userId: 'u', recordingId: 'a', action: 'discard', actorUserId: 'admin' }, deps);
+    expect(out.status).toBe('discarded');
+    expect(deps.userDb.updateUser).toHaveBeenCalledTimes(2);
+    expect(users.u.fathomOnboardingIngestions[0].status).toBe('discarded');
   });
 });

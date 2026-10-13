@@ -172,4 +172,11 @@ describe('fathomOnboardingAdminRoutes', () => {
     expect(res.status).toBe(400);
     expect(applyFathomOnboardingReviewAction).not.toHaveBeenCalled();
   });
+
+  it('accepts recording ids with spaces or plus signs (ingest accepts any id)', async () => {
+    (applyFathomOnboardingReviewAction as jest.Mock).mockResolvedValue({ recordingId: 'call 42+x', status: 'needs_review' });
+    const res = await request(app).post('/api/admin/fathom-onboarding/users/u1/ingestions/call%2042%2Bx/rollback');
+    expect(res.status).toBe(200);
+    expect(applyFathomOnboardingReviewAction).toHaveBeenCalledWith(expect.objectContaining({ recordingId: 'call 42+x' }));
+  });
 });
