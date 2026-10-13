@@ -21,6 +21,7 @@ import {
 } from './messagingChannelService';
 import {
   TEMPLATES,
+  WhatsAppError,
   isServiceWindowOpen,
   redactPhone,
   resolveUserIdByPhone,
@@ -104,24 +105,33 @@ export async function notifyApprovalOnWhatsApp(
     // INSIDE: real Approve/Reject buttons. Interactive messages are service messages, so
     // they need no pre-approved template.
     //
-    // OUTSIDE: only a template can be delivered at all, so the customer gets the text and
-    // a link and answers in the portal. Quick-reply buttons on the template would work,
-    // but Meta returns a template button's own LABEL rather than an id, and four or more
-    // buttons (or mixing button types) cannot be viewed on WhatsApp Desktop — so that
-    // variant is its own change, not a silent upgrade here.
+    // OUTSIDE: only a template can be delivered at all. The customer gets the Approve /
+    // Reject quick-reply template; until Meta has approved it (it answers 132001, template
+    // does not exist) they get the link-only template and answer in the portal. Templates
+    // with mixed button types cannot be viewed on WhatsApp Desktop, so this one carries
+    // quick replies only.
+    const sendOutsideWindow = async () => {
+      const send = (template: { name: string }) =>
+        getMessagingChannel('whatsapp').sendMessage({
+          destination,
+          text: summary,
+          template: { name: template.name, variables: [assetType, filename, params.assetUrl] },
+        } as any);
+      try {
+        return await send(TEMPLATES.APPROVAL_REQUEST_BUTTONS);
+      } catch (error) {
+        if (error instanceof WhatsAppError && error.subcode === 132001) {
+          return send(TEMPLATES.APPROVAL_REQUEST);
+        }
+        throw error;
+      }
+    };
     const sent = (await isServiceWindowOpen(destination))
       ? await sendInteractiveButtons(destination, summary, [
           { id: 'approve', title: 'Approve' },
           { id: 'reject', title: 'Reject' },
         ])
-      : await getMessagingChannel('whatsapp').sendMessage({
-          destination,
-          text: summary,
-          template: {
-            name: TEMPLATES.APPROVAL_REQUEST.name,
-            variables: [assetType, filename, params.assetUrl],
-          },
-        } as any);
+      : await sendOutsideWindow();
 
     // Keep the provider's message id. A tap arrives carrying `context.id` — the id of
     // the message the button was on — and NOTHING else that identifies the approval:

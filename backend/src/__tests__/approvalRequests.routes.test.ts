@@ -51,6 +51,15 @@ it('accepts a request with no Slack channel', async () => {
   );
 });
 
+it('asks for typed delivery failures so a Slack outage answers 502, not 500', async () => {
+  await request(app)
+    .post('/api/approval-requests')
+    .send({ assetUrl: 'https://a/x.png', filename: 'x.png' });
+  expect(svc.requestApproval).toHaveBeenCalledWith(
+    expect.objectContaining({ typedFailures: true, enforceOwnership: true }),
+  );
+});
+
 it('takes the user from the token, never from the body', async () => {
   await request(app)
     .post('/api/approval-requests')

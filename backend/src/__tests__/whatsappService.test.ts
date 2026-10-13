@@ -323,6 +323,22 @@ describe('template registry', () => {
     expect(bodyComponent.parameters.map((p: any) => p.text)).toEqual(['Dark mode', 'https://x/y']);
   });
 
+  it('addresses each quick-reply button by index with its payload', async () => {
+    await sendTemplate('+14155550123', TEMPLATES.APPROVAL_REQUEST_BUTTONS, ['image', 'a.png', 'https://x/a.png']);
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    const buttons = body.template.components.filter((c: any) => c.type === 'button');
+    expect(buttons).toEqual([
+      { type: 'button', sub_type: 'quick_reply', index: '0', parameters: [{ type: 'payload', payload: 'approve' }] },
+      { type: 'button', sub_type: 'quick_reply', index: '1', parameters: [{ type: 'payload', payload: 'reject' }] },
+    ]);
+  });
+
+  it('adds no button components to a template without quick replies', async () => {
+    await sendTemplate('+14155550123', TEMPLATES.SHIP_NOTIFY, ['a', 'b']);
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.template.components.filter((c: any) => c.type === 'button')).toEqual([]);
+  });
+
   it('rejects a variable-count mismatch rather than sending a broken template', async () => {
     await expect(
       sendTemplate('+14155550123', TEMPLATES.SHIP_NOTIFY, ['only-one']),

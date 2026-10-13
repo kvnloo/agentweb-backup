@@ -39,6 +39,12 @@ export interface ApprovalRequestInput {
    * the legacy Slack route, whose behaviour is deliberately unchanged.
    */
   enforceOwnership?: boolean;
+  /**
+   * Report a failed Slack send as ApprovalDeliveryFailedError instead of the raw error, so
+   * the neutral route can answer 502 (hold) rather than a generic 500. Off by default: the
+   * legacy Slack route keeps seeing the error it always saw.
+   */
+  typedFailures?: boolean;
 }
 
 export class ApprovalNotDeliveredError extends Error {
@@ -166,11 +172,17 @@ export async function requestApproval(
 
   // ── WhatsApp, only for a customer who has connected a number ──
   let whatsappFailed = false;
+  let previousApproval: AssetApproval | null = null;
   if (onWhatsApp) {
     // The record is written BEFORE the message goes out. Its buttons cannot be taken back,
     // so one that reaches the customer ahead of its record can never be answered — and a
     // tap on it would otherwise have nothing to update.
-    if (!approval) approval = await createRecord(null);
+    if (!approval) {
+      // createApproval is a put on the asset URL, so it replaces any earlier record. Keep
+      // that record: if this round reaches nobody it must be put back, not deleted.
+      previousApproval = await approvalDb.getApproval(request.imageUrl).catch(() => null);
+      approval = await createRecord(null);
+    }
 
     // The import is inside the guard as well as the call: a module-load failure rejects
     // before any of the notifier's own error handling runs.
@@ -195,17 +207,29 @@ export async function requestApproval(
   }
 
   if (deliveredVia.length === 0) {
-    // Reached nobody. Remove a record written ahead of a send that then failed: an
-    // approval nobody was shown can never be answered. (If this asset URL already had a
-    // record, writing the new one replaced it — approving the same asset again is a new
-    // round — so nothing older is lost by removing it.)
+    // Reached nobody. Undo a record written ahead of a send that then failed: an approval
+    // nobody was shown can never be answered. If this asset URL already had a record, the
+    // new one replaced it, so put the earlier one back — a failed re-request must not erase
+    // an earlier verdict.
     if (approval) {
-      await approvalDb
-        .deleteApproval(request.imageUrl)
-        .catch((e) => console.warn('[approval-request] could not remove unsent approval:', e?.message || e));
+      const undo = previousApproval
+        ? approvalDb.restoreApproval(previousApproval)
+        : approvalDb.deleteApproval(request.imageUrl).then(() => undefined);
+      await undo.catch((e) =>
+        console.warn('[approval-request] could not undo unsent approval:', e?.message || e),
+      );
     }
     // A Slack failure is surfaced unchanged so existing callers see the error they always saw.
-    if (slackError) throw slackError;
+    if (slackError) {
+      if (request.typedFailures) {
+        console.error(
+          `[approval-request] Slack send failed for user ${request.userId}:`,
+          (slackError as any)?.message || slackError,
+        );
+        throw new ApprovalDeliveryFailedError('The approval request could not be delivered to Slack.');
+      }
+      throw slackError;
+    }
     if (whatsappFailed) {
       // The caller will hold the customer's output until this is resolved, and nothing here
       // retries. Say so where an operator can see it (user id and asset only — never the

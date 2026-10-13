@@ -358,6 +358,19 @@ export class ApprovalDB {
   }
 
   /**
+   * Put a previously read approval back exactly as it was. Used when a re-request replaced a
+   * record and then reached nobody: the earlier verdict must survive, not be deleted.
+   */
+  async restoreApproval(approval: AssetApproval): Promise<void> {
+    try {
+      await dynamodb.put({ TableName: ASSET_APPROVALS_TABLE, Item: approval }).promise();
+    } catch (error) {
+      console.error('❌ Error restoring approval:', error);
+      throw new Error('Failed to restore approval');
+    }
+  }
+
+  /**
    * Delete approval request
    */
   async deleteApproval(assetUrl: string): Promise<boolean> {

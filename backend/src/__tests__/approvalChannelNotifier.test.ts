@@ -136,10 +136,28 @@ describe('notifyApprovalOnWhatsApp', () => {
       ]);
     });
 
-    it('falls back to the template when the window is shut', async () => {
+    it('sends the quick-reply button template when the window is shut', async () => {
       await notifyApprovalOnWhatsApp(params);
       expect(whatsapp.sendInteractiveButtons).not.toHaveBeenCalled();
-      expect(send.mock.calls[0][0].template.name).toBe(TEMPLATES.APPROVAL_REQUEST.name);
+      expect(send.mock.calls[0][0].template.name).toBe(TEMPLATES.APPROVAL_REQUEST_BUTTONS.name);
+      expect(TEMPLATES.APPROVAL_REQUEST_BUTTONS.quickReplies).toEqual(['approve', 'reject']);
+    });
+
+    it('falls back to the link-only template while Meta has not approved the button one', async () => {
+      send
+        .mockRejectedValueOnce(new whatsapp.WhatsAppError('template does not exist', 132001))
+        .mockResolvedValueOnce({ messageId: 'wamid.FALLBACK' });
+      expect(await notifyApprovalOnWhatsApp(params)).toBe('delivered');
+      expect(send.mock.calls[1][0].template.name).toBe(TEMPLATES.APPROVAL_REQUEST.name);
+      expect((settingsService.setSetting as jest.Mock).mock.calls[0][0]).toBe(
+        'whatsapp:approval-msg:wamid.FALLBACK',
+      );
+    });
+
+    it('does NOT fall back on any other Meta error', async () => {
+      send.mockRejectedValue(new whatsapp.WhatsAppError('quota', 80007));
+      expect(await notifyApprovalOnWhatsApp(params)).toBe('failed');
+      expect(send).toHaveBeenCalledTimes(1);
     });
 
     it('binds template variables in the order Meta substitutes them', async () => {
@@ -147,6 +165,7 @@ describe('notifyApprovalOnWhatsApp', () => {
       // delivers the wrong words to a customer.
       expect(TEMPLATES.APPROVAL_REQUEST.variables).toEqual(['asset_type', 'asset_name', 'review_url']);
       await notifyApprovalOnWhatsApp(params);
+      expect(TEMPLATES.APPROVAL_REQUEST_BUTTONS.variables).toEqual(TEMPLATES.APPROVAL_REQUEST.variables);
       expect(send.mock.calls[0][0].template.variables).toEqual(['image', 'q4-launch-hero.png', ASSET]);
     });
 

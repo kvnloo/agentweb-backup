@@ -40,6 +40,7 @@ router.post('/', authenticateToken, async (req: any, res: any) => {
       // The new route is strict for everyone: a caller may not replace another account's
       // approval or point at another account's execution.
       enforceOwnership: true,
+      typedFailures: true,
     });
 
     res.json({

@@ -14,7 +14,12 @@ jest.mock('@slack/web-api', () => ({
 }));
 jest.mock('../services/approvalChannelNotifier', () => ({ notifyApprovalOnWhatsApp: jest.fn() }));
 jest.mock('../services/approvalDb', () => ({
-  approvalDb: { createApproval: jest.fn(), deleteApproval: jest.fn(), getApproval: jest.fn() },
+  approvalDb: {
+    createApproval: jest.fn(),
+    deleteApproval: jest.fn(),
+    getApproval: jest.fn(),
+    restoreApproval: jest.fn(),
+  },
 }));
 jest.mock('../services/db', () => ({
   userDb: { getUserById: jest.fn() },
@@ -71,6 +76,7 @@ beforeEach(() => {
     return a;
   });
   approvalDb.deleteApproval.mockResolvedValue(true);
+  approvalDb.restoreApproval.mockResolvedValue(undefined);
   approvalDb.getApproval.mockResolvedValue(null);
   taskDb.getTaskExecutionById.mockResolvedValue({ executionId: 'exec-1', userId: 'user-1' });
   notifyApprovalOnWhatsApp.mockImplementation(async () => {
@@ -110,6 +116,13 @@ describe('a customer on Slack', () => {
     await expect(requestApproval(request)).rejects.toThrow('not_in_channel');
     expect(approvalDb.createApproval).not.toHaveBeenCalled();
     expect(approvalDb.deleteApproval).not.toHaveBeenCalled();
+  });
+
+  it('reports a failed Slack post as a typed delivery failure when the caller asks for it', async () => {
+    mockPostMessage.mockRejectedValue(new Error('not_in_channel'));
+    await expect(requestApproval({ ...request, typedFailures: true })).rejects.toBeInstanceOf(
+      ApprovalDeliveryFailedError,
+    );
   });
 
   it('still throws the old error type through the legacy entry point', async () => {
@@ -178,6 +191,25 @@ describe('a customer on WhatsApp', () => {
     );
     // An approval nobody was shown can never be answered.
     expect(approvalDb.deleteApproval).toHaveBeenCalledWith(request.imageUrl);
+  });
+
+  it('puts an EARLIER verdict back when a re-request reaches nobody', async () => {
+    const earlier = { assetUrl: request.imageUrl, userId: 'user-1', status: 'approved' };
+    approvalDb.getApproval.mockResolvedValue(earlier);
+    notifyApprovalOnWhatsApp.mockResolvedValue('failed');
+    await expect(requestApproval({ ...request, channel: undefined })).rejects.toBeInstanceOf(
+      ApprovalDeliveryFailedError,
+    );
+    expect(approvalDb.restoreApproval).toHaveBeenCalledWith(earlier);
+    expect(approvalDb.deleteApproval).not.toHaveBeenCalled();
+  });
+
+  it('deletes the unsent record when there was no earlier one', async () => {
+    notifyApprovalOnWhatsApp.mockResolvedValue('failed');
+    await expect(requestApproval({ ...request, channel: undefined })).rejects.toBeInstanceOf(
+      ApprovalDeliveryFailedError,
+    );
+    expect(approvalDb.restoreApproval).not.toHaveBeenCalled();
   });
 
   it('treats a notifier that throws as a failed send', async () => {

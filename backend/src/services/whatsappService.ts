@@ -73,6 +73,12 @@ export interface WhatsAppTemplate {
    * legality: 'marketing' cannot be delivered to +1 numbers at all (131049).
    */
   category: 'utility' | 'authentication' | 'marketing';
+  /**
+   * Quick-reply buttons the template was created with, in order. Each entry is the payload
+   * sent with that button. Meta requires every quick-reply button to be addressed by index
+   * at send time. A tap comes back as a `button` message carrying this payload.
+   */
+  quickReplies?: readonly string[];
 }
 
 /**
@@ -101,6 +107,19 @@ export const TEMPLATES = {
     language: 'en_US',
     variables: ['asset_type', 'asset_name', 'review_url'],
     category: 'utility',
+  },
+  /**
+   * Same words as APPROVAL_REQUEST plus Approve / Reject quick-reply buttons, so a customer
+   * outside the 24-hour window can answer with a tap. Created in Meta as its own template
+   * (a template's buttons cannot be changed after approval). Until Meta approves it the
+   * notifier falls back to APPROVAL_REQUEST — see approvalChannelNotifier.
+   */
+  APPROVAL_REQUEST_BUTTONS: {
+    name: 'agentweb_approval_request_buttons',
+    language: 'en_US',
+    variables: ['asset_type', 'asset_name', 'review_url'],
+    category: 'utility',
+    quickReplies: ['approve', 'reject'],
   },
 } as const satisfies Record<string, WhatsAppTemplate>;
 
@@ -485,6 +504,12 @@ export async function sendTemplate(
           type: 'body',
           parameters: variables.map((text) => ({ type: 'text', text: toTemplateParam(text) })),
         },
+        ...(template.quickReplies ?? []).map((payload, index) => ({
+          type: 'button',
+          sub_type: 'quick_reply',
+          index: String(index),
+          parameters: [{ type: 'payload', payload }],
+        })),
       ],
     },
   });
