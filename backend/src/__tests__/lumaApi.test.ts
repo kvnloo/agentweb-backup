@@ -440,31 +440,35 @@ describe('luma tools', () => {
 });
 
 describe('LUMA_API_BASE_URL override', () => {
-  const load = (nodeEnv: string) => {
-    const prevEnv = process.env.NODE_ENV;
-    const prevUrl = process.env.LUMA_API_BASE_URL;
+  // Set AFTER lumaApiService was imported: server.ts runs dotenv after its imports, so the override
+  // must be read per call or a value from .env is silently ignored (found in the branch preview).
+  const withEnv = async (nodeEnv: string, run: () => Promise<void>) => {
+    const prev = { n: process.env.NODE_ENV, u: process.env.LUMA_API_BASE_URL };
     process.env.NODE_ENV = nodeEnv;
     process.env.LUMA_API_BASE_URL = 'http://127.0.0.1:9999';
-    let svc: any;
-    jest.isolateModules(() => {
-      svc = require('../services/lumaApiService');
-    });
-    process.env.NODE_ENV = prevEnv;
-    if (prevUrl === undefined) delete process.env.LUMA_API_BASE_URL;
-    else process.env.LUMA_API_BASE_URL = prevUrl;
-    return svc;
+    try {
+      await run();
+    } finally {
+      process.env.NODE_ENV = prev.n;
+      if (prev.u === undefined) delete process.env.LUMA_API_BASE_URL;
+      else process.env.LUMA_API_BASE_URL = prev.u;
+    }
   };
 
-  it('redirects outside production (so a fake Luma can be used in a preview)', async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse({ id: 'cal-1', name: 'x' }));
-    await new (load('development').LumaApiService)('k').getCalendar();
-    expect(String(fetchMock.mock.calls.pop()![0])).toMatch(/^http:\/\/127\.0\.0\.1:9999\//);
+  it('redirects outside production, even when set after import (so a preview can use a fake Luma)', async () => {
+    await withEnv('development', async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse({ id: 'cal-1', name: 'x' }));
+      await new LumaApiService('k').getCalendar();
+      expect(String(fetchMock.mock.calls.pop()![0])).toMatch(/^http:\/\/127\.0\.0\.1:9999\//);
+    });
   });
 
   it('is ignored in production, so keys can only ever go to Luma', async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse({ id: 'cal-1', name: 'x' }));
-    await new (load('production').LumaApiService)('k').getCalendar();
-    expect(String(fetchMock.mock.calls.pop()![0])).toMatch(/^https:\/\/public-api\.luma\.com\//);
+    await withEnv('production', async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse({ id: 'cal-1', name: 'x' }));
+      await new LumaApiService('k').getCalendar();
+      expect(String(fetchMock.mock.calls.pop()![0])).toMatch(/^https:\/\/public-api\.luma\.com\//);
+    });
   });
 });
 
