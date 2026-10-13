@@ -33,7 +33,10 @@ import {
   sendOptOutConfirmation,
   OPT_IN_CONFIRMATION,
 } from '../services/whatsappService';
-import { handleVerificationMessage } from '../services/whatsappVerificationService';
+import {
+  disconnectWhatsAppForNumber,
+  handleVerificationMessage,
+} from '../services/whatsappVerificationService';
 import { handleApprovalButtonTap } from '../services/approvalChannelNotifier';
 import { handleUnrecognizedMessage } from '../services/whatsappInboundSupport';
 
@@ -258,6 +261,16 @@ async function handleInboundMessage(message: any): Promise<void> {
   if (STOP_KEYWORDS.has(normalized)) {
     await recordOptOut(phone);
     console.log(`[whatsapp-webhook] opt-out recorded for ${redactPhone(phone)}`);
+    // STOP also ends the connection: the account that held this number drops to "no
+    // platform" on its own, so nothing is left half-connected and nobody has to disconnect
+    // it by hand. Done BEFORE the confirmation so a Meta redelivery after a failure here
+    // does not send the confirmation twice. A storage error throws, so the webhook 500s.
+    const disconnectedUserId = await disconnectWhatsAppForNumber(phone);
+    if (disconnectedUserId) {
+      console.log(
+        `[whatsapp-webhook] WhatsApp disconnected from user ${disconnectedUserId} after STOP from ${redactPhone(phone)}`,
+      );
+    }
     // Acknowledged only AFTER the opt-out is recorded, and never allowed to throw:
     // recording is the compliance-critical half, and a silent STOP is indistinguishable
     // — to the person who sent it — from one that was dropped on the floor.

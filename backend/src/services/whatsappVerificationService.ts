@@ -435,6 +435,23 @@ export async function handleVerificationMessage(text: string, phone: string): Pr
  *
  * Returns the number that was removed, or null if there was none.
  */
+/**
+ * A customer texted STOP from this number: take WhatsApp off the account that holds it, so
+ * the account has NO platform (not "WhatsApp but unreachable"). Without this the account
+ * stayed on WhatsApp, Slack stayed suppressed, every approval failed against the opt-out and
+ * the task output was held until an admin intervened. The opt-out row itself is untouched —
+ * the number stays blocked until it sends START.
+ *
+ * Returns the account's id, or null when no account holds the number. Throws on a storage
+ * error so the webhook can 500 and let Meta redeliver (everything here is idempotent).
+ */
+export async function disconnectWhatsAppForNumber(phone: string): Promise<string | null> {
+  const userId = await resolveUserIdByPhone(phone);
+  if (!userId) return null;
+  await disconnectWhatsApp(userId);
+  return userId;
+}
+
 export async function disconnectWhatsApp(
   userId: string,
 ): Promise<{ removed: string | null; channels: UserMessagingChannelConfig[] } | null> {

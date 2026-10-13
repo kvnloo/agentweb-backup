@@ -30,6 +30,7 @@ jest.mock('../services/whatsappService', () => ({
 }));
 jest.mock('../services/whatsappVerificationService', () => ({
   handleVerificationMessage: jest.fn(),
+  disconnectWhatsAppForNumber: jest.fn(),
 }));
 jest.mock('../services/approvalChannelNotifier', () => ({
   handleApprovalButtonTap: jest.fn(),
@@ -48,7 +49,7 @@ const {
   sendText,
   sendOptOutConfirmation,
 } = require('../services/whatsappService');
-const { handleVerificationMessage } = require('../services/whatsappVerificationService');
+const { handleVerificationMessage, disconnectWhatsAppForNumber } = require('../services/whatsappVerificationService');
 const { handleApprovalButtonTap } = require('../services/approvalChannelNotifier');
 const { handleUnrecognizedMessage } = require('../services/whatsappInboundSupport');
 const { getWhatsAppCredentials } = require('../utils/secretsManager');
@@ -223,6 +224,46 @@ describe('POST — inbound messages', () => {
     // Meta reports `from` WITHOUT a leading +; the window key must not depend on
     // which form happened to arrive, or a send would look outside its own window.
     expect(recordInboundMessage).toHaveBeenCalledWith('+14155550123');
+  });
+
+  it('takes WhatsApp off the account that holds the number when it texts STOP', async () => {
+    disconnectWhatsAppForNumber.mockResolvedValue('user-1');
+    await post(inboundPayload('STOP'));
+    expect(disconnectWhatsAppForNumber).toHaveBeenCalledWith('+14155550123');
+  });
+
+  it('records the opt-out BEFORE disconnecting, and disconnects BEFORE confirming', async () => {
+    const order: string[] = [];
+    recordOptOut.mockImplementation(async () => void order.push('opt-out'));
+    disconnectWhatsAppForNumber.mockImplementation(async () => {
+      order.push('disconnect');
+      return 'user-1';
+    });
+    sendOptOutConfirmation.mockImplementation(async () => void order.push('confirm'));
+    await post(inboundPayload('STOP'));
+    expect(order).toEqual(['opt-out', 'disconnect', 'confirm']);
+  });
+
+  it('is fine when no account holds the number', async () => {
+    disconnectWhatsAppForNumber.mockResolvedValue(null);
+    sendOptOutConfirmation.mockResolvedValue(undefined);
+    const res = await post(inboundPayload('STOP'));
+    expect(res.status).toBe(200);
+    expect(sendOptOutConfirmation).toHaveBeenCalled();
+  });
+
+  it('answers 500 (so Meta redelivers) when the disconnect hits a storage error, and confirms nothing yet', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    disconnectWhatsAppForNumber.mockRejectedValue(new Error('dynamo down'));
+    const res = await post(inboundPayload('STOP'));
+    expect(res.status).toBe(500);
+    expect(recordOptOut).toHaveBeenCalled(); // the opt-out itself is already safe
+    expect(sendOptOutConfirmation).not.toHaveBeenCalled();
+  });
+
+  it('does not disconnect anyone for START / UNSTOP', async () => {
+    await post(inboundPayload('UNSTOP'));
+    expect(disconnectWhatsAppForNumber).not.toHaveBeenCalled();
   });
 
   it('records an opt-out on STOP', async () => {

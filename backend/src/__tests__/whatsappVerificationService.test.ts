@@ -58,6 +58,7 @@ import {
   completeVerification,
   getVerificationStatus,
   disconnectWhatsApp,
+  disconnectWhatsAppForNumber,
   handleVerificationMessage,
   parseVerificationMessage,
 } from '../services/whatsappVerificationService';
@@ -632,6 +633,39 @@ describe('completeVerification — the phone -> user index', () => {
     const code = await begin();
     await expect(completeVerification(code, PHONE)).rejects.toThrow('dynamo down');
     expect(users.get('u1').messagingChannels).toBeUndefined();
+  });
+});
+
+describe('disconnectWhatsAppForNumber (STOP)', () => {
+  it('leaves the account with no platform when the number it holds opts out', async () => {
+    const code = await begin();
+    await completeVerification(code, PHONE);
+    whatsapp.resolveUserIdByPhone.mockResolvedValue('u1');
+
+    await expect(disconnectWhatsAppForNumber(PHONE)).resolves.toBe('u1');
+
+    expect(users.get('u1').messagingChannels).toEqual([]);
+    await expect(getVerificationStatus('u1')).resolves.toEqual({ state: 'none' });
+    expect(whatsapp.unbindPhone).toHaveBeenCalledWith(PHONE, 'u1');
+  });
+
+  it('does nothing, and says so, when no account holds the number', async () => {
+    whatsapp.resolveUserIdByPhone.mockResolvedValue(null);
+    await expect(disconnectWhatsAppForNumber(PHONE)).resolves.toBeNull();
+  });
+
+  it('lets the account use Slack again afterwards (the platform rule no longer blocks it)', async () => {
+    const code = await begin();
+    await completeVerification(code, PHONE);
+    whatsapp.resolveUserIdByPhone.mockResolvedValue('u1');
+    await disconnectWhatsAppForNumber(PHONE);
+    const { hasWhatsApp } = require('../services/customerChannelPolicy');
+    expect(hasWhatsApp(users.get('u1'))).toBe(false);
+  });
+
+  it('surfaces a storage error instead of swallowing it', async () => {
+    whatsapp.resolveUserIdByPhone.mockRejectedValue(new Error('dynamo down'));
+    await expect(disconnectWhatsAppForNumber(PHONE)).rejects.toThrow('dynamo down');
   });
 });
 
