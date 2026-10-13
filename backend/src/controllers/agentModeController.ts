@@ -141,6 +141,8 @@ import {
   type SubscriptionFeatureId,
 } from '../services/subscriptionService';
 import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
+import { fileProductFeedback, EMMA_FEEDBACK_INTENTS } from '../services/productFeedbackFiling';
+import { ReportReplayCapacityError } from '../utils/reportIntake';
 import { resetSentence } from "../utils/usageCycle";
 import { buildUsageBlockCopy } from "../utils/usageBlockCopy";
 import { transcribeSpeech } from '../services/voiceService';
@@ -10007,6 +10009,81 @@ export const agentModeController = {
       // Check token usage limits
       const usageStatus = await checkTokenUsage(user.userId);
       if (!usageStatus.allowed) {
+        // ENG-527: product-feedback filing is never token-limited. An over-quota user who
+        // explicitly asks Emma to file a bug/feature request (portal `feedbackIntent`) gets it
+        // filed DETERMINISTICALLY — zero LLM calls, zero token spend — through the same shared
+        // policy as the in-app Send feedback form. Ordinary generation stays blocked below.
+        const feedbackIntent = typeof req.body.feedbackIntent === 'string' ? req.body.feedbackIntent : undefined;
+        if (feedbackIntent && Object.prototype.hasOwnProperty.call(EMMA_FEEDBACK_INTENTS, feedbackIntent)) {
+          const intentConfig = EMMA_FEEDBACK_INTENTS[feedbackIntent];
+          // Same validation as POST /support/report-ui-bug: blank input is a 400, not a filing failure.
+          const feedbackDescription = typeof userMessage === 'string' ? userMessage.trim() : '';
+          if (!feedbackDescription) {
+            return res.status(400).json({ error: 'Description is required', code: 'feedback_description_required', feedbackFiled: null });
+          }
+          try {
+            // Match /support attribution: reporter details come from the DB user record (the
+            // token carries no displayName/funnelStatus), and admin delegation is recorded.
+            const reporter = await userDb.getUserById(user.userId).catch(() => null);
+            const delegate = (req as any).delegateInfo;
+            const filing = await fileProductFeedback({
+              user: {
+                userId: user.userId,
+                email: reporter?.email || user.email,
+                displayName: reporter?.displayName,
+                funnelStatus: reporter?.funnelStatus,
+              },
+              reportedByAdmin: delegate?.isDelegated === true && delegate.adminEmail
+                ? delegate.adminEmail
+                : undefined,
+              reportType: feedbackIntent,
+              titlePrefix: intentConfig.titlePrefix,
+              tag: intentConfig.tag,
+              description: feedbackDescription,
+              pageUrl: typeof currentUrl === 'string' ? currentUrl : undefined,
+              sessionId,
+            });
+            const link = (filing.filed.userUrl || filing.filed.trackerUrl || '').trim();
+            const label = feedbackIntent === 'bug' ? 'bug report' : 'feature request';
+            // Never print "being tracked:" with nothing after it: only promise a link we have.
+            const content = link
+              ? `Your ${label} has been filed and is being tracked: ${link}`
+              : `Your ${label} has been filed${filing.issueId ? ` (${filing.issueId})` : ''}. The team will follow up.`;
+            // Persist the turn like an answered turn so the confirmation survives a reload.
+            const nowIso = new Date().toISOString();
+            try {
+              await chatbotDb.addMessagesToSession(sessionId, [
+                { role: 'user', content: String(userMessage), timestamp: nowIso, metadata: { timestamp: nowIso, feedbackIntent } },
+                { role: 'assistant', content, timestamp: nowIso, metadata: { timestamp: nowIso, feedbackFiled: true } },
+              ] as any);
+            } catch (persistError) {
+              // The filing already succeeded; a transcript write failure must not un-report it.
+              console.error('[agentMode] ENG-527 failed to persist over-quota feedback turn:', persistError);
+            }
+            return res.json({
+              content,
+              feedbackFiled: {
+                type: feedbackIntent,
+                trackerUrl: link || null,
+                issueId: filing.issueId ?? null,
+                deduped: filing.filed.deduped,
+                replayed: filing.replayed,
+              },
+              usageMode: 'paused',
+            });
+          } catch (filingError) {
+            // AC4: a failed filing is surfaced clearly and NEVER reported as tracked.
+            console.error('[agentMode] ENG-527 over-quota feedback filing failed:', filingError);
+            const busy = filingError instanceof ReportReplayCapacityError;
+            return res.status(busy ? 503 : 502).json({
+              error: busy
+                ? 'Feedback intake is busy; please retry shortly. Nothing was filed yet.'
+                : 'We could not file your feedback, so nothing was tracked. Please try again or use Send feedback.',
+              code: 'feedback_filing_failed',
+              feedbackFiled: null,
+            });
+          }
+        }
         return res.status(429).json(await buildUsagePausedBody({
           usageStatus,
           session,
