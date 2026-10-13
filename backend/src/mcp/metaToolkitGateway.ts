@@ -19,7 +19,7 @@ import {
   type ConnectedAccount,
 } from '../services/connectedAccountsDb';
 import { isMetaAdAccount } from '../services/metaTokenRefresh';
-import { recordMcpToolUse, type McpAuthMethod } from '../services/mcpUsageEventsService';
+import { recordMcpToolUse, recordMcpWriteExecuted, type McpAuthMethod } from '../services/mcpUsageEventsService';
 import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } from './metaToolkitManifest';
 import { RateLimiter } from '../middleware/rateLimiter';
 import { isZomaTool } from './zomaToolDefinitions';
@@ -60,6 +60,8 @@ export interface MetaToolkitGatewayDeps {
   runZomaTool?: typeof runZomaTool;
   /** ENG-2303 P3 guarded writes; defaults to executeMetaToolkitWrite. */
   executeWrite?: (userId: string, args: any) => Promise<any>;
+  /** ENG-2303 P4 distinct write metering; defaults to recordMcpWriteExecuted. */
+  recordWrite?: typeof recordMcpWriteExecuted;
 }
 
 /** Per-credential ceiling, so one key/token cannot exceed its limit by spreading calls across IPs. */
@@ -201,12 +203,36 @@ export async function handleMetaToolkitCall(
 
   // ENG-2303 P3: CAMPAIGN/AD_SET/AD CREATE + status/budget UPDATE go through the guarded
   // preview→confirm path; every other write stays refused by assertMetaToolkitV1Call.
-  const result = isGuardedWriteRequest(request.toolName, args)
+  const guardedWrite = isGuardedWriteRequest(request.toolName, args);
+  const result = guardedWrite
     ? await (deps.executeWrite ?? executeMetaToolkitWrite)(caller.userId, args)
     : await deps.execute(request.toolName, args, {
         userId: caller.userId,
         sessionId: request.sessionId,
       });
+
+  // ENG-2303 P4: a write that reached Meta (it has a read-back verdict) is metered as its
+  // own event kind. Previews, mismatched confirms and refused/failed writes are not.
+  // A metering failure must not make an executed write look failed (that invites a retry
+  // and a duplicate), so it is logged and surfaced on the result instead of thrown.
+  if (guardedWrite && typeof (result as any)?.verification === 'string') {
+    await (deps.recordWrite ?? recordMcpWriteExecuted)({
+      userId: caller.userId,
+      toolName: request.toolName,
+      authMethod: caller.authMethod,
+      apiKeyId: caller.apiKeyId,
+      clientId: caller.clientId,
+      sessionId: request.sessionId,
+      userAgent: request.userAgent,
+      entityType: String(args.entity_type),
+      action: String(args.action),
+      verification: (result as any).verification,
+      objectId: (result as any).id ?? undefined,
+    }).catch((error) => {
+      console.error('[meta-toolkit] write metering failed:', error instanceof Error ? error.message : error);
+      (result as any).metering = 'failed: this write executed but was not recorded in usage';
+    });
+  }
 
   await meter();
   return result;
