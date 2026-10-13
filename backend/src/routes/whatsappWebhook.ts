@@ -57,7 +57,15 @@ async function handleFailedStatus(status: any): Promise<void> {
   // delivery receipt, and nothing here may fail the webhook or open a service window.
   try {
     const ref = status?.id ? await lookupApprovalMessage(String(status.id)) : null;
-    if (ref?.userId) await notifyOwnerUnreachable(ref.userId);
+    if (ref?.userId) {
+      // Only while that approval is still waiting. A receipt for one already answered, or
+      // cancelled by STOP, would make the email say results are "on hold" when they are not.
+      const { approvalDb } = await import('../services/approvalDb');
+      const approval = await approvalDb.getApproval(ref.assetUrl);
+      if (approval && approval.userId === ref.userId && approval.status === 'pending') {
+        await notifyOwnerUnreachable(ref.userId);
+      }
+    }
   } catch (e) {
     console.warn(
       '[whatsapp-webhook] could not act on a failed delivery receipt:',

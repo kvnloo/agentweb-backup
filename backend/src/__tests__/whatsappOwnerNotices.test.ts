@@ -2,7 +2,7 @@
  * Emails to an account's owner about its WhatsApp connection (ENG-273).
  */
 jest.mock('../services/settingsService', () => ({
-  settingsService: { setSettingIfAbsent: jest.fn() },
+  settingsService: { setSettingIfAbsent: jest.fn(), deleteSetting: jest.fn() },
 }));
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() } }));
 jest.mock('../services/emailService', () => ({ emailService: { sendEmail: jest.fn() } }));
@@ -75,6 +75,12 @@ describe('notifyOwnerUnreachable', () => {
     const now = Math.floor(Date.now() / 1000);
     expect(ttl).toBeGreaterThan(now + 23 * 3600);
     expect(ttl).toBeLessThan(now + 25 * 3600);
+  });
+
+  it('gives the day\'s slot back when the email itself fails, so the next failure can try again', async () => {
+    emailService.sendEmail.mockResolvedValue('failed');
+    await expect(notifyOwnerUnreachable('u1')).resolves.toBe(false);
+    expect(settingsService.deleteSetting).toHaveBeenCalledWith('whatsapp:unreachable-notice:u1');
   });
 
   it('still sends when the rate-limit store is down (one extra email beats none)', async () => {

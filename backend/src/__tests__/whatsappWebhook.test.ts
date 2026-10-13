@@ -37,6 +37,7 @@ jest.mock('../services/approvalChannelNotifier', () => ({
   handleApprovalButtonTap: jest.fn(),
   lookupApprovalMessage: jest.fn(),
 }));
+jest.mock('../services/approvalDb', () => ({ approvalDb: { getApproval: jest.fn() } }));
 jest.mock('../services/whatsappOwnerNotices', () => ({
   notifyOwnerUnreachable: jest.fn(),
 }));
@@ -56,6 +57,7 @@ const {
 } = require('../services/whatsappService');
 const { lookupApprovalMessage } = require('../services/approvalChannelNotifier');
 const { notifyOwnerUnreachable } = require('../services/whatsappOwnerNotices');
+const { approvalDb } = require('../services/approvalDb');
 const { handleVerificationMessage, disconnectWhatsAppForNumber, resumeVerificationAfterStart } = require('../services/whatsappVerificationService');
 const { handleApprovalButtonTap } = require('../services/approvalChannelNotifier');
 const { handleUnrecognizedMessage } = require('../services/whatsappInboundSupport');
@@ -348,9 +350,29 @@ describe('POST — inbound messages', () => {
   it('emails the owner when a failed receipt belongs to an approval request', async () => {
     jest.spyOn(console, 'error').mockImplementation(() => {});
     lookupApprovalMessage.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-1' });
+    approvalDb.getApproval.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-1', status: 'pending' });
     await post(statusPayload('failed'));
     expect(lookupApprovalMessage).toHaveBeenCalledWith('wamid.OUT1');
     expect(notifyOwnerUnreachable).toHaveBeenCalledWith('user-1');
+  });
+
+  it.each(['approved', 'rejected', 'needs_changes'])(
+    'does NOT email the owner when the approval is already %s (the results are not on hold)',
+    async (status) => {
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+      lookupApprovalMessage.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-1' });
+      approvalDb.getApproval.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-1', status });
+      await post(statusPayload('failed'));
+      expect(notifyOwnerUnreachable).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does NOT email the owner when the record now belongs to someone else', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    lookupApprovalMessage.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-1' });
+    approvalDb.getApproval.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-2', status: 'pending' });
+    await post(statusPayload('failed'));
+    expect(notifyOwnerUnreachable).not.toHaveBeenCalled();
   });
 
   it('does not email anyone for a failed receipt that was not an approval request', async () => {

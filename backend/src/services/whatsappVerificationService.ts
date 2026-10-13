@@ -476,13 +476,25 @@ export async function disconnectWhatsAppForNumber(phone: string): Promise<string
     );
     return null;
   }
+  // Cancel BEFORE disconnecting, and let a failure throw: once the number is unbound a
+  // redelivered STOP can no longer find the account, so anything not done by then is lost.
+  // Cancelling is idempotent (an already-answered approval is skipped), so a redelivery
+  // after a later failure simply repeats it.
+  const cancelled = await cancelUnansweredWhatsAppApprovals(userId);
   await disconnectWhatsApp(userId, 'stop');
 
-  // The disconnect is the part that must not be lost (it throws, so the webhook 500s and
-  // Meta redelivers). What follows is best-effort and must never undo or fail it.
-  const cancelled = await cancelUnansweredWhatsAppApprovals(userId);
-  const { notifyOwnerStopDisconnected } = await import('./whatsappOwnerNotices');
-  await notifyOwnerStopDisconnected(userId, cancelled);
+  // The email is last and best-effort: it can no longer be allowed to undo or fail the
+  // disconnect. (A crash between the disconnect and this line loses the email, and nothing
+  // else; the marker on the account still says why it has no WhatsApp.)
+  try {
+    const { notifyOwnerStopDisconnected } = await import('./whatsappOwnerNotices');
+    await notifyOwnerStopDisconnected(userId, cancelled);
+  } catch (e) {
+    console.error(
+      `[whatsapp-verify] could not email user ${userId} after STOP:`,
+      e instanceof Error ? e.message : e,
+    );
+  }
   return userId;
 }
 
@@ -494,26 +506,19 @@ export async function disconnectWhatsAppForNumber(phone: string): Promise<string
  * customer can request approval again once they reconnect. Returns how many were cancelled.
  */
 async function cancelUnansweredWhatsAppApprovals(userId: string): Promise<number> {
-  try {
-    const { approvalDb } = await import('./approvalDb');
-    const mine = await approvalDb.getApprovalsByUserId(userId, 200);
-    let cancelled = 0;
-    for (const a of mine) {
-      // Asked on WhatsApp = no Slack message to answer on. An older Slack-era approval is
-      // still answerable in its Slack thread and is left alone.
-      if (a.slackChannel) continue;
-      if (a.status !== 'pending' && a.status !== 'needs_changes') continue;
-      const out = await approvalDb.answerIfOpen(a.assetUrl, 'rejected', 'system:whatsapp-stop', userId);
-      if (out.answered) cancelled++;
-    }
-    return cancelled;
-  } catch (e) {
-    console.error(
-      `[whatsapp-verify] could not cancel the unanswered approvals of user ${userId} after STOP:`,
-      e instanceof Error ? e.message : e,
-    );
-    return 0;
+  const { approvalDb } = await import('./approvalDb');
+  // Every pending approval, not just the newest page. Only `pending`: a `needs_changes`
+  // one may have a revision in flight that would write its own status over this.
+  const mine = await approvalDb.getPendingApprovalsByUserId(userId);
+  let cancelled = 0;
+  for (const a of mine) {
+    // Asked on WhatsApp = no Slack message to answer on. An older Slack-era approval is
+    // still answerable in its Slack thread and is left alone.
+    if (a.slackChannel) continue;
+    const out = await approvalDb.answerIfOpen(a.assetUrl, 'rejected', 'system:whatsapp-stop', userId);
+    if (out.answered) cancelled++;
   }
+  return cancelled;
 }
 
 /**
@@ -525,14 +530,26 @@ export async function resumeVerificationAfterStart(phone: string): Promise<boole
   const pointer = await settingsService.getSetting(optedOutKey(phone));
   if (!pointer?.settingValue) return false;
   const hash = pointer.settingValue;
-  await settingsService.deleteSetting(optedOutKey(phone)).catch(() => {});
 
   const found = await readRow(hash);
   // Only a code that is still waiting on THIS number, and not yet expired (readRow
-  // checks that).
-  if (!found || found.row.status !== 'opted_out' || found.row.phone !== phone) return false;
+  // checks that). Anything else is a stale pointer: drop it.
+  // 'claimed' by this same number is a first attempt that failed part-way: the normal flow
+  // resumes those too, so a redelivered START must not abandon it.
+  if (
+    !found ||
+    (found.row.status !== 'opted_out' && found.row.status !== 'claimed') ||
+    found.row.phone !== phone
+  ) {
+    await settingsService.deleteSetting(optedOutKey(phone)).catch(() => {});
+    return false;
+  }
 
+  // The pointer is dropped only AFTER the connection has been attempted. Deleting it first
+  // meant a storage error here (webhook 500, Meta redelivers) found no pointer on the retry
+  // and the connection was silently abandoned.
   const outcome = await completeFromRow(hash, found.row, found.raw, phone);
+  await settingsService.deleteSetting(optedOutKey(phone)).catch(() => {});
   const reply = REPLIES[outcome];
   if (reply) {
     try {
@@ -544,7 +561,9 @@ export async function resumeVerificationAfterStart(phone: string): Promise<boole
       );
     }
   }
-  return outcome === 'verified';
+  // True when the customer has been answered (connected, or told why not), so the webhook
+  // does not ALSO send the generic opt-in text. Silent outcomes fall back to that text.
+  return Boolean(reply) || outcome === 'already_verified';
 }
 
 export async function disconnectWhatsApp(
@@ -576,8 +595,16 @@ export async function disconnectWhatsApp(
   // and the customer could re-text the same code. They start a fresh verification instead.
   try {
     const pointer = await settingsService.getSetting(userKey(userId));
-    if (pointer?.settingValue) await settingsService.deleteSetting(codeKey(pointer.settingValue));
-    await settingsService.deleteSetting(userKey(userId));
+    if (pointer?.settingValue) {
+      // Only a code that already connected a number is replayable. One still waiting for its
+      // first message (the customer is connecting a REPLACEMENT number) is left alone, or a
+      // STOP from the old number would wipe it.
+      const waiting = await readRow(pointer.settingValue);
+      if (!waiting || waiting.row.status === 'verified' || waiting.row.status === 'claimed') {
+        await settingsService.deleteSetting(codeKey(pointer.settingValue));
+        await settingsService.deleteSetting(userKey(userId));
+      }
+    }
   } catch (e: any) {
     console.warn('[whatsapp] could not clear verification state on disconnect:', e?.message || e);
   }

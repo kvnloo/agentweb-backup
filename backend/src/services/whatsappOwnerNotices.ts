@@ -76,6 +76,19 @@ export async function notifyOwnerUnreachable(userId: string): Promise<boolean> {
   } catch {
     // Rate-limit store down: better one extra email than none.
   }
+  const sent = await sendUnreachable(userId);
+  if (!sent) {
+    // The email did not go: give the day's slot back so the next failure can try again.
+    try {
+      await settingsService.deleteSetting(`whatsapp:unreachable-notice:${userId}`);
+    } catch {
+      // Best-effort: at worst the next failure waits out the day.
+    }
+  }
+  return sent;
+}
+
+function sendUnreachable(userId: string): Promise<boolean> {
   return send(userId, "We couldn't reach you on WhatsApp", [
     "AgentWeb tried to send you an approval request on WhatsApp and it could not be delivered. The results waiting on that approval are on hold.",
     "This usually means the number can't receive WhatsApp messages from AgentWeb right now (for example you blocked the number, or the number changed). Open Settings in AgentWeb to check your WhatsApp connection or connect again.",
