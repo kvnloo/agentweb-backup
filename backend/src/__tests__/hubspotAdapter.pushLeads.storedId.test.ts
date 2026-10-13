@@ -181,6 +181,15 @@ describe('HubspotAdapter batched push — stored contact id wins over email (ENG
     expect(persistedMeta('l1').hubspot_contact_id).toBe('new_a@example.com');
   });
 
+  it.each(['OFF', ' off ', 'Off'])('kill switch is case- and whitespace-insensitive (%j)', async (value) => {
+    process.env.HUBSPOT_PUSH_BY_STORED_ID = value;
+
+    await adapter.pushLeads(auth, [lead('l1', 'a@example.com', 'A')], makeConfig());
+
+    expect(mockBatchUpdateContacts).not.toHaveBeenCalled();
+    expect(mockBatchUpsertContacts).toHaveBeenCalledTimes(1);
+  });
+
   describe('a stored contact HubSpot says is gone', () => {
     it.each([
       ['404', httpErr(404)],
@@ -238,6 +247,19 @@ describe('HubspotAdapter batched push — stored contact id wins over email (ENG
       },
     );
 
+    it('a bare 500 IS bisected: one poison record fails alone instead of failing its whole chunk', async () => {
+      failWhenContains(['POISON'], httpErr(500));
+      const leads = [lead('l1', 'ok1@example.com', 'OK1'), lead('l2', 'p@example.com', 'POISON'), lead('l3', 'ok3@example.com', 'OK3')];
+
+      const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+      expect(persistedMeta('l1')).toMatchObject({ hubspot_contact_id: 'OK1', syncStatus: 'synced' });
+      expect(persistedMeta('l3')).toMatchObject({ hubspot_contact_id: 'OK3', syncStatus: 'synced' });
+      expect(persistedMeta('l2')).toMatchObject({ hubspot_contact_id: 'POISON', syncStatus: 'sync_failed' });
+      expect(mockBatchUpsertContacts).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ successCount: 2, errorCount: 1 });
+    });
+
     it('a network error (no HTTP response) is also not bisected', async () => {
       mockBatchUpdateContacts.mockRejectedValue(new Error('socket hang up'));
 
@@ -256,6 +278,21 @@ describe('HubspotAdapter batched push — stored contact id wins over email (ENG
     expect(mockBatchUpdateContacts.mock.calls[0][0]).toHaveLength(1);
     expect(persistedMeta('l1').hubspot_contact_id).toBe('A');
     expect(persistedMeta('l2').hubspot_contact_id).toBe('A');
+    expect(result).toMatchObject({ successCount: 2, errorCount: 0 });
+  });
+
+  it('leads that share a stored id but have DIFFERENT emails: the second is not reported synced on the first one\'s data', async () => {
+    const leads = [lead('l1', 'a@example.com', 'A'), lead('l2', 'b@example.com', 'A')];
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    // l1 updates contact A; l2 is a different person's email, so it goes the old way (upsert by its OWN email)
+    expect(mockBatchUpdateContacts.mock.calls[0][0]).toEqual([
+      { id: 'A', properties: expect.objectContaining({ email: 'a@example.com' }) },
+    ]);
+    expect(mockBatchUpsertContacts.mock.calls[0][0].map((i: any) => i.email)).toEqual(['b@example.com']);
+    expect(persistedMeta('l1').hubspot_contact_id).toBe('A');
+    expect(persistedMeta('l2').hubspot_contact_id).toBe('new_b@example.com');
     expect(result).toMatchObject({ successCount: 2, errorCount: 0 });
   });
 
