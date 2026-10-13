@@ -14,7 +14,7 @@ describe('extractIssueIds (ENG-131)', () => {
   });
 
   it('ignores lookalikes that are part of a larger token', () => {
-    expect(extractIssueIds('bump XENG-12 and ENG-12a', 'branch swarm/eng-40-x')).toEqual(['ENG-40']);
+    expect(extractIssueIds('bump XENG-12, ENG-12a and chore_ENG-13_fix', 'branch swarm/eng-40-x')).toEqual(['ENG-40']);
   });
 });
 

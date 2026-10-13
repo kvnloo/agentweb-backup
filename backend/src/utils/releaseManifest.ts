@@ -40,7 +40,7 @@ export interface ReleaseManifest {
   unlinkedPrs: number[];
 }
 
-const ISSUE_RE = /(?<![A-Za-z0-9])eng-(\d+)(?![A-Za-z0-9])/gi;
+const ISSUE_RE = /(?<![A-Za-z0-9_])eng-(\d+)(?![A-Za-z0-9_])/gi;
 
 export function extractIssueIds(title: string, body?: string | null): string[] {
   const out: string[] = [];
