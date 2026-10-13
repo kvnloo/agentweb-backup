@@ -171,6 +171,7 @@ import { meterUsageFromResponse } from '../utils/llmClients';
 import { pickTransport } from './funding/transport';
 import { currentRunFunding } from './funding/runFunding';
 import { recordLlmUsage, customerUpstreamCost } from './funding/recordLlmUsage';
+import { resolveCallFunding } from './funding/callFunding';
 import {
   getModelPrice,
   costScoreFromPrice,
@@ -2500,10 +2501,27 @@ export class AgentModeService {
       usageContext = null,
       humanPaced = false,
       timeoutMs,
-      fallbackModels,
+      fallbackModels: requestedFallbackModels,
       taskClass,
       providerPolicy,
     } = options || {};
+
+    // ENG-2108: the funding for THIS call. A run starts AgentWeb-funded; this call moves
+    // to a customer key only when they have a usable key for this model's provider.
+    // Both the transport and the usage record below use this, not the run's ambient value.
+    const callFunding = await resolveCallFunding(currentRunFunding(), {
+      userId: usageContext?.userId,
+      modelLab: this.llmModels[model].provider,
+      feature: usageContext?.feature,
+    });
+    // On a customer key the request may only stay with the customer's provider, so a
+    // fallback model from another lab is dropped rather than left to fail (or bill AgentWeb).
+    const fallbackModels =
+      callFunding?.route === 'api_key'
+        ? requestedFallbackModels?.filter(
+            (id) => this.llmModels[this.normalizeModelId(id)]?.provider === this.llmModels[model].provider,
+          )
+        : requestedFallbackModels;
 
     // AgentWeb owns model selection; OpenRouter owns transport, provider
     // throttling, and provider fallback for every text/tool call.
@@ -2694,7 +2712,7 @@ export class AgentModeService {
     // ENG-1816 F1: send/validate/retry mechanics live in OpenRouterPlatformTransport
     // now (relocated unchanged, not rewritten — see transport/openRouterPlatformTransport.ts).
     // pickTransport always resolves this same transport today; A2 adds ApiKeyTransport.
-    const res = await pickTransport(currentRunFunding(), model).send(client, model, params, {
+    const res = await pickTransport(callFunding, model).send(client, model, params, {
       timeoutMs: timeoutMs ?? 5 * 60 * 1000,
       maxAttempts,
       isRetryableError: isRetryableLlmCallError,
@@ -2766,7 +2784,7 @@ export class AgentModeService {
       const usage: any = (res as any)?.usage;
       if (usage) {
         const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
-        recordLlmUsage(currentRunFunding(), {
+        recordLlmUsage(callFunding, {
           userId: usageContext?.userId,
           billingUserId: usageContext?.billingUserId,
           sessionId: usageContext?.sessionId,
