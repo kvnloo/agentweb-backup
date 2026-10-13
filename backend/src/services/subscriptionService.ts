@@ -426,13 +426,57 @@ export async function isSubscriptionFeatureEnabled(
 }
 
 /**
+ * Last good read of the `subscription_types` setting, used ONLY when the live read fails.
+ *
+ * The read is deliberately uncached in normal operation so an admin edit applies at once. But a
+ * transient DynamoDB error used to make every entitlement check unresolvable for its duration, and
+ * since ENG-1978 an unresolvable tier fails closed — so a blip would strip paid tools from users
+ * mid-conversation. Serving the config we read moments ago keeps those users on the plan they were
+ * on. It is bounded: past the max age (or on a cold process with nothing to serve) we fail closed
+ * as before, so a long outage can never keep honouring a plan an admin has since changed.
+ */
+type SubscriptionTypesSetting = Awaited<ReturnType<typeof settingsService.getSetting>>;
+const SUBSCRIPTION_TYPES_STALE_MAX_AGE_MS = 15 * 60 * 1000;
+const STALE_CONFIG_WARN_INTERVAL_MS = 60 * 1000;
+let lastKnownSubscriptionTypes: { setting: SubscriptionTypesSetting; at: number } | null = null;
+let lastStaleConfigWarnAt = 0;
+
+/** Forget the last good read (tests; a read that must not be served stale). */
+export function resetLastKnownSubscriptionTypes(): void {
+  lastKnownSubscriptionTypes = null;
+  lastStaleConfigWarnAt = 0;
+}
+
+async function readSubscriptionTypesSetting(): Promise<SubscriptionTypesSetting> {
+  try {
+    const setting = await settingsService.getSetting("subscription_types");
+    lastKnownSubscriptionTypes = { setting, at: Date.now() };
+    return setting;
+  } catch (error) {
+    const last = lastKnownSubscriptionTypes;
+    const now = Date.now();
+    if (!last || now - last.at > SUBSCRIPTION_TYPES_STALE_MAX_AGE_MS) throw error;
+    if (now - lastStaleConfigWarnAt >= STALE_CONFIG_WARN_INTERVAL_MS) {
+      lastStaleConfigWarnAt = now;
+      console.warn(
+        `[entitlement] STALE-CONFIG serving the last-known subscription_types (${Math.round(
+          (now - last.at) / 1000
+        )}s old) after a failed read:`,
+        (error as any)?.message || String(error)
+      );
+    }
+    return last.setting;
+  }
+}
+
+/**
  * Get subscription type configuration
  */
 export async function getSubscriptionTypeConfig(
   subscriptionTypeName: string
 ): Promise<SubscriptionType | null> {
   try {
-    const setting = await settingsService.getSetting("subscription_types");
+    const setting = await readSubscriptionTypesSetting();
     let subscriptionTypes: SubscriptionType[] = [];
 
     if (setting) {

@@ -5104,6 +5104,53 @@ router.get("/subscription-types", async (req, res) => {
 });
 
 // Create or update subscription types
+/**
+ * ENG-1978: tiers an admin is about to remove (or rename away from) that accounts are still on.
+ *
+ * A user's tier is stored by NAME. If that name stops existing in `subscription_types`, the
+ * entitlement gate can no longer resolve the user and fails closed, so they drop to the foundation
+ * tools only. Before the gate failed closed those users silently kept every tool, which is why
+ * nothing ever needed to stop this save. Counted by the user's own `subscriptionType`: that covers
+ * org owners (whose tier their members inherit) but not the members themselves, so the count is a
+ * floor. `Free` is also the implicit tier of accounts with no `subscriptionType` at all.
+ */
+async function findStrandedTiers(nextTierNames: string[]): Promise<Array<{ name: string; userCount: number }>> {
+  const current = await settingsService.getSetting("subscription_types");
+  if (!current) return [];
+  let currentTiers: any[];
+  try {
+    currentTiers = JSON.parse(current.settingValue);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(currentTiers)) return [];
+
+  const keep = new Set(nextTierNames);
+  const removed = currentTiers
+    .map((t) => t?.name)
+    .filter((n): n is string => typeof n === "string" && n.length > 0 && !keep.has(n));
+  if (removed.length === 0) return [];
+
+  const values: Record<string, string> = {};
+  removed.forEach((name, i) => { values[`:t${i}`] = name; });
+  const clauses = [`subscriptionType IN (${removed.map((_, i) => `:t${i}`).join(", ")})`];
+  if (removed.includes("Free")) {
+    clauses.push("attribute_not_exists(subscriptionType)", "subscriptionType = :emptyTier");
+    values[":emptyTier"] = "";
+  }
+  const users = await userDb.scanWithFilter(clauses.join(" OR "), values);
+
+  return removed
+    .map((name) => ({
+      name,
+      userCount: users.filter((u) =>
+        u.subscriptionType === name ||
+        (name === "Free" && (u.subscriptionType === undefined || u.subscriptionType === ""))
+      ).length,
+    }))
+    .filter((t) => t.userCount > 0);
+}
+
 router.post("/subscription-types", async (req, res) => {
   try {
     const { subscriptionTypes } = req.body;
@@ -5283,6 +5330,24 @@ router.post("/subscription-types", async (req, res) => {
         ...(normalizedSeatPricing ? { seatPricing: normalizedSeatPricing } : {}),
       };
     }));
+
+    // Refuse to strand accounts on a tier that no longer exists. API callers that really mean it
+    // (e.g. after reassigning users out of band) can pass `allowStrandedUsers: true`.
+    if (req.body.allowStrandedUsers !== true) {
+      const stranded = await findStrandedTiers(normalizedTypes.map((t: any) => t.name));
+      if (stranded.length > 0) {
+        const list = stranded
+          .map((t) => `"${t.name}" (${t.userCount} account${t.userCount === 1 ? "" : "s"})`)
+          .join(", ");
+        return res.status(409).json({
+          message:
+            `Cannot remove or rename ${list}: accounts are still on ${stranded.length === 1 ? "it" : "them"} ` +
+            `(org members of those accounts inherit it too). Move them to another tier first, ` +
+            `otherwise they lose paid tools until reassigned.`,
+          strandedTiers: stranded,
+        });
+      }
+    }
 
     const updatedBy = (req as any).user?.email || "unknown";
     await settingsService.setSetting(

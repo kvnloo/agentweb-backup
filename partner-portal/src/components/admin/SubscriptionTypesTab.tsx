@@ -827,6 +827,8 @@ const SubscriptionTypesTab: React.FC = () => {
                     <TableCell>
                       {type.allowedSkills.includes('*') ? (
                         <Chip label="All Skills" color="primary" size="small" />
+                      ) : type.allowedSkills.length === 0 ? (
+                        <Chip label="No skills" color="warning" size="small" />
                       ) : (
                         <Typography variant="body2" color="text.secondary">
                           {type.allowedSkills.length} skill
@@ -1190,6 +1192,12 @@ const SubscriptionTypesTab: React.FC = () => {
             <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
               Select which Agent Mode skills users with this subscription type can access. Each skill groups related tools together.
             </Typography>
+            {availableSkills.length > 0 && formData.allowedSkills.length === 0 && (
+              <Alert severity="warning" sx={{ mb: 2 }}>
+                No skills are selected. Users on this tier get the built-in basic tools only. An empty
+                list no longer means "all skills"; select every skill (or Select All Skills) to grant them all.
+              </Alert>
+            )}
             <Box
               sx={{
                 maxHeight: 400,

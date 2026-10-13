@@ -5668,6 +5668,9 @@ function getZeroAssistantRequeueDelayMs(retryCount: number): number {
   return Math.min(ZERO_ASSISTANT_REQUEUE_MAX_MS, ZERO_ASSISTANT_REQUEUE_BASE_MS * Math.pow(2, exponent));
 }
 
+// ENG-1978: waits between re-checks of an unresolved entitlement before a scheduled run is deferred.
+const ENTITLEMENT_RETRY_DELAYS_MS = [1000, 2000];
+
 // Common function to run a scheduled chat (used by both test and actual execution)
 //
 // ENG-446: the run result IS the run envelope. It carries the canonical
@@ -5977,7 +5980,15 @@ export async function runScheduledChat(
     const expectedFunctionCalls = schedule.requiredFunctionCalls || [];
     if (expectedFunctionCalls.length > 0) {
       const { getAllowedFunctionCalls } = await import('../services/subscriptionService');
-      const allowedFunctionCalls = await getAllowedFunctionCalls(userId);
+      let allowedFunctionCalls = await getAllowedFunctionCalls(userId);
+
+      // ENG-1978: a null can be a brief settings-read failure rather than a permanent problem, and
+      // skipping a whole scheduled run costs the user their slot. Nobody is waiting on a background
+      // run, so give it a couple of short retries before deferring.
+      for (let attempt = 1; allowedFunctionCalls === null && attempt <= ENTITLEMENT_RETRY_DELAYS_MS.length; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, ENTITLEMENT_RETRY_DELAYS_MS[attempt - 1]));
+        allowedFunctionCalls = await getAllowedFunctionCalls(userId);
+      }
 
       // ENG-1978: null = entitlement unresolved, which is neither "allowed" nor "denied". This is
       // a background path, so it defers rather than deciding — the same shape the scheduled-chat
