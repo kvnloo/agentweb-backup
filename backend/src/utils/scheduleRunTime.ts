@@ -4,7 +4,7 @@ import { fromZonedTime } from 'date-fns-tz';
 // `new Date()` reads such a string in the SERVER's zone (UTC in production), so a
 // wall-clock time the user meant in their own zone would silently shift (Opslane
 // 2026-10-13: 9am New York stored as 09:00Z = 05:00 New York).
-const OFFSETLESS_ISO_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?$/;
+const OFFSETLESS_ISO_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
 
 export type ScheduleRunTimeResult = { iso: string } | { error: string };
 

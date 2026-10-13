@@ -99,6 +99,11 @@ describe('Opslane #1 — offset-less next_run_time', () => {
     expect(result.nextRunTimeLocal).toMatch(/2026.*09:00.*America\/New_York/);
   });
 
+  it('reads microsecond-precision offset-less times in the given timezone too', async () => {
+    await run({ ...baseCreate, next_run_time: '2026-10-19T09:00:00.123456', timezone: 'America/New_York', email_notifications: ['owner@example.com'] });
+    expect(mockScheduleDb.createSchedule.mock.calls[0][0].nextRunTime).toBe('2026-10-19T13:00:00.123Z');
+  });
+
   it('rejects an offset-less next_run_time with no timezone instead of silently reading it as UTC', async () => {
     await expect(run({ ...baseCreate, next_run_time: '2026-10-19T09:00:00', email_notifications: ['owner@example.com'] }))
       .rejects.toThrow(/no UTC offset.*timezone/i);
