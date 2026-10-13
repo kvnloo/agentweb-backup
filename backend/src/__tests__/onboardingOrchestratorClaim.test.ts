@@ -143,4 +143,53 @@ describe("concurrent reconcile passes over one user", () => {
     expect(store.user.steps?.a?.status).toBe("failed");
     expect(store.user.steps?.z?.output).toBe("kept");
   });
+
+  it("still records a finished step when every conditional write keeps losing to other writers", async () => {
+    const { store, deps } = sharedStore();
+    const runs = jest.fn(async () => ({ made: "by-a" }));
+    // After the claim, another writer changes the map before every conditional write.
+    let claimed = false;
+    const contended = {
+      ...deps,
+      updateUserSteps: async (id: string, steps: UserSteps, expected?: { steps: UserSteps | null }) => {
+        if (expected && claimed) {
+          store.user = { ...store.user, steps: { ...store.user.steps, [`noise${Math.random()}`]: { output: null, inputsHash: "h", generation: 1, provenance: "anticipated", status: "ready", ranAt: "t" } } as any };
+        }
+        const result = await deps.updateUserSteps(id, steps, expected);
+        claimed = true;
+        return result;
+      },
+    };
+    const dag = { a: { deps: [], gatherInputs: () => ({ x: 1 }), runner: runs } } as any;
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const report = await new OnboardingPipelineOrchestrator({ dag, isEnabledGlobally: () => true, ...contended }).reconcile("u1");
+    warn.mockRestore();
+
+    // Never left `running`, which nothing would revisit.
+    expect(store.user.steps?.a?.status).toBe("ready");
+    expect(report.fired[0]).toMatchObject({ step: "a", status: "ready" });
+  });
+
+  it("does not record a finished step as failed when writing its result throws", async () => {
+    const { store, deps } = sharedStore();
+    const runs = jest.fn(async () => ({ made: "by-a" }));
+    let writes = 0;
+    const flaky = {
+      ...deps,
+      updateUserSteps: async (id: string, steps: UserSteps, expected?: { steps: UserSteps | null }) => {
+        // 1st write is the claim; the 2nd (the result) fails once. A later write
+        // would succeed, so a wrongly recorded failure is visible in the store.
+        if (++writes === 2) throw new Error("dynamo unavailable");
+        return deps.updateUserSteps(id, steps, expected);
+      },
+    };
+    const dag = { a: { deps: [], gatherInputs: () => ({ x: 1 }), runner: runs } } as any;
+    await expect(
+      new OnboardingPipelineOrchestrator({ dag, isEnabledGlobally: () => true, ...flaky }).reconcile("u1"),
+    ).rejects.toThrow(/dynamo unavailable/);
+
+    // The runner succeeded; a failed write of its result must not turn into a recorded failure.
+    expect(runs).toHaveBeenCalledTimes(1);
+    expect(store.user.steps?.a?.status).not.toBe("failed");
+  });
 });
