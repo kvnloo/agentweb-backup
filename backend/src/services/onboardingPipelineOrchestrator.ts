@@ -498,19 +498,28 @@ export class OnboardingPipelineOrchestrator {
       const latestGen = latest?.steps?.[step]?.generation ?? generation;
       if (!isResultFresh(generation, latestGen)) return { written: false, latestGen };
       const next: UserSteps = { ...(latest?.steps ?? fallback), [step]: record };
+      // The final attempt is unconditional. A step left `running` is never
+      // revisited (shouldFire skips a running record with unchanged inputs), so
+      // failing to record a finished result would strand it for good, which is
+      // worse than the tiny window in which this write could drop a sibling
+      // that landed since the read above.
+      const lastAttempt = attempt === MAX_COMMIT_ATTEMPTS - 1;
       try {
         await this.deps.updateUserSteps(
           userId,
           next,
-          latest ? { steps: latest.steps ?? null } : undefined,
+          latest && !lastAttempt ? { steps: latest.steps ?? null } : undefined,
         );
+        if (lastAttempt && attempt > 0) {
+          console.warn("[onboardingPipelineOrchestrator] recorded a step result without the compare-and-swap after repeated conflicts", { userId, step });
+        }
         return { written: true, steps: next };
       } catch (err) {
-        if ((err as { code?: string })?.code !== "ConditionalCheckFailedException") throw err;
+        if ((err as { code?: string })?.code !== "ConditionalCheckFailedException" || lastAttempt) throw err;
         await new Promise((resolve) => setTimeout(resolve, 15 * (attempt + 1) + Math.random() * 25));
       }
     }
-    throw new Error(`could not record the result of step ${step}: the pipeline state kept changing`);
+    throw new Error(`could not record the result of step ${step}`);
   }
 
   /**
@@ -628,59 +637,60 @@ export class OnboardingPipelineOrchestrator {
       }
       const { inputs, inputsHash, generation, prev } = claimed;
 
+      let output: unknown;
+      let runFailure: { reason: string } | null = null;
       try {
-        const output = await node.runner({
+        output = await node.runner({
           userId,
           inputs,
           inputsHash,
           generation,
         });
-
-        const readyRecord: StepRecord<unknown> = {
-          output,
-          inputsHash,
-          generation,
-          provenance: prev?.provenance ?? "anticipated",
-          status: "ready",
-          ranAt: this.deps.now(),
-        };
-        // Compare against the *latest* persisted generation, not our local
-        // working copy, to catch cancel-and-replace from concurrent reconcile()
-        // calls (see commitStepRecord).
-        const committed = await this.commitStepRecord(userId, step, generation, readyRecord, workingSteps);
-        if (!committed.written) {
-          report.skipped.push({
-            step,
-            reason: `stale generation ${generation} < ${committed.latestGen}`,
-          });
-          continue;
-        }
-        workingSteps = committed.steps;
-        workingUser.steps = workingSteps;
-        persisted = workingSteps;
-        report.fired.push({ step, generation, status: "ready" });
       } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err);
-        const failedRecord: StepRecord<unknown> = {
-          output: prev?.output ?? null,
-          inputsHash,
-          generation,
-          provenance: prev?.provenance ?? "anticipated",
-          status: "failed",
-          failedReason: reason,
-          ranAt: this.deps.now(),
-        };
-        const committed = await this.commitStepRecord(userId, step, generation, failedRecord, workingSteps);
-        if (committed.written) {
-          workingSteps = committed.steps;
-          workingUser.steps = workingSteps;
-          persisted = workingSteps;
-        }
-        report.fired.push({ step, generation, status: "failed", reason });
-        // On failure, downstream steps will be gated by the
-        // upstream-not-ready check above; no need to break out of the
-        // loop explicitly.
+        runFailure = { reason: err instanceof Error ? err.message : String(err) };
       }
+
+      // Recording the result is deliberately outside the runner's try: a failure
+      // to WRITE a finished step must not be recorded as that step having failed,
+      // which would make the next pass run it again.
+      const record: StepRecord<unknown> = runFailure
+        ? {
+            output: prev?.output ?? null,
+            inputsHash,
+            generation,
+            provenance: prev?.provenance ?? "anticipated",
+            status: "failed",
+            failedReason: runFailure.reason,
+            ranAt: this.deps.now(),
+          }
+        : {
+            output,
+            inputsHash,
+            generation,
+            provenance: prev?.provenance ?? "anticipated",
+            status: "ready",
+            ranAt: this.deps.now(),
+          };
+      // Compared against the *latest* persisted generation, not our local working
+      // copy, to catch cancel-and-replace from concurrent reconcile() calls (see
+      // commitStepRecord). On failure, downstream steps stay gated by the
+      // upstream-not-ready check above.
+      const committed = await this.commitStepRecord(userId, step, generation, record, workingSteps);
+      if (!committed.written) {
+        report.skipped.push({
+          step,
+          reason: `stale generation ${generation} < ${committed.latestGen}`,
+        });
+        continue;
+      }
+      workingSteps = committed.steps;
+      workingUser.steps = workingSteps;
+      persisted = workingSteps;
+      report.fired.push(
+        runFailure
+          ? { step, generation, status: "failed", reason: runFailure.reason }
+          : { step, generation, status: "ready" },
+      );
     }
 
     return report;
