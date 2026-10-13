@@ -171,6 +171,7 @@ import { meterUsageFromResponse } from '../utils/llmClients';
 import { pickTransport } from './funding/transport';
 import { currentRunFunding } from './funding/runFunding';
 import { recordLlmUsage, customerUpstreamCost } from './funding/recordLlmUsage';
+import { resolveCallFunding } from './funding/callFunding';
 import {
   getModelPrice,
   costScoreFromPrice,
@@ -1017,6 +1018,8 @@ export interface SupportedModelInfo {
 const PROMPT_CACHE_DEFAULT_TTL_MS = 5 * 60 * 1000;
 
 interface LLMCallOptions {
+  /** ENG-2108: set only by the agent's own working loop; lets this call use a customer key. */
+  customerRoutable?: boolean;
   tools?: any[] | null;
   tool_choice?: 'auto' | 'none' | any | null;
   /** Execute search through OpenRouter's provider-independent server tool. */
@@ -1717,6 +1720,7 @@ export class AgentModeService {
         await import('../mcp/server/evaluationTools');
         await import('../emma/tools');
         await import('../emma/fathomTools');
+        await import('../emma/lumaTools');
         await import('../emma/meetingActionRouter');
         await import('../emma/notionGuideTools');
         await import('../emma/slackMessageTools');
@@ -2500,10 +2504,30 @@ export class AgentModeService {
       usageContext = null,
       humanPaced = false,
       timeoutMs,
-      fallbackModels,
+      fallbackModels: requestedFallbackModels,
+      customerRoutable = false,
       taskClass,
       providerPolicy,
     } = options || {};
+
+    // ENG-2108: the funding for THIS call. A run starts AgentWeb-funded; this call moves
+    // to a customer key only when they have a usable key for this model's provider.
+    // Both the transport and the usage record below use this, not the run's ambient value.
+    const callFunding = await resolveCallFunding(currentRunFunding(), {
+      userId: usageContext?.userId,
+      modelLab: this.llmModels[model].provider,
+      customerRoutable,
+    });
+    // On a customer key the request may only stay with the customer's provider, so a
+    // fallback model from another lab is dropped rather than left to fail (or bill AgentWeb).
+    const fallbackModels =
+      callFunding?.route === 'api_key'
+        ? requestedFallbackModels?.filter((id) => {
+            const fallback = this.llmModels[this.normalizeModelId(id)];
+            // An unknown id is kept so it is rejected below exactly as on an AgentWeb call.
+            return !fallback || fallback.provider === this.llmModels[model].provider;
+          })
+        : requestedFallbackModels;
 
     // AgentWeb owns model selection; OpenRouter owns transport, provider
     // throttling, and provider fallback for every text/tool call.
@@ -2694,7 +2718,7 @@ export class AgentModeService {
     // ENG-1816 F1: send/validate/retry mechanics live in OpenRouterPlatformTransport
     // now (relocated unchanged, not rewritten — see transport/openRouterPlatformTransport.ts).
     // pickTransport always resolves this same transport today; A2 adds ApiKeyTransport.
-    const res = await pickTransport(currentRunFunding(), model).send(client, model, params, {
+    const res = await pickTransport(callFunding, model).send(client, model, params, {
       timeoutMs: timeoutMs ?? 5 * 60 * 1000,
       maxAttempts,
       isRetryableError: isRetryableLlmCallError,
@@ -2766,7 +2790,7 @@ export class AgentModeService {
       const usage: any = (res as any)?.usage;
       if (usage) {
         const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
-        recordLlmUsage(currentRunFunding(), {
+        recordLlmUsage(callFunding, {
           userId: usageContext?.userId,
           billingUserId: usageContext?.billingUserId,
           sessionId: usageContext?.sessionId,
@@ -4003,6 +4027,7 @@ export class AgentModeService {
             // Scheduled and interactive conversations canary independently;
             // OpenRouter owns provider fallback once either class is enabled.
             taskClass: chatTaskClass,
+            customerRoutable: true,
             // ENG-2121: bound this call to whatever remains before the synthesis
             // reserve (computed above) instead of letting it run unbounded — see the
             // catch block below for what happens when this actually fires.
@@ -6413,6 +6438,10 @@ export class AgentModeService {
     'fathom_get_transcript',
     'fathom_get_onboarding_context',
 
+    // Luma API (ENG-2338): guest lists without a browser login
+    'luma_list_events',
+    'luma_get_guests',
+
     // Coding Agent (sub-agent for code editing tasks)
     'coding_agent',
 
@@ -6527,6 +6556,12 @@ export class AgentModeService {
     'fathom_get_meetings',
     'fathom_get_transcript',
     'fathom_get_onboarding_context',
+    // Luma API (ENG-2338). Force-merged for the same reason as the Fathom tools: a
+    // stale prod `foundation_tools` override would otherwise strip them. Like Fathom,
+    // they stay reachable with no key connected so the model gets the "connect Luma /
+    // fall back to the browser path" guidance instead of a generic not-available error.
+    'luma_list_events',
+    'luma_get_guests',
     // ENG-396/400: re-exposed after being found dormant-only in practice (a
     // user asking Emma to "confirm settings via a card before building"
     // couldn't get one at all — she has no way to render a real card and was
