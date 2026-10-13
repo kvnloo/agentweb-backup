@@ -970,7 +970,125 @@ export function didSourcingBlockStateChange(
   return true;
 }
 
-export function computeScheduleRunHealth(runResults: any[] | undefined | null): ScheduleRunHealth {
+// ENG-2234 (AC-A): a scheduled run that never starts writes no runResults entry,
+// so runHealth used to read healthy (0 failures) across a silently skipped run.
+// These fields surface that gap; they are only present when the caller passes the
+// schedule's cadence (computeScheduleRunHealth's second argument).
+export interface ScheduleMissedRunHealth {
+  // Expected runs that never started, counted from gaps between consecutive real
+  // runs plus an overdue tail (nextRunTime passed without a run).
+  missedRuns: number;
+  // Human-readable reason for the most recent missed run, null when none.
+  lastMissedRunReason: string | null;
+}
+
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+// Grace before a run counts as missed: the scheduler polls periodically and a run
+// may legitimately start late (lease contention, deploys).
+export const MISSED_RUN_GRACE_MS = 2 * HOUR_MS;
+
+/** Nominal interval between runs, or null when the cadence is unknown/irregular. */
+export function scheduleCadenceMs(
+  frequency: string | undefined | null,
+  frequencyIntervalDays?: number | null,
+): number | null {
+  switch (frequency) {
+    case 'hourly':
+      return HOUR_MS;
+    case 'daily':
+      return DAY_MS;
+    case 'every_n_days': {
+      const n = typeof frequencyIntervalDays === 'number' && Number.isInteger(frequencyIntervalDays) && frequencyIntervalDays >= 1
+        ? frequencyIntervalDays
+        : 1;
+      return n * DAY_MS;
+    }
+    case 'weekly':
+      return 7 * DAY_MS;
+    default:
+      // monthly (nth-weekday, 28-35d) and one-off schedules have no fixed interval.
+      return null;
+  }
+}
+
+/**
+ * ENG-2234 (AC-A): detect expected scheduled runs that never started.
+ *
+ * Pure: reads only the run history timestamps, the cadence, the schedule status
+ * and nextRunTime. Gaps between consecutive runs longer than one interval plus the
+ * grace window count floor((gap - grace) / interval) missed runs. An active
+ * schedule whose nextRunTime is more than the grace window in the past also counts
+ * the overdue tail. A paused schedule is expected not to run, so its overdue tail
+ * is never counted.
+ */
+export function detectMissedScheduledRuns(
+  runResults: any[] | undefined | null,
+  schedule: {
+    frequency?: string | null;
+    frequencyIntervalDays?: number | null;
+    status?: string | null;
+    nextRunTime?: string | null;
+  },
+  now: number = Date.now(),
+): ScheduleMissedRunHealth {
+  const none: ScheduleMissedRunHealth = { missedRuns: 0, lastMissedRunReason: null };
+  const cadence = scheduleCadenceMs(schedule?.frequency, schedule?.frequencyIntervalDays);
+  if (!cadence) return none;
+
+  const times = (Array.isArray(runResults) ? runResults : [])
+    .map((r: any) => (r && typeof r === 'object' ? Date.parse(r.createdAt) : NaN))
+    .filter((t: number) => !Number.isNaN(t))
+    .sort((a: number, b: number) => a - b);
+
+  let missedRuns = 0;
+  let lastMissedRunReason: string | null = null;
+  const describe = (fromMs: number, count: number) =>
+    `${count} expected ${schedule.frequency} run${count === 1 ? '' : 's'} after ` +
+    `${new Date(fromMs).toISOString()} never started (no run recorded)`;
+
+  for (let i = 1; i < times.length; i++) {
+    const gap = times[i] - times[i - 1];
+    const missed = gap > cadence + MISSED_RUN_GRACE_MS
+      ? Math.floor((gap - MISSED_RUN_GRACE_MS) / cadence)
+      : 0;
+    if (missed > 0) {
+      missedRuns += missed;
+      lastMissedRunReason = describe(times[i - 1], missed);
+    }
+  }
+
+  if (schedule.status === 'active' && typeof schedule.nextRunTime === 'string') {
+    const next = Date.parse(schedule.nextRunTime);
+    if (!Number.isNaN(next) && now - next > MISSED_RUN_GRACE_MS) {
+      const overdue = 1 + Math.floor((now - next - MISSED_RUN_GRACE_MS) / cadence);
+      missedRuns += overdue;
+      lastMissedRunReason =
+        `Scheduled run due ${new Date(next).toISOString()} is overdue and never started` +
+        (overdue > 1 ? ` (${overdue} runs missed)` : '');
+    }
+  }
+
+  return { missedRuns, lastMissedRunReason };
+}
+
+export function computeScheduleRunHealth(runResults: any[] | undefined | null): ScheduleRunHealth;
+export function computeScheduleRunHealth(
+  runResults: any[] | undefined | null,
+  schedule: Parameters<typeof detectMissedScheduledRuns>[1],
+  now?: number,
+): ScheduleRunHealth & ScheduleMissedRunHealth;
+export function computeScheduleRunHealth(
+  runResults: any[] | undefined | null,
+  schedule?: Parameters<typeof detectMissedScheduledRuns>[1],
+  now?: number,
+): ScheduleRunHealth | (ScheduleRunHealth & ScheduleMissedRunHealth) {
+  const base = computeRecordedRunHealth(runResults);
+  if (!schedule) return base;
+  return { ...base, ...detectMissedScheduledRuns(runResults, schedule, now) };
+}
+
+function computeRecordedRunHealth(runResults: any[] | undefined | null): ScheduleRunHealth {
   const results = Array.isArray(runResults) ? runResults : [];
   if (results.length === 0) {
     return { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0, lastRunBlockedBy: null };
@@ -13193,7 +13311,7 @@ export const agentModeController = {
         // revoke. Emitted as a present boolean rather than an absent key so a consumer
         // never has to guess what "missing" meant.
         autopublishAuthorized: rest.autopublishAuthorized === true,
-        runHealth: computeScheduleRunHealth(runResults),
+        runHealth: computeScheduleRunHealth(runResults, rest),
       }));
 
       res.json(scheduledChatsWithHealth);
