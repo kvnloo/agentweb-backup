@@ -2113,6 +2113,77 @@ export const createLlmConnectionsTable = async () => {
   catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
 };
 
+// Create Attempt Usage table (ENG-2106 — customer-funded usage journal; append-only, no
+// secrets). Must stay identical to ATTEMPT_USAGE_TABLE_SPEC in
+// services/funding/dynamoAttemptUsageJournal.ts, which is what the boot-time
+// ensureCriticalTables creates; attemptUsageTable.test.ts fails if they differ. TTL
+// (attribute `ttl`, 400 days) and point-in-time recovery are separate calls CreateTable
+// cannot make; they are attempted below, non-fatally, like the model-change audit table.
+export const createAttemptUsageTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-AttemptUsage`,
+    AttributeDefinitions: [
+      { AttributeName: 'attemptId', AttributeType: 'S' },
+      { AttributeName: 'runId', AttributeType: 'S' },
+      { AttributeName: 'connectionId', AttributeType: 'S' },
+      { AttributeName: 'fundingPrincipalId', AttributeType: 'S' },
+      { AttributeName: 'startedAt', AttributeType: 'S' },
+    ],
+    KeySchema: [{ AttributeName: 'attemptId', KeyType: 'HASH' }],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'RunIndex',
+        KeySchema: [
+          { AttributeName: 'runId', KeyType: 'HASH' },
+          { AttributeName: 'startedAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'ConnectionIndex',
+        KeySchema: [
+          { AttributeName: 'connectionId', KeyType: 'HASH' },
+          { AttributeName: 'startedAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'PrincipalIndex',
+        KeySchema: [
+          { AttributeName: 'fundingPrincipalId', KeyType: 'HASH' },
+          { AttributeName: 'startedAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+    DeletionProtectionEnabled: true,
+  };
+  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
+  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+
+  try {
+    await dynamodb.updateTimeToLive({
+      TableName: params.TableName,
+      TimeToLiveSpecification: { Enabled: true, AttributeName: 'ttl' },
+    }).promise();
+    console.log(`Enabled TTL on ${params.TableName} (attribute: ttl)`);
+  } catch (error: any) {
+    if (!(error.code === 'ValidationException' && /already enabled/i.test(error.message || ''))) {
+      console.warn(`[create-tables] Could not enable TTL on ${params.TableName}: ${error.code || error.message}. Run: aws dynamodb update-time-to-live --table-name ${params.TableName} --time-to-live-specification "Enabled=true,AttributeName=ttl"`);
+    }
+  }
+  try {
+    await dynamodb.updateContinuousBackups({
+      TableName: params.TableName,
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true },
+    }).promise();
+    console.log(`Enabled point-in-time recovery on ${params.TableName}`);
+  } catch (error: any) {
+    console.warn(`[create-tables] Could not enable point-in-time recovery on ${params.TableName}: ${error.code || error.message}. Run: aws dynamodb update-continuous-backups --table-name ${params.TableName} --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true`);
+  }
+};
+
 export const createModelChangeAuditTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: `${TABLE_PREFIX}AW-ModelChangeAudit`,
@@ -2749,6 +2820,7 @@ const main = async () => {
     await createSpendProjectionTable();
     await createModelChangeAuditTable();
     await createLlmConnectionsTable();
+    await createAttemptUsageTable();
     await createLandingPagesTable();
     await createAccountMemoryTable();
     await createOrgMemoryTable();
