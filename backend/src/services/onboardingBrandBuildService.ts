@@ -441,6 +441,11 @@ export async function triggerBrandBuildForUser(
     try {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const { provisionOnboardingSlackConnect } = require("./slackConnectService");
+      // One platform per customer (ENG-273): an account that is on WhatsApp is not
+      // also given a Slack Connect channel.
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { hasWhatsApp } = require("./customerChannelPolicy");
+      if (hasWhatsApp(user)) return;
       await provisionOnboardingSlackConnect({
         userId,
         companyName,

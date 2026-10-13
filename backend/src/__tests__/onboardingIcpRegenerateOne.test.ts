@@ -424,10 +424,10 @@ describe("regenerateSingleIcpForUser — joined a full run (statusOwnedElsewhere
     await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), statusOwnedElsewhere: true });
     const opts = userDb.updateUser.mock.calls[0][2];
     expect(opts.condition.expression).toBe(
-      "#icpStatus = :icpDeferRunning AND #icpStartedAt = :icpDeferStartedAt AND #icpResult[1].#icpCardId = :icpCardId",
+      "#icpStatus = :icpDeferRunning AND #icpStartedAt = :icpDeferStartedAt AND #icpResult[1] = :icpCardNow",
     );
     expect(opts.condition.values).toEqual({
-      ":icpCardId": "icp_x_1",
+      ":icpCardNow": expect.objectContaining({ id: "icp_x_1" }),
       ":icpDeferRunning": "running",
       ":icpDeferStartedAt": startedAt,
     });

@@ -12,6 +12,8 @@ import { redactAccountSecrets, redactAccountsSecrets } from '../utils/accountSec
 import { oauthSessionDb } from '../services/db';
 import { MetaAdAccount, MetaInstagramAccount } from '../types/meta';
 import { getJwtSecret } from '../config/jwt';
+import { buildMetaConnectUrl } from '../services/metaConnectUrl';
+import { raiseMetaConnectionHandoff, verifyMetaAdAccountReadBack } from '../services/metaConnectionHandoff';
 
 const router = express.Router();
 const META_PRECONNECT_INSTRUCTIONS =
@@ -23,10 +25,6 @@ const META_PRECONNECT_INSTRUCTIONS =
 // ============================================
 // Helpers
 // ============================================
-
-function generateState(userId: string, extra: Record<string, any> = {}): string {
-    return jwt.sign({ userId, ...extra, timestamp: Date.now(), nonce: crypto.randomBytes(16).toString('hex') }, getJwtSecret(), { expiresIn: '10m' });
-}
 
 function verifyState(state: string): { userId: string; flow?: MetaFlowType } {
     const secret = getJwtSecret();
@@ -50,18 +48,6 @@ interface MetaOAuthTokenSession {
     meta_page_count?: number;
     meta_page_health_error?: string;
     flow: MetaFlowType;
-}
-
-function buildOAuthUrl(params: { authorizationUrl: string; clientId: string; redirectUri: string; scopes: string[]; state: string; authType?: string }): string {
-    const searchParams = new URLSearchParams({
-        client_id: params.clientId,
-        redirect_uri: params.redirectUri,
-        state: params.state,
-        scope: params.scopes.join(','),
-        response_type: 'code',
-        ...(params.authType ? { auth_type: params.authType } : {})
-    });
-    return `${params.authorizationUrl}?${searchParams.toString()}`;
 }
 
 async function storeTokenSession(userId: string, tokens: Omit<MetaOAuthTokenSession, 'userId'>): Promise<string> {
@@ -119,30 +105,8 @@ router.get('/init', authenticateToken, async (req: any, res) => {
         const rawFlow = req.query.flow as string | undefined;
         const flow: MetaFlowType = (rawFlow === 'instagram' || rawFlow === 'marketing') ? rawFlow : 'marketing';
 
-        // Use Instagram credentials for Instagram Business Login, Facebook App creds for marketing/pages
-        const creds = flow === 'instagram'
-            ? await getInstagramCredentials()
-            : await getMetaCredentials();
         const flowCfg = getMetaFlowConfig(flow);
-        const redirectUri = flow === 'instagram'
-            ? INTEGRATION_CONFIG.meta.instagramRedirectUri
-            : INTEGRATION_CONFIG.meta.redirectUri;
-        const clientId = flow === 'instagram'
-            ? creds.instagramClientId
-            : creds.clientId;
-        const state = generateState(userId, { flow });
-
-        const url = buildOAuthUrl({
-            authorizationUrl: flowCfg.authorizationUrl,
-            clientId: clientId,
-            redirectUri,
-            scopes: flowCfg.scopes,
-            state,
-            // Meta does not re-prompt for declined permissions during an ordinary reconnect.
-            // `rerequest` is the documented path that lets a customer approve previously
-            // declined Pages/permissions instead of receiving another token with the same gap.
-            authType: flow === 'marketing' ? 'rerequest' : undefined
-        });
+        const url = await buildMetaConnectUrl(userId, flow);
 
         console.log(`[Meta Init] flow=${flow}, scopes=${flowCfg.scopes.join(',')}`);
         res.json({
@@ -507,7 +471,20 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
             });
             connectedAccounts.push(account);
 
-            await safeAutoResolve('Meta Connect Ad Accounts', userId, 'meta', adAccount.account_id);
+            // ENG-1986: post-reconnect read-back — a 200 from OAuth is not proof the
+            // credential reads the account. Best-effort; never fails the connect.
+            const readBack = await verifyMetaAdAccountReadBack(adAccount.account_id, session.access_token);
+            if (!readBack.ok) {
+                await raiseMetaConnectionHandoff({
+                    reason: 'reconnect_readback_failed',
+                    userId,
+                    customerEmail: req.user?.email,
+                    account,
+                    error: readBack.error || 'read-back failed',
+                });
+            } else {
+                await safeAutoResolve('Meta Connect Ad Accounts', userId, 'meta', adAccount.account_id);
+            }
         }
 
         // ENG-2232: names which of the just-connected accounts have no accessible
