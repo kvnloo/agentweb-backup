@@ -31,9 +31,14 @@ jest.mock('../services/whatsappService', () => ({
 jest.mock('../services/whatsappVerificationService', () => ({
   handleVerificationMessage: jest.fn(),
   disconnectWhatsAppForNumber: jest.fn(),
+  resumeVerificationAfterStart: jest.fn(),
 }));
 jest.mock('../services/approvalChannelNotifier', () => ({
   handleApprovalButtonTap: jest.fn(),
+  lookupApprovalMessage: jest.fn(),
+}));
+jest.mock('../services/whatsappOwnerNotices', () => ({
+  notifyOwnerUnreachable: jest.fn(),
 }));
 jest.mock('../services/whatsappInboundSupport', () => ({
   handleUnrecognizedMessage: jest.fn(),
@@ -49,7 +54,9 @@ const {
   sendText,
   sendOptOutConfirmation,
 } = require('../services/whatsappService');
-const { handleVerificationMessage, disconnectWhatsAppForNumber } = require('../services/whatsappVerificationService');
+const { lookupApprovalMessage } = require('../services/approvalChannelNotifier');
+const { notifyOwnerUnreachable } = require('../services/whatsappOwnerNotices');
+const { handleVerificationMessage, disconnectWhatsAppForNumber, resumeVerificationAfterStart } = require('../services/whatsappVerificationService');
 const { handleApprovalButtonTap } = require('../services/approvalChannelNotifier');
 const { handleUnrecognizedMessage } = require('../services/whatsappInboundSupport');
 const { getWhatsAppCredentials } = require('../utils/secretsManager');
@@ -261,6 +268,28 @@ describe('POST — inbound messages', () => {
     expect(sendOptOutConfirmation).not.toHaveBeenCalled();
   });
 
+  it('START finishes a connection that was waiting on it, and sends the opt-in text only when nothing was waiting', async () => {
+    resumeVerificationAfterStart.mockResolvedValue(true);
+    await post(inboundPayload('START'));
+    expect(resumeVerificationAfterStart).toHaveBeenCalledWith('+14155550123');
+    expect(sendText).not.toHaveBeenCalled(); // the resume already replied "You're connected"
+  });
+
+  it('START with nothing waiting sends the ordinary opt-in confirmation', async () => {
+    resumeVerificationAfterStart.mockResolvedValue(false);
+    sendText.mockResolvedValue(undefined);
+    await post(inboundPayload('START'));
+    expect(sendText).toHaveBeenCalledWith('+14155550123', 'opt-in-confirmation-copy');
+  });
+
+  it('START answers 500 (Meta redelivers) when finishing the waiting connection hits a storage error', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    resumeVerificationAfterStart.mockRejectedValue(new Error('dynamo down'));
+    const res = await post(inboundPayload('START'));
+    expect(res.status).toBe(500);
+    expect(recordOptIn).toHaveBeenCalled(); // the opt-in itself is already safe
+  });
+
   it('does not disconnect anyone for START / UNSTOP', async () => {
     await post(inboundPayload('UNSTOP'));
     expect(disconnectWhatsAppForNumber).not.toHaveBeenCalled();
@@ -314,6 +343,29 @@ describe('POST — inbound messages', () => {
     expect(errSpy.mock.calls.flat().join(' ')).not.toContain('4155550123');
     expect(recordInboundMessage).not.toHaveBeenCalled();
     errSpy.mockRestore();
+  });
+
+  it('emails the owner when a failed receipt belongs to an approval request', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    lookupApprovalMessage.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-1' });
+    await post(statusPayload('failed'));
+    expect(lookupApprovalMessage).toHaveBeenCalledWith('wamid.OUT1');
+    expect(notifyOwnerUnreachable).toHaveBeenCalledWith('user-1');
+  });
+
+  it('does not email anyone for a failed receipt that was not an approval request', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    lookupApprovalMessage.mockResolvedValue(null);
+    await post(statusPayload('failed'));
+    expect(notifyOwnerUnreachable).not.toHaveBeenCalled();
+  });
+
+  it('a failure while acting on a receipt never fails the webhook', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    lookupApprovalMessage.mockRejectedValue(new Error('dynamo down'));
+    const res = await post(statusPayload('failed'));
+    expect(res.status).toBe(200);
   });
 
   it('stays quiet for a delivered receipt', async () => {

@@ -4947,6 +4947,11 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                       <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
                                         Slack can't be added while WhatsApp is connected.
                                       </Typography>
+                                      {user.whatsappOptedOut && (
+                                        <Typography variant="caption" color="error" sx={{ display: "block" }}>
+                                          This number texted STOP, so nothing can reach it. Disconnect it.
+                                        </Typography>
+                                      )}
                                       <Button
                                         size="small"
                                         color="error"
@@ -4968,6 +4973,17 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                             // null = looked up, nothing connected. undefined = the lookup failed
                                             // (or an older backend), which is not the same as "not connected".
                                             if (user.messagingPlatform === undefined) return "Unknown";
+                                            const gone = user.whatsappDisconnect;
+                                            if (gone) {
+                                              const when = new Date(gone.at).toLocaleDateString();
+                                              const why =
+                                                gone.reason === "stop"
+                                                  ? "customer texted STOP"
+                                                  : gone.reason === "admin"
+                                                    ? "removed by support"
+                                                    : "customer removed it";
+                                              return `Not connected (WhatsApp: ${why}, ${when})`;
+                                            }
                                             return "Not connected";
                                           }
                                           return "Slack: " + ids.map((id) =>

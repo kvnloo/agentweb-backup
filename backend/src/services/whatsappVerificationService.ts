@@ -62,6 +62,7 @@ const CODE_PATTERN = new RegExp(`^[${CODE_ALPHABET}]{${CODE_LENGTH}}$`);
 
 const codeKey = (hash: string) => `whatsapp:verify:${hash}`;
 const userKey = (userId: string) => `whatsapp:verify-user:${userId}`;
+const optedOutKey = (phone: string) => `whatsapp:verify-optedout:${phone}`;
 const failKey = (phone: string) => `whatsapp:verify-fail:${phone}`;
 const DESCRIPTION = 'WhatsApp number-ownership verification';
 
@@ -248,7 +249,7 @@ async function saveVerifiedChannel(
   // retry, and resolveUserIdByPhone ignores (and heals) a row whose account lacks the number.
   if ((await claimPhoneForUser(phone, row.userId)) === 'held_by_other') return 'number_in_use';
 
-  await userDb.updateUser(row.userId, { messagingChannels: [...others, entry] } as any);
+  await userDb.updateUser(row.userId, { messagingChannels: [...others, entry], whatsappDisconnect: null } as any);
 
   // Release the number the account is replacing. Without this the old number keeps
   // resolving to them and could answer their approvals.
@@ -286,8 +287,16 @@ export async function completeVerification(rawCode: string, sender: string): Pro
 
   const found = await readRow(hash);
   if (!found) return recordFailure(phone);
-  const { row, raw } = found;
+  return completeFromRow(hash, found.row, found.raw, phone);
+}
 
+/** Everything after the code has been found: shared by a typed code and a resume on START. */
+async function completeFromRow(
+  hash: string,
+  row: VerificationRow,
+  raw: string,
+  phone: string,
+): Promise<VerificationOutcome> {
   if (row.status === 'verified') {
     return row.phone === phone ? 'already_verified' : recordFailure(phone);
   }
@@ -321,6 +330,17 @@ export async function completeVerification(rawCode: string, sender: string): Pro
     // on the row so the portal can tell the user why nothing happened.
     if (await isOptedOut(phone)) {
       await writeRow(hash, { ...row, status: 'opted_out', phone });
+      // Remember which code is waiting on this number's START, so START can finish the
+      // connection by itself instead of making the customer type the code a second time.
+      await settingsService
+        .setSetting(
+          optedOutKey(phone),
+          hash,
+          DESCRIPTION,
+          'system',
+          epochSeconds(Date.parse(row.expiresAt)),
+        )
+        .catch((e: any) => console.warn('[whatsapp-verify] could not index the waiting code:', e?.message || e));
       return 'opted_out';
     }
 
@@ -447,13 +467,89 @@ export async function handleVerificationMessage(text: string, phone: string): Pr
  */
 export async function disconnectWhatsAppForNumber(phone: string): Promise<string | null> {
   const userId = await resolveUserIdByPhone(phone);
-  if (!userId) return null;
-  await disconnectWhatsApp(userId);
+  if (!userId) {
+    // A number that sent STOP but that no account can be found for: either nobody holds it
+    // or it was verified before the phone -> user index existed. Say so where support can
+    // see it; an account in the second case is still bound to an opted-out number.
+    console.warn(
+      `[whatsapp-verify] STOP from ${redactPhone(phone)}: no account found for the number, nothing disconnected`,
+    );
+    return null;
+  }
+  await disconnectWhatsApp(userId, 'stop');
+
+  // The disconnect is the part that must not be lost (it throws, so the webhook 500s and
+  // Meta redelivers). What follows is best-effort and must never undo or fail it.
+  const cancelled = await cancelUnansweredWhatsAppApprovals(userId);
+  const { notifyOwnerStopDisconnected } = await import('./whatsappOwnerNotices');
+  await notifyOwnerStopDisconnected(userId, cancelled);
   return userId;
+}
+
+/**
+ * Approvals that were sent to this customer on WhatsApp and are still waiting. After STOP
+ * nobody can answer them: the buttons are on a number that is now unbound, and a held
+ * task would otherwise wait for ever with no record of why. Mark them rejected, by the
+ * system, so the state is explicit (the results they were holding are NOT sent) and the
+ * customer can request approval again once they reconnect. Returns how many were cancelled.
+ */
+async function cancelUnansweredWhatsAppApprovals(userId: string): Promise<number> {
+  try {
+    const { approvalDb } = await import('./approvalDb');
+    const mine = await approvalDb.getApprovalsByUserId(userId, 200);
+    let cancelled = 0;
+    for (const a of mine) {
+      // Asked on WhatsApp = no Slack message to answer on. An older Slack-era approval is
+      // still answerable in its Slack thread and is left alone.
+      if (a.slackChannel) continue;
+      if (a.status !== 'pending' && a.status !== 'needs_changes') continue;
+      const out = await approvalDb.answerIfOpen(a.assetUrl, 'rejected', 'system:whatsapp-stop', userId);
+      if (out.answered) cancelled++;
+    }
+    return cancelled;
+  } catch (e) {
+    console.error(
+      `[whatsapp-verify] could not cancel the unanswered approvals of user ${userId} after STOP:`,
+      e instanceof Error ? e.message : e,
+    );
+    return 0;
+  }
+}
+
+/**
+ * The number sent START. If it had a connection waiting on exactly that (the customer
+ * typed their code while still opted out), finish it now — they should not have to type the
+ * code a second time. Returns true when it did, and has already replied.
+ */
+export async function resumeVerificationAfterStart(phone: string): Promise<boolean> {
+  const pointer = await settingsService.getSetting(optedOutKey(phone));
+  if (!pointer?.settingValue) return false;
+  const hash = pointer.settingValue;
+  await settingsService.deleteSetting(optedOutKey(phone)).catch(() => {});
+
+  const found = await readRow(hash);
+  // Only a code that is still waiting on THIS number, and not yet expired (readRow
+  // checks that).
+  if (!found || found.row.status !== 'opted_out' || found.row.phone !== phone) return false;
+
+  const outcome = await completeFromRow(hash, found.row, found.raw, phone);
+  const reply = REPLIES[outcome];
+  if (reply) {
+    try {
+      await sendMessage({ destination: phone, text: reply });
+    } catch (e) {
+      console.warn(
+        `[whatsapp-verify] ${outcome} reply to ${redactPhone(phone)} failed:`,
+        e instanceof Error ? e.message : e,
+      );
+    }
+  }
+  return outcome === 'verified';
 }
 
 export async function disconnectWhatsApp(
   userId: string,
+  reason: 'stop' | 'customer' | 'admin' = 'customer',
 ): Promise<{ removed: string | null; channels: UserMessagingChannelConfig[] } | null> {
   const user = await userDb.getUserById(userId);
   if (!user) return null;
@@ -461,7 +557,11 @@ export async function disconnectWhatsApp(
   const existing = explicitChannels(user as any);
   const removed = existing.find((c) => c.channel === 'whatsapp')?.destination ?? null;
   const channels = existing.filter((c) => c.channel !== 'whatsapp');
-  await userDb.updateUser(userId, { messagingChannels: channels } as any);
+  await userDb.updateUser(userId, {
+    messagingChannels: channels,
+    // Why there is no number any more, for support. Last four digits only.
+    ...(removed ? { whatsappDisconnect: { reason, at: new Date().toISOString(), last4: removed.slice(-4) } } : {}),
+  } as any);
 
   if (removed) {
     try {
