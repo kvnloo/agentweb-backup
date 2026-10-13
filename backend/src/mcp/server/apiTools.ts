@@ -664,8 +664,9 @@ export function validateManageScheduledChatArgs(args: any): string | null {
   }
   if (action === 'create' || action === 'update') {
     if (args.email_notifications !== undefined &&
-        (!Array.isArray(args.email_notifications) || args.email_notifications.length === 0)) {
-      return fail('email_notifications must be a non-empty array of email addresses when provided');
+        !Array.isArray(args.email_notifications)) {
+      // [] is valid: the explicit "no email" opt-out (Opslane #2).
+      return fail('email_notifications must be an array of email addresses when provided (use [] for no email)');
     }
     if (args.next_run_time !== undefined && Number.isNaN(Date.parse(args.next_run_time))) {
       return fail('next_run_time must be an ISO 8601 datetime (e.g. 2026-10-14T09:00:00Z)');
