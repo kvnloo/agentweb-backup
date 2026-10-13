@@ -85,8 +85,9 @@ export function guardLeadPutBody(body: unknown, opts: LeadPutGuardOptions): Lead
 
     const cleaned: Record<string, unknown> = { ...body };
     for (const key of flagged) delete cleaned[key];
-    // The client no longer decides who changed a suppression, or when.
-    if (typeof cleaned.contactStatus === 'string' && cleaned.contactStatus) cleaned.contactStatusUpdatedBy = opts.userId;
+    // The client no longer decides who changed a suppression, or when. updateLead writes the actor/time pair whenever contactStatus is present and not null
+    // (any value, including an empty string), so stamp in exactly those cases: otherwise a stale actor would sit next to a fresh time.
+    if (cleaned.contactStatus !== undefined && cleaned.contactStatus !== null) cleaned.contactStatusUpdatedBy = opts.userId;
     return { body: cleaned, flaggedKeys: flagged, dropped: true };
   } catch {
     return untouched;
@@ -133,12 +134,14 @@ export function contactSuppressionAuditEvent(input: ContactSuppressionAuditInput
     return {
       eventType: 'contact_status.changed',
       eventData: {
-        from: { contactStatus: beforeStatus, unsubscribedFromGroupEmail: beforeUnsub },
-        to: {
-          contactStatus: afterStatus,
-          ...(updates.contactStatusReason !== undefined ? { contactStatusReason: reason(updates.contactStatusReason) } : {}),
-          unsubscribedFromGroupEmail: afterUnsub,
-        },
+        // FLAT primitives on purpose. The customer portal's Engagements dialog (CRM.tsx) reads eventData.from / eventData.to for EVERY event type
+        // and renders them as React children, so an object there crashes the page; EngagementTimeline's generic row shows eventData.note.
+        // Do not name a key from / to / subject / message / content / platform.
+        fromStatus: beforeStatus,
+        toStatus: afterStatus,
+        fromGroupEmailUnsubscribed: beforeUnsub,
+        toGroupEmailUnsubscribed: afterUnsub,
+        ...(updates.contactStatusReason !== undefined ? { reason: reason(updates.contactStatusReason) } : {}),
         actorUserId: input.actorUserId,
         ...(input.delegatedByUserId ? { delegatedByUserId: input.delegatedByUserId } : {}),
         channel: input.channel,
