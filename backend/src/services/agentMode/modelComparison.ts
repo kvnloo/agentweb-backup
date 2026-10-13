@@ -204,7 +204,7 @@ export interface SelectDeps {
   isEntitled?(user: CompareUser): Promise<boolean>;
   /** `consistentRead` is requested for the re-read under the lock (replay/guard must see our own writes). */
   getSession(sessionId: string, options?: { consistentRead?: boolean }): Promise<CompareSession | null>;
-  tryClaim(sessionId: string): boolean;
+  tryClaim(sessionId: string, ownerUserId?: string): boolean;
   release(sessionId: string): void;
   appendMessages(sessionId: string, messages: ChatMessage[]): Promise<{ messages?: ChatMessage[] }>;
   updateSessionModel(sessionId: string, model: string): Promise<unknown>;
@@ -905,7 +905,7 @@ async function selectCompareResultInner(
     return fail(410, 'This comparison has expired. Run it again.', 'compare_expired');
   }
 
-  if (!deps.tryClaim(req.sessionId)) {
+  if (!deps.tryClaim(req.sessionId, session.userId)) {
     return fail(409, 'A response is already being generated for this session. Please wait.', 'SESSION_BUSY', {
       message: 'A response is already being generated for this session. Please wait.',
     });
