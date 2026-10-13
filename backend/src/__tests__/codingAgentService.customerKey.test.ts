@@ -166,6 +166,23 @@ describe('coding agent on the customer\'s own key (ENG-2108)', () => {
     expect(platformCreate).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['an HTTP 503', () => Object.assign(new Error('kms unavailable'), { status: 503 })],
+    ['a connection error', () => new RealAnthropic.APIConnectionError({ message: 'Connection error.' })],
+    ['a reset connection', () => Object.assign(new Error('reset'), { cause: { code: 'ECONNRESET' } })],
+  ])('fails the turn, without trying OpenRouter, when reading the key itself fails with %s', async (_label, makeError) => {
+    // Errors from the key store look like outages but are not the provider being down: a
+    // key that cannot be read must fail the turn, not move it to another route.
+    mockGetKeyMaterial.mockRejectedValue(makeError());
+    orCreate.mockResolvedValue(finalTurn);
+    const result = await runCodingAgent('edit', context);
+
+    expect(result.success).toBe(false);
+    expect(mockDirectCreate).not.toHaveBeenCalled();
+    expect(orCreate).not.toHaveBeenCalled();
+    expect(platformCreate).not.toHaveBeenCalled();
+  });
+
   it('refuses a subscription route rather than running its turns on AgentWeb\'s key', async () => {
     mockResolveCallFunding.mockResolvedValue(customerFunding({ route: 'claude_subscription' }));
     // Every client would succeed, so only the refusal itself can make the turn fail.

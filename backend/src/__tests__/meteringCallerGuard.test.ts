@@ -86,10 +86,15 @@ describe('which callLLM calls may use a customer key (ENG-2108)', () => {
   });
 
   it('lets only the coding agent skip the provisioner for Anthropic keys', () => {
-    const setters = sourceFiles(SRC)
-      .filter((file) => /canCallAnthropicDirect\s*:\s*true/.test(fs.readFileSync(file, 'utf8').replace(/\/\/.*$/gm, '')))
-      .map((file) => path.relative(SRC, file).split(path.sep).join('/'));
-    expect(setters).toEqual(['services/codingAgentService.ts']);
+    // Any mention at all (shorthand, computed key, a spread) outside these two files fails,
+    // not just the literal `canCallAnthropicDirect: true`.
+    const files = sourceFiles(SRC)
+      .filter((file) => fs.readFileSync(file, 'utf8').replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').includes('canCallAnthropicDirect'))
+      .map((file) => path.relative(SRC, file).split(path.sep).join('/'))
+      .sort();
+    expect(files).toEqual(['services/codingAgentService.ts', 'services/funding/callFunding.ts']);
+    const caller = fs.readFileSync(path.join(SRC, 'services/codingAgentService.ts'), 'utf8');
+    expect([...caller.matchAll(/canCallAnthropicDirect:\s*true/g)]).toHaveLength(1);
   });
 
   it('is opted in by the coding agent exactly once, on its own turns', () => {
