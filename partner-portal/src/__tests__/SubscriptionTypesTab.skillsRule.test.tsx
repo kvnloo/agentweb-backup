@@ -116,6 +116,20 @@ describe('SubscriptionTypesTab — empty allowedSkills means no skills (ENG-1978
     expect(body.subscriptionTypes.find((t: any) => t.name === 'Everything').allowedSkills).toEqual(['*']);
   });
 
+  it('refuses to save a NEW tier before the skill list has loaded', async () => {
+    mockMount([tier('Existing', ['*'])], []);
+
+    render(<SubscriptionTypesTab />);
+    await waitFor(() => expect(screen.getByText('Existing')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /add subscription type/i }));
+
+    fireEvent.change(await screen.findByLabelText('Subscription Type Name'), { target: { value: 'Fresh' } });
+    fireEvent.click(screen.getByRole('button', { name: /save|create/i }));
+
+    expect(await screen.findByText(/Skills are still loading/i)).toBeInTheDocument();
+    expect(mockedAxiosPost).not.toHaveBeenCalled();
+  });
+
   it('a * tier with the skill list loaded still round-trips as *', async () => {
     mockMount([tier('Everything', ['*'])]);
 

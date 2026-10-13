@@ -804,6 +804,45 @@ describe('Admin subscription types routes', () => {
       expect(scanSpy).not.toHaveBeenCalled();
     });
 
+    it('lists every removed tier that has accounts, with one IN placeholder per removed name', async () => {
+      stored(['Free', 'Pro', 'Starter']);
+      scanSpy.mockResolvedValue([
+        { subscriptionType: 'Pro' }, { subscriptionType: 'Starter' }, { subscriptionType: 'Starter' },
+      ]);
+
+      const res = await post(['Free']).expect(409);
+
+      expect(res.body.strandedTiers).toEqual([
+        { name: 'Pro', userCount: 1 },
+        { name: 'Starter', userCount: 2 },
+      ]);
+      const [filter, values] = scanSpy.mock.calls[0];
+      expect(filter).toContain('subscriptionType IN (:t0, :t1)');
+      expect(values).toEqual({ ':t0': 'Pro', ':t1': 'Starter' });
+    });
+
+    it('counts a null subscriptionType as Free and asks DynamoDB for NULL-typed attributes', async () => {
+      stored(['Free', 'Pro']);
+      scanSpy.mockResolvedValue([{ userId: 'a', subscriptionType: null }]);
+
+      const res = await post(['Pro']).expect(409);
+
+      expect(res.body.strandedTiers).toEqual([{ name: 'Free', userCount: 1 }]);
+      const [filter, values] = scanSpy.mock.calls[0];
+      expect(filter).toContain('attribute_type(subscriptionType, :nullType)');
+      expect(values[':nullType']).toBe('NULL');
+    });
+
+    it('answers 503 and saves nothing when the account check itself fails', async () => {
+      stored(['Free', 'Pro']);
+      scanSpy.mockRejectedValue(new Error('ProvisionedThroughputExceededException'));
+
+      const res = await post(['Free']).expect(503);
+
+      expect(res.body.message).toMatch(/nothing was saved/i);
+      expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
+    });
+
     it('counts accounts with no subscriptionType as Free when Free is removed', async () => {
       stored(['Free', 'Pro']);
       scanSpy.mockResolvedValue([{ userId: 'a' }, { userId: 'b', subscriptionType: '' }, { subscriptionType: 'Free' }]);
