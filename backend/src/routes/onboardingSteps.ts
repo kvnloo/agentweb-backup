@@ -42,7 +42,6 @@ import {
 } from "../services/icpStatusService";
 import {
   casUpdateIcpList,
-  ICP_LIST_CONTENDED,
   regenerateSingleIcpForUser,
   startIcpDiscoveryForUser,
 } from "../services/onboardingIcpService";
@@ -833,9 +832,6 @@ router.post("/icp/edit-one", authenticateToken, async (req, res) => {
     const nextList = outcome.next;
     return res.json({ icpResult: nextList });
   } catch (err) {
-    if ((err as any)?.code === ICP_LIST_CONTENDED) {
-      return res.status(409).json({ message: "The personas changed while saving. Please try again." });
-    }
     console.error("[icp] edit-one failed", err);
     return res.status(500).json({ message: "Failed to edit icp" });
   }
@@ -961,9 +957,6 @@ router.post("/icp/delete-one", authenticateToken, async (req, res) => {
     const nextList = outcome.next;
     return res.json({ icpResult: nextList });
   } catch (err) {
-    if ((err as any)?.code === ICP_LIST_CONTENDED) {
-      return res.status(409).json({ message: "The personas changed while saving. Please try again." });
-    }
     console.error("[icp] delete-one failed", err);
     return res.status(500).json({ message: "Failed to delete icp" });
   }

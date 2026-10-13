@@ -7,7 +7,7 @@ import type { DailyVolumeState } from './linkedInWritePacer';
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly' | 'slack';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly' | 'slack' | 'luma';
 
 /**
  * ENG-1616 — the subset of `PlatformType` that `postOnConnectedAccount` treats as
@@ -282,6 +282,19 @@ export interface FathomConfig {
   token_expires_at: number;
 }
 
+/**
+ * Luma calendar API key (ENG-2338). Keys are scoped to ONE Luma calendar and need
+ * a Luma Plus subscription. Like Fathom, the key itself lives in `access_token`
+ * (so the shared secret redaction already covers it); there is no expiry, so
+ * `token_expires_at` is pinned far in the future and a dead key is flagged via
+ * `needs_reconnect` instead.
+ */
+export interface LumaConfig extends BaseOAuthConfig {
+  account_type: 'api_key';
+  calendar_url?: string;
+  needs_reconnect?: boolean;
+}
+
 export interface LinkedInAdsAdAccountConfig extends BaseOAuthConfig {
   account_type: 'ad_account';
   currency: string;
@@ -406,7 +419,7 @@ export interface SlackConfig extends BaseOAuthConfig {
   team_id: string;
 }
 
-export type PlatformConfig = SlackConfig | LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig;
+export type PlatformConfig = SlackConfig | LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig | LumaConfig;
 
 /**
  * Per-connection engagement memory: a persona profile generated from LinkedIn data
@@ -1161,7 +1174,7 @@ export const getAccountsByAttioWorkspaceId = async (
  * Attio would be better served by its own key (e.g. `webhook_scope_missing`); until then
  * the exception is explicit rather than implied.
  */
-const RECONNECT_MEANS_DEAD_CREDENTIAL = new Set(['hubspot', 'twitter']);
+const RECONNECT_MEANS_DEAD_CREDENTIAL = new Set(['hubspot', 'twitter', 'luma']);
 
 export const isTokenValid = async (account: ConnectedAccount): Promise<boolean> => {
   const now = Date.now();

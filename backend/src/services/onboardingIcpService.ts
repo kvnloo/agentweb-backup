@@ -511,7 +511,6 @@ export type IcpListEdit<T> =
   | { next: ICPPersona[]; result: T }
   | { status: 400 | 404 };
 
-export const ICP_LIST_CONTENDED = "ICP_LIST_CONTENDED";
 const MAX_LIST_WRITE_ATTEMPTS = 6;
 
 /**
@@ -528,26 +527,67 @@ export async function casUpdateIcpList<T>(
   userId: string,
   edit: (list: ICPPersona[]) => IcpListEdit<T>,
 ): Promise<{ ok: true; next: ICPPersona[]; result: T } | { ok: false; status: 400 | 404 }> {
+  // One list write per user at a time within this process. Most contention on a
+  // user's list is requests that landed on the same instance (a user clicking
+  // quickly); queueing them here means they never fight over the condition, so
+  // the compare-and-swap below is left for contention BETWEEN instances. Without
+  // it, 20 simultaneous writes exhausted the retries and the unconditional final
+  // attempt lost an edit.
+  const behind = icpListQueues.get(userId) ?? Promise.resolve();
+  const mine = behind.catch(() => undefined).then(() => casUpdateIcpListUnqueued(userId, edit));
+  icpListQueues.set(userId, mine);
+  try {
+    return await mine;
+  } finally {
+    if (icpListQueues.get(userId) === mine) icpListQueues.delete(userId);
+  }
+}
+
+const icpListQueues = new Map<string, Promise<unknown>>();
+
+/** The compare-and-swap itself, without the per-process queue. Exported so tests can simulate two instances. */
+export async function casUpdateIcpListUnqueued<T>(
+  userId: string,
+  edit: (list: ICPPersona[]) => IcpListEdit<T>,
+): Promise<{ ok: true; next: ICPPersona[]; result: T } | { ok: false; status: 400 | 404 }> {
   for (let attempt = 0; attempt < MAX_LIST_WRITE_ATTEMPTS; attempt++) {
     const user: any = await readUserForRegeneration(userId);
     const list: ICPPersona[] = Array.isArray(user?.icpResult) ? user.icpResult : [];
     const decided = edit(list);
     if ("status" in decided) return { ok: false, status: decided.status };
+    // The final attempt is unconditional. The condition is whole-list equality, so
+    // a list that never reads back equal to what is stored (or sustained
+    // contention) would otherwise fail every edit and delete for that user, with
+    // nothing the user could do about it. Applying the change computed from the
+    // freshest read costs a concurrent change that lands between that read and
+    // this write: the lost update this helper exists to avoid, but only after five
+    // straight losses, i.e. under sustained contention, and it is logged below.
+    const lastAttempt = attempt === MAX_LIST_WRITE_ATTEMPTS - 1;
     try {
-      await userDb.updateUser(userId, { icpResult: decided.next as any }, {
-        condition: {
-          expression: "#icpResult = :icpListExpected",
-          names: { "#icpResult": "icpResult" },
-          values: { ":icpListExpected": list },
-        },
-      });
+      await userDb.updateUser(
+        userId,
+        { icpResult: decided.next as any },
+        lastAttempt
+          ? undefined
+          : {
+              condition: {
+                expression: "#icpResult = :icpListExpected",
+                names: { "#icpResult": "icpResult" },
+                values: { ":icpListExpected": list },
+              },
+            },
+      );
+      if (lastAttempt) {
+        console.warn("[onboardingIcpService] saved the persona list without the compare-and-swap after repeated conflicts", { userId });
+      }
       return { ok: true, next: decided.next, result: decided.result };
     } catch (err: any) {
-      if (err?.code !== "ConditionalCheckFailedException") throw err;
+      if (err?.code !== "ConditionalCheckFailedException" || lastAttempt) throw err;
       await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1) + Math.random() * 30));
     }
   }
-  throw Object.assign(new Error("the ICP list kept changing"), { code: ICP_LIST_CONTENDED });
+  // Unreachable: the loop returns or throws on its last attempt.
+  throw new Error("casUpdateIcpList exhausted its attempts");
 }
 
 /** True when the user has hand-written at least one field of this persona. */
