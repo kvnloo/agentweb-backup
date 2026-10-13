@@ -33,6 +33,7 @@ import {
   type RecipientRemediation,
 } from '../services/scheduledReportAccess';
 import { settingsService } from '../services/settingsService';
+import { sessionActiveRunGuard } from '../services/agentMode/sessionActiveRunGuardInstance';
 import { workPlanService } from '../services/workPlanService';
 import { projectWorkPlanForCustomer } from '../services/workPlanCustomerProjection';
 import { v4 as uuidv4 } from 'uuid';
@@ -9646,14 +9647,20 @@ export const agentModeController = {
             session,
           )
         : null;
+      // ENG-110: `activeRun` (runId/instanceId) is internal: read it, never serialise it.
+      const { activeRun, ...sessionForClient } = session;
+      // A run live on ANOTHER instance (deploy overlap) counts as generating for the genuine owner only.
+      const generatingElsewhere = genuineOwnerView && activeRun
+        ? await sessionActiveRunGuard.hasLiveRunElsewhere(activeRun).catch(() => false)
+        : false;
       const filteredSession = {
-        ...session,
+        ...sessionForClient,
         ...(healedBranchedFrom ? { branchedFrom: healedBranchedFrom } : {}),
         messages: filterMessagesForClient(session.messages, { viewerIsAdmin }),
         hasActiveProgress: progressActive,
         // ENG-110: additive, owner-only. In-memory on THIS instance (an Immutable deploy overlap hides the
         // other instance's runs). Admins/delegates viewing someone else's session never get it.
-        ...(genuineOwnerView ? { isGenerating: isSessionGeneratingForUser(session.sessionId, user?.userId) } : {}),
+        ...(genuineOwnerView ? { isGenerating: isSessionGeneratingForUser(session.sessionId, user?.userId) || generatingElsewhere } : {}),
         skills,
         ...modelAttribution,
       };
@@ -10018,6 +10025,25 @@ export const agentModeController = {
       if (!tryClaimSessionGeneration(sessionId, session.userId) && !(await preemptAutoContinuationAndWait(sessionId, session.userId))) {
         // A DIFFERENT message on a busy session: give back the idem claim we
         // just took so the user's retry (after the busy run finishes) is accepted.
+        if (idemKeyHeld) {
+          await releaseIdempotency(idemKeyHeld);
+          idemKeyHeld = undefined;
+        }
+        return res.status(409).json({
+          error: 'Session is busy',
+          message: 'A response is already being generated for this session. Please wait.',
+          code: 'SESSION_BUSY',
+        });
+      }
+
+      // ENG-110: cross-instance guard. The in-memory lock above only sees THIS instance; during an Immutable
+      // deploy overlap the old instance may still be running this very session. One conditional write claims
+      // `activeRun` on the session item. Switch off (default) => no DynamoDB call at all; any non-condition
+      // error => fail open (claim() never throws). Busy => release everything claimed so far, exactly like the
+      // in-memory busy path above (the cap slot is only taken below, after this point).
+      const activeRunClaim = await sessionActiveRunGuard.claim(sessionId).catch((): { status: 'skipped' } => ({ status: 'skipped' }));
+      if (activeRunClaim.status === 'busy') {
+        releaseSessionGeneration(sessionId);
         if (idemKeyHeld) {
           await releaseIdempotency(idemKeyHeld);
           idemKeyHeld = undefined;
@@ -10593,6 +10619,9 @@ export const agentModeController = {
         void markRunTerminal(runSurvivalRunId, 'completed');
       }
       } finally {
+        // ENG-110: stop the heartbeat timer (synchronously) and clear OUR activeRun on every exit: success,
+        // throw, timeout, stop, crash. The clear is best-effort and conditional on our runId.
+        if (activeRunClaim.status === 'claimed') void activeRunClaim.release().catch(() => undefined);
         generationSlot?.release();
         releaseSessionGeneration(sessionId);
         // Terminal state reached (success OR error unwinding through here):
@@ -12049,6 +12078,23 @@ export const agentModeController = {
       return res.status(401).json({ error: 'Unauthorized' });
     }
     const sessionIds = getClaimedSessionIdsForUser(user.userId);
+    // ENG-110: optional `?sessionId=<id>` also reports that ONE session when a run is live on another instance
+    // (deploy overlap). One record-only GetItem, no index; owner only (never a delegate or another user).
+    // Without the param, or with the switch off, nothing below runs and the answer is unchanged.
+    const probe = req.query?.sessionId;
+    if (typeof probe === 'string' && probe.length > 0 && probe.length <= 200 && !sessionIds.includes(probe)
+      && !(req as any).delegateInfo?.isDelegated) {
+      try {
+        if (await sessionActiveRunGuard.isEnabled()) {
+          const record = await chatbotDb.getChatSessionRecord(probe);
+          if (record && record.userId === user.userId && await sessionActiveRunGuard.hasLiveRunElsewhere(record.activeRun)) {
+            sessionIds.push(probe);
+          }
+        }
+      } catch (error) {
+        console.error('AgentMode: generating probe failed (ignored):', (error as Error)?.name);
+      }
+    }
     res.setHeader?.('Cache-Control', 'no-store');
     return res.json({ sessionIds });
   },
