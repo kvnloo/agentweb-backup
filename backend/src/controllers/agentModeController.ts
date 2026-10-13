@@ -1841,6 +1841,13 @@ async function userExplicitlyRequestedStop(sessionId: string, usageContext?: LLM
   }
 }
 
+/** ENG-2378: public plan responses never expose step models (the plan-level defaultModel exposure is pre-existing). */
+function withoutStepModels(steps: any): any {
+  return Array.isArray(steps)
+    ? steps.map((s) => (s && typeof s === 'object' && 'model' in s ? (({ model: _m, ...rest }) => rest)(s) : s))
+    : steps;
+}
+
 /**
  * ENG-2378: what the current plan step demands of THIS turn's model.
  *  - `none`: no plan, switch off, or the pending step has no explicit model: the turn runs exactly as before.
@@ -15524,7 +15531,7 @@ export const agentModeController = {
         showInAgentMode: p.showInAgentMode !== false,
         defaultModel: p.defaultModel,
         category: p.category,
-        steps: p.steps,
+        steps: withoutStepModels(p.steps),
         visibility: p.visibility,
         thumbnail_url: p.thumbnail_url,
         thumbnail_alt_text: p.thumbnail_alt_text,
@@ -15612,7 +15619,7 @@ export const agentModeController = {
         showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
         showInAgentMode: workPlan.showInAgentMode !== false,
         defaultModel: workPlan.defaultModel,
-        steps: workPlan.steps,
+        steps: withoutStepModels(workPlan.steps),
         visibility: workPlan.visibility,
         // Canonical customer-facing projection alongside the legacy keys above
         // — existing consumers are unaffected (ENG-1469).

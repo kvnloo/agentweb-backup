@@ -1,4 +1,5 @@
 import type { WorkPlanStep } from "./workPlanService";
+import { carryStoredStepModels } from "./agentMode/workPlanStepModels";
 
 /**
  * The step fields a submitted work plan can actually persist. The write routes
@@ -49,7 +50,13 @@ export function normalizeWorkPlanSteps(
   steps: any[],
   // ENG-2378: the `work_plan_step_models_enabled` switch, read by the calling route. Off (the default) = a submitted
   // step `model` is reported and dropped, i.e. exactly the pre-feature behaviour.
-  options: { stepModelsEnabled?: boolean } = {},
+  options: {
+    stepModelsEnabled?: boolean;
+    /** The plan's stored steps: a stored step model is carried onto the matching submitted step (never erased by a write). */
+    storedSteps?: ReadonlyArray<any>;
+    /** Carry the stored model even when the switch is on and the submitted step omits the key (routes with no content-loss guard). */
+    keepStoredWhenOmitted?: boolean;
+  } = {},
 ): NormalizedWorkPlanSteps {
   const warnings: string[] = [];
 
@@ -153,7 +160,20 @@ export function normalizeWorkPlanSteps(
     };
   });
 
-  return { steps: normalized, warnings };
+  // ENG-2378: a write must never erase a stored step model. Switch off / unknown: the submitted value is ignored and
+  // the stored one carried. Switch on: only an explicit value/blank decides; an omitted key is carried where the route
+  // has no content-loss guard of its own (keepStoredWhenOmitted).
+  const withCarried = options.storedSteps
+    ? carryStoredStepModels(normalized, options.storedSteps, (i) => {
+        if (!options.stepModelsEnabled) return true;
+        const raw: any = steps[i];
+        const submitted = raw && typeof raw === 'object' ? raw.model : undefined;
+        if (typeof submitted === 'string') return false; // explicit value or explicit clear
+        return !!options.keepStoredWhenOmitted;
+      })
+    : normalized;
+
+  return { steps: withCarried, warnings };
 }
 
 /* ─── Work-plan step guards (ENG-1221) ──────────────────────────────────────

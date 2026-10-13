@@ -168,7 +168,7 @@ router.put("/:planId", async (req, res) => {
     );
     if (!modelCheck.ok) return res.status(422).json(modelCheck.body);
     const stepModelsEnabled = (anyStepCarriesModel(steps) || anyStepCarriesModel(plan.steps)) && await workPlanStepModels.isEnabled();
-    const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps, { stepModelsEnabled }) : undefined;
+    const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps, { stepModelsEnabled, storedSteps: plan.steps, keepStoredWhenOmitted: true }) : undefined;
     if (normalized) {
       // ENG-2378: only a NEW or CHANGED step model is validated; an unchanged stored one is tolerated.
       const stepModelCheck = await checkPlanStepModelsWrite(

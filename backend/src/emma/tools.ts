@@ -7854,11 +7854,17 @@ emmaToolRegistry.register({
       }
     }
 
+    // ENG-2378: a step model on the session plan is the user's explicit choice; carry it into the saved template
+    // while per-step models are honoured (switch on, or unknown after a settings outage).
+    const { anyStepCarriesModel, carryStoredStepModels } = await import('../services/agentMode/workPlanStepModels');
+    const carrySessionModels = anyStepCarriesModel(sessionWorkPlan?.steps)
+      && await (await import('../services/agentMode/workPlanStepModelsInstance')).workPlanStepModels.shouldHonor();
+
     const plan = await workPlanService.createWorkPlan({
       title: args.title,
       description: args.description || '',
       welcomeMessage: args.welcomeMessage || '',
-      steps: steps.map((s: any, i: number) => {
+      steps: (carrySessionModels ? (list: any[]) => carryStoredStepModels(list, sessionWorkPlan.steps) : (list: any[]) => list)(steps.map((s: any, i: number) => {
         const stepNum = s.stepCount || i + 1;
         const sessionStep = sessionStepMap.get(stepNum);
         return {
@@ -7881,7 +7887,7 @@ emmaToolRegistry.register({
             return count !== undefined ? { expectedAssetCount: count } : {};
           })(),
         };
-      }),
+      })),
       ownerId: userId,
       visibility: 'private',
       isBuiltIn: false,

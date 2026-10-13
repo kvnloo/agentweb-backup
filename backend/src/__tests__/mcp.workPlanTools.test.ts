@@ -1317,14 +1317,13 @@ describe('Predefined Work Plan MCP Tools', () => {
       expect('model' in putBody().steps[0]).toBe(false);
     });
 
-    it('a replace that would blank a stored step model is refused (model is a guarded content field)', async () => {
+    it('a replace built without models (the tool never shows them) carries the stored models instead of erasing them', async () => {
       mockFetches();
-      const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
         action: 'update', plan_id: 'wp-m',
         steps: [{ stepCount: 1, title: 'One', description: 'd1' }, { stepCount: 2, title: 'Two', description: 'd2' }],
       }, context);
-      expect(result.content[0].text).toContain('model');
-      expect(mockMcpFetch.mock.calls.some((c: any) => c[0].method === 'PUT')).toBe(false);
+      expect(putBody().steps.map((s: any) => s.model)).toEqual(['gpt-5-chat', undefined]);
     });
 
     it('the step schema documents model so an LLM caller can see it', () => {

@@ -40,6 +40,7 @@ export interface WorkPlanStepModelsSwitchDeps {
 
 export function createWorkPlanStepModelsSwitch(deps: WorkPlanStepModelsSwitchDeps) {
   let known = false; // last successfully read value; cold start => off
+  let everRead = false; // a read has succeeded at least once (otherwise the state is UNKNOWN, not "off")
   let validUntil = 0;
   let inFlight: Promise<void> | null = null; // one refresh at a time
 
@@ -47,6 +48,7 @@ export function createWorkPlanStepModelsSwitch(deps: WorkPlanStepModelsSwitchDep
     try {
       const row = await deps.getSetting(WORK_PLAN_STEP_MODELS_SETTING);
       known = row?.settingValue === 'true';
+      everRead = true;
       validUntil = now + CACHE_TTL_MS;
     } catch (error) {
       deps.log('WorkPlanStepModels: failed to read the step-models switch; keeping last-known value (off if none)', {
@@ -66,7 +68,21 @@ export function createWorkPlanStepModelsSwitch(deps: WorkPlanStepModelsSwitchDep
     return known;
   }
 
-  return { isEnabled };
+  /** 'unknown' = no read has ever succeeded (cold-start settings outage); NOT the same as a definite 'off'. */
+  async function getState(): Promise<'on' | 'off' | 'unknown'> {
+    await isEnabled();
+    return everRead ? (known ? 'on' : 'off') : 'unknown';
+  }
+
+  /**
+   * Whether a STORED step model must be honoured by the engine / launch: on, or unknown. Only a definite 'off'
+   * ignores it, so a settings outage can never silently swap a user's explicit choice for another model.
+   */
+  async function shouldHonor(): Promise<boolean> {
+    return (await getState()) !== 'off';
+  }
+
+  return { isEnabled, getState, shouldHonor };
 }
 
 type StepLike = { stepCount?: unknown; title?: unknown; model?: unknown; status?: unknown };
@@ -116,6 +132,70 @@ function storedCounterpart(stored: StepLike[], step: StepLike, index: number): S
   }
   const n = stepNumber(step, index);
   return stored.find((s) => Number(s?.stepCount) === n);
+}
+
+const normTitle = (value: unknown): string => (typeof value === 'string' ? value.trim().toLowerCase() : '');
+
+/**
+ * Carry the STORED model of the matching existing step onto each incoming step that does not carry one, so a write
+ * can never erase a stored model by omission. Matching binds a model to its STEP, not to a slot: by unique title
+ * first; a step whose title is blank matches by stepCount; a renamed step (old title no longer present among the
+ * incoming titles) matches by stepCount. A different step that merely took over a number gets nothing. Each stored
+ * step is used at most once. `allow(i)` lets the caller exempt steps (e.g. an explicit clear).
+ */
+export function carryStoredStepModels<T extends StepLike>(
+  incoming: ReadonlyArray<T>,
+  stored: ReadonlyArray<StepLike> | undefined,
+  allow: (index: number) => boolean = () => true,
+): T[] {
+  const storedSteps = [...(stored ?? [])];
+  if (!storedSteps.some((s) => stepModelOf(s))) return [...incoming];
+  const incomingTitles = new Set(incoming.map((s) => normTitle(s?.title)).filter(Boolean));
+  const claimed = new Set<number>();
+  const byTitle = (title: string) => storedSteps
+    .map((s, i) => ({ s, i }))
+    .filter(({ s, i }) => !claimed.has(i) && normTitle(s?.title) === title);
+  return incoming.map((step, index) => {
+    if (!allow(index) || stepModelOf(step) || (step as StepLike)?.model === '') return step;
+    const title = normTitle(step?.title);
+    let match: { s: StepLike; i: number } | undefined;
+    if (title) {
+      const hits = byTitle(title);
+      if (hits.length === 1) match = hits[0];
+    }
+    if (!match) {
+      const n = Number(step?.stepCount);
+      if (Number.isFinite(n) && n > 0) {
+        const hit = storedSteps.findIndex((s, i) => !claimed.has(i) && Number(s?.stepCount) === n);
+        // a renamed step: its stored title is not among the incoming titles (else it moved elsewhere)
+        if (hit !== -1 && (!title || !incomingTitles.has(normTitle(storedSteps[hit]?.title)))) {
+          match = { s: storedSteps[hit], i: hit };
+        }
+      }
+    }
+    if (!match) return step;
+    claimed.add(match.i);
+    const model = stepModelOf(match.s);
+    return model ? { ...step, model } : step;
+  });
+}
+
+/**
+ * The model that belongs to the ORIGINAL step a modified step stands for: the original at the same number when its
+ * title is unchanged, else the one original step with that title (a step that moved), else none (a new or retitled
+ * step starts with no model; it is never inherited from whatever used to sit in the slot).
+ */
+export function modelBoundToStep(
+  originals: ReadonlyArray<StepLike>,
+  stepCount: number,
+  title: unknown,
+): string | undefined {
+  const t = normTitle(title);
+  if (!t) return undefined;
+  const slot = originals.find((s) => Number(s?.stepCount) === stepCount);
+  if (slot && normTitle(slot.title) === t) return stepModelOf(slot);
+  const hits = originals.filter((s) => normTitle(s?.title) === t);
+  return hits.length === 1 ? stepModelOf(hits[0]) : undefined;
 }
 
 /**

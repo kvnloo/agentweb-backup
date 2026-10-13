@@ -158,7 +158,7 @@ router.put("/:planId", async (req, res) => {
       ? { expectedStepsRev: req.body.expectedStepsRev }
       : {};
     const stepModelsEnabled = (anyStepCarriesModel(steps) || anyStepCarriesModel(plan.steps)) && await workPlanStepModels.isEnabled();
-    const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps, { stepModelsEnabled }) : undefined;
+    const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps, { stepModelsEnabled, storedSteps: plan.steps }) : undefined;
     let normalizedSteps = normalized?.steps;
     const warnings = normalized?.warnings ?? [];
 
@@ -200,11 +200,6 @@ router.put("/:planId", async (req, res) => {
     if (normalizedSteps !== undefined) {
       const mode: 'merge' | 'replace' = rawMode === 'merge' ? 'merge' : 'replace';
       const existingSteps: any[] = Array.isArray(plan.steps) ? plan.steps : [];
-      // ENG-2378: while the switch is off a submitted step model is dropped by design, so a replace that
-      // no longer carries a stored one is not "content loss" and must not be refused as such.
-      const comparableExisting: any[] = stepModelsEnabled
-        ? existingSteps
-        : existingSteps.map(({ model: _model, ...rest }: any) => rest);
 
       if (mode === 'merge') {
         // `normalizeWorkPlanSteps` FILLS IN what a partial step omits — `title`
@@ -324,7 +319,7 @@ router.put("/:planId", async (req, res) => {
           const { title, ...rest } = norm;
           return rest;
         });
-        const contentLoss = findStepContentLoss(comparableExisting, forCompare);
+        const contentLoss = findStepContentLoss(existingSteps, forCompare);
         if (contentLoss.length > 0) {
           // Two different accidents reach here, and saying "fields would be
           // blanked" for both misdescribes one of them. `blanked` is a step that
@@ -358,7 +353,7 @@ router.put("/:planId", async (req, res) => {
       // AC3: a step change always reports a diff. A 200 with a null diff used to
       // be indistinguishable from a successful no-op, which is exactly why a
       // destructive write could pass unnoticed.
-      stepsChange = summarizeStepChange(mode === 'replace' ? comparableExisting : existingSteps, normalizedSteps, mode);
+      stepsChange = summarizeStepChange(existingSteps, normalizedSteps, mode);
     }
 
     // ENG-2378: every step model that is NEW or CHANGED must be a served, selectable model (same rule as the

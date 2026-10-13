@@ -253,7 +253,7 @@ import { currentRunFunding } from '../../services/funding/runFunding';
 import { isNonConsumableRequiredFunctionCall } from '../../services/agentMode/workPlanRequiredCallsPolicy';
 import { resolvePlanLaunchModel, isUserAdminSafe, type ModelPinRegistry } from '../../services/agentMode/modelPin';
 import { assertSequentialStepCounts } from '../../services/workPlanSteps';
-import { anyStepCarriesModel, isStepModelUnavailableError, resolvePlanStepModelsForLaunch } from '../../services/agentMode/workPlanStepModels';
+import { anyStepCarriesModel, isStepModelUnavailableError, modelBoundToStep, resolvePlanStepModelsForLaunch } from '../../services/agentMode/workPlanStepModels';
 import { buildAnonymousModelUnavailableBody, buildAnonymousPlanModelToolMessage, buildModelUnavailableBody, buildPlanModelToolMessage, isModelUnavailableError, MODEL_SAVE_FAILED_MESSAGE } from '../../services/agentMode/modelUnavailable';
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
@@ -2139,8 +2139,13 @@ export async function modifyWorkPlan(
       const existingIndex = workPlan.steps.findIndex(s => s.stepCount === newStep.stepCount);
       if (existingIndex >= 0) {
         // Update existing step (preserve status and completion info)
+        // ENG-2378: the step's model follows the STEP (by title), not the stepCount slot it happened to occupy:
+        // after an insert/reorder the slot holds a different step. A new/retitled step starts with no model.
+        const { model: _slotModel, ...slotWithoutModel } = workPlan.steps[existingIndex] as any;
+        const boundModel = modelBoundToStep([...originalStepsBeforeRemoval.values()], newStep.stepCount, newStep.title);
         workPlan.steps[existingIndex] = {
-          ...workPlan.steps[existingIndex],
+          ...slotWithoutModel,
+          ...(boundModel && { model: boundModel }),
           title: newStep.title,
           // ENG-2400: omitting description preserves the stored one (same
           // contract as userInstructions/skillIds); it used to be wiped.
@@ -2183,9 +2188,11 @@ export async function modifyWorkPlan(
         const removedOriginal = removeStepCounts?.includes(newStep.stepCount)
           ? originalStepsBeforeRemoval.get(newStep.stepCount)
           : undefined;
+        const addedModel = modelBoundToStep([...originalStepsBeforeRemoval.values()], newStep.stepCount, newStep.title);
         workPlan.steps.push({
           stepCount: newStep.stepCount,
           title: newStep.title,
+          ...(addedModel && { model: addedModel }),
           description: newStep.description,
           ...(newStep.userInstructions !== undefined && { userInstructions: newStep.userInstructions }),
           status: 'pending',

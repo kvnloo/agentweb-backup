@@ -1,5 +1,6 @@
 import { mapManageBrandUpdate } from '../../utils/brandGuidelines';
 import { findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContentLoss, mergeWorkPlanSteps, summarizeStepChange } from '../../services/workPlanSteps';
+import { carryStoredStepModels } from '../../services/agentMode/workPlanStepModels';
 /**
  * API Tools — MCP tools that wrap the backend REST API via HTTP self-calls.
  *
@@ -3099,7 +3100,8 @@ async function runManagePredefinedWorkPlan(args: any, c: any): Promise<any> {
             }
             body.steps = mergeWorkPlanSteps(existingSteps || [], incomingSteps);
           } else {
-            body.steps = incomingSteps;
+            // ENG-2378: a replace built from memory (the tool never shows a step's model) must not erase stored models.
+            body.steps = carryStoredStepModels(incomingSteps, existingSteps);
             if (existingSteps && body.steps.length < existingSteps.length && args.confirm_step_removal !== true) {
               const preview = summarizeStepChange(existingSteps, body.steps, 'replace');
               return jsonResult({
