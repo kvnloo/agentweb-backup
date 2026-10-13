@@ -797,7 +797,7 @@ export class HubspotAdapter implements CrmAdapter {
                 console.warn(
                     `[HubspotAdapter] stored-id update of contact ${f.item.id} not classified as gone: ` +
                     `status=${e?.response?.status ?? 'none'} categories=${
-                        JSON.stringify((e?.response?.data?.errors ?? []).map((x: any) => x?.category ?? null))}`,
+                        JSON.stringify((Array.isArray(e?.response?.data?.errors) ? e.response.data.errors : []).map((x: any) => x?.category ?? null))}`,
                 );
             }
         }
