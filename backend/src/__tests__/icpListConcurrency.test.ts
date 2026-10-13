@@ -318,16 +318,16 @@ describe("persona data that a whole-list comparison would trip over", () => {
     expect(table().row.icpResult.map((p: any) => p.id)).toEqual(["icp_0", "icp_2"]);
   });
 
-  it("asks for a retry, not a false 404, when an id-less card cannot be found again", async () => {
+  it("answers 404 (refresh, no retry that could hit another card) when a clicked id-less card is already gone", async () => {
     seed({ icpResult: [legacy(0), legacy(1), legacy(2)] });
     holdUntilBothRead();
     const results = await Promise.all([post("delete-one", { icpId: "icp-1" }), post("delete-one", { icpId: "icp-1" })]);
 
-    expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+    expect(results.map((r) => r.status).sort()).toEqual([200, 404]);
     expect(table().row.icpResult.map((p: any) => p.name)).toEqual(["Legacy 0", "Legacy 2"]);
   });
 
-  it("never reports a false 404 when a concurrent edit renames the id-less card a pain edit was matched on", async () => {
+  it("lands both edits when a concurrent edit renames the id-less card the other was matched on", async () => {
     seed({ icpResult: [legacy(0), legacy(1)] });
     holdUntilBothRead();
     const results = await Promise.all([
@@ -335,14 +335,34 @@ describe("persona data that a whole-list comparison would trip over", () => {
       post("edit-one", { icpId: "icp-0", patch: { pain: "NEW PAIN" } }),
     ]);
 
-    const codes = results.map((r) => r.status);
-    expect(codes).not.toContain(404);
-    expect(codes).toContain(200);
-    const card = table().row.icpResult[0];
-    if (codes[1] === 200) expect(card.pain).toBe("NEW PAIN");
-    if (codes[0] === 200) expect(card.name).toBe("Renamed");
-    expect(table().row.icpResult).toHaveLength(2);
+    expect(results.map((r) => r.status)).toEqual([200, 200]);
+    expect(table().row.icpResult[0]).toMatchObject({ name: "Renamed", pain: "NEW PAIN" });
     expect(table().row.icpResult[1].name).toBe("Legacy 1");
+  });
+
+  it("lands both edits to different fields of one id-less card", async () => {
+    seed({ icpResult: [legacy(0), legacy(1)] });
+    holdUntilBothRead();
+    const results = await Promise.all([
+      post("edit-one", { icpId: "icp-0", patch: { pain: "P-NEW" } }),
+      post("edit-one", { icpId: "icp-0", patch: { desire: "D-NEW" } }),
+    ]);
+
+    expect(results.map((r) => r.status)).toEqual([200, 200]);
+    expect(table().row.icpResult[0]).toMatchObject({ pain: "P-NEW", desire: "D-NEW" });
+    expect(table().row.icpResult[0].userIntent).toEqual({ pain: "P-NEW", desire: "D-NEW" });
+  });
+
+  it("edits an id-less card whose fields hold lists or maps", async () => {
+    seed({ icpResult: [{ ...legacy(0), desire: ["a", "b"], objection: { k: "v" } }, legacy(1)] });
+    holdUntilBothRead();
+    const results = await Promise.all([
+      post("edit-one", { icpId: "icp-0", patch: { name: "N1" } }),
+      post("edit-one", { icpId: "icp-0", patch: { pain: "P1" } }),
+    ]);
+
+    expect(results.map((r) => r.status)).toEqual([200, 200]);
+    expect(table().row.icpResult[0]).toMatchObject({ name: "N1", pain: "P1", desire: ["a", "b"] });
   });
 
   it.each([
@@ -365,7 +385,7 @@ describe("persona data that a whole-list comparison would trip over", () => {
     holdUntilBothRead();
     const results = await Promise.all([post("delete-one", { icpId: "icp-1" }), post("delete-one", { icpId: "icp-1" })]);
 
-    expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+    expect(results.map((r) => r.status).sort()).toEqual([200, 404]);
     expect(table().row.icpResult.map((p: any) => p.name)).toEqual(["Legacy 0"]);
   });
 
