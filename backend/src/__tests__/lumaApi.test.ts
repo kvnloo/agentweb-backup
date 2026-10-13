@@ -276,27 +276,6 @@ describe('luma tools', () => {
     expect(keys.indexOf('next_cursor')).toBeLessThan(keys.indexOf('guests'));
   });
 
-  it('keeps a full default read of realistic guests inside the 20,000 chars the model is shown', async () => {
-    mockGetAccounts.mockResolvedValue([lumaAccount()]);
-    const real = (i: number) => ({
-      ...guest(`gst-Ab12Cd34Ef56Gh${i}`, '2026-10-11T18:22:41.123Z'),
-      user_email: `jonathan.fitzgerald${i}@acmecorp-industries.com`,
-      user_name: 'Jonathan Fitzgerald',
-      user_first_name: 'Jonathan',
-      user_last_name: 'Fitzgerald',
-      phone_number: '+14155550123',
-    });
-    fetchMock.mockImplementation(async (url: any) => {
-      const limit = Number(new URL(String(url)).searchParams.get('pagination_limit'));
-      return jsonResponse({ entries: Array.from({ length: limit }, (_, i) => real(i)), has_more: true, next_cursor: 'c2' });
-    });
-    for (const args of [{}, { max_guests: 5000 }]) {
-      const r: any = await tool('luma_get_guests')({ event: 'evt-1', ...args }, { userId: 'user-1' });
-      expect(JSON.stringify(r).length).toBeLessThan(20000);
-      expect(r.has_more).toBe(true);
-    }
-    fetchMock.mockReset();
-  });
 
   it('tells the model how many registration-less guests were dropped instead of dropping them silently', async () => {
     mockGetAccounts.mockResolvedValue([lumaAccount()]);
@@ -313,16 +292,67 @@ describe('luma tools', () => {
     expect(String(fetchMock.mock.calls.pop()![0])).toContain('pagination_limit=2&');
   });
 
-  it('omits null fields and registration answers by default, includes answers when asked', async () => {
+  it('omits null fields, redundant first/last name and registration answers by default', async () => {
     mockGetAccounts.mockResolvedValue([lumaAccount()]);
-    const entry = { ...guest('a', '2026-10-06T00:00:00Z'), registration_answers: [{ label: 'Role', answer: 'CMO' }] };
+    fetchMock.mockResolvedValue(jsonResponse({ entries: [guest('a', '2026-10-06T00:00:00Z')], has_more: false }));
+    const r: any = await tool('luma_get_guests')({ event: 'evt-1' }, { userId: 'user-1' });
+    expect(Object.keys(r.guests[0]).sort()).toEqual(['approval_status', 'email', 'guest_id', 'name', 'registered_at']);
+  });
+
+  it('returns answers as bare {label, value} and can filter them by label', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    const entry = {
+      ...guest('a', '2026-10-06T00:00:00Z'),
+      registration_answers: [
+        { label: 'What company do you work for?', question_id: 'qst-1', question_type: 'company', value: { company: 'Acme', job_title: null } },
+        { label: 'What is your LinkedIn profile?', question_id: 'qst-2', question_type: 'text', value: 'https://linkedin.com/in/x' },
+        { label: 'How did you hear about us?', question_id: 'qst-3', question_type: 'text', value: 'A friend' },
+        { label: 'Anything else?', question_id: 'qst-4', question_type: 'text', value: '' },
+      ],
+    };
     fetchMock.mockResolvedValue(jsonResponse({ entries: [entry], has_more: false }));
 
-    const lean: any = await tool('luma_get_guests')({ event: 'evt-1' }, { userId: 'user-1' });
-    expect(Object.keys(lean.guests[0]).sort()).toEqual(['approval_status', 'email', 'first_name', 'guest_id', 'name', 'registered_at']);
+    const all: any = await tool('luma_get_guests')({ event: 'evt-1', include_registration_answers: true }, { userId: 'user-1' });
+    expect(all.guests[0].registration_answers).toEqual([
+      { label: 'What company do you work for?', value: { company: 'Acme', job_title: null } },
+      { label: 'What is your LinkedIn profile?', value: 'https://linkedin.com/in/x' },
+      { label: 'How did you hear about us?', value: 'A friend' },
+    ]);
 
-    const full: any = await tool('luma_get_guests')({ event: 'evt-1', include_registration_answers: true }, { userId: 'user-1' });
-    expect(full.guests[0].registration_answers).toEqual([{ label: 'Role', answer: 'CMO' }]);
+    const some: any = await tool('luma_get_guests')({ event: 'evt-1', answer_labels: ['Company', 'LINKEDIN'] }, { userId: 'user-1' });
+    expect(some.guests[0].registration_answers.map((a: any) => a.label)).toEqual([
+      'What company do you work for?',
+      'What is your LinkedIn profile?',
+    ]);
+  });
+
+  it.each([
+    ['bare', {}, 60],
+    ['company + linkedin answers', { answer_labels: ['company', 'linkedin'] }, 35],
+    ['all three answers', { include_registration_answers: true }, 30],
+  ])('keeps a full realistic %s read inside the 20,000 chars the model is shown', async (_name, args, expected) => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    const real = (i: number) => ({
+      ...guest(`gst-Ab12Cd34Ef56Gh${i}`, '2026-10-11T18:22:41.123Z'),
+      user_email: `jonathan.fitzgerald${i}@acmecorp-industries.com`,
+      user_name: 'Jonathan Fitzgerald',
+      user_first_name: 'Jonathan',
+      user_last_name: 'Fitzgerald',
+      phone_number: '+14155550123',
+      registration_answers: [
+        { label: 'What company do you work for?', question_id: 'qst-Ab12Cd34Ef56', question_type: 'company', value: { company: 'Acme Industries', job_title: 'VP Marketing' } },
+        { label: 'What is your LinkedIn profile?', question_id: 'qst-Gh78Ij90Kl12', question_type: 'text', value: 'https://www.linkedin.com/in/jonathan-fitzgerald-123456' },
+        { label: 'How did you hear about this event?', question_id: 'qst-Mn34Op56Qr78', question_type: 'text', value: 'A colleague recommended it' },
+      ],
+    });
+    fetchMock.mockImplementation(async (url: any) => {
+      const limit = Number(new URL(String(url)).searchParams.get('pagination_limit'));
+      return jsonResponse({ entries: Array.from({ length: limit }, (_, i) => real(i)), has_more: true, next_cursor: 'c2' });
+    });
+    const r: any = await tool('luma_get_guests')({ event: 'evt-1', max_guests: 5000, ...(args as object) }, { userId: 'user-1' });
+    expect(r.count).toBe(expected);
+    expect(JSON.stringify(r).length).toBeLessThan(18000);
+    fetchMock.mockReset();
   });
 
   it('sends a bare registered_after date to Luma-side logic as an explicit UTC instant', async () => {

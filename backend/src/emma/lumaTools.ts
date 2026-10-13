@@ -18,22 +18,36 @@ import {
 import { LumaApiService, LumaApiError, LumaGuest, parseLumaEventId, normalizeIsoUtc } from '../services/lumaApiService';
 import { decryptPassword } from '../utils/crypto';
 
-// A compact guest is ~270 chars of JSON. A tool result over 8,000 chars is offloaded to S3 and the model
-// is shown only the first 20,000, so one call is capped to what fits (60 x 270 = ~16k) and anything
-// more is read by following next_cursor.
+// A tool result over 8,000 chars is offloaded to S3 and the model is shown only the first 20,000, so one
+// call is capped to what fits. Measured on realistic guests: ~230 chars bare, ~470 with the company +
+// LinkedIn answers only, ~540 with three answers. 60 x 230 = ~14k, 35 x 470 = ~16k, 30 x 540 = ~16k.
+// More is read by following next_cursor.
 const DEFAULT_MAX_GUESTS = 40;
 const HARD_MAX_GUESTS = 60;
-const MAX_GUESTS_WITH_ANSWERS = 20;
+const MAX_GUESTS_WITH_ANSWERS = 30;
+const MAX_GUESTS_WITH_FILTERED_ANSWERS = 35;
+const MAX_ANSWER_LABELS = 5;
+
 /**
- * Drops null fields and, unless asked for, registration answers. A result over 8,000 chars is
- * offloaded to S3 and the model is shown only its first 20,000, so a guest list padded with
- * nulls and long free-text answers would be cut off mid-list.
+ * Keeps only the fields the agent uses. Drops nulls; drops first/last name when `name` is present;
+ * and, unless asked for, registration answers — reduced to {label, value}, with Luma's internal
+ * question ids and types removed, and optionally to answers whose label contains one of `labels`.
+ * A guest list padded with these would be cut off mid-list by the 20,000-char view.
  */
-function compactGuest(guest: LumaGuest, includeAnswers: boolean): Record<string, unknown> {
+function compactGuest(guest: LumaGuest, includeAnswers: boolean, labels: string[] = []): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(guest)) {
     if (value === null || value === undefined) continue;
-    if (key === 'registration_answers' && (!includeAnswers || (Array.isArray(value) && value.length === 0))) continue;
+    if ((key === 'first_name' || key === 'last_name') && guest.name) continue;
+    if (key === 'registration_answers') {
+      if (!includeAnswers || !Array.isArray(value)) continue;
+      const answers = (value as any[])
+        .filter((a) => a && a.value !== null && a.value !== undefined && a.value !== '')
+        .filter((a) => labels.length === 0 || labels.some((l) => String(a.label ?? '').toLowerCase().includes(l)))
+        .map((a) => ({ label: a.label, value: a.value }));
+      if (answers.length > 0) out[key] = answers;
+      continue;
+    }
     out[key] = value;
   }
   return out;
@@ -198,7 +212,7 @@ emmaToolRegistry.register({
     description:
       'Get the registered guests of one Luma event via the Luma API, newest registration first. `event` accepts the ' +
       'event id (evt-…) or a luma.com manage URL containing it (public slug links do not — find the id with luma_list_events). Returns guest_id, email, name, ' +
-      'approval_status, registered_at and phone_number when present; registration answers only with include_registration_answers. Use registered_after to pull only recent ' +
+      'approval_status, registered_at and phone_number when present; registration answers only with include_registration_answers or answer_labels. Use registered_after to pull only recent ' +
       'registrants (e.g. a lookback window); de-duplicate on guest_id across calls. Invited-but-never-registered ' +
       'records are omitted unless approval_status is "invited". If has_more is true, call again with next_cursor. ' +
       'This is the reliable path — prefer it over scraping the guest table in a browser. Requires a connected Luma API key.',
@@ -217,11 +231,16 @@ emmaToolRegistry.register({
         },
         include_registration_answers: {
           type: 'boolean',
-          description: 'Include each guest\'s registration-question answers (default false). They are long; use a small max_guests (e.g. 25) when you need them.',
+          description: `Include each guest's registration-question answers as {label, value} (default false). Without answer_labels this is every answer, so calls are limited to ${MAX_GUESTS_WITH_ANSWERS} guests.`,
+        },
+        answer_labels: {
+          type: 'array',
+          items: { type: 'string' },
+          description: `Only include answers whose question label contains one of these words (case-insensitive, up to ${MAX_ANSWER_LABELS}), e.g. ["company", "linkedin"]. Implies include_registration_answers and allows ${MAX_GUESTS_WITH_FILTERED_ANSWERS} guests per call.`,
         },
         max_guests: {
           type: 'number',
-          description: `Soft cap per call (default ${DEFAULT_MAX_GUESTS}, max ${HARD_MAX_GUESTS}, ${MAX_GUESTS_WITH_ANSWERS} with registration answers). Larger lists are read by calling again with next_cursor until has_more is false.`,
+          description: `Soft cap per call (default ${DEFAULT_MAX_GUESTS}; max ${HARD_MAX_GUESTS}, or ${MAX_GUESTS_WITH_FILTERED_ANSWERS} with answer_labels, or ${MAX_GUESTS_WITH_ANSWERS} with all answers). Larger lists are read by calling again with next_cursor until has_more is false.`,
         },
         cursor: { type: 'string', description: 'next_cursor from a previous call, to continue.' },
         calendar_id: { type: 'string', description: 'Only needed when several Luma calendars are connected.' },
@@ -251,12 +270,15 @@ emmaToolRegistry.register({
       registeredAfter = normalizeIsoUtc(args.registered_after) ?? undefined;
       if (!registeredAfter) return { success: false, message: 'registered_after must be an ISO 8601 date or datetime.' };
     }
-    const includeAnswers = args?.include_registration_answers === true;
+    const answerLabels: string[] = Array.isArray(args?.answer_labels)
+      ? args.answer_labels.map((l: unknown) => String(l).trim().toLowerCase()).filter(Boolean).slice(0, MAX_ANSWER_LABELS)
+      : [];
+    const includeAnswers = args?.include_registration_answers === true || answerLabels.length > 0;
 
     const resolved = await resolveLuma(userId, args?.calendar_id);
     if ('error' in resolved) return { success: false, message: resolved.error };
 
-    const cap = includeAnswers ? MAX_GUESTS_WITH_ANSWERS : HARD_MAX_GUESTS;
+    const cap = !includeAnswers ? HARD_MAX_GUESTS : answerLabels.length > 0 ? MAX_GUESTS_WITH_FILTERED_ANSWERS : MAX_GUESTS_WITH_ANSWERS;
     const maxGuests = Math.min(Math.max(Math.floor(Number(args?.max_guests)) || Math.min(DEFAULT_MAX_GUESTS, cap), 1), cap);
     try {
       const page = await resolved.client.listGuests({
@@ -282,7 +304,7 @@ emmaToolRegistry.register({
         ...(page.skippedWithoutRegistration
           ? { skipped_without_registration: page.skippedWithoutRegistration }
           : {}),
-        guests: page.guests.map((g) => compactGuest(g, includeAnswers)),
+        guests: page.guests.map((g) => compactGuest(g, includeAnswers, answerLabels)),
       };
     } catch (error) {
       return lumaFailure(error, resolved);
