@@ -17,11 +17,12 @@
  *      crm_saved, asset_generated, settings_saved). No hit → zero LLM cost,
  *      text unchanged.
  *   2. ONLY on a hit: one structured-output judge call extracts the concrete
- *      claims the reply makes.
+ *      claims the reply makes. A claim counts only if its class was one of the
+ *      prefilter candidates and it quotes a non-empty statement (ENG-2459).
  *   3. Deterministic match of each claim class against SUCCESSFUL ledger
- *      entries (status==='success' && !toolResultError(result); asset claims
- *      additionally require mediaGenProducedAsset — a confirmation-gate pause
- *      is not an asset).
+ *      entries (status==='success' && !toolResultError(result); media-gen asset
+ *      claims additionally require mediaGenProducedAsset — a confirmation-gate
+ *      pause is not an asset).
  *   4. Mismatch → ONE corrective turn ("run log shows no successful <X> —
  *      restate the true outcome") → re-check → still mismatched → append a
  *      VISIBLE truthful correction and report claimMismatch=true so the caller
@@ -36,10 +37,10 @@
  * explicitly documented best-effort substep, because blocking chat delivery on
  * a judge outage would be failing badly (a new hard dependency).
  *
- * Feature flag: the CALLER gates this behind AGENT_FINALIZE_GUARD (env,
- * default OFF) — an A-or-B migration flag, not an on-error fallback. With the
- * flag off this module is never invoked and the characterization harness is
- * byte-identical.
+ * Feature flags: the CALLER gates this behind AGENT_FINALIZE_GUARD (enforce) or
+ * AGENT_FINALIZE_GUARD_SHADOW (detect-only), both env, default OFF — A-or-B
+ * migration flags, not an on-error fallback. With both off this module is never
+ * invoked and the characterization harness is byte-identical.
  */
 
 import { MEDIA_GEN_TOOLS } from './toolDispatch';
@@ -136,9 +137,8 @@ const CLAIM_TOOL_MATCHERS: Record<ClaimClass, (toolName: string) => boolean> = {
   schedule_created: (n) => /schedul/.test(n) && /^(create_|manage_|add_|update_)/.test(n),
   crm_saved: (n) => /lead|contact|crm/.test(n) && /^(create_|update_|manage_|add_|save_|import_)/.test(n),
   asset_generated: (n) => MEDIA_GEN_TOOLS.has(n) || ASSET_FILE_TOOLS.has(n),
-  // Grounded in the actual persistence tools Emma has: save_memory,
-  // save_org_memory (cross-session "Memory & Lessons"), update_brand_guidelines,
-  // update_market_strategy (the "setup" onboarding/brand context tools).
+  // Grounded in the actual persistence tools Emma has (see SETTINGS_PERSISTENCE_TOOLS):
+  // cross-session memory, the "setup" onboarding/brand context tools, and the knowledge base.
   settings_saved: (n) => SETTINGS_PERSISTENCE_TOOLS.has(n),
 };
 
