@@ -309,23 +309,64 @@ describe("persona data that a whole-list comparison would trip over", () => {
     expect(byName["Legacy 3"].pain).toBe("p3");
   });
 
-  it("answers 404, and changes nothing, when the clicked card was removed before the retry", async () => {
+  it("answers 404, and changes nothing, when a clicked card with an id was removed before the retry", async () => {
+    seed({ icpResult: [persona(0), persona(1), persona(2)] });
+    holdUntilBothRead();
+    const results = await Promise.all([post("delete-one", { icpId: "icp_1" }), post("delete-one", { icpId: "icp_1" })]);
+
+    expect(results.map((r) => r.status).sort()).toEqual([200, 404]);
+    expect(table().row.icpResult.map((p: any) => p.id)).toEqual(["icp_0", "icp_2"]);
+  });
+
+  it("asks for a retry, not a false 404, when an id-less card cannot be found again", async () => {
     seed({ icpResult: [legacy(0), legacy(1), legacy(2)] });
     holdUntilBothRead();
     const results = await Promise.all([post("delete-one", { icpId: "icp-1" }), post("delete-one", { icpId: "icp-1" })]);
 
-    expect(results.map((r) => r.status).sort()).toEqual([200, 404]);
+    expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
     expect(table().row.icpResult.map((p: any) => p.name)).toEqual(["Legacy 0", "Legacy 2"]);
   });
 
-  it("finds a legacy card by name when several share it, preferring the one nearest where it was", async () => {
+  it("never reports a false 404 when a concurrent edit renames the id-less card a pain edit was matched on", async () => {
+    seed({ icpResult: [legacy(0), legacy(1)] });
+    holdUntilBothRead();
+    const results = await Promise.all([
+      post("edit-one", { icpId: "icp-0", patch: { name: "Renamed" } }),
+      post("edit-one", { icpId: "icp-0", patch: { pain: "NEW PAIN" } }),
+    ]);
+
+    const codes = results.map((r) => r.status);
+    expect(codes).not.toContain(404);
+    expect(codes).toContain(200);
+    const card = table().row.icpResult[0];
+    if (codes[1] === 200) expect(card.pain).toBe("NEW PAIN");
+    if (codes[0] === 200) expect(card.name).toBe("Renamed");
+    expect(table().row.icpResult).toHaveLength(2);
+    expect(table().row.icpResult[1].name).toBe("Legacy 1");
+  });
+
+  it.each([
+    ["the shifting delete lands first", ["icp-0", "icp-1"]],
+    ["the shifting delete lands second", ["icp-1", "icp-0"]],
+  ])("never deletes the other card that shares the clicked id-less card's name (%s)", async (_label, order) => {
     seed({ icpResult: [legacy(0), { ...legacy(1), name: "Same name" }, { ...legacy(2), name: "Same name" }, legacy(3)] });
     holdUntilBothRead();
-    const results = await Promise.all([post("delete-one", { icpId: "icp-0" }), post("delete-one", { icpId: "icp-2" })]);
+    const results = await Promise.all(order.map((icpId) => post("delete-one", { icpId })));
 
-    expect(results.map((r) => r.status)).toEqual([200, 200]);
-    // The clicked second "Same name" (originally position 2) goes; the first stays.
-    expect(table().row.icpResult.map((p: any) => `${p.name}:${p.pain}`)).toEqual(["Same name:p1", "Legacy 3:p3"]);
+    for (const r of results) expect([200, 409]).toContain(r.status);
+    const left = table().row.icpResult.map((p: any) => `${p.name}:${p.pain}`);
+    // icp-1 is the FIRST "Same name" (p1); the second one (p2) is never the one removed.
+    expect(left).toContain("Same name:p2");
+    expect(left).toContain("Legacy 3:p3");
+  });
+
+  it("does not report success for a delete of a nameless, id-less card whose position the list has shrunk past", async () => {
+    seed({ icpResult: [legacy(0), { pain: "no name", desire: "d", objection: "o" }] });
+    holdUntilBothRead();
+    const results = await Promise.all([post("delete-one", { icpId: "icp-1" }), post("delete-one", { icpId: "icp-1" })]);
+
+    expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+    expect(table().row.icpResult.map((p: any) => p.name)).toEqual(["Legacy 0"]);
   });
 
   it.each([
