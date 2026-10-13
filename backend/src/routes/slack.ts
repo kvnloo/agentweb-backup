@@ -1,6 +1,6 @@
 import express, { Request, Response } from "express"; // slack-triggered-session v2
 import { createHmac, timingSafeEqual } from "crypto";
-import { authenticateToken } from "../middleware/auth";
+import { authenticateToken, isRealAdmin } from "../middleware/auth";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { getSecret } from "../utils/secretsManager";
 import {
@@ -20,7 +20,8 @@ import {
   resolveSlackMentionsInText,
   downloadSlackFile,
   resolveSlackFileUrl,
-  postSlackMessage
+  postSlackMessage,
+  getEffectiveAllowedChannels
 } from "../services/slackService";
 import {
   APPROVAL_DECISION_ACTION_IDS,
@@ -30,7 +31,7 @@ import {
 } from "../services/approvalInboxSlack";
 import { approvalInboxService } from "../services/approvalInboxService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
-import { taskDb } from "../services/db";
+import { taskDb, userDb } from "../services/db";
 import { emailService } from "../services/emailService";
 import { notifySubscribersOfApproval } from "../services/approvalSubscriberNotify";
 import { hasWhatsApp } from "../services/customerChannelPolicy";
@@ -383,6 +384,26 @@ router.post("/send-approval", authenticateToken, async (req: Request, res: Respo
 
     if (!userId) {
       return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    if (typeof channel !== "string") {
+      return res.status(400).json({ error: "channel must be a string" });
+    }
+
+    // ENG-2413 (ENG-2407 pattern): the bot posts with the workspace token, so the caller
+    // may only target a channel configured for their user/org (or be a real, non-delegated
+    // admin). Checked before any Slack call or approvalDb write.
+    //
+    // Not applied to a customer on WhatsApp: they are entitled to no Slack channel by
+    // design, and requestApproval ignores the channel it is given for them (nothing is
+    // posted to Slack), so refusing here would only stop a task that still names an old
+    // Slack channel from ever asking them on WhatsApp — and hold their output.
+    if (!isRealAdmin(req)) {
+      const user = await userDb.getUserById(userId);
+      const allowed = await getEffectiveAllowedChannels(user);
+      if (!hasWhatsApp(user) && !allowed.includes(channel)) {
+        return res.status(403).json({ error: "Not allowed to post to this Slack channel" });
+      }
     }
 
     // Determine asset type from filename

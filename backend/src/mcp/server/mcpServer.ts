@@ -18,6 +18,9 @@ import {
   createMcpSessionStore,
 } from './mcpSessionStore';
 import { rehydrateAndServe } from './mcpSessionRehydration';
+import { buildMcpAuthChallenge } from '../oauth/authChallenge';
+
+export { buildMcpAuthChallenge };
 import { anonymousUserIdForSession, isAnonymousDiscoveryEnabled, isAnonymouslyPermitted } from "./anonymousTransport";
 import { isCronEnabled } from '../../utils/instanceState';
 import { effectiveApiKeyScopes, findScopeDenial } from './apiKeyScopes';
@@ -171,15 +174,6 @@ export async function validateMcpAccessToken(req: Request, res: Response, next: 
     hint: `The provided token is not a valid API key, MCP token, or OAuth token.`,
     setup: `Get an API key at https://agentweb.pro (Settings > API Keys). Full guide: ${baseUrl}/skill.md`,
   });
-}
-
-export function buildMcpAuthChallenge(baseUrl: string, error?: string): string {
-  const params = [
-    `resource_metadata="${baseUrl}/.well-known/oauth-protected-resource/mcp"`,
-    `scope="mcp:tools"`,
-  ];
-  if (error) params.push(`error="${error}"`);
-  return `Bearer ${params.join(", ")}`;
 }
 
 function setMcpAuthChallenge(res: Response, baseUrl: string, error?: string) {

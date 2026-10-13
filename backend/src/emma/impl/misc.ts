@@ -263,6 +263,7 @@ import axios from 'axios';
 import { createHash } from 'crypto';
 import { extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../../utils/s3Utils';
 import { pdfPageRender } from './shared/pdfTextRender';
+import { resolvePinnedPublicAddress, SsrfBlockedError } from '../../utils/ssrfGuard';
 import { getCrmSenders } from './shared/crmSenders';
 import type { AgentTool } from '../../mcp/client/toolRegistry';
 // Self-import: `getUnassociatedToolNames` reaches sibling `getUnassociatedTools`
@@ -522,8 +523,71 @@ export async function saveFile(
   }
 }
 
+/**
+ * ENG-2420: caller identity for readFileContent. The shared private bucket holds
+ * every tenant's uploads, so an S3 key is only readable when it sits under one
+ * of the caller's own prefixes. No userId => no private-bucket read at all.
+ */
+export interface ReadFileCallerContext {
+  userId?: string | null;
+}
+
+/** Key prefixes a user owns in the shared bucket (see s3Utils/brand/books/sandbox writers). */
+export function isS3KeyOwnedByUser(key: string, userId: string | null | undefined): boolean {
+  if (typeof userId !== 'string' || userId.trim() === '' || userId.includes('/')) return false;
+  if (typeof key !== 'string' || key.includes('..')) return false;
+  return key.startsWith(`users/${userId}/`) || key.startsWith(`sandbox/${userId}/`);
+}
+
+const READ_FILE_MAX_REDIRECTS = 5;
+
+/**
+ * ENG-2420: SSRF-safe external GET. Every hop is DNS-resolved and refused if any
+ * answer is private/loopback/link-local, then the connection is pinned to the
+ * validated address (no rebinding window) and redirects are followed manually so
+ * each Location is re-validated.
+ */
+async function ssrfSafeGet(startUrl: string): Promise<{ data: any; headers: Record<string, any> }> {
+  let url = startUrl;
+  for (let hop = 0; hop <= READ_FILE_MAX_REDIRECTS; hop++) {
+    const pinned = await resolvePinnedPublicAddress(url);
+    const response: any = await axios.get(url, {
+      timeout: 30000,
+      responseType: 'arraybuffer',
+      headers: {
+        'User-Agent': 'AgentWeb-Backend/1.0',
+        'Cache-Control': 'no-cache',
+        Pragma: 'no-cache',
+      },
+      maxRedirects: 0,
+      validateStatus: (s: number) => s >= 200 && s < 400,
+      lookup: (_hostname: string, options: any, callback: any) => {
+        if (typeof options === 'function') callback = options;
+        if (options && options.all) {
+          callback(null, [{ address: pinned.address, family: pinned.family }]);
+        } else {
+          callback(null, pinned.address, pinned.family);
+        }
+      },
+    } as any);
+    const status = typeof response?.status === 'number' ? response.status : 200;
+    if (status >= 300 && status < 400) {
+      const location = response.headers?.location ?? response.headers?.Location;
+      if (!location) throw new Error(`Redirect ${status} with no Location header`);
+      const next = new URL(String(location), url);
+      if (next.protocol !== 'http:' && next.protocol !== 'https:') {
+        throw new SsrfBlockedError(`Refusing non-http(s) redirect to ${next.protocol}`);
+      }
+      url = next.toString();
+      continue;
+    }
+    return { data: response.data, headers: response.headers || {} };
+  }
+  throw new Error(`Too many redirects (>${READ_FILE_MAX_REDIRECTS})`);
+}
+
 // Read file content from URL with support for various file types
-export async function readFileContent(fileUrl: string): Promise<any> {
+export async function readFileContent(fileUrl: string, caller?: ReadFileCallerContext): Promise<any> {
   try {
     console.log('AgentMode: Reading file content from URL:', fileUrl);
 
@@ -574,6 +638,16 @@ export async function readFileContent(fileUrl: string): Promise<any> {
 
     const s3Key = extractS3KeyFromUrl(normalizedFileUrl);
     if (s3Key) {
+      // ENG-2420: never stream another tenant's object. Same message whether the
+      // key exists or not, so the response cannot be used as an existence oracle.
+      if (!isS3KeyOwnedByUser(s3Key, caller?.userId)) {
+        console.warn('AgentMode: read_file_content refused S3 key outside caller prefixes');
+        return {
+          success: false,
+          message: 'File not found or you do not have access to it.',
+          error: 'File not accessible'
+        };
+      }
       // Private bucket object — stream via SDK (same pattern as filesController)
       const stream = getS3ObjectStream(s3Key);
       const chunks: Buffer[] = [];
@@ -603,15 +677,7 @@ export async function readFileContent(fileUrl: string): Promise<any> {
       // External URL — plain fetch. Send no-cache headers so scrapes (e.g.
       // onboarding brand-build reading the user's live site) reflect the
       // CURRENT content and never a stale CDN/intermediary copy.
-      const response = await axios.get(normalizedFileUrl, {
-        timeout: 30000,
-        responseType: 'arraybuffer',
-        headers: {
-          'User-Agent': 'AgentWeb-Backend/1.0',
-          'Cache-Control': 'no-cache',
-          Pragma: 'no-cache',
-        },
-      });
+      const response = await ssrfSafeGet(normalizedFileUrl);
       buffer = Buffer.from(response.data as ArrayBuffer);
       contentType = response.headers['content-type'] || '';
       console.log(`AgentMode: Fetched external file, size: ${buffer.length} bytes, type: ${contentType}`);
@@ -742,6 +808,14 @@ export async function readFileContent(fileUrl: string): Promise<any> {
 
   } catch (error: any) {
     console.error('AgentMode: Error reading file content:', error);
+
+    if (error instanceof SsrfBlockedError || error?.name === 'SsrfBlockedError') {
+      return {
+        success: false,
+        message: 'This URL points to a private or internal network address and cannot be read.',
+        error: 'URL blocked: private or internal address'
+      };
+    }
 
     let errorMessage = 'Failed to read file content';
     let statusCode = 500;

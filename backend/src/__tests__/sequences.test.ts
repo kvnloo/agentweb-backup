@@ -1797,3 +1797,11 @@ describe('verify-variables counts the SAME population enrol does', () => {
     expect(crmDbMock.getLeadsByListId).not.toHaveBeenCalled();
   });
 });
+
+describe('POST /load-from-url SSRF guard (ENG-2425)', () => {
+  it.each(['http://169.254.169.254/latest/meta-data/', 'http://127.0.0.1:8080/'])('rejects %s with 400', async (url) => {
+    const res = await request(app).post('/load-from-url').send({ url });
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/public internet address/);
+  });
+});

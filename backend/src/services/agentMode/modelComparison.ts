@@ -27,6 +27,12 @@ import {
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import type { ChatMessage } from '../chatbotService';
 import { classifyToolErrorClass } from '../../utils/toolErrorClassifier';
+import {
+  MAX_ALTERNATIVE_LATENCY_MS,
+  MAX_COMPARE_ALTERNATIVES,
+  SavedAlternative,
+  withSavedAlternatives,
+} from './compareSaveAlternatives';
 
 // ---------------------------------------------------------------------------
 // Limits (single source of truth; exported for tests)
@@ -104,6 +110,8 @@ export interface CompareResponseBody {
   prompt: string;
   issuedAt: number;
   results: CompareResult[];
+  /** ENG-113: binds the whole set of ok columns, so /compare/select can trust the unchosen answers. Present when >= 2 columns are ok. */
+  alternativesToken?: string;
 }
 
 /** HTTP-shaped outcome so handlers stay thin: `res.status(out.status).json(out.body)`. */
@@ -204,6 +212,10 @@ export interface SelectDeps {
   getSecret(): string;
   now(): number;
   log(message: string, fields?: Record<string, unknown>): void;
+  /** ENG-113: AW-Settings `compare_save_alternatives` (exact 'true'). Omitted => off. Must not throw. */
+  isSaveAlternativesEnabled?(): Promise<boolean>;
+  /** ENG-113: server registry lookup for the saved alternatives' display name/provider (never taken from the client). */
+  getModelInfo?(model: string): CompareModelInfo | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +277,54 @@ export function signSelectToken(secret: string, fields: SelectTokenFields): stri
 export function verifySelectToken(secret: string, fields: SelectTokenFields, supplied: unknown): boolean {
   if (typeof supplied !== 'string') return false;
   const expected = Buffer.from(signSelectToken(secret, fields), 'utf8');
+  const given = Buffer.from(supplied, 'utf8');
+  if (given.length !== expected.length) return false;
+  return timingSafeEqual(given, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Alternatives (SET) token - ENG-113
+// ---------------------------------------------------------------------------
+const ALTERNATIVES_TOKEN_KIND = 'compare-alternatives-set:v1';
+
+export interface AlternativesTokenFields {
+  userId: string;
+  sessionId: string;
+  compareId: string;
+  prompt: string;
+  issuedAt: number;
+  /** EVERY ok column of the comparison (the chosen one included), in any order. */
+  columns: ReadonlyArray<{ model: string; content: string }>;
+}
+
+/**
+ * Same key derivation as the select token, with a `kind` tag inside the payload so a select token can never be
+ * replayed as a set token (or the reverse). Columns are sorted by model so the order the client sends is irrelevant.
+ * The setting state is deliberately NOT part of it: the token is issued whether or not saving is on.
+ */
+export function canonicalAlternativesPayload(fields: AlternativesTokenFields): string {
+  const columns = fields.columns
+    .map((c) => ({ model: c.model, contentSha256: sha256Hex(c.content) }))
+    .sort((a, b) => (a.model < b.model ? -1 : a.model > b.model ? 1 : 0));
+  return JSON.stringify({
+    kind: ALTERNATIVES_TOKEN_KIND,
+    userId: fields.userId,
+    sessionId: fields.sessionId,
+    compareId: fields.compareId,
+    prompt: fields.prompt,
+    issuedAt: fields.issuedAt,
+    columns,
+  });
+}
+
+export function signAlternativesToken(secret: string, fields: AlternativesTokenFields): string {
+  return createHmac('sha256', deriveSelectTokenKey(secret)).update(canonicalAlternativesPayload(fields)).digest('hex');
+}
+
+/** Constant-time; tolerates a caller-supplied value of any type/length. */
+export function verifyAlternativesToken(secret: string, fields: AlternativesTokenFields, supplied: unknown): boolean {
+  if (typeof supplied !== 'string') return false;
+  const expected = Buffer.from(signAlternativesToken(secret, fields), 'utf8');
   const given = Buffer.from(supplied, 'utf8');
   if (given.length !== expected.length) return false;
   return timingSafeEqual(given, expected);
@@ -610,6 +670,17 @@ export async function compareModels(
     });
 
     const body: CompareResponseBody = { compareId, prompt, issuedAt, results };
+    const okColumns = results.filter((r) => r.status === 'ok' && typeof r.content === 'string');
+    if (okColumns.length >= 2) {
+      body.alternativesToken = signAlternativesToken(secret, {
+        userId: session.userId,
+        sessionId,
+        compareId,
+        prompt,
+        issuedAt,
+        columns: okColumns.map((r) => ({ model: r.model, content: r.content as string })),
+      });
+    }
     return { status: 200, body };
   } catch (error) {
     // A paused policy blocks every model; surface it exactly like /generate.
@@ -878,13 +949,17 @@ async function selectCompareResultInner(
       timestamp: stamp,
       metadata: { timestamp: stamp, portalType: fresh.portalType ?? 'agent', attachments: [] },
     };
-    const assistantMessage: ChatMessage = {
+    let assistantMessage: ChatMessage = {
       role: 'assistant',
       content: req.content,
       timestamp: stamp,
       llm: req.model,
       metadata: { timestamp: stamp, portalType: fresh.portalType ?? 'agent' },
     };
+    // ENG-113: reached only for a NEW pair (an exact replay returned above and never rewrites anything). Any
+    // problem with the alternatives leaves the chosen answer exactly as it was.
+    const alternatives = await verifiedAlternatives(deps, secret, session.userId, req, input.body);
+    if (alternatives) assistantMessage = withSavedAlternatives(assistantMessage, req.compareId, alternatives);
 
     const saved = await deps.appendMessages(req.sessionId, [userMessage, assistantMessage]);
     const tail = (saved?.messages ?? []).slice(-2);
@@ -902,6 +977,64 @@ async function selectCompareResultInner(
     return fail(500, 'Failed to continue from this answer', 'select_failed');
   } finally {
     deps.release(req.sessionId);
+  }
+}
+
+/**
+ * ENG-113: the unchosen answers, accepted ONLY when every one of these holds; otherwise null (and the select
+ * still succeeds for the chosen answer):
+ *  - the AW-Settings switch is on (the setting state is not part of the token);
+ *  - the body has 1-3 well-formed `{model, content, latencyMs?}` entries with distinct models, none equal to the
+ *    chosen model, each content a non-empty string <= MAX_SELECT_CONTENT_CHARS;
+ *  - `alternativesToken` verifies (constant-time) over {user, session, compareId, prompt, issuedAt} and the SET of
+ *    {model, sha256(content)} made of these alternatives PLUS the chosen answer - so the set is exactly the ok columns
+ *    the server produced: nothing can be added, edited, dropped or re-attributed;
+ *  - display name/provider come from the server registry, never from the request.
+ */
+async function verifiedAlternatives(
+  deps: SelectDeps,
+  secret: string,
+  ownerId: string,
+  req: ValidatedSelectRequest,
+  rawBody: unknown,
+): Promise<SavedAlternative[] | null> {
+  const body = rawBody as Record<string, unknown>;
+  if (!isPlainObject(body) || body.alternatives === undefined || body.alternatives === null) return null;
+  try {
+    if (!deps.isSaveAlternativesEnabled || !(await deps.isSaveAlternativesEnabled())) return null;
+    const ignore = (reason: string): null => {
+      deps.log('ModelCompare: ignoring saved alternatives', { reason });
+      return null;
+    };
+    const raw = body.alternatives;
+    if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_COMPARE_ALTERNATIVES) return ignore('shape');
+    const seen = new Set<string>([req.model]);
+    const parsed: Array<{ model: string; content: string; latencyMs: number }> = [];
+    for (const entry of raw) {
+      if (!isPlainObject(entry)) return ignore('entry');
+      const { model, content, latencyMs } = entry;
+      if (typeof model !== 'string' || model.length === 0 || model.length > MAX_MODEL_ID_CHARS || seen.has(model)) return ignore('model');
+      if (typeof content !== 'string' || content.trim().length === 0 || content.length > MAX_SELECT_CONTENT_CHARS) return ignore('content');
+      seen.add(model);
+      const ms = typeof latencyMs === 'number' && Number.isFinite(latencyMs) ? Math.round(latencyMs) : 0;
+      parsed.push({ model, content, latencyMs: Math.min(MAX_ALTERNATIVE_LATENCY_MS, Math.max(0, ms)) });
+    }
+    const fields: AlternativesTokenFields = {
+      userId: ownerId,
+      sessionId: req.sessionId,
+      compareId: req.compareId,
+      prompt: req.prompt,
+      issuedAt: req.issuedAt,
+      columns: [{ model: req.model, content: req.content }, ...parsed],
+    };
+    if (!verifyAlternativesToken(secret, fields, body.alternativesToken)) return ignore('token');
+    return parsed.map((a) => {
+      const info = deps.getModelInfo?.(a.model) ?? null;
+      return { model: a.model, name: info?.name ?? a.model, provider: info?.provider ?? 'other', content: a.content, latencyMs: a.latencyMs };
+    });
+  } catch (error) {
+    deps.log('ModelCompare: saved alternatives check failed; ignoring', { errorClass: safeClass(error) });
+    return null;
   }
 }
 

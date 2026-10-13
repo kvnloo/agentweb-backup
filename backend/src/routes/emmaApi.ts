@@ -552,7 +552,7 @@ router.post('/data-analysis', async (req: Request, res: Response) => {
 router.post('/read-file', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const result = await svc.readFileContent(req.body.file_url);
+    const result = await svc.readFileContent(req.body.file_url, { userId: userId(req) });
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
@@ -566,7 +566,7 @@ router.post('/read-page', async (req: Request, res: Response) => {
       const result = await svc.extractCSSFromURL(req.body, userId(req));
       return res.json(result);
     }
-    const result = await svc.readFileContent(req.body.url);
+    const result = await svc.readFileContent(req.body.url, { userId: userId(req) });
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });

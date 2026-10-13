@@ -509,6 +509,7 @@ export function crmEvidenceFromEarlierInvocations(history: unknown): EarlierInvo
     const numbers = new Set<number>();
     let truncated = false;
     let wrote = false;
+    let unrecordedTimeout = false; // a time-limit partial persists no toolCalls/crmEvidence, so what its turn returned is unrecoverable
     let userIdx = lastIdx;
     for (let guard = 0; guard < MAX_HISTORY_SCANNED; guard++) {
       const user = msgs[userIdx];
@@ -533,15 +534,17 @@ export function crmEvidenceFromEarlierInvocations(history: unknown): EarlierInvo
           for (const t of ev.tools) recorded.add(t);
           for (const n of ev.numbers) numbers.add(n);
           if (ev.truncated) truncated = true;
+        } else if (md.kind === 'generation-timeout-continuation') {
+          unrecordedTimeout = true;
         }
       }
       if (i < 0) break;
       userIdx = i; // that user message may itself be a continuation boundary: keep walking
     }
     const tools = [...new Set([...ran, ...recorded])].sort();
-    if (tools.length === 0 && !wrote) return NO_EARLIER_EVIDENCE;
+    if (tools.length === 0 && !wrote && !unrecordedTimeout) return NO_EARLIER_EVIDENCE;
     // Complete = every CRM tool that ran has its numbers on file, nothing was cut off, and no write changed the totals since.
-    const complete = !wrote && !truncated && [...ran].every((t) => recorded.has(t));
+    const complete = !wrote && !truncated && !unrecordedTimeout && [...ran].every((t) => recorded.has(t));
     return { tools, numbers, complete };
   } catch {
     return NO_EARLIER_EVIDENCE;

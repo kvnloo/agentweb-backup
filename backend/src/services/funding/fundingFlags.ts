@@ -105,6 +105,19 @@ export async function getFundingFlags(): Promise<FundingFlags> {
 }
 
 /** Test hook: force the next getFundingFlags() call to re-read instead of using the cache. */
+/** In an allowlist, lets every user through. */
+export const FUNDING_ALLOW_ALL = "*";
+
+/**
+ * Whether customer API keys (BYOK) are switched on for this user. Off when the
+ * feature is disabled, when the kill switch is on, or when the user is not listed.
+ */
+export async function isByokEnabledFor(userId: string): Promise<boolean> {
+  const flags = await getFundingFlags();
+  if (flags.killSwitch || !flags.byok.enabled) return false;
+  return flags.byok.allowUserIds.includes(FUNDING_ALLOW_ALL) || flags.byok.allowUserIds.includes(userId);
+}
+
 export function __resetFundingFlagsCacheForTests(): void {
   cachedFlags = null;
   cachedAt = 0;

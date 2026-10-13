@@ -11,12 +11,19 @@
  *
  * Supported grammar (all this codebase's onboarding writes need):
  *   Update:    SET a = :v, #a.#b[2] = :v   REMOVE #x, #y
- *   Condition: clauses joined by AND, each `PATH = :v` or `attribute_exists(PATH)`
+ *   Condition: OR of AND-groups; each clause is `PATH = :v`, `PATH <> :v`,
+ *              `PATH <= :v`, `attribute_exists(PATH)` or `attribute_not_exists(PATH)`
+ *
+ * Eventual consistency: set `table.indexRow` to make `query` (the UserIdIndex
+ * GSI) keep returning that older snapshot while `get` (a base-table read)
+ * returns the current row, as DynamoDB does for a moment after any write.
  */
 
 export interface FakeTable {
   /** The single user row, keyed by email like the real AW-Users table. */
   row: Record<string, any>;
+  /** When set, GSI queries return this stale snapshot instead of `row`. */
+  indexRow?: Record<string, any> | null;
   /** Every UpdateItem the client received, for assertions. */
   updates: any[];
   /** Called before an UpdateItem is applied, to force interleavings. */
@@ -82,19 +89,27 @@ function placeholdersIn(expr: string): { names: Set<string>; values: Set<string>
   };
 }
 
+function evalClause(clause: string, row: any, names: Record<string, string>, values: Record<string, any>): boolean {
+  const exists = clause.match(/^attribute_exists\((.+)\)$/);
+  if (exists) return readPath(row, parsePath(exists[1], names)).exists;
+  const notExists = clause.match(/^attribute_not_exists\((.+)\)$/);
+  if (notExists) return !readPath(row, parsePath(notExists[1], names)).exists;
+  const cmp = clause.match(/^(.+?)\s*(<>|<=|=)\s*(:\w+)$/);
+  if (!cmp) throw validation(`Unsupported condition clause: ${clause}`);
+  const got = readPath(row, parsePath(cmp[1], names));
+  const want = values[cmp[3]];
+  if (cmp[2] === "=") return got.exists && JSON.stringify(got.value) === JSON.stringify(want);
+  if (cmp[2] === "<>") return !got.exists || JSON.stringify(got.value) !== JSON.stringify(want);
+  return got.exists && typeof got.value === typeof want && got.value <= want;
+}
+
 function evalCondition(expr: string, row: any, names: Record<string, string>, values: Record<string, any>): boolean {
-  return expr.split(/\s+AND\s+/).every((clause) => {
-    const exists = clause.match(/^attribute_exists\((.+)\)$/);
-    if (exists) return readPath(row, parsePath(exists[1], names)).exists;
-    const eq = clause.match(/^(.+?)\s*=\s*(:\w+)$/);
-    if (!eq) throw validation(`Unsupported condition clause: ${clause}`);
-    const got = readPath(row, parsePath(eq[1], names));
-    return got.exists && JSON.stringify(got.value) === JSON.stringify(values[eq[2]]);
-  });
+  // OR binds looser than AND, as in DynamoDB.
+  return expr.split(/\s+OR\s+/).some((group) => group.split(/\s+AND\s+/).every((c) => evalClause(c.trim(), row, names, values)));
 }
 
 export function createFakeDocClient(table: FakeTable) {
-  const find = (p: any) => ({ promise: async () => ({ Items: [clone(table.row)] }) });
+  const find = (p: any) => ({ promise: async () => ({ Items: [clone(table.indexRow ?? table.row)] }) });
   return {
     query: jest.fn(find),
     get: jest.fn(() => ({ promise: async () => ({ Item: clone(table.row) }) })),
