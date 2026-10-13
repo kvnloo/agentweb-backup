@@ -14627,7 +14627,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     params: any = {},
     sessionId?: string
   ): Promise<MetaApiResult> {
-    return adsApisImpl.callMetaMarketingApi(userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, sessionId, {
+    return adsApisImpl.callMetaMarketingApi(userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, sessionId, this.metaMarketingApiDeps());
+  }
+
+  private metaMarketingApiDeps(): adsApisImpl.CallMetaMarketingApiDeps {
+    return {
       resolveCampaignObjectiveGate: this.resolveCampaignObjectiveGate.bind(this),
       validateMetaActionParams: this.validateMetaActionParams.bind(this),
       claimMetaWriteManifestGrant: this.claimMetaWriteManifestGrant.bind(this),
@@ -14638,7 +14642,83 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       remedyFromScopeRefusal: AgentModeService.remedyFromScopeRefusal,
       getMetaCredentials: this.getMetaCredentials.bind(this),
       checkMetaBudgetChange: this.checkMetaBudgetChange.bind(this),
-    });
+    };
+  }
+
+  /**
+   * ENG-2303 P3 — the Meta Toolkit's preview of a guarded write: the same shared gate as
+   * callMetaMarketingApi (validation, Page check, ownership, budget anomaly, confirmation
+   * summary), sessionless so it can only halt with a preview and never dispatches. The one
+   * difference is the ENG-400 objective gate: an external agent has no Emma transcript or
+   * approval deck, so the objective must be supplied explicitly, is validated here, and is
+   * shown in the bound preview — the user's approval of that preview is the human choice.
+   * It never auto-provisions an Emma chat session.
+   */
+  public async previewToolkitMetaWrite(
+    userId: string, entity_type: any, action: string, account_id: string,
+    campaign_id?: string, ad_set_id?: string, ad_id?: string, params: any = {},
+  ): Promise<MetaApiResult> {
+    const deps = this.metaMarketingApiDeps();
+    deps.resolveCampaignObjectiveGate = async (_userId, _sessionId, _accountId, gateParams) => {
+      const objective = gateParams?.objective;
+      if (typeof objective === 'string' && AgentModeService.META_OBJECTIVE_VALUES.includes(objective)) {
+        return { allowed: true, objective };
+      }
+      const message = `CAMPAIGN CREATE needs an explicit objective, one of: ${AgentModeService.META_OBJECTIVE_VALUES.join(', ')}. It cannot be changed after creation, so ask the user which one they want.`;
+      return { allowed: false, response: { success: false, message, error: `PARAM_VALIDATION_ERROR: ${message}` } as any };
+    };
+    return adsApisImpl.callMetaMarketingApi(userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, undefined, deps);
+  }
+
+  /**
+   * ENG-2303 P3 — Meta Toolkit (external MCP) seams. The external agent's user approves a
+   * preview in their own conversation; the toolkit binds the confirm to that exact preview
+   * (HMAC, see mcp/metaToolkitWrites.ts) and then dispatches the SAME way an approved
+   * deck item does: through dispatchAuthorizedMetaWrite, so the budget-anomaly re-check,
+   * tracking pre-flight and rate shaper all stay in the path. These three methods perform
+   * no authorization of their own.
+   */
+  public async previewMetaMoneyParams(userId: string, account_id: string, params: any) {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    return this.normalizeMetaMoneyParams(accountId, accessToken, params);
+  }
+
+  public async dispatchToolkitConfirmedMetaWrite(
+    userId: string,
+    dispatch: { entity_type: string; action: string; account_id: string; resolvedAccountId?: string; campaign_id?: string; ad_set_id?: string; ad_id?: string; params: any },
+  ): Promise<{ result: MetaApiResult; createdId?: string }> {
+    const result = await this.dispatchAuthorizedMetaWrite(
+      userId, dispatch.entity_type, dispatch.action, dispatch.resolvedAccountId || dispatch.account_id,
+      dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params, false, undefined,
+    );
+    return { result, createdId: AgentModeService.extractDispatchedObjectId(result) };
+  }
+
+  /** Read-back after a toolkit write: status + effective status + budgets, ownership-scoped. */
+  public async readBackMetaWriteTarget(userId: string, account_id: string, entity_type: string, id: string) {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    let node: any;
+    if (entity_type === 'CAMPAIGN') {
+      node = (await metaService.listCampaigns(accountId, accessToken, {
+        campaignId: id, fields: ['id', 'status', 'effective_status', 'daily_budget', 'lifetime_budget'],
+      })).campaigns?.[0];
+    } else if (entity_type === 'AD_SET') {
+      node = (await metaService.listAdSets(accountId, accessToken, undefined, {
+        adSetId: id, fields: ['id', 'status', 'effective_status', 'daily_budget', 'lifetime_budget'],
+      })).adSets?.[0];
+    } else if (entity_type === 'AD') {
+      node = await metaService.getAd(accessToken, id, accountId);
+    } else {
+      throw new Error(`No read-back for ${entity_type}`);
+    }
+    if (!node?.id) return null;
+    return {
+      id: String(node.id),
+      status: node.status,
+      effective_status: node.effective_status,
+      daily_budget: node.daily_budget,
+      lifetime_budget: node.lifetime_budget,
+    };
   }
 
   /**
