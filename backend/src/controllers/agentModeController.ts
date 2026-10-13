@@ -149,6 +149,7 @@ import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 import { DynamoDB } from 'aws-sdk';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
+import { parseScheduledChatsPage, encodeScheduledChatsCursor } from '../utils/scheduledChatsPage';
 import {
   selectPolicyModel,
   type ModelBackupSource,
@@ -13273,7 +13274,23 @@ export const agentModeController = {
         runHealth: computeScheduleRunHealth(runResults),
       }));
 
-      res.json(scheduledChatsWithHealth);
+      // ENG-1611: optional bounded pagination. With neither `limit` nor `cursor`
+      // the legacy bare-array response is preserved for the portal; any caller
+      // that opts in gets `{ items, nextCursor }` with a hard page-size cap.
+      const page = parseScheduledChatsPage(req.query);
+      if (page === null) {
+        res.json(scheduledChatsWithHealth);
+        return;
+      }
+      if ('error' in page) {
+        return res.status(400).json({ error: page.error });
+      }
+      const items = scheduledChatsWithHealth.slice(page.offset, page.offset + page.limit);
+      const nextOffset = page.offset + items.length;
+      res.json({
+        items,
+        nextCursor: nextOffset < scheduledChatsWithHealth.length ? encodeScheduledChatsCursor(nextOffset) : null,
+      });
     } catch (error) {
       console.error('AgentMode: Get scheduled chats error:', error);
       res.status(500).json({ error: 'Failed to get scheduled chats' });

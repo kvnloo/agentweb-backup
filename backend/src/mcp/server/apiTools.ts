@@ -15,6 +15,7 @@ import { mcpFetch } from './httpClient';
 import './adminLookupTools';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
+import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../utils/scheduledChatsPage';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -609,18 +610,32 @@ mcpToolRegistry.register({
   name: 'list_scheduled_chats',
   definition: {
     name: 'list_scheduled_chats',
-    description: 'List all scheduled chats for the authenticated user, or a specific client (admin-only, via client_id).',
+    description: 'List scheduled chats (newest first) for the authenticated user, or a specific client (admin-only, via client_id). Paginated: returns { items, nextCursor }; pass nextCursor back as cursor to get the next page (null = last page).',
     inputSchema: {
       type: 'object',
-      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      properties: {
+        client_id: CLIENT_ID_SCHEMA_PROPERTY,
+        limit: { type: 'number', description: `Page size (default ${SCHEDULED_CHATS_DEFAULT_LIMIT}, max ${SCHEDULED_CHATS_MAX_LIMIT})` },
+        cursor: { type: 'string', description: 'Opaque nextCursor from a previous page' },
+      },
       required: []
     }
   },
-  /** Lists scheduled chats for the caller, or (admin-only) for `args.client_id`'s account. */
+  /**
+   * Lists scheduled chats for the caller, or (admin-only) for `args.client_id`'s account.
+   * ENG-1611: always requests a bounded page so a large client account cannot
+   * produce an unbounded response.
+   */
   execute: async (args: any, context: any) => {
+    const limit = Number.isFinite(Number(args?.limit))
+      ? Math.min(SCHEDULED_CHATS_MAX_LIMIT, Math.max(1, Math.floor(Number(args.limit))))
+      : SCHEDULED_CHATS_DEFAULT_LIMIT;
+    const queryParams: Record<string, string> = { limit: String(limit) };
+    if (typeof args?.cursor === 'string' && args.cursor) queryParams.cursor = args.cursor;
     const data = await mcpFetch({
       method: 'GET',
       path: '/api/agent-mode/scheduled-chats',
+      queryParams,
       context: await resolveClientScopedContext(context, args?.client_id, 'list_scheduled_chats')
     });
     return jsonResult(data);
