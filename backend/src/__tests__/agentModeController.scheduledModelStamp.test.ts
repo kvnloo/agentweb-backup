@@ -478,6 +478,52 @@ describe('getModelOptions — authoritative model discovery', () => {
     });
   });
 
+  // ENG-2378: additive capability hint for the per-step work-plan model. Default OFF; only the exact value "true" turns it on.
+  describe('workPlanStepModelsEnabled hint (ENG-2378)', () => {
+    let clock = Date.now() + 5_000 * 60_000;
+    beforeEach(() => {
+      clock += 10 * 60_000; // the reader caches for ~60s at module level
+      jest.spyOn(Date, 'now').mockImplementation(() => clock);
+    });
+    afterEach(() => jest.restoreAllMocks());
+    const optionsBody = async () => {
+      mockAgentModeService.getSupportedModels.mockResolvedValue(['gpt-a'] as any);
+      mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+        billingUserId: 'test-user-123', policy: null, costUsedMicroUsd: 0, creditsApplied: false,
+        mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' },
+      });
+      const json = jest.fn();
+      await agentModeController.getModelOptions(
+        { user: { userId: 'test-user-123', isAdmin: false } } as any,
+        { json, status: jest.fn(() => ({ json })) } as any,
+      );
+      return json.mock.calls[0][0];
+    };
+    const row = (value: unknown) =>
+      mockGetSetting.mockImplementation(async (name: string) => (name === 'work_plan_step_models_enabled' && value !== null ? { settingValue: value } : null));
+
+    it.each([[null], ['false'], [''], ['yes'], ['TRUE'], [' true']])('is false when the setting is %j', async (value) => {
+      row(value);
+      expect((await optionsBody()).workPlanStepModelsEnabled).toBe(false);
+    });
+    it('is true only for exactly "true", and sits next to the other hints', async () => {
+      row('true');
+      const body = await optionsBody();
+      expect(body.workPlanStepModelsEnabled).toBe(true);
+      expect(body).toHaveProperty('chatBranchingEnabled');
+      expect(body).toHaveProperty('compareSaveAlternatives');
+    });
+    it('a settings outage keeps the last-known value and never fails the model options', async () => {
+      row('true');
+      expect((await optionsBody()).workPlanStepModelsEnabled).toBe(true);
+      clock += 10 * 60_000;
+      mockGetSetting.mockRejectedValue(new Error('ddb down'));
+      const body = await optionsBody();
+      expect(body.workPlanStepModelsEnabled).toBe(true);
+      expect(body.allModels).toEqual(['gpt-a']);
+    });
+  });
+
   it('never offers a live-voice model: every consumer is a text-chat picker and an explicit live pick now 422s', async () => {
     mockAgentModeService.getSupportedModels.mockResolvedValue(['gpt-a', 'live-voice-1', 'gpt-b'] as any);
     (mockAgentModeService as any).isLiveModel = jest.fn((id: string) => id === 'live-voice-1');
