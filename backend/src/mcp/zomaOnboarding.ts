@@ -18,6 +18,7 @@ import { stripeService } from '../services/stripeService';
 import { buildMetaConnectUrl } from '../services/metaConnectUrl';
 import { getAccountsByUserIdIncludingOrgShared, type ConnectedAccount } from '../services/connectedAccountsDb';
 import { isMetaAdAccount } from '../services/metaTokenRefresh';
+import { getMcpUserUsage, type McpUserUsage } from '../services/mcpUsageEventsService';
 
 import { type ZomaToolName } from './zomaToolDefinitions';
 
@@ -54,6 +55,7 @@ export interface ZomaOnboardingDeps {
   buildMetaConnectUrl: (userId: string) => Promise<string>;
   frontendUrl: () => string;
   now: () => number;
+  getUsage: (userId: string, range: { start: string; end: string }) => Promise<McpUserUsage>;
 }
 
 const defaultDeps: ZomaOnboardingDeps = {
@@ -66,6 +68,7 @@ const defaultDeps: ZomaOnboardingDeps = {
   buildMetaConnectUrl: (userId) => buildMetaConnectUrl(userId, 'marketing'),
   frontendUrl: () => process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro',
   now: () => Date.now(),
+  getUsage: (userId, range) => getMcpUserUsage(userId, range),
 };
 
 /** Same usability rule the toolkit gateway applies to account resolution. */
@@ -189,11 +192,35 @@ export function formatZomaStatus(r: ZomaReadiness): string {
   return lines.join('\n');
 }
 
+/** Calendar month (UTC) containing `now`, as [start, end) ISO strings. */
+export function currentUsageMonth(now: number): { start: string; end: string } {
+  const d = new Date(now);
+  return {
+    start: new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)).toISOString(),
+    end: new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1)).toISOString(),
+  };
+}
+
+export function formatZomaUsage(u: McpUserUsage): string {
+  const lines = [
+    `Zoma usage ${u.start.slice(0, 7)} (UTC month):`,
+    `  Tool calls: ${u.toolCalls}`,
+    `  Writes sent to Meta: ${u.writes.total} (confirmed ${u.writes.confirmed}, mismatch ${u.writes.mismatch}, unconfirmed ${u.writes.unconfirmed})`,
+    ...u.recentWrites.map((w) => `  • ${w.ts.slice(0, 16).replace('T', ' ')}  ${w.action ?? ''} ${w.entityType ?? ''}${w.objectId ? ` ${w.objectId}` : ''} → ${w.verification ?? 'unknown'}`),
+    'Billing is not enabled yet; usage is only recorded.',
+  ];
+  return lines.join('\n');
+}
+
 /** Tool entry point for the toolkit gateway. Returns the text plus the structured state. */
 export async function runZomaTool(name: ZomaToolName, _args: unknown, context: { userId: string }, deps: ZomaOnboardingDeps = defaultDeps) {
   if (name === 'zoma_status') {
     const readiness = await getZomaReadiness(context.userId, deps);
     return { summary: formatZomaStatus(readiness), ...readiness };
+  }
+  if (name === 'zoma_usage') {
+    const usage = await deps.getUsage(context.userId, currentUsageMonth(deps.now()));
+    return { summary: formatZomaUsage(usage), ...usage };
   }
   throw new ZomaNotReadyError(`Unknown Zoma tool ${name}.`);
 }
