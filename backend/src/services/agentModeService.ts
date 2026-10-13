@@ -266,6 +266,7 @@ import * as linkedinImpl from '../emma/impl/linkedin';
 import * as twitterImpl from '../emma/impl/twitter';
 // ENG-2103 (F2): Meta/LinkedIn ads APIs tool cluster, same treatment as leadsImpl above.
 import * as adsApisImpl from '../emma/impl/adsApis';
+import { buildToolkitObjectiveGate, readBackMetaNode } from './agentMode/metaToolkitSeams';
 // ENG-2103 (F2): Google Ads + HubSpot/Attio CRM passthrough tool cluster,
 // same treatment as leadsImpl above.
 import * as adsCrmApisImpl from '../emma/impl/adsCrmApis';
@@ -14659,14 +14660,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     campaign_id?: string, ad_set_id?: string, ad_id?: string, params: any = {},
   ): Promise<MetaApiResult> {
     const deps = this.metaMarketingApiDeps();
-    deps.resolveCampaignObjectiveGate = async (_userId, _sessionId, _accountId, gateParams) => {
-      const objective = gateParams?.objective;
-      if (typeof objective === 'string' && AgentModeService.META_OBJECTIVE_VALUES.includes(objective)) {
-        return { allowed: true, objective };
-      }
-      const message = `CAMPAIGN CREATE needs an explicit objective, one of: ${AgentModeService.META_OBJECTIVE_VALUES.join(', ')}. It cannot be changed after creation, so ask the user which one they want.`;
-      return { allowed: false, response: { success: false, message, error: `PARAM_VALIDATION_ERROR: ${message}` } as any };
-    };
+    deps.resolveCampaignObjectiveGate = buildToolkitObjectiveGate(AgentModeService.META_OBJECTIVE_VALUES);
     return adsApisImpl.callMetaMarketingApi(userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, undefined, deps);
   }
 
@@ -14697,28 +14691,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   /** Read-back after a toolkit write: status + effective status + budgets, ownership-scoped. */
   public async readBackMetaWriteTarget(userId: string, account_id: string, entity_type: string, id: string) {
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-    let node: any;
-    if (entity_type === 'CAMPAIGN') {
-      node = (await metaService.listCampaigns(accountId, accessToken, {
-        campaignId: id, fields: ['id', 'status', 'effective_status', 'daily_budget', 'lifetime_budget'],
-      })).campaigns?.[0];
-    } else if (entity_type === 'AD_SET') {
-      node = (await metaService.listAdSets(accountId, accessToken, undefined, {
-        adSetId: id, fields: ['id', 'status', 'effective_status', 'daily_budget', 'lifetime_budget'],
-      })).adSets?.[0];
-    } else if (entity_type === 'AD') {
-      node = await metaService.getAd(accessToken, id, accountId);
-    } else {
-      throw new Error(`No read-back for ${entity_type}`);
-    }
-    if (!node?.id) return null;
-    return {
-      id: String(node.id),
-      status: node.status,
-      effective_status: node.effective_status,
-      daily_budget: node.daily_budget,
-      lifetime_budget: node.lifetime_budget,
-    };
+    return readBackMetaNode(metaService, accountId, accessToken, entity_type, id);
   }
 
   /**

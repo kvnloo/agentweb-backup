@@ -105,8 +105,8 @@ describe('ENG-2303 guarded Meta writes', () => {
   it('CREATE is forced PAUSED, confirmed by read-back with id + effective_status', async () => {
     const deps = makeDeps();
     const res: any = await previewThenConfirm(deps, createArgs());
-    expect(deps.preview.mock.calls[0][7].status).toBe('PAUSED');
-    expect(deps.dispatch.mock.calls[0][1].params.status).toBe('PAUSED');
+    expect((deps.preview as jest.Mock).mock.calls[0][7].status).toBe('PAUSED');
+    expect((deps.dispatch as jest.Mock).mock.calls[0][1].params.status).toBe('PAUSED');
     expect(res).toMatchObject({ success: true, verification: 'CONFIRMED', id: '999', status: 'PAUSED', effective_status: 'PAUSED' });
   });
 
@@ -233,5 +233,26 @@ describe('ENG-2303 guarded Meta writes', () => {
     await expect(executeMetaToolkitWrite('u1', createArgs({ override_tracking_check: true }), deps)).rejects.toThrow(/not available/);
     await expect(executeMetaToolkitWrite('u1', { ...createArgs(), client_id: 'other' }, deps)).rejects.toThrow(/client_id/);
     expect(deps.preview).not.toHaveBeenCalled();
+  });
+});
+
+describe('ENG-2303 read-back node mapping', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { readBackMetaNode } = require('../services/agentMode/metaToolkitSeams');
+  const reader = {
+    listCampaigns: jest.fn().mockResolvedValue({ campaigns: [{ id: 1, status: 'PAUSED', effective_status: 'PAUSED', daily_budget: '5000', name: 'x' }] }),
+    listAdSets: jest.fn().mockResolvedValue({ adSets: [] }),
+    getAd: jest.fn().mockResolvedValue({ id: '3', status: 'ACTIVE', effective_status: 'PENDING_REVIEW' }),
+  };
+
+  it('reads each entity ownership-scoped and maps status/effective_status/budgets', async () => {
+    await expect(readBackMetaNode(reader, '111', 'tok', 'CAMPAIGN', '1')).resolves.toEqual({
+      id: '1', status: 'PAUSED', effective_status: 'PAUSED', daily_budget: '5000', lifetime_budget: undefined,
+    });
+    expect(reader.listCampaigns).toHaveBeenCalledWith('111', 'tok', expect.objectContaining({ campaignId: '1' }));
+    await expect(readBackMetaNode(reader, '111', 'tok', 'AD_SET', '2')).resolves.toBeNull();
+    expect(reader.listAdSets).toHaveBeenCalledWith('111', 'tok', undefined, expect.objectContaining({ adSetId: '2' }));
+    await expect(readBackMetaNode(reader, '111', 'tok', 'AD', '3')).resolves.toMatchObject({ effective_status: 'PENDING_REVIEW' });
+    expect(reader.getAd).toHaveBeenCalledWith('tok', '3', '111');
   });
 });
