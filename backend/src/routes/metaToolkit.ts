@@ -8,6 +8,8 @@
  * maps HTTP <-> gateway and errors -> status codes. No new storage.
  */
 import { Router, type Request, type Response } from 'express';
+import fs from 'fs';
+import path from 'path';
 import {
   authenticateMetaToolkitCaller,
   handleMetaToolkitCall,
@@ -41,6 +43,15 @@ router.use((req: Request, res: Response, next) => {
     return res.status(429).json({ error: 'Too many Meta Toolkit requests. Try again shortly.' });
   }
   return next();
+});
+
+/** ENG-2303 P5 — public agent guide for the toolkit (served from backend/docs, like /skill.md). */
+router.get('/skill.md', (_req: Request, res: Response) => {
+  try {
+    res.type('text/markdown').send(fs.readFileSync(path.join(__dirname, '../../docs/meta-toolkit-skill.md'), 'utf-8'));
+  } catch {
+    res.status(404).json({ error: 'Documentation not found' });
+  }
 });
 
 router.get('/tools', async (req: Request, res: Response) => {
