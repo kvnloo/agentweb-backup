@@ -111,6 +111,7 @@ describe('AgentMode finalize guard — monolith ledger mapping (suppressed dupli
     };
     expect(snapshot).toEqual(expected);
   });
+
   /**
    * The ledger result is minimized (post_on_connected_account keeps `{}`), so a draft is visible to the guard
    * only through the call's arguments. Unit tests that build ledger entries by hand cannot catch a missing
@@ -126,7 +127,8 @@ describe('AgentMode finalize guard — monolith ledger mapping (suppressed dupli
         { content: '[{"claimClass":"post_published","statement":"Your LinkedIn post was published."}]' },
         { content: 'I only saved that as a LinkedIn draft, so nothing has gone live yet. Open it on LinkedIn to finish.' },
       ],
-      toolResults: { post_on_connected_account: { result: { success: true, draft: true, message: 'Saved as draft' } } },
+      // No `draft` in the result: the call's arguments are the only signal, as in prod where the stored result is `{}`.
+      toolResults: { post_on_connected_account: { result: { success: true, message: 'Saved' } } },
     });
 
     expect(snapshot.content).toBe('I only saved that as a LinkedIn draft, so nothing has gone live yet. Open it on LinkedIn to finish.');

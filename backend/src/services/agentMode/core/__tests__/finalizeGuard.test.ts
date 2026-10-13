@@ -518,6 +518,36 @@ describe('a saved draft does not back a "published" claim (ENG-2459)', () => {
     expect(outcome.mismatchedClaimClasses).toEqual(['post_published']);
   });
 
+  it.each([
+    ['no status (the tool defaults to draft)', {}],
+    ['status draft', { status: 'draft' }],
+  ])('a publish_blog_article call with %s does not back a "published" claim', async (_name, args) => {
+    const { ports, judge } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'post_published', statement: 'The blog article was published.' }]);
+
+    const outcome = await runFinalizeGuard({
+      finalText: 'The blog article was published.',
+      ledger: [{ toolName: 'publish_blog_article', status: 'success', result: {}, args }],
+      ports,
+      detectOnly: true,
+    });
+
+    expect(outcome.action).toBe('detected_mismatch');
+  });
+
+  it('a publish_blog_article call with status published still backs the claim', async () => {
+    const { ports, judge } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'post_published', statement: 'The blog article was published.' }]);
+
+    const outcome = await runFinalizeGuard({
+      finalText: 'The blog article was published.',
+      ledger: [{ toolName: 'publish_blog_article', status: 'success', result: {}, args: { status: 'published' } }],
+      ports,
+    });
+
+    expect(outcome.action).toBe('clean');
+  });
+
   it('a normal post call still backs the claim', async () => {
     const { ports, judge } = makePorts();
     judge.mockResolvedValueOnce([{ claimClass: 'post_published', statement: PUBLISHED }]);
