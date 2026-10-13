@@ -40,7 +40,7 @@ jest.mock("../services/brandGuidelinesPopulation", () => ({
 import express from "express";
 import request from "supertest";
 import onboardingStepsRoutes from "../routes/onboardingSteps";
-import { casUpdateIcpList, casUpdateIcpListUnqueued, regenerateSingleIcpForUser } from "../services/onboardingIcpService";
+import { regenerateSingleIcpForUser } from "../services/onboardingIcpService";
 import type { FakeTable } from "./helpers/fakeDocClient";
 
 const app = express();
@@ -162,54 +162,104 @@ describe("concurrent edit-one", () => {
   });
 });
 
-describe("many writers at once on one instance", () => {
-  it("applies all 20 simultaneous edits (5 cards x 4 fields) without lost updates or the unconditional fallback", async () => {
-    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+const listWrites = () =>
+  table().updates.filter((u: any) => Object.values(u.ExpressionAttributeNames ?? {}).includes("icpResult"));
+
+describe("per-card writes", () => {
+  it("applies all 20 simultaneous edits (5 cards x 4 fields) with no lost update, no 409 and no retry exhaustion", async () => {
     // A real write takes milliseconds; without that every writer wins its turn.
-    let inFlight = 0;
-    let maxInFlight = 0;
     table().beforeUpdate = async (params) => {
-      if (!Object.values(params.ExpressionAttributeNames ?? {}).includes("icpResult")) return;
-      inFlight += 1;
-      maxInFlight = Math.max(maxInFlight, inFlight);
-      await new Promise((r) => setTimeout(r, 8));
-      inFlight -= 1;
+      if (Object.values(params.ExpressionAttributeNames ?? {}).includes("icpResult")) await new Promise((r) => setTimeout(r, 8));
     };
     const fields = ["name", "pain", "desire", "objection"] as const;
     const jobs = [0, 1, 2, 3, 4].flatMap((i) => fields.map((f) => ({ id: `icp_${i}`, f, v: `${f}-${i}-new` })));
     const results = await Promise.all(jobs.map((j) => post("edit-one", { icpId: j.id, patch: { [j.f]: j.v } })));
 
-    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(results.map((r) => r.status)).toEqual(jobs.map(() => 200));
     for (const j of jobs) {
       const card = table().row.icpResult.find((p: any) => p.id === j.id);
       expect(card[j.f]).toBe(j.v);
+      expect(card.userIntent[j.f]).toBe(j.v);
     }
-    expect(warn.mock.calls.some((c) => String(c[0]).includes("without the compare-and-swap"))).toBe(false);
-    // They were queued, not raced: never more than one list write in flight.
-    expect(maxInFlight).toBe(1);
+  });
+
+  it("never rewrites the whole list: every write is a path update on one card", async () => {
+    await Promise.all([
+      post("edit-one", { icpId: "icp_1", patch: { name: "A" } }),
+      post("edit-one", { icpId: "icp_2", patch: { pain: "B" } }),
+      post("delete-one", { icpId: "icp_4" }),
+    ]);
+
+    expect(listWrites().length).toBeGreaterThan(0);
+    for (const u of listWrites()) {
+      // Every assignment and removal must target INSIDE the list (`#x[2]...`), never the bare list attribute.
+      const setPart = String(u.UpdateExpression).replace(/^SET\s+/, "").split(/\s+REMOVE\s+/)[0];
+      const removePart = String(u.UpdateExpression).includes(" REMOVE ") ? String(u.UpdateExpression).split(/\s+REMOVE\s+/)[1] : "";
+      const targets = [...setPart.split(","), ...removePart.split(",")]
+        .map((x) => x.trim().split("=")[0].trim())
+        .filter(Boolean);
+      for (const t of targets) {
+        const bare = !t.includes("[") && !t.includes(".");
+        expect(bare && u.ExpressionAttributeNames[t] === "icpResult").toBe(false);
+      }
+    }
   });
 
   it("removes exactly the cards asked for when four deletes arrive together", async () => {
+    table().beforeUpdate = async (params) => {
+      if (Object.values(params.ExpressionAttributeNames ?? {}).includes("icpResult")) await new Promise((r) => setTimeout(r, 8));
+    };
     const results = await Promise.all([0, 1, 2, 3].map((i) => post("delete-one", { icpId: `icp_${i}` })));
 
-    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(results.map((r) => r.status)).toEqual([200, 200, 200, 200]);
     expect(ids()).toEqual(["icp_4"]);
   });
 
-  it("does not let a failed write wedge the writes queued behind it", async () => {
+  it("a delete that shifts the list makes a concurrent write on a later card recompute its position", async () => {
+    holdUntilBothRead();
+    const [del, edit] = await Promise.all([
+      post("delete-one", { icpId: "icp_0" }),
+      post("edit-one", { icpId: "icp_3", patch: { name: "STILL THE RIGHT CARD" } }),
+    ]);
+
+    expect([del.status, edit.status]).toEqual([200, 200]);
+    expect(ids()).toEqual(["icp_1", "icp_2", "icp_3", "icp_4"]);
+    expect(table().row.icpResult.find((p: any) => p.id === "icp_3").name).toBe("STILL THE RIGHT CARD");
+    // Nothing else was touched.
+    expect(table().row.icpResult.find((p: any) => p.id === "icp_4").name).toBe("Original 4");
+  });
+
+  it("returns the updated list in the response", async () => {
+    const res = await post("edit-one", { icpId: "icp_2", patch: { name: "FROM RESPONSE" } });
+    expect(res.body.icpResult.map((p: any) => p.id)).toEqual(["icp_0", "icp_1", "icp_2", "icp_3", "icp_4"]);
+    expect(res.body.icpResult[2].name).toBe("FROM RESPONSE");
+    const del = await post("delete-one", { icpId: "icp_0" });
+    expect(del.body.icpResult.map((p: any) => p.id)).toEqual(["icp_1", "icp_2", "icp_3", "icp_4"]);
+  });
+
+  it("answers 409, and changes nothing, when the list keeps shifting under the write", async () => {
+    // Every attempt: another writer rotates the list just before this write lands.
+    table().beforeUpdate = async (params, t) => {
+      if (!Object.values(params.ExpressionAttributeNames ?? {}).includes("icpResult")) return;
+      const [first, ...rest] = t.row.icpResult;
+      t.row = { ...t.row, icpResult: [...rest, first] };
+    };
+    const res = await post("delete-one", { icpId: "icp_2" });
+
+    expect(res.status).toBe(409);
+    expect([...ids()].sort()).toEqual(["icp_0", "icp_1", "icp_2", "icp_3", "icp_4"]);
+  });
+
+  it("does not wedge other users' writes, or later ones, after a write fails", async () => {
     let fail = true;
     table().beforeUpdate = async (params) => {
       if (fail && Object.values(params.ExpressionAttributeNames ?? {}).includes("icpResult")) {
         fail = false;
-        // Slow enough that the second request is already queued behind this one.
-        await new Promise((r) => setTimeout(r, 60));
         throw Object.assign(new Error("dynamo unavailable"), { code: "InternalServerError" });
       }
     };
-    const [first, second] = await Promise.all([
-      post("delete-one", { icpId: "icp_0" }),
-      post("delete-one", { icpId: "icp_1" }),
-    ]);
+    const first = await post("delete-one", { icpId: "icp_0" });
+    const second = await post("delete-one", { icpId: "icp_1" });
 
     expect(first.status).toBe(500);
     expect(second.status).toBe(200);
@@ -217,72 +267,62 @@ describe("many writers at once on one instance", () => {
   });
 });
 
-describe("two instances (compare-and-swap, no shared queue)", () => {
-  it("both land when two deletes read the same list", async () => {
-    holdUntilBothRead();
-    const del = (id: string) => casUpdateIcpListUnqueued("u1", (list) => ({ next: list.filter((p) => p.id !== id), result: null }));
-    await Promise.all([del("icp_1"), del("icp_3")]);
+describe("persona data that a whole-list comparison would trip over", () => {
+  const legacy = (i: number) => ({ name: `Legacy ${i}`, pain: `p${i}`, desire: `d${i}`, objection: `o${i}`, meta_targeting_brief: `b${i}` });
+  const odd = {
+    ...persona(1),
+    emptyString: "",
+    float: 0.1 + 0.2,
+    big: 12345678901234567890,
+    nested: { a: [1, "two", { three: 3 }], z: null },
+    unicode: "caf\u00e9 \ud83d\ude80",
+    extraField: "kept",
+  };
 
-    expect(ids()).toEqual(["icp_0", "icp_2", "icp_4"]);
-    // The loser really lost the condition once and recomputed.
-    expect(table().updates.length).toBeGreaterThan(2);
+  it("edits and deletes cards that have no stable id (stored before ids existed)", async () => {
+    seed({ icpResult: [legacy(0), legacy(1), legacy(2)] });
+
+    const edit = await post("edit-one", { icpId: "icp-1", patch: { pain: "NEW PAIN" } });
+    expect(edit.status).toBe(200);
+    expect(table().row.icpResult[1].pain).toBe("NEW PAIN");
+    expect(table().row.icpResult[0].pain).toBe("p0");
+
+    const del = await post("delete-one", { icpId: "icp-0" });
+    expect(del.status).toBe(200);
+    expect(table().row.icpResult.map((p: any) => p.name)).toEqual(["Legacy 1", "Legacy 2"]);
   });
 
-  it("an edit and a delete of different cards both land", async () => {
-    holdUntilBothRead();
-    await Promise.all([
-      casUpdateIcpListUnqueued("u1", (list) => ({ next: list.map((p) => (p.id === "icp_0" ? { ...p, name: "KEPT" } : p)), result: null })),
-      casUpdateIcpListUnqueued("u1", (list) => ({ next: list.filter((p) => p.id !== "icp_3"), result: null })),
-    ]);
+  it("leaves odd values on untouched cards and fields exactly as stored", async () => {
+    seed({ icpResult: [persona(0), odd, persona(2)] });
+    const before = JSON.parse(JSON.stringify(table().row.icpResult[1]));
 
-    expect(ids()).toEqual(["icp_0", "icp_1", "icp_2", "icp_4"]);
-    expect(table().row.icpResult[0].name).toBe("KEPT");
-  });
-});
+    expect((await post("edit-one", { icpId: "icp_0", patch: { name: "EDITED" } })).status).toBe(200);
+    expect((await post("delete-one", { icpId: "icp_2" })).status).toBe(200);
 
-describe("casUpdateIcpList", () => {
-  it("still applies the change, from the freshest read, when the compare-and-swap never wins", async () => {
-    // Every conditional write loses: the list changes between each read and write
-    // (equivalently, the stored list never reads back equal to what was compared).
-    let churn = 0;
-    table().beforeUpdate = async (params, t) => {
-      if (!Object.values(params.ExpressionAttributeNames ?? {}).includes("icpResult")) return;
-      if (!params.ConditionExpression) return; // the final, unconditional write
-      churn += 1;
-      const list = t.row.icpResult.map((p: any, i: number) => (i === 4 ? { ...p, pain: `churn ${churn}` } : p));
-      t.row = { ...t.row, icpResult: list };
-    };
-    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
-    const res = await post("delete-one", { icpId: "icp_0" });
-
-    // The user's delete is not lost to a 409 they cannot act on...
-    expect(res.status).toBe(200);
-    expect(ids()).toEqual(["icp_1", "icp_2", "icp_3", "icp_4"]);
-    // ...it was computed from the latest list, so the concurrent change survives too...
-    expect(table().row.icpResult[3].pain).toBe(`churn ${churn}`);
-    // ...and the fallback is visible in the logs.
-    expect(warn.mock.calls.some((c) => String(c[0]).includes("without the compare-and-swap"))).toBe(true);
+    expect(table().row.icpResult[1]).toEqual(before);
   });
 
-  it("applies an edit the same way", async () => {
-    table().beforeUpdate = async (params, t) => {
-      if (!params.ConditionExpression) return;
-      t.row = { ...t.row, icpResult: t.row.icpResult.map((p: any, i: number) => (i === 4 ? { ...p, pain: `churn ${Math.random()}` } : p)) };
-    };
-    jest.spyOn(console, "warn").mockImplementation(() => {});
-    const res = await post("edit-one", { icpId: "icp_2", patch: { name: "STILL APPLIED" } });
+  it("edits a card that has odd values, keeping every other field", async () => {
+    seed({ icpResult: [persona(0), odd, persona(2)] });
+
+    const res = await post("edit-one", { icpId: "icp_1", patch: { desire: "EDITED" } });
 
     expect(res.status).toBe(200);
-    expect(table().row.icpResult[2].name).toBe("STILL APPLIED");
-    expect(table().row.icpResult[2].userIntent).toEqual({ name: "STILL APPLIED" });
+    const card = table().row.icpResult[1];
+    expect(card.desire).toBe("EDITED");
+    expect(card.emptyString).toBe("");
+    expect(card.float).toBe(odd.float);
+    expect(card.nested).toEqual(odd.nested);
+    expect(card.extraField).toBe("kept");
   });
 
-  it("does not take the unconditional path when the first attempt wins", async () => {
-    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
-    await casUpdateIcpList("u1", (list) => ({ next: list.slice(1), result: null }));
+  it("edit and delete still work when the stored list differs in any way from what the index shows", async () => {
+    table().indexRow = { ...table().row, icpResult: [{ id: "icp_0", name: "totally different" }] };
 
-    expect(warn.mock.calls.some((c) => String(c[0]).includes("without the compare-and-swap"))).toBe(false);
-    expect(table().updates.every((u: any) => Boolean(u.ConditionExpression))).toBe(true);
+    expect((await post("edit-one", { icpId: "icp_3", patch: { name: "EDITED" } })).status).toBe(200);
+    expect((await post("delete-one", { icpId: "icp_1" })).status).toBe(200);
+    expect(table().row.icpResult.find((p: any) => p.id === "icp_3").name).toBe("EDITED");
+    expect(ids()).toEqual(["icp_0", "icp_2", "icp_3", "icp_4"]);
   });
 });
 

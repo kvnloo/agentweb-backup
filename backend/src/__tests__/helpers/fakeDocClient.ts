@@ -10,7 +10,7 @@
  *  - a failed ConditionExpression leaves the item untouched.
  *
  * Supported grammar (all this codebase's onboarding writes need):
- *   Update:    SET a = :v, #a.#b[2] = :v   REMOVE #x, #y
+ *   Update:    SET a = :v, #a.#b[2] = :v   REMOVE #x, #y, #l[2] (a list element is spliced out)
  *   Condition: OR of AND-groups, parenthesised groups allowed; each clause is `PATH = :v`, `PATH <> :v`,
  *              `PATH <= :v`, `attribute_exists(PATH)` or `attribute_not_exists(PATH)`
  *
@@ -80,6 +80,26 @@ function writePath(root: any, steps: Step[], value: any): void {
     cur = cur[s.key];
     if (s.index !== undefined) cur = cur[s.index];
   });
+}
+
+/** `REMOVE path`: splice a list element out (later ones shift down) or delete a key, as DynamoDB does. A missing path is a no-op. */
+function removePath(root: any, steps: Step[]): void {
+  let cur = root;
+  for (let i = 0; i < steps.length; i++) {
+    const s = steps[i];
+    const last = i === steps.length - 1;
+    if (cur == null || typeof cur !== "object" || !(s.key in cur)) return;
+    if (last) {
+      if (s.index === undefined) delete cur[s.key];
+      else if (Array.isArray(cur[s.key]) && s.index < cur[s.key].length) cur[s.key].splice(s.index, 1);
+      return;
+    }
+    cur = cur[s.key];
+    if (s.index !== undefined) {
+      if (!Array.isArray(cur) || s.index >= cur.length) return;
+      cur = cur[s.index];
+    }
+  }
 }
 
 function placeholdersIn(expr: string): { names: Set<string>; values: Set<string> } {
@@ -179,10 +199,7 @@ export function createFakeDocClient(table: FakeTable) {
         const next = clone(table.row);
         const [setPart, removePart] = update.replace(/^SET\s+/, "").split(/\s+REMOVE\s+/);
         if (update.startsWith("REMOVE")) {
-          for (const r of update.replace(/^REMOVE\s+/, "").split(",")) {
-            const steps = parsePath(r.trim(), names);
-            delete next[steps[0].key];
-          }
+          for (const r of update.replace(/^REMOVE\s+/, "").split(",")) removePath(next, parsePath(r.trim(), names));
         } else {
           for (const assignment of setPart.split(/,\s*(?=[#\w.\[\]]+\s*=\s*:)/)) {
             const m = assignment.match(/^(.+?)\s*=\s*(:\w+)$/);
@@ -190,7 +207,7 @@ export function createFakeDocClient(table: FakeTable) {
             writePath(next, parsePath(m[1], names), clone(values[m[2]]));
           }
           if (removePart) {
-            for (const r of removePart.split(",")) delete next[parsePath(r.trim(), names)[0].key];
+            for (const r of removePart.split(",")) removePath(next, parsePath(r.trim(), names));
           }
         }
         table.row = next;
