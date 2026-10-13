@@ -33,6 +33,17 @@ failure = off = old behaviour; 60s cache, last-known value on a failed refresh,
   the continuation chain does not repeat it. An unexpected resolver failure fails the turn; it never falls back.
 - Hint: `GET /api/agent-mode/model-options` returns `workPlanStepModelsEnabled` (boolean) next to `chatBranchingEnabled`
   / `compareSaveAlternatives`. Partner-portal admin work-plan editor shows a per-step model select behind it.
+- Review hardening: a write NEVER erases a stored step model. With the switch off or its state unknown a submitted
+  `model` is ignored and the stored one of the matching step (title, then stepCount for a renamed step) is carried over
+  (admin, user, MCP replace/merge); `modify_work_plan` follows the step by title, not the stepCount slot;
+  `save_work_plan` carries it; `/public/plans` strips step models. A settings-read failure with no last-known value is
+  UNKNOWN, not off: stored step models are still honoured (launch + engine); only a definite off ignores them.
+- Paused step: an explicit pick (the `/generate` `llmModel` differing from the stored session stamp) overrides an
+  UNAVAILABLE pending step model, runs the turn and updates that step; an available step model still wins over the
+  picker. Without a pick the plan stays paused ("Choose another model in the model picker and send again").
+- A step with no model runs on `workPlan.planDefaultModel`, then `workPlan.launchModel` (the model the session had
+  before the plan), recorded at launch only for plans whose steps carry a model; the stamp is exactly what runs. When
+  the plan completes the pre-plan model returns unless the user picked one (`workPlan.engineModel` marker).
 - Not changed: Emma's `create_work_plan` / `modify_work_plan` tools (a model choice belongs to a user/admin, not the LLM;
   `modify_work_plan` keeps a stored step model), model-compare/branching, concurrency cap, retries, autocomplete rounds,
   and the legacy AW-Settings predefined-plans blob (`routes/settings.ts`), which never carried per-step fields.
