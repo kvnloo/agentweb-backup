@@ -141,6 +141,8 @@ import {
   type SubscriptionFeatureId,
 } from '../services/subscriptionService';
 import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
+import { fileProductFeedback, EMMA_FEEDBACK_INTENTS } from '../services/productFeedbackFiling';
+import { ReportReplayCapacityError } from '../utils/reportIntake';
 import { resetSentence } from "../utils/usageCycle";
 import { buildUsageBlockCopy } from "../utils/usageBlockCopy";
 import { transcribeSpeech } from '../services/voiceService';
@@ -10006,6 +10008,53 @@ export const agentModeController = {
       // Check token usage limits
       const usageStatus = await checkTokenUsage(user.userId);
       if (!usageStatus.allowed) {
+        // ENG-527: product-feedback filing is never token-limited. An over-quota user who
+        // explicitly asks Emma to file a bug/feature request (portal `feedbackIntent`) gets it
+        // filed DETERMINISTICALLY — zero LLM calls, zero token spend — through the same shared
+        // policy as the in-app Send feedback form. Ordinary generation stays blocked below.
+        const feedbackIntent = typeof req.body.feedbackIntent === 'string' ? req.body.feedbackIntent : undefined;
+        if (feedbackIntent && Object.prototype.hasOwnProperty.call(EMMA_FEEDBACK_INTENTS, feedbackIntent)) {
+          const intentConfig = EMMA_FEEDBACK_INTENTS[feedbackIntent];
+          try {
+            const filing = await fileProductFeedback({
+              user: {
+                userId: user.userId,
+                email: user.email,
+                displayName: (user as any).displayName,
+                funnelStatus: (user as any).funnelStatus,
+              },
+              reportType: feedbackIntent,
+              titlePrefix: intentConfig.titlePrefix,
+              tag: intentConfig.tag,
+              description: String(userMessage),
+              pageUrl: typeof currentUrl === 'string' ? currentUrl : undefined,
+              sessionId,
+            });
+            const link = filing.filed.userUrl || filing.filed.trackerUrl;
+            const label = feedbackIntent === 'bug' ? 'bug report' : 'feature request';
+            return res.json({
+              content: `Your ${label} has been filed and is being tracked: ${link}`,
+              feedbackFiled: {
+                type: feedbackIntent,
+                trackerUrl: link,
+                deduped: filing.filed.deduped,
+                replayed: filing.replayed,
+              },
+              usageMode: 'paused',
+            });
+          } catch (filingError) {
+            // AC4: a failed filing is surfaced clearly and NEVER reported as tracked.
+            console.error('[agentMode] ENG-527 over-quota feedback filing failed:', filingError);
+            const busy = filingError instanceof ReportReplayCapacityError;
+            return res.status(busy ? 503 : 502).json({
+              error: busy
+                ? 'Feedback intake is busy; please retry shortly. Nothing was filed yet.'
+                : 'We could not file your feedback, so nothing was tracked. Please try again or use Send feedback.',
+              code: 'feedback_filing_failed',
+              feedbackFiled: null,
+            });
+          }
+        }
         return res.status(429).json(await buildUsagePausedBody({
           usageStatus,
           session,
