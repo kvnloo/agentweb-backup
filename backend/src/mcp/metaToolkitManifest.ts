@@ -16,6 +16,17 @@
 import { metaToolRegistry } from '../emma/metaTools';
 import type { McpToolRegistry } from './server/registry';
 import { isZomaTool, ZOMA_TOOL_DEFINITIONS } from './zomaToolDefinitions';
+import { MetaToolkitRefusal } from './metaToolkitErrors';
+import { GUARDED_WRITE_ACTIONS } from './metaToolkitWriteSurface';
+
+const META_MARKETING_API_DESCRIPTION =
+  'Meta Marketing API for external agents. Reads: LIST, GET, PREVIEW, SEARCH, GET_MATCH_QUALITY. ' +
+  'Guarded writes (CAMPAIGN, AD_SET, AD only): CREATE, and UPDATE of status (ACTIVE/PAUSED) or budget. ' +
+  'Every write is two calls: first without confirm (returns a PREVIEW and preview_token, nothing changes), show the preview to the user, ' +
+  'then after their explicit approval repeat the exact same call with confirm=true and the preview_token. ' +
+  'New campaigns, ad sets and ads are always created PAUSED; activating (status=ACTIVE) is its own separate preview and approval. ' +
+  'Budgets are in MAJOR units of the ad account currency (e.g. 50 = $50.00); the preview echoes the converted amount. ' +
+  'A write is done only when the result says verification CONFIRMED. DELETE, creatives, audiences and uploads are not available.';
 
 export const META_TOOLKIT_V1_TOOL_NAMES = [
   'list_meta_ads_campaigns',
@@ -31,12 +42,7 @@ export const META_TOOLKIT_V1_ACTIONS = ['LIST', 'GET', 'PREVIEW', 'SEARCH', 'GET
 
 const READ_ACTIONS = new Set<string>(META_TOOLKIT_V1_ACTIONS);
 
-export class MetaToolkitRefusal extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'MetaToolkitRefusal';
-  }
-}
+export { MetaToolkitRefusal };
 
 function isV1Tool(name: string): name is MetaToolkitToolName {
   return (META_TOOLKIT_V1_TOOL_NAMES as readonly string[]).includes(name);
@@ -49,8 +55,16 @@ function narrowDefinition(definition: any): any {
     // client_id is admin-only cross-client access: internal only (§4).
     delete props.client_id;
     if (def.name === 'call_meta_marketing_api') {
-      def.description = "Read-only Meta Marketing API for external agents. Actions: LIST, GET, PREVIEW, SEARCH, GET_MATCH_QUALITY. All writes are excluded from v1.";
-      if (props.action?.enum) props.action.enum = [...META_TOOLKIT_V1_ACTIONS];
+      def.description = META_MARKETING_API_DESCRIPTION;
+      if (props.action?.enum) props.action.enum = [...META_TOOLKIT_V1_ACTIONS, ...GUARDED_WRITE_ACTIONS];
+      props.confirm = {
+        type: 'boolean',
+        description: 'Writes only. Omit to get a PREVIEW (nothing changes). Set true only after the user explicitly approved that preview, together with its preview_token.',
+      };
+      props.preview_token = {
+        type: 'string',
+        description: 'Writes only. The preview_token returned by the preview the user approved. Single use, 15 minutes; the call must repeat the previewed arguments exactly.',
+      };
       // The waiver replay is not wired through the deck flow (§4).
       if (props.params?.properties) delete props.params.properties.override_tracking_check;
     }
