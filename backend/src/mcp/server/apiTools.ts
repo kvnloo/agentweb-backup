@@ -642,6 +642,38 @@ mcpToolRegistry.register({
   }
 });
 
+const MANAGE_SCHEDULED_CHAT_ACTIONS = ['create', 'update', 'toggle', 'delete'];
+
+function isNonEmptyString(v: unknown): boolean {
+  return typeof v === 'string' && v.trim().length > 0;
+}
+
+/** ENG-1656: field-named validation for manage_scheduled_chat; null when the call is well-formed. */
+export function validateManageScheduledChatArgs(args: any): string | null {
+  const action = args?.action;
+  if (!MANAGE_SCHEDULED_CHAT_ACTIONS.includes(action)) return null; // default branch reports Unknown action
+  const fail = (msg: string) => `Invalid manage_scheduled_chat arguments: ${msg}`;
+  if (action === 'create') {
+    const missing = ['schedule_name', 'starting_message', 'schedule_frequency'].filter((f) => !isNonEmptyString(args[f]));
+    if (missing.length) return fail(`Missing required fields: ${missing.join(', ')} (required for action "create")`);
+  } else if (!isNonEmptyString(args.schedule_id)) {
+    return fail(`schedule_id is required for action "${action}" — call list_scheduled_chats to get one`);
+  }
+  if (action === 'toggle' && args.status !== 'active' && args.status !== 'paused') {
+    return fail('status must be "active" or "paused" for action "toggle"');
+  }
+  if (action === 'create' || action === 'update') {
+    if (args.email_notifications !== undefined &&
+        (!Array.isArray(args.email_notifications) || args.email_notifications.length === 0)) {
+      return fail('email_notifications must be a non-empty array of email addresses when provided');
+    }
+    if (args.next_run_time !== undefined && Number.isNaN(Date.parse(args.next_run_time))) {
+      return fail('next_run_time must be an ISO 8601 datetime (e.g. 2026-10-14T09:00:00Z)');
+    }
+  }
+  return null;
+}
+
 mcpToolRegistry.register({
   name: 'manage_scheduled_chat',
   definition: {
@@ -671,6 +703,7 @@ mcpToolRegistry.register({
         backup_model: { type: 'string', description: 'Legacy field, retained for compatibility. Since ENG-1211 a scheduled run always uses its own preferred model below the hard usage cap, so this is never consulted. Omitting it changes nothing.' },
         session_id: { type: 'string', description: 'Existing chat session ID to base the schedule on (create only)' },
         revoke_autopublish: { type: 'boolean', description: 'Set true to STOP this schedule publishing to the user\'s live connected accounts on its unattended runs, so future runs draft the content and tell them what is waiting instead. Revoking is always safe and always allowed. You CANNOT turn it back on — that means posts go live without the user ever seeing them, so only they can do it, on the schedule form. If a user asks you to enable automatic posting, point them there and never claim you have enabled it.' },
+        timezone: { type: 'string', description: 'IANA timezone the schedule runs in, e.g. America/Los_Angeles (create/update)' },
         status: { type: 'string', enum: ['active', 'paused'], description: 'Status (toggle only)' }
       },
       required: ['action']
@@ -678,6 +711,13 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const c = ctx(context);
+    // ENG-1656: reject malformed calls before any network hop with a message that
+    // names the exact field. Without this an update/toggle/delete missing
+    // schedule_id hit `/scheduled-chats/undefined` and came back as a misleading
+    // "Scheduled chat not found", and a create missing a required field cost a
+    // round-trip before failing.
+    const preflight = validateManageScheduledChatArgs(args);
+    if (preflight) throw new Error(preflight);
     switch (args.action) {
       case 'create': {
         const body: any = {
@@ -700,6 +740,7 @@ mcpToolRegistry.register({
         if (args.llm_model !== undefined) body.llmModel = args.llm_model;
         if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
         if (args.session_id !== undefined) body.sessionId = args.session_id;
+        if (args.timezone !== undefined) body.timezone = args.timezone;
         const data = await mcpFetch({ method: 'POST', path: '/api/agent-mode/scheduled-chats', context: c, body });
         return jsonResult(data);
       }
@@ -745,6 +786,7 @@ mcpToolRegistry.register({
         }
 
         if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
+        if (args.timezone !== undefined) body.timezone = args.timezone;
         const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}`, context: c, body });
         return jsonResult(publishConsent ? { ...(data as any), publishConsent } : data);
       }
