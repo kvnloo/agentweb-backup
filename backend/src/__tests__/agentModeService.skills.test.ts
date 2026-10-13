@@ -1268,21 +1268,41 @@ describe('AgentModeService - Skills', () => {
     /*
      * ENG-1978: resolveSkillsToToolNames now returns null when the entitlement could not be
      * resolved (an unknown/malformed tier or a failed settings read), where it previously
-     * returned ["*"] and silently granted every tool. getFilteredTools must fail closed to the
-     * same install_skills-only toolset its own error catch has always used — not fall through to
-     * the foundation-tools bypass below, which would hand back create_work_plan/you_search_web
-     * etc. even though the entitlement check never actually succeeded.
+     * returned ["*"] and silently granted every tool. getFilteredTools must fail closed: nothing a
+     * tier would unlock (paid tools, tools of skills already installed in the session) is
+     * returned. Foundation tools and install_skills ARE kept — every tier, Free included, gets
+     * them unconditionally on the normal path, so an unresolved tier gets no more than that.
      */
-    it('should fail closed to install_skills-only when the entitlement is unresolved', async () => {
+    // filterFunctionCalls is an identity mock in this suite, so these assert the allow-list the
+    // unresolved branch hands to it — that list IS the contract.
+    const lastAllowList = (): string[] => {
+      const { filterFunctionCalls } = require('../services/subscriptionService');
+      const calls = (filterFunctionCalls as jest.Mock).mock.calls;
+      return calls[calls.length - 1][1];
+    };
+
+    it('should fail closed to foundation tools + install_skills when the entitlement is unresolved', async () => {
       const { resolveSkillsToToolNames } = require('../services/subscriptionService');
       (resolveSkillsToToolNames as jest.Mock).mockResolvedValueOnce(null);
 
-      const result = await agentModeService.getFilteredTools('user-123', undefined);
+      await agentModeService.getFilteredTools('user-123', undefined);
 
-      const toolNames = result.map((t: any) => t.function?.name || t.name);
-      expect(toolNames).toEqual(['install_skills']);
-      expect(toolNames).not.toContain('create_work_plan');
-      expect(toolNames).not.toContain('you_search_web');
+      const allowed = lastAllowList();
+      expect(allowed).toEqual(expect.arrayContaining(['create_work_plan', 'you_search_web', 'install_skills']));
+      expect(allowed).not.toContain('*');
+      // Nothing a tier would unlock: no paid, non-foundation tool.
+      expect(allowed).not.toContain('launch_retargeting_campaign');
+    });
+
+    it('should not carry session-installed skill tools over when the entitlement is unresolved', async () => {
+      const { resolveSkillsToToolNames } = require('../services/subscriptionService');
+      (resolveSkillsToToolNames as jest.Mock).mockResolvedValueOnce(null);
+
+      await agentModeService.getFilteredTools('user-123', new Set(['installed_skill_tool', 'create_work_plan']));
+
+      const allowed = lastAllowList();
+      expect(allowed).not.toContain('installed_skill_tool');
+      expect(allowed).toContain('create_work_plan');
     });
 
     /*
@@ -1296,11 +1316,11 @@ describe('AgentModeService - Skills', () => {
       (getAllowedSkills as jest.Mock).mockClear();
       (resolveSkillsToToolNames as jest.Mock).mockResolvedValueOnce(null);
 
-      const result = await agentModeService.getFilteredTools('user-123', undefined, null);
+      await agentModeService.getFilteredTools('user-123', undefined, null);
 
       expect(getAllowedSkills).not.toHaveBeenCalled();
       expect(resolveSkillsToToolNames).toHaveBeenLastCalledWith(null, 'user-123');
-      expect(result.map((t: any) => t.function?.name || t.name)).toEqual(['install_skills']);
+      expect(lastAllowList()).not.toContain('*');
     });
 
     it('should use precomputed allowed names when provided', async () => {
