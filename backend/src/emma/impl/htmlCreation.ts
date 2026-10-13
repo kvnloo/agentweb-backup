@@ -1336,6 +1336,7 @@ export async function createHtmlFromTemplate(
         // ENG-1888: structured, actionable not_found instead of a bare message.
         return {
           success: false,
+          errorClass: 'not_found',
           error_code: 'TEMPLATE_NOT_FOUND',
           missing_template_id: templateId,
           available_templates: available,
@@ -1347,7 +1348,11 @@ export async function createHtmlFromTemplate(
       if (!template.html_content || !template.subject) {
         return {
           success: false,
-          message: 'Invalid template structure: missing html_content or subject'
+          // ENG-1888: a stored template with no body/subject is a template
+          // configuration defect, not a tool bug — the caller must pick another template.
+          errorClass: 'not_found',
+          error_code: 'TEMPLATE_INVALID',
+          message: `Invalid template structure: missing html_content or subject (template '${templateId}'). Call list_html_templates and choose a different template_id.`
         };
       }
       if (!llmModel) {
@@ -1422,6 +1427,9 @@ export async function createHtmlFromTemplate(
       if (validationErrors.length > 0) {
         return {
           success: false,
+          // ENG-1888: caller-supplied variables did not match the template — an
+          // argument error the model fixes by retrying, never a tool bug.
+          errorClass: 'invalid_args',
           message: validationErrors.join('; '),
           errors: validationErrors,
           template_variables: templateVariables,
@@ -1678,12 +1686,21 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         } else if (error.message.includes('LLM returned invalid JSON')) {
           return {
             success: false,
+            errorClass: 'invalid_output',
             message: 'Failed to parse LLM response',
+            error: error.message
+          };
+        } else if (error.message.includes('LLM did not return substitution result')) {
+          return {
+            success: false,
+            errorClass: 'invalid_output',
+            message: 'LLM returned empty substitution result',
             error: error.message
           };
         } else if (error.message.includes('missing final_html or final_subject')) {
           return {
             success: false,
+            errorClass: 'invalid_output',
             message: 'LLM response missing final_html',
             error: error.message
           };
