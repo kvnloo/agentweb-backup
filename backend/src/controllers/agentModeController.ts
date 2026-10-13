@@ -86,6 +86,15 @@ import {
 } from '../services/agentMode/runStore';
 import { assertSequentialStepCounts } from '../services/workPlanSteps';
 import { validateModelPin, normalizeRequestedLlmModel, resolvePlanLaunchModel, canonicalPinId } from '../services/agentMode/modelPin';
+import { workPlanStepModels } from '../services/agentMode/workPlanStepModelsInstance';
+import {
+  anyStepCarriesModel,
+  buildStepModelPausedMessage,
+  currentPendingStep,
+  isStepModelUnavailableError,
+  resolvePlanStepModelsForLaunch,
+  stepModelOf,
+} from '../services/agentMode/workPlanStepModels';
 import { ModelUnavailableError, MODEL_SAVE_FAILED_MESSAGE, buildAnonymousModelUnavailableBody, buildModelUnavailableBody, isModelUnavailableError, sanitizeModelLabel } from '../services/agentMode/modelUnavailable';
 import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
 // ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
@@ -1833,6 +1842,107 @@ async function userExplicitlyRequestedStop(sessionId: string, usageContext?: LLM
 }
 
 /**
+ * ENG-2378: what the current plan step demands of THIS turn's model.
+ *  - `none`: no plan, switch off, or the pending step has no explicit model: the turn runs exactly as before.
+ *  - `resolved`: the step's model is served and selectable; it wins over the request's llmModel and the session's.
+ *  - `unavailable`: the step's model has become unavailable mid-plan (retired / no longer selectable). The caller
+ *    must PAUSE the plan; nothing is ever sent to a different model.
+ */
+type WorkPlanStepModelTurn =
+  | { kind: 'none' }
+  | { kind: 'resolved'; stepCount: number; decision: EffectiveModelPolicyDecision & { effectiveModel: string } }
+  | { kind: 'unavailable'; stepCount: number; model: string; label: string; reason: string };
+
+async function resolveWorkPlanStepModelForTurn(
+  session: { userId: string; workPlan?: { steps?: Array<{ stepCount?: number; status?: string; model?: string }> } | null },
+): Promise<WorkPlanStepModelTurn> {
+  if (!session.workPlan) return { kind: 'none' };
+  const step = currentPendingStep(session.workPlan);
+  const model = stepModelOf(step);
+  if (!step || !model) return { kind: 'none' };
+  // Checked only once a pending step actually carries a model, so ordinary plan turns never read the switch.
+  if (!(await workPlanStepModels.isEnabled())) return { kind: 'none' };
+  const stepCount = Number(step.stepCount);
+  try {
+    const decision = await resolveEffectiveModelForUser({
+      userId: session.userId,
+      requestedModel: model,
+      // An explicit selection by the plan author: fail loud, never substitute.
+      allowSilentSwap: false,
+    });
+    // Defensive: only an honored decision may run. (A paused account has no effective model; the callers'
+    // usage gates answer that case before this point.)
+    if (decision.modelSelection !== 'honored' || !decision.effectiveModel) {
+      throw new Error(`Work plan step ${stepCount} model "${sanitizeModelLabel(model)}" could not be honored (${decision.modelSelection})`);
+    }
+    return { kind: 'resolved', stepCount, decision: decision as EffectiveModelPolicyDecision & { effectiveModel: string } };
+  } catch (modelError) {
+    if (!isModelUnavailableError(modelError)) throw modelError;
+    const display = typeof agentModeService.getModelDisplayName === 'function'
+      ? agentModeService.getModelDisplayName(modelError.requestedModel)
+      : undefined;
+    return { kind: 'unavailable', stepCount, model, label: sanitizeModelLabel(display || model), reason: modelError.reason };
+  }
+}
+
+/**
+ * ENG-2378: pause a work plan whose current step's model is no longer available. Leaves a visible assistant message
+ * ("Step N uses <model>, which is no longer available. Pick another model for this step to continue") and sends an
+ * oncall alert; the plan itself is untouched (nothing completes, nothing runs on another model). Idempotent per
+ * step+model: when the transcript already ends with this exact pause, no second message or alert is produced, so a
+ * continuation chain that re-checks cannot spam the chat.
+ */
+async function pauseWorkPlanForUnavailableStepModel(
+  sessionId: string,
+  userId: string,
+  turn: Extract<WorkPlanStepModelTurn, { kind: 'unavailable' }>,
+  options: { emitToUser: boolean },
+): Promise<{ content: string; message?: any }> {
+  const content = buildStepModelPausedMessage(turn.stepCount, turn.label);
+  const session = await chatbotDb.getChatSession(sessionId);
+  const last = session?.messages?.[session.messages.length - 1];
+  const lastMeta = last?.metadata as any;
+  if (
+    last?.role === 'assistant'
+    && lastMeta?.kind === 'work-plan-step-model-unavailable'
+    && lastMeta?.stepCount === turn.stepCount
+    && lastMeta?.model === turn.model
+  ) {
+    return { content: last.content };
+  }
+  const timestamp = new Date().toISOString();
+  const message = {
+    role: 'assistant' as const,
+    content,
+    timestamp,
+    metadata: { timestamp, kind: 'work-plan-step-model-unavailable', stepCount: turn.stepCount, model: turn.model },
+  };
+  await chatbotDb.addMessageToSession(sessionId, message);
+  console.warn(`AgentMode: work plan for session ${sessionId} paused — step ${turn.stepCount} model "${sanitizeModelLabel(turn.model)}" is ${turn.reason}.`);
+  if (options.emitToUser) {
+    try {
+      const { io } = await import('../server');
+      io.to(`user:${userId}`).emit('session-message-appended', { sessionId, message: { role: 'assistant', content } });
+    } catch (emitErr) {
+      console.error(`AgentMode: failed to emit the step-model pause message for session ${sessionId}:`, emitErr);
+    }
+  }
+  await sendAgentModeOncallAlert({
+    subject: 'AgentMode: Work Plan paused - a step\'s model is no longer available',
+    message:
+      `Session ${sessionId}'s work plan is paused at step ${turn.stepCount}: its model "${sanitizeModelLabel(turn.model)}" is not available ` +
+      `(${turn.reason}). Nothing was sent to a different model; the user was told to pick another model for this step.`,
+    context: { sessionId, userId, Step: String(turn.stepCount), 'Step Model': sanitizeModelLabel(turn.model) },
+    sessionId,
+    dedupeKey: `work_plan_step_model_unavailable:${sessionId}:${turn.stepCount}:${turn.model}`,
+    dedupeWindowMs: 60 * 60 * 1000,
+  }).catch((alertErr) =>
+    console.error('AgentMode: failed to send the step-model pause alert:', alertErr),
+  );
+  return { content, message };
+}
+
+/**
  * ENG-1684: the autocomplete-work-plan analogue of scheduleAutoMediaContinuation above —
  * same shape (usage-gated, lock-claimed so it never fights a real concurrent user turn,
  * bounded retry with an exhaustion backstop that alerts on-call rather than failing
@@ -1955,6 +2065,29 @@ async function scheduleAutoWorkPlanContinuation(
     return;
   }
 
+  // ENG-2378: the pending step may demand its own model, and may have lost it since the last round. Resolved
+  // here (before a stop-judge call or any generation) so a retired step model pauses the chain loudly instead of
+  // spending a turn; generateSessionResponse re-resolves, so every other entry point is covered the same way.
+  // Fails closed: if the step model cannot be resolved the round does not run on any other model.
+  let continuationModel = llmModel;
+  if (currentSession?.workPlan) {
+    try {
+      const stepTurn = await resolveWorkPlanStepModelForTurn({ userId: currentSession.userId, workPlan: currentSession.workPlan });
+      if (stepTurn.kind === 'unavailable') {
+        await pauseWorkPlanForUnavailableStepModel(sessionId, userId, stepTurn, { emitToUser: true });
+        autoContinuationSessions.delete(sessionId);
+        releaseSessionGeneration(sessionId);
+        return;
+      }
+      if (stepTurn.kind === 'resolved') continuationModel = stepTurn.decision.effectiveModel;
+    } catch (stepModelErr) {
+      console.error(`AgentMode: work-plan auto-continuation for session ${sessionId} could not resolve the step model; not continuing:`, stepModelErr);
+      autoContinuationSessions.delete(sessionId);
+      releaseSessionGeneration(sessionId);
+      return;
+    }
+  }
+
   // ENG-1819: honor an explicit "stop" instruction instead of firing anyway. Re-evaluated
   // fresh on every round (this function re-reads session state each time it's called), so a
   // user who says "stop" mid-chain is caught on the very next round automatically. Checked
@@ -2003,7 +2136,7 @@ async function scheduleAutoWorkPlanContinuation(
       sessionId,
       AUTO_WORK_PLAN_CONTINUATION_MESSAGE,
       userId,
-      llmModel,
+      continuationModel,
       undefined, // attachments
       undefined, // isInteractiveShare
       undefined, // pageContext
@@ -8950,6 +9083,31 @@ export async function generateSessionResponse(
     throw new Error('Session not found after update');
   }
 
+  // ENG-2378: the plan's CURRENT pending step may carry its own model. It wins over the request's llmModel and
+  // the session's for this turn (the session model is then updated so the UI shows the truth, exactly as /generate
+  // does). A step model that has become unavailable mid-plan PAUSES the plan, loudly: never a swap.
+  const stepModelTurn = await resolveWorkPlanStepModelForTurn(updatedSession);
+  if (stepModelTurn.kind === 'unavailable') {
+    const paused = await pauseWorkPlanForUnavailableStepModel(sessionId, userId, stepModelTurn, { emitToUser: false });
+    return {
+      content: paused.content,
+      toolCalls: [],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: paused.message ? [paused.message] : [],
+      workPlan: updatedSession.workPlan,
+      calledFunctions: updatedSession.calledFunctions,
+      skills: [],
+      userMessageIndex,
+    };
+  }
+  if (stepModelTurn.kind === 'resolved') {
+    llmModel = stepModelTurn.decision.effectiveModel;
+    if (updatedSession.llmModel !== llmModel) {
+      await chatbotDb.updateSessionLlmModel(sessionId, llmModel, toStoredModelPolicyDecision(stepModelTurn.decision));
+    }
+  }
+
   // Strip any harness crash/abandon placeholders (ENG-324 jobIncomplete, ENG-473
   // isRunFailureNotice) from the history fed to the model — they are not real
   // turns and reading one back would look like the assistant already gave up
@@ -10938,7 +11096,7 @@ export const agentModeController = {
   async getModelOptions(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const [usage, entitledModels, chatBranchingEnabled, compareSaveAlternativesEnabled] = await Promise.all([
+      const [usage, entitledModels, chatBranchingEnabled, compareSaveAlternativesEnabled, workPlanStepModelsEnabled] = await Promise.all([
         getEffectiveLlmUsagePolicy(user.userId),
         agentModeService.getSupportedModels(user.isAdmin === true),
         // ENG-112 capability hint so the portal only offers "Branch from here" when the endpoint will
@@ -10953,6 +11111,9 @@ export const agentModeController = {
         // ENG-113 capability hint: the Compare dialog only sends the unchosen answers (and the set token) when
         // saving is on. A hint, not the gate (select re-checks). Unreadable flag = off.
         compareSaveAlternatives.isEnabled().catch(() => false),
+        // ENG-2378 capability hint: the work-plan editor only offers a per-step model when the engine will honour
+        // it. A hint, not the gate (the write routes and the engine re-check the switch). Unreadable = off.
+        workPlanStepModels.isEnabled().catch(() => false),
       ]);
       // Every consumer (chat composer, schedule form, MCP) is a text-chat picker, and an
       // explicit live-voice pick is refused (422 not_selectable), so never offer one.
@@ -10981,6 +11142,7 @@ export const agentModeController = {
         // sessions and schedules. Additive; lets clients show the renamed model for an old pin instead of
         // keeping their own hand-copied list. A copy, so nothing downstream can mutate the registry's map.
         legacyModelAliases: { ...LEGACY_MODEL_ALIASES },
+        workPlanStepModelsEnabled,
       });
     } catch (error) {
       console.error('AgentMode: Get model options error:', error);
@@ -15522,19 +15684,29 @@ export const agentModeController = {
       // author. Resolve it against the LAUNCHING user (anonymous = non-admin) BEFORE the
       // session or any side effect exists; an unserved/unselectable pin is a 422, never a
       // silent swap to the account default. Empty = account default (unchanged).
+      //
+      // ENG-2378: with per-step models enabled, EVERY step's model is resolved the same way up front, so a plan
+      // whose step N model cannot be served is refused now (422 + stepCount), not when it reaches step N.
+      const stepModelsEnabled = anyStepCarriesModel(predefinedPlan.steps) && await workPlanStepModels.isEnabled();
       let planPinnedModel: string | undefined;
+      let stepModelIds = new Map<number, string>();
       try {
-        planPinnedModel = await resolvePlanLaunchModel(
-          agentModeService,
-          () => (result.user ? isUserAdmin(result.user.userId) : Promise.resolve(false)),
-          predefinedPlan.defaultModel,
-        );
-      } catch (modelError) {
-        if (!isModelUnavailableError(modelError)) throw modelError;
-        console.warn(`AgentMode: createSessionWithPlan "${predefinedPlan.title}" refused — plan model "${sanitizeModelLabel(modelError.requestedModel)}" is ${modelError.reason}.`);
+        const isLauncherAdmin = () => (result.user ? isUserAdmin(result.user.userId) : Promise.resolve(false));
+        planPinnedModel = await resolvePlanLaunchModel(agentModeService, isLauncherAdmin, predefinedPlan.defaultModel);
+        if (stepModelsEnabled) {
+          stepModelIds = await resolvePlanStepModelsForLaunch(agentModeService, isLauncherAdmin, predefinedPlan.steps || []);
+        }
+      } catch (launchModelError) {
+        const stepError = isStepModelUnavailableError(launchModelError) ? launchModelError : undefined;
+        const modelError = stepError ? stepError.cause : launchModelError;
+        if (!isModelUnavailableError(modelError)) throw launchModelError;
+        console.warn(`AgentMode: createSessionWithPlan "${predefinedPlan.title}" refused — ${stepError ? `step ${stepError.stepCount} ` : 'plan '}model "${sanitizeModelLabel(modelError.requestedModel)}" is ${modelError.reason}.`);
         // An anonymous visitor learns nothing about which models exist or why.
         return res.status(422).json(result.user
-          ? buildModelUnavailableBody(modelError, agentModeService.getModelDisplayName?.(modelError.requestedModel), 'work_plan_pin')
+          ? {
+              ...buildModelUnavailableBody(modelError, agentModeService.getModelDisplayName?.(modelError.requestedModel), 'work_plan_pin'),
+              ...(stepError && { stepCount: stepError.stepCount }),
+            }
           : buildAnonymousModelUnavailableBody());
       }
 
@@ -15583,10 +15755,12 @@ export const agentModeController = {
         // Convert predefined plan to session work plan format
         const workPlan = {
           title: predefinedPlan.title,
-          steps: predefinedPlan.steps.map((step: any) => ({
+          steps: predefinedPlan.steps.map((step: any, stepIndex: number) => ({
             stepCount: step.stepCount,
             title: step.title,
             description: step.description,
+            // ENG-2378: the step's validated canonical model (only while the switch is on; otherwise not copied).
+            ...(stepModelIds.has(stepIndex) && { model: stepModelIds.get(stepIndex) }),
             // Carry the user-facing instructions through to the session so
             // <HorizontalPlanProgress> can render them in the expanded-step
             // panel. Without this, the field set in the partner-portal
