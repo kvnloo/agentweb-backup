@@ -9,6 +9,7 @@
  */
 import type { RunFunding } from "./runFunding";
 import { getCustomerRouteProvisioner } from "./transport/customerRouteProvisioner";
+import { CustomerRouteError } from "./transport/apiKeyTransport";
 
 /** Registry lab -> the BYOK provider names A1 stores. Any other lab stays AgentWeb-funded. */
 const BYOK_PROVIDER_BY_LAB: Record<string, string> = {
@@ -17,14 +18,8 @@ const BYOK_PROVIDER_BY_LAB: Record<string, string> = {
   google: "google",
 };
 
-/**
- * v1: only the agent's own working calls may use a customer key. Helper calls (titles,
- * suggested replies, summaries, classification, judges, embeddings) stay AgentWeb-paid:
- * they are tiny, and switching their models under a customer's key is a separate decision.
- */
-export function isCustomerRoutableFeature(feature: string | undefined): boolean {
-  return !!feature && (feature === "agent_task" || feature.startsWith("agent_task:"));
-}
+/** Longest the connection lookup may take before the call is treated as unresolvable. */
+export const CONNECTION_LOOKUP_TIMEOUT_MS = 3_000;
 
 export interface CallFunding extends RunFunding {
   /** The usable same-provider connections in the order to try them (A4's fallback list). */
@@ -35,7 +30,14 @@ export interface ResolveCallFundingInput {
   userId: string | undefined;
   /** The lab of the model this call will use (`LLMModelConfig.provider`). */
   modelLab: string | undefined;
-  feature: string | undefined;
+  /**
+   * Set only by the agent's own working loop. v1: helper calls (titles, suggested
+   * replies, summaries, classification, scoring and judge calls, embeddings) stay
+   * AgentWeb-paid; they are tiny, and switching their models under a customer's key is a
+   * separate decision. An explicit flag, not a feature-name match, because several
+   * helpers reuse the `agent_task` feature name.
+   */
+  customerRoutable: boolean;
 }
 
 /**
@@ -48,7 +50,7 @@ export async function resolveCallFunding(
   input: ResolveCallFundingInput,
 ): Promise<CallFunding | undefined> {
   if (!runFunding || runFunding.route !== "agentweb") return runFunding;
-  if (!input.userId || !isCustomerRoutableFeature(input.feature)) return runFunding;
+  if (!input.userId || !input.customerRoutable) return runFunding;
   const provider = input.modelLab ? BYOK_PROVIDER_BY_LAB[input.modelLab] : undefined;
   if (!provider) return runFunding;
   if (!getCustomerRouteProvisioner()) return runFunding;
@@ -62,7 +64,7 @@ export async function resolveCallFunding(
 
     // Lazy: the connection service pulls in the AWS SDK graph (see runFunding.ts).
     const { getLlmConnectionService } = require("./llmConnectionService") as typeof import("./llmConnectionService");
-    const usable = (await getLlmConnectionService().listUsableForUser(input.userId)).filter(
+    const usable = (await withTimeout(getLlmConnectionService().listUsableForUser(input.userId), CONNECTION_LOOKUP_TIMEOUT_MS)).filter(
       (connection) => connection.kind === "api_key" && connection.status === "active" && connection.provider === provider,
     );
     if (usable.length === 0) return runFunding;
@@ -76,9 +78,22 @@ export async function resolveCallFunding(
       candidates: usable.map((c) => ({ connectionId: c.connectionId, fundingPrincipalId: c.ownerUserId })),
     };
   } catch (error) {
-    console.error(
-      `[resolveCallFunding] connection lookup failed; call stays AgentWeb-funded: ${(error as { code?: string })?.code || (error as Error)?.name || "error"}`,
-    );
+    const code = (error as { code?: string })?.code || (error as Error)?.name || "error";
+    // A run that must never be billed to AgentWeb does not quietly become AgentWeb-paid
+    // because a lookup failed: the call fails and the caller sees why.
+    if (runFunding.fallback === "stop") {
+      console.error(`[resolveCallFunding] connection lookup failed; run is fallback=stop, failing the call: ${code}`);
+      throw new CustomerRouteError("lookup_failed");
+    }
+    console.error(`[resolveCallFunding] connection lookup failed; call stays AgentWeb-funded: ${code}`);
     return runFunding;
   }
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error("connection lookup timed out"), { code: "lookup_timeout" })), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }

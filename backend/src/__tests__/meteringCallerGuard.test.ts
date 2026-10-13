@@ -1,7 +1,8 @@
 /**
  * ENG-2108 (A2): every direct caller of the AgentWeb metering rails is classified.
  *
- * `meterUserUsage` / `meterUsageFromResponse` write to the usage tables, the per-user cap
+ * `meterUserUsage`, `meterUsageFromResponse`, `meterWithResolvedBilling`, `recordUsage` and
+ * `incrementUserTokenUsage` write to the usage tables, the per-user cap
  * and the spend events: the rails that must only ever see AgentWeb-paid usage. A caller
  * that stays AgentWeb-funded belongs there. A caller that gets routed to a customer key
  * must go through `recordLlmUsage` with the funding that actually paid, or its usage
@@ -15,7 +16,7 @@ import path from 'path';
 
 const SRC = path.join(__dirname, '..');
 
-/** file (relative to src) -> why it is correct for it to meter on the rails. */
+/** file (relative to src) -> why it is correct for it to write to the rails. */
 const STAYS_AGENTWEB_PAID: Record<string, string> = {
   'utils/llmClients.ts': 'embeddings, search, video and factory auto-record: AgentWeb keys, not customer-routable (A2 PR 2 reclassifies any that get routed)',
   'utils/llmService.ts': 'AgentWeb-funded LLM helper',
@@ -25,6 +26,17 @@ const STAYS_AGENTWEB_PAID: Record<string, string> = {
   'services/liveVoiceService.ts': 'Live Voice: retain/migrate decision is ENG-2129',
   'emma/impl/video.ts': 'AgentWeb-funded describe_video until A2 PR 2 routes it',
   'emma/impl/searchResearch.ts': 'AgentWeb-funded search and research',
+  'emma/tools.ts': 'AgentWeb-funded tool-side metering',
+  'mcp/metaToolkitGateway.ts': 'AgentWeb-funded MCP gateway metering',
+  'routes/internalUsage.ts': 'internal usage ingestion for AgentWeb-paid vendors',
+  'services/codingAgentService.ts': 'coding agent makes its own OpenRouter calls on AgentWeb\'s key; A2 PR 2 decides whether it becomes customer-routable',
+  'services/codingAgentSubpageService.ts': 'AgentWeb-funded coding agent sub-page',
+  'services/apolloQuota.ts': 'Apollo vendor quota (AgentWeb vendor)',
+  'services/apolloService.ts': 'Apollo vendor (AgentWeb vendor)',
+  'services/enrichSoQuota.ts': 'enrich.so vendor quota (AgentWeb vendor)',
+  'services/enrichSoService.ts': 'enrich.so vendor (AgentWeb vendor)',
+  'services/tokenUsageService.ts': 'defines the per-user cap rail',
+  'services/usageRecordDb.ts': 'defines the usage-record rail',
   'services/agentMode/deferredBillingMetering.ts': 'the AgentWeb rail itself (meterWithResolvedBilling)',
   'services/funding/recordLlmUsage.ts': 'the funding branch: only AgentWeb-funded calls reach the rails',
   'services/usageRecorderService.ts': 'defines the rails',
@@ -40,7 +52,7 @@ function sourceFiles(dir: string, out: string[] = []): string[] {
   return out;
 }
 
-const CALL = /\b(meterUserUsage|meterUserUsageAsync|meterUsageFromResponse)\s*\(/;
+const CALL = /\b(meterUserUsage|meterUserUsageAsync|meterUsageFromResponse|meterWithResolvedBilling|recordUsage|incrementUserTokenUsage)\s*\(/;
 
 describe('direct callers of the AgentWeb metering rails', () => {
   const callers = sourceFiles(SRC)

@@ -7,7 +7,7 @@ export type { CustomerRouteProvisioner } from "./customerRouteProvisioner";
 import type { RunFunding } from "../runFunding";
 import type { LlmTransport } from "./llmTransport";
 import { OpenRouterPlatformTransport } from "./openRouterPlatformTransport";
-import { ApiKeyTransport } from "./apiKeyTransport";
+import { ApiKeyTransport, CustomerRouteError } from "./apiKeyTransport";
 
 const openRouterPlatformTransport = new OpenRouterPlatformTransport();
 
@@ -17,6 +17,9 @@ const openRouterPlatformTransport = new OpenRouterPlatformTransport();
  * keeps today's OpenRouter platform transport.
  */
 export function pickTransport(runFunding: RunFunding | undefined, _model: string): LlmTransport {
-  if (runFunding?.route === "api_key") return new ApiKeyTransport(runFunding);
-  return openRouterPlatformTransport;
+  if (!runFunding || runFunding.route === "agentweb") return openRouterPlatformTransport;
+  if (runFunding.route === "api_key") return new ApiKeyTransport(runFunding);
+  // A subscription route is served by its own runner, never by callLLM. Sending it out
+  // on AgentWeb's key would bill AgentWeb for a call recorded as customer-funded.
+  throw new CustomerRouteError("unsupported_route");
 }

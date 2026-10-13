@@ -29,7 +29,7 @@ export const OPENROUTER_PROVIDER_SLUG: Record<string, string> = {
 
 export class CustomerRouteError extends Error {
   constructor(
-    readonly code: "not_provisioned" | "unsupported_provider" | "no_connection",
+    readonly code: "not_provisioned" | "unsupported_provider" | "no_connection" | "lookup_failed" | "unsupported_route",
   ) {
     super(`customer-funded route unavailable (${code})`);
     this.name = "CustomerRouteError";

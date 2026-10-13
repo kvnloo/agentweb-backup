@@ -105,6 +105,12 @@ describe('pickTransport', () => {
     expect(pickTransport(funding(), 'm')).toBeInstanceOf(ApiKeyTransport);
     expect(pickTransport(funding({ route: 'agentweb' }), 'm')).toBeInstanceOf(OpenRouterPlatformTransport);
     expect(pickTransport(undefined, 'm')).toBeInstanceOf(OpenRouterPlatformTransport);
-    expect(pickTransport(funding({ route: 'claude_subscription' }), 'm')).toBeInstanceOf(OpenRouterPlatformTransport);
   });
+
+  it.each(['claude_subscription', 'codex_subscription'] as const)(
+    'refuses a %s route rather than sending it out on AgentWeb\'s key',
+    (route) => {
+      expect(() => pickTransport(funding({ route }), 'm')).toThrow(expect.objectContaining({ code: 'unsupported_route' }));
+    },
+  );
 });

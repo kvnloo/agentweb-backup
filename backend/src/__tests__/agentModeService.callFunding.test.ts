@@ -82,7 +82,11 @@ function setup() {
 }
 const call = (service: AgentModeService, model: string, feature: string, extra: Record<string, unknown> = {}) =>
   withRunFunding(run, () =>
-    service.callLLM(model, [{ role: 'user', content: 'Hello' }], { usageContext: { userId: 'member-1', feature } as any, ...extra }),
+    service.callLLM(model, [{ role: 'user', content: 'Hello' }], {
+      usageContext: { userId: 'member-1', feature } as any,
+      customerRoutable: feature.startsWith('agent_task'),
+      ...extra,
+    }),
   );
 const fundingSeen = () => (recordLlmUsage as jest.Mock).mock.calls.map((c: any[]) => c[0]);
 
@@ -114,13 +118,14 @@ describe('callLLM per-call funding (ENG-2108)', () => {
     expect(fundingSeen()).toEqual([expect.objectContaining({ route: 'agentweb' })]);
   });
 
-  it('keeps helper calls on AgentWeb even when a matching key exists', async () => {
+  it('keeps helper calls on AgentWeb even when a matching key exists, including ones that reuse the agent_task feature name', async () => {
     const { service, platformCreate, customerCreate } = setup();
     await call(service, CLAUDE, 'session_title:interactive');
+    await call(service, CLAUDE, 'agent_task', { customerRoutable: false });
 
     expect(customerCreate).not.toHaveBeenCalled();
-    expect(platformCreate).toHaveBeenCalledTimes(1);
-    expect(fundingSeen()).toEqual([expect.objectContaining({ route: 'agentweb' })]);
+    expect(platformCreate).toHaveBeenCalledTimes(2);
+    expect(fundingSeen()).toEqual([expect.objectContaining({ route: 'agentweb' }), expect.objectContaining({ route: 'agentweb' })]);
   });
 
   it('changes nothing when BYOK is off', async () => {
@@ -166,5 +171,10 @@ describe('callLLM per-call funding (ENG-2108)', () => {
     await expect(call(service, CLAUDE, 'agent_task:interactive')).rejects.toThrow('openrouter key revoked');
     spy.mockRestore();
     expect(platformCreate).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unknown fallback model on a customer key exactly as on an AgentWeb call', async () => {
+    const { service } = setup();
+    await expect(call(service, CLAUDE, 'agent_task:interactive', { fallbackModels: ['openrouter/no/such-model'] })).rejects.toThrow(/fallback model/i);
   });
 });

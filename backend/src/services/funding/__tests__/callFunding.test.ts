@@ -9,7 +9,7 @@ jest.mock('../llmConnectionService', () => ({
 const getFundingFlags = jest.fn();
 jest.mock('../fundingFlags', () => ({ getFundingFlags: (...a: unknown[]) => getFundingFlags(...a) }));
 
-import { resolveCallFunding, isCustomerRoutableFeature } from '../callFunding';
+import { resolveCallFunding, CONNECTION_LOOKUP_TIMEOUT_MS } from '../callFunding';
 import { registerCustomerRouteProvisioner } from '../transport/customerRouteProvisioner';
 import type { RunFunding } from '../runFunding';
 
@@ -29,7 +29,7 @@ const conn = (over: Record<string, unknown> = {}) => ({
   ownedByCaller: false,
   ...over,
 });
-const input = { userId: 'member-1', modelLab: 'anthropic', feature: 'agent_task:interactive' };
+const input = { userId: 'member-1', modelLab: 'anthropic', customerRoutable: true };
 
 describe('resolveCallFunding', () => {
   beforeEach(() => {
@@ -85,13 +85,9 @@ describe('resolveCallFunding', () => {
     expect(listUsableForUser).not.toHaveBeenCalled();
   });
 
-  it('keeps helper calls on AgentWeb in v1', async () => {
-    for (const feature of ['session_title:interactive', 'suggested_replies:interactive', 'report_classification', 'session_summary:interactive', undefined]) {
-      expect(await resolveCallFunding(run, { ...input, feature })).toBe(run);
-    }
+  it('keeps every call that is not the agent\'s own working loop on AgentWeb in v1', async () => {
+    expect(await resolveCallFunding(run, { ...input, customerRoutable: false })).toBe(run);
     expect(listUsableForUser).not.toHaveBeenCalled();
-    expect(isCustomerRoutableFeature('agent_task')).toBe(true);
-    expect(isCustomerRoutableFeature('agent_task_extra')).toBe(false);
   });
 
   it('stays dark with no provisioner registered, however the flags are set', async () => {
@@ -116,10 +112,30 @@ describe('resolveCallFunding', () => {
     expect(await resolveCallFunding(run, { ...input, userId: undefined })).toBe(run);
   });
 
-  it('keeps the call on AgentWeb, without throwing, if the connection lookup fails', async () => {
+  it('fails the call, instead of quietly billing AgentWeb, when a fallback=stop run\'s lookup fails', async () => {
     const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
     listUsableForUser.mockRejectedValue(Object.assign(new Error('secret detail'), { code: 'ThrottlingException' }));
-    expect(await resolveCallFunding(run, input)).toBe(run);
+    await expect(resolveCallFunding({ ...run, fallback: 'stop' }, input)).rejects.toMatchObject({ code: 'lookup_failed' });
+    spy.mockRestore();
+  });
+
+  it('treats a lookup that hangs as a failed lookup', async () => {
+    jest.useFakeTimers();
+    const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    listUsableForUser.mockReturnValue(new Promise(() => {}));
+    const pending = resolveCallFunding({ ...run, fallback: 'stop' }, input);
+    const assertion = expect(pending).rejects.toMatchObject({ code: 'lookup_failed' });
+    await jest.advanceTimersByTimeAsync(CONNECTION_LOOKUP_TIMEOUT_MS + 1);
+    await assertion;
+    spy.mockRestore();
+    jest.useRealTimers();
+  });
+
+  it('keeps the call on AgentWeb, without throwing, if the lookup fails and the run allows AgentWeb fallback', async () => {
+    const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    listUsableForUser.mockRejectedValue(Object.assign(new Error('secret detail'), { code: 'ThrottlingException' }));
+    const mayFallBack = { ...run, fallback: 'agentweb' as const };
+    expect(await resolveCallFunding(mayFallBack, input)).toBe(mayFallBack);
     const logged = spy.mock.calls.flat().join(' ');
     spy.mockRestore();
     expect(logged).toContain('ThrottlingException');

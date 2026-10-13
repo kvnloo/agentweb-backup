@@ -1018,6 +1018,8 @@ export interface SupportedModelInfo {
 const PROMPT_CACHE_DEFAULT_TTL_MS = 5 * 60 * 1000;
 
 interface LLMCallOptions {
+  /** ENG-2108: set only by the agent's own working loop; lets this call use a customer key. */
+  customerRoutable?: boolean;
   tools?: any[] | null;
   tool_choice?: 'auto' | 'none' | any | null;
   /** Execute search through OpenRouter's provider-independent server tool. */
@@ -2502,6 +2504,7 @@ export class AgentModeService {
       humanPaced = false,
       timeoutMs,
       fallbackModels: requestedFallbackModels,
+      customerRoutable = false,
       taskClass,
       providerPolicy,
     } = options || {};
@@ -2512,15 +2515,17 @@ export class AgentModeService {
     const callFunding = await resolveCallFunding(currentRunFunding(), {
       userId: usageContext?.userId,
       modelLab: this.llmModels[model].provider,
-      feature: usageContext?.feature,
+      customerRoutable,
     });
     // On a customer key the request may only stay with the customer's provider, so a
     // fallback model from another lab is dropped rather than left to fail (or bill AgentWeb).
     const fallbackModels =
       callFunding?.route === 'api_key'
-        ? requestedFallbackModels?.filter(
-            (id) => this.llmModels[this.normalizeModelId(id)]?.provider === this.llmModels[model].provider,
-          )
+        ? requestedFallbackModels?.filter((id) => {
+            const fallback = this.llmModels[this.normalizeModelId(id)];
+            // An unknown id is kept so it is rejected below exactly as on an AgentWeb call.
+            return !fallback || fallback.provider === this.llmModels[model].provider;
+          })
         : requestedFallbackModels;
 
     // AgentWeb owns model selection; OpenRouter owns transport, provider
@@ -4012,6 +4017,7 @@ export class AgentModeService {
             // Scheduled and interactive conversations canary independently;
             // OpenRouter owns provider fallback once either class is enabled.
             taskClass: chatTaskClass,
+            customerRoutable: true,
             // ENG-2121: bound this call to whatever remains before the synthesis
             // reserve (computed above) instead of letting it run unbounded — see the
             // catch block below for what happens when this actually fires.
