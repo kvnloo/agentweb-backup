@@ -29,7 +29,7 @@ const conn = (over: Record<string, unknown> = {}) => ({
   ownedByCaller: false,
   ...over,
 });
-const input = { userId: 'member-1', modelLab: 'anthropic', customerRoutable: true };
+const input: any = { userId: 'member-1', modelLab: 'anthropic', customerRoutable: true };
 
 describe('resolveCallFunding', () => {
   beforeEach(() => {
@@ -94,6 +94,18 @@ describe('resolveCallFunding', () => {
     registerCustomerRouteProvisioner(null);
     expect(await resolveCallFunding(run, input)).toBe(run);
     expect(getFundingFlags).not.toHaveBeenCalled();
+  });
+
+  it('lets a caller that can call Anthropic directly use an Anthropic key without a provisioner, but not any other provider', async () => {
+    registerCustomerRouteProvisioner(null);
+    const direct = await resolveCallFunding(run, { ...input, canCallAnthropicDirect: true });
+    expect(direct).toMatchObject({ route: 'api_key', provider: 'anthropic', connectionId: 'c1' });
+
+    listUsableForUser.mockResolvedValue([conn({ provider: 'openai' })]);
+    expect(await resolveCallFunding(run, { ...input, modelLab: 'openai', canCallAnthropicDirect: true })).toBe(run);
+    // The ordinary OpenRouter-only caller still needs a provisioner for Anthropic keys.
+    listUsableForUser.mockResolvedValue([conn()]);
+    expect(await resolveCallFunding(run, input)).toBe(run);
   });
 
   it.each([
