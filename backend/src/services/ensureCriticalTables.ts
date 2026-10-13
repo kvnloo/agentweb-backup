@@ -25,6 +25,7 @@ import { CONTACT_EVENTS_TABLE, CONTACT_EVENTS_SOURCE_RECORD_INDEX } from './cont
 import { LLM_CHARGE_EVENTS_TABLE, LLM_CHARGE_EVENTS_OCCURRED_AT_INDEX } from './llmChargeAuditDb';
 import { SPEND_EVENTS_TABLE, SPEND_EVENTS_OCCURRED_AT_INDEX } from './spendEventDb';
 import { SPEND_PROJECTION_TABLE } from './spendProjectionDb';
+import { LLM_CONNECTIONS_TABLE_SPEC } from './funding/llmConnectionDb';
 
 export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
   {
@@ -99,6 +100,9 @@ export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
     BillingMode: 'PAY_PER_REQUEST',
     DeletionProtectionEnabled: true,
   },
+  // ENG-2105 -- customer LLM provider keys (KMS envelope-encrypted). Ensured at
+  // boot like the tables above, because create-tables.ts is not run on deploy.
+  LLM_CONNECTIONS_TABLE_SPEC,
   {
     TableName: LOOP_EVENTS_TABLE,
     AttributeDefinitions: [

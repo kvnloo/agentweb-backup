@@ -226,6 +226,18 @@ async function syncCheckoutProfileFields(session: any): Promise<void> {
 }
 
 /**
+ * A setup-mode Checkout Session only saves a payment method; it never creates a
+ * subscription. ENG-2303: Zoma's "add a payment method" link uses one, and the
+ * subscription handlers must not treat its completion as a purchase (that would mark a
+ * non-subscriber `subscription_status: active`).
+ */
+export function isSetupModeCheckoutSession(session: any): boolean {
+  return session?.object !== 'subscription' && session?.mode === 'setup';
+}
+
+export const ZOMA_PAYMENT_METHOD_PURCHASE_TYPE = 'zoma_payment_method';
+
+/**
  * Stripe Service — wraps Stripe SDK calls with validation.
  */
 export const stripeService = {
@@ -349,6 +361,57 @@ export const stripeService = {
     return s.billingPortal.sessions.create({
       customer: stripeCustomerId,
       return_url: returnUrl || undefined,
+    });
+  },
+
+  /**
+   * ENG-2303 — Stripe customers created for a user that has no `stripe_customer_id` yet
+   * carry `metadata.userId`, so they can be found again without writing to the user row.
+   */
+  async findCustomerIdsByUserId(userId: string): Promise<string[]> {
+    if (!/^[A-Za-z0-9_-]+$/.test(userId)) throw new Error('userId has unexpected characters');
+    const s = getStripeOrThrow();
+    const result = await s.customers.search({ query: `metadata['userId']:'${userId}'`, limit: 10 });
+    return result.data.map((c) => c.id);
+  },
+
+  async createCustomerForUser(userId: string, email: string | undefined): Promise<string> {
+    if (!userId) throw new Error('userId is required');
+    const s = getStripeOrThrow();
+    // The idempotency key collapses rapid repeat calls (customer search is eventually consistent).
+    const customer = await s.customers.create(
+      { email, metadata: { userId, source: 'zoma_mcp' } },
+      { idempotencyKey: `zoma-customer-${userId}` },
+    );
+    return customer.id;
+  },
+
+  async customerHasPaymentMethod(stripeCustomerId: string): Promise<boolean> {
+    if (!stripeCustomerId) return false;
+    const s = getStripeOrThrow();
+    const methods = await s.paymentMethods.list({ customer: stripeCustomerId, limit: 1 });
+    return methods.data.length > 0;
+  },
+
+  /** Stripe-hosted Checkout in setup mode: saves a card, charges nothing. */
+  async createPaymentMethodSetupSession(params: {
+    stripeCustomerId: string;
+    userId: string;
+    successUrl: string;
+    cancelUrl: string;
+  }) {
+    if (!params.stripeCustomerId) throw new Error('stripeCustomerId is required');
+    if (!params.userId) throw new Error('userId is required');
+    const s = getStripeOrThrow();
+    const metadata = { userId: params.userId, purchaseType: ZOMA_PAYMENT_METHOD_PURCHASE_TYPE };
+    return s.checkout.sessions.create({
+      mode: 'setup',
+      currency: 'usd',
+      customer: params.stripeCustomerId,
+      success_url: params.successUrl,
+      cancel_url: params.cancelUrl,
+      metadata,
+      setup_intent_data: { metadata },
     });
   },
 

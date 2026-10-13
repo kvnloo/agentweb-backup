@@ -104,6 +104,18 @@ and the ENG-2280 shaper do NOT cover them. See D3.
 
 ## 4. DECIDED v1 external surface
 
+> **Superseded in part (ENG-2303, Harsha 2026-10-12):** guarded writes are in scope.
+> `call_meta_marketing_api` now also accepts CAMPAIGN / AD_SET / AD **CREATE** and
+> **UPDATE of status (ACTIVE|PAUSED) or budget**, via `mcp/metaToolkitWrites.ts`:
+> preview first (nothing sent), then `confirm=true` + a single-use HMAC `preview_token`
+> bound to the user, the exact arguments and what the preview showed (15 min TTL). New
+> entities are always created PAUSED; activation is its own preview + confirm. Writes
+> require a payment method + usable Meta connection (`zoma_status`), a **granted**
+> `ads_management` scope (D4), the optional `META_TOOLKIT_SPEND_CEILING` policy, the
+> currency echo, and dispatch through `dispatchAuthorizedMetaWrite` (budget-anomaly
+> re-check, tracking pre-flight, rate shaper); the read-back decides CONFIRMED / MISMATCH /
+> UNCONFIRMED. Everything else listed as excluded below stays excluded.
+
 Harsha approved D1–D5 on 2026-10-06. External v1 is **reads-only**.
 The manifest narrows the advertised action enum and `assertMetaToolkitV1Call`
 refuses every write with `MetaToolkitRefusal` before shared handler dispatch.
@@ -124,11 +136,12 @@ Excluded from v1:
 
 - **D1 — DECIDED:** Reads on all paid tiers; writes Pro+ in a future write-capable
   version. Pricing TBD. Documented only; no new billing/tier enforcement here.
-- **D2 — DECIDED:** Reads-only external v1. No external approval-token/deck write
-  flow in v1; CREATE/UPDATE are neither advertised nor allowed.
+- **D2 — SUPERSEDED (ENG-2303, 2026-10-12):** was reads-only external v1. Now guarded
+  CREATE + status/budget UPDATE for CAMPAIGN/AD_SET/AD behind a bound preview→confirm
+  (section 4 note). DELETE and the other exclusions stand.
 - **D3 — DECIDED:** `launch_*` tools stay internal, not in the external manifest.
 - **D4 — DECIDED:** Fail closed locally on writes when `granted_scopes` lacks
-  `ads_management`. Toolkit v1 enforces this through D2: all writes are refused
-  locally regardless of scopes, so no additional token/scope lookup is needed.
-  Any future external write surface must check granted (not requested) scopes.
+  `ads_management`. Enforced by ENG-2303's write path from `granted_scopes` on the
+  connected account; a missing record (`unknown`) also fails closed and asks for a
+  reconnect.
 - **D5 — DECIDED:** CUSTOM_AUDIENCE CREATE / UPLOAD_USERS remain excluded.

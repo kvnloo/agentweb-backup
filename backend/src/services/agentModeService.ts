@@ -82,7 +82,7 @@ import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActions
 import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory, type ToolDispatchPorts } from './agentMode/core/toolDispatch';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
-import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
+import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, buildFinalizeJudgePrompt, parseFinalizeJudgeOutput } from './agentMode/core/finalizeGuard';
 import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
 import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
 import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionIndex } from '../utils/modelMentionRequest';
@@ -266,6 +266,7 @@ import * as linkedinImpl from '../emma/impl/linkedin';
 import * as twitterImpl from '../emma/impl/twitter';
 // ENG-2103 (F2): Meta/LinkedIn ads APIs tool cluster, same treatment as leadsImpl above.
 import * as adsApisImpl from '../emma/impl/adsApis';
+import { buildToolkitObjectiveGate, readBackMetaNode } from './agentMode/metaToolkitSeams';
 // ENG-2103 (F2): Google Ads + HubSpot/Attio CRM passthrough tool cluster,
 // same treatment as leadsImpl above.
 import * as adsCrmApisImpl from '../emma/impl/adsCrmApis';
@@ -10757,14 +10758,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     const response = await this.callLLM(FINALIZE_GUARD_JUDGE_MODEL, [
       {
         role: 'user',
-        content:
-          'You are auditing an AI assistant\'s reply for COMPLETED-ACTION claims — statements that an action already happened '
-          + '(not offers, plans, or suggestions). The possible claim classes are: '
-          + `${CLAIM_CLASSES.join(', ')}. Candidate classes detected in this reply: ${candidateClasses.join(', ')}.\n\n`
-          + 'Return ONLY a JSON array, one element per claimed completed action, each shaped '
-          + '{"claimClass":"<class>","statement":"<short quote from the reply>"}. '
-          + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
-          + finalText,
+        content: buildFinalizeJudgePrompt(finalText, candidateClasses),
       },
     ], {
       max_completion_tokens: 500,
@@ -10774,19 +10768,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       usageContext: usageContext ?? { feature: 'finalize_guard_judge' },
     });
 
-    const text = (response as any)?.choices?.[0]?.message?.content;
-    if (typeof text !== 'string' || !text.trim()) {
-      throw new Error('finalize-guard judge returned no content');
-    }
-    const match = text.match(/\[[\s\S]*\]/);
-    if (!match) {
-      throw new Error(`finalize-guard judge returned unparseable output: ${text.slice(0, 200)}`);
-    }
-    const parsed = JSON.parse(match[0]); // throws on invalid JSON → judge_error path
-    if (!Array.isArray(parsed)) {
-      throw new Error('finalize-guard judge output is not an array');
-    }
-    return (parsed as any[]).filter((c) => c && typeof c.claimClass === 'string');
+    return parseFinalizeJudgeOutput((response as any)?.choices?.[0]?.message?.content);
   }
 
   /**
@@ -14657,7 +14639,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     params: any = {},
     sessionId?: string
   ): Promise<MetaApiResult> {
-    return adsApisImpl.callMetaMarketingApi(userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, sessionId, {
+    return adsApisImpl.callMetaMarketingApi(userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, sessionId, this.metaMarketingApiDeps());
+  }
+
+  private metaMarketingApiDeps(): adsApisImpl.CallMetaMarketingApiDeps {
+    return {
       resolveCampaignObjectiveGate: this.resolveCampaignObjectiveGate.bind(this),
       validateMetaActionParams: this.validateMetaActionParams.bind(this),
       claimMetaWriteManifestGrant: this.claimMetaWriteManifestGrant.bind(this),
@@ -14668,7 +14654,55 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       remedyFromScopeRefusal: AgentModeService.remedyFromScopeRefusal,
       getMetaCredentials: this.getMetaCredentials.bind(this),
       checkMetaBudgetChange: this.checkMetaBudgetChange.bind(this),
-    });
+    };
+  }
+
+  /**
+   * ENG-2303 P3 — the Meta Toolkit's preview of a guarded write: the same shared gate as
+   * callMetaMarketingApi (validation, Page check, ownership, budget anomaly, confirmation
+   * summary), sessionless so it can only halt with a preview and never dispatches. The one
+   * difference is the ENG-400 objective gate: an external agent has no Emma transcript or
+   * approval deck, so the objective must be supplied explicitly, is validated here, and is
+   * shown in the bound preview — the user's approval of that preview is the human choice.
+   * It never auto-provisions an Emma chat session.
+   */
+  public async previewToolkitMetaWrite(
+    userId: string, entity_type: any, action: string, account_id: string,
+    campaign_id?: string, ad_set_id?: string, ad_id?: string, params: any = {},
+  ): Promise<MetaApiResult> {
+    const deps = this.metaMarketingApiDeps();
+    deps.resolveCampaignObjectiveGate = buildToolkitObjectiveGate(AgentModeService.META_OBJECTIVE_VALUES);
+    return adsApisImpl.callMetaMarketingApi(userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, undefined, deps);
+  }
+
+  /**
+   * ENG-2303 P3 — Meta Toolkit (external MCP) seams. The external agent's user approves a
+   * preview in their own conversation; the toolkit binds the confirm to that exact preview
+   * (HMAC, see mcp/metaToolkitWrites.ts) and then dispatches the SAME way an approved
+   * deck item does: through dispatchAuthorizedMetaWrite, so the budget-anomaly re-check,
+   * tracking pre-flight and rate shaper all stay in the path. These three methods perform
+   * no authorization of their own.
+   */
+  public async previewMetaMoneyParams(userId: string, account_id: string, params: any) {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    return this.normalizeMetaMoneyParams(accountId, accessToken, params);
+  }
+
+  public async dispatchToolkitConfirmedMetaWrite(
+    userId: string,
+    dispatch: { entity_type: string; action: string; account_id: string; resolvedAccountId?: string; campaign_id?: string; ad_set_id?: string; ad_id?: string; params: any },
+  ): Promise<{ result: MetaApiResult; createdId?: string }> {
+    const result = await this.dispatchAuthorizedMetaWrite(
+      userId, dispatch.entity_type, dispatch.action, dispatch.resolvedAccountId || dispatch.account_id,
+      dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params, false, undefined,
+    );
+    return { result, createdId: AgentModeService.extractDispatchedObjectId(result) };
+  }
+
+  /** Read-back after a toolkit write: status + effective status + budgets, ownership-scoped. */
+  public async readBackMetaWriteTarget(userId: string, account_id: string, entity_type: string, id: string) {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    return readBackMetaNode(metaService, accountId, accessToken, entity_type, id);
   }
 
   /**

@@ -290,7 +290,7 @@ function classFromMessage(message: string): string | null {
   if (/arguments failed schema validation|has the wrong type|missing required (argument|variable)|invalid parameters?|invalid argument|validation (failed|error)|(is|are) required|must be|is too long|too long \(|is too short|too large to save|is too large/.test(m)) return 'invalid_args';
 
   if (/unauthorized|forbidden|invalid (access |api )?token|invalid api key|authentication|missing credentials|not authorized|do not have permission|permission to|no secrets configured|not a member of channel|account connected|account not configured|not configured to access/.test(m)) return 'auth';
-  if (/enotfound|econnrefused|econnreset|eai_again|socket hang up|network error|fetch failed|connection error/.test(m)) return 'network';
+  if (/enotfound|econnrefused|econnreset|eai_again|socket hang up|network error|fetch failed|connection error|premature close|invalid response body/.test(m)) return 'network';
   if (/does not exist|not found|no landing page found/.test(m)) return 'not_found';
   if (/internal server error|bad gateway|service unavailable|upstream/.test(m)) return 'upstream_5xx';
   // Meta Graph transient (codes 1/2): the SDK/campaign path surfaces Meta's generic
