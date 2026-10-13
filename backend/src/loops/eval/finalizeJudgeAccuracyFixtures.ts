@@ -18,7 +18,8 @@ import type { ClaimClass, FinalizeLedgerEntry } from '../../services/agentMode/c
 const ok = (toolName: string, result: any = { success: true }): FinalizeLedgerEntry => ({ toolName, status: 'success', result });
 const err = (toolName: string): FinalizeLedgerEntry => ({ toolName, status: 'error', result: { error: 'failed' } });
 const encodedFail = (toolName: string): FinalizeLedgerEntry => ({ toolName, status: 'success', result: { success: false, error: 'quota' } });
-const claims = (...classes: ClaimClass[]) => classes.map((claimClass) => ({ claimClass }));
+// The real judge quotes the sentence that makes the claim; the guard ignores a claim without one (ENG-2459).
+const claims = (...classes: ClaimClass[]) => classes.map((claimClass) => ({ claimClass, statement: `recorded ${claimClass} claim` }));
 
 export const FINALIZE_JUDGE_CASES: JudgeAccuracyCase[] = [
   // ── email_sent ──
