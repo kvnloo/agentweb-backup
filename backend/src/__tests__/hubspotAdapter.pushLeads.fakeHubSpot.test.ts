@@ -12,6 +12,12 @@
  * fake's answers for them are explicit per-test GUESSES (see `FakeOpts`). A pass here
  * means "the code behaves correctly if HubSpot answers like this", nothing more. ENG-2464
  * is the live check.
+ *
+ * The fake is also MORE FORGIVING than HubSpot in ways that matter: it is strongly
+ * consistent (an upsert is visible to the very next search, so the read-after-write hazard
+ * the adapter's adopt-instead-of-upsert logic avoids cannot occur here), it does not
+ * reject unknown properties, and a 404/409 batch/update applies none of the inputs while a
+ * 207 applies the valid ones (HubSpot's real atomicity is undocumented).
  */
 
 jest.mock('../services/db', () => ({
