@@ -535,29 +535,49 @@ export async function writeIcpCard(
   resolve: (list: ICPPersona[]) => { index: number } | { status: 400 | 404 },
   op: IcpCardOp,
 ): Promise<IcpCardResult> {
+  // The card the caller meant, fixed on the FIRST read. A retry must find that same
+  // card again, not re-run `resolve`: a positional ref such as `icp-2` names
+  // whatever sits at position 2 NOW, which after a concurrent delete is a different
+  // card.
+  let target: { idKnown: boolean; id: unknown; name: unknown; index: number } | null = null;
+
   for (let attempt = 0; attempt < MAX_CARD_WRITE_ATTEMPTS; attempt++) {
     const user: any = await readUserForRegeneration(userId);
     const list: ICPPersona[] = Array.isArray(user?.icpResult) ? user.icpResult : [];
     if (list.length === 0) return { ok: false, status: 404 };
-    const resolved = resolve(list);
-    if ("status" in resolved) return { ok: false, status: resolved.status };
-    const idx = resolved.index;
+
+    let idx: number;
+    if (!target) {
+      const resolved = resolve(list);
+      if ("status" in resolved) return { ok: false, status: resolved.status };
+      idx = resolved.index;
+      const first: any = list[idx];
+      target = { idKnown: first?.id !== undefined, id: first?.id, name: first?.name, index: idx };
+    } else {
+      // Same card by identity: its id, or, for a card stored before ids existed,
+      // its name (closest to where it was when several share one).
+      const wanted = target;
+      const matches = list
+        .map((p: any, i) => ({ i, p }))
+        .filter(({ p }) => (wanted.idKnown ? p?.id === wanted.id : p?.id === undefined && p?.name === wanted.name));
+      if (matches.length === 0) return { ok: false, status: 404 };
+      idx = matches.sort((x, y) => Math.abs(x.i - wanted.index) - Math.abs(y.i - wanted.index))[0].i;
+      target.index = idx;
+    }
     const card: any = list[idx];
 
-    // Identity: the same card still sits at this index. Cards from before stable
-    // ids existed are matched on their name instead.
-    const names: Record<string, string> = { "#cl": "icpResult" };
+    // Identity: the same card still sits at this index. Compared with whatever
+    // value was read (any type) so a card with an odd stored shape can still match.
+    const names: Record<string, string> = { "#cl": "icpResult", "#cid": "id" };
     const values: Record<string, unknown> = {};
     const clauses: string[] = [];
-    if (typeof card?.id === "string") {
-      names["#cid"] = "id";
+    if (card?.id !== undefined) {
       values[":cid"] = card.id;
       clauses.push(`#cl[${idx}].#cid = :cid`);
     } else {
-      names["#cid"] = "id";
       names["#cname"] = "name";
       clauses.push(`attribute_not_exists(#cl[${idx}].#cid)`);
-      if (typeof card?.name === "string") {
+      if (card?.name !== undefined) {
         values[":cname"] = card.name;
         clauses.push(`#cl[${idx}].#cname = :cname`);
       } else {
@@ -574,15 +594,22 @@ export async function writeIcpCard(
       // The user's own words are also kept as an anchor next to the visible field:
       // every later regeneration of this persona is driven from the anchor, so it
       // can neither be overwritten by a full-set run nor drift (ENG-255). Merged,
-      // not replaced, so an edit to a second field keeps the first. The anchor map
-      // either exists (set its fields) or doesn't (create it); the write asserts
-      // which, so two first edits racing cannot both think they are the first.
+      // not replaced, so an edit to a second field keeps the first. The write
+      // asserts the anchor's current shape, so two first edits racing cannot both
+      // think they are the first.
       names["#cui"] = "userIntent";
-      if (card?.userIntent && typeof card.userIntent === "object") {
-        clauses.push(`attribute_exists(#cl[${idx}].#cui)`);
+      const anchor = card?.userIntent;
+      const anchorPath = `#cl[${idx}].#cui`;
+      if (anchor === undefined) {
+        clauses.push(`attribute_not_exists(${anchorPath})`);
+        writeOptions.pathSets.push({ path: ["icpResult", idx, "userIntent"], value: { ...op.patch } });
+      } else if (anchor !== null && typeof anchor === "object" && !Array.isArray(anchor)) {
+        values[":tM"] = "M";
+        clauses.push(`attribute_type(${anchorPath}, :tM)`);
         for (const f of fields) writeOptions.pathSets.push({ path: ["icpResult", idx, "userIntent", f], value: op.patch[f] });
       } else {
-        clauses.push(`attribute_not_exists(#cl[${idx}].#cui)`);
+        // Present but not a map (null, a list, a string): replace it with a fresh anchor.
+        clauses.push(`attribute_exists(${anchorPath})`);
         writeOptions.pathSets.push({ path: ["icpResult", idx, "userIntent"], value: { ...op.patch } });
       }
     }
