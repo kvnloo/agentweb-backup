@@ -1774,8 +1774,23 @@ export class LinkedInOutreachService {
     try {
       const { getAccountsByUserId } = await import('./connectedAccountsDb');
       const accounts = await getAccountsByUserId(userId);
-      const userAccount = (accounts as any[]).find((a) => a.platform === 'unipile');
-      if (userAccount?.account_id) return userAccount.account_id;
+      const ids = (accounts as any[])
+        .filter((a) => a.platform === 'unipile' && a.account_id)
+        .map((a) => a.account_id as string);
+      if (ids.length <= 1) return ids[0] ?? null;
+      // ENG-2468: a LinkedIn reconnect mints a NEW Unipile account_id and appends
+      // it, leaving the dead row first. Returning the first row blindly pinned
+      // message sync / invites to the dead session (401 "Disconnected account")
+      // even though the user had just reconnected. Prefer a live session, then an
+      // unverifiable one (Unipile 5xx), and only fall back to the first row when
+      // every account is proven dead so the real disconnect error still surfaces.
+      let firstUnknown: string | null = null;
+      for (const id of ids) {
+        const state = await this.probeAccountSession(id);
+        if (state === 'connected') return id;
+        if (state === 'unknown' && !firstUnknown) firstUnknown = id;
+      }
+      return firstUnknown ?? ids[0];
     } catch { /* ignore */ }
     return null;
   }
