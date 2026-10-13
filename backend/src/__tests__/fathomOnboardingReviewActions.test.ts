@@ -150,6 +150,25 @@ describe('applyFathomOnboardingReviewAction (ENG-270)', () => {
     expect(deps.orgMemoryDb.deleteMemory).not.toHaveBeenCalledWith('org-new', 'o1');
   });
 
+  it('refuses rollback (409) and keeps org memory ids when the org cannot be resolved', async () => {
+    const users: Record<string, any> = {
+      legacy: { userId: 'legacy', fathomOnboardingIngestions: [entry({ status: 'reviewed', targetUserId: 'legacy', orgMemoryIds: ['o1'] })] },
+    };
+    const deps = setup(users);
+    await expect(applyFathomOnboardingReviewAction({ userId: 'legacy', recordingId: 'rec-1', action: 'rollback', actorUserId: 'admin' }, deps))
+      .rejects.toMatchObject({ statusCode: 409 });
+    expect(users.legacy.fathomOnboardingIngestions[0]).toMatchObject({ status: 'reviewed', orgMemoryIds: ['o1'] });
+  });
+
+  it('retrying discard finishes flagging a draft left unflagged by a half-finished first try', async () => {
+    const users: Record<string, any> = {
+      'fathom-draft-rec-1': { userId: 'fathom-draft-rec-1', fathomDraftAccount: true, isActive: false, fathomDraftStatus: 'needs_review', fathomOnboardingIngestions: [entry({ status: 'discarded' })] },
+    };
+    const deps = setup(users);
+    await applyFathomOnboardingReviewAction({ userId: 'fathom-draft-rec-1', recordingId: 'rec-1', action: 'discard', actorUserId: 'admin' }, deps);
+    expect(users['fathom-draft-rec-1']).toMatchObject({ fathomDraftStatus: 'discarded', isActive: false });
+  });
+
   it('does not overwrite a concurrent action on a different recording of the same user', async () => {
     const users: Record<string, any> = {
       u: { userId: 'u', fathomOnboardingIngestions: [

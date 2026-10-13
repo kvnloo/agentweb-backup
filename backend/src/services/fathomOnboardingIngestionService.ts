@@ -605,6 +605,14 @@ export class FathomOnboardingReviewError extends Error {
  *
  * Both are idempotent: repeating the action on an already-transitioned item is a no-op.
  */
+async function flagDiscardedDraft(deps: ReviewActionDeps, item: FathomOnboardingIngestion): Promise<void> {
+  if (!item.draftUserId) return;
+  const draft = await deps.userDb.getUserById(item.draftUserId);
+  if ((draft as any)?.fathomDraftAccount !== true) return;
+  if ((draft as any).fathomDraftStatus === 'discarded' && (draft as any).isActive === false) return;
+  await deps.userDb.updateUser(item.draftUserId, { fathomDraftStatus: 'discarded', isActive: false } as any);
+}
+
 export async function applyFathomOnboardingReviewAction(
   input: { userId: string; recordingId: string; action: FathomOnboardingReviewAction; actorUserId: string },
   injectedDeps?: Partial<ReviewActionDeps>,
@@ -635,7 +643,12 @@ export async function applyFathomOnboardingReviewAction(
     let next: FathomOnboardingIngestion;
 
     if (input.action === 'discard') {
-      if (item.status === 'discarded') return item;
+      if (item.status === 'discarded') {
+        // A crash between the entry write and the draft flag leaves the draft
+        // unflagged; a retry must finish that step (Opslane run 353, P2).
+        await flagDiscardedDraft(deps, item);
+        return item;
+      }
       const hasApprovedMemories = (item.memoryIds || []).length > 0 || (item.orgMemoryIds || []).length > 0;
       if (item.status === 'reviewed' || hasApprovedMemories) {
         throw new FathomOnboardingReviewError(409, 'Reviewed ingestion must be rolled back before it can be discarded.');
@@ -657,10 +670,13 @@ export async function applyFathomOnboardingReviewAction(
           const target = targetUserId === input.userId ? user : await deps.userDb.getUserById(targetUserId);
           orgId = target?.orgId || null;
         }
-        if (orgId) {
-          for (const memoryId of item.orgMemoryIds) {
-            await deps.orgMemoryDb.deleteMemory(orgId, memoryId);
-          }
+        if (!orgId) {
+          // Never report success while org memories are still live: keep the ids on
+          // the entry so the rollback can be retried (Opslane run 353, P1).
+          throw new FathomOnboardingReviewError(409, 'Cannot resolve the org for this ingestion\'s org memories; rollback not applied.');
+        }
+        for (const memoryId of item.orgMemoryIds) {
+          await deps.orgMemoryDb.deleteMemory(orgId, memoryId);
         }
       }
       next = {
@@ -694,12 +710,7 @@ export async function applyFathomOnboardingReviewAction(
       continue; // Ledger changed under us: re-read and re-decide.
     }
 
-    if (input.action === 'discard' && item.draftUserId) {
-      const draft = await deps.userDb.getUserById(item.draftUserId);
-      if ((draft as any)?.fathomDraftAccount === true) {
-        await deps.userDb.updateUser(item.draftUserId, { fathomDraftStatus: 'discarded', isActive: false } as any);
-      }
-    }
+    if (input.action === 'discard') await flagDiscardedDraft(deps, item);
     return next;
   }
   throw new FathomOnboardingReviewError(409, 'Ingestion changed concurrently; retry the action.');
