@@ -10,7 +10,7 @@
  * close the window.
  *
  * Public, unauthenticated `GET /api/v1/models` (the same call the monitor makes). Cached per process;
- * a failed refresh keeps the last good list, and with no list at all the caller falls back to the
+ * an expired list is served immediately while one background refresh runs, a failed refresh keeps the last good list, and with no list at all the caller falls back to the
  * registered ids alone (the previous behaviour), never to a looser one.
  */
 const CATALOG_URL = 'https://openrouter.ai/api/v1/models';
@@ -45,8 +45,11 @@ export function createCatalogIdsSource(deps: CatalogIdsDeps = {}): CatalogIdsSou
   let inFlight: Promise<void> | null = null;
 
   const refresh = async (): Promise<void> => {
+    // AbortController + timer (not AbortSignal.timeout) so the deadline is testable with fake timers.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), CATALOG_IDS_TIMEOUT_MS);
     try {
-      const res = await (deps.fetch ?? fetch)(CATALOG_URL, { signal: AbortSignal.timeout(CATALOG_IDS_TIMEOUT_MS) });
+      const res = await (deps.fetch ?? fetch)(CATALOG_URL, { signal: controller.signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const parsed = parseIds(await res.json());
       // An empty list is a broken response, not a catalog with no models: keep what we had.
@@ -55,6 +58,8 @@ export function createCatalogIdsSource(deps: CatalogIdsDeps = {}): CatalogIdsSou
       nextRefreshAt = now() + CATALOG_IDS_TTL_MS;
     } catch {
       nextRefreshAt = now() + CATALOG_IDS_RETRY_MS;
+    } finally {
+      clearTimeout(timer);
     }
   };
 
@@ -65,7 +70,8 @@ export function createCatalogIdsSource(deps: CatalogIdsDeps = {}): CatalogIdsSou
         inFlight ??= refresh().finally(() => {
           inFlight = null;
         });
-        await inFlight;
+        // Stale-while-revalidate: with a last-good list, never make a Compare column wait on the refresh.
+        if (ids.length === 0) await inFlight;
       }
       return ids;
     },

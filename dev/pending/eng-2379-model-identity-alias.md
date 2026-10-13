@@ -12,3 +12,8 @@
 
 ### Tests
 - modelCompare.routes (real matcher, mocked catalog), openRouterCatalogIds, agentModeController.scheduledModelStamp (model-options).
+
+### Review follow-ups
+- Catalog/registry sibling ids are normalised before comparison (`:free`/`:nitro` suffix, trailing `/`, `openrouter/` prefix, case).
+- Catalog list is stale-while-revalidate: an expired list is served at once and refreshed once in the background; only a cold start waits (<= 3 s). Timeout uses AbortController so it is testable.
+- Tests pin: last-good list kept on empty/non-OK/failed refresh, abort at timeout, non-OK body ignored.
