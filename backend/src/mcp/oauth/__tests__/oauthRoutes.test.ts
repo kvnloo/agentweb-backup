@@ -149,6 +149,7 @@ describe('MCP OAuth Routes', () => {
       expect(res.body.resource).toBe('https://api.agentweb.pro/api/meta-toolkit/mcp');
       expect(res.body.authorization_servers).toEqual(['https://api.agentweb.pro']);
       expect(res.body.scopes_supported).toEqual(['mcp:tools']);
+      expect(res.body.resource_documentation).toBe('https://api.agentweb.pro/api/meta-toolkit/skill.md');
     });
 
     it.each([

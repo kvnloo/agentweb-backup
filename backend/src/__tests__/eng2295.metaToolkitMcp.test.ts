@@ -149,4 +149,13 @@ describe('ENG-2295 Meta Toolkit MCP endpoint', () => {
     expect(mockHandle).not.toHaveBeenCalled();
     await request(app).get('/api/meta-toolkit/mcp').expect(405);
   });
+
+  it('ENG-2303 P5: serves the agent skill guide publicly as markdown', async () => {
+    const res = await request(app).get('/api/meta-toolkit/skill.md').expect(200);
+    expect(res.headers['content-type']).toMatch(/text\/markdown/);
+    expect(res.text).toContain('zoma_status');
+    expect(res.text).toContain('preview_token');
+    expect(res.text).toContain('always created PAUSED');
+    expect(mockAuthenticate).not.toHaveBeenCalled();
+  });
 });
