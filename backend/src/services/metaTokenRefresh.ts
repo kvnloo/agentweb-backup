@@ -160,6 +160,26 @@ export async function ensureFreshMetaAdAccountToken(
  * @param userId  - Owner user id, required to persist the refreshed token.
  * @param now     - Injectable clock for testing.
  */
+/**
+ * ENG-2441: axios' `error.message` is only "Request failed with status code 400";
+ * Meta's real reason lives in `response.data.error`. Surface it (message + code/
+ * subcode) so handoffs are diagnosable and `isMetaTokenDeadError` can see code 190.
+ * Pure; falls back to the plain message when there is no Graph error body.
+ */
+export function describeMetaRefreshError(error: any): string {
+  const base = error?.message || String(error);
+  const graph = error?.response?.data?.error;
+  if (!graph || typeof graph !== 'object') return base;
+  const parts: string[] = [];
+  if (graph.message) parts.push(String(graph.message));
+  const tags: string[] = [];
+  if (graph.type) tags.push(String(graph.type));
+  if (graph.code !== undefined) tags.push(`code ${graph.code}`);
+  if (graph.error_subcode !== undefined) tags.push(`subcode ${graph.error_subcode}`);
+  if (tags.length) parts.push(`(${tags.join(', ')})`);
+  return parts.length ? `${parts.join(' ')} [${base}]` : base;
+}
+
 async function performRefresh(
   account: ConnectedAccount,
   userId: string,
@@ -192,7 +212,7 @@ async function performRefresh(
     );
     return { attempted: true, refreshed: true, newExpiresAt, newAccessToken: access_token };
   } catch (error: any) {
-    const message = error?.message || String(error);
+    const message = describeMetaRefreshError(error);
     console.warn(
       `[MetaTokenRefresh] Failed to refresh token for user ${userId} account ${account.account_id}: ${message}`
     );
