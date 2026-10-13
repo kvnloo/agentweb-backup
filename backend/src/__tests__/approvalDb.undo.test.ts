@@ -4,6 +4,7 @@
  */
 const mockPut = jest.fn();
 const mockDelete = jest.fn();
+const mockQuery = jest.fn();
 jest.mock('aws-sdk', () => ({
   __esModule: true,
   default: {
@@ -11,6 +12,7 @@ jest.mock('aws-sdk', () => ({
       DocumentClient: jest.fn().mockImplementation(() => ({
         put: (p: any) => ({ promise: () => mockPut(p) }),
         delete: (p: any) => ({ promise: () => mockDelete(p) }),
+        query: (p: any) => ({ promise: () => mockQuery(p) }),
       })),
     },
   },
@@ -68,5 +70,33 @@ describe('deleteApprovalIfUnanswered', () => {
   it('surfaces a real storage error', async () => {
     mockDelete.mockRejectedValue(new Error('throttled'));
     await expect(approvalDb.deleteApprovalIfUnanswered(ASSET, 'T-OURS')).rejects.toThrow('Failed to delete approval');
+  });
+});
+
+describe('getPendingApprovalsByUserId', () => {
+  it('follows the index to the end instead of stopping at the first page', async () => {
+    mockQuery
+      .mockResolvedValueOnce({ Items: [{ assetUrl: 'a' }], LastEvaluatedKey: { k: 1 } })
+      .mockResolvedValueOnce({ Items: [{ assetUrl: 'b' }], LastEvaluatedKey: { k: 2 } })
+      .mockResolvedValueOnce({ Items: [{ assetUrl: 'c' }] });
+    const items = await approvalDb.getPendingApprovalsByUserId('u1');
+    expect(items.map((i: any) => i.assetUrl)).toEqual(['a', 'b', 'c']);
+    expect(mockQuery).toHaveBeenCalledTimes(3);
+    expect(mockQuery.mock.calls[1][0].ExclusiveStartKey).toEqual({ k: 1 });
+    expect(mockQuery.mock.calls[2][0].ExclusiveStartKey).toEqual({ k: 2 });
+  });
+
+  it('asks the index only for this user\'s pending rows (filter applied before paging)', async () => {
+    mockQuery.mockResolvedValue({ Items: [] });
+    await approvalDb.getPendingApprovalsByUserId('u1');
+    const p = mockQuery.mock.calls[0][0];
+    expect(p.IndexName).toBe('UserApprovalsIndex');
+    expect(p.FilterExpression).toBe('#status = :pending');
+    expect(p.ExpressionAttributeValues).toEqual({ ':userId': 'u1', ':pending': 'pending' });
+  });
+
+  it('surfaces a storage error so the STOP can be redelivered', async () => {
+    mockQuery.mockRejectedValue(new Error('throttled'));
+    await expect(approvalDb.getPendingApprovalsByUserId('u1')).rejects.toThrow('Failed to get pending approvals');
   });
 });
