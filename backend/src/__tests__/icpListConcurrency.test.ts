@@ -40,7 +40,7 @@ jest.mock("../services/brandGuidelinesPopulation", () => ({
 import express from "express";
 import request from "supertest";
 import onboardingStepsRoutes from "../routes/onboardingSteps";
-import { casUpdateIcpList, regenerateSingleIcpForUser } from "../services/onboardingIcpService";
+import { casUpdateIcpList, casUpdateIcpListUnqueued, regenerateSingleIcpForUser } from "../services/onboardingIcpService";
 import type { FakeTable } from "./helpers/fakeDocClient";
 
 const app = express();
@@ -159,6 +159,84 @@ describe("concurrent edit-one", () => {
     expect(res.status).toBe(200);
     expect(ids()).toEqual(["icp_0", "icp_2", "icp_3", "icp_4"]);
     expect(table().row.icpResult[1].name).toBe("AFTER DELETE");
+  });
+});
+
+describe("many writers at once on one instance", () => {
+  it("applies all 20 simultaneous edits (5 cards x 4 fields) without lost updates or the unconditional fallback", async () => {
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    // A real write takes milliseconds; without that every writer wins its turn.
+    let inFlight = 0;
+    let maxInFlight = 0;
+    table().beforeUpdate = async (params) => {
+      if (!Object.values(params.ExpressionAttributeNames ?? {}).includes("icpResult")) return;
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 8));
+      inFlight -= 1;
+    };
+    const fields = ["name", "pain", "desire", "objection"] as const;
+    const jobs = [0, 1, 2, 3, 4].flatMap((i) => fields.map((f) => ({ id: `icp_${i}`, f, v: `${f}-${i}-new` })));
+    const results = await Promise.all(jobs.map((j) => post("edit-one", { icpId: j.id, patch: { [j.f]: j.v } })));
+
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    for (const j of jobs) {
+      const card = table().row.icpResult.find((p: any) => p.id === j.id);
+      expect(card[j.f]).toBe(j.v);
+    }
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("without the compare-and-swap"))).toBe(false);
+    // They were queued, not raced: never more than one list write in flight.
+    expect(maxInFlight).toBe(1);
+  });
+
+  it("removes exactly the cards asked for when four deletes arrive together", async () => {
+    const results = await Promise.all([0, 1, 2, 3].map((i) => post("delete-one", { icpId: `icp_${i}` })));
+
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(ids()).toEqual(["icp_4"]);
+  });
+
+  it("does not let a failed write wedge the writes queued behind it", async () => {
+    let fail = true;
+    table().beforeUpdate = async (params) => {
+      if (fail && Object.values(params.ExpressionAttributeNames ?? {}).includes("icpResult")) {
+        fail = false;
+        // Slow enough that the second request is already queued behind this one.
+        await new Promise((r) => setTimeout(r, 60));
+        throw Object.assign(new Error("dynamo unavailable"), { code: "InternalServerError" });
+      }
+    };
+    const [first, second] = await Promise.all([
+      post("delete-one", { icpId: "icp_0" }),
+      post("delete-one", { icpId: "icp_1" }),
+    ]);
+
+    expect(first.status).toBe(500);
+    expect(second.status).toBe(200);
+    expect(ids()).toEqual(["icp_0", "icp_2", "icp_3", "icp_4"]);
+  });
+});
+
+describe("two instances (compare-and-swap, no shared queue)", () => {
+  it("both land when two deletes read the same list", async () => {
+    holdUntilBothRead();
+    const del = (id: string) => casUpdateIcpListUnqueued("u1", (list) => ({ next: list.filter((p) => p.id !== id), result: null }));
+    await Promise.all([del("icp_1"), del("icp_3")]);
+
+    expect(ids()).toEqual(["icp_0", "icp_2", "icp_4"]);
+    // The loser really lost the condition once and recomputed.
+    expect(table().updates.length).toBeGreaterThan(2);
+  });
+
+  it("an edit and a delete of different cards both land", async () => {
+    holdUntilBothRead();
+    await Promise.all([
+      casUpdateIcpListUnqueued("u1", (list) => ({ next: list.map((p) => (p.id === "icp_0" ? { ...p, name: "KEPT" } : p)), result: null })),
+      casUpdateIcpListUnqueued("u1", (list) => ({ next: list.filter((p) => p.id !== "icp_3"), result: null })),
+    ]);
+
+    expect(ids()).toEqual(["icp_0", "icp_1", "icp_2", "icp_4"]);
+    expect(table().row.icpResult[0].name).toBe("KEPT");
   });
 });
 
