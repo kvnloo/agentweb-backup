@@ -85,7 +85,8 @@ export function setupMcpOAuth(app: express.Express) {
       authorization_servers: [baseUrl],
       bearer_methods_supported: ['header'],
       scopes_supported: ['mcp:tools'],
-      resource_documentation: `${baseUrl}/skill.md`,
+      resource_documentation:
+        resourcePath === META_TOOLKIT_MCP_RESOURCE_PATH ? `${baseUrl}/api/meta-toolkit/skill.md` : `${baseUrl}/skill.md`,
     });
   };
 
