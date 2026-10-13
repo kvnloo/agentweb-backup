@@ -160,6 +160,27 @@ describe('applyFathomOnboardingReviewAction (ENG-270)', () => {
     expect(users.legacy.fathomOnboardingIngestions[0]).toMatchObject({ status: 'reviewed', orgMemoryIds: ['o1'] });
   });
 
+  it('a refused rollback deletes nothing, not even account memories (Opslane 355)', async () => {
+    const users: Record<string, any> = {
+      legacy: { userId: 'legacy', fathomOnboardingIngestions: [entry({ status: 'reviewed', targetUserId: 'legacy', memoryIds: ['m1'], orgMemoryIds: ['o1'] })] },
+    };
+    const deps = setup(users);
+    await expect(applyFathomOnboardingReviewAction({ userId: 'legacy', recordingId: 'rec-1', action: 'rollback', actorUserId: 'admin' }, deps))
+      .rejects.toMatchObject({ statusCode: 409 });
+    expect(deps.accountMemoryDb.deleteMemory).not.toHaveBeenCalled();
+    expect(deps.orgMemoryDb.deleteMemory).not.toHaveBeenCalled();
+  });
+
+  it('discard never disables a draft an admin has since approved/activated (Opslane 355)', async () => {
+    const users: Record<string, any> = {
+      'fathom-draft-rec-1': { userId: 'fathom-draft-rec-1', fathomDraftAccount: true, isActive: true, fathomDraftStatus: 'approved', fathomOnboardingIngestions: [entry()] },
+    };
+    const deps = setup(users);
+    const out = await applyFathomOnboardingReviewAction({ userId: 'fathom-draft-rec-1', recordingId: 'rec-1', action: 'discard', actorUserId: 'admin' }, deps);
+    expect(out.status).toBe('discarded');
+    expect(users['fathom-draft-rec-1']).toMatchObject({ fathomDraftStatus: 'approved', isActive: true });
+  });
+
   it('retrying discard finishes flagging a draft left unflagged by a half-finished first try', async () => {
     const users: Record<string, any> = {
       'fathom-draft-rec-1': { userId: 'fathom-draft-rec-1', fathomDraftAccount: true, isActive: false, fathomDraftStatus: 'needs_review', fathomOnboardingIngestions: [entry({ status: 'discarded' })] },

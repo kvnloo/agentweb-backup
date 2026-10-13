@@ -610,6 +610,8 @@ async function flagDiscardedDraft(deps: ReviewActionDeps, item: FathomOnboarding
   const draft = await deps.userDb.getUserById(item.draftUserId);
   if ((draft as any)?.fathomDraftAccount !== true) return;
   if ((draft as any).fathomDraftStatus === 'discarded' && (draft as any).isActive === false) return;
+  // Never disable an account an admin has since approved/activated (Opslane run 355, P1).
+  if ((draft as any).fathomDraftStatus === 'approved' || (draft as any).isActive === true) return;
   await deps.userDb.updateUser(item.draftUserId, { fathomDraftStatus: 'discarded', isActive: false } as any);
 }
 
@@ -660,12 +662,11 @@ export async function applyFathomOnboardingReviewAction(
       const hasApprovedMemories = (item.memoryIds || []).length > 0 || (item.orgMemoryIds || []).length > 0;
       if (item.status !== 'reviewed' && !hasApprovedMemories) return item;
       const targetUserId = item.targetUserId || input.userId;
-      // Deletes are idempotent, so a retry after a lost write race is safe.
-      for (const memoryId of item.memoryIds || []) {
-        await deps.accountMemoryDb.deleteMemory(targetUserId, memoryId);
-      }
+      // Resolve the org BEFORE deleting anything so a refused rollback changes
+      // nothing (Opslane run 355, P1).
+      let orgId: string | null = null;
       if ((item.orgMemoryIds || []).length > 0) {
-        let orgId = item.orgMemoryOrgId || null;
+        orgId = item.orgMemoryOrgId || null;
         if (!orgId) {
           const target = targetUserId === input.userId ? user : await deps.userDb.getUserById(targetUserId);
           orgId = target?.orgId || null;
@@ -675,7 +676,13 @@ export async function applyFathomOnboardingReviewAction(
           // the entry so the rollback can be retried (Opslane run 353, P1).
           throw new FathomOnboardingReviewError(409, 'Cannot resolve the org for this ingestion\'s org memories; rollback not applied.');
         }
-        for (const memoryId of item.orgMemoryIds) {
+      }
+      // Deletes are idempotent, so a retry after a lost write race is safe.
+      for (const memoryId of item.memoryIds || []) {
+        await deps.accountMemoryDb.deleteMemory(targetUserId, memoryId);
+      }
+      if (orgId) {
+        for (const memoryId of item.orgMemoryIds || []) {
           await deps.orgMemoryDb.deleteMemory(orgId, memoryId);
         }
       }
