@@ -502,6 +502,54 @@ async function readUserForRegeneration(userId: string): Promise<any> {
   }
 }
 
+/**
+ * What an edit of the persona list decided, given the list as it stands NOW.
+ * `status` aborts the write (the caller maps it to a 4xx); otherwise `next` is
+ * the list to store and `result` is handed back to the caller untouched.
+ */
+export type IcpListEdit<T> =
+  | { next: ICPPersona[]; result: T }
+  | { status: 400 | 404 };
+
+export const ICP_LIST_CONTENDED = "ICP_LIST_CONTENDED";
+const MAX_LIST_WRITE_ATTEMPTS = 6;
+
+/**
+ * Edit the persona list as a compare-and-swap. The route used to read the list,
+ * change it and write the WHOLE list back, so two writers that read the same
+ * list each wrote one without the other's change: a delete (or an edit) clicked
+ * while another was in flight was silently lost. Here every write is conditioned
+ * on the list still being exactly what the edit was computed from; if it moved,
+ * the edit is recomputed from a fresh read, so both changes land. Reads are
+ * base-table reads: the UserIdIndex can still show the list from before the
+ * previous write, which would make every retry compute from the same stale list.
+ */
+export async function casUpdateIcpList<T>(
+  userId: string,
+  edit: (list: ICPPersona[]) => IcpListEdit<T>,
+): Promise<{ ok: true; next: ICPPersona[]; result: T } | { ok: false; status: 400 | 404 }> {
+  for (let attempt = 0; attempt < MAX_LIST_WRITE_ATTEMPTS; attempt++) {
+    const user: any = await readUserForRegeneration(userId);
+    const list: ICPPersona[] = Array.isArray(user?.icpResult) ? user.icpResult : [];
+    const decided = edit(list);
+    if ("status" in decided) return { ok: false, status: decided.status };
+    try {
+      await userDb.updateUser(userId, { icpResult: decided.next as any }, {
+        condition: {
+          expression: "#icpResult = :icpListExpected",
+          names: { "#icpResult": "icpResult" },
+          values: { ":icpListExpected": list },
+        },
+      });
+      return { ok: true, next: decided.next, result: decided.result };
+    } catch (err: any) {
+      if (err?.code !== "ConditionalCheckFailedException") throw err;
+      await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1) + Math.random() * 30));
+    }
+  }
+  throw Object.assign(new Error("the ICP list kept changing"), { code: ICP_LIST_CONTENDED });
+}
+
 /** True when the user has hand-written at least one field of this persona. */
 function hasAnchor(persona: ICPPersona | undefined): boolean {
   return Boolean(
@@ -746,10 +794,11 @@ export async function regenerateSingleIcpForUser(
 
     const target = personas[index];
     const others = personas.filter((_, i) => i !== index);
-    const fresh = applyAnchor(
-      await generateSingleIcpForUser(brand, target, others, deps, userId),
-      target,
-    );
+    const generated = await generateSingleIcpForUser(brand, target, others, deps, userId);
+    // Re-anchored on every write attempt below from the card as it stands then:
+    // the LLM call took seconds and the user may have edited this very card
+    // meanwhile, which their words must survive.
+    let fresh = applyAnchor(generated, target);
 
     // The LLM call took seconds, and the user may have edited, deleted or
     // regenerated ANOTHER card meanwhile. Writing back a whole list built from a
@@ -797,17 +846,19 @@ export async function regenerateSingleIcpForUser(
         return;
       }
 
+      // The slot must still hold EXACTLY the card this attempt read, not merely a
+      // card with the same id: an edit made while the model was thinking changes
+      // the card but not its id, and an id-only check let this write replace the
+      // user's words with the model's. When the card moved, the retry re-anchors
+      // from the card as it stands, so the user's fields win and the rest still
+      // regenerate. The equality also fails past the end of the list, where
+      // DynamoDB would otherwise append.
+      const cardNow = currentList[spliceAt];
+      fresh = applyAnchor(generated, cardNow);
       const [card] = sanitizeICPPersonas([fresh]);
-      // The slot must still hold the card we are replacing. A record without
-      // stable ids can only assert that the slot exists (DynamoDB would append
-      // past the end of the list otherwise).
-      const slot: Record<string, string> = target.id
-        ? { "#icpResult": "icpResult", "#icpCardId": "id" }
-        : { "#icpResult": "icpResult" };
-      const slotIsOurs = target.id
-        ? "#icpResult[" + spliceAt + "].#icpCardId = :icpCardId"
-        : "attribute_exists(#icpResult[" + spliceAt + "])";
-      const slotValues: Record<string, unknown> = target.id ? { ":icpCardId": target.id } : {};
+      const slot: Record<string, string> = { "#icpResult": "icpResult" };
+      const slotIsOurs = "#icpResult[" + spliceAt + "] = :icpCardNow";
+      const slotValues: Record<string, unknown> = { ":icpCardNow": cardNow };
 
       const joinedRun = Boolean(deps.statusOwnedElsewhere) && current.icpStatus === "running";
       // Joined another claim: save the card only. A full run replaces every non-anchored

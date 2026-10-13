@@ -698,54 +698,11 @@ export async function openRejectModal(
 export async function sendApprovalRequestWithTracking(
   request: ApprovalRequest & { channelName?: string }
 ): Promise<{ messageTs: string | null; approvalId: string }> {
-  // Send to Slack
-  const result = await sendApprovalRequest(request);
-
-  // Store in database for tracking
-  const { approvalDb } = await import('./approvalDb');
-  const approval = await approvalDb.createApproval({
-    assetUrl: request.imageUrl,
-    filename: request.filename,
-    assetType: request.assetType as any, // Cast to any to handle string to AssetType
-    executionId: request.executionId || '',
-    userId: request.userId,
-    slackChannel: request.channel,
-    slackChannelName: request.channelName || request.channel,
-    slackMessageTs: result.messageTs,
-    note: request.note,
-  });
-
-  console.log("✅ Approval request sent to Slack and stored in database");
-
-  // ENG-273: WhatsApp is a peer notification channel, not a second place to approve
-  // from. Deliberately placed here rather than at the four call sites: this is the one
-  // choke point every approval already passes through, so a new caller cannot forget it.
-  //
-  // The IMPORT is inside the guard, not just the call. notifyApprovalOnWhatsApp handles
-  // its own errors, but a module-load failure rejects before any of that code runs — and
-  // by this point Slack has already sent and the approval record already exists, so
-  // throwing here would fail an approval that actually succeeded and invite a duplicate
-  // on retry.
-  try {
-    const { notifyApprovalOnWhatsApp } = await import('./approvalChannelNotifier');
-    await notifyApprovalOnWhatsApp({
-      userId: request.userId,
-      approvalChannel: request.channel,
-      assetType: request.assetType,
-      filename: request.filename,
-      assetUrl: request.imageUrl,
-    });
-  } catch (notifyError: any) {
-    console.warn(
-      '[slackService] WhatsApp approval notification could not be dispatched:',
-      notifyError?.message || notifyError,
-    );
-  }
-
-  return {
-    messageTs: result.messageTs,
-    approvalId: approval.assetUrl // Use assetUrl as the ID since that's the primary key
-  };
+  // ENG-273: the orchestration lives in approvalRequestService, which is channel-neutral.
+  // This name is kept so the existing Slack-side callers do not have to change.
+  const { requestApproval } = await import('./approvalRequestService');
+  const { messageTs, approvalId } = await requestApproval(request);
+  return { messageTs, approvalId };
 }
 
 /**
@@ -1626,6 +1583,11 @@ export function getUserAllowedChannels(user: { slackChannels?: string[]; slackCh
 export async function getEffectiveAllowedChannels(
   user: { slackChannels?: string[]; slackChannel?: string; orgId?: string } | null | undefined,
 ): Promise<string[]> {
+  // One platform per customer (ENG-273): an account on WhatsApp has no Slack channels, so
+  // none of Emma's Slack tools may reach one on its behalf — own or inherited.
+  const { hasVerifiedWhatsApp } = await import('./messagingChannelService');
+  if (hasVerifiedWhatsApp(user as any)) return [];
+
   const { userDb, orgDb } = await import('./db');
   const personal = getUserAllowedChannels(user ?? {});
   if (personal.length > 0) return personal;

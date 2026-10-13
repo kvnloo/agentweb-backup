@@ -92,60 +92,42 @@ describe('WhatsApp-configured reporter', () => {
   });
 });
 
-describe('Slack and WhatsApp as peers', () => {
-  it('sends to both when both are configured', async () => {
-    userDb.getUserByEmail.mockResolvedValue({
-      userId: 'u1',
-      slackChannels: ['C1'],
-      messagingChannels: [WA],
-    });
+// ENG-273: a customer is on ONE messaging platform. This block used to be titled "Slack and
+// WhatsApp as peers" and asserted that an account configured for both is notified on both,
+// with per-channel partial-failure handling. That is the double delivery the product rule
+// now forbids: an account with a verified WhatsApp number is delivered to on WhatsApp only,
+// so at most one channel ever fires. Four of those tests (both-configured delivery,
+// one-fails-other-lands, release-only-the-failed-claim, replay-only-the-failed-channel)
+// had a premise that no longer exists and are replaced below; the per-channel claim KEYS
+// still matter — they are what stops a deploy re-notifying items already sent on Slack —
+// and keep their coverage.
+describe('one platform per customer', () => {
+  const both = () => ({ userId: 'u1', slackChannels: ['C1'], messagingChannels: [WA] });
+
+  it('notifies an account that has both on WhatsApp only', async () => {
+    userDb.getUserByEmail.mockResolvedValue(both());
     await expect(notifyReporterShipped(base)).resolves.toBe('sent');
-    expect(postSlackMessage).toHaveBeenCalledTimes(1);
     expect(whatsapp.sendMessage).toHaveBeenCalledTimes(1);
+    expect(postSlackMessage).not.toHaveBeenCalled();
   });
 
-  it('still reports sent when one channel fails and the other lands', async () => {
-    userDb.getUserByEmail.mockResolvedValue({
-      userId: 'u1',
-      slackChannels: ['C1'],
-      messagingChannels: [WA],
-    });
-    whatsapp.sendMessage.mockRejectedValue(new Error('131047 window closed'));
-    await expect(notifyReporterShipped(base)).resolves.toBe('sent');
-  });
-
-  it('releases ONLY the failed channel claim, so a retry re-sends just that one', async () => {
-    // Greptile P1. Claims are per channel, so the failed channel can be retried
-    // without re-delivering the Slack message that already landed.
-    userDb.getUserByEmail.mockResolvedValue({
-      userId: 'u1',
-      slackChannels: ['C1'],
-      messagingChannels: [WA],
-    });
-    whatsapp.sendMessage.mockRejectedValue(new Error('boom'));
+  it('takes a single claim for that account, under the WhatsApp key', async () => {
+    userDb.getUserByEmail.mockResolvedValue(both());
     await notifyReporterShipped(base);
+    const keys = settingsService.claimSetMember.mock.calls.map((c: any[]) => c[0]);
+    expect(keys).toEqual(['ship-notify:post-1:whatsapp']);
+  });
+
+  it('releases the WhatsApp claim, and reports failed, when the send fails', async () => {
+    // So a retry re-sends rather than finding the item "already sent".
+    userDb.getUserByEmail.mockResolvedValue({ userId: 'u1', messagingChannels: [WA] });
+    whatsapp.sendMessage.mockRejectedValue(new Error('131047 window closed'));
+    await expect(notifyReporterShipped(base)).resolves.toBe('failed');
     expect(settingsService.releaseSetMember).toHaveBeenCalledTimes(1);
     expect(settingsService.releaseSetMember).toHaveBeenCalledWith(
       'ship-notify:post-1:whatsapp',
       'u@e.com',
     );
-  });
-
-  it('re-sends only the previously-failed channel on a replay', async () => {
-    // The behavior the per-channel claim exists for: Slack already landed (its claim
-    // is held), WhatsApp did not (its claim is free). A retry must reach WhatsApp
-    // and must NOT re-ping Slack.
-    userDb.getUserByEmail.mockResolvedValue({
-      userId: 'u1',
-      slackChannels: ['C1'],
-      messagingChannels: [WA],
-    });
-    settingsService.claimSetMember.mockImplementation(async (key: string) =>
-      key !== 'ship-notify:post-1',
-    );
-    await expect(notifyReporterShipped(base)).resolves.toBe('sent');
-    expect(whatsapp.sendMessage).toHaveBeenCalledTimes(1);
-    expect(postSlackMessage).not.toHaveBeenCalled();
   });
 
   it('keeps Slack on the legacy un-suffixed key so deploying cannot re-notify', async () => {
@@ -157,35 +139,8 @@ describe('Slack and WhatsApp as peers', () => {
     expect(settingsService.claimSetMember).toHaveBeenCalledWith('ship-notify:post-1', 'u@e.com');
   });
 
-  it('releases the claim only when every channel failed', async () => {
-    userDb.getUserByEmail.mockResolvedValue({
-      userId: 'u1',
-      slackChannels: ['C1'],
-      messagingChannels: [WA],
-    });
-    postSlackMessage.mockRejectedValue(new Error('slack down'));
-    whatsapp.sendMessage.mockRejectedValue(new Error('wa down'));
-    await expect(notifyReporterShipped(base)).resolves.toBe('failed');
-    expect(settingsService.releaseSetMember).toHaveBeenCalledWith('ship-notify:post-1', 'u@e.com');
-  });
-
-  it('takes one claim per channel, under distinct keys', async () => {
-    userDb.getUserByEmail.mockResolvedValue({
-      userId: 'u1',
-      slackChannels: ['C1'],
-      messagingChannels: [WA],
-    });
-    await notifyReporterShipped(base);
-    const keys = settingsService.claimSetMember.mock.calls.map((c: any[]) => c[0]);
-    expect(keys).toEqual(['ship-notify:post-1', 'ship-notify:post-1:whatsapp']);
-  });
-
-  it('reports already_sent when every channel was claimed by a prior delivery', async () => {
-    userDb.getUserByEmail.mockResolvedValue({
-      userId: 'u1',
-      slackChannels: ['C1'],
-      messagingChannels: [WA],
-    });
+  it('reports already_sent when the claim was taken by a prior delivery', async () => {
+    userDb.getUserByEmail.mockResolvedValue({ userId: 'u1', messagingChannels: [WA] });
     settingsService.claimSetMember.mockResolvedValue(false);
     await expect(notifyReporterShipped(base)).resolves.toBe('already_sent');
     expect(postSlackMessage).not.toHaveBeenCalled();

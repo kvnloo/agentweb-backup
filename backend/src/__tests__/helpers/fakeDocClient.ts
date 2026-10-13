@@ -11,7 +11,7 @@
  *
  * Supported grammar (all this codebase's onboarding writes need):
  *   Update:    SET a = :v, #a.#b[2] = :v   REMOVE #x, #y
- *   Condition: OR of AND-groups; each clause is `PATH = :v`, `PATH <> :v`,
+ *   Condition: OR of AND-groups, parenthesised groups allowed; each clause is `PATH = :v`, `PATH <> :v`,
  *              `PATH <= :v`, `attribute_exists(PATH)` or `attribute_not_exists(PATH)`
  *
  * Eventual consistency: set `table.indexRow` to make `query` (the UserIdIndex
@@ -103,9 +103,47 @@ function evalClause(clause: string, row: any, names: Record<string, string>, val
   return got.exists && typeof got.value === typeof want && got.value <= want;
 }
 
+/** Split on a top-level `AND` / `OR`, leaving anything inside parentheses (a group or a function call) intact. */
+function splitTopLevel(expr: string, keyword: "AND" | "OR"): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let last = 0;
+  const re = new RegExp(`^\\s+${keyword}\\s+`);
+  for (let i = 0; i < expr.length; i++) {
+    const ch = expr[i];
+    if (ch === "(") depth++;
+    else if (ch === ")") depth--;
+    else if (depth === 0) {
+      const hit = expr.slice(i).match(re);
+      if (hit) {
+        parts.push(expr.slice(last, i));
+        i += hit[0].length - 1;
+        last = i + 1;
+      }
+    }
+  }
+  parts.push(expr.slice(last));
+  return parts;
+}
+
+function isWrappedInParens(clause: string): boolean {
+  if (!clause.startsWith("(") || !clause.endsWith(")")) return false;
+  let depth = 0;
+  for (let i = 0; i < clause.length; i++) {
+    if (clause[i] === "(") depth++;
+    else if (clause[i] === ")" && --depth === 0 && i < clause.length - 1) return false;
+  }
+  return true;
+}
+
 function evalCondition(expr: string, row: any, names: Record<string, string>, values: Record<string, any>): boolean {
   // OR binds looser than AND, as in DynamoDB.
-  return expr.split(/\s+OR\s+/).some((group) => group.split(/\s+AND\s+/).every((c) => evalClause(c.trim(), row, names, values)));
+  return splitTopLevel(expr, "OR").some((group) =>
+    splitTopLevel(group, "AND").every((c) => {
+      const clause = c.trim();
+      return isWrappedInParens(clause) ? evalCondition(clause.slice(1, -1), row, names, values) : evalClause(clause, row, names, values);
+    }),
+  );
 }
 
 export function createFakeDocClient(table: FakeTable) {

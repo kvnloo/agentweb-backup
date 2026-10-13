@@ -66,6 +66,22 @@ beforeEach(() => {
   whatsapp.sendMessage.mockResolvedValue({ messageId: 'wamid.1' });
 });
 
+describe('one platform per customer', () => {
+  it('does not also post to Slack for an account that is on WhatsApp', async () => {
+    // This path reads the deprecated slackChannel field directly, so it bypasses the
+    // resolver that enforces the rule everywhere else.
+    await notify({ userId: 'u1', email: 'u@e.com', slackChannel: 'C0LEGACY', messagingChannels: [WA] });
+    expect(sendLeadNotification).not.toHaveBeenCalled();
+    expect(whatsapp.sendMessage).toHaveBeenCalled();
+  });
+
+  it('still posts to Slack for an account that is only on Slack', async () => {
+    await notify({ userId: 'u1', email: 'u@e.com', slackChannel: 'C0LEGACY' });
+    expect(sendLeadNotification).toHaveBeenCalled();
+    expect(whatsapp.sendMessage).not.toHaveBeenCalled();
+  });
+});
+
 // ENG-2082: lead capture accepts phone-only submissions, so the owner alert is now the
 // most-seen artifact of a lead with no address — one email per captured lead.
 describe('owner alert for a lead with no email address', () => {
@@ -155,10 +171,15 @@ describe('WhatsApp lead alerts', () => {
     expect(whatsapp.sendMessage).not.toHaveBeenCalled();
   });
 
-  it('sends to Slack and WhatsApp independently when both are configured', async () => {
+  // Replaced the earlier "sends to Slack and WhatsApp independently when both are
+  // configured" (ENG-273). A customer is on ONE messaging platform and the two features
+  // do not run side by side for one account; that test asserted the double delivery the
+  // product rule now forbids. An account that has both — from before the rule — is on
+  // WhatsApp, and Slack is not also posted to.
+  it('delivers an account that has both on WhatsApp only', async () => {
     await notify({ userId: 'u1', email: 'u@e.com', slackChannel: 'C1', messagingChannels: [WA] });
-    expect(sendLeadNotification).toHaveBeenCalledTimes(1);
     expect(whatsapp.sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendLeadNotification).not.toHaveBeenCalled();
   });
 
   it('carries the LEAD_ALERT template with its full declared variable count', async () => {

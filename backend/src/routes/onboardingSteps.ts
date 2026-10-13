@@ -41,6 +41,8 @@ import {
   sanitizeICPPersonas,
 } from "../services/icpStatusService";
 import {
+  casUpdateIcpList,
+  ICP_LIST_CONTENDED,
   regenerateSingleIcpForUser,
   startIcpDiscoveryForUser,
 } from "../services/onboardingIcpService";
@@ -801,35 +803,39 @@ router.post("/icp/edit-one", authenticateToken, async (req, res) => {
         .status(400)
         .json({ message: "patch must include at least one of " + ICP_PERSONA_FIELDS.join(", ") });
     }
-    const user = await userDb.getUserById(userId);
-    const list: Array<Record<string, string>> = user?.icpResult ?? [];
-    if (list.length === 0) {
-      return res.status(404).json({ message: "icp not found" });
-    }
-    const resolved = resolveIcpIndex(list, req.body?.icpId);
-    if ("status" in resolved) {
-      return res.status(resolved.status).json(ICP_ID_ERROR[resolved.status]);
-    }
-    const idx = resolved.index;
-    // Record the user's own words as an anchor alongside the visible field.
-    // Every later regeneration of this persona is driven from the anchor, so
-    // it can neither be overwritten by a full-set run nor drift across
-    // repeated regenerations (ENG-255). Merged, not replaced: a second edit to
-    // a different field must not discard the first.
-    const nextList = list.map((p, i) =>
-      i === idx
-        ? {
-            ...p,
-            ...patchFields,
-            userIntent: { ...((p as any).userIntent ?? {}), ...patchFields },
-          }
-        : p
-    );
-    await userDb.updateUser(userId, {
-      icpResult: nextList as Required<NonNullable<typeof user>>["icpResult"],
+    // Compare-and-swap (see casUpdateIcpList): the change is recomputed from a
+    // fresh list whenever another edit, delete or regeneration lands first, so
+    // none of them is lost to a whole-list write built from an older read.
+    const outcome = await casUpdateIcpList(userId, (list) => {
+      if (list.length === 0) return { status: 404 };
+      const resolved = resolveIcpIndex(list as unknown as Array<Record<string, unknown>>, req.body?.icpId);
+      if ("status" in resolved) return { status: resolved.status };
+      const idx = resolved.index;
+      // Record the user's own words as an anchor alongside the visible field.
+      // Every later regeneration of this persona is driven from the anchor, so
+      // it can neither be overwritten by a full-set run nor drift across
+      // repeated regenerations (ENG-255). Merged, not replaced: a second edit to
+      // a different field must not discard the first.
+      const next = list.map((p, i) =>
+        i === idx
+          ? {
+              ...p,
+              ...patchFields,
+              userIntent: { ...((p as any).userIntent ?? {}), ...patchFields },
+            }
+          : p
+      );
+      return { next, result: null };
     });
+    if (!outcome.ok) {
+      return res.status(outcome.status).json(ICP_ID_ERROR[outcome.status]);
+    }
+    const nextList = outcome.next;
     return res.json({ icpResult: nextList });
   } catch (err) {
+    if ((err as any)?.code === ICP_LIST_CONTENDED) {
+      return res.status(409).json({ message: "The personas changed while saving. Please try again." });
+    }
     console.error("[icp] edit-one failed", err);
     return res.status(500).json({ message: "Failed to edit icp" });
   }
@@ -941,22 +947,23 @@ router.post("/icp/delete-one", authenticateToken, async (req, res) => {
     if (!hasIcpIdShape(req.body?.icpId)) {
       return res.status(400).json(ICP_ID_ERROR[400]);
     }
-    const user = await userDb.getUserById(userId);
-    const list: Array<Record<string, string>> = user?.icpResult ?? [];
-    if (list.length === 0) {
-      return res.status(404).json({ message: "icp not found" });
-    }
-    const resolved = resolveIcpIndex(list, req.body?.icpId);
-    if ("status" in resolved) {
-      return res.status(resolved.status).json(ICP_ID_ERROR[resolved.status]);
-    }
-    const idx = resolved.index;
-    const nextList = list.filter((_, i) => i !== idx);
-    await userDb.updateUser(userId, {
-      icpResult: nextList as Required<NonNullable<typeof user>>["icpResult"],
+    // Compare-and-swap, as in edit-one: two deletes (or a delete and an edit) in
+    // flight together must both land.
+    const outcome = await casUpdateIcpList(userId, (list) => {
+      if (list.length === 0) return { status: 404 };
+      const resolved = resolveIcpIndex(list as unknown as Array<Record<string, unknown>>, req.body?.icpId);
+      if ("status" in resolved) return { status: resolved.status };
+      return { next: list.filter((_, i) => i !== resolved.index), result: null };
     });
+    if (!outcome.ok) {
+      return res.status(outcome.status).json(ICP_ID_ERROR[outcome.status]);
+    }
+    const nextList = outcome.next;
     return res.json({ icpResult: nextList });
   } catch (err) {
+    if ((err as any)?.code === ICP_LIST_CONTENDED) {
+      return res.status(409).json({ message: "The personas changed while saving. Please try again." });
+    }
     console.error("[icp] delete-one failed", err);
     return res.status(500).json({ message: "Failed to delete icp" });
   }

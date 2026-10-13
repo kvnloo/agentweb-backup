@@ -869,6 +869,37 @@ router.get("/users", async (req, res) => {
       }
     }
 
+    // ENG-273: which messaging platform each customer is on. Read from the same policy
+    // that enforces one-platform-per-customer, so this column can never disagree with
+    // what the rule allows. Computed from the full records (the compact list rows drop
+    // the channel fields), each organisation resolved once, and strictly best-effort:
+    // a failure here leaves the column empty rather than failing the whole user list.
+    try {
+      const { getPlatformSummary } = await import('../services/customerChannelPolicy');
+      const fullRecordById = new Map<string, any>(users.map((u: any) => [u.userId, u]));
+      const orgSlackCache = new Map<string, Promise<boolean>>();
+      await Promise.all(
+        sanitized.map(async (user: any) => {
+          // Each account settles on its own. One failing summary must not reject the whole
+          // batch and send the roster while other accounts' summaries are still pending,
+          // which would leave them without platform fields and shown as "Not connected".
+          try {
+            const summary = await getPlatformSummary(fullRecordById.get(user.userId), orgSlackCache);
+            user.messagingPlatform = summary.platform;
+            user.messagingPlatformSource = summary.source;
+            user.whatsappNumberMasked = summary.whatsappNumberMasked;
+          } catch (error) {
+            console.error(
+              `[admin/users] messaging platform lookup failed for user ${user.userId}; leaving it unset:`,
+              error instanceof Error ? error.message : error,
+            );
+          }
+        }),
+      );
+    } catch (error) {
+      console.error('[admin/users] messaging platform lookup failed; leaving it unset:', error);
+    }
+
     // Fetch only replay settings for these users in bounded BatchGet chunks.
     // Preserve the old per-setting best-effort behavior.
     const replaySettings = await settingsService.getSettings(
@@ -1378,7 +1409,81 @@ router.get("/slack/channel-info", async (req, res) => {
   }
 });
 
-// Update user slack channels (accepts an array)
+/**
+ * Disconnect a customer's WhatsApp number on their behalf (ENG-273).
+ *
+ * A customer is on one messaging platform, and only they could remove WhatsApp — so one
+ * who wanted to move to Slack and did not do it themselves left support with no way to
+ * help. This is the same disconnect the customer's own Settings performs.
+ *
+ * It removes a number the customer verified and consented with, so it is recorded with
+ * who did it, and the customer is told on WhatsApp when the 24-hour window allows.
+ */
+router.delete("/users/:userId/whatsapp", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    // User ids are UUIDs or numeric strings. Reject anything else as bad input rather than
+    // letting it reach the database and come back as "not found" or a server error.
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(userId)) {
+      return res.status(400).json({ message: "Invalid user id." });
+    }
+    const adminId = (req as any).user?.userId || 'unknown-admin';
+    const { disconnectWhatsApp } = await import('../services/whatsappVerificationService');
+
+    const result = await disconnectWhatsApp(userId);
+    if (!result) return res.status(404).json({ message: "User not found" });
+    if (!result.removed) {
+      return res.status(409).json({ message: "This account has no WhatsApp number connected." });
+    }
+
+    const { redactPhone, sendText } = await import('../services/whatsappService');
+    console.log(
+      `[admin] WhatsApp ${redactPhone(result.removed)} disconnected from user ${userId} by admin ${adminId}`,
+    );
+
+    // Best-effort courtesy notice. Outside the 24h window nothing but a template can be
+    // sent, and there is no template for this — so it may not arrive, and must never
+    // fail a disconnect that has already happened.
+    let customerNotified = false;
+    try {
+      await sendText(
+        result.removed,
+        'Your WhatsApp number has been disconnected from AgentWeb by our support team, so you will no longer receive notifications here. You can reconnect it any time from AgentWeb Settings.',
+      );
+      customerNotified = true;
+    } catch {
+      /* window closed, opted out, or Meta unavailable */
+    }
+
+    // The platform the account is on NOW. Removing WhatsApp can leave an account on Slack —
+    // an organisation member inherits the organisation's channel — so the dashboard must
+    // show what is true rather than assume "not connected".
+    let summary: { platform: string | null; source: string | null; whatsappNumberMasked: string | null } = {
+      platform: null,
+      source: null,
+      whatsappNumberMasked: null,
+    };
+    try {
+      const { getPlatformSummary } = await import('../services/customerChannelPolicy');
+      const { userDb } = await import('../services/db');
+      summary = await getPlatformSummary(await userDb.getUserById(userId));
+    } catch (error) {
+      console.error('[admin] could not recalculate the platform after disconnecting WhatsApp:', error);
+    }
+
+    res.json({
+      success: true,
+      customerNotified,
+      messagingPlatform: summary.platform,
+      messagingPlatformSource: summary.source,
+      whatsappNumberMasked: summary.whatsappNumberMasked,
+    });
+  } catch (error: any) {
+    console.error("Error disconnecting WhatsApp:", error?.message || error);
+    res.status(500).json({ message: "Failed to disconnect WhatsApp" });
+  }
+});
+
 router.put("/users/:userId/slack-channel", async (req, res) => {
   try {
     const { userId } = req.params;
@@ -1395,6 +1500,20 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
       ? slackChannels.map((c: any) => String(c).trim()).filter(Boolean)
       : [];
 
+    // One platform per customer (ENG-273): an account on WhatsApp cannot also be given a
+    // Slack channel. Clearing channels is always allowed — that is how Slack is removed.
+    if (channels.length > 0) {
+      const { hasWhatsApp } = await import('../services/customerChannelPolicy');
+      if (hasWhatsApp(user)) {
+        return res.status(409).json({
+          message:
+            'This account is already connected to WhatsApp. An account can use one messaging platform, so disconnect WhatsApp before assigning a Slack channel.',
+          code: 'platform_conflict',
+          connected: 'whatsapp',
+        });
+      }
+    }
+
     const { settingsService } = await import('../services/settingsService');
     // Invalidate by userId (old assignments) AND by channel ID (channels that may be cached under a different user)
     const oldChannels: string[] = (user.slackChannels ?? []).concat(user.slackChannel ? [user.slackChannel] : []);
@@ -1403,7 +1522,23 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
     const updatedUser = await userDb.updateUser(userId, {
       slackChannels: channels.length > 0 ? channels : (null as any),
     });
-    res.json(sanitizeUserForResponse(updatedUser));
+
+    // Clearing an account's own channels can leave a member of an organisation on the
+    // organisation's channel, so report the platform the account is on NOW rather than
+    // letting the dashboard guess.
+    let platformFields: Record<string, unknown> = {};
+    try {
+      const { getPlatformSummary } = await import('../services/customerChannelPolicy');
+      const summary = await getPlatformSummary(updatedUser);
+      platformFields = {
+        messagingPlatform: summary.platform,
+        messagingPlatformSource: summary.source,
+        whatsappNumberMasked: summary.whatsappNumberMasked,
+      };
+    } catch (error) {
+      console.error('[admin] could not recalculate the platform after a Slack channel edit:', error);
+    }
+    res.json({ ...sanitizeUserForResponse(updatedUser), ...platformFields });
   } catch (error) {
     console.error("Error updating user slack channels:", error);
     res.status(500).json({ message: "Error updating slack channels" });
