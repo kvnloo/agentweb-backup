@@ -494,6 +494,8 @@ export interface ChatSession {
     // ENG-2138: written by a shadow judge (sampled, never the primary score), with its model.
     shadow?: boolean;
     model?: string;
+    // ENG-2138: first 12 hex chars of sha256(judge.systemPrompt); shadow scores only.
+    promptVersion?: string;
   }>;
   // Scores retracted because the session turned out to be outside the
   // satisfaction cohort (zero-task — ENG-830). The original score is MOVED here
