@@ -1811,6 +1811,8 @@ async function resolveJudgeModel(judge: ScoringJudge, userId: string | undefined
   return judge.llmModel ? resolveScoringModel(judge.llmModel) : resolveModelForUser(userId, 'scoring_judge');
 }
 
+const roundToTenth = (n: number): number => Math.round(n * 10) / 10;
+
 export async function scoreSessionWithJudge(
   messages: ChatMessage[],
   currentMessageCount: number,
@@ -1902,7 +1904,11 @@ export async function scoreSessionWithJudge(
       `Judge response missing or non-numeric "score" field (got ${JSON.stringify(parsed.score)})`
     );
   }
-  const score = Math.max(1, Math.min(5, Math.round(rawScore)));
+  // ENG-2138: a shadow judge keeps the reply's one-decimal score. The original ENG-1710 rubric B asks for a
+  // decimal and was measured on it; rounding discards that signal. A rubric that asks for whole numbers is
+  // unaffected, and customer-facing judges stay whole numbers.
+  const boundedScore = Math.max(1, Math.min(5, rawScore));
+  const score = judge.shadow ? roundToTenth(boundedScore) : Math.round(boundedScore);
   const reason = parsed.reason || "No reason provided";
   const fabricationGuarded = applyFabricationGuard(
     manifest.count,
