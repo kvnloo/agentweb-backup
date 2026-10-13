@@ -122,6 +122,29 @@ describe('validation runner math (ENG-2135)', () => {
     warn.mockRestore();
   });
 
+  it('never runs the grader on a case without a human pass/fail label (an adapter may read live customer state)', async () => {
+    const unlabelledCase = labelled('u1', undefined);
+    const naCase = labelled('n1', 'na');
+    const passCase = labelled('p1', 'pass');
+    const grade = jest.fn(async () => ({ task_success: 'pass' as const }));
+    const grader: GoldenCaseGrader = { graderId: 'session-judge-general', surface: 'agent', criteria: ['task_success'], primaryCriterion: 'task_success', grade };
+    const run = await runValidation({ graderId: 'session-judge-general', store: storeOf([unlabelledCase, naCase, passCase]), graders: [grader], bootstrap: { iterations: 10 } });
+    expect(grade).toHaveBeenCalledTimes(1);
+    expect(grade).toHaveBeenCalledWith(expect.objectContaining({ caseId: passCase.caseId }));
+    expect(run).toMatchObject({ cases: 3, graded: 1, gradeErrors: 0 });
+    expect(run.criteria[0]).toMatchObject({ unlabelled: 1, humanNa: 1 });
+    expect(run.criteria[0].report?.n).toBe(1);
+  });
+
+  it('counts a case as graded when any of the grader\'s criteria has a binary label', async () => {
+    const c = { ...labelled('m1', undefined), labels: { groundedness: 'fail' as const } };
+    const grade = jest.fn(async () => ({}));
+    const grader: GoldenCaseGrader = { graderId: 'session-judge-general', surface: 'agent', criteria: ['task_success', 'groundedness'], primaryCriterion: 'task_success', grade };
+    const run = await runValidation({ graderId: 'session-judge-general', store: storeOf([c]), graders: [grader], bootstrap: { iterations: 10 } });
+    expect(grade).toHaveBeenCalledTimes(1);
+    expect(run.graded).toBe(1);
+  });
+
   it('leaves pairwise calibration cases out of a creative grader run (ENG-2142)', async () => {
     const single = { ...newGoldenCase({ surface: 'creative', taskType: 'creative_image', sourceId: 'c1', seedSource: 's', now: NOW }), split: 'test' as const, labels: { hook: 'pass' as const } };
     const pair: GoldenCase = {
@@ -288,12 +311,12 @@ describe('agent grader adapters (ENG-2137 graders on golden cases)', () => {
 });
 
 describe('creative deterministic gates adapter (ENG-2139, ENG-2226)', () => {
-  const gateResult = (passed: boolean): CreativeGateResult => ({
+  const gateResult = (passed: boolean, checks: CreativeGateResult['checks'] = [{ id: 'decode', status: passed ? 'pass' : 'fail' }]): CreativeGateResult => ({
     graderId: 'creative-deterministic-gates',
     version: '2026-09-29.1',
     advisory: true,
     passed,
-    checks: [{ id: 'decode', status: 'pass' }],
+    checks,
     bytes: 12345,
     fitsPlacements: [],
     evaluatedAt: '2026-09-29T00:00:00.000Z',
@@ -308,6 +331,48 @@ describe('creative deterministic gates adapter (ENG-2139, ENG-2226)', () => {
     expect(creativeGatesPrediction(gateResult(true))).toEqual({ format_readiness: 'pass' });
     expect(creativeGatesPrediction(gateResult(false))).toEqual({ format_readiness: 'fail' });
     expect(creativeGatesPrediction(undefined)).toEqual({});
+  });
+
+  it('ignores the advisory content checks: a launch-ready image with failing content checks is still format_readiness pass (ENG-2193 merged them into `passed`)', () => {
+    const g = gateResult(false, [
+      { id: 'decode', status: 'pass' },
+      { id: 'blank_render', status: 'pass' },
+      { id: 'aspect_ratio', status: 'pass' },
+      { id: 'dimensions', status: 'pass' },
+      { id: 'file_size', status: 'pass' },
+      { id: 'ocr_legibility', status: 'fail' },
+      { id: 'brand_colour', status: 'fail' },
+    ]);
+    expect(g.passed).toBe(false);
+    expect(creativeGatesPrediction(g)).toEqual({ format_readiness: 'pass' });
+  });
+
+  it('a failing structural check is a fail even when content checks pass', () => {
+    const g = gateResult(false, [
+      { id: 'decode', status: 'pass' },
+      { id: 'blank_render', status: 'fail' },
+      { id: 'logo_presence', status: 'pass' },
+    ]);
+    expect(creativeGatesPrediction(g)).toEqual({ format_readiness: 'fail' });
+  });
+
+  it('a skipped structural check does not count as pass: abstains when every structural check was skipped or the gates were not checked', () => {
+    const skipped = gateResult(true, [
+      { id: 'decode', status: 'skipped' },
+      { id: 'blank_render', status: 'skipped' },
+      { id: 'ocr_text_ratio', status: 'pass' },
+    ]);
+    expect(creativeGatesPrediction(skipped)).toEqual({});
+    expect(creativeGatesPrediction({ ...gateResult(true), notChecked: 'no image bytes' })).toEqual({});
+    expect(creativeGatesPrediction(gateResult(true, []))).toEqual({});
+  });
+
+  it('structural pass with some other structural check skipped is still a pass', () => {
+    const g = gateResult(true, [
+      { id: 'decode', status: 'pass' },
+      { id: 'aspect_ratio', status: 'skipped' },
+    ]);
+    expect(creativeGatesPrediction(g)).toEqual({ format_readiness: 'pass' });
   });
 
   it('grades a case by its candidate id, read-only', async () => {
