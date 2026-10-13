@@ -15,6 +15,7 @@ import {
 } from '../mcp/metaToolkitGateway';
 import { getMetaToolkitManifest, MetaToolkitRefusal } from '../mcp/metaToolkitManifest';
 import { rateLimiter } from '../middleware/rateLimiter';
+import { buildMcpAuthChallenge, getBackendUrl, META_TOOLKIT_MCP_RESOURCE_PATH } from '../mcp/oauth/authChallenge';
 
 /** Per-IP request ceiling, applied before bearer auth so unauthenticated floods are throttled too. */
 export const META_TOOLKIT_MAX_PER_MINUTE = 60;
@@ -118,6 +119,10 @@ router.post('/mcp', async (req: Request, res: Response) => {
   try {
     switch (method) {
       case 'initialize':
+        // MCP authorization: the protected resource answers an unauthenticated initialize with
+        // 401 + an RFC 9728 challenge, which is what makes Claude Code / Codex open the browser
+        // OAuth login. Serving initialize anonymously left clients "connected" with no tools.
+        await authenticateMetaToolkitCaller(req.headers.authorization);
         return rpcResult(res, id, {
           protocolVersion:
             typeof params.protocolVersion === 'string' && META_TOOLKIT_MCP_SUPPORTED_VERSIONS.has(params.protocolVersion)
@@ -164,7 +169,16 @@ router.post('/mcp', async (req: Request, res: Response) => {
   } catch (error) {
     if (error instanceof MetaToolkitAuthError) {
       if (error.retryAfterSeconds) res.setHeader('Retry-After', String(error.retryAfterSeconds));
-      if (error.status === 401) res.setHeader('WWW-Authenticate', 'Bearer');
+      if (error.status === 401) {
+        res.setHeader(
+          'WWW-Authenticate',
+          buildMcpAuthChallenge(
+            getBackendUrl(),
+            req.headers.authorization ? 'invalid_token' : undefined,
+            META_TOOLKIT_MCP_RESOURCE_PATH,
+          ),
+        );
+      }
       return rpcError(res, id, -32001, error.message, error.status);
     }
     console.error('[meta-toolkit] MCP call failed:', error instanceof Error ? error.message : error);
