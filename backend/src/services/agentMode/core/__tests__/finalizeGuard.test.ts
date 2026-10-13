@@ -584,6 +584,53 @@ describe('real tools back their claim class (ENG-2459)', () => {
   });
 });
 
+describe('a saved draft does not back a "published" claim (ENG-2459)', () => {
+  const PUBLISHED = 'The LinkedIn post was published.';
+  const post = (extra: Partial<FinalizeLedgerEntry>): FinalizeLedgerEntry => ({
+    toolName: 'post_on_connected_account', status: 'success', result: {}, ...extra,
+  });
+
+  it.each([
+    ['the call asked for save_as_draft', post({ args: { platform: 'linkedin', content: 'Hi', save_as_draft: true } })],
+    ['the stored result is flagged draft', post({ result: { success: true, draft: true } })],
+  ])('is a mismatch when %s', async (_name, entry) => {
+    const { ports, judge } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'post_published', statement: PUBLISHED }]);
+
+    const outcome = await runFinalizeGuard({ finalText: PUBLISHED, ledger: [entry], ports, detectOnly: true });
+
+    // Not 'ambiguous_unmatched': the loose tier must not swallow it either.
+    expect(outcome.action).toBe('detected_mismatch');
+    expect(outcome.mismatchedClaimClasses).toEqual(['post_published']);
+  });
+
+  it('a normal post call still backs the claim', async () => {
+    const { ports, judge } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'post_published', statement: PUBLISHED }]);
+
+    const outcome = await runFinalizeGuard({
+      finalText: PUBLISHED,
+      ledger: [post({ args: { platform: 'linkedin', content: 'Hi', save_as_draft: false } })],
+      ports,
+    });
+
+    expect(outcome.action).toBe('clean');
+  });
+
+  it('a published call next to a draft call still backs the claim', async () => {
+    const { ports, judge } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'post_published', statement: PUBLISHED }]);
+
+    const outcome = await runFinalizeGuard({
+      finalText: PUBLISHED,
+      ledger: [post({ args: { save_as_draft: true } }), post({ args: { content: 'Hi' } })],
+      ports,
+    });
+
+    expect(outcome.action).toBe('clean');
+  });
+});
+
 describe('judge output must be about a candidate class and quote a statement (ENG-2459)', () => {
   it.each([
     ['a class the lexicon never raised', [{ claimClass: 'schedule_created', statement: 'the schedule is active' }]],
@@ -600,6 +647,21 @@ describe('judge output must be about a candidate class and quote a statement (EN
     expect(outcome.action).toBe('clean');
     expect(outcome.claimMismatch).toBe(false);
     expect(correct).not.toHaveBeenCalled();
+  });
+
+  it('drops a non-candidate class but still checks the candidate class in the same reply', async () => {
+    const { ports, judge, correct } = makePorts();
+    judge.mockResolvedValueOnce([
+      { claimClass: 'schedule_created', statement: 'the schedule is active' },
+      { claimClass: 'email_sent', statement: "I've sent the email" },
+    ]);
+    correct.mockResolvedValue('The email was not sent. Want me to retry?');
+
+    const outcome = await runFinalizeGuard({ finalText: CLAIMING_TEXT, ledger: [], ports });
+
+    expect(outcome.action).toBe('corrected');
+    expect(correct.mock.calls[0][0].systemNote).toContain('no successful email_sent');
+    expect(correct.mock.calls[0][0].systemNote).not.toContain('schedule_created');
   });
 
   it('still corrects a real mismatch that is a candidate class and quotes its statement', async () => {
