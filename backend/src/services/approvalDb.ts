@@ -312,6 +312,36 @@ export class ApprovalDB {
   }
 
   /**
+   * Every PENDING approval of a user, following the index to the end. getApprovalsByUserId
+   * returns one page of the newest rows of any status, which can miss older pending ones.
+   */
+  async getPendingApprovalsByUserId(userId: string): Promise<AssetApproval[]> {
+    const items: AssetApproval[] = [];
+    let startKey: Record<string, any> | undefined;
+    try {
+      do {
+        const result = await dynamodb
+          .query({
+            TableName: ASSET_APPROVALS_TABLE,
+            IndexName: 'UserApprovalsIndex',
+            KeyConditionExpression: 'userId = :userId',
+            FilterExpression: '#status = :pending',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: { ':userId': userId, ':pending': 'pending' },
+            ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+          })
+          .promise();
+        items.push(...((result.Items as AssetApproval[]) || []));
+        startKey = result.LastEvaluatedKey;
+      } while (startKey);
+      return items;
+    } catch (error) {
+      console.error('❌ Error getting pending approvals by user ID:', error);
+      throw new Error('Failed to get pending approvals by user ID');
+    }
+  }
+
+  /**
    * Get approvals by status
    */
   async getApprovalsByStatus(status: 'pending' | 'approved' | 'needs_changes', limit?: number): Promise<AssetApproval[]> {

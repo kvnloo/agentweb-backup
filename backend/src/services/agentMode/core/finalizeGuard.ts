@@ -60,8 +60,9 @@ const SETTINGS_PERSISTENCE_TOOLS = new Set<string>([
  *
  * Deliberately NOT here: tools that can succeed without doing the claimed thing. The ledger keeps only a
  * minimised result (`{}` for almost every tool, see extractMinimalToolResult), so the guard cannot see
- * `draft`, `duplicate_suppressed` or a silent no-send. Those tools are in CLAIM_TOOL_LOOSE_MATCHERS instead,
- * where a hit means "ambiguous, never corrected":
+ * `draft`, `duplicate_suppressed` or a silent no-send in the result. Those tools are in CLAIM_TOOL_LOOSE_MATCHERS
+ * instead, where a hit means "ambiguous, never corrected". (A tool whose draft state shows in its call arguments,
+ * such as post_on_connected_account, can stay strict: savedAsDraft skips it through `entry.args`.)
  *  - send_gtm_status_report returns success after silent no-ops (no recipients, swallowed send errors);
  *  - create_social_media_posts / create_html_* / update_html_file produce an HTML document, not an image or
  *    video, and update_html_file can succeed with zero operations applied;
@@ -74,7 +75,7 @@ const EXTRA_BACKING_TOOLS: Record<'email_sent' | 'task_created_or_updated' | 'po
   email_sent: new Set(['notify_session']),
   // GTM plan work items are the product's tasks; both handlers await the DynamoDB write.
   task_created_or_updated: new Set(['add_gtm_work_items', 'update_gtm_work_item']),
-  // Known limit: on LinkedIn a save_as_draft call also succeeds (draft: true) and the ledger cannot see it.
+  // A LinkedIn save_as_draft call also succeeds; claimBackedByLedger skips it through the call's arguments (savedAsDraft).
   post_published: new Set(['post_on_connected_account']),
 };
 
@@ -201,6 +202,22 @@ export interface FinalizeLedgerEntry {
   /** the minimal stored result for successful calls (carries encoded-failure
    * and awaitingUserConfirmation markers) */
   result?: any;
+  /** the call's parsed arguments. The stored result is minimized (most tools keep `{}`),
+   * so an argument is the only way to see that a call only saved a draft. */
+  args?: unknown;
+}
+
+/**
+ * A LinkedIn post saved with save_as_draft, or a blog article not sent with status 'published', is a draft the user
+ * still has to publish, not a published post.
+ * The argument is the signal in prod; the result flag is a defensive second check (the stored result is `{}`).
+ */
+function savedAsDraft(entry: FinalizeLedgerEntry): boolean {
+  const args = entry.args as { save_as_draft?: unknown; status?: unknown } | null | undefined;
+  const result = entry.result as { draft?: unknown } | null | undefined;
+  // publish_blog_article saves a CMS draft unless status is exactly 'published' (emma/impl/blog.ts).
+  if (entry.toolName === 'publish_blog_article') return args?.status !== 'published';
+  return args?.save_as_draft === true || result?.draft === true;
 }
 
 /** One concrete claim the judge extracted from the final text. */
@@ -284,6 +301,7 @@ export function claimBackedByLedger(
       entry.status === 'success'
       && matches(entry.toolName)
       && !ports.toolResultError(entry.result)
+      && (claimClass !== 'post_published' || !savedAsDraft(entry))
       && (claimClass !== 'asset_generated' || ports.mediaGenProducedAsset(entry.toolName, entry.result)),
   );
 }
@@ -299,7 +317,12 @@ export function claimLooselyMatchedByLedger(
 ): boolean {
   const looseMatch = CLAIM_TOOL_LOOSE_MATCHERS[claimClass];
   return ledger.some(
-    (entry) => entry.status === 'success' && looseMatch(entry.toolName) && !ports.toolResultError(entry.result),
+    (entry) =>
+      entry.status === 'success'
+      && looseMatch(entry.toolName)
+      && !ports.toolResultError(entry.result)
+      // Without this a draft would downgrade a "published" claim to ambiguous and it would never be corrected.
+      && (claimClass !== 'post_published' || !savedAsDraft(entry)),
   );
 }
 
