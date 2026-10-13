@@ -483,6 +483,35 @@ describe('fathomOnboardingIngestionService', () => {
     expect(ledger.find((i: any) => i.recordingId === 'rv3-f').status).toBe('discarded');
   });
 
+  it('deletes memories a losing concurrent reviewed ingest created when it adopts the winner ids (Opslane 443)', async () => {
+    const stamp = '2026-07-08T19:00:00.000Z';
+    const winner = [{ recordingId: 'dbl-1', status: 'reviewed', context: baseContext, memoryIds: ['mem-win'], orgMemoryIds: ['org-mem-win'], orgMemoryOrgId: 'org-1', createdAt: stamp, updatedAt: stamp }];
+    let reads = 0;
+    const updateUser = jest.fn(async (_u: string, updates: Record<string, any>) => {
+      if (updateUser.mock.calls.length === 1) throw Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' });
+      return updates;
+    });
+    const base = makeDeps();
+    const deps = makeDeps({
+      userDb: {
+        ...base.userDb,
+        getUserById: jest.fn(async (userId: string) => ({ userId, email: 'owner@acme.ai', orgId: 'org-1', fathomOnboardingIngestions: (userId === 'target-user' && reads++ > 0) ? winner : [] })),
+        updateUser,
+      },
+      accountMemoryDb: { addMemory: jest.fn(async () => ({ memoryId: 'mem-lose' })), deleteMemory: jest.fn(async () => undefined) },
+      orgMemoryDb: { addMemory: jest.fn(async () => ({ memoryId: 'org-mem-lose' })), deleteMemory: jest.fn(async () => undefined) },
+    });
+
+    const result = await ingestFathomOnboardingRecording({
+      recordingId: 'dbl-1', targetUserId: 'target-user', reviewOwnerUserId: 'target-user', reviewed: true, extractedContext: baseContext,
+    }, deps as any);
+
+    expect(result.memoryIds).toEqual(['mem-win']);
+    expect(result.orgMemoryIds).toEqual(['org-mem-win']);
+    expect(deps.accountMemoryDb.deleteMemory).toHaveBeenCalledWith('target-user', 'mem-lose');
+    expect(deps.orgMemoryDb.deleteMemory).toHaveBeenCalledWith('org-1', 'org-mem-lose');
+  });
+
   it('routes existing account matches to review without creating another user', async () => {
     const deps = makeDeps();
 

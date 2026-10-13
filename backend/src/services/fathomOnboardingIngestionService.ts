@@ -101,8 +101,8 @@ interface IngestInput {
 interface IngestDeps {
   userDb: Pick<typeof userDb, 'getUserById' | 'getUserByEmail' | 'getUsersByEmailDomain' | 'updateUser' | 'createFathomDraftUser'>;
   crmDb: Pick<typeof crmDb, 'findLeadsByEmail'>;
-  accountMemoryDb: Pick<typeof accountMemoryDb, 'addMemory'>;
-  orgMemoryDb: Pick<typeof orgMemoryDb, 'addMemory'>;
+  accountMemoryDb: Pick<typeof accountMemoryDb, 'addMemory'> & Partial<Pick<typeof accountMemoryDb, 'deleteMemory'>>;
+  orgMemoryDb: Pick<typeof orgMemoryDb, 'addMemory'> & Partial<Pick<typeof orgMemoryDb, 'deleteMemory'>>;
   llm: Pick<LLMService, 'generateJsonRobust'>;
   getFathomAccessToken?: typeof getFathomAccessToken;
   FathomApiService?: typeof FathomApiService;
@@ -599,6 +599,24 @@ export async function ingestFathomOnboardingRecording(
   }
   if (!written) {
     throw new Error('Fathom onboarding ledger changed concurrently; retry the ingest.');
+  }
+
+  // ENG-270 (Opslane 443): a losing concurrent reviewed ingest adopts the winner's
+  // recorded memory ids on retry; delete the memories this call wrote that no ledger
+  // entry records, so rollback (which deletes only recorded ids) leaves nothing live.
+  if (target.userId) {
+    for (const memoryId of createdMemoryIds.filter((id) => !memoryIds.includes(id))) {
+      try { await deps.accountMemoryDb.deleteMemory?.(target.userId, memoryId); } catch (error: any) {
+        console.warn('[FathomOnboarding] Failed to delete orphaned account memory:', memoryId, error?.message);
+      }
+    }
+  }
+  if (createdOrgMemoryOrgId) {
+    for (const memoryId of createdOrgMemoryIds.filter((id) => !orgMemoryIds.includes(id))) {
+      try { await deps.orgMemoryDb.deleteMemory?.(createdOrgMemoryOrgId, memoryId); } catch (error: any) {
+        console.warn('[FathomOnboarding] Failed to delete orphaned org memory:', memoryId, error?.message);
+      }
+    }
   }
 
   if (reviewed && target.userId && input.reviewOwnerUserId !== ledgerUserId) {
