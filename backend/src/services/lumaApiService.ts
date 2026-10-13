@@ -12,7 +12,9 @@ const LUMA_PUBLIC_API = 'https://public-api.luma.com';
 // imports in server.ts, so a load-time read would silently miss a value from .env.
 function lumaApiBase(): string {
   const override = process.env.LUMA_API_BASE_URL;
-  return process.env.NODE_ENV !== 'production' && override ? override : LUMA_PUBLIC_API;
+  // Allowlist, not `!== 'production'`: a mis-set NODE_ENV on a real server must not be able to redirect keys.
+  const env = process.env.NODE_ENV;
+  return (env === 'development' || env === 'test') && override ? override : LUMA_PUBLIC_API;
 }
 const REQUEST_TIMEOUT_MS = 20_000;
 const PAGE_SIZE = 100;
@@ -224,7 +226,10 @@ export class LumaApiService {
 
       for (const g of data.entries || []) {
         if (!g.registered_at && !keepUnregistered) {
+          // Sorted `desc nulls last`: once one row has no registration time, every row after it has none
+          // either, so stop instead of paging through up to 25 pages of them against the rate limit.
           skipped += 1;
+          crossedCutoff = true;
           continue;
         }
         if (g.registered_at && Number.isFinite(cutoff) && Date.parse(g.registered_at) < cutoff) {

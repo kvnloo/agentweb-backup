@@ -83,7 +83,7 @@ import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHisto
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, buildFinalizeJudgePrompt, parseFinalizeJudgeOutput, FINALIZE_JUDGE_MAX_COMPLETION_TOKENS } from './agentMode/core/finalizeGuard';
-import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
+import { reconcileUnconsumedCursors, ROW_KEYS as LEDGER_ROW_KEYS } from './agentMode/core/unconsumedCursor';
 import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
 import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionIndex } from '../utils/modelMentionRequest';
 import { resolveTurnModelCorrection } from '../utils/modelCorrectionStamp';
@@ -8345,7 +8345,7 @@ export class AgentModeService {
       // Zero is worse than silence in that sentence: it reads as "this found
       // nothing", the opposite of what happened.
       if (Object.keys(paginationMarkers).length > 0) {
-        for (const key of ['leads', 'engagements', 'results', 'items', 'rows']) {
+        for (const key of LEDGER_ROW_KEYS) {
           const value = (result as Record<string, unknown>)[key];
           if (Array.isArray(value)) { paginationMarkers.rowCount = value.length; break; }
         }

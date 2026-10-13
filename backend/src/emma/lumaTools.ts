@@ -28,11 +28,39 @@ const MAX_GUESTS_WITH_ANSWERS = 30;
 const MAX_GUESTS_WITH_FILTERED_ANSWERS = 35;
 const MAX_ANSWER_LABELS = 5;
 
+const MAX_ANSWER_CHARS = 300;
+// Anything longer than this after compaction cannot be shown: the model sees only the first 20,000 chars.
+const MAX_RESULT_CHARS = 17_000;
+
+/** Registration answers are typed by the guest and unbounded; cap each so one guest cannot eat the view. */
+function capAnswerValue(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return value.length > MAX_ANSWER_CHARS ? `${value.slice(0, MAX_ANSWER_CHARS)}… [truncated]` : value;
+  }
+  if (Array.isArray(value)) return value.map(capAnswerValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, capAnswerValue(v)]));
+  }
+  return value;
+}
+
+/**
+ * True when an answer is one the caller asked for. Matched on the question label, on Luma's question type
+ * ("company"), and on a URL value naming the site ("linkedin"): a company question labelled "Where do you
+ * work?" or a LinkedIn question labelled "Your profile" must not silently vanish.
+ */
+function answerMatches(answer: any, labels: string[]): boolean {
+  const label = String(answer?.label ?? '').toLowerCase();
+  const type = String(answer?.question_type ?? '').toLowerCase();
+  const value = typeof answer?.value === 'string' ? answer.value.toLowerCase() : '';
+  return labels.some((l) => label.includes(l) || type === l || (value.startsWith('http') && value.includes(l)));
+}
+
 /**
  * Keeps only the fields the agent uses. Drops nulls; drops first/last name when `name` is present;
  * and, unless asked for, registration answers — reduced to {label, value}, with Luma's internal
- * question ids and types removed, and optionally to answers whose label contains one of `labels`.
- * A guest list padded with these would be cut off mid-list by the 20,000-char view.
+ * question ids and types removed, long free text capped, and optionally narrowed to the answers
+ * matching `labels`. A guest list padded with these would be cut off mid-list by the 20,000-char view.
  */
 function compactGuest(guest: LumaGuest, includeAnswers: boolean, labels: string[] = []): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -43,8 +71,8 @@ function compactGuest(guest: LumaGuest, includeAnswers: boolean, labels: string[
       if (!includeAnswers || !Array.isArray(value)) continue;
       const answers = (value as any[])
         .filter((a) => a && a.value !== null && a.value !== undefined && a.value !== '')
-        .filter((a) => labels.length === 0 || labels.some((l) => String(a.label ?? '').toLowerCase().includes(l)))
-        .map((a) => ({ label: a.label, value: a.value }));
+        .filter((a) => labels.length === 0 || answerMatches(a, labels))
+        .map((a) => ({ label: a.label, value: capAnswerValue(a.value) }));
       if (answers.length > 0) out[key] = answers;
       continue;
     }
@@ -56,9 +84,10 @@ function compactGuest(guest: LumaGuest, includeAnswers: boolean, labels: string[
 const GUEST_STATUSES = ['approved', 'session', 'pending_approval', 'invited', 'declined', 'waitlist'];
 
 const NOT_CONNECTED_MESSAGE =
-  'No Luma API key is connected. Connecting one on the "Luma API key" card — link the user to it with [Settings → Login Credentials](/settings/login-credentials); needs a Luma Plus ' +
-  'calendar API key from luma.com/calendar/manage/api-keys) is the reliable way to read guest lists. ' +
-  'Without it, fall back to the browser session-cookie path or a CSV export.';
+  'No Luma API key is connected. Connecting one is the reliable way to read guest lists: it needs a Luma Plus ' +
+  'calendar API key (create it at luma.com/calendar/manage/api-keys) saved on the "Luma API key" card in ' +
+  '[Settings → Login Credentials](/settings/login-credentials) — give the user that exact link. ' +
+  'Without a key, fall back to the browser session-cookie path or a CSV export.';
 
 type ResolvedLuma =
   | { client: LumaApiService; ownerUserId: string; calendarId: string; calendarName: string }
@@ -108,7 +137,11 @@ function describe(accounts: Array<{ account_id: string; account_name: string }>)
   return accounts.map((a) => `${a.account_name} (${a.account_id})`).join(', ');
 }
 
-/** Maps a Luma failure to an agent-facing message, flagging a dead key so Settings shows it. */
+/**
+ * Maps a Luma failure to an agent-facing message, flagging a dead key so Settings shows it.
+ * `errorClass` is set explicitly (honoured by toolResultError) so retry guidance never depends on prose:
+ * a calendar called "Founders 500 Club" in the message would otherwise match the embedded-status pattern.
+ */
 async function lumaFailure(error: unknown, resolved: Extract<ResolvedLuma, { client: LumaApiService }>) {
   if (error instanceof LumaApiError && error.isAuthFailure) {
     await updateAccountConfig(resolved.ownerUserId, 'luma', resolved.calendarId, { needs_reconnect: true }).catch(
@@ -116,33 +149,41 @@ async function lumaFailure(error: unknown, resolved: Extract<ResolvedLuma, { cli
     );
     return {
       success: false,
+      errorClass: 'auth',
       message:
-        `Luma rejected the API key for "${resolved.calendarName}" (revoked, the wrong calendar, or the Luma Plus ` +
-        'subscription lapsed). The user needs to replace it in Settings → Login Credentials → Luma API key. ' +
+        `Luma rejected the API key for the calendar "${resolved.calendarName}" (revoked, the wrong calendar, or the Luma Plus ` +
+        'subscription lapsed). The user needs to replace it on the "Luma API key" card in ' +
+        '[Settings → Login Credentials](/settings/login-credentials). ' +
         'Fall back to the browser session-cookie path or a CSV export meanwhile.',
     };
   }
   if (error instanceof LumaApiError && error.isForbidden) {
     return {
       success: false,
+      errorClass: 'auth',
       message:
-        `Luma says the key for "${resolved.calendarName}" cannot access that event — it probably belongs to a different ` +
+        `Luma says the key for the calendar "${resolved.calendarName}" cannot access that event — it probably belongs to a different ` +
         'calendar. The key itself is fine. Check the event id with luma_list_events, or ask the user for a key from the calendar that hosts it.',
     };
   }
   if (error instanceof LumaApiError && error.status === 429) {
-    const wait = error.retryAfterSeconds ? ` Retry after ${error.retryAfterSeconds}s.` : '';
-    // Worded so the dispatcher's classifier reads it as `rate_limit` (wait, then retry once) and not as a
-    // permanent failure: it matches "rate limit" / a bare 429, not "rate-limiting".
-    return { success: false, message: `Luma rate limit hit (HTTP 429; 200 requests/minute per calendar).${wait || ' Wait about a minute'}, then retry the same call.` };
+    const wait = error.retryAfterSeconds ? `Retry after ${error.retryAfterSeconds}s` : 'Wait about a minute';
+    return {
+      success: false,
+      errorClass: 'rate_limit',
+      message: `Luma rate limit hit (HTTP 429; 200 requests/minute per calendar). ${wait}, then retry the same call.`,
+    };
   }
   const detail = error instanceof Error ? error.message : 'unknown error';
-  // "timed out" / "network error" so transient failures classify as retryable, not as a dead end.
-  const transient =
-    error instanceof LumaApiError && error.status === 0
-      ? /respond in time/.test(detail) ? 'The request timed out' : 'Network error reaching Luma'
-      : null;
-  return { success: false, message: transient ? `${transient} (${detail}). Retry once.` : `Luma request failed: ${detail}.` };
+  if (error instanceof LumaApiError && error.status === 0) {
+    const timedOut = /respond in time/.test(detail);
+    return {
+      success: false,
+      errorClass: timedOut ? 'timeout' : 'network',
+      message: `${timedOut ? 'The request timed out' : 'Network error reaching Luma'} (${detail}). Retry once.`,
+    };
+  }
+  return { success: false, message: `Luma request failed: ${detail}.` };
 }
 
 emmaToolRegistry.register({
@@ -270,9 +311,17 @@ emmaToolRegistry.register({
       registeredAfter = normalizeIsoUtc(args.registered_after) ?? undefined;
       if (!registeredAfter) return { success: false, message: 'registered_after must be an ISO 8601 date or datetime.' };
     }
-    const answerLabels: string[] = Array.isArray(args?.answer_labels)
-      ? args.answer_labels.map((l: unknown) => String(l).trim().toLowerCase()).filter(Boolean).slice(0, MAX_ANSWER_LABELS)
-      : [];
+    // Accept a bare string or a comma-separated one too: a model that sends "company, linkedin" must not get
+    // silently-empty answers.
+    const rawLabels: unknown[] = Array.isArray(args?.answer_labels)
+      ? args.answer_labels
+      : typeof args?.answer_labels === 'string'
+        ? args.answer_labels.split(',')
+        : [];
+    const answerLabels: string[] = rawLabels
+      .map((l) => String(l).trim().toLowerCase())
+      .filter(Boolean)
+      .slice(0, MAX_ANSWER_LABELS);
     const includeAnswers = args?.include_registration_answers === true || answerLabels.length > 0;
 
     const resolved = await resolveLuma(userId, args?.calendar_id);
@@ -288,12 +337,13 @@ emmaToolRegistry.register({
         cursor: args?.cursor,
         maxGuests,
       });
-      return {
+      const guests = page.guests.map((g) => compactGuest(g, includeAnswers, answerLabels));
+      const result = {
         success: true,
         calendar: resolved.calendarName,
         event_id: eventId,
         approval_status: status,
-        count: page.guests.length,
+        count: guests.length,
         // Paging fields BEFORE the guest list: if a result is ever cut for size, the tail goes, so these
         // must never be what is lost.
         has_more: page.has_more,
@@ -304,8 +354,30 @@ emmaToolRegistry.register({
         ...(page.skippedWithoutRegistration
           ? { skipped_without_registration: page.skippedWithoutRegistration }
           : {}),
-        guests: page.guests.map((g) => compactGuest(g, includeAnswers, answerLabels)),
+        ...(answerLabels.length > 0 && guests.length > 0 && !guests.some((g) => g.registration_answers)
+          ? {
+              answers_note:
+                `None of the registration answers matched ${JSON.stringify(answerLabels)}. Retry with ` +
+                'include_registration_answers: true to see every question and pick the right ones.',
+            }
+          : {}),
+        guests,
       };
+      // The model is shown only the first 20,000 chars of a result, and a Luma page cannot be split (the
+      // cursor resumes at a page boundary). If this one will not fit, say so instead of letting the tail be
+      // cut silently under a header that claims `count: N`.
+      const size = JSON.stringify(result).length;
+      if (size > MAX_RESULT_CHARS && maxGuests > 1) {
+        const smaller = Math.max(1, Math.floor(maxGuests / 2));
+        return {
+          success: false,
+          message:
+            `This page of ${guests.length} guests is too large to show (${size} chars; the answers are long free text). ` +
+            `Call luma_get_guests again with ${args?.cursor ? 'the SAME cursor' : 'no cursor'} and max_guests: ${smaller}, ` +
+            'and keep halving it if it is still too large.',
+        };
+      }
+      return result;
     } catch (error) {
       return lumaFailure(error, resolved);
     }

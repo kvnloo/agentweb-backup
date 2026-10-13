@@ -472,6 +472,104 @@ describe('LUMA_API_BASE_URL override', () => {
   });
 });
 
+describe('review fixes (second independent review)', () => {
+  const company = (label: string, type = 'company') => ({ label, question_type: type, question_id: 'q', value: { company: 'Acme', job_title: 'CMO' } });
+
+  it('answer_labels also matches by question type and by a URL value, not only the label text', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    const entry = {
+      ...guest('a', '2026-10-06T00:00:00Z'),
+      registration_answers: [
+        company('Where do you work?'),
+        { label: 'Your profile', question_type: 'url', question_id: 'q2', value: 'https://www.linkedin.com/in/x' },
+        { label: 'Shirt size', question_type: 'select', question_id: 'q3', value: 'M' },
+      ],
+    };
+    fetchMock.mockResolvedValue(jsonResponse({ entries: [entry], has_more: false }));
+    const r: any = await tool('luma_get_guests')({ event: 'evt-1', answer_labels: ['company', 'linkedin'] }, { userId: 'user-1' });
+    expect(r.guests[0].registration_answers.map((a: any) => a.label)).toEqual(['Where do you work?', 'Your profile']);
+  });
+
+  it('accepts answer_labels as a (comma-separated) string instead of silently returning no answers', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    fetchMock.mockResolvedValue(jsonResponse({ entries: [{ ...guest('a', '2026-10-06T00:00:00Z'), registration_answers: [company('Company')] }], has_more: false }));
+    const r: any = await tool('luma_get_guests')({ event: 'evt-1', answer_labels: 'company, linkedin' }, { userId: 'user-1' });
+    expect(r.guests[0].registration_answers).toHaveLength(1);
+  });
+
+  it('says so when answer_labels matched nothing, instead of returning bare guests in silence', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    fetchMock.mockResolvedValue(jsonResponse({ entries: [{ ...guest('a', '2026-10-06T00:00:00Z'), registration_answers: [{ label: 'Shirt size', question_type: 'select', question_id: 'q', value: 'M' }] }], has_more: false }));
+    const r: any = await tool('luma_get_guests')({ event: 'evt-1', answer_labels: ['company'] }, { userId: 'user-1' });
+    expect(r.answers_note).toMatch(/include_registration_answers/);
+  });
+
+  it('caps long free-text answers, and refuses a page that still cannot fit, telling the model how to retry', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    const long = (i: number) => ({
+      ...guest(`g${i}`, '2026-10-06T00:00:00Z'),
+      registration_answers: Array.from({ length: 8 }, (_, q) => ({ label: `Q${q}`, question_type: 'text', question_id: `q${q}`, value: 'x'.repeat(2000) })),
+    });
+    fetchMock.mockImplementation(async (url: any) => {
+      const limit = Number(new URL(String(url)).searchParams.get('pagination_limit'));
+      return jsonResponse({ entries: Array.from({ length: limit }, (_, i) => long(i)), has_more: true, next_cursor: 'c2' });
+    });
+    const big: any = await tool('luma_get_guests')({ event: 'evt-1', include_registration_answers: true, max_guests: 30, cursor: 'c1' }, { userId: 'user-1' });
+    expect(big.success).toBe(false);
+    expect(big.message).toMatch(/SAME cursor and max_guests: 15/);
+
+    const ok: any = await tool('luma_get_guests')({ event: 'evt-1', include_registration_answers: true, max_guests: 3 }, { userId: 'user-1' });
+    expect(ok.success).toBe(true);
+    expect(JSON.stringify(ok).length).toBeLessThan(20000);
+    expect(ok.guests[0].registration_answers[0].value).toMatch(/\[truncated\]$/);
+    fetchMock.mockReset();
+  });
+
+  it('stops paging at the first unregistered row (desc nulls last) instead of reading 25 pages of them', async () => {
+    const svc = new LumaApiService('k');
+    fetchMock.mockReset();
+    fetchMock.mockImplementation(async () =>
+      jsonResponse({ entries: [guest('a', '2026-10-06T00:00:00Z'), guest('n1', null), guest('n2', null)], has_more: true, next_cursor: 'c2' }),
+    );
+    const r = await svc.listGuests({ eventId: 'evt-1', maxGuests: 500 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(r.guests.map((g) => g.guest_id)).toEqual(['a']);
+    expect(r.has_more).toBe(false);
+    fetchMock.mockReset();
+  });
+
+  it('only honours the test base-URL override in development/test, never on an unknown NODE_ENV', async () => {
+    const prev = { n: process.env.NODE_ENV, u: process.env.LUMA_API_BASE_URL };
+    process.env.LUMA_API_BASE_URL = 'http://127.0.0.1:9999';
+    try {
+      for (const env of ['staging', 'prod', undefined]) {
+        if (env === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = env;
+        fetchMock.mockResolvedValueOnce(jsonResponse({ id: 'c', name: 'x' }));
+        await new LumaApiService('k').getCalendar();
+        expect(String(fetchMock.mock.calls.pop()![0])).toMatch(/^https:\/\/public-api\.luma\.com\//);
+      }
+    } finally {
+      process.env.NODE_ENV = prev.n;
+      if (prev.u === undefined) delete process.env.LUMA_API_BASE_URL; else process.env.LUMA_API_BASE_URL = prev.u;
+    }
+  });
+
+  it('the not-connected message is a well-formed sentence that carries the exact link', async () => {
+    mockGetAccounts.mockResolvedValue([]);
+    const r: any = await tool('luma_get_guests')({ event: 'evt-1' }, { userId: 'user-1' });
+    expect(r.message).toContain('[Settings → Login Credentials](/settings/login-credentials)');
+    expect((r.message.match(/\(/g) || []).length).toBe((r.message.match(/\)/g) || []).length);
+  });
+
+  it('the 429 message has no stray punctuation', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, { status: 429, headers: { 'retry-after': '42' } }));
+    const r: any = await tool('luma_list_events')({}, { userId: 'user-1' });
+    expect(r.message).toContain('Retry after 42s, then retry the same call.');
+    expect(r.message).not.toContain('.,');
+  });
+});
+
 describe('failure messages are classified as retryable where they should be', () => {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { classifyToolErrorClass } = require('../utils/toolErrorClassifier');
@@ -489,6 +587,15 @@ describe('failure messages are classified as retryable where they should be', ()
     const aborted = new Error('aborted'); aborted.name = 'AbortError';
     expect(await run(aborted)).toBe('timeout');
     expect(await run(new Error('getaddrinfo ENOTFOUND'))).toBe('network');
-    expect(await run(jsonResponse({}, { status: 401 }))).not.toBe('rate_limit');
+    const { isRetryableErrorClass } = require('../services/agentMode/core/errorRetryability');
+    expect(isRetryableErrorClass('rate_limit')).toBe(true);
+    // A rejected key must be a fast-trip, non-retryable class — and must stay one even when the calendar
+    // name looks like an HTTP status ("Founders 500 Club" would otherwise read as upstream_5xx).
+    mockGetAccounts.mockResolvedValue([lumaAccount({ account_name: 'Founders 500 Club' })]);
+    fetchMock.mockReset();
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, { status: 401 }));
+    const dead: any = await tool('luma_list_events')({}, { userId: 'user-1' });
+    expect(dead.errorClass).toBe('auth');
+    expect(isRetryableErrorClass(classifyToolErrorClass(Object.assign(new Error(dead.message), { toolErrorClass: dead.errorClass })))).toBe(false);
   });
 });

@@ -140,3 +140,26 @@ describe('reconciler over a MINIMIZED ledger — the live failure', () => {
     expect(out).toContain('20 row(s)');
   });
 });
+
+// ENG-2338: luma_get_guests / luma_list_events return their rows under `guests` / `events`. The row-key list
+// lives in unconsumedCursor.ts but the minimizer kept its own copy, so the notice said "0 row(s)" for a page
+// that had 35 — found in the branch preview, and "fixed" once in the wrong list.
+describe('Luma tools through the REAL minimizer', () => {
+  const lumaPage = (key: 'guests' | 'events', n: number) => ({
+    success: true,
+    count: n,
+    has_more: true,
+    next_cursor: 'c2',
+    [key]: Array.from({ length: n }, (_, i) => ({ id: `r-${i}` })),
+  });
+
+  it.each([
+    ['luma_get_guests', 'guests', 35],
+    ['luma_list_events', 'events', 12],
+  ] as const)('%s keeps its row count (not 0) when a cursor is left unread', (name, key, n) => {
+    const out = reconcileUnconsumedCursors('Here are the guests.', [ledgerEntry(name, {}, lumaPage(key, n))]);
+    expect(out).toContain(name);
+    expect(out).toContain(`${n} row(s)`);
+    expect(out).not.toContain('0 row(s)');
+  });
+});
