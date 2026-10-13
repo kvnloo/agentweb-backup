@@ -47,6 +47,7 @@ import { emitProgress, registerProgressCallback, getLatestProgress, progressStor
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { CHAT_BRANCHING_ENABLED_SETTING, isChatBranchingSettingEnabled } from '../services/agentMode/chatBranching';
 import { compareSaveAlternatives } from '../services/agentMode/compareSaveAlternativesInstance';
+import { LEGACY_MODEL_ALIASES } from '../services/agentMode/llmModelRegistry';
 import { resolveRunFunding } from '../services/funding/runFunding';
 import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError, isProviderUnavailableError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
@@ -10832,6 +10833,10 @@ export const agentModeController = {
         usagePolicyVersion: usage.policy?.version || null,
         chatBranchingEnabled,
         compareSaveAlternatives: compareSaveAlternativesEnabled,
+        // Retired model id -> current id: the same map resolveGenerationModel/normalizeModelId apply to pinned
+        // sessions and schedules. Additive; lets clients show the renamed model for an old pin instead of
+        // keeping their own hand-copied list. A copy, so nothing downstream can mutate the registry's map.
+        legacyModelAliases: { ...LEGACY_MODEL_ALIASES },
       });
     } catch (error) {
       console.error('AgentMode: Get model options error:', error);
