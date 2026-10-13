@@ -41,9 +41,13 @@ export function describeScheduledRunFailureReasons(
     reasons.push('LinkedIn invite send requirement not met');
   }
   if (run.workPlanCompleted === false) reasons.push('work plan not completed');
-  if (!run.content || !String(run.content).trim()) reasons.push('empty final response');
 
   const hasMisses = (run.functionCallMisses?.length ?? 0) > 0 || (run.keywordMisses?.length ?? 0) > 0;
+  // Empty assistant text is normal for tool-call-only turns, so it only names the
+  // failure when nothing more specific does.
+  if (reasons.length === 0 && !hasMisses && (!run.content || !String(run.content).trim())) {
+    reasons.push('empty final response');
+  }
   if (reasons.length === 0 && !hasMisses) {
     reasons.push(
       `run did not succeed after ${run.attempts ?? 'unknown'} attempt(s) with no missed tool or keyword recorded ` +

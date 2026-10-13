@@ -15,9 +15,15 @@ describe('describeScheduledRunFailureReasons (ENG-1735)', () => {
     ]);
   });
 
-  it('names an incomplete work plan and empty output', () => {
+  it('names an incomplete work plan without blaming empty tool-call-only output', () => {
     const reasons = describeScheduledRunFailureReasons({ ...base, content: '  ', workPlanCompleted: false });
-    expect(reasons).toEqual([expect.stringMatching(/work plan not completed/), expect.stringMatching(/empty final response/)]);
+    expect(reasons).toEqual([expect.stringMatching(/work plan not completed/)]);
+  });
+
+  it('names empty output only when nothing more specific explains the failure', () => {
+    expect(describeScheduledRunFailureReasons({ ...base, content: '' })).toEqual([
+      expect.stringMatching(/empty final response/),
+    ]);
   });
 
   it('names press-budget and linkedIn markers', () => {
