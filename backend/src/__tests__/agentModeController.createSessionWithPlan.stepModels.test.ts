@@ -48,8 +48,12 @@ jest.mock('../services/generateMarketingResponseWorkerService', () => ({
 }));
 let mockSwitch = true;
 let mockSwitchReads = 0;
+let mockUnknown = false;
 jest.mock('../services/agentMode/workPlanStepModelsInstance', () => ({
-  workPlanStepModels: { isEnabled: jest.fn(async () => { mockSwitchReads += 1; return mockSwitch; }) },
+  workPlanStepModels: {
+    isEnabled: jest.fn(async () => { mockSwitchReads += 1; return mockSwitch; }),
+    shouldHonor: jest.fn(async () => { mockSwitchReads += 1; return mockSwitch || mockUnknown; }),
+  },
 }));
 
 const db = chatbotDb as jest.Mocked<typeof chatbotDb>;
@@ -71,6 +75,7 @@ const REG = new Set(['gpt-5-chat', 'gemini-3-pro-preview', 'admin-only-model', '
 beforeEach(() => {
   jest.clearAllMocks();
   mockSwitch = true;
+  mockUnknown = false;
   mockSwitchReads = 0;
   process.env.CUSTOMER_FRONTEND_URL = 'http://localhost:5174';
   wps.getWorkPlansByOwner.mockResolvedValue([]);
@@ -174,4 +179,33 @@ describe('createSessionWithPlan with per-step models', () => {
     expect(mockSwitchReads).toBe(0);
     expect((db.updateSessionWorkPlan.mock.calls[0][1].steps as any[]).every((s) => !('model' in s))).toBe(true);
   });
+
+  it('records launchModel (and planDefaultModel when the plan pins one) for the model-less steps to fall back to', async () => {
+    publish([S(1, 'gemini-3-pro-preview'), S(2)], { defaultModel: 'gpt-5-chat' });
+    await agentModeController.createSessionWithPlan(req(), res());
+    expect(db.updateSessionWorkPlan.mock.calls[0][1]).toMatchObject({ planDefaultModel: 'gpt-5-chat', launchModel: 'gpt-5-chat' });
+    jest.clearAllMocks();
+    publish([S(1, 'gemini-3-pro-preview'), S(2)]);
+    await agentModeController.createSessionWithPlan(req(), res());
+    const wp = db.updateSessionWorkPlan.mock.calls[0][1] as any;
+    expect(wp.launchModel).toBe('gpt-5-chat'); // the account default the session starts on
+    expect('planDefaultModel' in wp).toBe(false);
+  });
+
+  it('a plan without step models records neither', async () => {
+    publish([S(1), S(2)], { defaultModel: 'gpt-5-chat' });
+    await agentModeController.createSessionWithPlan(req(), res());
+    const wp = db.updateSessionWorkPlan.mock.calls[0][1] as any;
+    expect('launchModel' in wp).toBe(false);
+  });
+
+  it('switch state UNKNOWN still validates and copies step models', async () => {
+    mockSwitch = false;
+    mockUnknown = true;
+    publish([S(1, 'retired-9')]);
+    const r = res();
+    await agentModeController.createSessionWithPlan(req(), r);
+    expect(r.status).toHaveBeenCalledWith(422);
+  });
 });
+

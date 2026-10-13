@@ -279,6 +279,6 @@ export function isStepModelUnavailableError(error: unknown): error is StepModelU
 
 /** Text shown in the chat when a plan is paused because the current step's model is no longer served. */
 export function buildStepModelPausedMessage(stepCount: number, modelLabel: string): string {
-  return `Step ${stepCount} uses ${modelLabel}, which is no longer available. Pick another model for this step to continue. `
+  return `Step ${stepCount} uses ${modelLabel}, which is no longer available. Choose another model in the model picker and send again to resume this step. `
     + 'The plan is paused and nothing was sent to a different model.';
 }

@@ -531,8 +531,9 @@ export async function applyPredefinedWorkPlan(
     // launching user must be able to select it, or the whole launch is refused with no state written.
     // (Lazy import: this module must not load settingsService at module scope -- see the isolation test.)
     // Only plans that carry a step model read the switch at all.
+    // A stored step model is honoured unless the switch is definitely off (an unknown state after a settings outage is not "off").
     const stepModelsEnabled = anyStepCarriesModel(predefinedPlan.steps)
-      && await (await import('../../services/agentMode/workPlanStepModelsInstance')).workPlanStepModels.isEnabled();
+      && await (await import('../../services/agentMode/workPlanStepModelsInstance')).workPlanStepModels.shouldHonor();
     let planPinnedModel: string | undefined;
     let stepModelIds = new Map<number, string>();
     try {
@@ -677,6 +678,11 @@ export async function applyPredefinedWorkPlan(
       autocomplete: shouldForceScheduledAutocomplete(session, options?.isUnattendedRun) ? true : (predefinedPlan.autocomplete || false),
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
+      // ENG-2378: what a step WITHOUT a model falls back to: the plan default, then the model the session had before.
+      ...(stepModelIds.size > 0 && {
+        ...(planPinnedModel && { planDefaultModel: planPinnedModel }),
+        ...(session.llmModel && { launchModel: session.llmModel }),
+      }),
       // ENG-1472: which predefined template this session's plan was launched
       // from, so a completed run can traceably chain into its author-approved
       // "next plan" suggestions and so the accept endpoint can idempotently

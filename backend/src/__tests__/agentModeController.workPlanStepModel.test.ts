@@ -17,6 +17,7 @@ jest.mock('../services/chatbotService', () => ({
     getChatSessionRecord: jest.fn(),
     getMostRecentRealUserMessage: jest.fn(),
     updateSessionLlmModel: jest.fn(),
+    updateSessionWorkPlan: jest.fn(),
     addMessageToSession: jest.fn(),
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
@@ -92,8 +93,12 @@ jest.mock('../utils/agentModeErrors', () => ({
 }));
 let mockSwitch = true;
 let mockSwitchReads = 0;
+let mockUnknown = false;
 jest.mock('../services/agentMode/workPlanStepModelsInstance', () => ({
-  workPlanStepModels: { isEnabled: jest.fn(async () => { mockSwitchReads += 1; return mockSwitch; }) },
+  workPlanStepModels: {
+    isEnabled: jest.fn(async () => { mockSwitchReads += 1; return mockSwitch; }),
+    shouldHonor: jest.fn(async () => { mockSwitchReads += 1; return mockSwitch || mockUnknown; }),
+  },
 }));
 const mockIoEmit = jest.fn();
 const mockIoTo = jest.fn().mockReturnValue({ emit: mockIoEmit });
@@ -150,6 +155,7 @@ beforeEach(() => {
   activeSessionGenerations.clear();
   autoContinuationSessions.clear();
   mockSwitch = true;
+  mockUnknown = false;
   mockSwitchReads = 0;
   mockPolicy.mockResolvedValue({ billingUserId: OWNER, policy: null, costUsedMicroUsd: 0, tokenUsed: 0, mode: FULL_CHOICE });
   mockUsage.mockResolvedValue({ allowed: true, warning: false, used: 0, allowance: null, bonus: 0, effectiveAllowance: null, percentUsed: 0, month: '2026-10' });
@@ -162,6 +168,7 @@ beforeEach(() => {
   db.addMessagesToSession.mockResolvedValue(undefined as any);
   db.updateSessionTitle.mockResolvedValue(undefined as any);
   db.updateSessionLlmModel.mockResolvedValue(makeSession(undefined) as any);
+  db.updateSessionWorkPlan.mockResolvedValue(makeSession(undefined) as any);
   worker.runInWorker.mockResolvedValue(workerResult() as any);
 });
 
@@ -190,7 +197,6 @@ describe('interactive turn: the pending step\'s model wins', () => {
     db.getChatSession.mockResolvedValue(makeSession({ steps: [step(1, 'pending'), step(2, 'pending', 'gpt-5.5')] }) as any);
     await agentModeController.generateResponse(generateReq('gemini-3.5-flash'), makeRes());
     expect(workerModels()).toEqual(['gemini-3.5-flash']);
-    expect(mockSwitchReads).toBe(0);
   });
 
   it('a session without a work plan, and a plan whose steps are all done, are unaffected', async () => {
@@ -230,7 +236,7 @@ describe('mid-plan retirement: pause, never swap', () => {
     expect(worker.runInWorker).not.toHaveBeenCalled(); // no LLM call on ANY model
     expect(res.statusCode).toBe(200);
     expect(res.body.content).toBe(
-      `Step 2 uses ${RETIRED}, which is no longer available. Pick another model for this step to continue. The plan is paused and nothing was sent to a different model.`,
+      `Step 2 uses ${RETIRED}, which is no longer available. Choose another model in the model picker and send again to resume this step. The plan is paused and nothing was sent to a different model.`,
     );
     const assistantWrites = db.addMessageToSession.mock.calls.filter((c) => (c[1] as any).role === 'assistant');
     expect(assistantWrites).toHaveLength(1);
@@ -372,5 +378,148 @@ describe('automatic work-plan continuation', () => {
     await agentModeController.generateResponse(generateReq('gemini-3.5-flash'), makeRes());
     await flush();
     expect(workerModels()).toEqual(['gemini-3.5-flash', 'gemini-3.5-flash']);
+  });
+});
+
+// ---- ENG-2378 review fixes ------------------------------------------------------------------------------------
+
+describe('an explicit model pick resumes a paused step (finding 2)', () => {
+  const plan = (extra: any = {}) => ({ steps: [step(1, 'completed', 'gpt-5.5'), step(2, 'pending', RETIRED)], ...extra });
+
+  it('a request model that differs from the stored stamp overrides the UNAVAILABLE step model: the turn runs on it, the step is updated, the session stamped', async () => {
+    db.getChatSession.mockResolvedValue(makeSession(plan(), 'gemini-3.5-flash') as any);
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq('claude-step-model'), res);
+    expect(res.statusCode).toBe(200);
+    expect(workerModels()).toEqual(['claude-step-model']);
+    const written = db.updateSessionWorkPlan.mock.calls.map((c) => c[1] as any);
+    expect(written[written.length - 1].steps[1].model).toBe('claude-step-model');
+    expect(written[written.length - 1].steps[0].model).toBe('gpt-5.5'); // finished step untouched
+    const stamps = db.updateSessionLlmModel.mock.calls;
+    expect(stamps[stamps.length - 1][1]).toBe('claude-step-model');
+    expect(mockAlert).not.toHaveBeenCalled();
+    expect(db.addMessageToSession.mock.calls.some((c) => (c[1] as any).metadata?.kind === 'work-plan-step-model-unavailable')).toBe(false);
+  });
+
+  it('no explicit pick (the request just echoes the stored stamp): still paused, and the message says how to resume', async () => {
+    db.getChatSession.mockResolvedValue(makeSession(plan(), 'gemini-3.5-flash') as any);
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq('gemini-3.5-flash'), res);
+    expect(worker.runInWorker).not.toHaveBeenCalled();
+    expect(res.body.content).toContain('Choose another model in the model picker and send again');
+    expect(db.updateSessionWorkPlan).not.toHaveBeenCalled();
+  });
+
+  it('an explicit pick that is itself unavailable is a 422 and nothing runs or is written', async () => {
+    db.getChatSession.mockResolvedValue(makeSession(plan(), 'gemini-3.5-flash') as any);
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq('another-retired-9'), res);
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toMatchObject({ code: 'model_unavailable' });
+    expect(worker.runInWorker).not.toHaveBeenCalled();
+    expect(db.updateSessionWorkPlan).not.toHaveBeenCalled();
+  });
+
+  it('an AVAILABLE step model still wins over an explicit pick (the picker cannot override a working step)', async () => {
+    db.getChatSession.mockResolvedValue(makeSession({ steps: [step(1, 'pending', 'gpt-5.5')] }, 'gpt-5.5') as any);
+    await agentModeController.generateResponse(generateReq('claude-step-model'), makeRes());
+    expect(workerModels()).toEqual(['gpt-5.5']);
+    expect(db.updateSessionWorkPlan.mock.calls.every((c) => (c[1] as any).steps[0].model === 'gpt-5.5')).toBe(true);
+  });
+});
+
+describe('a step WITHOUT a model: plan default, then the pre-plan model (finding 3)', () => {
+  const twoStep = (extra: any = {}) => ({ steps: [step(1, 'completed', 'gpt-5.5'), step(2, 'pending')], ...extra });
+
+  it('interactive: step 2 (no model) does NOT inherit step 1\'s model; plan defaultModel wins over launchModel', async () => {
+    db.getChatSession.mockResolvedValue(makeSession(twoStep({ planDefaultModel: 'gemini-3.5-flash', launchModel: 'gpt-5-chat-2' }), 'gpt-5.5') as any);
+    await agentModeController.generateResponse(generateReq('gpt-5.5'), makeRes()); // the portal echoes the stamp
+    expect(workerModels()).toEqual(['gemini-3.5-flash']);
+    const stamps = db.updateSessionLlmModel.mock.calls;
+    expect(stamps[stamps.length - 1][1]).toBe('gemini-3.5-flash');
+  });
+
+  it('falls back to launchModel (the model the session had before the plan) when the plan has no default', async () => {
+    db.getChatSession.mockResolvedValue(makeSession(twoStep({ launchModel: 'gpt-5-chat-2' }), 'gpt-5.5') as any);
+    await agentModeController.generateResponse(generateReq('gpt-5.5'), makeRes());
+    expect(workerModels()).toEqual(['gpt-5-chat-2']);
+  });
+
+  it('a plan that never recorded either (legacy / pre-fix session) keeps today\'s behaviour: the request model', async () => {
+    db.getChatSession.mockResolvedValue(makeSession(twoStep(), 'gpt-5.5') as any);
+    await agentModeController.generateResponse(generateReq('gpt-5.5'), makeRes());
+    expect(workerModels()).toEqual(['gpt-5.5']);
+  });
+
+  it('an explicit pick (differs from the stamp) on a model-less step wins', async () => {
+    db.getChatSession.mockResolvedValue(makeSession(twoStep({ planDefaultModel: 'gemini-3.5-flash' }), 'gpt-5.5') as any);
+    await agentModeController.generateResponse(generateReq('claude-step-model'), makeRes());
+    expect(workerModels()).toEqual(['claude-step-model']);
+  });
+
+  it('a plan with no step models at all is untouched even if it carries launch fields', async () => {
+    db.getChatSession.mockResolvedValue(makeSession({ steps: [step(1, 'pending')], planDefaultModel: 'gemini-3.5-flash' }, 'gpt-5.5') as any);
+    await agentModeController.generateResponse(generateReq('gpt-5.5'), makeRes());
+    expect(workerModels()).toEqual(['gpt-5.5']);
+    expect(mockSwitchReads).toBe(0);
+  });
+
+  it('continuation: a model-less next step runs on the fallback, not on the original request model nor the previous step\'s', async () => {
+    const stall = (wp: any) => { db.getChatSession.mockResolvedValue(makeSession(wp, 'gpt-5.5') as any); db.getChatSessionRecord.mockResolvedValue(makeSession(wp, 'gpt-5.5') as any); };
+    const wp = (steps: any[]) => ({ autocomplete: true, launchModel: 'gpt-5-chat-2', steps });
+    stall(wp([step(1, 'pending', 'gpt-5.5'), step(2, 'pending')]));
+    worker.runInWorker
+      .mockImplementationOnce(async () => { stall(wp([step(1, 'completed', 'gpt-5.5'), step(2, 'pending')])); return workerResult('s1 done', []) as any; })
+      .mockImplementationOnce(async () => { stall(wp([step(1, 'completed', 'gpt-5.5'), step(2, 'completed')])); return workerResult('done', []) as any; });
+    await agentModeController.generateResponse(generateReq('gemini-3.5-flash'), makeRes());
+    await flush();
+    expect(workerModels()).toEqual(['gpt-5.5', 'gpt-5-chat-2']);
+    const stamps = db.updateSessionLlmModel.mock.calls.map((c) => c[1]);
+    expect(stamps[stamps.length - 1]).toBe('gpt-5-chat-2'); // the stamp is exactly what ran
+  });
+});
+
+describe('end of plan: the pre-plan model is restored unless the user picked one (finding 5)', () => {
+  const done = (extra: any = {}) => ({ steps: [step(1, 'completed', 'gpt-5.5')], launchModel: 'gemini-3.5-flash', engineModel: 'gpt-5.5', ...extra });
+
+  it('restores launchModel on the next turn, stamps it, and clears the marker', async () => {
+    db.getChatSession.mockResolvedValue(makeSession(done(), 'gpt-5.5') as any);
+    await agentModeController.generateResponse(generateReq('gpt-5.5'), makeRes());
+    expect(workerModels()).toEqual(['gemini-3.5-flash']);
+    const stamps = db.updateSessionLlmModel.mock.calls;
+    expect(stamps[stamps.length - 1][1]).toBe('gemini-3.5-flash');
+    const written = db.updateSessionWorkPlan.mock.calls.map((c) => c[1] as any);
+    expect(written[written.length - 1].engineModel).toBeUndefined();
+  });
+
+  it('an explicit pick during the plan wins: the stamp no longer equals the engine\'s model, so nothing is restored', async () => {
+    db.getChatSession.mockResolvedValue(makeSession(done(), 'claude-step-model') as any);
+    await agentModeController.generateResponse(generateReq('claude-step-model'), makeRes());
+    expect(workerModels()).toEqual(['claude-step-model']);
+  });
+
+  it('an explicit pick in the request itself wins too', async () => {
+    db.getChatSession.mockResolvedValue(makeSession(done(), 'gpt-5.5') as any);
+    await agentModeController.generateResponse(generateReq('claude-step-model'), makeRes());
+    expect(workerModels()).toEqual(['claude-step-model']);
+  });
+
+  it('runs once: after the marker is cleared nothing is restored again', async () => {
+    db.getChatSession.mockResolvedValue(makeSession(done({ engineModel: undefined }), 'gpt-5.5') as any);
+    await agentModeController.generateResponse(generateReq('gpt-5.5'), makeRes());
+    expect(workerModels()).toEqual(['gpt-5.5']);
+  });
+});
+
+describe('switch state UNKNOWN (settings outage, no last-known value) honours the stored model (finding 7a)', () => {
+  it('unknown: a stored step model is honoured; a definite off still ignores it', async () => {
+    mockSwitch = false;
+    mockUnknown = true;
+    db.getChatSession.mockResolvedValue(makeSession({ steps: [step(1, 'pending', 'gpt-5.5')] }) as any);
+    await agentModeController.generateResponse(generateReq('gemini-3.5-flash'), makeRes());
+    expect(workerModels()).toEqual(['gpt-5.5']);
+    mockUnknown = false;
+    await agentModeController.generateResponse(generateReq('gemini-3.5-flash'), makeRes());
+    expect(workerModels()).toEqual(['gpt-5.5', 'gemini-3.5-flash']);
   });
 });

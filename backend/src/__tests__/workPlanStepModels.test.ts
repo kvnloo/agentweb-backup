@@ -50,8 +50,12 @@ jest.mock('../services/workPlanThumbnailService', () => ({
 }));
 let mockSwitch = true;
 let mockSwitchReads = 0;
+let mockUnknown = false;
 jest.mock('../services/agentMode/workPlanStepModelsInstance', () => ({
-  workPlanStepModels: { isEnabled: jest.fn(async () => { mockSwitchReads += 1; return mockSwitch; }) },
+  workPlanStepModels: {
+    isEnabled: jest.fn(async () => { mockSwitchReads += 1; return mockSwitch; }),
+    shouldHonor: jest.fn(async () => { mockSwitchReads += 1; return mockSwitch || mockUnknown; }),
+  },
 }));
 let mockIsAdminCaller = false;
 jest.mock('../middleware/auth', () => ({
@@ -156,6 +160,28 @@ describe('the switch (work_plan_step_models_enabled)', () => {
     expect(getSetting).toHaveBeenCalledTimes(2);
     advance(5_000); // retry succeeds with 'false'
     expect(await sw.isEnabled()).toBe(false);
+  });
+
+  it('getState: a cold-start outage is UNKNOWN (honoured), a definite false is OFF (ignored), true is ON', async () => {
+    const outage = make([new Error('ddb down')]);
+    expect(await outage.sw.getState()).toBe('unknown');
+    expect(await outage.sw.shouldHonor()).toBe(true);
+    expect(await outage.sw.isEnabled()).toBe(false);
+    const off = make([{ settingValue: 'false' }]);
+    expect(await off.sw.getState()).toBe('off');
+    expect(await off.sw.shouldHonor()).toBe(false);
+    const absent = make([null]);
+    expect(await absent.sw.getState()).toBe('off');
+    const on = make([{ settingValue: 'true' }]);
+    expect(await on.sw.getState()).toBe('on');
+    expect(await on.sw.shouldHonor()).toBe(true);
+  });
+
+  it('getState: once a read has succeeded, a later outage keeps that value (never falls back to unknown)', async () => {
+    const { sw, advance } = make([{ settingValue: 'false' }, new Error('blip')]);
+    expect(await sw.getState()).toBe('off');
+    advance(61_000);
+    expect(await sw.getState()).toBe('off');
   });
 
   it('parallel callers share one in-flight read', async () => {
@@ -353,6 +379,7 @@ describe('plan write routes: round trip of step.model', () => {
     jest.clearAllMocks();
     mockStore.clear();
     mockSwitch = true;
+    mockUnknown = false;
     mockSwitchReads = 0;
     mockIsAdminCaller = true;
     getUser.mockResolvedValue({ userId: 'user-1', isAdmin: false });
@@ -623,4 +650,30 @@ describe('applyPredefinedWorkPlan (launch / accept / scheduled launch core)', ()
       expect((db.updateSessionWorkPlan.mock.calls[0][1].steps as any[]).every((s) => !('model' in s))).toBe(true);
     }
   });
+
+  it('records the plan default and the pre-plan session model so a model-less step has something to fall back to', async () => {
+    db.getChatSession.mockResolvedValue({ sessionId: 's1', messages: [], llmModel: 'claude-sonnet-x' } as any);
+    const r: any = await launch(plan([S(1, 'gpt-5-chat'), S(2)], { defaultModel: 'gpt-5-chat' }));
+    expect(r.success).toBe(true);
+    expect(db.updateSessionWorkPlan.mock.calls[0][1]).toMatchObject({ planDefaultModel: 'gpt-5-chat', launchModel: 'claude-sonnet-x' });
+  });
+
+  it('a plan without step models records neither (unchanged session shape)', async () => {
+    db.getChatSession.mockResolvedValue({ sessionId: 's1', messages: [], llmModel: 'claude-sonnet-x' } as any);
+    await launch(plan([S(1), S(2)], { defaultModel: 'gpt-5-chat' }));
+    const wp = db.updateSessionWorkPlan.mock.calls[0][1] as any;
+    expect('launchModel' in wp).toBe(false);
+    expect('planDefaultModel' in wp).toBe(false);
+  });
+
+  it('switch state UNKNOWN (settings outage): step models are still validated and copied; only a definite off ignores them', async () => {
+    mockSwitch = false;
+    mockUnknown = true;
+    const bad: any = await launch(plan([S(1, 'retired-9')]));
+    expect(bad.errorType).toBe('model_unavailable');
+    const ok: any = await launch(plan([S(1, 'gpt-5-chat')]));
+    expect(ok.success).toBe(true);
+    expect((db.updateSessionWorkPlan.mock.calls[0][1].steps as any[])[0].model).toBe('gpt-5-chat');
+  });
 });
+

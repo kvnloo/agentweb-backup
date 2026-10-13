@@ -270,6 +270,12 @@ export interface ChatSession {
     }>;
     createdAt: string;
     updatedAt: string;
+    // ENG-2378 (only written for plans whose steps carry a model): the plan's default pin and the model the session
+    // had before the plan started (what a step WITHOUT a model falls back to), and the model the engine last stamped
+    // (so a user's explicit pick during the plan can be told apart when the plan ends).
+    planDefaultModel?: string;
+    launchModel?: string;
+    engineModel?: string;
     welcomeMessage?: string; // Custom welcome message for this work plan
     autocomplete?: boolean; // When true, Emma MUST complete each step before responding to the user
     // ENG-1472: the predefined WorkPlan template (AW-WorkPlans planId) this
@@ -3890,6 +3896,10 @@ export class ChatbotDB {
       updatedAt: string;
       welcomeMessage?: string;
       autocomplete?: boolean;
+      /** ENG-2378: see the matching fields on the read-side workPlan type above. */
+      planDefaultModel?: string;
+      launchModel?: string;
+      engineModel?: string;
       /** ENG-1472: see the matching field on the read-side workPlan type above. */
       templatePlanId?: string;
       /** ENG-1811: see the matching field on the read-side workPlan type above. */
