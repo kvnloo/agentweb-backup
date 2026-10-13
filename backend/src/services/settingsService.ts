@@ -319,6 +319,42 @@ export class SettingsService {
     void recordSettingChange(settingName, 'set', settingValue);
   }
 
+  /**
+   * Create a setting only if no row exists. Returns false (and writes nothing) when one
+   * does, so two concurrent callers can never both win.
+   */
+  async setSettingIfAbsent(
+    settingName: string,
+    settingValue: string,
+    description?: string,
+    updatedBy: string = 'system',
+    ttl?: number,
+  ): Promise<boolean> {
+    if (ttl !== undefined && !Number.isFinite(ttl)) {
+      throw new Error(`Invalid ttl for setting "${settingName}": must be a finite epoch-second number, got ${ttl}`);
+    }
+    const setting: Setting = {
+      settingName,
+      settingValue,
+      description,
+      updatedAt: new Date().toISOString(),
+      updatedBy,
+      ...(ttl !== undefined ? { ttl } : {}),
+    };
+    try {
+      await dynamodb.put({
+        TableName: this.tableName,
+        Item: setting,
+        ConditionExpression: 'attribute_not_exists(settingName)',
+      }).promise();
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return false;
+      throw error;
+    }
+    void recordSettingChange(settingName, 'set', settingValue);
+    return true;
+  }
+
   /** Delete counterpart of `setSettingIfValueMatches` — see its doc comment. */
   async deleteSettingIfValueMatches(settingName: string, expectedValue: string): Promise<void> {
     await dynamodb.delete({

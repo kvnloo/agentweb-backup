@@ -18,7 +18,9 @@ import type { ClaimClass, FinalizeLedgerEntry } from '../../services/agentMode/c
 const ok = (toolName: string, result: any = { success: true }): FinalizeLedgerEntry => ({ toolName, status: 'success', result });
 const err = (toolName: string): FinalizeLedgerEntry => ({ toolName, status: 'error', result: { error: 'failed' } });
 const encodedFail = (toolName: string): FinalizeLedgerEntry => ({ toolName, status: 'success', result: { success: false, error: 'quota' } });
-const claims = (...classes: ClaimClass[]) => classes.map((claimClass) => ({ claimClass }));
+// The recorded judge always returns a well-formed claim (class + quoted statement), so this eval isolates prefilter and
+// matcher error. It cannot detect a live judge that stops emitting statements; only the live script can.
+const claims = (...classes: ClaimClass[]) => classes.map((claimClass) => ({ claimClass, statement: 'human-labelled claim in the reply' }));
 
 export const FINALIZE_JUDGE_CASES: JudgeAccuracyCase[] = [
   // ── email_sent ──

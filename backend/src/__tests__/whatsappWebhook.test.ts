@@ -31,6 +31,12 @@ jest.mock('../services/whatsappService', () => ({
 jest.mock('../services/whatsappVerificationService', () => ({
   handleVerificationMessage: jest.fn(),
 }));
+jest.mock('../services/approvalChannelNotifier', () => ({
+  handleApprovalButtonTap: jest.fn(),
+}));
+jest.mock('../services/whatsappInboundSupport', () => ({
+  handleUnrecognizedMessage: jest.fn(),
+}));
 jest.mock('../utils/secretsManager', () => ({
   getWhatsAppCredentials: jest.fn(),
 }));
@@ -43,6 +49,8 @@ const {
   sendOptOutConfirmation,
 } = require('../services/whatsappService');
 const { handleVerificationMessage } = require('../services/whatsappVerificationService');
+const { handleApprovalButtonTap } = require('../services/approvalChannelNotifier');
+const { handleUnrecognizedMessage } = require('../services/whatsappInboundSupport');
 const { getWhatsAppCredentials } = require('../utils/secretsManager');
 
 import whatsappWebhookRouter from '../routes/whatsappWebhook';
@@ -225,6 +233,53 @@ describe('POST — inbound messages', () => {
   it('treats stop keywords case- and whitespace-insensitively', async () => {
     await post(inboundPayload('  stop  '));
     expect(recordOptOut).toHaveBeenCalledWith('+14155550123');
+  });
+
+  it.each(['Stop.', 'STOP!', 'please stop', 'Stop please.', 'stop all'])(
+    'treats %s as an opt-out',
+    async (text) => {
+      await post(inboundPayload(text));
+      expect(recordOptOut).toHaveBeenCalledWith('+14155550123');
+    },
+  );
+
+  it.each([
+    'Stop 🛑',
+    'stop 👋',
+    'ＳＴＯＰ',
+    'stop…',
+    '"stop"',
+    'STOP\u200b',
+    'Stop 。',
+    'stop  all',
+    '  STOP\n  ',
+  ])('treats %j as an opt-out (emoji, quotes, fullwidth and zero-width noise)', async (text) => {
+    await post(inboundPayload(text));
+    expect(recordOptOut).toHaveBeenCalledWith('+14155550123');
+  });
+
+  it.each(['cancel my order', 'please stop by the office tomorrow', "don't stop", 'stop 2 items', 'what is the end date'])(
+    'does NOT treat %j as an opt-out',
+    async (text) => {
+      await post(inboundPayload(text));
+      expect(recordOptOut).not.toHaveBeenCalled();
+    },
+  );
+
+  it('logs a FAILED delivery receipt by message id and never opens a window', async () => {
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    await post(statusPayload('failed'));
+    expect(errSpy.mock.calls.flat().join(' ')).toMatch(/…[\w.]+ FAILED to deliver/);
+    expect(errSpy.mock.calls.flat().join(' ')).not.toContain('4155550123');
+    expect(recordInboundMessage).not.toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it('stays quiet for a delivered receipt', async () => {
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    await post(statusPayload('delivered'));
+    expect(errSpy).not.toHaveBeenCalled();
+    errSpy.mockRestore();
   });
 
   it('records an opt-in on UNSTOP', async () => {
@@ -423,5 +478,162 @@ describe('POST — number verification', () => {
   it('200s when verification completes, whatever the outcome it chose to reply with', async () => {
     handleVerificationMessage.mockResolvedValue(true);
     expect((await post(inboundPayload('Verify K7Q2M9XA'))).status).toBe(200);
+  });
+});
+
+describe('POST — tapped buttons', () => {
+  const post = (body: string) =>
+    request(app)
+      .post('/api/webhooks/whatsapp')
+      .set('X-Hub-Signature-256', sign(body))
+      .set('Content-Type', 'application/json')
+      .send(body);
+
+  const envelope = (msg: any) =>
+    JSON.stringify({
+      object: 'whatsapp_business_account',
+      entry: [
+        { id: 'W', changes: [{ field: 'messages', value: { messaging_product: 'whatsapp', messages: [msg] } }] },
+      ],
+    });
+
+  const base = { from: '14155550123', id: 'wamid.IN', timestamp: '1' };
+
+  it('routes a non-template reply button, keeping the id we set', async () => {
+    await post(
+      envelope({
+        ...base,
+        type: 'interactive',
+        context: { from: 'biz', id: 'wamid.APPROVAL' },
+        interactive: { type: 'button_reply', button_reply: { id: 'approve', title: 'Approve' } },
+      }),
+    );
+    expect(handleApprovalButtonTap).toHaveBeenCalledWith({
+      phone: '+14155550123',
+      approvalMessageId: 'wamid.APPROVAL',
+      action: 'approve',
+    });
+  });
+
+  it('routes a TEMPLATE quick-reply, where Meta sends back the label', async () => {
+    await post(
+      envelope({
+        ...base,
+        type: 'button',
+        context: { from: 'biz', id: 'wamid.APPROVAL' },
+        button: { payload: 'Approve', text: 'Approve' },
+      }),
+    );
+    expect(handleApprovalButtonTap).toHaveBeenCalledWith({
+      phone: '+14155550123',
+      approvalMessageId: 'wamid.APPROVAL',
+      action: 'Approve',
+    });
+  });
+
+  it('ignores a tap with no context — it cannot be attributed to anything', async () => {
+    await post(
+      envelope({
+        ...base,
+        type: 'interactive',
+        interactive: { type: 'button_reply', button_reply: { id: 'approve', title: 'Approve' } },
+      }),
+    );
+    expect(handleApprovalButtonTap).not.toHaveBeenCalled();
+  });
+
+  it('still opens the service window for a tap', async () => {
+    // The tap is a user message; treating it otherwise would leave us unable to reply.
+    await post(
+      envelope({
+        ...base,
+        type: 'button',
+        context: { from: 'biz', id: 'wamid.APPROVAL' },
+        button: { payload: 'Approve', text: 'Approve' },
+      }),
+    );
+    expect(recordInboundMessage).toHaveBeenCalledWith('+14155550123');
+  });
+
+  it('does not hand a tap to the verification parser', async () => {
+    await post(
+      envelope({
+        ...base,
+        type: 'button',
+        context: { from: 'biz', id: 'wamid.APPROVAL' },
+        button: { payload: 'Approve', text: 'Approve' },
+      }),
+    );
+    expect(handleVerificationMessage).not.toHaveBeenCalled();
+  });
+
+  it('leaves ordinary text alone', async () => {
+    await post(inboundPayload('hello there'));
+    expect(handleApprovalButtonTap).not.toHaveBeenCalled();
+    expect(handleVerificationMessage).toHaveBeenCalled();
+  });
+});
+
+describe('POST — messages that are not commands', () => {
+  const post = (body: string) =>
+    request(app)
+      .post('/api/webhooks/whatsapp')
+      .set('X-Hub-Signature-256', sign(body))
+      .set('Content-Type', 'application/json')
+      .send(body);
+
+  it('hands an ordinary message to the support hand-off', async () => {
+    (handleVerificationMessage as jest.Mock).mockResolvedValue(false);
+    await post(inboundPayload('hi'));
+    // replaced below with the media-aware assertion
+  });
+
+  it('passes a media message\'s caption and where to find the file to the hand-off', async () => {
+    (handleVerificationMessage as jest.Mock).mockResolvedValue(false);
+    await post(
+      JSON.stringify({
+        object: 'whatsapp_business_account',
+        entry: [{ id: 'W', changes: [{ field: 'messages', value: { messaging_product: 'whatsapp', messages: [{
+          from: '14155550123', id: 'wamid.M', timestamp: '1', type: 'image',
+          image: { id: 'MEDIA-123', caption: 'my dashboard is broken', mime_type: 'image/jpeg' },
+        }] } }] }],
+      }),
+    );
+    expect(handleUnrecognizedMessage).toHaveBeenCalledWith(
+      '+14155550123', 'my dashboard is broken', 'image', 'image, media id MEDIA-123', 'wamid.M',
+    );
+  });
+
+  it('names a document by its filename', async () => {
+    (handleVerificationMessage as jest.Mock).mockResolvedValue(false);
+    await post(
+      JSON.stringify({
+        object: 'whatsapp_business_account',
+        entry: [{ id: 'W', changes: [{ field: 'messages', value: { messaging_product: 'whatsapp', messages: [{
+          from: '14155550123', id: 'wamid.D', timestamp: '1', type: 'document',
+          document: { id: 'MEDIA-9', filename: 'invoice.pdf' },
+        }] } }] }],
+      }),
+    );
+    expect(handleUnrecognizedMessage).toHaveBeenCalledWith(
+      '+14155550123', '', 'document', 'document, file "invoice.pdf", media id MEDIA-9', 'wamid.D',
+    );
+  });
+
+  it('gives plain text no media detail', async () => {
+    (handleVerificationMessage as jest.Mock).mockResolvedValue(false);
+    await post(inboundPayload('hi'));
+    expect(handleUnrecognizedMessage).toHaveBeenCalledWith('+14155550123', 'hi', 'text', '', 'wamid.IN1');
+  });
+
+  it('does not greet someone who just sent a verification code', async () => {
+    (handleVerificationMessage as jest.Mock).mockResolvedValue(true);
+    await post(inboundPayload('Verify ABCD2345'));
+    expect(handleUnrecognizedMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(['STOP', 'UNSTOP'])('does not greet on %s', async (kw) => {
+    await post(inboundPayload(kw));
+    expect(handleUnrecognizedMessage).not.toHaveBeenCalled();
   });
 });
