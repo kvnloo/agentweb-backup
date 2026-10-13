@@ -1674,7 +1674,11 @@ async function resolveTurnFunding(context: CodingAgentContext, model: string): P
     customerRoutable: true,
     canCallAnthropicDirect: true,
   });
-  return funding?.route === 'api_key' ? funding : undefined;
+  if (!funding || funding.route === 'agentweb') return undefined;
+  // A subscription route is served by its own runner, never by this loop; sending it out
+  // on AgentWeb's key would bill AgentWeb for a customer-funded run.
+  if (funding.route !== 'api_key') throw new CustomerRouteError('unsupported_route');
+  return funding;
 }
 
 /**
@@ -1693,8 +1697,12 @@ export function toNativeAnthropicModel(model: string): string | undefined {
 function isProviderOutage(error: unknown): boolean {
   const status = (error as { status?: number })?.status;
   if (typeof status === 'number') return status >= 500 || status === 529;
-  const name = (error as { name?: string })?.name || '';
-  return /Timeout|Connection|Network/i.test(name) || /ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN/.test(String((error as { code?: string })?.code));
+  // The SDK's connection and timeout errors carry no status and no code of their own; the
+  // network error code, when there is one, sits on `.cause`.
+  const ConnectionError = (Anthropic as unknown as { APIConnectionError?: new (...a: any[]) => Error }).APIConnectionError;
+  if (typeof ConnectionError === 'function' && error instanceof ConnectionError) return true;
+  const code = String((error as { cause?: { code?: string } })?.cause?.code ?? (error as { code?: string })?.code ?? '');
+  return /^(ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED)$/.test(code);
 }
 
 /**
@@ -1713,12 +1721,17 @@ async function callCustomerKey(
   let directError: unknown;
   const nativeModel = funding.provider === 'anthropic' ? toNativeAnthropicModel(params.model) : undefined;
   if (nativeModel && funding.connectionId) {
+    // Read fresh on every turn, so a revoke stops the next one. Outside the outage
+    // handling below on purpose: a revoked, disabled or unreadable key is the customer's
+    // problem and must fail the turn, not be retried somewhere else. The key lives only
+    // in this client; it is never logged, cached or put in an error.
+    const { getLlmConnectionService } = require('./funding/llmConnectionService') as typeof import('./funding/llmConnectionService');
+    const { apiKey } = await getLlmConnectionService().getKeyMaterial(funding.connectionId, userId);
     try {
-      // Read fresh on every turn, so a revoke stops the next one. The key lives only in
-      // this client; it is never logged, cached or put in an error.
-      const { getLlmConnectionService } = require('./funding/llmConnectionService') as typeof import('./funding/llmConnectionService');
-      const { apiKey } = await getLlmConnectionService().getKeyMaterial(funding.connectionId, userId);
-      const direct = new Anthropic({ apiKey, maxRetries: 1, timeout: 5 * 60 * 1000 });
+      // An explicit host and no auth token: the SDK would otherwise pick up
+      // ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN from the environment and could send the
+      // customer's key to another host.
+      const direct = new Anthropic({ apiKey, baseURL: 'https://api.anthropic.com', authToken: null, maxRetries: 1, timeout: 5 * 60 * 1000 });
       return await direct.messages.create({ ...params, model: nativeModel });
     } catch (error) {
       if (!isProviderOutage(error)) throw error;

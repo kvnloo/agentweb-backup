@@ -85,6 +85,13 @@ describe('which callLLM calls may use a customer key (ENG-2108)', () => {
     ]);
   });
 
+  it('lets only the coding agent skip the provisioner for Anthropic keys', () => {
+    const setters = sourceFiles(SRC)
+      .filter((file) => /canCallAnthropicDirect\s*:\s*true/.test(fs.readFileSync(file, 'utf8').replace(/\/\/.*$/gm, '')))
+      .map((file) => path.relative(SRC, file).split(path.sep).join('/'));
+    expect(setters).toEqual(['services/codingAgentService.ts']);
+  });
+
   it('is opted in by the coding agent exactly once, on its own turns', () => {
     const source = read('services/codingAgentService.ts');
     expect([...source.matchAll(/customerRoutable:\s*true/g)]).toHaveLength(1);
