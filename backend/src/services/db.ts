@@ -11425,6 +11425,19 @@ export const orgMemoryDb = {
     }
   },
 
+  async getMemory(orgId: string, memoryId: string) {
+    try {
+      const result = await dynamodb.get({
+        TableName: ORG_MEMORY_TABLE,
+        Key: { orgId, memoryId },
+      }).promise();
+      return result.Item || null;
+    } catch (error) {
+      handleDynamoDbError(error, 'getOrgMemory');
+      throw error;
+    }
+  },
+
   async deleteMemory(orgId: string, memoryId: string) {
     try {
       await dynamodb.delete({

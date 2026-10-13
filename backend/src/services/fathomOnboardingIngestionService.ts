@@ -586,7 +586,7 @@ export type FathomOnboardingReviewAction = 'discard' | 'rollback';
 interface ReviewActionDeps {
   userDb: Pick<typeof userDb, 'getUserById' | 'updateUser'>;
   accountMemoryDb: Pick<typeof accountMemoryDb, 'deleteMemory'>;
-  orgMemoryDb: Pick<typeof orgMemoryDb, 'deleteMemory'>;
+  orgMemoryDb: Pick<typeof orgMemoryDb, 'deleteMemory' | 'getMemory'>;
   now: () => string;
 }
 
@@ -674,6 +674,17 @@ export async function applyFathomOnboardingReviewAction(
         if (!orgId) {
           const target = targetUserId === input.userId ? user : await deps.userDb.getUserById(targetUserId);
           orgId = target?.orgId || null;
+          // Legacy entry (no recorded org): the user may have moved orgs since
+          // approval. Only trust the current org if it actually holds every
+          // memory; otherwise deleting there is a silent no-op that would report
+          // success while the old org's memory stays live (Opslane run 417, P1).
+          if (orgId) {
+            for (const memoryId of item.orgMemoryIds || []) {
+              if (!(await deps.orgMemoryDb.getMemory(orgId, memoryId))) {
+                throw new FathomOnboardingReviewError(409, 'Org memories for this legacy ingestion are not in the user\'s current org; rollback not applied.');
+              }
+            }
+          }
         }
         if (!orgId) {
           // Never report success while org memories are still live: keep the ids on

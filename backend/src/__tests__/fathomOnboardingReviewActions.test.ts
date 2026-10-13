@@ -47,7 +47,7 @@ function setup(users: Record<string, any>) {
     }),
   };
   const accountMemoryDb = { deleteMemory: jest.fn().mockResolvedValue(undefined) };
-  const orgMemoryDb = { deleteMemory: jest.fn().mockResolvedValue(undefined) };
+  const orgMemoryDb = { deleteMemory: jest.fn().mockResolvedValue(undefined), getMemory: jest.fn().mockResolvedValue({ memoryId: 'o1' }) };
   return { userDb, accountMemoryDb, orgMemoryDb, now: () => NOW } as any;
 }
 
@@ -220,5 +220,19 @@ describe('applyFathomOnboardingReviewAction (ENG-270)', () => {
     expect(out.status).toBe('discarded');
     expect(deps.userDb.updateUser).toHaveBeenCalledTimes(2);
     expect(users.u.fathomOnboardingIngestions[0].status).toBe('discarded');
+  });
+
+  it('refuses a legacy rollback when the user moved orgs and the current org lacks the memory (Opslane run 417)', async () => {
+    const users: Record<string, any> = {
+      legacy: { userId: 'legacy', orgId: 'org-new', fathomOnboardingIngestions: [entry({ status: 'reviewed', targetUserId: 'legacy', memoryIds: ['m1'], orgMemoryIds: ['o-legacy-1'] })] },
+    };
+    const deps = setup(users);
+    deps.orgMemoryDb.getMemory.mockResolvedValue(null);
+    await expect(applyFathomOnboardingReviewAction({ userId: 'legacy', recordingId: 'rec-1', action: 'rollback', actorUserId: 'admin' }, deps))
+      .rejects.toMatchObject({ statusCode: 409 });
+    expect(deps.orgMemoryDb.getMemory).toHaveBeenCalledWith('org-new', 'o-legacy-1');
+    expect(deps.orgMemoryDb.deleteMemory).not.toHaveBeenCalled();
+    expect(deps.accountMemoryDb.deleteMemory).not.toHaveBeenCalled();
+    expect(users.legacy.fathomOnboardingIngestions[0]).toMatchObject({ status: 'reviewed', memoryIds: ['m1'], orgMemoryIds: ['o-legacy-1'] });
   });
 });
