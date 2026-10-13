@@ -65,7 +65,8 @@ const SETTINGS_PERSISTENCE_TOOLS = new Set<string>([
  *  - send_gtm_status_report returns success after silent no-ops (no recipients, swallowed send errors);
  *  - create_social_media_posts / create_html_* / update_html_file produce an HTML document, not an image or
  *    video, and update_html_file can succeed with zero operations applied;
- *  - knowledge-base writes persist content, not user settings.
+ *  - knowledge-base writes persist content, not user settings (loose for settings_saved and task claims, so
+ *    ambiguous, never a confident mismatch).
  */
 const EXTRA_BACKING_TOOLS: Record<'email_sent' | 'task_created_or_updated' | 'post_published', ReadonlySet<string>> = {
   // notify_session sends one email to the listed recipients (a repeat of an earlier send in the same session
@@ -324,8 +325,10 @@ function judgedClasses(claims: JudgedClaim[], candidates: readonly ClaimClass[])
   const seen = new Set<ClaimClass>();
   let discarded = 0;
   for (const claim of claims) {
-    if (claim && allowed.has(claim.claimClass) && typeof claim.statement === 'string' && claim.statement.trim() !== '') {
-      seen.add(claim.claimClass);
+    // The judge is an LLM: tolerate case and whitespace drift in the class name ("Email_Sent ").
+    const cls = (typeof claim?.claimClass === 'string' ? claim.claimClass.trim().toLowerCase() : '') as ClaimClass;
+    if (allowed.has(cls) && typeof claim.statement === 'string' && claim.statement.trim() !== '') {
+      seen.add(cls);
     } else {
       discarded++;
     }
