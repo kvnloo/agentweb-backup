@@ -8,12 +8,23 @@
 import type OpenAI from "openai";
 import type { RunFunding } from "../runFunding";
 
+/** The one call the coding agent makes: an Anthropic Messages-style client. */
+export interface MessagesClient {
+  messages: { create: (params: any) => Promise<any> };
+}
+
 export interface CustomerRouteProvisioner {
   /**
    * An OpenRouter client that bills the customer's own key for `funding.connectionId`.
    * Must throw rather than return a client that could bill AgentWeb.
    */
   clientFor(funding: RunFunding): Promise<OpenAI>;
+  /**
+   * Same, as an Anthropic Messages client pointed at OpenRouter (the coding agent's
+   * wire format). Optional: a provisioner without it makes a customer-funded coding run
+   * fail closed with `not_provisioned`, never fall back to AgentWeb's key.
+   */
+  messagesClientFor?(funding: RunFunding): Promise<MessagesClient>;
 }
 
 let provisioner: CustomerRouteProvisioner | null = null;

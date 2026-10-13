@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { resolveModelForUser } from './modelRoles';
 import { OUTCOME_JUDGE_SHADOW_FEATURE, assertOutcomeJudgeModelAllowed, DEFAULT_OUTCOME_JUDGE_MODEL, isInShadowSample } from './outcomeJudge';
 import { chatbotDb, ChatSession, ChatMessage } from "./chatbotService";
@@ -1561,19 +1562,37 @@ function finiteNumber(v: any): number | undefined {
  * `response_format: json_object` — leading text (e.g. "Here is my
  * evaluation:") or trailing text (e.g. "Hope that helps!") around the JSON
  * object makes a bare `JSON.parse(raw)` throw, and that throw was previously
- * swallowed silently by the judge-score route's `Promise.allSettled`. Always
- * slice from the first `{` to the last `}`, same as the "everything from the
- * first `{`" convention already used elsewhere in this codebase for
- * non-strict LLM output — this covers a bare JSON object (slicing is a
- * no-op), a leading preamble, trailing text, or both. Falls back to the
- * original `raw` when no `{` is present, so `JSON.parse` still throws with a
- * meaningful message.
+ * swallowed silently by the judge-score route's `Promise.allSettled`. Slice the
+ * first balanced `{...}` object — this covers a bare JSON object (slicing is a
+ * no-op), a leading preamble, trailing text, a trailing second object, or any
+ * mix. Falls back to the original `raw` when no `{` is present, so
+ * `JSON.parse` still throws with a meaningful message.
  */
 function extractJsonObject(raw: string): string {
   const start = raw.indexOf("{");
+  if (start === -1) return raw;
+  // ENG-2138: return the first balanced top-level object, so text (or a second object) after the
+  // JSON no longer ends up inside the slice. String-aware: braces inside string values don't
+  // count, and a backslash escapes the next character (so \" doesn't end a string).
+  let depth = 0;
+  let inString = false;
+  for (let i = start; i < raw.length; i++) {
+    const ch = raw[i];
+    if (inString) {
+      if (ch === "\\") i++;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') {
+      inString = true;
+    } else if (ch === "{") {
+      depth++;
+    } else if (ch === "}" && --depth === 0) {
+      return raw.slice(start, i + 1);
+    }
+  }
+  // Never balanced (truncated or malformed): keep the pre-ENG-2138 slice so the failure,
+  // and the control-character repair that follows, behave exactly as before.
   const end = raw.lastIndexOf("}");
-  if (start === -1 || end === -1 || end < start) return raw;
-  return raw.slice(start, end + 1);
+  return end < start ? raw : raw.slice(start, end + 1);
 }
 
 /**
@@ -2079,6 +2098,14 @@ export function judgeScoringPath(session: ChatSession): "in-flight" | "failed-ru
   return "judge";
 }
 
+/**
+ * ENG-2138: short stable digest of a judge's system prompt, stored on a shadow score so scores
+ * produced by different prompt revisions can be told apart after the prompt is swapped.
+ */
+export function judgePromptVersion(systemPrompt: string): string {
+  return createHash("sha256").update(systemPrompt).digest("hex").slice(0, 12);
+}
+
 export async function scoreSessionWithJudgeIfNeeded(
   session: ChatSession,
   judge: ScoringJudge,
@@ -2150,7 +2177,13 @@ export async function scoreSessionWithJudgeIfNeeded(
     evaluatedMessageIndex: result.evaluatedMessageIndex,
     judgeName: judge.name,
     ...(result.dimensions ? { dimensions: result.dimensions } : {}),
-    ...(judge.shadow ? { shadow: true, ...(result.model ? { model: result.model } : {}) } : {}),
+    ...(judge.shadow
+      ? {
+          shadow: true,
+          ...(result.model ? { model: result.model } : {}),
+          ...(judge.systemPrompt ? { promptVersion: judgePromptVersion(judge.systemPrompt) } : {}),
+        }
+      : {}),
   };
 
   await chatbotDb.updateSessionJudgeScore(session.sessionId, judge.id, judgeScore);

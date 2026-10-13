@@ -38,6 +38,12 @@ export interface ResolveCallFundingInput {
    * helpers reuse the `agent_task` feature name.
    */
   customerRoutable: boolean;
+  /**
+   * True for a caller that can serve an `anthropic` key by calling Anthropic directly
+   * (the coding agent already speaks the Messages format). Such a call needs no
+   * OpenRouter key, so it does not wait for a provisioner; every other provider still does.
+   */
+  canCallAnthropicDirect?: boolean;
 }
 
 /**
@@ -54,7 +60,7 @@ export async function resolveCallFunding(
   if (!input.userId || !input.customerRoutable) return runFunding;
   const provider = input.modelLab ? BYOK_PROVIDER_BY_LAB[input.modelLab] : undefined;
   if (!provider) return runFunding;
-  if (!getCustomerRouteProvisioner()) return runFunding;
+  if (!getCustomerRouteProvisioner() && !(provider === "anthropic" && input.canCallAnthropicDirect)) return runFunding;
 
   try {
     // Cheap, cached switch check first, so a call from an account with BYOK off never
