@@ -1110,12 +1110,57 @@ export const activeSessionGenerations = new Set<string>();
  * @returns `true` if the caller claimed the lock (session was free),
  *          `false` if the session is already generating (caller must reject).
  */
-export function tryClaimSessionGeneration(sessionId: string): boolean {
+export function tryClaimSessionGeneration(sessionId: string, ownerUserId?: string): boolean {
   if (activeSessionGenerations.has(sessionId)) {
     return false;
   }
   activeSessionGenerations.add(sessionId);
+  // ENG-110: record WHO holds the claim, in the same synchronous step, so /generating and
+  // isGenerating both derive from this one source. No owner given => no record (see
+  // getSessionGenerationOwner / the /generating fallback), never a stale one.
+  if (ownerUserId) {
+    sessionGenerationOwners.set(sessionId, ownerUserId);
+  } else {
+    sessionGenerationOwners.delete(sessionId);
+  }
   return true;
+}
+
+/**
+ * ENG-110: owner (userId) of each currently claimed session lock, written by
+ * tryClaimSessionGeneration and deleted by releaseSessionGeneration (every claim site releases in
+ * a `finally`, so this cannot outlive the lock). In-memory, per instance, no storage. Only ever
+ * read together with activeSessionGenerations, so an entry without a held lock is ignored.
+ * Exported so tests can inspect/reset it.
+ */
+export const sessionGenerationOwners = new Map<string, string>();
+
+/** Owner recorded for a currently held lock, or undefined (not held, or claimed without an owner). */
+export function getSessionGenerationOwner(sessionId: string): string | undefined {
+  return activeSessionGenerations.has(sessionId) ? sessionGenerationOwners.get(sessionId) : undefined;
+}
+
+/**
+ * ENG-110: single source for both generating signals. Session ids whose lock is held and which
+ * the caller owns. A lock claimed without an owner (legacy/unknown site) falls back to the cap
+ * module's per-user slots, so it is never invisible to the caller who started it.
+ */
+export function getClaimedSessionIdsForUser(userId: string): string[] {
+  const ids = new Set<string>();
+  for (const [sessionId, owner] of sessionGenerationOwners) {
+    if (owner === userId && activeSessionGenerations.has(sessionId)) ids.add(sessionId);
+  }
+  for (const sessionId of getGeneratingSessionIdsForUser(userId)) {
+    if (activeSessionGenerations.has(sessionId) && !sessionGenerationOwners.has(sessionId)) ids.add(sessionId);
+  }
+  return [...ids];
+}
+
+/** ENG-110: is the session's lock held by (or, if its owner is unknown, assumed to be) this user. */
+export function isSessionGeneratingForUser(sessionId: string, userId: string | undefined): boolean {
+  if (!activeSessionGenerations.has(sessionId)) return false;
+  const owner = sessionGenerationOwners.get(sessionId);
+  return owner === undefined || owner === userId;
 }
 
 /**
@@ -1124,6 +1169,7 @@ export function tryClaimSessionGeneration(sessionId: string): boolean {
  */
 export function releaseSessionGeneration(sessionId: string): void {
   activeSessionGenerations.delete(sessionId);
+  sessionGenerationOwners.delete(sessionId);
 }
 
 /**
@@ -1158,10 +1204,11 @@ export function isSessionBusyError(error: unknown): boolean {
 export async function claimSessionGenerationWithRetry(
   sessionId: string,
   { retries = 6, delayMs = 2000 }: { retries?: number; delayMs?: number } = {},
+  ownerUserId?: string,
 ): Promise<boolean> {
   const startedAt = Date.now();
   for (let i = 0; i <= retries; i++) {
-    if (tryClaimSessionGeneration(sessionId)) {
+    if (tryClaimSessionGeneration(sessionId, ownerUserId)) {
       return true;
     }
     if (i < retries) {
@@ -1233,16 +1280,16 @@ const AUTO_CONTINUATION_PREEMPT_POLL_MS = parseInt(process.env.AUTO_CONTINUATION
  * into the same session — worst case, it behaves exactly like before this fix existed.
  * Exported so tests can drive it directly instead of racing real generation timing.
  */
-export async function preemptAutoContinuationAndWait(sessionId: string): Promise<boolean> {
+export async function preemptAutoContinuationAndWait(sessionId: string, ownerUserId?: string): Promise<boolean> {
   if (!autoContinuationSessions.has(sessionId)) return false;
   requestCancel(sessionId);
   generateMarketingResponseWorkerService.cancelSession(sessionId);
   const deadline = Date.now() + AUTO_CONTINUATION_PREEMPT_WAIT_MS;
   while (Date.now() < deadline) {
-    if (tryClaimSessionGeneration(sessionId)) return true;
+    if (tryClaimSessionGeneration(sessionId, ownerUserId)) return true;
     await new Promise((resolve) => setTimeout(resolve, AUTO_CONTINUATION_PREEMPT_POLL_MS));
   }
-  return tryClaimSessionGeneration(sessionId);
+  return tryClaimSessionGeneration(sessionId, ownerUserId);
 }
 
 /**
@@ -1520,7 +1567,7 @@ async function scheduleAutoMediaContinuation(
   // A real user request may already be running for this session (e.g. they replied
   // manually while we were about to auto-continue) — don't fight it. If that turn still
   // leaves the batch incomplete, its own response re-triggers this path.
-  if (!tryClaimSessionGeneration(sessionId)) return;
+  if (!tryClaimSessionGeneration(sessionId, userId)) return;
   // ENG-1239: mark the lock as continuation-held so a real customer request that collides
   // with it (the OTHER direction from the check above) can preempt instead of just
   // 409ing — see preemptAutoContinuationAndWait.
@@ -1805,7 +1852,7 @@ async function scheduleAutoWorkPlanContinuation(
 
   // A real user request may already be running for this session — don't fight it. If that
   // turn still leaves the plan stalled, its own response re-triggers this path.
-  if (!tryClaimSessionGeneration(sessionId)) return;
+  if (!tryClaimSessionGeneration(sessionId, userId)) return;
   autoContinuationSessions.add(sessionId);
 
   // ENG-1699: this callback was scheduled via setImmediate after a stall was detected — a
@@ -5328,7 +5375,7 @@ export async function runVerifiedChat(
   options?: { lockTimeoutMs?: number; capInteractiveUserId?: string },
 ): Promise<RunVerifiedChatResult> {
   const { sessionId } = params;
-  const claimed = await claimSessionGenerationWithRetry(sessionId);
+  const claimed = await claimSessionGenerationWithRetry(sessionId, undefined, params.userId);
   if (!claimed) {
     throw new SessionBusyError(sessionId);
   }
@@ -9503,7 +9550,7 @@ export const agentModeController = {
         hasActiveProgress: progressActive,
         // ENG-110: additive, owner-only. In-memory on THIS instance (an Immutable deploy overlap hides the
         // other instance's runs). Admins/delegates viewing someone else's session never get it.
-        ...(genuineOwnerView ? { isGenerating: activeSessionGenerations.has(session.sessionId) } : {}),
+        ...(genuineOwnerView ? { isGenerating: isSessionGeneratingForUser(session.sessionId, user?.userId) } : {}),
         skills,
         ...modelAttribution,
       };
@@ -9865,7 +9912,7 @@ export const agentModeController = {
       // another real request — a genuine customer message takes priority over that, so
       // preempt it instead of flatly rejecting a request the customer had every right to
       // make (see preemptAutoContinuationAndWait).
-      if (!tryClaimSessionGeneration(sessionId) && !(await preemptAutoContinuationAndWait(sessionId))) {
+      if (!tryClaimSessionGeneration(sessionId, session.userId) && !(await preemptAutoContinuationAndWait(sessionId, session.userId))) {
         // A DIFFERENT message on a busy session: give back the idem claim we
         // just took so the user's retry (after the busy run finishes) is accepted.
         if (idemKeyHeld) {
@@ -11274,7 +11321,7 @@ export const agentModeController = {
       // never both proceed; exactly one wins, the other gets 409 SESSION_BUSY.
       // ENG-1239: unless it's a background media auto-continuation holding the lock —
       // preempt that instead (see the regular /generate path above).
-      if (!tryClaimSessionGeneration(session.sessionId) && !(await preemptAutoContinuationAndWait(session.sessionId))) {
+      if (!tryClaimSessionGeneration(session.sessionId, session.userId) && !(await preemptAutoContinuationAndWait(session.sessionId, session.userId))) {
         return res.status(409).json({
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
@@ -11861,15 +11908,17 @@ export const agentModeController = {
   // Stop generation for a session
   /**
    * ENG-110: GET /api/agent-mode/generating — ids of the CALLER's sessions that currently hold the generation
-   * claim on this instance. Derived from the cap module's per-user map (only the caller's entry is read),
-   * intersected with the session lock Set so a stale slot can never be reported as running.
+   * claim on this instance. Derived from the same source as `isGenerating` on GET /session/:id: the session
+   * lock plus its recorded owner (see getClaimedSessionIdsForUser). Runs that hold the lock without a cap slot
+   * (auto-continuation, branching, approval resume) are therefore listed too; a lock claimed without an owner
+   * falls back to the caller's cap slot. Only the caller's own ids are ever returned.
    */
   async getGeneratingSessions(req: AuthenticatedRequest, res: Response) {
     const user = req.user as User | undefined;
     if (!user?.userId) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
-    const sessionIds = getGeneratingSessionIdsForUser(user.userId).filter((id) => activeSessionGenerations.has(id));
+    const sessionIds = getClaimedSessionIdsForUser(user.userId);
     res.setHeader?.('Cache-Control', 'no-store');
     return res.json({ sessionIds });
   },
