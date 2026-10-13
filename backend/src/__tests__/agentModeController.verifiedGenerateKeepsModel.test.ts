@@ -313,6 +313,18 @@ describe('verifiedGenerate persists the explicit model only once the turn is adm
     expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
   });
 
+  it('a failing model write answers 500, releases the cap slot and the session lock, and never runs the worker', async () => {
+    const release = jest.fn();
+    (acquireInteractiveGenerationSlot as jest.Mock).mockResolvedValue({ ok: true, release });
+    mockChatbotDb.updateSessionLlmModel.mockRejectedValue(new Error('db down'));
+    const res = makeRes();
+    await agentModeController.verifiedGenerate(verifiedReq({ llmModel: 'gemini-3.5-flash' }), res);
+    expect(res.statusCode).toBe(500);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(activeSessionGenerations.has(SESSION_ID)).toBe(false);
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+  });
+
   it('an admitted turn persists the model before the worker runs', async () => {
     const order: string[] = [];
     mockChatbotDb.updateSessionLlmModel.mockImplementation((async () => { order.push('persist'); return session() as any; }) as any);
@@ -371,6 +383,12 @@ describe('verifiedGenerate applies the same usage gate as /generate', () => {
       requiredFunctions: [{ functionName: 'update_html_file', minCount: 1 }], maxAttempts: 1, attachments: [],
     });
     expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('checks the allowance of the authenticated user', async () => {
+    mockWorker.runInWorker.mockResolvedValue(reportTool as any);
+    await agentModeController.verifiedGenerate(verifiedReq(), makeRes());
+    expect(checkTokenUsage).toHaveBeenCalledWith(OWNER);
   });
 
   it('an allowed account is unchanged', async () => {

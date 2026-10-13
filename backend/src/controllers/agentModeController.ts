@@ -493,18 +493,20 @@ export async function resolveEffectiveModelForUser(input: {
  * The one 429 `usage_paused` body for an interactive turn refused because the allowance is
  * exhausted (/generate and /verified-generate share it, so they cannot disagree). When a
  * usage policy is active the policy decision is stamped on the session (its model is kept)
- * and echoed in the body; a ModelUnavailableError while resolving it must not mask the 429.
+ * and echoed in the body (a caller that already resolved it passes `decision`); a ModelUnavailableError while resolving it must not mask the 429.
  */
 async function buildUsagePausedBody(input: {
   usageStatus: Awaited<ReturnType<typeof checkTokenUsage>>;
   session: { sessionId: string; userId: string; llmModel?: string | null };
   requestedModel: string | null;
   backupModel?: string | null;
+  /** An already-resolved policy decision (skips the resolve below). */
+  decision?: EffectiveModelPolicyDecision;
 }): Promise<Record<string, unknown>> {
   const { usageStatus, session } = input;
   // ENG-1344 AC6: one server-side producer for both the flat string and the structured copy.
   const usageBlockCopy = buildUsageBlockCopy({ month: usageStatus.month });
-  const decision = usageStatus.usagePolicyVersion
+  const decision = input.decision ?? (usageStatus.usagePolicyVersion
     ? await resolveEffectiveModelForUser({
         userId: session.userId,
         requestedModel: input.requestedModel,
@@ -514,7 +516,7 @@ async function buildUsagePausedBody(input: {
         if (isModelUnavailableError(modelError)) return undefined;
         throw modelError;
       })
-    : undefined;
+    : undefined);
   if (!decision) {
     return { error: usageBlockCopy.message, usageBlock: usageBlockCopy, code: 'usage_paused', usageMode: 'paused' };
   }
@@ -10002,9 +10004,6 @@ export const agentModeController = {
 
       // Check token usage limits
       const usageStatus = await checkTokenUsage(user.userId);
-      // Composed once for every refusal path below so the three 429s cannot
-      // disagree with each other either (ENG-1344 AC6).
-      const usageBlockCopy = buildUsageBlockCopy({ month: usageStatus.month });
       if (!usageStatus.allowed) {
         return res.status(429).json(await buildUsagePausedBody({
           usageStatus,
@@ -10076,26 +10075,13 @@ export const agentModeController = {
         return res.status(422).json(modelUnavailableBody(modelError));
       }
       if (!modelPolicyDecision.effectiveModel) {
-        await chatbotDb.updateSessionLlmModel(
-          sessionId,
-          session.llmModel || agentModeService.default_model,
-          toStoredModelPolicyDecision(modelPolicyDecision),
-        );
-        return res.status(429).json({
-          // ENG-1344 AC6: one server-side producer for both the flat string and
-          // the structured copy, so no client can word this block differently.
-          error: usageBlockCopy.message,
-          usageBlock: usageBlockCopy,
-          code: 'usage_paused',
-          usageMode: 'paused',
+        // Paused: the one shared producer stamps the decision and builds the 429.
+        return res.status(429).json(await buildUsagePausedBody({
+          usageStatus,
+          session,
           requestedModel: modelPolicyDecision.requestedModel,
-          effectiveModel: null,
-          backupModel: modelPolicyDecision.backupModel,
-          backupSource: modelPolicyDecision.backupSource,
-          modelSelection: modelPolicyDecision.modelSelection,
-          modelSelectionReason: modelPolicyDecision.reason,
-          usagePolicyVersion: modelPolicyDecision.usagePolicyVersion,
-        });
+          decision: modelPolicyDecision,
+        }));
       }
       const modelToUse = modelPolicyDecision.effectiveModel;
       await chatbotDb.updateSessionLlmModel(
