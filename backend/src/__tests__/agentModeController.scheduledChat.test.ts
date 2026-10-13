@@ -4166,6 +4166,51 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       // Should only return scheduled_chat type
       expect(mockRes.json).toHaveBeenCalledWith([withHealth(scheduledChat)]);
     });
+
+    // ENG-1611: opt-in bounded pagination for large (admin client_id-scoped) accounts.
+    describe('pagination (ENG-1611)', () => {
+      const schedules = Array.from({ length: 250 }, (_, i) => ({
+        scheduleId: `s-${i}`,
+        userId: mockUserId,
+        type: 'scheduled_chat',
+        createdAt: new Date(Date.UTC(2026, 0, 1) + i * 60_000).toISOString(),
+      }));
+      const run = async (query: any) => {
+        mockScheduleDb.getSchedulesByUserId.mockResolvedValue([...schedules]);
+        const mockRes = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+        await agentModeController.getScheduledChats({ user: { userId: mockUserId }, query } as unknown as Request, mockRes);
+        return mockRes as any;
+      };
+
+      it('keeps the legacy bare array when no limit/cursor is passed', async () => {
+        const res = await run({});
+        expect(Array.isArray(res.json.mock.calls[0][0])).toBe(true);
+        expect(res.json.mock.calls[0][0]).toHaveLength(250);
+      });
+
+      it('walks every item newest-first in capped pages and terminates', async () => {
+        const seen: string[] = [];
+        let cursor: string | undefined;
+        let pages = 0;
+        do {
+          const res = await run({ limit: '1000', ...(cursor ? { cursor } : {}) });
+          const body = res.json.mock.calls[0][0];
+          expect(body.items.length).toBeLessThanOrEqual(100);
+          seen.push(...body.items.map((s: any) => s.scheduleId));
+          cursor = body.nextCursor ?? undefined;
+          pages++;
+        } while (cursor && pages < 10);
+        expect(pages).toBe(3);
+        expect(seen).toHaveLength(250);
+        expect(seen[0]).toBe('s-249');
+        expect(seen[249]).toBe('s-0');
+      });
+
+      it('rejects a malformed cursor with 400', async () => {
+        const res = await run({ cursor: '%%%' });
+        expect(res.status).toHaveBeenCalledWith(400);
+      });
+    });
   });
 
   describe('subscription wildcard handling', () => {
