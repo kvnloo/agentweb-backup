@@ -12,6 +12,7 @@ import { redactAccountSecrets, redactAccountsSecrets } from '../utils/accountSec
 import { oauthSessionDb } from '../services/db';
 import { MetaAdAccount, MetaInstagramAccount } from '../types/meta';
 import { getJwtSecret } from '../config/jwt';
+import { raiseMetaConnectionHandoff, verifyMetaAdAccountReadBack } from '../services/metaConnectionHandoff';
 
 const router = express.Router();
 const META_PRECONNECT_INSTRUCTIONS =
@@ -507,7 +508,20 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
             });
             connectedAccounts.push(account);
 
-            await safeAutoResolve('Meta Connect Ad Accounts', userId, 'meta', adAccount.account_id);
+            // ENG-1986: post-reconnect read-back — a 200 from OAuth is not proof the
+            // credential reads the account. Best-effort; never fails the connect.
+            const readBack = await verifyMetaAdAccountReadBack(adAccount.account_id, session.access_token);
+            if (!readBack.ok) {
+                await raiseMetaConnectionHandoff({
+                    reason: 'reconnect_readback_failed',
+                    userId,
+                    customerEmail: req.user?.email,
+                    account,
+                    error: readBack.error || 'read-back failed',
+                });
+            } else {
+                await safeAutoResolve('Meta Connect Ad Accounts', userId, 'meta', adAccount.account_id);
+            }
         }
 
         // ENG-2232: names which of the just-connected accounts have no accessible
