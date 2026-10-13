@@ -17,6 +17,12 @@ describe('ENG-707 engagement auto-approve', () => {
     expect(decideAutoApprove(like, optedIn, {}, { env: { LINKEDIN_SUPPORT_AUTO_APPROVE_ENABLED: '1' } as any }).autoApprove).toBe(false);
   });
 
+  it('non-finite usage fails closed as cap exhausted', () => {
+    for (const bad of [NaN, Infinity, -Infinity]) {
+      expect(decideAutoApprove(like, optedIn, { support_like: bad }, { env: ON })).toMatchObject({ autoApprove: false, reason: 'cap_exhausted' });
+    }
+  });
+
   it('defaults OFF per user: no settings / no explicit opt-in keeps the gate', () => {
     expect(decideAutoApprove(like, undefined, {}, { env: ON })).toMatchObject({ autoApprove: false, reason: 'not_opted_in' });
     expect(decideAutoApprove(like, { support_like: {} }, {}, { env: ON })).toMatchObject({ reason: 'not_opted_in' });

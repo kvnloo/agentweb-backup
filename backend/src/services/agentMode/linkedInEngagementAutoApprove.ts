@@ -120,7 +120,9 @@ export function decideAutoApprove(
   const setting = settings?.[actionClass];
   if (setting?.autoApprove !== true) return { autoApprove: false, reason: 'not_opted_in', actionClass };
   const cap = effectiveDailyCap(actionClass, setting);
-  const used = Math.max(0, Math.floor(usedToday[actionClass] ?? 0));
+  const rawUsed = usedToday[actionClass] ?? 0;
+  // Fail closed: unknown/corrupt usage (NaN, Infinity) counts as cap exhausted.
+  const used = Number.isFinite(rawUsed) ? Math.max(0, Math.floor(rawUsed)) : cap;
   if (used >= cap) return { autoApprove: false, reason: 'cap_exhausted', actionClass };
   return { autoApprove: true, actionClass, delayMs: jitterDelayMs(options.random), remainingAfter: cap - used - 1 };
 }
