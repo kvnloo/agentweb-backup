@@ -372,7 +372,7 @@ describe('healLegacyBranchedFrom: bounds (store-less)', () => {
 
   it('failures and a disabled flag are not remembered (retried on the next open)', async () => {
     let fail = true;
-    const deps = { ...makeDeps({ c1: rec('c1') }), getSessionRecord: async (id: string) => { if (fail) throw new Error('boom'); return rec(id); } };
+    const deps: LegacyBranchHealDeps = { ...makeDeps({ c1: rec('c1') }), getSessionRecord: async (id: string) => { if (fail) throw new Error('boom'); return rec(id) as any; } };
     expect(await healLegacyBranchedFrom(deps, target)).toBeNull();
     fail = false;
     expect((await healLegacyBranchedFrom(deps, target))?.rootSessionId).toBe('c1');
