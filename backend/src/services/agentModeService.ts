@@ -82,7 +82,7 @@ import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActions
 import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory, type ToolDispatchPorts } from './agentMode/core/toolDispatch';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
-import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, buildFinalizeJudgePrompt, parseFinalizeJudgeOutput } from './agentMode/core/finalizeGuard';
+import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, buildFinalizeJudgePrompt, parseFinalizeJudgeOutput, FINALIZE_JUDGE_MAX_COMPLETION_TOKENS } from './agentMode/core/finalizeGuard';
 import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
 import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
 import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionIndex } from '../utils/modelMentionRequest';
@@ -5113,6 +5113,11 @@ export class AgentModeService {
           // finalizeGuard.ts), so without this they'd be invisible even though
           // the whole point of the confidence tier is to surface them for
           // review instead of silently risking a false correction.
+          if (guardOutcome.discardedClaims) {
+            // Judge claims with no quoted statement or a class the lexicon did not surface are ignored (ENG-2459).
+            // Counted here so a judge whose output shape drifts shows up instead of silently disabling detection.
+            console.warn(`AgentMode: finalize guard discarded ${guardOutcome.discardedClaims} judge claim(s) in session ${sessionId} (no statement or non-candidate class)`);
+          }
           if (guardOutcome.ambiguousClaimClasses.length > 0) {
             console.warn(`AgentMode: finalize guard found AMBIGUOUS (uncorrected) claim(s) in session ${sessionId} — possible matcher coverage gap`, {
               ambiguousClaimClasses: guardOutcome.ambiguousClaimClasses,
@@ -10806,7 +10811,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         content: buildFinalizeJudgePrompt(finalText, candidateClasses),
       },
     ], {
-      max_completion_tokens: 500,
+      max_completion_tokens: FINALIZE_JUDGE_MAX_COMPLETION_TOKENS,
       temperature: 0,
       taskClass: 'nonstandard_consumer',
       // ENG-1858: the guard audits the user's own reply, so the user's run pays.
