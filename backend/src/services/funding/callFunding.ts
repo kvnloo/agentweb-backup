@@ -42,8 +42,9 @@ export interface ResolveCallFundingInput {
 
 /**
  * Returns `runFunding` itself whenever the call stays on AgentWeb, so a caller can pass
- * the result straight on. Never throws: any failure to look up connections leaves the
- * call AgentWeb-funded, exactly as before this existed.
+ * the result straight on. A failed connection lookup leaves the call AgentWeb-funded,
+ * exactly as before this existed, EXCEPT for a run with `fallback: 'stop'`, which throws
+ * `CustomerRouteError('lookup_failed')` rather than quietly billing AgentWeb.
  */
 export async function resolveCallFunding(
   runFunding: RunFunding | undefined,

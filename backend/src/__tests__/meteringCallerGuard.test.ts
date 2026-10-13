@@ -72,9 +72,18 @@ describe('direct callers of the AgentWeb metering rails', () => {
 });
 
 describe('which callLLM calls may use a customer key (ENG-2108)', () => {
-  const source = fs.readFileSync(path.join(SRC, 'services/agentModeService.ts'), 'utf8');
+  const read = (file: string) => fs.readFileSync(path.join(SRC, file), 'utf8');
+  const mentions = sourceFiles(SRC)
+    .map((file) => ({ file: path.relative(SRC, file).split(path.sep).join('/'), text: fs.readFileSync(file, 'utf8') }))
+    .filter(({ text }) => /customerRoutable\s*[:,=]/.test(text.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '')));
 
-  it('is only the agent\'s own working loop, and that loop does opt in', () => {
+  it('is read from the call options in callLLM and set nowhere outside the agent service and the resolver', () => {
+    expect(mentions.map((m) => m.file).sort()).toEqual(['services/agentModeService.ts', 'services/funding/callFunding.ts']);
+  });
+
+  it('defaults to off, and only the agent\'s own working loop opts in', () => {
+    const source = read('services/agentModeService.ts');
+    expect(source).toMatch(/customerRoutable\s*=\s*false/);
     const optIns = [...source.matchAll(/customerRoutable:\s*true/g)];
     expect(optIns).toHaveLength(1);
     // Same options object as the loop's metering feature, so it cannot drift to a helper.
@@ -85,4 +94,3 @@ describe('which callLLM calls may use a customer key (ENG-2108)', () => {
     expect(distance).toBeLessThan(1500);
   });
 });
-

@@ -177,4 +177,25 @@ describe('callLLM per-call funding (ENG-2108)', () => {
     const { service } = setup();
     await expect(call(service, CLAUDE, 'agent_task:interactive', { fallbackModels: ['openrouter/no/such-model'] })).rejects.toThrow(/fallback model/i);
   });
+
+  it('does not let a call that omits customerRoutable use a customer key (the default is off)', async () => {
+    const { service, platformCreate, customerCreate } = setup();
+    await withRunFunding(run, () =>
+      service.callLLM(CLAUDE, [{ role: 'user', content: 'Hello' }], { usageContext: { userId: 'member-1', feature: 'agent_task:interactive' } as any }),
+    );
+
+    expect(customerCreate).not.toHaveBeenCalled();
+    expect(platformCreate).toHaveBeenCalledTimes(1);
+    expect(listUsableForUser).not.toHaveBeenCalled();
+    expect(fundingSeen()).toEqual([expect.objectContaining({ route: 'agentweb' })]);
+  });
+
+  it('judges a fallback model\'s lab by its current id, so a legacy alias for another lab is dropped', async () => {
+    const { service, customerCreate } = setup();
+    // 'gemini-2.5-flash' is a legacy alias that now resolves to a Google model.
+    await call(service, CLAUDE, 'agent_task:interactive', { fallbackModels: ['gemini-2.5-flash'] });
+
+    expect((customerCreate.mock.calls[0] as any[])[0].models).toBeUndefined();
+  });
 });
+
