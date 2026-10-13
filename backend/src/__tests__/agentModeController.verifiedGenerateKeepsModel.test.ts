@@ -69,6 +69,11 @@ jest.mock('../services/agentModeService', () => ({
   AgentModeService: jest.fn(),
 }));
 
+jest.mock('../services/agentMode/concurrentGenerationCap', () => {
+  const actual = jest.requireActual('../services/agentMode/concurrentGenerationCap');
+  return { ...actual, acquireInteractiveGenerationSlot: jest.fn() };
+});
+
 jest.mock('../services/llmUsagePolicyResolverService', () => ({
   getEffectiveLlmUsagePolicy: jest.fn(),
 }));
@@ -115,9 +120,11 @@ jest.mock('../utils/agentModeErrors', () => ({
 import {
   agentModeController,
   activeSessionGenerations,
+  tryClaimSessionGeneration,
   runVerifiedChat,
 } from '../controllers/agentModeController';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { acquireInteractiveGenerationSlot } from '../services/agentMode/concurrentGenerationCap';
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
@@ -149,6 +156,7 @@ const makeRes = () => {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  (acquireInteractiveGenerationSlot as jest.Mock).mockResolvedValue({ ok: true, release: jest.fn() });
   activeSessionGenerations.clear();
   (getEffectiveLlmUsagePolicy as jest.Mock).mockResolvedValue({
     billingUserId: OWNER, policy: null, costUsedMicroUsd: 0, tokenUsed: 0,
@@ -262,5 +270,115 @@ describe('system callers of runVerifiedChat are unchanged', () => {
     });
     expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
     expect(workerModels()).toEqual(['gemini-3.5-flash']);
+  });
+});
+
+describe('verifiedGenerate persists the explicit model only once the turn is admitted', () => {
+  beforeEach(() => {
+    mockWorker.runInWorker.mockResolvedValue(reportTool as any);
+    mockChatbotDb.getChatSession.mockResolvedValue(session('gpt-5.5') as any);
+  });
+
+  it('a busy session answers 409 and leaves the stored model unchanged', async () => {
+    jest.useFakeTimers();
+    try {
+      tryClaimSessionGeneration(SESSION_ID, OWNER);
+      const res = makeRes();
+      const done = agentModeController.verifiedGenerate(verifiedReq({ llmModel: 'gemini-3.5-flash' }), res);
+      await jest.advanceTimersByTimeAsync(30_000);
+      await done;
+      expect(res.statusCode).toBe(409);
+      expect(res.body).toMatchObject({ code: 'SESSION_BUSY' });
+      expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+      expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+      activeSessionGenerations.clear();
+    }
+  });
+
+  it('an over-cap request answers 429 and leaves the stored model unchanged', async () => {
+    (acquireInteractiveGenerationSlot as jest.Mock).mockResolvedValue({ ok: false, current: 3, limit: 3 });
+    const res = makeRes();
+    await agentModeController.verifiedGenerate(verifiedReq({ llmModel: 'gemini-3.5-flash' }), res);
+    expect(res.statusCode).toBe(429);
+    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+  });
+
+  it('a retired stored model is corrected only after admission too', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(session(UNSERVED) as any);
+    (acquireInteractiveGenerationSlot as jest.Mock).mockResolvedValue({ ok: false, current: 3, limit: 3 });
+    await agentModeController.verifiedGenerate(verifiedReq(), makeRes());
+    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+  });
+
+  it('an admitted turn persists the model before the worker runs', async () => {
+    const order: string[] = [];
+    mockChatbotDb.updateSessionLlmModel.mockImplementation((async () => { order.push('persist'); return session() as any; }) as any);
+    mockWorker.runInWorker.mockImplementation((async () => { order.push('run'); return reportTool as any; }) as any);
+    await agentModeController.verifiedGenerate(verifiedReq({ llmModel: 'gemini-3.5-flash' }), makeRes());
+    expect(order).toEqual(['persist', 'run']);
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'gemini-3.5-flash', expect.anything());
+  });
+});
+
+describe('verifiedGenerate applies the same usage gate as /generate', () => {
+  const exhausted = (extra: Record<string, unknown> = {}) => (checkTokenUsage as jest.Mock).mockResolvedValue({
+    allowed: false, warning: false, used: 10, allowance: 10, bonus: 0, effectiveAllowance: 10, percentUsed: 100, month: '2026-07', ...extra,
+  });
+
+  it.each([['a stored model', {}, 'gpt-5.5'], ['no model', {}, undefined]])('an exhausted allowance (%s) answers 429 usage_paused and nothing runs', async (_n, _x, stored) => {
+    exhausted();
+    mockChatbotDb.getChatSession.mockResolvedValue(session(stored) as any);
+    const res = makeRes();
+    await agentModeController.verifiedGenerate(verifiedReq(), res);
+    expect(res.statusCode).toBe(429);
+    expect(res.body).toMatchObject({ code: 'usage_paused', usageMode: 'paused', usageBlock: expect.anything() });
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    expect(modelWrites()).toEqual([]);
+  });
+
+  it('with a usage policy, the 429 carries the policy decision and keeps the stored model', async () => {
+    exhausted({ usagePolicyVersion: 'v1' });
+    (getEffectiveLlmUsagePolicy as jest.Mock).mockResolvedValue({
+      billingUserId: OWNER, policy: { version: 'v1' }, costUsedMicroUsd: 0, tokenUsed: 0,
+      mode: { usageMode: 'paused', admissionAllowed: false, reason: 'cost_paused' },
+    });
+    mockChatbotDb.getChatSession.mockResolvedValue(session('gpt-5.5') as any);
+    const res = makeRes();
+    await agentModeController.verifiedGenerate(verifiedReq(), res);
+    expect(res.statusCode).toBe(429);
+    expect(res.body).toMatchObject({ code: 'usage_paused', usageMode: 'paused', effectiveModel: null });
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    expect(modelWrites().every((m) => m === 'gpt-5.5')).toBe(true);
+  });
+
+  it('an invalid explicit model with an exhausted allowance answers 429 first, like /generate', async () => {
+    exhausted();
+    const res = makeRes();
+    await agentModeController.verifiedGenerate(verifiedReq({ llmModel: UNSERVED }), res);
+    expect(res.statusCode).toBe(429);
+    expect(res.body.code).toBe('usage_paused');
+  });
+
+  it('system callers keep their behaviour: runVerifiedChat itself is not usage-gated', async () => {
+    exhausted();
+    mockWorker.runInWorker.mockResolvedValue(reportTool as any);
+    mockChatbotDb.getChatSession.mockResolvedValue(session('gpt-5.5') as any);
+    await runVerifiedChat({
+      sessionId: SESSION_ID, userId: OWNER, startingMessage: 'go', keywords: [],
+      requiredFunctions: [{ functionName: 'update_html_file', minCount: 1 }], maxAttempts: 1, attachments: [],
+    });
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('an allowed account is unchanged', async () => {
+    mockWorker.runInWorker.mockResolvedValue(reportTool as any);
+    mockChatbotDb.getChatSession.mockResolvedValue(session('gpt-5.5') as any);
+    const res = makeRes();
+    await agentModeController.verifiedGenerate(verifiedReq(), res);
+    expect(res.statusCode).toBe(200);
+    expect(workerModels()).toEqual(['gpt-5.5']);
   });
 });

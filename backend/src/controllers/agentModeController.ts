@@ -489,6 +489,55 @@ export async function resolveEffectiveModelForUser(input: {
   };
 }
 
+/**
+ * The one 429 `usage_paused` body for an interactive turn refused because the allowance is
+ * exhausted (/generate and /verified-generate share it, so they cannot disagree). When a
+ * usage policy is active the policy decision is stamped on the session (its model is kept)
+ * and echoed in the body; a ModelUnavailableError while resolving it must not mask the 429.
+ */
+async function buildUsagePausedBody(input: {
+  usageStatus: Awaited<ReturnType<typeof checkTokenUsage>>;
+  session: { sessionId: string; userId: string; llmModel?: string | null };
+  requestedModel: string | null;
+  backupModel?: string | null;
+}): Promise<Record<string, unknown>> {
+  const { usageStatus, session } = input;
+  // ENG-1344 AC6: one server-side producer for both the flat string and the structured copy.
+  const usageBlockCopy = buildUsageBlockCopy({ month: usageStatus.month });
+  const decision = usageStatus.usagePolicyVersion
+    ? await resolveEffectiveModelForUser({
+        userId: session.userId,
+        requestedModel: input.requestedModel,
+        backupModel: input.backupModel,
+        backupSource: input.backupModel ? 'user' : null,
+      }).catch((modelError) => {
+        if (isModelUnavailableError(modelError)) return undefined;
+        throw modelError;
+      })
+    : undefined;
+  if (!decision) {
+    return { error: usageBlockCopy.message, usageBlock: usageBlockCopy, code: 'usage_paused', usageMode: 'paused' };
+  }
+  await chatbotDb.updateSessionLlmModel(
+    session.sessionId,
+    session.llmModel || agentModeService.default_model,
+    toStoredModelPolicyDecision(decision),
+  );
+  return {
+    error: usageBlockCopy.message,
+    usageBlock: usageBlockCopy,
+    code: 'usage_paused',
+    usageMode: decision.usageMode,
+    requestedModel: decision.requestedModel,
+    effectiveModel: decision.effectiveModel,
+    backupModel: decision.backupModel,
+    backupSource: decision.backupSource,
+    modelSelection: decision.modelSelection,
+    modelSelectionReason: decision.reason,
+    usagePolicyVersion: decision.usagePolicyVersion,
+  };
+}
+
 /** Remove a session this request just created after a refused launch; failure is logged, never thrown. */
 async function deleteNewSessionBestEffort(sessionId: string): Promise<void> {
   try {
@@ -5372,7 +5421,13 @@ async function runVerifiedChatInner(
  */
 export async function runVerifiedChat(
   params: Parameters<typeof runVerifiedChatInner>[0],
-  options?: { lockTimeoutMs?: number; capInteractiveUserId?: string },
+  options?: {
+    lockTimeoutMs?: number;
+    capInteractiveUserId?: string;
+    // Runs once the session lock (and the interactive cap slot) are held, immediately before
+    // the turn: a request refused as busy / over the cap must not have changed the session.
+    beforeRun?: () => Promise<void>;
+  },
 ): Promise<RunVerifiedChatResult> {
   const { sessionId } = params;
   const claimed = await claimSessionGenerationWithRetry(sessionId, undefined, params.userId);
@@ -5387,6 +5442,7 @@ export async function runVerifiedChat(
       if (!slot.ok) throw new TooManyConcurrentRunsError(slot.current, slot.limit);
       generationSlot = slot;
     }
+    await options?.beforeRun?.();
     return await withGenerationTimeout(
       runVerifiedChatInner(params),
       sessionId,
@@ -9950,48 +10006,12 @@ export const agentModeController = {
       // disagree with each other either (ENG-1344 AC6).
       const usageBlockCopy = buildUsageBlockCopy({ month: usageStatus.month });
       if (!usageStatus.allowed) {
-        // A ModelUnavailableError here must not mask the 429: fall through to the plain one.
-        if (usageStatus.usagePolicyVersion) {
-          modelPolicyDecision = await resolveEffectiveModelForUser({
-            userId: session.userId,
-            requestedModel: llmModel || session.llmModel || null,
-            backupModel: llmBackupModel,
-            backupSource: llmBackupModel ? 'user' : null,
-          }).catch((modelError) => {
-            if (isModelUnavailableError(modelError)) return undefined;
-            throw modelError;
-          });
-        }
-        if (modelPolicyDecision) {
-          await chatbotDb.updateSessionLlmModel(
-            sessionId,
-            session.llmModel || agentModeService.default_model,
-            toStoredModelPolicyDecision(modelPolicyDecision),
-          );
-          return res.status(429).json({
-            // ENG-1344 AC6: one server-side producer for both the flat string and
-            // the structured copy, so no client can word this block differently.
-            error: usageBlockCopy.message,
-            usageBlock: usageBlockCopy,
-            code: 'usage_paused',
-            usageMode: modelPolicyDecision.usageMode,
-            requestedModel: modelPolicyDecision.requestedModel,
-            effectiveModel: modelPolicyDecision.effectiveModel,
-            backupModel: modelPolicyDecision.backupModel,
-            backupSource: modelPolicyDecision.backupSource,
-            modelSelection: modelPolicyDecision.modelSelection,
-            modelSelectionReason: modelPolicyDecision.reason,
-            usagePolicyVersion: modelPolicyDecision.usagePolicyVersion,
-          });
-        }
-        return res.status(429).json({
-          // ENG-1344 AC6: one server-side producer for both the flat string and
-          // the structured copy, so no client can word this block differently.
-          error: usageBlockCopy.message,
-          usageBlock: usageBlockCopy,
-          code: 'usage_paused',
-          usageMode: 'paused',
-        });
+        return res.status(429).json(await buildUsagePausedBody({
+          usageStatus,
+          session,
+          requestedModel: llmModel || session.llmModel || null,
+          backupModel: llmBackupModel,
+        }));
       }
 
       // (Session was fetched + ownership-checked above, before the locks.)
@@ -15811,6 +15831,18 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Access denied to this session' });
       }
 
+      // Same allowance gate (and 429 body) as /generate, checked before the model so an
+      // exhausted account gets the 429 first, exactly as there. Interactive only: the
+      // scheduled / Slack / email / result-endpoint callers of runVerifiedChat have their own.
+      const usageStatus = await checkTokenUsage(user.userId);
+      if (!usageStatus.allowed) {
+        return res.status(429).json(await buildUsagePausedBody({
+          usageStatus,
+          session,
+          requestedModel: normalizeRequestedLlmModel(req.body?.llmModel) || session.llmModel || null,
+        }));
+      }
+
       // The model the user picked for this chat is used as-is for the whole turn:
       // runVerifiedChat only applies its task-type defaults (report/image/video) when
       // it is given NO model, so passing the resolved one below disables that swap.
@@ -15821,8 +15853,11 @@ export const agentModeController = {
       //    configured default into it (Slack, GTM, ...). A retired / not-selectable
       //    stored model is replaced by the current default, as /generate does.
       //  - Neither: nothing is passed and the task-type defaults still apply.
+      // The session is only WRITTEN (beforeRun) once the lock and cap are held, so a
+      // 409 / 429 leaves the stored model untouched.
       const explicitModel = normalizeRequestedLlmModel(req.body?.llmModel);
       let selectedModel: string | undefined;
+      let persistSelectedModel: (() => Promise<void>) | undefined;
       const requestedModel = explicitModel || session.llmModel;
       if (requestedModel) {
         let modelDecision: EffectiveModelPolicyDecision;
@@ -15837,11 +15872,11 @@ export const agentModeController = {
           return res.status(422).json(modelUnavailableBody(modelError));
         }
         selectedModel = modelDecision.effectiveModel || session.llmModel || undefined;
-        if (
-          modelDecision.effectiveModel
-          && (modelDecision.modelSelection === 'corrected' || modelDecision.effectiveModel !== session.llmModel)
-        ) {
-          await chatbotDb.updateSessionLlmModel(sessionId, modelDecision.effectiveModel, toStoredModelPolicyDecision(modelDecision));
+        const effectiveModel = modelDecision.effectiveModel;
+        if (effectiveModel && (modelDecision.modelSelection === 'corrected' || effectiveModel !== session.llmModel)) {
+          persistSelectedModel = async () => {
+            await chatbotDb.updateSessionLlmModel(sessionId, effectiveModel, toStoredModelPolicyDecision(modelDecision));
+          };
         }
       }
 
@@ -15889,7 +15924,7 @@ export const agentModeController = {
         // ENG-2072: a real person is watching this turn — never force hands-off
         // work-plan autocomplete, even if this session happens to be scheduled.
         isUnattendedRun: false
-      }, { capInteractiveUserId: session.userId }));
+      }, { capInteractiveUserId: session.userId, beforeRun: persistSelectedModel }));
 
       // If client disconnected, don't try to send response
       // The results are already saved to the session
