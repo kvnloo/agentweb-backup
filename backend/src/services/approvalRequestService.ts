@@ -180,7 +180,7 @@ export async function requestApproval(
     if (!approval) {
       // createApproval is a put on the asset URL, so it replaces any earlier record. Keep
       // that record: if this round reaches nobody it must be put back, not deleted.
-      previousApproval = await approvalDb.getApproval(request.imageUrl).catch(() => null);
+      previousApproval = await approvalDb.getApproval(request.imageUrl);
       approval = await createRecord(null);
     }
 
@@ -213,7 +213,7 @@ export async function requestApproval(
     // an earlier verdict.
     if (approval) {
       const undo = previousApproval
-        ? approvalDb.restoreApproval(previousApproval)
+        ? approvalDb.restoreApproval(previousApproval, approval.createdAt)
         : approvalDb.deleteApproval(request.imageUrl).then(() => undefined);
       await undo.catch((e) =>
         console.warn('[approval-request] could not undo unsent approval:', e?.message || e),

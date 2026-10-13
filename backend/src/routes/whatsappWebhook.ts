@@ -44,7 +44,7 @@ function logFailedStatus(status: any): void {
   if (status?.status !== 'failed') return;
   const err = status?.errors?.[0];
   console.error(
-    `[whatsapp-webhook] outbound message ${status?.id ?? 'unknown'} FAILED to deliver ` +
+    `[whatsapp-webhook] outbound message …${String(status?.id ?? 'unknown').slice(-8)} FAILED to deliver ` +
       `(code ${err?.code ?? 'unknown'}: ${err?.title ?? err?.message ?? 'no detail'})`,
   );
 }

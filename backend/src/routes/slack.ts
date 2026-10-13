@@ -398,10 +398,16 @@ router.post("/send-approval", authenticateToken, async (req: Request, res: Respo
     // design, and requestApproval ignores the channel it is given for them (nothing is
     // posted to Slack), so refusing here would only stop a task that still names an old
     // Slack channel from ever asking them on WhatsApp — and hold their output.
+    let targetChannel: string = channel;
     if (!isRealAdmin(req)) {
       const user = await userDb.getUserById(userId);
       const allowed = await getEffectiveAllowedChannels(user);
-      if (!hasWhatsApp(user) && !allowed.includes(channel)) {
+      if (hasWhatsApp(user)) {
+        // Hand requestApproval NO channel. It re-reads the account itself; if that read
+        // disagrees (a blip, or a disconnect between the two reads) an empty channel makes
+        // it fail closed instead of posting to whatever channel the caller named.
+        targetChannel = "";
+      } else if (!allowed.includes(channel)) {
         return res.status(403).json({ error: "Not allowed to post to this Slack channel" });
       }
     }
@@ -418,7 +424,7 @@ router.post("/send-approval", authenticateToken, async (req: Request, res: Respo
       filename,
       assetType,
       userId,
-      channel,
+      channel: targetChannel,
       channelName: authReq.body.channelName || channel, // Use channel name if provided, fallback to channel ID
       note: note // Pass the note to Slack
     });

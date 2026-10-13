@@ -200,7 +200,7 @@ describe('a customer on WhatsApp', () => {
     await expect(requestApproval({ ...request, channel: undefined })).rejects.toBeInstanceOf(
       ApprovalDeliveryFailedError,
     );
-    expect(approvalDb.restoreApproval).toHaveBeenCalledWith(earlier);
+    expect((approvalDb.restoreApproval as jest.Mock).mock.calls[0][0]).toBe(earlier);
     expect(approvalDb.deleteApproval).not.toHaveBeenCalled();
   });
 

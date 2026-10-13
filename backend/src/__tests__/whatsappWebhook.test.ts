@@ -246,7 +246,7 @@ describe('POST — inbound messages', () => {
   it('logs a FAILED delivery receipt by message id and never opens a window', async () => {
     const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
     await post(statusPayload('failed'));
-    expect(errSpy.mock.calls.flat().join(' ')).toMatch(/wamid\.OUT1 FAILED to deliver/);
+    expect(errSpy.mock.calls.flat().join(' ')).toMatch(/…[\w.]+ FAILED to deliver/);
     expect(errSpy.mock.calls.flat().join(' ')).not.toContain('4155550123');
     expect(recordInboundMessage).not.toHaveBeenCalled();
     errSpy.mockRestore();

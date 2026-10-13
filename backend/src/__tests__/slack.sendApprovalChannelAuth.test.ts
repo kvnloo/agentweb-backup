@@ -78,7 +78,9 @@ describe('POST /api/slack/send-approval channel entitlement (ENG-2413)', () => {
     });
     (getEffectiveAllowedChannels as jest.Mock).mockResolvedValue([]);
     await request(app).post('/api/slack/send-approval').send(body('C_OLD_TASK_CHANNEL')).expect(200);
-    expect(sendApprovalRequestWithTracking).toHaveBeenCalled();
+    // No channel is handed on: if requestApproval's own read of the account disagrees, it
+    // must fail closed rather than post to the channel the caller named.
+    expect(sendApprovalRequestWithTracking).toHaveBeenCalledWith(expect.objectContaining({ channel: '' }));
   });
 
   it('allows a real admin to any channel without resolving the allowlist', async () => {
