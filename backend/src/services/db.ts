@@ -1731,6 +1731,19 @@ export class UserDB {
        * re-asserted at write time.
        */
       elementSets?: Array<{ path: [string] | [string, string]; index: number; value: any }>;
+      /**
+       * Set / remove a value at an arbitrary document path, e.g.
+       * `["icpResult", 2, "pain"]` -> `SET #icpResult[2].#pain = :v`. A string
+       * segment is an attribute name, a number is a list index. Unlike
+       * rewriting the parent, this touches only that one value, so writers
+       * working on different values never overwrite each other, and the
+       * `condition` only has to assert what THIS write depends on (for a list
+       * element, that it is still the element that was read). Removing a list
+       * element shifts every later element down, so pair a remove with a
+       * condition on the element's identity.
+       */
+      pathSets?: Array<{ path: Array<string | number>; value: any }>;
+      pathRemoves?: Array<{ path: Array<string | number> }>;
     }
   ) {
     // First, get the user by userId to ensure they exist and to get their email
@@ -1748,7 +1761,12 @@ export class UserDB {
       ...updatableFields
     } = updates;
 
-    if (Object.keys(updatableFields).length === 0 && !options?.elementSets?.length) {
+    if (
+      Object.keys(updatableFields).length === 0 &&
+      !options?.elementSets?.length &&
+      !options?.pathSets?.length &&
+      !options?.pathRemoves?.length
+    ) {
       return user; // Return the fetched user object if no updates are needed
     }
 
@@ -1783,6 +1801,36 @@ export class UserDB {
       });
       expressionAttributeValues[`:el${n}`] = el.value;
       setExpressions.push(`${pathNames.join(".")}[${el.index}] = :el${n}`);
+    });
+
+    const compilePath = (kind: string, n: number, path: Array<string | number>): string => {
+      if (!Array.isArray(path) || path.length === 0 || typeof path[0] !== "string") {
+        throw new Error(`updateUser ${kind}[${n}]: path must start with an attribute name`);
+      }
+      let out = "";
+      path.forEach((segment, k) => {
+        if (typeof segment === "number") {
+          if (!Number.isInteger(segment) || segment < 0) {
+            throw new Error(`updateUser ${kind}[${n}]: list index must be a non-negative integer`);
+          }
+          out += `[${segment}]`;
+        } else if (typeof segment === "string" && segment.length > 0) {
+          const placeholder = `#${kind}${n}p${k}`;
+          expressionAttributeNames[placeholder] = segment;
+          out += (out ? "." : "") + placeholder;
+        } else {
+          throw new Error(`updateUser ${kind}[${n}]: invalid path segment`);
+        }
+      });
+      return out;
+    };
+    (options?.pathSets ?? []).forEach((ps, n) => {
+      const target = compilePath("ps", n, ps.path);
+      expressionAttributeValues[`:ps${n}`] = ps.value;
+      setExpressions.push(`${target} = :ps${n}`);
+    });
+    (options?.pathRemoves ?? []).forEach((pr, n) => {
+      removeExpressions.push(compilePath("pr", n, pr.path));
     });
 
     if (setExpressions.length === 0 && removeExpressions.length === 0) {
