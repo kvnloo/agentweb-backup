@@ -1690,6 +1690,13 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
             message: 'Failed to parse LLM response',
             error: error.message
           };
+        } else if (error.message.includes('LLM did not return substitution result')) {
+          return {
+            success: false,
+            errorClass: 'invalid_output',
+            message: 'LLM returned empty substitution result',
+            error: error.message
+          };
         } else if (error.message.includes('missing final_html or final_subject')) {
           return {
             success: false,

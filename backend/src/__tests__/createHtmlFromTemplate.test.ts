@@ -876,6 +876,25 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(result.message).toContain('Failed to parse LLM response');
     });
 
+    it('classifies empty LLM substitution output as invalid_output', async () => {
+      jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
+        choices: [{ message: { content: '' } }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: 'Test Title', content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.errorClass).toBe('invalid_output');
+      expect(result.error).toContain('LLM did not return substitution result');
+    });
+
     it('should handle missing final_html in LLM response', async () => {
       jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
         choices: [{
