@@ -33,20 +33,45 @@ import {
   sendOptOutConfirmation,
   OPT_IN_CONFIRMATION,
 } from '../services/whatsappService';
-import { handleVerificationMessage } from '../services/whatsappVerificationService';
-import { handleApprovalButtonTap } from '../services/approvalChannelNotifier';
+import {
+  disconnectWhatsAppForNumber,
+  handleVerificationMessage,
+  resumeVerificationAfterStart,
+} from '../services/whatsappVerificationService';
+import { handleApprovalButtonTap, lookupApprovalMessage } from '../services/approvalChannelNotifier';
+import { notifyOwnerUnreachable } from '../services/whatsappOwnerNotices';
 import { handleUnrecognizedMessage } from '../services/whatsappInboundSupport';
 
 const router = express.Router();
 
 /** Log a failed delivery receipt by message id and Meta error code. Never the number. */
-function logFailedStatus(status: any): void {
+async function handleFailedStatus(status: any): Promise<void> {
   if (status?.status !== 'failed') return;
   const err = status?.errors?.[0];
   console.error(
     `[whatsapp-webhook] outbound message …${String(status?.id ?? 'unknown').slice(-8)} FAILED to deliver ` +
       `(code ${err?.code ?? 'unknown'}: ${err?.title ?? err?.message ?? 'no detail'})`,
   );
+  // The send API only confirms ACCEPTANCE. If the dropped message was an approval request,
+  // its owner would otherwise wait for ever, so tell them by email. Best-effort: this is a
+  // delivery receipt, and nothing here may fail the webhook or open a service window.
+  try {
+    const ref = status?.id ? await lookupApprovalMessage(String(status.id)) : null;
+    if (ref?.userId) {
+      // Only while that approval is still waiting. A receipt for one already answered, or
+      // cancelled by STOP, would make the email say results are "on hold" when they are not.
+      const { approvalDb } = await import('../services/approvalDb');
+      const approval = await approvalDb.getApproval(ref.assetUrl);
+      if (approval && approval.userId === ref.userId && approval.status === 'pending') {
+        await notifyOwnerUnreachable(ref.userId);
+      }
+    }
+  } catch (e) {
+    console.warn(
+      '[whatsapp-webhook] could not act on a failed delivery receipt:',
+      e instanceof Error ? e.message : e,
+    );
+  }
 }
 
 /**
@@ -165,7 +190,7 @@ router.post('/', async (req, res) => {
         // send API confirms acceptance, not delivery, so this is the one place a message
         // that was accepted and then dropped can be seen.
         for (const status of change?.value?.statuses ?? []) {
-          logFailedStatus(status);
+          await handleFailedStatus(status);
         }
         for (const message of change?.value?.messages ?? []) {
           await handleInboundMessage(message);
@@ -258,6 +283,16 @@ async function handleInboundMessage(message: any): Promise<void> {
   if (STOP_KEYWORDS.has(normalized)) {
     await recordOptOut(phone);
     console.log(`[whatsapp-webhook] opt-out recorded for ${redactPhone(phone)}`);
+    // STOP also ends the connection: the account that held this number drops to "no
+    // platform" on its own, so nothing is left half-connected and nobody has to disconnect
+    // it by hand. Done BEFORE the confirmation so a Meta redelivery after a failure here
+    // does not send the confirmation twice. A storage error throws, so the webhook 500s.
+    const disconnectedUserId = await disconnectWhatsAppForNumber(phone);
+    if (disconnectedUserId) {
+      console.log(
+        `[whatsapp-webhook] WhatsApp disconnected from user ${disconnectedUserId} after STOP from ${redactPhone(phone)}`,
+      );
+    }
     // Acknowledged only AFTER the opt-out is recorded, and never allowed to throw:
     // recording is the compliance-critical half, and a silent STOP is indistinguishable
     // — to the person who sent it — from one that was dropped on the floor.
@@ -270,14 +305,20 @@ async function handleInboundMessage(message: any): Promise<void> {
   } else if (START_KEYWORDS.has(normalized)) {
     await recordOptIn(phone, 'unstop_keyword');
     console.log(`[whatsapp-webhook] opt-in recorded for ${redactPhone(phone)}`);
-    // Plain sendText here, not the opt-out bypass: by this point the number is opted
-    // back in, so the ordinary guards are exactly the ones that should apply.
-    await sendText(phone, OPT_IN_CONFIRMATION).catch((e) =>
-      console.warn(
-        `[whatsapp-webhook] opt-in confirmation to ${redactPhone(phone)} failed:`,
-        e instanceof Error ? e.message : e,
-      ),
-    );
+    // If the customer had already typed a connection code while still opted out, START
+    // finishes that connection (and replies "You're connected"), so they do not have to type
+    // the code again. A storage error throws and the webhook 500s; every step is idempotent.
+    const connected = await resumeVerificationAfterStart(phone);
+    if (!connected) {
+      // Plain sendText here, not the opt-out bypass: by this point the number is opted
+      // back in, so the ordinary guards are exactly the ones that should apply.
+      await sendText(phone, OPT_IN_CONFIRMATION).catch((e) =>
+        console.warn(
+          `[whatsapp-webhook] opt-in confirmation to ${redactPhone(phone)} failed:`,
+          e instanceof Error ? e.message : e,
+        ),
+      );
+    }
   } else {
     // "Verify <CODE>" binds this sender's number to the portal user who holds the code.
     // A fixed command only. Anything else is handed to the support hand-off (a fixed

@@ -235,6 +235,14 @@ export async function requestApproval(
       // retries. Say so where an operator can see it (user id and asset only — never the
       // number), so a customer who has opted out or has a standing Meta error is not held
       // silently and indefinitely.
+      // And tell the owner by email (once a day at most): the buttons they were waiting for
+      // never reached them, and nothing else will say so.
+      try {
+        const { notifyOwnerUnreachable } = await import('./whatsappOwnerNotices');
+        await notifyOwnerUnreachable(request.userId);
+      } catch {
+        // Telling the owner is best-effort; the failure below is what the caller needs.
+      }
       console.error(
         `[approval-request] could not deliver an approval to user ${request.userId} on WhatsApp; ` +
           `their output for ${request.imageUrl} is being held until this is resolved`,

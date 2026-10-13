@@ -888,6 +888,18 @@ router.get("/users", async (req, res) => {
             user.messagingPlatform = summary.platform;
             user.messagingPlatformSource = summary.source;
             user.whatsappNumberMasked = summary.whatsappNumberMasked;
+            const full = fullRecordById.get(user.userId);
+            // Why a no-platform account has no WhatsApp (STOP / customer / admin), for support.
+            user.whatsappDisconnect = full?.whatsappDisconnect ?? null;
+            // A number that texted STOP but could not be matched to its account at the time
+            // (verified before the phone index existed) is still bound and unreachable.
+            // Only WhatsApp accounts are checked, so this costs a handful of reads.
+            if (summary.platform === 'whatsapp') {
+              const { explicitChannels } = await import('../services/messagingChannelService');
+              const { isOptedOut } = await import('../services/whatsappService');
+              const destination = explicitChannels(full).find((c: any) => c.channel === 'whatsapp')?.destination;
+              user.whatsappOptedOut = destination ? await isOptedOut(destination) : false;
+            }
           } catch (error) {
             console.error(
               `[admin/users] messaging platform lookup failed for user ${user.userId}; leaving it unset:`,
@@ -1430,7 +1442,7 @@ router.delete("/users/:userId/whatsapp", async (req, res) => {
     const adminId = (req as any).user?.userId || 'unknown-admin';
     const { disconnectWhatsApp } = await import('../services/whatsappVerificationService');
 
-    const result = await disconnectWhatsApp(userId);
+    const result = await disconnectWhatsApp(userId, 'admin');
     if (!result) return res.status(404).json({ message: "User not found" });
     if (!result.removed) {
       return res.status(409).json({ message: "This account has no WhatsApp number connected." });
@@ -5057,9 +5069,10 @@ router.get("/subscription-types", async (req, res) => {
         normalizedPages = allAvailablePages;
       }
 
-      // Handle allowedSkills with backward compatibility
-      // If old format (allowedFunctionCalls but no allowedSkills), treat as all skills
-      let normalizedSkills = type.allowedSkills || allAvailableSkills;
+      // ENG-1978: a row without allowedSkills (old allowedFunctionCalls format) is no longer read as
+      // "all skills" — the runtime refuses to resolve it, so show it as having none rather than
+      // let an admin save it back as a full grant.
+      let normalizedSkills = Array.isArray(type.allowedSkills) ? type.allowedSkills : [];
       if (normalizedSkills.includes('*')) {
         normalizedSkills = allAvailableSkills;
       }
@@ -5103,6 +5116,63 @@ router.get("/subscription-types", async (req, res) => {
 });
 
 // Create or update subscription types
+/**
+ * ENG-1978: tiers an admin is about to remove (or rename away from) that accounts are still on.
+ *
+ * A user's tier is stored by NAME. If that name stops existing in `subscription_types`, the
+ * entitlement gate can no longer resolve the user and fails closed, so they drop to the foundation
+ * tools only. Before the gate failed closed those users silently kept every tool, which is why
+ * nothing ever needed to stop this save. Counted by the user's own `subscriptionType`: that covers
+ * org owners (whose tier their members inherit) but not the members themselves, so the count is a
+ * floor. `Free` is also the implicit tier of accounts with no `subscriptionType` at all (absent, null
+ * or empty — the runtime reads any falsy value as Free).
+ *
+ * This is a guard rail, not an invariant: it reads the current list, scans, and the caller writes
+ * later with no conditional write, so two concurrent admin saves or a user move racing the save
+ * can slip past it.
+ */
+async function findStrandedTiers(nextTierNames: string[]): Promise<Array<{ name: string; userCount: number }>> {
+  const current = await settingsService.getSetting("subscription_types");
+  if (!current) return [];
+  let currentTiers: any[];
+  try {
+    currentTiers = JSON.parse(current.settingValue);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(currentTiers)) return [];
+
+  const keep = new Set(nextTierNames);
+  const removed = currentTiers
+    .map((t) => t?.name)
+    .filter((n): n is string => typeof n === "string" && n.length > 0 && !keep.has(n));
+  if (removed.length === 0) return [];
+
+  const values: Record<string, string> = {};
+  removed.forEach((name, i) => { values[`:t${i}`] = name; });
+  const clauses = [`subscriptionType IN (${removed.map((_, i) => `:t${i}`).join(", ")})`];
+  if (removed.includes("Free")) {
+    clauses.push(
+      "attribute_not_exists(subscriptionType)",
+      "attribute_type(subscriptionType, :nullType)",
+      "subscriptionType = :emptyTier"
+    );
+    values[":emptyTier"] = "";
+    values[":nullType"] = "NULL";
+  }
+  const users = await userDb.scanWithFilter(clauses.join(" OR "), values);
+
+  return removed
+    .map((name) => ({
+      name,
+      userCount: users.filter((u) =>
+        u.subscriptionType === name ||
+        (name === "Free" && !u.subscriptionType)
+      ).length,
+    }))
+    .filter((t) => t.userCount > 0);
+}
+
 router.post("/subscription-types", async (req, res) => {
   try {
     const { subscriptionTypes } = req.body;
@@ -5282,6 +5352,33 @@ router.post("/subscription-types", async (req, res) => {
         ...(normalizedSeatPricing ? { seatPricing: normalizedSeatPricing } : {}),
       };
     }));
+
+    // Refuse to strand accounts on a tier that no longer exists. API callers that really mean it
+    // (e.g. after reassigning users out of band) can pass `allowStrandedUsers: true`.
+    if (req.body.allowStrandedUsers !== true) {
+      let stranded: Array<{ name: string; userCount: number }>;
+      try {
+        stranded = await findStrandedTiers(normalizedTypes.map((t: any) => t.name));
+      } catch (scanError) {
+        // Not a validation problem and nothing has been saved: tell the admin to retry.
+        console.error("Error checking which accounts are on removed subscription types:", scanError);
+        return res.status(503).json({
+          message: "Could not check which accounts are on the tiers being removed. Nothing was saved; please try again.",
+        });
+      }
+      if (stranded.length > 0) {
+        const list = stranded
+          .map((t) => `"${t.name}" (${t.userCount} account${t.userCount === 1 ? "" : "s"})`)
+          .join(", ");
+        return res.status(409).json({
+          message:
+            `Cannot remove or rename ${list}: accounts are still on ${stranded.length === 1 ? "it" : "them"} ` +
+            `(org members of those accounts inherit it too). Move them to another tier first, ` +
+            `otherwise they lose paid tools until reassigned.`,
+          strandedTiers: stranded,
+        });
+      }
+    }
 
     const updatedBy = (req as any).user?.email || "unknown";
     await settingsService.setSetting(

@@ -233,6 +233,13 @@ export interface User {
     enabled: boolean;
     optIn?: { at: string; source: string; verifiedAt?: string }; // Required before first send where the channel demands it; verifiedAt = proved control of the number
   }>;
+  /**
+   * Why this account has no WhatsApp number any more (ENG-273). Written when a number is
+   * removed — by the customer's STOP, the customer in Settings, or an admin — and cleared
+   * when a number is verified. Lets support see "Not connected, because STOP on <date>"
+   * instead of a bare "Not connected". Display only: nothing decides delivery from it.
+   */
+  whatsappDisconnect?: { reason: 'stop' | 'customer' | 'admin'; at: string; last4?: string } | null;
   secrets?: Record<string, string>; // Encrypted per-user secrets (key → encrypted value)
   landerUtmDefault?: import("../utils/landerUtm").UtmConfig; // Customer-level UTM default for generated landers (ENG-724); read/write only via landerUtmStore
   seoDomains?: string[]; // SEO domains to track (e.g., ["example.com", "subdomain.example.com"])

@@ -137,7 +137,9 @@ router.get('/me', authenticateToken, async (req, res) => {
         response.hiddenPages = await getHiddenPages(userId);
 
         // Get allowed skills resolved to { skillId, name } for display
-        const allowedSkillIds = await getAllowedSkills(userId);
+        // ENG-1978: null = entitlement unresolved. Show no tier-granted skills rather than all of
+        // them; this list drives what the UI advertises as available.
+        const allowedSkillIds = (await getAllowedSkills(userId)) ?? [];
         const publishedSkills = await skillService.getPublishedSkills();
         const isWildcard = allowedSkillIds.includes("*");
         const allowedSet = new Set(allowedSkillIds);

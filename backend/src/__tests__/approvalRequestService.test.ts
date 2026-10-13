@@ -12,6 +12,7 @@ jest.mock('@slack/web-api', () => ({
     apiCall: jest.fn(),
   })),
 }));
+jest.mock('../services/whatsappOwnerNotices', () => ({ notifyOwnerUnreachable: jest.fn() }));
 jest.mock('../services/approvalChannelNotifier', () => ({ notifyApprovalOnWhatsApp: jest.fn() }));
 jest.mock('../services/approvalDb', () => ({
   approvalDb: {
@@ -212,6 +213,22 @@ describe('a customer on WhatsApp', () => {
       ApprovalDeliveryFailedError,
     );
     expect(approvalDb.restoreApproval).not.toHaveBeenCalled();
+  });
+
+  it('emails the owner when the approval could not be delivered, and a mail failure changes nothing', async () => {
+    const { notifyOwnerUnreachable } = require('../services/whatsappOwnerNotices');
+    notifyOwnerUnreachable.mockRejectedValue(new Error('mail down'));
+    notifyApprovalOnWhatsApp.mockResolvedValue('failed');
+    await expect(requestApproval({ ...request, channel: undefined })).rejects.toBeInstanceOf(
+      ApprovalDeliveryFailedError,
+    );
+    expect(notifyOwnerUnreachable).toHaveBeenCalledWith(request.userId);
+  });
+
+  it('does not email anyone when the approval was delivered', async () => {
+    const { notifyOwnerUnreachable } = require('../services/whatsappOwnerNotices');
+    await requestApproval({ ...request, channel: undefined });
+    expect(notifyOwnerUnreachable).not.toHaveBeenCalled();
   });
 
   it('treats a notifier that throws as a failed send', async () => {
