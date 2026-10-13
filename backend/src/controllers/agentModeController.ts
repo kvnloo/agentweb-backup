@@ -15807,17 +15807,37 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Access denied to this session' });
       }
 
-      // A STORED model is not an explicit selection: when it is retired or not
-      // selectable by the owner, store the current default instead (as /generate
-      // does) so runVerifiedChat, which reads the session, never runs the stored one.
-      if (session.llmModel) {
-        const storedPolicy = await resolveEffectiveModelForUser({
-          userId: session.userId,
-          requestedModel: session.llmModel,
-          allowSilentSwap: true,
-        });
-        if (storedPolicy.modelSelection === 'corrected' && storedPolicy.effectiveModel) {
-          await chatbotDb.updateSessionLlmModel(sessionId, storedPolicy.effectiveModel, toStoredModelPolicyDecision(storedPolicy));
+      // The model the user picked for this chat is used as-is for the whole turn:
+      // runVerifiedChat only applies its task-type defaults (report/image/video) when
+      // it is given NO model, so passing the resolved one below disables that swap.
+      //  - EXPLICIT (the request carries `llmModel`): must run on exactly that model or
+      //    not run at all. A retired / not-selectable pick is refused with the same
+      //    422 `model_unavailable` as /generate, before the generation lock is taken.
+      //  - STORED only (session.llmModel): not explicit, because the system stamps the
+      //    configured default into it (Slack, GTM, ...). A retired / not-selectable
+      //    stored model is replaced by the current default, as /generate does.
+      //  - Neither: nothing is passed and the task-type defaults still apply.
+      const explicitModel = normalizeRequestedLlmModel(req.body?.llmModel);
+      let selectedModel: string | undefined;
+      const requestedModel = explicitModel || session.llmModel;
+      if (requestedModel) {
+        let modelDecision: EffectiveModelPolicyDecision;
+        try {
+          modelDecision = await resolveEffectiveModelForUser({
+            userId: session.userId,
+            requestedModel,
+            allowSilentSwap: !explicitModel,
+          });
+        } catch (modelError) {
+          if (!isModelUnavailableError(modelError)) throw modelError;
+          return res.status(422).json(modelUnavailableBody(modelError));
+        }
+        selectedModel = modelDecision.effectiveModel || session.llmModel || undefined;
+        if (
+          modelDecision.effectiveModel
+          && (modelDecision.modelSelection === 'corrected' || modelDecision.effectiveModel !== session.llmModel)
+        ) {
+          await chatbotDb.updateSessionLlmModel(sessionId, modelDecision.effectiveModel, toStoredModelPolicyDecision(modelDecision));
         }
       }
 
@@ -15858,6 +15878,7 @@ export const agentModeController = {
         requiredFunctions: requiredFunctionsArray,
         maxAttempts: maxAttemptsParam || 5,
         attachments: attachmentsArray,
+        llmModel: selectedModel,
         // ENG-636: interactive endpoint — the user's live session renders the
         // deck-of-one card, so a park reaches a human who can answer.
         parkNotifiable: true,
