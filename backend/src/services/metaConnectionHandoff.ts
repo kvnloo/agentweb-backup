@@ -16,6 +16,7 @@
 import type { ConnectedAccount } from './connectedAccountsDb';
 import { metaService } from './metaService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { TOKEN_ALERT_CLASS } from './metaTrackingMonitor';
 
 /** At most one handoff per account per day; the cron runs every 12h. */
 export const META_HANDOFF_DEDUPE_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -77,6 +78,15 @@ export function decideMetaHandoff(input: MetaHandoffInput): MetaHandoffDecision 
   };
 }
 
+/**
+ * ENG-2442: per-ad-account dedupe identity shared with metaTrackingMonitor's token alert.
+ * Keyed on the ad account only (not the user), so every Meta token/connection alert for one
+ * account folds onto ONE open canonical; a different account still gets its own.
+ */
+export function metaAccountAlertContext(accountId: string): Record<string, string> {
+  return { 'Alert Class': TOKEN_ALERT_CLASS, 'Alert Scope': `meta-ad-account:${accountId}` };
+}
+
 /** Raise the handoff. Returns true only when an alert was actually delivered. Never throws. */
 export async function raiseMetaConnectionHandoff(input: MetaHandoffInput): Promise<boolean> {
   const decision = decideMetaHandoff(input);
@@ -104,8 +114,10 @@ export async function raiseMetaConnectionHandoff(input: MetaHandoffInput): Promi
       dedupeWindowMs: META_HANDOFF_DEDUPE_WINDOW_MS,
       now: input.now,
       context: {
-        // One open tracked issue per account: repeats land on it, not as new issues.
-        'Alert Class': `meta-connection:${input.userId}:${input.account.account_id}`,
+        // ENG-2442: share the tracking monitor's per-account canonical (class + scope), so a
+        // handoff re-fire for an account whose 'cannot be read — token invalid' issue is already
+        // open lands on THAT issue as a recurrence instead of filing a parallel one each tick.
+        ...metaAccountAlertContext(input.account.account_id),
         userId: input.userId,
         accountId: input.account.account_id,
         reason: input.reason,
