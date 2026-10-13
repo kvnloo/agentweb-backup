@@ -40,7 +40,7 @@ jest.mock("../services/brandGuidelinesPopulation", () => ({
 import express from "express";
 import request from "supertest";
 import onboardingStepsRoutes from "../routes/onboardingSteps";
-import { casUpdateIcpList, ICP_LIST_CONTENDED, regenerateSingleIcpForUser } from "../services/onboardingIcpService";
+import { casUpdateIcpList, regenerateSingleIcpForUser } from "../services/onboardingIcpService";
 import type { FakeTable } from "./helpers/fakeDocClient";
 
 const app = express();
@@ -163,17 +163,48 @@ describe("concurrent edit-one", () => {
 });
 
 describe("casUpdateIcpList", () => {
-  it("gives up with a 409 from the route rather than overwriting when the list never settles", async () => {
-    // Every write loses: someone else changes the list between each read and write.
+  it("still applies the change, from the freshest read, when the compare-and-swap never wins", async () => {
+    // Every conditional write loses: the list changes between each read and write
+    // (equivalently, the stored list never reads back equal to what was compared).
+    let churn = 0;
     table().beforeUpdate = async (params, t) => {
       if (!Object.values(params.ExpressionAttributeNames ?? {}).includes("icpResult")) return;
-      const list = t.row.icpResult.map((p: any, i: number) => (i === 4 ? { ...p, pain: `churn ${Math.random()}` } : p));
+      if (!params.ConditionExpression) return; // the final, unconditional write
+      churn += 1;
+      const list = t.row.icpResult.map((p: any, i: number) => (i === 4 ? { ...p, pain: `churn ${churn}` } : p));
       t.row = { ...t.row, icpResult: list };
     };
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
     const res = await post("delete-one", { icpId: "icp_0" });
 
-    expect(res.status).toBe(409);
-    await expect(casUpdateIcpList("u1", (list) => ({ next: list, result: null }))).rejects.toMatchObject({ code: ICP_LIST_CONTENDED });
+    // The user's delete is not lost to a 409 they cannot act on...
+    expect(res.status).toBe(200);
+    expect(ids()).toEqual(["icp_1", "icp_2", "icp_3", "icp_4"]);
+    // ...it was computed from the latest list, so the concurrent change survives too...
+    expect(table().row.icpResult[3].pain).toBe(`churn ${churn}`);
+    // ...and the fallback is visible in the logs.
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("without the compare-and-swap"))).toBe(true);
+  });
+
+  it("applies an edit the same way", async () => {
+    table().beforeUpdate = async (params, t) => {
+      if (!params.ConditionExpression) return;
+      t.row = { ...t.row, icpResult: t.row.icpResult.map((p: any, i: number) => (i === 4 ? { ...p, pain: `churn ${Math.random()}` } : p)) };
+    };
+    jest.spyOn(console, "warn").mockImplementation(() => {});
+    const res = await post("edit-one", { icpId: "icp_2", patch: { name: "STILL APPLIED" } });
+
+    expect(res.status).toBe(200);
+    expect(table().row.icpResult[2].name).toBe("STILL APPLIED");
+    expect(table().row.icpResult[2].userIntent).toEqual({ name: "STILL APPLIED" });
+  });
+
+  it("does not take the unconditional path when the first attempt wins", async () => {
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    await casUpdateIcpList("u1", (list) => ({ next: list.slice(1), result: null }));
+
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("without the compare-and-swap"))).toBe(false);
+    expect(table().updates.every((u: any) => Boolean(u.ConditionExpression))).toBe(true);
   });
 });
 
