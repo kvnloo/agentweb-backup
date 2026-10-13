@@ -704,11 +704,10 @@ router.post("/ad-copy/update", authenticateToken, async (req, res) => {
 // ─────────────────────── BrandReview-gate per-card actions ───────────────────
 //
 // These three endpoints power the per-ICP-card actions on the BrandReview
-// gate (the screen between dataGathering and adReveal). Personas don't
-// carry an opaque id in storage, so we use index-based identity: the FE
-// backfills `id: 'icp-{idx}'` when rendering, and we parse the index out
-// of that string here. Future schema change (adding a stable persona id)
-// can wrap these without changing the FE contract.
+// gate (the screen between dataGathering and adReveal). Newer personas carry a
+// stable `id`; older ones don't, and the FE names those `icp-{idx}`, which we
+// parse into an index here. writeIcpCard pins that index to the card's identity
+// on the first read, so a retry never lands on a different card.
 
 const ICP_ID_RE = /^icp-(\d+)$/;
 const ICP_PERSONA_FIELDS = [

@@ -520,7 +520,7 @@ function fingerprintOf(card: any): Record<string, unknown> {
 }
 
 function sameFingerprint(card: any, fingerprint: Record<string, unknown>): boolean {
-  return ID_LESS_IDENTITY_FIELDS.every((f) => card?.[f] === fingerprint[f]);
+  return ID_LESS_IDENTITY_FIELDS.every((f) => JSON.stringify(card?.[f]) === JSON.stringify(fingerprint[f]));
 }
 
 /**
@@ -549,7 +549,7 @@ export async function writeIcpCard(
   // card again, not re-run `resolve`: a positional ref such as `icp-2` names
   // whatever sits at position 2 NOW, which after a concurrent delete is a different
   // card.
-  let target: { idKnown: boolean; id: unknown; fingerprint: Record<string, unknown>; index: number } | null = null;
+  let target: { idKnown: boolean; id: unknown; fingerprint: Record<string, unknown>; index: number; length: number } | null = null;
 
   for (let attempt = 0; attempt < MAX_CARD_WRITE_ATTEMPTS; attempt++) {
     const user: any = await readUserForRegeneration(userId);
@@ -562,25 +562,32 @@ export async function writeIcpCard(
       if ("status" in resolved) return { ok: false, status: resolved.status };
       idx = resolved.index;
       const first: any = list[idx];
-      target = { idKnown: first?.id !== undefined, id: first?.id, fingerprint: fingerprintOf(first), index: idx };
+      target = { idKnown: first?.id !== undefined, id: first?.id, fingerprint: fingerprintOf(first), index: idx, length: list.length };
     } else {
-      // Same card by identity: its id, or, for a card stored before ids existed, its name.
+      // Same card by identity: its id, or, for a card stored before ids existed, its
+      // visible text.
       const wanted = target;
       const matches = list
         .map((p: any, i) => ({ i, p }))
         .filter(({ p }) => (wanted.idKnown ? p?.id === wanted.id : p?.id === undefined && sameFingerprint(p, wanted.fingerprint)));
-      if (matches.length === 0) {
-        if (wanted.idKnown) return { ok: false, status: 404 };
-        // Without an id, "gone" and "renamed by a concurrent edit" look the same:
-        // ask the caller to retry from a fresh read rather than report a false 404.
+      if (matches.length > 1) {
+        // Same-looking cards cannot be told apart: never guess.
         throw Object.assign(new Error("the persona could not be re-identified"), { code: ICP_LIST_CONTENDED });
       }
-      // Several id-less cards sharing a name cannot be told apart: never guess.
-      if (!wanted.idKnown && matches.length > 1) {
-        throw Object.assign(new Error("the persona could not be re-identified"), { code: ICP_LIST_CONTENDED });
+      if (matches.length === 1) {
+        idx = matches[0].i;
+      } else if (!wanted.idKnown && list.length === wanted.length && (list[wanted.index] as any)?.id === undefined) {
+        // A concurrent edit changed the text this card was matched on. Nothing was
+        // added or removed, so it is still where it was.
+        idx = wanted.index;
+      } else {
+        // Gone, or moved and changed beyond recognition. 404 makes the client refresh
+        // instead of offering a retry that could land on a different card.
+        return { ok: false, status: 404 };
       }
-      idx = matches.sort((x, y) => Math.abs(x.i - wanted.index) - Math.abs(y.i - wanted.index))[0].i;
       target.index = idx;
+      target.length = list.length;
+      if (!wanted.idKnown) target.fingerprint = fingerprintOf(list[idx]);
     }
     const card: any = list[idx];
 
