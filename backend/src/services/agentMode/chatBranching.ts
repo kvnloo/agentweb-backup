@@ -116,7 +116,7 @@ export interface BranchDeps {
   isAcceptingWork(): boolean;
   isFeatureEnabled(): Promise<boolean>;
   getSession(sessionId: string, options?: { consistentRead?: boolean }): Promise<ChatSession | null>;
-  tryClaim(sessionId: string): boolean;
+  tryClaim(sessionId: string, ownerUserId?: string): boolean;
   release(sessionId: string): void;
   /** Cross-instance submit lock (the AGENT_RUN_STORE lane createSession uses). Absent when the store is off. */
   claimIdempotency?(userId: string, scope: string): Promise<IdempotencyClaimResult>;
@@ -675,7 +675,7 @@ async function createBranch(
 
   // 2. Hold the SOURCE's generation lock for the whole read+copy so a running turn cannot tear the
   //    copy and none can start while it runs. Never release a lock we did not take.
-  if (!deps.tryClaim(input.sessionId)) {
+  if (!deps.tryClaim(input.sessionId, firstRead.userId)) {
     return fail(409, 'A response is already being generated for this session. Please wait.', 'SESSION_BUSY', {
       message: 'A response is already being generated for this session. Please wait.',
     });
