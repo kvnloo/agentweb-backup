@@ -15,6 +15,7 @@
  */
 import { metaToolRegistry } from '../emma/metaTools';
 import type { McpToolRegistry } from './server/registry';
+import { isZomaTool, ZOMA_TOOL_DEFINITIONS } from './zomaToolDefinitions';
 
 export const META_TOOLKIT_V1_TOOL_NAMES = [
   'list_meta_ads_campaigns',
@@ -66,15 +67,18 @@ function narrowDefinition(definition: any): any {
  * manifest would read as a product change.
  */
 export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegistry) {
-  return META_TOOLKIT_V1_TOOL_NAMES.map((name) => {
+  const metaTools = META_TOOLKIT_V1_TOOL_NAMES.map((name) => {
     const tool = registry.getTool(name);
     if (!tool) throw new Error(`Meta Toolkit manifest: tool ${name} is not registered`);
     return narrowDefinition(tool.definition);
   });
+  // ENG-2303: toolkit-local Zoma onboarding tools (handled by the gateway, not the registry).
+  return [...metaTools, ...ZOMA_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d)))];
 }
 
 /** Throws MetaToolkitRefusal when the call is outside the v1 surface. */
 export function assertMetaToolkitV1Call(name: string, args: any): void {
+  if (isZomaTool(name)) return;
   if (!isV1Tool(name)) {
     throw new MetaToolkitRefusal(`Tool ${name} is not part of the Meta Toolkit.`);
   }
