@@ -7476,12 +7476,11 @@ export class AgentModeService {
   }
 
   /**
-   * ENG-1978: the one fail-closed toolset. A session that cannot prove its entitlement gets
-   * `install_skills` and nothing else — enough to recover, not enough to act. Extracted so the
-   * error path and the unresolved-entitlement path cannot drift apart. Deliberately silent: the
-   * unresolved case was already recorded as a structured `[entitlement] ENTITLEMENT-DENIED` event
-   * where the tier failed to resolve, and the error path logs its own error — a third free-text
-   * `[entitlement]` line per agent turn would only inflate that grep during an outage.
+   * ENG-1978: the toolset for the catch-all error path in getFilteredTools — `install_skills` and
+   * nothing else, enough to recover, not enough to act. (An unresolved entitlement is handled
+   * separately and is more generous: it keeps the foundation tools.) Deliberately silent: the
+   * caller's catch already logs the error, and an unresolved tier is recorded as a structured
+   * `[entitlement] ENTITLEMENT-DENIED` event where it failed to resolve.
    */
   private installSkillsOnlyToolset(): any[] {
     const installSkillsTool = this.toolRegistry.getTool('install_skills');
@@ -7521,12 +7520,17 @@ export class AgentModeService {
       const allowedFunctionCalls = await resolveSkillsToToolNames(skillIds, userId);
 
       // ENG-1978: null means the entitlement could not be resolved — an unknown/malformed tier or
-      // a failed settings read. Fall into the same fail-closed toolset this function's own catch
-      // uses. Its comment below has always stated the policy ("DO NOT return all tools on error as
-      // it's a security risk"); until now the inner lookups returned ["*"] on exactly these
-      // failures and silently defeated it.
+      // a failed settings read. Fail closed: nothing the tier would have unlocked is granted.
+      // Foundation tools (plus install_skills, so the user can recover) are still returned: every
+      // tier, Free included, already gets them unconditionally on the normal path, so handing them
+      // to an unresolved tier grants nothing a plan-less user lacks — it just keeps the session
+      // usable through a blip instead of dead. Skill tools already installed in the session are
+      // NOT carried over: their entitlement is exactly what could not be confirmed.
       if (allowedFunctionCalls === null) {
-        return this.installSkillsOnlyToolset();
+        return filterFunctionCalls(definitions, [
+          ...AgentModeService.FOUNDATION_TOOLS,
+          'install_skills',
+        ]);
       }
 
       // Foundation tools must always bypass subscription filtering — they are
