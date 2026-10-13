@@ -10016,13 +10016,20 @@ export const agentModeController = {
         if (feedbackIntent && Object.prototype.hasOwnProperty.call(EMMA_FEEDBACK_INTENTS, feedbackIntent)) {
           const intentConfig = EMMA_FEEDBACK_INTENTS[feedbackIntent];
           try {
+            // Match /support attribution: reporter details come from the DB user record (the
+            // token carries no displayName/funnelStatus), and admin delegation is recorded.
+            const reporter = await userDb.getUserById(user.userId).catch(() => null);
+            const delegate = (req as any).delegateInfo;
             const filing = await fileProductFeedback({
               user: {
                 userId: user.userId,
-                email: user.email,
-                displayName: (user as any).displayName,
-                funnelStatus: (user as any).funnelStatus,
+                email: reporter?.email || user.email,
+                displayName: reporter?.displayName,
+                funnelStatus: reporter?.funnelStatus,
               },
+              reportedByAdmin: delegate?.isDelegated === true && delegate.adminEmail
+                ? delegate.adminEmail
+                : undefined,
               reportType: feedbackIntent,
               titlePrefix: intentConfig.titlePrefix,
               tag: intentConfig.tag,
