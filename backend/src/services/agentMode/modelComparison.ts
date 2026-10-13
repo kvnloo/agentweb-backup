@@ -171,7 +171,7 @@ export interface CompareDeps {
    * Did the model the gateway reports as having answered correspond to the one that was requested?
    * Only the selected model may ever answer a comparison column.
    */
-  servedModelMatches(requestedCanonical: string, served: unknown): boolean;
+  servedModelMatches(requestedCanonical: string, served: unknown): boolean | Promise<boolean>;
   /** Resolves a billing owner id for metering (org members pool onto the owner). */
   resolveBillingUserId(userId: string): Promise<string>;
   callLLM(model: string, messages: Array<{ role: string; content: string }>, options: CompareCallOptions): Promise<unknown>;
@@ -479,7 +479,8 @@ export function isSameServedModel(
   /**
    * Other registered upstream ids. A base id (`deepseek/deepseek-v4-pro`) must not accept the dated slug of a
    * registered MMDD sibling (`deepseek/deepseek-v4-pro-0813` -> `...-20260813`), which the date-stripping alone
-   * cannot tell apart from the base id's own snapshot.
+   * cannot tell apart from the base id's own snapshot. Callers also pass the live catalog's ids so a sibling
+   * that exists upstream but is not registered yet is refused too.
    */
   knownUpstreamIds: Iterable<string> = [],
 ): boolean {
@@ -506,6 +507,11 @@ export function isSameServedModel(
     }
   }
   return true;
+}
+
+/** Does this served slug carry a snapshot date (`-20260423` / `-2026-04-23`)? Only those need sibling disambiguation. */
+export function isDatedServedSlug(served: unknown): boolean {
+  return typeof served === 'string' && splitServedModel(served)?.date != null;
 }
 
 function sameTokens(a: string[], b: string[]): boolean {
@@ -791,7 +797,7 @@ async function runOne(
     // gateway should serve exactly it; verify what it reports and discard anything else rather than
     // label another model's answer with the selected model's name (or sign it for "Continue").
     const served = (response as { model?: unknown } | null | undefined)?.model;
-    if (typeof served === 'string' && served.trim() !== '' && !deps.servedModelMatches(candidate.canonical, served)) {
+    if (typeof served === 'string' && served.trim() !== '' && !(await deps.servedModelMatches(candidate.canonical, served))) {
       deps.log('ModelCompare: a different model answered than the one selected', { requested: candidate.canonical, served });
       return { status: 'error', errorCode: 'model_mismatch', latencyMs };
     }
