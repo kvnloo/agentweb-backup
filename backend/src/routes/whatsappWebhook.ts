@@ -34,16 +34,53 @@ import {
   OPT_IN_CONFIRMATION,
 } from '../services/whatsappService';
 import { handleVerificationMessage } from '../services/whatsappVerificationService';
+import { handleApprovalButtonTap } from '../services/approvalChannelNotifier';
+import { handleUnrecognizedMessage } from '../services/whatsappInboundSupport';
 
 const router = express.Router();
+
+/** Log a failed delivery receipt by message id and Meta error code. Never the number. */
+function logFailedStatus(status: any): void {
+  if (status?.status !== 'failed') return;
+  const err = status?.errors?.[0];
+  console.error(
+    `[whatsapp-webhook] outbound message …${String(status?.id ?? 'unknown').slice(-8)} FAILED to deliver ` +
+      `(code ${err?.code ?? 'unknown'}: ${err?.title ?? err?.message ?? 'no detail'})`,
+  );
+}
 
 /**
  * Opt-out keywords must match the WHOLE message, not appear anywhere in it —
  * "please stop by the office tomorrow" is not an opt-out request, and treating it
  * as one silently cuts a customer off from every future notification.
  */
-const STOP_KEYWORDS = new Set(['stop', 'unsubscribe', 'cancel', 'end', 'quit']);
+const STOP_KEYWORDS = new Set([
+  'stop',
+  'unsubscribe',
+  'cancel',
+  'end',
+  'quit',
+  'stop all',
+  'please stop',
+  'stop please',
+  'stop messages',
+]);
 const START_KEYWORDS = new Set(['unstop', 'start', 'resubscribe']);
+
+/**
+ * Lower-case, trim, and drop trailing punctuation so "Stop." and "STOP!" are the same
+ * request as "stop". Still a whole-message match: "please stop by the office" is not.
+ */
+const normalizeKeyword = (text: string): string =>
+  text
+    // NFKC folds fullwidth letters ("ＳＴＯＰ") to ASCII.
+    .normalize('NFKC')
+    .toLowerCase()
+    // Anything that is not a letter, digit or space — punctuation, quotes, emoji, zero-width
+    // characters — is noise around the word: "Stop 🛑", "\"stop\"" and "stop…" all mean stop.
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 
 /** Meta reports `from` without a leading '+'. Normalize so window/opt-out keys agree. */
 const toKeyPhone = (from: string): string => (from.startsWith('+') ? from : `+${from}`);
@@ -122,9 +159,14 @@ router.post('/', async (req, res) => {
   try {
     for (const entry of payload?.entry ?? []) {
       for (const change of entry?.changes ?? []) {
-        // `statuses` are OUR outbound messages being delivered/read. They are
-        // deliberately not handled here: treating one as inbound would open a service
-        // window and let us send free-form text to someone who never wrote to us.
+        // `statuses` are OUR outbound messages being delivered/read. They are never
+        // treated as inbound — that would open a service window and let us send free-form
+        // text to someone who never wrote to us. A FAILED one is only logged, loudly: the
+        // send API confirms acceptance, not delivery, so this is the one place a message
+        // that was accepted and then dropped can be seen.
+        for (const status of change?.value?.statuses ?? []) {
+          logFailedStatus(status);
+        }
         for (const message of change?.value?.messages ?? []) {
           await handleInboundMessage(message);
         }
@@ -140,6 +182,56 @@ router.post('/', async (req, res) => {
   }
 });
 
+/**
+ * A tapped button, in whichever of the two shapes Meta sends.
+ *
+ * Non-template interactive buttons return the `id` WE set, which is the useful case.
+ * TEMPLATE quick-replies do not: Meta fills `button.payload` with the button's own
+ * LABEL, so the label is all that comes back and the action has to be inferred from it.
+ * Either way the only link to what was being approved is `context.id` — the id of the
+ * message the button sat on — so a tap without it cannot be attributed and is ignored.
+ */
+function readButtonTap(
+  message: any,
+): { action: string; contextMessageId: string } | null {
+  const contextMessageId = message?.context?.id;
+  if (typeof contextMessageId !== 'string' || !contextMessageId) return null;
+
+  if (message?.type === 'interactive' && message?.interactive?.type === 'button_reply') {
+    const action = message.interactive.button_reply?.id;
+    return typeof action === 'string' && action ? { action, contextMessageId } : null;
+  }
+
+  if (message?.type === 'button') {
+    const action = message.button?.payload ?? message.button?.text;
+    return typeof action === 'string' && action ? { action, contextMessageId } : null;
+  }
+
+  return null;
+}
+
+/**
+ * What a media message carries that the team needs to act on it: its caption, and enough
+ * to find the file (its type, filename and Meta's media id). The file itself is not
+ * fetched or attached — downloading needs the Graph token and would put customer media in
+ * email — so the hand-off says where to look instead of just "[image message]".
+ */
+const MEDIA_KINDS = new Set(['image', 'document', 'audio', 'video']);
+
+function readMediaDetails(message: any): { caption: string; detail: string } {
+  const kind = message?.type;
+  // Text messages also carry an object under their own type (`text: { body }`), so the
+  // kind has to be a media one — otherwise plain text is described as an attachment.
+  if (typeof kind !== 'string' || !MEDIA_KINDS.has(kind)) return { caption: '', detail: '' };
+  const media = message?.[kind];
+  if (!media || typeof media !== 'object') return { caption: '', detail: '' };
+  const caption = typeof media.caption === 'string' ? media.caption : '';
+  const parts: string[] = [String(kind)];
+  if (typeof media.filename === 'string' && media.filename) parts.push(`file "${media.filename}"`);
+  if (typeof media.id === 'string' && media.id) parts.push(`media id ${media.id}`);
+  return { caption, detail: parts.join(', ') };
+}
+
 async function handleInboundMessage(message: any): Promise<void> {
   const from = message?.from;
   if (typeof from !== 'string' || !from) return;
@@ -149,8 +241,20 @@ async function handleInboundMessage(message: any): Promise<void> {
   // that is what makes the opt-out confirmation deliverable.
   await recordInboundMessage(phone);
 
+  // A tapped button carries no text body, so it must be read before the text branches
+  // below — otherwise it falls through to the verification parser and is dropped.
+  const tap = readButtonTap(message);
+  if (tap) {
+    await handleApprovalButtonTap({
+      phone,
+      approvalMessageId: tap.contextMessageId,
+      action: tap.action,
+    });
+    return;
+  }
+
   const text: string = message?.text?.body ?? '';
-  const normalized = text.trim().toLowerCase();
+  const normalized = normalizeKeyword(text);
   if (STOP_KEYWORDS.has(normalized)) {
     await recordOptOut(phone);
     console.log(`[whatsapp-webhook] opt-out recorded for ${redactPhone(phone)}`);
@@ -176,9 +280,16 @@ async function handleInboundMessage(message: any): Promise<void> {
     );
   } else {
     // "Verify <CODE>" binds this sender's number to the portal user who holds the code.
-    // A fixed command only — anything that is not exactly that shape is ignored, so this
-    // stays a notification channel and never becomes a conversation.
-    await handleVerificationMessage(text, phone);
+    // A fixed command only. Anything else is handed to the support hand-off (a fixed
+    // greeting plus a forward to the team, no model involved), so this never becomes an
+    // AI conversation.
+    const wasVerification = await handleVerificationMessage(text, phone);
+    if (!wasVerification) {
+      // Not a command at all. Greet, and pass the message to the team — a fixed reply
+      // and an email, never a model, so this stays a support hand-off and not a chat.
+      const media = readMediaDetails(message);
+      await handleUnrecognizedMessage(phone, text || media.caption, message?.type ?? 'text', media.detail, message?.id);
+    }
   }
 }
 

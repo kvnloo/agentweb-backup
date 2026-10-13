@@ -62,6 +62,35 @@ describe('POST /api/slack/send-approval channel entitlement (ENG-2413)', () => {
     expect(sendApprovalRequestWithTracking).toHaveBeenCalledWith(expect.objectContaining({ channel: 'C_OWN' }));
   });
 
+  it('does not refuse a WhatsApp customer whose task still names an old Slack channel', async () => {
+    // They are entitled to no Slack channel by design, and requestApproval ignores the
+    // channel for them — a 403 here would stop them being asked and hold their output.
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: 'u1',
+      messagingChannels: [
+        {
+          channel: 'whatsapp',
+          destination: '+14155550123',
+          enabled: true,
+          optIn: { at: '2026-10-01T00:00:00Z', source: 'inbound_verification', verifiedAt: '2026-10-01T00:01:00Z' },
+        },
+      ],
+    });
+    (getEffectiveAllowedChannels as jest.Mock).mockResolvedValue([]);
+    await request(app).post('/api/slack/send-approval').send(body('C_OLD_TASK_CHANNEL')).expect(200);
+    // No channel is handed on: if requestApproval's own read of the account disagrees, it
+    // must fail closed rather than post to the channel the caller named.
+    expect(sendApprovalRequestWithTracking).toHaveBeenCalledWith(expect.objectContaining({ channel: '' }));
+  });
+
+  it('answers 403, not 500, when the approval belongs to another account', async () => {
+    const err = Object.assign(new Error('That asset belongs to a different account.'), {
+      name: 'ApprovalForbiddenError',
+    });
+    (sendApprovalRequestWithTracking as jest.Mock).mockRejectedValue(err);
+    await request(app).post('/api/slack/send-approval').send(body('C_OWN')).expect(403);
+  });
+
   it('allows a real admin to any channel without resolving the allowlist', async () => {
     mockUser = { userId: 'u1', isAdmin: true };
     await request(app).post('/api/slack/send-approval').send(body('C_OTHER')).expect(200);

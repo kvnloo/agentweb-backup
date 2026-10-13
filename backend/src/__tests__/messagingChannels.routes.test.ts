@@ -25,14 +25,18 @@ jest.mock('../services/db', () => ({
 jest.mock('../services/whatsappService', () => ({
   isOptedOut: jest.fn(),
   getDisplayPhoneNumber: jest.fn(),
+  unbindPhone: jest.fn(),
 }));
 jest.mock('../services/whatsappVerificationService', () => ({
   startVerification: jest.fn(),
   getVerificationStatus: jest.fn(),
+  // The real disconnect: the DELETE tests below assert on what it writes.
+  disconnectWhatsApp: jest.requireActual('../services/whatsappVerificationService').disconnectWhatsApp,
 }));
 
 const { userDb } = require('../services/db');
 const { isOptedOut, getDisplayPhoneNumber } = require('../services/whatsappService');
+const whatsapp = require('../services/whatsappService');
 const { startVerification, getVerificationStatus } = require('../services/whatsappVerificationService');
 
 import messagingChannelsRouter from '../routes/messagingChannels';
@@ -116,10 +120,65 @@ describe('there is no way to save a typed-in number', () => {
   });
 });
 
+describe('GET / — which platform the account is on', () => {
+  it('reports Slack for a Slack customer', async () => {
+    userDb.getUserById.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
+    const res = await request(app).get('/api/messaging-channels');
+    expect(res.body.platform).toBe('slack');
+    expect(res.body.platformSource).toBe('account');
+  });
+
+  it('reports WhatsApp for a customer with a verified number', async () => {
+    isOptedOut.mockResolvedValue(false);
+    userDb.getUserById.mockResolvedValue({
+      userId: 'u1',
+      messagingChannels: [
+        { channel: 'whatsapp', destination: '+14155550123', enabled: true, optIn: { verifiedAt: 'y' } },
+      ],
+    });
+    const res = await request(app).get('/api/messaging-channels');
+    expect(res.body.platform).toBe('whatsapp');
+  });
+
+  it('reports no platform for an account that has connected neither', async () => {
+    userDb.getUserById.mockResolvedValue({ userId: 'u1' });
+    const res = await request(app).get('/api/messaging-channels');
+    expect(res.body.platform).toBeNull();
+  });
+});
+
 describe('POST /whatsapp/verification', () => {
   beforeEach(() => {
     getDisplayPhoneNumber.mockResolvedValue('14155550100');
     startVerification.mockResolvedValue({ code: 'K7Q2M9XA', expiresAt: '2026-09-21T12:10:00.000Z' });
+    userDb.getUserById.mockResolvedValue({ userId: 'u1' });
+  });
+
+  it('refuses an account that is already on Slack — one platform per customer', async () => {
+    userDb.getUserById.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
+    const res = await request(app)
+      .post('/api/messaging-channels/whatsapp/verification')
+      .send({ optIn: true });
+
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe('platform_conflict');
+    expect(res.body.connected).toBe('slack');
+    expect(res.body.error).toMatch(/already connected to Slack/);
+    // No code is issued for a connection that would be refused at the other end.
+    expect(startVerification).not.toHaveBeenCalled();
+  });
+
+  it('allows re-verifying for an account already on WhatsApp', async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: 'u1',
+      messagingChannels: [
+        { channel: 'whatsapp', destination: '+14155550123', enabled: true, optIn: { verifiedAt: 'y' } },
+      ],
+    });
+    const res = await request(app)
+      .post('/api/messaging-channels/whatsapp/verification')
+      .send({ optIn: true });
+    expect(res.status).toBe(200);
   });
 
   it('starts a verification and returns the code with a ready-to-tap WhatsApp link', async () => {
@@ -240,5 +299,35 @@ describe('DELETE /whatsapp', () => {
   it('is a no-op-shaped success when no WhatsApp entry exists', async () => {
     userDb.getUserById.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
     expect((await request(app).delete('/api/messaging-channels/whatsapp')).status).toBe(200);
+  });
+
+  it('clears the phone -> user index for the removed number', async () => {
+    // Left behind, a disconnected number keeps resolving to this account and could
+    // still answer its inbound actions.
+    userDb.getUserById.mockResolvedValue({
+      userId: 'u1',
+      messagingChannels: [{ channel: 'whatsapp', destination: '+14155550123', enabled: true }],
+    });
+    await request(app).delete('/api/messaging-channels/whatsapp');
+    // Conditional on the account still owning the row, so a number re-bound elsewhere is left alone.
+    expect(whatsapp.unbindPhone).toHaveBeenCalledWith('+14155550123', 'u1');
+  });
+
+  it('does not try to clear an index when there was no number', async () => {
+    userDb.getUserById.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
+    await request(app).delete('/api/messaging-channels/whatsapp');
+    expect(whatsapp.unbindPhone).not.toHaveBeenCalled();
+  });
+
+  it('still reports success when clearing the index fails', async () => {
+    // The index self-heals on read, so a failure here must not turn a disconnect the
+    // user already completed into an error.
+    whatsapp.unbindPhone.mockRejectedValueOnce(new Error('dynamo down'));
+    userDb.getUserById.mockResolvedValue({
+      userId: 'u1',
+      messagingChannels: [{ channel: 'whatsapp', destination: '+14155550123', enabled: true }],
+    });
+    const res = await request(app).delete('/api/messaging-channels/whatsapp');
+    expect(res.status).toBe(200);
   });
 });
