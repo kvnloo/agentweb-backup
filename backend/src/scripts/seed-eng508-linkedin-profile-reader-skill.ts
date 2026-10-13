@@ -156,7 +156,9 @@ export async function enrollSkillInTiers(
 
   // Reachability judged by the SAME rule used to enroll, so the two can never
   // disagree. A dry run reports the post-apply state (nothing was written yet).
-  const reachable = tiers.length === 0 || tiers.some((t) => tierAllowsSkill(t, skillId));
+  // An empty tier list reaches nothing at runtime either (it falls back to the built-in Free tier,
+  // which has no skills, or to a flagged Basic grant that is denied), so it is not "reachable".
+  const reachable = tiers.some((t) => tierAllowsSkill(t, skillId));
   return { changed, alreadyAllowed, reachable };
 }
 
@@ -197,19 +199,19 @@ async function main() {
   console.log(`Reachable (runtime semantics): ${reachable}`);
   if (!reachable) throw new Error('Skill is still not reachable from any subscription tier');
 
-  // Cross-check against findTiersAllowingSkill — the helper behind the admin
-  // entitlement warning. It reads an EMPTY allowedSkills list as "allows nothing"
-  // while the runtime treats it as wildcard, so the two can legitimately disagree
-  // for empty-list tiers. Report that divergence instead of failing on it: the
-  // runtime result above is authoritative for whether the tool is discoverable.
+  // Cross-check against findTiersAllowingSkill — the helper behind the admin entitlement warning.
+  // Per tier it follows the same rule as the runtime, but it deliberately fails OPEN when the
+  // subscription_types setting is absent, empty or unparseable, so the two can still disagree in
+  // those degraded states. Report that divergence instead of failing on it: the runtime result
+  // above is authoritative for whether the tool is discoverable.
   if (!dryRun) {
     const { findTiersAllowingSkill } = await import('../services/subscriptionService');
     const { reachable: warnReachable, allowingTiers, totalTiers } = await findTiersAllowingSkill(skill.skillId);
     console.log(`Admin-warning view: reachable=${warnReachable} (${allowingTiers.length}/${totalTiers}: ${allowingTiers.join(', ') || 'none'})`);
     if (!warnReachable) {
       console.warn(
-        'NOTE: the admin entitlement warning will still flag this skill. That happens when every ' +
-          'tier stores an EMPTY allowedSkills list — allowed at runtime, but not counted by that helper.'
+        'NOTE: the admin entitlement warning will still flag this skill. Check that no tier is ' +
+          'missing its allowedSkills list or holding an empty one — neither reaches the skill at runtime.'
       );
     }
   }

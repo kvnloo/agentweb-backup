@@ -4922,9 +4922,10 @@ router.get("/subscription-types", async (req, res) => {
         normalizedPages = allAvailablePages;
       }
 
-      // Handle allowedSkills with backward compatibility
-      // If old format (allowedFunctionCalls but no allowedSkills), treat as all skills
-      let normalizedSkills = type.allowedSkills || allAvailableSkills;
+      // ENG-1978: a row without allowedSkills (old allowedFunctionCalls format) is no longer read as
+      // "all skills" — the runtime refuses to resolve it, so show it as having none rather than
+      // let an admin save it back as a full grant.
+      let normalizedSkills = Array.isArray(type.allowedSkills) ? type.allowedSkills : [];
       if (normalizedSkills.includes('*')) {
         normalizedSkills = allAvailableSkills;
       }

@@ -531,10 +531,15 @@ const SubscriptionTypesTab: React.FC = () => {
         name: formData.name,
         allowedPages: formData.allowedPages,
         hiddenPages: formData.hiddenPages || [],
+        // ENG-1978: [] now means NO skills, so an unloaded skill list must never be saved over an
+        // existing tier (a '*' tier opens with no checked skills when the list is empty, and
+        // saving that would silently revoke everything). Keep what the tier already has.
         allowedSkills:
-          formData.allowedSkills.length === availableSkills.length && availableSkills.length > 0
-            ? ['*']
-            : formData.allowedSkills,
+          availableSkills.length === 0 && editingType
+            ? editingType.allowedSkills
+            : formData.allowedSkills.length === availableSkills.length && availableSkills.length > 0
+              ? ['*']
+              : formData.allowedSkills,
         allowedConnectedAccounts:
           (formData.allowedConnectedAccounts?.length ?? 0) === AVAILABLE_CONNECTED_ACCOUNTS.length
             ? ['*']

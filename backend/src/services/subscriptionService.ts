@@ -544,8 +544,10 @@ export async function findTiersAllowingSkill(
 
     const allowingTiers = tiers
       .filter((tier: any) => {
-        // Backward compat: a tier without allowedSkills is treated as wildcard.
-        const allowedSkills: string[] = tier.allowedSkills || ["*"];
+        // ENG-1978: a tier without an allowedSkills list is malformed and the runtime refuses to
+        // resolve it (getAllowedSkills returns null), so it reaches nothing. Do not report it as
+        // allowing the skill — that would hide the very problem this warning exists to surface.
+        const allowedSkills: string[] = Array.isArray(tier.allowedSkills) ? tier.allowedSkills : [];
         return allowedSkills.includes("*") || allowedSkills.includes(skillId);
       })
       .map((tier: any) => tier.name);
