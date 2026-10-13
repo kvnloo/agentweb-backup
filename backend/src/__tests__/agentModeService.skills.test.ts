@@ -1226,6 +1226,9 @@ describe('AgentModeService - Skills', () => {
         { name: 'you_search_news', definition: { function: { name: 'you_search_news', description: 'Search news with You.com' } } },
       ];
       jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+      jest.spyOn(agentModeService['toolRegistry'], 'getTool').mockImplementation(
+        (name: string) => mockTools.find((t) => t.name === name) as any
+      );
 
       await agentModeService.initialize();
     });
@@ -1258,8 +1261,67 @@ describe('AgentModeService - Skills', () => {
 
       const result = await agentModeService.getFilteredTools('user-123', new Set());
 
-      // Should fallback to just install_skills
-      expect(result.length).toBeGreaterThanOrEqual(0);
+      // The catch-all error path stays the strictest toolset: install_skills and nothing else
+      // (an unresolved entitlement is deliberately more generous — it keeps the foundation tools).
+      expect(result.map((t: any) => t.function?.name || t.name)).toEqual(['install_skills']);
+    });
+
+    /*
+     * ENG-1978: resolveSkillsToToolNames now returns null when the entitlement could not be
+     * resolved (an unknown/malformed tier or a failed settings read), where it previously
+     * returned ["*"] and silently granted every tool. getFilteredTools must fail closed: nothing a
+     * tier would unlock (paid tools, tools of skills already installed in the session) is
+     * returned. Foundation tools and install_skills ARE kept — every tier, Free included, gets
+     * them unconditionally on the normal path, so an unresolved tier gets no more than that.
+     */
+    // filterFunctionCalls is an identity mock in this suite, so these assert the allow-list the
+    // unresolved branch hands to it — that list IS the contract.
+    const lastAllowList = (): string[] => {
+      const { filterFunctionCalls } = require('../services/subscriptionService');
+      const calls = (filterFunctionCalls as jest.Mock).mock.calls;
+      return calls[calls.length - 1][1];
+    };
+
+    it('should fail closed to foundation tools + install_skills when the entitlement is unresolved', async () => {
+      const { resolveSkillsToToolNames } = require('../services/subscriptionService');
+      (resolveSkillsToToolNames as jest.Mock).mockResolvedValueOnce(null);
+
+      await agentModeService.getFilteredTools('user-123', undefined);
+
+      const allowed = lastAllowList();
+      expect(allowed).toEqual(expect.arrayContaining(['create_work_plan', 'you_search_web', 'install_skills']));
+      expect(allowed).not.toContain('*');
+      // Nothing a tier would unlock: no paid, non-foundation tool.
+      expect(allowed).not.toContain('launch_retargeting_campaign');
+    });
+
+    it('should not carry session-installed skill tools over when the entitlement is unresolved', async () => {
+      const { resolveSkillsToToolNames } = require('../services/subscriptionService');
+      (resolveSkillsToToolNames as jest.Mock).mockResolvedValueOnce(null);
+
+      await agentModeService.getFilteredTools('user-123', new Set(['installed_skill_tool', 'create_work_plan']));
+
+      const allowed = lastAllowList();
+      expect(allowed).not.toContain('installed_skill_tool');
+      expect(allowed).toContain('create_work_plan');
+    });
+
+    /*
+     * A caller that already resolved the entitlement to null (unresolved) passes that null as the
+     * third argument. It must be honoured, not treated as "not provided": re-fetching would read
+     * the tier a second time per turn, double-report the telemetry, and could resolve differently
+     * from the value the caller already used to build its own tool context.
+     */
+    it('should not re-fetch the entitlement when the caller passes an explicit null', async () => {
+      const { getAllowedSkills, resolveSkillsToToolNames } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockClear();
+      (resolveSkillsToToolNames as jest.Mock).mockResolvedValueOnce(null);
+
+      await agentModeService.getFilteredTools('user-123', undefined, null);
+
+      expect(getAllowedSkills).not.toHaveBeenCalled();
+      expect(resolveSkillsToToolNames).toHaveBeenLastCalledWith(null, 'user-123');
+      expect(lastAllowList()).not.toContain('*');
     });
 
     it('should use precomputed allowed names when provided', async () => {

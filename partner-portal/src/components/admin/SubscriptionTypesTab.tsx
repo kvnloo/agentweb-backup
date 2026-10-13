@@ -239,10 +239,7 @@ const SubscriptionTypesTab: React.FC = () => {
             allowedFeatures: availableFeatures.map((feature) => feature.id),
           }));
         }
-      } else if (
-        editingType.allowedSkills.includes('*') ||
-        editingType.allowedSkills.length === 0
-      ) {
+      } else if (editingType.allowedSkills.includes('*')) {
         // If editing a type that had "*" and skills just loaded, update formData
         if (availableSkills.length > 0) {
           setFormData((prev) => ({
@@ -298,7 +295,9 @@ const SubscriptionTypesTab: React.FC = () => {
         name: type.name,
         allowedPages: normalizedPages,
         hiddenPages: type.hiddenPages || [],
-        allowedSkills: type.allowedSkills.includes('*') || type.allowedSkills.length === 0
+        // ENG-1978: an empty list means NO skills (the runtime no longer reads [] as wildcard),
+        // so only an explicit '*' expands to every skill here.
+        allowedSkills: type.allowedSkills.includes('*')
           ? availableSkills.map((s) => s.skillId)
           : type.allowedSkills,
         allowedConnectedAccounts: expandedConnectedAccounts,
@@ -527,15 +526,27 @@ const SubscriptionTypesTab: React.FC = () => {
         seatPricing = { priceCents, usageCreditMicroUsd, baseSeats };
       }
 
+      // ENG-1978: a NEW tier saved before the skill list loads would store [] (no skills) without the
+      // admin ever seeing a skill to tick, so make them wait instead.
+      if (availableSkills.length === 0 && !editingType) {
+        setError('Skills are still loading — try again in a moment');
+        return;
+      }
+
       // Convert all selected items back to "*" if all are selected
       const dataToSave: SubscriptionType = {
         name: formData.name,
         allowedPages: formData.allowedPages,
         hiddenPages: formData.hiddenPages || [],
+        // ENG-1978: [] now means NO skills, so an unloaded skill list must never be saved over an
+        // existing tier (a '*' tier opens with no checked skills when the list is empty, and
+        // saving that would silently revoke everything). Keep what the tier already has.
         allowedSkills:
-          formData.allowedSkills.length === availableSkills.length && availableSkills.length > 0
-            ? ['*']
-            : formData.allowedSkills,
+          availableSkills.length === 0 && editingType
+            ? editingType.allowedSkills
+            : formData.allowedSkills.length === availableSkills.length && availableSkills.length > 0
+              ? ['*']
+              : formData.allowedSkills,
         allowedConnectedAccounts:
           (formData.allowedConnectedAccounts?.length ?? 0) === AVAILABLE_CONNECTED_ACCOUNTS.length
             ? ['*']
@@ -821,9 +832,10 @@ const SubscriptionTypesTab: React.FC = () => {
                       )}
                     </TableCell>
                     <TableCell>
-                      {type.allowedSkills.includes('*') ||
-                      type.allowedSkills.length === 0 ? (
+                      {type.allowedSkills.includes('*') ? (
                         <Chip label="All Skills" color="primary" size="small" />
+                      ) : type.allowedSkills.length === 0 ? (
+                        <Chip label="No skills" color="warning" size="small" />
                       ) : (
                         <Typography variant="body2" color="text.secondary">
                           {type.allowedSkills.length} skill
@@ -1187,6 +1199,12 @@ const SubscriptionTypesTab: React.FC = () => {
             <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
               Select which Agent Mode skills users with this subscription type can access. Each skill groups related tools together.
             </Typography>
+            {availableSkills.length > 0 && formData.allowedSkills.length === 0 && (
+              <Alert severity="warning" sx={{ mb: 2 }}>
+                No skills are selected. Users on this tier get the built-in basic tools only. An empty
+                list no longer means "all skills"; select every skill (or Select All Skills) to grant them all.
+              </Alert>
+            )}
             <Box
               sx={{
                 maxHeight: 400,
