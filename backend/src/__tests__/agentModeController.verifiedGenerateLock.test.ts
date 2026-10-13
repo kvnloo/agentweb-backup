@@ -17,6 +17,7 @@ import { Request, Response } from 'express';
 import {
   agentModeController,
   activeSessionGenerations,
+  sessionGenerationOwners,
   tryClaimSessionGeneration,
   releaseSessionGeneration,
   claimSessionGenerationWithRetry,
@@ -204,6 +205,25 @@ describe('runVerifiedChat participates in the shared session-generation lock (EN
     // The whole point: no write happened while /generate was still holding the session.
     expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
     expect(mockChatbotDb.addMessageToSession).not.toHaveBeenCalled();
+  });
+
+  it('ENG-110: runVerifiedChat records the caller as the lock owner while it runs (so /generating lists scheduled/Slack/email runs) and clears it after', async () => {
+    let ownerDuring: string | undefined;
+    mockWorkerService.runInWorker.mockImplementationOnce(async () => {
+      ownerDuring = sessionGenerationOwners.get(sessionId);
+      return workerResponse('Done') as any;
+    });
+    await runVerifiedChat({
+      sessionId,
+      userId: 'user-1',
+      startingMessage: 'Generate the report.',
+      keywords: [],
+      requiredFunctions: [{ functionName: 'update_html_file', minCount: 1 }],
+      maxAttempts: 1,
+      attachments: [],
+    });
+    expect(ownerDuring).toBe('user-1');
+    expect(sessionGenerationOwners.size).toBe(0);
   });
 
   it('proceeds normally once the lock is free, and releases it again on success', async () => {
