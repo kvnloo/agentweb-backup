@@ -527,6 +527,29 @@ export async function casUpdateIcpList<T>(
   userId: string,
   edit: (list: ICPPersona[]) => IcpListEdit<T>,
 ): Promise<{ ok: true; next: ICPPersona[]; result: T } | { ok: false; status: 400 | 404 }> {
+  // One list write per user at a time within this process. Most contention on a
+  // user's list is requests that landed on the same instance (a user clicking
+  // quickly); queueing them here means they never fight over the condition, so
+  // the compare-and-swap below is left for contention BETWEEN instances. Without
+  // it, 20 simultaneous writes exhausted the retries and the unconditional final
+  // attempt lost an edit.
+  const behind = icpListQueues.get(userId) ?? Promise.resolve();
+  const mine = behind.catch(() => undefined).then(() => casUpdateIcpListUnqueued(userId, edit));
+  icpListQueues.set(userId, mine);
+  try {
+    return await mine;
+  } finally {
+    if (icpListQueues.get(userId) === mine) icpListQueues.delete(userId);
+  }
+}
+
+const icpListQueues = new Map<string, Promise<unknown>>();
+
+/** The compare-and-swap itself, without the per-process queue. Exported so tests can simulate two instances. */
+export async function casUpdateIcpListUnqueued<T>(
+  userId: string,
+  edit: (list: ICPPersona[]) => IcpListEdit<T>,
+): Promise<{ ok: true; next: ICPPersona[]; result: T } | { ok: false; status: 400 | 404 }> {
   for (let attempt = 0; attempt < MAX_LIST_WRITE_ATTEMPTS; attempt++) {
     const user: any = await readUserForRegeneration(userId);
     const list: ICPPersona[] = Array.isArray(user?.icpResult) ? user.icpResult : [];
