@@ -39,13 +39,40 @@ import { handleUnrecognizedMessage } from '../services/whatsappInboundSupport';
 
 const router = express.Router();
 
+/** Log a failed delivery receipt by message id and Meta error code. Never the number. */
+function logFailedStatus(status: any): void {
+  if (status?.status !== 'failed') return;
+  const err = status?.errors?.[0];
+  console.error(
+    `[whatsapp-webhook] outbound message ${status?.id ?? 'unknown'} FAILED to deliver ` +
+      `(code ${err?.code ?? 'unknown'}: ${err?.title ?? err?.message ?? 'no detail'})`,
+  );
+}
+
 /**
  * Opt-out keywords must match the WHOLE message, not appear anywhere in it —
  * "please stop by the office tomorrow" is not an opt-out request, and treating it
  * as one silently cuts a customer off from every future notification.
  */
-const STOP_KEYWORDS = new Set(['stop', 'unsubscribe', 'cancel', 'end', 'quit']);
+const STOP_KEYWORDS = new Set([
+  'stop',
+  'unsubscribe',
+  'cancel',
+  'end',
+  'quit',
+  'stop all',
+  'please stop',
+  'stop please',
+  'stop messages',
+]);
 const START_KEYWORDS = new Set(['unstop', 'start', 'resubscribe']);
+
+/**
+ * Lower-case, trim, and drop trailing punctuation so "Stop." and "STOP!" are the same
+ * request as "stop". Still a whole-message match: "please stop by the office" is not.
+ */
+const normalizeKeyword = (text: string): string =>
+  text.trim().toLowerCase().replace(/[\s.!?,;:]+$/g, '');
 
 /** Meta reports `from` without a leading '+'. Normalize so window/opt-out keys agree. */
 const toKeyPhone = (from: string): string => (from.startsWith('+') ? from : `+${from}`);
@@ -124,9 +151,14 @@ router.post('/', async (req, res) => {
   try {
     for (const entry of payload?.entry ?? []) {
       for (const change of entry?.changes ?? []) {
-        // `statuses` are OUR outbound messages being delivered/read. They are
-        // deliberately not handled here: treating one as inbound would open a service
-        // window and let us send free-form text to someone who never wrote to us.
+        // `statuses` are OUR outbound messages being delivered/read. They are never
+        // treated as inbound — that would open a service window and let us send free-form
+        // text to someone who never wrote to us. A FAILED one is only logged, loudly: the
+        // send API confirms acceptance, not delivery, so this is the one place a message
+        // that was accepted and then dropped can be seen.
+        for (const status of change?.value?.statuses ?? []) {
+          logFailedStatus(status);
+        }
         for (const message of change?.value?.messages ?? []) {
           await handleInboundMessage(message);
         }
@@ -214,7 +246,7 @@ async function handleInboundMessage(message: any): Promise<void> {
   }
 
   const text: string = message?.text?.body ?? '';
-  const normalized = text.trim().toLowerCase();
+  const normalized = normalizeKeyword(text);
   if (STOP_KEYWORDS.has(normalized)) {
     await recordOptOut(phone);
     console.log(`[whatsapp-webhook] opt-out recorded for ${redactPhone(phone)}`);
@@ -240,8 +272,9 @@ async function handleInboundMessage(message: any): Promise<void> {
     );
   } else {
     // "Verify <CODE>" binds this sender's number to the portal user who holds the code.
-    // A fixed command only — anything that is not exactly that shape is ignored, so this
-    // stays a notification channel and never becomes a conversation.
+    // A fixed command only. Anything else is handed to the support hand-off (a fixed
+    // greeting plus a forward to the team, no model involved), so this never becomes an
+    // AI conversation.
     const wasVerification = await handleVerificationMessage(text, phone);
     if (!wasVerification) {
       // Not a command at all. Greet, and pass the message to the team — a fixed reply

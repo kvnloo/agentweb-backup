@@ -252,6 +252,10 @@ describe('completeVerification — one platform per customer', () => {
     await expect(completeVerification(code, PHONE)).resolves.toBe('other_platform');
     expect(users.get('u1').messagingChannels).toBeUndefined();
     expect(whatsapp.bindPhoneToUser).not.toHaveBeenCalled();
+    await expect(getVerificationStatus('u1')).resolves.toEqual({
+      state: 'refused',
+      reason: 'other_platform',
+    });
   });
 
   it('refuses for an explicitly-configured Slack entry too, and leaves it untouched', async () => {
@@ -281,13 +285,13 @@ describe('completeVerification — one platform per customer', () => {
     await expect(completeVerification(code, PHONE)).resolves.toBe('verified');
   });
 
-  it('leaves the code unclaimed when it refuses, so it is not stranded', async () => {
+  it('leaves the code retryable (never claimed) when it refuses, so it is not stranded', async () => {
     // Refusing AFTER claiming left the row "claimed": it could not be retried and the
     // portal kept polling a verification that would never finish.
     const code = await begin();
     users.set('u1', { userId: 'u1', slackChannels: ['C1'] });
     await expect(completeVerification(code, PHONE)).resolves.toBe('other_platform');
-    expect(rowFor(code).status).toBe('pending');
+    expect(rowFor(code).status).toBe('refused');
 
     // Once the Slack channel is removed, the same code works.
     users.set('u1', { userId: 'u1' });
@@ -515,7 +519,21 @@ describe('completeVerification — one number, one account', () => {
     await expect(completeVerification(code, PHONE)).resolves.toBe('number_in_use');
     expect(users.get('u1').messagingChannels).toBeUndefined();
     expect(whatsapp.bindPhoneToUser).not.toHaveBeenCalled();
-    expect(rowFor(code).status).toBe('pending');
+    expect(rowFor(code).status).toBe('refused');
+    // The portal is told why, instead of polling "waiting" until the code expires.
+    await expect(getVerificationStatus('u1')).resolves.toEqual({
+      state: 'refused',
+      reason: 'number_in_use',
+    });
+  });
+
+  it('lets a refused code be retried once the obstacle is gone', async () => {
+    const code = await begin();
+    whatsapp.resolveUserIdByPhone.mockResolvedValue('someone-else');
+    await expect(completeVerification(code, PHONE)).resolves.toBe('number_in_use');
+
+    whatsapp.resolveUserIdByPhone.mockResolvedValue(null);
+    await expect(completeVerification(code, PHONE)).resolves.toBe('verified');
   });
 
   it('lets the account that already holds the number verify it again', async () => {

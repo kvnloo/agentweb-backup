@@ -4951,6 +4951,9 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                             : user.slackChannel ? [user.slackChannel] : [];
                                           if (ids.length === 0) {
                                             if (user.messagingPlatformSource === "organisation") return "Slack (via organisation)";
+                                            // null = looked up, nothing connected. undefined = the lookup failed
+                                            // (or an older backend), which is not the same as "not connected".
+                                            if (user.messagingPlatform === undefined) return "Unknown";
                                             return "Not connected";
                                           }
                                           return "Slack: " + ids.map((id) =>

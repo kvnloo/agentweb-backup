@@ -1409,7 +1409,6 @@ router.get("/slack/channel-info", async (req, res) => {
   }
 });
 
-// Update user slack channels (accepts an array)
 /**
  * Disconnect a customer's WhatsApp number on their behalf (ENG-273).
  *

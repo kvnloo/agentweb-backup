@@ -65,7 +65,8 @@ const userKey = (userId: string) => `whatsapp:verify-user:${userId}`;
 const failKey = (phone: string) => `whatsapp:verify-fail:${phone}`;
 const DESCRIPTION = 'WhatsApp number-ownership verification';
 
-type RowStatus = 'pending' | 'opted_out' | 'claimed' | 'verified';
+type RowStatus = 'pending' | 'opted_out' | 'claimed' | 'verified' | 'refused';
+type RefusalReason = 'other_platform' | 'number_in_use';
 
 interface VerificationRow {
   userId: string;
@@ -76,6 +77,8 @@ interface VerificationRow {
   expiresAt: string;
   phone?: string;
   verifiedAt?: string;
+  /** Why a 'refused' row was refused, so the portal can say so instead of waiting. */
+  refusal?: RefusalReason;
 }
 
 const hashCode = (code: string) => crypto.createHash('sha256').update(code).digest('hex');
@@ -122,8 +125,8 @@ const normalizeCode = (raw: string): string | null => {
 
 /**
  * Recognise "Verify K7Q2M9XA" (optionally "Verify K7Q2-M9XA"). Deliberately narrow: a
- * message is only treated as a verification attempt when it is exactly that shape, so
- * ordinary text from a customer is never answered and this never turns into a chat.
+ * message is only treated as a verification attempt when it is exactly that shape.
+ * Anything else falls through to the support hand-off, so this never turns into a chat.
  */
 export function parseVerificationMessage(text: string): string | null {
   const match = /^verify[\s:-]+([A-Za-z0-9]{4})[\s-]?([A-Za-z0-9]{4})$/i.exec((text ?? '').trim());
@@ -166,7 +169,9 @@ export type VerificationStatus =
   | { state: 'pending'; expiresAt: string }
   /** The number texted STOP earlier; it stays blocked until it sends START. */
   | { state: 'opted_out'; expiresAt: string }
-  | { state: 'verified'; phone: string };
+  | { state: 'verified'; phone: string }
+  /** The code was refused (other platform / number in use); the user must act, not wait. */
+  | { state: 'refused'; reason: RefusalReason };
 
 export async function getVerificationStatus(userId: string): Promise<VerificationStatus> {
   const pointer = await settingsService.getSetting(userKey(userId));
@@ -177,6 +182,7 @@ export async function getVerificationStatus(userId: string): Promise<Verificatio
 
   const { row } = found;
   if (row.status === 'verified' && row.phone) return { state: 'verified', phone: row.phone };
+  if (row.status === 'refused' && row.refusal) return { state: 'refused', reason: row.refusal };
   if (row.status === 'opted_out') return { state: 'opted_out', expiresAt: row.expiresAt };
   // 'claimed' is a verification mid-flight; to the user it is still "waiting".
   return { state: 'pending', expiresAt: row.expiresAt };
@@ -290,13 +296,19 @@ export async function completeVerification(rawCode: string, sender: string): Pro
   // One platform per customer, re-checked here because the portal only checks when the
   // code is issued and a Slack channel can be assigned in the ten minutes it stays live.
   const account = await userDb.getUserById(row.userId);
-  if (account && hasOwnSlack(account)) return 'other_platform';
+  if (account && hasOwnSlack(account)) {
+    await writeRow(hash, { ...row, status: 'refused', refusal: 'other_platform', phone }).catch(() => {});
+    return 'other_platform';
+  }
 
   // One number, one account. Two accounts holding the same number would leave the
   // phone -> user lookup pointing at only one of them, so the other's taps would be
   // ignored while its sends kept going to the same handset.
   const holder = await resolveUserIdByPhone(phone);
-  if (holder && holder !== row.userId) return 'number_in_use';
+  if (holder && holder !== row.userId) {
+    await writeRow(hash, { ...row, status: 'refused', refusal: 'number_in_use', phone }).catch(() => {});
+    return 'number_in_use';
+  }
 
   if (row.status !== 'claimed') {
     // A STOPped number is not connected by messaging us — it must send START first.

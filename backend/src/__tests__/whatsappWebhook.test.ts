@@ -235,6 +235,30 @@ describe('POST — inbound messages', () => {
     expect(recordOptOut).toHaveBeenCalledWith('+14155550123');
   });
 
+  it.each(['Stop.', 'STOP!', 'please stop', 'Stop please.', 'stop all'])(
+    'treats %s as an opt-out',
+    async (text) => {
+      await post(inboundPayload(text));
+      expect(recordOptOut).toHaveBeenCalledWith('+14155550123');
+    },
+  );
+
+  it('logs a FAILED delivery receipt by message id and never opens a window', async () => {
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    await post(statusPayload('failed'));
+    expect(errSpy.mock.calls.flat().join(' ')).toMatch(/wamid\.OUT1 FAILED to deliver/);
+    expect(errSpy.mock.calls.flat().join(' ')).not.toContain('4155550123');
+    expect(recordInboundMessage).not.toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it('stays quiet for a delivered receipt', async () => {
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    await post(statusPayload('delivered'));
+    expect(errSpy).not.toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
   it('records an opt-in on UNSTOP', async () => {
     await post(inboundPayload('UNSTOP'));
     expect(recordOptIn).toHaveBeenCalledWith('+14155550123', 'unstop_keyword');
