@@ -56,7 +56,7 @@ function compactGuest(guest: LumaGuest, includeAnswers: boolean, labels: string[
 const GUEST_STATUSES = ['approved', 'session', 'pending_approval', 'invited', 'declined', 'waitlist'];
 
 const NOT_CONNECTED_MESSAGE =
-  'No Luma API key is connected. Connecting one (Settings → Login Credentials → Luma API key; needs a Luma Plus ' +
+  'No Luma API key is connected. Connecting one (Settings → Login Credentials → Luma API key, /settings/login-credentials; needs a Luma Plus ' +
   'calendar API key from luma.com/calendar/manage/api-keys) is the reliable way to read guest lists. ' +
   'Without it, fall back to the browser session-cookie path or a CSV export.';
 
