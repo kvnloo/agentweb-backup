@@ -511,7 +511,6 @@ export type IcpListEdit<T> =
   | { next: ICPPersona[]; result: T }
   | { status: 400 | 404 };
 
-export const ICP_LIST_CONTENDED = "ICP_LIST_CONTENDED";
 const MAX_LIST_WRITE_ATTEMPTS = 6;
 
 /**
@@ -533,21 +532,39 @@ export async function casUpdateIcpList<T>(
     const list: ICPPersona[] = Array.isArray(user?.icpResult) ? user.icpResult : [];
     const decided = edit(list);
     if ("status" in decided) return { ok: false, status: decided.status };
+    // The final attempt is unconditional. The condition is whole-list equality, so
+    // a list that never reads back equal to what is stored (or sustained
+    // contention) would otherwise fail every edit and delete for that user, with
+    // nothing the user could do about it. Applying the change computed from the
+    // freshest read costs, at worst, a concurrent change that landed in the last
+    // few milliseconds, which is the lost update this helper exists to avoid
+    // everywhere else.
+    const lastAttempt = attempt === MAX_LIST_WRITE_ATTEMPTS - 1;
     try {
-      await userDb.updateUser(userId, { icpResult: decided.next as any }, {
-        condition: {
-          expression: "#icpResult = :icpListExpected",
-          names: { "#icpResult": "icpResult" },
-          values: { ":icpListExpected": list },
-        },
-      });
+      await userDb.updateUser(
+        userId,
+        { icpResult: decided.next as any },
+        lastAttempt
+          ? undefined
+          : {
+              condition: {
+                expression: "#icpResult = :icpListExpected",
+                names: { "#icpResult": "icpResult" },
+                values: { ":icpListExpected": list },
+              },
+            },
+      );
+      if (lastAttempt) {
+        console.warn("[onboardingIcpService] saved the persona list without the compare-and-swap after repeated conflicts", { userId });
+      }
       return { ok: true, next: decided.next, result: decided.result };
     } catch (err: any) {
-      if (err?.code !== "ConditionalCheckFailedException") throw err;
+      if (err?.code !== "ConditionalCheckFailedException" || lastAttempt) throw err;
       await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1) + Math.random() * 30));
     }
   }
-  throw Object.assign(new Error("the ICP list kept changing"), { code: ICP_LIST_CONTENDED });
+  // Unreachable: the loop returns or throws on its last attempt.
+  throw new Error("casUpdateIcpList exhausted its attempts");
 }
 
 /** True when the user has hand-written at least one field of this persona. */
