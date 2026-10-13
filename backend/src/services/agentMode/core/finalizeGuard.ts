@@ -177,6 +177,16 @@ export interface FinalizeLedgerEntry {
   /** the minimal stored result for successful calls (carries encoded-failure
    * and awaitingUserConfirmation markers) */
   result?: any;
+  /** the call's parsed arguments. The stored result is minimized (most tools keep `{}`),
+   * so an argument is the only way to see that a call only saved a draft. */
+  args?: unknown;
+}
+
+/** A LinkedIn post saved with save_as_draft is a draft the user still has to publish, not a published post. */
+function savedAsDraft(entry: FinalizeLedgerEntry): boolean {
+  const args = entry.args as { save_as_draft?: unknown } | null | undefined;
+  const result = entry.result as { draft?: unknown } | null | undefined;
+  return args?.save_as_draft === true || result?.draft === true;
 }
 
 /** One concrete claim the judge extracted from the final text. */
@@ -257,6 +267,7 @@ export function claimBackedByLedger(
       entry.status === 'success'
       && matches(entry.toolName)
       && !ports.toolResultError(entry.result)
+      && (claimClass !== 'post_published' || !savedAsDraft(entry))
       // A media-gen call can pause for confirmation without producing anything, so it must also
       // have produced an asset; an asset-file tool call IS the asset.
       && (claimClass !== 'asset_generated' || !MEDIA_GEN_TOOLS.has(entry.toolName) || ports.mediaGenProducedAsset(entry.toolName, entry.result)),
@@ -274,7 +285,12 @@ export function claimLooselyMatchedByLedger(
 ): boolean {
   const looseMatch = CLAIM_TOOL_LOOSE_MATCHERS[claimClass];
   return ledger.some(
-    (entry) => entry.status === 'success' && looseMatch(entry.toolName) && !ports.toolResultError(entry.result),
+    (entry) =>
+      entry.status === 'success'
+      && looseMatch(entry.toolName)
+      && !ports.toolResultError(entry.result)
+      // Without this a draft would downgrade a "published" claim to ambiguous and it would never be corrected.
+      && (claimClass !== 'post_published' || !savedAsDraft(entry)),
   );
 }
 
