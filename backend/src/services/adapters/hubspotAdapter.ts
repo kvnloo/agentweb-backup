@@ -502,6 +502,25 @@ export class HubspotAdapter implements CrmAdapter {
         }
 
         // ── Stage 1.5: update leads that already have a stored contact id, by id ──
+        // One update input per contact id carries ONE lead's properties. Leads that
+        // share an id AND an email are the same person (collapsed); a lead sharing the
+        // id with a DIFFERENT email would be reported synced on someone else's data, so
+        // it takes the pre-ENG-2171 path (upsert by its own email) instead.
+        const emailByClaimedId = new Map<string, string>();
+        for (const p of [...storedIdLeads]) {
+            const claimedBy = emailByClaimedId.get(p.storedId!);
+            if (claimedBy === undefined) {
+                emailByClaimedId.set(p.storedId!, p.emailLower);
+            } else if (claimedBy !== p.emailLower) {
+                console.warn(
+                    `[HubspotAdapter] stored contact ${p.storedId} is shared by leads with different emails ` +
+                    `— lead ${p.lead.leadId} will upsert by its own email.`,
+                );
+                storedIdLeads.splice(storedIdLeads.indexOf(p), 1);
+                p.storedId = undefined;
+                emailLeads.push(p);
+            }
+        }
         const idOutcome = await this.updateContactsByStoredId(svc, storedIdLeads);
         // A stored contact HubSpot says no longer exists falls back to the email
         // upsert below, exactly as pushLeadsPerLead does on 404/410.
@@ -693,7 +712,7 @@ export class HubspotAdapter implements CrmAdapter {
 
     /** Kill switch: HUBSPOT_PUSH_BY_STORED_ID='off' restores upsert-by-email for every email lead. */
     private pushByStoredIdEnabled(): boolean {
-        return process.env.HUBSPOT_PUSH_BY_STORED_ID !== 'off';
+        return (process.env.HUBSPOT_PUSH_BY_STORED_ID || '').trim().toLowerCase() !== 'off';
     }
 
     private getStoredContactId(lead: any): string | undefined {
@@ -717,11 +736,15 @@ export class HubspotAdapter implements CrmAdapter {
         return Array.isArray(errs) && errs.length > 0 && errs.every((e: any) => /NOT_FOUND/i.test(e?.category || ''));
     }
 
-    /** Rate limit, lock, server or network failure: retrying smaller batches cannot help. */
+    /**
+     * Rate limit, lock, gateway or network failure: smaller batches cannot help, and
+     * bisecting would multiply the calls being throttled. A bare 500 is NOT included:
+     * it can be one bad record, which bisection isolates (as the email upsert does).
+     */
     private isTransientHubSpotError(error: any): boolean {
         const status = error?.response?.status;
         if (status === undefined) return true;
-        return status === 429 || status === 423 || status >= 500;
+        return status === 429 || status === 423 || status === 502 || status === 503 || status === 504;
     }
 
     /**
@@ -764,8 +787,19 @@ export class HubspotAdapter implements CrmAdapter {
             },
         );
         for (const f of outcome.failed) {
-            if (this.isContactGoneError(f.error)) gone.add(f.item.id);
-            else failed.set(f.item.id, this.formatError(f.error));
+            if (this.isContactGoneError(f.error)) {
+                gone.add(f.item.id);
+            } else {
+                failed.set(f.item.id, this.formatError(f.error));
+                // HubSpot does not document what a missing/merged/colliding contact id
+                // returns, so log the raw shape: it is how the real values get learned.
+                const e = f.error as any;
+                console.warn(
+                    `[HubspotAdapter] stored-id update of contact ${f.item.id} not classified as gone: ` +
+                    `status=${e?.response?.status ?? 'none'} categories=${
+                        JSON.stringify((e?.response?.data?.errors ?? []).map((x: any) => x?.category ?? null))}`,
+                );
+            }
         }
         return { updated, failed, gone };
     }
