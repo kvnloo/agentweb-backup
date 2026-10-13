@@ -869,6 +869,49 @@ router.get("/users", async (req, res) => {
       }
     }
 
+    // ENG-273: which messaging platform each customer is on. Read from the same policy
+    // that enforces one-platform-per-customer, so this column can never disagree with
+    // what the rule allows. Computed from the full records (the compact list rows drop
+    // the channel fields), each organisation resolved once, and strictly best-effort:
+    // a failure here leaves the column empty rather than failing the whole user list.
+    try {
+      const { getPlatformSummary } = await import('../services/customerChannelPolicy');
+      const fullRecordById = new Map<string, any>(users.map((u: any) => [u.userId, u]));
+      const orgSlackCache = new Map<string, Promise<boolean>>();
+      await Promise.all(
+        sanitized.map(async (user: any) => {
+          // Each account settles on its own. One failing summary must not reject the whole
+          // batch and send the roster while other accounts' summaries are still pending,
+          // which would leave them without platform fields and shown as "Not connected".
+          try {
+            const summary = await getPlatformSummary(fullRecordById.get(user.userId), orgSlackCache);
+            user.messagingPlatform = summary.platform;
+            user.messagingPlatformSource = summary.source;
+            user.whatsappNumberMasked = summary.whatsappNumberMasked;
+            const full = fullRecordById.get(user.userId);
+            // Why a no-platform account has no WhatsApp (STOP / customer / admin), for support.
+            user.whatsappDisconnect = full?.whatsappDisconnect ?? null;
+            // A number that texted STOP but could not be matched to its account at the time
+            // (verified before the phone index existed) is still bound and unreachable.
+            // Only WhatsApp accounts are checked, so this costs a handful of reads.
+            if (summary.platform === 'whatsapp') {
+              const { explicitChannels } = await import('../services/messagingChannelService');
+              const { isOptedOut } = await import('../services/whatsappService');
+              const destination = explicitChannels(full).find((c: any) => c.channel === 'whatsapp')?.destination;
+              user.whatsappOptedOut = destination ? await isOptedOut(destination) : false;
+            }
+          } catch (error) {
+            console.error(
+              `[admin/users] messaging platform lookup failed for user ${user.userId}; leaving it unset:`,
+              error instanceof Error ? error.message : error,
+            );
+          }
+        }),
+      );
+    } catch (error) {
+      console.error('[admin/users] messaging platform lookup failed; leaving it unset:', error);
+    }
+
     // Fetch only replay settings for these users in bounded BatchGet chunks.
     // Preserve the old per-setting best-effort behavior.
     const replaySettings = await settingsService.getSettings(
@@ -1378,7 +1421,81 @@ router.get("/slack/channel-info", async (req, res) => {
   }
 });
 
-// Update user slack channels (accepts an array)
+/**
+ * Disconnect a customer's WhatsApp number on their behalf (ENG-273).
+ *
+ * A customer is on one messaging platform, and only they could remove WhatsApp — so one
+ * who wanted to move to Slack and did not do it themselves left support with no way to
+ * help. This is the same disconnect the customer's own Settings performs.
+ *
+ * It removes a number the customer verified and consented with, so it is recorded with
+ * who did it, and the customer is told on WhatsApp when the 24-hour window allows.
+ */
+router.delete("/users/:userId/whatsapp", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    // User ids are UUIDs or numeric strings. Reject anything else as bad input rather than
+    // letting it reach the database and come back as "not found" or a server error.
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(userId)) {
+      return res.status(400).json({ message: "Invalid user id." });
+    }
+    const adminId = (req as any).user?.userId || 'unknown-admin';
+    const { disconnectWhatsApp } = await import('../services/whatsappVerificationService');
+
+    const result = await disconnectWhatsApp(userId, 'admin');
+    if (!result) return res.status(404).json({ message: "User not found" });
+    if (!result.removed) {
+      return res.status(409).json({ message: "This account has no WhatsApp number connected." });
+    }
+
+    const { redactPhone, sendText } = await import('../services/whatsappService');
+    console.log(
+      `[admin] WhatsApp ${redactPhone(result.removed)} disconnected from user ${userId} by admin ${adminId}`,
+    );
+
+    // Best-effort courtesy notice. Outside the 24h window nothing but a template can be
+    // sent, and there is no template for this — so it may not arrive, and must never
+    // fail a disconnect that has already happened.
+    let customerNotified = false;
+    try {
+      await sendText(
+        result.removed,
+        'Your WhatsApp number has been disconnected from AgentWeb by our support team, so you will no longer receive notifications here. You can reconnect it any time from AgentWeb Settings.',
+      );
+      customerNotified = true;
+    } catch {
+      /* window closed, opted out, or Meta unavailable */
+    }
+
+    // The platform the account is on NOW. Removing WhatsApp can leave an account on Slack —
+    // an organisation member inherits the organisation's channel — so the dashboard must
+    // show what is true rather than assume "not connected".
+    let summary: { platform: string | null; source: string | null; whatsappNumberMasked: string | null } = {
+      platform: null,
+      source: null,
+      whatsappNumberMasked: null,
+    };
+    try {
+      const { getPlatformSummary } = await import('../services/customerChannelPolicy');
+      const { userDb } = await import('../services/db');
+      summary = await getPlatformSummary(await userDb.getUserById(userId));
+    } catch (error) {
+      console.error('[admin] could not recalculate the platform after disconnecting WhatsApp:', error);
+    }
+
+    res.json({
+      success: true,
+      customerNotified,
+      messagingPlatform: summary.platform,
+      messagingPlatformSource: summary.source,
+      whatsappNumberMasked: summary.whatsappNumberMasked,
+    });
+  } catch (error: any) {
+    console.error("Error disconnecting WhatsApp:", error?.message || error);
+    res.status(500).json({ message: "Failed to disconnect WhatsApp" });
+  }
+});
+
 router.put("/users/:userId/slack-channel", async (req, res) => {
   try {
     const { userId } = req.params;
@@ -1395,6 +1512,20 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
       ? slackChannels.map((c: any) => String(c).trim()).filter(Boolean)
       : [];
 
+    // One platform per customer (ENG-273): an account on WhatsApp cannot also be given a
+    // Slack channel. Clearing channels is always allowed — that is how Slack is removed.
+    if (channels.length > 0) {
+      const { hasWhatsApp } = await import('../services/customerChannelPolicy');
+      if (hasWhatsApp(user)) {
+        return res.status(409).json({
+          message:
+            'This account is already connected to WhatsApp. An account can use one messaging platform, so disconnect WhatsApp before assigning a Slack channel.',
+          code: 'platform_conflict',
+          connected: 'whatsapp',
+        });
+      }
+    }
+
     const { settingsService } = await import('../services/settingsService');
     // Invalidate by userId (old assignments) AND by channel ID (channels that may be cached under a different user)
     const oldChannels: string[] = (user.slackChannels ?? []).concat(user.slackChannel ? [user.slackChannel] : []);
@@ -1403,7 +1534,23 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
     const updatedUser = await userDb.updateUser(userId, {
       slackChannels: channels.length > 0 ? channels : (null as any),
     });
-    res.json(sanitizeUserForResponse(updatedUser));
+
+    // Clearing an account's own channels can leave a member of an organisation on the
+    // organisation's channel, so report the platform the account is on NOW rather than
+    // letting the dashboard guess.
+    let platformFields: Record<string, unknown> = {};
+    try {
+      const { getPlatformSummary } = await import('../services/customerChannelPolicy');
+      const summary = await getPlatformSummary(updatedUser);
+      platformFields = {
+        messagingPlatform: summary.platform,
+        messagingPlatformSource: summary.source,
+        whatsappNumberMasked: summary.whatsappNumberMasked,
+      };
+    } catch (error) {
+      console.error('[admin] could not recalculate the platform after a Slack channel edit:', error);
+    }
+    res.json({ ...sanitizeUserForResponse(updatedUser), ...platformFields });
   } catch (error) {
     console.error("Error updating user slack channels:", error);
     res.status(500).json({ message: "Error updating slack channels" });
@@ -4922,9 +5069,10 @@ router.get("/subscription-types", async (req, res) => {
         normalizedPages = allAvailablePages;
       }
 
-      // Handle allowedSkills with backward compatibility
-      // If old format (allowedFunctionCalls but no allowedSkills), treat as all skills
-      let normalizedSkills = type.allowedSkills || allAvailableSkills;
+      // ENG-1978: a row without allowedSkills (old allowedFunctionCalls format) is no longer read as
+      // "all skills" — the runtime refuses to resolve it, so show it as having none rather than
+      // let an admin save it back as a full grant.
+      let normalizedSkills = Array.isArray(type.allowedSkills) ? type.allowedSkills : [];
       if (normalizedSkills.includes('*')) {
         normalizedSkills = allAvailableSkills;
       }
@@ -4968,6 +5116,63 @@ router.get("/subscription-types", async (req, res) => {
 });
 
 // Create or update subscription types
+/**
+ * ENG-1978: tiers an admin is about to remove (or rename away from) that accounts are still on.
+ *
+ * A user's tier is stored by NAME. If that name stops existing in `subscription_types`, the
+ * entitlement gate can no longer resolve the user and fails closed, so they drop to the foundation
+ * tools only. Before the gate failed closed those users silently kept every tool, which is why
+ * nothing ever needed to stop this save. Counted by the user's own `subscriptionType`: that covers
+ * org owners (whose tier their members inherit) but not the members themselves, so the count is a
+ * floor. `Free` is also the implicit tier of accounts with no `subscriptionType` at all (absent, null
+ * or empty — the runtime reads any falsy value as Free).
+ *
+ * This is a guard rail, not an invariant: it reads the current list, scans, and the caller writes
+ * later with no conditional write, so two concurrent admin saves or a user move racing the save
+ * can slip past it.
+ */
+async function findStrandedTiers(nextTierNames: string[]): Promise<Array<{ name: string; userCount: number }>> {
+  const current = await settingsService.getSetting("subscription_types");
+  if (!current) return [];
+  let currentTiers: any[];
+  try {
+    currentTiers = JSON.parse(current.settingValue);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(currentTiers)) return [];
+
+  const keep = new Set(nextTierNames);
+  const removed = currentTiers
+    .map((t) => t?.name)
+    .filter((n): n is string => typeof n === "string" && n.length > 0 && !keep.has(n));
+  if (removed.length === 0) return [];
+
+  const values: Record<string, string> = {};
+  removed.forEach((name, i) => { values[`:t${i}`] = name; });
+  const clauses = [`subscriptionType IN (${removed.map((_, i) => `:t${i}`).join(", ")})`];
+  if (removed.includes("Free")) {
+    clauses.push(
+      "attribute_not_exists(subscriptionType)",
+      "attribute_type(subscriptionType, :nullType)",
+      "subscriptionType = :emptyTier"
+    );
+    values[":emptyTier"] = "";
+    values[":nullType"] = "NULL";
+  }
+  const users = await userDb.scanWithFilter(clauses.join(" OR "), values);
+
+  return removed
+    .map((name) => ({
+      name,
+      userCount: users.filter((u) =>
+        u.subscriptionType === name ||
+        (name === "Free" && !u.subscriptionType)
+      ).length,
+    }))
+    .filter((t) => t.userCount > 0);
+}
+
 router.post("/subscription-types", async (req, res) => {
   try {
     const { subscriptionTypes } = req.body;
@@ -5147,6 +5352,33 @@ router.post("/subscription-types", async (req, res) => {
         ...(normalizedSeatPricing ? { seatPricing: normalizedSeatPricing } : {}),
       };
     }));
+
+    // Refuse to strand accounts on a tier that no longer exists. API callers that really mean it
+    // (e.g. after reassigning users out of band) can pass `allowStrandedUsers: true`.
+    if (req.body.allowStrandedUsers !== true) {
+      let stranded: Array<{ name: string; userCount: number }>;
+      try {
+        stranded = await findStrandedTiers(normalizedTypes.map((t: any) => t.name));
+      } catch (scanError) {
+        // Not a validation problem and nothing has been saved: tell the admin to retry.
+        console.error("Error checking which accounts are on removed subscription types:", scanError);
+        return res.status(503).json({
+          message: "Could not check which accounts are on the tiers being removed. Nothing was saved; please try again.",
+        });
+      }
+      if (stranded.length > 0) {
+        const list = stranded
+          .map((t) => `"${t.name}" (${t.userCount} account${t.userCount === 1 ? "" : "s"})`)
+          .join(", ");
+        return res.status(409).json({
+          message:
+            `Cannot remove or rename ${list}: accounts are still on ${stranded.length === 1 ? "it" : "them"} ` +
+            `(org members of those accounts inherit it too). Move them to another tier first, ` +
+            `otherwise they lose paid tools until reassigned.`,
+          strandedTiers: stranded,
+        });
+      }
+    }
 
     const updatedBy = (req as any).user?.email || "unknown";
     await settingsService.setSetting(

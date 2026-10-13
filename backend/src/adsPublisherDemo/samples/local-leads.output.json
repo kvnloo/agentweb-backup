@@ -1,0 +1,78 @@
+{
+  "dryRun": true,
+  "valid": true,
+  "errors": [],
+  "objects": [
+    {
+      "type": "campaign",
+      "ref": "campaign_1",
+      "endpoint": "POST /act_<AD_ACCOUNT_ID>/campaigns",
+      "payload": {
+        "name": "Water Heater Install Leads",
+        "objective": "OUTCOME_LEADS",
+        "status": "PAUSED",
+        "special_ad_categories": [],
+        "buying_type": "AUCTION"
+      }
+    },
+    {
+      "type": "adset",
+      "ref": "adset_1",
+      "endpoint": "POST /act_<AD_ACCOUNT_ID>/adsets",
+      "payload": {
+        "name": "Water Heater Install Leads — Ad set 1",
+        "campaign_id": "{campaign_1.id}",
+        "daily_budget": 2500,
+        "billing_event": "IMPRESSIONS",
+        "optimization_goal": "LEAD_GENERATION",
+        "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+        "status": "PAUSED",
+        "targeting": {
+          "geo_locations": {
+            "countries": [
+              "US"
+            ]
+          },
+          "age_min": 30,
+          "age_max": 65
+        }
+      }
+    },
+    {
+      "type": "adcreative",
+      "ref": "creative_1",
+      "endpoint": "POST /act_<AD_ACCOUNT_ID>/adcreatives",
+      "payload": {
+        "name": "Water Heater Install Leads — Creative 1",
+        "object_story_spec": {
+          "page_id": "<PAGE_ID>",
+          "link_data": {
+            "message": "Same-week water heater installs.",
+            "name": "Get a Free Quote",
+            "link": "https://example.com/quote",
+            "picture": "https://example.com/heater.jpg",
+            "call_to_action": {
+              "type": "GET_QUOTE",
+              "value": {
+                "link": "https://example.com/quote"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "ad",
+      "ref": "ad_1",
+      "endpoint": "POST /act_<AD_ACCOUNT_ID>/ads",
+      "payload": {
+        "name": "Water Heater Install Leads — Ad 1",
+        "adset_id": "{adset_1.id}",
+        "creative": {
+          "creative_id": "{creative_1.id}"
+        },
+        "status": "PAUSED"
+      }
+    }
+  ]
+}

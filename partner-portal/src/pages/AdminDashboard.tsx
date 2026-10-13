@@ -281,6 +281,11 @@ interface User {
   fromName?: string; // From name for emails
   slackChannel?: string; // @deprecated — use slackChannels
   slackChannels?: string[]; // Slack channels configured for this user
+  // ENG-273: one messaging platform per customer. Derived by the backend from the same
+  // policy that enforces the rule, so this never disagrees with what an edit will allow.
+  messagingPlatform?: "slack" | "whatsapp" | null;
+  messagingPlatformSource?: "account" | "organisation" | null;
+  whatsappNumberMasked?: string | null; // last four digits only
   secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
@@ -2684,7 +2689,15 @@ export default function AdminDashboard() {
         setUsers((prevUsers: User[]) =>
           prevUsers.map((user: User) =>
             user.userId === editingSlackChannelUserId
-              ? { ...user, slackChannels: response.data.slackChannels ?? [] }
+              ? {
+                  ...user,
+                  slackChannels: response.data.slackChannels ?? [],
+                  // Clearing an account's own channels can leave an organisation member on the
+                  // organisation's channel, so take the platform the server worked out.
+                  messagingPlatform: response.data.messagingPlatform ?? null,
+                  messagingPlatformSource: response.data.messagingPlatformSource ?? null,
+                  whatsappNumberMasked: response.data.whatsappNumberMasked ?? null,
+                }
               : user
           )
         );
@@ -2699,6 +2712,64 @@ export default function AdminDashboard() {
       setError(error.response?.data?.message || "Failed to update slack channel");
     } finally {
       setSlackChannelEditLoading(false);
+    }
+  };
+
+  // ENG-273: disconnect a customer's WhatsApp on their behalf. A customer is on one
+  // messaging platform, so this is also the only way support can move one to Slack.
+  const handleDisconnectWhatsApp = async (userId: string, maskedNumber?: string | null) => {
+    const which = maskedNumber ? ` (${maskedNumber})` : "";
+    if (!window.confirm(
+      `Disconnect this customer's WhatsApp number${which}?\n\n` +
+      "They will stop receiving AgentWeb notifications and approval requests on WhatsApp. " +
+      "They can reconnect from their own Settings, or you can then assign a Slack channel."
+    )) {
+      return;
+    }
+    try {
+      const response = await axios.delete(
+        buildApiUrl(`/api/admin/users/${userId}/whatsapp`),
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (response.status === 200) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === userId
+              // The server says what the account is on now. Removing WhatsApp can leave a member
+              // of an organisation on the organisation's Slack channel, not on nothing.
+              ? {
+                  ...user,
+                  // null = the server looked and found nothing; absent = it could not work it out,
+                  // which the table shows as "Unknown" rather than claiming "Not connected".
+                  messagingPlatform: response.data?.messagingPlatform,
+                  messagingPlatformSource: response.data?.messagingPlatformSource ?? null,
+                  whatsappNumberMasked: response.data?.whatsappNumberMasked ?? null,
+                }
+              : user
+          )
+        );
+        setSuccess(
+          response.data?.customerNotified
+            ? "WhatsApp disconnected. The customer was told on WhatsApp."
+            : "WhatsApp disconnected. The customer could not be told on WhatsApp (outside the 24-hour window)."
+        );
+      }
+    } catch (error: unknown) {
+      console.error("Error disconnecting WhatsApp:", error);
+      const message = axios.isAxiosError(error) ? error.response?.data?.message : undefined;
+      setError(typeof message === "string" && message ? message : "Failed to disconnect WhatsApp");
+      // 404 / 409 mean the account no longer has a number, so the row on screen is stale
+      // (someone else disconnected it, or the customer did). Stop claiming WhatsApp.
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      if (status === 404 || status === 409) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === userId
+              ? { ...user, messagingPlatform: undefined, messagingPlatformSource: null, whatsappNumberMasked: null }
+              : user
+          )
+        );
+      }
     }
   };
 
@@ -4864,30 +4935,74 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                   </Box>
                                 </Grid>
                                 <Grid item xs={3}>
-                                  <Typography variant="caption" color="text.secondary">Slack Channels</Typography>
-                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, flexWrap: "wrap" }}>
-                                    <Typography variant="body2">
-                                      {(() => {
-                                        const ids = user.slackChannels && user.slackChannels.length > 0
+                                  <Typography variant="caption" color="text.secondary">Messaging Platform</Typography>
+                                  {user.messagingPlatform === "whatsapp" ? (
+                                    // A customer is on ONE platform. On WhatsApp there is no Slack
+                                    // channel to edit, and the backend would refuse one — so the
+                                    // editor is not offered rather than offered and then rejected.
+                                    <Box>
+                                      <Typography variant="body2">
+                                        WhatsApp{user.whatsappNumberMasked ? ` (${user.whatsappNumberMasked})` : ""}
+                                      </Typography>
+                                      <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+                                        Slack can't be added while WhatsApp is connected.
+                                      </Typography>
+                                      {user.whatsappOptedOut && (
+                                        <Typography variant="caption" color="error" sx={{ display: "block" }}>
+                                          This number texted STOP, so nothing can reach it. Disconnect it.
+                                        </Typography>
+                                      )}
+                                      <Button
+                                        size="small"
+                                        color="error"
+                                        sx={{ mt: 0.5, p: 0, minWidth: 0, textTransform: "none" }}
+                                        onClick={() => handleDisconnectWhatsApp(user.userId, user.whatsappNumberMasked)}
+                                      >
+                                        Disconnect WhatsApp
+                                      </Button>
+                                    </Box>
+                                  ) : (
+                                    <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, flexWrap: "wrap" }}>
+                                      <Typography variant="body2">
+                                        {(() => {
+                                          const ids = user.slackChannels && user.slackChannels.length > 0
+                                            ? user.slackChannels
+                                            : user.slackChannel ? [user.slackChannel] : [];
+                                          if (ids.length === 0) {
+                                            if (user.messagingPlatformSource === "organisation") return "Slack (via organisation)";
+                                            // null = looked up, nothing connected. undefined = the lookup failed
+                                            // (or an older backend), which is not the same as "not connected".
+                                            if (user.messagingPlatform === undefined) return "Unknown";
+                                            const gone = user.whatsappDisconnect;
+                                            if (gone) {
+                                              const when = new Date(gone.at).toLocaleDateString();
+                                              const why =
+                                                gone.reason === "stop"
+                                                  ? "customer texted STOP"
+                                                  : gone.reason === "admin"
+                                                    ? "removed by support"
+                                                    : "customer removed it";
+                                              return `Not connected (WhatsApp: ${why}, ${when})`;
+                                            }
+                                            return "Not connected";
+                                          }
+                                          return "Slack: " + ids.map((id) =>
+                                            slackChannelNames[id] ? `${slackChannelNames[id]} (${id})` : id
+                                          ).join(", ");
+                                        })()}
+                                      </Typography>
+                                      <IconButton size="small" aria-label="Edit Slack channels" onClick={() => {
+                                        setEditingSlackChannelUserId(user.userId);
+                                        const channels = user.slackChannels && user.slackChannels.length > 0
                                           ? user.slackChannels
                                           : user.slackChannel ? [user.slackChannel] : [];
-                                        if (ids.length === 0) return "—";
-                                        return ids.map((id) =>
-                                          slackChannelNames[id] ? `${slackChannelNames[id]} (${id})` : id
-                                        ).join(", ");
-                                      })()}
-                                    </Typography>
-                                    <IconButton size="small" onClick={() => {
-                                      setEditingSlackChannelUserId(user.userId);
-                                      const channels = user.slackChannels && user.slackChannels.length > 0
-                                        ? user.slackChannels
-                                        : user.slackChannel ? [user.slackChannel] : [];
-                                      setCurrentSlackChannels(channels);
-                                      setSlackChannelInputText("");
-                                      setSlackChannelDialogOpen(true);
-                                      resolveSlackChannelNames(channels);
-                                    }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
-                                  </Box>
+                                        setCurrentSlackChannels(channels);
+                                        setSlackChannelInputText("");
+                                        setSlackChannelDialogOpen(true);
+                                        resolveSlackChannelNames(channels);
+                                      }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                    </Box>
+                                  )}
                                 </Grid>
                                 <Grid item xs={3}>
                                   <Typography variant="caption" color="text.secondary">SEO / GA / Clarity</Typography>

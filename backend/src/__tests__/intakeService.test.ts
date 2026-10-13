@@ -1562,3 +1562,63 @@ describe('intakeService.fileAutoIssue — LinkedIn disconnect alert class (ENG-2
     expect(linear.addIssueComment).not.toHaveBeenCalled();
   });
 });
+
+// ENG-2442: Meta connection handoff alerts share the tracking monitor's per-account canonical
+// (`Alert Class: meta-token-invalid` + `Alert Scope: meta-ad-account:<id>`), so re-fires fold onto
+// the open 'Meta ad account <id> cannot be read' issue instead of filing one per tick.
+describe('intakeService.fileAutoIssue — Meta connection alert dedupe (ENG-2442)', () => {
+  const { metaAccountAlertContext } = jest.requireActual('../services/metaConnectionHandoff');
+  afterEach(() => { jest.clearAllMocks(); });
+
+  function statefulBoard(seed: any[] = []) {
+    const open: any[] = seed.slice();
+    let n = 4000;
+    linear.listOpenIssuesByLabel.mockImplementation(async () => open.slice());
+    linear.createInternalLinearIssue.mockImplementation(async (a: any) => {
+      n += 1;
+      open.push({ identifier: `ENG-${n}`, issueId: `uuid-${n}`, title: a.title, description: String(a.description).replace(/^- /gm, '* ') });
+      return { identifier: `ENG-${n}`, url: 'u' };
+    });
+    return open;
+  }
+  const handoff = (accountId: string, userId = 'u1') => fileAutoIssue({
+    title: `Meta connection: info@x.ai — Incentiv Pay (${accountId}) token expired`,
+    description: 'd', source: 'Oncall alert',
+    notionContext: { ...metaAccountAlertContext(accountId), userId, accountId, reason: 'refresh_failed' },
+  });
+  const canonical = (accountId: string) => ({
+    identifier: 'ENG-2416', issueId: 'uuid-2416',
+    title: `Meta ad account ${accountId} cannot be read — token invalid`,
+    description: `x\n* Alert Class: meta-token-invalid\n* Alert Scope: meta-ad-account:${accountId}\n* Alert Priority: high`,
+  });
+
+  it('a handoff alert lands on the open monitor canonical for the same account', async () => {
+    statefulBoard([canonical('409853340719899')]);
+    const r = await handoff('409853340719899');
+    expect(r).toMatchObject({ pageId: 'ENG-2416', deduped: true });
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+  });
+
+  it('re-firing N times for one account yields exactly one open issue', async () => {
+    const open = statefulBoard();
+    for (let i = 0; i < 5; i++) await handoff('409853340719899', i % 2 ? 'u1' : 'u2');
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    expect(open).toHaveLength(1);
+  });
+
+  it('a different account (including a prefix id) still files its own issue', async () => {
+    statefulBoard([canonical('409853340719899')]);
+    await handoff('40985334071989');
+    await handoff('4098533407198990');
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(2);
+  });
+
+  it('after the canonical closes, repeated alerts file exactly one follow-up', async () => {
+    const open = statefulBoard([canonical('409853340719899')]);
+    open.splice(0, 1); // canonical closed: no longer in the open list
+    await handoff('409853340719899');
+    await handoff('409853340719899');
+    await handoff('409853340719899');
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+  });
+});

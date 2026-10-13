@@ -5512,6 +5512,14 @@ export async function generateChatResponse(
             // throw on an undefined id and silently falling back to zero tools below.
             userId ? getAllowedSkills(userId) : getPublicAllowedSkills(),
           ]);
+          // ENG-1978: getAllowedSkills now returns null when the tier could not be resolved,
+          // where it previously returned ["*"] (grant everything). Route that into the catch
+          // below so `skillAllowlistResolved` stays false — the hard gate then reports a
+          // configuration problem rather than claiming the customer's plan excludes the skill.
+          // Emma already failed closed on a *thrown* lookup; this keeps the two identical.
+          if (userAllowedSkillIds === null) {
+            throw new Error('subscription entitlement unresolved');
+          }
           userAllowedSkillIdsForGate = userAllowedSkillIds;
           // Set only after buildSkillContext itself succeeds — if it throws, the
           // catch block below must still see skillAllowlistResolved === false, or

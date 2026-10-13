@@ -119,6 +119,20 @@ describe('shadow outcome judge (ENG-2138)', () => {
     expect(result).toEqual(expect.objectContaining({ shadow: true, score: 4 }));
   });
 
+  it('stores the reply\'s one-decimal score unrounded, so a decimal rubric is measured on what it emitted (ENG-2138)', async () => {
+    mockCallLLM.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({ reason: 'Delivered with minor gaps.', score: 4.6 }) } }],
+    } as never);
+
+    await scoreSessionWithJudgeIfNeeded(session(), shadowJudge());
+
+    expect(mockUpdateJudgeScore).toHaveBeenCalledWith(
+      'sess-1',
+      OUTCOME_SHADOW_JUDGE_ID,
+      expect.objectContaining({ score: 4.6, shadow: true }),
+    );
+  });
+
   it('asks for the three behaviour criteria and stores only real booleans from the reply (ENG-2189)', async () => {
     for (const field of ['arguedWithInstruction', 'escalatedWhenNotRequired', 'failedToEscalate']) {
       expect(OUTCOME_RUBRIC_B_PROMPT).toContain(`"${field}": <true|false>`);

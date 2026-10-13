@@ -64,6 +64,7 @@ import fathomAuthRoutes from "./routes/fathomAuth";
 import fathomWebhookRoutes from "./routes/fathomWebhook";
 import whatsappWebhookRoutes from "./routes/whatsappWebhook";
 import messagingChannelsRoutes from "./routes/messagingChannels";
+import approvalRequestsRoutes from "./routes/approvalRequests";
 import calendlyWebhookRoutes from "./routes/calendlyWebhook";
 import unipileWebhookRoutes from "./routes/unipileWebhook";
 // ENG-926 §C: registers the CRM -> Meta conversion relay's queue processor at boot. The
@@ -357,7 +358,7 @@ app.use("/api/integrations/linear/webhook", express.raw({ type: "application/jso
 app.use("/api/integrations/featurebase/webhook", express.raw({ type: "application/json" }));
 // WhatsApp Cloud API webhook: Meta signs the exact payload bytes as X-Hub-Signature-256,
 // so the HMAC must be computed over the raw Buffer, not a re-serialized parse (ENG-273).
-app.use("/api/webhooks/whatsapp", express.raw({ type: "application/json" }));
+app.use("/api/webhooks/whatsapp", express.raw({ type: "application/json", limit: "2mb" }));
 // Unipile account_status webhook (ENG-1197): Unipile's deliveries do not carry a
 // Content-Type of exactly "application/json", so the global express.json() below
 // (which only parses when that type matches) leaves req.body empty, and the
@@ -453,6 +454,7 @@ app.use("/api/webhooks", webhookRoutes);
 app.use("/api/webhooks/fathom", fathomWebhookRoutes);
 app.use("/api/webhooks/whatsapp", whatsappWebhookRoutes);
 app.use("/api/messaging-channels", messagingChannelsRoutes);
+app.use("/api/approval-requests", approvalRequestsRoutes);
 app.use("/api/webhooks/calendly", calendlyWebhookRoutes);
 app.use("/api/webhooks/unipile", unipileWebhookRoutes);
 registerConversionRelayProcessor();

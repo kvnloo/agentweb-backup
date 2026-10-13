@@ -48,6 +48,14 @@ interface User {
   fromName?: string; // From name for emails
   slackChannel?: string; // @deprecated — use slackChannels
   slackChannels?: string[]; // Slack channels configured for this user
+  // ENG-273: one messaging platform per customer, derived by the backend policy.
+  messagingPlatform?: "slack" | "whatsapp" | null;
+  messagingPlatformSource?: "account" | "organisation" | null;
+  whatsappNumberMasked?: string | null; // last four digits only
+  // Why this account has no WhatsApp number any more, and whether the connected number has
+  // texted STOP (an account that could not be matched to its number at the time).
+  whatsappDisconnect?: { reason: "stop" | "customer" | "admin"; at: string; last4?: string } | null;
+  whatsappOptedOut?: boolean;
   secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID

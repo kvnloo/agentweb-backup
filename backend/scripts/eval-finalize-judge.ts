@@ -18,7 +18,7 @@ import {
   type JudgeFn,
 } from '../src/loops/eval/finalizeJudgeAccuracy';
 import { FINALIZE_JUDGE_CASES } from '../src/loops/eval/finalizeJudgeAccuracyFixtures';
-import { buildFinalizeJudgePrompt, parseFinalizeJudgeOutput } from '../src/services/agentMode/core/finalizeGuard';
+import { buildFinalizeJudgePrompt, parseFinalizeJudgeOutput, FINALIZE_JUDGE_MAX_COMPLETION_TOKENS } from '../src/services/agentMode/core/finalizeGuard';
 import { toolResultError } from '../src/utils/toolResultError';
 import { mediaGenProducedAsset } from '../src/services/agentMode/core/toolDispatch';
 
@@ -31,7 +31,7 @@ async function liveJudge(): Promise<JudgeFn> {
     const response = await (agentModeService as any).callLLM(JUDGE_MODEL, [
       { role: 'user', content: buildFinalizeJudgePrompt(finalText, candidates) },
     ], {
-      max_completion_tokens: 500,
+      max_completion_tokens: FINALIZE_JUDGE_MAX_COMPLETION_TOKENS,
       temperature: 0,
       taskClass: 'nonstandard_consumer',
       usageContext: { feature: 'finalize_guard_judge_eval' },

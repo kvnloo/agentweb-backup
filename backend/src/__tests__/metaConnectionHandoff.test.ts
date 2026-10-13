@@ -62,7 +62,8 @@ describe('raiseMetaConnectionHandoff', () => {
     expect(p.message.match(/Next actor:/g)).toHaveLength(1);
     expect(p.dedupeKey).toBe('meta-connection:u1:123:refresh_failed');
     expect(p.dedupeWindowMs).toBe(META_HANDOFF_DEDUPE_WINDOW_MS);
-    expect(p.context['Alert Class']).toBe('meta-connection:u1:123');
+    expect(p.context['Alert Class']).toBe('meta-token-invalid');
+    expect(p.context['Alert Scope']).toBe('meta-ad-account:123');
     expect(p.userId).toBe('u1');
   });
 

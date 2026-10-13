@@ -809,7 +809,7 @@ describe('POST /compare/select', () => {
     expect(res(out).messages.map((m: any) => m.messageIndex)).toEqual([3, 4]);
     expect(res(out).llmModel).toBe('gpt-5.5');
     expect(deps.updateSessionModel).toHaveBeenCalledWith('s-1', 'gpt-5.5');
-    expect(deps.tryClaim).toHaveBeenCalledWith('s-1');
+    expect(deps.tryClaim).toHaveBeenCalledWith('s-1', 'user-1');
     expect(deps.release).toHaveBeenCalledWith('s-1');
   });
 

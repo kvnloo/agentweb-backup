@@ -809,11 +809,15 @@ emmaToolRegistry.register({
       const { skillService } = await import('../services/skillService');
       const { getAllowedSkills } = await import('../services/subscriptionService');
 
-      const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+      const [publishedSkills, rawAllowedSkillIds] = await Promise.all([
         skillService.getSkillsAvailableToUser(userId),
         getAllowedSkills(userId)
       ]);
 
+      // ENG-1978: null = entitlement unresolved. Admit nothing on the tier's behalf — the user's
+      // own skills still install via the ownerId check below, but an unproven tier entitlement
+      // must never be the thing that admits a skill into a session.
+      const userAllowedSkillIds: string[] = rawAllowedSkillIds ?? [];
       const isWildcard = userAllowedSkillIds.includes("*");
       const allowedSkillSet = new Set(userAllowedSkillIds);
 
@@ -902,11 +906,14 @@ emmaToolRegistry.register({
       // best-effort: degrade to non-org behavior
     }
 
-    const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+    const [publishedSkills, rawAllowedSkillIds] = await Promise.all([
       skillService.getSkillsAvailableToUser(userId, userOrgId),
       getAllowedSkills(userId)
     ]);
 
+    // ENG-1978: null = entitlement unresolved. List nothing extra rather than the whole catalog;
+    // the user's own skills still appear via the ownerId check below.
+    const userAllowedSkillIds: string[] = rawAllowedSkillIds ?? [];
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSkillSet = new Set(userAllowedSkillIds);
 
