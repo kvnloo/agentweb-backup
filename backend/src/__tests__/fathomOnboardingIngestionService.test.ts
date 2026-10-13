@@ -396,6 +396,56 @@ describe('fathomOnboardingIngestionService', () => {
     expect(updatedLedger[0].createdAt).toBe('2026-07-08T19:00:00.000Z');
   });
 
+  it('keeps a discarded entry discarded when the same recording is re-ingested unreviewed (Opslane 357)', async () => {
+    const prior = {
+      recordingId: 'disc-1',
+      recordingUrl: 'https://fathom.video/calls/disc-1',
+      status: 'discarded',
+      extractionState: 'auto_extracted',
+      context: baseContext,
+      automationState: 'draft_account_created',
+      draftUserId: 'fathom-draft-disc-1',
+      draftEmail: 'fathom+disc-1@agentweb.internal',
+      memoryIds: [],
+      orgMemoryIds: [],
+      createdAt: '2026-07-08T19:00:00.000Z',
+      updatedAt: '2026-07-08T19:00:00.000Z',
+    };
+    const deps = makeDeps({
+      userDb: {
+        getUserById: jest.fn(async (userId: string) => ({
+          userId,
+          email: userId === 'fathom-draft-disc-1' ? 'fathom+disc-1@agentweb.internal' : 'harsha@agentweb.pro',
+          fathomDraftStatus: userId === 'fathom-draft-disc-1' ? 'discarded' : undefined,
+          isActive: false,
+          fathomOnboardingIngestions: userId === 'fathom-draft-disc-1' ? [prior] : [],
+        })),
+        getUserByEmail: jest.fn(async (email: string) => (
+          email === 'fathom+disc-1@agentweb.internal'
+            ? { userId: 'fathom-draft-disc-1', email, isActive: false, fathomDraftAccount: true, fathomDraftStatus: 'discarded' }
+            : null
+        )),
+        getUsersByEmailDomain: jest.fn(async () => []),
+        updateUser: jest.fn(async (_userId: string, updates: Record<string, any>) => updates),
+        createFathomDraftUser: jest.fn(),
+      },
+    });
+
+    const result = await ingestFathomOnboardingRecording({
+      recordingId: 'disc-1',
+      recordingUrl: 'https://fathom.video/calls/disc-1',
+      reviewOwnerUserId: 'review-owner',
+      automationMode: 'auto_draft',
+      allowDraftAccountCreation: true,
+      extractedContext: { ...baseContext, primaryContactEmail: 'buyer@disc.com', website: 'https://disc.com', companyName: 'Disc Co' },
+    }, deps as any);
+
+    expect(result.status).toBe('discarded');
+    const ledger = deps.userDb.updateUser.mock.calls[0][1].fathomOnboardingIngestions;
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0].status).toBe('discarded');
+  });
+
   it('routes existing account matches to review without creating another user', async () => {
     const deps = makeDeps();
 

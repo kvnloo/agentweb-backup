@@ -512,7 +512,11 @@ export async function ingestFathomOnboardingRecording(
   const existing = (ledgerUser as any).fathomOnboardingIngestions as FathomOnboardingIngestion[] | undefined;
   const previous = existing?.find((item) => sameLedgerRecording(item, { recordingId, recordingUrl: input.recordingUrl }));
   const reviewed = input.reviewed === true;
-  const status: IngestionStatus = reviewed ? 'reviewed' : 'needs_review';
+  // ENG-270 (Opslane 357): an admin discard sticks across unreviewed re-ingests, so the
+  // ledger never says needs_review while the draft account stays flagged discarded.
+  const status: IngestionStatus = reviewed
+    ? 'reviewed'
+    : previous?.status === 'discarded' ? 'discarded' : 'needs_review';
   const extractionState: ExtractionState = reviewed ? 'human_reviewed' : 'auto_extracted';
   const now = deps.now();
   let memoryIds = previous?.memoryIds || [];
