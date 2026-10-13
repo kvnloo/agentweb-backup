@@ -6,6 +6,8 @@ import { normalizeWorkPlanSteps, findAmbiguousMergeTargets, findConflictingMerge
 import { normalizeWorkPlanDisplayMetadata } from "../services/workPlanDisplayMetadata";
 import { checkPlanDefaultModelWrite, isUserAdminSafe, planAdminStatusApplies } from "../services/agentMode/modelPin";
 import { workPlanThumbnailService } from "../services/workPlanThumbnailService";
+import { workPlanStepModels } from "../services/agentMode/workPlanStepModelsInstance";
+import { anyStepCarriesModel, checkPlanStepModelsWrite, stepsWithModels } from "../services/agentMode/workPlanStepModels";
 
 const THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
 const THUMBNAIL_ACCEPTED_TYPES = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
@@ -77,7 +79,11 @@ router.post("/", async (req, res) => {
     const modelCheck = await checkPlanDefaultModelWrite(async () => false, defaultModel);
     if (!modelCheck.ok) return res.status(422).json(modelCheck.body);
 
-    const { steps: normalizedSteps, warnings } = normalizeWorkPlanSteps(steps);
+    // ENG-2378: a step `model` is stored (and validated like the plan default) only while the switch is on.
+    const stepModelsEnabled = anyStepCarriesModel(steps) && await workPlanStepModels.isEnabled();
+    const { steps: normalizedSteps, warnings } = normalizeWorkPlanSteps(steps, { stepModelsEnabled });
+    const stepModelCheck = await checkPlanStepModelsWrite(async () => false, normalizedSteps);
+    if (!stepModelCheck.ok) return res.status(422).json(stepModelCheck.body);
 
     // No plan id exists yet at create time, so a self-reference in
     // `nextPlanIds` cannot be checked (and cannot practically occur — the
@@ -151,7 +157,8 @@ router.put("/:planId", async (req, res) => {
     const stake = "expectedStepsRev" in req.body
       ? { expectedStepsRev: req.body.expectedStepsRev }
       : {};
-    const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps) : undefined;
+    const stepModelsEnabled = (anyStepCarriesModel(steps) || anyStepCarriesModel(plan.steps)) && await workPlanStepModels.isEnabled();
+    const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps, { stepModelsEnabled }) : undefined;
     let normalizedSteps = normalized?.steps;
     const warnings = normalized?.warnings ?? [];
 
@@ -193,6 +200,11 @@ router.put("/:planId", async (req, res) => {
     if (normalizedSteps !== undefined) {
       const mode: 'merge' | 'replace' = rawMode === 'merge' ? 'merge' : 'replace';
       const existingSteps: any[] = Array.isArray(plan.steps) ? plan.steps : [];
+      // ENG-2378: while the switch is off a submitted step model is dropped by design, so a replace that
+      // no longer carries a stored one is not "content loss" and must not be refused as such.
+      const comparableExisting: any[] = stepModelsEnabled
+        ? existingSteps
+        : existingSteps.map(({ model: _model, ...rest }: any) => rest);
 
       if (mode === 'merge') {
         // `normalizeWorkPlanSteps` FILLS IN what a partial step omits — `title`
@@ -244,6 +256,9 @@ router.put("/:planId", async (req, res) => {
           // victim of it).
           if (has('expectedAssetCountTools')) out.expectedAssetCountTools = norm.expectedAssetCountTools;
           if (has('inputRequest')) out.inputRequest = norm.inputRequest;
+          // ENG-2378: same pass-through, gated on the switch (off: nothing is "supplied", the stored model stands).
+          // A blank string is the explicit clear (the normalizer drops it, so it is re-expressed as '').
+          if (stepModelsEnabled && typeof raw.model === 'string') out.model = norm.model ?? '';
           return out;
         });
 
@@ -309,7 +324,7 @@ router.put("/:planId", async (req, res) => {
           const { title, ...rest } = norm;
           return rest;
         });
-        const contentLoss = findStepContentLoss(existingSteps, forCompare);
+        const contentLoss = findStepContentLoss(comparableExisting, forCompare);
         if (contentLoss.length > 0) {
           // Two different accidents reach here, and saying "fields would be
           // blanked" for both misdescribes one of them. `blanked` is a step that
@@ -343,7 +358,23 @@ router.put("/:planId", async (req, res) => {
       // AC3: a step change always reports a diff. A 200 with a null diff used to
       // be indistinguishable from a successful no-op, which is exactly why a
       // destructive write could pass unnoticed.
-      stepsChange = summarizeStepChange(existingSteps, normalizedSteps, mode);
+      stepsChange = summarizeStepChange(mode === 'replace' ? comparableExisting : existingSteps, normalizedSteps, mode);
+    }
+
+    // ENG-2378: every step model that is NEW or CHANGED must be a served, selectable model (same rule as the
+    // plan's defaultModel: an unchanged stored value is tolerated so a since-retired model never blocks an
+    // unrelated edit). When the plan's launcher scope widens, its stored step models are re-checked as a
+    // non-admin launcher would, even if the steps were not part of this write.
+    if (stepModelsEnabled) {
+      const stepsToCheck = normalizedSteps ?? (scopeWidened ? stepsWithModels(plan.steps) : undefined);
+      if (stepsToCheck) {
+        const stepModelCheck = await checkPlanStepModelsWrite(
+          () => adminClearsAfter ? isUserAdminSafe(plan.ownerId) : Promise.resolve(false),
+          stepsToCheck,
+          scopeWidened || normalizedSteps === undefined ? undefined : plan.steps,
+        );
+        if (!stepModelCheck.ok) return res.status(422).json(stepModelCheck.body);
+      }
     }
 
     // `display` is optional customer-facing browse metadata (ENG-1469). Presence

@@ -4,6 +4,8 @@ import { normalizeWorkPlanSteps } from "../services/workPlanSteps";
 import { userDb, orgDb } from "../services/db";
 import { can } from "../services/orgAuthz";
 import { checkPlanDefaultModelWrite, isUserAdminSafe, planAdminStatusApplies } from "../services/agentMode/modelPin";
+import { workPlanStepModels } from "../services/agentMode/workPlanStepModelsInstance";
+import { anyStepCarriesModel, checkPlanStepModelsWrite } from "../services/agentMode/workPlanStepModels";
 import {
   canEditItem,
   isFeatureEffectivelyEnabled,
@@ -88,7 +90,14 @@ router.post("/", async (req, res) => {
     );
     if (!modelCheck.ok) return res.status(422).json(modelCheck.body);
 
-    const { steps: normalizedSteps, warnings } = normalizeWorkPlanSteps(steps);
+    // ENG-2378: a step `model` is stored (and validated like the plan default) only while the switch is on.
+    const stepModelsEnabled = anyStepCarriesModel(steps) && await workPlanStepModels.isEnabled();
+    const { steps: normalizedSteps, warnings } = normalizeWorkPlanSteps(steps, { stepModelsEnabled });
+    const stepModelCheck = await checkPlanStepModelsWrite(
+      () => planAdminStatusApplies({ visibility: 'private', ownerId: userId, orgId }) ? isUserAdminSafe(userId) : Promise.resolve(false),
+      normalizedSteps,
+    );
+    if (!stepModelCheck.ok) return res.status(422).json(stepModelCheck.body);
 
     // Work plans are member-owned: any user may create their own. Org-wide
     // visibility is governed separately by the shareSettings `enabled` toggle.
@@ -158,7 +167,17 @@ router.put("/:planId", async (req, res) => {
       plan.defaultModel,
     );
     if (!modelCheck.ok) return res.status(422).json(modelCheck.body);
-    const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps) : undefined;
+    const stepModelsEnabled = (anyStepCarriesModel(steps) || anyStepCarriesModel(plan.steps)) && await workPlanStepModels.isEnabled();
+    const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps, { stepModelsEnabled }) : undefined;
+    if (normalized) {
+      // ENG-2378: only a NEW or CHANGED step model is validated; an unchanged stored one is tolerated.
+      const stepModelCheck = await checkPlanStepModelsWrite(
+        () => planAdminStatusApplies(plan) ? isUserAdminSafe(plan.ownerId) : Promise.resolve(false),
+        normalized.steps,
+        plan.steps,
+      );
+      if (!stepModelCheck.ok) return res.status(422).json(stepModelCheck.body);
+    }
     const warnings = normalized?.warnings ?? [];
     const updated = {
       ...plan,

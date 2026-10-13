@@ -264,6 +264,8 @@ export interface ChatSession {
       // = the gate falls back to the max succeeded count across every known
       // asset-producing tool.
       expectedAssetCountTools?: string[];
+      /** ENG-2378: this step's explicit model (canonical registry id), copied from the template at launch. */
+      model?: string;
       inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
     }>;
     createdAt: string;
@@ -3880,6 +3882,8 @@ export class ChatbotDB {
         expectedAssetCount?: number;
         /** ENG-1331: see the matching field on the read-side workPlan type above. */
         expectedAssetCountTools?: string[];
+        /** ENG-2378: see the matching field on the read-side workPlan type above. */
+        model?: string;
         inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
       }>;
       createdAt: string;
