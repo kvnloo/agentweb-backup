@@ -415,7 +415,10 @@ function getOrchestrator(): OnboardingPipelineOrchestrator {
   _orchestrator = new OnboardingPipelineOrchestrator({
     dag: PRODUCTION_DAG,
     getUser: async (userId): Promise<OrchestratorUser | null> => {
-      const u = (await userDb.getUserById(userId)) as
+      // Base-table read: the walk decides what to fire from `steps`, and a stale
+      // row (the previous write not yet visible through the index) makes it
+      // re-fire a step it just ran or overwrite a record it just wrote.
+      const u = (await readUserForOwnership(userId)) as
         | (Record<string, unknown> & { steps?: UserSteps; useEagerPipeline?: boolean })
         | null;
       if (!u) return null;
@@ -430,10 +433,20 @@ function getOrchestrator(): OnboardingPipelineOrchestrator {
         ...u,
       };
     },
-    updateUserSteps: async (userId, steps) => {
-      await userDb.updateUser(userId, { steps } as Partial<
-        Parameters<typeof userDb.updateUser>[1]
-      >);
+    updateUserSteps: async (userId, steps, expected) => {
+      await userDb.updateUser(
+        userId,
+        { steps } as Partial<Parameters<typeof userDb.updateUser>[1]>,
+        expected
+          ? {
+              condition: {
+                expression: expected.steps === null ? "attribute_not_exists(#steps)" : "#steps = :stepsExpected",
+                names: { "#steps": "steps" },
+                ...(expected.steps === null ? {} : { values: { ":stepsExpected": expected.steps } }),
+              },
+            }
+          : undefined,
+      );
     },
   });
   return _orchestrator;
