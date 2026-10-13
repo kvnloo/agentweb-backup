@@ -169,6 +169,15 @@ describe('recordLlmUsage (ENG-1816 F1)', () => {
       expect(attempt).not.toHaveProperty('customerEstimateMicroUsd');
     });
 
+    it('registers the pending journal write so a graceful shutdown drains it', async () => {
+      const { cronJobRegistry } = require('../../../utils/cronJobRegistry');
+      const trackSpy = jest.spyOn(cronJobRegistry, 'track');
+      bindAttemptUsageJournal({ record: jest.fn().mockResolvedValue(undefined) });
+      recordLlmUsage(customerFunding(), pricedCtx, 'test');
+      expect(trackSpy).toHaveBeenCalledWith('attemptUsageJournal', expect.any(Promise));
+      trackSpy.mockRestore();
+    });
+
     it('survives an attempt that cannot be built, without throwing or touching any rail', () => {
       const record = jest.fn();
       bindAttemptUsageJournal({ record });

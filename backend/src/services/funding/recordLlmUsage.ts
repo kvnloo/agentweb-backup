@@ -9,6 +9,7 @@
  * branch here, before any of it runs, is what makes the branch itself trustworthy.
  */
 import { randomUUID } from "crypto";
+import { cronJobRegistry } from "../../utils/cronJobRegistry";
 import { meterWithResolvedBilling } from "../agentMode/deferredBillingMetering";
 import { computeCostMicroUsd, type RecordUsageContext } from "../usageRecorderService";
 import { getModelPrice, LLM_PRICE_BOOK_PROVENANCE } from "../../utils/llmPricing";
@@ -66,7 +67,9 @@ export function recordLlmUsage(runFunding: RunFunding | undefined, ctx: RecordLl
     console.error(`[recordLlmUsage] could not build the attempt record (${where}, fail-open, no existing rail touched):`, errorCode(error));
     return;
   }
-  void getAttemptUsageJournal()
+  // Tracked, like the deferred metering rail, so a graceful shutdown drains the write
+  // instead of dropping a row that has no other record. Still never awaited here.
+  const write = getAttemptUsageJournal()
     .record(attempt)
     .catch((error) =>
       // The error carries an attempt id and a code only; never log the object, which
@@ -75,6 +78,7 @@ export function recordLlmUsage(runFunding: RunFunding | undefined, ctx: RecordLl
         `[recordLlmUsage] journal write failed (${where}, fail-open, no existing rail touched): attempt ${attempt.attemptId} run ${attempt.runId} ${errorCode(error)}`,
       ),
     );
+  void cronJobRegistry.track("attemptUsageJournal", write);
 }
 
 function errorCode(error: unknown): string {

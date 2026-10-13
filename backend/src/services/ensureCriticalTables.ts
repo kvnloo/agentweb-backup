@@ -272,7 +272,7 @@ async function ensureTimeToLive(dynamo: AWS.DynamoDB, tableName: string, attribu
     console.log(`[ensureCriticalTables] enabled TTL on ${tableName} (attribute: ${attribute})`);
   } catch (err: any) {
     console.error(
-      `[ensureCriticalTables] could NOT enable TTL on ${tableName} (needs dynamodb:UpdateTimeToLive). Rows will not expire until someone runs: ` +
+      `[ensureCriticalTables] could NOT enable TTL on ${tableName} (needs dynamodb:DescribeTimeToLive and dynamodb:UpdateTimeToLive). Rows will not expire until someone runs: ` +
         `aws dynamodb update-time-to-live --table-name ${tableName} --time-to-live-specification "Enabled=true,AttributeName=${attribute}"`,
       err?.message || err,
     );
@@ -302,7 +302,7 @@ async function ensurePointInTimeRecovery(dynamo: AWS.DynamoDB, tableName: string
     console.log(`[ensureCriticalTables] enabled point-in-time recovery on ${tableName}`);
   } catch (err: any) {
     console.error(
-      `[ensureCriticalTables] could NOT enable point-in-time recovery on ${tableName} (needs dynamodb:UpdateContinuousBackups). Run: ` +
+      `[ensureCriticalTables] could NOT enable point-in-time recovery on ${tableName} (needs dynamodb:DescribeContinuousBackups and dynamodb:UpdateContinuousBackups). Run: ` +
         `aws dynamodb update-continuous-backups --table-name ${tableName} --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true`,
       err?.message || err,
     );
