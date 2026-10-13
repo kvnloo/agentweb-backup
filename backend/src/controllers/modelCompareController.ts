@@ -28,10 +28,12 @@ import {
   tryClaimSessionGeneration,
 } from './agentModeController';
 import { createCompareProviderPolicy } from '../services/agentMode/compareProviderPolicy';
+import { openRouterCatalogIds } from '../services/agentMode/openRouterCatalogIds';
 import { compareSaveAlternatives } from '../services/agentMode/compareSaveAlternativesInstance';
 import {
   compareModels,
   CompareDeps,
+  isDatedServedSlug,
   isSameServedModel,
   CompareSession,
   MODEL_COMPARE_ENABLED_SETTING,
@@ -117,11 +119,18 @@ function compareDeps(): CompareDeps {
     resolveModel: (input) => resolveEffectiveModelForUser(input),
     getModelInfo: (model) => agentModeService.getModelCompareInfo(model),
     isPriced: (model) => getModelPrice(model) !== null,
-    servedModelMatches: (requested, served) => {
+    servedModelMatches: async (requested, served) => {
       // Strict (exact or dated snapshot of the same id); fail closed if the id has no gateway
       // mapping (callLLM would already have refused it).
       try {
-        return isSameServedModel(resolveOpenRouterUpstreamModelId(requested), served, registeredUpstreamIds());
+        const upstream = resolveOpenRouterUpstreamModelId(requested);
+        if (!isSameServedModel(upstream, served, registeredUpstreamIds())) return false;
+        // A dated slug is also what an MMDD sibling that is listed upstream but not registered yet looks
+        // like (the daily monitor only adds it after a human merge). Re-check against the live catalog;
+        // an exact undated id needs no lookup, and an unreachable catalog degrades to the check above.
+        if (!isDatedServedSlug(served)) return true;
+        const catalogIds = await openRouterCatalogIds.getIds();
+        return isSameServedModel(upstream, served, [...registeredUpstreamIds(), ...catalogIds]);
       } catch {
         return false;
       }
