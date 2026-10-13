@@ -513,6 +513,16 @@ export type IcpCardResult =
   | { ok: true; icpResult: ICPPersona[] }
   | { ok: false; status: 400 | 404 };
 
+const ID_LESS_IDENTITY_FIELDS = ["name", "pain", "desire", "objection"] as const;
+
+function fingerprintOf(card: any): Record<string, unknown> {
+  return Object.fromEntries(ID_LESS_IDENTITY_FIELDS.map((f) => [f, card?.[f]]));
+}
+
+function sameFingerprint(card: any, fingerprint: Record<string, unknown>): boolean {
+  return ID_LESS_IDENTITY_FIELDS.every((f) => card?.[f] === fingerprint[f]);
+}
+
 /**
  * Edit or delete ONE persona, touching only that card.
  *
@@ -539,7 +549,7 @@ export async function writeIcpCard(
   // card again, not re-run `resolve`: a positional ref such as `icp-2` names
   // whatever sits at position 2 NOW, which after a concurrent delete is a different
   // card.
-  let target: { idKnown: boolean; id: unknown; name: unknown; index: number } | null = null;
+  let target: { idKnown: boolean; id: unknown; fingerprint: Record<string, unknown>; index: number } | null = null;
 
   for (let attempt = 0; attempt < MAX_CARD_WRITE_ATTEMPTS; attempt++) {
     const user: any = await readUserForRegeneration(userId);
@@ -552,15 +562,23 @@ export async function writeIcpCard(
       if ("status" in resolved) return { ok: false, status: resolved.status };
       idx = resolved.index;
       const first: any = list[idx];
-      target = { idKnown: first?.id !== undefined, id: first?.id, name: first?.name, index: idx };
+      target = { idKnown: first?.id !== undefined, id: first?.id, fingerprint: fingerprintOf(first), index: idx };
     } else {
-      // Same card by identity: its id, or, for a card stored before ids existed,
-      // its name (closest to where it was when several share one).
+      // Same card by identity: its id, or, for a card stored before ids existed, its name.
       const wanted = target;
       const matches = list
         .map((p: any, i) => ({ i, p }))
-        .filter(({ p }) => (wanted.idKnown ? p?.id === wanted.id : p?.id === undefined && p?.name === wanted.name));
-      if (matches.length === 0) return { ok: false, status: 404 };
+        .filter(({ p }) => (wanted.idKnown ? p?.id === wanted.id : p?.id === undefined && sameFingerprint(p, wanted.fingerprint)));
+      if (matches.length === 0) {
+        if (wanted.idKnown) return { ok: false, status: 404 };
+        // Without an id, "gone" and "renamed by a concurrent edit" look the same:
+        // ask the caller to retry from a fresh read rather than report a false 404.
+        throw Object.assign(new Error("the persona could not be re-identified"), { code: ICP_LIST_CONTENDED });
+      }
+      // Several id-less cards sharing a name cannot be told apart: never guess.
+      if (!wanted.idKnown && matches.length > 1) {
+        throw Object.assign(new Error("the persona could not be re-identified"), { code: ICP_LIST_CONTENDED });
+      }
       idx = matches.sort((x, y) => Math.abs(x.i - wanted.index) - Math.abs(y.i - wanted.index))[0].i;
       target.index = idx;
     }
@@ -570,19 +588,26 @@ export async function writeIcpCard(
     // value was read (any type) so a card with an odd stored shape can still match.
     const names: Record<string, string> = { "#cl": "icpResult", "#cid": "id" };
     const values: Record<string, unknown> = {};
-    const clauses: string[] = [];
+    // The element must still exist: a nameless, id-less card would otherwise pass the
+    // checks below at an index the list has since shrunk past.
+    const clauses: string[] = [`attribute_exists(#cl[${idx}])`];
     if (card?.id !== undefined) {
       values[":cid"] = card.id;
       clauses.push(`#cl[${idx}].#cid = :cid`);
     } else {
-      names["#cname"] = "name";
+      // No id to hold on to: the visible text is the identity. A name alone cannot
+      // tell two same-named cards apart, so a card sliding into this position after
+      // a concurrent delete would pass it.
       clauses.push(`attribute_not_exists(#cl[${idx}].#cid)`);
-      if (card?.name !== undefined) {
-        values[":cname"] = card.name;
-        clauses.push(`#cl[${idx}].#cname = :cname`);
-      } else {
-        clauses.push(`attribute_not_exists(#cl[${idx}].#cname)`);
-      }
+      ID_LESS_IDENTITY_FIELDS.forEach((f, n) => {
+        names[`#cf${n}`] = f;
+        if (card?.[f] === undefined) {
+          clauses.push(`attribute_not_exists(#cl[${idx}].#cf${n})`);
+        } else {
+          values[`:cf${n}`] = card[f];
+          clauses.push(`#cl[${idx}].#cf${n} = :cf${n}`);
+        }
+      });
     }
 
     const writeOptions: Parameters<typeof userDb.updateUser>[2] = {};
