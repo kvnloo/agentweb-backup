@@ -74,9 +74,12 @@ describe('guardLeadPutBody (ENG-2157)', () => {
     const { r } = run({ contactStatus: 'do-not-contact', contactStatusUpdatedBy: 'forged@example.invalid', contactStatusUpdatedAt: '2020-01-01T00:00:00.000Z' }, 'enforce');
     expect(r.body).toEqual({ contactStatus: 'do-not-contact', contactStatusUpdatedBy: 'user-1' });
   });
-  it('enforce: no stamp when contactStatus is absent or empty', () => {
+  it('enforce: no stamp when contactStatus is absent or null (updateLead writes no actor/time then)', () => {
     expect(run({ contactStatusUpdatedBy: 'x', notes: 'n' }, 'enforce').r.body).toEqual({ notes: 'n' });
-    expect(run({ contactStatus: '', contactStatusUpdatedBy: 'x' }, 'enforce').r.body).toEqual({ contactStatus: '' });
+    expect(run({ contactStatus: null, contactStatusUpdatedBy: 'x' }, 'enforce').r.body).toEqual({ contactStatus: null });
+  });
+  it.each(['', 'active', 5, { a: 1 }, false])('enforce: stamps the authenticated user whenever updateLead would write the actor/time pair (contactStatus=%p), never the client value', (v) => {
+    expect(run({ contactStatus: v, contactStatusUpdatedBy: 'forged@example.invalid' }, 'enforce').r.body).toEqual({ contactStatus: v, contactStatusUpdatedBy: 'user-1' });
   });
 
   it('the log line carries key names, channel and user id only, never a value', () => {
@@ -146,7 +149,7 @@ describe('contactSuppressionAuditEvent (ENG-2157)', () => {
     const ev = contactSuppressionAuditEvent({ ...base, before: { contactStatus: 'active' }, updates: { contactStatus: 'do-not-contact', contactStatusReason: 'admin-flagged', unsubscribedFromGroupEmail: true } });
     expect(ev).toMatchObject({
       eventType: 'contact_status.changed', createdAt: '2026-10-12T12:00:00.000Z',
-      eventData: { from: { contactStatus: 'active', unsubscribedFromGroupEmail: false }, to: { contactStatus: 'do-not-contact', contactStatusReason: 'admin-flagged', unsubscribedFromGroupEmail: true }, actorUserId: 'user-1', channel: 'ui', via: 'lead-put' },
+      eventData: { fromStatus: 'active', toStatus: 'do-not-contact', fromGroupEmailUnsubscribed: false, toGroupEmailUnsubscribed: true, reason: 'admin-flagged', actorUserId: 'user-1', channel: 'ui', via: 'lead-put' },
     });
     expect((ev!.eventData as any).note).toBe('Contact status: active → do-not-contact; Group email: unsubscribed');
   });
@@ -154,7 +157,7 @@ describe('contactSuppressionAuditEvent (ENG-2157)', () => {
   it('records clearing a suppression (Remove / Resubscribe)', () => {
     const ev = contactSuppressionAuditEvent({ ...base, before: { contactStatus: 'unsubscribed', unsubscribedFromGroupEmail: true }, updates: { contactStatus: 'active', contactStatusReason: null, unsubscribedFromGroupEmail: false } });
     expect((ev!.eventData as any).note).toBe('Contact status: unsubscribed → active; Group email: subscribed');
-    expect((ev!.eventData as any).to.contactStatusReason).toBeNull();
+    expect((ev!.eventData as any).reason).toBeNull();
   });
 
   it('records the legacy-flag-only Resubscribe (just unsubscribedFromGroupEmail:false)', () => {
@@ -189,7 +192,26 @@ describe('contactSuppressionAuditEvent (ENG-2157)', () => {
     const text = JSON.stringify(ev).toLowerCase();
     for (const kw of ['clicked', 'replied', 'received']) expect(text).not.toContain(kw);
     expect(text.length).toBeLessThan(1500);
-    expect((ev!.eventData as any).to.contactStatus).toBe('other');
+    expect((ev!.eventData as any).toStatus).toBe('other');
+  });
+
+  // The portal's Engagements dialog (customer-portal CRM.tsx ~9166) does `const from = eventData.from || ''` and renders {from} for EVERY event type, and
+  // `to.join(', ')`: an object-valued from/to throws "Objects are not valid as a React child" and takes the page down.
+  it('the event is flat: every eventData value is a primitive, and no key collides with the portal dialog\'s from/to/subject/message/content/platform', () => {
+    const cases: Array<[any, any]> = [
+      [{ contactStatus: 'active' }, { contactStatus: 'do-not-contact', contactStatusReason: 'admin-flagged', unsubscribedFromGroupEmail: true }],
+      [{ contactStatus: 'unsubscribed', unsubscribedFromGroupEmail: true }, { contactStatus: 'active', contactStatusReason: null, unsubscribedFromGroupEmail: false }],
+      [{}, { unsubscribedFromGroupEmail: true }],
+      [{ contactStatus: 'active' }, { contactStatus: { evil: 1 }, contactStatusReason: ['x'] }],
+    ];
+    for (const [b, u] of cases) {
+      const ev = contactSuppressionAuditEvent({ ...base, delegatedByUserId: 'admin-9', before: b, updates: u })!;
+      expect(ev).not.toBeNull();
+      for (const [k, v] of Object.entries(ev.eventData)) {
+        expect(['string', 'boolean']).toContain(v === null ? 'string' : typeof v);
+        expect(['from', 'to', 'subject', 'message', 'content', 'platform']).not.toContain(k);
+      }
+    }
   });
 
   it('every normal event is free of the engaged keywords', () => {

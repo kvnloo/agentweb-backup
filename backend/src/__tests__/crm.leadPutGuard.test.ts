@@ -237,7 +237,7 @@ describe('contact-suppression audit on the lead route (ENG-2157)', () => {
     expect(crmDb.addLeadEngagement).toHaveBeenCalledTimes(1);
     const [listId, leadId, ev] = asMockFn(crmDb.addLeadEngagement).mock.calls[0];
     expect([listId, leadId]).toEqual(['list1', 'lead1']);
-    expect(ev).toMatchObject({ eventType: 'contact_status.changed', eventData: { actorUserId: 'test-user-id', channel: 'ui', via: 'lead-put', from: { contactStatus: 'active' }, to: { contactStatus: 'do-not-contact', unsubscribedFromGroupEmail: true } } });
+    expect(ev).toMatchObject({ eventType: 'contact_status.changed', eventData: { actorUserId: 'test-user-id', channel: 'ui', via: 'lead-put', fromStatus: 'active', toStatus: 'do-not-contact', toGroupEmailUnsubscribed: true } });
     expect(asMockFn(crmDb.updateLead).mock.invocationCallOrder[0]).toBeLessThan(asMockFn(crmDb.addLeadEngagement).mock.invocationCallOrder[0]);
   });
 
