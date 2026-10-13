@@ -11864,8 +11864,10 @@ export const agentModeController = {
   // Stop generation for a session
   /**
    * ENG-110: GET /api/agent-mode/generating — ids of the CALLER's sessions that currently hold the generation
-   * claim on this instance. Derived from the cap module's per-user map (only the caller's entry is read),
-   * intersected with the session lock Set so a stale slot can never be reported as running.
+   * claim on this instance. Derived from the same source as `isGenerating` on GET /session/:id: the session
+   * lock plus its recorded owner (see getClaimedSessionIdsForUser). Runs that hold the lock without a cap slot
+   * (auto-continuation, branching, approval resume) are therefore listed too; a lock claimed without an owner
+   * falls back to the caller's cap slot. Only the caller's own ids are ever returned.
    */
   async getGeneratingSessions(req: AuthenticatedRequest, res: Response) {
     const user = req.user as User | undefined;

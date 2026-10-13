@@ -19,6 +19,7 @@ import {
   autoContinuationSessions,
   preemptAutoContinuationAndWait,
   sessionGenerationOwners,
+  releaseSessionGeneration,
 } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
@@ -896,6 +897,32 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
       expect(preempted).toBe(false);
       expect(mockRequestCancel).not.toHaveBeenCalled();
       expect(mockWorkerService.cancelSession).not.toHaveBeenCalled();
+    });
+
+    it('ENG-110: the preempting request\'s re-claim records its owner (polling loop path)', async () => {
+      activeSessionGenerations.add(mockSessionId);
+      autoContinuationSessions.add(mockSessionId);
+      const p = preemptAutoContinuationAndWait(mockSessionId, 'owner-1');
+      setTimeout(() => activeSessionGenerations.delete(mockSessionId), 10);
+      expect(await p).toBe(true);
+      expect(sessionGenerationOwners.get(mockSessionId)).toBe('owner-1');
+      releaseSessionGeneration(mockSessionId);
+      expect(sessionGenerationOwners.size).toBe(0);
+    });
+
+    it('ENG-110: the preempting request\'s FINAL re-claim (after the window) records its owner', async () => {
+      autoContinuationSessions.add(mockSessionId); // continuation flagged, lock already free
+      const realNow = Date.now();
+      const nowSpy = jest.spyOn(Date, 'now')
+        .mockReturnValueOnce(realNow) // deadline computation
+        .mockReturnValue(realNow + 10 * 60 * 1000); // window already over: loop skipped
+      try {
+        expect(await preemptAutoContinuationAndWait(mockSessionId, 'owner-2')).toBe(true);
+      } finally {
+        nowSpy.mockRestore();
+      }
+      expect(sessionGenerationOwners.get(mockSessionId)).toBe('owner-2');
+      releaseSessionGeneration(mockSessionId);
     });
 
     it('cancels the auto-continuation and re-claims the lock once it releases within the window', async () => {

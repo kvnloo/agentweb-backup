@@ -144,14 +144,16 @@ function seedSource(overrides: Record<string, unknown> = {}, rows: ChatMessage[]
 // ---------------------------------------------------------------------------
 const claimed = new Set<string>();
 let events: string[] = [];
+const claimOwners: Array<string | undefined> = [];
 
 function makeDeps(over: Partial<BranchDeps> = {}): BranchDeps {
   return {
     isAcceptingWork: () => true,
     isFeatureEnabled: async () => true,
     getSession: (id, opts) => chatbotDb.getChatSession(id, opts?.consistentRead === true),
-    tryClaim: (id) => {
+    tryClaim: (id, ownerUserId) => {
       events.push(`claim:${id}`);
+      claimOwners.push(ownerUserId);
       if (claimed.has(id)) return false;
       claimed.add(id);
       return true;
@@ -903,6 +905,14 @@ describe('source generation claim', () => {
     expect(newSessionIds()).toEqual([]);
     expect(claimed.has(SRC)).toBe(true);
     expect(events).toEqual([`claim:${SRC}`]); // no release of a lock we never held
+  });
+
+  it('ENG-110: the source claim carries the branch OWNER so /generating can list the run (branching holds no cap slot)', async () => {
+    seedSource();
+    claimOwners.length = 0;
+    const out = await run({ messageIndex: 8 });
+    expect(out.status).toBe(201);
+    expect(claimOwners).toEqual([OWNER]);
   });
 
   it('a generation cannot start on the source while the copy runs (concurrent append during copy refused)', async () => {
