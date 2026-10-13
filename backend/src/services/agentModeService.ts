@@ -170,7 +170,7 @@ import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
 import { pickTransport } from './funding/transport';
 import { currentRunFunding } from './funding/runFunding';
-import { recordLlmUsage } from './funding/recordLlmUsage';
+import { recordLlmUsage, customerUpstreamCost } from './funding/recordLlmUsage';
 import {
   getModelPrice,
   costScoreFromPrice,
@@ -2779,6 +2779,10 @@ export class AgentModeService {
           cacheReadTokens: normalizedUsage.cacheReadTokens,
           cacheWriteTokens: normalizedUsage.cacheWriteTokens,
           cacheWriteByTtl: usage.cache_creation_by_ttl,
+          // ENG-2106: only on a BYOK response, and only for the customer-funded branch of
+          // recordLlmUsage (it strips this before any AgentWeb rail). Not costUsdOverride:
+          // on a non-BYOK response that is AgentWeb's own cost.
+          ...customerUpstreamCost(usage),
           costUsdOverride:
             usage.is_byok === true
               ? typeof usage.cost_details?.upstream_inference_cost === 'number' &&
