@@ -5059,6 +5059,7 @@ export class AgentModeService {
         try {
           const finalizeLedger: FinalizeLedgerEntry[] = toolCalls.map((tc: any): FinalizeLedgerEntry => ({
             toolName: tc.name,
+            args: tc.arguments,
             // A suppressed same-turn duplicate (duplicateOf) and a budget-deferred
             // media call never EXECUTED — neither may back a claim on its own (the
             // original executed call has its own ledger entry), so both map to
