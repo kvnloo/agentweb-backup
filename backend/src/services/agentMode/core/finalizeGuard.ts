@@ -78,6 +78,13 @@ const EXTRA_BACKING_TOOLS: Record<'email_sent' | 'task_created_or_updated' | 'po
   post_published: new Set(['post_on_connected_account']),
 };
 
+/**
+ * Output cap for the claim-extraction judge call. Shared by production (agentModeService.judgeFinalizeClaims) and the
+ * live judge-accuracy script so a live eval measures the same truncation behaviour as production. Sized for an array
+ * of { claimClass, statement } objects; 500 was sized for bare classes (ENG-2459).
+ */
+export const FINALIZE_JUDGE_MAX_COMPLETION_TOKENS = 800;
+
 /** The 7 high-harm completed-action claim classes the guard verifies. */
 export type ClaimClass =
   | 'email_sent'
