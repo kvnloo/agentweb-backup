@@ -296,6 +296,56 @@ describe('HubspotAdapter batched push — stored contact id wins over email (ENG
     expect(result).toMatchObject({ successCount: 2, errorCount: 0 });
   });
 
+  it('two leads with the SAME email but DIFFERENT stored ids: both are accounted for exactly once', async () => {
+    mockBatchUpdateContacts.mockImplementation(async (batch: any[]) => {
+      if (batch.some((b) => b.id === 'B')) throw httpErr(409, { category: 'CONFLICT' });
+    });
+    const leads = [lead('l1', 'same@example.com', 'A'), lead('l2', 'same@example.com', 'B')];
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    expect(mockBatchUpsertContacts).not.toHaveBeenCalled();
+    expect(persistedMeta('l1')).toMatchObject({ hubspot_contact_id: 'A', syncStatus: 'synced' });
+    expect(persistedMeta('l2')).toMatchObject({ hubspot_contact_id: 'B', syncStatus: 'sync_failed' });
+    expect(result.successCount + result.errorCount).toBe(2);
+    expect(result).toMatchObject({ successCount: 1, errorCount: 1 });
+  });
+
+  it('an error body whose `errors` is not an array cannot break the push (the diagnostic log must not throw)', async () => {
+    failWhenContains(['BAD'], httpErr(400, { errors: 'not-an-array' }));
+    const leads = [lead('l1', 'ok@example.com', 'OK'), lead('l2', 'bad@example.com', 'BAD')];
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    expect(persistedMeta('l2')).toMatchObject({ hubspot_contact_id: 'BAD', syncStatus: 'sync_failed' });
+    expect(persistedMeta('l1')).toMatchObject({ hubspot_contact_id: 'OK', syncStatus: 'synced' });
+    expect(result).toMatchObject({ successCount: 1, errorCount: 1 });
+  });
+
+  it('shared stored id, different emails, and the first claimer is gone: both upsert by their OWN email', async () => {
+    failWhenContains(['A'], httpErr(404));
+    const leads = [lead('l1', 'a@example.com', 'A'), lead('l2', 'b@example.com', 'A')];
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    expect(mockBatchUpsertContacts.mock.calls[0][0].map((i: any) => i.email).sort()).toEqual(['a@example.com', 'b@example.com']);
+    expect(persistedMeta('l1').hubspot_contact_id).toBe('new_a@example.com');
+    expect(persistedMeta('l2').hubspot_contact_id).toBe('new_b@example.com');
+    expect(result).toMatchObject({ successCount: 2, errorCount: 0 });
+  });
+
+  it('250 stored-id leads are updated in chunks of 100/100/50 and each keeps its own id', async () => {
+    const leads = Array.from({ length: 250 }, (_, i) => lead(`l${i}`, `u${i}@example.com`, `ID${i}`));
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    const sizes = mockBatchUpdateContacts.mock.calls.map((c) => c[0].length).sort((a, b) => b - a);
+    expect(sizes).toEqual([100, 100, 50]);
+    expect(mockBatchUpsertContacts).not.toHaveBeenCalled();
+    for (const i of [0, 99, 100, 249]) expect(persistedMeta(`l${i}`).hubspot_contact_id).toBe(`ID${i}`);
+    expect(result).toMatchObject({ successCount: 250, updatedCount: 250, errorCount: 0 });
+  });
+
   describe('a lead with no stored id that shares an email with an updated stored-id lead', () => {
     it('adopts that contact instead of upserting (no dependence on HubSpot finding an email just written)', async () => {
       const leads = [lead('l1', 'shared@example.com', 'A'), lead('l2', 'shared@example.com')];
