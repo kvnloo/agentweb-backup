@@ -536,9 +536,9 @@ export async function casUpdateIcpList<T>(
     // a list that never reads back equal to what is stored (or sustained
     // contention) would otherwise fail every edit and delete for that user, with
     // nothing the user could do about it. Applying the change computed from the
-    // freshest read costs, at worst, a concurrent change that landed in the last
-    // few milliseconds, which is the lost update this helper exists to avoid
-    // everywhere else.
+    // freshest read costs a concurrent change that lands between that read and
+    // this write: the lost update this helper exists to avoid, but only after five
+    // straight losses, i.e. under sustained contention, and it is logged below.
     const lastAttempt = attempt === MAX_LIST_WRITE_ATTEMPTS - 1;
     try {
       await userDb.updateUser(
