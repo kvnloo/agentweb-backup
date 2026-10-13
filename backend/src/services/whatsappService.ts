@@ -242,6 +242,8 @@ export async function bindPhoneToUser(phone: string, userId: string): Promise<vo
  * both win: the first conditional put takes it. A row left behind by an account that no
  * longer holds the number (resolveUserIdByPhone heals those) does not block a new owner.
  */
+const PHONE_CLAIM_GRACE_MS = 2 * 60 * 1000;
+
 export async function claimPhoneForUser(
   phone: string,
   userId: string,
@@ -251,6 +253,14 @@ export async function claimPhoneForUser(
   if (await tryClaim()) return 'claimed';
   const existing = await settingsService.getSetting(phoneUserKey(phone));
   if (existing?.settingValue === userId) return 'already_yours';
+  // A claim is written before its owner's user record is saved, so for a moment it looks
+  // "stale" to resolveUserIdByPhone (the account does not hold the number yet) and would be
+  // healed away from under a save that is about to land. Give a fresh claim a grace period
+  // before treating it as abandoned; an abandoned one only blocks others for that long.
+  const claimedAt = existing?.updatedAt ? Date.parse(existing.updatedAt) : NaN;
+  if (Number.isFinite(claimedAt) && Date.now() - claimedAt < PHONE_CLAIM_GRACE_MS) {
+    return 'held_by_other';
+  }
   // Held by someone else per the row: only if that account really still has the number.
   const holder = await resolveUserIdByPhone(phone);
   if (holder && holder !== userId) return 'held_by_other';

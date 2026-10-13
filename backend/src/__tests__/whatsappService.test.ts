@@ -746,6 +746,28 @@ describe('phone -> user index', () => {
       expect(settingsService.setSettingIfAbsent).toHaveBeenCalledTimes(2);
     });
 
+    it('does not heal away a claim made moments ago (its owner has not saved yet)', async () => {
+      (settingsService.setSettingIfAbsent as jest.Mock).mockResolvedValue(false);
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: 'user-2',
+        updatedAt: new Date().toISOString(),
+      });
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user-2', messagingChannels: [] });
+      await expect(claimPhoneForUser(PHONE, 'user-1')).resolves.toBe('held_by_other');
+      expect(settingsService.deleteSettingIfValueMatches).not.toHaveBeenCalled();
+      expect(settingsService.setSettingIfAbsent).toHaveBeenCalledTimes(1);
+    });
+
+    it('takes over a claim that has been abandoned for longer than the grace period', async () => {
+      (settingsService.setSettingIfAbsent as jest.Mock).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: 'user-2',
+        updatedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+      });
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user-2', messagingChannels: [] });
+      await expect(claimPhoneForUser(PHONE, 'user-1')).resolves.toBe('claimed');
+    });
+
     it('loses cleanly when a racing account wins the second attempt too', async () => {
       (settingsService.setSettingIfAbsent as jest.Mock).mockResolvedValue(false);
       (settingsService.getSetting as jest.Mock).mockResolvedValue({ settingValue: 'user-2' });
