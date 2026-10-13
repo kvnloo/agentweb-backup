@@ -55,7 +55,7 @@ it('disconnects the number and tells the customer', async () => {
   const res = await request(app).delete('/users/user-1/whatsapp');
   expect(res.status).toBe(200);
   expect(res.body).toMatchObject({ success: true, customerNotified: true });
-  expect(disconnectWhatsApp).toHaveBeenCalledWith('user-1');
+  expect(disconnectWhatsApp).toHaveBeenCalledWith('user-1', 'admin');
   expect(whatsapp.sendText).toHaveBeenCalledWith(
     '+918005326946',
     expect.stringMatching(/disconnected from AgentWeb by our support team/),

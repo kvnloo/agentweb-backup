@@ -39,6 +39,12 @@ jest.mock('../services/db', () => ({
   userDb: { getUserById: jest.fn(), updateUser: jest.fn() },
   orgDb: { getOrgById: jest.fn() },
 }));
+jest.mock('../services/approvalDb', () => ({
+  approvalDb: { getPendingApprovalsByUserId: jest.fn(), answerIfOpen: jest.fn() },
+}));
+jest.mock('../services/whatsappOwnerNotices', () => ({
+  notifyOwnerStopDisconnected: jest.fn(),
+}));
 jest.mock('../services/whatsappService', () => ({
   toE164: jest.requireActual('../services/whatsappService').toE164,
   redactPhone: jest.requireActual('../services/whatsappService').redactPhone,
@@ -51,6 +57,8 @@ jest.mock('../services/whatsappService', () => ({
 
 const { settingsService } = require('../services/settingsService');
 const { userDb } = require('../services/db');
+const { approvalDb } = require('../services/approvalDb');
+const { notifyOwnerStopDisconnected } = require('../services/whatsappOwnerNotices');
 const whatsapp = require('../services/whatsappService');
 
 import {
@@ -58,6 +66,8 @@ import {
   completeVerification,
   getVerificationStatus,
   disconnectWhatsApp,
+  disconnectWhatsAppForNumber,
+  resumeVerificationAfterStart,
   handleVerificationMessage,
   parseVerificationMessage,
 } from '../services/whatsappVerificationService';
@@ -113,6 +123,9 @@ beforeEach(() => {
   whatsapp.resolveUserIdByPhone.mockResolvedValue(null);
   whatsapp.claimPhoneForUser.mockResolvedValue('claimed');
   whatsapp.sendMessage.mockResolvedValue({ messageId: 'wamid.OUT' });
+  approvalDb.getPendingApprovalsByUserId.mockResolvedValue([]);
+  approvalDb.answerIfOpen.mockResolvedValue({ answered: true, approval: {} });
+  notifyOwnerStopDisconnected.mockResolvedValue(true);
 
   logSpies = (['log', 'warn', 'error', 'info'] as const).map((m) =>
     jest.spyOn(console, m).mockImplementation(() => {}),
@@ -631,6 +644,213 @@ describe('completeVerification — the phone -> user index', () => {
     whatsapp.claimPhoneForUser.mockRejectedValueOnce(new Error('dynamo down'));
     const code = await begin();
     await expect(completeVerification(code, PHONE)).rejects.toThrow('dynamo down');
+    expect(users.get('u1').messagingChannels).toBeUndefined();
+  });
+});
+
+describe('disconnectWhatsAppForNumber (STOP)', () => {
+  it('leaves the account with no platform when the number it holds opts out', async () => {
+    const code = await begin();
+    await completeVerification(code, PHONE);
+    whatsapp.resolveUserIdByPhone.mockResolvedValue('u1');
+
+    await expect(disconnectWhatsAppForNumber(PHONE)).resolves.toBe('u1');
+
+    expect(users.get('u1').messagingChannels).toEqual([]);
+    await expect(getVerificationStatus('u1')).resolves.toEqual({ state: 'none' });
+    expect(whatsapp.unbindPhone).toHaveBeenCalledWith(PHONE, 'u1');
+  });
+
+  it('does nothing, and says so, when no account holds the number', async () => {
+    whatsapp.resolveUserIdByPhone.mockResolvedValue(null);
+    await expect(disconnectWhatsAppForNumber(PHONE)).resolves.toBeNull();
+  });
+
+  it('lets the account use Slack again afterwards (the platform rule no longer blocks it)', async () => {
+    const code = await begin();
+    await completeVerification(code, PHONE);
+    whatsapp.resolveUserIdByPhone.mockResolvedValue('u1');
+    await disconnectWhatsAppForNumber(PHONE);
+    const { hasWhatsApp } = require('../services/customerChannelPolicy');
+    expect(hasWhatsApp(users.get('u1'))).toBe(false);
+  });
+
+  it('surfaces a storage error instead of swallowing it', async () => {
+    whatsapp.resolveUserIdByPhone.mockRejectedValue(new Error('dynamo down'));
+    await expect(disconnectWhatsAppForNumber(PHONE)).rejects.toThrow('dynamo down');
+  });
+});
+
+describe('STOP: what else happens when the account is disconnected', () => {
+  const connect = async () => {
+    const code = await begin();
+    await completeVerification(code, PHONE);
+    whatsapp.resolveUserIdByPhone.mockResolvedValue('u1');
+  };
+
+  it('records WHY the account has no WhatsApp, with the last four digits only', async () => {
+    await connect();
+    await disconnectWhatsAppForNumber(PHONE);
+    const marker = users.get('u1').whatsappDisconnect;
+    expect(marker).toMatchObject({ reason: 'stop', last4: '0123' });
+    expect(Date.parse(marker.at)).not.toBeNaN();
+    expect(JSON.stringify(marker)).not.toContain(PHONE);
+  });
+
+  it('records the reason for a customer or admin disconnect too', async () => {
+    await connect();
+    await disconnectWhatsApp('u1', 'admin');
+    expect(users.get('u1').whatsappDisconnect.reason).toBe('admin');
+  });
+
+  it('clears the marker when a number is verified again', async () => {
+    await connect();
+    await disconnectWhatsAppForNumber(PHONE);
+    expect(users.get('u1').whatsappDisconnect).toBeTruthy();
+    const code = await begin();
+    await completeVerification(code, PHONE);
+    expect(users.get('u1').whatsappDisconnect).toBeNull();
+  });
+
+  it('cancels pending approvals that were waiting on WhatsApp, as a system rejection, and leaves Slack-era ones', async () => {
+    await connect();
+    approvalDb.getPendingApprovalsByUserId.mockResolvedValue([
+      { assetUrl: 'https://a/1.png', status: 'pending', slackChannel: '' },
+      { assetUrl: 'https://a/2.png', status: 'pending', slackChannel: '' },
+      { assetUrl: 'https://a/4.png', status: 'pending', slackChannel: 'C123' },
+    ]);
+    await disconnectWhatsAppForNumber(PHONE);
+    const urls = approvalDb.answerIfOpen.mock.calls.map((c: any[]) => c[0]);
+    expect(urls).toEqual(['https://a/1.png', 'https://a/2.png']);
+    expect(approvalDb.answerIfOpen.mock.calls[0].slice(1)).toEqual(['rejected', 'system:whatsapp-stop', 'u1']);
+  });
+
+  it('tells the owner how many approvals were cancelled', async () => {
+    await connect();
+    approvalDb.getPendingApprovalsByUserId.mockResolvedValue([
+      { assetUrl: 'https://a/1.png', status: 'pending', slackChannel: '' },
+    ]);
+    await disconnectWhatsAppForNumber(PHONE);
+    expect(notifyOwnerStopDisconnected).toHaveBeenCalledWith('u1', 1);
+  });
+
+  it('cancels BEFORE it disconnects', async () => {
+    await connect();
+    const order: string[] = [];
+    approvalDb.getPendingApprovalsByUserId.mockImplementation(async () => {
+      order.push('cancel');
+      return [];
+    });
+    const realUpdate = userDb.updateUser.getMockImplementation();
+    userDb.updateUser.mockImplementation(async (...a: any[]) => {
+      order.push('disconnect');
+      return realUpdate(...a);
+    });
+    await disconnectWhatsAppForNumber(PHONE);
+    expect(order).toEqual(['cancel', 'disconnect']);
+  });
+
+  it('throws, and leaves the account connected, when cancelling fails — so Meta redelivers the STOP', async () => {
+    await connect();
+    approvalDb.getPendingApprovalsByUserId.mockRejectedValue(new Error('dynamo down'));
+    await expect(disconnectWhatsAppForNumber(PHONE)).rejects.toThrow('dynamo down');
+    expect(users.get('u1').messagingChannels).toHaveLength(1); // still findable on the retry
+    expect(notifyOwnerStopDisconnected).not.toHaveBeenCalled();
+  });
+
+  it('a failed owner email never fails or undoes the disconnect', async () => {
+    await connect();
+    notifyOwnerStopDisconnected.mockRejectedValue(new Error('mail down'));
+    await expect(disconnectWhatsAppForNumber(PHONE)).resolves.toBe('u1');
+    expect(users.get('u1').messagingChannels).toEqual([]);
+  });
+
+  it('keeps a replacement number\'s waiting code when the OLD number sends STOP', async () => {
+    await connect(); // u1 verified on PHONE
+    const { code } = await startVerification('u1', ACK); // now connecting a replacement
+    await disconnectWhatsAppForNumber(PHONE);
+    // the pending code still works
+    await expect(completeVerification(code, OTHER)).resolves.toBe('verified');
+  });
+
+  it('warns, and changes nothing, when no account can be found for the number', async () => {
+    whatsapp.resolveUserIdByPhone.mockResolvedValue(null);
+    await expect(disconnectWhatsAppForNumber(PHONE)).resolves.toBeNull();
+    expect(notifyOwnerStopDisconnected).not.toHaveBeenCalled();
+  });
+});
+
+describe('resumeVerificationAfterStart', () => {
+  it('finishes a connection whose code was typed while the number was opted out', async () => {
+    const code = await begin();
+    whatsapp.isOptedOut.mockResolvedValue(true);
+    await expect(completeVerification(code, PHONE)).resolves.toBe('opted_out');
+
+    whatsapp.isOptedOut.mockResolvedValue(false); // START has been recorded
+    await expect(resumeVerificationAfterStart(PHONE)).resolves.toBe(true);
+
+    expect(users.get('u1').messagingChannels).toHaveLength(1);
+    expect(whatsapp.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ destination: PHONE, text: expect.stringMatching(/connected/i) }),
+    );
+  });
+
+  it('keeps the pointer when finishing the connection fails, so the redelivered START can retry', async () => {
+    const code = await begin();
+    whatsapp.isOptedOut.mockResolvedValue(true);
+    await completeVerification(code, PHONE);
+    whatsapp.isOptedOut.mockResolvedValue(false);
+    whatsapp.claimPhoneForUser.mockRejectedValueOnce(new Error('dynamo down'));
+    await expect(resumeVerificationAfterStart(PHONE)).rejects.toThrow('dynamo down');
+    await expect(resumeVerificationAfterStart(PHONE)).resolves.toBe(true); // the retry completes it
+  });
+
+  it('counts a refusal as answered (the customer was told why), so no second message follows', async () => {
+    const code = await begin();
+    whatsapp.isOptedOut.mockResolvedValue(true);
+    await completeVerification(code, PHONE);
+    users.set('u1', { ...users.get('u1'), slackChannels: ['C1'] });
+    whatsapp.isOptedOut.mockResolvedValue(false);
+    await expect(resumeVerificationAfterStart(PHONE)).resolves.toBe(true);
+    expect(whatsapp.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ text: expect.stringMatching(/already connected to Slack/i) }),
+    );
+  });
+
+  it('does nothing when no code was waiting on this number', async () => {
+    await expect(resumeVerificationAfterStart(PHONE)).resolves.toBe(false);
+    expect(whatsapp.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('does nothing for a code that has expired meanwhile', async () => {
+    const code = await begin();
+    whatsapp.isOptedOut.mockResolvedValue(true);
+    await completeVerification(code, PHONE);
+    clock += TEN_MIN + 1;
+    whatsapp.isOptedOut.mockResolvedValue(false);
+    await expect(resumeVerificationAfterStart(PHONE)).resolves.toBe(false);
+    expect(users.get('u1').messagingChannels).toBeUndefined();
+  });
+
+  it('is single-use: a second START does not connect again', async () => {
+    const code = await begin();
+    whatsapp.isOptedOut.mockResolvedValue(true);
+    await completeVerification(code, PHONE);
+    whatsapp.isOptedOut.mockResolvedValue(false);
+    await resumeVerificationAfterStart(PHONE);
+    whatsapp.sendMessage.mockClear();
+    await expect(resumeVerificationAfterStart(PHONE)).resolves.toBe(false);
+    expect(whatsapp.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('still refuses when the account moved to Slack in the meantime (the platform rule holds)', async () => {
+    const code = await begin();
+    whatsapp.isOptedOut.mockResolvedValue(true);
+    await completeVerification(code, PHONE);
+    users.set('u1', { ...users.get('u1'), slackChannels: ['C1'] });
+    whatsapp.isOptedOut.mockResolvedValue(false);
+    // The customer is told why (so no second, generic message follows), and nothing is saved.
+    await expect(resumeVerificationAfterStart(PHONE)).resolves.toBe(true);
     expect(users.get('u1').messagingChannels).toBeUndefined();
   });
 });
