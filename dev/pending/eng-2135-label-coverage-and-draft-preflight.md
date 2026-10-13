@@ -1,0 +1,7 @@
+## ENG-2135: golden-set label coverage report and safer draft-tool invocation (2026-10-13)
+
+Golden-set labels must come from a human; nothing here generates, suggests or writes a label.
+
+- `npm run eval:label-coverage` (backend) prints, per surface and split, total cases, cases with at least one binary human label, per-criterion pass/fail/na/unlabelled and the n available for validation (pass + fail on the test split, as `runValidation` drops `na`) against `MIN_VALIDATION_N`. It prints "cannot reach n>=30 on the test split: has N" when the split is smaller than the minimum. Pairwise creative cases are reported separately. Aggregates only; read-only through `listCases`; no grader or LLM; refuses when `EVAL_GOLDEN_CASES_TABLE` is unset. A human runs it with the table env var set.
+- `npm run eval:draft-labels -- [flags]` runs `generateGoldenDraftLabels.ts`, unchanged in model, prompt and write semantics. It now prints a preflight (table, surface, cases it would draft, model); a non-dry run needs `--yes` or it exits 1 before any LLM call or write. `--dry-run` still calls the LLM but prints only criterion=label, never rationale text. A human runs it; never against the prod table from an agent session.
+- Data fact: as seeded, agent has 29 test-split cases and account_health has 22, so neither can reach n>=30 however fully labelled. creative_image has 32. Whether to reseed or change the split fraction or threshold is the owner's decision; this change alters none of it.
