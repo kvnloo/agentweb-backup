@@ -56,6 +56,41 @@ describe('summarizeLabelCoverage (ENG-2135)', () => {
     expect(text).toMatch(/6 of 7 criteria still below n>=30/);
   });
 
+  it('counts a case whose label an AI wrote as unlabelled and reports it apart, so the human work is never overstated (ENG-2135)', () => {
+    const AI = { notes: '[AI-LABEL] Written by Claude on behalf of the owner. Not an independent human review.' };
+    const human = [make('agent', 'h1', 'test', { task_success: 'pass' }), make('agent', 'h2', 'test', { task_success: 'fail' })];
+    const ai = [{ ...make('agent', 'a1', 'test', { task_success: 'pass' }), ...AI }, { ...make('agent', 'a2', 'test', { task_success: 'fail' }), ...AI }];
+    const test = summarizeLabelCoverage([...human, ...ai]).surfaces.find((s) => s.surface === 'agent')!.splits.test;
+    expect(test.totalCases).toBe(4);
+    expect(test.casesWithBinaryLabel).toBe(2);
+    expect(test.aiLabelledCases).toBe(2);
+    expect(test.criteria.find((c) => c.criterion === 'task_success')).toMatchObject({ pass: 1, fail: 1, unlabelled: 2, nAvailable: 2 });
+    const lines = formatLabelCoverage(summarizeLabelCoverage([...human, ...ai]));
+    expect(lines).toContain('  2 case(s) hold AI-written labels: not counted as human');
+  });
+
+  it('does not count an AI-written pairwise choice as labelled', () => {
+    const pair = (id: string, notes?: string): GoldenCase => ({
+      ...newCreativePairCase({
+        candidateIdA: id,
+        now: NOW,
+        pair: { candidateIdB: `${id}-b`, batch: '2026-W41', position: 0, batchSize: 2, category: 'c', placement: 'p', signal: 'clear' },
+      }),
+      split: 'test',
+      labels: { pairwise_preference: 'A' },
+      ...(notes ? { notes } : {}),
+    });
+    const creative = summarizeLabelCoverage([pair('p1'), pair('p2', '[AI-LABEL] Written by Claude.')]).surfaces.find((s) => s.surface === 'creative')!.splits.test;
+    expect(creative.pairwiseCases).toBe(2);
+    expect(creative.pairwiseLabelled).toBe(1);
+    expect(creative.aiLabelledCases).toBe(1);
+  });
+
+  it('prints no AI line when no case holds an AI-written label', () => {
+    const lines = formatLabelCoverage(summarizeLabelCoverage([make('agent', 'h1', 'test', { task_success: 'pass' })]));
+    expect(lines.join('\n')).not.toContain('AI-written');
+  });
+
   it('prints aggregates only: no case ids or source ids', () => {
     const cases = [make('agent', 'secret-session-id-123', 'test', { task_success: 'pass' })];
     const text = formatLabelCoverage(summarizeLabelCoverage(cases)).join('\n');
