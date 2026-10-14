@@ -138,6 +138,8 @@ const normTitle = (value: unknown): string => (typeof value === 'string' ? value
 
 const CONTENT_KEYS = ['description', 'userInstructions', 'requiredFunctionCalls', 'skillIds'] as const;
 const emptyish = (v: unknown) => v === undefined || v === null || v === '' || (Array.isArray(v) && v.length === 0);
+/** A step with nothing but a (new) title cannot be told apart from a different empty step: it never inherits a RENAME match. */
+const hasStepContent = (step: StepLike): boolean => CONTENT_KEYS.some((k) => !emptyish((step as any)?.[k]));
 /** A rename keeps what the step says; a replacement does not. Compared on the descriptive fields only. */
 function sameStepContent(a: StepLike, b: StepLike): boolean {
   return CONTENT_KEYS.every((k) => {
@@ -183,7 +185,9 @@ export function carryStoredStepModels<T extends StepLike>(
       return;
     }
     const n = Number(step?.stepCount);
-    const sameSlot = hits.find(({ s }) => Number(s?.stepCount) === n);
+    // Duplicated title: only the same-numbered stored step that also says the same thing (a shifted duplicate, e.g. after
+    // a delete or insert, is a different step). Fully identical duplicates cannot be told apart; they match by number.
+    const sameSlot = hits.find(({ s }) => Number(s?.stepCount) === n && sameStepContent(step, s));
     if (sameSlot) claim(i, sameSlot.j);
   });
 
@@ -202,6 +206,7 @@ export function carryStoredStepModels<T extends StepLike>(
     const freeStored = storedSteps.map((_, j) => j).filter((j) => !claimed.has(j));
     if (freeIncoming.length === 1 && freeStored.length === 1
       && Number(incoming[freeIncoming[0]]?.stepCount) === Number(storedSteps[freeStored[0]]?.stepCount)
+      && hasStepContent(incoming[freeIncoming[0]])
       && sameStepContent(incoming[freeIncoming[0]], storedSteps[freeStored[0]])) {
       claim(freeIncoming[0], freeStored[0]);
     }

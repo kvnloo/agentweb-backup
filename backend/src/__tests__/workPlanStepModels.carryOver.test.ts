@@ -71,11 +71,10 @@ describe('carryStoredStepModels', () => {
     const out = carryStoredStepModels([{ stepCount: 1, title: 'Beta' }, { stepCount: 2, title: 'Alpha' }], stored);
     expect(out.map((s: any) => s.model)).toEqual(['claude-sonnet-x', 'gpt-5-chat']);
   });
-  it('a step renamed in place (same count, nothing else moved) keeps its model', () => {
-    const out = carryStoredStepModels([{ stepCount: 1, title: 'Alpha' }, { stepCount: 2, title: 'Beta' }, { stepCount: 3, title: 'Gamma renamed' }], stored);
+  it('a step renamed in place (same count, nothing else moved, same content) keeps its model', () => {
+    const st = [{ stepCount: 1, title: 'Alpha', description: 'a', model: 'gpt-5-chat' }, { stepCount: 2, title: 'Beta', description: 'b', model: 'claude-sonnet-x' }, { stepCount: 3, title: 'Gamma', description: 'c' }];
+    const out = carryStoredStepModels([{ stepCount: 1, title: 'Alpha', description: 'a' }, { stepCount: 2, title: 'Beta renamed', description: 'b' }, { stepCount: 3, title: 'Gamma', description: 'c' }], st);
     expect(out.map((s: any) => s.model)).toEqual(['gpt-5-chat', 'claude-sonnet-x', undefined]);
-    const renamed = carryStoredStepModels([{ stepCount: 1, title: 'Alpha' }, { stepCount: 2, title: 'Beta renamed' }, { stepCount: 3, title: 'Gamma' }], stored);
-    expect(renamed.map((s: any) => s.model)).toEqual(['gpt-5-chat', 'claude-sonnet-x', undefined]);
   });
   it('does not hand a model to a different step that merely took over the number', () => {
     // Alpha moved to slot 2 and Beta was deleted: a brand-new step at slot 1 must NOT inherit Alpha's model
@@ -117,7 +116,8 @@ describe('carryStoredStepModels: duplicates, deletes and renames never bind the 
   it('N2: two renames at once (ambiguous) drop; a lone in-place rename with the same count keeps', () => {
     const stored = [{ stepCount: 1, title: 'Draft', model: 'm1' }, { stepCount: 2, title: 'Review', model: 'm2' }, { stepCount: 3, title: 'Ship' }];
     expect(m(carryStoredStepModels([{ stepCount: 1, title: 'Draft 2' }, { stepCount: 2, title: 'Review 2' }, { stepCount: 3, title: 'Ship' }], stored))).toEqual([undefined, undefined, undefined]);
-    expect(m(carryStoredStepModels([{ stepCount: 1, title: 'Draft' }, { stepCount: 2, title: 'Review renamed' }, { stepCount: 3, title: 'Ship' }], stored))).toEqual(['m1', 'm2', undefined]);
+    const withContent = [{ stepCount: 1, title: 'Draft', description: 'd', model: 'm1' }, { stepCount: 2, title: 'Review', description: 'r', model: 'm2' }, { stepCount: 3, title: 'Ship', description: 's' }];
+    expect(m(carryStoredStepModels([{ stepCount: 1, title: 'Draft', description: 'd' }, { stepCount: 2, title: 'Review renamed', description: 'r' }, { stepCount: 3, title: 'Ship', description: 's' }], withContent))).toEqual(['m1', 'm2', undefined]);
   });
   it('N2: with a different count a rename is never bound by position (insert / delete around it)', () => {
     const stored = [{ stepCount: 1, title: 'Draft', model: 'm1' }, { stepCount: 2, title: 'Review', model: 'm2' }];
@@ -130,6 +130,39 @@ describe('carryStoredStepModels: duplicates, deletes and renames never bind the 
   it('a stored step is consumed at most once (no reuse by a later incoming step)', () => {
     const stored = [{ stepCount: 1, title: 'A', model: 'mA' }];
     expect(m(carryStoredStepModels([{ stepCount: 1, title: 'A' }, { stepCount: 1, title: 'A' }], stored))).toEqual(['mA', undefined]);
+  });
+});
+
+describe('carryStoredStepModels: shifted duplicates and empty steps (round 3)', () => {
+  const m = (steps: any[]) => steps.map((s) => s.model);
+  const rev = (d: string, extra: any = {}) => ({ title: 'Review', description: d, ...extra });
+  const stored = [{ stepCount: 1, ...rev('d1'), model: 'm1' }, { stepCount: 2, ...rev('d2'), model: 'm2' }];
+  it('F1: deleting the first of two duplicates never hands its model to the survivor', () => {
+    expect(m(carryStoredStepModels([{ stepCount: 1, ...rev('d2') }], stored))).toEqual([undefined]);
+  });
+  it('F1: swapped duplicates do not swap (or keep) their models', () => {
+    expect(m(carryStoredStepModels([{ stepCount: 1, ...rev('d2') }, { stepCount: 2, ...rev('d1') }], stored))).toEqual([undefined, undefined]);
+  });
+  it('F1: a NEW duplicate inserted first gets nothing and the shifted ones are not guessed', () => {
+    expect(m(carryStoredStepModels([{ stepCount: 1, ...rev('d3') }, { stepCount: 2, ...rev('d1') }, { stepCount: 3, ...rev('d2') }], stored))).toEqual([undefined, undefined, undefined]);
+  });
+  it('F1: duplicates in the same place with the same content keep their own models; identical twins match by number', () => {
+    expect(m(carryStoredStepModels([{ stepCount: 1, ...rev('d1') }, { stepCount: 2, ...rev('d2') }], stored))).toEqual(['m1', 'm2']);
+    const twins = [{ stepCount: 1, ...rev('x'), model: 'm1' }, { stepCount: 2, ...rev('x'), model: 'm2' }];
+    expect(m(carryStoredStepModels([{ stepCount: 1, ...rev('x') }, { stepCount: 2, ...rev('x') }], twins))).toEqual(['m1', 'm2']);
+  });
+  it('LOW: a new step with no content at a deleted step\'s number does not inherit its model', () => {
+    const st = [{ stepCount: 1, title: 'A', model: 'm1' }, { stepCount: 2, title: 'B', model: 'm2' }];
+    expect(m(carryStoredStepModels([{ stepCount: 1, title: 'A' }, { stepCount: 2, title: 'C' }], st))).toEqual(['m1', undefined]);
+  });
+  it('A1: a stored title that is unique still does not match when the INCOMING list repeats it (stored [X,R] incoming [R,R])', () => {
+    const st = [{ stepCount: 1, title: 'X', description: 'x' }, { stepCount: 2, ...rev('r'), model: 'm' }];
+    expect(m(carryStoredStepModels([{ stepCount: 1, ...rev('r') }, { stepCount: 2, ...rev('r') }], st))).toEqual([undefined, 'm']);
+  });
+  it('A4: a rename never binds across different step numbers', () => {
+    const st = [{ stepCount: 1, title: 'A', description: 'd', model: 'm1' }, { stepCount: 2, title: 'B', description: 'e', model: 'm2' }];
+    // B moved up, and the step that replaced A (same text) sits at number 2: not a rename in place
+    expect(m(carryStoredStepModels([{ stepCount: 1, title: 'B', description: 'e' }, { stepCount: 2, title: 'C', description: 'd' }], st))).toEqual(['m2', undefined]);
   });
 });
 
