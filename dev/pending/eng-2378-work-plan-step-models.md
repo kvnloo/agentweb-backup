@@ -49,6 +49,11 @@ failure = off = old behaviour; 60s cache, last-known value on a failed refresh,
   same number with unchanged content. A pick on a model-less step stands (the marker `engineModel` keeps naming the
   engine's own choice); a failed end-of-plan restore clears the marker once. Share / conversable views and anonymous
   launches never carry step models or `launchModel` / `planDefaultModel` / `engineModel`.
+- The picker PATCHes the session model before `/generate`, so the request model equals the stamp: a stamp that differs
+  from the engine's last stamp (`engineModel`; before the first stamp the plan default / launch model) IS the user's
+  pick. It resumes a plan paused on a retired step model (the step adopts it), stands on model-less steps, and never
+  overrides an available step model. Duplicate-titled steps inherit a model only from the same-numbered stored step
+  with the same content (identical twins cannot be told apart and match by number).
 - Known consequences: with the switch off an admin cannot clear a stored step model; a client that always sends
   `llmModel` never sees the pause and rewrites a retired step model to its pick; authenticated
   `GET /api/user-work-plans` shows step models of public plans to signed-in users (as `defaultModel` today); a scheduled
