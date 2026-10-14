@@ -2,7 +2,7 @@
  * Weekly judge-vs-human agreement on the creative calibration pairs (ENG-2142, ENG-2128 T10).
  *
  * Usage:
- *   npx ts-node --transpile-only src/scripts/creativeCalibrationReport.ts --batch 2026-W39[,2026-W40] [--model <id>] [--no-judge]
+ *   npx ts-node --transpile-only src/scripts/creativeCalibrationReport.ts --batch 2026-W39[,2026-W40] [--model <id>] [--no-judge] [--include-ai-labels]
  *
  * READ-ONLY. It reads the batch's pairwise cases from the golden-set store (EVAL_GOLDEN_CASES_TABLE)
  * and both creatives of every labelled pair from AW-HumanEvalQueue, runs the rubric judge's
@@ -14,6 +14,8 @@
  * Counts and rates only: no ids, copy, requests, rationales or image URLs.
  *
  *   --no-judge  call no model; report only how many pairs are labelled and the human choices.
+ *   --include-ai-labels  also count choices an AI wrote (note starts with [AI-LABEL]); the report is then advisory,
+ *               not human agreement. They are left out by default.
  */
 
 import { argv, exit } from 'node:process';
