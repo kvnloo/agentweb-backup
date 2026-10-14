@@ -122,7 +122,8 @@ function idempotencyKeys(context?: Record<string, any>): string[] {
 
 function contextLines(context?: Record<string, any>): string[] {
   if (!context) return [];
-  return Object.entries(context).map(([k, v]) => {
+  // ENG-2492: the legacy match key is matcher input only, never occurrence data.
+  return Object.entries(context).filter(([k]) => k !== 'Alert Legacy Key').map(([k, v]) => {
     const val = typeof v === 'object' ? JSON.stringify(v) : String(v);
     return `- ${k}: ${val.length > 400 ? val.slice(0, 400) + '…' : val}`;
   });
@@ -653,6 +654,15 @@ export interface FileAutoIssueParams {
 const ALERT_CLASS_CONTEXT_KEY = 'Alert Class';
 const ALERT_PRIORITY_CONTEXT_KEY = 'Alert Priority';
 const ALERT_SCOPE_CONTEXT_KEY = 'Alert Scope';
+/**
+ * ENG-2492: `Alert Legacy Key` (e.g. `accountId: <id>`) lets a classed alert fold onto an open
+ * canonical filed BEFORE its filer emitted an Alert Class line. Such a canonical carries no class
+ * marker and a title whose numbers moved ("still disconnected (42d)" vs "(56d)"), so neither the
+ * class nor the title fallback matched and every reminder filed a new issue. Matched only against
+ * open candidates with NO `Alert Class:` line, anchored as a whole context line, so a classed
+ * canonical of a different class can never absorb it. Not rendered into the issue body.
+ */
+const ALERT_LEGACY_KEY_CONTEXT_KEY = 'Alert Legacy Key';
 
 export interface FiledAutoResult {
   pageId: string;
@@ -733,8 +743,16 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
   const rawPriority = p.notionContext?.[ALERT_PRIORITY_CONTEXT_KEY];
   const priority = rawPriority ? LINEAR_PRIORITY[String(rawPriority).trim().toLowerCase()] : undefined;
   const idKeys = idempotencyKeys(p.notionContext);
+  const rawLegacy = p.notionContext?.[ALERT_LEGACY_KEY_CONTEXT_KEY];
+  const legacyKey = rawLegacy === undefined || rawLegacy === null ? '' : String(rawLegacy).trim();
+  const legacyRe = classRe && legacyKey ? new RegExp(`^[-*]?\\s*${escapeRegExp(legacyKey)}\\s*$`, 'm') : null;
+  const anyClassRe = new RegExp(`${escapeRegExp(`${ALERT_CLASS_CONTEXT_KEY}:`)}`, 'm');
+  const legacyNeedle = legacyRe
+    ? { test: (d: string) => !anyClassRe.test(d) && legacyRe.test(d) }
+    : null;
   const match =
     (classNeedle ? open.find((i) => classNeedle.test(i.description || '')) : undefined) ||
+    (legacyNeedle ? open.find((i) => legacyNeedle.test(i.description || '')) : undefined) ||
     (idKeys.length ? open.find((i) => idKeys.some((k) => (i.description || '').includes(k))) : undefined) ||
     open.find((i) => norm(i.title) === norm(p.title));
   if (match) {
@@ -837,6 +855,7 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
       (i) =>
         i.identifier === li.identifier ||
         (classNeedle ? classNeedle.test(i.description || '') : false) ||
+        (legacyNeedle ? legacyNeedle.test(i.description || '') : false) ||
         (idKeys.length ? idKeys.some((k) => (i.description || '').includes(k)) : false) ||
         norm(i.title) === norm(p.title),
     );
