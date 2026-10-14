@@ -8,12 +8,14 @@
  *
  * Sources (ENG-2128 brain F4, F7, F10, F14):
  *   agent          sessions named in the judge false-positive catalogue (off-repo input file:
- *                  Linear issue -> session ids/prefixes) and sessions with satisfactionScore.adminOverride
+ *                  Linear issue -> session ids/prefixes) and sessions with satisfactionScore.adminOverride,
+ *                  plus an unbiased `sampled_session` fill (ordinary recent sessions, hash order, see below)
  *   creative       AW-HumanEvalQueue image/landing-page candidates with feedback from their reviewer (Matt)
  *   account_health AW-Users with subscription_status canceled vs active (by userId; admins excluded)
  */
 
 import { createHash } from 'crypto';
+import { isEvaluationUser } from '../../services/evaluationPolicy';
 import type { EvalSurface } from './evalRegistry';
 import { newGoldenCase, type GoldenCase, type ReplayLink } from './goldenSet';
 
@@ -22,7 +24,16 @@ export const DEFAULT_SEED_TARGETS: Record<EvalSurface, number> = { agent: 50, cr
 export interface SeedSessionRow {
   sessionId: string;
   adminOverride: boolean;
+  /** Cheap attributes for the `sampled_session` source; a row missing createdAt or messageCount is never sampled. */
+  createdAt?: string;
+  sessionType?: string;
+  messageCount?: number;
+  userId?: string;
 }
+
+/** `sampled_session` eligibility: created within this many days of `inputs.now`, with at least this many messages. */
+export const SAMPLE_WINDOW_DAYS = 90;
+export const SAMPLE_MIN_MESSAGES = 4;
 
 export interface SeedCandidateRow {
   candidateId: string;
@@ -30,6 +41,8 @@ export interface SeedCandidateRow {
   reviewerSlackUserId?: string;
   /** Slack user ids of everyone who replied; text is never read. */
   feedbackSlackUserIds: string[];
+  /** The candidate carries a stored creative-gate result that was actually evaluated (not `notChecked`). */
+  gated?: boolean;
 }
 
 export interface SeedUserRow {
@@ -51,6 +64,8 @@ export interface SeedInputs {
   users: SeedUserRow[];
   fpCatalogue?: FpCatalogue;
   targets?: Partial<Record<EvalSurface, number>>;
+  /** Opt in to `gated_candidate` creative cases (see seedCreative). Off by default so a plain run never adds them. */
+  gatedCreatives?: boolean;
   now: Date;
 }
 
@@ -98,6 +113,18 @@ function take(cases: GoldenCase[], target: number, pinned: (c: GoldenCase) => bo
   return [...first, ...rest].slice(0, Math.max(target, first.length));
 }
 
+/** Ordinary interactive traffic only: scheduled runs, generation pipelines and other machine-started
+ * session types are not what the agent judge is meant to agree with humans on. Legacy rows with no
+ * sessionType were written as regular. */
+function isSampleEligible(s: SeedSessionRow, now: Date): boolean {
+  if (s.sessionType !== undefined && s.sessionType !== 'regular') return false;
+  if (isEvaluationUser(s.userId)) return false;
+  if (typeof s.messageCount !== 'number' || s.messageCount < SAMPLE_MIN_MESSAGES) return false;
+  const created = s.createdAt ? Date.parse(s.createdAt) : NaN;
+  if (Number.isNaN(created)) return false;
+  return created <= now.getTime() && created >= now.getTime() - SAMPLE_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+}
+
 function countBy(cases: GoldenCase[], key: (c: GoldenCase) => string): Record<string, number> {
   const out: Record<string, number> = {};
   for (const c of cases) out[key(c)] = (out[key(c)] ?? 0) + 1;
@@ -138,18 +165,35 @@ function seedAgent(inputs: SeedInputs, target: number) {
     }
   }
 
+  // Unbiased source, added last so a session already in another source keeps that source. Selection
+  // below orders it by hash of the id (never recency or score), so a larger target only appends.
+  for (const s of inputs.sessions) if (isSampleEligible(s, inputs.now)) add(s.sessionId, 'sampled_session', 'sampled_session');
+
   const eligible = [...byId.values()];
-  // Replay-linked and human-overridden sessions are always kept; the catalogue fills the rest.
-  const selected = take(eligible, target, (c) => c.taskType !== 'fp_catalogue');
+  // Replay-linked and human-overridden sessions are always kept; the catalogue fills next, then the sample.
+  const tier = (c: GoldenCase) => (c.taskType === 'sampled_session' ? 2 : c.taskType === 'fp_catalogue' ? 1 : 0);
+  const pinned = eligible.filter((c) => tier(c) === 0).length;
+  const selected = [...eligible].sort((a, b) => tier(a) - tier(b) || hashOrder(a, b)).slice(0, Math.max(target, pinned));
   return { eligible, selected, unresolved, unresolvedReplayFixtures };
 }
 
 function seedCreative(inputs: SeedInputs, target: number) {
-  const eligible = inputs.candidates
+  const reviewed = inputs.candidates
     .filter((c) => CREATIVE_REVIEW_TYPES.has(c.reviewType))
     .filter((c) => !!c.reviewerSlackUserId && c.feedbackSlackUserIds.includes(c.reviewerSlackUserId))
     .map((c) => newGoldenCase({ surface: 'creative', taskType: c.reviewType, sourceId: c.candidateId, seedSource: 'human_eval_reviewer_feedback', now: inputs.now }));
-  return { eligible, selected: take(eligible, target, () => false) };
+  if (!inputs.gatedCreatives) return { eligible: reviewed, selected: take(reviewed, target, () => false) };
+
+  // ENG-2226: the gates adapter can only grade a candidate that carries a stored gate result, and every
+  // reviewer-feedback candidate predates the gates (earliest gated candidate 2026-09-25), so it abstains on
+  // all of them. Gated image candidates are added after the reviewed ones; a larger target only appends.
+  const seen = new Set(reviewed.map((c) => c.sourceRef.id));
+  const gated = inputs.candidates
+    .filter((c) => c.gated === true && c.reviewType === 'creative_image' && !seen.has(c.candidateId))
+    .map((c) => newGoldenCase({ surface: 'creative', taskType: c.reviewType, sourceId: c.candidateId, seedSource: 'gated_candidate', now: inputs.now }))
+    .sort(hashOrder);
+  const first = [...reviewed].sort(hashOrder);
+  return { eligible: [...reviewed, ...gated], selected: [...first, ...gated].slice(0, Math.max(target, 0)) };
 }
 
 function seedAccount(inputs: SeedInputs, target: number) {

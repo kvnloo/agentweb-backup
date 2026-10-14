@@ -3,10 +3,11 @@
  *
  * Usage:
  *   npx ts-node --transpile-only src/scripts/seedGoldenCases.ts [--fp-catalogue <file>]
- *     [--target-agent N] [--target-creative N] [--target-account-health N] [--write]
+ *     [--target-agent N] [--target-creative N] [--target-account-health N] [--gated-creatives] [--write]
  *
  * Reads (read-only, projected scans — ids and flags only):
- *   AW-ChatSessions   sessionId, satisfactionScore.adminOverride
+ *   AW-ChatSessions   sessionId, satisfactionScore.adminOverride, userId, createdAt, sessionType, messageCount
+ *                     (the last four only decide `sampled_session` eligibility; no message bodies)
  *   AW-HumanEvalQueue candidateId, reviewType, reviewerSlackUserId, feedback (only each reply's slackUserId is kept)
  *   AW-Users          userId, subscription_status, isAdmin
  * (`Dev-` tables when NODE_ENV=development, as everywhere else.)
@@ -51,6 +52,8 @@ const TARGET_FLAGS: Record<string, EvalSurface> = {
 
 export interface Args {
   fpCatalogue?: string;
+  /** Add `gated_candidate` creative cases: candidates that carry a stored creative-gate result (ENG-2226). */
+  gatedCreatives?: boolean;
   write: boolean;
   targets: Partial<Record<EvalSurface, number>>;
 }
@@ -61,6 +64,7 @@ export function parseArgs(argv: string[]): Args {
     const flag = argv[i];
     const surface = TARGET_FLAGS[flag];
     if (flag === '--write') args.write = true;
+    else if (flag === '--gated-creatives') args.gatedCreatives = true;
     else if (flag === '--fp-catalogue') args.fpCatalogue = argv[++i];
     else if (surface) {
       const raw = argv[++i];
@@ -75,6 +79,10 @@ export function parseArgs(argv: string[]): Args {
 interface SessionItem {
   sessionId: string;
   satisfactionScore?: { adminOverride?: boolean };
+  userId?: string;
+  createdAt?: string;
+  sessionType?: string;
+  messageCount?: number;
 }
 
 interface CandidateItem {
@@ -82,6 +90,7 @@ interface CandidateItem {
   reviewType?: string;
   reviewerSlackUserId?: string;
   feedback?: Array<{ slackUserId?: string }>;
+  creativeGates?: { graderId?: string; notChecked?: string };
 }
 
 interface UserItem {
@@ -94,14 +103,21 @@ async function loadInputs(client: AWS.DynamoDB.DocumentClient) {
   const sessions: SeedSessionRow[] = (
     await paginatedScan<SessionItem>(client, {
       TableName: `${TABLE_PREFIX}AW-ChatSessions`,
-      ProjectionExpression: 'sessionId, satisfactionScore.adminOverride',
+      ProjectionExpression: 'sessionId, satisfactionScore.adminOverride, userId, createdAt, sessionType, messageCount',
     })
-  ).map((s) => ({ sessionId: s.sessionId, adminOverride: s.satisfactionScore?.adminOverride === true }));
+  ).map((s) => ({
+    sessionId: s.sessionId,
+    adminOverride: s.satisfactionScore?.adminOverride === true,
+    ...(s.userId ? { userId: s.userId } : {}),
+    ...(s.createdAt ? { createdAt: s.createdAt } : {}),
+    ...(s.sessionType ? { sessionType: s.sessionType } : {}),
+    ...(typeof s.messageCount === 'number' ? { messageCount: s.messageCount } : {}),
+  }));
 
   const candidates: SeedCandidateRow[] = (
     await paginatedScan<CandidateItem>(client, {
       TableName: `${TABLE_PREFIX}AW-HumanEvalQueue`,
-      ProjectionExpression: 'candidateId, reviewType, reviewerSlackUserId, feedback',
+      ProjectionExpression: 'candidateId, reviewType, reviewerSlackUserId, feedback, creativeGates.graderId, creativeGates.notChecked',
     })
   ).map((c) => ({
     candidateId: c.candidateId,
@@ -109,6 +125,8 @@ async function loadInputs(client: AWS.DynamoDB.DocumentClient) {
     ...(c.reviewerSlackUserId ? { reviewerSlackUserId: c.reviewerSlackUserId } : {}),
     // Keep who replied, drop what they said.
     feedbackSlackUserIds: (c.feedback ?? []).flatMap((f) => (f.slackUserId ? [f.slackUserId] : [])),
+    // A gate result that was actually evaluated; only its presence is read (no check detail).
+    ...(c.creativeGates?.graderId && !c.creativeGates.notChecked ? { gated: true } : {}),
   }));
 
   const users: SeedUserRow[] = (
@@ -137,6 +155,7 @@ async function main(): Promise<void> {
     ...inputs,
     ...(fpCatalogue ? { fpCatalogue } : {}),
     ...(Object.keys(args.targets).length ? { targets: args.targets } : {}),
+    ...(args.gatedCreatives ? { gatedCreatives: true } : {}),
     now: new Date(),
   });
 
