@@ -33,6 +33,11 @@ export const ACTIVE_RUN_HEARTBEAT_INTERVAL_MS = 30_000;
 export const ACTIVE_RUN_STALE_AFTER_MS = 3 * ACTIVE_RUN_HEARTBEAT_INTERVAL_MS;
 
 const SETTING_CACHE_TTL_MS = 60_000;
+/**
+ * Upper bound on one switch read. /generate awaits it (at most once per cache window), so a hung AW-Settings read must
+ * never stall the core path: on timeout we behave like any failed refresh (keep the last-known value, off if none).
+ */
+export const SETTING_READ_TIMEOUT_MS = 2_000;
 /** After a failed refresh, retry sooner than a full window but not on every request. */
 const SETTING_ERROR_RETRY_MS = 5_000;
 const CONDITION_FAILED = 'ConditionalCheckFailedException';
@@ -120,8 +125,13 @@ export function createSessionActiveRunGuard(deps: ActiveRunGuardDeps) {
   let inFlight: Promise<void> | null = null; // one refresh at a time
 
   async function refresh(now: number): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const row = await deps.getSetting(SESSION_ACTIVE_RUN_GUARD_SETTING);
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('settings read timed out')), SETTING_READ_TIMEOUT_MS);
+        (timer as { unref?: () => void })?.unref?.();
+      });
+      const row = await Promise.race([deps.getSetting(SESSION_ACTIVE_RUN_GUARD_SETTING), timeout]);
       known = row?.settingValue === 'true';
       validUntil = now + SETTING_CACHE_TTL_MS;
     } catch (error) {
@@ -130,6 +140,8 @@ export function createSessionActiveRunGuard(deps: ActiveRunGuardDeps) {
         known,
       });
       validUntil = now + SETTING_ERROR_RETRY_MS;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
   }
 

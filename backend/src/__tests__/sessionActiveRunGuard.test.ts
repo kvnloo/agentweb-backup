@@ -7,6 +7,7 @@ import { BranchFakeDynamo } from './helpers/branchFakeDynamo';
 import {
   ACTIVE_RUN_HEARTBEAT_INTERVAL_MS,
   ACTIVE_RUN_STALE_AFTER_MS,
+  SETTING_READ_TIMEOUT_MS,
   SESSION_ACTIVE_RUN_GUARD_SETTING,
   carryConcealedActiveRun,
   concealActiveRun,
@@ -189,6 +190,40 @@ describe('switch', () => {
     const cold = env('true');
     cold.setting.fail = true;
     expect(await cold.make('C').isEnabled()).toBe(false);
+  });
+
+  it('a HUNG settings read never stalls the claim: it gives up after the timeout, skips the guard, touches DynamoDB not at all, and logs', async () => {
+    const e = env('true');
+    const getSetting = jest.fn(() => new Promise<never>(() => undefined)); // never settles
+    const guard = e.make('A', { getSetting });
+    let result: unknown;
+    void guard.claim(SID).then((r) => { result = r; });
+    await flush();
+    expect(result).toBeUndefined(); // still waiting, bounded by the timeout
+    jest.advanceTimersByTime(SETTING_READ_TIMEOUT_MS);
+    await flush();
+    expect(result).toEqual({ status: 'skipped' });
+    expect(e.fake.writeLog).toEqual([]);
+    expect(e.log).toHaveBeenCalledWith(expect.stringContaining('failed to read switch'), expect.anything());
+    expect(jest.getTimerCount()).toBe(0); // the timeout timer does not leak
+    // Within the error-retry window the next claim does not wait again.
+    expect(await guard.claim(SID)).toEqual({ status: 'skipped' });
+    expect(getSetting).toHaveBeenCalledTimes(1);
+  });
+
+  it('a hung refresh keeps the last-known value (on) instead of turning the guard off', async () => {
+    const e = env('true');
+    let hang = false;
+    const guard = e.make('A', { getSetting: () => (hang ? new Promise<never>(() => undefined) : Promise.resolve({ settingValue: 'true' })) });
+    expect(await guard.isEnabled()).toBe(true);
+    hang = true;
+    jest.setSystemTime(Date.now() + 61_000);
+    let result: boolean | undefined;
+    void guard.isEnabled().then((r) => { result = r; });
+    await flush();
+    jest.advanceTimersByTime(SETTING_READ_TIMEOUT_MS);
+    await flush();
+    expect(result).toBe(true);
   });
 
   it('a settings read failure never blocks a run (claim is skipped)', async () => {
