@@ -54,7 +54,13 @@ failure = off = old behaviour; 60s cache, last-known value on a failed refresh,
   pick. It resumes a plan paused on a retired step model (the step adopts it), stands on model-less steps, and never
   overrides an available step model. Duplicate-titled steps inherit a model only from the same-numbered stored step
   with the same content (identical twins cannot be told apart and match by number).
-- Known consequences: with the switch off an admin cannot clear a stored step model; a client that always sends
+- An interactive-share viewer's pick may run for the turn on a model-less step but never rewrites the owner's stored
+  step model or the engine marker; on a retired step model the viewer gets the pause and the owner resumes.
+- Known consequences: a stale picker echo (a `/generate` carrying a model different from the stamp, without a PATCH) is
+  indistinguishable from a pick (relies on the portal syncing the picker to the stamp); a plan with later steps pending
+  but no marker (hand-edited / legacy only; the engine never creates it) has no baseline; in the unique-title carry
+  path the TITLE is the identity (a step retitled into a deleted step's title keeps that model) and duplicates with
+  identical title+content cannot be told apart. Also: with the switch off an admin cannot clear a stored step model; a client that always sends
   `llmModel` never sees the pause and rewrites a retired step model to its pick; authenticated
   `GET /api/user-work-plans` shows step models of public plans to signed-in users (as `defaultModel` today); a scheduled
   run paused mid-plan retries up to 20 verified-chat attempts, then the run fails and the next scheduled run re-validates
