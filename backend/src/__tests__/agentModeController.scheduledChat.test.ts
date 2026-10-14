@@ -1561,6 +1561,22 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(flagWrite).toBeUndefined();
     });
 
+    // ENG-2493: a schedule created with email_notifications: [] persists emailOptOut;
+    // the owner fallback must not resurrect the address they declined.
+    it('sends no run-failed email to the owner when the schedule opted out of email (ENG-2493)', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
+      mockUserDb.getUserById.mockResolvedValue({ userId: mockUserId, email: 'owner@example.com' } as any);
+
+      await runScheduledChat(
+        { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 3,
+          emailNotifications: [], emailOptOut: true } as any,
+        mockUserId,
+        false,
+      );
+
+      expect(mockEmailService.sendScheduledRunFailedEmail).not.toHaveBeenCalled();
+    });
+
     it('alerts on each exhausted failing slot (no persisted dedup state to diverge)', async () => {
       // No "already alerted" flag is persisted, so there is no state to get out of sync
       // with delivery — every exhausted run notifies (a stale flag value is ignored).
@@ -4362,6 +4378,28 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
     });
 
+    it('sends no usage-limit or disallowed-tool email to the owner when the schedule opted out (ENG-2493)', async () => {
+      mockedCheckTokenUsage.mockResolvedValueOnce({
+        allowed: false, warning: false, used: 1050000, allowance: 1000000, percentUsed: 105,
+        effectiveAllowance: 1000000, bonus: 0, month: '2026-04', costUsed: 0, costAllowance: null,
+        costPercentUsed: 0, costEnforced: false,
+        alertThresholds: { usagePercent: 90, onForecastShortfall: true },
+      });
+      await runScheduledChat(
+        { ...baseSchedule, requiredFunctionCalls: [], emailNotifications: [], emailOptOut: true } as any,
+        mockUserId, true,
+      );
+      expect(mockEmailService.sendScheduledChatTokenLimitEmail).not.toHaveBeenCalled();
+
+      mockedGetAllowedFunctionCalls.mockResolvedValueOnce([]);
+      await runScheduledChat(
+        { ...baseSchedule, emailNotifications: [], emailOptOut: true } as any,
+        mockUserId, true,
+      );
+      expect(mockEmailService.sendScheduledChatErrorEmail).not.toHaveBeenCalled();
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+    });
+
     it('should save failure run result to DB when token limit is exceeded', async () => {
       mockedCheckTokenUsage.mockResolvedValueOnce({
         allowed: false,
@@ -4895,6 +4933,20 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       });
 
       await runScheduledChat(staleSchedule, mockUserId, false);
+
+      expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).not.toHaveBeenCalled();
+    });
+
+    it('sends no sourcing-block email to the owner when the schedule opted out of email (ENG-2493)', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(blockedToolCallsResponse);
+      mockUserDb.getUserById.mockResolvedValue({ userId: mockUserId, email: 'owner@example.com' } as any);
+      const optedOut = { ...baseSchedule, emailNotifications: [], emailOptOut: true };
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...optedOut,
+        runResults: [{ status: 'success', passed: true, blockedBy: undefined, createdAt: new Date().toISOString() }],
+      });
+
+      await runScheduledChat(optedOut, mockUserId, false);
 
       expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).not.toHaveBeenCalled();
     });
