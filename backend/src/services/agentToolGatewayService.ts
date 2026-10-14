@@ -745,6 +745,8 @@ const DEFAULT_ARG_ALIASES: Record<string, string[]> = {
   page_id: ['pageId', 'landing_page_id', 'landingPageId'],
   task_description: ['instructions', 'instruction', 'prompt', 'task', 'description'],
   operations_json: ['replacement_json', 'operations', 'replacements', 'replacement_instructions'],
+  // playwright_browser_evaluate requires `function`; models send `expression`/`script` (ENG-2473).
+  function: ['expression', 'script', 'js', 'code'],
 };
 
 export function evaluateAgentToolPolicy(input: AgentToolPolicyInput): AgentToolPolicyDecision {
