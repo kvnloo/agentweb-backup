@@ -21,7 +21,6 @@ jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     getChatSession: jest.fn(),
     addAssociatedSkills: jest.fn(),
-    setOtherSkillsToolSnapshotIfAbsent: jest.fn().mockResolvedValue(undefined),
     addMessagesToSession: jest.fn().mockResolvedValue(undefined),
   },
   searchPlatformKnowledgeBase: jest.fn().mockResolvedValue([]),
@@ -1042,100 +1041,6 @@ describe('AgentModeService - Skills', () => {
       // cannot install — it must stay claimed (hidden) rather than falling
       // through to this tier's __other_skills__ catch-all.
       expect(result.allowedToolNames.has('tool_other_tier')).toBe(false);
-    });
-
-    // ENG-2299: the shared catalog changes under a running session whenever any skill is
-    // published. A tool the session already had through __other_skills__ must survive that.
-    describe('__other_skills__ session snapshot (ENG-2299)', () => {
-      const registry = [
-        { name: 'tool_stays', definition: {} },
-        { name: 'tool_claimed_later', definition: {} },
-        { name: 'manage_skill', definition: {} },
-      ];
-      const catalogAfterPublish = [
-        { skillId: 'new-skill', name: 'New', toolNames: ['tool_claimed_later'], isPublished: true },
-      ];
-      const entitled = ['__other_skills__'];
-
-      beforeEach(() => {
-        jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(registry as any);
-      });
-
-      it('control: without a snapshot a skill published later removes the tool', () => {
-        const result = agentModeService.buildSkillContext([], entitled, catalogAfterPublish, ['__other_skills__']);
-        expect(result.allowedToolNames.has('tool_stays')).toBe(true);
-        expect(result.allowedToolNames.has('tool_claimed_later')).toBe(false);
-      });
-
-      it('keeps a snapshotted tool after another skill claims it, and still adds new pool tools', () => {
-        const result = agentModeService.buildSkillContext(
-          [], entitled, catalogAfterPublish, ['__other_skills__'], false,
-          ['tool_stays', 'tool_claimed_later'],
-        );
-        expect(result.allowedToolNames.has('tool_claimed_later')).toBe(true);
-        expect(result.allowedToolNames.has('tool_stays')).toBe(true);
-      });
-
-      it('ignores the snapshot when __other_skills__ is not installed on the session', () => {
-        const result = agentModeService.buildSkillContext(
-          [], entitled, catalogAfterPublish, [], false, ['tool_claimed_later'],
-        );
-        expect(result.allowedToolNames.has('tool_claimed_later')).toBe(false);
-      });
-
-      it('ignores the snapshot when the tier is no longer entitled to __other_skills__', () => {
-        const result = agentModeService.buildSkillContext(
-          [], ['some-other-skill'], catalogAfterPublish, ['__other_skills__'], false, ['tool_claimed_later'],
-        );
-        expect(result.allowedToolNames.has('tool_claimed_later')).toBe(false);
-      });
-
-      it('never grants an admin-only tool from a snapshot to a non-admin', () => {
-        const result = agentModeService.buildSkillContext(
-          [], entitled, catalogAfterPublish, ['__other_skills__'], false, ['manage_skill'],
-        );
-        expect(result.allowedToolNames.has('manage_skill')).toBe(false);
-      });
-    });
-
-    describe('ensureOtherSkillsSnapshot (ENG-2299)', () => {
-      const publish = [{ skillId: 'claims-b', name: 'B', toolNames: ['tool_b'], isPublished: true }];
-      const setSnapshot = () => chatbotDb.setOtherSkillsToolSnapshotIfAbsent as jest.Mock;
-
-      beforeEach(() => {
-        jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue([
-          { name: 'tool_a', definition: {} },
-          { name: 'tool_b', definition: {} },
-        ] as any);
-      });
-
-      it('does nothing for a session without __other_skills__ or without a session', async () => {
-        expect(await agentModeService.ensureOtherSkillsSnapshot(
-          { sessionId: 's1', associatedSkills: ['x'] }, publish)).toBeUndefined();
-        expect(await agentModeService.ensureOtherSkillsSnapshot(null, publish)).toBeUndefined();
-        expect(setSnapshot()).not.toHaveBeenCalled();
-      });
-
-      it('records the live pool on first use', async () => {
-        const session: any = { sessionId: 's1', associatedSkills: ['__other_skills__'] };
-        const result = await agentModeService.ensureOtherSkillsSnapshot(session, publish);
-        expect(result).toEqual(['tool_a']);
-        expect(setSnapshot()).toHaveBeenCalledWith('s1', ['tool_a']);
-        expect(session.otherSkillsToolSnapshot).toEqual(['tool_a']);
-      });
-
-      it('returns an existing snapshot without recomputing or writing', async () => {
-        const session: any = { sessionId: 's1', associatedSkills: ['__other_skills__'], otherSkillsToolSnapshot: ['tool_b'] };
-        expect(await agentModeService.ensureOtherSkillsSnapshot(session, publish)).toEqual(['tool_b']);
-        expect(setSnapshot()).not.toHaveBeenCalled();
-      });
-
-      it('falls back to the live pool when the write fails, and retries next turn', async () => {
-        setSnapshot().mockRejectedValueOnce(new Error('ddb down'));
-        const session: any = { sessionId: 's1', associatedSkills: ['__other_skills__'] };
-        expect(await agentModeService.ensureOtherSkillsSnapshot(session, publish)).toEqual(['tool_a']);
-        expect(session.otherSkillsToolSnapshot).toBeUndefined();
-      });
     });
   });
 
