@@ -97,6 +97,8 @@ export interface LlmConnectionServiceDeps {
   getOrg: (orgId: string) => Promise<AuthzOrg | null>;
   now: () => string;
   newId: () => string;
+  /** Best-effort, called after a connection is revoked. Must not throw into the request. */
+  onRevoked?: (connectionId: string) => void;
 }
 
 interface Access {
@@ -245,7 +247,14 @@ export class LlmConnectionService {
     const didRevoke = await this.deps.db.revoke(connectionId, { userId: actor.userId, adminId: actor.adminId }, this.deps.now());
     // Only the call that actually revoked it owned that slot; a second revoke of an
     // already-revoked connection must not release a slot that was already freed.
-    if (didRevoke) await this.deps.db.releaseSlot(record.ownerUserId);
+    if (didRevoke) {
+      await this.deps.db.releaseSlot(record.ownerUserId);
+      try {
+        this.deps.onRevoked?.(connectionId);
+      } catch {
+        /* a holder in another process notices at its next heartbeat */
+      }
+    }
   }
 
   async setShared(actor: Actor, connectionId: string, shared: boolean): Promise<LlmConnectionView> {
@@ -377,6 +386,8 @@ export function getLlmConnectionService(): LlmConnectionService {
       getOrg: async (orgId) => (await orgDb.getOrgById(orgId)) as AuthzOrg | null,
       now: () => new Date().toISOString(),
       newId: () => randomUUID(),
+      // A running turn on a revoked Claude login must stop now, not at its next heartbeat (ENG-2110).
+      onRevoked: (id) => (require("./claudeSubscriptionService") as typeof import("./claudeSubscriptionService")).abortClaudeSubscriptionConnection(id),
     });
   }
   return defaultService;

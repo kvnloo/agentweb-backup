@@ -31,7 +31,10 @@ export function scheduleClaudeSubscriptionExpiry(deps: ExpiryScheduleDeps): { sc
     deps.run ??
     (async () => {
       const result = await getClaudeSubscriptionService().expiryPass();
-      console.log(`[${CLAUDE_SUBSCRIPTION_EXPIRY_JOB_NAME}] expired=${result.expired} within7Days=${result.within7Days} within2Days=${result.within2Days}`);
+      console.log(
+        `[${CLAUDE_SUBSCRIPTION_EXPIRY_JOB_NAME}] expired=${result.expired} within7Days=${result.within7Days} within2Days=${result.within2Days}` +
+          (result.soon.length ? ` soon=${result.soon.map((s) => `${s.connectionId}:${s.daysLeft}d`).join(",")}` : ""),
+      );
       return result;
     });
   const tick = () => {

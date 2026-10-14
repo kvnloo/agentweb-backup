@@ -588,6 +588,73 @@ describe('withLogin: the single live copy', () => {
       expect(homeDirs(ctx.tmpRoot)).toEqual([]);
     });
 
+    it('does not lose the NEWEST login when an older refresh of the same run landed with a lost response', async () => {
+      const ctx = setup({ deps: { persistRetryMs: 40, persistMaxMs: 3000 } });
+      await seedLogin(ctx);
+      const real = ctx.db.saveSubCredentials.bind(ctx.db);
+      let calls = 0;
+      const err = quiet();
+      jest.spyOn(ctx.db, 'saveSubCredentials').mockImplementation(async (...a) => {
+        calls++;
+        if (calls < 3) throw new Error('down');
+        if (calls === 3) { await real(...a); throw new Error('response lost after commit'); } // login A committed, no answer
+        return real(...a);
+      });
+      const res = await ctx.service.withLogin('sub-x', 'user-1', async ({ configDir }) => {
+        rewrite(configDir, credsText({ refreshToken: 'SENTINEL-REFRESH-A' }));
+        await sleep(1100); // all three attempts for A are over
+        rewrite(configDir, credsText({ refreshToken: 'SENTINEL-REFRESH-B' })); // the CLI refreshed again
+      });
+      err.mockRestore();
+      expect(res.status).toBe('ok');
+      const row = (await ctx.db.get('sub-x'))!;
+      expect(row.subVersion).toBe(3); // A then B on top, nothing dropped
+      expect(JSON.parse(await openSecret(ctx.kms, row.sealed!, { connectionId: 'sub-x', ownerUserId: 'user-1', provider: 'anthropic', purpose: 'claude_login' })).claudeAiOauth.refreshToken).toBe('SENTINEL-REFRESH-B');
+    });
+
+    it('a revoke in this process stops the running holder at once, as revoked, and wipes the login dir', async () => {
+      const ctx = setup();
+      await seedLogin(ctx);
+      let aborted = false;
+      let started!: () => void;
+      const running = new Promise<void>((r) => (started = r));
+      const p = ctx.service.withLogin('sub-x', 'user-1', async ({ signal }) => {
+        signal.addEventListener('abort', () => (aborted = true));
+        started();
+        await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve()));
+      });
+      await running;
+      const t0 = Date.now();
+      ctx.service.abortConnection('sub-x');
+      const res = await p;
+      expect(aborted).toBe(true);
+      expect(res.status).toBe('revoked');
+      expect(Date.now() - t0).toBeLessThan(2000); // not the next heartbeat (30 s)
+      expect(homeDirs(ctx.tmpRoot)).toEqual([]);
+    });
+
+    it('a reconnect is refused BEFORE the one-time code is spent when a turn has started meanwhile', async () => {
+      const ctx = setup();
+      await connect(ctx);
+      const { loginId } = await ctx.service.startLogin({ userId: 'user-1' }, { reconnectConnectionId: 'sub-1' });
+      await ctx.db.acquireSubLease('sub-1', 'a-turn', Date.now(), 60_000);
+      expect(await codeOf(ctx.service.completeLogin({ userId: 'user-1' }, loginId, GOOD))).toBe('busy');
+      expect(ctx.service.pendingCount()).toBe(1); // the sign-in is still pending: the code was not consumed
+      await ctx.db.releaseSubLease('sub-1', 'a-turn');
+      expect((await ctx.service.completeLogin({ userId: 'user-1' }, loginId, GOOD)).connectionId).toBe('sub-1');
+    });
+
+    it('recovery leaves a login dir recorded by another host alone while it is fresh', async () => {
+      const ctx = setup();
+      await seedLogin(ctx);
+      const dir = join(ctx.tmpRoot, `${HOME_DIR_PREFIX}foreign`);
+      mkdirSync(join(dir, 'cfg'), { recursive: true });
+      writeFileSync(join(dir, 'cfg', '.credentials.json'), credsText({ refreshToken: 'SENTINEL-REFRESH-FOREIGN' }));
+      writeFileSync(join(dir, 'marker.json'), JSON.stringify({ connectionId: 'sub-x', owner: 'x', version: 1, ownerUserId: 'user-1', pid: 999999, host: 'some-other-machine' }));
+      await ctx.service.recoverOrphans();
+      expect(existsSync(dir)).toBe(true);
+    });
+
     it('recovery leaves a young dir with no marker yet alone (a run still setting up), but removes an old one', async () => {
       const ctx = setup();
       const young = join(ctx.tmpRoot, `${HOME_DIR_PREFIX}young`);
@@ -775,9 +842,9 @@ describe('expiry', () => {
       ctx.db.create({ connectionId: id, ownerUserId: 'user-1', kind: 'claude_subscription', provider: 'anthropic', status: 'active', keyLast4: '', createdAt: 'x', updatedAt: 'x', sealed: { v: 1, wrappedDataKey: 'w', iv: 'i', ciphertext: 'c', tag: 't' }, subVersion: 1, subNeedsReconnect: false, subRefreshExpiresAtMs: now + ms, ...over } as any);
     await mk('past', -1000); await mk('soon2', 86400e3); await mk('soon7', 5 * 86400e3); await mk('far', 20 * 86400e3);
     await mk('revoked', -1000, { revokedAt: 'x', status: 'revoked' });
-    expect(await ctx.service.expiryPass()).toEqual({ expired: 1, within7Days: 1, within2Days: 1 });
+    expect(await ctx.service.expiryPass()).toEqual({ expired: 1, within7Days: 1, within2Days: 1, soon: [{ connectionId: 'soon2', daysLeft: 1 }, { connectionId: 'soon7', daysLeft: 5 }] });
     expect((await ctx.db.get('past'))?.status).toBe('expired');
     expect((await ctx.db.get('far'))?.status).toBe('active');
-    expect(await ctx.service.expiryPass()).toEqual({ expired: 0, within7Days: 1, within2Days: 1 });
+    expect(await ctx.service.expiryPass()).toMatchObject({ expired: 0, within7Days: 1, within2Days: 1 });
   });
 });

@@ -102,6 +102,8 @@ export interface LlmConnectionRecord {
   /** Fixed 30 days from login; does NOT move on refresh. */
   subRefreshExpiresAtMs?: number;
   subSavedAt?: string;
+  /** sha256 of the stored login text: lets a writer tell "my earlier write landed" from "someone else's". */
+  subContentHash?: string;
   /** The stored login is probably dead (the CLI said so); the owner must sign in again. */
   subNeedsReconnect?: boolean;
   subReconnectReason?: string;
@@ -398,15 +400,16 @@ export class LlmConnectionDb {
    */
   async saveSubCredentials(
     connectionId: string,
-    save: { owner: string; expectedVersion: number; sealed: SealedSecret; health: SubHealth; nowIso: string },
+    save: { owner: string; expectedVersion: number; sealed: SealedSecret; health: SubHealth; nowIso: string; contentHash?: string },
   ): Promise<"ok" | "stale" | "revoked"> {
     const ok = await this.subUpdate(connectionId, {
       update:
-        "SET sealed = :sealed, subVersion = :next, subSavedAt = :now, updatedAt = :now, subType = :type, subTier = :tier, subAccessExpiresAtMs = :acc, subRefreshExpiresAtMs = :ref",
+        "SET sealed = :sealed, subVersion = :next, subSavedAt = :now, updatedAt = :now, subType = :type, subTier = :tier, subAccessExpiresAtMs = :acc, subRefreshExpiresAtMs = :ref, subContentHash = :hash",
       condition:
         "attribute_exists(connectionId) AND #kind = :sub AND attribute_not_exists(revokedAt) AND subLeaseOwner = :me AND subVersion = :v",
       names: { "#kind": "kind" },
       values: {
+        ":hash": save.contentHash ?? "",
         ":sealed": save.sealed,
         ":next": save.expectedVersion + 1,
         ":now": save.nowIso,
@@ -427,15 +430,16 @@ export class LlmConnectionDb {
   /** Sign-in again for an existing connection: replaces the login in place. Refused while anyone holds the lease. */
   async replaceSubCredentials(
     connectionId: string,
-    replace: { expectedVersion: number; sealed: SealedSecret; health: SubHealth; nowMs: number; nowIso: string },
+    replace: { expectedVersion: number; sealed: SealedSecret; health: SubHealth; nowMs: number; nowIso: string; contentHash?: string },
   ): Promise<boolean> {
     return this.subUpdate(connectionId, {
       update:
-        "SET sealed = :sealed, subVersion = :next, subSavedAt = :now, updatedAt = :now, subType = :type, subTier = :tier, subAccessExpiresAtMs = :acc, subRefreshExpiresAtMs = :ref, #status = :active, subNeedsReconnect = :no REMOVE subReconnectReason, subLeaseOwner, subLeaseUntil",
+        "SET sealed = :sealed, subVersion = :next, subSavedAt = :now, updatedAt = :now, subType = :type, subTier = :tier, subAccessExpiresAtMs = :acc, subRefreshExpiresAtMs = :ref, subContentHash = :hash, #status = :active, subNeedsReconnect = :no REMOVE subReconnectReason, subLeaseOwner, subLeaseUntil",
       condition:
         "attribute_exists(connectionId) AND #kind = :sub AND attribute_not_exists(revokedAt) AND subVersion = :v AND (attribute_not_exists(subLeaseUntil) OR subLeaseUntil < :nowMs)",
       names: { "#kind": "kind", "#status": "status" },
       values: {
+        ":hash": replace.contentHash ?? "",
         ":sealed": replace.sealed,
         ":next": replace.expectedVersion + 1,
         ":now": replace.nowIso,

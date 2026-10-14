@@ -12,7 +12,7 @@
  * org. Delegated admin sessions may not run the ceremony (an admin's own Claude account
  * would end up stored under the customer).
  */
-import { randomBytes, randomUUID } from "crypto";
+import { createHash, randomBytes, randomUUID } from "crypto";
 import { watch, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, type FSWatcher } from "fs";
 import { hostname, tmpdir } from "os";
 import { join } from "path";
@@ -62,6 +62,8 @@ export const PERSIST_RETRY_MS = 5_000;
 export const PERSIST_MAX_MS = 10 * 60 * 1000;
 /** A recovery pass leaves a login dir younger than this alone if its marker is missing (it is still being set up). */
 export const YOUNG_DIR_MS = 60_000;
+/** A login dir recorded by another host is left alone this long, then treated as abandoned. */
+export const FOREIGN_DIR_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const MARKER = "marker.json";
 
 export interface ParsedLogin {
@@ -122,6 +124,8 @@ export interface LoginContext {
 }
 export type LoginStatus = "ok" | "revoked" | "lost" | "save_failed";
 
+const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+
 function loginCtx(r: Pick<LlmConnectionRecord, "connectionId" | "ownerUserId">) {
   return { connectionId: r.connectionId, ownerUserId: r.ownerUserId, provider: "anthropic", purpose: "claude_login" };
 }
@@ -145,6 +149,8 @@ export class ClaudeSubscriptionService {
   private readonly pending = new Map<string, Pending>();
   private readonly starting = new Set<string>();
   private readonly activeDirs = new Set<string>();
+  /** Runs live in THIS process, so a revoke here can stop them at once (another instance's holder notices at its next heartbeat). */
+  private readonly runs = new Map<string, Set<(reason: string) => void>>();
   private reserved = 0;
 
   constructor(private readonly deps: ClaudeSubscriptionDeps) {}
@@ -196,6 +202,11 @@ export class ClaudeSubscriptionService {
     // Same answer for "unknown", "expired" and "someone else's": a wrong caller never cancels the real login.
     if (!pending || pending.userId !== actor.userId) throw new ClaudeSubscriptionError("login_not_found");
     if (typeof code !== "string" || !CODE_PATTERN.test(code)) throw new ClaudeSubscriptionError("bad_code_format");
+    if (pending.reconnectConnectionId) {
+      // A turn may have started since the sign-in began: say so BEFORE the one-time code is spent.
+      const target = await this.deps.db.get(pending.reconnectConnectionId);
+      if (target && (target.subLeaseUntil ?? 0) > this.deps.now()) throw new ClaudeSubscriptionError("busy");
+    }
     this.pending.delete(loginId);
     clearTimeout(pending.timer);
 
@@ -218,7 +229,7 @@ export class ClaudeSubscriptionService {
       const current = await this.deps.db.get(pending.reconnectConnectionId);
       if (!current || current.kind !== "claude_subscription" || current.ownerUserId !== actor.userId || current.revokedAt) throw new ClaudeSubscriptionError("not_found");
       const sealed = await sealSecret(this.deps.kms, text, loginCtx(current));
-      const replaced = await this.deps.db.replaceSubCredentials(current.connectionId, { expectedVersion: current.subVersion ?? 1, sealed, health, nowMs, nowIso });
+      const replaced = await this.deps.db.replaceSubCredentials(current.connectionId, { expectedVersion: current.subVersion ?? 1, sealed, health, nowMs, nowIso, contentHash: sha256(text) });
       if (!replaced) throw new ClaudeSubscriptionError("busy");
       console.log(`[claude-subscription] reconnected connection=${current.connectionId} instance=${hostname()}`);
       return viewOf((await this.deps.db.get(current.connectionId))!, actor.userId);
@@ -230,7 +241,7 @@ export class ClaudeSubscriptionService {
       connectionId, ownerUserId: actor.userId, kind: "claude_subscription", provider: "anthropic", status: "active", keyLast4: "",
       createdAt: nowIso, updatedAt: nowIso, sealed,
       subVersion: 1, subNeedsReconnect: false, subType: health.type, subTier: health.tier,
-      subAccessExpiresAtMs: health.accessExpiresAtMs, subRefreshExpiresAtMs: health.refreshExpiresAtMs, subSavedAt: nowIso,
+      subAccessExpiresAtMs: health.accessExpiresAtMs, subRefreshExpiresAtMs: health.refreshExpiresAtMs, subSavedAt: nowIso, subContentHash: sha256(text),
     };
     if (!(await this.deps.db.createWithinLimit(record, MAX_ACTIVE_CONNECTIONS_PER_OWNER))) throw new ClaudeSubscriptionError("limit_reached");
     console.log(`[claude-subscription] connected connection=${connectionId} instance=${hostname()}`);
@@ -285,11 +296,24 @@ export class ClaudeSubscriptionService {
     if (first.status !== "active") throw new ClaudeSubscriptionError("not_usable");
 
     const owner = this.deps.newToken();
-    if (!(await db.acquireSubLease(connectionId, owner, this.deps.now(), LEASE_MS))) throw new ClaudeSubscriptionError("busy");
-    let confirmedUntil = this.deps.now() + LEASE_MS;
+    const acquiredAt = this.deps.now();
+    if (!(await db.acquireSubLease(connectionId, owner, acquiredAt, LEASE_MS))) throw new ClaudeSubscriptionError("busy");
+    let confirmedUntil = acquiredAt + LEASE_MS;
     const abort = new AbortController();
     const stop = (reason: string) => {
       if (!abort.signal.aborted) abort.abort(reason);
+    };
+    let abortedAsRevoked = false;
+    const onAbortRequest = (reason: string) => {
+      if (reason === "revoked") abortedAsRevoked = true;
+      stop(reason);
+    };
+    const registered = this.runs.get(connectionId) ?? new Set<(reason: string) => void>();
+    registered.add(onAbortRequest);
+    this.runs.set(connectionId, registered);
+    const unregister = () => {
+      registered.delete(onAbortRequest);
+      if (registered.size === 0) this.runs.delete(connectionId);
     };
 
     // Everything between taking the lease and handing over to the caller is inside one try:
@@ -312,10 +336,11 @@ export class ClaudeSubscriptionService {
       var runDir: string = dir;
       var version: number = record.subVersion ?? 1;
       var writeMarker = () =>
-        writeFileSync(join(runDir, MARKER), JSON.stringify({ connectionId, owner, version, ownerUserId: record!.ownerUserId, pid: process.pid }), { mode: 0o600 });
+        writeFileSync(join(runDir, MARKER), JSON.stringify({ connectionId, owner, version, ownerUserId: record!.ownerUserId, pid: process.pid, host: hostname() }), { mode: 0o600 });
       writeMarker();
       this.activeDirs.add(runDir);
     } catch (err) {
+      unregister();
       this.activeDirs.delete(dir ?? "");
       if (dir) rmSync(dir, { recursive: true, force: true });
       await db.releaseSubLease(connectionId, owner).catch(() => undefined);
@@ -323,8 +348,8 @@ export class ClaudeSubscriptionService {
     }
 
     let lastText = text;
-    /** Timestamps of every save attempt in this run: a lost response from ANY of them may have committed. */
-    const attempted: string[] = [];
+    /** Content hashes of every save attempted in this run: a lost response from ANY may have committed. */
+    const attemptedHashes = new Set<string>();
     let lost: "stale" | "revoked" | undefined;
     let leaseLost = false;
     let saveFailed = false;
@@ -345,8 +370,9 @@ export class ClaudeSubscriptionService {
       } catch {
         return;
       }
-      const succeeded = () => {
-        version += 1;
+      const hash = sha256(current);
+      const succeeded = (newVersion: number = version + 1) => {
+        version = newVersion;
         lastText = current;
         saveFailed = false;
         confirmedUntil = Math.max(confirmedUntil, this.deps.now());
@@ -358,16 +384,26 @@ export class ClaudeSubscriptionService {
       };
       for (let attempt = 1; attempt <= SAVE_ATTEMPTS; attempt++) {
         const nowIso = new Date(this.deps.now()).toISOString();
-        attempted.push(nowIso);
+        attemptedHashes.add(hash);
         try {
           const sealed = await sealSecret(kms, current, loginCtx(record!));
-          const res = await db.saveSubCredentials(connectionId, { owner, expectedVersion: version, sealed, health, nowIso });
+          const res = await db.saveSubCredentials(connectionId, { owner, expectedVersion: version, sealed, health, nowIso, contentHash: hash });
           if (res === "ok") return succeeded();
           if (res === "stale") {
-            // An earlier attempt may have committed although its response never arrived: if the
-            // stored copy is exactly the next version, saved by us, that is our write, not a loss.
+            // An earlier attempt may have committed although its response never arrived. A stored copy that is
+            // held by us, newer than our version, and has content WE tried to save in this run is our own write.
             const cur = await db.get(connectionId).catch(() => null);
-            if (cur && !cur.revokedAt && cur.subLeaseOwner === owner && cur.subVersion === version + 1 && cur.subSavedAt && attempted.includes(cur.subSavedAt)) return succeeded();
+            if (cur && !cur.revokedAt && cur.subLeaseOwner === owner && cur.subVersion !== undefined && cur.subVersion > version && attemptedHashes.has(cur.subContentHash ?? "")) {
+              if (cur.subContentHash === hash) return succeeded(cur.subVersion); // exactly this content: done
+              // An OLDER refresh of ours landed. Build on it: the newest content still has to go in, on top.
+              version = cur.subVersion;
+              try {
+                writeMarker();
+              } catch {
+                /* recovery retries against the stored version */
+              }
+              continue;
+            }
           }
           lost = res;
           stop(res === "revoked" ? "revoked" : "lease_or_version_lost");
@@ -396,7 +432,8 @@ export class ClaudeSubscriptionService {
     const heartbeat = setInterval(() => {
       void (async () => {
         try {
-          if (await db.extendSubLease(connectionId, owner, this.deps.now(), LEASE_MS)) confirmedUntil = this.deps.now() + LEASE_MS;
+          const requestedAt = this.deps.now(); // the lease runs from when we asked, not from when the answer came back
+          if (await db.extendSubLease(connectionId, owner, requestedAt, LEASE_MS)) confirmedUntil = requestedAt + LEASE_MS;
           else {
             // Someone else holds it now, or it was revoked: stop the CLI before a second copy can refresh.
             leaseLost = true;
@@ -424,6 +461,7 @@ export class ClaudeSubscriptionService {
     const stopTimers = () => {
       clearInterval(heartbeat);
       clearInterval(watchdog);
+      unregister();
     };
     const wipe = () => {
       this.activeDirs.delete(runDir);
@@ -458,12 +496,12 @@ export class ClaudeSubscriptionService {
       stopTimers();
       wipe();
       console.error(`[claude-subscription] caller ignored the abort for connection=${connectionId}; stopped waiting, lease left to lapse`);
-      return { value: undefined as T, status: lost === "revoked" ? "revoked" : "lost" };
+      return { value: undefined as T, status: lost === "revoked" || abortedAsRevoked ? "revoked" : "lost" };
     }
 
     await enqueue();
     await queue;
-    const status: LoginStatus = lost === "revoked" ? "revoked" : lost || leaseLost ? "lost" : saveFailed ? "save_failed" : "ok";
+    const status: LoginStatus = lost === "revoked" || abortedAsRevoked ? "revoked" : lost || leaseLost ? "lost" : saveFailed ? "save_failed" : "ok";
     if (status === "save_failed") {
       // The refreshed login exists only in this dir. Keep the lease alive and keep trying in the
       // background until the save lands, the connection is revoked, or we give up (then boot recovery).
@@ -501,6 +539,14 @@ export class ClaudeSubscriptionService {
     return { value: outcome.value, status };
   }
 
+  /**
+   * The connection was just revoked: stop any run on it in this process now, rather than at the next
+   * heartbeat. The run ends as "revoked" and its dir is wiped.
+   */
+  abortConnection(connectionId: string): void {
+    for (const stop of [...(this.runs.get(connectionId) ?? [])]) stop("revoked");
+  }
+
   /** The CLI itself said the stored login is dead. Conditional on the version the caller saw. */
   async reportDeadLogin(connectionId: string, version: number, reason: string): Promise<boolean> {
     return this.deps.db.markSubNeedsReconnect(connectionId, version, reason.slice(0, 64), new Date(this.deps.now()).toISOString());
@@ -522,14 +568,17 @@ export class ClaudeSubscriptionService {
       if (this.activeDirs.has(dir)) continue;
       try {
         if (!statSync(dir).isDirectory()) continue;
-        const marker = JSON.parse(readFileSync(join(dir, MARKER), "utf8")) as { connectionId: string; owner: string; version: number; ownerUserId: string; pid?: number };
-        if (marker.pid && marker.pid !== process.pid && pidAlive(marker.pid)) continue; // another live process owns it
+        const marker = JSON.parse(readFileSync(join(dir, MARKER), "utf8")) as { connectionId: string; owner: string; version: number; ownerUserId: string; pid?: number; host?: string };
+        // Another machine's dir (or another live process's) is not ours to touch; a very old one is wiped regardless.
+        const ageMs = this.deps.now() - statSync(dir).mtimeMs;
+        if (marker.host && marker.host !== hostname() && ageMs < FOREIGN_DIR_MAX_AGE_MS) continue;
+        if (marker.pid && marker.pid !== process.pid && (!marker.host || marker.host === hostname()) && pidAlive(marker.pid)) continue;
         const text = readFileSync(join(dir, "cfg", ".credentials.json"), "utf8");
         const { health } = parseCredentials(text, 0);
         const sealed = await sealSecret(this.deps.kms, text, loginCtx({ connectionId: marker.connectionId, ownerUserId: marker.ownerUserId }));
         let expectedVersion = marker.version;
         for (let attempt = 0; attempt < 2; attempt++) {
-          const res = await this.deps.db.saveSubCredentials(marker.connectionId, { owner: marker.owner, expectedVersion, sealed, health, nowIso: new Date(this.deps.now()).toISOString() });
+          const res = await this.deps.db.saveSubCredentials(marker.connectionId, { owner: marker.owner, expectedVersion, sealed, health, nowIso: new Date(this.deps.now()).toISOString(), contentHash: sha256(text) });
           if (res === "ok") {
             out.saved++;
             break;
@@ -563,16 +612,20 @@ export class ClaudeSubscriptionService {
 
   // ============================ expiry ============================
   /** Marks logins past their fixed refresh lifetime as expired, and counts those about to be. */
-  async expiryPass(): Promise<{ expired: number; within7Days: number; within2Days: number }> {
+  async expiryPass(): Promise<{ expired: number; within7Days: number; within2Days: number; soon: Array<{ connectionId: string; daysLeft: number }> }> {
     const nowMs = this.deps.now();
-    const out = { expired: 0, within7Days: 0, within2Days: 0 };
+    const out = { expired: 0, within7Days: 0, within2Days: 0, soon: [] as Array<{ connectionId: string; daysLeft: number }> };
     for (const r of await this.deps.db.listSubscriptions()) {
       if (r.revokedAt || r.status !== "active" || !r.subRefreshExpiresAtMs) continue;
       const left = r.subRefreshExpiresAtMs - nowMs;
       if (left < 0) {
         if (await this.deps.db.markSubExpired(r.connectionId, nowMs, new Date(nowMs).toISOString())) out.expired++;
-      } else if (left < 2 * 86400_000) out.within2Days++;
-      else if (left < 7 * 86400_000) out.within7Days++;
+      } else if (left < 7 * 86400_000) {
+        // Actionable: which connection, and how long it has left.
+        out.soon.push({ connectionId: r.connectionId, daysLeft: Math.ceil(left / 86400_000) });
+        if (left < 2 * 86400_000) out.within2Days++;
+        else out.within7Days++;
+      }
     }
     return out;
   }
@@ -601,6 +654,11 @@ export function getClaudeSubscriptionService(): ClaudeSubscriptionService {
     });
   }
   return defaultService;
+}
+
+/** Revoke hook: stops a run on this connection in this process. Does nothing if the service was never used. */
+export function abortClaudeSubscriptionConnection(connectionId: string): void {
+  defaultService?.abortConnection(connectionId);
 }
 
 /** Shutdown hook: stops any pending sign-in CLI and wipes its dir. Does nothing if the service was never used. */

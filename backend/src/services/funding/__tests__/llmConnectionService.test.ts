@@ -32,17 +32,19 @@ function setup() {
   const users = JSON.parse(JSON.stringify(USERS));
   const enabled = new Set(Object.keys(users));
   const validateKey = jest.fn(async (): Promise<KeyCheckResult> => 'ok');
+  const onRevoked = jest.fn();
   const service = new LlmConnectionService({
     db: store.db,
     kms,
     validateKey,
     isByokEnabledFor: async (userId) => enabled.has(userId),
+    onRevoked,
     getUser: async (userId) => users[userId] ?? null,
     getOrg: async (orgId) => (orgId === 'org-1' ? ORG : orgId === 'org-2' ? { orgId: 'org-2', ownerUserId: 'outsider' } : null),
     now: () => new Date(Date.UTC(2026, 9, 9, 0, 0, tick++)).toISOString(),
     newId: () => `conn-${++ids}`,
   });
-  return { service, store, kms, validateKey, users, enabled };
+  return { service, store, kms, validateKey, users, enabled, onRevoked };
 }
 
 const code = (promise: Promise<unknown>) =>
@@ -389,6 +391,14 @@ describe('LlmConnectionService', () => {
       const ctx = await withLogin();
       const stored = (await ctx.store.db.get('login-1'))!.sealed!;
       await expect(openSecret(ctx.kms, stored, { connectionId: 'login-1', ownerUserId: 'solo', provider: 'anthropic' })).rejects.toBeTruthy();
+    });
+
+    it('tells the revoke hook, so a running turn in this process can stop at once', async () => {
+      const { service, onRevoked } = await withLogin();
+      await service.revoke({ userId: 'solo' }, 'login-1');
+      await service.revoke({ userId: 'solo' }, 'login-1'); // a repeat does not fire it again
+      expect(onRevoked).toHaveBeenCalledTimes(1);
+      expect(onRevoked).toHaveBeenCalledWith('login-1');
     });
 
     it('is revoked like any connection: the sealed login is gone and the slot is freed', async () => {
