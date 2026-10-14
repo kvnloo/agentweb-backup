@@ -1803,6 +1803,29 @@ export interface ScoringJudge {
   updatedAt: string;
 }
 
+/**
+ * ENG-2483: offline-replay switch. ENG-2481's bisect found the appended clauses, not the
+ * serializer, cost the outcome judge its discrimination (AUC 0.83 serializer-only vs 0.70
+ * with clauses). `appendClauses: false` lets a replay score serializer-only. Default (absent
+ * or true) is the production prompt, byte-identical to before.
+ */
+export interface JudgePromptOptions {
+  appendClauses?: boolean;
+}
+
+export function buildJudgeSystemPrompt(basePrompt: string, options?: JudgePromptOptions): string {
+  if (options?.appendClauses === false) return basePrompt;
+  return (
+    basePrompt +
+    NO_TASK_JUDGMENT_CLAUSE +
+    VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE +
+    PUBLISH_APPROVAL_WITHHOLDING_CLAUSE +
+    FABRICATION_GROUNDING_CLAUSE +
+    OUTPUT_INTEGRITY_GUARD_CLAUSE +
+    AWAITING_USER_REPLY_CLAUSE
+  );
+}
+
 /** The one LLM call a judge makes; injectable so offline replays can call the model unmetered. */
 export type ScoringLlmCall = (
   model: string,
@@ -1838,7 +1861,8 @@ export async function scoreSessionWithJudge(
   judge: ScoringJudge,
   sessionType?: string,
   usageContext?: { userId?: string; feature?: string; sessionId?: string },
-  callLLM?: ScoringLlmCall
+  callLLM?: ScoringLlmCall,
+  judgeOptions?: JudgePromptOptions
 ): Promise<ScoringResult> {
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
   const capped = capTranscriptForScoring(serializeMessagesForScoring(recentMessages));
@@ -1875,14 +1899,7 @@ export async function scoreSessionWithJudge(
     ? { sessionId: usageContext?.sessionId, feature: OUTCOME_JUDGE_SHADOW_FEATURE }
     : { ...usageContext, feature: usageContext?.feature || "agent_task" };
 
-  const judgeSystemPrompt =
-    judge.systemPrompt +
-    NO_TASK_JUDGMENT_CLAUSE +
-    VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE +
-    PUBLISH_APPROVAL_WITHHOLDING_CLAUSE +
-    FABRICATION_GROUNDING_CLAUSE +
-    OUTPUT_INTEGRITY_GUARD_CLAUSE +
-    AWAITING_USER_REPLY_CLAUSE;
+  const judgeSystemPrompt = buildJudgeSystemPrompt(judge.systemPrompt, judgeOptions);
   const requestJudge = (strictJson: boolean) =>
     raceWithScoringTimeout(
       llm(
