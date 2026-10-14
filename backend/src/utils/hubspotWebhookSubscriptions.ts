@@ -165,7 +165,7 @@ async function syncSubscriptions(
           // say what to do once and report "nothing this code can do" instead of failing the build.
           console.warn(
             `[HubSpotWebhook] HubSpot refuses API changes to this app's webhook subscriptions (it is managed by a HubSpot project). ` +
-            `Not registered: ${toRegister.join(', ')}. Add them to the project's webhook configuration and redeploy the project.`,
+            `Not registered: ${toRegister.slice(toRegister.indexOf(key)).join(', ')}. Add them to the project's webhook configuration and redeploy the project.`,
           );
           return true;
         }
