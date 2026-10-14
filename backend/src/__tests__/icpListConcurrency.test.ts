@@ -380,6 +380,26 @@ describe("persona data that a whole-list comparison would trip over", () => {
     expect(left).toContain("Legacy 3:p3");
   });
 
+  it.each([
+    ["the rename lands first", ["edit", "delete"]],
+    ["the delete lands first", ["delete", "edit"]],
+  ])("never removes the wrong one of two identical id-less cards when the other is renamed (%s)", async (_label, order) => {
+    const twin = { name: "Twin", pain: "same", desire: "same", objection: "same" };
+    seed({ icpResult: [{ ...twin }, { ...twin }, legacy(2)] });
+    holdUntilBothRead();
+    const jobs: Record<string, () => Promise<any>> = {
+      edit: () => post("edit-one", { icpId: "icp-1", patch: { name: "Renamed" } }),
+      delete: () => post("delete-one", { icpId: "icp-1" }),
+    };
+    const results = await Promise.all(order.map((k) => jobs[k]()));
+
+    for (const r of results) expect([200, 409]).toContain(r.status);
+    const names = table().row.icpResult.map((p: any) => p.name);
+    // Wrong card: the untouched twin deleted while the renamed one stays.
+    expect(names).not.toEqual(["Renamed", "Legacy 2"]);
+    expect(names).toContain("Legacy 2");
+  });
+
   it("does not report success for a delete of a nameless, id-less card whose position the list has shrunk past", async () => {
     seed({ icpResult: [legacy(0), { pain: "no name", desire: "d", objection: "o" }] });
     holdUntilBothRead();
