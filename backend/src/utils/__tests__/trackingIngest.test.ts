@@ -186,7 +186,8 @@ describe('buildSessionRow: the server owns classification', () => {
 
   it('first-touch channel is classified server-side from the stored first landing URL + referrer host', () => {
     const v = ok(base({ firstTouchLanding: 'https://go.example.com/?utm_source=tiktok', firstTouchReferrer: 'l.instagram.com', firstTouchChannel: 'Spoof' }));
-    expect(buildSessionRow(v, { userAgent: CHROME, nowIso: 'T' }).customFields.firstTouchChannel).toBe('TikTok');
+    // 2.2.0: the observed first referrer (Instagram) beats the link's tiktok tag.
+    expect(buildSessionRow(v, { userAgent: CHROME, nowIso: 'T' }).customFields.firstTouchChannel).toBe('Instagram');
     const legacy = ok(base({ firstTouchChannel: 'Facebook' }));
     expect(buildSessionRow(legacy, { userAgent: CHROME, nowIso: 'T' }).customFields.firstTouchChannel).toBe('Facebook');
   });
