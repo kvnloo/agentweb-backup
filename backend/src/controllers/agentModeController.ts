@@ -141,12 +141,17 @@ import {
   type SubscriptionFeatureId,
 } from '../services/subscriptionService';
 import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
+import { fileProductFeedback, EMMA_FEEDBACK_INTENTS } from '../services/productFeedbackFiling';
+import { ReportReplayCapacityError } from '../utils/reportIntake';
 import { resetSentence } from "../utils/usageCycle";
 import { buildUsageBlockCopy } from "../utils/usageBlockCopy";
 import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 import { DynamoDB } from 'aws-sdk';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
+import { parseScheduledChatsPage, encodeScheduledChatsCursor } from '../utils/scheduledChatsPage';
+import { describeScheduledRunFailureReasons } from '../utils/scheduledRunFailureReasons';
+import { resolveScheduleRunTime, formatRunTimeInZone } from '../utils/scheduleRunTime';
 import {
   selectPolicyModel,
   type ModelBackupSource,
@@ -487,6 +492,57 @@ export async function resolveEffectiveModelForUser(input: {
     ...decision,
     usageMode: usage.mode.usageMode,
     usagePolicyVersion: usage.policy?.version || null,
+  };
+}
+
+/**
+ * The one 429 `usage_paused` body for an interactive turn refused because the allowance is
+ * exhausted (/generate and /verified-generate share it, so they cannot disagree). When a
+ * usage policy is active the policy decision is stamped on the session (its model is kept)
+ * and echoed in the body (a caller that already resolved it passes `decision`); a ModelUnavailableError while resolving it must not mask the 429.
+ */
+async function buildUsagePausedBody(input: {
+  usageStatus: Awaited<ReturnType<typeof checkTokenUsage>>;
+  session: { sessionId: string; userId: string; llmModel?: string | null };
+  requestedModel: string | null;
+  backupModel?: string | null;
+  /** An already-resolved policy decision (skips the resolve below). */
+  decision?: EffectiveModelPolicyDecision;
+}): Promise<Record<string, unknown>> {
+  const { usageStatus, session } = input;
+  // ENG-1344 AC6: one server-side producer for both the flat string and the structured copy.
+  const usageBlockCopy = buildUsageBlockCopy({ month: usageStatus.month });
+  const decision = input.decision ?? (usageStatus.usagePolicyVersion
+    ? await resolveEffectiveModelForUser({
+        userId: session.userId,
+        requestedModel: input.requestedModel,
+        backupModel: input.backupModel,
+        backupSource: input.backupModel ? 'user' : null,
+      }).catch((modelError) => {
+        if (isModelUnavailableError(modelError)) return undefined;
+        throw modelError;
+      })
+    : undefined);
+  if (!decision) {
+    return { error: usageBlockCopy.message, usageBlock: usageBlockCopy, code: 'usage_paused', usageMode: 'paused' };
+  }
+  await chatbotDb.updateSessionLlmModel(
+    session.sessionId,
+    session.llmModel || agentModeService.default_model,
+    toStoredModelPolicyDecision(decision),
+  );
+  return {
+    error: usageBlockCopy.message,
+    usageBlock: usageBlockCopy,
+    code: 'usage_paused',
+    usageMode: decision.usageMode,
+    requestedModel: decision.requestedModel,
+    effectiveModel: decision.effectiveModel,
+    backupModel: decision.backupModel,
+    backupSource: decision.backupSource,
+    modelSelection: decision.modelSelection,
+    modelSelectionReason: decision.reason,
+    usagePolicyVersion: decision.usagePolicyVersion,
   };
 }
 
@@ -3093,6 +3149,13 @@ export function isValidIanaTimeZone(tz: unknown): tz is string {
   }
 }
 
+// Echo the stored run time in the owner's zone so the agent repeats what was
+// actually stored, not what it meant to send (Opslane 2026-10-13).
+function runTimeInOwnerZone(iso: string | undefined, timeZone: unknown): { timezone?: string; nextRunTimeLocal?: string } {
+  if (!iso || !isValidIanaTimeZone(timeZone)) return {};
+  return { timezone: timeZone, nextRunTimeLocal: formatRunTimeInZone(iso, timeZone) };
+}
+
 function weekdayInTimeZone(when: Date, timeZone?: string): number {
   if (!timeZone) return when.getUTCDay();
   try {
@@ -5373,7 +5436,13 @@ async function runVerifiedChatInner(
  */
 export async function runVerifiedChat(
   params: Parameters<typeof runVerifiedChatInner>[0],
-  options?: { lockTimeoutMs?: number; capInteractiveUserId?: string },
+  options?: {
+    lockTimeoutMs?: number;
+    capInteractiveUserId?: string;
+    // Runs once the session lock (and the interactive cap slot) are held, immediately before
+    // the turn: a request refused as busy / over the cap must not have changed the session.
+    beforeRun?: () => Promise<void>;
+  },
 ): Promise<RunVerifiedChatResult> {
   const { sessionId } = params;
   const claimed = await claimSessionGenerationWithRetry(sessionId, undefined, params.userId);
@@ -5388,6 +5457,7 @@ export async function runVerifiedChat(
       if (!slot.ok) throw new TooManyConcurrentRunsError(slot.current, slot.limit);
       generationSlot = slot;
     }
+    await options?.beforeRun?.();
     return await withGenerationTimeout(
       runVerifiedChatInner(params),
       sessionId,
@@ -7337,10 +7407,18 @@ export async function runScheduledChat(
       // distinguishable from a run that exhausted all 20 attempts some other way.
       ...(result.sendPressExhausted ? { sendPressExhausted: true } : {}),
     };
+    // ENG-1735: name the concrete failing check so a failure with no tool/keyword
+    // misses is not reported as "none / none".
+    const scheduledRunFailureReasons = runDelivered
+      ? []
+      : describeScheduledRunFailureReasons(result, { linkedInInviteSendRequirementMissed });
     const scheduledChatFailureDescription =
       `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\n` +
       `Missing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\n` +
       `Keyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}` +
+      (scheduledRunFailureReasons.length
+        ? `\nFailure reason: ${scheduledRunFailureReasons.join('; ')}`
+        : '') +
       (linkedInInviteSendBlock
         ? `\n\nBlocked action: send-invite. ${linkedInInviteSendBlock.notice}`
         : '');
@@ -9482,6 +9560,10 @@ export const agentModeController = {
       if (!user?.isAdmin && session.userId !== user?.userId) {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
+      // The body carries live state (messages, llmModel, progress), so a cached copy
+      // would show a stale conversation or a stale model selection. Same header as
+      // getGeneratingSessions.
+      res.setHeader?.('Cache-Control', 'no-store');
 
       // ENG-1239: durability backstop for the in-process media auto-continuation chain —
       // it only fires right after the deferred turn, so a process death in between (a
@@ -9963,52 +10045,88 @@ export const agentModeController = {
 
       // Check token usage limits
       const usageStatus = await checkTokenUsage(user.userId);
-      // Composed once for every refusal path below so the three 429s cannot
-      // disagree with each other either (ENG-1344 AC6).
-      const usageBlockCopy = buildUsageBlockCopy({ month: usageStatus.month });
       if (!usageStatus.allowed) {
-        // A ModelUnavailableError here must not mask the 429: fall through to the plain one.
-        if (usageStatus.usagePolicyVersion) {
-          modelPolicyDecision = await resolveEffectiveModelForUser({
-            userId: session.userId,
-            requestedModel: llmModel || session.llmModel || null,
-            backupModel: llmBackupModel,
-            backupSource: llmBackupModel ? 'user' : null,
-          }).catch((modelError) => {
-            if (isModelUnavailableError(modelError)) return undefined;
-            throw modelError;
-          });
+        // ENG-527: product-feedback filing is never token-limited. An over-quota user who
+        // explicitly asks Emma to file a bug/feature request (portal `feedbackIntent`) gets it
+        // filed DETERMINISTICALLY — zero LLM calls, zero token spend — through the same shared
+        // policy as the in-app Send feedback form. Ordinary generation stays blocked below.
+        const feedbackIntent = typeof req.body.feedbackIntent === 'string' ? req.body.feedbackIntent : undefined;
+        if (feedbackIntent && Object.prototype.hasOwnProperty.call(EMMA_FEEDBACK_INTENTS, feedbackIntent)) {
+          const intentConfig = EMMA_FEEDBACK_INTENTS[feedbackIntent];
+          // Same validation as POST /support/report-ui-bug: blank input is a 400, not a filing failure.
+          const feedbackDescription = typeof userMessage === 'string' ? userMessage.trim() : '';
+          if (!feedbackDescription) {
+            return res.status(400).json({ error: 'Description is required', code: 'feedback_description_required', feedbackFiled: null });
+          }
+          try {
+            // Match /support attribution: reporter details come from the DB user record (the
+            // token carries no displayName/funnelStatus), and admin delegation is recorded.
+            const reporter = await userDb.getUserById(user.userId).catch(() => null);
+            const delegate = (req as any).delegateInfo;
+            const filing = await fileProductFeedback({
+              user: {
+                userId: user.userId,
+                email: reporter?.email || user.email,
+                displayName: reporter?.displayName,
+                funnelStatus: reporter?.funnelStatus,
+              },
+              reportedByAdmin: delegate?.isDelegated === true && delegate.adminEmail
+                ? delegate.adminEmail
+                : undefined,
+              reportType: feedbackIntent,
+              titlePrefix: intentConfig.titlePrefix,
+              tag: intentConfig.tag,
+              description: feedbackDescription,
+              pageUrl: typeof currentUrl === 'string' ? currentUrl : undefined,
+              sessionId,
+            });
+            const link = (filing.filed.userUrl || filing.filed.trackerUrl || '').trim();
+            const label = feedbackIntent === 'bug' ? 'bug report' : 'feature request';
+            // Never print "being tracked:" with nothing after it: only promise a link we have.
+            const content = link
+              ? `Your ${label} has been filed and is being tracked: ${link}`
+              : `Your ${label} has been filed${filing.issueId ? ` (${filing.issueId})` : ''}. The team will follow up.`;
+            // Persist the turn like an answered turn so the confirmation survives a reload.
+            const nowIso = new Date().toISOString();
+            try {
+              await chatbotDb.addMessagesToSession(sessionId, [
+                { role: 'user', content: String(userMessage), timestamp: nowIso, metadata: { timestamp: nowIso, feedbackIntent } },
+                { role: 'assistant', content, timestamp: nowIso, metadata: { timestamp: nowIso, feedbackFiled: true } },
+              ] as any);
+            } catch (persistError) {
+              // The filing already succeeded; a transcript write failure must not un-report it.
+              console.error('[agentMode] ENG-527 failed to persist over-quota feedback turn:', persistError);
+            }
+            return res.json({
+              content,
+              feedbackFiled: {
+                type: feedbackIntent,
+                trackerUrl: link || null,
+                issueId: filing.issueId ?? null,
+                deduped: filing.filed.deduped,
+                replayed: filing.replayed,
+              },
+              usageMode: 'paused',
+            });
+          } catch (filingError) {
+            // AC4: a failed filing is surfaced clearly and NEVER reported as tracked.
+            console.error('[agentMode] ENG-527 over-quota feedback filing failed:', filingError);
+            const busy = filingError instanceof ReportReplayCapacityError;
+            return res.status(busy ? 503 : 502).json({
+              error: busy
+                ? 'Feedback intake is busy; please retry shortly. Nothing was filed yet.'
+                : 'We could not file your feedback, so nothing was tracked. Please try again or use Send feedback.',
+              code: 'feedback_filing_failed',
+              feedbackFiled: null,
+            });
+          }
         }
-        if (modelPolicyDecision) {
-          await chatbotDb.updateSessionLlmModel(
-            sessionId,
-            session.llmModel || agentModeService.default_model,
-            toStoredModelPolicyDecision(modelPolicyDecision),
-          );
-          return res.status(429).json({
-            // ENG-1344 AC6: one server-side producer for both the flat string and
-            // the structured copy, so no client can word this block differently.
-            error: usageBlockCopy.message,
-            usageBlock: usageBlockCopy,
-            code: 'usage_paused',
-            usageMode: modelPolicyDecision.usageMode,
-            requestedModel: modelPolicyDecision.requestedModel,
-            effectiveModel: modelPolicyDecision.effectiveModel,
-            backupModel: modelPolicyDecision.backupModel,
-            backupSource: modelPolicyDecision.backupSource,
-            modelSelection: modelPolicyDecision.modelSelection,
-            modelSelectionReason: modelPolicyDecision.reason,
-            usagePolicyVersion: modelPolicyDecision.usagePolicyVersion,
-          });
-        }
-        return res.status(429).json({
-          // ENG-1344 AC6: one server-side producer for both the flat string and
-          // the structured copy, so no client can word this block differently.
-          error: usageBlockCopy.message,
-          usageBlock: usageBlockCopy,
-          code: 'usage_paused',
-          usageMode: 'paused',
-        });
+        return res.status(429).json(await buildUsagePausedBody({
+          usageStatus,
+          session,
+          requestedModel: llmModel || session.llmModel || null,
+          backupModel: llmBackupModel,
+        }));
       }
 
       // (Session was fetched + ownership-checked above, before the locks.)
@@ -10073,26 +10191,13 @@ export const agentModeController = {
         return res.status(422).json(modelUnavailableBody(modelError));
       }
       if (!modelPolicyDecision.effectiveModel) {
-        await chatbotDb.updateSessionLlmModel(
-          sessionId,
-          session.llmModel || agentModeService.default_model,
-          toStoredModelPolicyDecision(modelPolicyDecision),
-        );
-        return res.status(429).json({
-          // ENG-1344 AC6: one server-side producer for both the flat string and
-          // the structured copy, so no client can word this block differently.
-          error: usageBlockCopy.message,
-          usageBlock: usageBlockCopy,
-          code: 'usage_paused',
-          usageMode: 'paused',
+        // Paused: the one shared producer stamps the decision and builds the 429.
+        return res.status(429).json(await buildUsagePausedBody({
+          usageStatus,
+          session,
           requestedModel: modelPolicyDecision.requestedModel,
-          effectiveModel: null,
-          backupModel: modelPolicyDecision.backupModel,
-          backupSource: modelPolicyDecision.backupSource,
-          modelSelection: modelPolicyDecision.modelSelection,
-          modelSelectionReason: modelPolicyDecision.reason,
-          usagePolicyVersion: modelPolicyDecision.usagePolicyVersion,
-        });
+          decision: modelPolicyDecision,
+        }));
       }
       const modelToUse = modelPolicyDecision.effectiveModel;
       await chatbotDb.updateSessionLlmModel(
@@ -12970,7 +13075,8 @@ export const agentModeController = {
         fullAutonomy,
         requirePublishApproval,
         requireSlackApproval,
-        timezone
+        timezone,
+        emailNotificationsOptOut
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -13027,12 +13133,12 @@ export const agentModeController = {
       // Use provided nextRunTime or calculate default
       let scheduledNextRunTime: string;
       if (nextRunTime) {
-        // Validate the provided nextRunTime
-        const providedDate = new Date(nextRunTime);
-        if (isNaN(providedDate.getTime())) {
-          return res.status(400).json({ error: 'Invalid nextRunTime format' });
+        // Opslane 2026-10-13: an offset-less time is read in `timezone`, or refused.
+        const resolved = resolveScheduleRunTime(nextRunTime, isValidIanaTimeZone(timezone) ? timezone : undefined);
+        if ('error' in resolved) {
+          return res.status(400).json({ error: resolved.error });
         }
-        scheduledNextRunTime = providedDate.toISOString();
+        scheduledNextRunTime = resolved.iso;
       } else {
         // Default behavior: calculate next run time (9 AM UTC = 1 AM PST)
         const calculatedTime = calculateNextRunTime(scheduleFrequency, now, frequencyIntervalDays, scheduleId);
@@ -13121,7 +13227,11 @@ export const agentModeController = {
       const allVariablesPrefilled = normalizedVariables.length > 0
         && getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length === 0;
       const normalizedEmails = normalizeEmailList(emailNotifications);
-      const shouldUseFallbackEmail = normalizedEmails.length === 0 && !allVariablesPrefilled;
+      // Opslane 2026-10-13: an explicit opt-out (the MCP tool's `email_notifications: []`)
+      // is honoured. A bare [] from other REST callers keeps the fallback — the portal
+      // sends [] for "not set" and relies on it.
+      const optedOutOfEmail = emailNotificationsOptOut === true && normalizedEmails.length === 0;
+      const shouldUseFallbackEmail = normalizedEmails.length === 0 && !allVariablesPrefilled && !optedOutOfEmail;
       scheduledChat.emailNotifications = shouldUseFallbackEmail ? [fallbackEmail] : normalizedEmails;
       scheduledChat.variables = normalizedVariables;
       scheduledChat.variableValues = normalizedVariableValues;
@@ -13154,6 +13264,8 @@ export const agentModeController = {
         scheduleId,
         message: 'Scheduled chat created successfully',
         nextRunTime: scheduledNextRunTime,
+        ...runTimeInOwnerZone(scheduledNextRunTime, scheduledChat.timezone),
+        emailNotifications: scheduledChat.emailNotifications,
         ...scheduleBackup,
         backupSelectionRequired: scheduleBackup.llmBackupNeedsConfirmation,
       });
@@ -13206,7 +13318,23 @@ export const agentModeController = {
         runHealth: computeScheduleRunHealth(runResults),
       }));
 
-      res.json(scheduledChatsWithHealth);
+      // ENG-1611: optional bounded pagination. With neither `limit` nor `cursor`
+      // the legacy bare-array response is preserved for the portal; any caller
+      // that opts in gets `{ items, nextCursor }` with a hard page-size cap.
+      const page = parseScheduledChatsPage(req.query);
+      if (page === null) {
+        res.json(scheduledChatsWithHealth);
+        return;
+      }
+      if ('error' in page) {
+        return res.status(400).json({ error: page.error });
+      }
+      const items = scheduledChatsWithHealth.slice(page.offset, page.offset + page.limit);
+      const nextOffset = page.offset + items.length;
+      res.json({
+        items,
+        nextCursor: nextOffset < scheduledChatsWithHealth.length ? encodeScheduledChatsCursor(nextOffset) : null,
+      });
     } catch (error) {
       console.error('AgentMode: Get scheduled chats error:', error);
       res.status(500).json({ error: 'Failed to get scheduled chats' });
@@ -13242,7 +13370,8 @@ export const agentModeController = {
         requirePublishApproval,
         requireSlackApproval,
         disableSourcingBlockAlerts,
-        timezone
+        timezone,
+        emailNotificationsOptOut
       } = req.body;
 
       // Verify schedule exists and belongs to user (before validation so we can merge)
@@ -13327,12 +13456,17 @@ export const agentModeController = {
       // Determine nextRunTime: use provided value or keep existing
       let scheduledNextRunTime = existingSchedule.nextRunTime;
       let shouldUpdateNextRunTime = false;
+      const effectiveTimezone: string | undefined = isValidIanaTimeZone(timezone)
+        ? timezone
+        : (isValidIanaTimeZone((existingSchedule as any).timezone) ? (existingSchedule as any).timezone : undefined);
       if (nextRunTime) {
-        const providedDate = new Date(nextRunTime);
-        if (isNaN(providedDate.getTime())) {
-          return res.status(400).json({ error: 'Invalid nextRunTime format' });
+        // Opslane 2026-10-13: an offset-less time is read in the request's or the
+        // schedule's stored timezone, or refused.
+        const resolved = resolveScheduleRunTime(nextRunTime, effectiveTimezone);
+        if ('error' in resolved) {
+          return res.status(400).json({ error: resolved.error });
         }
-        scheduledNextRunTime = providedDate.toISOString();
+        scheduledNextRunTime = resolved.iso;
         shouldUpdateNextRunTime = true;
       }
 
@@ -13469,7 +13603,9 @@ export const agentModeController = {
       // had one is allowed to stay that way.
       const hadEmailNotifications =
         normalizeEmailList(existingSchedule.emailNotifications || []).length > 0;
-      if (effectiveEmailNotifications.length === 0 && hadEmailNotifications) {
+      // Opslane 2026-10-13: an explicit opt-out (MCP `email_notifications: []`) may clear them.
+      const clearingEmailOnPurpose = emailNotificationsOptOut === true && emailNotifications !== undefined;
+      if (effectiveEmailNotifications.length === 0 && hadEmailNotifications && !clearingEmailOnPurpose) {
         return res.status(400).json({ error: 'At least one email notification is required for scheduled chats' });
       }
 
@@ -13659,6 +13795,8 @@ export const agentModeController = {
       res.json({
         message: 'Scheduled chat updated successfully',
         nextRunTime: scheduledNextRunTime,
+        ...runTimeInOwnerZone(scheduledNextRunTime, effectiveTimezone),
+        emailNotifications: effectiveEmailNotifications,
         ...scheduleBackup,
         backupSelectionRequired: scheduleBackup.llmBackupNeedsConfirmation,
       });
@@ -15832,17 +15970,52 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Access denied to this session' });
       }
 
-      // A STORED model is not an explicit selection: when it is retired or not
-      // selectable by the owner, store the current default instead (as /generate
-      // does) so runVerifiedChat, which reads the session, never runs the stored one.
-      if (session.llmModel) {
-        const storedPolicy = await resolveEffectiveModelForUser({
-          userId: session.userId,
-          requestedModel: session.llmModel,
-          allowSilentSwap: true,
-        });
-        if (storedPolicy.modelSelection === 'corrected' && storedPolicy.effectiveModel) {
-          await chatbotDb.updateSessionLlmModel(sessionId, storedPolicy.effectiveModel, toStoredModelPolicyDecision(storedPolicy));
+      // Same allowance gate (and 429 body) as /generate, checked before the model so an
+      // exhausted account gets the 429 first, exactly as there. Interactive only: the
+      // scheduled / Slack / email / result-endpoint callers of runVerifiedChat have their own.
+      const usageStatus = await checkTokenUsage(user.userId);
+      if (!usageStatus.allowed) {
+        return res.status(429).json(await buildUsagePausedBody({
+          usageStatus,
+          session,
+          requestedModel: normalizeRequestedLlmModel(req.body?.llmModel) || session.llmModel || null,
+        }));
+      }
+
+      // The model the user picked for this chat is used as-is for the whole turn:
+      // runVerifiedChat only applies its task-type defaults (report/image/video) when
+      // it is given NO model, so passing the resolved one below disables that swap.
+      //  - EXPLICIT (the request carries `llmModel`): must run on exactly that model or
+      //    not run at all. A retired / not-selectable pick is refused with the same
+      //    422 `model_unavailable` as /generate, before the generation lock is taken.
+      //  - STORED only (session.llmModel): not explicit, because the system stamps the
+      //    configured default into it (Slack, GTM, ...). A retired / not-selectable
+      //    stored model is replaced by the current default, as /generate does.
+      //  - Neither: nothing is passed and the task-type defaults still apply.
+      // The session is only WRITTEN (beforeRun) once the lock and cap are held, so a
+      // 409 / 429 leaves the stored model untouched.
+      const explicitModel = normalizeRequestedLlmModel(req.body?.llmModel);
+      let selectedModel: string | undefined;
+      let persistSelectedModel: (() => Promise<void>) | undefined;
+      const requestedModel = explicitModel || session.llmModel;
+      if (requestedModel) {
+        let modelDecision: EffectiveModelPolicyDecision;
+        try {
+          modelDecision = await resolveEffectiveModelForUser({
+            userId: session.userId,
+            requestedModel,
+            allowSilentSwap: !explicitModel,
+          });
+        } catch (modelError) {
+          if (!isModelUnavailableError(modelError)) throw modelError;
+          return res.status(422).json(modelUnavailableBody(modelError));
+        }
+        selectedModel = modelDecision.effectiveModel || session.llmModel || undefined;
+        const effectiveModel = modelDecision.effectiveModel;
+        if (effectiveModel && (modelDecision.modelSelection === 'corrected' || effectiveModel !== session.llmModel)) {
+          persistSelectedModel = async () => {
+            await chatbotDb.updateSessionLlmModel(sessionId, effectiveModel, toStoredModelPolicyDecision(modelDecision));
+          };
         }
       }
 
@@ -15883,13 +16056,14 @@ export const agentModeController = {
         requiredFunctions: requiredFunctionsArray,
         maxAttempts: maxAttemptsParam || 5,
         attachments: attachmentsArray,
+        llmModel: selectedModel,
         // ENG-636: interactive endpoint — the user's live session renders the
         // deck-of-one card, so a park reaches a human who can answer.
         parkNotifiable: true,
         // ENG-2072: a real person is watching this turn — never force hands-off
         // work-plan autocomplete, even if this session happens to be scheduled.
         isUnattendedRun: false
-      }, { capInteractiveUserId: session.userId }));
+      }, { capInteractiveUserId: session.userId, beforeRun: persistSelectedModel }));
 
       // If client disconnected, don't try to send response
       // The results are already saved to the session

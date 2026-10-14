@@ -2762,7 +2762,7 @@
   {
     "name": "manage_scheduled_chat",
     "listed": false,
-    "description": "Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: \"create\", \"update\", \"toggle\", or \"delete\". For \"create\": schedule_name, starting_message, and schedule_frequency are REQUIRED — do not call with action \"create\" unless you have all three. email_notifications is optional but strongly recommended — without it, the user gets no automatic notification when a run completes. For \"update\": schedule_id is required; omit any field to keep its existing value — if you provide email_notifications it must be non-empty. IMPORTANT: When email_notifications is configured on the schedule, the system automatically emails results after every run — do NOT include notify_session or any email-sending instruction in starting_message, as that would cause duplicate emails (one from the system, one from the AI executing the tool).",
+    "description": "Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: \"create\", \"update\", \"toggle\", or \"delete\". For \"create\": schedule_name, starting_message, and schedule_frequency are REQUIRED — do not call with action \"create\" unless you have all three. email_notifications: omit it to email results to the requesting user by default; pass [] ONLY when the user explicitly declines email (no emails are sent). For \"update\": schedule_id is required; omit any field to keep its existing value — email_notifications: [] turns emails off. next_run_time must carry a UTC offset (e.g. 2026-10-19T09:00:00-04:00), or pass timezone (the user IANA zone) and give next_run_time as local time in that zone. The result echoes what was stored — nextRunTime, nextRunTimeLocal (in the schedule timezone) and emailNotifications; tell the user those stored values, not what you intended to send. IMPORTANT: When email_notifications is configured on the schedule, the system automatically emails results after every run — do NOT include notify_session or any email-sending instruction in starting_message, as that would cause duplicate emails (one from the system, one from the AI executing the tool).",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2798,7 +2798,11 @@
         },
         "next_run_time": {
           "type": "string",
-          "description": "ISO 8601 datetime for the first/next run (create/update)"
+          "description": "ISO 8601 datetime for the first/next run (create/update). Include a UTC offset (2026-10-19T09:00:00-04:00), or omit the offset AND pass timezone so it is read as local time in that zone. An offset-less time with no timezone is rejected."
+        },
+        "timezone": {
+          "type": "string",
+          "description": "The user's IANA timezone, e.g. America/New_York (create/update). Used to interpret an offset-less next_run_time and stored on the schedule for its local-calendar cadence."
         },
         "description": {
           "type": "string",
@@ -2827,7 +2831,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Email addresses for notifications (optional for create/update but strongly recommended — without it, the user gets no automatic notification when a run completes; if provided, must be non-empty)"
+          "description": "Email addresses that receive results after every run (create/update). Omit on create to default to the requesting user's email; omit on update to keep the current recipients. Pass [] only when the user explicitly does not want email — that stores no recipients and sends nothing."
         },
         "daily_digest": {
           "type": "boolean",

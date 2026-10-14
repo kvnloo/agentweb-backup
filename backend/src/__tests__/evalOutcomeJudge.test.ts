@@ -54,6 +54,12 @@ describe('summarizeReplay', () => {
     expect(s.shareAt5).toBeCloseTo(2 / 5, 10);
     // The histogram keeps whole-number buckets for display.
     expect(s.histogram).toEqual({ 1: 0, 2: 1, 3: 0, 4: 0, 5: 4 });
+    // ENG-2138: the rounded share is a separate field, so the two printed numbers are not confused.
+    expect(s.shareRoundingTo5).toBeCloseTo(4 / 5, 10);
+  });
+
+  it('has no rounded share for an empty replay', () => {
+    expect(summarizeReplay([])).toEqual(expect.objectContaining({ shareAt5: null, shareRoundingTo5: null }));
   });
 
   it('reports AUC, share at 5, histogram, means and per-model rows from n >= 5', () => {

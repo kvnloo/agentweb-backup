@@ -568,12 +568,14 @@ describe('HubspotAdapter.pushLeads — batched push path', () => {
     // The deal stage (Stage 4) runs AFTER the Stage 3 synced writeback, so the
     // LAST writeback for the lead is authoritative. It must carry the NEW
     // recreated dealId — never the stale (deleted) one. With the in-memory
-    // syncMetadata propagation, that final writeback also preserves the fresh
-    // upsert contact id (c_a@b.com) + synced status — confirming the clobber fix.
+    // syncMetadata propagation, that final writeback also preserves the contact id
+    // + synced status — confirming the clobber fix. The lead carries a stored
+    // contact id (c1), which the push now updates in place (ENG-2171) instead of
+    // replacing it with an upsert-by-email result; this used to assert 'c_a@b.com'.
     const allWritebacks = (crmDb.updateLead as jest.Mock).mock.calls.filter((c) => c[1] === 'l1');
     const finalMeta = allWritebacks[allWritebacks.length - 1][2].syncMetadata;
     expect(finalMeta.hubspot_deal_id).toBe('deal_recreated_l1');
-    expect(finalMeta.hubspot_contact_id).toBe('c_a@b.com');
+    expect(finalMeta.hubspot_contact_id).toBe('c1');
     expect(finalMeta.syncStatus).toBe('synced');
     // The recreated dealId is the authoritative final value — the stale id is
     // never the lead's final persisted deal id.

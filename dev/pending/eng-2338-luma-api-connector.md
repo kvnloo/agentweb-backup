@@ -1,7 +1,0 @@
-## ENG-2338: Luma sign-in cannot be automated from our infrastructure; use the Luma API instead (2026-10-12)
-
-- Prod session bf7f3c5f: first-ever Luma login (the user's cookie jar held only anonymous Luma cookies, no `luma.auth-session-key`) was stopped by the "Verifying Your Browser" gate, which never cleared.
-- Reproduced from the autofix box with the production launch args + stealth script, then headless/headed (Xvfb) x spoofed/native user agent: all four variants show the gate after "Continue with Email" and none reach the code step in 90s. It is not the headless flag, the user-agent spoof or the stealth script; the likely cause is datacenter-IP reputation (untested — no alternate egress available).
-- Fix: Luma calendar API key as a connected account (`platform: 'luma'`, `POST /api/oauth/luma/connect`). Tools `luma_list_events` / `luma_get_guests` call `public-api.luma.com` (header `x-luma-api-key`; 200 req/min per calendar; Luma Plus required; keys are per-calendar). The key is encrypted at rest with `encryptPassword(key, userId)` inside `config.access_token`.
-- The guest list is read newest-registration-first with `sort_column=registered_at&sort_direction=desc nulls last`; entries with no `registered_at` are invited-never-registered and are dropped. A page is never split, so `next_cursor` resumes exactly; de-duplicate on `guest_id`.
-- Without a key the tools say so and the agent keeps the existing browser/session-cookie fallback.

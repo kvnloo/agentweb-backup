@@ -1,8 +1,8 @@
 export type { LlmTransport, LlmTransportRetryOptions, BackoffDecision } from "./llmTransport";
 export { OpenRouterPlatformTransport } from "./openRouterPlatformTransport";
-export { ApiKeyTransport, CustomerRouteError } from "./apiKeyTransport";
+export { ApiKeyTransport, CustomerRouteError, pinToCustomerProvider } from "./apiKeyTransport";
 export { registerCustomerRouteProvisioner, getCustomerRouteProvisioner } from "./customerRouteProvisioner";
-export type { CustomerRouteProvisioner } from "./customerRouteProvisioner";
+export type { CustomerRouteProvisioner, MessagesClient } from "./customerRouteProvisioner";
 
 import type { RunFunding } from "../runFunding";
 import type { LlmTransport } from "./llmTransport";

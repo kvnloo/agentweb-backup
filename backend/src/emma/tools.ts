@@ -7507,8 +7507,15 @@ const SELF_ONLY_BRIDGE_DEFINITIONS: Record<string, { description: string; inputS
     inputSchema: { type: 'object', properties: {}, required: [] },
   },
   list_scheduled_chats: {
-    description: 'List all scheduled chats for the authenticated user.',
-    inputSchema: { type: 'object', properties: {}, required: [] },
+    description: 'List scheduled chats (newest first) for the authenticated user. Paginated: returns { items, nextCursor }; pass nextCursor back as cursor for the next page (null = last page).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Page size (default 50, max 100)' },
+        cursor: { type: 'string', description: 'Opaque nextCursor from a previous page' },
+      },
+      required: [],
+    },
   },
 };
 
