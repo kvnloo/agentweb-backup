@@ -1044,6 +1044,45 @@ describe('AgentModeService - Skills', () => {
     });
   });
 
+  describe('describeToolGateRefusal (ENG-2299)', () => {
+    const published = [
+      { skillId: 'ads', name: 'Ads', toolNames: ['call_ads'], isPublished: true },
+      { skillId: 'draft', name: 'Draft', toolNames: ['call_draft'], isPublished: false },
+    ];
+
+    beforeEach(() => {
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue([
+        { name: 'call_ads', definition: {} },
+        { name: 'call_draft', definition: {} },
+        { name: 'loose_tool', definition: {} },
+      ] as any);
+    });
+
+    it('reports a claimed tool as not installed and not in the pool', () => {
+      const d = agentModeService.describeToolGateRefusal('call_ads', published, [], ['ads', '__other_skills__']);
+      expect(d.claimedBy).toEqual([{ skillId: 'ads', installed: false, tierAllows: true }]);
+      expect(d.inOtherSkillsPool).toBe(false);
+      expect(d.otherSkillsInstalled).toBe(false);
+      expect(d.tierAllowsOtherSkills).toBe(true);
+    });
+
+    it('reports an unclaimed tool as in the pool, and ignores unpublished claimers', () => {
+      const loose = agentModeService.describeToolGateRefusal('loose_tool', published, ['__other_skills__'], ['*']);
+      expect(loose.inOtherSkillsPool).toBe(true);
+      expect(loose.claimedBy).toEqual([]);
+      expect(loose.otherSkillsInstalled).toBe(true);
+      const draft = agentModeService.describeToolGateRefusal('call_draft', published, [], ['*']);
+      expect(draft.claimedBy).toEqual([]);
+      expect(draft.inOtherSkillsPool).toBe(true);
+    });
+
+    it('marks a claiming skill the tier does not allow', () => {
+      const d = agentModeService.describeToolGateRefusal('call_ads', published, ['ads'], ['other']);
+      expect(d.claimedBy).toEqual([{ skillId: 'ads', installed: true, tierAllows: false }]);
+      expect(d.tierAllowsOtherSkills).toBe(false);
+    });
+  });
+
   describe('getUnassociatedTools', () => {
     it('should return tools not associated with any published skill', () => {
       const publishedSkills = [
