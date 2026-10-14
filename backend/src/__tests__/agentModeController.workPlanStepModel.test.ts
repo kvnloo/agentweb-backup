@@ -523,3 +523,68 @@ describe('switch state UNKNOWN (settings outage, no last-known value) honours th
     expect(workerModels()).toEqual(['gpt-5.5', 'gemini-3.5-flash']);
   });
 });
+
+describe('round 2: standing pick, restore retry, pause idempotence', () => {
+  const wp = (extra: any = {}) => ({ steps: [step(1, 'completed', 'gpt-5.5'), step(2, 'pending')], planDefaultModel: 'gemini-3.5-flash', launchModel: 'gpt-5-chat-2', engineModel: 'gpt-5.5', ...extra });
+
+  it('N3: a pick made on a model-less step STANDS for the following turns (stamp = pick, no restamp to the default)', async () => {
+    // turn 1: the user picks claude-step-model on model-less step 2 (stored stamp is the engine's gpt-5.5)
+    db.getChatSession.mockResolvedValue(makeSession(wp(), 'gpt-5.5') as any);
+    await agentModeController.generateResponse(generateReq('claude-step-model'), makeRes());
+    expect(workerModels()).toEqual(['claude-step-model']);
+    const written = db.updateSessionWorkPlan.mock.calls.map((c) => c[1] as any);
+    // the engine marker still names ITS choice, so the pick stays distinguishable from engine stamps
+    expect(written.every((w) => w.engineModel !== 'claude-step-model')).toBe(true);
+    // turn 2: the portal echoes the stamp (= the pick); the engine marker is whatever turn 1 left
+    const marker = written.length ? written[written.length - 1].engineModel : 'gpt-5.5';
+    db.getChatSession.mockResolvedValue(makeSession(wp({ engineModel: marker }), 'claude-step-model') as any);
+    db.updateSessionLlmModel.mockClear();
+    await agentModeController.generateResponse(generateReq('claude-step-model'), makeRes());
+    expect(workerModels()).toEqual(['claude-step-model', 'claude-step-model']);
+    expect(db.updateSessionLlmModel.mock.calls.every((c) => c[1] === 'claude-step-model')).toBe(true);
+  });
+
+  it('N3: when no pick was ever made the plan default still applies (stamp == engine marker)', async () => {
+    db.getChatSession.mockResolvedValue(makeSession(wp(), 'gpt-5.5') as any);
+    await agentModeController.generateResponse(generateReq('gpt-5.5'), makeRes());
+    expect(workerModels()).toEqual(['gemini-3.5-flash']);
+  });
+
+  it('N3: a pick on the very first, model-less step also stands (marker records the engine\'s own choice)', async () => {
+    const first = (extra: any = {}) => ({ steps: [step(1, 'pending'), step(2, 'pending', 'gpt-5.5')], launchModel: 'gpt-5-chat-2', ...extra });
+    db.getChatSession.mockResolvedValue(makeSession(first(), 'gpt-5-chat-2') as any);
+    await agentModeController.generateResponse(generateReq('claude-step-model'), makeRes());
+    const written = db.updateSessionWorkPlan.mock.calls.map((c) => c[1] as any);
+    expect(written[written.length - 1].engineModel).toBe('gpt-5-chat-2');
+    db.getChatSession.mockResolvedValue(makeSession(first({ engineModel: 'gpt-5-chat-2' }), 'claude-step-model') as any);
+    await agentModeController.generateResponse(generateReq('claude-step-model'), makeRes());
+    expect(workerModels()).toEqual(['claude-step-model', 'claude-step-model']);
+  });
+
+  it('restore retry: when the pre-plan model is gone the marker is cleared once, the turn runs on the request model, and it is not retried', async () => {
+    const done = { steps: [step(1, 'completed', 'gpt-5.5')], launchModel: RETIRED, engineModel: 'gpt-5.5' };
+    db.getChatSession.mockResolvedValue(makeSession(done, 'gpt-5.5') as any);
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    await agentModeController.generateResponse(generateReq('gpt-5.5'), makeRes());
+    expect(workerModels()).toEqual(['gpt-5.5']);
+    const written = db.updateSessionWorkPlan.mock.calls.map((c) => c[1] as any);
+    expect(written).toHaveLength(1);
+    expect('engineModel' in written[0]).toBe(false);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes('could not be restored'))).toBe(true);
+    warn.mockRestore();
+  });
+
+  it('M10: the pause is idempotent per step AND model: a different model or step at the tail is a new pause', async () => {
+    const tail = (stepCount: number, model: string) => ({ role: 'assistant', content: 'x', metadata: { kind: 'work-plan-step-model-unavailable', stepCount, model } });
+    const run = async (t: any) => {
+      jest.clearAllMocks();
+      db.getChatSession.mockResolvedValue(makeSession({ steps: [step(1, 'completed', 'gpt-5.5'), step(2, 'pending', RETIRED)] }, 'gemini-3.5-flash', [t]) as any);
+      db.addMessageToSession.mockResolvedValue(makeSession(undefined) as any);
+      await agentModeController.generateResponse(generateReq(), makeRes());
+      return db.addMessageToSession.mock.calls.filter((c) => (c[1] as any).metadata?.kind === 'work-plan-step-model-unavailable').length;
+    };
+    expect(await run(tail(2, RETIRED))).toBe(0);            // same step + model: no duplicate
+    expect(await run(tail(2, 'some-other-retired'))).toBe(1); // same step, different model: new pause
+    expect(await run(tail(3, RETIRED))).toBe(1);             // different step: new pause
+  });
+});

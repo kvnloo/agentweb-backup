@@ -1862,8 +1862,13 @@ function withoutStepModels(steps: any): any {
 type ResolvedStepDecision = EffectiveModelPolicyDecision & { effectiveModel: string };
 type WorkPlanStepModelTurn =
   | { kind: 'none' }
-  | { kind: 'resolved'; stepCount: number; decision: ResolvedStepDecision; updateStepModelTo?: string }
+  | {
+      kind: 'resolved'; stepCount: number; decision: ResolvedStepDecision; updateStepModelTo?: string;
+      /** The user's own pick is running on a model-less step; `engineChoice` is what the engine itself would have used. */
+      userPick?: boolean; engineChoice?: string;
+    }
   | { kind: 'restored'; decision: ResolvedStepDecision }
+  | { kind: 'restoreFailed' }
   | { kind: 'unavailable'; stepCount: number; model: string; label: string; reason: string };
 
 async function resolveWorkPlanStepModelForTurn(
@@ -1894,6 +1899,9 @@ async function resolveWorkPlanStepModelForTurn(
         return { kind: 'restored', decision: await resolveHonored(plan.launchModel, 0) };
       } catch (restoreError) {
         if (!isModelUnavailableError(restoreError)) throw restoreError;
+        // The pre-plan model is gone: do not retry every turn. The caller clears the marker; this turn runs as requested.
+        console.warn(`AgentMode: pre-plan model "${sanitizeModelLabel(plan.launchModel)}" could not be restored after the work plan finished (${restoreError.reason}); keeping the current model.`);
+        return { kind: 'restoreFailed' };
       }
     }
     return { kind: 'none' };
@@ -1903,11 +1911,17 @@ async function resolveWorkPlanStepModelForTurn(
   const ownModel = stepModelOf(step);
   const fallbackModel = (typeof plan.planDefaultModel === 'string' && plan.planDefaultModel.trim()) || (typeof plan.launchModel === 'string' && plan.launchModel.trim()) || undefined;
   // A step without a model follows "plan default, then the model the session had before the plan" (never the previous
-  // step's model); a user's explicit pick on such a step wins.
-  const candidate = ownModel ?? (options.explicitPick || fallbackModel);
+  // step's model); a user's pick on such a step wins, and keeps winning: a stored model that is not the one the engine
+  // last stamped is a standing pick by the user (the same marker the end-of-plan restore uses).
+  const standingPick = plan.engineModel && session.llmModel && session.llmModel !== plan.engineModel ? session.llmModel : undefined;
+  const userPick = ownModel ? undefined : (options.explicitPick || standingPick);
+  const candidate = ownModel ?? (userPick || fallbackModel);
   if (!candidate) return { kind: 'none' };
   try {
-    return { kind: 'resolved', stepCount, decision: await resolveHonored(candidate, stepCount) };
+    return {
+      kind: 'resolved', stepCount, decision: await resolveHonored(candidate, stepCount),
+      ...(userPick && { userPick: true, engineChoice: fallbackModel }),
+    };
   } catch (modelError) {
     if (!isModelUnavailableError(modelError)) throw modelError;
     if (options.explicitPick && candidate !== options.explicitPick) {
@@ -9142,6 +9156,13 @@ export async function generateSessionResponse(
       userMessageIndex,
     };
   }
+  if (stepModelTurn.kind === 'restoreFailed') {
+    const wpFailed: any = updatedSession.workPlan;
+    if (wpFailed?.engineModel) {
+      const { engineModel: _cleared, ...wpRest } = wpFailed;
+      await chatbotDb.updateSessionWorkPlan(sessionId, wpRest);
+    }
+  }
   if (stepModelTurn.kind === 'resolved' || stepModelTurn.kind === 'restored') {
     llmModel = stepModelTurn.decision.effectiveModel;
     if (updatedSession.llmModel !== llmModel) {
@@ -9150,7 +9171,11 @@ export async function generateSessionResponse(
     // Record what the engine stamped (so the end of the plan can tell a later explicit pick apart), adopt an explicit
     // pick on the step that lost its model, and clear the marker once the pre-plan model is restored.
     const adoptStepModel = stepModelTurn.kind === 'resolved' ? stepModelTurn.updateStepModelTo : undefined;
-    const nextEngineModel = stepModelTurn.kind === 'restored' ? undefined : llmModel;
+    // A user pick on a model-less step must stay distinguishable from engine stamps: the marker keeps naming the
+    // engine's own choice, so the pick (the stored stamp) stands for the following turns.
+    const nextEngineModel = stepModelTurn.kind === 'restored'
+      ? undefined
+      : (stepModelTurn.userPick ? (stepModelTurn.engineChoice ?? (updatedSession.workPlan as any)?.engineModel) : llmModel);
     const wp: any = updatedSession.workPlan;
     if (wp && (adoptStepModel || wp.engineModel !== nextEngineModel)) {
       const { engineModel: _previousEngineModel, ...wpRest } = wp;
