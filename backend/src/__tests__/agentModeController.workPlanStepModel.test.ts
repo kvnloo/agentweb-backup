@@ -760,3 +760,61 @@ describe('review: the user\'s pick survives the end of the plan', () => {
     expect(workerModels()).toEqual(['gpt-5.5', 'gemini-3.5-flash']);
   });
 });
+
+describe('/generate reports the model that RAN (CodeRabbit)', () => {
+  let store: any;
+  const mkStore = (wp: any, stamp: string) => {
+    store = makeSession(wp, stamp);
+    db.getChatSession.mockImplementation(async () => JSON.parse(JSON.stringify(store)));
+    db.getChatSessionRecord.mockImplementation(async () => JSON.parse(JSON.stringify(store)));
+    db.updateSessionLlmModel.mockImplementation(async (_id: string, m: string) => { store.llmModel = m; return store; });
+    db.updateSessionWorkPlan.mockImplementation(async (_id: string, w: any) => { store.workPlan = w; return store; });
+  };
+  const fields = (b: any) => ({ requestedModel: b.requestedModel, effectiveModel: b.effectiveModel, modelSelection: b.modelSelection });
+
+  it('an available step model B overrides request A: the response says B, B is what the worker ran (and stamps on the message)', async () => {
+    mkStore({ steps: [step(1, 'pending', 'gpt-5.5')] }, 'gemini-3.5-flash');
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq('gemini-3.5-flash'), res);
+    expect(workerModels()).toEqual(['gpt-5.5']);
+    expect(fields(res.body)).toEqual({ requestedModel: 'gpt-5.5', effectiveModel: 'gpt-5.5', modelSelection: 'honored' });
+  });
+
+  it('a pick that resumed a retired step: the response names the pick', async () => {
+    mkStore({ steps: [step(1, 'pending', RETIRED)], engineModel: RETIRED }, RETIRED);
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq('claude-step-model'), res);
+    expect(workerModels()).toEqual(['claude-step-model']);
+    expect(res.body.effectiveModel).toBe('claude-step-model');
+  });
+
+  it('a standing pick on a model-less step: the response names the model that ran', async () => {
+    mkStore({ steps: [step(1, 'pending'), step(2, 'pending', 'gpt-5.5')], planDefaultModel: 'gpt-5-chat-2', launchModel: 'gemini-3.5-flash', engineModel: 'gpt-5-chat-2' }, 'claude-step-model');
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq('claude-step-model'), res);
+    expect(res.body.effectiveModel).toBe(workerModels()[0]);
+    expect(res.body.effectiveModel).toBe('claude-step-model');
+  });
+
+  it('the plan default replacing a stale echo is what the response reports', async () => {
+    mkStore({ steps: [step(1, 'completed', 'gpt-5.5'), step(2, 'pending')], planDefaultModel: 'gemini-3.5-flash', launchModel: 'gpt-5-chat-2', engineModel: 'gpt-5.5' }, 'gpt-5.5');
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq('gpt-5.5'), res);
+    expect(res.body.effectiveModel).toBe('gemini-3.5-flash');
+    expect(workerModels()).toEqual(['gemini-3.5-flash']);
+  });
+
+  it('no plan: unchanged (the request-level decision)', async () => {
+    mkStore(undefined, 'gemini-3.5-flash');
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq('gemini-3.5-flash'), res);
+    expect(fields(res.body)).toEqual({ requestedModel: 'gemini-3.5-flash', effectiveModel: 'gemini-3.5-flash', modelSelection: 'honored' });
+  });
+
+  it('a plan whose steps carry no model: unchanged', async () => {
+    mkStore({ steps: [step(1, 'pending')] }, 'gemini-3.5-flash');
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq('gemini-3.5-flash'), res);
+    expect(res.body.effectiveModel).toBe('gemini-3.5-flash');
+  });
+});

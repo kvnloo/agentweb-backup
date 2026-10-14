@@ -8913,6 +8913,9 @@ export async function generateSessionResponse(
   // so the controller can lift it onto the live HTTP response (see that field's
   // own comment there for why this is needed at all).
   pendingApprovalDeck?: PendingApprovalDeck;
+  // ENG-2378: the decision for the model that actually RAN this turn when a work-plan step (or the end-of-plan restore)
+  // overrode the caller's model; callers report this, not their request-level decision. Absent = the caller's model ran.
+  modelDecision?: EffectiveModelPolicyDecision;
 }> {
   // Clear any stale cancel from a previous request on this session
   clearCancel(sessionId);
@@ -9184,7 +9187,9 @@ export async function generateSessionResponse(
       await chatbotDb.updateSessionWorkPlan(sessionId, wpRest);
     }
   }
+  let ranModelDecision: EffectiveModelPolicyDecision | undefined;
   if (stepModelTurn.kind === 'resolved' || stepModelTurn.kind === 'restored') {
+    ranModelDecision = stepModelTurn.decision;
     llmModel = stepModelTurn.decision.effectiveModel;
     if (updatedSession.llmModel !== llmModel) {
       await chatbotDb.updateSessionLlmModel(sessionId, llmModel, toStoredModelPolicyDecision(stepModelTurn.decision));
@@ -9402,7 +9407,8 @@ export async function generateSessionResponse(
     workPlan: finalSession?.workPlan,
     calledFunctions: finalSession?.calledFunctions,
     skills,
-    userMessageIndex
+    userMessageIndex,
+    ...(ranModelDecision && { modelDecision: ranModelDecision }),
   };
 }
 
@@ -10843,6 +10849,7 @@ export const agentModeController = {
         .reverse()
         .find((m: any) => m?.role === 'assistant')?.messageIndex;
 
+      const reportedModelDecision = response.modelDecision ?? modelPolicyDecision;
       res.json({
         content: response.content,
         toolCalls: response.toolCalls,
@@ -10868,15 +10875,16 @@ export const agentModeController = {
         // would match two messages at once and render the card twice.
         ...(answeredApprovalDeck ? { answeredApprovalDeck } : {}),
         ...(deckCancelled ? { deckCancelled: true } : {}),
-        ...(modelPolicyDecision ? {
-          requestedModel: modelPolicyDecision.requestedModel,
-          effectiveModel: modelPolicyDecision.effectiveModel,
-          backupModel: modelPolicyDecision.backupModel,
-          backupSource: modelPolicyDecision.backupSource,
-          modelSelection: modelPolicyDecision.modelSelection,
-          modelSelectionReason: modelPolicyDecision.reason,
-          usageMode: modelPolicyDecision.usageMode,
-          usagePolicyVersion: modelPolicyDecision.usagePolicyVersion,
+        // Report the model that RAN: a work-plan step override beats the request-level decision.
+        ...(reportedModelDecision ? {
+          requestedModel: reportedModelDecision.requestedModel,
+          effectiveModel: reportedModelDecision.effectiveModel,
+          backupModel: reportedModelDecision.backupModel,
+          backupSource: reportedModelDecision.backupSource,
+          modelSelection: reportedModelDecision.modelSelection,
+          modelSelectionReason: reportedModelDecision.reason,
+          usageMode: reportedModelDecision.usageMode,
+          usagePolicyVersion: reportedModelDecision.usagePolicyVersion,
         } : {}),
       });
 
