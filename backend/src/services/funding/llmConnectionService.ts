@@ -248,12 +248,13 @@ export class LlmConnectionService {
     // Only the call that actually revoked it owned that slot; a second revoke of an
     // already-revoked connection must not release a slot that was already freed.
     if (didRevoke) {
-      await this.deps.db.releaseSlot(record.ownerUserId);
+      // Stop a running holder first: the revoke is committed whatever happens to the slot bookkeeping after it.
       try {
         this.deps.onRevoked?.(connectionId);
       } catch {
         /* a holder in another process notices at its next heartbeat */
       }
+      await this.deps.db.releaseSlot(record.ownerUserId);
     }
   }
 

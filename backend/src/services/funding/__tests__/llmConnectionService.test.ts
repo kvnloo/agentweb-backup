@@ -401,6 +401,13 @@ describe('LlmConnectionService', () => {
       expect(onRevoked).toHaveBeenCalledWith('login-1');
     });
 
+    it('still tells the revoke hook when the slot bookkeeping afterwards fails', async () => {
+      const { service, store, onRevoked } = await withLogin();
+      jest.spyOn(store.db, 'releaseSlot').mockRejectedValue(new Error('dynamo blip'));
+      await expect(service.revoke({ userId: 'solo' }, 'login-1')).rejects.toBeTruthy();
+      expect(onRevoked).toHaveBeenCalledWith('login-1'); // the revoke was committed: the holder must still be stopped
+    });
+
     it('is revoked like any connection: the sealed login is gone and the slot is freed', async () => {
       const { service, store } = await withLogin();
       await service.revoke({ userId: 'solo' }, 'login-1');

@@ -612,6 +612,46 @@ describe('withLogin: the single live copy', () => {
       expect(JSON.parse(await openSecret(ctx.kms, row.sealed!, { connectionId: 'sub-x', ownerUserId: 'user-1', provider: 'anthropic', purpose: 'claude_login' })).claudeAiOauth.refreshToken).toBe('SENTINEL-REFRESH-B');
     });
 
+    it('a failed READ while checking a stale save is retried, never read as a lost login', async () => {
+      const ctx = setup({ deps: { persistRetryMs: 40, persistMaxMs: 4000 } });
+      await seedLogin(ctx);
+      const realSave = ctx.db.saveSubCredentials.bind(ctx.db);
+      const realGet = ctx.db.get.bind(ctx.db);
+      let saves = 0;
+      let armed = false;
+      let readFailures = 0;
+      const err = quiet();
+      jest.spyOn(ctx.db, 'saveSubCredentials').mockImplementation(async (...a) => {
+        saves++;
+        if (saves < 3) throw new Error('down');
+        if (saves === 3) { await realSave(...a); throw new Error('response lost after commit'); } // login A committed, no answer
+        return realSave(...a); // later retries: stale (A is already stored)
+      });
+      // On a stale save the store itself reads once (to tell stale from revoked), then the service reads again to
+      // check whether the stored copy is its own earlier write. Fail THAT second read, once.
+      let armedReads = 0;
+      jest.spyOn(ctx.db, 'get').mockImplementation(async (id: string) => {
+        if (armed && armedReads++ === 1) { readFailures++; throw new Error('read blip'); }
+        return realGet(id);
+      });
+      let aborted = false;
+      const res = await ctx.service.withLogin('sub-x', 'user-1', async ({ configDir, signal }) => {
+        armed = true;
+        signal.addEventListener('abort', () => (aborted = true));
+        rewrite(configDir, credsText({ refreshToken: 'SENTINEL-REFRESH-A' }));
+        await sleep(SAVE_DEBOUNCE_MS + 900); // all three attempts are over: the save is reported failed
+      });
+      expect(['ok', 'save_failed']).toContain(res.status); // depends on how many file-watch events fire; both are legitimate
+      await sleep(1500); // any background retry meets "stale", its read fails once, then succeeds and adopts A
+      err.mockRestore();
+      expect(readFailures).toBeGreaterThanOrEqual(1);
+      expect(aborted).toBe(false); // a failed read is not a lost login
+      const row = (await realGet('sub-x'))!;
+      expect(row.subVersion).toBe(2);
+      expect(homeDirs(ctx.tmpRoot)).toEqual([]); // saved, so the dir was wiped and the lease released
+      expect(row.subLeaseOwner).toBeUndefined();
+    });
+
     it('a revoke in this process stops the running holder at once, as revoked, and wipes the login dir', async () => {
       const ctx = setup();
       await seedLogin(ctx);
@@ -797,6 +837,28 @@ describe('withLogin: the single live copy', () => {
       expect(aborted).toBe(true);
       expect((await p).status).toBe('revoked');
       expect(homeDirs(ctx.tmpRoot)).toEqual([]);
+    });
+
+    it('stops the caller at once on a lost lease even when the follow-up read hangs, then ends as "lost" after its deadline', async () => {
+      jest.useFakeTimers();
+      const ctx = setup();
+      await seedLogin(ctx);
+      const realGet = ctx.db.get.bind(ctx.db);
+      let hang = false;
+      jest.spyOn(ctx.db, 'get').mockImplementation((id: string) => (hang ? new Promise(() => undefined) : realGet(id)));
+      let abortedAt = -1;
+      const t0 = Date.now();
+      const p = ctx.service.withLogin('sub-x', 'user-1', async ({ signal }) => {
+        await new Promise<void>((resolve) => signal.addEventListener('abort', () => { abortedAt = Date.now() - t0; resolve(); }));
+      });
+      await jest.advanceTimersByTimeAsync(1000);
+      hang = true;
+      await ctx.db.revoke('sub-x', { userId: 'user-1' }, new Date().toISOString());
+      await jest.advanceTimersByTimeAsync(HEARTBEAT_MS + 500);
+      expect(abortedAt).toBeGreaterThan(0); // stopped at the heartbeat, not after the hung read
+      expect(abortedAt).toBeLessThan(HEARTBEAT_MS + 600);
+      await jest.advanceTimersByTimeAsync(4000); // the read's own deadline passes
+      expect((await p).status).toBe('lost');
     });
 
     it('aborts when another holder has taken the lease', async () => {

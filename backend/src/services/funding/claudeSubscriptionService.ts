@@ -60,6 +60,8 @@ export const ABORT_GRACE_MS = 10_000;
 /** When a save-back keeps failing, retry this often, for at most this long, while still holding the lease. */
 export const PERSIST_RETRY_MS = 5_000;
 export const PERSIST_MAX_MS = 10 * 60 * 1000;
+/** How long the "was it revoked?" read may take before the run just ends as lost. */
+export const WHY_LOST_TIMEOUT_MS = 3_000;
 /** A recovery pass leaves a login dir younger than this alone if its marker is missing (it is still being set up). */
 export const YOUNG_DIR_MS = 60_000;
 /** A login dir recorded by another host is left alone this long, then treated as abandoned. */
@@ -392,7 +394,8 @@ export class ClaudeSubscriptionService {
           if (res === "stale") {
             // An earlier attempt may have committed although its response never arrived. A stored copy that is
             // held by us, newer than our version, and has content WE tried to save in this run is our own write.
-            const cur = await db.get(connectionId).catch(() => null);
+            // A failed read here throws into the retry path below: a transient error must never be read as "lost".
+            const cur = await db.get(connectionId);
             if (cur && !cur.revokedAt && cur.subLeaseOwner === owner && cur.subVersion !== undefined && cur.subVersion > version && attemptedHashes.has(cur.subContentHash ?? "")) {
               if (cur.subContentHash === hash) return succeeded(cur.subVersion); // exactly this content: done
               // An OLDER refresh of ours landed. Build on it: the newest content still has to go in, on top.
@@ -429,6 +432,26 @@ export class ClaudeSubscriptionService {
       /* the final save below still covers it */
     }
 
+    // Why the lease was lost (revoked or not) is read separately and with a deadline, and the final status waits for it,
+    // so a hung read can delay the answer but never the stop.
+    let whyLost: Promise<void> | undefined;
+    const lookUpWhyLost = () => {
+      whyLost ??= (async () => {
+        try {
+          const now = await Promise.race([
+            db.get(connectionId),
+            new Promise<never>((_, reject) => {
+              const t = setTimeout(() => reject(new Error("timeout")), WHY_LOST_TIMEOUT_MS);
+              t.unref?.();
+            }),
+          ]);
+          if (!now || now.revokedAt) lost = lost ?? "revoked";
+        } catch {
+          /* unknown, not revoked: the lease loss alone already stopped the caller */
+        }
+      })();
+    };
+
     const heartbeat = setInterval(() => {
       void (async () => {
         try {
@@ -437,14 +460,8 @@ export class ClaudeSubscriptionService {
           else {
             // Someone else holds it now, or it was revoked: stop the CLI before a second copy can refresh.
             leaseLost = true;
-            // Find out WHY before stopping the caller: once it stops, the run may finish and compute its status.
-            try {
-              const now = await db.get(connectionId);
-              if (!now || now.revokedAt) lost = lost ?? "revoked";
-            } catch {
-              /* unknown, not revoked: the lease loss alone already stops the caller */
-            }
-            stop("lease_lost");
+            stop("lease_lost"); // never wait on a read before stopping the caller
+            lookUpWhyLost();
           }
         } catch {
           /* the watchdog decides */
@@ -455,6 +472,7 @@ export class ClaudeSubscriptionService {
       if (this.deps.now() > confirmedUntil - SKEW_MARGIN_MS) {
         leaseLost = true;
         stop("lease_unconfirmed");
+        lookUpWhyLost();
       }
     }, WATCHDOG_MS);
     heartbeat.unref?.();
@@ -502,6 +520,7 @@ export class ClaudeSubscriptionService {
 
     await enqueue();
     await queue;
+    await whyLost;
     const status: LoginStatus = lost === "revoked" || abortedAsRevoked ? "revoked" : lost || leaseLost ? "lost" : saveFailed ? "save_failed" : "ok";
     if (status === "save_failed") {
       // The refreshed login exists only in this dir. Keep the lease alive and keep trying in the
