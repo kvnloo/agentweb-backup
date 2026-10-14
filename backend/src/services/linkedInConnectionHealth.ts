@@ -481,6 +481,9 @@ async function notify(params: {
       disconnectedAt: params.disconnectedAt,
       isReminder: params.isReminder,
       'Alert Class': linkedInDisconnectAlertClass(params.accountId),
+      // ENG-2492: pre-ENG-2363 canonicals (ENG-2229/2230) carry no Alert Class line; key the
+      // fold on their `accountId:` context line so reminders comment instead of re-filing.
+      'Alert Legacy Key': `accountId: ${params.accountId}`,
     },
     dedupeKey: `unipile_disconnected:${params.accountId}`,
     dedupeWindowMs: 12 * 60 * 60 * 1000,
