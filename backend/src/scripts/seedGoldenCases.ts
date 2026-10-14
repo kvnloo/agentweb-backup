@@ -3,7 +3,7 @@
  *
  * Usage:
  *   npx ts-node --transpile-only src/scripts/seedGoldenCases.ts [--fp-catalogue <file>]
- *     [--target-agent N] [--target-creative N] [--target-account-health N] [--gated-creatives] [--write]
+ *     [--target-agent N] [--target-creative N] [--target-account-health N] [--gated-creatives] [--ad-connected-accounts] [--write]
  *
  * Reads (read-only, projected scans — ids and flags only):
  *   AW-ChatSessions   sessionId, satisfactionScore.adminOverride, userId, createdAt, sessionType, messageCount
@@ -32,6 +32,7 @@ import AWS from 'aws-sdk';
 import { readFileSync } from 'fs';
 import { paginatedScan } from '../utils/dynamoPagination';
 import {
+  AD_PLATFORMS,
   buildSeedCases,
   parseFpCatalogue,
   type FpCatalogue,
@@ -54,6 +55,8 @@ export interface Args {
   fpCatalogue?: string;
   /** Add `gated_candidate` creative cases: candidates that carry a stored creative-gate result (ENG-2226). */
   gatedCreatives?: boolean;
+  /** Take every account with an ad platform connected first (ENG-2135). */
+  adConnectedAccounts?: boolean;
   write: boolean;
   targets: Partial<Record<EvalSurface, number>>;
 }
@@ -65,6 +68,7 @@ export function parseArgs(argv: string[]): Args {
     const surface = TARGET_FLAGS[flag];
     if (flag === '--write') args.write = true;
     else if (flag === '--gated-creatives') args.gatedCreatives = true;
+    else if (flag === '--ad-connected-accounts') args.adConnectedAccounts = true;
     else if (flag === '--fp-catalogue') args.fpCatalogue = argv[++i];
     else if (surface) {
       const raw = argv[++i];
@@ -97,6 +101,8 @@ interface UserItem {
   userId?: string;
   subscription_status?: string;
   isAdmin?: boolean;
+  /** Read only to learn which platforms are connected; the connection config (tokens) is never kept or printed. */
+  connected_accounts?: Array<{ platform?: string }>;
 }
 
 async function loadInputs(client: AWS.DynamoDB.DocumentClient) {
@@ -132,9 +138,18 @@ async function loadInputs(client: AWS.DynamoDB.DocumentClient) {
   const users: SeedUserRow[] = (
     await paginatedScan<UserItem>(client, {
       TableName: `${TABLE_PREFIX}AW-Users`,
-      ProjectionExpression: 'userId, subscription_status, isAdmin',
+      ProjectionExpression: 'userId, subscription_status, isAdmin, connected_accounts',
     })
-  ).flatMap((u) => (u.userId ? [{ userId: u.userId, subscriptionStatus: u.subscription_status, isAdmin: u.isAdmin === true }] : []));
+  ).flatMap((u) =>
+    u.userId
+      ? [{
+          userId: u.userId,
+          subscriptionStatus: u.subscription_status,
+          isAdmin: u.isAdmin === true,
+          hasAdPlatform: (u.connected_accounts ?? []).some((a) => !!a?.platform && AD_PLATFORMS.has(a.platform)),
+        }]
+      : [],
+  );
 
   return { sessions, candidates, users };
 }
@@ -156,6 +171,7 @@ async function main(): Promise<void> {
     ...(fpCatalogue ? { fpCatalogue } : {}),
     ...(Object.keys(args.targets).length ? { targets: args.targets } : {}),
     ...(args.gatedCreatives ? { gatedCreatives: true } : {}),
+    ...(args.adConnectedAccounts ? { adConnectedAccounts: true } : {}),
     now: new Date(),
   });
 
