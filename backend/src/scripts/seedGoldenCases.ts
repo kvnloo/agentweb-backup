@@ -6,7 +6,8 @@
  *     [--target-agent N] [--target-creative N] [--target-account-health N] [--write]
  *
  * Reads (read-only, projected scans — ids and flags only):
- *   AW-ChatSessions   sessionId, satisfactionScore.adminOverride
+ *   AW-ChatSessions   sessionId, satisfactionScore.adminOverride, userId, createdAt, sessionType, messageCount
+ *                     (the last four only decide `sampled_session` eligibility; no message bodies)
  *   AW-HumanEvalQueue candidateId, reviewType, reviewerSlackUserId, feedback (only each reply's slackUserId is kept)
  *   AW-Users          userId, subscription_status, isAdmin
  * (`Dev-` tables when NODE_ENV=development, as everywhere else.)
@@ -75,6 +76,10 @@ export function parseArgs(argv: string[]): Args {
 interface SessionItem {
   sessionId: string;
   satisfactionScore?: { adminOverride?: boolean };
+  userId?: string;
+  createdAt?: string;
+  sessionType?: string;
+  messageCount?: number;
 }
 
 interface CandidateItem {
@@ -94,9 +99,16 @@ async function loadInputs(client: AWS.DynamoDB.DocumentClient) {
   const sessions: SeedSessionRow[] = (
     await paginatedScan<SessionItem>(client, {
       TableName: `${TABLE_PREFIX}AW-ChatSessions`,
-      ProjectionExpression: 'sessionId, satisfactionScore.adminOverride',
+      ProjectionExpression: 'sessionId, satisfactionScore.adminOverride, userId, createdAt, sessionType, messageCount',
     })
-  ).map((s) => ({ sessionId: s.sessionId, adminOverride: s.satisfactionScore?.adminOverride === true }));
+  ).map((s) => ({
+    sessionId: s.sessionId,
+    adminOverride: s.satisfactionScore?.adminOverride === true,
+    ...(s.userId ? { userId: s.userId } : {}),
+    ...(s.createdAt ? { createdAt: s.createdAt } : {}),
+    ...(s.sessionType ? { sessionType: s.sessionType } : {}),
+    ...(typeof s.messageCount === 'number' ? { messageCount: s.messageCount } : {}),
+  }));
 
   const candidates: SeedCandidateRow[] = (
     await paginatedScan<CandidateItem>(client, {
