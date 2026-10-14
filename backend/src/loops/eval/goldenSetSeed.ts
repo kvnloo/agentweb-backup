@@ -49,6 +49,16 @@ export interface SeedUserRow {
   userId: string;
   subscriptionStatus?: string;
   isAdmin?: boolean;
+  /** At least one connected ad platform (Meta, Google Ads or LinkedIn Ads); organic and outreach connections do not count. */
+  hasAdPlatform?: boolean;
+}
+
+/** Platforms that carry ad delivery. Outreach (unipile, linkedin), mail, drive and CRM connections are not ad platforms. */
+export const AD_PLATFORMS: ReadonlySet<string> = new Set(['meta', 'google_ads', 'linkedin_ads']);
+
+/** A tombstoned (deleted) or synthetic evaluation account has no health state to label. */
+function isLabellableAccount(u: SeedUserRow): boolean {
+  return !u.isAdmin && !u.userId.startsWith('deleted_') && !isEvaluationUser(u.userId);
 }
 
 /** Off-repo input: which sessions each false-positive issue names, and which session turn backs
@@ -66,6 +76,8 @@ export interface SeedInputs {
   targets?: Partial<Record<EvalSurface, number>>;
   /** Opt in to `gated_candidate` creative cases (see seedCreative). Off by default so a plain run never adds them. */
   gatedCreatives?: boolean;
+  /** Opt in to taking every ad-connected account first (see seedAccount). Off by default. */
+  adConnectedAccounts?: boolean;
   now: Date;
 }
 
@@ -196,27 +208,43 @@ function seedCreative(inputs: SeedInputs, target: number) {
   return { eligible: [...reviewed, ...gated], selected: [...first, ...gated].slice(0, Math.max(target, 0)) };
 }
 
-function seedAccount(inputs: SeedInputs, target: number) {
+function seedAccount(inputs: SeedInputs, target: number, adConnectedFirst: boolean) {
   const build = (status: 'canceled' | 'active') =>
     inputs.users
-      .filter((u) => !u.isAdmin && u.subscriptionStatus === status)
+      .filter((u) => isLabellableAccount(u) && u.subscriptionStatus === status)
       .map((u) => newGoldenCase({ surface: 'account_health', taskType: `subscription_${status}`, sourceId: u.userId, seedSource: `subscription_status:${status}`, now: inputs.now }))
       .sort(hashOrder);
   const canceled = build('canceled');
   const active = build('active');
-  // Balance the two classes; if one runs short the other fills the remainder.
-  const half = Math.ceil(target / 2);
-  let nCanceled = Math.min(canceled.length, half);
-  const nActive = Math.min(active.length, target - nCanceled);
-  nCanceled = Math.min(canceled.length, target - nActive);
-  return { eligible: [...canceled, ...active], selected: [...canceled.slice(0, nCanceled), ...active.slice(0, nActive)] };
+  const balanced = (n: number, from: { canceled: GoldenCase[]; active: GoldenCase[] }) => {
+    // Balance the two classes; if one runs short the other fills the remainder.
+    const half = Math.ceil(n / 2);
+    let nCanceled = Math.min(from.canceled.length, half);
+    const nActive = Math.min(from.active.length, n - nCanceled);
+    nCanceled = Math.min(from.canceled.length, n - nActive);
+    return [...from.canceled.slice(0, nCanceled), ...from.active.slice(0, nActive)];
+  };
+  if (!adConnectedFirst) return { eligible: [...canceled, ...active], selected: balanced(target, { canceled, active }) };
+
+  // ENG-2135: subscription status is a poor stratifier for health. About 27 of ~490 users have an ad platform
+  // connected, and they are the only source of `healthy` and `at_risk` examples (a 30-account sample by
+  // subscription status came out 22 activation_incomplete / 3 healthy / 2 at_risk). Take every ad-connected
+  // account first, in hash order, then fill the rest with the balanced subscription sample.
+  const adConnected = inputs.users
+    .filter((u) => isLabellableAccount(u) && u.hasAdPlatform === true)
+    .map((u) => newGoldenCase({ surface: 'account_health', taskType: 'ad_connected', sourceId: u.userId, seedSource: 'ad_platform_connected', now: inputs.now }))
+    .sort(hashOrder);
+  const taken = new Set(adConnected.map((c) => c.sourceRef.id));
+  const rest = { canceled: canceled.filter((c) => !taken.has(c.sourceRef.id)), active: active.filter((c) => !taken.has(c.sourceRef.id)) };
+  const lead = adConnected.slice(0, Math.max(target, 0));
+  return { eligible: [...adConnected, ...rest.canceled, ...rest.active], selected: [...lead, ...balanced(Math.max(target - lead.length, 0), rest)] };
 }
 
 export function buildSeedCases(inputs: SeedInputs): SeedResult {
   const targets = { ...DEFAULT_SEED_TARGETS, ...inputs.targets };
   const agent = seedAgent(inputs, targets.agent);
   const creative = seedCreative(inputs, targets.creative);
-  const account = seedAccount(inputs, targets.account_health);
+  const account = seedAccount(inputs, targets.account_health, inputs.adConnectedAccounts === true);
   return {
     cases: [...agent.selected, ...creative.selected, ...account.selected],
     report: {
