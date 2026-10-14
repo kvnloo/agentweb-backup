@@ -151,6 +151,7 @@ import { DynamoDB } from 'aws-sdk';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
 import { parseScheduledChatsPage, encodeScheduledChatsCursor } from '../utils/scheduledChatsPage';
 import { describeScheduledRunFailureReasons } from '../utils/scheduledRunFailureReasons';
+import { resolveScheduleRunTime, formatRunTimeInZone } from '../utils/scheduleRunTime';
 import {
   selectPolicyModel,
   type ModelBackupSource,
@@ -3146,6 +3147,13 @@ export function isValidIanaTimeZone(tz: unknown): tz is string {
   } catch {
     return false;
   }
+}
+
+// Echo the stored run time in the owner's zone so the agent repeats what was
+// actually stored, not what it meant to send (Opslane 2026-10-13).
+function runTimeInOwnerZone(iso: string | undefined, timeZone: unknown): { timezone?: string; nextRunTimeLocal?: string } {
+  if (!iso || !isValidIanaTimeZone(timeZone)) return {};
+  return { timezone: timeZone, nextRunTimeLocal: formatRunTimeInZone(iso, timeZone) };
 }
 
 function weekdayInTimeZone(when: Date, timeZone?: string): number {
@@ -13047,7 +13055,8 @@ export const agentModeController = {
         fullAutonomy,
         requirePublishApproval,
         requireSlackApproval,
-        timezone
+        timezone,
+        emailNotificationsOptOut
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -13104,12 +13113,12 @@ export const agentModeController = {
       // Use provided nextRunTime or calculate default
       let scheduledNextRunTime: string;
       if (nextRunTime) {
-        // Validate the provided nextRunTime
-        const providedDate = new Date(nextRunTime);
-        if (isNaN(providedDate.getTime())) {
-          return res.status(400).json({ error: 'Invalid nextRunTime format' });
+        // Opslane 2026-10-13: an offset-less time is read in `timezone`, or refused.
+        const resolved = resolveScheduleRunTime(nextRunTime, isValidIanaTimeZone(timezone) ? timezone : undefined);
+        if ('error' in resolved) {
+          return res.status(400).json({ error: resolved.error });
         }
-        scheduledNextRunTime = providedDate.toISOString();
+        scheduledNextRunTime = resolved.iso;
       } else {
         // Default behavior: calculate next run time (9 AM UTC = 1 AM PST)
         const calculatedTime = calculateNextRunTime(scheduleFrequency, now, frequencyIntervalDays, scheduleId);
@@ -13198,7 +13207,11 @@ export const agentModeController = {
       const allVariablesPrefilled = normalizedVariables.length > 0
         && getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length === 0;
       const normalizedEmails = normalizeEmailList(emailNotifications);
-      const shouldUseFallbackEmail = normalizedEmails.length === 0 && !allVariablesPrefilled;
+      // Opslane 2026-10-13: an explicit opt-out (the MCP tool's `email_notifications: []`)
+      // is honoured. A bare [] from other REST callers keeps the fallback — the portal
+      // sends [] for "not set" and relies on it.
+      const optedOutOfEmail = emailNotificationsOptOut === true && normalizedEmails.length === 0;
+      const shouldUseFallbackEmail = normalizedEmails.length === 0 && !allVariablesPrefilled && !optedOutOfEmail;
       scheduledChat.emailNotifications = shouldUseFallbackEmail ? [fallbackEmail] : normalizedEmails;
       scheduledChat.variables = normalizedVariables;
       scheduledChat.variableValues = normalizedVariableValues;
@@ -13231,6 +13244,8 @@ export const agentModeController = {
         scheduleId,
         message: 'Scheduled chat created successfully',
         nextRunTime: scheduledNextRunTime,
+        ...runTimeInOwnerZone(scheduledNextRunTime, scheduledChat.timezone),
+        emailNotifications: scheduledChat.emailNotifications,
         ...scheduleBackup,
         backupSelectionRequired: scheduleBackup.llmBackupNeedsConfirmation,
       });
@@ -13335,7 +13350,8 @@ export const agentModeController = {
         requirePublishApproval,
         requireSlackApproval,
         disableSourcingBlockAlerts,
-        timezone
+        timezone,
+        emailNotificationsOptOut
       } = req.body;
 
       // Verify schedule exists and belongs to user (before validation so we can merge)
@@ -13420,12 +13436,17 @@ export const agentModeController = {
       // Determine nextRunTime: use provided value or keep existing
       let scheduledNextRunTime = existingSchedule.nextRunTime;
       let shouldUpdateNextRunTime = false;
+      const effectiveTimezone: string | undefined = isValidIanaTimeZone(timezone)
+        ? timezone
+        : (isValidIanaTimeZone((existingSchedule as any).timezone) ? (existingSchedule as any).timezone : undefined);
       if (nextRunTime) {
-        const providedDate = new Date(nextRunTime);
-        if (isNaN(providedDate.getTime())) {
-          return res.status(400).json({ error: 'Invalid nextRunTime format' });
+        // Opslane 2026-10-13: an offset-less time is read in the request's or the
+        // schedule's stored timezone, or refused.
+        const resolved = resolveScheduleRunTime(nextRunTime, effectiveTimezone);
+        if ('error' in resolved) {
+          return res.status(400).json({ error: resolved.error });
         }
-        scheduledNextRunTime = providedDate.toISOString();
+        scheduledNextRunTime = resolved.iso;
         shouldUpdateNextRunTime = true;
       }
 
@@ -13562,7 +13583,9 @@ export const agentModeController = {
       // had one is allowed to stay that way.
       const hadEmailNotifications =
         normalizeEmailList(existingSchedule.emailNotifications || []).length > 0;
-      if (effectiveEmailNotifications.length === 0 && hadEmailNotifications) {
+      // Opslane 2026-10-13: an explicit opt-out (MCP `email_notifications: []`) may clear them.
+      const clearingEmailOnPurpose = emailNotificationsOptOut === true && emailNotifications !== undefined;
+      if (effectiveEmailNotifications.length === 0 && hadEmailNotifications && !clearingEmailOnPurpose) {
         return res.status(400).json({ error: 'At least one email notification is required for scheduled chats' });
       }
 
@@ -13752,6 +13775,8 @@ export const agentModeController = {
       res.json({
         message: 'Scheduled chat updated successfully',
         nextRunTime: scheduledNextRunTime,
+        ...runTimeInOwnerZone(scheduledNextRunTime, effectiveTimezone),
+        emailNotifications: effectiveEmailNotifications,
         ...scheduleBackup,
         backupSelectionRequired: scheduleBackup.llmBackupNeedsConfirmation,
       });

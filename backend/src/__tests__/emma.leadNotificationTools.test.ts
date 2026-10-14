@@ -89,3 +89,20 @@ it('does not report success when a concurrent edit rejects the conditional write
   (orgDb.updateOrg as jest.Mock).mockRejectedValueOnce(new Error('ConditionalCheckFailedException'));
   await expect(update({ leadTypes: ['linkedin'] })).rejects.toThrow('ConditionalCheckFailedException');
 });
+it('Opslane: toggling enabled alone keeps the stored lead types (off then on)', async () => {
+  org.leadNotifications.leadTypes = ['form_fill', 'booking', 'linkedin', 'manual'];
+  (orgDb.updateOrg as jest.Mock).mockImplementation(async (_id: string, patch: any) => { org.leadNotifications = patch.leadNotifications; });
+  expect(await update({ enabled: false })).toMatchObject({ enabled: false, leadTypes: ['form_fill', 'booking', 'linkedin', 'manual'] });
+  expect(await update({ enabled: true })).toMatchObject({ enabled: true, leadTypes: ['form_fill', 'booking', 'linkedin', 'manual'] });
+  expect(org.leadNotifications.leadTypes).toEqual(['form_fill', 'booking', 'linkedin', 'manual']);
+});
+it('Opslane: omitting leadTypes on an org with default types does not persist an explicit list', async () => {
+  const result = await update({ enabled: false });
+  expect(result).toMatchObject({ enabled: false, leadTypes: ['form_fill', 'booking'] });
+  expect((orgDb.updateOrg as jest.Mock).mock.calls[0][1].leadNotifications).not.toHaveProperty('leadTypes');
+});
+it('Opslane: the tool schema no longer requires leadTypes and tells the model to omit it when turning off', () => {
+  const def = handlers.get('update_lead_notification_settings').definition;
+  expect(def.inputSchema.required ?? []).not.toContain('leadTypes');
+  expect(def.description).toMatch(/omit leadTypes/i);
+});

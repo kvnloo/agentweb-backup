@@ -59,7 +59,7 @@ emmaToolRegistry.register({
   name: 'update_lead_notification_settings',
   definition: {
     name: 'update_lead_notification_settings',
-    description: 'Set which leads notify your organization’s configured Slack channel (org owners/admins only). leadTypes replaces the entire list: “only form fills” = ["form_fill"]; “also notify me about LinkedIn leads” = read current settings, then add "linkedin". An empty list silences all lead types. Optionally enable/disable notifications or replace Slack user mentions. Channel, sources, and phone masking are preserved.',
+    description: 'Set which leads notify your organization’s configured Slack channel (org owners/admins only). leadTypes, when given, replaces the entire list: “only form fills” = ["form_fill"]; “also notify me about LinkedIn leads” = read current settings, then add "linkedin". Omit leadTypes to keep the current selection — to turn notifications off or back on, send only enabled (omit leadTypes) so the selection is still there when they are re-enabled. An empty list silences every lead type while notifications stay on. Optionally replace Slack user mentions. Channel, sources, and phone masking are preserved.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -67,7 +67,7 @@ emmaToolRegistry.register({
         enabled: { type: 'boolean' },
         mentions: { type: 'array', items: { type: 'string', pattern: '^[UW][A-Z0-9]+$' }, maxItems: 50 },
       },
-      required: ['leadTypes'], additionalProperties: false,
+      additionalProperties: false,
     },
   },
   execute: async (args: unknown, context?: any) => {
@@ -75,7 +75,11 @@ emmaToolRegistry.register({
     // Models often send null for omitted optionals; treat null as "not provided".
     if (args.enabled === null) delete args.enabled;
     if (args.mentions === null) delete args.mentions;
-    if (!isLeadTypes(args.leadTypes) || (args.enabled !== undefined && typeof args.enabled !== 'boolean')) {
+    if (args.leadTypes === null) delete args.leadTypes;
+    if (args.leadTypes === undefined && args.enabled === undefined && args.mentions === undefined) {
+      throw new Error('Invalid lead notification settings arguments: provide leadTypes, enabled, or mentions');
+    }
+    if ((args.leadTypes !== undefined && !isLeadTypes(args.leadTypes)) || (args.enabled !== undefined && typeof args.enabled !== 'boolean')) {
       throw new Error('Invalid lead types or enabled flag');
     }
     const org = await callerOrg(context, true);
@@ -83,7 +87,9 @@ emmaToolRegistry.register({
     const config = configOf(previous);
     if (!config) throw new Error('Configure a valid Slack lead notification channel for this organization first');
     const updated = {
-      ...config, leadTypes: args.leadTypes,
+      ...config,
+      // Omitted leadTypes keeps the stored selection (or the implicit default).
+      ...(args.leadTypes !== undefined ? { leadTypes: args.leadTypes } : {}),
       ...(args.enabled !== undefined ? { enabled: args.enabled } : {}),
       ...(args.mentions !== undefined ? { mentions: args.mentions } : {}),
     };
