@@ -862,16 +862,16 @@ export async function executePreparedTools(
          *
          * The prefix is unchanged: `classifyToolErrorClass` keys 'tool_unavailable' off it.
          */
-        try {
-          console.warn('[tool-gate-refused]', JSON.stringify({
-            sessionId,
-            userId,
-            tool: toolCall.function.name,
-            allowedToolCount: allowedToolNames.size,
-            publishedSkillsCount,
-            ...(describeGateRefusal ? describeGateRefusal(toolCall.function.name) : {}),
-          }));
-        } catch { /* diagnostics must never change the refusal */ }
+        let gateDetail: Record<string, unknown> = {};
+        try { gateDetail = describeGateRefusal ? describeGateRefusal(toolCall.function.name) : {}; } catch { gateDetail = { describeError: true }; }
+        console.warn('[tool-gate-refused]', JSON.stringify({
+          sessionId,
+          userId,
+          tool: String(toolCall.function.name).slice(0, 128),
+          allowedToolCount: allowedToolNames.size,
+          publishedSkillsCount,
+          ...gateDetail,
+        }));
         const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`
           + ` If install_skills cannot install it, STOP — do NOT guess or assume why (it is not always a billing/subscription limit). Relay install_skills' own response message to the user exactly as it states the reason.`
           + ` Do NOT run a different tool and present its output as this tool's result: reporting that a specific check ran, or passed, is a claim about THAT check, and substituting other data makes the claim false.`;

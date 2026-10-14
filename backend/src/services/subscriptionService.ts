@@ -748,14 +748,7 @@ export async function resolveSkillsToToolNames(
 
     for (const skillId of skillIds) {
       if (skillId === "__other_skills__") {
-        // ENG-2299 (reverted): pass the FULL published-skills catalog, not just
-        // this caller's own reachable `skillIds`. getUnassociatedToolNames already
-        // scopes "claimed" by publish/visibility state (isPublished, ENG-1237) —
-        // that's the only axis that should remove a tool from the catch-all.
-        // Filtering by the caller's own skillIds first was the wrong axis: a tool
-        // exclusively owned by a tier this caller can't install would then read as
-        // "unclaimed" and get handed back via __other_skills__ anyway, bypassing
-        // the tier gate this function exists to enforce.
+        // ENG-2299: pass the full published catalog; scoping by the caller's tier would leak higher-tier tools into the catch-all.
         const { agentModeService } = await import("./agentModeService");
         const unassociatedTools = agentModeService.getUnassociatedToolNames(publishedSkills);
         unassociatedTools.forEach((name: string) => toolNames.add(name));

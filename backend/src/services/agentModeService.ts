@@ -3155,6 +3155,7 @@ export class AgentModeService {
       const isLegacySession = rawAssociatedSkills === undefined || rawAssociatedSkills === null;
       let associatedSkills: any[] = [];
       const sessionAssociatedSkillIds: string[] = Array.isArray(rawAssociatedSkills) ? rawAssociatedSkills : [];
+      let liveInstalledSkillIds: string[] = sessionAssociatedSkillIds;
       if (sessionAssociatedSkillIds.length) {
         associatedSkills = await skillService.getSkillsByIds(sessionAssociatedSkillIds);
       }
@@ -3786,6 +3787,7 @@ export class AgentModeService {
             // Refresh session and skills
             currentSession = await chatbotDb.getChatSession(sessionId);
             const updatedAssociatedSkillIds = currentSession?.associatedSkills || [];
+            liveInstalledSkillIds = updatedAssociatedSkillIds;
 
             if (updatedAssociatedSkillIds.length) {
               associatedSkills = await skillService.getSkillsByIds(updatedAssociatedSkillIds);
@@ -4711,7 +4713,7 @@ export class AgentModeService {
           publishedSkillsCount: publishedSkills.length,
           sessionAssociatedSkillIdsCount: sessionAssociatedSkillIds.length,
           allowedToolNames,
-          describeGateRefusal: (toolName: string) => this.describeToolGateRefusal(toolName, publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIdsForDisplay),
+          describeGateRefusal: (toolName: string) => this.describeToolGateRefusal(toolName, publishedSkills, liveInstalledSkillIds, userAllowedSkillIds),
           toolResponseS3Threshold: TOOL_RESPONSE_S3_THRESHOLD,
           maxToolContentSize: MAX_TOOL_CONTENT_SIZE,
           mediaGenerationDeadlineMs,
@@ -6764,13 +6766,7 @@ export class AgentModeService {
 
     // Add virtual other_skills if allowed, there are unassociated tools, AND it's not already installed
     if (!associatedSet.has(OTHER_SKILLS_VIRTUAL_ID) && (isWildcard || allowedSet.has(OTHER_SKILLS_VIRTUAL_ID))) {
-      // ENG-2299 (reverted): a published skill from a tier this user can't install
-      // still exclusively claims its tool platform-wide — that's the same
-      // publish-state-based claim getUnassociatedTools already enforces via
-      // `isPublished` (ENG-1237), not a per-tier concern. Scoping this catalog by
-      // the caller's own allowedSkillIds doesn't fix the ENG-2299 catalog-churn
-      // report — it bypasses the tier gate instead, since a tier-excluded skill's
-      // tool would then leak into every tier's __other_skills__ catch-all.
+      // ENG-2299: use the full published catalog; scoping by the caller's tier would leak higher-tier tools into the catch-all.
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
 
       if (unassociatedTools.length > 0) {
@@ -7446,22 +7442,26 @@ export class AgentModeService {
   public describeToolGateRefusal(
     toolName: string,
     publishedSkills: any[],
-    sessionAssociatedSkillIds: string[],
-    userAllowedSkillIds: string[],
+    installedSkillIds: string[],
+    userAllowedSkillIds: string[] | null,
   ): Record<string, unknown> {
-    const isWildcard = userAllowedSkillIds.includes('*');
+    const entitlementResolved = userAllowedSkillIds !== null && userAllowedSkillIds !== undefined;
+    const allowed = userAllowedSkillIds ?? [];
+    const isWildcard = allowed.includes('*');
     const claimedBy = publishedSkills
       .filter(s => s.isPublished === true && Array.isArray(s.toolNames) && s.toolNames.includes(toolName))
       .map(s => ({
         skillId: s.skillId,
-        installed: sessionAssociatedSkillIds.includes(s.skillId),
-        tierAllows: isWildcard || userAllowedSkillIds.includes(s.skillId),
+        installed: installedSkillIds.includes(s.skillId),
+        tierAllows: isWildcard || allowed.includes(s.skillId),
       }));
     return {
-      installedSkillIds: sessionAssociatedSkillIds,
-      otherSkillsInstalled: sessionAssociatedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID),
-      tierAllowsOtherSkills: isWildcard || userAllowedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID),
-      allowedSkillCount: userAllowedSkillIds.length,
+      entitlementResolved,
+      installedSkillIds,
+      otherSkillsInstalled: installedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID),
+      tierAllowsOtherSkills: isWildcard || allowed.includes(OTHER_SKILLS_VIRTUAL_ID),
+      allowedSkillCount: allowed.length,
+      catalogSize: publishedSkills.length,
       inOtherSkillsPool: this.getUnassociatedToolNames(publishedSkills).includes(toolName),
       claimedBy,
     };
@@ -7504,15 +7504,7 @@ export class AgentModeService {
 
     // Handle virtual other_skills (gated by subscription)
     if (sessionAssociatedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID) && (isWildcard || allowedSkillSet.has(OTHER_SKILLS_VIRTUAL_ID))) {
-      // ENG-2299 (reverted): `publishedSkills` is the full, shared, multi-tenant
-      // catalog by design — __other_skills__ is a platform-wide catch-all, and a
-      // tool is only "claimed" out of it by publish/visibility state
-      // (getUnassociatedTools' own `isPublished` check, ENG-1237), never by
-      // whether the CALLER's own tier happens to be entitled to install the
-      // claiming skill. Filtering this catalog down to the caller's own
-      // allowedSkillIds doesn't fix cross-org catalog churn — it reintroduces a
-      // cross-tier bypass: a skill exclusive to a higher tier would have its
-      // tool fall through to every tier's catch-all instead of staying claimed.
+      // ENG-2299: use the full published catalog; scoping by the caller's tier would leak higher-tier tools into the catch-all.
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
       unassociatedTools.forEach(t => allowedToolNames.add(t.name));
     }

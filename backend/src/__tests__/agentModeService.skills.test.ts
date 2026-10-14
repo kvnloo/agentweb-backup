@@ -1076,6 +1076,14 @@ describe('AgentModeService - Skills', () => {
       expect(draft.inOtherSkillsPool).toBe(true);
     });
 
+    it('distinguishes an unresolved entitlement from a tier that allows nothing', () => {
+      const unresolved = agentModeService.describeToolGateRefusal('call_ads', published, [], null);
+      expect(unresolved.entitlementResolved).toBe(false);
+      const empty = agentModeService.describeToolGateRefusal('call_ads', published, [], []);
+      expect(empty.entitlementResolved).toBe(true);
+      expect(unresolved.catalogSize).toBe(2);
+    });
+
     it('marks a claiming skill the tier does not allow', () => {
       const d = agentModeService.describeToolGateRefusal('call_ads', published, ['ads'], ['other']);
       expect(d.claimedBy).toEqual([{ skillId: 'ads', installed: true, tierAllows: false }]);
