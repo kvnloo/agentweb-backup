@@ -48,7 +48,8 @@ describe('classifyTraffic: V1 parity (must not change)', () => {
     ['utm_source t.co', { landingUrl: lp('utm_source=t.co') }, { channel: 'X' }],
     ['unknown utm_source stays raw, group Referral', { landingUrl: lp('utm_source=creator_john') }, { channel: 'creator_john', channelGroup: 'Referral' }],
     ['unknown utm_source + known referrer -> referrer decides', { landingUrl: lp('utm_source=creator_john'), referrer: 'https://l.instagram.com/' }, { channel: 'Instagram' }],
-    ['utm_source beats referrer', { landingUrl: lp('utm_source=tiktok'), referrer: 'https://l.instagram.com/' }, { channel: 'TikTok' }],
+    // 2.2.0: observed referrer beats the link's tag; the tag is kept as linkChannel.
+    ['observed referrer beats utm_source (2.2.0)', { landingUrl: lp('utm_source=tiktok'), referrer: 'https://l.instagram.com/' }, { channel: 'Instagram', linkChannel: 'TikTok', detectedChannel: 'Instagram', matchedBy: 'referrer' }],
     ['utm_source is capped at 40 chars in the fallback channel', { landingUrl: lp(`utm_source=${'a'.repeat(80)}`) }, { channel: 'a'.repeat(40) }],
     ['referrer l.instagram.com', { landingUrl: lp(), referrer: 'https://l.instagram.com/' }, { channel: 'Instagram', referrerHost: 'l.instagram.com', sourceLink: '' }],
     ['referrer lm.facebook.com', { landingUrl: lp(), referrer: 'https://lm.facebook.com/' }, { channel: 'Facebook' }],
@@ -76,7 +77,8 @@ describe('classifyTraffic: V1 parity (must not change)', () => {
     ['in-app UA LinkedIn', { landingUrl: lp(), userAgent: UA.linkedin }, { channel: 'LinkedIn' }],
     ['plain desktop UA is direct', { landingUrl: lp(), userAgent: UA.desktop }, { channel: 'Direct', channelGroup: 'Direct' }],
     ['link-preview crawler UA is not Facebook in-app', { landingUrl: lp(), userAgent: UA.crawler }, { channel: 'Direct' }],
-    ['referrer beats UA', { landingUrl: lp(), referrer: 'https://www.reddit.com/', userAgent: UA.tiktok }, { channel: 'Reddit' }],
+    // 2.2.0: the in-app browser is where the visitor physically is; it beats the referrer.
+    ['in-app UA beats referrer (2.2.0)', { landingUrl: lp(), referrer: 'https://www.reddit.com/', userAgent: UA.tiktok }, { channel: 'TikTok', matchedBy: 'user_agent' }],
     ['unknown referrer + in-app UA -> UA decides', { landingUrl: lp(), referrer: 'https://example.org/', userAgent: UA.instagram }, { channel: 'Instagram', referrerHost: 'example.org' }],
     ['direct', { landingUrl: lp() }, { trafficType: 'organic', channel: 'Direct', channelGroup: 'Direct', referrerHost: '', sourceLink: '', sourceDetail: '' }],
     ['source_detail lists all keys in V1 order', { landingUrl: lp('post=p&utm_term=t&utm_content=tt-1&utm_campaign=c&utm_medium=bio&utm_source=tiktok&ref=r&src=s') }, { sourceDetail: 'utm_source=tiktok | utm_medium=bio | utm_campaign=c | utm_content=tt-1 | utm_term=t | ref=r | src=s | post=p' }],
@@ -300,5 +302,37 @@ describe('paid channel split: routing compatibility', () => {
     ];
     expect(matchRoutingRules(rules, paid).sort()).toEqual(['ads-only', 'any-google']);
     expect(matchRoutingRules(rules, organic)).toEqual(['any-google']);
+  });
+});
+
+describe('2.2.0 DramaBreak attribution decisions', () => {
+  it('Rise case: TikTok-tagged link opened from YouTube reports YouTube, keeps TikTok as linkChannel', () => {
+    expect(classifyTraffic({ landingUrl: lp('utm_source=tiktok&utm_medium=bio'), referrer: 'https://www.youtube.com/' }))
+      .toMatchObject({ channel: 'YouTube', linkChannel: 'TikTok', detectedChannel: 'YouTube', trafficType: 'organic' });
+  });
+  it('Facebook-tagged link inside the Instagram app reports Instagram', () => {
+    expect(classifyTraffic({ landingUrl: lp('utm_source=facebook'), userAgent: UA.instagram }))
+      .toMatchObject({ channel: 'Instagram', linkChannel: 'Facebook', matchedBy: 'user_agent' });
+  });
+  it('no referrer, no in-app UA: falls back to the link tag', () => {
+    expect(classifyTraffic({ landingUrl: lp('utm_source=tiktok') })).toMatchObject({ channel: 'TikTok', matchedBy: 'utm_source', detectedChannel: '' });
+  });
+  it('nothing at all: Direct', () => {
+    expect(classifyTraffic({ landingUrl: lp() })).toMatchObject({ channel: 'Direct', linkChannel: '', detectedChannel: '' });
+  });
+  it('paid link keeps its ad platform even when opened in another app', () => {
+    expect(classifyTraffic({ landingUrl: lp('utm_source=meta&utm_medium=paid_social'), userAgent: UA.instagram }))
+      .toMatchObject({ channel: 'Meta', channelGroup: 'Paid', trafficType: 'paid' });
+  });
+  it('Nova is paid by construction and its own channel', () => {
+    expect(classifyTraffic({ landingUrl: lp('utm_source=nova&utm_campaign=gbtm'), referrer: 'https://www.newsbreak.com/' }))
+      .toMatchObject({ channel: 'Nova (NewsBreak Ads)', channelKey: 'nova', channelGroup: 'Paid', trafficType: 'paid', paidSignal: 'utm_source:nova' });
+  });
+  it('organic newsbreak.com referrer is NewsBreak.com, not Direct', () => {
+    expect(classifyTraffic({ landingUrl: lp(), referrer: 'https://www.newsbreak.com/' })).toMatchObject({ channel: 'NewsBreak.com', trafficType: 'organic' });
+  });
+  it('Google: search vs ads stay split', () => {
+    expect(classifyTraffic({ landingUrl: lp(), referrer: 'https://www.google.com/' })).toMatchObject({ channel: 'Google Search' });
+    expect(classifyTraffic({ landingUrl: lp('gclid=x'), referrer: 'https://www.google.com/' })).toMatchObject({ channel: 'Google Ads', trafficType: 'paid' });
   });
 });

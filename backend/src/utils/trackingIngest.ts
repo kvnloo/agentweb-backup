@@ -265,6 +265,8 @@ export function buildSessionRow(
   fields.channelKey = classification.channelKey;
   fields.channelGroup = classification.channelGroup;
   fields.classifierVersion = classification.classifierVersion;
+  if (classification.linkChannel) fields.linkChannel = classification.linkChannel; else delete fields.linkChannel;
+  if (classification.detectedChannel) fields.detectedChannel = classification.detectedChannel; else delete fields.detectedChannel;
   fields.device = deviceFromUserAgent(ctx.userAgent);
   if (classification.referrerHost) fields.referrerHost = classification.referrerHost; else delete fields.referrerHost;
   if (classification.sourceLink) fields.sourceLink = classification.sourceLink; else delete fields.sourceLink;
