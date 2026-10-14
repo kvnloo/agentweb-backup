@@ -83,7 +83,7 @@ import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHisto
 import { computeCheckpointBatch, isPersistedResponseMessage } from './agentMode/incrementalPersist';
 import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, buildFinalizeJudgePrompt, parseFinalizeJudgeOutput, FINALIZE_JUDGE_MAX_COMPLETION_TOKENS } from './agentMode/core/finalizeGuard';
-import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
+import { reconcileUnconsumedCursors, ROW_KEYS as LEDGER_ROW_KEYS } from './agentMode/core/unconsumedCursor';
 import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
 import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionIndex } from '../utils/modelMentionRequest';
 import { resolveTurnModelCorrection } from '../utils/modelCorrectionStamp';
@@ -7892,6 +7892,18 @@ export class AgentModeService {
       return minimal;
     }
 
+    // ENG-2338: keep enough of a Luma result for the ledger to tell "pulled 0 guests" from "no key connected" (both
+    // would otherwise minimise to {}). `rowCount` is what the unread-page notice reads; rows themselves are dropped.
+    if (toolName === 'luma_get_guests' || toolName === 'luma_list_events') {
+      const rows = Array.isArray(result?.guests) ? result.guests : Array.isArray(result?.events) ? result.events : undefined;
+      const minimal: Record<string, any> = {};
+      for (const field of ['success', 'connected', 'nothing_pulled', 'reason', 'count', 'has_more', 'next_cursor', 'skipped_without_registration']) {
+        if (result?.[field] !== undefined) minimal[field] = result[field];
+      }
+      if (rows) minimal.rowCount = rows.length;
+      return minimal;
+    }
+
     // For playwright screenshots, result has already been processed (base64 → S3 URL)
     if (toolName === 'playwright_browser_take_screenshot') {
       return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };
@@ -8377,7 +8389,7 @@ export class AgentModeService {
       // Zero is worse than silence in that sentence: it reads as "this found
       // nothing", the opposite of what happened.
       if (Object.keys(paginationMarkers).length > 0) {
-        for (const key of ['leads', 'engagements', 'results', 'items', 'rows']) {
+        for (const key of LEDGER_ROW_KEYS) {
           const value = (result as Record<string, unknown>)[key];
           if (Array.isArray(value)) { paginationMarkers.rowCount = value.length; break; }
         }
