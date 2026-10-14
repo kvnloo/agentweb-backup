@@ -28,7 +28,7 @@
  */
 
 /** Bump on ANY change that can alter an output for an existing input; stored with every row. */
-export const TRAFFIC_CLASSIFIER_VERSION = '2.1.0';
+export const TRAFFIC_CLASSIFIER_VERSION = '2.2.0';
 
 export type ChannelGroup =
   | 'Paid'
@@ -229,6 +229,14 @@ export const CHANNELS: readonly ChannelDef[] = [
     appPackages: ['com.whatsapp', 'org.telegram.messenger', 'com.snapchat.android', 'com.discord', 'com.instagram.barcelona'],
   },
   {
+    // ENG-2494: NewsBreak. Its paid product ("NOVA") is tagged with a `nova` UTM token, which makes
+    // the visit paid; an untagged newsbreak.com referrer stays organic.
+    key: 'newsbreak', name: 'NewsBreak', group: 'Referral', utmSource: 'newsbreak',
+    utmAliases: ['newsbreak', 'nova'],
+    hosts: ['newsbreak.com'],
+    appPackages: ['com.particlenews.newsbreak'],
+  },
+  {
     // Webmail / mail apps. Newsletters rarely carry a referrer, so utm_source=newsletter is the real signal.
     key: 'email', name: 'Email', group: 'Email', utmSource: 'newsletter',
     utmAliases: ['email', 'newsletter', 'mail', 'gmail', 'outlook'],
@@ -317,6 +325,13 @@ export interface ClassifyTrafficInput {
   userAgent?: string;
   /** The landing page's own hostname; defaults to the host of landingUrl. Used to discard internal referrers. */
   hostname?: string;
+  /**
+   * ENG-2494. 'utm_first' (default) = utm_source decides the channel before the referrer.
+   * 'referrer_first' = the click's own referrer / in-app UA decides first and utm_source is only a
+   * fallback. Used for FIRST-TOUCH channel: one agency UTM link per creator is shared across
+   * TikTok / YouTube / Instagram, so only the browser's referral data can say where the click came from.
+   */
+  sourceOrder?: 'utm_first' | 'referrer_first';
 }
 
 export type MatchedBy =
@@ -675,6 +690,13 @@ export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassi
   if (!paidSignal && clickIds.has('fbclid') && !(ORGANIC_MEDIUMS as readonly string[]).includes(utm.utm_medium.toLowerCase())) {
     paidSignal = 'click_id:fbclid';
   }
+  // ENG-2494: NewsBreak's paid NOVA traffic. Whole-token match in source/medium/campaign so
+  // 'supernova' or 'novamind' never trip it.
+  if (!paidSignal) {
+    const hasNova = [utm.utm_source, utm.utm_medium, utm.utm_campaign]
+      .some((v) => v.toLowerCase().split(/[^a-z0-9]+/).includes('nova'));
+    if (hasNova) paidSignal = 'utm:nova';
+  }
   const paid = paidSignal !== null;
 
   // 3. Referrer (internal ones are not a source at all).
@@ -688,8 +710,12 @@ export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassi
   let def: ChannelDef | undefined;
   let matchedBy: MatchedBy = 'none';
 
-  def = matchUtmSource(sourceLower);
-  if (def) matchedBy = 'utm_source';
+  const referrerFirst = safe.sourceOrder === 'referrer_first';
+
+  if (!referrerFirst) {
+    def = matchUtmSource(sourceLower);
+    if (def) matchedBy = 'utm_source';
+  }
 
   if (!def && ref) {
     def = findChannelByReferrer(ref);
@@ -700,6 +726,11 @@ export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassi
     const ua = safe.userAgent.slice(0, MAX_INPUT_LEN);
     def = IN_APP_UA_MATCHERS.find((m) => m.re.test(ua))?.def;
     if (def) matchedBy = 'user_agent';
+  }
+
+  if (!def && referrerFirst) {
+    def = matchUtmSource(sourceLower);
+    if (def) matchedBy = 'utm_source';
   }
 
   // New vs V1: a platform click id with no other source signal names its platform, instead of the
