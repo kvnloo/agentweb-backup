@@ -174,8 +174,9 @@ describe('ensureWebhookSubscriptionsOncePerBuild', () => {
     expect(post).toHaveBeenCalledTimes(1);                   // the remaining 12 would fail identically: not attempted
     expect(mockComplete).toHaveBeenCalled();
     expect(mockFailed).not.toHaveBeenCalled();
-    const msg = warn.mock.calls.map((c) => String(c[0])).find((m) => m.includes('managed by a HubSpot project'))!;
-    expect(msg).toContain('contact.merge');                  // names what still has to be added by hand
+    const msgs = warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('managed by a HubSpot project'));
+    expect(msgs).toHaveLength(1);                            // exactly one warning, not one per subscription
+    expect(msgs[0]).toContain('contact.merge');              // names what still has to be added by hand
   });
 
   it('a different 403 (e.g. a missing scope) is still a retryable failure', async () => {
