@@ -107,6 +107,41 @@ export interface XProjectUsage {
   capResetDay: number | null;
 }
 
+/**
+ * ENG-2474: X API v2 recent search rejects v1.1 operators (min_faves,
+ * min_retweets, min_replies, filter:*) with HTTP 400. Translate the ones with
+ * v2 equivalents, strip the rest, and return min_* thresholds so the caller can
+ * post-filter on public_metrics.
+ */
+const MIN_METRIC_FIELDS: Record<string, string> = {
+  min_faves: 'like_count',
+  min_retweets: 'retweet_count',
+  min_replies: 'reply_count',
+};
+const FILTER_TO_IS: Record<string, string> = {
+  replies: 'is:reply',
+  retweets: 'is:retweet',
+  nativeretweets: 'is:retweet',
+};
+
+export function translateV1SearchOperators(raw: string): { query: string; minMetrics: Record<string, number> } {
+  const minMetrics: Record<string, number> = {};
+  let q = raw.replace(/\b(min_faves|min_retweets|min_replies):(\d+)/gi, (_m, op: string, n: string) => {
+    const field = MIN_METRIC_FIELDS[op.toLowerCase()];
+    minMetrics[field] = Math.max(minMetrics[field] ?? 0, Number(n));
+    return ' ';
+  });
+  q = q.replace(/(^|[\s(])(-?)filter:(\w+)/gi, (_m, lead: string, neg: string, kind: string) => {
+    const mapped = FILTER_TO_IS[kind.toLowerCase()];
+    return mapped ? `${lead}${neg}${mapped}` : `${lead} `;
+  });
+  // Remove groups emptied by stripping, e.g. "( )", then collapse whitespace.
+  let prev: string;
+  do { prev = q; q = q.replace(/\(\s*\)/g, ' '); } while (q !== prev);
+  q = q.replace(/\s+/g, ' ').trim();
+  return { query: q, minMetrics };
+}
+
 export class TwitterService {
   private cachedClientId: string | null = null;
   private cachedClientSecret: string | null = null;
@@ -818,12 +853,20 @@ export class TwitterService {
    */
   async searchTweets(ownerUserId: string, accountId: string, query: string, maxResults?: number): Promise<any[]> {
     if (!query || query.trim() === '') throw new Error('query is required for search-tweets');
+    const { query: v2Query, minMetrics } = translateV1SearchOperators(query);
+    if (!v2Query) {
+      throw new Error('search query has no searchable terms after removing unsupported operators (min_faves/min_retweets/min_replies/filter:)');
+    }
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
-      const res: any = await client.v2.search(query.trim(), {
+      const res: any = await client.v2.search(v2Query, {
         max_results: this.clampMaxResults(maxResults, 10, 10),
         'tweet.fields': ['public_metrics', 'created_at', 'author_id'],
       });
-      return res?.data?.data ?? res?.data ?? [];
+      const rows = res?.data?.data ?? res?.data ?? [];
+      const entries = Object.entries(minMetrics);
+      if (!entries.length || !Array.isArray(rows)) return rows;
+      return rows.filter((t: any) =>
+        entries.every(([field, min]) => Number(t?.public_metrics?.[field] ?? 0) >= min));
     }, { operation: 'search_tweets', units: arrayLen });
   }
 
