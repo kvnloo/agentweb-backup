@@ -195,8 +195,9 @@ export function carryStoredStepModels<T extends StepLike>(
     if (j !== -1) claim(i, j);
   });
 
-  // Rename in place: nothing else moved (same count) and exactly one step on each side is left over.
-  if (incoming.length === storedSteps.length) {
+  // Rename in place: exactly one step on each side is left over (which also means the counts are equal and nothing
+  // else was inserted, deleted or renamed), at the same number, saying the same thing.
+  {
     const freeIncoming = incoming.map((_, i) => i).filter((i) => !matchOf.has(i));
     const freeStored = storedSteps.map((_, j) => j).filter((j) => !claimed.has(j));
     if (freeIncoming.length === 1 && freeStored.length === 1
