@@ -1714,6 +1714,7 @@ interface HubspotJobPayload {
  *  receiver had, since this handler acks HubSpot's webhook before this runs). */
 export async function processHubspotWebhookJob(payload: HubspotJobPayload): Promise<void> {
   // ── contact.merge: re-point stored contact ids at the survivor ───────────
+  let mergeFailures = 0;
   for (const merge of payload.merges ?? []) {
     try {
       const userId = await getUserIdByHubSpotPortalId(merge.portalId);
@@ -1725,13 +1726,26 @@ export async function processHubspotWebhookJob(payload: HubspotJobPayload): Prom
       for (const list of lists) {
         const cfgs = (list as any).externalCrmSyncConfigs as Record<string, any> | undefined;
         if (String(cfgs?.hubspot?.accountId) !== String(merge.portalId)) continue;
-        await repointMergedContactIds(list.listId, merge);
+        const r = await repointMergedContactIds(list.listId, merge);
+        mergeFailures += r.lookupFailed;
       }
     } catch (err: any) {
+      mergeFailures++;
       console.error(`[HubSpot Webhook] contact.merge handling failed for survivor ${merge.survivorId}: ${err?.message || err}`);
     }
   }
 
+  await processHubspotContactChanges(payload);
+
+  // A merge whose lookup or write failed throws AFTER the rest of the delivery is applied, so the
+  // durable queue retries the job (the repoint is idempotent; the contact changes are idempotent
+  // updates, as for any retry of this job). Attempts are capped by the queue.
+  if (mergeFailures > 0) {
+    throw new Error(`contact.merge: ${mergeFailures} stored contact id(s) could not be re-pointed`);
+  }
+}
+
+async function processHubspotContactChanges(payload: HubspotJobPayload): Promise<void> {
   // ── Process each contact / deal ─────────────────────────────────────────
   for (const [objectId, data] of Object.entries(payload.changesByObjectId)) {
         const userId = await getUserIdByHubSpotPortalId(data.portalId);
