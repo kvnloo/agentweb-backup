@@ -77,7 +77,11 @@ describe('ENG-2483 judge clause opt-out', () => {
 
   it('scoreSessionWithJudge sends the clause-bearing prompt by default', async () => {
     const sys = await capturedSystemPrompt();
-    expect(sys.startsWith(BASE + CLAUSES.join(''))).toBe(true);
+    expect(sys).toBe(BASE + CLAUSES.join(''));
+    // SHA256 pinned from the pre-ENG-2483 production concatenation, independently
+    // evaluated from origin/main (not derived from the imported constants).
+    expect(require('node:crypto').createHash('sha256').update(sys).digest('hex'))
+      .toBe('d6ba8c24fc9df5ea8992fbe54fa1afc28f880194ada1639b919e098b05fd65bb');
   });
 
   it('scoreSessionWithJudge sends no appended clause when opted out', async () => {
