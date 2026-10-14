@@ -5736,9 +5736,25 @@ function getZeroAssistantRetryCount(schedule: any): number {
 }
 
 /**
- * Tell the schedule owner a run needs a human look. Recipients: the schedule's
- * configured notification list, else the owner's account email. Best-effort by
- * design — a notification failure must never break the run.
+ * Who gets a schedule's alert emails: the configured notification list, else the
+ * owner's account email — unless the owner explicitly opted out of email (ENG-2493),
+ * in which case nobody. Non-email channels (oncall, run history) are unaffected.
+ */
+async function resolveScheduleAlertRecipients(
+  schedule: any,
+  loadOwnerEmail: () => Promise<string | undefined>,
+): Promise<string[]> {
+  // Normalized: older rows store a bare string or a JSON-array string.
+  const configured = normalizeEmailList(schedule.emailNotifications);
+  if (configured.length > 0 || schedule.emailOptOut === true) return configured;
+  const ownerEmail = await loadOwnerEmail();
+  return ownerEmail ? [ownerEmail] : [];
+}
+
+/**
+ * Tell the schedule owner a run needs a human look. Recipients per
+ * resolveScheduleAlertRecipients. Best-effort by design — a notification failure
+ * must never break the run.
  */
 async function notifyScheduleOwnerOfFailure(
   schedule: any,
@@ -5746,13 +5762,10 @@ async function notifyScheduleOwnerOfFailure(
   detail: { failedAttempts: number; failureClass: any }
 ): Promise<void> {
   try {
-    let recipients: string[] = Array.isArray(schedule.emailNotifications)
-      ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
-      : [];
-    if (recipients.length === 0) {
-      const owner = await userDb.getUserById(userId);
-      if (owner?.email) recipients = [owner.email];
-    }
+    const recipients = await resolveScheduleAlertRecipients(
+      schedule, async () => (await userDb.getUserById(userId))?.email
+    );
+    if (schedule.emailOptOut === true && recipients.length === 0) return;
     if (recipients.length > 0) {
       await emailService.sendScheduledRunFailedEmail(
         recipients, schedule.scheduleName, schedule.scheduleId, detail
@@ -5966,13 +5979,10 @@ async function notifyScheduleOwnerOfSourcingBlockTransition(
 ): Promise<void> {
   if (schedule.disableSourcingBlockAlerts === true) return;
   try {
-    let recipients: string[] = Array.isArray(schedule.emailNotifications)
-      ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
-      : [];
-    if (recipients.length === 0) {
-      const owner = await userDb.getUserById(userId);
-      if (owner?.email) recipients = [owner.email];
-    }
+    const recipients = await resolveScheduleAlertRecipients(
+      schedule, async () => (await userDb.getUserById(userId))?.email
+    );
+    if (schedule.emailOptOut === true && recipients.length === 0) return;
     if (recipients.length > 0) {
       await emailService.sendScheduleSourcingBlockTransitionEmail(
         recipients, schedule.scheduleName, schedule.scheduleId, detail.isNowBlocked
@@ -6355,16 +6365,17 @@ export async function runScheduledChat(
       );
 
       if (disallowedFunctions.length > 0) {
-        const emailNotifications = schedule.emailNotifications || [];
-        
         // Send error email instead of running
-        const { emailService } = await import('../services/emailService');
-        await emailService.sendScheduledChatErrorEmail(
-          emailNotifications.length > 0 ? emailNotifications : (scheduleUser?.email ? [scheduleUser.email] : []),
-          schedule.scheduleName,
-          disallowedFunctions,
-          schedule.scheduleId
-        );
+        const errorRecipients = await resolveScheduleAlertRecipients(schedule, async () => scheduleUser?.email);
+        if (errorRecipients.length > 0) {
+          const { emailService } = await import('../services/emailService');
+          await emailService.sendScheduledChatErrorEmail(
+            errorRecipients,
+            schedule.scheduleName,
+            disallowedFunctions,
+            schedule.scheduleId
+          );
+        }
         
         // Create failure result
         const errorResult = {
@@ -6398,13 +6409,10 @@ export async function runScheduledChat(
     // Check token usage limits before creating the session
     const usageStatus = await checkTokenUsage(userId);
     if (!usageStatus.allowed) {
-      const emailNotifications = schedule.emailNotifications || [];
-      let notifyEmails: string[] = emailNotifications;
-      if (notifyEmails.length === 0) {
+      const notifyEmails = await resolveScheduleAlertRecipients(schedule, async () => {
         const { userDb: tokenUserDb } = await import('../services/db');
-        const tokenUser = await tokenUserDb.getUserById(userId);
-        if (tokenUser?.email) notifyEmails = [tokenUser.email];
-      }
+        return (await tokenUserDb.getUserById(userId))?.email;
+      });
 
       if (notifyEmails.length > 0) {
         const { emailService } = await import('../services/emailService');
@@ -13559,6 +13567,8 @@ export const agentModeController = {
       const optedOutOfEmail = emailNotificationsOptOut === true && normalizedEmails.length === 0;
       const shouldUseFallbackEmail = normalizedEmails.length === 0 && !allVariablesPrefilled && !optedOutOfEmail;
       scheduledChat.emailNotifications = shouldUseFallbackEmail ? [fallbackEmail] : normalizedEmails;
+      // ENG-2493: persisted so run-time alerts don't fall back to the owner's address.
+      if (optedOutOfEmail) scheduledChat.emailOptOut = true;
       scheduledChat.variables = normalizedVariables;
       scheduledChat.variableValues = normalizedVariableValues;
       scheduledChat.variableRequestStatus = normalizedVariables.length > 0
@@ -13933,6 +13943,13 @@ export const agentModeController = {
       const clearingEmailOnPurpose = emailNotificationsOptOut === true && emailNotifications !== undefined;
       if (effectiveEmailNotifications.length === 0 && hadEmailNotifications && !clearingEmailOnPurpose) {
         return res.status(400).json({ error: 'At least one email notification is required for scheduled chats' });
+      }
+      // ENG-2493: clearing on purpose opts out; setting recipients opts back in. Any other
+      // edit omits the key so the partial SET leaves the stored value alone.
+      if (clearingEmailOnPurpose && effectiveEmailNotifications.length === 0) {
+        updates.emailOptOut = true;
+      } else if (emailNotifications !== undefined && effectiveEmailNotifications.length > 0) {
+        updates.emailOptOut = false;
       }
 
       // Tool names are case-sensitive everywhere else; addresses are not.
