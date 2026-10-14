@@ -41,6 +41,8 @@ export interface SeedCandidateRow {
   reviewerSlackUserId?: string;
   /** Slack user ids of everyone who replied; text is never read. */
   feedbackSlackUserIds: string[];
+  /** The candidate carries a stored creative-gate result that was actually evaluated (not `notChecked`). */
+  gated?: boolean;
 }
 
 export interface SeedUserRow {
@@ -62,6 +64,8 @@ export interface SeedInputs {
   users: SeedUserRow[];
   fpCatalogue?: FpCatalogue;
   targets?: Partial<Record<EvalSurface, number>>;
+  /** Opt in to `gated_candidate` creative cases (see seedCreative). Off by default so a plain run never adds them. */
+  gatedCreatives?: boolean;
   now: Date;
 }
 
@@ -174,11 +178,22 @@ function seedAgent(inputs: SeedInputs, target: number) {
 }
 
 function seedCreative(inputs: SeedInputs, target: number) {
-  const eligible = inputs.candidates
+  const reviewed = inputs.candidates
     .filter((c) => CREATIVE_REVIEW_TYPES.has(c.reviewType))
     .filter((c) => !!c.reviewerSlackUserId && c.feedbackSlackUserIds.includes(c.reviewerSlackUserId))
     .map((c) => newGoldenCase({ surface: 'creative', taskType: c.reviewType, sourceId: c.candidateId, seedSource: 'human_eval_reviewer_feedback', now: inputs.now }));
-  return { eligible, selected: take(eligible, target, () => false) };
+  if (!inputs.gatedCreatives) return { eligible: reviewed, selected: take(reviewed, target, () => false) };
+
+  // ENG-2226: the gates adapter can only grade a candidate that carries a stored gate result, and every
+  // reviewer-feedback candidate predates the gates (earliest gated candidate 2026-09-25), so it abstains on
+  // all of them. Gated image candidates are added after the reviewed ones; a larger target only appends.
+  const seen = new Set(reviewed.map((c) => c.sourceRef.id));
+  const gated = inputs.candidates
+    .filter((c) => c.gated === true && c.reviewType === 'creative_image' && !seen.has(c.candidateId))
+    .map((c) => newGoldenCase({ surface: 'creative', taskType: c.reviewType, sourceId: c.candidateId, seedSource: 'gated_candidate', now: inputs.now }))
+    .sort(hashOrder);
+  const first = [...reviewed].sort(hashOrder);
+  return { eligible: [...reviewed, ...gated], selected: [...first, ...gated].slice(0, Math.max(target, 0)) };
 }
 
 function seedAccount(inputs: SeedInputs, target: number) {
