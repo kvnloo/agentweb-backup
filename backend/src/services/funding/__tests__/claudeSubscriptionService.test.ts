@@ -781,12 +781,17 @@ describe('withLogin: the single live copy', () => {
       jest.useFakeTimers();
       const ctx = setup();
       await seedLogin(ctx);
+      // A real store answers in milliseconds, not instantly: make the heartbeat's read slow so the order matters.
+      const realGet = ctx.db.get.bind(ctx.db);
+      let slow = false;
+      jest.spyOn(ctx.db, 'get').mockImplementation(async (id: string) => { if (slow) await new Promise((r) => setTimeout(r, 300)); return realGet(id); });
       let aborted = false;
       const p = ctx.service.withLogin('sub-x', 'user-1', async ({ signal }) => {
         signal.addEventListener('abort', () => (aborted = true));
         await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve()));
       });
       await jest.advanceTimersByTimeAsync(1000);
+      slow = true;
       await ctx.db.revoke('sub-x', { userId: 'user-1' }, new Date().toISOString()); // another instance's revoke: no in-process hook here
       await jest.advanceTimersByTimeAsync(HEARTBEAT_MS + 1000);
       expect(aborted).toBe(true);
