@@ -3160,7 +3160,7 @@ export class AgentModeService {
       }
 
       // Build initial skill context
-      let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIdsForDisplay, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess, await this.ensureOtherSkillsSnapshot(currentSession, publishedSkills));
+      let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIdsForDisplay, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
 
       // 3. Build Initial Messages
       let effectiveMessageContent = messageContent;
@@ -3794,7 +3794,7 @@ export class AgentModeService {
             }
 
             // Re-build context using helper
-            const skillContext = this.buildSkillContext(associatedSkills, userAllowedSkillIdsForDisplay, publishedSkills, updatedAssociatedSkillIds, hasAdminAccess, await this.ensureOtherSkillsSnapshot(currentSession, publishedSkills));
+            const skillContext = this.buildSkillContext(associatedSkills, userAllowedSkillIdsForDisplay, publishedSkills, updatedAssociatedSkillIds, hasAdminAccess);
             // ENG-893: a skill install that ADDS tools changes `toolConfig`, and
             // Bedrock chains its cache checkpoints tools -> system -> messages —
             // so the whole cached prefix dies and the next call re-writes it in
@@ -7399,7 +7399,6 @@ export class AgentModeService {
       publishedSkills,
       sessionAssociatedSkillIds,
       hasAdminAccess,
-      await this.ensureOtherSkillsSnapshot(currentSession, publishedSkills),
     );
 
     try {
@@ -7440,31 +7439,6 @@ export class AgentModeService {
   }
 
   /**
-   * ENG-2299: the pool of tools behind `__other_skills__` is derived from the shared published-skill
-   * catalog, so it shifts whenever any skill anywhere is published or edited. Record it on the session
-   * the first turn the session uses `__other_skills__` and hand that record to buildSkillContext, which
-   * unions it with the live pool. Returns undefined when the session has not installed `__other_skills__`.
-   * A failed write degrades to the live pool for this turn and retries on the next.
-   */
-  public async ensureOtherSkillsSnapshot(
-    session: Pick<ChatSession, 'sessionId' | 'associatedSkills' | 'otherSkillsToolSnapshot'> | null | undefined,
-    publishedSkills: any[],
-  ): Promise<string[] | undefined> {
-    if (!session || !Array.isArray(session.associatedSkills) || !session.associatedSkills.includes(OTHER_SKILLS_VIRTUAL_ID)) {
-      return undefined;
-    }
-    if (Array.isArray(session.otherSkillsToolSnapshot)) return session.otherSkillsToolSnapshot;
-    const toolNames = this.getUnassociatedToolNames(publishedSkills);
-    try {
-      await chatbotDb.setOtherSkillsToolSnapshotIfAbsent(session.sessionId, toolNames);
-      session.otherSkillsToolSnapshot = toolNames;
-    } catch (err) {
-      console.warn(`[AgentMode] Could not persist __other_skills__ snapshot for session ${session.sessionId}:`, err);
-    }
-    return toolNames;
-  }
-
-  /**
    * ENG-1222: the single source of truth for "which tools + skill-context text
    * does a session with these installed skills get". Was private to Agent Mode
    * until chatbotService.generateChatResponse (the Emma-widget path) started
@@ -7479,8 +7453,7 @@ export class AgentModeService {
     userAllowedSkillIds: string[],
     publishedSkills: any[],
     sessionAssociatedSkillIds: string[] = [],
-    hasAdminAccess: boolean = false,
-    otherSkillsToolSnapshot?: string[]
+    hasAdminAccess: boolean = false
   ): { allowedToolNames: Set<string>; installedSkillContextMsg: string } {
     const allowedToolNames = new Set<string>(AgentModeService.FOUNDATION_TOOLS);
 
@@ -7502,17 +7475,17 @@ export class AgentModeService {
 
     // Handle virtual other_skills (gated by subscription)
     if (sessionAssociatedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID) && (isWildcard || allowedSkillSet.has(OTHER_SKILLS_VIRTUAL_ID))) {
-      // `publishedSkills` is the full, shared, multi-tenant catalog by design: a tool leaves the
-      // catch-all pool when ANY published skill claims it (ENG-1237), whatever the caller's tier.
-      // Scoping this by the caller's allowedSkillIds would let a higher-tier skill's tool fall
-      // through to every tier. Instead the session keeps what the pool held when it first used it
-      // (ENG-2299), so a skill published later cannot take an installed tool away mid-session.
+      // ENG-2299 (reverted): `publishedSkills` is the full, shared, multi-tenant
+      // catalog by design — __other_skills__ is a platform-wide catch-all, and a
+      // tool is only "claimed" out of it by publish/visibility state
+      // (getUnassociatedTools' own `isPublished` check, ENG-1237), never by
+      // whether the CALLER's own tier happens to be entitled to install the
+      // claiming skill. Filtering this catalog down to the caller's own
+      // allowedSkillIds doesn't fix cross-org catalog churn — it reintroduces a
+      // cross-tier bypass: a skill exclusive to a higher tier would have its
+      // tool fall through to every tier's catch-all instead of staying claimed.
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
       unassociatedTools.forEach(t => allowedToolNames.add(t.name));
-      const adminOnly = new Set<string>(ADMIN_SKILL_TOOL_NAMES);
-      otherSkillsToolSnapshot?.forEach(name => {
-        if (!adminOnly.has(name)) allowedToolNames.add(name);
-      });
     }
 
     // Handle virtual admin_tools skill — always available to admin users regardless of session install
