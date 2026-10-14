@@ -22,7 +22,8 @@ export async function getSecret(secretName: string): Promise<string> {
 
     throw new Error('Secret string is empty');
   } catch (error) {
-    console.error(`Error fetching secret ${secretName}:`, error);
+    // The name and the error code only: the whole error object has no business in logs.
+    console.error(`Error fetching secret ${secretName}: ${(error as { code?: string })?.code || (error as Error)?.name || 'error'}`);
     throw new Error(`Failed to fetch secret: ${secretName}`);
   }
 }
