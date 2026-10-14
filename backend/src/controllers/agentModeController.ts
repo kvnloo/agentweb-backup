@@ -1884,7 +1884,9 @@ type WorkPlanStepModelTurn =
 
 async function resolveWorkPlanStepModelForTurn(
   session: { userId: string; llmModel?: string; workPlan?: any },
-  options: { explicitPick?: string } = {},
+  // `viewerIsOwner` false = an interactive-share viewer: their pick may run for the turn on a model-less step, but it
+  // never rewrites the OWNER's stored step model (the viewer gets the pause; the owner resumes).
+  options: { explicitPick?: string; viewerIsOwner?: boolean } = {},
 ): Promise<WorkPlanStepModelTurn> {
   const plan = session.workPlan;
   if (!plan || !anyStepCarriesModel(plan.steps)) return { kind: 'none' };
@@ -1941,7 +1943,7 @@ async function resolveWorkPlanStepModelForTurn(
     };
   } catch (modelError) {
     if (!isModelUnavailableError(modelError)) throw modelError;
-    if (pick && candidate !== pick) {
+    if (pick && candidate !== pick && options.viewerIsOwner !== false) {
       // The plan's model is gone but the user chose another one: it runs, and the step adopts it (the engine marker then
       // follows the new step model, so the stamp is the engine's own from here on).
       const decision = await resolveHonored(pick, stepCount);
@@ -9159,7 +9161,7 @@ export async function generateSessionResponse(
   // ENG-2378: the plan's CURRENT pending step may carry its own model. It wins over the request's llmModel and
   // the session's for this turn (the session model is then updated so the UI shows the truth, exactly as /generate
   // does). A step model that has become unavailable mid-plan PAUSES the plan, loudly: never a swap.
-  const stepModelTurn = await resolveWorkPlanStepModelForTurn(updatedSession, { explicitPick: explicitModelPick });
+  const stepModelTurn = await resolveWorkPlanStepModelForTurn(updatedSession, { explicitPick: explicitModelPick, viewerIsOwner: !isInteractiveShare });
   if (stepModelTurn.kind === 'unavailable') {
     const paused = await pauseWorkPlanForUnavailableStepModel(sessionId, userId, stepModelTurn, { emitToUser: false });
     return {
@@ -9195,7 +9197,9 @@ export async function generateSessionResponse(
       ? undefined
       : (stepModelTurn.userPick ? (stepModelTurn.engineChoice ?? (updatedSession.workPlan as any)?.engineModel) : llmModel);
     const wp: any = updatedSession.workPlan;
-    if (wp && (adoptStepModel || wp.engineModel !== nextEngineModel)) {
+    // A share viewer's pick runs for the turn but leaves the owner's plan alone (no adoption, no marker change).
+    const viewerPick = Boolean(isInteractiveShare) && stepModelTurn.kind === 'resolved' && Boolean(stepModelTurn.userPick);
+    if (wp && !viewerPick && (adoptStepModel || wp.engineModel !== nextEngineModel)) {
       const { engineModel: _previousEngineModel, ...wpRest } = wp;
       await chatbotDb.updateSessionWorkPlan(sessionId, {
         ...wpRest,

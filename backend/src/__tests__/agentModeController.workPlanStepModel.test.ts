@@ -672,3 +672,44 @@ describe('picker flow: PATCH /llm-model then /generate echoing the stamp', () =>
     expect(workerModels()[1]).toBe('claude-step-model');
   });
 });
+
+describe('round 4: share viewers and the first-step baseline', () => {
+  let store: any;
+  const mkStore = (wp: any, stamp: string) => {
+    store = makeSession(wp, stamp);
+    db.getChatSession.mockImplementation(async () => JSON.parse(JSON.stringify(store)));
+    db.getChatSessionRecord.mockImplementation(async () => JSON.parse(JSON.stringify(store)));
+    db.updateSessionLlmModel.mockImplementation(async (_id: string, m: string) => { store.llmModel = m; return store; });
+    db.updateSessionWorkPlan.mockImplementation(async (_id: string, w: any) => { store.workPlan = w; return store; });
+  };
+  const base = { launchModel: 'gemini-3.5-flash', planDefaultModel: 'gpt-5-chat-2' };
+
+  it('a share VIEWER\'s pick never rewrites the owner\'s retired step model: the viewer gets the pause, the owner resumes', async () => {
+    mkStore({ steps: [step(1, 'pending', RETIRED)], ...base, engineModel: RETIRED }, 'claude-step-model'); // the viewer PATCHed the stamp
+    const viewer = await generateSessionResponse(SESSION_ID, 'go', OWNER, 'claude-step-model', undefined, true);
+    expect(worker.runInWorker).not.toHaveBeenCalled();
+    expect(viewer.content).toContain('Choose another model in the model picker');
+    expect(store.workPlan.steps[0].model).toBe(RETIRED);
+    // the genuine owner, same stamp, resumes
+    await generateSessionResponse(SESSION_ID, 'go', OWNER, 'claude-step-model', undefined, false);
+    expect(workerModels()).toEqual(['claude-step-model']);
+    expect(store.workPlan.steps[0].model).toBe('claude-step-model');
+  });
+
+  it('on a MODEL-LESS step a viewer\'s pick still runs for the turn, with no plan write', async () => {
+    mkStore({ steps: [step(1, 'pending'), step(2, 'pending', 'gpt-5.5')], ...base, engineModel: 'gpt-5-chat-2' }, 'claude-step-model');
+    await generateSessionResponse(SESSION_ID, 'go', OWNER, 'claude-step-model', undefined, true);
+    expect(workerModels()).toEqual(['claude-step-model']);
+    expect(db.updateSessionWorkPlan).not.toHaveBeenCalled();
+  });
+
+  it('M2: when Emma pinned a plan default, an untouched stamp (= the pin) is NOT a pick, so a retired first-step model pauses instead of adopting the pin', async () => {
+    // launchModel is the PRE-pin model, planDefaultModel the pin the launch stamped onto the session
+    mkStore({ steps: [step(1, 'pending', RETIRED), step(2, 'pending')], launchModel: 'gemini-3.5-flash', planDefaultModel: 'gpt-5-chat-2' }, 'gpt-5-chat-2');
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq('gpt-5-chat-2'), res);
+    expect(worker.runInWorker).not.toHaveBeenCalled();
+    expect(store.workPlan.steps[0].model).toBe(RETIRED);
+    expect(res.body.content).toContain('Choose another model in the model picker');
+  });
+});
