@@ -705,7 +705,6 @@ mcpToolRegistry.register({
         backup_model: { type: 'string', description: 'Legacy field, retained for compatibility. Since ENG-1211 a scheduled run always uses its own preferred model below the hard usage cap, so this is never consulted. Omitting it changes nothing.' },
         session_id: { type: 'string', description: 'Existing chat session ID to base the schedule on (create only)' },
         revoke_autopublish: { type: 'boolean', description: 'Set true to STOP this schedule publishing to the user\'s live connected accounts on its unattended runs, so future runs draft the content and tell them what is waiting instead. Revoking is always safe and always allowed. You CANNOT turn it back on — that means posts go live without the user ever seeing them, so only they can do it, on the schedule form. If a user asks you to enable automatic posting, point them there and never claim you have enabled it.' },
-        timezone: { type: 'string', description: 'IANA timezone the schedule runs in, e.g. America/Los_Angeles (create/update)' },
         status: { type: 'string', enum: ['active', 'paused'], description: 'Status (toggle only)' }
       },
       required: ['action']
