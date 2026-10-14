@@ -1091,13 +1091,17 @@ describe("POST /api/onboarding/icp/edit-one records the user's words as an ancho
       .send({ icpId: "icp-0", patch: { name: "patients and healthcare professionals." } });
 
     expect(res.status).toBe(200);
-    const written = userDb.updateUser.mock.calls.at(-1)![1].icpResult;
-    expect(written[0].name).toBe("patients and healthcare professionals.");
-    expect(written[0].userIntent).toEqual({
-      name: "patients and healthcare professionals.",
-    });
+    // One card, written by path: the visible field and a fresh anchor holding only
+    // the field the user edited.
+    const options = userDb.updateUser.mock.calls.at(-1)![2];
+    expect(options.pathSets).toEqual([
+      { path: ["icpResult", 0, "name"], value: "patients and healthcare professionals." },
+      { path: ["icpResult", 0, "userIntent"], value: { name: "patients and healthcare professionals." } },
+    ]);
     // Untouched fields are not anchored — regeneration is free to rewrite them.
-    expect(written[0].userIntent.pain).toBeUndefined();
+    expect(JSON.stringify(options.pathSets)).not.toContain("pain");
+    // The write is conditioned on the card it was computed from, and on there being no anchor yet.
+    expect(options.condition.expression).toContain("attribute_not_exists(#cl[0].#cui)");
   });
 
   it("merges a second edit into the existing anchor", async () => {
@@ -1109,10 +1113,14 @@ describe("POST /api/onboarding/icp/edit-one records the user's words as an ancho
       .post("/api/onboarding/icp/edit-one")
       .send({ icpId: "icp-0", patch: { pain: "second edit" } });
 
-    const written = userDb.updateUser.mock.calls.at(-1)![1].icpResult;
-    expect(written[0].userIntent).toEqual({
-      name: "first edit",
-      pain: "second edit",
-    });
+    // Merged into the existing anchor by setting only the new field inside it, so
+    // the first edit is not replaced.
+    const options = userDb.updateUser.mock.calls.at(-1)![2];
+    expect(options.pathSets).toEqual([
+      { path: ["icpResult", 0, "pain"], value: "second edit" },
+      { path: ["icpResult", 0, "userIntent", "pain"], value: "second edit" },
+    ]);
+    expect(options.condition.expression).toContain("attribute_type(#cl[0].#cui, :tM)");
+    expect(options.condition.values[":tM"]).toBe("M");
   });
 });

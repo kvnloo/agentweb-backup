@@ -176,8 +176,9 @@ describe('ENG-2338 Luma API-first guidance', () => {
 // ENG-2338: the Luma key is NOT in Connected Accounts (OAuth only); Emma must send users to the card.
 describe('ENG-2338 Luma key placement', () => {
   it('tells the agent the key goes on Login Credentials, with a direct link, never Connected Accounts', () => {
-    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('Settings > Login Credentials > Luma API key');
-    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('/settings/login-credentials');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('saved on the "Luma API key" card in Settings > Login Credentials');
+    // The exact markdown link renders clickable in chat (checked in the preview); a bare path does not.
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('[Settings → Login Credentials](/settings/login-credentials)');
     expect(AGENT_MODE_SYSTEM_PROMPT).not.toMatch(/Connected Accounts[^\n]{0,40}Luma|Luma[^\n]{0,40}Connected Accounts/);
   });
 });

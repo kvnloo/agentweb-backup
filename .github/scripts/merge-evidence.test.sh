@@ -1609,6 +1609,12 @@ d="$(new_fixture_dir)"; foreign_pr "${d}" 'harshmoney123' 'swarm/eng-2116-x'; ru
 check 'ENG-2116: a swarm-owned green PR is not FOREIGN_OWNER' 0 'VERDICT: PASS'
 d="$(new_fixture_dir)"; foreign_pr "${d}" 'harshmoney123' 'mananx/eng-1'; run_gate "${d}"
 check 'ENG-2116: prefix match is exact (mananx/ is not manan/)' 0 'VERDICT: PASS'
+d="$(new_fixture_dir)"; foreign_pr "${d}" 'anurag-seth' 'anurag/eng-1-x'; MERGE_EVIDENCE_DIRECTING_LOGIN='anurag-seth' run_gate "${d}"
+check 'ENG-2116 opt2: Anurag directing a merge of his own green PR PASSes' 0 'VERDICT: PASS'
+d="$(new_fixture_dir)"; foreign_pr "${d}" 'anurag-seth' 'anurag/eng-1-x'; MERGE_EVIDENCE_DIRECTING_LOGIN='mananv-argusoft' run_gate "${d}"
+check 'ENG-2116 opt2: Manan cannot direct a merge of Anurag PR' 5 'VERDICT: FOREIGN_OWNER'
+d="$(new_fixture_dir)"; foreign_pr "${d}" 'harshmoney123' 'anurag/eng-1-x'; MERGE_EVIDENCE_DIRECTING_LOGIN='anurag-seth' run_gate "${d}"
+check 'ENG-2116 opt2: author must match, branch prefix alone is not enough' 5 'VERDICT: FOREIGN_OWNER'
 
 printf '\n%s tests, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
 [ "${TESTS_FAILED}" -eq 0 ]

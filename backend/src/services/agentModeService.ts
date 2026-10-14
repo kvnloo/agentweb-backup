@@ -52,7 +52,7 @@ import {
 import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
 import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
-import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
+import { ANTI_LOOP_STOP_MESSAGE, EMPTY_FINAL_RESPONSE_FALLBACK } from './agentMode/core/termination';
 import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
 import {
   normalizeOpenRouterResponseMetadata,
@@ -80,10 +80,10 @@ import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActions
 // 4 exports and agentMode/dataFabricationGuard's 5 exports were used only by
 // generateImage, which moved to emma/impl/mediaVideo.ts (imports them there directly).
 import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory, type ToolDispatchPorts } from './agentMode/core/toolDispatch';
-import { computeCheckpointBatch } from './agentMode/incrementalPersist';
+import { computeCheckpointBatch, isPersistedResponseMessage } from './agentMode/incrementalPersist';
 import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, buildFinalizeJudgePrompt, parseFinalizeJudgeOutput, FINALIZE_JUDGE_MAX_COMPLETION_TOKENS } from './agentMode/core/finalizeGuard';
-import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
+import { reconcileUnconsumedCursors, ROW_KEYS as LEDGER_ROW_KEYS } from './agentMode/core/unconsumedCursor';
 import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
 import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionIndex } from '../utils/modelMentionRequest';
 import { resolveTurnModelCorrection } from '../utils/modelCorrectionStamp';
@@ -3655,6 +3655,7 @@ export class AgentModeService {
       let lastToolSignature = '';
       let consecutiveRepeats = 0;
       const MAX_CONSECUTIVE_REPEATS = 3;
+      let antiLoopRepeatNudged = false;
       // Sliding-window loop detection: catches alternating/cycling patterns like
       // navigate→screenshot→navigate→screenshot that evade the consecutive check
       const toolSignatureHistory: string[] = [];
@@ -3741,7 +3742,9 @@ export class AgentModeService {
           const urgency = remaining <= 3
             ? `[SYSTEM WARNING] Only ${remaining} step${remaining === 1 ? '' : 's'} remaining. Stop all searching/pagination immediately. Complete any pending writes, then give your final response with what you have so far.`
             : `[SYSTEM] Step budget: ${iteration}/${maxIterations} used, ${remaining} steps remaining. Prefer batch operations, avoid unnecessary pagination, and wrap up soon.`;
-          (messages as any[]).push({ role: 'user', content: urgency });
+          // Opslane 2026-10-13: in-turn control text is role 'system' (as ENG-763 did for
+          // the cross-turn loop-breaker) — as 'user' the model attributes it to the user.
+          (messages as any[]).push({ role: 'system', content: urgency });
         }
 
         // ENG-907: same self-regulation for the wall-clock budget. The first iteration is
@@ -3765,13 +3768,13 @@ export class AgentModeService {
               'no longer honouring tool calls and forcing a final synthesis so the work so far is delivered'
             );
             (messages as any[]).push({
-              role: 'user',
+              role: 'system',
               content: buildTurnTimeBudgetNudge(timeBudget, 'final_synthesis'),
             });
           } else if (timeBudget.phase === 'wrap_up' && !timeBudgetWrapUpWarned) {
             timeBudgetWrapUpWarned = true;
             (messages as any[]).push({
-              role: 'user',
+              role: 'system',
               content: buildTurnTimeBudgetNudge(timeBudget, 'wrap_up'),
             });
           }
@@ -4074,7 +4077,7 @@ export class AgentModeService {
               'forcing a final synthesis so the work done so far is delivered instead of a hard failure'
             );
             (messages as any[]).push({
-              role: 'user',
+              role: 'system',
               content: buildTurnTimeBudgetNudge(
                 evaluateTurnTimeBudget({
                   startedAtMs: turnStartedAtMs,
@@ -5006,10 +5009,13 @@ export class AgentModeService {
           .join('|') || '';
         if (currentToolSignature && currentToolSignature === lastToolSignature) {
           consecutiveRepeats++;
-          if (consecutiveRepeats >= MAX_CONSECUTIVE_REPEATS) {
+          // Once per turn: re-adding it on every identical step piles up copies of the
+          // same instruction (Opslane 2026-10-13); one standing system directive is enough.
+          if (consecutiveRepeats >= MAX_CONSECUTIVE_REPEATS && !antiLoopRepeatNudged) {
+            antiLoopRepeatNudged = true;
             console.warn(`AgentMode: Detected ${consecutiveRepeats} consecutive identical tool calls in session ${sessionId}, injecting anti-loop warning`);
             (messages as any[]).push({
-              role: 'user',
+              role: 'system',
               content: ANTI_LOOP_STOP_MESSAGE,
             });
           }
@@ -5035,7 +5041,7 @@ export class AgentModeService {
               console.warn(`AgentMode: Detected cycling tool call pattern (${maxCount}x in last ${SIGNATURE_HISTORY_WINDOW} steps) in session ${sessionId}, injecting anti-loop warning`);
               toolSignatureHistory.length = 0; // reset to avoid spamming
               (messages as any[]).push({
-                role: 'user',
+                role: 'system',
                 content: '[SYSTEM] You are stuck in a loop — you have been calling the same tools repeatedly without making meaningful progress. STOP. Do not navigate or take screenshots again. Provide your final response now based on what you have already observed.'
               });
             }
@@ -5348,6 +5354,34 @@ export class AgentModeService {
         }
       }
 
+      // Opslane 2026-10-13: persist exactly what is returned. The step-cap,
+      // content-filter and time-budget texts are assigned to `content` after the
+      // model's own (often empty) message was already appended, so the transcript
+      // kept "" while the user read the explanation. Reconcile once, here, after
+      // every content rewrite above. Never mutate a message incremental
+      // checkpointing already wrote — append a fresh one instead.
+      if (!wasCancelled) {
+        if (!content || !content.trim()) {
+          content = EMPTY_FINAL_RESPONSE_FALLBACK;
+        }
+        const persistedTail = messages.slice(initialMessageCount).filter(isPersistedResponseMessage);
+        const lastResponse: any = persistedTail[persistedTail.length - 1];
+        const lastIsUnflushedTextAnswer = !!lastResponse
+          && lastResponse.role === 'assistant'
+          && !(Array.isArray(lastResponse.tool_calls) && lastResponse.tool_calls.length > 0)
+          && persistedTail.length > persistedResponseCount;
+        if (lastIsUnflushedTextAnswer) {
+          if (lastResponse.content !== content) lastResponse.content = content;
+        } else {
+          (messages as any[]).push({
+            role: 'assistant',
+            content,
+            llm: llmModel,
+            metadata: { timestamp: new Date().toISOString() },
+          });
+        }
+      }
+
       // Attach timing metadata, memory usage, and tool calls to the last assistant message
       if (messages.length > 0) {
         const lastAssistantIdx = messages.length - 1 - [...messages].reverse().findIndex((m: any) => m.role === 'assistant');
@@ -5387,11 +5421,9 @@ export class AgentModeService {
           };
         }
       }
-      // Filter out user messages from responseMessages since the controller already saved
-      // the user message before calling this function. Only return assistant/tool messages.
-      const responseMessages = messages.slice(initialMessageCount).filter(
-        (msg: any) => msg.role !== 'user'
-      );
+      // Only assistant/tool messages are persisted: the controller already saved the
+      // user message, and system messages are in-turn control nudges.
+      const responseMessages = messages.slice(initialMessageCount).filter(isPersistedResponseMessage);
 
       recordAgentModeRunCompleted(agentRuntimeRunId, {
         sessionId,
@@ -5482,7 +5514,7 @@ export class AgentModeService {
       const partialResponseMessages = _messages
         ? _messages
             .slice(_initialMessageCount)
-            .filter((msg: any) => msg.role !== 'user')
+            .filter(isPersistedResponseMessage)
             .slice(_persistedResponseCount)
             .filter((msg: any) => msg.usage)
         : [];
@@ -7860,6 +7892,18 @@ export class AgentModeService {
       return minimal;
     }
 
+    // ENG-2338: keep enough of a Luma result for the ledger to tell "pulled 0 guests" from "no key connected" (both
+    // would otherwise minimise to {}). `rowCount` is what the unread-page notice reads; rows themselves are dropped.
+    if (toolName === 'luma_get_guests' || toolName === 'luma_list_events') {
+      const rows = Array.isArray(result?.guests) ? result.guests : Array.isArray(result?.events) ? result.events : undefined;
+      const minimal: Record<string, any> = {};
+      for (const field of ['success', 'connected', 'nothing_pulled', 'reason', 'count', 'has_more', 'next_cursor', 'skipped_without_registration']) {
+        if (result?.[field] !== undefined) minimal[field] = result[field];
+      }
+      if (rows) minimal.rowCount = rows.length;
+      return minimal;
+    }
+
     // For playwright screenshots, result has already been processed (base64 → S3 URL)
     if (toolName === 'playwright_browser_take_screenshot') {
       return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };
@@ -8345,7 +8389,7 @@ export class AgentModeService {
       // Zero is worse than silence in that sentence: it reads as "this found
       // nothing", the opposite of what happened.
       if (Object.keys(paginationMarkers).length > 0) {
-        for (const key of ['leads', 'engagements', 'results', 'items', 'rows']) {
+        for (const key of LEDGER_ROW_KEYS) {
           const value = (result as Record<string, unknown>)[key];
           if (Array.isArray(value)) { paginationMarkers.rowCount = value.length; break; }
         }
@@ -16311,6 +16355,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
     // manage_scheduled_chat validation errors — guide LLM to the exact fix instead of a generic retry
     if (toolName === 'manage_scheduled_chat') {
+      // ENG-1656: tool-side preflight already names the exact field to fix.
+      if (safeMessage.includes('Invalid manage_scheduled_chat arguments')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: Correct exactly the argument named above and retry immediately. Nothing was sent to the server, so no schedule was created or changed.`;
+      }
+      if (safeMessage.includes('Invalid nextRunTime') || safeMessage.includes('valid IANA timezone') || safeMessage.includes('Invalid status')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: next_run_time must be an ISO 8601 datetime, timezone a valid IANA identifier (e.g. America/Los_Angeles), and toggle status "active" or "paused". Correct the named value and retry immediately.`;
+      }
       if (safeMessage.includes('Missing required fields')) {
         return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: For action "create", schedule_name, starting_message, and schedule_frequency are all required. For action "update", these three fall back to the schedule's existing values if omitted, but at least one must resolve to a non-empty value. Add the missing field(s) named above and retry immediately.`;
       }

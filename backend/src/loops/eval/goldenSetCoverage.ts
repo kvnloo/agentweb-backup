@@ -2,14 +2,16 @@
  * Golden-set label coverage (ENG-2135): how many human-labelled cases exist per surface, split and
  * criterion, and whether any grader could reach MIN_VALIDATION_N on the test split.
  *
- * Pure and read-only: it counts labels a human already saved. It never grades, never calls an LLM
- * and never produces or suggests a label. Output is aggregates only: no case ids, source ids or
+ * Pure and read-only: it counts labels a human already saved. A case whose label an AI wrote (note starts
+ * with [AI-LABEL], see goldenSet.ts) is counted as unlabelled and reported apart, so this report never says
+ * the human work is done when it is not. It never grades, never calls an LLM and never produces or suggests
+ * a label. Output is aggregates only: no case ids, source ids or
  * text. Pairwise creative cases (an A / B / tie label, not these binary criteria) are counted
  * apart, as runValidation excludes them too.
  */
 
 import { MIN_VALIDATION_N, type EvalSurface } from './evalRegistry';
-import { GOLDEN_CRITERIA, type GoldenCase, type GoldenCriterion, type GoldenSplit } from './goldenSet';
+import { GOLDEN_CRITERIA, isAiLabelled, type GoldenCase, type GoldenCriterion, type GoldenSplit } from './goldenSet';
 
 export interface CriterionCoverage {
   criterion: string;
@@ -27,6 +29,8 @@ export interface SplitCoverage {
   totalCases: number;
   /** Binary cases with at least one human label saved on a criterion. */
   casesWithBinaryLabel: number;
+  /** Cases (binary or pairwise) carrying labels an AI wrote; those labels are not counted anywhere below. */
+  aiLabelledCases: number;
   /** Pairwise creative cases, reported apart. */
   pairwiseCases: number;
   pairwiseLabelled: number;
@@ -54,7 +58,7 @@ function summarizeSplit(split: GoldenSplit, cases: readonly GoldenCase[], criter
   const rows: CriterionCoverage[] = criteria.map((criterion) => {
     const row: CriterionCoverage = { criterion, pass: 0, fail: 0, na: 0, unlabelled: 0, nAvailable: 0 };
     for (const c of binary) {
-      const label = c.labels[criterion as GoldenCriterion];
+      const label = isAiLabelled(c) ? undefined : c.labels[criterion as GoldenCriterion];
       if (label === 'pass') row.pass++;
       else if (label === 'fail') row.fail++;
       else if (label === 'na') row.na++;
@@ -66,9 +70,10 @@ function summarizeSplit(split: GoldenSplit, cases: readonly GoldenCase[], criter
   return {
     split,
     totalCases: binary.length,
-    casesWithBinaryLabel: binary.filter((c) => criteria.some((k) => c.labels[k as GoldenCriterion] !== undefined)).length,
+    casesWithBinaryLabel: binary.filter((c) => !isAiLabelled(c) && criteria.some((k) => c.labels[k as GoldenCriterion] !== undefined)).length,
+    aiLabelledCases: cases.filter((c) => isAiLabelled(c) && Object.keys(c.labels).length > 0).length,
     pairwiseCases: pairwise.length,
-    pairwiseLabelled: pairwise.filter((c) => Object.keys(c.labels).length > 0).length,
+    pairwiseLabelled: pairwise.filter((c) => !isAiLabelled(c) && Object.keys(c.labels).length > 0).length,
     criteria: rows,
   };
 }
@@ -99,6 +104,7 @@ export function formatLabelCoverage(coverage: LabelCoverage): string[] {
     for (const split of ['test', 'dev'] as const) {
       const sp = s.splits[split];
       lines.push('', `${s.surface} / ${split}: ${sp.totalCases} cases, ${sp.casesWithBinaryLabel} with at least one binary human label`);
+      if (sp.aiLabelledCases > 0) lines.push(`  ${sp.aiLabelledCases} case(s) hold AI-written labels: not counted as human`);
       if (sp.pairwiseCases > 0) lines.push(`  pairwise creative (reported separately): ${sp.pairwiseCases} cases, ${sp.pairwiseLabelled} labelled`);
       for (const c of sp.criteria) {
         lines.push(

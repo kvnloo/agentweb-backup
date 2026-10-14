@@ -502,92 +502,169 @@ async function readUserForRegeneration(userId: string): Promise<any> {
   }
 }
 
-/**
- * What an edit of the persona list decided, given the list as it stands NOW.
- * `status` aborts the write (the caller maps it to a 4xx); otherwise `next` is
- * the list to store and `result` is handed back to the caller untouched.
- */
-export type IcpListEdit<T> =
-  | { next: ICPPersona[]; result: T }
-  | { status: 400 | 404 };
+export const ICP_LIST_CONTENDED = "ICP_LIST_CONTENDED";
+const MAX_CARD_WRITE_ATTEMPTS = 8;
 
-const MAX_LIST_WRITE_ATTEMPTS = 6;
+export type IcpCardOp =
+  | { type: "edit"; patch: Record<string, string> }
+  | { type: "delete" };
 
-/**
- * Edit the persona list as a compare-and-swap. The route used to read the list,
- * change it and write the WHOLE list back, so two writers that read the same
- * list each wrote one without the other's change: a delete (or an edit) clicked
- * while another was in flight was silently lost. Here every write is conditioned
- * on the list still being exactly what the edit was computed from; if it moved,
- * the edit is recomputed from a fresh read, so both changes land. Reads are
- * base-table reads: the UserIdIndex can still show the list from before the
- * previous write, which would make every retry compute from the same stale list.
- */
-export async function casUpdateIcpList<T>(
-  userId: string,
-  edit: (list: ICPPersona[]) => IcpListEdit<T>,
-): Promise<{ ok: true; next: ICPPersona[]; result: T } | { ok: false; status: 400 | 404 }> {
-  // One list write per user at a time within this process. Most contention on a
-  // user's list is requests that landed on the same instance (a user clicking
-  // quickly); queueing them here means they never fight over the condition, so
-  // the compare-and-swap below is left for contention BETWEEN instances. Without
-  // it, 20 simultaneous writes exhausted the retries and the unconditional final
-  // attempt lost an edit.
-  const behind = icpListQueues.get(userId) ?? Promise.resolve();
-  const mine = behind.catch(() => undefined).then(() => casUpdateIcpListUnqueued(userId, edit));
-  icpListQueues.set(userId, mine);
-  try {
-    return await mine;
-  } finally {
-    if (icpListQueues.get(userId) === mine) icpListQueues.delete(userId);
-  }
+export type IcpCardResult =
+  | { ok: true; icpResult: ICPPersona[] }
+  | { ok: false; status: 400 | 404 };
+
+const ID_LESS_IDENTITY_FIELDS = ["name", "pain", "desire", "objection"] as const;
+
+function fingerprintOf(card: any): Record<string, unknown> {
+  return Object.fromEntries(ID_LESS_IDENTITY_FIELDS.map((f) => [f, card?.[f]]));
 }
 
-const icpListQueues = new Map<string, Promise<unknown>>();
+function sameFingerprint(card: any, fingerprint: Record<string, unknown>): boolean {
+  return ID_LESS_IDENTITY_FIELDS.every((f) => JSON.stringify(card?.[f]) === JSON.stringify(fingerprint[f]));
+}
 
-/** The compare-and-swap itself, without the per-process queue. Exported so tests can simulate two instances. */
-export async function casUpdateIcpListUnqueued<T>(
+/**
+ * Edit or delete ONE persona, touching only that card.
+ *
+ * The routes used to read the whole list, change it in memory and write the whole
+ * list back, so two writers that read the same list each stored one change without
+ * the other. A whole-list compare-and-swap fixed that but made every write depend
+ * on the entire stored list reading back byte-equal, which needs an unconditional
+ * last attempt (and so can still lose a change) when it never does.
+ *
+ * Here each write is a document-path update on the one card, conditioned only on
+ * what that write depends on: that the card at the index we read is still the same
+ * card. Writers on different cards or fields never conflict, a delete that shifts
+ * the list simply makes later writes recompute their index from a fresh read, and
+ * nothing here compares data that could fail to read back equal. Reads are
+ * base-table reads: the UserIdIndex can still show the list from before the last
+ * write, which would make every retry compute the same stale index.
+ */
+export async function writeIcpCard(
   userId: string,
-  edit: (list: ICPPersona[]) => IcpListEdit<T>,
-): Promise<{ ok: true; next: ICPPersona[]; result: T } | { ok: false; status: 400 | 404 }> {
-  for (let attempt = 0; attempt < MAX_LIST_WRITE_ATTEMPTS; attempt++) {
+  resolve: (list: ICPPersona[]) => { index: number } | { status: 400 | 404 },
+  op: IcpCardOp,
+): Promise<IcpCardResult> {
+  // The card the caller meant, fixed on the FIRST read. A retry must find that same
+  // card again, not re-run `resolve`: a positional ref such as `icp-2` names
+  // whatever sits at position 2 NOW, which after a concurrent delete is a different
+  // card.
+  let target: { idKnown: boolean; id: unknown; fingerprint: Record<string, unknown>; index: number; length: number; twins: number } | null = null;
+
+  for (let attempt = 0; attempt < MAX_CARD_WRITE_ATTEMPTS; attempt++) {
     const user: any = await readUserForRegeneration(userId);
     const list: ICPPersona[] = Array.isArray(user?.icpResult) ? user.icpResult : [];
-    const decided = edit(list);
-    if ("status" in decided) return { ok: false, status: decided.status };
-    // The final attempt is unconditional. The condition is whole-list equality, so
-    // a list that never reads back equal to what is stored (or sustained
-    // contention) would otherwise fail every edit and delete for that user, with
-    // nothing the user could do about it. Applying the change computed from the
-    // freshest read costs a concurrent change that lands between that read and
-    // this write: the lost update this helper exists to avoid, but only after five
-    // straight losses, i.e. under sustained contention, and it is logged below.
-    const lastAttempt = attempt === MAX_LIST_WRITE_ATTEMPTS - 1;
-    try {
-      await userDb.updateUser(
-        userId,
-        { icpResult: decided.next as any },
-        lastAttempt
-          ? undefined
-          : {
-              condition: {
-                expression: "#icpResult = :icpListExpected",
-                names: { "#icpResult": "icpResult" },
-                values: { ":icpListExpected": list },
-              },
-            },
-      );
-      if (lastAttempt) {
-        console.warn("[onboardingIcpService] saved the persona list without the compare-and-swap after repeated conflicts", { userId });
+    if (list.length === 0) return { ok: false, status: 404 };
+
+    let idx: number;
+    if (!target) {
+      const resolved = resolve(list);
+      if ("status" in resolved) return { ok: false, status: resolved.status };
+      idx = resolved.index;
+      const first: any = list[idx];
+      const fingerprint = fingerprintOf(first);
+      // Id-less cards with identical text: once one of them changes, the survivor
+      // cannot be told from the card that was clicked.
+      const twins = first?.id !== undefined ? 1 : list.filter((p: any) => p?.id === undefined && sameFingerprint(p, fingerprint)).length;
+      target = { idKnown: first?.id !== undefined, id: first?.id, fingerprint, index: idx, length: list.length, twins };
+    } else {
+      // Same card by identity: its id, or, for a card stored before ids existed, its
+      // visible text.
+      const wanted = target;
+      if (!wanted.idKnown && wanted.twins > 1) {
+        // The write failed because this position changed; with look-alikes present, a
+        // lone survivor of the same text may be the OTHER card. Never guess.
+        throw Object.assign(new Error("the persona could not be re-identified"), { code: ICP_LIST_CONTENDED });
       }
-      return { ok: true, next: decided.next, result: decided.result };
+      const matches = list
+        .map((p: any, i) => ({ i, p }))
+        .filter(({ p }) => (wanted.idKnown ? p?.id === wanted.id : p?.id === undefined && sameFingerprint(p, wanted.fingerprint)));
+      if (matches.length > 1) {
+        // Same-looking cards cannot be told apart: never guess.
+        throw Object.assign(new Error("the persona could not be re-identified"), { code: ICP_LIST_CONTENDED });
+      }
+      if (matches.length === 1) {
+        idx = matches[0].i;
+      } else if (!wanted.idKnown && list.length === wanted.length && (list[wanted.index] as any)?.id === undefined) {
+        // A concurrent edit changed the text this card was matched on. Nothing was
+        // added or removed, so it is still where it was.
+        idx = wanted.index;
+      } else {
+        // Gone, or moved and changed beyond recognition. 404 makes the client refresh
+        // instead of offering a retry that could land on a different card.
+        return { ok: false, status: 404 };
+      }
+      target.index = idx;
+      target.length = list.length;
+      if (!wanted.idKnown) target.fingerprint = fingerprintOf(list[idx]);
+    }
+    const card: any = list[idx];
+
+    // Identity: the same card still sits at this index. Compared with whatever
+    // value was read (any type) so a card with an odd stored shape can still match.
+    const names: Record<string, string> = { "#cl": "icpResult", "#cid": "id" };
+    const values: Record<string, unknown> = {};
+    // The element must still exist: a nameless, id-less card would otherwise pass the
+    // checks below at an index the list has since shrunk past.
+    const clauses: string[] = [`attribute_exists(#cl[${idx}])`];
+    if (card?.id !== undefined) {
+      values[":cid"] = card.id;
+      clauses.push(`#cl[${idx}].#cid = :cid`);
+    } else {
+      // No id to hold on to: the visible text is the identity. A name alone cannot
+      // tell two same-named cards apart, so a card sliding into this position after
+      // a concurrent delete would pass it.
+      clauses.push(`attribute_not_exists(#cl[${idx}].#cid)`);
+      ID_LESS_IDENTITY_FIELDS.forEach((f, n) => {
+        names[`#cf${n}`] = f;
+        if (card?.[f] === undefined) {
+          clauses.push(`attribute_not_exists(#cl[${idx}].#cf${n})`);
+        } else {
+          values[`:cf${n}`] = card[f];
+          clauses.push(`#cl[${idx}].#cf${n} = :cf${n}`);
+        }
+      });
+    }
+
+    const writeOptions: Parameters<typeof userDb.updateUser>[2] = {};
+    if (op.type === "delete") {
+      writeOptions.pathRemoves = [{ path: ["icpResult", idx] }];
+    } else {
+      const fields = Object.keys(op.patch);
+      writeOptions.pathSets = fields.map((f) => ({ path: ["icpResult", idx, f], value: op.patch[f] }));
+      // The user's own words are also kept as an anchor next to the visible field:
+      // every later regeneration of this persona is driven from the anchor, so it
+      // can neither be overwritten by a full-set run nor drift (ENG-255). Merged,
+      // not replaced, so an edit to a second field keeps the first. The write
+      // asserts the anchor's current shape, so two first edits racing cannot both
+      // think they are the first.
+      names["#cui"] = "userIntent";
+      const anchor = card?.userIntent;
+      const anchorPath = `#cl[${idx}].#cui`;
+      if (anchor === undefined) {
+        clauses.push(`attribute_not_exists(${anchorPath})`);
+        writeOptions.pathSets.push({ path: ["icpResult", idx, "userIntent"], value: { ...op.patch } });
+      } else if (anchor !== null && typeof anchor === "object" && !Array.isArray(anchor)) {
+        values[":tM"] = "M";
+        clauses.push(`attribute_type(${anchorPath}, :tM)`);
+        for (const f of fields) writeOptions.pathSets.push({ path: ["icpResult", idx, "userIntent", f], value: op.patch[f] });
+      } else {
+        // Present but not a map (null, a list, a string): replace it with a fresh anchor.
+        clauses.push(`attribute_exists(${anchorPath})`);
+        writeOptions.pathSets.push({ path: ["icpResult", idx, "userIntent"], value: { ...op.patch } });
+      }
+    }
+    writeOptions.condition = { expression: clauses.join(" AND "), names, values };
+
+    try {
+      const updated: any = await userDb.updateUser(userId, {}, writeOptions);
+      return { ok: true, icpResult: Array.isArray(updated?.icpResult) ? updated.icpResult : [] };
     } catch (err: any) {
-      if (err?.code !== "ConditionalCheckFailedException" || lastAttempt) throw err;
-      await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1) + Math.random() * 30));
+      if (err?.code !== "ConditionalCheckFailedException") throw err;
+      await new Promise((resolve) => setTimeout(resolve, 15 * (attempt + 1) + Math.random() * 25));
     }
   }
-  // Unreachable: the loop returns or throws on its last attempt.
-  throw new Error("casUpdateIcpList exhausted its attempts");
+  throw Object.assign(new Error("the persona list kept changing"), { code: ICP_LIST_CONTENDED });
 }
 
 /** True when the user has hand-written at least one field of this persona. */
