@@ -34,7 +34,7 @@ async function getExistingSubscriptions(appId: string, developerApiKey: string):
         (sub.eventType === 'contact.propertyChange' || sub.eventType === 'deal.propertyChange')) {
       subscribed.add(`${sub.eventType}:${sub.propertyName.toLowerCase()}`);
     } else if (!sub.propertyName &&
-        (sub.eventType === 'contact.creation' || sub.eventType === 'contact.deletion')) {
+        (sub.eventType === 'contact.creation' || sub.eventType === 'contact.deletion' || sub.eventType === 'contact.merge')) {
       subscribed.add(sub.eventType);
     }
   }
@@ -80,6 +80,8 @@ export async function ensureWebhookSubscriptions(
     // Contact: lifecycle events (no propertyName)
     candidateProps.add('contact.creation');
     candidateProps.add('contact.deletion');
+    // A merge leaves our stored hubspot_contact_id pointing at the merged-away contact (ENG-2465).
+    candidateProps.add('contact.merge');
 
     // Contact: standard props
     for (const prop of STANDARD_CONTACT_PROPS_TO_SUBSCRIBE) {
