@@ -1,3 +1,381 @@
+## ENG-0000: Opslane agent findings fixes (2026-10-13)
+
+Five bugs from Opslane's simulated-user run against `8eac4e0a5`, each reproduced with a failing test on current main before the fix.
+
+- **Schedule timezone.** `manage_scheduled_chat` now takes `timezone` (IANA). An offset-less `next_run_time` is read as wall-clock time in that zone (create) or the schedule's stored zone (update); with no zone it is rejected instead of being silently read as UTC (9am New York had been stored as 09:00Z). Logic in `backend/src/utils/scheduleRunTime.ts`. Create/update responses echo `nextRunTimeLocal` + `timezone` so Emma repeats what was stored.
+- **Email opt-out.** The tool maps an explicit `email_notifications: []` to `emailNotificationsOptOut: true`; the controller then stores no recipients on create and allows clearing on update. A bare REST `[]` without the flag keeps the requester-email fallback, because the customer portal sends `[]` for "not set". Responses echo the stored `emailNotifications`.
+- **Lead notification types.** `update_lead_notification_settings.leadTypes` is optional; omitted keeps the stored selection, so "off" then "on" no longer wipes it. An empty argument set is still rejected.
+- **In-turn nudges.** Consecutive-repeat anti-loop, sliding-window loop, step-budget and time-budget nudges are pushed as `role: 'system'` (ENG-763 precedent). The repeat nudge fires once per turn. `isPersistedResponseMessage` (incrementalPersist.ts) now excludes system messages from checkpoint/final persistence and error-path usage. Before this, the workplan-recovery system nudge was being persisted too. `CONTINUE_PROMPT` / `SYNTHESIS_NUDGE` deliberately stay user-role: they are continuation prompts, and Gemini needs a trailing user turn.
+- **Persisted reply.** After every content rewrite, the loop reconciles once: an empty final answer becomes `EMPTY_FINAL_RESPONSE_FALLBACK`, and the last unflushed assistant text message is set to the returned content. When the last persisted message is a tool or tool-call turn (step cap), a fresh assistant message is appended instead.
+
+## ENG-527: Product-feedback filing is never token-limited (2026-10-13)
+
+- New `services/productFeedbackFiling.ts` is the one shared filing policy (title normalization, replay guard, durable fingerprint) used by `POST /api/support/report-ui-bug` and Emma.
+- `agentModeController.generateResponse`: when over quota and the request carries `feedbackIntent: 'bug' | 'feature_request'`, the message is filed deterministically (zero LLM calls) and the tracked link returned; failures answer 502/503 `feedback_filing_failed` and never claim tracking. Ordinary over-quota generation keeps its 429.
+- Follow-up: the customer portal must send `feedbackIntent` from a Report bug / Request feature affordance.
+
+## ENG-273: WhatsApp STOP moves the customer to no platform (2026-10-13)
+
+- **ENG-273: STOP now moves the customer to "no platform", automatically.** Until now a customer who texted STOP stayed marked as being on WhatsApp: Slack stayed suppressed, every approval failed against the opt-out (502) and the agent engine held their task output until an admin disconnected them by hand. The webhook now, after recording the opt-out, resolves the account that holds the number and disconnects it (`disconnectWhatsAppForNumber`): number unbound, verification rows cleared, opt-out row left in place so the number stays blocked until START. It runs before the confirmation message and a storage error answers 500 so Meta redelivers (everything is idempotent). **Consequence to be aware of:** with no platform, an approval-required task has no channel to ask on, so the engine treats it as `no_channel` and releases that task's output to its subscribers unreviewed (the same as a customer who never connected anything). START clears the opt-out only; the customer reconnects from Settings (new consent). The STOP and START confirmation texts changed to say so, and need Harsha's wording review. Not covered: a number verified before the phone→user index existed cannot be resolved from the number alone (none exist in production: 0 of 489 users have a messaging channel).
+- **STOP follow-ups (same PR).** (1) The owner is emailed: WhatsApp was removed, approvals are off, how to undo it. (2) Approvals still waiting on WhatsApp when STOP arrives are cancelled as a system rejection (`reviewedBy: system:whatsapp-stop`), because nobody can answer them any more and the held results would otherwise wait for ever with no record; the results they hold are NOT sent, and the owner is told. Older Slack-era approvals are left alone. A tap from a number that is no longer connected now gets a reply instead of silence. (3) An approval that cannot be delivered (502) or a failed delivery receipt for an approval message emails the owner, at most once a day. (4) The account record carries `whatsappDisconnect {reason: stop|customer|admin, at, last4}` (additive, display only, cleared on a successful verification) and the admin Users list shows it ("Not connected (WhatsApp: customer texted STOP, 12/10/2026)"), plus a red "texted STOP, disconnect it" note for an account still bound to an opted-out number. (5) A code typed while the number was opted out is remembered (`whatsapp:verify-optedout:<phone>`); START finishes the connection and replies "You're connected", so the customer does not type the code twice. (6) A STOP from a number no account can be found for is logged as a warning. Items already covered and not changed: lead alerts email first and ship notifications are additive to email, so an account with no platform still hears by email.
+- **Decision recorded:** cancelling pending approvals marks them rejected rather than approving or releasing the held results. Releasing would email possibly-unreviewed work to subscribers because of one message; the safe failure is to withhold and say so. New tasks for an account with no platform still follow the existing no-channel rule (released), which is the earlier product decision.
+- **Review corrections (2026-10-13):** approvals are cancelled BEFORE the number is unbound and a failure throws, so a redelivered STOP can still find the account (once unbound it cannot); only `pending` approvals are cancelled (a `needs_changes` one may have a revision in flight), and every page of the index is read, not just the newest 200; a replacement number's waiting code is no longer wiped by the old number's STOP; START keeps its "waiting code" pointer until the connection has been attempted (a storage error no longer abandons it) and also resumes a first attempt that failed part-way (`claimed`); when START answers the customer itself (connected, or told why not) the generic opt-in text is not sent as well; the "we couldn't reach you" email is sent only while that approval is still pending, and gives back the day's slot if the email fails. Known and accepted: a crash between the disconnect and the owner email loses the email (the account marker still records why); a redelivered STOP after a successful disconnect cannot find the account, so it logs a warning and repeats the confirmation text.
+
+## ENG-2468: Resolve live user-owned LinkedIn account after reconnect (2026-10-13)
+
+`resolveUserOwnedAccountId` returned the first Unipile row; a reconnect appends a new account_id, so CRM message sync/invites stayed pinned to the dead session (401 Disconnected account). Now probes and prefers a live account, then unknown, then first.
+
+## ENG-2459: finalize guard shadow window - why 52 flags were false alarms, and what we changed (2026-10-13)
+
+The finalize guard (`backend/src/services/agentMode/core/finalizeGuard.ts`) ran in shadow mode in prod from 2026-09-28 11:46Z to 2026-10-12 (`AGENT_FINALIZE_GUARD_SHADOW`, ENG-2150). The flag is now unset and `AGENT_FINALIZE_GUARD` was never set.
+
+**Numbers (re-derived from raw tables, three independent passes).** 1,625 `agent_run_verdict` events, 288 `finalize_guard_shadow_judge` calls (the judge only runs when the keyword prefilter hits, about 17.7% of runs), 52 `claim_mismatch` flags in 42 sessions. The claim class behind 51 of the 52 is in the web.stdout CloudWatch log (`finalize guard SHADOW detected_mismatch ... claimClasses`): asset_generated 20, email_sent 11, schedule_created 9, task_created_or_updated 8, settings_saved 7, crm_saved 4. The event itself stores no claim or judge output.
+
+**Result.** By the guard's own definition (a completed action in one of the 7 classes with no successful backing tool in that run), 0 of the 52 were true mismatches. Causes of the false alarms:
+1. The tool-name matchers did not know real tools (`notify_session`, `add_gtm_work_items`, `update_gtm_work_item`, `create_html_*`, `create_social_media_posts`, knowledge-base writers). Replayed on real runs, the matcher change alone clears 21 of the 58 confidently-unbacked class flags; the new unbacked set is a strict subset of the old one in the 52 flagged and in 96 control runs.
+2. The judge prompt never told the judge to skip negated, withheld, zero-count, drafted, quoted or historical statements, and the guard accepted any known class with no quoted statement. About 37 class flags in 29 runs remain after the matcher change and look like judge reads of negations or retold history. The new prompt is NOT measured against a live judge yet.
+3. The ledger covers one invocation, so a retry nudge ("Please try again...") or a "continue" run loses the earlier run's tool calls (6 of 52). Not changed here.
+
+**Not a guard problem but real (found by the skeptic review, verified in raw data):** a scheduled Meta Ads report labelled as an analysis of a client after every client lookup failed (numbers came from the caller's own account), and a reply that invented account history absent from its only tool result. These are groundedness failures, not completed-action claims. Tracked with ENG-2137. The offline `gradeGroundedness` grader uses the same keyword prefilter with no judge, so its "ungrounded" rate is inflated by the same noise.
+
+**What changed.** Strict backing added only for tools whose success reliably means the action happened (`notify_session`, `add_gtm_work_items`, `update_gtm_work_item`, `post_on_connected_account`). Tools that can succeed without doing the thing are loose (ambiguous, never corrected): `send_gtm_status_report` (silent no-send), `create_html_*` / `update_html_file` / `create_social_media_posts` (an HTML document, not an image), `perform_data_analysis`, knowledge-base writers. The ledger keeps only a minimised result (`{}` for almost every tool, `extractMinimalToolResult`), so result fields like `draft` or `duplicate_suppressed` are invisible to the guard; that is why those tools are loose and not result-checked. The judge prompt now excludes negated/withheld/drafted/quoted/historical statements, requires a quoted statement, and ignores classes the lexicon did not surface. Dropped claims are counted (`discardedClaims`) and logged with a `console.warn` (session id and count only; not yet on the verdict event, so there is no metric or alert) so a judge whose output shape changes is at least visible in the logs. Class-name case and whitespace drift from the judge is tolerated. Judge `max_completion_tokens` 500 to 800 for the longer output.
+
+**Known limits.** (A saved LinkedIn draft no longer backs a "published" claim; see the ENG-2459 draft-post note.) `create_social_media_posts` still strictly backs a "published" claim (pre-existing); Spanish and other non-English replies skip the English-only lexicon unless they contain English nouns (under-detection, not false alarms).
+
+**Rollout.** Flags stay unset. Before any enforce use: run the live judge-accuracy script on the 52 reply texts and the labelled fixtures with the old and new prompt, then a second shadow window to re-measure precision. Enforce mode appends a visible "Correction" to customer replies, so false positives are customer-visible.
+
+## ENG-2459: a saved LinkedIn draft no longer backs a "published" claim (2026-10-13)
+
+`post_on_connected_account` strictly backs `post_published`, but with `save_as_draft` it also succeeds, so a reply claiming the post was
+published passed the guard (the "known limit" in the ENG-2459 precision change). The ledger result for this tool is minimized to `{}`,
+so a result check cannot see it; the ledger entry now also carries the call's arguments (`FinalizeLedgerEntry.args`), and both the
+strict and the loose matcher skip a call with `save_as_draft: true` (or a result flagged `draft`) for `post_published`. The same applies to
+`publish_blog_article`, which saves a CMS draft unless `status` is exactly `published` (the `publish_` prefix strictly backs `post_published`). A loop-level
+test pins the hand-off, because unit tests that build ledger entries by hand cannot catch a missing one.
+
+Not changed: `create_social_media_posts` still strictly backs a "published" claim although it only builds an HTML file of drafted posts
+(pre-existing, listed in the precision change's known limits). Shadow/enforce behaviour and the flags are untouched; the guard is off in
+prod while both flags are unset.
+
+## ENG-2442: Meta connection alerts dedupe onto per-account canonical (2026-10-13)
+
+raiseMetaConnectionHandoff now uses the tracking monitor token alert identity (Alert Class meta-token-invalid + Alert Scope meta-ad-account:<id>), so re-fires comment on the open per-account canonical instead of filing a new issue each tick.
+
+## ENG-2430: Ads Auto Publisher dry-run demo (2026-10-13)
+
+Added `backend/src/adsPublisherDemo/` (pure planner, CLI, mock `POST /v1/publish`, samples). Dry-run only; not mounted in app.ts; test asserts zero network calls.
+
+## ENG-2379: /verified-generate keeps the user-selected model (2026-10-13)
+
+`runVerifiedChat` swapped `session.llmModel` for the report/image/video task-type model whenever it was called without a model, which the interactive `POST /api/agent-mode/verified-generate` always was. The handler now resolves the user's model (request `llmModel`, else the stored one) and passes it, so task defaults apply only when the session has no model. An unavailable explicit pick returns the same 422 `model_unavailable` as `/generate` before any work starts; a retired stored model still falls back to the current default (stored is not explicit). Scheduled, Slack, email, revision, human-eval and result-endpoint callers are unchanged. `GET /api/agent-mode/session/:id` now sends `Cache-Control: no-store`. `/verified-generate` now also applies /generate's allowance gate (same 429 `usage_paused` body, checked before the model so an exhausted account gets 429 before 422); previously an exhausted or paused account ran through it unchecked. The chosen model is persisted only after the session lock and concurrent-cap checks pass, so a 409/429 leaves the stored model unchanged.
+
+## ENG-2379: Compare identity check is catalog-aware; model-options serves the legacy alias map (2026-10-13)
+
+### Identity gap closed
+- `isSameServedModel` accepts a dated canonical slug for a bare id (`deepseek/deepseek-v4-flash` -> `...-20260731`) unless a REGISTERED MMDD sibling owns that date. An unregistered sibling (`deepseek-v4-flash-0731`, a different model and price) was therefore accepted if OpenRouter repointed the bare id. The daily catalog monitor only registers a new sibling after a human merge, so the window was real.
+- Compare now re-checks any DATED served slug against the live OpenRouter catalog ids (`services/agentMode/openRouterCatalogIds.ts`: public `GET /api/v1/models`, 10 min cache, single-flight, 3 s timeout, stale list kept on failure, 60 s back-off). A listed sibling with the same MMDD => `model_mismatch`.
+- Undated exact ids never touch the network. Catalog unreachable and no prior list => falls back to the registered-ids check (the old behaviour, never looser).
+- Aliased models are unaffected: a legacy id is normalised to its current id first (`qwen3.8-max` -> `qwen3.8-max-0902`), and an MMDD-suffixed id is its own identity.
+- Known conservative edge: if a bare id's own legitimate snapshot date equals a listed sibling's MMDD, Compare refuses it (fail closed).
+
+### Alias map
+- `GET /api/agent-mode/model-options` gains `legacyModelAliases: Record<string,string>`, a copy of `LEGACY_MODEL_ALIASES` (the map `normalizeModelId`/`resolveGenerationModel` use). Additive; old portals ignore it. Portal feature-detects it and can drop its hand-copied `LEGACY_MODEL_ALIAS_IDS`.
+
+### Tests
+- modelCompare.routes (real matcher, mocked catalog), openRouterCatalogIds, agentModeController.scheduledModelStamp (model-options).
+
+### Review follow-ups
+- Catalog/registry sibling ids are normalised before comparison (`:free`/`:nitro` suffix, trailing `/`, `openrouter/` prefix, case).
+- Catalog list is stale-while-revalidate: an expired list is served at once and refreshed once in the background; only a cold start waits (<= 3 s). Timeout uses AbortController so it is testable.
+- Tests pin: last-good list kept on empty/non-OK/failed refresh, abort at timeout, non-OK body ignored.
+
+## ENG-2171: HubSpot batched push now updates by stored contact id instead of orphaning it (2026-10-13)
+
+**Bug.** `pushLeadsBatched` split leads on email alone, upserted by email and overwrote `syncMetadata.hubspot_contact_id` at Stage 3. A lead first pushed without an email (contact A) and later given one produced contact B and orphaned A. #3026 fixed this only in `pushLeadsPerLead`, but `batchEnabled()` defaults true (the env var is set nowhere), so email leads never reach that path. `autoSyncLead` (the real-time `/forward-lead` sync) also takes the batched path.
+
+**Fix** (`hubspotAdapter.ts`, Stage 1.5): an email lead with a stored id (`syncMetadata.hubspot_contact_id`, or `customFields.hubspot_contact_id` as the per-lead path reads) is updated by id through `batchUpdateContacts`, with the email in the properties, so A gains the address in place. This changes the NORMAL re-push path for every previously synced email lead, not only phone-only ones. A side effect is that an email edited in Emma now updates the contact instead of creating a second one.
+
+**Failure rules** (HubSpot documents none of these for contact batch update, so unknowns fail closed):
+- "Gone" = 404/410, or a 207 whose every error category matches `NOT_FOUND`. Only then does the lead fall back to upsert-by-email (new id replaces the stale one), as the per-lead path does.
+- Anything else (409 collision, 400, other 207, merged id) is a lead error: `sync_failed`, stored id kept, nothing created.
+- 429 / 423 / 502 / 503 / 504 / no response fail the chunk once; they are not bisected. A bare 500 is bisected, so one poison record fails alone.
+- Duplicate stored ids with the SAME email collapse to one input. A lead that shares a stored id with a DIFFERENT email upserts by its own email (the pre-fix behaviour) rather than being reported synced on another lead's data. A lead with no stored id that shares an email with an updated stored-id lead adopts that contact (no read-after-write on an email just written).
+
+**Known stuck state: the lead's new email already belongs to a DIFFERENT HubSpot contact.** A phone-only lead (contact A) gains `bob@x.com`, and the customer already has a separate contact B with that address. Before this change the push upserted B and orphaned A; now it tries to put the email on A, HubSpot is expected to refuse (undocumented; probably a 409), and the lead is `sync_failed` on every push with its stored id kept, until someone merges A and B in HubSpot or clears the stored id. This is deliberate (adopting B would silently reintroduce the orphan) but it is a per-lead stuck state, and the kill switch is global, not per lead. The raw status and error categories of every unclassified failure are logged (`not classified as gone`) so the real HubSpot values can be learned.
+
+**Kill switch.** `HUBSPOT_PUSH_BY_STORED_ID=off` (case- and whitespace-insensitive) restores upsert-by-email for every email lead. It is an Elastic Beanstalk env var, so changing it needs a restart.
+
+**Not live-verified.** The only connected HubSpot credential was dead (401, last pull 2026-06-16) and no `[HubspotAdapter]` line appeared in the production log for 7 days, so there was no HubSpot to test against. HubSpot's docs are silent on: the missing-id and archived-id response, batch-update atomicity, duplicate ids in one batch, the email-collision status, merged-away ids, and read-after-write for upsert-by-email. The `OBJECT_NOT_FOUND` category does not appear in the docs at all (the existing deal handler matches it too). If the "gone" classifier is wrong, a deleted-contact lead shows `sync_failed` and stays stuck; it does not duplicate. A merged-away id has the same effect. HubSpot's `contact.merge` webhook (`primaryObjectId`, `mergedObjectIds`) is documented but not handled by `crmWebhook.ts` or `webhooks.ts`.
+
+`HUBSPOT_BATCH_PUSH_ENABLED` is left in place; deleting it is a later change.
+
+## ENG-2143: Feed live Google Ads campaign delivery into the zero-delivery health check (2026-10-13)
+
+- `googleAdsService.getCampaignDelivery` (read-only GAQL: status, budget, start/end, 7-day impressions/clicks, recent `change_event`s) now feeds `accountHealthClassifierCron` `signals.campaigns`, which was hard-coded `null`.
+- Go-live is the later of `campaign.start_date_time` and the latest campaign `change_event` in the 7-day window (the API has no "enabled since" field), so a re-enabled campaign gets a fresh 24h grace. A passed `campaign.end_date_time` reports `ENDED`, which the classifier excludes. Account-timezone date-times are read as UTC and skewed toward abstaining.
+- A failed/truncated read (including 429, no retry) stays unread (`null`), never zero delivery; one failing Google account leaves that user unread. No schema/data-plane change; Meta campaigns remain unread; no flag changes.
+- `--dry-run` of the cron still makes live (read-only) Google Ads calls and consumes API quota.
+
+## ENG-2138: Shadow-judge reliability (2026-10-13)
+
+- The daily sampler (`shadowJudgeSamplerCron.ts`) now retries each session whose scoring threw once, after the main loop. Result and log line gain `retried` and `recovered`; a session that fails twice counts once in `errors`. Session-load failures are not retried.
+- `extractJsonObject` returns the first balanced top-level `{...}` (string-aware), so trailing prose or a second object no longer breaks the parse. A never-balanced reply keeps the old first-`{`-to-last-`}` slice and fails as before.
+- Shadow scores now store `promptVersion` (first 12 hex of sha256 of the judge system prompt). Scores written before this change have no `promptVersion`; non-shadow judges never get it.
+- `evalOutcomeJudge` summary prints both "share of raw scores >= 4.95" and "share of scores that round to 5"; `shareAt5` is unchanged and `shareRoundingTo5` is new.
+- Known limits: timeouts are still the only guard against slow judge calls (constants untouched); a failed attempt that reached the model has already spent its cost; rows scored before 2026-10-13 cannot be attributed to a prompt.
+
+## ENG-2138: the shadow outcome judge keeps its one-decimal score (2026-10-13)
+
+`scoreSessionWithJudge` rounded every judge score to a whole number. The original ENG-1710 rubric B asks for a one-decimal
+score and was measured on those decimals (a 5 counted at >= 4.95). On the ENG-1710 corpus, with the labels rebuilt in ENG-2410
+(comments on ENG-2138, 2026-10-12), the cached scores read AUC 0.76 / 3.4% at 5 raw and AUC 0.72 / 46% at 5 once rounded, so
+no integer-scale replay (ENG-2356, ENG-2380, the prod shadow scores) could meet the "< 15% at 5" bar. The committed
+reconstructed-3 rubric asks for whole numbers, so this change does nothing to it; it matters once a decimal rubric is the
+shadow judge's prompt.
+
+- A shadow judge now stores `Math.round(score * 10) / 10`, clamped to 1-5. Customer-facing judges still store whole numbers.
+- `scripts/evalOutcomeJudge.ts` counts a 5 as a score of at least 4.95, matching ENG-1710.
+- The fabrication and awaiting-reply guards only use `min`/`max`, so they work on decimals.
+- Readers of `judgeScores[outcome-judge-b-shadow]` (`evalAgentGraders`, `runValidation`, the MCP session tool) use the
+  `dimensions` or pass the object through; none assumes an integer `score`.
+- Existing stored shadow scores are whole numbers and stay as they are; no data is rewritten.
+
+## ENG-2135: golden-set label coverage report and safer draft-tool invocation (2026-10-13)
+
+Golden-set labels must come from a human; nothing here generates, suggests or writes a label.
+
+- `npm run eval:label-coverage` (backend) prints, per surface and split, total cases, cases with at least one binary human label, per-criterion pass/fail/na/unlabelled and the n available for validation (pass + fail on the test split, as `runValidation` drops `na`) against `MIN_VALIDATION_N`. It prints "cannot reach n>=30 on the test split: has N" when the split is smaller than the minimum. Pairwise creative cases are reported separately. Aggregates only; read-only through `listCases`; no grader or LLM; refuses when `EVAL_GOLDEN_CASES_TABLE` is unset. A human runs it with the table env var set.
+- `npm run eval:draft-labels -- [flags]` runs `generateGoldenDraftLabels.ts`, unchanged in model, prompt and write semantics. It now prints a preflight (table, surface, cases it would draft, model); a non-dry run needs `--yes` or it exits 1 before any LLM call or write. `--dry-run` still calls the LLM but prints only criterion=label, never rationale text. A human runs it; never against the prod table from an agent session.
+- Data fact: as seeded, agent has 29 test-split cases and account_health has 22, so neither can reach n>=30 however fully labelled. creative_image has 32. Whether to reseed or change the split fraction or threshold is the owner's decision; this change alters none of it.
+
+## ENG-2116: Owner-directed agent merges for Argusoft PRs (2026-10-13)
+
+merge-evidence.sh lifts FOREIGN_OWNER when MERGE_EVIDENCE_DIRECTING_LOGIN equals the PR author; CI evidence still decides. Approved by Harsha.
+
+## ENG-1656: manage_scheduled_chat field-named preflight validation (2026-10-13)
+
+- `manage_scheduled_chat` now validates before any API call: create's three required fields, `schedule_id` for update/toggle/delete (previously hit `/scheduled-chats/undefined` and returned a misleading "not found"), toggle `status`, non-empty `email_notifications`, ISO `next_run_time`. Errors name the field.
+- `timezone` added to the tool schema and forwarded on create/update (the route already accepted it).
+- Agent Mode error guidance covers the preflight message plus nextRunTime/timezone/status rejections.
+- Tests: `mcp.manageScheduledChatPreflight.test.ts` (mocked; no live schedules).
+
+## ENG-1607: twitter_manage_post typed auth vs handler errors (2026-10-13)
+
+twitter_manage_post failures now carry `error_type` (auth_required/rate_limited/validation/credits_exhausted/api) + `retryable`; 401/403/no-account are non-retryable auth_required with a reconnect step. Input validation errors are typed; JSON-string/single-string `tweets`/`tweet_ids` are coerced instead of failing. Tests: backend/src/__tests__/emma/twitterManagePostErrors.test.ts.
+
+## ENG-1539: create_google_doc typed error classification (2026-10-13)
+
+createGoogleDoc now returns `error_type` (auth_expired/permission/not_found/validation/api/internal). 401/invalid_grant/missing connection map to a reconnect hint instead of misleading folder_id advice on root-Drive calls. Regression test: backend/src/__tests__/emma/createGoogleDocErrors.test.ts.
+
+## ENG-110: One source for the "generating" signals: /generating and isGenerating (2026-10-13)
+
+### Problem
+`GET /api/agent-mode/generating` was built from the per-user concurrent-generation cap map intersected with the session lock, while `isGenerating` on `GET /session/:id` is the lock alone. Auto-continuation runs (media / work-plan) hold the session lock WITHOUT a cap slot, so for them `isGenerating` was true but `/generating` omitted the session. The portal's reload reconcile polls `/generating` and treats absence as "not running", which could show the "response wasn't received / Resend" banner while a continuation run was live.
+
+### Fix
+- The lock claim records its owner: `tryClaimSessionGeneration(sessionId, ownerUserId?)` writes `sessionGenerationOwners` (in-memory Map) in the same synchronous step; `releaseSessionGeneration` deletes it. Every claim site already releases in a `finally`, so nothing can outlive the lock. No storage.
+- `/generating` = the caller's sessions among the claimed locks (`getClaimedSessionIdsForUser`); `isGenerating` = lock held and owner === caller (`isSessionGeneratingForUser`).
+- Owner is passed at every claim site: /generate, public/conversable generate, runVerifiedChat (scheduled, Slack, email, /verified-generate, result endpoint, revision, human eval) via `claimSessionGenerationWithRetry`, media + work-plan auto-continuation, preempt re-claim, approval-inbox resume, chat branching, model compare select.
+- Safe fallback: a lock claimed with no owner is not invisible. `/generating` falls back to the caller's cap slot for it, and `isGenerating` stays lock-based (true for the session's own viewer).
+- Owner record is the session OWNER (not an admin acting on the session), so the customer's portal sees admin-driven runs. Other users, admins, delegates and share views are never shown the flag or others' ids.
+
+### ACCEPTED risk: deploy overlap
+During an Immutable deploy the old instance can still run a chat while the new instance reports nothing (locks are per instance; AW-AgentRuns / AGENT_RUN_STORE is not provisioned and is owned by ENG-784). A Resend in that window could start a second generation. Narrow window, bounded by the 10-minute drain ceiling. Accepted; not fixed here.
+
+### Tests
+agentModeController.generatingConsistency, agentModeRoutes.generatingConsistency, and a real media-continuation case in agentModeController.autoMediaContinuation. Mutations that must fail: drop owner record on claim, never delete on release, expose other users' ids.
+
+### Rollback
+Revert the PR. No data, no schema, no config.
+
+## ENG-2425: SSRF-guard load-from-url endpoints (2026-10-12)
+
+/api/crm/sequences/load-from-url and /api/admin/announcements/load-from-url now fetch via ssrfGuard.fetchPublicHtml (DNS-pinned, per-hop redirect re-validation, 5MB cap, 15s total timeout); private/loopback/link-local targets return 400.
+
+## ENG-2413: Scope /api/slack/send-approval to caller-entitled channels (2026-10-12)
+
+POST /api/slack/send-approval now 400s a non-string channel and 403s non-admin callers targeting a channel outside getEffectiveAllowedChannels, before any Slack post or approvalDb write (ENG-2407 pattern).
+
+## ENG-2408: Scope character reference image keys to caller's S3 prefix (2026-10-12)
+
+POST /api/characters rejects referenceImageKey outside `users/{userId}/files/`; DELETE only removes S3 objects under the caller's prefix (row still deleted). No schema change.
+
+## ENG-2407: batch-review create restricted to caller-entitled Slack channels (2026-10-12)
+
+POST /api/batch-review/create now 403s unless the channel is in the caller user/org configured Slack channels (getEffectiveAllowedChannels) or the caller is a real admin; check runs before any DB write or Slack post.
+
+## ENG-2402: Workflow run/rerun ownership checks (2026-10-12)
+
+`POST /api/workflows/:id/run` now 403s non-owners and referenced tasks not owned by the caller (400 if missing); task rerun 403s non-owners and 404s when the execution belongs to another workflow. Removed the dead, unrouted `runWorkflow` controller so one run path remains.
+
+## ENG-2338: Luma sign-in cannot be automated from our infrastructure; use the Luma API instead (2026-10-12)
+
+- Prod session bf7f3c5f: first-ever Luma login (the user's cookie jar held only anonymous Luma cookies, no `luma.auth-session-key`) was stopped by the "Verifying Your Browser" gate, which never cleared.
+- Reproduced from the autofix box with the production launch args + stealth script, then headless/headed (Xvfb) x spoofed/native user agent: all four variants show the gate after "Continue with Email" and none reach the code step in 90s. It is not the headless flag, the user-agent spoof or the stealth script; the likely cause is datacenter-IP reputation (untested — no alternate egress available).
+- Fix: Luma calendar API key as a connected account (`platform: 'luma'`, `POST /api/oauth/luma/connect`). Tools `luma_list_events` / `luma_get_guests` call `public-api.luma.com` (header `x-luma-api-key`; 200 req/min per calendar; Luma Plus required; keys are per-calendar). The key is encrypted at rest with `encryptPassword(key, userId)` inside `config.access_token`.
+- The guest list is read newest-registration-first with `sort_column=registered_at&sort_direction=desc nulls last`; entries with no `registered_at` are invited-never-registered and are dropped. A page is never split, so `next_cursor` resumes exactly; de-duplicate on `guest_id`.
+- Without a key the tools say so and the agent keeps the existing browser/session-cookie fallback.
+
+## ENG-2303: Zoma Meta Toolkit — OAuth discovery, onboarding, guarded writes (2026-10-12)
+
+- `/api/meta-toolkit/mcp` now answers unauthenticated `initialize` with 401 + RFC 9728
+  `resource_metadata` pointing at `/.well-known/oauth-protected-resource/api/meta-toolkit/mcp`.
+  MCP clients reject protected-resource metadata whose `resource` differs from the URL they
+  connected to, which is why the old `/mcp`-only document never started OAuth.
+- A setup-mode Stripe Checkout completion used to be handled as a subscription purchase
+  (`handleCheckoutSessionCompleted` defaults `subscription_status: 'active'`). It is now
+  acknowledged with no side effects; `zoma_status` uses setup mode for "add a payment method".
+- The ENG-400 objective gate needs an Emma transcript or approval deck; the toolkit has
+  neither, and a sessionless call used to auto-provision a chat session. The toolkit preview
+  (`previewToolkitMetaWrite`) swaps in an explicit-objective gate and never creates sessions.
+- Guarded-write replay protection is per-process (no durable claim store — that would be new
+  persistence). Worst case cross-instance within 15 min: a duplicate PAUSED create.
+- `evaluateMetaSpendCeiling` had no caller; the toolkit write path now calls it with an
+  optional env policy (`META_TOOLKIT_SPEND_CEILING`). Per-account ceilings need a policy store.
+
+## ENG-2263: a "continue" after a REAL time-limit partial no longer logs a false total (2026-10-12)
+
+A preview run with AGENT_MODE_GENERATION_TIMEOUT_MS=25000 showed that a real time-limit partial (`kind: generation-timeout-continuation`) persists neither
+`toolCalls` nor `crmEvidence`, although CRM tools ran in that turn. The next "continue" restated the totals the timed-out turn had fetched and the log-only
+detector flagged them (`continuation:false`, `echoesEarlier:0`). The earlier note's claim that these partials are credited was only true for messages that carry
+evidence. `crmEvidenceFromEarlierInvocations` now treats an earlier timeout message WITHOUT persisted evidence as incomplete, so the total check abstains for that
+"continue" (the tag check still runs). A timeout message that does carry evidence is still credited, and a plain follow-up after a timeout is still fully checked.
+Log-only; the reply is never edited. No controller change.
+
+## ENG-2157: lead PUT route reports/drops server-owned keys, audits suppression changes, and accepts PATCH (2026-10-12)
+
+`PUT /api/crm/lists/:listId/leads/:leadId` handed its whole body to `crmDb.updateLead` (~50 keys). Verified live on the preview that an editor could set or clear `lastAutoSendAt`,
+forge `syncMetadata.hubspot_contact_id`, `system`, `firstTouch`/`utmSource`/`clickIds`, pass the internal write flags (`customFieldsKeyMerge`, `skipFieldNamesUpdate`), and
+forge who/when changed a suppression (`contactStatusUpdatedBy/At`, honoured whenever `contactStatus` is in the body). No customer-portal code sends any of those, and Emma's own `update_lead` filters to
+11 fields. The MCP `lead.update` action forwards its body verbatim, so real usage there is unknown.
+
+- `CRM_LEAD_PUT_GUARD=log|enforce|off`, default **log**: reports which server-owned keys arrive (key names, channel, user id; never values) as `[crm-lead-put-guard] {json}` and changes nothing.
+  `enforce` drops them and stamps `contactStatusUpdatedBy` with the authenticated user. Read the log for a week before flipping it; MCP usage is the unknown.
+  `aws logs filter-log-events --log-group-name <web.stdout.log group> --filter-pattern '"crm-lead-put-guard"'`
+- Do-not-contact / unsubscribe keys are NOT dropped (the portal's Mark DNC, Remove and Resubscribe buttons write them here). A real change to `contactStatus` or `unsubscribedFromGroupEmail` now appends a
+  `contact_status.changed` engagement with the authenticated actor (and the delegating admin), a server timestamp and fixed vocabulary only (an unvalidated client string never reaches the event: the
+  engagement layer raises `isEngaged` on the words clicked/replied/received). It never blocks or fails the write. `CRM_CONTACT_STATUS_AUDIT=off` disables it.
+  The event data is FLAT strings/booleans (`fromStatus`, `toStatus`, `fromGroupEmailUnsubscribed`, `toGroupEmailUnsubscribed`, `reason`, `actorUserId`, `delegatedByUserId`, `channel`, `via`, `note`): the portal's
+  Engagements dialog (CRM.tsx) renders `eventData.from` / `eventData.to` as React children for every event type, so an object there would crash it. That dialog is currently unreachable (no caller since engagements moved into the lead drawer), so this is defensive, not a live crash; a test pins the flat shape.
+  The trail is best-effort and PARTIAL: it records changes made through this route only (not bulk-contact-status, Emma's update_lead, the public unsubscribe, webhooks or the bounce cron), and the before-state is read
+  before the write with no compare-and-swap, so two concurrent changes can both record the same `from`.
+- `PATCH` on the same path now runs the same handler. The portal's deal editor (`DealSection`) has always sent PATCH here; the route did not exist, the fetch swallowed the 404, and deal edits vanished on reload.
+  Note: DealSection sends the WHOLE `customFields` map built from its local state, so a deal edit rewrites the map (no key-merge) and can overwrite keys written since the page loaded (enrichment, Emma). The drawer's
+  `patchCustomField` already does the same through PUT, so this is not a new class of risk, but PATCH newly exposes it to the deal editor. An object-valued `deal` also registers a `deal` name in the list's field names.
+  In `enforce` mode `contactStatusUpdatedBy` is stamped with the authenticated user whenever `contactStatus` is present and not null (updateLead then writes the actor/time pair for any value).
+
+Not changed: clearing a suppression is still allowed (product behaviour). Enforcing a compliance-field allowlist needs a dedicated single-lead endpoint and a customer-portal change (separate repo).
+
+## ENG-113: Compare models keeps the unchosen answers (multiverse view) behind compare_save_alternatives (2026-10-12)
+
+Before: "Continue with this answer" appends ONE user+assistant pair and the other columns are lost, so a user could
+never revisit the possible outcomes or branch from a different one.
+
+Now, with AW-Settings `compare_save_alternatives` = exactly `true` (absent / any other value / cold-start read failure
+= off = old behaviour; 60s cache, last-known value on a failed refresh, `services/agentMode/compareSaveAlternatives.ts`):
+
+- `POST /compare` also returns `alternativesToken`, an HMAC (same key derivation as the select token, with a `kind`
+  tag so the two are not interchangeable) over `{userId, sessionId, compareId, prompt, issuedAt}` and the sorted SET of
+  `{model, sha256(content)}` of EVERY ok column. The switch is not part of it; it is issued whenever >= 2 columns are ok.
+- `POST /compare/select` accepts optional `alternatives:[{model,content,latencyMs?}]` + `alternativesToken`. When the
+  switch is on and the token verifies (constant time) over the alternatives PLUS the chosen answer (so the set is exactly
+  the ok columns the server produced: nothing added, edited, dropped or re-attributed; models distinct; max 3; each
+  content <= 200k chars), the assistant row the select already appends gets `metadata.compareId` and
+  `metadata.compareAlternatives:[{model,name,provider,content,latencyMs}]`. name/provider come from the server registry
+  (`getModelCompareInfo`), never the client; latencyMs is clamped display data. Any failure => alternatives ignored,
+  logged (reason only), select still succeeds for the chosen answer. Replay returns the existing pair and never rewrites;
+  409 `compare_already_selected` unchanged; select makes no model call, so usage/cost are unchanged.
+- Size (fail closed): the serialized alternatives array must be <= 120,000 UTF-8 bytes AND the whole assistant row must
+  be <= 341,808 bytes (`MAX_MESSAGE_CONTENT_SIZE` 350,000 minus 8,192 headroom, `COMPARE_ROW_CAP_BYTES`). The headroom exists
+  because a later like/dislike/edit re-runs `shrinkMessageForPersistence`, which truncates the chosen ANSWER before it
+  drops metadata; a row accepted right at 350,000 lost answer characters after a feedback write. A row accepted this way
+  is returned untouched by the guard, now and after a feedback write (both tested). Otherwise NONE are stored (never a partial set)
+  and the row gets `metadata.compareAlternativesOmitted:'size'`; if even the marker would not fit under the cap the
+  message is stored exactly as today (the chosen answer is never put at risk for a marker). Bytes are measured as
+  JSON-escaped UTF-8 (CJK/emoji/control chars), not characters.
+- Exposure: `filterMessagesForClient({omitBranchOrigin:true})` (share/ishare `getSharedConversation`, `getConversableSession`)
+  now also drops `compareAlternatives` by the same mechanism as `branchOrigin`. The MCP admin transcript and the
+  summarizer/judge/replay inputs build `{role, content}` from an explicit field list, so they cannot carry it; a tripwire
+  test fails if any file outside a 5-file allowlist mentions the key.
+- LLM context: `isReplayableTurn`/`buildCompareMessages` and `buildMarketingContext` read only role/content/flags; tests
+  prove the built context is identical with and without alternatives (hostile alternative text included).
+- Branching: copied rows lose `compareAlternatives`/`compareId`/`compareAlternativesOmitted`. New optional request field
+  `alternativeModel` ("Branch with this answer"): the target must be an assistant message whose
+  `compareAlternatives` contains that model (400 `no_saved_alternatives` / `alternative_not_found` otherwise); the
+  branch copies rows 0..N-1 (generic strip) and row N with `content` and `llm` replaced by the alternative's,
+  `metadata.branchedFromAlternative:{model}`, alternatives removed; the new session's model is the alternative's
+  (resolved as an explicit choice through the usual entitlement/usage policy). `llmModel` must equal
+  `alternativeModel` when both are sent. The idempotency scope appends `alternativeModel` only when present, so existing
+  scopes are byte-identical.
+- Capability hint: `compareSaveAlternatives` (boolean) on `GET /api/agent-mode/model-options`, next to `chatBranchingEnabled`.
+
+Storage: owner-approved additive free-form `metadata` keys; no schema/index/table change. Rollback: set the switch to
+anything but `true`; already-saved alternatives stay on their rows (owner-only, stripped from non-owner views).
+
+## ENG-112: Branch family link and GET /session/:id/branches (2026-10-12)
+
+A branch used to be tied back to its source only by `metadata.branchOrigin` on its first message row, so a chat could not list its branches and the sidebar could not group them.
+
+- New optional session attribute `branchedFrom: { sessionId, rootSessionId, messageIndex, branchedAt }`, written once when a branch is created (born archived, revealed after verification, like the rest of the branch). `sessionId` is the immediate source, `rootSessionId` is the source's root (or the source itself), so a branch of a branch stays in one family. Never copied from the source.
+- `GET /api/agent-mode/sessions` and `GET /api/agent-mode/session/:id` return it for the owner. Share, conversable, ishare and MCP views do not (MCP strips it explicitly; the share serializers pick fields by name).
+- New `GET /api/agent-mode/session/:sessionId/branches` (auth, owner only, same `chat_branching_enabled` flag, 404 `chat_branching_disabled` when off): the root plus every non-archived session of the same owner with that root, createdAt ascending, max 50. One paginated, projected query over the existing `UserIdIndex` (no scan, no new GSI); the walk is newest-first (`ScanIndexForward=false`, like `getUserSessions`), so a capped walk drops the OLDEST sessions, and stops after 20 pages or once a 50th match proves there are more; `truncated: true` is exact (a further match exists, or the page cap hit with index left). Cost is one indexed pass over the owner's sessions (typical user has <1000).
+- Per-user lookup throttle (in memory, per instance, sliding 1 minute): AW-Settings `branch_family_max_per_minute`, default 20, `0` = unlimited, garbage = default, cached ~60s with last-known fallback. Over the limit: 429 `TOO_MANY_BRANCH_LOOKUPS`.
+- Legacy branches made before this change have no `branchedFrom` (only the row-0 `branchOrigin`). They are NOT grouped: finding them would mean reading message rows for every session. No backfill. Consequence: a branch made from a LEGACY branch starts a NEW family root (its source has no `branchedFrom`).
+- Reads are eventually consistent (GSI): a just-created branch may be missing from the endpoint; the portal adds it client-side.
+- `UserIdIndex` projects ALL attributes, so each page reads up to 1 MB of full session rows even though the response is projected; worst case 20 pages (20 MB) per request, which is why the throttle exists.
+
+Data plane: owner-approved additive optional attribute; no GSI, no backfill, rollback = stop writing/reading (the attribute is ignored by every other reader; existing items with it are harmless).
+
+## ENG-110: Chats already survive a tab close / reload; add visibility so the UI can re-attach (2026-10-12)
+
+### FACTS (paste into ENG-110 / ENG-2424)
+- The premise "closing or reloading the tab cancels an in-flight /generate" is FALSE on the current stack. `POST /api/agent-mode/generate` registers `req.on('close', ...)` (agentModeController.ts, "Cancel generation immediately when the client disconnects") AFTER `express.json()` has consumed the body. On Node >= 16 the request stream is already closed then, so that listener never fires on a client abort; only `res.on('close')` and the socket do. Reproduced with a plain Express server + a client that destroys its socket mid-request on Node 20.19.2 and 22.23.3 (req 'close' never; res 'close' + socket 'close' fire; Node 14.6.0 does fire req 'close').
+- Production Node is not pinned in the repo (no .nvmrc, no `engines`; CI uses 22.x; EB platform decides) but every supported EB Node (>= 18) is >= 16, so the listener is dead in production.
+- Nothing else cancels: no `res.on('close')`/'aborted'/AbortSignal in the /generate path; nginx (`.platform/nginx/conf.d/agent-mode-timeout.conf`, 600s proxy timeouts) and the ALB (IdleTimeout 600, `.ebextensions/timeout.config`) only close sockets, which the handler ignores; the portal has no beforeunload/pagehide/unmount stop and aborts the fetch only in `handleStop`, which also calls `POST /session/:id/stop` (the real canceller).
+- Therefore a running chat keeps running to completion and persists its reply when the tab is closed/reloaded TODAY. What was missing is visibility: after a reload the UI could not tell the chat was still running.
+- The dead listener also exists in the conversable-share generate (cancel, never fires) and `/verified-generate` (sets `clientDisconnected`, never true; harmless: `res.json` on a closed socket is a no-op). The SSE GET listener (`/progress`) is a bodyless GET and does fire (verified).
+- Do not "repair" these to `res.on('close')` without a product decision: it would make every reload kill the run.
+
+### What this PR adds
+- `GET /api/agent-mode/generating` (auth) returns `{ sessionIds }` for the CALLER's sessions only (cap module's per-user map intersected with the session lock Set; added on claim, removed in `finally`).
+- `GET /session/:id` gains an additive owner-only `isGenerating`; admins/delegates and share views never get it.
+- State is in-memory per instance: during an Immutable deploy overlap another instance's runs are invisible, and a run on the old instance dies with it (accepted). No table/attribute/index.
+- No behaviour switch: nothing is changed about cancellation. A comment at the dead listener records the fact. A real-socket test (`agentModeController.generateDisconnect.socket.test.ts`) pins it: client aborts, worker is not cancelled, reply persisted once, lock + slot released, `/generating` lists the run while in flight; explicit Stop cancels.
+- Cost note: an abandoned run holds its cap slot until it finishes (<= cap x 600s per user) — this is already today's behaviour.
+
+## ENG-55: Compare no longer fails with model_mismatch for a model OpenRouter renamed (2026-10-09)
+
+- Cause: OpenRouter dropped the bare `qwen/qwen3.8-max` id from its public catalog (only `qwen/qwen3.8-max-0902`, canonical `qwen/qwen3.8-max-20260902`, remains) but still routes the old id as an alias. Our registry kept the stale id, so Compare's strict served-model check (a base id must not accept a sibling's MMDD snapshot) refused the response: `model_mismatch`.
+- Fix: registry/pricing key renamed to `openrouter/qwen/qwen3.8-max-0902`; the old id is a `LEGACY_MODEL_ALIASES` entry so existing sessions/schedules/settings keep working on the same model. The identity check is unchanged and still strict.
+- Why the registry guard missed it: its snapshot comes from `/models/{id}/endpoints`, which follows aliases; it only checked parameters. It now also fails when a registry id resolves to a different id in the snapshot.
+- Portal follow-up: add `'openrouter/qwen/qwen3.8-max'` to `LEGACY_MODEL_ALIAS_IDS` in `src/lib/modelUnavailable.ts`.
+
+## ENG-273: WhatsApp approvals are interactive, and a customer is on one platform (2026-10-09)
+
+Slack and WhatsApp are separate features and a customer connects one of them. Things learned making that true:
+
+- **A WhatsApp-only customer could never be asked to approve anything — for approvals the agent engine creates.** Three independent Slack assumptions: `task_monitor.py` requested approval only when the task had a `slackChannel` (otherwise it logged a warning and emailed results to subscribers unapproved), `POST /api/slack/send-approval` 400'd without `channel`, and `sendApprovalRequestWithTracking` posted to Slack first and threw on failure. Approvals now go through `approvalRequestService.requestApproval` / `POST /api/approval-requests`; the engine keeps the Slack endpoint for tasks that have a channel and uses the neutral one only for tasks without. **Not covered: approvals a person starts from the customer portal.** Images, Videos and Research Reports ask the user to pick a Slack channel and call `/api/slack/send-approval`, so a WhatsApp-only customer cannot start one there; those three callers need a channel-neutral path (skip the picker and call `/api/approval-requests` when the account is on WhatsApp). **The agent engine is deployed by hand** (GCP VM, `agent-engine/deploy/RUNBOOK.md`) and has no CI. Deploy order is safe either way: an engine that runs ahead of the backend gets a 404 from the new endpoint and treats it as "no channel" (release, as before) rather than a failed send, which would hold output.
+- **Meta sets a template quick-reply's `button.payload` to the button's LABEL.** An id cannot ride on a template button. A tap is attributable only through `context.id` (the wamid of the message the button sat on), so the outbound id is stored at send time (`whatsapp:approval-msg:<wamid>`, 30-day TTL). Non-template `interactive` buttons do return the `id` we set, and need no template inside the 24h window.
+- **WhatsApp buttons can never be removed or disabled.** The client greys out only the tapped one, so every tap, however late, arrives as a fresh message and may come from a customer who already answered elsewhere. Idempotency has to be server-side, in the verdict write itself: `approvalDb.answerIfOpen` is one conditional update (`attribute_exists AND status IN (pending, needs_changes)`), so exactly one tap wins and only the winner emails subscribers. `approvalDb.updateApprovalStatus` is still unconditional and approving fans out subscriber email — on Slack that is masked only because `chat.update` strips the buttons.
+- **`resolveDestination(user, 'slack')` falls back to the org and then the org owner.** A WhatsApp member of a Slack org would be delivered to twice. Decided in the resolver (personal verified WhatsApp suppresses the inherited org channel) instead of guarding the three routes by which the two can come to coexist.
+- **There was no phone → user lookup.** Verification is code → user. The inverse row (`whatsapp:phone-user:<phone>`) is written at bind time and is a cache only: `resolveUserIdByPhone` re-checks the user record and clears a stale row. Numbers verified before this change have no row until they re-verify (none exist in production).
+- **Staging cannot send email.** `nonProdEmailGuard` suppresses everything unless `NONPROD_EMAIL_ALLOWLIST` is set on the environment (it is not on `Agentweb-backend-env-1`). The guard logs the suppressed SUBJECT, so nothing sensitive belongs in a subject line.
+- **Meta's January 2026 AI restriction targets "AI Providers"** distributing general-purpose assistants, not a business using AI for its own customers. Keeping Emma off WhatsApp is a product decision (the 24h window), not a platform rule.
+- **Review findings worth remembering (2026-10-12).** An independent review found that the first cut of the tap handler used a separate claim row, which guarded WhatsApp taps only (portal, batch review and Slack write the same status unconditionally), never expired, and survived a re-requested approval. The fix is one conditional DynamoDB update (`approvalDb.answerIfOpen`, condition `attribute_exists AND status IN (pending, needs_changes)`). Same review: a failed WhatsApp send was reported as "no channel" (409) and the engine answered by emailing unreviewed output — it must be a different status (502 `delivery_failed`) so the engine holds. `sendEmail` never throws (it returns `'failed'`), so a `.catch` around it is dead code.
+- **`requestApproval` ordering.** For a Slack customer the record is written straight after the Slack post, as before. For a WhatsApp customer it is written before the buttons go out, because buttons cannot be recalled; it is deleted again if nothing was delivered.
+- **Three suites failed on main independently of this work** (`admin.gtmPlans`, `admin.crmAnalytics`, `slackLeadNotificationCompact`): ENG-1760 made `admin.ts` read a table prefix fixed at import while the tests flip `NODE_ENV` per case, and one asserted two calls in the same millisecond on a payload that embeds a timestamp. Fixed in their own commit.
+- **Tests replaced on purpose**, not to bless behaviour: `leadListAlertService.whatsapp` "independently when both configured" and four `shipNotifyService.whatsapp` "peers" tests asserted the double delivery the one-platform rule forbids.
+- **A failed re-request must not erase an earlier verdict (2026-10-13).** `createApproval` is a put on the asset URL, so writing the pending record ahead of a WhatsApp send replaced any earlier record, and the cleanup after a failed send then deleted it. `requestApproval` now reads the earlier record first and puts it back (`approvalDb.restoreApproval`). The neutral route also passes `typedFailures` so a failed Slack send is a 502 `delivery_failed`, not a generic 500.
+- **Outside the 24h window an approval was unanswerable.** The portal only reads approval status and nothing else answers one, so the link-only template could not be acted on. A second template, `agentweb_approval_request_buttons`, carries Approve / Reject quick replies; the existing `button` tap parsing handles it. It must be approved by Meta per WABA; until then the notifier falls back on error 132001.
+- **A refused verification used to look like "waiting".** `other_platform` / `number_in_use` now mark the row `refused` with the reason, and the status endpoint returns `state: 'refused'` so the portal can say why. The code stays retryable.
+- **Failed delivery receipts are logged** (`[whatsapp-webhook] outbound message <wamid> FAILED to deliver (code …)`), a stable string for a log alarm. No state is changed and no window is opened by a status event.
+- **360° review round (2026-10-13), fixed:** `/api/approval-requests` no longer reads a Slack `channel` from the body (it had no entitlement check, so the bot would post wherever it was pointed); the undo after a failed send deletes/restores only the record this request wrote and only while it is still pending (a concurrent request or a customer's tap is no longer clobbered); a tap's verdict write also requires the record to belong to the tapping customer; a tap whose correlation cannot be read is answered "tap again" instead of silently dropped; STOP is matched after NFKC folding and stripping punctuation/emoji/zero-width characters ("Stop 🛑", "ＳＴＯＰ"); a redelivered inbound message is claimed by id so it cannot be forwarded or greeted twice; the phone→user claim is one atomic put-if-absent taken BEFORE the user record is written, so two accounts cannot both verify one number; disconnect clears the verification pointer and code row so a used code cannot be replayed and the portal stops showing a disconnected number; the engine treats a 404 as "no channel" only when the body is Express's own "Cannot POST /api/approval-requests"; filenames are shortened by code point (no lone surrogates); the legacy send-approval route answers 403, not 500, for another account's approval; the webhook raw-body limit is 2mb.
+- **Accepted, not fixed — decide consciously:** (1) *Opt-out is not a platform decision.* A customer who texts STOP stays "on WhatsApp": Slack stays suppressed and their approvals fail with 502, holding task output with no retry, until an admin disconnects the number. (2) *A send that errors after Meta accepted it* (timeout/5xx) is treated as undelivered: the record is undone, the buttons that did arrive answer "no longer available", the engine holds. (3) *Two concurrent re-requests of the same asset that both fail* can leave a pending record in place of an earlier approved one (a narrow window; the conditional undo prevents the other orderings). (4) Org members still inherit an org owner's legacy Slack channel even when the owner is on WhatsApp. (5) Users connected before approvals were added consented to ship notifications and lead alerts only (none exist in production; verified 0 of 489 users have a messaging channel).
+
+## OPS: nginx timing log emits bare request_time for CloudWatch metric filter (2026-10-07)
+
+- `main_timing` now ends with a bare `$request_time` as the last field (no `rt=` prefix; `$upstream_response_time` dropped because it can be `-` or a comma list) so the per-route p99 metric filter can use `$request_time` as a numeric metric value. Only `/var/log/nginx/access_timing.log` changes; `access.log` is untouched.
+
 ## ENG-2403: domain-attach writes require project ownership (2026-10-12)
 
 - `POST /api/domains/custom` and `/subdomain` now 403 (before any Vercel call) unless the caller owns, or has org edit rights (`canUserEditLandingPage`) to, a landing page whose `vercelProjectId` matches the body. Lookup errors fail closed.
