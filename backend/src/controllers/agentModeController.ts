@@ -1841,6 +1841,17 @@ async function userExplicitlyRequestedStop(sessionId: string, usageContext?: LLM
   }
 }
 
+/**
+ * ENG-2378: a work plan as shown to someone who is not the owner (share / conversable / anonymous launch): never the
+ * engine's internal bookkeeping (launchModel, planDefaultModel, engineModel) and, unless `keepStepModels`, no step models.
+ * Returns a copy; the stored plan is untouched.
+ */
+function redactWorkPlanForViewer(workPlan: any, options: { keepStepModels?: boolean } = {}): any {
+  if (!workPlan || typeof workPlan !== 'object') return workPlan;
+  const { launchModel: _l, planDefaultModel: _p, engineModel: _e, ...rest } = workPlan;
+  return options.keepStepModels ? rest : { ...rest, ...(Array.isArray(rest.steps) && { steps: withoutStepModels(rest.steps) }) };
+}
+
 /** ENG-2378: public plan responses never expose step models (the plan-level defaultModel exposure is pre-existing). */
 function withoutStepModels(steps: any): any {
   return Array.isArray(steps)
@@ -11609,7 +11620,7 @@ export const agentModeController = {
           updatedAt: session.updatedAt,
           shareMetadata: session.shareMetadata,
           interactiveShareMetadata: session.interactiveShareMetadata,
-          workPlan: session.workPlan,
+          workPlan: redactWorkPlanForViewer(session.workPlan),
           llmModel: modelToUse,
           isConversable: !!conversable,
           hasActiveProgress: hasActiveProgress(session.sessionId),
@@ -11962,7 +11973,7 @@ export const agentModeController = {
         sources: response.sources,
         ...(typeof sharedAssistantMessageIndex === 'number' ? { messageIndex: sharedAssistantMessageIndex } : {}),
         ...(typeof response.userMessageIndex === 'number' ? { userMessageIndex: response.userMessageIndex } : {}),
-        workPlan: response.workPlan,
+        workPlan: redactWorkPlanForViewer(response.workPlan),
         skills: response.skills,
         ...(response.workPlanTurnDisposition ? { workPlanTurnDisposition: response.workPlanTurnDisposition } : {}),
         // ENG-1635/1644: same immediate-sync fields as the authenticated path (see
@@ -15405,7 +15416,7 @@ export const agentModeController = {
         messages: filterMessagesForClient(session.messages, { omitBranchOrigin: true }),
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
-        workPlan: session.workPlan,
+        workPlan: redactWorkPlanForViewer(session.workPlan),
         pendingWorkPlanInput: session.pendingWorkPlanInput,
         llmModel: modelToUse,
         isConversable: true
@@ -15466,7 +15477,7 @@ export const agentModeController = {
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
-        workPlan: response.workPlan,
+        workPlan: redactWorkPlanForViewer(response.workPlan),
         skills: response.skills,
       });
     } catch (error) {
@@ -15940,7 +15951,8 @@ export const agentModeController = {
       res.json({
         sessionId: session.sessionId,
         redirectUrl,
-        workPlan: workPlanWithWelcome,
+        // The launcher's own client may show step models; an anonymous visitor never sees them. Internal bookkeeping never leaves.
+        workPlan: redactWorkPlanForViewer(workPlanWithWelcome, { keepStepModels: Boolean(result.user) }),
         conversableToken,
         userId: session.userId
       });

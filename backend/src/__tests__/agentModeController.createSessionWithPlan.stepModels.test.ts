@@ -207,5 +207,30 @@ describe('createSessionWithPlan with per-step models', () => {
     await agentModeController.createSessionWithPlan(req(), r);
     expect(r.status).toHaveBeenCalledWith(422);
   });
+
+  describe('the response never leaks step models or bookkeeping to an anonymous visitor (round 2)', () => {
+    const body = (r: Response) => (r.json as jest.Mock).mock.calls[0][0];
+    it('anonymous: no step model, launchModel, planDefaultModel or engineModel in the returned workPlan; the stored session plan keeps them', async () => {
+      mockGetUserFromToken.mockResolvedValue({ user: null });
+      publish([S(1, 'gpt-5-chat'), S(2)], { defaultModel: 'gpt-5-chat' });
+      const r = res();
+      await agentModeController.createSessionWithPlan(req(), r);
+      const wp = body(r).workPlan;
+      expect(JSON.stringify(wp)).not.toMatch(/gpt-5-chat|launchModel|planDefaultModel|engineModel|"model"/);
+      expect(wp.steps).toHaveLength(2);
+      expect(wp.steps[0]).toMatchObject({ stepCount: 1, title: 'Step 1' });
+      // the persisted session plan is untouched (the engine needs it)
+      expect((db.updateSessionWorkPlan.mock.calls[0][1].steps as any[])[0].model).toBe('gpt-5-chat');
+    });
+    it('authenticated owner: keeps step models but never the internal bookkeeping fields', async () => {
+      publish([S(1, 'gpt-5-chat'), S(2)], { defaultModel: 'gpt-5-chat' });
+      const r = res();
+      await agentModeController.createSessionWithPlan(req(), r);
+      const wp = body(r).workPlan;
+      expect(wp.steps[0].model).toBe('gpt-5-chat');
+      expect(JSON.stringify(wp)).not.toMatch(/launchModel|planDefaultModel|engineModel/);
+    });
+  });
 });
+
 
