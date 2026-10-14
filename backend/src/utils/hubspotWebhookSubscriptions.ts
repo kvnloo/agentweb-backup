@@ -54,6 +54,14 @@ async function registerSubscription(appId: string, developerApiKey: string, even
   console.log(`[HubSpotWebhook] Registered ${eventType}${propertyName ? ` for "${propertyName}"` : ''}`);
 }
 
+/** HubSpot's answer when the app was created by a project: 403 BANNED / PROJECT_BASED_APP_WEBHOOK_EDIT_ERROR. */
+function isProjectManagedWebhookError(err: any): boolean {
+  if (err?.response?.status !== 403) return false;
+  const d = err.response.data;
+  return d?.subCategory === 'AppProjectAssociationErrors.PROJECT_BASED_APP_WEBHOOK_EDIT_ERROR'
+    || /webhook configuration can't be edited through the API/i.test(String(d?.message ?? ''));
+}
+
 type FieldMappings = Array<{ crmProperty: string; enabled: boolean; direction: string }>;
 
 // Runs are serialised within a process: each reads the subscription list, then registers what is
@@ -151,6 +159,16 @@ async function syncSubscriptions(
       try {
         await registerSubscription(appId, developerApiKey, eventType, propertyName);
       } catch (err: any) {
+        if (isProjectManagedWebhookError(err)) {
+          // A developer-platform project app owns its webhook subscriptions: the API refuses every
+          // edit, now and on every retry. Retrying (or posting the remaining ones) cannot help, so
+          // say what to do once and report "nothing this code can do" instead of failing the build.
+          console.warn(
+            `[HubSpotWebhook] HubSpot refuses API changes to this app's webhook subscriptions (it is managed by a HubSpot project). ` +
+            `Not registered: ${toRegister.slice(toRegister.indexOf(key)).join(', ')}. Add them to the project's webhook configuration and redeploy the project.`,
+          );
+          return true;
+        }
         const detail = err?.response?.data ?? err?.message;
         const status = err?.response?.status;
         console.error(`[HubSpotWebhook] Failed to register ${eventType} for "${propertyName}" (HTTP ${status}):`, JSON.stringify(detail));
