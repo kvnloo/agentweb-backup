@@ -1,3 +1,5 @@
+import type { LeadFitFilter } from './leadNotificationFit';
+
 /** Server-assigned provenance, separate from untrusted lead/form fields. */
 export const LEAD_ORIGINS = ['form_fill', 'booking', 'linkedin', 'enrichment_import', 'manual', 'integration'] as const;
 export type LeadOrigin = typeof LEAD_ORIGINS[number];
@@ -21,6 +23,7 @@ export const allowsLeadOrigin = (config: LeadNotificationsConfig, origin: unknow
 
 export interface LeadNotificationsConfig {
   enabled: boolean;
+  fitFilter?: LeadFitFilter;
   leadTypes?: LeadOrigin[];
   slackChannelId: string;
   /** Case-insensitive persisted list IDs/names or LP/source identifiers; absent means all. */
@@ -41,5 +44,11 @@ export function configOf(value: unknown): LeadNotificationsConfig | undefined {
   }
   if (value.mentions?.some((id: string) => !/^[UW][A-Z0-9]+$/.test(id))) return;
   if (value.leadTypes !== undefined && !isLeadTypes(value.leadTypes)) return;
+  if (value.fitFilter !== undefined) {
+    const fit = value.fitFilter;
+    if (!record(fit) || typeof fit.enabled !== 'boolean' ||
+        (fit.minUnitsDisqualifiers !== undefined && (!strings(fit.minUnitsDisqualifiers) ||
+          fit.minUnitsDisqualifiers.length > 50 || fit.minUnitsDisqualifiers.some((v: string) => v.length > 254)))) return;
+  }
   return value as unknown as LeadNotificationsConfig;
 }

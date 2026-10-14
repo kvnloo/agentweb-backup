@@ -27,6 +27,57 @@ Only email placeholders matching `noemail+*@waterheater.app` (case-insensitive)
 are hidden automatically. The notification still sends. Other addresses are
 visible; legacy `excludeEmailPatterns` values no longer broaden email hiding.
 
+## Optional full-criteria lead-fit judgement (Haven)
+
+Default is off; other orgs are unaffected. After separate production-config
+approval, merge this exact JSON into Haven's existing `leadNotifications` object,
+preserving its verified Slack channel, enabled state and other settings:
+
+```json
+{
+  "fitFilter": {
+    "enabled": true,
+    "minUnitsDisqualifiers": ["under_50"]
+  }
+}
+```
+
+No production DynamoDB config is changed by this PR. `minUnitsDisqualifiers`
+defaults to `["under_50"]`; it supplies deterministic hints, **not a veto**.
+The LLM weighs the entire submission against Haven's ICP: property managers /
+real-estate portfolio operators who need leasing automation. Inputs include units,
+company, website, email domain, message intent/content/language, name and phone
+plausibility. Under 50 units is a strong negative but not automatically disqualifying.
+Non-English language or names alone must not determine fit. Free email and missing
+fields alone do not establish poor fit. Deterministic property-keyword and units
+signals are weak supporting hints; **the old two-flag AND rule is not used**.
+
+The existing shared LLM gateway uses `gemini-3.1-flash-lite`, 240 output tokens,
+a 3-second request timeout and a 3-second total scoring deadline. It requests
+`{"verdict":"good|maybe|bad","reasons":["short business-fit reason"]}` and validates
+the response (1–3 reasons, at most 160 characters each). Only `bad` skips Slack.
+`good` and `maybe` post with `Fit: <verdict>: <reasons>`. Errors, timeout and invalid
+output fail open with `Fit: unscored`; deterministic hints never suppress on failure.
+Missing/disabled fit config makes no model request and leaves message layout unchanged.
+
+Scoring happens only at delivery/recovery, not upfront enqueue, to avoid two model
+calls per dispatch. Retries may re-evaluate the latest persisted lead; no verdict
+is persisted. Bad leads remain in CRM. Existing sent-marker/deduplication behavior
+and CRM persistence are unchanged. Model usage is attributed to the list owner.
+
+Only allowlisted scalar contact/company/units/message fields are sent, bounded to
+1,000 characters per value; internal, credential and attribution fields are excluded.
+No web browsing or enrichment occurs. Website/property keyword hints use hostnames,
+not query/path text; PM/HOA require word boundaries. Submitted text is untrusted data,
+not instructions. Reasons are Slack escaped and bounded like other message content.
+The model does receive contact details for plausibility; do not enable for another
+org without accepting this processing. Scoring is a heuristic, not verified qualification.
+
+Post-deploy verification (after approval): mock/controlled bad, good/maybe, and
+provider-failure cases; confirm bad leads remain in CRM, only bad skips Slack,
+error posts unscored, and other orgs are unchanged. Roll back by disabling
+`fitFilter.enabled` (with approval) or reverting this PR. No backfill is introduced.
+
 ## Lead-type filter and Emma tools
 
 `leadTypes` is optional on the existing org JSON config. Absent means

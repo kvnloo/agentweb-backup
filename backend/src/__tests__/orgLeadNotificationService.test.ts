@@ -1,3 +1,5 @@
+jest.mock('../services/agentModeService', () => ({ agentModeService: { callLLM: jest.fn() } }));
+import { agentModeService as fitGateway } from '../services/agentModeService';
 jest.mock('../services/leadNotificationLookup', () => ({ notificationLookup: { pages: jest.fn(), campaigns: jest.fn() } }));
 import { notificationLookup } from '../services/leadNotificationLookup';
 const postMessage = jest.fn();
@@ -67,6 +69,34 @@ beforeEach(() => {
 });
 
 afterEach(() => jest.useRealTimers());
+
+it('suppresses bad LLM verdict without changing persisted leads', async () => {
+  org.leadNotifications.fitFilter = { enabled: true };
+  mock(fitGateway.callLLM).mockResolvedValue({ choices: [{ message: { content: '{"verdict":"bad","reasons":["No leasing intent"]}' } }] });
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
+  expect(postMessage).not.toHaveBeenCalled();
+  expect(crmDb.setLeadFields).not.toHaveBeenCalled();
+  expect(fitGateway.callLLM).toHaveBeenCalledTimes(1);
+});
+it.each(['good', 'maybe'])('posts %s verdict with reasons', async verdict => {
+  org.leadNotifications.fitFilter = { enabled: true };
+  mock(fitGateway.callLLM).mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ verdict, reasons: ['Property operator'] }) } }] });
+  await processLeadNotificationJob(job);
+  expect(postMessage).toHaveBeenCalledTimes(1);
+  expect(postMessage.mock.calls[0][0].text).toContain(`Fit: ${verdict}: Property operator`);
+});
+it('posts unscored on LLM error', async () => {
+  org.leadNotifications.fitFilter = { enabled: true };
+  mock(fitGateway.callLLM).mockRejectedValue(new Error('unavailable'));
+  await processLeadNotificationJob(job);
+  expect(postMessage.mock.calls[0][0].text).toContain('Fit: unscored');
+});
+it('keeps other orgs unchanged when fit filtering is absent', async () => {
+  lead.company = 'UsuarioK'; lead.customFields.units = 'under_50';
+  await processLeadNotificationJob(job);
+  expect(postMessage).toHaveBeenCalledTimes(1);
+  expect(postMessage.mock.calls[0][0].text).not.toContain('Fit flags:');
+});
 
 it('masks all but the last four phone digits; short values never leak', () => {
   expect(maskLeadPhone('+1 (415) 555-1234')).toBe('***-***-1234');

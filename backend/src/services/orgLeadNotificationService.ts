@@ -1,3 +1,4 @@
+import { judgeLeadFit } from './leadNotificationFitJudge';
 import { allowsLeadOrigin, configOf, LeadOrigin } from './leadNotificationConfig';
 export type { LeadOrigin, LeadNotificationsConfig } from './leadNotificationConfig';
 import { attributionValues, fieldKey, humanizeField, resolveNotificationNames, slackAttributionUrl, submittedPacific } from './leadNotificationAttribution';
@@ -70,7 +71,7 @@ async function routingContext(listId: string, expectedOrgId?: string) {
 }
 
 type RoutingContext = NonNullable<Awaited<ReturnType<typeof routingContext>>>;
-async function leadContext(routing: RoutingContext, leadId: string) {
+async function leadContext(routing: RoutingContext, leadId: string, scoreFit = false) {
   const { list, config } = routing;
   const listId = list.listId;
   const lead = await crmDb.getLeadById(listId, leadId, { consistentRead: true });
@@ -84,9 +85,11 @@ async function leadContext(routing: RoutingContext, leadId: string) {
     ...Object.entries(customFields).filter(([key]) => SOURCE_KEYS.has(normalizedKey(key))).map(([, value]) => value),
   ].map(value => string(value).toLowerCase()).filter(Boolean);
   if (config.sources && !config.sources.some(s => sources.includes(s.trim().toLowerCase()))) return;
+  const fit = scoreFit ? await judgeLeadFit(lead, config.fitFilter, list.userId) : undefined;
+  if (fit?.verdict === 'bad') return;
   const email = string(lead.email);
   const hideEmail = /^noemail\+[^@]*@waterheater\.app$/i.test(email);
-  return { ...routing, lead, source, customFields, hideEmail };
+  return { ...routing, lead, source, customFields, hideEmail, fit };
 }
 
 async function context(listId: string, leadId: string, expectedOrgId?: string) {
@@ -120,6 +123,8 @@ async function message(ctx: NonNullable<Awaited<ReturnType<typeof context>>>, jo
     return true;
   };
   append('New lead:');
+  if (ctx.fit) append(ctx.fit.verdict === 'unscored' ? 'Fit: unscored' :
+    `Fit: ${ctx.fit.verdict}: ${render(ctx.fit.reasons.join('; '), 500)}`);
   if (name) append(`Name: ${render(name, name.length)}`);
   if (phone) append(`Phone: ${config.maskPhone ? maskLeadPhone(phone) : escapeSlack(phone, phone.length)}`);
   if (email && !hideEmail) append(`Email: ${escapeSlack(email, email.length)}`);
@@ -182,8 +187,10 @@ async function message(ctx: NonNullable<Awaited<ReturnType<typeof context>>>, jo
 /** Immediate bounded retries; the existing queue recovers interrupted/exhausted jobs, not lead polling. */
 export async function processLeadNotificationJob(job: LeadNotificationJob): Promise<void> {
   if (!record(job) || !string(job.orgId) || !string(job.listId) || !string(job.leadId)) throw new Error('Invalid lead notification job');
-  const ctx = await context(job.listId, job.leadId, job.orgId);
-  if (!ctx || !allowsLeadOrigin(ctx.config, job.origin)) return;
+  const routing = await routingContext(job.listId, job.orgId);
+  if (!routing || !allowsLeadOrigin(routing.config, job.origin)) return;
+  const ctx = await leadContext(routing, job.leadId, true);
+  if (!ctx) return;
   await deliverLeadNotification(job, ctx);
 }
 
