@@ -485,6 +485,18 @@ describe('withLogin: the single live copy', () => {
       expect((await ctx.db.get('sub-x'))?.subVersion).toBe(2);
     });
 
+    it('does not build on a stored version that is more than one save ahead of the marker (not ours to overwrite)', async () => {
+      const ctx = setup();
+      await seedLogin(ctx, { subVersion: 5 });
+      await ctx.db.acquireSubLease('sub-x', 'owner-old', Date.now(), 60_000);
+      const dir = join(ctx.tmpRoot, `${HOME_DIR_PREFIX}far`);
+      mkdirSync(join(dir, 'cfg'), { recursive: true });
+      writeFileSync(join(dir, 'cfg', '.credentials.json'), credsText({ refreshToken: 'SENTINEL-REFRESH-FAR' }));
+      writeFileSync(join(dir, 'marker.json'), JSON.stringify({ connectionId: 'sub-x', owner: 'owner-old', version: 2, ownerUserId: 'user-1', pid: 999999 }));
+      expect(await ctx.service.recoverOrphans()).toMatchObject({ saved: 0, wiped: 1 });
+      expect((await ctx.db.get('sub-x'))?.subVersion).toBe(5);
+    });
+
     it('does not touch a dir whose recording process is still alive, but cleans one whose process is gone', async () => {
       const ctx = setup();
       await seedLogin(ctx);
