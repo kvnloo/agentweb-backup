@@ -9,6 +9,7 @@ import { crmDb, userDb, tempEmailDb } from '../services/db';
 import { dripSequenceDb } from '../services/dripSequenceDb';
 import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
 import { getUserIdByHubSpotPortalId, getAccountsByAttioWorkspaceId } from '../services/connectedAccountsDb';
+import { parseHubSpotMergeEvent, repointMergedContactIds, HubSpotContactMerge } from '../services/hubspotContactMerge';
 import { HubSpotService } from '../services/hubspotService';
 import { AttioService } from '../services/attioService';
 import { AttioAdapter } from '../services/adapters/attioAdapter';
@@ -1703,6 +1704,8 @@ interface HubspotContactChange {
 
 interface HubspotJobPayload {
   changesByObjectId: Record<string, HubspotContactChange>;
+  /** contact.merge events (ENG-2465). Optional: jobs queued before this field existed lack it. */
+  merges?: Array<HubSpotContactMerge & { portalId: number }>;
 }
 
 /** Contact/deal sync, run either inline (same request, the common case) or later by
@@ -1710,6 +1713,25 @@ interface HubspotJobPayload {
  *  fast-follow, Greptile P1 — same fire-and-forget crash-loss risk the Calendly
  *  receiver had, since this handler acks HubSpot's webhook before this runs). */
 export async function processHubspotWebhookJob(payload: HubspotJobPayload): Promise<void> {
+  // ── contact.merge: re-point stored contact ids at the survivor ───────────
+  for (const merge of payload.merges ?? []) {
+    try {
+      const userId = await getUserIdByHubSpotPortalId(merge.portalId);
+      if (!userId) {
+        console.log(`[HubSpot Webhook] contact.merge: no user found for portal ${merge.portalId}`);
+        continue;
+      }
+      const lists = (await crmDb.getLeadListsByUserId(userId)) || [];
+      for (const list of lists) {
+        const cfgs = (list as any).externalCrmSyncConfigs as Record<string, any> | undefined;
+        if (String(cfgs?.hubspot?.accountId) !== String(merge.portalId)) continue;
+        await repointMergedContactIds(list.listId, merge);
+      }
+    } catch (err: any) {
+      console.error(`[HubSpot Webhook] contact.merge handling failed for survivor ${merge.survivorId}: ${err?.message || err}`);
+    }
+  }
+
   // ── Process each contact / deal ─────────────────────────────────────────
   for (const [objectId, data] of Object.entries(payload.changesByObjectId)) {
         const userId = await getUserIdByHubSpotPortalId(data.portalId);
@@ -1994,6 +2016,7 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
       // ── Aggregate events by objectId ────────────────────────────────────────
       const events: any[] = Array.isArray(parsedBody) ? parsedBody : [parsedBody];
       const changesByObjectId: Record<string, HubspotContactChange> = {};
+      const merges: Array<HubSpotContactMerge & { portalId: number }> = [];
 
       for (const event of events) {
         const eventType: string = event?.subscriptionType ?? 'unknown';
@@ -2003,6 +2026,12 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
         const propertyValue: string = event?.propertyValue ?? '';
 
         console.log(`[HubSpot Webhook] event=${eventType} portal=${portalId} object=${objectId}${propertyName ? ` property=${propertyName}` : ''}`);
+
+        const merge = parseHubSpotMergeEvent(event);
+        if (merge) {
+          merges.push({ ...merge, portalId });
+          continue;
+        }
 
         const isContactEvent = ['contact.creation', 'contact.propertyChange', 'contact.deletion'].includes(eventType);
         const isDealEvent = eventType === 'deal.propertyChange';
@@ -2025,7 +2054,7 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
       // a hash of the raw body is stable across a genuine redelivery of the exact
       // same payload and distinct for any payload with different actual content.
       const dedupeKey = crypto.createHash('sha256').update(rawBody).digest('hex');
-      const jobPayload: HubspotJobPayload = { changesByObjectId };
+      const jobPayload: HubspotJobPayload = merges.length > 0 ? { changesByObjectId, merges } : { changesByObjectId };
 
       // claimImmediately: this same request processes the job right below, so the
       // enqueue writes it straight in as 'processing' — no separate claim call, no
