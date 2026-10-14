@@ -39,30 +39,46 @@ async function main(): Promise<void> {
         ProjectionExpression: 'listId, leadId, customFields.trafficType, customFields.channel, customFields.channelKey, customFields.channelKeyPreSplit, customFields.channelPreSplit',
         FilterExpression: REVERT
           ? 'attribute_exists(customFields.channelKeyPreSplit)'
-          : 'customFields.trafficType = :paid AND customFields.channelKey IN (:g, :y)',
-        ExpressionAttributeValues: REVERT ? undefined : { ':paid': 'paid', ':g': 'google_search', ':y': 'youtube' },
+          : 'customFields.trafficType = :paid AND (customFields.channelKey IN (:g, :y) OR (attribute_not_exists(customFields.channelKey) AND customFields.channel IN (:gn, :yn)))',
+        ExpressionAttributeValues: REVERT ? undefined : { ':paid': 'paid', ':g': 'google_search', ':y': 'youtube', ':gn': 'Google Search', ':yn': 'YouTube' },
       })
       .promise();
     scanned += page.ScannedCount ?? 0;
     for (const item of page.Items ?? []) {
       if (LIST_FILTER && item.listId !== LIST_FILTER) continue;
       const cf = item.customFields ?? {};
+      // V1 rows (pre-2.0) carry only the channel name; derive the key the classifier would have set.
+      const hadKey = typeof cf.channelKey === 'string';
+      if (!hadKey && !REVERT) cf.channelKey = cf.channel === 'YouTube' ? 'youtube' : 'google_search';
       const label = REVERT ? `${cf.channelKey} -> ${cf.channelKeyPreSplit}` : `${cf.channelKey} -> ${PAID_CHANNEL_SPLIT[cf.channelKey]?.key}`;
       counts[label] = (counts[label] ?? 0) + 1;
       perList[item.listId] = (perList[item.listId] ?? 0) + 1;
       if (!APPLY) continue;
-      const params = REVERT
+      const params = REVERT && cf.channelKeyPreSplit === ''
+        ? {
+            UpdateExpression: 'SET customFields.channel = :oc REMOVE customFields.channelKey, customFields.channelPreSplit, customFields.channelKeyPreSplit',
+            ConditionExpression: 'customFields.channelKey = :cur',
+            ExpressionAttributeValues: { ':oc': cf.channelPreSplit, ':cur': cf.channelKey },
+          }
+        : REVERT
         ? {
             UpdateExpression: 'SET customFields.channel = :oc, customFields.channelKey = :ok REMOVE customFields.channelPreSplit, customFields.channelKeyPreSplit',
             ConditionExpression: 'customFields.channelKey = :cur',
             ExpressionAttributeValues: { ':oc': cf.channelPreSplit, ':ok': cf.channelKeyPreSplit, ':cur': cf.channelKey },
+            // channelKeyPreSplit = '' marks a V1 row that had no channelKey; revert restores that by removing it.
           }
         : (() => {
             const next = splitPaidChannel(cf.channel, cf.channelKey, true);
             return {
-              UpdateExpression: 'SET customFields.channel = :nc, customFields.channelKey = :nk, customFields.channelPreSplit = :oc, customFields.channelKeyPreSplit = :ok',
-              ConditionExpression: 'customFields.channelKey = :ok AND customFields.trafficType = :paid',
-              ExpressionAttributeValues: { ':nc': next.channel, ':nk': next.channelKey, ':oc': cf.channel, ':ok': cf.channelKey, ':paid': 'paid' },
+              UpdateExpression: 'SET customFields.channel = :nc, customFields.channelKey = :nk, customFields.channelPreSplit = :oc, customFields.channelKeyPreSplit = :okStored',
+              ConditionExpression: hadKey
+                ? 'customFields.channelKey = :ok AND customFields.trafficType = :paid'
+                : 'attribute_not_exists(customFields.channelKey) AND customFields.channel = :oc AND customFields.trafficType = :paid',
+              ExpressionAttributeValues: {
+                ':nc': next.channel, ':nk': next.channelKey, ':oc': cf.channel, ':paid': 'paid',
+                ':okStored': hadKey ? cf.channelKey : '',
+                ...(hadKey ? { ':ok': cf.channelKey } : {}),
+              },
             };
           })();
       try {
