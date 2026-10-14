@@ -2785,6 +2785,34 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * ENG-112 (self-heal of legacy branches): set `branchedFrom` on a session that has none, for its owner only.
+   * One conditional write: the row must exist, belong to `ownerUserId` and carry no `branchedFrom` yet, so a
+   * concurrent open is idempotent and an existing value is never overwritten. Touches nothing else (not
+   * `updatedAt`: healing must not reorder the sidebar). Returns false when the condition refused the write.
+   */
+  async setBranchedFromIfAbsent(sessionId: string, ownerUserId: string, branchedFrom: BranchedFrom): Promise<boolean> {
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: "SET branchedFrom = :branchedFrom",
+      ConditionExpression: "attribute_exists(sessionId) AND userId = :ownerUserId AND attribute_not_exists(branchedFrom)",
+      ExpressionAttributeValues: {
+        ":branchedFrom": branchedFrom,
+        ":ownerUserId": ownerUserId,
+      },
+    };
+
+    try {
+      await dynamodb.update(params).promise();
+      return true;
+    } catch (error) {
+      if ((error as { code?: string })?.code === "ConditionalCheckFailedException") return false;
+      console.error("Error setting branchedFrom:", error);
+      throw error;
+    }
+  }
+
   async deleteSession(sessionId: string): Promise<void> {
     const params = {
       TableName: this.tableName,

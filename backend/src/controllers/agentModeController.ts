@@ -45,7 +45,7 @@ import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/age
 import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/finalAnswer';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
-import { CHAT_BRANCHING_ENABLED_SETTING, isChatBranchingSettingEnabled } from '../services/agentMode/chatBranching';
+import { CHAT_BRANCHING_ENABLED_SETTING, isChatBranchingSettingEnabled, healLegacyBranchedFrom } from '../services/agentMode/chatBranching';
 import { compareSaveAlternatives } from '../services/agentMode/compareSaveAlternativesInstance';
 import { LEGACY_MODEL_ALIASES } from '../services/agentMode/llmModelRegistry';
 import { resolveRunFunding } from '../services/funding/runFunding';
@@ -9627,8 +9627,28 @@ export const agentModeController = {
       // ENG-2163: a real admin OR an admin viewing via delegation may see admin-tainted turns;
       // the account owner (customer) viewing their own session may not.
       const viewerIsAdmin = !!(user?.isAdmin || (req as any).delegateInfo?.isDelegated);
+      // ENG-112: a branch made before `branchedFrom` existed is grouped the first time its owner opens it
+      // (bounded record reads, one conditional write, never throws). Owner views only.
+      const healedBranchedFrom = genuineOwnerView
+        ? await healLegacyBranchedFrom(
+            {
+              isFeatureEnabled: async () => {
+                try {
+                  return isChatBranchingSettingEnabled((await settingsService.getSetting(CHAT_BRANCHING_ENABLED_SETTING))?.settingValue);
+                } catch {
+                  return false;
+                }
+              },
+              getSessionRecord: (id) => chatbotDb.getChatSessionRecord(id),
+              setBranchedFromIfAbsent: (id, ownerUserId, value) => chatbotDb.setBranchedFromIfAbsent(id, ownerUserId, value),
+              log: (message, details) => console.warn(message, details),
+            },
+            session,
+          )
+        : null;
       const filteredSession = {
         ...session,
+        ...(healedBranchedFrom ? { branchedFrom: healedBranchedFrom } : {}),
         messages: filterMessagesForClient(session.messages, { viewerIsAdmin }),
         hasActiveProgress: progressActive,
         // ENG-110: additive, owner-only. In-memory on THIS instance (an Immutable deploy overlap hides the

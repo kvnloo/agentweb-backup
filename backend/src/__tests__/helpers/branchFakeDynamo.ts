@@ -25,6 +25,12 @@ export class BranchFakeDynamo {
   readonly messageQueries: any[] = [];
   /** Every write call, in order: [op, table, key-ish]. */
   readonly writeLog: Array<{ op: string; table: string; key: string }> = [];
+  /** Every get call: `table:key` (a record-only lookup is exactly one of these and no message query). */
+  readonly getLog: string[] = [];
+  /** Conditional updates the store refused (ConditionalCheckFailedException). */
+  conditionalFailures = 0;
+  /** When set, every update throws this (a store outage). */
+  failUpdates: Error | undefined = undefined;
 
   private table(name: string): Map<string, Item> {
     let t = this.tables.get(name);
@@ -88,6 +94,7 @@ export class BranchFakeDynamo {
     return {
       get: (p: any) =>
         BranchFakeDynamo.wrap(() => {
+          this.getLog.push(`${p.TableName}:${this.keyOf(p.TableName, p.Key)}`);
           const item = this.table(p.TableName).get(this.keyOf(p.TableName, p.Key));
           return item ? { Item: clone(item) } : {};
         }),
@@ -102,13 +109,10 @@ export class BranchFakeDynamo {
           const key = this.keyOf(p.TableName, p.Key);
           this.writeLog.push({ op: 'update', table: p.TableName, key });
           const t = this.table(p.TableName);
-          if (p.ConditionExpression !== undefined) {
-            if (p.ConditionExpression !== 'attribute_exists(sessionId)') {
-              throw new Error(`BranchFakeDynamo: unsupported ConditionExpression: ${p.ConditionExpression}`);
-            }
-            if (!t.has(key)) {
-              throw Object.assign(new Error('The conditional request failed'), { code: 'ConditionalCheckFailedException' });
-            }
+          if (this.failUpdates) throw this.failUpdates;
+          if (p.ConditionExpression !== undefined && !this.conditionHolds(t.get(key), p)) {
+            this.conditionalFailures += 1;
+            throw Object.assign(new Error('The conditional request failed'), { code: 'ConditionalCheckFailedException' });
           }
           const item = t.get(key) ?? { ...clone(p.Key) };
           this.applyUpdate(item, p);
@@ -142,6 +146,21 @@ export class BranchFakeDynamo {
           return { UnprocessedItems: unprocessed };
         }),
     };
+  }
+
+  /** AND-joined `attribute_exists(a)`, `attribute_not_exists(a)` and `a = :v` clauses; anything else throws. */
+  private conditionHolds(existing: Item | undefined, p: any): boolean {
+    const values: Record<string, any> = p.ExpressionAttributeValues ?? {};
+    return String(p.ConditionExpression).split(' AND ').every((raw) => {
+      const clause = raw.trim();
+      let m = clause.match(/^attribute_exists\((\w+)\)$/);
+      if (m) return !!existing && existing[m[1]] !== undefined;
+      m = clause.match(/^attribute_not_exists\((\w+)\)$/);
+      if (m) return !existing || existing[m[1]] === undefined;
+      m = clause.match(/^(\w+) = (:\w+)$/);
+      if (m) return !!existing && JSON.stringify(existing[m[1]]) === JSON.stringify(values[m[2]]);
+      throw new Error(`BranchFakeDynamo: unsupported ConditionExpression clause: ${clause}`);
+    });
   }
 
   /** UserIdIndex (userId, updatedAt): only the plain `userId = :userId` key condition, paged by `indexPageSize`. */
