@@ -41,7 +41,7 @@ describe('manage_scheduled_chat preflight (ENG-1656)', () => {
     [{ action: 'toggle', status: 'paused' }, 'schedule_id'],
     [{ action: 'delete' }, 'schedule_id'],
     [{ action: 'toggle', schedule_id: 's1', status: 'stopped' }, 'status'],
-    [{ ...validCreate, email_notifications: [] }, 'email_notifications'],
+    [{ ...validCreate, email_notifications: 'a@b.com' }, 'email_notifications'],
     [{ action: 'update', schedule_id: 's1', email_notifications: 'a@b.co' }, 'email_notifications'],
     [{ ...validCreate, next_run_time: 'tomorrow-ish' }, 'next_run_time'],
   ])('rejects %j naming %s without calling the API', async (args, field) => {

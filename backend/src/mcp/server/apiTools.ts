@@ -664,8 +664,9 @@ export function validateManageScheduledChatArgs(args: any): string | null {
   }
   if (action === 'create' || action === 'update') {
     if (args.email_notifications !== undefined &&
-        (!Array.isArray(args.email_notifications) || args.email_notifications.length === 0)) {
-      return fail('email_notifications must be a non-empty array of email addresses when provided');
+        !Array.isArray(args.email_notifications)) {
+      // [] is valid: the explicit "no email" opt-out (Opslane #2).
+      return fail('email_notifications must be an array of email addresses when provided (use [] for no email)');
     }
     if (args.next_run_time !== undefined && Number.isNaN(Date.parse(args.next_run_time))) {
       return fail('next_run_time must be an ISO 8601 datetime (e.g. 2026-10-14T09:00:00Z)');
@@ -678,7 +679,7 @@ mcpToolRegistry.register({
   name: 'manage_scheduled_chat',
   definition: {
     name: 'manage_scheduled_chat',
-    description: 'Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: "create", "update", "toggle", or "delete". For "create": schedule_name, starting_message, and schedule_frequency are REQUIRED — do not call with action "create" unless you have all three. email_notifications is optional but strongly recommended — without it, the user gets no automatic notification when a run completes. For "update": schedule_id is required; omit any field to keep its existing value — if you provide email_notifications it must be non-empty. IMPORTANT: When email_notifications is configured on the schedule, the system automatically emails results after every run — do NOT include notify_session or any email-sending instruction in starting_message, as that would cause duplicate emails (one from the system, one from the AI executing the tool).',
+    description: 'Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: "create", "update", "toggle", or "delete". For "create": schedule_name, starting_message, and schedule_frequency are REQUIRED — do not call with action "create" unless you have all three. email_notifications: omit it to email results to the requesting user by default; pass [] ONLY when the user explicitly declines email (no emails are sent). For "update": schedule_id is required; omit any field to keep its existing value — email_notifications: [] turns emails off. next_run_time must carry a UTC offset (e.g. 2026-10-19T09:00:00-04:00), or pass timezone (the user IANA zone) and give next_run_time as local time in that zone. The result echoes what was stored — nextRunTime, nextRunTimeLocal (in the schedule timezone) and emailNotifications; tell the user those stored values, not what you intended to send. IMPORTANT: When email_notifications is configured on the schedule, the system automatically emails results after every run — do NOT include notify_session or any email-sending instruction in starting_message, as that would cause duplicate emails (one from the system, one from the AI executing the tool).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -688,12 +689,13 @@ mcpToolRegistry.register({
         starting_message: { type: 'string', description: 'The prompt/message to run on each execution (REQUIRED for create, optional for update). IMPORTANT: Do NOT include notify_session or any instruction to send an email in this prompt when email_notifications is set — the system already sends emails automatically, and adding notify_session here will cause duplicate emails.' },
         schedule_frequency: { type: 'string', description: 'Frequency: hourly, daily, weekly, monthly, every_n_days (REQUIRED for create, optional for update)' },
         frequency_interval_days: { type: 'number', description: 'Number of days between runs when schedule_frequency is every_n_days (create/update)' },
-        next_run_time: { type: 'string', description: 'ISO 8601 datetime for the first/next run (create/update)' },
+        next_run_time: { type: 'string', description: 'ISO 8601 datetime for the first/next run (create/update). Include a UTC offset (2026-10-19T09:00:00-04:00), or omit the offset AND pass timezone so it is read as local time in that zone. An offset-less time with no timezone is rejected.' },
+        timezone: { type: 'string', description: 'The user\'s IANA timezone, e.g. America/New_York (create/update). Used to interpret an offset-less next_run_time and stored on the schedule for its local-calendar cadence.' },
         description: { type: 'string', description: 'Description (create/update)' },
         keywords: { type: 'array', items: { type: 'string' }, description: 'Keywords to look for in results (create/update)' },
         required_function_calls: { type: 'array', items: { type: 'string' }, description: 'Function calls required in each run (create/update). Without a tool listed here, its delivery is best-effort — the run can complete "successfully" even if the model skips it, silently. IMPORTANT (ENG-2204): if starting_message instructs posting, alerting, or notifying via Slack, ALWAYS include slack_send_message here too — an unattended run has no live approval step for it, and without this it may be silently skipped even when the task asked for it. Same reasoning applies to any other action the run must actually take (a publish tool, etc.) — list it here rather than trusting the prompt wording alone.' },
         function_call_min_calls: { type: 'object', description: 'Minimum call counts per function (create/update)' },
-        email_notifications: { type: 'array', items: { type: 'string' }, description: 'Email addresses for notifications (optional for create/update but strongly recommended — without it, the user gets no automatic notification when a run completes; if provided, must be non-empty)' },
+        email_notifications: { type: 'array', items: { type: 'string' }, description: 'Email addresses that receive results after every run (create/update). Omit on create to default to the requesting user\'s email; omit on update to keep the current recipients. Pass [] only when the user explicitly does not want email — that stores no recipients and sends nothing.' },
         daily_digest: { type: 'boolean', description: 'Send daily digest instead of per-run emails (create/update, hourly only)' },
         self_improve: { type: 'boolean', description: 'When true, after each run a reflection turn reviews the result and may automatically refine starting_message so future runs do better. Off by default (create/update).' },
         run_count: { type: 'number', description: 'Number of runs (-1 for unlimited, create/update)' },
@@ -703,7 +705,6 @@ mcpToolRegistry.register({
         backup_model: { type: 'string', description: 'Legacy field, retained for compatibility. Since ENG-1211 a scheduled run always uses its own preferred model below the hard usage cap, so this is never consulted. Omitting it changes nothing.' },
         session_id: { type: 'string', description: 'Existing chat session ID to base the schedule on (create only)' },
         revoke_autopublish: { type: 'boolean', description: 'Set true to STOP this schedule publishing to the user\'s live connected accounts on its unattended runs, so future runs draft the content and tell them what is waiting instead. Revoking is always safe and always allowed. You CANNOT turn it back on — that means posts go live without the user ever seeing them, so only they can do it, on the schedule form. If a user asks you to enable automatic posting, point them there and never claim you have enabled it.' },
-        timezone: { type: 'string', description: 'IANA timezone the schedule runs in, e.g. America/Los_Angeles (create/update)' },
         status: { type: 'string', enum: ['active', 'paused'], description: 'Status (toggle only)' }
       },
       required: ['action']
@@ -731,7 +732,13 @@ mcpToolRegistry.register({
         if (args.keywords !== undefined) body.keywords = args.keywords;
         if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
         if (args.function_call_min_calls !== undefined) body.functionCallMinCalls = args.function_call_min_calls;
-        if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
+        if (args.email_notifications !== undefined) {
+          body.emailNotifications = args.email_notifications;
+          // An explicit [] is the user declining email — tell the API it is deliberate,
+          // so it neither substitutes the requester's address nor refuses the clear.
+          if (Array.isArray(args.email_notifications) && args.email_notifications.length === 0) body.emailNotificationsOptOut = true;
+        }
+        if (args.timezone !== undefined) body.timezone = args.timezone;
         if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
         if (args.self_improve !== undefined) body.selfImprove = args.self_improve;
         if (args.run_count !== undefined) body.runCount = args.run_count;
@@ -756,7 +763,13 @@ mcpToolRegistry.register({
         if (args.keywords !== undefined) body.keywords = args.keywords;
         if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
         if (args.function_call_min_calls !== undefined) body.functionCallMinCalls = args.function_call_min_calls;
-        if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
+        if (args.email_notifications !== undefined) {
+          body.emailNotifications = args.email_notifications;
+          // An explicit [] is the user declining email — tell the API it is deliberate,
+          // so it neither substitutes the requester's address nor refuses the clear.
+          if (Array.isArray(args.email_notifications) && args.email_notifications.length === 0) body.emailNotificationsOptOut = true;
+        }
+        if (args.timezone !== undefined) body.timezone = args.timezone;
         if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
         if (args.self_improve !== undefined) body.selfImprove = args.self_improve;
         if (args.run_count !== undefined) body.runCount = args.run_count;
