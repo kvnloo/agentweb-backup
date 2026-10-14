@@ -465,6 +465,9 @@ export interface ChatSession {
     isDelegated: boolean;
   }; // Delegate access info when admin is acting on behalf of a user
   associatedSkills?: string[]; // List of skill IDs associated for this session
+  // Tool names the __other_skills__ catch-all pool held when this session first used it (ENG-2299).
+  // Absent on sessions that never had __other_skills__ or haven't been snapshotted yet.
+  otherSkillsToolSnapshot?: string[];
   // Incremental asset cache for fast Images/Videos/Reports page loading
   assetCache?: {
     images: Array<{ url: string; filename: string; generatedAt: string }>;
@@ -2066,6 +2069,23 @@ export class ChatbotDB {
       await dynamodb.update(params).promise();
     } catch (error) {
       console.error(`Error adding associated skills for session ${sessionId}:`, error);
+      throw error;
+    }
+  }
+
+  // First writer wins: a concurrent turn that loses the race keeps the stored value, which was
+  // computed from the same near-identical catalog, so there is nothing to retry.
+  async setOtherSkillsToolSnapshotIfAbsent(sessionId: string, toolNames: string[]): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: "SET otherSkillsToolSnapshot = :snapshot",
+        ConditionExpression: "attribute_exists(sessionId) AND attribute_not_exists(otherSkillsToolSnapshot)",
+        ExpressionAttributeValues: { ":snapshot": toolNames },
+      }).promise();
+    } catch (error: any) {
+      if (error?.code === "ConditionalCheckFailedException") return;
       throw error;
     }
   }
@@ -5586,7 +5606,7 @@ export async function generateChatResponse(
           // catch block below must still see skillAllowlistResolved === false, or
           // the hard gate would misreport a context-construction bug as "your
           // subscription doesn't include this skill".
-          skillContext = agentModeService.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionSkillIds, !!isDelegatedAdmin);
+          skillContext = agentModeService.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionSkillIds, !!isDelegatedAdmin, await agentModeService.ensureOtherSkillsSnapshot(session, publishedSkills));
           skillAllowlistResolved = true;
         } else {
           skillContext = agentModeService.buildSkillContext([], [], [], [], !!isDelegatedAdmin);
