@@ -6,6 +6,8 @@ import { normalizeWorkPlanSteps, findAmbiguousMergeTargets, findConflictingMerge
 import { normalizeWorkPlanDisplayMetadata } from "../services/workPlanDisplayMetadata";
 import { checkPlanDefaultModelWrite, isUserAdminSafe, planAdminStatusApplies } from "../services/agentMode/modelPin";
 import { workPlanThumbnailService } from "../services/workPlanThumbnailService";
+import { workPlanStepModels } from "../services/agentMode/workPlanStepModelsInstance";
+import { anyStepCarriesModel, checkPlanStepModelsWrite, checkStoredStepModelsForPublic, stepsWithModels } from "../services/agentMode/workPlanStepModels";
 
 const THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
 const THUMBNAIL_ACCEPTED_TYPES = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
@@ -77,7 +79,11 @@ router.post("/", async (req, res) => {
     const modelCheck = await checkPlanDefaultModelWrite(async () => false, defaultModel);
     if (!modelCheck.ok) return res.status(422).json(modelCheck.body);
 
-    const { steps: normalizedSteps, warnings } = normalizeWorkPlanSteps(steps);
+    // ENG-2378: a step `model` is stored (and validated like the plan default) only while the switch is on.
+    const stepModelsEnabled = anyStepCarriesModel(steps) && await workPlanStepModels.isEnabled();
+    const { steps: normalizedSteps, warnings } = normalizeWorkPlanSteps(steps, { stepModelsEnabled });
+    const stepModelCheck = await checkPlanStepModelsWrite(async () => false, normalizedSteps);
+    if (!stepModelCheck.ok) return res.status(422).json(stepModelCheck.body);
 
     // No plan id exists yet at create time, so a self-reference in
     // `nextPlanIds` cannot be checked (and cannot practically occur — the
@@ -151,7 +157,8 @@ router.put("/:planId", async (req, res) => {
     const stake = "expectedStepsRev" in req.body
       ? { expectedStepsRev: req.body.expectedStepsRev }
       : {};
-    const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps) : undefined;
+    const stepModelsEnabled = (anyStepCarriesModel(steps) || anyStepCarriesModel(plan.steps)) && await workPlanStepModels.isEnabled();
+    const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps, { stepModelsEnabled, storedSteps: plan.steps }) : undefined;
     let normalizedSteps = normalized?.steps;
     const warnings = normalized?.warnings ?? [];
 
@@ -244,6 +251,9 @@ router.put("/:planId", async (req, res) => {
           // victim of it).
           if (has('expectedAssetCountTools')) out.expectedAssetCountTools = norm.expectedAssetCountTools;
           if (has('inputRequest')) out.inputRequest = norm.inputRequest;
+          // ENG-2378: same pass-through, gated on the switch (off: nothing is "supplied", the stored model stands).
+          // A blank string is the explicit clear (the normalizer drops it, so it is re-expressed as '').
+          if (stepModelsEnabled && typeof raw.model === 'string') out.model = norm.model ?? '';
           return out;
         });
 
@@ -346,6 +356,22 @@ router.put("/:planId", async (req, res) => {
       stepsChange = summarizeStepChange(existingSteps, normalizedSteps, mode);
     }
 
+    // ENG-2378: every step model that is NEW or CHANGED must be a served, selectable model (same rule as the
+    // plan's defaultModel: an unchanged stored value is tolerated so a since-retired model never blocks an
+    // unrelated edit). When the plan's launcher scope widens, its stored step models are re-checked as a
+    // non-admin launcher would, even if the steps were not part of this write.
+    if (stepModelsEnabled) {
+      const stepsToCheck = normalizedSteps ?? (scopeWidened ? stepsWithModels(plan.steps) : undefined);
+      if (stepsToCheck) {
+        const stepModelCheck = await checkPlanStepModelsWrite(
+          () => adminClearsAfter ? isUserAdminSafe(plan.ownerId) : Promise.resolve(false),
+          stepsToCheck,
+          scopeWidened || normalizedSteps === undefined ? undefined : plan.steps,
+        );
+        if (!stepModelCheck.ok) return res.status(422).json(stepModelCheck.body);
+      }
+    }
+
     // `display` is optional customer-facing browse metadata (ENG-1469). Presence
     // of the key is what counts, exactly like `expectedStepsRev` above: `null`
     // is a real instruction ("remove it"), so coalescing it away with `??` or
@@ -433,6 +459,13 @@ router.delete("/:planId", async (req, res) => {
 // Approve a work plan
 router.post("/:planId/approve", async (req, res) => {
   try {
+    // ENG-2378: approval makes the plan public, launched by non-admins: refuse (state unchanged) when a step model is
+    // not selectable by them, same 422 body as a write.
+    const pending = await workPlanService.getWorkPlan(req.params.planId);
+    if (pending && pending.visibility === 'pending_review') {
+      const stepModelCheck = await checkStoredStepModelsForPublic(pending.steps, () => workPlanStepModels.shouldHonor());
+      if (!stepModelCheck.ok) return res.status(422).json(stepModelCheck.body);
+    }
     const plan = await workPlanService.approveWorkPlan(req.params.planId);
     res.json(plan);
   } catch (error: any) {
