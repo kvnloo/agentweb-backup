@@ -195,3 +195,45 @@ describe('golden-set seed builder (ENG-2135)', () => {
     });
   });
 });
+
+describe('gated creative candidates (ENG-2226)', () => {
+  const reviewed = (id: string) => ({ candidateId: id, reviewType: 'creative_image', reviewerSlackUserId: 'U', feedbackSlackUserIds: ['U'] });
+  const gated = (id: string) => ({ candidateId: id, reviewType: 'creative_image', feedbackSlackUserIds: [] as string[], gated: true });
+
+  it('adds nothing unless opted in, even when gated candidates exist', () => {
+    const candidates = [...Array.from({ length: 5 }, (_, i) => reviewed(`r-${i}`)), ...Array.from({ length: 10 }, (_, i) => gated(`g-${i}`))];
+    const plain = buildSeedCases(inputs({ candidates, targets: { creative: 12 } })).cases.filter((c) => c.surface === 'creative');
+    expect(plain.map((c) => c.sourceRef.id).every((id) => id.startsWith('r-'))).toBe(true);
+    expect(plain).toHaveLength(5);
+  });
+
+  it('opted in: reviewed candidates keep priority, gated ones fill after them and are tagged', () => {
+    const candidates = [...Array.from({ length: 5 }, (_, i) => reviewed(`r-${i}`)), ...Array.from({ length: 10 }, (_, i) => gated(`g-${i}`))];
+    const out = buildSeedCases(inputs({ candidates, gatedCreatives: true, targets: { creative: 12 } })).cases.filter((c) => c.surface === 'creative');
+    expect(out).toHaveLength(12);
+    expect(out.filter((c) => c.sourceRef.id.startsWith('r-'))).toHaveLength(5);
+    expect(out.filter((c) => c.seedSource === 'gated_candidate')).toHaveLength(7);
+  });
+
+  it('a larger target only appends (prefix property) and the default target adds none when reviewed already fill it', () => {
+    const candidates = [...Array.from({ length: 60 }, (_, i) => reviewed(`r-${i}`)), ...Array.from({ length: 40 }, (_, i) => gated(`g-${i}`))];
+    const base = buildSeedCases(inputs({ candidates, gatedCreatives: true })).cases.filter((c) => c.surface === 'creative');
+    expect(base).toHaveLength(50);
+    expect(base.some((c) => c.seedSource === 'gated_candidate')).toBe(false);
+    const a = buildSeedCases(inputs({ candidates, gatedCreatives: true, targets: { creative: 70 } })).cases.filter((c) => c.surface === 'creative').map((c) => c.caseId);
+    const b = buildSeedCases(inputs({ candidates, gatedCreatives: true, targets: { creative: 80 } })).cases.filter((c) => c.surface === 'creative').map((c) => c.caseId);
+    expect(b.slice(0, a.length)).toEqual(a);
+  });
+
+  it('skips candidates already reviewed, non-image types and ungated rows', () => {
+    const candidates = [
+      { ...reviewed('both'), gated: true },
+      { candidateId: 'lp', reviewType: 'landing_page', feedbackSlackUserIds: [] as string[], gated: true },
+      { candidateId: 'plain', reviewType: 'creative_image', feedbackSlackUserIds: [] as string[] },
+      gated('only-gated'),
+    ];
+    const out = buildSeedCases(inputs({ candidates, gatedCreatives: true, targets: { creative: 10 } })).cases.filter((c) => c.surface === 'creative');
+    expect(out.map((c) => c.sourceRef.id).sort()).toEqual(['both', 'only-gated']);
+    expect(out.find((c) => c.sourceRef.id === 'both')?.seedSource).toBe('human_eval_reviewer_feedback');
+  });
+});
