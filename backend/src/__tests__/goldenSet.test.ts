@@ -1,7 +1,9 @@
 import {
+  AI_LABEL_NOTE_PREFIX,
   buildCaseId,
   GOLDEN_CRITERIA,
   GoldenCaseValidationError,
+  isAiLabelled,
   isFullyLabelled,
   newCreativePairCase,
   newGoldenCase,
@@ -141,5 +143,15 @@ describe('deterministic dev/test split', () => {
 
   it('pins known ids so a hashing change cannot silently reshuffle the split', () => {
     expect(['agent#sessionId#a', 'agent#sessionId#b', 'agent#sessionId#c', 'agent#sessionId#d'].map(splitForCaseId)).toEqual(['dev', 'dev', 'test', 'test']);
+  });
+});
+
+describe('AI-written labels (ENG-2135)', () => {
+  it('recognises a case whose note starts with the AI-label marker, and only that', () => {
+    expect(AI_LABEL_NOTE_PREFIX).toBe('[AI-LABEL]');
+    expect(isAiLabelled({ notes: `${AI_LABEL_NOTE_PREFIX} Written by Claude. Confidence: low.` })).toBe(true);
+    expect(isAiLabelled({ notes: 'Looked fine to me. [AI-LABEL] is a marker used elsewhere' })).toBe(false);
+    expect(isAiLabelled({ notes: '' })).toBe(false);
+    expect(isAiLabelled({})).toBe(false);
   });
 });
