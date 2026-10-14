@@ -1601,8 +1601,10 @@ createTestAccount().then(async () => {
           track: (jobName, promise) => cronJobRegistry.track(jobName, promise),
         });
         const { recoverClaudeSubscriptionOrphansAtBoot } = await import('./services/funding/claudeSubscriptionService');
-        const recovered = await recoverClaudeSubscriptionOrphansAtBoot();
-        if (recovered) console.log('[ClaudeSubscription] boot recovery:', recovered);
+        // Not awaited: a slow store must never hold up the rest of boot.
+        void recoverClaudeSubscriptionOrphansAtBoot()
+          .then((recovered) => recovered && console.log('[ClaudeSubscription] boot recovery:', recovered))
+          .catch((error) => console.error('[ClaudeSubscription] boot recovery failed:', (error as { code?: string })?.code || 'error'));
       } catch (error) {
         console.error('[ClaudeSubscription] Failed to initialize:', (error as { code?: string })?.code || 'error');
       }

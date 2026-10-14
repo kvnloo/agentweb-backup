@@ -521,6 +521,75 @@ describe('withLogin: the single live copy', () => {
     });
   });
 
+  describe('after a reconnect and other edge cases (second review)', () => {
+    const quiet = () => jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    it('recovery never overwrites a login the user has since reconnected', async () => {
+      const ctx = setup();
+      await seedLogin(ctx);
+      // a process died holding a refreshed login: its dir and marker remain, its lease lapsed
+      await ctx.db.acquireSubLease('sub-x', 'dead-owner', Date.now() - 200_000, 90_000);
+      const dir = join(ctx.tmpRoot, `${HOME_DIR_PREFIX}dead`);
+      mkdirSync(join(dir, 'cfg'), { recursive: true });
+      writeFileSync(join(dir, 'cfg', '.credentials.json'), credsText({ refreshToken: 'SENTINEL-REFRESH-DEADPROC' }));
+      writeFileSync(join(dir, 'marker.json'), JSON.stringify({ connectionId: 'sub-x', owner: 'dead-owner', version: 1, ownerUserId: 'user-1', pid: 999999 }));
+      // the user reconnects meanwhile
+      expect(await ctx.db.replaceSubCredentials('sub-x', { expectedVersion: 1, sealed: (await ctx.db.get('sub-x'))!.sealed!, health: { type: 'max', tier: '', accessExpiresAtMs: 1, refreshExpiresAtMs: Date.now() + 1e9 }, nowMs: Date.now(), nowIso: new Date().toISOString() })).toBe(true);
+      expect((await ctx.db.get('sub-x'))?.subLeaseOwner).toBeUndefined();
+      const before = (await ctx.db.get('sub-x'))!;
+      expect(await ctx.service.recoverOrphans()).toMatchObject({ saved: 0, wiped: 1 });
+      const after = (await ctx.db.get('sub-x'))!;
+      expect(after.subVersion).toBe(before.subVersion);
+      expect(after.sealed).toEqual(before.sealed);
+    });
+
+    it('a synchronous throw from the caller still stops the timers, wipes the dir and releases the lease', async () => {
+      const ctx = setup();
+      await seedLogin(ctx);
+      await expect(ctx.service.withLogin('sub-x', 'user-1', (() => { throw new Error('sync boom'); }) as any)).rejects.toThrow('sync boom');
+      expect(homeDirs(ctx.tmpRoot)).toEqual([]);
+      expect((await ctx.db.get('sub-x'))?.subLeaseOwner).toBeUndefined();
+    });
+
+    it('recovers a lost response on the LAST attempt of a save, not only the first (attempts are tracked per run)', async () => {
+      const ctx = setup({ deps: { persistRetryMs: 40, persistMaxMs: 3000 } });
+      await seedLogin(ctx);
+      const real = ctx.db.saveSubCredentials.bind(ctx.db);
+      let calls = 0;
+      const err = quiet();
+      jest.spyOn(ctx.db, 'saveSubCredentials').mockImplementation(async (...a) => {
+        calls++;
+        if (calls < 3) throw new Error('down');
+        if (calls === 3) { await real(...a); throw new Error('response lost after commit'); }
+        return real(...a);
+      });
+      let aborted = false;
+      const res = await ctx.service.withLogin('sub-x', 'user-1', async ({ configDir, signal }) => {
+        signal.addEventListener('abort', () => (aborted = true));
+        rewrite(configDir, credsText({ refreshToken: 'SENTINEL-REFRESH-LASTATTEMPT' }));
+      });
+      expect(res.status).toBe('save_failed');
+      await sleep(900); // background retry sees "stale" and recognises its own earlier write
+      err.mockRestore();
+      expect(aborted).toBe(false);
+      expect((await ctx.db.get('sub-x'))?.subVersion).toBe(2);
+      expect(homeDirs(ctx.tmpRoot)).toEqual([]);
+    });
+
+    it('recovery leaves a young dir with no marker yet alone (a run still setting up), but removes an old one', async () => {
+      const ctx = setup();
+      const young = join(ctx.tmpRoot, `${HOME_DIR_PREFIX}young`);
+      const old = join(ctx.tmpRoot, `${HOME_DIR_PREFIX}old`);
+      mkdirSync(join(young, 'cfg'), { recursive: true });
+      mkdirSync(join(old, 'cfg'), { recursive: true });
+      const t = new Date(Date.now() - 3600e3);
+      utimesSync(old, t, t);
+      await ctx.service.recoverOrphans();
+      expect(existsSync(young)).toBe(true);
+      expect(existsSync(old)).toBe(false);
+    });
+  });
+
   describe('a response that never arrived', () => {
     it('is not mistaken for a lost login: the retry finds our own write already stored', async () => {
       const ctx = setup();

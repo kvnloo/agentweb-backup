@@ -431,7 +431,7 @@ export class LlmConnectionDb {
   ): Promise<boolean> {
     return this.subUpdate(connectionId, {
       update:
-        "SET sealed = :sealed, subVersion = :next, subSavedAt = :now, updatedAt = :now, subType = :type, subTier = :tier, subAccessExpiresAtMs = :acc, subRefreshExpiresAtMs = :ref, #status = :active, subNeedsReconnect = :no REMOVE subReconnectReason",
+        "SET sealed = :sealed, subVersion = :next, subSavedAt = :now, updatedAt = :now, subType = :type, subTier = :tier, subAccessExpiresAtMs = :acc, subRefreshExpiresAtMs = :ref, #status = :active, subNeedsReconnect = :no REMOVE subReconnectReason, subLeaseOwner, subLeaseUntil",
       condition:
         "attribute_exists(connectionId) AND #kind = :sub AND attribute_not_exists(revokedAt) AND subVersion = :v AND (attribute_not_exists(subLeaseUntil) OR subLeaseUntil < :nowMs)",
       names: { "#kind": "kind", "#status": "status" },

@@ -60,6 +60,8 @@ export const ABORT_GRACE_MS = 10_000;
 /** When a save-back keeps failing, retry this often, for at most this long, while still holding the lease. */
 export const PERSIST_RETRY_MS = 5_000;
 export const PERSIST_MAX_MS = 10 * 60 * 1000;
+/** A recovery pass leaves a login dir younger than this alone if its marker is missing (it is still being set up). */
+export const YOUNG_DIR_MS = 60_000;
 const MARKER = "marker.json";
 
 export interface ParsedLogin {
@@ -307,19 +309,22 @@ export class ClaudeSubscriptionService {
       mkdirSync(configDir, { mode: 0o700 });
       credsPath = join(configDir, ".credentials.json");
       writeFileSync(credsPath, text, { mode: 0o600 });
+      var runDir: string = dir;
+      var version: number = record.subVersion ?? 1;
+      var writeMarker = () =>
+        writeFileSync(join(runDir, MARKER), JSON.stringify({ connectionId, owner, version, ownerUserId: record!.ownerUserId, pid: process.pid }), { mode: 0o600 });
+      writeMarker();
+      this.activeDirs.add(runDir);
     } catch (err) {
+      this.activeDirs.delete(dir ?? "");
       if (dir) rmSync(dir, { recursive: true, force: true });
       await db.releaseSubLease(connectionId, owner).catch(() => undefined);
       throw err;
     }
-    const runDir = dir;
-    this.activeDirs.add(runDir);
-    let version = record.subVersion ?? 1;
-    const writeMarker = () =>
-      writeFileSync(join(runDir, MARKER), JSON.stringify({ connectionId, owner, version, ownerUserId: record!.ownerUserId, pid: process.pid }), { mode: 0o600 });
-    writeMarker();
 
     let lastText = text;
+    /** Timestamps of every save attempt in this run: a lost response from ANY of them may have committed. */
+    const attempted: string[] = [];
     let lost: "stale" | "revoked" | undefined;
     let leaseLost = false;
     let saveFailed = false;
@@ -340,13 +345,16 @@ export class ClaudeSubscriptionService {
       } catch {
         return;
       }
-      const attempted: string[] = [];
       const succeeded = () => {
         version += 1;
         lastText = current;
         saveFailed = false;
         confirmedUntil = Math.max(confirmedUntil, this.deps.now());
-        writeMarker(); // recovery must start from the version we now hold
+        try {
+          writeMarker(); // recovery must start from the version we now hold
+        } catch {
+          console.error(`[claude-subscription] could not update the recovery marker for connection=${connectionId}`);
+        }
       };
       for (let attempt = 1; attempt <= SAVE_ATTEMPTS; attempt++) {
         const nowIso = new Date(this.deps.now()).toISOString();
@@ -393,8 +401,12 @@ export class ClaudeSubscriptionService {
             // Someone else holds it now, or it was revoked: stop the CLI before a second copy can refresh.
             leaseLost = true;
             stop("lease_lost");
-            const now = await db.get(connectionId).catch(() => null);
-            if (!now || now.revokedAt) lost = lost ?? "revoked";
+            try {
+              const now = await db.get(connectionId);
+              if (!now || now.revokedAt) lost = lost ?? "revoked";
+            } catch {
+              /* unknown, not revoked: the lease loss alone already stops the caller */
+            }
           }
         } catch {
           /* the watchdog decides */
@@ -428,7 +440,7 @@ export class ClaudeSubscriptionService {
         graceTimer.unref?.();
       });
     });
-    const fnPromise = fn({ configDir, signal: abort.signal, connectionId, version: () => version }).then(
+    const fnPromise = (async () => fn({ configDir, signal: abort.signal, connectionId, version: () => version }))().then(
       (value) => ({ kind: "done" as const, value }),
       (error) => ({ kind: "threw" as const, error }),
     );
@@ -474,6 +486,7 @@ export class ClaudeSubscriptionService {
               this.activeDirs.delete(runDir); // no longer a live run: a recovery pass may take it
               return; // dir kept on purpose: it is the only copy
             }
+            if (lost === "stale") console.error(`[claude-subscription] lost the live copy of connection=${connectionId} while the store was unreachable; the customer may need to sign in again`);
             wipe();
             await db.releaseSubLease(connectionId, owner).catch(() => undefined);
           })(),
@@ -524,7 +537,9 @@ export class ClaudeSubscriptionService {
           if (res !== "stale") break;
           // The marker may lag one save behind the store: if the lease is still the recorded owner's, build on the stored version.
           const cur = await this.deps.db.get(marker.connectionId);
-          if (!cur || cur.revokedAt || cur.subLeaseOwner !== marker.owner || cur.subVersion === undefined || cur.subVersion === expectedVersion) break;
+          // Only when the store is exactly one save ahead of the marker (a crash between a save and its marker
+          // write) and the lease is still the recorded owner's. A reconnect clears the owner, so it is never overwritten.
+          if (!cur || cur.revokedAt || cur.subLeaseOwner !== marker.owner || cur.subVersion !== expectedVersion + 1) break;
           expectedVersion = cur.subVersion;
         }
         await this.deps.db.releaseSubLease(marker.connectionId, marker.owner).catch(() => undefined);
@@ -532,6 +547,12 @@ export class ClaudeSubscriptionService {
         out.wiped++;
       } catch (err) {
         if ((err as { code?: string })?.code === "ENOENT" || err instanceof SyntaxError || err instanceof ClaudeSubscriptionError) {
+          // A run still setting up has not written its marker yet: leave a young dir alone.
+          try {
+            if (this.deps.now() - statSync(dir).mtimeMs < YOUNG_DIR_MS) continue;
+          } catch {
+            continue;
+          }
           rmSync(dir, { recursive: true, force: true });
           out.wiped++;
         } else out.kept++; // the store was unreachable: keep the only copy for the next boot
