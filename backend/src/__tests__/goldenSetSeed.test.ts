@@ -113,4 +113,85 @@ describe('golden-set seed builder (ENG-2135)', () => {
     expect(() => parseFpCatalogue({ issues: { 'ENG-1': [1] } })).toThrow(/string array/);
     expect(() => parseFpCatalogue({ issues: {}, replayFixtures: { f: { session: 's', messageIndex: -1 } } })).toThrow(/messageIndex/);
   });
+
+  describe('sampled_session source', () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    const ordinary = (i: number, over: Record<string, unknown> = {}) => ({
+      sessionId: sid(1000 + i),
+      adminOverride: false,
+      createdAt: new Date(NOW.getTime() - 10 * DAY).toISOString(),
+      sessionType: 'regular',
+      messageCount: 6,
+      userId: `user-${i}`,
+      ...over,
+    });
+    const pool = (n = 100) => Array.from({ length: n }, (_, i) => ordinary(i));
+    const agentOf = (result: ReturnType<typeof buildSeedCases>) => result.cases.filter((c) => c.surface === 'agent');
+    const sampledIds = (result: ReturnType<typeof buildSeedCases>) => agentOf(result).filter((c) => c.taskType === 'sampled_session').map((c) => c.sourceRef.id);
+
+    it('is deterministic and a larger target only appends (70 contains 60)', () => {
+      const sessions = [...inputs().sessions.slice(0, 3), ...pool()];
+      const at = (agent: number, rows = sessions) => sampledIds(buildSeedCases(inputs({ sessions: rows, targets: { agent } })));
+      const s60 = at(60);
+      const s70 = at(70);
+      expect(s60).toHaveLength(57);
+      expect(s70).toHaveLength(67);
+      expect(s70).toEqual(expect.arrayContaining(s60));
+      expect(at(70, [...sessions].reverse()).sort()).toEqual([...s70].sort());
+      expect(buildSeedCases(inputs({ sessions, targets: { agent: 70 } })).report.agent.bySource).toMatchObject({ admin_override: 3, sampled_session: 67 });
+    });
+
+    it('is ordered by hash, not recency: newer sessions are not preferred', () => {
+      const sessions = pool(60).map((s, i) => ({ ...s, createdAt: new Date(NOW.getTime() - (i + 1) * DAY).toISOString() }));
+      const picked = new Set(sampledIds(buildSeedCases(inputs({ sessions, targets: { agent: 20 } }))));
+      const newest20 = new Set(sessions.slice(0, 20).map((s) => s.sessionId));
+      expect([...picked].filter((id) => newest20.has(id)).length).toBeLessThan(20);
+    });
+
+    it('excludes short, old, future-dated, evaluation, non-regular and unattributed sessions', () => {
+      const bad = [
+        ordinary(1, { messageCount: 3 }),
+        ordinary(2, { messageCount: undefined }),
+        ordinary(3, { createdAt: new Date(NOW.getTime() - 91 * DAY).toISOString() }),
+        ordinary(4, { createdAt: undefined }),
+        ordinary(5, { createdAt: 'not-a-date' }),
+        ordinary(6, { createdAt: new Date(NOW.getTime() + DAY).toISOString() }),
+        ordinary(7, { userId: 'eval_abc123' }),
+        ordinary(8, { sessionType: 'scheduled' }),
+      ];
+      const good = [ordinary(10), ordinary(11, { messageCount: 4 }), ordinary(12, { sessionType: undefined }), ordinary(13, { createdAt: new Date(NOW.getTime() - 90 * DAY).toISOString() })];
+      const result = buildSeedCases(inputs({ sessions: [...bad, ...good], targets: { agent: 20 } }));
+      expect(sampledIds(result).sort()).toEqual(good.map((s) => s.sessionId).sort());
+    });
+
+    it('never re-labels a session already present as admin_override, fp_catalogue or replay_fixture', () => {
+      const rows = [ordinary(1, { adminOverride: true }), ordinary(2), ordinary(3), ordinary(4)];
+      const fpCatalogue = { issues: { 'ENG-9': [rows[1].sessionId] }, replayFixtures: { f1: { session: rows[2].sessionId, messageIndex: 2 } } };
+      const agent = agentOf(buildSeedCases(inputs({ sessions: rows, fpCatalogue, targets: { agent: 50 } })));
+      const type = (r: { sessionId: string }) => agent.find((c) => c.sourceRef.id === r.sessionId)?.taskType;
+      expect([type(rows[0]), type(rows[1]), type(rows[2]), type(rows[3])]).toEqual(['admin_override', 'fp_catalogue', 'replay_fixture', 'sampled_session']);
+      expect(agent).toHaveLength(4);
+    });
+
+    it('fills after pinned and fp_catalogue cases, and leaves a full default-target result unchanged', () => {
+      const base = inputs({ fpCatalogue: { issues: { 'ENG-1': Array.from({ length: 70 }, (_, i) => sid(i)) } } });
+      const without = buildSeedCases(base);
+      const withPool = buildSeedCases({ ...base, sessions: [...base.sessions, ...pool()] });
+      expect(withPool.cases.map((c) => c.caseId)).toEqual(without.cases.map((c) => c.caseId));
+      expect(withPool.report.agent.bySource).toEqual(without.report.agent.bySource);
+      expect(withPool.report.agent.eligible).toBe(without.report.agent.eligible + 100);
+      // Raising the target keeps every existing case and adds sampled ones only.
+      const bigger = buildSeedCases({ ...base, sessions: [...base.sessions, ...pool()], targets: { agent: 90 } });
+      const ids = new Set(bigger.cases.map((c) => c.caseId));
+      expect(without.cases.filter((c) => c.surface === 'agent').every((c) => ids.has(c.caseId))).toBe(true);
+      expect(bigger.report.agent.bySource.sampled_session).toBe(90 - without.report.agent.eligible);
+    });
+
+    it('an empty candidate pool leaves the result unchanged', () => {
+      const a = buildSeedCases(inputs({ targets: { agent: 70 } }));
+      const b = buildSeedCases(inputs({ sessions: inputs().sessions.map((s) => ({ ...s, messageCount: 2, createdAt: NOW.toISOString() })), targets: { agent: 70 } }));
+      expect(b.cases.map((c) => c.caseId)).toEqual(a.cases.map((c) => c.caseId));
+      expect(b.report.agent.bySource.sampled_session).toBeUndefined();
+    });
+  });
 });
