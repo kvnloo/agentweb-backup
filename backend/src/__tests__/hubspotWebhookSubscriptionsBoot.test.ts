@@ -36,6 +36,7 @@ import { ensureWebhookSubscriptions } from '../utils/hubspotWebhookSubscriptions
 const get = axios.get as jest.Mock;
 const post = axios.post as jest.Mock;
 const registeredAtBoot = mockRegister.mock.calls.map((c) => c[0]);   // captured at import time
+const bootProcessor = mockRegister.mock.calls.find((c) => c[0] === SUBSCRIPTION_SYNC_SOURCE)![1] as () => Promise<void>;
 
 // A tiny stateful HubSpot app: POST adds a subscription, GET lists them.
 let subs: Array<{ eventType: string; propertyName?: string }> = [];
@@ -148,11 +149,55 @@ describe('ensureWebhookSubscriptionsOncePerBuild', () => {
     expect(mockEnqueue).not.toHaveBeenCalled();
   });
 
-  it('a registration failure is absorbed: the job still completes and nothing throws', async () => {
+  it('a failed registration is NOT marked complete: the claim goes back to the queue for retry, and nothing throws', async () => {
     post.mockRejectedValue(Object.assign(new Error('403'), { response: { status: 403, data: { message: 'nope' } } }));
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    await expect(ensureWebhookSubscriptionsOncePerBuild()).resolves.toBe('failed-will-retry');
+
+    expect(mockComplete).not.toHaveBeenCalled();
+    expect(mockFailed).toHaveBeenCalledWith(SUBSCRIPTION_SYNC_SOURCE, 'abc123', expect.any(Error));
+  });
+
+  it('a transient credentials failure is also retried, not treated as done', async () => {
+    (getHubSpotCredentials as jest.Mock).mockRejectedValueOnce(new Error('secrets down'));
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await expect(ensureWebhookSubscriptionsOncePerBuild()).resolves.toBe('failed-will-retry');
+    expect(mockFailed).toHaveBeenCalled();
+  });
+
+  it('missing credentials (nothing this environment can do) completes instead of retrying forever', async () => {
+    (getHubSpotCredentials as jest.Mock).mockResolvedValue({});
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     await expect(ensureWebhookSubscriptionsOncePerBuild()).resolves.toBe('ran');
     expect(mockComplete).toHaveBeenCalled();
+    expect(mockFailed).not.toHaveBeenCalled();
+  });
+
+  it('an app id without a developer key is also "nothing to do", not a retry loop', async () => {
+    (getHubSpotCredentials as jest.Mock).mockResolvedValue({ hubspotAppId: 'app1' });
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await expect(ensureWebhookSubscriptionsOncePerBuild()).resolves.toBe('ran');
+    expect(mockFailed).not.toHaveBeenCalled();
+  });
+
+  it('the processor the queue poller calls rejects when a registration fails (so the retry counts an attempt)', async () => {
+    const processor = bootProcessor;
+    post.mockRejectedValue(new Error('boom'));
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    await expect(processor()).rejects.toThrow(/could not be registered/);
+    post.mockReset().mockResolvedValue({ data: { id: 1 } });
+    await expect(processor()).resolves.toBeUndefined();
+  });
+
+  it('every HubSpot call carries a timeout, so a hung socket cannot hold the claim forever', async () => {
+    await ensureWebhookSubscriptionsOncePerBuild();
+    for (const c of [...get.mock.calls, ...post.mock.calls]) {
+      const cfg = c[c.length - 1];
+      expect(cfg.timeout).toBeGreaterThan(0);
+    }
   });
 });
 
