@@ -38,6 +38,7 @@ import { PendingApprovalDeck } from './agentMode/core/approvalDeck';
 import { WorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import { WorkflowRunState } from './agentMode/core/workflow';
 import { assertSequentialStepCounts } from './workPlanSteps';
+import { carryConcealedActiveRun, concealActiveRun, type ActiveRun } from './agentMode/sessionActiveRunGuard';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -53,6 +54,9 @@ const REPAIRABLE_TOOL_CALLS = [
   'generate_image',
   'generate_video'
 ];
+
+/** AW-ChatSessions table name (the ENG-110 active-run guard writes to it without going through ChatbotDB). */
+export const CHAT_SESSIONS_TABLE_NAME = `${TABLE_PREFIX}AW-ChatSessions`;
 
 // Make sure we have a DynamoDB instance
 export const dynamodb = new AWS.DynamoDB.DocumentClient({
@@ -206,6 +210,14 @@ export interface ChatSession {
    * never serialised on share / conversable / MCP views. No GSI, no backfill; rollback = stop writing/reading.
    */
   branchedFrom?: BranchedFrom;
+  /**
+   * ENG-110 (owner-approved additive optional attribute): the interactive /generate run currently live on this
+   * session, with a heartbeat, so another backend instance (Immutable deploy overlap) can see it. Written only by
+   * the active-run guard (sessionActiveRunGuard.ts) behind the `session_active_run_guard_enabled` switch. No GSI,
+   * no backfill; rollback = switch off, leftovers go stale harmlessly. NEVER serialised: every ChatbotDB read
+   * hides it (non-enumerable) and the owner/MCP views omit it.
+   */
+  activeRun?: ActiveRun;
   selectedStartupId?: string; // Selected startup profile for context
   workflowId?: string; // Added workflowId for agent mode sessions
   executionId?: string; // Added executionId for agent mode sessions
@@ -1964,7 +1976,7 @@ export class ChatbotDB {
 
     try {
       const result = await dynamodb.get(params).promise();
-      return (result.Item as ChatSession) || null;
+      return concealActiveRun(result.Item as ChatSession) || null;
     } catch (error) {
       console.error("Error getting chat session record:", error);
       throw error;
@@ -1992,10 +2004,11 @@ export class ChatbotDB {
       // Remove messages from session object and replace with messages from messages table
       // This ensures we always return the correct format from the messages table
       const { messages: _, ...sessionWithoutMessages } = session;
-      const normalizedSession = {
+      // activeRun is hidden (non-enumerable) on the record, so the spread drops it: carry it over, still hidden.
+      const normalizedSession = carryConcealedActiveRun(session, {
         ...sessionWithoutMessages,
         messages,
-      };
+      });
 
       // Normalize associatedSkills to string[] (handles DynamoDB Set wrapper)
       // Legacy sessions (pre-skills) have no associatedSkills field — preserve undefined
@@ -2131,7 +2144,7 @@ export class ChatbotDB {
           params.ExclusiveStartKey = paginationKey;
         }
         const result = await dynamodb.query(params).promise();
-        const items = (result.Items as ChatSession[]) || [];
+        const items = ((result.Items as ChatSession[]) || []).map(concealActiveRun);
         collected.push(...items);
         paginationKey = result.LastEvaluatedKey;
       } while (paginationKey && collected.length < targetCount);
@@ -2236,7 +2249,7 @@ export class ChatbotDB {
         params.ExclusiveStartKey = lastEvaluatedKey;
       }
       const result = await dynamodb.query(params).promise();
-      const items = (result.Items as ChatSession[]) || [];
+      const items = ((result.Items as ChatSession[]) || []).map(concealActiveRun);
       collected.push(...items);
       lastEvaluatedKey = result.LastEvaluatedKey;
     } while (lastEvaluatedKey && collected.length < limit);
@@ -2365,7 +2378,7 @@ export class ChatbotDB {
           params.ExclusiveStartKey = lastEvaluatedKey;
         }
         const result = await dynamodb.query(params).promise();
-        allItems = allItems.concat((result.Items as ChatSession[]) || []);
+        allItems = allItems.concat(((result.Items as ChatSession[]) || []).map(concealActiveRun));
         lastEvaluatedKey = result.LastEvaluatedKey;
       } while (lastEvaluatedKey);
 
@@ -2724,7 +2737,7 @@ export class ChatbotDB {
 
     try {
       const result = await dynamodb.query(params).promise();
-      const sessions = (result.Items as ChatSession[]) || [];
+      const sessions = ((result.Items as ChatSession[]) || []).map(concealActiveRun);
       
       console.log(
         `Found ${sessions.length} archived chat sessions`
@@ -4512,7 +4525,7 @@ export class ChatbotDB {
       try {
         const result = await dynamodb.scan(params).promise();
         if (result.Items) {
-          allSessions = allSessions.concat(result.Items as ChatSession[]);
+          allSessions = allSessions.concat((result.Items as ChatSession[]).map(concealActiveRun));
         }
         lastEvaluatedKey = result.LastEvaluatedKey;
       } catch (error) {
@@ -4570,7 +4583,7 @@ export class ChatbotDB {
           }
 
           const result = await dynamodb.query(params).promise();
-          accumulated.push(...((result.Items as ChatSession[]) || []));
+          accumulated.push(...((result.Items as ChatSession[]) || []).map(concealActiveRun));
           currentKey = result.LastEvaluatedKey;
         } while (currentKey);
 
@@ -4639,7 +4652,7 @@ export class ChatbotDB {
 
             const lateResult = await dynamodb.query(lateParams).promise();
             pageCount++;
-            for (const session of (lateResult.Items as ChatSession[]) || []) {
+            for (const session of ((lateResult.Items as ChatSession[]) || []).map(concealActiveRun)) {
               if (primarySessionIds.has(session.sessionId)) continue; // already covered by the primary query
               const createdAt = session.createdAt;
               if (createdAt && createdAt >= timeRange.startTime && createdAt <= timeRange.endTime) {
@@ -4712,7 +4725,7 @@ export class ChatbotDB {
         }
 
         const result = await dynamodb.query(params).promise();
-        accumulated.push(...((result.Items as ChatSession[]) || []));
+        accumulated.push(...((result.Items as ChatSession[]) || []).map(concealActiveRun));
         currentKey = result.LastEvaluatedKey;
       } while (currentKey && accumulated.length < limit);
 

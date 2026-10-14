@@ -13,6 +13,75 @@ type Item = Record<string, any>;
 
 const clone = <T>(v: T): T => (v === undefined ? v : JSON.parse(JSON.stringify(v)));
 
+/**
+ * ConditionExpression evaluator: attribute_exists(path), attribute_not_exists(path) and `path <op> :value`
+ * (=, <>, <, <=, >, >=) over dotted / #aliased paths, combined with AND / OR and parentheses (AND binds tighter).
+ * Anything else throws, so an unsupported expression fails the test instead of silently passing.
+ * DynamoDB semantics kept: a comparison against a missing attribute is false.
+ */
+function evaluateCondition(expr: string, item: Item | undefined, names: Record<string, string>, values: Record<string, any>): boolean {
+  const tokens = expr.match(/\(|\)|<>|<=|>=|=|<|>|[A-Za-z_#:][\w#:.]*/g);
+  if (!tokens || tokens.join('').length < expr.replace(/\s+/g, '').length) {
+    throw new Error(`BranchFakeDynamo: unsupported ConditionExpression: ${expr}`);
+  }
+  let pos = 0;
+  const peek = () => tokens[pos];
+  const next = () => tokens[pos++];
+  const read = (path: string): any => {
+    if (!item) return undefined;
+    return path
+      .split('.')
+      .map((seg) => (seg.startsWith('#') ? names[seg] ?? seg.slice(1) : seg))
+      .reduce<any>((cur, seg) => (cur === undefined || cur === null ? undefined : cur[seg]), item);
+  };
+  const fail = (): never => {
+    throw new Error(`BranchFakeDynamo: unsupported ConditionExpression: ${expr}`);
+  };
+  const operand = (): boolean => {
+    const tok = next();
+    if (tok === '(') {
+      const inner = or();
+      if (next() !== ')') fail();
+      return inner;
+    }
+    if (tok === 'attribute_exists' || tok === 'attribute_not_exists') {
+      if (next() !== '(') fail();
+      const exists = read(next()) !== undefined;
+      if (next() !== ')') fail();
+      return tok === 'attribute_exists' ? exists : !exists;
+    }
+    if (tok === undefined || /^(AND|OR)$/.test(tok)) fail();
+    const op = next();
+    const valueRef = next();
+    if (!valueRef || !valueRef.startsWith(':') || !(valueRef in values)) fail();
+    const left = read(tok);
+    const right = values[valueRef];
+    if (left === undefined) return false;
+    switch (op) {
+      case '=': return JSON.stringify(left) === JSON.stringify(right);
+      case '<>': return JSON.stringify(left) !== JSON.stringify(right);
+      case '<': return left < right;
+      case '<=': return left <= right;
+      case '>': return left > right;
+      case '>=': return left >= right;
+      default: return fail();
+    }
+  };
+  const and = (): boolean => {
+    let result = operand();
+    while (peek() === 'AND') { next(); result = operand() && result; }
+    return result;
+  };
+  function or(): boolean {
+    let result = and();
+    while (peek() === 'OR') { next(); result = and() || result; }
+    return result;
+  }
+  const result = or();
+  if (pos !== tokens.length) fail();
+  return result;
+}
+
 export class BranchFakeDynamo {
   readonly tables = new Map<string, Map<string, Item>>();
   /** When set, batchWrite reports these message indexes as UnprocessedItems forever (silent partial write). */
@@ -150,17 +219,7 @@ export class BranchFakeDynamo {
 
   /** AND-joined `attribute_exists(a)`, `attribute_not_exists(a)` and `a = :v` clauses; anything else throws. */
   private conditionHolds(existing: Item | undefined, p: any): boolean {
-    const values: Record<string, any> = p.ExpressionAttributeValues ?? {};
-    return String(p.ConditionExpression).split(' AND ').every((raw) => {
-      const clause = raw.trim();
-      let m = clause.match(/^attribute_exists\((\w+)\)$/);
-      if (m) return !!existing && existing[m[1]] !== undefined;
-      m = clause.match(/^attribute_not_exists\((\w+)\)$/);
-      if (m) return !existing || existing[m[1]] === undefined;
-      m = clause.match(/^(\w+) = (:\w+)$/);
-      if (m) return !!existing && JSON.stringify(existing[m[1]]) === JSON.stringify(values[m[2]]);
-      throw new Error(`BranchFakeDynamo: unsupported ConditionExpression clause: ${clause}`);
-    });
+    return evaluateCondition(String(p.ConditionExpression), existing, p.ExpressionAttributeNames ?? {}, p.ExpressionAttributeValues ?? {});
   }
 
   /** UserIdIndex (userId, updatedAt): only the plain `userId = :userId` key condition, paged by `indexPageSize`. */

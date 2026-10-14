@@ -22,6 +22,7 @@ import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../
 // ENG-982: `ctx` and `jsonResult` moved to ./toolHelpers so workflowTools.ts can
 // share them instead of keeping a second copy. Behaviour unchanged.
 import { omitBranchedFrom } from '../../utils/adminOnlyMessageFilter';
+import { omitActiveRun } from '../../services/agentMode/sessionActiveRunGuard';
 import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 import { resolveClientScopedContext } from './adminClientScope';
@@ -390,7 +391,8 @@ mcpToolRegistry.register({
     }
     return jsonResult({
       // ENG-112: branch-family linkage is portal-only; MCP clients never see it.
-      ...omitBranchedFrom(data),
+      // ENG-110: the cross-instance run marker (runId/instanceId) is internal; MCP clients never see it.
+      ...omitActiveRun(omitBranchedFrom(data)),
       run,
       // Terminal means the request ended, not that all detached or continuation work did.
       completion_confirmed: run !== null && run.status !== 'running' &&
@@ -409,7 +411,7 @@ mcpToolRegistry.register({
   },
   execute: async (_args: any, context: any) => {
     const data = await mcpFetch({ method: 'GET', path: '/api/agent-mode/sessions', context: ctx(context) });
-    return jsonResult(omitBranchedFrom(data));
+    return jsonResult(omitActiveRun(omitBranchedFrom(data)));
   }
 });
 
