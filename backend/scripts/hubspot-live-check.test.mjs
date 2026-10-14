@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { run, classifyGone } from './hubspot-live-check.mjs';
 
-function startFake({ missing = '404' } = {}) {
+function startFake({ missing = '404', accountType = 'DEVELOPER_TEST' } = {}) {
   const contacts = new Map(); const archived = new Set(); let next = 5000;
   const calls = [];
   const byEmail = (e) => [...contacts.values()].find((c) => c.properties.email?.toLowerCase() === e.toLowerCase());
@@ -20,7 +20,7 @@ function startFake({ missing = '404' } = {}) {
       calls.push(`${req.method} ${path}`);
       const send = (s, b) => { res.writeHead(s, { 'content-type': 'application/json' }); res.end(b === undefined ? '' : JSON.stringify(b)); };
       if (req.headers.authorization !== 'Bearer tok') return send(401, {});
-      if (path === '/account-info/v3/details') return send(200, { portalId: 1, accountType: 'DEVELOPER_TEST' });
+      if (path === '/account-info/v3/details') return send(200, { portalId: 1, accountType });
       if (req.method === 'POST' && path === '/crm/v3/objects/contacts') {
         const id = String(next++); contacts.set(id, { id, properties: { ...body.properties } }); return send(201, { id, properties: body.properties });
       }
@@ -106,6 +106,15 @@ test('still archives its probes when an experiment throws midway', async () => {
     globalThis.fetch = (...a) => (String(a[0]).includes('batch/upsert') && ++n === 1 ? Promise.reject(new Error('boom')) : realFetch(...a));
     await assert.rejects(run({ base: f.base, token: 'tok', upsertGapMs: 0, log: () => {} }), /boom/);
     globalThis.fetch = realFetch;
+    assert.equal(f.contacts.size, 0);
+  } finally { f.server.close(); }
+});
+
+test('refuses a STANDARD (customer) portal before creating or changing anything', async () => {
+  const f = await startFake({ accountType: 'STANDARD' });
+  try {
+    await assert.rejects(run({ base: f.base, token: 'tok', upsertGapMs: 0, log: () => {} }), /refusing to run/);
+    assert.deepEqual(f.calls.filter((c) => c !== 'GET /account-info/v3/details' && !c.startsWith('DELETE')), []);
     assert.equal(f.contacts.size, 0);
   } finally { f.server.close(); }
 });

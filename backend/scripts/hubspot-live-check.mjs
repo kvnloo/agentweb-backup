@@ -60,6 +60,11 @@ export async function run({ base = 'https://api.hubapi.com', token, upsertGapMs 
     const acct = await api('GET', '/account-info/v3/details');
     log(`portal: ${JSON.stringify({ status: acct.status, portalId: acct.body?.portalId, accountType: acct.body?.accountType })}`);
     results.push({ id: 'account', status: acct.status, body: acct.body });
+    // Self-asserted confirmation is not enough: refuse any portal HubSpot does not label as a test or
+    // sandbox account (STANDARD is a real customer portal), before anything is created.
+    if (acct.status !== 200 || !/DEVELOPER|SANDBOX|TEST/i.test(String(acct.body?.accountType))) {
+      throw new Error(`refusing to run: account-info says status=${acct.status} accountType=${acct.body?.accountType} — this must be a HubSpot developer test or sandbox account`);
+    }
 
     // ── setup ──
     const A = await create({ phone: '+15550100001' });
