@@ -32,3 +32,16 @@ The run-store guard (`AGENT_RUN_STORE`, `AW-AgentRuns`) is NOT used.
   `copy-session-to-dev.ts` / `seed-imageresume-testenv.ts`. A dropped attribute only means a missed guard.
 - Out of scope (phase 1): conversable-share generate and system paths (scheduled / Slack / email / verified-generate).
 - Rollback: set the switch to anything but `'true'`; leftover attributes go stale harmlessly.
+
+Switch read is bounded: the (at most once per ~60s) AW-Settings read that /generate awaits is raced against a 2s
+timeout (`SETTING_READ_TIMEOUT_MS`); a hung read behaves like a failed refresh (last-known value, off if none, one log
+line, retry in 5s) and never stalls the core path.
+
+Accepted tradeoffs (phase 1):
+- A >90s event-loop / GC stall of the running instance makes a live run look dead, so a Resend elsewhere is allowed; the
+  stalled run's later beat then only logs `lostClaim` and the two runs can overlap.
+- After a crash / SIGKILL, Resend on the new instance gets 409 and `isGenerating` stays true for up to 90s (until the
+  heartbeat goes stale).
+- Out of scope: the conversable / ishare generate path and the GET /session media-continuation durability backstop.
+- A malformed existing `activeRun` (e.g. a non-numeric `heartbeatAt`) would stay busy; nothing in the codebase writes one,
+  and handling it would need `NOT attribute_type(...)` in the claim condition, which is not worth the complexity.
