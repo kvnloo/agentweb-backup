@@ -4711,6 +4711,7 @@ export class AgentModeService {
           publishedSkillsCount: publishedSkills.length,
           sessionAssociatedSkillIdsCount: sessionAssociatedSkillIds.length,
           allowedToolNames,
+          describeGateRefusal: (toolName: string) => this.describeToolGateRefusal(toolName, publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIdsForDisplay),
           toolResponseS3Threshold: TOOL_RESPONSE_S3_THRESHOLD,
           maxToolContentSize: MAX_TOOL_CONTENT_SIZE,
           mediaGenerationDeadlineMs,
@@ -7435,6 +7436,34 @@ export class AgentModeService {
       hasAdminAccess,
       publishedSkillsCount: publishedSkills.length,
       sessionAssociatedSkillIdsCount: sessionAssociatedSkillIds.length,
+    };
+  }
+
+  /**
+   * ENG-2299: facts needed to tell a missing install from catalog or entitlement drift when a
+   * "tool is not available" refusal is reported. Logged by the dispatch gate; changes no behavior.
+   */
+  public describeToolGateRefusal(
+    toolName: string,
+    publishedSkills: any[],
+    sessionAssociatedSkillIds: string[],
+    userAllowedSkillIds: string[],
+  ): Record<string, unknown> {
+    const isWildcard = userAllowedSkillIds.includes('*');
+    const claimedBy = publishedSkills
+      .filter(s => s.isPublished === true && Array.isArray(s.toolNames) && s.toolNames.includes(toolName))
+      .map(s => ({
+        skillId: s.skillId,
+        installed: sessionAssociatedSkillIds.includes(s.skillId),
+        tierAllows: isWildcard || userAllowedSkillIds.includes(s.skillId),
+      }));
+    return {
+      installedSkillIds: sessionAssociatedSkillIds,
+      otherSkillsInstalled: sessionAssociatedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID),
+      tierAllowsOtherSkills: isWildcard || userAllowedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID),
+      allowedSkillCount: userAllowedSkillIds.length,
+      inOtherSkillsPool: this.getUnassociatedToolNames(publishedSkills).includes(toolName),
+      claimedBy,
     };
   }
 

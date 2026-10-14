@@ -432,6 +432,8 @@ export interface ExecutePreparedToolsInput {
   publishedSkillsCount: number;
   sessionAssociatedSkillIdsCount: number;
   allowedToolNames: Set<string>;
+  /** Diagnostic detail for the skill-install gate refusal log (ENG-2299); must not throw. */
+  describeGateRefusal?: (toolName: string) => Record<string, unknown>;
   // ---- limits ----
   toolResponseS3Threshold: number;
   maxToolContentSize: number;
@@ -661,6 +663,7 @@ export async function executePreparedTools(
     publishedSkillsCount,
     sessionAssociatedSkillIdsCount,
     allowedToolNames,
+    describeGateRefusal,
     toolResponseS3Threshold,
     maxToolContentSize,
     mediaGenerationDeadlineMs,
@@ -859,6 +862,16 @@ export async function executePreparedTools(
          *
          * The prefix is unchanged: `classifyToolErrorClass` keys 'tool_unavailable' off it.
          */
+        try {
+          console.warn('[tool-gate-refused]', JSON.stringify({
+            sessionId,
+            userId,
+            tool: toolCall.function.name,
+            allowedToolCount: allowedToolNames.size,
+            publishedSkillsCount,
+            ...(describeGateRefusal ? describeGateRefusal(toolCall.function.name) : {}),
+          }));
+        } catch { /* diagnostics must never change the refusal */ }
         const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`
           + ` If install_skills cannot install it, STOP — do NOT guess or assume why (it is not always a billing/subscription limit). Relay install_skills' own response message to the user exactly as it states the reason.`
           + ` Do NOT run a different tool and present its output as this tool's result: reporting that a specific check ran, or passed, is a claim about THAT check, and substituting other data makes the claim false.`;
