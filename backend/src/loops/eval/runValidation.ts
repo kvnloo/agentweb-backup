@@ -52,6 +52,9 @@ export interface GoldenCaseGrader {
   grade(goldenCase: GoldenCase): Promise<GraderPrediction>;
 }
 
+/** A class needs at least this many examples (of the rarer truth label) before its kappa means anything. */
+export const MIN_CLASS_EXAMPLES = 5;
+
 export interface CriterionAgreement {
   criterion: GoldenCriterion;
   /** null when no case has both a human and a grader pass/fail for this criterion. */
@@ -59,6 +62,9 @@ export interface CriterionAgreement {
   humanNa: number;
   unlabelled: number;
   graderAbstained: number;
+  /** The rarer of the two truth labels among the pairs. Under MIN_CLASS_EXAMPLES a kappa is not reported as reliable. */
+  minorityN: number;
+  reliable: boolean;
 }
 
 export interface ValidationRun {
@@ -113,12 +119,16 @@ export function computeCriterionAgreement(
     }
     pairs.push({ truth, predicted });
   }
+  const positives = pairs.filter((p) => p.truth === 'pass').length;
+  const minorityN = Math.min(positives, pairs.length - positives);
   return {
     criterion,
     report: pairs.length > 0 ? agreementReport(pairs, bootstrap) : null,
     humanNa,
     unlabelled,
     graderAbstained,
+    minorityN,
+    reliable: pairs.length > 0 && minorityN >= MIN_CLASS_EXAMPLES,
   };
 }
 
@@ -176,7 +186,8 @@ export async function runValidation(opts: {
     primaryCriterion: grader.primaryCriterion,
     aiLabelledCases,
     labelSource,
-    validation: labelSource === 'human' && primary?.report ? toGraderValidation(primary.report, opts.evidence ?? 'unpublished', opts.now) : null,
+    // No record for a class too rare to measure: a kappa on a handful of examples would read as evidence.
+    validation: labelSource === 'human' && primary?.report && primary.reliable ? toGraderValidation(primary.report, opts.evidence ?? 'unpublished', opts.now, 'human') : null,
   };
 }
 

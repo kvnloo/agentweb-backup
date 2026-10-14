@@ -19,9 +19,13 @@ describe('eval registry', () => {
     expect(mayGate('no-such-grader')).toBe(false);
   });
 
-  it('qualifies a validation only with kappa, n and an http(s) evidence link together', () => {
-    const ok = { kappa: MIN_KAPPA, n: MIN_VALIDATION_N, date: '2026-09-25', evidence: 'https://linear.app/emmabyaw/issue/ENG-2136' };
+  it('qualifies a validation only with kappa, n, an http(s) evidence link and HUMAN labels together', () => {
+    const ok = { kappa: MIN_KAPPA, n: MIN_VALIDATION_N, date: '2026-09-25', evidence: 'https://linear.app/emmabyaw/issue/ENG-2136', labelSource: 'human' as const };
     expect(isQualifyingValidation(ok)).toBe(true);
+    // AI-written or mixed labels, or a record that does not say who labelled, can never qualify a grader (ENG-2135).
+    expect(isQualifyingValidation({ ...ok, labelSource: 'ai' })).toBe(false);
+    expect(isQualifyingValidation({ ...ok, labelSource: 'mixed' })).toBe(false);
+    expect(isQualifyingValidation({ ...ok, labelSource: undefined })).toBe(false);
     expect(isQualifyingValidation({ ...ok, kappa: MIN_KAPPA - 0.01 })).toBe(false);
     expect(isQualifyingValidation({ ...ok, n: MIN_VALIDATION_N - 1 })).toBe(false);
     expect(isQualifyingValidation({ ...ok, evidence: 'see slack' })).toBe(false);
