@@ -5,9 +5,16 @@ so a plan could not use e.g. a strong reasoning model for one step and a cheap o
 
 Principle (owner): every user and admin picks the model; the selected model is the only one ever used. No swaps.
 
-Now, with AW-Settings `work_plan_step_models_enabled` = exactly `true` (absent / any other value / cold-start read
-failure = off = old behaviour; 60s cache, last-known value on a failed refresh,
-`services/agentMode/workPlanStepModels.ts`, same pattern as `compare_save_alternatives`):
+Now, with AW-Settings `work_plan_step_models_enabled` = exactly `true` the feature is on (60s cache, last-known value on
+a failed refresh, `services/agentMode/workPlanStepModels.ts`, same pattern as `compare_save_alternatives`). The switch has
+THREE states, and they differ for writes and for stored models:
+- ON (`true`): new/changed step models are accepted and validated; stored models are honoured at launch and by the engine.
+- OFF (a row that is absent or any other value, i.e. a successful read): behaves exactly as before the feature. A submitted
+  `model` is ignored (with a `warnings` entry), stored models are carried over untouched by writes, not copied at launch
+  and ignored by the engine.
+- UNKNOWN (settings read failing with no last-known value, e.g. cold start): stored step models are still HONOURED
+  (launch validation + copy, engine, `save_work_plan`), because only a definite off may ignore a user's explicit choice;
+  writes treat it like off (submitted models ignored, stored ones carried over), and `GET /model-options` reports `false`.
 
 - Storage: an OPTIONAL `model?: string` (canonical registry id) on `WorkPlanStep`, an additive optional key INSIDE the
   existing JSON `steps` array of AW-WorkPlans. No migration, table, index or attribute. Absent = the plan `defaultModel`
@@ -56,6 +63,9 @@ failure = off = old behaviour; 60s cache, last-known value on a failed refresh,
   with the same content (identical twins cannot be told apart and match by number).
 - An interactive-share viewer's pick may run for the turn on a model-less step but never rewrites the owner's stored
   step model or the engine marker; on a retired step model the viewer gets the pause and the owner resumes.
+- `workPlan.pickedModel` records a model the user explicitly picked during the plan (a model-less step running on it, or a
+  retired step adopting it); the end-of-plan restore never replaces it. Submit-for-review and approve revalidate the
+  stored step models as a NON-admin launcher (422 + `stepCount`, state unchanged), like the admin scope-widening check.
 - Known consequences: a stale picker echo (a `/generate` carrying a model different from the stamp, without a PATCH) is
   indistinguishable from a pick (relies on the portal syncing the picker to the stamp); a plan with later steps pending
   but no marker (hand-edited / legacy only; the engine never creates it) has no baseline; in the unique-title carry
