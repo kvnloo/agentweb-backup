@@ -669,11 +669,13 @@ const SIDE_EFFECTING_PREFIXES = [
 export const EXTERNAL_SEND_TOOLS = new Set([
   'send_email',
   'linkedin_outreach',
+  'manage_crm_sequence', // ENG-964: activation starts drip email to real leads
 ]);
 
 export const EXTERNAL_PUBLISH_TOOLS = new Set([
   'publish_blog_article',
   'publish_landing_page_changes',
+  'enable_session_tracking', // ENG-2327: commits to a customer's live repo
 ]);
 
 const SESSION_STATE_TOOLS = new Set([
@@ -743,6 +745,8 @@ const DEFAULT_ARG_ALIASES: Record<string, string[]> = {
   page_id: ['pageId', 'landing_page_id', 'landingPageId'],
   task_description: ['instructions', 'instruction', 'prompt', 'task', 'description'],
   operations_json: ['replacement_json', 'operations', 'replacements', 'replacement_instructions'],
+  // playwright_browser_evaluate requires `function`; models send `expression`/`script` (ENG-2473).
+  function: ['expression', 'script', 'js', 'code'],
 };
 
 export function evaluateAgentToolPolicy(input: AgentToolPolicyInput): AgentToolPolicyDecision {
@@ -981,6 +985,12 @@ export function validateAndRepairToolArgs(
   // scalar type so the call succeeds instead of bouncing back to the model.
   for (const [name, propSchema] of Object.entries(properties)) {
     if (repairedArgs[name] === undefined || repairedArgs[name] === null) continue;
+    const idString = coerceIdIntegerToString(name, repairedArgs[name], propSchema);
+    if (idString.changed) {
+      repairedArgs[name] = idString.value;
+      repairs.push(`${name}:scalar_coerce`);
+      continue;
+    }
     const coerced = coerceScalarForSchema(repairedArgs[name], propSchema);
     if (coerced.changed) {
       repairedArgs[name] = coerced.value;
@@ -1414,6 +1424,27 @@ function validateJsonSchemaType(name: string, value: unknown, schema: any): Agen
     path: `$.${name}`,
     message: `Argument "${name}" has the wrong type. Expected ${expectedTypes.join(' or ')}.`,
   };
+}
+
+/**
+ * Lossless integer -> string repair for identifier fields (ENG-2472). Models emit
+ * IDs as bare integers (live repro: call_hubspot_api `list_id: 17`) where the
+ * schema declares `string`, and then retry the same shape until the run is
+ * classified degraded. Deliberately narrow so a genuinely wrong primitive still
+ * surfaces as type_mismatch: only id-named fields (`id`, `*_id`, `*Id`), only
+ * safe integers, only when `string` is the sole accepted type, and — because
+ * enum is not validated downstream — only when any declared enum contains the
+ * coerced value.
+ */
+function coerceIdIntegerToString(name: string, value: unknown, schema: any): { changed: boolean; value: unknown } {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) return { changed: false, value };
+  if (!/(^id$|_id$|[a-z]Id$)/.test(name)) return { changed: false, value };
+  const expected = schema?.type;
+  const expectedTypes = Array.isArray(expected) ? expected : [expected];
+  if (expectedTypes.length !== 1 || expectedTypes[0] !== 'string') return { changed: false, value };
+  const coerced = String(value);
+  if (Array.isArray(schema?.enum) && !schema.enum.includes(coerced)) return { changed: false, value };
+  return { changed: true, value: coerced };
 }
 
 /**

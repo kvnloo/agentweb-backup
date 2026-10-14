@@ -18,6 +18,8 @@ import {
   activeSessionGenerations,
   autoContinuationSessions,
   preemptAutoContinuationAndWait,
+  sessionGenerationOwners,
+  releaseSessionGeneration,
 } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
@@ -101,10 +103,13 @@ jest.mock('../utils/agentModeAlerts', () => ({
 }));
 
 jest.mock('../utils/agentModeErrors', () => ({
+  // Spread the real module so new exports (e.g. isProviderUnavailableError) never leave the controller error handler calling undefined.
+  ...jest.requireActual('../utils/agentModeErrors'),
   isContextLimitError: jest.fn().mockReturnValue(false),
   isSessionLimitError: jest.fn().mockReturnValue(false),
   isTransientLLMError: jest.fn().mockReturnValue(false),
   isWorkerShutdownError: jest.fn().mockReturnValue(false),
+  isProviderNoEndpointsError: jest.fn().mockReturnValue(false),
 }));
 
 const mockIoEmit = jest.fn();
@@ -196,6 +201,7 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
     jest.clearAllMocks();
     activeSessionGenerations.clear();
     autoContinuationSessions.clear();
+    sessionGenerationOwners.clear();
     delete process.env.AGENT_RUN_STORE;
     mockSendOncallAlert.mockResolvedValue(undefined);
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession as any);
@@ -353,6 +359,41 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
     expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
 
     consoleErrorSpy.mockRestore();
+  });
+
+  it('ENG-110: a REAL continuation holds the lock without a cap slot yet is listed by /generating for its owner only, then released with no owner leak', async () => {
+    const seen: any = {};
+    const listFor = async (userId: string) => {
+      const r = makeRes();
+      await agentModeController.getGeneratingSessions({ user: { userId } } as any, r);
+      return (r.json as jest.Mock).mock.calls[0][0].sessionIds;
+    };
+    mockWorkerService.runInWorker
+      .mockResolvedValueOnce(
+        workerResponse('paused', [imageToolCall(1), imageToolCall(2), imageToolCall(3), deferredToolCall()]),
+      )
+      .mockImplementationOnce(async () => {
+        seen.continuation = autoContinuationSessions.has(mockSessionId);
+        seen.owner = sessionGenerationOwners.get(mockSessionId);
+        seen.ownerList = await listFor(mockUserId);
+        seen.otherList = await listFor('someone-else');
+        const gr = makeRes();
+        await agentModeController.getSession({ params: { sessionId: mockSessionId }, user: { userId: mockUserId } } as any, gr);
+        seen.isGenerating = (gr.json as jest.Mock).mock.calls[0]?.[0]?.isGenerating;
+        return workerResponse('All 4 creatives are ready.', [imageToolCall(4)]);
+      });
+
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    await flush();
+
+    expect(seen.continuation).toBe(true);
+    expect(seen.owner).toBe(mockUserId);
+    expect(seen.ownerList).toEqual([mockSessionId]);
+    expect(seen.otherList).toEqual([]);
+    expect(seen.isGenerating).toBe(true);
+    expect(sessionGenerationOwners.size).toBe(0);
+    expect(activeSessionGenerations.size).toBe(0);
+    expect(await listFor(mockUserId)).toEqual([]);
   });
 
   it('releases the lock and does not recurse when a continuation call rejects outright', async () => {
@@ -856,6 +897,32 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
       expect(preempted).toBe(false);
       expect(mockRequestCancel).not.toHaveBeenCalled();
       expect(mockWorkerService.cancelSession).not.toHaveBeenCalled();
+    });
+
+    it('ENG-110: the preempting request\'s re-claim records its owner (polling loop path)', async () => {
+      activeSessionGenerations.add(mockSessionId);
+      autoContinuationSessions.add(mockSessionId);
+      const p = preemptAutoContinuationAndWait(mockSessionId, 'owner-1');
+      setTimeout(() => activeSessionGenerations.delete(mockSessionId), 10);
+      expect(await p).toBe(true);
+      expect(sessionGenerationOwners.get(mockSessionId)).toBe('owner-1');
+      releaseSessionGeneration(mockSessionId);
+      expect(sessionGenerationOwners.size).toBe(0);
+    });
+
+    it('ENG-110: the preempting request\'s FINAL re-claim (after the window) records its owner', async () => {
+      autoContinuationSessions.add(mockSessionId); // continuation flagged, lock already free
+      const realNow = Date.now();
+      const nowSpy = jest.spyOn(Date, 'now')
+        .mockReturnValueOnce(realNow) // deadline computation
+        .mockReturnValue(realNow + 10 * 60 * 1000); // window already over: loop skipped
+      try {
+        expect(await preemptAutoContinuationAndWait(mockSessionId, 'owner-2')).toBe(true);
+      } finally {
+        nowSpy.mockRestore();
+      }
+      expect(sessionGenerationOwners.get(mockSessionId)).toBe('owner-2');
+      releaseSessionGeneration(mockSessionId);
     });
 
     it('cancels the auto-continuation and re-claims the lock once it releases within the window', async () => {

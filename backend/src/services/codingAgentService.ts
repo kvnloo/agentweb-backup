@@ -15,6 +15,12 @@ import { mcpFetch } from '../mcp/server/httpClient';
 import { agentModeService } from './agentModeService';
 import { getGitHubOrgToken, getSecret } from '../utils/secretsManager';
 import { recordUsage, computeCostMicroUsd } from './usageRecorderService';
+import { currentRunFunding, type RunFunding } from './funding/runFunding';
+import { resolveCallFunding } from './funding/callFunding';
+import { recordLlmUsage, customerUpstreamCost } from './funding/recordLlmUsage';
+import { getCustomerRouteProvisioner } from './funding/transport/customerRouteProvisioner';
+import { CustomerRouteError, pinToCustomerProvider } from './funding/transport/apiKeyTransport';
+import { LLM_MODEL_REGISTRY, LEGACY_MODEL_ALIASES } from './agentMode/llmModelRegistry';
 import { getModelPrice, MODEL_PRICING } from '../utils/llmPricing';
 import { normalizeAnthropicCacheCreation } from '../utils/llmClients';
 import { resolveOpenRouterUpstreamModelId } from '../utils/openRouterGatewayContract';
@@ -1655,6 +1661,99 @@ function containsImageInput(value: unknown): boolean {
   return containsImageInput(block.content);
 }
 
+/**
+ * ENG-2108: one coding-agent turn, funded by the customer's own key when they have a
+ * usable one for this model's lab (dark until a provisioner is registered). Resolved per
+ * turn, so a revoked key stops the very next turn. `undefined` = AgentWeb-funded.
+ */
+async function resolveTurnFunding(context: CodingAgentContext, model: string): Promise<RunFunding | undefined> {
+  const modelId = LEGACY_MODEL_ALIASES[model] ?? model;
+  const funding = await resolveCallFunding(currentRunFunding(), {
+    userId: context.userId,
+    modelLab: (LLM_MODEL_REGISTRY as Record<string, { provider?: string }>)[modelId]?.provider,
+    customerRoutable: true,
+    canCallAnthropicDirect: true,
+  });
+  if (!funding || funding.route === 'agentweb') return undefined;
+  // A subscription route is served by its own runner, never by this loop; sending it out
+  // on AgentWeb's key would bill AgentWeb for a customer-funded run.
+  if (funding.route !== 'api_key') throw new CustomerRouteError('unsupported_route');
+  return funding;
+}
+
+/**
+ * The native Anthropic model id for a registry id, derived from its OpenRouter slug
+ * (`anthropic/claude-sonnet-4.6` -> `claude-sonnet-4-6`). UNVERIFIED against live
+ * Anthropic: confirm with a real customer key before enabling a route. `undefined` when
+ * the model is not an Anthropic one, in which case only the OpenRouter leg is possible.
+ */
+export function toNativeAnthropicModel(model: string): string | undefined {
+  const slug = resolveOpenRouterUpstreamModelId(model);
+  if (!slug.startsWith('anthropic/')) return undefined;
+  return slug.slice('anthropic/'.length).replace(/\./g, '-');
+}
+
+/** Failures worth retrying on the OpenRouter leg: the provider was unreachable or overloaded. A bad or exhausted key would fail the same way there, so those surface as they are. */
+function isProviderOutage(error: unknown): boolean {
+  const status = (error as { status?: number })?.status;
+  if (typeof status === 'number') return status >= 500 || status === 529;
+  // The SDK's connection and timeout errors carry no status and no code of their own; the
+  // network error code, when there is one, sits on `.cause`.
+  const ConnectionError = (Anthropic as unknown as { APIConnectionError?: new (...a: any[]) => Error }).APIConnectionError;
+  if (typeof ConnectionError === 'function' && error instanceof ConnectionError) return true;
+  const code = String((error as { cause?: { code?: string } })?.cause?.code ?? (error as { code?: string })?.code ?? '');
+  return /^(ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED)$/.test(code);
+}
+
+/**
+ * One coding-agent turn paid for with the customer's own key. Anthropic keys are called
+ * directly first (the Messages format this agent already speaks), and only an outage
+ * moves the turn to OpenRouter, still on the customer's key (BYOK). Never the platform
+ * client, never AgentWeb's managed fallback models, and never AgentWeb's key: a failure
+ * that cannot be served on the customer's key is thrown.
+ */
+async function callCustomerKey(
+  funding: RunFunding,
+  userId: string,
+  params: Anthropic.MessageCreateParamsNonStreaming,
+  sessionId: string,
+): Promise<Anthropic.Message> {
+  let directError: unknown;
+  const nativeModel = funding.provider === 'anthropic' ? toNativeAnthropicModel(params.model) : undefined;
+  if (nativeModel && funding.connectionId) {
+    // Read fresh on every turn, so a revoke stops the next one. Outside the outage
+    // handling below on purpose: a revoked, disabled or unreadable key is the customer's
+    // problem and must fail the turn, not be retried somewhere else. The key lives only
+    // in this client; it is never logged, cached or put in an error.
+    const { getLlmConnectionService } = require('./funding/llmConnectionService') as typeof import('./funding/llmConnectionService');
+    const { apiKey } = await getLlmConnectionService().getKeyMaterial(funding.connectionId, userId);
+    try {
+      // An explicit host and no auth token: the SDK would otherwise pick up
+      // ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN from the environment and could send the
+      // customer's key to another host.
+      const direct = new Anthropic({ apiKey, baseURL: 'https://api.anthropic.com', authToken: null, maxRetries: 1, timeout: 5 * 60 * 1000 });
+      return await direct.messages.create({ ...params, model: nativeModel });
+    } catch (error) {
+      if (!isProviderOutage(error)) throw error;
+      directError = error;
+    }
+  }
+
+  const provisioner = getCustomerRouteProvisioner();
+  if (!provisioner?.messagesClientFor) {
+    // Nothing else can serve this turn on the customer's key.
+    if (directError) throw directError;
+    throw new CustomerRouteError('not_provisioned');
+  }
+  const customerClient = await provisioner.messagesClientFor(funding);
+  return customerClient.messages.create({
+    ...params,
+    model: resolveOpenRouterUpstreamModelId(params.model),
+    provider: pinToCustomerProvider({ require_parameters: true }, funding),
+    ...(sessionId.length <= 256 ? { session_id: sessionId } : {}),
+  });
+}
+
 async function callOpenRouter(
   client: AnthropicLikeClient,
   params: Anthropic.MessageCreateParamsNonStreaming,
@@ -1880,13 +1979,17 @@ async function runCodingAgentInternal(
 
       // Preserve the native Anthropic message/tool loop while OpenRouter owns
       // upstream provider selection, fallback, throttling, and overflow handling.
-      const response = await callOpenRouter(client, {
+      const turnFunding = await resolveTurnFunding(context, model);
+      const turnParams = {
         model,
         max_tokens: 16384,
         system: systemPrompt,
         tools,
         messages,
-      }, context.sessionId);
+      };
+      const response = turnFunding
+        ? await callCustomerKey(turnFunding, context.userId, turnParams, context.sessionId)
+        : await callOpenRouter(client, turnParams, context.sessionId);
       throwIfAborted(context.abortSignal);
 
       // Report this turn's token usage if a consumer is listening (eval harness).
@@ -1894,11 +1997,38 @@ async function runCodingAgentInternal(
         context.onUsage(response.usage as any);
       }
 
+      // A customer-funded turn goes to the attempt journal only. It is NOT added to
+      // `usageAcc` (the callers charge that total to the per-user cap) and does not touch
+      // the usage rails, so the customer is never billed twice for their own key.
+      if (turnFunding) {
+        try {
+          const u: any = response.usage;
+          if (u) {
+            recordLlmUsage(turnFunding, {
+              userId: context.userId,
+              sessionId: context.sessionId,
+              // The registry id, which the price book knows; a natively served response names its model differently.
+              model,
+              provider: turnFunding.provider || 'openrouter',
+              feature: 'coding_agent',
+              inputTokens: u.input_tokens || 0,
+              outputTokens: u.output_tokens || 0,
+              cacheReadTokens: u.cache_read_input_tokens || 0,
+              cacheWriteTokens: u.cache_creation_input_tokens || 0,
+              cacheWriteByTtl: normalizeAnthropicCacheCreation(u.cache_creation),
+              ...customerUpstreamCost({ is_byok: (response as any).openrouter_metadata?.is_byok === true, cost_details: u.cost_details }),
+            }, 'codingAgent');
+          }
+        } catch {
+          // Metering must never break the coding loop.
+        }
+      }
+
       // Shadow-meter every turn's spend. The coding loop can run many high-cost
       // coding-agent iterations, so leaving it unmetered was the biggest hole in
       // per-user cost data. Fire-and-forget + fail-open: never blocks/slows the run.
       try {
-        const u: any = response.usage;
+        const u: any = turnFunding ? undefined : response.usage;
         if (u) {
           const inputTokens = u.input_tokens || 0;
           const outputTokens = u.output_tokens || 0;

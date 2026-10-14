@@ -25,6 +25,8 @@ import { CONTACT_EVENTS_TABLE, CONTACT_EVENTS_SOURCE_RECORD_INDEX } from './cont
 import { LLM_CHARGE_EVENTS_TABLE, LLM_CHARGE_EVENTS_OCCURRED_AT_INDEX } from './llmChargeAuditDb';
 import { SPEND_EVENTS_TABLE, SPEND_EVENTS_OCCURRED_AT_INDEX } from './spendEventDb';
 import { SPEND_PROJECTION_TABLE } from './spendProjectionDb';
+import { LLM_CONNECTIONS_TABLE_SPEC } from './funding/llmConnectionDb';
+import { ATTEMPT_USAGE_TABLE_SPEC, ATTEMPT_USAGE_TABLE, ATTEMPT_USAGE_TTL_ATTRIBUTE } from './funding/dynamoAttemptUsageJournal';
 
 export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
   {
@@ -99,6 +101,12 @@ export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
     BillingMode: 'PAY_PER_REQUEST',
     DeletionProtectionEnabled: true,
   },
+  // ENG-2105 -- customer LLM provider keys (KMS envelope-encrypted). Ensured at
+  // boot like the tables above, because create-tables.ts is not run on deploy.
+  LLM_CONNECTIONS_TABLE_SPEC,
+  // ENG-2106 -- customer-funded usage journal (append-only, no secrets, 400-day TTL,
+  // point-in-time recovery on). TTL and recovery are applied by reconcileTableSettings.
+  ATTEMPT_USAGE_TABLE_SPEC,
   {
     TableName: LOOP_EVENTS_TABLE,
     AttributeDefinitions: [
@@ -174,12 +182,28 @@ export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
 ];
 
 /**
+ * Settings CreateTable cannot apply. DynamoDB TTL and point-in-time recovery are
+ * separate calls, and nothing else in this codebase has ever made them at runtime (TTL
+ * on the other boot-created tables was enabled by hand), so whether the backend's role
+ * may is unverified. Each is attempted at boot, non-fatally and loudly, and has to be
+ * checked after a deploy; see finding-boot-created-tables-need-manual-ttl.
+ */
+export const CRITICAL_TABLE_SETTINGS: Record<string, { ttlAttribute?: string; pointInTimeRecovery?: boolean }> = {
+  [ATTEMPT_USAGE_TABLE]: { ttlAttribute: ATTEMPT_USAGE_TTL_ATTRIBUTE, pointInTimeRecovery: true },
+};
+
+const ACTIVE_POLL_MS = 3_000;
+const ACTIVE_POLL_ATTEMPTS = 20;
+
+/**
  * Ensure the critical telemetry tables exist. Idempotent and non-fatal —
  * intended to be called once (fire-and-forget) at server startup.
  */
 export async function ensureCriticalTables(
   dynamo: AWS.DynamoDB = new AWS.DynamoDB({ region: process.env.AWS_REGION || 'us-west-2' }),
+  opts: { sleep?: (ms: number) => Promise<void> } = {},
 ): Promise<void> {
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   for (const spec of CRITICAL_TABLE_SPECS) {
     try {
       await dynamo.createTable(spec).promise();
@@ -201,6 +225,87 @@ export async function ensureCriticalTables(
         err?.message || err,
       );
     }
+  }
+
+  // After every table exists: the settings CreateTable cannot apply. A table just
+  // created is still CREATING, so each is waited on until ACTIVE (bounded), and each
+  // setting is checked first so a restart that finds it already on writes nothing.
+  for (const [tableName, settings] of Object.entries(CRITICAL_TABLE_SETTINGS)) {
+    await reconcileTableSettings(dynamo, tableName, settings, sleep);
+  }
+}
+
+async function reconcileTableSettings(
+  dynamo: AWS.DynamoDB,
+  tableName: string,
+  settings: { ttlAttribute?: string; pointInTimeRecovery?: boolean },
+  sleep: (ms: number) => Promise<void>,
+): Promise<void> {
+  try {
+    let active = false;
+    for (let i = 0; i < ACTIVE_POLL_ATTEMPTS && !active; i++) {
+      const described = await dynamo.describeTable({ TableName: tableName }).promise();
+      active = described.Table?.TableStatus === 'ACTIVE';
+      if (!active) await sleep(ACTIVE_POLL_MS);
+    }
+    if (!active) {
+      console.error(`[ensureCriticalTables] ${tableName} was not ACTIVE in time; TTL and recovery settings will be retried at the next boot`);
+      return;
+    }
+  } catch (err: any) {
+    console.error(`[ensureCriticalTables] could NOT check ${tableName} before applying its settings:`, err?.message || err);
+    return;
+  }
+  if (settings.ttlAttribute) await ensureTimeToLive(dynamo, tableName, settings.ttlAttribute);
+  if (settings.pointInTimeRecovery) await ensurePointInTimeRecovery(dynamo, tableName, sleep);
+}
+
+/** Describe-first and fail-safe, like ensureDeletionProtection. A table with a `ttl` attribute but TTL off never expires. */
+async function ensureTimeToLive(dynamo: AWS.DynamoDB, tableName: string, attribute: string): Promise<void> {
+  try {
+    const described = await dynamo.describeTimeToLive({ TableName: tableName }).promise();
+    const status = described.TimeToLiveDescription?.TimeToLiveStatus;
+    if ((status === 'ENABLED' || status === 'ENABLING') && described.TimeToLiveDescription?.AttributeName === attribute) return;
+    await dynamo
+      .updateTimeToLive({ TableName: tableName, TimeToLiveSpecification: { Enabled: true, AttributeName: attribute } })
+      .promise();
+    console.log(`[ensureCriticalTables] enabled TTL on ${tableName} (attribute: ${attribute})`);
+  } catch (err: any) {
+    console.error(
+      `[ensureCriticalTables] could NOT enable TTL on ${tableName} (needs dynamodb:DescribeTimeToLive and dynamodb:UpdateTimeToLive). Rows will not expire until someone runs: ` +
+        `aws dynamodb update-time-to-live --table-name ${tableName} --time-to-live-specification "Enabled=true,AttributeName=${attribute}"`,
+      err?.message || err,
+    );
+  }
+}
+
+async function ensurePointInTimeRecovery(dynamo: AWS.DynamoDB, tableName: string, sleep: (ms: number) => Promise<void>): Promise<void> {
+  try {
+    // Right after a table turns ACTIVE, DynamoDB can briefly answer that continuous
+    // backups are not available yet; that is transient, so wait it out a little.
+    let described = await dynamo.describeContinuousBackups({ TableName: tableName }).promise().catch(async (err: any) => {
+      if (err?.code !== 'ContinuousBackupsUnavailableException') throw err;
+      for (let i = 0; i < 5; i++) {
+        await sleep(ACTIVE_POLL_MS);
+        try {
+          return await dynamo.describeContinuousBackups({ TableName: tableName }).promise();
+        } catch (again: any) {
+          if (again?.code !== 'ContinuousBackupsUnavailableException') throw again;
+        }
+      }
+      throw err;
+    });
+    if (described.ContinuousBackupsDescription?.PointInTimeRecoveryDescription?.PointInTimeRecoveryStatus === 'ENABLED') return;
+    await dynamo
+      .updateContinuousBackups({ TableName: tableName, PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true } })
+      .promise();
+    console.log(`[ensureCriticalTables] enabled point-in-time recovery on ${tableName}`);
+  } catch (err: any) {
+    console.error(
+      `[ensureCriticalTables] could NOT enable point-in-time recovery on ${tableName} (needs dynamodb:DescribeContinuousBackups and dynamodb:UpdateContinuousBackups). Run: ` +
+        `aws dynamodb update-continuous-backups --table-name ${tableName} --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true`,
+      err?.message || err,
+    );
   }
 }
 

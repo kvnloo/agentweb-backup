@@ -26,13 +26,33 @@ describe('parseIngestBody: rejection', () => {
     ['unknown event', base({ event: 'purchase' }), 'invalid_event'],
     ['event wrong type', base({ event: ['lp_view'] }), 'invalid_event'],
     ['bad sessionId', base({ sessionId: 'short' }), 'invalid_session'],
-    ['sessionStartMs too old', base({ sessionStartMs: NOW - 49 * 3600_000 }), 'invalid_session'],
-    ['sessionStartMs in the future', base({ sessionStartMs: NOW + 10 * 60_000 }), 'invalid_session'],
+    ['sessionStartMs missing', base({ sessionStartMs: undefined }), 'invalid_session'],
+    ['sessionStartMs fractional', base({ sessionStartMs: NOW - 5000.5 }), 'invalid_session'],
+    ['sessionStartMs Infinity-sized', base({ sessionStartMs: 1e300 }), 'invalid_session'],
     ['sessionStartMs not a number', base({ sessionStartMs: 'soon' }), 'invalid_session'],
     ['custom without name', base({ event: 'custom' }), 'invalid_name'],
     ['custom name not a slug', base({ event: 'custom', name: 'has space' }), 'invalid_name'],
     ['custom name too long', base({ event: 'custom', name: 'a'.repeat(33) }), 'invalid_name'],
   ])('%s -> %s', (_l, b, code) => expect(parse(b)).toMatchObject({ ok: false, code }));
+});
+
+describe('parseIngestBody: ENG-2324 device clock', () => {
+  it('a start outside the window is accepted with a substitute; an in-window one is untouched', () => {
+    const v = ok(base({ sessionStartMs: NOW - 5 * 24 * 3600_000 }));
+    expect(v.identity.sessionStartMs).toBeGreaterThan(NOW - 24 * 3600_000);
+    expect(v.identity.sessionStartMs).toBeLessThanOrEqual(NOW);
+    expect(ok(base()).identity).toEqual({ sessionId: 'abcd1234-ef56-7890', sessionStartMs: NOW - 5000 });
+  });
+
+  it('clientNowMs >5min ahead of the server makes even an in-window start substituted (and a missing / garbage one is ignored)', () => {
+    expect(ok(base({ clientNowMs: NOW + 10 * 60_000 })).identity.sessionStartMs).not.toBe(NOW - 5000);
+    expect(ok(base({ clientNowMs: String(NOW + 10 * 60_000) })).identity.sessionStartMs).not.toBe(NOW - 5000);
+    for (const v of [NOW, NOW + 60_000, 'x', {}, null, -5]) expect(ok(base({ clientNowMs: v })).identity.sessionStartMs).toBe(NOW - 5000);
+  });
+
+  it('clientNowMs is never stored on the row', () => {
+    expect(JSON.stringify(ok(base({ clientNowMs: NOW }))).includes('clientNowMs')).toBe(false);
+  });
 });
 
 describe('parseIngestBody: bounded fields', () => {
@@ -169,5 +189,20 @@ describe('buildSessionRow: the server owns classification', () => {
     expect(buildSessionRow(v, { userAgent: CHROME, nowIso: 'T' }).customFields.firstTouchChannel).toBe('TikTok');
     const legacy = ok(base({ firstTouchChannel: 'Facebook' }));
     expect(buildSessionRow(legacy, { userAgent: CHROME, nowIso: 'T' }).customFields.firstTouchChannel).toBe('Facebook');
+  });
+});
+
+describe('repairEscapedQuery (HTML-escaped share links)', () => {
+  const { repairEscapedQuery } = require('../trackingIngest');
+  it('recovers UTMs from a link whose & became amp;', () => {
+    const fixed = repairEscapedQuery('https://go.dramabreak.ai/x?utm_source=dramabreakamp;utm_medium=socialamp;utm_campaign=gbtm_launchamp;utm_content=sunny');
+    expect(Object.fromEntries(new URL(fixed).searchParams)).toEqual({ utm_source: 'dramabreak', utm_medium: 'social', utm_campaign: 'gbtm_launch', utm_content: 'sunny' });
+  });
+  it('recovers &amp; and keeps the hash', () => {
+    expect(repairEscapedQuery('https://a.b/x?utm_source=a&amp;utm_medium=b#h')).toBe('https://a.b/x?utm_source=a&utm_medium=b#h');
+  });
+  it('leaves clean links and values that only contain "amp" unchanged', () => {
+    expect(repairEscapedQuery('https://a.b/x?utm_source=ok&utm_medium=s')).toBe('https://a.b/x?utm_source=ok&utm_medium=s');
+    expect(repairEscapedQuery('https://a.b/x?utm_source=campamp;x')).toBe('https://a.b/x?utm_source=campamp;x');
   });
 });

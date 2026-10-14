@@ -1,6 +1,8 @@
+import { createHash } from 'node:crypto';
 import { resolveModelForUser } from './modelRoles';
 import { OUTCOME_JUDGE_SHADOW_FEATURE, assertOutcomeJudgeModelAllowed, DEFAULT_OUTCOME_JUDGE_MODEL, isInShadowSample } from './outcomeJudge';
 import { chatbotDb, ChatSession, ChatMessage } from "./chatbotService";
+import { summarizeAiStyleTells } from "./aiStyleGuard";
 import {
   appendConfirmedPublishNotice,
   ledgerFromSucceededFunctions,
@@ -31,6 +33,18 @@ const MAX_TOOL_CONTENT_FOR_SCORING = 500; // chars per tool result in scoring co
  * the judge can see that tools were actually invoked rather than treating the turn
  * as a silent/empty response.
  */
+/**
+ * Message content as plain text. `null`/`undefined` (a tool-calls-only turn persists with the
+ * field absent) is empty text, NOT a JSON value: `JSON.stringify(undefined ?? "")` is the
+ * two-character string `""`, which is truthy, so it would print a literal `""` into the judge's
+ * transcript and stop empty assistant turns being skipped.
+ */
+function textOf(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (content == null) return "";
+  return JSON.stringify(content);
+}
+
 function serializeMessagesForScoring(messages: ChatMessage[]): string {
   const lines: string[] = [];
 
@@ -38,7 +52,7 @@ function serializeMessagesForScoring(messages: ChatMessage[]): string {
     if (m.role === "system") continue;
 
     if (m.role === "user") {
-      const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      const text = textOf(m.content);
       lines.push(`user: ${text}`);
 
     } else if (m.role === "assistant") {
@@ -48,7 +62,7 @@ function serializeMessagesForScoring(messages: ChatMessage[]): string {
       // interactive run that crashed and the user retried in the same session), the
       // judge would otherwise read the note verbatim and score against it (ENG-479).
       if (isRunFailurePlaceholder(m)) continue;
-      const text = (typeof m.content === "string" ? m.content : JSON.stringify(m.content)).trim();
+      const text = textOf(m.content).trim();
       const toolCalls: Array<{ name: string; arguments?: any }> = (m as any).metadata?.toolCalls || [];
 
       if (text && toolCalls.length > 0) {
@@ -65,7 +79,7 @@ function serializeMessagesForScoring(messages: ChatMessage[]): string {
 
     } else if (m.role === "tool") {
       const name = (m as any).name || "tool";
-      const raw = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      const raw = textOf(m.content);
       const preview = raw.length > MAX_TOOL_CONTENT_FOR_SCORING
         ? raw.slice(0, MAX_TOOL_CONTENT_FOR_SCORING) + "…"
         : raw;
@@ -817,7 +831,7 @@ function normalizeUserTurn(text: string, stripSenderPrefix: boolean): string {
 export function isNoTaskSession(messages: ChatMessage[] = [], pageIdentifier?: string): boolean {
   const userTexts = (messages || [])
     .filter((m: any) => m.role === "user")
-    .map((m: any) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")));
+    .map((m: any) => textOf(m.content));
 
   if (userTexts.length === 0) return false;
 
@@ -892,7 +906,7 @@ function hasAssistantTurn(messages: ChatMessage[] = []): boolean {
     // NOT a genuine assistant turn, so a session that only carries it must still
     // classify as a failed run (and no note is ever double-added on a later pass).
     if (isRunFailurePlaceholder(m)) return false;
-    const text = (typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")).trim();
+    const text = textOf(m.content).trim();
     const toolCalls = m.metadata?.toolCalls;
     return text.length > 0 || (Array.isArray(toolCalls) && toolCalls.length > 0);
   });
@@ -1179,7 +1193,7 @@ function lastAssistantText(messages: ChatMessage[] = []): string {
   const nonSystem = (messages || []).filter((m: any) => m.role !== "system");
   const last: any = nonSystem[nonSystem.length - 1];
   if (!last || last.role !== "assistant" || isRunFailurePlaceholder(last)) return "";
-  return typeof last.content === "string" ? last.content : JSON.stringify(last.content ?? "");
+  return textOf(last.content);
 }
 
 export function isBlockedExternalSession(messages: ChatMessage[] = []): boolean {
@@ -1295,7 +1309,7 @@ function transcriptEndsMidToolLoop(messages: ChatMessage[]): boolean {
 
   // Pure tool-call assistant turn with no text → mid-loop
   if (last.role === "assistant") {
-    const text = (typeof last.content === "string" ? last.content : JSON.stringify(last.content ?? "")).trim();
+    const text = textOf(last.content).trim();
     const toolCalls = last.metadata?.toolCalls;
     if (!text && Array.isArray(toolCalls) && toolCalls.length > 0) return true;
   }
@@ -1548,19 +1562,37 @@ function finiteNumber(v: any): number | undefined {
  * `response_format: json_object` — leading text (e.g. "Here is my
  * evaluation:") or trailing text (e.g. "Hope that helps!") around the JSON
  * object makes a bare `JSON.parse(raw)` throw, and that throw was previously
- * swallowed silently by the judge-score route's `Promise.allSettled`. Always
- * slice from the first `{` to the last `}`, same as the "everything from the
- * first `{`" convention already used elsewhere in this codebase for
- * non-strict LLM output — this covers a bare JSON object (slicing is a
- * no-op), a leading preamble, trailing text, or both. Falls back to the
- * original `raw` when no `{` is present, so `JSON.parse` still throws with a
- * meaningful message.
+ * swallowed silently by the judge-score route's `Promise.allSettled`. Slice the
+ * first balanced `{...}` object — this covers a bare JSON object (slicing is a
+ * no-op), a leading preamble, trailing text, a trailing second object, or any
+ * mix. Falls back to the original `raw` when no `{` is present, so
+ * `JSON.parse` still throws with a meaningful message.
  */
 function extractJsonObject(raw: string): string {
   const start = raw.indexOf("{");
+  if (start === -1) return raw;
+  // ENG-2138: return the first balanced top-level object, so text (or a second object) after the
+  // JSON no longer ends up inside the slice. String-aware: braces inside string values don't
+  // count, and a backslash escapes the next character (so \" doesn't end a string).
+  let depth = 0;
+  let inString = false;
+  for (let i = start; i < raw.length; i++) {
+    const ch = raw[i];
+    if (inString) {
+      if (ch === "\\") i++;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') {
+      inString = true;
+    } else if (ch === "{") {
+      depth++;
+    } else if (ch === "}" && --depth === 0) {
+      return raw.slice(start, i + 1);
+    }
+  }
+  // Never balanced (truncated or malformed): keep the pre-ENG-2138 slice so the failure,
+  // and the control-character repair that follows, behave exactly as before.
   const end = raw.lastIndexOf("}");
-  if (start === -1 || end === -1 || end < start) return raw;
-  return raw.slice(start, end + 1);
+  return end < start ? raw : raw.slice(start, end + 1);
 }
 
 /**
@@ -1798,6 +1830,8 @@ async function resolveJudgeModel(judge: ScoringJudge, userId: string | undefined
   return judge.llmModel ? resolveScoringModel(judge.llmModel) : resolveModelForUser(userId, 'scoring_judge');
 }
 
+const roundToTenth = (n: number): number => Math.round(n * 10) / 10;
+
 export async function scoreSessionWithJudge(
   messages: ChatMessage[],
   currentMessageCount: number,
@@ -1813,6 +1847,18 @@ export async function scoreSessionWithJudge(
   // recentMessages, so the manifest's "anywhere in this session" claim is
   // actually true and applyFabricationGuard isn't fooled by an out-of-window
   // tool call.
+  // ENG-2429: eval-only telemetry for AI-tell phrasing in Emma's output.
+  // Logged, never persisted; never affects the score or throws.
+  try {
+    const styleTells = summarizeAiStyleTells(messages);
+    if (styleTells.total > 0) {
+      console.log(
+        JSON.stringify({ event: "ai_style_tells", sessionId: usageContext?.sessionId, ...styleTells })
+      );
+    }
+  } catch {
+    // telemetry must not break scoring
+  }
   const manifest = buildToolCallManifest(messages);
   const conversationText = header
     ? `${header}\n${manifest.text}\n\n${capped.text}`
@@ -1877,7 +1923,11 @@ export async function scoreSessionWithJudge(
       `Judge response missing or non-numeric "score" field (got ${JSON.stringify(parsed.score)})`
     );
   }
-  const score = Math.max(1, Math.min(5, Math.round(rawScore)));
+  // ENG-2138: a shadow judge keeps the reply's one-decimal score. The original ENG-1710 rubric B asks for a
+  // decimal and was measured on it; rounding discards that signal. A rubric that asks for whole numbers is
+  // unaffected, and customer-facing judges stay whole numbers.
+  const boundedScore = Math.max(1, Math.min(5, rawScore));
+  const score = judge.shadow ? roundToTenth(boundedScore) : Math.round(boundedScore);
   const reason = parsed.reason || "No reason provided";
   const fabricationGuarded = applyFabricationGuard(
     manifest.count,
@@ -2048,6 +2098,14 @@ export function judgeScoringPath(session: ChatSession): "in-flight" | "failed-ru
   return "judge";
 }
 
+/**
+ * ENG-2138: short stable digest of a judge's system prompt, stored on a shadow score so scores
+ * produced by different prompt revisions can be told apart after the prompt is swapped.
+ */
+export function judgePromptVersion(systemPrompt: string): string {
+  return createHash("sha256").update(systemPrompt).digest("hex").slice(0, 12);
+}
+
 export async function scoreSessionWithJudgeIfNeeded(
   session: ChatSession,
   judge: ScoringJudge,
@@ -2119,7 +2177,13 @@ export async function scoreSessionWithJudgeIfNeeded(
     evaluatedMessageIndex: result.evaluatedMessageIndex,
     judgeName: judge.name,
     ...(result.dimensions ? { dimensions: result.dimensions } : {}),
-    ...(judge.shadow ? { shadow: true, ...(result.model ? { model: result.model } : {}) } : {}),
+    ...(judge.shadow
+      ? {
+          shadow: true,
+          ...(result.model ? { model: result.model } : {}),
+          ...(judge.systemPrompt ? { promptVersion: judgePromptVersion(judge.systemPrompt) } : {}),
+        }
+      : {}),
   };
 
   await chatbotDb.updateSessionJudgeScore(session.sessionId, judge.id, judgeScore);

@@ -529,6 +529,50 @@ describe('apiTools', () => {
     });
   });
 
+  describe('enable_session_tracking (ENG-2327)', () => {
+    it('is registered, requires only page_id, and carries a description Emma can act on', () => {
+      expect(mcpToolRegistry.getToolNames()).toContain('enable_session_tracking');
+      const def = mcpToolRegistry.getToolDefinitions().find((d: any) => d.name === 'enable_session_tracking') as any;
+      expect(def).toBeDefined();
+      expect(def.inputSchema.required).toEqual(['page_id']);
+      expect(Object.keys(def.inputSchema.properties).sort()).toEqual(['html_path', 'page_id']);
+      expect(def.description).toMatch(/session tracking/i);
+      expect(def.description).toMatch(/safe to call again/i);
+      // The override that would double-count a bespoke tracker is deliberately NOT exposed to the model.
+      expect(JSON.stringify(def.inputSchema)).not.toMatch(/override/i);
+    });
+
+    it('POSTs to the session-tracking route and returns its JSON', async () => {
+      mockMcpFetch.mockResolvedValue({ success: true, listId: 'list_1', installed: true, alreadyInstalled: false });
+      await mcpToolRegistry.execute('enable_session_tracking', { page_id: 'page 1/../x' }, context);
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+        method: 'POST',
+        path: '/api/landing-pages/v0/generated/page%201%2F..%2Fx/session-tracking',
+        body: {},
+      }));
+    });
+
+    it('forwards html_path as htmlPath, and nothing else', async () => {
+      mockMcpFetch.mockResolvedValue({ success: true });
+      await mcpToolRegistry.execute('enable_session_tracking', { page_id: 'p1', html_path: 'public/offer.html', overrideExistingTracker: true }, context);
+      expect(mockMcpFetch.mock.calls[0][0].body).toEqual({ htmlPath: 'public/offer.html' });
+    });
+
+    it('stops BEFORE the route when publish consent was withdrawn mid-run (unattended schedule), like its sibling', async () => {
+      const assertPublishStillAuthorized = jest.fn(async () => ({ error: 'Publishing was withdrawn for this schedule' }));
+      // the handler itself (the registry attaches its own hook in front of it; see sessionTracking.consentGate.test.ts)
+      const res: any = await mcpToolRegistry.getTool('enable_session_tracking')!.execute({ page_id: 'p1' }, { ...context, assertPublishStillAuthorized });
+      expect(assertPublishStillAuthorized).toHaveBeenCalled();
+      expect(mockMcpFetch).not.toHaveBeenCalled();
+      expect(JSON.stringify(res)).toContain('withdrawn');
+    });
+
+    it('propagates a refusal from the route (e.g. the page already has a tracker)', async () => {
+      mockMcpFetch.mockRejectedValue(new Error('API error (409): This page already carries its own tracker'));
+      await expect(mcpToolRegistry.execute('enable_session_tracking', { page_id: 'p1' }, context)).rejects.toThrow('already carries its own tracker');
+    });
+  });
+
   describe('manage_gtm_items - add_phase', () => {
     it('should call POST /api/gtm-plan/:id/phases', async () => {
       mockMcpFetch.mockResolvedValue({ phaseId: 'phase-1' });
@@ -1412,6 +1456,52 @@ describe('apiTools', () => {
       expect(session.attributionBasis).toBe('partial-transcript');
     });
 
+    // ENG-972: the query filters on last activity, so a long-lived session
+    // enters the window carrying its lifetime cost. inWindowCost separates the
+    // spend from turns inside [start_time, end_time) from carried history.
+    it('should report in-window cost separately from lifetime totalCost', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-long-lived',
+          userId: 'user-13',
+          title: 'Long-lived deck',
+          createdAt: '2026-07-02T00:00:00Z',
+          updatedAt: '2026-08-08T01:00:00Z',
+          totalCost: 47.5,
+          messages: [
+            { role: 'user', content: 'start', timestamp: '2026-07-02T00:00:00Z' },
+            { role: 'assistant', content: 'old', timestamp: '2026-07-02T00:01:00Z', usage: { estimated_cost: 45.0 } },
+            { role: 'assistant', content: 'new', timestamp: '2026-08-08T00:30:00Z', usage: { estimated_cost: 2.25 } },
+            { role: 'assistant', content: 'edge', timestamp: '2026-08-09T00:00:00Z', usage: { estimated_cost: 0.25 } },
+          ],
+        }, {
+          sessionId: 'sess-no-timestamps',
+          userId: 'user-14',
+          title: 'No timestamps',
+          createdAt: '2026-08-08T00:00:00Z',
+          updatedAt: '2026-08-08T01:00:00Z',
+          totalCost: 1.0,
+          messages: [
+            { role: 'assistant', content: 'x', usage: { estimated_cost: 1.0 } },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-08-08T00:00:00Z',
+        end_time: '2026-08-09T00:00:00Z',
+      }, context);
+
+      const [longLived, untimed] = JSON.parse((result as any).content[0].text).sessions;
+
+      expect(longLived.totalCost).toBe(47.5);
+      // Only the 00:30 turn is inside the half-open window.
+      expect(longLived.inWindowCost).toBe(2.25);
+      // No turn carries a timestamp, so the in-window share is unknown, not zero.
+      expect(untimed.inWindowCost).toBeNull();
+    });
+
     // Greptile 4/5 follow-up: an unlabelled turn carrying no cost left
     // unattributedCost null, so a partial transcript still claimed 'transcript'.
     // Real shape — prod session 8fb98376 has 2 unlabelled turns and a ~$0 delta.
@@ -2005,5 +2095,29 @@ describe('ENG-1015 durable session polling', () => {
     await expect(mcpToolRegistry.execute('emma_get_session', { session_id: 's1', run_id: 'r1' }, context))
       .rejects.toThrow('Forbidden');
     expect(mockMcpFetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe('ENG-112: MCP never exposes the branch-family link', () => {
+  const link = { sessionId: 'a', rootSessionId: 'root-secret-id', messageIndex: 2, branchedAt: 'x' };
+  const context: any = { userId: 'user-123', agentUserId: 'user-123' };
+
+  it('emma_get_session strips session-level branchedFrom', async () => {
+    mockMcpFetch.mockResolvedValue({ sessionId: 's1', title: 'T', branchedFrom: link, pendingWorkPlanInput: null } as any);
+    const out = await mcpToolRegistry.execute('emma_get_session', { session_id: 's1' }, context);
+    const text = JSON.stringify(out);
+    expect(text).toContain('s1');
+    expect(text).not.toContain('branchedFrom');
+    expect(text).not.toContain('root-secret-id');
+  });
+
+  it('emma_list_sessions strips branchedFrom from every listed session', async () => {
+    mockMcpFetch.mockResolvedValue({ sessions: [{ sessionId: 's1', branchedFrom: link }, { sessionId: 's2' }], hasMore: false } as any);
+    const out = await mcpToolRegistry.execute('emma_list_sessions', {}, context);
+    const text = JSON.stringify(out);
+    expect(text).toContain('s2');
+    expect(text).not.toContain('branchedFrom');
+    expect(text).not.toContain('root-secret-id');
   });
 });

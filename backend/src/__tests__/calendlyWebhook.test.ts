@@ -635,7 +635,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
 
       expect(mockCreateLeadList).not.toHaveBeenCalled();
       expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
-      expect(mockCreateLead).toHaveBeenCalledWith('list-1', expect.objectContaining({ email: 'lead@example.com' }));
+      expect(mockCreateLead).toHaveBeenCalledWith('list-1', expect.objectContaining({ email: 'lead@example.com' }), 'booking');
     });
 
     it('falls back to resolveOrCreateBookingList when the explicitly configured list no longer exists (gap 2)', async () => {
@@ -659,7 +659,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
         USER_ID, 'calendly', mockAccount.account_id, { booking_lead_list_id: 'list-fresh' },
       );
-      expect(mockCreateLead).toHaveBeenCalledWith('list-fresh', expect.objectContaining({ email: 'lead@example.com' }));
+      expect(mockCreateLead).toHaveBeenCalledWith('list-fresh', expect.objectContaining({ email: 'lead@example.com' }), 'booking');
     });
 
     // Confirmed live: crmDb.createLead's list-metadata update has no attribute_exists
@@ -690,7 +690,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
         USER_ID, 'calendly', mockAccount.account_id, { booking_lead_list_id: 'list-fresh' },
       );
-      expect(mockCreateLead).toHaveBeenCalledWith('list-fresh', expect.objectContaining({ email: 'lead@example.com' }));
+      expect(mockCreateLead).toHaveBeenCalledWith('list-fresh', expect.objectContaining({ email: 'lead@example.com' }), 'booking');
     });
 
     it('falls back to resolveOrCreateBookingList and persists the result when no list is configured', async () => {
@@ -706,7 +706,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
         USER_ID, 'calendly', mockAccount.account_id, { booking_lead_list_id: 'list-auto-created' },
       );
-      expect(mockCreateLead).toHaveBeenCalledWith('list-auto-created', expect.objectContaining({ email: 'lead@example.com' }));
+      expect(mockCreateLead).toHaveBeenCalledWith('list-auto-created', expect.objectContaining({ email: 'lead@example.com' }), 'booking');
     });
 
     it('creates a new lead and auto-syncs as "created" when no existing lead matches the email', async () => {
@@ -800,6 +800,55 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
         expect.objectContaining({ leadId: 'lead-won-the-race' }),
         'hubspot',
         'updated',
+      );
+      expect(mockMarkJobFailed).not.toHaveBeenCalled();
+    });
+
+    // ENG-2322: this create does NOT skip createLead's email-index pre-check, so when the first
+    // getLeadByEmail missed (eventually-consistent GSI) the pre-check can find the row and throw a
+    // typed duplicate-email error — which has no `leadAlreadyExists` and used to fail the job.
+    it('adopts the lead named by a duplicate-email error: stamps THIS booking on it, never creates, never fails the job', async () => {
+      mockGetLeadByEmail.mockResolvedValue(null);
+      mockCreateLead.mockRejectedValueOnce(Object.assign(
+        new Error('Lead with email "lead@example.com" already exists in this list'),
+        { duplicateEmail: true, existingLead: { leadId: 'lead-other-id', email: 'lead@example.com', customFields: { foo: 'bar' } } },
+      ));
+      const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
+
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockCreateLead).toHaveBeenCalledTimes(1);
+      expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-other-id', {
+        customFields: { lastBookedAt: expect.any(String), lastBookingUri: body.payload.uri },
+      });
+      expect(mockAutoSyncLead).toHaveBeenCalledWith(
+        USER_ID, 'list-1', expect.objectContaining({ leadId: 'lead-other-id' }), 'hubspot', 'updated',
+      );
+      expect(mockMarkJobFailed).not.toHaveBeenCalled();
+    });
+
+    it('a duplicate-email error naming a lead that already recorded THIS booking is not re-stamped (idempotent redelivery)', async () => {
+      const body = makePayload({ email: 'lead@example.com' });
+      mockGetLeadByEmail.mockResolvedValue(null);
+      mockCreateLead.mockRejectedValueOnce(Object.assign(new Error('dup'), {
+        duplicateEmail: true,
+        existingLead: { leadId: 'lead-created-by-first-try', email: 'lead@example.com', customFields: { bookingUri: body.payload.uri } },
+      }));
+      const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
+
+      await postSigned(body);
+      await flushPromises();
+
+      expect(mockSetLeadFields).not.toHaveBeenCalledWith('list-1', 'lead-created-by-first-try', expect.objectContaining({
+        customFields: expect.anything(),
+      }));
+      expect(mockAutoSyncLead).toHaveBeenCalledWith(
+        USER_ID, 'list-1', expect.objectContaining({ leadId: 'lead-created-by-first-try' }), 'hubspot', 'created',
       );
       expect(mockMarkJobFailed).not.toHaveBeenCalled();
     });

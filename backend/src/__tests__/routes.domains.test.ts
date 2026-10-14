@@ -60,7 +60,23 @@ jest.mock("../services/customDomainService", () => ({
 const mockUpdateSubdomainMiddleware = jest.fn();
 jest.mock("../services/v0Service", () => ({
   updateSubdomainMiddleware: (...args: any[]) => mockUpdateSubdomainMiddleware(...args),
+  canUserEditLandingPage: (...args: any[]) => mockCanUserEditLandingPage(...args),
 }));
+
+const mockCanUserEditLandingPage = jest.fn();
+const mockGetUserById = jest.fn();
+const mockGetOrgMembers = jest.fn();
+jest.mock("../services/db", () => ({
+  userDb: { getUserById: (...args: any[]) => mockGetUserById(...args) },
+  orgDb: { getOrgMembers: (...args: any[]) => mockGetOrgMembers(...args) },
+}));
+
+/** Make the caller own a landing page on proj-1 for the next ownership query. */
+const ownProject = () =>
+  mockDynamoInstance.query.mockReturnValueOnce({
+    promise: () =>
+      Promise.resolve({ Items: [{ id: "page-own", userId: "test-user-123", vercelProjectId: "proj-1" }] }),
+  });
 
 // Mock auth middleware
 jest.mock("../middleware/auth", () => ({
@@ -82,6 +98,9 @@ app.use("/api/domains", domainRoutes);
 describe("Domain API Routes", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Drop queued once-values (e.g. an unconsumed ownProject()) so they can't leak across tests.
+    mockDynamoInstance.query.mockReset();
+    mockDynamoInstance.query.mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) });
   });
 
   describe("GET /api/domains", () => {
@@ -112,6 +131,7 @@ describe("Domain API Routes", () => {
   });
 
   describe("POST /api/domains/subdomain", () => {
+    beforeEach(() => ownProject());
     it("should add a subdomain", async () => {
       mockAddSubdomain.mockResolvedValueOnce({
         id: "dom-new",
@@ -207,6 +227,7 @@ describe("Domain API Routes", () => {
   });
 
   describe("POST /api/domains/custom", () => {
+    beforeEach(() => ownProject());
     it("should add a custom domain", async () => {
       mockAddCustomDomain.mockResolvedValueOnce({
         id: "dom-new",
@@ -234,6 +255,68 @@ describe("Domain API Routes", () => {
         .send({ vercelProjectId: "proj-1" });
 
       expect(res.status).toBe(400);
+    });
+  });
+
+  describe("ENG-2403: project ownership on domain-attach writes", () => {
+    const noPages = () =>
+      mockDynamoInstance.query.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+
+    it.each([
+      ["/api/domains/custom", { vercelProjectId: "prj_foreign", domain: "evil.example.com" }],
+      ["/api/domains/subdomain", { vercelProjectId: "prj_foreign", subdomain: "evil" }],
+    ])("%s returns 403 and never calls Vercel for a foreign project", async (path, body) => {
+      noPages();
+      mockGetUserById.mockResolvedValueOnce({ userId: "test-user-123" });
+      const res = await request(app).post(path).send(body);
+      expect(res.status).toBe(403);
+      expect(mockAddCustomDomain).not.toHaveBeenCalled();
+      expect(mockAddSubdomain).not.toHaveBeenCalled();
+    });
+
+    it("denies an org member who lacks edit rights on the owner's page", async () => {
+      mockDynamoInstance.query
+        .mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) })
+        .mockReturnValueOnce({
+          promise: () => Promise.resolve({ Items: [{ id: "p2", userId: "owner-2", vercelProjectId: "proj-2" }] }),
+        });
+      mockGetUserById.mockResolvedValueOnce({ userId: "test-user-123", orgId: "org-1" });
+      mockGetOrgMembers.mockResolvedValueOnce([{ userId: "test-user-123" }, { userId: "owner-2" }]);
+      mockCanUserEditLandingPage.mockResolvedValueOnce(false);
+      const res = await request(app)
+        .post("/api/domains/custom")
+        .send({ vercelProjectId: "proj-2", domain: "x.example.com" });
+      expect(res.status).toBe(403);
+      expect(mockAddCustomDomain).not.toHaveBeenCalled();
+    });
+
+    it("allows an org editor of the owner's page", async () => {
+      mockDynamoInstance.query
+        .mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) })
+        .mockReturnValueOnce({
+          promise: () => Promise.resolve({ Items: [{ id: "p2", userId: "owner-2", vercelProjectId: "proj-2" }] }),
+        });
+      mockGetUserById.mockResolvedValueOnce({ userId: "test-user-123", orgId: "org-1" });
+      mockGetOrgMembers.mockResolvedValueOnce([{ userId: "owner-2" }]);
+      mockCanUserEditLandingPage.mockResolvedValueOnce(true);
+      mockAddCustomDomain.mockResolvedValueOnce({ id: "d", domain: "x.example.com" });
+      const res = await request(app)
+        .post("/api/domains/custom")
+        .send({ vercelProjectId: "proj-2", domain: "x.example.com" });
+      expect(res.status).toBe(201);
+      expect(mockCanUserEditLandingPage).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: "owner-2" }),
+        "test-user-123",
+      );
+    });
+
+    it("fails closed when the ownership lookup throws", async () => {
+      mockDynamoInstance.query.mockReturnValueOnce({ promise: () => Promise.reject(new Error("ddb down")) });
+      const res = await request(app)
+        .post("/api/domains/subdomain")
+        .send({ vercelProjectId: "proj-1", subdomain: "x" });
+      expect(res.status).toBe(403);
+      expect(mockAddSubdomain).not.toHaveBeenCalled();
     });
   });
 
@@ -429,6 +512,52 @@ describe("Domain API Routes", () => {
           }),
       });
       mockDynamoInstance.update.mockReturnValue({ promise: () => Promise.resolve() });
+      mockListDomains.mockResolvedValue([
+        { id: "dom-own", userId: "test-user-123", domain: "mysite.com", type: "custom", status: "active", vercelProjectId: "proj-1" },
+      ]);
+    });
+
+    afterEach(() => {
+      mockListDomains.mockReset();
+    });
+
+    describe("ENG-2412: authorize before any Vercel side effect", () => {
+      it("foreign landingPageId -> 404 and no Vercel call", async () => {
+        mockDynamoInstance.get.mockReturnValueOnce({
+          promise: () =>
+            Promise.resolve({ Item: { id: "lp-1", userId: "someone-else", vercelProjectId: "proj-1" } }),
+        });
+        const res = await request(app).post("/api/domains/page-subdomain").send(VALID_BODY);
+        expect(res.status).toBe(404);
+        expect(mockSetPageSubdomain).not.toHaveBeenCalled();
+        expect(mockUpdateSubdomainMiddleware).not.toHaveBeenCalled();
+      });
+
+      it("mismatched vercelProjectId -> 403 and no Vercel call", async () => {
+        const res = await request(app)
+          .post("/api/domains/page-subdomain")
+          .send({ ...VALID_BODY, vercelProjectId: "victim-proj" });
+        expect(res.status).toBe(403);
+        expect(mockSetPageSubdomain).not.toHaveBeenCalled();
+        expect(mockDynamoInstance.update).not.toHaveBeenCalled();
+      });
+
+      it("unowned mainDomain -> 403 and no Vercel call", async () => {
+        const res = await request(app)
+          .post("/api/domains/page-subdomain")
+          .send({ ...VALID_BODY, mainDomain: "victim.com" });
+        expect(res.status).toBe(403);
+        expect(mockListDomains).toHaveBeenCalledWith("test-user-123", "proj-1");
+        expect(mockSetPageSubdomain).not.toHaveBeenCalled();
+      });
+
+      it("mainDomain match is case-insensitive for the owner", async () => {
+        const res = await request(app)
+          .post("/api/domains/page-subdomain")
+          .send({ ...VALID_BODY, mainDomain: "MySite.com" });
+        expect(res.status).toBe(201);
+        expect(mockSetPageSubdomain).toHaveBeenCalled();
+      });
     });
 
     it("returns 201 with fullDomain and customDomainUrl on success", async () => {

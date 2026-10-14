@@ -20,7 +20,7 @@
 import AWS from 'aws-sdk';
 import { agreementReport, toGraderValidation, type AgreementReport, type LabelPair, type ValidationRecord } from './agreement';
 import { getGrader, type EvalSurface } from './evalRegistry';
-import type { GoldenCase, GoldenCriterion, GoldenSplit, LabelValue } from './goldenSet';
+import { isAiLabelled, type GoldenCase, type GoldenCriterion, type GoldenSplit, type LabelValue } from './goldenSet';
 import type { GoldenSetStore } from './goldenSetStore';
 import {
   gradeFormatAdherence,
@@ -52,6 +52,9 @@ export interface GoldenCaseGrader {
   grade(goldenCase: GoldenCase): Promise<GraderPrediction>;
 }
 
+/** A class needs at least this many examples (of the rarer truth label) before its kappa means anything. */
+export const MIN_CLASS_EXAMPLES = 5;
+
 export interface CriterionAgreement {
   criterion: GoldenCriterion;
   /** null when no case has both a human and a grader pass/fail for this criterion. */
@@ -59,6 +62,9 @@ export interface CriterionAgreement {
   humanNa: number;
   unlabelled: number;
   graderAbstained: number;
+  /** The rarer of the two truth labels among the pairs. Under MIN_CLASS_EXAMPLES a kappa is not reported as reliable. */
+  minorityN: number;
+  reliable: boolean;
 }
 
 export interface ValidationRun {
@@ -66,12 +72,19 @@ export interface ValidationRun {
   surface: EvalSurface;
   split: GoldenSplit;
   cases: number;
+  /** Cases the grader was actually run on: only those with a human pass/fail label on one of its criteria. */
+  graded: number;
   /** Cases the grader threw on (their criteria count as abstained). */
   gradeErrors: number;
   criteria: CriterionAgreement[];
   primaryCriterion: GoldenCriterion;
-  /** For the primary criterion; null when it has no pairs. Qualifies for gating only if the
-   * registry's isQualifyingValidation accepts it (kappa, n and an http(s) evidence link). */
+  /** Cases in the split whose label an AI wrote (note starts with AI_LABEL_NOTE_PREFIX); left out unless asked. */
+  aiLabelledCases: number;
+  /** `human+ai` only when AI-written labels were included on request; that run is advisory. */
+  labelSource: 'human' | 'human+ai';
+  /** For the primary criterion; null when it has no pairs, or when AI-written labels were included (an advisory run
+   * is never a registry record). Qualifies for gating only if the registry's isQualifyingValidation accepts it
+   * (kappa, n and an http(s) evidence link). */
   validation: ValidationRecord | null;
 }
 
@@ -106,12 +119,16 @@ export function computeCriterionAgreement(
     }
     pairs.push({ truth, predicted });
   }
+  const positives = pairs.filter((p) => p.truth === 'pass').length;
+  const minorityN = Math.min(positives, pairs.length - positives);
   return {
     criterion,
     report: pairs.length > 0 ? agreementReport(pairs, bootstrap) : null,
     humanNa,
     unlabelled,
     graderAbstained,
+    minorityN,
+    reliable: pairs.length > 0 && minorityN >= MIN_CLASS_EXAMPLES,
   };
 }
 
@@ -121,6 +138,8 @@ export async function runValidation(opts: {
   graders: readonly GoldenCaseGrader[];
   evidence?: string;
   split?: GoldenSplit;
+  /** Count cases whose label an AI wrote. Off by default: agreement with them is not human agreement. */
+  includeAiLabels?: boolean;
   now?: Date;
   bootstrap?: { iterations?: number; seed?: number };
 }): Promise<ValidationRun> {
@@ -133,10 +152,19 @@ export async function runValidation(opts: {
   const split = opts.split ?? 'test';
   // Pairwise creative cases (ENG-2142) carry an A/B/tie preference, not these binary criteria;
   // their agreement is reported by scripts/creativeCalibrationReport.ts.
-  const cases = (await opts.store.listCases(entry.surface, { split })).filter((c) => c.pair === undefined);
+  const listed = (await opts.store.listCases(entry.surface, { split })).filter((c) => c.pair === undefined);
+  const aiLabelledCases = listed.filter(isAiLabelled).length;
+  const labelSource = opts.includeAiLabels && aiLabelledCases > 0 ? 'human+ai' : 'human';
+  const cases = opts.includeAiLabels ? listed : listed.filter((c) => !isAiLabelled(c));
   const predictions = new Map<string, GraderPrediction>();
   let gradeErrors = 0;
+  let graded = 0;
   for (const c of cases) {
+    // A prediction is only ever compared with a human pass/fail label, so a case without one cannot change the
+    // result. Skipping it also keeps graders that read live state (the account-health adapter calls Meta with the
+    // customer's token) from running on cases that cannot contribute.
+    if (!grader.criteria.some((criterion) => isBinary(c.labels[criterion]))) continue;
+    graded++;
     try {
       predictions.set(c.caseId, await grader.grade(c));
     } catch (error) {
@@ -152,10 +180,14 @@ export async function runValidation(opts: {
     surface: entry.surface,
     split,
     cases: cases.length,
+    graded,
     gradeErrors,
     criteria,
     primaryCriterion: grader.primaryCriterion,
-    validation: primary?.report ? toGraderValidation(primary.report, opts.evidence ?? 'unpublished', opts.now) : null,
+    aiLabelledCases,
+    labelSource,
+    // No record for a class too rare to measure: a kappa on a handful of examples would read as evidence.
+    validation: labelSource === 'human' && primary?.report && primary.reliable ? toGraderValidation(primary.report, opts.evidence ?? 'unpublished', opts.now, 'human') : null,
   };
 }
 
@@ -353,13 +385,34 @@ export function liveAgentGraders(load: (sessionId: string) => Promise<SessionFor
 export const CREATIVE_GATES_CRITERION: GoldenCriterion = 'format_readiness';
 
 /**
- * Maps the stored gate result onto `format_readiness`: pass when no check failed. Abstains (no
- * verdict) when this candidate has no stored gate result at all — an older candidate, a non-image
- * one, or one whose gates never ran.
+ * The checks that decide `format_readiness`: ENG-421's launch-ready floor (decode, blank render, aspect, size,
+ * file size). Since ENG-2193 the stored result also carries advisory CONTENT checks (OCR text ratio and
+ * legibility, spelling, brand colour, logo, policy keywords) and `appendCreativeGateChecks` recomputes the
+ * result's overall `passed` across all of them, so `passed` is no longer a format verdict: a launch-ready
+ * image with a failing brand-colour check has `passed: false`.
+ */
+const FORMAT_READINESS_CHECK_IDS: ReadonlySet<string> = new Set([
+  'decode',
+  'blank_render',
+  'aspect_ratio',
+  'dimensions',
+  'file_size',
+  'aspect_fallback',
+]);
+
+/**
+ * Maps the stored gate result onto `format_readiness`: fail when a structural check failed, pass when at
+ * least one structural check ran and none failed. Abstains (no verdict) when this candidate has no stored
+ * gate result at all (an older candidate, a non-image one, or one whose gates never ran), when the gates
+ * were recorded as not checked, or when every structural check was skipped: a skipped check measured
+ * nothing, so it cannot support "pass".
  */
 export function creativeGatesPrediction(gates: CreativeGateResult | undefined): GraderPrediction {
-  if (!gates) return {};
-  return { [CREATIVE_GATES_CRITERION]: gates.passed ? 'pass' : 'fail' };
+  if (!gates || gates.notChecked) return {};
+  const structural = gates.checks.filter((c) => FORMAT_READINESS_CHECK_IDS.has(c.id));
+  if (structural.some((c) => c.status === 'fail')) return { [CREATIVE_GATES_CRITERION]: 'fail' };
+  if (structural.some((c) => c.status === 'pass')) return { [CREATIVE_GATES_CRITERION]: 'pass' };
+  return {};
 }
 
 export type CreativeGateReader = (candidateId: string) => Promise<CreativeGateResult | undefined>;

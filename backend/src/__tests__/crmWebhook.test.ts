@@ -275,6 +275,57 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     expect(updates.email).toBeUndefined();
   });
 
+  // ─── contact.merge (ENG-2465) ─────────────────────────────────────────────────
+
+  const mergeEvent = { subscriptionType: 'contact.merge', portalId: 99999, objectId: '200', primaryObjectId: 200, mergedObjectIds: [101], newObjectId: 200 };
+  const holder = (id: string) => ({ leadId: 'lead-101', listId: VALID_LIST_ID, syncMetadata: { hubspot_contact_id: id, syncStatus: 'synced' } });
+  const postEvents = async (events: any[]) => {
+    await request(app).post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`).set('x-webhook-secret', VALID_SECRET).send(events);
+    await new Promise(r => setTimeout(r, 80));
+  };
+
+  it('contact.merge re-points the lead holding the merged-away id at the survivor', async () => {
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockResolvedValueOnce(holder('101')).mockResolvedValue(null);
+
+    await postEvents([mergeEvent]);
+
+    expect(crmDb.updateLead).toHaveBeenCalledWith(VALID_LIST_ID, 'lead-101', {
+      syncMetadata: { hubspot_contact_id: '200', syncStatus: 'synced' },
+    });
+  });
+
+  it('a deletion in the SAME delivery does not delete the re-pointed lead (merge is applied first); without the merge it does', async () => {
+    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue({ ...mockConfig('hubspot'), deleteOnPull: true });
+    // the lead is findable by its id only until the merge rewrites it
+    let storedId = '101';
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockImplementation(async (_l: string, id: string) => (id === storedId ? holder(storedId) : null));
+    (crmDb.updateLead as jest.Mock).mockImplementation(async (_l: string, _id: string, u: any) => { storedId = u.syncMetadata.hubspot_contact_id; });
+
+    await postEvents([mergeEvent, { subscriptionType: 'contact.deletion', portalId: 99999, objectId: '101' }]);
+    expect(crmDb.deleteLead).not.toHaveBeenCalled();
+
+    jest.clearAllMocks();
+    (crmDb.updateLead as jest.Mock).mockResolvedValue(undefined);
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockImplementation(async (_l: string, id: string) => (id === '101' ? holder('101') : null));
+    await postEvents([{ subscriptionType: 'contact.deletion', portalId: 99999, objectId: '101' }]);
+    expect(crmDb.deleteLead).toHaveBeenCalledWith(VALID_LIST_ID, 'lead-101');
+  });
+
+  it('a merge for an id no lead holds changes nothing', async () => {
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockResolvedValue(null);
+    await postEvents([mergeEvent]);
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  it('a throwing merge lookup does not stop a later event in the same delivery', async () => {
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockRejectedValue(new Error('throttled'));
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({ leadId: 'lead-9', listId: VALID_LIST_ID });
+
+    await postEvents([mergeEvent, { subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '9', propertyName: 'email', propertyValue: 'x@acme.com' }]);
+
+    expect(crmDb.updateLead).toHaveBeenCalledWith(VALID_LIST_ID, 'lead-9', expect.objectContaining({ email: 'x@acme.com' }));
+  });
+
   // A throw out of the deletion lookup does not just skip that contact: it escapes
   // handleHubSpotEvent into the fire-and-forget wrapper and abandons every remaining
   // objectId in the batch. HubSpot already has its 200, so nothing retries.
@@ -326,6 +377,53 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
 
     await new Promise(r => setTimeout(r, 50));
     expect(crmDb.createLead).not.toHaveBeenCalled();
+  });
+
+  // ENG-2322: the lookups said "absent" but createLead's email pre-check found the row (a
+  // concurrent create won). That used to throw out of the loop and abandon the whole delivery.
+  it('adopts the existing lead as an update when createLead loses a duplicate-email race, and still processes the next contact', async () => {
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockResolvedValue(null);
+    (crmDb.createLead as jest.Mock)
+      .mockRejectedValueOnce(Object.assign(
+        new Error('Lead with email "raced@acme.com" already exists in this list'),
+        { duplicateEmail: true, existingLead: { leadId: 'lead-won', email: 'raced@acme.com', firstName: 'Old' } },
+      ))
+      .mockResolvedValueOnce({ leadId: 'lead-second' });
+
+    const res = await request(app)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send([
+        { subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '111', propertyName: 'email', propertyValue: 'raced@acme.com' },
+        { subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '111', propertyName: 'firstname', propertyValue: 'New' },
+        { subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '222', propertyName: 'email', propertyValue: 'second@acme.com' },
+      ]);
+
+    expect(res.status).toBe(200);
+    await new Promise(r => setTimeout(r, 80));
+    expect(crmDb.updateLead).toHaveBeenCalledWith(
+      VALID_LIST_ID, 'lead-won',
+      expect.objectContaining({ firstName: 'New' }),
+    );
+    // The adopted lead already has the address: it is not rewritten.
+    expect((crmDb.updateLead as jest.Mock).mock.calls[0][2].email).toBeUndefined();
+    // The contact behind the race was not abandoned.
+    expect(crmDb.createLead).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not swallow a createLead failure that is not a duplicate-email race', async () => {
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockResolvedValue(null);
+    (crmDb.createLead as jest.Mock).mockRejectedValueOnce(new Error('dynamo down'));
+
+    await request(app)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send([{ subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '111', propertyName: 'email', propertyValue: 'x@acme.com' }]);
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
   });
 
   // ─── Happy paths ──────────────────────────────────────────────────────────────

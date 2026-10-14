@@ -6,7 +6,7 @@
  *      OAuth access token, the same two mechanisms the MCP transport accepts),
  *   2. resolve the caller's connected Meta ad account (own or org-shared, same visibility
  *      Emma uses) and refuse a foreign account or a revoked/expired connection,
- *   3. execute through executeMetaToolkitCall (all ENG-2046 write guards stay in the path),
+ *   3. execute through executeMetaToolkitCall (ENG-2268 refuses all external v1 writes),
  *   4. emit exactly ONE usage event per successful call via recordMcpToolUse.
  *
  * Storage: reuses agent API keys, MCP OAuth tokens, connected accounts and MCP usage events
@@ -19,9 +19,12 @@ import {
   type ConnectedAccount,
 } from '../services/connectedAccountsDb';
 import { isMetaAdAccount } from '../services/metaTokenRefresh';
-import { recordMcpToolUse, type McpAuthMethod } from '../services/mcpUsageEventsService';
+import { recordMcpToolUse, recordMcpWriteExecuted, type McpAuthMethod } from '../services/mcpUsageEventsService';
 import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } from './metaToolkitManifest';
 import { RateLimiter } from '../middleware/rateLimiter';
+import { isZomaTool } from './zomaToolDefinitions';
+import { executeMetaToolkitWrite, isGuardedWriteRequest } from './metaToolkitWrites';
+import { metaConnectionIsUsable, runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
 
 export class MetaToolkitAuthError extends Error {
   readonly status: 401 | 403 | 429;
@@ -53,6 +56,12 @@ export interface MetaToolkitGatewayDeps {
   recordUsage: typeof recordMcpToolUse;
   now: () => number;
   rateLimiter?: Pick<RateLimiter, 'check'>;
+  /** ENG-2303 toolkit-local Zoma tools; defaults to runZomaTool. */
+  runZomaTool?: typeof runZomaTool;
+  /** ENG-2303 P3 guarded writes; defaults to executeMetaToolkitWrite. */
+  executeWrite?: (userId: string, args: any) => Promise<any>;
+  /** ENG-2303 P4 distinct write metering; defaults to recordMcpWriteExecuted. */
+  recordWrite?: typeof recordMcpWriteExecuted;
 }
 
 /** Per-credential ceiling, so one key/token cannot exceed its limit by spreading calls across IPs. */
@@ -110,12 +119,7 @@ function normalizeAdAccountId(id: unknown): string {
   return String(id ?? '').trim().replace(/^act_/, '');
 }
 
-function connectionIsUsable(account: ConnectedAccount, now: number): boolean {
-  const config: any = account.config;
-  if (config?.ads_scope_revoked_at) return false;
-  const expiresAt = config?.token_expires_at;
-  return !(typeof expiresAt === 'number' && expiresAt < now);
-}
+const connectionIsUsable = metaConnectionIsUsable;
 
 /**
  * Resolve the Meta ad account this call runs against. A requested account must be one the
@@ -169,23 +173,67 @@ export async function handleMetaToolkitCall(
   deps: MetaToolkitGatewayDeps = defaultDeps,
 ) {
   const caller = await authenticateMetaToolkitCaller(request.authorization, deps);
+  const meter = () =>
+    deps.recordUsage({
+      userId: caller.userId,
+      toolName: request.toolName,
+      authMethod: caller.authMethod,
+      apiKeyId: caller.apiKeyId,
+      clientId: caller.clientId,
+      sessionId: request.sessionId,
+      userAgent: request.userAgent,
+    });
+
+  // ENG-2303: onboarding tools must work before Meta is connected, so they skip account resolution.
+  if (isZomaTool(request.toolName)) {
+    let result;
+    try {
+      result = await (deps.runZomaTool ?? runZomaTool)(request.toolName, request.args ?? {}, { userId: caller.userId });
+    } catch (error) {
+      if (error instanceof ZomaNotReadyError) throw new MetaToolkitRefusal(error.message);
+      throw error;
+    }
+    await meter();
+    return result;
+  }
+
   const args = { ...(request.args ?? {}) };
   const accountId = await resolveMetaToolkitAdAccount(caller.userId, args.account_id, deps);
   if (toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
 
-  const result = await deps.execute(request.toolName, args, {
-    userId: caller.userId,
-    sessionId: request.sessionId,
-  });
+  // ENG-2303 P3: CAMPAIGN/AD_SET/AD CREATE + status/budget UPDATE go through the guarded
+  // preview→confirm path; every other write stays refused by assertMetaToolkitV1Call.
+  const guardedWrite = isGuardedWriteRequest(request.toolName, args);
+  const result = guardedWrite
+    ? await (deps.executeWrite ?? executeMetaToolkitWrite)(caller.userId, args)
+    : await deps.execute(request.toolName, args, {
+        userId: caller.userId,
+        sessionId: request.sessionId,
+      });
 
-  await deps.recordUsage({
-    userId: caller.userId,
-    toolName: request.toolName,
-    authMethod: caller.authMethod,
-    apiKeyId: caller.apiKeyId,
-    clientId: caller.clientId,
-    sessionId: request.sessionId,
-    userAgent: request.userAgent,
-  });
+  // ENG-2303 P4: a write that reached Meta (it has a read-back verdict) is metered as its
+  // own event kind. Previews, mismatched confirms and refused/failed writes are not.
+  // A metering failure must not make an executed write look failed (that invites a retry
+  // and a duplicate), so it is logged and surfaced on the result instead of thrown.
+  if (guardedWrite && typeof (result as any)?.verification === 'string') {
+    await (deps.recordWrite ?? recordMcpWriteExecuted)({
+      userId: caller.userId,
+      toolName: request.toolName,
+      authMethod: caller.authMethod,
+      apiKeyId: caller.apiKeyId,
+      clientId: caller.clientId,
+      sessionId: request.sessionId,
+      userAgent: request.userAgent,
+      entityType: String(args.entity_type),
+      action: String(args.action),
+      verification: (result as any).verification,
+      objectId: (result as any).id ?? undefined,
+    }).catch((error) => {
+      console.error('[meta-toolkit] write metering failed:', error instanceof Error ? error.message : error);
+      (result as any).metering = 'failed: this write executed but was not recorded in usage';
+    });
+  }
+
+  await meter();
   return result;
 }

@@ -194,3 +194,181 @@ describe('askCrm — respects load limit', () => {
     expect(loadLeadsForUser).toHaveBeenCalledWith('u1', { limit: 42 });
   });
 });
+
+
+describe('askCrm — ENG-2155 live lifecycle precedence', () => {
+  it('lets an authorized active subscription advance stale inbox to paying', async () => {
+    const result = await askCrm('show paying customers', 'u1', makeDeps([
+      lead({ lifecycle: 'inbox', subscriptionState: 'active', hasUserRecord: true }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('paying');
+  });
+
+  it('lets positive open-deal evidence advance stale inbox to in_deal', async () => {
+    const result = await askCrm('which deals are closing', 'u1', makeDeps([
+      lead({ lifecycle: 'inbox', openDealStages: ['Negotiation'] }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('in_deal');
+  });
+
+  it('does not treat closed-only deal stages as authoritative evidence for a downgrade', async () => {
+    const result = await askCrm('which deals are closing', 'u1', makeDeps([
+      lead({ lifecycle: 'in_deal', openDealStages: ['Won'] }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('in_deal');
+  });
+
+  it('uses stored lifecycle when no positive/terminal live signal can replace it', async () => {
+    const result = await askCrm('show paying customers', 'u1', makeDeps([
+      lead({ lifecycle: 'paying', openDealStages: [] }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('paying');
+  });
+
+  // specific_contact is lifecycle-agnostic (text match only), unlike the
+  // paying_customers/at_risk/deals_closing intents above, which filter the result
+  // list BY the derived lifecycle — so a test whose derived outcome isn't in that
+  // intent's own target set would see result.items come back empty rather than
+  // actually exercising deriveScores. Querying by name keeps every case below
+  // observable regardless of what lifecycle it resolves to.
+  it('lets a confirmed account record advance stale inbox to signed_up', async () => {
+    const result = await askCrm('is Signupcase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Signupcase', company: 'Acme', lifecycle: 'inbox', hasUserRecord: true }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('signed_up');
+  });
+
+  it('lets 60+ days of inactivity advance stale paying to churned', async () => {
+    const result = await askCrm('is Churncase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Churncase', company: 'Acme', lifecycle: 'paying', lastActivityAt: '2026-01-01T00:00:00Z' }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('churned');
+  });
+
+  // healthScore/lastUsageAt are NOT live signals: askCrmLeadLoader.ts never merges
+  // either one (healthScore is written once, historic-only, by
+  // scripts/backfill-crm-scores.ts and never refreshed; lastUsageAt is never
+  // persisted onto a lead row outside that same one-time script). A gate branch
+  // that trusted them alone would downgrade a stored "paying" off a snapshot with
+  // zero live evidence behind it — exactly what this gate exists to prevent. These
+  // two guard against reintroducing that.
+  it('does not let a stale stored health score alone move a stored paying customer to at_risk', async () => {
+    const result = await askCrm('is Healthcase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Healthcase', company: 'Acme', lifecycle: 'paying', healthScore: 20 }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('paying');
+  });
+
+  it.each(['paying', 'trialing', 'at_risk'] as const)(
+    'does not let an open deal downgrade a stored %s customer to in_deal', async stored => {
+      const result = await askCrm('is Dealcase at acme', 'u1', makeDeps([
+        lead({ firstName: 'Dealcase', company: 'Acme', lifecycle: stored, openDealStages: ['Negotiation'] }),
+      ]));
+      expect(result.items[0].lifecycle).toBe(stored);
+    });
+
+  it('still lets an open deal promote a stored signed_up lead to in_deal', async () => {
+    const result = await askCrm('is Promocase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Promocase', company: 'Acme', lifecycle: 'signed_up', hasUserRecord: true, openDealStages: ['Proposal'] }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('in_deal');
+  });
+
+  it('still lets a live active subscription win over an open deal on a stored inbox lead', async () => {
+    const result = await askCrm('is Subwins at acme', 'u1', makeDeps([
+      lead({ firstName: 'Subwins', company: 'Acme', lifecycle: 'inbox', subscriptionState: 'active', openDealStages: ['Proposal'] }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('paying');
+  });
+
+  describe('win-back: a live open deal on a churned-looking lead', () => {
+    const live = { liveOpenDealStages: ['Negotiation'], openDealStages: ['Negotiation'] };
+    const life = async (name: string, l: Partial<AskCrmLead>) =>
+      (await askCrm(`is ${name} at acme`, 'u1', makeDeps([lead({ firstName: name, company: 'Acme', ...l })]))).items[0].lifecycle;
+
+    it('reports in_deal for a stored churned lead', async () => {
+      expect(await life('Wbstored', { lifecycle: 'churned', ...live })).toBe('in_deal');
+    });
+    it('reports in_deal for a stored paying lead whose subscription was canceled', async () => {
+      expect(await life('Wbcancel', { lifecycle: 'paying', subscriptionState: 'canceled', ...live })).toBe('in_deal');
+    });
+    it('reports in_deal for a cold lead that is 60+ days idle', async () => {
+      expect(await life('Wbidle', { lifecycle: 'inbox', lastActivityAt: '2026-01-01T00:00:00Z', ...live })).toBe('in_deal');
+    });
+    it('stays churned when the only deal evidence is stored (possibly stale), not live', async () => {
+      expect(await life('Wbstale', { lifecycle: 'churned', openDealStages: ['Negotiation'] })).toBe('churned');
+    });
+    it('stays churned when the live deal is closed', async () => {
+      expect(await life('Wbclosed', { lifecycle: 'churned', liveOpenDealStages: ['Won'] })).toBe('churned');
+    });
+    it('does not override a live active subscription', async () => {
+      expect(await life('Wbsub', { lifecycle: 'churned', subscriptionState: 'active', hasUserRecord: true, ...live })).toBe('paying');
+    });
+    it('does not change a healthy stored paying lead that has an upsell deal', async () => {
+      expect(await life('Wbupsell', { lifecycle: 'paying', ...live })).toBe('paying');
+    });
+  });
+
+  it('keeps a live active subscriber paying despite 60+ days without a login', async () => {
+    const result = await askCrm('is Annualcase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Annualcase', company: 'Acme', lifecycle: 'inbox', subscriptionState: 'active', hasUserRecord: true, lastActivityAt: '2026-01-01T00:00:00Z' }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('paying');
+  });
+
+  it('keeps a live trialing subscriber trialing despite 60+ days without a login', async () => {
+    const result = await askCrm('is Trialcase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Trialcase', company: 'Acme', lifecycle: 'inbox', subscriptionState: 'trialing', hasUserRecord: true, lastActivityAt: '2026-01-01T00:00:00Z' }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('trialing');
+  });
+
+  it('still churns a canceled subscription', async () => {
+    const result = await askCrm('is Cancelcase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Cancelcase', company: 'Acme', lifecycle: 'paying', subscriptionState: 'canceled', lastActivityAt: '2026-04-01T00:00:00Z' }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('churned');
+  });
+
+  it('does not let a stale health score leak in through a different gate branch (live active sub)', async () => {
+    const result = await askCrm('is Leakcase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Leakcase', company: 'Acme', lifecycle: 'paying', subscriptionState: 'active', healthScore: 20, lastUsageAt: '2026-03-01T00:00:00Z' }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('paying');
+  });
+
+  it('does not let a stale stored usage timestamp alone move a stored paying customer to at_risk', async () => {
+    const result = await askCrm('is Usagecase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Usagecase', company: 'Acme', lifecycle: 'paying', lastUsageAt: '2026-03-01T00:00:00Z' }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('paying');
+  });
+
+  it('does not downgrade stored paying from a healthy score and recent usage alone', async () => {
+    const result = await askCrm('is Healthycase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Healthycase', company: 'Acme', lifecycle: 'paying', healthScore: 90, lastUsageAt: '2026-04-13T00:00:00Z' }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('paying');
+  });
+
+  it('does not let past_due downgrade a stored signed_up lead to inbox', async () => {
+    const result = await askCrm('is Pastduecase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Pastduecase', company: 'Acme', lifecycle: 'signed_up', subscriptionState: 'past_due' }),
+    ]));
+    // Before the fix, subscriptionIsDefinitive treated ANY past_due as definitive,
+    // so the gate trusted computeLifecycle here — which (Rule 2 only applies from
+    // paying/at_risk, so past_due is a no-op, and hasUserRecord is unset) falls
+    // through to the Rule 7 email-visibility floor and returns 'inbox'. That is a
+    // real downgrade of a stronger stored state, the exact failure class this
+    // gate exists to prevent. provesSignup can't rescue this case either —
+    // its own condition requires lifecycle to already be 'unknown'/'inbox'.
+    expect(result.items[0].lifecycle).toBe('signed_up');
+  });
+
+  it('does treat past_due as definitive from an already-paying stored state', async () => {
+    const result = await askCrm('is Atriskcase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Atriskcase', company: 'Acme', lifecycle: 'paying', subscriptionState: 'past_due' }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('at_risk');
+  });
+});

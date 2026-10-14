@@ -152,8 +152,10 @@
  * four names; none matched.
  */
 import { googleAdsService } from '../../services/googleAdsService';
+import { stampGoogleAssetUpload, stampGoogleAdCreated } from '../../services/creativeLineage';
 import {
   NegativeCampaignCriteriaValidationError,
+  validateDeviceBidAdjustments,
   validateNegativeCampaignCriteria,
 } from '../../services/googleAdsCampaignCriteria';
 import { preflightTrackingGate } from '../../services/googleAdsTrackingPreflight';
@@ -602,6 +604,23 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
       return { success: true, biddingStrategies };
     }
 
+    if (entity_type === 'CAMPAIGN_CRITERION' && action === 'SET_DEVICE_BID_ADJUSTMENT') {
+      // ENG-2036: validate fully before credentials/mutation; one atomic mutate.
+      const normalized = validateDeviceBidAdjustments(
+        customer_id,
+        args.campaign_resource_name,
+        args.ad_group_resource_name,
+        args.device_bid_adjustments,
+      );
+      await googleAdsService.setDeviceBidAdjustments(userId, normalized);
+      return {
+        success: true,
+        scope: normalized.scope,
+        adjustments: normalized.adjustments,
+        message: `Set ${normalized.adjustments.length} device bid adjustment(s) at ${normalized.scope.toLowerCase()} level`,
+      };
+    }
+
     if (entity_type === 'CAMPAIGN_CRITERION' && action === 'ADD') {
       const { placementUrls, mobileAppCategoryResourceNames } = validateNegativeCampaignCriteria(
         customer_id,
@@ -715,19 +734,24 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
         };
       }
       if (action === 'ADD_PROXIMITY') {
-        if (!args.campaign_resource_name || args.radius === undefined || !args.address) {
-          return { success: false, error: 'campaign_resource_name, radius, and address are required for ADD_PROXIMITY' };
+        const hasGeo = args.latitude !== undefined || args.longitude !== undefined;
+        if (!args.campaign_resource_name || args.radius === undefined || (!args.address && !hasGeo)) {
+          return { success: false, error: 'campaign_resource_name, radius, and address (or latitude+longitude) are required for ADD_PROXIMITY' };
+        }
+        if (hasGeo && (typeof args.latitude !== 'number' || typeof args.longitude !== 'number')) {
+          return { success: false, error: 'ADD_PROXIMITY needs both latitude and longitude as numbers when centering on coordinates' };
         }
         const criterion = await googleAdsService.addProximityCriterion(userId, customer_id, args.campaign_resource_name, {
           radius: args.radius,
           radiusUnits: args.radius_units,
+          ...(hasGeo ? { geoPoint: { latitude: args.latitude, longitude: args.longitude } } : {}),
           address: {
-            streetAddress: args.address.street_address,
-            cityName: args.address.city_name,
-            postalCode: args.address.postal_code,
-            provinceCode: args.address.province_code,
-            provinceName: args.address.province_name,
-            countryCode: args.address.country_code,
+            streetAddress: args.address?.street_address,
+            cityName: args.address?.city_name,
+            postalCode: args.address?.postal_code,
+            provinceCode: args.address?.province_code,
+            provinceName: args.address?.province_name,
+            countryCode: args.address?.country_code,
           },
         });
         return { success: true, criterionResourceName: criterion.resourceName };
@@ -1102,6 +1126,10 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
           // moment its campaign is enabled.
           status: args.status || 'PAUSED',
         });
+        // ENG-2235: fire-and-forget lineage stamp (inert unless CREATIVE_LINEAGE_ENABLED).
+        if (ad?.resourceName && Array.isArray(args.image_asset_resource_names)) {
+          void stampGoogleAdCreated({ userId, customerId: String(customer_id), adResourceName: ad.resourceName, assetResourceNames: args.image_asset_resource_names });
+        }
         return { success: true, adResourceName: ad.resourceName, ...(creativeTrackingWarning ? { trackingWarning: creativeTrackingWarning } : {}) };
       }
       if (action === 'UPDATE') {
@@ -1148,6 +1176,10 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
         name: args.name,
         data: args.data,
       });
+      // ENG-2235: only a URL upload can resolve to a generated creative.
+      if (resourceName && typeof args.data === 'string' && args.data.startsWith('https://')) {
+        void stampGoogleAssetUpload({ userId, imageUrl: args.data, assetResourceName: resourceName });
+      }
       return { success: true, assetResourceName: resourceName };
     }
 
@@ -1224,6 +1256,10 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
         error: error.message,
         code,
       };
+    }
+    if (error?.name === 'GoogleAdsReadBackError' && error?.code === 'unsupported_field') {
+      // ENG-592: mutate said success, read-back says unchanged. Never relay as success.
+      return { success: false, errorType: error.code, errorCode: error.code, fields: error.fields, error: error.message };
     }
     if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true, code };
     console.error('[AgentMode] handleCallGoogleAdsApi error:', error);

@@ -1,5 +1,5 @@
 import { classifyTraffic, type TrafficClassification } from './trafficSource';
-import { resolveSessionIdentity, type SessionIdentity } from './sessionList';
+import { resolveIngestSessionIdentity, type SessionIdentity } from './sessionList';
 import { isPlausibleListId } from './trackingConfig';
 
 /**
@@ -77,10 +77,11 @@ export function parseIngestBody(body: unknown, nowMs: number): IngestParseResult
   const event = typeof b.event === 'string' ? b.event : '';
   if (!(INGEST_EVENTS as readonly string[]).includes(event)) return fail('invalid_event', 'unknown event');
 
-  // Identity goes through the SAME parser forward-lead uses, so the 48h / +5min window on
-  // sessionStartMs (which becomes the leadId's time prefix) is one rule, not two.
-  const identity = resolveSessionIdentity({ sessionId: b.sessionId, sessionStartMs: b.sessionStartMs }, nowMs);
-  if (!identity) return fail('invalid_session', 'sessionId and a recent sessionStartMs are required');
+  // Same parser and 48h / +5min window as forward-lead, EXCEPT that a well-formed sessionStartMs outside it
+  // is replaced by a stable server-derived one instead of rejected (ENG-2324: a skewed device clock must not
+  // cost the session every event). Only a missing / malformed sessionId or sessionStartMs is still a 400.
+  const identity = resolveIngestSessionIdentity({ sessionId: b.sessionId, sessionStartMs: b.sessionStartMs, clientNowMs: int(b.clientNowMs, 0, Number.MAX_SAFE_INTEGER) }, nowMs);
+  if (!identity) return fail('invalid_session', 'sessionId and an integer sessionStartMs are required');
 
   let customName: string | undefined;
   if (event === 'custom') {
@@ -142,9 +143,9 @@ export function parseIngestBody(body: unknown, nowMs: number): IngestParseResult
     }
   }
 
-  const landingUrl = cleanUrl(b.landingUrl, 1000);
+  const landingUrl = repairEscapedQuery(cleanUrl(b.landingUrl, 1000));
   const referrer = cleanUrl(b.referrer, 1000);
-  const firstTouchLanding = cleanUrl(b.firstTouchLanding, 1000);
+  const firstTouchLanding = repairEscapedQuery(cleanUrl(b.firstTouchLanding, 1000));
   return {
     ok: true,
     value: {
@@ -158,6 +159,23 @@ export function parseIngestBody(body: unknown, nowMs: number): IngestParseResult
       firstTouchLanding: isHttpUrl(firstTouchLanding) ? firstTouchLanding : '',
     },
   };
+}
+
+/**
+ * Undo HTML-entity damage to a shared link's query string. A link copied out of HTML arrives as
+ * `?utm_source=x&amp;utm_medium=y`, and some apps then drop the `&`, leaving `x` + `amp;utm_medium=y`
+ * as one value. Either way every UTM after the first is lost. Only `amp;` immediately followed by
+ * a `name=` pair is rewritten, so a value that merely contains "amp" is left alone.
+ */
+export function repairEscapedQuery(url: string): string {
+  const q = url.indexOf('?');
+  if (q < 0 || !/amp;/i.test(url)) return url;
+  const hashAt = url.indexOf('#', q);
+  const end = hashAt < 0 ? url.length : hashAt;
+  const query = url.slice(q + 1, end)
+    .replace(/&?amp;(?=[A-Za-z_][\w.-]*=)/gi, '&')
+    .replace(/^&+/, '');
+  return url.slice(0, q + 1) + query + url.slice(end);
 }
 
 export function deviceFromUserAgent(ua: string): string {

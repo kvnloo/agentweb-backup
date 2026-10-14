@@ -116,6 +116,10 @@ export interface EquivalentPublishRoute {
  * and silently collapsed a requested 2-tweet thread into one tweet instead.
  */
 export const EQUIVALENT_PUBLISH_ROUTES: Record<string, EquivalentPublishRoute[]> = {
+  // ENG-1005: REST self-calls revalidate under the underlying publisher's name.
+  // This preserves consent at the handoff, without crediting a draft as completed work.
+  emma_publish_social_post: [{ tool: 'post_on_connected_account', consentOnly: true }],
+  emma_publish_blog_post: [{ tool: 'publish_blog_article', consentOnly: true }],
   post_on_connected_account: [
     // A multi-tweet thread puts the mandated content on the owner's timeline —
     // the ONLY case impossible to express via post_on_connected_account, and the

@@ -1,4 +1,5 @@
 import type { WorkPlanStep } from "./workPlanService";
+import { carryStoredStepModels } from "./agentMode/workPlanStepModels";
 
 /**
  * The step fields a submitted work plan can actually persist. The write routes
@@ -12,7 +13,7 @@ import type { WorkPlanStep } from "./workPlanService";
  * pure function, and ~18 route tests `jest.mock` the service wholesale, which
  * would blank out an export living there.
  */
-const WORK_PLAN_STEP_FIELDS = new Set([
+export const WORK_PLAN_STEP_FIELDS = new Set([
   'stepCount',
   'title',
   'description',
@@ -26,6 +27,10 @@ const WORK_PLAN_STEP_FIELDS = new Set([
   // any field on the step, however unrelated.
   'expectedAssetCountTools',
   'inputRequest',
+  // ENG-2378: the per-step model. Kept in this list unconditionally (so it is never reported as an
+  // "unrecognized field"); whether it is STORED is decided in normalizeWorkPlanSteps by the
+  // `work_plan_step_models_enabled` switch.
+  'model',
 ]);
 
 export interface NormalizedWorkPlanSteps {
@@ -41,7 +46,18 @@ export interface NormalizedWorkPlanSteps {
  * discarded. Shared by the admin and user create/update routes so the field
  * list cannot drift between them again.
  */
-export function normalizeWorkPlanSteps(steps: any[]): NormalizedWorkPlanSteps {
+export function normalizeWorkPlanSteps(
+  steps: any[],
+  // ENG-2378: the `work_plan_step_models_enabled` switch, read by the calling route. Off (the default) = a submitted
+  // step `model` is reported and dropped, i.e. exactly the pre-feature behaviour.
+  options: {
+    stepModelsEnabled?: boolean;
+    /** The plan's stored steps: a stored step model is carried onto the matching submitted step (never erased by a write). */
+    storedSteps?: ReadonlyArray<any>;
+    /** Carry the stored model even when the switch is on and the submitted step omits the key (routes with no content-loss guard). */
+    keepStoredWhenOmitted?: boolean;
+  } = {},
+): NormalizedWorkPlanSteps {
   const warnings: string[] = [];
 
   const normalized = steps.map((raw: any, i: number) => {
@@ -117,6 +133,19 @@ export function normalizeWorkPlanSteps(steps: any[]): NormalizedWorkPlanSteps {
       }
     }
 
+    // ENG-2378: a step's explicit model. Stored only while the switch is on, and only as a non-blank string (a blank
+    // value is the explicit "no model on this step"). A wrong-shaped value is reported, never stored.
+    let stepModel: string | undefined;
+    if (s.model !== undefined && s.model !== null) {
+      if (!options.stepModelsEnabled) {
+        warnings.push(`step ${i + 1}: ignored model — per-step models are not enabled`);
+      } else if (typeof s.model !== 'string') {
+        warnings.push(`step ${i + 1}: ignored model — expected a string`);
+      } else if (s.model.trim()) {
+        stepModel = s.model.trim();
+      }
+    }
+
     return {
       stepCount: s.stepCount || i + 1,
       title: s.title || `Step ${i + 1}`,
@@ -127,10 +156,24 @@ export function normalizeWorkPlanSteps(steps: any[]): NormalizedWorkPlanSteps {
       ...(keepAssetCount && { expectedAssetCount: assetCount }),
       ...(keepAssetCountTools && { expectedAssetCountTools: usableAssetCountTools }),
       ...(s.inputRequest !== undefined && { inputRequest: s.inputRequest }),
+      ...(stepModel !== undefined && { model: stepModel }),
     };
   });
 
-  return { steps: normalized, warnings };
+  // ENG-2378: a write must never erase a stored step model. Switch off / unknown: the submitted value is ignored and
+  // the stored one carried. Switch on: only an explicit value/blank decides; an omitted key is carried where the route
+  // has no content-loss guard of its own (keepStoredWhenOmitted).
+  const withCarried = options.storedSteps
+    ? carryStoredStepModels(normalized, options.storedSteps, (i) => {
+        if (!options.stepModelsEnabled) return true;
+        const raw: any = steps[i];
+        const submitted = raw && typeof raw === 'object' ? raw.model : undefined;
+        if (typeof submitted === 'string') return false; // explicit value or explicit clear
+        return !!options.keepStoredWhenOmitted;
+      })
+    : normalized;
+
+  return { steps: withCarried, warnings };
 }
 
 /* ─── Work-plan step guards (ENG-1221) ──────────────────────────────────────
@@ -164,6 +207,8 @@ const STEP_CONTENT_FIELDS = [
   'expectedAssetCount',
   'expectedAssetCountTools',
   'inputRequest',
+  // ENG-2378: a replace that omits a stored step model would silently reset that step to the account default.
+  'model',
 ] as const;
 
 function isEmptyStepValue(value: unknown): boolean {
@@ -399,6 +444,12 @@ function mergeWorkPlanStep(existing: any, incoming: any): any {
     // null as a value would blank an existing field in what is meant to be the
     // non-destructive mode.
     if (value === undefined || value === null) continue;
+    // ENG-2378: a blank step model is the explicit "clear it" instruction (merge cannot express a clear any other
+    // way, since null/undefined mean "not supplied"). The key is removed, never stored as ''.
+    if (key === 'model' && value === '') {
+      delete merged.model;
+      continue;
+    }
     merged[key] = value;
   }
   return merged;
@@ -471,4 +522,22 @@ export function summarizeStepChange(before: any[], after: any[], mode: 'merge' |
     // Omitted rather than empty so a clean update's summary stays quiet.
     ...(contentLoss.length > 0 && { stepContentLoss: contentLoss }),
   };
+}
+
+/**
+ * The stepCount rule `chatbotDb.updateSessionWorkPlan` enforces on write: steps must be
+ * numbered sequentially from 1 (stepCount === index + 1). Exported so a launch can run the
+ * SAME check BEFORE it writes anything else (e.g. the session model) and fail with no state
+ * change instead of discovering a malformed plan only at the final write (ENG-903).
+ */
+export function assertSequentialStepCounts(steps: ReadonlyArray<{ stepCount: number }>): void {
+  for (let i = 0; i < steps.length; i++) {
+    const expectedStepCount = i + 1;
+    if (steps[i].stepCount !== expectedStepCount) {
+      throw new Error(
+        `Invalid stepCount at index ${i}: expected ${expectedStepCount} but got ${steps[i].stepCount}. ` +
+        `Steps must be numbered sequentially starting from 1 (stepCount must equal index+1).`
+      );
+    }
+  }
 }

@@ -363,6 +363,17 @@ export function parseGoldenCase(value: unknown): GoldenCase {
 
 export const MAX_NOTE_CHARS = 2000;
 
+/**
+ * A label an AI wrote, with the owner's permission, starts its note with this (ENG-2135, 2026-10-14). The store
+ * records the saving admin as the labeller, so the note is the only marker. Agreement measured on such a label is
+ * not human agreement, so validation and the creative calibration report leave these cases out unless asked.
+ */
+export const AI_LABEL_NOTE_PREFIX = '[AI-LABEL]';
+
+export function isAiLabelled(c: Pick<GoldenCase, 'notes'>): boolean {
+  return typeof c.notes === 'string' && c.notes.startsWith(AI_LABEL_NOTE_PREFIX);
+}
+
 export interface LabelUpdate {
   labels: Partial<Record<GoldenCriterion, LabelValue>>;
   notes?: string;

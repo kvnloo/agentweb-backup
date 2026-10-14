@@ -289,6 +289,18 @@ describe('CORS Access-Control-Allow-Methods', () => {
     });
   });
 
+  // ENG-2418: the portal (app.agentweb.pro) reads with-images paging metadata from
+  // response headers cross-origin; browsers hide non-safelisted headers unless exposed.
+  it('exposes the with-images paging headers to allowed cross-origin callers', async () => {
+    const res = await request(app)
+      .get('/api/loop-events')
+      .set('Origin', 'https://app.agentweb.pro');
+
+    const exposed = String(res.headers['access-control-expose-headers'] || '');
+    expect(exposed).toContain('X-Total-Tasks');
+    expect(exposed).toContain('X-Next-Cursor');
+  });
+
   it('public endpoints should only advertise GET, POST, OPTIONS methods', async () => {
     const res = await request(app)
       .options('/api/lead-magnet/test')

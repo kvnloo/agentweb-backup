@@ -9,6 +9,7 @@ import { crmDb, userDb, tempEmailDb } from '../services/db';
 import { dripSequenceDb } from '../services/dripSequenceDb';
 import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
 import { getUserIdByHubSpotPortalId, getAccountsByAttioWorkspaceId } from '../services/connectedAccountsDb';
+import { parseHubSpotMergeEvent, repointMergedContactIds, HubSpotContactMerge } from '../services/hubspotContactMerge';
 import { HubSpotService } from '../services/hubspotService';
 import { AttioService } from '../services/attioService';
 import { AttioAdapter } from '../services/adapters/attioAdapter';
@@ -108,6 +109,30 @@ function validatedEventTimeSeconds(capturedAtMs: unknown): number | undefined {
   return Math.floor(capturedAtMs / 1000);
 }
 
+
+/**
+ * ENG-2320: turn an `updateLead` payload that carries the WHOLE merged customFields map into one
+ * that carries only the keys this write adds or changes, flagged for per-key atomic writes.
+ *
+ * A full-map `SET customFields = :map` overwrites every key a concurrent request stored since the
+ * snapshot `existingCustomFields` was read (12 concurrent multi-step / double submits kept 1 of
+ * 12). A key is picked when it is absent from the snapshot or its value differs by JSON
+ * comparison, the same comparison the merges use to decide `changed`, so an unchanged value (and a
+ * `source` restored from the stored row) is never rewritten: a stale snapshot cannot revert a key
+ * this write does not own. Updates without customFields pass through untouched.
+ */
+function toKeyMergeUpdate(updates: any, existingCustomFields: Record<string, any>): any {
+  if (!updates.customFields) return updates;
+  const { customFields: mergedMap, ...rest } = updates;
+  const patch = Object.fromEntries(
+    Object.entries(mergedMap).filter(
+      ([k, v]) =>
+        !Object.prototype.hasOwnProperty.call(existingCustomFields, k) ||
+        JSON.stringify(existingCustomFields[k]) !== JSON.stringify(v),
+    ),
+  );
+  return { ...rest, customFields: patch, customFieldsKeyMerge: true };
+}
 
 /**
  * Fire-and-forget: enroll a single lead into any sequences that have
@@ -863,7 +888,10 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       }
 
       if (changed || matchQualityBackfilled) {
-        await crmDb.updateLead(leadList.listId, existingLead.leadId, updates);
+        // ENG-2320: customFields goes to DynamoDB PER KEY (see toKeyMergeUpdate). `updates` keeps
+        // the full merged map because `lead` below (what the response cascade renders) is built
+        // from it.
+        await crmDb.updateLead(leadList.listId, existingLead.leadId, toKeyMergeUpdate(updates, existingCustomFields));
         // Only a user-visible change makes this an "update". See the ENG-926 §B note above:
         // isUpdated drives sequence enrolment, CRM sync and owner alerts, so a silent
         // metadata backfill deliberately does not set it.
@@ -926,7 +954,10 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
             ...(deterministicLeadId ? { ...leadData, leadId: deterministicLeadId, failIfExists: true } : leadData),
             // Only added when true, so every non-session list passes byte-identical input.
             ...(suppressSideEffects ? { suppressSideEffects: true } : {}),
-          }
+            // ENG-2321: an email lead on an ordinary list takes the exactly-once create (db.createLead).
+            ...(normalizedEmail && !isSessionList(leadList) ? { emailUniqueCreate: true } : {}),
+          },
+          'form_fill'
         );
         isNew = true;
       } catch (createErr: any) {
@@ -946,10 +977,11 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           mergedCustomFields = incomingCustomFields;
           leadData.customFields = mergedCustomFields;
           // The carried row came off the eventually-consistent email-index GSI, so it can be
-          // OLDER than what the race winner is still writing — and the merge below writes the
-          // whole customFields map, so merging into the snapshot would drop keys the winner
-          // added after the projection. Re-read by primary key, consistently (one GetItem, race
-          // path only); fall back to the carried row only if that read comes back empty.
+          // OLDER than what the race winner is still writing. The merge below writes per key
+          // (ENG-2320), so a stale snapshot no longer drops the winner's keys, but it still
+          // decides `changed` and the write-once backfills — so re-read by primary key,
+          // consistently (one GetItem, race path only); fall back to the carried row only if
+          // that read comes back empty.
           const fresh = await crmDb.getLeadById(leadList.listId, createErr.existingLead.leadId, { consistentRead: true });
           await mergeIntoExistingLead(fresh || createErr.existingLead);
         } else if (!createErr?.leadAlreadyExists) {
@@ -1039,7 +1071,8 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           }
 
           if (adoptedChanged) {
-            await crmDb.updateLead(leadList.listId, lead.leadId, adoptedUpdates);
+            // ENG-2320: per key, like the email branch (only the keys this adopt adds or changes).
+            await crmDb.updateLead(leadList.listId, lead.leadId, toKeyMergeUpdate(adoptedUpdates, adoptedExistingCustom));
             lead = { ...lead, ...adoptedUpdates };
             // A real, user-visible change — same meaning the email branch gives isUpdated.
             isUpdated = true;
@@ -1063,7 +1096,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     if (!suppressSideEffects && !isNew && !isSmokeTestLead(lead) && !isSmokeTestLead(leadData)) {
       const submission = { submissionId: crypto.randomUUID(), submittedAt: new Date().toISOString() };
       void import('../services/orgLeadNotificationService')
-        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, submission))
+        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, 'form_fill', submission))
         .catch(() => console.warn('[leadNotifications] submission hook failed', { listId: leadList.listId, leadId: lead.leadId }));
     }
 
@@ -1158,12 +1191,16 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         if (!sent) return;
 
         try {
+          // ENG-2320: write ONLY the two keys this marker owns, per key. It runs seconds after
+          // the merge, from an in-memory snapshot; spreading that snapshot back as the whole map
+          // overwrote every key a concurrent submission stored in the meantime (it could undo
+          // the merge's own per-key writes).
           await crmDb.updateLead(leadList.listId, lead.leadId, {
             customFields: {
-              ...roadmapCustomFields,
               roadmapEmailSentAt: new Date().toISOString(),
               roadmapEmailStage: Number(roadmapCustomFields.stage),
             },
+            customFieldsKeyMerge: true,
           });
         } catch (markError) {
           console.error('[roadmapDelivery] sent but failed to mark lead:', markError);
@@ -1667,6 +1704,8 @@ interface HubspotContactChange {
 
 interface HubspotJobPayload {
   changesByObjectId: Record<string, HubspotContactChange>;
+  /** contact.merge events (ENG-2465). Optional: jobs queued before this field existed lack it. */
+  merges?: Array<HubSpotContactMerge & { portalId: number }>;
 }
 
 /** Contact/deal sync, run either inline (same request, the common case) or later by
@@ -1674,6 +1713,39 @@ interface HubspotJobPayload {
  *  fast-follow, Greptile P1 — same fire-and-forget crash-loss risk the Calendly
  *  receiver had, since this handler acks HubSpot's webhook before this runs). */
 export async function processHubspotWebhookJob(payload: HubspotJobPayload): Promise<void> {
+  // ── contact.merge: re-point stored contact ids at the survivor ───────────
+  let mergeFailures = 0;
+  for (const merge of payload.merges ?? []) {
+    try {
+      const userId = await getUserIdByHubSpotPortalId(merge.portalId);
+      if (!userId) {
+        console.log(`[HubSpot Webhook] contact.merge: no user found for portal ${merge.portalId}`);
+        continue;
+      }
+      const lists = (await crmDb.getLeadListsByUserId(userId)) || [];
+      for (const list of lists) {
+        const cfgs = (list as any).externalCrmSyncConfigs as Record<string, any> | undefined;
+        if (String(cfgs?.hubspot?.accountId) !== String(merge.portalId)) continue;
+        const r = await repointMergedContactIds(list.listId, merge);
+        mergeFailures += r.lookupFailed;
+      }
+    } catch (err: any) {
+      mergeFailures++;
+      console.error(`[HubSpot Webhook] contact.merge handling failed for survivor ${merge.survivorId}: ${err?.message || err}`);
+    }
+  }
+
+  await processHubspotContactChanges(payload);
+
+  // A merge whose lookup or write failed throws AFTER the rest of the delivery is applied, so the
+  // durable queue retries the job (the repoint is idempotent; the contact changes are idempotent
+  // updates, as for any retry of this job). Attempts are capped by the queue.
+  if (mergeFailures > 0) {
+    throw new Error(`contact.merge: ${mergeFailures} stored contact id(s) could not be re-pointed`);
+  }
+}
+
+async function processHubspotContactChanges(payload: HubspotJobPayload): Promise<void> {
   // ── Process each contact / deal ─────────────────────────────────────────
   for (const [objectId, data] of Object.entries(payload.changesByObjectId)) {
         const userId = await getUserIdByHubSpotPortalId(data.portalId);
@@ -1876,9 +1948,19 @@ export async function processHubspotWebhookJob(payload: HubspotJobPayload): Prom
             if (!data.isCreation) continue;
             const newLead: any = { email: email.toLowerCase(), ...fields, syncMetadata: { hubspot_contact_id: objectId } };
             if (Object.keys(customFieldUpdates).length > 0) newLead.customFields = customFieldUpdates;
-            await crmDb.createLead(list.listId, newLead);
-            console.log(`[HubSpot Webhook] Created lead for ${email} in list ${list.listId}`);
-            continue;
+            try {
+              await crmDb.createLead(list.listId, newLead, 'integration');
+              console.log(`[HubSpot Webhook] Created lead for ${email} in list ${list.listId}`);
+              continue;
+            } catch (createErr: any) {
+              // The lookups above said "absent" but createLead's own email pre-check found the
+              // row (a concurrent create won). Throwing would abandon every remaining list and
+              // contact in this job; adopt the row and apply the event as an update below.
+              if (!createErr?.duplicateEmail || !createErr.existingLead) throw createErr;
+              lead = createErr.existingLead as Record<string, any>;
+              if (lead.email) delete fields.email;
+              console.log(`[HubSpot Webhook] Lead for ${email} already existed in list ${list.listId} (lost create race) — updating ${lead.leadId}`);
+            }
           }
 
           const updates: any = { ...fields };
@@ -1948,6 +2030,7 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
       // ── Aggregate events by objectId ────────────────────────────────────────
       const events: any[] = Array.isArray(parsedBody) ? parsedBody : [parsedBody];
       const changesByObjectId: Record<string, HubspotContactChange> = {};
+      const merges: Array<HubSpotContactMerge & { portalId: number }> = [];
 
       for (const event of events) {
         const eventType: string = event?.subscriptionType ?? 'unknown';
@@ -1957,6 +2040,12 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
         const propertyValue: string = event?.propertyValue ?? '';
 
         console.log(`[HubSpot Webhook] event=${eventType} portal=${portalId} object=${objectId}${propertyName ? ` property=${propertyName}` : ''}`);
+
+        const merge = parseHubSpotMergeEvent(event);
+        if (merge) {
+          merges.push({ ...merge, portalId });
+          continue;
+        }
 
         const isContactEvent = ['contact.creation', 'contact.propertyChange', 'contact.deletion'].includes(eventType);
         const isDealEvent = eventType === 'deal.propertyChange';
@@ -1979,7 +2068,7 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
       // a hash of the raw body is stable across a genuine redelivery of the exact
       // same payload and distinct for any payload with different actual content.
       const dedupeKey = crypto.createHash('sha256').update(rawBody).digest('hex');
-      const jobPayload: HubspotJobPayload = { changesByObjectId };
+      const jobPayload: HubspotJobPayload = merges.length > 0 ? { changesByObjectId, merges } : { changesByObjectId };
 
       // claimImmediately: this same request processes the job right below, so the
       // enqueue writes it straight in as 'processing' — no separate claim call, no

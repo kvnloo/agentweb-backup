@@ -96,6 +96,8 @@ describe('§G destinations — when it alerts', () => {
     const alert = alerts.find((a) => a.context['Alert Class'] === DESTINATION_ALERT_CLASS);
     expect(alert).toBeDefined();
     expect(alert.subject).toContain('acct1');
+    // ENG-2267: scoped to the account so intake files one canonical per account.
+    expect(alert.context['Alert Scope']).toBe('meta-ad-account:acct1');
     expect(alert.message).toContain('https://lander.test/lp');
     expect(alert.message).toContain('no Meta pixel in the served page');
     expect(alert.context['Reasons']).toBe('no_pixel');

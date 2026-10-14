@@ -18,6 +18,8 @@ import { paginatedQuery } from '../utils/dynamoPagination';
 import { TABLE_PREFIX } from '../config/constants';
 import { ChatbotDB, ChatSession } from '../services/chatbotService';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
+import { parseWithImagesQuery, applyWithImagesQuery } from '../utils/withImagesQuery';
+import { approvalDb } from '../services/approvalDb';
 import { MAX_FILE_SIZE } from '../config';
 import { isSupportedFileType, getContentType } from '../utils/fileProcessor';
 import { uploadFileToS3 } from '../utils/s3Utils';
@@ -2636,8 +2638,27 @@ router.get('/executions/with-images', authenticateToken, async (req: Request, re
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
+    // ENG-2386: optional favorites/approved/limit/cursor; no params = unchanged response.
+    const parsed = parseWithImagesQuery(req.query as Record<string, unknown>);
+    if (parsed && 'error' in parsed) {
+      return res.status(400).json({ message: parsed.error });
+    }
+
     const result = await getExecutionsWithAssets(userId, 'images', 'Error getting executions with images');
-    res.json(result);
+    if (!parsed) {
+      return res.json(result);
+    }
+
+    let approvalStatusByUrl: Record<string, string | undefined> = {};
+    if (parsed.approved) {
+      const approvals = await approvalDb.getApprovalsByUserId(userId);
+      approvalStatusByUrl = Object.fromEntries(approvals.map((a) => [a.assetUrl, a.status]));
+    }
+    const { tasks, nextCursor, total } = applyWithImagesQuery(result, parsed, approvalStatusByUrl);
+    // Paging metadata travels in headers so the body shape stays Record<taskId, task>.
+    res.setHeader('X-Total-Tasks', String(total));
+    if (nextCursor !== null) res.setHeader('X-Next-Cursor', String(nextCursor));
+    res.json(tasks);
   } catch (error) {
     console.error('Error getting executions with images:', error);
     res.status(500).json({ message: 'Internal server error' });

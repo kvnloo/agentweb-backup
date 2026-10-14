@@ -747,7 +747,11 @@ These checks prevent CI failures and ensure code quality. The `npm run typecheck
 - A new feature is its own commit
 - Unit tests are their own commit
 - User release notes updates are their own commit
-- Documentation changes (dev.md, CLAUDE.md) are their own commit
+- Documentation changes (dev.md fragments, CLAUDE.md) are their own commit
+
+**dev.md notes are fragments (ENG-809).** Never edit `dev.md` directly — CI rejects it. Write
+`dev/pending/<eng-id>-<slug>.md` whose first line is `## ENG-<n>: <title> (YYYY-MM-DD)`; after merge a
+workflow folds fragments into `dev.md` newest first. See `dev/pending/README.md`.
 
 For example, a PR that fixes a bug and adds a feature should have at minimum: one commit for the bug fix, one for the feature, one for tests, one for release notes, and one for any dev.md investigation notes — not a single commit bundling everything together.
 
@@ -818,7 +822,7 @@ When making changes, these files are critical to understand:
 
 3. **Documentation:**
    - `README.md` - Setup and features
-   - `dev.md` - Known issues, troubleshooting, database operations
+   - `dev.md` - Known issues, troubleshooting, database operations (add notes via `dev/pending/` fragments, ENG-809)
    - `design.md` - System architecture and security model
 
 ## Additional Notes

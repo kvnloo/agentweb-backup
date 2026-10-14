@@ -101,6 +101,32 @@ export function isWorkerShutdownError(error: unknown): boolean {
   return false;
 }
 
+/**
+ * ENG-2293 (Opslane finding on PR #3276): `require_parameters: true` means a
+ * single requested parameter unsupported by every eligible provider leaves no
+ * routable endpoint at all — OpenRouter's 404 reads literally "No endpoints
+ * found that can handle the requested parameters" (see
+ * openRouterRequestParams.ts, same failure class as ENG-199). That's a
+ * provider-routing condition, not an unknown server error, and deserves its
+ * own handled, user-readable outcome instead of falling through to a generic
+ * 500.
+ */
+export function isProviderNoEndpointsError(error: unknown): boolean {
+  if (!error) return false;
+  const e = error as any;
+  const text = [error instanceof Error ? error.message : String(error), e.originalMessage, e.originalError?.message]
+    .filter((part): part is string => typeof part === 'string')
+    .join(' ')
+    .toLowerCase();
+  // Primary signal: OpenRouter's own wording, case-insensitive and tolerant of
+  // "found"/"available". Fallback for a reworded message: a 404 whose text still
+  // names the unmet "requested parameters". A bare 404 deliberately does NOT
+  // match — that could be a wrong slug or URL, which must stay a loud 500.
+  if (/no (?:allowed )?endpoints? (?:found|available)/.test(text)) return true;
+  const is404 = e.status === 404 || e.code === 404 || e.originalError?.status === 404;
+  return is404 && text.includes('requested parameters');
+}
+
 const TRANSIENT_STATUS_CODES = [429, 500, 502, 503, 504];
 
 // Bedrock also returns ModelTimeoutException with a 500-class status — treat any
@@ -119,6 +145,10 @@ const TRANSIENT_MESSAGE_PATTERNS = [
   /econnreset/i,
   /etimedout/i,
   /socket hang up/i,
+  // ENG-2427: node-fetch/undici stream cut mid-body — "Invalid response body while
+  // trying to fetch <url>: Premature close". Same class as a socket hang up.
+  /premature close/i,
+  /invalid response body/i,
   /aborted.*timeout/i,
   /TimeoutError/i,
   /request aborted/i,
@@ -156,4 +186,16 @@ export function isTransientLLMError(error: unknown): boolean {
   if (typeof e?.code === 'string' && TRANSIENT_STRING_CODES.has(e.code)) return true;
 
   return TRANSIENT_MESSAGE_PATTERNS.some((pattern) => pattern.test(message) || pattern.test(originalMessage));
+}
+
+/**
+ * ENG-2381: user-facing message for a final upstream 5xx from the LLM provider.
+ * agentModeService wraps such errors with this message; the controller matches it
+ * via isProviderUnavailableError to answer 503 instead of an "Unknown Error" page.
+ */
+export const PROVIDER_UNAVAILABLE_USER_MESSAGE =
+  'The AI provider is temporarily unavailable. Please try again in a moment.';
+
+export function isProviderUnavailableError(error: unknown): boolean {
+  return error instanceof Error && error.message === PROVIDER_UNAVAILABLE_USER_MESSAGE;
 }

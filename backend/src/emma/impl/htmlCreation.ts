@@ -1185,21 +1185,29 @@ async function computeSafeTextRanges(html: string): Promise<Array<{ start: numbe
  * `createHtmlFromTemplate` (confirmed by a whole-backend grep), so it's a
  * local, non-exported helper here rather than a public export.
  */
-async function findTemplateById(templateId: string, userId: string): Promise<{ template: any | null, isPublic: boolean }> {
+async function findTemplateById(templateId: string, userId: string): Promise<{ template: any | null, isPublic: boolean, available: Array<{ template_id: string, template_name?: string }> }> {
   const { userTemplates, publicTemplates } = await getTemplatesForUser(userId);
+  // ENG-1888: on a miss the caller returns these so the model can self-correct
+  // instead of retrying an invalid id (the dominant prod failure class).
+  const available = [...userTemplates, ...publicTemplates]
+    .filter((t: any) => t && typeof t.template_id === 'string')
+    .slice(0, MAX_AVAILABLE_TEMPLATES_IN_ERROR)
+    .map((t: any) => ({ template_id: t.template_id, template_name: t.template_name }));
 
   const userMatch = userTemplates.find((t: any) => t.template_id === templateId);
   if (userMatch) {
-    return { template: userMatch, isPublic: false };
+    return { template: userMatch, isPublic: false, available };
   }
 
   const publicMatch = publicTemplates.find((t: any) => t.template_id === templateId);
   if (publicMatch) {
-    return { template: publicMatch, isPublic: true };
+    return { template: publicMatch, isPublic: true, available };
   }
 
-  return { template: null, isPublic: false };
+  return { template: null, isPublic: false, available };
 }
+
+const MAX_AVAILABLE_TEMPLATES_IN_ERROR = 25;
 
 /**
  * ENG-46: structured, greppable, observability-only signal for a model
@@ -1322,12 +1330,17 @@ export async function createHtmlFromTemplate(
   ): Promise<any> {
     try {
       // Get the template from user or public store
-      const { template } = await findTemplateById(templateId, userId);
+      const { template, available } = await findTemplateById(templateId, userId);
 
       if (!template) {
+        // ENG-1888: structured, actionable not_found instead of a bare message.
         return {
           success: false,
-          message: `Template '${templateId}' not found`
+          errorClass: 'not_found',
+          error_code: 'TEMPLATE_NOT_FOUND',
+          missing_template_id: templateId,
+          available_templates: available,
+          message: `Template '${templateId}' not found. Call list_html_templates and retry with one of the available template_id values${available.length ? ` (e.g. ${available.slice(0, 5).map((t) => t.template_id).join(', ')})` : '; no templates are available for this user'}.`
         };
       }
 
@@ -1335,7 +1348,11 @@ export async function createHtmlFromTemplate(
       if (!template.html_content || !template.subject) {
         return {
           success: false,
-          message: 'Invalid template structure: missing html_content or subject'
+          // ENG-1888: a stored template with no body/subject is a template
+          // configuration defect, not a tool bug — the caller must pick another template.
+          errorClass: 'not_found',
+          error_code: 'TEMPLATE_INVALID',
+          message: `Invalid template structure: missing html_content or subject (template '${templateId}'). Call list_html_templates and choose a different template_id.`
         };
       }
       if (!llmModel) {
@@ -1410,6 +1427,9 @@ export async function createHtmlFromTemplate(
       if (validationErrors.length > 0) {
         return {
           success: false,
+          // ENG-1888: caller-supplied variables did not match the template — an
+          // argument error the model fixes by retrying, never a tool bug.
+          errorClass: 'invalid_args',
           message: validationErrors.join('; '),
           errors: validationErrors,
           template_variables: templateVariables,
@@ -1666,12 +1686,21 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         } else if (error.message.includes('LLM returned invalid JSON')) {
           return {
             success: false,
+            errorClass: 'invalid_output',
             message: 'Failed to parse LLM response',
+            error: error.message
+          };
+        } else if (error.message.includes('LLM did not return substitution result')) {
+          return {
+            success: false,
+            errorClass: 'invalid_output',
+            message: 'LLM returned empty substitution result',
             error: error.message
           };
         } else if (error.message.includes('missing final_html or final_subject')) {
           return {
             success: false,
+            errorClass: 'invalid_output',
             message: 'LLM response missing final_html',
             error: error.message
           };

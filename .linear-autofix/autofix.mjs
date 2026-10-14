@@ -319,7 +319,7 @@ async function main() {
     const gateSummary = [
       review ? `Code review: ${review.manager?.verdict === 'needs_rework' ? '⚠️ needs rework' : '✅ sound'}${review.manager?.confirmed?.length ? ` — ${review.manager.confirmed.length} finding(s) fixed` : ''}` : null,
       checks.length ? `Deterministic checks: ${checksAllPass ? '✅ all passed' : '❌ FAILED — ' + checks.filter((c) => c.result !== 'pass').map((c) => c.cmd).join('; ')}` : null,
-      verify ? `Browser verify: ${verify.verdict === 'verified' ? '✅ verified' : verify.verdict === 'not_fixed' ? '❌ not fixed' : verify.verdict === 'env_down' ? '⚠️ environment down (not verified)' : '❓ inconclusive'}` : null,
+      verifyGateLine(verify, id),
     ].filter(Boolean).join('\n');
     const prBody = `${marker.prBody || marker.summary || ''}\n\n---\n**Automated gates**\n${gateSummary || '(none run)'}\n\nFixes ${id} — ${issue.url || ''}`;
     const prs = openPrs(changed, prTitle, prBody);
@@ -594,6 +594,19 @@ export function runChecks(WT, changed) {
 //   rework — a gate says the fix is wrong (manager needs_rework, browser not_fixed, failed check)
 //   green  — every enabled gate is green AND the fix was verified in a REAL browser
 //   manual — everything else (verify inconclusive / env_down / api-only / review errored)
+// ENG-1324: an env_down verdict must always carry its path back to automated verification —
+// the exact --verify-only rerun — instead of silently leaving the fix at "needs manual test".
+export function envDownRecovery(id) {
+  return `The per-bug preview environment failed to start (see .linear-autofix/preview/logs/${id.toLowerCase()}-*.log), so automated browser verification was skipped. `
+    + `Recover automated proof once the environment is healthy: \`node .linear-autofix/autofix.mjs ${id} --verify-only\`.`;
+}
+
+export function verifyGateLine(verify, id) {
+  if (!verify) return null;
+  if (verify.verdict === 'env_down') return `Browser verify: ⚠️ environment down (not verified) — rerun \`node .linear-autofix/autofix.mjs ${id} --verify-only\``;
+  return `Browser verify: ${verify.verdict === 'verified' ? '✅ verified' : verify.verdict === 'not_fixed' ? '❌ not fixed' : '❓ inconclusive'}`;
+}
+
 export function computeTriage({ review, verify, checks, reviewEnabled }) {
   const checksFailed = (checks || []).some((c) => c.result === 'fail');
   const managerVerdict = review?.manager?.verdict;
@@ -828,7 +841,7 @@ async function runVerify(issue, WT) {
       tearDown(); // don't leave dead processes registered in routes/preview-state
       return {
         verdict: 'env_down', method: '', scenario: '',
-        summary: `The per-bug preview environment failed to start (see .linear-autofix/preview/logs/${id.toLowerCase()}-*.log), so automated browser verification was skipped.`,
+        summary: envDownRecovery(id),
         screenshots: [], urls,
       };
     }
