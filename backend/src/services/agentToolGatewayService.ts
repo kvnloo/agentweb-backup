@@ -983,6 +983,12 @@ export function validateAndRepairToolArgs(
   // scalar type so the call succeeds instead of bouncing back to the model.
   for (const [name, propSchema] of Object.entries(properties)) {
     if (repairedArgs[name] === undefined || repairedArgs[name] === null) continue;
+    const idString = coerceIdIntegerToString(name, repairedArgs[name], propSchema);
+    if (idString.changed) {
+      repairedArgs[name] = idString.value;
+      repairs.push(`${name}:scalar_coerce`);
+      continue;
+    }
     const coerced = coerceScalarForSchema(repairedArgs[name], propSchema);
     if (coerced.changed) {
       repairedArgs[name] = coerced.value;
@@ -1416,6 +1422,27 @@ function validateJsonSchemaType(name: string, value: unknown, schema: any): Agen
     path: `$.${name}`,
     message: `Argument "${name}" has the wrong type. Expected ${expectedTypes.join(' or ')}.`,
   };
+}
+
+/**
+ * Lossless integer -> string repair for identifier fields (ENG-2472). Models emit
+ * IDs as bare integers (live repro: call_hubspot_api `list_id: 17`) where the
+ * schema declares `string`, and then retry the same shape until the run is
+ * classified degraded. Deliberately narrow so a genuinely wrong primitive still
+ * surfaces as type_mismatch: only id-named fields (`id`, `*_id`, `*Id`), only
+ * safe integers, only when `string` is the sole accepted type, and — because
+ * enum is not validated downstream — only when any declared enum contains the
+ * coerced value.
+ */
+function coerceIdIntegerToString(name: string, value: unknown, schema: any): { changed: boolean; value: unknown } {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) return { changed: false, value };
+  if (!/(^id$|_id$|[a-z]Id$)/.test(name)) return { changed: false, value };
+  const expected = schema?.type;
+  const expectedTypes = Array.isArray(expected) ? expected : [expected];
+  if (expectedTypes.length !== 1 || expectedTypes[0] !== 'string') return { changed: false, value };
+  const coerced = String(value);
+  if (Array.isArray(schema?.enum) && !schema.enum.includes(coerced)) return { changed: false, value };
+  return { changed: true, value: coerced };
 }
 
 /**
