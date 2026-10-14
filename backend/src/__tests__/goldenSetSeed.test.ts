@@ -1,4 +1,4 @@
-import { buildSeedCases, parseFpCatalogue, resolveSessionRef, type SeedInputs } from '../loops/eval/goldenSetSeed';
+import { buildSeedCases, parseFpCatalogue, resolveSessionRef, type SeedInputs, type SeedUserRow } from '../loops/eval/goldenSetSeed';
 
 const NOW = new Date('2026-09-25T00:00:00.000Z');
 
@@ -235,5 +235,62 @@ describe('gated creative candidates (ENG-2226)', () => {
     const out = buildSeedCases(inputs({ candidates, gatedCreatives: true, targets: { creative: 10 } })).cases.filter((c) => c.surface === 'creative');
     expect(out.map((c) => c.sourceRef.id).sort()).toEqual(['both', 'only-gated']);
     expect(out.find((c) => c.sourceRef.id === 'both')?.seedSource).toBe('human_eval_reviewer_feedback');
+  });
+});
+
+describe('account_health pool (ENG-2135)', () => {
+  const user = (userId: string, subscriptionStatus: string, extra: { hasAdPlatform?: boolean } = {}): SeedUserRow => ({ userId, subscriptionStatus, ...extra });
+  const accountCases = (r: ReturnType<typeof buildSeedCases>) => r.cases.filter((c) => c.surface === 'account_health');
+
+  it('never selects tombstoned (deleted_) or evaluation (eval_) accounts, in either mode', () => {
+    const users = [
+      ...Array.from({ length: 20 }, (_, i) => user(`u-${i}`, i % 2 ? 'active' : 'canceled')),
+      user('deleted_a', 'active'), user('deleted_b', 'canceled'), user('eval_x', 'active'), user('eval_y', 'canceled'),
+    ];
+    for (const adConnectedAccounts of [false, true]) {
+      const ids = accountCases(buildSeedCases(inputs({ users, adConnectedAccounts, targets: { account_health: 30 } }))).map((c) => c.sourceRef.id);
+      expect(ids).toHaveLength(20);
+      expect(ids.some((id) => id.startsWith('deleted_') || id.startsWith('eval_'))).toBe(false);
+    }
+  });
+
+  it('opt-in: every ad-connected account comes first, the rest fill with the balanced subscription sample', () => {
+    const users = [
+      ...Array.from({ length: 6 }, (_, i) => user(`ad-${i}`, i % 2 ? 'active' : 'canceled', { hasAdPlatform: true })),
+      user('ad-nosub', '', { hasAdPlatform: true }),
+      ...Array.from({ length: 30 }, (_, i) => user(`n-${i}`, i % 2 ? 'active' : 'canceled')),
+    ];
+    const out = accountCases(buildSeedCases(inputs({ users, adConnectedAccounts: true, targets: { account_health: 20 } })));
+    expect(out).toHaveLength(20);
+    const ad = out.filter((c) => c.taskType === 'ad_connected');
+    expect(ad.map((c) => c.sourceRef.id).sort()).toEqual(['ad-0', 'ad-1', 'ad-2', 'ad-3', 'ad-4', 'ad-5', 'ad-nosub']);
+    expect(ad.every((c) => c.seedSource === 'ad_platform_connected')).toBe(true);
+    expect(out.filter((c) => c.taskType.startsWith('subscription_'))).toHaveLength(13);
+    // no account appears twice
+    expect(new Set(out.map((c) => c.sourceRef.id)).size).toBe(20);
+  });
+
+  it('off by default: ad-connected accounts get no priority, and the default selection is unchanged', () => {
+    const users = [
+      ...Array.from({ length: 5 }, (_, i) => user(`ad-${i}`, 'active', { hasAdPlatform: true })),
+      ...Array.from({ length: 40 }, (_, i) => user(`n-${i}`, i % 2 ? 'active' : 'canceled')),
+    ];
+    const plain = accountCases(buildSeedCases(inputs({ users })));
+    expect(plain.some((c) => c.taskType === 'ad_connected')).toBe(false);
+    expect(plain).toHaveLength(30);
+  });
+
+  it('a larger target only appends (prefix property) and an empty ad-connected set equals the plain sample', () => {
+    const users = [
+      ...Array.from({ length: 4 }, (_, i) => user(`ad-${i}`, 'active', { hasAdPlatform: true })),
+      ...Array.from({ length: 80 }, (_, i) => user(`n-${i}`, i % 2 ? 'active' : 'canceled')),
+    ];
+    const a = accountCases(buildSeedCases(inputs({ users, adConnectedAccounts: true, targets: { account_health: 20 } }))).map((c) => c.caseId);
+    const b = accountCases(buildSeedCases(inputs({ users, adConnectedAccounts: true, targets: { account_health: 40 } }))).map((c) => c.caseId);
+    expect(b.slice(0, 4).sort()).toEqual(a.slice(0, 4).sort());
+    expect(a.every((id) => b.includes(id))).toBe(true);
+    const none = users.filter((u) => !u.hasAdPlatform);
+    expect(accountCases(buildSeedCases(inputs({ users: none, adConnectedAccounts: true }))).map((c) => c.caseId))
+      .toEqual(accountCases(buildSeedCases(inputs({ users: none }))).map((c) => c.caseId));
   });
 });

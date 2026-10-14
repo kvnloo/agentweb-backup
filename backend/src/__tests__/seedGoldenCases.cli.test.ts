@@ -36,3 +36,10 @@ describe('seedGoldenCases --gated-creatives (ENG-2226)', () => {
     expect(parseArgs(['--gated-creatives', '--target-creative', '80'])).toEqual({ write: false, gatedCreatives: true, targets: { creative: 80 } });
   });
 });
+
+describe('seedGoldenCases --ad-connected-accounts (ENG-2135)', () => {
+  it('is off unless passed, and parses alongside the other flags', () => {
+    expect(parseArgs([]).adConnectedAccounts).toBeUndefined();
+    expect(parseArgs(['--ad-connected-accounts', '--target-account-health', '50'])).toEqual({ write: false, adConnectedAccounts: true, targets: { account_health: 50 } });
+  });
+});
