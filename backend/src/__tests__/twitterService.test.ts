@@ -715,6 +715,18 @@ describe('TwitterService.searchTweets', () => {
     await expect(twitterService.searchTweets(OWNER, ACCOUNT_ID, 'min_faves:50 filter:safe')).rejects.toThrow(/no searchable terms/);
     expect(mockSearch).not.toHaveBeenCalled();
   });
+
+  it('keeps operator-like text inside quoted phrases literal', async () => {
+    mockSearch.mockResolvedValue({ data: { data: [{ id: 'a', public_metrics: { like_count: 0 } }] } });
+    const res = await twitterService.searchTweets(OWNER, ACCOUNT_ID, '"min_faves:10 filter:links" agents');
+    expect(mockSearch).toHaveBeenCalledWith('"min_faves:10 filter:links" agents', expect.anything());
+    expect(res.map((t: any) => t.id)).toEqual(['a']);
+  });
+
+  it('rejects a query whose OR lost an operand to translation', async () => {
+    await expect(twitterService.searchTweets(OWNER, ACCOUNT_ID, 'cats OR (filter:safe)')).rejects.toThrow(/incomplete/);
+    expect(mockSearch).not.toHaveBeenCalled();
+  });
 });
 
 // ─── getUserTweets max_results clamping ────────────────────────────────────────
