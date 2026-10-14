@@ -203,3 +203,33 @@ describe('API-key-only writes never touch a Claude login', () => {
     expect(await db.recordCheck('key-1', { result: 'ok', status: 'active', ok: true }, ISO(NOW))).toBe(true);
   });
 });
+
+describe('expressions are valid for real DynamoDB (the in-memory double cannot check this)', () => {
+  // `subType` is a DynamoDB reserved word: bare use failed on the real service (found by the ENG-2110 live test).
+  it('references every Claude-login attribute through an alias, and defines every alias it uses', async () => {
+    const { db } = makeDb();
+    const seen: Array<{ UpdateExpression: string; ConditionExpression: string; ExpressionAttributeNames?: Record<string, string> }> = [];
+    const client = (db as any).client;
+    const realUpdate = client.update.bind(client);
+    client.update = (params: any) => { seen.push(params); return realUpdate(params); };
+    await db.create(sub());
+    await db.acquireSubLease('sub-1', 'A', NOW, 90_000);
+    await db.extendSubLease('sub-1', 'A', NOW, 90_000);
+    await db.saveSubCredentials('sub-1', { owner: 'A', expectedVersion: 1, sealed: SEAL('1'), health: HEALTH, nowIso: ISO(NOW), contentHash: 'h' });
+    await db.replaceSubCredentials('sub-1', { expectedVersion: 2, sealed: SEAL('2'), health: HEALTH, nowMs: NOW + 1e9, nowIso: ISO(NOW), contentHash: 'h' });
+    await db.markSubNeedsReconnect('sub-1', 3, 'x', ISO(NOW));
+    await db.markSubExpired('sub-1', NOW, ISO(NOW));
+    await db.releaseSubLease('sub-1', 'A');
+    expect(seen.length).toBeGreaterThanOrEqual(7);
+    for (const p of seen) {
+      for (const expr of [p.UpdateExpression, p.ConditionExpression]) {
+        expect(expr.replace(/#\w+|:\w+/g, '')).not.toMatch(/\b(sub[A-Z]\w*|sealed)\b/); // nothing bare
+        for (const alias of expr.match(/#\w+/g) ?? []) expect(p.ExpressionAttributeNames).toHaveProperty([alias]); // nothing undefined
+      }
+      for (const alias of Object.keys(p.ExpressionAttributeNames ?? {})) {
+        expect(`${p.UpdateExpression} ${p.ConditionExpression}`).toContain(alias); // nothing unused: DynamoDB rejects unused names
+      }
+    }
+  });
+});
+

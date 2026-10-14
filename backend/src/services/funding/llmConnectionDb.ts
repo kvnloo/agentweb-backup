@@ -486,14 +486,25 @@ export class LlmConnectionDb {
     connectionId: string,
     u: { update: string; condition: string; names?: Record<string, string>; values?: Record<string, unknown> },
   ): Promise<boolean> {
+    // Every attribute of a Claude login is referenced through an alias. DynamoDB's reserved-word list is long
+    // and not obvious (`subType` is on it: found by the live test, which the in-memory test double cannot catch),
+    // so no attribute is ever written bare in these expressions.
+    const names: Record<string, string> = { ...(u.names ?? {}) };
+    const alias = (expression: string) =>
+      expression.replace(/(?<![#:\w])(sub[A-Z]\w*|sealed)\b/g, (_m, attr: string) => {
+        names[`#a_${attr}`] = attr;
+        return `#a_${attr}`;
+      });
+    const update = alias(u.update);
+    const condition = alias(u.condition);
     try {
       await this.client
         .update({
           TableName: LLM_CONNECTIONS_TABLE,
           Key: { connectionId },
-          UpdateExpression: u.update,
-          ConditionExpression: u.condition,
-          ...(u.names ? { ExpressionAttributeNames: u.names } : {}),
+          UpdateExpression: update,
+          ConditionExpression: condition,
+          ...(Object.keys(names).length ? { ExpressionAttributeNames: names } : {}),
           ...(u.values ? { ExpressionAttributeValues: u.values } : {}),
         })
         .promise();
