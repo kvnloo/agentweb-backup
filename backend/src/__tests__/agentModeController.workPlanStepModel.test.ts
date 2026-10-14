@@ -52,6 +52,7 @@ jest.mock('../services/agentModeService', () => ({
         : { model: 'gpt-5-chat-2', fellBack: true, requestedModel: model };
     }),
     isLiveModel: jest.fn(() => false),
+    isModelSelectableBy: jest.fn(() => true),
     getModelDisplayName: jest.fn((id: string) => (id === 'retired-named-1' ? 'Retired Named' : undefined)),
     generateSessionTitle: jest.fn().mockResolvedValue('Test Title'),
     getMarketingSystemPrompt: jest.fn().mockResolvedValue('System prompt'),
@@ -586,5 +587,88 @@ describe('round 2: standing pick, restore retry, pause idempotence', () => {
     expect(await run(tail(2, RETIRED))).toBe(0);            // same step + model: no duplicate
     expect(await run(tail(2, 'some-other-retired'))).toBe(1); // same step, different model: new pause
     expect(await run(tail(3, RETIRED))).toBe(1);             // different step: new pause
+  });
+});
+
+// ---- round 3: the picker PATCHes the stamp BEFORE /generate, so the request model equals the stamp ---------------------
+describe('picker flow: PATCH /llm-model then /generate echoing the stamp', () => {
+  let store: any;
+  const mkStore = (wp: any, stamp: string) => {
+    store = makeSession(wp, stamp);
+    db.getChatSession.mockImplementation(async () => JSON.parse(JSON.stringify(store)));
+    db.getChatSessionRecord.mockImplementation(async () => JSON.parse(JSON.stringify(store)));
+    db.updateSessionLlmModel.mockImplementation(async (_id: string, m: string) => { store.llmModel = m; return store; });
+    db.updateSessionWorkPlan.mockImplementation(async (_id: string, w: any) => { store.workPlan = w; return store; });
+  };
+  const patchPick = async (m: string) => {
+    const r = makeRes();
+    await (agentModeController as any).updateSessionLlmModel({ params: { sessionId: SESSION_ID }, body: { llmModel: m }, user: { userId: OWNER, isAdmin: false } }, r);
+    expect(r.statusCode).toBe(200);
+  };
+  const base = { launchModel: 'gemini-3.5-flash', planDefaultModel: 'gpt-5-chat-2' };
+
+  it.each([
+    ['with the engine marker on the retired step model', { engineModel: RETIRED }, RETIRED],
+    ['without a marker (nothing stamped yet)', {}, 'gpt-5-chat-2'],
+  ])('P1: a plan paused on a retired step model resumes via the picker, %s', async (_n, extra, stamp) => {
+    mkStore({ steps: [step(1, 'pending', RETIRED), step(2, 'pending')], ...base, ...extra }, stamp);
+    await patchPick('claude-step-model');
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq('claude-step-model'), res);
+    expect(workerModels()).toEqual(['claude-step-model']);
+    expect(store.workPlan.steps[0].model).toBe('claude-step-model'); // the step adopted the pick
+    expect(store.workPlan.engineModel).toBe('claude-step-model');   // ...and the stamp is the engine's own from here on
+    expect(mockAlert).not.toHaveBeenCalled();
+    // next turn: no pause, still the same model, no restamp churn
+    await agentModeController.generateResponse(generateReq('claude-step-model'), makeRes());
+    expect(workerModels()).toEqual(['claude-step-model', 'claude-step-model']);
+    expect(db.addMessageToSession.mock.calls.some((c) => (c[1] as any).metadata?.kind === 'work-plan-step-model-unavailable')).toBe(false);
+  });
+
+  it('P1: without any pick the same plan stays paused', async () => {
+    mkStore({ steps: [step(1, 'pending', RETIRED), step(2, 'pending')], ...base, engineModel: RETIRED }, RETIRED);
+    await agentModeController.generateResponse(generateReq(RETIRED), makeRes());
+    // the request model equals the stamp equals the marker: nothing is a pick (the preflight accepts the stored id for a non-explicit stamp)
+    expect(worker.runInWorker).not.toHaveBeenCalled();
+  });
+
+  it('P2: an AVAILABLE step model still wins over a PATCHed pick', async () => {
+    mkStore({ steps: [step(1, 'pending', 'gpt-5.5')], ...base, engineModel: 'gpt-5.5' }, 'gpt-5.5');
+    await patchPick('claude-step-model');
+    await agentModeController.generateResponse(generateReq('claude-step-model'), makeRes());
+    expect(workerModels()).toEqual(['gpt-5.5']);
+    expect(store.llmModel).toBe('gpt-5.5');
+    expect(store.workPlan.engineModel).toBe('gpt-5.5');
+  });
+
+  it.each([
+    ['marker present', { engineModel: 'gpt-5-chat-2' }, 'gpt-5-chat-2'],
+    ['no marker yet (the plan\'s first step)', {}, 'gpt-5-chat-2'],
+  ])('P3: a pick on a model-less step is the model used, now and on the next turn, %s', async (_n, extra, stamp) => {
+    mkStore({ steps: [step(1, 'pending'), step(2, 'pending', 'gpt-5.5')], ...base, ...extra }, stamp);
+    await patchPick('claude-step-model');
+    await agentModeController.generateResponse(generateReq('claude-step-model'), makeRes());
+    await agentModeController.generateResponse(generateReq('claude-step-model'), makeRes());
+    expect(workerModels()).toEqual(['claude-step-model', 'claude-step-model']);
+    expect(store.llmModel).toBe('claude-step-model');
+    expect(store.workPlan.engineModel).not.toBe('claude-step-model'); // the pick stays distinguishable from engine stamps
+  });
+
+  it('P3: with no pick, the model-less first step runs on the plan default', async () => {
+    mkStore({ steps: [step(1, 'pending'), step(2, 'pending', 'gpt-5.5')], ...base }, 'gpt-5-chat-2');
+    await agentModeController.generateResponse(generateReq('gpt-5-chat-2'), makeRes());
+    expect(workerModels()).toEqual(['gpt-5-chat-2']);
+  });
+
+  it('continuation uses the same rule: a standing pick is honoured by the automatic round too', async () => {
+    mkStore({ autocomplete: true, steps: [step(1, 'pending'), step(2, 'pending', 'gpt-5.5')], ...base, engineModel: 'gpt-5-chat-2' }, 'gpt-5-chat-2');
+    await patchPick('claude-step-model');
+    worker.runInWorker
+      .mockResolvedValueOnce(workerResult('thinking', []) as any)
+      .mockImplementationOnce(async () => { store.workPlan = { ...store.workPlan, steps: [step(1, 'completed'), step(2, 'completed', 'gpt-5.5')] }; return workerResult('done', []) as any; });
+    await agentModeController.generateResponse(generateReq('claude-step-model'), makeRes());
+    await flush();
+    expect(workerModels()[0]).toBe('claude-step-model');
+    expect(workerModels()[1]).toBe('claude-step-model');
   });
 });

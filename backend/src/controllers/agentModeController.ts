@@ -1924,8 +1924,14 @@ async function resolveWorkPlanStepModelForTurn(
   // A step without a model follows "plan default, then the model the session had before the plan" (never the previous
   // step's model); a user's pick on such a step wins, and keeps winning: a stored model that is not the one the engine
   // last stamped is a standing pick by the user (the same marker the end-of-plan restore uses).
-  const standingPick = plan.engineModel && session.llmModel && session.llmModel !== plan.engineModel ? session.llmModel : undefined;
-  const userPick = ownModel ? undefined : (options.explicitPick || standingPick);
+  // The picker PATCHes session.llmModel on every pick, so by the time /generate arrives the request model EQUALS the
+  // stamp and `explicitPick` is empty: whatever the stored stamp is, if it is not what the engine itself last stamped
+  // (before its first stamp: the model the plan was launched on), it is the user's pick.
+  const engineStamp = plan.engineModel
+    || (plan.steps.every((x: any) => !x?.status || x.status === 'pending') ? (plan.planDefaultModel || plan.launchModel) : undefined);
+  const standingPick = engineStamp && session.llmModel && session.llmModel !== engineStamp ? session.llmModel : undefined;
+  const pick = options.explicitPick || standingPick;
+  const userPick = ownModel ? undefined : pick;
   const candidate = ownModel ?? (userPick || fallbackModel);
   if (!candidate) return { kind: 'none' };
   try {
@@ -1935,9 +1941,10 @@ async function resolveWorkPlanStepModelForTurn(
     };
   } catch (modelError) {
     if (!isModelUnavailableError(modelError)) throw modelError;
-    if (options.explicitPick && candidate !== options.explicitPick) {
-      // The plan's model is gone but the user chose another one for this request: it runs, and the step adopts it.
-      const decision = await resolveHonored(options.explicitPick, stepCount);
+    if (pick && candidate !== pick) {
+      // The plan's model is gone but the user chose another one: it runs, and the step adopts it (the engine marker then
+      // follows the new step model, so the stamp is the engine's own from here on).
+      const decision = await resolveHonored(pick, stepCount);
       return { kind: 'resolved', stepCount, decision, ...(ownModel && { updateStepModelTo: decision.effectiveModel }) };
     }
     const display = typeof agentModeService.getModelDisplayName === 'function'
