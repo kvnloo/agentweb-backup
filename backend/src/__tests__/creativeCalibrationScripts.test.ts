@@ -59,6 +59,26 @@ describe('creativeCalibrationReport', () => {
     expect(labelled.map((l) => l.human)).toEqual(['A', 'tie']);
   });
 
+  it('leaves AI-written choices out by default and counts them only with --include-ai-labels (ENG-2135)', () => {
+    const ai = { ...pairCase('ai1', '2026-W39', 'B'), notes: '[AI-LABEL] Written by Claude on behalf of the owner. Not an independent human review.' };
+    const cases = [pairCase('h1', '2026-W39', 'A'), ai, pairCase('h2', '2026-W39', 'tie')];
+    const byDefault = labelledPairs(cases, ['2026-W39']);
+    expect(byDefault.labelled.map((l) => l.human)).toEqual(['A', 'tie']);
+    expect(byDefault.aiLabelled).toBe(1);
+    const included = labelledPairs(cases, ['2026-W39'], true);
+    expect(included.labelled.map((l) => l.human)).toEqual(['A', 'B', 'tie']);
+    expect(included.aiLabelled).toBe(1);
+    expect(parseReportArgs(['--batch', '2026-W39'])).toMatchObject({ includeAiLabels: false });
+    expect(parseReportArgs(['--batch', '2026-W39', '--include-ai-labels'])).toMatchObject({ includeAiLabels: true });
+  });
+
+  it('says how many AI-written choices were left out or included, and that included ones are not human agreement', () => {
+    const base = { batches: ['2026-W39'], inBatch: 3, humanChoices: ['A' as const], judgeErrors: 0, agreement: null };
+    expect(formatCalibrationReport({ ...base, aiLabelled: { count: 2, included: false } })).toContain('2 AI-written choice(s) left out');
+    expect(formatCalibrationReport({ ...base, aiLabelled: { count: 2, included: true } })).toContain('ADVISORY, not human agreement');
+    expect(formatCalibrationReport({ ...base, aiLabelled: { count: 0, included: false } })).not.toContain('AI-written');
+  });
+
   it('prints n, agreement with its CI, kappa and win rates — and no ids', () => {
     const rows = [
       { human: 'A' as const, judge: 'A' as const },

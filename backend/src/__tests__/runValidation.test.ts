@@ -102,6 +102,67 @@ describe('validation runner math (ENG-2135)', () => {
     expect(isQualifyingValidation(withEvidence.validation ?? undefined)).toBe(true);
   });
 
+  describe('AI-written labels (ENG-2135)', () => {
+    const AI_NOTE = '[AI-LABEL] Written by Claude on behalf of the owner. Not an independent human review.';
+    const aiGrader = (predictions: Map<string, GraderPrediction>): GoldenCaseGrader => ({
+      graderId: 'session-judge-general',
+      surface: 'agent',
+      criteria: ['task_success'],
+      primaryCriterion: 'task_success',
+      grade: async (c) => predictions.get(c.caseId) ?? {},
+    });
+
+    it('leaves AI-written labels out by default, so agreement and the registry record rest on human labels only', async () => {
+      const { cases, predictions } = fixture(); // 40 human-labelled cases, kappa 0.7
+      const aiCases = Array.from({ length: 10 }, (_, i) => ({ ...labelled(`ai${i}`, 'pass'), notes: AI_NOTE }));
+      // The grader disagrees with every AI label, so counting them would lower kappa.
+      const aiPredictions = new Map(aiCases.map((c) => [c.caseId, { task_success: 'fail' as LabelValue }]));
+      const run = await runValidation({
+        graderId: 'session-judge-general',
+        store: storeOf([...cases, ...aiCases]),
+        graders: [aiGrader(new Map([...predictions, ...aiPredictions]))],
+        now: NOW,
+        bootstrap: { iterations: 100 },
+      });
+      expect(run).toMatchObject({ cases: 40, aiLabelledCases: 10, labelSource: 'human' });
+      expect(run.criteria[0].report?.n).toBe(40);
+      expect(run.validation).toEqual({ kappa: expect.closeTo(0.7, 10), n: 40, date: '2026-09-25', evidence: 'unpublished' });
+    });
+
+    it('counts them only on request, and then withholds the registry record: an advisory run is never evidence', async () => {
+      const { cases, predictions } = fixture();
+      const aiCases = Array.from({ length: 10 }, (_, i) => ({ ...labelled(`ai${i}`, 'pass'), notes: AI_NOTE }));
+      const aiPredictions = new Map(aiCases.map((c) => [c.caseId, { task_success: 'fail' as LabelValue }]));
+      const run = await runValidation({
+        graderId: 'session-judge-general',
+        store: storeOf([...cases, ...aiCases]),
+        graders: [aiGrader(new Map([...predictions, ...aiPredictions]))],
+        includeAiLabels: true,
+        evidence: 'https://linear.app/x',
+        now: NOW,
+        bootstrap: { iterations: 100 },
+      });
+      expect(run).toMatchObject({ cases: 50, aiLabelledCases: 10, labelSource: 'human+ai' });
+      expect(run.criteria[0].report?.n).toBe(50);
+      expect(run.validation).toBeNull();
+      expect(isQualifyingValidation(run.validation ?? undefined)).toBe(false);
+    });
+
+    it('stays a human run when the flag is set but the split holds no AI-written label', async () => {
+      const { cases, predictions } = fixture();
+      const run = await runValidation({
+        graderId: 'session-judge-general',
+        store: storeOf(cases),
+        graders: [aiGrader(predictions)],
+        includeAiLabels: true,
+        now: NOW,
+        bootstrap: { iterations: 100 },
+      });
+      expect(run).toMatchObject({ aiLabelledCases: 0, labelSource: 'human' });
+      expect(run.validation).not.toBeNull();
+    });
+  });
+
   it('counts a grader that throws on a case as an error and an abstention', async () => {
     const { cases, predictions } = fixture();
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
