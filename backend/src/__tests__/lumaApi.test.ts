@@ -239,12 +239,19 @@ describe('LumaApiService — events and the page ceiling', () => {
 });
 
 describe('luma tools', () => {
-  it('say so, with the fallback, when no key is connected', async () => {
+  it('treat "no key" as a normal, non-error result that tells the model to carry on with the browser', async () => {
     mockGetAccounts.mockResolvedValue([]);
-    const r: any = await tool('luma_get_guests')({ event: 'evt-1' }, { userId: 'user-1' });
-    expect(r.success).toBe(false);
-    expect(r.message).toMatch(/No Luma API key is connected/);
-    expect(r.message).toMatch(/fall back/i);
+    for (const name of ['luma_get_guests', 'luma_list_events']) {
+      const r: any = await tool(name)({ event: 'evt-1' }, { userId: 'user-1' });
+      expect(r.success).toBe(true); // not a red "failed" card, not counted as a failed call
+      expect(r.connected).toBe(false);
+      expect(r.reason).toBe('no_key');
+      expect(r.guests).toBeUndefined();
+      expect(r.message).toMatch(/No Luma API key is connected/);
+      expect(r.message).toMatch(/NOT an error/);
+      expect(r.message).toMatch(/continue the task now with the browser/);
+      expect(r.message).toContain('[Settings → Login Credentials](/settings/login-credentials)');
+    }
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -378,15 +385,29 @@ describe('luma tools', () => {
     expect(r.message).toContain('cal-2');
   });
 
-  it('flags a rejected key as needing reconnect and points at the fallback', async () => {
+  it('flags a key as dead only after an independent call ALSO gets a 401, then reports it as a normal unavailable state', async () => {
     mockGetAccounts.mockResolvedValue([lumaAccount()]);
-    fetchMock.mockResolvedValueOnce(jsonResponse({}, { status: 401 }));
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, { status: 401 })).mockResolvedValueOnce(jsonResponse({}, { status: 401 }));
 
     const r: any = await tool('luma_get_guests')({ event: 'evt-1' }, { userId: 'user-1' });
 
-    expect(r.success).toBe(false);
     expect(mockUpdateAccountConfig).toHaveBeenCalledWith('owner', 'luma', 'cal-1', { needs_reconnect: true });
-    expect(r.message).toMatch(/rejected the API key/);
+    expect(r.success).toBe(true);
+    expect(r.connected).toBe(false);
+    expect(r.reason).toBe('key_rejected');
+    expect(r.message).toMatch(/continue with the browser/i);
+    expect(String(fetchMock.mock.calls[1][0])).toContain('/v1/calendars/get');
+  });
+
+  it('does NOT flag the key dead when a single 401 is not confirmed (Luma-side blip)', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({}, { status: 401 }))
+      .mockResolvedValueOnce(jsonResponse({ id: 'cal-1', name: 'ThinkingAI' }));
+    const r: any = await tool('luma_get_guests')({ event: 'evt-1' }, { userId: 'user-1' });
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+    expect(r.success).toBe(false);
+    expect(r.message).toMatch(/key still works\. Retry once/);
   });
 
   it('does NOT flag the key dead when Luma answers 403 for one event', async () => {
@@ -423,10 +444,11 @@ describe('luma tools', () => {
     expect(r.interrupted).toMatch(/call again with next_cursor/);
   });
 
-  it('does not call Luma again once an account is flagged needs_reconnect', async () => {
+  it('does not call Luma again once an account is flagged needs_reconnect, and still tells the model to carry on', async () => {
     mockGetAccounts.mockResolvedValue([lumaAccount({ config: { ...lumaAccount().config, needs_reconnect: true } })]);
     const r: any = await tool('luma_get_guests')({ event: 'evt-1' }, { userId: 'user-1' });
-    expect(r.success).toBe(false);
+    expect(r.success).toBe(true);
+    expect(r.reason).toBe('key_rejected');
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -504,7 +526,7 @@ describe('review fixes (second independent review)', () => {
     expect(r.answers_note).toMatch(/include_registration_answers/);
   });
 
-  it('caps long free-text answers, and refuses a page that still cannot fit, telling the model how to retry', async () => {
+  it('caps long free-text answers and SHRINKS an oversized page itself — no refusal for the model to mishandle', async () => {
     mockGetAccounts.mockResolvedValue([lumaAccount()]);
     const long = (i: number) => ({
       ...guest(`g${i}`, '2026-10-06T00:00:00Z'),
@@ -514,28 +536,57 @@ describe('review fixes (second independent review)', () => {
       const limit = Number(new URL(String(url)).searchParams.get('pagination_limit'));
       return jsonResponse({ entries: Array.from({ length: limit }, (_, i) => long(i)), has_more: true, next_cursor: 'c2' });
     });
-    const big: any = await tool('luma_get_guests')({ event: 'evt-1', include_registration_answers: true, max_guests: 30, cursor: 'c1' }, { userId: 'user-1' });
-    expect(big.success).toBe(false);
-    expect(big.message).toMatch(/SAME cursor and max_guests: 15/);
 
-    const ok: any = await tool('luma_get_guests')({ event: 'evt-1', include_registration_answers: true, max_guests: 3 }, { userId: 'user-1' });
-    expect(ok.success).toBe(true);
-    expect(JSON.stringify(ok).length).toBeLessThan(20000);
-    expect(ok.guests[0].registration_answers[0].value).toMatch(/\[truncated\]$/);
+    const r: any = await tool('luma_get_guests')({ event: 'evt-1', include_registration_answers: true, max_guests: 30, cursor: 'c1' }, { userId: 'user-1' });
+
+    expect(r.success).toBe(true);
+    expect(r.count).toBeGreaterThan(0);
+    expect(r.count).toBeLessThan(30);
+    expect(JSON.stringify(r).length).toBeLessThanOrEqual(17000);
+    expect(r.has_more).toBe(true);
+    expect(r.guests[0].registration_answers[0].value).toMatch(/\[truncated\]$/);
+    // every re-read starts from the SAME cursor, so nothing is skipped or repeated
+    const cursors = fetchMock.mock.calls.map((c: any[]) => new URL(String(c[0])).searchParams.get('pagination_cursor'));
+    expect(new Set(cursors)).toEqual(new Set(['c1']));
+    const limits = fetchMock.mock.calls.map((c: any[]) => Number(new URL(String(c[0])).searchParams.get('pagination_limit')));
+    expect(limits[0]).toBe(30);
+    expect(limits[limits.length - 1]).toBeLessThan(limits[0]);
     fetchMock.mockReset();
   });
 
-  it('stops paging at the first unregistered row (desc nulls last) instead of reading 25 pages of them', async () => {
+  it('stops once a whole PAGE has no registered guests (desc nulls last) instead of reading 25 pages of them', async () => {
     const svc = new LumaApiService('k');
     fetchMock.mockReset();
-    fetchMock.mockImplementation(async () =>
-      jsonResponse({ entries: [guest('a', '2026-10-06T00:00:00Z'), guest('n1', null), guest('n2', null)], has_more: true, next_cursor: 'c2' }),
-    );
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ entries: [guest('a', '2026-10-06T00:00:00Z'), guest('n0', null)], has_more: true, next_cursor: 'c2' }))
+      .mockResolvedValueOnce(jsonResponse({ entries: [guest('n1', null), guest('n2', null)], has_more: true, next_cursor: 'c3' }))
+      .mockResolvedValue(jsonResponse({ entries: [guest('n3', null)], has_more: true, next_cursor: 'c4' }));
     const r = await svc.listGuests({ eventId: 'evt-1', maxGuests: 500 });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(r.guests.map((g) => g.guest_id)).toEqual(['a']);
     expect(r.has_more).toBe(false);
     fetchMock.mockReset();
+  });
+
+  it('does NOT truncate when unregistered rows are interleaved with registered ones (unverified Luma ordering)', async () => {
+    const svc = new LumaApiService('k');
+    fetchMock.mockReset();
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ entries: [guest('a', '2026-10-06T00:00:00Z'), guest('n1', null), guest('b', '2026-10-05T00:00:00Z')], has_more: true, next_cursor: 'c2' }))
+      .mockResolvedValueOnce(jsonResponse({ entries: [guest('c', '2026-10-04T00:00:00Z')], has_more: false }));
+    const r = await svc.listGuests({ eventId: 'evt-1', maxGuests: 500 });
+    expect(r.guests.map((g) => g.guest_id)).toEqual(['a', 'b', 'c']);
+    expect(r.skippedWithoutRegistration).toBe(1);
+    fetchMock.mockReset();
+  });
+
+  it('omits phone numbers unless include_phone is asked for', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    fetchMock.mockResolvedValue(jsonResponse({ entries: [{ ...guest('a', '2026-10-06T00:00:00Z'), phone_number: '+14155550123' }], has_more: false }));
+    const lean: any = await tool('luma_get_guests')({ event: 'evt-1' }, { userId: 'user-1' });
+    expect(lean.guests[0].phone_number).toBeUndefined();
+    const withPhone: any = await tool('luma_get_guests')({ event: 'evt-1', include_phone: true }, { userId: 'user-1' });
+    expect(withPhone.guests[0].phone_number).toBe('+14155550123');
   });
 
   it('only honours the test base-URL override in development/test, never on an unknown NODE_ENV', async () => {
@@ -573,29 +624,39 @@ describe('review fixes (second independent review)', () => {
 describe('failure messages are classified as retryable where they should be', () => {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { classifyToolErrorClass } = require('../utils/toolErrorClassifier');
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { isRetryableErrorClass } = require('../services/agentMode/core/errorRetryability');
 
-  it('429, timeout and network failures read as retryable classes; a rejected key does not', async () => {
-    mockGetAccounts.mockResolvedValue([lumaAccount()]);
-    const run = async (resp: any) => {
-      fetchMock.mockReset();
-      if (resp instanceof Error) fetchMock.mockRejectedValueOnce(resp);
-      else fetchMock.mockResolvedValueOnce(resp);
-      const r: any = await tool('luma_list_events')({}, { userId: 'user-1' });
-      return classifyToolErrorClass(new Error(r.message));
-    };
-    expect(await run(jsonResponse({}, { status: 429, headers: { 'retry-after': '30' } }))).toBe('rate_limit');
-    const aborted = new Error('aborted'); aborted.name = 'AbortError';
-    expect(await run(aborted)).toBe('timeout');
-    expect(await run(new Error('getaddrinfo ENOTFOUND'))).toBe('network');
-    const { isRetryableErrorClass } = require('../services/agentMode/core/errorRetryability');
-    expect(isRetryableErrorClass('rate_limit')).toBe(true);
-    // A rejected key must be a fast-trip, non-retryable class — and must stay one even when the calendar
-    // name looks like an HTTP status ("Founders 500 Club" would otherwise read as upstream_5xx).
+  const run = async (resp: any) => {
     mockGetAccounts.mockResolvedValue([lumaAccount({ account_name: 'Founders 500 Club' })]);
     fetchMock.mockReset();
-    fetchMock.mockResolvedValueOnce(jsonResponse({}, { status: 401 }));
-    const dead: any = await tool('luma_list_events')({}, { userId: 'user-1' });
-    expect(dead.errorClass).toBe('auth');
-    expect(isRetryableErrorClass(classifyToolErrorClass(Object.assign(new Error(dead.message), { toolErrorClass: dead.errorClass })))).toBe(false);
+    if (resp instanceof Error) fetchMock.mockRejectedValueOnce(resp);
+    else fetchMock.mockResolvedValueOnce(resp);
+    const r: any = await tool('luma_list_events')({}, { userId: 'user-1' });
+    return { r, cls: classifyToolErrorClass(Object.assign(new Error(r.message), r.errorClass ? { toolErrorClass: r.errorClass } : {})) };
+  };
+
+  it('429, timeout and network failures are retryable classes', async () => {
+    expect((await run(jsonResponse({}, { status: 429, headers: { 'retry-after': '30' } }))).cls).toBe('rate_limit');
+    const aborted = new Error('aborted'); aborted.name = 'AbortError';
+    expect((await run(aborted)).cls).toBe('timeout');
+    expect((await run(new Error('getaddrinfo ENOTFOUND'))).cls).toBe('network');
+    expect(isRetryableErrorClass('rate_limit')).toBe(true);
+  });
+
+  it('a wrong-calendar 403 is an argument problem, not a reconnect-your-account problem, and is not retryable', async () => {
+    const { r, cls } = await run(jsonResponse({}, { status: 403 }));
+    expect(r.errorClass).toBe('invalid_args');
+    expect(cls).toBe('invalid_args');
+    expect(isRetryableErrorClass(cls)).toBe(false);
+  });
+
+  it('a confirmed-dead key is not an error at all, whatever the calendar is called', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount({ account_name: 'Founders 500 Club' })]);
+    fetchMock.mockReset();
+    fetchMock.mockResolvedValue(jsonResponse({}, { status: 401 }));
+    const r: any = await tool('luma_list_events')({}, { userId: 'user-1' });
+    expect(r.success).toBe(true);
+    expect(r.connected).toBe(false);
   });
 });

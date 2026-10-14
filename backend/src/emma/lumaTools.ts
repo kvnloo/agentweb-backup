@@ -62,11 +62,18 @@ function answerMatches(answer: any, labels: string[]): boolean {
  * question ids and types removed, long free text capped, and optionally narrowed to the answers
  * matching `labels`. A guest list padded with these would be cut off mid-list by the 20,000-char view.
  */
-function compactGuest(guest: LumaGuest, includeAnswers: boolean, labels: string[] = []): Record<string, unknown> {
+function compactGuest(
+  guest: LumaGuest,
+  includeAnswers: boolean,
+  labels: string[] = [],
+  includePhone = false,
+): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(guest)) {
     if (value === null || value === undefined) continue;
     if ((key === 'first_name' || key === 'last_name') && guest.name) continue;
+    // Data minimisation: a phone number is personal data the skills never use, so it is only sent when asked for.
+    if (key === 'phone_number' && !includePhone) continue;
     if (key === 'registration_answers') {
       if (!includeAnswers || !Array.isArray(value)) continue;
       const answers = (value as any[])
@@ -84,19 +91,41 @@ function compactGuest(guest: LumaGuest, includeAnswers: boolean, labels: string[
 const GUEST_STATUSES = ['approved', 'session', 'pending_approval', 'invited', 'declined', 'waitlist'];
 
 const NOT_CONNECTED_MESSAGE =
-  'No Luma API key is connected. Connecting one is the reliable way to read guest lists: it needs a Luma Plus ' +
-  'calendar API key (create it at luma.com/calendar/manage/api-keys) saved on the "Luma API key" card in ' +
-  '[Settings → Login Credentials](/settings/login-credentials) — give the user that exact link. ' +
-  'Without a key, fall back to the browser session-cookie path or a CSV export.';
+  'No Luma API key is connected for this account. That is normal and NOT an error — most accounts read Luma through ' +
+  'the browser. Do not stop and do not report a failure: continue the task now with the browser session-cookie path ' +
+  '(or ask for a CSV export). You may mention once that a Luma Plus calendar API key (create it at ' +
+  'luma.com/calendar/manage/api-keys) saved on the "Luma API key" card in ' +
+  '[Settings → Login Credentials](/settings/login-credentials) would let future pulls skip the login — give that exact link. ' +
+  'In a scheduled or unattended run, just continue.';
+
+const keyRejectedMessage = (calendarName: string) =>
+  `The Luma API key for the calendar "${calendarName}" was rejected by Luma (revoked, the wrong calendar, or the Luma ` +
+  'Plus subscription lapsed), so the API path is unavailable. Do not stop: continue with the browser session-cookie ' +
+  'path or a CSV export, and tell the user the key needs replacing on the "Luma API key" card in ' +
+  '[Settings → Login Credentials](/settings/login-credentials).';
+
+/**
+ * "No usable key" is a normal state for most accounts, not a failure. It is returned as a SUCCESS so the dispatcher
+ * does not paint a red "failed" card at users who never had a key, does not count it in failedFunctions, and does
+ * not append "do NOT retry / report the blocker" guidance that made a weak model abandon a scheduled run
+ * (observed in production on 2026-10-14: two failed luma_list_events calls, then the run ended having done nothing).
+ */
+const unavailable = (reason: 'no_key' | 'key_rejected', message: string) => ({
+  success: true,
+  connected: false,
+  reason,
+  message,
+});
 
 type ResolvedLuma =
   | { client: LumaApiService; ownerUserId: string; calendarId: string; calendarName: string }
+  | { unavailable: ReturnType<typeof unavailable> }
   | { error: string };
 
 async function resolveLuma(userId: string, calendarId?: string): Promise<ResolvedLuma> {
   const all = await getAccountsWithOwnerIncludingOrgShared(userId);
   const accounts = all.filter((a) => a.platform === 'luma');
-  if (accounts.length === 0) return { error: NOT_CONNECTED_MESSAGE };
+  if (accounts.length === 0) return { unavailable: unavailable('no_key', NOT_CONNECTED_MESSAGE) };
 
   let account = accounts[0];
   if (calendarId) {
@@ -112,11 +141,7 @@ async function resolveLuma(userId: string, calendarId?: string): Promise<Resolve
   }
 
   if ((account.config as any)?.needs_reconnect) {
-    return {
-      error:
-        `The Luma API key for "${account.account_name}" was rejected earlier and needs to be replaced ` +
-        '(Settings → Login Credentials → Luma API key). Fall back to the browser session-cookie path or a CSV export meanwhile.',
-    };
+    return { unavailable: unavailable('key_rejected', keyRejectedMessage(account.account_name)) };
   }
 
   let apiKey: string;
@@ -144,23 +169,30 @@ function describe(accounts: Array<{ account_id: string; account_name: string }>)
  */
 async function lumaFailure(error: unknown, resolved: Extract<ResolvedLuma, { client: LumaApiService }>) {
   if (error instanceof LumaApiError && error.isAuthFailure) {
+    // A single 401 could be a Luma-side blip; flagging the key dead makes every later call (and the Settings card)
+    // say it is broken until the user re-enters it. Confirm with an independent call before believing it.
+    const stillAuthorised = await resolved.client.getCalendar().then(
+      () => true,
+      (e) => !(e instanceof LumaApiError && e.isAuthFailure),
+    );
+    if (stillAuthorised) {
+      return {
+        success: false,
+        errorClass: 'upstream_5xx',
+        message: 'Luma answered that request with an authorisation error, but the key still works. Retry once.',
+      };
+    }
     await updateAccountConfig(resolved.ownerUserId, 'luma', resolved.calendarId, { needs_reconnect: true }).catch(
       (e) => console.warn('[Luma] Could not flag the rejected key:', e instanceof Error ? e.message : e),
     );
-    return {
-      success: false,
-      errorClass: 'auth',
-      message:
-        `Luma rejected the API key for the calendar "${resolved.calendarName}" (revoked, the wrong calendar, or the Luma Plus ` +
-        'subscription lapsed). The user needs to replace it on the "Luma API key" card in ' +
-        '[Settings → Login Credentials](/settings/login-credentials). ' +
-        'Fall back to the browser session-cookie path or a CSV export meanwhile.',
-    };
+    return unavailable('key_rejected', keyRejectedMessage(resolved.calendarName));
   }
   if (error instanceof LumaApiError && error.isForbidden) {
     return {
       success: false,
-      errorClass: 'auth',
+      // An argument problem (wrong event / wrong calendar), not a dead credential: `auth` would tell the model to
+      // have the user reconnect an account that is fine.
+      errorClass: 'invalid_args',
       message:
         `Luma says the key for the calendar "${resolved.calendarName}" cannot access that event — it probably belongs to a different ` +
         'calendar. The key itself is fine. Check the event id with luma_list_events, or ask the user for a key from the calendar that hosts it.',
@@ -223,6 +255,7 @@ emmaToolRegistry.register({
     }
 
     const resolved = await resolveLuma(userId, args?.calendar_id);
+    if ('unavailable' in resolved) return resolved.unavailable;
     if ('error' in resolved) return { success: false, message: resolved.error };
 
     try {
@@ -253,7 +286,7 @@ emmaToolRegistry.register({
     description:
       'Get the registered guests of one Luma event via the Luma API, newest registration first. `event` accepts the ' +
       'event id (evt-…) or a luma.com manage URL containing it (public slug links do not — find the id with luma_list_events). Returns guest_id, email, name, ' +
-      'approval_status, registered_at and phone_number when present; registration answers only with include_registration_answers or answer_labels. Use registered_after to pull only recent ' +
+      'approval_status, registered_at when present (phone number only with include_phone); registration answers only with include_registration_answers or answer_labels. Use registered_after to pull only recent ' +
       'registrants (e.g. a lookback window); de-duplicate on guest_id across calls. Invited-but-never-registered ' +
       'records are omitted unless approval_status is "invited". If has_more is true, call again with next_cursor. ' +
       'This is the reliable path — prefer it over scraping the guest table in a browser. Requires a connected Luma API key.',
@@ -273,6 +306,10 @@ emmaToolRegistry.register({
         include_registration_answers: {
           type: 'boolean',
           description: `Include each guest's registration-question answers as {label, value} (default false). Without answer_labels this is every answer, so calls are limited to ${MAX_GUESTS_WITH_ANSWERS} guests.`,
+        },
+        include_phone: {
+          type: 'boolean',
+          description: 'Include each guest\'s phone number (default false; only ask for it if the task needs it).',
         },
         answer_labels: {
           type: 'array',
@@ -323,61 +360,69 @@ emmaToolRegistry.register({
       .filter(Boolean)
       .slice(0, MAX_ANSWER_LABELS);
     const includeAnswers = args?.include_registration_answers === true || answerLabels.length > 0;
+    const includePhone = args?.include_phone === true;
 
     const resolved = await resolveLuma(userId, args?.calendar_id);
+    if ('unavailable' in resolved) return resolved.unavailable;
     if ('error' in resolved) return { success: false, message: resolved.error };
 
     const cap = !includeAnswers ? HARD_MAX_GUESTS : answerLabels.length > 0 ? MAX_GUESTS_WITH_FILTERED_ANSWERS : MAX_GUESTS_WITH_ANSWERS;
     const maxGuests = Math.min(Math.max(Math.floor(Number(args?.max_guests)) || Math.min(DEFAULT_MAX_GUESTS, cap), 1), cap);
     try {
-      const page = await resolved.client.listGuests({
-        eventId,
-        approvalStatus: status,
-        registeredAfter,
-        cursor: args?.cursor,
-        maxGuests,
-      });
-      const guests = page.guests.map((g) => compactGuest(g, includeAnswers, answerLabels));
-      const result = {
-        success: true,
-        calendar: resolved.calendarName,
-        event_id: eventId,
-        approval_status: status,
-        count: guests.length,
-        // Paging fields BEFORE the guest list: if a result is ever cut for size, the tail goes, so these
-        // must never be what is lost.
-        has_more: page.has_more,
-        ...(page.next_cursor ? { next_cursor: page.next_cursor } : {}),
-        ...(page.interrupted
-          ? { interrupted: `Stopped early (${page.interrupted}). These guests are valid; call again with next_cursor to continue.` }
-          : {}),
-        ...(page.skippedWithoutRegistration
-          ? { skipped_without_registration: page.skippedWithoutRegistration }
-          : {}),
-        ...(answerLabels.length > 0 && guests.length > 0 && !guests.some((g) => g.registration_answers)
-          ? {
-              answers_note:
-                `None of the registration answers matched ${JSON.stringify(answerLabels)}. Retry with ` +
-                'include_registration_answers: true to see every question and pick the right ones.',
-            }
-          : {}),
-        guests,
-      };
-      // The model is shown only the first 20,000 chars of a result, and a Luma page cannot be split (the
-      // cursor resumes at a page boundary). If this one will not fit, say so instead of letting the tail be
-      // cut silently under a header that claims `count: N`.
-      const size = JSON.stringify(result).length;
-      if (size > MAX_RESULT_CHARS && maxGuests > 1) {
-        const smaller = Math.max(1, Math.floor(maxGuests / 2));
-        return {
-          success: false,
-          message:
-            `This page of ${guests.length} guests is too large to show (${size} chars; the answers are long free text). ` +
-            `Call luma_get_guests again with ${args?.cursor ? 'the SAME cursor' : 'no cursor'} and max_guests: ${smaller}, ` +
-            'and keep halving it if it is still too large.',
+      // The model is shown only the first 20,000 chars of a result and a Luma page cannot be split (the cursor
+      // resumes at a page boundary). So if a page does not fit, re-read the SAME starting point with a smaller
+      // page, sized from what we just measured, instead of asking the model to do it — a weak model that gets a
+      // refusal may simply stop. Luma's rate limit (200/min) makes one or two extra reads cheap.
+      let pageSize = maxGuests;
+      let attempts = 0;
+      for (;;) {
+        const page = await resolved.client.listGuests({
+          eventId,
+          approvalStatus: status,
+          registeredAfter,
+          cursor: args?.cursor,
+          maxGuests: pageSize,
+        });
+        const guests = page.guests.map((g) => compactGuest(g, includeAnswers, answerLabels, includePhone));
+        const result = {
+          success: true,
+          calendar: resolved.calendarName,
+          event_id: eventId,
+          approval_status: status,
+          count: guests.length,
+          // Paging fields BEFORE the guest list: if a result is ever cut for size, the tail goes, so these
+          // must never be what is lost.
+          has_more: page.has_more,
+          ...(page.next_cursor ? { next_cursor: page.next_cursor } : {}),
+          ...(page.interrupted
+            ? { interrupted: `Stopped early (${page.interrupted}). These guests are valid; call again with next_cursor to continue.` }
+            : {}),
+          ...(page.skippedWithoutRegistration
+            ? { skipped_without_registration: page.skippedWithoutRegistration }
+            : {}),
+          ...(answerLabels.length > 0 && guests.length > 0 && !guests.some((g) => g.registration_answers)
+            ? {
+                answers_note:
+                  `None of the registration answers matched ${JSON.stringify(answerLabels)}. Retry with ` +
+                  'include_registration_answers: true to see every question and pick the right ones.',
+              }
+            : {}),
+          guests,
         };
+        const size = JSON.stringify(result).length;
+        if (size <= MAX_RESULT_CHARS || pageSize <= 1) return result;
+        if (attempts >= 4) {
+          return {
+            success: false,
+            message:
+              `A page of guests is still too large to show (${size} chars; the answers are long free text). ` +
+              `Call luma_get_guests again with ${args?.cursor ? 'the SAME cursor' : 'no cursor'} and a much smaller max_guests.`,
+          };
+        }
+        const perGuest = size / Math.max(1, guests.length);
+        pageSize = Math.max(1, Math.min(pageSize - 1, Math.floor((MAX_RESULT_CHARS * 0.9) / perGuest)));
+        attempts += 1;
       }
-      return result;
     } catch (error) {
       return lumaFailure(error, resolved);
     }

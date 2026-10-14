@@ -224,14 +224,13 @@ export class LumaApiService {
       // has_more without a cursor cannot be resumed; re-reading page one would return duplicates.
       if (hasMore && !cursor) hasMore = false;
 
+      let registeredOnPage = 0;
       for (const g of data.entries || []) {
         if (!g.registered_at && !keepUnregistered) {
-          // Sorted `desc nulls last`: once one row has no registration time, every row after it has none
-          // either, so stop instead of paging through up to 25 pages of them against the rate limit.
           skipped += 1;
-          crossedCutoff = true;
           continue;
         }
+        registeredOnPage += 1;
         if (g.registered_at && Number.isFinite(cutoff) && Date.parse(g.registered_at) < cutoff) {
           crossedCutoff = true;
           continue;
@@ -248,6 +247,10 @@ export class LumaApiService {
           registration_answers: g.registration_answers ?? null,
         });
       }
+      // Sorted `desc nulls last`, so a page with NO registered rows means everything after it is unregistered too:
+      // stop instead of paging through up to 25 pages of them against the rate limit. Judged per PAGE, not per
+      // row, so a mixed page (if Luma ever interleaves them) keeps going rather than silently truncating the list.
+      if (!keepUnregistered && (data.entries || []).length > 0 && registeredOnPage === 0) crossedCutoff = true;
     }
 
     const exhausted = !interrupted && (crossedCutoff || !hasMore);
