@@ -9,7 +9,8 @@
  *   3. INVARIANTS  - taxonomy/alignment properties and "never throws".
  */
 import { buildUtmSpec, UTM_MEDIUM_PAID } from '../adUtm';
-import {
+import { matchRoutingRules } from '../trackingConfig';
+import { splitPaidChannel,
   CHANNELS,
   CHANNEL_GROUPS,
   ORGANIC_MEDIUMS,
@@ -171,7 +172,12 @@ describe('classifyTraffic: intentional differences from V1', () => {
 
     // click ids
     ['fbclid with no other signal names Meta (V1: Direct/Paid)', { landingUrl: lp('fbclid=IwAR1') }, { trafficType: 'paid', channel: 'Meta', channelGroup: 'Paid', matchedBy: 'click_id' }],
-    ['gclid with no other signal names Google Search', { landingUrl: lp('gclid=abc') }, { trafficType: 'paid', channel: 'Google Search', channelGroup: 'Paid' }],
+    ['gclid with no other signal names Google Ads', { landingUrl: lp('gclid=abc') }, { trafficType: 'paid', channel: 'Google Ads', channelKey: 'google_ads', channelGroup: 'Paid' }],
+    ['google referrer + gclid is Google Ads', { landingUrl: lp('gclid=abc'), referrer: 'https://www.google.com/' }, { channel: 'Google Ads', channelKey: 'google_ads' }],
+    ['utm_source=adwords&utm_medium=cpc is Google Ads', { landingUrl: lp('utm_source=adwords&utm_medium=cpc') }, { channel: 'Google Ads', channelGroup: 'Paid' }],
+    ['organic google referrer stays Google Search', { landingUrl: lp(), referrer: 'https://www.google.com/' }, { trafficType: 'organic', channel: 'Google Search', channelKey: 'google_search', channelGroup: 'Organic Search' }],
+    ['paid youtube is YouTube Ads', { landingUrl: lp('utm_source=youtube&utm_medium=cpv') }, { channel: 'YouTube Ads', channelKey: 'youtube_ads', channelGroup: 'Paid' }],
+    ['organic youtube stays YouTube', { landingUrl: lp('utm_source=youtube&utm_medium=description') }, { channel: 'YouTube', channelKey: 'youtube', trafficType: 'organic' }],
     ['ttclid names TikTok', { landingUrl: lp('ttclid=E.C.P') }, { channel: 'TikTok', channelGroup: 'Paid' }],
     ['ad_id alone cannot name a platform: still Direct/Paid', { landingUrl: lp('ad_id=123') }, { trafficType: 'paid', channel: 'Direct', channelGroup: 'Paid' }],
     ['click id never overrides an explicit utm_source', { landingUrl: lp('utm_source=creator_john&gclid=abc') }, { channel: 'creator_john', channelGroup: 'Paid' }],
@@ -266,13 +272,33 @@ describe('classifyTraffic: invariants', () => {
     }
   });
 
+  it('splitPaidChannel is idempotent and leaves organic/other channels alone (backfill-safe)', () => {
+    expect(splitPaidChannel('Google Search', 'google_search', true)).toEqual({ channel: 'Google Ads', channelKey: 'google_ads' });
+    expect(splitPaidChannel('Google Ads', 'google_ads', true)).toEqual({ channel: 'Google Ads', channelKey: 'google_ads' });
+    expect(splitPaidChannel('Google Search', 'google_search', false)).toEqual({ channel: 'Google Search', channelKey: 'google_search' });
+    expect(splitPaidChannel('Meta', 'meta', true)).toEqual({ channel: 'Meta', channelKey: 'meta' });
+  });
+
   it('aligns with adUtm.ts: ad links Emma builds classify as paid on their platform', () => {
-    for (const [platform, channel] of [['meta', 'Meta'], ['google', 'Google Search'], ['linkedin', 'LinkedIn']] as const) {
+    for (const [platform, channel] of [['meta', 'Meta'], ['google', 'Google Ads'], ['linkedin', 'LinkedIn']] as const) {
       const spec = buildUtmSpec(platform, { campaign: 'c1' });
       expect(spec.medium).toBe(UTM_MEDIUM_PAID);
       expect(run({ utm: { source: spec.source, medium: spec.medium, campaign: spec.campaign } })).toMatchObject({
         trafficType: 'paid', channel, channelGroup: 'Paid',
       });
     }
+  });
+});
+
+describe('paid channel split: routing compatibility', () => {
+  it('a pre-2.1.0 google_search rule still routes paid Google Ads sessions; google_ads rule routes only paid', () => {
+    const paid = classifyTraffic({ landingUrl: 'https://lp.example.com/?gclid=x' });
+    const organic = classifyTraffic({ landingUrl: 'https://lp.example.com/', referrer: 'https://www.google.com/' });
+    const rules = [
+      { id: 'a', match: { channel: 'google_search' }, childListId: 'any-google' },
+      { id: 'b', match: { channel: 'google_ads' }, childListId: 'ads-only' },
+    ];
+    expect(matchRoutingRules(rules, paid).sort()).toEqual(['ads-only', 'any-google']);
+    expect(matchRoutingRules(rules, organic)).toEqual(['any-google']);
   });
 });

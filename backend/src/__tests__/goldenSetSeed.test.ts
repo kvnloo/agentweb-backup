@@ -1,4 +1,4 @@
-import { buildSeedCases, parseFpCatalogue, resolveSessionRef, type SeedInputs } from '../loops/eval/goldenSetSeed';
+import { buildSeedCases, parseFpCatalogue, resolveSessionRef, type SeedInputs, type SeedUserRow } from '../loops/eval/goldenSetSeed';
 
 const NOW = new Date('2026-09-25T00:00:00.000Z');
 
@@ -112,5 +112,185 @@ describe('golden-set seed builder (ENG-2135)', () => {
     expect(() => parseFpCatalogue({ 'ENG-1': ['a'] })).toThrow(/issues/);
     expect(() => parseFpCatalogue({ issues: { 'ENG-1': [1] } })).toThrow(/string array/);
     expect(() => parseFpCatalogue({ issues: {}, replayFixtures: { f: { session: 's', messageIndex: -1 } } })).toThrow(/messageIndex/);
+  });
+
+  describe('sampled_session source', () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    const ordinary = (i: number, over: Record<string, unknown> = {}) => ({
+      sessionId: sid(1000 + i),
+      adminOverride: false,
+      createdAt: new Date(NOW.getTime() - 10 * DAY).toISOString(),
+      sessionType: 'regular',
+      messageCount: 6,
+      userId: `user-${i}`,
+      ...over,
+    });
+    const pool = (n = 100) => Array.from({ length: n }, (_, i) => ordinary(i));
+    const agentOf = (result: ReturnType<typeof buildSeedCases>) => result.cases.filter((c) => c.surface === 'agent');
+    const sampledIds = (result: ReturnType<typeof buildSeedCases>) => agentOf(result).filter((c) => c.taskType === 'sampled_session').map((c) => c.sourceRef.id);
+
+    it('is deterministic and a larger target only appends (70 contains 60)', () => {
+      const sessions = [...inputs().sessions.slice(0, 3), ...pool()];
+      const at = (agent: number, rows = sessions) => sampledIds(buildSeedCases(inputs({ sessions: rows, targets: { agent } })));
+      const s60 = at(60);
+      const s70 = at(70);
+      expect(s60).toHaveLength(57);
+      expect(s70).toHaveLength(67);
+      expect(s70).toEqual(expect.arrayContaining(s60));
+      expect(at(70, [...sessions].reverse()).sort()).toEqual([...s70].sort());
+      expect(buildSeedCases(inputs({ sessions, targets: { agent: 70 } })).report.agent.bySource).toMatchObject({ admin_override: 3, sampled_session: 67 });
+    });
+
+    it('is ordered by hash, not recency: newer sessions are not preferred', () => {
+      const sessions = pool(60).map((s, i) => ({ ...s, createdAt: new Date(NOW.getTime() - (i + 1) * DAY).toISOString() }));
+      const picked = new Set(sampledIds(buildSeedCases(inputs({ sessions, targets: { agent: 20 } }))));
+      const newest20 = new Set(sessions.slice(0, 20).map((s) => s.sessionId));
+      expect([...picked].filter((id) => newest20.has(id)).length).toBeLessThan(20);
+    });
+
+    it('excludes short, old, future-dated, evaluation, non-regular and unattributed sessions', () => {
+      const bad = [
+        ordinary(1, { messageCount: 3 }),
+        ordinary(2, { messageCount: undefined }),
+        ordinary(3, { createdAt: new Date(NOW.getTime() - 91 * DAY).toISOString() }),
+        ordinary(4, { createdAt: undefined }),
+        ordinary(5, { createdAt: 'not-a-date' }),
+        ordinary(6, { createdAt: new Date(NOW.getTime() + DAY).toISOString() }),
+        ordinary(7, { userId: 'eval_abc123' }),
+        ordinary(8, { sessionType: 'scheduled' }),
+      ];
+      const good = [ordinary(10), ordinary(11, { messageCount: 4 }), ordinary(12, { sessionType: undefined }), ordinary(13, { createdAt: new Date(NOW.getTime() - 90 * DAY).toISOString() })];
+      const result = buildSeedCases(inputs({ sessions: [...bad, ...good], targets: { agent: 20 } }));
+      expect(sampledIds(result).sort()).toEqual(good.map((s) => s.sessionId).sort());
+    });
+
+    it('never re-labels a session already present as admin_override, fp_catalogue or replay_fixture', () => {
+      const rows = [ordinary(1, { adminOverride: true }), ordinary(2), ordinary(3), ordinary(4)];
+      const fpCatalogue = { issues: { 'ENG-9': [rows[1].sessionId] }, replayFixtures: { f1: { session: rows[2].sessionId, messageIndex: 2 } } };
+      const agent = agentOf(buildSeedCases(inputs({ sessions: rows, fpCatalogue, targets: { agent: 50 } })));
+      const type = (r: { sessionId: string }) => agent.find((c) => c.sourceRef.id === r.sessionId)?.taskType;
+      expect([type(rows[0]), type(rows[1]), type(rows[2]), type(rows[3])]).toEqual(['admin_override', 'fp_catalogue', 'replay_fixture', 'sampled_session']);
+      expect(agent).toHaveLength(4);
+    });
+
+    it('fills after pinned and fp_catalogue cases, and leaves a full default-target result unchanged', () => {
+      const base = inputs({ fpCatalogue: { issues: { 'ENG-1': Array.from({ length: 70 }, (_, i) => sid(i)) } } });
+      const without = buildSeedCases(base);
+      const withPool = buildSeedCases({ ...base, sessions: [...base.sessions, ...pool()] });
+      expect(withPool.cases.map((c) => c.caseId)).toEqual(without.cases.map((c) => c.caseId));
+      expect(withPool.report.agent.bySource).toEqual(without.report.agent.bySource);
+      expect(withPool.report.agent.eligible).toBe(without.report.agent.eligible + 100);
+      // Raising the target keeps every existing case and adds sampled ones only.
+      const bigger = buildSeedCases({ ...base, sessions: [...base.sessions, ...pool()], targets: { agent: 90 } });
+      const ids = new Set(bigger.cases.map((c) => c.caseId));
+      expect(without.cases.filter((c) => c.surface === 'agent').every((c) => ids.has(c.caseId))).toBe(true);
+      expect(bigger.report.agent.bySource.sampled_session).toBe(90 - without.report.agent.eligible);
+    });
+
+    it('an empty candidate pool leaves the result unchanged', () => {
+      const a = buildSeedCases(inputs({ targets: { agent: 70 } }));
+      const b = buildSeedCases(inputs({ sessions: inputs().sessions.map((s) => ({ ...s, messageCount: 2, createdAt: NOW.toISOString() })), targets: { agent: 70 } }));
+      expect(b.cases.map((c) => c.caseId)).toEqual(a.cases.map((c) => c.caseId));
+      expect(b.report.agent.bySource.sampled_session).toBeUndefined();
+    });
+  });
+});
+
+describe('gated creative candidates (ENG-2226)', () => {
+  const reviewed = (id: string) => ({ candidateId: id, reviewType: 'creative_image', reviewerSlackUserId: 'U', feedbackSlackUserIds: ['U'] });
+  const gated = (id: string) => ({ candidateId: id, reviewType: 'creative_image', feedbackSlackUserIds: [] as string[], gated: true });
+
+  it('adds nothing unless opted in, even when gated candidates exist', () => {
+    const candidates = [...Array.from({ length: 5 }, (_, i) => reviewed(`r-${i}`)), ...Array.from({ length: 10 }, (_, i) => gated(`g-${i}`))];
+    const plain = buildSeedCases(inputs({ candidates, targets: { creative: 12 } })).cases.filter((c) => c.surface === 'creative');
+    expect(plain.map((c) => c.sourceRef.id).every((id) => id.startsWith('r-'))).toBe(true);
+    expect(plain).toHaveLength(5);
+  });
+
+  it('opted in: reviewed candidates keep priority, gated ones fill after them and are tagged', () => {
+    const candidates = [...Array.from({ length: 5 }, (_, i) => reviewed(`r-${i}`)), ...Array.from({ length: 10 }, (_, i) => gated(`g-${i}`))];
+    const out = buildSeedCases(inputs({ candidates, gatedCreatives: true, targets: { creative: 12 } })).cases.filter((c) => c.surface === 'creative');
+    expect(out).toHaveLength(12);
+    expect(out.filter((c) => c.sourceRef.id.startsWith('r-'))).toHaveLength(5);
+    expect(out.filter((c) => c.seedSource === 'gated_candidate')).toHaveLength(7);
+  });
+
+  it('a larger target only appends (prefix property) and the default target adds none when reviewed already fill it', () => {
+    const candidates = [...Array.from({ length: 60 }, (_, i) => reviewed(`r-${i}`)), ...Array.from({ length: 40 }, (_, i) => gated(`g-${i}`))];
+    const base = buildSeedCases(inputs({ candidates, gatedCreatives: true })).cases.filter((c) => c.surface === 'creative');
+    expect(base).toHaveLength(50);
+    expect(base.some((c) => c.seedSource === 'gated_candidate')).toBe(false);
+    const a = buildSeedCases(inputs({ candidates, gatedCreatives: true, targets: { creative: 70 } })).cases.filter((c) => c.surface === 'creative').map((c) => c.caseId);
+    const b = buildSeedCases(inputs({ candidates, gatedCreatives: true, targets: { creative: 80 } })).cases.filter((c) => c.surface === 'creative').map((c) => c.caseId);
+    expect(b.slice(0, a.length)).toEqual(a);
+  });
+
+  it('skips candidates already reviewed, non-image types and ungated rows', () => {
+    const candidates = [
+      { ...reviewed('both'), gated: true },
+      { candidateId: 'lp', reviewType: 'landing_page', feedbackSlackUserIds: [] as string[], gated: true },
+      { candidateId: 'plain', reviewType: 'creative_image', feedbackSlackUserIds: [] as string[] },
+      gated('only-gated'),
+    ];
+    const out = buildSeedCases(inputs({ candidates, gatedCreatives: true, targets: { creative: 10 } })).cases.filter((c) => c.surface === 'creative');
+    expect(out.map((c) => c.sourceRef.id).sort()).toEqual(['both', 'only-gated']);
+    expect(out.find((c) => c.sourceRef.id === 'both')?.seedSource).toBe('human_eval_reviewer_feedback');
+  });
+});
+
+describe('account_health pool (ENG-2135)', () => {
+  const user = (userId: string, subscriptionStatus: string, extra: { hasAdPlatform?: boolean } = {}): SeedUserRow => ({ userId, subscriptionStatus, ...extra });
+  const accountCases = (r: ReturnType<typeof buildSeedCases>) => r.cases.filter((c) => c.surface === 'account_health');
+
+  it('never selects tombstoned (deleted_) or evaluation (eval_) accounts, in either mode', () => {
+    const users = [
+      ...Array.from({ length: 20 }, (_, i) => user(`u-${i}`, i % 2 ? 'active' : 'canceled')),
+      user('deleted_a', 'active'), user('deleted_b', 'canceled'), user('eval_x', 'active'), user('eval_y', 'canceled'),
+    ];
+    for (const adConnectedAccounts of [false, true]) {
+      const ids = accountCases(buildSeedCases(inputs({ users, adConnectedAccounts, targets: { account_health: 30 } }))).map((c) => c.sourceRef.id);
+      expect(ids).toHaveLength(20);
+      expect(ids.some((id) => id.startsWith('deleted_') || id.startsWith('eval_'))).toBe(false);
+    }
+  });
+
+  it('opt-in: every ad-connected account comes first, the rest fill with the balanced subscription sample', () => {
+    const users = [
+      ...Array.from({ length: 6 }, (_, i) => user(`ad-${i}`, i % 2 ? 'active' : 'canceled', { hasAdPlatform: true })),
+      user('ad-nosub', '', { hasAdPlatform: true }),
+      ...Array.from({ length: 30 }, (_, i) => user(`n-${i}`, i % 2 ? 'active' : 'canceled')),
+    ];
+    const out = accountCases(buildSeedCases(inputs({ users, adConnectedAccounts: true, targets: { account_health: 20 } })));
+    expect(out).toHaveLength(20);
+    const ad = out.filter((c) => c.taskType === 'ad_connected');
+    expect(ad.map((c) => c.sourceRef.id).sort()).toEqual(['ad-0', 'ad-1', 'ad-2', 'ad-3', 'ad-4', 'ad-5', 'ad-nosub']);
+    expect(ad.every((c) => c.seedSource === 'ad_platform_connected')).toBe(true);
+    expect(out.filter((c) => c.taskType.startsWith('subscription_'))).toHaveLength(13);
+    // no account appears twice
+    expect(new Set(out.map((c) => c.sourceRef.id)).size).toBe(20);
+  });
+
+  it('off by default: ad-connected accounts get no priority, and the default selection is unchanged', () => {
+    const users = [
+      ...Array.from({ length: 5 }, (_, i) => user(`ad-${i}`, 'active', { hasAdPlatform: true })),
+      ...Array.from({ length: 40 }, (_, i) => user(`n-${i}`, i % 2 ? 'active' : 'canceled')),
+    ];
+    const plain = accountCases(buildSeedCases(inputs({ users })));
+    expect(plain.some((c) => c.taskType === 'ad_connected')).toBe(false);
+    expect(plain).toHaveLength(30);
+  });
+
+  it('a larger target only appends (prefix property) and an empty ad-connected set equals the plain sample', () => {
+    const users = [
+      ...Array.from({ length: 4 }, (_, i) => user(`ad-${i}`, 'active', { hasAdPlatform: true })),
+      ...Array.from({ length: 80 }, (_, i) => user(`n-${i}`, i % 2 ? 'active' : 'canceled')),
+    ];
+    const a = accountCases(buildSeedCases(inputs({ users, adConnectedAccounts: true, targets: { account_health: 20 } }))).map((c) => c.caseId);
+    const b = accountCases(buildSeedCases(inputs({ users, adConnectedAccounts: true, targets: { account_health: 40 } }))).map((c) => c.caseId);
+    expect(b.slice(0, 4).sort()).toEqual(a.slice(0, 4).sort());
+    expect(a.every((id) => b.includes(id))).toBe(true);
+    const none = users.filter((u) => !u.hasAdPlatform);
+    expect(accountCases(buildSeedCases(inputs({ users: none, adConnectedAccounts: true }))).map((c) => c.caseId))
+      .toEqual(accountCases(buildSeedCases(inputs({ users: none }))).map((c) => c.caseId));
   });
 });

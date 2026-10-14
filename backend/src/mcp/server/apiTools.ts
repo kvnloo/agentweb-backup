@@ -1,5 +1,6 @@
 import { mapManageBrandUpdate } from '../../utils/brandGuidelines';
 import { findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContentLoss, mergeWorkPlanSteps, summarizeStepChange } from '../../services/workPlanSteps';
+import { carryStoredStepModels } from '../../services/agentMode/workPlanStepModels';
 /**
  * API Tools — MCP tools that wrap the backend REST API via HTTP self-calls.
  *
@@ -15,12 +16,14 @@ import { mcpFetch } from './httpClient';
 import './adminLookupTools';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
+import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../utils/scheduledChatsPage';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 // ENG-982: `ctx` and `jsonResult` moved to ./toolHelpers so workflowTools.ts can
 // share them instead of keeping a second copy. Behaviour unchanged.
 import { omitBranchedFrom } from '../../utils/adminOnlyMessageFilter';
+import { omitActiveRun } from '../../services/agentMode/sessionActiveRunGuard';
 import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 import { resolveClientScopedContext } from './adminClientScope';
@@ -389,7 +392,8 @@ mcpToolRegistry.register({
     }
     return jsonResult({
       // ENG-112: branch-family linkage is portal-only; MCP clients never see it.
-      ...omitBranchedFrom(data),
+      // ENG-110: the cross-instance run marker (runId/instanceId) is internal; MCP clients never see it.
+      ...omitActiveRun(omitBranchedFrom(data)),
       run,
       // Terminal means the request ended, not that all detached or continuation work did.
       completion_confirmed: run !== null && run.status !== 'running' &&
@@ -408,7 +412,7 @@ mcpToolRegistry.register({
   },
   execute: async (_args: any, context: any) => {
     const data = await mcpFetch({ method: 'GET', path: '/api/agent-mode/sessions', context: ctx(context) });
-    return jsonResult(omitBranchedFrom(data));
+    return jsonResult(omitActiveRun(omitBranchedFrom(data)));
   }
 });
 
@@ -609,29 +613,76 @@ mcpToolRegistry.register({
   name: 'list_scheduled_chats',
   definition: {
     name: 'list_scheduled_chats',
-    description: 'List all scheduled chats for the authenticated user, or a specific client (admin-only, via client_id).',
+    description: 'List scheduled chats (newest first) for the authenticated user, or a specific client (admin-only, via client_id). Paginated: returns { items, nextCursor }; pass nextCursor back as cursor to get the next page (null = last page).',
     inputSchema: {
       type: 'object',
-      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      properties: {
+        client_id: CLIENT_ID_SCHEMA_PROPERTY,
+        limit: { type: 'number', description: `Page size (default ${SCHEDULED_CHATS_DEFAULT_LIMIT}, max ${SCHEDULED_CHATS_MAX_LIMIT})` },
+        cursor: { type: 'string', description: 'Opaque nextCursor from a previous page' },
+      },
       required: []
     }
   },
-  /** Lists scheduled chats for the caller, or (admin-only) for `args.client_id`'s account. */
+  /**
+   * Lists scheduled chats for the caller, or (admin-only) for `args.client_id`'s account.
+   * ENG-1611: always requests a bounded page so a large client account cannot
+   * produce an unbounded response.
+   */
   execute: async (args: any, context: any) => {
+    const limit = Number.isFinite(Number(args?.limit))
+      ? Math.min(SCHEDULED_CHATS_MAX_LIMIT, Math.max(1, Math.floor(Number(args.limit))))
+      : SCHEDULED_CHATS_DEFAULT_LIMIT;
+    const queryParams: Record<string, string> = { limit: String(limit) };
+    if (typeof args?.cursor === 'string' && args.cursor) queryParams.cursor = args.cursor;
     const data = await mcpFetch({
       method: 'GET',
       path: '/api/agent-mode/scheduled-chats',
+      queryParams,
       context: await resolveClientScopedContext(context, args?.client_id, 'list_scheduled_chats')
     });
     return jsonResult(data);
   }
 });
 
+const MANAGE_SCHEDULED_CHAT_ACTIONS = ['create', 'update', 'toggle', 'delete'];
+
+function isNonEmptyString(v: unknown): boolean {
+  return typeof v === 'string' && v.trim().length > 0;
+}
+
+/** ENG-1656: field-named validation for manage_scheduled_chat; null when the call is well-formed. */
+export function validateManageScheduledChatArgs(args: any): string | null {
+  const action = args?.action;
+  if (!MANAGE_SCHEDULED_CHAT_ACTIONS.includes(action)) return null; // default branch reports Unknown action
+  const fail = (msg: string) => `Invalid manage_scheduled_chat arguments: ${msg}`;
+  if (action === 'create') {
+    const missing = ['schedule_name', 'starting_message', 'schedule_frequency'].filter((f) => !isNonEmptyString(args[f]));
+    if (missing.length) return fail(`Missing required fields: ${missing.join(', ')} (required for action "create")`);
+  } else if (!isNonEmptyString(args.schedule_id)) {
+    return fail(`schedule_id is required for action "${action}" — call list_scheduled_chats to get one`);
+  }
+  if (action === 'toggle' && args.status !== 'active' && args.status !== 'paused') {
+    return fail('status must be "active" or "paused" for action "toggle"');
+  }
+  if (action === 'create' || action === 'update') {
+    if (args.email_notifications !== undefined &&
+        !Array.isArray(args.email_notifications)) {
+      // [] is valid: the explicit "no email" opt-out (Opslane #2).
+      return fail('email_notifications must be an array of email addresses when provided (use [] for no email)');
+    }
+    if (args.next_run_time !== undefined && Number.isNaN(Date.parse(args.next_run_time))) {
+      return fail('next_run_time must be an ISO 8601 datetime (e.g. 2026-10-14T09:00:00Z)');
+    }
+  }
+  return null;
+}
+
 mcpToolRegistry.register({
   name: 'manage_scheduled_chat',
   definition: {
     name: 'manage_scheduled_chat',
-    description: 'Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: "create", "update", "toggle", or "delete". For "create": schedule_name, starting_message, and schedule_frequency are REQUIRED — do not call with action "create" unless you have all three. email_notifications is optional but strongly recommended — without it, the user gets no automatic notification when a run completes. For "update": schedule_id is required; omit any field to keep its existing value — if you provide email_notifications it must be non-empty. IMPORTANT: When email_notifications is configured on the schedule, the system automatically emails results after every run — do NOT include notify_session or any email-sending instruction in starting_message, as that would cause duplicate emails (one from the system, one from the AI executing the tool).',
+    description: 'Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: "create", "update", "toggle", or "delete". For "create": schedule_name, starting_message, and schedule_frequency are REQUIRED — do not call with action "create" unless you have all three. email_notifications: omit it to email results to the requesting user by default; pass [] ONLY when the user explicitly declines email (no emails are sent). For "update": schedule_id is required; omit any field to keep its existing value — email_notifications: [] turns emails off. next_run_time must carry a UTC offset (e.g. 2026-10-19T09:00:00-04:00), or pass timezone (the user IANA zone) and give next_run_time as local time in that zone. The result echoes what was stored — nextRunTime, nextRunTimeLocal (in the schedule timezone) and emailNotifications; tell the user those stored values, not what you intended to send. IMPORTANT: When email_notifications is configured on the schedule, the system automatically emails results after every run — do NOT include notify_session or any email-sending instruction in starting_message, as that would cause duplicate emails (one from the system, one from the AI executing the tool).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -641,12 +692,13 @@ mcpToolRegistry.register({
         starting_message: { type: 'string', description: 'The prompt/message to run on each execution (REQUIRED for create, optional for update). IMPORTANT: Do NOT include notify_session or any instruction to send an email in this prompt when email_notifications is set — the system already sends emails automatically, and adding notify_session here will cause duplicate emails.' },
         schedule_frequency: { type: 'string', description: 'Frequency: hourly, daily, weekly, monthly, every_n_days (REQUIRED for create, optional for update)' },
         frequency_interval_days: { type: 'number', description: 'Number of days between runs when schedule_frequency is every_n_days (create/update)' },
-        next_run_time: { type: 'string', description: 'ISO 8601 datetime for the first/next run (create/update)' },
+        next_run_time: { type: 'string', description: 'ISO 8601 datetime for the first/next run (create/update). Include a UTC offset (2026-10-19T09:00:00-04:00), or omit the offset AND pass timezone so it is read as local time in that zone. An offset-less time with no timezone is rejected.' },
+        timezone: { type: 'string', description: 'The user\'s IANA timezone, e.g. America/New_York (create/update). Used to interpret an offset-less next_run_time and stored on the schedule for its local-calendar cadence.' },
         description: { type: 'string', description: 'Description (create/update)' },
         keywords: { type: 'array', items: { type: 'string' }, description: 'Keywords to look for in results (create/update)' },
         required_function_calls: { type: 'array', items: { type: 'string' }, description: 'Function calls required in each run (create/update). Without a tool listed here, its delivery is best-effort — the run can complete "successfully" even if the model skips it, silently. IMPORTANT (ENG-2204): if starting_message instructs posting, alerting, or notifying via Slack, ALWAYS include slack_send_message here too — an unattended run has no live approval step for it, and without this it may be silently skipped even when the task asked for it. Same reasoning applies to any other action the run must actually take (a publish tool, etc.) — list it here rather than trusting the prompt wording alone.' },
         function_call_min_calls: { type: 'object', description: 'Minimum call counts per function (create/update)' },
-        email_notifications: { type: 'array', items: { type: 'string' }, description: 'Email addresses for notifications (optional for create/update but strongly recommended — without it, the user gets no automatic notification when a run completes; if provided, must be non-empty)' },
+        email_notifications: { type: 'array', items: { type: 'string' }, description: 'Email addresses that receive results after every run (create/update). Omit on create to default to the requesting user\'s email; omit on update to keep the current recipients. Pass [] only when the user explicitly does not want email — that stores no recipients and sends nothing.' },
         daily_digest: { type: 'boolean', description: 'Send daily digest instead of per-run emails (create/update, hourly only)' },
         self_improve: { type: 'boolean', description: 'When true, after each run a reflection turn reviews the result and may automatically refine starting_message so future runs do better. Off by default (create/update).' },
         run_count: { type: 'number', description: 'Number of runs (-1 for unlimited, create/update)' },
@@ -663,6 +715,13 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const c = ctx(context);
+    // ENG-1656: reject malformed calls before any network hop with a message that
+    // names the exact field. Without this an update/toggle/delete missing
+    // schedule_id hit `/scheduled-chats/undefined` and came back as a misleading
+    // "Scheduled chat not found", and a create missing a required field cost a
+    // round-trip before failing.
+    const preflight = validateManageScheduledChatArgs(args);
+    if (preflight) throw new Error(preflight);
     switch (args.action) {
       case 'create': {
         const body: any = {
@@ -676,7 +735,13 @@ mcpToolRegistry.register({
         if (args.keywords !== undefined) body.keywords = args.keywords;
         if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
         if (args.function_call_min_calls !== undefined) body.functionCallMinCalls = args.function_call_min_calls;
-        if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
+        if (args.email_notifications !== undefined) {
+          body.emailNotifications = args.email_notifications;
+          // An explicit [] is the user declining email — tell the API it is deliberate,
+          // so it neither substitutes the requester's address nor refuses the clear.
+          if (Array.isArray(args.email_notifications) && args.email_notifications.length === 0) body.emailNotificationsOptOut = true;
+        }
+        if (args.timezone !== undefined) body.timezone = args.timezone;
         if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
         if (args.self_improve !== undefined) body.selfImprove = args.self_improve;
         if (args.run_count !== undefined) body.runCount = args.run_count;
@@ -685,6 +750,7 @@ mcpToolRegistry.register({
         if (args.llm_model !== undefined) body.llmModel = args.llm_model;
         if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
         if (args.session_id !== undefined) body.sessionId = args.session_id;
+        if (args.timezone !== undefined) body.timezone = args.timezone;
         const data = await mcpFetch({ method: 'POST', path: '/api/agent-mode/scheduled-chats', context: c, body });
         return jsonResult(data);
       }
@@ -700,7 +766,13 @@ mcpToolRegistry.register({
         if (args.keywords !== undefined) body.keywords = args.keywords;
         if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
         if (args.function_call_min_calls !== undefined) body.functionCallMinCalls = args.function_call_min_calls;
-        if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
+        if (args.email_notifications !== undefined) {
+          body.emailNotifications = args.email_notifications;
+          // An explicit [] is the user declining email — tell the API it is deliberate,
+          // so it neither substitutes the requester's address nor refuses the clear.
+          if (Array.isArray(args.email_notifications) && args.email_notifications.length === 0) body.emailNotificationsOptOut = true;
+        }
+        if (args.timezone !== undefined) body.timezone = args.timezone;
         if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
         if (args.self_improve !== undefined) body.selfImprove = args.self_improve;
         if (args.run_count !== undefined) body.runCount = args.run_count;
@@ -730,6 +802,7 @@ mcpToolRegistry.register({
         }
 
         if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
+        if (args.timezone !== undefined) body.timezone = args.timezone;
         const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}`, context: c, body });
         return jsonResult(publishConsent ? { ...(data as any), publishConsent } : data);
       }
@@ -2900,7 +2973,8 @@ mcpToolRegistry.register({
               userInstructions: { type: 'string', description: 'Instructions shown to the user for this step. Alias: user_instructions.' },
               stepCount: { type: 'number', description: 'Step order, 1-based. Defaults to the array position. In steps_mode="merge" this is what selects the existing step to amend. Alias: step_count.' },
               expectedAssetCount: { type: 'number', description: 'For a step that must produce a fixed number of media assets (e.g. "generate 18 images"), the required count. The step cannot be marked completed until that many assets have been produced SINCE THE PREVIOUS STEP RESOLVED — an earlier step\'s assets never count toward a later step\'s requirement. Omit for steps with no fixed asset count. Alias: expected_asset_count.' },
-              expectedAssetCountTools: { type: 'array', items: { type: 'string' }, description: 'Which tool name(s) count toward expectedAssetCount, for a step that calls more than one asset-producing tool that aren\'t interchangeable (e.g. a step that builds a few reusable HTML templates via create_html_file AND takes one screenshot per requested size via playwright_browser_take_screenshot — only the screenshot count is "the N things"). Named tools are summed. Omit when the step calls only one asset-producing tool, or when every asset-producing tool it calls should count as the same deliverable — the count then falls back to the largest count among them. Alias: expected_asset_count_tools.' }
+              expectedAssetCountTools: { type: 'array', items: { type: 'string' }, description: 'Which tool name(s) count toward expectedAssetCount, for a step that calls more than one asset-producing tool that aren\'t interchangeable (e.g. a step that builds a few reusable HTML templates via create_html_file AND takes one screenshot per requested size via playwright_browser_take_screenshot — only the screenshot count is "the N things"). Named tools are summed. Omit when the step calls only one asset-producing tool, or when every asset-producing tool it calls should count as the same deliverable — the count then falls back to the largest count among them. Alias: expected_asset_count_tools.' },
+              model: { type: 'string', description: 'Optional model for THIS step (a canonical model id from the model picker). When set, the step runs on exactly this model and the plan pauses (never switches models) if it becomes unavailable. Omit to use the plan default_model, then the account default. Only stored while per-step models are enabled; a blank string clears it in steps_mode="merge". A model that is not served or not selectable is refused with a 422 naming the step.' }
             },
             required: ['title']
           },
@@ -2913,7 +2987,7 @@ mcpToolRegistry.register({
         },
         confirm_step_removal: {
           type: 'boolean',
-          description: 'Required (true) when a steps_mode="replace" update would leave the plan with fewer steps than it has now, or would blank fields (description, requiredFunctionCalls, skillIds, userInstructions, expectedAssetCount, expectedAssetCountTools) that are currently set on the steps it keeps. Without it the update is rejected instead of silently destroying that content.'
+          description: 'Required (true) when a steps_mode="replace" update would leave the plan with fewer steps than it has now, or would blank fields (description, requiredFunctionCalls, skillIds, userInstructions, expectedAssetCount, expectedAssetCountTools, model) that are currently set on the steps it keeps. Without it the update is rejected instead of silently destroying that content.'
         }
       },
       required: ['action']
@@ -3026,7 +3100,8 @@ async function runManagePredefinedWorkPlan(args: any, c: any): Promise<any> {
             }
             body.steps = mergeWorkPlanSteps(existingSteps || [], incomingSteps);
           } else {
-            body.steps = incomingSteps;
+            // ENG-2378: a replace built from memory (the tool never shows a step's model) must not erase stored models.
+            body.steps = carryStoredStepModels(incomingSteps, existingSteps);
             if (existingSteps && body.steps.length < existingSteps.length && args.confirm_step_removal !== true) {
               const preview = summarizeStepChange(existingSteps, body.steps, 'replace');
               return jsonResult({

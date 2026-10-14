@@ -644,6 +644,12 @@ createTestAccount().then(async () => {
       .then(({ ensureCriticalTables }) => ensureCriticalTables())
       .catch((err) => console.error('[startup] ensureCriticalTables failed (non-fatal):', err?.message || err));
 
+    // Register app-wide HubSpot webhook subscriptions once per build (one instance wins the claim).
+    import('./utils/hubspotWebhookSubscriptionsBoot')
+      .then(({ ensureWebhookSubscriptionsOncePerBuild }) => ensureWebhookSubscriptionsOncePerBuild())
+      .then((outcome) => console.log(`[startup] HubSpot webhook subscription sync: ${outcome}`))
+      .catch((err) => console.error('[startup] HubSpot webhook subscription sync failed (non-fatal):', err?.message || err));
+
     // Proactively refresh OAuth tokens for outbound MCP servers before they expire.
     import('./mcp/client/mcpOAuthRefreshService')
       .then(({ startMcpOAuthRefreshScheduler }) => startMcpOAuthRefreshScheduler())

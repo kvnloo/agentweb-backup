@@ -1561,6 +1561,22 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(flagWrite).toBeUndefined();
     });
 
+    // ENG-2493: a schedule created with email_notifications: [] persists emailOptOut;
+    // the owner fallback must not resurrect the address they declined.
+    it('sends no run-failed email to the owner when the schedule opted out of email (ENG-2493)', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
+      mockUserDb.getUserById.mockResolvedValue({ userId: mockUserId, email: 'owner@example.com' } as any);
+
+      await runScheduledChat(
+        { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 3,
+          emailNotifications: [], emailOptOut: true } as any,
+        mockUserId,
+        false,
+      );
+
+      expect(mockEmailService.sendScheduledRunFailedEmail).not.toHaveBeenCalled();
+    });
+
     it('alerts on each exhausted failing slot (no persisted dedup state to diverge)', async () => {
       // No "already alerted" flag is persisted, so there is no state to get out of sync
       // with delivery — every exhausted run notifies (a stale flag value is ignored).
@@ -4172,6 +4188,51 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       // Should only return scheduled_chat type
       expect(mockRes.json).toHaveBeenCalledWith([withHealth(scheduledChat)]);
     });
+
+    // ENG-1611: opt-in bounded pagination for large (admin client_id-scoped) accounts.
+    describe('pagination (ENG-1611)', () => {
+      const schedules = Array.from({ length: 250 }, (_, i) => ({
+        scheduleId: `s-${i}`,
+        userId: mockUserId,
+        type: 'scheduled_chat',
+        createdAt: new Date(Date.UTC(2026, 0, 1) + i * 60_000).toISOString(),
+      }));
+      const run = async (query: any) => {
+        mockScheduleDb.getSchedulesByUserId.mockResolvedValue([...schedules]);
+        const mockRes = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+        await agentModeController.getScheduledChats({ user: { userId: mockUserId }, query } as unknown as Request, mockRes);
+        return mockRes as any;
+      };
+
+      it('keeps the legacy bare array when no limit/cursor is passed', async () => {
+        const res = await run({});
+        expect(Array.isArray(res.json.mock.calls[0][0])).toBe(true);
+        expect(res.json.mock.calls[0][0]).toHaveLength(250);
+      });
+
+      it('walks every item newest-first in capped pages and terminates', async () => {
+        const seen: string[] = [];
+        let cursor: string | undefined;
+        let pages = 0;
+        do {
+          const res = await run({ limit: '1000', ...(cursor ? { cursor } : {}) });
+          const body = res.json.mock.calls[0][0];
+          expect(body.items.length).toBeLessThanOrEqual(100);
+          seen.push(...body.items.map((s: any) => s.scheduleId));
+          cursor = body.nextCursor ?? undefined;
+          pages++;
+        } while (cursor && pages < 10);
+        expect(pages).toBe(3);
+        expect(seen).toHaveLength(250);
+        expect(seen[0]).toBe('s-249');
+        expect(seen[249]).toBe('s-0');
+      });
+
+      it('rejects a malformed cursor with 400', async () => {
+        const res = await run({ cursor: '%%%' });
+        expect(res.status).toHaveBeenCalledWith(400);
+      });
+    });
   });
 
   describe('subscription wildcard handling', () => {
@@ -4320,6 +4381,28 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         scheduleNoEmails.scheduleId,
         expect.objectContaining({ allowed: false })
       );
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+    });
+
+    it('sends no usage-limit or disallowed-tool email to the owner when the schedule opted out (ENG-2493)', async () => {
+      mockedCheckTokenUsage.mockResolvedValueOnce({
+        allowed: false, warning: false, used: 1050000, allowance: 1000000, percentUsed: 105,
+        effectiveAllowance: 1000000, bonus: 0, month: '2026-04', costUsed: 0, costAllowance: null,
+        costPercentUsed: 0, costEnforced: false,
+        alertThresholds: { usagePercent: 90, onForecastShortfall: true },
+      });
+      await runScheduledChat(
+        { ...baseSchedule, requiredFunctionCalls: [], emailNotifications: [], emailOptOut: true } as any,
+        mockUserId, true,
+      );
+      expect(mockEmailService.sendScheduledChatTokenLimitEmail).not.toHaveBeenCalled();
+
+      mockedGetAllowedFunctionCalls.mockResolvedValueOnce([]);
+      await runScheduledChat(
+        { ...baseSchedule, emailNotifications: [], emailOptOut: true } as any,
+        mockUserId, true,
+      );
+      expect(mockEmailService.sendScheduledChatErrorEmail).not.toHaveBeenCalled();
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
     });
 
@@ -4856,6 +4939,20 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       });
 
       await runScheduledChat(staleSchedule, mockUserId, false);
+
+      expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).not.toHaveBeenCalled();
+    });
+
+    it('sends no sourcing-block email to the owner when the schedule opted out of email (ENG-2493)', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(blockedToolCallsResponse);
+      mockUserDb.getUserById.mockResolvedValue({ userId: mockUserId, email: 'owner@example.com' } as any);
+      const optedOut = { ...baseSchedule, emailNotifications: [], emailOptOut: true };
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...optedOut,
+        runResults: [{ status: 'success', passed: true, blockedBy: undefined, createdAt: new Date().toISOString() }],
+      });
+
+      await runScheduledChat(optedOut, mockUserId, false);
 
       expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).not.toHaveBeenCalled();
     });
