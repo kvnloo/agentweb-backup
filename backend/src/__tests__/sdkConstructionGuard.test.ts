@@ -114,7 +114,7 @@ const ALLOWLIST = new Set<string>([
   // is not a text/chat call routable through the OpenRouter gateway — it needs
   // Gemini's own sandboxed code-execution tool to analyze uploaded CSV/data
   // files. Independently metered via meterUsageFromResponse (utils/llmClients.ts),
-  // same non-factory-but-still-metered shape as videoGeneration.ts below. This
+  // a non-factory-but-still-metered shape (cf. liveVoiceService.ts below). This
   // call site used to be covered by the broad agentModeService.ts entry above
   // before the extraction; scoping it to this file is narrower, not new.
   'emma/impl/searchResearch.ts',
@@ -122,10 +122,6 @@ const ALLOWLIST = new Set<string>([
   // the factory; usage recorded directly from usageMetadata in
   // handleIncomingMessage. Module-level singleton is intentional.
   'services/liveVoiceService.ts',
-  // videoGeneration: Veo video generation via GoogleGenAI. Billed per-video,
-  // not per-token — token metering does not apply. Video/image cost is tracked
-  // separately (incrementUserTokenUsage cost-only path in agentModeService).
-  'services/videoGeneration.ts',
   // chatbotService constructs Azure's embeddings client for semantic search;
   // its chat/text generation path routes through AgentModeService.callLLM.
   'services/chatbotService.ts',
@@ -350,7 +346,6 @@ describe('SDK construction guard alias resistance (ENG-1414)', () => {
   it('passes the approved gateway and documented non-text exceptions', () => {
     expect(() => assertNoForbiddenProviderImports('utils/llmClients.ts', "import OpenAI from 'openai';")).not.toThrow();
     expect(() => assertNoForbiddenProviderImports('services/liveVoiceService.ts', "import { GoogleGenAI } from '@google/genai';")).not.toThrow();
-    expect(() => assertNoForbiddenProviderImports('services/videoGeneration.ts', "const sdk = require('@google/genai');")).not.toThrow();
   });
 });
 
