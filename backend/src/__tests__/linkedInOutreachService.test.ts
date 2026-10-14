@@ -2246,6 +2246,39 @@ describe('LinkedInOutreachService', () => {
 
       expect(result).toBeNull();
     });
+
+    // ENG-2468 regression: reconnect appends a new account after the dead one.
+    it('skips a dead first account and returns the reconnected live one', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'dead-old' },
+        { platform: 'unipile', account_id: 'live-new' },
+      ]);
+      const probe = jest
+        .spyOn(linkedInOutreachService as any, 'probeAccountSession')
+        .mockImplementation(async (id: any) => (id === 'live-new' ? 'connected' : 'disconnected'));
+      try {
+        expect(await linkedInOutreachService.resolveUserOwnedAccountId('user-5')).toBe('live-new');
+      } finally {
+        probe.mockRestore();
+      }
+    });
+
+    it('prefers an unverifiable account over a proven-dead one, and falls back to first when all dead', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'a' },
+        { platform: 'unipile', account_id: 'b' },
+      ]);
+      const probe = jest
+        .spyOn(linkedInOutreachService as any, 'probeAccountSession')
+        .mockImplementation(async (id: any) => (id === 'b' ? 'unknown' : 'disconnected'));
+      try {
+        expect(await linkedInOutreachService.resolveUserOwnedAccountId('user-6')).toBe('b');
+        probe.mockImplementation(async () => 'disconnected');
+        expect(await linkedInOutreachService.resolveUserOwnedAccountId('user-6')).toBe('a');
+      } finally {
+        probe.mockRestore();
+      }
+    });
   });
 
   describe('listUserOwnedUnipileAccountIds', () => {

@@ -7507,8 +7507,15 @@ const SELF_ONLY_BRIDGE_DEFINITIONS: Record<string, { description: string; inputS
     inputSchema: { type: 'object', properties: {}, required: [] },
   },
   list_scheduled_chats: {
-    description: 'List all scheduled chats for the authenticated user.',
-    inputSchema: { type: 'object', properties: {}, required: [] },
+    description: 'List scheduled chats (newest first) for the authenticated user. Paginated: returns { items, nextCursor }; pass nextCursor back as cursor for the next page (null = last page).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Page size (default 50, max 100)' },
+        cursor: { type: 'string', description: 'Opaque nextCursor from a previous page' },
+      },
+      required: [],
+    },
   },
 };
 
@@ -7847,11 +7854,17 @@ emmaToolRegistry.register({
       }
     }
 
+    // ENG-2378: a step model on the session plan is the user's explicit choice; carry it into the saved template
+    // while per-step models are honoured (switch on, or unknown after a settings outage).
+    const { anyStepCarriesModel, carryStoredStepModels } = await import('../services/agentMode/workPlanStepModels');
+    const carrySessionModels = anyStepCarriesModel(sessionWorkPlan?.steps)
+      && await (await import('../services/agentMode/workPlanStepModelsInstance')).workPlanStepModels.shouldHonor();
+
     const plan = await workPlanService.createWorkPlan({
       title: args.title,
       description: args.description || '',
       welcomeMessage: args.welcomeMessage || '',
-      steps: steps.map((s: any, i: number) => {
+      steps: (carrySessionModels ? (list: any[]) => carryStoredStepModels(list, sessionWorkPlan.steps) : (list: any[]) => list)(steps.map((s: any, i: number) => {
         const stepNum = s.stepCount || i + 1;
         const sessionStep = sessionStepMap.get(stepNum);
         return {
@@ -7874,7 +7887,7 @@ emmaToolRegistry.register({
             return count !== undefined ? { expectedAssetCount: count } : {};
           })(),
         };
-      }),
+      })),
       ownerId: userId,
       visibility: 'private',
       isBuiltIn: false,
