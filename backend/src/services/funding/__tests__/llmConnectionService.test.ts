@@ -6,6 +6,7 @@
 jest.mock('../../db', () => ({ userDb: {}, orgDb: {} }));
 jest.mock('../fundingFlags', () => ({ isByokEnabledFor: jest.fn() }));
 
+import { openSecret, sealSecret } from '../llmConnectionCrypto';
 import { LlmConnectionError, LlmConnectionService, MAX_ACTIVE_CONNECTIONS_PER_OWNER } from '../llmConnectionService';
 import type { KeyCheckResult } from '../llmProviderValidation';
 import { FakeKms, makeDb } from './llmConnectionTestKit';
@@ -329,6 +330,74 @@ describe('LlmConnectionService', () => {
       const { connectionId } = await service.add({ userId: 'solo' }, { provider: 'openai', apiKey: KEY_B });
       validateKey.mockResolvedValueOnce('quota_exhausted');
       expect((await service.validate({ userId: 'solo' }, connectionId)).connection.status).toBe('active');
+    });
+  });
+
+  describe('a Claude login is never treated as an API key (ENG-2110)', () => {
+    const LOGIN = '{"claudeAiOauth":{"accessToken":"SENTINEL-ACCESS-TOKEN","refreshToken":"SENTINEL-REFRESH-TOKEN"}}';
+    async function withLogin(ownerId = 'solo', over: Record<string, unknown> = {}) {
+      const ctx = setup();
+      const sealed = await sealSecret(ctx.kms, LOGIN, { connectionId: 'login-1', ownerUserId: ownerId, provider: 'anthropic', purpose: 'claude_login' });
+      await ctx.store.db.create({
+        connectionId: 'login-1', ownerUserId: ownerId, kind: 'claude_subscription', provider: 'anthropic', status: 'active', keyLast4: '',
+        createdAt: '2026-10-14T00:00:00.000Z', updatedAt: '2026-10-14T00:00:00.000Z', sealed,
+        subVersion: 1, subNeedsReconnect: false, subType: 'max', subRefreshExpiresAtMs: Date.UTC(2026, 10, 12), ...over,
+      } as any);
+      return ctx;
+    }
+
+    it('is listed for its owner with plan, expiry and reconnect state, and no secret', async () => {
+      const { service } = await withLogin();
+      const { connections } = await service.list('solo');
+      expect(connections).toHaveLength(1);
+      expect(connections[0]).toMatchObject({ kind: 'claude_subscription', health: { expiresAt: '2026-11-12T00:00:00.000Z' }, subscription: { plan: 'max', needsReconnect: false } });
+      expect(JSON.stringify(connections)).not.toMatch(/SENTINEL|wrappedDataKey|ciphertext/);
+    });
+
+    it('is not usable as a key by anyone, and is never decrypted by the key paths', async () => {
+      const { service, kms } = await withLogin();
+      expect(await service.listUsableForUser('solo')).toEqual([]);
+      expect(await code(service.getKeyMaterial('login-1', 'solo'))).toBe('not_usable');
+      expect(kms.decryptCalls).toHaveLength(0);
+    });
+
+    it('is not sent to a provider key validator', async () => {
+      const { service, validateKey, kms } = await withLogin();
+      expect(await code(service.validate({ userId: 'solo' }, 'login-1'))).toBe('not_found');
+      expect(validateKey).not.toHaveBeenCalled();
+      expect(kms.decryptCalls).toHaveLength(0);
+    });
+
+    it('cannot be shared with an org, even by its owner', async () => {
+      const { service } = await withLogin('owner-1');
+      expect(await code(service.setShared({ userId: 'owner-1' }, 'login-1', true))).toBe('forbidden');
+      expect(await code(service.setShared({ userId: 'owner-1' }, 'login-1', false))).toBe('forbidden');
+    });
+
+    it('is invisible to other people, including org members', async () => {
+      const { service } = await withLogin('owner-1');
+      expect((await service.list('member')).connections).toEqual([]);
+      expect(await code(service.revoke({ userId: 'member' }, 'login-1'))).toBe('not_found');
+    });
+
+    it('cannot be opened with the API-key context, and an API key cannot be opened with the login context', async () => {
+      const { kms } = await withLogin();
+      const row = (await (await withLogin()).store.db.get('login-1'))!;
+      expect(row.sealed).toBeTruthy();
+      const sealedKey = await sealSecret(kms, KEY_A, { connectionId: 'k', ownerUserId: 'solo', provider: 'anthropic' });
+      await expect(openSecret(kms, sealedKey, { connectionId: 'k', ownerUserId: 'solo', provider: 'anthropic', purpose: 'claude_login' })).rejects.toBeTruthy();
+      const ctx = await withLogin();
+      const stored = (await ctx.store.db.get('login-1'))!.sealed!;
+      await expect(openSecret(ctx.kms, stored, { connectionId: 'login-1', ownerUserId: 'solo', provider: 'anthropic' })).rejects.toBeTruthy();
+    });
+
+    it('is revoked like any connection: the sealed login is gone and the slot is freed', async () => {
+      const { service, store } = await withLogin();
+      await service.revoke({ userId: 'solo' }, 'login-1');
+      const row = (await store.db.get('login-1'))!;
+      expect(row.status).toBe('revoked');
+      expect(row.sealed).toBeUndefined();
+      expect((await service.list('solo')).connections).toEqual([]);
     });
   });
 
