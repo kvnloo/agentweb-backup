@@ -10,9 +10,9 @@
  *  - a failed ConditionExpression leaves the item untouched.
  *
  * Supported grammar (all this codebase's onboarding writes need):
- *   Update:    SET a = :v, #a.#b[2] = :v   REMOVE #x, #y
+ *   Update:    SET a = :v, #a.#b[2] = :v   REMOVE #x, #y, #l[2] (a list element is spliced out)
  *   Condition: OR of AND-groups, parenthesised groups allowed; each clause is `PATH = :v`, `PATH <> :v`,
- *              `PATH <= :v`, `attribute_exists(PATH)` or `attribute_not_exists(PATH)`
+ *              `PATH <= :v`, `attribute_exists(PATH)`, `attribute_not_exists(PATH)` or `attribute_type(PATH, :t)`
  *
  * Eventual consistency: set `table.indexRow` to make `query` (the UserIdIndex
  * GSI) keep returning that older snapshot while `get` (a base-table read)
@@ -82,6 +82,26 @@ function writePath(root: any, steps: Step[], value: any): void {
   });
 }
 
+/** `REMOVE path`: splice a list element out (later ones shift down) or delete a key, as DynamoDB does. A missing path is a no-op. */
+function removePath(root: any, steps: Step[]): void {
+  let cur = root;
+  for (let i = 0; i < steps.length; i++) {
+    const s = steps[i];
+    const last = i === steps.length - 1;
+    if (cur == null || typeof cur !== "object" || !(s.key in cur)) return;
+    if (last) {
+      if (s.index === undefined) delete cur[s.key];
+      else if (Array.isArray(cur[s.key]) && s.index < cur[s.key].length) cur[s.key].splice(s.index, 1);
+      return;
+    }
+    cur = cur[s.key];
+    if (s.index !== undefined) {
+      if (!Array.isArray(cur) || s.index >= cur.length) return;
+      cur = cur[s.index];
+    }
+  }
+}
+
 function placeholdersIn(expr: string): { names: Set<string>; values: Set<string> } {
   return {
     names: new Set(expr.match(/#\w+/g) ?? []),
@@ -92,6 +112,14 @@ function placeholdersIn(expr: string): { names: Set<string>; values: Set<string>
 function evalClause(clause: string, row: any, names: Record<string, string>, values: Record<string, any>): boolean {
   const exists = clause.match(/^attribute_exists\((.+)\)$/);
   if (exists) return readPath(row, parsePath(exists[1], names)).exists;
+  const typed = clause.match(/^attribute_type\((.+?),\s*(:\w+)\)$/);
+  if (typed) {
+    const got = readPath(row, parsePath(typed[1], names));
+    if (!got.exists) return false;
+    const v = got.value;
+    const kind = v === null ? "NULL" : Array.isArray(v) ? "L" : typeof v === "object" ? "M" : typeof v === "string" ? "S" : typeof v === "number" ? "N" : typeof v === "boolean" ? "BOOL" : "?";
+    return kind === values[typed[2]];
+  }
   const notExists = clause.match(/^attribute_not_exists\((.+)\)$/);
   if (notExists) return !readPath(row, parsePath(notExists[1], names)).exists;
   const cmp = clause.match(/^(.+?)\s*(<>|<=|=)\s*(:\w+)$/);
@@ -179,10 +207,7 @@ export function createFakeDocClient(table: FakeTable) {
         const next = clone(table.row);
         const [setPart, removePart] = update.replace(/^SET\s+/, "").split(/\s+REMOVE\s+/);
         if (update.startsWith("REMOVE")) {
-          for (const r of update.replace(/^REMOVE\s+/, "").split(",")) {
-            const steps = parsePath(r.trim(), names);
-            delete next[steps[0].key];
-          }
+          for (const r of update.replace(/^REMOVE\s+/, "").split(",")) removePath(next, parsePath(r.trim(), names));
         } else {
           for (const assignment of setPart.split(/,\s*(?=[#\w.\[\]]+\s*=\s*:)/)) {
             const m = assignment.match(/^(.+?)\s*=\s*(:\w+)$/);
@@ -190,7 +215,7 @@ export function createFakeDocClient(table: FakeTable) {
             writePath(next, parsePath(m[1], names), clone(values[m[2]]));
           }
           if (removePart) {
-            for (const r of removePart.split(",")) delete next[parsePath(r.trim(), names)[0].key];
+            for (const r of removePart.split(",")) removePath(next, parsePath(r.trim(), names));
           }
         }
         table.row = next;

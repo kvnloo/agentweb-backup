@@ -12,7 +12,9 @@ const LUMA_PUBLIC_API = 'https://public-api.luma.com';
 // imports in server.ts, so a load-time read would silently miss a value from .env.
 function lumaApiBase(): string {
   const override = process.env.LUMA_API_BASE_URL;
-  return process.env.NODE_ENV !== 'production' && override ? override : LUMA_PUBLIC_API;
+  // Allowlist, not `!== 'production'`: a mis-set NODE_ENV on a real server must not be able to redirect keys.
+  const env = process.env.NODE_ENV;
+  return (env === 'development' || env === 'test') && override ? override : LUMA_PUBLIC_API;
 }
 const REQUEST_TIMEOUT_MS = 20_000;
 const PAGE_SIZE = 100;
@@ -222,11 +224,13 @@ export class LumaApiService {
       // has_more without a cursor cannot be resumed; re-reading page one would return duplicates.
       if (hasMore && !cursor) hasMore = false;
 
+      let registeredOnPage = 0;
       for (const g of data.entries || []) {
         if (!g.registered_at && !keepUnregistered) {
           skipped += 1;
           continue;
         }
+        registeredOnPage += 1;
         if (g.registered_at && Number.isFinite(cutoff) && Date.parse(g.registered_at) < cutoff) {
           crossedCutoff = true;
           continue;
@@ -243,6 +247,10 @@ export class LumaApiService {
           registration_answers: g.registration_answers ?? null,
         });
       }
+      // Sorted `desc nulls last`, so a page with NO registered rows means everything after it is unregistered too:
+      // stop instead of paging through up to 25 pages of them against the rate limit. Judged per PAGE, not per
+      // row, so a mixed page (if Luma ever interleaves them) keeps going rather than silently truncating the list.
+      if (!keepUnregistered && (data.entries || []).length > 0 && registeredOnPage === 0) crossedCutoff = true;
     }
 
     const exhausted = !interrupted && (crossedCutoff || !hasMore);

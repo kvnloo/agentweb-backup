@@ -1,4 +1,5 @@
 import express from 'express';
+import rateLimit from 'express-rate-limit';
 import { authenticateToken } from '../middleware/auth';
 import { createAccount, LumaConfig } from '../services/connectedAccountsDb';
 import { LumaApiService, LumaApiError } from '../services/lumaApiService';
@@ -8,9 +9,21 @@ import { NON_EXPIRING_TOKEN_TIMESTAMP } from '../utils/tokenUtils';
 
 const router = express.Router();
 
+// /connect makes an outbound call with a user-supplied key, so without a limit it is a free Luma-key validator.
+// Keyed by user (this runs after authenticateToken), generous for a human retyping a key.
+const connectLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req: any) => String(req.user?.userId ?? 'anonymous'),
+  validate: { keyGeneratorIpFallback: false },
+  message: { error: 'Too many attempts to connect a Luma key. Try again in a few minutes.' },
+});
+
 // POST /connect — validate a Luma calendar API key against Luma, then store it
 // encrypted as a connected account (ENG-2338). Keys are per-calendar and need Luma Plus.
-router.post('/connect', authenticateToken, async (req: any, res) => {
+router.post('/connect', authenticateToken, connectLimiter, async (req: any, res) => {
   const userId = req.user.userId;
   const apiKey = typeof req.body?.api_key === 'string' ? req.body.api_key.trim() : '';
   if (!apiKey) {
