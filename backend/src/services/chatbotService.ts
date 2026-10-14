@@ -264,10 +264,21 @@ export interface ChatSession {
       // = the gate falls back to the max succeeded count across every known
       // asset-producing tool.
       expectedAssetCountTools?: string[];
+      /** ENG-2378: this step's explicit model (canonical registry id), copied from the template at launch. */
+      model?: string;
       inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
     }>;
     createdAt: string;
     updatedAt: string;
+    // ENG-2378 (only written for plans whose steps carry a model): the plan's default pin and the model the session
+    // had before the plan started (what a step WITHOUT a model falls back to), and the model the engine last stamped
+    // (so a user's explicit pick during the plan can be told apart when the plan ends).
+    planDefaultModel?: string;
+    launchModel?: string;
+    engineModel?: string;
+    // The model the USER explicitly picked during the plan (a resumed step adopts it, or a model-less step runs on it):
+    // the end-of-plan restore never replaces it.
+    pickedModel?: string;
     welcomeMessage?: string; // Custom welcome message for this work plan
     autocomplete?: boolean; // When true, Emma MUST complete each step before responding to the user
     // ENG-1472: the predefined WorkPlan template (AW-WorkPlans planId) this
@@ -3880,12 +3891,19 @@ export class ChatbotDB {
         expectedAssetCount?: number;
         /** ENG-1331: see the matching field on the read-side workPlan type above. */
         expectedAssetCountTools?: string[];
+        /** ENG-2378: see the matching field on the read-side workPlan type above. */
+        model?: string;
         inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
       }>;
       createdAt: string;
       updatedAt: string;
       welcomeMessage?: string;
       autocomplete?: boolean;
+      /** ENG-2378: see the matching fields on the read-side workPlan type above. */
+      planDefaultModel?: string;
+      launchModel?: string;
+      engineModel?: string;
+      pickedModel?: string;
       /** ENG-1472: see the matching field on the read-side workPlan type above. */
       templatePlanId?: string;
       /** ENG-1811: see the matching field on the read-side workPlan type above. */
