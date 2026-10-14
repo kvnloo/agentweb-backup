@@ -56,6 +56,7 @@ const mockAgentModeService = {
   executeTool: mockExecuteTool,
   initialize: mockInitialize,
   buildSkillContext: (...args: any[]) => mockBuildSkillContext(...args),
+  ensureOtherSkillsSnapshot: jest.fn().mockResolvedValue(undefined),
   getAdminToolNames: (...args: any[]) => mockGetAdminToolNames(...args),
 };
 
@@ -340,6 +341,7 @@ describe('generateChatResponse — skill-session tool binding (ENG-1222)', () =>
       [googleAdsSkill],
       ['google-ads-skill'],
       false,
+      undefined,
     );
   });
 });
@@ -564,7 +566,7 @@ describe('generateChatResponse — ENG-1222 risk-hardening: perf, anonymous user
     expect(mockGetAllowedSkills).not.toHaveBeenCalled();
     expect(mockGetPublicAllowedSkills).toHaveBeenCalled();
     expect(mockBuildSkillContext).toHaveBeenCalledWith(
-      [googleAdsSkill], ['google-ads-skill'], [googleAdsSkill], ['google-ads-skill'], false,
+      [googleAdsSkill], ['google-ads-skill'], [googleAdsSkill], ['google-ads-skill'], false, undefined,
     );
   });
 
