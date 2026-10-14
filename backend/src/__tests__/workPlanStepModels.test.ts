@@ -346,6 +346,26 @@ describe('checkPlanStepModelsWrite (same semantics as the plan defaultModel)', (
   });
 });
 
+describe('checkPlanStepModelsWrite: each stored step is a counterpart at most once (CodeRabbit)', () => {
+  const notAdmin = async () => false;
+  it('a retired model copied onto a SECOND step with the same title is validated as new (only one step can be "unchanged")', async () => {
+    const stored = [{ stepCount: 1, title: 'A', model: 'retired-9' }];
+    const r: any = await checkPlanStepModelsWrite(notAdmin, [{ stepCount: 1, title: 'A', model: 'retired-9' }, { stepCount: 2, title: 'A', model: 'retired-9' }], stored);
+    expect(r).toMatchObject({ ok: false, body: { stepCount: 2, requestedModel: 'retired-9', reason: 'not_served' } });
+  });
+  it('the step that still carries the stored model claims it, whichever order they arrive in', async () => {
+    const stored = [{ stepCount: 1, title: 'A', model: 'retired-9' }];
+    const r: any = await checkPlanStepModelsWrite(notAdmin, [{ stepCount: 1, title: 'A', model: 'other-retired' }, { stepCount: 2, title: 'A', model: 'retired-9' }], stored);
+    expect(r).toMatchObject({ ok: false, body: { stepCount: 1, requestedModel: 'other-retired' } });
+    const ok = await checkPlanStepModelsWrite(notAdmin, [{ stepCount: 1, title: 'A', model: 'gpt-5-chat' }, { stepCount: 2, title: 'A', model: 'retired-9' }], stored);
+    expect(ok).toEqual({ ok: true });
+  });
+  it('a valid new model on the second duplicate passes while the first keeps its retired stored one', async () => {
+    const stored = [{ stepCount: 1, title: 'A', model: 'retired-9' }];
+    await expect(checkPlanStepModelsWrite(notAdmin, [{ stepCount: 1, title: 'A', model: 'retired-9' }, { stepCount: 2, title: 'A', model: 'gpt-5-chat' }], stored)).resolves.toEqual({ ok: true });
+  });
+});
+
 describe('resolvePlanStepModelsForLaunch', () => {
   const notAdmin = async () => false;
   it('returns the canonical id per step index, skipping steps with no model', async () => {
@@ -677,3 +697,76 @@ describe('applyPredefinedWorkPlan (launch / accept / scheduled launch core)', ()
   });
 });
 
+describe('private -> public transitions revalidate step models for NON-admin launchers (CodeRabbit)', () => {
+  const app = express();
+  app.use(express.json());
+  app.use('/api/admin/work-plans', authenticateToken, isAdmin, adminWorkPlanRoutes);
+  app.use('/api/user-work-plans', authenticateToken, userWorkPlanRoutes);
+  const withModel = (visibility: string, model: string) => ({
+    planId: 'p1', title: 'T', visibility, ownerId: 'user-1',
+    steps: [{ stepCount: 1, title: 'One', description: 'd' }, { stepCount: 2, title: 'Two', description: 'd', model }],
+  });
+  const svc: any = workPlanService;
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockStore.clear();
+    mockSwitch = true;
+    mockUnknown = false;
+    svc.submitForReview = jest.fn(async (id: string) => ({ ...mockStore.get(id), visibility: 'pending_review' }));
+    svc.approveWorkPlan = jest.fn(async (id: string) => ({ ...mockStore.get(id), visibility: 'public' }));
+  });
+
+  it.each([
+    ['submit', 'post', '/api/user-work-plans/p1/submit-for-review', 'private', () => svc.submitForReview],
+    ['approve', 'post', '/api/admin/work-plans/p1/approve', 'pending_review', () => svc.approveWorkPlan],
+  ] as const)('%s: an admin-only step model is refused with the shared 422 + stepCount and the plan state is unchanged', async (_n, _m, url, visibility, fn) => {
+    mockIsAdminCaller = true;
+    mockStore.set('p1', withModel(visibility, 'admin-only-model'));
+    const res = await request(app).post(url).send({});
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({ code: 'model_unavailable', reason: 'not_selectable', requestedModel: 'admin-only-model', stepCount: 2 });
+    expect(fn()).not.toHaveBeenCalled();
+    expect(mockStore.get('p1').visibility).toBe(visibility);
+  });
+
+  it.each([
+    ['submit', '/api/user-work-plans/p1/submit-for-review', 'private', () => svc.submitForReview],
+    ['approve', '/api/admin/work-plans/p1/approve', 'pending_review', () => svc.approveWorkPlan],
+  ] as const)('%s: a normal step model goes through', async (_n, url, visibility, fn) => {
+    mockIsAdminCaller = true;
+    mockStore.set('p1', withModel(visibility, 'gpt-5-chat'));
+    const res = await request(app).post(url).send({});
+    expect(res.status).toBe(200);
+    expect(fn()).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['submit', '/api/user-work-plans/p1/submit-for-review', 'private', () => svc.submitForReview],
+    ['approve', '/api/admin/work-plans/p1/approve', 'pending_review', () => svc.approveWorkPlan],
+  ] as const)('%s: switch OFF ignores stored step models (no refusal); UNKNOWN still validates them', async (_n, url, visibility, fn) => {
+    mockIsAdminCaller = true;
+    mockStore.set('p1', withModel(visibility, 'admin-only-model'));
+    mockSwitch = false;
+    expect((await request(app).post(url).send({})).status).toBe(200);
+    fn().mockClear();
+    mockUnknown = true;
+    const res = await request(app).post(url).send({});
+    expect(res.status).toBe(422);
+    expect(fn()).not.toHaveBeenCalled();
+  });
+
+  it('a plan with no step models never reads the switch on these transitions', async () => {
+    mockIsAdminCaller = true;
+    mockStore.set('p1', { planId: 'p1', title: 'T', visibility: 'private', ownerId: 'user-1', steps: [{ stepCount: 1, title: 'One' }] });
+    mockSwitchReads = 0;
+    expect((await request(app).post('/api/user-work-plans/p1/submit-for-review').send({})).status).toBe(200);
+    expect(mockSwitchReads).toBe(0);
+  });
+
+  it('submit by a non-owner still gets the service\'s own refusal (no early 422 leak of someone else\'s step models)', async () => {
+    mockStore.set('p1', { ...withModel('private', 'admin-only-model'), ownerId: 'someone-else' });
+    svc.submitForReview = jest.fn(async () => { throw new Error('Not authorized'); });
+    const res = await request(app).post('/api/user-work-plans/p1/submit-for-review').send({});
+    expect(res.status).toBe(403);
+  });
+});

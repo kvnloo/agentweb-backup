@@ -5,7 +5,7 @@ import { userDb, orgDb } from "../services/db";
 import { can } from "../services/orgAuthz";
 import { checkPlanDefaultModelWrite, isUserAdminSafe, planAdminStatusApplies } from "../services/agentMode/modelPin";
 import { workPlanStepModels } from "../services/agentMode/workPlanStepModelsInstance";
-import { anyStepCarriesModel, checkPlanStepModelsWrite } from "../services/agentMode/workPlanStepModels";
+import { anyStepCarriesModel, checkPlanStepModelsWrite, checkStoredStepModelsForPublic } from "../services/agentMode/workPlanStepModels";
 import {
   canEditItem,
   isFeatureEffectivelyEnabled,
@@ -253,6 +253,14 @@ router.post("/:planId/submit-for-review", async (req, res) => {
     const { userId } = (req as any).user;
     const { planId } = req.params;
 
+    // ENG-2378: submitting widens who can launch this plan (an approved plan is launched by non-admins), so its step
+    // models must be selectable by a NON-admin now, not discovered at the first launch. The owner's own plan only: any
+    // other caller gets the service's usual refusal. Nothing is written when a model is refused.
+    const existing = await workPlanService.getWorkPlan(planId);
+    if (existing && existing.ownerId === userId && existing.visibility === 'private') {
+      const stepModelCheck = await checkStoredStepModelsForPublic(existing.steps, () => workPlanStepModels.shouldHonor());
+      if (!stepModelCheck.ok) return res.status(422).json(stepModelCheck.body);
+    }
     const plan = await workPlanService.submitForReview(planId, userId);
 
     res.json(plan);

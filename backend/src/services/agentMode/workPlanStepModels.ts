@@ -122,16 +122,18 @@ function stepNumber(step: StepLike, index: number): number {
 
 /**
  * The stored step that a submitted step replaces, for the "unchanged stored value is tolerated" rule: matched by
- * title when exactly one stored step has it (a reorder renumbers but keeps titles), else by stepCount.
+ * title when exactly one UNCLAIMED stored step has it (a reorder renumbers but keeps titles), else by stepCount. A
+ * stored step is the counterpart of at most one submitted step (`claimed`), so a model copied onto a second step is new.
  */
-function storedCounterpart(stored: StepLike[], step: StepLike, index: number): StepLike | undefined {
+function storedCounterpart(stored: StepLike[], step: StepLike, index: number, claimed: Set<StepLike>): StepLike | undefined {
+  const free = stored.filter((s) => !claimed.has(s));
   const title = typeof step.title === 'string' ? step.title.trim().toLowerCase() : '';
   if (title) {
-    const byTitle = stored.filter((s) => typeof s?.title === 'string' && s.title.trim().toLowerCase() === title);
+    const byTitle = free.filter((s) => typeof s?.title === 'string' && s.title.trim().toLowerCase() === title);
     if (byTitle.length === 1) return byTitle[0];
   }
   const n = stepNumber(step, index);
-  return stored.find((s) => Number(s?.stepCount) === n);
+  return free.find((s) => Number(s?.stepCount) === n);
 }
 
 const normTitle = (value: unknown): string => (typeof value === 'string' ? value.trim().toLowerCase() : '');
@@ -251,14 +253,44 @@ export async function checkPlanStepModelsWrite(
   steps: ReadonlyArray<StepLike>,
   storedSteps?: ReadonlyArray<StepLike>,
 ): Promise<{ ok: true } | { ok: false; body: ModelUnavailableBody & { stepCount: number } }> {
+  const stored = storedSteps ? [...storedSteps] : [];
+  const claimed = new Set<StepLike>();
+  const counterpartOf = new Map<number, StepLike>();
+  // Pass 1: a step that still carries exactly the model of a same-titled stored step claims it first, so a copy of that
+  // model on another step (or an earlier step with a different model) cannot steal the "unchanged" tolerance.
+  steps.forEach((step, i) => {
+    const model = stepModelOf(step);
+    if (!model) return;
+    const t = normTitle(step.title);
+    const hit = stored.find((s) => !claimed.has(s) && stepModelOf(s) === model && (!t || normTitle(s.title) === t));
+    if (hit) { claimed.add(hit); counterpartOf.set(i, hit); }
+  });
+  // Pass 2: everything else is matched by title, then number, against what is still unclaimed.
+  steps.forEach((step, i) => {
+    if (!stepModelOf(step) || counterpartOf.has(i)) return;
+    const hit = storedCounterpart(stored, step, i, claimed);
+    if (hit) { claimed.add(hit); counterpartOf.set(i, hit); }
+  });
   for (let i = 0; i < steps.length; i++) {
     const model = stepModelOf(steps[i]);
     if (!model) continue;
-    const counterpart = storedSteps ? storedCounterpart([...storedSteps], steps[i], i) : undefined;
-    const check = await checkPlanDefaultModelWrite(isAdmin, model, stepModelOf(counterpart));
+    const check = await checkPlanDefaultModelWrite(isAdmin, model, stepModelOf(counterpartOf.get(i)));
     if (!check.ok) return { ok: false, body: { ...check.body, stepCount: stepNumber(steps[i], i) } };
   }
   return { ok: true };
+}
+
+/**
+ * Validation of a plan's STORED step models as a NON-admin launcher would face them, run before the plan becomes
+ * available to non-admins (submit for review, approve). Only while per-step models are honoured, and only for plans
+ * that carry one. Same 422 body as a write (`model_unavailable` + `stepCount`).
+ */
+export async function checkStoredStepModelsForPublic(
+  steps: unknown,
+  honor: () => Promise<boolean>,
+): Promise<{ ok: true } | { ok: false; body: ModelUnavailableBody & { stepCount: number } }> {
+  if (!anyStepCarriesModel(steps) || !(await honor())) return { ok: true };
+  return checkPlanStepModelsWrite(async () => false, steps as StepLike[]);
 }
 
 /** Stored steps that carry a model, re-validated as a (non-admin) launcher would: used when a plan's scope widens. */

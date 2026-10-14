@@ -7,7 +7,7 @@ import { normalizeWorkPlanDisplayMetadata } from "../services/workPlanDisplayMet
 import { checkPlanDefaultModelWrite, isUserAdminSafe, planAdminStatusApplies } from "../services/agentMode/modelPin";
 import { workPlanThumbnailService } from "../services/workPlanThumbnailService";
 import { workPlanStepModels } from "../services/agentMode/workPlanStepModelsInstance";
-import { anyStepCarriesModel, checkPlanStepModelsWrite, stepsWithModels } from "../services/agentMode/workPlanStepModels";
+import { anyStepCarriesModel, checkPlanStepModelsWrite, checkStoredStepModelsForPublic, stepsWithModels } from "../services/agentMode/workPlanStepModels";
 
 const THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
 const THUMBNAIL_ACCEPTED_TYPES = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
@@ -459,6 +459,13 @@ router.delete("/:planId", async (req, res) => {
 // Approve a work plan
 router.post("/:planId/approve", async (req, res) => {
   try {
+    // ENG-2378: approval makes the plan public, launched by non-admins: refuse (state unchanged) when a step model is
+    // not selectable by them, same 422 body as a write.
+    const pending = await workPlanService.getWorkPlan(req.params.planId);
+    if (pending && pending.visibility === 'pending_review') {
+      const stepModelCheck = await checkStoredStepModelsForPublic(pending.steps, () => workPlanStepModels.shouldHonor());
+      if (!stepModelCheck.ok) return res.status(422).json(stepModelCheck.body);
+    }
     const plan = await workPlanService.approveWorkPlan(req.params.planId);
     res.json(plan);
   } catch (error: any) {
