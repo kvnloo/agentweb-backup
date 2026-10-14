@@ -31,9 +31,9 @@ const START = { loginId: 'abc123', authorizeUrl: 'https://claude.com/cai/oauth/a
 
 function makeApp() {
   const service = {
-    startLogin: jest.fn(async () => START),
-    completeLogin: jest.fn(async () => ({ connectionId: 'sub-1', kind: 'claude_subscription' })),
-    cancelLogin: jest.fn(async () => undefined),
+    startLogin: jest.fn(async (..._a: any[]) => START),
+    completeLogin: jest.fn(async (..._a: any[]) => ({ connectionId: 'sub-1', kind: 'claude_subscription' })),
+    cancelLogin: jest.fn(async (..._a: any[]) => undefined),
   };
   const app = express();
   app.use(express.json());
@@ -74,7 +74,7 @@ describe(BASE, () => {
   it('passes a delegated admin through so the service can refuse it, and returns its code', async () => {
     session = { userId: 'user-1', adminUserId: 'admin-9' };
     const { app, service } = makeApp();
-    service.startLogin.mockRejectedValue(new ClaudeSubscriptionError('forbidden', 403));
+    service.startLogin.mockRejectedValue(new (ClaudeSubscriptionError as any)('forbidden', 403));
     const res = await request(app).post(`${BASE}/start`).send({});
     expect(service.startLogin).toHaveBeenCalledWith({ userId: 'user-1', adminId: 'admin-9' }, expect.anything());
     expect(res.status).toBe(403);
@@ -102,7 +102,7 @@ describe(BASE, () => {
 
   it.each([['login_not_found', 409], ['code_rejected', 400], ['disabled', 403], ['too_many_logins', 429]])('maps %s to %i', async (code, status) => {
     const { app, service } = makeApp();
-    service.completeLogin.mockRejectedValue(new ClaudeSubscriptionError(code, status));
+    service.completeLogin.mockRejectedValue(new (ClaudeSubscriptionError as any)(code, status));
     const res = await request(app).post(`${BASE}/complete`).send({ loginId: 'a', code: CODE });
     expect(res.status).toBe(status);
     expect(res.body).toEqual({ error: code });

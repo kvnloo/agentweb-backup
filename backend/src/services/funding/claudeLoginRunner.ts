@@ -12,12 +12,12 @@
  * stray ANTHROPIC_* and no AWS keys). Output is parsed for the URL only and never logged.
  */
 import { spawn as spawnChild, type ChildProcessWithoutNullStreams } from "child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import { dirname, join } from "path";
 import { buildAllowlistedEnv } from "./claudeCliRunner";
 
-export type LoginErrorCode = "start_failed" | "start_timeout" | "bad_code_format" | "code_rejected" | "complete_timeout" | "no_credentials" | "cancelled";
+export type LoginErrorCode = "start_failed" | "start_timeout" | "bad_code_format" | "code_rejected" | "complete_timeout" | "no_credentials" | "cancelled" | "login_gone";
 
 export class LoginError extends Error {
   constructor(readonly code: LoginErrorCode) {
@@ -33,6 +33,48 @@ export const MAX_OUTPUT_CHARS = 16_384;
 /** The code is `<code>#<state>`: URL-safe characters only, bounded, no whitespace or control characters. */
 export const CODE_PATTERN = /^[A-Za-z0-9._~-]{8,200}#[A-Za-z0-9._~-]{8,200}$/;
 export const TMP_ROOT_PREFIX = "aw-claude-login-";
+/** A pending sign-in lives at most 10 minutes; a login dir older than this is a leftover. */
+export const STALE_LOGIN_DIR_MS = 30 * 60 * 1000;
+const AUTHORIZE_URL = /https:\/\/claude\.com\/cai\/oauth\/authorize[^\s"'<>]*/;
+
+/**
+ * The pinned `claude` binary (the @anthropic-ai/claude-code dependency), by absolute path.
+ * Not looked up on PATH: the backend runs as `node dist/server.js`, whose PATH does not
+ * include node_modules/.bin (seen on the test instance), so a bare "claude" is not found.
+ * Falls back to the bare name when the package cannot be resolved.
+ */
+export function resolveClaudeBinary(): string {
+  try {
+    const pkgPath = require.resolve("@anthropic-ai/claude-code/package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { bin?: string | Record<string, string> };
+    const rel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.claude;
+    if (rel) {
+      const abs = join(dirname(pkgPath), rel);
+      if (existsSync(abs)) return abs;
+    }
+  } catch {
+    /* fall through */
+  }
+  return "claude";
+}
+
+/** Removes login dirs a dead process left behind (they may hold a freshly written credentials file). */
+export function sweepStaleLoginDirs(root: string, nowMs: number = Date.now(), maxAgeMs: number = STALE_LOGIN_DIR_MS): number {
+  let removed = 0;
+  for (const name of existsSync(root) ? readdirSync(root) : []) {
+    if (!name.startsWith(TMP_ROOT_PREFIX)) continue;
+    const dir = join(root, name);
+    try {
+      if (nowMs - statSync(dir).mtimeMs > maxAgeMs) {
+        rmSync(dir, { recursive: true, force: true });
+        removed++;
+      }
+    } catch {
+      /* raced with its owner */
+    }
+  }
+  return removed;
+}
 
 export interface LoginHandle {
   authorizeUrl: string;
@@ -70,7 +112,7 @@ export class LocalClaudeLoginRunner implements LoginRunner {
 
     let child: ChildProcessWithoutNullStreams;
     try {
-      child = spawnChild(this.options.command ?? "claude", this.options.args ?? ["auth", "login"], {
+      child = spawnChild(this.options.command ?? resolveClaudeBinary(), this.options.args ?? ["auth", "login"], {
         env: buildAllowlistedEnv(configDir, homeDir),
         stdio: ["pipe", "pipe", "pipe"],
         detached: false,
@@ -131,7 +173,7 @@ export class LocalClaudeLoginRunner implements LoginRunner {
     const authorizeUrl = await new Promise<string | null>((resolve) => {
       const started = Date.now();
       const poll = setInterval(() => {
-        const match = output.replace(ANSI, "").match(/https:\/\/[^\s"'<>]+/);
+        const match = output.replace(ANSI, "").match(AUTHORIZE_URL);
         if (match) {
           clearInterval(poll);
           resolve(match[0]);
@@ -156,7 +198,8 @@ export class LocalClaudeLoginRunner implements LoginRunner {
         used = true;
         try {
           if (typeof code !== "string" || !CODE_PATTERN.test(code)) throw new LoginError("bad_code_format");
-          if (exited) throw new LoginError("cancelled");
+          // The CLI is gone already (it exited on its own, or the sign-in was cancelled): start again.
+          if (exited) throw new LoginError("login_gone");
           child.stdin.write(`${code}\n`);
           const done = await waitExit(this.options.completeTimeoutMs ?? COMPLETE_TIMEOUT_MS);
           if (!done) throw new LoginError("complete_timeout");

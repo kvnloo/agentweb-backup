@@ -18,7 +18,7 @@ import { hostname, tmpdir } from "os";
 import { join } from "path";
 import { AwsKmsPort, openSecret, sealSecret, type KmsPort } from "./llmConnectionCrypto";
 import { LlmConnectionDb, type LlmConnectionRecord, type SubHealth } from "./llmConnectionDb";
-import { CODE_PATTERN, LocalClaudeLoginRunner, LoginError, type LoginHandle, type LoginRunner } from "./claudeLoginRunner";
+import { CODE_PATTERN, LocalClaudeLoginRunner, LoginError, TMP_ROOT_PREFIX, sweepStaleLoginDirs, type LoginHandle, type LoginRunner } from "./claudeLoginRunner";
 import { isClaudeSubscriptionEnabledFor } from "./fundingFlags";
 import { MAX_ACTIVE_CONNECTIONS_PER_OWNER, type LlmConnectionView } from "./llmConnectionService";
 
@@ -55,6 +55,11 @@ export const WATCHDOG_MS = 5_000;
 export const SAVE_DEBOUNCE_MS = 200;
 export const SAVE_ATTEMPTS = 3;
 export const HOME_DIR_PREFIX = "aw-claude-home-";
+/** After an abort, how long the caller gets to stop its CLI before withLogin stops waiting for it. */
+export const ABORT_GRACE_MS = 10_000;
+/** When a save-back keeps failing, retry this often, for at most this long, while still holding the lease. */
+export const PERSIST_RETRY_MS = 5_000;
+export const PERSIST_MAX_MS = 10 * 60 * 1000;
 const MARKER = "marker.json";
 
 export interface ParsedLogin {
@@ -92,6 +97,9 @@ export interface ClaudeSubscriptionDeps {
   newId: () => string;
   newToken: () => string;
   tmpRoot?: string;
+  abortGraceMs?: number;
+  persistRetryMs?: number;
+  persistMaxMs?: number;
 }
 
 interface Pending {
@@ -103,6 +111,8 @@ interface Pending {
 }
 
 export interface LoginContext {
+  /** The stored version the CLI's changes build on (needed for `reportDeadLogin`). Moves up after each save-back. */
+  version: () => number;
   configDir: string;
   /** Aborts when the single live copy can no longer be guaranteed: stop the CLI at once. */
   signal: AbortSignal;
@@ -132,6 +142,8 @@ function viewOf(r: LlmConnectionRecord, callerId: string): LlmConnectionView {
 export class ClaudeSubscriptionService {
   private readonly pending = new Map<string, Pending>();
   private readonly starting = new Set<string>();
+  private readonly activeDirs = new Set<string>();
+  private reserved = 0;
 
   constructor(private readonly deps: ClaudeSubscriptionDeps) {}
 
@@ -146,17 +158,23 @@ export class ClaudeSubscriptionService {
     if (input.reconnectConnectionId) {
       const target = await this.deps.db.get(input.reconnectConnectionId);
       if (!target || target.kind !== "claude_subscription" || target.ownerUserId !== actor.userId || target.revokedAt) throw new ClaudeSubscriptionError("not_found");
+      // Do not spend the user's one-time code on a sign-in that cannot be applied right now.
+      if ((target.subLeaseUntil ?? 0) > this.deps.now()) throw new ClaudeSubscriptionError("busy");
     }
     if (this.starting.has(actor.userId)) throw new ClaudeSubscriptionError("busy");
     this.starting.add(actor.userId);
     try {
       await this.cancelFor(actor.userId);
-      if (this.pending.size >= MAX_PENDING_LOGINS) throw new ClaudeSubscriptionError("too_many_logins");
+      // The slot is reserved before the (slow) CLI start, so concurrent starts cannot overshoot the cap.
+      if (this.pending.size + this.reserved >= MAX_PENDING_LOGINS) throw new ClaudeSubscriptionError("too_many_logins");
+      this.reserved++;
       let handle: LoginHandle;
       try {
         handle = await this.deps.runner.start();
       } catch (err) {
         throw new ClaudeSubscriptionError(err instanceof LoginError && err.code === "start_timeout" ? "start_timeout" : "start_failed");
+      } finally {
+        this.reserved--;
       }
       const loginId = randomBytes(16).toString("hex");
       const expiresAtMs = this.deps.now() + LOGIN_TTL_MS;
@@ -186,6 +204,8 @@ export class ClaudeSubscriptionService {
       const c = err instanceof LoginError ? err.code : "start_failed";
       if (c === "complete_timeout") throw new ClaudeSubscriptionError("complete_timeout");
       if (c === "code_rejected" || c === "bad_code_format") throw new ClaudeSubscriptionError("code_rejected");
+      // The CLI went away before the code arrived (a deploy, a restart, a cancel): start again.
+      if (c === "cancelled" || c === "login_gone") throw new ClaudeSubscriptionError("login_not_found");
       throw new ClaudeSubscriptionError("bad_credentials");
     }
     const nowMs = this.deps.now();
@@ -270,25 +290,34 @@ export class ClaudeSubscriptionService {
       if (!abort.signal.aborted) abort.abort(reason);
     };
 
+    // Everything between taking the lease and handing over to the caller is inside one try:
+    // a failure here (disk full, bad blob) must neither leak a dir that may hold the login
+    // nor keep the lease.
+    let dir: string | undefined;
     let record: LlmConnectionRecord | null;
     let text: string;
+    let configDir: string;
+    let credsPath: string;
     try {
       record = await db.get(connectionId);
       if (!record || record.revokedAt || !record.sealed) throw new ClaudeSubscriptionError("not_found");
       text = await openSecret(kms, record.sealed, loginCtx(record));
+      dir = mkdtempSync(join(this.deps.tmpRoot ?? tmpdir(), HOME_DIR_PREFIX)); // 0700
+      configDir = join(dir, "cfg");
+      mkdirSync(configDir, { mode: 0o700 });
+      credsPath = join(configDir, ".credentials.json");
+      writeFileSync(credsPath, text, { mode: 0o600 });
     } catch (err) {
+      if (dir) rmSync(dir, { recursive: true, force: true });
       await db.releaseSubLease(connectionId, owner).catch(() => undefined);
       throw err;
     }
-
-    const root = this.deps.tmpRoot ?? tmpdir();
-    const dir = mkdtempSync(join(root, HOME_DIR_PREFIX)); // 0700
-    const configDir = join(dir, "cfg");
-    mkdirSync(configDir, { mode: 0o700 });
-    const credsPath = join(configDir, ".credentials.json");
-    writeFileSync(credsPath, text, { mode: 0o600 });
+    const runDir = dir;
+    this.activeDirs.add(runDir);
     let version = record.subVersion ?? 1;
-    writeFileSync(join(dir, MARKER), JSON.stringify({ connectionId, owner, version, ownerUserId: record.ownerUserId }), { mode: 0o600 });
+    const writeMarker = () =>
+      writeFileSync(join(runDir, MARKER), JSON.stringify({ connectionId, owner, version, ownerUserId: record!.ownerUserId, pid: process.pid }), { mode: 0o600 });
+    writeMarker();
 
     let lastText = text;
     let lost: "stale" | "revoked" | undefined;
@@ -311,16 +340,26 @@ export class ClaudeSubscriptionService {
       } catch {
         return;
       }
+      const attempted: string[] = [];
+      const succeeded = () => {
+        version += 1;
+        lastText = current;
+        saveFailed = false;
+        confirmedUntil = Math.max(confirmedUntil, this.deps.now());
+        writeMarker(); // recovery must start from the version we now hold
+      };
       for (let attempt = 1; attempt <= SAVE_ATTEMPTS; attempt++) {
+        const nowIso = new Date(this.deps.now()).toISOString();
+        attempted.push(nowIso);
         try {
           const sealed = await sealSecret(kms, current, loginCtx(record!));
-          const res = await db.saveSubCredentials(connectionId, { owner, expectedVersion: version, sealed, health, nowIso: new Date(this.deps.now()).toISOString() });
-          if (res === "ok") {
-            version += 1;
-            lastText = current;
-            saveFailed = false;
-            confirmedUntil = Math.max(confirmedUntil, this.deps.now());
-            return;
+          const res = await db.saveSubCredentials(connectionId, { owner, expectedVersion: version, sealed, health, nowIso });
+          if (res === "ok") return succeeded();
+          if (res === "stale") {
+            // An earlier attempt may have committed although its response never arrived: if the
+            // stored copy is exactly the next version, saved by us, that is our write, not a loss.
+            const cur = await db.get(connectionId).catch(() => null);
+            if (cur && !cur.revokedAt && cur.subLeaseOwner === owner && cur.subVersion === version + 1 && cur.subSavedAt && attempted.includes(cur.subSavedAt)) return succeeded();
           }
           lost = res;
           stop(res === "revoked" ? "revoked" : "lease_or_version_lost");
@@ -370,34 +409,83 @@ export class ClaudeSubscriptionService {
     }, WATCHDOG_MS);
     heartbeat.unref?.();
     watchdog.unref?.();
+    const stopTimers = () => {
+      clearInterval(heartbeat);
+      clearInterval(watchdog);
+    };
+    const wipe = () => {
+      this.activeDirs.delete(runDir);
+      rmSync(runDir, { recursive: true, force: true });
+    };
 
-    let value: T | undefined;
-    let thrown: unknown;
-    let threw = false;
-    try {
-      value = await fn({ configDir, signal: abort.signal, connectionId });
-    } catch (err) {
-      threw = true;
-      thrown = err;
-    }
-    clearInterval(heartbeat);
-    clearInterval(watchdog);
+    // Run the caller. If the lease is lost the caller is told to stop (signal); if it does not, we
+    // stop waiting for it after a grace period rather than hang with the dir and lease dangling.
+    const grace = this.deps.abortGraceMs ?? ABORT_GRACE_MS;
+    let graceTimer: NodeJS.Timeout | undefined;
+    const graceExpired = new Promise<{ kind: "grace" }>((resolve) => {
+      abort.signal.addEventListener("abort", () => {
+        graceTimer = setTimeout(() => resolve({ kind: "grace" }), grace);
+        graceTimer.unref?.();
+      });
+    });
+    const fnPromise = fn({ configDir, signal: abort.signal, connectionId, version: () => version }).then(
+      (value) => ({ kind: "done" as const, value }),
+      (error) => ({ kind: "threw" as const, error }),
+    );
+    const outcome = await Promise.race([fnPromise, graceExpired]);
+    clearTimeout(graceTimer);
     clearTimeout(debounce);
     watcher?.close();
+
+    if (outcome.kind === "grace") {
+      // The caller ignored the abort. Do not wait for it. Save what is there, wipe, and leave the
+      // lease to lapse (it is not released: a CLI that is still running may hold the live copy).
+      void fnPromise.catch(() => undefined);
+      await enqueue();
+      await queue;
+      stopTimers();
+      wipe();
+      console.error(`[claude-subscription] caller ignored the abort for connection=${connectionId}; stopped waiting, lease left to lapse`);
+      return { value: undefined as T, status: lost === "revoked" ? "revoked" : "lost" };
+    }
+
     await enqueue();
     await queue;
-
     const status: LoginStatus = lost === "revoked" ? "revoked" : lost || leaseLost ? "lost" : saveFailed ? "save_failed" : "ok";
-    if (saveFailed) {
-      // The refreshed login exists only in this dir: keep it (private, 0700) and the lease,
-      // so boot recovery can still save it, rather than wiping the only live copy.
-      console.error(`[claude-subscription] save-back failed for connection=${connectionId}; keeping the login dir for recovery`);
+    if (status === "save_failed") {
+      // The refreshed login exists only in this dir. Keep the lease alive and keep trying in the
+      // background until the save lands, the connection is revoked, or we give up (then boot recovery).
+      const { cronJobRegistry } = require("../../utils/cronJobRegistry") as typeof import("../../utils/cronJobRegistry");
+      const retryMs = this.deps.persistRetryMs ?? PERSIST_RETRY_MS;
+      const until = this.deps.now() + (this.deps.persistMaxMs ?? PERSIST_MAX_MS);
+      console.error(`[claude-subscription] save-back failed for connection=${connectionId}; retrying in the background`);
+      void cronJobRegistry
+        .track(
+          "ClaudeSubscriptionPersist",
+          (async () => {
+            while (saveFailed && !lost && this.deps.now() < until) {
+              await new Promise((r) => setTimeout(r, retryMs));
+              await enqueue();
+              await queue;
+            }
+            stopTimers();
+            if (saveFailed && !lost) {
+              console.error(`[claude-subscription] giving up on save-back for connection=${connectionId}; the login stays in its private dir for boot recovery`);
+              this.activeDirs.delete(runDir); // no longer a live run: a recovery pass may take it
+              return; // dir kept on purpose: it is the only copy
+            }
+            wipe();
+            await db.releaseSubLease(connectionId, owner).catch(() => undefined);
+          })(),
+        )
+        .catch(() => undefined);
     } else {
-      rmSync(dir, { recursive: true, force: true });
+      stopTimers();
+      wipe();
       await db.releaseSubLease(connectionId, owner).catch(() => undefined);
     }
-    if (threw) throw thrown;
-    return { value: value as T, status };
+    if (outcome.kind === "threw") throw outcome.error;
+    return { value: outcome.value, status };
   }
 
   /** The CLI itself said the stored login is dead. Conditional on the version the caller saw. */
@@ -407,23 +495,38 @@ export class ClaudeSubscriptionService {
 
   /**
    * Boot recovery: a previous process may have died holding a refreshed login that never
-   * reached the store. Try the compare-and-swap with the lease it recorded; wipe the dir
-   * unless the store itself was unreachable.
+   * reached the store. Try the compare-and-swap with the lease and the latest version it
+   * recorded; wipe the dir unless the store was unreachable. Never touches a dir whose
+   * recording process is still alive. Also removes sign-in dirs a dead process left behind.
    */
   async recoverOrphans(): Promise<{ saved: number; wiped: number; kept: number }> {
     const root = this.deps.tmpRoot ?? tmpdir();
     const out = { saved: 0, wiped: 0, kept: 0 };
+    sweepStaleLoginDirs(root, this.deps.now());
     for (const name of existsSync(root) ? readdirSync(root) : []) {
       if (!name.startsWith(HOME_DIR_PREFIX)) continue;
       const dir = join(root, name);
+      if (this.activeDirs.has(dir)) continue;
       try {
         if (!statSync(dir).isDirectory()) continue;
-        const marker = JSON.parse(readFileSync(join(dir, MARKER), "utf8")) as { connectionId: string; owner: string; version: number; ownerUserId: string };
+        const marker = JSON.parse(readFileSync(join(dir, MARKER), "utf8")) as { connectionId: string; owner: string; version: number; ownerUserId: string; pid?: number };
+        if (marker.pid && marker.pid !== process.pid && pidAlive(marker.pid)) continue; // another live process owns it
         const text = readFileSync(join(dir, "cfg", ".credentials.json"), "utf8");
         const { health } = parseCredentials(text, 0);
         const sealed = await sealSecret(this.deps.kms, text, loginCtx({ connectionId: marker.connectionId, ownerUserId: marker.ownerUserId }));
-        const res = await this.deps.db.saveSubCredentials(marker.connectionId, { owner: marker.owner, expectedVersion: marker.version, sealed, health, nowIso: new Date(this.deps.now()).toISOString() });
-        if (res === "ok") out.saved++;
+        let expectedVersion = marker.version;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const res = await this.deps.db.saveSubCredentials(marker.connectionId, { owner: marker.owner, expectedVersion, sealed, health, nowIso: new Date(this.deps.now()).toISOString() });
+          if (res === "ok") {
+            out.saved++;
+            break;
+          }
+          if (res !== "stale") break;
+          // The marker may lag one save behind the store: if the lease is still the recorded owner's, build on the stored version.
+          const cur = await this.deps.db.get(marker.connectionId);
+          if (!cur || cur.revokedAt || cur.subLeaseOwner !== marker.owner || cur.subVersion === undefined || cur.subVersion === expectedVersion) break;
+          expectedVersion = cur.subVersion;
+        }
         await this.deps.db.releaseSubLease(marker.connectionId, marker.owner).catch(() => undefined);
         rmSync(dir, { recursive: true, force: true });
         out.wiped++;
@@ -454,6 +557,15 @@ export class ClaudeSubscriptionService {
   }
 }
 
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as { code?: string })?.code === "EPERM";
+  }
+}
+
 let defaultService: ClaudeSubscriptionService | null = null;
 export function getClaudeSubscriptionService(): ClaudeSubscriptionService {
   if (!defaultService) {
@@ -473,4 +585,15 @@ export function getClaudeSubscriptionService(): ClaudeSubscriptionService {
 /** Shutdown hook: stops any pending sign-in CLI and wipes its dir. Does nothing if the service was never used. */
 export async function shutdownClaudeSubscriptionService(): Promise<void> {
   await defaultService?.shutdown();
+}
+
+/**
+ * Boot hook: recover a refreshed login a previous process died holding, and clear leftover
+ * sign-in dirs. Runs whatever the flag says (an orphan can outlive a flag change), but builds
+ * nothing and touches no AWS service unless such a dir actually exists.
+ */
+export async function recoverClaudeSubscriptionOrphansAtBoot(root: string = tmpdir()): Promise<{ saved: number; wiped: number; kept: number } | null> {
+  const present = existsSync(root) ? readdirSync(root).filter((n) => n.startsWith(HOME_DIR_PREFIX) || n.startsWith(TMP_ROOT_PREFIX)) : [];
+  if (present.length === 0) return null;
+  return getClaudeSubscriptionService().recoverOrphans();
 }

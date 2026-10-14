@@ -2,13 +2,13 @@
  * ENG-2110 (B3): connecting a Claude login, and holding its single live copy.
  * In-memory store + KMS; the CLI is a stand-in script, so no real login happens in CI.
  */
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { openSecret, sealSecret } from '../llmConnectionCrypto';
 import { LocalClaudeLoginRunner, TMP_ROOT_PREFIX, type LoginHandle, type LoginRunner } from '../claudeLoginRunner';
 import {
-  ClaudeSubscriptionError, ClaudeSubscriptionService, HEARTBEAT_MS, HOME_DIR_PREFIX, LEASE_MS, LOGIN_TTL_MS, MAX_PENDING_LOGINS, parseCredentials, SAVE_DEBOUNCE_MS,
+  ClaudeSubscriptionError, ClaudeSubscriptionService, recoverClaudeSubscriptionOrphansAtBoot, HEARTBEAT_MS, HOME_DIR_PREFIX, LEASE_MS, LOGIN_TTL_MS, MAX_PENDING_LOGINS, parseCredentials, SAVE_DEBOUNCE_MS,
 } from '../claudeSubscriptionService';
 import { FakeKms, makeDb } from './llmConnectionTestKit';
 
@@ -26,7 +26,7 @@ function credsText(over: Record<string, unknown> = {}, nowMs = Date.now()) {
   });
 }
 
-function setup(opts: { enabled?: Set<string>; runner?: LoginRunner } = {}) {
+function setup(opts: { enabled?: Set<string>; runner?: LoginRunner; deps?: Record<string, unknown> } = {}) {
   const { db } = makeDb();
   const kms = new FakeKms();
   const enabled = opts.enabled ?? new Set(['user-1', 'user-2']);
@@ -36,11 +36,12 @@ function setup(opts: { enabled?: Set<string>; runner?: LoginRunner } = {}) {
   const runner = opts.runner ?? new LocalClaudeLoginRunner({ command: process.execPath, args: [FAKE, 'ok'], tmpRoot });
   const service = new ClaudeSubscriptionService({
     db, kms, runner, tmpRoot,
-    isEnabledFor: async (u) => enabled.has(u),
+    isEnabledFor: async (u: string) => enabled.has(u),
     now: () => Date.now(),
     newId: () => `sub-${++ids}`,
     newToken: () => `tok-${++tokens}`,
-  });
+    ...(opts.deps ?? {}),
+  } as any);
   return { db, kms, service, enabled, tmpRoot };
 }
 const homeDirs = (root: string) => readdirSync(root).filter((n) => n.startsWith(HOME_DIR_PREFIX));
@@ -197,6 +198,24 @@ describe('the sign-in ceremony', () => {
     expect(logged).not.toMatch(/GOODCODE1|GOODSTATE1|SENTINEL/);
   });
 
+  it('cannot be pushed past the pending cap by concurrent starts', async () => {
+    const users = Array.from({ length: MAX_PENDING_LOGINS + 5 }, (_, i) => `u${i}`);
+    const slow: LoginRunner = { start: async () => { await sleep(30); return { authorizeUrl: 'https://claude.com/x', complete: async () => '', cancel: async () => undefined }; } };
+    const ctx = setup({ enabled: new Set(users), runner: slow });
+    const results = await Promise.all(users.map((u) => codeOf(ctx.service.startLogin({ userId: u }))));
+    expect(results.filter((r) => r === 'resolved')).toHaveLength(MAX_PENDING_LOGINS);
+    expect(ctx.service.pendingCount()).toBe(MAX_PENDING_LOGINS);
+    await ctx.service.shutdown();
+  });
+
+  it('tells the user to start again when the CLI went away before the code arrived', async () => {
+    const { LoginError } = require('../claudeLoginRunner');
+    const gone: LoginRunner = { start: async () => ({ authorizeUrl: 'https://claude.com/x', complete: async () => { throw new LoginError('login_gone'); }, cancel: async () => undefined }) };
+    const ctx = setup({ runner: gone });
+    const { loginId } = await ctx.service.startLogin({ userId: 'user-1' });
+    expect(await codeOf(ctx.service.completeLogin({ userId: 'user-1' }, loginId, GOOD))).toBe('login_not_found');
+  });
+
   describe('signing in again (reconnect in place)', () => {
     it('replaces the login, keeps the connection id, clears the flag', async () => {
       const ctx = setup();
@@ -213,6 +232,13 @@ describe('the sign-in ceremony', () => {
       await connect(ctx);
       expect(await codeOf(ctx.service.startLogin({ userId: 'user-2' }, { reconnectConnectionId: 'sub-1' }))).toBe('not_found');
       expect(await codeOf(ctx.service.startLogin({ userId: 'user-1' }, { reconnectConnectionId: 'nope' }))).toBe('not_found');
+    });
+    it('is refused at the start, before the user spends a code, while a turn holds the live copy', async () => {
+      const ctx = setup();
+      await connect(ctx);
+      await ctx.db.acquireSubLease('sub-1', 'someone', Date.now(), 60_000);
+      expect(await codeOf(ctx.service.startLogin({ userId: 'user-1' }, { reconnectConnectionId: 'sub-1' }))).toBe('busy');
+      expect(ctx.service.pendingCount()).toBe(0);
     });
     it('is busy while a turn holds the live copy', async () => {
       const ctx = setup();
@@ -291,9 +317,11 @@ describe('withLogin: the single live copy', () => {
     const ctx = setup();
     await seedLogin(ctx);
     let release!: () => void;
+    let started!: () => void;
     const hold = new Promise<void>((r) => (release = r));
-    const first = ctx.service.withLogin('sub-x', 'user-1', async () => { await hold; });
-    await sleep(50);
+    const running = new Promise<void>((r) => (started = r));
+    const first = ctx.service.withLogin('sub-x', 'user-1', async () => { started(); await hold; });
+    await running; // the first turn really holds the lease now
     expect(await codeOf(ctx.service.withLogin('sub-x', 'user-1', async () => 1))).toBe('busy');
     release();
     await first;
@@ -347,37 +375,216 @@ describe('withLogin: the single live copy', () => {
     expect(calls).toBe(2);
   });
 
-  it('keeps the refreshed login (private) and the lease when every save fails, and boot recovery then saves it', async () => {
-    const ctx = setup();
-    await seedLogin(ctx);
-    const real = ctx.db.saveSubCredentials.bind(ctx.db);
-    const spy = jest.spyOn(ctx.db, 'saveSubCredentials').mockRejectedValue(new Error('dynamo down'));
-    const err = jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    const res = await ctx.service.withLogin('sub-x', 'user-1', async ({ configDir }) => rewrite(configDir, credsText({ refreshToken: 'SENTINEL-REFRESH-ONLYCOPY' })));
-    expect(res.status).toBe('save_failed');
-    expect(homeDirs(ctx.tmpRoot)).toHaveLength(1);
-    expect((await ctx.db.get('sub-x'))?.subLeaseOwner).toBeDefined();
-    expect(err.mock.calls.flat().join(' ')).not.toContain('SENTINEL');
-    err.mockRestore();
-    spy.mockImplementation(real);
-    expect(await ctx.service.recoverOrphans()).toEqual({ saved: 1, wiped: 1, kept: 0 });
-    expect(homeDirs(ctx.tmpRoot)).toEqual([]);
-    expect((await ctx.db.get('sub-x'))?.subVersion).toBe(2);
-    expect((await ctx.db.get('sub-x'))?.subLeaseOwner).toBeUndefined();
+  describe('when saving back keeps failing', () => {
+    const FAST = { persistRetryMs: 40, persistMaxMs: 400 };
+    const failing = (ctx: ReturnType<typeof setup>) => jest.spyOn(ctx.db, 'saveSubCredentials').mockRejectedValue(new Error('dynamo down'));
+    const quiet = () => jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    it('keeps retrying in the background, still holding the lease, and cleans up once the save lands', async () => {
+      const ctx = setup({ deps: FAST });
+      await seedLogin(ctx);
+      const real = ctx.db.saveSubCredentials.bind(ctx.db);
+      const spy = failing(ctx);
+      const err = quiet();
+      const res = await ctx.service.withLogin('sub-x', 'user-1', async ({ configDir }) => rewrite(configDir, credsText({ refreshToken: 'SENTINEL-REFRESH-LATE' })));
+      expect(res.status).toBe('save_failed');
+      expect(homeDirs(ctx.tmpRoot)).toHaveLength(1);
+      expect((await ctx.db.get('sub-x'))?.subLeaseOwner).toBeDefined();
+      spy.mockImplementation(real); // the store comes back
+      await sleep(400);
+      expect((await ctx.db.get('sub-x'))?.subVersion).toBe(2);
+      expect(homeDirs(ctx.tmpRoot)).toEqual([]);
+      expect((await ctx.db.get('sub-x'))?.subLeaseOwner).toBeUndefined();
+      expect(err.mock.calls.flat().join(' ')).not.toContain('SENTINEL');
+      err.mockRestore();
+    });
+
+    it('wipes the dir and stops if the connection is revoked while it is still retrying', async () => {
+      const ctx = setup({ deps: { persistRetryMs: 40, persistMaxMs: 5000 } });
+      await seedLogin(ctx);
+      const real = ctx.db.saveSubCredentials.bind(ctx.db);
+      const spy = failing(ctx);
+      const err = quiet();
+      await ctx.service.withLogin('sub-x', 'user-1', async ({ configDir }) => rewrite(configDir, credsText({ refreshToken: 'SENTINEL-REFRESH-REVOKED' })));
+      await ctx.db.revoke('sub-x', { userId: 'user-1' }, new Date().toISOString());
+      spy.mockImplementation(real);
+      await sleep(400);
+      expect(homeDirs(ctx.tmpRoot)).toEqual([]);
+      err.mockRestore();
+    });
+
+    it('gives up after its window, keeps the only copy for boot recovery, and recovery then saves it', async () => {
+      const ctx = setup({ deps: FAST });
+      await seedLogin(ctx);
+      const real = ctx.db.saveSubCredentials.bind(ctx.db);
+      const spy = failing(ctx);
+      const err = quiet();
+      await ctx.service.withLogin('sub-x', 'user-1', async ({ configDir }) => rewrite(configDir, credsText({ refreshToken: 'SENTINEL-REFRESH-ONLYCOPY' })));
+      await sleep(1800); // past the window (each failing attempt backs off ~600 ms)
+      expect(homeDirs(ctx.tmpRoot)).toHaveLength(1);
+      err.mockRestore();
+      spy.mockImplementation(real);
+      // a new process: this one's own dir is only "active" while its run is live
+      expect(await ctx.service.recoverOrphans()).toEqual({ saved: 1, wiped: 1, kept: 0 });
+      expect(homeDirs(ctx.tmpRoot)).toEqual([]);
+      expect((await ctx.db.get('sub-x'))?.subVersion).toBe(2);
+      expect((await ctx.db.get('sub-x'))?.subLeaseOwner).toBeUndefined();
+    });
+
+    it('recovery keeps the dir while the store is unreachable and wipes junk', async () => {
+      const ctx = setup({ deps: FAST });
+      await seedLogin(ctx);
+      const err = quiet();
+      const spy = failing(ctx);
+      await ctx.service.withLogin('sub-x', 'user-1', async ({ configDir }) => rewrite(configDir, credsText({ refreshToken: 'SENTINEL-REFRESH-KEEP' })));
+      await sleep(1800);
+      expect(await ctx.service.recoverOrphans()).toEqual({ saved: 0, wiped: 0, kept: 1 });
+      expect(homeDirs(ctx.tmpRoot)).toHaveLength(1);
+      mkdirSync(join(ctx.tmpRoot, `${HOME_DIR_PREFIX}junk`));
+      spy.mockRestore();
+      err.mockRestore();
+      const out = await ctx.service.recoverOrphans();
+      expect(out.wiped).toBeGreaterThanOrEqual(1);
+    });
   });
 
-  it('recovery keeps the dir when the store is unreachable, and wipes junk', async () => {
-    const ctx = setup();
-    await seedLogin(ctx);
-    jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    jest.spyOn(ctx.db, 'saveSubCredentials').mockRejectedValue(new Error('down'));
-    await ctx.service.withLogin('sub-x', 'user-1', async ({ configDir }) => rewrite(configDir, credsText({ refreshToken: 'SENTINEL-REFRESH-KEEP' })));
-    expect(await ctx.service.recoverOrphans()).toEqual({ saved: 0, wiped: 0, kept: 1 });
-    expect(homeDirs(ctx.tmpRoot)).toHaveLength(1);
-    require('fs').mkdirSync(join(ctx.tmpRoot, `${HOME_DIR_PREFIX}junk`));
-    (ctx.db.saveSubCredentials as jest.Mock).mockRestore();
-    const out = await ctx.service.recoverOrphans();
-    expect(out.wiped).toBeGreaterThanOrEqual(1);
+  describe('recovery', () => {
+    const quiet = () => jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    it('saves the NEWEST login after an earlier save in the same turn (the marker follows the version)', async () => {
+      const ctx = setup({ deps: { persistRetryMs: 40, persistMaxMs: 300 } });
+      await seedLogin(ctx);
+      const real = ctx.db.saveSubCredentials.bind(ctx.db);
+      let calls = 0;
+      const err = quiet();
+      const spy = jest.spyOn(ctx.db, 'saveSubCredentials').mockImplementation(async (...a) => { if (++calls > 1) throw new Error('down'); return real(...a); });
+      await ctx.service.withLogin('sub-x', 'user-1', async ({ configDir }) => {
+        rewrite(configDir, credsText({ refreshToken: 'SENTINEL-REFRESH-ONE' }));
+        await sleep(SAVE_DEBOUNCE_MS + 300); // saved: version 2
+        rewrite(configDir, credsText({ refreshToken: 'SENTINEL-REFRESH-TWO' })); // this one never reaches the store
+      });
+      await sleep(1800); // past the background window (each failing attempt backs off ~600 ms)
+      err.mockRestore();
+      spy.mockImplementation(real);
+      expect(JSON.parse(readFileSync(join(ctx.tmpRoot, homeDirs(ctx.tmpRoot)[0], 'marker.json'), 'utf8')).version).toBe(2);
+      expect(await ctx.service.recoverOrphans()).toMatchObject({ saved: 1 });
+      expect((await ctx.db.get('sub-x'))?.subVersion).toBe(3);
+      const row = (await ctx.db.get('sub-x'))!;
+      expect(JSON.parse(await openSecret(ctx.kms, row.sealed!, { connectionId: 'sub-x', ownerUserId: 'user-1', provider: 'anthropic', purpose: 'claude_login' })).claudeAiOauth.refreshToken).toBe('SENTINEL-REFRESH-TWO');
+    });
+
+    it('builds on the stored version when the marker lags it and the lease is still the recorded owner\'s', async () => {
+      const ctx = setup();
+      await seedLogin(ctx);
+      await ctx.db.acquireSubLease('sub-x', 'owner-old', Date.now(), 60_000);
+      const dir = join(ctx.tmpRoot, `${HOME_DIR_PREFIX}lag`);
+      mkdirSync(join(dir, 'cfg'), { recursive: true });
+      writeFileSync(join(dir, 'cfg', '.credentials.json'), credsText({ refreshToken: 'SENTINEL-REFRESH-LAG' }));
+      writeFileSync(join(dir, 'marker.json'), JSON.stringify({ connectionId: 'sub-x', owner: 'owner-old', version: 0, ownerUserId: 'user-1', pid: 999999 }));
+      expect(await ctx.service.recoverOrphans()).toMatchObject({ saved: 1, wiped: 1 });
+      expect((await ctx.db.get('sub-x'))?.subVersion).toBe(2);
+    });
+
+    it('does not touch a dir whose recording process is still alive, but cleans one whose process is gone', async () => {
+      const ctx = setup();
+      await seedLogin(ctx);
+      const mk = (name: string, pid: number) => {
+        const dir = join(ctx.tmpRoot, `${HOME_DIR_PREFIX}${name}`);
+        mkdirSync(join(dir, 'cfg'), { recursive: true });
+        writeFileSync(join(dir, 'cfg', '.credentials.json'), credsText({ refreshToken: `SENTINEL-${name}` }));
+        writeFileSync(join(dir, 'marker.json'), JSON.stringify({ connectionId: 'sub-x', owner: 'nobody', version: 1, ownerUserId: 'user-1', pid }));
+        return dir;
+      };
+      const alive = mk('alive', process.ppid);
+      const dead = mk('dead', 999999);
+      await ctx.service.recoverOrphans();
+      expect(existsSync(alive)).toBe(true);
+      expect(existsSync(dead)).toBe(false);
+    });
+
+    it('removes stale sign-in dirs and keeps fresh ones', async () => {
+      const ctx = setup();
+      const stale = join(ctx.tmpRoot, `${TMP_ROOT_PREFIX}old`);
+      const fresh = join(ctx.tmpRoot, `${TMP_ROOT_PREFIX}new`);
+      mkdirSync(stale); mkdirSync(fresh);
+      const old = new Date(Date.now() - 2 * 3600e3);
+      utimesSync(stale, old, old);
+      await ctx.service.recoverOrphans();
+      expect(existsSync(stale)).toBe(false);
+      expect(existsSync(fresh)).toBe(true);
+    });
+
+    it('the boot hook does nothing, and builds nothing, when no such dir exists', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'aw-boot-empty-'));
+      expect(await recoverClaudeSubscriptionOrphansAtBoot(root)).toBeNull();
+      rmSync(root, { recursive: true, force: true });
+    });
+  });
+
+  describe('a response that never arrived', () => {
+    it('is not mistaken for a lost login: the retry finds our own write already stored', async () => {
+      const ctx = setup();
+      await seedLogin(ctx);
+      const real = ctx.db.saveSubCredentials.bind(ctx.db);
+      let calls = 0;
+      jest.spyOn(ctx.db, 'saveSubCredentials').mockImplementation(async (...a) => {
+        if (++calls === 1) { await real(...a); throw new Error('timeout after commit'); }
+        return real(...a);
+      });
+      let aborted = false;
+      const res = await ctx.service.withLogin('sub-x', 'user-1', async ({ configDir, signal }) => {
+        signal.addEventListener('abort', () => (aborted = true));
+        rewrite(configDir, credsText({ refreshToken: 'SENTINEL-REFRESH-COMMITTED' }));
+        await sleep(SAVE_DEBOUNCE_MS + 700);
+      });
+      expect(res.status).toBe('ok');
+      expect(aborted).toBe(false);
+      expect((await ctx.db.get('sub-x'))?.subVersion).toBe(2);
+    });
+  });
+
+  describe('a caller that ignores the abort', () => {
+    it('is not waited for forever: withLogin returns after the grace period, wipes the dir, and does not release the lease', async () => {
+      const ctx = setup({ deps: { abortGraceMs: 200 } });
+      await seedLogin(ctx);
+      const err = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      const t0 = Date.now();
+      const res = await ctx.service.withLogin('sub-x', 'user-1', async ({ configDir }) => {
+        await ctx.db.revoke('sub-x', { userId: 'user-1' }, new Date().toISOString());
+        rewrite(configDir, credsText({ refreshToken: 'SENTINEL-REFRESH-IGNORED' }));
+        await new Promise(() => undefined); // never stops
+      });
+      expect(Date.now() - t0).toBeLessThan(3000);
+      expect(res.status).toBe('revoked');
+      expect(homeDirs(ctx.tmpRoot)).toEqual([]);
+      err.mockRestore();
+    });
+  });
+
+  describe('setting up', () => {
+    it('releases the lease and leaves no dir when the temp dir cannot be created', async () => {
+      const ctx = setup();
+      await seedLogin(ctx);
+      const notADir = join(ctx.tmpRoot, 'a-file');
+      writeFileSync(notADir, 'x');
+      const svc = new ClaudeSubscriptionService({ ...(ctx.service as any).deps, tmpRoot: notADir });
+      await expect(svc.withLogin('sub-x', 'user-1', async () => 1)).rejects.toBeTruthy();
+      expect((await ctx.db.get('sub-x'))?.subLeaseOwner).toBeUndefined();
+      expect(await codeOf(ctx.service.withLogin('sub-x', 'user-1', async () => 2))).toBe('resolved');
+    });
+
+    it('tells the caller which version its changes build on, and it moves up after a save', async () => {
+      const ctx = setup();
+      await seedLogin(ctx);
+      const seen: number[] = [];
+      await ctx.service.withLogin('sub-x', 'user-1', async ({ configDir, version }) => {
+        seen.push(version());
+        rewrite(configDir, credsText({ refreshToken: 'SENTINEL-REFRESH-VER' }));
+        await sleep(SAVE_DEBOUNCE_MS + 300);
+        seen.push(version());
+      });
+      expect(seen).toEqual([1, 2]);
+    });
   });
 
   it('still saves and cleans up, then rethrows, when the caller throws', async () => {

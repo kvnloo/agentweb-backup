@@ -4,7 +4,9 @@ const mode = process.argv[2] || 'ok';
 const GOOD = 'GOODCODE1#GOODSTATE1';
 if (mode === 'nourl') { console.error('boom'); process.exit(1); }
 console.log('Opening browser to sign in…');
+if (mode === 'otherlink') console.log('Docs: https://example.com/help/login');
 console.log('If the browser didn\'t open, visit: https://claude.com/cai/oauth/authorize?code=true&client_id=fake&state=fakestate');
+if (mode === 'exitsoon') { setTimeout(() => process.exit(0), 100); return; }
 if (mode === 'hang') { setInterval(() => {}, 1000); return; }
 let buf = '';
 process.stdin.on('data', (d) => {

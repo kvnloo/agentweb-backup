@@ -1592,19 +1592,17 @@ createTestAccount().then(async () => {
       }
 
       // Claude subscription logins (ENG-2110): daily expiry pass (no-op unless the claudeSubscription
-      // funding flag is on), and recovery of any refreshed login a previous process died holding.
+      // funding flag is on), and recovery of any refreshed login a previous process died holding
+      // (runs whatever the flag says, and does nothing unless such a dir exists).
       try {
         const { scheduleClaudeSubscriptionExpiry } = await import('./cron/claudeSubscriptionExpiryCron');
         scheduleClaudeSubscriptionExpiry({
           isCronEnabled,
           track: (jobName, promise) => cronJobRegistry.track(jobName, promise),
         });
-        const { getFundingFlags } = await import('./services/funding/fundingFlags');
-        if ((await getFundingFlags()).claudeSubscription.enabled) {
-          const { getClaudeSubscriptionService } = await import('./services/funding/claudeSubscriptionService');
-          const recovered = await getClaudeSubscriptionService().recoverOrphans();
-          if (recovered.saved || recovered.wiped || recovered.kept) console.log('[ClaudeSubscription] boot recovery:', recovered);
-        }
+        const { recoverClaudeSubscriptionOrphansAtBoot } = await import('./services/funding/claudeSubscriptionService');
+        const recovered = await recoverClaudeSubscriptionOrphansAtBoot();
+        if (recovered) console.log('[ClaudeSubscription] boot recovery:', recovered);
       } catch (error) {
         console.error('[ClaudeSubscription] Failed to initialize:', (error as { code?: string })?.code || 'error');
       }
