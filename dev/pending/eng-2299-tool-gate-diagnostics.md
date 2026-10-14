@@ -1,0 +1,14 @@
+## ENG-2299: No catalog churn found; tool-gate refusals now log why (2026-10-14)
+
+**Finding.** The ticket's premise (the shared published-skill catalog changes under a live session) was not borne out by prod evidence on 2026-10-14. Nothing was changed in code to "fix" it.
+
+- **2026-10-05 `call_google_ads_api`:** eight published skills claim it, so it can never be in the `__other_skills__` pool. No skill was created or updated that day. The one session where it failed (`72f4afd2`) failed with Google `USER_PERMISSION_DENIED` and connected-account errors, not gating. Prod web logs for the day had zero entitlement-unresolved, tier-fallback (`UNCONFIRMED-TIER`, org-owner lookup errors, `STALE-CONFIG`) or skill-resolution failures.
+- **ENG-152 session (`00ffae8d`):** a plain missing install; one `install_skills` fixed it. `read_file_content` is now a foundation tool.
+- **ENG-1867 session (`4b9f7b7d`):** `__other_skills__` was refused for an entitled Free user. `convert_to_pdf` is now a foundation tool, so the symptom is gone. The cause of the refusal is NOT established: the ENG-1237 unpublished-skill filter predates the session (2026-08-24), the 09-10 logs are past retention, and `AW-Skills` has no history table.
+- **Catalog churn:** no published skill changed between 2026-09-25 and 2026-10-13.
+
+**Real but separate inconsistency (not changed).** The install/display path (`getSkillsForDisplay` -> `loadAuthorizedSkillCatalog`) computes the `__other_skills__` pool from the tier-filtered catalog; execution (`buildSkillContext`, `resolveSkillsToToolNames`) computes it from the full published catalog. A tool claimed only by a skill the tier cannot install can therefore look installable and still never be callable. Scoping execution to the tier catalog was tried and rejected in review (it lets a higher-tier skill's tool leak to every tier), so which side is right is a product decision.
+
+**Added.** The skill-install gate in `toolDispatch.ts` now logs one `[tool-gate-refused]` JSON line per refusal: session, user, tool, installed skill ids, whether `__other_skills__` is installed and tier-allowed, whether the tool is in the live pool, and which published skills claim it (installed / tier-allowed). The refusal text is unchanged. Search CloudWatch `web.stdout.log` for `tool-gate-refused` when the next report arrives; a missing install, a pool change and an entitlement gap each look different in that line.
+
+**Still unexplained / open.** `call_hubspot_api` (session `d7e413d3`) and `search_ads_knowledge_base` (`f7e326bb`) were reported "not available" on 2026-10-05; neither is in any published skill. Their `associatedSkills` were not checked.
