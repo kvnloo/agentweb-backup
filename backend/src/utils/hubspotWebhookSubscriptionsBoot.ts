@@ -1,13 +1,16 @@
 import { buildInfo } from './buildInfo';
-import { ensureWebhookSubscriptions } from './hubspotWebhookSubscriptions';
+import { ensureWebhookSubscriptionsChecked } from './hubspotWebhookSubscriptions';
 import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from '../services/asyncJobQueue';
 
 export const SUBSCRIPTION_SYNC_SOURCE = 'hubspot_webhook_subscription_sync';
 
-export type BootSyncOutcome = 'ran' | 'already-claimed' | 'skipped-no-build' | 'skipped-disabled' | 'skipped-queue-unavailable';
+export type BootSyncOutcome = 'ran' | 'failed-will-retry' | 'already-claimed' | 'skipped-no-build' | 'skipped-disabled' | 'skipped-queue-unavailable';
 
+// Throws when any registration failed, so the queue marks the claim for retry instead of completed.
 const syncStandardSubscriptions = async (): Promise<void> => {
-  await ensureWebhookSubscriptions([], []);
+  if (!(await ensureWebhookSubscriptionsChecked())) {
+    throw new Error('one or more HubSpot webhook subscriptions could not be registered');
+  }
 };
 
 // A claim whose owner crashed mid-run is re-run by the queue's poller; the run is idempotent.
@@ -23,8 +26,8 @@ registerProcessor(SUBSCRIPTION_SYNC_SOURCE, syncStandardSubscriptions);
  * be reached we DO NOT run unguarded. No build identity (local run, preview, tests) means no run, so a
  * developer machine can never register against the shared HubSpot app.
  *
- * Never throws. A failed registration is logged by ensureWebhookSubscriptions and retried on the next
- * config save or the next build.
+ * Never throws. A failed registration marks the claim for retry: the queue's poller re-runs the
+ * registered processor (capped attempts), and the next config save also retries.
  */
 export async function ensureWebhookSubscriptionsOncePerBuild(): Promise<BootSyncOutcome> {
   if (String(process.env.HUBSPOT_BOOT_SUBSCRIPTIONS || '').trim().toLowerCase() === 'off') return 'skipped-disabled';
@@ -48,10 +51,12 @@ export async function ensureWebhookSubscriptionsOncePerBuild(): Promise<BootSync
   try {
     await syncStandardSubscriptions();
     await markJobComplete(SUBSCRIPTION_SYNC_SOURCE, build);
+    return 'ran';
   } catch (err: any) {
+    console.warn(`[HubSpotWebhook] boot subscription sync did not complete (${err?.message || err}) — queued for retry.`);
     await markJobFailed(SUBSCRIPTION_SYNC_SOURCE, build, err).catch(() => undefined);
+    return 'failed-will-retry';
   } finally {
     stopHeartbeat();
   }
-  return 'ran';
 }
