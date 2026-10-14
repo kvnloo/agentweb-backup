@@ -276,6 +276,9 @@ export interface ChatSession {
     planDefaultModel?: string;
     launchModel?: string;
     engineModel?: string;
+    // The model the USER explicitly picked during the plan (a resumed step adopts it, or a model-less step runs on it):
+    // the end-of-plan restore never replaces it.
+    pickedModel?: string;
     welcomeMessage?: string; // Custom welcome message for this work plan
     autocomplete?: boolean; // When true, Emma MUST complete each step before responding to the user
     // ENG-1472: the predefined WorkPlan template (AW-WorkPlans planId) this
@@ -3900,6 +3903,7 @@ export class ChatbotDB {
       planDefaultModel?: string;
       launchModel?: string;
       engineModel?: string;
+      pickedModel?: string;
       /** ENG-1472: see the matching field on the read-side workPlan type above. */
       templatePlanId?: string;
       /** ENG-1811: see the matching field on the read-side workPlan type above. */

@@ -30,7 +30,7 @@ import { agentModeController } from '../controllers/agentModeController';
 
 const plan = {
   title: 'P',
-  planDefaultModel: 'secret-default', launchModel: 'secret-launch', engineModel: 'secret-engine',
+  planDefaultModel: 'secret-default', launchModel: 'secret-launch', engineModel: 'secret-engine', pickedModel: 'secret-picked',
   steps: [{ stepCount: 1, title: 'A', status: 'pending', model: 'secret-step-model', description: 'd' }],
 };
 const session = {
@@ -42,7 +42,7 @@ const res = () => { const r: any = {}; r.status = jest.fn().mockReturnValue(r); 
 describe('share / conversable views redact step models and bookkeeping', () => {
   beforeEach(() => { jest.clearAllMocks(); (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(session); });
   const expectRedacted = (payload: any) => {
-    expect(JSON.stringify(payload)).not.toMatch(/secret-|launchModel|planDefaultModel|engineModel/);
+    expect(JSON.stringify(payload)).not.toMatch(/secret-|launchModel|planDefaultModel|engineModel|pickedModel/);
     expect(payload.workPlan.steps[0]).toMatchObject({ stepCount: 1, title: 'A', status: 'pending', description: 'd' });
   };
 

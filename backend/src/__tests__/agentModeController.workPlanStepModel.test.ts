@@ -713,3 +713,50 @@ describe('round 4: share viewers and the first-step baseline', () => {
     expect(res.body.content).toContain('Choose another model in the model picker');
   });
 });
+
+describe('review: the user\'s pick survives the end of the plan', () => {
+  let store: any;
+  const mkStore = (wp: any, stamp: string) => {
+    store = makeSession(wp, stamp);
+    db.getChatSession.mockImplementation(async () => JSON.parse(JSON.stringify(store)));
+    db.getChatSessionRecord.mockImplementation(async () => JSON.parse(JSON.stringify(store)));
+    db.updateSessionLlmModel.mockImplementation(async (_id: string, m: string) => { store.llmModel = m; return store; });
+    db.updateSessionWorkPlan.mockImplementation(async (_id: string, w: any) => { store.workPlan = w; return store; });
+  };
+  const patchPick = async (m: string) => {
+    const r = makeRes();
+    await (agentModeController as any).updateSessionLlmModel({ params: { sessionId: SESSION_ID }, body: { llmModel: m }, user: { userId: OWNER, isAdmin: false } }, r);
+  };
+  const complete = () => { store.workPlan = { ...store.workPlan, steps: store.workPlan.steps.map((x: any) => ({ ...x, status: 'completed' })) }; };
+  const base = { launchModel: 'gemini-3.5-flash', planDefaultModel: 'gpt-5-chat-2' };
+
+  it('a pick on a MODEL-LESS step: after the plan completes the next turn still runs on the pick', async () => {
+    mkStore({ steps: [step(1, 'pending'), step(2, 'pending', 'gpt-5.5')], ...base, engineModel: 'gpt-5-chat-2' }, 'gpt-5-chat-2');
+    await patchPick('claude-step-model');
+    await agentModeController.generateResponse(generateReq('claude-step-model'), makeRes());
+    store.workPlan = { ...store.workPlan, steps: [step(1, 'completed'), step(2, 'completed', 'gpt-5.5')] };
+    await agentModeController.generateResponse(generateReq('claude-step-model'), makeRes());
+    expect(workerModels()).toEqual(['claude-step-model', 'claude-step-model']);
+    expect(store.llmModel).toBe('claude-step-model');
+  });
+
+  it('a pick that RESUMED a retired step (the step adopted it): after completion it is not replaced by the launch model', async () => {
+    mkStore({ steps: [step(1, 'pending', RETIRED)], ...base, engineModel: RETIRED }, RETIRED);
+    await patchPick('claude-step-model');
+    await agentModeController.generateResponse(generateReq('claude-step-model'), makeRes());
+    expect(store.workPlan.steps[0].model).toBe('claude-step-model');
+    complete();
+    await agentModeController.generateResponse(generateReq('claude-step-model'), makeRes());
+    expect(workerModels()).toEqual(['claude-step-model', 'claude-step-model']);
+    expect(store.llmModel).toBe('claude-step-model');
+  });
+
+  it('control: with no pick the pre-plan model still returns when the plan completes', async () => {
+    mkStore({ steps: [step(1, 'pending', 'gpt-5.5')], ...base }, 'gpt-5-chat-2');
+    await agentModeController.generateResponse(generateReq('gpt-5-chat-2'), makeRes());
+    expect(workerModels()).toEqual(['gpt-5.5']);
+    complete();
+    await agentModeController.generateResponse(generateReq('gpt-5.5'), makeRes());
+    expect(workerModels()).toEqual(['gpt-5.5', 'gemini-3.5-flash']);
+  });
+});

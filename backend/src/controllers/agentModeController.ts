@@ -1848,7 +1848,7 @@ async function userExplicitlyRequestedStop(sessionId: string, usageContext?: LLM
  */
 function redactWorkPlanForViewer(workPlan: any, options: { keepStepModels?: boolean } = {}): any {
   if (!workPlan || typeof workPlan !== 'object') return workPlan;
-  const { launchModel: _l, planDefaultModel: _p, engineModel: _e, ...rest } = workPlan;
+  const { launchModel: _l, planDefaultModel: _p, engineModel: _e, pickedModel: _k, ...rest } = workPlan;
   return options.keepStepModels ? rest : { ...rest, ...(Array.isArray(rest.steps) && { steps: withoutStepModels(rest.steps) }) };
 }
 
@@ -1907,7 +1907,8 @@ async function resolveWorkPlanStepModelForTurn(
   const step = currentPendingStep<any>(plan);
   if (!step) {
     // Plan complete: put the pre-plan model back, unless the user has picked another model since the engine's last stamp.
-    if (plan.engineModel && plan.launchModel && session.llmModel === plan.engineModel && !options.explicitPick) {
+    // ...nor when the stamp is a model the user picked during the plan (even if a resumed step adopted it as its own).
+    if (plan.engineModel && plan.launchModel && session.llmModel === plan.engineModel && session.llmModel !== plan.pickedModel && !options.explicitPick) {
       try {
         return { kind: 'restored', decision: await resolveHonored(plan.launchModel, 0) };
       } catch (restoreError) {
@@ -9199,11 +9200,17 @@ export async function generateSessionResponse(
     const wp: any = updatedSession.workPlan;
     // A share viewer's pick runs for the turn but leaves the owner's plan alone (no adoption, no marker change).
     const viewerPick = Boolean(isInteractiveShare) && stepModelTurn.kind === 'resolved' && Boolean(stepModelTurn.userPick);
-    if (wp && !viewerPick && (adoptStepModel || wp.engineModel !== nextEngineModel)) {
-      const { engineModel: _previousEngineModel, ...wpRest } = wp;
+    // What the user explicitly picked (a model-less step running on the pick, or a retired step adopting it) is recorded so
+    // the end-of-plan restore leaves it alone; the restore itself clears the record.
+    const nextPickedModel = stepModelTurn.kind === 'restored'
+      ? undefined
+      : (stepModelTurn.userPick ? llmModel : (adoptStepModel ?? (updatedSession.workPlan as any)?.pickedModel));
+    if (wp && !viewerPick && (adoptStepModel || wp.engineModel !== nextEngineModel || wp.pickedModel !== nextPickedModel)) {
+      const { engineModel: _previousEngineModel, pickedModel: _previousPicked, ...wpRest } = wp;
       await chatbotDb.updateSessionWorkPlan(sessionId, {
         ...wpRest,
         ...(nextEngineModel && { engineModel: nextEngineModel }),
+        ...(nextPickedModel && { pickedModel: nextPickedModel }),
         steps: wp.steps.map((s: any) => (adoptStepModel && s.stepCount === (stepModelTurn as any).stepCount ? { ...s, model: adoptStepModel } : s)),
       });
     }
