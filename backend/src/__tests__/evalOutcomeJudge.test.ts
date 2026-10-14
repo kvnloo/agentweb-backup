@@ -20,6 +20,13 @@ describe('evalOutcomeJudge parseArgs', () => {
     });
   });
 
+  it('accepts --no-judge-clauses for a serializer-only replay (ENG-2483)', () => {
+    expect(parseArgs(['--from', '2026-07-10', '--to', '2026-10-07', '--no-judge-clauses'])).toEqual(
+      expect.objectContaining({ mode: 'replay', noJudgeClauses: true }),
+    );
+    expect(parseArgs(['--from', '2026-07-10', '--to', '2026-10-07'])).not.toHaveProperty('noJudgeClauses');
+  });
+
   it('accepts --prompt-file for a candidate rubric and rejects an empty one (ENG-2380)', () => {
     expect(parseArgs(['--from', '2026-07-10', '--to', '2026-10-07', '--prompt-file', '/tmp/B.txt'])).toEqual(
       expect.objectContaining({ mode: 'replay', promptFile: '/tmp/B.txt' }),

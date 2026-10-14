@@ -21,7 +21,7 @@
  *
  * Usage (default AWS profile; NODE_ENV=development reads the Dev- tables):
  *   npx ts-node --transpile-only src/scripts/evalOutcomeJudge.ts --from 2026-09-14 --to 2026-09-27 \
- *     [--sample 150] [--seed eng-2138] [--model anthropic.claude-sonnet-4-6] [--prompt-file F] [--dry-run]
+ *     [--sample 150] [--seed eng-2138] [--model anthropic.claude-sonnet-4-6] [--prompt-file F] [--no-judge-clauses] [--dry-run]
  *   npx ts-node --transpile-only src/scripts/evalOutcomeJudge.ts --print-judge-row --sample-rate 0.33
  *
  *   --dry-run          grade and count, call no model
@@ -59,7 +59,7 @@ import {
 import { SPEND_EVENTS_TABLE } from '../services/spendEventDb';
 
 const USAGE =
-  'Usage: evalOutcomeJudge.ts --from <date> --to <date> [--sample N] [--seed S] [--model ID] [--prompt-file F] [--dry-run]\n' +
+  'Usage: evalOutcomeJudge.ts --from <date> --to <date> [--sample N] [--seed S] [--model ID] [--prompt-file F] [--no-judge-clauses] [--dry-run]\n' +
   '       evalOutcomeJudge.ts --print-judge-row --sample-rate <0..1> [--model ID]';
 
 export const TARGET_AUC = 0.75;
@@ -72,7 +72,7 @@ const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
 
 export type Args =
   | { mode: 'print-row'; sampleRate: number; model: string }
-  | { mode: 'replay'; from: string; to: string; sample: number; seed: string; model: string; dryRun: boolean; promptFile?: string };
+  | { mode: 'replay'; from: string; to: string; sample: number; seed: string; model: string; dryRun: boolean; promptFile?: string; noJudgeClauses?: boolean };
 
 /** Strict: an unknown flag or a missing operand is an error, so a typo cannot start live judge calls. */
 export function parseArgs(raw: readonly string[]): Args {
@@ -81,7 +81,7 @@ export function parseArgs(raw: readonly string[]): Args {
   const withValue = new Set(['--from', '--to', '--sample', '--seed', '--model', '--sample-rate', '--prompt-file']);
   for (let i = 0; i < raw.length; i++) {
     const flag = raw[i];
-    if (flag === '--dry-run' || flag === '--print-judge-row') flags.add(flag);
+    if (flag === '--dry-run' || flag === '--print-judge-row' || flag === '--no-judge-clauses') flags.add(flag);
     else if (withValue.has(flag)) {
       const operand = raw[++i];
       if (operand === undefined || operand.startsWith('--') || !operand.trim()) throw new Error(`${flag} needs a value.\n${USAGE}`);
@@ -112,6 +112,7 @@ export function parseArgs(raw: readonly string[]): Args {
   return {
     mode: 'replay', from, to, sample, seed: values.get('--seed') ?? 'eng-2138', model, dryRun: flags.has('--dry-run'),
     ...(promptFile ? { promptFile } : {}),
+    ...(flags.has('--no-judge-clauses') ? { noJudgeClauses: true } : {}),
   };
 }
 
@@ -305,6 +306,9 @@ async function replay(args: Extract<Args, { mode: 'replay' }>): Promise<void> {
   const base = buildOutcomeShadowJudgeRow({ sampleRate: 1, model: args.model });
   const judge = args.promptFile ? { ...base, systemPrompt: loadPromptFile(args.promptFile) } : base;
   if (args.promptFile) console.log(`Judge prompt: ${args.promptFile} (${judge.systemPrompt.length} chars), not the committed rubric.`);
+  // ENG-2483: serializer-only replay drops the six appended clauses; production keeps the default.
+  const judgeOptions = args.noJudgeClauses ? { appendClauses: false } : undefined;
+  if (judgeOptions) console.log('Judge clauses: off (serializer-only prompt).');
   const cost = { usd: 0 };
   const call = await unmeteredJudgeCall(cost);
   const rows: JudgedSession[] = [];
@@ -319,7 +323,7 @@ async function replay(args: Extract<Args, { mode: 'replay' }>): Promise<void> {
       ]);
       const session = { ...item, sessionId: g.sessionId, messages, messageCount: messages.length } as unknown as ChatSession;
       const outcome = await replaySession(session, (s) =>
-        scoreSessionWithJudge(messages, messages.length, judge, s.sessionType, { sessionId: g.sessionId }, call));
+        scoreSessionWithJudge(messages, messages.length, judge, s.sessionType, { sessionId: g.sessionId }, call, judgeOptions));
       if (outcome.kind === 'scored') {
         if (outcome.failedRun) failedRuns++;
         rows.push({ success: g.task.verdict === 'success', score: outcome.score, model: g.model });
