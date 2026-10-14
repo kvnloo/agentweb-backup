@@ -44,6 +44,16 @@ failure = off = old behaviour; 60s cache, last-known value on a failed refresh,
 - A step with no model runs on `workPlan.planDefaultModel`, then `workPlan.launchModel` (the model the session had
   before the plan), recorded at launch only for plans whose steps carry a model; the stamp is exactly what runs. When
   the plan completes the pre-plan model returns unless the user picked one (`workPlan.engineModel` marker).
+- Carry-over matching is conservative ("a wrong model is worse than none"): by unique title; duplicated titles match
+  only the same-numbered stored step; a rename binds only when exactly one step on each side is left unmatched at the
+  same number with unchanged content. A pick on a model-less step stands (the marker `engineModel` keeps naming the
+  engine's own choice); a failed end-of-plan restore clears the marker once. Share / conversable views and anonymous
+  launches never carry step models or `launchModel` / `planDefaultModel` / `engineModel`.
+- Known consequences: with the switch off an admin cannot clear a stored step model; a client that always sends
+  `llmModel` never sees the pause and rewrites a retired step model to its pick; authenticated
+  `GET /api/user-work-plans` shows step models of public plans to signed-in users (as `defaultModel` today); a scheduled
+  run paused mid-plan retries up to 20 verified-chat attempts, then the run fails and the next scheduled run re-validates
+  every step model at launch.
 - Not changed: Emma's `create_work_plan` / `modify_work_plan` tools (a model choice belongs to a user/admin, not the LLM;
   `modify_work_plan` keeps a stored step model), model-compare/branching, concurrency cap, retries, autocomplete rounds,
   and the legacy AW-Settings predefined-plans blob (`routes/settings.ts`), which never carried per-step fields.
