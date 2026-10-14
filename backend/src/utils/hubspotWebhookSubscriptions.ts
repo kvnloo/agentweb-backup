@@ -52,6 +52,12 @@ async function registerSubscription(appId: string, developerApiKey: string, even
   console.log(`[HubSpotWebhook] Registered ${eventType}${propertyName ? ` for "${propertyName}"` : ''}`);
 }
 
+type FieldMappings = Array<{ crmProperty: string; enabled: boolean; direction: string }>;
+
+// Runs are serialised within a process: each reads the subscription list, then registers what is
+// missing, so two overlapping runs (boot sync + a config save) could both register the same one.
+let inFlight: Promise<void> = Promise.resolve();
+
 /**
  * Ensures webhook subscriptions exist for all HubSpot contact and deal properties
  * that need real-time sync. Fire-and-forget — never throws.
@@ -59,9 +65,18 @@ async function registerSubscription(appId: string, developerApiKey: string, even
  * Contact: standard fields + any enabled non-push-only custom mappings.
  * Deal: amount, dealstage, deal_currency_code (always — no user config needed).
  */
-export async function ensureWebhookSubscriptions(
-  contactFieldMapping: Array<{ crmProperty: string; enabled: boolean; direction: string }>,
-  customFieldMapping: Array<{ crmProperty: string; enabled: boolean; direction: string }>,
+export function ensureWebhookSubscriptions(
+  contactFieldMapping: FieldMappings,
+  customFieldMapping: FieldMappings,
+): Promise<void> {
+  const run = inFlight.then(() => syncSubscriptions(contactFieldMapping, customFieldMapping));
+  inFlight = run.catch(() => undefined);
+  return run;
+}
+
+async function syncSubscriptions(
+  contactFieldMapping: FieldMappings,
+  customFieldMapping: FieldMappings,
 ): Promise<void> {
   try {
     const credentials = await getHubSpotCredentials();
