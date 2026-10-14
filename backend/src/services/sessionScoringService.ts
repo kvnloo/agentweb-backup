@@ -1799,6 +1799,14 @@ export interface ScoringJudge {
    */
   shadow?: boolean;
   sampleRate?: number;
+  /**
+   * ENG-2484: which generic ENG-* clauses a SHADOW judge's prompt gets appended. 'all' (or
+   * absent) is the pre-ENG-2484 behaviour; 'none' sends the rubric alone (its own outcome
+   * dimensions replace the generic satisfaction clauses). Ignored on non-shadow judges, so an
+   * ordinary satisfaction judge always keeps every clause. Deterministic code guards (cohort
+   * exclusion, no-task retraction, fabrication/integrity caps) run regardless of this value.
+   */
+  clausePolicy?: JudgeClausePolicy;
   createdAt: string;
   updatedAt: string;
 }
@@ -1811,6 +1819,13 @@ export interface ScoringJudge {
  */
 export interface JudgePromptOptions {
   appendClauses?: boolean;
+}
+
+export type JudgeClausePolicy = 'all' | 'none';
+
+/** ENG-2484: the effective clause policy — only a shadow judge may opt out of the clauses. */
+export function effectiveClausePolicy(judge: Pick<ScoringJudge, 'shadow' | 'clausePolicy'>): JudgeClausePolicy {
+  return judge.shadow && judge.clausePolicy === 'none' ? 'none' : 'all';
 }
 
 export function buildJudgeSystemPrompt(basePrompt: string, options?: JudgePromptOptions): string {
@@ -2123,6 +2138,17 @@ export function judgePromptVersion(systemPrompt: string): string {
   return createHash("sha256").update(systemPrompt).digest("hex").slice(0, 12);
 }
 
+/**
+ * ENG-2484: promptVersion recorded on a shadow score. Under the default 'all' policy it keeps
+ * its existing meaning (sha256[:12] of the stored rubric), so historical rows are not
+ * reinterpreted. Under 'none' it gets a `+clauses-none` suffix, so a score from the
+ * rubric-only prompt can never be mistaken for one from the clause-bearing prompt.
+ */
+export function shadowPromptVersion(judge: Pick<ScoringJudge, 'systemPrompt' | 'shadow' | 'clausePolicy'>): string {
+  const base = judgePromptVersion(judge.systemPrompt);
+  return effectiveClausePolicy(judge) === 'none' ? `${base}+clauses-none` : base;
+}
+
 export async function scoreSessionWithJudgeIfNeeded(
   session: ChatSession,
   judge: ScoringJudge,
@@ -2173,10 +2199,15 @@ export async function scoreSessionWithJudgeIfNeeded(
   const result: ScoringResult =
     path === "failed-run"
       ? buildFailedRunResult(messageCount)
-      : await scoreSessionWithJudge(session.messages || [], messageCount, judge, session.sessionType, {
-          userId: session.userId,
-          sessionId: session.sessionId,
-        });
+      : await scoreSessionWithJudge(
+          session.messages || [],
+          messageCount,
+          judge,
+          session.sessionType,
+          { userId: session.userId, sessionId: session.sessionId },
+          undefined,
+          effectiveClausePolicy(judge) === 'none' ? { appendClauses: false } : undefined,
+        );
 
   // Backstop for zero-task phrasings the static lists cannot enumerate: the
   // judge itself reported that the user never asked for anything, so the
@@ -2198,7 +2229,7 @@ export async function scoreSessionWithJudgeIfNeeded(
       ? {
           shadow: true,
           ...(result.model ? { model: result.model } : {}),
-          ...(judge.systemPrompt ? { promptVersion: judgePromptVersion(judge.systemPrompt) } : {}),
+          ...(judge.systemPrompt ? { promptVersion: shadowPromptVersion(judge) } : {}),
         }
       : {}),
   };
