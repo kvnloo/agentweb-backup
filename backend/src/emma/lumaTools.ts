@@ -29,6 +29,9 @@ const MAX_GUESTS_WITH_FILTERED_ANSWERS = 35;
 const MAX_ANSWER_LABELS = 5;
 
 const MAX_ANSWER_CHARS = 300;
+// Per-guest total for answers: even a form with hundreds of long questions must not make ONE guest overflow the view
+// (the page-size loop cannot shrink below a single guest).
+const MAX_GUEST_ANSWER_CHARS = 6000;
 // Anything longer than this after compaction cannot be shown: the model sees only the first 20,000 chars.
 const MAX_RESULT_CHARS = 17_000;
 
@@ -76,11 +79,20 @@ function compactGuest(
     if (key === 'phone_number' && !includePhone) continue;
     if (key === 'registration_answers') {
       if (!includeAnswers || !Array.isArray(value)) continue;
-      const answers = (value as any[])
+      const wanted = (value as any[])
         .filter((a) => a && a.value !== null && a.value !== undefined && a.value !== '')
         .filter((a) => labels.length === 0 || answerMatches(a, labels))
         .map((a) => ({ label: a.label, value: capAnswerValue(a.value) }));
+      let budget = MAX_GUEST_ANSWER_CHARS;
+      const answers: typeof wanted = [];
+      for (const a of wanted) {
+        const size = JSON.stringify(a).length;
+        if (answers.length > 0 && size > budget) break;
+        answers.push(a);
+        budget -= size;
+      }
       if (answers.length > 0) out[key] = answers;
+      if (answers.length < wanted.length) out.answers_omitted = wanted.length - answers.length;
       continue;
     }
     out[key] = value;
@@ -140,16 +152,31 @@ async function resolveLuma(userId: string, calendarId?: string): Promise<Resolve
     };
   }
 
-  if ((account.config as any)?.needs_reconnect) {
-    return { unavailable: unavailable('key_rejected', keyRejectedMessage(account.account_name)) };
-  }
-
   let apiKey: string;
   try {
     apiKey = decryptPassword((account.config as any).access_token).password;
   } catch {
-    return { error: `The stored Luma key for "${account.account_name}" could not be read. Reconnect Luma in Settings.` };
+    return { unavailable: unavailable('key_rejected', keyRejectedMessage(account.account_name)) };
   }
+
+  if ((account.config as any)?.needs_reconnect) {
+    // A flagged key is re-probed with one cheap call instead of staying dead forever: two 401s during a short Luma
+    // auth outage must not silently push every later run (scheduled ones included) onto the bot-blocked browser path.
+    const probe = await new LumaApiService(apiKey).getCalendar().then(
+      () => 'ok' as const,
+      (e) => (e instanceof LumaApiError && e.isAuthFailure ? ('rejected' as const) : ('unknown' as const)),
+    );
+    if (probe === 'rejected') {
+      return { unavailable: unavailable('key_rejected', keyRejectedMessage(account.account_name)) };
+    }
+    if (probe === 'ok') {
+      await updateAccountConfig((account as any).userId, 'luma', account.account_id, () => ({ updates: {}, unset: ['needs_reconnect'] })).catch(
+        (e) => console.warn('[Luma] Could not clear the recovered key flag:', e instanceof Error ? e.message : e),
+      );
+    }
+    // 'unknown' (timeout / 429 / network): not proof either way, so try the real call and let it report honestly.
+  }
+
   return {
     client: new LumaApiService(apiKey),
     ownerUserId: (account as any).userId,
@@ -171,15 +198,23 @@ async function lumaFailure(error: unknown, resolved: Extract<ResolvedLuma, { cli
   if (error instanceof LumaApiError && error.isAuthFailure) {
     // A single 401 could be a Luma-side blip; flagging the key dead makes every later call (and the Settings card)
     // say it is broken until the user re-enters it. Confirm with an independent call before believing it.
-    const stillAuthorised = await resolved.client.getCalendar().then(
-      () => true,
-      (e) => !(e instanceof LumaApiError && e.isAuthFailure),
+    const confirm = await resolved.client.getCalendar().then(
+      () => 'works' as const,
+      (e) => (e instanceof LumaApiError && e.isAuthFailure ? ('rejected' as const) : ('unknown' as const)),
     );
-    if (stillAuthorised) {
+    if (confirm === 'works') {
       return {
         success: false,
         errorClass: 'upstream_5xx',
         message: 'Luma answered that request with an authorisation error, but the key still works. Retry once.',
+      };
+    }
+    if (confirm === 'unknown') {
+      // Could not prove either way (Luma timing out / rate-limiting): do not flag the key and do not claim it works.
+      return {
+        success: false,
+        errorClass: 'upstream_5xx',
+        message: 'Luma answered with an authorisation error and could not be re-checked just now. Retry once in a moment.',
       };
     }
     await updateAccountConfig(resolved.ownerUserId, 'luma', resolved.calendarId, { needs_reconnect: true }).catch(
@@ -242,6 +277,11 @@ emmaToolRegistry.register({
     const userId = context?.userId;
     if (!userId) return { success: false, message: 'Authentication required: no user context.' };
 
+    // Key first: a user with no key must get the normal "carry on with the browser" answer, not an argument error.
+    const resolved = await resolveLuma(userId, args?.calendar_id);
+    if ('unavailable' in resolved) return resolved.unavailable;
+    if ('error' in resolved) return { success: false, message: resolved.error };
+
     const bounds: { after?: string; before?: string } = {};
     for (const key of ['after', 'before'] as const) {
       if (!args?.[key]) continue;
@@ -253,10 +293,6 @@ emmaToolRegistry.register({
     if (limit !== undefined && (!Number.isFinite(limit) || limit < 1)) {
       return { success: false, message: 'limit must be a positive number.' };
     }
-
-    const resolved = await resolveLuma(userId, args?.calendar_id);
-    if ('unavailable' in resolved) return resolved.unavailable;
-    if ('error' in resolved) return { success: false, message: resolved.error };
 
     try {
       const page = await resolved.client.listEvents({
@@ -330,6 +366,11 @@ emmaToolRegistry.register({
     const userId = context?.userId;
     if (!userId) return { success: false, message: 'Authentication required: no user context.' };
 
+    // Key first (see luma_list_events): a bad slug link from a key-less user must not become a red failure.
+    const resolved = await resolveLuma(userId, args?.calendar_id);
+    if ('unavailable' in resolved) return resolved.unavailable;
+    if ('error' in resolved) return { success: false, message: resolved.error };
+
     const eventId = parseLumaEventId(String(args?.event ?? ''));
     if (!eventId) {
       return {
@@ -361,10 +402,6 @@ emmaToolRegistry.register({
       .slice(0, MAX_ANSWER_LABELS);
     const includeAnswers = args?.include_registration_answers === true || answerLabels.length > 0;
     const includePhone = args?.include_phone === true;
-
-    const resolved = await resolveLuma(userId, args?.calendar_id);
-    if ('unavailable' in resolved) return resolved.unavailable;
-    if ('error' in resolved) return { success: false, message: resolved.error };
 
     const cap = !includeAnswers ? HARD_MAX_GUESTS : answerLabels.length > 0 ? MAX_GUESTS_WITH_FILTERED_ANSWERS : MAX_GUESTS_WITH_ANSWERS;
     const maxGuests = Math.min(Math.max(Math.floor(Number(args?.max_guests)) || Math.min(DEFAULT_MAX_GUESTS, cap), 1), cap);
@@ -414,6 +451,7 @@ emmaToolRegistry.register({
         if (attempts >= 4) {
           return {
             success: false,
+            errorClass: 'read_incomplete',
             message:
               `A page of guests is still too large to show (${size} chars; the answers are long free text). ` +
               `Call luma_get_guests again with ${args?.cursor ? 'the SAME cursor' : 'no cursor'} and a much smaller max_guests.`,

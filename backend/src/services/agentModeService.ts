@@ -7892,6 +7892,18 @@ export class AgentModeService {
       return minimal;
     }
 
+    // ENG-2338: keep enough of a Luma result for the ledger to tell "pulled 0 guests" from "no key connected" (both
+    // would otherwise minimise to {}). `rowCount` is what the unread-page notice reads; rows themselves are dropped.
+    if (toolName === 'luma_get_guests' || toolName === 'luma_list_events') {
+      const rows = Array.isArray(result?.guests) ? result.guests : Array.isArray(result?.events) ? result.events : undefined;
+      const minimal: Record<string, any> = {};
+      for (const field of ['success', 'connected', 'reason', 'count', 'has_more', 'next_cursor', 'skipped_without_registration']) {
+        if (result?.[field] !== undefined) minimal[field] = result[field];
+      }
+      if (rows) minimal.rowCount = rows.length;
+      return minimal;
+    }
+
     // For playwright screenshots, result has already been processed (base64 → S3 URL)
     if (toolName === 'playwright_browser_take_screenshot') {
       return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };

@@ -18,7 +18,10 @@ jest.mock('../services/connectedAccountsDb', () => ({
 
 jest.mock('../utils/crypto', () => ({
   encryptPassword: (p: string, u: string) => `enc(${u}):${p}`,
-  decryptPassword: (e: string) => ({ password: e.replace(/^enc\([^)]*\):/, ''), userId: 'owner' }),
+  decryptPassword: (e: string) => {
+    if (e.startsWith('%%%')) throw new Error('bad ciphertext');
+    return { password: e.replace(/^enc\([^)]*\):/, ''), userId: 'owner' };
+  },
 }));
 
 jest.mock('../middleware/auth', () => ({
@@ -111,6 +114,16 @@ describe('POST /connect', () => {
     const res = await request(app).post('/api/oauth/luma/connect').send({});
     expect(res.status).toBe(400);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('rate-limits repeated attempts per user (it is otherwise a free Luma-key validator)', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({}, { status: 401 }));
+    const codes: number[] = [];
+    for (let i = 0; i < 12; i++) {
+      codes.push((await request(app).post('/api/oauth/luma/connect').send({ api_key: `bad-${i}` })).status);
+    }
+    expect(codes).toContain(429);
+    expect(codes[0]).toBe(422);
   });
 });
 
@@ -407,7 +420,18 @@ describe('luma tools', () => {
     const r: any = await tool('luma_get_guests')({ event: 'evt-1' }, { userId: 'user-1' });
     expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
     expect(r.success).toBe(false);
+    expect(r.errorClass).toBe('upstream_5xx');
     expect(r.message).toMatch(/key still works\. Retry once/);
+  });
+
+  it('an UNPROVEN 401 (the re-check itself times out or is rate-limited) neither flags the key nor claims it works', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, { status: 401 })).mockResolvedValueOnce(jsonResponse({}, { status: 429 }));
+    const r: any = await tool('luma_get_guests')({ event: 'evt-1' }, { userId: 'user-1' });
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+    expect(r.success).toBe(false);
+    expect(r.message).not.toMatch(/still works/);
+    expect(r.message).toMatch(/could not be re-checked/);
   });
 
   it('does NOT flag the key dead when Luma answers 403 for one event', async () => {
@@ -444,12 +468,47 @@ describe('luma tools', () => {
     expect(r.interrupted).toMatch(/call again with next_cursor/);
   });
 
-  it('does not call Luma again once an account is flagged needs_reconnect, and still tells the model to carry on', async () => {
-    mockGetAccounts.mockResolvedValue([lumaAccount({ config: { ...lumaAccount().config, needs_reconnect: true } })]);
+  it('re-probes a flagged key once: still dead -> normal "unavailable" with no real call; recovered -> flag cleared and the call proceeds', async () => {
+    const flagged = () => lumaAccount({ config: { ...lumaAccount().config, needs_reconnect: true } });
+
+    mockGetAccounts.mockResolvedValue([flagged()]);
+    fetchMock.mockReset();
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, { status: 401 }));
+    const dead: any = await tool('luma_get_guests')({ event: 'evt-1' }, { userId: 'user-1' });
+    expect(dead.success).toBe(true);
+    expect(dead.reason).toBe('key_rejected');
+    expect(fetchMock).toHaveBeenCalledTimes(1); // only the probe, never the guest list
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/v1/calendars/get');
+
+    mockUpdateAccountConfig.mockClear();
+    fetchMock.mockReset();
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ id: 'cal-1', name: 'ThinkingAI' }))
+      .mockResolvedValueOnce(jsonResponse({ entries: [guest('a', '2026-10-06T00:00:00Z')], has_more: false }));
+    const ok: any = await tool('luma_get_guests')({ event: 'evt-1' }, { userId: 'user-1' });
+    expect(ok.guests).toHaveLength(1);
+    expect(mockUpdateAccountConfig).toHaveBeenCalledWith('owner', 'luma', 'cal-1', expect.any(Function));
+    const fn = mockUpdateAccountConfig.mock.calls[0][3];
+    expect(fn({})).toEqual({ updates: {}, unset: ['needs_reconnect'] });
+  });
+
+  it('a no-key user gets the normal answer even when the arguments are bad (a public slug link is the normal link shape)', async () => {
+    mockGetAccounts.mockResolvedValue([]);
+    for (const args of [{ event: 'https://luma.com/my-event' }, { event: 'evt-1', approval_status: 'bogus' }, { event: 'evt-1', registered_after: 'yesterday' }]) {
+      const r: any = await tool('luma_get_guests')(args, { userId: 'user-1' });
+      expect(r.success).toBe(true);
+      expect(r.reason).toBe('no_key');
+    }
+    const list: any = await tool('luma_list_events')({ after: 'nonsense', limit: 'lots' }, { userId: 'user-1' });
+    expect(list.success).toBe(true);
+    expect(list.reason).toBe('no_key');
+  });
+
+  it('a stored key that cannot be decrypted is a normal unavailable state, not an unclassified do-not-retry failure', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount({ config: { ...lumaAccount().config, access_token: '%%%not-base64-ciphertext' } })]);
     const r: any = await tool('luma_get_guests')({ event: 'evt-1' }, { userId: 'user-1' });
     expect(r.success).toBe(true);
-    expect(r.reason).toBe('key_rejected');
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(r.connected).toBe(false);
   });
 
   it('reports a 429 with the retry window', async () => {
@@ -618,6 +677,23 @@ describe('review fixes (second independent review)', () => {
     const r: any = await tool('luma_list_events')({}, { userId: 'user-1' });
     expect(r.message).toContain('Retry after 42s, then retry the same call.');
     expect(r.message).not.toContain('.,');
+  });
+});
+
+describe('size exit and ledger shape', () => {
+  it('even a guest with hundreds of long answers cannot overflow the view: a per-guest budget keeps one guest small', async () => {
+    mockGetAccounts.mockResolvedValue([lumaAccount()]);
+    const huge = { ...guest('g', '2026-10-06T00:00:00Z'), registration_answers: Array.from({ length: 200 }, (_, q) => ({ label: `Q${q}`, question_type: 'text', question_id: `q${q}`, value: 'y'.repeat(2000) })) };
+    fetchMock.mockReset();
+    fetchMock.mockImplementation(async (url: any) => {
+      const limit = Number(new URL(String(url)).searchParams.get('pagination_limit'));
+      return jsonResponse({ entries: Array.from({ length: limit }, () => huge), has_more: true, next_cursor: 'c2' });
+    });
+    const r: any = await tool('luma_get_guests')({ event: 'evt-1', include_registration_answers: true, max_guests: 30 }, { userId: 'user-1' });
+    expect(r.success).toBe(true);
+    expect(JSON.stringify(r).length).toBeLessThanOrEqual(17000);
+    expect(r.guests[0].answers_omitted).toBeGreaterThan(0); // told, not silently cut
+    fetchMock.mockReset();
   });
 });
 
