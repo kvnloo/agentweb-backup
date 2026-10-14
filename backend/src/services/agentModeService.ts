@@ -7897,7 +7897,7 @@ export class AgentModeService {
     if (toolName === 'luma_get_guests' || toolName === 'luma_list_events') {
       const rows = Array.isArray(result?.guests) ? result.guests : Array.isArray(result?.events) ? result.events : undefined;
       const minimal: Record<string, any> = {};
-      for (const field of ['success', 'connected', 'reason', 'count', 'has_more', 'next_cursor', 'skipped_without_registration']) {
+      for (const field of ['success', 'connected', 'nothing_pulled', 'reason', 'count', 'has_more', 'next_cursor', 'skipped_without_registration']) {
         if (result?.[field] !== undefined) minimal[field] = result[field];
       }
       if (rows) minimal.rowCount = rows.length;

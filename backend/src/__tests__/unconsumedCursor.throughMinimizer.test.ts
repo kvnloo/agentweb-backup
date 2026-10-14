@@ -166,8 +166,8 @@ describe('Luma tools through the REAL minimizer', () => {
 
 describe('the ledger can tell "no key" from "pulled zero guests" (ENG-2338)', () => {
   it('keeps connected/reason/count, drops the rows', () => {
-    const noKey = minimize({ success: true, connected: false, reason: 'no_key', message: 'long text' }, 'luma_get_guests');
-    expect(noKey).toEqual({ success: true, connected: false, reason: 'no_key' });
+    const noKey = minimize({ success: true, connected: false, nothing_pulled: true, reason: 'no_key', message: 'long text' }, 'luma_get_guests');
+    expect(noKey).toEqual({ success: true, connected: false, nothing_pulled: true, reason: 'no_key' });
     const empty = minimize({ success: true, count: 0, has_more: false, guests: [] }, 'luma_get_guests');
     expect(empty).toEqual({ success: true, count: 0, has_more: false, rowCount: 0 });
     expect(empty).not.toEqual(noKey);

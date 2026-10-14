@@ -259,8 +259,10 @@ describe('luma tools', () => {
       expect(r.success).toBe(true); // not a red "failed" card, not counted as a failed call
       expect(r.connected).toBe(false);
       expect(r.reason).toBe('no_key');
+      expect(r.nothing_pulled).toBe(true);
+      expect(r.message).toMatch(/^NOTHING WAS PULLED/);
       expect(r.guests).toBeUndefined();
-      expect(r.message).toMatch(/No Luma API key is connected/);
+      expect(r.message).toMatch(/no Luma API key is connected/);
       expect(r.message).toMatch(/NOT an error/);
       expect(r.message).toMatch(/continue the task now with the browser/);
       expect(r.message).toContain('[Settings → Login Credentials](/settings/login-credentials)');

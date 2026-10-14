@@ -103,7 +103,7 @@ function compactGuest(
 const GUEST_STATUSES = ['approved', 'session', 'pending_approval', 'invited', 'declined', 'waitlist'];
 
 const NOT_CONNECTED_MESSAGE =
-  'No Luma API key is connected for this account. That is normal and NOT an error — most accounts read Luma through ' +
+  'NOTHING WAS PULLED: no Luma API key is connected for this account. That is normal and NOT an error — most accounts read Luma through ' +
   'the browser. Do not stop and do not report a failure: continue the task now with the browser session-cookie path ' +
   '(or ask for a CSV export). You may mention once that a Luma Plus calendar API key (create it at ' +
   'luma.com/calendar/manage/api-keys) saved on the "Luma API key" card in ' +
@@ -111,7 +111,7 @@ const NOT_CONNECTED_MESSAGE =
   'In a scheduled or unattended run, just continue.';
 
 const keyRejectedMessage = (calendarName: string) =>
-  `The Luma API key for the calendar "${calendarName}" was rejected by Luma (revoked, the wrong calendar, or the Luma ` +
+  `NOTHING WAS PULLED: the Luma API key for the calendar "${calendarName}" was rejected by Luma (revoked, the wrong calendar, or the Luma ` +
   'Plus subscription lapsed), so the API path is unavailable. Do not stop: continue with the browser session-cookie ' +
   'path or a CSV export, and tell the user the key needs replacing on the "Luma API key" card in ' +
   '[Settings → Login Credentials](/settings/login-credentials).';
@@ -125,6 +125,9 @@ const keyRejectedMessage = (calendarName: string) =>
 const unavailable = (reason: 'no_key' | 'key_rejected', message: string) => ({
   success: true,
   connected: false,
+  // `success: true` only means "the tool ran without error". A weak model read it as "the pull succeeded" and told the
+  // user it had pulled guests (seen live on gpt-5.4-nano), so the result says in plain fields that no data came back.
+  nothing_pulled: true,
   reason,
   message,
 });
