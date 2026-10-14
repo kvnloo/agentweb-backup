@@ -822,7 +822,8 @@ const familyMember = (s: ChatSession): BranchFamilyMember => ({
  * Owner-only. The family root is the requested session's `branchedFrom.rootSessionId` (or itself); the answer is
  * the root plus every non-archived session of the same owner whose `branchedFrom.rootSessionId` is that root,
  * createdAt ascending, at most 50. Legacy branches made before `branchedFrom` existed carry only the row-0
- * `branchOrigin` marker; finding them would mean reading message rows for every session, so they are NOT grouped.
+ * `branchOrigin` marker; finding them would mean reading message rows for every session, so there is no backfill:
+ * each one gets its `branchedFrom` the first time its owner opens it (healLegacyBranchedFrom).
  */
 export async function listBranchFamily(deps: BranchFamilyDeps, input: { user: BranchUser; sessionId: string }): Promise<ServiceOutcome> {
   try {
@@ -869,5 +870,134 @@ export async function listBranchFamily(deps: BranchFamilyDeps, input: { user: Br
   } catch (error) {
     console.error('ChatBranching: listing the branch family failed', { errorClass: (error as Error)?.name, message: String((error as Error)?.message ?? '').slice(0, 200) });
     return fail(500, 'Failed to list branches', 'branches_failed');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Self-healing of legacy branches (created before `branchedFrom` was written).
+// ---------------------------------------------------------------------------
+
+/** Most record reads one heal may make while looking for the family root. */
+export const LEGACY_HEAL_MAX_HOPS = 10;
+
+/**
+ * Sessions whose heal was decided to be impossible (source missing, foreign or cyclic). Remembering them
+ * means an owner who keeps opening such a chat does not repeat the flag read and source read every time.
+ * Per process, capped, cleared on restart; nothing is written. Failures and a disabled flag are NOT remembered.
+ */
+const UNHEALABLE_MAX = 500;
+const unhealable = new Set<string>();
+
+function rememberUnhealable(sessionId: string): void {
+  unhealable.delete(sessionId);
+  unhealable.add(sessionId);
+  if (unhealable.size > UNHEALABLE_MAX) unhealable.delete(unhealable.values().next().value as string);
+}
+
+export function __resetLegacyHealCacheForTests(): void {
+  unhealable.clear();
+}
+
+export function __legacyHealCacheSizeForTests(): number {
+  return unhealable.size;
+}
+
+export interface LegacyBranchHealDeps {
+  isFeatureEnabled(): Promise<boolean>;
+  /** Record-only read (ChatbotDB.getChatSessionRecord): never reads or migrates message rows. */
+  getSessionRecord(sessionId: string): Promise<ChatSession | null>;
+  /**
+   * Conditional write (ChatbotDB.setBranchedFromIfAbsent). true = written; false = refused because the
+   * session is gone, is not the owner's or already has a `branchedFrom` (never overwritten).
+   */
+  setBranchedFromIfAbsent(sessionId: string, ownerUserId: string, branchedFrom: NonNullable<ChatSession['branchedFrom']>): Promise<boolean>;
+  log(message: string, details?: Record<string, unknown>): void;
+}
+
+/** A row-0 marker is usable only when every field the derived `branchedFrom` copies is well formed. */
+function readUsableBranchOrigin(messages: readonly ChatMessage[] | undefined): BranchOrigin | null {
+  const origin = readBranchOrigin(messages);
+  if (!origin) return null;
+  if (!isAcceptableSessionId(origin.sourceSessionId)) return null;
+  if (!Number.isInteger(origin.sourceMessageIndex) || origin.sourceMessageIndex < 0) return null;
+  if (typeof origin.branchedAt !== 'string' || origin.branchedAt.length === 0) return null;
+  return origin;
+}
+
+/**
+ * The `branchedFrom` a legacy branch would have been created with, or null (skip silently). Reads at most
+ * LEGACY_HEAL_MAX_HOPS session RECORDS, never message rows:
+ *  - the source must exist and belong to the same owner (never link across users); archived is fine;
+ *  - root = the source's `branchedFrom.rootSessionId`; a source without one is followed through a row-0
+ *    marker only when its record carries inline messages (very old sessions), otherwise the source itself is
+ *    the root (what branching it would have written). The hop limit also ends on the last session reached;
+ *  - a cycle (including back to this session) means corrupt data: skip.
+ */
+async function deriveLegacyBranchedFrom(
+  deps: LegacyBranchHealDeps,
+  session: Pick<ChatSession, 'sessionId' | 'userId'>,
+  origin: BranchOrigin,
+): Promise<NonNullable<ChatSession['branchedFrom']> | null> {
+  const visited = new Set<string>([session.sessionId]);
+  let currentId = origin.sourceSessionId;
+  let rootSessionId: string | undefined;
+  for (let hop = 0; hop < LEGACY_HEAL_MAX_HOPS; hop++) {
+    if (visited.has(currentId)) return null;
+    visited.add(currentId);
+    const record = await deps.getSessionRecord(currentId);
+    if (!record || record.sessionId !== currentId || record.userId !== session.userId) return null;
+    if (typeof record.branchedFrom?.rootSessionId === 'string' && record.branchedFrom.rootSessionId.length > 0) {
+      rootSessionId = record.branchedFrom.rootSessionId;
+      break;
+    }
+    rootSessionId = currentId;
+    const next = readUsableBranchOrigin(record.messages);
+    if (!next) break;
+    currentId = next.sourceSessionId;
+  }
+  if (!rootSessionId) return null;
+  return {
+    sessionId: origin.sourceSessionId,
+    rootSessionId,
+    messageIndex: origin.sourceMessageIndex,
+    branchedAt: origin.branchedAt,
+  };
+}
+
+/**
+ * Called when the OWNER opens a session. If it is a legacy branch (row 0 carries `branchOrigin` but the
+ * session has no `branchedFrom`) and branching is enabled, derive and persist `branchedFrom` once, and return
+ * it so the same response can carry it. Best effort: every failure is logged and swallowed (null), so opening a
+ * chat never fails or waits on this. Sessions that already have `branchedFrom`, or are not branches, cost
+ * nothing: no flag read, no store call.
+ */
+export async function healLegacyBranchedFrom(
+  deps: LegacyBranchHealDeps,
+  session: Pick<ChatSession, 'sessionId' | 'userId' | 'branchedFrom' | 'messages'>,
+): Promise<NonNullable<ChatSession['branchedFrom']> | null> {
+  try {
+    if (session.branchedFrom) return null;
+    const origin = readUsableBranchOrigin(session.messages);
+    if (!origin) return null;
+    if (unhealable.has(session.sessionId)) return null;
+    if (!(await deps.isFeatureEnabled())) return null;
+    const derived = await deriveLegacyBranchedFrom(deps, session, origin);
+    if (!derived) {
+      rememberUnhealable(session.sessionId);
+      return null;
+    }
+    if (await deps.setBranchedFromIfAbsent(session.sessionId, session.userId, derived)) {
+      deps.log('ChatBranching: healed a legacy branch', { sessionId: session.sessionId, rootSessionId: derived.rootSessionId });
+      return derived;
+    }
+    // Refused: a concurrent open already wrote it (identical value), or the session vanished. Report what is stored.
+    return (await deps.getSessionRecord(session.sessionId))?.branchedFrom ?? null;
+  } catch (error) {
+    deps.log('ChatBranching: healing a legacy branch failed; ignored', {
+      sessionId: session.sessionId,
+      errorClass: (error as Error)?.name,
+      message: String((error as Error)?.message ?? '').slice(0, 200),
+    });
+    return null;
   }
 }

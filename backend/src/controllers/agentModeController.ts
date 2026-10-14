@@ -33,6 +33,7 @@ import {
   type RecipientRemediation,
 } from '../services/scheduledReportAccess';
 import { settingsService } from '../services/settingsService';
+import { sessionActiveRunGuard } from '../services/agentMode/sessionActiveRunGuardInstance';
 import { workPlanService } from '../services/workPlanService';
 import { projectWorkPlanForCustomer } from '../services/workPlanCustomerProjection';
 import { v4 as uuidv4 } from 'uuid';
@@ -45,8 +46,9 @@ import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/age
 import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/finalAnswer';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
-import { CHAT_BRANCHING_ENABLED_SETTING, isChatBranchingSettingEnabled } from '../services/agentMode/chatBranching';
+import { CHAT_BRANCHING_ENABLED_SETTING, isChatBranchingSettingEnabled, healLegacyBranchedFrom } from '../services/agentMode/chatBranching';
 import { compareSaveAlternatives } from '../services/agentMode/compareSaveAlternativesInstance';
+import { LEGACY_MODEL_ALIASES } from '../services/agentMode/llmModelRegistry';
 import { resolveRunFunding } from '../services/funding/runFunding';
 import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError, isProviderUnavailableError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
@@ -84,6 +86,15 @@ import {
 } from '../services/agentMode/runStore';
 import { assertSequentialStepCounts } from '../services/workPlanSteps';
 import { validateModelPin, normalizeRequestedLlmModel, resolvePlanLaunchModel, canonicalPinId } from '../services/agentMode/modelPin';
+import { workPlanStepModels } from '../services/agentMode/workPlanStepModelsInstance';
+import {
+  anyStepCarriesModel,
+  buildStepModelPausedMessage,
+  currentPendingStep,
+  isStepModelUnavailableError,
+  resolvePlanStepModelsForLaunch,
+  stepModelOf,
+} from '../services/agentMode/workPlanStepModels';
 import { ModelUnavailableError, MODEL_SAVE_FAILED_MESSAGE, buildAnonymousModelUnavailableBody, buildModelUnavailableBody, isModelUnavailableError, sanitizeModelLabel } from '../services/agentMode/modelUnavailable';
 import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
 // ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
@@ -140,12 +151,17 @@ import {
   type SubscriptionFeatureId,
 } from '../services/subscriptionService';
 import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
+import { fileProductFeedback, EMMA_FEEDBACK_INTENTS } from '../services/productFeedbackFiling';
+import { ReportReplayCapacityError } from '../utils/reportIntake';
 import { resetSentence } from "../utils/usageCycle";
 import { buildUsageBlockCopy } from "../utils/usageBlockCopy";
 import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 import { DynamoDB } from 'aws-sdk';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
+import { parseScheduledChatsPage, encodeScheduledChatsCursor } from '../utils/scheduledChatsPage';
+import { describeScheduledRunFailureReasons } from '../utils/scheduledRunFailureReasons';
+import { resolveScheduleRunTime, formatRunTimeInZone } from '../utils/scheduleRunTime';
 import {
   selectPolicyModel,
   type ModelBackupSource,
@@ -486,6 +502,57 @@ export async function resolveEffectiveModelForUser(input: {
     ...decision,
     usageMode: usage.mode.usageMode,
     usagePolicyVersion: usage.policy?.version || null,
+  };
+}
+
+/**
+ * The one 429 `usage_paused` body for an interactive turn refused because the allowance is
+ * exhausted (/generate and /verified-generate share it, so they cannot disagree). When a
+ * usage policy is active the policy decision is stamped on the session (its model is kept)
+ * and echoed in the body (a caller that already resolved it passes `decision`); a ModelUnavailableError while resolving it must not mask the 429.
+ */
+async function buildUsagePausedBody(input: {
+  usageStatus: Awaited<ReturnType<typeof checkTokenUsage>>;
+  session: { sessionId: string; userId: string; llmModel?: string | null };
+  requestedModel: string | null;
+  backupModel?: string | null;
+  /** An already-resolved policy decision (skips the resolve below). */
+  decision?: EffectiveModelPolicyDecision;
+}): Promise<Record<string, unknown>> {
+  const { usageStatus, session } = input;
+  // ENG-1344 AC6: one server-side producer for both the flat string and the structured copy.
+  const usageBlockCopy = buildUsageBlockCopy({ month: usageStatus.month });
+  const decision = input.decision ?? (usageStatus.usagePolicyVersion
+    ? await resolveEffectiveModelForUser({
+        userId: session.userId,
+        requestedModel: input.requestedModel,
+        backupModel: input.backupModel,
+        backupSource: input.backupModel ? 'user' : null,
+      }).catch((modelError) => {
+        if (isModelUnavailableError(modelError)) return undefined;
+        throw modelError;
+      })
+    : undefined);
+  if (!decision) {
+    return { error: usageBlockCopy.message, usageBlock: usageBlockCopy, code: 'usage_paused', usageMode: 'paused' };
+  }
+  await chatbotDb.updateSessionLlmModel(
+    session.sessionId,
+    session.llmModel || agentModeService.default_model,
+    toStoredModelPolicyDecision(decision),
+  );
+  return {
+    error: usageBlockCopy.message,
+    usageBlock: usageBlockCopy,
+    code: 'usage_paused',
+    usageMode: decision.usageMode,
+    requestedModel: decision.requestedModel,
+    effectiveModel: decision.effectiveModel,
+    backupModel: decision.backupModel,
+    backupSource: decision.backupSource,
+    modelSelection: decision.modelSelection,
+    modelSelectionReason: decision.reason,
+    usagePolicyVersion: decision.usagePolicyVersion,
   };
 }
 
@@ -1775,6 +1842,179 @@ async function userExplicitlyRequestedStop(sessionId: string, usageContext?: LLM
 }
 
 /**
+ * ENG-2378: a work plan as shown to someone who is not the owner (share / conversable / anonymous launch): never the
+ * engine's internal bookkeeping (launchModel, planDefaultModel, engineModel) and, unless `keepStepModels`, no step models.
+ * Returns a copy; the stored plan is untouched.
+ */
+function redactWorkPlanForViewer(workPlan: any, options: { keepStepModels?: boolean } = {}): any {
+  if (!workPlan || typeof workPlan !== 'object') return workPlan;
+  const { launchModel: _l, planDefaultModel: _p, engineModel: _e, pickedModel: _k, ...rest } = workPlan;
+  return options.keepStepModels ? rest : { ...rest, ...(Array.isArray(rest.steps) && { steps: withoutStepModels(rest.steps) }) };
+}
+
+/** ENG-2378: public plan responses never expose step models (the plan-level defaultModel exposure is pre-existing). */
+function withoutStepModels(steps: any): any {
+  return Array.isArray(steps)
+    ? steps.map((s) => (s && typeof s === 'object' && 'model' in s ? (({ model: _m, ...rest }) => rest)(s) : s))
+    : steps;
+}
+
+/**
+ * ENG-2378: what the plan demands of THIS turn's model. Applies only to a plan whose steps carry a model, and only
+ * while per-step models are honoured (switch on, or unknown after a settings outage; only a definite off ignores them).
+ *  - `none`: today's behaviour (the request model runs).
+ *  - `resolved`: this model runs (the pending step's, else the plan default, else the pre-plan model; an explicit user
+ *    pick wins on a step with no model). `updateStepModelTo` is set when an explicit pick took over a step whose own
+ *    model is unavailable: the step is updated so the plan resumes.
+ *  - `restored`: the plan is complete and the user has not picked a model since: the pre-plan model returns.
+ *  - `unavailable`: the pending step's model is unavailable and the user made no explicit pick: PAUSE the plan.
+ *    Nothing is ever sent to a different model.
+ */
+type ResolvedStepDecision = EffectiveModelPolicyDecision & { effectiveModel: string };
+type WorkPlanStepModelTurn =
+  | { kind: 'none' }
+  | {
+      kind: 'resolved'; stepCount: number; decision: ResolvedStepDecision; updateStepModelTo?: string;
+      /** The user's own pick is running on a model-less step; `engineChoice` is what the engine itself would have used. */
+      userPick?: boolean; engineChoice?: string;
+    }
+  | { kind: 'restored'; decision: ResolvedStepDecision }
+  | { kind: 'restoreFailed' }
+  | { kind: 'unavailable'; stepCount: number; model: string; label: string; reason: string };
+
+async function resolveWorkPlanStepModelForTurn(
+  session: { userId: string; llmModel?: string; workPlan?: any },
+  // `viewerIsOwner` false = an interactive-share viewer: their pick may run for the turn on a model-less step, but it
+  // never rewrites the OWNER's stored step model (the viewer gets the pause; the owner resumes).
+  options: { explicitPick?: string; viewerIsOwner?: boolean } = {},
+): Promise<WorkPlanStepModelTurn> {
+  const plan = session.workPlan;
+  if (!plan || !anyStepCarriesModel(plan.steps)) return { kind: 'none' };
+  // Checked only for a plan that carries step models, so ordinary plan turns never read the switch.
+  if (!(await workPlanStepModels.shouldHonor())) return { kind: 'none' };
+
+  const resolveHonored = async (model: string, stepCount: number): Promise<ResolvedStepDecision> => {
+    // An explicit selection by a human: fail loud, never substitute.
+    const decision = await resolveEffectiveModelForUser({ userId: session.userId, requestedModel: model, allowSilentSwap: false });
+    // Defensive: only an honored decision may run. (A paused account has no effective model; the callers' usage gates
+    // answer that case before this point.)
+    if (decision.modelSelection !== 'honored' || !decision.effectiveModel) {
+      throw new Error(`Work plan step ${stepCount} model "${sanitizeModelLabel(model)}" could not be honored (${decision.modelSelection})`);
+    }
+    return decision as ResolvedStepDecision;
+  };
+
+  const step = currentPendingStep<any>(plan);
+  if (!step) {
+    // Plan complete: put the pre-plan model back, unless the user has picked another model since the engine's last stamp.
+    // ...nor when the stamp is a model the user picked during the plan (even if a resumed step adopted it as its own).
+    if (plan.engineModel && plan.launchModel && session.llmModel === plan.engineModel && session.llmModel !== plan.pickedModel && !options.explicitPick) {
+      try {
+        return { kind: 'restored', decision: await resolveHonored(plan.launchModel, 0) };
+      } catch (restoreError) {
+        if (!isModelUnavailableError(restoreError)) throw restoreError;
+        // The pre-plan model is gone: do not retry every turn. The caller clears the marker; this turn runs as requested.
+        console.warn(`AgentMode: pre-plan model "${sanitizeModelLabel(plan.launchModel)}" could not be restored after the work plan finished (${restoreError.reason}); keeping the current model.`);
+        return { kind: 'restoreFailed' };
+      }
+    }
+    return { kind: 'none' };
+  }
+
+  const stepCount = Number(step.stepCount);
+  const ownModel = stepModelOf(step);
+  const fallbackModel = (typeof plan.planDefaultModel === 'string' && plan.planDefaultModel.trim()) || (typeof plan.launchModel === 'string' && plan.launchModel.trim()) || undefined;
+  // A step without a model follows "plan default, then the model the session had before the plan" (never the previous
+  // step's model); a user's pick on such a step wins, and keeps winning: a stored model that is not the one the engine
+  // last stamped is a standing pick by the user (the same marker the end-of-plan restore uses).
+  // The picker PATCHes session.llmModel on every pick, so by the time /generate arrives the request model EQUALS the
+  // stamp and `explicitPick` is empty: whatever the stored stamp is, if it is not what the engine itself last stamped
+  // (before its first stamp: the model the plan was launched on), it is the user's pick.
+  const engineStamp = plan.engineModel
+    || (plan.steps.every((x: any) => !x?.status || x.status === 'pending') ? (plan.planDefaultModel || plan.launchModel) : undefined);
+  const standingPick = engineStamp && session.llmModel && session.llmModel !== engineStamp ? session.llmModel : undefined;
+  const pick = options.explicitPick || standingPick;
+  const userPick = ownModel ? undefined : pick;
+  const candidate = ownModel ?? (userPick || fallbackModel);
+  if (!candidate) return { kind: 'none' };
+  try {
+    return {
+      kind: 'resolved', stepCount, decision: await resolveHonored(candidate, stepCount),
+      ...(userPick && { userPick: true, engineChoice: fallbackModel }),
+    };
+  } catch (modelError) {
+    if (!isModelUnavailableError(modelError)) throw modelError;
+    if (pick && candidate !== pick && options.viewerIsOwner !== false) {
+      // The plan's model is gone but the user chose another one: it runs, and the step adopts it (the engine marker then
+      // follows the new step model, so the stamp is the engine's own from here on).
+      const decision = await resolveHonored(pick, stepCount);
+      return { kind: 'resolved', stepCount, decision, ...(ownModel && { updateStepModelTo: decision.effectiveModel }) };
+    }
+    const display = typeof agentModeService.getModelDisplayName === 'function'
+      ? agentModeService.getModelDisplayName(modelError.requestedModel)
+      : undefined;
+    return { kind: 'unavailable', stepCount, model: candidate, label: sanitizeModelLabel(display || candidate), reason: modelError.reason };
+  }
+}
+
+/**
+ * ENG-2378: pause a work plan whose current step's model is no longer available. Leaves a visible assistant message
+ * ("Step N uses <model>, which is no longer available. Choose another model in the model picker and send again") and sends an
+ * oncall alert; the plan itself is untouched (nothing completes, nothing runs on another model). Idempotent per
+ * step+model: when the transcript already ends with this exact pause, no second message or alert is produced, so a
+ * continuation chain that re-checks cannot spam the chat.
+ */
+async function pauseWorkPlanForUnavailableStepModel(
+  sessionId: string,
+  userId: string,
+  turn: Extract<WorkPlanStepModelTurn, { kind: 'unavailable' }>,
+  options: { emitToUser: boolean },
+): Promise<{ content: string; message?: any }> {
+  const content = buildStepModelPausedMessage(turn.stepCount, turn.label);
+  const session = await chatbotDb.getChatSession(sessionId);
+  const last = session?.messages?.[session.messages.length - 1];
+  const lastMeta = last?.metadata as any;
+  if (
+    last?.role === 'assistant'
+    && lastMeta?.kind === 'work-plan-step-model-unavailable'
+    && lastMeta?.stepCount === turn.stepCount
+    && lastMeta?.model === turn.model
+  ) {
+    return { content: last.content };
+  }
+  const timestamp = new Date().toISOString();
+  const message = {
+    role: 'assistant' as const,
+    content,
+    timestamp,
+    metadata: { timestamp, kind: 'work-plan-step-model-unavailable', stepCount: turn.stepCount, model: turn.model },
+  };
+  await chatbotDb.addMessageToSession(sessionId, message);
+  console.warn(`AgentMode: work plan for session ${sessionId} paused — step ${turn.stepCount} model "${sanitizeModelLabel(turn.model)}" is ${turn.reason}.`);
+  if (options.emitToUser) {
+    try {
+      const { io } = await import('../server');
+      io.to(`user:${userId}`).emit('session-message-appended', { sessionId, message: { role: 'assistant', content } });
+    } catch (emitErr) {
+      console.error(`AgentMode: failed to emit the step-model pause message for session ${sessionId}:`, emitErr);
+    }
+  }
+  await sendAgentModeOncallAlert({
+    subject: 'AgentMode: Work Plan paused - a step\'s model is no longer available',
+    message:
+      `Session ${sessionId}'s work plan is paused at step ${turn.stepCount}: its model "${sanitizeModelLabel(turn.model)}" is not available ` +
+      `(${turn.reason}). Nothing was sent to a different model; the user was told to pick another model for this step.`,
+    context: { sessionId, userId, Step: String(turn.stepCount), 'Step Model': sanitizeModelLabel(turn.model) },
+    sessionId,
+    dedupeKey: `work_plan_step_model_unavailable:${sessionId}:${turn.stepCount}:${turn.model}`,
+    dedupeWindowMs: 60 * 60 * 1000,
+  }).catch((alertErr) =>
+    console.error('AgentMode: failed to send the step-model pause alert:', alertErr),
+  );
+  return { content, message };
+}
+
+/**
  * ENG-1684: the autocomplete-work-plan analogue of scheduleAutoMediaContinuation above —
  * same shape (usage-gated, lock-claimed so it never fights a real concurrent user turn,
  * bounded retry with an exhaustion backstop that alerts on-call rather than failing
@@ -1897,6 +2137,29 @@ async function scheduleAutoWorkPlanContinuation(
     return;
   }
 
+  // ENG-2378: the pending step may demand its own model, and may have lost it since the last round. Resolved
+  // here (before a stop-judge call or any generation) so a retired step model pauses the chain loudly instead of
+  // spending a turn; generateSessionResponse re-resolves, so every other entry point is covered the same way.
+  // Fails closed: if the step model cannot be resolved the round does not run on any other model.
+  let continuationModel = llmModel;
+  if (currentSession?.workPlan) {
+    try {
+      const stepTurn = await resolveWorkPlanStepModelForTurn({ userId: currentSession.userId, llmModel: currentSession.llmModel, workPlan: currentSession.workPlan });
+      if (stepTurn.kind === 'unavailable') {
+        await pauseWorkPlanForUnavailableStepModel(sessionId, userId, stepTurn, { emitToUser: true });
+        autoContinuationSessions.delete(sessionId);
+        releaseSessionGeneration(sessionId);
+        return;
+      }
+      if (stepTurn.kind === 'resolved' || stepTurn.kind === 'restored') continuationModel = stepTurn.decision.effectiveModel;
+    } catch (stepModelErr) {
+      console.error(`AgentMode: work-plan auto-continuation for session ${sessionId} could not resolve the step model; not continuing:`, stepModelErr);
+      autoContinuationSessions.delete(sessionId);
+      releaseSessionGeneration(sessionId);
+      return;
+    }
+  }
+
   // ENG-1819: honor an explicit "stop" instruction instead of firing anyway. Re-evaluated
   // fresh on every round (this function re-reads session state each time it's called), so a
   // user who says "stop" mid-chain is caught on the very next round automatically. Checked
@@ -1945,7 +2208,7 @@ async function scheduleAutoWorkPlanContinuation(
       sessionId,
       AUTO_WORK_PLAN_CONTINUATION_MESSAGE,
       userId,
-      llmModel,
+      continuationModel,
       undefined, // attachments
       undefined, // isInteractiveShare
       undefined, // pageContext
@@ -3090,6 +3353,13 @@ export function isValidIanaTimeZone(tz: unknown): tz is string {
   } catch {
     return false;
   }
+}
+
+// Echo the stored run time in the owner's zone so the agent repeats what was
+// actually stored, not what it meant to send (Opslane 2026-10-13).
+function runTimeInOwnerZone(iso: string | undefined, timeZone: unknown): { timezone?: string; nextRunTimeLocal?: string } {
+  if (!iso || !isValidIanaTimeZone(timeZone)) return {};
+  return { timezone: timeZone, nextRunTimeLocal: formatRunTimeInZone(iso, timeZone) };
 }
 
 function weekdayInTimeZone(when: Date, timeZone?: string): number {
@@ -5372,7 +5642,13 @@ async function runVerifiedChatInner(
  */
 export async function runVerifiedChat(
   params: Parameters<typeof runVerifiedChatInner>[0],
-  options?: { lockTimeoutMs?: number; capInteractiveUserId?: string },
+  options?: {
+    lockTimeoutMs?: number;
+    capInteractiveUserId?: string;
+    // Runs once the session lock (and the interactive cap slot) are held, immediately before
+    // the turn: a request refused as busy / over the cap must not have changed the session.
+    beforeRun?: () => Promise<void>;
+  },
 ): Promise<RunVerifiedChatResult> {
   const { sessionId } = params;
   const claimed = await claimSessionGenerationWithRetry(sessionId, undefined, params.userId);
@@ -5387,6 +5663,7 @@ export async function runVerifiedChat(
       if (!slot.ok) throw new TooManyConcurrentRunsError(slot.current, slot.limit);
       generationSlot = slot;
     }
+    await options?.beforeRun?.();
     return await withGenerationTimeout(
       runVerifiedChatInner(params),
       sessionId,
@@ -7336,10 +7613,18 @@ export async function runScheduledChat(
       // distinguishable from a run that exhausted all 20 attempts some other way.
       ...(result.sendPressExhausted ? { sendPressExhausted: true } : {}),
     };
+    // ENG-1735: name the concrete failing check so a failure with no tool/keyword
+    // misses is not reported as "none / none".
+    const scheduledRunFailureReasons = runDelivered
+      ? []
+      : describeScheduledRunFailureReasons(result, { linkedInInviteSendRequirementMissed });
     const scheduledChatFailureDescription =
       `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\n` +
       `Missing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\n` +
       `Keyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}` +
+      (scheduledRunFailureReasons.length
+        ? `\nFailure reason: ${scheduledRunFailureReasons.join('; ')}`
+        : '') +
       (linkedInInviteSendBlock
         ? `\n\nBlocked action: send-invite. ${linkedInInviteSendBlock.notice}`
         : '');
@@ -8591,6 +8876,10 @@ export async function generateSessionResponse(
   // (unchanged prior behavior) inside createWorkPlan/modifyWorkPlan/
   // applyPredefinedWorkPlan, same as before this fix.
   isUnattendedRun?: boolean,
+  // ENG-2378: the model the USER explicitly picked for this request (the /generate request model when it differs from the
+  // session's stored stamp; the portal echoes the stamp otherwise). Overrides an UNAVAILABLE pending step model and
+  // wins on a step with no model; never overrides an available step model.
+  explicitModelPick?: string,
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -8624,6 +8913,9 @@ export async function generateSessionResponse(
   // so the controller can lift it onto the live HTTP response (see that field's
   // own comment there for why this is needed at all).
   pendingApprovalDeck?: PendingApprovalDeck;
+  // ENG-2378: the decision for the model that actually RAN this turn when a work-plan step (or the end-of-plan restore)
+  // overrode the caller's model; callers report this, not their request-level decision. Absent = the caller's model ran.
+  modelDecision?: EffectiveModelPolicyDecision;
 }> {
   // Clear any stale cancel from a previous request on this session
   clearCancel(sessionId);
@@ -8870,6 +9162,65 @@ export async function generateSessionResponse(
     throw new Error('Session not found after update');
   }
 
+  // ENG-2378: the plan's CURRENT pending step may carry its own model. It wins over the request's llmModel and
+  // the session's for this turn (the session model is then updated so the UI shows the truth, exactly as /generate
+  // does). A step model that has become unavailable mid-plan PAUSES the plan, loudly: never a swap.
+  const stepModelTurn = await resolveWorkPlanStepModelForTurn(updatedSession, { explicitPick: explicitModelPick, viewerIsOwner: !isInteractiveShare });
+  if (stepModelTurn.kind === 'unavailable') {
+    const paused = await pauseWorkPlanForUnavailableStepModel(sessionId, userId, stepModelTurn, { emitToUser: false });
+    return {
+      content: paused.content,
+      toolCalls: [],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: paused.message ? [paused.message] : [],
+      workPlan: updatedSession.workPlan,
+      calledFunctions: updatedSession.calledFunctions,
+      skills: [],
+      userMessageIndex,
+    };
+  }
+  if (stepModelTurn.kind === 'restoreFailed') {
+    const wpFailed: any = updatedSession.workPlan;
+    if (wpFailed?.engineModel) {
+      const { engineModel: _cleared, ...wpRest } = wpFailed;
+      await chatbotDb.updateSessionWorkPlan(sessionId, wpRest);
+    }
+  }
+  let ranModelDecision: EffectiveModelPolicyDecision | undefined;
+  if (stepModelTurn.kind === 'resolved' || stepModelTurn.kind === 'restored') {
+    ranModelDecision = stepModelTurn.decision;
+    llmModel = stepModelTurn.decision.effectiveModel;
+    if (updatedSession.llmModel !== llmModel) {
+      await chatbotDb.updateSessionLlmModel(sessionId, llmModel, toStoredModelPolicyDecision(stepModelTurn.decision));
+    }
+    // Record what the engine stamped (so the end of the plan can tell a later explicit pick apart), adopt an explicit
+    // pick on the step that lost its model, and clear the marker once the pre-plan model is restored.
+    const adoptStepModel = stepModelTurn.kind === 'resolved' ? stepModelTurn.updateStepModelTo : undefined;
+    // A user pick on a model-less step must stay distinguishable from engine stamps: the marker keeps naming the
+    // engine's own choice, so the pick (the stored stamp) stands for the following turns.
+    const nextEngineModel = stepModelTurn.kind === 'restored'
+      ? undefined
+      : (stepModelTurn.userPick ? (stepModelTurn.engineChoice ?? (updatedSession.workPlan as any)?.engineModel) : llmModel);
+    const wp: any = updatedSession.workPlan;
+    // A share viewer's pick runs for the turn but leaves the owner's plan alone (no adoption, no marker change).
+    const viewerPick = Boolean(isInteractiveShare) && stepModelTurn.kind === 'resolved' && Boolean(stepModelTurn.userPick);
+    // What the user explicitly picked (a model-less step running on the pick, or a retired step adopting it) is recorded so
+    // the end-of-plan restore leaves it alone; the restore itself clears the record.
+    const nextPickedModel = stepModelTurn.kind === 'restored'
+      ? undefined
+      : (stepModelTurn.userPick ? llmModel : (adoptStepModel ?? (updatedSession.workPlan as any)?.pickedModel));
+    if (wp && !viewerPick && (adoptStepModel || wp.engineModel !== nextEngineModel || wp.pickedModel !== nextPickedModel)) {
+      const { engineModel: _previousEngineModel, pickedModel: _previousPicked, ...wpRest } = wp;
+      await chatbotDb.updateSessionWorkPlan(sessionId, {
+        ...wpRest,
+        ...(nextEngineModel && { engineModel: nextEngineModel }),
+        ...(nextPickedModel && { pickedModel: nextPickedModel }),
+        steps: wp.steps.map((s: any) => (adoptStepModel && s.stepCount === (stepModelTurn as any).stepCount ? { ...s, model: adoptStepModel } : s)),
+      });
+    }
+  }
+
   // Strip any harness crash/abandon placeholders (ENG-324 jobIncomplete, ENG-473
   // isRunFailureNotice) from the history fed to the model — they are not real
   // turns and reading one back would look like the assistant already gave up
@@ -9056,7 +9407,8 @@ export async function generateSessionResponse(
     workPlan: finalSession?.workPlan,
     calledFunctions: finalSession?.calledFunctions,
     skills,
-    userMessageIndex
+    userMessageIndex,
+    ...(ranModelDecision && { modelDecision: ranModelDecision }),
   };
 }
 
@@ -9481,6 +9833,10 @@ export const agentModeController = {
       if (!user?.isAdmin && session.userId !== user?.userId) {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
+      // The body carries live state (messages, llmModel, progress), so a cached copy
+      // would show a stale conversation or a stale model selection. Same header as
+      // getGeneratingSessions.
+      res.setHeader?.('Cache-Control', 'no-store');
 
       // ENG-1239: durability backstop for the in-process media auto-continuation chain —
       // it only fires right after the deferred turn, so a process death in between (a
@@ -9544,13 +9900,39 @@ export const agentModeController = {
       // ENG-2163: a real admin OR an admin viewing via delegation may see admin-tainted turns;
       // the account owner (customer) viewing their own session may not.
       const viewerIsAdmin = !!(user?.isAdmin || (req as any).delegateInfo?.isDelegated);
+      // ENG-112: a branch made before `branchedFrom` existed is grouped the first time its owner opens it
+      // (bounded record reads, one conditional write, never throws). Owner views only.
+      const healedBranchedFrom = genuineOwnerView
+        ? await healLegacyBranchedFrom(
+            {
+              isFeatureEnabled: async () => {
+                try {
+                  return isChatBranchingSettingEnabled((await settingsService.getSetting(CHAT_BRANCHING_ENABLED_SETTING))?.settingValue);
+                } catch {
+                  return false;
+                }
+              },
+              getSessionRecord: (id) => chatbotDb.getChatSessionRecord(id),
+              setBranchedFromIfAbsent: (id, ownerUserId, value) => chatbotDb.setBranchedFromIfAbsent(id, ownerUserId, value),
+              log: (message, details) => console.warn(message, details),
+            },
+            session,
+          )
+        : null;
+      // ENG-110: `activeRun` (runId/instanceId) is internal: read it, never serialise it.
+      const { activeRun, ...sessionForClient } = session;
+      // A run live on ANOTHER instance (deploy overlap) counts as generating for the genuine owner only.
+      const generatingElsewhere = genuineOwnerView && activeRun
+        ? await sessionActiveRunGuard.hasLiveRunElsewhere(activeRun).catch(() => false)
+        : false;
       const filteredSession = {
-        ...session,
+        ...sessionForClient,
+        ...(healedBranchedFrom ? { branchedFrom: healedBranchedFrom } : {}),
         messages: filterMessagesForClient(session.messages, { viewerIsAdmin }),
         hasActiveProgress: progressActive,
         // ENG-110: additive, owner-only. In-memory on THIS instance (an Immutable deploy overlap hides the
         // other instance's runs). Admins/delegates viewing someone else's session never get it.
-        ...(genuineOwnerView ? { isGenerating: isSessionGeneratingForUser(session.sessionId, user?.userId) } : {}),
+        ...(genuineOwnerView ? { isGenerating: isSessionGeneratingForUser(session.sessionId, user?.userId) || generatingElsewhere } : {}),
         skills,
         ...modelAttribution,
       };
@@ -9926,6 +10308,25 @@ export const agentModeController = {
         });
       }
 
+      // ENG-110: cross-instance guard. The in-memory lock above only sees THIS instance; during an Immutable
+      // deploy overlap the old instance may still be running this very session. One conditional write claims
+      // `activeRun` on the session item. Switch off (default) => no DynamoDB call at all; any non-condition
+      // error => fail open (claim() never throws). Busy => release everything claimed so far, exactly like the
+      // in-memory busy path above (the cap slot is only taken below, after this point).
+      const activeRunClaim = await sessionActiveRunGuard.claim(sessionId).catch((): { status: 'skipped' } => ({ status: 'skipped' }));
+      if (activeRunClaim.status === 'busy') {
+        releaseSessionGeneration(sessionId);
+        if (idemKeyHeld) {
+          await releaseIdempotency(idemKeyHeld);
+          idemKeyHeld = undefined;
+        }
+        return res.status(409).json({
+          error: 'Session is busy',
+          message: 'A response is already being generated for this session. Please wait.',
+          code: 'SESSION_BUSY',
+        });
+      }
+
       // ENG-110: per-user soft cap on concurrently generating interactive chats.
       // Taken AFTER the session claim, released in the finally below on every exit.
       let generationSlot: { release: () => void } | undefined;
@@ -9942,52 +10343,88 @@ export const agentModeController = {
 
       // Check token usage limits
       const usageStatus = await checkTokenUsage(user.userId);
-      // Composed once for every refusal path below so the three 429s cannot
-      // disagree with each other either (ENG-1344 AC6).
-      const usageBlockCopy = buildUsageBlockCopy({ month: usageStatus.month });
       if (!usageStatus.allowed) {
-        // A ModelUnavailableError here must not mask the 429: fall through to the plain one.
-        if (usageStatus.usagePolicyVersion) {
-          modelPolicyDecision = await resolveEffectiveModelForUser({
-            userId: session.userId,
-            requestedModel: llmModel || session.llmModel || null,
-            backupModel: llmBackupModel,
-            backupSource: llmBackupModel ? 'user' : null,
-          }).catch((modelError) => {
-            if (isModelUnavailableError(modelError)) return undefined;
-            throw modelError;
-          });
+        // ENG-527: product-feedback filing is never token-limited. An over-quota user who
+        // explicitly asks Emma to file a bug/feature request (portal `feedbackIntent`) gets it
+        // filed DETERMINISTICALLY — zero LLM calls, zero token spend — through the same shared
+        // policy as the in-app Send feedback form. Ordinary generation stays blocked below.
+        const feedbackIntent = typeof req.body.feedbackIntent === 'string' ? req.body.feedbackIntent : undefined;
+        if (feedbackIntent && Object.prototype.hasOwnProperty.call(EMMA_FEEDBACK_INTENTS, feedbackIntent)) {
+          const intentConfig = EMMA_FEEDBACK_INTENTS[feedbackIntent];
+          // Same validation as POST /support/report-ui-bug: blank input is a 400, not a filing failure.
+          const feedbackDescription = typeof userMessage === 'string' ? userMessage.trim() : '';
+          if (!feedbackDescription) {
+            return res.status(400).json({ error: 'Description is required', code: 'feedback_description_required', feedbackFiled: null });
+          }
+          try {
+            // Match /support attribution: reporter details come from the DB user record (the
+            // token carries no displayName/funnelStatus), and admin delegation is recorded.
+            const reporter = await userDb.getUserById(user.userId).catch(() => null);
+            const delegate = (req as any).delegateInfo;
+            const filing = await fileProductFeedback({
+              user: {
+                userId: user.userId,
+                email: reporter?.email || user.email,
+                displayName: reporter?.displayName,
+                funnelStatus: reporter?.funnelStatus,
+              },
+              reportedByAdmin: delegate?.isDelegated === true && delegate.adminEmail
+                ? delegate.adminEmail
+                : undefined,
+              reportType: feedbackIntent,
+              titlePrefix: intentConfig.titlePrefix,
+              tag: intentConfig.tag,
+              description: feedbackDescription,
+              pageUrl: typeof currentUrl === 'string' ? currentUrl : undefined,
+              sessionId,
+            });
+            const link = (filing.filed.userUrl || filing.filed.trackerUrl || '').trim();
+            const label = feedbackIntent === 'bug' ? 'bug report' : 'feature request';
+            // Never print "being tracked:" with nothing after it: only promise a link we have.
+            const content = link
+              ? `Your ${label} has been filed and is being tracked: ${link}`
+              : `Your ${label} has been filed${filing.issueId ? ` (${filing.issueId})` : ''}. The team will follow up.`;
+            // Persist the turn like an answered turn so the confirmation survives a reload.
+            const nowIso = new Date().toISOString();
+            try {
+              await chatbotDb.addMessagesToSession(sessionId, [
+                { role: 'user', content: String(userMessage), timestamp: nowIso, metadata: { timestamp: nowIso, feedbackIntent } },
+                { role: 'assistant', content, timestamp: nowIso, metadata: { timestamp: nowIso, feedbackFiled: true } },
+              ] as any);
+            } catch (persistError) {
+              // The filing already succeeded; a transcript write failure must not un-report it.
+              console.error('[agentMode] ENG-527 failed to persist over-quota feedback turn:', persistError);
+            }
+            return res.json({
+              content,
+              feedbackFiled: {
+                type: feedbackIntent,
+                trackerUrl: link || null,
+                issueId: filing.issueId ?? null,
+                deduped: filing.filed.deduped,
+                replayed: filing.replayed,
+              },
+              usageMode: 'paused',
+            });
+          } catch (filingError) {
+            // AC4: a failed filing is surfaced clearly and NEVER reported as tracked.
+            console.error('[agentMode] ENG-527 over-quota feedback filing failed:', filingError);
+            const busy = filingError instanceof ReportReplayCapacityError;
+            return res.status(busy ? 503 : 502).json({
+              error: busy
+                ? 'Feedback intake is busy; please retry shortly. Nothing was filed yet.'
+                : 'We could not file your feedback, so nothing was tracked. Please try again or use Send feedback.',
+              code: 'feedback_filing_failed',
+              feedbackFiled: null,
+            });
+          }
         }
-        if (modelPolicyDecision) {
-          await chatbotDb.updateSessionLlmModel(
-            sessionId,
-            session.llmModel || agentModeService.default_model,
-            toStoredModelPolicyDecision(modelPolicyDecision),
-          );
-          return res.status(429).json({
-            // ENG-1344 AC6: one server-side producer for both the flat string and
-            // the structured copy, so no client can word this block differently.
-            error: usageBlockCopy.message,
-            usageBlock: usageBlockCopy,
-            code: 'usage_paused',
-            usageMode: modelPolicyDecision.usageMode,
-            requestedModel: modelPolicyDecision.requestedModel,
-            effectiveModel: modelPolicyDecision.effectiveModel,
-            backupModel: modelPolicyDecision.backupModel,
-            backupSource: modelPolicyDecision.backupSource,
-            modelSelection: modelPolicyDecision.modelSelection,
-            modelSelectionReason: modelPolicyDecision.reason,
-            usagePolicyVersion: modelPolicyDecision.usagePolicyVersion,
-          });
-        }
-        return res.status(429).json({
-          // ENG-1344 AC6: one server-side producer for both the flat string and
-          // the structured copy, so no client can word this block differently.
-          error: usageBlockCopy.message,
-          usageBlock: usageBlockCopy,
-          code: 'usage_paused',
-          usageMode: 'paused',
-        });
+        return res.status(429).json(await buildUsagePausedBody({
+          usageStatus,
+          session,
+          requestedModel: llmModel || session.llmModel || null,
+          backupModel: llmBackupModel,
+        }));
       }
 
       // (Session was fetched + ownership-checked above, before the locks.)
@@ -10052,26 +10489,13 @@ export const agentModeController = {
         return res.status(422).json(modelUnavailableBody(modelError));
       }
       if (!modelPolicyDecision.effectiveModel) {
-        await chatbotDb.updateSessionLlmModel(
-          sessionId,
-          session.llmModel || agentModeService.default_model,
-          toStoredModelPolicyDecision(modelPolicyDecision),
-        );
-        return res.status(429).json({
-          // ENG-1344 AC6: one server-side producer for both the flat string and
-          // the structured copy, so no client can word this block differently.
-          error: usageBlockCopy.message,
-          usageBlock: usageBlockCopy,
-          code: 'usage_paused',
-          usageMode: 'paused',
+        // Paused: the one shared producer stamps the decision and builds the 429.
+        return res.status(429).json(await buildUsagePausedBody({
+          usageStatus,
+          session,
           requestedModel: modelPolicyDecision.requestedModel,
-          effectiveModel: null,
-          backupModel: modelPolicyDecision.backupModel,
-          backupSource: modelPolicyDecision.backupSource,
-          modelSelection: modelPolicyDecision.modelSelection,
-          modelSelectionReason: modelPolicyDecision.reason,
-          usagePolicyVersion: modelPolicyDecision.usagePolicyVersion,
-        });
+          decision: modelPolicyDecision,
+        }));
       }
       const modelToUse = modelPolicyDecision.effectiveModel;
       await chatbotDb.updateSessionLlmModel(
@@ -10152,6 +10576,8 @@ export const agentModeController = {
         // reopened from the "Scheduled" sidebar tab. Never fall back to
         // session.sessionType here.
         false,
+        // ENG-2378: an explicit model pick = a request model that differs from the stored stamp (the portal echoes the stamp).
+        explicitModelSelection && modelToUse !== session.llmModel ? modelToUse : undefined,
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
@@ -10423,6 +10849,7 @@ export const agentModeController = {
         .reverse()
         .find((m: any) => m?.role === 'assistant')?.messageIndex;
 
+      const reportedModelDecision = response.modelDecision ?? modelPolicyDecision;
       res.json({
         content: response.content,
         toolCalls: response.toolCalls,
@@ -10448,15 +10875,16 @@ export const agentModeController = {
         // would match two messages at once and render the card twice.
         ...(answeredApprovalDeck ? { answeredApprovalDeck } : {}),
         ...(deckCancelled ? { deckCancelled: true } : {}),
-        ...(modelPolicyDecision ? {
-          requestedModel: modelPolicyDecision.requestedModel,
-          effectiveModel: modelPolicyDecision.effectiveModel,
-          backupModel: modelPolicyDecision.backupModel,
-          backupSource: modelPolicyDecision.backupSource,
-          modelSelection: modelPolicyDecision.modelSelection,
-          modelSelectionReason: modelPolicyDecision.reason,
-          usageMode: modelPolicyDecision.usageMode,
-          usagePolicyVersion: modelPolicyDecision.usagePolicyVersion,
+        // Report the model that RAN: a work-plan step override beats the request-level decision.
+        ...(reportedModelDecision ? {
+          requestedModel: reportedModelDecision.requestedModel,
+          effectiveModel: reportedModelDecision.effectiveModel,
+          backupModel: reportedModelDecision.backupModel,
+          backupSource: reportedModelDecision.backupSource,
+          modelSelection: reportedModelDecision.modelSelection,
+          modelSelectionReason: reportedModelDecision.reason,
+          usageMode: reportedModelDecision.usageMode,
+          usagePolicyVersion: reportedModelDecision.usagePolicyVersion,
         } : {}),
       });
 
@@ -10467,6 +10895,9 @@ export const agentModeController = {
         void markRunTerminal(runSurvivalRunId, 'completed');
       }
       } finally {
+        // ENG-110: stop the heartbeat timer (synchronously) and clear OUR activeRun on every exit: success,
+        // throw, timeout, stop, crash. The clear is best-effort and conditional on our runId.
+        if (activeRunClaim.status === 'claimed') void activeRunClaim.release().catch(() => undefined);
         generationSlot?.release();
         releaseSessionGeneration(sessionId);
         // Terminal state reached (success OR error unwinding through here):
@@ -10783,7 +11214,7 @@ export const agentModeController = {
   async getModelOptions(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const [usage, entitledModels, chatBranchingEnabled, compareSaveAlternativesEnabled] = await Promise.all([
+      const [usage, entitledModels, chatBranchingEnabled, compareSaveAlternativesEnabled, workPlanStepModelsEnabled] = await Promise.all([
         getEffectiveLlmUsagePolicy(user.userId),
         agentModeService.getSupportedModels(user.isAdmin === true),
         // ENG-112 capability hint so the portal only offers "Branch from here" when the endpoint will
@@ -10798,6 +11229,9 @@ export const agentModeController = {
         // ENG-113 capability hint: the Compare dialog only sends the unchosen answers (and the set token) when
         // saving is on. A hint, not the gate (select re-checks). Unreadable flag = off.
         compareSaveAlternatives.isEnabled().catch(() => false),
+        // ENG-2378 capability hint: the work-plan editor only offers a per-step model when the engine will honour
+        // it. A hint, not the gate (the write routes and the engine re-check the switch). Unreadable = off.
+        workPlanStepModels.isEnabled().catch(() => false),
       ]);
       // Every consumer (chat composer, schedule form, MCP) is a text-chat picker, and an
       // explicit live-voice pick is refused (422 not_selectable), so never offer one.
@@ -10822,6 +11256,11 @@ export const agentModeController = {
         usagePolicyVersion: usage.policy?.version || null,
         chatBranchingEnabled,
         compareSaveAlternatives: compareSaveAlternativesEnabled,
+        // Retired model id -> current id: the same map resolveGenerationModel/normalizeModelId apply to pinned
+        // sessions and schedules. Additive; lets clients show the renamed model for an old pin instead of
+        // keeping their own hand-copied list. A copy, so nothing downstream can mutate the registry's map.
+        legacyModelAliases: { ...LEGACY_MODEL_ALIASES },
+        workPlanStepModelsEnabled,
       });
     } catch (error) {
       console.error('AgentMode: Get model options error:', error);
@@ -11207,7 +11646,7 @@ export const agentModeController = {
           updatedAt: session.updatedAt,
           shareMetadata: session.shareMetadata,
           interactiveShareMetadata: session.interactiveShareMetadata,
-          workPlan: session.workPlan,
+          workPlan: redactWorkPlanForViewer(session.workPlan),
           llmModel: modelToUse,
           isConversable: !!conversable,
           hasActiveProgress: hasActiveProgress(session.sessionId),
@@ -11560,7 +11999,7 @@ export const agentModeController = {
         sources: response.sources,
         ...(typeof sharedAssistantMessageIndex === 'number' ? { messageIndex: sharedAssistantMessageIndex } : {}),
         ...(typeof response.userMessageIndex === 'number' ? { userMessageIndex: response.userMessageIndex } : {}),
-        workPlan: response.workPlan,
+        workPlan: redactWorkPlanForViewer(response.workPlan),
         skills: response.skills,
         ...(response.workPlanTurnDisposition ? { workPlanTurnDisposition: response.workPlanTurnDisposition } : {}),
         // ENG-1635/1644: same immediate-sync fields as the authenticated path (see
@@ -11919,6 +12358,23 @@ export const agentModeController = {
       return res.status(401).json({ error: 'Unauthorized' });
     }
     const sessionIds = getClaimedSessionIdsForUser(user.userId);
+    // ENG-110: optional `?sessionId=<id>` also reports that ONE session when a run is live on another instance
+    // (deploy overlap). One record-only GetItem, no index; owner only (never a delegate or another user).
+    // Without the param, or with the switch off, nothing below runs and the answer is unchanged.
+    const probe = req.query?.sessionId;
+    if (typeof probe === 'string' && probe.length > 0 && probe.length <= 200 && !sessionIds.includes(probe)
+      && !(req as any).delegateInfo?.isDelegated) {
+      try {
+        if (await sessionActiveRunGuard.isEnabled()) {
+          const record = await chatbotDb.getChatSessionRecord(probe);
+          if (record && record.userId === user.userId && await sessionActiveRunGuard.hasLiveRunElsewhere(record.activeRun)) {
+            sessionIds.push(probe);
+          }
+        }
+      } catch (error) {
+        console.error('AgentMode: generating probe failed (ignored):', (error as Error)?.name);
+      }
+    }
     res.setHeader?.('Cache-Control', 'no-store');
     return res.json({ sessionIds });
   },
@@ -12945,7 +13401,8 @@ export const agentModeController = {
         fullAutonomy,
         requirePublishApproval,
         requireSlackApproval,
-        timezone
+        timezone,
+        emailNotificationsOptOut
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -13002,12 +13459,12 @@ export const agentModeController = {
       // Use provided nextRunTime or calculate default
       let scheduledNextRunTime: string;
       if (nextRunTime) {
-        // Validate the provided nextRunTime
-        const providedDate = new Date(nextRunTime);
-        if (isNaN(providedDate.getTime())) {
-          return res.status(400).json({ error: 'Invalid nextRunTime format' });
+        // Opslane 2026-10-13: an offset-less time is read in `timezone`, or refused.
+        const resolved = resolveScheduleRunTime(nextRunTime, isValidIanaTimeZone(timezone) ? timezone : undefined);
+        if ('error' in resolved) {
+          return res.status(400).json({ error: resolved.error });
         }
-        scheduledNextRunTime = providedDate.toISOString();
+        scheduledNextRunTime = resolved.iso;
       } else {
         // Default behavior: calculate next run time (9 AM UTC = 1 AM PST)
         const calculatedTime = calculateNextRunTime(scheduleFrequency, now, frequencyIntervalDays, scheduleId);
@@ -13096,7 +13553,11 @@ export const agentModeController = {
       const allVariablesPrefilled = normalizedVariables.length > 0
         && getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length === 0;
       const normalizedEmails = normalizeEmailList(emailNotifications);
-      const shouldUseFallbackEmail = normalizedEmails.length === 0 && !allVariablesPrefilled;
+      // Opslane 2026-10-13: an explicit opt-out (the MCP tool's `email_notifications: []`)
+      // is honoured. A bare [] from other REST callers keeps the fallback — the portal
+      // sends [] for "not set" and relies on it.
+      const optedOutOfEmail = emailNotificationsOptOut === true && normalizedEmails.length === 0;
+      const shouldUseFallbackEmail = normalizedEmails.length === 0 && !allVariablesPrefilled && !optedOutOfEmail;
       scheduledChat.emailNotifications = shouldUseFallbackEmail ? [fallbackEmail] : normalizedEmails;
       scheduledChat.variables = normalizedVariables;
       scheduledChat.variableValues = normalizedVariableValues;
@@ -13129,6 +13590,8 @@ export const agentModeController = {
         scheduleId,
         message: 'Scheduled chat created successfully',
         nextRunTime: scheduledNextRunTime,
+        ...runTimeInOwnerZone(scheduledNextRunTime, scheduledChat.timezone),
+        emailNotifications: scheduledChat.emailNotifications,
         ...scheduleBackup,
         backupSelectionRequired: scheduleBackup.llmBackupNeedsConfirmation,
       });
@@ -13181,7 +13644,23 @@ export const agentModeController = {
         runHealth: computeScheduleRunHealth(runResults),
       }));
 
-      res.json(scheduledChatsWithHealth);
+      // ENG-1611: optional bounded pagination. With neither `limit` nor `cursor`
+      // the legacy bare-array response is preserved for the portal; any caller
+      // that opts in gets `{ items, nextCursor }` with a hard page-size cap.
+      const page = parseScheduledChatsPage(req.query);
+      if (page === null) {
+        res.json(scheduledChatsWithHealth);
+        return;
+      }
+      if ('error' in page) {
+        return res.status(400).json({ error: page.error });
+      }
+      const items = scheduledChatsWithHealth.slice(page.offset, page.offset + page.limit);
+      const nextOffset = page.offset + items.length;
+      res.json({
+        items,
+        nextCursor: nextOffset < scheduledChatsWithHealth.length ? encodeScheduledChatsCursor(nextOffset) : null,
+      });
     } catch (error) {
       console.error('AgentMode: Get scheduled chats error:', error);
       res.status(500).json({ error: 'Failed to get scheduled chats' });
@@ -13217,7 +13696,8 @@ export const agentModeController = {
         requirePublishApproval,
         requireSlackApproval,
         disableSourcingBlockAlerts,
-        timezone
+        timezone,
+        emailNotificationsOptOut
       } = req.body;
 
       // Verify schedule exists and belongs to user (before validation so we can merge)
@@ -13302,12 +13782,17 @@ export const agentModeController = {
       // Determine nextRunTime: use provided value or keep existing
       let scheduledNextRunTime = existingSchedule.nextRunTime;
       let shouldUpdateNextRunTime = false;
+      const effectiveTimezone: string | undefined = isValidIanaTimeZone(timezone)
+        ? timezone
+        : (isValidIanaTimeZone((existingSchedule as any).timezone) ? (existingSchedule as any).timezone : undefined);
       if (nextRunTime) {
-        const providedDate = new Date(nextRunTime);
-        if (isNaN(providedDate.getTime())) {
-          return res.status(400).json({ error: 'Invalid nextRunTime format' });
+        // Opslane 2026-10-13: an offset-less time is read in the request's or the
+        // schedule's stored timezone, or refused.
+        const resolved = resolveScheduleRunTime(nextRunTime, effectiveTimezone);
+        if ('error' in resolved) {
+          return res.status(400).json({ error: resolved.error });
         }
-        scheduledNextRunTime = providedDate.toISOString();
+        scheduledNextRunTime = resolved.iso;
         shouldUpdateNextRunTime = true;
       }
 
@@ -13444,7 +13929,9 @@ export const agentModeController = {
       // had one is allowed to stay that way.
       const hadEmailNotifications =
         normalizeEmailList(existingSchedule.emailNotifications || []).length > 0;
-      if (effectiveEmailNotifications.length === 0 && hadEmailNotifications) {
+      // Opslane 2026-10-13: an explicit opt-out (MCP `email_notifications: []`) may clear them.
+      const clearingEmailOnPurpose = emailNotificationsOptOut === true && emailNotifications !== undefined;
+      if (effectiveEmailNotifications.length === 0 && hadEmailNotifications && !clearingEmailOnPurpose) {
         return res.status(400).json({ error: 'At least one email notification is required for scheduled chats' });
       }
 
@@ -13634,6 +14121,8 @@ export const agentModeController = {
       res.json({
         message: 'Scheduled chat updated successfully',
         nextRunTime: scheduledNextRunTime,
+        ...runTimeInOwnerZone(scheduledNextRunTime, effectiveTimezone),
+        emailNotifications: effectiveEmailNotifications,
         ...scheduleBackup,
         backupSelectionRequired: scheduleBackup.llmBackupNeedsConfirmation,
       });
@@ -14953,7 +15442,7 @@ export const agentModeController = {
         messages: filterMessagesForClient(session.messages, { omitBranchOrigin: true }),
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
-        workPlan: session.workPlan,
+        workPlan: redactWorkPlanForViewer(session.workPlan),
         pendingWorkPlanInput: session.pendingWorkPlanInput,
         llmModel: modelToUse,
         isConversable: true
@@ -15014,7 +15503,7 @@ export const agentModeController = {
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
-        workPlan: response.workPlan,
+        workPlan: redactWorkPlanForViewer(response.workPlan),
         skills: response.skills,
       });
     } catch (error) {
@@ -15153,7 +15642,7 @@ export const agentModeController = {
         showInAgentMode: p.showInAgentMode !== false,
         defaultModel: p.defaultModel,
         category: p.category,
-        steps: p.steps,
+        steps: withoutStepModels(p.steps),
         visibility: p.visibility,
         thumbnail_url: p.thumbnail_url,
         thumbnail_alt_text: p.thumbnail_alt_text,
@@ -15241,7 +15730,7 @@ export const agentModeController = {
         showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
         showInAgentMode: workPlan.showInAgentMode !== false,
         defaultModel: workPlan.defaultModel,
-        steps: workPlan.steps,
+        steps: withoutStepModels(workPlan.steps),
         visibility: workPlan.visibility,
         // Canonical customer-facing projection alongside the legacy keys above
         // — existing consumers are unaffected (ENG-1469).
@@ -15313,19 +15802,29 @@ export const agentModeController = {
       // author. Resolve it against the LAUNCHING user (anonymous = non-admin) BEFORE the
       // session or any side effect exists; an unserved/unselectable pin is a 422, never a
       // silent swap to the account default. Empty = account default (unchanged).
+      //
+      // ENG-2378: with per-step models enabled, EVERY step's model is resolved the same way up front, so a plan
+      // whose step N model cannot be served is refused now (422 + stepCount), not when it reaches step N.
+      const stepModelsEnabled = anyStepCarriesModel(predefinedPlan.steps) && await workPlanStepModels.shouldHonor();
       let planPinnedModel: string | undefined;
+      let stepModelIds = new Map<number, string>();
       try {
-        planPinnedModel = await resolvePlanLaunchModel(
-          agentModeService,
-          () => (result.user ? isUserAdmin(result.user.userId) : Promise.resolve(false)),
-          predefinedPlan.defaultModel,
-        );
-      } catch (modelError) {
-        if (!isModelUnavailableError(modelError)) throw modelError;
-        console.warn(`AgentMode: createSessionWithPlan "${predefinedPlan.title}" refused — plan model "${sanitizeModelLabel(modelError.requestedModel)}" is ${modelError.reason}.`);
+        const isLauncherAdmin = () => (result.user ? isUserAdmin(result.user.userId) : Promise.resolve(false));
+        planPinnedModel = await resolvePlanLaunchModel(agentModeService, isLauncherAdmin, predefinedPlan.defaultModel);
+        if (stepModelsEnabled) {
+          stepModelIds = await resolvePlanStepModelsForLaunch(agentModeService, isLauncherAdmin, predefinedPlan.steps || []);
+        }
+      } catch (launchModelError) {
+        const stepError = isStepModelUnavailableError(launchModelError) ? launchModelError : undefined;
+        const modelError = stepError ? stepError.cause : launchModelError;
+        if (!isModelUnavailableError(modelError)) throw launchModelError;
+        console.warn(`AgentMode: createSessionWithPlan "${predefinedPlan.title}" refused — ${stepError ? `step ${stepError.stepCount} ` : 'plan '}model "${sanitizeModelLabel(modelError.requestedModel)}" is ${modelError.reason}.`);
         // An anonymous visitor learns nothing about which models exist or why.
         return res.status(422).json(result.user
-          ? buildModelUnavailableBody(modelError, agentModeService.getModelDisplayName?.(modelError.requestedModel), 'work_plan_pin')
+          ? {
+              ...buildModelUnavailableBody(modelError, agentModeService.getModelDisplayName?.(modelError.requestedModel), 'work_plan_pin'),
+              ...(stepError && { stepCount: stepError.stepCount }),
+            }
           : buildAnonymousModelUnavailableBody());
       }
 
@@ -15374,10 +15873,12 @@ export const agentModeController = {
         // Convert predefined plan to session work plan format
         const workPlan = {
           title: predefinedPlan.title,
-          steps: predefinedPlan.steps.map((step: any) => ({
+          steps: predefinedPlan.steps.map((step: any, stepIndex: number) => ({
             stepCount: step.stepCount,
             title: step.title,
             description: step.description,
+            // ENG-2378: the step's validated canonical model (only while the switch is on; otherwise not copied).
+            ...(stepModelIds.has(stepIndex) && { model: stepModelIds.get(stepIndex) }),
             // Carry the user-facing instructions through to the session so
             // <HorizontalPlanProgress> can render them in the expanded-step
             // panel. Without this, the field set in the partner-portal
@@ -15399,7 +15900,9 @@ export const agentModeController = {
             ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools }),
           })),
           createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
+          updatedAt: new Date().toISOString(),
+          // ENG-2378: what a step WITHOUT a model falls back to (plan default, then the model the session starts on).
+          ...(stepModelIds.size > 0 && { ...(planPinnedModel && { planDefaultModel: planPinnedModel }), launchModel: selectedModel }),
         };
 
         // Create work plan in session (include welcome message and autocomplete if defined)
@@ -15474,7 +15977,8 @@ export const agentModeController = {
       res.json({
         sessionId: session.sessionId,
         redirectUrl,
-        workPlan: workPlanWithWelcome,
+        // The launcher's own client may show step models; an anonymous visitor never sees them. Internal bookkeeping never leaves.
+        workPlan: redactWorkPlanForViewer(workPlanWithWelcome, { keepStepModels: Boolean(result.user) }),
         conversableToken,
         userId: session.userId
       });
@@ -15807,17 +16311,52 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Access denied to this session' });
       }
 
-      // A STORED model is not an explicit selection: when it is retired or not
-      // selectable by the owner, store the current default instead (as /generate
-      // does) so runVerifiedChat, which reads the session, never runs the stored one.
-      if (session.llmModel) {
-        const storedPolicy = await resolveEffectiveModelForUser({
-          userId: session.userId,
-          requestedModel: session.llmModel,
-          allowSilentSwap: true,
-        });
-        if (storedPolicy.modelSelection === 'corrected' && storedPolicy.effectiveModel) {
-          await chatbotDb.updateSessionLlmModel(sessionId, storedPolicy.effectiveModel, toStoredModelPolicyDecision(storedPolicy));
+      // Same allowance gate (and 429 body) as /generate, checked before the model so an
+      // exhausted account gets the 429 first, exactly as there. Interactive only: the
+      // scheduled / Slack / email / result-endpoint callers of runVerifiedChat have their own.
+      const usageStatus = await checkTokenUsage(user.userId);
+      if (!usageStatus.allowed) {
+        return res.status(429).json(await buildUsagePausedBody({
+          usageStatus,
+          session,
+          requestedModel: normalizeRequestedLlmModel(req.body?.llmModel) || session.llmModel || null,
+        }));
+      }
+
+      // The model the user picked for this chat is used as-is for the whole turn:
+      // runVerifiedChat only applies its task-type defaults (report/image/video) when
+      // it is given NO model, so passing the resolved one below disables that swap.
+      //  - EXPLICIT (the request carries `llmModel`): must run on exactly that model or
+      //    not run at all. A retired / not-selectable pick is refused with the same
+      //    422 `model_unavailable` as /generate, before the generation lock is taken.
+      //  - STORED only (session.llmModel): not explicit, because the system stamps the
+      //    configured default into it (Slack, GTM, ...). A retired / not-selectable
+      //    stored model is replaced by the current default, as /generate does.
+      //  - Neither: nothing is passed and the task-type defaults still apply.
+      // The session is only WRITTEN (beforeRun) once the lock and cap are held, so a
+      // 409 / 429 leaves the stored model untouched.
+      const explicitModel = normalizeRequestedLlmModel(req.body?.llmModel);
+      let selectedModel: string | undefined;
+      let persistSelectedModel: (() => Promise<void>) | undefined;
+      const requestedModel = explicitModel || session.llmModel;
+      if (requestedModel) {
+        let modelDecision: EffectiveModelPolicyDecision;
+        try {
+          modelDecision = await resolveEffectiveModelForUser({
+            userId: session.userId,
+            requestedModel,
+            allowSilentSwap: !explicitModel,
+          });
+        } catch (modelError) {
+          if (!isModelUnavailableError(modelError)) throw modelError;
+          return res.status(422).json(modelUnavailableBody(modelError));
+        }
+        selectedModel = modelDecision.effectiveModel || session.llmModel || undefined;
+        const effectiveModel = modelDecision.effectiveModel;
+        if (effectiveModel && (modelDecision.modelSelection === 'corrected' || effectiveModel !== session.llmModel)) {
+          persistSelectedModel = async () => {
+            await chatbotDb.updateSessionLlmModel(sessionId, effectiveModel, toStoredModelPolicyDecision(modelDecision));
+          };
         }
       }
 
@@ -15858,13 +16397,14 @@ export const agentModeController = {
         requiredFunctions: requiredFunctionsArray,
         maxAttempts: maxAttemptsParam || 5,
         attachments: attachmentsArray,
+        llmModel: selectedModel,
         // ENG-636: interactive endpoint — the user's live session renders the
         // deck-of-one card, so a park reaches a human who can answer.
         parkNotifiable: true,
         // ENG-2072: a real person is watching this turn — never force hands-off
         // work-plan autocomplete, even if this session happens to be scheduled.
         isUnattendedRun: false
-      }, { capInteractiveUserId: session.userId }));
+      }, { capInteractiveUserId: session.userId, beforeRun: persistSelectedModel }));
 
       // If client disconnected, don't try to send response
       // The results are already saved to the session

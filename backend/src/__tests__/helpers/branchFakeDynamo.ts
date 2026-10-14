@@ -13,6 +13,75 @@ type Item = Record<string, any>;
 
 const clone = <T>(v: T): T => (v === undefined ? v : JSON.parse(JSON.stringify(v)));
 
+/**
+ * ConditionExpression evaluator: attribute_exists(path), attribute_not_exists(path) and `path <op> :value`
+ * (=, <>, <, <=, >, >=) over dotted / #aliased paths, combined with AND / OR and parentheses (AND binds tighter).
+ * Anything else throws, so an unsupported expression fails the test instead of silently passing.
+ * DynamoDB semantics kept: a comparison against a missing attribute is false.
+ */
+function evaluateCondition(expr: string, item: Item | undefined, names: Record<string, string>, values: Record<string, any>): boolean {
+  const tokens = expr.match(/\(|\)|<>|<=|>=|=|<|>|[A-Za-z_#:][\w#:.]*/g);
+  if (!tokens || tokens.join('').length < expr.replace(/\s+/g, '').length) {
+    throw new Error(`BranchFakeDynamo: unsupported ConditionExpression: ${expr}`);
+  }
+  let pos = 0;
+  const peek = () => tokens[pos];
+  const next = () => tokens[pos++];
+  const read = (path: string): any => {
+    if (!item) return undefined;
+    return path
+      .split('.')
+      .map((seg) => (seg.startsWith('#') ? names[seg] ?? seg.slice(1) : seg))
+      .reduce<any>((cur, seg) => (cur === undefined || cur === null ? undefined : cur[seg]), item);
+  };
+  const fail = (): never => {
+    throw new Error(`BranchFakeDynamo: unsupported ConditionExpression: ${expr}`);
+  };
+  const operand = (): boolean => {
+    const tok = next();
+    if (tok === '(') {
+      const inner = or();
+      if (next() !== ')') fail();
+      return inner;
+    }
+    if (tok === 'attribute_exists' || tok === 'attribute_not_exists') {
+      if (next() !== '(') fail();
+      const exists = read(next()) !== undefined;
+      if (next() !== ')') fail();
+      return tok === 'attribute_exists' ? exists : !exists;
+    }
+    if (tok === undefined || /^(AND|OR)$/.test(tok)) fail();
+    const op = next();
+    const valueRef = next();
+    if (!valueRef || !valueRef.startsWith(':') || !(valueRef in values)) fail();
+    const left = read(tok);
+    const right = values[valueRef];
+    if (left === undefined) return false;
+    switch (op) {
+      case '=': return JSON.stringify(left) === JSON.stringify(right);
+      case '<>': return JSON.stringify(left) !== JSON.stringify(right);
+      case '<': return left < right;
+      case '<=': return left <= right;
+      case '>': return left > right;
+      case '>=': return left >= right;
+      default: return fail();
+    }
+  };
+  const and = (): boolean => {
+    let result = operand();
+    while (peek() === 'AND') { next(); result = operand() && result; }
+    return result;
+  };
+  function or(): boolean {
+    let result = and();
+    while (peek() === 'OR') { next(); result = and() || result; }
+    return result;
+  }
+  const result = or();
+  if (pos !== tokens.length) fail();
+  return result;
+}
+
 export class BranchFakeDynamo {
   readonly tables = new Map<string, Map<string, Item>>();
   /** When set, batchWrite reports these message indexes as UnprocessedItems forever (silent partial write). */
@@ -25,6 +94,12 @@ export class BranchFakeDynamo {
   readonly messageQueries: any[] = [];
   /** Every write call, in order: [op, table, key-ish]. */
   readonly writeLog: Array<{ op: string; table: string; key: string }> = [];
+  /** Every get call: `table:key` (a record-only lookup is exactly one of these and no message query). */
+  readonly getLog: string[] = [];
+  /** Conditional updates the store refused (ConditionalCheckFailedException). */
+  conditionalFailures = 0;
+  /** When set, every update throws this (a store outage). */
+  failUpdates: Error | undefined = undefined;
 
   private table(name: string): Map<string, Item> {
     let t = this.tables.get(name);
@@ -88,6 +163,7 @@ export class BranchFakeDynamo {
     return {
       get: (p: any) =>
         BranchFakeDynamo.wrap(() => {
+          this.getLog.push(`${p.TableName}:${this.keyOf(p.TableName, p.Key)}`);
           const item = this.table(p.TableName).get(this.keyOf(p.TableName, p.Key));
           return item ? { Item: clone(item) } : {};
         }),
@@ -102,13 +178,10 @@ export class BranchFakeDynamo {
           const key = this.keyOf(p.TableName, p.Key);
           this.writeLog.push({ op: 'update', table: p.TableName, key });
           const t = this.table(p.TableName);
-          if (p.ConditionExpression !== undefined) {
-            if (p.ConditionExpression !== 'attribute_exists(sessionId)') {
-              throw new Error(`BranchFakeDynamo: unsupported ConditionExpression: ${p.ConditionExpression}`);
-            }
-            if (!t.has(key)) {
-              throw Object.assign(new Error('The conditional request failed'), { code: 'ConditionalCheckFailedException' });
-            }
+          if (this.failUpdates) throw this.failUpdates;
+          if (p.ConditionExpression !== undefined && !this.conditionHolds(t.get(key), p)) {
+            this.conditionalFailures += 1;
+            throw Object.assign(new Error('The conditional request failed'), { code: 'ConditionalCheckFailedException' });
           }
           const item = t.get(key) ?? { ...clone(p.Key) };
           this.applyUpdate(item, p);
@@ -142,6 +215,11 @@ export class BranchFakeDynamo {
           return { UnprocessedItems: unprocessed };
         }),
     };
+  }
+
+  /** AND-joined `attribute_exists(a)`, `attribute_not_exists(a)` and `a = :v` clauses; anything else throws. */
+  private conditionHolds(existing: Item | undefined, p: any): boolean {
+    return evaluateCondition(String(p.ConditionExpression), existing, p.ExpressionAttributeNames ?? {}, p.ExpressionAttributeValues ?? {});
   }
 
   /** UserIdIndex (userId, updatedAt): only the plain `userId = :userId` key condition, paged by `indexPageSize`. */

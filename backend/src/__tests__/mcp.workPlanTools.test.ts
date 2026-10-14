@@ -1269,6 +1269,77 @@ describe('Predefined Work Plan MCP Tools', () => {
       expect(result.content[0].text).toContain('Onboarding');
     });
   });
+  // ENG-2378: a step's optional `model` must survive the tool (it is the layer that drops unknown keys silently).
+  describe('manage_predefined_work_plan - per-step model (ENG-2378)', () => {
+    const stored = {
+      planId: 'wp-m', title: 'Model Plan', steps_rev: 'rev-1',
+      steps: [
+        { stepCount: 1, title: 'One', description: 'd1', requiredFunctionCalls: [], skillIds: [], model: 'gpt-5-chat' },
+        { stepCount: 2, title: 'Two', description: 'd2', requiredFunctionCalls: [], skillIds: [] },
+      ],
+    };
+    const mockFetches = () =>
+      mockMcpFetch.mockImplementation(async (opts: any) => (opts.method === 'GET' ? JSON.parse(JSON.stringify(stored)) : { planId: 'wp-m' }));
+    const putBody = () => (mockMcpFetch.mock.calls.find((c: any) => c[0].method === 'PUT')![0] as any).body;
+
+    it('create passes step.model through to the route untouched', async () => {
+      mockMcpFetch.mockResolvedValue({ planId: 'wp-new' });
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create', title: 'T', steps: [{ title: 'S1', model: 'claude-sonnet-4' }, { title: 'S2' }],
+      }, context);
+      expect((writeCalls()[0][0] as any).body.steps).toEqual([{ title: 'S1', model: 'claude-sonnet-4' }, { title: 'S2' }]);
+    });
+
+    it('replace update passes step.model through', async () => {
+      mockFetches();
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update', plan_id: 'wp-m',
+        steps: [{ stepCount: 1, title: 'One', description: 'd1', requiredFunctionCalls: [], skillIds: [], model: 'claude-sonnet-4' }, { stepCount: 2, title: 'Two', description: 'd2', requiredFunctionCalls: [], skillIds: [] }],
+      }, context);
+      expect(putBody().steps[0].model).toBe('claude-sonnet-4');
+    });
+
+    it('merge: amending another field keeps the stored model; supplying one sets it; a blank clears it', async () => {
+      mockFetches();
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update', plan_id: 'wp-m', steps_mode: 'merge',
+        steps: [{ stepCount: 1, description: 'amended' }, { stepCount: 2, model: 'claude-sonnet-4' }],
+      }, context);
+      expect(putBody().steps[0]).toMatchObject({ description: 'amended', model: 'gpt-5-chat' });
+      expect(putBody().steps[1].model).toBe('claude-sonnet-4');
+
+      mockMcpFetch.mockClear();
+      mockFetches();
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update', plan_id: 'wp-m', steps_mode: 'merge', confirm_step_removal: true,
+        steps: [{ stepCount: 1, model: '' }],
+      }, context);
+      expect('model' in putBody().steps[0]).toBe(false);
+    });
+
+    it('a replace built without models (the tool never shows them) carries the stored models instead of erasing them', async () => {
+      mockFetches();
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update', plan_id: 'wp-m',
+        steps: [{ stepCount: 1, title: 'One', description: 'd1' }, { stepCount: 2, title: 'Two', description: 'd2' }],
+      }, context);
+      expect(putBody().steps.map((s: any) => s.model)).toEqual(['gpt-5-chat', undefined]);
+    });
+
+    it('A7: an explicit blank model through a replace is the clear instruction: it is NOT re-filled from the stored plan', async () => {
+      mockFetches();
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update', plan_id: 'wp-m', confirm_step_removal: true,
+        steps: [{ stepCount: 1, title: 'One', description: 'd1', model: '' }, { stepCount: 2, title: 'Two', description: 'd2' }],
+      }, context);
+      expect(putBody().steps[0].model).toBe('');
+    });
+
+    it('the step schema documents model so an LLM caller can see it', () => {
+      const def = mcpToolRegistry.getToolDefinitions().find((d: any) => d.name === 'manage_predefined_work_plan') as any;
+      expect(def.inputSchema.properties.steps.items.properties.model).toMatchObject({ type: 'string' });
+    });
+  });
 });
 
 describe('Admin tools are NOT in chatbotService', () => {

@@ -38,6 +38,7 @@ import { PendingApprovalDeck } from './agentMode/core/approvalDeck';
 import { WorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import { WorkflowRunState } from './agentMode/core/workflow';
 import { assertSequentialStepCounts } from './workPlanSteps';
+import { carryConcealedActiveRun, concealActiveRun, type ActiveRun } from './agentMode/sessionActiveRunGuard';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -53,6 +54,9 @@ const REPAIRABLE_TOOL_CALLS = [
   'generate_image',
   'generate_video'
 ];
+
+/** AW-ChatSessions table name (the ENG-110 active-run guard writes to it without going through ChatbotDB). */
+export const CHAT_SESSIONS_TABLE_NAME = `${TABLE_PREFIX}AW-ChatSessions`;
 
 // Make sure we have a DynamoDB instance
 export const dynamodb = new AWS.DynamoDB.DocumentClient({
@@ -206,6 +210,14 @@ export interface ChatSession {
    * never serialised on share / conversable / MCP views. No GSI, no backfill; rollback = stop writing/reading.
    */
   branchedFrom?: BranchedFrom;
+  /**
+   * ENG-110 (owner-approved additive optional attribute): the interactive /generate run currently live on this
+   * session, with a heartbeat, so another backend instance (Immutable deploy overlap) can see it. Written only by
+   * the active-run guard (sessionActiveRunGuard.ts) behind the `session_active_run_guard_enabled` switch. No GSI,
+   * no backfill; rollback = switch off, leftovers go stale harmlessly. NEVER serialised: every ChatbotDB read
+   * hides it (non-enumerable) and the owner/MCP views omit it.
+   */
+  activeRun?: ActiveRun;
   selectedStartupId?: string; // Selected startup profile for context
   workflowId?: string; // Added workflowId for agent mode sessions
   executionId?: string; // Added executionId for agent mode sessions
@@ -252,10 +264,21 @@ export interface ChatSession {
       // = the gate falls back to the max succeeded count across every known
       // asset-producing tool.
       expectedAssetCountTools?: string[];
+      /** ENG-2378: this step's explicit model (canonical registry id), copied from the template at launch. */
+      model?: string;
       inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
     }>;
     createdAt: string;
     updatedAt: string;
+    // ENG-2378 (only written for plans whose steps carry a model): the plan's default pin and the model the session
+    // had before the plan started (what a step WITHOUT a model falls back to), and the model the engine last stamped
+    // (so a user's explicit pick during the plan can be told apart when the plan ends).
+    planDefaultModel?: string;
+    launchModel?: string;
+    engineModel?: string;
+    // The model the USER explicitly picked during the plan (a resumed step adopts it, or a model-less step runs on it):
+    // the end-of-plan restore never replaces it.
+    pickedModel?: string;
     welcomeMessage?: string; // Custom welcome message for this work plan
     autocomplete?: boolean; // When true, Emma MUST complete each step before responding to the user
     // ENG-1472: the predefined WorkPlan template (AW-WorkPlans planId) this
@@ -494,6 +517,8 @@ export interface ChatSession {
     // ENG-2138: written by a shadow judge (sampled, never the primary score), with its model.
     shadow?: boolean;
     model?: string;
+    // ENG-2138: first 12 hex chars of sha256(judge.systemPrompt); shadow scores only.
+    promptVersion?: string;
   }>;
   // Scores retracted because the session turned out to be outside the
   // satisfaction cohort (zero-task — ENG-830). The original score is MOVED here
@@ -1962,7 +1987,7 @@ export class ChatbotDB {
 
     try {
       const result = await dynamodb.get(params).promise();
-      return (result.Item as ChatSession) || null;
+      return concealActiveRun(result.Item as ChatSession) || null;
     } catch (error) {
       console.error("Error getting chat session record:", error);
       throw error;
@@ -1990,10 +2015,11 @@ export class ChatbotDB {
       // Remove messages from session object and replace with messages from messages table
       // This ensures we always return the correct format from the messages table
       const { messages: _, ...sessionWithoutMessages } = session;
-      const normalizedSession = {
+      // activeRun is hidden (non-enumerable) on the record, so the spread drops it: carry it over, still hidden.
+      const normalizedSession = carryConcealedActiveRun(session, {
         ...sessionWithoutMessages,
         messages,
-      };
+      });
 
       // Normalize associatedSkills to string[] (handles DynamoDB Set wrapper)
       // Legacy sessions (pre-skills) have no associatedSkills field — preserve undefined
@@ -2129,7 +2155,7 @@ export class ChatbotDB {
           params.ExclusiveStartKey = paginationKey;
         }
         const result = await dynamodb.query(params).promise();
-        const items = (result.Items as ChatSession[]) || [];
+        const items = ((result.Items as ChatSession[]) || []).map(concealActiveRun);
         collected.push(...items);
         paginationKey = result.LastEvaluatedKey;
       } while (paginationKey && collected.length < targetCount);
@@ -2234,7 +2260,7 @@ export class ChatbotDB {
         params.ExclusiveStartKey = lastEvaluatedKey;
       }
       const result = await dynamodb.query(params).promise();
-      const items = (result.Items as ChatSession[]) || [];
+      const items = ((result.Items as ChatSession[]) || []).map(concealActiveRun);
       collected.push(...items);
       lastEvaluatedKey = result.LastEvaluatedKey;
     } while (lastEvaluatedKey && collected.length < limit);
@@ -2363,7 +2389,7 @@ export class ChatbotDB {
           params.ExclusiveStartKey = lastEvaluatedKey;
         }
         const result = await dynamodb.query(params).promise();
-        allItems = allItems.concat((result.Items as ChatSession[]) || []);
+        allItems = allItems.concat(((result.Items as ChatSession[]) || []).map(concealActiveRun));
         lastEvaluatedKey = result.LastEvaluatedKey;
       } while (lastEvaluatedKey);
 
@@ -2722,7 +2748,7 @@ export class ChatbotDB {
 
     try {
       const result = await dynamodb.query(params).promise();
-      const sessions = (result.Items as ChatSession[]) || [];
+      const sessions = ((result.Items as ChatSession[]) || []).map(concealActiveRun);
       
       console.log(
         `Found ${sessions.length} archived chat sessions`
@@ -2779,6 +2805,34 @@ export class ChatbotDB {
       await dynamodb.update(params).promise();
     } catch (error) {
       console.error("Error unarchiving chat session:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-112 (self-heal of legacy branches): set `branchedFrom` on a session that has none, for its owner only.
+   * One conditional write: the row must exist, belong to `ownerUserId` and carry no `branchedFrom` yet, so a
+   * concurrent open is idempotent and an existing value is never overwritten. Touches nothing else (not
+   * `updatedAt`: healing must not reorder the sidebar). Returns false when the condition refused the write.
+   */
+  async setBranchedFromIfAbsent(sessionId: string, ownerUserId: string, branchedFrom: BranchedFrom): Promise<boolean> {
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: "SET branchedFrom = :branchedFrom",
+      ConditionExpression: "attribute_exists(sessionId) AND userId = :ownerUserId AND attribute_not_exists(branchedFrom)",
+      ExpressionAttributeValues: {
+        ":branchedFrom": branchedFrom,
+        ":ownerUserId": ownerUserId,
+      },
+    };
+
+    try {
+      await dynamodb.update(params).promise();
+      return true;
+    } catch (error) {
+      if ((error as { code?: string })?.code === "ConditionalCheckFailedException") return false;
+      console.error("Error setting branchedFrom:", error);
       throw error;
     }
   }
@@ -3837,12 +3891,19 @@ export class ChatbotDB {
         expectedAssetCount?: number;
         /** ENG-1331: see the matching field on the read-side workPlan type above. */
         expectedAssetCountTools?: string[];
+        /** ENG-2378: see the matching field on the read-side workPlan type above. */
+        model?: string;
         inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
       }>;
       createdAt: string;
       updatedAt: string;
       welcomeMessage?: string;
       autocomplete?: boolean;
+      /** ENG-2378: see the matching fields on the read-side workPlan type above. */
+      planDefaultModel?: string;
+      launchModel?: string;
+      engineModel?: string;
+      pickedModel?: string;
       /** ENG-1472: see the matching field on the read-side workPlan type above. */
       templatePlanId?: string;
       /** ENG-1811: see the matching field on the read-side workPlan type above. */
@@ -4482,7 +4543,7 @@ export class ChatbotDB {
       try {
         const result = await dynamodb.scan(params).promise();
         if (result.Items) {
-          allSessions = allSessions.concat(result.Items as ChatSession[]);
+          allSessions = allSessions.concat((result.Items as ChatSession[]).map(concealActiveRun));
         }
         lastEvaluatedKey = result.LastEvaluatedKey;
       } catch (error) {
@@ -4540,7 +4601,7 @@ export class ChatbotDB {
           }
 
           const result = await dynamodb.query(params).promise();
-          accumulated.push(...((result.Items as ChatSession[]) || []));
+          accumulated.push(...((result.Items as ChatSession[]) || []).map(concealActiveRun));
           currentKey = result.LastEvaluatedKey;
         } while (currentKey);
 
@@ -4609,7 +4670,7 @@ export class ChatbotDB {
 
             const lateResult = await dynamodb.query(lateParams).promise();
             pageCount++;
-            for (const session of (lateResult.Items as ChatSession[]) || []) {
+            for (const session of ((lateResult.Items as ChatSession[]) || []).map(concealActiveRun)) {
               if (primarySessionIds.has(session.sessionId)) continue; // already covered by the primary query
               const createdAt = session.createdAt;
               if (createdAt && createdAt >= timeRange.startTime && createdAt <= timeRange.endTime) {
@@ -4682,7 +4743,7 @@ export class ChatbotDB {
         }
 
         const result = await dynamodb.query(params).promise();
-        accumulated.push(...((result.Items as ChatSession[]) || []));
+        accumulated.push(...((result.Items as ChatSession[]) || []).map(concealActiveRun));
         currentKey = result.LastEvaluatedKey;
       } while (currentKey && accumulated.length < limit);
 

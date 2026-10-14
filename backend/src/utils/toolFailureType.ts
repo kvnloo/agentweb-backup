@@ -56,7 +56,7 @@ const BY_DESIGN_RE =
 // "too long (N chars)" = an argument-length constraint (e.g. the LinkedIn 200/300
 // invite-note limit) — an arg validation, not a tool defect.
 const SCHEMA_RE =
-  /failed schema validation|\b[\w-]+ (?:is|are) required\b|missing required (?:argument|variable|field|parameter)|both .* (?:is|are) required|message is too long|note is too long|too long \(\d/i;
+  /failed schema validation|\b[\w-]+ (?:is|are) required\b|missing required (?:array )?(?:argument|variable|field|parameter)|both .* (?:is|are) required|message is too long|note is too long|too long \(\d/i;
 
 // Includes the technical config/credential/quota signals from the error MESSAGE
 // so pre-classifier events (errorClass recorded as the unhelpful 'Error') are

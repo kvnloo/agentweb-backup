@@ -20,7 +20,7 @@
 import AWS from 'aws-sdk';
 import { agreementReport, toGraderValidation, type AgreementReport, type LabelPair, type ValidationRecord } from './agreement';
 import { getGrader, type EvalSurface } from './evalRegistry';
-import type { GoldenCase, GoldenCriterion, GoldenSplit, LabelValue } from './goldenSet';
+import { isAiLabelled, type GoldenCase, type GoldenCriterion, type GoldenSplit, type LabelValue } from './goldenSet';
 import type { GoldenSetStore } from './goldenSetStore';
 import {
   gradeFormatAdherence,
@@ -52,6 +52,9 @@ export interface GoldenCaseGrader {
   grade(goldenCase: GoldenCase): Promise<GraderPrediction>;
 }
 
+/** A class needs at least this many examples (of the rarer truth label) before its kappa means anything. */
+export const MIN_CLASS_EXAMPLES = 5;
+
 export interface CriterionAgreement {
   criterion: GoldenCriterion;
   /** null when no case has both a human and a grader pass/fail for this criterion. */
@@ -59,6 +62,9 @@ export interface CriterionAgreement {
   humanNa: number;
   unlabelled: number;
   graderAbstained: number;
+  /** The rarer of the two truth labels among the pairs. Under MIN_CLASS_EXAMPLES a kappa is not reported as reliable. */
+  minorityN: number;
+  reliable: boolean;
 }
 
 export interface ValidationRun {
@@ -72,8 +78,13 @@ export interface ValidationRun {
   gradeErrors: number;
   criteria: CriterionAgreement[];
   primaryCriterion: GoldenCriterion;
-  /** For the primary criterion; null when it has no pairs. Qualifies for gating only if the
-   * registry's isQualifyingValidation accepts it (kappa, n and an http(s) evidence link). */
+  /** Cases in the split whose label an AI wrote (note starts with AI_LABEL_NOTE_PREFIX); left out unless asked. */
+  aiLabelledCases: number;
+  /** `human+ai` only when AI-written labels were included on request; that run is advisory. */
+  labelSource: 'human' | 'human+ai';
+  /** For the primary criterion; null when it has no pairs, or when AI-written labels were included (an advisory run
+   * is never a registry record). Qualifies for gating only if the registry's isQualifyingValidation accepts it
+   * (kappa, n and an http(s) evidence link). */
   validation: ValidationRecord | null;
 }
 
@@ -108,12 +119,16 @@ export function computeCriterionAgreement(
     }
     pairs.push({ truth, predicted });
   }
+  const positives = pairs.filter((p) => p.truth === 'pass').length;
+  const minorityN = Math.min(positives, pairs.length - positives);
   return {
     criterion,
     report: pairs.length > 0 ? agreementReport(pairs, bootstrap) : null,
     humanNa,
     unlabelled,
     graderAbstained,
+    minorityN,
+    reliable: pairs.length > 0 && minorityN >= MIN_CLASS_EXAMPLES,
   };
 }
 
@@ -123,6 +138,8 @@ export async function runValidation(opts: {
   graders: readonly GoldenCaseGrader[];
   evidence?: string;
   split?: GoldenSplit;
+  /** Count cases whose label an AI wrote. Off by default: agreement with them is not human agreement. */
+  includeAiLabels?: boolean;
   now?: Date;
   bootstrap?: { iterations?: number; seed?: number };
 }): Promise<ValidationRun> {
@@ -135,7 +152,10 @@ export async function runValidation(opts: {
   const split = opts.split ?? 'test';
   // Pairwise creative cases (ENG-2142) carry an A/B/tie preference, not these binary criteria;
   // their agreement is reported by scripts/creativeCalibrationReport.ts.
-  const cases = (await opts.store.listCases(entry.surface, { split })).filter((c) => c.pair === undefined);
+  const listed = (await opts.store.listCases(entry.surface, { split })).filter((c) => c.pair === undefined);
+  const aiLabelledCases = listed.filter(isAiLabelled).length;
+  const labelSource = opts.includeAiLabels && aiLabelledCases > 0 ? 'human+ai' : 'human';
+  const cases = opts.includeAiLabels ? listed : listed.filter((c) => !isAiLabelled(c));
   const predictions = new Map<string, GraderPrediction>();
   let gradeErrors = 0;
   let graded = 0;
@@ -164,7 +184,10 @@ export async function runValidation(opts: {
     gradeErrors,
     criteria,
     primaryCriterion: grader.primaryCriterion,
-    validation: primary?.report ? toGraderValidation(primary.report, opts.evidence ?? 'unpublished', opts.now) : null,
+    aiLabelledCases,
+    labelSource,
+    // No record for a class too rare to measure: a kappa on a handful of examples would read as evidence.
+    validation: labelSource === 'human' && primary?.report && primary.reliable ? toGraderValidation(primary.report, opts.evidence ?? 'unpublished', opts.now, 'human') : null,
   };
 }
 

@@ -26,6 +26,11 @@ export interface GraderValidation {
   date: string;
   /** Link to the run output (Linear comment, PR, report). */
   evidence: string;
+  /**
+   * Who wrote the labels the run was scored against. Only `human` qualifies: an AI labelling the set that validates
+   * an AI judge is circular, and a model of the same family as the judge shares its blind spots (ENG-2135).
+   */
+  labelSource?: 'human';
 }
 
 export interface GraderEntry {
@@ -426,9 +431,9 @@ export function mayGate(id: string): boolean {
   return isQualifyingValidation(getGrader(id)?.validation);
 }
 
-/** kappa >= MIN_KAPPA on n >= MIN_VALIDATION_N cases, with an http(s) link to the run. */
+/** kappa >= MIN_KAPPA on n >= MIN_VALIDATION_N cases scored against HUMAN labels, with an http(s) link to the run. */
 export function isQualifyingValidation(v: GraderValidation | undefined): boolean {
-  return !!v && v.kappa >= MIN_KAPPA && v.n >= MIN_VALIDATION_N && hasEvidenceLink(v.evidence);
+  return !!v && v.labelSource === 'human' && v.kappa >= MIN_KAPPA && v.n >= MIN_VALIDATION_N && hasEvidenceLink(v.evidence);
 }
 
 function hasEvidenceLink(evidence: string): boolean {

@@ -1,6 +1,11 @@
 import { Request, Response } from 'express';
 
 // Mock all dependencies before importing the controller
+jest.mock('../services/tokenUsageService', () => ({
+  ...jest.requireActual('../services/tokenUsageService'),
+  checkTokenUsage: jest.fn().mockResolvedValue({ allowed: true, warning: false, month: '2026-07' }),
+}));
+
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     createChatSession: jest.fn(),

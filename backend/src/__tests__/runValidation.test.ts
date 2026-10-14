@@ -13,6 +13,7 @@ import {
   computeCriterionAgreement,
   creativeGatesGrader,
   creativeGatesPrediction,
+  MIN_CLASS_EXAMPLES,
   liveAgentGraders,
   loadSessionForGrading,
   runValidation,
@@ -95,11 +96,72 @@ describe('validation runner math (ENG-2135)', () => {
     const run = await runValidation({ graderId: 'session-judge-general', store, graders: [grader], now: NOW, bootstrap: { iterations: 200 } });
     expect(store.listCases).toHaveBeenCalledWith('agent', { split: 'test' });
     expect(run).toMatchObject({ cases: 40, gradeErrors: 0, split: 'test', primaryCriterion: 'task_success' });
-    expect(run.validation).toEqual({ kappa: expect.closeTo(0.7, 10), n: 40, date: '2026-09-25', evidence: 'unpublished' });
+    expect(run.validation).toEqual({ kappa: expect.closeTo(0.7, 10), n: 40, date: '2026-09-25', evidence: 'unpublished', labelSource: 'human' });
     expect(isQualifyingValidation(run.validation ?? undefined)).toBe(false);
 
     const withEvidence = await runValidation({ graderId: 'session-judge-general', store, graders: [grader], evidence: 'https://linear.app/x', now: NOW, bootstrap: { iterations: 200 } });
     expect(isQualifyingValidation(withEvidence.validation ?? undefined)).toBe(true);
+  });
+
+  describe('AI-written labels (ENG-2135)', () => {
+    const AI_NOTE = '[AI-LABEL] Written by Claude on behalf of the owner. Not an independent human review.';
+    const aiGrader = (predictions: Map<string, GraderPrediction>): GoldenCaseGrader => ({
+      graderId: 'session-judge-general',
+      surface: 'agent',
+      criteria: ['task_success'],
+      primaryCriterion: 'task_success',
+      grade: async (c) => predictions.get(c.caseId) ?? {},
+    });
+
+    it('leaves AI-written labels out by default, so agreement and the registry record rest on human labels only', async () => {
+      const { cases, predictions } = fixture(); // 40 human-labelled cases, kappa 0.7
+      const aiCases = Array.from({ length: 10 }, (_, i) => ({ ...labelled(`ai${i}`, 'pass'), notes: AI_NOTE }));
+      // The grader disagrees with every AI label, so counting them would lower kappa.
+      const aiPredictions = new Map(aiCases.map((c) => [c.caseId, { task_success: 'fail' as LabelValue }]));
+      const run = await runValidation({
+        graderId: 'session-judge-general',
+        store: storeOf([...cases, ...aiCases]),
+        graders: [aiGrader(new Map([...predictions, ...aiPredictions]))],
+        now: NOW,
+        bootstrap: { iterations: 100 },
+      });
+      expect(run).toMatchObject({ cases: 40, aiLabelledCases: 10, labelSource: 'human' });
+      expect(run.criteria[0].report?.n).toBe(40);
+      expect(run.validation).toEqual({ kappa: expect.closeTo(0.7, 10), n: 40, date: '2026-09-25', evidence: 'unpublished', labelSource: 'human' });
+    });
+
+    it('counts them only on request, and then withholds the registry record: an advisory run is never evidence', async () => {
+      const { cases, predictions } = fixture();
+      const aiCases = Array.from({ length: 10 }, (_, i) => ({ ...labelled(`ai${i}`, 'pass'), notes: AI_NOTE }));
+      const aiPredictions = new Map(aiCases.map((c) => [c.caseId, { task_success: 'fail' as LabelValue }]));
+      const run = await runValidation({
+        graderId: 'session-judge-general',
+        store: storeOf([...cases, ...aiCases]),
+        graders: [aiGrader(new Map([...predictions, ...aiPredictions]))],
+        includeAiLabels: true,
+        evidence: 'https://linear.app/x',
+        now: NOW,
+        bootstrap: { iterations: 100 },
+      });
+      expect(run).toMatchObject({ cases: 50, aiLabelledCases: 10, labelSource: 'human+ai' });
+      expect(run.criteria[0].report?.n).toBe(50);
+      expect(run.validation).toBeNull();
+      expect(isQualifyingValidation(run.validation ?? undefined)).toBe(false);
+    });
+
+    it('stays a human run when the flag is set but the split holds no AI-written label', async () => {
+      const { cases, predictions } = fixture();
+      const run = await runValidation({
+        graderId: 'session-judge-general',
+        store: storeOf(cases),
+        graders: [aiGrader(predictions)],
+        includeAiLabels: true,
+        now: NOW,
+        bootstrap: { iterations: 100 },
+      });
+      expect(run).toMatchObject({ aiLabelledCases: 0, labelSource: 'human' });
+      expect(run.validation).not.toBeNull();
+    });
   });
 
   it('counts a grader that throws on a case as an error and an abstention', async () => {
@@ -423,5 +485,49 @@ describe('account-health classifier adapter (ENG-2143, ENG-2226)', () => {
 
     // Abstention: the classify function found nothing for this user (e.g. deleted since the case was seeded).
     expect(await grader.grade(accountCase('user-2'))).toEqual({});
+  });
+});
+
+describe('class reliability and the human-only record (ENG-2135)', () => {
+  const grader = (predict: (c: GoldenCase) => 'pass' | 'fail'): GoldenCaseGrader => ({
+    graderId: 'session-judge-general',
+    surface: 'agent',
+    criteria: ['task_success'],
+    primaryCriterion: 'task_success',
+    grade: async (c) => ({ task_success: predict(c) }),
+  });
+  const perfect = grader((c) => (c.labels.task_success === 'pass' ? 'pass' : 'fail'));
+  const withPass = (nPass: number) => Array.from({ length: 40 }, (_, i) => labelled(`c${i}`, i < nPass ? 'pass' : 'fail'));
+
+  it('a balanced human-labelled run produces a record that says the labels are human, and it can qualify', async () => {
+    const run = await runValidation({ graderId: 'session-judge-general', store: storeOf(withPass(20)), graders: [perfect], evidence: 'https://linear.app/x', now: NOW, bootstrap: { iterations: 20 } });
+    expect(run.criteria[0]).toMatchObject({ minorityN: 20, reliable: true });
+    expect(run.validation).toMatchObject({ labelSource: 'human', n: 40 });
+    expect(isQualifyingValidation(run.validation!)).toBe(true);
+  });
+
+  it('a class with fewer than MIN_CLASS_EXAMPLES examples is not reliable and produces no validation record', async () => {
+    const run = await runValidation({ graderId: 'session-judge-general', store: storeOf(withPass(MIN_CLASS_EXAMPLES - 1)), graders: [perfect], evidence: 'https://linear.app/x', now: NOW, bootstrap: { iterations: 20 } });
+    expect(run.criteria[0]).toMatchObject({ minorityN: MIN_CLASS_EXAMPLES - 1, reliable: false });
+    expect(run.criteria[0].report).not.toBeNull();
+    expect(run.validation).toBeNull();
+  });
+
+  it('the rarer class can be either label: too few fails is just as unreliable as too few passes', async () => {
+    const run = await runValidation({ graderId: 'session-judge-general', store: storeOf(withPass(40 - (MIN_CLASS_EXAMPLES - 1))), graders: [perfect], evidence: 'https://linear.app/x', now: NOW, bootstrap: { iterations: 20 } });
+    expect(run.criteria[0]).toMatchObject({ minorityN: MIN_CLASS_EXAMPLES - 1, reliable: false });
+    expect(run.validation).toBeNull();
+  });
+
+  it('exactly MIN_CLASS_EXAMPLES examples of the rarer class is enough', async () => {
+    const run = await runValidation({ graderId: 'session-judge-general', store: storeOf(withPass(MIN_CLASS_EXAMPLES)), graders: [perfect], evidence: 'https://linear.app/x', now: NOW, bootstrap: { iterations: 20 } });
+    expect(run.criteria[0]).toMatchObject({ minorityN: MIN_CLASS_EXAMPLES, reliable: true });
+    expect(run.validation).not.toBeNull();
+  });
+
+  it('no pairs: not reliable, no record', async () => {
+    const run = await runValidation({ graderId: 'session-judge-general', store: storeOf([labelled('x', undefined)]), graders: [perfect], now: NOW });
+    expect(run.criteria[0]).toMatchObject({ reliable: false, minorityN: 0 });
+    expect(run.validation).toBeNull();
   });
 });
