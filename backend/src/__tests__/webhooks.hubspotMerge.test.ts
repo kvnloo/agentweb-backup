@@ -65,11 +65,12 @@ describe('processHubspotWebhookJob — contact.merge', () => {
     (crmDb.getLeadListsByUserId as jest.Mock).mockResolvedValue([
       listFor('L-this', String(PORTAL)), listFor('L-other-portal', '999'), listFor('L-unconnected'),
     ]);
-    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockImplementation(async () => holder('101'));
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockResolvedValueOnce(holder('101')).mockResolvedValue(null);
 
     await processHubspotWebhookJob(payload as any);
 
-    expect(crmDb.getLeadByHubSpotContactId).toHaveBeenCalledTimes(1);
+    // one lookup per matching lead plus the one that finds nothing, and only on the portal's own list
+    expect((crmDb.getLeadByHubSpotContactId as jest.Mock).mock.calls.map((c) => c[0])).toEqual(['L-this', 'L-this']);
     expect(crmDb.getLeadByHubSpotContactId).toHaveBeenCalledWith('L-this', '101');
     expect(crmDb.updateLead).toHaveBeenCalledTimes(1);
     expect(crmDb.updateLead).toHaveBeenCalledWith('L-this', 'lead-1', { syncMetadata: { hubspot_contact_id: '200', syncStatus: 'synced' } });
@@ -82,9 +83,23 @@ describe('processHubspotWebhookJob — contact.merge', () => {
     expect(crmDb.updateLead).not.toHaveBeenCalled();
   });
 
-  it('a failure on the merge does not throw out of the job', async () => {
+  it('a merge that fails makes the JOB fail, so the durable queue retries it', async () => {
     (crmDb.getLeadListsByUserId as jest.Mock).mockRejectedValue(new Error('dynamo down'));
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    await expect(processHubspotWebhookJob(payload as any)).rejects.toThrow(/could not be re-pointed/);
+  });
+
+  it('a throttled lookup inside a list also fails the job, but the rest of the delivery is still applied first', async () => {
+    (crmDb.getLeadListsByUserId as jest.Mock).mockResolvedValue([listFor('L-this', String(PORTAL))]);
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockRejectedValue(new Error('throttled'));
+    const withChange = { ...payload, changesByObjectId: { '5': { portalId: PORTAL, properties: {}, isCreation: false, isDeleted: false, isDealChange: false } } };
+    await expect(processHubspotWebhookJob(withChange as any)).rejects.toThrow(/could not be re-pointed/);
+    expect(getUserIdByHubSpotPortalId).toHaveBeenCalledTimes(2);   // once for the merge, once for the contact change
+  });
+
+  it('a successful merge does not fail the job', async () => {
+    (crmDb.getLeadListsByUserId as jest.Mock).mockResolvedValue([listFor('L-this', String(PORTAL))]);
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockResolvedValueOnce(holder('101')).mockResolvedValue(null);
     await expect(processHubspotWebhookJob(payload as any)).resolves.toBeUndefined();
   });
 
@@ -103,7 +118,7 @@ describe('POST /api/webhooks/hubspot — contact.merge', () => {
   it('carries the merge in the durable job payload, and the processed job re-points the id', async () => {
     (enqueueJob as jest.Mock).mockResolvedValue('enqueued');
     (crmDb.getLeadListsByUserId as jest.Mock).mockResolvedValue([listFor('L-this', String(PORTAL))]);
-    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockResolvedValue(holder('101'));
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockResolvedValueOnce(holder('101')).mockResolvedValue(null);
 
     await request(app).post('/api/webhooks/hubspot').set('content-type', 'application/json').send(JSON.stringify([mergeEvent]));
     await flush();

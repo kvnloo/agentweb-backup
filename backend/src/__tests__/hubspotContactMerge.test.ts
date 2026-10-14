@@ -40,6 +40,12 @@ describe('parseHubSpotMergeEvent', () => {
   });
 });
 
+/** A lookup like the real one: a lead matches only while it still holds the id, and a rewrite stops that. */
+function statefulLeads(leads: Array<{ leadId: string; syncMetadata?: any }>) {
+  find.mockImplementation(async (_l: string, id: string) => leads.find((l) => l.syncMetadata?.hubspot_contact_id === id) ?? null);
+  update.mockImplementation(async (_l: string, leadId: string, u: any) => { leads.find((l) => l.leadId === leadId)!.syncMetadata = u.syncMetadata; });
+}
+
 describe('repointMergedContactIds', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -50,8 +56,7 @@ describe('repointMergedContactIds', () => {
   afterEach(() => jest.restoreAllMocks());
 
   it('rewrites the stored id to the survivor and keeps every other syncMetadata field', async () => {
-    find.mockImplementation(async (_l: string, id: string) =>
-      id === '101' ? { leadId: 'l1', syncMetadata: { hubspot_contact_id: '101', hubspot_deal_id: 'D1', syncStatus: 'synced' } } : null);
+    statefulLeads([{ leadId: 'l1', syncMetadata: { hubspot_contact_id: '101', hubspot_deal_id: 'D1', syncStatus: 'synced' } }]);
 
     const r = await repointMergedContactIds('list_1', { survivorId: '200', mergedIds: ['101', '102'] });
 
@@ -70,10 +75,12 @@ describe('repointMergedContactIds', () => {
   });
 
   it('a lookup that throws (page cap, throttle) does not stop the remaining ids and never throws', async () => {
+    const l2 = { leadId: 'l2', syncMetadata: { hubspot_contact_id: '102' } };
     find.mockImplementation(async (_l: string, id: string) => {
       if (id === '101') throw Object.assign(new Error('exhausted 20 pages'), { lookupExhausted: true });
-      return { leadId: 'l2', syncMetadata: { hubspot_contact_id: '102' } };
+      return l2.syncMetadata.hubspot_contact_id === id ? l2 : null;
     });
+    update.mockImplementation(async (_l: string, _id: string, u: any) => { l2.syncMetadata = u.syncMetadata; });
 
     const r = await repointMergedContactIds('list_1', { survivorId: '200', mergedIds: ['101', '102'] });
 
@@ -82,8 +89,10 @@ describe('repointMergedContactIds', () => {
   });
 
   it('a failed write is counted, does not throw, and does not stop the next id', async () => {
-    find.mockImplementation(async (_l: string, id: string) => ({ leadId: `lead-${id}`, syncMetadata: { hubspot_contact_id: id } }));
-    update.mockRejectedValueOnce(new Error('ProvisionedThroughputExceeded')).mockResolvedValue(undefined);
+    const leads = [{ leadId: 'lead-101', syncMetadata: { hubspot_contact_id: '101' } }, { leadId: 'lead-102', syncMetadata: { hubspot_contact_id: '102' } }];
+    find.mockImplementation(async (_l: string, id: string) => leads.find((l) => l.syncMetadata.hubspot_contact_id === id) ?? null);
+    update.mockRejectedValueOnce(new Error('ProvisionedThroughputExceeded'))
+      .mockImplementation(async (_l: string, leadId: string, u: any) => { leads.find((l) => l.leadId === leadId)!.syncMetadata = u.syncMetadata; });
 
     const r = await repointMergedContactIds('list_1', { survivorId: '200', mergedIds: ['101', '102'] });
 
@@ -91,8 +100,33 @@ describe('repointMergedContactIds', () => {
     expect(r).toEqual({ rewritten: 1, lookupFailed: 1 });
   });
 
+  it('rewrites EVERY lead holding the merged id (duplicate leads for one contact), not just the first', async () => {
+    const leads = [
+      { leadId: 'a', syncMetadata: { hubspot_contact_id: '101' } },
+      { leadId: 'b', syncMetadata: { hubspot_contact_id: '101' } },
+      { leadId: 'c', syncMetadata: { hubspot_contact_id: '101' } },
+    ];
+    // like the real lookup, a rewritten lead stops matching
+    find.mockImplementation(async (_l: string, id: string) => leads.find((l) => l.syncMetadata.hubspot_contact_id === id) ?? null);
+    update.mockImplementation(async (_l: string, leadId: string, u: any) => { leads.find((l) => l.leadId === leadId)!.syncMetadata = u.syncMetadata; });
+
+    const r = await repointMergedContactIds('list_1', { survivorId: '200', mergedIds: ['101'] });
+
+    expect(leads.map((l) => l.syncMetadata.hubspot_contact_id)).toEqual(['200', '200', '200']);
+    expect(r).toEqual({ rewritten: 3, lookupFailed: 0 });
+  });
+
+  it('a write that does not take cannot loop forever (bounded)', async () => {
+    find.mockResolvedValue({ leadId: 'stuck', syncMetadata: { hubspot_contact_id: '101' } });   // still matches after every write
+    const r = await repointMergedContactIds('list_1', { survivorId: '200', mergedIds: ['101'] });
+    expect(update.mock.calls.length).toBeLessThanOrEqual(25);
+    expect(r.rewritten).toBeLessThanOrEqual(25);
+  });
+
   it('tolerates a lead with no syncMetadata object', async () => {
-    find.mockResolvedValue({ leadId: 'l3' });
+    const l3: any = { leadId: 'l3' };
+    find.mockImplementation(async () => (l3.syncMetadata ? null : l3));
+    update.mockImplementation(async (_l: string, _id: string, u: any) => { l3.syncMetadata = u.syncMetadata; });
     await repointMergedContactIds('list_1', { survivorId: '200', mergedIds: ['101'] });
     expect(update).toHaveBeenCalledWith('list_1', 'l3', { syncMetadata: { hubspot_contact_id: '200' } });
   });

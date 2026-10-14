@@ -275,9 +275,6 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     expect(updates.email).toBeUndefined();
   });
 
-  // A throw out of the deletion lookup does not just skip that contact: it escapes
-  // handleHubSpotEvent into the fire-and-forget wrapper and abandons every remaining
-  // objectId in the batch. HubSpot already has its 200, so nothing retries.
   // ─── contact.merge (ENG-2465) ─────────────────────────────────────────────────
 
   const mergeEvent = { subscriptionType: 'contact.merge', portalId: 99999, objectId: '200', primaryObjectId: 200, mergedObjectIds: [101], newObjectId: 200 };
@@ -288,7 +285,7 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
   };
 
   it('contact.merge re-points the lead holding the merged-away id at the survivor', async () => {
-    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockImplementation(async (_l: string, id: string) => (id === '101' ? holder('101') : null));
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockResolvedValueOnce(holder('101')).mockResolvedValue(null);
 
     await postEvents([mergeEvent]);
 
@@ -329,6 +326,9 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     expect(crmDb.updateLead).toHaveBeenCalledWith(VALID_LIST_ID, 'lead-9', expect.objectContaining({ email: 'x@acme.com' }));
   });
 
+  // A throw out of the deletion lookup does not just skip that contact: it escapes
+  // handleHubSpotEvent into the fire-and-forget wrapper and abandons every remaining
+  // objectId in the batch. HubSpot already has its 200, so nothing retries.
   it('an exhausted DELETION lookup does not abandon the rest of the batch', async () => {
     (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue({
       ...mockConfig('hubspot'), deleteOnPull: true,
