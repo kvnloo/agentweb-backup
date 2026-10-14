@@ -40,6 +40,14 @@ const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
  * read into a spurious failure. This is a ceiling on hanging, not a latency target.
  */
 const GOOGLE_ADS_HTTP_TIMEOUT_MS = 60_000;
+
+/** ENG-2475: true when a Google Ads error body carries databaseError CONCURRENT_MODIFICATION. */
+function isConcurrentModificationError(err: any): boolean {
+  const details = err?.response?.data?.error?.details;
+  if (!Array.isArray(details)) return false;
+  return details.some((d: any) => Array.isArray(d?.errors) && d.errors.some((e: any) =>
+    e?.errorCode && typeof e.errorCode === 'object' && Object.values(e.errorCode).includes('CONCURRENT_MODIFICATION')));
+}
 const TOKEN_REFRESH_URL = 'https://oauth2.googleapis.com/token';
 
 export interface GoogleAdAccount {
@@ -535,11 +543,36 @@ export class GoogleAdsService {
   }
 
   async mutate(customerId: string, accessToken: string, resource: string, operations: any[], loginCustomerId?: string): Promise<any> {
-    return this.callApi('POST', `/customers/${customerId}/${resource}:mutate`, accessToken, { operations }, loginCustomerId);
+    return this.withConcurrentModificationRetry(() =>
+      this.callApi('POST', `/customers/${customerId}/${resource}:mutate`, accessToken, { operations }, loginCustomerId));
   }
 
   async batchMutate(customerId: string, accessToken: string, mutateOperations: any[], loginCustomerId?: string): Promise<any> {
-    return this.callApi('POST', `/customers/${customerId}/googleAds:mutate`, accessToken, { mutateOperations }, loginCustomerId);
+    return this.withConcurrentModificationRetry(() =>
+      this.callApi('POST', `/customers/${customerId}/googleAds:mutate`, accessToken, { mutateOperations }, loginCustomerId));
+  }
+
+  /** Jittered backoff between CONCURRENT_MODIFICATION retries (overridable in tests). */
+  private concurrentRetryDelayMs(attempt: number): number {
+    return 250 * attempt + Math.floor(Math.random() * 250);
+  }
+
+  /**
+   * ENG-2475: Google rejects a whole mutate with CONCURRENT_MODIFICATION when parallel
+   * writes hit the same resource, and its message says "Retry the request." Nothing was
+   * applied, so retrying is safe. Only that code is retried; every other error (and the
+   * final failure) is rethrown as the original object, which callers read codes from.
+   */
+  private async withConcurrentModificationRetry<T>(fn: () => Promise<T>): Promise<T> {
+    const MAX_ATTEMPTS = 3;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await fn();
+      } catch (err: any) {
+        if (attempt >= MAX_ATTEMPTS || !isConcurrentModificationError(err)) throw err;
+        await new Promise((r) => setTimeout(r, this.concurrentRetryDelayMs(attempt)));
+      }
+    }
   }
 
   makeAuthError(message: string): Error {
