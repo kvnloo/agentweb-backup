@@ -29,3 +29,7 @@ roughly 12 test labels; reaching 30 test labels from 29 needs only a few, 70 giv
 Sessions with no `messageCount` (written before the counter) are never sampled. Evaluation sessions are
 identified only by the `eval_` userId prefix; other internal/QA accounts cannot be told apart from cheap
 attributes and are not excluded.
+
+**Gated creative candidates (ENG-2226).** `--gated-creatives` (opt-in, off by default) adds `gated_candidate` creative cases: image candidates in `AW-HumanEvalQueue` that carry an evaluated creative-gate result (`creativeGates` present and not `notChecked`). Every reviewer-feedback creative case predates the gates (earliest gated candidate 2026-09-25), so the gates adapter abstains on all of them; labelling `format_readiness` on those is wasted effort. Reviewed candidates keep priority and a larger `--target-creative` only appends.
+
+**Target semantics, a foot-gun worth stating.** `--target-<surface>` is the size of the *selection*, not the number of additions, and `createCase` never overwrites. For agent the pinned and catalogue cases (10 admin-override + 2 replay + 38 catalogue = 50) come first, so with `--fp-catalogue` the sampled additions are `target - 50`; without the catalogue file only the 10 admin-override cases are pinned, so the same 20 additions need `--target-agent 30`. Read `bySource` in the dry run and aim for about 20 new `sampled_session` cases (about 12 land in the test split), then diff against the store before any `--write`.
