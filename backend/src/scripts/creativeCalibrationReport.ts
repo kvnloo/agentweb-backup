@@ -19,7 +19,7 @@
 import { argv, exit } from 'node:process';
 import type { PairwiseChoice } from '../loops/eval/agreement';
 import { isoWeekStart, pairwiseAgreement, type PairwiseAgreement, type PairwiseComparison } from '../loops/eval/creativeCalibration';
-import { PAIRWISE_CRITERION, isPairwiseLabel, type GoldenCase } from '../loops/eval/goldenSet';
+import { PAIRWISE_CRITERION, isAiLabelled, isPairwiseLabel, type GoldenCase } from '../loops/eval/goldenSet';
 import { goldenSetStoreFromEnv, GOLDEN_CASES_TABLE_ENV } from '../loops/eval/goldenSetStore';
 import { DEFAULT_RUBRIC_JUDGE_MODEL, type CreativeBrief, type judgeCreativePair as JudgeCreativePairImpl } from '../services/creativeRubricJudge';
 import type { HumanEvalCandidate } from '../services/humanEvalService';
@@ -30,12 +30,14 @@ export interface ReportArgs {
   batches: string[];
   model: string;
   judge: boolean;
+  /** Count pairs whose choice an AI wrote. Off by default: agreement with them is not human agreement. */
+  includeAiLabels: boolean;
 }
 
-const USAGE = 'Usage: creativeCalibrationReport.ts --batch <YYYY-Www>[,...] [--model <id>] [--no-judge]';
+const USAGE = 'Usage: creativeCalibrationReport.ts --batch <YYYY-Www>[,...] [--model <id>] [--no-judge] [--include-ai-labels]';
 
 export function parseReportArgs(raw: readonly string[]): ReportArgs {
-  const args: ReportArgs = { batches: [], model: DEFAULT_RUBRIC_JUDGE_MODEL, judge: true };
+  const args: ReportArgs = { batches: [], model: DEFAULT_RUBRIC_JUDGE_MODEL, judge: true, includeAiLabels: false };
   const operand = (i: number, flag: string): string => {
     const value = raw[i];
     if (value === undefined || value.startsWith('--') || !value.trim()) throw new Error(`${flag} needs a value. ${USAGE}`);
@@ -46,6 +48,7 @@ export function parseReportArgs(raw: readonly string[]): ReportArgs {
     if (flag === '--batch') args.batches = operand(++i, flag).split(',').map((s) => s.trim()).filter(Boolean);
     else if (flag === '--model') args.model = operand(++i, flag);
     else if (flag === '--no-judge') args.judge = false;
+    else if (flag === '--include-ai-labels') args.includeAiLabels = true;
     else throw new Error(`unknown argument "${flag}". ${USAGE}`);
   }
   if (args.batches.length === 0) throw new Error(`--batch is required. ${USAGE}`);
@@ -53,15 +56,28 @@ export function parseReportArgs(raw: readonly string[]): ReportArgs {
   return args;
 }
 
-/** The batch's pairwise cases and, of those, the ones with a human choice. */
-export function labelledPairs(cases: readonly GoldenCase[], batches: readonly string[]): { inBatch: GoldenCase[]; labelled: Array<{ c: GoldenCase; human: PairwiseChoice }> } {
+/**
+ * The batch's pairwise cases and, of those, the ones with a human choice. A choice an AI wrote is counted in
+ * `aiLabelled` and left out of `labelled` unless `includeAiLabels` is set.
+ */
+export function labelledPairs(
+  cases: readonly GoldenCase[],
+  batches: readonly string[],
+  includeAiLabels = false,
+): { inBatch: GoldenCase[]; labelled: Array<{ c: GoldenCase; human: PairwiseChoice }>; aiLabelled: number } {
   const inBatch = cases.filter((c) => c.pair !== undefined && batches.includes(c.pair.batch));
   const labelled: Array<{ c: GoldenCase; human: PairwiseChoice }> = [];
+  let aiLabelled = 0;
   for (const c of inBatch) {
     const human = c.labels[PAIRWISE_CRITERION];
-    if (isPairwiseLabel(human)) labelled.push({ c, human });
+    if (!isPairwiseLabel(human)) continue;
+    if (isAiLabelled(c)) {
+      aiLabelled++;
+      if (!includeAiLabels) continue;
+    }
+    labelled.push({ c, human });
   }
-  return { inBatch, labelled };
+  return { inBatch, labelled, aiLabelled };
 }
 
 function pct(x: number): string {
@@ -81,11 +97,20 @@ export function formatCalibrationReport(input: {
   judgeErrors: number;
   agreement: PairwiseAgreement | null;
   model?: string;
+  /** Pairs whose choice an AI wrote, and whether they are counted below (advisory) or left out. */
+  aiLabelled?: { count: number; included: boolean };
 }): string {
   const lines = [
     `Creative calibration ${input.batches.join(', ')}: ${input.humanChoices.length}/${input.inBatch} pairs labelled`,
     `Human: ${tally(input.humanChoices)}`,
   ];
+  if (input.aiLabelled && input.aiLabelled.count > 0) {
+    lines.push(
+      input.aiLabelled.included
+        ? `Includes ${input.aiLabelled.count} AI-written choice(s): ADVISORY, not human agreement`
+        : `${input.aiLabelled.count} AI-written choice(s) left out (--include-ai-labels counts them as advisory)`,
+    );
+  }
   if (input.model) lines.push(`Judge: ${input.model} (pairwise, advisory); errors ${input.judgeErrors}`);
   const a = input.agreement;
   if (!a) {
@@ -149,10 +174,11 @@ async function main(): Promise<void> {
   const args = parseReportArgs(argv.slice(2));
   const store = goldenSetStoreFromEnv();
   if (!store.isProvisioned()) throw new Error(`Golden-set store not provisioned: set ${GOLDEN_CASES_TABLE_ENV} (OPS-2 / ENG-2147).`);
-  const { inBatch, labelled } = labelledPairs(await store.listCases('creative'), args.batches);
+  const { inBatch, labelled, aiLabelled } = labelledPairs(await store.listCases('creative'), args.batches, args.includeAiLabels);
   const humanChoices = labelled.map((l) => l.human);
+  const aiNote = { count: aiLabelled, included: args.includeAiLabels };
   if (!args.judge) {
-    console.log(formatCalibrationReport({ batches: args.batches, inBatch: inBatch.length, humanChoices, judgeErrors: 0, agreement: null }));
+    console.log(formatCalibrationReport({ batches: args.batches, inBatch: inBatch.length, humanChoices, judgeErrors: 0, agreement: null, aiLabelled: aiNote }));
     return;
   }
 
@@ -172,6 +198,7 @@ async function main(): Promise<void> {
       judgeErrors,
       agreement: rows.length > 0 ? pairwiseAgreement(rows) : null,
       model: args.model,
+      aiLabelled: aiNote,
     }),
   );
 }
