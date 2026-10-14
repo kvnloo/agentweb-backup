@@ -358,6 +358,55 @@ describe('agentToolGatewayService', () => {
         expect(result.repairs).toEqual([]);
       });
 
+      describe('evaluate source alias -> function (ENG-2473)', () => {
+        // Repro from live telemetry: playwright_browser_evaluate {"expression": "..."} rejected with
+        // 'Unknown argument "expression". ... Missing required argument "function".'
+        const evaluateSchema = {
+          type: 'object',
+          properties: {
+            function: { type: 'string' },
+            element: { type: 'string' },
+            ref: { type: 'string' },
+            filename: { type: 'string' },
+          },
+          required: ['function'],
+        };
+
+        it.each(['expression', 'script', 'js', 'code'])('maps %s to function', (alias) => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'playwright_browser_evaluate',
+            args: { [alias]: '() => document.title' },
+            inputSchema: evaluateSchema,
+            effect: 'read',
+          });
+          expect(result.status).toBe('repaired');
+          expect(result.args).toEqual({ function: '() => document.title' });
+          expect(result.repairs).toEqual(expect.arrayContaining([`${alias}->function`]));
+        });
+
+        it('does not overwrite an existing function argument', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'playwright_browser_evaluate',
+            args: { function: '() => 1', expression: '() => 2' },
+            inputSchema: evaluateSchema,
+            effect: 'read',
+          });
+          expect(result.repairs).not.toEqual(expect.arrayContaining(['expression->function']));
+          expect(result.args).toMatchObject({ function: '() => 1' });
+        });
+
+        it('does not map expression when the schema has no function property', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'other_tool',
+            args: { expression: 'x' },
+            inputSchema: { type: 'object', properties: { query: { type: 'string' } }, required: [] },
+            effect: 'read',
+          });
+          expect(result.repairs).not.toEqual(expect.arrayContaining(['expression->function']));
+          expect(result.args).not.toHaveProperty('function');
+        });
+      });
+
       describe('number/boolean -> string (ENG-2472)', () => {
         // Repro from live telemetry: call_hubspot_api {"list_id":17} rejected with
         // 'Argument "list_id" has the wrong type. Expected string.' three times in a row.
