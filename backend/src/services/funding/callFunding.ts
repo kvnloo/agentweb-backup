@@ -4,12 +4,17 @@
  * usable key for THAT call's provider. This resolves it, so the transport and the usage
  * record both see the funding that actually pays for the call, not the run's ambient one.
  *
- * Dark by default: nothing leaves AgentWeb funding unless BYOK is enabled for the account
- * that would pay AND a provisioner is registered (the OpenRouter-key half, ENG-2383).
+ * THE RULE THIS FILE EXISTS TO KEEP: a customer who has a key for the call's provider is
+ * never silently served on AgentWeb's account. Their connection being pending, failed,
+ * suspended, not yet provisioned, or the lookup failing all END THE CALL with a
+ * CustomerRouteError; they do not fall back to AgentWeb. (A4 will let the user choose to
+ * spend AgentWeb quota, explicitly.) AgentWeb funding is only returned when BYOK is off
+ * for the account, or the user has no connection for this provider at all.
  */
 import type { RunFunding } from "./runFunding";
 import { getCustomerRouteProvisioner } from "./transport/customerRouteProvisioner";
 import { CustomerRouteError } from "./transport/apiKeyTransport";
+import type { LlmConnectionView } from "./llmConnectionService";
 
 /** Registry lab -> the BYOK provider names A1 stores. Any other lab stays AgentWeb-funded. */
 const BYOK_PROVIDER_BY_LAB: Record<string, string> = {
@@ -20,6 +25,8 @@ const BYOK_PROVIDER_BY_LAB: Record<string, string> = {
 
 /** Longest the connection lookup may take before the call is treated as unresolvable. */
 export const CONNECTION_LOOKUP_TIMEOUT_MS = 3_000;
+/** How long a routing answer is reused per (user, provider); keeps the per-call cost down. */
+export const ROUTING_CACHE_TTL_MS = 10_000;
 
 export interface CallFunding extends RunFunding {
   /** The usable same-provider connections in the order to try them (A4's fallback list). */
@@ -41,16 +48,22 @@ export interface ResolveCallFundingInput {
   /**
    * True for a caller that can serve an `anthropic` key by calling Anthropic directly
    * (the coding agent already speaks the Messages format). Such a call needs no
-   * OpenRouter key, so it does not wait for a provisioner; every other provider still does.
+   * OpenRouter key, so it does not wait for provisioning; every other caller does.
    */
   canCallAnthropicDirect?: boolean;
 }
 
+type RoutingState = { hasConnection: boolean; usable: LlmConnectionView[] };
+const routingCache = new Map<string, { at: number; state: RoutingState }>();
+
+export function __resetCallFundingCacheForTests(): void {
+  routingCache.clear();
+}
+
 /**
- * Returns `runFunding` itself whenever the call stays on AgentWeb, so a caller can pass
- * the result straight on. A failed connection lookup leaves the call AgentWeb-funded,
- * exactly as before this existed, EXCEPT for a run with `fallback: 'stop'`, which throws
- * `CustomerRouteError('lookup_failed')` rather than quietly billing AgentWeb.
+ * Returns `runFunding` itself whenever the call stays on AgentWeb (BYOK off, or no
+ * connection for this provider), so a caller can pass the result straight on. Throws
+ * `CustomerRouteError` for a customer who has a key that cannot serve this call.
  */
 export async function resolveCallFunding(
   runFunding: RunFunding | undefined,
@@ -60,40 +73,58 @@ export async function resolveCallFunding(
   if (!input.userId || !input.customerRoutable) return runFunding;
   const provider = input.modelLab ? BYOK_PROVIDER_BY_LAB[input.modelLab] : undefined;
   if (!provider) return runFunding;
-  if (!getCustomerRouteProvisioner() && !(provider === "anthropic" && input.canCallAnthropicDirect)) return runFunding;
 
+  // Cheap, cached switch check first, so a call from an account with BYOK off never pays
+  // for a connection lookup. `getFundingFlags` never throws and keeps the last good value
+  // across a failed read.
+  const { getFundingFlags } = require("./fundingFlags") as typeof import("./fundingFlags");
+  const flags = await getFundingFlags();
+  if (flags.killSwitch || !flags.byok.enabled) return runFunding;
+
+  const state = await lookupRoutingState(input.userId, provider);
+  if (!state.hasConnection) return runFunding;
+
+  // What can serve THIS caller: a direct-Anthropic caller needs only an active key; every
+  // other caller goes through OpenRouter and needs a provisioned connection. Nothing is
+  // provisioned yet, so those callers have no routable connection and fail closed.
+  const routable = state.usable.filter(
+    (connection) =>
+      connection.kind === "api_key" &&
+      connection.status === "active" &&
+      (provider === "anthropic" && input.canCallAnthropicDirect ? true : !!getCustomerRouteProvisioner()),
+  );
+  if (routable.length === 0) throw new CustomerRouteError("connection_unavailable");
+
+  const first = routable[0];
+  return {
+    ...runFunding,
+    route: "api_key",
+    // A customer-funded call never inherits the run's `agentweb` fallback: until the user
+    // has explicitly chosen another policy (a later ticket), a failure of their own key stops the call.
+    fallback: "stop",
+    connectionId: first.connectionId,
+    provider,
+    fundingPrincipalId: first.ownerUserId,
+    candidates: routable.map((c) => ({ connectionId: c.connectionId, fundingPrincipalId: c.ownerUserId })),
+  };
+}
+
+async function lookupRoutingState(userId: string, provider: string): Promise<RoutingState> {
+  const key = `${userId}|${provider}`;
+  const cached = routingCache.get(key);
+  if (cached && Date.now() - cached.at < ROUTING_CACHE_TTL_MS) return cached.state;
   try {
-    // Cheap, cached switch check first, so a call from an account with BYOK off never
-    // pays for a connection lookup.
-    const { getFundingFlags } = require("./fundingFlags") as typeof import("./fundingFlags");
-    const flags = await getFundingFlags();
-    if (flags.killSwitch || !flags.byok.enabled) return runFunding;
-
     // Lazy: the connection service pulls in the AWS SDK graph (see runFunding.ts).
     const { getLlmConnectionService } = require("./llmConnectionService") as typeof import("./llmConnectionService");
-    const usable = (await withTimeout(getLlmConnectionService().listUsableForUser(input.userId), CONNECTION_LOOKUP_TIMEOUT_MS)).filter(
-      (connection) => connection.kind === "api_key" && connection.status === "active" && connection.provider === provider,
-    );
-    if (usable.length === 0) return runFunding;
-    const first = usable[0];
-    return {
-      ...runFunding,
-      route: "api_key",
-      connectionId: first.connectionId,
-      provider,
-      fundingPrincipalId: first.ownerUserId,
-      candidates: usable.map((c) => ({ connectionId: c.connectionId, fundingPrincipalId: c.ownerUserId })),
-    };
+    const state = await withTimeout(getLlmConnectionService().routingStateFor(userId, provider), CONNECTION_LOOKUP_TIMEOUT_MS);
+    routingCache.set(key, { at: Date.now(), state });
+    return state;
   } catch (error) {
     const code = (error as { code?: string })?.code || (error as Error)?.name || "error";
-    // A run that must never be billed to AgentWeb does not quietly become AgentWeb-paid
-    // because a lookup failed: the call fails and the caller sees why.
-    if (runFunding.fallback === "stop") {
-      console.error(`[resolveCallFunding] connection lookup failed; run is fallback=stop, failing the call: ${code}`);
-      throw new CustomerRouteError("lookup_failed");
-    }
-    console.error(`[resolveCallFunding] connection lookup failed; call stays AgentWeb-funded: ${code}`);
-    return runFunding;
+    // BYOK is on and we cannot tell whether this customer has a key: ending the call is
+    // the only answer that cannot bill AgentWeb for a customer's usage.
+    console.error(`[resolveCallFunding] connection lookup failed; failing the call: ${code}`);
+    throw new CustomerRouteError("lookup_failed");
   }
 }
 

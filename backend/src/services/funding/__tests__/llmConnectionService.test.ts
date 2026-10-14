@@ -418,6 +418,62 @@ describe('LlmConnectionService', () => {
     });
   });
 
+  describe('routing state for a provider (ENG-2108)', () => {
+    it('reports a usable own key, and that a connection exists', async () => {
+      const { service } = setup();
+      const { connectionId } = await service.add({ userId: 'solo' }, { provider: 'anthropic', apiKey: KEY_A });
+      const state = await service.routingStateFor('solo', 'anthropic');
+      expect(state.hasConnection).toBe(true);
+      expect(state.usable.map((c) => c.connectionId)).toEqual([connectionId]);
+    });
+
+    it('still says a connection exists when the key is invalid and so cannot serve (never "no connection")', async () => {
+      const { service, validateKey } = setup();
+      const { connectionId } = await service.add({ userId: 'solo' }, { provider: 'anthropic', apiKey: KEY_A });
+      validateKey.mockResolvedValueOnce('invalid_key');
+      await service.validate({ userId: 'solo' }, connectionId);
+      expect(await service.routingStateFor('solo', 'anthropic')).toEqual({ hasConnection: true, usable: [] });
+    });
+
+    it('treats a revoked connection as no connection: revoking is how a customer says they are done', async () => {
+      const { service } = setup();
+      const { connectionId } = await service.add({ userId: 'solo' }, { provider: 'anthropic', apiKey: KEY_A });
+      await service.revoke({ userId: 'solo' }, connectionId);
+      expect(await service.routingStateFor('solo', 'anthropic')).toEqual({ hasConnection: false, usable: [] });
+    });
+
+    it('only looks at the requested provider', async () => {
+      const { service } = setup();
+      await service.add({ userId: 'solo' }, { provider: 'openai', apiKey: KEY_B });
+      expect(await service.routingStateFor('solo', 'anthropic')).toEqual({ hasConnection: false, usable: [] });
+      expect((await service.routingStateFor('solo', 'openai')).hasConnection).toBe(true);
+    });
+
+    it('sees a key shared with the org by an owner, for a member', async () => {
+      const { service } = setup();
+      const { connectionId } = await service.add({ userId: 'owner-1' }, { provider: 'anthropic', apiKey: KEY_A, shareWithOrg: true });
+      const state = await service.routingStateFor('member', 'anthropic');
+      expect(state.hasConnection).toBe(true);
+      expect(state.usable.map((c) => c.connectionId)).toEqual([connectionId]);
+    });
+
+    it('does not see a shared key once its sharer is no longer an owner of the org, or a key shared with another org', async () => {
+      const { service, users } = setup();
+      await service.add({ userId: 'owner-1' }, { provider: 'anthropic', apiKey: KEY_A, shareWithOrg: true });
+      expect((await service.routingStateFor('outsider', 'anthropic')).hasConnection).toBe(false);
+      users['owner-1'] = { userId: 'owner-1', orgId: 'org-9', orgRole: 'owner' };
+      expect(await service.routingStateFor('member', 'anthropic')).toEqual({ hasConnection: false, usable: [] });
+    });
+
+    it('reports nothing when BYOK is switched off for the account that pays', async () => {
+      const { service, enabled } = setup();
+      await service.add({ userId: 'owner-1' }, { provider: 'anthropic', apiKey: KEY_A, shareWithOrg: true });
+      enabled.delete('owner-1');
+      expect(await service.routingStateFor('member', 'anthropic')).toEqual({ hasConnection: false, usable: [] });
+      expect(await service.routingStateFor('owner-1', 'anthropic')).toEqual({ hasConnection: false, usable: [] });
+    });
+  });
+
   describe('using keys for a run', () => {
     it('returns the raw key only to the owner or to a member of the org it is shared with', async () => {
       const { service } = setup();

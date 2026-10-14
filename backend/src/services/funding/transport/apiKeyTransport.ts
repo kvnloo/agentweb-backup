@@ -41,7 +41,13 @@ export function pinToCustomerProvider(provider: Record<string, unknown> | undefi
 
 export class CustomerRouteError extends Error {
   constructor(
-    readonly code: "not_provisioned" | "unsupported_provider" | "no_connection" | "lookup_failed" | "unsupported_route",
+    readonly code:
+      | "not_provisioned"
+      | "unsupported_provider"
+      | "no_connection"
+      | "lookup_failed"
+      | "unsupported_route"
+      | "connection_unavailable",
   ) {
     super(`customer-funded route unavailable (${code})`);
     this.name = "CustomerRouteError";

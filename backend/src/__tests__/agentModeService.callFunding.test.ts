@@ -40,9 +40,9 @@ jest.mock('../services/funding/recordLlmUsage', () => ({
   ...jest.requireActual('../services/funding/recordLlmUsage'),
   recordLlmUsage: jest.fn(),
 }));
-const listUsableForUser = jest.fn();
+const routingStateFor = jest.fn();
 jest.mock('../services/funding/llmConnectionService', () => ({
-  getLlmConnectionService: () => ({ listUsableForUser }),
+  getLlmConnectionService: () => ({ routingStateFor }),
 }));
 const getFundingFlags = jest.fn();
 jest.mock('../services/funding/fundingFlags', () => ({
@@ -53,6 +53,7 @@ import { AgentModeService } from '../services/agentModeService';
 import { recordLlmUsage } from '../services/funding/recordLlmUsage';
 import { withRunFunding, type RunFunding } from '../services/funding/runFunding';
 import { registerCustomerRouteProvisioner } from '../services/funding/transport/customerRouteProvisioner';
+import { __resetCallFundingCacheForTests } from '../services/funding/callFunding';
 
 /**
  * ENG-2108 (A2): callLLM funds each call from the key that actually pays, and the usage
@@ -95,7 +96,11 @@ describe('callLLM per-call funding (ENG-2108)', () => {
     jest.clearAllMocks();
     process.env.OPENROUTER_API_KEY = 'platform-key';
     getFundingFlags.mockResolvedValue({ killSwitch: false, byok: { enabled: true, allowUserIds: ['*'] } });
-    listUsableForUser.mockResolvedValue([connection]);
+    __resetCallFundingCacheForTests();
+    // Provider-aware, like the real service: only the Anthropic key exists.
+    routingStateFor.mockImplementation(async (_user: string, provider: string) =>
+      provider === 'anthropic' ? { hasConnection: true, usable: [connection] } : { hasConnection: false, usable: [] },
+    );
   });
   afterEach(() => registerCustomerRouteProvisioner(null));
 
@@ -135,7 +140,7 @@ describe('callLLM per-call funding (ENG-2108)', () => {
 
     expect(customerCreate).not.toHaveBeenCalled();
     expect(platformCreate).toHaveBeenCalledTimes(1);
-    expect(listUsableForUser).not.toHaveBeenCalled();
+    expect(routingStateFor).not.toHaveBeenCalled();
   });
 
   it('drops fallback models from another lab on a customer key, and keeps same-lab ones', async () => {
@@ -173,6 +178,27 @@ describe('callLLM per-call funding (ENG-2108)', () => {
     expect(platformCreate).not.toHaveBeenCalled();
   });
 
+  it('ENDS the call, and never serves it on AgentWeb, when the customer has a key that cannot serve (the headline bug)', async () => {
+    const { service, platformCreate, customerCreate } = setup();
+    // The customer has an Anthropic key, but it is not usable right now (invalid, pending, ...).
+    routingStateFor.mockImplementation(async () => ({ hasConnection: true, usable: [] }));
+    await expect(call(service, CLAUDE, 'agent_task:interactive')).rejects.toMatchObject({ code: 'connection_unavailable' });
+
+    expect(platformCreate).not.toHaveBeenCalled();
+    expect(customerCreate).not.toHaveBeenCalled();
+    expect(recordLlmUsage).not.toHaveBeenCalled();
+  });
+
+  it('ENDS the call, and never serves it on AgentWeb, when the connection lookup fails', async () => {
+    const { service, platformCreate } = setup();
+    const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    routingStateFor.mockRejectedValue(Object.assign(new Error('x'), { code: 'ThrottlingException' }));
+    await expect(call(service, CLAUDE, 'agent_task:interactive')).rejects.toMatchObject({ code: 'lookup_failed' });
+    spy.mockRestore();
+
+    expect(platformCreate).not.toHaveBeenCalled();
+  });
+
   it('rejects an unknown fallback model on a customer key exactly as on an AgentWeb call', async () => {
     const { service } = setup();
     await expect(call(service, CLAUDE, 'agent_task:interactive', { fallbackModels: ['openrouter/no/such-model'] })).rejects.toThrow(/fallback model/i);
@@ -186,7 +212,7 @@ describe('callLLM per-call funding (ENG-2108)', () => {
 
     expect(customerCreate).not.toHaveBeenCalled();
     expect(platformCreate).toHaveBeenCalledTimes(1);
-    expect(listUsableForUser).not.toHaveBeenCalled();
+    expect(routingStateFor).not.toHaveBeenCalled();
     expect(fundingSeen()).toEqual([expect.objectContaining({ route: 'agentweb' })]);
   });
 
