@@ -697,7 +697,7 @@ describe('round 4: share viewers and the first-step baseline', () => {
   });
 
   it('on a MODEL-LESS step a viewer\'s pick still runs for the turn, with no plan write', async () => {
-    mkStore({ steps: [step(1, 'pending'), step(2, 'pending', 'gpt-5.5')], ...base, engineModel: 'gpt-5-chat-2' }, 'claude-step-model');
+    mkStore({ steps: [step(1, 'pending'), step(2, 'pending', 'gpt-5.5')], ...base, engineModel: 'gpt-5.5' }, 'claude-step-model');
     await generateSessionResponse(SESSION_ID, 'go', OWNER, 'claude-step-model', undefined, true);
     expect(workerModels()).toEqual(['claude-step-model']);
     expect(db.updateSessionWorkPlan).not.toHaveBeenCalled();
