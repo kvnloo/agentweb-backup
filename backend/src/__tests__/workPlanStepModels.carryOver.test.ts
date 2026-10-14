@@ -71,9 +71,11 @@ describe('carryStoredStepModels', () => {
     const out = carryStoredStepModels([{ stepCount: 1, title: 'Beta' }, { stepCount: 2, title: 'Alpha' }], stored);
     expect(out.map((s: any) => s.model)).toEqual(['claude-sonnet-x', 'gpt-5-chat']);
   });
-  it('falls back to stepCount only for a renamed step whose old title is gone', () => {
-    const out = carryStoredStepModels([{ stepCount: 1, title: 'Alpha renamed' }, { stepCount: 2, title: 'Beta' }], stored);
-    expect(out.map((s: any) => s.model)).toEqual(['gpt-5-chat', 'claude-sonnet-x']);
+  it('a step renamed in place (same count, nothing else moved) keeps its model', () => {
+    const out = carryStoredStepModels([{ stepCount: 1, title: 'Alpha' }, { stepCount: 2, title: 'Beta' }, { stepCount: 3, title: 'Gamma renamed' }], stored);
+    expect(out.map((s: any) => s.model)).toEqual(['gpt-5-chat', 'claude-sonnet-x', undefined]);
+    const renamed = carryStoredStepModels([{ stepCount: 1, title: 'Alpha' }, { stepCount: 2, title: 'Beta renamed' }, { stepCount: 3, title: 'Gamma' }], stored);
+    expect(renamed.map((s: any) => s.model)).toEqual(['gpt-5-chat', 'claude-sonnet-x', undefined]);
   });
   it('does not hand a model to a different step that merely took over the number', () => {
     // Alpha moved to slot 2 and Beta was deleted: a brand-new step at slot 1 must NOT inherit Alpha's model
@@ -83,6 +85,51 @@ describe('carryStoredStepModels', () => {
   it('never overrides a model the step already carries, and leaves model-less stored steps alone', () => {
     const out = carryStoredStepModels([{ stepCount: 1, title: 'Alpha', model: 'claude-sonnet-x' }, { stepCount: 3, title: 'Gamma' }], stored);
     expect(out.map((s: any) => s.model)).toEqual(['claude-sonnet-x', undefined]);
+  });
+});
+
+describe('carryStoredStepModels: duplicates, deletes and renames never bind the wrong model (round 2)', () => {
+  const m = (steps: any[]) => steps.map((s) => s.model);
+  it('N1: duplicated titles keep their own models (matched by slot when the title is ambiguous)', () => {
+    const stored = [{ stepCount: 1, title: 'Review', model: 'm1' }, { stepCount: 2, title: 'Review', model: 'm2' }];
+    expect(m(carryStoredStepModels([{ stepCount: 1, title: 'Review' }, { stepCount: 2, title: 'Review' }], stored))).toEqual(['m1', 'm2']);
+  });
+  it('N1: a duplicated title at a DIFFERENT slot does not guess (first hit must not win)', () => {
+    const stored = [{ stepCount: 1, title: 'Review', model: 'm1' }, { stepCount: 2, title: 'Review', model: 'm2' }];
+    const stored2 = [{ stepCount: 1, title: 'Review', description: 'old', model: 'm1' }, { stepCount: 2, title: 'Review', model: 'm2' }];
+    // slot 1 was replaced by a different step (different content): it must not inherit m1; slot 2 keeps m2
+    expect(m(carryStoredStepModels([{ stepCount: 1, title: 'Intro', description: 'new' }, { stepCount: 2, title: 'Review' }], stored2))).toEqual([undefined, 'm2']);
+    expect(m(carryStoredStepModels([{ stepCount: 1, title: 'Intro' }, { stepCount: 2, title: 'Other' }, { stepCount: 3, title: 'Review' }], stored))).toEqual([undefined, undefined, undefined]);
+  });
+  it('N1: two incoming steps with one title cannot both inherit the single stored model', () => {
+    const stored = [{ stepCount: 1, title: 'Review', model: 'm1' }];
+    expect(m(carryStoredStepModels([{ stepCount: 1, title: 'Review' }, { stepCount: 2, title: 'Review' }], stored))).toEqual(['m1', undefined]);
+  });
+  it('N2: delete + rename drops the model instead of binding another step\'s', () => {
+    const stored = [{ stepCount: 1, title: 'Draft', model: 'm1' }, { stepCount: 2, title: 'Review', model: 'm2' }];
+    expect(m(carryStoredStepModels([{ stepCount: 1, title: 'Review v2' }], stored))).toEqual([undefined]);
+  });
+  it('N2: a same-count replacement with different content is not a rename', () => {
+    const stored = [{ stepCount: 1, title: 'Draft', description: 'write it', model: 'm1' }, { stepCount: 2, title: 'Ship' }];
+    expect(m(carryStoredStepModels([{ stepCount: 1, title: 'Plan the launch', description: 'plan it' }, { stepCount: 2, title: 'Ship' }], stored))).toEqual([undefined, undefined]);
+    expect(m(carryStoredStepModels([{ stepCount: 1, title: 'Draft v2', description: 'write it' }, { stepCount: 2, title: 'Ship' }], stored))).toEqual(['m1', undefined]);
+  });
+  it('N2: two renames at once (ambiguous) drop; a lone in-place rename with the same count keeps', () => {
+    const stored = [{ stepCount: 1, title: 'Draft', model: 'm1' }, { stepCount: 2, title: 'Review', model: 'm2' }, { stepCount: 3, title: 'Ship' }];
+    expect(m(carryStoredStepModels([{ stepCount: 1, title: 'Draft 2' }, { stepCount: 2, title: 'Review 2' }, { stepCount: 3, title: 'Ship' }], stored))).toEqual([undefined, undefined, undefined]);
+    expect(m(carryStoredStepModels([{ stepCount: 1, title: 'Draft' }, { stepCount: 2, title: 'Review renamed' }, { stepCount: 3, title: 'Ship' }], stored))).toEqual(['m1', 'm2', undefined]);
+  });
+  it('N2: with a different count a rename is never bound by position (insert / delete around it)', () => {
+    const stored = [{ stepCount: 1, title: 'Draft', model: 'm1' }, { stepCount: 2, title: 'Review', model: 'm2' }];
+    expect(m(carryStoredStepModels([{ stepCount: 1, title: 'New first' }, { stepCount: 2, title: 'Draft' }, { stepCount: 3, title: 'Review renamed' }], stored))).toEqual([undefined, 'm1', undefined]);
+  });
+  it('reorder and insert still follow the title', () => {
+    const stored = [{ stepCount: 1, title: 'A', model: 'mA' }, { stepCount: 2, title: 'B', model: 'mB' }];
+    expect(m(carryStoredStepModels([{ stepCount: 1, title: 'B' }, { stepCount: 2, title: 'Inserted' }, { stepCount: 3, title: 'A' }], stored))).toEqual(['mB', undefined, 'mA']);
+  });
+  it('a stored step is consumed at most once (no reuse by a later incoming step)', () => {
+    const stored = [{ stepCount: 1, title: 'A', model: 'mA' }];
+    expect(m(carryStoredStepModels([{ stepCount: 1, title: 'A' }, { stepCount: 1, title: 'A' }], stored))).toEqual(['mA', undefined]);
   });
 });
 
@@ -116,6 +163,15 @@ describe.each([
   it.each(['off', 'unknown'] as const)('switch %s: a payload LACKING model (portal / MCP round trip) keeps the stored models', async (state) => {
     mockState = state;
     const res = await request(app).put(`${base}/p1`).send({ title: 'Edited', steps: full(false) });
+    expect(res.status).toBe(200);
+    expect(mockStore.get('p1').steps.map((s: any) => s.model)).toEqual(['gpt-5-chat', 'claude-sonnet-x']);
+  });
+
+  it.each(['off', 'unknown'] as const)('N1 switch %s: duplicate titles keep their own stored models on a full-step payload lacking model', async (state) => {
+    mockState = state;
+    mockStore.set('p1', { planId: 'p1', title: 'T', visibility: 'private', ownerId: 'user-1', steps: [
+      { stepCount: 1, title: 'Review', description: 'a', model: 'gpt-5-chat' }, { stepCount: 2, title: 'Review', description: 'b', model: 'claude-sonnet-x' }] });
+    const res = await request(app).put(`${base}/p1`).send({ steps: [{ stepCount: 1, title: 'Review', description: 'a' }, { stepCount: 2, title: 'Review', description: 'b' }] });
     expect(res.status).toBe(200);
     expect(mockStore.get('p1').steps.map((s: any) => s.model)).toEqual(['gpt-5-chat', 'claude-sonnet-x']);
   });

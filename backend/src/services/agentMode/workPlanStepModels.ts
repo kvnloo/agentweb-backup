@@ -136,12 +136,29 @@ function storedCounterpart(stored: StepLike[], step: StepLike, index: number): S
 
 const normTitle = (value: unknown): string => (typeof value === 'string' ? value.trim().toLowerCase() : '');
 
+const CONTENT_KEYS = ['description', 'userInstructions', 'requiredFunctionCalls', 'skillIds'] as const;
+const emptyish = (v: unknown) => v === undefined || v === null || v === '' || (Array.isArray(v) && v.length === 0);
+/** A rename keeps what the step says; a replacement does not. Compared on the descriptive fields only. */
+function sameStepContent(a: StepLike, b: StepLike): boolean {
+  return CONTENT_KEYS.every((k) => {
+    const x = (a as any)?.[k];
+    const y = (b as any)?.[k];
+    return (emptyish(x) && emptyish(y)) || JSON.stringify(x) === JSON.stringify(y);
+  });
+}
+
 /**
  * Carry the STORED model of the matching existing step onto each incoming step that does not carry one, so a write
- * can never erase a stored model by omission. Matching binds a model to its STEP, not to a slot: by unique title
- * first; a step whose title is blank matches by stepCount; a renamed step (old title no longer present among the
- * incoming titles) matches by stepCount. A different step that merely took over a number gets nothing. Each stored
- * step is used at most once. `allow(i)` lets the caller exempt steps (e.g. an explicit clear).
+ * can never erase a stored model by omission. A wrong model is worse than none, so a step only inherits a model when
+ * the match is unambiguous; in doubt it gets none:
+ *  1. by title: a title held by exactly one stored step AND one incoming step matches that pair; when a title is
+ *     duplicated (either side) a step matches the stored step with the same title at the SAME stepCount, nothing else;
+ *  2. a rename: only when the incoming list has exactly as many steps as the stored one, exactly ONE incoming and
+ *     ONE stored step are left unmatched at the same stepCount, and they say the same thing (description,
+ *     instructions, required calls, skills: a replacement does not). With a different count (an insert or delete around
+ *     the rename), several unmatched steps or changed content, nothing is bound by position.
+ * Each stored step is used at most once. `allow(i)` lets the caller exempt steps (e.g. an explicit clear); exempt and
+ * model-carrying steps still take part in the matching so they cannot lend their counterpart's model to another step.
  */
 export function carryStoredStepModels<T extends StepLike>(
   incoming: ReadonlyArray<T>,
@@ -150,32 +167,49 @@ export function carryStoredStepModels<T extends StepLike>(
 ): T[] {
   const storedSteps = [...(stored ?? [])];
   if (!storedSteps.some((s) => stepModelOf(s))) return [...incoming];
-  const incomingTitles = new Set(incoming.map((s) => normTitle(s?.title)).filter(Boolean));
+
+  const matchOf = new Map<number, number>(); // incoming index -> stored index
   const claimed = new Set<number>();
-  const byTitle = (title: string) => storedSteps
-    .map((s, i) => ({ s, i }))
-    .filter(({ s, i }) => !claimed.has(i) && normTitle(s?.title) === title);
-  return incoming.map((step, index) => {
-    if (!allow(index) || stepModelOf(step) || (step as StepLike)?.model === '') return step;
+  const claim = (i: number, j: number) => { matchOf.set(i, j); claimed.add(j); };
+  const count = <U extends StepLike>(list: ReadonlyArray<U>, title: string) => list.filter((x) => normTitle(x?.title) === title).length;
+
+  incoming.forEach((step, i) => {
     const title = normTitle(step?.title);
-    let match: { s: StepLike; i: number } | undefined;
-    if (title) {
-      const hits = byTitle(title);
-      if (hits.length === 1) match = hits[0];
+    if (!title) return;
+    const hits = storedSteps.map((s, j) => ({ s, j })).filter(({ s, j }) => !claimed.has(j) && normTitle(s?.title) === title);
+    if (hits.length === 0) return;
+    if (hits.length === 1 && count(storedSteps, title) === 1 && count(incoming, title) === 1) {
+      claim(i, hits[0].j);
+      return;
     }
-    if (!match) {
-      const n = Number(step?.stepCount);
-      if (Number.isFinite(n) && n > 0) {
-        const hit = storedSteps.findIndex((s, i) => !claimed.has(i) && Number(s?.stepCount) === n);
-        // a renamed step: its stored title is not among the incoming titles (else it moved elsewhere)
-        if (hit !== -1 && (!title || !incomingTitles.has(normTitle(storedSteps[hit]?.title)))) {
-          match = { s: storedSteps[hit], i: hit };
-        }
-      }
+    const n = Number(step?.stepCount);
+    const sameSlot = hits.find(({ s }) => Number(s?.stepCount) === n);
+    if (sameSlot) claim(i, sameSlot.j);
+  });
+
+  // A blank-titled incoming step (partial payload) can only be identified by its number.
+  incoming.forEach((step, i) => {
+    if (matchOf.has(i) || normTitle(step?.title)) return;
+    const n = Number(step?.stepCount);
+    const j = storedSteps.findIndex((s, k) => !claimed.has(k) && Number(s?.stepCount) === n);
+    if (j !== -1) claim(i, j);
+  });
+
+  // Rename in place: nothing else moved (same count) and exactly one step on each side is left over.
+  if (incoming.length === storedSteps.length) {
+    const freeIncoming = incoming.map((_, i) => i).filter((i) => !matchOf.has(i));
+    const freeStored = storedSteps.map((_, j) => j).filter((j) => !claimed.has(j));
+    if (freeIncoming.length === 1 && freeStored.length === 1
+      && Number(incoming[freeIncoming[0]]?.stepCount) === Number(storedSteps[freeStored[0]]?.stepCount)
+      && sameStepContent(incoming[freeIncoming[0]], storedSteps[freeStored[0]])) {
+      claim(freeIncoming[0], freeStored[0]);
     }
-    if (!match) return step;
-    claimed.add(match.i);
-    const model = stepModelOf(match.s);
+  }
+
+  return incoming.map((step, i) => {
+    if (!allow(i) || stepModelOf(step) || (step as StepLike)?.model === '') return step;
+    const j = matchOf.get(i);
+    const model = j === undefined ? undefined : stepModelOf(storedSteps[j]);
     return model ? { ...step, model } : step;
   });
 }
