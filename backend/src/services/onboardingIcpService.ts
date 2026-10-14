@@ -549,7 +549,7 @@ export async function writeIcpCard(
   // card again, not re-run `resolve`: a positional ref such as `icp-2` names
   // whatever sits at position 2 NOW, which after a concurrent delete is a different
   // card.
-  let target: { idKnown: boolean; id: unknown; fingerprint: Record<string, unknown>; index: number; length: number } | null = null;
+  let target: { idKnown: boolean; id: unknown; fingerprint: Record<string, unknown>; index: number; length: number; twins: number } | null = null;
 
   for (let attempt = 0; attempt < MAX_CARD_WRITE_ATTEMPTS; attempt++) {
     const user: any = await readUserForRegeneration(userId);
@@ -562,11 +562,20 @@ export async function writeIcpCard(
       if ("status" in resolved) return { ok: false, status: resolved.status };
       idx = resolved.index;
       const first: any = list[idx];
-      target = { idKnown: first?.id !== undefined, id: first?.id, fingerprint: fingerprintOf(first), index: idx, length: list.length };
+      const fingerprint = fingerprintOf(first);
+      // Id-less cards with identical text: once one of them changes, the survivor
+      // cannot be told from the card that was clicked.
+      const twins = first?.id !== undefined ? 1 : list.filter((p: any) => p?.id === undefined && sameFingerprint(p, fingerprint)).length;
+      target = { idKnown: first?.id !== undefined, id: first?.id, fingerprint, index: idx, length: list.length, twins };
     } else {
       // Same card by identity: its id, or, for a card stored before ids existed, its
       // visible text.
       const wanted = target;
+      if (!wanted.idKnown && wanted.twins > 1) {
+        // The write failed because this position changed; with look-alikes present, a
+        // lone survivor of the same text may be the OTHER card. Never guess.
+        throw Object.assign(new Error("the persona could not be re-identified"), { code: ICP_LIST_CONTENDED });
+      }
       const matches = list
         .map((p: any, i) => ({ i, p }))
         .filter(({ p }) => (wanted.idKnown ? p?.id === wanted.id : p?.id === undefined && sameFingerprint(p, wanted.fingerprint)));
