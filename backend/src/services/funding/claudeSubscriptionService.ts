@@ -469,3 +469,8 @@ export function getClaudeSubscriptionService(): ClaudeSubscriptionService {
   }
   return defaultService;
 }
+
+/** Shutdown hook: stops any pending sign-in CLI and wipes its dir. Does nothing if the service was never used. */
+export async function shutdownClaudeSubscriptionService(): Promise<void> {
+  await defaultService?.shutdown();
+}

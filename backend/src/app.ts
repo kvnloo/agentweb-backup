@@ -84,6 +84,7 @@ import mcpServersRoutes, { mcpOAuthPublicRouter } from "./routes/mcpServers";
 import metaToolkitRoutes from "./routes/metaToolkit";
 import { createToolBridgeRouter } from "./routes/toolBridge";
 import { createLlmConnectionsRouter } from "./routes/llmConnections";
+import { createClaudeSubscriptionRouter } from "./routes/claudeSubscription";
 import { toolBridgeMcp } from "./services/funding/toolBridgeService";
 import skillRoutes from "./routes/skillRoutes";
 import userSkillRoutes from "./routes/userSkillRoutes";
@@ -421,6 +422,9 @@ app.use("/api/internal", internalUsageRoutes);
 app.use("/internal/tool-bridge", createToolBridgeRouter(toolBridgeMcp));
 // ENG-2105: a customer's own LLM provider keys (BYOK). Adding or re-validating a key
 // is gated by the eng1816_funding_flags row; listing and revoking always work.
+// ENG-2110: connecting a Claude subscription (sign-in ceremony). Gated per user by the claudeSubscription flag.
+// Mounted before the generic router so its paths are never read as a connection id.
+app.use("/api/llm-connections/claude-subscription", createClaudeSubscriptionRouter());
 app.use("/api/llm-connections", createLlmConnectionsRouter());
 app.use("/api/config", configRouter);
 app.use("/api/browser-cookies", browserCookiesRouter);
