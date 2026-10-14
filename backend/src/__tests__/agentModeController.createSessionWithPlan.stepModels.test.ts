@@ -222,6 +222,17 @@ describe('createSessionWithPlan with per-step models', () => {
       // the persisted session plan is untouched (the engine needs it)
       expect((db.updateSessionWorkPlan.mock.calls[0][1].steps as any[])[0].model).toBe('gpt-5-chat');
     });
+    it('D6: the plan persisted on the session is not mutated by the response redaction', async () => {
+      mockGetUserFromToken.mockResolvedValue({ user: null });
+      publish([S(1, 'gpt-5-chat'), S(2)], { defaultModel: 'gpt-5-chat' });
+      let snapshot = '';
+      db.updateSessionWorkPlan.mockImplementation(async (_id: string, wp: any) => { snapshot = JSON.stringify(wp); return session as any; });
+      await agentModeController.createSessionWithPlan(req(), res());
+      const persisted = db.updateSessionWorkPlan.mock.calls[0][1];
+      expect(JSON.stringify(persisted)).toBe(snapshot);
+      expect(snapshot).toMatch(/launchModel/);
+      expect((persisted.steps as any[])[0].model).toBe('gpt-5-chat');
+    });
     it('authenticated owner: keeps step models but never the internal bookkeeping fields', async () => {
       publish([S(1, 'gpt-5-chat'), S(2)], { defaultModel: 'gpt-5-chat' });
       const r = res();

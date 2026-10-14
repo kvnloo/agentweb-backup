@@ -59,9 +59,11 @@ describe('share / conversable views redact step models and bookkeeping', () => {
     expectRedacted((r.json as jest.Mock).mock.calls[0][0]);
   });
 
-  it('the stored session object is not mutated by redaction', async () => {
+  it('D6: redaction works on a copy: the stored plan deep-equals its snapshot after every redacting response', async () => {
+    const snapshot = JSON.parse(JSON.stringify(session.workPlan));
     await agentModeController.getConversableSession({ params: { sessionId: 's1' }, conversableSession: session } as unknown as Request, res());
-    expect(session.workPlan.steps[0].model).toBe('secret-step-model');
-    expect(session.workPlan.launchModel).toBe('secret-launch');
+    expect(session.workPlan).toEqual(snapshot);
+    await agentModeController.getSharedConversation({ params: { shareId: 's1' }, query: {} } as unknown as Request, res());
+    expect(session.workPlan).toEqual(snapshot);
   });
 });

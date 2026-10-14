@@ -1326,6 +1326,15 @@ describe('Predefined Work Plan MCP Tools', () => {
       expect(putBody().steps.map((s: any) => s.model)).toEqual(['gpt-5-chat', undefined]);
     });
 
+    it('A7: an explicit blank model through a replace is the clear instruction: it is NOT re-filled from the stored plan', async () => {
+      mockFetches();
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update', plan_id: 'wp-m', confirm_step_removal: true,
+        steps: [{ stepCount: 1, title: 'One', description: 'd1', model: '' }, { stepCount: 2, title: 'Two', description: 'd2' }],
+      }, context);
+      expect(putBody().steps[0].model).toBe('');
+    });
+
     it('the step schema documents model so an LLM caller can see it', () => {
       const def = mcpToolRegistry.getToolDefinitions().find((d: any) => d.name === 'manage_predefined_work_plan') as any;
       expect(def.inputSchema.properties.steps.items.properties.model).toMatchObject({ type: 'string' });
