@@ -28,7 +28,7 @@
  */
 
 /** Bump on ANY change that can alter an output for an existing input; stored with every row. */
-export const TRAFFIC_CLASSIFIER_VERSION = '2.0.0';
+export const TRAFFIC_CLASSIFIER_VERSION = '2.1.0';
 
 export type ChannelGroup =
   | 'Paid'
@@ -613,6 +613,21 @@ function isInternal(refHost: string, ownHost: string): boolean {
 
 const SOURCE_DETAIL_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'ref', 'src', 'post'] as const;
 
+/** Paid variants of channels whose organic and paid traffic must read differently in reports. */
+export const PAID_CHANNEL_SPLIT: Readonly<Record<string, { key: string; name: string }>> = {
+  google_search: { key: 'google_ads', name: 'Google Ads' },
+  youtube: { key: 'youtube_ads', name: 'YouTube Ads' },
+};
+
+/**
+ * Maps a (channel, channelKey, paid) triple to its split channel. Pure and idempotent, so the same
+ * function serves live classification and a retroactive backfill of stored rows.
+ */
+export function splitPaidChannel(channel: string, channelKey: string, paid: boolean): { channel: string; channelKey: string } {
+  const split = paid ? PAID_CHANNEL_SPLIT[channelKey] : undefined;
+  return split ? { channel: split.name, channelKey: split.key } : { channel, channelKey };
+}
+
 export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassification {
   const safe = input && typeof input === 'object' ? input : {};
 
@@ -714,6 +729,10 @@ export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassi
     matchedBy = sourceLower ? 'fallback_utm_source' : referrerHost ? 'fallback_referrer' : 'none';
   }
   if (paid) group = 'Paid';
+  // 2.1.0: paid Google / YouTube traffic gets its own channel so CRM rows and reports separate
+  // Google Ads from organic Google Search (and YouTube ads from organic YouTube) without needing
+  // the trafficType column.
+  ({ channel, channelKey } = splitPaidChannel(channel, channelKey, paid));
 
   // 5. Exact source: the referrer URL when it says more than the origin; else the placement tag.
   let sourceLink = '';

@@ -1622,3 +1622,67 @@ describe('intakeService.fileAutoIssue — Meta connection alert dedupe (ENG-2442
     expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
   });
 });
+
+// ENG-2492: Unipile disconnect reminders must fold onto pre-ENG-2363 canonicals (no Alert Class
+// line, day count in title) keyed on accountId, never on title.
+describe('intakeService.fileAutoIssue — legacy canonical fold (ENG-2492)', () => {
+  afterEach(() => { jest.clearAllMocks(); });
+  const ACCT = 'b7S0eC2ITLS-ydjPEhj-5g';
+  const ctx = (acct: string) => ({
+    accountId: acct,
+    isReminder: true,
+    'Alert Class': `unipile-disconnected:${acct}`,
+    'Alert Legacy Key': `accountId: ${acct}`,
+  });
+  const legacyCanonical = (acct: string, id = 'ENG-2229') => ({
+    identifier: id,
+    issueId: `uuid-${id}`,
+    title: 'LinkedIn Outreach account still disconnected (42d): Sue Xu',
+    description: `body\n\n---\n\nSource: Oncall alert\n\n* accountId: ${acct}\n* isReminder: true\n* Session ID: unknown`,
+  });
+
+  it('reminder comments on an open canonical without an Alert Class line and a stale day count', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([legacyCanonical(ACCT)]);
+    const r = await fileAutoIssue({
+      title: 'LinkedIn Outreach account still disconnected (56d): Sue Xu',
+      description: 'd', source: 'Oncall alert', extraLabels: ['Oncall'], notionContext: ctx(ACCT),
+    });
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-ENG-2229', expect.stringContaining('Recurred on'));
+    expect(linear.addIssueComment.mock.calls[0][1]).not.toContain('Alert Legacy Key');
+    expect(r).toMatchObject({ pageId: 'ENG-2229', deduped: true });
+  });
+
+  it('matches on accountId, not title: a different account with the same title does not fold', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([legacyCanonical('other-acct')]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9001', id: 'uuid-9001', url: 'u' });
+    const r = await fileAutoIssue({
+      title: 'LinkedIn Outreach account still disconnected (56d): Sue Xu',
+      description: 'd', source: 'Oncall alert', notionContext: ctx(ACCT),
+    });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    expect(linear.createInternalLinearIssue.mock.calls[0][0].description).not.toContain('Alert Legacy Key');
+    expect(r).toMatchObject({ deduped: false });
+  });
+
+  it('a legacy key never folds onto a canonical carrying a different Alert Class', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-50', issueId: 'uuid-50', title: 'x', description: `* accountId: ${ACCT}\n* Alert Class: account-health:${ACCT}` },
+    ]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9002', id: 'uuid-9002', url: 'u' });
+    await fileAutoIssue({ title: 'LinkedIn Outreach account disconnected: Sue Xu', description: 'd', source: 'Oncall alert', notionContext: ctx(ACCT) });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+  });
+
+  it('after the canonical is closed (not in the open list) a reminder files a new issue', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9003', id: 'uuid-9003', url: 'u' });
+    const r = await fileAutoIssue({
+      title: 'LinkedIn Outreach account still disconnected (56d): Sue Xu',
+      description: 'd', source: 'Oncall alert', notionContext: ctx(ACCT),
+    });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    expect(linear.createInternalLinearIssue.mock.calls[0][0].description).toContain(`Alert Class: unipile-disconnected:${ACCT}`);
+    expect(r).toMatchObject({ deduped: false });
+  });
+});
