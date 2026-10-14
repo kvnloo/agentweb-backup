@@ -437,13 +437,14 @@ export class ClaudeSubscriptionService {
           else {
             // Someone else holds it now, or it was revoked: stop the CLI before a second copy can refresh.
             leaseLost = true;
-            stop("lease_lost");
+            // Find out WHY before stopping the caller: once it stops, the run may finish and compute its status.
             try {
               const now = await db.get(connectionId);
               if (!now || now.revokedAt) lost = lost ?? "revoked";
             } catch {
               /* unknown, not revoked: the lease loss alone already stops the caller */
             }
+            stop("lease_lost");
           }
         } catch {
           /* the watchdog decides */

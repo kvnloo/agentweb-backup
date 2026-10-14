@@ -777,6 +777,23 @@ describe('withLogin: the single live copy', () => {
       expect((await p).status).toBe('lost');
     });
 
+    it('reports "revoked" (not just "lost") when the heartbeat finds the connection was revoked from another process', async () => {
+      jest.useFakeTimers();
+      const ctx = setup();
+      await seedLogin(ctx);
+      let aborted = false;
+      const p = ctx.service.withLogin('sub-x', 'user-1', async ({ signal }) => {
+        signal.addEventListener('abort', () => (aborted = true));
+        await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve()));
+      });
+      await jest.advanceTimersByTimeAsync(1000);
+      await ctx.db.revoke('sub-x', { userId: 'user-1' }, new Date().toISOString()); // another instance's revoke: no in-process hook here
+      await jest.advanceTimersByTimeAsync(HEARTBEAT_MS + 1000);
+      expect(aborted).toBe(true);
+      expect((await p).status).toBe('revoked');
+      expect(homeDirs(ctx.tmpRoot)).toEqual([]);
+    });
+
     it('aborts when another holder has taken the lease', async () => {
       jest.useFakeTimers();
       const ctx = setup();
