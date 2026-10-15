@@ -435,21 +435,35 @@ export class ClaudeSubscriptionService {
     // Why the lease was lost (revoked or not) is read separately and with a deadline, and the final status waits for it,
     // so a hung read can delay the answer but never the stop.
     let whyLost: Promise<void> | undefined;
+    let whyLostAnswered = false;
     const lookUpWhyLost = () => {
       whyLost ??= (async () => {
+        let timer: NodeJS.Timeout | undefined;
         try {
           const now = await Promise.race([
             db.get(connectionId),
             new Promise<never>((_, reject) => {
-              const t = setTimeout(() => reject(new Error("timeout")), WHY_LOST_TIMEOUT_MS);
-              t.unref?.();
+              timer = setTimeout(() => reject(new Error("timeout")), WHY_LOST_TIMEOUT_MS);
+              timer.unref?.();
             }),
           ]);
+          whyLostAnswered = true;
           if (!now || now.revokedAt) lost = lost ?? "revoked";
         } catch {
           /* unknown, not revoked: the lease loss alone already stopped the caller */
+        } finally {
+          clearTimeout(timer);
+          if (!whyLostAnswered) whyLost = undefined; // a lookup that did not get an answer may be tried again
         }
       })();
+    };
+    /** Settles the "was it revoked?" question before a status is computed: waits for the lookup, and asks once more if it never got an answer. */
+    const settleWhyLost = async () => {
+      await whyLost;
+      if (leaseLost && !whyLostAnswered && lost === undefined) {
+        lookUpWhyLost();
+        await whyLost;
+      }
     };
 
     const heartbeat = setInterval(() => {
@@ -512,6 +526,7 @@ export class ClaudeSubscriptionService {
       void fnPromise.catch(() => undefined);
       await enqueue();
       await queue;
+      await settleWhyLost();
       stopTimers();
       wipe();
       console.error(`[claude-subscription] caller ignored the abort for connection=${connectionId}; stopped waiting, lease left to lapse`);
@@ -520,7 +535,7 @@ export class ClaudeSubscriptionService {
 
     await enqueue();
     await queue;
-    await whyLost;
+    await settleWhyLost();
     const status: LoginStatus = lost === "revoked" || abortedAsRevoked ? "revoked" : lost || leaseLost ? "lost" : saveFailed ? "save_failed" : "ok";
     if (status === "save_failed") {
       // The refreshed login exists only in this dir. Keep the lease alive and keep trying in the

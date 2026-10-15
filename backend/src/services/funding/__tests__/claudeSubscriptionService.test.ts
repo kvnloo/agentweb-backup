@@ -620,18 +620,20 @@ describe('withLogin: the single live copy', () => {
       let saves = 0;
       let armed = false;
       let readFailures = 0;
+      let afterStale = false;
       const err = quiet();
       jest.spyOn(ctx.db, 'saveSubCredentials').mockImplementation(async (...a) => {
         saves++;
         if (saves < 3) throw new Error('down');
         if (saves === 3) { await realSave(...a); throw new Error('response lost after commit'); } // login A committed, no answer
-        return realSave(...a); // later retries: stale (A is already stored)
+        const r = await realSave(...a); // later retries: stale (A is already stored)
+        if (r === 'stale' && armed) afterStale = true;
+        return r;
       });
-      // On a stale save the store itself reads once (to tell stale from revoked), then the service reads again to
-      // check whether the stored copy is its own earlier write. Fail THAT second read, once.
-      let armedReads = 0;
+      // Fail the read the SERVICE makes right after the store reports "stale" (to check whether the stored copy is its own
+      // earlier write): the store's own internal read happens before it returns, so the next read is the service's.
       jest.spyOn(ctx.db, 'get').mockImplementation(async (id: string) => {
-        if (armed && armedReads++ === 1) { readFailures++; throw new Error('read blip'); }
+        if (armed && afterStale && readFailures === 0) { afterStale = false; readFailures++; throw new Error('read blip'); } // once
         return realGet(id);
       });
       let aborted = false;
@@ -857,8 +859,53 @@ describe('withLogin: the single live copy', () => {
       await jest.advanceTimersByTimeAsync(HEARTBEAT_MS + 500);
       expect(abortedAt).toBeGreaterThan(0); // stopped at the heartbeat, not after the hung read
       expect(abortedAt).toBeLessThan(HEARTBEAT_MS + 600);
-      await jest.advanceTimersByTimeAsync(4000); // the read's own deadline passes
+      await jest.advanceTimersByTimeAsync(8000); // the read's deadline passes, the run asks once more, and that one times out too
       expect((await p).status).toBe('lost');
+    });
+
+    it('still reports "revoked" when the first "why was the lease lost?" read failed but the row was revoked by the end', async () => {
+      jest.useFakeTimers();
+      const ctx = setup();
+      await seedLogin(ctx);
+      const realGet = ctx.db.get.bind(ctx.db);
+      let down = false;
+      jest.spyOn(ctx.db, 'extendSubLease').mockRejectedValue(new Error('store down')); // the heartbeat cannot renew: the watchdog will stop the run
+      jest.spyOn(ctx.db, 'get').mockImplementation(async (id: string) => {
+        if (down) { await new Promise((r) => setTimeout(r, 1000)); throw new Error('store down'); }
+        return realGet(id);
+      });
+      let aborted = false;
+      const p = ctx.service.withLogin('sub-x', 'user-1', async ({ signal }) => {
+        signal.addEventListener('abort', () => (aborted = true));
+        await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve()));
+      });
+      await jest.advanceTimersByTimeAsync(LEASE_MS - 20_000);
+      down = true; // from now the store is unreachable for reads too
+      await jest.advanceTimersByTimeAsync(15_000); // the watchdog fires: stop, and the first lookup starts (and will fail)
+      expect(aborted).toBe(true);
+      await ctx.db.revoke('sub-x', { userId: 'user-1' }, new Date().toISOString());
+      await jest.advanceTimersByTimeAsync(500);
+      down = false; // the store is back before the first lookup has failed
+      await jest.advanceTimersByTimeAsync(2500); // first lookup fails; the run asks once more and now gets the answer
+      expect((await p).status).toBe('revoked');
+    });
+
+    it('a caller that ignores the abort is still reported "revoked" when the lease was lost to a revoke (the grace path waits for the answer)', async () => {
+      jest.useFakeTimers();
+      const ctx = setup({ deps: { abortGraceMs: 100 } });
+      await seedLogin(ctx);
+      const err = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      const realGet = ctx.db.get.bind(ctx.db);
+      let slow = false;
+      jest.spyOn(ctx.db, 'get').mockImplementation(async (id: string) => { if (slow) await new Promise((r) => setTimeout(r, 400)); return realGet(id); });
+      const p = ctx.service.withLogin('sub-x', 'user-1', async () => { await new Promise(() => undefined); }); // never stops
+      await jest.advanceTimersByTimeAsync(1000);
+      slow = true;
+      await ctx.db.revoke('sub-x', { userId: 'user-1' }, new Date().toISOString());
+      await jest.advanceTimersByTimeAsync(HEARTBEAT_MS + 1000); // heartbeat sees the lost lease, stops the caller; grace (100 ms) ends before the 400 ms read
+      await jest.advanceTimersByTimeAsync(2000);
+      expect((await p).status).toBe('revoked');
+      err.mockRestore();
     });
 
     it('aborts when another holder has taken the lease', async () => {
