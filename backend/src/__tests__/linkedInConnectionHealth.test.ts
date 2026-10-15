@@ -427,7 +427,7 @@ describe('recordUnipileAccountHealth — reminders', () => {
     // alert, so intake folds it onto the account's open canonical instead of filing anew.
     expect(sendAgentModeOncallAlert).toHaveBeenCalledWith(
       expect.objectContaining({
-        context: expect.objectContaining({ 'Alert Class': `unipile-disconnected:${ACCOUNT_ID}` }),
+        context: expect.objectContaining({ 'Alert Class': `unipile-disconnected:${ACCOUNT_ID}`, 'Alert Legacy Key': `accountId: ${ACCOUNT_ID}` }),
         dedupeKey: `unipile_disconnected:${ACCOUNT_ID}`,
         dedupeWindowMs: 12 * 60 * 60 * 1000,
       }),

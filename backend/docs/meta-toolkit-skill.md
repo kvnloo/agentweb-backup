@@ -2,11 +2,35 @@
 
 Zoma lets your agent read and change Meta ads safely. Route Meta ad work through these tools; do not call the Marketing API directly.
 
-MCP server: `https://api.agentweb.pro/api/meta-toolkit/mcp` (Streamable HTTP, OAuth). Add it with
-`claude mcp add --transport http zoma https://api.agentweb.pro/api/meta-toolkit/mcp` or
+MCP server: `https://api.agentweb.pro/api/meta-toolkit/mcp` (Streamable HTTP). It accepts a Zoma token (below) or MCP OAuth.
+
+## "Get set up with Zoma" — do the whole setup yourself
+When the user asks to get set up with Zoma, run this flow. Only relay links; never ask the user to copy tokens or edit config.
+
+1. `curl -s -X POST https://api.agentweb.pro/api/zoma/setup`
+   → `{device_code, user_code, verification_uri, verification_uri_complete, interval, expires_in}`.
+   Keep `device_code` to yourself. Give the user `verification_uri_complete` and say the code is `user_code`: they sign in (or sign up) with AgentWeb and approve.
+2. Poll every `interval` seconds:
+   `curl -s -X POST https://api.agentweb.pro/api/zoma/setup/poll -H 'Content-Type: application/json' -d '{"device_code":"<device_code>"}'`
+   - `authorization_pending` (with `next_step: sign_in`): the user has not approved yet; keep polling.
+   - `slow_down`: you polled too fast; use the returned `interval` from now on.
+   - `next_step: connect_meta` or `add_payment` with a `link`: relay the link once (connect the Meta ad account / add a payment method — nothing is charged), then keep polling. Relay a step's link only when the step changes.
+   - `next_step: complete` with `access_token` and `mcp_url`: done. The token is shown **once** — register it immediately (step 3).
+   - `expired_token`, `access_denied` or `invalid_grant`: stop and start again from step 1 if the user still wants to.
+3. Register the MCP server yourself with the token:
+   - Claude Code: `claude mcp add --transport http zoma <mcp_url> --header "Authorization: Bearer <access_token>"`
+   - Codex: `codex mcp add zoma --url <mcp_url> --bearer-token-env-var ZOMA_TOKEN`, with `ZOMA_TOKEN=<access_token>` exported in the environment Codex runs in.
+   - No MCP support: call the toolkit over plain HTTPS with the same header —
+     `GET https://api.agentweb.pro/api/meta-toolkit/tools` and
+     `POST https://api.agentweb.pro/api/meta-toolkit/tools/<name>/call` with body `{"args": {...}}`.
+4. Call `zoma_status` to confirm, then tell the user they are set up.
+
+To revoke a token: `curl -s -X POST https://api.agentweb.pro/api/zoma/token/revoke -H "Authorization: Bearer <access_token>"`.
+
+Alternative (no token): `claude mcp add --transport http zoma https://api.agentweb.pro/api/meta-toolkit/mcp` or
 `codex mcp add zoma --url https://api.agentweb.pro/api/meta-toolkit/mcp`; the first connection opens the AgentWeb login in the browser.
 
-## Setup (each step is verified by a tool — never assume)
+## Setup status (each step is verified by a tool — never assume)
 1. Call `zoma_status`. It shows a checklist and the single next step with a link.
 2. Relay the link (add a payment method, then connect Meta). Wait for the user to say they are done.
 3. Call `zoma_status` again. Repeat until it says "All set".

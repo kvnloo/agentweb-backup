@@ -2,8 +2,8 @@
  * ENG-2283 — External-agent auth + per-call metering for Meta Toolkit calls (ENG-2268 child 3).
  *
  * The call path an external agent (e.g. Claude) uses to invoke the ENG-2282 manifest:
- *   1. authenticate with an EXISTING account-scoped credential (aw_ agent API key or MCP
- *      OAuth access token, the same two mechanisms the MCP transport accepts),
+ *   1. authenticate with an account-scoped credential (aw_ agent API key, MCP OAuth access
+ *      token, or — ENG-2496 — a zoma_ device-flow token),
  *   2. resolve the caller's connected Meta ad account (own or org-shared, same visibility
  *      Emma uses) and refuse a foreign account or a revoked/expired connection,
  *   3. execute through executeMetaToolkitCall (ENG-2268 refuses all external v1 writes),
@@ -25,6 +25,7 @@ import { RateLimiter } from '../middleware/rateLimiter';
 import { isZomaTool } from './zomaToolDefinitions';
 import { executeMetaToolkitWrite, isGuardedWriteRequest } from './metaToolkitWrites';
 import { metaConnectionIsUsable, runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
+import { validateZomaToken, ZOMA_TOKEN_PREFIX } from './zomaDeviceFlow';
 
 export class MetaToolkitAuthError extends Error {
   readonly status: 401 | 403 | 429;
@@ -46,11 +47,15 @@ export interface MetaToolkitCaller {
   authMethod: McpAuthMethod;
   apiKeyId?: string;
   clientId?: string;
+  /** ENG-2496 device-flow Zoma token id (never the token). */
+  zomaTokenId?: string;
 }
 
 export interface MetaToolkitGatewayDeps {
   validateApiKey: (raw: string) => Promise<{ userId: string; keyId: string; expiresAt?: string; rateLimitPerMin?: number } | null>;
   validateOAuthToken: (raw: string) => Promise<{ userId: string; clientId: string } | null>;
+  /** ENG-2496 per-user Zoma token from device-flow onboarding; defaults to validateZomaToken. */
+  validateZomaToken?: (raw: string) => Promise<{ userId: string; tokenId: string } | null>;
   listAccounts: (userId: string) => Promise<ConnectedAccount[]>;
   execute: typeof executeMetaToolkitCall;
   recordUsage: typeof recordMcpToolUse;
@@ -107,6 +112,13 @@ export async function authenticateMetaToolkitCaller(
     }
     enforceCredentialLimit(deps, `key:${key.keyId}`, key.rateLimitPerMin ?? META_TOOLKIT_OAUTH_MAX_PER_MINUTE);
     return { userId: key.userId, authMethod: 'api_key', apiKeyId: key.keyId };
+  }
+
+  if (token.startsWith(ZOMA_TOKEN_PREFIX)) {
+    const zoma = await (deps.validateZomaToken ?? ((raw: string) => validateZomaToken(raw)))(token);
+    if (!zoma?.userId) throw new MetaToolkitAuthError('Invalid or revoked Zoma token.', 401);
+    enforceCredentialLimit(deps, `zoma:${zoma.tokenId}`, META_TOOLKIT_OAUTH_MAX_PER_MINUTE);
+    return { userId: zoma.userId, authMethod: 'zoma_token', zomaTokenId: zoma.tokenId };
   }
 
   const oauth = await deps.validateOAuthToken(token);

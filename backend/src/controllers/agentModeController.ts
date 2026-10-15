@@ -985,7 +985,144 @@ export function didSourcingBlockStateChange(
   return true;
 }
 
-export function computeScheduleRunHealth(runResults: any[] | undefined | null): ScheduleRunHealth {
+// ENG-2234 (AC-A): a scheduled run that never starts writes no runResults entry,
+// so runHealth used to read healthy (0 failures) across a silently skipped run.
+// These fields surface that gap; they are only present when the caller passes the
+// schedule's cadence (computeScheduleRunHealth's second argument).
+export interface ScheduleMissedRunHealth {
+  // Expected runs that never started, counted from gaps between consecutive real
+  // runs plus an overdue tail (nextRunTime passed without a run).
+  missedRuns: number;
+  // Human-readable reason for the most recent missed run, null when none.
+  lastMissedRunReason: string | null;
+}
+
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+// Grace before a run counts as missed: the scheduler polls periodically and a run
+// may legitimately start late (lease contention, deploys).
+export const MISSED_RUN_GRACE_MS = 2 * HOUR_MS;
+
+/** Nominal interval between runs, or null when the cadence is unknown/irregular. */
+export function scheduleCadenceMs(
+  frequency: string | undefined | null,
+  frequencyIntervalDays?: number | null,
+): number | null {
+  switch (frequency) {
+    case 'hourly':
+      return HOUR_MS;
+    case 'daily':
+      return DAY_MS;
+    case 'every_n_days': {
+      const n = typeof frequencyIntervalDays === 'number' && Number.isInteger(frequencyIntervalDays) && frequencyIntervalDays >= 1
+        ? frequencyIntervalDays
+        : 1;
+      return n * DAY_MS;
+    }
+    case 'weekly':
+      return 7 * DAY_MS;
+    default:
+      // monthly (nth-weekday, 28-35d) and one-off schedules have no fixed interval.
+      return null;
+  }
+}
+
+/**
+ * ENG-2234 (AC-A): detect expected scheduled runs that never started.
+ *
+ * Pure: reads only the run history timestamps, the cadence, the schedule status
+ * and nextRunTime. Gaps between consecutive runs longer than one interval plus the
+ * grace window count floor((gap - grace) / interval) missed runs. An active
+ * schedule whose nextRunTime is more than the grace window in the past also counts
+ * the overdue tail. A paused schedule is expected not to run, so its overdue tail
+ * is never counted.
+ */
+export function detectMissedScheduledRuns(
+  runResults: any[] | undefined | null,
+  schedule: {
+    frequency?: string | null;
+    frequencyIntervalDays?: number | null;
+    status?: string | null;
+    nextRunTime?: string | null;
+    updatedAt?: string | null;
+  },
+  now: number = Date.now(),
+): ScheduleMissedRunHealth {
+  const none: ScheduleMissedRunHealth = { missedRuns: 0, lastMissedRunReason: null };
+  const cadence = scheduleCadenceMs(schedule?.frequency, schedule?.frequencyIntervalDays);
+  if (!cadence) return none;
+
+  const times = (Array.isArray(runResults) ? runResults : [])
+    .map((r: any) => (r && typeof r === 'object' ? Date.parse(r.createdAt) : NaN))
+    .filter((t: number) => !Number.isNaN(t))
+    .sort((a: number, b: number) => a - b);
+
+  let missedRuns = 0;
+  let lastMissedRunReason: string | null = null;
+  const describe = (fromMs: number, count: number) =>
+    `${count} expected ${schedule.frequency} run${count === 1 ? '' : 's'} after ` +
+    `${new Date(fromMs).toISOString()} never started (no run recorded)`;
+
+  // The cadence history is not persisted, so a gap that began before the last
+  // schedule edit may have been governed by a different frequency (e.g. daily ->
+  // hourly would otherwise report ~22 false misses per old 24h gap). Only judge
+  // gaps that started at or after the last edit; undercounting is the safe side.
+  const editedAt = typeof schedule.updatedAt === 'string' ? Date.parse(schedule.updatedAt) : NaN;
+  for (let i = 1; i < times.length; i++) {
+    if (!Number.isNaN(editedAt) && times[i - 1] < editedAt) continue;
+    const gap = times[i] - times[i - 1];
+    const missed = gap > cadence + MISSED_RUN_GRACE_MS
+      ? Math.floor((gap - MISSED_RUN_GRACE_MS) / cadence)
+      : 0;
+    if (missed > 0) {
+      missedRuns += missed;
+      lastMissedRunReason = describe(times[i - 1], missed);
+    }
+  }
+
+  if (schedule.status === 'active') {
+    // The dispatcher advances nextRunTime BEFORE the run starts, so a slot that
+    // never produced a run result can leave nextRunTime in the future. Base the
+    // overdue tail on the earlier of nextRunTime and (last recorded run + cadence)
+    // so a silently skipped slot is still counted.
+    const parsedNext = typeof schedule.nextRunTime === 'string' ? Date.parse(schedule.nextRunTime) : NaN;
+    const lastRun = times.length > 0 ? times[times.length - 1] : NaN;
+    // A schedule written after that slot (edit, reactivation after a pause) has a
+    // fresh nextRunTime the run history cannot contradict, so only nextRunTime counts.
+    const writtenAfterSlot = !Number.isNaN(editedAt) && !Number.isNaN(lastRun) && editedAt > lastRun + cadence;
+    const fromLast = Number.isNaN(lastRun) || writtenAfterSlot ? NaN : lastRun + cadence;
+    const next = Number.isNaN(parsedNext)
+      ? fromLast
+      : Number.isNaN(fromLast) ? parsedNext : Math.min(parsedNext, fromLast);
+    if (!Number.isNaN(next) && now - next > MISSED_RUN_GRACE_MS) {
+      const overdue = 1 + Math.floor((now - next - MISSED_RUN_GRACE_MS) / cadence);
+      missedRuns += overdue;
+      lastMissedRunReason =
+        `Scheduled run due ${new Date(next).toISOString()} is overdue and never started` +
+        (overdue > 1 ? ` (${overdue} runs missed)` : '');
+    }
+  }
+
+  return { missedRuns, lastMissedRunReason };
+}
+
+export function computeScheduleRunHealth(runResults: any[] | undefined | null): ScheduleRunHealth;
+export function computeScheduleRunHealth(
+  runResults: any[] | undefined | null,
+  schedule: Parameters<typeof detectMissedScheduledRuns>[1],
+  now?: number,
+): ScheduleRunHealth & ScheduleMissedRunHealth;
+export function computeScheduleRunHealth(
+  runResults: any[] | undefined | null,
+  schedule?: Parameters<typeof detectMissedScheduledRuns>[1],
+  now?: number,
+): ScheduleRunHealth | (ScheduleRunHealth & ScheduleMissedRunHealth) {
+  const base = computeRecordedRunHealth(runResults);
+  if (!schedule) return base;
+  return { ...base, ...detectMissedScheduledRuns(runResults, schedule, now) };
+}
+
+function computeRecordedRunHealth(runResults: any[] | undefined | null): ScheduleRunHealth {
   const results = Array.isArray(runResults) ? runResults : [];
   if (results.length === 0) {
     return { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0, lastRunBlockedBy: null };
@@ -5736,9 +5873,25 @@ function getZeroAssistantRetryCount(schedule: any): number {
 }
 
 /**
- * Tell the schedule owner a run needs a human look. Recipients: the schedule's
- * configured notification list, else the owner's account email. Best-effort by
- * design — a notification failure must never break the run.
+ * Who gets a schedule's alert emails: the configured notification list, else the
+ * owner's account email — unless the owner explicitly opted out of email (ENG-2493),
+ * in which case nobody. Non-email channels (oncall, run history) are unaffected.
+ */
+async function resolveScheduleAlertRecipients(
+  schedule: any,
+  loadOwnerEmail: () => Promise<string | undefined>,
+): Promise<string[]> {
+  // Normalized: older rows store a bare string or a JSON-array string.
+  const configured = normalizeEmailList(schedule.emailNotifications);
+  if (configured.length > 0 || schedule.emailOptOut === true) return configured;
+  const ownerEmail = await loadOwnerEmail();
+  return ownerEmail ? [ownerEmail] : [];
+}
+
+/**
+ * Tell the schedule owner a run needs a human look. Recipients per
+ * resolveScheduleAlertRecipients. Best-effort by design — a notification failure
+ * must never break the run.
  */
 async function notifyScheduleOwnerOfFailure(
   schedule: any,
@@ -5746,13 +5899,10 @@ async function notifyScheduleOwnerOfFailure(
   detail: { failedAttempts: number; failureClass: any }
 ): Promise<void> {
   try {
-    let recipients: string[] = Array.isArray(schedule.emailNotifications)
-      ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
-      : [];
-    if (recipients.length === 0) {
-      const owner = await userDb.getUserById(userId);
-      if (owner?.email) recipients = [owner.email];
-    }
+    const recipients = await resolveScheduleAlertRecipients(
+      schedule, async () => (await userDb.getUserById(userId))?.email
+    );
+    if (schedule.emailOptOut === true && recipients.length === 0) return;
     if (recipients.length > 0) {
       await emailService.sendScheduledRunFailedEmail(
         recipients, schedule.scheduleName, schedule.scheduleId, detail
@@ -5966,13 +6116,10 @@ async function notifyScheduleOwnerOfSourcingBlockTransition(
 ): Promise<void> {
   if (schedule.disableSourcingBlockAlerts === true) return;
   try {
-    let recipients: string[] = Array.isArray(schedule.emailNotifications)
-      ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
-      : [];
-    if (recipients.length === 0) {
-      const owner = await userDb.getUserById(userId);
-      if (owner?.email) recipients = [owner.email];
-    }
+    const recipients = await resolveScheduleAlertRecipients(
+      schedule, async () => (await userDb.getUserById(userId))?.email
+    );
+    if (schedule.emailOptOut === true && recipients.length === 0) return;
     if (recipients.length > 0) {
       await emailService.sendScheduleSourcingBlockTransitionEmail(
         recipients, schedule.scheduleName, schedule.scheduleId, detail.isNowBlocked
@@ -6355,16 +6502,17 @@ export async function runScheduledChat(
       );
 
       if (disallowedFunctions.length > 0) {
-        const emailNotifications = schedule.emailNotifications || [];
-        
         // Send error email instead of running
-        const { emailService } = await import('../services/emailService');
-        await emailService.sendScheduledChatErrorEmail(
-          emailNotifications.length > 0 ? emailNotifications : (scheduleUser?.email ? [scheduleUser.email] : []),
-          schedule.scheduleName,
-          disallowedFunctions,
-          schedule.scheduleId
-        );
+        const errorRecipients = await resolveScheduleAlertRecipients(schedule, async () => scheduleUser?.email);
+        if (errorRecipients.length > 0) {
+          const { emailService } = await import('../services/emailService');
+          await emailService.sendScheduledChatErrorEmail(
+            errorRecipients,
+            schedule.scheduleName,
+            disallowedFunctions,
+            schedule.scheduleId
+          );
+        }
         
         // Create failure result
         const errorResult = {
@@ -6398,13 +6546,10 @@ export async function runScheduledChat(
     // Check token usage limits before creating the session
     const usageStatus = await checkTokenUsage(userId);
     if (!usageStatus.allowed) {
-      const emailNotifications = schedule.emailNotifications || [];
-      let notifyEmails: string[] = emailNotifications;
-      if (notifyEmails.length === 0) {
+      const notifyEmails = await resolveScheduleAlertRecipients(schedule, async () => {
         const { userDb: tokenUserDb } = await import('../services/db');
-        const tokenUser = await tokenUserDb.getUserById(userId);
-        if (tokenUser?.email) notifyEmails = [tokenUser.email];
-      }
+        return (await tokenUserDb.getUserById(userId))?.email;
+      });
 
       if (notifyEmails.length > 0) {
         const { emailService } = await import('../services/emailService');
@@ -13559,6 +13704,8 @@ export const agentModeController = {
       const optedOutOfEmail = emailNotificationsOptOut === true && normalizedEmails.length === 0;
       const shouldUseFallbackEmail = normalizedEmails.length === 0 && !allVariablesPrefilled && !optedOutOfEmail;
       scheduledChat.emailNotifications = shouldUseFallbackEmail ? [fallbackEmail] : normalizedEmails;
+      // ENG-2493: persisted so run-time alerts don't fall back to the owner's address.
+      if (optedOutOfEmail) scheduledChat.emailOptOut = true;
       scheduledChat.variables = normalizedVariables;
       scheduledChat.variableValues = normalizedVariableValues;
       scheduledChat.variableRequestStatus = normalizedVariables.length > 0
@@ -13641,7 +13788,7 @@ export const agentModeController = {
         // revoke. Emitted as a present boolean rather than an absent key so a consumer
         // never has to guess what "missing" meant.
         autopublishAuthorized: rest.autopublishAuthorized === true,
-        runHealth: computeScheduleRunHealth(runResults),
+        runHealth: computeScheduleRunHealth(runResults, rest),
       }));
 
       // ENG-1611: optional bounded pagination. With neither `limit` nor `cursor`
@@ -13933,6 +14080,13 @@ export const agentModeController = {
       const clearingEmailOnPurpose = emailNotificationsOptOut === true && emailNotifications !== undefined;
       if (effectiveEmailNotifications.length === 0 && hadEmailNotifications && !clearingEmailOnPurpose) {
         return res.status(400).json({ error: 'At least one email notification is required for scheduled chats' });
+      }
+      // ENG-2493: clearing on purpose opts out; setting recipients opts back in. Any other
+      // edit omits the key so the partial SET leaves the stored value alone.
+      if (clearingEmailOnPurpose && effectiveEmailNotifications.length === 0) {
+        updates.emailOptOut = true;
+      } else if (emailNotifications !== undefined && effectiveEmailNotifications.length > 0) {
+        updates.emailOptOut = false;
       }
 
       // Tool names are case-sensitive everywhere else; addresses are not.

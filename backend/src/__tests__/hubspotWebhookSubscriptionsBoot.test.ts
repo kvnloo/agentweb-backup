@@ -160,6 +160,32 @@ describe('ensureWebhookSubscriptionsOncePerBuild', () => {
     expect(mockFailed).toHaveBeenCalledWith(SUBSCRIPTION_SYNC_SOURCE, 'abc123', expect.any(Error));
   });
 
+  const projectBanned = () => Object.assign(new Error('403'), { response: { status: 403, data: {
+    status: 'error', category: 'BANNED', subCategory: 'AppProjectAssociationErrors.PROJECT_BASED_APP_WEBHOOK_EDIT_ERROR',
+    message: "This app was created by a project `agentweb_hubspot` and it's webhook configuration can't be edited through the API or UI." } } });
+
+  it('HubSpot refusing edits because the app is project-managed: ONE clear warning, the build completes, nothing is retried', async () => {
+    post.mockRejectedValue(projectBanned());
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    await expect(ensureWebhookSubscriptionsOncePerBuild()).resolves.toBe('ran');
+
+    expect(post).toHaveBeenCalledTimes(1);                   // the remaining 12 would fail identically: not attempted
+    expect(mockComplete).toHaveBeenCalled();
+    expect(mockFailed).not.toHaveBeenCalled();
+    const msgs = warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('managed by a HubSpot project'));
+    expect(msgs).toHaveLength(1);                            // exactly one warning, not one per subscription
+    expect(msgs[0]).toContain('contact.merge');              // names what still has to be added by hand
+  });
+
+  it('a different 403 (e.g. a missing scope) is still a retryable failure', async () => {
+    post.mockRejectedValue(Object.assign(new Error('403'), { response: { status: 403, data: { category: 'MISSING_SCOPES', message: 'nope' } } }));
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await expect(ensureWebhookSubscriptionsOncePerBuild()).resolves.toBe('failed-will-retry');
+  });
+
   it('a transient credentials failure is also retried, not treated as done', async () => {
     (getHubSpotCredentials as jest.Mock).mockRejectedValueOnce(new Error('secrets down'));
     jest.spyOn(console, 'error').mockImplementation(() => undefined);

@@ -3664,6 +3664,9 @@ export const scheduleDb = {
     // transition email specifically (does not affect the schedule-card badge,
     // per-run emails, or run history).
     disableSourcingBlockAlerts?: boolean;
+    // ENG-2493: the owner explicitly declined email (MCP `email_notifications: []`).
+    // Absent = false. Alert senders skip their owner-address fallback when true.
+    emailOptOut?: boolean;
     updatedAt?: string;
     sessionId?: string | null;
     type?: string;
