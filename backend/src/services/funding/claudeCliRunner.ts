@@ -477,7 +477,7 @@ export class ClaudeCliRunner {
   }
 }
 
-function buildAllowlistedEnv(configDir: string, scratchHomeDir: string): NodeJS.ProcessEnv {
+export function buildAllowlistedEnv(configDir: string, scratchHomeDir: string): NodeJS.ProcessEnv {
   const path = process.env.PATH;
   if (!path) throw new Error("claudeCliRunner: PATH is not set in the parent process — cannot resolve the claude binary");
   return {

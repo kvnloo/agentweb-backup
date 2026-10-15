@@ -31,6 +31,15 @@ export interface SecretContext {
   connectionId: string;
   ownerUserId: string;
   provider: string;
+  /**
+   * What the sealed value is, when it is not the customer's provider key itself (e.g.
+   * `openrouter_key`). Part of the context only when present, so a sealed OpenRouter key
+   * can never be opened as, or swapped with, the provider key sealed for the same
+   * connection. Absent for every existing ciphertext, which keeps opening unchanged.
+   */
+  purpose?: string;
+  /** The hash of the OpenRouter key this value belongs to, binding it to that one key. */
+  keyHash?: string;
 }
 
 export interface SealedSecret {
@@ -50,12 +59,24 @@ function encryptionContext(context: SecretContext): Record<string, string> {
   if (!context.connectionId || !context.ownerUserId || !context.provider) {
     throw new Error("llmConnectionCrypto: incomplete secret context");
   }
-  return { connectionId: context.connectionId, ownerUserId: context.ownerUserId, provider: context.provider };
+  return {
+    connectionId: context.connectionId,
+    ownerUserId: context.ownerUserId,
+    provider: context.provider,
+    // Added only when present: the KMS grants require `connectionId` and tolerate extra
+    // keys, and a value sealed without them must keep its original context.
+    ...(context.purpose ? { purpose: context.purpose } : {}),
+    ...(context.keyHash ? { keyHash: context.keyHash } : {}),
+  };
 }
 
 function additionalData(context: SecretContext): Buffer {
   const ctx = encryptionContext(context);
-  return Buffer.from(JSON.stringify([ctx.connectionId, ctx.ownerUserId, ctx.provider]), "utf8");
+  // The three original fields keep their exact encoding; extras are appended only when
+  // present, so ciphertexts sealed before they existed still authenticate.
+  const base = [ctx.connectionId, ctx.ownerUserId, ctx.provider];
+  const extended = ctx.purpose || ctx.keyHash ? [...base, ctx.purpose ?? "", ctx.keyHash ?? ""] : base;
+  return Buffer.from(JSON.stringify(extended), "utf8");
 }
 
 export class AwsKmsPort implements KmsPort {
