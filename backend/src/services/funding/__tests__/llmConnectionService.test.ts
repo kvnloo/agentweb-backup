@@ -442,6 +442,21 @@ describe('LlmConnectionService', () => {
       expect(await service.routingStateFor('solo', 'anthropic')).toEqual({ hasConnection: false, usable: [] });
     });
 
+    it('does not count a Claude login as a connection for the provider (kind isolation)', async () => {
+      const { service, store } = setup();
+      await store.db.create({
+        connectionId: 'login-only', ownerUserId: 'solo', kind: 'claude_subscription', provider: 'anthropic', status: 'active', keyLast4: '',
+        createdAt: '2026-10-14T00:00:00.000Z', updatedAt: '2026-10-14T00:00:00.000Z', sealed: { v: 1, wrappedDataKey: 'w', iv: 'i', ciphertext: 'c', tag: 't' },
+        subVersion: 1, subNeedsReconnect: false,
+      } as any);
+      expect(await service.routingStateFor('solo', 'anthropic')).toEqual({ hasConnection: false, usable: [] });
+    });
+
+    it('rejects, rather than answering "no connection", for a user who does not exist', async () => {
+      const { service } = setup();
+      await expect(service.routingStateFor('ghost-user', 'anthropic')).rejects.toBeTruthy();
+    });
+
     it('only looks at the requested provider', async () => {
       const { service } = setup();
       await service.add({ userId: 'solo' }, { provider: 'openai', apiKey: KEY_B });

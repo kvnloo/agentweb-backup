@@ -10,7 +10,7 @@ jest.mock('../llmConnectionService', () => ({
 const getFundingFlags = jest.fn();
 jest.mock('../fundingFlags', () => ({ getFundingFlags: (...a: unknown[]) => getFundingFlags(...a) }));
 
-import { resolveCallFunding, CONNECTION_LOOKUP_TIMEOUT_MS, ROUTING_CACHE_TTL_MS, __resetCallFundingCacheForTests } from '../callFunding';
+import { resolveCallFunding, CONNECTION_LOOKUP_TIMEOUT_MS, ROUTING_CACHE_MAX_ENTRIES, ROUTING_CACHE_TTL_MS, __callFundingCacheSizeForTests, __resetCallFundingCacheForTests } from '../callFunding';
 import { registerCustomerRouteProvisioner } from '../transport/customerRouteProvisioner';
 import type { RunFunding } from '../runFunding';
 
@@ -58,6 +58,27 @@ describe('resolveCallFunding', () => {
     it('never inherits the run\'s AgentWeb fallback: a customer-funded call defaults to stop', async () => {
       expect(run.fallback).toBe('agentweb'); // what resolveRunFunding really sets
       expect((await resolveCallFunding(run, input))?.fallback).toBe('stop');
+    });
+
+    it('looks nobody up and stays on AgentWeb for a user the BYOK allowlist does not name, even if the store is failing', async () => {
+      getFundingFlags.mockResolvedValue({ killSwitch: false, byok: { enabled: true, allowUserIds: ['someone-else'] } });
+      routingStateFor.mockRejectedValue(new Error('store down'));
+      expect(await resolveCallFunding(run, input)).toBe(run);
+      expect(routingStateFor).not.toHaveBeenCalled();
+    });
+
+    it('routes a user the allowlist names by id, and everyone under *', async () => {
+      getFundingFlags.mockResolvedValue({ killSwitch: false, byok: { enabled: true, allowUserIds: ['member-1'] } });
+      expect(await resolveCallFunding(run, input)).toMatchObject({ route: 'api_key' });
+      getFundingFlags.mockResolvedValue({ killSwitch: false, byok: { enabled: true, allowUserIds: ['*'] } });
+      __resetCallFundingCacheForTests();
+      expect(await resolveCallFunding(run, { ...input, userId: 'anyone' })).toMatchObject({ route: 'api_key' });
+    });
+
+    it('bounds the routing cache and still answers correctly past the bound', async () => {
+      for (let i = 0; i < ROUTING_CACHE_MAX_ENTRIES + 20; i++) await resolveCallFunding(run, { ...input, userId: `u${i}` });
+      expect(__callFundingCacheSizeForTests()).toBeLessThanOrEqual(ROUTING_CACHE_MAX_ENTRIES);
+      expect(await resolveCallFunding(run, { ...input, userId: 'u0' })).toMatchObject({ route: 'api_key' });
     });
 
     it('lists every usable same-provider key in order, and takes the first', async () => {

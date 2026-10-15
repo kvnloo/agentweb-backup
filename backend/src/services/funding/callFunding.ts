@@ -27,6 +27,8 @@ const BYOK_PROVIDER_BY_LAB: Record<string, string> = {
 export const CONNECTION_LOOKUP_TIMEOUT_MS = 3_000;
 /** How long a routing answer is reused per (user, provider); keeps the per-call cost down. */
 export const ROUTING_CACHE_TTL_MS = 10_000;
+/** Upper bound on cached (user, provider) answers per process; the oldest entry is dropped first. */
+export const ROUTING_CACHE_MAX_ENTRIES = 5_000;
 
 export interface CallFunding extends RunFunding {
   /** The usable same-provider connections in the order to try them (A4's fallback list). */
@@ -56,6 +58,10 @@ export interface ResolveCallFundingInput {
 type RoutingState = { hasConnection: boolean; usable: LlmConnectionView[] };
 const routingCache = new Map<string, { at: number; state: RoutingState }>();
 
+export function __callFundingCacheSizeForTests(): number {
+  return routingCache.size;
+}
+
 export function __resetCallFundingCacheForTests(): void {
   routingCache.clear();
 }
@@ -80,6 +86,11 @@ export async function resolveCallFunding(
   const { getFundingFlags } = require("./fundingFlags") as typeof import("./fundingFlags");
   const flags = await getFundingFlags();
   if (flags.killSwitch || !flags.byok.enabled) return runFunding;
+  // BYOK applies to the people the allowlist names (`*` = everyone). Anyone else is never looked up, so a
+  // connection-store problem cannot fail the calls of users who were never switched on; the lookup (and so
+  // the fail-closed throws below) is scoped to the rollout. Note this means an org member runs on the org's
+  // shared key only if the member is allowlisted too.
+  if (!flags.byok.allowUserIds.includes("*") && !flags.byok.allowUserIds.includes(input.userId)) return runFunding;
 
   const state = await lookupRoutingState(input.userId, provider);
   if (!state.hasConnection) return runFunding;
@@ -117,6 +128,7 @@ async function lookupRoutingState(userId: string, provider: string): Promise<Rou
     // Lazy: the connection service pulls in the AWS SDK graph (see runFunding.ts).
     const { getLlmConnectionService } = require("./llmConnectionService") as typeof import("./llmConnectionService");
     const state = await withTimeout(getLlmConnectionService().routingStateFor(userId, provider), CONNECTION_LOOKUP_TIMEOUT_MS);
+    if (routingCache.size >= ROUTING_CACHE_MAX_ENTRIES) routingCache.delete(routingCache.keys().next().value as string); // oldest out
     routingCache.set(key, { at: Date.now(), state });
     return state;
   } catch (error) {
