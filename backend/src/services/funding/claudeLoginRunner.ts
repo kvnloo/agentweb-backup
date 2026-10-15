@@ -14,8 +14,11 @@
 import { spawn as spawnChild, type ChildProcessWithoutNullStreams } from "child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "fs";
 import { tmpdir } from "os";
-import { dirname, join } from "path";
+import { join } from "path";
 import { buildAllowlistedEnv } from "./claudeCliRunner";
+import { resolveClaudeBinary } from "./claudeBinary";
+
+export { resolveClaudeBinary };
 
 export type LoginErrorCode = "start_failed" | "start_timeout" | "bad_code_format" | "code_rejected" | "complete_timeout" | "no_credentials" | "cancelled" | "login_gone";
 
@@ -37,26 +40,6 @@ export const TMP_ROOT_PREFIX = "aw-claude-login-";
 export const STALE_LOGIN_DIR_MS = 30 * 60 * 1000;
 const AUTHORIZE_URL = /https:\/\/claude\.com\/cai\/oauth\/authorize[^\s"'<>]*/;
 
-/**
- * The pinned `claude` binary (the @anthropic-ai/claude-code dependency), by absolute path.
- * Not looked up on PATH: the backend runs as `node dist/server.js`, whose PATH does not
- * include node_modules/.bin (seen on the test instance), so a bare "claude" is not found.
- * Falls back to the bare name when the package cannot be resolved.
- */
-export function resolveClaudeBinary(): string {
-  try {
-    const pkgPath = require.resolve("@anthropic-ai/claude-code/package.json");
-    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { bin?: string | Record<string, string> };
-    const rel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.claude;
-    if (rel) {
-      const abs = join(dirname(pkgPath), rel);
-      if (existsSync(abs)) return abs;
-    }
-  } catch {
-    /* fall through */
-  }
-  return "claude";
-}
 
 /** Removes login dirs a dead process left behind (they may hold a freshly written credentials file). */
 export function sweepStaleLoginDirs(root: string, nowMs: number = Date.now(), maxAgeMs: number = STALE_LOGIN_DIR_MS): number {
