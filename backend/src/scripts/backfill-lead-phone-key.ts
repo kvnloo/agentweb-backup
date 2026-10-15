@@ -34,6 +34,7 @@
  *   NODE_ENV=production  npx ts-node src/scripts/backfill-lead-phone-key.ts --apply --confirm-table=AW-Leads --rate=25
  */
 import { phoneDedupeKey } from '../utils/phoneLeadDedupe';
+import { isSmokeTestPhone } from '../utils/smokeTestLead';
 
 export interface PhoneKeyRow {
   listId: string;
@@ -63,7 +64,7 @@ export function decidePhoneKeyBackfill(row: PhoneKeyRow): PhoneKeyDecision {
   }
   if (!hasText(row.phone)) return { action: 'skip', reason: 'no-phone' };
   const key = phoneDedupeKey(row.phone);
-  if (!key) return { action: 'skip', reason: 'not-dedupable' };
+  if (!key || isSmokeTestPhone(String(row.phone))) return { action: 'skip', reason: 'not-dedupable' };
   return {
     action: 'write',
     key,
@@ -118,15 +119,17 @@ export async function runPhoneKeyBackfill(ddb: any, opts: BackfillOptions): Prom
       perList.set(row.listId, (perList.get(row.listId) || 0) + 1);
       if (!opts.apply) continue;
 
-      // The row is only rewritten if it is still exactly what the scan saw: no key yet, the same phone,
-      // and each hazard attribute still absent (or still "" when this write is removing it).
-      const hasEmpty = d.removeEmpty.length > 0;
-      const values: Record<string, any> = { ':k': d.key, ':p': d.phone, ...(hasEmpty ? { ':empty': '' } : {}) };
-      const conditions = [
-        'attribute_not_exists(phoneKey)',
-        'phone = :p',
-        ...EMPTY_HAZARD_ATTRS.map((a) => (hasEmpty ? `(attribute_not_exists(${a}) OR ${a} = :empty)` : `attribute_not_exists(${a})`)),
-      ];
+      // The row is only rewritten if it is still what the scan saw: no key yet, the same phone, and no
+      // email or linkedin url gained since (an attribute being REMOVEd must still be ""). nameCompanyKey
+      // is deliberately NOT required to be absent - createLead writes a real one for any lead with first
+      // name, last name and company, and requiring its absence would silently skip all of them.
+      const removing = new Set(d.removeEmpty);
+      const values: Record<string, any> = { ':k': d.key, ':p': d.phone, ...(removing.size ? { ':empty': '' } : {}) };
+      const conditions = ['attribute_not_exists(phoneKey)', 'phone = :p'];
+      for (const a of ['email', 'linkedin'] as const) {
+        conditions.push(removing.has(a) ? `(attribute_not_exists(${a}) OR ${a} = :empty)` : `attribute_not_exists(${a})`);
+      }
+      if (removing.has('nameCompanyKey')) conditions.push('nameCompanyKey = :empty');
       try {
         await ddb.update({
           TableName: opts.tableName,

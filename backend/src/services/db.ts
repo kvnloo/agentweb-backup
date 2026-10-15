@@ -22,6 +22,7 @@ import { onUserSignup } from "./crmSignalHooks";
 import { isEvaluationUser } from "./evaluationPolicy";
 import { emailLeadIds, isEmailUniqueCreateEnabled, emailTxAllowed, tripEmailTxBreaker, type EmailLeadIds } from '../utils/emailLeadId';
 import { phoneDedupeKey, PHONE_FANOUT_CAP } from '../utils/phoneLeadDedupe';
+import { isSmokeTestPhone } from '../utils/smokeTestLead';
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
 import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
@@ -6553,7 +6554,7 @@ export const crmDb = {
       // before the lookup index does. Other origins (LinkedIn mirror, manual, imports) never write one.
       const phoneKey = origin === 'form_fill' && !leadData.email?.trim() && !leadData.linkedin?.trim()
         && !(leadData.syncMetadata && Object.keys(leadData.syncMetadata).length > 0)
-        ? phoneDedupeKey(leadData.phone)
+        ? (isSmokeTestPhone(leadData.phone) ? '' : phoneDedupeKey(leadData.phone))
         : '';
       const phoneKeyIds: EmailLeadIds | null =
         leadData.phoneUniqueCreate && phoneKey && !leadData.leadId?.trim() && !emailKeyIds
@@ -7563,7 +7564,7 @@ export const crmDb = {
       const ids = (result.Items || []).map((i: any) => String(i.leadId));
       return { available: true, leadIds: ids, capped: ids.length > PHONE_FANOUT_CAP };
     } catch (error: any) {
-      const missingIndex = error?.code === 'ValidationException' && /specified index|does not have the specified index/i.test(String(error?.message));
+      const missingIndex = error?.code === 'ValidationException' && /specified index|backfilling/i.test(String(error?.message));
       if (missingIndex || error?.code === 'AccessDeniedException') {
         phoneIndexUnavailableUntil = Date.now() + 10 * 60 * 1000;
         console.warn(`[phone-dedupe] PhoneKeyIndex unavailable (${error.code}); phone lookup disabled for 10 minutes.`);

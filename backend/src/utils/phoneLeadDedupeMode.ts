@@ -26,6 +26,27 @@ let override: PhoneDedupeMode | null = null;
 export function setPhoneDedupeModeOverride(mode: PhoneDedupeMode | null): void {
   override = mode;
   cached = null;
+  inflight = null;
+}
+
+const READ_TIMEOUT_MS = 1500;
+let inflight: Promise<PhoneDedupeMode> | null = null;
+
+async function readMode(): Promise<PhoneDedupeMode> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const row = await Promise.race([
+      settingsService.getSetting(PHONE_DEDUPE_SETTING),
+      // A stalled read must not stall the public capture route: give up and stay off.
+      new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), READ_TIMEOUT_MS); }),
+    ]);
+    const v = String(row?.settingValue ?? '').trim().toLowerCase();
+    return MODES.has(v) ? (v as PhoneDedupeMode) : 'off';
+  } catch {
+    return 'off'; // settingsService already logged
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export async function getPhoneDedupeMode(): Promise<PhoneDedupeMode> {
@@ -34,14 +55,9 @@ export async function getPhoneDedupeMode(): Promise<PhoneDedupeMode> {
   if (process.env.NODE_ENV === 'test') return 'off';
   const now = Date.now();
   if (cached && now - cached.at < TTL_MS) return cached.mode;
-  let mode: PhoneDedupeMode = 'off';
-  try {
-    const row = await settingsService.getSetting(PHONE_DEDUPE_SETTING);
-    const v = String(row?.settingValue ?? '').trim().toLowerCase();
-    if (MODES.has(v)) mode = v as PhoneDedupeMode;
-  } catch {
-    // settingsService already logged; stay off and retry after the TTL
+  // Concurrent captures at cache expiry share ONE read instead of each issuing their own.
+  if (!inflight) {
+    inflight = readMode().then((mode) => { cached = { mode, at: Date.now() }; return mode; }).finally(() => { inflight = null; });
   }
-  cached = { mode, at: now };
-  return mode;
+  return inflight;
 }
