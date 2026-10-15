@@ -96,6 +96,22 @@ describe('detectMissedScheduledRuns (ENG-2234 AC-A)', () => {
     expect(health.missedRuns).toBe(3);
   });
 
+  it('does not judge pre-edit history by a newly changed cadence (daily -> hourly)', () => {
+    const history = [
+      run('2026-10-10T22:05:00Z'), run('2026-10-11T22:05:00Z'), run('2026-10-12T22:05:00Z'),
+      run('2026-10-13T22:05:00Z'), run('2026-10-14T22:05:00Z'),
+    ];
+    expect(
+      detectMissedScheduledRuns(history, { frequency: 'hourly', status: 'paused', updatedAt: '2026-10-14T23:00:00Z' }),
+    ).toEqual({ missedRuns: 0, lastMissedRunReason: null });
+    // Gaps after the edit are still judged by the new cadence.
+    const after = detectMissedScheduledRuns(
+      [...history, run('2026-10-15T03:00:00Z')],
+      { frequency: 'hourly', status: 'paused', updatedAt: '2026-10-14T21:00:00Z' },
+    );
+    expect(after.missedRuns).toBe(2);
+  });
+
   it('keeps the legacy single-argument shape unchanged', () => {
     expect(computeScheduleRunHealth([])).toEqual({
       lastRunStatus: null,

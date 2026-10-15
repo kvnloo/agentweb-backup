@@ -1044,6 +1044,7 @@ export function detectMissedScheduledRuns(
     frequencyIntervalDays?: number | null;
     status?: string | null;
     nextRunTime?: string | null;
+    updatedAt?: string | null;
   },
   now: number = Date.now(),
 ): ScheduleMissedRunHealth {
@@ -1062,7 +1063,13 @@ export function detectMissedScheduledRuns(
     `${count} expected ${schedule.frequency} run${count === 1 ? '' : 's'} after ` +
     `${new Date(fromMs).toISOString()} never started (no run recorded)`;
 
+  // The cadence history is not persisted, so a gap that began before the last
+  // schedule edit may have been governed by a different frequency (e.g. daily ->
+  // hourly would otherwise report ~22 false misses per old 24h gap). Only judge
+  // gaps that started at or after the last edit; undercounting is the safe side.
+  const editedAt = typeof schedule.updatedAt === 'string' ? Date.parse(schedule.updatedAt) : NaN;
   for (let i = 1; i < times.length; i++) {
+    if (!Number.isNaN(editedAt) && times[i - 1] < editedAt) continue;
     const gap = times[i] - times[i - 1];
     const missed = gap > cadence + MISSED_RUN_GRACE_MS
       ? Math.floor((gap - MISSED_RUN_GRACE_MS) / cadence)
