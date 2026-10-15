@@ -70,6 +70,12 @@ export function __resetCallFundingCacheForTests(): void {
  * Returns `runFunding` itself whenever the call stays on AgentWeb (BYOK off, or no
  * connection for this provider), so a caller can pass the result straight on. Throws
  * `CustomerRouteError` for a customer who has a key that cannot serve this call.
+ *
+ * Only the agent's own working calls (`customerRoutable: true`) are looked at. Helper calls
+ * around a turn, such as the first-message session title generated before the turn starts,
+ * are AgentWeb-funded on purpose and never reach the connection lookup: a turn that fails
+ * closed on a dead key can therefore still show one small AgentWeb-paid helper call, and
+ * never an AgentWeb-paid answer from the agent itself.
  */
 export async function resolveCallFunding(
   runFunding: RunFunding | undefined,
