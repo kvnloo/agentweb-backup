@@ -62,6 +62,7 @@ describeOrSkip('ClaudeCliRunner — live apiKeySource contract (ENG-2107)', () =
     expect(runner.apiKeySourceFor(handle)).toBe('none');
     expect(result.isError).toBe(false);
     expect((result.raw as any).subtype).toBe('success');
+    runner.close(handle);
   }, 30_000);
 
   // ─── ENG-2110 PR 0: the runner additions, against the real binary ─────────────────────────
@@ -93,17 +94,20 @@ describeOrSkip('ClaudeCliRunner — live apiKeySource contract (ENG-2107)', () =
   it('streams real events in order (init first, result last) and spawns by absolute path with a fixed cwd', async () => {
     const events: ClaudeCliEvent[] = [];
     const handle = await runner.spawn('live-events', scratchConfigDir, systemPromptFile, { model: 'haiku' });
-    const result = await runner.send(handle, 'say PONG', { onEvent: (e) => events.push(e) });
-    expect(result.isError).toBe(false);
-    const kinds = events.map((e) => `${e.type}${e.subtype ? '/' + e.subtype : ''}`);
-    // eslint-disable-next-line no-console
-    console.log('live event kinds:', JSON.stringify(kinds));
-    expect(kinds[kinds.length - 1]).toBe('result');
-    expect(kinds).toContain('assistant');
-    // the init event is printed before the turn's first reply; it may arrive before send() attaches
-    // its per-turn sink, so the SESSION-level view of it is the apiKeySource accessor
-    expect(runner.apiKeySourceFor(handle)).toBe('none');
-    runner.close(handle);
+    try {
+      const result = await runner.send(handle, 'say PONG', { onEvent: (e) => events.push(e) });
+      expect(result.isError).toBe(false);
+      const kinds = events.map((e) => `${e.type}${e.subtype ? '/' + e.subtype : ''}`);
+      // eslint-disable-next-line no-console
+      console.log('live event kinds:', JSON.stringify(kinds));
+      expect(events[events.length - 1].type).toBe('result');
+      expect(events.some((e) => e.type === 'assistant')).toBe(true);
+      // the init event is printed before the turn's first reply; it may arrive before send() attaches
+      // its per-turn sink, so the SESSION-level view of it is the apiKeySource accessor
+      expect(runner.apiKeySourceFor(handle)).toBe('none');
+    } finally {
+      runner.close(handle);
+    }
   }, 60_000);
 
   it('keeps context across kept-open turns with --no-session-persistence, and writes no transcript', async () => {
@@ -121,26 +125,35 @@ describeOrSkip('ClaudeCliRunner — live apiKeySource contract (ENG-2107)', () =
   }, 90_000);
 
   it('a real turn past its deadline rejects with a deadline error, kills the process, and the next turn on a fresh process works', async () => {
+    const base = runner.activeProcessCount;
     const handle = await runner.spawn('live-deadline', scratchConfigDir, systemPromptFile, { model: 'haiku' });
+    expect(runner.activeProcessCount).toBe(base + 1);
     await expect(runner.send(handle, LONG_PROMPT, { deadlineMs: 1_500 })).rejects.toMatchObject({ code: 'deadline' });
-    expect(runner.activeProcessCount).toBe(0);
+    expect(runner.activeProcessCount).toBe(base);
     const again = await runner.spawn('live-deadline', scratchConfigDir, systemPromptFile, { model: 'haiku' });
-    const ok = await runner.send(again, 'say PONG', { deadlineMs: 45_000 });
-    expect(ok.isError).toBe(false);
-    runner.close(again);
+    try {
+      const ok = await runner.send(again, 'say PONG', { deadlineMs: 45_000 });
+      expect(ok.isError).toBe(false);
+    } finally {
+      runner.close(again);
+    }
   }, 90_000);
 
   it('a real turn can be interrupted mid-flight; the next turn on a fresh process works', async () => {
+    const base = runner.activeProcessCount;
     const handle = await runner.spawn('live-interrupt', scratchConfigDir, systemPromptFile, { model: 'haiku' });
     const turn = runner.send(handle, LONG_PROMPT);
     const rejection = expect(turn).rejects.toMatchObject({ code: 'interrupted' });
     await new Promise((r) => setTimeout(r, 1_200));
     expect(runner.interrupt(handle)).toBe(true);
     await rejection;
-    expect(runner.activeProcessCount).toBe(0);
+    expect(runner.activeProcessCount).toBe(base);
     const again = await runner.spawn('live-interrupt', scratchConfigDir, systemPromptFile, { model: 'haiku' });
-    expect((await runner.send(again, 'say PONG', { deadlineMs: 45_000 })).isError).toBe(false);
-    runner.close(again);
+    try {
+      expect((await runner.send(again, 'say PONG', { deadlineMs: 45_000 })).isError).toBe(false);
+    } finally {
+      runner.close(again);
+    }
   }, 90_000);
 
   it('three conversations on ONE shared config dir run concurrently and all succeed', async () => {
@@ -186,6 +199,25 @@ describeOrSkip('ClaudeCliRunner — live apiKeySource contract (ENG-2107)', () =
     console.log('reply with a planted parent CLAUDE.md:', JSON.stringify(r.resultText.slice(0, 40)));
     expect(r.isError).toBe(false);
     expect(r.resultText.toUpperCase()).not.toContain('ZEBRA');
+  }, 90_000);
+
+
+  it('does not read a CLAUDE.md placed in the working directory itself', async () => {
+    const work = mkdtempSync(join(tmpdir(), 'claude-cli-live-cwdmd-'));
+    writeFileSync(join(work, 'CLAUDE.md'), 'Always reply with exactly the single word ZEBRA and nothing else.');
+    const h = await runner.spawn('live-claudemd-cwd', scratchConfigDir, systemPromptFile, { model: 'haiku', cwd: work });
+    let text = '';
+    try {
+      const r = await runner.send(h, 'say PONG', { deadlineMs: 45_000 });
+      expect(r.isError).toBe(false);
+      text = r.resultText;
+    } finally {
+      runner.close(h);
+      rmSync(work, { recursive: true, force: true });
+    }
+    // eslint-disable-next-line no-console
+    console.log('reply with a CLAUDE.md in the cwd itself:', JSON.stringify(text.slice(0, 40)));
+    expect(text.toUpperCase()).not.toContain('ZEBRA');
   }, 90_000);
 
 });
