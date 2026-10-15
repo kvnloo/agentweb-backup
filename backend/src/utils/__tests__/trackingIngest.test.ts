@@ -203,6 +203,33 @@ describe('buildSessionRow: the server owns classification', () => {
   });
 });
 
+describe('ENG-2494 first touch on agency links and follow-up events (Opslane run 590)', () => {
+  const CHROME = 'Mozilla/5.0 (Windows NT 10.0) Chrome/120';
+  const agency = 'https://go.dramabreak.ai/g?utm_source=agency-rise&utm_medium=agency';
+  const ctx = { userAgent: CHROME, nowIso: 'T' };
+  it('first visit on an agency link: first touch is the click platform, last touch stays Agency', () => {
+    for (const [ref, want] of [['https://www.tiktok.com/', 'TikTok'], ['https://www.youtube.com/', 'YouTube'], ['https://l.instagram.com/', 'Instagram']]) {
+      const row = buildSessionRow(ok(base({ visitNo: 1, eventCount: 1, landingUrl: agency, referrer: ref })), ctx).customFields;
+      expect(row.firstTouchChannel).toBe(want);
+      expect(row.channel).toBe('Agency');
+    }
+    const ig = buildSessionRow(ok(base({ visitNo: 1, eventCount: 1, landingUrl: agency })), { userAgent: 'Mozilla/5.0 (iPhone) Instagram 300.0', nowIso: 'T' }).customFields;
+    expect(ig.firstTouchChannel).toBe('Instagram');
+  });
+  it('return visit: stored agency landing + stored TikTok referrer gives TikTok', () => {
+    const row = buildSessionRow(ok(base({ visitNo: 2, eventCount: 1, landingUrl: 'https://go.dramabreak.ai/g', referrer: 'https://www.youtube.com/', firstTouchLanding: agency, firstTouchReferrer: 'tiktok.com', firstTouchChannel: 'Agency' })), ctx).customFields;
+    expect(row.firstTouchChannel).toBe('TikTok');
+  });
+  it('agency link with no observable signal stays Agency; paid links keep the ad platform', () => {
+    expect(buildSessionRow(ok(base({ visitNo: 1, eventCount: 1, landingUrl: agency })), ctx).customFields.firstTouchChannel).toBe('Agency');
+  });
+  it('a later event in the first visit without an external signal does not overwrite first touch', () => {
+    const later = buildSessionRow(ok(base({ visitNo: 1, eventCount: 3, event: 'click', clickLabel: 'x', landingUrl: 'https://go.dramabreak.ai/g', referrer: 'https://go.dramabreak.ai/' })), ctx).customFields;
+    expect(later).not.toHaveProperty('firstTouchChannel');
+    expect(later).not.toHaveProperty('firstTouchReferrer');
+  });
+});
+
 describe('repairEscapedQuery (HTML-escaped share links)', () => {
   const { repairEscapedQuery } = require('../trackingIngest');
   it('recovers UTMs from a link whose & became amp;', () => {
