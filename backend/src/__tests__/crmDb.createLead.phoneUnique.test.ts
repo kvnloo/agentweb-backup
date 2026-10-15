@@ -166,6 +166,7 @@ describe('where the exactly-once create and the phoneKey do NOT apply', () => {
     ['the number is junk (one repeated digit)', { phone: '555-555-5555' }, 'form_fill'],
     ['the number is too short', { phone: '415-0142' }, 'form_fill'],
     ['a NANP exchange starts with 1', { phone: '212 156 7890' }, 'form_fill'],
+    ['the number is a synthetic smoke-test number (it has its own deterministic-id path)', { phone: '(415) 555-0142' }, 'form_fill'],
     ['a linkedin url is present', { linkedin: 'https://www.linkedin.com/in/ana' }, 'form_fill'],
     ['sync metadata is present', { syncMetadata: { hubspot_contact_id: '9' } }, 'form_fill'],
   ])('%s: random id, no phoneKey', async (_n, extra, origin) => {
@@ -234,5 +235,15 @@ describe('getLeadIdsByPhoneKey when the index cannot be used', () => {
     expect(await crmDb.getLeadIdsByPhoneKey('L1', KEY)).toEqual({ available: false, leadIds: [], capped: false });
     expect(queries.length).toBe(before);
     expect((console.warn as jest.Mock).mock.calls.filter((c) => String(c[0]).includes('PhoneKeyIndex unavailable'))).toHaveLength(1);
+  });
+
+  it('an index that is still BUILDING is unavailable too, and the 10-minute negative cache expires', async () => {
+    const real = Date.now();
+    const spy = jest.spyOn(Date, 'now').mockReturnValue(real + 11 * 60 * 1000); // past the cache set by the previous test
+    queryImpl = () => { throw Object.assign(new Error('Cannot read from backfilling global secondary index: PhoneKeyIndex'), { code: 'ValidationException' }); };
+    const before = queries.length;
+    expect(await crmDb.getLeadIdsByPhoneKey('L1', KEY)).toEqual({ available: false, leadIds: [], capped: false });
+    expect(queries.length).toBe(before + 1); // it really queried (the earlier cache had expired)
+    spy.mockRestore();
   });
 });

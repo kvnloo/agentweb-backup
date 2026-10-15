@@ -51,6 +51,34 @@ describe('getPhoneDedupeMode', () => {
     expect(mockGetSetting).toHaveBeenCalledTimes(1);
   });
 
+  it('concurrent callers at cache expiry share ONE read', async () => {
+    let release: (v: any) => void = () => undefined;
+    mockGetSetting.mockReturnValue(new Promise((r) => { release = r; }));
+    const get = await fresh();
+    const calls = [get(), get(), get(), get()];
+    release({ settingValue: 'shadow' });
+    expect(await Promise.all(calls)).toEqual(['shadow', 'shadow', 'shadow', 'shadow']);
+    expect(mockGetSetting).toHaveBeenCalledTimes(1);
+  });
+
+  it('a stalled read gives up after 1.5s and fails OFF instead of stalling the capture', async () => {
+    jest.useFakeTimers();
+    try {
+      mockGetSetting.mockReturnValue(new Promise(() => undefined)); // never settles
+      const get = await fresh();
+      const result = get();
+      await jest.advanceTimersByTimeAsync(1499);
+      let settled = false;
+      void result.then(() => { settled = true; });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      await jest.advanceTimersByTimeAsync(2);
+      expect(await result).toBe('off');
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('reads nothing under NODE_ENV=test (existing capture-route tests must not reach DynamoDB)', async () => {
     (process.env as any).NODE_ENV = 'test';
     expect(await (await fresh())()).toBe('off');
