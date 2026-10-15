@@ -45,6 +45,7 @@ import {
 import FactCheckIcon from '@mui/icons-material/FactCheck';
 import { buildApiUrl } from '../config';
 import { useAuth } from '../contexts/AuthContext';
+import { blindForHuman } from '../utils/blindLabelling';
 
 type Surface = 'agent' | 'creative' | 'account_health';
 type LabelValue = 'pass' | 'fail' | 'na';
@@ -444,7 +445,7 @@ export default function EvalLabelling() {
       const res = await axios.get<{ cases: GoldenCaseView[] }>(buildApiUrl(`/api/admin/eval/golden-cases?surface=${which}`), { headers });
       if (!isCurrent()) return;
       // Pairwise calibration cases take an A/B/tie choice on their own page, not binary criteria.
-      const next = res.data.cases.filter((c) => c.pair === undefined).sort(byLeastLabelled);
+      const next = res.data.cases.filter((c) => c.pair === undefined).map(blindForHuman).sort(byLeastLabelled);
       setCases(next);
       setSelectedId((current) => (current && next.some((c) => c.caseId === current) ? current : next[0]?.caseId ?? null));
     } catch (err) {
