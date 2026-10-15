@@ -4030,7 +4030,13 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       // see agentModeController.scheduledChatConsentShape.test.ts for why.
       autopublishAuthorized: s.autopublishAuthorized === true,
       // ENG-1131 adds lastRunBlockedBy (why the last run could not source), null here.
-      runHealth: { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0, lastRunBlockedBy: null },
+      // ENG-2234 adds missedRuns/lastMissedRunReason; these fixtures carry stale
+      // January nextRunTimes, so the overdue count depends on wall-clock time and
+      // is asserted in agentModeController.missedRuns.test.ts instead.
+      runHealth: expect.objectContaining({
+        lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0, lastRunBlockedBy: null,
+        missedRuns: expect.any(Number),
+      }),
     });
 
     it('should sort scheduled chats by createdAt descending (newest first)', async () => {
