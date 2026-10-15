@@ -285,6 +285,14 @@ describe('where no phone dedupe applies, in ANY mode', () => {
     untouched();
   });
 
+  it('a capture that carries a linkedin URL (createLead never gives it a phoneKey)', async () => {
+    withCandidates([existing()]);
+    const res = await post({ linkedin: 'https://www.linkedin.com/in/ana' });
+    expect(res.status).toBe(201);
+    untouched();
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
+  });
+
   it('a capture that carries an email follows the email path only', async () => {
     await post({ email: 'ana@example.com' });
     expect(createCalls()[0][1]).toMatchObject({ emailUniqueCreate: true });
