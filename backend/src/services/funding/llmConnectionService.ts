@@ -80,6 +80,8 @@ export interface Actor {
 export interface LlmConnectionView extends Omit<LlmConnection, "secretRef"> {
   /** True when the caller owns it; false for a key another owner shared with the org. */
   ownedByCaller: boolean;
+  /** Claude-login connections only: non-secret facts about the stored login. */
+  subscription?: { plan?: string; needsReconnect: boolean };
 }
 
 interface UserLike extends AuthzUser {
@@ -95,6 +97,8 @@ export interface LlmConnectionServiceDeps {
   getOrg: (orgId: string) => Promise<AuthzOrg | null>;
   now: () => string;
   newId: () => string;
+  /** Best-effort, called after a connection is revoked. Must not throw into the request. */
+  onRevoked?: (connectionId: string) => void;
 }
 
 interface Access {
@@ -114,8 +118,15 @@ function toView(record: LlmConnectionRecord, callerId: string): LlmConnectionVie
     keyLast4: record.keyLast4,
     createdAt: record.createdAt,
     ...(record.orgId ? { sharedWithOrgId: record.orgId } : {}),
-    health: { ...(record.lastOkAt ? { lastOkAt: record.lastOkAt } : {}) },
+    health: {
+      ...(record.lastOkAt ? { lastOkAt: record.lastOkAt } : {}),
+      // A Claude login's refresh token has a fixed lifetime; this is when the customer must sign in again.
+      ...(record.subRefreshExpiresAtMs ? { expiresAt: new Date(record.subRefreshExpiresAtMs).toISOString() } : {}),
+    },
     ownedByCaller: record.ownerUserId === callerId,
+    ...(record.kind === "claude_subscription"
+      ? { subscription: { ...(record.subType ? { plan: record.subType } : {}), needsReconnect: record.subNeedsReconnect === true } }
+      : {}),
   };
 }
 
@@ -236,13 +247,23 @@ export class LlmConnectionService {
     const didRevoke = await this.deps.db.revoke(connectionId, { userId: actor.userId, adminId: actor.adminId }, this.deps.now());
     // Only the call that actually revoked it owned that slot; a second revoke of an
     // already-revoked connection must not release a slot that was already freed.
-    if (didRevoke) await this.deps.db.releaseSlot(record.ownerUserId);
+    if (didRevoke) {
+      // Stop a running holder first: the revoke is committed whatever happens to the slot bookkeeping after it.
+      try {
+        this.deps.onRevoked?.(connectionId);
+      } catch {
+        /* a holder in another process notices at its next heartbeat */
+      }
+      await this.deps.db.releaseSlot(record.ownerUserId);
+    }
   }
 
   async setShared(actor: Actor, connectionId: string, shared: boolean): Promise<LlmConnectionView> {
     const { record, access } = await this.visible(actor.userId, connectionId);
     if (record.ownerUserId !== actor.userId) throw new LlmConnectionError("forbidden");
     if (record.status === "revoked") throw new LlmConnectionError("not_found");
+    // A Claude login is for its owner's ordinary use; sharing it across an org is never allowed.
+    if (record.kind !== "api_key") throw new LlmConnectionError("forbidden");
     if (shared) {
       await this.requireEnabled(actor.userId);
       if (!access.org) throw new LlmConnectionError("not_in_org");
@@ -260,7 +281,8 @@ export class LlmConnectionService {
     await this.requireEnabled(actor.userId);
     const { record, access } = await this.visible(actor.userId, connectionId);
     if (record.ownerUserId !== actor.userId && !access.canManage) throw new LlmConnectionError("forbidden");
-    if (record.status === "revoked" || !record.sealed || !isSupportedByokProvider(record.provider)) {
+    // A Claude login is not a provider key: its sealed blob must never be opened here or sent to a validator.
+    if (record.kind !== "api_key" || record.status === "revoked" || !record.sealed || !isSupportedByokProvider(record.provider)) {
       throw new LlmConnectionError("not_found");
     }
     const apiKey = await openSecret(this.deps.kms, record.sealed, {
@@ -297,6 +319,8 @@ export class LlmConnectionService {
    * with their org by someone who is still an owner of it.
    */
   private async usableBy(record: LlmConnectionRecord, access: Access): Promise<boolean> {
+    // Only provider API keys are ever used as keys; a Claude login is reachable only through its own service.
+    if (record.kind !== "api_key") return false;
     if (record.status !== "active" || !record.sealed) return false;
     if (record.ownerUserId === access.user.userId) return true;
     if (!access.org) return false;
@@ -363,6 +387,8 @@ export function getLlmConnectionService(): LlmConnectionService {
       getOrg: async (orgId) => (await orgDb.getOrgById(orgId)) as AuthzOrg | null,
       now: () => new Date().toISOString(),
       newId: () => randomUUID(),
+      // A running turn on a revoked Claude login must stop now, not at its next heartbeat (ENG-2110).
+      onRevoked: (id) => (require("./claudeSubscriptionService") as typeof import("./claudeSubscriptionService")).abortClaudeSubscriptionConnection(id),
     });
   }
   return defaultService;

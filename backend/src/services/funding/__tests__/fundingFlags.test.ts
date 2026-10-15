@@ -3,7 +3,7 @@ jest.mock('../../settingsService', () => ({
 }));
 
 import { settingsService } from '../../settingsService';
-import { getFundingFlags, __resetFundingFlagsCacheForTests } from '../fundingFlags';
+import { getFundingFlags, isClaudeSubscriptionEnabledFor, __resetFundingFlagsCacheForTests } from '../fundingFlags';
 
 const mockedGetSetting = settingsService.getSetting as jest.Mock;
 
@@ -57,5 +57,37 @@ describe('getFundingFlags (ENG-1816 F1)', () => {
     await getFundingFlags();
     await getFundingFlags();
     expect(mockedGetSetting).toHaveBeenCalledTimes(1);
+  });
+
+  describe('isClaudeSubscriptionEnabledFor (ENG-2110)', () => {
+    const row = (sub: unknown, killSwitch = false) => ({ settingValue: JSON.stringify({ ...VALID_FLAGS, claudeSubscription: sub, killSwitch }) });
+
+    it('is true only for a user named one by one while the feature is on', async () => {
+      mockedGetSetting.mockResolvedValue(row({ enabled: true, allowUserIds: ['user-1'] }));
+      expect(await isClaudeSubscriptionEnabledFor('user-1')).toBe(true);
+      expect(await isClaudeSubscriptionEnabledFor('user-2')).toBe(false);
+    });
+
+    it('does NOT honour the * wildcard (logins are handled on the main backend until the worker exists)', async () => {
+      mockedGetSetting.mockResolvedValue(row({ enabled: true, allowUserIds: ['*'] }));
+      expect(await isClaudeSubscriptionEnabledFor('user-1')).toBe(false);
+      expect(await isClaudeSubscriptionEnabledFor('*')).toBe(false);
+    });
+
+    it('is false when the feature is off, when the kill switch is on, and when the row is missing', async () => {
+      mockedGetSetting.mockResolvedValue(row({ enabled: false, allowUserIds: ['user-1'] }));
+      expect(await isClaudeSubscriptionEnabledFor('user-1')).toBe(false);
+      __resetFundingFlagsCacheForTests();
+      mockedGetSetting.mockResolvedValue(row({ enabled: true, allowUserIds: ['user-1'] }, true));
+      expect(await isClaudeSubscriptionEnabledFor('user-1')).toBe(false);
+      __resetFundingFlagsCacheForTests();
+      mockedGetSetting.mockResolvedValue(null);
+      expect(await isClaudeSubscriptionEnabledFor('user-1')).toBe(false);
+    });
+
+    it('is independent of the BYOK switch', async () => {
+      mockedGetSetting.mockResolvedValue({ settingValue: JSON.stringify({ ...VALID_FLAGS, byok: { enabled: true, allowUserIds: ['*'] }, claudeSubscription: { enabled: false, allowUserIds: [] } }) });
+      expect(await isClaudeSubscriptionEnabledFor('user-1')).toBe(false);
+    });
   });
 });
