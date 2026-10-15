@@ -191,4 +191,77 @@ describe('AgentMode core loop — install_skills same-batch tool gate (ENG-1945)
       'is not available. You must install the required skill first using install_skills.',
     );
   });
+
+  describe('[tool-gate-refused] diagnostic (ENG-2299)', () => {
+    const REFUSAL = 'is not available. You must install the required skill first using install_skills.';
+    let warn: jest.SpyInstance;
+
+    const refusedLines = () => warn.mock.calls
+      .filter(([tag]) => tag === '[tool-gate-refused]')
+      .map(([, json]) => JSON.parse(json as string));
+
+    beforeEach(() => { warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined); });
+    afterEach(() => warn.mockRestore());
+
+    it('logs which skill claims a refused tool and leaves the refusal text unchanged', async () => {
+      const { result } = await runScenarioWithResult(service, {
+        message: 'Open the page.',
+        transcript: [
+          { tool_calls: [{ id: 'n1', name: 'playwright_browser_navigate', arguments: '{"url":"https://x.test"}' }] },
+          { content: 'Could not navigate.' },
+        ],
+        toolResults: {},
+      });
+
+      expect(String(result.toolCalls[0].error)).toContain(`Tool "playwright_browser_navigate" ${REFUSAL}`);
+      const [line] = refusedLines();
+      expect(line).toMatchObject({
+        tool: 'playwright_browser_navigate',
+        entitlementResolved: true,
+        installedSkillIds: ['linkedin-skill'],
+        otherSkillsInstalled: false,
+        inOtherSkillsPool: false,
+        catalogSize: 2,
+        claimedBy: [{ skillId: 'browser-skill', installed: false, tierAllows: true }],
+      });
+    });
+
+    it('still refuses with the same text when the describer throws', async () => {
+      jest.spyOn(service, 'describeToolGateRefusal').mockImplementation(() => { throw new Error('boom'); });
+      const { result } = await runScenarioWithResult(service, {
+        message: 'Open the page.',
+        transcript: [
+          { tool_calls: [{ id: 'n1', name: 'playwright_browser_navigate', arguments: '{"url":"https://x.test"}' }] },
+          { content: 'Could not navigate.' },
+        ],
+        toolResults: {},
+      });
+
+      expect(String(result.toolCalls[0].error)).toContain(`Tool "playwright_browser_navigate" ${REFUSAL}`);
+      expect(refusedLines()[0]).toMatchObject({ tool: 'playwright_browser_navigate', describeError: true });
+    });
+
+    it('reports a skill installed earlier in the same turn, not the turn-start list', async () => {
+      const getChatSession = (require('../../../services/chatbotService').chatbotDb.getChatSession as jest.Mock);
+      getChatSession
+        .mockResolvedValueOnce({ sessionId: 'test-session', messages: [], associatedSkills: ['linkedin-skill'] })
+        .mockResolvedValue({ sessionId: 'test-session', messages: [], associatedSkills: ['linkedin-skill', 'browser-skill'] });
+
+      await runScenarioWithResult(service, {
+        message: 'Install the browser skill, then check SEO.',
+        transcript: [
+          { tool_calls: [{ id: 'i1', name: 'install_skills', arguments: '{"skillIds":["browser-skill"]}' }] },
+          { tool_calls: [{ id: 's1', name: 'get_seo_metrics', arguments: '{}' }] },
+          { content: 'Done.' },
+        ],
+        toolResults: {
+          install_skills: { result: { success: true, message: 'ok', installedSkills: ['Browser automation'], installedToolNames: ['playwright_browser_navigate'] } },
+        },
+      });
+
+      const seo = refusedLines().find((l) => l.tool === 'get_seo_metrics');
+      expect(seo?.installedSkillIds).toEqual(['linkedin-skill', 'browser-skill']);
+      expect(seo?.claimedBy).toEqual([]);
+    });
+  });
 });

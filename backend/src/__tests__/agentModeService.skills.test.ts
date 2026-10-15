@@ -1008,6 +1008,136 @@ describe('AgentModeService - Skills', () => {
       // install_skills is always included (infrastructure but needed)
       expect(result.allowedToolNames.has('install_skills')).toBe(true);
     });
+
+    // ENG-2299: a published skill belonging to a subscription tier this user can
+    // never install must STILL claim its tool out of the shared __other_skills__
+    // catch-all — exactly like any other published skill (ENG-1237's isPublished
+    // check is the only axis that un-claims a tool). The caller's own tier
+    // entitlement governs whether THEY can install that skill directly, not
+    // whether its tool leaks into every other tier's catch-all; scoping the
+    // catalog by the caller's own allowedSkillIds before computing "claimed"
+    // tools would bypass that tier gate instead of fixing it.
+    it('should still treat a tool as associated when only a subscription-unreachable published skill claims it', () => {
+      const publishedSkills = [
+        { skillId: 'reachable-skill', name: 'Reachable', toolNames: ['tool_mine'], isPublished: true },
+        { skillId: 'other-tier-skill', name: 'Other Tier Skill', toolNames: ['tool_other_tier'], isPublished: true },
+      ];
+      const mockTools = [
+        { name: 'tool_mine', definition: {} },
+        { name: 'tool_other_tier', definition: {} },
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      // This subscriber's tier allows 'reachable-skill' and __other_skills__, but
+      // NOT 'other-tier-skill' — they can never install it to reach tool_other_tier.
+      const userAllowedSkillIds = ['reachable-skill', '__other_skills__'];
+
+      const result = (agentModeService as any).buildSkillContext([], userAllowedSkillIds, publishedSkills, ['__other_skills__']);
+
+      // tool_mine is claimed by 'reachable-skill' (even if not installed), so it
+      // must stay out of the catch-all.
+      expect(result.allowedToolNames.has('tool_mine')).toBe(false);
+      // tool_other_tier is claimed by a published skill this subscriber's tier
+      // cannot install — it must stay claimed (hidden) rather than falling
+      // through to this tier's __other_skills__ catch-all.
+      expect(result.allowedToolNames.has('tool_other_tier')).toBe(false);
+    });
+  });
+
+  describe('[install-refused] diagnostic (ENG-2299)', () => {
+    it('logs the buckets and pool size when __other_skills__ is refused, without changing the result', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue([] as any);
+
+      const result = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
+
+      expect(result.success).toBe(false);
+      expect(result.unavailableSkillIds).toEqual(['__other_skills__']);
+      const call = warn.mock.calls.find(([tag]) => tag === '[install-refused]');
+      expect(JSON.parse(call![1] as string)).toMatchObject({
+        sessionId: 'session-123',
+        userId: 'user-123',
+        unavailable: ['__other_skills__'],
+        catalogSize: 0,
+        otherSkillsPoolSize: 0,
+      });
+      warn.mockRestore();
+    });
+
+    it('also logs a partial install, flagged partial, when one requested id is rejected', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([
+        { skillId: 'real-skill', name: 'Real', description: 'd', toolNames: ['t1'], isPublished: true },
+      ]);
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue([] as any);
+
+      const result = await agentModeService.installSkills(['real-skill', 'ghost'], 'user-123', 'session-123');
+
+      expect(result.success).toBe(true);
+      expect(result.rejectedSkillIds).toEqual(['ghost']);
+      const call = warn.mock.calls.find(([tag]) => tag === '[install-refused]');
+      expect(JSON.parse(call![1] as string)).toMatchObject({ partial: true, unresolved: ['ghost'], requested: ['real-skill', 'ghost'] });
+      warn.mockRestore();
+    });
+
+    it('still returns the same refusal when the log cannot be built', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => { throw new Error('log sink down'); });
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+      const result = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
+
+      expect(result.success).toBe(false);
+      expect(result.unavailableSkillIds).toEqual(['__other_skills__']);
+      warn.mockRestore();
+    });
+  });
+
+  describe('describeToolGateRefusal (ENG-2299)', () => {
+    const published = [
+      { skillId: 'ads', name: 'Ads', toolNames: ['call_ads'], isPublished: true },
+      { skillId: 'draft', name: 'Draft', toolNames: ['call_draft'], isPublished: false },
+    ];
+
+    beforeEach(() => {
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue([
+        { name: 'call_ads', definition: {} },
+        { name: 'call_draft', definition: {} },
+        { name: 'loose_tool', definition: {} },
+      ] as any);
+    });
+
+    it('reports a claimed tool as not installed and not in the pool', () => {
+      const d = agentModeService.describeToolGateRefusal('call_ads', published, [], ['ads', '__other_skills__']);
+      expect(d.claimedBy).toEqual([{ skillId: 'ads', installed: false, tierAllows: true }]);
+      expect(d.inOtherSkillsPool).toBe(false);
+      expect(d.otherSkillsInstalled).toBe(false);
+      expect(d.tierAllowsOtherSkills).toBe(true);
+    });
+
+    it('reports an unclaimed tool as in the pool, and ignores unpublished claimers', () => {
+      const loose = agentModeService.describeToolGateRefusal('loose_tool', published, ['__other_skills__'], ['*']);
+      expect(loose.inOtherSkillsPool).toBe(true);
+      expect(loose.claimedBy).toEqual([]);
+      expect(loose.otherSkillsInstalled).toBe(true);
+      const draft = agentModeService.describeToolGateRefusal('call_draft', published, [], ['*']);
+      expect(draft.claimedBy).toEqual([]);
+      expect(draft.inOtherSkillsPool).toBe(true);
+    });
+
+    it('distinguishes an unresolved entitlement from a tier that allows nothing', () => {
+      const unresolved = agentModeService.describeToolGateRefusal('call_ads', published, [], null);
+      expect(unresolved.entitlementResolved).toBe(false);
+      const empty = agentModeService.describeToolGateRefusal('call_ads', published, [], []);
+      expect(empty.entitlementResolved).toBe(true);
+      expect(unresolved.catalogSize).toBe(2);
+    });
+
+    it('marks a claiming skill the tier does not allow', () => {
+      const d = agentModeService.describeToolGateRefusal('call_ads', published, ['ads'], ['other']);
+      expect(d.claimedBy).toEqual([{ skillId: 'ads', installed: true, tierAllows: false }]);
+      expect(d.tierAllowsOtherSkills).toBe(false);
+    });
   });
 
   describe('getUnassociatedTools', () => {
@@ -1212,6 +1342,47 @@ describe('AgentModeService - Skills', () => {
       const result = (agentModeService as any).buildAvailableSkillsMessage(publishedSkills, []);
 
       expect(result).toBe('');
+    });
+
+    // ENG-2299: every call above omits userAllowedSkillIds, so it defaults to
+    // ['*'] and the non-wildcard filter branch (`allowedSet.has(...)`) never
+    // runs. Covers both branches directly, mirroring buildSkillContext's
+    // corrected ENG-2299 test: a tier-excluded skill is hidden from the
+    // directly-listed entries, but its tool still stays claimed (hidden) out of
+    // __other_skills__ rather than falling through to this tier's catch-all.
+    it('wildcard userAllowedSkillIds lists every published skill', () => {
+      const publishedSkills = [
+        { skillId: 'reachable-skill', name: 'Reachable', description: 'Desc', toolNames: ['tool_mine'], isPublished: true },
+        { skillId: 'other-tier-skill', name: 'Other Tier Skill', description: 'Desc', toolNames: ['tool_other_tier'], isPublished: true },
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue([] as any);
+
+      const result = (agentModeService as any).buildAvailableSkillsMessage(publishedSkills, [], ['*']);
+
+      expect(result).toContain('reachable-skill- Reachable');
+      expect(result).toContain('other-tier-skill- Other Tier Skill');
+    });
+
+    it('non-wildcard userAllowedSkillIds hides a tier-excluded skill from the list but keeps its tool out of __other_skills__', () => {
+      const publishedSkills = [
+        { skillId: 'reachable-skill', name: 'Reachable', description: 'Desc', toolNames: ['tool_mine'], isPublished: true },
+        { skillId: 'other-tier-skill', name: 'Other Tier Skill', description: 'Desc', toolNames: ['tool_other_tier'], isPublished: true },
+      ];
+      const mockTools = [
+        { name: 'tool_mine', definition: { function: { description: 'desc' } } },
+        { name: 'tool_other_tier', definition: { function: { description: 'desc' } } },
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const userAllowedSkillIds = ['reachable-skill', '__other_skills__'];
+      const result = (agentModeService as any).buildAvailableSkillsMessage(publishedSkills, [], userAllowedSkillIds);
+
+      // Listed directly: only the reachable skill.
+      expect(result).toContain('reachable-skill- Reachable');
+      expect(result).not.toContain('other-tier-skill- Other Tier Skill');
+      // __other_skills__ catch-all: tool_other_tier stays claimed by the
+      // tier-excluded skill, so it must not surface here either.
+      expect(result).not.toContain('tool_other_tier');
     });
   });
 
