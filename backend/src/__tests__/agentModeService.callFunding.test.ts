@@ -189,6 +189,22 @@ describe('callLLM per-call funding (ENG-2108)', () => {
     expect(recordLlmUsage).not.toHaveBeenCalled();
   });
 
+  it('INTENDED: while the agent turn fails closed on a dead key, the helper calls around it (first-turn session title) stay AgentWeb-funded', async () => {
+    const { service, platformCreate, customerCreate } = setup();
+    routingStateFor.mockImplementation(async () => ({ hasConnection: true, usable: [] }));
+
+    // The turn's own working call ends with the real reason and is never served on AgentWeb...
+    await expect(call(service, CLAUDE, 'agent_task:interactive')).rejects.toMatchObject({ code: 'connection_unavailable' });
+    expect(platformCreate).not.toHaveBeenCalled();
+
+    // ...while the tiny helper call that runs before the turn (generateSessionTitle, feature 'session_title',
+    // customerRoutable false) is AgentWeb-funded by design: it never looks the customer's connection up.
+    await expect(call(service, CLAUDE, 'session_title')).resolves.toBeDefined();
+    expect(platformCreate).toHaveBeenCalledTimes(1);
+    expect(customerCreate).not.toHaveBeenCalled();
+    expect(fundingSeen().map((f: any) => f.route)).toEqual(['agentweb']);
+  });
+
   it('ENDS the call, and never serves it on AgentWeb, when the connection lookup fails', async () => {
     const { service, platformCreate } = setup();
     const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
