@@ -12,9 +12,9 @@
 
 import { spawn as spawnChildProcess, type ChildProcessWithoutNullStreams } from "child_process";
 import { createInterface, type Interface } from "readline";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import { isAbsolute, join } from "path";
 import { resolveClaudeBinary } from "./claudeBinary";
 
 /** The one MCP server a session may reach: the tool bridge (ENG-2109), with its run token. */
@@ -54,8 +54,9 @@ export interface ClaudeCliRunnerOptions {
    * runner's own handling does not depend on this hook, and an error thrown from it is
    * swallowed. Per-turn events can also be taken through `send()`'s `onEvent`.
    * The runner acts on an event first; sinks then receive it read-only (frozen). A sink runs
-   * while the turn is still pending, so it cannot call `send()` for the next turn from a
-   * `result` event. Events that arrive between turns, or after a `result`, go to the
+   * after the runner has settled the turn, so a sink may call `send()` for the next turn from a
+   * `result` event. A sink also sees the `system/init` event that made the runner reject a turn or
+   * close the session (an MCP server that is not connected), after that decision. Events that arrive between turns, or after a `result`, go to the
    * session-level sink only or to whichever turn is pending when they arrive: a caller must
    * not rely on per-turn attribution for hook events. To stop on an alarm use `terminate()`
    * (works between turns) or `interrupt()` (a turn in flight).
@@ -99,8 +100,8 @@ export interface ClaudeCliToolUseEvent {
 export interface ClaudeCliTurnResult {
   isError: boolean;
   resultText: string;
-  /** The raw parsed `result`-type stream-json event, for callers that need fields this type doesn't surface yet. */
-  raw: Record<string, unknown>;
+  /** The raw parsed `result`-type stream-json event (frozen), for callers that need fields this type doesn't surface yet. */
+  raw: Readonly<Record<string, unknown>>;
 }
 
 export interface ClaudeCliSessionHandle {
@@ -159,10 +160,25 @@ export class ClaudeCliRunner {
   private readonly pendingCloseRequests = new Set<string>();
   private readonly maxConcurrentProcesses: number;
   private readonly idleCloseMs: number;
+  /** The empty, private (mkdtemp: 0700, unpredictable name) working directory for sessions that pass no `cwd`. */
+  private defaultCwd: string | undefined;
 
   constructor(opts: { maxConcurrentProcesses?: number; idleCloseMs?: number } = {}) {
     this.maxConcurrentProcesses = opts.maxConcurrentProcesses ?? DEFAULT_MAX_CONCURRENT_PROCESSES;
     this.idleCloseMs = opts.idleCloseMs ?? DEFAULT_IDLE_CLOSE_MS;
+  }
+
+  /**
+   * One empty private directory per runner, created on first use. Created with `mkdtemp` (an
+   * unpredictable name, so nobody can pre-plant it), and recreated if the OS temp cleaner
+   * removed it while the backend was running (a missing cwd makes the spawn fail with an error
+   * that blames the binary).
+   */
+  private workingDir(): string {
+    if (!this.defaultCwd || !existsSync(this.defaultCwd)) {
+      this.defaultCwd = mkdtempSync(join(tmpdir(), "claude-cli-cwd-"));
+    }
+    return this.defaultCwd;
   }
 
   get activeProcessCount(): number {
@@ -187,6 +203,10 @@ export class ClaudeCliRunner {
     systemPromptFile: string,
     opts: ClaudeCliRunnerOptions = {},
   ): Promise<ClaudeCliSessionHandle> {
+    // A relative cwd would resolve against the backend's own working directory.
+    if (opts.cwd !== undefined && !isAbsolute(opts.cwd)) {
+      throw new Error("claudeCliRunner: cwd must be an absolute path");
+    }
     const existing = this.pool.get(conversationId);
     if (existing && !existing.closed) {
       // The MCP config is fixed at process start. Handing back a process that holds a
@@ -249,7 +269,7 @@ export class ClaudeCliRunner {
         // directory, so the process does not inherit the backend's cwd.
         child = spawnChildProcess(resolveClaudeBinary(), buildArgs(systemPromptFile, opts, mcpConfigFile), {
           env,
-          cwd: opts.cwd ?? defaultWorkingDir(),
+          cwd: opts.cwd ?? this.workingDir(),
         });
       } catch (err) {
         // Nothing owns the scratch dir yet, and it may already hold the run token.
@@ -363,7 +383,14 @@ export class ClaudeCliRunner {
    */
   terminate(handle: ClaudeCliSessionHandle): boolean {
     const session = this.pool.get(handle.conversationId);
-    if (!session || session.closed) return false;
+    if (!session || session.closed) {
+      // A spawn still queued or in flight has no session yet: close() makes it abort itself.
+      if (!session && this.spawning.has(handle.conversationId)) {
+        this.close(handle);
+        return true;
+      }
+      return false;
+    }
     this.closeSessionInternal(session, "terminated");
     return true;
   }
@@ -454,7 +481,7 @@ export class ClaudeCliRunner {
   }
 
   private handleLine(session: PooledSession, line: string): void {
-    // readline keeps delivering the rest of a chunk after close(); a closed session emits nothing.
+    // readline keeps delivering the rest of a chunk after close(); a session that was already closed emits nothing.
     if (session.closed || !line.trim()) return;
     let parsed: Record<string, unknown>;
     try {
@@ -462,6 +489,9 @@ export class ClaudeCliRunner {
     } catch {
       return; // stray non-JSON stdout noise is not a valid event; ignore rather than crash the session
     }
+    // `null`, numbers, strings and arrays are valid JSON but not events; reading `.type` on null throws,
+    // and a throw inside the readline listener would be an uncaught exception in the backend.
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return;
     // The sinks that were listening when this event arrived. The runner acts on the event
     // first and the sinks see it afterwards (read-only), so a sink cannot change what the
     // runner decides, and a sink that closes the session cannot mask the runner's own
@@ -627,17 +657,6 @@ function emitEvent(sinks: Array<((event: ClaudeCliEvent) => void) | undefined>, 
       console.error("[claudeCliRunner] onEvent failed (swallowed):", err instanceof Error ? err.message : String(err));
     }
   }
-}
-
-let sharedWorkingDir: string | undefined;
-/** One empty, private working directory shared by sessions that do not pass their own. */
-function defaultWorkingDir(): string {
-  if (!sharedWorkingDir) {
-    const dir = join(tmpdir(), `claude-cli-cwd-${process.getuid?.() ?? "x"}`);
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    sharedWorkingDir = dir;
-  }
-  return sharedWorkingDir;
 }
 
 function reportToolUses(message: unknown, report: (event: ClaudeCliToolUseEvent) => void): void {

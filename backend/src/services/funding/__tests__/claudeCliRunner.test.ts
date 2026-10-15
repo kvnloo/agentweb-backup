@@ -5,12 +5,13 @@ jest.mock('child_process', () => ({ spawn: jest.fn() }));
 jest.mock('fs', () => ({
   ...jest.requireActual('fs'),
   mkdtempSync: jest.fn((prefix: string) => `${prefix}fake`),
+  existsSync: jest.fn(() => true),
   rmSync: jest.fn(),
   writeFileSync: jest.fn(),
 }));
 
 import { spawn as mockSpawnFn } from 'child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { ClaudeCliRunner } from '../claudeCliRunner';
 
 const mockSpawn = mockSpawnFn as jest.Mock;
@@ -136,7 +137,7 @@ describe('ClaudeCliRunner', () => {
     expect(command).toMatch(/claude/);
   });
 
-  it('uses one stable working directory across sessions (not a new directory per session), distinct from the per-session HOME', async () => {
+  it('uses one private working directory for all of a runner\'s sessions, distinct from the per-session HOME, created once with mkdtemp', async () => {
     const runner = trackedRunner();
     await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
     await runner.spawn('conv-2', CONFIG_DIR, SYSTEM_PROMPT_FILE);
@@ -146,9 +147,25 @@ describe('ClaudeCliRunner', () => {
     expect(a.cwd).toBe(b.cwd);
     expect(a.cwd).not.toBe(a.env.HOME);
     expect(a.cwd).not.toBe(process.cwd());
-    // mkdtempSync is mocked to a constant, so also prove the cwd is never created per session:
-    // the only temp directory a session makes is its own HOME.
-    expect((mkdtempSync as jest.Mock).mock.calls.every((c) => String(c[0]).includes('claude-cli-home-'))).toBe(true);
+    const prefixes = (mkdtempSync as jest.Mock).mock.calls.map((c) => String(c[0]));
+    expect(prefixes.filter((p) => p.includes('claude-cli-cwd-'))).toHaveLength(1); // unpredictable name, made once
+    expect(prefixes.filter((p) => p.includes('claude-cli-home-'))).toHaveLength(2); // one HOME per session
+  });
+
+  it('recreates the working directory if the OS removed it while the backend was running', async () => {
+    const runner = trackedRunner();
+    await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    (existsSync as jest.Mock).mockImplementation((path: string) => !String(path).includes('claude-cli-cwd-'));
+    await runner.spawn('conv-2', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+    const prefixes = (mkdtempSync as jest.Mock).mock.calls.map((c) => String(c[0]));
+    expect(prefixes.filter((p) => p.includes('claude-cli-cwd-'))).toHaveLength(2);
+    (existsSync as jest.Mock).mockImplementation(() => true);
+  });
+
+  it('rejects a relative cwd (it would resolve against the backend\'s own working directory)', async () => {
+    const runner = trackedRunner();
+    await expect(runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { cwd: 'relative/dir' })).rejects.toThrow(/absolute/);
+    expect(mockSpawn).not.toHaveBeenCalled();
   });
 
   it('honours a caller-provided working directory', async () => {
@@ -1023,6 +1040,50 @@ describe('ClaudeCliRunner', () => {
         await flush();
         expect(runner.activeProcessCount).toBe(0);
       });
+    });
+  });
+
+
+  describe('round-2 review hardening (ENG-2110 PR 0)', () => {
+    it.each([['null', 'null'], ['a number', '123'], ['an array', '[1,2]'], ['a string', '"str"']])('ignores a stdout line that is valid JSON but not an event (%s) without crashing', async (_n, line) => {
+      const seen: string[] = [];
+      const runner = trackedRunner();
+      await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE, { onEvent: (e) => seen.push(String(e.type)) });
+      const child = spawnedChildren[0];
+      const turn = runner.send({ conversationId: 'conv-1' }, 'x');
+      child.stdout.push(line + '\n');
+      emitResult(child, { type: 'result', is_error: false, result: 'ok' });
+      await expect(turn).resolves.toMatchObject({ resultText: 'ok' });
+      expect(seen).toEqual(['result']);
+    });
+
+    it('terminate() during a spawn that is still queued aborts it: no process is ever started for it', async () => {
+      const runner = trackedRunner({ maxConcurrentProcesses: 1 });
+      const first = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+      const queued = runner.spawn('conv-2', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+      expect(runner.terminate({ conversationId: 'conv-2' })).toBe(true);
+      await queued;
+      runner.close(first); // frees the slot the queued spawn was waiting for
+      await flush();
+      expect(mockSpawn).toHaveBeenCalledTimes(1);
+      expect(runner.activeProcessCount).toBe(0);
+    });
+
+    it('a sink may start the next turn from the result event (the turn is already settled)', async () => {
+      const runner = trackedRunner();
+      const handle = await runner.spawn('conv-1', CONFIG_DIR, SYSTEM_PROMPT_FILE);
+      const child = spawnedChildren[0];
+      let next: Promise<unknown> | undefined;
+      const first = runner.send(handle, 'one', {
+        onEvent: (e) => {
+          if (e.type === 'result' && !next) next = runner.send(handle, 'two');
+        },
+      });
+      emitResult(child, { type: 'result', is_error: false, result: 'a' });
+      await first;
+      expect(next).toBeDefined();
+      emitResult(child, { type: 'result', is_error: false, result: 'b' });
+      await expect(next).resolves.toMatchObject({ resultText: 'b' });
     });
   });
 
