@@ -186,23 +186,20 @@ describe('buildSessionRow: the server owns classification', () => {
 
   it('first-touch channel is classified server-side from the stored first landing URL + referrer host', () => {
     const v = ok(base({ firstTouchLanding: 'https://go.example.com/?utm_source=tiktok', firstTouchReferrer: 'l.instagram.com', firstTouchChannel: 'Spoof' }));
-    // ENG-2494: referrer_first — the click's own referrer beats the (shared) utm_source.
+    // 2.2.0: the observed first referrer (Instagram) beats the link's tiktok tag.
     expect(buildSessionRow(v, { userAgent: CHROME, nowIso: 'T' }).customFields.firstTouchChannel).toBe('Instagram');
-    const noRef = ok(base({ firstTouchLanding: 'https://go.example.com/?utm_source=tiktok' }));
-    expect(buildSessionRow(noRef, { userAgent: CHROME, nowIso: 'T' }).customFields.firstTouchChannel).toBe('TikTok');
     const legacy = ok(base({ firstTouchChannel: 'Facebook' }));
     expect(buildSessionRow(legacy, { userAgent: CHROME, nowIso: 'T' }).customFields.firstTouchChannel).toBe('Facebook');
   });
-
   it('ENG-2494: on the first visit, first touch comes from THIS landing session, not SDK-stored state', () => {
-    const creator = 'https://go.dramabreak.ai/g?utm_source=agency-rise&utm_medium=agency';
+    const creator = 'https://go.dramabreak.ai/g?utm_source=tiktok&utm_medium=social';
     const stale = { firstTouchLanding: 'https://go.dramabreak.ai/g', firstTouchReferrer: 'youtube.com', firstTouchChannel: 'YouTube' };
-    const tt = ok(base({ visitNo: 1, landingUrl: creator, referrer: 'https://www.tiktok.com/', ...stale }));
-    const row = buildSessionRow(tt, { userAgent: CHROME, nowIso: 'T' }).customFields;
-    expect(row.firstTouchChannel).toBe('TikTok');
-    expect(row.firstTouchReferrer).toBe('tiktok.com');
-    const yt = ok(base({ visitNo: 1, landingUrl: creator, referrer: 'https://www.youtube.com/' }));
-    expect(buildSessionRow(yt, { userAgent: CHROME, nowIso: 'T' }).customFields.firstTouchChannel).toBe('YouTube');
+    const yt = ok(base({ visitNo: 1, landingUrl: creator, referrer: 'https://www.youtube.com/', ...stale }));
+    const row = buildSessionRow(yt, { userAgent: CHROME, nowIso: 'T' }).customFields;
+    expect(row.firstTouchChannel).toBe('YouTube');
+    expect(row.firstTouchReferrer).toBe('youtube.com');
+    const ig = ok(base({ visitNo: 1, landingUrl: creator, referrer: 'https://l.instagram.com/', ...stale }));
+    expect(buildSessionRow(ig, { userAgent: CHROME, nowIso: 'T' }).customFields.firstTouchChannel).toBe('Instagram');
   });
 });
 

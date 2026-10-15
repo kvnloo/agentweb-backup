@@ -246,7 +246,7 @@ export function buildSessionRow(
     fields[`${p.event}_at`] = ctx.nowIso;
   }
 
-  // Server-classified first touch (ENG-2494). referrer_first: a creator's single agency UTM link is
+  // Server-classified first touch (ENG-2494). A creator's single UTM link is
   // shared across platforms, so the click's own referrer / in-app UA decides the channel. On the
   // visitor's first visit first touch IS this landing session, so it is derived from this request's own referrer and URL, never from SDK-stored state
   // left by earlier browser activity.
@@ -255,7 +255,6 @@ export function buildSessionRow(
       landingUrl: p.landingUrl,
       referrer: p.referrer,
       userAgent: ctx.userAgent,
-      sourceOrder: 'referrer_first',
     });
     fields.firstTouchChannel = ft.channel;
     if (ft.referrerHost) fields.firstTouchReferrer = ft.referrerHost; else delete fields.firstTouchReferrer;
@@ -267,7 +266,6 @@ export function buildSessionRow(
       landingUrl: p.firstTouchLanding,
       referrer: /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(ftHost) ? `https://${ftHost}/` : '',
       userAgent: ctx.userAgent,
-      sourceOrder: 'referrer_first',
     });
     fields.firstTouchChannel = ft.channel;
   }
@@ -277,6 +275,8 @@ export function buildSessionRow(
   fields.channelKey = classification.channelKey;
   fields.channelGroup = classification.channelGroup;
   fields.classifierVersion = classification.classifierVersion;
+  if (classification.linkChannel) fields.linkChannel = classification.linkChannel; else delete fields.linkChannel;
+  if (classification.detectedChannel) fields.detectedChannel = classification.detectedChannel; else delete fields.detectedChannel;
   fields.device = deviceFromUserAgent(ctx.userAgent);
   if (classification.referrerHost) fields.referrerHost = classification.referrerHost; else delete fields.referrerHost;
   if (classification.sourceLink) fields.sourceLink = classification.sourceLink; else delete fields.sourceLink;
