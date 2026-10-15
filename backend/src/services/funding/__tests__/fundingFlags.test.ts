@@ -90,4 +90,66 @@ describe('getFundingFlags (ENG-1816 F1)', () => {
       expect(await isClaudeSubscriptionEnabledFor('user-1')).toBe(false);
     });
   });
+
+  describe('a failed read keeps the last good flags (ENG-2108)', () => {
+    afterEach(() => jest.useRealTimers());
+
+    it('does not flip BYOK off for a customer already on their own key when a refresh read fails', async () => {
+      jest.useFakeTimers();
+      const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockedGetSetting.mockResolvedValueOnce({ settingValue: JSON.stringify(VALID_FLAGS) });
+      expect((await getFundingFlags()).byok.enabled).toBe(true);
+
+      jest.advanceTimersByTime(61_000);
+      mockedGetSetting.mockRejectedValueOnce(new Error('dynamo blip'));
+      expect((await getFundingFlags()).byok).toEqual({ enabled: true, allowUserIds: ['user-1'] });
+      spy.mockRestore();
+    });
+
+    it('does the same when the stored value is malformed', async () => {
+      jest.useFakeTimers();
+      const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockedGetSetting.mockResolvedValueOnce({ settingValue: JSON.stringify(VALID_FLAGS) });
+      await getFundingFlags();
+      jest.advanceTimersByTime(61_000);
+      mockedGetSetting.mockResolvedValueOnce({ settingValue: '{ nope' });
+      expect((await getFundingFlags()).byok.enabled).toBe(true);
+      spy.mockRestore();
+    });
+
+    it('retries soon after a failed read, not after a full cache window, and recovers', async () => {
+      jest.useFakeTimers();
+      const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockedGetSetting.mockResolvedValueOnce({ settingValue: JSON.stringify(VALID_FLAGS) });
+      await getFundingFlags();
+      jest.advanceTimersByTime(61_000);
+      mockedGetSetting.mockRejectedValueOnce(new Error('blip'));
+      await getFundingFlags();
+      expect(mockedGetSetting).toHaveBeenCalledTimes(2);
+      await getFundingFlags(); // within the retry delay: no new read
+      expect(mockedGetSetting).toHaveBeenCalledTimes(2);
+
+      jest.advanceTimersByTime(5_001);
+      mockedGetSetting.mockResolvedValueOnce({ settingValue: JSON.stringify({ ...VALID_FLAGS, byok: { enabled: false, allowUserIds: [] } }) });
+      expect((await getFundingFlags()).byok.enabled).toBe(false);
+      expect(mockedGetSetting).toHaveBeenCalledTimes(3);
+      spy.mockRestore();
+    });
+
+    it('still turns BYOK off when the row was deliberately changed or deleted (only FAILED reads keep the old value)', async () => {
+      jest.useFakeTimers();
+      mockedGetSetting.mockResolvedValueOnce({ settingValue: JSON.stringify(VALID_FLAGS) });
+      await getFundingFlags();
+      jest.advanceTimersByTime(61_000);
+      mockedGetSetting.mockResolvedValueOnce(null);
+      expect((await getFundingFlags()).byok.enabled).toBe(false);
+    });
+
+    it('a process that has never read the flags falls back to all-off on a failed read', async () => {
+      const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockedGetSetting.mockRejectedValueOnce(new Error('blip'));
+      expect((await getFundingFlags()).byok.enabled).toBe(false);
+      spy.mockRestore();
+    });
+  });
 });
