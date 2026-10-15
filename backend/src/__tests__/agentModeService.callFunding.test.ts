@@ -40,19 +40,21 @@ jest.mock('../services/funding/recordLlmUsage', () => ({
   ...jest.requireActual('../services/funding/recordLlmUsage'),
   recordLlmUsage: jest.fn(),
 }));
-const listUsableForUser = jest.fn();
+const routingStateFor = jest.fn();
 jest.mock('../services/funding/llmConnectionService', () => ({
-  getLlmConnectionService: () => ({ listUsableForUser }),
+  getLlmConnectionService: () => ({ routingStateFor }),
 }));
 const getFundingFlags = jest.fn();
 jest.mock('../services/funding/fundingFlags', () => ({
   getFundingFlags: (...a: unknown[]) => getFundingFlags(...a),
 }));
 
-import { AgentModeService } from '../services/agentModeService';
+import { AgentModeService, titleFromUserMessage } from '../services/agentModeService';
+import { LEGACY_MODEL_ALIASES } from '../services/agentMode/llmModelRegistry';
 import { recordLlmUsage } from '../services/funding/recordLlmUsage';
 import { withRunFunding, type RunFunding } from '../services/funding/runFunding';
 import { registerCustomerRouteProvisioner } from '../services/funding/transport/customerRouteProvisioner';
+import { __resetCallFundingCacheForTests } from '../services/funding/callFunding';
 
 /**
  * ENG-2108 (A2): callLLM funds each call from the key that actually pays, and the usage
@@ -95,7 +97,11 @@ describe('callLLM per-call funding (ENG-2108)', () => {
     jest.clearAllMocks();
     process.env.OPENROUTER_API_KEY = 'platform-key';
     getFundingFlags.mockResolvedValue({ killSwitch: false, byok: { enabled: true, allowUserIds: ['*'] } });
-    listUsableForUser.mockResolvedValue([connection]);
+    __resetCallFundingCacheForTests();
+    // Provider-aware, like the real service: only the Anthropic key exists.
+    routingStateFor.mockImplementation(async (_user: string, provider: string) =>
+      provider === 'anthropic' ? { hasConnection: true, usable: [connection] } : { hasConnection: false, usable: [] },
+    );
   });
   afterEach(() => registerCustomerRouteProvisioner(null));
 
@@ -135,7 +141,7 @@ describe('callLLM per-call funding (ENG-2108)', () => {
 
     expect(customerCreate).not.toHaveBeenCalled();
     expect(platformCreate).toHaveBeenCalledTimes(1);
-    expect(listUsableForUser).not.toHaveBeenCalled();
+    expect(routingStateFor).not.toHaveBeenCalled();
   });
 
   it('drops fallback models from another lab on a customer key, and keeps same-lab ones', async () => {
@@ -173,6 +179,102 @@ describe('callLLM per-call funding (ENG-2108)', () => {
     expect(platformCreate).not.toHaveBeenCalled();
   });
 
+  it('ENDS the call, and never serves it on AgentWeb, when the customer has a key that cannot serve (the headline bug)', async () => {
+    const { service, platformCreate, customerCreate } = setup();
+    // The customer has an Anthropic key, but it is not usable right now (invalid, pending, ...).
+    routingStateFor.mockImplementation(async () => ({ hasConnection: true, usable: [] }));
+    await expect(call(service, CLAUDE, 'agent_task:interactive')).rejects.toMatchObject({ code: 'connection_unavailable' });
+
+    expect(platformCreate).not.toHaveBeenCalled();
+    expect(customerCreate).not.toHaveBeenCalled();
+    expect(recordLlmUsage).not.toHaveBeenCalled();
+  });
+
+  it('INTENDED: while the agent turn fails closed on a dead key, the helper calls around it (first-turn session title) stay AgentWeb-funded', async () => {
+    const { service, platformCreate, customerCreate } = setup();
+    routingStateFor.mockImplementation(async () => ({ hasConnection: true, usable: [] }));
+
+    // The turn's own working call ends with the real reason and is never served on AgentWeb...
+    await expect(call(service, CLAUDE, 'agent_task:interactive')).rejects.toMatchObject({ code: 'connection_unavailable' });
+    expect(platformCreate).not.toHaveBeenCalled();
+
+    // ...while the tiny helper call that runs before the turn (generateSessionTitle, feature 'session_title',
+    // customerRoutable false) is AgentWeb-funded by design: it never looks the customer's connection up.
+    await expect(call(service, CLAUDE, 'session_title')).resolves.toBeDefined();
+    expect(platformCreate).toHaveBeenCalledTimes(1);
+    expect(customerCreate).not.toHaveBeenCalled();
+    expect(fundingSeen().map((f: any) => f.route)).toEqual(['agentweb']);
+  });
+
+  describe('the first-message title when the user\'s own key cannot serve the turn (ENG-2111)', () => {
+    const MESSAGE = 'Plan a launch campaign for our new SaaS product';
+    const ctxFor = { userId: 'member-1', feature: 'session_title' } as any;
+    const deadKey = () => routingStateFor.mockImplementation(async () => ({ hasConnection: true, usable: [] }));
+
+    it('is cut from the message with no AI call, so AgentWeb spends nothing on a turn that fails closed', async () => {
+      const { service, platformCreate, customerCreate } = setup();
+      deadKey();
+      expect(await service.generateSessionTitle(MESSAGE, ctxFor, CLAUDE)).toBe(MESSAGE);
+      expect(platformCreate).not.toHaveBeenCalled();
+      expect(customerCreate).not.toHaveBeenCalled();
+      expect(recordLlmUsage).not.toHaveBeenCalled();
+    });
+
+    it('also skips the AI call when the connection lookup fails (fails closed here too)', async () => {
+      const { service, platformCreate } = setup();
+      const err = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      routingStateFor.mockRejectedValue(Object.assign(new Error('store down'), { code: 'ThrottlingException' }));
+      expect(await service.generateSessionTitle(MESSAGE, ctxFor, CLAUDE)).toBe(MESSAGE);
+      expect(platformCreate).not.toHaveBeenCalled();
+      err.mockRestore();
+    });
+
+    it('resolves a legacy model id to the same provider the turn uses', async () => {
+      const { service, platformCreate } = setup();
+      deadKey();
+      const legacy = Object.keys(LEGACY_MODEL_ALIASES).find((k) => (service as any).llmModels[(service as any).normalizeModelId(k)]?.provider === 'anthropic');
+      expect(legacy).toBeDefined(); // the registry must still have a legacy alias for an anthropic model, or this test proves nothing
+      expect(await service.generateSessionTitle(MESSAGE, ctxFor, legacy!)).toBe(MESSAGE);
+      expect(platformCreate).not.toHaveBeenCalled();
+    });
+
+    it('still makes the AI title call for everyone else: no connection, BYOK off, no turn model, an unknown model', async () => {
+      const cases: Array<[string, () => void, string | undefined]> = [
+        ['no connection for the provider', () => routingStateFor.mockImplementation(async () => ({ hasConnection: false, usable: [] })), CLAUDE],
+        ['BYOK off', () => { getFundingFlags.mockResolvedValue({ killSwitch: false, byok: { enabled: false, allowUserIds: [] } }); deadKey(); }, CLAUDE],
+        ['no turn model passed (other callers)', () => deadKey(), undefined],
+        ['a model the registry does not know', () => deadKey(), 'no-such-model'],
+      ];
+      for (const [label, arrange, model] of cases) {
+        jest.clearAllMocks();
+        getFundingFlags.mockResolvedValue({ killSwitch: false, byok: { enabled: true, allowUserIds: ['*'] } });
+        __resetCallFundingCacheForTests();
+        const { service, platformCreate } = setup();
+        arrange();
+        await service.generateSessionTitle(MESSAGE, ctxFor, model);
+        expect({ label, aiCalls: platformCreate.mock.calls.length }).toEqual({ label, aiCalls: 1 });
+      }
+    });
+
+    it('a message-derived title is clean and bounded', () => {
+      expect(titleFromUserMessage('  **Hello**\n\n`world`  ')).toBe('Hello world');
+      expect(titleFromUserMessage('')).toBe('Marketing Task');
+      const long = titleFromUserMessage('word '.repeat(40));
+      expect(long.length).toBeLessThanOrEqual(60);
+      expect(long.endsWith(' ')).toBe(false);
+    });
+  });
+
+  it('ENDS the call, and never serves it on AgentWeb, when the connection lookup fails', async () => {
+    const { service, platformCreate } = setup();
+    const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    routingStateFor.mockRejectedValue(Object.assign(new Error('x'), { code: 'ThrottlingException' }));
+    await expect(call(service, CLAUDE, 'agent_task:interactive')).rejects.toMatchObject({ code: 'lookup_failed' });
+    spy.mockRestore();
+
+    expect(platformCreate).not.toHaveBeenCalled();
+  });
+
   it('rejects an unknown fallback model on a customer key exactly as on an AgentWeb call', async () => {
     const { service } = setup();
     await expect(call(service, CLAUDE, 'agent_task:interactive', { fallbackModels: ['openrouter/no/such-model'] })).rejects.toThrow(/fallback model/i);
@@ -186,7 +288,7 @@ describe('callLLM per-call funding (ENG-2108)', () => {
 
     expect(customerCreate).not.toHaveBeenCalled();
     expect(platformCreate).toHaveBeenCalledTimes(1);
-    expect(listUsableForUser).not.toHaveBeenCalled();
+    expect(routingStateFor).not.toHaveBeenCalled();
     expect(fundingSeen()).toEqual([expect.objectContaining({ route: 'agentweb' })]);
   });
 

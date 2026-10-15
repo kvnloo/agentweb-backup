@@ -356,6 +356,40 @@ export class LlmConnectionService {
   }
 
   /**
+   * What routing must know about a user's connections for ONE provider, so a customer who
+   * has a key never silently becomes AgentWeb-funded because that key is not usable right
+   * now (pending, invalid, suspended, anything).
+   *
+   * `hasConnection`: the user can reach at least one non-revoked connection for the
+   * provider (their own, or one shared with their org by someone who is still an owner)
+   * whose owner has BYOK switched on. `usable`: the subset that can serve a call now.
+   * Revoked connections count as neither: revoking is how a customer says they are done.
+   */
+  async routingStateFor(userId: string, provider: string): Promise<{ hasConnection: boolean; usable: LlmConnectionView[] }> {
+    const access = await this.access(userId);
+    const own = await this.deps.db.listByOwner(userId);
+    const shared = access.org ? await this.deps.db.listSharedWithOrg(access.org.orgId) : [];
+    const seen = new Set(own.map((record) => record.connectionId));
+    const enabledByOwner = new Map<string, boolean>();
+    let hasConnection = false;
+    const usable: LlmConnectionView[] = [];
+    for (const record of [...own, ...shared.filter((r) => !seen.has(r.connectionId))]) {
+      if (record.kind !== "api_key" || record.provider !== provider || record.status === "revoked") continue;
+      const mine = record.ownerUserId === userId;
+      if (!mine && !(access.org && (await this.sharerStillOwns(record, access.org)))) continue;
+      let enabled = enabledByOwner.get(record.ownerUserId);
+      if (enabled === undefined) {
+        enabled = await this.deps.isByokEnabledFor(record.ownerUserId);
+        enabledByOwner.set(record.ownerUserId, enabled);
+      }
+      if (!enabled) continue;
+      hasConnection = true;
+      if (await this.usableBy(record, access)) usable.push(toView(record, userId));
+    }
+    return { hasConnection, usable };
+  }
+
+  /**
    * The raw provider key, for a transport about to make a call on `forUserId`'s behalf.
    * Reads the connection fresh every time, so a revoke takes effect on the next call.
    * Callers must not cache the result beyond the run and must never log it.
