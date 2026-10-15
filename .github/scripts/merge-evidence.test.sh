@@ -997,6 +997,55 @@ run_gate "${d}"
 check 'retired integration success is not execution evidence' 3 'NO_EVIDENCE'
 
 # ---------------------------------------------------------------------------
+# ENG-2506 — Opslane "nothing to verify" neutral is an abstention, not a fail
+# ---------------------------------------------------------------------------
+# Real shape from agentweb#3552 (2026-10-15).
+opslane_run() { # $1 conclusion, $2 title
+  printf '{"name":"Opslane","app":{"slug":"opslane"},"status":"completed","conclusion":"%s","output":{"title":"%s","summary":"This check doesn'"'"'t block the merge."}}' "$1" "$2"
+}
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_run neutral 'Nothing Opslane can verify here')"'
+]'
+run_gate "${d}"
+check 'ENG-2506: Opslane neutral nothing-to-verify alone does not block' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_run failure 'Nothing Opslane can verify here')"'
+]'
+run_gate "${d}"
+check 'ENG-2506: Opslane failure still blocks' 1 'Opslane (failure)'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_run neutral 'Opslane found 2 risks')"'
+]'
+run_gate "${d}"
+check 'ENG-2506: Opslane neutral with any other title still blocks' 1 'Opslane (neutral)'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Opslane","app":{"slug":"impostor"},"status":"completed","conclusion":"neutral","output":{"title":"Nothing Opslane can verify here"}}
+]'
+run_gate "${d}"
+check 'ENG-2506: a non-Opslane app using the same name/title still blocks' 1 'Opslane (neutral)'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "[$(opslane_run neutral 'Nothing Opslane can verify here')]"
+run_gate "${d}"
+check 'ENG-2506: an Opslane abstention alone is not execution evidence' 3 'NO_EVIDENCE'
+
+# ---------------------------------------------------------------------------
 # Regression proof — the previous procedure returns a false green here
 # ---------------------------------------------------------------------------
 #
