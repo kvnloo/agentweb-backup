@@ -776,7 +776,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // ENG-2123: an EMAIL-LESS capture can be a repeat of an earlier one on the same number. Off unless the
     // LEAD_PHONE_DEDUPE_MODE setting says otherwise (utils/phoneLeadDedupeMode.ts), never for session lists
     // or the synthetic smoke-test numbers (which have their own deterministic-id path below).
-    const phoneMode = !normalizedEmail && normalizedPhone && !sessionIdentity && !isSessionList(leadList) && !isSmokeTestPhone(normalizedPhone)
+    const phoneMode = !normalizedEmail && !leadData.linkedin && normalizedPhone && !sessionIdentity && !isSessionList(leadList) && !isSmokeTestPhone(normalizedPhone)
       ? await getPhoneDedupeMode()
       : 'off';
     const phoneKey = phoneMode === 'off' ? '' : phoneDedupeKey(normalizedPhone);

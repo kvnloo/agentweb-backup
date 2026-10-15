@@ -7,7 +7,8 @@ import { settingsService } from '../services/settingsService';
  *
  *   off     (default) today's behaviour exactly
  *   create  concurrent same-phone captures collapse to one row (exactly-once create)
- *   shadow  create + look up repeat visitors and LOG what a merge would do; nothing is merged
+ *   shadow  create + look up repeat visitors and LOG what a merge would do; no cross-time merge (a
+ *           same-bucket repeat still collapses exactly as in 'create')
  *   on      create + lookup + merge a repeat visitor into the existing row
  *
  * Any read failure, a missing row, or an unknown value means 'off': this guards the public capture
