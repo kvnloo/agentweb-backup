@@ -1044,6 +1044,39 @@ describe('AgentModeService - Skills', () => {
     });
   });
 
+  describe('[install-refused] diagnostic (ENG-2299)', () => {
+    it('logs the buckets and pool size when __other_skills__ is refused, without changing the result', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue([] as any);
+
+      const result = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
+
+      expect(result.success).toBe(false);
+      expect(result.unavailableSkillIds).toEqual(['__other_skills__']);
+      const call = warn.mock.calls.find(([tag]) => tag === '[install-refused]');
+      expect(JSON.parse(call![1] as string)).toMatchObject({
+        sessionId: 'session-123',
+        userId: 'user-123',
+        unavailable: ['__other_skills__'],
+        catalogSize: 0,
+        otherSkillsPoolSize: 0,
+      });
+      warn.mockRestore();
+    });
+
+    it('still returns the same refusal when the log cannot be built', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => { throw new Error('log sink down'); });
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+      const result = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
+
+      expect(result.success).toBe(false);
+      expect(result.unavailableSkillIds).toEqual(['__other_skills__']);
+      warn.mockRestore();
+    });
+  });
+
   describe('describeToolGateRefusal (ENG-2299)', () => {
     const published = [
       { skillId: 'ads', name: 'Ads', toolNames: ['call_ads'], isPublished: true },

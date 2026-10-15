@@ -7170,6 +7170,20 @@ export class AgentModeService {
         if (rejectedSkillIds.length > 0) {
           const buckets = await this.classifySkillRejections(rejectedSkillIds, userId);
           const { unentitled, unavailable, unresolved, forbidden } = buckets;
+          try {
+            const published = await skillService.getPublishedSkills();
+            console.warn('[install-refused]', JSON.stringify({
+              sessionId,
+              userId,
+              requested: skillIds.slice(0, 20),
+              unentitled: unentitled.slice(0, 20),
+              unavailable: unavailable.slice(0, 20),
+              unresolved: unresolved.slice(0, 20),
+              forbidden: forbidden.slice(0, 20),
+              catalogSize: published.length,
+              otherSkillsPoolSize: this.getUnassociatedToolNames(published).length,
+            }));
+          } catch { /* diagnostics must never change the refusal */ }
           /*
            * `success: false` matters as much as the text: the success path returns
            * `success: true`, so a bare `{ message }` left `success` undefined and this refusal
