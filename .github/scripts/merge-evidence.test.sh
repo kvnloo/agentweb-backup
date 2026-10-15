@@ -1016,6 +1016,24 @@ d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" '[
   {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_run neutral 'Nothing to verify in this PR')"'
+]'
+run_gate "${d}"
+check 'ENG-2506: Opslane alternate abstention title does not block' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_run neutral 'Nothing to verify')"'
+]'
+run_gate "${d}"
+check 'ENG-2506: a near-miss abstention title still blocks' 1 'Opslane (neutral)'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
   '"$(opslane_run failure 'Nothing Opslane can verify here')"'
 ]'
 run_gate "${d}"
