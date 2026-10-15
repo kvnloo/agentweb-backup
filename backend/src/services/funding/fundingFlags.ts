@@ -118,6 +118,17 @@ export async function isByokEnabledFor(userId: string): Promise<boolean> {
   return flags.byok.allowUserIds.includes(FUNDING_ALLOW_ALL) || flags.byok.allowUserIds.includes(userId);
 }
 
+/**
+ * Whether `userId` may connect and use a Claude subscription. Unlike BYOK, the `*`
+ * wildcard is NOT honoured: until the shared worker machine exists (B5), logins are
+ * handled on the main backend, so only users named one by one can be enabled.
+ */
+export async function isClaudeSubscriptionEnabledFor(userId: string): Promise<boolean> {
+  const flags = await getFundingFlags();
+  if (flags.killSwitch || !flags.claudeSubscription.enabled) return false;
+  return userId !== FUNDING_ALLOW_ALL && flags.claudeSubscription.allowUserIds.includes(userId);
+}
+
 export function __resetFundingFlagsCacheForTests(): void {
   cachedFlags = null;
   cachedAt = 0;
