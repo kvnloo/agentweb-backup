@@ -570,6 +570,7 @@ fi
 # Opslane `failure`, or a `neutral` with any other title, still blocks. A
 # dropped abstention is not positive evidence either.
 OPSLANE_NOOP_TITLE='Nothing Opslane can verify here'
+# shellcheck disable=SC2016 # $t is a jq variable, not a shell expansion
 opslane_filter='select((.app.slug // "") == "opslane" and .name == "Opslane"
   and .conclusion == "neutral" and ((.output.title // "") == $t))'
 opslane_noop="$(printf '%s' "${runs_json}" | jq -r --arg t "${OPSLANE_NOOP_TITLE}" \
@@ -578,9 +579,9 @@ if ! grep -qE '^[0-9]+$' <<<"${opslane_noop}"; then
   hard_fail "failed to identify Opslane nothing-to-verify check-runs at ${head_sha}"
 fi
 if [ "${opslane_noop}" -gt 0 ]; then
-  runs_json="$(printf '%s' "${runs_json}" | jq -c --arg t "${OPSLANE_NOOP_TITLE}" \
-    ".check_runs |= map(select(. as \$c | [\$c | ${opslane_filter}] | length == 0))" 2>/dev/null)"
-  if [ "$?" -ne 0 ] || [ -z "${runs_json}" ]; then
+  if ! runs_json="$(printf '%s' "${runs_json}" | jq -c --arg t "${OPSLANE_NOOP_TITLE}" \
+    ".check_runs |= map(select(. as \$c | [\$c | ${opslane_filter}] | length == 0))" 2>/dev/null)" \
+    || [ -z "${runs_json}" ]; then
     hard_fail "failed to exclude Opslane nothing-to-verify check-runs at ${head_sha}"
   fi
   log "ignored ${opslane_noop} Opslane (neutral) check-run(s) titled '${OPSLANE_NOOP_TITLE}': an abstention, not a verdict"
