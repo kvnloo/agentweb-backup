@@ -171,3 +171,42 @@ describe('Opslane #2 — explicit "no email"', () => {
     expect(text).toMatch(/\[\]/);
   });
 });
+
+// ENG-2493: the opt-out is persisted so the run-time alert senders (run-failed,
+// sourcing-block, disallowed-tool, usage-limit) stop falling back to the owner's address.
+describe('ENG-2493 — the email opt-out is persisted on the schedule', () => {
+  const existing = (over: any = {}) => ({
+    scheduleId: 's1', userId: USER.userId, scheduleName: 'n', startingMessage: 'm', frequency: 'weekly',
+    status: 'paused', emailNotifications: ['owner@example.com'], nextRunTime: '2026-10-19T13:00:00.000Z', ...over,
+  });
+
+  it('create via the tool with email_notifications: [] stores emailOptOut: true', async () => {
+    await run({ ...baseCreate, next_run_time: '2026-10-19T13:00:00Z', email_notifications: [] });
+    expect(mockScheduleDb.createSchedule.mock.calls[0][0].emailOptOut).toBe(true);
+  });
+
+  it('create with recipients, or with the field omitted, does not opt out', async () => {
+    await run({ ...baseCreate, next_run_time: '2026-10-19T13:00:00Z', email_notifications: ['a@example.com'] });
+    await run({ ...baseCreate, next_run_time: '2026-10-19T13:00:00Z' });
+    expect(mockScheduleDb.createSchedule.mock.calls[0][0].emailOptOut).not.toBe(true);
+    expect(mockScheduleDb.createSchedule.mock.calls[1][0].emailOptOut).not.toBe(true);
+  });
+
+  it('update clearing recipients with [] sets emailOptOut: true', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(existing() as any);
+    await run({ action: 'update', schedule_id: 's1', email_notifications: [] });
+    expect((mockScheduleDb.updateSchedule.mock.calls[0][1] as any).emailOptOut).toBe(true);
+  });
+
+  it('update setting recipients clears emailOptOut', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(existing({ emailNotifications: [], emailOptOut: true }) as any);
+    await run({ action: 'update', schedule_id: 's1', email_notifications: ['owner@example.com'] });
+    expect((mockScheduleDb.updateSchedule.mock.calls[0][1] as any).emailOptOut).toBe(false);
+  });
+
+  it('an update that does not touch recipients leaves the stored opt-out alone', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(existing({ emailNotifications: [], emailOptOut: true }) as any);
+    await run({ action: 'update', schedule_id: 's1', schedule_name: 'renamed' });
+    expect(mockScheduleDb.updateSchedule.mock.calls[0][1]).not.toHaveProperty('emailOptOut');
+  });
+});
