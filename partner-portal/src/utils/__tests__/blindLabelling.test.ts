@@ -1,4 +1,4 @@
-import { AI_LABEL_NOTE_PREFIX, blindForHuman, isAiLabelledCase } from "../blindLabelling";
+import { AI_LABEL_NOTE_PREFIX, blindForHuman, isAiLabelledCase, withoutDraft } from "../blindLabelling";
 
 const humanCase = { caseId: "h", version: 3, labels: { task_success: "pass" }, notes: "checked by hand" };
 const aiCase = {
@@ -43,5 +43,14 @@ describe("blindLabelling", () => {
   it("works for a pairwise case", () => {
     const pair = { labels: { pairwise_preference: "A" }, notes: `${AI_LABEL_NOTE_PREFIX} x`, pair: { batch: "2026-W40" } };
     expect(blindForHuman(pair).labels).toEqual({});
+  });
+
+  it("withoutDraft drops the draft from a saved case and returns draft-less cases as they are", () => {
+    const saved = { caseId: "s", labels: { task_success: "pass" }, draft: { model: "m" } };
+    const out = withoutDraft(saved);
+    expect("draft" in out).toBe(false);
+    expect(out.labels).toEqual({ task_success: "pass" });
+    expect(saved.draft).toEqual({ model: "m" });
+    expect(withoutDraft(humanCase)).toBe(humanCase);
   });
 });

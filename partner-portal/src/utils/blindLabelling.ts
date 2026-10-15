@@ -28,3 +28,13 @@ export function blindForHuman<T extends BlindableCase>(c: T): T {
   const { draft: _draft, labeller: _labeller, labelledAt: _labelledAt, ...rest } = c;
   return { ...rest, labels: {}, notes: '' } as T;
 }
+
+/**
+ * A case as returned by a save: the AI draft is dropped so it cannot appear right after the human's
+ * labels are stored (the backend keeps `draft` on the record; it is not part of the label).
+ */
+export function withoutDraft<T extends object>(c: T): T {
+  if (!('draft' in c)) return c;
+  const { draft: _draft, ...rest } = c as T & { draft?: unknown };
+  return rest as T;
+}

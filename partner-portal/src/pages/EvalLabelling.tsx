@@ -45,7 +45,7 @@ import {
 import FactCheckIcon from '@mui/icons-material/FactCheck';
 import { buildApiUrl } from '../config';
 import { useAuth } from '../contexts/AuthContext';
-import { blindForHuman } from '../utils/blindLabelling';
+import { blindForHuman, withoutDraft } from '../utils/blindLabelling';
 
 type Surface = 'agent' | 'creative' | 'account_health';
 type LabelValue = 'pass' | 'fail' | 'na';
@@ -315,7 +315,7 @@ function LabelForm({ goldenCase, token, onSaved }: { goldenCase: GoldenCaseView;
         { labels, notes, expectedVersion: goldenCase.version },
         { headers: { Authorization: `Bearer ${token}` } },
       );
-      onSaved(res.data.case);
+      onSaved(withoutDraft(res.data.case));
       setSaved(true);
     } catch (err) {
       if (axios.isAxiosError(err) && err.response?.status === 409) {
