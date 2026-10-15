@@ -748,7 +748,7 @@ export async function resolveSkillsToToolNames(
 
     for (const skillId of skillIds) {
       if (skillId === "__other_skills__") {
-        // Get tools not associated with any published skill
+        // ENG-2299: pass the full published catalog; scoping by the caller's tier would leak higher-tier tools into the catch-all.
         const { agentModeService } = await import("./agentModeService");
         const unassociatedTools = agentModeService.getUnassociatedToolNames(publishedSkills);
         unassociatedTools.forEach((name: string) => toolNames.add(name));

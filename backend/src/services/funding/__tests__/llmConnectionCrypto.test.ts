@@ -85,6 +85,61 @@ describe('llmConnectionCrypto', () => {
     await expect(openSecret(kms, sealed, other)).rejects.toThrow();
   });
 
+  describe('purpose and key hash (ENG-2108)', () => {
+    const OR_CTX = { ...CTX, purpose: 'openrouter_key', keyHash: 'a'.repeat(64) };
+
+    it('adds them to the KMS context only when present', async () => {
+      const kms = new FakeKms();
+      await sealSecret(kms, SECRET, OR_CTX);
+      expect(kms.generateCalls).toEqual([OR_CTX]);
+      const plain = new FakeKms();
+      await sealSecret(plain, SECRET, CTX);
+      expect(plain.generateCalls).toEqual([CTX]);
+      expect(Object.keys(plain.generateCalls[0])).not.toContain('purpose');
+    });
+
+    it('opens under the same purpose and hash', async () => {
+      const kms = new FakeKms();
+      expect(await openSecret(kms, await sealSecret(kms, SECRET, OR_CTX), OR_CTX)).toBe(SECRET);
+    });
+
+    it('cannot be opened as the provider key, or the provider key as it: no swapping the two blobs for one connection', async () => {
+      const kms = new FakeKms();
+      const orKey = await sealSecret(kms, 'or-key-value', OR_CTX);
+      const providerKey = await sealSecret(kms, SECRET, CTX);
+      await expect(openSecret(kms, orKey, CTX)).rejects.toThrow();
+      await expect(openSecret(kms, providerKey, OR_CTX)).rejects.toThrow();
+    });
+
+    it('holds in the AES layer even if KMS ignored the context (the AAD binds purpose and hash)', async () => {
+      const kms = new FakeKms();
+      const sealed = await sealSecret(kms, SECRET, OR_CTX);
+      kms.ignoreContext = true;
+      await expect(openSecret(kms, sealed, CTX)).rejects.toThrow();
+      await expect(openSecret(kms, sealed, { ...OR_CTX, keyHash: 'b'.repeat(64) })).rejects.toThrow();
+      await expect(openSecret(kms, sealed, { ...OR_CTX, purpose: 'other' })).rejects.toThrow();
+      expect(await openSecret(kms, sealed, OR_CTX)).toBe(SECRET);
+    });
+
+    it('still opens a value sealed before these fields existed (the original 3-element AAD is unchanged)', async () => {
+      const { createCipheriv, randomBytes } = await import('crypto');
+      const kms = new FakeKms();
+      const { plaintext, wrapped } = await kms.generateDataKey(CTX);
+      const iv = randomBytes(12);
+      const cipher = createCipheriv('aes-256-gcm', plaintext, iv);
+      cipher.setAAD(Buffer.from(JSON.stringify([CTX.connectionId, CTX.ownerUserId, CTX.provider]), 'utf8'));
+      const ciphertext = Buffer.concat([cipher.update(SECRET, 'utf8'), cipher.final()]);
+      const legacy = {
+        v: 1 as const,
+        wrappedDataKey: wrapped.toString('base64'),
+        iv: iv.toString('base64'),
+        ciphertext: ciphertext.toString('base64'),
+        tag: cipher.getAuthTag().toString('base64'),
+      };
+      expect(await openSecret(kms, legacy, CTX)).toBe(SECRET);
+    });
+  });
+
   it('binds the context in the AES layer too, so it holds even if KMS did not check it', async () => {
     const kms = new FakeKms();
     const sealed = await sealSecret(kms, SECRET, CTX);
@@ -130,6 +185,14 @@ describe('llmConnectionCrypto', () => {
       op: 'generateDataKey',
       params: { KeyId: 'alias/some-key', KeySpec: 'AES_256', EncryptionContext: CTX },
     });
+  });
+
+  it('sends purpose and key hash to KMS as extra encryption-context keys, and only when present', async () => {
+    const port = new AwsKmsPort('alias/some-key');
+    await port.generateDataKey({ ...CTX, purpose: 'openrouter_key', keyHash: 'c'.repeat(64) });
+    await port.generateDataKey(CTX);
+    expect(kmsCalls[0].params.EncryptionContext).toEqual({ ...CTX, purpose: 'openrouter_key', keyHash: 'c'.repeat(64) });
+    expect(kmsCalls[1].params.EncryptionContext).toEqual(CTX);
   });
 
   it('lets a developer machine use its own profile, outside production only', async () => {
