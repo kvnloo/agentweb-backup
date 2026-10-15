@@ -126,6 +126,25 @@ export async function resolveCallFunding(
   };
 }
 
+/**
+ * True when the user has switched on their own key for `modelLab` and it cannot serve a turn on
+ * that model (the turn will end with a `CustomerRouteError`). Used to avoid spending AgentWeb money
+ * on helper work that belongs to a turn which fails closed (the first-message title). Anything else,
+ * including an unexpected error in this check, is false: a helper must never be lost to a bug here.
+ */
+export async function customerKeyBlocksTurn(userId: string, modelLab: string | undefined): Promise<boolean> {
+  try {
+    const { resolveRunFunding } = require("./runFunding") as typeof import("./runFunding");
+    const runFunding = await resolveRunFunding({ userId });
+    await resolveCallFunding(runFunding, { userId, modelLab, customerRoutable: true });
+    return false;
+  } catch (error) {
+    if (error instanceof CustomerRouteError) return true;
+    console.error(`[customerKeyBlocksTurn] check failed (helper stays on AgentWeb): ${(error as { code?: string })?.code || (error as Error)?.name || "error"}`);
+    return false;
+  }
+}
+
 async function lookupRoutingState(userId: string, provider: string): Promise<RoutingState> {
   const key = `${userId}|${provider}`;
   const cached = routingCache.get(key);

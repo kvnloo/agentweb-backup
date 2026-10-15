@@ -9255,11 +9255,16 @@ export async function generateSessionResponse(
   if (isFirstMessage && session.sessionType !== 'scheduled') {
     try {
       // ENG-1858: the title is part of this user's first turn — attribute and charge it.
-      const title = await agentModeService.generateSessionTitle(userMessage, {
-        userId,
-        sessionId,
-        feature: meteringFeature('session_title', session.sessionType, extractScheduleId(session.pageIdentifier)),
-      });
+      const title = await agentModeService.generateSessionTitle(
+        userMessage,
+        {
+          userId,
+          sessionId,
+          feature: meteringFeature('session_title', session.sessionType, extractScheduleId(session.pageIdentifier)),
+        },
+        // ENG-2111: lets the title skip its AgentWeb-funded AI call when this turn will fail closed on a dead customer key.
+        llmModel,
+      );
       await chatbotDb.updateSessionTitle(sessionId, title);
     } catch (error) {
       console.error('AgentMode: Failed to update session title:', error);

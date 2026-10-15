@@ -171,7 +171,7 @@ import { meterUsageFromResponse } from '../utils/llmClients';
 import { pickTransport } from './funding/transport';
 import { currentRunFunding } from './funding/runFunding';
 import { recordLlmUsage, customerUpstreamCost } from './funding/recordLlmUsage';
-import { resolveCallFunding } from './funding/callFunding';
+import { resolveCallFunding, customerKeyBlocksTurn } from './funding/callFunding';
 import {
   getModelPrice,
   costScoreFromPrice,
@@ -1219,6 +1219,16 @@ async function recordToolReliabilityEvent(params: {
   } catch (reliabilityErr) {
     console.warn('[AgentMode] H-LEARN reliability record skipped (non-fatal):', reliabilityErr);
   }
+}
+
+/** A plain title cut from the user's first message: no AI call, so nothing for AgentWeb to pay. */
+export function titleFromUserMessage(message: string): string {
+  const flat = message.replace(/[`*_#>\[\]{}"]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!flat) return 'Marketing Task';
+  if (flat.length <= 60) return flat;
+  const cut = flat.slice(0, 60);
+  const lastSpace = cut.lastIndexOf(' ');
+  return (lastSpace > 24 ? cut.slice(0, lastSpace) : cut).trim();
 }
 
 export class AgentModeService {
@@ -10593,7 +10603,19 @@ export class AgentModeService {
     return tasksImpl.createImageTaskFromPrompt(taskName, prompt, category, userId, sessionId, attachPreviousTaskResults);
   }
 
-  async generateSessionTitle(userMessage: string, usageContext?: LLMUsageContext): Promise<string> {
+  /**
+   * `turnModel` is the model the user's turn (the one this title belongs to) will run on. When the
+   * user has switched on their own key for that model's provider and it cannot serve the turn, the
+   * turn fails closed, so AgentWeb must not spend an AI call on a title for it either: the title is
+   * cut from the message instead. Omitted by callers that have no customer-routable turn behind
+   * the title (the title is then always AgentWeb-funded, as before).
+   */
+  async generateSessionTitle(userMessage: string, usageContext?: LLMUsageContext, turnModel?: string): Promise<string> {
+    if (turnModel && usageContext?.userId) {
+      // Same alias map the turn itself uses, so a legacy model id resolves to the same provider.
+      const modelLab = this.llmModels[this.normalizeModelId(turnModel)]?.provider;
+      if (await customerKeyBlocksTurn(usageContext.userId, modelLab)) return titleFromUserMessage(userMessage);
+    }
     try {
       const defaultModel = await this.getDefaultModel();
 
