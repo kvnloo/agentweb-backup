@@ -1080,8 +1080,20 @@ export function detectMissedScheduledRuns(
     }
   }
 
-  if (schedule.status === 'active' && typeof schedule.nextRunTime === 'string') {
-    const next = Date.parse(schedule.nextRunTime);
+  if (schedule.status === 'active') {
+    // The dispatcher advances nextRunTime BEFORE the run starts, so a slot that
+    // never produced a run result can leave nextRunTime in the future. Base the
+    // overdue tail on the earlier of nextRunTime and (last recorded run + cadence)
+    // so a silently skipped slot is still counted.
+    const parsedNext = typeof schedule.nextRunTime === 'string' ? Date.parse(schedule.nextRunTime) : NaN;
+    const lastRun = times.length > 0 ? times[times.length - 1] : NaN;
+    // A schedule written after that slot (edit, reactivation after a pause) has a
+    // fresh nextRunTime the run history cannot contradict, so only nextRunTime counts.
+    const writtenAfterSlot = !Number.isNaN(editedAt) && !Number.isNaN(lastRun) && editedAt > lastRun + cadence;
+    const fromLast = Number.isNaN(lastRun) || writtenAfterSlot ? NaN : lastRun + cadence;
+    const next = Number.isNaN(parsedNext)
+      ? fromLast
+      : Number.isNaN(fromLast) ? parsedNext : Math.min(parsedNext, fromLast);
     if (!Number.isNaN(next) && now - next > MISSED_RUN_GRACE_MS) {
       const overdue = 1 + Math.floor((now - next - MISSED_RUN_GRACE_MS) / cadence);
       missedRuns += overdue;

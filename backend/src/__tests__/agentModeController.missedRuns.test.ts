@@ -92,8 +92,32 @@ describe('detectMissedScheduledRuns (ENG-2234 AC-A)', () => {
     const health = detectMissedScheduledRuns(
       [run('2026-09-01T09:00:00Z'), run('2026-09-05T09:00:00Z')],
       { frequency: 'daily', status: 'active' },
+      Date.parse('2026-09-05T12:00:00Z'),
     );
     expect(health.missedRuns).toBe(3);
+  });
+
+  it('counts a skipped slot after the dispatcher already advanced nextRunTime', () => {
+    // Daily run on Oct 1; dispatcher advanced nextRunTime to Oct 3 but the Oct 2 run
+    // never recorded a result. nextRunTime is still in the future.
+    const health = detectMissedScheduledRuns(
+      [run('2026-10-01T09:00:00Z')],
+      { frequency: 'daily', status: 'active', nextRunTime: '2026-10-03T09:00:00Z', updatedAt: '2026-10-01T09:05:00Z' },
+      Date.parse('2026-10-02T20:00:00Z'),
+    );
+    expect(health.missedRuns).toBe(1);
+    expect(health.lastMissedRunReason).toMatch(/due 2026-10-02T09:00:00\.000Z is overdue/);
+  });
+
+  it('does not count a pause as missed after reactivation', () => {
+    // Paused Oct 1 after a run, reactivated Oct 8 (updatedAt) with a fresh nextRunTime.
+    expect(
+      detectMissedScheduledRuns(
+        [run('2026-10-01T09:00:00Z')],
+        { frequency: 'daily', status: 'active', nextRunTime: '2026-10-09T09:00:00Z', updatedAt: '2026-10-08T15:00:00Z' },
+        Date.parse('2026-10-08T16:00:00Z'),
+      ),
+    ).toEqual({ missedRuns: 0, lastMissedRunReason: null });
   });
 
   it('does not judge pre-edit history by a newly changed cadence (daily -> hourly)', () => {
