@@ -134,16 +134,23 @@ async function paymentSetupLink(user: any, userId: string, deps: ZomaOnboardingD
 
 /**
  * Full readiness with links. Links are only minted for the missing step(s), so a fully
- * set-up user never causes a Stripe customer or session to be created.
+ * set-up user never causes a Stripe customer or session to be created. `mintLinks: false`
+ * (ENG-2496 device-flow polling) reads state only, so a 5-second poll never creates a
+ * Stripe Checkout session per request.
  */
-export async function getZomaReadiness(userId: string, deps: ZomaOnboardingDeps = defaultDeps): Promise<ZomaReadiness> {
+export async function getZomaReadiness(
+  userId: string,
+  deps: ZomaOnboardingDeps = defaultDeps,
+  opts: { mintLinks?: boolean } = {},
+): Promise<ZomaReadiness> {
+  const mintLinks = opts.mintLinks !== false;
   const user = await deps.getUser(userId);
   if (!user) throw new ZomaNotReadyError('No AgentWeb account was found for this login.');
 
   const payment: ZomaReadiness['payment'] = { ready: false };
   try {
     payment.ready = await hasPaymentMethod(user, userId, deps);
-    if (!payment.ready) payment.link = await paymentSetupLink(user, userId, deps);
+    if (!payment.ready && mintLinks) payment.link = await paymentSetupLink(user, userId, deps);
   } catch (error) {
     // Fail closed: an unreadable payment state never enables writes.
     payment.ready = false;
@@ -153,7 +160,7 @@ export async function getZomaReadiness(userId: string, deps: ZomaOnboardingDeps 
 
   const accounts = await usableMetaAccounts(userId, deps);
   const meta: ZomaReadiness['meta'] = { ready: accounts.length > 0, accounts: accounts.map(summarize) };
-  if (!meta.ready) meta.link = await deps.buildMetaConnectUrl(userId);
+  if (!meta.ready && mintLinks) meta.link = await deps.buildMetaConnectUrl(userId);
 
   const writes_enabled = payment.ready && meta.ready;
   return { email: user.email, payment, meta, writes_enabled, next_step: nextStep(payment, meta) };

@@ -246,9 +246,33 @@ export function buildSessionRow(
     fields[`${p.event}_at`] = ctx.nowIso;
   }
 
-  // Server-classified. If the SDK also knew the first-touch landing URL, classify THAT here so the
-  // channel is decided by the same classifier as every other session; else keep the client string.
-  if (p.firstTouchLanding) {
+  // Server-classified first touch (ENG-2494). A creator's single UTM link is
+  // shared across platforms, so the click's own referrer / in-app UA decides the channel. On the
+  // visitor's first visit first touch IS this landing session, so it is derived from this request's own referrer and URL, never from SDK-stored state
+  // left by earlier browser activity.
+  // First touch reports the platform the click came FROM: the observed signal (in-app UA, then
+  // referrer) outranks the link's claim, including an agency-<slug> link (last touch keeps Agency).
+  // Paid links keep the link's channel: the ad platform in utm_source is the spend being attributed.
+  const firstTouchOf = (c: TrafficClassification): string =>
+    c.trafficType === 'paid' ? c.channel : c.detectedChannel || c.channel;
+  if (p.landingUrl && p.client.visitNo === 1) {
+    const ft = classifyTraffic({
+      landingUrl: p.landingUrl,
+      referrer: p.referrer,
+      userAgent: ctx.userAgent,
+    });
+    // Only the session's opening event (or one that still carries an external signal) sets first
+    // touch; a later in-session event (internal referrer, no in-app UA) must not overwrite it with
+    // Direct. Dropping the keys leaves the stored value untouched (the merge is per-key SET).
+    const opening = Number(p.client.eventCount ?? 0) <= 1 || Boolean(ft.referrerHost || ft.detectedChannel);
+    if (opening) {
+      fields.firstTouchChannel = firstTouchOf(ft);
+      if (ft.referrerHost) fields.firstTouchReferrer = ft.referrerHost; else delete fields.firstTouchReferrer;
+    } else {
+      delete fields.firstTouchChannel;
+      delete fields.firstTouchReferrer;
+    }
+  } else if (p.firstTouchLanding) {
     // The SDK stores only the first referrer's HOST (the platforms mostly send origin-only anyway),
     // which is all the referrer rules use.
     const ftHost = typeof p.client.firstTouchReferrer === 'string' ? p.client.firstTouchReferrer.toLowerCase() : '';
@@ -257,7 +281,7 @@ export function buildSessionRow(
       referrer: /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(ftHost) ? `https://${ftHost}/` : '',
       userAgent: ctx.userAgent,
     });
-    fields.firstTouchChannel = ft.channel;
+    fields.firstTouchChannel = firstTouchOf(ft);
   }
 
   fields.trafficType = classification.trafficType;
@@ -265,6 +289,8 @@ export function buildSessionRow(
   fields.channelKey = classification.channelKey;
   fields.channelGroup = classification.channelGroup;
   fields.classifierVersion = classification.classifierVersion;
+  if (classification.linkChannel) fields.linkChannel = classification.linkChannel; else delete fields.linkChannel;
+  if (classification.detectedChannel) fields.detectedChannel = classification.detectedChannel; else delete fields.detectedChannel;
   fields.device = deviceFromUserAgent(ctx.userAgent);
   if (classification.referrerHost) fields.referrerHost = classification.referrerHost; else delete fields.referrerHost;
   if (classification.sourceLink) fields.sourceLink = classification.sourceLink; else delete fields.sourceLink;

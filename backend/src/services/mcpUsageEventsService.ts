@@ -14,7 +14,7 @@ export const EVT_MCP_FIRST_TOOL_USED = 'mcp_first_tool_used';
 /** ENG-2303 P4: a Meta Toolkit write that was dispatched to Meta (the billable unit). */
 export const EVT_MCP_WRITE_EXECUTED = 'mcp_write_executed';
 
-export type McpAuthMethod = 'api_key' | 'oauth' | 'internal_token' | 'unknown';
+export type McpAuthMethod = 'api_key' | 'oauth' | 'internal_token' | 'zoma_token' | 'unknown';
 export type McpClientType =
   | 'claude_ai'
   | 'claude_code'
