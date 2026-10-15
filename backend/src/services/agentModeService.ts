@@ -7170,20 +7170,7 @@ export class AgentModeService {
         if (rejectedSkillIds.length > 0) {
           const buckets = await this.classifySkillRejections(rejectedSkillIds, userId);
           const { unentitled, unavailable, unresolved, forbidden } = buckets;
-          try {
-            const published = await skillService.getPublishedSkills();
-            console.warn('[install-refused]', JSON.stringify({
-              sessionId,
-              userId,
-              requested: skillIds.slice(0, 20),
-              unentitled: unentitled.slice(0, 20),
-              unavailable: unavailable.slice(0, 20),
-              unresolved: unresolved.slice(0, 20),
-              forbidden: forbidden.slice(0, 20),
-              catalogSize: published.length,
-              otherSkillsPoolSize: this.getUnassociatedToolNames(published).length,
-            }));
-          } catch { /* diagnostics must never change the refusal */ }
+          await this.logInstallRefusal(sessionId, userId, skillIds, buckets, false);
           /*
            * `success: false` matters as much as the text: the success path returns
            * `success: true`, so a bare `{ message }` left `success` undefined and this refusal
@@ -7237,6 +7224,7 @@ export class AgentModeService {
          * ledger too.
          */
         const partialBuckets = await this.classifySkillRejections(rejectedSkillIds, userId);
+        await this.logInstallRefusal(sessionId, userId, skillIds, partialBuckets, true);
         /*
          * `noSubstitution` matters MORE here than on the full-refusal branch, not less. There,
          * the dispatcher's downgrade attaches an error class whose retryability line carries
@@ -7447,6 +7435,31 @@ export class AgentModeService {
       publishedSkillsCount: publishedSkills.length,
       sessionAssociatedSkillIdsCount: sessionAssociatedSkillIds.length,
     };
+  }
+
+  /** ENG-2299: one diagnostic line per install_skills rejection; never alters the result. */
+  private async logInstallRefusal(
+    sessionId: string,
+    userId: string,
+    requested: string[],
+    buckets: { unentitled: string[]; unavailable: string[]; unresolved: string[]; forbidden: string[] },
+    partial: boolean,
+  ): Promise<void> {
+    try {
+      const published = await skillService.getPublishedSkills();
+      console.warn('[install-refused]', JSON.stringify({
+        sessionId,
+        userId,
+        partial,
+        requested: requested.slice(0, 20),
+        unentitled: buckets.unentitled.slice(0, 20),
+        unavailable: buckets.unavailable.slice(0, 20),
+        unresolved: buckets.unresolved.slice(0, 20),
+        forbidden: buckets.forbidden.slice(0, 20),
+        catalogSize: published.length,
+        otherSkillsPoolSize: this.getUnassociatedToolNames(published).length,
+      }));
+    } catch { /* diagnostics must never change the refusal */ }
   }
 
   /**

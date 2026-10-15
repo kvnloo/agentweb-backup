@@ -1,4 +1,4 @@
-## ENG-2299: No catalog churn found; tool-gate refusals now log why (2026-10-14)
+## ENG-2299: No catalog churn found; tool-gate and install refusals now log why (2026-10-14)
 
 **Finding.** The ticket's premise (the shared published-skill catalog changes under a live session) was not borne out by prod evidence on 2026-10-14. Nothing was changed in code to "fix" it.
 
@@ -11,6 +11,6 @@
 
 **Added.** The skill-install gate in `toolDispatch.ts` now logs one `[tool-gate-refused]` JSON line per refusal: session, user, tool, the session's live installed skill ids (refreshed after a mid-turn install), `entitlementResolved`, whether `__other_skills__` is installed and tier-allowed, published-catalog size, whether the tool is in the live pool, and which published skills claim it (installed / tier-allowed). The refusal text is unchanged. Search CloudWatch `web.stdout.log` for `tool-gate-refused` when the next report arrives. It separates a missing install (`claimedBy`/`otherSkillsInstalled` false), a tier gap (`tierAllows` false with `entitlementResolved` true) and an unresolved entitlement. A pool change over time is only visible by comparing `catalogSize` and `inOtherSkillsPool` across lines.
 
-**Install refusals too.** A full `install_skills` refusal (the ENG-1867 "unavailable to install" path) logs one `[install-refused]` line: session, user, requested ids, the four rejection buckets, published-catalog size and the current `__other_skills__` pool size. An empty pool with `__other_skills__` in `unavailable` is the ENG-1237/ENG-1867 signature.
+**Install refusals too.** An `install_skills` rejection (full refusal, the ENG-1867 "unavailable to install" path, or a partial install with `partial: true`) logs one `[install-refused]` line: session, user, requested ids, the four rejection buckets, published-catalog size and the `__other_skills__` pool size. The pool size is computed from the unfiltered published list, so an empty pool is conclusive for every user, but a non-empty one does not prove a given user's tier-filtered pool was non-empty. An empty pool with `__other_skills__` in `unavailable` is the ENG-1237/ENG-1867 signature.
 
 **The two other 2026-10-05 "not available" reports.** `call_hubspot_api` (session `d7e413d3`) and `search_ads_knowledge_base` (`f7e326bb`) are registered tools, are not foundation tools, and appear in no published skill, so both sit in the `__other_skills__` pool. The likeliest reading is the same as ENG-152: the session had not installed `__other_skills__`, so the gate refused as designed. Not confirmed: their `associatedSkills` were not read (the autofix role cannot query sessions by time). The `[tool-gate-refused]` line will settle this for the next occurrence.

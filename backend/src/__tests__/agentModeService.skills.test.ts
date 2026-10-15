@@ -1065,6 +1065,22 @@ describe('AgentModeService - Skills', () => {
       warn.mockRestore();
     });
 
+    it('also logs a partial install, flagged partial, when one requested id is rejected', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([
+        { skillId: 'real-skill', name: 'Real', description: 'd', toolNames: ['t1'], isPublished: true },
+      ]);
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue([] as any);
+
+      const result = await agentModeService.installSkills(['real-skill', 'ghost'], 'user-123', 'session-123');
+
+      expect(result.success).toBe(true);
+      expect(result.rejectedSkillIds).toEqual(['ghost']);
+      const call = warn.mock.calls.find(([tag]) => tag === '[install-refused]');
+      expect(JSON.parse(call![1] as string)).toMatchObject({ partial: true, unresolved: ['ghost'], requested: ['real-skill', 'ghost'] });
+      warn.mockRestore();
+    });
+
     it('still returns the same refusal when the log cannot be built', async () => {
       const warn = jest.spyOn(console, 'warn').mockImplementation(() => { throw new Error('log sink down'); });
       (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
