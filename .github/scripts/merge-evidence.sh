@@ -561,6 +561,34 @@ if [ -n "${RETIRED_CHECKS}" ]; then
   fi
 fi
 
+# Pass 4 — DROP OPSLANE'S "NOTHING TO VERIFY" NEUTRAL (ENG-2506).
+# Opslane reports `neutral` with the title "Nothing Opslane can verify here"
+# ("This check doesn't block the merge.") on PRs it has no opinion on. That is
+# an abstention, not a negative verdict, but section 4 counts every `neutral`
+# as bad, so it blocked every otherwise-proven PR (#3552, #3543). The match is
+# deliberately narrow: app slug AND name AND conclusion AND exact title. An
+# Opslane `failure`, or a `neutral` with any other title, still blocks. A
+# dropped abstention is not positive evidence either. Opslane uses more than
+# one abstention wording (#3559 got "Nothing to verify in this PR"), so the
+# exact-title match is against a closed allowlist.
+OPSLANE_NOOP_TITLES='["Nothing Opslane can verify here","Nothing to verify in this PR"]'
+# shellcheck disable=SC2016 # $t is a jq variable, not a shell expansion
+opslane_filter='select((.app.slug // "") == "opslane" and .name == "Opslane"
+  and .conclusion == "neutral" and ((.output.title // "") as $x | $t | index($x) != null))'
+opslane_noop="$(printf '%s' "${runs_json}" | jq -r --argjson t "${OPSLANE_NOOP_TITLES}" \
+  "[ .check_runs[] | ${opslane_filter} ] | length" 2>/dev/null)"
+if ! grep -qE '^[0-9]+$' <<<"${opslane_noop}"; then
+  hard_fail "failed to identify Opslane nothing-to-verify check-runs at ${head_sha}"
+fi
+if [ "${opslane_noop}" -gt 0 ]; then
+  if ! runs_json="$(printf '%s' "${runs_json}" | jq -c --argjson t "${OPSLANE_NOOP_TITLES}" \
+    ".check_runs |= map(select(. as \$c | [\$c | ${opslane_filter}] | length == 0))" 2>/dev/null)" \
+    || [ -z "${runs_json}" ]; then
+    hard_fail "failed to exclude Opslane nothing-to-verify check-runs at ${head_sha}"
+  fi
+  log "ignored ${opslane_noop} Opslane (neutral) check-run(s) with an abstention title: an abstention, not a verdict"
+fi
+
 effective_count="$(printf '%s' "${runs_json}" | jq -r '.check_runs | length' 2>/dev/null)"
 if ! grep -qE '^[0-9]+$' <<<"${effective_count}"; then
   hard_fail "check-runs payload became unreadable after narrowing to effective runs at ${head_sha}"
