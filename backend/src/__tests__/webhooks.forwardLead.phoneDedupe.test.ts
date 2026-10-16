@@ -121,6 +121,29 @@ describe('mode create', () => {
     expect(res.body.leadId).toBe(winner.leadId);
   });
 
+  it('a loser whose winner has since been given a corrected phone is NOT merged (the carried row is stale)', async () => {
+    setPhoneDedupeModeOverride('create');
+    const carried = existing();
+    (crmDb.createLead as jest.Mock).mockRejectedValueOnce(Object.assign(new Error('dup'), { duplicatePhone: true, existingLead: carried }));
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue({ ...carried, phone: '+1 646 555 0188' });
+    const res = await post();
+    expect(res.status).toBe(201);
+    expect(createCalls()).toHaveLength(2);
+    expect(createCalls()[1][1]).not.toHaveProperty('phoneUniqueCreate');
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  it('a loser whose winner has since gained an email is NOT merged', async () => {
+    setPhoneDedupeModeOverride('create');
+    const carried = existing();
+    (crmDb.createLead as jest.Mock).mockRejectedValueOnce(Object.assign(new Error('dup'), { duplicatePhone: true, existingLead: carried }));
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue({ ...carried, email: 'ana@example.com' });
+    const res = await post();
+    expect(res.status).toBe(201);
+    expect(createCalls()).toHaveLength(2);
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
+  });
+
   it('a concurrent loser naming a DIFFERENT person becomes its own row on an ordinary id (no overwrite)', async () => {
     setPhoneDedupeModeOverride('create');
     const winner = existing({ firstName: 'Bob' });
@@ -214,6 +237,13 @@ describe('mode on', () => {
     expect(createCalls()).toHaveLength(1);
     expect(crmDb.getLeadById).not.toHaveBeenCalled();
     expect(logged()[0]).toContain('decision=shared-line');
+  });
+
+  it.each(['shadow', 'on'] as const)('a known shared line (%s) also opts out of the same-bucket exactly-once create', async (mode) => {
+    setPhoneDedupeModeOverride(mode);
+    (crmDb.getLeadIdsByPhoneKey as jest.Mock).mockResolvedValue({ available: true, leadIds: ['a', 'b', 'c', 'd', 'e', 'f'], capped: true });
+    await post();
+    expect(createCalls()[0][1]).not.toHaveProperty('phoneUniqueCreate');
   });
 
   it('a STALE index entry (the row has since gained an email) is ignored', async () => {
