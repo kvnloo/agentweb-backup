@@ -157,6 +157,15 @@ describe('phoneUniqueCreate', () => {
   });
 });
 
+describe('id namespace: a hostile "email" can never equal a phone id', () => {
+  it('an email of literally phone:<digits> in the same bucket does not collide with the phone lead', async () => {
+    const phone = await make();
+    const hostile = await crmDb.createLead('L1', { email: 'phone:2124567890', firstName: 'X', customFields: {}, emailUniqueCreate: true }, 'form_fill');
+    expect(hostile.leadId).not.toBe(phone.leadId);
+    expect(rows.size).toBe(2);
+  });
+});
+
 describe('where the exactly-once create and the phoneKey do NOT apply', () => {
   it.each([
     ['an email is present', { email: 'a@b.com' }, 'form_fill'],

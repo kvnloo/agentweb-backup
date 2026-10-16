@@ -122,6 +122,13 @@ describe('runPhoneKeyBackfill', () => {
     expect(scans[1].ExclusiveStartKey).toEqual({ listId: 'L1', leadId: 'c' });
   });
 
+  it('pauses between scan pages when pageDelayMs is set (and not after the last page)', async () => {
+    const { ddb, scans } = fake();
+    await runPhoneKeyBackfill(ddb, { ...base, apply: false, pageDelayMs: 250 });
+    expect(scans).toHaveLength(2);
+    expect(sleep.mock.calls).toEqual([[250]]);
+  });
+
   it('APPLY writes every eligible row for real - INCLUDING a lead with a real nameCompanyKey (the earlier bug)', async () => {
     const { ddb, store } = fake();
     const s = await runPhoneKeyBackfill(ddb, { ...base, apply: true });
