@@ -12,6 +12,9 @@ export const API_URL = import.meta.env.VITE_API_URL || "http://localhost:3001";
 // Get the Customer Frontend URL from Vite environment variable or fallback to production URL
 export const CUSTOMER_FRONTEND_URL = import.meta.env.VITE_CUSTOMER_FRONTEND_URL || "http://localhost:5174";
 
+// ENG-2488: custom subscription link generator (default OFF in all envs).
+export const CUSTOM_SUBSCRIPTION_LINKS_ENABLED = String(import.meta.env.VITE_CUSTOM_SUBSCRIPTION_LINKS ?? "").trim().toLowerCase() === "true";
+
 // Discord Invite URL
 export const DISCORD_INVITE_URL = "https://discord.gg/kP2u6Wf9KQ";
 

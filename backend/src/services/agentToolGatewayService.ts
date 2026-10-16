@@ -1437,8 +1437,15 @@ function validateJsonSchemaType(name: string, value: unknown, schema: any): Agen
  * coerced value.
  */
 function coerceIdIntegerToString(name: string, value: unknown, schema: any): { changed: boolean; value: unknown } {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value)) return { changed: false, value };
-  if (!/(^id$|_id$|[a-z]Id$)/.test(name)) return { changed: false, value };
+  // ENG-2509: finite non-integer decimals and booleans are lossless and unambiguous
+  // as strings (`ratio: 1.5` -> "1.5", `flag: true` -> "true"), so they coerce for
+  // any field. Bare integers stay limited to id-named fields: an integer in a
+  // non-id string field (`file_url: 123`, `action: 7`) usually means the model
+  // filled the wrong field and must keep surfacing as type_mismatch.
+  const isDecimal = typeof value === 'number' && Number.isFinite(value) && !Number.isInteger(value);
+  const isBoolean = typeof value === 'boolean';
+  const isIdInteger = typeof value === 'number' && Number.isSafeInteger(value) && /(^id$|_id$|[a-z]Id$)/.test(name);
+  if (!isDecimal && !isBoolean && !isIdInteger) return { changed: false, value };
   const expected = schema?.type;
   const expectedTypes = Array.isArray(expected) ? expected : [expected];
   if (expectedTypes.length !== 1 || expectedTypes[0] !== 'string') return { changed: false, value };

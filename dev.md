@@ -1,3 +1,340 @@
+## ENG-2509: Coerce finite decimals/booleans to string for exactly-string tool schemas (2026-10-16)
+
+`validateAndRepairToolArgs` now repairs finite non-integer decimals and booleans passed where the property schema is exactly `string` (`String(value)`, `scalar_coerce` repair). Bare integers remain limited to id-named fields, so `file_url: 123` / `action: 7` still fail as `type_mismatch`. NaN/Infinity/unsafe ints, containers, null, multi-type schemas, and values outside a declared enum are never coerced.
+
+## ENG-2508: Pure scheduled-post due selector + lifecycle transitions (2026-10-16)
+
+- Added `backend/src/services/scheduledPosts/scheduledPostLifecycle.ts`: `selectDuePosts(records, now)` and `transition(record, action)` (edit/cancel/idempotent markFired) with typed results. In-memory only; storage/firing gated on ENG-2501.
+
+## ENG-2507: Pure scheduled-post request validator (2026-10-16)
+
+- Added `backend/src/services/scheduledPosts/validateScheduledPostRequest.ts`: pure ok/error validator (platform x/instagram/linkedin, tz-qualified future publishAt within 90 days via injected clock, per-platform content caps, http(s) media URLs, Instagram requires media). No persistence, no tool registration; storage/firing remain gated on ENG-2501.
+
+## ENG-2504: Pure drip completion -> newsletter-segment routing decision (2026-10-15)
+
+Added `backend/src/services/dripSequenceRouting.ts` `completionRouting()`: delivered no-response completions with a configured segment route to `add_to_segment`; untouched leads, all stop reasons (unsubscribed/bounced compliance, replied/booked sales-owned), missing segment and unknown outcomes return `none`. Pure; not yet wired into the worker.
+
+## ENG-2502: Blind human labelling pages (2026-10-15)
+
+- `/eval-labelling` and `/eval-labelling/calibration` now show a case whose notes start with `[AI-LABEL]` as unlabelled: no stored labels, notes or draft suggestions, not counted as labelled, not skipped by "next unlabelled". A human save replaces the AI label as before.
+- Front-end only (`partner-portal/src/utils/blindLabelling.ts`); no backend or data change.
+
+## GROW: Split paid Google/YouTube traffic channels (2026-10-14)
+
+- Traffic classifier 2.1.0: paid `google_search` -> `Google Ads` (`google_ads`), paid `youtube` -> `YouTube Ads` (`youtube_ads`). Organic unchanged.
+- Routing rules keyed on `google_search`/`youtube` still match the paid variants.
+- `backend/scripts/backfill-paid-channel-split.ts`: dry-run by default, reversible (`--revert`), conditional writes. Needs Harsha approval before `--apply` in prod.
+
+## ENG-2496: Zoma device-flow onboarding (2026-10-14)
+
+- **Shape:** RFC 8628 device flow at `/api/zoma/*` (`routes/zoma.ts` → `mcp/zomaDeviceFlow.ts`). The verification page does NOT build its own login: it redirects into the existing `/oauth/authorize` → portal consent page as a first-party public client `zoma-device-setup`, created lazily by `mcpOAuthService.ensureFirstPartyClient` with redirect URI `<BACKEND_URL>/api/zoma/activate/callback`. The PKCE verifier lives on the device record, so only the backend can redeem the code. `state` = sha256(device_code).
+- **Readiness is not duplicated:** the poll calls `getZomaReadiness(userId, …, { mintLinks: false })` each time. It mints links (Stripe setup Checkout / Meta connect) only once per step and caches them on the device record, because minting on every 5s poll would create a Stripe Checkout session per request.
+- **Step order in poll:** `connect_meta` before `add_payment` (ticket order); `zoma_status` still lists payment first. Both are derived from the same readiness.
+- **Single issuance:** `issueToken` is one DynamoDB transaction: device `status approved→issued` (conditional on the same userId) plus a token-row put with `attribute_not_exists`. A reused device_code returns `invalid_grant`. `slow_down` is an atomic conditional update on `lastPollAt`/`intervalSec`, and the interval grows by 5s per violation.
+- **Storage (data-plane, needs approval):** new table `AW-ZomaDeviceAuth` (`Dev-` prefix in development). PK `pk` (S), no SK/GSI, TTL attr `ttl`. Items `device#…`, `usercode#…`, `token#…`. The table must be created before deploy; the code does not create it.
+- **Known limit:** revoke requires presenting the token. There is no per-user "list/revoke all" (that needs a userId GSI, which was deliberately left out).
+
+## ENG-2493: Scheduled chat email opt-out also suppresses alert emails (2026-10-14)
+
+PR #3527 let `manage_scheduled_chat` honour `email_notifications: []` as an opt-out, but only as
+a request-time flag: the stored schedule just had `emailNotifications: []`. Every alert sender
+(run-failed, sourcing-block transition, disallowed-tool error, usage-limit) treats an empty list as
+"fall back to the owner's account email", so the owner kept getting alert emails after opting out.
+
+Fix: one persisted optional field, `emailOptOut` (absent = false; Harsha approved 2026-10-14, no
+backfill/migration). Create sets it when the tool sends `[]`; update sets it when recipients are
+cleared on purpose, sets it false when recipients are set, and omits it otherwise (partial SET keeps
+the stored value). The four senders share `resolveScheduleAlertRecipients` in
+`agentModeController.ts`: configured recipients, else nobody if opted out, else the owner.
+Oncall alerts, run history, and the schedule-card badge are unchanged. The paused-for-input and
+variable-request emails still fall back to the owner: they ask for an action the run needs, so
+suppressing them would strand the schedule.
+
+## ENG-2488: Partner-portal custom subscription link form (2026-10-14)
+
+Admin-only "Create custom subscription link" button + validated form on the Users org cell, calling the existing `POST /api/admin/custom-subscription-links` (ENG-2428). Hidden unless `VITE_CUSTOM_SUBSCRIPTION_LINKS=true` (default off). No schema/webhook changes.
+
+## ENG-2465: the HubSpot app's webhook subscriptions can only be changed in its HubSpot project (2026-10-14)
+
+**Found in production after #3537.** The boot registration of `contact.merge` failed: HubSpot answered `403 BANNED / AppProjectAssociationErrors.PROJECT_BASED_APP_WEBHOOK_EDIT_ERROR`: the AgentWeb app was created by the project `agentweb_hubspot`, so its webhook configuration "can't be edited through the API or UI"; it has to be changed in the project's webhook config file and the project redeployed. The assumption that the backend could register this app's subscriptions through the API does not hold for this app. The same 403 applies to the config-save path (`routes/crmSync.ts`) and to any mapped-custom-property subscription it tried to add.
+
+**Effect.** Nothing was broken (the contact.merge handlers are inert until the event arrives), but every deploy burned 5 queue attempts on a request that can never succeed and logged 5 errors.
+
+**Fix.** `ensureWebhookSubscriptions` recognises that specific 403, logs ONE warning naming the subscriptions that still have to be added to the project's webhook configuration, skips the remaining POSTs, and reports "nothing this code can do" so the build completes instead of retrying. Any other failure (other 403s, 429, 5xx, timeouts) still fails the build's claim and is retried as before.
+
+**Still to do by hand.** Add the `contact.merge` subscription to the `agentweb_hubspot` project's webhook configuration and redeploy the project; until then merges in HubSpot are not delivered to us, and the stored-id push fails closed on a merged-away id as before.
+
+**Consequence for custom mapped properties.** The config-save path (`routes/crmSync.ts`) registers a `contact.propertyChange` subscription for each user-mapped custom property. Against this app that is refused the same way, so inbound realtime updates for any mapped property that is not already in the project's webhook configuration do not arrive; the warning (one per save) names them. Fixing that means adding the property to the project's webhook configuration; no code in this repo can.
+
+## ENG-2465 / ENG-2464: re-point stored HubSpot contact ids on `contact.merge`, and a live-check script (2026-10-14)
+
+**Why.** Since ENG-2171 the batched HubSpot push updates a lead by its stored `syncMetadata.hubspot_contact_id`. If the customer merges two contacts in HubSpot, that id points at the merged-away contact, so the lead would fail every push (`sync_failed`, id kept, nothing created). HubSpot documents a `contact.merge` webhook (`primaryObjectId`, `mergedObjectIds[]`, `newObjectId`, `numberOfPropertiesMoved`) and no API to find the survivor from a merged-away id, so the webhook is the only documented way to learn it.
+
+**ENG-2465.** Both HubSpot webhook handlers (`routes/webhooks.ts` shared endpoint, `routes/crmWebhook.ts` per-list endpoint) now handle `contact.merge`: the lead holding a merged-away id gets `hubspot_contact_id` rewritten to the survivor (`newObjectId`, else `primaryObjectId`), other `syncMetadata` kept. In the shared endpoint the merge rides in the durable job payload (optional `merges` field, so already-queued jobs still process) and applies only to lists connected to that portal. Every lead holding the merged-away id is rewritten (duplicate leads for one contact), bounded at 25 per id. Merges are applied before deletions in the same delivery; on the per-list endpoint with `deleteOnPull` that stops a `contact.deletion` for the merged-away id deleting the re-pointed lead (the shared endpoint only flags `crmRemovedAt`, and finds the lead by email first, so the ordering matters little there). Idempotent: after the rewrite the old id matches no lead. A lookup or write failure never throws out of the helper; on the shared endpoint it fails the job AFTER the rest of the delivery is applied, so the durable queue retries it (capped at 5 attempts); on the per-list endpoint it is only logged.
+
+**Not done / limits.**
+- A merge that fails the same way every time (e.g. a list over the lookup's 20-page cap) fails the shared-webhook job after the delivery's other changes are applied, so each queue retry re-applies those changes; an older delivery replayed late could overwrite a newer value. Same retry semantics as any failure of this job, now reachable by a permanent merge failure.
+- `AW-AsyncJobQueue` must exist in the target environment (created by a manual script); if it does not, the boot registration is skipped for that build.
+- The `contact.merge` subscription is registered by the backend itself with the developer API key: `ensureWebhookSubscriptions` (`utils/hubspotWebhookSubscriptions.ts`) includes it and recognises it as already present, so it is not re-registered. It runs (a) on a user's HubSpot OAuth sync-config save, as before, and (b) **once per deployed build at server start** (`utils/hubspotWebhookSubscriptionsBoot.ts`, called from `server.ts`). Several instances boot together on a deploy and HubSpot's behaviour on a duplicate subscription is undocumented, so the boot run is claimed with the job queue's atomic insert-if-absent keyed on the build's commit: exactly one instance registers, the rest stand down, and a restart of the same build does nothing. If the queue is unreachable it does NOT run unguarded; with no build identity (local, preview, tests) it does not run at all. A claim whose owner crashes is retried by the queue's poller (idempotent). If any registration FAILS (HubSpot 4xx/5xx/429, transient Secrets Manager error) the claim is marked failed and retried by the poller (capped attempts) instead of being marked complete; missing credentials (nothing this environment can do) complete without retry. HubSpot calls carry a 15s timeout so a hung socket cannot hold the claim. A job whose retries are exhausted stays `failed` for that build and blocks further boot attempts for it (a config save still retries). Runs within one process are serialised, so a boot run and a config save cannot interleave. Kill switch: `HUBSPOT_BOOT_SUBSCRIPTIONS=off` (EB env var, restart). One row per build per source stays in `AW-AsyncJobQueue`. A rejected registration is logged (`[HubSpotWebhook] Failed to register ...`) and does not affect boot. Not covered: two config saves on DIFFERENT instances at the same moment can still both register a missing subscription (this existed before). Not verified against HubSpot; check the app's subscriptions list after the first deploy. Only API-key customers (per-list endpoint) configure their own endpoint.
+- If another lead in the list already holds the survivor's id, both now share it; the push handles that (same email collapses, different emails upsert by their own email).
+- `getLeadByHubSpotContactId` is a bounded partition query (no index): a very large list can exhaust the page cap, in which case that merge is skipped with a warning.
+- A push already in flight holds the old `syncMetadata` map and can write the dead id back after the webhook rewrote it (the rewrite replaces the whole map, as `persistSyncMetadata` does). The window is one push batch and nothing repairs it later; it fails closed, as before the rewrite.
+- Leads whose id lives only in `customFields.hubspot_contact_id` are not found (the lookup filters on `syncMetadata`).
+- Not live-verified (no connected HubSpot); covered by unit tests only.
+
+**ENG-2464.** `backend/scripts/hubspot-live-check.mjs` records the raw status and body of the contact edge cases HubSpot's docs do not describe (missing id, archived id, mixed batch, duplicate id, email collision, merged-away id, unknown property, upsert right after an email write) and whether `isContactGoneError` would classify each as "gone". It needs a HubSpot developer test account private-app token (`HUBSPOT_TOKEN`) and `HUBSPOT_SANDBOX_CONFIRMED=yes`, reads `/account-info/v3/details` first and refuses any account HubSpot does not label developer, sandbox or test, uses only `@eng2171.example.invalid` probes, and archives them in a `finally`. Its own offline test (`node --test backend/scripts/hubspot-live-check.test.mjs`) runs against a local fake and proves the script, not HubSpot. The card stays open until someone runs it against a real portal and pastes the output.
+
+**Connect error (not in this PR).** The HubSpot connect failing for portals without Marketing Hub is a HubSpot app-config mismatch (marketing scopes registered as `conditionallyRequiredScopes` while we send them as `optional_scope`). `social` is documented as deprecated but `SOCIAL` broadcasts in the Emma HubSpot tool use it, so it is left in `marketingOnlyScopes`.
+
+## ENG-2299: No catalog churn found; tool-gate and install refusals now log why (2026-10-14)
+
+**Finding.** The ticket's premise (the shared published-skill catalog changes under a live session) was not borne out by prod evidence on 2026-10-14. Nothing was changed in code to "fix" it.
+
+- **2026-10-05 `call_google_ads_api`:** eight published skills claim it, so it can never be in the `__other_skills__` pool. No skill was created or updated that day. The one session where it failed (`72f4afd2`) failed with Google `USER_PERMISSION_DENIED` and connected-account errors, not gating. Prod web logs for the day had zero entitlement-unresolved, tier-fallback (`UNCONFIRMED-TIER`, org-owner lookup errors, `STALE-CONFIG`) or skill-resolution failures.
+- **ENG-152 session (`00ffae8d`):** a plain missing install; one `install_skills` fixed it. `read_file_content` is now a foundation tool.
+- **ENG-1867 session (`4b9f7b7d`):** `__other_skills__` was refused for an entitled Free user. `convert_to_pdf` is now a foundation tool, so the symptom is gone. The cause of the refusal is NOT established: the ENG-1237 unpublished-skill filter predates the session (2026-08-24), the 09-10 logs are past retention, and `AW-Skills` has no history table.
+- **Catalog churn:** no published skill changed between 2026-09-25 and 2026-10-13.
+
+**Real but separate inconsistency (not changed).** The install/display path (`getSkillsForDisplay` -> `loadAuthorizedSkillCatalog`) computes the `__other_skills__` pool from the tier-filtered catalog; execution (`buildSkillContext`, `resolveSkillsToToolNames`) computes it from the full published catalog. A tool claimed only by a skill the tier cannot install can therefore look installable and still never be callable. Scoping execution to the tier catalog was tried and rejected in review (it lets a higher-tier skill's tool leak to every tier), so which side is right is a product decision.
+
+**Added.** The skill-install gate in `toolDispatch.ts` now logs one `[tool-gate-refused]` JSON line per refusal: session, user, tool, the session's live installed skill ids (refreshed after a mid-turn install), `entitlementResolved`, whether `__other_skills__` is installed and tier-allowed, published-catalog size, whether the tool is in the live pool, and which published skills claim it (installed / tier-allowed). The refusal text is unchanged. Search CloudWatch `web.stdout.log` for `tool-gate-refused` when the next report arrives. It separates a missing install (`claimedBy`/`otherSkillsInstalled` false), a tier gap (`tierAllows` false with `entitlementResolved` true) and an unresolved entitlement. A pool change over time is only visible by comparing `catalogSize` and `inOtherSkillsPool` across lines.
+
+**Install refusals too.** An `install_skills` rejection (full refusal, the ENG-1867 "unavailable to install" path, or a partial install with `partial: true`) logs one `[install-refused]` line: session, user, requested ids, the four rejection buckets, published-catalog size and the `__other_skills__` pool size. The pool size is computed from the unfiltered published list, so an empty pool is conclusive for every user, but a non-empty one does not prove a given user's tier-filtered pool was non-empty. An empty pool with `__other_skills__` in `unavailable` is the ENG-1237/ENG-1867 signature.
+
+**The two other 2026-10-05 "not available" reports.** `call_hubspot_api` (session `d7e413d3`) and `search_ads_knowledge_base` (`f7e326bb`) are registered tools, are not foundation tools, and appear in no published skill, so both sit in the `__other_skills__` pool. The likeliest reading is the same as ENG-152: the session had not installed `__other_skills__`, so the gate refused as designed. Not confirmed: their `associatedSkills` were not read (the autofix role cannot query sessions by time). The `[tool-gate-refused]` line will settle this for the next occurrence.
+
+## ENG-2135: how reliable are AI-written golden labels? What the cross-checks showed (2026-10-14)
+
+150 label sets (50 agent sessions, 30 accounts, 50 creative images, plus pairwise checks) were produced by independent AI annotators reading raw records, never judge or classifier output, and tagged `[AI-LABEL]`. They are NOT human agreement and cannot qualify a grader: `runValidation` leaves them out by default and a registry validation must now declare `labelSource: 'human'`.
+
+Cross-checks (all counts from the saved annotation passes): account health, two independent passes agree on the state for 28 of 30 (kappa 0.86); creative images, 324 of 350 criterion labels agree between two passes (per-criterion kappa 0.46 for policy_risk up to 0.89 for brand_fidelity); agent sessions, after a decision table was applied, 288 of 350 criterion labels were unanimous across passes and 61 were settled by majority or a third vote, 1 stayed split (left unlabelled for a human). Before the decision table, two passes agreed on instruction_compliance at kappa 0.27: the old help text was ambiguous, now fixed in the labelling UI. Pairwise creative preferences are weak: an independent pass matched the seven human labels on only 3 of 7 pairs and the other AI-written pairs on 27 of 50, so those need people.
+
+Known limits: the annotators are the same model family as the Sonnet shadow judge, so their errors correlate with the judge's; classes are skewed (failed_to_escalate has 2 positives of 50, hook 47 of 50 pass), and `reliable: false` in the report now says so instead of printing a kappa; a claim that might come from hidden injected memory counts as unsupported for groundedness, because a judge sees only the transcript.
+
+## ENG-2135: AI-written golden-set labels never count as human agreement (2026-10-14)
+
+On 2026-10-14, with the owner's permission, a Claude model wrote golden-set labels (72 at the time of writing: creative pairwise
+choices and agent `task_success` labels; see ENG-2135). Each carries a note starting `[AI-LABEL]`; the store records the saving admin as the labeller, so that note is
+the only marker. The validation harness and the creative calibration report treated every label as human, so a later run could have
+produced a registry-shaped "validation" from AI labels, which is the evidence a reviewer pastes into `evalRegistry.ts` to let a judge
+gate or alert.
+
+- `isAiLabelled` / `AI_LABEL_NOTE_PREFIX` (`goldenSet.ts`): a case whose note starts with the marker.
+- `runValidation` leaves those cases out by default. `includeAiLabels` (CLI `--include-ai-labels`) adds them for an advisory run: the
+  result reports `labelSource: 'human+ai'` and `validation: null`, so it can never be recorded as registry evidence.
+- `creativeCalibrationReport` leaves AI-written choices out by default, prints how many were left out, and with `--include-ai-labels`
+  marks the report "ADVISORY, not human agreement".
+- `eval:label-coverage` counts such a case as unlabelled and reports how many cases hold AI-written labels, so it cannot say the human
+  work is done when it is not. The offline suite's `golden-agreement` baseline (`--golden`) leaves those cases out too.
+- Not changed: stored labels, the label API, flags, `mayGate` for any grader. A label written without the marker is still treated as
+  human, so anyone writing labels for the owner must keep the marker.
+
+## ENG-2135: Agent golden set gets an unbiased sampled_session source (2026-10-14)
+
+### Problem
+`seedAgent` built cases from replay fixtures, `admin_override` sessions (10) and the false-positive
+catalogue (38). All 10 admin_override sessions are already in `AW-EvalGoldenCases`, so no
+`--target-agent` value could add cases: the agent surface sat at 50 (29 test / 21 dev). Validation
+needs n >= MIN_VALIDATION_N (30) human-labelled cases on the test split, and the split is a hash of the
+case id fixed at creation, so agent could never validate as seeded. All three sources are also
+failure-biased, a poor base for judge agreement on ordinary traffic.
+
+### What changed
+A fourth source, `taskType` / `seedSource` = `sampled_session`. A session qualifies when it was created
+within 90 days of `now`, has `messageCount >= 4`, has `sessionType` regular (or absent on legacy rows),
+and its `userId` is not an evaluation user (`isEvaluationUser`, `eval_` prefix). Sessions already in
+another agent source keep that source. Candidates are ordered by a salted hash of the case id, never by
+recency or score, so re-runs pick the same sessions and a larger target only appends. Sampled cases are
+not pinned: they fill after pinned and `fp_catalogue` cases, so the default target (50) adds nothing while
+the existing store already holds 50 pinned + catalogue cases. The loader now also projects `userId`,
+`createdAt`, `sessionType`, `messageCount` (no message bodies). `bySource` and the dry-run line count it.
+
+### Use
+Dry run first (reads only, writes nothing): `--target-agent 70` adds up to 20 sampled sessions on top of
+the existing 50. `store.createCase` is conditional on `attribute_not_exists(caseId)`, so `--write` never
+overwrites and is idempotent. The write is additive but still data-plane work: needs Harsha's approval.
+Human labelling workload grows by the number of new cases (about 60% land in test, so 20 new cases is
+roughly 12 test labels; reaching 30 test labels from 29 needs only a few, 70 gives margin).
+
+### Limits
+Sessions with no `messageCount` (written before the counter) are never sampled. Evaluation sessions are
+identified only by the `eval_` userId prefix; other internal/QA accounts cannot be told apart from cheap
+attributes and are not excluded.
+
+**Gated creative candidates (ENG-2226).** `--gated-creatives` (opt-in, off by default) adds `gated_candidate` creative cases: image candidates in `AW-HumanEvalQueue` that carry an evaluated creative-gate result (`creativeGates` present and not `notChecked`). Every reviewer-feedback creative case predates the gates (earliest gated candidate 2026-09-25), so the gates adapter abstains on all of them; labelling `format_readiness` on those is wasted effort. Reviewed candidates keep priority and a larger `--target-creative` only appends.
+
+**Target semantics, a foot-gun worth stating.** `--target-<surface>` is the size of the *selection*, not the number of additions, and `createCase` never overwrites. For agent the pinned and catalogue cases (10 admin-override + 2 replay + 38 catalogue = 50) come first, so with `--fp-catalogue` the sampled additions are `target - 50`; without the catalogue file only the 10 admin-override cases are pinned, so the same 20 additions need `--target-agent 30`. Read `bySource` in the dry run and aim for about 20 new `sampled_session` cases (about 12 land in the test split), then diff against the store before any `--write`.
+
+## ENG-2135: account-health golden cases need ad-connected accounts, not a subscription-status split (2026-10-14)
+
+An annotated read of all 30 seeded account-health cases (state judged from raw connection, payment, spend and engagement records, never from the classifier) came out 22 `activation_incomplete`, 3 `healthy`, 2 `at_risk`, 3 not applicable. Subscription status (`canceled` / `active`) says almost nothing about health: only about 27 of roughly 490 users have an ad platform (Meta, Google Ads, LinkedIn Ads) connected, and they are the only possible source of `healthy` and `at_risk` examples. A larger subscription-status sample would only add more `activation_incomplete`, leaving the other two classes with a handful of positives and no usable per-class kappa.
+
+Changes: (1) tombstoned (`deleted_`) and evaluation (`eval_`) accounts are never selected, in either mode (the pool included them; a tombstoned user has no health state, and the other health code already excludes them); (2) opt-in `--ad-connected-accounts` takes every ad-connected account first (hash order), then fills with the existing balanced subscription sample. Default behaviour is otherwise unchanged. With `--target-account-health 50` the expected selection is every ad-connected account (about 27, some already seeded) plus about 23 from the subscription sample.
+
+Limits: the loader projects `connected_accounts` to learn which platforms are connected; the connection config (tokens) is never kept or printed. `at_risk` will stay rare until more accounts have connected ad platforms; the grader cannot be validated on that class before then and must stay ungated. A tombstoned account that already has a golden case keeps it (labelled not applicable).
+
+## DRAMABREAK: observed channel beats link tag; Nova paid channel (2026-10-14)
+
+Classifier 2.2.0. Decided by Harsha 2026-10-14 (DramaBreak attribution decision queue, all recommendations):
+- Channel = in-app browser UA, then referrer, then utm_source, then click id, then fallback. Agency and paid links keep the link's platform.
+- New row fields `linkChannel` (what the link claims) and `detectedChannel` (what we observed), reported side by side.
+- New channels: `nova` (NewsBreak Ads, Paid by construction) and `newsbreak` (newsbreak.com referral).
+- Not backfilled: only new sessions use 2.2.0 (rows carry classifierVersion). A backfill is a data-plane change and needs separate approval.
+
+## ENG-2378: Work Plans can pin a model per step (work_plan_step_models_enabled) (2026-10-13)
+
+Before: a Work Plan could pin one `defaultModel` for the whole plan; every step ran on that (or the account default),
+so a plan could not use e.g. a strong reasoning model for one step and a cheap one for the rest.
+
+Principle (owner): every user and admin picks the model; the selected model is the only one ever used. No swaps.
+
+Now, with AW-Settings `work_plan_step_models_enabled` = exactly `true` the feature is on (60s cache, last-known value on
+a failed refresh, `services/agentMode/workPlanStepModels.ts`, same pattern as `compare_save_alternatives`). The switch has
+THREE states, and they differ for writes and for stored models:
+- ON (`true`): new/changed step models are accepted and validated; stored models are honoured at launch and by the engine.
+- OFF (a row that is absent or any other value, i.e. a successful read): behaves exactly as before the feature. A submitted
+  `model` is ignored (with a `warnings` entry), stored models are carried over untouched by writes, not copied at launch
+  and ignored by the engine.
+- UNKNOWN (settings read failing with no last-known value, e.g. cold start): stored step models are still HONOURED
+  (launch validation + copy, engine, `save_work_plan`), because only a definite off may ignore a user's explicit choice;
+  writes treat it like off (submitted models ignored, stored ones carried over), and `GET /model-options` reports `false`.
+
+- Storage: an OPTIONAL `model?: string` (canonical registry id) on `WorkPlanStep`, an additive optional key INSIDE the
+  existing JSON `steps` array of AW-WorkPlans. No migration, table, index or attribute. Absent = the plan `defaultModel`
+  pin, then the account default (today). Owner accepted additive optional keys.
+- Whitelists (the ENG-889/ENG-1331 silent-drop class): `WORK_PLAN_STEP_FIELDS` and `STEP_CONTENT_FIELDS`
+  (workPlanSteps.ts), the admin merge-supplied builder, `createSessionWithPlan`, `applyPredefinedWorkPlan`, the session
+  work-plan step types (chatbotService.ts), and the MCP `manage_predefined_work_plan` step schema. A source-scan test
+  fails if a `WorkPlanStep` field is ever missing from `WORK_PLAN_STEP_FIELDS`.
+- Write (admin + user routes, create/update): each step model is validated with `checkPlanDefaultModelWrite` semantics: an
+  UNCHANGED stored value is tolerated (a since-retired model never blocks an unrelated edit; matched by title, else
+  stepCount), a new/changed value must be served and selectable by the plan's launchers, else 422 `model_unavailable`
+  with `stepCount`. A replace that omits a stored step model is refused as content loss; a blank `model` in
+  `steps_mode="merge"` clears it. Switch off: a submitted `model` is dropped with a `warnings` entry and never validated.
+- Launch (`launchWorkPlan` / accept / `applyPredefinedWorkPlan` incl. unattended schedule launches, and
+  `createSessionWithPlan`): ALL step models are resolved up front for the launching user with the plan-pin rules
+  (`resolvePlanLaunchModel`, no silent swap); any failure is a 422 (+ `stepCount`) before any state is written; the
+  unattended launch also pages oncall. Canonical ids are copied onto the session plan only while the switch is on.
+- Engine (`generateSessionResponse`, `scheduleAutoWorkPlanContinuation`): at each turn/continuation the first
+  not-completed/skipped step's model wins over the request's `llmModel` and the session's, via
+  `resolveEffectiveModelForUser(allowSilentSwap:false)`, and the session `llmModel` is updated to it. A step model that
+  became unavailable mid-plan PAUSES the plan: a visible assistant message ("Step N uses <model>, which is no longer
+  available. Pick another model for this step to continue."), an oncall alert, no LLM call; idempotent per step+model so
+  the continuation chain does not repeat it. An unexpected resolver failure fails the turn; it never falls back.
+- Hint: `GET /api/agent-mode/model-options` returns `workPlanStepModelsEnabled` (boolean) next to `chatBranchingEnabled`
+  / `compareSaveAlternatives`. Partner-portal admin work-plan editor shows a per-step model select behind it.
+- Review hardening: a write NEVER erases a stored step model. With the switch off or its state unknown a submitted
+  `model` is ignored and the stored one of the matching step (title, then stepCount for a renamed step) is carried over
+  (admin, user, MCP replace/merge); `modify_work_plan` follows the step by title, not the stepCount slot;
+  `save_work_plan` carries it; `/public/plans` strips step models. A settings-read failure with no last-known value is
+  UNKNOWN, not off: stored step models are still honoured (launch + engine); only a definite off ignores them.
+- Paused step: an explicit pick (the `/generate` `llmModel` differing from the stored session stamp) overrides an
+  UNAVAILABLE pending step model, runs the turn and updates that step; an available step model still wins over the
+  picker. Without a pick the plan stays paused ("Choose another model in the model picker and send again").
+- A step with no model runs on `workPlan.planDefaultModel`, then `workPlan.launchModel` (the model the session had
+  before the plan), recorded at launch only for plans whose steps carry a model; the stamp is exactly what runs. When
+  the plan completes the pre-plan model returns unless the user picked one (`workPlan.engineModel` marker).
+- Carry-over matching is conservative ("a wrong model is worse than none"): by unique title; duplicated titles match
+  only the same-numbered stored step; a rename binds only when exactly one step on each side is left unmatched at the
+  same number with unchanged content. A pick on a model-less step stands (the marker `engineModel` keeps naming the
+  engine's own choice); a failed end-of-plan restore clears the marker once. Share / conversable views and anonymous
+  launches never carry step models or `launchModel` / `planDefaultModel` / `engineModel`.
+- The picker PATCHes the session model before `/generate`, so the request model equals the stamp: a stamp that differs
+  from the engine's last stamp (`engineModel`; before the first stamp the plan default / launch model) IS the user's
+  pick. It resumes a plan paused on a retired step model (the step adopts it), stands on model-less steps, and never
+  overrides an available step model. Duplicate-titled steps inherit a model only from the same-numbered stored step
+  with the same content (identical twins cannot be told apart and match by number).
+- An interactive-share viewer's pick may run for the turn on a model-less step but never rewrites the owner's stored
+  step model or the engine marker; on a retired step model the viewer gets the pause and the owner resumes.
+- `workPlan.pickedModel` records a model the user explicitly picked during the plan (a model-less step running on it, or a
+  retired step adopting it); the end-of-plan restore never replaces it. Submit-for-review and approve revalidate the
+  stored step models as a NON-admin launcher (422 + `stepCount`, state unchanged), like the admin scope-widening check.
+- Known consequences: a stale picker echo (a `/generate` carrying a model different from the stamp, without a PATCH) is
+  indistinguishable from a pick (relies on the portal syncing the picker to the stamp); a plan with later steps pending
+  but no marker (hand-edited / legacy only; the engine never creates it) has no baseline; in the unique-title carry
+  path the TITLE is the identity (a step retitled into a deleted step's title keeps that model) and duplicates with
+  identical title+content cannot be told apart. Also: with the switch off an admin cannot clear a stored step model; a client that always sends
+  `llmModel` never sees the pause and rewrites a retired step model to its pick; authenticated
+  `GET /api/user-work-plans` shows step models of public plans to signed-in users (as `defaultModel` today); a scheduled
+  run paused mid-plan retries up to 20 verified-chat attempts, then the run fails and the next scheduled run re-validates
+  every step model at launch.
+- Not changed: Emma's `create_work_plan` / `modify_work_plan` tools (a model choice belongs to a user/admin, not the LLM;
+  `modify_work_plan` keeps a stored step model), model-compare/branching, concurrency cap, retries, autocomplete rounds,
+  and the legacy AW-Settings predefined-plans blob (`routes/settings.ts`), which never carried per-step fields.
+- Rollback: set `work_plan_step_models_enabled` to anything but `true` (writes drop the field again, launches stop
+  copying it, the engine ignores stored values; nothing to migrate back).
+
+## ENG-112: Legacy branches heal themselves when their owner opens them (2026-10-13)
+
+### Problem
+Branches created before agentweb#3463 (2026-10-09..10-13; `chat_branching_enabled` was only turned on 2026-10-09) carry the row-0 `metadata.branchOrigin` marker but no session-level `branchedFrom`. They are not grouped in the sidebar, not listed by `GET /session/:id/branches`, and a branch of one starts a NEW family root.
+
+### Fix (self-healing, bounded, no backfill)
+- `GET /api/agent-mode/session/:id`, genuine OWNER view only (not admins, not delegated, not share/MCP views), only when `chat_branching_enabled` is exactly "true", only when the loaded session has no `branchedFrom` and its already-loaded row 0 carries a well-formed `branchOrigin`.
+- Derives `branchedFrom {sessionId: sourceSessionId, rootSessionId, messageIndex: sourceMessageIndex, branchedAt}` (the exact values #3463 writes) and persists it with ONE conditional update: `attribute_exists(sessionId) AND userId = :owner AND attribute_not_exists(branchedFrom)`. Concurrent opens are idempotent, an existing value is never overwritten, `updatedAt` is not touched (sidebar order unchanged). The healed value is returned in the same response.
+- rootSessionId = the source's `branchedFrom.rootSessionId`, else the source itself (a legacy source without `branchedFrom` is not walked further: that would need its message rows). Inline-message records (very old sessions) are followed up to 10 record reads, cycle-safe. Only `getChatSessionRecord` reads; never message rows.
+- Source must exist and belong to the SAME owner (archived is fine); otherwise skipped silently.
+- Best effort: any failure is logged and swallowed; GET never fails. Sessions that already have `branchedFrom` or are not branches cost nothing (no flag read, no store call). A legacy session costs the bounded record reads once, ever.
+
+### Known limitation
+A chain of two or more legacy hops (C branched from legacy B branched from A) heals C with root B until B itself is opened and healed; C is then in B's family, not A's. Walking further would need message rows, which this change deliberately never reads.
+
+- Accepted two-hop split (pre-#3463 data only): healing B first and then C puts both in A's family; opening C first (root B) and B later splits them (C in B's family, B in A's). Nothing is rewritten after the fact.
+- A session whose source is missing/foreign/cyclic is remembered in a per-process set (max 500, cleared on restart, nothing written), so repeated opens do not repeat the flag read and source read.
+
+### Approval / rollout / rollback
+- `branchedFrom` is the additive optional attribute already owner-approved with #3463; no new attribute, index, table or backfill.
+- Rollback = revert this PR. Values already written are harmless (owner-only, optional, read by the same code as #3463 branches).
+- Tests: `chatBranching.legacyHeal.test.ts` (real controller + real ChatbotDB over the in-memory store with enforced ConditionExpressions). Mutation-checked: dropping the owner condition, the attribute_not_exists condition, the owner-view gate, the flag check or the same-owner source check each fails tests.
+
+## ENG-110: Cross-instance active-run guard for interactive /generate (2026-10-13)
+
+Problem: production runs one backend instance but deploys are Immutable (two instances overlap) and the old one
+drains for up to 10 min (`DRAIN_CEILING_MS`). The per-session generation lock, its owner map and `/generating` are
+process memory, so during an overlap the OLD instance can still run a chat while the NEW instance reports nothing:
+after a reload the portal shows the "response wasn't received / Resend" banner and a Resend click starts a SECOND
+generation (duplicate user message, two assistant replies, double cost).
+
+Fix (additive, switch-gated, fail-open): an optional attribute on the existing `AW-ChatSessions` item,
+`activeRun: { runId, instanceId, startedAt, heartbeatAt }` (epoch ms). No GSI, no backfill, no new table or index.
+The run-store guard (`AGENT_RUN_STORE`, `AW-AgentRuns`) is NOT used.
+
+- Switch: AW-Settings `session_active_run_guard_enabled`, exactly `'true'` enables. Absent / anything else / cold-start
+  read failure = off = today's behaviour with ZERO session-table calls. ~60s cache, last-known on a failed refresh
+  (same pattern as `compareProviderPolicy.ts`). Not an env var. Turn it ON only after the deploy that ships this is live.
+- Claim (interactive `/generate` only, right after the in-memory claim): one conditional `UpdateItem`
+  (`attribute_exists(sessionId) AND (attribute_not_exists(activeRun) OR activeRun.heartbeatAt < :staleBefore OR
+  activeRun.runId = :me OR activeRun.instanceId = :instanceId)`). Condition lost => release lock/owner and answer
+  409 `SESSION_BUSY` (same body as the in-memory busy path). Any other error => log and proceed (fail-open).
+  The `instanceId` clause (not in the original design) lets the same process re-claim: its in-memory lock already
+  proved the earlier run there ended (Stop then an immediate resend before the old run's clear landed).
+- Beat: every 30s `SET activeRun.heartbeatAt` conditional on our `runId`; a failed or lost beat is only logged.
+  Timer is `unref`'d and cleared synchronously in the existing `finally` (success, throw, timeout, stop, 429, crash path).
+- Clear: `REMOVE activeRun` conditional on our `runId` in the same `finally`, best-effort (never clears a newer run).
+- Staleness 90s (3 beats). Writes never touch `updatedAt` / `adminListPartition`.
+- Reads: `GET /session/:id` `isGenerating` = in-memory OR (fresh activeRun of ANOTHER instance AND genuine owner view),
+  no extra read. `GET /generating?sessionId=<id>` (optional; owner only, not delegates) adds that one session via one
+  record-only `getChatSessionRecord`; without the param it is unchanged.
+- `activeRun` is never serialised: every ChatbotDB session read makes it non-enumerable (invisible to spread / JSON /
+  lists / exports / share / admin views), and the owner view and MCP tools also omit it explicitly.
+- Whole-item overwrites (`put`) of a session: only `createChatSession` (a new item) and the dev/test scripts
+  `copy-session-to-dev.ts` / `seed-imageresume-testenv.ts`. A dropped attribute only means a missed guard.
+- Out of scope (phase 1): conversable-share generate and system paths (scheduled / Slack / email / verified-generate).
+- Rollback: set the switch to anything but `'true'`; leftover attributes go stale harmlessly.
+
+Switch read is bounded: the (at most once per ~60s) AW-Settings read that /generate awaits is raced against a 2s
+timeout (`SETTING_READ_TIMEOUT_MS`); a hung read behaves like a failed refresh (last-known value, off if none, one log
+line, retry in 5s) and never stalls the core path.
+
+Accepted tradeoffs (phase 1):
+- A >90s event-loop / GC stall of the running instance makes a live run look dead, so a Resend elsewhere is allowed; the
+  stalled run's later beat then only logs `lostClaim` and the two runs can overlap.
+- After a crash / SIGKILL, Resend on the new instance gets 409 and `isGenerating` stays true for up to 90s (until the
+  heartbeat goes stale).
+- Out of scope: the conversable / ishare generate path and the GET /session media-continuation durability backstop.
+- A malformed existing `activeRun` (e.g. a non-numeric `heartbeatAt`) would stay busy; nothing in the codebase writes one,
+  and handling it would need `NOT attribute_type(...)` in the claim condition, which is not worth the complexity.
+
 ## ENG-0000: Opslane agent findings fixes (2026-10-13)
 
 Five bugs from Opslane's simulated-user run against `8eac4e0a5`, each reproduced with a failing test on current main before the fix.
