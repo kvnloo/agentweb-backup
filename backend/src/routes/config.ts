@@ -9,12 +9,12 @@ import crypto from 'crypto';
 export { encryptPassword, decryptPassword } from '../utils/crypto';
 // Import for local use
 import { encryptPassword } from '../utils/crypto';
+import { TABLE_PREFIX } from '../config/constants';
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient();
 
 // Get table prefix based on NODE_ENV
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 
 // Single source of truth for which config fields never leave the server. Every
 // response builder in this file must route through this instead of destructuring
