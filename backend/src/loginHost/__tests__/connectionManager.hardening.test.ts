@@ -321,6 +321,21 @@ describe("failed and interrupted promotes", () => {
     expect(rig.mgr.status({ connectionId: "c1" }).state).toBe("needs_attention");
   });
 
+  it("disabling a connection that is mid first sign-in (or parked needs_reconnect) is recorded, not silently dropped", async () => {
+    rig = makeRig();
+    const ref = await readyAttempt(rig, "c1");
+    await rig.mgr.disable({ connectionId: "c1", epoch: 1 });
+    expect(await rig.mgr.loginPromote({ connectionId: "c1", loginRef: ref, epoch: 2 })).toEqual({ state: "disabled", epoch: 2 });
+    // parked by a dead login, then disabled, then reconnected
+    await signIn(rig, "c2", 1);
+    rig.script.preflight = { ok: false, kind: "auth_dead" };
+    await drain((await rig.mgr.runTurn(turnReq("c2", 1))).events!);
+    expect(rig.mgr.status({ connectionId: "c2" }).state).toBe("needs_reconnect");
+    await rig.mgr.disable({ connectionId: "c2", epoch: 2 });
+    const re = await readyAttempt(rig, "c2", true);
+    expect(await rig.mgr.loginPromote({ connectionId: "c2", loginRef: re, epoch: 3 })).toEqual({ state: "disabled", epoch: 3 });
+  });
+
   it("a parked or home-less connection cannot be brought back by disable then enable (only a reconnect clears it)", async () => {
     rig = makeRig();
     // first sign-in whose promote fails: no home at all

@@ -627,7 +627,9 @@ export class ConnectionManager {
       const c = this.requireConn(req.connectionId);
       if (c.state === "revoking" || c.state === "revoked") throw new HostError("ESTATE", c.state);
       this.adoptEpoch(c, req.epoch, "disable");
-      if (c.state === "active" || c.state === "needs_attention") c.state = "disabled";
+      // Every non-terminal state records the disable (a first sign-in or a parked connection included): otherwise
+      // the call succeeds and does nothing, and the next promote activates the connection.
+      if (c.state === "active" || c.state === "needs_attention" || c.state === "attempting" || c.state === "needs_reconnect") c.state = "disabled";
       this.save();
       await this.terminateConnection(c, "disabled");
       return { state: c.state, epoch: c.epoch };
@@ -691,7 +693,7 @@ export class ConnectionManager {
             await this.expireStaleAttempt(c);
             if (c.state === "revoking") await this.cleanupRevoking(c);
             await this.drainWipes(c);
-            if (c.state === "attempting" && !c.attempt && !c.wipePending?.length) delete this.state().connections[id]; // abandoned first sign-in
+            if ((c.state === "attempting" || (c.state === "disabled" && c.uid < 0 && !c.homeRef)) && !c.attempt && !c.wipePending?.length) delete this.state().connections[id]; // abandoned first sign-in
           });
         } catch (err) {
           this.log.warn("sweep_connection_failed", { connectionId: id, code: errCode(err) });
