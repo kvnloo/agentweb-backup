@@ -434,8 +434,41 @@ describe('agentToolGatewayService', () => {
           expect(result.repairs).toEqual(expect.arrayContaining(['list_id:scalar_coerce']));
         });
 
-        it('does not coerce non-identifier fields, decimals, or booleans', () => {
-          for (const args of [{ ratio: 1.5 }, { flag: true }, { action: 7 }, { list_id: 1.5 }, { list_id: true }]) {
+        it('coerces finite decimals and booleans for exactly-string fields (ENG-2509)', () => {
+          const cases: Array<[Record<string, unknown>, Record<string, unknown>]> = [
+            [{ ratio: 1.5 }, { ratio: '1.5' }],
+            [{ ratio: -0.25 }, { ratio: '-0.25' }],
+            [{ flag: true }, { flag: 'true' }],
+            [{ flag: false }, { flag: 'false' }],
+            [{ list_id: 1.5 }, { list_id: '1.5' }],
+          ];
+          for (const [args, expected] of cases) {
+            const result = validateAndRepairToolArgs({
+              toolName: 'call_hubspot_api',
+              args: { entity_type: 'CONTACT', action: 'GET', ...args },
+              inputSchema: hubspotSchema,
+              effect: 'read',
+            });
+            expect(result.status).toBe('repaired');
+            expect(result.args).toEqual({ entity_type: 'CONTACT', action: 'GET', ...expected });
+            expect(result.repairs).toEqual(expect.arrayContaining([`${Object.keys(args)[0]}:scalar_coerce`]));
+          }
+        });
+
+        it('does not coerce booleans/decimals outside a declared string enum (negative)', () => {
+          for (const args of [{ entity_type: true }, { entity_type: 1.5 }]) {
+            const result = validateAndRepairToolArgs({
+              toolName: 'call_hubspot_api',
+              args: { action: 'GET', ...args },
+              inputSchema: hubspotSchema,
+              effect: 'read',
+            });
+            expect(result.status).toBe('invalid');
+          }
+        });
+
+        it('still rejects integers in non-identifier string fields', () => {
+          for (const args of [{ action: 7 }, { ratio: 2 }]) {
             const result = validateAndRepairToolArgs({
               toolName: 'call_hubspot_api',
               args: { entity_type: 'CONTACT', action: 'GET', ...args },
