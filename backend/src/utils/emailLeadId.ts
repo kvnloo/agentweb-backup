@@ -38,14 +38,16 @@ export function emailLeadBucketMs(): number {
   return Number.isInteger(n) && n >= MIN_BUCKET_MS && n <= MAX_BUCKET_MS ? n : DEFAULT_BUCKET_MS;
 }
 
-function emailKeyHash(listId: string, emailLower: string): string {
+function emailKeyHash(listId: string, emailLower: string, namespace = ''): string {
   // Keyed so the id never carries a plain, offline-guessable hash of the address. The id is
   // short-lived (it only has to agree between racers seconds apart), so rotating the secret is
   // harmless. JWT_SECRET is asserted at boot (server.ts:50 -> config/jwt.ts assertJwtSecretAtBoot); the unkeyed
   // fallback only serves unconfigured test envs. If two instances ever disagreed on it their ids would
   // differ, racers on different instances would not collide, and dedupe would silently degrade to the
   // pre-check (the pre-ENG-2321 behaviour): benign, and unrealistic since JWT verification needs one shared secret.
-  const secret = process.env.JWT_SECRET || 'email-lead-id';
+  // A non-empty namespace derives a DIFFERENT HMAC key, so ids in one namespace can never equal ids in another
+  // whatever string a public caller sends (an "email" of literally `phone:2125551234` included).
+  const secret = (process.env.JWT_SECRET || 'email-lead-id') + (namespace ? `\u0000${namespace}` : '');
   return crypto.createHmac('sha256', secret).update(`${listId}:${emailLower}`).digest('hex').slice(0, 12);
 }
 
@@ -58,15 +60,20 @@ export interface EmailLeadIds {
 }
 
 /** `emailLower` must already be trimmed and lower-cased (createLead's own normalisation). */
-export function emailLeadIds(listId: string, emailLower: string, nowMs: number = emailLeadClock.now()): EmailLeadIds {
+export function emailLeadIds(listId: string, emailLower: string, nowMs: number = emailLeadClock.now(), namespace = ''): EmailLeadIds {
   const width = emailLeadBucketMs();
   const bucket = Math.floor(nowMs / width) * width;
-  const hash = emailKeyHash(listId, emailLower);
+  const hash = emailKeyHash(listId, emailLower, namespace);
   return {
     leadId: `lead_${bucket}_${hash}`,
     prevLeadId: `lead_${bucket - width}_${hash}`,
     nextLeadId: `lead_${bucket + width}_${hash}`,
   };
+}
+
+/** ENG-2123: the phone twin, in its own id namespace. */
+export function phoneLeadIds(listId: string, phoneKey: string, nowMs: number = emailLeadClock.now()): EmailLeadIds {
+  return emailLeadIds(listId, phoneKey, nowMs, 'phone');
 }
 
 const DEFAULT_TX_BACKOFF_MS = 10 * 60 * 1000;
