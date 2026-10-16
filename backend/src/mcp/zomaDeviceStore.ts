@@ -9,9 +9,14 @@
  *   usercode#<USER_CODE>          user_code -> device lookup (TTL = expiry)
  *   token#<sha256(zoma token)>    per-user Zoma API token, hash only, no TTL, revocable
  * Raw device codes and raw tokens are never stored.
+ *
+ * Device items also carry `events` (append-only setup timeline, ENG-2496 tracing) and
+ * `lastPollOutcome`. TTL is the logical expiry plus ZOMA_TRACE_RETENTION_MS so support can
+ * still read a finished/expired setup's timeline; every read path checks `expiresAt`, never TTL.
  */
 import AWS from 'aws-sdk';
 import { TABLE_PREFIX } from '../config/constants';
+import type { ZomaSetupEvent } from './zomaSetupLog';
 
 export const ZOMA_DEVICE_TABLE = `${TABLE_PREFIX}AW-ZomaDeviceAuth`;
 
@@ -29,6 +34,8 @@ export interface ZomaDeviceRecord {
   userId?: string;
   links?: Partial<Record<ZomaLinkStep, string>>;
   createdAt: string;
+  events?: ZomaSetupEvent[];
+  lastPollOutcome?: string;
 }
 
 export interface ZomaTokenRecord {
@@ -59,12 +66,17 @@ export interface ZomaDeviceStore {
   getToken(tokenHash: string): Promise<ZomaTokenRecord | null>;
   /** Idempotent; true when the token exists (now revoked). */
   revokeToken(tokenHash: string, now: number): Promise<boolean>;
+  /** Append to the device's setup timeline; optionally record the latest poll outcome. No-op for a missing device. */
+  appendEvent(deviceId: string, event: ZomaSetupEvent, opts?: { pollOutcome?: string }): Promise<void>;
 }
+
+/** Support can read a setup's timeline for this long after it expires. */
+export const ZOMA_TRACE_RETENTION_MS = 14 * 24 * 3600 * 1000;
 
 const deviceKey = (deviceId: string) => `device#${deviceId}`;
 const userCodeKey = (userCode: string) => `usercode#${userCode}`;
 const tokenKey = (tokenHash: string) => `token#${tokenHash}`;
-const ttlOf = (expiresAtMs: number) => Math.ceil(expiresAtMs / 1000);
+const ttlOf = (expiresAtMs: number) => Math.ceil((expiresAtMs + ZOMA_TRACE_RETENTION_MS) / 1000);
 
 function isConditionFailure(error: unknown): boolean {
   const code = (error as { code?: string })?.code;
@@ -199,6 +211,40 @@ export class DynamoZomaDeviceStore implements ZomaDeviceStore {
     if (!r.Item) return null;
     const { pk: _pk, ...rest } = r.Item;
     return rest as ZomaTokenRecord;
+  }
+
+  async appendEvent(deviceId: string, event: ZomaSetupEvent, opts: { pollOutcome?: string } = {}) {
+    try {
+      await this.db.update({
+        TableName: this.table,
+        Key: { pk: deviceKey(deviceId) },
+        UpdateExpression: `SET events = list_append(if_not_exists(events, :empty), :ev)${opts.pollOutcome ? ', lastPollOutcome = :poll' : ''}`,
+        ConditionExpression: 'attribute_exists(pk)',
+        ExpressionAttributeValues: { ':empty': [], ':ev': [event], ...(opts.pollOutcome ? { ':poll': opts.pollOutcome } : {}) },
+      }).promise();
+    } catch (error) {
+      if (!isConditionFailure(error)) throw error;
+    }
+  }
+
+  /** Support tooling only (scripts/zoma-setup-trace.ts): full scan of device items. Small table. */
+  async scanDevices(): Promise<ZomaDeviceRecord[]> {
+    const out: ZomaDeviceRecord[] = [];
+    let ExclusiveStartKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const r = await this.db.scan({
+        TableName: this.table,
+        FilterExpression: 'begins_with(pk, :device)',
+        ExpressionAttributeValues: { ':device': 'device#' },
+        ExclusiveStartKey,
+      }).promise();
+      for (const item of r.Items ?? []) {
+        const { pk: _pk, ttl: _ttl, ...rest } = item;
+        out.push(rest as ZomaDeviceRecord);
+      }
+      ExclusiveStartKey = r.LastEvaluatedKey;
+    } while (ExclusiveStartKey);
+    return out;
   }
 
   async revokeToken(tokenHash: string, now: number) {
