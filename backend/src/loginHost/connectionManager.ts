@@ -359,7 +359,7 @@ export class ConnectionManager {
       const previous = c.uid >= 0 && c.homeRef ? { uid: c.uid, ref: c.homeRef, owner: c.connectionId } : undefined;
 
       // Fence the old home first: new epoch recorded, no turn admitted while swapping.
-      c.swapWasDisabled = (resuming && c.swapWasDisabled) || c.state === "disabled"; // a reconnect (or its resume) must not silently re-enable a disabled connection
+      c.swapWasDisabled = c.swapWasDisabled || c.state === "disabled"; // sticky until a promote completes (cleared at success): a reconnect, its resume or a retry must not silently re-enable a disabled connection
       c.epoch = req.epoch;
       c.state = "swapping";
       c.reason = undefined;
@@ -371,7 +371,9 @@ export class ConnectionManager {
         attempt.homeRef = homeRef;
         this.save(); // the intended home is recorded BEFORE the rename: a crash cannot lose track of where the credentials went
         await this.f("promoteAttempt", () => this.deps.fs.promoteAttempt(attempt.uid, attempt.attemptRef, homeRef));
-        if (this.uids.ownerOf(attempt.uid) === `attempt:${attempt.attemptRef}`) this.uids.transfer(attempt.uid, `attempt:${attempt.attemptRef}`, c.connectionId);
+        const uidOwner = this.uids.ownerOf(attempt.uid);
+        if (uidOwner === `attempt:${attempt.attemptRef}`) this.uids.transfer(attempt.uid, `attempt:${attempt.attemptRef}`, c.connectionId);
+        else if (uidOwner !== c.connectionId) throw new Error("uid_owner_mismatch"); // already transferred by an earlier try of this promote, or a bug: never carry on
       } catch (err) {
         c.state = "needs_attention";
         c.reason = "promote_failed"; // only a reconnect (or resuming this promote) clears it
@@ -836,7 +838,10 @@ export class ConnectionManager {
   private async drainWipes(c: ConnRecord): Promise<void> {
     const queue = c.wipePending;
     if (!queue?.length) return;
-    c.wipePending = undefined; // entries pushed while we await land in a fresh array and are kept
+    // The queue stays on the record (and so on disk) until the wipes are confirmed: a save by any other
+    // operation during the awaits below must still show the pending work. Entries pushed meanwhile are
+    // appended after index n.
+    const n = queue.length;
     const byUid = new Map<number, NonNullable<ConnRecord["wipePending"]>>();
     for (const w of queue) byUid.set(w.uid, [...(byUid.get(w.uid) ?? []), w]);
     const remaining: NonNullable<ConnRecord["wipePending"]> = [];
@@ -845,14 +850,16 @@ export class ConnectionManager {
       if (!mine.length) continue; // stale: the uid is free or belongs to someone else now
       try {
         if (!(await this.safeKill(uid))) {
-          this.log.warn("wipe_entry_dropped_uid_out_of_range", { connectionId: c.connectionId });
+          // Never treat as clean: the credentials may still be on disk. Kept (and re-logged each sweep) until an operator acts.
+          this.log.warn("wipe_entry_uid_out_of_range_kept", { connectionId: c.connectionId });
+          remaining.push(...mine);
           continue;
         }
         for (const w of mine) {
           if (w.kind === "attempt") await this.f("wipeAttempt", () => this.deps.fs.wipeAttempt(w.uid, w.ref));
           else await this.f("wipeHome", () => this.deps.fs.wipeHome(w.uid, w.ref));
         }
-        const queuedMeanwhile = ((c as ConnRecord).wipePending ?? []).some((w) => w.uid === uid); // re-read: entries may have been pushed during the awaits above
+        const queuedMeanwhile = (c.wipePending ?? []).slice(n).some((w) => w.uid === uid); // entries pushed during the awaits above
         if (!queuedMeanwhile && (await this.f("residueCount", () => this.deps.fs.residueCount(uid))) === 0) {
           for (const w of mine) this.uids.free(uid, w.owner);
         } else remaining.push(...mine);
@@ -860,7 +867,7 @@ export class ConnectionManager {
         remaining.push(...mine); // all of this uid's entries stay together; the uid stays allocated
       }
     }
-    const added = c.wipePending ?? [];
+    const added = (c.wipePending ?? []).slice(n);
     const merged = [...remaining, ...added];
     c.wipePending = merged.length ? merged : undefined;
     this.save();

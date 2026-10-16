@@ -101,7 +101,7 @@ describe("uid release while more cleanup is queued", () => {
     assertConsistent(rig);
   });
 
-  it("a cleanup entry for a uid that is now outside the configured range (range narrowed between restarts) is dropped, never signalled", async () => {
+  it("a cleanup entry for a uid that is now outside the configured range (range narrowed between restarts) is never signalled and is kept", async () => {
     rig = makeRig({ config: { uidMin: 400_000, uidMax: 400_009 } });
     await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
     rig.store.get().uidOwners["5"] = "c1"; // an old allocation from a wider range
@@ -109,7 +109,52 @@ describe("uid release while more cleanup is queued", () => {
     rig.fs.killed.length = 0;
     await rig.mgr.sweep();
     expect(rig.fs.killed).not.toContain(5);
-    expect(rig.store.get().connections.c1.wipePending).toBeUndefined(); // dropped, not retried forever
+    expect(rig.store.get().connections.c1.wipePending).toHaveLength(1); // kept: credentials may still be on disk, so never "clean"
+  });
+});
+
+describe("pending cleanup is durable while it runs", () => {
+  let rig: Rig;
+  afterEach(() => rig?.cleanup());
+
+  it("a save by another operation during a revoke's wipe still records the pending wipe, so a restart finishes it instead of confirming a revoke with credentials on disk", async () => {
+    rig = makeRig();
+    await signIn(rig, "c1", 1);
+    await signIn(rig, "c2", 1);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    rig.fs.wipeGate = gate;
+    const revoking = rig.mgr.revoke({ connectionId: "c1", epoch: 2 });
+    await flush();
+    await rig.mgr.disable({ connectionId: "c2", epoch: 2 }); // saves the whole state while c1's wipe is in flight
+    const onDisk = JSON.parse(JSON.stringify(rig.store.get())); // what a crash right now would leave
+    expect(onDisk.connections.c1.wipePending?.length).toBeGreaterThan(0);
+    release();
+    await revoking;
+  });
+
+  it("a stuck wipe survives a restart and is retried", async () => {
+    rig = makeRig({ config: { portCallTimeoutMs: 50 } });
+    await signIn(rig, "c1", 1);
+    rig.fs.hangWipe = true;
+    await rig.mgr.revoke({ connectionId: "c1", epoch: 2 });
+    rig.fs.hangWipe = false;
+    const mgr2 = rig.restart();
+    await mgr2.recover();
+    await mgr2.sweep();
+    expect(mgr2.status({ connectionId: "c1" }).state).toBe("revoked");
+    expect([...rig.fs.dirs].filter((d) => d.startsWith("home:"))).toEqual([]);
+    assertConsistent(rig);
+  });
+
+  it("an entry for a uid outside the configured range is kept, and the revoke is not confirmed", async () => {
+    rig = makeRig({ config: { uidMin: 400_000, uidMax: 400_009 } });
+    await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
+    rig.store.get().uidOwners["5"] = "c1";
+    rig.store.get().connections.c1.wipePending = [{ uid: 5, ref: "old", kind: "home", owner: "c1" }];
+    await rig.mgr.sweep();
+    expect(rig.fs.killed).not.toContain(5);
+    expect(rig.store.get().connections.c1.wipePending).toHaveLength(1);
   });
 });
 
@@ -251,6 +296,29 @@ describe("failed and interrupted promotes", () => {
     await code(rig.mgr.loginPromote({ connectionId: "c1", loginRef, epoch: 3 }));
     expect(rig.mgr.status({ connectionId: "c1" })).toMatchObject({ state: "needs_attention", reason: "promote_failed" }); // the failure path forgot it was disabled...
     expect(await rig.mgr.loginPromote({ connectionId: "c1", loginRef, epoch: 3 })).toEqual({ state: "disabled", epoch: 3 }); // ...the record did not
+  });
+
+  it("a connection disabled before a failed reconnect stays disabled when the user cancels and starts a NEW reconnect", async () => {
+    rig = makeRig();
+    await signIn(rig, "c1", 1);
+    await rig.mgr.disable({ connectionId: "c1", epoch: 2 });
+    const a = await readyAttempt(rig, "c1", true);
+    rig.fs.failPromote = true;
+    expect(await code(rig.mgr.loginPromote({ connectionId: "c1", loginRef: a, epoch: 3 }))).toBe("EINTERNAL:promote_failed");
+    expect(rig.mgr.status({ connectionId: "c1" }).state).toBe("needs_attention");
+    rig.fs.failPromote = false;
+    await rig.mgr.loginCancel({ connectionId: "c1", loginRef: a });
+    const b = await readyAttempt(rig, "c1", true);
+    expect(await rig.mgr.loginPromote({ connectionId: "c1", loginRef: b, epoch: 4 })).toEqual({ state: "disabled", epoch: 4 });
+  });
+
+  it("a promote whose attempt uid is owned by someone else fails closed instead of carrying on", async () => {
+    rig = makeRig();
+    const loginRef = await readyAttempt(rig, "c1");
+    const uid = rig.store.get().connections.c1.attempt!.uid;
+    rig.store.get().uidOwners[String(uid)] = "someone-else"; // corrupted books
+    expect(await code(rig.mgr.loginPromote({ connectionId: "c1", loginRef, epoch: 1 }))).toBe("EINTERNAL:promote_failed");
+    expect(rig.mgr.status({ connectionId: "c1" }).state).toBe("needs_attention");
   });
 
   it("a parked or home-less connection cannot be brought back by disable then enable (only a reconnect clears it)", async () => {

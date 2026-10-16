@@ -40,6 +40,8 @@ export class FakeFs implements UserFsPort {
   crashAfterPromote = false;
   /** wipeHome never returns. */
   hangWipe = false;
+  /** wipeHome waits for this. */
+  wipeGate?: Promise<void>;
   /** Runs after every successful wipe: lets a test queue another cleanup entry while a drain is in progress. */
   onWipe?: () => void;
   writes: Array<{ uid: number; home: string; kind: "attempt" | "home"; rel: string }> = [];
@@ -86,6 +88,7 @@ export class FakeFs implements UserFsPort {
   }
   async wipeHome(uid: number, ref: string): Promise<void> {
     if (this.hangWipe) await new Promise<void>(() => undefined);
+    if (this.wipeGate) await this.wipeGate;
     if (this.failWipes) throw new Error("wipe failed");
     this.dirs.delete(`home:${uid}:${ref}`);
     this.wipes.push(`home:${uid}:${ref}`);
