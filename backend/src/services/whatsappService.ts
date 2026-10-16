@@ -572,7 +572,7 @@ export async function sendText(
 
 export const OPT_OUT_CONFIRMATION =
   "You're opted out. AgentWeb won't send any more WhatsApp messages to this number, and it is " +
-  'no longer connected to your AgentWeb account. Reply UNSTOP if you change your mind, then ' +
+  'no longer connected to your AgentWeb account. Reply START if you change your mind, then ' +
   'reconnect it from Settings in AgentWeb.';
 
 export const OPT_IN_CONFIRMATION =
