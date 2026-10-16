@@ -221,9 +221,10 @@ export class ConnectionManager {
   }
 
   /** Kill every process of a uid, but never with a value outside the reserved range (-1 would mean "everything" to kill(2)). */
-  private async safeKill(uid: number): Promise<void> {
-    if (!Number.isInteger(uid) || uid < this.cfg.uidMin || uid > this.cfg.uidMax) return;
+  private async safeKill(uid: number): Promise<boolean> {
+    if (!Number.isInteger(uid) || uid < this.cfg.uidMin || uid > this.cfg.uidMax) return false;
     await this.f("killAll", () => this.deps.fs.killAll(uid));
+    return true;
   }
 
   private turnKey(connectionId: string, turnId: string): string {
@@ -358,7 +359,7 @@ export class ConnectionManager {
       const previous = c.uid >= 0 && c.homeRef ? { uid: c.uid, ref: c.homeRef, owner: c.connectionId } : undefined;
 
       // Fence the old home first: new epoch recorded, no turn admitted while swapping.
-      if (!resuming) c.swapWasDisabled = c.state === "disabled"; // a reconnect must not silently re-enable a disabled connection
+      c.swapWasDisabled = (resuming && c.swapWasDisabled) || c.state === "disabled"; // a reconnect (or its resume) must not silently re-enable a disabled connection
       c.epoch = req.epoch;
       c.state = "swapping";
       c.reason = undefined;
@@ -759,6 +760,7 @@ export class ConnectionManager {
     const login = this.logins.get(loginRef);
     // Unknown, expired and "not yours" all answer the same.
     if (!c || !c.attempt || c.attempt.loginRef !== loginRef || !login || login.connectionId !== connectionId) throw new HostError("ENOTFOUND");
+    if (c.state === "revoking" || c.state === "revoked") throw new HostError("ENOTFOUND"); // a revoked connection never gets a login
     if (this.deps.clock.nowMs() > c.attempt.expiresAtMs) {
       await this.discardAttempt(c, "expired");
       throw new HostError("ENOTFOUND");
@@ -825,21 +827,37 @@ export class ConnectionManager {
     await this.drainWipes(c);
   }
 
-  /** Wipe whatever is pending; free a uid only when killed + wiped + residue-free + still owned by who queued it. */
+  /**
+   * Wipe whatever is pending. A uid is freed only when ALL of its pending entries (the attempt dir and any
+   * intended home) are wiped, nothing new was queued for it meanwhile, the residue scan is clean, and the
+   * owner that queued the entry still owns it. An entry whose owner no longer owns the uid is stale (the uid
+   * was freed and re-allocated): it is dropped without touching the new owner's processes or files.
+   */
   private async drainWipes(c: ConnRecord): Promise<void> {
     const queue = c.wipePending;
     if (!queue?.length) return;
     c.wipePending = undefined; // entries pushed while we await land in a fresh array and are kept
+    const byUid = new Map<number, NonNullable<ConnRecord["wipePending"]>>();
+    for (const w of queue) byUid.set(w.uid, [...(byUid.get(w.uid) ?? []), w]);
     const remaining: NonNullable<ConnRecord["wipePending"]> = [];
-    for (const w of queue) {
+    for (const [uid, entries] of byUid) {
+      const mine = entries.filter((w) => this.uids.ownerOf(uid) === w.owner);
+      if (!mine.length) continue; // stale: the uid is free or belongs to someone else now
       try {
-        await this.safeKill(w.uid);
-        if (w.kind === "attempt") await this.f("wipeAttempt", () => this.deps.fs.wipeAttempt(w.uid, w.ref));
-        else await this.f("wipeHome", () => this.deps.fs.wipeHome(w.uid, w.ref));
-        if ((await this.f("residueCount", () => this.deps.fs.residueCount(w.uid))) === 0) this.uids.free(w.uid, w.owner);
-        else remaining.push(w);
+        if (!(await this.safeKill(uid))) {
+          this.log.warn("wipe_entry_dropped_uid_out_of_range", { connectionId: c.connectionId });
+          continue;
+        }
+        for (const w of mine) {
+          if (w.kind === "attempt") await this.f("wipeAttempt", () => this.deps.fs.wipeAttempt(w.uid, w.ref));
+          else await this.f("wipeHome", () => this.deps.fs.wipeHome(w.uid, w.ref));
+        }
+        const queuedMeanwhile = ((c as ConnRecord).wipePending ?? []).some((w) => w.uid === uid); // re-read: entries may have been pushed during the awaits above
+        if (!queuedMeanwhile && (await this.f("residueCount", () => this.deps.fs.residueCount(uid))) === 0) {
+          for (const w of mine) this.uids.free(uid, w.owner);
+        } else remaining.push(...mine);
       } catch {
-        remaining.push(w);
+        remaining.push(...mine); // all of this uid's entries stay together; the uid stays allocated
       }
     }
     const added = c.wipePending ?? [];
@@ -888,7 +906,7 @@ export class ConnectionManager {
         }
       }),
     );
-    await this.safeKill(c.uid);
+    if (c.uid >= 0) await this.safeKill(c.uid);
   }
 
   private markNeedsReconnect(c: ConnRecord, reason: string): void {

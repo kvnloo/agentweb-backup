@@ -237,10 +237,11 @@ describe("login host server", () => {
     sockC.on("error", () => undefined);
     const body = JSON.stringify({ ...turnReq("c1", 1), turnId: "stall-1" });
     sockC.write(`POST /v1/turn.run HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
-    for (let i = 0; i < 100 && (rig.mgr.status({ connectionId: "c1" }).runningTurns === 0 || rig.mgr.status({ connectionId: "c1" }).runningTurns > 0); i++) {
-      await new Promise((r) => setTimeout(r, 50));
-      if (i > 4 && rig.mgr.status({ connectionId: "c1" }).runningTurns === 0) break;
-    }
+    // the turn really started...
+    for (let i = 0; i < 100 && rig.mgr.status({ connectionId: "c1" }).runningTurns === 0; i++) await new Promise((r) => setTimeout(r, 20));
+    expect(rig.mgr.status({ connectionId: "c1" }).runningTurns).toBe(1);
+    // ...and the stalled stream was cut, which ended it
+    for (let i = 0; i < 150 && rig.mgr.status({ connectionId: "c1" }).runningTurns > 0; i++) await new Promise((r) => setTimeout(r, 50));
     expect(rig.mgr.status({ connectionId: "c1" }).runningTurns).toBe(0);
     sockC.destroy();
   }, 20_000);

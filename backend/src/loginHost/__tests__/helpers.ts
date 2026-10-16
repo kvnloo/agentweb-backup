@@ -40,6 +40,8 @@ export class FakeFs implements UserFsPort {
   crashAfterPromote = false;
   /** wipeHome never returns. */
   hangWipe = false;
+  /** Runs after every successful wipe: lets a test queue another cleanup entry while a drain is in progress. */
+  onWipe?: () => void;
   writes: Array<{ uid: number; home: string; kind: "attempt" | "home"; rel: string }> = [];
   /** Ordered log of destructive operations: kill:<uid>, wipe:<kind>:<uid>. */
   log: string[] = [];
@@ -80,6 +82,7 @@ export class FakeFs implements UserFsPort {
     this.dirs.delete(`attempt:${uid}:${ref}`);
     this.wipes.push(`attempt:${uid}:${ref}`);
     this.log.push(`wipe:attempt:${uid}`);
+    this.onWipe?.();
   }
   async wipeHome(uid: number, ref: string): Promise<void> {
     if (this.hangWipe) await new Promise<void>(() => undefined);
@@ -87,6 +90,7 @@ export class FakeFs implements UserFsPort {
     this.dirs.delete(`home:${uid}:${ref}`);
     this.wipes.push(`home:${uid}:${ref}`);
     this.log.push(`wipe:home:${uid}`);
+    this.onWipe?.();
   }
   async killAll(uid: number): Promise<void> {
     if (this.failKillOnce) {

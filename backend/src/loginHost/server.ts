@@ -184,6 +184,8 @@ async function streamTurn(m: ConnectionManager, input: never, res: ServerRespons
           const stall = setTimeout(() => res.destroy(), stallMs);
           const done = () => {
             clearTimeout(stall);
+            res.off("drain", done);
+            res.off("close", done);
             resolve();
           };
           res.once("drain", done);

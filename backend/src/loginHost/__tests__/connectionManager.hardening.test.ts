@@ -76,6 +76,43 @@ describe("uid safety", () => {
   });
 });
 
+describe("uid release while more cleanup is queued", () => {
+  let rig: Rig;
+  afterEach(() => rig?.cleanup());
+
+  it("a uid is not freed when another cleanup entry for it was queued while the drain was running; the next sweep releases it", async () => {
+    rig = makeRig();
+    const a = await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
+    const c = rig.store.get().connections.c1;
+    const uid = c.attempt!.uid;
+    const owner = `attempt:${c.attempt!.attemptRef}`;
+    let fired = false;
+    rig.fs.onWipe = () => {
+      if (fired) return;
+      fired = true;
+      (c.wipePending ??= []).push({ uid, ref: "late-home", kind: "home", owner }); // a concurrent operation queues more work for the same uid
+    };
+    await rig.mgr.loginCancel({ connectionId: "c1", loginRef: a.loginRef });
+    expect(rig.store.get().uidOwners[String(uid)]).toBe(owner); // still allocated: work remains for it
+    expect(rig.store.get().connections.c1.wipePending).toHaveLength(2); // both entries of the uid are kept together and retried (wipes are idempotent)
+    rig.fs.onWipe = undefined;
+    await rig.mgr.sweep();
+    expect(rig.store.get().uidOwners[String(uid)]).toBeUndefined();
+    assertConsistent(rig);
+  });
+
+  it("a cleanup entry for a uid that is now outside the configured range (range narrowed between restarts) is dropped, never signalled", async () => {
+    rig = makeRig({ config: { uidMin: 400_000, uidMax: 400_009 } });
+    await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
+    rig.store.get().uidOwners["5"] = "c1"; // an old allocation from a wider range
+    rig.store.get().connections.c1.wipePending = [{ uid: 5, ref: "old", kind: "home", owner: "c1" }];
+    rig.fs.killed.length = 0;
+    await rig.mgr.sweep();
+    expect(rig.fs.killed).not.toContain(5);
+    expect(rig.store.get().connections.c1.wipePending).toBeUndefined(); // dropped, not retried forever
+  });
+});
+
 describe("a superseded login's late side effects", () => {
   let rig: Rig;
   afterEach(() => rig?.cleanup());
@@ -95,7 +132,7 @@ describe("a superseded login's late side effects", () => {
     expect(rig.mgr.status({ connectionId: "c1" })).toMatchObject({ state: "active", epoch: 2 });
   });
 
-  it("an alarm from a superseded login does not park the new one", async () => {
+  it("an alarm from a superseded login (whose turn was aborted by the reconnect) does not park the new one", async () => {
     rig = makeRig();
     await signIn(rig, "c1", 1);
     let release!: () => void;
@@ -205,6 +242,17 @@ describe("failed and interrupted promotes", () => {
     assertConsistent(rig);
   });
 
+  it("a connection that was disabled BEFORE a reconnect whose promote failed stays disabled when that promote is resumed", async () => {
+    rig = makeRig();
+    await signIn(rig, "c1", 1);
+    await rig.mgr.disable({ connectionId: "c1", epoch: 2 });
+    const loginRef = await readyAttempt(rig, "c1", true);
+    rig.fs.failKillOnce = true;
+    await code(rig.mgr.loginPromote({ connectionId: "c1", loginRef, epoch: 3 }));
+    expect(rig.mgr.status({ connectionId: "c1" })).toMatchObject({ state: "needs_attention", reason: "promote_failed" }); // the failure path forgot it was disabled...
+    expect(await rig.mgr.loginPromote({ connectionId: "c1", loginRef, epoch: 3 })).toEqual({ state: "disabled", epoch: 3 }); // ...the record did not
+  });
+
   it("a parked or home-less connection cannot be brought back by disable then enable (only a reconnect clears it)", async () => {
     rig = makeRig();
     // first sign-in whose promote fails: no home at all
@@ -232,6 +280,60 @@ describe("failed and interrupted promotes", () => {
     const re = await readyAttempt(rig, "c1", true);
     expect(await rig.mgr.loginPromote({ connectionId: "c1", loginRef: re, epoch: 3 })).toEqual({ state: "disabled", epoch: 3 });
     expect(await rig.mgr.loginPromote({ connectionId: "c1", loginRef: re, epoch: 3 })).toEqual({ state: "disabled", epoch: 3 });
+  });
+
+  it("resuming a failed promote of a connection that was disabled meanwhile keeps it disabled", async () => {
+    rig = makeRig();
+    await signIn(rig, "c1", 1);
+    const loginRef = await readyAttempt(rig, "c1", true);
+    rig.fs.failKillOnce = true;
+    await code(rig.mgr.loginPromote({ connectionId: "c1", loginRef, epoch: 2 }));
+    await rig.mgr.disable({ connectionId: "c1", epoch: 2 }); // allowed at the equal epoch
+    expect(await rig.mgr.loginPromote({ connectionId: "c1", loginRef, epoch: 2 })).toEqual({ state: "disabled", epoch: 2 });
+    expect(await code(rig.mgr.runTurn(turnReq("c1", 2)))).toBe("ESTATE:disabled");
+  });
+
+  it("a uid is not handed out again while the home that holds credentials under it still has to be wiped (cross-tenant)", async () => {
+    rig = makeRig({ config: { uidMin: 400_000, uidMax: 400_001, portCallTimeoutMs: 50 } });
+    const loginRef = await readyAttempt(rig, "c1");
+    rig.fs.crashAfterPromote = true;
+    await code(rig.mgr.loginPromote({ connectionId: "c1", loginRef, epoch: 1 })); // the rename happened; the books say "attempt"
+    rig.fs.crashAfterPromote = false;
+    const credentialUid = Number([...rig.fs.dirs].find((d) => d.startsWith("home:"))!.split(":")[1]);
+    rig.fs.hangWipe = true; // the home wipe cannot complete
+    await rig.mgr.loginCancel({ connectionId: "c1", loginRef }); // wipes the attempt (done) and the intended home (stuck)
+    expect(rig.store.get().uidOwners[String(credentialUid)]).toBeDefined(); // NOT freed
+    // another tenant signing in must not be given that uid
+    const other = await rig.mgr.loginStart({ connectionId: "c2", provider: "fake" });
+    expect(other.loginRef).toBeTruthy();
+    const c2Uid = rig.store.get().connections.c2.attempt!.uid;
+    expect(c2Uid).not.toBe(credentialUid);
+    // once the wipe can finish, the uid is released
+    rig.fs.hangWipe = false;
+    await rig.mgr.sweep();
+    expect(rig.store.get().uidOwners[String(credentialUid)]).toBeUndefined();
+    assertConsistent(rig);
+  });
+
+  it("the second pending entry of a uid cannot kill or wipe a different tenant who now owns that uid", async () => {
+    rig = makeRig();
+    await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
+    const uid = rig.store.get().connections.c1.attempt!.uid;
+    // a stale entry (owner no longer owns the uid) pointing at a uid that belongs to c1's live attempt
+    rig.store.get().connections.c9 = { connectionId: "c9", provider: "fake", uid: -1, homeRef: "", epoch: 0, state: "attempting", createdAtMs: 1, updatedAtMs: 1, wipePending: [{ uid, ref: "old", kind: "home", owner: "someone-else" }] };
+    rig.fs.killed.length = 0;
+    await rig.mgr.sweep();
+    expect(rig.fs.killed).not.toContain(uid);
+    expect(rig.store.get().uidOwners[String(uid)]).toBe(`attempt:${rig.store.get().connections.c1.attempt!.attemptRef}`);
+  });
+
+  it("a revoked connection cannot complete a sign-in that was in flight", async () => {
+    rig = makeRig();
+    await signIn(rig, "c1", 1);
+    const re = await rig.mgr.loginStart({ connectionId: "c1", provider: "fake", reconnect: true });
+    rig.fs.failKillOnce = true; // the kill inside revoke's cleanup throws before it reaches the attempt
+    await rig.mgr.revoke({ connectionId: "c1", epoch: 2 });
+    expect(await code(rig.mgr.loginComplete({ connectionId: "c1", loginRef: re.loginRef, code: "abcdefgh#12345678" }))).toBe("ENOTFOUND");
   });
 
   it("a crash between the rename and the save does not leave credentials behind: the intended home is recorded first and recovery wipes it", async () => {
