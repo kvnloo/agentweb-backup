@@ -653,8 +653,10 @@ describe('sendOptOutConfirmation', () => {
 
   it('tells the customer how to come back', async () => {
     // The confirmation is the only message they will get after opting out, so it has to
-    // carry the re-subscribe keyword the webhook actually honours.
-    expect(OPT_OUT_CONFIRMATION).toMatch(/UNSTOP/);
+    // carry the re-subscribe keyword the webhook actually honours — START, the same word
+    // the portal tells an opted-out customer to send, so the two never disagree.
+    expect(OPT_OUT_CONFIRMATION).toMatch(/Reply START\b/);
+    expect(OPT_OUT_CONFIRMATION).not.toMatch(/UNSTOP/);
     // It must not leave the customer believing they are still connected.
     expect(OPT_OUT_CONFIRMATION).toMatch(/no longer connected/i);
   });
