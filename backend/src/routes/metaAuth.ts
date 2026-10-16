@@ -14,6 +14,7 @@ import {
     retrieveTokenSession,
     safeAutoResolve,
 } from '../services/metaOAuthFinalize';
+import { ZOMA_META_CALLBACK_PATH } from '../mcp/zomaSetupLinks';
 
 const router = express.Router();
 
@@ -21,10 +22,10 @@ const router = express.Router();
 // Helpers
 // ============================================
 
-function verifyState(state: string): { userId: string; flow?: MetaFlowType } {
+function verifyState(state: string): { userId: string; flow?: MetaFlowType; zoma?: string } {
     const secret = getJwtSecret();
     try {
-        return jwt.verify(state, secret) as { userId: string; flow?: MetaFlowType };
+        return jwt.verify(state, secret) as { userId: string; flow?: MetaFlowType; zoma?: string };
     } catch {
         throw new Error('Invalid or expired state parameter');
     }
@@ -76,6 +77,18 @@ router.get('/callback', async (req, res) => {
             try {
                 const stateData = verifyState(state as string);
                 if (stateData.flow) flow = stateData.flow;
+                // ENG-2496: a Zoma setup's connect link (signed state carrying `zoma`) finishes
+                // server-side for the state's user, independent of any portal session in this
+                // browser. Same registered redirect URI, so no Meta app change. Portal states
+                // never carry `zoma` and fall through unchanged.
+                if (typeof stateData.zoma === 'string' && stateData.zoma) {
+                    const forward = new URLSearchParams();
+                    for (const key of ['code', 'state', 'error', 'error_reason'] as const) {
+                        const value = req.query[key];
+                        if (typeof value === 'string') forward.set(key, value);
+                    }
+                    return res.redirect(302, `${ZOMA_META_CALLBACK_PATH}?${forward.toString()}`);
+                }
             } catch (e) {
                 // Ignore state errors here, will be caught in /finalize
             }
