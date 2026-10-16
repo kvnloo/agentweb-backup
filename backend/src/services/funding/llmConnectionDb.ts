@@ -89,6 +89,32 @@ export interface LlmConnectionRecord {
   lastCheckedAt?: string;
   lastCheckResult?: string;
   lastOkAt?: string;
+  // ---- claude_subscription only (ENG-2110). Flat attributes, expiries as epoch-ms numbers
+  // ---- so conditional compares work in DynamoDB and in the in-memory test double.
+  /** Compare-and-swap counter for `sealed`; starts at 1, +1 on every save. */
+  subVersion?: number;
+  /** Random token of the process that holds the (single) live copy of the login. */
+  subLeaseOwner?: string;
+  subLeaseUntil?: number;
+  subType?: string;
+  subTier?: string;
+  subAccessExpiresAtMs?: number;
+  /** Fixed 30 days from login; does NOT move on refresh. */
+  subRefreshExpiresAtMs?: number;
+  subSavedAt?: string;
+  /** sha256 of the stored login text: lets a writer tell "my earlier write landed" from "someone else's". */
+  subContentHash?: string;
+  /** The stored login is probably dead (the CLI said so); the owner must sign in again. */
+  subNeedsReconnect?: boolean;
+  subReconnectReason?: string;
+}
+
+/** Non-secret facts read from a Claude login, kept next to the sealed blob. */
+export interface SubHealth {
+  type: string;
+  tier: string;
+  accessExpiresAtMs: number;
+  refreshExpiresAtMs: number;
 }
 
 type DocClient = Pick<AWS.DynamoDB.DocumentClient, "put" | "get" | "update" | "query" | "transactWrite">;
@@ -294,8 +320,10 @@ export class LlmConnectionDb {
           TableName: LLM_CONNECTIONS_TABLE,
           Key: { connectionId },
           UpdateExpression: orgId ? "SET orgId = :org, updatedAt = :now" : "SET updatedAt = :now REMOVE orgId",
-          ConditionExpression: "attribute_exists(connectionId) AND attribute_not_exists(revokedAt)",
-          ExpressionAttributeValues: { ":now": now, ...(orgId ? { ":org": orgId } : {}) },
+          // API keys only: a Claude login is never shared (ENG-2110).
+          ConditionExpression: "attribute_exists(connectionId) AND attribute_not_exists(revokedAt) AND #kind = :apiKey",
+          ExpressionAttributeNames: { "#kind": "kind" },
+          ExpressionAttributeValues: { ":now": now, ":apiKey": "api_key", ...(orgId ? { ":org": orgId } : {}) },
         })
         .promise();
       return true;
@@ -319,9 +347,165 @@ export class LlmConnectionDb {
           UpdateExpression:
             "SET #status = :status, lastCheckedAt = :now, lastCheckResult = :result, updatedAt = :now" +
             (check.ok ? ", lastOkAt = :now" : ""),
-          ConditionExpression: "attribute_exists(connectionId) AND attribute_not_exists(revokedAt)",
-          ExpressionAttributeNames: { "#status": "status" },
-          ExpressionAttributeValues: { ":status": check.status, ":now": now, ":result": check.result },
+          // API keys only: a provider-key check must never rewrite a Claude login's status.
+          ConditionExpression: "attribute_exists(connectionId) AND attribute_not_exists(revokedAt) AND #kind = :apiKey",
+          ExpressionAttributeNames: { "#status": "status", "#kind": "kind" },
+          ExpressionAttributeValues: { ":status": check.status, ":now": now, ":result": check.result, ":apiKey": "api_key" },
+        })
+        .promise();
+      return true;
+    } catch (err) {
+      if (isConditionFailure(err)) return false;
+      throw err;
+    }
+  }
+
+  // ===================== claude_subscription (ENG-2110) =====================
+  // A refresh token is single-use, so exactly one live copy of a login may exist. The
+  // lease says who holds it; the version makes every save a compare-and-swap.
+
+  /** Takes the single live copy for `ms`. False when held, revoked, not active, needs reconnect, or not a subscription. */
+  async acquireSubLease(connectionId: string, owner: string, nowMs: number, ms: number): Promise<boolean> {
+    return this.subUpdate(connectionId, {
+      update: "SET subLeaseOwner = :me, subLeaseUntil = :until",
+      condition:
+        "attribute_exists(connectionId) AND #kind = :sub AND attribute_not_exists(revokedAt) AND #status = :active AND subNeedsReconnect = :no AND (attribute_not_exists(subLeaseUntil) OR subLeaseUntil < :now)",
+      names: { "#kind": "kind", "#status": "status" },
+      values: { ":me": owner, ":until": nowMs + ms, ":sub": "claude_subscription", ":active": "active", ":no": false, ":now": nowMs },
+    });
+  }
+
+  /** Extends the lease only while it is still ours (even if it lapsed, as long as nobody took it). */
+  async extendSubLease(connectionId: string, owner: string, nowMs: number, ms: number): Promise<boolean> {
+    return this.subUpdate(connectionId, {
+      update: "SET subLeaseUntil = :until",
+      condition: "attribute_exists(connectionId) AND #kind = :sub AND attribute_not_exists(revokedAt) AND subLeaseOwner = :me",
+      names: { "#kind": "kind" },
+      values: { ":me": owner, ":until": nowMs + ms, ":sub": "claude_subscription" },
+    });
+  }
+
+  async releaseSubLease(connectionId: string, owner: string): Promise<void> {
+    await this.subUpdate(connectionId, {
+      update: "REMOVE subLeaseOwner, subLeaseUntil",
+      condition: "attribute_exists(connectionId) AND subLeaseOwner = :me",
+      values: { ":me": owner },
+    });
+  }
+
+  /**
+   * Replaces the sealed login if, and only if, the caller still holds the lease and the
+   * stored version is the one it started from. 'stale' means the stored copy moved on
+   * (or the lease was lost); 'revoked' means the connection is gone.
+   */
+  async saveSubCredentials(
+    connectionId: string,
+    save: { owner: string; expectedVersion: number; sealed: SealedSecret; health: SubHealth; nowIso: string; contentHash?: string },
+  ): Promise<"ok" | "stale" | "revoked"> {
+    const ok = await this.subUpdate(connectionId, {
+      update:
+        "SET sealed = :sealed, subVersion = :next, subSavedAt = :now, updatedAt = :now, subType = :type, subTier = :tier, subAccessExpiresAtMs = :acc, subRefreshExpiresAtMs = :ref, subContentHash = :hash",
+      condition:
+        "attribute_exists(connectionId) AND #kind = :sub AND attribute_not_exists(revokedAt) AND subLeaseOwner = :me AND subVersion = :v",
+      names: { "#kind": "kind" },
+      values: {
+        ":hash": save.contentHash ?? "",
+        ":sealed": save.sealed,
+        ":next": save.expectedVersion + 1,
+        ":now": save.nowIso,
+        ":type": save.health.type,
+        ":tier": save.health.tier,
+        ":acc": save.health.accessExpiresAtMs,
+        ":ref": save.health.refreshExpiresAtMs,
+        ":sub": "claude_subscription",
+        ":me": save.owner,
+        ":v": save.expectedVersion,
+      },
+    });
+    if (ok) return "ok";
+    const current = await this.get(connectionId);
+    return !current || current.revokedAt ? "revoked" : "stale";
+  }
+
+  /** Sign-in again for an existing connection: replaces the login in place. Refused while anyone holds the lease. */
+  async replaceSubCredentials(
+    connectionId: string,
+    replace: { expectedVersion: number; sealed: SealedSecret; health: SubHealth; nowMs: number; nowIso: string; contentHash?: string },
+  ): Promise<boolean> {
+    return this.subUpdate(connectionId, {
+      update:
+        "SET sealed = :sealed, subVersion = :next, subSavedAt = :now, updatedAt = :now, subType = :type, subTier = :tier, subAccessExpiresAtMs = :acc, subRefreshExpiresAtMs = :ref, subContentHash = :hash, #status = :active, subNeedsReconnect = :no REMOVE subReconnectReason, subLeaseOwner, subLeaseUntil",
+      condition:
+        "attribute_exists(connectionId) AND #kind = :sub AND attribute_not_exists(revokedAt) AND subVersion = :v AND (attribute_not_exists(subLeaseUntil) OR subLeaseUntil < :nowMs)",
+      names: { "#kind": "kind", "#status": "status" },
+      values: {
+        ":hash": replace.contentHash ?? "",
+        ":sealed": replace.sealed,
+        ":next": replace.expectedVersion + 1,
+        ":now": replace.nowIso,
+        ":type": replace.health.type,
+        ":tier": replace.health.tier,
+        ":acc": replace.health.accessExpiresAtMs,
+        ":ref": replace.health.refreshExpiresAtMs,
+        ":sub": "claude_subscription",
+        ":active": "active",
+        ":no": false,
+        ":v": replace.expectedVersion,
+        ":nowMs": replace.nowMs,
+      },
+    });
+  }
+
+  /** The CLI said the stored login is dead. Conditional on the version, so a copy saved meanwhile is never flagged. */
+  async markSubNeedsReconnect(connectionId: string, expectedVersion: number, reason: string, nowIso: string): Promise<boolean> {
+    return this.subUpdate(connectionId, {
+      update: "SET subNeedsReconnect = :yes, subReconnectReason = :reason, updatedAt = :now",
+      condition: "attribute_exists(connectionId) AND #kind = :sub AND attribute_not_exists(revokedAt) AND subVersion = :v",
+      names: { "#kind": "kind" },
+      values: { ":yes": true, ":reason": reason, ":now": nowIso, ":sub": "claude_subscription", ":v": expectedVersion },
+    });
+  }
+
+  /** The refresh token's fixed lifetime has run out. */
+  async markSubExpired(connectionId: string, nowMs: number, nowIso: string): Promise<boolean> {
+    return this.subUpdate(connectionId, {
+      update: "SET #status = :expired, updatedAt = :now",
+      condition:
+        "attribute_exists(connectionId) AND #kind = :sub AND attribute_not_exists(revokedAt) AND #status = :active AND subRefreshExpiresAtMs < :nowMs",
+      names: { "#kind": "kind", "#status": "status" },
+      values: { ":expired": "expired", ":active": "active", ":sub": "claude_subscription", ":nowMs": nowMs, ":now": nowIso },
+    });
+  }
+
+  /** Every Claude-login connection, via the provider index (small: one row per connected customer). */
+  async listSubscriptions(): Promise<LlmConnectionRecord[]> {
+    return (await this.listByProvider("anthropic")).filter((r) => r.kind === "claude_subscription");
+  }
+
+  private async subUpdate(
+    connectionId: string,
+    u: { update: string; condition: string; names?: Record<string, string>; values?: Record<string, unknown> },
+  ): Promise<boolean> {
+    // Every attribute of a Claude login is referenced through an alias. DynamoDB's reserved-word list is long
+    // and not obvious (`subType` is on it: found by the live test, which the in-memory test double cannot catch),
+    // so no attribute is ever written bare in these expressions.
+    const names: Record<string, string> = { ...(u.names ?? {}) };
+    const alias = (expression: string) =>
+      expression.replace(/(?<![#:\w])(sub[A-Z]\w*|sealed)\b/g, (_m, attr: string) => {
+        names[`#a_${attr}`] = attr;
+        return `#a_${attr}`;
+      });
+    const update = alias(u.update);
+    const condition = alias(u.condition);
+    try {
+      await this.client
+        .update({
+          TableName: LLM_CONNECTIONS_TABLE,
+          Key: { connectionId },
+          UpdateExpression: update,
+          ConditionExpression: condition,
+          ...(Object.keys(names).length ? { ExpressionAttributeNames: names } : {}),
+          ...(u.values ? { ExpressionAttributeValues: u.values } : {}),
         })
         .promise();
       return true;

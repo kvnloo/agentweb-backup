@@ -194,8 +194,12 @@ describe('ROUND TRIP: generated link -> classifyTraffic -> intended channel', ()
     if (preset.referrerOrigin) {
       expect(classifyTraffic({ landingUrl: link.url, referrer: preset.referrerOrigin })).toMatchObject(expected);
     }
-    // a hostile/contradictory referrer must not override our own tag
-    expect(classifyTraffic({ landingUrl: link.url, referrer: 'https://www.reddit.com/' })).toMatchObject(expected);
+    // 2.2.0 (DramaBreak decision, 2026-10-14): an OBSERVED contradictory referrer wins over the link's
+    // tag (one link per creator is reposted across platforms); the tag survives as linkChannel.
+    // Agency links are the exception: the agency is the attribution, whatever platform it posted on.
+    const contra = classifyTraffic({ landingUrl: link.url, referrer: 'https://www.reddit.com/' });
+    if (preset.channelKey === 'agency' || preset.channelKey === 'reddit') expect(contra).toMatchObject(expected);
+    else expect(contra).toMatchObject({ channel: 'Reddit', matchedBy: 'referrer', linkChannel: preset.channel });
     // the platform's in-app browser UA, where there is one
     const ua = IN_APP_UA[preset.channelKey];
     if (ua) {

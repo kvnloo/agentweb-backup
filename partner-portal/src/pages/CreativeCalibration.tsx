@@ -36,6 +36,7 @@ import CompareIcon from '@mui/icons-material/Compare';
 import { buildApiUrl } from '../config';
 import { useAuth } from '../contexts/AuthContext';
 import { newerOnRight } from '../utils/calibrationSides';
+import { blindForHuman } from '../utils/blindLabelling';
 import type { GoldenCaseView } from './EvalLabelling';
 
 type Choice = 'A' | 'B' | 'tie';
@@ -204,7 +205,7 @@ export default function CreativeCalibration() {
       setProvisioned(status.data.provisioned);
       if (!status.data.provisioned) return;
       const res = await axios.get<{ cases: GoldenCaseView[] }>(buildApiUrl('/api/admin/eval/golden-cases?surface=creative'), { headers });
-      setCases(res.data.cases.filter((c) => c.pair !== undefined));
+      setCases(res.data.cases.filter((c) => c.pair !== undefined).map(blindForHuman));
     } catch (err) {
       if (axios.isAxiosError(err) && err.response?.status === 503) setProvisioned(false);
       else setError(apiMessage(err, 'Failed to load the calibration batch.'));
@@ -245,7 +246,7 @@ export default function CreativeCalibration() {
         { labels: { [PAIRWISE_CRITERION]: choice }, notes: notes[target.caseId] ?? target.notes ?? '', expectedVersion: target.version },
         { headers: { Authorization: `Bearer ${token}` } },
       );
-      const updated = res.data.case;
+      const updated = blindForHuman(res.data.case);
       const nextCases = cases.map((c) => (c.caseId === updated.caseId ? updated : c));
       setCases(nextCases);
       setSaved({ position: target.pair?.position ?? 0, choice, newerOnRight: newerOnRight(target.caseId) });

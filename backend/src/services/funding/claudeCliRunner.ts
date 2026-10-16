@@ -12,9 +12,10 @@
 
 import { spawn as spawnChildProcess, type ChildProcessWithoutNullStreams } from "child_process";
 import { createInterface, type Interface } from "readline";
-import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import { isAbsolute, join } from "path";
+import { resolveClaudeBinary } from "./claudeBinary";
 
 /** The one MCP server a session may reach: the tool bridge (ENG-2109), with its run token. */
 export interface ClaudeCliMcpServer {
@@ -39,11 +40,55 @@ export interface ClaudeCliRunnerOptions {
    */
   onToolUse?: (event: ClaudeCliToolUseEvent) => void;
   /**
+   * Working directory for the process. Keep it stable for a given login: Claude Code keeps
+   * per-project state in the login's `.claude.json` keyed by the working directory, so a
+   * new directory per session would add a key per session. Defaults to one shared, empty,
+   * private (0700) directory. A host that serves several logins should pass a directory
+   * per login, outside any world-writable parent: memory files such as CLAUDE.md are
+   * looked up from the working directory upwards.
+   */
+  cwd?: string;
+  /**
+   * Called with every parsed stream-json event the process prints (system/init, assistant,
+   * user, rate_limit_event, hook events, result, ...), before the runner acts on it. The
+   * runner's own handling does not depend on this hook, and an error thrown from it is
+   * swallowed. Per-turn events can also be taken through `send()`'s `onEvent`.
+   * The runner acts on an event first; sinks then receive it read-only (frozen). A sink runs
+   * after the runner has settled the turn, so a sink may call `send()` for the next turn from a
+   * `result` event. A sink also sees the `system/init` event that made the runner reject a turn or
+   * close the session (an MCP server that is not connected), after that decision. Events that arrive between turns, or after a `result`, go to the
+   * session-level sink only or to whichever turn is pending when they arrive: a caller must
+   * not rely on per-turn attribution for hook events. To stop on an alarm use `terminate()`
+   * (works between turns) or `interrupt()` (a turn in flight).
+   */
+  onEvent?: (event: ClaudeCliEvent) => void;
+  /**
    * Called once when the session's process is gone for any reason (idle close, exit,
    * close(), MCP not connected), so the caller can end what it tied to the session,
    * such as the tool-bridge run and its token.
    */
   onClose?: (reason: string) => void;
+}
+
+/** One parsed stream-json line, as printed by the CLI. Nothing here is interpreted by the runner except where noted. */
+export type ClaudeCliEvent = Record<string, unknown>;
+
+export interface ClaudeCliSendOptions {
+  /** Called with every event printed while this turn is in flight (and only then). */
+  onEvent?: (event: ClaudeCliEvent) => void;
+  /**
+   * Wall-clock limit for this turn. When it passes, the turn rejects with a
+   * `ClaudeCliTurnError` (code "deadline") and the session is closed: a CLI that has not
+   * answered in time cannot be resynchronised, and the next turn gets a fresh process.
+   */
+  deadlineMs?: number;
+}
+
+export class ClaudeCliTurnError extends Error {
+  constructor(readonly code: "deadline" | "interrupted") {
+    super(`claudeCliRunner: turn ${code === "deadline" ? "exceeded its deadline" : "was interrupted"}`);
+    this.name = "ClaudeCliTurnError";
+  }
 }
 
 export interface ClaudeCliToolUseEvent {
@@ -55,8 +100,8 @@ export interface ClaudeCliToolUseEvent {
 export interface ClaudeCliTurnResult {
   isError: boolean;
   resultText: string;
-  /** The raw parsed `result`-type stream-json event, for callers that need fields this type doesn't surface yet. */
-  raw: Record<string, unknown>;
+  /** The raw parsed `result`-type stream-json event (frozen), for callers that need fields this type doesn't surface yet. */
+  raw: Readonly<Record<string, unknown>>;
 }
 
 export interface ClaudeCliSessionHandle {
@@ -64,13 +109,21 @@ export interface ClaudeCliSessionHandle {
 }
 
 const STDERR_TAIL_MAX_CHARS = 4000;
+const MAX_TIMER_MS = 2_147_483_647;
+
+interface PendingTurn {
+  resolve: (result: ClaudeCliTurnResult) => void;
+  reject: (err: Error) => void;
+  onEvent: ((event: ClaudeCliEvent) => void) | undefined;
+  deadlineTimer: NodeJS.Timeout | null;
+}
 
 interface PooledSession {
   conversationId: string;
   child: ChildProcessWithoutNullStreams;
   rl: Interface;
   scratchHomeDir: string;
-  pending: { resolve: (result: ClaudeCliTurnResult) => void; reject: (err: Error) => void } | null;
+  pending: PendingTurn | null;
   idleTimer: NodeJS.Timeout | null;
   closed: boolean;
   /** From the session's `system`/`init` event — the ENG-2107 contract-test field. Undefined until init arrives. */
@@ -82,6 +135,7 @@ interface PooledSession {
   /** That server's status from the latest `system/init` event. */
   mcpServerStatus: string | undefined;
   onToolUse: ((event: ClaudeCliToolUseEvent) => void) | undefined;
+  onEvent: ((event: ClaudeCliEvent) => void) | undefined;
   onClose: ((reason: string) => void) | undefined;
   /** The MCP server this process was started with; it cannot be changed afterwards. */
   mcpServer: ClaudeCliMcpServer | undefined;
@@ -106,10 +160,25 @@ export class ClaudeCliRunner {
   private readonly pendingCloseRequests = new Set<string>();
   private readonly maxConcurrentProcesses: number;
   private readonly idleCloseMs: number;
+  /** The empty, private (mkdtemp: 0700, unpredictable name) working directory for sessions that pass no `cwd`. */
+  private defaultCwd: string | undefined;
 
   constructor(opts: { maxConcurrentProcesses?: number; idleCloseMs?: number } = {}) {
     this.maxConcurrentProcesses = opts.maxConcurrentProcesses ?? DEFAULT_MAX_CONCURRENT_PROCESSES;
     this.idleCloseMs = opts.idleCloseMs ?? DEFAULT_IDLE_CLOSE_MS;
+  }
+
+  /**
+   * One empty private directory per runner, created on first use. Created with `mkdtemp` (an
+   * unpredictable name, so nobody can pre-plant it), and recreated if the OS temp cleaner
+   * removed it while the backend was running (a missing cwd makes the spawn fail with an error
+   * that blames the binary).
+   */
+  private workingDir(): string {
+    if (!this.defaultCwd || !existsSync(this.defaultCwd)) {
+      this.defaultCwd = mkdtempSync(join(tmpdir(), "claude-cli-cwd-"));
+    }
+    return this.defaultCwd;
   }
 
   get activeProcessCount(): number {
@@ -134,6 +203,10 @@ export class ClaudeCliRunner {
     systemPromptFile: string,
     opts: ClaudeCliRunnerOptions = {},
   ): Promise<ClaudeCliSessionHandle> {
+    // A relative cwd would resolve against the backend's own working directory.
+    if (opts.cwd !== undefined && !isAbsolute(opts.cwd)) {
+      throw new Error("claudeCliRunner: cwd must be an absolute path");
+    }
     const existing = this.pool.get(conversationId);
     if (existing && !existing.closed) {
       // The MCP config is fixed at process start. Handing back a process that holds a
@@ -192,7 +265,12 @@ export class ClaudeCliRunner {
       try {
         const env = buildAllowlistedEnv(configDir, scratchHomeDir);
         const mcpConfigFile = opts.mcpServer ? writeMcpConfig(scratchHomeDir, opts.mcpServer) : undefined;
-        child = spawnChildProcess("claude", buildArgs(systemPromptFile, opts, mcpConfigFile), { env });
+        // Absolute path to the pinned binary (never a PATH lookup) and a fixed, stable working
+        // directory, so the process does not inherit the backend's cwd.
+        child = spawnChildProcess(resolveClaudeBinary(), buildArgs(systemPromptFile, opts, mcpConfigFile), {
+          env,
+          cwd: opts.cwd ?? this.workingDir(),
+        });
       } catch (err) {
         // Nothing owns the scratch dir yet, and it may already hold the run token.
         rmSync(scratchHomeDir, { recursive: true, force: true });
@@ -212,6 +290,7 @@ export class ClaudeCliRunner {
         expectedMcpServer: opts.mcpServer?.name,
         mcpServerStatus: undefined,
         onToolUse: opts.onToolUse,
+        onEvent: opts.onEvent,
         onClose: opts.onClose,
         mcpServer: opts.mcpServer,
       };
@@ -224,15 +303,13 @@ export class ClaudeCliRunner {
       });
       child.on("exit", () => this.closeSessionInternal(session, "process-exit"));
       child.on("error", (err) => {
-        session.pending?.reject(err);
-        session.pending = null;
+        this.clearPending(session)?.reject(err);
         this.closeSessionInternal(session, "process-error");
       });
       child.stdin.on("error", (err) => {
         // An async EPIPE-type error here is an EventEmitter 'error' event; leaving it
         // unhandled would crash the whole backend process, not just this session.
-        session.pending?.reject(err);
-        session.pending = null;
+        this.clearPending(session)?.reject(err);
       });
 
       this.pool.set(conversationId, session);
@@ -253,7 +330,7 @@ export class ClaudeCliRunner {
   }
 
   /** Sends one turn to an already-open session and resolves on its terminal `result` event. */
-  send(handle: ClaudeCliSessionHandle, message: string): Promise<ClaudeCliTurnResult> {
+  send(handle: ClaudeCliSessionHandle, message: string, options: ClaudeCliSendOptions = {}): Promise<ClaudeCliTurnResult> {
     const session = this.pool.get(handle.conversationId);
     if (!session || session.closed) {
       return Promise.reject(
@@ -268,15 +345,62 @@ export class ClaudeCliRunner {
 
     this.scheduleIdleClose(session);
     return new Promise<ClaudeCliTurnResult>((resolve, reject) => {
-      session.pending = { resolve, reject };
+      const pending: PendingTurn = { resolve, reject, onEvent: options.onEvent, deadlineTimer: null };
+      session.pending = pending;
+      if (typeof options.deadlineMs === "number" && Number.isFinite(options.deadlineMs) && options.deadlineMs > 0) {
+        pending.deadlineTimer = setTimeout(() => {
+          if (session.pending !== pending) return;
+          this.closeSessionInternal(session, "turn-deadline", new ClaudeCliTurnError("deadline"));
+        }, Math.min(options.deadlineMs, MAX_TIMER_MS)); // a larger delay would make Node fire the timer after 1 ms
+      }
       const line = JSON.stringify({ type: "user", message: { role: "user", content: message } });
       try {
         session.child.stdin.write(line + "\n");
       } catch (err) {
-        session.pending = null;
+        this.clearPending(session);
         reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
+  }
+
+  /**
+   * Stops the turn in flight for this conversation by closing its session (the process is
+   * killed; there is no verified graceful interrupt). The turn rejects with a
+   * `ClaudeCliTurnError` (code "interrupted"). Returns false when nothing is in flight.
+   */
+  interrupt(handle: ClaudeCliSessionHandle): boolean {
+    const session = this.pool.get(handle.conversationId);
+    if (!session || session.closed || !session.pending) return false;
+    this.closeSessionInternal(session, "interrupted", new ClaudeCliTurnError("interrupted"));
+    return true;
+  }
+
+  /**
+   * Closes the session whether or not a turn is in flight (an alarm that arrives between
+   * turns, such as a hook event at start-up, has nothing for `interrupt()` to stop). Any
+   * turn in flight rejects with the generic "session closed" error. Returns false when no
+   * session is open.
+   */
+  terminate(handle: ClaudeCliSessionHandle): boolean {
+    const session = this.pool.get(handle.conversationId);
+    if (!session || session.closed) {
+      // A spawn still queued or in flight has no session yet: close() makes it abort itself.
+      if (!session && this.spawning.has(handle.conversationId)) {
+        this.close(handle);
+        return true;
+      }
+      return false;
+    }
+    this.closeSessionInternal(session, "terminated");
+    return true;
+  }
+
+  /** Clears the in-flight turn and its deadline timer. */
+  private clearPending(session: PooledSession): PendingTurn | null {
+    const pending = session.pending;
+    if (pending?.deadlineTimer) clearTimeout(pending.deadlineTimer);
+    session.pending = null;
+    return pending;
   }
 
   /**
@@ -357,13 +481,28 @@ export class ClaudeCliRunner {
   }
 
   private handleLine(session: PooledSession, line: string): void {
-    if (!line.trim()) return;
+    // readline keeps delivering the rest of a chunk after close(); a session that was already closed emits nothing.
+    if (session.closed || !line.trim()) return;
     let parsed: Record<string, unknown>;
     try {
       parsed = JSON.parse(line);
     } catch {
       return; // stray non-JSON stdout noise is not a valid event; ignore rather than crash the session
     }
+    // `null`, numbers, strings and arrays are valid JSON but not events; reading `.type` on null throws,
+    // and a throw inside the readline listener would be an uncaught exception in the backend.
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return;
+    // The sinks that were listening when this event arrived. The runner acts on the event
+    // first and the sinks see it afterwards (read-only), so a sink cannot change what the
+    // runner decides, and a sink that closes the session cannot mask the runner's own
+    // diagnosis (such as an MCP server that is not connected).
+    const sinks = [session.onEvent, session.pending?.onEvent];
+    this.actOn(session, parsed);
+    Object.freeze(parsed);
+    emitEvent(sinks, parsed);
+  }
+
+  private actOn(session: PooledSession, parsed: Record<string, unknown>): void {
     if (parsed.type === "system" && parsed.subtype === "init") {
       session.apiKeySource = typeof parsed.apiKeySource === "string" ? parsed.apiKeySource : undefined;
       if (session.expectedMcpServer) {
@@ -372,12 +511,11 @@ export class ClaudeCliRunner {
           // The CLI carries on with zero tools when its MCP server fails to connect (a
           // rejected token, an unreachable bridge) and reports the turn as a success.
           // A toolless Emma turn must not pass for a real one, so stop here.
-          session.pending?.reject(
+          this.clearPending(session)?.reject(
             new Error(
               `claudeCliRunner: MCP server "${session.expectedMcpServer}" is not connected (${session.mcpServerStatus ?? "missing"})`,
             ),
           );
-          session.pending = null;
           this.closeSessionInternal(session, "mcp-not-connected");
         }
       }
@@ -388,8 +526,7 @@ export class ClaudeCliRunner {
       return;
     }
     if (parsed.type !== "result" || !session.pending) return;
-    const { resolve } = session.pending;
-    session.pending = null;
+    const { resolve } = this.clearPending(session)!;
     this.scheduleIdleClose(session); // restart the idle window from actual completion, not from when the turn started
     resolve({
       isError: parsed.is_error === true,
@@ -411,7 +548,7 @@ export class ClaudeCliRunner {
     }, this.idleCloseMs);
   }
 
-  private closeSessionInternal(session: PooledSession, reason: string): void {
+  private closeSessionInternal(session: PooledSession, reason: string, pendingError?: Error): void {
     if (session.closed) return;
     session.closed = true;
     if (session.idleTimer) clearTimeout(session.idleTimer);
@@ -435,10 +572,9 @@ export class ClaudeCliRunner {
     }
     session.child.kill();
     removeScratch();
-    if (session.pending) {
-      session.pending.reject(new Error(`claudeCliRunner: session closed (${reason}) with a turn still in flight`));
-      session.pending = null;
-    }
+    this.clearPending(session)?.reject(
+      pendingError ?? new Error(`claudeCliRunner: session closed (${reason}) with a turn still in flight`),
+    );
     this.releaseSlotToQueue();
     if (session.onClose) {
       try {
@@ -477,7 +613,7 @@ export class ClaudeCliRunner {
   }
 }
 
-function buildAllowlistedEnv(configDir: string, scratchHomeDir: string): NodeJS.ProcessEnv {
+export function buildAllowlistedEnv(configDir: string, scratchHomeDir: string): NodeJS.ProcessEnv {
   const path = process.env.PATH;
   if (!path) throw new Error("claudeCliRunner: PATH is not set in the parent process — cannot resolve the claude binary");
   return {
@@ -510,6 +646,17 @@ function writeMcpConfig(scratchHomeDir: string, server: ClaudeCliMcpServer): str
 
 function sameMcpServer(a: ClaudeCliMcpServer | undefined, b: ClaudeCliMcpServer): boolean {
   return !!a && a.name === b.name && a.url === b.url && a.bearerToken === b.bearerToken;
+}
+
+function emitEvent(sinks: Array<((event: ClaudeCliEvent) => void) | undefined>, event: ClaudeCliEvent): void {
+  for (const sink of sinks) {
+    if (!sink) continue;
+    try {
+      sink(event);
+    } catch (err) {
+      console.error("[claudeCliRunner] onEvent failed (swallowed):", err instanceof Error ? err.message : String(err));
+    }
+  }
 }
 
 function reportToolUses(message: unknown, report: (event: ClaudeCliToolUseEvent) => void): void {
@@ -546,6 +693,11 @@ function buildArgs(systemPromptFile: string, opts: ClaudeCliRunnerOptions, mcpCo
     "--strict-mcp-config",
     "--setting-sources",
     "",
+    // Hook lifecycle events are alarms for the host: an organization can deliver hooks that
+    // run in `-p` sessions, and only SessionStart/Setup events are printed without this flag.
+    "--include-hook-events",
+    // Conversations stay in Emma's own transcript; nothing is written under the login's home.
+    "--no-session-persistence",
   ];
   if (opts.model) args.push("--model", opts.model);
   // --strict-mcp-config above already limits the session to exactly this file.
@@ -564,8 +716,16 @@ export function spawn(
   return defaultRunner.spawn(conversationId, configDir, systemPromptFile, opts);
 }
 
-export function send(handle: ClaudeCliSessionHandle, message: string): Promise<ClaudeCliTurnResult> {
-  return defaultRunner.send(handle, message);
+export function send(handle: ClaudeCliSessionHandle, message: string, options?: ClaudeCliSendOptions): Promise<ClaudeCliTurnResult> {
+  return defaultRunner.send(handle, message, options);
+}
+
+export function interrupt(handle: ClaudeCliSessionHandle): boolean {
+  return defaultRunner.interrupt(handle);
+}
+
+export function terminate(handle: ClaudeCliSessionHandle): boolean {
+  return defaultRunner.terminate(handle);
 }
 
 export function close(handle: ClaudeCliSessionHandle): void {

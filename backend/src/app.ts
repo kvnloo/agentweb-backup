@@ -82,8 +82,10 @@ import outcomeLedgerRoutes from "./routes/outcomeLedger";
 import crmWebhookRoutes from "./routes/crmWebhook";
 import mcpServersRoutes, { mcpOAuthPublicRouter } from "./routes/mcpServers";
 import metaToolkitRoutes from "./routes/metaToolkit";
+import zomaRoutes from "./routes/zoma";
 import { createToolBridgeRouter } from "./routes/toolBridge";
 import { createLlmConnectionsRouter } from "./routes/llmConnections";
+import { createClaudeSubscriptionRouter } from "./routes/claudeSubscription";
 import { toolBridgeMcp } from "./services/funding/toolBridgeService";
 import skillRoutes from "./routes/skillRoutes";
 import userSkillRoutes from "./routes/userSkillRoutes";
@@ -419,6 +421,9 @@ app.use("/api/admin", adminCustomSubscriptionLinksRoutes);
 app.use("/api/internal", internalUsageRoutes);
 // ENG-2109: MCP endpoint for claude -p sessions this backend spawned. Local-only; see routes/toolBridge.ts.
 app.use("/internal/tool-bridge", createToolBridgeRouter(toolBridgeMcp));
+// ENG-2110: connecting a Claude subscription (sign-in ceremony). Gated per user by the claudeSubscription flag.
+// Mounted before the generic router so its paths are never read as a connection id.
+app.use("/api/llm-connections/claude-subscription", createClaudeSubscriptionRouter());
 // ENG-2105: a customer's own LLM provider keys (BYOK). Adding or re-validating a key
 // is gated by the eng1816_funding_flags row; listing and revoking always work.
 app.use("/api/llm-connections", createLlmConnectionsRouter());
@@ -512,6 +517,9 @@ app.use("/api/mcp-oauth", mcpOAuthPublicRouter);
 // ENG-2288: external-agent Meta Toolkit. Auth is the gateway's own bearer check
 // (aw_ agent API key or MCP OAuth token), not the portal JWT.
 app.use("/api/meta-toolkit", metaToolkitRoutes);
+// ENG-2496: Zoma device-flow onboarding. Unauthenticated by design (RFC 8628); the
+// user binds the device code through the existing MCP OAuth sign-in + consent page.
+app.use("/api/zoma", zomaRoutes);
 app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
 app.use("/api/admin/lead-magnets", authenticateToken, isAdmin, leadMagnetAdminRoutes);
 app.use("/api/admin/fathom-onboarding", authenticateToken, isAdmin, fathomOnboardingAdminRoutes);
