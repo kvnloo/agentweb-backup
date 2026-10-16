@@ -116,7 +116,12 @@ async function hasPaymentMethod(user: any, userId: string, deps: ZomaOnboardingD
   return false;
 }
 
-async function paymentSetupLink(user: any, userId: string, deps: ZomaOnboardingDeps): Promise<string> {
+async function paymentSetupLink(
+  user: any,
+  userId: string,
+  deps: ZomaOnboardingDeps,
+  returnUrls?: { successUrl: string; cancelUrl: string },
+): Promise<string> {
   let customerId: string | undefined =
     typeof user?.stripe_customer_id === 'string' && user.stripe_customer_id ? user.stripe_customer_id : undefined;
   if (!customerId) customerId = (await deps.findCustomerIdsByUserId(userId))[0];
@@ -125,11 +130,25 @@ async function paymentSetupLink(user: any, userId: string, deps: ZomaOnboardingD
   const session = await deps.createPaymentMethodSetupSession({
     stripeCustomerId: customerId,
     userId,
-    successUrl: `${base}/settings?zoma=payment_method_added`,
-    cancelUrl: `${base}/settings?zoma=payment_method_canceled`,
+    successUrl: returnUrls?.successUrl ?? `${base}/settings?zoma=payment_method_added`,
+    cancelUrl: returnUrls?.cancelUrl ?? `${base}/settings?zoma=payment_method_canceled`,
   });
   if (!session?.url) throw new Error('Stripe did not return a Checkout URL.');
   return session.url;
+}
+
+/**
+ * ENG-2496: mint the setup-mode Checkout link for a device-flow setup, returning the browser to
+ * Zoma's own pages instead of the portal settings page.
+ */
+export async function createZomaPaymentSetupLink(
+  userId: string,
+  returnUrls: { successUrl: string; cancelUrl: string },
+  deps: ZomaOnboardingDeps = defaultDeps,
+): Promise<string> {
+  const user = await deps.getUser(userId);
+  if (!user) throw new ZomaNotReadyError('No AgentWeb account was found for this login.');
+  return paymentSetupLink(user, userId, deps, returnUrls);
 }
 
 /**

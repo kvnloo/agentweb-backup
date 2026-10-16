@@ -15,6 +15,7 @@ import {
   buildAgentRunChatContext,
   fetchAgentRunSummaries,
 } from '../services/agentRunInspectorService';
+import { TABLE_PREFIX } from '../config/constants';
 
 const router = express.Router();
 
@@ -22,7 +23,6 @@ const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || 'us-west-2',
 });
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 const CHAT_SESSIONS_TABLE = `${TABLE_PREFIX}AW-ChatSessions`;
 const CHAT_MESSAGES_TABLE = `${TABLE_PREFIX}AW-ChatMessages`;
 // `limit` counts RUNS returned, not events scanned. A single chatty run emits

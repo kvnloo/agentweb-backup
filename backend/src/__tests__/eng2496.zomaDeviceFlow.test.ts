@@ -6,7 +6,13 @@
  *  - a revoked token is rejected by the Meta Toolkit gateway
  *  - an unbound (pending / denied / failed-consent) code never yields a token
  *  - only the token hash is persisted
+ *  - Zoma's Meta callback rejects a tampered / other-user / non-Zoma state, and finalizes for
+ *    the state's user regardless of the browser's AgentWeb session
+ *  - the browser journey reaches the payment step (Checkout minted) right after Meta
+ *  - setup trace logs and the stored timeline never contain codes or tokens
  */
+process.env.JWT_SECRET = process.env.JWT_SECRET || 'eng-2496-test-secret';
+
 jest.mock('../mcp/oauth/oauthService', () => ({ mcpOAuthService: {} }));
 jest.mock('../mcp/zomaOnboarding', () => ({
   getZomaReadiness: jest.fn(),
@@ -19,11 +25,22 @@ jest.mock('../services/connectedAccountsDb', () => ({ getAccountsByUserIdIncludi
 jest.mock('../services/mcpUsageEventsService', () => ({ recordMcpToolUse: jest.fn(), recordMcpWriteExecuted: jest.fn() }));
 jest.mock('../mcp/metaToolkitManifest', () => ({ MetaToolkitRefusal: class extends Error {}, executeMetaToolkitCall: jest.fn(), getMetaToolkitManifest: () => [] }));
 jest.mock('../mcp/metaToolkitWrites', () => ({ executeMetaToolkitWrite: jest.fn(), isGuardedWriteRequest: jest.fn() }));
+jest.mock('../middleware/auth', () => ({ authenticateToken: (_req: any, _res: any, next: any) => next() }));
+jest.mock('../services/metaOAuthFinalize', () => ({ META_PRECONNECT_INSTRUCTIONS: '', MetaTokenSessionError: class extends Error {} }));
+
+import express from 'express';
+import jwt from 'jsonwebtoken';
+import request from 'supertest';
 
 import {
   beginVerification,
+  completeMetaConnect,
   completeVerification,
+  continueInBrowser,
+  defaultZomaDeviceFlowDeps,
+  finishPayment,
   pollSetup,
+  selectMetaAccounts,
   revokeZomaToken,
   sha256,
   startSetup,
@@ -32,6 +49,11 @@ import {
 } from '../mcp/zomaDeviceFlow';
 import { DynamoZomaDeviceStore, type ZomaDeviceRecord, type ZomaDeviceStore, type ZomaTokenRecord } from '../mcp/zomaDeviceStore';
 import { authenticateMetaToolkitCaller, MetaToolkitAuthError, type MetaToolkitGatewayDeps } from '../mcp/metaToolkitGateway';
+import { generateMetaOAuthState } from '../services/metaConnectUrl';
+import { defaultZomaLinkCodec, ZOMA_META_CALLBACK_PATH } from '../mcp/zomaSetupLinks';
+import { scrubReason } from '../mcp/zomaSetupLog';
+import { createZomaRouter } from '../routes/zoma';
+import metaAuthRouter from '../routes/metaAuth';
 
 /** In-memory store with the same atomic semantics the DynamoDB conditions enforce. */
 class MemoryStore implements ZomaDeviceStore {
@@ -89,9 +111,18 @@ class MemoryStore implements ZomaDeviceStore {
     t.revoked = true;
     return true;
   }
+  async appendEvent(id: string, event: any, opts: { pollOutcome?: string } = {}) {
+    const d = this.devices.get(id);
+    if (!d) return;
+    d.events = [...(d.events ?? []), event];
+    if (opts.pollOutcome) d.lastPollOutcome = opts.pollOutcome;
+  }
 }
 
 const READY = { payment: { ready: true }, meta: { ready: true, accounts: [] }, writes_enabled: true, next_step: null };
+const ACCT = (id: string) => ({ id: `act_${id}`, account_id: id, name: `Acct ${id}`, currency: 'USD', account_status: 1 });
+/** The real Meta connect state format (signed with JWT_SECRET), carrying the Zoma marker. */
+const metaState = (userId: string, extra: Record<string, string> = {}) => generateMetaOAuthState(userId, { flow: 'marketing', ...extra });
 
 function harness(over: Partial<ZomaDeviceFlowDeps> = {}) {
   let now = 1_800_000_000_000;
@@ -101,9 +132,16 @@ function harness(over: Partial<ZomaDeviceFlowDeps> = {}) {
     now: () => now,
     backendUrl: () => 'https://api.example.test',
     readiness: jest.fn().mockResolvedValue(READY),
+    mintMetaLink: jest.fn(async (userId: string, deviceId: string) => `https://www.facebook.com/v1/dialog/oauth?state=${metaState(userId, { zoma: deviceId })}`),
+    mintPaymentLink: jest.fn(async (_u: string, urls: { successUrl: string }) => `https://checkout.stripe.com/c/pay/cs_test_1#${urls.successUrl}`),
     ensureClient: jest.fn().mockResolvedValue(undefined),
     consumeAuthCode: jest.fn().mockResolvedValue({ userId: 'user-1' }),
     principalAllowed: jest.fn().mockResolvedValue(true),
+    links: defaultZomaLinkCodec,
+    verifyMetaState: defaultZomaDeviceFlowDeps.verifyMetaState,
+    finalizeMeta: jest.fn().mockResolvedValue({ flow: 'marketing', adAccounts: [ACCT('111')], tokenSessionId: 'tsid-secret', preconnectInstructions: '' }),
+    connectAdAccounts: jest.fn().mockResolvedValue(undefined),
+    getCheckoutSession: jest.fn().mockResolvedValue({ status: 'complete', userId: 'user-1' }),
     ...over,
   };
   return { deps, store, advance: (ms: number) => (now += ms) };
@@ -118,6 +156,18 @@ async function startAndApprove(h: ReturnType<typeof harness>) {
   const done = await completeVerification({ code: 'auth-code', state }, h.deps);
   expect(done.ok).toBe(true);
   return start.device_code;
+}
+
+/** Readiness that flips as the journey connects Meta / adds payment. */
+function liveReadiness() {
+  const live = { meta: false, payment: false };
+  const readiness = jest.fn(async () => ({
+    payment: { ready: live.payment },
+    meta: { ready: live.meta, accounts: [] },
+    writes_enabled: live.meta && live.payment,
+    next_step: null,
+  }));
+  return { live, readiness: readiness as any };
 }
 
 describe('ENG-2496 Zoma device flow — security invariants', () => {
@@ -146,12 +196,8 @@ describe('ENG-2496 Zoma device flow — security invariants', () => {
 
   it('a bound user who is not finished onboarding gets next_step, not a token', async () => {
     const h = harness({
-      readiness: jest.fn(async (_u: string, opts: { mintLinks: boolean }) => ({
-        payment: { ready: false, ...(opts.mintLinks ? { link: 'https://checkout.stripe.test/setup' } : {}) },
-        meta: { ready: true, accounts: [] },
-        writes_enabled: false,
-        next_step: 'x',
-      })) as any,
+      readiness: jest.fn(async () => ({ payment: { ready: false }, meta: { ready: true, accounts: [] }, writes_enabled: false, next_step: 'x' })) as any,
+      mintPaymentLink: jest.fn().mockResolvedValue('https://checkout.stripe.test/setup'),
     });
     const deviceCode = await startAndApprove(h);
     const r = await pollSetup(deviceCode, h.deps);
@@ -247,3 +293,196 @@ describe('ENG-2496 Zoma device flow — security invariants', () => {
     expect(put.Put.Item).toMatchObject({ pk: 'token#h' });
   });
 });
+
+describe('ENG-2496 Zoma Meta connect — session-independent, bound to the setup', () => {
+  async function approvedSetup(over: Partial<ZomaDeviceFlowDeps> = {}) {
+    const h = harness(over);
+    const deviceCode = await startAndApprove(h);
+    return { h, deviceCode, deviceId: sha256(deviceCode) };
+  }
+
+  it('rejects a tampered, other-user, expired, or non-Zoma state and never finalizes', async () => {
+    const { h, deviceId } = await approvedSetup();
+    const valid = metaState('user-1', { zoma: deviceId });
+    const [head, body, sig] = valid.split('.');
+    const forgedBody = Buffer.from(JSON.stringify({ ...(jwt.decode(valid) as object), userId: 'user-2' })).toString('base64url');
+    const states = [
+      `${head}.${forgedBody}.${sig}`, // payload swapped to another user, signature kept
+      `${head}.${body}.${sig.slice(0, -2)}xx`, // signature tampered
+      jwt.sign({ userId: 'user-1', flow: 'marketing', zoma: deviceId }, 'not-the-secret'), // wrong key
+      metaState('user-2', { zoma: deviceId }), // validly signed, but for another user than the setup's
+      metaState('user-1'), // a portal (non-Zoma) state
+      metaState('user-1', { zoma: sha256('another-setup') }), // unknown setup
+      jwt.sign({ userId: 'user-1', flow: 'marketing', zoma: deviceId }, process.env.JWT_SECRET!, { expiresIn: -10 }), // expired
+    ];
+    for (const state of states) {
+      const step = await completeMetaConnect({ code: 'meta-code', state }, h.deps);
+      expect(step).toMatchObject({ kind: 'page', status: 400 });
+    }
+    expect(h.deps.finalizeMeta).not.toHaveBeenCalled();
+    expect(h.deps.connectAdAccounts).not.toHaveBeenCalled();
+  });
+
+  it('a picker submit cannot connect an account Meta did not offer, nor use a forged picker link', async () => {
+    const { h, deviceId } = await approvedSetup({
+      finalizeMeta: jest.fn().mockResolvedValue({ flow: 'marketing', adAccounts: [ACCT('111'), ACCT('222')], tokenSessionId: 'tsid', preconnectInstructions: '' }),
+    });
+    const picker = await completeMetaConnect({ code: 'meta-code', state: metaState('user-1', { zoma: deviceId }) }, h.deps);
+    expect(picker).toMatchObject({ kind: 'pick_account' });
+    const t = (picker as any).token as string;
+
+    expect(await selectMetaAccounts({ t, account_id: 'attacker-999' }, h.deps)).toMatchObject({ kind: 'pick_account', message: expect.any(String) });
+    expect(await selectMetaAccounts({ t: `${t.slice(0, -2)}xx`, account_id: '111' }, h.deps)).toMatchObject({ kind: 'page', status: 400 });
+    // A portal-style JWT signed with the raw secret is not a Zoma link token.
+    const raw = jwt.sign({ purpose: 'pick_meta_account', zoma: deviceId, tokenSessionId: 'x', accounts: [ACCT('999')] }, process.env.JWT_SECRET!);
+    expect(await selectMetaAccounts({ t: raw, account_id: '999' }, h.deps)).toMatchObject({ kind: 'page', status: 400 });
+    expect(h.deps.connectAdAccounts).not.toHaveBeenCalled();
+
+    await selectMetaAccounts({ t, account_id: ['222', 'attacker-999'] }, h.deps);
+    expect(h.deps.connectAdAccounts).toHaveBeenCalledTimes(1);
+    expect((h.deps.connectAdAccounts as jest.Mock).mock.calls[0]).toEqual(['user-1', [{ account_id: '222', name: 'Acct 222', currency: 'USD', account_status: 1 }], 'tsid']);
+  });
+
+  it('HTTP: the callback finalizes for the state\'s user even when the browser is signed in as someone else', async () => {
+    const { live, readiness } = liveReadiness();
+    const { h, deviceId } = await approvedSetup({ readiness });
+    (h.deps.connectAdAccounts as jest.Mock).mockImplementation(async () => { live.meta = true; });
+    const app = express();
+    app.use('/api/oauth/meta', metaAuthRouter);
+    app.use('/api/zoma', createZomaRouter(h.deps));
+
+    // Meta redirects to the EXISTING registered redirect URI; a Zoma state is forwarded to Zoma.
+    const state = metaState('user-1', { zoma: deviceId });
+    const forwarded = await request(app).get('/api/oauth/meta/callback').query({ code: 'meta-code', state });
+    expect(forwarded.status).toBe(302);
+    expect(forwarded.headers.location.startsWith(`${ZOMA_META_CALLBACK_PATH}?`)).toBe(true);
+
+    const otherUsersSession = jwt.sign({ userId: 'user-2', email: 'other@example.com' }, process.env.JWT_SECRET!);
+    const res = await request(app)
+      .get(forwarded.headers.location)
+      .set('Authorization', `Bearer ${otherUsersSession}`)
+      .set('Cookie', `token=${otherUsersSession}`);
+    expect(h.deps.finalizeMeta).toHaveBeenCalledWith('user-1', 'meta-code');
+    expect((h.deps.connectAdAccounts as jest.Mock).mock.calls[0][0]).toBe('user-1');
+    // ...and goes straight on to payment.
+    expect(res.status).toBe(302);
+    expect(res.headers.location).toMatch(/^https:\/\/checkout\.stripe\.com\//);
+
+    // The portal flow is untouched: a portal state still goes to the portal's callback page.
+    process.env.CUSTOMER_FRONTEND_URL = 'https://app.example.test';
+    const portal = await request(app).get('/api/oauth/meta/callback').query({ code: 'c', state: metaState('user-2') });
+    expect(portal.headers.location).toMatch(/^https:\/\/app\.example\.test\/oauth\/meta\/callback\?code=c&state=/);
+  });
+});
+
+describe('ENG-2496 one browser journey: approval -> Meta -> payment -> done', () => {
+  it('reaches the payment step right after Meta, mints Checkout once, and the agent poll gets the same link', async () => {
+    const { live, readiness } = liveReadiness();
+    const h = harness({ readiness });
+    (h.deps.connectAdAccounts as jest.Mock).mockImplementation(async () => { live.meta = true; });
+    const deviceCode = await startAndApprove(h);
+    const deviceId = sha256(deviceCode);
+
+    // After approval the browser goes straight to Meta.
+    const afterApproval = await continueInBrowser(deviceId, h.deps);
+    expect(afterApproval).toMatchObject({ kind: 'redirect', url: expect.stringMatching(/^https:\/\/www\.facebook\.com\//) });
+    const state = new URL((afterApproval as any).url).searchParams.get('state');
+
+    // Meta's callback goes straight on to Stripe setup-mode Checkout.
+    const afterMeta = await completeMetaConnect({ code: 'meta-code', state }, h.deps);
+    expect(afterMeta).toMatchObject({ kind: 'redirect', url: expect.stringMatching(/^https:\/\/checkout\.stripe\.com\//) });
+    expect(h.deps.mintPaymentLink).toHaveBeenCalledTimes(1);
+    const [payUser, urls] = (h.deps.mintPaymentLink as jest.Mock).mock.calls[0];
+    expect(payUser).toBe('user-1');
+    expect(urls.successUrl).toMatch(/^https:\/\/api\.example\.test\/api\/zoma\/done\?t=.+&session_id=\{CHECKOUT_SESSION_ID\}$/);
+
+    // The agent's poll reports add_payment with the same link; no second session is minted.
+    h.advance(5_000);
+    const poll = await pollSetup(deviceCode, h.deps);
+    expect(poll).toMatchObject({ status: 200, body: { next_step: 'add_payment', link: (afterMeta as any).url } });
+    expect(h.deps.mintPaymentLink).toHaveBeenCalledTimes(1);
+
+    // Stripe returns to Zoma's own "you're set" page.
+    const t = new URL(urls.successUrl.replace('{CHECKOUT_SESSION_ID}', 'cs_test_1')).searchParams.get('t');
+    const done = await finishPayment({ t, session_id: 'cs_test_1' }, h.deps);
+    expect(done).toMatchObject({ kind: 'page', status: 200, done: true });
+    expect((h.store.devices.get(deviceId)!.events ?? []).map((e) => `${e.step}:${e.outcome}`)).toEqual(
+      expect.arrayContaining(['approval:approved', 'meta_redirect:ok', 'meta_callback:ok', 'meta_connect:ok', 'payment_checkout:created', 'checkout_completed:ok']),
+    );
+  });
+
+  it('skips steps that are already done', async () => {
+    const { live, readiness } = liveReadiness();
+    live.meta = true;
+    const h = harness({ readiness });
+    const deviceId = sha256(await startAndApprove(h));
+    expect(await continueInBrowser(deviceId, h.deps)).toMatchObject({ kind: 'redirect', url: expect.stringMatching(/checkout\.stripe\.com/) });
+    live.payment = true;
+    expect(await continueInBrowser(deviceId, h.deps)).toMatchObject({ kind: 'page', done: true });
+    expect(h.deps.mintMetaLink).not.toHaveBeenCalled();
+  });
+});
+
+describe('ENG-2496 setup tracing never leaks codes or tokens', () => {
+  it('a full setup, poll, token issue and revoke logs one JSON line per event with no secrets', async () => {
+    const lines: string[] = [];
+    const spy = jest.spyOn(console, 'log').mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+    try {
+      const { live, readiness } = liveReadiness();
+      const h = harness({ readiness });
+      (h.deps.connectAdAccounts as jest.Mock).mockImplementation(async () => { live.meta = true; });
+      (h.deps.finalizeMeta as jest.Mock).mockRejectedValueOnce(new Error('Meta said no: access_token=EAABsecretsecretsecretsecret code=meta-code-123'));
+      const start = await startSetup(h.deps);
+      const begin = await beginVerification(start.user_code, h.deps);
+      const consentState = begin.ok ? new URL(begin.redirect).searchParams.get('state') : null;
+      await completeVerification({ code: 'auth-code-xyz', state: consentState }, h.deps);
+      const deviceId = sha256(start.device_code);
+      const toMeta = (await continueInBrowser(deviceId, h.deps)) as any;
+      const state = new URL(toMeta.url).searchParams.get('state')!;
+      await completeMetaConnect({ code: 'meta-code-123', state }, h.deps); // fails with a secret-laden error
+      const toPay = (await completeMetaConnect({ code: 'meta-code-123', state }, h.deps)) as any;
+      live.payment = true;
+      h.advance(5_000);
+      const issued = await pollSetup(start.device_code, h.deps);
+      const token = (issued.body as any).access_token as string;
+      expect(token).toMatch(/^zoma_/);
+      await revokeZomaToken(token, h.deps);
+
+      const zomaLines = lines.filter((l) => l.includes('zoma_setup')).map((l) => JSON.parse(l));
+      expect(zomaLines.length).toBeGreaterThan(5);
+      expect(zomaLines.every((l) => l.event === 'zoma_setup' && /^[0-9a-f]{12}$/.test(l.setup_id ?? '000000000000'))).toBe(true);
+      expect(zomaLines.map((l) => `${l.step}:${l.outcome}`)).toEqual(
+        expect.arrayContaining(['setup_started:ok', 'activate_visited:ok', 'approval:approved', 'meta_callback:failed', 'payment_checkout:created', 'token_issued:ok', 'token_revoked:ok']),
+      );
+
+      const secrets = [
+        start.device_code,
+        start.user_code,
+        start.user_code.replace('-', ''),
+        'auth-code-xyz',
+        'meta-code-123',
+        'EAABsecretsecretsecretsecret',
+        token,
+        token.slice('zoma_'.length),
+        state,
+        toPay.url,
+        'tsid-secret',
+        h.store.devices.get(deviceId)!.pkceVerifier,
+      ];
+      const stored = JSON.stringify(h.store.devices.get(deviceId)!.events);
+      for (const secret of secrets) {
+        expect(lines.join('\n')).not.toContain(secret);
+        expect(stored).not.toContain(secret);
+      }
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('scrubReason redacts tokens, codes, JWTs and Stripe secrets from free-text errors', () => {
+    const jwtLike = jwt.sign({ a: 1 }, 'k');
+    const out = scrubReason(`bad zoma_abcDEF123 ${jwtLike} sk_live_abc123XYZ cs_test_a1b2c3d4e5 ?code=xyz&state=abc`);
+    for (const s of ['zoma_abcDEF123', jwtLike, 'sk_live_abc123XYZ', 'cs_test_a1b2c3d4e5', 'code=xyz', 'state=abc']) expect(out).not.toContain(s);
+  });
+});
+

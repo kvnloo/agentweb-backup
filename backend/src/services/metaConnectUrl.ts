@@ -26,7 +26,11 @@ export function buildOAuthUrl(params: { authorizationUrl: string; clientId: stri
   return `${params.authorizationUrl}?${searchParams.toString()}`;
 }
 
-export async function buildMetaConnectUrl(userId: string, flow: MetaFlowType = 'marketing'): Promise<string> {
+/**
+ * `stateExtra` adds signed claims to the OAuth state (ENG-2496: `{ zoma: deviceId }` routes the
+ * callback to Zoma's server-side finalize instead of the portal).
+ */
+export async function buildMetaConnectUrl(userId: string, flow: MetaFlowType = 'marketing', stateExtra: Record<string, string> = {}): Promise<string> {
   // Instagram Business Login uses its own app credentials; marketing/pages use the Facebook app.
   const creds = flow === 'instagram' ? await getInstagramCredentials() : await getMetaCredentials();
   const flowCfg = getMetaFlowConfig(flow);
@@ -35,7 +39,7 @@ export async function buildMetaConnectUrl(userId: string, flow: MetaFlowType = '
     clientId: flow === 'instagram' ? creds.instagramClientId : creds.clientId,
     redirectUri: flow === 'instagram' ? INTEGRATION_CONFIG.meta.instagramRedirectUri : INTEGRATION_CONFIG.meta.redirectUri,
     scopes: flowCfg.scopes,
-    state: generateMetaOAuthState(userId, { flow }),
+    state: generateMetaOAuthState(userId, { ...stateExtra, flow }),
     // Meta does not re-prompt for declined permissions during an ordinary reconnect.
     // `rerequest` is the documented path that lets a customer approve previously
     // declined Pages/permissions instead of receiving another token with the same gap.
