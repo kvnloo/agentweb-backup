@@ -405,7 +405,7 @@ const REPLIES: Partial<Record<VerificationOutcome, string>> = {
     'connected here. Disconnect it from that account first, or use a different number.',
   invalid:
     "That verification code isn't valid or has expired. " +
-    'Start again from AgentWeb Settings → Notifications to get a new one.',
+    'Start again from AgentWeb Settings → Connected Accounts to get a new one.',
   // opted_out / rate_limited / already_verified are deliberately silent: an opted-out
   // number cannot be messaged, a throttled sender should learn nothing, and a redelivery
   // has already been answered.
