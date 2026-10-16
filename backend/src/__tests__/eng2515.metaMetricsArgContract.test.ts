@@ -12,6 +12,10 @@ import { getMetaAdsMetricsArgsSchema } from '../utils/metaCampaignIds';
 const inputSchema = getMetaAdsMetricsTool.definition.inputSchema;
 const validate = (args: Record<string, unknown>) =>
   validateAndRepairToolArgs({ toolName: 'get_meta_ads_metrics', args, inputSchema, effect: 'read' });
+// get_meta_ads_metrics short-circuits to its typed zod schema, so check the
+// declared JSON schema through the generic (untyped-tool) validation path.
+const validateDeclared = (args: Record<string, unknown>) =>
+  validateAndRepairToolArgs({ toolName: 'eng2515_declared_schema_probe', args, inputSchema, effect: 'read' });
 
 describe('ENG-2515 get_meta_ads_metrics schema/runtime agreement', () => {
   // Schema-valid shapes from the ENG-821 invalid_args corpus class
@@ -29,7 +33,10 @@ describe('ENG-2515 get_meta_ads_metrics schema/runtime agreement', () => {
   it.each(schemaValid)('accepts %s and the handler receives usable ids', (_label, args, expected) => {
     const result = validate(args);
     expect(result.status).not.toBe('invalid');
-    const parsed = getMetaAdsMetricsArgsSchema.safeParse(args);
+    expect(validateDeclared(args).status).not.toBe('invalid');
+    // The gateway's returned args are what the runtime forwards to the handler.
+    expect((result.args as { campaign_ids?: unknown }).campaign_ids).toEqual(expected);
+    const parsed = getMetaAdsMetricsArgsSchema.safeParse(result.args);
     expect(parsed.success).toBe(true);
     if (parsed.success) expect(parsed.data.campaign_ids).toEqual(expected);
   });
