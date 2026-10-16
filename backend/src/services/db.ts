@@ -20,7 +20,9 @@ import type { MonthlyLlmUsageCredits } from "./llmUsageCreditService";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { isEvaluationUser } from "./evaluationPolicy";
-import { emailLeadIds, isEmailUniqueCreateEnabled, emailTxAllowed, tripEmailTxBreaker, type EmailLeadIds } from '../utils/emailLeadId';
+import { emailLeadIds, phoneLeadIds, isEmailUniqueCreateEnabled, emailTxAllowed, tripEmailTxBreaker, type EmailLeadIds } from '../utils/emailLeadId';
+import { phoneDedupeKey, PHONE_FANOUT_CAP } from '../utils/phoneLeadDedupe';
+import { isSmokeTestPhone } from '../utils/smokeTestLead';
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
 import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
@@ -30,6 +32,9 @@ dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
 // Get table prefix based on NODE_ENV (defaults to empty string for production)
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+
+/** ENG-2123: until when getLeadIdsByPhoneKey should not try PhoneKeyIndex again (missing index / denied). */
+let phoneIndexUnavailableUntil = 0;
 
 /** One counter-guarded group of customFields for crmDb.mergeSessionLeadEvent. */
 type MonotonicPlan = { counterKey: string; counter: number; fields: Record<string, any> };
@@ -6532,13 +6537,30 @@ export const crmDb = {
      *  `duplicateEmail` error the pre-check does. Ignored when the caller supplies a leadId, when
      *  there is no email, or when LEAD_EMAIL_UNIQUE_CREATE=false (random-id path, unchanged). */
     emailUniqueCreate?: boolean;
+    /** ENG-2123: the phone twin of emailUniqueCreate, for an EMAIL-LESS form capture whose number passes
+     *  phoneDedupeKey. Same bucketed deterministic id + adjacent-bucket transaction; a loser throws the
+     *  typed `duplicatePhone` (carrying the winner) so the caller can adopt it or, when the two submissions
+     *  name different people, create a separate row. Ignored when the caller supplies a leadId, when there is
+     *  an email, or for any origin other than form_fill. */
+    phoneUniqueCreate?: boolean;
   }, origin?: LeadOrigin) {
     try {
       const emailKeyIds: EmailLeadIds | null =
         leadData.emailUniqueCreate && !leadData.leadId?.trim() && leadData.email?.trim() && isEmailUniqueCreateEnabled()
           ? emailLeadIds(listId, leadData.email.trim().toLowerCase())
           : null;
-      let leadId = leadData.leadId?.trim() || emailKeyIds?.leadId || `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      // ENG-2123. phoneKey: the sparse identity of an email-less FORM capture (never '' - DynamoDB rejects an
+      // empty index key). Written whenever it applies, independent of any rollout mode, so the key exists
+      // before the lookup index does. Other origins (LinkedIn mirror, manual, imports) never write one.
+      const phoneKey = origin === 'form_fill' && !leadData.email?.trim() && !leadData.linkedin?.trim()
+        && !(leadData.syncMetadata && Object.keys(leadData.syncMetadata).length > 0)
+        ? (isSmokeTestPhone(leadData.phone) ? '' : phoneDedupeKey(leadData.phone))
+        : '';
+      const phoneKeyIds: EmailLeadIds | null =
+        leadData.phoneUniqueCreate && phoneKey && !leadData.leadId?.trim() && !emailKeyIds
+          ? phoneLeadIds(listId, phoneKey)
+          : null;
+      let leadId = leadData.leadId?.trim() || emailKeyIds?.leadId || phoneKeyIds?.leadId || `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
       // Check for duplicate email if email is provided
       if (!leadData.skipEmailDuplicateCheck && leadData.email && leadData.email.trim()) {
@@ -6591,6 +6613,9 @@ export const crmDb = {
 
       if (emailValue) {
         item.email = emailValue;
+      }
+      if (phoneKey) {
+        item.phoneKey = phoneKey;
       }
       // Keep linkedin sparse so LinkedinLookupIndex GSI only indexes leads
       // with a real value (empty-string HASH keys are wasteful in the GSI).
@@ -6706,6 +6731,8 @@ export const crmDb = {
 
       if (emailKeyIds) {
         leadId = await this.putEmailKeyedLead(params, emailKeyIds);
+      } else if (phoneKeyIds) {
+        leadId = await this.putPhoneKeyedLead(params, phoneKeyIds);
       } else {
         await dynamodb.put(params).promise();
       }
@@ -6806,6 +6833,25 @@ export const crmDb = {
    * never reach the caller: a duplicate row is recoverable, a dropped lead is not.
    */
   async putEmailKeyedLead(params: any, ids: EmailLeadIds): Promise<string> {
+    return this.putBucketKeyedLead(params, ids, (existing) => {
+      const duplicateErr: any = new Error(`Lead with email "${params.Item.email}" already exists in this list`);
+      duplicateErr.duplicateEmail = true;
+      duplicateErr.existingLead = existing;
+      return duplicateErr;
+    });
+  },
+
+  /** ENG-2123: the phone twin of putEmailKeyedLead. A loser throws a typed `duplicatePhone`. */
+  async putPhoneKeyedLead(params: any, ids: EmailLeadIds): Promise<string> {
+    return this.putBucketKeyedLead(params, ids, (existing) => {
+      const duplicateErr: any = new Error('Lead with this phone number already exists in this list');
+      duplicateErr.duplicatePhone = true;
+      duplicateErr.existingLead = existing;
+      return duplicateErr;
+    });
+  },
+
+  async putBucketKeyedLead(params: any, ids: EmailLeadIds, makeDuplicate: (existing: any) => Error): Promise<string> {
     const table = params.TableName;
     const listId = params.Item.listId;
     const nonexistent = (leadId: string) => ({
@@ -6814,12 +6860,7 @@ export const crmDb = {
     const adoptOrThrow = async (err: any): Promise<void> => {
       for (const id of [ids.prevLeadId, ids.leadId, ids.nextLeadId]) {
         const existing = await this.getLeadById(listId, id, { consistentRead: true });
-        if (existing) {
-          const duplicateErr: any = new Error(`Lead with email "${params.Item.email}" already exists in this list`);
-          duplicateErr.duplicateEmail = true;
-          duplicateErr.existingLead = existing;
-          throw duplicateErr;
-        }
+        if (existing) throw makeDuplicate(existing);
       }
       if (err) throw err;
     };
@@ -7501,6 +7542,36 @@ export const crmDb = {
     }
 
     return results;
+  },
+
+  /**
+   * ENG-2123: ids of the email-less form captures in a list that share a phoneKey, via PhoneKeyIndex
+   * (HASH listId, RANGE phoneKey, KEYS_ONLY, eventually consistent - callers re-read and VALIDATE each
+   * row). Returns `available:false` instead of throwing when the index does not exist yet or the role may
+   * not query it, remembered for 10 minutes so a missing index costs one warning, not one per capture.
+   * Any other error propagates: a bad expression must not silently disable dedupe forever.
+   */
+  async getLeadIdsByPhoneKey(listId: string, phoneKey: string): Promise<{ available: boolean; leadIds: string[]; capped: boolean }> {
+    if (Date.now() < phoneIndexUnavailableUntil) return { available: false, leadIds: [], capped: false };
+    try {
+      const result = await dynamodb.query({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        IndexName: 'PhoneKeyIndex',
+        KeyConditionExpression: 'listId = :l AND phoneKey = :k',
+        ExpressionAttributeValues: { ':l': listId, ':k': phoneKey },
+        Limit: PHONE_FANOUT_CAP + 1,
+      }).promise();
+      const ids = (result.Items || []).map((i: any) => String(i.leadId));
+      return { available: true, leadIds: ids, capped: ids.length > PHONE_FANOUT_CAP };
+    } catch (error: any) {
+      const missingIndex = error?.code === 'ValidationException' && /specified index|backfilling/i.test(String(error?.message));
+      if (missingIndex || error?.code === 'AccessDeniedException') {
+        phoneIndexUnavailableUntil = Date.now() + 10 * 60 * 1000;
+        console.warn(`[phone-dedupe] PhoneKeyIndex unavailable (${error.code}); phone lookup disabled for 10 minutes.`);
+        return { available: false, leadIds: [], capped: false };
+      }
+      throw error;
+    }
   },
 
   async getLeadByEmail(listId: string, email: string) {

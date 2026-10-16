@@ -1361,6 +1361,7 @@ const createLeadsTable = async () => {
       { AttributeName: 'nameCompanyKey', AttributeType: 'S' },
       { AttributeName: 'updatedAt', AttributeType: 'S' },
       { AttributeName: 'companyId', AttributeType: 'S' },
+      { AttributeName: 'phoneKey', AttributeType: 'S' },
     ],
     KeySchema: [
       { AttributeName: 'listId', KeyType: 'HASH' },
@@ -1375,6 +1376,21 @@ const createLeadsTable = async () => {
         ],
         Projection: {
           ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      },
+      {
+        // ENG-2123: sparse lookup of an email-less form capture by normalised phone (utils/phoneLeadDedupe.ts).
+        IndexName: 'PhoneKeyIndex',
+        KeySchema: [
+          { AttributeName: 'listId', KeyType: 'HASH' },
+          { AttributeName: 'phoneKey', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'KEYS_ONLY'
         },
         ProvisionedThroughput: {
           ReadCapacityUnits: 5,
