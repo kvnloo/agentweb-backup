@@ -15,9 +15,9 @@
  * still read a finished/expired setup's timeline; every read path checks `expiresAt`, never TTL.
  */
 import AWS from 'aws-sdk';
+import { TABLE_PREFIX } from '../config/constants';
 import type { ZomaSetupEvent } from './zomaSetupLog';
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 export const ZOMA_DEVICE_TABLE = `${TABLE_PREFIX}AW-ZomaDeviceAuth`;
 
 export type ZomaDeviceStatus = 'pending' | 'approved' | 'denied' | 'issued';

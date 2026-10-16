@@ -6,8 +6,9 @@ import { OUTCOME_LEDGER_TABLE, itemToRecommendation, ledgerRequest, getRecommend
 import { buildOutcomeEntityKey, hasLearningContext, validateRecommendationContext, type Recommendation } from './outcomeLedger';
 import { buildOutcomeLesson, resolveScopedLessons, LEARNING_PREFIX, type LearningScope, type ScopedLesson } from './adsScopedLearning';
 import type { ExecutionReceipt } from './adsOutcomeEvaluator';
+import { TABLE_PREFIX } from '../config/constants';
 const db = new AWS.DynamoDB.DocumentClient();
-const MEMORY_TABLE = `${process.env.NODE_ENV === 'development' ? 'Dev-' : ''}AW-AccountMemory`;
+const MEMORY_TABLE = `${TABLE_PREFIX}AW-AccountMemory`;
 export async function getDueRecommendations(now: Date, cursor?: AWS.DynamoDB.DocumentClient.Key) {
   const result = await ledgerRequest(db.query({ TableName: OUTCOME_LEDGER_TABLE, IndexName: 'StatusEvaluationDateIndex',
     KeyConditionExpression: '#status = :pending AND evaluationDate <= :due', ExpressionAttributeNames: { '#status': 'status' },
@@ -113,7 +114,7 @@ export async function getLearningAccountOwners(accountId: string): Promise<Set<s
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new Error('Ownership read deadline exceeded');
     const result = await ledgerRequest(db.scan({
-      TableName: `${process.env.NODE_ENV === 'development' ? 'Dev-' : ''}AW-Users`,
+      TableName: `${TABLE_PREFIX}AW-Users`,
       ProjectionExpression: 'userId, adAccount, connected_accounts',
       ConsistentRead: true, Limit: 100, ...(cursor ? { ExclusiveStartKey: cursor } : {}),
     }), remaining);
