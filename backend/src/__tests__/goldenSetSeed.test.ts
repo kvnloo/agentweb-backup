@@ -1,4 +1,5 @@
-import { buildSeedCases, parseFpCatalogue, resolveSessionRef, type SeedInputs, type SeedUserRow } from '../loops/eval/goldenSetSeed';
+import { buildSeedCases, buildWorkPlanCases, parseFpCatalogue, resolveSessionRef, WORK_PLAN_SEED_SOURCE, type SeedInputs, type SeedUserRow } from '../loops/eval/goldenSetSeed';
+import { newGoldenCase } from '../loops/eval/goldenSet';
 
 const NOW = new Date('2026-09-25T00:00:00.000Z');
 
@@ -292,5 +293,51 @@ describe('account_health pool (ENG-2135)', () => {
     const none = users.filter((u) => !u.hasAdPlatform);
     expect(accountCases(buildSeedCases(inputs({ users: none, adConnectedAccounts: true }))).map((c) => c.caseId))
       .toEqual(accountCases(buildSeedCases(inputs({ users: none }))).map((c) => c.caseId));
+  });
+});
+
+describe('work-plan sessions (ENG-665)', () => {
+  const recent = (i: number) => new Date(NOW.getTime() - (i % 80) * 24 * 60 * 60 * 1000).toISOString();
+  const rows = Array.from({ length: 120 }, (_, i) => ({ sessionId: sid(1000 + i), userId: `u${i}`, createdAt: recent(i) }));
+  const stored = (sessionId: string, seedSource: string) =>
+    newGoldenCase({ surface: 'agent', taskType: seedSource, sourceId: sessionId, seedSource, now: NOW });
+
+  it('selects up to the target in hash order, tagged as work-plan cases', () => {
+    const result = buildWorkPlanCases({ sessions: rows, existing: [], target: 80, now: NOW });
+    expect(result).toMatchObject({ eligible: 120, alreadyStored: 0, target: 80 });
+    expect(result.cases).toHaveLength(80);
+    expect(result.cases.every((c) => c.surface === 'agent' && c.seedSource === WORK_PLAN_SEED_SOURCE && c.taskType === WORK_PLAN_SEED_SOURCE)).toBe(true);
+    const smaller = buildWorkPlanCases({ sessions: rows, existing: [], target: 30, now: NOW });
+    expect(result.cases.slice(0, 30).map((c) => c.caseId)).toEqual(smaller.cases.map((c) => c.caseId));
+  });
+
+  it('is idempotent: work-plan cases already stored count toward the target and are not repeated', () => {
+    const first = buildWorkPlanCases({ sessions: rows, existing: [], target: 80, now: NOW });
+    const again = buildWorkPlanCases({ sessions: rows, existing: first.cases, target: 80, now: NOW });
+    expect(again).toMatchObject({ alreadyStored: 80, cases: [] });
+    const partial = buildWorkPlanCases({ sessions: rows, existing: first.cases.slice(0, 50), target: 80, now: NOW });
+    expect(partial.cases.map((c) => c.caseId)).toEqual(first.cases.slice(50).map((c) => c.caseId));
+  });
+
+  it('skips sessions already stored under another agent source without counting them toward the target', () => {
+    const existing = [stored(rows[0].sessionId, 'sampled_session'), stored(rows[1].sessionId, 'admin_override')];
+    const result = buildWorkPlanCases({ sessions: rows, existing, target: 200, now: NOW });
+    expect(result.alreadyStored).toBe(0);
+    expect(result.cases).toHaveLength(118);
+    expect(result.cases.map((c) => c.sourceRef.id)).not.toEqual(expect.arrayContaining([rows[0].sessionId, rows[1].sessionId]));
+  });
+
+  it('excludes evaluation users and sessions that are old, future-dated or undated', () => {
+    const day = 24 * 60 * 60 * 1000;
+    const sessions = [
+      { sessionId: sid(1), userId: 'eval_bot', createdAt: recent(1) },
+      { sessionId: sid(2), createdAt: new Date(NOW.getTime() - 91 * day).toISOString() },
+      { sessionId: sid(3), createdAt: new Date(NOW.getTime() + day).toISOString() },
+      { sessionId: sid(4) },
+      { sessionId: sid(5), createdAt: recent(2) },
+    ];
+    const result = buildWorkPlanCases({ sessions, existing: [], target: 10, now: NOW });
+    expect(result.eligible).toBe(1);
+    expect(result.cases.map((c) => c.sourceRef.id)).toEqual([sid(5)]);
   });
 });

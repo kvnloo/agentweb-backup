@@ -4,6 +4,7 @@
  * Usage:
  *   npx ts-node --transpile-only src/scripts/seedGoldenCases.ts [--fp-catalogue <file>]
  *     [--target-agent N] [--target-creative N] [--target-account-health N] [--gated-creatives] [--ad-connected-accounts] [--write]
+ *   npx ts-node --transpile-only src/scripts/seedGoldenCases.ts --work-plan-sessions N [--write]
  *
  * Reads (read-only, projected scans — ids and flags only):
  *   AW-ChatSessions   sessionId, satisfactionScore.adminOverride, userId, createdAt, sessionType, messageCount
@@ -22,6 +23,12 @@
  * past the ENG-2136 validation minimum (MIN_VALIDATION_N = 30) is to raise its total target so
  * more cases get selected, some of which land in test.
  *
+ * `--work-plan-sessions N` (ENG-665) is a separate mode: it adds only agent cases for sessions that
+ * have a work plan (the only sessions `agent-task-success` grades) until the store holds N of them,
+ * and builds nothing else, so the stored sample of the other sources is left exactly as it is. It
+ * reads AW-ChatSessions (sessionId, userId, createdAt of rows with a work-plan step) and the agent
+ * cases already in the store.
+ *
  * Prints counts only. Writes nothing unless `--write` is given, and then only to the table in
  * EVAL_GOLDEN_CASES_TABLE; with that unset it refuses and exits 1. Existing cases (and their
  * labels) are never overwritten — `store.createCase` only creates, so raising a target and
@@ -34,14 +41,17 @@ import { paginatedScan } from '../utils/dynamoPagination';
 import {
   AD_PLATFORMS,
   buildSeedCases,
+  buildWorkPlanCases,
   parseFpCatalogue,
+  SAMPLE_WINDOW_DAYS,
   type FpCatalogue,
   type SeedCandidateRow,
   type SeedSessionRow,
   type SeedUserRow,
+  type WorkPlanSessionRow,
 } from '../loops/eval/goldenSetSeed';
 import type { EvalSurface } from '../loops/eval/evalRegistry';
-import { goldenSetStoreFromEnv, GOLDEN_CASES_TABLE_ENV } from '../loops/eval/goldenSetStore';
+import { goldenSetStoreFromEnv, GOLDEN_CASES_TABLE_ENV, type GoldenSetStore } from '../loops/eval/goldenSetStore';
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 
@@ -57,6 +67,8 @@ export interface Args {
   gatedCreatives?: boolean;
   /** Take every account with an ad platform connected first (ENG-2135). */
   adConnectedAccounts?: boolean;
+  /** Work-plan-only mode (ENG-665): the total number of work-plan agent cases the store should hold. */
+  workPlanSessions?: number;
   write: boolean;
   targets: Partial<Record<EvalSurface, number>>;
 }
@@ -70,14 +82,20 @@ export function parseArgs(argv: string[]): Args {
     else if (flag === '--gated-creatives') args.gatedCreatives = true;
     else if (flag === '--ad-connected-accounts') args.adConnectedAccounts = true;
     else if (flag === '--fp-catalogue') args.fpCatalogue = argv[++i];
-    else if (surface) {
-      const raw = argv[++i];
-      const n = Number(raw);
-      if (!Number.isInteger(n) || n < 1) throw new Error(`${flag} needs a positive integer, got ${JSON.stringify(raw)}`);
-      args.targets[surface] = n;
-    } else throw new Error(`unknown argument ${flag}`);
+    else if (flag === '--work-plan-sessions') args.workPlanSessions = positiveInt(flag, argv[++i]);
+    else if (surface) args.targets[surface] = positiveInt(flag, argv[++i]);
+    else throw new Error(`unknown argument ${flag}`);
+  }
+  if (args.workPlanSessions !== undefined && (args.fpCatalogue || args.gatedCreatives || args.adConnectedAccounts || Object.keys(args.targets).length)) {
+    throw new Error('--work-plan-sessions runs on its own (only --write may be added)');
   }
   return args;
+}
+
+function positiveInt(flag: string, raw: string | undefined): number {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) throw new Error(`${flag} needs a positive integer, got ${JSON.stringify(raw)}`);
+  return n;
 }
 
 interface SessionItem {
@@ -154,12 +172,52 @@ async function loadInputs(client: AWS.DynamoDB.DocumentClient) {
   return { sessions, candidates, users };
 }
 
+async function loadWorkPlanSessions(client: AWS.DynamoDB.DocumentClient): Promise<WorkPlanSessionRow[]> {
+  const rows = await paginatedScan<WorkPlanSessionRow>(client, {
+    TableName: `${TABLE_PREFIX}AW-ChatSessions`,
+    FilterExpression: 'size(workPlan.steps) > :zero',
+    ProjectionExpression: 'sessionId, userId, createdAt',
+    ExpressionAttributeValues: { ':zero': 0 },
+  });
+  return rows.map((s) => ({ sessionId: s.sessionId, ...(s.userId ? { userId: s.userId } : {}), ...(s.createdAt ? { createdAt: s.createdAt } : {}) }));
+}
+
+async function seedWorkPlanSessions(store: GoldenSetStore, target: number, write: boolean): Promise<void> {
+  if (!store.isProvisioned()) {
+    // Needs the stored cases to skip sessions already present and keep a re-run idempotent.
+    console.error(`--work-plan-sessions needs ${GOLDEN_CASES_TABLE_ENV} set, also for a dry run.`);
+    process.exit(1);
+  }
+  const sessions = await loadWorkPlanSessions(new AWS.DynamoDB.DocumentClient());
+  const existing = await store.listCases('agent');
+  const result = buildWorkPlanCases({ sessions, existing, target, now: new Date() });
+  const test = result.cases.filter((c) => c.split === 'test').length;
+  console.log(`Work-plan sessions: ${sessions.length} with a work plan, ${result.eligible} eligible (last ${SAMPLE_WINDOW_DAYS} days, no evaluation users)`);
+  console.log(`Agent cases in store: ${existing.length}, of which ${result.alreadyStored} work-plan; target ${target}`);
+  console.log(`To create: ${result.cases.length} (test ${test}, dev ${result.cases.length - test})`);
+  if (!write) {
+    console.log('Dry run: nothing written (pass --write to create the cases in the store).');
+    return;
+  }
+  let created = 0;
+  let existed = 0;
+  for (const goldenCase of result.cases) {
+    if ((await store.createCase(goldenCase)) === 'created') created++;
+    else existed++;
+  }
+  console.log(`Wrote to ${store.tableName}: ${created} created, ${existed} already present (left unchanged).`);
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const store = goldenSetStoreFromEnv();
   if (args.write && !store.isProvisioned()) {
     console.error(`Refusing to write: ${GOLDEN_CASES_TABLE_ENV} is not set (golden-set store not provisioned, OPS-2 / ENG-2147).`);
     process.exit(1);
+  }
+  if (args.workPlanSessions !== undefined) {
+    await seedWorkPlanSessions(store, args.workPlanSessions, args.write);
+    return;
   }
 
   const fpCatalogue: FpCatalogue | undefined = args.fpCatalogue
