@@ -20,7 +20,7 @@ import type { MonthlyLlmUsageCredits } from "./llmUsageCreditService";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { isEvaluationUser } from "./evaluationPolicy";
-import { emailLeadIds, isEmailUniqueCreateEnabled, emailTxAllowed, tripEmailTxBreaker, type EmailLeadIds } from '../utils/emailLeadId';
+import { emailLeadIds, phoneLeadIds, isEmailUniqueCreateEnabled, emailTxAllowed, tripEmailTxBreaker, type EmailLeadIds } from '../utils/emailLeadId';
 import { phoneDedupeKey, PHONE_FANOUT_CAP } from '../utils/phoneLeadDedupe';
 import { isSmokeTestPhone } from '../utils/smokeTestLead';
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
@@ -6558,7 +6558,7 @@ export const crmDb = {
         : '';
       const phoneKeyIds: EmailLeadIds | null =
         leadData.phoneUniqueCreate && phoneKey && !leadData.leadId?.trim() && !emailKeyIds
-          ? emailLeadIds(listId, `phone:${phoneKey}`)
+          ? phoneLeadIds(listId, phoneKey)
           : null;
       let leadId = leadData.leadId?.trim() || emailKeyIds?.leadId || phoneKeyIds?.leadId || `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 

@@ -79,6 +79,8 @@ export interface BackfillOptions {
   listId?: string;
   /** writes per second when applying */
   rate: number;
+  /** pause after each scanned page, so the scan does not run flat out against the live table (0 = none) */
+  pageDelayMs?: number;
   sleep?: (ms: number) => Promise<void>;
   log?: (line: string) => void;
 }
@@ -150,6 +152,7 @@ export async function runPhoneKeyBackfill(ddb: any, opts: BackfillOptions): Prom
       await sleep(Math.ceil(1000 / Math.max(1, opts.rate)));
     }
     startKey = page.LastEvaluatedKey;
+    if (startKey && opts.pageDelayMs) await sleep(opts.pageDelayMs);
     log(`scanned ${summary.scanned} (eligible ${summary.eligible}, written ${summary.written})`);
   } while (startKey);
   summary.topLists = [...perList.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([listId, eligible]) => ({ listId, eligible }));
@@ -173,7 +176,7 @@ async function main(): Promise<void> {
   }
   const rate = Number(arg('rate') || 25);
   console.log(`${apply ? 'APPLY' : 'DRY RUN'} on ${tableName}${arg('list') ? ` (list ${arg('list')})` : ''}, ${apply ? `${rate} writes/s` : 'no writes'}`);
-  const summary = await runPhoneKeyBackfill(dynamodb, { tableName, apply, listId: arg('list'), rate, log: console.log });
+  const summary = await runPhoneKeyBackfill(dynamodb, { tableName, apply, listId: arg('list'), rate, pageDelayMs: 250, log: console.log });
   console.log(JSON.stringify(summary, null, 2));
 }
 
