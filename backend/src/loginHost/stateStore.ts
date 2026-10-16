@@ -10,7 +10,7 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "fs";
 import { join } from "path";
 
-export type ConnState = "attempting" | "active" | "disabled" | "needs_reconnect" | "needs_attention" | "revoking" | "revoked";
+export type ConnState = "attempting" | "swapping" | "active" | "disabled" | "needs_reconnect" | "needs_attention" | "revoking" | "revoked";
 
 export interface ConnRecord {
   connectionId: string;
@@ -24,7 +24,7 @@ export interface ConnRecord {
   /** Pending sign-in attempt for this connection, if any (one at a time). */
   attempt?: { loginRef: string; uid: number; attemptRef: string; startedAtMs: number; expiresAtMs: number; state: "pending" | "ready" };
   /** Uids/dirs awaiting wipe confirmation (cancelled or expired attempts, replaced homes). `kind` says what to wipe. */
-  wipePending?: Array<{ uid: number; ref: string; kind: "attempt" | "home" }>;
+  wipePending?: Array<{ uid: number; ref: string; kind: "attempt" | "home"; /** who owned the uid when it was queued; the uid is freed only while this still matches */ owner: string }>;
   /** Idempotency for promote: the login attempt that produced the current home. */
   promotedLoginRef?: string;
   /** Why the connection is in needs_attention / needs_reconnect (a code, never a message with secrets). */
@@ -68,7 +68,7 @@ export class StateStore {
   private readonly file: string;
   private readonly lockFile: string;
 
-  constructor(private readonly dir: string, private readonly pidAlive: (pid: number) => boolean = defaultPidAlive) {
+  constructor(private readonly dir: string, private readonly pidAlive: (pid: number, startTime?: string) => boolean = defaultPidAlive) {
     this.file = join(dir, "state.json");
     this.lockFile = join(dir, "host.lock");
   }
@@ -120,13 +120,14 @@ export class StateStore {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const fd = openSync(this.lockFile, "wx", 0o600); // O_EXCL: fails if it exists
-        writeSync(fd, String(process.pid));
+        writeSync(fd, `${process.pid}:${processStartTime(process.pid) ?? ""}`);
         this.fd = fd;
         return;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-        const holder = Number(safeRead(this.lockFile));
-        if (Number.isInteger(holder) && holder > 0 && this.pidAlive(holder)) throw new StateLockedError();
+        const [pidText, startTime] = safeRead(this.lockFile).split(":");
+        const holder = Number(pidText);
+        if (Number.isInteger(holder) && holder > 0 && this.pidAlive(holder, startTime || undefined)) throw new StateLockedError();
         rmSync(this.lockFile, { force: true }); // stale lock from a dead host
       }
     }
@@ -142,11 +143,26 @@ function safeRead(file: string): string {
   }
 }
 
-function defaultPidAlive(pid: number): boolean {
+/** Linux: the process's start time in clock ticks since boot (field 22 of /proc/<pid>/stat); undefined elsewhere. */
+export function processStartTime(pid: number): string | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+  } catch {
+    return undefined;
+  }
+}
+
+/** Alive means: the pid exists AND (when the lock recorded one) it started at the same time, so a recycled pid does not keep a dead host's lock. */
+function defaultPidAlive(pid: number, startTime?: string): boolean {
   try {
     process.kill(pid, 0);
-    return true;
   } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "EPERM";
+    if ((err as NodeJS.ErrnoException).code !== "EPERM") return false;
   }
+  if (startTime) {
+    const now = processStartTime(pid);
+    if (now !== undefined && now !== startTime) return false;
+  }
+  return true;
 }

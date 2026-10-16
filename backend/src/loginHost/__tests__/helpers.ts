@@ -32,7 +32,7 @@ export class FakeFs implements UserFsPort {
   wipes: string[] = [];
   residue = new Map<number, number>();
   failWipes = false;
-  writes: Array<{ uid: number; home: string; rel: string }> = [];
+  writes: Array<{ uid: number; home: string; kind: "attempt" | "home"; rel: string }> = [];
   /** Ordered log of destructive operations: kill:<uid>, wipe:<kind>:<uid>. */
   log: string[] = [];
 
@@ -51,14 +51,17 @@ export class FakeFs implements UserFsPort {
   async createAttemptDir(uid: number, ref: string): Promise<void> {
     this.dirs.add(`attempt:${uid}:${ref}`);
   }
+  /** When set, promoteAttempt waits for it: lets a test interleave other operations mid-promote. */
+  promoteGate?: Promise<void>;
   async promoteAttempt(uid: number, attemptRef: string, homeRef: string): Promise<void> {
+    if (this.promoteGate) await this.promoteGate;
     this.dirs.delete(`attempt:${uid}:${attemptRef}`);
     this.dirs.add(`home:${uid}:${homeRef}`);
   }
-  asUser(uid: number, homeRef: string): AsUser {
+  asUser(uid: number, homeRef: string, kind: "attempt" | "home"): AsUser {
     return {
       writeFile: async (rel: string) => {
-        this.writes.push({ uid, home: homeRef, rel });
+        this.writes.push({ uid, home: homeRef, kind, rel });
       },
     };
   }
@@ -128,6 +131,21 @@ export function makeRig(opts: { adapter?: FakeOptions; config?: Partial<ManagerC
     },
   };
   return rig;
+}
+
+/** Cross-checks the host's bookkeeping against the (fake) disk: no live directory on a free uid, no owned uid without a directory or a pending wipe. */
+export function assertConsistent(rig: Rig): void {
+  const st = rig.store.get();
+  const pendingUids = new Set<number>();
+  for (const c of Object.values(st.connections)) for (const w of c.wipePending ?? []) pendingUids.add(w.uid);
+  const dirUids = new Set([...rig.fs.dirs].map((d) => Number(d.split(":")[1])));
+  for (const uid of dirUids) {
+    if (st.uidOwners[String(uid)] === undefined) throw new Error(`a directory exists for uid ${uid}, which is marked free`);
+  }
+  for (const uid of Object.keys(st.uidOwners)) {
+    const n = Number(uid);
+    if (!dirUids.has(n) && !pendingUids.has(n)) throw new Error(`uid ${uid} is owned but has no directory and no pending wipe`);
+  }
 }
 
 export async function drain(events: AsyncIterable<ProviderEvent>): Promise<ProviderEvent[]> {

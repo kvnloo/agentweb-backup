@@ -41,6 +41,8 @@ export function describeAdapterConformance(name: string, make: () => Subscriptio
       const b = adapter.binary();
       expect(b.path.startsWith("/")).toBe(true);
       expect(b.version.length).toBeGreaterThan(0);
+      expect(b.digest.length).toBeGreaterThan(0);
+      expect(["mcp_direct", "host_relay"]).toContain(adapter.toolTransport);
     });
 
     it("implements exactly the sign-in methods its ceremony needs", () => {
@@ -60,10 +62,12 @@ export function describeAdapterConformance(name: string, make: () => Subscriptio
       await expect(adapter.loginCancel(proc)).resolves.toBeUndefined();
     });
 
-    it("preflight and authStatus return their documented shapes", async () => {
-      const pre = await adapter.preflight(ctxFor());
+    it("preflight (on the open session) and authStatus return their documented shapes", async () => {
+      const session = await adapter.openSession(ctxFor(), { connectionId: "conf1", epoch: 1 });
+      const pre = await session.preflight();
       expect(typeof pre.ok).toBe("boolean");
       if (!pre.ok) expect(ERROR_KINDS).toContain(pre.kind);
+      await session.close();
       const st = await adapter.authStatus(ctxFor());
       expect(typeof st.loggedIn).toBe("boolean");
       const hz = await adapter.hazards(ctxFor());
@@ -79,6 +83,7 @@ export function describeAdapterConformance(name: string, make: () => Subscriptio
       expect(events[events.length - 1].type).toBe("result");
       await expect(session.close()).resolves.toBeUndefined();
       await expect(session.close()).resolves.toBeUndefined();
+      await expect(session.closed).resolves.toBeUndefined(); // closing makes `closed` resolve
     });
 
     it("interrupt() stops a turn in flight", async () => {
@@ -86,7 +91,7 @@ export function describeAdapterConformance(name: string, make: () => Subscriptio
       const model = [...adapter.models][0];
       const it = session.turn({ turnId: "t2", prompt: "hi", model, bridgeToken: "bridge-token-0123456789" })[Symbol.asyncIterator]();
       await it.next();
-      await session.interrupt();
+      await session.interrupt("t2");
       const rest: ProviderEvent[] = [];
       for (let i = 0; i < 20; i++) {
         const n = await it.next();

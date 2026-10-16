@@ -6,16 +6,23 @@
  * knows nothing about any vendor CLI (adapters) and nothing about real uids or files (ports).
  *
  * Invariants (each has a test):
+ *  - Every operation that changes a connection runs under that connection's mutex, so a cancel,
+ *    sweep, revoke, disable or promote can never interleave with another on the same connection.
  *  - A request carrying an epoch older than the host's is refused (ESTALE). Fencing actions
- *    (disable, revoke, promote) may carry a NEWER epoch (the backend writes the new epoch to its
- *    record first, then tells the host) and the host adopts it; everything else needs equality.
- *  - A uid returns to the pool only after: processes killed, home/attempt wiped, residue scan = 0.
+ *    (disable, revoke) may carry a NEWER epoch (the backend writes the new epoch to its record
+ *    first, then tells the host) and the host adopts it; everything else needs equality.
+ *    A promote always needs a strictly newer epoch.
+ *  - A uid returns to the pool only after: processes killed, home/attempt wiped, residue scan = 0,
+ *    and only while the owner recorded with the wipe still owns it.
  *  - The host never opens a credential file: it only moves directories and asks adapters/ports.
- *  - A turn needs a backend-renewed lease (monotonic clock); a lapse ends the turn.
+ *  - The home is prepared (adapter lockdown config) BEFORE the sign-in runs, and no turn is
+ *    admitted while a connection is swapping homes.
+ *  - A turn needs a backend-renewed lease (monotonic clock); a lapse ends the turn, and a provider
+ *    that does not stop within the abort grace is closed and its uid's processes killed.
  *  - A retried idempotent request never runs a second turn.
  */
 import { createHash } from "crypto";
-import type { AdapterContext, EntitlementObservation, Hazard, ProviderEvent, ProviderSession, SubscriptionProviderAdapter, LoginProcess } from "./adapter";
+import type { Hazard, LoginProcess, ProviderEvent, ProviderSession, SubscriptionProviderAdapter } from "./adapter";
 import { HostError, type RouteInput } from "./protocol";
 import type { Clock, IdGen, Logger, UserFsPort } from "./ports";
 import { noopLogger } from "./ports";
@@ -27,10 +34,18 @@ export interface ManagerConfig {
   uidMax: number;
   /** A turn must be renewed within this window or the host ends it. */
   leaseMs: number;
+  /** After a turn is aborted the provider gets this long to stop; then its session is force-closed. */
+  abortGraceMs: number;
   /** Concurrent turns across all connections on this host. */
   maxTurnsPerHost: number;
+  /** Provider processes across all connections on this host. */
+  maxSessionsPerHost: number;
   /** Turn slots kept free for interactive turns: scheduled turns are admitted only below max - reserve. */
   scheduledReserve: number;
+  /** A session with no turn for this long is closed ("idle runtimes stop"). */
+  idleSessionMs: number;
+  /** A relayed tool call the backend does not answer within this window is answered with a failure. */
+  toolCallTimeoutMs: number;
   idempotencyTtlMs: number;
   /** Org-delivered settings (Claude Team/Enterprise) are refused unless the sandbox gate is enabled. */
   allowManagedSettings: boolean;
@@ -40,9 +55,13 @@ export const DEFAULT_CONFIG: ManagerConfig = {
   uidMin: 400_000,
   uidMax: 460_000,
   leaseMs: 30_000,
+  abortGraceMs: 5_000,
   maxTurnsPerHost: 12,
+  maxSessionsPerHost: 24,
   scheduledReserve: 2,
-  idempotencyTtlMs: 24 * 60 * 60 * 1000,
+  idleSessionMs: 10 * 60 * 1000,
+  toolCallTimeoutMs: 120_000,
+  idempotencyTtlMs: 6 * 60 * 60 * 1000,
   allowManagedSettings: false,
 };
 
@@ -58,9 +77,11 @@ export interface ManagerDeps {
 
 interface HostSession {
   provider: string;
+  connectionId: string;
   ready: Promise<ProviderSession>;
   turns: Set<string>;
   dead: boolean;
+  lastUsedMono: number;
 }
 
 interface RunningTurn {
@@ -71,10 +92,13 @@ interface RunningTurn {
   leaseUntilMono: number;
   deadlineMono?: number;
   priority: "interactive" | "scheduled";
-  /** Ends the turn. Safe at any moment, including before the session has finished opening: the reason is recorded first, the provider is interrupted once it can be. */
+  /** Relayed tool calls awaiting the backend's answer: operationId -> when it was issued (monotonic). */
+  operations: Map<string, number>;
+  /** Ends the turn. Safe at any moment, including before the session has finished opening. */
   abort: (reason: string) => void;
-  /** Set once the provider session exists. */
   onAbort?: () => void;
+  /** Called on the first abort; starts the grace timer that force-closes a provider that will not stop. */
+  onFirstAbort?: () => void;
   aborted?: string;
 }
 
@@ -96,18 +120,33 @@ export interface LoginReady {
 export interface TurnStarted {
   duplicate: boolean;
   turnId: string;
-  /** Present unless this was a duplicate of a request already accepted. */
   events?: AsyncIterable<ProviderEvent>;
-  /** For a duplicate: what is known about the earlier request. */
   status?: "running" | "finished" | "failed" | "aborted";
 }
 
-const FENCING_ACTIONS = new Set(["disable", "revoke", "promote"]);
+const FENCING_ACTIONS = new Set(["disable", "revoke"]);
+
+/** Runs async work one at a time per key, in arrival order. */
+class KeyedMutex {
+  private readonly tails = new Map<string, Promise<void>>();
+  run<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.tails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const tail = prev.then(() => gate);
+    this.tails.set(key, tail);
+    return prev.then(fn).finally(() => {
+      release();
+      if (this.tails.get(key) === tail) this.tails.delete(key);
+    });
+  }
+}
 
 export class ConnectionManager {
   private readonly cfg: ManagerConfig;
   private readonly log: Logger;
   private readonly uids: UidAllocator;
+  private readonly locks = new KeyedMutex();
   private readonly logins = new Map<string, { connectionId: string; proc: LoginProcess; provider: string }>();
   private readonly sessions = new Map<string, HostSession[]>();
   private readonly turns = new Map<string, RunningTurn>();
@@ -126,142 +165,173 @@ export class ConnectionManager {
     this.deps.store.save();
   }
 
+  private turnKey(connectionId: string, turnId: string): string {
+    return `${connectionId}/${turnId}`;
+  }
+
+  private locked<T>(connectionId: string, fn: () => Promise<T>): Promise<T> {
+    return this.locks.run(connectionId, fn);
+  }
+
   // ───────────────────────────── startup recovery ─────────────────────────────
 
-  /** After a host restart every turn that was running is gone (systemd killed the children). */
-  recover(): void {
+  /**
+   * After a host restart: processes started through systemd-run live OUTSIDE the host's cgroup and
+   * may still be running, so every allocated uid is killed before the host serves anything. Turns
+   * that were running are gone; sign-ins that were in flight can never complete.
+   */
+  async recover(): Promise<void> {
     const st = this.state();
+    for (const uid of Object.keys(st.uidOwners)) await this.deps.fs.killAll(Number(uid));
     for (const rec of Object.values(st.idempotency)) {
       const outcome = rec.outcome as { status?: string } | undefined;
       if (outcome?.status === "running") outcome.status = "aborted";
     }
-    // A sign-in process died with the host: its attempt can never complete.
     for (const c of Object.values(st.connections)) {
-      if (c.attempt && !this.logins.has(c.attempt.loginRef)) this.expireAttempt(c, "host_restart");
+      if (c.state === "swapping") {
+        c.state = "needs_attention";
+        c.reason = "swap_interrupted";
+      }
+      if (c.attempt && !this.logins.has(c.attempt.loginRef)) await this.discardAttempt(c, "host_restart");
     }
     this.save();
   }
 
   // ───────────────────────────── sign-in ─────────────────────────────
 
-  async loginStart(req: RouteInput<"login.start">): Promise<LoginStartResult> {
-    const adapter = this.adapter(req.provider);
-    const st = this.state();
-    let c = st.connections[req.connectionId];
-    if (c) {
-      if (c.provider !== req.provider) throw new HostError("EINVALID", "provider_mismatch");
-      if (c.state === "revoking" || c.state === "revoked") throw new HostError("ESTATE", "revoked");
-      if (!req.reconnect && c.state !== "attempting") throw new HostError("ESTATE", "exists_use_reconnect");
-      this.expireStaleAttempt(c);
-      if (c.attempt) throw new HostError("ESTATE", "login_pending");
-    } else {
-      if (req.reconnect) throw new HostError("ENOTFOUND");
+  loginStart(req: RouteInput<"login.start">): Promise<LoginStartResult> {
+    return this.locked(req.connectionId, async () => {
+      const adapter = this.adapter(req.provider);
+      const st = this.state();
+      let c = st.connections[req.connectionId];
+      if (c) {
+        if (c.provider !== req.provider) throw new HostError("EINVALID", "provider_mismatch");
+        if (c.state === "revoking" || c.state === "revoked") throw new HostError("ESTATE", "revoked");
+        if (c.state === "swapping") throw new HostError("ESTATE", "swapping");
+        if (!req.reconnect && c.state !== "attempting") throw new HostError("ESTATE", "exists_use_reconnect");
+        await this.expireStaleAttempt(c);
+        if (c.attempt) throw new HostError("ESTATE", "login_pending");
+      } else {
+        if (req.reconnect) throw new HostError("ENOTFOUND");
+        const now = this.deps.clock.nowMs();
+        c = { connectionId: req.connectionId, provider: req.provider, uid: -1, homeRef: "", epoch: 0, state: "attempting", createdAtMs: now, updatedAtMs: now };
+        st.connections[req.connectionId] = c;
+      }
+      const attemptRef = this.deps.ids.next("att");
+      const loginRef = this.deps.ids.next("login");
+      const owner = `attempt:${attemptRef}`;
+      const uid = this.uids.allocate(owner);
       const now = this.deps.clock.nowMs();
-      c = { connectionId: req.connectionId, provider: req.provider, uid: -1, homeRef: "", epoch: 0, state: "attempting", createdAtMs: now, updatedAtMs: now };
-      st.connections[req.connectionId] = c;
-    }
-    const attemptRef = this.deps.ids.next("att");
-    const loginRef = this.deps.ids.next("login");
-    const uid = this.uids.allocate(`attempt:${attemptRef}`);
-    const now = this.deps.clock.nowMs();
-    c.attempt = { loginRef, uid, attemptRef, startedAtMs: now, expiresAtMs: now + adapter.loginTtlMs, state: "pending" };
-    this.save();
-    try {
-      await this.deps.fs.createAttemptDir(uid, attemptRef);
-      const ctx = this.deps.fs.contextFor(req.connectionId, uid, attemptRef, "attempt");
-      const proc = await adapter.loginStart(ctx);
-      this.logins.set(loginRef, { connectionId: req.connectionId, proc, provider: req.provider });
-      return { loginRef, ceremony: adapter.ceremony, url: proc.data.url, ...(proc.data.userCode ? { userCode: proc.data.userCode } : {}), expiresAtMs: c.attempt.expiresAtMs };
-    } catch (err) {
-      await this.discardAttempt(c, "start_failed");
-      this.log.warn("login_start_failed", { connectionId: req.connectionId, code: errCode(err) });
-      throw err instanceof HostError ? err : new HostError("EINTERNAL", "login_start_failed");
-    }
+      c.attempt = { loginRef, uid, attemptRef, startedAtMs: now, expiresAtMs: now + adapter.loginTtlMs, state: "pending" };
+      this.save();
+      try {
+        await this.deps.fs.createAttemptDir(uid, attemptRef);
+        const ctx = this.deps.fs.contextFor(req.connectionId, uid, attemptRef, "attempt");
+        // The lockdown configuration must exist before the CLI runs for the first time (Codex: file credential store, no tools).
+        await adapter.prepareHome(this.deps.fs.asUser(uid, attemptRef, "attempt"), ctx);
+        const proc = await adapter.loginStart(ctx);
+        this.logins.set(loginRef, { connectionId: req.connectionId, proc, provider: req.provider });
+        return { loginRef, ceremony: adapter.ceremony, url: proc.data.url, ...(proc.data.userCode ? { userCode: proc.data.userCode } : {}), expiresAtMs: c.attempt.expiresAtMs };
+      } catch (err) {
+        await this.discardAttempt(c, "start_failed");
+        this.log.warn("login_start_failed", { connectionId: req.connectionId, code: errCode(err) });
+        throw err instanceof HostError ? err : new HostError("EINTERNAL", "login_start_failed");
+      }
+    });
   }
 
-  async loginComplete(req: RouteInput<"login.complete">): Promise<LoginReady> {
-    const { c, login } = this.requireAttempt(req.connectionId, req.loginRef);
-    const adapter = this.adapter(login.provider);
-    if (adapter.ceremony !== "paste_code" || !adapter.loginComplete) throw new HostError("ESTATE", "ceremony_not_paste_code");
-    try {
-      await adapter.loginComplete(login.proc, req.code);
-    } catch (err) {
-      await this.discardAttempt(c, "code_rejected");
-      this.log.warn("login_complete_failed", { connectionId: req.connectionId, code: errCode(err) });
-      throw new HostError("EINVALID", "code_rejected");
-    }
-    return this.finishAttempt(c, adapter);
+  loginComplete(req: RouteInput<"login.complete">): Promise<LoginReady> {
+    return this.locked(req.connectionId, async () => {
+      const { c, login } = await this.requireAttempt(req.connectionId, req.loginRef);
+      const adapter = this.adapter(login.provider);
+      if (adapter.ceremony !== "paste_code" || !adapter.loginComplete) throw new HostError("ESTATE", "ceremony_not_paste_code");
+      try {
+        await adapter.loginComplete(login.proc, req.code);
+      } catch (err) {
+        await this.discardAttempt(c, "code_rejected");
+        this.log.warn("login_complete_failed", { connectionId: req.connectionId, code: errCode(err) });
+        throw new HostError("EINVALID", "code_rejected");
+      }
+      return this.finishAttempt(c, adapter, login.proc);
+    });
   }
 
-  async loginStatus(req: RouteInput<"login.status">): Promise<{ status: "pending" | "failed" } | LoginReady> {
-    const { c, login } = this.requireAttempt(req.connectionId, req.loginRef);
-    const adapter = this.adapter(login.provider);
-    if (c.attempt?.state === "ready") return this.readyInfo(c, adapter);
-    if (adapter.ceremony !== "device_code" || !adapter.loginPoll) throw new HostError("ESTATE", "ceremony_not_device_code");
-    const polled = await adapter.loginPoll(login.proc);
-    if (polled === "pending") return { status: "pending" };
-    if (polled === "failed") {
-      await this.discardAttempt(c, "login_failed");
-      return { status: "failed" };
-    }
-    return this.finishAttempt(c, adapter);
+  loginStatus(req: RouteInput<"login.status">): Promise<{ status: "pending" | "failed" } | LoginReady> {
+    return this.locked(req.connectionId, async () => {
+      const { c, login } = await this.requireAttempt(req.connectionId, req.loginRef);
+      const adapter = this.adapter(login.provider);
+      if (c.attempt?.state === "ready") return this.readyInfo(c, adapter);
+      if (adapter.ceremony !== "device_code" || !adapter.loginPoll) throw new HostError("ESTATE", "ceremony_not_device_code");
+      const polled = await adapter.loginPoll(login.proc);
+      if (polled === "pending") return { status: "pending" as const };
+      if (polled === "failed") {
+        await this.discardAttempt(c, "login_failed");
+        return { status: "failed" as const };
+      }
+      return this.finishAttempt(c, adapter, login.proc);
+    });
   }
 
-  async loginCancel(req: RouteInput<"login.cancel">): Promise<{ cancelled: true }> {
-    const c = this.state().connections[req.connectionId];
-    if (!c?.attempt || c.attempt.loginRef !== req.loginRef) return { cancelled: true }; // already gone: idempotent
-    await this.discardAttempt(c, "cancelled");
-    return { cancelled: true };
+  loginCancel(req: RouteInput<"login.cancel">): Promise<{ cancelled: true }> {
+    return this.locked(req.connectionId, async () => {
+      const c = this.state().connections[req.connectionId];
+      if (c?.attempt && c.attempt.loginRef === req.loginRef) await this.discardAttempt(c, "cancelled");
+      return { cancelled: true as const }; // already gone: idempotent
+    });
   }
 
   /** Phase 3: the backend has created its record at `epoch`; make the attempt the connection's home. */
-  async loginPromote(req: RouteInput<"login.promote">): Promise<{ state: "active"; epoch: number }> {
-    const c = this.state().connections[req.connectionId];
-    if (!c) throw new HostError("ENOTFOUND");
-    if (c.promotedLoginRef === req.loginRef && c.epoch === req.epoch && c.state === "active") return { state: "active", epoch: c.epoch }; // retry
-    if (!c.attempt || c.attempt.loginRef !== req.loginRef || c.attempt.state !== "ready") throw new HostError("ENOTFOUND");
-    if (req.epoch < c.epoch) throw new HostError("ESTALE");
-    if (c.state === "revoking" || c.state === "revoked") throw new HostError("ESTATE", "revoked");
-    const attempt = c.attempt;
-    const adapter = this.adapter(c.provider);
-    const previous = c.uid >= 0 && c.homeRef ? { uid: c.uid, ref: c.homeRef } : undefined;
+  loginPromote(req: RouteInput<"login.promote">): Promise<{ state: "active"; epoch: number }> {
+    return this.locked(req.connectionId, async () => {
+      const c = this.state().connections[req.connectionId];
+      if (!c) throw new HostError("ENOTFOUND");
+      if (c.promotedLoginRef === req.loginRef && c.epoch === req.epoch && c.state === "active") return { state: "active" as const, epoch: c.epoch }; // retry
+      if (!c.attempt || c.attempt.loginRef !== req.loginRef || c.attempt.state !== "ready") throw new HostError("ENOTFOUND");
+      if (req.epoch <= c.epoch) throw new HostError("ESTALE"); // a home swap always needs a newer epoch
+      if (c.state === "revoking" || c.state === "revoked") throw new HostError("ESTATE", "revoked");
+      const attempt = c.attempt;
+      const previous = c.uid >= 0 && c.homeRef ? { uid: c.uid, ref: c.homeRef, owner: c.connectionId } : undefined;
+      const wasDisabled = c.state === "disabled"; // a reconnect must not silently re-enable a disabled connection
 
-    // Fence the old home first: new epoch recorded, every process of the old login stopped.
-    c.epoch = req.epoch;
-    c.updatedAtMs = this.deps.clock.nowMs();
-    this.save();
-    await this.terminateConnection(c, "reconnect");
-
-    const homeRef = this.deps.ids.next("home");
-    await this.deps.fs.promoteAttempt(attempt.uid, attempt.attemptRef, homeRef);
-    this.uids.transfer(attempt.uid, `attempt:${attempt.attemptRef}`, c.connectionId);
-    c.uid = attempt.uid;
-    c.homeRef = homeRef;
-    c.promotedLoginRef = attempt.loginRef;
-    c.state = "active";
-    c.reason = undefined;
-    c.signedInAtMs = this.deps.clock.nowMs();
-    delete c.attempt;
-    delete c.cleanupConfirmedAtMs;
-    if (previous) (c.wipePending ??= []).push({ ...previous, kind: "home" });
-    this.logins.delete(attempt.loginRef);
-    this.save();
-    try {
-      const ctx = this.deps.fs.contextFor(c.connectionId, c.uid, c.homeRef, "home");
-      await adapter.prepareHome(this.deps.fs.asUser(c.uid, c.homeRef), ctx);
-    } catch (err) {
-      this.log.warn("prepare_home_failed", { connectionId: c.connectionId, code: errCode(err) });
-      c.state = "needs_attention";
-      c.reason = "prepare_home_failed";
+      // Fence the old home first: new epoch recorded, no turn admitted while swapping, every process of the old login stopped.
+      c.epoch = req.epoch;
+      c.state = "swapping";
+      c.updatedAtMs = this.deps.clock.nowMs();
       this.save();
-      throw new HostError("EINTERNAL", "prepare_home_failed");
-    }
-    return { state: "active", epoch: c.epoch };
+      await this.terminateConnection(c, "reconnect");
+
+      const homeRef = this.deps.ids.next("home");
+      try {
+        await this.deps.fs.promoteAttempt(attempt.uid, attempt.attemptRef, homeRef);
+        this.uids.transfer(attempt.uid, `attempt:${attempt.attemptRef}`, c.connectionId);
+      } catch (err) {
+        c.state = "needs_attention";
+        c.reason = "promote_failed";
+        this.save();
+        this.log.warn("promote_failed", { connectionId: c.connectionId, code: errCode(err) });
+        throw new HostError("EINTERNAL", "promote_failed");
+      }
+      c.uid = attempt.uid;
+      c.homeRef = homeRef;
+      c.promotedLoginRef = attempt.loginRef;
+      c.reason = undefined;
+      c.signedInAtMs = this.deps.clock.nowMs();
+      delete c.attempt;
+      delete c.cleanupConfirmedAtMs;
+      if (previous) (c.wipePending ??= []).push({ ...previous, kind: "home" });
+      this.logins.delete(attempt.loginRef);
+      c.state = wasDisabled ? "disabled" : "active"; // only now may turns be admitted
+      this.save();
+      return { state: "active" as const, epoch: c.epoch };
+    });
   }
 
   // ───────────────────────────── turns ─────────────────────────────
 
   async runTurn(req: RouteInput<"turn.run">): Promise<TurnStarted> {
+    // Admission is synchronous up to the point where its slots are reserved (no await before `turns.set`),
+    // so concurrent requests cannot exceed the caps. State changes that must stop admission set the
+    // connection state synchronously before their first await.
     const st = this.state();
     const key = `turn:${req.connectionId}:${req.idempotencyKey}`;
     const hash = hashOf({ c: req.connectionId, e: req.epoch, t: req.turnId, p: req.prompt, m: req.model, pr: req.priority ?? "interactive" });
@@ -276,28 +346,34 @@ export class ConnectionManager {
     if (c.state !== "active") throw new HostError("ESTATE", c.state);
     const adapter = this.adapter(c.provider);
     if (!adapter.models.has(req.model)) throw new HostError("EINVALID", "model_not_allowed");
-    if (this.turns.has(req.turnId)) throw new HostError("EEXISTS");
+    const tkey = this.turnKey(c.connectionId, req.turnId);
+    if (this.turns.has(tkey)) throw new HostError("EEXISTS");
 
-    // Admission: host-wide, scheduled turns leave room for interactive ones.
     const priority = req.priority ?? "interactive";
     const hostLimit = priority === "scheduled" ? this.cfg.maxTurnsPerHost - this.cfg.scheduledReserve : this.cfg.maxTurnsPerHost;
     if (this.turns.size >= hostLimit) throw new HostError("EBUSY", "host_busy");
 
-    // Reserve a session slot synchronously (before any await) so concurrent requests cannot exceed the caps.
     const list = this.sessions.get(c.connectionId) ?? [];
     this.sessions.set(c.connectionId, list);
+    const nowMono = this.deps.clock.monotonicMs();
     let hs = list.find((s) => !s.dead && s.turns.size < adapter.maxTurnsPerProcess);
     if (!hs) {
       if (list.filter((s) => !s.dead).length >= adapter.maxProcessesPerHome) throw new HostError("EBUSY", "connection_busy");
+      if (this.liveSessionCount() >= this.cfg.maxSessionsPerHost) throw new HostError("EBUSY", "host_busy");
       const ctx = this.deps.fs.contextFor(c.connectionId, c.uid, c.homeRef, "home");
-      hs = { provider: c.provider, turns: new Set(), dead: false, ready: undefined as unknown as Promise<ProviderSession> };
-      hs.ready = adapter.openSession(ctx, { connectionId: c.connectionId, epoch: c.epoch });
-      list.push(hs);
+      const fresh: HostSession = { provider: c.provider, connectionId: c.connectionId, turns: new Set(), dead: false, lastUsedMono: nowMono, ready: undefined as unknown as Promise<ProviderSession> };
+      fresh.ready = adapter.openSession(ctx, { connectionId: c.connectionId, epoch: c.epoch });
+      void fresh.ready.then(
+        (ps) => void ps.closed.then(() => this.retireSession(fresh)),
+        () => this.retireSession(fresh),
+      );
+      list.push(fresh);
+      hs = fresh;
     }
     const session = hs;
     session.turns.add(req.turnId);
+    session.lastUsedMono = nowMono;
 
-    const nowMono = this.deps.clock.monotonicMs();
     const running: RunningTurn = {
       connectionId: c.connectionId,
       epoch: c.epoch,
@@ -306,26 +382,28 @@ export class ConnectionManager {
       leaseUntilMono: nowMono + this.cfg.leaseMs,
       ...(req.deadlineMs ? { deadlineMono: nowMono + req.deadlineMs } : {}),
       priority,
+      operations: new Map(),
       abort: (reason: string) => {
+        const first = running.aborted === undefined;
         running.aborted ??= reason;
         running.onAbort?.();
+        if (first) running.onFirstAbort?.();
       },
     };
-    this.turns.set(req.turnId, running);
+    this.turns.set(tkey, running);
     st.idempotency[key] = { requestHash: hash, outcome: { turnId: req.turnId, status: "running" }, atMs: this.deps.clock.nowMs() };
     this.save();
 
     const finish = (status: "finished" | "failed" | "aborted") => {
-      this.turns.delete(req.turnId);
+      this.turns.delete(tkey);
       session.turns.delete(req.turnId);
+      session.lastUsedMono = this.deps.clock.monotonicMs();
       const rec = this.state().idempotency[key];
       if (rec) (rec.outcome as { status: string }).status = status;
       this.save();
     };
 
-    const events = this.streamTurn(c, adapter, session, running, req, finish);
-
-    return { duplicate: false, turnId: req.turnId, events };
+    return { duplicate: false, turnId: req.turnId, events: this.streamTurn(c, adapter, session, running, req, finish) };
   }
 
   /** Runs one turn against its provider session and cleans up when the consumer is done (or stops listening). */
@@ -338,35 +416,52 @@ export class ConnectionManager {
     finish: (status: "finished" | "failed" | "aborted") => void,
   ): AsyncGenerator<ProviderEvent> {
     let status: "finished" | "failed" | "aborted" = "failed";
+    // After an abort the provider gets abortGraceMs to stop; this promise resolves "hung" if it does not.
+    let graceTimer: NodeJS.Timeout | undefined;
+    const hung = new Promise<"hung">((resolve) => {
+      running.onFirstAbort = () => {
+        graceTimer = setTimeout(() => resolve("hung"), this.cfg.abortGraceMs);
+      };
+      if (running.aborted !== undefined) running.onFirstAbort();
+    });
+    let iterator: AsyncIterator<ProviderEvent> | undefined;
     try {
-      let providerSession: ProviderSession;
-      try {
-        providerSession = await session.ready;
-      } catch (err) {
+      const opened = await Promise.race([session.ready.then((s) => ({ s }), (e: unknown) => ({ e })), hung]);
+      if (opened === "hung") return yield* this.abandonHung(c, session, running, () => (status = "aborted"));
+      if ("e" in opened) {
         session.dead = true;
-        yield { type: "result", ok: false, text: "", errorKind: adapter.mapError(err) };
+        yield { type: "result", ok: false, text: "", errorKind: adapter.mapError(opened.e) };
         return;
       }
-      running.onAbort = () => void providerSession.interrupt().catch(() => undefined);
+      const providerSession = opened.s;
+      running.onAbort = () => void providerSession.interrupt(req.turnId).catch(() => undefined);
       if (running.aborted) {
         status = "aborted";
         yield { type: "result", ok: false, text: "", aborted: running.aborted };
         return;
       }
-      const pre = await adapter.preflight(this.deps.fs.contextFor(c.connectionId, c.uid, c.homeRef, "home"));
+      const pre = await Promise.race([providerSession.preflight(), hung]);
+      if (pre === "hung") return yield* this.abandonHung(c, session, running, () => (status = "aborted"));
       if (!pre.ok) {
-        if (pre.kind === "auth_dead") this.markNeedsReconnect(c, "auth_dead");
+        if (pre.kind === "auth_dead") await this.locked(c.connectionId, async () => this.markNeedsReconnect(c, "auth_dead"));
         yield { type: "result", ok: false, text: "", errorKind: pre.kind };
         return;
       }
-      for await (const ev of providerSession.turn({ turnId: req.turnId, prompt: req.prompt, model: req.model, bridgeToken: req.bridgeToken })) {
+      iterator = providerSession.turn({ turnId: req.turnId, prompt: req.prompt, model: req.model, bridgeToken: req.bridgeToken })[Symbol.asyncIterator]();
+      for (;;) {
+        const next = await Promise.race([iterator.next(), hung]);
+        if (next === "hung") return yield* this.abandonHung(c, session, running, () => (status = "aborted"));
+        if (next.done) break;
+        const ev = next.value;
         if (running.aborted) break;
         if (ev.type === "alarm") {
-          await this.raiseAlarm(c, ev.hazard);
-          running.aborted = "alarm";
+          await this.locked(c.connectionId, () => this.raiseAlarm(c, ev.hazard));
+          running.aborted ??= "alarm";
           yield ev;
           break;
         }
+        if (ev.type === "tool-use" && adapter.toolTransport === "host_relay") running.operations.set(ev.operationId, this.deps.clock.monotonicMs());
+        if (ev.type === "tool-result") running.operations.delete(ev.operationId);
         yield ev;
         if (ev.type === "result") {
           status = ev.ok ? "finished" : "failed";
@@ -378,8 +473,24 @@ export class ConnectionManager {
     } catch (err) {
       yield { type: "result", ok: false, text: "", errorKind: adapter.mapError(err) };
     } finally {
+      if (graceTimer) clearTimeout(graceTimer);
+      void iterator?.return?.().catch(() => undefined);
       finish(running.aborted ? "aborted" : status);
     }
+  }
+
+  /** The provider did not stop after an abort: close its session, kill the uid's processes, report the abort. */
+  private async *abandonHung(c: ConnRecord, session: HostSession, running: RunningTurn, mark: () => void): AsyncGenerator<ProviderEvent, void> {
+    mark();
+    this.retireSession(session);
+    void session.ready.then((s) => s.close()).catch(() => undefined);
+    try {
+      await this.deps.fs.killAll(c.uid);
+    } catch {
+      /* the sweeper retries */
+    }
+    this.log.warn("provider_hung", { connectionId: c.connectionId });
+    yield { type: "result", ok: false, text: "", aborted: running.aborted ?? "hung" };
   }
 
   renewLease(req: RouteInput<"turn.renew">): { leaseMs: number } {
@@ -396,60 +507,83 @@ export class ConnectionManager {
     return { interrupted: true };
   }
 
+  /** The backend's answer to a relayed tool call; the operation must be one this turn issued and not yet answered. */
   async turnToolResult(req: RouteInput<"turn.toolResult">): Promise<{ ok: true }> {
     const t = this.requireTurn(req.connectionId, req.turnId);
     this.requireEpochNumber(t.epoch, req.epoch);
+    if (!t.operations.delete(req.operationId)) throw new HostError("ENOTFOUND");
     const session = await t.hs.ready;
     session.answer(req.operationId, { kind: "tool-result", ok: req.ok, content: req.content });
     return { ok: true };
   }
 
   /** Ends a turn from inside the host (the caller's stream dropped). Unknown turns are ignored. */
-  abortTurn(turnId: string, reason: string): void {
-    this.turns.get(turnId)?.abort(reason);
+  abortTurn(connectionId: string, turnId: string, reason: string): void {
+    this.turns.get(this.turnKey(connectionId, turnId))?.abort(reason);
   }
 
-  /** Called periodically: ends turns whose lease lapsed or whose deadline passed. */
+  /** Called periodically: ends turns whose lease lapsed or whose deadline passed, times out relayed tool calls, retires idle sessions. */
   tick(): void {
     const mono = this.deps.clock.monotonicMs();
     for (const t of [...this.turns.values()]) {
-      if (t.aborted) continue;
-      if (mono > t.leaseUntilMono) t.abort("lease_lapsed");
-      else if (t.deadlineMono !== undefined && mono > t.deadlineMono) t.abort("deadline");
+      if (!t.aborted) {
+        if (mono > t.leaseUntilMono) t.abort("lease_lapsed");
+        else if (t.deadlineMono !== undefined && mono > t.deadlineMono) t.abort("deadline");
+      }
+      for (const [op, issuedAt] of [...t.operations]) {
+        if (mono - issuedAt > this.cfg.toolCallTimeoutMs) {
+          t.operations.delete(op);
+          void t.hs.ready.then((s) => s.answer(op, { kind: "tool-result", ok: false, content: "tool_call_timeout" })).catch(() => undefined);
+        }
+      }
+    }
+    for (const list of [...this.sessions.values()]) {
+      for (const hs of [...list]) {
+        if (!hs.dead && hs.turns.size === 0 && mono - hs.lastUsedMono > this.cfg.idleSessionMs) {
+          this.retireSession(hs);
+          void hs.ready.then((s) => s.close()).catch(() => undefined);
+        }
+      }
     }
   }
 
   // ───────────────────────────── connection actions ─────────────────────────────
 
-  async disable(req: RouteInput<"connection.disable">): Promise<{ state: string; epoch: number }> {
-    const c = this.requireConn(req.connectionId);
-    this.adoptEpoch(c, req.epoch, "disable");
-    if (c.state === "revoking" || c.state === "revoked") throw new HostError("ESTATE", c.state);
-    if (c.state === "active" || c.state === "needs_attention") c.state = "disabled";
-    this.save();
-    await this.terminateConnection(c, "disabled");
-    return { state: c.state, epoch: c.epoch };
+  disable(req: RouteInput<"connection.disable">): Promise<{ state: string; epoch: number }> {
+    return this.locked(req.connectionId, async () => {
+      const c = this.requireConn(req.connectionId);
+      if (c.state === "revoking" || c.state === "revoked") throw new HostError("ESTATE", c.state);
+      this.adoptEpoch(c, req.epoch, "disable");
+      if (c.state === "active" || c.state === "needs_attention") c.state = "disabled";
+      this.save();
+      await this.terminateConnection(c, "disabled");
+      return { state: c.state, epoch: c.epoch };
+    });
   }
 
-  enable(req: RouteInput<"connection.enable">): { state: string; epoch: number } {
-    const c = this.requireConn(req.connectionId);
-    this.requireEpoch(c, req.epoch);
-    if (c.state !== "disabled") throw new HostError("ESTATE", c.state);
-    c.state = "active";
-    this.save();
-    return { state: c.state, epoch: c.epoch };
+  enable(req: RouteInput<"connection.enable">): Promise<{ state: string; epoch: number }> {
+    return this.locked(req.connectionId, async () => {
+      const c = this.requireConn(req.connectionId);
+      this.requireEpoch(c, req.epoch);
+      if (c.state !== "disabled") throw new HostError("ESTATE", c.state);
+      c.state = "active";
+      this.save();
+      return { state: c.state, epoch: c.epoch };
+    });
   }
 
   /** Idempotent. Returns once the connection is `revoking`; cleanup completes now or in a later sweep. */
-  async revoke(req: RouteInput<"connection.revoke">): Promise<{ state: string; epoch: number; cleanupConfirmed: boolean }> {
-    const c = this.requireConn(req.connectionId);
-    if (c.state === "revoked") return { state: "revoked", epoch: c.epoch, cleanupConfirmed: c.cleanupConfirmedAtMs !== undefined };
-    this.adoptEpoch(c, req.epoch, "revoke");
-    c.state = "revoking";
-    c.updatedAtMs = this.deps.clock.nowMs();
-    this.save();
-    await this.cleanupRevoking(c);
-    return { state: c.state, epoch: c.epoch, cleanupConfirmed: c.cleanupConfirmedAtMs !== undefined };
+  revoke(req: RouteInput<"connection.revoke">): Promise<{ state: string; epoch: number; cleanupConfirmed: boolean }> {
+    return this.locked(req.connectionId, async () => {
+      const c = this.requireConn(req.connectionId);
+      if (c.state === "revoked") return { state: "revoked", epoch: c.epoch, cleanupConfirmed: c.cleanupConfirmedAtMs !== undefined };
+      this.adoptEpoch(c, req.epoch, "revoke");
+      c.state = "revoking"; // set before any await: no new turn is admitted from here on
+      c.updatedAtMs = this.deps.clock.nowMs();
+      this.save();
+      await this.cleanupRevoking(c);
+      return { state: c.state, epoch: c.epoch, cleanupConfirmed: c.cleanupConfirmedAtMs !== undefined };
+    });
   }
 
   status(req: RouteInput<"connection.status">): { state: string; epoch: number; runningTurns: number; planLabel?: string; reason?: string } {
@@ -462,13 +596,17 @@ export class ConnectionManager {
 
   /** Expire attempts, retry wipes, finish revokes, free uids that are provably clean, prune idempotency. */
   async sweep(): Promise<void> {
-    const st = this.state();
-    for (const c of Object.values(st.connections)) {
-      this.expireStaleAttempt(c);
-      if (c.state === "revoking") await this.cleanupRevoking(c);
-      await this.drainWipes(c);
-      if (c.state === "attempting" && !c.attempt && !(c.wipePending?.length)) delete st.connections[c.connectionId]; // abandoned first sign-in
+    for (const id of Object.keys(this.state().connections)) {
+      await this.locked(id, async () => {
+        const c = this.state().connections[id];
+        if (!c) return;
+        await this.expireStaleAttempt(c);
+        if (c.state === "revoking") await this.cleanupRevoking(c);
+        await this.drainWipes(c);
+        if (c.state === "attempting" && !c.attempt && !c.wipePending?.length) delete this.state().connections[id]; // abandoned first sign-in
+      });
     }
+    const st = this.state();
     const now = this.deps.clock.nowMs();
     for (const [k, rec] of Object.entries(st.idempotency)) {
       if (now - rec.atMs > this.cfg.idempotencyTtlMs && (rec.outcome as { status?: string }).status !== "running") delete st.idempotency[k];
@@ -506,30 +644,45 @@ export class ConnectionManager {
   }
 
   private requireTurn(connectionId: string, turnId: string): RunningTurn {
-    const t = this.turns.get(turnId);
-    if (!t || t.connectionId !== connectionId) throw new HostError("ENOTFOUND");
+    const t = this.turns.get(this.turnKey(connectionId, turnId));
+    if (!t) throw new HostError("ENOTFOUND");
     return t;
   }
 
-  private requireAttempt(connectionId: string, loginRef: string): { c: ConnRecord; login: { connectionId: string; proc: LoginProcess; provider: string } } {
+  private liveSessionCount(): number {
+    let n = 0;
+    for (const list of this.sessions.values()) n += list.filter((s) => !s.dead).length;
+    return n;
+  }
+
+  private retireSession(hs: HostSession): void {
+    hs.dead = true;
+    const list = this.sessions.get(hs.connectionId);
+    if (!list) return;
+    const i = list.indexOf(hs);
+    if (i >= 0) list.splice(i, 1);
+    if (!list.length) this.sessions.delete(hs.connectionId);
+  }
+
+  private async requireAttempt(connectionId: string, loginRef: string): Promise<{ c: ConnRecord; login: { connectionId: string; proc: LoginProcess; provider: string } }> {
     const c = this.state().connections[connectionId];
     const login = this.logins.get(loginRef);
     // Unknown, expired and "not yours" all answer the same.
     if (!c || !c.attempt || c.attempt.loginRef !== loginRef || !login || login.connectionId !== connectionId) throw new HostError("ENOTFOUND");
     if (this.deps.clock.nowMs() > c.attempt.expiresAtMs) {
-      void this.discardAttempt(c, "expired");
+      await this.discardAttempt(c, "expired");
       throw new HostError("ENOTFOUND");
     }
     return { c, login };
   }
 
-  private async finishAttempt(c: ConnRecord, adapter: SubscriptionProviderAdapter): Promise<LoginReady> {
+  private async finishAttempt(c: ConnRecord, adapter: SubscriptionProviderAdapter, proc: LoginProcess): Promise<LoginReady> {
     const attempt = c.attempt!;
     const ctx = this.deps.fs.contextFor(c.connectionId, attempt.uid, attempt.attemptRef, "attempt");
     let status;
     let hazards: Hazard[];
     try {
-      status = await adapter.authStatus(ctx);
+      status = await adapter.authStatus(ctx, proc);
       hazards = await adapter.hazards(ctx);
     } catch {
       await this.discardAttempt(c, "status_failed");
@@ -552,25 +705,20 @@ export class ConnectionManager {
   }
 
   private readyInfo(c: ConnRecord, adapter: SubscriptionProviderAdapter): LoginReady {
-    const now = this.deps.clock.nowMs();
-    const expiry = adapter.expiryModel(now);
+    const expiry = adapter.expiryModel(this.deps.clock.nowMs());
     return { status: "ready", ...(c.planLabel ? { planLabel: c.planLabel } : {}), ...(c.accountFingerprint ? { accountFingerprint: c.accountFingerprint } : {}), ...(expiry?.refreshExpiresAtMs ? { refreshExpiresAtMs: expiry.refreshExpiresAtMs } : {}) };
   }
 
-  private expireStaleAttempt(c: ConnRecord): void {
-    if (c.attempt && this.deps.clock.nowMs() > c.attempt.expiresAtMs) this.expireAttempt(c, "expired");
+  private async expireStaleAttempt(c: ConnRecord): Promise<void> {
+    if (c.attempt && this.deps.clock.nowMs() > c.attempt.expiresAtMs) await this.discardAttempt(c, "expired");
   }
 
-  /** Marks the attempt for discard (sync) and starts the wipe; the uid is freed only after a confirmed clean wipe. */
-  private expireAttempt(c: ConnRecord, reason: string): void {
-    void this.discardAttempt(c, reason);
-  }
-
+  /** Caller holds the connection's lock (or the host is starting up). The uid is freed only after a confirmed clean wipe. */
   private async discardAttempt(c: ConnRecord, reason: string): Promise<void> {
     const attempt = c.attempt;
     if (!attempt) return;
     delete c.attempt;
-    (c.wipePending ??= []).push({ uid: attempt.uid, ref: attempt.attemptRef, kind: "attempt" });
+    (c.wipePending ??= []).push({ uid: attempt.uid, ref: attempt.attemptRef, kind: "attempt", owner: `attempt:${attempt.attemptRef}` });
     const login = this.logins.get(attempt.loginRef);
     this.logins.delete(attempt.loginRef);
     this.save();
@@ -585,22 +733,26 @@ export class ConnectionManager {
     await this.drainWipes(c);
   }
 
-  /** Wipe whatever is pending; free a uid only when killed + wiped + residue-free. */
+  /** Wipe whatever is pending; free a uid only when killed + wiped + residue-free + still owned by who queued it. */
   private async drainWipes(c: ConnRecord): Promise<void> {
-    if (!c.wipePending?.length) return;
+    const queue = c.wipePending;
+    if (!queue?.length) return;
+    c.wipePending = undefined; // entries pushed while we await land in a fresh array and are kept
     const remaining: NonNullable<ConnRecord["wipePending"]> = [];
-    for (const w of c.wipePending) {
+    for (const w of queue) {
       try {
         await this.deps.fs.killAll(w.uid);
         if (w.kind === "attempt") await this.deps.fs.wipeAttempt(w.uid, w.ref);
         else await this.deps.fs.wipeHome(w.uid, w.ref);
-        if ((await this.deps.fs.residueCount(w.uid)) === 0) this.uids.free(w.uid);
+        if ((await this.deps.fs.residueCount(w.uid)) === 0) this.uids.free(w.uid, w.owner);
         else remaining.push(w);
       } catch {
         remaining.push(w);
       }
     }
-    c.wipePending = remaining.length ? remaining : undefined;
+    const added = c.wipePending ?? [];
+    const merged = [...remaining, ...added];
+    c.wipePending = merged.length ? merged : undefined;
     this.save();
   }
 
@@ -615,9 +767,10 @@ export class ConnectionManager {
       }
     }
     if (c.uid >= 0 && c.homeRef) {
-      (c.wipePending ??= []).push({ uid: c.uid, ref: c.homeRef, kind: "home" });
+      (c.wipePending ??= []).push({ uid: c.uid, ref: c.homeRef, kind: "home", owner: c.connectionId });
       c.uid = -1;
       c.homeRef = "";
+      this.save();
     }
     if (c.attempt) await this.discardAttempt(c, "revoked");
     await this.drainWipes(c);
@@ -672,5 +825,3 @@ function hashOf(v: unknown): string {
 function errCode(err: unknown): string {
   return err instanceof HostError ? err.code : (err as { code?: string })?.code || (err as Error)?.name || "error";
 }
-
-export type { EntitlementObservation, AdapterContext };

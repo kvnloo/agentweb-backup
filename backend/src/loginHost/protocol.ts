@@ -16,13 +16,13 @@ import { z } from "zod";
 const ID = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/, "id: letters, digits, _ and - only, 1-64 chars");
 const PROVIDER = z.string().regex(/^[a-z][a-z0-9_]{0,31}$/);
 const EPOCH = z.number().int().min(1).max(2_147_483_647);
-const MODEL = z.string().regex(/^[A-Za-z0-9._:-]{1,64}$/);
+const MODEL = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/);
 /** Prompt text only; never a path. Bounded so a request cannot exhaust host memory. */
 const PROMPT = z.string().min(1).max(2_000_000);
 /** Opaque short-lived token for the backend's tool bridge, for this turn only. */
-const BRIDGE_TOKEN = z.string().regex(/^[A-Za-z0-9._~-]{16,512}$/);
+const BRIDGE_TOKEN = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._~-]{15,511}$/); // never starts with "-"
 /** The pasted sign-in code (Claude: `<code>#<state>`). Never logged. */
-const LOGIN_CODE = z.string().regex(/^[A-Za-z0-9._~#-]{8,512}$/);
+const LOGIN_CODE = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._~#-]{7,511}$/); // never starts with "-"
 
 export const loginStartReq = z.object({ connectionId: ID, provider: PROVIDER, reconnect: z.boolean().optional() }).strict();
 export const loginCompleteReq = z.object({ connectionId: ID, loginRef: ID, code: LOGIN_CODE }).strict();

@@ -12,11 +12,14 @@
  */
 import { chmodSync, existsSync, rmSync } from "fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "http";
+import { connect } from "net";
 import { ZodError } from "zod";
 import type { ConnectionManager } from "./connectionManager";
 import { HostError, HTTP_STATUS, ROUTES, type RouteName } from "./protocol";
 
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
+/** A request body that stops arriving for this long is dropped (slowloris). */
+const BODY_IDLE_MS = 15_000;
 
 export interface HostServerOptions {
   socketPath: string;
@@ -25,6 +28,29 @@ export interface HostServerOptions {
   /** Background tick (lease/deadline enforcement) and sweep intervals. */
   tickMs?: number;
   sweepMs?: number;
+  /** Concurrent connections accepted; a flood of idle connections cannot exhaust file descriptors. */
+  maxConnections?: number;
+  /** A request body that stops arriving for this long is dropped (default 15 s). */
+  bodyIdleMs?: number;
+}
+
+export class SocketInUseError extends Error {
+  constructor() {
+    super("another login host is listening on this socket");
+    this.name = "SocketInUseError";
+  }
+}
+
+/** True if something accepts connections on the socket (a live host); a stale file left by a dead host does not. */
+function socketIsLive(path: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const c = connect(path);
+    c.once("connect", () => {
+      c.destroy();
+      resolve(true);
+    });
+    c.once("error", () => resolve(false));
+  });
 }
 
 export interface HostServerHandle {
@@ -33,14 +59,21 @@ export interface HostServerHandle {
 }
 
 export async function startHostServer(manager: ConnectionManager, opts: HostServerOptions): Promise<HostServerHandle> {
-  if (existsSync(opts.socketPath)) rmSync(opts.socketPath, { force: true });
+  if (existsSync(opts.socketPath)) {
+    if (await socketIsLive(opts.socketPath)) throw new SocketInUseError(); // never hijack another environment's host
+    rmSync(opts.socketPath, { force: true });
+  }
+  // Processes started by a previous run may still be alive: kill them before serving anything.
+  await manager.recover();
   const server = createServer((req, res) => {
-    void handle(manager, req, res).catch(() => {
+    void handle(manager, req, res, opts.bodyIdleMs ?? BODY_IDLE_MS).catch(() => {
       if (!res.headersSent) sendError(res, new HostError("EINTERNAL"));
       else res.end();
     });
   });
-  server.requestTimeout = 0; // turn.run streams for a long time
+  server.requestTimeout = 0; // turn.run streams for a long time; the BODY is bounded separately (BODY_IDLE_MS)
+  server.headersTimeout = 10_000;
+  server.maxConnections = opts.maxConnections ?? 128;
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(opts.socketPath, () => resolve());
@@ -62,7 +95,7 @@ export async function startHostServer(manager: ConnectionManager, opts: HostServ
   };
 }
 
-async function handle(manager: ConnectionManager, req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handle(manager: ConnectionManager, req: IncomingMessage, res: ServerResponse, bodyIdleMs: number): Promise<void> {
   if (req.method !== "POST") return sendError(res, new HostError("EINVALID", "method"), 405);
   const match = /^\/v1\/([A-Za-z.]+)$/.exec(req.url ?? "");
   const route = match?.[1] as RouteName | undefined;
@@ -71,9 +104,13 @@ async function handle(manager: ConnectionManager, req: IncomingMessage, res: Ser
 
   let body: unknown;
   try {
-    body = JSON.parse(await readBody(req));
+    body = JSON.parse(await readBody(req, bodyIdleMs));
   } catch (err) {
-    if (err instanceof HostError) return sendError(res, err, err.detail === "too_large" ? 413 : undefined);
+    if (err instanceof HostError) {
+      sendError(res, err, err.detail === "too_large" ? 413 : undefined);
+      if (err.detail === "too_large" || err.detail === "body_timeout") res.once("finish", () => req.destroy()); // reply first, then cut the upload
+      return;
+    }
     return sendError(res, new HostError("EINVALID", "json"));
   }
   let input: never;
@@ -133,12 +170,13 @@ async function streamTurn(m: ConnectionManager, input: never, res: ServerRespons
   let finished = false;
   // A dropped stream means the caller is gone: end the turn (it would otherwise run until its lease lapses).
   res.on("close", () => {
-    if (!finished) m.abortTurn(started.turnId, "stream_dropped");
+    if (!finished) m.abortTurn((input as { connectionId: string }).connectionId, started.turnId, "stream_dropped");
   });
   try {
     for await (const ev of started.events) {
       if (res.destroyed) break;
-      res.write(JSON.stringify(ev) + "\n");
+      // Backpressure: wait for a slow reader to drain instead of buffering without bound.
+      if (!res.write(JSON.stringify(ev) + "\n")) await new Promise<void>((resolve) => { res.once("drain", resolve); res.once("close", resolve); });
     }
   } finally {
     finished = true;
@@ -146,21 +184,33 @@ async function streamTurn(m: ConnectionManager, input: never, res: ServerRespons
   }
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
+function readBody(req: IncomingMessage, bodyIdleMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
     req.on("data", (c: Buffer) => {
       size += c.length;
       if (size > MAX_BODY_BYTES) {
+        clearTimeout(idle);
+        req.pause();
         reject(new HostError("EINVALID", "too_large"));
-        req.destroy();
         return;
       }
       chunks.push(c);
+      idle.refresh();
     });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", reject);
+    const idle = setTimeout(() => {
+      req.pause();
+      reject(new HostError("EINVALID", "body_timeout")); // answered first; the connection is cut after the reply
+    }, bodyIdleMs);
+    req.on("end", () => {
+      clearTimeout(idle);
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+    req.on("error", (e) => {
+      clearTimeout(idle);
+      reject(e);
+    });
   });
 }
 

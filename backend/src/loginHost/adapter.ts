@@ -28,9 +28,11 @@ export type Hazard =
 /** Normalised events a turn emits to the backend. Provider-specific raw events never leave the adapter. */
 export type ProviderEvent =
   | { type: "text"; delta: string }
+  /** With `toolTransport = "host_relay"` the backend must answer `operationId` through the host (turn.toolResult), within the host's tool-call timeout. */
   | { type: "tool-use"; operationId: string; name: string; input: unknown }
   | { type: "tool-result"; operationId: string; ok: boolean }
-  | { type: "usage"; inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
+  /** Unknown stays unknown: a count the provider did not report is left out, never 0. */
+  | { type: "usage"; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number }
   | { type: "entitlement"; observation: EntitlementObservation }
   | { type: "alarm"; hazard: Hazard }
   | { type: "result"; ok: boolean; text: string; errorKind?: ErrorKind; /** Set by the host when it ended the turn (lease lapse, deadline, epoch change, alarm, restart). */ aborted?: string };
@@ -60,12 +62,20 @@ export type ServerRequest =
 export type ServerRequestAnswer = { kind: "tool-result"; ok: boolean; content: string } | { kind: "decline" };
 
 export interface ProviderSession {
+  /** Resolves when the session's process is gone for any reason (the provider closed it, it crashed, close() was called). The host retires the session then. */
+  readonly closed: Promise<void>;
+  /**
+   * Cheap "can this login still make a turn?" check on the OPEN session (Codex: `account/read`;
+   * its 401 only shows after turn/start otherwise). Runs on the session, never in a second process
+   * on the same home.
+   */
+  preflight(): Promise<{ ok: true } | { ok: false; kind: ErrorKind }>;
   /** Run one turn; resolves the events as they arrive. Throws only for host-level faults; provider failures are `result` events with an errorKind. */
   turn(input: { turnId: string; prompt: string; model: string; bridgeToken: string }): AsyncIterable<ProviderEvent>;
   /** Answer a server-initiated request that was surfaced as a `tool-use` event (host-relayed tools). */
   answer(operationId: string, answer: ServerRequestAnswer): void;
-  /** Stop the turn in flight; the session stays usable where the provider supports it (Codex `turn/interrupt`), otherwise it closes. */
-  interrupt(): Promise<void>;
+  /** Stop ONE turn (several can share a process: Codex threads); the session stays usable where the provider supports it (Codex `turn/interrupt`), otherwise it closes. */
+  interrupt(turnId: string): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -123,6 +133,17 @@ export interface SubscriptionProviderAdapter {
   /** The environment variable that points the CLI at its login home (CLAUDE_CONFIG_DIR / CODEX_HOME). */
   readonly homeEnvVar: string;
   readonly ceremony: "paste_code" | "device_code";
+  /**
+   * How Emma's tools reach the provider. `mcp_direct`: the CLI calls the backend's bridge itself
+   * (Claude). `host_relay`: the provider asks the host (server request / dynamic tool call) and the
+   * backend answers through the host (Codex).
+   *
+   * CONTRACT for every adapter: approvals and elicitations a provider asks for are DECLINED by the
+   * adapter (never approved) and surfaced as an `alarm`; the prompt, the sign-in code and the bridge
+   * token reach the provider through stdin / the protocol, NEVER through argv or the environment
+   * (a value starting with "-" must not be able to become a flag); no method reads a credential file.
+   */
+  readonly toolTransport: "mcp_direct" | "host_relay";
   /** Single-use refresh tokens (Codex) force 1; Claude's shared-dir behaviour was verified up to 8. */
   readonly maxProcessesPerHome: number;
   /** Concurrent turns one process can serve (Claude 1; Codex: many threads). */
@@ -131,7 +152,8 @@ export interface SubscriptionProviderAdapter {
   /** Allowlist of model names the backend may request. */
   readonly models: ReadonlySet<string>;
 
-  binary(): { path: string; version: string; digest?: string };
+  /** Pinned binary: absolute path, version and content digest (checked on every upgrade). */
+  binary(): { path: string; version: string; digest: string };
   /** Runs as the customer's uid through `asUser`; must not read credential files. */
   prepareHome(asUser: AsUser, ctx: AdapterContext): Promise<void>;
 
@@ -143,15 +165,14 @@ export interface SubscriptionProviderAdapter {
   loginPoll?(proc: LoginProcess): Promise<"pending" | "done" | "failed">;
   loginCancel(proc: LoginProcess): Promise<void>;
 
-  /** Cheap check before a turn (Codex returns 401 only at turn/start). */
-  preflight(ctx: AdapterContext): Promise<{ ok: true } | { ok: false; kind: ErrorKind }>;
-  authStatus(ctx: AdapterContext): Promise<AuthStatus>;
+  /** At sign-in time: `proc` is the still-open login process when the provider needs it (Codex asks its login app-server). */
+  authStatus(ctx: AdapterContext, proc?: LoginProcess): Promise<AuthStatus>;
   hazards(ctx: AdapterContext): Promise<Hazard[]>;
 
   openSession(ctx: AdapterContext, spec: SessionSpec): Promise<ProviderSession>;
 
   mapError(raw: unknown): ErrorKind;
-  /** Server-side revoke (Claude `auth logout` is verified to invalidate the login; Codex unverified). Best effort. */
+  /** Server-side revoke (Claude `auth logout` is verified to invalidate the login; Codex unverified). Best effort; runs after the host closed every session, so a short-lived process on the home is allowed. */
   logout(ctx: AdapterContext): Promise<void>;
   expiryModel(signedInAtMs: number): { refreshExpiresAtMs?: number } | undefined;
 }

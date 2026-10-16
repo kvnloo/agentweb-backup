@@ -34,8 +34,12 @@ export class UidAllocator {
     owners[String(uid)] = to;
   }
 
-  free(uid: number): void {
-    delete this.state().uidOwners[String(uid)];
+  /** Frees `uid` only if `owner` still owns it: a late or repeated cleanup must never free a uid that was re-allocated. */
+  free(uid: number, owner: string): boolean {
+    const owners = this.state().uidOwners;
+    if (owners[String(uid)] !== owner) return false;
+    delete owners[String(uid)];
+    return true;
   }
 
   inUseCount(): number {

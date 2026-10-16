@@ -30,6 +30,12 @@ export interface FakeScript {
   openFails?: boolean;
   /** A misbehaving provider: keeps emitting after interrupt(). */
   ignoreInterrupt?: boolean;
+  /** A hung provider: a turn never ends and ignores interrupt() and close() entirely. */
+  hangTurn?: boolean;
+  /** Called by tests to make every open session report `closed` (the provider process died). */
+  killSessions: Array<() => void>;
+  /** Turns that were interrupted individually. */
+  interruptedTurns: string[];
   /** Counters tests can assert on. */
   opened: number;
   closed: number;
@@ -63,6 +69,8 @@ export function newScript(): FakeScript {
     answers: [],
     activeTurns: 0,
     maxActiveTurns: 0,
+    killSessions: [],
+    interruptedTurns: [],
   };
 }
 
@@ -72,6 +80,7 @@ export interface FakeOptions {
   maxProcessesPerHome?: number;
   maxTurnsPerProcess?: number;
   loginTtlMs?: number;
+  toolTransport?: "mcp_direct" | "host_relay";
 }
 
 export function createFakeAdapter(script: FakeScript, opts: FakeOptions = {}): SubscriptionProviderAdapter {
@@ -81,11 +90,12 @@ export function createFakeAdapter(script: FakeScript, opts: FakeOptions = {}): S
     flagKey: "fakeSubscription",
     homeEnvVar: "FAKE_HOME",
     ceremony,
+    toolTransport: opts.toolTransport ?? "mcp_direct",
     maxProcessesPerHome: opts.maxProcessesPerHome ?? 3,
     maxTurnsPerProcess: opts.maxTurnsPerProcess ?? 1,
     loginTtlMs: opts.loginTtlMs ?? 10 * 60 * 1000,
     models: new Set(["fast", "smart"]),
-    binary: () => ({ path: "/opt/fake/fake-cli", version: "0.0.0-fake" }),
+    binary: () => ({ path: "/opt/fake/fake-cli", version: "0.0.0-fake", digest: "sha256:fake" }),
     prepareHome: async () => {
       script.prepared++;
     },
@@ -97,24 +107,35 @@ export function createFakeAdapter(script: FakeScript, opts: FakeOptions = {}): S
     loginCancel: async () => {
       script.loginsCancelled++;
     },
-    preflight: async () => script.preflight,
     authStatus: async (): Promise<AuthStatus> => ({ loggedIn: script.loggedIn, planLabel: script.planLabel, accountFingerprint: script.accountFingerprint }),
     hazards: async () => script.hazards,
     openSession: async (): Promise<ProviderSession> => {
       if (script.openFails) throw Object.assign(new Error("open failed"), { code: "open_failed" });
       script.opened++;
       const bus = new EventEmitter();
-      let interrupted = false;
+      const interrupted = new Set<string>();
+      let closedAll = false;
+      let markClosed!: () => void;
+      const closed = new Promise<void>((resolve) => (markClosed = resolve));
+      script.killSessions.push(() => {
+        closedAll = true;
+        bus.emit("interrupt");
+        markClosed();
+      });
       return {
-        async *turn() {
+        closed,
+        preflight: async () => script.preflight,
+        async *turn({ turnId }) {
           script.activeTurns++;
           script.maxActiveTurns = Math.max(script.maxActiveTurns, script.activeTurns);
           try {
+            if (script.hangTurn) await new Promise<void>(() => undefined);
+            const stopped = () => (interrupted.has(turnId) || closedAll) && !script.ignoreInterrupt;
             for (const item of script.turnEvents) {
-              if (interrupted && !script.ignoreInterrupt) return;
+              if (stopped()) return;
               if ("wait" in item) {
                 await Promise.race([item.wait, new Promise<void>((resolve) => bus.once("interrupt", () => resolve()))]);
-                if (interrupted && !script.ignoreInterrupt) return;
+                if (stopped()) return;
                 continue;
               }
               yield item;
@@ -126,15 +147,17 @@ export function createFakeAdapter(script: FakeScript, opts: FakeOptions = {}): S
         answer(operationId, answer) {
           script.answers.push({ operationId, answer });
         },
-        async interrupt() {
+        async interrupt(turnId) {
           script.interrupts++;
-          interrupted = true;
+          script.interruptedTurns.push(turnId);
+          interrupted.add(turnId);
           bus.emit("interrupt");
         },
         async close() {
           script.closed++;
-          interrupted = true;
+          closedAll = true;
           bus.emit("interrupt");
+          markClosed();
         },
       };
     },

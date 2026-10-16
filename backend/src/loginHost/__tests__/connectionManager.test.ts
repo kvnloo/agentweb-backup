@@ -287,18 +287,18 @@ describe("ConnectionManager", () => {
       expect(out[out.length - 1]).toMatchObject({ aborted: "deadline" });
     });
 
-    it("renew / interrupt / tool results need the right epoch and a live turn", async () => {
+    it("renew / interrupt need the right epoch and a live turn", async () => {
       rig.script.turnEvents = [{ wait: new Promise<void>(() => undefined) }, { type: "result", ok: true, text: "x" }];
       const started = await rig.mgr.runTurn(turnReq("conn1", 1, { turnId: "tR" }));
       const pending = drain(started.events!);
+      await flushTurns(); // the turn is running inside the provider
       expect(() => rig.mgr.renewLease({ connectionId: "conn1", turnId: "tR", epoch: 2 })).toThrow(HostError);
       expect(() => rig.mgr.renewLease({ connectionId: "other", turnId: "tR", epoch: 1 })).toThrow(HostError);
       expect(() => rig.mgr.renewLease({ connectionId: "conn1", turnId: "missing", epoch: 1 })).toThrow(HostError);
-      await rig.mgr.turnToolResult({ connectionId: "conn1", turnId: "tR", epoch: 1, operationId: "op1", ok: true, content: "r" });
-      expect(rig.script.answers).toEqual([{ operationId: "op1", answer: { kind: "tool-result", ok: true, content: "r" } }]);
       await rig.mgr.interruptTurn({ connectionId: "conn1", turnId: "tR", epoch: 1 });
       const out = await pending;
       expect(out[out.length - 1]).toMatchObject({ aborted: "interrupted" });
+      expect(rig.script.interruptedTurns).toEqual(["tR"]); // this turn only
     });
 
     it("an alarm event ends the turn, stops the sessions and parks the connection", async () => {
@@ -376,7 +376,7 @@ describe("ConnectionManager", () => {
       expect((await pending).pop()).toMatchObject({ aborted: "disabled" });
       expect([...rig.fs.dirs].some((d) => d.startsWith("home:"))).toBe(true); // home kept
       expect(await code(rig.mgr.disable({ connectionId: "conn1", epoch: 1 }))).toBe("ESTALE");
-      expect(rig.mgr.enable({ connectionId: "conn1", epoch: 2 })).toEqual({ state: "active", epoch: 2 });
+      await expect(rig.mgr.enable({ connectionId: "conn1", epoch: 2 })).resolves.toEqual({ state: "active", epoch: 2 });
       rig.script.turnEvents = [{ type: "result", ok: true, text: "ok" }];
       expect((await drain((await rig.mgr.runTurn(turnReq("conn1", 2))).events!)).pop()).toMatchObject({ ok: true });
     });
@@ -437,7 +437,7 @@ describe("ConnectionManager", () => {
       rig.script.turnEvents = [{ wait: new Promise<void>(() => undefined) }, { type: "result", ok: true, text: "x" }];
       await rig.mgr.runTurn(req); // left running when the host "dies"
       const mgr2 = rig.restart();
-      mgr2.recover();
+      await mgr2.recover();
       expect(await code(mgr2.runTurn(turnReq("conn1", 2)))).toBe("ESTALE");
       const opened = rig.script.opened;
       await expect(mgr2.runTurn(req)).resolves.toMatchObject({ duplicate: true, status: "aborted" });
@@ -449,7 +449,7 @@ describe("ConnectionManager", () => {
       rig = makeRig();
       await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
       const mgr2 = rig.restart();
-      mgr2.recover();
+      await mgr2.recover();
       await mgr2.sweep();
       expect(Object.keys(rig.store.get().uidOwners)).toHaveLength(0);
     });

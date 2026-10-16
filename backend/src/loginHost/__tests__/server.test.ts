@@ -1,9 +1,10 @@
 import { request } from "http";
+import { connect } from "net";
 import { existsSync, mkdtempSync, rmSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { ROUTES, type RouteName } from "../protocol";
-import { startHostServer, type HostServerHandle } from "../server";
+import { SocketInUseError, startHostServer, type HostServerHandle } from "../server";
 import { makeRig, signIn, turnReq, type Rig } from "./helpers";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test-only: dynamic JSON from the host
@@ -25,6 +26,7 @@ function call(socketPath: string, method: string, path: string, body?: unknown, 
         resolve({ status: res.statusCode ?? 0, text, json });
       });
     });
+    req.on("socket", (sock) => sock.on("error", () => undefined)); // the server may cut an oversized upload
     req.on("error", reject);
     if (body !== undefined) req.write(typeof body === "string" ? body : JSON.stringify(body));
     req.end();
@@ -79,7 +81,7 @@ describe("login host server", () => {
     expect((await call(sock, "POST", "/v1/connection.status", { connectionId: "c1" }, { "content-type": "text/plain" })).status).toBe(415);
     expect((await call(sock, "POST", "/v1/connection.status", "{not json")).json).toMatchObject({ error: "EINVALID", detail: "json" });
     const big = await call(sock, "POST", "/v1/turn.run", JSON.stringify({ prompt: "x".repeat(6 * 1024 * 1024) })).catch(() => ({ status: 0, text: "", json: undefined }));
-    expect([413, 0]).toContain(big.status); // 413, or the connection is cut while the body is still arriving
+    expect(big.status).toBe(413); // the reply is delivered before the upload is cut
   });
 
   it("never echoes an offending value back, whatever the field", async () => {
@@ -186,6 +188,36 @@ describe("login host server", () => {
     for (let i = 0; i < 50 && rig.mgr.status({ connectionId: "c1" }).runningTurns > 0; i++) await new Promise((r) => setTimeout(r, 20));
     expect(rig.mgr.status({ connectionId: "c1" }).runningTurns).toBe(0);
     expect(rig.script.interrupts).toBe(1);
+  });
+
+  it("refuses to take over a socket another live host is listening on", async () => {
+    await expect(startHostServer(rig.mgr, { socketPath: sock, tickMs: 60_000, sweepMs: 60_000 })).rejects.toBeInstanceOf(SocketInUseError);
+    // the first host still answers
+    expect((await call(sock, "POST", "/v1/connection.status", { connectionId: "x" })).status).toBe(404);
+  });
+
+  it("drops a request body that stops arriving (slowloris) instead of holding the connection open", async () => {
+    await handle.close();
+    handle = await startHostServer(rig.mgr, { socketPath: sock, tickMs: 60_000, sweepMs: 60_000, bodyIdleMs: 150 });
+    const reply = await new Promise<string>((resolve) => {
+      const s = connect(sock);
+      let got = "";
+      s.on("data", (d) => (got += d.toString("utf8")));
+      s.on("close", () => resolve(got));
+      s.on("error", () => resolve(got));
+      s.write("POST /v1/connection.status HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"conn");
+      setTimeout(() => s.destroy(), 3000); // safety net
+    });
+    expect(reply).toContain("400");
+    expect(reply).toContain("body_timeout");
+  });
+
+  it("a bridge token or sign-in code that starts with '-' is rejected (it must never be able to become a CLI flag)", () => {
+    expect(ROUTES["turn.run"].safeParse({ connectionId: "c1", epoch: 1, idempotencyKey: "k", turnId: "t", prompt: "-x", model: "fast", bridgeToken: "--dangerously-skip-permissions" }).success).toBe(false);
+    expect(ROUTES["turn.run"].safeParse({ connectionId: "c1", epoch: 1, idempotencyKey: "k", turnId: "t", prompt: "-x", model: "-fast", bridgeToken: "bridge-token-0123456789" }).success).toBe(false);
+    expect(ROUTES["login.complete"].safeParse({ connectionId: "c1", loginRef: "l", code: "--version-aaaaa#bbbbbbbb" }).success).toBe(false);
+    // a prompt may start with '-' (it is data, passed over stdin/protocol only)
+    expect(ROUTES["turn.run"].safeParse({ connectionId: "c1", epoch: 1, idempotencyKey: "k", turnId: "t", prompt: "-x", model: "fast", bridgeToken: "bridge-token-0123456789" }).success).toBe(true);
   });
 
   it("removes a stale socket file left by a dead host and listens again", async () => {

@@ -30,8 +30,8 @@ export interface UserFsPort {
   createAttemptDir(uid: number, attemptRef: string): Promise<void>;
   /** Moves the attempt directory to become the home (same filesystem, atomic rename). */
   promoteAttempt(uid: number, attemptRef: string, homeRef: string): Promise<void>;
-  /** An AsUser handle limited to the connection's home. */
-  asUser(uid: number, homeRef: string): AsUser;
+  /** An AsUser handle limited to one directory: the sign-in attempt dir or the promoted home. */
+  asUser(uid: number, ref: string, kind: "attempt" | "home"): AsUser;
   /** Remove an attempt directory. Called only after the uid's processes are dead. */
   wipeAttempt(uid: number, attemptRef: string): Promise<void>;
   wipeHome(uid: number, homeRef: string): Promise<void>;
