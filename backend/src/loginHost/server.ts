@@ -32,6 +32,8 @@ export interface HostServerOptions {
   maxConnections?: number;
   /** A request body that stops arriving for this long is dropped (default 15 s). */
   bodyIdleMs?: number;
+  /** A turn stream the reader stops draining for this long is cut, which also ends the turn (default 30 s). */
+  streamStallMs?: number;
 }
 
 export class SocketInUseError extends Error {
@@ -66,7 +68,7 @@ export async function startHostServer(manager: ConnectionManager, opts: HostServ
   // Processes started by a previous run may still be alive: kill them before serving anything.
   await manager.recover();
   const server = createServer((req, res) => {
-    void handle(manager, req, res, opts.bodyIdleMs ?? BODY_IDLE_MS).catch(() => {
+    void handle(manager, req, res, opts.bodyIdleMs ?? BODY_IDLE_MS, opts.streamStallMs ?? 30_000).catch(() => {
       if (!res.headersSent) sendError(res, new HostError("EINTERNAL"));
       else res.end();
     });
@@ -95,7 +97,7 @@ export async function startHostServer(manager: ConnectionManager, opts: HostServ
   };
 }
 
-async function handle(manager: ConnectionManager, req: IncomingMessage, res: ServerResponse, bodyIdleMs: number): Promise<void> {
+async function handle(manager: ConnectionManager, req: IncomingMessage, res: ServerResponse, bodyIdleMs: number, streamStallMs: number): Promise<void> {
   if (req.method !== "POST") return sendError(res, new HostError("EINVALID", "method"), 405);
   const match = /^\/v1\/([A-Za-z.]+)$/.exec(req.url ?? "");
   const route = match?.[1] as RouteName | undefined;
@@ -123,7 +125,7 @@ async function handle(manager: ConnectionManager, req: IncomingMessage, res: Ser
   }
 
   try {
-    if (route === "turn.run") return await streamTurn(manager, input, res);
+    if (route === "turn.run") return await streamTurn(manager, input, res, streamStallMs);
     const result = await dispatch(manager, route, input);
     send(res, 200, result);
   } catch (err) {
@@ -162,7 +164,7 @@ async function dispatch(m: ConnectionManager, route: RouteName, input: never): P
   }
 }
 
-async function streamTurn(m: ConnectionManager, input: never, res: ServerResponse): Promise<void> {
+async function streamTurn(m: ConnectionManager, input: never, res: ServerResponse, stallMs: number): Promise<void> {
   const started = await m.runTurn(input);
   res.writeHead(200, { "content-type": "application/x-ndjson", "cache-control": "no-store" });
   res.write(JSON.stringify({ type: "accepted", turnId: started.turnId, duplicate: started.duplicate, ...(started.status ? { status: started.status } : {}) }) + "\n");
@@ -176,7 +178,18 @@ async function streamTurn(m: ConnectionManager, input: never, res: ServerRespons
     for await (const ev of started.events) {
       if (res.destroyed) break;
       // Backpressure: wait for a slow reader to drain instead of buffering without bound.
-      if (!res.write(JSON.stringify(ev) + "\n")) await new Promise<void>((resolve) => { res.once("drain", resolve); res.once("close", resolve); });
+      if (!res.write(JSON.stringify(ev) + "\n")) {
+        // A reader that stops draining must not park the turn (and its slot) forever: cut the stream after stallMs.
+        await new Promise<void>((resolve) => {
+          const stall = setTimeout(() => res.destroy(), stallMs);
+          const done = () => {
+            clearTimeout(stall);
+            resolve();
+          };
+          res.once("drain", done);
+          res.once("close", done);
+        });
+      }
     }
   } finally {
     finished = true;

@@ -105,7 +105,7 @@ describe("ConnectionManager: interleaving operations", () => {
   it("the home is prepared before the sign-in runs, not after promotion", async () => {
     const start = await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
     expect(rig.script.prepared).toBe(1);
-    expect(rig.fs.writes.length).toBeGreaterThanOrEqual(0);
+    expect(rig.fs.writes.every((w) => w.kind === "attempt")).toBe(true); // nothing is written into a promoted home by the host itself
     await rig.mgr.loginComplete({ connectionId: "c1", loginRef: start.loginRef, code: "abcdefgh#12345678" });
     await rig.mgr.loginPromote({ connectionId: "c1", loginRef: start.loginRef, epoch: 1 });
     expect(rig.script.prepared).toBe(1); // not prepared a second time
@@ -245,16 +245,15 @@ describe("ConnectionManager: host restart", () => {
   it("recover() kills the processes of every allocated uid before serving, and parks a connection that died mid-swap", async () => {
     rig = makeRig();
     await signIn(rig, "c1", 1);
-    const uid = rig.store.get().connections.c1.uid;
     await rig.mgr.loginStart({ connectionId: "c2", provider: "fake" });
+    const ownedBefore = Object.keys(rig.store.get().uidOwners).map(Number);
+    expect(ownedBefore).toHaveLength(2); // the connection's uid and the pending attempt's uid
     rig.store.get().connections.c1.state = "swapping";
     rig.store.save();
     rig.fs.killed.length = 0;
     const mgr2 = rig.restart();
     await mgr2.recover();
-    const owned = Object.keys(rig.store.get().uidOwners).map(Number);
-    expect(owned.length).toBeGreaterThanOrEqual(1);
-    for (const u of owned.length ? owned : [uid]) expect(rig.fs.killed).toContain(u);
+    for (const u of ownedBefore) expect(rig.fs.killed).toContain(u);
     expect(mgr2.status({ connectionId: "c1" })).toMatchObject({ state: "needs_attention", reason: "swap_interrupted" });
     await mgr2.sweep();
     assertConsistent(rig);

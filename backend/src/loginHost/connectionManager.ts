@@ -47,6 +47,10 @@ export interface ManagerConfig {
   /** A relayed tool call the backend does not answer within this window is answered with a failure. */
   toolCallTimeoutMs: number;
   idempotencyTtlMs: number;
+  /** Every adapter call made while a connection's lock is held is bounded by this; a hung CLI must not wedge a connection (or its revoke) forever. */
+  adapterCallTimeoutMs: number;
+  /** Same for filesystem / process port calls. */
+  portCallTimeoutMs: number;
   /** Org-delivered settings (Claude Team/Enterprise) are refused unless the sandbox gate is enabled. */
   allowManagedSettings: boolean;
 }
@@ -62,6 +66,8 @@ export const DEFAULT_CONFIG: ManagerConfig = {
   idleSessionMs: 10 * 60 * 1000,
   toolCallTimeoutMs: 120_000,
   idempotencyTtlMs: 6 * 60 * 60 * 1000,
+  adapterCallTimeoutMs: 60_000,
+  portCallTimeoutMs: 30_000,
   allowManagedSettings: false,
 };
 
@@ -87,6 +93,8 @@ interface HostSession {
 interface RunningTurn {
   connectionId: string;
   epoch: number;
+  /** The uid this turn started on: cleanup after a revoke or reconnect must target THIS uid, never the connection's current one. */
+  uid: number;
   turnId: string;
   hs: HostSession;
   leaseUntilMono: number;
@@ -126,6 +134,42 @@ export interface TurnStarted {
 
 const FENCING_ACTIONS = new Set(["disable", "revoke"]);
 
+/** Rejects if `p` has not settled within `ms`; the timer is always cleared. */
+function bounded<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const limit = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new HostError("EINTERNAL", `${label}_timeout`)), ms);
+  });
+  return Promise.race([p, limit]).finally(() => timer && clearTimeout(timer));
+}
+
+/** Resolves racing waits to "hung" once fired; listeners are removed as each wait settles (no handler pile-up on long turns). */
+class AbortGate {
+  fired = false;
+  private readonly listeners = new Set<() => void>();
+  fire(): void {
+    this.fired = true;
+    for (const l of [...this.listeners]) l();
+  }
+  race<T>(p: Promise<T>): Promise<T | "hung"> {
+    return new Promise((resolve, reject) => {
+      const onFire = () => resolve("hung");
+      this.listeners.add(onFire);
+      p.then(
+        (v) => {
+          this.listeners.delete(onFire);
+          resolve(v);
+        },
+        (e) => {
+          this.listeners.delete(onFire);
+          reject(e);
+        },
+      );
+      if (this.fired) onFire();
+    });
+  }
+}
+
 /** Runs async work one at a time per key, in arrival order. */
 class KeyedMutex {
   private readonly tails = new Map<string, Promise<void>>();
@@ -150,6 +194,7 @@ export class ConnectionManager {
   private readonly logins = new Map<string, { connectionId: string; proc: LoginProcess; provider: string }>();
   private readonly sessions = new Map<string, HostSession[]>();
   private readonly turns = new Map<string, RunningTurn>();
+  private sweeping: Promise<void> | undefined;
 
   constructor(private readonly deps: ManagerDeps) {
     this.cfg = { ...DEFAULT_CONFIG, ...(deps.config ?? {}) };
@@ -163,6 +208,22 @@ export class ConnectionManager {
 
   private save(): void {
     this.deps.store.save();
+  }
+
+  /** An adapter call bounded in time. */
+  private a<T>(label: string, fn: () => Promise<T>): Promise<T> {
+    return bounded(fn(), this.cfg.adapterCallTimeoutMs, label);
+  }
+
+  /** A port call bounded in time. */
+  private f<T>(label: string, fn: () => Promise<T>): Promise<T> {
+    return bounded(fn(), this.cfg.portCallTimeoutMs, label);
+  }
+
+  /** Kill every process of a uid, but never with a value outside the reserved range (-1 would mean "everything" to kill(2)). */
+  private async safeKill(uid: number): Promise<void> {
+    if (!Number.isInteger(uid) || uid < this.cfg.uidMin || uid > this.cfg.uidMax) return;
+    await this.f("killAll", () => this.deps.fs.killAll(uid));
   }
 
   private turnKey(connectionId: string, turnId: string): string {
@@ -182,7 +243,7 @@ export class ConnectionManager {
    */
   async recover(): Promise<void> {
     const st = this.state();
-    for (const uid of Object.keys(st.uidOwners)) await this.deps.fs.killAll(Number(uid));
+    for (const uid of Object.keys(st.uidOwners)) await this.safeKill(Number(uid)).catch(() => undefined);
     for (const rec of Object.values(st.idempotency)) {
       const outcome = rec.outcome as { status?: string } | undefined;
       if (outcome?.status === "running") outcome.status = "aborted";
@@ -192,7 +253,8 @@ export class ConnectionManager {
         c.state = "needs_attention";
         c.reason = "swap_interrupted";
       }
-      if (c.attempt && !this.logins.has(c.attempt.loginRef)) await this.discardAttempt(c, "host_restart");
+      // An attempt whose promote was interrupted may have been moved into place: its intended home is wiped too (discardAttempt queues both).
+      if (c.attempt && !this.logins.has(c.attempt.loginRef)) await this.discardAttempt(c, "host_restart").catch(() => undefined);
     }
     this.save();
   }
@@ -225,11 +287,11 @@ export class ConnectionManager {
       c.attempt = { loginRef, uid, attemptRef, startedAtMs: now, expiresAtMs: now + adapter.loginTtlMs, state: "pending" };
       this.save();
       try {
-        await this.deps.fs.createAttemptDir(uid, attemptRef);
+        await this.f("createAttemptDir", () => this.deps.fs.createAttemptDir(uid, attemptRef));
         const ctx = this.deps.fs.contextFor(req.connectionId, uid, attemptRef, "attempt");
         // The lockdown configuration must exist before the CLI runs for the first time (Codex: file credential store, no tools).
-        await adapter.prepareHome(this.deps.fs.asUser(uid, attemptRef, "attempt"), ctx);
-        const proc = await adapter.loginStart(ctx);
+        await this.a("prepareHome", () => adapter.prepareHome(this.deps.fs.asUser(uid, attemptRef, "attempt"), ctx));
+        const proc = await this.a("loginStart", () => adapter.loginStart(ctx));
         this.logins.set(loginRef, { connectionId: req.connectionId, proc, provider: req.provider });
         return { loginRef, ceremony: adapter.ceremony, url: proc.data.url, ...(proc.data.userCode ? { userCode: proc.data.userCode } : {}), expiresAtMs: c.attempt.expiresAtMs };
       } catch (err) {
@@ -246,7 +308,7 @@ export class ConnectionManager {
       const adapter = this.adapter(login.provider);
       if (adapter.ceremony !== "paste_code" || !adapter.loginComplete) throw new HostError("ESTATE", "ceremony_not_paste_code");
       try {
-        await adapter.loginComplete(login.proc, req.code);
+        await this.a("loginComplete", () => adapter.loginComplete!(login.proc, req.code));
       } catch (err) {
         await this.discardAttempt(c, "code_rejected");
         this.log.warn("login_complete_failed", { connectionId: req.connectionId, code: errCode(err) });
@@ -262,7 +324,7 @@ export class ConnectionManager {
       const adapter = this.adapter(login.provider);
       if (c.attempt?.state === "ready") return this.readyInfo(c, adapter);
       if (adapter.ceremony !== "device_code" || !adapter.loginPoll) throw new HostError("ESTATE", "ceremony_not_device_code");
-      const polled = await adapter.loginPoll(login.proc);
+      const polled = await this.a("loginPoll", () => adapter.loginPoll!(login.proc));
       if (polled === "pending") return { status: "pending" as const };
       if (polled === "failed") {
         await this.discardAttempt(c, "login_failed");
@@ -281,38 +343,43 @@ export class ConnectionManager {
   }
 
   /** Phase 3: the backend has created its record at `epoch`; make the attempt the connection's home. */
-  loginPromote(req: RouteInput<"login.promote">): Promise<{ state: "active"; epoch: number }> {
+  loginPromote(req: RouteInput<"login.promote">): Promise<{ state: string; epoch: number }> {
     return this.locked(req.connectionId, async () => {
       const c = this.state().connections[req.connectionId];
       if (!c) throw new HostError("ENOTFOUND");
-      if (c.promotedLoginRef === req.loginRef && c.epoch === req.epoch && c.state === "active") return { state: "active" as const, epoch: c.epoch }; // retry
+      // A retry of a promote that already completed returns the actual state (a disabled connection stays disabled).
+      if (c.promotedLoginRef === req.loginRef && c.epoch === req.epoch && (c.state === "active" || c.state === "disabled")) return { state: c.state, epoch: c.epoch };
       if (!c.attempt || c.attempt.loginRef !== req.loginRef || c.attempt.state !== "ready") throw new HostError("ENOTFOUND");
-      if (req.epoch <= c.epoch) throw new HostError("ESTALE"); // a home swap always needs a newer epoch
+      // A home swap always needs a strictly newer epoch, except resuming the same promote after it failed part-way.
+      const resuming = c.reason === "promote_failed" && req.epoch === c.epoch;
+      if (!resuming && req.epoch <= c.epoch) throw new HostError("ESTALE");
       if (c.state === "revoking" || c.state === "revoked") throw new HostError("ESTATE", "revoked");
       const attempt = c.attempt;
       const previous = c.uid >= 0 && c.homeRef ? { uid: c.uid, ref: c.homeRef, owner: c.connectionId } : undefined;
-      const wasDisabled = c.state === "disabled"; // a reconnect must not silently re-enable a disabled connection
 
-      // Fence the old home first: new epoch recorded, no turn admitted while swapping, every process of the old login stopped.
+      // Fence the old home first: new epoch recorded, no turn admitted while swapping.
+      if (!resuming) c.swapWasDisabled = c.state === "disabled"; // a reconnect must not silently re-enable a disabled connection
       c.epoch = req.epoch;
       c.state = "swapping";
+      c.reason = undefined;
       c.updatedAtMs = this.deps.clock.nowMs();
       this.save();
-      await this.terminateConnection(c, "reconnect");
-
-      const homeRef = this.deps.ids.next("home");
       try {
-        await this.deps.fs.promoteAttempt(attempt.uid, attempt.attemptRef, homeRef);
-        this.uids.transfer(attempt.uid, `attempt:${attempt.attemptRef}`, c.connectionId);
+        await this.terminateConnection(c, "reconnect");
+        const homeRef = attempt.homeRef ?? this.deps.ids.next("home");
+        attempt.homeRef = homeRef;
+        this.save(); // the intended home is recorded BEFORE the rename: a crash cannot lose track of where the credentials went
+        await this.f("promoteAttempt", () => this.deps.fs.promoteAttempt(attempt.uid, attempt.attemptRef, homeRef));
+        if (this.uids.ownerOf(attempt.uid) === `attempt:${attempt.attemptRef}`) this.uids.transfer(attempt.uid, `attempt:${attempt.attemptRef}`, c.connectionId);
       } catch (err) {
         c.state = "needs_attention";
-        c.reason = "promote_failed";
+        c.reason = "promote_failed"; // only a reconnect (or resuming this promote) clears it
         this.save();
         this.log.warn("promote_failed", { connectionId: c.connectionId, code: errCode(err) });
         throw new HostError("EINTERNAL", "promote_failed");
       }
       c.uid = attempt.uid;
-      c.homeRef = homeRef;
+      c.homeRef = attempt.homeRef!;
       c.promotedLoginRef = attempt.loginRef;
       c.reason = undefined;
       c.signedInAtMs = this.deps.clock.nowMs();
@@ -320,9 +387,10 @@ export class ConnectionManager {
       delete c.cleanupConfirmedAtMs;
       if (previous) (c.wipePending ??= []).push({ ...previous, kind: "home" });
       this.logins.delete(attempt.loginRef);
-      c.state = wasDisabled ? "disabled" : "active"; // only now may turns be admitted
+      c.state = c.swapWasDisabled ? "disabled" : "active"; // only now may turns be admitted
+      delete c.swapWasDisabled;
       this.save();
-      return { state: "active" as const, epoch: c.epoch };
+      return { state: c.state, epoch: c.epoch };
     });
   }
 
@@ -377,6 +445,7 @@ export class ConnectionManager {
     const running: RunningTurn = {
       connectionId: c.connectionId,
       epoch: c.epoch,
+      uid: c.uid,
       turnId: req.turnId,
       hs: session,
       leaseUntilMono: nowMono + this.cfg.leaseMs,
@@ -416,17 +485,16 @@ export class ConnectionManager {
     finish: (status: "finished" | "failed" | "aborted") => void,
   ): AsyncGenerator<ProviderEvent> {
     let status: "finished" | "failed" | "aborted" = "failed";
-    // After an abort the provider gets abortGraceMs to stop; this promise resolves "hung" if it does not.
+    // After an abort the provider gets abortGraceMs to stop; the gate resolves waits as "hung" if it does not.
     let graceTimer: NodeJS.Timeout | undefined;
-    const hung = new Promise<"hung">((resolve) => {
-      running.onFirstAbort = () => {
-        graceTimer = setTimeout(() => resolve("hung"), this.cfg.abortGraceMs);
-      };
-      if (running.aborted !== undefined) running.onFirstAbort();
-    });
+    const gate = new AbortGate();
+    running.onFirstAbort = () => {
+      graceTimer = setTimeout(() => gate.fire(), this.cfg.abortGraceMs);
+    };
+    if (running.aborted !== undefined) running.onFirstAbort();
     let iterator: AsyncIterator<ProviderEvent> | undefined;
     try {
-      const opened = await Promise.race([session.ready.then((s) => ({ s }), (e: unknown) => ({ e })), hung]);
+      const opened = await gate.race(session.ready.then((s) => ({ s }), (e: unknown) => ({ e })));
       if (opened === "hung") return yield* this.abandonHung(c, session, running, () => (status = "aborted"));
       if ("e" in opened) {
         session.dead = true;
@@ -440,22 +508,24 @@ export class ConnectionManager {
         yield { type: "result", ok: false, text: "", aborted: running.aborted };
         return;
       }
-      const pre = await Promise.race([providerSession.preflight(), hung]);
+      const pre = await gate.race(providerSession.preflight());
       if (pre === "hung") return yield* this.abandonHung(c, session, running, () => (status = "aborted"));
       if (!pre.ok) {
-        if (pre.kind === "auth_dead") await this.locked(c.connectionId, async () => this.markNeedsReconnect(c, "auth_dead"));
+        // Only if this turn is still on the current login: a reconnect that landed meanwhile must not be parked by the old login's failure.
+        if (pre.kind === "auth_dead") await this.locked(c.connectionId, async () => (c.epoch === running.epoch && running.aborted === undefined ? this.markNeedsReconnect(c, "auth_dead") : undefined));
         yield { type: "result", ok: false, text: "", errorKind: pre.kind };
         return;
       }
       iterator = providerSession.turn({ turnId: req.turnId, prompt: req.prompt, model: req.model, bridgeToken: req.bridgeToken })[Symbol.asyncIterator]();
       for (;;) {
-        const next = await Promise.race([iterator.next(), hung]);
+        const next = await gate.race(iterator.next());
         if (next === "hung") return yield* this.abandonHung(c, session, running, () => (status = "aborted"));
         if (next.done) break;
         const ev = next.value;
         if (running.aborted) break;
         if (ev.type === "alarm") {
-          await this.locked(c.connectionId, () => this.raiseAlarm(c, ev.hazard));
+          // Defense in depth: an epoch change always aborts the turn first (checked above), so a stale alarm should not get here.
+          await this.locked(c.connectionId, async () => (c.epoch === running.epoch ? this.raiseAlarm(c, ev.hazard) : undefined));
           running.aborted ??= "alarm";
           yield ev;
           break;
@@ -483,9 +553,9 @@ export class ConnectionManager {
   private async *abandonHung(c: ConnRecord, session: HostSession, running: RunningTurn, mark: () => void): AsyncGenerator<ProviderEvent, void> {
     mark();
     this.retireSession(session);
-    void session.ready.then((s) => s.close()).catch(() => undefined);
+    void session.ready.then((s) => this.a("closeSession", async () => s.close())).catch(() => undefined);
     try {
-      await this.deps.fs.killAll(c.uid);
+      await this.safeKill(running.uid); // the uid this turn ran on, not whatever the connection has now
     } catch {
       /* the sweeper retries */
     }
@@ -566,6 +636,8 @@ export class ConnectionManager {
       const c = this.requireConn(req.connectionId);
       this.requireEpoch(c, req.epoch);
       if (c.state !== "disabled") throw new HostError("ESTATE", c.state);
+      // A connection parked for a reason (failed swap, interrupted swap, dead login) or without a home is cleared only by a reconnect.
+      if (c.reason || c.uid < 0 || !c.homeRef) throw new HostError("ESTATE", c.reason ?? "no_home");
       c.state = "active";
       this.save();
       return { state: c.state, epoch: c.epoch };
@@ -581,7 +653,8 @@ export class ConnectionManager {
       c.state = "revoking"; // set before any await: no new turn is admitted from here on
       c.updatedAtMs = this.deps.clock.nowMs();
       this.save();
-      await this.cleanupRevoking(c);
+      // A failure here (a kill that errors, a wipe that times out) leaves the connection revoking with cleanup pending; the sweeper finishes it.
+      await this.cleanupRevoking(c).catch((err) => this.log.warn("revoke_cleanup_failed", { connectionId: c.connectionId, code: errCode(err) }));
       return { state: c.state, epoch: c.epoch, cleanupConfirmed: c.cleanupConfirmedAtMs !== undefined };
     });
   }
@@ -594,18 +667,35 @@ export class ConnectionManager {
 
   // ───────────────────────────── sweeper ─────────────────────────────
 
-  /** Expire attempts, retry wipes, finish revokes, free uids that are provably clean, prune idempotency. */
-  async sweep(): Promise<void> {
-    for (const id of Object.keys(this.state().connections)) {
-      await this.locked(id, async () => {
-        const c = this.state().connections[id];
-        if (!c) return;
-        await this.expireStaleAttempt(c);
-        if (c.state === "revoking") await this.cleanupRevoking(c);
-        await this.drainWipes(c);
-        if (c.state === "attempting" && !c.attempt && !c.wipePending?.length) delete this.state().connections[id]; // abandoned first sign-in
-      });
-    }
+  /** Expire attempts, retry wipes, finish revokes, free uids that are provably clean, prune idempotency. One sweep at a time; one stuck connection never blocks the rest. */
+  sweep(): Promise<void> {
+    this.sweeping ??= this.sweepAll().finally(() => {
+      this.sweeping = undefined;
+    });
+    return this.sweeping;
+  }
+
+  private async sweepAll(): Promise<void> {
+    const ids = Object.keys(this.state().connections);
+    let next = 0;
+    const worker = async () => {
+      for (let i = next++; i < ids.length; i = next++) {
+        const id = ids[i];
+        try {
+          await this.locked(id, async () => {
+            const c = this.state().connections[id];
+            if (!c) return;
+            await this.expireStaleAttempt(c);
+            if (c.state === "revoking") await this.cleanupRevoking(c);
+            await this.drainWipes(c);
+            if (c.state === "attempting" && !c.attempt && !c.wipePending?.length) delete this.state().connections[id]; // abandoned first sign-in
+          });
+        } catch (err) {
+          this.log.warn("sweep_connection_failed", { connectionId: id, code: errCode(err) });
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(8, ids.length) }, worker));
     const st = this.state();
     const now = this.deps.clock.nowMs();
     for (const [k, rec] of Object.entries(st.idempotency)) {
@@ -682,8 +772,8 @@ export class ConnectionManager {
     let status;
     let hazards: Hazard[];
     try {
-      status = await adapter.authStatus(ctx, proc);
-      hazards = await adapter.hazards(ctx);
+      status = await this.a("authStatus", () => adapter.authStatus(ctx, proc));
+      hazards = await this.a("hazards", () => adapter.hazards(ctx));
     } catch {
       await this.discardAttempt(c, "status_failed");
       throw new HostError("EINTERNAL", "status_failed");
@@ -719,12 +809,14 @@ export class ConnectionManager {
     if (!attempt) return;
     delete c.attempt;
     (c.wipePending ??= []).push({ uid: attempt.uid, ref: attempt.attemptRef, kind: "attempt", owner: `attempt:${attempt.attemptRef}` });
+    // A promote that was interrupted after the rename leaves the credentials in the intended home: wipe that too.
+    if (attempt.homeRef) c.wipePending.push({ uid: attempt.uid, ref: attempt.homeRef, kind: "home", owner: `attempt:${attempt.attemptRef}` });
     const login = this.logins.get(attempt.loginRef);
     this.logins.delete(attempt.loginRef);
     this.save();
     if (login) {
       try {
-        await this.adapter(login.provider).loginCancel(login.proc);
+        await this.a("loginCancel", () => this.adapter(login.provider).loginCancel(login.proc));
       } catch {
         /* the process is killed by killAll below */
       }
@@ -741,10 +833,10 @@ export class ConnectionManager {
     const remaining: NonNullable<ConnRecord["wipePending"]> = [];
     for (const w of queue) {
       try {
-        await this.deps.fs.killAll(w.uid);
-        if (w.kind === "attempt") await this.deps.fs.wipeAttempt(w.uid, w.ref);
-        else await this.deps.fs.wipeHome(w.uid, w.ref);
-        if ((await this.deps.fs.residueCount(w.uid)) === 0) this.uids.free(w.uid, w.owner);
+        await this.safeKill(w.uid);
+        if (w.kind === "attempt") await this.f("wipeAttempt", () => this.deps.fs.wipeAttempt(w.uid, w.ref));
+        else await this.f("wipeHome", () => this.deps.fs.wipeHome(w.uid, w.ref));
+        if ((await this.f("residueCount", () => this.deps.fs.residueCount(w.uid))) === 0) this.uids.free(w.uid, w.owner);
         else remaining.push(w);
       } catch {
         remaining.push(w);
@@ -761,7 +853,7 @@ export class ConnectionManager {
     const adapter = this.deps.adapters.get(c.provider);
     if (adapter && c.uid >= 0 && c.homeRef) {
       try {
-        await adapter.logout(this.deps.fs.contextFor(c.connectionId, c.uid, c.homeRef, "home"));
+        await this.a("logout", () => adapter.logout(this.deps.fs.contextFor(c.connectionId, c.uid, c.homeRef, "home")));
       } catch {
         /* best effort: the home is wiped next */
       }
@@ -790,13 +882,13 @@ export class ConnectionManager {
       list.map(async (hs) => {
         hs.dead = true;
         try {
-          await (await hs.ready).close();
+          await this.a("closeSession", async () => (await hs.ready).close());
         } catch {
           /* the process is killed below */
         }
       }),
     );
-    if (c.uid >= 0) await this.deps.fs.killAll(c.uid);
+    await this.safeKill(c.uid);
   }
 
   private markNeedsReconnect(c: ConnRecord, reason: string): void {

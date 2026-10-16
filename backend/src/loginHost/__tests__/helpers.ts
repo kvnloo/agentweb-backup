@@ -32,6 +32,14 @@ export class FakeFs implements UserFsPort {
   wipes: string[] = [];
   residue = new Map<number, number>();
   failWipes = false;
+  /** killAll throws once. */
+  failKillOnce = false;
+  /** promoteAttempt throws before doing anything. */
+  failPromote = false;
+  /** promoteAttempt moves the directory and THEN throws: the shape of a crash between the rename and the save. */
+  crashAfterPromote = false;
+  /** wipeHome never returns. */
+  hangWipe = false;
   writes: Array<{ uid: number; home: string; kind: "attempt" | "home"; rel: string }> = [];
   /** Ordered log of destructive operations: kill:<uid>, wipe:<kind>:<uid>. */
   log: string[] = [];
@@ -55,8 +63,10 @@ export class FakeFs implements UserFsPort {
   promoteGate?: Promise<void>;
   async promoteAttempt(uid: number, attemptRef: string, homeRef: string): Promise<void> {
     if (this.promoteGate) await this.promoteGate;
+    if (this.failPromote) throw new Error("promote failed");
     this.dirs.delete(`attempt:${uid}:${attemptRef}`);
     this.dirs.add(`home:${uid}:${homeRef}`);
+    if (this.crashAfterPromote) throw new Error("crash after rename");
   }
   asUser(uid: number, homeRef: string, kind: "attempt" | "home"): AsUser {
     return {
@@ -72,12 +82,17 @@ export class FakeFs implements UserFsPort {
     this.log.push(`wipe:attempt:${uid}`);
   }
   async wipeHome(uid: number, ref: string): Promise<void> {
+    if (this.hangWipe) await new Promise<void>(() => undefined);
     if (this.failWipes) throw new Error("wipe failed");
     this.dirs.delete(`home:${uid}:${ref}`);
     this.wipes.push(`home:${uid}:${ref}`);
     this.log.push(`wipe:home:${uid}`);
   }
   async killAll(uid: number): Promise<void> {
+    if (this.failKillOnce) {
+      this.failKillOnce = false;
+      throw new Error("kill failed");
+    }
     this.killed.push(uid);
     this.log.push(`kill:${uid}`);
   }

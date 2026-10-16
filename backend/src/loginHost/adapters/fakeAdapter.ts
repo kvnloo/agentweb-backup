@@ -32,6 +32,10 @@ export interface FakeScript {
   ignoreInterrupt?: boolean;
   /** A hung provider: a turn never ends and ignores interrupt() and close() entirely. */
   hangTurn?: boolean;
+  /** openSession never resolves. */
+  openHang?: boolean;
+  /** preflight waits for this before answering. */
+  preflightGate?: Promise<void>;
   /** Called by tests to make every open session report `closed` (the provider process died). */
   killSessions: Array<() => void>;
   /** Turns that were interrupted individually. */
@@ -110,6 +114,7 @@ export function createFakeAdapter(script: FakeScript, opts: FakeOptions = {}): S
     authStatus: async (): Promise<AuthStatus> => ({ loggedIn: script.loggedIn, planLabel: script.planLabel, accountFingerprint: script.accountFingerprint }),
     hazards: async () => script.hazards,
     openSession: async (): Promise<ProviderSession> => {
+      if (script.openHang) await new Promise<void>(() => undefined);
       if (script.openFails) throw Object.assign(new Error("open failed"), { code: "open_failed" });
       script.opened++;
       const bus = new EventEmitter();
@@ -124,7 +129,10 @@ export function createFakeAdapter(script: FakeScript, opts: FakeOptions = {}): S
       });
       return {
         closed,
-        preflight: async () => script.preflight,
+        preflight: async () => {
+          if (script.preflightGate) await script.preflightGate;
+          return script.preflight;
+        },
         async *turn({ turnId }) {
           script.activeTurns++;
           script.maxActiveTurns = Math.max(script.maxActiveTurns, script.activeTurns);

@@ -220,6 +220,31 @@ describe("login host server", () => {
     expect(ROUTES["turn.run"].safeParse({ connectionId: "c1", epoch: 1, idempotencyKey: "k", turnId: "t", prompt: "-x", model: "fast", bridgeToken: "bridge-token-0123456789" }).success).toBe(true);
   });
 
+  it("cuts a turn stream whose reader stops draining, which also ends the turn and frees its slot", async () => {
+    await handle.close();
+    handle = await startHostServer(rig.mgr, { socketPath: sock, tickMs: 60_000, sweepMs: 60_000, streamStallMs: 150 });
+    await signIn(rig, "c1", 1);
+    const big = "x".repeat(4 * 1024 * 1024);
+    rig.script.turnEvents = [
+      { type: "text", delta: big },
+      { type: "text", delta: big },
+      { type: "text", delta: big },
+      { wait: new Promise<void>(() => undefined) },
+      { type: "result", ok: true, text: "x" },
+    ];
+    const sockC = connect(sock);
+    sockC.pause(); // a reader that never reads
+    sockC.on("error", () => undefined);
+    const body = JSON.stringify({ ...turnReq("c1", 1), turnId: "stall-1" });
+    sockC.write(`POST /v1/turn.run HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+    for (let i = 0; i < 100 && (rig.mgr.status({ connectionId: "c1" }).runningTurns === 0 || rig.mgr.status({ connectionId: "c1" }).runningTurns > 0); i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      if (i > 4 && rig.mgr.status({ connectionId: "c1" }).runningTurns === 0) break;
+    }
+    expect(rig.mgr.status({ connectionId: "c1" }).runningTurns).toBe(0);
+    sockC.destroy();
+  }, 20_000);
+
   it("removes a stale socket file left by a dead host and listens again", async () => {
     await handle.close();
     expect(existsSync(sock)).toBe(false);

@@ -22,11 +22,13 @@ export interface ConnRecord {
   createdAtMs: number;
   updatedAtMs: number;
   /** Pending sign-in attempt for this connection, if any (one at a time). */
-  attempt?: { loginRef: string; uid: number; attemptRef: string; startedAtMs: number; expiresAtMs: number; state: "pending" | "ready" };
+  attempt?: { loginRef: string; uid: number; attemptRef: string; startedAtMs: number; expiresAtMs: number; state: "pending" | "ready"; /** Set (and saved) BEFORE the rename during promote, so a crash cannot lose track of where the credentials went. */ homeRef?: string };
   /** Uids/dirs awaiting wipe confirmation (cancelled or expired attempts, replaced homes). `kind` says what to wipe. */
   wipePending?: Array<{ uid: number; ref: string; kind: "attempt" | "home"; /** who owned the uid when it was queued; the uid is freed only while this still matches */ owner: string }>;
   /** Idempotency for promote: the login attempt that produced the current home. */
   promotedLoginRef?: string;
+  /** Set while a home swap is in flight: whether the connection was disabled before it (a reconnect must not re-enable it). */
+  swapWasDisabled?: boolean;
   /** Why the connection is in needs_attention / needs_reconnect (a code, never a message with secrets). */
   reason?: string;
   planLabel?: string;
