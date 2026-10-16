@@ -33,3 +33,10 @@ To roll back at any step, set the row to `off`. `phoneKey` attributes and the in
 - `phoneUniqueCreate` is governed by the settings row only; it does not read `LEAD_EMAIL_UNIQUE_CREATE` (that switch is the email feature's). It shares the email feature's `AccessDenied` circuit breaker, so if the role cannot run `TransactWriteItems` both degrade to a conditional put together.
 - The 10-minute "index unavailable" memory is per process; while the index is building the lookup is skipped, not retried per capture.
 - The backfill had a bug found in review (it required `nameCompanyKey` to be absent, which would have silently skipped every lead with a first name, last name and company); it now only guards what matters and its test fake evaluates real DynamoDB condition expressions.
+
+**Must be settled BEFORE `on` (found by the all-angles review of PR #3569; `create` and `shadow` are unaffected).**
+- The backfill keys every email-less row without a linkedin URL or sync metadata, including hand-entered and imported phone-only leads (leads store no origin, so they cannot be told apart from form captures). In `on`, a form capture on that number merges into the oldest compatible row and `mergeIntoExistingLead` overwrites its firstName, lastName, company, title and notes with any non-empty incoming value. A salesperson's notes can be replaced.
+- A blank name on either side is deliberately not a conflict (multi-step landers), so anyone who knows a number can submit it with blank names and merge into that lead, or seed a row a later real visitor merges into. The email path has the same exposure class.
+- Needed for `on`: either a non-destructive phone merge (fill blanks, never overwrite non-empty fields) or an eligibility guard (a stated name on both sides, plus excluding rows a person has edited), decided after reading the `shadow` counts.
+
+**Fixed in review:** the phone id used the email hash over `phone:<digits>`, so an "email" of literally `phone:2124567890` produced the same id inside one bucket; phone ids now use their own HMAC namespace (email ids are unchanged). The backfill scan now pauses 250 ms between pages.
