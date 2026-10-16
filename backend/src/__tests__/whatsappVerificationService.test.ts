@@ -945,6 +945,8 @@ describe('handleVerificationMessage', () => {
     await begin();
     await handleVerificationMessage('Verify ZZZZZZZZ', PHONE);
     expect(whatsapp.sendMessage.mock.calls[0][0].text).toMatch(/isn't valid or has expired/);
+    // Where the WhatsApp card actually lives in the portal.
+    expect(whatsapp.sendMessage.mock.calls[0][0].text).toMatch(/Settings → Connected Accounts/);
   });
 
   it('stays silent for a redelivery, which has already been answered', async () => {
