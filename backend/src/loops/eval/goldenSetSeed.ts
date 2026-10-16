@@ -257,6 +257,57 @@ export function buildSeedCases(inputs: SeedInputs): SeedResult {
   };
 }
 
+// Work-plan sessions (ENG-665) ------------------------------------------------------------------
+
+/** One AW-ChatSessions row that has at least one work-plan step (ids and dates only). */
+export interface WorkPlanSessionRow {
+  sessionId: string;
+  userId?: string;
+  createdAt?: string;
+}
+
+export const WORK_PLAN_SEED_SOURCE = 'work_plan_session';
+
+export interface WorkPlanSeedResult {
+  /** New cases to create; already-stored work-plan cases are not repeated. */
+  cases: GoldenCase[];
+  eligible: number;
+  alreadyStored: number;
+  target: number;
+}
+
+/**
+ * `agent-task-success` only grades sessions that carry a work plan; it abstained on 46 of the first 50
+ * agent cases (45 had none), so labelling them could never reach the validation minimum. This source
+ * adds work-plan sessions of every session type (the eval-v2 sampler grades scheduled and predefined
+ * work-plan runs too), created within SAMPLE_WINDOW_DAYS, in hash order, never by any grader verdict.
+ *
+ * `target` is the total number of work-plan cases the store should hold, so a re-run with the same
+ * target creates nothing. Sessions already in the store under any agent source are skipped.
+ */
+export function buildWorkPlanCases(input: {
+  sessions: WorkPlanSessionRow[];
+  existing: GoldenCase[];
+  target: number;
+  now: Date;
+}): WorkPlanSeedResult {
+  const stored = new Set(input.existing.filter((c) => c.surface === 'agent').map((c) => c.sourceRef.id));
+  const alreadyStored = input.existing.filter((c) => c.surface === 'agent' && c.seedSource === WORK_PLAN_SEED_SOURCE).length;
+  const windowStart = input.now.getTime() - SAMPLE_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+  const eligible = input.sessions
+    .filter((s) => !isEvaluationUser(s.userId))
+    .filter((s) => {
+      const created = s.createdAt ? Date.parse(s.createdAt) : NaN;
+      return !Number.isNaN(created) && created <= input.now.getTime() && created >= windowStart;
+    })
+    .map((s) => newGoldenCase({ surface: 'agent', taskType: WORK_PLAN_SEED_SOURCE, sourceId: s.sessionId, seedSource: WORK_PLAN_SEED_SOURCE, now: input.now }));
+  const cases = eligible
+    .filter((c) => !stored.has(c.sourceRef.id))
+    .sort(hashOrder)
+    .slice(0, Math.max(input.target - alreadyStored, 0));
+  return { cases, eligible: eligible.length, alreadyStored, target: input.target };
+}
+
 /** Validates the off-repo catalogue file's shape. */
 export function parseFpCatalogue(value: unknown): FpCatalogue {
   const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
