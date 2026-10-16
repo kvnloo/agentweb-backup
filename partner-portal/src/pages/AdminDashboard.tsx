@@ -52,7 +52,8 @@ const ADMIN_TAB_DESCRIPTIONS: Readonly<Record<string, string>> = {
 import { format } from "date-fns";
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
-import { buildApiUrl, CUSTOMER_FRONTEND_URL } from "../config";
+import { buildApiUrl, CUSTOMER_FRONTEND_URL, CUSTOM_SUBSCRIPTION_LINKS_ENABLED } from "../config";
+import CustomSubscriptionLinkButton from "../components/admin/CustomSubscriptionLinkButton";
 import { buildAgentRunInspectorUrl } from "../utils/agentRunLinks";
 import DOMPurify from "dompurify";
 import ImageModelsSettings from "../components/admin/ImageModelsSettings";
@@ -992,6 +993,8 @@ export default function AdminDashboard() {
   const [editWaitlistLoading, setEditWaitlistLoading] = useState(false);
 
   const { token, user, setToken } = useAuth();
+  // ENG-2488: captured before row maps shadow `user`.
+  const viewerIsAdmin = !!user?.isAdmin;
 
   const {
     users: contextUsers,
@@ -4809,6 +4812,17 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                       <Typography variant="caption" color="text.disabled" sx={{ fontFamily: "monospace", fontSize: "0.7rem" }}>
                                         {user.orgId}
                                       </Typography>
+                                      <CustomSubscriptionLinkButton
+                                        orgId={user.orgId}
+                                        viewerIsAdmin={viewerIsAdmin}
+                                        enabled={CUSTOM_SUBSCRIPTION_LINKS_ENABLED}
+                                        submit={async (body) => {
+                                          const res = await axios.post(buildApiUrl("/api/admin/custom-subscription-links"), body, {
+                                            headers: { Authorization: `Bearer ${token}` },
+                                          });
+                                          return { url: res.data.url };
+                                        }}
+                                      />
                                     </Box>
                                   </Grid>
                                 )}

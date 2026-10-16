@@ -171,7 +171,7 @@ import { meterUsageFromResponse } from '../utils/llmClients';
 import { pickTransport } from './funding/transport';
 import { currentRunFunding } from './funding/runFunding';
 import { recordLlmUsage, customerUpstreamCost } from './funding/recordLlmUsage';
-import { resolveCallFunding } from './funding/callFunding';
+import { resolveCallFunding, customerKeyBlocksTurn } from './funding/callFunding';
 import {
   getModelPrice,
   costScoreFromPrice,
@@ -1219,6 +1219,16 @@ async function recordToolReliabilityEvent(params: {
   } catch (reliabilityErr) {
     console.warn('[AgentMode] H-LEARN reliability record skipped (non-fatal):', reliabilityErr);
   }
+}
+
+/** A plain title cut from the user's first message: no AI call, so nothing for AgentWeb to pay. */
+export function titleFromUserMessage(message: string): string {
+  const flat = message.replace(/[`*_#>\[\]{}"]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!flat) return 'Marketing Task';
+  if (flat.length <= 60) return flat;
+  const cut = flat.slice(0, 60);
+  const lastSpace = cut.lastIndexOf(' ');
+  return (lastSpace > 24 ? cut.slice(0, lastSpace) : cut).trim();
 }
 
 export class AgentModeService {
@@ -3155,6 +3165,7 @@ export class AgentModeService {
       const isLegacySession = rawAssociatedSkills === undefined || rawAssociatedSkills === null;
       let associatedSkills: any[] = [];
       const sessionAssociatedSkillIds: string[] = Array.isArray(rawAssociatedSkills) ? rawAssociatedSkills : [];
+      let liveInstalledSkillIds: string[] = sessionAssociatedSkillIds;
       if (sessionAssociatedSkillIds.length) {
         associatedSkills = await skillService.getSkillsByIds(sessionAssociatedSkillIds);
       }
@@ -3786,6 +3797,7 @@ export class AgentModeService {
             // Refresh session and skills
             currentSession = await chatbotDb.getChatSession(sessionId);
             const updatedAssociatedSkillIds = currentSession?.associatedSkills || [];
+            liveInstalledSkillIds = updatedAssociatedSkillIds;
 
             if (updatedAssociatedSkillIds.length) {
               associatedSkills = await skillService.getSkillsByIds(updatedAssociatedSkillIds);
@@ -4711,6 +4723,7 @@ export class AgentModeService {
           publishedSkillsCount: publishedSkills.length,
           sessionAssociatedSkillIdsCount: sessionAssociatedSkillIds.length,
           allowedToolNames,
+          describeGateRefusal: (toolName: string) => this.describeToolGateRefusal(toolName, publishedSkills, liveInstalledSkillIds, userAllowedSkillIds),
           toolResponseS3Threshold: TOOL_RESPONSE_S3_THRESHOLD,
           maxToolContentSize: MAX_TOOL_CONTENT_SIZE,
           mediaGenerationDeadlineMs,
@@ -6763,6 +6776,7 @@ export class AgentModeService {
 
     // Add virtual other_skills if allowed, there are unassociated tools, AND it's not already installed
     if (!associatedSet.has(OTHER_SKILLS_VIRTUAL_ID) && (isWildcard || allowedSet.has(OTHER_SKILLS_VIRTUAL_ID))) {
+      // ENG-2299: use the full published catalog; scoping by the caller's tier would leak higher-tier tools into the catch-all.
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
 
       if (unassociatedTools.length > 0) {
@@ -7166,6 +7180,7 @@ export class AgentModeService {
         if (rejectedSkillIds.length > 0) {
           const buckets = await this.classifySkillRejections(rejectedSkillIds, userId);
           const { unentitled, unavailable, unresolved, forbidden } = buckets;
+          await this.logInstallRefusal(sessionId, userId, skillIds, buckets, false);
           /*
            * `success: false` matters as much as the text: the success path returns
            * `success: true`, so a bare `{ message }` left `success` undefined and this refusal
@@ -7219,6 +7234,7 @@ export class AgentModeService {
          * ledger too.
          */
         const partialBuckets = await this.classifySkillRejections(rejectedSkillIds, userId);
+        await this.logInstallRefusal(sessionId, userId, skillIds, partialBuckets, true);
         /*
          * `noSubstitution` matters MORE here than on the full-refusal branch, not less. There,
          * the dispatcher's downgrade attaches an error class whose retryability line carries
@@ -7431,6 +7447,63 @@ export class AgentModeService {
     };
   }
 
+  /** ENG-2299: one diagnostic line per install_skills rejection; never alters the result. */
+  private async logInstallRefusal(
+    sessionId: string,
+    userId: string,
+    requested: string[],
+    buckets: { unentitled: string[]; unavailable: string[]; unresolved: string[]; forbidden: string[] },
+    partial: boolean,
+  ): Promise<void> {
+    try {
+      const published = await skillService.getPublishedSkills();
+      console.warn('[install-refused]', JSON.stringify({
+        sessionId,
+        userId,
+        partial,
+        requested: requested.slice(0, 20),
+        unentitled: buckets.unentitled.slice(0, 20),
+        unavailable: buckets.unavailable.slice(0, 20),
+        unresolved: buckets.unresolved.slice(0, 20),
+        forbidden: buckets.forbidden.slice(0, 20),
+        catalogSize: published.length,
+        otherSkillsPoolSize: this.getUnassociatedToolNames(published).length,
+      }));
+    } catch { /* diagnostics must never change the refusal */ }
+  }
+
+  /**
+   * ENG-2299: facts needed to tell a missing install from catalog or entitlement drift when a
+   * "tool is not available" refusal is reported. Logged by the dispatch gate; changes no behavior.
+   */
+  public describeToolGateRefusal(
+    toolName: string,
+    publishedSkills: any[],
+    installedSkillIds: string[],
+    userAllowedSkillIds: string[] | null,
+  ): Record<string, unknown> {
+    const entitlementResolved = userAllowedSkillIds !== null && userAllowedSkillIds !== undefined;
+    const allowed = userAllowedSkillIds ?? [];
+    const isWildcard = allowed.includes('*');
+    const claimedBy = publishedSkills
+      .filter(s => s.isPublished === true && Array.isArray(s.toolNames) && s.toolNames.includes(toolName))
+      .map(s => ({
+        skillId: s.skillId,
+        installed: installedSkillIds.includes(s.skillId),
+        tierAllows: isWildcard || allowed.includes(s.skillId),
+      }));
+    return {
+      entitlementResolved,
+      installedSkillIds,
+      otherSkillsInstalled: installedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID),
+      tierAllowsOtherSkills: isWildcard || allowed.includes(OTHER_SKILLS_VIRTUAL_ID),
+      allowedSkillCount: allowed.length,
+      catalogSize: publishedSkills.length,
+      inOtherSkillsPool: this.getUnassociatedToolNames(publishedSkills).includes(toolName),
+      claimedBy,
+    };
+  }
+
   /**
    * ENG-1222: the single source of truth for "which tools + skill-context text
    * does a session with these installed skills get". Was private to Agent Mode
@@ -7468,6 +7541,7 @@ export class AgentModeService {
 
     // Handle virtual other_skills (gated by subscription)
     if (sessionAssociatedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID) && (isWildcard || allowedSkillSet.has(OTHER_SKILLS_VIRTUAL_ID))) {
+      // ENG-2299: use the full published catalog; scoping by the caller's tier would leak higher-tier tools into the catch-all.
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
       unassociatedTools.forEach(t => allowedToolNames.add(t.name));
     }
@@ -10529,7 +10603,19 @@ export class AgentModeService {
     return tasksImpl.createImageTaskFromPrompt(taskName, prompt, category, userId, sessionId, attachPreviousTaskResults);
   }
 
-  async generateSessionTitle(userMessage: string, usageContext?: LLMUsageContext): Promise<string> {
+  /**
+   * `turnModel` is the model the user's turn (the one this title belongs to) will run on. When the
+   * user has switched on their own key for that model's provider and it cannot serve the turn, the
+   * turn fails closed, so AgentWeb must not spend an AI call on a title for it either: the title is
+   * cut from the message instead. Omitted by callers that have no customer-routable turn behind
+   * the title (the title is then always AgentWeb-funded, as before).
+   */
+  async generateSessionTitle(userMessage: string, usageContext?: LLMUsageContext, turnModel?: string): Promise<string> {
+    if (turnModel && usageContext?.userId) {
+      // Same alias map the turn itself uses, so a legacy model id resolves to the same provider.
+      const modelLab = this.llmModels[this.normalizeModelId(turnModel)]?.provider;
+      if (await customerKeyBlocksTurn(usageContext.userId, modelLab)) return titleFromUserMessage(userMessage);
+    }
     try {
       const defaultModel = await this.getDefaultModel();
 
