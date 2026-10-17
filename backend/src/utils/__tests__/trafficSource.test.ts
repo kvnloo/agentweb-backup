@@ -327,7 +327,7 @@ describe('2.2.0 DramaBreak attribution decisions', () => {
   it('Nova ads without utm_source=nova are still paid Nova via is_nova / nb_cid / nvss_ (2.3.0)', () => {
     for (const q of ['is_nova=true', 'nb_cid=2049718437503352834', 'utm_content=nvss_ABC_123']) {
       expect(classifyTraffic({ landingUrl: lp(q), referrer: 'https://www.newsbreak.com/' }))
-        .toMatchObject({ channelKey: 'nova', channelGroup: 'Paid', trafficType: 'paid', paidSignal: 'url:nova' });
+        .toMatchObject({ channelKey: 'nova', channelGroup: 'Paid', trafficType: 'paid', paidSignal: 'url:nova', matchedBy: 'url:nova', linkChannel: '' });
       expect(classifyTraffic({ landingUrl: lp(q) })).toMatchObject({ channelKey: 'nova', trafficType: 'paid' });
     }
     expect(classifyTraffic({ landingUrl: lp(''), referrer: 'https://www.newsbreak.com/' }))

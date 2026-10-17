@@ -338,6 +338,7 @@ export type MatchedBy =
   | 'referrer'
   | 'user_agent'
   | 'click_id'
+  | 'url:nova'
   | 'fallback_utm_source'
   | 'fallback_referrer'
   | 'none';
@@ -715,9 +716,10 @@ export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassi
   // newsbreak.com / Direct traffic and were routed into organic-only lists.
   const novaUrlSignal = param('is_nova').toLowerCase() === 'true' || Boolean(param('nb_cid'))
     || utm.utm_content.toLowerCase().startsWith('nvss_');
-  const linkDef = matchUtmSource(sourceLower)
-    ?? (!sourceLower && novaUrlSignal ? CHANNEL_BY_KEY.get('nova') : undefined);
-  if (linkDef?.key === 'nova' && !paidSignal) paidSignal = matchUtmSource(sourceLower) ? 'utm_source:nova' : 'url:nova';
+  const utmLinkDef = matchUtmSource(sourceLower);
+  const novaUrlDef = !utmLinkDef && !sourceLower && novaUrlSignal ? CHANNEL_BY_KEY.get('nova') : undefined;
+  const linkDef = utmLinkDef ?? novaUrlDef;
+  if (linkDef?.key === 'nova' && !paidSignal) paidSignal = utmLinkDef ? 'utm_source:nova' : 'url:nova';
   const paidFinal = paidSignal !== null;
   let detectedDef: ChannelDef | undefined;
   let detectedBy: MatchedBy = 'none';
@@ -733,13 +735,13 @@ export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassi
 
   if (linkDef && (linkDef.key === 'agency' || paidFinal)) {
     def = linkDef;
-    matchedBy = 'utm_source';
+    matchedBy = novaUrlDef ? 'url:nova' : 'utm_source';
   } else if (detectedDef) {
     def = detectedDef;
     matchedBy = detectedBy;
   } else if (linkDef) {
     def = linkDef;
-    matchedBy = 'utm_source';
+    matchedBy = novaUrlDef ? 'url:nova' : 'utm_source';
   }
 
   // New vs V1: a platform click id with no other source signal names its platform, instead of the
@@ -796,7 +798,7 @@ export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassi
     sourceLink,
     sourceDetail,
     matchedBy,
-    linkChannel: linkDef ? linkDef.name : '',
+    linkChannel: utmLinkDef ? utmLinkDef.name : '',
     detectedChannel: detectedDef ? detectedDef.name : '',
     paidSignal,
     classifierVersion: TRAFFIC_CLASSIFIER_VERSION,
