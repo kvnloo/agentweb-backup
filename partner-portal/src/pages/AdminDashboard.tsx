@@ -118,6 +118,7 @@ import {
   ContentCopy as ContentCopyIcon,
 } from "@mui/icons-material";
 import { staffOperatedBadge, type SelfActivitySignal } from "../utils/selfActivityBadge";
+import { ErrorState } from "../components/StatusState";
 
 interface TabPanelProps {
   children?: React.ReactNode;
@@ -3468,7 +3469,16 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
   const currentAdminTab = ADMIN_TABS.find((adminTab) => adminTab.value === tabValue);
 
   if (adminError) {
-    return <Alert severity="error">{adminError}</Alert>;
+    return (
+      <ErrorState
+        title="We couldn't load the admin dashboard"
+        description={adminError}
+        onRetry={() => {
+          void loadUsers();
+          void loadWaitlist();
+        }}
+      />
+    );
   }
 
   return (
