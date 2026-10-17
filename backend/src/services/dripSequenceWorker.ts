@@ -23,6 +23,7 @@ import { loadSenderConfig as loadCrmSenderConfig } from './crmSenderService';
 import { CrmSender } from './crmSenderTypes';
 import { settingsService } from './settingsService';
 import { v4 as uuidv4 } from 'uuid';
+import { isSuspectedMachineEngagement } from './machineEngagement';
 
 // Identifies this process for the claimedBy field — mirrors
 // socialEngagementExecutor.ts's INSTANCE_ID, used for log correlation only.
@@ -492,6 +493,17 @@ async function checkExitConditions(
           `gapFromSend=${gapSeconds === null ? 'unknown' : `${gapSeconds}s`}; ` +
           `userAgent=${detail.userAgent || 'n/a'})`,
         );
+        // ENG-2524: make the tripwire observable. Logging only — the exit is unchanged.
+        const gapMs = Number.isFinite(sentAt) ? eventAt - sentAt : null;
+        if (isSuspectedMachineEngagement(t.eventType, gapMs)) {
+          console.warn('[dripWorker] suspected_machine_engagement', JSON.stringify({
+            enrollmentId: enrollment.enrollmentId,
+            sequenceId: enrollment.sequenceId,
+            eventType: t.eventType,
+            gapFromSendMs: gapMs,
+            userAgent: detail.userAgent || null,
+          }));
+        }
         return 'engagement';
       }
     }
