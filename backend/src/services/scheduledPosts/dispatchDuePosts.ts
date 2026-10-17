@@ -14,8 +14,19 @@ export interface ScheduledPostRepository {
 
 export type PublishResult = { ok: true } | { ok: false; error: string; retryable: boolean };
 
+/**
+ * Publication contract: implementations MUST be idempotent on `idempotencyKey`
+ * (a repeat call with the same key must not publish a second time). The
+ * dispatcher's fresh read narrows but cannot close the window between publish
+ * and save (concurrent dispatchers, or save failing after a successful publish),
+ * so duplicate-safety is owned by the publisher, keyed by post ID.
+ */
 export interface ScheduledPostPublisher {
-  publish(record: ScheduledPostRecord): Promise<PublishResult>;
+  publish(record: ScheduledPostRecord, opts: { idempotencyKey: string }): Promise<PublishResult>;
+}
+
+export function scheduledPostIdempotencyKey(postId: string): string {
+  return `scheduled-post:${postId}`;
 }
 
 export interface DispatchSummary {
@@ -44,7 +55,7 @@ export async function dispatchDuePosts(deps: {
       }
       let result: PublishResult;
       try {
-        result = await publisher.publish(current);
+        result = await publisher.publish(current, { idempotencyKey: scheduledPostIdempotencyKey(current.id) });
       } catch (err) {
         result = { ok: false, error: err instanceof Error ? err.message : String(err), retryable: true };
       }

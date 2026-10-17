@@ -19,15 +19,17 @@ function fakeRepo(records: ScheduledPostRecord[], overrides: Record<string, Sche
 
 function fakePublisher(outcomes: Record<string, PublishResult | Error> = {}) {
   const calls: string[] = [];
+  const keys: string[] = [];
   const publisher: ScheduledPostPublisher = {
-    publish: async (r) => {
+    publish: async (r, opts) => {
       calls.push(r.id);
+      keys.push(opts.idempotencyKey);
       const o = outcomes[r.id];
       if (o instanceof Error) throw o;
       return o ?? { ok: true };
     },
   };
-  return { publisher, calls };
+  return { publisher, calls, keys };
 }
 
 describe('dispatchDuePosts (ENG-2520)', () => {
@@ -66,5 +68,17 @@ describe('dispatchDuePosts (ENG-2520)', () => {
     await dispatchDuePosts({ repo, publisher, now: NOW });
     expect(calls).toEqual(['early', 'mid', 'late']);
     expect(saves.map((r) => [r.id, r.status])).toEqual([['early', 'fired'], ['mid', 'fired'], ['late', 'fired']]);
+  });
+
+  it('passes a stable post-ID idempotency key so a retry after a failed save is dedupable', async () => {
+    const { repo } = fakeRepo([rec('p', -10)]);
+    let failSave = true;
+    const origSave = repo.save;
+    repo.save = async (r) => { if (failSave) { failSave = false; throw new Error('save failed'); } return origSave(r); };
+    const { publisher, keys } = fakePublisher();
+    const first = await dispatchDuePosts({ repo, publisher, now: NOW });
+    expect(first.failed).toEqual(['p']);
+    await dispatchDuePosts({ repo, publisher, now: NOW });
+    expect(keys).toEqual(['scheduled-post:p', 'scheduled-post:p']);
   });
 });
