@@ -36,6 +36,9 @@ import { handleHardBounceRecipients } from '../services/emailDeliverabilityServi
 // same counters instead of a second set that drifts out of step with this one.
 import { shouldAttemptCapiSend, isCapiAccountPaused, recordCapiUsage } from '../services/capiSendBudget';
 import { suppressLeadSideEffects, isSessionList, resolveSessionIdentity } from '../utils/sessionList';
+import { getPhoneDedupeMode } from '../utils/phoneLeadDedupeMode';
+import { phoneDedupeKey, phoneNamesConflict } from '../utils/phoneLeadDedupe';
+import { findPhoneMatch } from '../services/phoneLeadMatch';
 import { upsertSessionLead } from '../services/sessionUpsertService';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
@@ -766,9 +769,31 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // the body only supplies the identity to use, and an invalid or missing identity falls back
     // to exactly the behaviour below, so LPs that do not send sessionStartMs yet are unchanged.
     const sessionIdentity = isSessionList(leadList) ? resolveSessionIdentity(req.body) : null;
-    const existingLead = normalizedEmail && !sessionIdentity
+    let existingLead: any = normalizedEmail && !sessionIdentity
       ? await crmDb.getLeadByEmail(leadList.listId, normalizedEmail.toLowerCase())
       : null;
+
+    // ENG-2123: an EMAIL-LESS capture can be a repeat of an earlier one on the same number. Off unless the
+    // LEAD_PHONE_DEDUPE_MODE setting says otherwise (utils/phoneLeadDedupeMode.ts), never for session lists
+    // or the synthetic smoke-test numbers (which have their own deterministic-id path below).
+    const phoneMode = !normalizedEmail && !leadData.linkedin && normalizedPhone && !sessionIdentity && !isSessionList(leadList) && !isSmokeTestPhone(normalizedPhone)
+      ? await getPhoneDedupeMode()
+      : 'off';
+    const phoneKey = phoneMode === 'off' ? '' : phoneDedupeKey(normalizedPhone);
+    let phoneSharedLine = false;
+    if (phoneKey && (phoneMode === 'shadow' || phoneMode === 'on')) {
+      try {
+        const match = await findPhoneMatch(leadList.listId, phoneKey, leadData);
+        // No phone number, name or lead id in this line: only counts and the decision.
+        console.log(`[phone-dedupe] mode=${phoneMode} list=${leadList.listId} decision=${match.decision} candidates=${match.candidates} valid=${match.valid}`);
+        if (phoneMode === 'on' && match.decision === 'match') existingLead = match.lead;
+        // A known shared line is never collapsed, not even by the same-bucket exactly-once create.
+        phoneSharedLine = match.decision === 'shared-line';
+      } catch (lookupErr: any) {
+        // A failed lookup must never fail the capture: create normally.
+        console.warn(`[phone-dedupe] lookup failed, creating normally: ${lookupErr?.message || lookupErr}`);
+      }
+    }
 
     // Only stamp forwardedAt for new leads; for existing leads, preserve the original timestamp
     let mergedCustomFields: Record<string, any> = existingLead
@@ -947,18 +972,17 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // dedupe on top of it. Until then the primary key stops doubling as an index.
       const deterministicLeadId =
         !normalizedEmail && isSmokeTestPhone(normalizedPhone) ? phoneLeadId(normalizedPhone) : '';
+      const createInput: any = {
+        ...(deterministicLeadId ? { ...leadData, leadId: deterministicLeadId, failIfExists: true } : leadData),
+        // Only added when true, so every non-session list passes byte-identical input.
+        ...(suppressSideEffects ? { suppressSideEffects: true } : {}),
+        // ENG-2321: an email lead on an ordinary list takes the exactly-once create (db.createLead).
+        ...(normalizedEmail && !isSessionList(leadList) ? { emailUniqueCreate: true } : {}),
+        // ENG-2123: the phone twin, when the rollout mode is not 'off' and the number is specific enough.
+        ...(phoneKey && !phoneSharedLine ? { phoneUniqueCreate: true } : {}),
+      };
       try {
-        lead = await crmDb.createLead(
-          leadList.listId,
-          {
-            ...(deterministicLeadId ? { ...leadData, leadId: deterministicLeadId, failIfExists: true } : leadData),
-            // Only added when true, so every non-session list passes byte-identical input.
-            ...(suppressSideEffects ? { suppressSideEffects: true } : {}),
-            // ENG-2321: an email lead on an ordinary list takes the exactly-once create (db.createLead).
-            ...(normalizedEmail && !isSessionList(leadList) ? { emailUniqueCreate: true } : {}),
-          },
-          'form_fill'
-        );
+        lead = await crmDb.createLead(leadList.listId, createInput, 'form_fill');
         isNew = true;
       } catch (createErr: any) {
         // The conditional create lost to an earlier submission of the same number. That is
@@ -966,7 +990,23 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         // report it as a duplicate. isNew stays false, so none of the new-lead side effects
         // (sequence enrolment, auto-draft/auto-send, owner notify, CAPI) fire a second time
         // for one person — which is the whole reason the number is keyed deterministically.
-        if (createErr?.duplicateEmail && createErr.existingLead) {
+        // The winner is re-read by primary key: the carried row may predate an edit made since (a corrected
+        // phone, an added email), and a row that no longer qualifies must not be merged into.
+        const phoneWinner: any = createErr?.duplicatePhone && createErr.existingLead
+          ? (await crmDb.getLeadById(leadList.listId, createErr.existingLead.leadId, { consistentRead: true })) || createErr.existingLead
+          : null;
+        if (phoneWinner && (
+          phoneNamesConflict(phoneWinner, leadData)
+          || String(phoneWinner.email ?? '').trim() !== ''
+          || phoneDedupeKey(phoneWinner.phone) !== phoneKey
+        )) {
+          // ENG-2123: a concurrent submission on the same number that names a DIFFERENT person (a shared
+          // household/office line). Merging would overwrite the first person's name and answers with the
+          // second's, so keep two rows - exactly what happened before this feature - on an ordinary id.
+          const { phoneUniqueCreate: _separate, ...separateInput } = createInput;
+          lead = await crmDb.createLead(leadList.listId, separateInput, 'form_fill');
+          isNew = true;
+        } else if ((createErr?.duplicateEmail || createErr?.duplicatePhone) && createErr.existingLead) {
           // The email twin of the case below: getLeadByEmail (eventually-consistent GSI) missed
           // above, but createLead's own pre-check found a row a concurrent submission wrote in
           // between. That is a REPEAT submission of an existing lead, not a failure — throwing
@@ -982,7 +1022,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           // decides `changed` and the write-once backfills — so re-read by primary key,
           // consistently (one GetItem, race path only); fall back to the carried row only if
           // that read comes back empty.
-          const fresh = await crmDb.getLeadById(leadList.listId, createErr.existingLead.leadId, { consistentRead: true });
+          const fresh = phoneWinner || await crmDb.getLeadById(leadList.listId, createErr.existingLead.leadId, { consistentRead: true });
           await mergeIntoExistingLead(fresh || createErr.existingLead);
         } else if (!createErr?.leadAlreadyExists) {
           throw createErr;
