@@ -13,6 +13,13 @@
 import { googleAdsService } from '../src/services/googleAdsService';
 import { runServingChainCli } from '../src/services/googleAdsServingChainCli';
 
+// Exit only after stdout drains so piped/file JSON readback is never truncated; an explicit
+// exit is still needed because SDK clients can hold the event loop open.
+const exitAfterFlush = (code: number): void => {
+  process.exitCode = code;
+  process.stdout.write('', () => process.exit(code));
+};
+
 runServingChainCli(process.argv.slice(2), googleAdsService)
-  .then(code => process.exit(code))
-  .catch(() => process.exit(1));
+  .then(exitAfterFlush)
+  .catch(() => exitAfterFlush(1));

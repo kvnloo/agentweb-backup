@@ -73,5 +73,6 @@ test('bad args exit 1 without calling the verifier', async () => {
 
 test('parse/redact helpers', () => {
   expect(parseServingChainArgs(['--user-id=u', '--customer-id=123-456-7890'])).toEqual({ userId: 'u', customerId: '1234567890' });
+  expect(() => parseServingChainArgs(['--user-id', 'u', '--customer-id', '1', '--campaign-id', '--campaign-id=4'])).toThrow('missing value for --campaign-id');
   expect(redact('x eyJhbGc.eyJzdWI.sig y 1//0gRefreshTok3n_abc z')).toBe('x [REDACTED] y [REDACTED] z');
 });

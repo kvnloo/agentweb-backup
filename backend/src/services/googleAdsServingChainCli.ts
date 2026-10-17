@@ -33,7 +33,7 @@ export function parseServingChainArgs(argv: string[]): ServingChainCliArgs {
   for (let i = 0; i < argv.length; i++) {
     const [flag, inline] = argv[i].split(/=(.*)/s, 2);
     const value = inline !== undefined ? inline : argv[++i];
-    if (value === undefined || value === '') throw new Error(`missing value for ${flag}`);
+    if (value === undefined || value === '' || (inline === undefined && value.startsWith('--'))) throw new Error(`missing value for ${flag}`);
     if (flag === '--user-id') userId = value;
     else if (flag === '--customer-id') customerId = value.replace(/-/g, '');
     else if (flag === '--campaign-id') campaignIds.push(value);
