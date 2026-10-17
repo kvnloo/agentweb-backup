@@ -31,6 +31,28 @@ const INSTANCE_ID = uuidv4();
 
 const PINNED_ACCOUNT_SNOOZE_MS = 30 * 60 * 1000;
 
+/**
+ * ENG-2529: the shared LinkedIn write gate (daily volume cap + hourly pacer) refused this step's send.
+ * Not a failure of the step: the enrollment is deferred (snoozed, step NOT advanced) and retried later.
+ */
+export class LinkedInWriteDeferredError extends Error {
+  constructor(public readonly gate: string, public readonly reason: string, public readonly accountId: string) {
+    super(`LinkedIn write deferred by ${gate} on account ${accountId}: ${reason}`);
+    this.name = 'LinkedInWriteDeferredError';
+  }
+}
+
+/** How long to defer an enrollment whose LinkedIn send was refused by the hourly pacer. */
+export const LINKEDIN_PACER_DEFER_MS = 30 * 60 * 1000;
+
+/** Retry time for a deferred LinkedIn send: next UTC midnight for the daily cap, else a short pacer backoff. */
+export function linkedInDeferRetryAt(gate: string, now: Date = new Date()): string {
+  if (gate === 'daily_volume') {
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)).toISOString();
+  }
+  return new Date(now.getTime() + LINKEDIN_PACER_DEFER_MS).toISOString();
+}
+
 /** A LinkedIn step pins an account the sequence owner no longer owns or shares. */
 export class PinnedLinkedInAccountNotConnectedError extends Error {
   constructor(stepNumber: number, userId: string) {
@@ -92,6 +114,12 @@ export async function processDueEnrollments(): Promise<{
         const retryAt = new Date(Date.now() + PINNED_ACCOUNT_SNOOZE_MS).toISOString();
         await dripSequenceDb.snoozeEnrollment(enrollment.enrollmentId, retryAt).catch(() => {});
         console.log(`[dripWorker] Snoozed enrollment ${enrollment.enrollmentId} until ${retryAt} (pinned LinkedIn account not connected)`);
+      } else if (err instanceof LinkedInWriteDeferredError) {
+        // ENG-2529: the shared LinkedIn gate refused the send. Defer — do not fail, do not advance —
+        // so the step is sent once the pacer/daily cap has room.
+        const retryAt = linkedInDeferRetryAt(err.gate);
+        await dripSequenceDb.snoozeEnrollment(enrollment.enrollmentId, retryAt).catch(() => {});
+        console.log(`[dripWorker] Deferred enrollment ${enrollment.enrollmentId} until ${retryAt} (LinkedIn ${err.gate} refused on ${err.accountId}: ${err.reason})`);
       } else if (err instanceof SenderDailyLimitExceededError) {
         // ENG-265: the sender's daily counter resets at UTC midnight — releasing
         // the claim here would just re-fail on the very next 5-minute tick until
@@ -368,6 +396,8 @@ async function sendLinkedInStep(
     throw new Error(`LinkedIn step ${step.stepNumber} has empty message text`);
   }
 
+  await paceDripLinkedInWrite(enrollment.userId, accountId, 'send-message');
+
   await linkedInOutreachService.sendMessage(accountId, linkedInUrl, true, messageText);
   console.log(`[dripWorker] Sent LinkedIn step ${step.stepNumber} to ${linkedInUrl} (account: ${accountId})`);
 
@@ -379,6 +409,30 @@ async function sendLinkedInStep(
     } catch { /* non-critical */ }
   }
   return true;
+}
+
+/**
+ * ENG-2529: every drip LinkedIn write goes through the same gate as the agent tool and CRM routes.
+ * An account the sequence owner owns or shares gets the full gate (daily cap + hourly pacer);
+ * a shared-pool fallback account has no owner record to reserve a daily slot against, so it is
+ * still held to the per-account hourly pacer. Which account is used stays with ENG-1759/ENG-2347.
+ * Throws LinkedInWriteDeferredError on refusal so the caller never sends.
+ */
+export async function paceDripLinkedInWrite(userId: string, accountId: string, action: 'send-message' | 'send-invite'): Promise<void> {
+  const { resolveLinkedInAccountForWrite, paceLinkedInWrite } = await import('./agentMode/linkedInDailyVolumeGate');
+  const resolved = await resolveLinkedInAccountForWrite(userId, accountId);
+  if (resolved) {
+    const paced = await paceLinkedInWrite(action, resolved, accountId);
+    if (paced.refusal) {
+      throw new LinkedInWriteDeferredError(paced.refusal.gate, paced.refusal.error.split('\n')[0], accountId);
+    }
+    return;
+  }
+  const { reserveWriteSlot } = await import('./linkedInWritePacer');
+  const slot = await reserveWriteSlot(accountId);
+  if (!slot.allowed) {
+    throw new LinkedInWriteDeferredError('write_pacer', String(slot.reason ?? 'write pacer refused'), accountId);
+  }
 }
 
 async function checkExitConditions(
