@@ -28,7 +28,7 @@
  */
 
 /** Bump on ANY change that can alter an output for an existing input; stored with every row. */
-export const TRAFFIC_CLASSIFIER_VERSION = '2.2.0';
+export const TRAFFIC_CLASSIFIER_VERSION = '2.3.0';
 
 export type ChannelGroup =
   | 'Paid'
@@ -338,6 +338,7 @@ export type MatchedBy =
   | 'referrer'
   | 'user_agent'
   | 'click_id'
+  | 'url:nova'
   | 'fallback_utm_source'
   | 'fallback_referrer'
   | 'none';
@@ -710,8 +711,15 @@ export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassi
   let def: ChannelDef | undefined;
   let matchedBy: MatchedBy = 'none';
 
-  const linkDef = matchUtmSource(sourceLower);
-  if (linkDef?.key === 'nova' && !paidSignal) paidSignal = 'utm_source:nova';
+  // 2.3.0: NewsBreak Nova ads that omit utm_source=nova still carry their own URL signals
+  // (is_nova=true, nb_cid, utm_content=nvss_*). Without this they classified as organic
+  // newsbreak.com / Direct traffic and were routed into organic-only lists.
+  const novaUrlSignal = param('is_nova').toLowerCase() === 'true' || Boolean(param('nb_cid'))
+    || utm.utm_content.toLowerCase().startsWith('nvss_');
+  const utmLinkDef = matchUtmSource(sourceLower);
+  const novaUrlDef = !utmLinkDef && !sourceLower && novaUrlSignal ? CHANNEL_BY_KEY.get('nova') : undefined;
+  const linkDef = utmLinkDef ?? novaUrlDef;
+  if (linkDef?.key === 'nova' && !paidSignal) paidSignal = utmLinkDef ? 'utm_source:nova' : 'url:nova';
   const paidFinal = paidSignal !== null;
   let detectedDef: ChannelDef | undefined;
   let detectedBy: MatchedBy = 'none';
@@ -727,13 +735,13 @@ export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassi
 
   if (linkDef && (linkDef.key === 'agency' || paidFinal)) {
     def = linkDef;
-    matchedBy = 'utm_source';
+    matchedBy = novaUrlDef ? 'url:nova' : 'utm_source';
   } else if (detectedDef) {
     def = detectedDef;
     matchedBy = detectedBy;
   } else if (linkDef) {
     def = linkDef;
-    matchedBy = 'utm_source';
+    matchedBy = novaUrlDef ? 'url:nova' : 'utm_source';
   }
 
   // New vs V1: a platform click id with no other source signal names its platform, instead of the
@@ -790,7 +798,7 @@ export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassi
     sourceLink,
     sourceDetail,
     matchedBy,
-    linkChannel: linkDef ? linkDef.name : '',
+    linkChannel: utmLinkDef ? utmLinkDef.name : '',
     detectedChannel: detectedDef ? detectedDef.name : '',
     paidSignal,
     classifierVersion: TRAFFIC_CLASSIFIER_VERSION,
