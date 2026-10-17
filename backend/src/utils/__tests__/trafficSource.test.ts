@@ -332,6 +332,8 @@ describe('2.2.0 DramaBreak attribution decisions', () => {
     }
     expect(classifyTraffic({ landingUrl: lp(''), referrer: 'https://www.newsbreak.com/' }))
       .toMatchObject({ channelKey: 'newsbreak', trafficType: 'organic' });
+    // An explicit, unrecognised utm_source still wins over the Nova URL fallback.
+    expect(classifyTraffic({ landingUrl: lp('utm_source=creator_john&is_nova=true') }).channelKey).not.toBe('nova');
   });
 
   it('Nova is paid by construction and its own channel', () => {

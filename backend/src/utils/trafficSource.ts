@@ -715,7 +715,8 @@ export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassi
   // newsbreak.com / Direct traffic and were routed into organic-only lists.
   const novaUrlSignal = param('is_nova').toLowerCase() === 'true' || Boolean(param('nb_cid'))
     || utm.utm_content.toLowerCase().startsWith('nvss_');
-  const linkDef = matchUtmSource(sourceLower) ?? (novaUrlSignal ? CHANNEL_BY_KEY.get('nova') : undefined);
+  const linkDef = matchUtmSource(sourceLower)
+    ?? (!sourceLower && novaUrlSignal ? CHANNEL_BY_KEY.get('nova') : undefined);
   if (linkDef?.key === 'nova' && !paidSignal) paidSignal = matchUtmSource(sourceLower) ? 'utm_source:nova' : 'url:nova';
   const paidFinal = paidSignal !== null;
   let detectedDef: ChannelDef | undefined;
