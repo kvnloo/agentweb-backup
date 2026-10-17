@@ -151,7 +151,9 @@ export default function Workflows() {
       setShowSnackbar(true);
     } catch (error) {
       console.error('Error archiving workflow:', error);
-      setError(error instanceof Error ? error.message : 'Failed to archive workflow');
+      setSnackbarMessage(error instanceof Error ? error.message : 'Failed to archive workflow');
+      setSnackbarSeverity('error');
+      setShowSnackbar(true);
     } finally {
       setIsArchiveDialogOpen(false);
       handleMenuClose();

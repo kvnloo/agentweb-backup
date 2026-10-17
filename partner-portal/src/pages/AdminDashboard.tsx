@@ -3474,7 +3474,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
         title="We couldn't load the admin dashboard"
         description={adminError}
         onRetry={() => {
-          void loadUsers();
+          void loadUsers(userFilterHideBotLike);
           void loadWaitlist();
         }}
       />
