@@ -24,7 +24,10 @@ export interface SendRecipient {
 
 export type Recipient = string | SendRecipient;
 
-const EMAIL_RE = /^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/;
+// Unquoted dot-atom local part (RFC 5322 atext) and LDH domain labels (RFC 5321/1123).
+const LOCAL_ATOM = "[a-z0-9!#$%&'*+/=?^_`{|}~-]+";
+const DOMAIN_LABEL = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?';
+const EMAIL_RE = new RegExp(`^${LOCAL_ATOM}(?:\\.${LOCAL_ATOM})*@${DOMAIN_LABEL}(?:\\.${DOMAIN_LABEL})+$`);
 
 export function normalizeEmail(email: unknown): string {
   return typeof email === 'string' ? email.trim().toLowerCase() : '';
@@ -61,7 +64,7 @@ function recipientEmail(r: Recipient): string {
 }
 
 function decideCompiled(email: string, c: CompiledFacts): SendEligibility {
-  if (!EMAIL_RE.test(email) || email.split('@')[0].includes('..') || email.startsWith('.') || email.split('@')[0].endsWith('.')) return { send: false, reason: 'invalid_address' };
+  if (!EMAIL_RE.test(email)) return { send: false, reason: 'invalid_address' };
   // Explicit human/compliance signals first, then deliverability signals.
   if (c.doNotEmail.has(email)) return { send: false, reason: 'do_not_email' };
   if (c.unsubscribed.has(email)) return { send: false, reason: 'unsubscribed' };

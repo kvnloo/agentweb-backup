@@ -22,6 +22,11 @@ describe('decideSendEligibility', () => {
     ['', 'invalid_address'],
     ['a@b..com', 'invalid_address'],
     ['a@.b.com', 'invalid_address'],
+    ['a;b@example.com', 'invalid_address'],
+    ['a@-example.com', 'invalid_address'],
+    ['a@example-.com', 'invalid_address'],
+    ['.a@example.com', 'invalid_address'],
+    ['a.@example.com', 'invalid_address'],
   ])('suppresses %s as %s', (email, reason) => {
     expect(decideSendEligibility(email, facts)).toEqual({ send: false, reason });
   });
