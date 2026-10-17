@@ -61,7 +61,7 @@ function recipientEmail(r: Recipient): string {
 }
 
 function decideCompiled(email: string, c: CompiledFacts): SendEligibility {
-  if (!EMAIL_RE.test(email)) return { send: false, reason: 'invalid_address' };
+  if (!EMAIL_RE.test(email) || email.split('@')[0].includes('..') || email.startsWith('.') || email.split('@')[0].endsWith('.')) return { send: false, reason: 'invalid_address' };
   // Explicit human/compliance signals first, then deliverability signals.
   if (c.doNotEmail.has(email)) return { send: false, reason: 'do_not_email' };
   if (c.unsubscribed.has(email)) return { send: false, reason: 'unsubscribed' };

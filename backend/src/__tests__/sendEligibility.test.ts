@@ -56,3 +56,9 @@ describe('partitionRecipients', () => {
     });
   });
 });
+
+describe('local-part dot rules', () => {
+  it.each(['a..b@example.com', '.a@example.com', 'a.@example.com'])('rejects %s', (addr) => {
+    expect(decideSendEligibility(addr, {})).toEqual({ send: false, reason: 'invalid_address' });
+  });
+});
