@@ -122,7 +122,8 @@ export type PaceRefusalGate =
   | 'reservation_persistence';
 
 export type PaceLinkedInWriteResult =
-  | { refusal: null }
+  /** `reservedWindowStartedAt`: identity of the daily window the slot was committed to (ENG-2529 refund guard). */
+  | { refusal: null; reservedWindowStartedAt?: number }
   | {
       refusal: {
         success: false;
@@ -174,7 +175,9 @@ export async function paceLinkedInWrite(
     };
   }
 
-  const hourlySlot = await reserveWriteSlot(accountId);
+  // ENG-2529: key the hourly pacer by the canonical stored id so a legacy row named by its
+  // Unipile id shares one hourly slot across drip and CRM callers. The send itself keeps accountId.
+  const hourlySlot = await reserveWriteSlot(account.storedAccountId || accountId);
   if (!hourlySlot.allowed) {
     console.log(`[linkedInDailyVolumeGate] ${action} on ${accountId} refused by write pacer — ${hourlySlot.reason}`);
     return {
@@ -206,6 +209,8 @@ export async function paceLinkedInWrite(
   // CAS retry, so concurrent writers cannot lose a reservation. Failing closed
   // here matters: the actual Unipile call happens only after this returns.
   let durableRefusalReason: string | undefined;
+  let reservedWindowStartedAt: number | undefined;
+  const reservedClass = dailyVolumeClassFor(action);
   try {
     await updateAccountConfig(account.ownerUserId, 'unipile', account.storedAccountId || accountId, (freshConfig) => {
       const freshDailySlot = reserveDailyVolumeSlot(
@@ -224,6 +229,7 @@ export async function paceLinkedInWrite(
         durableRefusalReason = freshDailySlot.reason;
         return { updates: {}, skip: true };
       }
+      reservedWindowStartedAt = reservedClass ? freshDailySlot.nextState[reservedClass]?.windowStartedAt : undefined;
       return { updates: { daily_volume: freshDailySlot.nextState } };
     });
   } catch (err) {
@@ -255,7 +261,7 @@ export async function paceLinkedInWrite(
     };
   }
 
-  return { refusal: null };
+  return { refusal: null, reservedWindowStartedAt };
 }
 
 /**
@@ -268,6 +274,7 @@ export async function releaseLinkedInDailySlot(
   action: string,
   account: ResolvedLinkedInAccount,
   accountId: string,
+  reservedWindowStartedAt?: number,
 ): Promise<void> {
   const cls = dailyVolumeClassFor(action);
   if (cls === null || !PACED_WRITE_ACTIONS.has(action)) return;
@@ -276,6 +283,9 @@ export async function releaseLinkedInDailySlot(
       const state: DailyVolumeState = freshConfig.daily_volume || {};
       const win = state[cls];
       if (!win || win.count <= 0) return { updates: {}, skip: true };
+      // Refund only the window that received the reservation: if a new window started since,
+      // decrementing it would let later sends exceed that day's cap.
+      if (reservedWindowStartedAt === undefined || win.windowStartedAt !== reservedWindowStartedAt) return { updates: {}, skip: true };
       return { updates: { daily_volume: { ...state, [cls]: { ...win, count: win.count - 1 } } } };
     });
   } catch (err) {

@@ -433,7 +433,7 @@ export async function paceDripLinkedInWrite(userId: string, accountId: string, a
     if (paced.refusal) {
       throw new LinkedInWriteDeferredError(paced.refusal.gate, paced.refusal.error.split('\n')[0], accountId);
     }
-    return () => releaseLinkedInDailySlot(action, resolved, accountId);
+    return () => releaseLinkedInDailySlot(action, resolved, accountId, paced.reservedWindowStartedAt);
   }
   const { reserveWriteSlot } = await import('./linkedInWritePacer');
   const slot = await reserveWriteSlot(accountId);

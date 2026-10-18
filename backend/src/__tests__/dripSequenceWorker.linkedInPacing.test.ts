@@ -135,7 +135,7 @@ describe('ENG-2529: a failed send gives its daily slot back (Opslane run 725 P1)
     mockDb.releaseEnrollmentClaim.mockResolvedValue(undefined as any);
     jest.spyOn(console, 'error').mockImplementation(() => {});
     await processDueEnrollments();
-    expect(mockRelease).toHaveBeenCalledWith('send-message', resolved, 'acct-1');
+    expect(mockRelease).toHaveBeenCalledWith('send-message', resolved, 'acct-1', undefined);
 
     mockRelease.mockClear();
     mockLi.sendMessage.mockResolvedValue(undefined as any);
