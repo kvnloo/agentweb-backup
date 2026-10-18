@@ -13,6 +13,7 @@ import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch, ADM
 import { filterMessagesForClient as filterMessagesForClientPure } from '../utils/adminOnlyMessageFilter';
 import { ABOUT_AGENTWEB_TEAM, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
+import { shouldSuppressScheduledNotification } from '../services/linkScanNotificationPolicy';
 import { computeSessionModelAttribution } from '../utils/sessionModelAttribution';
 import { scheduleDb, userDb, taskDb, scheduleTemplateDb } from '../services/db';
 import { User } from '../types/auth';
@@ -3005,6 +3006,22 @@ async function getActualResponseFromSession(sessionId: string): Promise<string> 
   }
 }
 
+// ENG-1098: true when the run's executed tool ledger shows exactly one clean
+// scan_website_links result, so its scheduled report (and digest entry) is not
+// sent. Fails open: any load error or missing session means "send as today".
+export async function isCleanLinkScanSession(sessionId: string | undefined): Promise<boolean> {
+  if (!sessionId) return false;
+  try {
+    const session = await chatbotDb.getChatSession(sessionId);
+    const suppress = shouldSuppressScheduledNotification(session?.messages);
+    if (suppress) console.log(`[ENG-1098] Clean broken-link scan in session ${sessionId}; scheduled notification suppressed.`);
+    return suppress;
+  } catch (error) {
+    console.error(`[ENG-1098] Could not read session ${sessionId} for link-scan suppression; sending as usual:`, error);
+    return false;
+  }
+}
+
 // Evaluate schedule response against expected criteria
 function evaluateScheduleResponse(
   actualResponse: string,
@@ -3125,8 +3142,12 @@ async function sendDailyDigestEmail(schedule: any, emailNotifications: string[])
       })
     );
 
-    if (todaysResults.length === 0) {
-      console.log(`No run results found for today for schedule ${schedule.scheduleName}`);
+    // ENG-1098: a run whose only finding is a clean broken-link scan is not news.
+    const cleanScan = await Promise.all(todaysResults.map((result: any) => isCleanLinkScanSession(result.sessionId)));
+    const digestResults = todaysResults.filter((_: any, i: number) => !cleanScan[i]);
+
+    if (digestResults.length === 0) {
+      console.log(`No run results to include in today's digest for schedule ${schedule.scheduleName}`);
       return;
     }
 
@@ -3134,11 +3155,11 @@ async function sendDailyDigestEmail(schedule: any, emailNotifications: string[])
     await emailService.sendDailyDigestEmail(
       emailNotifications,
       schedule.scheduleName,
-      todaysResults,
+      digestResults,
       schedule.scheduleId
     );
 
-    console.log(`Daily digest email sent for schedule ${schedule.scheduleName} with ${todaysResults.length} results`);
+    console.log(`Daily digest email sent for schedule ${schedule.scheduleName} with ${digestResults.length} results`);
   } catch (error) {
     console.error(`Error sending daily digest email for schedule ${schedule.scheduleName}:`, error);
     throw error;
@@ -14394,7 +14415,7 @@ export const agentModeController = {
           if (result.sessionId) {
             try {
               const emailNotifications = scheduleToRun.emailNotifications || [];
-              if (emailNotifications.length > 0) {
+              if (emailNotifications.length > 0 && !(await isCleanLinkScanSession(result.sessionId))) {
                 await emailService.sendScheduledChatResultEmail(
                   emailNotifications,
                   scheduleToRun.scheduleName,
@@ -14569,7 +14590,7 @@ export const agentModeController = {
         if (result.sessionId) {
           try {
             const emailNotifications = scheduleToRun.emailNotifications || [];
-            if (emailNotifications.length > 0) {
+            if (emailNotifications.length > 0 && !(await isCleanLinkScanSession(result.sessionId))) {
               await emailService.sendScheduledChatResultEmail(
                 emailNotifications,
                 scheduleToRun.scheduleName,
@@ -15455,8 +15476,9 @@ export const agentModeController = {
                     }
                     // For hourly schedules with daily digest, don't send individual emails
                     // Only send the daily digest on the last run of the day
-                  } else {
+                  } else if (!(await isCleanLinkScanSession(result.sessionId))) {
                     // Send individual email as usual for non-hourly schedules or hourly without daily digest
+                    // (ENG-1098: unless the run was a clean broken-link scan)
                     await emailService.sendScheduledChatResultEmail(
                       emailNotifications,
                       schedule.scheduleName,
