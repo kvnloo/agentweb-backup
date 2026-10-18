@@ -3,12 +3,14 @@ import { collectLeadFitHints } from '../services/leadNotificationFit';
 
 const enabled = { enabled: true, minUnitsDisqualifiers: ['under_50'] };
 describe('lead notification fit', () => {
-  it('preserves valid fit config and rejects malformed opt-ins', () => {
+  it('preserves valid fit config and ignores malformed fit opt-ins without disabling notifications', () => {
     const base = { enabled: true, slackChannelId: 'C123' };
     expect(configOf({ ...base, fitFilter: enabled })?.fitFilter).toEqual(enabled);
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     for (const fitFilter of [null, [], { enabled: 'true' }, { enabled: true, minUnitsDisqualifiers: [9] }]) {
-      expect(configOf({ ...base, fitFilter })).toBeUndefined();
+      expect(configOf({ ...base, fitFilter })).toEqual(base);
     }
+    warn.mockRestore();
   });
   it.each([
     [{ company: 'Sunrise Property Management', customFields: { units: '50_200' } }, []],

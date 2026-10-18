@@ -48,7 +48,13 @@ export function configOf(value: unknown): LeadNotificationsConfig | undefined {
     const fit = value.fitFilter;
     if (!record(fit) || typeof fit.enabled !== 'boolean' ||
         (fit.minUnitsDisqualifiers !== undefined && (!strings(fit.minUnitsDisqualifiers) ||
-          fit.minUnitsDisqualifiers.length > 50 || fit.minUnitsDisqualifiers.some((v: string) => v.length > 254)))) return;
+          fit.minUnitsDisqualifiers.length > 50 || fit.minUnitsDisqualifiers.some((v: string) => v.length > 254)))) {
+      // Optional fit filtering must never silence the whole channel: drop the malformed filter (fit filtering off).
+      console.warn('[leadNotifications] ignoring malformed fitFilter', { slackChannelId: value.slackChannelId });
+      const rest = { ...value };
+      delete rest.fitFilter;
+      return rest as unknown as LeadNotificationsConfig;
+    }
   }
   return value as unknown as LeadNotificationsConfig;
 }
