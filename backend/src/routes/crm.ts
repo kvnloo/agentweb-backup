@@ -5155,6 +5155,27 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
       return res.status(409).json(identity.refusal);
     }
 
+    // ENG-2529: hand CRM sends go through the same daily + hourly pacer as the agent tool and
+    // drip worker. Paced after the identity check so a 409 never burns a daily slot.
+    {
+      const { resolveLinkedInAccountForWrite, paceLinkedInWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+      // Same split as paceDripLinkedInWrite: an owned/org-shared account gets the full gate; a
+      // list-assigned/pool account with no owner record is still held to the hourly pacer.
+      const pacedAccount = await resolveLinkedInAccountForWrite(userId, accountId);
+      if (pacedAccount) {
+        const paced = await paceLinkedInWrite('send-message', pacedAccount, accountId);
+        if (paced.refusal) {
+          return res.status(429).json(paced.refusal);
+        }
+      } else {
+        const { reserveWriteSlot } = await import('../services/linkedInWritePacer');
+        const slot = await reserveWriteSlot(accountId);
+        if (!slot.allowed) {
+          return res.status(429).json({ success: false, message: 'LinkedIn write actions are being paced', error: String(slot.reason ?? ''), gate: 'write_pacer' });
+        }
+      }
+    }
+
     await linkedInOutreachService.sendMessage(accountId, leadLinkedIn, true, message.trim());
 
     // Record the engagement. The message is ALREADY sent at this point, so a failure here must not be
@@ -5267,6 +5288,33 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     });
     if (!identity.allowed) {
       return res.status(409).json(identity.refusal);
+    }
+
+    // ENG-2529: hand CRM sends go through the same daily + hourly pacer as the agent tool and
+    // drip worker. Paced after the identity check so a 409 never burns a daily slot.
+    {
+      const { resolveLinkedInAccountForWrite, paceLinkedInWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+      // Same split as paceDripLinkedInWrite: an owned/org-shared account gets the full gate; a
+      // list-assigned/pool account with no owner record is still held to the hourly pacer.
+      let pacedAccount = await resolveLinkedInAccountForWrite(userId, accountId);
+      // The list-assigned account may belong to the list owner (an editor sending from a
+      // shared list); resolve it under the owner so its daily invite cap still applies.
+      const listOwnerId = (list as any).userId;
+      if (!pacedAccount && accountId === (list as any).linkedInAccountId && listOwnerId && listOwnerId !== userId) {
+        pacedAccount = await resolveLinkedInAccountForWrite(listOwnerId, accountId);
+      }
+      if (pacedAccount) {
+        const paced = await paceLinkedInWrite('send-invite', pacedAccount, accountId);
+        if (paced.refusal) {
+          return res.status(429).json(paced.refusal);
+        }
+      } else {
+        const { reserveWriteSlot } = await import('../services/linkedInWritePacer');
+        const slot = await reserveWriteSlot(accountId);
+        if (!slot.allowed) {
+          return res.status(429).json({ success: false, message: 'LinkedIn write actions are being paced', error: String(slot.reason ?? ''), gate: 'write_pacer' });
+        }
+      }
     }
 
     const note = message && typeof message === 'string' && message.trim() ? message.trim() : undefined;
