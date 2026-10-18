@@ -3479,7 +3479,8 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
           // a successful load hide a still-failing one (e.g. waitlist/analytics).
           if (!(await loadUsers(userFilterHideBotLike))) return;
           if (!(await loadWaitlist())) return;
-          if (startDate && endDate) {
+          // Analytics only loads on the Overview tab (matches the analytics effect).
+          if (tabValue === 0 && startDate && endDate) {
             const startDateStr = format(startDate, "yyyy-MM-dd");
             const endDateStr = format(endDate, "yyyy-MM-dd");
             lastLoadedDatesRef.current = { startDate: startDateStr, endDate: endDateStr };
