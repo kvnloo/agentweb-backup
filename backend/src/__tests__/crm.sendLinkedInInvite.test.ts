@@ -87,10 +87,23 @@ jest.mock('../services/linkedInOutreachService', () => ({
 }));
 
 const mockResolveLinkedInAccountForWrite = jest.fn().mockResolvedValue({ ownerUserId: 'test-user-id' });
+const mockPaceLinkedInWrite = jest.fn().mockResolvedValue({ refusal: null });
 jest.mock('../services/agentMode/linkedInDailyVolumeGate', () => ({
   resolveLinkedInAccountForWrite: (...args: any[]) => mockResolveLinkedInAccountForWrite(...args),
+  paceLinkedInWrite: (...args: any[]) => mockPaceLinkedInWrite(...args),
+}));
+const mockReserveWriteSlot = jest.fn().mockResolvedValue({ allowed: true });
+jest.mock('../services/linkedInWritePacer', () => ({
+  ...jest.requireActual('../services/linkedInWritePacer'),
+  reserveWriteSlot: (...args: any[]) => mockReserveWriteSlot(...args),
 }));
 
+const mockCanDestructiveCrmList = jest.fn();
+jest.mock('../services/crmAccessControl', () => {
+  const actual = jest.requireActual('../services/crmAccessControl');
+  return { ...actual, // Unset mock (undefined) defers to the real check; a test can grant editor access explicitly.
+    canDestructiveCrmList: async (...args: any[]) => (await mockCanDestructiveCrmList(...args)) ?? actual.canDestructiveCrmList(...args) };
+});
 jest.mock('../services/agentModeService', () => ({ agentModeService: {} }));
 jest.mock('../utils/llmService', () => ({ createLLMService: jest.fn() }));
 jest.mock('../services/settingsService', () => ({ settingsService: {} }));
@@ -256,11 +269,35 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
     expect(mockSendInvitation).not.toHaveBeenCalled();
   });
 
-  it('does not run the ownership check when no account was supplied (list/own-resolved accounts are unchanged)', async () => {
+  it('does not 403 an auto-resolved account the caller does not own; it is held to the hourly pacer instead (ENG-2529)', async () => {
+    mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
     const res = makeRes();
     await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: {} } as any, res as any);
-    expect(mockResolveLinkedInAccountForWrite).not.toHaveBeenCalled();
+    expect(res.status).not.toHaveBeenCalledWith(403);
+    expect(mockPaceLinkedInWrite).not.toHaveBeenCalled();
+    expect(mockReserveWriteSlot).toHaveBeenCalled();
     expect(mockSendInvitation).toHaveBeenCalled();
+  });
+
+  it('applies the list owner\'s daily cap to an owner-assigned account when an editor sends (ENG-2529)', async () => {
+    mockGetLeadListById.mockResolvedValue({ ...OWNED_LIST_WITH_ACCT, userId: 'list-owner-id' });
+    mockCanDestructiveCrmList.mockImplementationOnce(async () => true); // org editor on a shared list
+    mockResolveLinkedInAccountForWrite.mockImplementation(async (uid: string) => (uid === 'list-owner-id' ? { ownerUserId: 'list-owner-id' } : null));
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: {} } as any, res as any);
+    expect(mockResolveLinkedInAccountForWrite).toHaveBeenCalledWith('list-owner-id', 'list-acct-9');
+    expect(mockPaceLinkedInWrite).toHaveBeenCalledWith('send-invite', { ownerUserId: 'list-owner-id' }, 'list-acct-9');
+    expect(mockReserveWriteSlot).not.toHaveBeenCalled();
+  });
+
+  it('refuses with 429 and sends nothing when the daily cap is reached (ENG-2529)', async () => {
+    mockResolveLinkedInAccountForWrite.mockResolvedValue({ ownerUserId: 'test-user-id' });
+    mockPaceLinkedInWrite.mockResolvedValueOnce({ refusal: { success: false, message: 'LinkedIn daily volume limit reached', error: 'cap', gate: 'daily_volume' } });
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: {} } as any, res as any);
+    expect(mockPaceLinkedInWrite).toHaveBeenCalledWith('send-invite', expect.anything(), expect.any(String));
+    expect(res.status).toHaveBeenCalledWith(429);
+    expect(mockSendInvitation).not.toHaveBeenCalled();
   });
 
   it('falls back to the user own account when list has none assigned', async () => {
