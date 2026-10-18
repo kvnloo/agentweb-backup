@@ -40,3 +40,11 @@ it('does not call LLM for other orgs', async () => {
   expect(await judgeLeadFit({}, undefined, 'owner')).toBeUndefined();
   expect(call).not.toHaveBeenCalled();
 });
+it.each(['Manages 100-1000 units but message is unrelated to leasing', 'Founded 2015-2019, 120 units across 3 cities'])('keeps reasons with number ranges %s', async reason => {
+  call.mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ verdict: 'bad', reasons: [reason] }) } }] });
+  expect(await judgeLeadFit({}, { enabled: true }, 'owner')).toEqual({ verdict: 'bad', reasons: [reason] });
+});
+it.each(['Call +1 5551234567', 'Reach 555.123.4567', 'Phone 5551234567'])('rejects phone-shaped reason %s', async reason => {
+  call.mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ verdict: 'good', reasons: [reason] }) } }] });
+  expect(await judgeLeadFit({}, { enabled: true }, 'owner')).toEqual({ verdict: 'unscored', reasons: [] });
+});
