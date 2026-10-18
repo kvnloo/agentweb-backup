@@ -24,7 +24,8 @@ it('fails open on timeout without waiting for provider completion', async () => 
     expect(await result).toEqual({ verdict: 'unscored', reasons: [] });
   } finally { jest.useRealTimers(); }
 });
-it.each(['not json', '{"verdict":"bad","reasons":[]}', '{"verdict":"unknown","reasons":["why"]}'])('fails open on malformed response %s', async content => {
+it.each(['not json', '{"verdict":"bad","reasons":[]}', '{"verdict":"unknown","reasons":["why"]}',
+  '{"verdict":"good","reasons":["Call back at (555) 123-4567"]}', '{"verdict":"good","reasons":["Contact jane@acme.com"]}'])('fails open on malformed response %s', async content => {
   call.mockResolvedValue({ choices: [{ message: { content } }] });
   expect(await judgeLeadFit({}, { enabled: true }, 'owner')).toEqual({ verdict: 'unscored', reasons: [] });
 });
