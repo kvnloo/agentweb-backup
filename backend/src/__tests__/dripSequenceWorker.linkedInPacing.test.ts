@@ -165,3 +165,24 @@ describe('ENG-2529 AC3: every LinkedIn write surface calls the shared gate', () 
     expect(code).toMatch(/paceLinkedInWrite\(/);
   });
 });
+
+describe('ENG-2529 AC3: each CRM LinkedIn send route paces before sending', () => {
+  const code = fs.readFileSync(path.join(__dirname, '..', 'routes/crm.ts'), 'utf8');
+  const routeBody = (route: string): string => {
+    const start = code.indexOf(`router.post('${route}'`);
+    expect(start).toBeGreaterThan(-1);
+    const next = code.indexOf('\nrouter.', start + 1);
+    return code.slice(start, next === -1 ? undefined : next);
+  };
+  it.each([
+    ['/lists/:listId/leads/:leadId/send-linkedin-message', 'send-message', 'sendMessage('],
+    ['/lists/:listId/leads/:leadId/send-linkedin-invite', 'send-invite', 'sendInvitation('],
+  ])('%s calls paceLinkedInWrite(%s) before the Unipile call', (route, action, sendCall) => {
+    const body = routeBody(route);
+    const paceIdx = body.indexOf(`paceLinkedInWrite('${action}'`);
+    const sendIdx = body.indexOf(sendCall);
+    expect(paceIdx).toBeGreaterThan(-1);
+    expect(sendIdx).toBeGreaterThan(paceIdx);
+    expect(body.slice(paceIdx, sendIdx)).toMatch(/status\(429\)/);
+  });
+});
