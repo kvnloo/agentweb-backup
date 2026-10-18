@@ -37,6 +37,8 @@ describe('decideDripSend (ENG-2533)', () => {
     { sentToday: 0, dailyCap: 10, senderAgeDays: 0, now, ramp: [] },
     { sentToday: 0, dailyCap: 10, senderAgeDays: 0, now, ramp: [{ fromDay: 2, cap: 5 }] },
     { sentToday: 0, dailyCap: 10, senderAgeDays: 0, now, ramp: [{ fromDay: 0, cap: 5 }, { fromDay: 0, cap: 9 }] },
+    { sentToday: 0, dailyCap: 10, senderAgeDays: 0, now, ramp: [null] },
+    { sentToday: 0, dailyCap: 10, senderAgeDays: 0, now, ramp: [{ fromDay: 0, cap: 5 }, null] },
   ])('fails closed on invalid config %#', (input) => {
     expect(decideDripSend(input as never)).toEqual({ allow: false, reason: 'invalid_config' });
   });

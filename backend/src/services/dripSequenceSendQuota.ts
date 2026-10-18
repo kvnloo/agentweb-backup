@@ -60,9 +60,11 @@ export function nextUtcDayStart(now: Date): Date {
 }
 
 function validRamp(ramp: WarmupRamp): boolean {
-  if (!Array.isArray(ramp) || ramp.length === 0 || ramp[0].fromDay !== 0) return false;
+  if (!Array.isArray(ramp) || ramp.length === 0) return false;
   for (let i = 0; i < ramp.length; i++) {
     const s = ramp[i];
+    if (s === null || typeof s !== 'object') return false;
+    if (i === 0 && s.fromDay !== 0) return false;
     if (!isNonNegInt(s.fromDay) || !(s.cap === Number.POSITIVE_INFINITY || isNonNegInt(s.cap))) return false;
     if (i > 0 && s.fromDay <= ramp[i - 1].fromDay) return false;
   }
