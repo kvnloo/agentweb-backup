@@ -98,6 +98,12 @@ jest.mock('../services/linkedInWritePacer', () => ({
   reserveWriteSlot: (...args: any[]) => mockReserveWriteSlot(...args),
 }));
 
+const mockCanDestructiveCrmList = jest.fn();
+jest.mock('../services/crmAccessControl', () => {
+  const actual = jest.requireActual('../services/crmAccessControl');
+  return { ...actual, // Unset mock (undefined) defers to the real check; a test can grant editor access explicitly.
+    canDestructiveCrmList: async (...args: any[]) => (await mockCanDestructiveCrmList(...args)) ?? actual.canDestructiveCrmList(...args) };
+});
 jest.mock('../services/agentModeService', () => ({ agentModeService: {} }));
 jest.mock('../utils/llmService', () => ({ createLLMService: jest.fn() }));
 jest.mock('../services/settingsService', () => ({ settingsService: {} }));
@@ -271,6 +277,17 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
     expect(mockPaceLinkedInWrite).not.toHaveBeenCalled();
     expect(mockReserveWriteSlot).toHaveBeenCalled();
     expect(mockSendInvitation).toHaveBeenCalled();
+  });
+
+  it('applies the list owner\'s daily cap to an owner-assigned account when an editor sends (ENG-2529)', async () => {
+    mockGetLeadListById.mockResolvedValue({ ...OWNED_LIST_WITH_ACCT, userId: 'list-owner-id' });
+    mockCanDestructiveCrmList.mockImplementationOnce(async () => true); // org editor on a shared list
+    mockResolveLinkedInAccountForWrite.mockImplementation(async (uid: string) => (uid === 'list-owner-id' ? { ownerUserId: 'list-owner-id' } : null));
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: {} } as any, res as any);
+    expect(mockResolveLinkedInAccountForWrite).toHaveBeenCalledWith('list-owner-id', 'list-acct-9');
+    expect(mockPaceLinkedInWrite).toHaveBeenCalledWith('send-invite', { ownerUserId: 'list-owner-id' }, 'list-acct-9');
+    expect(mockReserveWriteSlot).not.toHaveBeenCalled();
   });
 
   it('refuses with 429 and sends nothing when the daily cap is reached (ENG-2529)', async () => {

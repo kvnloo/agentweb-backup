@@ -5296,7 +5296,13 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
       const { resolveLinkedInAccountForWrite, paceLinkedInWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
       // Same split as paceDripLinkedInWrite: an owned/org-shared account gets the full gate; a
       // list-assigned/pool account with no owner record is still held to the hourly pacer.
-      const pacedAccount = await resolveLinkedInAccountForWrite(userId, accountId);
+      let pacedAccount = await resolveLinkedInAccountForWrite(userId, accountId);
+      // The list-assigned account may belong to the list owner (an editor sending from a
+      // shared list); resolve it under the owner so its daily invite cap still applies.
+      const listOwnerId = (list as any).userId;
+      if (!pacedAccount && accountId === (list as any).linkedInAccountId && listOwnerId && listOwnerId !== userId) {
+        pacedAccount = await resolveLinkedInAccountForWrite(listOwnerId, accountId);
+      }
       if (pacedAccount) {
         const paced = await paceLinkedInWrite('send-invite', pacedAccount, accountId);
         if (paced.refusal) {
