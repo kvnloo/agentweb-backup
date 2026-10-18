@@ -73,8 +73,15 @@ jest.mock('../cron/linkedInConnectionSyncCron', () => ({
 }));
 
 const mockResolveLinkedInAccountForWrite = jest.fn().mockResolvedValue({ ownerUserId: 'test-user-id' });
+const mockPaceLinkedInWrite = jest.fn().mockResolvedValue({ refusal: null });
 jest.mock('../services/agentMode/linkedInDailyVolumeGate', () => ({
   resolveLinkedInAccountForWrite: (...args: any[]) => mockResolveLinkedInAccountForWrite(...args),
+  paceLinkedInWrite: (...args: any[]) => mockPaceLinkedInWrite(...args),
+}));
+const mockReserveWriteSlot = jest.fn().mockResolvedValue({ allowed: true });
+jest.mock('../services/linkedInWritePacer', () => ({
+  ...jest.requireActual('../services/linkedInWritePacer'),
+  reserveWriteSlot: (...args: any[]) => mockReserveWriteSlot(...args),
 }));
 
 jest.mock('../services/agentModeService', () => ({ agentModeService: {} }));
@@ -290,8 +297,20 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-message', () =
     const res = makeRes();
     await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { message: 'Hello!' } } as any, res as any);
     expect(mockResolveAccountId).toHaveBeenCalledWith('test-user-id');
-    expect(mockResolveLinkedInAccountForWrite).not.toHaveBeenCalled();
+    // ENG-2529: the account is looked up only to pace it — never a 403 on the auto-resolved path.
+    expect(res.status).not.toHaveBeenCalledWith(403);
+    expect(mockPaceLinkedInWrite).toHaveBeenCalledWith('send-message', expect.anything(), 'unipile-acct-1');
     expect(mockSendMessage).toHaveBeenCalledWith('unipile-acct-1', expect.any(String), true, 'Hello!');
+  });
+
+  it('refuses with 429 before any send when the account is at its daily cap (ENG-2529)', async () => {
+    mockPaceLinkedInWrite.mockResolvedValueOnce({ refusal: { success: false, message: 'LinkedIn daily volume limit reached', error: 'cap', gate: 'daily_volume' } });
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { message: 'hello', accountId: 'li-cap-world' } } as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(429);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ message: 'LinkedIn daily volume limit reached' }));
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(mockAddLinkedInMessageEvent).not.toHaveBeenCalled();
   });
 
   it('refuses with 403 and sends nothing when the caller-specified account is not theirs', async () => {
