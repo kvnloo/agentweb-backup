@@ -163,8 +163,35 @@ const TRANSIENT_MESSAGE_PATTERNS = [
   /status code \(no body\)/i,
 ];
 
+/**
+ * ENG-503: the AWS SDK / provider client failed to parse a truncated response
+ * body ("Unterminated string in JSON at position 8735 ... Deserialization
+ * error: to see the raw response, inspect the hidden field {error}.$response").
+ * The request itself was valid — the body was cut mid-stream — so one retry is
+ * the right recovery, and repeats share one oncall class instead of each paging
+ * as a new "Unknown Error".
+ */
+export const PROVIDER_DESERIALIZATION_ERROR_CLASS = 'provider_deserialization';
+const PROVIDER_DESERIALIZATION_PATTERNS = [
+  /deserialization error/i,
+  /unterminated string in json/i,
+  /unexpected end of json input/i,
+];
+
+export function isProviderDeserializationError(error: unknown): boolean {
+  if (!error) return false;
+  const e = error as any;
+  const texts = [
+    error instanceof Error ? error.message : String(error),
+    typeof e?.originalMessage === 'string' ? e.originalMessage : '',
+    e?.originalError instanceof Error ? e.originalError.message : '',
+  ];
+  return texts.some((t) => PROVIDER_DESERIALIZATION_PATTERNS.some((p) => p.test(t)));
+}
+
 export function isTransientLLMError(error: unknown): boolean {
   if (!error) return false;
+  if (isProviderDeserializationError(error)) return true;
 
   // Don't retry context-limit errors — they need message trimming, not retries
   if (isContextLimitError(error)) return false;

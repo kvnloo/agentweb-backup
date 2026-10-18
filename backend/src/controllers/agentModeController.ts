@@ -50,7 +50,7 @@ import { CHAT_BRANCHING_ENABLED_SETTING, isChatBranchingSettingEnabled, healLega
 import { compareSaveAlternatives } from '../services/agentMode/compareSaveAlternativesInstance';
 import { LEGACY_MODEL_ALIASES } from '../services/agentMode/llmModelRegistry';
 import { resolveRunFunding } from '../services/funding/runFunding';
-import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError, isProviderUnavailableError } from '../utils/agentModeErrors';
+import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isProviderDeserializationError, PROVIDER_DESERIALIZATION_ERROR_CLASS, isWorkerShutdownError, isProviderUnavailableError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
@@ -11317,13 +11317,18 @@ export const agentModeController = {
         
         // Send oncall alert asynchronously (don't await to avoid blocking response)
         const originalMessageForAlert = (error as any)?.originalMessage;
+        // ENG-503: truncated-provider-JSON failures (already retried once in callLLM)
+        // carry a stable class and dedupe on one key instead of paging per occurrence.
+        const isDeserialization = isProviderDeserializationError(error);
         sendAgentModeOncallAlert({
+          ...(isDeserialization ? { dedupeKey: `${PROVIDER_DESERIALIZATION_ERROR_CLASS}:${user?.userId || 'unknown'}`, userId: user?.userId } : {}),
           subject: 'Agent Mode: Unknown Error in Generate Response',
           message: `An unknown error occurred while generating a response in Agent Mode.\n\nError: ${originalMessageForAlert || error.message || 'Unknown error'}`,
           sessionId,
           context: {
             'Error Message': error.message || 'Unknown error',
             'Original Error': originalMessageForAlert || 'Not available',
+            ...(isDeserialization ? { errorClass: PROVIDER_DESERIALIZATION_ERROR_CLASS } : {}),
             'Error Stack': error.stack || 'No stack trace available',
             'Error Name': error.name || 'Unknown',
             'User ID': user?.userId || 'Not available',
