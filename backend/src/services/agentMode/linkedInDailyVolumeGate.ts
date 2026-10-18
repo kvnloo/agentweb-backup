@@ -58,6 +58,12 @@ export interface ResolvedLinkedInAccount {
    * an established account that reconnects does not restart its ramp.
    */
   connectedAt: string | null | undefined;
+  /**
+   * The stored row's `account_id`. A caller may name the account by its Unipile id
+   * (legacy rows differ), but `updateAccountConfig` keys on `account_id` only, so the
+   * durable reservation must be written under this id or it throws and refuses the send.
+   */
+  storedAccountId?: string;
 }
 
 /**
@@ -82,6 +88,7 @@ export function resolveLinkedInAccountFromList(
     configuredDailyInviteCap: (matched as any)?.config?.daily_invite_cap,
     dailyVolumeState: (matched as any)?.config?.daily_volume,
     connectedAt: (matched as any)?.created_at,
+    storedAccountId: (matched as any).account_id,
   };
 }
 
@@ -200,7 +207,7 @@ export async function paceLinkedInWrite(
   // here matters: the actual Unipile call happens only after this returns.
   let durableRefusalReason: string | undefined;
   try {
-    await updateAccountConfig(account.ownerUserId, 'unipile', accountId, (freshConfig) => {
+    await updateAccountConfig(account.ownerUserId, 'unipile', account.storedAccountId || accountId, (freshConfig) => {
       const freshDailySlot = reserveDailyVolumeSlot(
         action,
         freshConfig.daily_invite_cap,
@@ -249,6 +256,31 @@ export async function paceLinkedInWrite(
   }
 
   return { refusal: null };
+}
+
+/**
+ * ENG-2529: give back a daily slot reserved by `paceLinkedInWrite` when the write it
+ * guarded then failed (the Unipile call threw), so failing sends do not exhaust the
+ * account's daily budget. Decrements only the current window; best-effort — a refund
+ * failure is logged, never thrown, because the caller is already handling a send error.
+ */
+export async function releaseLinkedInDailySlot(
+  action: string,
+  account: ResolvedLinkedInAccount,
+  accountId: string,
+): Promise<void> {
+  const cls = dailyVolumeClassFor(action);
+  if (cls === null || !PACED_WRITE_ACTIONS.has(action)) return;
+  try {
+    await updateAccountConfig(account.ownerUserId, 'unipile', account.storedAccountId || accountId, (freshConfig) => {
+      const state: DailyVolumeState = freshConfig.daily_volume || {};
+      const win = state[cls];
+      if (!win || win.count <= 0) return { updates: {}, skip: true };
+      return { updates: { daily_volume: { ...state, [cls]: { ...win, count: win.count - 1 } } } };
+    });
+  } catch (err) {
+    console.error(`[linkedInDailyVolumeGate] failed to release daily slot for ${accountId}:`, err);
+  }
 }
 
 /** Thrown when a non-owner (e.g. an org-shared member) tries to change the cap. */

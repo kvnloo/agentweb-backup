@@ -25,6 +25,7 @@ jest.mock('../services/dripSequenceDb', () => ({
 jest.mock('../services/resendService', () => ({ resendService: { sendEmail: jest.fn() } }));
 const mockResolveLinkedInAccountForWrite = jest.fn();
 const mockPace = jest.fn();
+const mockRelease = jest.fn();
 const mockReserveWriteSlot = jest.fn();
 jest.mock('../services/linkedInWritePacer', () => ({
   reserveWriteSlot: (...args: any[]) => mockReserveWriteSlot(...args),
@@ -33,6 +34,7 @@ jest.mock('../services/agentMode/linkedInDailyVolumeGate', () => ({
   resolveLinkedInAccountForWrite: (...args: any[]) => mockResolveLinkedInAccountForWrite(...args),
   // ENG-2529: the send path is paced; this suite is about URLs, so the gate always allows.
   paceLinkedInWrite: (...args: any[]) => mockPace(...args),
+  releaseLinkedInDailySlot: (...args: any[]) => mockRelease(...args),
 }));
 
 jest.mock('../services/linkedInOutreachService', () => ({
@@ -124,6 +126,21 @@ describe('ENG-2529 AC1: drip LinkedIn sends call the shared gate before sending'
     expect(mockReserveWriteSlot).toHaveBeenCalledWith('acct-1');
     expect(mockLi.sendMessage).not.toHaveBeenCalled();
     expect(mockDb.snoozeEnrollment).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('ENG-2529: a failed send gives its daily slot back (Opslane run 725 P1)', () => {
+  it('releases the reserved slot when sendMessage throws, and not on success', async () => {
+    mockLi.sendMessage.mockRejectedValueOnce(new Error('unipile down'));
+    mockDb.releaseEnrollmentClaim.mockResolvedValue(undefined as any);
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    await processDueEnrollments();
+    expect(mockRelease).toHaveBeenCalledWith('send-message', resolved, 'acct-1');
+
+    mockRelease.mockClear();
+    mockLi.sendMessage.mockResolvedValue(undefined as any);
+    await processDueEnrollments();
+    expect(mockRelease).not.toHaveBeenCalled();
   });
 });
 

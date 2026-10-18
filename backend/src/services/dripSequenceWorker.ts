@@ -396,9 +396,16 @@ async function sendLinkedInStep(
     throw new Error(`LinkedIn step ${step.stepNumber} has empty message text`);
   }
 
-  await paceDripLinkedInWrite(enrollment.userId, accountId, 'send-message');
+  const releaseSlot = await paceDripLinkedInWrite(enrollment.userId, accountId, 'send-message');
 
-  await linkedInOutreachService.sendMessage(accountId, linkedInUrl, true, messageText);
+  try {
+    await linkedInOutreachService.sendMessage(accountId, linkedInUrl, true, messageText);
+  } catch (err) {
+    // ENG-2529: a send that failed must not keep its daily slot, or a repeatedly failing
+    // enrollment drains the account's daily budget with nothing sent.
+    await releaseSlot();
+    throw err;
+  }
   console.log(`[dripWorker] Sent LinkedIn step ${step.stepNumber} to ${linkedInUrl} (account: ${accountId})`);
 
   // Cache the provider_id so reply-exit checks don't need to re-resolve the URL
@@ -418,21 +425,22 @@ async function sendLinkedInStep(
  * still held to the per-account hourly pacer. Which account is used stays with ENG-1759/ENG-2347.
  * Throws LinkedInWriteDeferredError on refusal so the caller never sends.
  */
-export async function paceDripLinkedInWrite(userId: string, accountId: string, action: 'send-message' | 'send-invite'): Promise<void> {
-  const { resolveLinkedInAccountForWrite, paceLinkedInWrite } = await import('./agentMode/linkedInDailyVolumeGate');
+export async function paceDripLinkedInWrite(userId: string, accountId: string, action: 'send-message' | 'send-invite'): Promise<() => Promise<void>> {
+  const { resolveLinkedInAccountForWrite, paceLinkedInWrite, releaseLinkedInDailySlot } = await import('./agentMode/linkedInDailyVolumeGate');
   const resolved = await resolveLinkedInAccountForWrite(userId, accountId);
   if (resolved) {
     const paced = await paceLinkedInWrite(action, resolved, accountId);
     if (paced.refusal) {
       throw new LinkedInWriteDeferredError(paced.refusal.gate, paced.refusal.error.split('\n')[0], accountId);
     }
-    return;
+    return () => releaseLinkedInDailySlot(action, resolved, accountId);
   }
   const { reserveWriteSlot } = await import('./linkedInWritePacer');
   const slot = await reserveWriteSlot(accountId);
   if (!slot.allowed) {
     throw new LinkedInWriteDeferredError('write_pacer', String(slot.reason ?? 'write pacer refused'), accountId);
   }
+  return async () => {};
 }
 
 async function checkExitConditions(
