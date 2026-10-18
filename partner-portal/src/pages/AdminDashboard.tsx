@@ -3473,9 +3473,18 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
       <ErrorState
         title="We couldn't load the admin dashboard"
         description={adminError}
-        onRetry={() => {
-          void loadUsers(userFilterHideBotLike);
-          void loadWaitlist();
+        onRetry={async () => {
+          // ENG-2526: retry every load sequentially and stop at the first failure.
+          // Each loader clears the shared error on success, so parallel retries let
+          // a successful load hide a still-failing one (e.g. waitlist/analytics).
+          if (!(await loadUsers(userFilterHideBotLike))) return;
+          if (!(await loadWaitlist())) return;
+          if (startDate && endDate) {
+            const startDateStr = format(startDate, "yyyy-MM-dd");
+            const endDateStr = format(endDate, "yyyy-MM-dd");
+            lastLoadedDatesRef.current = { startDate: startDateStr, endDate: endDateStr };
+            await loadAnalytics(startDateStr, endDateStr);
+          }
         }}
       />
     );

@@ -243,7 +243,7 @@ export default function Tasks() {
             </Card>
           </Grid>
         ))}
-        {fetchError && tasks.length === 0 && (
+        {fetchError && activeTasks.length === 0 && (
           <Grid item xs={12}>
             <ErrorState title="We couldn't load your tasks" onRetry={fetchTasks} />
           </Grid>
