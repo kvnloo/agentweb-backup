@@ -252,10 +252,14 @@ export async function applyModelChange(
     throw new ModelNotAvailableError("That model is not available for this change");
   }
   // ENG-669: the schedule runs under its OWNER's plan, so a recommendation outside that plan
-  // would only make the next run fail. Switch off => no read, unchanged.
-  if ((await modelAccess.filterAllowedModels(schedule.userId, [input.toModel], systemModelCheck(null))).length === 0) {
-    throw new ModelNotAvailableError("That model is not included in this account's plan");
-  }
+  // would only make the next run fail. Throws the standard ModelUnavailableError (`not_in_plan`),
+  // which the route answers with the shared 422 body. Switch off => no read, unchanged.
+  await modelAccess.assertModelAllowed({
+    ownerUserId: schedule.userId,
+    requestedModel: input.toModel,
+    canonicalModel: input.toModel,
+    isSystemModel: systemModelCheck(null),
+  });
 
   // NULL means the schedule inherited the platform default rather than pinning a
   // model. That is the common case — 66 of 91 active production schedules carry
@@ -291,7 +295,8 @@ export async function applyModelChange(
   try {
     await scheduleDb.updateSchedule(
       input.scopeId,
-      { llmModel: input.toModel },
+      // ENG-669: the confirmed switch is the owner's choice, so an inherited admin-template origin no longer applies.
+      { llmModel: input.toModel, ...(schedule.llmModelSource === 'system' && { llmModelSource: 'user' as const }) },
       // ENG-1363: `EXPECT_UNSET`, not `undefined`. Inheriting is stored two ways —
       // the attribute absent, or holding `""` — and `undefined` asserts only the
       // first. The 48 active schedules spelling it the second way failed this

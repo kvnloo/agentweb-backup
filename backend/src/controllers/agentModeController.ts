@@ -88,7 +88,8 @@ import {
 import { assertSequentialStepCounts } from '../services/workPlanSteps';
 import { validateModelPin, normalizeRequestedLlmModel, resolvePlanLaunchModel, canonicalPinId } from '../services/agentMode/modelPin';
 import { workPlanStepModels } from '../services/agentMode/workPlanStepModelsInstance';
-import { isSystemAuthoredPlan, modelAccess, systemModelCheck, type SystemModelSession } from '../services/agentMode/modelAccessInstance';
+import { assertModelInOwnerPlan, isSystemAuthoredPlan, modelAccess, systemModelCheck, type SystemModelSession } from '../services/agentMode/modelAccessInstance';
+import { modelSourceAfter as modelSourceAfterStamp, type ModelSource, type StoredModelRecord } from '../services/agentMode/modelAccess';
 import {
   anyStepCarriesModel,
   buildStepModelPausedMessage,
@@ -546,7 +547,7 @@ export async function resolveEffectiveModelForUser(input: {
  */
 async function buildUsagePausedBody(input: {
   usageStatus: Awaited<ReturnType<typeof checkTokenUsage>>;
-  session: { sessionId: string; userId: string; llmModel?: string | null };
+  session: { sessionId: string; userId: string; llmModel?: string | null } & StoredModelRecord;
   requestedModel: string | null;
   backupModel?: string | null;
   /** An already-resolved policy decision (skips the resolve below). */
@@ -571,10 +572,12 @@ async function buildUsagePausedBody(input: {
   if (!decision) {
     return { error: usageBlockCopy.message, usageBlock: usageBlockCopy, code: 'usage_paused', usageMode: 'paused' };
   }
+  const stampedModel = session.llmModel || agentModeService.default_model;
   await chatbotDb.updateSessionLlmModel(
     session.sessionId,
-    session.llmModel || agentModeService.default_model,
+    stampedModel,
     toStoredModelPolicyDecision(decision),
+    modelSourceAfter(session, stampedModel, null),
   );
   return {
     error: usageBlockCopy.message,
@@ -609,30 +612,6 @@ export function modelUnavailableBody(err: ModelUnavailableError, audience: Model
     ? agentModeService.getModelDisplayName(err.requestedModel)
     : undefined;
   return buildModelUnavailableBody(err, displayName, 'selection', audience);
-}
-
-/**
- * ENG-669: the tier allowlist for a model that reaches generation (or storage) WITHOUT the resolver: the final
- * gate in generateSessionResponse, the shared-turn pre-flight and the session-model PATCH routes. Same rule as
- * the resolver: matched on the CANONICAL id against the OWNER's plan, system models pass, an unserved id is left
- * to the existing handling. Throws ModelUnavailableError(`not_in_plan`). Switch off => returns before any read.
- */
-async function assertModelInOwnerPlan(input: {
-  ownerUserId: string;
-  model: string | null | undefined;
-  session?: SystemModelSession | null;
-}): Promise<void> {
-  const model = typeof input.model === 'string' ? input.model.trim() : '';
-  if (!model || typeof agentModeService.resolveGenerationModel !== 'function') return;
-  if (!(await modelAccess.isEnabled())) return;
-  const resolution = agentModeService.resolveGenerationModel(model);
-  if (resolution.fellBack) return;
-  await modelAccess.assertModelAllowed({
-    ownerUserId: input.ownerUserId,
-    requestedModel: model,
-    canonicalModel: resolution.model,
-    isSystemModel: systemModelCheck(input.session),
-  });
 }
 
 /**
@@ -2044,12 +2023,16 @@ async function userExplicitlyRequestedStop(sessionId: string, usageContext?: LLM
 
 /**
  * ENG-2378: a work plan as shown to someone who is not the owner (share / conversable / anonymous launch): never the
- * engine's internal bookkeeping (launchModel, planDefaultModel, engineModel) and, unless `keepStepModels`, no step models.
+ * engine's internal bookkeeping (launchModel, launchModelSource, planAuthor, planDefaultModel, engineModel) and, unless
+ * `keepStepModels`, no step models.
  * Returns a copy; the stored plan is untouched.
  */
 function redactWorkPlanForViewer(workPlan: any, options: { keepStepModels?: boolean } = {}): any {
   if (!workPlan || typeof workPlan !== 'object') return workPlan;
-  const { launchModel: _l, planDefaultModel: _p, engineModel: _e, pickedModel: _k, ...rest } = workPlan;
+  // ENG-669: launchModelSource / planAuthor are model bookkeeping too.
+  const {
+    launchModel: _l, launchModelSource: _ls, planAuthor: _pa, planDefaultModel: _p, engineModel: _e, pickedModel: _k, ...rest
+  } = workPlan;
   return options.keepStepModels ? rest : { ...rest, ...(Array.isArray(rest.steps) && { steps: withoutStepModels(rest.steps) }) };
 }
 
@@ -2078,13 +2061,15 @@ type WorkPlanStepModelTurn =
       kind: 'resolved'; stepCount: number; decision: ResolvedStepDecision; updateStepModelTo?: string;
       /** The user's own pick is running on a model-less step; `engineChoice` is what the engine itself would have used. */
       userPick?: boolean; engineChoice?: string;
+      /** ENG-669: who chose the model that runs (stamped as the session's llmModelSource). */
+      source: ModelSource;
     }
-  | { kind: 'restored'; decision: ResolvedStepDecision }
+  | { kind: 'restored'; decision: ResolvedStepDecision; source: ModelSource }
   | { kind: 'restoreFailed' }
   | { kind: 'unavailable'; stepCount: number; model: string; label: string; reason: string };
 
 async function resolveWorkPlanStepModelForTurn(
-  session: { userId: string; llmModel?: string; workPlan?: any; sessionType?: string; portalType?: string },
+  session: SystemModelSession & { userId: string; llmModel?: string; workPlan?: any },
   // `viewerIsOwner` false = an interactive-share viewer: their pick may run for the turn on a model-less step, but it
   // never rewrites the OWNER's stored step model (the viewer gets the pause; the owner resumes).
   options: { explicitPick?: string; viewerIsOwner?: boolean } = {},
@@ -2094,10 +2079,15 @@ async function resolveWorkPlanStepModelForTurn(
   // Checked only for a plan that carries step models, so ordinary plan turns never read the switch.
   if (!(await workPlanStepModels.shouldHonor())) return { kind: 'none' };
 
-  const resolveHonored = async (model: string, stepCount: number): Promise<ResolvedStepDecision> => {
+  // ENG-669: who chose each model the plan can run. An admin-authored plan's pins are AgentWeb's (planAuthor, recorded
+  // at launch; older sessions fall back to the template via `session`); the pre-plan model keeps its own source.
+  const planPinSource: ModelSource = plan.planAuthor === 'system' ? 'system' : 'user';
+  const launchSource: ModelSource = plan.launchModelSource === 'system' ? 'system' : 'user';
+  const resolveHonored = async (model: string, stepCount: number, source: ModelSource): Promise<ResolvedStepDecision> => {
     // An explicit selection by a human: fail loud, never substitute.
-    // ENG-669: the session decides which step pins are system models (an admin-authored plan's).
-    const decision = await resolveEffectiveModelForUser({ userId: session.userId, requestedModel: model, allowSilentSwap: false, session });
+    const decision = await resolveEffectiveModelForUser({
+      userId: session.userId, requestedModel: model, allowSilentSwap: false, systemModel: source === 'system', session,
+    });
     // Defensive: only an honored decision may run. (A paused account has no effective model; the callers' usage gates
     // answer that case before this point.)
     if (decision.modelSelection !== 'honored' || !decision.effectiveModel) {
@@ -2112,7 +2102,7 @@ async function resolveWorkPlanStepModelForTurn(
     // ...nor when the stamp is a model the user picked during the plan (even if a resumed step adopted it as its own).
     if (plan.engineModel && plan.launchModel && session.llmModel === plan.engineModel && session.llmModel !== plan.pickedModel && !options.explicitPick) {
       try {
-        return { kind: 'restored', decision: await resolveHonored(plan.launchModel, 0) };
+        return { kind: 'restored', decision: await resolveHonored(plan.launchModel, 0, launchSource), source: launchSource };
       } catch (restoreError) {
         if (!isModelUnavailableError(restoreError)) throw restoreError;
         // The pre-plan model is gone: do not retry every turn. The caller clears the marker; this turn runs as requested.
@@ -2139,9 +2129,12 @@ async function resolveWorkPlanStepModelForTurn(
   const userPick = ownModel ? undefined : pick;
   const candidate = ownModel ?? (userPick || fallbackModel);
   if (!candidate) return { kind: 'none' };
+  const candidateSource: ModelSource = userPick
+    ? 'user'
+    : (ownModel || (typeof plan.planDefaultModel === 'string' && plan.planDefaultModel.trim()) ? planPinSource : launchSource);
   try {
     return {
-      kind: 'resolved', stepCount, decision: await resolveHonored(candidate, stepCount),
+      kind: 'resolved', stepCount, decision: await resolveHonored(candidate, stepCount, candidateSource), source: candidateSource,
       ...(userPick && { userPick: true, engineChoice: fallbackModel }),
     };
   } catch (modelError) {
@@ -2149,8 +2142,8 @@ async function resolveWorkPlanStepModelForTurn(
     if (pick && candidate !== pick && options.viewerIsOwner !== false) {
       // The plan's model is gone but the user chose another one: it runs, and the step adopts it (the engine marker then
       // follows the new step model, so the stamp is the engine's own from here on).
-      const decision = await resolveHonored(pick, stepCount);
-      return { kind: 'resolved', stepCount, decision, ...(ownModel && { updateStepModelTo: decision.effectiveModel }) };
+      const decision = await resolveHonored(pick, stepCount, 'user');
+      return { kind: 'resolved', stepCount, decision, source: 'user', ...(ownModel && { updateStepModelTo: decision.effectiveModel }) };
     }
     const display = typeof agentModeService.getModelDisplayName === 'function'
       ? agentModeService.getModelDisplayName(modelError.requestedModel)
@@ -2351,6 +2344,7 @@ async function scheduleAutoWorkPlanContinuation(
       const stepTurn = await resolveWorkPlanStepModelForTurn({
         userId: currentSession.userId, llmModel: currentSession.llmModel, workPlan: currentSession.workPlan,
         sessionType: currentSession.sessionType, portalType: currentSession.portalType,
+        llmModelSource: currentSession.llmModelSource, llmUsagePolicyDecision: currentSession.llmUsagePolicyDecision,
       });
       if (stepTurn.kind === 'unavailable') {
         await pauseWorkPlanForUnavailableStepModel(sessionId, userId, stepTurn, { emitToUser: true });
@@ -4758,19 +4752,19 @@ async function runVerifiedChatInner(
     if (shouldUseReportGenerationModel) {
       const reportGenModel = await agentModeService.getReportGenerationDefaultModel();
       if (sessionModel !== reportGenModel) {
-        await chatbotDb.updateSessionLlmModel(sessionId, reportGenModel);
+        await chatbotDb.updateSessionLlmModel(sessionId, reportGenModel, undefined, 'system');
         sessionModel = reportGenModel;
       }
     } else if (shouldUseImageGenerationModel) {
       const imageGenModel = await agentModeService.getImageGenerationDefaultModel();
       if (sessionModel !== imageGenModel) {
-        await chatbotDb.updateSessionLlmModel(sessionId, imageGenModel);
+        await chatbotDb.updateSessionLlmModel(sessionId, imageGenModel, undefined, 'system');
         sessionModel = imageGenModel;
       }
     } else if (shouldUseVideoGenerationModel) {
       const videoGenModel = await agentModeService.getVideoGenerationDefaultModel();
       if (sessionModel !== videoGenModel) {
-        await chatbotDb.updateSessionLlmModel(sessionId, videoGenModel);
+        await chatbotDb.updateSessionLlmModel(sessionId, videoGenModel, undefined, 'system');
         sessionModel = videoGenModel;
       }
     }
@@ -6957,6 +6951,9 @@ export async function runScheduledChat(
     // A whitespace-only pin is no pin.
     const schedulePin = typeof schedule.llmModel === 'string' ? schedule.llmModel.trim() : '';
     const rawRequestedModel = schedulePin || defaultModel;
+    // ENG-669: AgentWeb's choice (not the owner's): no pin (the scheduled default), or a pin inherited from an
+    // admin-authored schedule template. Exempt from the tier model allowlist; any other pin must be in the plan.
+    const scheduleRunsSystemModel = !schedulePin || schedule.llmModelSource === 'system';
     const requestedModelResolution = agentModeService.resolveGenerationModel(rawRequestedModel);
     let scheduleModelPolicy: EffectiveModelPolicyDecision;
     try {
@@ -6966,9 +6963,10 @@ export async function runScheduledChat(
         backupModel: schedule.llmBackupModel,
         backupSource: schedule.llmBackupSource,
         allowSilentSwap: !schedulePin,
-        // ENG-669: an unpinned schedule runs the admin-configured scheduled default (a system
-        // model); a pin is the owner's choice and must be in the owner's plan.
-        systemModel: !schedulePin,
+        // ENG-669: an unpinned schedule runs the admin-configured scheduled default and an
+        // admin-template pin is AgentWeb's choice (system models); any other pin is the owner's
+        // choice and must be in the owner's plan.
+        systemModel: scheduleRunsSystemModel,
       });
     } catch (modelError) {
       if (!isModelUnavailableError(modelError)) throw modelError;
@@ -7344,6 +7342,8 @@ export async function runScheduledChat(
       sessionId,
       modelToUse,
       toStoredModelPolicyDecision(scheduleModelPolicy),
+      // ENG-669: an unpinned schedule (or one pinned by an admin-authored template) runs AgentWeb's choice.
+      scheduleRunsSystemModel ? 'system' : 'user',
     );
 
     // Convert schedule format to runVerifiedChat format
@@ -9084,6 +9084,17 @@ function sameModelId(a: string | null | undefined, b: string | null | undefined)
   return normalize(a) === normalize(b);
 }
 
+/** ENG-669: who chose `model` once written to this session (see modelAccess.modelSourceAfter), alias-aware. */
+function modelSourceAfter(
+  session: StoredModelRecord | null | undefined,
+  model: string | null | undefined,
+  explicitPick: string | null | undefined,
+): ModelSource {
+  return modelSourceAfterStamp(session, model, explicitPick, (id) => (
+    typeof agentModeService.normalizeModelId === 'function' ? agentModeService.normalizeModelId(id) : id
+  ));
+}
+
 // Common function to generate AI response for a session
 // Always uses worker process to prevent blocking the main event loop
 export async function generateSessionResponse(
@@ -9482,7 +9493,7 @@ export async function generateSessionResponse(
     ranModelDecision = stepModelTurn.decision;
     llmModel = stepModelTurn.decision.effectiveModel;
     if (updatedSession.llmModel !== llmModel) {
-      await chatbotDb.updateSessionLlmModel(sessionId, llmModel, toStoredModelPolicyDecision(stepModelTurn.decision));
+      await chatbotDb.updateSessionLlmModel(sessionId, llmModel, toStoredModelPolicyDecision(stepModelTurn.decision), stepModelTurn.source);
     }
     // Record what the engine stamped (so the end of the plan can tell a later explicit pick apart), adopt an explicit
     // pick on the step that lost its model, and clear the marker once the pre-plan model is restored.
@@ -10011,7 +10022,8 @@ export const agentModeController = {
       // first turn below instead of being lost.
       const hasOpeningAction = Boolean(skillId && skill && (skill as any)?.openingAction);
       const initialSkillState = skillId ? {
-        llmModel: modelToUse, associatedSkills: [skillId],
+        // ENG-669: a skill session runs the admin-configured model (AgentWeb's choice).
+        llmModel: modelToUse, llmModelSource: 'system' as const, associatedSkills: [skillId],
         messages: (welcomeMessage && !hasOpeningAction) ? [{ role: 'assistant' as const, content: welcomeMessage, metadata: { timestamp: new Date().toISOString(), kind: 'skill-welcome' } }] : [],
       } : undefined;
       const createSessionArgs: Parameters<typeof chatbotDb.createChatSession> = [
@@ -10034,6 +10046,8 @@ export const agentModeController = {
             session.sessionId,
             modelToUse,
             initialModelPolicy ? toStoredModelPolicyDecision(initialModelPolicy) : undefined,
+            // ENG-669: a requested model is the user's; otherwise AgentWeb stamped its configured default.
+            requestedLlmModel ? 'user' : 'system',
           );
 
       // Stamp the winner's sessionId on the idem claim so duplicate losers
@@ -10796,6 +10810,8 @@ export const agentModeController = {
         sessionId,
         modelToUse,
         toStoredModelPolicyDecision(modelPolicyDecision),
+        // ENG-669: the portal echoes the stored stamp every turn; that is not a new choice.
+        modelSourceAfter(session, modelToUse, llmModel),
       );
 
       // Build page context for emma-sidebar sessions
@@ -12253,6 +12269,7 @@ export const agentModeController = {
             session.sessionId,
             session.llmModel || defaultModel,
             toStoredModelPolicyDecision(modelPolicyDecision),
+            modelSourceAfter(session, session.llmModel || defaultModel, null),
           );
         }
         return res.status(429).json({
@@ -12265,6 +12282,8 @@ export const agentModeController = {
           session.sessionId,
           modelToUse,
           toStoredModelPolicyDecision(modelPolicyDecision),
+          // The visitor selects nothing: the stored model keeps its source; a default standing in is AgentWeb's.
+          modelSourceAfter(session, modelToUse, null),
         );
       }
 
@@ -14178,6 +14197,8 @@ export const agentModeController = {
         // Explicit empty -> a REMOVAL below, because inheritance is the ABSENCE of
         // the attribute, not a blank value in it.
         ...(validatedLlmModel ? { llmModel: validatedLlmModel } : (llmModelProvided && !llmModelClearing && !llmModelChanging ? { llmModel: incomingLlmModel as string } : {})),
+        // ENG-669: a CHANGED pin is the owner's choice (an inherited admin-template pin no longer applies).
+        ...(validatedLlmModel && { llmModelSource: 'user' as const }),
         ...scheduleBackup,
         // ENG-844: update the owner's timezone when a valid one is supplied; keep
         // the existing value otherwise (partial-update safe).
@@ -14443,6 +14464,8 @@ export const agentModeController = {
         // cross-account tools" could never get the schedule running again.
         [
           ...(llmModelClearing ? ['llmModel'] : []),
+          // ENG-669: the cleared pin's recorded origin goes with it (only when one was recorded).
+          ...(llmModelClearing && existingSchedule.llmModelSource !== undefined ? ['llmModelSource'] : []),
           ...((toolsChanged || effectiveStartingMessage !== previousStartingMessage)
             && (existingSchedule as any).lastKnownSensitive !== undefined
             ? ['lastKnownSensitive', 'lastKnownSensitiveAt']
@@ -16201,6 +16224,7 @@ export const agentModeController = {
       // then either maps to the 503 model_save_failed body or rethrows to the generic 500.
       let modelSaveFailed = false;
       let selectedModel: string;
+      let selectedModelSource: ModelSource = 'system';
       let workPlanWithWelcome: any;
       let conversableToken: string;
       try {
@@ -16208,8 +16232,10 @@ export const agentModeController = {
         // If the write fails nothing else has been written, so the plan is never started on
         // a model other than the one it pins; the empty session is removed best-effort.
         selectedModel = planPinnedModel || await agentModeService.getDefaultModel();
+        // ENG-669: the default, or an admin-authored plan's pin, is AgentWeb's choice; a user plan's pin is a user's.
+        selectedModelSource = planPinnedModel && !isSystemAuthoredPlan(predefinedPlan) ? 'user' : 'system';
         try {
-          await chatbotDb.updateSessionLlmModel(session.sessionId, selectedModel);
+          await chatbotDb.updateSessionLlmModel(session.sessionId, selectedModel, undefined, selectedModelSource);
         } catch (modelErr) {
           console.error(`AgentMode: createSessionWithPlan failed to save model for ${session.sessionId}; launch refused:`, modelErr);
           modelSaveFailed = true;
@@ -16248,7 +16274,11 @@ export const agentModeController = {
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
           // ENG-2378: what a step WITHOUT a model falls back to (plan default, then the model the session starts on).
-          ...(stepModelIds.size > 0 && { ...(planPinnedModel && { planDefaultModel: planPinnedModel }), launchModel: selectedModel }),
+          ...(stepModelIds.size > 0 && {
+            ...(planPinnedModel && { planDefaultModel: planPinnedModel }),
+            launchModel: selectedModel,
+            launchModelSource: selectedModelSource,
+          }),
         };
 
         // Create work plan in session (include welcome message and autocomplete if defined)
@@ -16263,6 +16293,8 @@ export const agentModeController = {
           // path — so every predefined-plan session is traceable back to its
           // template regardless of which route created it.
           templatePlanId: predefinedPlan.planId,
+          // ENG-669: recorded now, so a later edit or deletion of the template cannot change whose pins these are.
+          planAuthor: isSystemAuthoredPlan(predefinedPlan) ? 'system' as const : 'user' as const,
         };
         try {
           await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
@@ -16702,7 +16734,9 @@ export const agentModeController = {
         const effectiveModel = modelDecision.effectiveModel;
         if (effectiveModel && (modelDecision.modelSelection === 'corrected' || effectiveModel !== session.llmModel)) {
           persistSelectedModel = async () => {
-            await chatbotDb.updateSessionLlmModel(sessionId, effectiveModel, toStoredModelPolicyDecision(modelDecision));
+            await chatbotDb.updateSessionLlmModel(
+              sessionId, effectiveModel, toStoredModelPolicyDecision(modelDecision), modelSourceAfter(session, effectiveModel, explicitModel),
+            );
           };
         }
       }
@@ -16904,7 +16938,8 @@ export const agentModeController = {
       }
 
       // Update the session's llmModel
-      const updatedSession = await chatbotDb.updateSessionLlmModel(sessionId, canonicalModel);
+      // ENG-669: a pick is the user's (re-picking the model the session already runs keeps its source).
+      const updatedSession = await chatbotDb.updateSessionLlmModel(sessionId, canonicalModel, undefined, modelSourceAfter(session, canonicalModel, canonicalModel));
 
       res.json({ llmModel: updatedSession.llmModel });
     } catch (error) {
@@ -16975,7 +17010,7 @@ export const agentModeController = {
       }
 
       // Update the session's llmModel
-      const updatedSession = await chatbotDb.updateSessionLlmModel(shareId, canonicalModel);
+      const updatedSession = await chatbotDb.updateSessionLlmModel(shareId, canonicalModel, undefined, modelSourceAfter(session, canonicalModel, canonicalModel));
 
       res.json({ llmModel: updatedSession.llmModel });
     } catch (error) {
@@ -17409,6 +17444,15 @@ export const agentModeController = {
       // own stored llmModel is deliberately not re-validated here (see dev note).
       const validatedOverrideModel = await validateScheduleModelPin(user.userId, overrideModel);
       const validatedOverrideBackup = await validateScheduleModelPin(user.userId, overrideBackupModel);
+      // ENG-669: a pin INHERITED from the template. An admin-authored (system) template's pin is AgentWeb's choice:
+      // recorded as such on the schedule, so its runs are exempt from the tier model allowlist. A user-authored
+      // template's pin becomes this user's pin, so it must be in their plan: refused now (422), not at every run.
+      const inheritsTemplatePin = (overrideModel === undefined || overrideModel === null)
+        && typeof template.llmModel === 'string' && template.llmModel.trim() !== '';
+      const templatePinIsSystem = inheritsTemplatePin && template.visibility === 'system';
+      if (inheritsTemplatePin && !templatePinIsSystem) {
+        await assertModelInOwnerPlan({ ownerUserId: user.userId, model: template.llmModel });
+      }
 
       const now = new Date();
       // Generated here (rather than at the schedule-object build below) so it can
@@ -17479,6 +17523,7 @@ export const agentModeController = {
         llmModel: (overrideModel === undefined || overrideModel === null)
           ? (template.llmModel || '')
           : validatedOverrideModel,
+        ...(templatePinIsSystem && { llmModelSource: 'system' as const }),
         ...scheduleBackup,
         runCount: runCount !== undefined ? runCount : -1,
         variables: templateVars,

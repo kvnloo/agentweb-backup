@@ -252,7 +252,7 @@ import { extractGeneratedImageFilenames } from './shared/generatedAssets';
 import { currentRunFunding } from '../../services/funding/runFunding';
 import { isNonConsumableRequiredFunctionCall } from '../../services/agentMode/workPlanRequiredCallsPolicy';
 import { resolvePlanLaunchModel, isUserAdminSafe, type ModelPinRegistry } from '../../services/agentMode/modelPin';
-import { isSystemAuthoredPlan } from '../../services/agentMode/modelAccess';
+import { isSystemAuthoredPlan, storedModelSource } from '../../services/agentMode/modelAccess';
 import { assertSequentialStepCounts } from '../../services/workPlanSteps';
 import { anyStepCarriesModel, isStepModelUnavailableError, modelBoundToStep, resolvePlanStepModelsForLaunch } from '../../services/agentMode/workPlanStepModels';
 import { buildAnonymousModelUnavailableBody, buildAnonymousPlanModelToolMessage, buildModelUnavailableBody, buildPlanModelToolMessage, isModelUnavailableError, MODEL_SAVE_FAILED_MESSAGE } from '../../services/agentMode/modelUnavailable';
@@ -686,13 +686,15 @@ export async function applyPredefinedWorkPlan(
       // ENG-2378: what a step WITHOUT a model falls back to: the plan default, then the model the session had before.
       ...(stepModelIds.size > 0 && {
         ...(planPinnedModel && { planDefaultModel: planPinnedModel }),
-        ...(session.llmModel && { launchModel: session.llmModel }),
+        ...(session.llmModel && { launchModel: session.llmModel, launchModelSource: storedModelSource(session) }),
       }),
       // ENG-1472: which predefined template this session's plan was launched
       // from, so a completed run can traceably chain into its author-approved
       // "next plan" suggestions and so the accept endpoint can idempotently
       // detect "this recommendation was already applied".
       templatePlanId: predefinedPlan.planId,
+      // ENG-669: recorded now, so a later edit or deletion of the template cannot change whose pins these are.
+      planAuthor: isSystemAuthoredPlan(predefinedPlan) ? 'system' as const : 'user' as const,
     };
     // Validate the plan structure BEFORE the model write: updateSessionWorkPlan rejects a
     // non-sequential stepCount, and by then the model would already have been changed.
@@ -706,9 +708,11 @@ export async function applyPredefinedWorkPlan(
     // failure can put the session back exactly as it was.
     const previousModel = session.llmModel;
     const previousPolicyDecision = session.llmUsagePolicyDecision;
+    const previousModelSource = session.llmModelSource;
     if (planPinnedModel) {
       try {
-        await chatbotDb.updateSessionLlmModel(sessionId, planPinnedModel);
+        // ENG-669: an admin-authored plan's pin is AgentWeb's choice; a user plan's pin is a user's.
+        await chatbotDb.updateSessionLlmModel(sessionId, planPinnedModel, undefined, isSystemAuthoredPlan(predefinedPlan) ? 'system' : 'user');
       } catch (modelErr) {
         console.error('[applyPredefinedWorkPlan] Failed to save plan model; launch refused:', (modelErr as Error).message);
         return {
@@ -731,6 +735,7 @@ export async function applyPredefinedWorkPlan(
           const restored = await chatbotDb.restoreSessionLlmModelIfUnchanged(sessionId, planPinnedModel, {
             llmModel: previousModel,
             llmUsagePolicyDecision: previousPolicyDecision,
+            llmModelSource: previousModelSource,
           });
           if (!restored) {
             console.info(`[applyPredefinedWorkPlan] plan write failed for session ${sessionId}; model no longer "${planPinnedModel}" (changed since the launch's write), so the previous model was NOT restored over it.`);

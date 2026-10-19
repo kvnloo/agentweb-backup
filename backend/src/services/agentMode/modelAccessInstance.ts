@@ -11,7 +11,9 @@ import {
   countAllowedRunnable,
   createModelAccess,
   isSystemAuthoredPlan,
+  storedModelSource,
   type ModelAccessService,
+  type StoredModelRecord,
   type TierModelsConfig,
 } from './modelAccess';
 
@@ -22,7 +24,7 @@ export const modelAccess: ModelAccessService = createModelAccess({
   getSetting: async (name) => (await import('../settingsService')).settingsService.getSetting(name),
   getUser: async (userId) => (await import('../db')).userDb.getUserById(userId),
   resolveTier: async (userId) => (await import('../subscriptionService')).getUserSubscriptionResolution(userId),
-  getTierConfig: async (tierName) => (await import('../subscriptionService')).getSubscriptionTypeConfig(tierName),
+  readTierModels: async (tierName) => (await import('../subscriptionService')).readTierAllowedModels(tierName),
   listTiers: async () => {
     const { settingsService } = await import('../settingsService');
     const setting = await settingsService.getSetting('subscription_types');
@@ -50,10 +52,16 @@ export const modelAccess: ModelAccessService = createModelAccess({
 });
 
 /** The slice of a chat session that decides which models AgentWeb (not the user) chose for it. */
-export interface SystemModelSession {
+export interface SystemModelSession extends StoredModelRecord {
   sessionType?: string;
   portalType?: string;
-  workPlan?: { templatePlanId?: unknown } | null;
+  workPlan?: {
+    templatePlanId?: unknown;
+    /** ENG-669: who authored the plan this session runs, recorded at launch ('system' = admin-authored). */
+    planAuthor?: unknown;
+    planDefaultModel?: unknown;
+    steps?: unknown;
+  } | null;
 }
 
 /** The system models of a context: canonical ids, or `all` when the context could not be read (never block on it). */
@@ -65,9 +73,13 @@ type SystemModels = { all: true } | { all: false; ids: Set<string> };
  *    only break the picker round-trip);
  *  - the default configured for the session's kind: scheduled, report generation, image / video generation,
  *    customer support (emma-sidebar);
- *  - the pins (plan default and step models) of the admin-authored template a work-plan session was launched from.
- * A failed read never blocks: an unreadable default contributes nothing, an unreadable template counts as
- * admin-authored (logged).
+ *  - the session's STORED model when AgentWeb stamped it (llmModelSource 'system', or a legacy decision that shows it
+ *    was defaulted / corrected): e.g. the default at creation, which stays a system stamp after an admin rotates it;
+ *  - the pins (plan default and step models) of an admin-authored plan the session runs: recorded at launch
+ *    (`workPlan.planAuthor`), so a later edit or deletion of the template does not matter. Sessions launched before
+ *    that record existed fall back to reading the template: a deleted template (null) exempts nothing, a failed read
+ *    exempts everything (an outage never blocks; logged).
+ * An unreadable default contributes nothing.
  */
 async function systemModelsFor(session: SystemModelSession | null | undefined): Promise<SystemModels> {
   const { agentModeService } = await import('../agentModeService');
@@ -92,8 +104,17 @@ async function systemModelsFor(session: SystemModelSession | null | undefined): 
   for (const settled of await Promise.allSettled(reads)) {
     if (settled.status === 'fulfilled') add(settled.value);
   }
+  if (storedModelSource(session) === 'system') add(session?.llmModel);
 
-  const templatePlanId = session?.workPlan?.templatePlanId;
+  const plan = session?.workPlan;
+  if (plan?.planAuthor === 'system') {
+    add(plan.planDefaultModel);
+    if (Array.isArray(plan.steps)) for (const step of plan.steps) add((step as { model?: unknown })?.model);
+    return { all: false, ids };
+  }
+  if (plan?.planAuthor === 'user') return { all: false, ids };
+
+  const templatePlanId = plan?.templatePlanId;
   if (typeof templatePlanId === 'string' && templatePlanId) {
     try {
       const { workPlanService } = await import('../workPlanService');
@@ -128,6 +149,33 @@ export function systemModelCheck(session?: SystemModelSession | null): (canonica
     const resolved = await system;
     return resolved.all || resolved.ids.has(canonicalModel);
   };
+}
+
+/**
+ * ENG-669: the tier allowlist for a model that reaches an LLM (or storage) WITHOUT the resolver (the final gate in
+ * generateSessionResponse, the shared-turn pre-flight, the session-model PATCH routes, /api/emma routes that take a
+ * model from the request). Same rule as the resolver: matched on the CANONICAL id against the OWNER's plan, system
+ * models pass, an unserved id is left to the existing handling. Throws ModelUnavailableError(`not_in_plan`).
+ * Switch off => returns before any read.
+ */
+export async function assertModelInOwnerPlan(input: {
+  ownerUserId: string;
+  model: string | null | undefined;
+  session?: SystemModelSession | null;
+}): Promise<void> {
+  const model = typeof input.model === 'string' ? input.model.trim() : '';
+  if (!model) return;
+  if (!(await modelAccess.isEnabled())) return;
+  const { agentModeService } = await import('../agentModeService');
+  if (typeof agentModeService.resolveGenerationModel !== 'function') return;
+  const resolution = agentModeService.resolveGenerationModel(model);
+  if (resolution.fellBack) return;
+  await modelAccess.assertModelAllowed({
+    ownerUserId: input.ownerUserId,
+    requestedModel: model,
+    canonicalModel: resolution.model,
+    isSystemModel: systemModelCheck(input.session),
+  });
 }
 
 /** Compare needs two columns. */

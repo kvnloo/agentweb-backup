@@ -480,6 +480,22 @@ async function readSubscriptionTypesSetting(): Promise<SubscriptionTypesSetting>
 }
 
 /**
+ * ENG-669: the raw `allowedModels` of one tier, for the tier model allowlist. Unlike getSubscriptionTypeConfig this
+ * keeps "the tier has no row" (`configured: false`: nothing narrows it, every model) apart from "the setting could
+ * not be read": that THROWS (after the same bounded last-known fallback as every entitlement read), so the caller can
+ * serve its own last-known answer instead of mistaking an outage for a configuration.
+ */
+export async function readTierAllowedModels(tierName: string): Promise<{ configured: boolean; allowedModels?: unknown }> {
+  const setting = await readSubscriptionTypesSetting();
+  if (!setting?.settingValue) return { configured: false };
+  const tiers: unknown = JSON.parse(setting.settingValue);
+  const tier = Array.isArray(tiers)
+    ? tiers.find((t: any) => t && typeof t === 'object' && t.name === tierName)
+    : undefined;
+  return tier ? { configured: true, allowedModels: (tier as SubscriptionType).allowedModels } : { configured: false };
+}
+
+/**
  * Get subscription type configuration
  */
 export async function getSubscriptionTypeConfig(

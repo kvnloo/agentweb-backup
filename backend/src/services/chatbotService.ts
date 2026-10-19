@@ -275,6 +275,13 @@ export interface ChatSession {
     // (so a user's explicit pick during the plan can be told apart when the plan ends).
     planDefaultModel?: string;
     launchModel?: string;
+    /** ENG-669: who chose `launchModel` (the session's llmModelSource when the plan started). */
+    launchModelSource?: 'user' | 'system';
+    /**
+     * ENG-669: who authored this plan, recorded at launch: 'system' = an admin-authored template (its pins are
+     * AgentWeb's choice and are exempt from the tier model allowlist), 'user' = a user-authored one.
+     */
+    planAuthor?: 'user' | 'system';
     engineModel?: string;
     // The model the USER explicitly picked during the plan (a resumed step adopts it, or a model-less step runs on it):
     // the end-of-plan restore never replaces it.
@@ -448,6 +455,13 @@ export interface ChatSession {
     threadTs: string;
   }; // Slack thread association for in-thread Q&A
   llmModel?: string; // Selected LLM model for this session
+  /**
+   * ENG-669: who chose `llmModel`. 'user' = a person picked it (picker, request, a user-authored pin);
+   * 'system' = AgentWeb stamped it (a configured default, an admin-authored plan pin, a task-type model).
+   * Additive and optional: absent on older sessions (see storedModelSource for how those are read).
+   * The tier model allowlist checks a user's choice; a system stamp is AgentWeb's choice and is exempt.
+   */
+  llmModelSource?: 'user' | 'system';
   llmUsagePolicyDecision?: {
     requestedModel: string | null;
     effectiveModel: string | null;
@@ -802,7 +816,7 @@ export class ChatbotDB {
     emailCampaignTaskId?: string,
     sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email" | "meeting-intake",
     delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean },
-    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages" | "archived" | "branchedFrom">>
+    initialState?: Partial<Pick<ChatSession, "llmModel" | "llmModelSource" | "associatedSkills" | "messages" | "archived" | "branchedFrom">>
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -3902,6 +3916,8 @@ export class ChatbotDB {
       /** ENG-2378: see the matching fields on the read-side workPlan type above. */
       planDefaultModel?: string;
       launchModel?: string;
+      launchModelSource?: 'user' | 'system';
+      planAuthor?: 'user' | 'system';
       engineModel?: string;
       pickedModel?: string;
       /** ENG-1472: see the matching field on the read-side workPlan type above. */
@@ -3972,6 +3988,9 @@ export class ChatbotDB {
     sessionId: string,
     llmModel: string,
     policyDecision?: NonNullable<ChatSession['llmUsagePolicyDecision']>,
+    // ENG-669: who chose this model (see ChatSession.llmModelSource). Like the decision, a stored source describes
+    // the model it was written with, so a write without one REMOVES it rather than leaving a stale claim.
+    source?: NonNullable<ChatSession['llmModelSource']>,
   ): Promise<ChatSession> {
     // A stored llmUsagePolicyDecision describes the specific model it was recorded
     // for. Changing llmModel without a fresh decision to match (task-type model
@@ -3982,17 +4001,23 @@ export class ChatbotDB {
     // actual turn ran on the latter. REMOVE it here so a session record can never
     // pair a decision with a model it doesn't describe; the next real turn through
     // resolveEffectiveModelForUser re-stamps a correct, matching pair anyway.
+    const sets = ["llmModel = :llmModel"];
+    const removes: string[] = [];
+    if (policyDecision) sets.push("llmUsagePolicyDecision = :policyDecision");
+    else removes.push("llmUsagePolicyDecision");
+    if (source) sets.push("llmModelSource = :llmModelSource");
+    else removes.push("llmModelSource");
+    sets.push("adminListPartition = :adminListPartition");
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
-      UpdateExpression: policyDecision
-        ? "SET llmModel = :llmModel, llmUsagePolicyDecision = :policyDecision, adminListPartition = :adminListPartition"
-        : "SET llmModel = :llmModel, adminListPartition = :adminListPartition REMOVE llmUsagePolicyDecision",
+      UpdateExpression: `SET ${sets.join(", ")}${removes.length ? ` REMOVE ${removes.join(", ")}` : ""}`,
       ExpressionAttributeValues: {
         ":llmModel": llmModel,
         ...(policyDecision ? { ":policyDecision": policyDecision } : {}),
+        ...(source ? { ":llmModelSource": source } : {}),
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -4018,7 +4043,11 @@ export class ChatbotDB {
   async restoreSessionLlmModelIfUnchanged(
     sessionId: string,
     expectedModel: string,
-    previous: { llmModel?: string; llmUsagePolicyDecision?: NonNullable<ChatSession['llmUsagePolicyDecision']> },
+    previous: {
+      llmModel?: string;
+      llmUsagePolicyDecision?: NonNullable<ChatSession['llmUsagePolicyDecision']>;
+      llmModelSource?: ChatSession['llmModelSource'];
+    },
   ): Promise<boolean> {
     const sets: string[] = [];
     const removes: string[] = [];
@@ -4034,6 +4063,12 @@ export class ChatbotDB {
       values[":prevDecision"] = previous.llmUsagePolicyDecision;
     } else {
       removes.push("llmUsagePolicyDecision");
+    }
+    if (previous.llmModelSource) {
+      sets.push("llmModelSource = :prevSource");
+      values[":prevSource"] = previous.llmModelSource;
+    } else {
+      removes.push("llmModelSource");
     }
     sets.push("adminListPartition = :adminListPartition");
     values[":adminListPartition"] = "all";

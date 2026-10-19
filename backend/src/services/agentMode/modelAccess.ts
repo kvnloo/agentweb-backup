@@ -22,8 +22,9 @@
  * Exempt: SYSTEM models, i.e. AgentWeb's choice rather than the user's (configured defaults, admin-authored plan pins;
  * see modelAccessInstance.ts systemModelsFor). Only a check that would otherwise refuse ever computes that set.
  *
- * Never blocks on infrastructure: an unreadable tier uses this owner's last-known access; with none at all the model
- * is allowed and one deduped on-call alert fires.
+ * Never blocks on infrastructure: an unreadable tier (a failed user / org / settings read) uses this owner's
+ * last-known access; with none at all the model is allowed and one deduped on-call alert fires. Either answer is
+ * reused ~10s, like a good one. A tier that simply has no `subscription_types` row is NOT unreadable: every model.
  *
  * This module has no dependency on the service graph (unit-testable); the process-wide instance lives in
  * modelAccessInstance.ts.
@@ -69,8 +70,11 @@ export interface ModelAccessDeps {
   getUser(userId: string): Promise<{ isAdmin?: boolean } | null | undefined>;
   /** Effective (org-aware) tier name; `resolved: false` when it could not be confirmed. */
   resolveTier(userId: string): Promise<{ subscriptionType: string; resolved: boolean }>;
-  /** The tier's config, or null when unreadable / not configured. */
-  getTierConfig(tierName: string): Promise<TierModelsConfig | null>;
+  /**
+   * The tier's raw `allowedModels`. `configured: false` = the tier has no row (nothing narrows it: every model).
+   * THROWS only when the tiers cannot be read, which is the one "unreadable" case.
+   */
+  readTierModels(tierName: string): Promise<{ configured: boolean; allowedModels?: unknown }>;
   /** Every configured tier, in admin order (for `upgradeRequired`). */
   listTiers(): Promise<TierModelsConfig[]>;
   normalizeModelId(id: string): string;
@@ -114,6 +118,55 @@ export function countAllowedRunnable(access: ModelAccess, catalogIds: readonly s
   return runnable.size;
 }
 
+/** ENG-669: who chose a stored model: a person ('user') or AgentWeb ('system'). */
+export type ModelSource = 'user' | 'system';
+
+/** The slice of a stored session that says who chose its model. */
+export interface StoredModelRecord {
+  llmModel?: string | null;
+  llmModelSource?: ModelSource | null;
+  llmUsagePolicyDecision?: { effectiveModel?: string | null; modelSelection?: string | null } | null;
+}
+
+/**
+ * Who chose the session's STORED model: its recorded `llmModelSource`; for a session written before that field
+ * existed, 'system' when the stored policy decision shows the model was not the requested one (defaulted /
+ * corrected), otherwise 'user' (a visible 422 at worst, never a silent swap). Undefined when nothing is stored.
+ */
+export function storedModelSource(session: StoredModelRecord | null | undefined): ModelSource | undefined {
+  if (!session?.llmModel) return undefined;
+  if (session.llmModelSource === 'user' || session.llmModelSource === 'system') return session.llmModelSource;
+  const decision = session.llmUsagePolicyDecision;
+  if (
+    decision
+    && decision.effectiveModel === session.llmModel
+    && (decision.modelSelection === 'defaulted' || decision.modelSelection === 'corrected')
+  ) {
+    return 'system';
+  }
+  return 'user';
+}
+
+/**
+ * Who chose `model` once it is written to this session (ChatSession.llmModelSource). Keeping the model the session
+ * already has (an echo of the stored stamp counts: the portal re-sends the picker value every turn) keeps its source;
+ * a different explicit pick is the user's; anything else (the default standing in) is AgentWeb's. Ids are compared
+ * after `normalizeModelId` (legacy aliases).
+ */
+export function modelSourceAfter(
+  session: StoredModelRecord | null | undefined,
+  model: string | null | undefined,
+  explicitPick: string | null | undefined,
+  normalizeModelId: (id: string) => string = (id) => id,
+): ModelSource {
+  const same = (a: string | null | undefined, b: string | null | undefined) =>
+    Boolean(a && b && normalizeModelId(a.trim()) === normalizeModelId(b.trim()));
+  if (session?.llmModel && same(model, session.llmModel) && (!explicitPick || same(explicitPick, session.llmModel))) {
+    return storedModelSource(session) ?? 'system';
+  }
+  return explicitPick ? 'user' : 'system';
+}
+
 /**
  * An admin-authored Work Plan (created through the admin routes, i.e. built-in, or published as a system plan): its
  * pins are AgentWeb's choice, so they are not checked against the launching user's plan. A user plan stays
@@ -154,30 +207,43 @@ export function createModelAccess(deps: ModelAccessDeps) {
 
   // ---- per-owner access: fresh for ACCESS_TTL_MS, then kept as the last-known answer ----
   const remembered = new Map<string, { access: ModelAccess; at: number }>();
+  // A degraded answer (read failed) is reused for ACCESS_TTL_MS too, so a failing read cannot become a read storm.
+  const degraded = new Map<string, { access: ModelAccess; at: number }>();
+  // Tiers already reported as having no row (one log line per tier per process, not one per turn).
+  const unconfiguredTiersLogged = new Set<string>();
 
-  function remember(ownerKey: string, access: ModelAccess, at: number): void {
-    remembered.delete(ownerKey); // re-insert so Map order is oldest-first
-    remembered.set(ownerKey, { access, at });
-    if (remembered.size > MAX_REMEMBERED_OWNERS) {
-      const oldest = remembered.keys().next().value;
-      if (oldest !== undefined) remembered.delete(oldest);
+  function boundedSet(map: Map<string, { access: ModelAccess; at: number }>, ownerKey: string, access: ModelAccess, at: number): void {
+    map.delete(ownerKey); // re-insert so Map order is oldest-first
+    map.set(ownerKey, { access, at });
+    if (map.size > MAX_REMEMBERED_OWNERS) {
+      const oldest = map.keys().next().value;
+      if (oldest !== undefined) map.delete(oldest);
     }
   }
 
-  function unreadable(ownerKey: string, ownerUserId: string, tier: string | null, why: string): ModelAccess {
+  function remember(ownerKey: string, access: ModelAccess, at: number): void {
+    degraded.delete(ownerKey);
+    boundedSet(remembered, ownerKey, access, at);
+  }
+
+  function unreadable(ownerKey: string, ownerUserId: string, tier: string | null, why: string, at: number): ModelAccess {
     const last = remembered.get(ownerKey);
+    let access: ModelAccess;
     if (last) {
       deps.log('ModelAccess: tier unreadable; serving the last-known access', { why, tier: last.access.tier });
-      return { ...last.access, source: 'last_known' };
+      access = { ...last.access, source: 'last_known' };
+    } else {
+      deps.log('ModelAccess: tier unreadable and nothing known; allowing every model', { why, tier });
+      void deps.alertTierUnreadable({
+        ownerUserId,
+        tier,
+        dedupeKey: TIER_UNREADABLE_ALERT_DEDUPE_KEY,
+        dedupeWindowMs: UNREADABLE_ALERT_WINDOW_MS,
+      }).catch(() => { /* the alert sink must never fail a turn */ });
+      access = { tier, allowedModels: ALL_MODELS, isAdmin: false, source: 'unavailable' };
     }
-    deps.log('ModelAccess: tier unreadable and nothing known; allowing every model', { why, tier });
-    void deps.alertTierUnreadable({
-      ownerUserId,
-      tier,
-      dedupeKey: TIER_UNREADABLE_ALERT_DEDUPE_KEY,
-      dedupeWindowMs: UNREADABLE_ALERT_WINDOW_MS,
-    }).catch(() => { /* the alert sink must never fail a turn */ });
-    return { tier, allowedModels: ALL_MODELS, isAdmin: false, source: 'unavailable' };
+    boundedSet(degraded, ownerKey, access, at);
+    return access;
   }
 
   async function readAccess(ownerUserId: string): Promise<ModelAccess> {
@@ -187,6 +253,8 @@ export function createModelAccess(deps: ModelAccessDeps) {
     const now = deps.now();
     const cached = remembered.get(ownerKey);
     if (cached && now - cached.at < ACCESS_TTL_MS) return cached.access;
+    const failing = degraded.get(ownerKey);
+    if (failing && now - failing.at < ACCESS_TTL_MS) return failing.access;
 
     let tier: string | null = null;
     try {
@@ -200,10 +268,16 @@ export function createModelAccess(deps: ModelAccessDeps) {
       }
       const resolution = anonymous ? { subscriptionType: 'Free', resolved: true } : await deps.resolveTier(ownerUserId);
       tier = resolution.subscriptionType;
-      if (!resolution.resolved) return unreadable(ownerKey, ownerUserId, tier, 'tier_unconfirmed');
-      const config = await deps.getTierConfig(tier);
-      if (!config) return unreadable(ownerKey, ownerUserId, tier, 'tier_config_unavailable');
-      if (config.allowedModels !== undefined && !Array.isArray(config.allowedModels)) {
+      // The tier could not be confirmed (a user / org-owner read failed): an outage, not a configuration.
+      if (!resolution.resolved) return unreadable(ownerKey, ownerUserId, tier, 'tier_unconfirmed', now);
+      const config = await deps.readTierModels(tier);
+      if (!config.configured) {
+        // A tier with no row (or no tiers at all) is not narrowed by anything: every model, cached like any answer.
+        if (!unconfiguredTiersLogged.has(tier)) {
+          unconfiguredTiersLogged.add(tier);
+          deps.log('ModelAccess: tier has no subscription_types row; allowing every model', { tier });
+        }
+      } else if (config.allowedModels !== undefined && !Array.isArray(config.allowedModels)) {
         deps.log('ModelAccess: malformed allowedModels on a tier; treating it as every model', { tier });
       }
       const access: ModelAccess = {
@@ -215,7 +289,7 @@ export function createModelAccess(deps: ModelAccessDeps) {
       remember(ownerKey, access, now);
       return access;
     } catch (error) {
-      return unreadable(ownerKey, ownerUserId, tier, (error as Error)?.name ?? 'Error');
+      return unreadable(ownerKey, ownerUserId, tier, (error as Error)?.name ?? 'Error', now);
     }
   }
 
@@ -314,6 +388,8 @@ export function createModelAccess(deps: ModelAccessDeps) {
   /** Forget cached access and the switch (tests). */
   function reset(): void {
     remembered.clear();
+    degraded.clear();
+    unconfiguredTiersLogged.clear();
     known = false;
     validUntil = 0;
     inFlight = null;

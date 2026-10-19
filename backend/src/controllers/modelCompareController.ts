@@ -159,7 +159,8 @@ function selectDeps(): SelectDeps {
     tryClaim: tryClaimSessionGeneration,
     release: releaseSessionGeneration,
     appendMessages: (sessionId, messages) => chatbotDb.addMessagesToSession(sessionId, messages),
-    updateSessionModel: (sessionId, model) => chatbotDb.updateSessionLlmModel(sessionId, model),
+    // ENG-669: continuing with a compared column is the user's pick.
+    updateSessionModel: (sessionId, model) => chatbotDb.updateSessionLlmModel(sessionId, model, undefined, 'user'),
     maxSessionMessages: MAX_MESSAGE_SIZE_PER_SESSION,
     getSecret: getJwtSecret,
     now: () => Date.now(),

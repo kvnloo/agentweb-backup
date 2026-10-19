@@ -7,6 +7,8 @@ import {
 } from '../services/llmUsageDeclineService';
 import { getCustomerPortalPages } from '../services/customerPortalPages';
 import { checkTokenUsage } from '../services/tokenUsageService';
+import { buildModelUnavailableBody, isModelUnavailableError } from '../services/agentMode/modelUnavailable';
+import { agentModeService } from '../services/agentModeService';
 import { resolveUsageRunway } from '../services/llmUsageRunwayResolverService';
 import { toCustomerRunway } from '../services/llmUsageForecastService';
 import { resolveUsageDrivers, toCustomerDrivers, previewUsageRunway } from '../services/llmUsageDriversResolverService';
@@ -280,6 +282,13 @@ router.post('/usage-runway/apply', authenticateToken, async (req, res) => {
     }
     if (error instanceof ModelNotAvailableError) {
       return res.status(400).json({ error: error.message });
+    }
+    // ENG-669: the model is outside the schedule owner's plan: the same 422 body every model refusal uses.
+    if (isModelUnavailableError(error)) {
+      const displayName = typeof agentModeService.getModelDisplayName === 'function'
+        ? agentModeService.getModelDisplayName(error.requestedModel)
+        : undefined;
+      return res.status(422).json(buildModelUnavailableBody(error, displayName));
     }
     // 409, not 500: nothing failed. Someone else changed the schedule first, so
     // the client's own view is stale — reload-and-retry is the fix, which a 500

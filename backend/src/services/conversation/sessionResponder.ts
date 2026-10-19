@@ -88,7 +88,7 @@ export async function handleSessionResponse(
 
     const llmModel = session.llmModel || await agentModeService.getDefaultModel();
     if (!session.llmModel) {
-      await chatbotDb.updateSessionLlmModel(session.sessionId, llmModel);
+      await chatbotDb.updateSessionLlmModel(session.sessionId, llmModel, undefined, 'system');
     }
 
     // Download and persist any files attached to the inbound message

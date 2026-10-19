@@ -153,7 +153,7 @@ export async function handleResult(req: Request, res: Response): Promise<void> {
 
     // 6. Set LLM model (use default)
     const llmModel = await agentModeService.getDefaultModel();
-    await chatbotDb.updateSessionLlmModel(session.sessionId, llmModel);
+    await chatbotDb.updateSessionLlmModel(session.sessionId, llmModel, undefined, 'system');
 
     // 7. Substitute URL params into prompt template
     const resolvedPrompt = applyVariableValues(config.prompt, args);

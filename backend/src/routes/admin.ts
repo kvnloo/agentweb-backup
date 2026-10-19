@@ -4894,7 +4894,7 @@ router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/start-ses
 
     const { agentModeService } = await import('../services/agentModeService');
     const modelToUse = await agentModeService.getDefaultModel();
-    await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
+    await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse, undefined, 'system');
     await chatbotDb.updateSessionGtmWorkItem(session.sessionId, { planId, phaseId, workItemId });
 
     // Build the initial message from work item title + description
@@ -5181,7 +5181,9 @@ async function findStrandedTiers(nextTierNames: string[]): Promise<Array<{ name:
 /**
  * ENG-669: a tier's `allowedModels` as it is stored: canonical registry ids (legacy aliases resolved), de-duplicated,
  * in the admin's order; `"*"` alone when it is present (every model); the reserved `"agentweb-model"` kept as is.
- * Throws (-> 400, nothing saved) when the value is not a list of strings or names an id that is not served.
+ * Throws (-> 400, nothing saved) when the value is not a list of strings, is empty (a tier that can choose no model is
+ * meaningless: use "*" or name the models), or names an id that is not served or that a customer can never select
+ * (admin-only, internal-only, live-voice).
  */
 async function canonicalizeTierAllowedModels(tierName: string, raw: unknown): Promise<string[]> {
   if (!Array.isArray(raw) || raw.some((entry) => typeof entry !== 'string')) {
@@ -5191,6 +5193,7 @@ async function canonicalizeTierAllowedModels(tierName: string, raw: unknown): Pr
   const { agentModeService } = await import('../services/agentModeService');
   const ids: string[] = [];
   const unknown: string[] = [];
+  const notSelectable: string[] = [];
   for (const entry of raw as string[]) {
     const id = entry.trim();
     if (!id) continue;
@@ -5204,10 +5207,21 @@ async function canonicalizeTierAllowedModels(tierName: string, raw: unknown): Pr
       unknown.push(id);
       continue;
     }
+    if (!agentModeService.isModelSelectableBy(resolution.model, false)) {
+      notSelectable.push(id);
+      continue;
+    }
     if (!ids.includes(resolution.model)) ids.push(resolution.model);
   }
+  const list = (bad: string[]) => bad.map((id) => `'${id}'`).join(', ');
   if (unknown.length > 0) {
-    throw new Error(`${tierName} allowedModels: unknown model id${unknown.length === 1 ? '' : 's'} ${unknown.map((id) => `'${id}'`).join(', ')}`);
+    throw new Error(`${tierName} allowedModels: unknown model id${unknown.length === 1 ? '' : 's'} ${list(unknown)}`);
+  }
+  if (notSelectable.length > 0) {
+    throw new Error(`${tierName} allowedModels: ${list(notSelectable)} cannot be selected by customers (admin-only, internal or live-voice)`);
+  }
+  if (ids.length === 0) {
+    throw new Error(`${tierName} allowedModels must name at least one model, or "*" for every model`);
   }
   return ids;
 }
