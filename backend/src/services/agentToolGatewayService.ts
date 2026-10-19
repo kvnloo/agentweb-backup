@@ -799,6 +799,47 @@ export function evaluateAgentToolPolicy(input: AgentToolPolicyInput): AgentToolP
   };
 }
 
+// ENG-2570: call_hubspot_api CONTACT_LIST GET — models put the list id in
+// `query` ({listId:"17"}, "listId=17", 17) instead of `list_id`, then loop to
+// repeated_failure (prod session 6935593b, 2026-10-17). Move an unambiguous id
+// into list_id. Scoped to this tool/action; never overwrites list_id and never
+// touches free-text queries.
+const HUBSPOT_QUERY_ID_KEYS = ['list_id', 'listId', 'listid', 'id'];
+function extractHubSpotListIdFromQuery(query: unknown): string | null {
+  if (typeof query === 'number') {
+    return Number.isSafeInteger(query) && query > 0 ? String(query) : null;
+  }
+  if (typeof query === 'string') {
+    const trimmed = query.trim();
+    if (/^\d+$/.test(trimmed)) return trimmed;
+    const kv = /^(?:list_?id|id)\s*[=:]\s*["']?(\d+)["']?$/i.exec(trimmed);
+    return kv ? kv[1] : null;
+  }
+  if (query && typeof query === 'object' && !Array.isArray(query)) {
+    const obj = query as Record<string, unknown>;
+    const keys = Object.keys(obj);
+    if (keys.length !== 1 || !HUBSPOT_QUERY_ID_KEYS.includes(keys[0])) return null;
+    return extractHubSpotListIdFromQuery(obj[keys[0]]);
+  }
+  return null;
+}
+
+function repairHubSpotListIdFromQuery(
+  toolName: string,
+  args: Record<string, unknown>,
+  properties: Record<string, unknown>,
+): string | null {
+  if (toolName !== 'call_hubspot_api' || !properties.list_id) return null;
+  if (String(args.entity_type ?? '').toUpperCase() !== 'CONTACT_LIST') return null;
+  if (String(args.action ?? '').toUpperCase() !== 'GET') return null;
+  if (args.list_id !== undefined && args.list_id !== null && args.list_id !== '') return null;
+  const listId = extractHubSpotListIdFromQuery(args.query);
+  if (!listId) return null;
+  args.list_id = listId;
+  delete args.query;
+  return 'query->list_id';
+}
+
 export function validateAndRepairToolArgs(
   input: AgentToolContractValidationInput,
 ): AgentToolContractValidationResult {
@@ -933,6 +974,9 @@ export function validateAndRepairToolArgs(
       });
     }
   }
+
+  const hubspotListIdRepair = repairHubSpotListIdFromQuery(input.toolName, repairedArgs, properties);
+  if (hubspotListIdRepair) repairs.push(hubspotListIdRepair);
 
   const missingRequiredUrlTargetCount = required.filter((name: string) =>
     isMissingRequiredValue(repairedArgs[name], properties[name]) &&
