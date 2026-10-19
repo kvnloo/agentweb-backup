@@ -13,8 +13,24 @@ value on a failed refresh (same pattern as `work_plan_step_models_enabled`). Cod
 - `"*"` = every non-admin catalog model; a list containing `"*"` is stored as `["*"]`;
 - `"agentweb-model"` is reserved for the AgentWeb router (PR-C). It is not a registry key, so until PR-C ships it
   matches nothing runnable: a tier listing only it can run only system models (the configured default);
-- field absent = every model. Admin GET/POST round-trip it as stored (`"*"` is not expanded). Partner portal: the
-  "Chat models" field in Subscription Types (comma-separated; blank = absent).
+- field absent = every model. Admin GET/POST round-trip it as stored (`"*"` is not expanded). POST rejects (400) an
+  unknown id, an id customers can never select (admin-only / internal / live-voice) and an empty list. Partner
+  portal: the "Chat models" field in Subscription Types (comma-separated; blank = absent; a stored empty list is sent
+  back as-is so the server refuses it instead of the editor silently widening it).
+- a tier with no `subscription_types` row (or no tiers at all) is NOT narrowed: every model, cached, logged once per
+  tier, no alert.
+
+**Who chose a stored model (additive optional attributes, no migration).** `ChatSession.llmModelSource`
+(`'user' | 'system'`) is written by every `updateSessionLlmModel` call (a write without one removes it, like the
+policy decision): createSession (requested = user, else system), the /generate, verified-generate and shared
+persists (an echo of the stored stamp keeps its source), PATCH (user), branch (inherits), Compare select (user),
+schedule runs, plan launches, step stamps, task-type models, Slack/transports/email/GTM/result-endpoint defaults
+(system). A system-stamped model stays AgentWeb's choice after an admin rotates the default (no false 422). Legacy
+sessions without the field: system when the stored decision shows `defaulted`/`corrected`, otherwise a user pick
+(a visible 422 at worst). `ScheduledChat.llmModelSource: 'system'` marks a pin inherited from an admin-authored
+(`visibility: 'system'`) schedule template; a user-authored template's pin is checked at creation (422). The
+session `workPlan` records `planAuthor` (and `launchModelSource`) at launch, so a later edit or deletion of the
+template does not change whose pins they are.
 
 **Who / what is checked.** The canonical id (after alias resolution) against the session OWNER's tier (org members:
 the org owner's tier unless they have their own live subscription; `anon_` owners: Free), never the caller. Admin
@@ -32,7 +48,8 @@ template copies the template's model as a user pin, so it is checked at run time
 and launch helpers (owner/launcher threaded through); session PATCH (with the switch on: checked against the session
 OWNER, 422 instead of the caller-based 403) and shared-session PATCH; `llmModelChangeService` and the usage-drivers
 recommendation catalog; a final gate in `generateSessionResponse` for side channels that run `session.llmModel`
-without the resolver (it checks the STORED model; a model the caller chose itself is AgentWeb's choice); Compare
+without the resolver (it checks the STORED model; a model the caller chose itself is AgentWeb's choice); `/api/emma/create-html-from-template` and `/api/emma/describe-media`
+(they take a model from the request body; the MCP server's `llmModel` argument reaches no LLM call); Compare
 per column (through the resolver) and up front (D3: owner runs fewer than two models => 403
 `compare_not_available_for_tier` + `upgradeRequired`, `/me` hint `modelCompareTierBlocked` while the switch is on);
 `/model-options` filters `allModels` / `selectableModels` and adds `modelAccess: { tier, allowedModels, upgradeRequired? }`.
@@ -42,8 +59,9 @@ upgradeRequired }`; the share-viewer (interactive share / conversable) body omit
 `upgradeRequired`. Slack threads, other transports and approval-inbox resumes post the same sentence instead of the
 generic error.
 
-**Unreadable tier.** Never blocks: this owner's last-known access, else allow and one deduped on-call alert
-(`model_tier_allowlist:tier_unreadable`, 1h). A pin outside the plan on a scheduled run fails the run visibly but does
+**Unreadable tier.** Only a failed user / org / settings read. Never blocks: this owner's last-known access, else
+allow and one deduped on-call alert (`model_tier_allowlist:tier_unreadable`, 1h); either answer is reused ~10s so a
+failing read cannot become a read storm. A pin outside the plan on a scheduled run fails the run visibly but does
 not page (it is the plan limit working, not a fault).
 
 **Rollout.** 1) Ship with every tier's `allowedModels` absent or `["*"]` and the switch off. 2) Turn the switch on:
