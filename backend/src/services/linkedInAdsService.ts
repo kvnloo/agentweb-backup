@@ -972,6 +972,29 @@ export async function createCreativeInline(
   return makeRequest('POST', `/rest/adAccounts/${adAccountId}/creatives?action=createInline`, accessToken, body);
 }
 
+/** ENG-2575: statuses LinkedIn accepts for a creative's intendedStatus. */
+export const CREATIVE_INTENDED_STATUSES = ['ACTIVE', 'PAUSED', 'ARCHIVED', 'CANCELED', 'DRAFT'] as const;
+
+/**
+ * ENG-2575: change a creative's status (pause / resume / archive). LinkedIn models
+ * this as a PARTIAL_UPDATE of `intendedStatus` on the account-scoped creative.
+ */
+export async function updateCreativeStatus(
+  accessToken: string,
+  adAccountId: string,
+  creativeId: string,
+  status: string,
+): Promise<LinkedInAdsApiResult> {
+  const creativeUrn = creativeId.startsWith('urn:') ? creativeId : `urn:li:sponsoredCreative:${creativeId}`;
+  return makeRequest(
+    'POST',
+    `/rest/adAccounts/${adAccountId}/creatives/${encodeURIComponent(creativeUrn)}`,
+    accessToken,
+    { patch: { $set: { intendedStatus: status } } },
+    { 'X-RestLi-Method': 'PARTIAL_UPDATE' },
+  );
+}
+
 /**
  * Retag ONE existing, already-live LinkedIn creative missing UTMs (Harsha's ask —
  * the audit tool can only find these, never fix them). Deliberately single-creative:
