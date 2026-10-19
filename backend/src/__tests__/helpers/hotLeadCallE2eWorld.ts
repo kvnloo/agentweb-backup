@@ -127,7 +127,13 @@ export async function submitLead(leadId: string, o: SubmitOptions = {}): Promise
 
 export const recordOf = (leadId: string, listId = LIST) => world.crm.lead(listId, leadId).system?.hot_lead_call as Record<string, unknown> | undefined;
 export const eventsOf = (leadId: string) => world.crm.timeline(LIST, leadId);
-export const placedCall = (i = 0): PlaceCallParams => world.provider.placedCalls[i];
+/** A webhook-driven call placed by the orchestrator (not an inline-TwiML verification call). */
+export type WebhookCall = Extract<PlaceCallParams, { url: string }>;
+export function placedCall(i = 0): WebhookCall {
+  const placed = world.provider.placedCalls[i];
+  if (!placed || placed.url === undefined) throw new Error(`no webhook-driven call was placed at index ${i}`);
+  return placed;
+}
 export const usage = () => mock(recordVendorUsage).mock.calls.map(([u]) => u).sort((a, b) => a.idempotencyKey.localeCompare(b.idempotencyKey));
 /** [idempotency key, minutes] per usage event, sorted by key. */
 export const usageSummary = () => usage().map((u) => [u.idempotencyKey, u.quantity]);
@@ -140,7 +146,7 @@ export const skipReason = (leadId: string) => (world.crm.lead(LIST, leadId).enga
  * out for it: the placeCall URLs first, then the action/statusCallback URLs found in the TwiML it was answered with.
  * SequenceNumber starts at 0, as Twilio's does.
  */
-export function twilioCall(placed: PlaceCallParams, ownerSid = 'CA00000001', leadSid = 'CA00000002') {
+export function twilioCall(placed: WebhookCall, ownerSid = 'CA00000001', leadSid = 'CA00000002') {
   const ownerLeg = { AccountSid: 'AC00000000000000000000000000000000', Direction: 'outbound-api', From: TWILIO_NUMBER, To: OWNER_PHONE };
   const { twilio } = world;
   let gatherUrl = '';
@@ -184,7 +190,7 @@ function expectNoPhoneNumberAnywhere(): void {
   const surfaces: string[] = [
     ...consoleSpies.flatMap((s) => s.mock.calls.map((c) => JSON.stringify(c))),
     ...[...crm.leads.values()].flatMap((l) => [JSON.stringify(l.engagements ?? []), JSON.stringify(l.system?.hot_lead_call ?? {})]),
-    ...provider.placedCalls.flatMap((p) => [p.url, p.statusCallbackUrl]),
+    ...provider.placedCalls.flatMap((p) => [p.url, p.statusCallbackUrl].filter((u): u is string => u !== undefined)),
     JSON.stringify(mock(recordVendorUsage).mock.calls),
   ];
   for (const text of surfaces) {
