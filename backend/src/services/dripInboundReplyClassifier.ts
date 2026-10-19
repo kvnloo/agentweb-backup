@@ -35,31 +35,49 @@ const BOUNCE_SENDER = /(^|[<\s"])(mailer-daemon|postmaster)@/i;
 
 const AUTO_PRECEDENCE = /^(bulk|junk|list|auto_reply)$/i;
 
-/** Subject/body markers for out-of-office notices (English + common variants). */
-export const OUT_OF_OFFICE_PATTERNS: RegExp[] = [
-  /\bout of (the )?office\b/i,
+/**
+ * Strong auto-reply markers: safe to match in the subject AND the (unquoted)
+ * body, because a human rarely writes these phrases in a genuine reply.
+ */
+export const STRONG_OOO_PATTERNS: RegExp[] = [
   /\bautomatic reply\b/i,
   /\bauto[- ]?reply\b/i,
   /\bautoreply\b/i,
   /\bauto[- ]?response\b/i,
-  /\bon (annual )?(leave|vacation|holiday)\b/i,
+  /\bi am (currently )?out of (the )?office\b/i,
+  /\bi'?m (currently )?out of (the )?office\b/i,
   /\babwesenheitsnotiz\b/i, // de
   /\bautomatische antwort\b/i, // de
+  /\bréponse automatique\b/i, // fr
+  /\brespuesta automática\b/i, // es
+  /\brisposta automatica\b/i, // it
+  /\bresposta automática\b/i, // pt
+  /\bautomatisch antwoord\b/i, // nl
+  /自动回复/, // zh
+  /自動回覆/, // zh-TW
+  /自動返信/, // ja
+  /不在通知/, // ja
+];
+
+/**
+ * Ambiguous absence phrases ("on vacation", "out of office"): a human reply
+ * can say "I was on vacation, yes let's talk", so these match the SUBJECT only.
+ */
+export const SUBJECT_ONLY_OOO_PATTERNS: RegExp[] = [
+  /\bout of (the )?office\b/i,
+  /\bon (annual )?(leave|vacation|holiday)\b/i,
   /\bnicht im büro\b/i, // de
   /\babsence du bureau\b/i, // fr
-  /\bréponse automatique\b/i, // fr
   /\bhors du bureau\b/i, // fr
   /\bfuera de la oficina\b/i, // es
-  /\brespuesta automática\b/i, // es
   /\bfuori sede\b/i, // it
-  /\brisposta automatica\b/i, // it
   /\bfora do escritório\b/i, // pt
-  /\bresposta automática\b/i, // pt
   /\bafwezig\b/i, // nl
-  /\bautomatisch antwoord\b/i, // nl
-  /不在/, // ja/zh
-  /自动回复/, // zh
+  /不在办公室|不在公司|外出中|休假中|休暇中/, // zh/ja workplace absence
 ];
+
+/** All subject markers (back-compat export). */
+export const OUT_OF_OFFICE_PATTERNS: RegExp[] = [...STRONG_OOO_PATTERNS, ...SUBJECT_ONLY_OOO_PATTERNS];
 
 function headerMap(headers: InboundMessage['headers']): Map<string, string> {
   const map = new Map<string, string>();
@@ -123,7 +141,7 @@ export function classifyInboundReply(msg: InboundMessage): InboundReplyClassific
   // 3. Out-of-office patterns in subject/body.
   const oooReasons: string[] = [];
   if (OUT_OF_OFFICE_PATTERNS.some((p) => p.test(subject))) oooReasons.push('ooo_subject');
-  if (OUT_OF_OFFICE_PATTERNS.some((p) => p.test(stripQuotedText(body)))) oooReasons.push('ooo_body');
+  if (STRONG_OOO_PATTERNS.some((p) => p.test(stripQuotedText(body)))) oooReasons.push('ooo_body');
   if (oooReasons.length) return result('out_of_office', oooReasons);
 
   // 4. Body content.

@@ -99,4 +99,21 @@ describe('classifyInboundReply (ENG-2539)', () => {
   it('stripQuotedText drops Original Message tail', () => {
     expect(stripQuotedText('ok\n-----Original Message-----\nFrom: x')).toBe('ok');
   });
+
+  describe('ambiguous absence phrases (CodeRabbit #3598)', () => {
+    it.each([
+      'I was on vacation last week, but yes let us talk Tuesday.',
+      'I will be out of office Friday; Monday works.',
+      '我不在意价格，我们谈谈吧',
+      '不在乎，周二可以',
+    ])('human body %s stays human_reply', (bodyText) => {
+      expect(classifyInboundReply({ ...human, bodyText }).kind).toBe('human_reply');
+    });
+    it('ambiguous phrase in subject is still OOO', () => {
+      expect(classifyInboundReply({ ...human, subject: 'Out of Office: back Monday', bodyText: 'Back Monday.' }).kind).toBe('out_of_office');
+    });
+    it.each(['I am currently out of the office until Monday.', '这是自动回复', '自動返信: 不在です'])('strong body marker %s => OOO', (bodyText) => {
+      expect(classifyInboundReply({ ...human, bodyText }).kind).toBe('out_of_office');
+    });
+  });
 });
