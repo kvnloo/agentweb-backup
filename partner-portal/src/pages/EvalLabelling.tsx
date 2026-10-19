@@ -426,17 +426,24 @@ function isTypingTarget(target: EventTarget | null): boolean {
   return !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable);
 }
 
+interface QuickLabelProps {
+  goldenCase: GoldenCaseView;
+  criterion: string;
+  token: string | null;
+  /** True while a save of this case is in flight, even one started before this form mounted. */
+  saving: boolean;
+  /** Claims the case for a save; false if one is already in flight (it would reuse a stale version). */
+  beginSave: (caseId: string) => boolean;
+  endSave: (caseId: string) => void;
+  onSaved: (saved: GoldenCaseView, criterion: string) => void;
+}
+
 /** Quick mode: one criterion, saved on a click or a 1 / 2 / 3 keypress; other labels are kept as they are. */
-function QuickLabel({ goldenCase, criterion, token, onSaved }: { goldenCase: GoldenCaseView; criterion: string; token: string | null; onSaved: (saved: GoldenCaseView, criterion: string) => void }) {
-  const [saving, setSaving] = useState(false);
+function QuickLabel({ goldenCase, criterion, token, saving, beginSave, endSave, onSaved }: QuickLabelProps) {
   const [error, setError] = useState<string | null>(null);
-  // A keypress during a save must not fire a second PUT with the same (now stale) version.
-  const inFlight = useRef(false);
 
   const save = useCallback(async (value: LabelValue) => {
-    if (inFlight.current) return;
-    inFlight.current = true;
-    setSaving(true);
+    if (!beginSave(goldenCase.caseId)) return;
     setError(null);
     try {
       const res = await axios.put<{ case: GoldenCaseView }>(
@@ -452,10 +459,9 @@ function QuickLabel({ goldenCase, criterion, token, onSaved }: { goldenCase: Gol
         setError(apiMessage(err, 'Failed to save the label.'));
       }
     } finally {
-      inFlight.current = false;
-      setSaving(false);
+      endSave(goldenCase.caseId);
     }
-  }, [goldenCase, criterion, token, onSaved]);
+  }, [goldenCase, criterion, token, beginSave, endSave, onSaved]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -509,6 +515,20 @@ export default function EvalLabelling() {
   const [taskTypeFilter, setTaskTypeFilter] = useState<string>('all');
   // Quick mode: the one criterion being labelled, or null for the full form.
   const [quickCriterion, setQuickCriterion] = useState<string | null>(null);
+  // Cases with a quick save in flight. Kept here, not in the form, so leaving a case and coming
+  // back before its save returns cannot start a second save with the same version.
+  const pendingSaves = useRef(new Set<string>());
+  const [pendingIds, setPendingIds] = useState<ReadonlySet<string>>(new Set());
+  const beginSave = useCallback((caseId: string) => {
+    if (pendingSaves.current.has(caseId)) return false;
+    pendingSaves.current.add(caseId);
+    setPendingIds(new Set(pendingSaves.current));
+    return true;
+  }, []);
+  const endSave = useCallback((caseId: string) => {
+    pendingSaves.current.delete(caseId);
+    setPendingIds(new Set(pendingSaves.current));
+  }, []);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -553,12 +573,13 @@ export default function EvalLabelling() {
     setQuickCriterion(null);
   }, [surface]);
 
-  const matchesFilters = (c: GoldenCaseView) =>
-    (splitFilter === 'all' || c.split === splitFilter) && (taskTypeFilter === 'all' || c.taskType === taskTypeFilter);
+  const filtersMatch = (split: string, taskType: string) => (c: GoldenCaseView) =>
+    (split === 'all' || c.split === split) && (taskType === 'all' || c.taskType === taskType);
+  const matchesFilters = filtersMatch(splitFilter, taskTypeFilter);
 
   /** The next case in list order, after `fromId` and wrapping round, that still lacks `criterion`. */
-  const nextUnlabelled = (list: GoldenCaseView[], criterion: string, fromId: string | null): string | null => {
-    const candidates = list.filter(matchesFilters);
+  const nextUnlabelled = (list: GoldenCaseView[], criterion: string, fromId: string | null, matches = matchesFilters): string | null => {
+    const candidates = list.filter(matches);
     const start = fromId ? candidates.findIndex((c) => c.caseId === fromId) + 1 : 0;
     const ordered = [...candidates.slice(start), ...candidates.slice(0, start)];
     return ordered.find((c) => c.caseId !== fromId && c.labels[criterion] === undefined)?.caseId ?? null;
@@ -571,8 +592,8 @@ export default function EvalLabelling() {
 
   // A quick save can finish after the admin has moved on (another case, mode or surface); the
   // response is then merged into the list as it is now, never the list from when the save began.
-  const latest = useRef({ cases, surface, selectedId, quickCriterion });
-  latest.current = { cases, surface, selectedId, quickCriterion };
+  const latest = useRef({ cases, surface, selectedId, quickCriterion, splitFilter, taskTypeFilter });
+  latest.current = { cases, surface, selectedId, quickCriterion, splitFilter, taskTypeFilter };
 
   const onQuickSaved = (saved: GoldenCaseView, criterion: string) => {
     const now = latest.current;
@@ -583,7 +604,8 @@ export default function EvalLabelling() {
     setCases((prev) => prev.map((c) => (c.caseId === saved.caseId ? saved : c)));
     // Advance only if the admin is still on the case that was saved, in the same quick mode.
     if (now.selectedId === saved.caseId && now.quickCriterion === criterion) {
-      setSelectedId(nextUnlabelled(updated, criterion, saved.caseId) ?? saved.caseId);
+      // Use the filters as they are now: the admin may have changed them while the save was out.
+      setSelectedId(nextUnlabelled(updated, criterion, saved.caseId, filtersMatch(now.splitFilter, now.taskTypeFilter)) ?? saved.caseId);
     }
   };
 
@@ -766,7 +788,16 @@ export default function EvalLabelling() {
                       </Alert>
                     )}
                     {quickCriterion ? (
-                      <QuickLabel key={selected.caseId} goldenCase={selected} criterion={quickCriterion} token={token} onSaved={onQuickSaved} />
+                      <QuickLabel
+                        key={selected.caseId}
+                        goldenCase={selected}
+                        criterion={quickCriterion}
+                        token={token}
+                        saving={pendingIds.has(selected.caseId)}
+                        beginSave={beginSave}
+                        endSave={endSave}
+                        onSaved={onQuickSaved}
+                      />
                     ) : (
                       // Keyed by case so the form starts fresh per case but keeps its "saved" state across its own save.
                       <LabelForm
