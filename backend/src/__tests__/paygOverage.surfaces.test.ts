@@ -116,6 +116,28 @@ describe('usage runway when PAYG admits with nothing billable yet', () => {
   });
 });
 
+describe('usage runway right after opting in with overage standing', () => {
+  it('is paygCovering (no exhaustion claimed) even though the billable overage is 0', async () => {
+    mockRows.mockResolvedValue(overPool.dailyCostMicroUsd.map((r) => ({ ...r, userId: 'owner-1' })));
+    mockPolicy.mockResolvedValue({
+      billingUserId: 'owner-1',
+      policy: {
+        version: 'v', enforcementState: 'hard_only', optimizationCostThresholdMicroUsd: 50 * USD,
+        hardCostThresholdMicroUsd: 100 * USD, optimizedModelIds: ['m'], optimizedDefaultModel: 'm',
+      },
+      costUsedMicroUsd: 120 * USD,
+      creditsApplied: false,
+      mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'payg_overage' },
+      // $20 standing at opt-in is the baseline: nothing billable yet.
+      overage: { overageMicroUsd: 0, capMicroUsd: 50 * USD, poolMicroUsd: 100 * USD, percentOfCap: 0 },
+    });
+    const { runway } = await resolveUsageRunway('owner-1', { today: '2026-10-19' });
+    expect(runway!.paygCovering).toBe(true);
+    expect(runway!.onTrack).toBeNull();
+    expect(runway!.estimatedDaysRemaining).toBeNull();
+  });
+});
+
 describe('sanitizeUserForResponse strips PAYG money fields (/api/auth/me)', () => {
   it('passes only the on/off state and the percentage cap', () => {
     const out = sanitizeUserForResponse({

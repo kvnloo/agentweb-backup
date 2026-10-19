@@ -47,7 +47,11 @@ import { userDb, orgDb } from '../../services/db';
 import { getSubscriptionTypeConfig, getUserSubscriptionType } from '../../services/subscriptionService';
 import { stripeService } from '../../services/stripeService';
 import { resolveEnforcementCostBasisMicroUsd } from '../../services/spendEnforcementBasis';
-import { paygOverageSwitch } from '../../services/paygOverageService';
+import {
+  LIVE_PAYMENT_METHOD_CHECK_WINDOW_MS,
+  paygOverageSwitch,
+  resetLivePaymentMethodChecksForTests,
+} from '../../services/paygOverageService';
 import { getCurrentUsageMonth } from '../../services/llmUsageCreditService';
 
 const USD = 1_000_000;
@@ -108,6 +112,7 @@ beforeEach(() => {
   mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 0 });
   mockHasPaymentMethod.mockResolvedValue(true);
   switchSpy = jest.spyOn(paygOverageSwitch, 'isEnabled').mockResolvedValue(true);
+  resetLivePaymentMethodChecksForTests();
   app = express();
   app.use(express.json());
   app.use('/api/subscription', subscriptionRoutes);
@@ -194,6 +199,28 @@ describe('GET /api/subscription/payg', () => {
       expect(mockUpdateUser).not.toHaveBeenCalledWith(OWNER, { has_payment_method: true });
     });
 
+    it('does not ask Stripe when the cached flag is already true', async () => {
+      users[OWNER].has_payment_method = true;
+      expect((await get(OWNER).expect(200)).body.hasPaymentMethod).toBe(true);
+      expect(mockHasPaymentMethod).not.toHaveBeenCalled();
+    });
+
+    it('asks Stripe at most once per owner per window, however often settings are opened', async () => {
+      mockHasPaymentMethod.mockResolvedValue(false);
+      const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
+      try {
+        await get(OWNER).expect(200);
+        nowSpy.mockReturnValue(1_000_000 + LIVE_PAYMENT_METHOD_CHECK_WINDOW_MS - 1);
+        await get(OWNER).expect(200);
+        expect(mockHasPaymentMethod).toHaveBeenCalledTimes(1);
+        nowSpy.mockReturnValue(1_000_000 + LIVE_PAYMENT_METHOD_CHECK_WINDOW_MS);
+        await get(OWNER).expect(200);
+        expect(mockHasPaymentMethod).toHaveBeenCalledTimes(2);
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
     it('does not ask Stripe for a member, or when PAYG is off', async () => {
       await get(MEMBER).expect(200);
       expect(mockHasPaymentMethod).not.toHaveBeenCalled();
@@ -263,6 +290,28 @@ describe('PUT /api/subscription/payg', () => {
     const [, fields, options] = mockUpdateUser.mock.calls[0];
     expect(fields).toEqual({ has_payment_method: true });
     expect(options.condition.expression).toContain('#payg.#version = :expectedVersion');
+  });
+
+  it('an opt-in never lowers a high-water mark the gate raised meanwhile (conflict, not a lower mark)', async () => {
+    // Read: the month's pool was $100. Between that read and the write, a check raised the stored mark
+    // to $300 (a top-up). The opt-in's write must not put $100 back: its guard fails and it is a 409.
+    users[OWNER].paygOverage = {
+      enabled: false, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 2,
+      poolHighWater: { month: '2000-01', thresholdMicroUsd: 50 * USD },
+    };
+    const storedThreshold = 300 * USD;
+    mockUpdateUser.mockImplementationOnce(async (_id: string, _fields: any, options: any) => {
+      const guarded = /#payg\.#hw\.#hwThreshold <= :hwThreshold/.test(options.condition.expression);
+      if (guarded && options.condition.values[':hwThreshold'] < storedThreshold) {
+        throw Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' });
+      }
+      return users[OWNER];
+    });
+
+    const res = await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(409);
+    expect(res.body.error).toBe('payg_conflict');
+    const [, , options] = mockUpdateUser.mock.calls[0];
+    expect(options.condition.values).toMatchObject({ ':hwMonth': getCurrentUsageMonth(), ':hwThreshold': 100 * USD });
   });
 
   it('opting in while already past the pool records the standing overage, so it reads 0% right after', async () => {

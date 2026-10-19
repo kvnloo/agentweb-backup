@@ -352,7 +352,8 @@ describe('ENG-668 PAYG — review regressions', () => {
     });
     const { status, decision } = await bothGates();
     expect(status.allowed).toBe(true);
-    expect(status.overage).toEqual({ active: false, percentOfCap: 0 });
+    // Past the pool and admitted on PAYG: PAYG is covering, even though nothing is billable yet.
+    expect(status.overage).toEqual({ active: true, percentOfCap: 0 });
     expect(decision.modelSelection).toBe('honored');
   });
 
@@ -402,5 +403,22 @@ describe('ENG-668 PAYG — opt-in baseline after the pool grows (counted once, n
     const status = await checkTokenUsage(OWNER);
     expect(status.allowed).toBe(true);
     expect(status.overage).toEqual({ active: true, percentOfCap: 20 });
+  });
+});
+
+describe('ENG-668 PAYG — opting in with overage already standing', () => {
+  it('$120 on a $100 pool, $20 baseline: admitted, PAYG covering (active), 0% of the cap', async () => {
+    setup({
+      spendUsd: 120,
+      user: {
+        paygOverage: payg({
+          optIn: { month: getCurrentUsageMonth(), overageBaselineMicroUsd: 20 * USD, poolAtOptInMicroUsd: 100 * USD },
+        }),
+      },
+    });
+    const { status, decision } = await bothGates();
+    expect(status.allowed).toBe(true);
+    expect(status.overage).toEqual({ active: true, percentOfCap: 0 });
+    expect(decision.effectiveModel).toBe(CHOSEN_MODEL);
   });
 });
