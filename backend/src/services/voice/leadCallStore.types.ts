@@ -5,7 +5,7 @@
  */
 
 export type HotLeadCallState =
-  | 'dialing' // claimed, owner call being created; no CallSid known yet
+  | 'dialing' // record created; the owner call is being placed (or placement was ambiguous)
   | 'owner_ringing'
   | 'owner_answered' // owner picked up, prompt playing
   | 'bridging' // owner pressed 1, dialing the lead
