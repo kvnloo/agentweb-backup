@@ -16,6 +16,11 @@ import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 
+jest.mock('../services/tokenUsageService', () => ({
+  ...jest.requireActual('../services/tokenUsageService'),
+  checkTokenUsage: jest.fn().mockResolvedValue({ allowed: true, warning: false, month: '2026-07' }),
+}));
+
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     getChatSession: jest.fn(),
@@ -62,6 +67,8 @@ jest.mock('../utils/agentModeAlerts', () => ({
 }));
 
 jest.mock('../utils/agentModeErrors', () => ({
+  // Spread the real module so new exports (e.g. isProviderUnavailableError) never leave the controller error handler calling undefined.
+  ...jest.requireActual('../utils/agentModeErrors'),
   isContextLimitError: jest.fn().mockReturnValue(false),
   isSessionLimitError: jest.fn().mockReturnValue(false),
   isTransientLLMError: jest.fn().mockReturnValue(false),

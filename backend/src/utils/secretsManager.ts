@@ -22,7 +22,8 @@ export async function getSecret(secretName: string): Promise<string> {
 
     throw new Error('Secret string is empty');
   } catch (error) {
-    console.error(`Error fetching secret ${secretName}:`, error);
+    // The name and the error code only: the whole error object has no business in logs.
+    console.error(`Error fetching secret ${secretName}: ${(error as { code?: string })?.code || (error as Error)?.name || 'error'}`);
     throw new Error(`Failed to fetch secret: ${secretName}`);
   }
 }
@@ -1223,7 +1224,12 @@ async function fetchWhatsAppCredentialsFromSecretsManager(): Promise<WhatsAppCre
   const credentials = JSON.parse(secretString) as WhatsAppCredentials;
 
   const missing = (['phoneNumberId', 'wabaId', 'accessToken', 'appSecret', 'webhookVerifyToken'] as const)
-    .filter((k) => !credentials[k]);
+    // A whitespace-only value is as unusable as an absent one (the env path already treats
+    // it that way), and for phoneNumberId it would quietly make the webhook skip every event.
+    .filter((k) => {
+      const value = credentials[k];
+      return typeof value === 'string' ? value.trim() === '' : !value;
+    });
   if (missing.length > 0) {
     throw new Error(`WhatsApp credentials missing: ${missing.join(', ')}`);
   }

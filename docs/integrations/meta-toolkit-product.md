@@ -104,6 +104,18 @@ and the ENG-2280 shaper do NOT cover them. See D3.
 
 ## 4. DECIDED v1 external surface
 
+> **Superseded in part (ENG-2303, Harsha 2026-10-12):** guarded writes are in scope.
+> `call_meta_marketing_api` now also accepts CAMPAIGN / AD_SET / AD **CREATE** and
+> **UPDATE of status (ACTIVE|PAUSED) or budget**, via `mcp/metaToolkitWrites.ts`:
+> preview first (nothing sent), then `confirm=true` + a single-use HMAC `preview_token`
+> bound to the user, the exact arguments and what the preview showed (15 min TTL). New
+> entities are always created PAUSED; activation is its own preview + confirm. Writes
+> require a payment method + usable Meta connection (`zoma_status`), a **granted**
+> `ads_management` scope (D4), the optional `META_TOOLKIT_SPEND_CEILING` policy, the
+> currency echo, and dispatch through `dispatchAuthorizedMetaWrite` (budget-anomaly
+> re-check, tracking pre-flight, rate shaper); the read-back decides CONFIRMED / MISMATCH /
+> UNCONFIRMED. Everything else listed as excluded below stays excluded.
+
 Harsha approved D1–D5 on 2026-10-06. External v1 is **reads-only**.
 The manifest narrows the advertised action enum and `assertMetaToolkitV1Call`
 refuses every write with `MetaToolkitRefusal` before shared handler dispatch.
@@ -124,11 +136,27 @@ Excluded from v1:
 
 - **D1 — DECIDED:** Reads on all paid tiers; writes Pro+ in a future write-capable
   version. Pricing TBD. Documented only; no new billing/tier enforcement here.
-- **D2 — DECIDED:** Reads-only external v1. No external approval-token/deck write
-  flow in v1; CREATE/UPDATE are neither advertised nor allowed.
+- **D2 — SUPERSEDED (ENG-2303, 2026-10-12):** was reads-only external v1. Now guarded
+  CREATE + status/budget UPDATE for CAMPAIGN/AD_SET/AD behind a bound preview→confirm
+  (section 4 note). DELETE and the other exclusions stand.
 - **D3 — DECIDED:** `launch_*` tools stay internal, not in the external manifest.
 - **D4 — DECIDED:** Fail closed locally on writes when `granted_scopes` lacks
-  `ads_management`. Toolkit v1 enforces this through D2: all writes are refused
-  locally regardless of scopes, so no additional token/scope lookup is needed.
-  Any future external write surface must check granted (not requested) scopes.
+  `ads_management`. Enforced by ENG-2303's write path from `granted_scopes` on the
+  connected account; a missing record (`unknown`) also fails closed and asks for a
+  reconnect.
 - **D5 — DECIDED:** CUSTOM_AUDIENCE CREATE / UPLOAD_USERS remain excluded.
+
+## 6. Agent-driven onboarding — device flow (ENG-2496)
+
+An agent can set a user up end to end without the user editing any config ("get set up with
+Zoma"). The flow follows RFC 8628:
+
+| Step | Endpoint | Notes |
+|---|---|---|
+| Start | `POST /api/zoma/setup` (unauthenticated, 10/min/IP) | `device_code`, `user_code` (`XXXX-XXXX`), `verification_uri(_complete)`, `interval` 5s, `expires_in` 900s |
+| Approve | `GET /api/zoma/activate?user_code=` | Redirects into the existing MCP OAuth sign-in + consent page as first-party client `zoma-device-setup` (PKCE held server-side); the callback binds the device code to the signed-in user. Sign-up works through the same portal page. |
+| Poll | `POST /api/zoma/setup/poll {device_code}` | `authorization_pending` (+`next_step: sign_in`) / `slow_down` / `expired_token` / `access_denied` / `invalid_grant`; once bound, `next_step` `connect_meta` → `add_payment` → `complete`, derived from `getZomaReadiness` (links minted once per step and cached on the device record). Once bound, the device code stays valid for 60 min of onboarding. |
+| Token | returned once on `complete` | `zoma_…` bearer; only `sha256` is stored. Accepted by `/api/meta-toolkit/mcp` and the REST toolkit via `authenticateMetaToolkitCaller` (`authMethod: zoma_token`, 60/min per token). |
+| Revoke | `POST /api/zoma/token/revoke` with the token as Bearer | Idempotent; unknown tokens also return 200 (RFC 7009). |
+
+Storage is isolated in `backend/src/mcp/zomaDeviceStore.ts` (table `AW-ZomaDeviceAuth`).

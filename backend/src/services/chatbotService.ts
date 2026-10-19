@@ -26,7 +26,7 @@ import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService, agentModeService as agentModeServiceSingleton } from './agentModeService';
 import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../utils/citations';
-import { shrinkMessageForPersistence } from '../utils/messageSizeGuard';
+import { MAX_PERSISTED_MESSAGE_BYTES, shrinkMessageForPersistence } from '../utils/messageSizeGuard';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
 import { withKeyedMutex } from '../utils/keyedMutex';
@@ -37,6 +37,8 @@ import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
 import { PendingApprovalDeck } from './agentMode/core/approvalDeck';
 import { WorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import { WorkflowRunState } from './agentMode/core/workflow';
+import { assertSequentialStepCounts } from './workPlanSteps';
+import { carryConcealedActiveRun, concealActiveRun, type ActiveRun } from './agentMode/sessionActiveRunGuard';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -45,13 +47,16 @@ const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
 // Max serialized message size for DynamoDB persistence (400KB item limit).
 // Safety net in addMessagesToMessagesTable; primary truncation happens in agentModeService.
-const MAX_MESSAGE_CONTENT_SIZE = 350_000;
+export const MAX_MESSAGE_CONTENT_SIZE = MAX_PERSISTED_MESSAGE_BYTES;
 
 // Tool calls that require repair for empty results (MCP PR #433 bug)
 const REPAIRABLE_TOOL_CALLS = [
   'generate_image',
   'generate_video'
 ];
+
+/** AW-ChatSessions table name (the ENG-110 active-run guard writes to it without going through ChatbotDB). */
+export const CHAT_SESSIONS_TABLE_NAME = `${TABLE_PREFIX}AW-ChatSessions`;
 
 // Make sure we have a DynamoDB instance
 export const dynamodb = new AWS.DynamoDB.DocumentClient({
@@ -131,7 +136,26 @@ export interface ChatMessage {
     kind?: string;                      // Stable marker for system messages (e.g. 'image-generated')
     imageFilename?: string;             // Filename when kind === 'image-generated'
     imageUrl?: string;                  // ENG-510: image URL on the immediate marker so a completed image survives a whole-turn-cap kill
+    crmEvidence?: { tools: string[]; numbers: number[]; truncated?: true }; // ENG-2263: numbers (never text) this turn's CRM tools returned, so a continuation can check its totals
     citations?: Citation[];             // ENG-351: de-duplicated web sources this message consulted (ChatGPT-style Sources UI)
+    // ENG-112: provenance of a branched chat. Stamped ONLY on row 0 (the stored system prompt, which
+    // is never sent to the model) of a session created by "Branch from here". Free-form metadata, not a
+    // session field: see services/agentMode/chatBranching.ts.
+    branchOrigin?: {
+      sourceSessionId: string;
+      sourceTitle?: string;
+      sourceMessageIndex: number;       // RAW row index in the source session
+      branchedAt: string;
+    };
+    // ENG-113: saved "Compare models" alternatives (the unchosen answers), stamped on the chosen assistant row by
+    // /compare/select when AW-Settings `compare_save_alternatives` is 'true'. Free-form metadata, owner-approved
+    // additive key (no schema/index/table change). Owner views only: stripped from every non-owner serializer and
+    // never part of any LLM context. See services/agentMode/compareSaveAlternatives.ts.
+    compareId?: string;
+    compareAlternatives?: Array<{ model: string; name: string; provider: string; content: string; latencyMs: number }>;
+    compareAlternativesOmitted?: 'size';
+    /** ENG-113: set on the copied row of a branch created with "Branch with this answer". */
+    branchedFromAlternative?: { model: string };
     mediaBudgetDeferred?: boolean;      // ENG-1239: set on the tool-role deferral marker AND on the whole-turn-timeout partial-delivery message that reports it, so an unresolved media-batch pause is detectable from the tail of session history alone
   };
 }
@@ -145,6 +169,24 @@ export interface OpenResearchRequest {
   topic: string;
   failedAt: string; // ISO timestamp
   errorSummary: string;
+}
+
+export interface BranchedFrom {
+  sessionId: string;
+  rootSessionId: string;
+  messageIndex: number;
+  branchedAt: string;
+}
+
+/** The slim projection of a session returned by getBranchFamilySessions. */
+export interface BranchFamilyMember {
+  sessionId: string;
+  title?: string;
+  llmModel?: string;
+  messageCount: number;
+  updatedAt: string;
+  createdAt: string;
+  branchedFrom?: BranchedFrom;
 }
 
 // Interface for chat sessions
@@ -161,6 +203,21 @@ export interface ChatSession {
   portalType?: "customer" | "partner" | "genius" | "agent" | "emma-sidebar"; // Added portalType to session
   pageIdentifier?: string; // Added pageIdentifier for page-specific sessions
   archived?: boolean; // Archive status for soft deletion
+  /**
+   * ENG-112 (owner-approved additive optional attribute): set ONLY on a chat created by "Branch from here".
+   * `sessionId` = the immediate source, `rootSessionId` = the first chat of the family (a branch of a branch
+   * keeps the original root), `messageIndex` = the raw fork index sent to the branch endpoint. Owner-only:
+   * never serialised on share / conversable / MCP views. No GSI, no backfill; rollback = stop writing/reading.
+   */
+  branchedFrom?: BranchedFrom;
+  /**
+   * ENG-110 (owner-approved additive optional attribute): the interactive /generate run currently live on this
+   * session, with a heartbeat, so another backend instance (Immutable deploy overlap) can see it. Written only by
+   * the active-run guard (sessionActiveRunGuard.ts) behind the `session_active_run_guard_enabled` switch. No GSI,
+   * no backfill; rollback = switch off, leftovers go stale harmlessly. NEVER serialised: every ChatbotDB read
+   * hides it (non-enumerable) and the owner/MCP views omit it.
+   */
+  activeRun?: ActiveRun;
   selectedStartupId?: string; // Selected startup profile for context
   workflowId?: string; // Added workflowId for agent mode sessions
   executionId?: string; // Added executionId for agent mode sessions
@@ -207,10 +264,21 @@ export interface ChatSession {
       // = the gate falls back to the max succeeded count across every known
       // asset-producing tool.
       expectedAssetCountTools?: string[];
+      /** ENG-2378: this step's explicit model (canonical registry id), copied from the template at launch. */
+      model?: string;
       inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
     }>;
     createdAt: string;
     updatedAt: string;
+    // ENG-2378 (only written for plans whose steps carry a model): the plan's default pin and the model the session
+    // had before the plan started (what a step WITHOUT a model falls back to), and the model the engine last stamped
+    // (so a user's explicit pick during the plan can be told apart when the plan ends).
+    planDefaultModel?: string;
+    launchModel?: string;
+    engineModel?: string;
+    // The model the USER explicitly picked during the plan (a resumed step adopts it, or a model-less step runs on it):
+    // the end-of-plan restore never replaces it.
+    pickedModel?: string;
     welcomeMessage?: string; // Custom welcome message for this work plan
     autocomplete?: boolean; // When true, Emma MUST complete each step before responding to the user
     // ENG-1472: the predefined WorkPlan template (AW-WorkPlans planId) this
@@ -449,6 +517,8 @@ export interface ChatSession {
     // ENG-2138: written by a shadow judge (sampled, never the primary score), with its model.
     shadow?: boolean;
     model?: string;
+    // ENG-2138: first 12 hex chars of sha256(judge.systemPrompt); shadow scores only.
+    promptVersion?: string;
   }>;
   // Scores retracted because the session turned out to be outside the
   // satisfaction cohort (zero-task — ENG-830). The original score is MOVED here
@@ -732,7 +802,7 @@ export class ChatbotDB {
     emailCampaignTaskId?: string,
     sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email" | "meeting-intake",
     delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean },
-    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages">>
+    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages" | "archived" | "branchedFrom">>
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -1917,7 +1987,7 @@ export class ChatbotDB {
 
     try {
       const result = await dynamodb.get(params).promise();
-      return (result.Item as ChatSession) || null;
+      return concealActiveRun(result.Item as ChatSession) || null;
     } catch (error) {
       console.error("Error getting chat session record:", error);
       throw error;
@@ -1945,10 +2015,11 @@ export class ChatbotDB {
       // Remove messages from session object and replace with messages from messages table
       // This ensures we always return the correct format from the messages table
       const { messages: _, ...sessionWithoutMessages } = session;
-      const normalizedSession = {
+      // activeRun is hidden (non-enumerable) on the record, so the spread drops it: carry it over, still hidden.
+      const normalizedSession = carryConcealedActiveRun(session, {
         ...sessionWithoutMessages,
         messages,
-      };
+      });
 
       // Normalize associatedSkills to string[] (handles DynamoDB Set wrapper)
       // Legacy sessions (pre-skills) have no associatedSkills field — preserve undefined
@@ -2084,7 +2155,7 @@ export class ChatbotDB {
           params.ExclusiveStartKey = paginationKey;
         }
         const result = await dynamodb.query(params).promise();
-        const items = (result.Items as ChatSession[]) || [];
+        const items = ((result.Items as ChatSession[]) || []).map(concealActiveRun);
         collected.push(...items);
         paginationKey = result.LastEvaluatedKey;
       } while (paginationKey && collected.length < targetCount);
@@ -2189,7 +2260,7 @@ export class ChatbotDB {
         params.ExclusiveStartKey = lastEvaluatedKey;
       }
       const result = await dynamodb.query(params).promise();
-      const items = (result.Items as ChatSession[]) || [];
+      const items = ((result.Items as ChatSession[]) || []).map(concealActiveRun);
       collected.push(...items);
       lastEvaluatedKey = result.LastEvaluatedKey;
     } while (lastEvaluatedKey && collected.length < limit);
@@ -2208,6 +2279,57 @@ export class ChatbotDB {
     );
 
     return sessionsWithPreview;
+  }
+
+  /**
+   * ENG-112: the NON-ARCHIVED branches of one chat family for one owner.
+   *
+   * Cost: ONE query over the existing UserIdIndex (no scan, no new GSI). DynamoDB bills a GSI query by the
+   * items it reads, not by what survives the projection, so this reads the owner's whole index once, in
+   * 1 MB pages; a typical user has <1000 sessions (a handful of pages). `maxPages` bounds the worst case and
+   * `truncated` is exact: true only if a further matching branch exists beyond `maxBranches`, or `maxPages` stopped the walk with index left. The walk is newest-first, so a capped walk drops the OLDEST sessions.
+   * The root session itself is NOT returned here (the caller already loads it).
+   */
+  async getBranchFamilySessions(
+    userId: string,
+    rootSessionId: string,
+    opts: { maxBranches?: number; maxPages?: number } = {},
+  ): Promise<{ branches: BranchFamilyMember[]; truncated: boolean }> {
+    const maxBranches = opts.maxBranches ?? 49;
+    const maxPages = opts.maxPages ?? 20;
+    const branches: BranchFamilyMember[] = [];
+    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    for (let page = 0; page < maxPages; page++) {
+      const result = await dynamodb.query({
+        TableName: this.tableName,
+        IndexName: "UserIdIndex",
+        KeyConditionExpression: "userId = :userId",
+        ScanIndexForward: false, // newest first (like getUserSessions): a capped walk must keep the branches just made
+        ExpressionAttributeValues: { ":userId": userId },
+        ExpressionAttributeNames: { "#title": "title", "#archived": "archived" },
+        ProjectionExpression: "sessionId, userId, #title, llmModel, messageCount, updatedAt, createdAt, branchedFrom, #archived",
+        ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+      }).promise();
+      for (const item of (result.Items ?? []) as Array<ChatSession>) {
+        if (item.userId !== userId) continue; // defence in depth: never another owner's row
+        if (item.archived) continue; // includes a branch still being copied (born archived)
+        if (item.branchedFrom?.rootSessionId !== rootSessionId || item.sessionId === rootSessionId) continue;
+        branches.push({
+          sessionId: item.sessionId,
+          title: item.title,
+          llmModel: item.llmModel,
+          messageCount: item.messageCount ?? 0,
+          updatedAt: item.updatedAt,
+          createdAt: item.createdAt,
+          branchedFrom: item.branchedFrom,
+        });
+      }
+      // One match beyond the cap proves there is more; otherwise keep walking until the index is exhausted.
+      if (branches.length > maxBranches) return { branches: branches.slice(0, maxBranches), truncated: true };
+      lastKey = result.LastEvaluatedKey;
+      if (!lastKey) return { branches, truncated: false };
+    }
+    return { branches, truncated: true }; // page cap hit with LastEvaluatedKey still pending
   }
 
   /**
@@ -2267,7 +2389,7 @@ export class ChatbotDB {
           params.ExclusiveStartKey = lastEvaluatedKey;
         }
         const result = await dynamodb.query(params).promise();
-        allItems = allItems.concat((result.Items as ChatSession[]) || []);
+        allItems = allItems.concat(((result.Items as ChatSession[]) || []).map(concealActiveRun));
         lastEvaluatedKey = result.LastEvaluatedKey;
       } while (lastEvaluatedKey);
 
@@ -2626,7 +2748,7 @@ export class ChatbotDB {
 
     try {
       const result = await dynamodb.query(params).promise();
-      const sessions = (result.Items as ChatSession[]) || [];
+      const sessions = ((result.Items as ChatSession[]) || []).map(concealActiveRun);
       
       console.log(
         `Found ${sessions.length} archived chat sessions`
@@ -2655,6 +2777,62 @@ export class ChatbotDB {
       await dynamodb.update(params).promise();
     } catch (error) {
       console.error("Error archiving chat session:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-112: inverse of archiveSession. REMOVES the `archived` attribute (an ordinary session never has
+   * one: every reader treats absent as live, `!session.archived` and `attribute_not_exists(archived) OR
+   * archived = :false`), so a revealed branch carries no stored shape an ordinary session lacks.
+   * Conditional on the row existing: an update on a deleted id would otherwise upsert a ghost row;
+   * that case rejects with `code: 'ConditionalCheckFailedException'`. Used only by chat branching.
+   */
+  async unarchiveSession(sessionId: string): Promise<void> {
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression: "SET adminListPartition = :adminListPartition REMOVE archived",
+      ConditionExpression: "attribute_exists(sessionId)",
+      ExpressionAttributeValues: {
+        ":adminListPartition": "all",
+      },
+    };
+
+    try {
+      await dynamodb.update(params).promise();
+    } catch (error) {
+      console.error("Error unarchiving chat session:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-112 (self-heal of legacy branches): set `branchedFrom` on a session that has none, for its owner only.
+   * One conditional write: the row must exist, belong to `ownerUserId` and carry no `branchedFrom` yet, so a
+   * concurrent open is idempotent and an existing value is never overwritten. Touches nothing else (not
+   * `updatedAt`: healing must not reorder the sidebar). Returns false when the condition refused the write.
+   */
+  async setBranchedFromIfAbsent(sessionId: string, ownerUserId: string, branchedFrom: BranchedFrom): Promise<boolean> {
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: "SET branchedFrom = :branchedFrom",
+      ConditionExpression: "attribute_exists(sessionId) AND userId = :ownerUserId AND attribute_not_exists(branchedFrom)",
+      ExpressionAttributeValues: {
+        ":branchedFrom": branchedFrom,
+        ":ownerUserId": ownerUserId,
+      },
+    };
+
+    try {
+      await dynamodb.update(params).promise();
+      return true;
+    } catch (error) {
+      if ((error as { code?: string })?.code === "ConditionalCheckFailedException") return false;
+      console.error("Error setting branchedFrom:", error);
       throw error;
     }
   }
@@ -3713,12 +3891,19 @@ export class ChatbotDB {
         expectedAssetCount?: number;
         /** ENG-1331: see the matching field on the read-side workPlan type above. */
         expectedAssetCountTools?: string[];
+        /** ENG-2378: see the matching field on the read-side workPlan type above. */
+        model?: string;
         inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
       }>;
       createdAt: string;
       updatedAt: string;
       welcomeMessage?: string;
       autocomplete?: boolean;
+      /** ENG-2378: see the matching fields on the read-side workPlan type above. */
+      planDefaultModel?: string;
+      launchModel?: string;
+      engineModel?: string;
+      pickedModel?: string;
       /** ENG-1472: see the matching field on the read-side workPlan type above. */
       templatePlanId?: string;
       /** ENG-1811: see the matching field on the read-side workPlan type above. */
@@ -3728,15 +3913,7 @@ export class ChatbotDB {
     const timestamp = new Date().toISOString();
 
     // Validate stepCount - must be sequential starting from 1 (index+1)
-    for (let i = 0; i < workPlan.steps.length; i++) {
-      const expectedStepCount = i + 1;
-      if (workPlan.steps[i].stepCount !== expectedStepCount) {
-        throw new Error(
-          `Invalid stepCount at index ${i}: expected ${expectedStepCount} but got ${workPlan.steps[i].stepCount}. ` +
-          `Steps must be numbered sequentially starting from 1 (stepCount must equal index+1).`
-        );
-      }
-    }
+    assertSequentialStepCounts(workPlan.steps);
 
     const validatedWorkPlan = {
       ...workPlan,
@@ -3826,6 +4003,55 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session LLM model:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-903: undo a plan-launch model write, but only if the session still holds the model
+   * that launch wrote. A plain conditional UpdateItem on EXISTING attributes (no schema
+   * change). If a user changed the model after the launch's write, the condition fails and
+   * their choice is left alone (resolves false). A session that had NO explicit model gets
+   * `REMOVE llmModel`, returning it to exactly its prior state instead of a stored default.
+   * Resolves true when restored; rethrows any other failure.
+   */
+  async restoreSessionLlmModelIfUnchanged(
+    sessionId: string,
+    expectedModel: string,
+    previous: { llmModel?: string; llmUsagePolicyDecision?: NonNullable<ChatSession['llmUsagePolicyDecision']> },
+  ): Promise<boolean> {
+    const sets: string[] = [];
+    const removes: string[] = [];
+    const values: Record<string, any> = { ":planModel": expectedModel };
+    if (previous.llmModel) {
+      sets.push("llmModel = :prevModel");
+      values[":prevModel"] = previous.llmModel;
+    } else {
+      removes.push("llmModel");
+    }
+    if (previous.llmUsagePolicyDecision) {
+      sets.push("llmUsagePolicyDecision = :prevDecision");
+      values[":prevDecision"] = previous.llmUsagePolicyDecision;
+    } else {
+      removes.push("llmUsagePolicyDecision");
+    }
+    sets.push("adminListPartition = :adminListPartition");
+    values[":adminListPartition"] = "all";
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: `SET ${sets.join(", ")}${removes.length ? ` REMOVE ${removes.join(", ")}` : ""}`,
+      ConditionExpression: "llmModel = :planModel",
+      ExpressionAttributeValues: values,
+    };
+    try {
+      await dynamodb.update(params).promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === "ConditionalCheckFailedException" || error?.name === "ConditionalCheckFailedException") {
+        return false;
+      }
+      console.error("Error restoring session LLM model:", error);
       throw error;
     }
   }
@@ -4317,7 +4543,7 @@ export class ChatbotDB {
       try {
         const result = await dynamodb.scan(params).promise();
         if (result.Items) {
-          allSessions = allSessions.concat(result.Items as ChatSession[]);
+          allSessions = allSessions.concat((result.Items as ChatSession[]).map(concealActiveRun));
         }
         lastEvaluatedKey = result.LastEvaluatedKey;
       } catch (error) {
@@ -4375,7 +4601,7 @@ export class ChatbotDB {
           }
 
           const result = await dynamodb.query(params).promise();
-          accumulated.push(...((result.Items as ChatSession[]) || []));
+          accumulated.push(...((result.Items as ChatSession[]) || []).map(concealActiveRun));
           currentKey = result.LastEvaluatedKey;
         } while (currentKey);
 
@@ -4444,7 +4670,7 @@ export class ChatbotDB {
 
             const lateResult = await dynamodb.query(lateParams).promise();
             pageCount++;
-            for (const session of (lateResult.Items as ChatSession[]) || []) {
+            for (const session of ((lateResult.Items as ChatSession[]) || []).map(concealActiveRun)) {
               if (primarySessionIds.has(session.sessionId)) continue; // already covered by the primary query
               const createdAt = session.createdAt;
               if (createdAt && createdAt >= timeRange.startTime && createdAt <= timeRange.endTime) {
@@ -4517,7 +4743,7 @@ export class ChatbotDB {
         }
 
         const result = await dynamodb.query(params).promise();
-        accumulated.push(...((result.Items as ChatSession[]) || []));
+        accumulated.push(...((result.Items as ChatSession[]) || []).map(concealActiveRun));
         currentKey = result.LastEvaluatedKey;
       } while (currentKey && accumulated.length < limit);
 
@@ -5347,6 +5573,14 @@ export async function generateChatResponse(
             // throw on an undefined id and silently falling back to zero tools below.
             userId ? getAllowedSkills(userId) : getPublicAllowedSkills(),
           ]);
+          // ENG-1978: getAllowedSkills now returns null when the tier could not be resolved,
+          // where it previously returned ["*"] (grant everything). Route that into the catch
+          // below so `skillAllowlistResolved` stays false — the hard gate then reports a
+          // configuration problem rather than claiming the customer's plan excludes the skill.
+          // Emma already failed closed on a *thrown* lookup; this keeps the two identical.
+          if (userAllowedSkillIds === null) {
+            throw new Error('subscription entitlement unresolved');
+          }
           userAllowedSkillIdsForGate = userAllowedSkillIds;
           // Set only after buildSkillContext itself succeeds — if it throws, the
           // catch block below must still see skillAllowlistResolved === false, or

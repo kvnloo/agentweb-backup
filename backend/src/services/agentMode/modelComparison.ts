@@ -19,9 +19,20 @@
  * Everything with side effects (LLM, DB, lock, clock, secret) is injected so the
  * flow is unit-testable; controllers/modelCompareController.ts wires the real ones.
  */
+import {
+  COMPARE_PROVIDER_POLICY_UNAVAILABLE_CODE,
+  CompareProviderPolicy,
+  isProviderPolicyUnavailableError,
+} from './compareProviderPolicy';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import type { ChatMessage } from '../chatbotService';
 import { classifyToolErrorClass } from '../../utils/toolErrorClassifier';
+import {
+  MAX_ALTERNATIVE_LATENCY_MS,
+  MAX_COMPARE_ALTERNATIVES,
+  SavedAlternative,
+  withSavedAlternatives,
+} from './compareSaveAlternatives';
 
 // ---------------------------------------------------------------------------
 // Limits (single source of truth; exported for tests)
@@ -80,7 +91,8 @@ export type CompareErrorCode =
   | 'model_live_unsupported'
   | 'output_limit'
   | 'model_mismatch'
-  | 'empty_response';
+  | 'empty_response'
+  | 'provider_policy_unavailable';
 
 export interface CompareResult {
   model: string;
@@ -98,6 +110,8 @@ export interface CompareResponseBody {
   prompt: string;
   issuedAt: number;
   results: CompareResult[];
+  /** ENG-113: binds the whole set of ok columns, so /compare/select can trust the unchosen answers. Present when >= 2 columns are ok. */
+  alternativesToken?: string;
 }
 
 /** HTTP-shaped outcome so handlers stay thin: `res.status(out.status).json(out.body)`. */
@@ -157,10 +171,15 @@ export interface CompareDeps {
    * Did the model the gateway reports as having answered correspond to the one that was requested?
    * Only the selected model may ever answer a comparison column.
    */
-  servedModelMatches(requestedCanonical: string, served: unknown): boolean;
+  servedModelMatches(requestedCanonical: string, served: unknown): boolean | Promise<boolean>;
   /** Resolves a billing owner id for metering (org members pool onto the owner). */
   resolveBillingUserId(userId: string): Promise<string>;
   callLLM(model: string, messages: Array<{ role: string; content: string }>, options: CompareCallOptions): Promise<unknown>;
+  /**
+   * ENG-55: provider data-collection policy (AW-Settings `model_compare_deny_data_collection`).
+   * Omitted or null => no policy, i.e. the request is exactly what it was before. Must not throw.
+   */
+  getProviderPolicy?(): Promise<CompareProviderPolicy | null>;
   /** Throws when the server secret is unavailable. */
   getSecret(): string;
   now(): number;
@@ -174,6 +193,8 @@ export interface CompareCallOptions {
   timeoutMs: number;
   taskClass: 'interactive_chat';
   usageContext: { userId: string; billingUserId: string; feature: string; sessionId: string };
+  /** ENG-55: present only when the data-collection switch is on; merged into the OpenRouter `provider` object. */
+  providerPolicy?: CompareProviderPolicy;
 }
 
 export interface SelectDeps {
@@ -183,7 +204,7 @@ export interface SelectDeps {
   isEntitled?(user: CompareUser): Promise<boolean>;
   /** `consistentRead` is requested for the re-read under the lock (replay/guard must see our own writes). */
   getSession(sessionId: string, options?: { consistentRead?: boolean }): Promise<CompareSession | null>;
-  tryClaim(sessionId: string): boolean;
+  tryClaim(sessionId: string, ownerUserId?: string): boolean;
   release(sessionId: string): void;
   appendMessages(sessionId: string, messages: ChatMessage[]): Promise<{ messages?: ChatMessage[] }>;
   updateSessionModel(sessionId: string, model: string): Promise<unknown>;
@@ -191,6 +212,10 @@ export interface SelectDeps {
   getSecret(): string;
   now(): number;
   log(message: string, fields?: Record<string, unknown>): void;
+  /** ENG-113: AW-Settings `compare_save_alternatives` (exact 'true'). Omitted => off. Must not throw. */
+  isSaveAlternativesEnabled?(): Promise<boolean>;
+  /** ENG-113: server registry lookup for the saved alternatives' display name/provider (never taken from the client). */
+  getModelInfo?(model: string): CompareModelInfo | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +277,54 @@ export function signSelectToken(secret: string, fields: SelectTokenFields): stri
 export function verifySelectToken(secret: string, fields: SelectTokenFields, supplied: unknown): boolean {
   if (typeof supplied !== 'string') return false;
   const expected = Buffer.from(signSelectToken(secret, fields), 'utf8');
+  const given = Buffer.from(supplied, 'utf8');
+  if (given.length !== expected.length) return false;
+  return timingSafeEqual(given, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Alternatives (SET) token - ENG-113
+// ---------------------------------------------------------------------------
+const ALTERNATIVES_TOKEN_KIND = 'compare-alternatives-set:v1';
+
+export interface AlternativesTokenFields {
+  userId: string;
+  sessionId: string;
+  compareId: string;
+  prompt: string;
+  issuedAt: number;
+  /** EVERY ok column of the comparison (the chosen one included), in any order. */
+  columns: ReadonlyArray<{ model: string; content: string }>;
+}
+
+/**
+ * Same key derivation as the select token, with a `kind` tag inside the payload so a select token can never be
+ * replayed as a set token (or the reverse). Columns are sorted by model so the order the client sends is irrelevant.
+ * The setting state is deliberately NOT part of it: the token is issued whether or not saving is on.
+ */
+export function canonicalAlternativesPayload(fields: AlternativesTokenFields): string {
+  const columns = fields.columns
+    .map((c) => ({ model: c.model, contentSha256: sha256Hex(c.content) }))
+    .sort((a, b) => (a.model < b.model ? -1 : a.model > b.model ? 1 : 0));
+  return JSON.stringify({
+    kind: ALTERNATIVES_TOKEN_KIND,
+    userId: fields.userId,
+    sessionId: fields.sessionId,
+    compareId: fields.compareId,
+    prompt: fields.prompt,
+    issuedAt: fields.issuedAt,
+    columns,
+  });
+}
+
+export function signAlternativesToken(secret: string, fields: AlternativesTokenFields): string {
+  return createHmac('sha256', deriveSelectTokenKey(secret)).update(canonicalAlternativesPayload(fields)).digest('hex');
+}
+
+/** Constant-time; tolerates a caller-supplied value of any type/length. */
+export function verifyAlternativesToken(secret: string, fields: AlternativesTokenFields, supplied: unknown): boolean {
+  if (typeof supplied !== 'string') return false;
+  const expected = Buffer.from(signAlternativesToken(secret, fields), 'utf8');
   const given = Buffer.from(supplied, 'utf8');
   if (given.length !== expected.length) return false;
   return timingSafeEqual(given, expected);
@@ -406,7 +479,8 @@ export function isSameServedModel(
   /**
    * Other registered upstream ids. A base id (`deepseek/deepseek-v4-pro`) must not accept the dated slug of a
    * registered MMDD sibling (`deepseek/deepseek-v4-pro-0813` -> `...-20260813`), which the date-stripping alone
-   * cannot tell apart from the base id's own snapshot.
+   * cannot tell apart from the base id's own snapshot. Callers also pass the live catalog's ids so a sibling
+   * that exists upstream but is not registered yet is refused too.
    */
   knownUpstreamIds: Iterable<string> = [],
 ): boolean {
@@ -425,7 +499,7 @@ export function isSameServedModel(
   if (!sameTokens(want.tokens, got.tokens)) return false;
   if (got.date) {
     for (const known of knownUpstreamIds) {
-      const sibling = typeof known === 'string' ? splitServedModel(known) : null;
+      const sibling = typeof known === 'string' ? splitServedModel(normalizeCatalogId(known)) : null;
       const m = sibling && sibling.vendor === want.vendor ? trailingMmdd(sibling.tokens) : null;
       if (sibling && m && !sibling.date && got.date.slice(4) === m && sameTokens(sibling.tokens.slice(0, -1), want.tokens)) {
         return false;
@@ -433,6 +507,23 @@ export function isSameServedModel(
     }
   }
   return true;
+}
+
+/**
+ * Catalog/registry ids come in forms a served slug never does: `:free` / `:nitro` variants, a trailing `/`,
+ * an `openrouter/` registry prefix, mixed case. All of them name the same sibling model, so reduce to `vendor/name`.
+ */
+export function normalizeCatalogId(id: string): string {
+  let out = id.trim().toLowerCase();
+  const colon = out.indexOf(':');
+  if (colon >= 0) out = out.slice(0, colon);
+  out = out.replace(/\/+$/, '');
+  return out.startsWith('openrouter/') ? out.slice('openrouter/'.length) : out;
+}
+
+/** Does this served slug carry a snapshot date (`-20260423` / `-2026-04-23`)? Only those need sibling disambiguation. */
+export function isDatedServedSlug(served: unknown): boolean {
+  return typeof served === 'string' && splitServedModel(served)?.date != null;
 }
 
 function sameTokens(a: string[], b: string[]): boolean {
@@ -471,13 +562,16 @@ function splitServedModel(id: string): { vendor: string; tokens: string[]; date:
   return { vendor, tokens, date: dated ? `${dated[1]}${dated[2]}${dated[3]}` : null };
 }
 
-function mapCallError(error: unknown): { errorCode: CompareErrorCode; errorClass: string } {
+function mapCallError(error: unknown, policy: CompareProviderPolicy | null | undefined, modelKnown: boolean): { errorCode: CompareErrorCode; errorClass: string } {
   let errorClass = 'unknown';
   try {
     // classifyToolErrorClass tolerates non-Error values, but never let classification itself throw.
     errorClass = classifyToolErrorClass(error);
   } catch {
     /* keep 'unknown' */
+  }
+  if (isProviderPolicyUnavailableError(error, policy, modelKnown)) {
+    return { errorCode: COMPARE_PROVIDER_POLICY_UNAVAILABLE_CODE, errorClass };
   }
   return { errorCode: errorClass === 'timeout' ? 'timeout' : 'upstream_error', errorClass };
 }
@@ -594,6 +688,17 @@ export async function compareModels(
     });
 
     const body: CompareResponseBody = { compareId, prompt, issuedAt, results };
+    const okColumns = results.filter((r) => r.status === 'ok' && typeof r.content === 'string');
+    if (okColumns.length >= 2) {
+      body.alternativesToken = signAlternativesToken(secret, {
+        userId: session.userId,
+        sessionId,
+        compareId,
+        prompt,
+        issuedAt,
+        columns: okColumns.map((r) => ({ model: r.model, content: r.content as string })),
+      });
+    }
     return { status: 200, body };
   } catch (error) {
     // A paused policy blocks every model; surface it exactly like /generate.
@@ -679,6 +784,12 @@ async function runOne(
     return { status: 'rejected', errorCode: candidate.rejection, latencyMs: 0 };
   }
   const started = deps.now();
+  let policy: CompareProviderPolicy | null = null;
+  try {
+    policy = (await deps.getProviderPolicy?.()) ?? null;
+  } catch {
+    policy = null; // never let the privacy switch read break a column
+  }
   try {
     const options: CompareCallOptions = {
       max_completion_tokens: COMPARE_MAX_OUTPUT_TOKENS,
@@ -690,6 +801,7 @@ async function runOne(
         feature: COMPARE_FEATURE,
         sessionId: ctx.sessionId,
       },
+      ...(policy ? { providerPolicy: policy } : {}),
     };
     const response = await deps.callLLM(candidate.canonical, messages, options);
     const latencyMs = Math.max(0, deps.now() - started);
@@ -697,7 +809,7 @@ async function runOne(
     // gateway should serve exactly it; verify what it reports and discard anything else rather than
     // label another model's answer with the selected model's name (or sign it for "Continue").
     const served = (response as { model?: unknown } | null | undefined)?.model;
-    if (typeof served === 'string' && served.trim() !== '' && !deps.servedModelMatches(candidate.canonical, served)) {
+    if (typeof served === 'string' && served.trim() !== '' && !(await deps.servedModelMatches(candidate.canonical, served))) {
       deps.log('ModelCompare: a different model answered than the one selected', { requested: candidate.canonical, served });
       return { status: 'error', errorCode: 'model_mismatch', latencyMs };
     }
@@ -713,7 +825,7 @@ async function runOne(
     return { status: 'ok', content: text, latencyMs };
   } catch (error) {
     const latencyMs = Math.max(0, deps.now() - started);
-    const { errorCode, errorClass } = mapCallError(error);
+    const { errorCode, errorClass } = mapCallError(error, policy, !!candidate.info);
     // Class only: provider error text can echo the prompt or carry provider internals.
     deps.log('ModelCompare: model call failed', { model: candidate.canonical, errorClass });
     return { status: 'error', errorCode, latencyMs };
@@ -811,7 +923,7 @@ async function selectCompareResultInner(
     return fail(410, 'This comparison has expired. Run it again.', 'compare_expired');
   }
 
-  if (!deps.tryClaim(req.sessionId)) {
+  if (!deps.tryClaim(req.sessionId, session.userId)) {
     return fail(409, 'A response is already being generated for this session. Please wait.', 'SESSION_BUSY', {
       message: 'A response is already being generated for this session. Please wait.',
     });
@@ -855,13 +967,17 @@ async function selectCompareResultInner(
       timestamp: stamp,
       metadata: { timestamp: stamp, portalType: fresh.portalType ?? 'agent', attachments: [] },
     };
-    const assistantMessage: ChatMessage = {
+    let assistantMessage: ChatMessage = {
       role: 'assistant',
       content: req.content,
       timestamp: stamp,
       llm: req.model,
       metadata: { timestamp: stamp, portalType: fresh.portalType ?? 'agent' },
     };
+    // ENG-113: reached only for a NEW pair (an exact replay returned above and never rewrites anything). Any
+    // problem with the alternatives leaves the chosen answer exactly as it was.
+    const alternatives = await verifiedAlternatives(deps, secret, session.userId, req, input.body);
+    if (alternatives) assistantMessage = withSavedAlternatives(assistantMessage, req.compareId, alternatives);
 
     const saved = await deps.appendMessages(req.sessionId, [userMessage, assistantMessage]);
     const tail = (saved?.messages ?? []).slice(-2);
@@ -879,6 +995,64 @@ async function selectCompareResultInner(
     return fail(500, 'Failed to continue from this answer', 'select_failed');
   } finally {
     deps.release(req.sessionId);
+  }
+}
+
+/**
+ * ENG-113: the unchosen answers, accepted ONLY when every one of these holds; otherwise null (and the select
+ * still succeeds for the chosen answer):
+ *  - the AW-Settings switch is on (the setting state is not part of the token);
+ *  - the body has 1-3 well-formed `{model, content, latencyMs?}` entries with distinct models, none equal to the
+ *    chosen model, each content a non-empty string <= MAX_SELECT_CONTENT_CHARS;
+ *  - `alternativesToken` verifies (constant-time) over {user, session, compareId, prompt, issuedAt} and the SET of
+ *    {model, sha256(content)} made of these alternatives PLUS the chosen answer - so the set is exactly the ok columns
+ *    the server produced: nothing can be added, edited, dropped or re-attributed;
+ *  - display name/provider come from the server registry, never from the request.
+ */
+async function verifiedAlternatives(
+  deps: SelectDeps,
+  secret: string,
+  ownerId: string,
+  req: ValidatedSelectRequest,
+  rawBody: unknown,
+): Promise<SavedAlternative[] | null> {
+  const body = rawBody as Record<string, unknown>;
+  if (!isPlainObject(body) || body.alternatives === undefined || body.alternatives === null) return null;
+  try {
+    if (!deps.isSaveAlternativesEnabled || !(await deps.isSaveAlternativesEnabled())) return null;
+    const ignore = (reason: string): null => {
+      deps.log('ModelCompare: ignoring saved alternatives', { reason });
+      return null;
+    };
+    const raw = body.alternatives;
+    if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_COMPARE_ALTERNATIVES) return ignore('shape');
+    const seen = new Set<string>([req.model]);
+    const parsed: Array<{ model: string; content: string; latencyMs: number }> = [];
+    for (const entry of raw) {
+      if (!isPlainObject(entry)) return ignore('entry');
+      const { model, content, latencyMs } = entry;
+      if (typeof model !== 'string' || model.length === 0 || model.length > MAX_MODEL_ID_CHARS || seen.has(model)) return ignore('model');
+      if (typeof content !== 'string' || content.trim().length === 0 || content.length > MAX_SELECT_CONTENT_CHARS) return ignore('content');
+      seen.add(model);
+      const ms = typeof latencyMs === 'number' && Number.isFinite(latencyMs) ? Math.round(latencyMs) : 0;
+      parsed.push({ model, content, latencyMs: Math.min(MAX_ALTERNATIVE_LATENCY_MS, Math.max(0, ms)) });
+    }
+    const fields: AlternativesTokenFields = {
+      userId: ownerId,
+      sessionId: req.sessionId,
+      compareId: req.compareId,
+      prompt: req.prompt,
+      issuedAt: req.issuedAt,
+      columns: [{ model: req.model, content: req.content }, ...parsed],
+    };
+    if (!verifyAlternativesToken(secret, fields, body.alternativesToken)) return ignore('token');
+    return parsed.map((a) => {
+      const info = deps.getModelInfo?.(a.model) ?? null;
+      return { model: a.model, name: info?.name ?? a.model, provider: info?.provider ?? 'other', content: a.content, latencyMs: a.latencyMs };
+    });
+  } catch (error) {
+    deps.log('ModelCompare: saved alternatives check failed; ignoring', { errorClass: safeClass(error) });
+    return null;
   }
 }
 

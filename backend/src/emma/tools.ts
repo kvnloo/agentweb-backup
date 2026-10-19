@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import { MODIFY_WORK_PLAN_INPUT_SCHEMA, validateModifyWorkPlanArgs } from './impl/modifyWorkPlanArgs';
 import { agentModeService } from '../services/agentModeService';
 import { getAccessToken as getClickUpAccessToken, createTaskInList as createClickUpTaskInList, getListCustomFields as getClickUpListCustomFields, ClickUpTaskError } from '../services/clickupService';
 import { emmaToolRegistry } from './registry';
@@ -125,6 +126,9 @@ import './leadNotificationTools';
 
 // Register email lookup / find tool (provider-agnostic)
 import './emailLookupTool';
+
+// Register the read-only site-wide broken-link scan (ENG-1098)
+import './siteLinkScanTool';
 
 emmaToolRegistry.register({
   name: 'enqueue_human_eval',
@@ -808,11 +812,15 @@ emmaToolRegistry.register({
       const { skillService } = await import('../services/skillService');
       const { getAllowedSkills } = await import('../services/subscriptionService');
 
-      const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+      const [publishedSkills, rawAllowedSkillIds] = await Promise.all([
         skillService.getSkillsAvailableToUser(userId),
         getAllowedSkills(userId)
       ]);
 
+      // ENG-1978: null = entitlement unresolved. Admit nothing on the tier's behalf — the user's
+      // own skills still install via the ownerId check below, but an unproven tier entitlement
+      // must never be the thing that admits a skill into a session.
+      const userAllowedSkillIds: string[] = rawAllowedSkillIds ?? [];
       const isWildcard = userAllowedSkillIds.includes("*");
       const allowedSkillSet = new Set(userAllowedSkillIds);
 
@@ -901,11 +909,14 @@ emmaToolRegistry.register({
       // best-effort: degrade to non-org behavior
     }
 
-    const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+    const [publishedSkills, rawAllowedSkillIds] = await Promise.all([
       skillService.getSkillsAvailableToUser(userId, userOrgId),
       getAllowedSkills(userId)
     ]);
 
+    // ENG-1978: null = entitlement unresolved. List nothing extra rather than the whole catalog;
+    // the user's own skills still appear via the ownerId check below.
+    const userAllowedSkillIds: string[] = rawAllowedSkillIds ?? [];
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSkillSet = new Set(userAllowedSkillIds);
 
@@ -2026,7 +2037,9 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await brandMarketStrategyImpl.updateBrandGuidelines(args, context?.userId);
+    return await brandMarketStrategyImpl.updateBrandGuidelines(args, context?.userId, {
+      sessionId: context?.sessionId,
+    });
   }
 });
 
@@ -2106,7 +2119,9 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await brandMarketStrategyImpl.updateMarketStrategy(args, context?.userId);
+    return await brandMarketStrategyImpl.updateMarketStrategy(args, context?.userId, {
+      sessionId: context?.sessionId,
+    });
   }
 });
 
@@ -2125,7 +2140,9 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await brandMarketStrategyImpl.regenerateMarketStrategy(context?.userId);
+    return await brandMarketStrategyImpl.regenerateMarketStrategy(context?.userId, {}, {
+      sessionId: context?.sessionId,
+    });
   }
 });
 
@@ -2780,7 +2797,7 @@ emmaToolRegistry.register({
   name: 'create_html_from_template',
   definition: {
     name: 'create_html_from_template',
-    description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3. If the user refers to a template by name and multiple templates share that name, you MUST ask which template_id to use before calling this tool. IMPORTANT: every variable value is inserted into the template as literal text, exactly as you write it — do NOT format values with HTML tags (e.g. <ul>, <li>, <strong>) or Markdown syntax (e.g. **bold**, "- " bullets, # headers). Write plain sentences only; for multiple points within one variable, separate them with periods, not a list.',
+    description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3. Always call list_html_templates first and pass a template_id exactly as returned; never guess or invent a template_id. If this tool returns error_code TEMPLATE_NOT_FOUND, pick from its available_templates instead of retrying the same id. If the user refers to a template by name and multiple templates share that name, you MUST ask which template_id to use before calling this tool. IMPORTANT: every variable value is inserted into the template as literal text, exactly as you write it — do NOT format values with HTML tags (e.g. <ul>, <li>, <strong>) or Markdown syntax (e.g. **bold**, "- " bullets, # headers). Write plain sentences only; for multiple points within one variable, separate them with periods, not a list.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3663,7 +3680,7 @@ emmaToolRegistry.register({
   name: 'search_leads',
   definition: {
     name: 'search_leads',
-    description: 'Find leads matching structured field-level criteria within one or more lead lists. Pass list_id for a single list (legacy) or list_ids for up to 5 lists at once — each returned lead carries its listId/listName so you can attribute results. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields. For cross-CRM strategic questions ("who should I reach out to?"), prefer ask_crm. Each returned lead also carries `enrichmentMetadata`: a per-field provenance map (keyed by field name, including enriched custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) with `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile, enigma), `sourceUrl`/`sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt`. When the user asks about enriched values across leads (e.g. "what is the funding stage for each lead?"), USE THIS to report the source and confidence per value — present a table with the value alongside its provider/source and confidence rather than stating values as bare fact, and explicitly caveat medium/low-confidence or web-sourced values. Each meta entry also carries `grounding`: "grounded" = the value was verified against a real fetched source (safe to state plainly); "web-unverified" = from a web source that could not be confirmed; "ai-knowledge" = the AI asserted it from its own general knowledge with no source found. NEVER state a "web-unverified" or "ai-knowledge" value as established fact — flag it as unverified and say which (e.g. "Series C (unverified — from an unconfirmed web source)" or "Series C (unverified — from AI general knowledge, no source found)"). A field with no entry in enrichmentMetadata was entered manually or imported, not enriched. Enigma card revenue (`card_revenue_12m`, `card_revenue_period_end`, `card_revenue_yoy_growth`; provider "enigma") is card spend on US consumer and small-business cards over the 12 months ending the meta `asOf` date — ALWAYS call it "card revenue" with that date (e.g. "$4.2M card revenue, 12 months to May 2026"), NEVER "revenue" or total revenue; it excludes corporate-card, invoice and cash sales and is a floor for B2B or mixed businesses. `card_revenue_yoy_growth` is a signed change versus the same 12 months a year earlier (0.07 = up 7%, -0.61 = down 61%), not a ratio.',
+    description: 'Find leads matching structured field-level criteria within one or more lead lists. Pass list_id for a single list (legacy) or list_ids for up to 5 lists at once — each returned lead carries its listId/listName so you can attribute results. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields. Filters are optional for list-scoped reads: passing list_id or list_ids with filters: [] (and no search) returns the leads of those lists page by page — follow next_cursor via cursor to read every page. A call with no filters, no search and no list_id/list_ids is rejected. For cross-CRM strategic questions ("who should I reach out to?"), prefer ask_crm. Each returned lead also carries `enrichmentMetadata`: a per-field provenance map (keyed by field name, including enriched custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) with `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile, enigma), `sourceUrl`/`sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt`. When the user asks about enriched values across leads (e.g. "what is the funding stage for each lead?"), USE THIS to report the source and confidence per value — present a table with the value alongside its provider/source and confidence rather than stating values as bare fact, and explicitly caveat medium/low-confidence or web-sourced values. Each meta entry also carries `grounding`: "grounded" = the value was verified against a real fetched source (safe to state plainly); "web-unverified" = from a web source that could not be confirmed; "ai-knowledge" = the AI asserted it from its own general knowledge with no source found. NEVER state a "web-unverified" or "ai-knowledge" value as established fact — flag it as unverified and say which (e.g. "Series C (unverified — from an unconfirmed web source)" or "Series C (unverified — from AI general knowledge, no source found)"). A field with no entry in enrichmentMetadata was entered manually or imported, not enriched. Enigma card revenue (`card_revenue_12m`, `card_revenue_period_end`, `card_revenue_yoy_growth`; provider "enigma") is card spend on US consumer and small-business cards over the 12 months ending the meta `asOf` date — ALWAYS call it "card revenue" with that date (e.g. "$4.2M card revenue, 12 months to May 2026"), NEVER "revenue" or total revenue; it excludes corporate-card, invoice and cash sales and is a floor for B2B or mixed businesses. `card_revenue_yoy_growth` is a signed change versus the same 12 months a year earlier (0.07 = up 7%, -0.61 = down 61%), not a ratio.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3696,7 +3713,7 @@ emmaToolRegistry.register({
             },
             required: ['field', 'operator']
           },
-          description: 'Array of filter criteria (AND logic — all must match)'
+          description: 'Array of filter criteria (AND logic — all must match). May be empty ([]) when list_id or list_ids is provided, to page through those lists unfiltered.'
         },
         search: {
           type: 'string',
@@ -4115,6 +4132,18 @@ emmaToolRegistry.register({
         notes: {
           type: 'string',
           description: 'Optional notes about this status change'
+        },
+        message_draft: {
+          type: 'string',
+          description: 'Optional. The exact LinkedIn message text you drafted for this lead. Saved verbatim on the lead (messageDraft) so it appears in the CRM lead panel and the Pending Review queue for human approval. Pass it whenever you set status to pending_review for a LinkedIn draft.'
+        },
+        email_subject: {
+          type: 'string',
+          description: 'Optional. Subject of the email you drafted for this lead. Must be passed together with email_body. Saved verbatim on the lead (emailDraft).'
+        },
+        email_body: {
+          type: 'string',
+          description: 'Optional. Plain-text body of the email you drafted for this lead. Must be passed together with email_subject. Saved verbatim on the lead (emailDraft).'
         }
       },
       required: ['list_id', 'lead_id', 'status']
@@ -4123,7 +4152,8 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     return await leadsImpl.updateLeadStatus(
       args.list_id, args.lead_id, args.status, context?.userId,
-      args.deal_value, args.deal_currency, args.notes
+      args.deal_value, args.deal_currency, args.notes,
+      { messageDraft: args.message_draft, emailSubject: args.email_subject, emailBody: args.email_body, sessionId: context?.sessionId }
     );
   }
 });
@@ -5033,7 +5063,7 @@ emmaToolRegistry.register({
   name: 'generate_video',
   definition: {
     name: 'generate_video',
-    description: 'Generate videos using AI video generation models. Supports text-to-video generation and video generation with optional start and end frames for interpolation. Can optionally post-process the generated clip with Remotion to add brand overlays (headline, tagline, logo, CTA). IMPORTANT: For multi-clip videos (e.g. 24s = 3 clips), ALWAYS use a single generate_video call with durationSeconds=24 and compose=true — do NOT generate clips separately and stitch later. To stitch already-generated clips, use compose_video instead. REFERENCE IMAGES: When the user provides image(s) to base the video on, ALWAYS pass the actual image(s) as frames — never use a text description in place of the image. Recommended flow: (1) call describe_image on each reference image so you understand what it depicts (this grounds your motion prompt; it does NOT replace the frame); (2) pass the image URL(s) as frames — ONE image → set startFrame to its URL and leave endFrame unset (do NOT invent or duplicate a second frame); TWO images → startFrame = the opening/first image, endFrame = the closing/last image (only set endFrame when the user actually intends an end frame); (3) write a prompt that describes the MOTION/transition you want (informed by the descriptions) rather than restating the static contents the frame already carries. You may skip describe_image (step 1) when the user has already given a clear, detailed prompt and just wants the exact image animated. The default model (seedance-2.0 via Higgsfield) and the Veo fallback BOTH accept a single reference frame or two frames natively, so the actual image(s) are used. Only if a generation explicitly fails because a reference frame could not be loaded/imported should you fall back to describing the image(s) with describe_image and adding that to the prompt as text. ASPECT RATIO: infer the aspect ratio from the user\'s intent (e.g. a reel/short → vertical 9:16); if the user gives no orientation/format cue AND no reference frame to match, ASK them for the orientation before generating. Never ask about resolution — infer it or use the default. LENGTH: infer the duration from the request (4–15s for the default Seedance model); if the user gives no length and you cannot infer one, ASK before generating rather than defaulting silently.',
+    description: 'Generate videos using AI video generation models. Supports text-to-video generation and video generation with optional start and end frames for interpolation. Can optionally post-process the generated clip with Remotion to add brand overlays (headline, tagline, logo, CTA). IMPORTANT: For multi-clip videos (e.g. 24s = 3 clips), ALWAYS use a single generate_video call with durationSeconds=24 and compose=true — do NOT generate clips separately and stitch later. To stitch already-generated clips, use compose_video instead. REFERENCE IMAGES: When the user provides image(s) to base the video on, ALWAYS pass the actual image(s) as frames — never use a text description in place of the image. Recommended flow: (1) call describe_image on each reference image so you understand what it depicts (this grounds your motion prompt; it does NOT replace the frame); (2) pass the image URL(s) as frames — ONE image → set startFrame to its URL and leave endFrame unset (do NOT invent or duplicate a second frame); TWO images → startFrame = the opening/first image, endFrame = the closing/last image (only set endFrame when the user actually intends an end frame); (3) write a prompt that describes the MOTION/transition you want (informed by the descriptions) rather than restating the static contents the frame already carries. You may skip describe_image (step 1) when the user has already given a clear, detailed prompt and just wants the exact image animated. The default model (seedance-2.0 via Higgsfield) and the gemini-omni-1.1-flash fallback BOTH accept a single reference frame or two frames natively, so the actual image(s) are used. Only if a generation explicitly fails because a reference frame could not be loaded/imported should you fall back to describing the image(s) with describe_image and adding that to the prompt as text. ASPECT RATIO: infer the aspect ratio from the user\'s intent (e.g. a reel/short → vertical 9:16); if the user gives no orientation/format cue AND no reference frame to match, ASK them for the orientation before generating. Never ask about resolution — infer it or use the default. LENGTH: infer the duration from the request (4–15s for the default Seedance model); if the user gives no length and you cannot infer one, ASK before generating rather than defaulting silently.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -5047,16 +5077,16 @@ emmaToolRegistry.register({
         },
         videoModel: {
           type: 'string',
-          description: 'Optional: video generation model. Leave unset — the default is seedance-2.0 (ByteDance Seedance 2.0 via Higgsfield; text-to-video, or image-to-video when startFrame/endFrame are given). Veo 3.1 is used automatically as a fallback if Seedance fails. Do not surface model choice to the user.',
-          enum: ['veo-3.1-generate-preview', 'seedance-2.0']
+          description: 'Optional: video generation model. Leave unset — the default is seedance-2.0 (ByteDance Seedance 2.0 via Higgsfield; text-to-video, or image-to-video when startFrame/endFrame are given). gemini-omni-1.1-flash is used automatically as a fallback if Seedance fails. Do not surface model choice to the user.',
+          enum: ['gemini-omni-1.1-flash', 'seedance-2.0']
         },
         durationSeconds: {
           type: 'number',
-          description: 'Requested total video length in seconds. INFER it from the user\'s request (e.g. "a 12-second video" → 12, "make it 15s" → 15); if the user does not specify a length and you cannot infer one, ASK them before generating — do NOT silently default. The default model (Seedance 2.0) produces a SINGLE clip of 4–15s, so for the normal path set this to the requested length within 4–15. (If a generation falls back to Veo, which caps at 8s/clip, durations >8s are produced as multiple 8s clips stitched to the target length via Remotion — needs compose:true; for ≤8s Veo uses a single clip.) Falls back to 8 only if truly unspecified.'
+          description: 'Requested total video length in seconds. INFER it from the user\'s request (e.g. "a 12-second video" → 12, "make it 15s" → 15); if the user does not specify a length and you cannot infer one, ASK them before generating — do NOT silently default. The default model (Seedance 2.0) produces a SINGLE clip of 4–15s, so for the normal path set this to the requested length within 4–15. (If a generation falls back to gemini-omni-1.1-flash, which produces ~10s clips, durations >10s are produced as multiple clips stitched to the target length via Remotion; for ≤10s it uses a single clip.) Falls back to 8 only if truly unspecified.'
         },
         useKeyframes: {
           type: 'boolean',
-          description: 'Optional: When true and durationSeconds > 8 (multiple clips), automatically generate AI keyframe images (f0, f1, ... fN) to guide each clip. Clip i gets startFrame=f[i] and endFrame=f[i+1], so Veo interpolates between visually coherent waypoints. This greatly improves visual continuity across clip boundaries. Recommended for multi-clip videos. Defaults to false.'
+          description: 'Optional: When true and durationSeconds > 10 (multiple fallback clips), automatically generate AI keyframe images (f0, f1, ... fN) to guide each clip. Clip i gets startFrame=f[i] and endFrame=f[i+1], so the model interpolates between visually coherent waypoints. This greatly improves visual continuity across clip boundaries. Recommended for multi-clip videos. Defaults to false.'
         },
         startFrame: {
           type: 'string',
@@ -6000,7 +6030,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    const result = await miscImpl.readFileContent(args.file_url);
+    const result = await miscImpl.readFileContent(args.file_url, { userId: context?.userId || context?.agentUserId });
     if (result.success === false) {
       return {
         content: [
@@ -6050,7 +6080,7 @@ emmaToolRegistry.register({
     }
 
     // Default: read raw HTML
-    const result = await miscImpl.readFileContent(args.url);
+    const result = await miscImpl.readFileContent(args.url, { userId: context?.userId || context?.agentUserId });
     if (result.success === false) {
       return {
         content: [
@@ -6447,59 +6477,12 @@ emmaToolRegistry.register({
   definition: {
     name: 'modify_work_plan',
     description: 'Add new steps or modify existing step details in the current work plan. Does not change step status - use set_work_plan_status for that.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        steps: {
-          type: 'array',
-          description: 'Array of steps to add or update',
-          items: {
-            type: 'object',
-            properties: {
-              stepCount: {
-                type: 'number',
-                description: 'Step number'
-              },
-              title: {
-                type: 'string',
-                description: 'Step title'
-              },
-              description: {
-                type: 'string',
-                description: 'Optional detailed description'
-              },
-              requiredFunctionCalls: {
-                type: 'array',
-                description: 'Optional array of function names that must be called before marking this step as completed',
-                items: {
-                  type: 'string'
-                }
-              },
-              expectedAssetCount: {
-                type: 'number',
-                description: 'Optional. Number of media assets the step must produce before it can be completed. Set to a lower number (or 0 to remove the requirement entirely) when the user explicitly approves generating fewer assets than originally planned. Omitting it leaves the existing value unchanged.'
-              }
-            },
-            required: ['stepCount', 'title']
-          }
-        },
-        removeStepCounts: {
-          type: 'array',
-          description: 'Optional array of step numbers to remove',
-          items: {
-            type: 'number'
-          }
-        },
-        autocomplete: {
-          type: 'boolean',
-          description: 'Optional. Update the autocomplete setting. When true, Emma runs all steps automatically without asking for user confirmation between steps.'
-        }
-      },
-      required: ['steps']
-    }
+    inputSchema: MODIFY_WORK_PLAN_INPUT_SCHEMA
   },
   execute: async (args: any, context?: any) => {
-    return await workPlansImpl.modifyWorkPlan(args.steps, args.removeStepCounts || [], context?.sessionId, args.autocomplete, context?.isUnattendedRun, agentModeService.callLLM.bind(agentModeService));
+    const argsError = validateModifyWorkPlanArgs(args);
+    if (argsError) return argsError;
+    return await workPlansImpl.modifyWorkPlan(args.steps || [], args.removeStepCounts || [], context?.sessionId, args.autocomplete, context?.isUnattendedRun, agentModeService.callLLM.bind(agentModeService));
   }
 });
 
@@ -7527,8 +7510,15 @@ const SELF_ONLY_BRIDGE_DEFINITIONS: Record<string, { description: string; inputS
     inputSchema: { type: 'object', properties: {}, required: [] },
   },
   list_scheduled_chats: {
-    description: 'List all scheduled chats for the authenticated user.',
-    inputSchema: { type: 'object', properties: {}, required: [] },
+    description: 'List scheduled chats (newest first) for the authenticated user. Paginated: returns { items, nextCursor }; pass nextCursor back as cursor for the next page (null = last page).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Page size (default 50, max 100)' },
+        cursor: { type: 'string', description: 'Opaque nextCursor from a previous page' },
+      },
+      required: [],
+    },
   },
 };
 
@@ -7610,6 +7600,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     const { LANDING_PAGE_PREVIEW_BRANCH, runCodingAgent } = await import('../services/codingAgentService');
+    const { classifyCodingAgentFailure } = await import('../services/codingAgentFailureClass');
     const executeMcpTool = context?.service
       ? async (toolName: string, toolArgs: any) => {
         return context.service.executeTool(
@@ -7675,6 +7666,9 @@ emmaToolRegistry.register({
       return {
         success: false,
         error: result.message,
+        // ENG-1949: semantic class for telemetry/retry guidance; the message is
+        // often the sub-agent's own prose and cannot be classified by text.
+        errorClass: classifyCodingAgentFailure(result),
         iterations: result.iterations,
         previewUrl: result.previewUrl,
         branch: result.branch,
@@ -7863,11 +7857,17 @@ emmaToolRegistry.register({
       }
     }
 
+    // ENG-2378: a step model on the session plan is the user's explicit choice; carry it into the saved template
+    // while per-step models are honoured (switch on, or unknown after a settings outage).
+    const { anyStepCarriesModel, carryStoredStepModels } = await import('../services/agentMode/workPlanStepModels');
+    const carrySessionModels = anyStepCarriesModel(sessionWorkPlan?.steps)
+      && await (await import('../services/agentMode/workPlanStepModelsInstance')).workPlanStepModels.shouldHonor();
+
     const plan = await workPlanService.createWorkPlan({
       title: args.title,
       description: args.description || '',
       welcomeMessage: args.welcomeMessage || '',
-      steps: steps.map((s: any, i: number) => {
+      steps: (carrySessionModels ? (list: any[]) => carryStoredStepModels(list, sessionWorkPlan.steps) : (list: any[]) => list)(steps.map((s: any, i: number) => {
         const stepNum = s.stepCount || i + 1;
         const sessionStep = sessionStepMap.get(stepNum);
         return {
@@ -7890,7 +7890,7 @@ emmaToolRegistry.register({
             return count !== undefined ? { expectedAssetCount: count } : {};
           })(),
         };
-      }),
+      })),
       ownerId: userId,
       visibility: 'private',
       isBuiltIn: false,
@@ -9269,8 +9269,10 @@ ACTION MATRIX:
               ENG-1944: enabling the CAMPAIGN does NOT enable its ad groups, keywords, or ads — those default to PAUSED on creation and stay that way unless explicitly updated. A successful RESUME/UPDATE(ENABLED) response may include pausedChildEntitiesWarning naming ad groups/keywords/ads still PAUSED underneath — if present, the campaign will deliver ZERO traffic despite showing ENABLED. Do not report a launch as live until you've enabled those too (AD_GROUP/KEYWORD/AD UPDATE with status=ENABLED) and re-checked. Never rely on CAMPAIGN status alone to confirm something is live.
               ADD_PROXIMITY (campaign_resource_name, radius, and EITHER address{street_address?, city_name?, postal_code?, province_code?, province_name?, country_code?} OR latitude+longitude (decimal degrees); radius_units defaults MILES) — mile/km-radius targeting centered on a real address (Google geocodes it server-side). This is native API support for "within N miles of our store/showroom" requests — do NOT tell the user proximity/radius targeting requires the UI; it does not. Additive to any existing LOCATION (city) criteria — REMOVE_PROXIMITY the old one first if only the radius should apply.
               REMOVE_PROXIMITY (criterion_resource_name) — removes a campaign-level LOCATION or PROXIMITY criterion. Obtain resource names via a raw GAQL query on campaign_criterion (call_google_ads_reporting_api mode="raw").
+              DISCLOSURE RULE (AGW-155): if any targeting step cannot be completed via this API (ADD_PROXIMITY errors, or the user asks for a targeting type this tool does not support), tell the user explicitly in the same reply what was NOT applied and why, give the exact manual UI steps, and list it as an outstanding manual action in the launch summary. Never silently substitute a UI workaround or report the campaign as fully configured while a targeting step is pending.
               TRANSPARENCY GUARDRAIL: if any Google Ads request cannot be fully satisfied via this API — including cases where you genuinely must fall back to a UI-only step (e.g. linking Google Business Profile) — you MUST say so explicitly to the user at deployment: name the gap, what you did instead, and the exact manual step left for them. Never silently substitute a workaround or imply a request is fully done when a manual step remains outstanding.
-  CAMPAIGN_CRITERION → ADD (campaign_resource_name, placement_urls? and/or mobile_app_category_resource_names?)
+  CAMPAIGN_CRITERION → ADD (campaign_resource_name, placement_urls? and/or mobile_app_category_resource_names?), SET_DEVICE_BID_ADJUSTMENT (campaign_resource_name OR ad_group_resource_name, device_bid_adjustments[{device, bid_modifier_percent}])
+              SET_DEVICE_BID_ADJUSTMENT: device is MOBILE|TABLET|DESKTOP|CONNECTED_TV; bid_modifier_percent -100..900 (-100 excludes the device, e.g. desktop-only B2B = MOBILE -100 + TABLET -100). Campaign level updates the campaign's device criteria; ad-group level overrides for that ad group. Google may reject some combinations (e.g. excluding every device) — relay its error verbatim.
               Adds campaign-scoped negative placement and mobile-app-category criteria atomically. placement_urls accepts domains or HTTP(S) URLs. mobile_app_category_resource_names must use canonical mobileAppCategoryConstants/<id> resource names. This is not a keyword/ad-group fallback.
   BIDDING_STRATEGY → LIST (portfolio/shared bidding strategies; returns resource_name for use as bidding_strategy_resource_name)
   AD_GROUP    → LIST (campaign_resource_name)
@@ -9359,6 +9361,7 @@ ACTION MATRIX:
         criterion_resource_name: { type: 'string', description: 'Criterion resource name. Required for KEYWORD UPDATE and KEYWORD REMOVE (ad group criterion, from KEYWORD LIST) and CAMPAIGN REMOVE_PROXIMITY (campaign criterion, from a raw GAQL query on campaign_criterion).' },
         placement_urls: { type: 'array', items: { type: 'string' }, description: 'Placement domains or HTTP(S) URLs to add as negative campaign criteria. For CAMPAIGN_CRITERION ADD.' },
         mobile_app_category_resource_names: { type: 'array', items: { type: 'string' }, description: 'Canonical mobileAppCategoryConstants/<id> resource names to add as negative campaign criteria. For CAMPAIGN_CRITERION ADD.' },
+        device_bid_adjustments: { type: 'array', items: { type: 'object', properties: { device: { type: 'string', enum: ['MOBILE', 'TABLET', 'DESKTOP', 'CONNECTED_TV'] }, bid_modifier_percent: { type: 'number', description: '-100 (exclude device) to 900.' } }, required: ['device', 'bid_modifier_percent'] }, description: 'For CAMPAIGN_CRITERION SET_DEVICE_BID_ADJUSTMENT.' },
         assets: { type: 'array', items: { type: 'object', properties: { fieldType: { type: 'string', enum: ['BUSINESS_NAME', 'LOGO', 'SQUARE_MARKETING_IMAGE', 'MARKETING_IMAGE', 'HEADLINE', 'DESCRIPTION'] }, assetResourceName: { type: 'string' }, text: { type: 'string' } }, required: ['fieldType'] }, description: 'Assets to attach for CAMPAIGN_ASSET ATTACH. Use text for BUSINESS_NAME, assetResourceName for image/logo types.' },
         keywords: { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, matchType: { type: 'string', enum: ['BROAD', 'PHRASE', 'EXACT'] } }, required: ['text', 'matchType'] }, description: 'Keywords for ADD or ADD_NEGATIVE action.' },
         query: { type: 'string', description: 'Location search query.' },
@@ -9416,7 +9419,7 @@ GAQL EXAMPLES:
   Campaign: SELECT campaign.id, campaign.name, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions FROM campaign WHERE segments.date DURING LAST_30_DAYS
   Keywords: SELECT ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, metrics.clicks, metrics.cost_micros, metrics.average_cpc FROM keyword_view WHERE segments.date DURING LAST_30_DAYS
   Quality Score: SELECT ad_group_criterion.keyword.text, ad_group_criterion.quality_info.quality_score, ad_group_criterion.quality_info.creative_quality_score, ad_group_criterion.quality_info.post_click_quality_score, ad_group_criterion.quality_info.search_predicted_ctr FROM keyword_view WHERE ad_group_criterion.status = 'ENABLED'
-  (There is no quality_info.ad_relevance field; "ad relevance" is creative_quality_score. ad_group_criterion.quality_info.* fields cannot be combined with segments.date; use metrics.historical_quality_score for date-segmented quality score.)`,
+  (There is no quality_info.ad_relevance field; "ad relevance" is creative_quality_score. quality_info.* + segments.date is accepted FROM keyword_view but rejected FROM ad_group_criterion; for a per-day quality score history use metrics.historical_quality_score for date-segmented quality score. quality_info.* fields only support =, !=, IN, NOT IN in a WHERE clause; IS NULL / IS NOT NULL is invalid on them. Unpopulated scores (keywords below Google's auction-impression threshold) come back as absent/null fields on the row, not as rows you can filter out with a null check - don't attempt to filter on quality_info.* presence.)`,
     inputSchema: {
       type: 'object',
       properties: {

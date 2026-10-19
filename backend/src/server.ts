@@ -433,6 +433,10 @@ const runDrain = async (reason: string): Promise<void> => {
     drainLiveVoiceToolExecutions(remainingDrainMs()),
   ]);
   await generateMarketingResponseWorkerService.shutdown(remainingDrainMs());
+  // ENG-2110: pending Claude sign-ins hold a child process and a private temp dir.
+  await import('./services/funding/claudeSubscriptionService')
+    .then((m) => m.shutdownClaudeSubscriptionService())
+    .catch(() => undefined);
   if (!cronDrain.drained) {
     console.warn(
       `[gracefulShutdown] Cron drain ceiling reached — ${cronDrain.stuckCount} job(s) still in-flight:`,
@@ -643,6 +647,12 @@ createTestAccount().then(async () => {
     void import('./services/ensureCriticalTables')
       .then(({ ensureCriticalTables }) => ensureCriticalTables())
       .catch((err) => console.error('[startup] ensureCriticalTables failed (non-fatal):', err?.message || err));
+
+    // Register app-wide HubSpot webhook subscriptions once per build (one instance wins the claim).
+    import('./utils/hubspotWebhookSubscriptionsBoot')
+      .then(({ ensureWebhookSubscriptionsOncePerBuild }) => ensureWebhookSubscriptionsOncePerBuild())
+      .then((outcome) => console.log(`[startup] HubSpot webhook subscription sync: ${outcome}`))
+      .catch((err) => console.error('[startup] HubSpot webhook subscription sync failed (non-fatal):', err?.message || err));
 
     // Proactively refresh OAuth tokens for outbound MCP servers before they expire.
     import('./mcp/client/mcpOAuthRefreshService')
@@ -1579,6 +1589,24 @@ createTestAccount().then(async () => {
         });
       } catch (error) {
         console.error('[EvalMarkerSuite] Failed to initialize:', error);
+      }
+
+      // Claude subscription logins (ENG-2110): daily expiry pass (no-op unless the claudeSubscription
+      // funding flag is on), and recovery of any refreshed login a previous process died holding
+      // (runs whatever the flag says, and does nothing unless such a dir exists).
+      try {
+        const { scheduleClaudeSubscriptionExpiry } = await import('./cron/claudeSubscriptionExpiryCron');
+        scheduleClaudeSubscriptionExpiry({
+          isCronEnabled,
+          track: (jobName, promise) => cronJobRegistry.track(jobName, promise),
+        });
+        const { recoverClaudeSubscriptionOrphansAtBoot } = await import('./services/funding/claudeSubscriptionService');
+        // Not awaited: a slow store must never hold up the rest of boot.
+        void recoverClaudeSubscriptionOrphansAtBoot()
+          .then((recovered) => recovered && console.log('[ClaudeSubscription] boot recovery:', recovered))
+          .catch((error) => console.error('[ClaudeSubscription] boot recovery failed:', (error as { code?: string })?.code || 'error'));
+      } catch (error) {
+        console.error('[ClaudeSubscription] Failed to initialize:', (error as { code?: string })?.code || 'error');
       }
 
       // Weekly Engineering Scoreboard — read-only backend replacement for the

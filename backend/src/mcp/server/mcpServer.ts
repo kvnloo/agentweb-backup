@@ -18,8 +18,13 @@ import {
   createMcpSessionStore,
 } from './mcpSessionStore';
 import { rehydrateAndServe } from './mcpSessionRehydration';
+import { buildMcpAuthChallenge } from '../oauth/authChallenge';
+
+export { buildMcpAuthChallenge };
 import { anonymousUserIdForSession, isAnonymousDiscoveryEnabled, isAnonymouslyPermitted } from "./anonymousTransport";
 import { isCronEnabled } from '../../utils/instanceState';
+import { effectiveApiKeyScopes, findScopeDenial } from './apiKeyScopes';
+import { mcpToolRegistry } from './registry';
 
 // Rate limiter for MCP requests authenticated via aw_* API keys
 const mcpRateLimiter = new RateLimiter();
@@ -117,6 +122,7 @@ export async function validateMcpAccessToken(req: Request, res: Response, next: 
       (req as any)._mcpIsInternal = false;  // External client
       (req as any)._mcpAuthMethod = 'api_key';
       (req as any)._mcpApiKeyId = keyRecord.keyId;
+      (req as any)._mcpApiKeyScopes = effectiveApiKeyScopes(keyRecord.scopes);
       (req as any)._mcpClientType = classifyMcpClient({ authMethod: 'api_key', userAgent: req.get('user-agent') });
       return next();
     } catch (error) {
@@ -168,15 +174,6 @@ export async function validateMcpAccessToken(req: Request, res: Response, next: 
     hint: `The provided token is not a valid API key, MCP token, or OAuth token.`,
     setup: `Get an API key at https://agentweb.pro (Settings > API Keys). Full guide: ${baseUrl}/skill.md`,
   });
-}
-
-export function buildMcpAuthChallenge(baseUrl: string, error?: string): string {
-  const params = [
-    `resource_metadata="${baseUrl}/.well-known/oauth-protected-resource/mcp"`,
-    `scope="mcp:tools"`,
-  ];
-  if (error) params.push(`error="${error}"`);
-  return `Bearer ${params.join(", ")}`;
 }
 
 function setMcpAuthChallenge(res: Response, baseUrl: string, error?: string) {
@@ -304,6 +301,23 @@ export function setupMcpServer(
       !isCronEnabled()
     ) {
       return res.status(503).json({ message: 'Instance draining — retry on new instance' });
+    }
+
+    // ENG-1083: API key scopes are enforced. Checked per request (the auth
+    // middleware re-validates the key on every POST), so a reused or
+    // rehydrated session cannot outlive a scope restriction.
+    if ((req as any)._mcpAuthMethod === 'api_key') {
+      const denial = findScopeDenial(req.body, (req as any)._mcpApiKeyScopes ?? [], (name) => mcpToolRegistry.getTool(name));
+      if (denial) {
+        return res.status(403).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32003,
+            message: `Forbidden: API key lacks scope '${denial.requiredScope}' required for tool '${denial.tool}'. Create a key with that scope at https://agentweb.pro (Settings > API Keys).`,
+          },
+          id: Array.isArray(req.body) ? null : (req.body?.id ?? null),
+        });
+      }
     }
 
     // Log all incoming requests

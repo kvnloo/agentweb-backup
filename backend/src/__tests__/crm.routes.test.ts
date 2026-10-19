@@ -1740,6 +1740,8 @@ describe('CRM Routes', () => {
         subject: 'Test Subject',
         html: '<p>Test content</p>',
       });
+      // ENG-2367: one-off sends never carry bulk-mail List-Unsubscribe headers.
+      expect((resendService.sendEmail as jest.Mock).mock.calls[0][0].headers).toBeUndefined();
       expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', { emailDraft: null });
       expect(mockResponse.json).toHaveBeenCalled();
     });

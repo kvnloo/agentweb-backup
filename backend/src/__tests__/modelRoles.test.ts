@@ -123,6 +123,12 @@ describe('persisted admin defaults hidden by the picker (ENG-2183)', () => {
     expect(await resolveModelForRole(undefined, 'content_generation')).toBe('anthropic.claude-opus-4-8');
   });
 
+  it('maps a renamed model stored under its old id to the new id (alias-aware persisted default)', async () => {
+    setting('agent_mode_content_model', 'openrouter/qwen/qwen3.8-max');
+    expect(await resolveModelForRole(undefined, 'content_generation')).toBe('openrouter/qwen/qwen3.8-max-0902');
+    expect(await getRoleDefault('content_generation')).toBe('openrouter/qwen/qwen3.8-max-0902');
+  });
+
   it.each(['retired-model', 'constructor', 'gpt-image-1'])('falls back for an unknown or wrong-kind content setting %s', async value => {
     setting('agent_mode_content_model', value);
     expect(await resolveModelForRole(undefined, 'content_generation')).toBe('gemini-3.8-flash');

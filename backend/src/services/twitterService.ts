@@ -107,6 +107,56 @@ export interface XProjectUsage {
   capResetDay: number | null;
 }
 
+/**
+ * ENG-2474: X API v2 recent search rejects v1.1 operators (min_faves,
+ * min_retweets, min_replies, filter:*) with HTTP 400. Translate the ones with
+ * v2 equivalents, strip the rest, and return min_* thresholds so the caller can
+ * post-filter on public_metrics.
+ */
+const MIN_METRIC_FIELDS: Record<string, string> = {
+  min_faves: 'like_count',
+  min_retweets: 'retweet_count',
+  min_replies: 'reply_count',
+};
+const FILTER_TO_IS: Record<string, string> = {
+  replies: 'is:reply',
+  retweets: 'is:retweet',
+  nativeretweets: 'is:retweet',
+};
+
+// Apply `transform` only to text outside double-quoted phrases, so quoted
+// literals like "min_faves:10" are searched verbatim, not parsed as operators.
+const transformOutsideQuotedPhrases = (raw: string, transform: (segment: string) => string): string =>
+  raw.split(/("(?:\\.|[^"\\])*")/g).map((part, i) => (i % 2 === 1 ? part : transform(part))).join('');
+
+export function translateV1SearchOperators(raw: string): { query: string; minMetrics: Record<string, number> } {
+  const minMetrics: Record<string, number> = {};
+  let q = transformOutsideQuotedPhrases(raw, (segment) => segment
+    .replace(/\b(min_faves|min_retweets|min_replies):(\d+)/gi, (_m, op: string, n: string) => {
+      const field = MIN_METRIC_FIELDS[op.toLowerCase()];
+      minMetrics[field] = Math.max(minMetrics[field] ?? 0, Number(n));
+      return ' ';
+    })
+    .replace(/(^|[\s(])(-?)filter:(\w+)/gi, (_m, lead: string, neg: string, kind: string) => {
+      const mapped = FILTER_TO_IS[kind.toLowerCase()];
+      return mapped ? `${lead}${neg}${mapped}` : `${lead} `;
+    }));
+  // Remove groups emptied by stripping, e.g. "( )", then collapse whitespace.
+  let prev: string;
+  do {
+    prev = q;
+    q = transformOutsideQuotedPhrases(q, (segment) => segment.replace(/\(\s*\)/g, ' '));
+  } while (q !== prev);
+  q = transformOutsideQuotedPhrases(q, (segment) => segment.replace(/\s+/g, ' ')).trim();
+  return { query: q, minMetrics };
+}
+
+// True when an OR lost an operand (e.g. "cats OR (filter:links)" -> "cats OR").
+export function hasDanglingBooleanOperator(query: string): boolean {
+  const unquoted = query.replace(/"(?:\\.|[^"\\])*"/g, ' X ');
+  return /(^|[\s(])OR(?=\s*($|\)|OR\b))/.test(unquoted) || /(^|\()\s*OR\b/.test(unquoted);
+}
+
 export class TwitterService {
   private cachedClientId: string | null = null;
   private cachedClientSecret: string | null = null;
@@ -818,12 +868,23 @@ export class TwitterService {
    */
   async searchTweets(ownerUserId: string, accountId: string, query: string, maxResults?: number): Promise<any[]> {
     if (!query || query.trim() === '') throw new Error('query is required for search-tweets');
+    const { query: v2Query, minMetrics } = translateV1SearchOperators(query);
+    if (!v2Query) {
+      throw new Error('search query has no searchable terms after removing unsupported operators (min_faves/min_retweets/min_replies/filter:)');
+    }
+    if (hasDanglingBooleanOperator(v2Query)) {
+      throw new Error(`search query is incomplete after removing unsupported operators (an OR lost its operand): ${v2Query}`);
+    }
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
-      const res: any = await client.v2.search(query.trim(), {
+      const res: any = await client.v2.search(v2Query, {
         max_results: this.clampMaxResults(maxResults, 10, 10),
         'tweet.fields': ['public_metrics', 'created_at', 'author_id'],
       });
-      return res?.data?.data ?? res?.data ?? [];
+      const rows = res?.data?.data ?? res?.data ?? [];
+      const entries = Object.entries(minMetrics);
+      if (!entries.length || !Array.isArray(rows)) return rows;
+      return rows.filter((t: any) =>
+        entries.every(([field, min]) => Number(t?.public_metrics?.[field] ?? 0) >= min));
     }, { operation: 'search_tweets', units: arrayLen });
   }
 

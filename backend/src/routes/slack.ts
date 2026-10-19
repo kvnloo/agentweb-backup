@@ -1,6 +1,6 @@
 import express, { Request, Response } from "express"; // slack-triggered-session v2
 import { createHmac, timingSafeEqual } from "crypto";
-import { authenticateToken } from "../middleware/auth";
+import { authenticateToken, isRealAdmin } from "../middleware/auth";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { getSecret } from "../utils/secretsManager";
 import {
@@ -20,7 +20,8 @@ import {
   resolveSlackMentionsInText,
   downloadSlackFile,
   resolveSlackFileUrl,
-  postSlackMessage
+  postSlackMessage,
+  getEffectiveAllowedChannels
 } from "../services/slackService";
 import {
   APPROVAL_DECISION_ACTION_IDS,
@@ -30,8 +31,10 @@ import {
 } from "../services/approvalInboxSlack";
 import { approvalInboxService } from "../services/approvalInboxService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
-import { taskDb, subscriberDb } from "../services/db";
+import { taskDb, userDb } from "../services/db";
 import { emailService } from "../services/emailService";
+import { notifySubscribersOfApproval } from "../services/approvalSubscriberNotify";
+import { hasWhatsApp } from "../services/customerChannelPolicy";
 import { createRevisionExecutionFromSlack } from "../controllers/tasks";
 import { isSessionLimitError } from "../utils/agentModeErrors";
 import { sendAgentModeOncallAlert } from "../utils/agentModeAlerts";
@@ -383,6 +386,32 @@ router.post("/send-approval", authenticateToken, async (req: Request, res: Respo
       return res.status(401).json({ error: "User not authenticated" });
     }
 
+    if (typeof channel !== "string") {
+      return res.status(400).json({ error: "channel must be a string" });
+    }
+
+    // ENG-2413 (ENG-2407 pattern): the bot posts with the workspace token, so the caller
+    // may only target a channel configured for their user/org (or be a real, non-delegated
+    // admin). Checked before any Slack call or approvalDb write.
+    //
+    // Not applied to a customer on WhatsApp: they are entitled to no Slack channel by
+    // design, and requestApproval ignores the channel it is given for them (nothing is
+    // posted to Slack), so refusing here would only stop a task that still names an old
+    // Slack channel from ever asking them on WhatsApp — and hold their output.
+    let targetChannel: string = channel;
+    if (!isRealAdmin(req)) {
+      const user = await userDb.getUserById(userId);
+      const allowed = await getEffectiveAllowedChannels(user);
+      if (hasWhatsApp(user)) {
+        // Hand requestApproval NO channel. It re-reads the account itself; if that read
+        // disagrees (a blip, or a disconnect between the two reads) an empty channel makes
+        // it fail closed instead of posting to whatever channel the caller named.
+        targetChannel = "";
+      } else if (!allowed.includes(channel)) {
+        return res.status(403).json({ error: "Not allowed to post to this Slack channel" });
+      }
+    }
+
     // Determine asset type from filename
     const assetType = getAssetTypeFromFilename(filename);
 
@@ -395,7 +424,7 @@ router.post("/send-approval", authenticateToken, async (req: Request, res: Respo
       filename,
       assetType,
       userId,
-      channel,
+      channel: targetChannel,
       channelName: authReq.body.channelName || channel, // Use channel name if provided, fallback to channel ID
       note: note // Pass the note to Slack
     });
@@ -411,6 +440,9 @@ router.post("/send-approval", authenticateToken, async (req: Request, res: Respo
   } catch (error: any) {
     console.error("❌ Error sending approval request:", error.message);
     
+    if (error?.name === "ApprovalForbiddenError" || error?.constructor?.name === "ApprovalForbiddenError") {
+      return res.status(403).json({ error: error.message });
+    }
     if (error.message.includes("Slack client not initialized")) {
       res.status(503).json({ 
         error: "Slack integration not configured", 
@@ -611,6 +643,17 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
               await slackClient.chat.postMessage({
                 channel,
                 text: `User not found: ${targetEmail}`,
+                thread_ts: responseThreadTs
+              });
+              return;
+            }
+
+            // One platform per customer: an account on WhatsApp cannot also be linked
+            // to a Slack channel.
+            if (hasWhatsApp(targetUser)) {
+              await slackClient.chat.postMessage({
+                channel,
+                text: `${targetEmail} is already connected to WhatsApp. An account can use one messaging platform, so disconnect WhatsApp before linking a Slack channel.`,
                 thread_ts: responseThreadTs
               });
               return;
@@ -1097,66 +1140,9 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
           user.username || user.id
         );
 
-        // Send email notifications to subscribers after approval
-        try {
-          if (approval && approval.executionId) {
-            console.log(`🔍 Looking up execution details for executionId: ${approval.executionId}`);
-            
-            // Get task information from the execution
-            const execution = await taskDb.getTaskExecutionById(approval.executionId);
-            if (execution) {
-              console.log(`✅ Found execution for taskId: ${execution.taskId}`);
-              
-              // Get task details
-              const task = await taskDb.getTaskById(execution.taskId);
-              if (task) {
-                console.log(`✅ Found task: ${task.name}`);
-                
-                // Get task subscribers
-                const subscribers = await subscriberDb.getTaskSubscribers(execution.taskId);
-                const activeSubscribers = subscribers ? subscribers.filter(sub => !sub.unsubscribed) : [];
-                const subscriberEmails = activeSubscribers.map(sub => sub.email);
-                
-                // Apply subscriber email limit
-                const emailLimit = parseInt(process.env.SUBSCRIBER_EMAIL_LIMIT || '1000');
-                const limitedSubscriberEmails = subscriberEmails.slice(0, emailLimit);
-                
-                console.log(`📧 Found ${subscriberEmails.length} active subscribers for task: ${execution.taskId}`);
-                if (subscriberEmails.length > emailLimit) {
-                  console.log(`⚠️ Subscriber count (${subscriberEmails.length}) exceeds limit (${emailLimit}). Sending to first ${emailLimit} subscribers only.`);
-                }
-                
-                if (limitedSubscriberEmails.length > 0) {
-                  // Send task results to subscribers using common function
-                  for (const email of limitedSubscriberEmails) {
-                    try {
-                      await emailService.sendTaskExecutionEmail(
-                        email,
-                        approval.executionId
-                      );
-                      console.log(`📧 Task results sent to subscriber: ${email}`);
-                    } catch (error) {
-                      console.error(`Failed to send task results to ${email}:`, error);
-                      // Continue with other subscribers even if one fails
-                    }
-                  }
-                  console.log(`📧 Task results sent to ${limitedSubscriberEmails.length} subscribers for task: ${execution.taskId}`);
-                } else {
-                  console.log(`No subscribers to notify for task: ${execution.taskId}`);
-                }
-              } else {
-                console.log(`❌ Task not found for taskId: ${execution.taskId}`);
-              }
-            } else {
-              console.log(`❌ Execution not found for executionId: ${approval.executionId}`);
-            }
-          } else {
-            console.log(`❌ No executionId found in approval:`, approval);
-          }
-        } catch (error) {
-          console.error('Error sending approval notifications to subscribers:', error);
-          // Don't fail the approval if email notifications fail
-        }
+        // Email the task's subscribers. Shared with the WhatsApp approval path (ENG-273)
+        // so 'approved' has one consequence whichever channel it came from.
+        await notifySubscribersOfApproval(approval);
 
         console.log(`✅ Approved: ${assetUrl} by ${user.username}`);
         res.status(200).json({

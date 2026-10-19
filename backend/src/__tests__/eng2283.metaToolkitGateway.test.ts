@@ -161,4 +161,24 @@ describe('ENG-2283 Meta Toolkit gateway', () => {
     expect(limiter.check).toHaveBeenCalledWith('meta-toolkit:oauth:user-2', 60);
     expect(deps.execute).not.toHaveBeenCalled();
   });
+
+  // ENG-2303 P2: onboarding must work before Meta is connected.
+  it('zoma_status skips Meta account resolution, runs the Zoma handler, and is metered once', async () => {
+    const runZomaTool = jest.fn().mockResolvedValue({ next_step: 'connect Meta' });
+    const deps = makeDeps({ listAccounts: jest.fn().mockResolvedValue([]), runZomaTool: runZomaTool as any });
+    const result = await call(deps, { toolName: 'zoma_status' });
+    expect(result).toEqual({ next_step: 'connect Meta' });
+    expect(runZomaTool).toHaveBeenCalledWith('zoma_status', {}, { userId: 'user-1' });
+    expect(deps.listAccounts).not.toHaveBeenCalled();
+    expect(deps.execute).not.toHaveBeenCalled();
+    expect(deps.recordUsage).toHaveBeenCalledTimes(1);
+    expect(deps.recordUsage).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'zoma_status', authMethod: 'api_key' }));
+  });
+
+  it('zoma_status still requires authentication', async () => {
+    const runZomaTool = jest.fn();
+    const deps = makeDeps({ runZomaTool: runZomaTool as any });
+    await expect(call(deps, { toolName: 'zoma_status', authorization: undefined })).rejects.toMatchObject({ status: 401 });
+    expect(runZomaTool).not.toHaveBeenCalled();
+  });
 });

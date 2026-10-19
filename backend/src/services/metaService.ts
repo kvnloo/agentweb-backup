@@ -405,6 +405,8 @@ export class MetaService {
     'id', 'name', 'status', 'campaign_id',
     'optimization_goal', 'billing_event', 'destination_type', 'promoted_object', 'bid_strategy', 'bid_amount',
     'daily_budget', 'lifetime_budget', 'start_time', 'end_time', 'targeting',
+    // ENG-2303: documented AdSet field; the toolkit write read-back reports it.
+    'effective_status',
   ] as const;
 
   /**
@@ -1523,6 +1525,13 @@ export class MetaService {
       } else if ((params as any).advantage_campaign_budget && (params as any).budget_amount !== undefined) {
         const currency = await this.getAdAccountCurrency(adAccountId, accessToken);
         finalParams.daily_budget = normalizeMetaMoney((params as any).budget_amount, currency).minorUnits;
+      }
+
+      // ENG-2364: under CBO the bid strategy lives on the campaign. Without one, Meta rejects
+      // every ad set with subcode 1815857 ("Bid amount required") even when the ad set asks
+      // for LOWEST_COST_WITHOUT_CAP. Send the no-cap default whenever we set a campaign budget.
+      if (finalParams.daily_budget !== undefined) {
+        finalParams.bid_strategy = 'LOWEST_COST_WITHOUT_CAP';
       }
 
       // Already normalized by the agent, just like the ad-set SDK write fields.

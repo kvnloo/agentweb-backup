@@ -809,7 +809,7 @@ describe('POST /compare/select', () => {
     expect(res(out).messages.map((m: any) => m.messageIndex)).toEqual([3, 4]);
     expect(res(out).llmModel).toBe('gpt-5.5');
     expect(deps.updateSessionModel).toHaveBeenCalledWith('s-1', 'gpt-5.5');
-    expect(deps.tryClaim).toHaveBeenCalledWith('s-1');
+    expect(deps.tryClaim).toHaveBeenCalledWith('s-1', 'user-1');
     expect(deps.release).toHaveBeenCalledWith('s-1');
   });
 
@@ -1270,6 +1270,26 @@ describe('only the selected model may answer (served-model verification)', () =>
     expect(isSameServedModel('', 'openai/gpt-5.5')).toBe(false);
   });
 
+  describe('catalog sibling ids in non-slug forms still protect the bare id (ENG-2379)', () => {
+    it.each([
+      'deepseek/deepseek-v4-flash-0731',
+      'deepseek/deepseek-v4-flash-0731:free',
+      'deepseek/deepseek-v4-flash-0731:nitro',
+      'deepseek/deepseek-v4-flash-0731/',
+      'openrouter/deepseek/deepseek-v4-flash-0731',
+      'DeepSeek/DeepSeek-V4-Flash-0731',
+      ' openrouter/deepseek/deepseek-v4-flash-0731:free/ ',
+    ])('sibling listed as %j => the bare id refuses its dated slug', (listed) => {
+      expect(isSameServedModel('deepseek/deepseek-v4-flash', 'deepseek/deepseek-v4-flash-20260731')).toBe(true);
+      expect(isSameServedModel('deepseek/deepseek-v4-flash', 'deepseek/deepseek-v4-flash-20260731', [listed])).toBe(false);
+    });
+
+    it('unrelated or differently-dated catalog entries do not block the bare id own snapshot', () => {
+      const known = ['deepseek/deepseek-v4-flash-0801:free', 'deepseek/deepseek-v4-flash', 'openrouter/deepseek/deepseek-v4-pro-0731', 'x'];
+      expect(isSameServedModel('deepseek/deepseek-v4-flash', 'deepseek/deepseek-v4-flash-20260731', known)).toBe(true);
+    });
+  });
+
   describe('MMDD-suffixed ids are part of the model identity (F3)', () => {
     const SIBLINGS = [
       'deepseek/deepseek-v4-pro', 'deepseek/deepseek-v4-pro-0813',
@@ -1307,5 +1327,82 @@ describe('only the selected model may answer (served-model verification)', () =>
     const { deps } = makeDeps({ callLLM: jest.fn(async (m: string) => ok(`answer from ${m}`)) as any });
     const out = await run(deps, body());
     expect(res(out).results.map((r: any) => r.status)).toEqual(['ok', 'ok']);
+  });
+});
+
+describe('ENG-55 data-collection policy (provider_policy_unavailable)', () => {
+  const noEndpoints = () => Object.assign(new Error('404 No endpoints found matching your data policy'), { status: 404 });
+  const DENY = { data_collection: 'deny' as const };
+  const optionsOf = (callLLM: jest.Mock) => callLLM.mock.calls.map((c) => c[2] as Record<string, unknown>);
+
+  it('no getProviderPolicy dep => options carry no providerPolicy key at all', async () => {
+    const { deps, callLLM } = makeDeps();
+    await run(deps, body());
+    for (const o of optionsOf(callLLM)) expect(o).not.toHaveProperty('providerPolicy');
+  });
+
+  it('switch off (null) => options unchanged: no providerPolicy key', async () => {
+    const { deps, callLLM } = makeDeps({ getProviderPolicy: async () => null });
+    await run(deps, body());
+    for (const o of optionsOf(callLLM)) expect(Object.keys(o).sort()).toEqual(['max_completion_tokens', 'taskClass', 'timeoutMs', 'usageContext']);
+  });
+
+  it('switch on => every column call carries providerPolicy deny', async () => {
+    const { deps, callLLM } = makeDeps({ getProviderPolicy: async () => DENY });
+    await run(deps, body());
+    expect(optionsOf(callLLM)).toHaveLength(2);
+    for (const o of optionsOf(callLLM)) expect(o.providerPolicy).toEqual({ data_collection: 'deny' });
+  });
+
+  it('a throwing policy read never breaks a column (treated as off)', async () => {
+    const { deps, callLLM } = makeDeps({ getProviderPolicy: async () => { throw new Error('x'); } });
+    const out = await run(deps, body());
+    expect(res(out).results.map((r: any) => r.status)).toEqual(['ok', 'ok']);
+    for (const o of optionsOf(callLLM)) expect(o).not.toHaveProperty('providerPolicy');
+  });
+
+  it('policy on + no-endpoints 404 for one column => that column provider_policy_unavailable, the other still answers', async () => {
+    const callLLM = jest.fn(async (m: string) => {
+      if (m === 'gemini-3.5-flash') throw noEndpoints();
+      return ok(`answer from ${m}`, m);
+    });
+    const { deps } = makeDeps({ callLLM: callLLM as any, getProviderPolicy: async () => DENY });
+    const out = await run(deps, body());
+    const results = res(out).results;
+    expect(results[0]).toMatchObject({ model: 'gpt-5.5', status: 'ok' });
+    expect(results[1]).toMatchObject({ model: 'gemini-3.5-flash', status: 'error', errorCode: 'provider_policy_unavailable' });
+  });
+
+  it('policy off + the same 404 => unchanged upstream_error', async () => {
+    const callLLM = jest.fn(async (m: string) => {
+      if (m === 'gemini-3.5-flash') throw noEndpoints();
+      return ok(`answer from ${m}`, m);
+    });
+    const { deps } = makeDeps({ callLLM: callLLM as any, getProviderPolicy: async () => null });
+    const out = await run(deps, body());
+    expect(res(out).results[1]).toMatchObject({ status: 'error', errorCode: 'upstream_error' });
+  });
+
+  it.each([
+    ['require_parameters 404', 'No endpoints found that can handle the requested parameters'],
+    ['unknown/retired model 404', 'No endpoints found for foo/bar-9.'],
+  ])('policy on + %s is NOT labelled a privacy problem (stays upstream_error)', async (_n, text) => {
+    const callLLM = jest.fn(async (m: string) => {
+      if (m === 'gemini-3.5-flash') throw Object.assign(new Error(text), { status: 404 });
+      return ok(`answer from ${m}`, m);
+    });
+    const { deps } = makeDeps({ callLLM: callLLM as any, getProviderPolicy: async () => DENY });
+    const out = await run(deps, body());
+    expect(res(out).results[1]).toMatchObject({ status: 'error', errorCode: 'upstream_error' });
+  });
+
+  it('policy on + an unrelated error stays upstream_error', async () => {
+    const callLLM = jest.fn(async (m: string) => {
+      if (m === 'gemini-3.5-flash') throw new Error('socket hang up');
+      return ok(`answer from ${m}`, m);
+    });
+    const { deps } = makeDeps({ callLLM: callLLM as any, getProviderPolicy: async () => DENY });
+    const out = await run(deps, body());
+    expect(res(out).results[1]).toMatchObject({ errorCode: 'upstream_error' });
   });
 });

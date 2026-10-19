@@ -441,6 +441,16 @@ export async function recordUnipileAccountHealth(params: {
   }
 }
 
+/**
+ * ENG-2363: stable per-account Alert Class for the disconnect oncall alert. The
+ * subject carries a day count and first/reminder wording, so title-based intake
+ * dedupe filed a new Linear issue per reminder; the class folds every occurrence
+ * for one account onto its open canonical as a `Recurred on` comment.
+ */
+export function linkedInDisconnectAlertClass(accountId: string): string {
+  return `unipile-disconnected:${accountId}`;
+}
+
 async function notify(params: {
   ownerUserId: string;
   accountId: string;
@@ -470,6 +480,10 @@ async function notify(params: {
       ownerEmail: owner?.email,
       disconnectedAt: params.disconnectedAt,
       isReminder: params.isReminder,
+      'Alert Class': linkedInDisconnectAlertClass(params.accountId),
+      // ENG-2492: pre-ENG-2363 canonicals (ENG-2229/2230) carry no Alert Class line; key the
+      // fold on their `accountId:` context line so reminders comment instead of re-filing.
+      'Alert Legacy Key': `accountId: ${params.accountId}`,
     },
     dedupeKey: `unipile_disconnected:${params.accountId}`,
     dedupeWindowMs: 12 * 60 * 60 * 1000,
