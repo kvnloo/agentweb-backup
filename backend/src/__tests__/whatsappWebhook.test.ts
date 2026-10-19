@@ -526,6 +526,8 @@ describe('POST — inbound messages', () => {
     expect(recordInboundMessage).not.toHaveBeenCalled();
     expect(recordOptOut).not.toHaveBeenCalled();
     expect(handleUnrecognizedMessage).not.toHaveBeenCalled();
+    // The failed receipt for another number must not reach the owner-notification path either.
+    expect(lookupApprovalMessage).not.toHaveBeenCalled();
   });
 
   it('ignores a change that does not say which number it is for', async () => {
