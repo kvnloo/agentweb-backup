@@ -238,6 +238,9 @@ export function isSetupModeCheckoutSession(session: any): boolean {
 export const ZOMA_PAYMENT_METHOD_PURCHASE_TYPE = 'zoma_payment_method';
 
 /** ENG-2571: what `resolveUserPaymentMethod` found. `customerId` never leaves the backend. */
+/** The user-row fields the ENG-2571 customer lookup reads. */
+export type CustomerCandidateUser = { stripe_customer_id?: string | null; email?: string | null } | null | undefined;
+
 export interface UserPaymentMethod {
   hasPaymentMethod: boolean;
   customerId: string | null;
@@ -399,16 +402,26 @@ export const stripeService = {
     }
   },
 
-  /** ENG-2571 — the user row's `stripe_customer_id` first, then customers found by `metadata.userId`. */
-  async customerCandidateIds(user: { stripe_customer_id?: string | null } | null | undefined, userId: string): Promise<string[]> {
+  /**
+   * ENG-2571 — the user row's `stripe_customer_id` first, then this user's customers by email,
+   * then customers found by `metadata.userId`. Search lags new customers by up to a minute, so
+   * a card saved through Zoma's setup Checkout would read as "no card" right as the user lands
+   * back on Settings; the email list is consistent, and Zoma always creates with the email.
+   * Email matches count only when they carry this `metadata.userId`.
+   */
+  async customerCandidateIds(user: CustomerCandidateUser, userId: string): Promise<string[]> {
     const ids = new Set<string>();
     if (typeof user?.stripe_customer_id === 'string' && user.stripe_customer_id) ids.add(user.stripe_customer_id);
+    if (typeof user?.email === 'string' && user.email) {
+      const byEmail = await getStripeOrThrow().customers.list({ email: user.email, limit: 10 });
+      for (const c of byEmail.data) if (c.metadata?.userId === userId) ids.add(c.id);
+    }
     for (const id of await stripeService.findCustomerIdsByUserId(userId)) ids.add(id);
     return [...ids];
   },
 
   /** ENG-2571 — the first candidate customer that still exists in Stripe, or null. */
-  async findLiveCustomerIdForUser(user: { stripe_customer_id?: string | null } | null | undefined, userId: string): Promise<string | null> {
+  async findLiveCustomerIdForUser(user: CustomerCandidateUser, userId: string): Promise<string | null> {
     for (const id of await stripeService.customerCandidateIds(user, userId)) {
       if (await stripeService.retrieveLiveCustomer(id)) return id;
     }
@@ -442,7 +455,7 @@ export const stripeService = {
    * propagate: callers decide how to report an unknown state, never "no card".
    */
   async resolveUserPaymentMethod(
-    user: { stripe_customer_id?: string | null } | null | undefined,
+    user: CustomerCandidateUser,
     userId: string,
   ): Promise<UserPaymentMethod> {
     const s = getStripeOrThrow();

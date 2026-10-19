@@ -16,7 +16,7 @@ import express from 'express';
 import request from 'supertest';
 
 const mockStripe = {
-  customers: { create: jest.fn(), retrieve: jest.fn(), search: jest.fn() },
+  customers: { create: jest.fn(), retrieve: jest.fn(), search: jest.fn(), list: jest.fn() },
   paymentMethods: { list: jest.fn() },
   setupIntents: { list: jest.fn() },
   checkout: { sessions: { create: jest.fn() } },
@@ -63,6 +63,7 @@ const ZOMA_SI = { id: 'seti_1', status: 'succeeded', metadata: { userId: 'u1', p
 /** Stripe state keyed by customer id. */
 function stripeState(customers: Record<string, { deleted?: boolean; defaultPm?: any; pms?: any[]; sis?: any[]; metadata?: any }>, searchIds: string[] = []) {
   mockStripe.customers.search.mockResolvedValue({ data: searchIds.map((id) => ({ id })) });
+  mockStripe.customers.list.mockResolvedValue({ data: [] });
   mockStripe.customers.retrieve.mockImplementation(async (id: string) => {
     const c = customers[id];
     if (!c) {
@@ -124,6 +125,27 @@ describe('GET /api/stripe/billing-summary', () => {
     stripeState({ cus_other: { pms: [] }, cus_zoma: { pms: [VISA], sis: [ZOMA_SI] } }, ['cus_zoma']);
     const res = await request(app).get('/api/stripe/billing-summary');
     expect(res.body).toEqual({ hasPaymentMethod: true, isZoma: true, card: { brand: 'visa', last4: '0159' } });
+  });
+
+  it('a card saved moments ago is found by email while search still lags (Opslane run 925)', async () => {
+    mockGetUserById.mockResolvedValue({ userId: 'u1', email: 'z@acme.co' });
+    stripeState({ cus_new: { pms: [VISA], sis: [ZOMA_SI] } }, []);
+    mockStripe.customers.list.mockResolvedValue({ data: [{ id: 'cus_new', metadata: { userId: 'u1' } }] });
+    const res = await request(app).get('/api/stripe/billing-summary');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ hasPaymentMethod: true, isZoma: true, card: { brand: 'visa', last4: '0159' } });
+    expect(mockStripe.customers.list).toHaveBeenCalledWith({ email: 'z@acme.co', limit: 10 });
+    const portal = await request(app).post('/api/stripe/create-customer-portal-session');
+    expect(portal.status).toBe(200);
+    expect(mockStripe.billingPortal.sessions.create).toHaveBeenCalledWith(expect.objectContaining({ customer: 'cus_new' }));
+  });
+
+  it("an email match that belongs to another user id is ignored", async () => {
+    mockGetUserById.mockResolvedValue({ userId: 'u1', email: 'z@acme.co' });
+    stripeState({ cus_someone: { pms: [VISA], sis: [ZOMA_SI] } }, []);
+    mockStripe.customers.list.mockResolvedValue({ data: [{ id: 'cus_someone', metadata: { userId: 'u2' } }] });
+    const res = await request(app).get('/api/stripe/billing-summary');
+    expect(res.body).toEqual({ hasPaymentMethod: false, isZoma: false, card: null });
   });
 
   it('a stale user.stripe_customer_id Stripe no longer knows is skipped; the searched card holder still wins', async () => {
