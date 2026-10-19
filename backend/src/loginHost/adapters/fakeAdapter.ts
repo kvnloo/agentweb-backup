@@ -36,6 +36,8 @@ export interface FakeScript {
   openHang?: boolean;
   /** preflight waits for this before answering. */
   preflightGate?: Promise<void>;
+  /** close() waits for this before the process counts as gone. */
+  closeGate?: Promise<void>;
   /** Called by tests to make every open session report `closed` (the provider process died). */
   killSessions: Array<() => void>;
   /** Turns that were interrupted individually. */
@@ -85,6 +87,7 @@ export interface FakeOptions {
   maxTurnsPerProcess?: number;
   loginTtlMs?: number;
   toolTransport?: "mcp_direct" | "host_relay";
+  singleUse?: boolean;
 }
 
 export function createFakeAdapter(script: FakeScript, opts: FakeOptions = {}): SubscriptionProviderAdapter {
@@ -97,6 +100,7 @@ export function createFakeAdapter(script: FakeScript, opts: FakeOptions = {}): S
     toolTransport: opts.toolTransport ?? "mcp_direct",
     maxProcessesPerHome: opts.maxProcessesPerHome ?? 3,
     maxTurnsPerProcess: opts.maxTurnsPerProcess ?? 1,
+    ...(opts.singleUse ? { singleUse: true } : {}),
     loginTtlMs: opts.loginTtlMs ?? 10 * 60 * 1000,
     models: new Set(["fast", "smart"]),
     binary: () => ({ path: "/opt/fake/fake-cli", version: "0.0.0-fake", digest: "sha256:fake" }),
@@ -162,9 +166,10 @@ export function createFakeAdapter(script: FakeScript, opts: FakeOptions = {}): S
           bus.emit("interrupt");
         },
         async close() {
-          script.closed++;
           closedAll = true;
           bus.emit("interrupt");
+          if (script.closeGate) await script.closeGate;
+          script.closed++;
           markClosed();
         },
       };
