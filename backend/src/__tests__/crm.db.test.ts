@@ -1413,6 +1413,111 @@ describe('CRM Database Service', () => {
     });
   });
 
+  // ENG-2271: hot-lead call state lives at lead.system.hot_lead_call; these two primitives are its
+  // conditional writes. DynamoDB evaluates the conditions, so these assert the expressions we send.
+  describe('createLeadSystemRecordOnce', () => {
+    it('bootstraps the system map, then SETs the key only if it is absent', async () => {
+      const result = await crmDb.createLeadSystemRecordOnce('list_1', 'lead_1', 'hot_lead_call', { state: 'dialing' });
+
+      expect(result).toBe(true);
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+      const call = mockDocumentClientMethods.update.mock.calls[1][0];
+      expect(call.UpdateExpression).toBe('SET #system.#k = :rec, updatedAt = :ts');
+      expect(call.ConditionExpression).toBe('attribute_not_exists(#system.#k)');
+      expect(call.ExpressionAttributeNames).toEqual({ '#system': 'system', '#k': 'hot_lead_call' });
+      expect(call.ExpressionAttributeValues[':rec']).toEqual({ state: 'dialing' });
+    });
+
+    it('returns false when the record already exists', async () => {
+      mockDocumentClientMethods.update
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) })
+        .mockReturnValueOnce({ promise: jest.fn().mockRejectedValue({ code: 'ConditionalCheckFailedException' }) });
+      expect(await crmDb.createLeadSystemRecordOnce('list_1', 'lead_1', 'hot_lead_call', {})).toBe(false);
+    });
+
+    it('returns false when the lead does not exist, without attempting the SET', async () => {
+      mockDocumentClientMethods.update.mockReturnValueOnce({
+        promise: jest.fn().mockRejectedValue({ code: 'ConditionalCheckFailedException' }),
+      });
+      expect(await crmDb.createLeadSystemRecordOnce('list_1', 'gone', 'hot_lead_call', {})).toBe(false);
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(1);
+    });
+
+    it('rethrows errors other than a failed condition', async () => {
+      mockDocumentClientMethods.update.mockReturnValueOnce({ promise: jest.fn().mockRejectedValue(new Error('boom')) });
+      await expect(crmDb.createLeadSystemRecordOnce('list_1', 'lead_1', 'hot_lead_call', {})).rejects.toThrow('boom');
+    });
+  });
+
+  describe('updateLeadSystemRecordIf', () => {
+    it('builds one conditional UpdateItem with state, set, max-map and list-append parts', async () => {
+      const result = await crmDb.updateLeadSystemRecordIf('list_1', 'lead_1', 'hot_lead_call', {
+        stateIn: ['dialing', 'owner_ringing'],
+        set: { state: 'owner_answered', outcome: undefined, ownerCallSid: 'CA1' },
+        maxIn: { lastSequence: { CA1: 3 } },
+        appendNew: { meteredLegs: ['owner', 'lead'] },
+      });
+
+      expect(result).toBe(true);
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(1);
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.Key).toEqual({ listId: 'list_1', leadId: 'lead_1' });
+      expect(call.UpdateExpression).toBe(
+        'SET updatedAt = :ts, #system.#k.#f0 = :v0, #system.#k.#f1 = :v1, #system.#k.#f2.#e2 = :v2, ' +
+        '#system.#k.#f3 = list_append(#system.#k.#f3, :v3)',
+      );
+      expect(call.ConditionExpression).toBe(
+        '#system.#k.#state IN (:from0, :from1) AND ' +
+        '(attribute_not_exists(#system.#k.#f2.#e2) OR #system.#k.#f2.#e2 < :v2) AND ' +
+        'NOT contains(#system.#k.#f3, :v3_0) AND NOT contains(#system.#k.#f3, :v3_1)',
+      );
+      expect(call.ExpressionAttributeNames).toEqual({
+        '#system': 'system', '#k': 'hot_lead_call', '#state': 'state',
+        '#f0': 'state', '#f1': 'ownerCallSid', '#f2': 'lastSequence', '#e2': 'CA1', '#f3': 'meteredLegs',
+      });
+      expect(call.ExpressionAttributeValues).toMatchObject({
+        ':from0': 'dialing', ':from1': 'owner_ringing', ':v0': 'owner_answered', ':v1': 'CA1', ':v2': 3,
+        ':v3': ['owner', 'lead'], ':v3_0': 'owner', ':v3_1': 'lead',
+      });
+      // Every placeholder must be used or DynamoDB rejects the request.
+      const text = `${call.UpdateExpression} ${call.ConditionExpression}`;
+      for (const name of Object.keys(call.ExpressionAttributeNames)) expect(text).toContain(name);
+      for (const value of Object.keys(call.ExpressionAttributeValues)) expect(text).toContain(value);
+    });
+
+    it('with only a state condition sends no max or append clauses', async () => {
+      await crmDb.updateLeadSystemRecordIf('list_1', 'lead_1', 'hot_lead_call', {
+        stateIn: ['dialing'], set: { state: 'failed' }, appendNew: { meteredLegs: [] },
+      });
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.ConditionExpression).toBe('#system.#k.#state IN (:from0)');
+      expect(call.UpdateExpression).not.toContain('list_append');
+    });
+
+    it('returns false when a condition fails and rethrows other errors', async () => {
+      mockDocumentClientMethods.update
+        .mockReturnValueOnce({ promise: jest.fn().mockRejectedValue({ code: 'ConditionalCheckFailedException' }) })
+        .mockReturnValueOnce({ promise: jest.fn().mockRejectedValue(new Error('boom')) });
+      const op = { stateIn: ['dialing'], set: { state: 'failed' } };
+      expect(await crmDb.updateLeadSystemRecordIf('list_1', 'lead_1', 'hot_lead_call', op)).toBe(false);
+      await expect(crmDb.updateLeadSystemRecordIf('list_1', 'lead_1', 'hot_lead_call', op)).rejects.toThrow('boom');
+    });
+  });
+
+  // ENG-2271: the call timeline reuses addLeadEngagement, which raises isEngaged by keyword.
+  describe('addLeadEngagement with hot-lead call events', () => {
+    it.each([
+      'call.initiated', 'call.owner_answered', 'call.owner_declined', 'call.owner_no_answer', 'call.connected',
+      'call.lead_no_answer', 'call.completed', 'call.failed', 'call.skipped',
+    ])('does not mark the lead engaged for %s', async (eventType) => {
+      await crmDb.addLeadEngagement('list_1', 'lead_1', {
+        eventType, eventData: { leg: 'owner', seconds: 12, reason: 'no_answer' }, createdAt: '2026-10-19T10:00:00.000Z',
+      });
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.UpdateExpression).not.toContain('isEngaged');
+    });
+  });
+
   describe('mergeFieldNames', () => {
     it('atomically appends via list_append without a read-modify-write', async () => {
       // The previous implementation read-then-set, which loses concurrent writes.

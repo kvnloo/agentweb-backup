@@ -10936,6 +10936,131 @@ export const crmDb = {
     }
   },
 
+  /**
+   * Creates the object `record` at `lead.system[key]` ONLY if that key is absent, returning whether THIS
+   * caller created it. Unlike claimLeadStepOnce there is no stale-reclaim: an existing record is never
+   * overwritten, so the single winner of two racing creators is decided by DynamoDB, not by a read.
+   * False also covers a lead that does not exist.
+   */
+  async createLeadSystemRecordOnce(
+    listId: string,
+    leadId: string,
+    key: string,
+    record: Record<string, unknown>,
+  ): Promise<boolean> {
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+    const dynKey = { listId, leadId };
+    try {
+      await dynamodb.update({
+        TableName: tableName,
+        Key: dynKey,
+        UpdateExpression: 'SET #system = if_not_exists(#system, :emptyMap)',
+        ExpressionAttributeNames: { '#system': 'system' },
+        ExpressionAttributeValues: { ':emptyMap': {} },
+        ConditionExpression: 'attribute_exists(leadId)',
+      }).promise();
+    } catch (err) {
+      if ((err as { code?: string }).code === 'ConditionalCheckFailedException') return false;
+      handleDynamoDbError(err, 'createLeadSystemRecordOnce:bootstrap');
+      throw err;
+    }
+    try {
+      await dynamodb.update({
+        TableName: tableName,
+        Key: dynKey,
+        UpdateExpression: 'SET #system.#k = :rec, updatedAt = :ts',
+        ExpressionAttributeNames: { '#system': 'system', '#k': key },
+        ExpressionAttributeValues: { ':rec': record, ':ts': new Date().toISOString() },
+        ConditionExpression: 'attribute_not_exists(#system.#k)',
+      }).promise();
+      return true;
+    } catch (err) {
+      if ((err as { code?: string }).code === 'ConditionalCheckFailedException') return false;
+      handleDynamoDbError(err, 'createLeadSystemRecordOnce');
+      throw err;
+    }
+  },
+
+  /**
+   * Conditional patch of the object record at `lead.system[key]`, applied in ONE UpdateItem. Returns
+   * false (nothing written) when ANY condition fails, so a replayed or out-of-order caller is a clean
+   * no-op rather than a partial write:
+   *  - `stateIn`: the record's current `state` must be one of these (a missing record fails too);
+   *  - `set`: plain field overwrites (undefined values are skipped);
+   *  - `maxIn`: per-entry numeric maps, e.g. { lastSequence: { [callSid]: 3 } }; an entry is written only
+   *    if it is higher than the stored one (or absent), otherwise the whole patch fails;
+   *  - `appendNew`: values appended to a list field; if any is already in the list the whole patch fails.
+   * The map and list fields named in `maxIn`/`appendNew` must already exist on the record (the creator
+   * initialises them), because DynamoDB cannot SET a path under a missing map.
+   */
+  async updateLeadSystemRecordIf(
+    listId: string,
+    leadId: string,
+    key: string,
+    op: {
+      stateIn: string[];
+      set?: Record<string, unknown>;
+      maxIn?: Record<string, Record<string, number>>;
+      appendNew?: Record<string, string[]>;
+    },
+  ): Promise<boolean> {
+    const names: Record<string, string> = { '#system': 'system', '#k': key, '#state': 'state' };
+    const values: Record<string, unknown> = { ':ts': new Date().toISOString() };
+    const setClauses: string[] = ['updatedAt = :ts'];
+    const conditions: string[] = [];
+    // Every name and value goes through a generated placeholder (CallSids contain no reserved words, but
+    // an allowlist of safe ones is the bug that already shipped from this file once).
+    let n = 0;
+
+    op.stateIn.forEach((s, i) => { values[`:from${i}`] = s; });
+    conditions.push(`#system.#k.#state IN (${op.stateIn.map((_, i) => `:from${i}`).join(', ')})`);
+
+    for (const [field, v] of Object.entries(op.set ?? {})) {
+      if (v === undefined) continue;
+      names[`#f${n}`] = field;
+      values[`:v${n}`] = v;
+      setClauses.push(`#system.#k.#f${n} = :v${n}`);
+      n++;
+    }
+    for (const [field, entries] of Object.entries(op.maxIn ?? {})) {
+      names[`#f${n}`] = field;
+      for (const [entryKey, num] of Object.entries(entries)) {
+        names[`#e${n}`] = entryKey;
+        values[`:v${n}`] = num;
+        setClauses.push(`#system.#k.#f${n}.#e${n} = :v${n}`);
+        conditions.push(`(attribute_not_exists(#system.#k.#f${n}.#e${n}) OR #system.#k.#f${n}.#e${n} < :v${n})`);
+        n++;
+      }
+    }
+    for (const [field, items] of Object.entries(op.appendNew ?? {})) {
+      if (items.length === 0) continue;
+      names[`#f${n}`] = field;
+      values[`:v${n}`] = items;
+      setClauses.push(`#system.#k.#f${n} = list_append(#system.#k.#f${n}, :v${n})`);
+      items.forEach((item, i) => {
+        values[`:v${n}_${i}`] = item;
+        conditions.push(`NOT contains(#system.#k.#f${n}, :v${n}_${i})`);
+      });
+      n++;
+    }
+
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: { listId, leadId },
+        UpdateExpression: `SET ${setClauses.join(', ')}`,
+        ConditionExpression: conditions.join(' AND '),
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+      }).promise();
+      return true;
+    } catch (err) {
+      if ((err as { code?: string }).code === 'ConditionalCheckFailedException') return false;
+      handleDynamoDbError(err, 'updateLeadSystemRecordIf');
+      throw err;
+    }
+  },
+
   async deleteEnrichmentCacheByEntityKey(entityKey: string): Promise<void> {
     try {
       const result = await dynamodb.query({
