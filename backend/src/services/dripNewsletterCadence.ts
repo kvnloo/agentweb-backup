@@ -24,7 +24,8 @@ export type NewsletterSkipReason =
   | 'suppressed'
   | 'before_send_day'
   | 'already_sent_this_month'
-  | 'joined_after_issue';
+  | 'joined_after_issue'
+  | 'invalid_now';
 
 export type NewsletterCadenceDecision =
   | { action: 'send'; issueMonth: string }
@@ -49,6 +50,7 @@ export function newsletterCadence(
   // Compliance first.
   if (member.unsubscribed || member.bounced || member.complained) return { action: 'skip', reason: 'suppressed' };
 
+  if (!Number.isFinite(now.getTime())) return { action: 'skip', reason: 'invalid_now' };
   if (now.getUTCDate() < sendDay) return { action: 'skip', reason: 'before_send_day' };
 
   const issueMonth = issueMonthOf(now);

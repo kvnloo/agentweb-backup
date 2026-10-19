@@ -65,6 +65,10 @@ describe('newsletterCadence (ENG-2545)', () => {
     expect(newsletterCadence({ joinedSegmentAt: new Date('nope') }, now).action).toBe('skip');
   });
 
+  it('invalid now fails closed', () => {
+    expect(newsletterCadence({ joinedSegmentAt: joined }, new Date(NaN))).toEqual({ action: 'skip', reason: 'invalid_now' });
+  });
+
   it('issueMonthOf uses UTC', () => {
     expect(issueMonthOf(new Date('2026-01-01T00:30:00Z'))).toBe('2026-01');
   });
