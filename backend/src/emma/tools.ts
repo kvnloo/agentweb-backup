@@ -7,6 +7,7 @@ import { auditCampaigns } from '../services/adUtmAuditService';
 import type { AdPlatform } from '../utils/adUtm';
 import { metaAdReadPort, googleAdReadPort, linkedInAdReadPort } from '../services/adUtmAuditAdapters';
 import { accountMemoryDb, orgMemoryDb, userDb } from '../services/db';
+import { MEMORY_AUTOSPLIT_MAX_CHARS, splitMemoryContent } from '../utils/memoryContentLimit';
 import { crmDb } from '../services/db';
 import { askCrm } from '../services/askCrmService';
 import { createAskCrmLeadLoader, USER_LOOKUP_BUDGET } from '../services/askCrmLeadLoader';
@@ -6726,8 +6727,8 @@ emmaToolRegistry.register({
       properties: {
         content: {
           type: 'string',
-          maxLength: 2000,
-          description: 'The fact to remember. Be specific and actionable. HARD LIMIT 2000 characters — content over it is REJECTED, not truncated. If you have more to record, split it into several save_memory calls of at most 2000 characters each rather than re-sending the same oversized text, which fails identically every time (ENG-908).'
+          maxLength: MEMORY_AUTOSPLIT_MAX_CHARS,
+          description: 'The fact to remember. Be specific and actionable. Keep each fact under 2000 characters; content up to 8000 characters is split automatically into several memories at paragraph/sentence boundaries (ENG-2574). Content over 8000 characters is rejected.'
         },
         category: {
           type: 'string',
@@ -6751,18 +6752,28 @@ emmaToolRegistry.register({
     // Embed at write time so the memory can later be retrieved by relevance, not just
     // recency. Best-effort: a failure must not block saving (read path falls back to recency).
     const { embedText } = await import('../utils/embeddings');
-    const embedding = (await embedText(args.content, { userId, feature: 'embeddings' })) ?? undefined;
-    const memory = await accountMemoryDb.addMemory(
-      userId,
-      args.category,
-      args.content,
-      context?.sessionId,
-      embedding
-    );
+    // ENG-2574: split oversized content into <=2000-char rows rather than rejecting it.
+    const chunks = splitMemoryContent(String(args.content ?? ''));
+    const memoryIds: string[] = [];
+    for (const chunk of chunks) {
+      const embedding = (await embedText(chunk, { userId, feature: 'embeddings' })) ?? undefined;
+      const memory = await accountMemoryDb.addMemory(
+        userId,
+        args.category,
+        chunk,
+        context?.sessionId,
+        embedding
+      );
+      memoryIds.push(memory.memoryId);
+    }
+    const preview = `"${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`;
     return {
       success: true,
-      memoryId: memory.memoryId,
-      message: `Saved memory: "${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`
+      memoryId: memoryIds[0],
+      ...(memoryIds.length > 1 ? { memoryIds } : {}),
+      message: memoryIds.length > 1
+        ? `Saved memory as ${memoryIds.length} parts (content exceeded 2000 characters): ${preview}`
+        : `Saved memory: ${preview}`
     };
   }
 });
@@ -6804,8 +6815,8 @@ emmaToolRegistry.register({
       properties: {
         content: {
           type: 'string',
-          maxLength: 2000,
-          description: 'The org-wide fact to remember. Be specific and actionable. HARD LIMIT 2000 characters — content over it is REJECTED, not truncated. If you have more to record, split it into several save_org_memory calls of at most 2000 characters each rather than re-sending the same oversized text, which fails identically every time (ENG-831).'
+          maxLength: MEMORY_AUTOSPLIT_MAX_CHARS,
+          description: 'The org-wide fact to remember. Be specific and actionable. Keep each fact under 2000 characters; content up to 8000 characters is split automatically into several org memories at paragraph/sentence boundaries (ENG-2574). Content over 8000 characters is rejected.'
         },
         category: {
           type: 'string',
@@ -6836,18 +6847,28 @@ emmaToolRegistry.register({
 
     // Embed at write time so the memory can later be retrieved by relevance (best-effort).
     const { embedText } = await import('../utils/embeddings');
-    const embedding = (await embedText(args.content, { userId, feature: 'embeddings' })) ?? undefined;
-    const memory = await orgMemoryDb.addMemory(
-      user.orgId,
-      args.category,
-      args.content,
-      userId,
-      embedding
-    );
+    // ENG-2574: split oversized content into <=2000-char rows rather than rejecting it.
+    const chunks = splitMemoryContent(String(args.content ?? ''));
+    const memoryIds: string[] = [];
+    for (const chunk of chunks) {
+      const embedding = (await embedText(chunk, { userId, feature: 'embeddings' })) ?? undefined;
+      const memory = await orgMemoryDb.addMemory(
+        user.orgId,
+        args.category,
+        chunk,
+        userId,
+        embedding
+      );
+      memoryIds.push(memory.memoryId);
+    }
+    const preview = `"${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`;
     return {
       success: true,
-      memoryId: memory.memoryId,
-      message: `Saved org memory: "${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`
+      memoryId: memoryIds[0],
+      ...(memoryIds.length > 1 ? { memoryIds } : {}),
+      message: memoryIds.length > 1
+        ? `Saved org memory as ${memoryIds.length} parts (content exceeded 2000 characters): ${preview}`
+        : `Saved org memory: ${preview}`
     };
   }
 });
