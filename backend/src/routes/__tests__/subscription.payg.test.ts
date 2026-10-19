@@ -196,6 +196,51 @@ describe('PUT /api/subscription/payg', () => {
     expect((await get(OWNER).expect(200)).body.overagePercentUsed).toBe(10);
   });
 
+  describe('the opt-in baseline is per month: taken on the first off->on only', () => {
+    it('re-enabling later in the same month keeps the baseline, so toggling cannot reset the cap', async () => {
+      // First opt-in at the pool: baseline 0. Then $30 of overage = 60% of the 50% cap ($50).
+      mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 100 * USD });
+      await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(200);
+      const firstOptIn = users[OWNER].paygOverage.optIn;
+      expect(firstOptIn).toEqual({ month: getCurrentUsageMonth(), overageBaselineMicroUsd: 0 });
+      mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 130 * USD });
+      expect((await get(OWNER).expect(200)).body.overagePercentUsed).toBe(60);
+
+      await put(OWNER, { enabled: false }).expect(200);
+      mockUpdateUser.mockClear();
+      mockHasPaymentMethod.mockClear();
+      const res = await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(200);
+
+      // Not re-measured: a fresh baseline would have been $30 and read 0%.
+      expect(res.body.overagePercentUsed).toBe(60);
+      expect(users[OWNER].paygOverage.optIn).toEqual(firstOptIn);
+      const written = Object.fromEntries(mockUpdateUser.mock.calls[0][2].pathSets.map((p: any) => [p.path[1], p.value]));
+      expect(written).not.toHaveProperty('optIn');
+      // Still a real re-enable: the live payment-method check runs again.
+      expect(mockHasPaymentMethod).toHaveBeenCalledWith('cus_owner');
+    });
+
+    it('a baseline from an earlier month is ignored: the new month starts at baseline 0', async () => {
+      users[OWNER].paygOverage = {
+        enabled: true, capPercentOfPool: 200, updatedBy: OWNER, updatedAt: '2000-01-31T00:00:00.000Z', version: 1,
+        optIn: { month: '2000-01', overageBaselineMicroUsd: 150 * USD },
+      };
+      // $150 over a $100 pool this month: all of it counts, 75% of the 200% cap ($200).
+      mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 250 * USD });
+      expect((await get(OWNER).expect(200)).body.overagePercentUsed).toBe(75);
+    });
+
+    it('the first re-enable of a new month takes that month\'s baseline', async () => {
+      users[OWNER].paygOverage = {
+        enabled: false, capPercentOfPool: 200, updatedBy: OWNER, updatedAt: '2000-01-31T00:00:00.000Z', version: 1,
+        optIn: { month: '2000-01', overageBaselineMicroUsd: 150 * USD },
+      };
+      mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 120 * USD });
+      await put(OWNER, { enabled: true, capPercentOfPool: 200 }).expect(200);
+      expect(users[OWNER].paygOverage.optIn).toEqual({ month: getCurrentUsageMonth(), overageBaselineMicroUsd: 20 * USD });
+    });
+  });
+
   describe('a delegated admin acting as the customer cannot consent to charges', () => {
     const putAsDelegate = (body: unknown) => request(app).put('/api/subscription/payg')
       .set('x-test-user', OWNER).set('x-test-delegate-admin', 'admin-9').send(body as object);
@@ -212,6 +257,14 @@ describe('PUT /api/subscription/payg', () => {
         users[OWNER].paygOverage = {
           enabled: true, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 2,
         };
+      });
+
+      it('403s re-enabling after the owner turned it off', async () => {
+        users[OWNER].paygOverage.enabled = false;
+        expect((await putAsDelegate({ enabled: true, capPercentOfPool: 50 }).expect(403)).body.error)
+          .toBe('delegate_cannot_consent');
+        expect(mockHasPaymentMethod).not.toHaveBeenCalled();
+        expect(mockUpdateUser).not.toHaveBeenCalled();
       });
 
       it('403s raising the cap', async () => {
