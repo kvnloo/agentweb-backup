@@ -53,6 +53,22 @@ describe('buildVoiceWebhookUrl', () => {
   });
 });
 
+describe('status callback retry override', () => {
+  beforeEach(() => { process.env.BACKEND_URL = 'https://api.example.com'; });
+
+  it('puts the documented retry fragment on status URLs only', () => {
+    const c = { listId: 'l', leadId: 'd', jobKey: 'j' };
+    expect(buildVoiceWebhookUrl('status', c)).toMatch(/\?listId=l&leadId=d&jobKey=j#rc=3&rp=5xx,ct$/);
+    for (const kind of ['owner', 'gather', 'dial'] as const) expect(buildVoiceWebhookUrl(kind, c)).not.toContain('#');
+  });
+
+  it('adds leg=lead to the query, before the fragment', () => {
+    const url = buildVoiceWebhookUrl('status', { listId: 'l', leadId: 'd', jobKey: 'j' }, { leg: 'lead' });
+    expect(url).toMatch(/\?listId=l&leadId=d&jobKey=j&leg=lead#rc=3&rp=5xx,ct$/);
+    expect(new URL(url).searchParams.get('leg')).toBe('lead');
+  });
+});
+
 describe('voiceWebhookBaseUrl', () => {
   it('returns the configured origin without trailing slashes and refuses an unset base in staging', () => {
     process.env.BACKEND_URL = ' https://api.example.com// ';
