@@ -1069,3 +1069,163 @@ describe('ENG-669 tier model allowlist', () => {
     });
   });
 });
+
+/**
+ * ENG-669 review round 3. Who chose a stored model is decided on CANONICAL ids (an alias of the stored model is the
+ * same model, in both directions); a model the final gate refuses is the standard 422, never a 500; and a side-channel
+ * session stamped before llmModelSource existed (no decision either) is AgentWeb's choice.
+ */
+describe('ENG-669 model source on canonical ids, final-gate 422, legacy side channels', () => {
+  const ALLOWED = 'gemini-3.5-flash';
+  const DISALLOWED = 'gpt-5.5';
+  const TARGET = 'legacy-old-alias-target';
+  const ALIAS = 'legacy-old-alias';
+  const mockResolution = getUserSubscriptionResolution as jest.Mock;
+  const mockTierConfig = readTierAllowedModels as jest.Mock;
+  const SUPPORTED = ['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5', 'live-voice-1'];
+
+  /** A session store that keeps what updateSessionLlmModel writes (model, decision, source). */
+  const storeSession = (initial: Record<string, unknown>) => {
+    let stored: any = { ...initial };
+    mockChatbotDb.getChatSession.mockImplementation(async () => stored);
+    mockChatbotDb.updateSessionLlmModel.mockImplementation(async (_id: string, model: string, decision: any, source?: any) => {
+      stored = { ...stored, llmModel: model, llmUsagePolicyDecision: decision, llmModelSource: source };
+      if (!source) delete stored.llmModelSource;
+      return stored;
+    });
+    return () => stored;
+  };
+
+  beforeEach(() => {
+    mockSettings.model_tier_allowlist_enabled = 'true';
+    mockSettings.subscription_types = JSON.stringify([{ name: 'Free', allowedModels: [ALLOWED] }, { name: 'Pro', allowedModels: ['*'] }]);
+    mockResolution.mockResolvedValue({ subscriptionType: 'Free', resolved: true });
+    mockTierConfig.mockImplementation(async (tier: string) => {
+      const row = JSON.parse(mockSettings.subscription_types as string).find((t: any) => t.name === tier);
+      return row ? { configured: true, allowedModels: row.allowedModels } : { configured: false };
+    });
+    (mockAgentModeService.getSupportedModels as jest.Mock).mockResolvedValue([...SUPPORTED, TARGET]);
+  });
+  afterEach(() => {
+    (mockAgentModeService.getSupportedModels as jest.Mock).mockResolvedValue(SUPPORTED);
+    mockAgentModeService.getDefaultModel.mockResolvedValue(DEFAULT_MODEL);
+    assertSpy?.mockRestore();
+    assertSpy = undefined;
+  });
+  let assertSpy: jest.SpyInstance | undefined;
+
+  it('an ALIAS echo of a system stamp keeps it a system stamp: the next turn still runs (no false 422)', async () => {
+    const stored = storeSession({ ...baseSession(TARGET), llmModelSource: 'system' });
+    const first = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: ALIAS }), first);
+    expect(first.statusCode).toBe(200);
+    expect(stored().llmModelSource).toBe('system');
+    activeSessionGenerations.clear();
+    const second = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: TARGET }), second);
+    expect(second.statusCode).toBe(200);
+  });
+
+  it('no laundering: a legacy stored user pick spelled as an ALIAS stays the user\'s on a no-model turn', async () => {
+    mockSettings.subscription_types = JSON.stringify([{ name: 'Free', allowedModels: [ALLOWED, TARGET] }]);
+    const stored = storeSession({ ...baseSession(ALIAS) }); // legacy: no source, no decision => a user pick
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({}), res);
+    expect(res.statusCode).toBe(200);
+    expect(stored().llmModelSource).toBe('user');
+  });
+
+  it('...and the same holds with the switch off (the source is recorded either way, nothing is read)', async () => {
+    delete mockSettings.model_tier_allowlist_enabled;
+    modelAccess.reset();
+    const stored = storeSession({ ...baseSession(ALIAS) });
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({}), res);
+    expect(res.statusCode).toBe(200);
+    expect(stored().llmModelSource).toBe('user');
+    expect(mockResolution).not.toHaveBeenCalled();
+  });
+
+  it('a user pick stays the user\'s: after the tier narrows, its echo is a 422', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue({ ...baseSession(DISALLOWED), llmModelSource: 'user' } as any);
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: DISALLOWED }), res);
+    expect(res.statusCode).toBe(422);
+  });
+
+  it('PATCHing away from a system stamp and back loses the exemption (a pick is the user\'s)', async () => {
+    mockAgentModeService.getDefaultModel.mockResolvedValue(ALLOWED);
+    storeSession({ ...baseSession(DISALLOWED), llmModelSource: 'system' });
+    const patch = (llmModel: string) => ({ user: { userId: OWNER }, params: { sessionId: SESSION_ID }, body: { llmModel } }) as any;
+    const away = makeRes();
+    await agentModeController.updateSessionLlmModel(patch(ALLOWED), away);
+    expect(away.statusCode).toBe(200);
+    const back = makeRes();
+    await agentModeController.updateSessionLlmModel(patch(DISALLOWED), back);
+    expect(back.statusCode).toBe(422);
+  });
+
+  it('verified-generate runs a system stamp after the default rotates', async () => {
+    mockAgentModeService.getDefaultModel.mockResolvedValue(ALLOWED);
+    mockChatbotDb.getChatSession.mockResolvedValue({ ...baseSession(DISALLOWED), llmModelSource: 'system' } as any);
+    const res = makeRes();
+    await agentModeController.verifiedGenerate({
+      user: { userId: OWNER }, body: { sessionId: SESSION_ID, startingMessage: MESSAGE, attachments: [], llmModel: DISALLOWED }, on: jest.fn(),
+    } as any, res);
+    expect(res.statusCode).not.toBe(422);
+  });
+
+  it.each([
+    ['a Slack thread', { slackThread: { channel: 'C1', threadTs: '1.2' } }],
+    ['a GTM work item', { gtmWorkItem: { planId: 'p', phaseId: 'ph', workItemId: 'w' } }],
+    ['an Emma email', { sessionType: 'emma-email' }],
+    ['a result endpoint', { sessionType: 'result-endpoint' }],
+  ])('legacy side channel (%s) stamped with the then-default and no decision is AgentWeb\'s choice after rotation', async (_n, marker) => {
+    mockAgentModeService.getDefaultModel.mockResolvedValue(ALLOWED); // the default rotated away from gpt-5.5
+    mockChatbotDb.getChatSession.mockResolvedValue({ ...baseSession(DISALLOWED), ...marker } as any);
+    const err = await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, DISALLOWED).catch((e) => e);
+    expect(isModelUnavailableError(err)).toBe(false);
+    expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: DISALLOWED }), expect.anything());
+  });
+
+  it('a regular legacy session with no decision is still a user pick (refused, visibly)', async () => {
+    mockAgentModeService.getDefaultModel.mockResolvedValue(ALLOWED);
+    mockChatbotDb.getChatSession.mockResolvedValue(baseSession(DISALLOWED) as any);
+    const err = await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, DISALLOWED).catch((e) => e);
+    expect(err).toMatchObject({ reason: 'not_in_plan' });
+  });
+
+  it('/generate: a refusal from the FINAL gate (e.g. a tier change mid-turn) is the standard 422, not a 500', async () => {
+    assertSpy = jest.spyOn(modelAccess, 'assertModelAllowed');
+    // The pre-flight passes; the final gate inside generateSessionResponse then refuses.
+    assertSpy.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new ModelUnavailableError(DISALLOWED, 'not_in_plan', {
+      model: DISALLOWED, tier: 'Free', allowedModels: [ALLOWED], upgradeRequired: ['Pro'],
+    }));
+    storeSession({ ...baseSession(DISALLOWED), llmModelSource: 'user' });
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: DISALLOWED }), res);
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toMatchObject({ code: 'model_unavailable', reason: 'not_in_plan', tier: 'Free', upgradeRequired: ['Pro'] });
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    expect(activeSessionGenerations.has(SESSION_ID)).toBe(false);
+  });
+
+  it('shared view: a final-gate refusal is a 422 without the owner\'s plan', async () => {
+    assertSpy = jest.spyOn(modelAccess, 'assertModelAllowed');
+    assertSpy
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new ModelUnavailableError(DISALLOWED, 'not_in_plan', { model: DISALLOWED, tier: 'Free', allowedModels: [], upgradeRequired: [] }));
+    storeSession({
+      ...baseSession(DISALLOWED), llmModelSource: 'user',
+      interactiveShareMetadata: { isActive: true, token: 'tok', sharedAt: '2026-07-01T00:00:00Z' },
+    });
+    const res = makeRes();
+    await agentModeController.generateSharedResponse({
+      params: { shareId: SESSION_ID }, query: { conversable: 'tok' }, body: { userMessage: MESSAGE, attachments: [] }, on: jest.fn(),
+    } as unknown as Request, res);
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toMatchObject({ code: 'model_unavailable', reason: 'not_in_plan' });
+    expect(res.body).not.toHaveProperty('tier');
+  });
+});

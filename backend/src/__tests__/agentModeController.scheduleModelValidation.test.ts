@@ -64,7 +64,7 @@ jest.mock('../services/db', () => ({
     updateSchedule: jest.fn(),
   },
   userDb: { getUserById: jest.fn() },
-  scheduleTemplateDb: { getTemplateById: jest.fn() },
+  scheduleTemplateDb: { getTemplateById: jest.fn(), updateTemplate: jest.fn() },
 }));
 
 import { scheduleDb, userDb, scheduleTemplateDb } from '../services/db';
@@ -396,6 +396,34 @@ describe('ENG-669 tier model allowlist on schedule pins', () => {
     it('an explicit override is the owner\'s pin even on a system template', async () => {
       expect((await fromTemplate({ visibility: 'system', llmModel: 'gemini-3.5-flash' }, { llmModel: NOT_IN_PLAN })).status)
         .toHaveBeenCalledWith(422);
+    });
+  });
+
+  describe('updateScheduleTemplate on a system template (review NIT 4)', () => {
+    const systemTemplate = { templateId: 't1', createdBy: USER, visibility: 'system', name: 'T', startingMessage: 'Hi', llmModel: NOT_IN_PLAN };
+    const updateTemplate = async (body: Record<string, unknown>, user: Record<string, unknown> = { userId: USER }) => {
+      (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue(systemTemplate);
+      const res = makeRes();
+      await (agentModeController as any).updateScheduleTemplate(
+        { user, params: { templateId: 't1' }, body } as unknown as Request, res);
+      return res;
+    };
+
+    it("its non-admin creator cannot change the model: schedules from it inherit the pin as a system model (403)", async () => {
+      const res = await updateTemplate({ llmModel: 'gemini-3.5-flash' });
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(scheduleTemplateDb.updateTemplate).not.toHaveBeenCalled();
+    });
+
+    it('re-sending the stored model (a full-object PUT) is not a change', async () => {
+      const res = await updateTemplate({ name: 'Renamed', llmModel: ` ${NOT_IN_PLAN} ` });
+      expect(res.status).not.toHaveBeenCalledWith(403);
+    });
+
+    it('an administrator may change it', async () => {
+      const res = await updateTemplate({ llmModel: 'gemini-3.5-flash' }, { userId: USER, isAdmin: true });
+      expect(res.status).not.toHaveBeenCalledWith(403);
+      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalled();
     });
   });
 

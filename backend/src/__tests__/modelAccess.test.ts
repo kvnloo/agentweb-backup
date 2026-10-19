@@ -16,7 +16,9 @@ import {
   createModelAccess,
   isModelAllowed,
   isSystemAuthoredPlan,
+  modelSourceAfter,
   normalizeAllowedModels,
+  storedModelSource,
   type ModelAccessDeps,
   type TierModelsConfig,
 } from '../services/agentMode/modelAccess';
@@ -366,5 +368,28 @@ describe('the 422 body', () => {
       requestedModel: 'x',
       reason: 'not_served',
     });
+  });
+});
+
+describe('who chose a stored model (review round 3)', () => {
+  // 'gpt-5-chat-2' is a real legacy alias of 'gpt-5.5' in the registry's alias table.
+  it('modelSourceAfter compares through the registry alias table BY DEFAULT (every caller, by construction)', () => {
+    expect(modelSourceAfter({ llmModel: 'gpt-5.5', llmModelSource: 'system' }, 'gpt-5.5', 'gpt-5-chat-2')).toBe('system');
+    expect(modelSourceAfter({ llmModel: 'gpt-5-chat-2' }, 'gpt-5.5', null)).toBe('user');
+    expect(modelSourceAfter({ llmModel: 'gpt-5.5', llmModelSource: 'system' }, 'gemini-3.5-flash', 'gemini-3.5-flash')).toBe('user');
+    expect(modelSourceAfter({ llmModel: 'gpt-5.5', llmModelSource: 'user' }, 'gemini-3.5-flash', null)).toBe('system');
+  });
+
+  it('legacy rule: no source and no decision is AgentWeb\'s only on a side-channel session', () => {
+    expect(storedModelSource({ llmModel: 'm' })).toBe('user');
+    expect(storedModelSource({ llmModel: 'm', slackThread: { channel: 'C', threadTs: '1' } })).toBe('system');
+    expect(storedModelSource({ llmModel: 'm', gtmWorkItem: { planId: 'p' } })).toBe('system');
+    expect(storedModelSource({ llmModel: 'm', sessionType: 'emma-email' })).toBe('system');
+    expect(storedModelSource({ llmModel: 'm', sessionType: 'result-endpoint' })).toBe('system');
+    // A recorded source or a decision always wins over the marker.
+    expect(storedModelSource({ llmModel: 'm', slackThread: { channel: 'C' }, llmModelSource: 'user' })).toBe('user');
+    expect(storedModelSource({
+      llmModel: 'm', slackThread: { channel: 'C' }, llmUsagePolicyDecision: { effectiveModel: 'm', modelSelection: 'honored' },
+    })).toBe('user');
   });
 });
