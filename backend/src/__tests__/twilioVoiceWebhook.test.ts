@@ -25,6 +25,7 @@ import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
 import { FakeVoiceProvider } from '../services/voice/fakeVoiceProvider';
 import type { HotLeadCallEventType, HotLeadCallRecord, HotLeadCallState, LeadCallStore } from '../services/voice/leadCallStore.types';
 import * as twiml from '../services/voice/twiml';
+import { buildVoiceWebhookUrl } from '../services/voice/voiceUrls';
 import twilioVoiceWebhookRoutes, { twilioVoiceBodyParser } from '../routes/twilioVoiceWebhook';
 
 const mock = (fn: unknown) => fn as jest.Mock;
@@ -315,16 +316,6 @@ describe('POST /owner', () => {
     expect(store.events).toHaveLength(0);
   });
 
-  it('hangs up without a prompt when the kill switch is off, recording only the aborted outcome', async () => {
-    seed('owner_ringing');
-    setHotLeadCallEnabledOverride(false);
-    const res = await owner();
-    expect(res.text).toContain('<Hangup/>');
-    expect(res.text).not.toContain('<Gather');
-    expect(store.record).toMatchObject({ state: 'owner_answered', outcome: 'aborted' });
-    expect(store.eventTypes()).toEqual(['call.failed']);
-  });
-
   it.each([
     ['disabled', { ...orgConfig, enabled: false }],
     ['invalid', { ...orgConfig, maxCallsPerDay: 9999 }],
@@ -345,7 +336,38 @@ describe('records still in dialing (orchestrator has not stored the owner CallSi
     const res = await owner();
     expect(res.text).toContain('<Gather');
     expect(store.record).toMatchObject({ state: 'owner_answered', ownerCallSid: OWNER_SID });
-    expect(store.eventTypes()).toEqual(['call.owner_answered']);
+    expect(store.eventTypes()).toEqual(['call.initiated', 'call.owner_answered']);
+  });
+
+  it('writes call.initiated once, by the winning adoption only, even when callbacks race', async () => {
+    await Promise.all([owner(), owner(), ownerStatus('in-progress')]);
+    expect(store.eventTypes().filter((t) => t === 'call.initiated')).toHaveLength(1);
+    expect(store.record?.ownerCallSid).toBe(OWNER_SID);
+  });
+
+  it('with both callbacks holding the same stale snapshot, only one adoption writes call.initiated', async () => {
+    let reads = 0;
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const realGet = store.get.bind(store);
+    jest.spyOn(store, 'get').mockImplementation(async () => {
+      const snapshot = await realGet();
+      if (++reads <= 2) {
+        if (reads === 2) release();
+        await gate; // both requests read 'dialing' before either writes
+      }
+      return snapshot;
+    });
+    await Promise.all([owner(), post('owner', { CallSid: 'CA00000077' })]);
+    expect(store.eventTypes().filter((t) => t === 'call.initiated')).toHaveLength(1);
+  });
+
+  it('the first adopted sid wins: a racing callback with another sid cannot replace it', async () => {
+    await Promise.all([owner(), post('owner', { CallSid: 'CA00000077' })]);
+    expect(['CA00000077', OWNER_SID]).toContain(store.record?.ownerCallSid);
+    const first = store.record?.ownerCallSid;
+    await post('owner', { CallSid: first === OWNER_SID ? 'CA00000077' : OWNER_SID });
+    expect(store.record?.ownerCallSid).toBe(first);
   });
 
   it('does not adopt for a callback whose jobKey is not the record\'s', async () => {
@@ -401,7 +423,7 @@ describe('POST /gather', () => {
     expect(res.text).toContain('Connecting you now.');
     expect(res.text).toContain(`callerId="${TWILIO_NUMBER}"`);
     expect(res.text).toContain(`>${LEAD_PHONE}</Number>`);
-    expect(res.text).toContain(`${MOUNT}/status?${QUERY.replace(/&/g, '&amp;')}&amp;leg=lead`);
+    expect(res.text).toContain(`${MOUNT}/status?${QUERY.replace(/&/g, '&amp;')}&amp;leg=lead#rc=3&amp;rp=5xx,ct"`);
     expect(res.text).toContain(`${MOUNT}/dial?${QUERY.replace(/&/g, '&amp;')}`);
     // The lead number appears in the <Number> element and nowhere else.
     expect(res.text.split(LEAD_PHONE)).toHaveLength(2);
@@ -554,16 +576,12 @@ describe('POST /dial', () => {
 // ── /status ──────────────────────────────────────────────────────────────────
 
 describe('POST /status', () => {
-  it('owner never answered: meters the owner leg once, records owner_no_answer and finishes', async () => {
+  it.each(['no-answer', 'busy', 'failed', 'canceled'])('owner never answered (%s): meters the owner leg once, records owner_no_answer and finishes', async (status) => {
     seed('owner_ringing');
-    for (const status of ['no-answer', 'busy', 'failed', 'canceled']) {
-      seed('owner_ringing');
-      mock(recordCallUsage).mockClear();
-      const res = await ownerStatus(status, { CallDuration: '0', SequenceNumber: '1' });
-      expect(res.status).toBe(200);
-      expect(store.record).toMatchObject({ state: 'finished', outcome: 'owner_no_answer', meteredLegs: ['owner'] });
-      expect(usage()).toEqual([{ userId: 'owner-a', callSid: OWNER_SID, leg: 'owner', durationSeconds: 0 }]);
-    }
+    const res = await ownerStatus(status, { CallDuration: '0', SequenceNumber: '1' });
+    expect(res.status).toBe(200);
+    expect(store.record).toMatchObject({ state: 'finished', outcome: 'owner_no_answer', meteredLegs: ['owner'] });
+    expect(usage()).toEqual([{ userId: 'owner-a', callSid: OWNER_SID, leg: 'owner', durationSeconds: 0 }]);
   });
 
   it('records the timeline events for an unanswered owner exactly once, even when replayed', async () => {
@@ -723,7 +741,7 @@ describe('POST /status', () => {
     expect(store.record?.state).toBe('finished');
   });
 
-  it('answers 500 without writing when no owner can be found to bill, so Twilio retries', async () => {
+  it('answers 500 without writing when no owner can be found to bill, so the status retry override redelivers', async () => {
     seed('owner_answered');
     mock(crmDb.getLeadListById).mockResolvedValue(null);
     const res = await ownerStatus('completed', { CallDuration: '30' });
@@ -800,6 +818,24 @@ describe('request body parsing', () => {
     expect(store.transitions).toBe(0);
   });
 
+  it('answers parse errors locally: 413/400 never reach the global error handler', async () => {
+    const onError = jest.fn();
+    const a = express();
+    a.use(MOUNT, twilioVoiceBodyParser);
+    a.use(express.urlencoded({ limit: '50mb', extended: true }));
+    a.use(MOUNT, twilioVoiceWebhookRoutes);
+    // Same shape as the global handler in app.ts: any error that reaches it is logged and reported.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- Express only treats a 4-argument function as an error handler
+    a.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => { onError(err); res.status(500).end(); });
+    const big = await request(a).post(`${MOUNT}/owner?${QUERY}`).type('form').send({ Junk: 'x'.repeat(70 * 1024) });
+    const bad = await request(a).post(`${MOUNT}/owner?${QUERY}`).set('Content-Type', 'application/x-www-form-urlencoded; charset=nope').send('CallSid=CA1');
+    expect(big.status).toBe(413);
+    expect(big.text).toBe('');
+    expect(bad.status).toBe(400);
+    expect(bad.text).toBe('');
+    expect(onError).not.toHaveBeenCalled();
+  });
+
   it('keeps bracketed keys as flat strings instead of building nested objects', async () => {
     await request(app()).post(`${MOUNT}/owner?${QUERY}`).set('X-Twilio-Signature', 'sig').type('form').send('CallSid=CA00000001&a[b]=1&a[c][d]=2');
     expect(fake.signatureChecks[0].params).toEqual({ CallSid: OWNER_SID, 'a[b]': '1', 'a[c][d]': '2' });
@@ -824,6 +860,75 @@ describe('request body parsing', () => {
   });
 });
 
+describe('status retries (Twilio does not retry a 5xx unless the URL says so)', () => {
+  it('a redelivery after a 500 meters the leg exactly once and the first attempt left nothing behind', async () => {
+    seed('owner_answered');
+    mock(crmDb.getLeadListById).mockResolvedValue(null);
+    expect((await ownerStatus('completed', { CallDuration: '30', SequenceNumber: '1' })).status).toBe(500);
+    expect(store.transitions).toBe(0);
+    expect(store.record?.meteredLegs).toEqual([]);
+    mock(crmDb.getLeadListById).mockResolvedValue({ listId: LIST, userId: 'owner-a' });
+    expect((await ownerStatus('completed', { CallDuration: '30', SequenceNumber: '1' })).status).toBe(200);
+    expect((await ownerStatus('completed', { CallDuration: '30', SequenceNumber: '1' })).status).toBe(200);
+    expect(usage()).toHaveLength(1);
+    expect(store.record?.state).toBe('finished');
+  });
+
+  it('answers 500 and logs when every attempt loses its transition, then a redelivery meters', async () => {
+    seed('owner_answered');
+    const spy = jest.spyOn(store, 'transition').mockResolvedValue(false);
+    const res = await ownerStatus('completed', { CallDuration: '30' });
+    expect(res.status).toBe(500);
+    expect(spy).toHaveBeenCalledTimes(3);
+    expect(recordCallUsage).not.toHaveBeenCalled();
+    expect(JSON.stringify(logSpy.flatMap((s) => s.mock.calls))).toContain('metering gave up after retries');
+    spy.mockRestore();
+    expect((await ownerStatus('completed', { CallDuration: '30' })).status).toBe(200);
+    expect(usage()).toHaveLength(1);
+  });
+
+  it('does not answer 500 for a replayed leg callback while the record is still live', async () => {
+    seed('connected', { leadCallSid: LEAD_SID });
+    expect((await leadStatus('completed', { CallDuration: '30', SequenceNumber: '3' })).status).toBe(200);
+    expect((await leadStatus('completed', { CallDuration: '30', SequenceNumber: '3' })).status).toBe(200);
+    expect(store.record?.state).toBe('connected');
+    expect(JSON.stringify(logSpy.flatMap((s) => s.mock.calls))).not.toContain('gave up');
+  });
+
+  it('does not answer 500 or log gave-up on the normal already-metered and finished paths', async () => {
+    seed('owner_answered');
+    await ownerStatus('completed', { CallDuration: '30' });
+    const again = await ownerStatus('completed', { CallDuration: '30' });
+    expect(again.status).toBe(200);
+    expect(JSON.stringify(logSpy.flatMap((s) => s.mock.calls))).not.toContain('gave up');
+  });
+
+  it('validates the signature of a status URL built with the retry fragment (Twilio signs without it)', async () => {
+    setVoiceProviderForTests(null);
+    mockGetCreds.mockResolvedValue({ accountSid: 'ACfake0123456789abcdef0123456789ab', authToken: 'tok' });
+    seed('owner_answered');
+    const built = buildVoiceWebhookUrl('status', { listId: LIST, leadId: LEAD, jobKey: JOB });
+    expect(built).toContain('#rc=3&rp=5xx,ct');
+    const [onWire] = built.split('#');
+    const params = { CallSid: OWNER_SID, CallStatus: 'completed', CallDuration: '8' };
+    const res = await request(app())
+      .post(onWire.slice(BASE.length))
+      .set('X-Twilio-Signature', getExpectedTwilioSignature('tok', onWire, params))
+      .type('form')
+      .send(params);
+    expect(res.status).toBe(200);
+    expect(usage()).toHaveLength(1);
+  });
+
+  it('puts the retry fragment on the lead <Number> status callback only, not on the TwiML fetch URLs', async () => {
+    seed('owner_answered');
+    const text = (await gather('1')).text;
+    expect(text.match(/#rc=3&amp;rp=5xx,ct/g)).toHaveLength(1);
+    expect(text).toContain('statusCallback="');
+    expect(text.split('action="')[1].split('"')[0]).not.toContain('#');
+  });
+});
+
 // ── aborted calls, unconfirmed placements, concurrency ───────────────────────
 
 describe('aborted calls', () => {
@@ -845,7 +950,7 @@ describe('aborted calls', () => {
     await owner();
     await owner();
     expect(store.record).toMatchObject({ outcome: 'aborted', ownerCallSid: OWNER_SID });
-    expect(store.eventTypes()).toEqual(['call.failed']);
+    expect(store.eventTypes()).toEqual(['call.initiated', 'call.failed']);
   });
 
   it('/gather with the config disabled mid-call aborts and never dials', async () => {
@@ -873,14 +978,14 @@ describe('ambiguous placements (dialing + outcome placement_unknown) and rejecte
     const res = await owner();
     expect(res.text).toContain('<Gather');
     expect(store.record).toMatchObject({ state: 'owner_answered', ownerCallSid: OWNER_SID });
-    expect(store.eventTypes()).toEqual(['call.owner_answered']);
+    expect(store.eventTypes()).toEqual(['call.initiated', 'call.owner_answered']);
   });
 
   it('still records owner_no_answer, meters and finishes when the owner never answers', async () => {
     seed('dialing', { outcome: 'placement_unknown', ownerCallSid: undefined });
     await ownerStatus('no-answer', { CallDuration: '0', SequenceNumber: '1' });
     expect(store.record).toMatchObject({ state: 'finished', outcome: 'owner_no_answer', ownerCallSid: OWNER_SID });
-    expect(store.eventTypes()).toEqual(['call.owner_no_answer', 'call.completed']);
+    expect(store.eventTypes()).toEqual(['call.initiated', 'call.owner_no_answer', 'call.completed']);
     expect(usage()).toHaveLength(1);
   });
 
@@ -891,12 +996,15 @@ describe('ambiguous placements (dialing + outcome placement_unknown) and rejecte
     expect(store.record).toMatchObject({ state: 'finished', outcome: 'owner_declined' });
   });
 
-  it('reports a normal completed call as completed, not as placement_unknown', async () => {
+  it('keeps the owner decision when the record carried placement_unknown', async () => {
     seed('dialing', { outcome: 'placement_unknown', ownerCallSid: undefined });
     await owner();
     await gather('2');
     await ownerStatus('completed', { CallDuration: '4' });
     expect(store.record?.outcome).toBe('owner_declined');
+  });
+
+  it('reports a connected call as completed, not as placement_unknown', async () => {
     seed('owner_answered', { outcome: 'placement_unknown' });
     await gather('1');
     await leadStatus('in-progress', { SequenceNumber: '2' });

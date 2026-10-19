@@ -6,12 +6,14 @@
  * /gather bridges to the lead with <Dial><Number> -> /dial reports how the bridge ended. /status
  * receives the per-leg call-progress callbacks and is the ONLY place usage is metered.
  *
- * Every endpoint runs the same guard: credentials loaded (else 503, Twilio retries) -> signature over
+ * Every endpoint runs the same guard: credentials loaded (else 503) -> signature over
  * the URL rebuilt from BACKEND_URL (else 401) -> strict query shape -> record + jobKey + CallSid match.
  * A TwiML endpoint (/owner, /gather, /dial) answers a request that passes the signature but does not
  * belong to a live call with a bare hangup and HTTP 200 (so Twilio does not retry), writing nothing.
  * /status answers such a request with an empty 200; it answers 500 only when a leg ended but no owner
- * can be found to bill (nothing written, so Twilio's retry can still meter it), or on an unexpected error.
+ * can be found to bill or metering lost its race repeatedly (nothing partial is written), or on an unexpected
+ * error. Twilio does NOT retry a 5xx by default, so the status callback URLs carry a retry override (see
+ * voiceUrls.ts); every handler is idempotent on a redelivery (meteredLegs winner rule).
  *
  * Record lifecycle (all moves go through LeadCallStore.transition with explicit `from` sets). The
  * orchestrator creates the record in 'dialing' BEFORE calling Twilio and moves it to owner_ringing
@@ -30,7 +32,7 @@
  */
 
 import express from 'express';
-import type { Request, Response } from 'express';
+import type { Request, RequestHandler, Response } from 'express';
 import { crmDb } from '../services/db';
 import { getVoiceProvider } from '../services/voice/voiceProvider';
 import { voiceWebhookBaseUrl, buildVoiceWebhookUrl, isWebhookSafeId } from '../services/voice/voiceUrls';
@@ -44,14 +46,23 @@ import { allowlistedE164 } from '../services/hotLeadCallConfig';
 import { toE164 } from '../services/whatsappService';
 import { parsePhoneNumberWithError } from 'libphonenumber-js';
 
+const flatFormParser = express.urlencoded({ limit: '64kb', extended: false });
+
 /**
  * Twilio posts small flat form bodies. app.ts mounts this BEFORE the global 50mb extended parser (which
  * skips a body that is already parsed), so this route never accepts a large body or `a[b]=1` nesting.
+ * Parse errors are answered here: left to next(err) they would reach the global error handler, which logs
+ * and reports every unauthenticated bad request.
  */
-export const twilioVoiceBodyParser = express.urlencoded({ limit: '64kb', extended: false });
+export const twilioVoiceBodyParser: RequestHandler = (req, res, next) => {
+  flatFormParser(req, res, (err?: unknown) => {
+    if (!err) return next();
+    const tooLarge = (err as { status?: unknown }).status === 413;
+    res.status(tooLarge ? 413 : 400).end();
+  });
+};
 
 const router = express.Router();
-router.use(twilioVoiceBodyParser);
 
 interface CallQuery {
   listId: string;
@@ -72,6 +83,8 @@ const MAX_TRANSITION_ATTEMPTS = 3;
 
 /** Decisions that do not change `state` are made once per call: see HotLeadCallRecord.lastSequence. */
 const decisionKey = (ownerSid: string, step: 'gather' | 'dial'): string => `${ownerSid}#${step}`;
+/** Marker key for the one-time adoption of the owner CallSid, see withOwnerSid. */
+const ADOPT_MARKER = 'owner#adopt';
 const errorName = (err: unknown): string => (err instanceof Error ? err.name : 'unknown error');
 
 const sendXml = (res: Response, xml: string): void => {
@@ -114,15 +127,19 @@ async function loadRecord(q: CallQuery): Promise<HotLeadCallRecord | null> {
  * Owner-leg callbacks only. While the record is still 'dialing' (the orchestrator's post-call
  * transition has not landed, or failed) the first signed owner-leg callback for this job supplies
  * the owner CallSid. The jobKey was already matched by loadRecord and the signature covers it.
- * A sid is only written when the record we just read has none; two callbacks with different sids can
- * only race inside that window, and the orchestrator's own move out of 'dialing' is atomic, so after
- * this call the caller always compares against whichever sid the re-read shows.
+ * Adoption is first-writer-wins through the `#adopt` decision marker (the store's strictly-higher
+ * condition), so two racing callbacks cannot overwrite each other's sid or both write call.initiated;
+ * after this call the caller compares against whichever sid the re-read shows.
  * A record stuck in 'dialing'/'owner_ringing' (no callback ever) needs an ops cleanup, see header.
  */
 async function withOwnerSid(q: CallQuery, record: HotLeadCallRecord, callSid: string | undefined): Promise<HotLeadCallRecord> {
   if (record.ownerCallSid || record.state !== 'dialing' || !callSid) return record;
   const store = getLeadCallStore();
-  await store.transition(q.listId, q.leadId, ['dialing'], { state: 'dialing', ownerCallSid: callSid });
+  // The orchestrator's own settle is unchanged and loses its transition once the owner answered, so the
+  // call.initiated it would have written is written here, by the winning adoption only.
+  if (await store.transition(q.listId, q.leadId, ['dialing'], { state: 'dialing', ownerCallSid: callSid, lastSequence: { [ADOPT_MARKER]: 1 } })) {
+    await store.addEvent(q.listId, q.leadId, 'call.initiated');
+  }
   return (await store.get(q.listId, q.leadId)) ?? record; // a lost race still shows whichever sid won
 }
 
@@ -147,22 +164,17 @@ interface ErrorReplies {
 function guarded(handler: Handler, replies: ErrorReplies) {
   return async (req: Request, res: Response): Promise<void> => {
     const provider = getVoiceProvider();
-    try {
-      await provider.ensureCredentials();
-    } catch (err) {
-      console.error('[twilio-voice] cannot verify callback:', errorName(err));
-      res.status(503).end(); // cannot verify right now: Twilio retries, nothing is processed
-      return;
-    }
-    const body = paramsOf(req);
     let url: string;
     try {
+      await provider.ensureCredentials();
       url = `${voiceWebhookBaseUrl()}${req.originalUrl}`;
     } catch (err) {
+      // Cannot verify right now, so nothing is processed. Only /status carries a retry override.
       console.error('[twilio-voice] cannot verify callback:', errorName(err));
       res.status(503).end();
       return;
     }
+    const body = paramsOf(req);
     const signature = req.header('X-Twilio-Signature');
     if (!body || !provider.validateSignature({ url, params: body, signature })) {
       res.status(401).end();
@@ -199,7 +211,7 @@ const statusReplies: ErrorReplies = { invalid: ack, failed: serverError };
  */
 async function abortCall(q: CallQuery, record: HotLeadCallRecord, from: HotLeadCallState[]): Promise<void> {
   const store = getLeadCallStore();
-  const decision = record.state === 'owner_answered' ? { [decisionKey(record.ownerCallSid as string, 'gather')]: 1 } : undefined;
+  const decision = record.state === 'owner_answered' && record.ownerCallSid ? { [decisionKey(record.ownerCallSid, 'gather')]: 1 } : undefined;
   if (await store.transition(q.listId, q.leadId, from, { state: 'owner_answered', outcome: 'aborted', lastSequence: decision })) {
     await store.addEvent(q.listId, q.leadId, 'call.failed', { reason: 'aborted' });
   }
@@ -251,7 +263,7 @@ async function leadPhoneFor(q: CallQuery, ctx: HotLeadCallContext): Promise<stri
   if (!allowed) return null;
   try {
     const country = parsePhoneNumberWithError(allowed).country;
-    return country && (ctx.config.allowedCountries as string[]).includes(country) ? allowed : null;
+    return country && ctx.config.allowedCountries.some((c) => c === country) ? allowed : null;
   } catch {
     return null;
   }
@@ -291,7 +303,7 @@ router.post('/gather', guarded(async (_req, res, q, body) => {
     twilioNumber: ctx.config.twilioNumber,
     leadE164,
     dialUrl: buildVoiceWebhookUrl('dial', q),
-    statusUrl: `${buildVoiceWebhookUrl('status', q)}&leg=lead`,
+    statusUrl: buildVoiceWebhookUrl('status', q, { leg: 'lead' }),
   });
   // Only the winner dials the lead; a replayed "1" gets a hangup instead of a second bridge.
   if (!(await store.transition(q.listId, q.leadId, ['owner_answered'], { state: 'bridging', lastSequence: decision }))) return sendHangup(res);
@@ -397,17 +409,18 @@ async function handleProgress(cb: LegCallback, record: HotLeadCallRecord, callSt
 
 /**
  * Terminal status for one leg: record it as metered in ONE transition and bill only if this caller
- * won it. Returns 'no-owner-to-bill' when nothing could be written because nobody can be billed.
+ * won it. Returns 'no-owner-to-bill' when nothing could be written because nobody can be billed, and
+ * 'gave-up' when every attempt lost its transition (the caller answers 5xx so the retry override redelivers).
  */
-async function meterLeg(cb: LegCallback): Promise<'done' | 'no-owner-to-bill'> {
+async function meterLeg(cb: LegCallback): Promise<'done' | 'no-owner-to-bill' | 'gave-up'> {
   const { q, callSid, sequence } = cb;
   const store = getLeadCallStore();
   let billedUserId: string | null | undefined;
   for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt++) {
     const current = await store.get(q.listId, q.leadId);
-    if (!current || current.jobKey !== q.jobKey || !LIVE_STATES.includes(current.state)) break;
-    if ((current.meteredLegs ?? []).includes(q.leg)) break;
-    if (sequence !== undefined && (current.lastSequence?.[callSid] ?? -1) >= sequence) break;
+    if (!current || current.jobKey !== q.jobKey || !LIVE_STATES.includes(current.state)) return 'done';
+    if ((current.meteredLegs ?? []).includes(q.leg)) return 'done';
+    if (sequence !== undefined && (current.lastSequence?.[callSid] ?? -1) >= sequence) return 'done';
 
     if (billedUserId === undefined) billedUserId = await meteringUserId(q.listId, await resolveHotLeadCallContext(q.listId));
     if (!billedUserId) {
@@ -431,9 +444,10 @@ async function meterLeg(cb: LegCallback): Promise<'done' | 'no-owner-to-bill'> {
     } catch (err) {
       console.error('[twilio-voice] metering failed:', errorName(err));
     }
-    break;
+    return 'done';
   }
-  return 'done';
+  console.error('[twilio-voice] metering gave up after retries:', q.leg);
+  return 'gave-up';
 }
 
 router.post('/status', guarded(async (_req, res, q, body) => {
@@ -462,7 +476,8 @@ router.post('/status', guarded(async (_req, res, q, body) => {
     await handleProgress(cb, record, callStatus);
     return ack(res);
   }
-  if ((await meterLeg(cb)) === 'no-owner-to-bill') return serverError(res); // nothing written: Twilio's retry can still meter
+  // Nothing partial is left behind in either case, so the redelivery can still meter the leg.
+  if ((await meterLeg(cb)) !== 'done') return serverError(res);
   // Whichever leg is metered last finishes the call (also heals a crash between the two steps).
   await finishIfComplete(q);
   ack(res);
