@@ -28,7 +28,11 @@ export interface HotLeadCallRecord {
   outcome?: string;
   /** Legs already metered through recordCallUsage, so a replayed status callback cannot meter twice. */
   meteredLegs?: HotLeadCallLeg[];
-  /** Highest Twilio SequenceNumber handled per CallSid, to ignore out-of-order status callbacks. */
+  /**
+   * Highest Twilio SequenceNumber handled per CallSid, to ignore out-of-order status callbacks. It also holds
+   * the voice webhooks' decision markers (`<ownerCallSid>#gather`, `<ownerCallSid>#dial`): the strictly-higher
+   * condition makes the first writer of a decision win, with no extra state or field.
+   */
   lastSequence?: Record<string, number>;
 }
 
