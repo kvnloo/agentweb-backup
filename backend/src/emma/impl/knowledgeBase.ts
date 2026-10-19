@@ -546,6 +546,19 @@ export async function attachKnowledgeBaseFiles(
       };
     }
 
+    // Models sometimes serialize the array as a JSON string.
+    if (typeof files === 'string') {
+      try { files = JSON.parse(files); } catch { /* handled by the array check below */ }
+    }
+
+    if (files && !Array.isArray(files)) {
+      return {
+        success: false,
+        message: 'files must be an array',
+        error: 'Invalid input: files must be an array of {"name": "design.md", "content": "..."} objects'
+      };
+    }
+
     if (!files || files.length === 0) {
       return {
         success: false,
@@ -557,26 +570,23 @@ export async function attachKnowledgeBaseFiles(
     // Models often reuse update_knowledge_base_file's `fileName` key; accept the aliases.
     files = files.map((f: any) => ({
       ...f,
-      name: f?.name ?? f?.fileName ?? f?.file_name ?? f?.filename,
+      name: f?.name || f?.fileName || f?.file_name || f?.filename,
     }));
 
-    for (const f of files) {
+    // `error` (not `message`) is what the model sees on failure, so it must name the fix.
+    for (const [i, f] of files.entries()) {
       if (typeof f.name !== 'string' || f.name.trim().length === 0) {
         return {
           success: false,
-          message: 'Each file needs a "name" (e.g. "design.md") alongside its "content"',
-          error: 'Invalid input: missing file name'
+          message: `File #${i + 1} has no name`,
+          error: `Invalid input: file #${i + 1} is missing "name" - each file must be {"name": "design.md", "content": "..."}`
         };
       }
-    }
-
-    // Validate each file has content
-    for (const f of files) {
-      if (!f.content || f.content.trim().length === 0) {
+      if (typeof f.content !== 'string' || f.content.trim().length === 0) {
         return {
           success: false,
           message: `File "${f.name}" has empty content`,
-          error: 'Invalid input: empty file content'
+          error: `Invalid input: empty file content for "${f.name}" - put the text in a non-empty string "content" field`
         };
       }
     }
