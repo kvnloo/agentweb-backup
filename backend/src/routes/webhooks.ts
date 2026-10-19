@@ -37,7 +37,7 @@ import { handleHardBounceRecipients } from '../services/emailDeliverabilityServi
 import { shouldAttemptCapiSend, isCapiAccountPaused, recordCapiUsage } from '../services/capiSendBudget';
 import { suppressLeadSideEffects, isSessionList, resolveSessionIdentity } from '../utils/sessionList';
 import { getPhoneDedupeMode } from '../utils/phoneLeadDedupeMode';
-import { fillBlankCustomFields, phoneDedupeKey, phoneNamesConflict } from '../utils/phoneLeadDedupe';
+import { fillBlankCustomFields, phoneDedupeKey, phoneNamesConflict, phoneNameSeed } from '../utils/phoneLeadDedupe';
 import { findPhoneMatch } from '../services/phoneLeadMatch';
 import { upsertSessionLead } from '../services/sessionUpsertService';
 
@@ -847,10 +847,17 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       if (!callerSuppliedSource && 'source' in existingCustomFields) {
         mergedCf.source = existingCustomFields.source;
       }
+      // A phone-matched merge must not stamp the DEFAULTED 'api' source onto a row that never had one.
+      if (fillBlanksOnly && !callerSuppliedSource && !('source' in existingCustomFields)) {
+        delete mergedCf.source;
+      }
       if (JSON.stringify(existingCustomFields) !== JSON.stringify(mergedCf)) {
         updates.customFields = mergedCf;
         changed = true;
       }
+
+      // ENG-2123: what the caller's own data changed, before the attribution refresh below flips `changed`.
+      const fieldsChanged = changed;
 
       // Attribution merge (Lead UTM — mirrors the User schema contract).
       // The new-lead path stamps firstTouch+lastTouch via createLead; the merge
@@ -925,7 +932,9 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         // Only a user-visible change makes this an "update". See the ENG-926 §B note above:
         // isUpdated drives sequence enrolment, CRM sync and owner alerts, so a silent
         // metadata backfill deliberately does not set it.
-        isUpdated = changed;
+        // A phone-matched repeat that filled nothing is not an update: the lastTouch refresh is still saved,
+        // but it must not re-run drip enrolment, CRM sync or the owner alert.
+        isUpdated = fillBlanksOnly ? fieldsChanged : changed;
       }
 
       lead = { ...existingLead, ...updates };
@@ -1008,9 +1017,31 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           // ENG-2123: a concurrent submission on the same number that names a DIFFERENT person (a shared
           // household/office line). Merging would overwrite the first person's name and answers with the
           // second's, so keep two rows - exactly what happened before this feature - on an ordinary id.
-          const { phoneUniqueCreate: _separate, ...separateInput } = createInput;
-          lead = await crmDb.createLead(leadList.listId, separateInput, 'form_fill');
-          isNew = true;
+          //
+          // Everyone who names that same other person shares ONE separate row: the id is bucketed on the number
+          // AND the normalized names, so a burst of same-named submissions collapses instead of writing one row each.
+          let separateHandled = false;
+          if (phoneNamesConflict(phoneWinner, leadData)) {
+            try {
+              lead = await crmDb.createLead(leadList.listId, { ...createInput, phoneUniqueIdSeed: phoneNameSeed(leadData) }, 'form_fill');
+              isNew = true;
+              separateHandled = true;
+            } catch (nameErr: any) {
+              if (!(nameErr?.duplicatePhone && nameErr.existingLead)) throw nameErr;
+              const sameName = (await crmDb.getLeadById(leadList.listId, nameErr.existingLead.leadId, { consistentRead: true })) || nameErr.existingLead;
+              if (String(sameName.email ?? '').trim() === '' && phoneDedupeKey(sameName.phone) === phoneKey && !phoneNamesConflict(sameName, leadData)) {
+                mergedCustomFields = incomingCustomFields;
+                leadData.customFields = mergedCustomFields;
+                await mergeIntoExistingLead(sameName, { fillBlanksOnly: true });
+                separateHandled = true;
+              }
+            }
+          }
+          if (!separateHandled) {
+            const { phoneUniqueCreate: _separate, ...separateInput } = createInput;
+            lead = await crmDb.createLead(leadList.listId, separateInput, 'form_fill');
+            isNew = true;
+          }
         } else if ((createErr?.duplicateEmail || createErr?.duplicatePhone) && createErr.existingLead) {
           // The email twin of the case below: getLeadByEmail (eventually-consistent GSI) missed
           // above, but createLead's own pre-check found a row a concurrent submission wrote in

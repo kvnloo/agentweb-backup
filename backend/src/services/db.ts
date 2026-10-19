@@ -6543,6 +6543,9 @@ export const crmDb = {
      *  name different people, create a separate row. Ignored when the caller supplies a leadId, when there is
      *  an email, or for any origin other than form_fill. */
     phoneUniqueCreate?: boolean;
+    /** ENG-2123: with phoneUniqueCreate, narrows the bucketed id to this seed (the normalized names of a row that
+     *  conflicts with the number's first row), so same-named racers collapse onto ONE separate row. */
+    phoneUniqueIdSeed?: string;
   }, origin?: LeadOrigin) {
     try {
       const emailKeyIds: EmailLeadIds | null =
@@ -6558,7 +6561,7 @@ export const crmDb = {
         : '';
       const phoneKeyIds: EmailLeadIds | null =
         leadData.phoneUniqueCreate && phoneKey && !leadData.leadId?.trim() && !emailKeyIds
-          ? phoneLeadIds(listId, phoneKey)
+          ? phoneLeadIds(listId, leadData.phoneUniqueIdSeed ? `${phoneKey}|${leadData.phoneUniqueIdSeed}` : phoneKey)
           : null;
       let leadId = leadData.leadId?.trim() || emailKeyIds?.leadId || phoneKeyIds?.leadId || `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
