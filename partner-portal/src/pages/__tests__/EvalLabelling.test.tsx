@@ -577,6 +577,51 @@ describe("EvalLabelling (ENG-2135)", () => {
       expect(screen.getByText("Session wp-1")).toBeInTheDocument();
     });
 
+    it("a save that finishes after the admin opened another case updates the list but does not move them (#3616 review)", async () => {
+      routeQuick([WP1, WP2]);
+      let resolvePut: (v: unknown) => void = () => undefined;
+      mockedAxios.put.mockImplementationOnce(() => new Promise((r) => { resolvePut = r; }));
+      renderPage();
+      await screen.findByText("Session wp-1");
+      await choose("Quick mode", "task success only");
+
+      fireEvent.keyDown(window, { key: "1" });
+      fireEvent.click(screen.getByText("wp-2"));
+      expect(await screen.findByText("Session wp-2")).toBeInTheDocument();
+
+      resolvePut(savedAs(WP1, { task_success: "pass" }));
+      await waitFor(() => expect(screen.getByTestId("eval-labelling-count")).toHaveTextContent("1 of 2 labelled for task success"));
+      expect(screen.getByText("Session wp-2")).toBeInTheDocument();
+    });
+
+    it("a save that finishes after a surface switch does not bring the old surface's list back (#3616 review)", async () => {
+      const CREATIVE: GoldenCaseView = { ...CASE, caseId: "creative#candidateId#c-1", surface: "creative", taskType: "creative_image", sourceRef: { kind: "candidateId", id: "c-1" }, criteria: ["hook"] };
+      mockedAxios.get.mockImplementation(async (url: string) => {
+        if (url.endsWith("/status")) return { data: { provisioned: true } };
+        if (url.includes("surface=agent")) return { data: { cases: [WP1, WP2] } };
+        if (url.includes("surface=creative")) return { data: { cases: [CREATIVE] } };
+        if (url.includes("chat-sessions")) return { data: { sessions: [{ title: "Session wp-1", messages: [] }] } };
+        if (url.includes("/api/human-eval/candidates/")) return { data: { candidate: { reviewType: "creative_image" } } };
+        throw new Error(`unexpected GET ${url}`);
+      });
+      let resolvePut: (v: unknown) => void = () => undefined;
+      mockedAxios.put.mockImplementationOnce(() => new Promise((r) => { resolvePut = r; }));
+      renderPage();
+      await screen.findByText("Session wp-1");
+      await choose("Quick mode", "task success only");
+
+      fireEvent.keyDown(window, { key: "1" });
+      fireEvent.click(screen.getByRole("tab", { name: "Creatives" }));
+      expect(await screen.findByText("c-1")).toBeInTheDocument();
+
+      resolvePut(savedAs(WP1, { task_success: "pass" }));
+      await waitFor(() => expect(mockedAxios.put).toHaveBeenCalledTimes(1));
+      await new Promise((r) => setTimeout(r, 0));
+      expect(screen.getByText("c-1")).toBeInTheDocument();
+      expect(screen.queryByText("wp-1")).not.toBeInTheDocument();
+      expect(screen.queryByText("wp-2")).not.toBeInTheDocument();
+    });
+
     it("turning quick mode off brings back the full form", async () => {
       routeQuick([WP1]);
       renderPage();
