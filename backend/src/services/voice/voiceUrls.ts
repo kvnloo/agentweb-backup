@@ -1,3 +1,14 @@
+const WEBHOOK_SAFE_ID = /^[A-Za-z0-9_.:-]{1,200}$/;
+
+/**
+ * Whether an id can travel in a webhook query and pass the voice webhooks' strict shape check. The
+ * orchestrator must refuse to place a call for a list/lead/job id that fails this: Twilio would ring
+ * the owner, and every callback would then be rejected.
+ */
+export function isWebhookSafeId(id: string): boolean {
+  return WEBHOOK_SAFE_ID.test(id);
+}
+
 export type VoiceWebhookKind = 'owner' | 'gather' | 'dial' | 'status';
 
 export interface VoiceWebhookContext {
@@ -15,9 +26,17 @@ export interface VoiceWebhookContext {
  * unreachable callback, so every deployed NODE_ENV (production, staging) throws instead.
  */
 export function buildVoiceWebhookUrl(kind: VoiceWebhookKind, ctx: VoiceWebhookContext): string {
-  const base = process.env.BACKEND_URL?.trim().replace(/\/+$/, '') || localhostFallbackOrThrow();
+  const base = voiceWebhookBaseUrl();
   const query = new URLSearchParams({ listId: ctx.listId, leadId: ctx.leadId, jobKey: ctx.jobKey });
   return `${base}/api/webhooks/twilio-voice/${kind}?${query.toString()}`;
+}
+
+/**
+ * The configured public origin, without a trailing slash. The webhook route rebuilds the URL
+ * Twilio signed from this plus the request path, so it never has to trust the Host header.
+ */
+export function voiceWebhookBaseUrl(): string {
+  return process.env.BACKEND_URL?.trim().replace(/\/+$/, '') || localhostFallbackOrThrow();
 }
 
 function localhostFallbackOrThrow(): string {
