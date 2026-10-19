@@ -77,6 +77,7 @@ describe('phoneNameSeed', () => {
     expect(phoneNameSeed({ firstName: ' Ana ', lastName: 'LEE' })).toBe('ana|lee');
     expect(phoneNameSeed({ firstName: 'ana', lastName: ' lee' })).toBe('ana|lee');
     expect(phoneNameSeed({ firstName: 'Ana' })).toBe('ana|');
+    expect(phoneNameSeed({ firstName: '', lastName: '|' })).not.toBe(phoneNameSeed({ firstName: '|', lastName: '' }));
     expect(phoneNameSeed({ firstName: 'Ana', lastName: 'Lee' })).not.toBe(phoneNameSeed({ firstName: 'Bob', lastName: 'Lee' }));
   });
 });

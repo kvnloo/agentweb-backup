@@ -166,8 +166,10 @@ describe('mode create', () => {
     const res = await post({ firstName: 'Ana', company: 'Other', title: 'CEO' });
     expect(createCalls()).toHaveLength(2);
     expect(res.status).toBe(200);
+    expect(res.body.event).toBe('lead.updated');
     expect(crmDb.updateLead).toHaveBeenCalledTimes(1);
     expect((crmDb.updateLead as jest.Mock).mock.calls[0][1]).toBe('lead_ana_row');
+    expect((crmDb.updateLead as jest.Mock).mock.calls[0][2].customFields ?? {}).not.toHaveProperty('forwardedAt');
     expect((crmDb.updateLead as jest.Mock).mock.calls[0][2]).toMatchObject({ title: 'CEO' });
     expect((crmDb.updateLead as jest.Mock).mock.calls[0][2]).not.toHaveProperty('company');
   });
@@ -184,6 +186,17 @@ describe('mode create', () => {
     expect(res.status).toBe(201);
     expect(createCalls()).toHaveLength(3);
     expect(createCalls()[2][1]).not.toHaveProperty('phoneUniqueCreate');
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  it('a non-duplicate error from the name-keyed create is not swallowed (the lander gets the failure, no silent drop)', async () => {
+    setPhoneDedupeModeOverride('create');
+    const bob = existing({ firstName: 'Bob' });
+    (crmDb.createLead as jest.Mock)
+      .mockRejectedValueOnce(Object.assign(new Error('dup'), { duplicatePhone: true, existingLead: bob }))
+      .mockRejectedValueOnce(new Error('boom'));
+    const res = await post({ firstName: 'Ana' });
+    expect(res.status).toBeGreaterThanOrEqual(500);
     expect(crmDb.updateLead).not.toHaveBeenCalled();
   });
 
@@ -407,6 +420,15 @@ describe('a phone-matched repeat that fills nothing is not an update', () => {
     expect(res.body.event).toBe('lead.unchanged');
     expect((crmDb.updateLead as jest.Mock).mock.calls[0][2]).toMatchObject({ lastTouch: expect.anything() });
     expect((crmDb.updateLead as jest.Mock).mock.calls[0][2]).not.toHaveProperty('company');
+  });
+
+  it('on: a repeat that sends NO source does not stamp the defaulted "api" onto a row that has none', async () => {
+    setPhoneDedupeModeOverride('on');
+    withCandidates([existing({ company: 'Acme', customFields: {} })]);
+    const res = await post({ source: undefined, attribution: TOUCH });
+    expect(res.body.event).toBe('lead.unchanged');
+    const sent = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
+    expect(sent.customFields ?? {}).not.toHaveProperty('source');
   });
 
   it('on: a repeat that DOES fill a blank is still reported as lead.updated', async () => {
