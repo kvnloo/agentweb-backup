@@ -7,7 +7,7 @@ import type { HotLeadCallConfig } from './hotLeadCallConfig';
 import { callableLeadPhone } from './hotLeadCallConfig';
 import type { LeadOrigin } from './leadNotificationConfig';
 import { VoiceCallError, getVoiceProvider, scrubErrorText } from './voice/voiceProvider';
-import { buildVoiceWebhookUrl } from './voice/voiceUrls';
+import { buildVoiceWebhookUrl, isWebhookSafeId } from './voice/voiceUrls';
 import { isHotLeadCallEnabled } from './voice/hotLeadCallMode';
 import { resolveHotLeadCallContext, type HotLeadCallContext } from './voice/hotLeadCallContext';
 import { getLeadCallStore } from './voice/leadCallStore';
@@ -41,6 +41,8 @@ const SKIP_GATES: Array<(g: GateInput) => string | null> = [
   // Enabled configs are validated to have one, but the call must never reach create without it: a skip
   // keeps the lead's single call slot unused.
   ({ config }) => (config.twilioNumber ? null : 'no_caller_number'),
+  // The webhooks reject ids outside their strict shape; Twilio would ring the owner and every callback would fail.
+  ({ job }) => (isWebhookSafeId(job.listId) && isWebhookSafeId(job.leadId) ? null : 'unsafe_id'),
   ({ lead, config }) => {
     const callable = callableLeadPhone(lead.phone, config);
     return 'reason' in callable ? callable.reason : null;

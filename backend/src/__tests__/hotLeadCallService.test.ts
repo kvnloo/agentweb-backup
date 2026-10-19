@@ -1,4 +1,5 @@
 jest.mock('../services/db', () => ({
+  ENGAGED_EVENT_KEYWORDS: jest.requireActual('../services/db').ENGAGED_EVENT_KEYWORDS,
   crmDb: { getLeadListById: jest.fn(), getLeadById: jest.fn() },
   userDb: { getUserById: jest.fn() },
   orgDb: { getOrgById: jest.fn() },
@@ -132,6 +133,15 @@ describe('dispatchHotLeadCall gates', () => {
     ['lead without a createdAt', 'too_old', () => { delete lead.createdAt; }],
     ['lead with an unparseable createdAt', 'too_old', () => { lead.createdAt = 'yesterday'; }],
   ];
+  it.each([['@'], ['+'], [' ']])('skips with unsafe_id, before any record, for a lead id containing %j', async (ch) => {
+    const leadId = `lead${ch}1`;
+    lead.leadId = leadId;
+    await dispatchHotLeadCall('list-a', leadId, 'form_fill');
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'unsafe_id' } }]);
+    expect(enqueueCalls()).toHaveLength(0);
+    expect(provider.placedCalls).toHaveLength(0);
+  });
+
   it.each(skipped)('records call.skipped and stops: %s', async (_name, reason, arrange) => {
     arrange();
     await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');

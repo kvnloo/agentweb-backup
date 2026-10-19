@@ -2,8 +2,8 @@ const WEBHOOK_SAFE_ID = /^[A-Za-z0-9_.:-]{1,200}$/;
 
 /**
  * Whether an id can travel in a webhook query and pass the voice webhooks' strict shape check. The
- * orchestrator must refuse to place a call for a list/lead/job id that fails this: Twilio would ring
- * the owner, and every callback would then be rejected.
+ * orchestrator's skip gates refuse a list/lead id that fails this: Twilio would ring the owner, and
+ * every callback would then be rejected (the job key is a hex digest and always passes).
  */
 export function isWebhookSafeId(id: string): boolean {
   return WEBHOOK_SAFE_ID.test(id);
