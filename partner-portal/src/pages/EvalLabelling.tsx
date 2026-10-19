@@ -427,7 +427,7 @@ function isTypingTarget(target: EventTarget | null): boolean {
 }
 
 /** Quick mode: one criterion, saved on a click or a 1 / 2 / 3 keypress; other labels are kept as they are. */
-function QuickLabel({ goldenCase, criterion, token, onSaved }: { goldenCase: GoldenCaseView; criterion: string; token: string | null; onSaved: (saved: GoldenCaseView) => void }) {
+function QuickLabel({ goldenCase, criterion, token, onSaved }: { goldenCase: GoldenCaseView; criterion: string; token: string | null; onSaved: (saved: GoldenCaseView, criterion: string) => void }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // A keypress during a save must not fire a second PUT with the same (now stale) version.
@@ -444,7 +444,7 @@ function QuickLabel({ goldenCase, criterion, token, onSaved }: { goldenCase: Gol
         { labels: { ...goldenCase.labels, [criterion]: value }, notes: goldenCase.notes ?? '', expectedVersion: goldenCase.version },
         { headers: { Authorization: `Bearer ${token}` } },
       );
-      onSaved(withoutDraft(res.data.case));
+      onSaved(withoutDraft(res.data.case), criterion);
     } catch (err) {
       if (axios.isAxiosError(err) && err.response?.status === 409) {
         setError('Someone saved this case after you opened it. Reload the list and label it again.');
@@ -569,12 +569,22 @@ export default function EvalLabelling() {
     if (criterion) setSelectedId((current) => nextUnlabelled(cases, criterion, null) ?? current);
   };
 
-  const onQuickSaved = (saved: GoldenCaseView) => {
-    if (!quickCriterion) return;
+  // A quick save can finish after the admin has moved on (another case, mode or surface); the
+  // response is then merged into the list as it is now, never the list from when the save began.
+  const latest = useRef({ cases, surface, selectedId, quickCriterion });
+  latest.current = { cases, surface, selectedId, quickCriterion };
+
+  const onQuickSaved = (saved: GoldenCaseView, criterion: string) => {
+    const now = latest.current;
+    if (saved.surface !== now.surface) return;
     // Keep the list order while labelling, so "next" walks forward instead of jumping round.
-    const updated = cases.map((c) => (c.caseId === saved.caseId ? saved : c));
-    setCases(updated);
-    setSelectedId(nextUnlabelled(updated, quickCriterion, saved.caseId) ?? saved.caseId);
+    const updated = now.cases.map((c) => (c.caseId === saved.caseId ? saved : c));
+    latest.current = { ...now, cases: updated };
+    setCases((prev) => prev.map((c) => (c.caseId === saved.caseId ? saved : c)));
+    // Advance only if the admin is still on the case that was saved, in the same quick mode.
+    if (now.selectedId === saved.caseId && now.quickCriterion === criterion) {
+      setSelectedId(nextUnlabelled(updated, criterion, saved.caseId) ?? saved.caseId);
+    }
   };
 
   if (!user?.isAdmin) {
