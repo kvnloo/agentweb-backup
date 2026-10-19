@@ -8,13 +8,17 @@
  * Storage is the AW-Settings item `vendor_rate_overrides` (no new table); null
  * removes one override. Auth is per-route like adminV0Credits so mounting this
  * router changes nothing for other /api/admin paths.
+ *
+ * No durable audit history by decision: the applied rate is derivable from an event's
+ * costMicroUsd / quantity (rates have at most 6 decimals, see isValidOverrideRate), and each
+ * change is logged with the admin id and old/new value.
  */
 
 import express, { Response } from "express";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { AuthRequest } from "../types/express";
-import { settingsService } from "../services/settingsService";
+import { Setting, settingsService } from "../services/settingsService";
 import {
   EDITABLE_VENDOR_RATE_PROVIDERS,
   MAX_OVERRIDE_USD_PER_UNIT,
@@ -33,6 +37,7 @@ import {
 const router = express.Router();
 
 const BODY_KEYS = ["provider", "key", "usdPerUnit"];
+const DESCRIPTION = "Admin overrides of provisional vendor spend rates (ENG-2271)";
 const MAX_WRITE_ATTEMPTS = 3;
 
 class ValidationError extends Error {}
@@ -60,7 +65,7 @@ function parseBody(body: unknown): { provider: VendorRateProvider; key: string; 
   }
   if (!isEditableVendorRate(provider, key)) throw new ValidationError(`Unknown rate key "${key}" for ${provider}`);
   if (usdPerUnit !== null && !isValidOverrideRate(usdPerUnit)) {
-    throw new ValidationError(`usdPerUnit must be null or a finite number greater than 0 and at most ${MAX_OVERRIDE_USD_PER_UNIT}`);
+    throw new ValidationError(`usdPerUnit must be null or a finite number from 0.000001 (at most 6 decimal places) to ${MAX_OVERRIDE_USD_PER_UNIT}`);
   }
   return { provider: provider as VendorRateProvider, key, usdPerUnit };
 }
@@ -75,8 +80,41 @@ router.get("/vendor-rates", authenticateToken, isAdmin, async (_req: AuthRequest
   }
 });
 
+type Change = ReturnType<typeof parseBody>;
+
+/** The merged overrides after applying one change; `before` is not mutated. */
+function applyChange(before: VendorRateOverrides, change: Change): VendorRateOverrides {
+  const overrides = structuredClone(before);
+  if (change.usdPerUnit === null) {
+    const block = overrides[change.provider];
+    if (block) {
+      delete block[change.key];
+      if (Object.keys(block).length === 0) delete overrides[change.provider];
+    }
+  } else {
+    (overrides[change.provider] ??= {})[change.key] = change.usdPerUnit;
+  }
+  return overrides;
+}
+
+/** Conditional write; false means another writer got there first (re-read and retry). */
+async function writeOverrides(row: Setting | null, value: string, adminId: string): Promise<boolean> {
+  try {
+    if (row) {
+      await settingsService.setSettingIfValueMatches(VENDOR_RATE_OVERRIDES_SETTING, value, row.settingValue, DESCRIPTION, adminId);
+      return true;
+    }
+    return await settingsService.setSettingIfAbsent(VENDOR_RATE_OVERRIDES_SETTING, value, DESCRIPTION, adminId);
+  } catch (error) {
+    if ((error as { code?: string })?.code === "ConditionalCheckFailedException") return false;
+    throw error;
+  }
+}
+
+const jitter = () => new Promise<void>((r) => setTimeout(r, 20 + Math.random() * 60));
+
 router.put("/vendor-rates", authenticateToken, isAdmin, async (req: AuthRequest, res: Response) => {
-  let change: ReturnType<typeof parseBody>;
+  let change: Change;
   try {
     change = parseBody(req.body);
   } catch (error) {
@@ -87,43 +125,19 @@ router.put("/vendor-rates", authenticateToken, isAdmin, async (req: AuthRequest,
 
   try {
     // Read-modify-write guarded by the exact raw value read (optimistic concurrency), so two
-    // admins editing different keys cannot silently drop each other's change.
+    // admins editing different keys cannot silently drop each other's change. A short jittered
+    // pause between attempts keeps two quick PUTs from the UI from colliding again.
     for (let attempt = 0; attempt < MAX_WRITE_ATTEMPTS; attempt++) {
+      if (attempt > 0) await jitter();
       const row = await settingsService.getSetting(VENDOR_RATE_OVERRIDES_SETTING);
       const before = parseVendorRateOverrides(row?.settingValue);
-      const overrides: VendorRateOverrides = {};
-      for (const [p, entries] of Object.entries(before.overrides)) {
-        overrides[p as VendorRateProvider] = { ...entries };
-      }
-      const oldValue = overrides[change.provider]?.[change.key] ?? null;
-      if (change.usdPerUnit === null) {
-        const block = overrides[change.provider];
-        if (block) {
-          delete block[change.key];
-          if (Object.keys(block).length === 0) delete overrides[change.provider];
-        }
-      } else {
-        (overrides[change.provider] ??= {})[change.key] = change.usdPerUnit;
-      }
-
-      const updatedAt = new Date().toISOString();
-      const value = JSON.stringify({ overrides, updatedAt, updatedBy: adminId });
-      const description = "Admin overrides of provisional vendor spend rates (ENG-2271)";
-      try {
-        if (row) {
-          await settingsService.setSettingIfValueMatches(
-            VENDOR_RATE_OVERRIDES_SETTING, value, row.settingValue, description, adminId,
-          );
-        } else if (!(await settingsService.setSettingIfAbsent(VENDOR_RATE_OVERRIDES_SETTING, value, description, adminId))) {
-          continue;
-        }
-      } catch (error) {
-        if ((error as { code?: string })?.code === "ConditionalCheckFailedException") continue;
-        throw error;
-      }
+      const overrides = applyChange(before.overrides, change);
+      const value = JSON.stringify({ overrides, updatedAt: new Date().toISOString(), updatedBy: adminId });
+      if (!(await writeOverrides(row, value, adminId))) continue;
 
       console.info(
-        `[adminVendorRates] admin=${adminId} ${change.provider}:${change.key} ${oldValue} -> ${change.usdPerUnit}`,
+        `[adminVendorRates] admin=${adminId} ${change.provider}:${change.key} ` +
+          `${before.overrides[change.provider]?.[change.key] ?? null} -> ${change.usdPerUnit}`,
       );
       // Parse what was written so this instance applies exactly the persisted state at once;
       // other instances pick it up within the cache TTL.

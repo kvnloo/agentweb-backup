@@ -103,6 +103,11 @@ describe('PUT /vendor-rates validation', () => {
     ['unknown key', { key: 'made_up' }],
     ['prototype key', { key: 'toString' }],
     ['zero', { usdPerUnit: 0 }],
+    ['7 decimal places', { usdPerUnit: 0.0000001 }],
+    ['exponent below 1e-6', { usdPerUnit: 1e-7 }],
+    ['denormal', { usdPerUnit: 5e-324 }],
+    ['sub-micro tail', { usdPerUnit: 0.0140004 }],
+    ['just above the cap', { usdPerUnit: 1000.000001 }],
     ['negative', { usdPerUnit: -0.01 }],
     ['above 1000', { usdPerUnit: 1000.5 }],
     ['string rate', { usdPerUnit: '0.02' }],
@@ -128,8 +133,8 @@ describe('PUT /vendor-rates validation', () => {
     expect((await as(request(app).put(URL)).send([ok])).status).toBe(400);
   });
 
-  it('accepts the 1000 upper bound', async () => {
-    expect((await as(request(app).put(URL)).send({ ...ok, usdPerUnit: 1000 })).status).toBe(200);
+  it.each([1000, 0.000001, 0.014])('accepts %s', async (v) => {
+    expect((await as(request(app).put(URL)).send({ ...ok, usdPerUnit: v })).status).toBe(200);
   });
 });
 
@@ -169,6 +174,25 @@ describe('PUT /vendor-rates writes', () => {
     expect(res.body.version).toBe(VENDOR_RATE_CARD_VERSION);
     expect(res.body.rates[0]).toMatchObject({ overrideUsdPerUnit: null, effectiveUsdPerUnit: 0.014 });
     expect(getAllocatedRate('twilio', 'voice_minute_outbound')).toBe(0.014);
+  });
+
+  it('pauses briefly between attempts so quick successive PUTs do not collide again', async () => {
+    mockGet.mockResolvedValue(row({}));
+    mockIfMatches
+      .mockRejectedValueOnce(Object.assign(new Error('x'), { code: 'ConditionalCheckFailedException' }))
+      .mockResolvedValueOnce(undefined);
+    const timeouts = jest.spyOn(global, 'setTimeout');
+    const res = await as(request(app).put(URL)).send(set);
+    expect(res.status).toBe(200);
+    const delays = timeouts.mock.calls.map((c) => c[1]).filter((d): d is number => typeof d === 'number' && d >= 20 && d <= 80);
+    expect(delays).toHaveLength(1);
+  });
+
+  it('GET after the last override was removed still shows who and when', async () => {
+    mockGet.mockResolvedValue(row({}, '2026-11-03T00:00:00.000Z'));
+    const res = await as(request(app).get(URL));
+    expect(res.body).toMatchObject({ version: VENDOR_RATE_CARD_VERSION, updatedAt: '2026-11-03T00:00:00.000Z', updatedBy: 'admin-1' });
+    expect(res.body.rates[0].overrideUsdPerUnit).toBeNull();
   });
 
   it('retries on a lost race and re-merges from the fresh read', async () => {
