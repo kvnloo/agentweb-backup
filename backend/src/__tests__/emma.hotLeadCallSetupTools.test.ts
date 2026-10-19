@@ -237,7 +237,7 @@ describe('provision_hot_lead_call_number', () => {
     setTime(T0 + 5 * MIN);
     await expect(provision()).rejects.toThrow('limit of 2 number purchases per day');
     expect(fake.boughtNumbers).toHaveLength(2);
-    expect(org.hotLeadCallProvisioning!.purchases).toEqual([T0, T0 + MIN]);
+    expect((org.hotLeadCallProvisioning as { purchases: number[] }).purchases).toEqual([T0, T0 + MIN]);
     setTime(T0 + 24 * 60 * MIN - 1);
     await expect(provision()).rejects.toThrow('limit of 2');
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
@@ -248,7 +248,7 @@ describe('provision_hot_lead_call_number', () => {
   it('a failed purchase still uses a reservation, and a malformed history fails closed', async () => {
     fake.failNextBuyNumber('no');
     await expect(provision()).rejects.toThrow('nothing was bought');
-    expect(org.hotLeadCallProvisioning!.purchases).toEqual([T0]);
+    expect((org.hotLeadCallProvisioning as { purchases: number[] }).purchases).toEqual([T0]);
     org.hotLeadCallProvisioning = { purchases: 'x', releases: [] } as never;
     await expect(provision()).rejects.toThrow('Contact support');
     expect(fake.boughtNumbers).toHaveLength(1);
