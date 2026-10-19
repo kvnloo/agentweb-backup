@@ -414,6 +414,44 @@ describe("claude adapter: a turn", () => {
     expect(closed).toBe(true);
   });
 
+  it("a close() that arrives while the turn's process is being stopped still waits for the auth check, which then does not run at all", async () => {
+    const e = makeEnv();
+    e.scenario({ turn: [{ type: "result", subtype: "error", is_error: true, result: "Not logged in · Please run /login" }], status: { loggedIn: false } });
+    let session!: ProviderSession;
+    let closeFromKill: Promise<void> | undefined;
+    let statusRuns = 0;
+    const ctx: AdapterContext = {
+      ...e.ctx,
+      spawnAs: (spec) => {
+        if (spec.args.includes("status")) statusRuns++;
+        const child = localSpawn(spec);
+        return {
+          ...child,
+          kill: () => {
+            if (spec.file === WRAPPER) closeFromKill ??= session.close(); // the host closes the session exactly while the turn's process is being stopped
+            child.kill();
+          },
+        };
+      },
+    };
+    session = await makeAdapter(e.unitTmp).openSession(ctx, { connectionId: "conn1", epoch: 1 });
+    const events = await collect(session);
+    await session.closed;
+    expect(statusRuns).toBe(0); // a close had begun while the process was being stopped: no check process was spawned after it (it would have run beside the next turn)
+    expect(events[events.length - 1]).toMatchObject({ type: "result", ok: false, errorKind: "transient" }); // uncertainty never parks a login
+  });
+
+  it("a status check whose kill keeps failing does not hang the caller beyond the kill wait", async () => {
+    const e = makeEnv();
+    e.scenario({ statusHang: true });
+    const ctx: AdapterContext = { ...e.ctx, spawnAs: (spec) => ({ ...localSpawn(spec), kill: () => { throw new Error("EPERM"); } }) };
+    const t0 = Date.now();
+    const a = makeAdapter(e.unitTmp, { authConfirmTimeoutMs: 300, killWaitMs: 400 });
+    await expect(a.confirmLoggedOut(ctx)).resolves.toBe("transient");
+    expect(Date.now() - t0).toBeLessThan(2500);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(600); // 300 ms timeout + the 400 ms kill wait: it waited for the exit before giving up
+  });
+
   it("a kill that keeps failing cannot hang the turn: the result still arrives (bounded stop), and `closed` honestly stays pending", async () => {
     const e = makeEnv();
     e.scenario({ turn: [{ type: "result", subtype: "error", is_error: true, result: "Not logged in · Please run /login" }], status: { loggedIn: false } });

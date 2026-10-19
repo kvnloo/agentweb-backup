@@ -267,6 +267,47 @@ describe("a hung turn that shares its uid with a live sibling", () => {
     expect(await code(rig.mgr.runTurn(nextTurn("c1", 1)))).toBe("OK");
   });
 
+  it("the kill guard outlives the bounded wait: while the port's own kill is still running turns stay refused; a port that never answers cannot make the connection busy forever", async () => {
+    rig = makeRig({ adapter: { singleUse: true }, config: { portCallTimeoutMs: 40 } });
+    await signIn(rig, "c1", 1);
+    const uid = rig.store.get().connections.c1.uid;
+    const priv = rig.mgr as unknown as { killGuarded(id: string, uid: number): Promise<void> };
+    let releaseKill!: () => void;
+    rig.fs.killGate = new Promise<void>((r) => (releaseKill = r));
+    await priv.killGuarded("c1", uid).catch(() => undefined); // returns (rejecting) when the bounded wait (40 ms) gives up, while killAll is still pending
+    expect(await code(rig.mgr.runTurn(nextTurn("c1", 1)))).toBe("EBUSY:connection_busy"); // the kill is STILL running: no new process may start
+    releaseKill();
+    await flush();
+    expect(await code(rig.mgr.runTurn(nextTurn("c1", 1)))).toBe("OK"); // released the moment the real kill settled
+    // a kill that never settles: released by the hard backstop (10 x the port timeout)
+    rig.fs.killGate = new Promise<void>(() => undefined);
+    await priv.killGuarded("c1", uid).catch(() => undefined);
+    expect(await code(rig.mgr.runTurn(nextTurn("c1", 1)))).toBe("EBUSY:connection_busy");
+    await new Promise((r) => setTimeout(r, 500));
+    expect(await code(rig.mgr.runTurn(nextTurn("c1", 1)))).toBe("OK");
+  });
+
+  it("a hung turn never kills a uid its connection no longer owns (after a reconnect the old uid belongs to the wipe queue, and may be someone else's)", async () => {
+    rig = makeRig({ adapter: { singleUse: true }, config: { abortGraceMs: 500, adapterCallTimeoutMs: 60, portCallTimeoutMs: 60 } }); // the grace is long: the hung path runs AFTER the swap and the sweep freed the old uid
+    await signIn(rig, "c1", 1);
+    const oldUid = rig.store.get().connections.c1.uid;
+    rig.script.hangTurn = true;
+    rig.script.closeGate = new Promise<void>(() => undefined);
+    const hung = nextTurn("c1", 1);
+    const hOut = drain((await rig.mgr.runTurn(hung)).events!);
+    await flush();
+    // reconnect: the hung turn is aborted, the old uid goes to the wipe queue and is wiped (killed) by the swap itself
+    const start = await rig.mgr.loginStart({ connectionId: "c1", provider: "fake", reconnect: true });
+    await rig.mgr.loginComplete({ connectionId: "c1", loginRef: start.loginRef, code: "abcdefgh#12345678" });
+    await rig.mgr.loginPromote({ connectionId: "c1", loginRef: start.loginRef, epoch: 2 });
+    await rig.mgr.sweep();
+    const killsOfOldUid = () => rig.fs.killed.filter((u) => u === oldUid).length;
+    const before = killsOfOldUid();
+    expect(rig.store.get().uidOwners[String(oldUid)]).toBeUndefined(); // freed: it could belong to anyone now
+    await hOut; // the grace period passes, the hung path runs
+    expect(killsOfOldUid()).toBe(before); // the hung-turn path did not signal it
+  });
+
   it("disabling the connection clears a pending deferred kill (it must not fire at some unrelated later retire)", async () => {
     rig = makeRig({ adapter: { singleUse: true } });
     await signIn(rig, "c1", 1);

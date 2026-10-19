@@ -227,9 +227,14 @@ export class ConnectionManager {
   }
 
   /** Kill every process of a uid, but never with a value outside the reserved range (-1 would mean "everything" to kill(2)). */
-  private async safeKill(uid: number): Promise<boolean> {
+  /** `onRaw` receives the port's own promise, so a caller can keep a guard until the REAL kill settles (the bounded wait may give up first). */
+  private async safeKill(uid: number, onRaw?: (raw: Promise<void>) => void): Promise<boolean> {
     if (!Number.isInteger(uid) || uid < this.cfg.uidMin || uid > this.cfg.uidMax) return false;
-    await this.f("killAll", () => this.deps.fs.killAll(uid));
+    await this.f("killAll", () => {
+      const raw = (async () => this.deps.fs.killAll(uid))(); // starts synchronously (as before), and a synchronous throw becomes a rejection
+      onRaw?.(raw);
+      return raw;
+    });
     return true;
   }
 
@@ -584,10 +589,14 @@ export class ConnectionManager {
     } else {
       this.retireSession(session);
       void closing;
-      try {
-        await this.killGuarded(c.connectionId, running.uid);
-      } catch {
-        /* the sweeper retries */
+      // Only a uid this connection STILL owns: after a reconnect the old uid belongs to the wipe queue (which kills it) and may by now
+      // be free or allocated to someone else, whose processes must never be touched.
+      if (this.uids.ownerOf(running.uid) === c.connectionId) {
+        try {
+          await this.killGuarded(c.connectionId, running.uid);
+        } catch {
+          /* the sweeper retries */
+        }
       }
     }
     this.log.warn("provider_hung", { connectionId: c.connectionId });
@@ -966,12 +975,25 @@ export class ConnectionManager {
   /** Kills a uid's processes while refusing new turns on that connection, so the kill cannot hit a process started after it began. */
   private async killGuarded(connectionId: string, uid: number): Promise<void> {
     this.killsInFlight.set(connectionId, (this.killsInFlight.get(connectionId) ?? 0) + 1);
-    try {
-      await this.safeKill(uid);
-    } finally {
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
       const n = (this.killsInFlight.get(connectionId) ?? 1) - 1;
       if (n <= 0) this.killsInFlight.delete(connectionId);
       else this.killsInFlight.set(connectionId, n);
+    };
+    let raw: Promise<void> | undefined;
+    try {
+      await this.safeKill(uid, (p) => (raw = p));
+    } finally {
+      // The bounded wait may have given up while the port's kill is still running: keep refusing turns until it really settles,
+      // with a hard backstop so a port that never answers cannot leave the connection busy forever.
+      if (raw) {
+        void raw.then(release, release);
+        const backstop = setTimeout(release, this.cfg.portCallTimeoutMs * 10);
+        backstop.unref?.();
+      } else release();
     }
   }
 

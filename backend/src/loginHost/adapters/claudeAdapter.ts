@@ -250,10 +250,13 @@ export class ClaudeAdapter implements SubscriptionProviderAdapter {
       }
       let output = "";
       let settled = false;
-      const finish = (code: number | null, timedOut: boolean) => {
+      let timedOut = false;
+      let killTimer: NodeJS.Timeout | undefined;
+      const finish = (code: number | null) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (killTimer) clearTimeout(killTimer);
         resolve({ code, timedOut, output });
       };
       const onData = (chunk: Buffer) => {
@@ -263,15 +266,18 @@ export class ClaudeAdapter implements SubscriptionProviderAdapter {
       child.stderr.on("data", onData);
       child.stdin.on("error", () => undefined);
       child.stdin.end();
-      child.onExit((code) => finish(code, false));
-      child.onError?.(() => finish(null, false));
+      child.onExit((code) => finish(code));
+      child.onError?.(() => finish(null));
       const timer = setTimeout(() => {
+        timedOut = true;
         try {
           child.kill();
         } catch {
           /* already gone */
         }
-        finish(null, true);
+        // Resolve when the process is really gone; give up after the kill wait if it is not (a failing kill must not hang the caller).
+        killTimer = setTimeout(() => finish(null), this.cfg.killWaitMs);
+        killTimer.unref?.();
       }, timeoutMs);
       timer.unref?.();
     });
@@ -536,9 +542,17 @@ class ClaudeSession implements ProviderSession {
       const cls = classifyFailureText(result.resultText);
       let errorKind: ErrorKind = failureClassToKind(cls);
       if (cls === "auth_like") {
-        await this.stopProcess(); // the turn's process is gone first: the confirmation must not run beside it (one process per cap slot)
-        // `closed` (which frees the cap slot) waits for this check, so the slot is held while the check's own process runs.
-        const confirmation = this.adapter.confirmLoggedOut(this.ctx);
+        // (The `closing` skip below already makes the early assignment redundant for a close that arrives during the stop: no check is
+        // spawned then. It stays as a second guard: `closed` must never be able to resolve before a check that does run.)
+        // `confirming` is set BEFORE any await: a close() arriving while the turn's process is being stopped must find it and
+        // wait (`closed` frees the cap slot, so it may not resolve before the check's own process has finished). If a close has
+        // already begun, nothing is spawned at all.
+        const confirmation: Promise<ErrorKind> = this.closing
+          ? Promise.resolve("transient")
+          : (async () => {
+              await this.stopProcess(); // the turn's process is gone first: the check must not run beside it (one process per cap slot)
+              return this.closing ? "transient" : await this.adapter.confirmLoggedOut(this.ctx);
+            })();
         this.confirming = confirmation;
         errorKind = await confirmation;
       }
