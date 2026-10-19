@@ -24,6 +24,7 @@ import { CrmSender } from './crmSenderTypes';
 import { settingsService } from './settingsService';
 import { v4 as uuidv4 } from 'uuid';
 import { isSuspectedMachineEngagement } from './machineEngagement';
+import { selectEngagementExitTrigger } from './dripEngagementExit';
 
 // Identifies this process for the claimedBy field — mirrors
 // socialEngagementExecutor.ts's INSTANCE_ID, used for log correlation only.
@@ -515,17 +516,20 @@ async function checkExitConditions(
       // count — better to keep sending than to silently kill a live sequence.
       const enrolledAt = new Date(enrollment.enrolledAt).getTime();
       const wanted = exitConditions.onEmailEngagement;
-      const trigger = events.find((e: any) => {
-        const at = e.createdAt ? new Date(e.createdAt).getTime() : NaN;
-        if (!Number.isFinite(at) || at <= enrolledAt) return false;
-
-        if (wanted.includes('opened') && e.eventType === 'email.opened') return true;
-        if (wanted.includes('clicked') && e.eventType === 'email.clicked') return true;
-        // An inbound reply is stored as email.received, with leadEmail set to the SENDER
-        // (i.e. the lead) — see emailEventsDb.extractLeadEmail.
-        if (wanted.includes('replied') && e.eventType === 'email.received') return true;
-        return false;
-      });
+      // ENG-2548: opens/clicks go through dripEngagementClassifier — link scanners and
+      // image proxies no longer exit a lead. Replies always count.
+      const { trigger, suppressed } = selectEngagementExitTrigger(events, enrolledAt, wanted);
+      for (const s of suppressed) {
+        const detail = s.event?.data?.click || s.event?.data?.open || {};
+        console.warn('[dripWorker] suspected_machine_engagement', JSON.stringify({
+          enrollmentId: enrollment.enrollmentId,
+          sequenceId: enrollment.sequenceId,
+          eventType: s.event?.eventType,
+          reason: s.reason,
+          exitSuppressed: true,
+          userAgent: detail.userAgent || null,
+        }));
+      }
 
       if (trigger) {
         // Name the exact event that caused this, and carry the two fields that would expose
