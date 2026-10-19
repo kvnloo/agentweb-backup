@@ -21,27 +21,42 @@ admits (`reason: 'payg_overage'`, `full_choice`) only when the switch is on, the
 `has_payment_method === true`, `subscription_status` is active/trialing, and overage < cap. Anything
 missing keeps the 429. A non-opted account never reads the switch or writes anything.
 
+**How overage and the cap are measured.**
+- The month's pool = `max(today's effective threshold after credits, poolHighWater for this UTC month)`.
+  The high-water mark is written by the gate only when it rises (conditional write) and only for
+  opted-in accounts, so a downgrade AFTER opting in never creates retroactive overage.
+- Only usage after opting in is overage: the PUT that turns PAYG on (off -> on) records
+  `optIn: { month, overageBaselineMicroUsd }` = the overage standing at that moment (same pool measure as
+  the gates), subtracted for that month only. This covers a downgrade BEFORE opting in, when no
+  high-water mark was kept.
+- The cap is stored as `capPercentOfPool` only (25|50|100|200) and re-derived every check as percent x
+  the month's pool, so "50% of your plan" stays true across top-ups, plan changes and months. No
+  micro-USD cap is stored.
+
 **Data (additive, optional; no table/index).**
-- AW-Users (billing owner) `paygOverage`: `{ enabled, capPercentOfPool: 25|50|100|200, capMicroUsd,
-  poolHighWater?: { month, thresholdMicroUsd }, enabledBy, updatedAt, version, suspended?: { reason:
-  'payment_failed'|'dispute', at, invoiceId? } }`. `capMicroUsd` is frozen at set time (percent x the
-  effective pool after credits). Settings writes are field-by-field and conditional on `version`;
-  `poolHighWater` is written by the gate only when it rises (conditional on the stored mark being lower)
-  and only for opted-in accounts. Overage is measured above `max(today's pool, this month's high-water)`,
-  so a mid-month downgrade never creates retroactive overage. High-water month is UTC
-  (`getCurrentUsageMonth`).
-- `subscription_types` tier `paygOverage: { allowed, markupBps }`. Admin save (`routes/admin.ts`) and GET
-  both carry it; `markupBps` defaults to the tier's `llmUsageTopUp.minimumMarkupBps` and is required when
-  there is none. The partner-portal tier editor has no fields for it yet and preserves it on save.
+- AW-Users (billing owner) `paygOverage`: `{ enabled, capPercentOfPool, poolHighWater?: { month,
+  thresholdMicroUsd }, optIn?: { month, overageBaselineMicroUsd }, updatedBy, updatedAt, version,
+  suspended?: { reason: 'payment_failed'|'dispute', at, invoiceId? } }`. Settings writes are field-by-field
+  and conditional on `version`. `sanitizeUserForResponse` (/api/auth/me etc.) projects it to
+  `{ enabled, capPercentOfPool }`.
+- `subscription_types` tier `paygOverage: { allowed, markupBps? }`. Admin save (`routes/admin.ts`) and
+  GET both carry it; `markupBps` defaults to the tier's `llmUsageTopUp.minimumMarkupBps` and is required
+  only when `allowed: true`. The partner-portal tier editor has no fields for it yet and preserves it.
 
 **API.** `GET/PUT /api/subscription/payg` (same auth as `/usage`). Percentages only — no dollars.
-PUT errors: 404 `payg_unavailable`, 403 `not_billing_owner`, 400 `invalid_request`, 422 `invalid_cap`,
-409 `payment_method_required` (live Stripe check on enabling), 503 `payment_check_unavailable`,
-409 `payg_conflict` (version moved). Disabling never calls Stripe and is allowed even if the tier stops
-offering PAYG.
+PUT errors (`{ error: <code> }`): 404 `payg_unavailable`, 403 `not_billing_owner`, 403
+`delegate_cannot_consent` (a delegated admin may turn PAYG off or lower the cap, never turn it on or raise
+it), 400 `invalid_request`, 422 `invalid_cap`, 409 `payment_method_required` (live Stripe check on
+enabling), 503 `payment_check_unavailable`, 409 `payg_conflict` (version moved). Disabling never calls
+Stripe and is allowed even if the tier stops offering PAYG.
 
-**429 copy.** `usageBlock.reason` (`payg_cap_reached` | `payg_suspended`) is added only for those blocks;
-`code: 'usage_paused'` is unchanged everywhere.
+**429 / runway copy.** `usageBlock.reason` is added only for PAYG's own blocks: `payg_cap_reached`,
+`payg_suspended`, `payg_inactive` (+ `usageBlock.paygInactiveReason`: `no_payment_method` |
+`subscription_inactive`). `code: 'usage_paused'` is unchanged everywhere. The scheduled-chat run result
+and the token-limit email name the PAYG reason instead of a >100% plan figure. While PAYG is admitting,
+`/usage-runway` returns `paygCovering: true` and withholds the exhaustion forecast (`onTrack`,
+`estimatedDaysRemaining`, `estimatedExhaustionDate` null).
 
-**Known gap.** `getCurrentMonth()` in tokenUsageService is still local time (UTC on the fleet, so no
-effect today); it was left alone.
+**Known gaps.** `getCurrentMonth()` in tokenUsageService is still local time (UTC on the fleet, so no
+effect today); left alone. `sanitizeUserForResponse` still passes `llmUsageCredits` (micro-USD) through —
+pre-existing, not changed here.
