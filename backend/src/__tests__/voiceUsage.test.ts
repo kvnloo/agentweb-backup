@@ -59,10 +59,11 @@ describe('recordCallUsage', () => {
     expect(mockRecord).not.toHaveBeenCalled();
   });
 
-  it('never throws into the caller when the recorder rejects', async () => {
-    const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
-    mockRecord.mockRejectedValue(new Error('ddb down'));
-    await expect(recordCallUsage({ ...base, durationSeconds: 10 })).resolves.toBeUndefined();
+  it('skips and warns on a non-finite duration instead of metering garbage', async () => {
+    const spy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    await recordCallUsage({ ...base, durationSeconds: NaN });
+    expect(mockRecord).not.toHaveBeenCalled();
+    expect(spy).toHaveBeenCalledTimes(1);
     spy.mockRestore();
   });
 

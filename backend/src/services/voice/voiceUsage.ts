@@ -26,24 +26,23 @@ export function billableMinutes(durationSeconds: number): number {
  * never-throw boundary rather than failing the call flow.
  */
 export async function recordCallUsage(usage: CallUsage): Promise<void> {
-  const quantity = billableMinutes(usage.durationSeconds);
-  // An unanswered leg has no duration and bills nothing.
-  if (quantity === 0) return;
-  try {
-    await recordVendorUsage({
-      userId: usage.userId,
-      provider: 'twilio',
-      operation: 'voice_minute_outbound',
-      feature: 'hot_lead_call',
-      unit: 'minute',
-      quantity,
-      rateKey: 'voice_minute_outbound',
-      idempotencyKey: `twilio:voice:${usage.callSid}:${usage.leg}`,
-    });
-  } catch (error) {
-    console.error(
-      'voiceUsage: failed to meter call leg (call unaffected):',
-      error instanceof Error ? error.message : error,
-    );
+  // A missing or garbled duration on an answered leg would silently undercharge,
+  // so say so; a plain 0 is an unanswered leg and bills nothing.
+  if (!Number.isFinite(usage.durationSeconds)) {
+    console.warn('voiceUsage: non-finite call duration, leg not metered:', usage.leg);
+    return;
   }
+  const quantity = billableMinutes(usage.durationSeconds);
+  if (quantity === 0) return;
+  // recordVendorUsage owns the never-throw boundary, so no wrapper here.
+  await recordVendorUsage({
+    userId: usage.userId,
+    provider: 'twilio',
+    operation: 'voice_minute_outbound',
+    feature: 'hot_lead_call',
+    unit: 'minute',
+    quantity,
+    rateKey: 'voice_minute_outbound',
+    idempotencyKey: `twilio:voice:${usage.callSid}:${usage.leg}`,
+  });
 }
