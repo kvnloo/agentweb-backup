@@ -126,17 +126,26 @@ describe('update_hot_lead_call_settings', () => {
     await expect(update({ quietHours })).rejects.toThrow('quietHours must be an object');
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
-  it.each(['UTC', 'Mars/Olympus', 'AMERICA/CHICAGO', 'Etc/UTC', 'America/Los_ANGELES'])('names the timezone problem for %s', async timezone => {
+  it.each(['UTC', 'Mars/Olympus', 'Etc/UTC', '+05:00'])('names the timezone problem for %s', async timezone => {
     await expect(update({ quietHours: { timezone } })).rejects.toThrow(/timezone must be an IANA Area\/Location name such as America\/Chicago/);
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
+  it('stores and echoes the normalised timezone, and re-sending the stored zone in another case still writes cleanly', async () => {
+    const result = await update({ quietHours: { timezone: 'AMERICA/CHICAGO' } });
+    expect(result.quietHours).toMatchObject({ timezone: 'America/Chicago' });
+    expect(lastWrite()[1].hotLeadCall.quietHours.timezone).toBe('America/Chicago');
+    expect(lastWrite()[2].condition.values[':previousHotLeadCall']).toEqual(stored());
+    jest.clearAllMocks();
+    await update({ quietHours: { timezone: 'US/Eastern' } });
+    expect(lastWrite()[1].hotLeadCall.quietHours.timezone).toBe('America/New_York');
+  });
   it('accepts a valid timezone change and describes quiet hours and territory limits', async () => {
     await update({ quietHours: { timezone: 'America/Indiana/Indianapolis' } });
-    expect(lastWrite()[1].hotLeadCall.quietHours.timezone).toBe('America/Indiana/Indianapolis');
+    expect(lastWrite()[1].hotLeadCall.quietHours.timezone).toBe('America/Indianapolis');
     const def = handlers.get('update_hot_lead_call_settings')!.definition;
     expect(def.description).toMatch(/wraps past midnight/);
     expect(def.description).toMatch(/Puerto Rico/);
-    expect(def.description).toMatch(/IANA Area\/Location name such as America\/Chicago \(UTC, abbreviations and Etc\/ zones are refused\)/);
+    expect(def.description).toMatch(/IANA Area\/Location name such as America\/Chicago \(UTC, abbreviations and Etc\/ zones are refused; letter case is normalised\)/);
   });
   it('rejects a destination equal to the assigned caller number', async () => {
     await expect(update({ destinationPhone: '+14155550111' })).rejects.toThrow('Check the limits and name format');

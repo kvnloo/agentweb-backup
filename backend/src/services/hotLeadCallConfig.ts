@@ -2,7 +2,6 @@ import { parsePhoneNumberWithError } from 'libphonenumber-js';
 import { toE164 } from './whatsappService';
 import { isLeadTypes, type LeadOrigin } from './leadNotificationConfig';
 import { isRecord } from './leadNotificationAttribution';
-import { isValidTimezone as isKnownTimezone } from './dripSendWindow';
 
 export const HOT_LEAD_CALL_COUNTRIES = ['US', 'CA'] as const;
 type HotLeadCallCountry = typeof HOT_LEAD_CALL_COUNTRIES[number];
@@ -30,7 +29,7 @@ interface HotLeadCallQuietHours {
    */
   start: string;
   end: string;
-  /** An IANA Area/Location name such as America/Chicago (UTC, abbreviations and Etc/ zones are refused). */
+  /** An IANA Area/Location name such as America/Chicago (UTC, abbreviations and Etc/ zones are refused); case is normalised. */
   timezone: string;
 }
 
@@ -68,21 +67,16 @@ const ANNOUNCED_NAME = /^[\p{L}\p{N} .,&'-]+$/u;
 export const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
 const TWILIO_SID = /^PN[0-9a-f]{32}$/;
 
-// IANA 'Area/Location' with sane capitalisation, for a calling-window clock. Not a membership test against
-// Intl.supportedValuesOf: ICU canonicalises aliases and the list varies by Node/ICU version. Checked: area
-// capitalisation, no Etc/ zones, location words are Capitalised (all-caps only for 2-3 letter names such as
-// NSW), plus Intl accepting the name. Not checked: Intl folds case, so a case variant that still looks like
-// real words (e.g. America/Los_angeles) can pass; the UTC/EST/GMT abbreviations fail for having no slash.
-const AREA = /^(?:[A-Z][a-z]+|US)$/;
-const LOCATION_WORD = /^(?:[A-Z]{2,3}|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)*)$/;
-const isLocationPart = (part: string): boolean =>
-  part === 'DumontDUrville' || // the one real name whose casing looks like a corruption
-  part.split(/[_-]/).every((word) => LOCATION_WORD.test(word) || /^(?:of|es|au)$/.test(word));
-export const isIanaAreaTimezone = (tz: unknown): tz is string => {
-  if (typeof tz !== 'string') return false;
-  const [area, ...locations] = tz.split('/');
-  return AREA.test(area) && area !== 'Etc' && locations.length > 0 && locations.every(isLocationPart) && isKnownTimezone(tz);
-};
+// Area/Location only: UTC, abbreviations (EST), offsets and Etc/ zones are not a place whose local clock gates
+// calls. Intl folds case and resolves aliases, so we store the name it resolves to.
+export function normalizeTimezone(tz: unknown): string | null {
+  if (typeof tz !== 'string' || !/^[A-Za-z]+(?:\/[A-Za-z0-9_+-]+)+$/.test(tz) || /^etc\//i.test(tz)) return null;
+  try {
+    return new Intl.DateTimeFormat('en-US', { timeZone: tz }).resolvedOptions().timeZone;
+  } catch {
+    return null;
+  }
+}
 
 // Types that bill the caller (toll fraud: premium, toll-free, shared-cost, personal, UAN) or are not a
 // person's direct line. VOIP can ring a person but is blocked anyway; note the default (min) metadata only
@@ -119,8 +113,8 @@ function quietHoursOf(raw: unknown): HotLeadCallQuietHours | null {
   const start = raw.start === undefined ? HOT_LEAD_CALL_DEFAULT_QUIET_HOURS.start : raw.start;
   const end = raw.end === undefined ? HOT_LEAD_CALL_DEFAULT_QUIET_HOURS.end : raw.end;
   if (typeof start !== 'string' || typeof end !== 'string' || !HHMM.test(start) || !HHMM.test(end) || start === end) return null;
-  if (!isIanaAreaTimezone(raw.timezone)) return null;
-  return { start, end, timezone: raw.timezone };
+  const timezone = normalizeTimezone(raw.timezone);
+  return timezone ? { start, end, timezone } : null;
 }
 
 /**

@@ -41,27 +41,30 @@ describe('hotLeadCallConfigOf', () => {
 
   it.each([
     ['no slash', 'UTC'],
-    ['lowercase area', 'america/chicago'],
     ['unknown zone', 'Mars/Olympus'],
-    ['Etc area', 'Etc/UTC'],
-    ['all-caps area', 'AMERICA/CHICAGO'],
-    ['all-caps location', 'America/CHICAGO'],
-    ['mixed case: caps tail', 'America/Los_ANGELES'],
-    ['mixed case: caps word', 'America/New_YORK'],
-    ['mixed case: caps prefix', 'America/CHicago'],
-    ['mixed case: all-caps words', 'America/LOS_ANGELES'],
-    ['lowercase second word', 'America/New_york'],
+    ['Etc area (any case)', 'ETC/UTC'],
+    ['offset', '+05:00'],
     ['trailing whitespace', 'America/Chicago '],
+    ['non-string', 5],
   ])('rejects timezone: %s', (_reason, timezone) => {
     expect(hotLeadCallConfigOf(base({ quietHours: { timezone } }))).toBeNull();
   });
+  // Intl folds case and resolves aliases; the resolved name is what gets stored.
   it.each([
-    'America/Chicago', 'America/Toronto', 'America/Los_Angeles', 'America/Indiana/Indianapolis', 'America/Kentucky/Louisville',
-    'America/Montreal', 'America/Halifax', 'America/St_Johns', 'America/Phoenix', 'America/Anchorage', 'Pacific/Honolulu', 'US/Eastern', 'Australia/NSW',
-    'America/Port-au-Prince', 'America/Argentina/ComodRivadavia', 'Antarctica/DumontDUrville', 'Africa/Dar_es_Salaam', 'America/Indiana/Tell_City',
-    'America/Nipigon', 'America/Fort_Wayne', 'Canada/Eastern',
-  ])('accepts IANA timezone %s (including ICU-canonicalised aliases)', timezone => {
-    expect(hotLeadCallConfigOf(base({ quietHours: { timezone } }))?.quietHours?.timezone).toBe(timezone);
+    ['America/Chicago', 'America/Chicago'],
+    ['america/chicago', 'America/Chicago'],
+    ['AMERICA/CHICAGO', 'America/Chicago'],
+    ['America/Los_Angeles', 'America/Los_Angeles'],
+    ['US/Eastern', 'America/New_York'],
+    ['Canada/Eastern', 'America/Toronto'],
+    ['America/Indiana/Indianapolis', 'America/Indianapolis'],
+    ['America/Montreal', 'America/Toronto'],
+    ['Australia/NSW', 'Australia/Sydney'],
+    ['America/Port-au-Prince', 'America/Port-au-Prince'],
+  ])('stores timezone %s as %s', (input, stored) => {
+    const once = hotLeadCallConfigOf(base({ quietHours: { timezone: input } }));
+    expect(once?.quietHours?.timezone).toBe(stored);
+    expect(hotLeadCallConfigOf(once)?.quietHours?.timezone).toBe(stored);
   });
 
   it.each([null, undefined, 'x', 5, [], base({ enabled: 'true' }), base({ enabled: undefined })])('rejects non-object or bad enabled %j', raw => {
