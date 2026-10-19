@@ -37,7 +37,8 @@ export type VendorRateProvider =
   | "2captcha"
   | "elevenlabs"
   | "placid"
-  | "remotion";
+  | "remotion"
+  | "twilio";
 
 interface VendorRateEntry {
   /** Human unit label written to RecordVendorUsageContext.unit. */
@@ -50,13 +51,12 @@ interface VendorRateEntry {
  * Version stamp for the rates below (ENG-1250 §5: "A price change creates a new
  * version; historical events retain the rate version used").
  *
- * Dated to the last change to the rates in this file — currently the ENG-696
- * Apollo `org_enrichment` / enrich.so `reverse_lookup` confirmations of
- * 2026-09-02. **Bump this in the same commit as any rate edit**, otherwise two
- * different prices share one version and a historical event can no longer be
- * re-derived from the card that produced it.
+ * Dated to the last change to the rates in this file — currently the ENG-2271
+ * Twilio voice placeholders of 2026-10-19. **Bump this in the same commit as
+ * any rate edit**, otherwise two different prices share one version and a
+ * historical event can no longer be re-derived from the card that produced it.
  */
-export const VENDOR_RATE_CARD_VERSION = "2026-09-14";
+export const VENDOR_RATE_CARD_VERSION = "2026-10-19";
 
 const RATE_CARD: Record<VendorRateProvider, Record<string, VendorRateEntry>> = {
   v0: {
@@ -123,6 +123,15 @@ const RATE_CARD: Record<VendorRateProvider, Record<string, VendorRateEntry>> = {
   },
   remotion: {
     render: { recordingUnit: "render", usdPerUnit: 0.1375 },
+  },
+  // ENG-2271 — PROVISIONAL placeholders at Twilio's public US list price
+  // (twilio.com/en-us/voice/pricing/us, "Pricing current as of August 2026",
+  // checked 2026-10-19): outbound to United States & Canada $0.0140/min,
+  // local number $1.15/mo. Pending Harsha's allocation confirmation (ENG-1706
+  // pattern) before the hot-lead auto-call goes live.
+  twilio: {
+    voice_minute_outbound: { recordingUnit: "minute", usdPerUnit: 0.014 },
+    number_monthly_rent: { recordingUnit: "number_month", usdPerUnit: 1.15 },
   },
 };
 
