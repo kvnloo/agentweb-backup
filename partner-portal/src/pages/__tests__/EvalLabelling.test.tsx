@@ -622,6 +622,47 @@ describe("EvalLabelling (ENG-2135)", () => {
       expect(screen.queryByText("wp-2")).not.toBeInTheDocument();
     });
 
+    it("a late save advances within the filters as they are now, not as they were when it started (#3616 review)", async () => {
+      // wp-2-dev sorts right after wp-1, so it is "next" unless the current filter is applied.
+      const DEV_WP: GoldenCaseView = { ...WP2, caseId: "agent#sessionId#wp-2-dev", sourceRef: { kind: "sessionId", id: "wp-2-dev" }, split: "dev" };
+      const WP3: GoldenCaseView = { ...WP2, caseId: "agent#sessionId#wp-3", sourceRef: { kind: "sessionId", id: "wp-3" } };
+      routeQuick([WP1, DEV_WP, WP3]);
+      let resolvePut: (v: unknown) => void = () => undefined;
+      mockedAxios.put.mockImplementationOnce(() => new Promise((r) => { resolvePut = r; }));
+      renderPage();
+      await screen.findByText("Session wp-1");
+      await choose("Quick mode", "task success only");
+
+      fireEvent.keyDown(window, { key: "1" });
+      await choose("Split", "test");
+      resolvePut(savedAs(WP1, { task_success: "pass" }));
+
+      expect(await screen.findByText("Session wp-3")).toBeInTheDocument();
+      expect(screen.queryByText("Session wp-2-dev")).not.toBeInTheDocument();
+    });
+
+    it("returning to a case while its save is still in flight cannot start a second save (#3616 review)", async () => {
+      routeQuick([WP1, WP2]);
+      let resolvePut: (v: unknown) => void = () => undefined;
+      mockedAxios.put.mockImplementationOnce(() => new Promise((r) => { resolvePut = r; }));
+      renderPage();
+      await screen.findByText("Session wp-1");
+      await choose("Quick mode", "task success only");
+
+      fireEvent.keyDown(window, { key: "1" });
+      fireEvent.click(screen.getByText("wp-2"));
+      await screen.findByText("Session wp-2");
+      fireEvent.click(screen.getByText("wp-1"));
+      await screen.findByText("Session wp-1");
+
+      expect(screen.getByRole("button", { name: "quick task_success fail" })).toBeDisabled();
+      fireEvent.keyDown(window, { key: "2" });
+      expect(mockedAxios.put).toHaveBeenCalledTimes(1);
+
+      resolvePut(savedAs(WP1, { task_success: "pass" }));
+      await waitFor(() => expect(screen.getByRole("button", { name: "quick task_success fail" })).toBeEnabled());
+    });
+
     it("turning quick mode off brings back the full form", async () => {
       routeQuick([WP1]);
       renderPage();
