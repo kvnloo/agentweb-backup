@@ -646,6 +646,21 @@ describe('getAudienceCount', () => {
     expect(url).toContain(encodeURIComponent('urn:li:skill:31706'));
   });
 
+  it('percent-encodes RestLi-reserved parentheses inside value URNs (ENG-2576)', async () => {
+    await svc.getAudienceCount(ACCESS_TOKEN, {
+      include: {
+        and: [
+          { or: { 'urn:li:adTargetingFacet:staffCountRanges': ['urn:li:staffCountRange:(11,50)'] } },
+        ],
+      },
+      exclude: { or: { 'urn:li:adTargetingFacet:staffCountRanges': ['urn:li:staffCountRange:(1,1)'] } },
+    });
+    const url: string = mockAxiosFn.mock.calls[0][0].url;
+    expect(url).toContain('List(urn%3Ali%3AstaffCountRange%3A%2811%2C50%29)');
+    expect(url).toContain('List(urn%3Ali%3AstaffCountRange%3A%281%2C1%29)');
+    expect(url).not.toContain('staffCountRange%3A(');
+  });
+
   it('includes an exclude clause when the criteria has one', async () => {
     await svc.getAudienceCount(ACCESS_TOKEN, {
       ...CRITERIA,
