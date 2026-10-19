@@ -25,10 +25,15 @@ value on a failed refresh (same pattern as `work_plan_step_models_enabled`). Cod
 policy decision): createSession (requested = user, else system), the /generate, verified-generate and shared
 persists (an echo of the stored stamp keeps its source), PATCH (user), branch (inherits), Compare select (user),
 schedule runs, plan launches, step stamps, task-type models, Slack/transports/email/GTM/result-endpoint defaults
-(system). A system-stamped model stays AgentWeb's choice after an admin rotates the default (no false 422). Legacy
-sessions without the field: system when the stored decision shows `defaulted`/`corrected`, otherwise a user pick
-(a visible 422 at worst). `ScheduledChat.llmModelSource: 'system'` marks a pin inherited from an admin-authored
-(`visibility: 'system'`) schedule template; a user-authored template's pin is checked at creation (422). The
+(system). An echo is recognised on canonical ids (an alias of the stored model is the same model). A system-stamped
+model stays AgentWeb's choice after an admin rotates the default (no false 422). Legacy sessions without the field:
+system when the stored decision shows `defaulted`/`corrected`, or when there is no decision at all on a side-channel
+session (`slackThread`, `gtmWorkItem`, sessionType `emma-email` / `result-endpoint`: those wrote the then-default
+without one); otherwise a user pick (a visible 422 at worst). Owner session reads now include `llmModelSource` and
+the plan's `planAuthor` / `launchModelSource` (stripped for share viewers). `ScheduledChat.llmModelSource: 'system'` marks a pin inherited from an admin-authored
+(`visibility: 'system'`) schedule template; a user-authored template's pin is checked at creation (422). Only an
+administrator may change a system template's model (403 for its non-admin creator). A confirmed recommendation
+switch records `modelSourceBefore` on its audit row, so an undo restores the 'system' origin with the model. The
 session `workPlan` records `planAuthor` (and `launchModelSource`) at launch, so a later edit or deletion of the
 template does not change whose pins they are.
 
@@ -53,6 +58,9 @@ without the resolver (it checks the STORED model; a model the caller chose itsel
 per column (through the resolver) and up front (D3: owner runs fewer than two models => 403
 `compare_not_available_for_tier` + `upgradeRequired`, `/me` hint `modelCompareTierBlocked` while the switch is on);
 `/model-options` filters `allModels` / `selectableModels` and adds `modelAccess: { tier, allowedModels, upgradeRequired? }`.
+
+A refusal by the final gate during /generate, verified-generate or a shared/conversable turn is the same 422 as the
+pre-flight (never a 500).
 
 **422 body.** `{ error, code: 'model_unavailable', requestedModel, reason: 'not_in_plan', model, tier, allowedModels,
 upgradeRequired }`; the share-viewer (interactive share / conversable) body omits `model`, `tier`, `allowedModels`,
