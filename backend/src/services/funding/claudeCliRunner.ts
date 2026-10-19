@@ -684,7 +684,13 @@ export class ClaudeCliRunner {
 export function buildAllowlistedEnv(configDir: string, scratchHomeDir: string): NodeJS.ProcessEnv {
   const path = process.env.PATH;
   if (!path) throw new Error("claudeCliRunner: PATH is not set in the parent process — cannot resolve the claude binary");
+  return allowlistedEnv(path, configDir, scratchHomeDir);
+}
+
+/** The complete environment of a hosted `claude` process; nothing else is ever inherited. `extra` is for the host's own fixed additions (TMPDIR). */
+export function allowlistedEnv(path: string, configDir: string, scratchHomeDir: string, extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
+    ...extra,
     PATH: path,
     HOME: scratchHomeDir,
     CLAUDE_CONFIG_DIR: configDir,
