@@ -70,3 +70,10 @@ export function connectTwiml(p: { twilioNumber: string; leadE164: string; dialUr
 export function leadUnreachableTwiml(): string {
   return response(say(LEAD_UNREACHABLE_COPY), '<Hangup/>');
 }
+
+/** Destination-verification call: the fixed phrase and the six digits, spaced so text-to-speech reads them one by one. */
+export function verificationCodeTwiml(code: string): string {
+  if (!/^\d{6}$/.test(code)) throw new Error('verification code must be 6 digits');
+  const spoken = code.split('').join(' ');
+  return response(`<Pause length="1"/>`, say(`Your Agent Web verification code is ${spoken}. Again, your code is ${spoken}. Goodbye.`));
+}

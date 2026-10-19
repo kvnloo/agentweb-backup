@@ -15,7 +15,7 @@ import '../emma/hotLeadCallSetupTools';
 import { FakeVoiceProvider } from '../services/voice/fakeVoiceProvider';
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
 import { getRecordingUnit } from '../utils/vendorRateCard';
-import { verificationTwiml } from '../services/voice/destinationVerification';
+import { verificationCodeTwiml as verificationTwiml } from '../services/voice/twiml';
 import { SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS } from '../services/agentMode/core/toolDispatch';
 
 const run = (name: string, args: unknown = {}, context: unknown = { userId: 'owner' }) => handlers.get(name)!.execute(args, context);

@@ -5,6 +5,7 @@ import { hotLeadCallConfigOf, maskPhone, type HotLeadCallConfig } from '../hotLe
 import { isRecord } from '../leadNotificationAttribution';
 import { getVoiceProvider, VoiceCallError } from './voiceProvider';
 import { recordCallUsage } from './voiceUsage';
+import { verificationCodeTwiml } from './twiml';
 import { isConditionalFailure, unchangedSince } from './setupWrites';
 
 /**
@@ -69,17 +70,6 @@ function hashCode(orgId: string, phone: string, code: string): string {
   return crypto.createHmac('sha256', getJwtSecret()).update(`hlc-verify-v1|${orgId}|${phone}|${code}`).digest('hex');
 }
 
-function escapeXml(text: string): string {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
-}
-
-/** Fixed phrase plus the digits, spaced so text-to-speech reads them one by one. Nothing else is interpolated. */
-export function verificationTwiml(code: string): string {
-  if (!/^\d{6}$/.test(code)) throw new Error('verification code must be 6 digits');
-  const spoken = escapeXml(code.split('').join(' '));
-  return `<?xml version="1.0" encoding="UTF-8"?><Response><Pause length="1"/><Say>Your Agent Web verification code is ${spoken}. Again, your code is ${spoken}. Goodbye.</Say></Response>`;
-}
-
 const minutes = (ms: number) => Math.ceil(ms / 60_000);
 
 export async function startVerification(org: Organization, config: HotLeadCallConfig, userId: string) {
@@ -118,7 +108,7 @@ export async function startVerification(org: Organization, config: HotLeadCallCo
   let callSid: string;
   try {
     ({ callSid } = await getVoiceProvider().placeCall({
-      to: config.destinationPhone, from: config.twilioNumber, twiml: verificationTwiml(code), timeoutSeconds: CALL_TIMEOUT_SECONDS,
+      to: config.destinationPhone, from: config.twilioNumber, twiml: verificationCodeTwiml(code), timeoutSeconds: CALL_TIMEOUT_SECONDS,
     }));
   } catch (err) {
     if (err instanceof VoiceCallError && err.placed === 'no') {
