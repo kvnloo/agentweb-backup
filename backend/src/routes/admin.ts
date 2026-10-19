@@ -4,7 +4,7 @@ import { disconnectStaleUserSockets } from "../services/sessionSockets";
 import jwt from "jsonwebtoken";
 import { getJwtSecret } from "../config/jwt";
 import bcrypt from "bcryptjs";
-import axios from "axios";
+import { fetchPublicHtml, SsrfBlockedError } from "../utils/ssrfGuard";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { userDb, taskDb, subscriberDb, crmDb, orgDb } from "../services/db";
@@ -45,6 +45,7 @@ import { readAnalyticsConfig, writeAnalyticsConfig } from "../services/analytics
 import { validateAnalyticsConfig } from "../services/analyticsConfigValidator";
 import { sweepUndeliverableDomains } from "../services/emailDeliverabilityService";
 import { isSessionList } from "../utils/sessionList";
+import { TABLE_PREFIX } from "../config/constants";
 
 const router = express.Router();
 
@@ -721,7 +722,7 @@ router.post("/crm-sync/:source/start", async (req, res) => {
 
     const syncStartedAt = new Date().toISOString();
     const results = leads.length > 0
-      ? await crmDb.batchCreateLeads(parsed.listId, leads)
+      ? await crmDb.batchCreateLeads(parsed.listId, leads, { origin: 'integration' })
       : { successCount: 0, newCount: 0, mergedCount: 0, errorCount: 0, errors: [] as string[], anonymizedSkipped: 0 };
 
     let updatedLastSyncAt: string | null = parsed.lastSyncAt || null;
@@ -866,6 +867,49 @@ router.get("/users", async (req, res) => {
           user.subscriptionType = orgInfo.ownerSubscriptionType;
         }
       }
+    }
+
+    // ENG-273: which messaging platform each customer is on. Read from the same policy
+    // that enforces one-platform-per-customer, so this column can never disagree with
+    // what the rule allows. Computed from the full records (the compact list rows drop
+    // the channel fields), each organisation resolved once, and strictly best-effort:
+    // a failure here leaves the column empty rather than failing the whole user list.
+    try {
+      const { getPlatformSummary } = await import('../services/customerChannelPolicy');
+      const fullRecordById = new Map<string, any>(users.map((u: any) => [u.userId, u]));
+      const orgSlackCache = new Map<string, Promise<boolean>>();
+      await Promise.all(
+        sanitized.map(async (user: any) => {
+          // Each account settles on its own. One failing summary must not reject the whole
+          // batch and send the roster while other accounts' summaries are still pending,
+          // which would leave them without platform fields and shown as "Not connected".
+          try {
+            const summary = await getPlatformSummary(fullRecordById.get(user.userId), orgSlackCache);
+            user.messagingPlatform = summary.platform;
+            user.messagingPlatformSource = summary.source;
+            user.whatsappNumberMasked = summary.whatsappNumberMasked;
+            const full = fullRecordById.get(user.userId);
+            // Why a no-platform account has no WhatsApp (STOP / customer / admin), for support.
+            user.whatsappDisconnect = full?.whatsappDisconnect ?? null;
+            // A number that texted STOP but could not be matched to its account at the time
+            // (verified before the phone index existed) is still bound and unreachable.
+            // Only WhatsApp accounts are checked, so this costs a handful of reads.
+            if (summary.platform === 'whatsapp') {
+              const { explicitChannels } = await import('../services/messagingChannelService');
+              const { isOptedOut } = await import('../services/whatsappService');
+              const destination = explicitChannels(full).find((c: any) => c.channel === 'whatsapp')?.destination;
+              user.whatsappOptedOut = destination ? await isOptedOut(destination) : false;
+            }
+          } catch (error) {
+            console.error(
+              `[admin/users] messaging platform lookup failed for user ${user.userId}; leaving it unset:`,
+              error instanceof Error ? error.message : error,
+            );
+          }
+        }),
+      );
+    } catch (error) {
+      console.error('[admin/users] messaging platform lookup failed; leaving it unset:', error);
     }
 
     // Fetch only replay settings for these users in bounded BatchGet chunks.
@@ -1377,7 +1421,81 @@ router.get("/slack/channel-info", async (req, res) => {
   }
 });
 
-// Update user slack channels (accepts an array)
+/**
+ * Disconnect a customer's WhatsApp number on their behalf (ENG-273).
+ *
+ * A customer is on one messaging platform, and only they could remove WhatsApp — so one
+ * who wanted to move to Slack and did not do it themselves left support with no way to
+ * help. This is the same disconnect the customer's own Settings performs.
+ *
+ * It removes a number the customer verified and consented with, so it is recorded with
+ * who did it, and the customer is told on WhatsApp when the 24-hour window allows.
+ */
+router.delete("/users/:userId/whatsapp", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    // User ids are UUIDs or numeric strings. Reject anything else as bad input rather than
+    // letting it reach the database and come back as "not found" or a server error.
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(userId)) {
+      return res.status(400).json({ message: "Invalid user id." });
+    }
+    const adminId = (req as any).user?.userId || 'unknown-admin';
+    const { disconnectWhatsApp } = await import('../services/whatsappVerificationService');
+
+    const result = await disconnectWhatsApp(userId, 'admin');
+    if (!result) return res.status(404).json({ message: "User not found" });
+    if (!result.removed) {
+      return res.status(409).json({ message: "This account has no WhatsApp number connected." });
+    }
+
+    const { redactPhone, sendText } = await import('../services/whatsappService');
+    console.log(
+      `[admin] WhatsApp ${redactPhone(result.removed)} disconnected from user ${userId} by admin ${adminId}`,
+    );
+
+    // Best-effort courtesy notice. Outside the 24h window nothing but a template can be
+    // sent, and there is no template for this — so it may not arrive, and must never
+    // fail a disconnect that has already happened.
+    let customerNotified = false;
+    try {
+      await sendText(
+        result.removed,
+        'Your WhatsApp number has been disconnected from AgentWeb by our support team, so you will no longer receive notifications here. You can reconnect it any time from AgentWeb Settings.',
+      );
+      customerNotified = true;
+    } catch {
+      /* window closed, opted out, or Meta unavailable */
+    }
+
+    // The platform the account is on NOW. Removing WhatsApp can leave an account on Slack —
+    // an organisation member inherits the organisation's channel — so the dashboard must
+    // show what is true rather than assume "not connected".
+    let summary: { platform: string | null; source: string | null; whatsappNumberMasked: string | null } = {
+      platform: null,
+      source: null,
+      whatsappNumberMasked: null,
+    };
+    try {
+      const { getPlatformSummary } = await import('../services/customerChannelPolicy');
+      const { userDb } = await import('../services/db');
+      summary = await getPlatformSummary(await userDb.getUserById(userId));
+    } catch (error) {
+      console.error('[admin] could not recalculate the platform after disconnecting WhatsApp:', error);
+    }
+
+    res.json({
+      success: true,
+      customerNotified,
+      messagingPlatform: summary.platform,
+      messagingPlatformSource: summary.source,
+      whatsappNumberMasked: summary.whatsappNumberMasked,
+    });
+  } catch (error: any) {
+    console.error("Error disconnecting WhatsApp:", error?.message || error);
+    res.status(500).json({ message: "Failed to disconnect WhatsApp" });
+  }
+});
+
 router.put("/users/:userId/slack-channel", async (req, res) => {
   try {
     const { userId } = req.params;
@@ -1394,6 +1512,20 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
       ? slackChannels.map((c: any) => String(c).trim()).filter(Boolean)
       : [];
 
+    // One platform per customer (ENG-273): an account on WhatsApp cannot also be given a
+    // Slack channel. Clearing channels is always allowed — that is how Slack is removed.
+    if (channels.length > 0) {
+      const { hasWhatsApp } = await import('../services/customerChannelPolicy');
+      if (hasWhatsApp(user)) {
+        return res.status(409).json({
+          message:
+            'This account is already connected to WhatsApp. An account can use one messaging platform, so disconnect WhatsApp before assigning a Slack channel.',
+          code: 'platform_conflict',
+          connected: 'whatsapp',
+        });
+      }
+    }
+
     const { settingsService } = await import('../services/settingsService');
     // Invalidate by userId (old assignments) AND by channel ID (channels that may be cached under a different user)
     const oldChannels: string[] = (user.slackChannels ?? []).concat(user.slackChannel ? [user.slackChannel] : []);
@@ -1402,7 +1534,23 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
     const updatedUser = await userDb.updateUser(userId, {
       slackChannels: channels.length > 0 ? channels : (null as any),
     });
-    res.json(sanitizeUserForResponse(updatedUser));
+
+    // Clearing an account's own channels can leave a member of an organisation on the
+    // organisation's channel, so report the platform the account is on NOW rather than
+    // letting the dashboard guess.
+    let platformFields: Record<string, unknown> = {};
+    try {
+      const { getPlatformSummary } = await import('../services/customerChannelPolicy');
+      const summary = await getPlatformSummary(updatedUser);
+      platformFields = {
+        messagingPlatform: summary.platform,
+        messagingPlatformSource: summary.source,
+        whatsappNumberMasked: summary.whatsappNumberMasked,
+      };
+    } catch (error) {
+      console.error('[admin] could not recalculate the platform after a Slack channel edit:', error);
+    }
+    res.json({ ...sanitizeUserForResponse(updatedUser), ...platformFields });
   } catch (error) {
     console.error("Error updating user slack channels:", error);
     res.status(500).json({ message: "Error updating slack channels" });
@@ -3051,15 +3199,18 @@ router.post("/announcements/load-from-url", async (req, res) => {
     console.log(`🔽 Fetching HTML content from: ${url}`);
 
     // Fetch the HTML content
-    const response = await axios.get(url, {
-      timeout: 15000, // 15 seconds timeout
-      responseType: "text",
-      headers: {
-        "User-Agent": "AgentWeb-Backend/1.0",
-      },
-    });
-
-    const html = response.data as string;
+    // ENG-2425: SSRF-safe (DNS-pinned, per-hop re-validated, size-capped).
+    let html: string;
+    try {
+      html = await fetchPublicHtml(url);
+    } catch (fetchErr) {
+      if (fetchErr instanceof SsrfBlockedError) {
+        return res
+          .status(400)
+          .json({ success: false, message: "URL must point to a public internet address" });
+      }
+      throw fetchErr;
+    }
     console.log(`✅ Successfully fetched HTML, length: ${html.length}`);
 
     // Extract title from <title> tag
@@ -3526,7 +3677,6 @@ router.put("/users/:userId/role", async (req, res) => {
 router.delete("/configs/:configId", async (req, res) => {
   const { configId } = req.params;
   const dynamodb = new DynamoDB.DocumentClient(); // Ensure dynamodb client is available
-  const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
   const tableName = `${TABLE_PREFIX}AW-Configs`;
 
   try {
@@ -3850,7 +4000,6 @@ router.get("/analytics/gtm", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     const plans = await paginatedScan(dynamodb, {
@@ -3921,7 +4070,6 @@ router.get("/analytics/crm", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
     const scanAll = async (tableName: string) => {
       const items: any[] = [];
@@ -3996,7 +4144,6 @@ router.get("/gtm-plans", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Scan all GTM plans (admin can see all)
@@ -4056,7 +4203,6 @@ router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (r
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4255,7 +4401,6 @@ router.put("/gtm-plans/:planId", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4339,7 +4484,6 @@ router.put("/gtm-plans/:planId/phases/:phaseId", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4436,7 +4580,6 @@ router.post("/gtm-plans/:planId/phases/:phaseId/send-status-report", async (req,
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4505,7 +4648,6 @@ router.post("/gtm-plans/:planId/send-status-report", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4568,7 +4710,6 @@ router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/attachmen
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     const getResult = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
@@ -4642,7 +4783,6 @@ router.delete("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/attachm
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     const getResult = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
@@ -4705,7 +4845,6 @@ router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/start-ses
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     const getResult = await dynamodb
@@ -4930,9 +5069,10 @@ router.get("/subscription-types", async (req, res) => {
         normalizedPages = allAvailablePages;
       }
 
-      // Handle allowedSkills with backward compatibility
-      // If old format (allowedFunctionCalls but no allowedSkills), treat as all skills
-      let normalizedSkills = type.allowedSkills || allAvailableSkills;
+      // ENG-1978: a row without allowedSkills (old allowedFunctionCalls format) is no longer read as
+      // "all skills" — the runtime refuses to resolve it, so show it as having none rather than
+      // let an admin save it back as a full grant.
+      let normalizedSkills = Array.isArray(type.allowedSkills) ? type.allowedSkills : [];
       if (normalizedSkills.includes('*')) {
         normalizedSkills = allAvailableSkills;
       }
@@ -4976,6 +5116,63 @@ router.get("/subscription-types", async (req, res) => {
 });
 
 // Create or update subscription types
+/**
+ * ENG-1978: tiers an admin is about to remove (or rename away from) that accounts are still on.
+ *
+ * A user's tier is stored by NAME. If that name stops existing in `subscription_types`, the
+ * entitlement gate can no longer resolve the user and fails closed, so they drop to the foundation
+ * tools only. Before the gate failed closed those users silently kept every tool, which is why
+ * nothing ever needed to stop this save. Counted by the user's own `subscriptionType`: that covers
+ * org owners (whose tier their members inherit) but not the members themselves, so the count is a
+ * floor. `Free` is also the implicit tier of accounts with no `subscriptionType` at all (absent, null
+ * or empty — the runtime reads any falsy value as Free).
+ *
+ * This is a guard rail, not an invariant: it reads the current list, scans, and the caller writes
+ * later with no conditional write, so two concurrent admin saves or a user move racing the save
+ * can slip past it.
+ */
+async function findStrandedTiers(nextTierNames: string[]): Promise<Array<{ name: string; userCount: number }>> {
+  const current = await settingsService.getSetting("subscription_types");
+  if (!current) return [];
+  let currentTiers: any[];
+  try {
+    currentTiers = JSON.parse(current.settingValue);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(currentTiers)) return [];
+
+  const keep = new Set(nextTierNames);
+  const removed = currentTiers
+    .map((t) => t?.name)
+    .filter((n): n is string => typeof n === "string" && n.length > 0 && !keep.has(n));
+  if (removed.length === 0) return [];
+
+  const values: Record<string, string> = {};
+  removed.forEach((name, i) => { values[`:t${i}`] = name; });
+  const clauses = [`subscriptionType IN (${removed.map((_, i) => `:t${i}`).join(", ")})`];
+  if (removed.includes("Free")) {
+    clauses.push(
+      "attribute_not_exists(subscriptionType)",
+      "attribute_type(subscriptionType, :nullType)",
+      "subscriptionType = :emptyTier"
+    );
+    values[":emptyTier"] = "";
+    values[":nullType"] = "NULL";
+  }
+  const users = await userDb.scanWithFilter(clauses.join(" OR "), values);
+
+  return removed
+    .map((name) => ({
+      name,
+      userCount: users.filter((u) =>
+        u.subscriptionType === name ||
+        (name === "Free" && !u.subscriptionType)
+      ).length,
+    }))
+    .filter((t) => t.userCount > 0);
+}
+
 router.post("/subscription-types", async (req, res) => {
   try {
     const { subscriptionTypes } = req.body;
@@ -5055,15 +5252,18 @@ router.post("/subscription-types", async (req, res) => {
         const { validateLlmUsagePolicy } = await import('../services/llmUsagePolicyService');
         const { getModelPrice } = await import('../utils/llmPricing');
         const { agentModeService } = await import('../services/agentModeService');
+        // Stored policies may hold a renamed model's legacy id; runtime filters drop it, so
+        // canonicalise before validating (and store the canonical id).
+        const canonicalModelId = (model: unknown): string => agentModeService.normalizeModelId(String(model).trim());
         normalizedLlmUsagePolicy = {
           version: String(type.llmUsagePolicy.version || '').trim(),
           enforcementState: type.llmUsagePolicy.enforcementState,
           optimizationCostThresholdMicroUsd: Number(type.llmUsagePolicy.optimizationCostThresholdMicroUsd),
           hardCostThresholdMicroUsd: Number(type.llmUsagePolicy.hardCostThresholdMicroUsd),
           optimizedModelIds: Array.isArray(type.llmUsagePolicy.optimizedModelIds)
-            ? [...new Set(type.llmUsagePolicy.optimizedModelIds.map((model: unknown) => String(model).trim()).filter(Boolean))]
+            ? [...new Set(type.llmUsagePolicy.optimizedModelIds.map(canonicalModelId).filter(Boolean))]
             : [],
-          optimizedDefaultModel: String(type.llmUsagePolicy.optimizedDefaultModel || '').trim(),
+          optimizedDefaultModel: canonicalModelId(type.llmUsagePolicy.optimizedDefaultModel || ''),
           // ENG-1214 AC5. Carried through RAW and only when present.
           //
           // Raw, because `validateLlmUsagePolicy` rejects a present-but-invalid
@@ -5152,6 +5352,33 @@ router.post("/subscription-types", async (req, res) => {
         ...(normalizedSeatPricing ? { seatPricing: normalizedSeatPricing } : {}),
       };
     }));
+
+    // Refuse to strand accounts on a tier that no longer exists. API callers that really mean it
+    // (e.g. after reassigning users out of band) can pass `allowStrandedUsers: true`.
+    if (req.body.allowStrandedUsers !== true) {
+      let stranded: Array<{ name: string; userCount: number }>;
+      try {
+        stranded = await findStrandedTiers(normalizedTypes.map((t: any) => t.name));
+      } catch (scanError) {
+        // Not a validation problem and nothing has been saved: tell the admin to retry.
+        console.error("Error checking which accounts are on removed subscription types:", scanError);
+        return res.status(503).json({
+          message: "Could not check which accounts are on the tiers being removed. Nothing was saved; please try again.",
+        });
+      }
+      if (stranded.length > 0) {
+        const list = stranded
+          .map((t) => `"${t.name}" (${t.userCount} account${t.userCount === 1 ? "" : "s"})`)
+          .join(", ");
+        return res.status(409).json({
+          message:
+            `Cannot remove or rename ${list}: accounts are still on ${stranded.length === 1 ? "it" : "them"} ` +
+            `(org members of those accounts inherit it too). Move them to another tier first, ` +
+            `otherwise they lose paid tools until reassigned.`,
+          strandedTiers: stranded,
+        });
+      }
+    }
 
     const updatedBy = (req as any).user?.email || "unknown";
     await settingsService.setSetting(

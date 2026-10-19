@@ -19,9 +19,10 @@ import {
   findTiersAllowingSkill,
   getAllowedFeatures,
   isSubscriptionFeatureEnabled,
-  setWildcardGrantSink,
-  resetWildcardGrantSink,
+  setEntitlementDeniedSink,
+  resetEntitlementDeniedSink,
   flushUnconfirmedTierObservations,
+  resetLastKnownSubscriptionTypes,
 } from '../services/subscriptionService';
 
 jest.mock('../services/settingsService', () => ({
@@ -86,6 +87,7 @@ const mockedUserDb = userDb as jest.Mocked<typeof userDb>;
 describe('subscriptionService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    resetLastKnownSubscriptionTypes();
   });
 
   it('getUserSubscriptionType returns user.subscriptionType or Free by default', async () => {
@@ -118,6 +120,45 @@ describe('subscriptionService', () => {
     expect(await getAllowedFeatures('u1')).toEqual(['scheduled_chats']);
   });
 
+  describe('model_compare add-on feature', () => {
+    const tiers = (rows: unknown[]) =>
+      mockedSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(rows) } as any);
+
+    it('is enabled for a tier that lists it and disabled for an explicit list without it', async () => {
+      mockedUserDb.getUserById.mockResolvedValue({ userId: 'u1', subscriptionType: 'Pro' } as any);
+      tiers([{ name: 'Pro', allowedPages: ['/'], allowedSkills: [], allowedFeatures: ['model_compare'] }]);
+      expect(await isSubscriptionFeatureEnabled('u1', 'model_compare')).toBe(true);
+      tiers([{ name: 'Pro', allowedPages: ['/'], allowedSkills: [], allowedFeatures: ['scheduled_chats'] }]);
+      expect(await isSubscriptionFeatureEnabled('u1', 'model_compare')).toBe(false);
+    });
+
+    it('stays enabled for a legacy tier with no allowedFeatures list', async () => {
+      mockedUserDb.getUserById.mockResolvedValue({ userId: 'u1', subscriptionType: 'Legacy' } as any);
+      tiers([{ name: 'Legacy', allowedPages: ['/'], allowedSkills: [] }]);
+      expect(await isSubscriptionFeatureEnabled('u1', 'model_compare')).toBe(true);
+    });
+
+    it('an org member inherits the org owner tier', async () => {
+      const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+      mockedUserDb.getUserById.mockImplementation(async (id: string) => {
+        if (id === 'member-1') return { userId: 'member-1', orgId: 'org-1', orgRole: 'member', subscriptionType: 'Free' } as any;
+        if (id === 'owner-1') return { userId: 'owner-1', subscriptionType: 'Pro' } as any;
+        return null as any;
+      });
+      mockedOrgDb.getOrgById.mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1' } as any);
+      tiers([
+        { name: 'Free', allowedPages: ['/'], allowedSkills: [], allowedFeatures: [] },
+        { name: 'Pro', allowedPages: ['/'], allowedSkills: [], allowedFeatures: ['model_compare'] },
+      ]);
+      expect(await isSubscriptionFeatureEnabled('member-1', 'model_compare')).toBe(true);
+    });
+
+    it('returns null (callers fail closed) when the tier cannot be read', async () => {
+      mockedUserDb.getUserById.mockResolvedValue(null as any);
+      expect(await isSubscriptionFeatureEnabled('ghost', 'model_compare')).toBeNull();
+    });
+  });
+
   it('denies a feature when an admin explicitly omits it', async () => {
     mockedUserDb.getUserById.mockResolvedValue({ userId: 'u1', subscriptionType: 'Community' } as any);
     mockedSettingsService.getSetting.mockResolvedValue({
@@ -135,7 +176,7 @@ describe('subscriptionService', () => {
       settingValue: JSON.stringify([{ name: 'Legacy', allowedPages: ['/'], allowedSkills: [] }]),
     } as any);
 
-    expect(await getAllowedFeatures('u1')).toEqual(['scheduled_chats']);
+    expect(await getAllowedFeatures('u1')).toEqual(['scheduled_chats', 'model_compare']);
   });
 
   it('getUserSubscriptionType resolves an org member to the owner tier dynamically (ENG-288)', async () => {
@@ -422,13 +463,14 @@ describe('subscriptionService', () => {
     expect(res.allowingTiers).toContain('Super');
   });
 
-  it('findTiersAllowingSkill: tier missing allowedSkills is treated as wildcard (backward compat)', async () => {
+  it('findTiersAllowingSkill: tier missing allowedSkills reaches nothing (the runtime refuses to resolve it)', async () => {
     mockedSettingsService.getSetting.mockResolvedValueOnce(tiersSetting([
       { name: 'Legacy', allowedPages: [], allowedFunctionCalls: ['x'] },
     ]) as any);
 
     const res = await findTiersAllowingSkill('skill-x');
-    expect(res.reachable).toBe(true);
+    expect(res.reachable).toBe(false);
+    expect(res.allowingTiers).toEqual([]);
   });
 
   it('findTiersAllowingSkill: fail-open (reachable) when no subscription_types setting exists', async () => {
@@ -495,13 +537,13 @@ describe('subscriptionService', () => {
     expect(skills).toEqual(['skill-1']);
   });
 
-  it('getAllowedSkills returns wildcard for "*" or empty', async () => {
+  it('getAllowedSkills keeps an explicit wildcard but fixes the empty-list inversion', async () => {
     const base = {
       name: 'Pro',
       allowedPages: ['/tasks'],
     };
 
-    // "*"
+    // "*": an admin deliberately configured wildcard — unchanged by ENG-1978.
     mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u1', subscriptionType: 'Pro' } as any);
     mockedSettingsService.getSetting.mockResolvedValueOnce({
       settingName: 'subscription_types',
@@ -511,7 +553,8 @@ describe('subscriptionService', () => {
     const skills1 = await getAllowedSkills('u1');
     expect(skills1).toEqual(['*']);
 
-    // empty array
+    // ENG-1978: empty array means NO skills, not all of them. This is the actual bug fix — an
+    // empty `allowedSkills` is a resolved tier with zero skills, not an unresolved wildcard.
     mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u2', subscriptionType: 'Pro' } as any);
     mockedSettingsService.getSetting.mockResolvedValueOnce({
       settingName: 'subscription_types',
@@ -519,55 +562,54 @@ describe('subscriptionService', () => {
     } as any);
 
     const skills2 = await getAllowedSkills('u2');
-    expect(skills2).toEqual(['*']);
+    expect(skills2).toEqual([]);
   });
 
   /*
-   * ENG-1978 observation pass. These assert that an unconfirmed wildcard grant is now RECORDED.
-   * They deliberately also assert the return value is still ["*"] — this change must not alter
-   * behaviour, and these tests are what would catch it if someone later edited the return while
-   * thinking they were only touching logging.
+   * ENG-1978 fail-closed. These assert that a case which used to silently grant everything now
+   * returns null and is recorded under `entitlement-denied` — PR #2947 shipped this same
+   * instrumentation as `wildcard-grant`; renamed here because the behaviour it describes flipped.
    */
-  describe('wildcard-grant observation (no behaviour change)', () => {
-    // resetWildcardGrantSink, not a silent stub: installing `() => {}` here would leave every
+  describe('entitlement-denied fail-closed (ENG-1978)', () => {
+    // resetEntitlementDeniedSink, not a silent stub: installing `() => {}` here would leave every
     // test declared after this block running with observation disabled.
-    afterEach(() => resetWildcardGrantSink());
+    afterEach(() => resetEntitlementDeniedSink());
 
-    it('records, and still grants, when the tier name is not in the config', async () => {
+    it('fails closed and records when the tier name is not in the config', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u1', subscriptionType: 'NoSuchTier' } as any);
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'subscription_types',
         settingValue: JSON.stringify([{ name: 'Pro', allowedPages: ['/tasks'], allowedSkills: ['skill-1'] }]),
       } as any);
 
-      expect(await getAllowedSkills('u1')).toEqual(['*']);
+      expect(await getAllowedSkills('u1')).toBeNull();
       expect(events.map((e) => e.reason)).toContain('subscription-type-config-unavailable');
     });
 
-    it('records, and still grants, when a tier lists no skills at all', async () => {
+    it('resolves an empty-list tier to [] without reporting anything (no longer a wildcard case)', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u2', subscriptionType: 'Pro' } as any);
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'subscription_types',
         settingValue: JSON.stringify([{ name: 'Pro', allowedPages: ['/tasks'], allowedSkills: [] }]),
       } as any);
 
-      expect(await getAllowedSkills('u2')).toEqual(['*']);
-      expect(events.map((e) => e.reason)).toContain('empty-allowed-skills-treated-as-wildcard');
+      expect(await getAllowedSkills('u2')).toEqual([]);
+      expect(events).toHaveLength(0);
     });
 
     /*
      * Review finding: an unconfirmed tier frequently produces a RESTRICTED result, not a wildcard
      * — an unreadable user row still resolves to a real Free tier with a real skill list. If that
-     * were recorded as a wildcard-grant it would inflate the over-grant count and argue for the
+     * were recorded as an entitlement-denied it would inflate the over-grant count and argue for the
      * fail-closed change on false evidence. Hence the separate `kind`, asserted here.
      */
-    it('records an unconfirmed tier as its OWN kind, not as a wildcard grant', async () => {
+    it('records an unconfirmed tier as its OWN kind, not as an entitlement-denied', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValueOnce(null as any);
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'subscription_types',
@@ -583,13 +625,14 @@ describe('subscriptionService', () => {
       expect(events).toHaveLength(1);
       expect(events[0].kind).toBe('unconfirmed-tier');
       expect(events[0].detail.byReason).toEqual({ 'subscription-type-unresolved': 1 });
-      expect(events.filter((e) => e.kind === 'wildcard-grant')).toHaveLength(0);
+      expect(events.filter((e) => e.kind === 'entitlement-denied')).toHaveLength(0);
     });
 
     /*
-     * Round-2 review, finding #1: the PR's documented "grep WILDCARD-GRANT" instruction cannot
-     * see unconfirmed-tier events at all, since they use a different marker string. Both must
-     * share the `[entitlement]` prefix so a broader grep catches both kinds.
+     * Round-2 review, finding #1: PR #2947's documented "grep WILDCARD-GRANT" instruction (now
+     * "grep ENTITLEMENT-DENIED") cannot see unconfirmed-tier events at all, since they use a
+     * different marker string. Both must share the `[entitlement]` prefix so a broader grep
+     * catches both kinds.
      */
     it('both kinds share the [entitlement] prefix so one grep catches both', async () => {
       const lines: string[] = [];
@@ -614,13 +657,13 @@ describe('subscriptionService', () => {
      * deliberate" claim. Now shares the same allowedSkillsDefaulted mechanism, with its own reason
      * so it stays distinguishable from a malformed row on a real tier.
      */
-    it('records the legacy Basic fallback distinctly from a malformed real-tier row', async () => {
+    it('fails closed on the legacy Basic fallback, distinctly from a malformed real-tier row', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u10', subscriptionType: 'Basic' } as any);
       mockedSettingsService.getSetting.mockResolvedValue(null as any); // setting entirely absent
 
-      expect(await getAllowedSkills('u10')).toEqual(['*']);
+      expect(await getAllowedSkills('u10')).toBeNull();
       expect(events.map((e) => e.reason)).toContain('legacy-basic-fallback-no-tier-config');
       expect(events.map((e) => e.reason)).not.toContain('tier-config-missing-allowed-skills');
     });
@@ -630,13 +673,13 @@ describe('subscriptionService', () => {
      * iteration loop) threads userId through so the one reason that is ALWAYS a genuine
      * full-registry grant does not end up unattributable.
      */
-    it('resolveSkillsToToolNames attributes skill-to-tool-resolution-failed to the given userId', async () => {
+    it('resolveSkillsToToolNames fails closed and attributes skill-to-tool-resolution-failed to the given userId', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       const skillSvc = jest.requireMock('../services/skillService').skillService;
       skillSvc.getPublishedSkills.mockImplementationOnce(() => { throw new Error('dynamo scan failed'); });
 
-      expect(await resolveSkillsToToolNames(['skill-1'], 'u11')).toEqual(['*']);
+      expect(await resolveSkillsToToolNames(['skill-1'], 'u11')).toBeNull();
       const ev = events.find((e) => e.reason === 'skill-to-tool-resolution-failed');
       expect(ev?.userId).toBe('u11');
     });
@@ -647,31 +690,32 @@ describe('subscriptionService', () => {
      * getSubscriptionTypeConfig, so the branch taken is the config-unavailable one. Asserting the
      * reason string is what exposed the mislabel.
      */
-    it('records config-unavailable (not the outer catch) when the settings lookup throws', async () => {
+    it('fails closed on config-unavailable (not the outer catch) when the settings lookup throws', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u3', subscriptionType: 'Pro' } as any);
       mockedSettingsService.getSetting.mockRejectedValue(new Error('dynamo down'));
 
-      expect(await getAllowedSkills('u3')).toEqual(['*']);
+      expect(await getAllowedSkills('u3')).toBeNull();
       const ev = events.find((e) => e.reason === 'subscription-type-config-unavailable');
       expect(ev).toBeDefined();
-      // A genuine full-registry grant — must be kind 'wildcard-grant', not 'unconfirmed-tier'.
-      expect(ev.kind).toBe('wildcard-grant');
+      // A genuine full-registry over-grant that now fails closed — must be kind 'entitlement-denied',
+      // not 'unconfirmed-tier'.
+      expect(ev.kind).toBe('entitlement-denied');
     });
 
     /* The genuine trigger for getAllowedSkills' own catch: a non-array allowedSkills makes
      * `.includes` throw. Previously uncovered entirely. */
-    it('records, and still grants, when allowedSkills is not an array', async () => {
+    it('fails closed when allowedSkills is not an array', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u4', subscriptionType: 'Pro' } as any);
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'subscription_types',
         settingValue: JSON.stringify([{ name: 'Pro', allowedPages: ['/tasks'], allowedSkills: { nope: true } }]),
       } as any);
 
-      expect(await getAllowedSkills('u4')).toEqual(['*']);
+      expect(await getAllowedSkills('u4')).toBeNull();
       expect(events.map((e) => e.reason)).toContain('allowed-skills-lookup-failed');
     });
 
@@ -684,7 +728,7 @@ describe('subscriptionService', () => {
      */
     it('does NOT emit for a tier that explicitly authored allowedSkills: ["*"]', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u12', subscriptionType: 'Pro' } as any);
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'subscription_types',
@@ -697,17 +741,17 @@ describe('subscriptionService', () => {
 
     /* A tier row missing allowedSkills entirely is rewritten to ["*"] inside
      * getSubscriptionTypeConfig, before getAllowedSkills sees it — the likeliest real
-     * malformation, and previously invisible to this instrumentation. */
-    it('records a tier row that omits allowedSkills, which silently becomes a wildcard', async () => {
+     * malformation. ENG-1978: that silent default is no longer granted either. */
+    it('fails closed on a tier row that omits allowedSkills, which silently defaults to wildcard', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u5', subscriptionType: 'Legacy' } as any);
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'subscription_types',
         settingValue: JSON.stringify([{ name: 'Legacy', allowedPages: ['/tasks'] }]),
       } as any);
 
-      expect(await getAllowedSkills('u5')).toEqual(['*']);
+      expect(await getAllowedSkills('u5')).toBeNull();
       expect(events.map((e) => e.reason)).toContain('tier-config-missing-allowed-skills');
     });
 
@@ -720,7 +764,7 @@ describe('subscriptionService', () => {
      */
     it('does not emit for a malformed tier row when resolving something other than skills', async () => {
       const events: any[] = [];
-      setWildcardGrantSink((e) => events.push(e));
+      setEntitlementDeniedSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValue({ userId: 'u8', subscriptionType: 'Legacy' } as any);
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'subscription_types',
@@ -736,26 +780,26 @@ describe('subscriptionService', () => {
     /* Observation must never be the reason the SERVER fails. An async sink is assignable to a
      * `=> void` type, and its rejection would otherwise escape as an unhandled rejection. */
     it('survives a sink that rejects asynchronously', async () => {
-      setWildcardGrantSink((() => Promise.reject(new Error('sink blew up'))) as any);
+      setEntitlementDeniedSink((() => Promise.reject(new Error('sink blew up'))) as any);
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u6', subscriptionType: 'NoSuchTier' } as any);
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'subscription_types',
         settingValue: JSON.stringify([{ name: 'Pro', allowedPages: ['/tasks'], allowedSkills: ['s'] }]),
       } as any);
 
-      await expect(getAllowedSkills('u6')).resolves.toEqual(['*']);
+      await expect(getAllowedSkills('u6')).resolves.toBeNull();
       await new Promise((r) => setImmediate(r)); // let any unhandled rejection surface
     });
 
     it('survives a sink that throws synchronously', async () => {
-      setWildcardGrantSink(() => { throw new Error('sync boom'); });
+      setEntitlementDeniedSink(() => { throw new Error('sync boom'); });
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u7', subscriptionType: 'NoSuchTier' } as any);
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'subscription_types',
         settingValue: JSON.stringify([{ name: 'Pro', allowedPages: ['/tasks'], allowedSkills: ['s'] }]),
       } as any);
 
-      await expect(getAllowedSkills('u7')).resolves.toEqual(['*']);
+      await expect(getAllowedSkills('u7')).resolves.toBeNull();
     });
   });
 
@@ -808,12 +852,37 @@ describe('subscriptionService', () => {
 
   it('resolveSkillsToToolNames resolves skill IDs to tool names', async () => {
     const tools = await resolveSkillsToToolNames(['skill-1', 'skill-2']);
-    expect(tools.sort()).toEqual(['generate_image', 'generate_video'].sort());
+    expect(tools).not.toBeNull();
+    expect(tools!.sort()).toEqual(['generate_image', 'generate_video'].sort());
   });
 
   it('resolveSkillsToToolNames handles __other_skills__', async () => {
     const tools = await resolveSkillsToToolNames(['__other_skills__']);
     expect(tools).toContain('generate_image');
+  });
+
+  it('resolveSkillsToToolNames passes the FULL published catalog to getUnassociatedToolNames, not just the caller\'s own reachable skillIds (ENG-2299)', async () => {
+    // getPublishedSkills() (mocked above) returns the FULL multi-tenant catalog:
+    // skill-1 and skill-2. Even though this caller's own skillIds only reach
+    // skill-1, skill-2 must still be passed through — a published skill always
+    // claims its tool out of the shared __other_skills__ catch-all regardless of
+    // which tier is asking, exactly like getUnassociatedTools' own isPublished
+    // check (ENG-1237). Pre-filtering the catalog to the caller's own skillIds
+    // before this call is what let a tier-excluded skill's tool leak back into
+    // every tier's catch-all (the bug this test guards against).
+    const { agentModeService } = require('../services/agentModeService');
+    const seenSkillIds: string[][] = [];
+    const spy = jest
+      .spyOn(agentModeService, 'getUnassociatedToolNames')
+      .mockImplementation((skills: any) => {
+        seenSkillIds.push(skills.map((s: any) => s.skillId));
+        return ['generate_image'];
+      });
+
+    await resolveSkillsToToolNames(['skill-1', '__other_skills__']);
+
+    expect(seenSkillIds).toEqual([['skill-1', 'skill-2']]);
+    spy.mockRestore();
   });
 
   // ---- getAllowedFunctionCalls bridge tests ----
@@ -837,12 +906,29 @@ describe('subscriptionService', () => {
     expect(calls).toEqual(['generate_image']);
   });
 
-  it('getAllowedFunctionCalls returns wildcard when skills are wildcard', async () => {
+  it('getAllowedFunctionCalls returns wildcard when a tier explicitly authors it', async () => {
+    mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u1', subscriptionType: 'Pro' } as any);
+    mockedSettingsService.getSetting.mockResolvedValueOnce({
+      settingName: 'subscription_types',
+      settingValue: JSON.stringify([{ name: 'Pro', allowedPages: ['/tasks'], allowedSkills: ['*'] }]),
+    } as any);
+
+    const calls = await getAllowedFunctionCalls('u1');
+    expect(calls).toEqual(['*']);
+  });
+
+  /*
+   * ENG-1978: the legacy "Basic, no subscription_types row at all" bootstrap fallback is a
+   * silent default, not an admin-authored wildcard — it now fails closed through the whole
+   * getAllowedSkills -> resolveSkillsToToolNames -> getAllowedFunctionCalls bridge. This used to
+   * assert `['*']` before the fix.
+   */
+  it('getAllowedFunctionCalls fails closed through the bridge on the legacy Basic fallback', async () => {
     mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u1', subscriptionType: 'Basic' } as any);
     mockedSettingsService.getSetting.mockResolvedValueOnce(null as any);
 
     const calls = await getAllowedFunctionCalls('u1');
-    expect(calls).toEqual(['*']);
+    expect(calls).toBeNull();
   });
 
   it('getAllowedPages returns explicit list and strips /marketing prefix', async () => {
@@ -932,5 +1018,89 @@ describe('getAllAvailableConnectedAccounts', () => {
   // Settings page, since this list is what gates that page's card.
   it('includes linkedin_ads, which was missing despite having a full platform integration', () => {
     expect(getAllAvailableConnectedAccounts()).toContain('linkedin_ads');
+  });
+  /*
+   * ENG-1978: a transient DynamoDB error on the subscription_types read must not strip a user's plan.
+   * The last good read is served — bounded in age — only when the live read fails; a successful
+   * read always wins, so admin edits still apply immediately.
+   */
+  describe('last-known subscription_types on a failed read (ENG-1978)', () => {
+    const config = (skills: string[]) => ({
+      settingName: 'subscription_types',
+      settingValue: JSON.stringify([{ name: 'Pro', allowedPages: ['/tasks'], allowedSkills: skills }]),
+    });
+    let warn: jest.SpyInstance;
+
+    beforeEach(() => {
+      resetLastKnownSubscriptionTypes();
+      mockedSettingsService.getSetting.mockReset();
+      mockedUserDb.getUserById.mockReset();
+      mockedUserDb.getUserById.mockResolvedValue({ userId: 'u1', subscriptionType: 'Pro' } as any);
+      warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+    });
+    afterEach(() => {
+      jest.restoreAllMocks();
+      resetEntitlementDeniedSink();
+    });
+
+    it('keeps the user on their plan when the next read fails', async () => {
+      mockedSettingsService.getSetting.mockResolvedValueOnce(config(['skill-1']) as any);
+      expect(await getAllowedSkills('u1')).toEqual(['skill-1']);
+
+      mockedSettingsService.getSetting.mockRejectedValueOnce(new Error('dynamo down'));
+      expect(await getAllowedSkills('u1')).toEqual(['skill-1']);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('STALE-CONFIG'), 'dynamo down');
+    });
+
+    it('fails closed when a read fails and nothing was ever read', async () => {
+      const events: any[] = [];
+      setEntitlementDeniedSink((e) => events.push(e));
+      mockedSettingsService.getSetting.mockRejectedValueOnce(new Error('dynamo down'));
+
+      expect(await getAllowedSkills('u1')).toBeNull();
+      expect(events.map((e) => e.reason)).toContain('subscription-type-config-unavailable');
+    });
+
+    it('a successful read always wins over the remembered one (admin edits apply at once)', async () => {
+      mockedSettingsService.getSetting.mockResolvedValueOnce(config(['skill-1']) as any);
+      expect(await getAllowedSkills('u1')).toEqual(['skill-1']);
+
+      mockedSettingsService.getSetting.mockResolvedValueOnce(config(['skill-2']) as any);
+      expect(await getAllowedSkills('u1')).toEqual(['skill-2']);
+    });
+
+    it('stops serving the remembered config after 15 minutes', async () => {
+      const t0 = 1_800_000_000_000;
+      const now = jest.spyOn(Date, 'now').mockReturnValue(t0);
+      mockedSettingsService.getSetting.mockResolvedValueOnce(config(['skill-1']) as any);
+      expect(await getAllowedSkills('u1')).toEqual(['skill-1']);
+
+      now.mockReturnValue(t0 + 14 * 60_000);
+      mockedSettingsService.getSetting.mockRejectedValueOnce(new Error('dynamo down'));
+      expect(await getAllowedSkills('u1')).toEqual(['skill-1']);
+
+      now.mockReturnValue(t0 + 16 * 60_000);
+      mockedSettingsService.getSetting.mockRejectedValueOnce(new Error('dynamo down'));
+      expect(await getAllowedSkills('u1')).toBeNull();
+    });
+
+    it('warns at most once a minute while serving stale config', async () => {
+      const t0 = 1_800_000_000_000;
+      const now = jest.spyOn(Date, 'now').mockReturnValue(t0);
+      mockedSettingsService.getSetting.mockResolvedValueOnce(config(['skill-1']) as any);
+      await getAllowedSkills('u1');
+
+      mockedSettingsService.getSetting.mockRejectedValue(new Error('dynamo down'));
+      now.mockReturnValue(t0 + 1_000);
+      await getAllowedSkills('u1');
+      now.mockReturnValue(t0 + 20_000);
+      await getAllowedSkills('u1');
+      expect(warn.mock.calls.filter((c) => String(c[0]).includes('STALE-CONFIG'))).toHaveLength(1);
+
+      now.mockReturnValue(t0 + 61_000);
+      await getAllowedSkills('u1');
+      expect(warn.mock.calls.filter((c) => String(c[0]).includes('STALE-CONFIG'))).toHaveLength(2);
+    });
   });
 });

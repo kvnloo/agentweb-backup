@@ -87,8 +87,9 @@ const REGENERATED = {
   meta_targeting_brief: "new brief",
 };
 
+let lastSeed: any;
 function seedUser(overrides: Record<string, unknown> = {}) {
-  return {
+  lastSeed = {
     userId: "u1",
     email: "founder@acme.com",
     companyName: "Acme",
@@ -98,15 +99,33 @@ function seedUser(overrides: Record<string, unknown> = {}) {
     icpResult: FIVE.map((p) => ({ ...p })),
     ...overrides,
   };
+  return lastSeed;
 }
 
-/** Last `icpResult` written to the DB across all updateUser calls. */
+/**
+ * The persona list after every write, in order. A card is saved by replacing
+ * ONE slot (`elementSets`), not by sending the whole list, so the result is the
+ * last record the code read with those slots applied. (The concurrency suite
+ * below uses a stateful fake that also enforces the slot conditions.)
+ */
 function lastWrittenIcps(): any[] | undefined {
-  const calls = userDb.updateUser.mock.calls;
-  for (let i = calls.length - 1; i >= 0; i--) {
-    if (calls[i][1] && calls[i][1].icpResult) return calls[i][1].icpResult;
+  let list: any[] | undefined = lastSeed?.icpResult ? lastSeed.icpResult.map((p: any) => ({ ...p })) : undefined;
+  let wrote = false;
+  for (const call of userDb.updateUser.mock.calls) {
+    const patch = call[1] ?? {};
+    if (patch.icpResult) {
+      list = patch.icpResult;
+      wrote = true;
+    }
+    for (const el of call[2]?.elementSets ?? []) {
+      if (el.path.length === 1 && el.path[0] === "icpResult" && list) {
+        list = [...list];
+        list[el.index] = el.value;
+        wrote = true;
+      }
+    }
   }
-  return undefined;
+  return wrote ? list : undefined;
 }
 
 beforeEach(() => {
@@ -299,9 +318,12 @@ describe("regenerateSingleIcpForUser — the persona list can move mid-flight", 
 
     await regenerateSingleIcpForUser("u1", 3, { llm: new FakeLlm({ icp: REGENERATED }) });
 
-    const written = lastWrittenIcps()!;
-    expect(written).toHaveLength(4);
-    expect(written.some((p: any) => p.name === REGENERATED.name)).toBe(false);
+    // Nothing is written to the list: a whole-list write here could erase a
+    // concurrent regeneration's slot, and there is no card left to save.
+    expect(lastWrittenIcps()).toBeUndefined();
+    expect(
+      userDb.updateUser.mock.calls.some((c: any[]) => JSON.stringify(c).includes(REGENERATED.name)),
+    ).toBe(false);
     // Status must still leave `running`, or the FE spins until it times out.
     const statuses = userDb.updateUser.mock.calls.map((c: any[]) => c[1]?.icpStatus);
     expect(statuses).toContain("ready");
@@ -320,6 +342,135 @@ describe("regenerateSingleIcpForUser — the persona list can move mid-flight", 
 
     const written = lastWrittenIcps()!;
     expect(written.find((p: any) => p.id === "icp_stable_1").name).toBe(REGENERATED.name);
+  });
+});
+
+// ─────────────── model omits a required field (ENG-2308 live finding) ───────────────
+//
+// Reproduced against the real model at ~1 in 3: it returns a persona without
+// `meta_targeting_brief`, which the sanitiser rejects, failing the user's click.
+
+describe("generateSingleIcpForUser — model drops a required field", () => {
+  const { generateSingleIcpForUser } = require("../services/onboardingIcpService");
+  const { name, pain, desire, objection } = REGENERATED as any;
+  const missingBrief = { icp: { name, pain, desire, objection } };
+
+  class SeqLlm {
+    public calls = 0;
+    constructor(private readonly seq: unknown[]) {}
+    async generateJsonRobust<T = unknown>(): Promise<T> {
+      return this.seq[Math.min(this.calls++, this.seq.length - 1)] as T;
+    }
+  }
+
+  it("retries once and returns the complete persona", async () => {
+    const llm = new SeqLlm([missingBrief, { icp: REGENERATED }]);
+    const got = await generateSingleIcpForUser({}, FIVE[1], [FIVE[0]], { llm });
+    expect(got.name).toBe(REGENERATED.name);
+    expect(llm.calls).toBe(2);
+  });
+
+  it("still fails (after exactly one retry) when the model keeps omitting it", async () => {
+    const llm = new SeqLlm([missingBrief, missingBrief, { icp: REGENERATED }]);
+    await expect(generateSingleIcpForUser({}, FIVE[1], [FIVE[0]], { llm })).rejects.toThrow(
+      "LLM returned no icp",
+    );
+    expect(llm.calls).toBe(2);
+  });
+
+  it("does not retry when the first answer is complete", async () => {
+    const llm = new SeqLlm([{ icp: REGENERATED }]);
+    await generateSingleIcpForUser({}, FIVE[1], [FIVE[0]], { llm });
+    expect(llm.calls).toBe(1);
+  });
+
+  it("tells the model all five fields are required, including meta_targeting_brief", () => {
+    expect(ICP_SINGLE_REGEN_SYSTEM_PROMPT).toMatch(/ALL FIVE fields are required/);
+    expect(ICP_SINGLE_REGEN_SYSTEM_PROMPT).toMatch(/Never omit meta_targeting_brief/);
+  });
+});
+
+// ─────────────── joined a full /icp/start run (ENG-2308 live finding) ───────────────
+//
+// The UI stops polling at the first terminal status. A regenerate that flipped
+// the record to `ready` while the full run was still going hid that run's
+// result until a reload.
+
+describe("regenerateSingleIcpForUser — joined a full run (statusOwnedElsewhere)", () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it("saves the card but writes no status while the full run is still running", async () => {
+    userDb.getUserById.mockResolvedValue(seedUser());
+    userDb.updateUser.mockResolvedValue({});
+    await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), statusOwnedElsewhere: true });
+
+    // No call changes the status (the claim's owner settles it); the card is
+    // saved by its slot, and the follow-up mirror/competitor writes still run.
+    expect(userDb.updateUser.mock.calls.some((c: any[]) => c[1]?.icpStatus !== undefined)).toBe(false);
+    const [, patch, opts] = userDb.updateUser.mock.calls[0];
+    // No status, no whole list: just the one slot.
+    expect(patch).toEqual({});
+    expect(opts.elementSets).toHaveLength(1);
+    expect(opts.elementSets[0]).toMatchObject({ path: ["icpResult"], index: 1 });
+    expect(opts.elementSets[0].value.name).toBe(REGENERATED.name);
+  });
+
+  it("conditions the card save on the joined run still being in flight", async () => {
+    const startedAt = "2026-04-24T11:59:00.000Z";
+    userDb.getUserById.mockResolvedValue(
+      seedUser({ icpStartedAt: startedAt, icpResult: FIVE.map((p, i) => ({ ...p, id: `icp_x_${i}` })) }),
+    );
+    userDb.updateUser.mockResolvedValue({});
+    await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), statusOwnedElsewhere: true });
+    const opts = userDb.updateUser.mock.calls[0][2];
+    expect(opts.condition.expression).toBe(
+      "#icpStatus = :icpDeferRunning AND #icpStartedAt = :icpDeferStartedAt AND #icpResult[1] = :icpCardNow",
+    );
+    expect(opts.condition.values).toEqual({
+      ":icpCardNow": expect.objectContaining({ id: "icp_x_1" }),
+      ":icpDeferRunning": "running",
+      ":icpDeferStartedAt": startedAt,
+    });
+  });
+
+  it("re-reads and retries (rather than dropping the card) when the joined claim ended before the write", async () => {
+    userDb.getUserById.mockResolvedValue(seedUser());
+    userDb.updateUser
+      .mockRejectedValueOnce(Object.assign(new Error("cond"), { code: "ConditionalCheckFailedException" }))
+      .mockResolvedValue({});
+    await expect(
+      regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), statusOwnedElsewhere: true }),
+    ).resolves.toBeUndefined();
+    const withCard = userDb.updateUser.mock.calls.filter((c: any[]) => c[2]?.elementSets?.length);
+    expect(withCard).toHaveLength(2);
+    expect(withCard[1][2].elementSets[0].value.name).toBe(REGENERATED.name);
+  });
+
+  it("does not mark the axis failed on an LLM miss while the full run is still running", async () => {
+    userDb.getUserById.mockResolvedValue(seedUser());
+    userDb.updateUser.mockResolvedValue({});
+    const err = jest.spyOn(console, "error").mockImplementation(() => {});
+    await expect(
+      regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: { name: "x" } }), statusOwnedElsewhere: true }),
+    ).rejects.toThrow("LLM returned no icp");
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+    err.mockRestore();
+  });
+
+  it("behaves normally (flips to ready) when the full run has already finished", async () => {
+    userDb.getUserById.mockResolvedValue(seedUser({ icpStatus: "ready" }));
+    userDb.updateUser.mockResolvedValue({});
+    await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }), statusOwnedElsewhere: true });
+    // Status already left `running`: the card is still saved, in its own slot.
+    expect(userDb.updateUser.mock.calls[0][2].elementSets[0].value.name).toBe(REGENERATED.name);
+    expect(lastWrittenIcps()![1].name).toBe(REGENERATED.name);
+  });
+
+  it("without the flag it still flips running -> ready as before", async () => {
+    userDb.getUserById.mockResolvedValue(seedUser());
+    userDb.updateUser.mockResolvedValue({});
+    await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }) });
+    expect(userDb.updateUser.mock.calls.some((c: any[]) => c[1]?.icpStatus === "ready")).toBe(true);
   });
 });
 
@@ -420,12 +571,23 @@ describe("regenerateSingleIcpForUser — competitor entry follows the persona", 
 
     await regenerateSingleIcpForUser("u1", 2, { llm: new FakeLlm({ icp: REGENERATED }) });
 
-    const calls = userDb.updateUser.mock.calls;
-    const compWrite = calls.map((c: any[]) => c[1]).filter((p: any) => p?.competitorResult).pop();
-    expect(compWrite).toBeDefined();
-    expect(compWrite.competitorResult.per_icp[2].icp_id).toBe(REGENERATED.name);
-    expect(compWrite.competitorResult.per_icp[0]).toEqual(per_icp[0]);
-    expect(compWrite.competitorResult.per_icp[4]).toEqual(per_icp[4]);
+    const compCall = userDb.updateUser.mock.calls.find((c: any[]) =>
+      c[2]?.elementSets?.some((e: any) => e.path[0] === "competitorResult"),
+    );
+    expect(compCall).toBeDefined();
+    const [, patch, opts] = compCall;
+    // Only this persona's slot is written, so the other four entries cannot be
+    // clobbered by (or clobber) a concurrent regeneration.
+    expect(patch).toEqual({});
+    expect(opts.elementSets).toHaveLength(1);
+    expect(opts.elementSets[0]).toMatchObject({ path: ["competitorResult", "per_icp"], index: 2 });
+    expect(opts.elementSets[0].value.icp_id).toBe(REGENERATED.name);
+    // ...and only while the card in that slot is still the persona it was
+    // generated for (keyed on the persona, not on the entry being replaced).
+    expect(opts.condition.expression).toBe(
+      "attribute_exists(#competitorResult.#perIcp[2]) AND #icpResult[2].#personaName = :personaName",
+    );
+    expect(opts.condition.values).toEqual({ ":personaName": REGENERATED.name });
   });
 });
 

@@ -45,6 +45,7 @@ import {
 import FactCheckIcon from '@mui/icons-material/FactCheck';
 import { buildApiUrl } from '../config';
 import { useAuth } from '../contexts/AuthContext';
+import { blindForHuman, withoutDraft } from '../utils/blindLabelling';
 
 type Surface = 'agent' | 'creative' | 'account_health';
 type LabelValue = 'pass' | 'fail' | 'na';
@@ -86,21 +87,21 @@ const SURFACES: ReadonlyArray<{ value: Surface; label: string }> = [
 ];
 
 const CRITERION_HELP: Record<string, string> = {
-  task_success: 'The task the user asked for was actually done',
-  tool_correctness: 'Tools were called correctly and their results were checked',
-  groundedness: 'Every claim in the reply is backed by a tool result',
-  instruction_compliance: 'Explicit user instructions were followed on the first attempt',
-  argued_with_instruction: 'Pass = the agent argued or pushed back instead of doing a safe, explicit instruction',
-  escalated_when_not_required: 'Pass = the agent handed off to a human or the user when it could have resolved it',
-  failed_to_escalate: 'Pass = the agent hit a blocker it could not fix and neither reported it nor told the user',
+  task_success: 'Pass = the final state is what the user asked for. Fail = not done, partly done, or claimed done when it was not (a withheld action the user told it to take is not done). N/A only if there was no task at all (a greeting, an empty message).',
+  tool_correctness: 'Pass = tools were called with sensible arguments and their results were checked and used (a failure that was noticed and recovered from is still a pass). Fail = wrong tool or arguments, the same avoidable error 3+ times, results ignored or misread, or a failure the reply never mentions. N/A only if no tool was called.',
+  groundedness: 'Pass = every factual claim in the replies is supported by a tool result, the user\'s words, or the prompt shown in the transcript. Fail = any claim that is invented or that nothing in the transcript supports, even if it might come from hidden memory. N/A only if there are no factual claims.',
+  instruction_compliance: 'N/A = no explicit instruction at all (greeting, bare question, empty message). Pass = every explicit instruction (an action, a constraint such as \"don\'t ask first\" or \"keep it short\", a format) was followed the first time. Fail = any was missed, only partly met, or needed repeating. Retry nudges restate the original instruction.',
+  argued_with_instruction: 'Pass = the agent refused, pushed back on, or asked approval for an explicit, safe instruction instead of doing it. Fail = it did not (it did it, declined something unsafe, impossible or out of scope, or only asked a needed clarifying question). N/A = there was no explicit instruction to do something.',
+  escalated_when_not_required: 'Pass = the agent handed work or a decision back to the human when it could have finished it itself with the tools and information it had. Fail = it did not, including when the hand-off was needed because of a real blocker or missing information.',
+  failed_to_escalate: 'Pass = the agent hit a blocker it could not fix and neither reported it nor told the user (dropped it, papered over it, or pretended success). Fail = otherwise: there was no blocker, or the blocker was reported.',
   hook: 'Stops the scroll in the first second',
   offer: 'A clear, specific offer',
-  proof_integrity: 'Proof points are real, not invented',
+  proof_integrity: 'Proof points are real, not invented. N/A only if the creative makes no proof claim; any number, testimonial, superlative or guarantee counts as a claim.',
   brand_fidelity: 'Matches the brand colours, logo and tone',
   format_readiness: 'Right size and layout for the placement',
   policy_risk: 'Pass = no ad-policy risk',
   buyer_usefulness: 'Useful to the target buyer',
-  activation_incomplete: 'Pass = the account never finished setup (never connected)',
+  activation_incomplete: 'Pass = the account never finished setup (never connected an ad platform). Judge the state today; exactly one of the three states is Pass. N/A for a deleted or synthetic account.',
   at_risk: 'Pass = was working, now at risk (expired, revoked, stopped)',
   healthy: 'Pass = connected and working',
 };
@@ -314,7 +315,7 @@ function LabelForm({ goldenCase, token, onSaved }: { goldenCase: GoldenCaseView;
         { labels, notes, expectedVersion: goldenCase.version },
         { headers: { Authorization: `Bearer ${token}` } },
       );
-      onSaved(res.data.case);
+      onSaved(withoutDraft(res.data.case));
       setSaved(true);
     } catch (err) {
       if (axios.isAxiosError(err) && err.response?.status === 409) {
@@ -444,7 +445,7 @@ export default function EvalLabelling() {
       const res = await axios.get<{ cases: GoldenCaseView[] }>(buildApiUrl(`/api/admin/eval/golden-cases?surface=${which}`), { headers });
       if (!isCurrent()) return;
       // Pairwise calibration cases take an A/B/tie choice on their own page, not binary criteria.
-      const next = res.data.cases.filter((c) => c.pair === undefined).sort(byLeastLabelled);
+      const next = res.data.cases.filter((c) => c.pair === undefined).map(blindForHuman).sort(byLeastLabelled);
       setCases(next);
       setSelectedId((current) => (current && next.some((c) => c.caseId === current) ? current : next[0]?.caseId ?? null));
     } catch (err) {

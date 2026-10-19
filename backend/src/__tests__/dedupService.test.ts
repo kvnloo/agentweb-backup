@@ -80,3 +80,29 @@ describe('dedupService.findDuplicate attribution (ENG-1961)', () => {
     expect(options.usageContext.userId).toBeUndefined();
   });
 });
+
+
+// ENG-1335: the judge must compare the substantive ask, not title tokens, and must keep
+// adjacent-but-different asks (publish-refusal vs awaiting-user-input) apart.
+describe('dedupService.findDuplicate prompt (ENG-1335)', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('instructs substantive-ask matching with an explicit over-match guard', async () => {
+    mockJudge(JSON.stringify({ matchedIndex: null, confidence: 0 }));
+    await findDuplicate({ type: 'bug', title: 'a', description: 'b' }, CANDS);
+    const system = (agentModeService.callLLM as jest.Mock).mock.calls[0][1][0].content as string;
+    expect(system).toMatch(/substantive ask/);
+    expect(system).toMatch(/no distinctive title words/);
+    expect(system).toMatch(/DIFFERENT change are NOT a match/);
+    expect(system).toMatch(/publish-approval gate/);
+  });
+
+  it('keeps an ask that sits past a long preamble (ENG-1334 shape) in the prompt', async () => {
+    mockJudge(JSON.stringify({ matchedIndex: null, confidence: 0 }));
+    const description = 'REPEAT REQUEST — evidence. '.repeat(30) + 'ASK: score awaiting-user-input sessions neutral';
+    expect(description.length).toBeGreaterThan(600);
+    await findDuplicate({ type: 'bug', title: 'x', description }, CANDS);
+    const user = (agentModeService.callLLM as jest.Mock).mock.calls[0][1][1].content as string;
+    expect(user).toContain('ASK: score awaiting-user-input sessions neutral');
+  });
+});

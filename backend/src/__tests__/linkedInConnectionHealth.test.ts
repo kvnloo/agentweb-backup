@@ -423,6 +423,15 @@ describe('recordUnipileAccountHealth — reminders', () => {
       ['jennifer.sun@tfaconnect.com'],
       expect.objectContaining({ isReminder: true, daysDisconnected: 9 }),
     );
+    // ENG-2363: the reminder carries the same stable per-account Alert Class as the first
+    // alert, so intake folds it onto the account's open canonical instead of filing anew.
+    expect(sendAgentModeOncallAlert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        context: expect.objectContaining({ 'Alert Class': `unipile-disconnected:${ACCOUNT_ID}`, 'Alert Legacy Key': `accountId: ${ACCOUNT_ID}` }),
+        dedupeKey: `unipile_disconnected:${ACCOUNT_ID}`,
+        dedupeWindowMs: 12 * 60 * 60 * 1000,
+      }),
+    );
   });
 
   it('does not remind before the window elapses', async () => {

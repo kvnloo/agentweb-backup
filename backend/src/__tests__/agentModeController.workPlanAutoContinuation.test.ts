@@ -17,6 +17,7 @@ import { Request, Response } from 'express';
 import {
   agentModeController,
   activeSessionGenerations,
+  sessionGenerationOwners,
   autoContinuationSessions,
   AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS,
 } from '../controllers/agentModeController';
@@ -106,10 +107,13 @@ jest.mock('../utils/agentModeAlerts', () => ({
 }));
 
 jest.mock('../utils/agentModeErrors', () => ({
+  // Spread the real module so new exports (e.g. isProviderUnavailableError) never leave the controller error handler calling undefined.
+  ...jest.requireActual('../utils/agentModeErrors'),
   isContextLimitError: jest.fn().mockReturnValue(false),
   isSessionLimitError: jest.fn().mockReturnValue(false),
   isTransientLLMError: jest.fn().mockReturnValue(false),
   isWorkerShutdownError: jest.fn().mockReturnValue(false),
+  isProviderNoEndpointsError: jest.fn().mockReturnValue(false),
 }));
 
 const mockIoEmit = jest.fn();
@@ -313,6 +317,23 @@ describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1
 
     expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
     expect(mockIoEmit).not.toHaveBeenCalled();
+  });
+
+  it('ENG-110: a work-plan continuation round records the session owner as the lock owner while it runs, and clears it after', async () => {
+    let ownerDuring: string | undefined;
+    mockWorkerService.runInWorker
+      .mockResolvedValueOnce(workerResponse('Step 6 was interrupted.', [failedToolCall()]))
+      .mockImplementationOnce(async () => {
+        ownerDuring = sessionGenerationOwners.get(mockSessionId);
+        mockChatbotDb.getChatSession.mockResolvedValue(baseSession(completedWorkPlan) as any);
+        (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(baseSession(completedWorkPlan) as any);
+        return workerResponse('Report generated.', []);
+      });
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    await flush();
+    expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+    expect(ownerDuring).toBe(mockUserId);
+    expect(sessionGenerationOwners.size).toBe(0);
   });
 
   it('ENG-1699: does not fire the continuation if the stall was already resolved by the time it runs', async () => {

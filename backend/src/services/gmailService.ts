@@ -561,6 +561,11 @@ export class GmailService implements IEmailService {
     if (bccStr) headerLines.push(`Bcc: ${bccStr}`);
     if (inReplyTo) headerLines.push(`In-Reply-To: ${inReplyTo}`);
     if (references) headerLines.push(`References: ${references}`);
+    // ENG-2367: caller-supplied headers; CR/LF stripped so a value can't inject extra headers.
+    for (const [name, value] of Object.entries(params.headers || {})) {
+      const safeName = name.replace(/[^A-Za-z0-9-]/g, '');
+      if (safeName) headerLines.push(`${safeName}: ${String(value).replace(/[\r\n]+/g, ' ')}`);
+    }
     headerLines.push('', params.body);
 
     const rawMessage = headerLines.join('\r\n');

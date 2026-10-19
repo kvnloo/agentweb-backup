@@ -173,4 +173,24 @@ describe('Work plans tool cluster delegates to emma/impl/workPlans.ts (ENG-2103 
     expect(() => (callArgs[5] as any)()).toThrow('agentModeService.callLLM should not be called by the work-plans tool cluster after ENG-2103 F2');
     expect(result).toBe(expected);
   });
+
+  // ENG-2399 (Opslane run 285 findings 1-2): pin the registered tool entry, not just the validator.
+  it('modify_work_plan: a remove-only call reaches the handler and its result is returned', async () => {
+    const expected = { success: true, message: 'Work plan modified successfully' };
+    mockWorkPlans.modifyWorkPlan.mockReset();
+    mockWorkPlans.modifyWorkPlan.mockResolvedValue(expected as any);
+    const tool = emmaToolRegistry.getTool('modify_work_plan')!;
+    const result = await tool.execute({ removeStepCounts: [3] }, { sessionId: 's1' });
+    expect(mockWorkPlans.modifyWorkPlan.mock.calls[0].slice(0, 3)).toEqual([[], [3], 's1']);
+    expect(result).toBe(expected);
+  });
+
+  it('modify_work_plan: a string stepCount returns structured invalid_args and never reaches the handler', async () => {
+    mockWorkPlans.modifyWorkPlan.mockReset();
+    const tool = emmaToolRegistry.getTool('modify_work_plan')!;
+    const result: any = await tool.execute({ steps: [{ stepCount: '2', title: 'X' }] }, { sessionId: 's1' });
+    expect(result).toMatchObject({ success: false, errorClass: 'invalid_args', field: 'steps[0].stepCount', expected: 'integer >= 1' });
+    expect(result.message).toMatch(/^Invalid parameters for modify_work_plan/);
+    expect(mockWorkPlans.modifyWorkPlan).not.toHaveBeenCalled();
+  });
 });

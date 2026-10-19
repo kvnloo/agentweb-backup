@@ -1,5 +1,5 @@
 {
-  "fetchedAt": "2026-09-23T00:39:44.967Z",
+  "fetchedAt": "2026-10-08T09:37:43.920Z",
   "source": "https://openrouter.ai/api/v1/models/{id}/endpoints",
   "models": {
     "anthropic/claude-fable-5.1": {
@@ -7,8 +7,8 @@
       "endpoints": [
         {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]}
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]}
       ]
     },
     "anthropic/claude-haiku-4.5": {
@@ -18,10 +18,25 @@
         {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","response_format","temperature","tool_choice","tools","top_k","top_p"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","stop","temperature","tool_choice","tools","top_k","top_p"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","stop","temperature","tool_choice","tools","top_k","top_p"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","stop","temperature","tool_choice","tools","top_k","top_p"]}
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","response_format","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]}
+      ]
+    },
+    "anthropic/claude-haiku-5.5": {
+      "resolvedId": "anthropic/claude-haiku-5.5",
+      "endpoints": [
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
+        {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Claude Platform on AWS","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]}
       ]
     },
     "anthropic/claude-opus-4.6": {
@@ -29,10 +44,10 @@
       "endpoints": [
         {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p","verbosity"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","temperature","tool_choice","tools","top_k","top_p","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p","verbosity"]},
         {"provider":"Claude Platform on AWS","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p","verbosity"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","temperature","tool_choice","tools","top_p","verbosity"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","temperature","tool_choice","tools","top_p","verbosity"]}
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p","verbosity"]}
       ]
     },
     "anthropic/claude-opus-4.8": {
@@ -43,12 +58,12 @@
         {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","temperature","tool_choice","tools","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","temperature","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Claude Platform on AWS","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]}
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]}
       ]
     },
     "anthropic/claude-opus-5": {
@@ -59,12 +74,12 @@
         {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","temperature","tool_choice","tools","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","temperature","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Claude Platform on AWS","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]}
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]}
       ]
     },
     "anthropic/claude-opus-5.5": {
@@ -75,12 +90,12 @@
         {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","temperature","tool_choice","tools","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","temperature","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Claude Platform on AWS","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]}
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]}
       ]
     },
     "anthropic/claude-sonnet-4.5": {
@@ -89,10 +104,10 @@
         {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","response_format","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","response_format","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Claude Platform on AWS","supported_parameters":["include_reasoning","max_tokens","reasoning","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","stop","temperature","tool_choice","tools","top_k","top_p"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","stop","temperature","tool_choice","tools","top_k","top_p"]}
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]}
       ]
     },
     "anthropic/claude-sonnet-4.6": {
@@ -102,11 +117,11 @@
         {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p","verbosity"]},
         {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p","verbosity"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","temperature","tool_choice","tools","top_k","top_p","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p","verbosity"]},
         {"provider":"Claude Platform on AWS","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p","verbosity"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","temperature","tool_choice","tools","top_p","verbosity"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","temperature","tool_choice","tools","top_p","verbosity"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","temperature","tool_choice","tools","top_p","verbosity"]}
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p","verbosity"]}
       ]
     },
     "anthropic/claude-sonnet-5": {
@@ -116,12 +131,25 @@
         {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
         {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
         {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
         {"provider":"Claude Platform on AWS","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
-        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]}
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]}
+      ]
+    },
+    "anthropic/claude-sonnet-5.5": {
+      "resolvedId": "anthropic/claude-sonnet-5.5",
+      "endpoints": [
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
+        {"provider":"Anthropic","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Claude Platform on AWS","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","tool_choice","tools","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools","verbosity"]}
       ]
     },
     "deepseek/deepseek-v4-flash": {
@@ -131,17 +159,19 @@
         {"provider":"AtlasCloud","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","temperature","tool_choice","tools","top_p"]},
         {"provider":"Baidu","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
+        {"provider":"Cloudflare","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"DeepInfra","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"DigitalOcean","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"GMICloud","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","temperature","tool_choice","tools","top_p"]},
         {"provider":"Mancer 2","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_a","top_k","top_logprobs","top_p"]},
-        {"provider":"NextBit","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
         {"provider":"Novita","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"OpenInference","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Parasail","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Relace","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"SiliconFlow","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"StreamLake","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
-        {"provider":"Venice","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]}
+        {"provider":"Venice","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Wafer","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]}
       ]
     },
     "deepseek/deepseek-v4-pro": {
@@ -151,18 +181,78 @@
         {"provider":"AtlasCloud","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","max_tokens","reasoning","reasoning_effort","response_format","temperature","tool_choice","tools","top_p"]},
         {"provider":"Baidu","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
-        {"provider":"BaseTen","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
-        {"provider":"BaseTen","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
         {"provider":"Cloudflare","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"DeepInfra","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"DigitalOcean","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"GMICloud","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","temperature","tool_choice","tools","top_p"]},
-        {"provider":"NextBit","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
         {"provider":"Novita","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Parasail","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Reka","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Relace","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"SiliconFlow","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"StreamLake","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"Venice","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]}
+      ]
+    },
+    "deepseek/deepseek-v4-pro-0813": {
+      "resolvedId": "deepseek/deepseek-v4-pro-0813",
+      "endpoints": [
+        {"provider":"Alibaba","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"AtlasCloud","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Baidu","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
+        {"provider":"Cloudflare","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"CoreWeave","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"DeepInfra","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"DeepSeek","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"DigitalOcean","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"GMICloud","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Ionstream","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Nebius","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Novita","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Parasail","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Phala","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Relace","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Sail Research","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Sail Research","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"SiliconFlow","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"StreamLake","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","stop","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Together","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Venice","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Wafer","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]}
+      ]
+    },
+    "deepseek/deepseek-v4.1-flash": {
+      "resolvedId": "deepseek/deepseek-v4.1-flash",
+      "endpoints": [
+        {"provider":"Alibaba","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"AtlasCloud","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Baidu","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
+        {"provider":"BaseTen","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
+        {"provider":"BaseTen","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
+        {"provider":"CoreWeave","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Decart","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"DeepInfra","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"DeepSeek","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"DekaLLM","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"DigitalOcean","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Fireworks","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Fireworks","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"GMICloud","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"InferenceNet","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Ionstream","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Makora","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Modal","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
+        {"provider":"Morph","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Novita","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Parasail","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Phala","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Relace","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","stop","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Sail Research","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"SiliconFlow","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"StreamLake","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","stop","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Together","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Venice","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Wafer","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]}
       ]
     },
     "google/gemini-3-flash-preview": {
@@ -212,6 +302,19 @@
         {"provider":"Google AI Studio","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_p"]}
       ]
     },
+    "google/gemini-3.5-flash-lite": {
+      "resolvedId": "google/gemini-3.5-flash-lite",
+      "endpoints": [
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","tool_choice","tools"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","tool_choice","tools"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","tool_choice","tools"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","tool_choice","tools"]},
+        {"provider":"Google","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","tool_choice","tools"]},
+        {"provider":"Google AI Studio","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_p"]},
+        {"provider":"Google AI Studio","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_p"]},
+        {"provider":"Google AI Studio","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_p"]}
+      ]
+    },
     "google/gemini-3.7-flash": {
       "resolvedId": "google/gemini-3.7-flash",
       "endpoints": [
@@ -239,6 +342,7 @@
       "endpoints": [
         {"provider":"Mistral","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
         {"provider":"Mistral","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
+        {"provider":"Mistral","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
         {"provider":"Mistral","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_p"]}
       ]
     },
@@ -246,16 +350,13 @@
       "resolvedId": "moonshotai/kimi-k2.7-code",
       "endpoints": [
         {"provider":"Alibaba","supported_parameters":["include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
-        {"provider":"BaseTen","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","stop","temperature","tool_choice","tools","top_p"]},
         {"provider":"Cloudflare","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"CoreWeave","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
-        {"provider":"DeepInfra","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","repetition_penalty","seed","stop","temperature","tool_choice","tools","top_k","top_p"]},
-        {"provider":"Fireworks","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"GMICloud","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"Inceptron","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","parallel_tool_calls","presence_penalty","reasoning","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
-        {"provider":"ModelRun","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Moonshot AI","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","response_format","stop","structured_outputs","tool_choice","tools"]},
         {"provider":"Moonshot AI","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","response_format","stop","structured_outputs","tool_choice","tools"]},
+        {"provider":"Nebius","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Novita","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"SiliconFlow","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","reasoning","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"StreamLake","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","response_format","stop","structured_outputs","tool_choice","tools","top_logprobs","top_p"]},
@@ -265,25 +366,29 @@
     "moonshotai/kimi-k3": {
       "resolvedId": "moonshotai/kimi-k3",
       "endpoints": [
+        {"provider":"AkashML","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Alibaba","supported_parameters":["include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","top_logprobs"]},
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","seed","stop","tools","top_k"]},
         {"provider":"BaseTen","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","stop","temperature","tool_choice","tools","top_p"]},
         {"provider":"Chutes","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","top_k","top_p"]},
+        {"provider":"Decart","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"DeepInfra","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"DigitalOcean","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"Fireworks","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Fireworks","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Fireworks","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","top_k","top_logprobs","top_p"]},
-        {"provider":"InferenceNet","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"InferenceNet","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"InferenceNet","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Makora","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Modal","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tools","top_p"]},
         {"provider":"Moonshot AI","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","tool_choice","tools"]},
-        {"provider":"Morph","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Morph","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Parasail","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Phala","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Relace","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","stop","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Sail Research","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Together","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Wafer","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Wafer","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]}
       ]
     },
@@ -298,99 +403,118 @@
     "openai/gpt-5.4": {
       "resolvedId": "openai/gpt-5.4",
       "endpoints": [
-        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","tool_choice","tools"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]}
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]}
       ]
     },
     "openai/gpt-5.4-nano": {
       "resolvedId": "openai/gpt-5.4-nano",
       "endpoints": [
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]}
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]}
       ]
     },
     "openai/gpt-5.5": {
       "resolvedId": "openai/gpt-5.5",
       "endpoints": [
-        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","tool_choice","tools"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]}
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]}
       ]
     },
     "openai/gpt-5.6-luna": {
       "resolvedId": "openai/gpt-5.6-luna",
       "endpoints": [
-        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","tool_choice","tools"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]}
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]}
       ]
     },
     "openai/gpt-5.6-sol": {
       "resolvedId": "openai/gpt-5.6-sol",
       "endpoints": [
-        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","tool_choice","tools"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]}
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]}
       ]
     },
     "openai/gpt-5.6-terra": {
       "resolvedId": "openai/gpt-5.6-terra",
       "endpoints": [
-        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","tool_choice","tools"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]}
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]}
       ]
     },
     "openai/gpt-6-astra": {
       "resolvedId": "openai/gpt-6-astra",
       "endpoints": [
-        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","tool_choice","tools"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]}
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]}
       ]
     },
     "openai/gpt-6-luna": {
       "resolvedId": "openai/gpt-6-luna",
       "endpoints": [
-        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]}
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]}
       ]
     },
     "openai/gpt-6-sol": {
       "resolvedId": "openai/gpt-6-sol",
       "endpoints": [
-        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
-        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]}
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]}
+      ]
+    },
+    "openai/gpt-6.1-sol": {
+      "resolvedId": "openai/gpt-6.1-sol",
+      "endpoints": [
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools","verbosity"]}
       ]
     },
     "perplexity/sonar-deep-research": {
@@ -410,6 +534,7 @@
       "endpoints": [
         {"provider":"AkashML","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Alibaba","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Cerebras","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","seed","stop","temperature","top_logprobs","top_p"]},
         {"provider":"Chutes","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Cloudflare","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"CoreWeave","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
@@ -418,6 +543,7 @@
         {"provider":"DekaLLM","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"Ionstream","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"Mancer 2","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_a","top_k","top_logprobs","top_p"]},
+        {"provider":"ModelRun","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
         {"provider":"Novita","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Parasail","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Phala","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
@@ -426,7 +552,7 @@
         {"provider":"Wafer","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]}
       ]
     },
-    "qwen/qwen3.8-max": {
+    "qwen/qwen3.8-max-0902": {
       "resolvedId": "qwen/qwen3.8-max-0902",
       "endpoints": [
         {"provider":"Alibaba","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]}
@@ -439,12 +565,14 @@
         {"provider":"xAI","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"xAI","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"xAI","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"xAI","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"xAI","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]}
       ]
     },
     "x-ai/grok-4.7": {
       "resolvedId": "x-ai/grok-4.7",
       "endpoints": [
+        {"provider":"xAI","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"xAI","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"xAI","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"xAI","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
@@ -473,21 +601,112 @@
         {"provider":"BaseTen","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
         {"provider":"Cloudflare","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"CoreWeave","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Decart","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Decart","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"DeepInfra","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
-        {"provider":"DigitalOcean","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","temperature","tool_choice","tools","top_logprobs","top_p"]},
-        {"provider":"Fireworks","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
-        {"provider":"Fireworks","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
-        {"provider":"Fireworks","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"DigitalOcean","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"Friendli","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"GMICloud","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
-        {"provider":"Inceptron","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","parallel_tool_calls","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Inceptron","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","parallel_tool_calls","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"InferenceNet","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Mistral","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Mistral","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Morph","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Nebius","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Novita","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Parasail","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Phala","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Relace","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"SiliconFlow","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","reasoning","reasoning_effort","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"StreamLake","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"Together","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Venice","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Wafer","supported_parameters":["include_reasoning","logit_bias","max_tokens","min_p","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","tool_choice","tools","top_k"]},
+        {"provider":"Wafer","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Z.AI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","temperature","tool_choice","tools","top_k","top_p"]}
+      ]
+    },
+    "z-ai/glm-5.3": {
+      "resolvedId": "z-ai/glm-5.3",
+      "endpoints": [
+        {"provider":"AkashML","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Alibaba","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Alibaba","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"AtlasCloud","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Baidu","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
+        {"provider":"BaseTen","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
+        {"provider":"BaseTen","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
+        {"provider":"BaseTen","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","stop","temperature","tool_choice","tools","top_p"]},
+        {"provider":"BaseTen","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","stop","temperature","tool_choice","tools","top_p"]},
+        {"provider":"Cloudflare","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Crusoe","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Decart","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"DeepInfra","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"DigitalOcean","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Fireworks","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Fireworks","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Friendli","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"GMICloud","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","temperature","tool_choice","tools","top_p"]},
+        {"provider":"Inceptron","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","parallel_tool_calls","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"InferenceNet","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Io Net","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Makora","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Mistral","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Mistral","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Mistral","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Modal","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Morph","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Nebius","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Novita","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Parasail","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Phala","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"PrimeIntellect","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Reka","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Relace","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Sail Research","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Sail Research","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"SiliconFlow","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Together","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Venice","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Wafer","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Wafer","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Z.AI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","temperature","tool_choice","tools","top_k","top_p"]}
+      ]
+    },
+    "z-ai/glm-5.3-flash": {
+      "resolvedId": "z-ai/glm-5.3-flash",
+      "endpoints": [
+        {"provider":"AtlasCloud","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","seed","stop","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"BaseTen","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
+        {"provider":"BaseTen","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_p"]},
+        {"provider":"Cloudflare","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"CoreWeave","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Crusoe","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Decart","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"DeepInfra","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"DekaLLM","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"DigitalOcean","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Fireworks","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Fireworks","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Friendli","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"GMICloud","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","temperature","tool_choice","tools","top_p"]},
+        {"provider":"Inceptron","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","parallel_tool_calls","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"InferenceNet","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Modal","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"Morph","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Near AI","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Novita","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"OpenInference","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Parasail","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Parasail","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Phala","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Reka","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Relace","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","repetition_penalty","seed","stop","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"Sail Research","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"Sail Research","supported_parameters":["frequency_penalty","include_reasoning","logprobs","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
+        {"provider":"SiliconFlow","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"StreamLake","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","temperature","tool_choice","tools","top_p"]},
+        {"provider":"Together","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Venice","supported_parameters":["frequency_penalty","include_reasoning","max_tokens","presence_penalty","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
         {"provider":"Wafer","supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"]},
         {"provider":"Z.AI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","temperature","tool_choice","tools","top_k","top_p"]}

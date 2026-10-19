@@ -86,7 +86,7 @@ describe('read_file_content Emma tool', () => {
       { userId: 'user-123', sessionId: 'sess-1' }
     );
 
-    expect(miscImpl.readFileContent).toHaveBeenCalledWith('https://example.com/pasted-text.txt');
+    expect(miscImpl.readFileContent).toHaveBeenCalledWith('https://example.com/pasted-text.txt', { userId: 'user-123' });
     expect(result).toEqual({
       content: [{ type: 'text', text: 'hello from attachment' }]
     });
@@ -104,7 +104,7 @@ describe('read_file_content Emma tool', () => {
 
     const result = await tool.execute({}, { userId: 'user-123', sessionId: 'sess-1' });
 
-    expect(miscImpl.readFileContent).toHaveBeenCalledWith(undefined);
+    expect(miscImpl.readFileContent).toHaveBeenCalledWith(undefined, { userId: 'user-123' });
     expect(result).toMatchObject({ isError: true });
     expect(result.content?.[0]?.text).toContain('file_url is required');
   });

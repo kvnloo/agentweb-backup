@@ -186,8 +186,61 @@ describe('buildSessionRow: the server owns classification', () => {
 
   it('first-touch channel is classified server-side from the stored first landing URL + referrer host', () => {
     const v = ok(base({ firstTouchLanding: 'https://go.example.com/?utm_source=tiktok', firstTouchReferrer: 'l.instagram.com', firstTouchChannel: 'Spoof' }));
-    expect(buildSessionRow(v, { userAgent: CHROME, nowIso: 'T' }).customFields.firstTouchChannel).toBe('TikTok');
+    // 2.2.0: the observed first referrer (Instagram) beats the link's tiktok tag.
+    expect(buildSessionRow(v, { userAgent: CHROME, nowIso: 'T' }).customFields.firstTouchChannel).toBe('Instagram');
     const legacy = ok(base({ firstTouchChannel: 'Facebook' }));
     expect(buildSessionRow(legacy, { userAgent: CHROME, nowIso: 'T' }).customFields.firstTouchChannel).toBe('Facebook');
+  });
+  it('ENG-2494: on the first visit, first touch comes from THIS landing session, not SDK-stored state', () => {
+    const creator = 'https://go.dramabreak.ai/g?utm_source=tiktok&utm_medium=social';
+    const stale = { firstTouchLanding: 'https://go.dramabreak.ai/g', firstTouchReferrer: 'youtube.com', firstTouchChannel: 'YouTube' };
+    const yt = ok(base({ visitNo: 1, landingUrl: creator, referrer: 'https://www.youtube.com/', ...stale }));
+    const row = buildSessionRow(yt, { userAgent: CHROME, nowIso: 'T' }).customFields;
+    expect(row.firstTouchChannel).toBe('YouTube');
+    expect(row.firstTouchReferrer).toBe('youtube.com');
+    const ig = ok(base({ visitNo: 1, landingUrl: creator, referrer: 'https://l.instagram.com/', ...stale }));
+    expect(buildSessionRow(ig, { userAgent: CHROME, nowIso: 'T' }).customFields.firstTouchChannel).toBe('Instagram');
+  });
+});
+
+describe('ENG-2494 first touch on agency links and follow-up events (Opslane run 590)', () => {
+  const CHROME = 'Mozilla/5.0 (Windows NT 10.0) Chrome/120';
+  const agency = 'https://go.dramabreak.ai/g?utm_source=agency-rise&utm_medium=agency';
+  const ctx = { userAgent: CHROME, nowIso: 'T' };
+  it('first visit on an agency link: first touch is the click platform, last touch stays Agency', () => {
+    for (const [ref, want] of [['https://www.tiktok.com/', 'TikTok'], ['https://www.youtube.com/', 'YouTube'], ['https://l.instagram.com/', 'Instagram']]) {
+      const row = buildSessionRow(ok(base({ visitNo: 1, eventCount: 1, landingUrl: agency, referrer: ref })), ctx).customFields;
+      expect(row.firstTouchChannel).toBe(want);
+      expect(row.channel).toBe('Agency');
+    }
+    const ig = buildSessionRow(ok(base({ visitNo: 1, eventCount: 1, landingUrl: agency })), { userAgent: 'Mozilla/5.0 (iPhone) Instagram 300.0', nowIso: 'T' }).customFields;
+    expect(ig.firstTouchChannel).toBe('Instagram');
+  });
+  it('return visit: stored agency landing + stored TikTok referrer gives TikTok', () => {
+    const row = buildSessionRow(ok(base({ visitNo: 2, eventCount: 1, landingUrl: 'https://go.dramabreak.ai/g', referrer: 'https://www.youtube.com/', firstTouchLanding: agency, firstTouchReferrer: 'tiktok.com', firstTouchChannel: 'Agency' })), ctx).customFields;
+    expect(row.firstTouchChannel).toBe('TikTok');
+  });
+  it('agency link with no observable signal stays Agency; paid links keep the ad platform', () => {
+    expect(buildSessionRow(ok(base({ visitNo: 1, eventCount: 1, landingUrl: agency })), ctx).customFields.firstTouchChannel).toBe('Agency');
+  });
+  it('a later event in the first visit without an external signal does not overwrite first touch', () => {
+    const later = buildSessionRow(ok(base({ visitNo: 1, eventCount: 3, event: 'click', clickLabel: 'x', landingUrl: 'https://go.dramabreak.ai/g', referrer: 'https://go.dramabreak.ai/' })), ctx).customFields;
+    expect(later).not.toHaveProperty('firstTouchChannel');
+    expect(later).not.toHaveProperty('firstTouchReferrer');
+  });
+});
+
+describe('repairEscapedQuery (HTML-escaped share links)', () => {
+  const { repairEscapedQuery } = require('../trackingIngest');
+  it('recovers UTMs from a link whose & became amp;', () => {
+    const fixed = repairEscapedQuery('https://go.dramabreak.ai/x?utm_source=dramabreakamp;utm_medium=socialamp;utm_campaign=gbtm_launchamp;utm_content=sunny');
+    expect(Object.fromEntries(new URL(fixed).searchParams)).toEqual({ utm_source: 'dramabreak', utm_medium: 'social', utm_campaign: 'gbtm_launch', utm_content: 'sunny' });
+  });
+  it('recovers &amp; and keeps the hash', () => {
+    expect(repairEscapedQuery('https://a.b/x?utm_source=a&amp;utm_medium=b#h')).toBe('https://a.b/x?utm_source=a&utm_medium=b#h');
+  });
+  it('leaves clean links and values that only contain "amp" unchanged', () => {
+    expect(repairEscapedQuery('https://a.b/x?utm_source=ok&utm_medium=s')).toBe('https://a.b/x?utm_source=ok&utm_medium=s');
+    expect(repairEscapedQuery('https://a.b/x?utm_source=campamp;x')).toBe('https://a.b/x?utm_source=campamp;x');
   });
 });

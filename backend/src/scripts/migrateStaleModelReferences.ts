@@ -55,7 +55,7 @@ export const SAME_FAMILY_MODEL_REPLACEMENTS: Record<string, string> = {
   'openrouter/x-ai/grok-4.3': 'openrouter/x-ai/grok-4.6',
   'openrouter/mistralai/mistral-large-2512': 'openrouter/mistralai/mistral-small-2603',
   'openrouter/moonshotai/kimi-k2.6': 'openrouter/moonshotai/kimi-k2.7-code',
-  'openrouter/qwen/qwen3.7-flash': 'openrouter/qwen/qwen3.8-max',
+  'openrouter/qwen/qwen3.7-flash': 'openrouter/qwen/qwen3.8-max-0902',
   // openrouter/meta-llama/llama-4-maverick, llama-4-scout, llama-3.1-8b-instruct:
   // deliberately NOT mapped — no current-gen Llama entrant exists on OpenRouter
   // (checked live 2026-08-17, no meta-llama/llama-5* listed). Records referencing

@@ -26,13 +26,53 @@ const mockProbeSearchCapability = jest.fn().mockResolvedValue('ok');
 const mockFilterByCompanySize = jest.fn(
   async (...args: any[]) => ({ items: args[0], excludedUnverifiable: 0 }),
 );
-jest.mock('../services/linkedInOutreachService', () => ({
-  linkedInOutreachService: {
-    searchPeople: (...args: any[]) => mockSearchPeople(...args),
-    resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
-    probeSearchCapability: (...args: any[]) => mockProbeSearchCapability(...args),
-    filterByCompanySize: (...args: any[]) => mockFilterByCompanySize(...args),
-  },
+const mockClearStatusCache = jest.fn();
+const mockProbeAccountSession = jest.fn();
+// Defaults to false (own account) so every pre-existing test below — none of
+// which care about site-wide-pool attribution — keeps working unmodified.
+// Only the reactive-handler tests override it to exercise usedSharedAccount: true.
+const mockUsedSharedAccount = jest.fn().mockReturnValue(false);
+// A faithful inline copy of isProvenDisconnectError's logic (pure,
+// dependency-free). jest.requireActual on this module was tried first, but
+// that pulls in linkedInOutreachService.ts's real top-level `import {
+// UnipileClient } from 'unipile-node-sdk'` at load time, which interacted
+// unreliably with another test file's `{virtual: true}` mock of that same
+// package when both ran in the same jest worker — reproducibly ~50% failure
+// rate across runs of the combined suite, 0% in isolation. Inlining avoids
+// loading the real module's import graph at all.
+function isProvenDisconnectErrorMock(error: any): boolean {
+  const structured = error?.structuredError;
+  const code = structured?.code || error?.body?.code || error?.code || '';
+  const status = structured?.status || error?.body?.status || error?.status;
+  const classification = structured?.classification || error?.body?.classification || error?.classification;
+  if (Number(status) === 403 && code !== 'errors/disconnected_account') return false;
+  return code === 'errors/disconnected_account' || classification === 'AUTH_ERROR' || Number(status) === 401;
+}
+jest.mock('../services/linkedInOutreachService', () => {
+  return {
+    isProvenDisconnectError: isProvenDisconnectErrorMock,
+    linkedInOutreachService: {
+      searchPeople: (...args: any[]) => mockSearchPeople(...args),
+      resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
+      // importLeadsFromSearch calls resolveAccountIdWithSource (needs
+      // usedSharedAccount for the reactive handler's ownerUserId attribution);
+      // synthesized from the same mockResolveAccountId so every existing test
+      // setup (`mockResolveAccountId.mockResolvedValue(...)`) keeps working.
+      resolveAccountIdWithSource: async (...args: any[]) => ({
+        accountId: await mockResolveAccountId(...args),
+        usedSharedAccount: mockUsedSharedAccount(),
+      }),
+      probeSearchCapability: (...args: any[]) => mockProbeSearchCapability(...args),
+      filterByCompanySize: (...args: any[]) => mockFilterByCompanySize(...args),
+      clearStatusCache: (...args: any[]) => mockClearStatusCache(...args),
+      probeAccountSession: (...args: any[]) => mockProbeAccountSession(...args),
+    },
+  };
+});
+
+const mockRecordUnipileAccountHealth = jest.fn();
+jest.mock('../services/linkedInConnectionHealth', () => ({
+  recordUnipileAccountHealth: (...args: any[]) => mockRecordUnipileAccountHealth(...args),
 }));
 
 const mockGetProfile = jest.fn();
@@ -727,6 +767,10 @@ describe('AgentModeService.importLeadsFromSearch — top-up loop', () => {
     mockGetLeadListById.mockReset();
     mockDeleteLead.mockReset();
     mockSetLeadListSearchCursor.mockReset();
+    mockClearStatusCache.mockReset();
+    mockProbeAccountSession.mockReset();
+    mockRecordUnipileAccountHealth.mockReset();
+    mockUsedSharedAccount.mockReset().mockReturnValue(false);
     service = new AgentModeService();
     mockResolveAccountId.mockResolvedValue('test-account-id');
     mockGetLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1', leadCount: 0 });
@@ -799,6 +843,132 @@ describe('AgentModeService.importLeadsFromSearch — top-up loop', () => {
     expect(result.imported).toBe(4);
     expect(result.success).toBe(true);
     expect(result.searchError).toContain('Unipile boom');
+    // A plain, unstructured error says nothing about session liveness — must
+    // not be treated as a proven disconnect.
+    expect(mockClearStatusCache).not.toHaveBeenCalled();
+    expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
+  });
+
+  it('corrects the probe cache and records account health on a proven-dead session (ENG-2205)', async () => {
+    const disconnectedError: any = new Error('Session expired');
+    disconnectedError.structuredError = { code: 'errors/disconnected_account', status: 401, classification: 'AUTH_ERROR' };
+    mockSearchPeople
+      .mockResolvedValueOnce({ items: [makeItem(1), makeItem(2)], cursor: 'c2' })
+      .mockRejectedValueOnce(disconnectedError);
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(2, 0, 'p1'));
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 10 });
+
+    expect(result.searchError).toContain('Session expired');
+    expect(mockClearStatusCache).toHaveBeenCalledWith('test-account-id');
+    expect(mockRecordUnipileAccountHealth).toHaveBeenCalledWith({
+      accountId: 'test-account-id',
+      ownerUserId: 'user-1',
+      state: 'disconnected',
+    });
+  });
+
+  it('omits ownerUserId for a proven-dead SITE-WIDE pool account (ENG-2205)', async () => {
+    // recordUnipileAccountHealth can only resolve a real owner by looking up
+    // ownerUserId's OWN/org-shared accounts — it can never find the ownerless
+    // global site-wide pool account under an unrelated caller's userId. Passing
+    // userId there would silently no-op instead of reaching the dedicated
+    // ownerless/oncall alert branch, so this must stay undefined for that case.
+    mockUsedSharedAccount.mockReturnValue(true);
+    const disconnectedError: any = new Error('Session expired');
+    disconnectedError.structuredError = { code: 'errors/disconnected_account', status: 401, classification: 'AUTH_ERROR' };
+    mockSearchPeople
+      .mockResolvedValueOnce({ items: [makeItem(1), makeItem(2)], cursor: 'c2' })
+      .mockRejectedValueOnce(disconnectedError);
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(2, 0, 'p1'));
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 10 });
+
+    expect(result.searchError).toContain('Session expired');
+    expect(mockRecordUnipileAccountHealth).toHaveBeenCalledWith({
+      accountId: 'test-account-id',
+      ownerUserId: undefined,
+      state: 'disconnected',
+    });
+  });
+
+  it('does not correct the probe cache on a transient/indeterminate search failure', async () => {
+    const timeoutError: any = new Error('LinkedIn connectivity check timed out');
+    timeoutError.structuredError = { classification: 'TIMEOUT_ERROR', isTimeout: true };
+    mockSearchPeople
+      .mockResolvedValueOnce({ items: [makeItem(1), makeItem(2)], cursor: 'c2' })
+      .mockRejectedValueOnce(timeoutError);
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(2, 0, 'p1'));
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 10 });
+
+    // Infrastructure failures are reported to the agent as a generic, retry-shaped message —
+    // never the raw internal text.
+    expect(result.searchError).toBe('LinkedIn is temporarily unavailable. Please try again in a few minutes.');
+    expect(mockClearStatusCache).not.toHaveBeenCalled();
+    expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
+  });
+
+  describe('a BARE 401 (no explicit disconnected_account code) needs a fresh second opinion before marking the account disconnected', () => {
+    const bare401 = () => { const err: any = new Error('Unauthorized'); err.structuredError = { status: 401, classification: 'AUTH_ERROR' }; return err; };
+    const run = async () => {
+      mockSearchPeople
+        .mockResolvedValueOnce({ items: [makeItem(1), makeItem(2)], cursor: 'c2' })
+        .mockRejectedValueOnce(bare401());
+      mockBatchCreateLeads.mockResolvedValueOnce(batchResult(2, 0, 'p1'));
+      return service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 10 });
+    };
+
+    it('records disconnected when the fresh probe CONFIRMS it', async () => {
+      mockProbeAccountSession.mockResolvedValue('disconnected');
+      await run();
+      expect(mockClearStatusCache).toHaveBeenCalledWith('test-account-id');
+      expect(mockProbeAccountSession).toHaveBeenCalledWith('test-account-id');
+      expect(mockRecordUnipileAccountHealth).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT record when the fresh probe says the session is fine (one-off auth blip)', async () => {
+      mockProbeAccountSession.mockResolvedValue('connected');
+      await run();
+      expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
+    });
+
+    it('does NOT record when the fresh probe is inconclusive (the cron decides)', async () => {
+      mockProbeAccountSession.mockResolvedValue('unknown');
+      await run();
+      expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
+    });
+
+    it("an explicit errors/disconnected_account is conclusive: recorded without needing the probe", async () => {
+      const explicit: any = new Error('Disconnected account');
+      explicit.structuredError = { code: 'errors/disconnected_account', status: 401, classification: 'AUTH_ERROR' };
+      mockSearchPeople
+        .mockResolvedValueOnce({ items: [makeItem(1), makeItem(2)], cursor: 'c2' })
+        .mockRejectedValueOnce(explicit);
+      mockBatchCreateLeads.mockResolvedValueOnce(batchResult(2, 0, 'p1'));
+      await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 10 });
+      expect(mockProbeAccountSession).not.toHaveBeenCalled();
+      expect(mockRecordUnipileAccountHealth).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('does not treat a bare 403 (permission/plan restriction) as a proven disconnect', async () => {
+    // handleError classifies both 401 and 403 as AUTH_ERROR, but a 403 means the
+    // session is alive and just not allowed to do that specific thing — only
+    // errors/disconnected_account or a real 401 prove the session is dead
+    // (isProvenDisconnectError deliberately excludes a bare 403).
+    const forbiddenError: any = new Error('Forbidden');
+    forbiddenError.structuredError = { status: 403, classification: 'AUTH_ERROR' };
+    mockSearchPeople
+      .mockResolvedValueOnce({ items: [makeItem(1), makeItem(2)], cursor: 'c2' })
+      .mockRejectedValueOnce(forbiddenError);
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(2, 0, 'p1'));
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 10 });
+
+    expect(result.searchError).toContain('Forbidden');
+    expect(mockClearStatusCache).not.toHaveBeenCalled();
+    expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
   });
 
   it('trim on first page resumes from null cursor', async () => {

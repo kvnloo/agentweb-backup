@@ -15,7 +15,7 @@ import { leadListAlertService } from '../services/leadListAlertService';
 import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, checkEmailFormat, injectColorSchemeMeta } from '../utils/emailVariables';
 import axios from 'axios';
 import { assertPublicHostname, SsrfBlockedError } from '../utils/ssrfGuard';
-import { signUnsubscribeUrl } from '../utils/unsubscribeUrl';
+import { signUnsubscribeUrl, signOneClickUnsubscribeUrl, listUnsubscribeHeaders } from '../utils/unsubscribeUrl';
 import multer from 'multer';
 import { parse } from 'csv-parse/sync';
 import AdmZip from 'adm-zip';
@@ -23,7 +23,9 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { contactSuppressionAuditEnabled, contactSuppressionAuditEvent, guardLeadPutBody, leadWriteChannel, touchesContactSuppression } from '../utils/leadWriteGuard';
 import { suppressLeadSideEffects } from '../utils/sessionList';
+import { isLinkedInInfraError, LINKEDIN_UNAVAILABLE_MESSAGE } from '../utils/linkedInInfraError';
 import { isValidLeadLifecycle, LEAD_LIFECYCLES, isLeadListType, type LeadListType } from '../utils/leadSchema';
 import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
 import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValidation';
@@ -75,6 +77,9 @@ import { runEnrichment as svcRunEnrichmentV3 } from '../services/crmEnrichmentSe
 import { buildOrchestratorDeps as buildV3OrchestratorDeps } from '../services/enrichmentV3RealDeps';
 import { sanitizeLeadForResponse, shouldHideCardRevenueForViewer } from '../utils/enrichmentMetadataPresentation';
 import { getExternalCrmConnection, getMappedAgentwebFields, mappedFieldChanged, resolveSyncStatus } from '../utils/leadSyncStatus';
+
+const LINKEDIN_ACCOUNT_NOT_YOURS_MESSAGE =
+  'That LinkedIn account is not connected to your user. Send from one of your own connected LinkedIn accounts (Settings → Connected Accounts).';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
 
@@ -828,6 +833,73 @@ router.delete('/saved-views/:viewId', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('Error in DELETE /api/crm/saved-views/:viewId:', error);
     return res.status(500).json({ message: error?.message || 'Failed to delete saved view' });
+  }
+});
+
+const CROSS_LIST_LEAD_STATUSES = new Set(['pending_review']);
+const CROSS_LIST_LEADS_CAP = 500;
+const CROSS_LIST_CONCURRENCY = 5;
+
+/**
+ * @route GET /api/crm/leads
+ * @desc Leads with a given status across every list the caller can access
+ *       (own + org-shared). Powers the CRM Inbox "Pending Review" quick
+ *       filter (ENG-2361). Each lead is annotated with listId + listName.
+ * @access Private
+ * @query status — required; v1 accepts only "pending_review"
+ */
+router.get('/leads', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const status = typeof req.query.status === 'string' ? req.query.status.trim() : '';
+    if (!CROSS_LIST_LEAD_STATUSES.has(status)) {
+      return res.status(400).json({ message: 'status must be "pending_review"' });
+    }
+
+    // Same enumeration as GET /lists: own lists + org-shared members' lists.
+    const ownLists = (await crmDb.getLeadListsByUserId(userId)) || [];
+    const memberIds = await getReadableOrgMemberIds(userId);
+    const memberLists = memberIds.length > 0
+      ? (await Promise.all(memberIds.map((id) => crmDb.getLeadListsByUserId(id)))).flat()
+      : [];
+    const candidateLists = [...ownLists, ...memberLists].filter(Boolean);
+    const accessible = await Promise.all(candidateLists.map((list: any) => canAccessCrmList(userId, list)));
+    const lists = candidateLists.filter((_list: any, i: number) => accessible[i]);
+
+    const collected: any[] = [];
+    let truncated = false;
+    for (let i = 0; i < lists.length; i += CROSS_LIST_CONCURRENCY) {
+      if (collected.length >= CROSS_LIST_LEADS_CAP) {
+        truncated = true;
+        break;
+      }
+      const batch = lists.slice(i, i + CROSS_LIST_CONCURRENCY);
+      const results = await Promise.all(
+        batch.map((list: any) => fetchAllLeadsByStatusIndex(list.listId, status, 200))
+      );
+      results.forEach((leads, j) => {
+        const list: any = batch[j];
+        for (const lead of leads) {
+          // The index fallback returns the whole list — re-check the status.
+          if (lead?.status !== status) continue;
+          collected.push({ ...sanitizeLeadForResponse(lead, userId), listId: list.listId, listName: list.name });
+        }
+      });
+    }
+
+    collected.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+    if (collected.length > CROSS_LIST_LEADS_CAP) truncated = true;
+    const leads = collected.slice(0, CROSS_LIST_LEADS_CAP);
+
+    res.json({ leads, total: leads.length, truncated });
+  } catch (error: any) {
+    console.error('Error in GET /api/crm/leads:', error);
+    res.status(500).json({ message: error?.message || 'Failed to fetch leads' });
   }
 });
 
@@ -2128,7 +2200,7 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
     // ENG-2311: session lists are telemetry — no CRM push, sequence enrolment or paid
     // email validation for their rows. Flag only added when true (other lists unchanged).
     const suppressSideEffects = suppressLeadSideEffects(list);
-    const lead = await crmDb.createLead(listId, suppressSideEffects ? { ...leadData, suppressSideEffects: true } : leadData);
+    const lead = await crmDb.createLead(listId, suppressSideEffects ? { ...leadData, suppressSideEffects: true } : leadData, 'manual');
 
     if (!suppressSideEffects) void Promise.allSettled([
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'hubspot', 'created'),
@@ -2214,7 +2286,7 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
       return normalized;
     });
 
-    const result = await crmDb.batchCreateLeads(listId, normalizedLeads);
+    const result = await crmDb.batchCreateLeads(listId, normalizedLeads, { origin: 'enrichment_import' });
 
     // Auto-enroll new leads into any sequences watching this list (fire-and-forget)
     if (result.newCount > 0 && !suppressLeadSideEffects(list)) {
@@ -2790,12 +2862,13 @@ router.delete('/lists/:listId/leads/bulk-delete', async (req: Request, res: Resp
  * @desc Update a lead
  * @access Private
  */
-router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) => {
+// ENG-2157: registered for PATCH as well - the customer portal's deal editor (DealSection) has always sent PATCH here, which 404'd, so deal edits were lost on reload.
+const updateLeadHandler = async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId, leadId } = req.params;
-    const updates = req.body;
+    let updates = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -2810,6 +2883,9 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
     if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
+
+    // ENG-2157: server-owned keys (sync ids, attribution, auto-send marker, write flags). Default mode only reports them.
+    updates = guardLeadPutBody(req.body, { channel: leadWriteChannel(req), userId }).body;
 
     // `lifecycle` became a writable attribute on this route when updateLead grew an
     // explicit handler for it; before that the key was silently dropped. It outranks the
@@ -2856,6 +2932,12 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
 
     const updateData = updates;
 
+    // ENG-2157: who changed a lead's do-not-contact / unsubscribe state is recorded as an engagement event (never blocks the write).
+    const auditSuppression = contactSuppressionAuditEnabled() && touchesContactSuppression(updates);
+    const suppressionBefore = auditSuppression
+      ? await crmDb.getLeadById(listId, leadId).catch((err: any) => { console.error('[contact-status-audit] could not read lead before update:', err?.message || err); return null; })
+      : null;
+
     // Auto-create status change engagement if status changed
     if (updates.status !== undefined) {
       const existingLead = await crmDb.getLeadById(listId, leadId);
@@ -2875,6 +2957,15 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
 
     const updatedLead = await crmDb.updateLead(listId, leadId, updateData);
 
+    if (suppressionBefore) {
+      const delegatedBy = (authReq as any).delegateInfo?.isDelegated ? (authReq as any).delegateInfo?.adminUserId : undefined;
+      const event = contactSuppressionAuditEvent({ before: suppressionBefore, updates, actorUserId: userId, delegatedByUserId: delegatedBy, channel: leadWriteChannel(req) });
+      if (event) {
+        await crmDb.addLeadEngagement(listId, leadId, event)
+          .catch((err: any) => console.error('[contact-status-audit] could not record the change:', err?.message || err));
+      }
+    }
+
     // ENG-2311: no CRM push for a session-list row (see utils/sessionList.ts).
     if (!suppressLeadSideEffects(list)) void Promise.allSettled([
       externalCrmSyncService.autoSyncLead(userId, listId, updatedLead, 'hubspot', 'updated'),
@@ -2890,7 +2981,9 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
     console.error('Error updating lead:', error);
     res.status(500).json({ message: error.message || 'Failed to update lead' });
   }
-});
+};
+router.put('/lists/:listId/leads/:leadId', updateLeadHandler);
+router.patch('/lists/:listId/leads/:leadId', updateLeadHandler);
 
 /**
  * @route DELETE /api/crm/lists/:listId/leads/:leadId
@@ -3242,7 +3335,7 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
     const leads = records.map((record) => projectRecordWithMapping(record, columnMapping));
 
     // Batch create leads
-    const results = await crmDb.batchCreateLeads(listId, leads);
+    const results = await crmDb.batchCreateLeads(listId, leads, { origin: 'enrichment_import' });
 
     if (results.newCount > 0 && !suppressLeadSideEffects(list)) {
       void autoEnrollListIntoSequences(userId, listId);
@@ -3827,7 +3920,7 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
 
       for (let i = 0; i < leads.length; i += leadBatchSize) {
         const batch = leads.slice(i, i + leadBatchSize);
-        const results = await crmDb.batchCreateLeads(listId, batch);
+        const results = await crmDb.batchCreateLeads(listId, batch, { origin: 'enrichment_import' });
 
         connectionsSuccessCount += results.successCount;
         connectionsErrorCount += results.errorCount;
@@ -4989,6 +5082,9 @@ router.post('/lists/:listId/sync-linkedin-connections', async (req: Request, res
     return res.json({ synced: synced.length, syncedAt: new Date().toISOString() });
   } catch (error: any) {
     console.error('Error syncing LinkedIn connections for list:', error);
+    if (isLinkedInInfraError(error)) {
+      return res.status(503).json({ message: LINKEDIN_UNAVAILABLE_MESSAGE, code: 'linkedin_unavailable' });
+    }
     return res.status(500).json({ message: error.message || 'Failed to sync LinkedIn connections' });
   }
 });
@@ -5036,6 +5132,14 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
     if (!accountId) {
       return res.status(400).json({ message: 'No LinkedIn account connected. Connect LinkedIn outreach in Settings first.' });
     }
+    // A client-supplied accountId is untrusted: it must be the caller's own account or one
+    // shared with their org — the same check withdraw/accept-invitation already apply.
+    if (requestedAccountId && typeof requestedAccountId === 'string') {
+      const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+      if (!(await resolveLinkedInAccountForWrite(userId, accountId))) {
+        return res.status(403).json({ message: LINKEDIN_ACCOUNT_NOT_YOURS_MESSAGE, code: 'linkedin_account_not_connected' });
+      }
+    }
 
     // ENG-1026: cross-check the live profile's identity against the lead before
     // sending. Positive mismatch (wrong person behind the stored URL) → 409.
@@ -5051,28 +5155,70 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
       return res.status(409).json(identity.refusal);
     }
 
+    // ENG-2529: hand CRM sends go through the same daily + hourly pacer as the agent tool and
+    // drip worker. Paced after the identity check so a 409 never burns a daily slot.
+    {
+      const { resolveLinkedInAccountForWrite, paceLinkedInWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+      // Same split as paceDripLinkedInWrite: an owned/org-shared account gets the full gate; a
+      // list-assigned/pool account with no owner record is still held to the hourly pacer.
+      const pacedAccount = await resolveLinkedInAccountForWrite(userId, accountId);
+      if (pacedAccount) {
+        const paced = await paceLinkedInWrite('send-message', pacedAccount, accountId);
+        if (paced.refusal) {
+          return res.status(429).json(paced.refusal);
+        }
+      } else {
+        const { reserveWriteSlot } = await import('../services/linkedInWritePacer');
+        const slot = await reserveWriteSlot(accountId);
+        if (!slot.allowed) {
+          return res.status(429).json({ success: false, message: 'LinkedIn write actions are being paced', error: String(slot.reason ?? ''), gate: 'write_pacer' });
+        }
+      }
+    }
+
     await linkedInOutreachService.sendMessage(accountId, leadLinkedIn, true, message.trim());
 
-    // Record the engagement
-    const { emailEventsDb } = await import('../services/emailEventsDb');
-    const emailDomain = `linkedin-${listId}`;
-    const leadLinkedInKey = leadLinkedIn.toLowerCase();
-    await emailEventsDb.addLinkedInMessageEvent({
-      eventId: `linkedin_sent_${Date.now()}_${leadId}`,
-      emailDomain,
-      leadEmail: leadLinkedInKey,
-      eventType: 'linkedin.message.sent',
-      text: message.trim(),
-      timestamp: new Date().toISOString(),
-      senderId: accountId,
-      messageProviderId: '',
-    });
+    // Record the engagement. The message is ALREADY sent at this point, so a failure here must not be
+    // reported as a failed send: the user would retry and message the lead twice.
+    try {
+      const { emailEventsDb } = await import('../services/emailEventsDb');
+      const emailDomain = `linkedin-${listId}`;
+      const leadLinkedInKey = leadLinkedIn.toLowerCase();
+      // eventId and timestamp are fixed BEFORE the retries: the write is a keyed put, so a retry overwrites the
+      // same item instead of creating a second engagement.
+      const engagementEvent = {
+        eventId: `linkedin_sent_${Date.now()}_${leadId}`,
+        emailDomain,
+        leadEmail: leadLinkedInKey,
+        eventType: 'linkedin.message.sent' as const,
+        text: message.trim(),
+        timestamp: new Date().toISOString(),
+        senderId: accountId,
+        messageProviderId: '',
+      };
+      const RETRY_DELAYS_MS = [150, 400];
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await emailEventsDb.addLinkedInMessageEvent(engagementEvent);
+          break;
+        } catch (writeErr) {
+          if (attempt >= RETRY_DELAYS_MS.length) throw writeErr;
+          await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[attempt]));
+        }
+      }
+    } catch (recordErr) {
+      console.error('LinkedIn message was sent but its engagement could not be recorded after retries (non-fatal):', recordErr);
+      return res.json({ success: true, engagementRecorded: false });
+    }
 
     return res.json({ success: true });
   } catch (error: any) {
     console.error('Error sending LinkedIn message:', error);
     if (error.message?.startsWith('Cannot send message:')) {
       return res.status(400).json({ message: error.message });
+    }
+    if (isLinkedInInfraError(error)) {
+      return res.status(503).json({ message: LINKEDIN_UNAVAILABLE_MESSAGE, code: 'linkedin_unavailable' });
     }
     return res.status(500).json({ message: error.message || 'Failed to send LinkedIn message' });
   }
@@ -5121,6 +5267,14 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     if (!accountId) {
       return res.status(400).json({ message: 'No LinkedIn account connected. Connect LinkedIn outreach in Settings first.' });
     }
+    // A client-supplied accountId is untrusted: it must be the caller's own account or one
+    // shared with their org — the same check withdraw/accept-invitation already apply.
+    if (requestedAccountId && typeof requestedAccountId === 'string') {
+      const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+      if (!(await resolveLinkedInAccountForWrite(userId, accountId))) {
+        return res.status(403).json({ message: LINKEDIN_ACCOUNT_NOT_YOURS_MESSAGE, code: 'linkedin_account_not_connected' });
+      }
+    }
 
     // ENG-1026: cross-check the live profile's identity against the lead before
     // sending the invite. Positive mismatch → 409, nothing sent.
@@ -5134,6 +5288,33 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     });
     if (!identity.allowed) {
       return res.status(409).json(identity.refusal);
+    }
+
+    // ENG-2529: hand CRM sends go through the same daily + hourly pacer as the agent tool and
+    // drip worker. Paced after the identity check so a 409 never burns a daily slot.
+    {
+      const { resolveLinkedInAccountForWrite, paceLinkedInWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+      // Same split as paceDripLinkedInWrite: an owned/org-shared account gets the full gate; a
+      // list-assigned/pool account with no owner record is still held to the hourly pacer.
+      let pacedAccount = await resolveLinkedInAccountForWrite(userId, accountId);
+      // The list-assigned account may belong to the list owner (an editor sending from a
+      // shared list); resolve it under the owner so its daily invite cap still applies.
+      const listOwnerId = (list as any).userId;
+      if (!pacedAccount && accountId === (list as any).linkedInAccountId && listOwnerId && listOwnerId !== userId) {
+        pacedAccount = await resolveLinkedInAccountForWrite(listOwnerId, accountId);
+      }
+      if (pacedAccount) {
+        const paced = await paceLinkedInWrite('send-invite', pacedAccount, accountId);
+        if (paced.refusal) {
+          return res.status(429).json(paced.refusal);
+        }
+      } else {
+        const { reserveWriteSlot } = await import('../services/linkedInWritePacer');
+        const slot = await reserveWriteSlot(accountId);
+        if (!slot.allowed) {
+          return res.status(429).json({ success: false, message: 'LinkedIn write actions are being paced', error: String(slot.reason ?? ''), gate: 'write_pacer' });
+        }
+      }
     }
 
     const note = message && typeof message === 'string' && message.trim() ? message.trim() : undefined;
@@ -5224,6 +5405,11 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     return res.json({ success: true, linkedInInviteSentAt: sentAt, noteDropped });
   } catch (error: any) {
     console.error('Error sending LinkedIn invite:', error);
+    // Same infrastructure handling as send-linkedin-message: an unreachable Unipile (credential
+    // fetch, gateway/5xx, timeout) is a handled 503, never a 500 echoing an internal message.
+    if (isLinkedInInfraError(error)) {
+      return res.status(503).json({ message: LINKEDIN_UNAVAILABLE_MESSAGE, code: 'linkedin_unavailable' });
+    }
     return res.status(500).json({ message: error.message || 'Failed to send LinkedIn invite' });
   }
 });
@@ -6647,7 +6833,7 @@ router.post('/sync-subscribers', async (req: Request, res: Response) => {
     });
 
     // Batch create/merge leads (always force update)
-    const results = await crmDb.batchCreateLeads(leadList.listId, leads);
+    const results = await crmDb.batchCreateLeads(leadList.listId, leads, { origin: 'integration' });
 
     const syncAnonymizedSkipped = results.anonymizedSkipped || 0;
     res.json({
@@ -6970,6 +7156,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     }
 
     const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
+    const BACKEND_PUBLIC_URL = process.env.BACKEND_URL || 'https://api.agentweb.pro';
 
     let sent = 0;
     let failed = 0;
@@ -7007,12 +7194,20 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
           email: lead.email,
         });
         personalizedHtml = injectUnsubscribeUrl(personalizedHtml, unsubscribeUrl, unsubscribeFooterHtml);
+        // ENG-2367: RFC 8058 one-click header, same signature, backend POST target.
+        const oneClickUrl = signOneClickUnsubscribeUrl({
+          baseUrl: BACKEND_PUBLIC_URL,
+          listId,
+          leadId: lead.leadId,
+          email: lead.email,
+        });
 
         await sendAsSender(userId, sender, {
           to: lead.email,
           subject: personalizedSubject,
           html: personalizedHtml,
           text: personalizedText,
+          headers: listUnsubscribeHeaders(oneClickUrl),
         });
         sent++;
       } catch (err: any) {

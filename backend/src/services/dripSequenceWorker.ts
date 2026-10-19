@@ -23,10 +23,43 @@ import { loadSenderConfig as loadCrmSenderConfig } from './crmSenderService';
 import { CrmSender } from './crmSenderTypes';
 import { settingsService } from './settingsService';
 import { v4 as uuidv4 } from 'uuid';
+import { isSuspectedMachineEngagement } from './machineEngagement';
 
 // Identifies this process for the claimedBy field — mirrors
 // socialEngagementExecutor.ts's INSTANCE_ID, used for log correlation only.
 const INSTANCE_ID = uuidv4();
+
+const PINNED_ACCOUNT_SNOOZE_MS = 30 * 60 * 1000;
+
+/**
+ * ENG-2529: the shared LinkedIn write gate (daily volume cap + hourly pacer) refused this step's send.
+ * Not a failure of the step: the enrollment is deferred (snoozed, step NOT advanced) and retried later.
+ */
+export class LinkedInWriteDeferredError extends Error {
+  constructor(public readonly gate: string, public readonly reason: string, public readonly accountId: string) {
+    super(`LinkedIn write deferred by ${gate} on account ${accountId}: ${reason}`);
+    this.name = 'LinkedInWriteDeferredError';
+  }
+}
+
+/** How long to defer an enrollment whose LinkedIn send was refused by the hourly pacer. */
+export const LINKEDIN_PACER_DEFER_MS = 30 * 60 * 1000;
+
+/** Retry time for a deferred LinkedIn send: next UTC midnight for the daily cap, else a short pacer backoff. */
+export function linkedInDeferRetryAt(gate: string, now: Date = new Date()): string {
+  if (gate === 'daily_volume') {
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)).toISOString();
+  }
+  return new Date(now.getTime() + LINKEDIN_PACER_DEFER_MS).toISOString();
+}
+
+/** A LinkedIn step pins an account the sequence owner no longer owns or shares. */
+export class PinnedLinkedInAccountNotConnectedError extends Error {
+  constructor(stepNumber: number, userId: string) {
+    super(`LinkedIn step ${stepNumber} references an account that is not connected to user ${userId}`);
+    this.name = 'PinnedLinkedInAccountNotConnectedError';
+  }
+}
 
 export async function processDueEnrollments(): Promise<{
   processed: number;
@@ -73,6 +106,20 @@ export async function processDueEnrollments(): Promise<{
         const retryAt = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
         await dripSequenceDb.snoozeEnrollment(enrollment.enrollmentId, retryAt).catch(() => {});
         console.log(`[dripWorker] Snoozed enrollment ${enrollment.enrollmentId} until ${retryAt} (not yet connected)`);
+      } else if (err instanceof PinnedLinkedInAccountNotConnectedError) {
+        // A config problem the owner has to fix (re-pick or reconnect the account). Retrying every 5-minute
+        // tick cannot succeed and only burns claims and log noise, so back off. Deliberately SHORT (30 min,
+        // not the 6h used for 'not yet connected'): editing a sequence does not reset an enrollment's
+        // nextSendAt, so a long snooze would delay sending long after the user has fixed the step.
+        const retryAt = new Date(Date.now() + PINNED_ACCOUNT_SNOOZE_MS).toISOString();
+        await dripSequenceDb.snoozeEnrollment(enrollment.enrollmentId, retryAt).catch(() => {});
+        console.log(`[dripWorker] Snoozed enrollment ${enrollment.enrollmentId} until ${retryAt} (pinned LinkedIn account not connected)`);
+      } else if (err instanceof LinkedInWriteDeferredError) {
+        // ENG-2529: the shared LinkedIn gate refused the send. Defer — do not fail, do not advance —
+        // so the step is sent once the pacer/daily cap has room.
+        const retryAt = linkedInDeferRetryAt(err.gate);
+        await dripSequenceDb.snoozeEnrollment(enrollment.enrollmentId, retryAt).catch(() => {});
+        console.log(`[dripWorker] Deferred enrollment ${enrollment.enrollmentId} until ${retryAt} (LinkedIn ${err.gate} refused on ${err.accountId}: ${err.reason})`);
       } else if (err instanceof SenderDailyLimitExceededError) {
         // ENG-265: the sender's daily counter resets at UTC midnight — releasing
         // the claim here would just re-fail on the very next 5-minute tick until
@@ -326,6 +373,16 @@ async function sendLinkedInStep(
   }
 
   // Resolve which LinkedIn account to send from
+  if (step.linkedInAccountId) {
+    // ENG-2205: a pinned account must be the sequence owner's own or org-shared one. Checked here
+    // as well as on sequence write because sequences saved before that check may name any account.
+    // A config problem, so it throws (retried once the user fixes the step) rather than skipping.
+    const { resolveLinkedInAccountForWrite } = await import('./agentMode/linkedInDailyVolumeGate');
+    if (!(await resolveLinkedInAccountForWrite(enrollment.userId, step.linkedInAccountId))) {
+      console.error(`[dripWorker] LinkedIn step ${step.stepNumber} for enrollment ${enrollment.enrollmentId}: pinned account is not connected to user ${enrollment.userId}`);
+      throw new PinnedLinkedInAccountNotConnectedError(step.stepNumber, enrollment.userId);
+    }
+  }
   const accountId = step.linkedInAccountId
     || await linkedInOutreachService.resolveAccountId(enrollment.userId);
 
@@ -339,7 +396,16 @@ async function sendLinkedInStep(
     throw new Error(`LinkedIn step ${step.stepNumber} has empty message text`);
   }
 
-  await linkedInOutreachService.sendMessage(accountId, linkedInUrl, true, messageText);
+  const releaseSlot = await paceDripLinkedInWrite(enrollment.userId, accountId, 'send-message');
+
+  try {
+    await linkedInOutreachService.sendMessage(accountId, linkedInUrl, true, messageText);
+  } catch (err) {
+    // ENG-2529: a send that failed must not keep its daily slot, or a repeatedly failing
+    // enrollment drains the account's daily budget with nothing sent.
+    await releaseSlot();
+    throw err;
+  }
   console.log(`[dripWorker] Sent LinkedIn step ${step.stepNumber} to ${linkedInUrl} (account: ${accountId})`);
 
   // Cache the provider_id so reply-exit checks don't need to re-resolve the URL
@@ -350,6 +416,31 @@ async function sendLinkedInStep(
     } catch { /* non-critical */ }
   }
   return true;
+}
+
+/**
+ * ENG-2529: every drip LinkedIn write goes through the same gate as the agent tool and CRM routes.
+ * An account the sequence owner owns or shares gets the full gate (daily cap + hourly pacer);
+ * a shared-pool fallback account has no owner record to reserve a daily slot against, so it is
+ * still held to the per-account hourly pacer. Which account is used stays with ENG-1759/ENG-2347.
+ * Throws LinkedInWriteDeferredError on refusal so the caller never sends.
+ */
+export async function paceDripLinkedInWrite(userId: string, accountId: string, action: 'send-message' | 'send-invite'): Promise<() => Promise<void>> {
+  const { resolveLinkedInAccountForWrite, paceLinkedInWrite, releaseLinkedInDailySlot } = await import('./agentMode/linkedInDailyVolumeGate');
+  const resolved = await resolveLinkedInAccountForWrite(userId, accountId);
+  if (resolved) {
+    const paced = await paceLinkedInWrite(action, resolved, accountId);
+    if (paced.refusal) {
+      throw new LinkedInWriteDeferredError(paced.refusal.gate, paced.refusal.error.split('\n')[0], accountId);
+    }
+    return () => releaseLinkedInDailySlot(action, resolved, accountId, paced.reservedWindowStartedAt);
+  }
+  const { reserveWriteSlot } = await import('./linkedInWritePacer');
+  const slot = await reserveWriteSlot(accountId);
+  if (!slot.allowed) {
+    throw new LinkedInWriteDeferredError('write_pacer', String(slot.reason ?? 'write pacer refused'), accountId);
+  }
+  return async () => {};
 }
 
 async function checkExitConditions(
@@ -464,6 +555,17 @@ async function checkExitConditions(
           `gapFromSend=${gapSeconds === null ? 'unknown' : `${gapSeconds}s`}; ` +
           `userAgent=${detail.userAgent || 'n/a'})`,
         );
+        // ENG-2524: make the tripwire observable. Logging only — the exit is unchanged.
+        const gapMs = Number.isFinite(sentAt) ? eventAt - sentAt : null;
+        if (isSuspectedMachineEngagement(t.eventType, gapMs)) {
+          console.warn('[dripWorker] suspected_machine_engagement', JSON.stringify({
+            enrollmentId: enrollment.enrollmentId,
+            sequenceId: enrollment.sequenceId,
+            eventType: t.eventType,
+            gapFromSendMs: gapMs,
+            userAgent: detail.userAgent || null,
+          }));
+        }
         return 'engagement';
       }
     }

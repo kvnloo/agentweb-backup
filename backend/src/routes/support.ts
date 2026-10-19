@@ -5,15 +5,8 @@ import { userDb } from "../services/db";
 import { settingsService } from "../services/settingsService";
 import { uploadScreenshotToS3, presignS3Url } from "../utils/s3Utils";
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from "../config";
-import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from "../utils/userFunnelStatus";
-import {
-  buildReportTitle,
-  toSingleLine,
-  reportFingerprint,
-  fileReportOnce,
-  REPORT_CAPACITY_WAIT_MS,
-  ReportReplayCapacityError,
-} from "../utils/reportIntake";
+import { toSingleLine, ReportReplayCapacityError } from "../utils/reportIntake";
+import { fileProductFeedback } from "../services/productFeedbackFiling";
 import { reportUIError } from "../utils/errorReporter";
 import type { FiledUserResult } from "../services/intakeService";
 
@@ -417,68 +410,25 @@ router.post("/report-ui-bug", async (req, res) => {
     const isDelegated = authenticatedReq.delegateInfo?.isDelegated === true;
     const adminEmail: string | undefined = authenticatedReq.delegateInfo?.adminEmail;
 
-    // The ONE normalization of the shared report title: the tracked item and the notification
-    // subject are both derived from this single-line string (ENG-529).
-    const title = buildReportTitle(config.titlePrefix, description);
-
-    const issueContext: Record<string, any> = {
-      "User Name": user.displayName || user.email,
-      "User Email": user.email,
-      "User ID": userId,
-      "Page URL": pageUrl || "N/A",
-      "Screenshot": screenshotContext,
-    };
-    const funnelStatusLabel = getUserFunnelStatusLabel(user.funnelStatus);
-    const funnelStatusTags = getUserFunnelStatusIssueTags(user.funnelStatus);
-    if (funnelStatusLabel) {
-      issueContext["User Status"] = funnelStatusLabel;
-    }
-    if (isDelegated && adminEmail) {
-      issueContext["Reported By (Admin)"] = adminEmail;
-    }
-
-    // File the user-reported issue. Behind FEATUREBASE_INTAKE this dedups and creates a
-    // public, votable canonical in Linear (Featurebase-mirrored); flag off -> Notion. Same
-    // shared path as Emma's report_product_issues tool.
-    //
-    // Wrapped in the replay guard so a retried or timed-out submission of the SAME report
-    // returns the first filing instead of opening another reporter ticket (ENG-529: one report
-    // became tickets #169/#170/#171 when the client retried three 500s).
-    const reportItemType: 'feature_request' | 'bug' = typeKey === 'bug' ? 'bug' : 'feature_request';
-    const { fileUserIssue } = await import('../services/intakeService');
-    // ONE fingerprint, used twice on purpose (ENG-529 AC5 / ENG-598 option A):
-    //   - `fileReportOnce` coalesces concurrent and in-window retries IN THIS PROCESS, and
-    //   - `fileUserIssue` stamps it on the Featurebase ticket and looks it up before creating,
-    //     which is the DURABLE half — it is what still holds after the bounded replay map evicts
-    //     this entry, after a restart, or when a second instance serves the retry.
-    // Computing it inline for the guard alone would leave the destination check dead code, so the
-    // two must share this value rather than each deriving their own.
-    const fingerprint = reportFingerprint({ userId, reportType: typeKey, description, pageUrl });
-    const outcome = await fileReportOnce(
-      fingerprint,
-      () => fileUserIssue({
-        type: reportItemType,
-        title,
-        description: description.trim(),
-        userEmail: user.email,
-        userName: user.displayName || user.email,
-        reportedByAdmin: isDelegated && adminEmail ? adminEmail : undefined,
-        sessionId: typeof sessionId === "string" ? sessionId : undefined,
-        // ENG-1961: the dedup judge this filing runs is the caller's work, not "system".
-        actingUserId: userId,
-        reportFingerprint: fingerprint,
-        // Linear-side triage enrichment (ENG-187): stage labels + priority/state/assignee defaults.
-        funnelStatus: user.funnelStatus,
-        notionTags: ["Customer Reported", config.tag, ...funnelStatusTags],
-        notionContext: issueContext,
-      }),
-      Date.now(),
-      REPORT_CAPACITY_WAIT_MS,
-      userId,
-    );
-    filed = outcome.result;
-    replayed = outcome.replayed;
-    issueId = filed.pageId ? `AGW-${filed.pageId}` : undefined;
+    // File through the ONE shared product-feedback policy (ENG-527) — the same function Emma's
+    // over-quota filing path uses, so UI and Emma filing cannot drift. It applies the ENG-529
+    // title normalization, the replay guard and the durable fingerprint.
+    const filing = await fileProductFeedback({
+      user: { userId, email: user.email, displayName: user.displayName, funnelStatus: user.funnelStatus },
+      reportType: typeKey,
+      titlePrefix: config.titlePrefix,
+      tag: config.tag,
+      description,
+      pageUrl,
+      sessionId: typeof sessionId === "string" ? sessionId : undefined,
+      screenshotContext,
+      reportedByAdmin: isDelegated && adminEmail ? adminEmail : undefined,
+    });
+    const title = filing.title;
+    const funnelStatusLabel = filing.funnelStatusLabel ?? null;
+    filed = filing.filed;
+    replayed = filing.replayed;
+    issueId = filing.issueId;
 
     notify = {
       config,

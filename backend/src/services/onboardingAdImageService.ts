@@ -34,6 +34,8 @@
  *   then read steps[4].description.
  */
 
+import { withClearedError } from "../utils/clearErrorOnClaim";
+import { readUserForOwnership } from "../utils/readUserForOwnership";
 import { imageService as defaultImageService } from "./imageGeneration";
 import { reportUIError } from "../utils/errorReporter";
 import { userDb } from "./db";
@@ -49,6 +51,7 @@ import {
   AdImageResult,
   AdImageStatusFields,
   AdImageVariant,
+  AD_IMAGE_TIMEOUT_MS,
 } from "./adImageStatusService";
 import {
   extractIcpBrandContext,
@@ -73,6 +76,7 @@ import {
   type Aesthetic,
   type Archetype,
 } from "./brick5Archetypes";
+import { trackBackgroundRun } from "../utils/trackedBackgroundRun";
 
 /** Number of ad image variants per run. Brick 8 spec is "3 per ICP". */
 const AD_IMAGE_VARIANT_COUNT = 3;
@@ -889,7 +893,7 @@ async function failAdImageRunIfOwned(
   logMessage: string,
   logContext: Record<string, unknown> = {}
 ): Promise<boolean> {
-  const current = await userDb.getUserById(userId);
+  const current = await readUserForOwnership(userId);
   const axis = readAxisIdentity(current);
   if (axisIsNotOurs(axis, ours)) {
     // eslint-disable-next-line no-console
@@ -964,7 +968,7 @@ export async function triggerAdImageGenerationForUser(
     run?: AdImageRunIdentity;
   } = {}
 ): Promise<void> {
-  const user = await userDb.getUserById(userId);
+  const user = await readUserForOwnership(userId);
   if (!user) return;
 
   const u = user as any;
@@ -1164,6 +1168,9 @@ export async function triggerAdImageGenerationForUser(
 
   // Read only now: the failure path above does its own owning-run read, and
   // hoisting this above it would cost every failed run a redundant fetch.
+  // Left on the index on purpose: this is tens of seconds after the claim, long
+  // past any index lag, and the write below is conditioned on this run's own
+  // identity regardless of what this read shows.
   const current = await userDb.getUserById(userId);
   const patch = adImageReadyPatch(((current as any) || {}) as AdImageStatusFields, result);
   if (!patch) {
@@ -1242,6 +1249,39 @@ export async function triggerAdImageGenerationForUser(
 }
 
 /**
+ * Guards the non-running -> `running` claim with a DynamoDB
+ * ConditionExpression (ENG-2308) — same race as the icp/competitor/
+ * creative-dir/ad-copy axes: two concurrent claims (the legacy route and
+ * the eager-orchestrator's `runAdImage`, or two overlapping `/ad-image/start`
+ * calls) can each mint a nonce and launch a real Gemini generation before
+ * either one's completion-time ownership check (`axisOwnershipCondition`,
+ * ENG-792) ever runs — that check only stops a stale run from PUBLISHING
+ * over a newer one, it does not stop a stale run from being launched at all.
+ * Making the claim itself atomic closes that gap instead of leaving it to a
+ * best-effort early read in the worker.
+ *
+ * Also allows a fresh claim once the in-flight run has exceeded
+ * `AD_IMAGE_TIMEOUT_MS` — see `icpStartClaimCondition`'s docstring in
+ * `onboardingIcpService.ts` for why: without this, a run genuinely stuck
+ * in `running` (lost to a deploy/crash) could never be retried again. Does
+ * NOT replace `axisOwnershipCondition` — that condition still separately
+ * decides who may publish a TERMINAL state; this one only decides who may
+ * START a new one.
+ */
+function adImageStartClaimCondition(now: Date = new Date()) {
+  const staleBefore = new Date(now.getTime() - AD_IMAGE_TIMEOUT_MS).toISOString();
+  return {
+    expression:
+      "attribute_not_exists(#adImageStatus) OR #adImageStatus <> :adImageRunning OR #adImageStartedAt <= :adImageStaleBefore",
+    names: {
+      "#adImageStatus": "adImageStatus",
+      "#adImageStartedAt": "adImageStartedAt",
+    },
+    values: { ":adImageRunning": "running", ":adImageStaleBefore": staleBefore },
+  };
+}
+
+/**
  * Claim the ad-image axis for a NEW run: mint the run's identity, publish it,
  * and hand it back so the caller can pass it to the worker it is about to
  * launch.
@@ -1251,12 +1291,25 @@ export async function triggerAdImageGenerationForUser(
  * ITSELF — it adopts whichever run the record names at read time, so two
  * overlapping starts both adopt the later nonce, both pass the conditional
  * terminal write, and each can overwrite the other's result (Greptile).
+ *
+ * Returns `null` when a concurrent caller already claimed a run that is
+ * still `running` (ENG-2308) — callers must NOT launch a second worker in
+ * that case.
  */
 export async function claimAdImageRun(
   userId: string,
-): Promise<AdImageRunIdentity> {
+): Promise<AdImageRunIdentity | null> {
   const startPatch = adImageStartPatch();
-  await userDb.updateUser(userId, startPatch as any);
+  try {
+    await userDb.updateUser(userId, withClearedError(startPatch, "adImageError") as any, {
+      condition: adImageStartClaimCondition(),
+    });
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") {
+      return null;
+    }
+    throw err;
+  }
   return {
     runId: startPatch.adImageRunId,
     startedAt: startPatch.adImageStartedAt,
@@ -1265,7 +1318,10 @@ export async function claimAdImageRun(
 
 /**
  * Synchronous entry point for routes — flips status to `running` and
- * launches background work.
+ * launches background work. Returns the claimed run identity, or `null` if
+ * a concurrent caller already claimed this run (ENG-2308), OR if the user
+ * is on the eager pipeline (see below) — callers must NOT launch a second
+ * background worker when this returns `null`.
  */
 export async function startAdImageGenerationForUser(
   userId: string,
@@ -1276,10 +1332,23 @@ export async function startAdImageGenerationForUser(
     // because this function is the thing that mints it.
     verifyLogoUrl?: (logoUrl: string) => Promise<boolean>;
   } = {}
-): Promise<void> {
-  const run = await claimAdImageRun(userId);
+): Promise<AdImageRunIdentity | null> {
   // Eager DAG sub-task 2: orchestrator owns step ordering for opted-in
   // users; cheap no-op gated inside the orchestrator for everyone else.
+  //
+  // Checked BEFORE claiming (ENG-2308 fix-of-a-fix, caught live): the
+  // orchestrator's `runAdImage` claims this SAME axis itself, with its own
+  // identity, when it actually fires the step — that is the real claim for
+  // an eager-pipeline run. Claiming here too, then discarding the result,
+  // used to be harmless because the old unconditional `claimAdImageRun`
+  // let both claims win (latest nonce wins, by design — see its docstring).
+  // Once the claim became exclusive, this route's throwaway claim always
+  // won first and permanently starved `runAdImage`'s real claim moments
+  // later for every eager-pipeline request, so ad-image generation never
+  // actually fired on that path. Checking eager status first and skipping
+  // the claim entirely leaves `claimAdImageRun` as the SOLE claimant for
+  // eager-pipeline users, exactly like the other four axes' runners (which
+  // never claim at the route level before delegating either).
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const {
     isEagerPipelineActiveFor,
@@ -1290,7 +1359,16 @@ export async function startAdImageGenerationForUser(
     | null;
   if (isEagerPipelineActiveFor(current)) {
     void reconcileForUser(userId);
-    return;
+    return null;
   }
-  void triggerAdImageGenerationForUser(userId, { ...deps, run });
+  const run = await claimAdImageRun(userId);
+  if (!run) return null;
+  // Tracked so a deploy's graceful shutdown waits for this run (cronJobRegistry
+  // is drained before the listener closes) instead of killing it mid-flight and
+  // leaving a dead `running` claim that nothing completes until it times out.
+  trackBackgroundRun(
+    "onboardingAdImage",
+    triggerAdImageGenerationForUser(userId, { ...deps, run }),
+  );
+  return run;
 }

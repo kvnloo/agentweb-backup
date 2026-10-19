@@ -58,6 +58,32 @@ export function signUnsubscribeUrl({ baseUrl, listId, leadId, email }: SignParam
 }
 
 /**
+ * ENG-2367: RFC 8058 one-click target for the `List-Unsubscribe` header.
+ *
+ * Signs the same (listId, leadId, email) as signUnsubscribeUrl, but points at the
+ * backend POST route (`routes/crmPublic.ts` group-email-unsubscribe) because the body
+ * link is a frontend page that cannot accept the mail client's one-click POST.
+ * email/sig ride in the query string since an RFC 8058 POST body carries only
+ * `List-Unsubscribe=One-Click`.
+ */
+export function signOneClickUnsubscribeUrl({ baseUrl, listId, leadId, email }: SignParams): string {
+  const sig = computeSignature(listId, leadId, email);
+  const root = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
+  return (
+    `${root}/api/crm/public/lists/${encodeURIComponent(listId)}/leads/${encodeURIComponent(leadId)}` +
+    `/group-email-unsubscribe?email=${encodeURIComponent(email)}&sig=${sig}`
+  );
+}
+
+/** ENG-2367: the RFC 2369 + RFC 8058 header pair for a one-click unsubscribe URL. */
+export function listUnsubscribeHeaders(oneClickUrl: string): Record<string, string> {
+  return {
+    'List-Unsubscribe': `<${oneClickUrl}>`,
+    'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+  };
+}
+
+/**
  * Verify an unsubscribe signature using a constant-time comparison.
  *
  * Returns false on any malformed sig (wrong length, non-hex characters,

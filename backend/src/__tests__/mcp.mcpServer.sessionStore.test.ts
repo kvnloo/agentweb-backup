@@ -52,7 +52,7 @@ jest.mock('@modelcontextprotocol/sdk/types.js', () => ({
   ListToolsRequestSchema: 'ListToolsRequestSchema',
 }));
 jest.mock('../mcp/server/registry', () => ({
-  mcpToolRegistry: { getToolDefinitions: jest.fn().mockReturnValue([]), execute: jest.fn() },
+  mcpToolRegistry: { getToolDefinitions: jest.fn().mockReturnValue([]), execute: jest.fn(), getTool: jest.fn() },
 }));
 jest.mock('../mcp/server/apiTools', () => ({}));
 jest.mock('../mcp/server/mcpServerCore', () => ({
