@@ -10,7 +10,8 @@
  * child — see the ticket's "Watch" section).
  */
 
-import { spawn as spawnChildProcess, type ChildProcessWithoutNullStreams } from "child_process";
+import { spawn as spawnChildProcess } from "child_process";
+import type { Readable, Writable } from "stream";
 import { createInterface, type Interface } from "readline";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
@@ -24,6 +25,45 @@ export interface ClaudeCliMcpServer {
   bearerToken: string;
 }
 
+/**
+ * The part of a child process the runner uses. `child_process.ChildProcess` satisfies it; the login
+ * host passes a handle backed by a hardened systemd unit running as the customer's uid.
+ */
+export interface RunnerChild {
+  stdin: Writable;
+  stdout: Readable;
+  stderr: Readable;
+  readonly exitCode: number | null;
+  readonly signalCode: string | null;
+  kill(): unknown;
+  on(event: "exit", cb: (code: number | null, signal: string | null) => void): unknown;
+  on(event: "error", cb: (err: Error) => void): unknown;
+  once(event: "exit", cb: (code: number | null, signal: string | null) => void): unknown;
+}
+
+export interface ClaudeCliSpawnSpec {
+  file: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+  cwd: string;
+}
+
+/**
+ * Seams for hosting the runner inside the login host (ENG-2110 PR 1b). Every field defaults to what the
+ * backend has always done (local `child_process.spawn`, a `mkdtemp` scratch HOME under the OS temp dir,
+ * the pinned binary from `resolveClaudeBinary()`, the allowlisted env built from `process.env.PATH`).
+ */
+export interface ClaudeCliRunnerPorts {
+  /** Starts the CLI. A custom one must be given `opts.cwd` for every session (there is no local default directory to fall back to). */
+  spawnProcess?: (spec: ClaudeCliSpawnSpec) => RunnerChild;
+  /** Scratch HOME for one process. `create` returns a path the process can use; `remove` is best effort. */
+  scratch?: { create(): string; remove(dir: string): void };
+  /** Absolute path of the pinned binary (default: `resolveClaudeBinary()`). */
+  binaryPath?: string;
+  /** Builds the complete environment (default: `buildAllowlistedEnv`, which needs PATH in the parent process). */
+  buildEnv?: (configDir: string, scratchHomeDir: string) => NodeJS.ProcessEnv;
+}
+
 export interface ClaudeCliRunnerOptions {
   /** Model alias or id, e.g. "haiku" | "sonnet" | "opus" | a full model id. Omit for the CLI's own default. */
   model?: string;
@@ -33,6 +73,13 @@ export interface ClaudeCliRunnerOptions {
    * passed on the command line, where it would be visible in the process list.
    */
   mcpServer?: ClaudeCliMcpServer;
+  /**
+   * How `mcpServer` reaches the process. Default: a 0600 `mcp.json` in the scratch HOME. `stdin`: the config
+   * is written as ONE JSON line on the process's stdin before anything else, and `--mcp-config` names `path`;
+   * the process wrapper (the login host's `claude-turn.sh`) must consume that line, write it to `path` inside
+   * the process's private tmp and exec the CLI. The token is then in no argv, no environment and no persistent file.
+   */
+  mcpDelivery?: { via: "stdin"; path: string };
   /**
    * Called for every tool call the model emits, with the id of the model message it
    * came in. The tool bridge needs this to collapse an identical call repeated within
@@ -120,7 +167,7 @@ interface PendingTurn {
 
 interface PooledSession {
   conversationId: string;
-  child: ChildProcessWithoutNullStreams;
+  child: RunnerChild;
   rl: Interface;
   scratchHomeDir: string;
   pending: PendingTurn | null;
@@ -163,9 +210,12 @@ export class ClaudeCliRunner {
   /** The empty, private (mkdtemp: 0700, unpredictable name) working directory for sessions that pass no `cwd`. */
   private defaultCwd: string | undefined;
 
-  constructor(opts: { maxConcurrentProcesses?: number; idleCloseMs?: number } = {}) {
+  private readonly ports: ClaudeCliRunnerPorts;
+
+  constructor(opts: { maxConcurrentProcesses?: number; idleCloseMs?: number; ports?: ClaudeCliRunnerPorts } = {}) {
     this.maxConcurrentProcesses = opts.maxConcurrentProcesses ?? DEFAULT_MAX_CONCURRENT_PROCESSES;
     this.idleCloseMs = opts.idleCloseMs ?? DEFAULT_IDLE_CLOSE_MS;
+    this.ports = opts.ports ?? {};
   }
 
   /**
@@ -260,20 +310,33 @@ export class ClaudeCliRunner {
         return; // close() arrived right after the slot was granted -- it WAS granted, so the finally below must release it.
       }
 
-      const scratchHomeDir = mkdtempSync(join(tmpdir(), "claude-cli-home-"));
-      let child: ChildProcessWithoutNullStreams;
+      const scratchHomeDir = this.ports.scratch ? this.ports.scratch.create() : mkdtempSync(join(tmpdir(), "claude-cli-home-"));
+      let child: RunnerChild;
+      let mcpPreamble: string | undefined;
       try {
-        const env = buildAllowlistedEnv(configDir, scratchHomeDir);
-        const mcpConfigFile = opts.mcpServer ? writeMcpConfig(scratchHomeDir, opts.mcpServer) : undefined;
+        const env = (this.ports.buildEnv ?? buildAllowlistedEnv)(configDir, scratchHomeDir);
+        let mcpConfigFile: string | undefined;
+        if (opts.mcpServer) {
+          if (opts.mcpDelivery?.via === "stdin") {
+            mcpConfigFile = opts.mcpDelivery.path;
+            mcpPreamble = JSON.stringify(mcpConfigFor(opts.mcpServer)) + "\n";
+          } else {
+            mcpConfigFile = writeMcpConfig(scratchHomeDir, opts.mcpServer);
+          }
+        }
+        if (this.ports.spawnProcess && !opts.cwd) throw new Error("claudeCliRunner: a custom spawnProcess needs opts.cwd for every session");
         // Absolute path to the pinned binary (never a PATH lookup) and a fixed, stable working
         // directory, so the process does not inherit the backend's cwd.
-        child = spawnChildProcess(resolveClaudeBinary(), buildArgs(systemPromptFile, opts, mcpConfigFile), {
+        const spec: ClaudeCliSpawnSpec = {
+          file: this.ports.binaryPath ?? resolveClaudeBinary(),
+          args: buildArgs(systemPromptFile, opts, mcpConfigFile),
           env,
           cwd: opts.cwd ?? this.workingDir(),
-        });
+        };
+        child = this.ports.spawnProcess ? this.ports.spawnProcess(spec) : spawnChildProcess(spec.file, spec.args, { env: spec.env, cwd: spec.cwd });
       } catch (err) {
         // Nothing owns the scratch dir yet, and it may already hold the run token.
-        rmSync(scratchHomeDir, { recursive: true, force: true });
+        this.removeScratchDir(scratchHomeDir);
         throw err;
       }
 
@@ -311,6 +374,8 @@ export class ClaudeCliRunner {
         // unhandled would crash the whole backend process, not just this session.
         this.clearPending(session)?.reject(err);
       });
+      // Stdin MCP delivery: the first line the wrapper reads, before any conversation message.
+      if (mcpPreamble) child.stdin.write(mcpPreamble);
 
       this.pool.set(conversationId, session);
       sessionCreated = true; // set immediately after pool.set() — if anything after this throws, the
@@ -535,6 +600,15 @@ export class ClaudeCliRunner {
     });
   }
 
+  private removeScratchDir(dir: string): void {
+    try {
+      if (this.ports.scratch) this.ports.scratch.remove(dir);
+      else rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // best-effort cleanup of a throwaway scratch dir
+    }
+  }
+
   private scheduleIdleClose(session: PooledSession): void {
     if (session.idleTimer) clearTimeout(session.idleTimer);
     session.idleTimer = setTimeout(() => {
@@ -558,13 +632,7 @@ export class ClaudeCliRunner {
       this.pool.delete(session.conversationId);
     }
     session.rl.close();
-    const removeScratch = () => {
-      try {
-        rmSync(session.scratchHomeDir, { recursive: true, force: true });
-      } catch {
-        // best-effort cleanup of a throwaway scratch dir
-      }
-    };
+    const removeScratch = () => this.removeScratchDir(session.scratchHomeDir);
     // Removed now so the run token file is gone at once, and again when the process has
     // really exited: a CLI that is still shutting down re-creates its HOME (a cache dir).
     if (session.child.exitCode === null && session.child.signalCode === null) {
@@ -616,7 +684,13 @@ export class ClaudeCliRunner {
 export function buildAllowlistedEnv(configDir: string, scratchHomeDir: string): NodeJS.ProcessEnv {
   const path = process.env.PATH;
   if (!path) throw new Error("claudeCliRunner: PATH is not set in the parent process — cannot resolve the claude binary");
+  return allowlistedEnv(path, configDir, scratchHomeDir);
+}
+
+/** The complete environment of a hosted `claude` process; nothing else is ever inherited. `extra` is for the host's own fixed additions (TMPDIR). */
+export function allowlistedEnv(path: string, configDir: string, scratchHomeDir: string, extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
+    ...extra,
     PATH: path,
     HOME: scratchHomeDir,
     CLAUDE_CONFIG_DIR: configDir,
@@ -633,14 +707,17 @@ export function buildAllowlistedEnv(configDir: string, scratchHomeDir: string): 
   };
 }
 
-function writeMcpConfig(scratchHomeDir: string, server: ClaudeCliMcpServer): string {
-  const file = join(scratchHomeDir, "mcp.json");
-  const config = {
+function mcpConfigFor(server: ClaudeCliMcpServer): { mcpServers: Record<string, unknown> } {
+  return {
     mcpServers: {
       [server.name]: { type: "http", url: server.url, headers: { Authorization: `Bearer ${server.bearerToken}` } },
     },
   };
-  writeFileSync(file, JSON.stringify(config), { mode: 0o600 });
+}
+
+function writeMcpConfig(scratchHomeDir: string, server: ClaudeCliMcpServer): string {
+  const file = join(scratchHomeDir, "mcp.json");
+  writeFileSync(file, JSON.stringify(mcpConfigFor(server)), { mode: 0o600 });
   return file;
 }
 
