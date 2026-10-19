@@ -29,7 +29,13 @@ missing keeps the 429. A non-opted account never reads the switch or writes anyt
   `optIn: { month, overageBaselineMicroUsd }` = the overage standing at that moment (same pool measure as
   the gates), subtracted for that month only. Re-enabling later in the same month keeps that baseline
   (never re-measured), so toggling cannot reset the cap; a new month starts at baseline 0. This covers a
-  downgrade BEFORE opting in, when no high-water mark was kept.
+  downgrade BEFORE opting in, when no high-water mark was kept. `optIn.poolAtOptInMicroUsd` records the
+  pool the baseline was measured on; if the pool grows afterwards (upgrade, top-up), the baseline shrinks
+  by that growth (`max(0, baseline - max(0, poolNow - poolAtOptIn))`) so it is not subtracted twice. An
+  opt-in stored without it is read as measured against that month's `poolHighWater` (no growth if none).
+  Opting in also raises `poolHighWater` to the opt-in pool.
+- `overage.active` (and `/usage-runway` `paygCovering`) are true only with billable overage (> 0). Admitted
+  at 0% (a downgrade still under the month's high-water pool), the runway forecasts against that pool.
 - The cap is stored as `capPercentOfPool` only (25|50|100|200) and re-derived every check as percent x
   the month's pool, so "50% of your plan" stays true across top-ups, plan changes and months. No
   micro-USD cap is stored.
@@ -49,7 +55,11 @@ PUT errors (`{ error: <code> }`): 404 `payg_unavailable`, 403 `not_billing_owner
 `delegate_cannot_consent` (a delegated admin may turn PAYG off or lower the cap, never turn it on or raise
 it), 400 `invalid_request`, 422 `invalid_cap`, 409 `payment_method_required` (live Stripe check on
 enabling), 503 `payment_check_unavailable`, 409 `payg_conflict` (version moved). Disabling never calls
-Stripe and is allowed even if the tier stops offering PAYG.
+Stripe and is allowed even if the tier stops offering PAYG. Enabling also writes `has_payment_method: true`
+(the card Stripe just confirmed) in the same conditional update, because the gates read the cached flag and
+nothing refreshes it when a card is added in the Stripe customer portal; GET /payg repairs a stale `false`
+for an owner with PAYG on (live check, upward only, Stripe error = leave as is). `hasPaymentMethod` in the
+GET body is the owner's only — always `false` for a pooled member.
 
 **429 / runway copy.** `usageBlock.reason` is added only for PAYG's own blocks: `payg_cap_reached`,
 `payg_suspended`, `payg_inactive` (+ `usageBlock.paygInactiveReason`: `no_payment_method` |
