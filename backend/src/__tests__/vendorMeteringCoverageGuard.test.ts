@@ -143,6 +143,7 @@ const VENDOR_SIGNATURES: VendorSignature[] = [
   { vendor: '2captcha', re: /2captcha\.com/ },
   { vendor: 'Placid', re: /api\.placid\.app/ },
   { vendor: 'Remotion Lambda', re: /@remotion\/lambda/ },
+  { vendor: 'Twilio', re: /api\.twilio\.com|from\s+['"]twilio['"]/ },
 ];
 
 /**
