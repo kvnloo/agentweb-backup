@@ -62,4 +62,25 @@ describe('FakeVoiceProvider', () => {
     setVoiceProviderForTests(f);
     expect(getVoiceProvider()).toBe(f);
   });
+
+  it('scripts buyNumber and releaseNumber failures and results, still recording the attempt', async () => {
+    const f = new FakeVoiceProvider();
+    f.failNextBuyNumber('unknown', 'timeout');
+    await expect(f.buyNumber({ countryCode: 'US' })).rejects.toMatchObject({ placed: 'unknown' });
+    f.queueBuyNumberResult({ numberSid: 'PNx', phoneNumber: '+14155550123' });
+    await expect(f.buyNumber({ countryCode: 'US', areaCode: '415' })).resolves.toEqual({ numberSid: 'PNx', phoneNumber: '+14155550123' });
+    expect(f.boughtNumbers).toHaveLength(2);
+    f.failNextReleaseNumber('no', 'gone', 404);
+    await expect(f.releaseNumber('PNx')).rejects.toMatchObject({ placed: 'no', httpStatus: 404 });
+    await expect(f.releaseNumber('PNx')).resolves.toBeUndefined();
+    expect(f.releasedNumbers).toEqual(['PNx', 'PNx']);
+  });
+
+  it('rejects a placeCall that sets both url and twiml, or neither (the real provider would silently pick one)', async () => {
+    const f = new FakeVoiceProvider();
+    await expect(f.placeCall({ ...p, twiml: '<Response/>' } as never)).rejects.toThrow('exactly one of url and twiml');
+    await expect(f.placeCall({ to: p.to, from: p.from, timeoutSeconds: 20 } as never)).rejects.toThrow('exactly one');
+    await expect(f.placeCall({ to: p.to, from: p.from, twiml: '<Response/>', timeoutSeconds: 20 })).resolves.toEqual({ callSid: 'CA00000001' });
+    expect(f.placedCalls).toHaveLength(1);
+  });
 });

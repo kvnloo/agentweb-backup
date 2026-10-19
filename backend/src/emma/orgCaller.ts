@@ -1,7 +1,7 @@
 import { orgDb, userDb } from '../services/db';
 import { can } from '../services/orgAuthz';
 
-export type ToolContext = { userId?: unknown; agentUserId?: unknown } | undefined;
+export type ToolContext = { userId?: unknown; agentUserId?: unknown; isUnattendedRun?: unknown } | undefined;
 
 /**
  * Resolve the caller's own org from their persisted user record (never from tool arguments).

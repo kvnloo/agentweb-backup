@@ -7,6 +7,7 @@ import {
   hangupTwiml,
   leadUnreachableTwiml,
   ownerPromptTwiml,
+  verificationCodeTwiml,
 } from '../twiml';
 
 // No XML parser is a direct dependency of the backend, so this is a small strict checker for the subset
@@ -128,5 +129,17 @@ describe('twiml builders', () => {
       expect(out).not.toMatch(/[<>"']/);
       expect(out).not.toMatch(/&(?!(amp|lt|gt|quot|apos);)/);
     }
+  });
+});
+
+describe('verificationCodeTwiml', () => {
+  it('is well-formed and contains only the fixed phrase and the spaced digits', () => {
+    const xml = verificationCodeTwiml('042917');
+    const root = parseXml(xml);
+    expect(root.children.map(c => c.name)).toEqual(['Pause', 'Say']);
+    expect(root.children[1].text).toBe('Your Agent Web verification code is 0 4 2 9 1 7. Again, your code is 0 4 2 9 1 7. Goodbye.');
+  });
+  it.each(['12345', '1234567', '12&456', '<1234>', '12 456', '１２３４５６', ''])('refuses %j instead of interpolating it', bad => {
+    expect(() => verificationCodeTwiml(bad)).toThrow('6 digits');
   });
 });
