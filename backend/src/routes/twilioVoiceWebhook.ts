@@ -29,8 +29,8 @@
  * arrives the record stays non-terminal: WP6/ops needs a cleanup for records stuck in bridging/connected
  * (no cron is added here).
  *
- * Decisions that do not change `state` (owner declined, lead did not answer, sid adoption) are made once
- * through marker entries in `lastSequence`: see HotLeadCallRecord.lastSequence for the three markers.
+ * Decisions that do not change `state` (owner declined, lead did not answer) are made once through marker
+ * entries in `lastSequence`: see HotLeadCallRecord.lastSequence.
  */
 
 import express from 'express';
@@ -85,7 +85,6 @@ const MAX_TRANSITION_ATTEMPTS = 3;
 
 // Marker entries in `lastSequence` that make a decision first-writer-wins: see HotLeadCallRecord.lastSequence.
 const decisionKey = (ownerSid: string, step: 'gather' | 'dial'): string => `${ownerSid}#${step}`;
-const ADOPT_MARKER = 'owner#adopt';
 const errorName = (err: unknown): string => (err instanceof Error ? err.name : 'unknown error');
 
 const sendXml = (res: Response, xml: string): void => {
@@ -127,18 +126,18 @@ async function loadRecord(q: CallQuery): Promise<HotLeadCallRecord | null> {
  * Owner-leg callbacks only. While the record is still 'dialing' (the orchestrator's post-call
  * transition has not landed, or failed) the first signed owner-leg callback for this job supplies
  * the owner CallSid. The jobKey was already matched by loadRecord and the signature covers it.
- * Adoption moves the record to owner_ringing with the sid, from 'dialing' only, so the orchestrator's own
- * settle (also from 'dialing') loses and cannot write a second call.initiated. It is first-writer-wins
- * through the `owner#adopt` marker, so two racing callbacks cannot overwrite each other's sid; after this
- * call the caller compares against whichever sid the re-read shows.
+ * Adoption moves the record to owner_ringing with the sid. That dialing -> owner_ringing transition is the
+ * single-writer guard: exactly one caller wins it, so two racing callbacks cannot overwrite each other's
+ * sid, and the orchestrator's own settle (also from 'dialing') loses and cannot write a second
+ * call.initiated. After this call the caller compares against whichever sid the re-read shows.
  * A record stuck in 'dialing'/'owner_ringing' (no callback ever) needs an ops cleanup, see header.
  */
 async function withOwnerSid(q: CallQuery, record: HotLeadCallRecord, callSid: string | undefined): Promise<HotLeadCallRecord> {
   if (record.ownerCallSid || record.state !== 'dialing' || !callSid) return record;
   const store = getLeadCallStore();
-  // The orchestrator's settle is unchanged; it now loses its transition, so the call.initiated it would
-  // have written is written here, by the winning adoption only.
-  if (await store.transition(q.listId, q.leadId, ['dialing'], { state: 'owner_ringing', ownerCallSid: callSid, lastSequence: { [ADOPT_MARKER]: 1 } })) {
+  // Adoption moves the record out of 'dialing', so the orchestrator's later settle loses and only this path
+  // writes call.initiated.
+  if (await store.transition(q.listId, q.leadId, ['dialing'], { state: 'owner_ringing', ownerCallSid: callSid })) {
     await store.addEvent(q.listId, q.leadId, 'call.initiated');
   }
   return (await store.get(q.listId, q.leadId)) ?? record; // a lost race still shows whichever sid won

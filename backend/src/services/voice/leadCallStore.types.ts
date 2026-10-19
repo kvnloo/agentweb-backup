@@ -31,9 +31,8 @@ export interface HotLeadCallRecord {
   /**
    * Highest Twilio SequenceNumber handled per CallSid, to ignore out-of-order status callbacks. It also holds
    * the voice webhooks' first-writer-wins decision markers, which rely on the same strictly-higher condition
-   * (a second write of the same key fails): `<ownerCallSid>#gather` (the owner's one decision at the Gather),
-   * `<ownerCallSid>#dial` (the one lead-did-not-answer result) and `owner#adopt` (the one adoption of the
-   * owner CallSid by a webhook, when it beats the orchestrator's own settle).
+   * (a second write of the same key fails): `<ownerCallSid>#gather` (the owner's one decision at the Gather)
+   * and `<ownerCallSid>#dial` (the one lead-did-not-answer result).
    */
   lastSequence?: Record<string, number>;
 }

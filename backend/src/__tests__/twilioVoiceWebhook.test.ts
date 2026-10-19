@@ -373,7 +373,7 @@ describe('records still in dialing (orchestrator has not stored the owner CallSi
   it('adoption moves the record to owner_ringing, so the orchestrator\'s late settle loses and call.initiated is written once', async () => {
     await ownerStatus('in-progress');
     expect(store.record).toMatchObject({ state: 'owner_ringing', ownerCallSid: OWNER_SID });
-    // The orchestrator's settle (dialing -> owner_ringing, then call.initiated), unchanged.
+    // The orchestrator's settle (dialing -> owner_ringing, then call.initiated).
     const settled = await store.transition(LIST, LEAD, ['dialing'], { state: 'owner_ringing', ownerCallSid: OWNER_SID });
     if (settled) await store.addEvent(LIST, LEAD, 'call.initiated');
     expect(settled).toBe(false);
