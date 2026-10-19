@@ -6472,6 +6472,8 @@ export class AgentModeService {
     // Org notification preferences use the same org-settings authorization.
     'get_lead_notification_settings',
     'update_lead_notification_settings',
+    'get_hot_lead_call_settings',
+    'update_hot_lead_call_settings',
 
     // Scheduled Chat Management
     'list_scheduled_chats',
