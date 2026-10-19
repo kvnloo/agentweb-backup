@@ -2,7 +2,7 @@
  * ENG-2110 PR 1b-i: the Claude adapter against a scripted `claude` (fakeClaude.js) running as a REAL local
  * process through the real turn wrapper. No root, no systemd: the host's hardening is the port's job (1b-ii).
  */
-import { spawn } from "child_process";
+import { execFileSync, spawn } from "child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
@@ -228,7 +228,7 @@ describe("claude adapter: a turn", () => {
     expect(events[4]).toEqual({ type: "usage", inputTokens: 10, outputTokens: 5 });
     const turn = e.last("turn");
     expect(turn.args).toEqual(expect.arrayContaining(["-p", "--no-session-persistence", "--include-hook-events", "--strict-mcp-config", "--model", "sonnet", "--system-prompt-file", "/opt/aw/prompt.txt"]));
-    expect(turn.args[turn.args.indexOf("--mcp-config") + 1]).toBe(join(e.unitTmp, "aw-mcp.json"));
+    expect(turn.args[turn.args.indexOf("--mcp-config") + 1]).toBe(join(e.unitTmp, "aw-cfg", "mcp.json"));
     expect(JSON.stringify(turn.args)).not.toContain("TOKEN-0123456789");
     expect(JSON.stringify(turn.env)).not.toContain("TOKEN-0123456789");
     expect(turn.env.CLAUDE_CONFIG_DIR).toBe(e.ctx.homeDir);
@@ -238,12 +238,12 @@ describe("claude adapter: a turn", () => {
     const mcp = e.last("turn-input");
     expect(mcp.mcpMode).toBe("600");
     expect(turn.mcpServers).toEqual(["emma"]);
-    expect(JSON.parse(readFileSync(join(e.unitTmp, "aw-mcp.json"), "utf8")).mcpServers.emma.headers.Authorization).toBe("Bearer TOKEN-0123456789-abcdef");
+    expect(JSON.parse(readFileSync(join(e.unitTmp, "aw-cfg", "mcp.json"), "utf8")).mcpServers.emma.headers.Authorization).toBe("Bearer TOKEN-0123456789-abcdef");
     expect(mcp.firstUser).toMatchObject({ type: "user", message: { content: "hi" } }); // the config line was consumed by the wrapper, the conversation starts after it
     await session.closed;
     expect(isGone(turn.pid)).toBe(true);
     expect(readdirSync(e.ctx.homeDir).filter((n) => !n.startsWith(".fake"))).toEqual([]); // nothing but the test's own files in the credential home
-    expect(existsSync(join(e.ctx.workDir, "aw-mcp.json"))).toBe(false);
+    expect(existsSync(join(e.ctx.workDir, "aw-cfg"))).toBe(false);
   });
 
   it("a session serves exactly one turn", async () => {
@@ -391,6 +391,55 @@ describe("claude adapter: a turn", () => {
     expect(Date.now() - t0).toBeLessThan(2500);
   });
 
+  it("the session (and so its cap slot) stays alive until the auth confirmation has finished, and the turn's process is already gone while it runs", async () => {
+    const e = makeEnv();
+    e.scenario({ turn: [{ type: "assistant", message: { content: [{ type: "text", text: "x" }] } }, { type: "result", subtype: "error", is_error: true, result: "Not logged in · Please run /login" }], status: { loggedIn: false }, statusDelayMs: 900 });
+    const session = await makeAdapter(e.unitTmp).openSession(e.ctx, { connectionId: "conn1", epoch: 1 });
+    let closed = false;
+    void session.closed.then(() => (closed = true));
+    const it = session.turn({ turnId: "t1", prompt: "hi", model: "sonnet", bridgeToken: "TOKEN-0123456789-abcdef" })[Symbol.asyncIterator]();
+    const first = await it.next(); // the text event: the CLI's turn is still running here
+    expect(first.value).toMatchObject({ type: "text" });
+    const resultP = it.next(); // drives the generator through the failure, the stop and the (delayed) confirmation
+    await new Promise((r) => setTimeout(r, 500)); // inside the confirmation window
+    expect(closed).toBe(false); // the slot is NOT released while the second process runs
+    expect(isGone(e.last("turn").pid)).toBe(true); // ...but the turn's own process is already gone
+    void session.interrupt("t1"); // the host aborts the turn DURING the confirmation: that must not release the slot early either
+    await new Promise((r) => setTimeout(r, 150));
+    expect(closed).toBe(false);
+    const res = await resultP;
+    expect(res.value).toMatchObject({ type: "result", ok: false, errorKind: "auth_dead" });
+    await it.next();
+    await session.closed;
+    expect(closed).toBe(true);
+  });
+
+  it("a kill that keeps failing cannot hang the turn: the result still arrives (bounded stop), and `closed` honestly stays pending", async () => {
+    const e = makeEnv();
+    e.scenario({ turn: [{ type: "result", subtype: "error", is_error: true, result: "Not logged in · Please run /login" }], status: { loggedIn: false } });
+    let allowKill = false;
+    let realKill: (() => void) | undefined;
+    const ctx: AdapterContext = {
+      ...e.ctx,
+      spawnAs: (spec) => {
+        const child = localSpawn(spec);
+        if (spec.file === WRAPPER) realKill = () => child.kill(); // the turn's process (not the status check's)
+        return { ...child, kill: () => (allowKill || spec.file !== WRAPPER ? child.kill() : (() => { throw new Error("EPERM"); })()) };
+      },
+    };
+    const session = await makeAdapter(e.unitTmp, { killWaitMs: 300 }).openSession(ctx, { connectionId: "conn1", epoch: 1 });
+    let closed = false;
+    void session.closed.then(() => (closed = true));
+    const t0 = Date.now();
+    const events = await collect(session);
+    expect(events[events.length - 1]).toMatchObject({ type: "result", ok: false, errorKind: "auth_dead" });
+    expect(Date.now() - t0).toBeLessThan(4000);
+    expect(closed).toBe(false); // the process could not be killed: not "gone"
+    allowKill = true;
+    realKill?.();
+    await session.closed;
+  });
+
   it("a process that dies mid-turn ends the turn with a failure result (never silence), and `closed` resolves", async () => {
     const e = makeEnv();
     e.scenario({ turn: [{ type: "assistant", message: { content: [{ type: "text", text: "partial" }] } }, { exit: 3 }] });
@@ -520,35 +569,42 @@ describe("claude-turn.sh wrapper", () => {
       c.stdin.end();
     });
     expect(result.stdout).toBe("line two\nline three\n");
-    expect(readFileSync(join(dir, "aw-mcp.json"), "utf8")).toContain("Bearer SECRET");
-    expect((statSync(join(dir, "aw-mcp.json")).mode & 0o777).toString(8)).toBe("600");
+    expect(readFileSync(join(dir, "aw-cfg", "mcp.json"), "utf8")).toContain("Bearer SECRET");
+    expect((statSync(join(dir, "aw-cfg", "mcp.json")).mode & 0o777).toString(8)).toBe("600");
+    expect((statSync(join(dir, "aw-cfg")).mode & 0o777).toString(8)).toBe("700");
     expect(existsSync(join(dir, "aw-home"))).toBe(true);
     expect(result.code).toBe(0);
   });
-  it("never writes through a pre-existing path: a planted config file or HOME directory makes it refuse (exclusive create)", async () => {
+  it("creates its directories exclusively: ANYTHING planted at aw-cfg or aw-home (dir, file, symlink, FIFO) makes it refuse, and nothing is written through it", async () => {
     const run = (dir: string) =>
       new Promise<number | null>((resolve) => {
         const c = spawn(WRAPPER, ["/bin/echo", "STARTED"], { env: { PATH: "/usr/bin:/bin", TMPDIR: dir }, stdio: ["pipe", "ignore", "ignore"] });
         c.stdin.on("error", () => undefined);
         c.on("exit", (code) => resolve(code));
-        c.stdin.end("{}\n");
+        c.stdin.end('{"mcpServers":{"emma":{"headers":{"Authorization":"Bearer PLANT-SECRET"}}}}\n');
       });
-    const planted = mkdtempSync(join(tmpdir(), "wrapper-test-"));
-    roots.push(planted);
-    writeFileSync(join(planted, "aw-mcp.json"), "planted");
-    expect(await run(planted)).not.toBe(0);
-    expect(readFileSync(join(planted, "aw-mcp.json"), "utf8")).toBe("planted"); // untouched
-    const plantedDir = mkdtempSync(join(tmpdir(), "wrapper-test-"));
-    roots.push(plantedDir);
-    mkdirSync(join(plantedDir, "aw-home")); // an existing HOME dir is refused too (mkdir without -p)
-    expect(await run(plantedDir)).not.toBe(0);
-    expect(existsSync(join(plantedDir, "aw-mcp.json"))).toBe(false);
-    const planted2 = mkdtempSync(join(tmpdir(), "wrapper-test-"));
-    roots.push(planted2);
-    writeFileSync(join(planted2, "target"), "victim");
-    symlinkSync(join(planted2, "target"), join(planted2, "aw-mcp.json"));
-    expect(await run(planted2)).not.toBe(0);
-    expect(readFileSync(join(planted2, "target"), "utf8")).toBe("victim"); // a planted symlink is not followed
+    const fresh = () => {
+      const d = mkdtempSync(join(tmpdir(), "wrapper-test-"));
+      roots.push(d);
+      return d;
+    };
+    for (const planted of ["aw-cfg", "aw-home"]) {
+      const asDir = fresh();
+      mkdirSync(join(asDir, planted));
+      expect(await run(asDir)).not.toBe(0);
+      const asFile = fresh();
+      writeFileSync(join(asFile, planted), "planted");
+      expect(await run(asFile)).not.toBe(0);
+      expect(readFileSync(join(asFile, planted), "utf8")).toBe("planted");
+      const asFifo = fresh();
+      execFileSync("mkfifo", [join(asFifo, planted)]);
+      expect(await run(asFifo)).not.toBe(0);
+      const asLink = fresh();
+      const victim = fresh();
+      symlinkSync(victim, join(asLink, planted));
+      expect(await run(asLink)).not.toBe(0);
+      expect(readdirSync(victim)).toEqual([]); // nothing was written through the symlink
+    }
   });
 
   it("refuses to run without TMPDIR or with empty stdin (never starts the CLI without its config)", async () => {

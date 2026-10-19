@@ -39,10 +39,16 @@ if (args[0] === "auth" && args[1] === "login") {
     fs.writeFileSync(cfgDir + "/.fake-status-saw-turn-alive", String(alive));
   } catch {}
   const st = scenario.status || { loggedIn: true, authMethod: "claude.ai", subscriptionType: "max", email: null, orgId: null, orgName: null };
-  if (scenario.statusHang) setInterval(() => {}, 1000);
+  if (scenario.statusDelayMs) {
+    const delayed = JSON.stringify(st) + "\n";
+    setTimeout(() => {
+      process.stdout.write(delayed);
+      process.exit(st.loggedIn === false ? 1 : 0);
+    }, scenario.statusDelayMs);
+  } else if (scenario.statusHang) setInterval(() => {}, 1000);
   else if (scenario.statusRaw !== undefined) process.stdout.write(scenario.statusRaw);
   else process.stdout.write(JSON.stringify(st) + "\n");
-  if (!scenario.statusHang) process.exit(st.loggedIn === false ? 1 : 0);
+  if (!scenario.statusHang && !scenario.statusDelayMs) process.exit(st.loggedIn === false ? 1 : 0);
 } else if (args[0] === "auth" && args[1] === "logout") {
   record({ mode: "logout" });
   process.exit(0);

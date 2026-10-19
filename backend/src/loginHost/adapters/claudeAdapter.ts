@@ -111,6 +111,7 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
       this.emit("exit", code, signal);
     });
     child.onError?.((err) => {
+      this.exitCode = -1; // it never ran: not "still running" for the runner
       done();
       this.emit("error", err);
     });
@@ -443,6 +444,8 @@ class ClaudeSession implements ProviderSession {
   private closing = false;
   private closePromise: Promise<void> | undefined;
   private spawning: Promise<unknown> | undefined;
+  /** An in-flight `auth status` confirmation: the session (and so its cap slot) stays alive until it settles. */
+  private confirming: Promise<unknown> | undefined;
 
   constructor(
     private readonly adapter: ClaudeAdapter,
@@ -492,7 +495,7 @@ class ClaudeSession implements ProviderSession {
         model: input.model,
         cwd: this.ctx.workDir,
         mcpServer: { name: this.cfg.mcpServerName, url: this.cfg.bridgeUrl, bearerToken: input.bridgeToken },
-        mcpDelivery: { via: "stdin", path: join(this.cfg.unitTmp, "aw-mcp.json") },
+        mcpDelivery: { via: "stdin", path: join(this.cfg.unitTmp, "aw-cfg", "mcp.json") },
       });
       await this.spawning;
       if (this.closing || this.interrupted) return;
@@ -533,8 +536,11 @@ class ClaudeSession implements ProviderSession {
       const cls = classifyFailureText(result.resultText);
       let errorKind: ErrorKind = failureClassToKind(cls);
       if (cls === "auth_like") {
-        await this.close(); // the turn's process is gone first: the confirmation must not run beside it (one process per cap slot)
-        errorKind = await this.adapter.confirmLoggedOut(this.ctx);
+        await this.stopProcess(); // the turn's process is gone first: the confirmation must not run beside it (one process per cap slot)
+        // `closed` (which frees the cap slot) waits for this check, so the slot is held while the check's own process runs.
+        const confirmation = this.adapter.confirmLoggedOut(this.ctx);
+        this.confirming = confirmation;
+        errorKind = await confirmation;
       }
       yield { type: "result", ok: false, text: "", errorKind };
     } catch (err) {
@@ -553,6 +559,23 @@ class ClaudeSession implements ProviderSession {
   close(): Promise<void> {
     this.closePromise ??= this.doClose();
     return this.closePromise;
+  }
+
+  /** Asks the runner to end the turn's process and waits for it to be gone, bounded: a kill that keeps failing must not hang the turn (`close()` keeps waiting for the real exit). */
+  private async stopProcess(): Promise<void> {
+    try {
+      if (this.key) this.runner.close({ conversationId: this.key });
+      else this.runner.closeAll();
+    } catch {
+      /* a kill that threw: the process is not gone, so waiting for its exit below keeps going */
+    }
+    await this.spawning?.catch(() => undefined);
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([Promise.all(this.exits), new Promise<void>((r) => (timer = setTimeout(r, this.cfg.killWaitMs)))]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private async doClose(): Promise<void> {
@@ -574,6 +597,8 @@ class ClaudeSession implements ProviderSession {
         seen = this.exits.length;
         await Promise.all(this.exits);
       } while (this.exits.length !== seen);
+      // ...and when the auth confirmation (a second, short-lived process on this home) has finished.
+      await this.confirming?.catch(() => undefined);
     } finally {
       this.resolveClosed();
     }

@@ -195,6 +195,8 @@ export class ConnectionManager {
   private readonly locks = new KeyedMutex();
   /** connectionId -> uid whose hung process may still be alive; killed when the connection has no live session left. */
   private readonly deferredKills = new Map<string, number>();
+  /** connectionId -> number of uid kills in flight. A turn admitted while a kill runs would have its fresh process killed, so admission waits (EBUSY) until the kill settles. */
+  private readonly killsInFlight = new Map<string, number>();
   private readonly logins = new Map<string, { connectionId: string; proc: LoginProcess; provider: string }>();
   private readonly sessions = new Map<string, HostSession[]>();
   private readonly turns = new Map<string, RunningTurn>();
@@ -419,6 +421,7 @@ export class ConnectionManager {
     const c = this.requireConn(req.connectionId);
     this.requireEpoch(c, req.epoch);
     if (c.state !== "active") throw new HostError("ESTATE", c.state);
+    if ((this.killsInFlight.get(c.connectionId) ?? 0) > 0) throw new HostError("EBUSY", "connection_busy");
     const adapter = this.adapter(c.provider);
     if (!adapter.models.has(req.model)) throw new HostError("EINVALID", "model_not_allowed");
     const tkey = this.turnKey(c.connectionId, req.turnId);
@@ -582,7 +585,7 @@ export class ConnectionManager {
       this.retireSession(session);
       void closing;
       try {
-        await this.safeKill(running.uid);
+        await this.killGuarded(c.connectionId, running.uid);
       } catch {
         /* the sweeper retries */
       }
@@ -795,7 +798,7 @@ export class ConnectionManager {
     const uid = this.deferredKills.get(hs.connectionId);
     if (uid !== undefined && !(this.sessions.get(hs.connectionId) ?? []).some((s) => !s.dead)) {
       this.deferredKills.delete(hs.connectionId);
-      if (this.state().connections[hs.connectionId]?.uid === uid) void this.safeKill(uid).catch(() => undefined); // only while the connection still owns that uid: never a uid that was freed and re-allocated
+      if (this.state().connections[hs.connectionId]?.uid === uid) void this.killGuarded(hs.connectionId, uid).catch(() => undefined); // only while the connection still owns that uid: never a uid that was freed and re-allocated
     }
   }
 
@@ -956,7 +959,20 @@ export class ConnectionManager {
         }
       }),
     );
+    this.deferredKills.delete(c.connectionId); // the uid is killed below (or the connection is going away): a stale entry must not fire at some later retire
     if (c.uid >= 0) await this.safeKill(c.uid);
+  }
+
+  /** Kills a uid's processes while refusing new turns on that connection, so the kill cannot hit a process started after it began. */
+  private async killGuarded(connectionId: string, uid: number): Promise<void> {
+    this.killsInFlight.set(connectionId, (this.killsInFlight.get(connectionId) ?? 0) + 1);
+    try {
+      await this.safeKill(uid);
+    } finally {
+      const n = (this.killsInFlight.get(connectionId) ?? 1) - 1;
+      if (n <= 0) this.killsInFlight.delete(connectionId);
+      else this.killsInFlight.set(connectionId, n);
+    }
   }
 
   private markNeedsReconnect(c: ConnRecord, reason: string): void {

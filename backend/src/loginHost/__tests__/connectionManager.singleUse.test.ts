@@ -200,6 +200,82 @@ describe("a hung turn that shares its uid with a live sibling", () => {
     expect((rig.mgr as unknown as { deferredKills: Map<string, number> }).deferredKills.has("c1")).toBe(false); // consumed either way
   });
 
+  it("no turn is admitted while a kill of its connection's uid is running (its fresh process would be the one killed)", async () => {
+    rig = makeRig({ adapter: { singleUse: true, maxProcessesPerHome: 3 }, config: { abortGraceMs: 20, adapterCallTimeoutMs: 100 } });
+    await signIn(rig, "c1", 1);
+    rig.script.hangTurn = true;
+    rig.script.closeGate = new Promise<void>(() => undefined);
+    let releaseKill!: () => void;
+    rig.fs.killGate = new Promise<void>((r) => (releaseKill = r)); // a slow killAll
+    const hung = nextTurn("c1", 1);
+    const hOut = drain((await rig.mgr.runTurn(hung)).events!);
+    await flush();
+    await rig.mgr.interruptTurn({ connectionId: "c1", epoch: 1, turnId: hung.turnId });
+    await new Promise((r) => setTimeout(r, 80)); // grace passed: the host is now inside killAll (held)
+    rig.script.hangTurn = false;
+    expect(await code(rig.mgr.runTurn(nextTurn("c1", 1)))).toBe("EBUSY:connection_busy"); // refused while the kill runs
+    releaseKill();
+    await hOut;
+    await flush();
+    expect(await code(rig.mgr.runTurn(nextTurn("c1", 1)))).toBe("OK"); // and allowed again once it settled
+  });
+
+  it("admission is also refused while a DEFERRED kill runs, and two overlapping kills keep it refused until the LAST one settles", async () => {
+    rig = makeRig({ adapter: { singleUse: true, maxProcessesPerHome: 3 }, config: { abortGraceMs: 20, adapterCallTimeoutMs: 80 } });
+    await signIn(rig, "c1", 1);
+    const uid = rig.store.get().connections.c1.uid;
+    // deferred kill path: a hung turn beside a sibling, close stuck; when the sibling ends the kill fires (held by the gate)
+    let releaseSibling!: () => void;
+    rig.script.turnEvents = [{ wait: new Promise<void>((r) => (releaseSibling = r)) }, resultEvent];
+    const sOut = drain((await rig.mgr.runTurn(nextTurn("c1", 1))).events!);
+    await flush();
+    rig.script.hangTurn = true;
+    rig.script.closeGate = new Promise<void>(() => undefined);
+    const hung = nextTurn("c1", 1);
+    const hOut = drain((await rig.mgr.runTurn(hung)).events!);
+    await flush();
+    await rig.mgr.interruptTurn({ connectionId: "c1", epoch: 1, turnId: hung.turnId });
+    await hOut;
+    await new Promise((r) => setTimeout(r, 150)); // the hung session's bounded close timed out: kill deferred
+    rig.script.hangTurn = false;
+    let releaseKill!: () => void;
+    rig.fs.killGate = new Promise<void>((r) => (releaseKill = r));
+    releaseSibling();
+    await sOut;
+    await new Promise((r) => setTimeout(r, 150)); // the sibling's stuck close times out; no live session left: the deferred kill starts and waits on the gate
+    expect(await code(rig.mgr.runTurn(nextTurn("c1", 1)))).toBe("EBUSY:connection_busy");
+    releaseKill();
+    await flush();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(rig.fs.killed).toContain(uid);
+    rig.script.closeGate = undefined;
+    expect(await code(rig.mgr.runTurn(nextTurn("c1", 1)))).toBe("OK");
+
+    // overlapping guarded kills: the guard holds until the last one settles
+    const priv = rig.mgr as unknown as { killGuarded(id: string, uid: number): Promise<void> };
+    let r1!: () => void;
+    let r2!: () => void;
+    rig.fs.killGate = new Promise<void>((r) => (r1 = r));
+    const k1 = priv.killGuarded("c1", uid);
+    rig.fs.killGate = new Promise<void>((r) => (r2 = r));
+    const k2 = priv.killGuarded("c1", uid);
+    r1();
+    await k1;
+    expect(await code(rig.mgr.runTurn(nextTurn("c1", 1)))).toBe("EBUSY:connection_busy"); // the second kill is still running
+    r2();
+    await k2;
+    expect(await code(rig.mgr.runTurn(nextTurn("c1", 1)))).toBe("OK");
+  });
+
+  it("disabling the connection clears a pending deferred kill (it must not fire at some unrelated later retire)", async () => {
+    rig = makeRig({ adapter: { singleUse: true } });
+    await signIn(rig, "c1", 1);
+    const deferred = (rig.mgr as unknown as { deferredKills: Map<string, number> }).deferredKills;
+    deferred.set("c1", rig.store.get().connections.c1.uid);
+    await rig.mgr.disable({ connectionId: "c1", epoch: 2 });
+    expect(deferred.has("c1")).toBe(false);
+  });
+
   it("a close that succeeds needs no kill at all", async () => {
     rig = makeRig({ adapter: { singleUse: true, maxProcessesPerHome: 2 }, config: { abortGraceMs: 20 } });
     await signIn(rig, "c1", 1);
