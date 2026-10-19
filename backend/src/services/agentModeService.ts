@@ -525,7 +525,7 @@ import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } fro
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
-import { isTransientLLMError, extractAffordableTokens, PROVIDER_UNAVAILABLE_USER_MESSAGE } from '../utils/agentModeErrors';
+import { isTransientLLMError, isProviderDeserializationError, extractAffordableTokens, PROVIDER_UNAVAILABLE_USER_MESSAGE } from '../utils/agentModeErrors';
 import { isLLMProviderOutage } from './agentMode/providerOutage';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
 import { computeRunVerdict, type RunTerminalInfo } from '../loops/instances/agent-mode/runRecorder';
@@ -2702,7 +2702,10 @@ export class AgentModeService {
       // this covers OpenRouter's malformed/empty-response failure classes,
       // which are not a rate limit, network blip, or 5xx by
       // classifyToolErrorClass's general taxonomy.
-      return isMalformedOpenRouterResponseError(error);
+      // ENG-503: a truncated provider body the SDK could not deserialize is the
+      // same "response cut mid-stream" class — one in-call retry (bounded by
+      // maxAttempts, before anything from this call is persisted).
+      return isMalformedOpenRouterResponseError(error) || isProviderDeserializationError(error);
     };
 
     // A single 1.5s retry wasn't enough to clear a burst-triggered 429 — prod

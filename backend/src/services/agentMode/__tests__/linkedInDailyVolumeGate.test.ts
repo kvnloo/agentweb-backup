@@ -28,6 +28,7 @@ jest.mock('../../linkedInWritePacer', () => {
 
 import {
   paceLinkedInWrite,
+  releaseLinkedInDailySlot,
   resolveLinkedInAccountForWrite,
   setDailyInviteCap,
   DailyInviteCapNotOwnerError,
@@ -406,5 +407,50 @@ describe('warm-up ramp wiring (ENG-1721)', () => {
     const result = await paceLinkedInWrite('send-invite', account, ACCOUNT_ID);
 
     expect(result.refusal).toBeNull();
+  });
+});
+
+describe('ENG-2529: legacy-row id + slot release (Opslane run 725)', () => {
+  it("persists the reservation under the stored account_id when the caller named the row by its Unipile id", async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: 'legacy-row-w5', userId: 'user-1', config: { unipile_account_id: 'unipile-legacy-w5' } },
+    ]);
+    const resolved = await resolveLinkedInAccountForWrite('user-1', 'unipile-legacy-w5');
+    const result = await paceLinkedInWrite('send-message', resolved!, 'unipile-legacy-w5');
+    expect(result.refusal).toBeNull();
+    expect(mockUpdateAccountConfig.mock.calls[0][2]).toBe('legacy-row-w5');
+  });
+
+  it('releaseLinkedInDailySlot decrements the current window under the stored id', async () => {
+    const acct = { ownerUserId: 'owner', configuredDailyInviteCap: 10, dailyVolumeState: undefined, connectedAt: undefined, storedAccountId: 'row-1' };
+    await releaseLinkedInDailySlot('send-message', acct, 'uni-1', 5);
+    const [owner, , id, fn] = mockUpdateAccountConfig.mock.calls[0];
+    expect(owner).toBe('owner');
+    expect(id).toBe('row-1');
+    expect(fn({ daily_volume: { message: { count: 2, windowStartedAt: 5 } } }).updates.daily_volume.message).toEqual({ count: 1, windowStartedAt: 5 });
+    expect(fn({ daily_volume: { message: { count: 0, windowStartedAt: 5 } } }).skip).toBe(true);
+  });
+
+  it('releaseLinkedInDailySlot skips the refund when a new daily window started after the reservation', async () => {
+    const acct = { ownerUserId: 'owner', configuredDailyInviteCap: 10, dailyVolumeState: undefined, connectedAt: undefined, storedAccountId: 'row-1' };
+    await releaseLinkedInDailySlot('send-message', acct, 'uni-1', 5);
+    const fn = mockUpdateAccountConfig.mock.calls[0][3];
+    expect(fn({ daily_volume: { message: { count: 1, windowStartedAt: 999 } } }).skip).toBe(true);
+  });
+
+  it('paceLinkedInWrite reserves the hourly slot under the stored account id', async () => {
+    const acct = { ownerUserId: 'owner', configuredDailyInviteCap: 10, dailyVolumeState: undefined, connectedAt: undefined, storedAccountId: 'row-1' };
+    mockUpdateAccountConfig.mockImplementation(async (_o: string, _p: string, _i: string, f: any) => f({ daily_invite_cap: 10 }));
+    const res = await paceLinkedInWrite('send-invite', acct, 'uni-1');
+    expect(res.refusal).toBeNull();
+    expect(mockReserveWriteSlot).toHaveBeenCalledWith('row-1');
+    expect(typeof (res as any).reservedWindowStartedAt).toBe('number');
+  });
+
+  it('releaseLinkedInDailySlot never throws when the refund cannot be persisted', async () => {
+    mockUpdateAccountConfig.mockRejectedValueOnce(new Error('boom'));
+    const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    await expect(releaseLinkedInDailySlot('send-message', { ownerUserId: 'o', configuredDailyInviteCap: 1, dailyVolumeState: undefined, connectedAt: undefined }, 'a')).resolves.toBeUndefined();
+    spy.mockRestore();
   });
 });

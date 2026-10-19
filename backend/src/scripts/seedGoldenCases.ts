@@ -55,6 +55,11 @@ import { goldenSetStoreFromEnv, GOLDEN_CASES_TABLE_ENV, type GoldenSetStore } fr
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 
+// The SDK has no default region outside the app (whose startup sets it), so a bare ops run failed
+// with "Missing region in config" until AWS_REGION was exported (ENG-665). Set before any client,
+// including the golden-set store's, is built.
+AWS.config.update({ region: process.env.AWS_REGION || 'us-west-2' });
+
 const TARGET_FLAGS: Record<string, EvalSurface> = {
   '--target-agent': 'agent',
   '--target-creative': 'creative',

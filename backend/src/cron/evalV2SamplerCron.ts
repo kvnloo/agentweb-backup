@@ -76,6 +76,7 @@ import {
 } from '../loops/eval/evalV2Surfaces';
 import { ACCOUNT_HEALTH_SIGNAL_CAPABILITY } from '../services/accountCapabilityRequirementsDb';
 import { SPEND_EVENTS_OCCURRED_AT_INDEX, SPEND_EVENTS_TABLE } from '../services/spendEventDb';
+import { TABLE_PREFIX } from '../config/constants';
 
 export const EVAL_V2_SAMPLER_FLAG = 'EVAL_V2_SAMPLER_ENABLED';
 export const EVAL_V2_SAMPLE_SIZE_ENV = 'EVAL_V2_SAMPLE_SIZE';
@@ -478,7 +479,6 @@ export async function readEvalV2Trend(
 // Production wiring
 // ---------------------------------------------------------------------------
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 
 export function productionGraderTables(): GraderTables {
   return {
