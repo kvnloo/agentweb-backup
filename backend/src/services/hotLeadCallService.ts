@@ -1,11 +1,10 @@
 import { createHash } from 'crypto';
-import { parsePhoneNumberWithError } from 'libphonenumber-js';
 import { isSmokeTestLead } from '../utils/smokeTestLead';
 import { crmDb } from './db';
 import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from './asyncJobQueue';
-import { toE164, redactPhone } from './whatsappService';
+import { redactPhone } from './whatsappService';
 import type { HotLeadCallConfig } from './hotLeadCallConfig';
-import { allowlistedE164 } from './hotLeadCallConfig';
+import { callableLeadPhone } from './hotLeadCallConfig';
 import type { LeadOrigin } from './leadNotificationConfig';
 import { VoiceCallError, getVoiceProvider, scrubErrorText } from './voice/voiceProvider';
 import { buildVoiceWebhookUrl } from './voice/voiceUrls';
@@ -37,28 +36,14 @@ const isNonEmpty = (v: unknown): v is string => typeof v === 'string' && v.trim(
 type LeadRow = NonNullable<Awaited<ReturnType<typeof crmDb.getLeadById>>>;
 interface GateInput { config: HotLeadCallConfig; lead: LeadRow; job: HotLeadCallJob }
 
-// National-format numbers are parsed as US (forms for US/CA carry no '+1'); anything that resolves to another
-// country, or to a blocked number type, fails allowlistedE164.
-function leadPhoneE164(lead: LeadRow): string | null {
-  const e164 = typeof lead.phone === 'string' ? toE164(lead.phone, 'US') : null;
-  return e164 ? allowlistedE164(e164) : null;
-}
-
-function phoneCountry(e164: string): string | undefined {
-  try { return parsePhoneNumberWithError(e164).country; } catch { return undefined; }
-}
-
 // Gates that record `call.skipped` when they refuse, cheapest first. Each returns a skip reason or null.
 const SKIP_GATES: Array<(g: GateInput) => string | null> = [
   // Enabled configs are validated to have one, but the call must never reach create without it: a skip
   // keeps the lead's single call slot unused.
   ({ config }) => (config.twilioNumber ? null : 'no_caller_number'),
   ({ lead, config }) => {
-    const phone = leadPhoneE164(lead);
-    if (!phone) return 'invalid_phone';
-    const country = phoneCountry(phone);
-    // allowlistedE164 already limits to US/CA, so this only refuses when allowedCountries is a strict subset.
-    return country && config.allowedCountries.some(c => c === country) ? null : 'country_not_allowed';
+    const callable = callableLeadPhone(lead.phone, config);
+    return 'reason' in callable ? callable.reason : null;
   },
   // Protects against queue-reclaim delays: a lead that waited too long is no longer "hot". A missing or
   // unparseable timestamp fails closed.

@@ -98,6 +98,24 @@ export function allowlistedE164(raw: unknown): string | null {
   }
 }
 
+/**
+ * The number to ring for a lead, from the lead row's raw phone. National-format numbers are parsed as US
+ * (forms for US/CA carry no '+1'); anything that resolves to another country or a blocked number type is
+ * refused, as is a country outside this org's allowedCountries (a strict subset of the global US/CA list).
+ * Shared by the call orchestrator's gates and the voice webhooks, which re-check at bridge time.
+ */
+export function callableLeadPhone(
+  rawPhone: unknown,
+  config: Pick<HotLeadCallConfig, 'allowedCountries'>,
+): { phone: string } | { reason: 'invalid_phone' | 'country_not_allowed' } {
+  const e164 = typeof rawPhone === 'string' ? toE164(rawPhone, 'US') : null;
+  const phone = e164 ? allowlistedE164(e164) : null;
+  if (!phone) return { reason: 'invalid_phone' };
+  let country: string | undefined;
+  try { country = parsePhoneNumberWithError(phone).country; } catch { country = undefined; }
+  return country && config.allowedCountries.some(c => c === country) ? { phone } : { reason: 'country_not_allowed' };
+}
+
 const isCountries = (v: unknown): v is HotLeadCallCountry[] =>
   Array.isArray(v) && v.length > 0 && new Set(v).size === v.length &&
   v.every(c => (HOT_LEAD_CALL_COUNTRIES as readonly unknown[]).includes(c));
