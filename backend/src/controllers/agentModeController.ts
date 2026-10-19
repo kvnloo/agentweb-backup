@@ -14426,7 +14426,7 @@ export const agentModeController = {
           if (result.sessionId) {
             try {
               const emailNotifications = scheduleToRun.emailNotifications || [];
-              if (emailNotifications.length > 0 && !(await isCleanLinkScanSession(result.sessionId, result))) {
+              if (emailNotifications.length > 0) {
                 await emailService.sendScheduledChatResultEmail(
                   emailNotifications,
                   scheduleToRun.scheduleName,
@@ -14601,7 +14601,7 @@ export const agentModeController = {
         if (result.sessionId) {
           try {
             const emailNotifications = scheduleToRun.emailNotifications || [];
-            if (emailNotifications.length > 0 && !(await isCleanLinkScanSession(result.sessionId, result))) {
+            if (emailNotifications.length > 0) {
               await emailService.sendScheduledChatResultEmail(
                 emailNotifications,
                 scheduleToRun.scheduleName,
