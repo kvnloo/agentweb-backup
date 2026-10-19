@@ -8,6 +8,16 @@ import { Request, Response } from 'express';
 jest.mock('../services/subscriptionService', () => ({
   getAllowedFunctionCalls: jest.fn(async () => []),
   isSubscriptionFeatureEnabled: jest.fn(async () => true),
+  // ENG-669: the owner's tier for the model allowlist.
+  getUserSubscriptionResolution: jest.fn(async () => ({ subscriptionType: 'Free', resolved: true })),
+  getSubscriptionTypeConfig: jest.fn(async (tier: string) => (tier === 'Free' ? { name: 'Free', allowedModels: ['anthropic.claude-opus-4-8'] } : null)),
+}));
+// ENG-669: AW-Settings rows by name; the tier-allowlist switch is off unless a test sets it.
+const mockSettings: Record<string, string | undefined> = {};
+jest.mock('../services/settingsService', () => ({
+  settingsService: {
+    getSetting: jest.fn(async (name: string) => (mockSettings[name] === undefined ? null : { settingName: name, settingValue: mockSettings[name] })),
+  },
 }));
 
 jest.mock('../services/chatbotService', () => ({
@@ -57,6 +67,7 @@ jest.mock('../services/db', () => ({
 
 import { scheduleDb, userDb, scheduleTemplateDb } from '../services/db';
 import { agentModeController } from '../controllers/agentModeController';
+import { modelAccess } from '../services/agentMode/modelAccessInstance';
 
 const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
@@ -82,6 +93,8 @@ const stored = (extra: Record<string, unknown> = {}) => ({
 
 beforeEach(() => {
   jest.clearAllMocks();
+  for (const key of Object.keys(mockSettings)) delete mockSettings[key];
+  modelAccess.reset();
   mockUserDb.getUserById.mockResolvedValue({ userId: USER, isAdmin: false } as any);
   mockScheduleDb.createSchedule.mockResolvedValue(undefined as any);
   mockScheduleDb.updateSchedule.mockResolvedValue(undefined as any);
@@ -288,5 +301,62 @@ describe('createScheduleFromTemplate override semantics (CodeRabbit)', () => {
   it('explicit empty backup override stays unpinned', async () => {
     await fromTemplate({ llmBackupModel: '' });
     expect((mockScheduleDb.createSchedule.mock.calls[0][0] as any).llmBackupModel).toBe('');
+  });
+});
+
+/**
+ * ENG-669 PR-A: a schedule pin (and backup) is the OWNER's selection, so with the tier allowlist on it must be in the
+ * owner's plan: refused at write time (422 not_in_plan). An UNCHANGED stored pin stays editable (the run itself is
+ * gated: runScheduledChat resolves the pin without a silent swap).
+ */
+describe('ENG-669 tier model allowlist on schedule pins', () => {
+  const NOT_IN_PLAN = 'anthropic.claude-sonnet-5';
+  beforeEach(() => {
+    mockSettings.model_tier_allowlist_enabled = 'true';
+    mockSettings.subscription_types = JSON.stringify([{ name: 'Free', allowedModels: ['gpt-5-chat-2'] }, { name: 'Pro', allowedModels: ['*'] }]);
+  });
+
+  it('create: a pin (or an alias of one) outside the plan is a 422 with the plan details; nothing written', async () => {
+    for (const llmModel of [NOT_IN_PLAN, 'claude-sonnet-5']) {
+      const res = await create({ llmModel });
+      expect(res.status).toHaveBeenCalledWith(422);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+        code: 'model_unavailable', reason: 'not_in_plan', requestedModel: llmModel,
+        model: NOT_IN_PLAN, tier: 'Free', allowedModels: ['anthropic.claude-opus-4-8'], upgradeRequired: ['Pro'],
+      }));
+    }
+    expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+  });
+
+  it('create: the backup is checked too; an allowed pin is stored', async () => {
+    expect((await create({ llmBackupModel: NOT_IN_PLAN })).status).toHaveBeenCalledWith(422);
+    expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+    await create({ llmModel: 'gpt-5-chat-2' });
+    expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(expect.objectContaining({ llmModel: 'gpt-5-chat-2' }));
+  });
+
+  it('an admin owner bypasses the allowlist', async () => {
+    mockUserDb.getUserById.mockResolvedValue({ userId: USER, isAdmin: true } as any);
+    await create({ llmModel: NOT_IN_PLAN });
+    expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(expect.objectContaining({ llmModel: NOT_IN_PLAN }));
+  });
+
+  it('update: an UNCHANGED stored pin outside the plan stays editable; changing TO one is a 422', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored({ llmModel: NOT_IN_PLAN }) as any);
+    expect((await update({ scheduleName: 'Renamed', llmModel: NOT_IN_PLAN })).status).not.toHaveBeenCalledWith(422);
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(1);
+
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored({ llmModel: 'gpt-5-chat-2' }) as any);
+    const changed = await update({ llmModel: NOT_IN_PLAN });
+    expect(changed.status).toHaveBeenCalledWith(422);
+    expect(changed.json).toHaveBeenCalledWith(expect.objectContaining({ reason: 'not_in_plan' }));
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(1);
+  });
+
+  it('switch off: the same pin is accepted exactly as before', async () => {
+    delete mockSettings.model_tier_allowlist_enabled;
+    modelAccess.reset();
+    await create({ llmModel: NOT_IN_PLAN });
+    expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(expect.objectContaining({ llmModel: NOT_IN_PLAN }));
   });
 });

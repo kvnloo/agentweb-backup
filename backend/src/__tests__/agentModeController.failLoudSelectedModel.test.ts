@@ -64,6 +64,8 @@ jest.mock('../services/agentModeService', () => ({
         : { model: 'gpt-5-chat-2', fellBack: true, requestedModel: model };
     }),
     isLiveModel: jest.fn((id: string) => id === 'live-voice-1'),
+    // Like the real one: registry, not internalOnly, not live (no adminOnly ids in this double).
+    isModelSelectableBy: jest.fn((id: string) => ['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5', 'legacy-old-alias-target'].includes(id)),
     getModelDisplayName: jest.fn((id: string) => (id === 'gpt-5.5' ? 'GPT-5.5' : undefined)),
     generateSessionTitle: jest.fn().mockResolvedValue('Test Title'),
     getMarketingSystemPrompt: jest.fn().mockResolvedValue('System prompt'),
@@ -103,6 +105,16 @@ jest.mock('../services/skillService', () => ({
 }));
 jest.mock('../services/subscriptionService', () => ({
   getAllowedSkills: jest.fn().mockResolvedValue([]),
+  // ENG-669: the tier allowlist resolves the owner's tier through these two.
+  getUserSubscriptionResolution: jest.fn(),
+  getSubscriptionTypeConfig: jest.fn(),
+}));
+// ENG-669: AW-Settings rows by name (the tier-allowlist switch, subscription_types); absent = null.
+const mockSettings: Record<string, string | undefined> = {};
+jest.mock('../services/settingsService', () => ({
+  settingsService: {
+    getSetting: jest.fn(async (name: string) => (mockSettings[name] === undefined ? null : { settingName: name, settingValue: mockSettings[name] })),
+  },
 }));
 // Delegates to the real runStore unless a test overrides it (ENG-903 ordering tests).
 jest.mock('../services/agentMode/runStore', () => {
@@ -128,6 +140,7 @@ jest.mock('../utils/agentModeErrors', () => ({
 import {
   agentModeController,
   activeSessionGenerations,
+  generateSessionResponse,
   resolveEffectiveModelForUser,
 } from '../controllers/agentModeController';
 import { ModelUnavailableError, buildModelUnavailableBody, isModelUnavailableError } from '../services/agentMode/modelUnavailable';
@@ -138,6 +151,8 @@ import { generateMarketingResponseWorkerService } from '../services/generateMark
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
 import { checkTokenUsage, incrementUserTokenUsage } from '../services/tokenUsageService';
 import { isRunStoreEnabled, claimIdempotency } from '../services/agentMode/runStore';
+import { modelAccess } from '../services/agentMode/modelAccessInstance';
+import { getSubscriptionTypeConfig, getUserSubscriptionResolution } from '../services/subscriptionService';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockWorker = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
@@ -205,6 +220,9 @@ beforeEach(() => {
   mockChatbotDb.createChatSession.mockResolvedValue(baseSession() as any);
   mockWorker.runInWorker.mockResolvedValue(workerResult as any);
   mockUserDb.getUserById.mockResolvedValue({ userId: OWNER, isAdmin: false } as any);
+  // ENG-669: the tier allowlist is OFF unless a test turns it on (absent row = today's behaviour).
+  for (const key of Object.keys(mockSettings)) delete mockSettings[key];
+  modelAccess.reset();
 });
 
 describe('resolveEffectiveModelForUser (fail-loud)', () => {
@@ -687,5 +705,290 @@ describe('buildModelUnavailableBody (single message producer)', () => {
 
   it('falls back to a placeholder when nothing printable remains', () => {
     expect(buildModelUnavailableBody(new ModelUnavailableError('\u0000\u0001', 'not_served')).error).toContain('(unknown model)');
+  });
+});
+
+/**
+ * ENG-669 PR-A: tier-gated model selection. The owner's tier allowlist (`allowedModels`) is checked on the
+ * CANONICAL id, against the SESSION OWNER, for the requested AND the stored model, before any silent swap: a model
+ * outside the plan is a 422 `model_unavailable` / `not_in_plan` (with the plan details for the owner, without them
+ * for a share viewer), never swapped and never rewritten. System models (the configured default) always run.
+ * Switch off => exactly the behaviour above.
+ */
+describe('ENG-669 tier model allowlist', () => {
+  const ALLOWED = 'gemini-3.5-flash';
+  const DISALLOWED = 'gpt-5.5';
+  const mockResolution = getUserSubscriptionResolution as jest.Mock;
+  const mockTierConfig = getSubscriptionTypeConfig as jest.Mock;
+  const PLAN_FIELDS = { model: DISALLOWED, tier: 'Free', allowedModels: [ALLOWED], upgradeRequired: ['Pro'] };
+
+  const switchOn = () => { mockSettings.model_tier_allowlist_enabled = 'true'; };
+
+  beforeEach(() => {
+    mockSettings.subscription_types = JSON.stringify([
+      { name: 'Free', allowedModels: [ALLOWED] },
+      { name: 'Pro', allowedModels: ['*'] },
+    ]);
+    mockResolution.mockResolvedValue({ subscriptionType: 'Free', resolved: true });
+    mockTierConfig.mockImplementation(async (tier: string) => JSON.parse(mockSettings.subscription_types as string).find((t: any) => t.name === tier) ?? null);
+  });
+
+  const shareReq = () => ({
+    params: { shareId: SESSION_ID },
+    query: { conversable: 'tok' },
+    body: { userMessage: MESSAGE, attachments: [] },
+    on: jest.fn(),
+  } as unknown as Request);
+  const sharedSession = (llmModel: string) => ({
+    ...baseSession(llmModel),
+    interactiveShareMetadata: { isActive: true, token: 'tok', sharedAt: '2026-07-01T00:00:00Z' },
+  });
+
+  describe('switch OFF: byte-identical to today', () => {
+    it('a stored model outside the (configured) plan still runs, and no tier is read', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(baseSession(DISALLOWED) as any);
+      const res = makeRes();
+      await agentModeController.generateResponse(generateReq({}), res);
+      expect(res.statusCode).toBe(200);
+      expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: DISALLOWED }), expect.anything());
+      expect(mockResolution).not.toHaveBeenCalled();
+      expect(mockTierConfig).not.toHaveBeenCalled();
+    });
+
+    it('resolver: explicit and stored selections are honored exactly as before', async () => {
+      await expect(resolveEffectiveModelForUser({ userId: OWNER, requestedModel: DISALLOWED }))
+        .resolves.toMatchObject({ effectiveModel: DISALLOWED, modelSelection: 'honored' });
+      await expect(resolveEffectiveModelForUser({ userId: OWNER, requestedModel: DISALLOWED, allowSilentSwap: true }))
+        .resolves.toMatchObject({ effectiveModel: DISALLOWED, modelSelection: 'honored' });
+    });
+
+    it('the session-model PATCH keeps its pre-existing caller-based 403 / 200', async () => {
+      const res = makeRes();
+      await agentModeController.updateSessionLlmModel({ user: { userId: OWNER }, params: { sessionId: SESSION_ID }, body: { llmModel: DISALLOWED } } as any, res);
+      expect(res.statusCode).toBe(200);
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DISALLOWED);
+    });
+  });
+
+  describe('switch ON', () => {
+    beforeEach(switchOn);
+
+    describe('resolver', () => {
+      it('refuses an explicit selection outside the plan with not_in_plan and the plan details', async () => {
+        const err = await resolveEffectiveModelForUser({ userId: OWNER, requestedModel: DISALLOWED }).catch((e) => e);
+        expect(err).toMatchObject({ code: 'model_unavailable', reason: 'not_in_plan', requestedModel: DISALLOWED, plan: PLAN_FIELDS });
+      });
+
+      it('refuses a STORED selection too (allowSilentSwap): never corrected to the default', async () => {
+        const err = await resolveEffectiveModelForUser({ userId: OWNER, requestedModel: DISALLOWED, allowSilentSwap: true }).catch((e) => e);
+        expect(err).toMatchObject({ reason: 'not_in_plan' });
+      });
+
+      it('matches the canonical id after alias resolution', async () => {
+        mockSettings.subscription_types = JSON.stringify([{ name: 'Free', allowedModels: ['legacy-old-alias-target'] }]);
+        (mockAgentModeService.getSupportedModels as jest.Mock).mockResolvedValueOnce([DEFAULT_MODEL, 'legacy-old-alias-target', DISALLOWED]);
+        await expect(resolveEffectiveModelForUser({ userId: OWNER, requestedModel: 'legacy-old-alias' }))
+          .resolves.toMatchObject({ effectiveModel: 'legacy-old-alias-target', modelSelection: 'honored' });
+      });
+
+      it('the only exempt paths: defaulted (nothing requested), the configured default, a system model', async () => {
+        await expect(resolveEffectiveModelForUser({ userId: OWNER })).resolves.toMatchObject({ modelSelection: 'defaulted' });
+        await expect(resolveEffectiveModelForUser({ userId: OWNER, requestedModel: DEFAULT_MODEL })).resolves.toMatchObject({ modelSelection: 'honored' });
+        await expect(resolveEffectiveModelForUser({ userId: OWNER, requestedModel: DISALLOWED, systemModel: true }))
+          .resolves.toMatchObject({ effectiveModel: DISALLOWED, modelSelection: 'honored' });
+      });
+
+      it('an admin owner bypasses; a paused account keeps its plain blocked decision', async () => {
+        mockUserDb.getUserById.mockResolvedValue({ userId: OWNER, isAdmin: true } as any);
+        await expect(resolveEffectiveModelForUser({ userId: OWNER, requestedModel: DISALLOWED })).resolves.toMatchObject({ modelSelection: 'honored' });
+        mockUserDb.getUserById.mockResolvedValue({ userId: OWNER, isAdmin: false } as any);
+        modelAccess.reset();
+        switchOn();
+        mockPolicy.mockResolvedValue({
+          billingUserId: OWNER, policy: null, costUsedMicroUsd: 0, tokenUsed: 0,
+          mode: { usageMode: 'paused', admissionAllowed: false, reason: 'hard_threshold_reached' },
+        });
+        await expect(resolveEffectiveModelForUser({ userId: OWNER, requestedModel: DISALLOWED })).resolves.toMatchObject({ modelSelection: 'blocked' });
+      });
+
+      it('an anon_ owner gets the Free tier', async () => {
+        mockResolution.mockResolvedValue({ subscriptionType: 'Pro', resolved: true });
+        const err = await resolveEffectiveModelForUser({ userId: 'anon_visitor', requestedModel: DISALLOWED }).catch((e) => e);
+        expect(err).toMatchObject({ reason: 'not_in_plan', plan: expect.objectContaining({ tier: 'Free' }) });
+        expect(mockResolution).not.toHaveBeenCalled();
+      });
+
+      it('an unreadable tier never blocks', async () => {
+        mockResolution.mockResolvedValue({ subscriptionType: 'Free', resolved: false });
+        await expect(resolveEffectiveModelForUser({ userId: OWNER, requestedModel: DISALLOWED })).resolves.toMatchObject({ modelSelection: 'honored' });
+      });
+    });
+
+    describe('POST /generate', () => {
+      const assertNothingRan = () => {
+        expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+        expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+        expect(mockChatbotDb.addMessageToSession).not.toHaveBeenCalled();
+        expect(mockIncrementUsage).not.toHaveBeenCalled();
+        expect(activeSessionGenerations.has(SESSION_ID)).toBe(false);
+      };
+
+      it('422s an explicit pick outside the plan with the plan details; nothing ran', async () => {
+        const res = makeRes();
+        await agentModeController.generateResponse(generateReq({ llmModel: DISALLOWED }), res);
+        expect(res.statusCode).toBe(422);
+        expect(res.body).toEqual({
+          error: "The model you selected (GPT-5.5) isn't included in your plan, so nothing was sent to a different model. Choose another model, or upgrade your plan to use this one.",
+          code: 'model_unavailable',
+          requestedModel: DISALLOWED,
+          reason: 'not_in_plan',
+          ...PLAN_FIELDS,
+        });
+        assertNothingRan();
+      });
+
+      it('grandfathering: a STORED model outside the plan (no request model) is a 422, never swapped or rewritten', async () => {
+        mockChatbotDb.getChatSession.mockResolvedValue(baseSession(DISALLOWED) as any);
+        const res = makeRes();
+        await agentModeController.generateResponse(generateReq({}), res);
+        expect(res.statusCode).toBe(422);
+        expect(res.body).toMatchObject({ reason: 'not_in_plan', requestedModel: DISALLOWED });
+        assertNothingRan();
+      });
+
+      it('an allowed pick and the configured default run as before', async () => {
+        for (const llmModel of [ALLOWED, DEFAULT_MODEL]) {
+          mockWorker.runInWorker.mockClear();
+          const res = makeRes();
+          await agentModeController.generateResponse(generateReq({ llmModel }), res);
+          expect(res.statusCode).toBe(200);
+          expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel }), expect.anything());
+        }
+      });
+
+      it('an admin caller acting on a user session is checked against the OWNER', async () => {
+        mockUserDb.getUserById.mockImplementation(async (id: string) => ({ userId: id, isAdmin: id !== OWNER }) as any);
+        const res = makeRes();
+        await agentModeController.generateResponse({ ...generateReq({ llmModel: DISALLOWED }, true), user: { userId: 'admin-1', isAdmin: true } } as any, res);
+        expect(res.statusCode).toBe(422);
+        expect(res.body).toMatchObject({ reason: 'not_in_plan', tier: 'Free' });
+      });
+    });
+
+    it('createSession: a requested model outside the plan is a 422 and no session is created; no model = default', async () => {
+      const refused = makeRes();
+      await agentModeController.createSession({ user: { userId: OWNER }, body: { portalType: 'agent', llmModel: DISALLOWED } } as any, refused);
+      expect(refused.statusCode).toBe(422);
+      expect(refused.body).toMatchObject({ reason: 'not_in_plan', ...PLAN_FIELDS });
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+
+      const dflt = makeRes();
+      await agentModeController.createSession({ user: { userId: OWNER }, body: { portalType: 'agent' } } as any, dflt);
+      expect(dflt.statusCode).toBe(201);
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, expect.anything());
+    });
+
+    it('verified-generate: a stored model outside the plan is a 422 before anything runs', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(baseSession(DISALLOWED) as any);
+      const res = makeRes();
+      await agentModeController.verifiedGenerate({
+        user: { userId: OWNER },
+        body: { sessionId: SESSION_ID, startingMessage: MESSAGE, attachments: [] },
+        on: jest.fn(),
+      } as any, res);
+      expect(res.statusCode).toBe(422);
+      expect(res.body).toMatchObject({ reason: 'not_in_plan', ...PLAN_FIELDS });
+      expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+      expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    });
+
+    it("shared view: the owner's stored model outside the plan is a 422 that does NOT carry the owner's plan", async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(sharedSession(DISALLOWED) as any);
+      const res = makeRes();
+      await agentModeController.generateSharedResponse(shareReq(), res);
+      expect(res.statusCode).toBe(422);
+      expect(res.body).toEqual({
+        error: "The model selected for this chat (GPT-5.5) isn't available on this account, so nothing was sent to a different model. Choose another model and try again.",
+        code: 'model_unavailable',
+        requestedModel: DISALLOWED,
+        reason: 'not_in_plan',
+      });
+      expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+      expect(mockChatbotDb.addMessageToSession).not.toHaveBeenCalled();
+    });
+
+    it('shared view: an allowed stored model still runs', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(sharedSession(ALLOWED) as any);
+      const res = makeRes();
+      await agentModeController.generateSharedResponse(shareReq(), res);
+      expect(res.statusCode).not.toBe(422);
+      expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: ALLOWED }), expect.anything());
+    });
+
+    describe('session-model PATCH (checked against the session OWNER, 422 model_unavailable)', () => {
+      const patchReq = (llmModel: string, user: Record<string, unknown> = { userId: OWNER }) =>
+        ({ user, params: { sessionId: SESSION_ID }, body: { llmModel } }) as any;
+
+      it('a pick outside the owner\'s plan is a 422 with the plan details and is not stored', async () => {
+        const res = makeRes();
+        await agentModeController.updateSessionLlmModel(patchReq(DISALLOWED), res);
+        expect(res.statusCode).toBe(422);
+        expect(res.body).toMatchObject({ code: 'model_unavailable', reason: 'not_in_plan', ...PLAN_FIELDS });
+        expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+      });
+
+      it("an admin caller cannot widen a user's session beyond the user's plan", async () => {
+        mockUserDb.getUserById.mockImplementation(async (id: string) => ({ userId: id, isAdmin: id !== OWNER }) as any);
+        const res = makeRes();
+        await agentModeController.updateSessionLlmModel(patchReq(DISALLOWED, { userId: 'admin-1', isAdmin: true }), res);
+        expect(res.statusCode).toBe(422);
+        expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+      });
+
+      it('an allowed pick is stored', async () => {
+        const res = makeRes();
+        await agentModeController.updateSessionLlmModel(patchReq(ALLOWED), res);
+        expect(res.statusCode).toBe(200);
+        expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, ALLOWED);
+      });
+
+      it("the shared PATCH refuses a pick outside the owner's plan without exposing the plan", async () => {
+        mockChatbotDb.getChatSession.mockResolvedValue(sharedSession(ALLOWED) as any);
+        const res = makeRes();
+        await agentModeController.updateSharedSessionLlmModel(
+          { params: { shareId: SESSION_ID }, query: { conversable: 'tok' }, body: { llmModel: DISALLOWED } } as any, res);
+        expect(res.statusCode).toBe(422);
+        expect(res.body).toEqual(expect.objectContaining({ code: 'model_unavailable', reason: 'not_in_plan' }));
+        expect(res.body).not.toHaveProperty('tier');
+        expect(res.body).not.toHaveProperty('allowedModels');
+        expect(res.body).not.toHaveProperty('upgradeRequired');
+        expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('final gate in generateSessionResponse (side channels: Slack, email, transports, resumes)', () => {
+      it("refuses the session's STORED model outside the plan before anything is persisted", async () => {
+        mockChatbotDb.getChatSession.mockResolvedValue(baseSession(DISALLOWED) as any);
+        const err = await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, DISALLOWED).catch((e) => e);
+        expect(isModelUnavailableError(err)).toBe(true);
+        expect(err).toMatchObject({ reason: 'not_in_plan' });
+        expect(mockChatbotDb.addMessageToSession).not.toHaveBeenCalled();
+        expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+      });
+
+      it('a model the caller chose itself (not the stored one) is AgentWeb\'s choice and runs', async () => {
+        mockChatbotDb.getChatSession.mockResolvedValue(baseSession(ALLOWED) as any);
+        await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, DISALLOWED);
+        expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: DISALLOWED }), expect.anything());
+      });
+
+      it('switch off: the stored model runs', async () => {
+        delete mockSettings.model_tier_allowlist_enabled;
+        modelAccess.reset();
+        mockChatbotDb.getChatSession.mockResolvedValue(baseSession(DISALLOWED) as any);
+        await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, DISALLOWED);
+        expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: DISALLOWED }), expect.anything());
+      });
+    });
   });
 });
