@@ -21,7 +21,7 @@ import { setHotLeadCallEnabledOverride } from '../services/voice/hotLeadCallMode
 import { LEAD_UNREACHABLE_COPY } from '../services/voice/twiml';
 import { attrOf, sayText, MOUNT } from './helpers/hotLeadCallTwilioSim';
 import {
-  BASE, LEAD_E164, LEAD_PHONE_AS_TYPED, LIST, OWNER_PHONE, TWILIO_NUMBER, eventsOf, installWorld, mock, placedCall, recordOf, submitLead,
+  BASE, LEAD_E164, advanceMinutes, LEAD_PHONE_AS_TYPED, LIST, OWNER_PHONE, TWILIO_NUMBER, eventsOf, installWorld, mock, placedCall, recordOf, submitLead,
   twilioCall, usage, usageSummary, world, bridgedCall,
 } from './helpers/hotLeadCallE2eWorld';
 
@@ -141,6 +141,7 @@ describe('a hot lead rings the owner and, on 1, bridges the lead', () => {
     expect(recordOf('lead-a')).toMatchObject({ state: 'failed', outcome: 'place_rejected' });
     expect(eventsOf('lead-a')).toEqual(['call.failed']);
 
+    advanceMinutes(25 * 60); // past the 24h phone marker, so only the permanent record stops the repeat
     await submitLead('lead-a', { submission: true });
     expect(world.provider.placedCalls).toHaveLength(1);
     expect(eventsOf('lead-a')).toEqual(['call.failed']);
@@ -279,7 +280,7 @@ describe('Twilio retries and reorders callbacks', () => {
 });
 
 describe('simultaneous and failed deliveries', () => {
-  it('two identical status callbacks racing each other meter the leg exactly once', async () => {
+  it('two identical status callbacks fired together are processed once (smoke; the winner rules are mutation-tested in twilioVoiceWebhook.test.ts)', async () => {
     const call = await bridgedCall();
     const [a, b] = await Promise.all([call.leadStatus('completed', 3, { CallDuration: '61' }), call.leadStatus('completed', 3, { CallDuration: '61' })]);
     expect([a.status, b.status]).toEqual([200, 200]);
@@ -290,7 +291,7 @@ describe('simultaneous and failed deliveries', () => {
     expect(eventsOf('lead-a').filter((e) => e === 'call.completed')).toHaveLength(1);
   });
 
-  it('a replayed "1" racing the first one bridges exactly once', async () => {
+  it('a replayed "1" fired together with the first is processed once (smoke; the winner rules are mutation-tested in twilioVoiceWebhook.test.ts)', async () => {
     await submitLead('lead-a');
     const call = twilioCall(placedCall());
     await call.ownerAnswers();
@@ -311,9 +312,10 @@ describe('simultaneous and failed deliveries', () => {
     expect(usageSummary()).toEqual([['twilio:voice:CA00000002:lead', 2]]);
   });
 
-  it('treats an empty CallDuration as missing: the leg is not billed as zero seconds', async () => {
+  it('treats an empty CallDuration as missing: warned about and not billed, not silently read as zero seconds', async () => {
     const call = await bridgedCall();
     await call.leadStatus('completed', 3, { CallDuration: '' });
+    expect(JSON.stringify(world.consoleSpies.flatMap((s) => s.mock.calls))).toContain('[VoiceUsage] non-finite call duration');
     await call.ownerLegEnds('completed', '30');
     expect(usageSummary()).toEqual([['twilio:voice:CA00000001:owner', 1]]);
     expect(recordOf('lead-a')?.state).toBe('finished');

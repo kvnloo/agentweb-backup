@@ -28,7 +28,7 @@ export const OWNER_PHONE = '+14155550100';
 export const TWILIO_NUMBER = '+14155550111';
 export const LEAD_PHONE_AS_TYPED = '(212) 555-0142';
 export const LEAD_E164 = '+12125550142';
-export const NOW = '2026-10-19T17:00:00.000Z'; // 12:00 in America/Chicago, inside the 08:00-21:00 call window
+const NOW = '2026-10-19T17:00:00.000Z'; // 12:00 in America/Chicago, inside the 08:00-21:00 call window
 const MINUTE_MS = 60_000;
 
 export const callConfig = {
@@ -36,7 +36,7 @@ export const callConfig = {
   announcedName: 'Smith & Sons', quietHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
 };
 const slackConnection = { platform: 'slack', account_id: 'T123', config: { account_type: 'bot', access_token: 'xoxb-org-a', team_id: 'T123' } };
-export const orgWithSlack = { orgId: 'org-a', hotLeadCall: callConfig, leadNotifications: { enabled: true, slackChannelId: 'C123' }, connected_accounts: [slackConnection] };
+const orgWithSlack = { orgId: 'org-a', hotLeadCall: callConfig, leadNotifications: { enabled: true, slackChannelId: 'C123' }, connected_accounts: [slackConnection] };
 
 interface World {
   crm: FakeCrm;
@@ -72,7 +72,12 @@ export function installWorld(): void {
 
     // The queue's permanent job row: a second enqueue of the same source+key is a duplicate.
     const seen = new Set<string>();
-    mock(queue.enqueueJob).mockImplementation(async (source: string, key: string) => (seen.size === seen.add(`${source}:${key}`).size ? 'duplicate' : 'enqueued'));
+    mock(queue.enqueueJob).mockImplementation(async (source: string, key: string) => {
+      const job = `${source}:${key}`;
+      if (seen.has(job)) return 'duplicate';
+      seen.add(job);
+      return 'enqueued';
+    });
     mock(queue.startHeartbeat).mockReturnValue(jest.fn());
     mock(notificationLookup.campaigns).mockResolvedValue({ rows: [], truncated: false });
     mock(notificationLookup.pages).mockResolvedValue([]);
@@ -95,7 +100,7 @@ export function installWorld(): void {
 
 // ── clock and lead helpers ──────────────────────────────────────────────────
 
-export const flush = async () => { for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve)); };
+const flush = async () => { for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve)); };
 export const setClock = (iso: string) => jest.setSystemTime(new Date(iso));
 export const advanceMinutes = (n: number) => jest.setSystemTime(Date.now() + n * MINUTE_MS);
 /** Distinct valid lead phones, one per n. */
@@ -128,7 +133,7 @@ export async function submitLead(leadId: string, o: SubmitOptions = {}): Promise
 export const recordOf = (leadId: string, listId = LIST) => world.crm.lead(listId, leadId).system?.hot_lead_call as Record<string, unknown> | undefined;
 export const eventsOf = (leadId: string) => world.crm.timeline(LIST, leadId);
 /** A webhook-driven call placed by the orchestrator (not an inline-TwiML verification call). */
-export type WebhookCall = Extract<PlaceCallParams, { url: string }>;
+type WebhookCall = Extract<PlaceCallParams, { url: string }>;
 export function placedCall(i = 0): WebhookCall {
   const placed = world.provider.placedCalls[i];
   if (!placed || placed.url === undefined) throw new Error(`no webhook-driven call was placed at index ${i}`);
