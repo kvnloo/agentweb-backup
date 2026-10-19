@@ -3479,6 +3479,18 @@ export async function callLinkedInMarketingApi(
         if (result.alreadyTagged) return { success: true, message: 'Creative already carries every UTM key — no change made.' };
         return { success: true, message: 'Creative retagged with UTMs' };
       }
+      if (action === 'UPDATE') {
+        // ENG-2575: status change only (pause / resume / archive).
+        if (!params.creative_id) throw new Error('CREATIVE UPDATE requires params.creative_id');
+        const allowed = linkedInAdsService.CREATIVE_INTENDED_STATUSES as readonly string[];
+        const status = typeof params.status === 'string' ? params.status.trim().toUpperCase() : '';
+        if (!allowed.includes(status)) {
+          throw new Error(`CREATIVE UPDATE requires params.status, one of: ${allowed.join(', ')}`);
+        }
+        const result = await linkedInAdsService.updateCreativeStatus(accessToken, accountId, String(params.creative_id), status);
+        if (!result.success) throw new Error(result.error || 'Failed to update creative');
+        return { success: true, message: `Ad status set to ${status}`, result: result.data };
+      }
       throw new Error(`Unknown action "${action}" for CREATIVE`);
     }
 
