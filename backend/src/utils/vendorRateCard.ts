@@ -52,9 +52,9 @@ interface VendorRateEntry {
  * version; historical events retain the rate version used").
  *
  * Dated to the last change to the rates in this file — currently the ENG-2271
- * Twilio voice placeholders of 2026-10-19. **Bump this in the same commit as any rate edit**, otherwise two
- * different prices share one version and a historical event can no longer be
- * re-derived from the card that produced it.
+ * Twilio voice placeholders of 2026-10-19. **Bump this in the same commit as
+ * any rate edit**, otherwise two different prices share one version and a
+ * historical event can no longer be re-derived from the card that produced it.
  */
 export const VENDOR_RATE_CARD_VERSION = "2026-10-19";
 
