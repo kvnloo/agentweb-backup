@@ -12,6 +12,7 @@ import { buildVoiceWebhookUrl } from './voice/voiceUrls';
 import { isHotLeadCallEnabled } from './voice/hotLeadCallMode';
 import { resolveHotLeadCallContext, type HotLeadCallContext } from './voice/hotLeadCallContext';
 import { getLeadCallStore } from './voice/leadCallStore';
+import { isWithinCallWindow, reserveCallSlot } from './voice/hotLeadCallLimits';
 // This file must not import orgLeadNotificationService: that module calls dispatchHotLeadCall.
 
 interface HotLeadCallJob {
@@ -60,6 +61,9 @@ const SKIP_GATES: Array<(g: GateInput) => string | null> = [
     // allowlistedE164 already limits to US/CA, so this only refuses when allowedCountries is a strict subset.
     return country && config.allowedCountries.some(c => c === country) ? null : 'country_not_allowed';
   },
+  // Stateless, so it runs in every pass; the limits that count calls run once, just before create. A skip leaves
+  // the lead's call slot unused, and the Slack alert goes out regardless.
+  ({ config }) => (isWithinCallWindow(config.quietHours, new Date()) ? null : 'outside_quiet_hours'),
   // Protects against queue-reclaim delays: a lead that waited too long is no longer "hot". A missing or
   // unparseable timestamp fails closed.
   ({ lead, job, config }) => {
@@ -73,7 +77,7 @@ const SKIP_GATES: Array<(g: GateInput) => string | null> = [
  * dispatch and again in the job (state can change in between). Returns null for "do nothing";
  * refusals worth showing on the timeline also record `call.skipped`.
  */
-async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: HotLeadCallJob; ctx: HotLeadCallContext } | null> {
+async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: HotLeadCallJob; ctx: HotLeadCallContext; phone: string } | null> {
   const { listId, leadId, origin } = input;
   if (origin !== 'form_fill') return null;
   const ctx = await resolveHotLeadCallContext(listId);
@@ -97,7 +101,8 @@ async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: H
       return null;
     }
   }
-  return { job, ctx };
+  const phone = leadPhoneE164(lead);
+  return phone ? { job, ctx, phone } : null; // always set: the invalid_phone gate refused otherwise
 }
 
 /**
@@ -121,8 +126,31 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
   const statusCallbackUrl = buildVoiceWebhookUrl('status', webhook);
   const store = getLeadCallStore();
 
+  // Reserve BEFORE create and give back if create does not win: a lead that never dials costs no slot, and a
+  // lead refused by a limit leaves no record, so its single call slot stays unused (a repeat submission can retry).
+  let slot: Awaited<ReturnType<typeof reserveCallSlot>>;
+  try {
+    slot = await reserveCallSlot({ orgId: job.orgId, phoneE164: reviewed.phone, config });
+  } catch (err) {
+    // Fail closed (nothing dialed, no record) but leave a trace on the lead: a missing table or secret is an ops problem.
+    console.warn('[hotLeadCall] call limits unavailable', { listId, leadId, error: errorText(err) });
+    await store.addEvent(listId, leadId, 'call.skipped', { reason: 'limits_unavailable' });
+    throw err;
+  }
+  if (!slot.ok) {
+    // A repeat submission of a lead that was already called trips the phone marker; its timeline has the call.
+    if (slot.reason === 'duplicate_phone' && await store.get(listId, leadId)) return;
+    await store.addEvent(listId, leadId, 'call.skipped', { reason: slot.reason });
+    return;
+  }
   const startedAt = new Date().toISOString();
-  if (!await store.create(listId, leadId, { state: 'dialing', jobKey: key, startedAt, updatedAt: startedAt })) return;
+  let created = false;
+  try {
+    created = await store.create(listId, leadId, { state: 'dialing', jobKey: key, startedAt, updatedAt: startedAt });
+  } finally {
+    if (!created) await slot.release();
+  }
+  if (!created) return;
 
   // If the post-call transition fails the record stays 'dialing'; the first signed owner callback adopts the CallSid.
   const settle = async (patch: Parameters<typeof store.transition>[3], event: 'call.initiated' | 'call.failed', detail?: Record<string, string>) => {
