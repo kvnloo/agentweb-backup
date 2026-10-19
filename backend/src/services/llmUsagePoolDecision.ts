@@ -20,7 +20,7 @@ import { resolveEnforcementCostBasisMicroUsd } from './spendEnforcementBasis';
 import {
   evaluatePaygAdmission,
   paygOverageThresholdMicroUsd,
-  type PaygBlockReason,
+  type PaygBlock,
   type PaygOverageSettings,
   type PaygOverageStatus,
   type SubscriptionPaygOverageConfig,
@@ -35,7 +35,7 @@ export interface LlmUsagePoolDecision {
   mode: LlmUsageModeDecision;
   /** Non-null only while a PAYG-enabled account is past its pool (see `evaluatePaygAdmission`). */
   overage: PaygOverageStatus | null;
-  paygBlockReason: PaygBlockReason | null;
+  paygBlock: PaygBlock | null;
 }
 
 export async function resolveLlmUsagePoolDecision(input: {
@@ -80,7 +80,7 @@ export async function resolveLlmUsagePoolDecision(input: {
     adjustment,
     mode,
     overage: null,
-    paygBlockReason: null,
+    paygBlock: null,
   };
 
   // Opt-in is per billing owner and the row is already in hand, so every account that never turned
@@ -112,8 +112,9 @@ export async function resolveLlmUsagePoolDecision(input: {
       poolHighWater: account.poolHighWater,
       month: usageMonth,
     }),
+    month: usageMonth,
   });
-  return { ...base, mode: payg.decision, overage: payg.overage, paygBlockReason: payg.blockReason };
+  return { ...base, mode: payg.decision, overage: payg.overage, paygBlock: payg.block };
 }
 
 /**

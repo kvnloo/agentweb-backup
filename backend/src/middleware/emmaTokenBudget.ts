@@ -187,7 +187,7 @@ export async function requireEmmaTokenBudget(
       //    since ENG-1116 flipped enforcement to cost, and "contact support or
       //    upgrade your plan" is the dead end ENG-1035 was raised about: no
       //    reset date, no remedy an agent can relay.
-      const blockCopy = buildUsageBlockCopy({ month: usageStatus.month, reason: usageStatus.usageBlockReason });
+      const blockCopy = buildUsageBlockCopy({ month: usageStatus.month, paygBlock: usageStatus.paygBlock });
       res.status(429).json({
         error: blockCopy.message,
         usageBlock: blockCopy,

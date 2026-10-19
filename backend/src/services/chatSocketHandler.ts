@@ -47,7 +47,7 @@ export async function handleSocketChatMessage(
       // raw status leaked `costUsed`/`costAllowance` past ENG-1212's projection,
       // and the copy named tokens (not the gating dimension since ENG-1116) with
       // no reset date. `code` is unchanged — clients branch on it.
-      const blockCopy = buildUsageBlockCopy({ month: usageStatus.month, reason: usageStatus.usageBlockReason });
+      const blockCopy = buildUsageBlockCopy({ month: usageStatus.month, paygBlock: usageStatus.paygBlock });
       socket.emit('error', {
         message: blockCopy.message,
         code: 'TOKEN_LIMIT_EXCEEDED',

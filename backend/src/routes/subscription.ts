@@ -74,8 +74,10 @@ router.put('/payg', authenticateToken, async (req, res) => {
     const { enabled, capPercentOfPool } = req.body || {};
     return res.json(await updatePaygOverage({
       userId,
-      // A delegated admin acts AS the customer (req.user is the customer); record who actually did it.
+      // A delegated admin acts AS the customer (req.user is the customer): record who actually did it,
+      // and let the service refuse consent that only the customer can give.
       actorId: (req as any).delegateInfo?.adminUserId || userId,
+      isDelegated: (req as any).delegateInfo?.isDelegated === true,
       enabled,
       capPercentOfPool,
     }));

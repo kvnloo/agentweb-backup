@@ -7,7 +7,7 @@ import {
 } from "./llmUsagePolicyService";
 import { userDb } from './db';
 import { resolveLlmUsagePoolDecision } from './llmUsagePoolDecision';
-import type { PaygBlockReason, PaygOverageStatus } from './paygOverage';
+import type { PaygBlock, PaygOverageStatus } from './paygOverage';
 
 export async function getEffectiveLlmUsagePolicy(userId: string): Promise<{
   billingUserId: string;
@@ -25,7 +25,7 @@ export async function getEffectiveLlmUsagePolicy(userId: string): Promise<{
   creditsApplied: boolean;
   /** ENG-668: overage past the pool, for a PAYG-live account only. Internal: carries micro-USD. */
   overage?: PaygOverageStatus;
-  paygBlockReason?: PaygBlockReason;
+  paygBlock?: PaygBlock;
 }> {
   // A number of legacy controller unit tests replace the token/subscription
   // modules with deliberately partial Jest mocks. Keep those unrelated tests
@@ -82,6 +82,6 @@ export async function getEffectiveLlmUsagePolicy(userId: string): Promise<{
       adjustment.migrationOffsetMicroUsd > 0,
     // Present only for an account with PAYG live and past its pool (absent keeps every other result as it was).
     ...(pool.overage ? { overage: pool.overage } : {}),
-    ...(pool.paygBlockReason ? { paygBlockReason: pool.paygBlockReason } : {}),
+    ...(pool.paygBlock ? { paygBlock: pool.paygBlock } : {}),
   };
 }

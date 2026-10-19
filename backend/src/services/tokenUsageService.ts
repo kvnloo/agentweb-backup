@@ -6,7 +6,7 @@ import { type LlmUsageMode, type LlmUsagePolicy,
   type ResolvedAlertThresholds,
 } from "./llmUsagePolicyService";
 import { resolveLlmUsagePoolDecision } from './llmUsagePoolDecision';
-import type { PaygBlockReason } from './paygOverage';
+import type { PaygBlock } from './paygOverage';
 import { randomUUID } from 'crypto';
 import { recordLlmChargeEvent, LLM_CHARGE_EVENTS_TABLE } from './llmChargeAuditDb';
 import { buildUsageBlockCopy, type UsageBlockCopy } from '../utils/usageBlockCopy';
@@ -51,8 +51,11 @@ export interface TokenUsageStatus {
    * `costPercentUsed` keeps meaning the plan pool, so it reads above 100 while this is active.
    */
   overage?: { active: boolean; percentOfCap: number };
-  /** ENG-668: why the block is PAYG's own (cap reached, suspended), when it is; drives `usageBlock` copy. */
-  usageBlockReason?: PaygBlockReason;
+  /**
+   * ENG-668: why the block is PAYG's own (cap reached, suspended, not covered), when it is; drives the
+   * `usageBlock` copy. Internal: customers see it as `usageBlock.reason` / `usageBlock.paygInactiveReason`.
+   */
+  paygBlock?: PaygBlock;
 }
 
 /**
@@ -61,7 +64,7 @@ export interface TokenUsageStatus {
  * `costUsed` and `costAllowance` are dropped. `hasCostAllowance` replaces the
  * only thing the client ever did with the latter — a null check.
  */
-export type CustomerTokenUsageStatus = Omit<TokenUsageStatus, 'costUsed' | 'costAllowance' | 'used' | 'usageBlockReason'> & {
+export type CustomerTokenUsageStatus = Omit<TokenUsageStatus, 'costUsed' | 'costAllowance' | 'used' | 'paygBlock'> & {
   /**
    * Token volume used this month. ABSENT when no token limit applies (ENG-1250 AC7: token volume is no
    * longer measured), so the portal's `typeof used === "number"` check hides its token meter instead of
@@ -107,14 +110,14 @@ export type CustomerTokenUsageStatus = Omit<TokenUsageStatus, 'costUsed' | 'cost
  * emailService and the policy services keep the figures they need.
  */
 export function toCustomerTokenUsage(status: TokenUsageStatus): CustomerTokenUsageStatus {
-  // `usageBlockReason` is carried by `usageBlock.reason` instead of twice. `overage` passes through:
+  // `paygBlock` is carried by `usageBlock.reason` instead of twice. `overage` passes through:
   // it is percentages by construction (ENG-668).
-  const { costUsed: _costUsed, costAllowance, used, usageBlockReason, ...customerSafe } = status;
+  const { costUsed: _costUsed, costAllowance, used, paygBlock, ...customerSafe } = status;
   return {
     ...customerSafe,
     ...(status.effectiveAllowance === null ? {} : { used }),
     hasCostAllowance: costAllowance != null,
-    usageBlock: buildUsageBlockCopy({ month: status.month, reason: usageBlockReason }),
+    usageBlock: buildUsageBlockCopy({ month: status.month, paygBlock }),
   };
 }
 
@@ -446,7 +449,7 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
     ...(pool.overage
       ? { overage: { active: usageDecision.reason === "payg_overage", percentOfCap: pool.overage.percentOfCap } }
       : {}),
-    ...(pool.paygBlockReason ? { usageBlockReason: pool.paygBlockReason } : {}),
+    ...(pool.paygBlock ? { paygBlock: pool.paygBlock } : {}),
   };
 }
 

@@ -11,6 +11,7 @@ import { settingsService } from './settingsService';
 import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
 import { resetDateFromMonth, formatResetDateLong } from '../utils/usageCycle';
+import { buildUsageBlockCopy, type UsageBlockPaygInput } from '../utils/usageBlockCopy';
 
 // ENG-351: resolve {{cite:N}} markers in Emma's text to inline source attributions, using the
 // citation metadata on the session's last assistant message. Email has no chip renderer, so this
@@ -1364,6 +1365,8 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       // Optional only because this type under-declared the `TokenUsageStatus` the
       // sole caller has always passed whole — every runtime call already carries it.
       month?: string;
+      // ENG-668: set when the block is pay-as-you-go's own (cap reached / suspended / not covered).
+      paygBlock?: UsageBlockPaygInput;
     }
   ) {
     try {
@@ -1387,10 +1390,18 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
         blockedByCost ? (usageStatus.costPercentUsed ?? 100) : (usageStatus.percentUsed ?? 100)
       );
 
-      const limitLabel = 'Monthly Usage Limit Reached';
-      const limitReasonText = 'monthly usage limit';
-      const usageLine = `<strong>Usage:</strong> ${limitPercent}% of your monthly allowance used.`;
-      const usageLineText = `Usage: ${limitPercent}% of your monthly allowance used.`;
+      // ENG-668: a pay-as-you-go account is past its plan pool by design, so "N% of your monthly
+      // allowance" is not what stopped it (and can read far above 100%). Name the PAYG reason instead,
+      // in the same words as the 429.
+      const paygCopy = usageStatus.paygBlock
+        ? buildUsageBlockCopy({ month: usageStatus.month, paygBlock: usageStatus.paygBlock })
+        : null;
+      const limitLabel = paygCopy ? paygCopy.headline : 'Monthly Usage Limit Reached';
+      const limitReasonText = paygCopy?.reason === 'payg_cap_reached' ? 'pay-as-you-go limit' : 'monthly usage limit';
+      const usageLine = paygCopy
+        ? this.escapeHtml(paygCopy.body)
+        : `<strong>Usage:</strong> ${limitPercent}% of your monthly allowance used.`;
+      const usageLineText = paygCopy ? paygCopy.body : `Usage: ${limitPercent}% of your monthly allowance used.`;
       const allowanceResetNoun = 'usage allowance';
       // ENG-1344: "resets at the start of each billing period" is the exact
       // vagueness the escalating customer could not decode. Name the day when we

@@ -1,4 +1,4 @@
-import { resetDateFromMonth, formatResetDateLong } from "./usageCycle";
+import { resetDateFromMonth, formatResetDateLong, resetSentence } from "./usageCycle";
 
 /**
  * The ONE producer of "why am I blocked and when does it lift".
@@ -36,16 +36,30 @@ export interface UsageBlockCopy {
    * Additive: every surface keeps `code: 'usage_paused'`.
    */
   reason?: UsageBlockReason;
+  /** ENG-668: present only with `reason: 'payg_inactive'` — which PAYG prerequisite is missing. */
+  paygInactiveReason?: PaygInactiveReason;
 }
 
-/** `payg_cap_reached`: past the pool AND the cap the customer chose. `payg_suspended`: settlement failed. */
-export type UsageBlockReason = "payg_cap_reached" | "payg_suspended";
+/**
+ * `payg_cap_reached`: past the pool AND the cap the customer chose. `payg_suspended`: settlement failed.
+ * `payg_inactive`: PAYG is on but cannot cover this (no payment method, or the subscription is not live).
+ */
+export type UsageBlockReason = "payg_cap_reached" | "payg_suspended" | "payg_inactive";
+export type PaygInactiveReason = "no_payment_method" | "subscription_inactive";
+
+/** The PAYG-specific block, as the gates report it. */
+export interface UsageBlockPaygInput {
+  reason: UsageBlockReason;
+  paygInactiveReason?: PaygInactiveReason;
+}
 
 const HEADLINE = "Your monthly AI usage is paused";
 const BODY = "You've used all of the AI usage included in your plan this month.";
 const ACTION_TAIL = "Add usage or upgrade your plan to keep working before then.";
 
-const PAYG_COPY: Record<UsageBlockReason, { headline: string; body: string; actionTail: string; undated: string }> = {
+type PaygCopy = { headline: string; body: string; actionTail: string; undated: string };
+
+const PAYG_COPY: Record<"payg_cap_reached" | "payg_suspended", PaygCopy> = {
   payg_cap_reached: {
     headline: "You've reached your pay-as-you-go limit",
     body: "You've used all of the AI usage included in your plan this month and the pay-as-you-go limit you set.",
@@ -60,6 +74,29 @@ const PAYG_COPY: Record<UsageBlockReason, { headline: string; body: string; acti
   },
 };
 
+const PAYG_INACTIVE_COPY: Record<PaygInactiveReason, PaygCopy> = {
+  no_payment_method: {
+    headline: "Pay-as-you-go needs a payment method",
+    body: "You've used all of the AI usage included in your plan this month. Pay-as-you-go is on, but there is no payment method on file to cover more.",
+    actionTail: "Add a payment method to keep working with pay-as-you-go.",
+    undated: "AI usage is paused: pay-as-you-go is on, but there is no payment method on file. Add one to keep working.",
+  },
+  subscription_inactive: {
+    headline: "Pay-as-you-go needs an active subscription",
+    body: "You've used all of the AI usage included in your plan this month. Pay-as-you-go is on, but it only covers more usage while your subscription is active.",
+    actionTail: "Reactivate your subscription to keep working with pay-as-you-go.",
+    undated: "AI usage is paused: pay-as-you-go only covers more usage while your subscription is active. Reactivate it to keep working.",
+  },
+};
+
+function paygCopyFor(block: UsageBlockPaygInput | null | undefined): PaygCopy | undefined {
+  if (!block) return undefined;
+  if (block.reason === "payg_inactive") {
+    return block.paygInactiveReason ? PAYG_INACTIVE_COPY[block.paygInactiveReason] : undefined;
+  }
+  return PAYG_COPY[block.reason];
+}
+
 /**
  * Pre-ENG-1344 wording, kept verbatim as the fallback. It is vague — which is the
  * defect — but it is TRUE. A customer who plans around an invented date is worse
@@ -70,21 +107,25 @@ const UNDATED_MESSAGE =
 
 export function buildUsageBlockCopy(input: {
   month?: string | null;
-  reason?: UsageBlockReason | null;
+  /** ENG-668: the PAYG-specific block reason, when there is one. Absent = the plain copy, unchanged. */
+  paygBlock?: UsageBlockPaygInput | null;
 }): UsageBlockCopy {
   const resetDate = resetDateFromMonth(input.month);
   const label = formatResetDateLong(resetDate);
   const resetSentence = label ? `Your included usage resets on ${label}.` : null;
 
-  const payg = input.reason ? PAYG_COPY[input.reason] : undefined;
-  if (payg) {
+  const payg = paygCopyFor(input.paygBlock);
+  if (payg && input.paygBlock) {
     return {
       resetDate,
       headline: payg.headline,
       body: payg.body,
       resetSentence,
       message: resetSentence ? `AI usage is paused. ${resetSentence} ${payg.actionTail}` : payg.undated,
-      reason: input.reason!,
+      reason: input.paygBlock.reason,
+      ...(input.paygBlock.reason === "payg_inactive"
+        ? { paygInactiveReason: input.paygBlock.paygInactiveReason }
+        : {}),
     };
   }
 
@@ -97,4 +138,38 @@ export function buildUsageBlockCopy(input: {
       ? `AI usage is paused. ${resetSentence} ${ACTION_TAIL}`
       : UNDATED_MESSAGE,
   };
+}
+
+/**
+ * The run-result text a scheduled chat records when the usage gate refuses it (agentModeController
+ * `runScheduledChat`). Unlike the shared copy above it ends with an action, because the run result is
+ * the only place the schedule owner reads it.
+ *
+ * ENG-1344: both branches used to end at the word "reset" with no date. The reset sentence is appended
+ * rather than interpolated so the percentage branch keeps its own leading clause, and so a month we
+ * cannot parse drops the sentence instead of rendering "resets on null".
+ *
+ * ENG-668: a pay-as-you-go account is past its plan pool by design, so the plan percentage is not the
+ * limit that stopped it (and can read far above 100%). For a PAYG block, say which PAYG limit did, in
+ * the 429's own words, and print no percentage.
+ */
+export function buildScheduledChatBlockMessage(input: {
+  usageMode?: string | null;
+  limitPercent: number;
+  month?: string | null;
+  paygBlock?: UsageBlockPaygInput | null;
+}): string {
+  if (input.paygBlock) {
+    const copy = buildUsageBlockCopy({ month: input.month, paygBlock: input.paygBlock });
+    if (copy.reason) return `Scheduled chat cannot run: ${copy.headline}. ${copy.message}`;
+  }
+  return [
+    input.usageMode === "paused"
+      ? "Scheduled chat cannot run: AI usage is paused."
+      : `Scheduled chat cannot run: you've reached your monthly usage limit (${input.limitPercent}% used).`,
+    resetSentence(input.month),
+    "Add usage or upgrade your plan to keep working before then.",
+  ]
+    .filter(Boolean)
+    .join(" ");
 }

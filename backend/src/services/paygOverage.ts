@@ -17,15 +17,16 @@
  *
  * Data (all additive and optional — no table, no index):
  *   - `SubscriptionType.paygOverage` — whether the tier may opt in, and the markup PR-2 will bill at.
- *   - `User.paygOverage` on the BILLING OWNER's row — the opt-in, the frozen cap, the month's pool
- *     high-water mark, and a suspension set by settlement when a charge fails.
+ *   - `User.paygOverage` on the BILLING OWNER's row — the opt-in and its cap (a percentage only), the
+ *     month's pool high-water mark, the overage already standing when the owner opted in, and a
+ *     suspension set by settlement when a charge fails.
  *
  * Every input that is missing or unreadable keeps the 429. Being paused by mistake is recoverable; an
  * uncapped account billed for usage it did not agree to is not.
  */
 import type { LlmUsageModeDecision } from './llmUsagePolicyService';
 import { hasOwnLiveSubscription } from './orgAuthz';
-import type { UsageBlockReason } from '../utils/usageBlockCopy';
+import type { PaygInactiveReason, UsageBlockReason } from '../utils/usageBlockCopy';
 
 export const PAYG_OVERAGE_SETTING = 'payg_overage_enabled';
 
@@ -40,8 +41,11 @@ export function isPaygCapPercent(value: unknown): value is PaygCapPercent {
 /** Tier-level config, admin-managed in `subscription_types`. */
 export interface SubscriptionPaygOverageConfig {
   allowed: boolean;
-  /** Customer price / provider cost, in basis points (10_000 = 1x). Read by settlement (PR-2). */
-  markupBps: number;
+  /**
+   * Customer price / provider cost, in basis points (10_000 = 1x). Read by settlement (PR-2). Required
+   * when `allowed` is true; a tier that does not offer PAYG need not price it.
+   */
+  markupBps?: number;
 }
 
 export type PaygSuspensionReason = 'payment_failed' | 'dispute';
@@ -49,20 +53,27 @@ export type PaygSuspensionReason = 'payment_failed' | 'dispute';
 /** Per-account opt-in, stored on the billing owner's AW-Users row. */
 export interface PaygOverageSettings {
   enabled: boolean;
-  capPercentOfPool: PaygCapPercent;
   /**
-   * The cap in micro-USD, frozen when it was set: `capPercentOfPool` x the account's effective pool
-   * threshold (after credits) at that moment. Frozen so a later top-up or plan change cannot silently
-   * move a ceiling the customer agreed to. Never shown to the customer.
+   * The cap, as a percentage of the month's pool. Deliberately NOT stored in dollars: the cap is
+   * re-derived every check from the same pool figure overage is measured against, so "50% of your
+   * plan" stays true across top-ups and plan changes, and next month's cap follows next month's pool.
    */
-  capMicroUsd: number;
+  capPercentOfPool: PaygCapPercent;
   /**
    * The highest effective pool threshold seen in `month` (UTC `YYYY-MM`). Overage is measured above
    * this, not above today's threshold, so a mid-month downgrade never turns usage the customer already
    * had included into retroactive overage. Written only when it rises.
    */
   poolHighWater?: { month: string; thresholdMicroUsd: number };
-  enabledBy: string;
+  /**
+   * Overage already standing when the owner turned PAYG on (off -> on), in `month` (UTC `YYYY-MM`).
+   * Only usage AFTER opting in is ever overage: this is subtracted for that month and ignored after it.
+   * Covers what the high-water mark cannot — a downgrade that happened BEFORE opting in, when no mark
+   * was being kept.
+   */
+  optIn?: { month: string; overageBaselineMicroUsd: number };
+  /** Who last changed the settings (a delegated admin's id when acting as the customer). */
+  updatedBy: string;
   updatedAt: string;
   /** Optimistic-concurrency token; every settings write is conditional on the version it read. */
   version: number;
@@ -70,11 +81,17 @@ export interface PaygOverageSettings {
   suspended?: { reason: PaygSuspensionReason; at: string; invoiceId?: string };
 }
 
-/** Why a PAYG-enabled account is still blocked, when the reason is PAYG's own (the 429 copy variant). */
-export type PaygBlockReason = UsageBlockReason;
+/** Why a PAYG-enabled account is still blocked, when the reason is PAYG's own: drives the 429 copy. */
+export interface PaygBlock {
+  reason: UsageBlockReason;
+  /** Only with `payg_inactive`: which admission prerequisite is missing. */
+  paygInactiveReason?: PaygInactiveReason;
+}
 
 export interface PaygOverageStatus {
+  /** Overage since opting in (baseline already subtracted). */
   overageMicroUsd: number;
+  /** `capPercentOfPool` x the month's pool, derived for this check. */
   capMicroUsd: number;
   /** Floor, so 100 is only ever reported once the cap is actually reached. */
   percentOfCap: number;
@@ -84,10 +101,10 @@ export interface PaygAdmission {
   decision: LlmUsageModeDecision;
   /** Non-null once the account is past its pool with PAYG live (switch, tier and opt-in all on). */
   overage: PaygOverageStatus | null;
-  blockReason: PaygBlockReason | null;
+  block: PaygBlock | null;
 }
 
-/** The threshold overage is measured from: today's effective threshold or this month's high-water. */
+/** The month's pool: today's effective threshold or this month's high-water, whichever is higher. */
 export function paygOverageThresholdMicroUsd(input: {
   effectiveHardThresholdMicroUsd: number;
   poolHighWater: PaygOverageSettings['poolHighWater'] | null | undefined;
@@ -105,6 +122,11 @@ export function paygCapMicroUsd(capPercentOfPool: PaygCapPercent, poolThresholdM
   return Math.floor((poolThresholdMicroUsd * capPercentOfPool) / 100);
 }
 
+/** Overage above the month's pool before any opt-in baseline: what the baseline is recorded from. */
+export function paygGrossOverageMicroUsd(costUsedMicroUsd: number, poolMicroUsd: number): number {
+  return Math.max(0, Math.round(costUsedMicroUsd) - Math.round(poolMicroUsd));
+}
+
 /**
  * Admit a turn past the plan pool, or keep the 429.
  *
@@ -116,7 +138,7 @@ export function paygCapMicroUsd(capPercentOfPool: PaygCapPercent, poolThresholdM
  *   - the billing owner opted in (`enabled === true`) and is not suspended;
  *   - a payment method is on file (cached flag, `=== true`);
  *   - the subscription is active or trialing;
- *   - overage above the pool is still below the frozen cap.
+ *   - overage since opting in is still below `capPercentOfPool` of the month's pool.
  */
 export function evaluatePaygAdmission(input: {
   decision: LlmUsageModeDecision;
@@ -126,47 +148,74 @@ export function evaluatePaygAdmission(input: {
   hasPaymentMethod: unknown;
   subscriptionStatus: unknown;
   costUsedMicroUsd: number;
-  /** From `paygOverageThresholdMicroUsd`: today's effective threshold or the month's high-water. */
+  /** From `paygOverageThresholdMicroUsd`: the month's pool, which overage AND the cap are measured on. */
   overageThresholdMicroUsd: number;
+  /** UTC `YYYY-MM` of this check; the opt-in baseline applies only in its own month. */
+  month: string;
 }): PaygAdmission {
-  const keep: PaygAdmission = { decision: input.decision, overage: null, blockReason: null };
+  const keep: PaygAdmission = { decision: input.decision, overage: null, block: null };
   if (input.decision.reason !== 'hard_threshold_reached') return keep;
   if (input.switchOn !== true) return keep;
   if (input.tier?.allowed !== true) return keep;
   const account = input.account;
   if (account?.enabled !== true) return keep;
-
-  const capMicroUsd = account.capMicroUsd;
-  if (!Number.isInteger(capMicroUsd) || capMicroUsd <= 0) return keep;
+  if (!isPaygCapPercent(account.capPercentOfPool)) return keep;
   if (!Number.isFinite(input.costUsedMicroUsd) || !Number.isFinite(input.overageThresholdMicroUsd)) return keep;
 
-  const overageMicroUsd = Math.max(0, Math.round(input.costUsedMicroUsd) - Math.round(input.overageThresholdMicroUsd));
+  const capMicroUsd = paygCapMicroUsd(account.capPercentOfPool, input.overageThresholdMicroUsd);
+  if (capMicroUsd <= 0) return keep;
+  const baseline = account.optIn?.month === input.month ? account.optIn.overageBaselineMicroUsd : 0;
+  if (!Number.isFinite(baseline) || baseline < 0) return keep;
+
+  const overageMicroUsd = Math.max(
+    0,
+    paygGrossOverageMicroUsd(input.costUsedMicroUsd, input.overageThresholdMicroUsd) - Math.round(baseline),
+  );
   const overage: PaygOverageStatus = {
     overageMicroUsd,
     capMicroUsd,
     percentOfCap: Math.floor((overageMicroUsd / capMicroUsd) * 100),
   };
 
-  if (account.suspended) return { ...keep, overage, blockReason: 'payg_suspended' };
-  if (input.hasPaymentMethod !== true) return { ...keep, overage };
-  if (!hasOwnLiveSubscription({ subscription_status: input.subscriptionStatus as string | null | undefined })) {
-    return { ...keep, overage };
+  if (account.suspended) return { ...keep, overage, block: { reason: 'payg_suspended' } };
+  if (input.hasPaymentMethod !== true) {
+    return { ...keep, overage, block: { reason: 'payg_inactive', paygInactiveReason: 'no_payment_method' } };
   }
-  if (overageMicroUsd >= capMicroUsd) return { ...keep, overage, blockReason: 'payg_cap_reached' };
+  if (!hasOwnLiveSubscription({ subscription_status: input.subscriptionStatus as string | null | undefined })) {
+    return { ...keep, overage, block: { reason: 'payg_inactive', paygInactiveReason: 'subscription_inactive' } };
+  }
+  if (overageMicroUsd >= capMicroUsd) return { ...keep, overage, block: { reason: 'payg_cap_reached' } };
 
   return {
     decision: { usageMode: 'full_choice', admissionAllowed: true, reason: 'payg_overage' },
     overage,
-    blockReason: null,
+    block: null,
   };
 }
 
-/** Validates a tier's `paygOverage` block (admin save). Present-but-invalid is an error, never coerced. */
+/** The customer-safe view of a stored opt-in: no micro-USD (high-water mark, opt-in baseline). */
+export function toCustomerPaygOverage(
+  settings: Partial<PaygOverageSettings> | null | undefined,
+): { enabled: boolean; capPercentOfPool: PaygCapPercent | null } | undefined {
+  if (!settings || typeof settings !== 'object') return undefined;
+  return {
+    enabled: settings.enabled === true,
+    capPercentOfPool: isPaygCapPercent(settings.capPercentOfPool) ? settings.capPercentOfPool : null,
+  };
+}
+
+/**
+ * Validates a tier's `paygOverage` block (admin save). Present-but-invalid is an error, never coerced.
+ * `markupBps` is required only when the tier offers PAYG.
+ */
 export function validatePaygOverageTierConfig(config: SubscriptionPaygOverageConfig): string[] {
   const errors: string[] = [];
   if (typeof config.allowed !== 'boolean') errors.push('allowed must be boolean');
   // Same floor as llmUsageTopUp.minimumMarkupBps: overage is never sold below cost.
-  if (!Number.isInteger(config.markupBps) || config.markupBps < 10_000) {
+  if (
+    (config.allowed === true || config.markupBps !== undefined)
+    && (!Number.isInteger(config.markupBps) || (config.markupBps as number) < 10_000)
+  ) {
     errors.push('markupBps must be an integer of at least 10000 (1x)');
   }
   return errors;

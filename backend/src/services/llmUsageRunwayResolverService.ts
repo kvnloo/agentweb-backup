@@ -136,6 +136,8 @@ export async function resolveUsageRunway(
     cycleStartDate,
     cycleResetDate,
     today,
+    // ENG-668: admitted past the pool on pay-as-you-go — the same decision both admission gates reach.
+    ...(usage.mode.reason === "payg_overage" ? { paygCovering: true } : {}),
   };
   const runway = computeUsageRunway(forecastInput);
 
@@ -172,9 +174,10 @@ export async function resolveUsageRunway(
   // for a cycle too short to hold both a forecast and an outcome — in which
   // case nothing is emitted rather than a zero that would read as a perfect
   // score.
-  const accuracy = assessForecastAccuracy(forecastInput, runway, {
-    creditsApplied: usage.creditsApplied,
-  });
+  // No forecast was made while PAYG covers the account, so there is nothing to score.
+  const accuracy = runway.paygCovering
+    ? null
+    : assessForecastAccuracy(forecastInput, runway, { creditsApplied: usage.creditsApplied });
   if (accuracy) {
     await recordUsageTelemetry(usage.billingUserId, USAGE_TELEMETRY_EVENTS.forecastAccuracy, {
       version: runway.version,

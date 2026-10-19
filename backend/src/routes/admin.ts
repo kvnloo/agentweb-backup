@@ -5322,15 +5322,16 @@ router.post("/subscription-types", async (req, res) => {
       // whitelist and replaces the stored tier, so a field missing here is silently dropped on save.
       // `markupBps` defaults to the tier's own additional-usage (top-up) markup floor, so overage is
       // never priced below what a top-up of the same usage costs; with no top-up to inherit from it
-      // must be given explicitly. Present-but-invalid values are rejected, never coerced.
+      // must be given explicitly — but only for a tier that offers PAYG (`allowed: true`): a tier that
+      // does not has nothing to price. Present-but-invalid values are rejected, never coerced.
       let normalizedPaygOverage: any = undefined;
       if (type.paygOverage != null) {
         const { validatePaygOverageTierConfig } = await import('../services/paygOverage');
         const markupBps = type.paygOverage.markupBps ?? normalizedLlmUsageTopUp?.minimumMarkupBps;
-        if (markupBps === undefined) {
+        if (markupBps === undefined && type.paygOverage.allowed === true) {
           throw new Error(`${type.name} pay-as-you-go: markupBps is required when the tier has no additional usage markup to inherit`);
         }
-        normalizedPaygOverage = { allowed: type.paygOverage.allowed, markupBps };
+        normalizedPaygOverage = { allowed: type.paygOverage.allowed, ...(markupBps !== undefined ? { markupBps } : {}) };
         const paygErrors = validatePaygOverageTierConfig(normalizedPaygOverage);
         if (paygErrors.length > 0) {
           throw new Error(`${type.name} pay-as-you-go: ${paygErrors.join('; ')}`);

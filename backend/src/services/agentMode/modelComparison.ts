@@ -27,7 +27,7 @@ import {
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import type { ChatMessage } from '../chatbotService';
 import { classifyToolErrorClass } from '../../utils/toolErrorClassifier';
-import type { UsageBlockReason } from '../../utils/usageBlockCopy';
+import type { UsageBlockPaygInput } from '../../utils/usageBlockCopy';
 import {
   MAX_ALTERNATIVE_LATENCY_MS,
   MAX_COMPARE_ALTERNATIVES,
@@ -153,8 +153,8 @@ export interface CompareModelDecision {
 export interface CompareUsageStatus {
   allowed: boolean;
   month?: string | null;
-  /** ENG-668: set when the block is pay-as-you-go's own (cap reached / suspended). */
-  usageBlockReason?: UsageBlockReason;
+  /** ENG-668: set when the block is pay-as-you-go's own (cap reached / suspended / not covered). */
+  paygBlock?: UsageBlockPaygInput;
 }
 
 export interface CompareDeps {
@@ -165,7 +165,7 @@ export interface CompareDeps {
   getSession(sessionId: string): Promise<CompareSession | null>;
   checkUsage(userId: string): Promise<CompareUsageStatus>;
   /** Builds the 429 body fields shared with /generate (message + structured usageBlock). */
-  buildUsageBlock(month: string | null | undefined, reason?: UsageBlockReason): { message: string };
+  buildUsageBlock(month: string | null | undefined, paygBlock?: UsageBlockPaygInput): { message: string };
   normalizeModelId(model: string): string;
   resolveModel(input: { userId: string; requestedModel: string }): Promise<CompareModelDecision>;
   getModelInfo(model: string): CompareModelInfo | null;
@@ -731,7 +731,7 @@ function safeClass(error: unknown): string {
 }
 
 function usagePausedOutcome(deps: CompareDeps, usage: CompareUsageStatus): ServiceOutcome {
-  const block = deps.buildUsageBlock(usage.month, usage.usageBlockReason);
+  const block = deps.buildUsageBlock(usage.month, usage.paygBlock);
   return {
     status: 429,
     // Same shape as /generate's non-policy 429 (agentModeController generateResponse).

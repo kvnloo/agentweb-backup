@@ -154,8 +154,7 @@ import {
 import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
 import { fileProductFeedback, EMMA_FEEDBACK_INTENTS } from '../services/productFeedbackFiling';
 import { ReportReplayCapacityError } from '../utils/reportIntake';
-import { resetSentence } from "../utils/usageCycle";
-import { buildUsageBlockCopy } from "../utils/usageBlockCopy";
+import { buildUsageBlockCopy, buildScheduledChatBlockMessage } from "../utils/usageBlockCopy";
 import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 import { DynamoDB } from 'aws-sdk';
@@ -522,7 +521,7 @@ async function buildUsagePausedBody(input: {
 }): Promise<Record<string, unknown>> {
   const { usageStatus, session } = input;
   // ENG-1344 AC6: one server-side producer for both the flat string and the structured copy.
-  const usageBlockCopy = buildUsageBlockCopy({ month: usageStatus.month, reason: usageStatus.usageBlockReason });
+  const usageBlockCopy = buildUsageBlockCopy({ month: usageStatus.month, paygBlock: usageStatus.paygBlock });
   const decision = input.decision ?? (usageStatus.usagePolicyVersion
     ? await resolveEffectiveModelForUser({
         userId: session.userId,
@@ -6597,19 +6596,13 @@ export async function runScheduledChat(
       const limitPercent = Math.round(
         blockedByCost ? (usageStatus.costPercentUsed ?? 100) : (usageStatus.percentUsed ?? 100)
       );
-      // ENG-1344: both branches used to end at the word "reset" with no date. The
-      // reset sentence is appended rather than interpolated so the percentage
-      // branch keeps its own leading clause, and so a month we cannot parse drops
-      // the sentence instead of rendering "resets on null".
-      const blockMessage = [
-        usageStatus.usageMode === 'paused'
-          ? 'Scheduled chat cannot run: AI usage is paused.'
-          : `Scheduled chat cannot run: you've reached your monthly usage limit (${limitPercent}% used).`,
-        resetSentence(usageStatus.month),
-        'Add usage or upgrade your plan to keep working before then.',
-      ]
-        .filter(Boolean)
-        .join(' ');
+      // ENG-1344 / ENG-668: one producer for this text (see buildScheduledChatBlockMessage).
+      const blockMessage = buildScheduledChatBlockMessage({
+        usageMode: usageStatus.usageMode,
+        limitPercent,
+        month: usageStatus.month,
+        paygBlock: usageStatus.paygBlock,
+      });
 
       const tokenLimitResult = {
         scheduleId: schedule.scheduleId,

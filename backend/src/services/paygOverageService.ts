@@ -11,10 +11,12 @@ import { settingsService } from './settingsService';
 import { getSubscriptionTypeConfig, getUserSubscriptionType } from './subscriptionService';
 import { resolveBillingUserId } from './tokenUsageService';
 import { getEffectiveLlmUsagePolicy } from './llmUsagePolicyResolverService';
+import { getCurrentUsageMonth } from './llmUsageCreditService';
 import {
   createPaygOverageSwitch,
   isPaygCapPercent,
-  paygCapMicroUsd,
+  paygGrossOverageMicroUsd,
+  paygOverageThresholdMicroUsd,
   type PaygCapPercent,
   type PaygOverageSettings,
   type PaygSuspensionReason,
@@ -107,11 +109,19 @@ export async function getPaygOverageView(userId: string): Promise<PaygOverageVie
  * Stripe failure refuses rather than enabling on a guess. Turning PAYG off never touches Stripe, and is
  * accepted even after the tier stops offering PAYG: an opt-in the customer cannot withdraw would resume
  * billing silently the day the tier offered it again.
+ *
+ * Consent to be billed is the customer's own. A delegated admin (acting AS the customer) may only
+ * reduce exposure — turn PAYG off or lower the cap — never turn it on or raise the cap.
+ *
+ * Only usage AFTER opting in is overage: turning PAYG on records the overage already standing at that
+ * moment (`optIn`), and the gates subtract it for the rest of that month.
  */
 export async function updatePaygOverage(input: {
   userId: string;
   /** Who made the change (a delegated admin's id when acting as the customer). */
   actorId: string;
+  /** The caller is a delegated admin acting as the customer (`req.delegateInfo.isDelegated`). */
+  isDelegated: boolean;
   enabled: unknown;
   capPercentOfPool: unknown;
 }): Promise<PaygOverageView> {
@@ -131,24 +141,36 @@ export async function updatePaygOverage(input: {
   if ((input.enabled && !capProvided) || (capProvided && !isPaygCapPercent(input.capPercentOfPool))) {
     throw new PaygOverageRequestError(422, 'invalid_cap', 'capPercentOfPool must be one of 25, 50, 100 or 200');
   }
+  const capPercentOfPool = capProvided ? (input.capPercentOfPool as PaygCapPercent) : null;
+  const turningOn = input.enabled && existing?.enabled !== true;
+  const raisingCap = capPercentOfPool !== null
+    && (!isPaygCapPercent(existing?.capPercentOfPool) || capPercentOfPool > existing!.capPercentOfPool);
+  if (input.isDelegated && (turningOn || raisingCap)) {
+    throw new PaygOverageRequestError(
+      403,
+      'delegate_cannot_consent',
+      'Only the account owner can turn on pay-as-you-go or raise its limit',
+    );
+  }
 
   // Nothing stored and nothing to turn on: there is no opt-in to withdraw.
   if (!existing && !input.enabled) return toView(context, existing, 0);
 
-  let cap: { capPercentOfPool: PaygCapPercent; capMicroUsd: number } | null = null;
-  if (capProvided) {
-    // Frozen against the pool as it stands now, after credits — the same threshold the gates compare to.
+  let optIn: PaygOverageSettings['optIn'] | undefined;
+  if (turningOn) {
+    // Overage already standing right now is not the customer's to pay for: it accrued before they
+    // agreed. Measured exactly the way the gates measure it (same pool, same high-water mark).
     const usage = await getEffectiveLlmUsagePolicy(input.userId);
-    const poolMicroUsd = usage.mode.reason === 'policy_not_enforced' ? 0 : usage.policy?.hardCostThresholdMicroUsd ?? 0;
-    const capPercentOfPool = input.capPercentOfPool as PaygCapPercent;
-    const capMicroUsd = paygCapMicroUsd(capPercentOfPool, poolMicroUsd);
-    if (capMicroUsd <= 0) {
+    if (!usage.policy || usage.mode.reason === 'policy_not_enforced' || usage.policy.hardCostThresholdMicroUsd <= 0) {
       throw new PaygOverageRequestError(404, 'payg_unavailable', 'This plan has no usage pool to go past');
     }
-    cap = { capPercentOfPool, capMicroUsd };
-  }
-
-  if (input.enabled && existing?.enabled !== true) {
+    const month = getCurrentUsageMonth();
+    const poolMicroUsd = paygOverageThresholdMicroUsd({
+      effectiveHardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd,
+      poolHighWater: existing?.poolHighWater,
+      month,
+    });
+    optIn = { month, overageBaselineMicroUsd: paygGrossOverageMicroUsd(usage.costUsedMicroUsd, poolMicroUsd) };
     await requireLivePaymentMethod(context.billingUser);
   }
 
@@ -159,9 +181,9 @@ export async function updatePaygOverage(input: {
     if (!existing) {
       const created: PaygOverageSettings = {
         enabled: input.enabled,
-        capPercentOfPool: cap!.capPercentOfPool,
-        capMicroUsd: cap!.capMicroUsd,
-        enabledBy: input.actorId,
+        capPercentOfPool: capPercentOfPool!,
+        ...(optIn ? { optIn } : {}),
+        updatedBy: input.actorId,
         updatedAt: now,
         version: nextVersion,
       };
@@ -172,8 +194,9 @@ export async function updatePaygOverage(input: {
       // Field-by-field, so the high-water mark and a settlement suspension written alongside are kept.
       const fields: Partial<PaygOverageSettings> = {
         enabled: input.enabled,
-        ...(cap ?? {}),
-        enabledBy: input.actorId,
+        ...(capPercentOfPool !== null ? { capPercentOfPool } : {}),
+        ...(optIn ? { optIn } : {}),
+        updatedBy: input.actorId,
         updatedAt: now,
         version: nextVersion,
       };

@@ -114,7 +114,7 @@ function compareDeps(): CompareDeps {
     isEntitled: (user) => modelCompareEntitlement.isEntitled(user),
     getSession,
     checkUsage: (userId) => checkTokenUsage(userId),
-    buildUsageBlock: (month, reason) => buildUsageBlockCopy({ month, reason }),
+    buildUsageBlock: (month, paygBlock) => buildUsageBlockCopy({ month, paygBlock }),
     normalizeModelId: (model) => agentModeService.normalizeModelId(model),
     resolveModel: (input) => resolveEffectiveModelForUser(input),
     getModelInfo: (model) => agentModeService.getModelCompareInfo(model),
