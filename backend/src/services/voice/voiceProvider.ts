@@ -1,6 +1,7 @@
 import twilio from 'twilio';
 import { getTwilioCredentials, type TwilioCredentials } from '../../utils/secretsManager';
 import { redactPhone } from '../whatsappService';
+import { REDACTED, redactPhones } from './redactText';
 
 interface PlaceCallBase {
   to: string;
@@ -96,16 +97,10 @@ export class VoiceCallError extends Error {
 const REQUEST_TIMEOUT_MS = 15_000;
 
 // Twilio echoes the dialled number in its error text (21211: "The 'To' number +1555... is not a
-// valid phone number."). This message is logged and persisted, so any 7+ digit run is removed,
-// including non-ASCII decimal digits and the separators people type inside a number (spaces,
-// dots, dashes of any width, slashes, brackets). Twilio resource SIDs (two letters + 32 hex,
-// e.g. CA... call, PN... number) are matched first and passed through untouched: they are
-// identifiers worth keeping and can contain long digit runs. Account SIDs (AC...) are the
-// exception: they are half of the API credential, so ACCOUNT_SID redacts them before this runs.
+// valid phone number."). This message is logged and persisted, so phone-like text goes through the
+// shared redactor. Account SIDs (AC...) are half of the API credential, so ACCOUNT_SID removes them
+// before it runs; other resource SIDs (call, number) pass through untouched.
 const ACCOUNT_SID = /\bAC[0-9a-f]{32}\b/g;
-const RESOURCE_SID = /\b[A-Z]{2}[0-9a-f]{32}\b/;
-const PHONE_LIKE = /\+?\p{Nd}(?:[\s().\-\u2010-\u2015\u2212/]*\p{Nd}){6,}/u;
-const SCRUB = new RegExp(`(${RESOURCE_SID.source})|${PHONE_LIKE.source}`, 'gu');
 // A Basic Authorization value is base64(sid:token); the SDK never puts it in a message, but a
 // proxy or HTTP layer could.
 const BASIC_AUTH = /\bBasic\s+[A-Za-z0-9+/=_-]{20,}/g;
@@ -124,12 +119,12 @@ export function scrubErrorText(text: string, credentials?: TwilioCredentials): s
   const known = credentials
     ? [credentials.accountSid, credentials.authToken, Buffer.from(`${credentials.accountSid}:${credentials.authToken}`).toString('base64')]
     : [];
-  return known
+  const withoutCredentials = known
     .filter((v) => v.length >= MIN_REDACTABLE_SECRET)
-    .reduce((acc, v) => acc.split(v).join('[redacted]'), text)
-    .replace(BASIC_AUTH, 'Basic [redacted]')
-    .replace(ACCOUNT_SID, '[redacted]')
-    .replace(SCRUB, (m, resourceSid) => (resourceSid ? m : '[number]'));
+    .reduce((acc, v) => acc.split(v).join(REDACTED), text)
+    .replace(BASIC_AUTH, `Basic ${REDACTED}`)
+    .replace(ACCOUNT_SID, REDACTED);
+  return redactPhones(withoutCredentials);
 }
 
 /**

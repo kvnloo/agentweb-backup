@@ -235,7 +235,7 @@ describe('real voice provider', () => {
     ])('scrubs %s', async (_label, num) => {
       const m = await msg(`bad ${num} here`);
       expect(longestDigitRun(m)).toBeLessThan(7);
-      expect(m).toContain('[number]');
+      expect(m).toContain('[redacted]');
     });
     it('keeps runs shorter than 7 digits', async () => {
       expect(await msg('code 21211 and 123456')).toContain('123456');

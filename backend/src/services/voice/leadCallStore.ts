@@ -1,4 +1,5 @@
 import { crmDb, ENGAGED_EVENT_KEYWORDS } from '../db';
+import { redactPhones } from './redactText';
 import type {
   HotLeadCallEventType,
   HotLeadCallLeg,
@@ -13,19 +14,6 @@ const SYSTEM_KEY = 'hot_lead_call';
 const MAX_DETAIL_VALUE_LENGTH = 200;
 
 const TERMINAL_STATES: HotLeadCallState[] = ['finished', 'failed', 'skipped'];
-
-// Matched in order at each position: a Twilio SID (CA..., AC..., PN...: 34 chars of hex that can hold a
-// long digit run) and an ISO date (2026-10-19) are kept as they are; anything else shaped like a phone
-// number is redacted: 7+ decimal digits (any script, via \p{Nd}) with optional + and separators (spaces
-// incl. NBSP, ( ) . and any Unicode hyphen/minus). Rule: only the LEFT edge is bounded (not glued to a
-// word character or dash, so ids like job_1234567 survive); a digit run glued on the right
-// ("4155550100x") is still redacted.
-const SID_DATE_OR_PHONE =
-  /\b[A-Z]{2}[0-9a-f]{32}\b|\b\d{4}-\d{2}-\d{2}(?!\d)|(?<![\w-])[+\uFF0B]?\p{Nd}[\p{Nd}\s().\u2010-\u2015\u2212\uFF0D-]{5,}\p{Nd}/gu;
-
-function redactPhones(value: string): string {
-  return value.replace(SID_DATE_OR_PHONE, (m) => (/^[A-Z]{2}|^\d{4}-\d{2}-\d{2}$/.test(m) ? m : '[redacted]'));
-}
 
 // db.ts raises `isEngaged` (the lead counts as engaged/hot in lists and filters) when an engagement's
 // eventType or serialised eventData contains one of ENGAGED_EVENT_KEYWORDS. A call event must never do
