@@ -522,7 +522,7 @@ async function buildUsagePausedBody(input: {
 }): Promise<Record<string, unknown>> {
   const { usageStatus, session } = input;
   // ENG-1344 AC6: one server-side producer for both the flat string and the structured copy.
-  const usageBlockCopy = buildUsageBlockCopy({ month: usageStatus.month });
+  const usageBlockCopy = buildUsageBlockCopy({ month: usageStatus.month, reason: usageStatus.usageBlockReason });
   const decision = input.decision ?? (usageStatus.usagePolicyVersion
     ? await resolveEffectiveModelForUser({
         userId: session.userId,

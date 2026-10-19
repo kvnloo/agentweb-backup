@@ -1,12 +1,12 @@
 import { userDb, orgDb, User } from "./db";
 import { getSubscriptionTypeConfig, getUserSubscriptionType } from "./subscriptionService";
 import { inheritsOrgBilling } from "./orgAuthz";
-import { evaluateLlmUsageMode, type LlmUsageMode, type LlmUsagePolicy,
+import { type LlmUsageMode, type LlmUsagePolicy,
   resolveAlertThresholds,
   type ResolvedAlertThresholds,
 } from "./llmUsagePolicyService";
-import { applyLlmUsageCredits, getLlmUsageCreditAdjustment } from './llmUsageCreditService';
-import { resolveEnforcementCostBasisMicroUsd } from './spendEnforcementBasis';
+import { resolveLlmUsagePoolDecision } from './llmUsagePoolDecision';
+import type { PaygBlockReason } from './paygOverage';
 import { randomUUID } from 'crypto';
 import { recordLlmChargeEvent, LLM_CHARGE_EVENTS_TABLE } from './llmChargeAuditDb';
 import { buildUsageBlockCopy, type UsageBlockCopy } from '../utils/usageBlockCopy';
@@ -44,6 +44,15 @@ export interface TokenUsageStatus {
    * is warned at the wrong moment.
    */
   alertThresholds: ResolvedAlertThresholds;
+  /**
+   * ENG-668: pay-as-you-go state, present only while an account with PAYG live is past its plan pool.
+   * `active` = this turn was admitted on PAYG; `percentOfCap` = overage as a percentage of the cap the
+   * customer chose. Percentages only — the cap and the overage in dollars never leave the server.
+   * `costPercentUsed` keeps meaning the plan pool, so it reads above 100 while this is active.
+   */
+  overage?: { active: boolean; percentOfCap: number };
+  /** ENG-668: why the block is PAYG's own (cap reached, suspended), when it is; drives `usageBlock` copy. */
+  usageBlockReason?: PaygBlockReason;
 }
 
 /**
@@ -52,7 +61,7 @@ export interface TokenUsageStatus {
  * `costUsed` and `costAllowance` are dropped. `hasCostAllowance` replaces the
  * only thing the client ever did with the latter — a null check.
  */
-export type CustomerTokenUsageStatus = Omit<TokenUsageStatus, 'costUsed' | 'costAllowance' | 'used'> & {
+export type CustomerTokenUsageStatus = Omit<TokenUsageStatus, 'costUsed' | 'costAllowance' | 'used' | 'usageBlockReason'> & {
   /**
    * Token volume used this month. ABSENT when no token limit applies (ENG-1250 AC7: token volume is no
    * longer measured), so the portal's `typeof used === "number"` check hides its token meter instead of
@@ -98,12 +107,14 @@ export type CustomerTokenUsageStatus = Omit<TokenUsageStatus, 'costUsed' | 'cost
  * emailService and the policy services keep the figures they need.
  */
 export function toCustomerTokenUsage(status: TokenUsageStatus): CustomerTokenUsageStatus {
-  const { costUsed: _costUsed, costAllowance, used, ...customerSafe } = status;
+  // `usageBlockReason` is carried by `usageBlock.reason` instead of twice. `overage` passes through:
+  // it is percentages by construction (ENG-668).
+  const { costUsed: _costUsed, costAllowance, used, usageBlockReason, ...customerSafe } = status;
   return {
     ...customerSafe,
     ...(status.effectiveAllowance === null ? {} : { used }),
     hasCostAllowance: costAllowance != null,
-    usageBlock: buildUsageBlockCopy({ month: status.month }),
+    usageBlock: buildUsageBlockCopy({ month: status.month, reason: usageBlockReason }),
   };
 }
 
@@ -364,34 +375,23 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
   const versionedCostPolicyEnforced = !!llmUsagePolicy && llmUsagePolicy.enforcementState !== "observe";
   const enforceCostCap = versionedCostPolicyEnforced || process.env.ENFORCE_COST_CAP === "true";
 
-  // Lazy: read only if the basis falls back to legacy (rollback path), never on the live ledger path.
-  const legacyRawCostUsedMicroUsd = async (): Promise<number> =>
-    Math.max(0, Math.round(((await getUserTokenUsage(billingUserId)).totalCost || 0) * 1_000_000));
-  // ENG-1250 §9.6 enforcement cutover (dark by default): swap the raw spend basis
-  // onto the vendor-inclusive spend ledger; the credit/threshold/predicate path
-  // below is reused unchanged so the only divergence is vendor inclusion.
-  const { rawCostUsedMicroUsd } = await resolveEnforcementCostBasisMicroUsd({
+  // ENG-668: spend basis, credits and the hard-threshold predicate (plus PAYG, for an account that
+  // opted in) come from the one decision getEffectiveLlmUsagePolicy also uses, so the two gates
+  // cannot disagree about whether this account is paused.
+  const pool = await resolveLlmUsagePoolDecision({
     billingUserId,
-    billingMonth: month,
-    legacyRawCostUsedMicroUsd,
-    tier: subscriptionType,
+    billingUser,
+    month,
+    subscriptionType,
+    basePolicy: llmUsagePolicy,
+    paygTier: async () => (await getSubscriptionTypeConfig(subscriptionType))?.paygOverage,
+    // Lazy: read only if the basis falls back to legacy (rollback path), never on the live ledger path.
+    legacyRawCostUsedMicroUsd: async (): Promise<number> =>
+      Math.max(0, Math.round(((await getUserTokenUsage(billingUserId)).totalCost || 0) * 1_000_000)),
   });
-  const creditAdjustment = getLlmUsageCreditAdjustment(billingUser?.llmUsageCredits, month);
-  const adjustedUsage = llmUsagePolicy
-    ? applyLlmUsageCredits({
-        rawCostUsedMicroUsd,
-        hardThresholdMicroUsd: llmUsagePolicy.hardCostThresholdMicroUsd,
-        adjustment: creditAdjustment,
-      })
-    : { policyCostUsedMicroUsd: rawCostUsedMicroUsd, effectiveHardThresholdMicroUsd: 0 };
-  const effectiveLlmUsagePolicy = llmUsagePolicy
-    ? { ...llmUsagePolicy, hardCostThresholdMicroUsd: adjustedUsage.effectiveHardThresholdMicroUsd }
-    : null;
-  const costUsedMicroUsd = adjustedUsage.policyCostUsedMicroUsd;
-  const usageDecision = evaluateLlmUsageMode({
-    costUsedMicroUsd,
-    policy: effectiveLlmUsagePolicy,
-  });
+  const effectiveLlmUsagePolicy = pool.policy;
+  const costUsedMicroUsd = pool.costUsedMicroUsd;
+  const usageDecision = pool.mode;
   const effectiveCostAllowance = versionedCostPolicyEnforced
     ? effectiveLlmUsagePolicy!.hardCostThresholdMicroUsd / 1_000_000
     : costAllowance;
@@ -441,6 +441,12 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
     usagePolicyVersion: llmUsagePolicy?.version || null,
     // Always present, always resolved — see the note on the field.
     alertThresholds: resolveAlertThresholds(llmUsagePolicy),
+    // ENG-668: present only for an account with PAYG live and past its pool, so every other
+    // account's status is exactly what it was.
+    ...(pool.overage
+      ? { overage: { active: usageDecision.reason === "payg_overage", percentOfCap: pool.overage.percentOfCap } }
+      : {}),
+    ...(pool.paygBlockReason ? { usageBlockReason: pool.paygBlockReason } : {}),
   };
 }
 

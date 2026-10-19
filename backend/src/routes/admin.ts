@@ -5105,6 +5105,8 @@ router.get("/subscription-types", async (req, res) => {
         ...(type.llmUsagePolicy ? { llmUsagePolicy: type.llmUsagePolicy } : {}),
         ...(type.llmUsageTopUp ? { llmUsageTopUp: type.llmUsageTopUp } : {}),
         ...(type.seatPricing ? { seatPricing: type.seatPricing } : {}),
+        // ENG-668: round-trip it, or the admin UI's next save (which posts what this returned) drops it.
+        ...(type.paygOverage ? { paygOverage: type.paygOverage } : {}),
       };
     }));
 
@@ -5316,6 +5318,25 @@ router.post("/subscription-types", async (req, res) => {
         }
       }
 
+      // ENG-668: whether this tier may opt into pay-as-you-go overages. This object is rebuilt from a
+      // whitelist and replaces the stored tier, so a field missing here is silently dropped on save.
+      // `markupBps` defaults to the tier's own additional-usage (top-up) markup floor, so overage is
+      // never priced below what a top-up of the same usage costs; with no top-up to inherit from it
+      // must be given explicitly. Present-but-invalid values are rejected, never coerced.
+      let normalizedPaygOverage: any = undefined;
+      if (type.paygOverage != null) {
+        const { validatePaygOverageTierConfig } = await import('../services/paygOverage');
+        const markupBps = type.paygOverage.markupBps ?? normalizedLlmUsageTopUp?.minimumMarkupBps;
+        if (markupBps === undefined) {
+          throw new Error(`${type.name} pay-as-you-go: markupBps is required when the tier has no additional usage markup to inherit`);
+        }
+        normalizedPaygOverage = { allowed: type.paygOverage.allowed, markupBps };
+        const paygErrors = validatePaygOverageTierConfig(normalizedPaygOverage);
+        if (paygErrors.length > 0) {
+          throw new Error(`${type.name} pay-as-you-go: ${paygErrors.join('; ')}`);
+        }
+      }
+
       // Seat-based billing (ENG-2243..2246): admin-configured pricing for extra
       // org seats. priceCents is the full monthly per-seat charge; baseSeats
       // mirrors orgSeatService.baseSeatsForTier for display/config purposes.
@@ -5350,6 +5371,7 @@ router.post("/subscription-types", async (req, res) => {
         ...(normalizedLlmUsagePolicy ? { llmUsagePolicy: normalizedLlmUsagePolicy } : {}),
         ...(normalizedLlmUsageTopUp ? { llmUsageTopUp: normalizedLlmUsageTopUp } : {}),
         ...(normalizedSeatPricing ? { seatPricing: normalizedSeatPricing } : {}),
+        ...(normalizedPaygOverage ? { paygOverage: normalizedPaygOverage } : {}),
       };
     }));
 
