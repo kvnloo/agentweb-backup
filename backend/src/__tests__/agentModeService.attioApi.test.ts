@@ -19,7 +19,13 @@ const mockAddPersonToList = jest.fn();
 const mockFindListEntry = jest.fn();
 const mockDeleteListEntry = jest.fn();
 const mockListListEntriesDetailed = jest.fn();
+const mockSearchRecords = jest.fn();
+const mockListPeople = jest.fn();
+const mockListCompanies = jest.fn();
 const mockSvcInstance = {
+  searchRecords: mockSearchRecords,
+  listPeople: mockListPeople,
+  listCompanies: mockListCompanies,
   listListEntriesDetailed: mockListListEntriesDetailed,
   countListEntries: mockCountListEntries,
   getAllLists: mockGetAllLists,
@@ -131,6 +137,59 @@ const at = (args: any) => agentModeService.handleAttioApi(USER, args);
 beforeEach(() => {
   jest.clearAllMocks();
   mockAttioCreate.mockResolvedValue(mockSvcInstance);
+});
+
+// ─── RECORDS (ENG-2580) ─────────────────────────────────────────────────────
+
+describe('RECORDS SEARCH / LIST', () => {
+  const PERSON = { recordId: 'r1', firstName: 'Joy', lastName: 'Goel', email: 'joy@x.com' };
+
+  it('infers RECORDS from the prod shape {action:search_records, params:{query}}', async () => {
+    mockSearchRecords.mockResolvedValue([PERSON]);
+    const result = await at({ action: 'search_records', params: { query: 'Joy Goel' } });
+    expect(mockSearchRecords).toHaveBeenCalledWith('people', 'Joy Goel');
+    expect(result).toEqual({ success: true, object_type: 'people', records: [PERSON] });
+  });
+
+  it('maps entity_type COMPANY to a companies search', async () => {
+    mockSearchRecords.mockResolvedValue([]);
+    const result = await at({ entity_type: 'company', action: 'SEARCH', query: 'Weybright' });
+    expect(mockSearchRecords).toHaveBeenCalledWith('companies', 'Weybright');
+    expect(result.success).toBe(true);
+  });
+
+  it('requires query for SEARCH', async () => {
+    const result = await at({ entity_type: 'RECORDS', action: 'SEARCH' });
+    expect(result).toEqual({ success: false, error: 'query is required for RECORDS SEARCH.' });
+    expect(mockSearchRecords).not.toHaveBeenCalled();
+  });
+
+  it('maps the prod shape {entity_type:person, action:list} to a people page', async () => {
+    mockListPeople.mockResolvedValue({ people: [PERSON], nextOffset: 50 });
+    const result = await at({ entity_type: 'person', action: 'list' });
+    expect(mockListPeople).toHaveBeenCalledWith(0);
+    expect(result).toEqual({ success: true, object_type: 'people', records: [PERSON], next_offset: 50 });
+  });
+
+  it('lists companies with offset and no next_offset on the last page', async () => {
+    mockListCompanies.mockResolvedValue({ companies: [{ recordId: 'c1', name: 'Acme', domainNames: [] }] });
+    const result = await at({ entity_type: 'RECORDS', action: 'LIST', object_type: 'companies', offset: 50 });
+    expect(mockListCompanies).toHaveBeenCalledWith(50);
+    expect(result.next_offset).toBeUndefined();
+    expect(result.records).toHaveLength(1);
+  });
+
+  it('returns a clear error when entity_type is missing and cannot be inferred', async () => {
+    const result = await at({ action: 'get_workspace' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/entity_type is required.*RECORDS/);
+    expect(mockAttioCreate).not.toHaveBeenCalled();
+  });
+
+  it('rejects unknown RECORDS actions', async () => {
+    const result = await at({ entity_type: 'RECORDS', action: 'DELETE' });
+    expect(result).toEqual({ success: false, error: 'Unknown action "DELETE" for RECORDS. Valid: SEARCH, LIST.' });
+  });
 });
 
 // ─── LIST_ENTRIES LIST (ENG-2578) ───────────────────────────────────────────
