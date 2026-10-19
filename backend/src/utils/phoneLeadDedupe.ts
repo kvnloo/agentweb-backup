@@ -58,6 +58,11 @@ export function phoneNamesConflict(existing: any, incoming: any): boolean {
   return false;
 }
 
+/** The normalized first+last name of a submission: the seed that lets same-named racers share one separate row. */
+export function phoneNameSeed(lead: any): string {
+  return `${norm(lead?.firstName)}|${norm(lead?.lastName)}`;
+}
+
 /** More matches on one key than this means a shared line, not a repeat visitor: never merge. */
 export const PHONE_FANOUT_CAP = 5;
 
