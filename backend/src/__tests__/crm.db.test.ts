@@ -1415,6 +1415,16 @@ describe('CRM Database Service', () => {
 
   // ENG-2271: hot-lead call state lives at lead.system.hot_lead_call; these two primitives are its
   // conditional writes. DynamoDB evaluates the conditions, so these assert the expressions we send.
+  // DynamoDB rejects an expression that declares a placeholder it never uses, or uses one it never declares.
+  const expectNoDanglingPlaceholders = (call: any) => {
+    const text = `${call.UpdateExpression} ${call.ConditionExpression}`;
+    const used = (re: RegExp) => new Set(text.match(re) ?? []);
+    const declaredNames = new Set(Object.keys(call.ExpressionAttributeNames));
+    const declaredValues = new Set(Object.keys(call.ExpressionAttributeValues));
+    expect(used(/#[A-Za-z]\w*/g)).toEqual(declaredNames);
+    expect(used(/:[A-Za-z]\w*/g)).toEqual(declaredValues);
+  };
+
   describe('createLeadSystemRecordOnce', () => {
     it('bootstraps the system map, then SETs the key only if it is absent', async () => {
       const result = await crmDb.createLeadSystemRecordOnce('list_1', 'lead_1', 'hot_lead_call', { state: 'dialing' });
@@ -1454,7 +1464,7 @@ describe('CRM Database Service', () => {
       const result = await crmDb.updateLeadSystemRecordIf('list_1', 'lead_1', 'hot_lead_call', {
         stateIn: ['dialing', 'owner_ringing'],
         set: { state: 'owner_answered', outcome: undefined, ownerCallSid: 'CA1' },
-        maxIn: { lastSequence: { CA1: 3 } },
+        maxIn: { lastSequence: { CA1: 3, CA2: 5 } },
         appendNew: { meteredLegs: ['owner', 'lead'] },
       });
 
@@ -1462,27 +1472,56 @@ describe('CRM Database Service', () => {
       expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(1);
       const call = mockDocumentClientMethods.update.mock.calls[0][0];
       expect(call.Key).toEqual({ listId: 'list_1', leadId: 'lead_1' });
+      // One name placeholder per field, one per map entry: #f2 is lastSequence, #e3/#e4 its entries.
       expect(call.UpdateExpression).toBe(
-        'SET updatedAt = :ts, #system.#k.#f0 = :v0, #system.#k.#f1 = :v1, #system.#k.#f2.#e2 = :v2, ' +
-        '#system.#k.#f3 = list_append(#system.#k.#f3, :v3)',
+        'SET updatedAt = :ts, #system.#k.#f0 = :v0, #system.#k.#f1 = :v1, ' +
+        '#system.#k.#f2.#e3 = :v3, #system.#k.#f2.#e4 = :v4, ' +
+        '#system.#k.#f5 = list_append(#system.#k.#f5, :v5)',
       );
       expect(call.ConditionExpression).toBe(
         '#system.#k.#state IN (:from0, :from1) AND ' +
-        '(attribute_not_exists(#system.#k.#f2.#e2) OR #system.#k.#f2.#e2 < :v2) AND ' +
-        'NOT contains(#system.#k.#f3, :v3_0) AND NOT contains(#system.#k.#f3, :v3_1)',
+        '(attribute_not_exists(#system.#k.#f2.#e3) OR #system.#k.#f2.#e3 < :v3) AND ' +
+        '(attribute_not_exists(#system.#k.#f2.#e4) OR #system.#k.#f2.#e4 < :v4) AND ' +
+        'NOT contains(#system.#k.#f5, :v5_0) AND NOT contains(#system.#k.#f5, :v5_1)',
       );
       expect(call.ExpressionAttributeNames).toEqual({
         '#system': 'system', '#k': 'hot_lead_call', '#state': 'state',
-        '#f0': 'state', '#f1': 'ownerCallSid', '#f2': 'lastSequence', '#e2': 'CA1', '#f3': 'meteredLegs',
+        '#f0': 'state', '#f1': 'ownerCallSid', '#f2': 'lastSequence', '#e3': 'CA1', '#e4': 'CA2', '#f5': 'meteredLegs',
       });
       expect(call.ExpressionAttributeValues).toMatchObject({
-        ':from0': 'dialing', ':from1': 'owner_ringing', ':v0': 'owner_answered', ':v1': 'CA1', ':v2': 3,
-        ':v3': ['owner', 'lead'], ':v3_0': 'owner', ':v3_1': 'lead',
+        ':from0': 'dialing', ':from1': 'owner_ringing', ':v0': 'owner_answered', ':v1': 'CA1', ':v3': 3, ':v4': 5,
+        ':v5': ['owner', 'lead'], ':v5_0': 'owner', ':v5_1': 'lead',
       });
-      // Every placeholder must be used or DynamoDB rejects the request.
-      const text = `${call.UpdateExpression} ${call.ConditionExpression}`;
-      for (const name of Object.keys(call.ExpressionAttributeNames)) expect(text).toContain(name);
-      for (const value of Object.keys(call.ExpressionAttributeValues)) expect(text).toContain(value);
+      expectNoDanglingPlaceholders(call);
+    });
+
+    it('declares no placeholder for empty entry maps, empty lists or undefined values', async () => {
+      await crmDb.updateLeadSystemRecordIf('list_1', 'lead_1', 'hot_lead_call', {
+        stateIn: ['dialing'],
+        set: { state: 'failed', outcome: undefined },
+        maxIn: { lastSequence: {} },
+        appendNew: { meteredLegs: [] },
+      });
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.UpdateExpression).toBe('SET updatedAt = :ts, #system.#k.#f0 = :v0');
+      expect(call.ExpressionAttributeNames).toEqual({ '#system': 'system', '#k': 'hot_lead_call', '#state': 'state', '#f0': 'state' });
+      expectNoDanglingPlaceholders(call);
+    });
+
+    it('keeps placeholders distinct across several maxIn fields and appendNew fields', async () => {
+      await crmDb.updateLeadSystemRecordIf('list_1', 'lead_1', 'hot_lead_call', {
+        stateIn: ['dialing'],
+        maxIn: { a: { x: 1, y: 2 }, b: { z: 3 } },
+        appendNew: { l1: ['p'], l2: ['q', 'r'] },
+      });
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(new Set(Object.keys(call.ExpressionAttributeNames)).size).toBe(Object.keys(call.ExpressionAttributeNames).length);
+      expectNoDanglingPlaceholders(call);
+    });
+
+    it('returns false for an empty stateIn without calling DynamoDB', async () => {
+      expect(await crmDb.updateLeadSystemRecordIf('list_1', 'lead_1', 'hot_lead_call', { stateIn: [] })).toBe(false);
+      expect(mockDocumentClientMethods.update).not.toHaveBeenCalled();
     });
 
     it('with only a state condition sends no max or append clauses', async () => {
