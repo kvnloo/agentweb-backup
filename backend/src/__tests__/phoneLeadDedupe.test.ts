@@ -1,7 +1,7 @@
 /**
  * ENG-2123: identity rules for phone-only capture dedupe, and the rollout-mode setting.
  */
-import { fillBlankCustomFields, phoneDedupeKey, phoneNamesConflict, PHONE_FANOUT_CAP } from '../utils/phoneLeadDedupe';
+import { fillBlankCustomFields, phoneDedupeKey, phoneNameSeed, phoneNamesConflict, PHONE_FANOUT_CAP } from '../utils/phoneLeadDedupe';
 
 describe('phoneDedupeKey', () => {
   it.each([
@@ -69,5 +69,14 @@ describe('fillBlankCustomFields', () => {
   it('handles missing maps', () => {
     expect(fillBlankCustomFields(undefined, { a: '1' })).toEqual({ a: '1' });
     expect(fillBlankCustomFields({ a: '1' }, undefined)).toEqual({ a: '1' });
+  });
+});
+
+describe('phoneNameSeed', () => {
+  it('normalizes case, spacing and blanks so same-named racers share one seed', () => {
+    expect(phoneNameSeed({ firstName: ' Ana ', lastName: 'LEE' })).toBe('ana|lee');
+    expect(phoneNameSeed({ firstName: 'ana', lastName: ' lee' })).toBe('ana|lee');
+    expect(phoneNameSeed({ firstName: 'Ana' })).toBe('ana|');
+    expect(phoneNameSeed({ firstName: 'Ana', lastName: 'Lee' })).not.toBe(phoneNameSeed({ firstName: 'Bob', lastName: 'Lee' }));
   });
 });

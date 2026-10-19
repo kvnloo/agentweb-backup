@@ -151,9 +151,51 @@ describe('mode create', () => {
     const res = await post({ firstName: 'Ana' });
     expect(res.status).toBe(201);
     expect(createCalls()).toHaveLength(2);
-    expect(createCalls()[1][1]).not.toHaveProperty('phoneUniqueCreate');
-    expect(createCalls()[1][1]).toMatchObject({ firstName: 'Ana' });
+    expect(createCalls()[1][1]).toMatchObject({ firstName: 'Ana', phoneUniqueCreate: true, phoneUniqueIdSeed: 'ana|' });
     expect(crmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  it('a conflicting-name loser whose OWN name-keyed row already exists adopts it (fills blanks), never a third row', async () => {
+    setPhoneDedupeModeOverride('create');
+    const bob = existing({ firstName: 'Bob' });
+    const ana = existing({ leadId: 'lead_ana_row', firstName: 'Ana', company: 'AnaCo', title: '' });
+    (crmDb.createLead as jest.Mock)
+      .mockRejectedValueOnce(Object.assign(new Error('dup'), { duplicatePhone: true, existingLead: bob }))
+      .mockRejectedValueOnce(Object.assign(new Error('dup'), { duplicatePhone: true, existingLead: ana }));
+    (crmDb.getLeadById as jest.Mock).mockImplementation(async (_l: string, id: string) => (id === 'lead_ana_row' ? ana : bob));
+    const res = await post({ firstName: 'Ana', company: 'Other', title: 'CEO' });
+    expect(createCalls()).toHaveLength(2);
+    expect(res.status).toBe(200);
+    expect(crmDb.updateLead).toHaveBeenCalledTimes(1);
+    expect((crmDb.updateLead as jest.Mock).mock.calls[0][1]).toBe('lead_ana_row');
+    expect((crmDb.updateLead as jest.Mock).mock.calls[0][2]).toMatchObject({ title: 'CEO' });
+    expect((crmDb.updateLead as jest.Mock).mock.calls[0][2]).not.toHaveProperty('company');
+  });
+
+  it('a stale name-keyed winner (it gained an email) falls back to an ordinary-id row, not a merge', async () => {
+    setPhoneDedupeModeOverride('create');
+    const bob = existing({ firstName: 'Bob' });
+    const ana = existing({ leadId: 'lead_ana_row', firstName: 'Ana' });
+    (crmDb.createLead as jest.Mock)
+      .mockRejectedValueOnce(Object.assign(new Error('dup'), { duplicatePhone: true, existingLead: bob }))
+      .mockRejectedValueOnce(Object.assign(new Error('dup'), { duplicatePhone: true, existingLead: ana }));
+    (crmDb.getLeadById as jest.Mock).mockImplementation(async (_l: string, id: string) => (id === 'lead_ana_row' ? { ...ana, email: 'ana@example.com' } : bob));
+    const res = await post({ firstName: 'Ana' });
+    expect(res.status).toBe(201);
+    expect(createCalls()).toHaveLength(3);
+    expect(createCalls()[2][1]).not.toHaveProperty('phoneUniqueCreate');
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  it('a winner that gained an email (not a name conflict) gets an ordinary id with NO name seed', async () => {
+    setPhoneDedupeModeOverride('create');
+    const carried = existing();
+    (crmDb.createLead as jest.Mock).mockRejectedValueOnce(Object.assign(new Error('dup'), { duplicatePhone: true, existingLead: carried }));
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue({ ...carried, email: 'ana@example.com' });
+    await post();
+    expect(createCalls()).toHaveLength(2);
+    expect(createCalls()[1][1]).not.toHaveProperty('phoneUniqueIdSeed');
+    expect(createCalls()[1][1]).not.toHaveProperty('phoneUniqueCreate');
   });
 });
 
@@ -352,6 +394,32 @@ describe('a phone-matched merge only FILLS BLANKS (never overwrites)', () => {
     await post({ phone: undefined, email: 'ana@example.com', company: 'New Co', notes: 'new', customFields: { budget: '50k' } });
     expect(sentToUpdate()[0]).toMatchObject({ company: 'New Co', notes: 'new' });
     expect(sentToUpdate()[0].customFields).toMatchObject({ budget: '50k' });
+  });
+});
+
+describe('a phone-matched repeat that fills nothing is not an update', () => {
+  const TOUCH = { timestamp: '2026-10-19T00:00:00.000Z', utm: { source: 'google' } };
+
+  it('on: only the attribution refresh changed -> lead.unchanged (no drip/CRM/owner alert), the touch is still saved', async () => {
+    setPhoneDedupeModeOverride('on');
+    withCandidates([existing({ company: 'Acme', customFields: { source: 'lp' } })]);
+    const res = await post({ company: 'Other Co', attribution: TOUCH });
+    expect(res.body.event).toBe('lead.unchanged');
+    expect((crmDb.updateLead as jest.Mock).mock.calls[0][2]).toMatchObject({ lastTouch: expect.anything() });
+    expect((crmDb.updateLead as jest.Mock).mock.calls[0][2]).not.toHaveProperty('company');
+  });
+
+  it('on: a repeat that DOES fill a blank is still reported as lead.updated', async () => {
+    setPhoneDedupeModeOverride('on');
+    withCandidates([existing({ title: '', customFields: { source: 'lp' } })]);
+    const res = await post({ title: 'CEO', attribution: TOUCH });
+    expect(res.body.event).toBe('lead.updated');
+  });
+
+  it('GUARD: an EMAIL repeat with only a new touch is STILL lead.updated (unchanged behaviour)', async () => {
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({ leadId: 'lead_e1', listId: 'L1', email: 'ana@example.com', firstName: 'Ana', customFields: {}, createdAt: '2026-10-01T00:00:00.000Z' });
+    const res = await post({ phone: undefined, email: 'ana@example.com', attribution: TOUCH });
+    expect(res.body.event).toBe('lead.updated');
   });
 });
 
