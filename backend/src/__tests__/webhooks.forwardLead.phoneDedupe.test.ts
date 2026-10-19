@@ -174,6 +174,17 @@ describe('mode create', () => {
     expect((crmDb.updateLead as jest.Mock).mock.calls[0][2]).not.toHaveProperty('company');
   });
 
+  it('a name with a lone surrogate (truncated emoji) on a conflicting number is still captured, not a 500', async () => {
+    setPhoneDedupeModeOverride('create');
+    const bob = existing({ firstName: 'Bob' });
+    (crmDb.createLead as jest.Mock).mockRejectedValueOnce(Object.assign(new Error('dup'), { duplicatePhone: true, existingLead: bob }));
+    const res = await post({ firstName: 'Ana\uD83D' });
+    expect(res.status).toBe(201);
+    expect(createCalls()).toHaveLength(2);
+    expect(createCalls()[1][1]).toMatchObject({ phoneUniqueCreate: true });
+    expect(typeof createCalls()[1][1].phoneUniqueIdSeed).toBe('string');
+  });
+
   it('a stale name-keyed winner (it gained an email) falls back to an ordinary-id row, not a merge', async () => {
     setPhoneDedupeModeOverride('create');
     const bob = existing({ firstName: 'Bob' });

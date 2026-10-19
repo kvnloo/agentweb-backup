@@ -73,6 +73,17 @@ describe('fillBlankCustomFields', () => {
 });
 
 describe('phoneNameSeed', () => {
+  it('NEVER throws, whatever the name holds (a lone surrogate from a truncated emoji used to throw URIError and 500 the lander)', () => {
+    for (const bad of ['Ana\uD83D', '\uDE00Ana', '\uD83D\uD83D', 'A\uDE00\uD83DB', '\uD83D\uDE00']) {
+      expect(() => phoneNameSeed({ firstName: bad, lastName: bad })).not.toThrow();
+    }
+  });
+  it('a lone surrogate seeds the same as itself and differently from a different name; a valid emoji is kept', () => {
+    expect(phoneNameSeed({ firstName: 'Ana\uD83D' })).toBe(phoneNameSeed({ firstName: 'Ana\uD83D' }));
+    expect(phoneNameSeed({ firstName: 'Ana\uD83D' })).not.toBe(phoneNameSeed({ firstName: 'Bob\uD83D' }));
+    expect(phoneNameSeed({ firstName: '\uD83D\uDE00' })).not.toBe(phoneNameSeed({ firstName: '\uFFFD' }));
+  });
+
   it('normalizes case, spacing and blanks so same-named racers share one seed', () => {
     expect(phoneNameSeed({ firstName: ' Ana ', lastName: 'LEE' })).toBe('ana|lee');
     expect(phoneNameSeed({ firstName: 'ana', lastName: ' lee' })).toBe('ana|lee');
