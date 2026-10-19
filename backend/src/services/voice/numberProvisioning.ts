@@ -1,6 +1,8 @@
 import { orgDb, type Organization } from '../db';
 import { hotLeadCallConfigOf, maskPhone, type HotLeadCallConfig } from '../hotLeadCallConfig';
 import { recordVendorUsage } from '../usageRecorderService';
+import { getAllocatedRate, getRecordingUnit } from '../../utils/vendorRateCard';
+import { isRecord } from '../leadNotificationAttribution';
 import { getVoiceProvider, VoiceCallError } from './voiceProvider';
 import { isConditionalFailure, unchangedSince } from './setupWrites';
 
@@ -9,9 +11,66 @@ import { isConditionalFailure, unchangedSince } from './setupWrites';
  *
  * Buying and releasing are non-idempotent account changes, so every path that can leave a number billed
  * but unrecorded ("orphan") is either compensated (released again) or logged for ops with the number SID.
- * First month's rent is metered at purchase. RECURRING rent is not: that needs a scheduled job that meters
- * `twilio:number:<sid>:<YYYY-MM>` each month for every stored twilioNumberSid (follow-up, not built here).
+ * Rent is metered for EVERY successful purchase, including one that is released again straight away (Twilio
+ * has already billed it); the key is idempotent per sid and month. RECURRING rent is not metered: that needs
+ * a scheduled job that meters `twilio:number:<sid>:<YYYY-MM>` each month for every stored twilioNumberSid
+ * (follow-up, not built here).
+ *
+ * Cost control: before any purchase, a reservation is written to the org attribute `hotLeadCallProvisioning`
+ * (same system-managed family as hotLeadCallVerification), conditional on that attribute AND hotLeadCall being
+ * unchanged since they were read. That makes the one-number cap atomic (parallel provisions cannot both reach
+ * Twilio) and caps purchases at 2 per org per rolling 24h. The history survives success and release, so a
+ * release/provision loop is bounded (~2 numbers/day/org). A reservation whose purchase then fails still counts.
+ * Releases are reserved the same way so a loop cannot hammer Twilio.
+ *
+ * `confirm: true` on the tool is advisory (the model controls it); these caps are the real control. A
+ * human-approval gate (approval deck) for provision/release is a recommended follow-up: the existing
+ * mechanism is Meta-write specific (digest manifests halted inside agentModeService).
  */
+
+const DAY_MS = 24 * 60 * 60_000;
+const MAX_PURCHASES_PER_DAY = 2;
+const MAX_RELEASES_PER_DAY = 6;
+
+export interface HotLeadCallProvisioning {
+  /** Epoch ms of each purchase reservation in the last 24h. */
+  purchases: number[];
+  /** Epoch ms of each release reservation in the last 24h. */
+  releases: number[];
+}
+
+const isEpochList = (v: unknown): v is number[] => Array.isArray(v) && v.every(t => typeof t === 'number' && Number.isFinite(t) && t > 0);
+
+/** Absent is an empty history; present-but-malformed is null, and callers fail closed on it (this guards money). */
+function provisioningOf(raw: unknown): HotLeadCallProvisioning | null {
+  if (raw === undefined) return { purchases: [], releases: [] };
+  return isRecord(raw) && isEpochList(raw.purchases) && isEpochList(raw.releases) ? { purchases: raw.purchases, releases: raw.releases } : null;
+}
+
+/** Writes the reservation; the conditional write is what makes the caps race-free. */
+async function reserve(org: Organization, kind: 'purchases' | 'releases', max: number, reads: Record<string, unknown>): Promise<void> {
+  const history = provisioningOf(org.hotLeadCallProvisioning);
+  if (!history) throw new Error('Stored number purchase history is invalid. Contact support.');
+  const now = Date.now();
+  const recent = history[kind].filter(t => now - t < DAY_MS);
+  if (recent.length >= max) {
+    throw new Error(`The limit of ${max} number ${kind === 'purchases' ? 'purchases' : 'releases'} per day was reached. Try again tomorrow.`);
+  }
+  try {
+    await orgDb.updateOrg(org.orgId, { hotLeadCallProvisioning: { ...history, [kind]: [...recent, now] } }, {
+      condition: unchangedSince({ hotLeadCallProvisioning: org.hotLeadCallProvisioning, ...reads }),
+    });
+  } catch (err) {
+    if (isConditionalFailure(err)) throw new Error('Another change to the caller number is in progress. Wait a moment and try again.');
+    throw err;
+  }
+}
+
+/** Live card price for messages, never a number typed into this file. */
+export function monthlyRentText(): string {
+  const rent = getAllocatedRate('twilio', 'number_monthly_rent');
+  return rent === null ? 'a monthly fee' : `$${rent.toFixed(2)} per month`;
+}
 
 const orphanLog = (orgId: string, sid: string, why: string) =>
   console.error(`[hotLeadCall] ORPHAN number: org ${orgId} sid ${sid} (${why}); release it in the Twilio console`);
@@ -30,10 +89,23 @@ async function discard(orgId: string, sid: string, why: string): Promise<boolean
 /** Whether the stored org now holds this number sid: how an ambiguous write failure is told from a lost one. */
 async function persisted(orgId: string, sid: string): Promise<boolean | 'unreadable'> {
   try {
-    return (await orgDb.getOrgById(orgId))?.hotLeadCall?.twilioNumberSid === sid;
+    return (await orgDb.getOrgById(orgId, undefined, true))?.hotLeadCall?.twilioNumberSid === sid;
   } catch {
     return 'unreadable';
   }
+}
+
+/** Billed the moment the number was bought, so metered before anything that can fail or discard it. */
+async function meterRent(userId: string, sid: string): Promise<void> {
+  const unit = getRecordingUnit('twilio', 'number_monthly_rent');
+  if (!unit) {
+    console.error('[hotLeadCall] number rent not metered: twilio number_monthly_rent is missing from the rate card');
+    return;
+  }
+  await recordVendorUsage({
+    userId, provider: 'twilio', operation: 'number_monthly_rent', feature: 'hot_lead_call', unit, quantity: 1,
+    rateKey: 'number_monthly_rent', idempotencyKey: `twilio:number:${sid}:${new Date().toISOString().slice(0, 7)}`,
+  });
 }
 
 export async function provisionNumber(p: { org: Organization; config: HotLeadCallConfig; userId: string; areaCode?: string }) {
@@ -41,6 +113,8 @@ export async function provisionNumber(p: { org: Organization; config: HotLeadCal
   if (config.twilioNumber || config.twilioNumberSid) {
     throw new Error('This organization already has a caller number. Release it first if you need a different one.');
   }
+
+  await reserve(org, 'purchases', MAX_PURCHASES_PER_DAY, { hotLeadCall: org.hotLeadCall });
 
   let bought: { numberSid: string; phoneNumber: string };
   try {
@@ -52,6 +126,8 @@ export async function provisionNumber(p: { org: Organization; config: HotLeadCal
     console.error(`[hotLeadCall] ORPHAN RISK: buyNumber outcome unknown for org ${org.orgId}; check the Twilio console for a number not recorded here`);
     throw new Error('The phone provider did not confirm whether a number was bought, so one may have been bought and billed. Do not retry; contact support.');
   }
+
+  await meterRent(p.userId, bought.numberSid);
 
   const next = hotLeadCallConfigOf({ ...config, twilioNumber: bought.phoneNumber, twilioNumberSid: bought.numberSid });
   if (!next) {
@@ -78,17 +154,7 @@ export async function provisionNumber(p: { org: Organization; config: HotLeadCal
     }
   }
 
-  await recordVendorUsage({
-    userId: p.userId,
-    provider: 'twilio',
-    operation: 'number_monthly_rent',
-    feature: 'hot_lead_call',
-    unit: 'number_month',
-    quantity: 1,
-    rateKey: 'number_monthly_rent',
-    idempotencyKey: `twilio:number:${bought.numberSid}:${new Date().toISOString().slice(0, 7)}`,
-  });
-  return { callerNumber: maskPhone(next.twilioNumber ?? bought.phoneNumber), enabled: next.enabled, destinationVerified: !!next.destinationVerifiedAt };
+  return { callerNumber: maskPhone(bought.phoneNumber), enabled: next.enabled, destinationVerified: !!next.destinationVerifiedAt };
 }
 
 /** Writes `change(current)` over the freshest stored config, retrying once if a concurrent edit wins. */
@@ -113,6 +179,7 @@ export async function releaseNumber(p: { org: Organization; config: HotLeadCallC
   const { org, config } = p;
   const sid = config.twilioNumberSid;
   if (!config.twilioNumber && !sid) throw new Error('This organization has no caller number to release.');
+  await reserve(org, 'releases', MAX_RELEASES_PER_DAY, { hotLeadCall: org.hotLeadCall });
 
   // Calling goes off before the number is touched, so no call can start from a number being released.
   if (config.enabled) await rewriteConfig(org.orgId, c => ({ ...c, enabled: false }), org);
