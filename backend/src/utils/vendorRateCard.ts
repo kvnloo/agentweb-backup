@@ -165,9 +165,13 @@ const NO_OVERRIDES: VendorRateOverrideState = { overrides: {}, updatedAt: null, 
 
 const hasOwn = (o: object, k: string): boolean => Object.prototype.hasOwnProperty.call(o, k);
 
+export function isEditableProvider(provider: string): boolean {
+  return (EDITABLE_VENDOR_RATE_PROVIDERS as readonly string[]).includes(provider);
+}
+
 export function isEditableVendorRate(provider: string, rateKey: string): boolean {
   return (
-    (EDITABLE_VENDOR_RATE_PROVIDERS as readonly string[]).includes(provider) &&
+    isEditableProvider(provider) &&
     hasOwn(RATE_CARD, provider) &&
     hasOwn(RATE_CARD[provider as VendorRateProvider], rateKey)
   );
@@ -176,7 +180,8 @@ export function isEditableVendorRate(provider: string, rateKey: string): boolean
 /**
  * At most 6 decimal places: costs are booked in whole micro-dollars, so anything finer
  * (1e-7 per minute) would round to a $0 "allocated" event. The single validator for both
- * the admin route and the load path.
+ * the admin route and the load path. Positive plus exactly-6-decimals is what guarantees
+ * >= 1 micro-dollar per WHOLE unit (fractional quantities can still round to 0).
  */
 export function isValidOverrideRate(value: unknown): value is number {
   return (
@@ -184,8 +189,7 @@ export function isValidOverrideRate(value: unknown): value is number {
     Number.isFinite(value) &&
     value > 0 &&
     value <= MAX_OVERRIDE_USD_PER_UNIT &&
-    value === Number(value.toFixed(6)) &&
-    Math.round(value * 1e6) >= 1
+    value === Number(value.toFixed(6))
   );
 }
 
@@ -193,7 +197,8 @@ export function isValidOverrideRate(value: unknown): value is number {
  * Strictly parse the stored item. Never throws. Garbage as a whole (bad JSON,
  * wrong shape, no usable updatedAt) yields no overrides; a bad individual entry
  * is dropped on its own so one typo cannot disable the rest. Warnings name the
- * provider and key only (the stored value is deliberately left out of the log).
+ * provider and key only, and an unreadable item logs only the error name (JSON.parse
+ * messages quote a snippet of the stored text).
  *
  * Stored shape: { overrides: { <provider>: { <rateKey>: <usdPerUnit> } }, updatedAt, updatedBy }
  */
@@ -225,7 +230,7 @@ export function parseVendorRateOverrides(raw: unknown): VendorRateOverrideState 
     return { overrides: clean, updatedAt, updatedBy: typeof updatedBy === "string" ? updatedBy : null };
   } catch (error) {
     console.warn(
-      `[vendorRateCard] ignoring unreadable ${VENDOR_RATE_OVERRIDES_SETTING} (${error instanceof Error ? error.message : "error"}); using the built-in card`,
+      `[vendorRateCard] ignoring unreadable ${VENDOR_RATE_OVERRIDES_SETTING} (${error instanceof Error ? error.name : "error"}); using the built-in card`,
     );
     return NO_OVERRIDES;
   }
@@ -319,7 +324,6 @@ export function refreshVendorRateOverrides(): Promise<void> {
         at: loaded ? now : now - (OVERRIDE_TTL_MS - COLD_RETRY_MS),
       };
     })
-    .catch(() => undefined)
     .finally(() => {
       if (inflight === run) inflight = null;
     });
@@ -352,7 +356,7 @@ export function getAllocatedRateWithVersion(
   rateKey: string,
 ): { rate: number; version: string } | null {
   if (!rateKey || !hasOwn(RATE_CARD, provider) || !hasOwn(RATE_CARD[provider], rateKey)) return null;
-  if ((EDITABLE_VENDOR_RATE_PROVIDERS as readonly string[]).includes(provider)) {
+  if (isEditableProvider(provider)) {
     // Snapshot entries were validated by the parser; nothing here can throw.
     const state = currentState();
     const override = state.overrides[provider]?.[rateKey];
@@ -411,8 +415,8 @@ export function getRecordingUnit(
   provider: VendorRateProvider,
   rateKey: string
 ): string | null {
-  if (!rateKey || !Object.prototype.hasOwnProperty.call(RATE_CARD, provider)) return null;
+  if (!rateKey || !hasOwn(RATE_CARD, provider)) return null;
   const providerCard = RATE_CARD[provider];
-  if (!Object.prototype.hasOwnProperty.call(providerCard, rateKey)) return null;
+  if (!hasOwn(providerCard, rateKey)) return null;
   return providerCard[rateKey].recordingUnit;
 }

@@ -11,7 +11,9 @@
  *
  * No durable audit history by decision: the applied rate is derivable from an event's
  * costMicroUsd / quantity (rates have at most 6 decimals, see isValidOverrideRate), and each
- * change is logged with the admin id and old/new value.
+ * change is logged with the admin id and old/new value. The rate guarantees >= 1 micro-dollar
+ * per WHOLE unit; fractional quantities can still round to 0, and Twilio recording uses whole
+ * billable minutes.
  */
 
 import express, { Response } from "express";
@@ -21,6 +23,7 @@ import { AuthRequest } from "../types/express";
 import { Setting, settingsService } from "../services/settingsService";
 import {
   EDITABLE_VENDOR_RATE_PROVIDERS,
+  isEditableProvider,
   MAX_OVERRIDE_USD_PER_UNIT,
   VENDOR_RATE_OVERRIDES_SETTING,
   VendorRateOverrideState,
@@ -60,7 +63,7 @@ function parseBody(body: unknown): { provider: VendorRateProvider; key: string; 
   if (typeof provider !== "string" || typeof key !== "string") {
     throw new ValidationError("provider and key must be strings");
   }
-  if (!(EDITABLE_VENDOR_RATE_PROVIDERS as readonly string[]).includes(provider)) {
+  if (!isEditableProvider(provider)) {
     throw new ValidationError(`Provider "${provider}" is not editable; editable: ${EDITABLE_VENDOR_RATE_PROVIDERS.join(", ")}`);
   }
   if (!isEditableVendorRate(provider, key)) throw new ValidationError(`Unknown rate key "${key}" for ${provider}`);

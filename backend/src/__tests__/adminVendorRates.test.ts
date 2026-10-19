@@ -86,6 +86,13 @@ describe('GET /vendor-rates', () => {
     expect(res.body.rates[0]).toMatchObject({ overrideUsdPerUnit: 0.02, effectiveUsdPerUnit: 0.02, defaultUsdPerUnit: 0.014 });
   });
 
+  it('GET after the last override was removed still shows who and when', async () => {
+    mockGet.mockResolvedValue(row({}, '2026-11-03T00:00:00.000Z'));
+    const res = await as(request(app).get(URL));
+    expect(res.body).toMatchObject({ version: VENDOR_RATE_CARD_VERSION, updatedAt: '2026-11-03T00:00:00.000Z', updatedBy: 'admin-1' });
+    expect(res.body.rates[0].overrideUsdPerUnit).toBeNull();
+  });
+
   it('500s with { error } when the read fails', async () => {
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
     mockGet.mockRejectedValue(new Error('boom'));
@@ -122,7 +129,7 @@ describe('PUT /vendor-rates validation', () => {
     expect(mockIfMatches).not.toHaveBeenCalled();
   });
 
-  it('rejects non-finite numbers (JSON null-ish / huge exponents)', async () => {
+  it('rejects an out-of-range exponent (1e999)', async () => {
     const res = await as(request(app).put(URL).set('Content-Type', 'application/json'))
       .send('{"provider":"twilio","key":"voice_minute_outbound","usdPerUnit":1e999}');
     expect(res.status).toBe(400);
@@ -186,13 +193,6 @@ describe('PUT /vendor-rates writes', () => {
     expect(res.status).toBe(200);
     const delays = timeouts.mock.calls.map((c) => c[1]).filter((d): d is number => typeof d === 'number' && d >= 20 && d <= 80);
     expect(delays).toHaveLength(1);
-  });
-
-  it('GET after the last override was removed still shows who and when', async () => {
-    mockGet.mockResolvedValue(row({}, '2026-11-03T00:00:00.000Z'));
-    const res = await as(request(app).get(URL));
-    expect(res.body).toMatchObject({ version: VENDOR_RATE_CARD_VERSION, updatedAt: '2026-11-03T00:00:00.000Z', updatedBy: 'admin-1' });
-    expect(res.body.rates[0].overrideUsdPerUnit).toBeNull();
   });
 
   it('retries on a lost race and re-merges from the fresh read', async () => {

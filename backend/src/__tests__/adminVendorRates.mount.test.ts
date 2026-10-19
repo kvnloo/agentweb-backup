@@ -41,8 +41,19 @@ jest.mock('../utils/secretsManager', () => ({
   getSecret: jest.fn().mockResolvedValue('mock-secret'),
 }));
 
+import jwt from 'jsonwebtoken';
 import request from 'supertest';
 import app from '../app';
+
+const mockGetSetting = jest.fn();
+jest.mock('../services/settingsService', () => ({
+  ...jest.requireActual('../services/settingsService'),
+  settingsService: { getSetting: (...a: unknown[]) => mockGetSetting(...a) },
+}));
+
+// Service tokens carry their isAdmin claim directly, so no user lookup is needed.
+const token = (isAdmin: boolean) =>
+  jwt.sign({ userId: 'u1', email: 'u1@example.test', isAdmin, _svc: true }, process.env.JWT_SECRET!);
 
 describe('/api/admin/vendor-rates — real app mount', () => {
   it('the router is mounted under /api/admin with GET and PUT', () => {
@@ -58,5 +69,18 @@ describe('/api/admin/vendor-rates — real app mount', () => {
     const res = await request(app)[m]('/api/admin/vendor-rates').send({});
     expect(res.status).toBe(401);
     expect(res.body.message).toBe('No token provided');
+  });
+
+  it('an authenticated non-admin gets 403', async () => {
+    const res = await request(app).get('/api/admin/vendor-rates').set('Authorization', `Bearer ${token(false)}`);
+    expect(res.status).toBe(403);
+  });
+
+  it('an admin reaches the route at exactly /api/admin/vendor-rates', async () => {
+    // A wrong mount prefix would 404 here (non-admins and anonymous callers cannot tell).
+    mockGetSetting.mockResolvedValue(null);
+    const res = await request(app).get('/api/admin/vendor-rates').set('Authorization', `Bearer ${token(true)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.editableProviders).toEqual(['twilio']);
   });
 });

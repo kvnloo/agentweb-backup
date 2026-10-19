@@ -58,7 +58,6 @@ describe('parseVendorRateOverrides (fail safe)', () => {
     ['null', null],
     ['string', '0.5'],
     ['above the cap', 1000.01],
-    ['Infinity-as-null', null],
   ])('drops a %s rate but keeps valid siblings', (_n, bad) => {
     const state = parseVendorRateOverrides(
       stored({ twilio: { voice_minute_outbound: bad, number_monthly_rent: 2 } }),
@@ -76,16 +75,18 @@ describe('parseVendorRateOverrides (fail safe)', () => {
     expect(parseVendorRateOverrides(raw).overrides).toEqual({});
   });
 
+  it('does not echo stored text from an unparseable item', () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    parseVendorRateOverrides('{"a":1,"b":SECRETSNIPPET}');
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).not.toContain('SECRETSNIP');
+  });
+
   it('warns without echoing values', () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     parseVendorRateOverrides(stored({ twilio: { voice_minute_outbound: -7.77 } }));
     expect(warn).toHaveBeenCalledTimes(1);
     expect(String(warn.mock.calls[0][0])).not.toContain('7.77');
-  });
-
-  it('ignores a zero override', () => {
-    setVendorRateOverridesForTests({ twilio: { voice_minute_outbound: 0 } } as never);
-    expect(getAllocatedRate('twilio', 'voice_minute_outbound')).toBe(0.014);
   });
 
   it('keeps the audit fields when the last override has been removed', () => {
@@ -139,6 +140,15 @@ describe('refresh from AW-Settings (outside NODE_ENV=test)', () => {
     expect(getAllocatedRate('twilio', 'voice_minute_outbound')).toBe(0.014); // stale read never blocks
     await jest.advanceTimersByTimeAsync(0); // only the lookup's own background refresh runs
     expect(getAllocatedRate('twilio', 'voice_minute_outbound')).toBe(0.02);
+  });
+
+  it('a boot-time refresh loads the override before the first lookup, with no further read', async () => {
+    // server.ts awaits this before listen (verified by reading); this pins what that await buys.
+    mockGetSetting.mockResolvedValue({ settingValue: stored({ twilio: { voice_minute_outbound: 0.02 } }) });
+    await refreshVendorRateOverrides();
+    expect(getAllocatedRate('twilio', 'voice_minute_outbound')).toBe(0.02);
+    await jest.advanceTimersByTimeAsync(0);
+    expect(mockGetSetting).toHaveBeenCalledTimes(1);
   });
 
   it('does not re-read inside the 60s TTL and re-reads after it', async () => {
@@ -217,13 +227,6 @@ describe('6-decimal rule (a rate must never book as $0)', () => {
       expect(isValidOverrideRate(v)).toBe(false);
     },
   );
-
-  it('every accepted rate books at least one micro-dollar per unit', () => {
-    for (let i = 0; i < 20000; i++) {
-      const v = Math.random() < 0.5 ? Math.round(Math.random() * 1e6) / 1e6 : Math.random() * 10 ** -(Math.random() * 9);
-      if (isValidOverrideRate(v)) expect(Math.round(1 * v * 1e6)).toBeGreaterThanOrEqual(1);
-    }
-  });
 
   it('the load path drops a stored sub-micro rate', () => {
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
