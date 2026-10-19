@@ -14,11 +14,11 @@
 export const CONNECTING_COPY = 'Connecting you now.';
 export const NO_INPUT_COPY = 'We did not get a response. Goodbye.';
 export const LEAD_UNREACHABLE_COPY = 'Sorry, we could not reach them. Goodbye.';
-export const ownerPromptCopy = (announcedName: string): string => `New lead from ${announcedName}. Press 1 to connect to them now.`;
+const ownerPromptCopy = (announcedName: string): string => `New lead from ${announcedName}. Press 1 to connect to them now.`;
 
 const GATHER_TIMEOUT_SECONDS = 8;
 /** Ring time for the lead; Twilio may add a few seconds of buffer. */
-export const LEAD_DIAL_TIMEOUT_SECONDS = 25;
+const LEAD_DIAL_TIMEOUT_SECONDS = 25;
 
 const E164 = /^\+[1-9]\d{6,14}$/;
 // XML 1.0 forbids most control characters even when escaped; drop them rather than emit a document Twilio rejects.
