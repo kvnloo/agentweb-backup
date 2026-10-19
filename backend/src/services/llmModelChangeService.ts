@@ -38,6 +38,7 @@ import {
   type ModelChangeScope,
 } from "./llmModelChangeAuditDb";
 import { recordUsageTelemetry, USAGE_TELEMETRY_EVENTS } from "./llmUsageTelemetry";
+import { modelAccess, systemModelCheck } from "./agentMode/modelAccessInstance";
 
 export class ModelChangeNotFoundError extends Error {
   constructor(message = "Not found") {
@@ -249,6 +250,11 @@ export async function applyModelChange(
 
   if (!catalog.has(input.toModel)) {
     throw new ModelNotAvailableError("That model is not available for this change");
+  }
+  // ENG-669: the schedule runs under its OWNER's plan, so a recommendation outside that plan
+  // would only make the next run fail. Switch off => no read, unchanged.
+  if ((await modelAccess.filterAllowedModels(schedule.userId, [input.toModel], systemModelCheck(null))).length === 0) {
+    throw new ModelNotAvailableError("That model is not included in this account's plan");
   }
 
   // NULL means the schedule inherited the platform default rather than pinning a

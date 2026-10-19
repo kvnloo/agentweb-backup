@@ -15,6 +15,13 @@ export interface SubscriptionType {
   allowedSkills: string[]; // Array of skill IDs (e.g., ["skill-uuid-1", "skill-uuid-2"]) or ["*"] for all
   allowedConnectedAccounts?: string[]; // Array of platform types (e.g., ["linkedin", "gmail"]) or ["*"] for all; undefined = all
   allowedFeatures?: string[]; // Stable product feature IDs or ["*"]; undefined = legacy row (all current features)
+  /**
+   * ENG-669: chat models this tier may select (canonical registry ids), or ["*"] for every non-admin catalog model.
+   * The reserved id "agentweb-model" names the future AgentWeb router and matches nothing runnable until it exists.
+   * undefined = every model. Enforced only while AW-Settings `model_tier_allowlist_enabled` is 'true'
+   * (services/agentMode/modelAccess.ts); system-chosen models (configured defaults) are always allowed.
+   */
+  allowedModels?: string[];
   allowedFunctionCalls?: string[]; // Deprecated — kept for on-read migration from old configs
   /** ENG-1978, observation only, never persisted: true when the stored row carried NO
    *  `allowedSkills` and it was defaulted to ["*"] on read. Set by getSubscriptionTypeConfig so

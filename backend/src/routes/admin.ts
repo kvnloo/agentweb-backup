@@ -5107,6 +5107,9 @@ router.get("/subscription-types", async (req, res) => {
         ...(type.seatPricing ? { seatPricing: type.seatPricing } : {}),
         // ENG-668: round-trip it, or the admin UI's next save (which posts what this returned) drops it.
         ...(type.paygOverage ? { paygOverage: type.paygOverage } : {}),
+        // ENG-669: returned as stored ("*" is NOT expanded: it must keep meaning "every model", including
+        // models added later). Absent stays absent (= every model), so a save round-trips it unchanged.
+        ...(Array.isArray(type.allowedModels) ? { allowedModels: type.allowedModels } : {}),
       };
     }));
 
@@ -5173,6 +5176,40 @@ async function findStrandedTiers(nextTierNames: string[]): Promise<Array<{ name:
       ).length,
     }))
     .filter((t) => t.userCount > 0);
+}
+
+/**
+ * ENG-669: a tier's `allowedModels` as it is stored: canonical registry ids (legacy aliases resolved), de-duplicated,
+ * in the admin's order; `"*"` alone when it is present (every model); the reserved `"agentweb-model"` kept as is.
+ * Throws (-> 400, nothing saved) when the value is not a list of strings or names an id that is not served.
+ */
+async function canonicalizeTierAllowedModels(tierName: string, raw: unknown): Promise<string[]> {
+  if (!Array.isArray(raw) || raw.some((entry) => typeof entry !== 'string')) {
+    throw new Error(`${tierName} allowedModels must be an array of model ids`);
+  }
+  const { ALL_MODELS, AGENTWEB_MODEL_ID } = await import('../services/agentMode/modelAccess');
+  const { agentModeService } = await import('../services/agentModeService');
+  const ids: string[] = [];
+  const unknown: string[] = [];
+  for (const entry of raw as string[]) {
+    const id = entry.trim();
+    if (!id) continue;
+    if (id === ALL_MODELS) return [ALL_MODELS];
+    if (id === AGENTWEB_MODEL_ID) {
+      if (!ids.includes(id)) ids.push(id);
+      continue;
+    }
+    const resolution = agentModeService.resolveGenerationModel(id);
+    if (resolution.fellBack) {
+      unknown.push(id);
+      continue;
+    }
+    if (!ids.includes(resolution.model)) ids.push(resolution.model);
+  }
+  if (unknown.length > 0) {
+    throw new Error(`${tierName} allowedModels: unknown model id${unknown.length === 1 ? '' : 's'} ${unknown.map((id) => `'${id}'`).join(', ')}`);
+  }
+  return ids;
 }
 
 router.post("/subscription-types", async (req, res) => {
@@ -5360,6 +5397,12 @@ router.post("/subscription-types", async (req, res) => {
         ? type.hiddenPages.filter((p: any) => typeof p === 'string')
         : [];
 
+      // ENG-669: this object REPLACES the stored tier, so an omitted allowedModels must stay omitted
+      // (= every model), never be materialised or dropped.
+      const normalizedAllowedModels = type.allowedModels != null
+        ? await canonicalizeTierAllowedModels(type.name, type.allowedModels)
+        : undefined;
+
       return {
         name: type.name,
         allowedPages: normalizedPages,
@@ -5373,6 +5416,7 @@ router.post("/subscription-types", async (req, res) => {
         ...(normalizedLlmUsageTopUp ? { llmUsageTopUp: normalizedLlmUsageTopUp } : {}),
         ...(normalizedSeatPricing ? { seatPricing: normalizedSeatPricing } : {}),
         ...(normalizedPaygOverage ? { paygOverage: normalizedPaygOverage } : {}),
+        ...(normalizedAllowedModels ? { allowedModels: normalizedAllowedModels } : {}),
       };
     }));
 

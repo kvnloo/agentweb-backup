@@ -27,6 +27,7 @@
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
 import { runwayAllowance } from "./llmUsageRunwayResolverService";
 import { contentAuthorityOver } from "./orgContentAuthority";
+import { modelAccess, systemModelCheck } from "./agentMode/modelAccessInstance";
 import {
   readBilledLedgerRows,
   resolvePooledLedgerUserIds,
@@ -551,7 +552,13 @@ export async function resolveUsageDrivers(
       ? await agentModeService.getSupportedModels(false)
       : [],
   );
-  const catalog = (usage.policy.optimizedModelIds || []).filter((m) => supported.has(m));
+  // ENG-669: and only what the account's plan includes (switch off => unchanged, nothing read):
+  // recommending a model the tier allowlist then refuses would only break the work it targets.
+  const catalog = await modelAccess.filterAllowedModels(
+    userId,
+    (usage.policy.optimizedModelIds || []).filter((m) => supported.has(m)),
+    systemModelCheck(null),
+  );
 
   /**
    * The recommendation's confidence, capped by the forecast's own (AC6).

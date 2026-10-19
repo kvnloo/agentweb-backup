@@ -252,6 +252,7 @@ import { extractGeneratedImageFilenames } from './shared/generatedAssets';
 import { currentRunFunding } from '../../services/funding/runFunding';
 import { isNonConsumableRequiredFunctionCall } from '../../services/agentMode/workPlanRequiredCallsPolicy';
 import { resolvePlanLaunchModel, isUserAdminSafe, type ModelPinRegistry } from '../../services/agentMode/modelPin';
+import { isSystemAuthoredPlan } from '../../services/agentMode/modelAccess';
 import { assertSequentialStepCounts } from '../../services/workPlanSteps';
 import { anyStepCarriesModel, isStepModelUnavailableError, modelBoundToStep, resolvePlanStepModelsForLaunch } from '../../services/agentMode/workPlanStepModels';
 import { buildAnonymousModelUnavailableBody, buildAnonymousPlanModelToolMessage, buildModelUnavailableBody, buildPlanModelToolMessage, isModelUnavailableError, MODEL_SAVE_FAILED_MESSAGE } from '../../services/agentMode/modelUnavailable';
@@ -536,14 +537,18 @@ export async function applyPredefinedWorkPlan(
       && await (await import('../../services/agentMode/workPlanStepModelsInstance')).workPlanStepModels.shouldHonor();
     let planPinnedModel: string | undefined;
     let stepModelIds = new Map<number, string>();
+    // ENG-669: an admin-authored plan's pins are AgentWeb's choice (no tier check); any other plan's pins must be in
+    // the launching (session-owner) user's plan.
+    const tierOwner = isSystemAuthoredPlan(predefinedPlan) ? undefined : (userId || undefined);
     try {
       planPinnedModel = await resolvePlanLaunchModel(
         modelRegistry,
         () => isUserAdminSafe(userId),
         predefinedPlan.defaultModel,
+        tierOwner,
       );
       if (stepModelsEnabled) {
-        stepModelIds = await resolvePlanStepModelsForLaunch(modelRegistry, () => isUserAdminSafe(userId), predefinedPlan.steps || []);
+        stepModelIds = await resolvePlanStepModelsForLaunch(modelRegistry, () => isUserAdminSafe(userId), predefinedPlan.steps || [], tierOwner);
       }
     } catch (launchModelError) {
       const stepError = isStepModelUnavailableError(launchModelError) ? launchModelError : undefined;

@@ -247,11 +247,14 @@ export function modelBoundToStep(
  * `model_unavailable` 422 body is returned, extended with the offending `stepCount`.
  *
  * `storedSteps` omitted (create, or the plan's launcher scope widened) = every model is validated as new.
+ * ENG-669: `tierOwnerUserId` = the plan owner whose tier must include a new/changed step model (omitted for an
+ * admin-authored plan).
  */
 export async function checkPlanStepModelsWrite(
   isAdmin: () => Promise<boolean>,
   steps: ReadonlyArray<StepLike>,
   storedSteps?: ReadonlyArray<StepLike>,
+  tierOwnerUserId?: string,
 ): Promise<{ ok: true } | { ok: false; body: ModelUnavailableBody & { stepCount: number } }> {
   const stored = storedSteps ? [...storedSteps] : [];
   const claimed = new Set<StepLike>();
@@ -274,7 +277,7 @@ export async function checkPlanStepModelsWrite(
   for (let i = 0; i < steps.length; i++) {
     const model = stepModelOf(steps[i]);
     if (!model) continue;
-    const check = await checkPlanDefaultModelWrite(isAdmin, model, stepModelOf(counterpartOf.get(i)));
+    const check = await checkPlanDefaultModelWrite(isAdmin, model, stepModelOf(counterpartOf.get(i)), tierOwnerUserId);
     if (!check.ok) return { ok: false, body: { ...check.body, stepCount: stepNumber(steps[i], i) } };
   }
   return { ok: true };
@@ -314,11 +317,13 @@ export class StepModelUnavailableError extends Error {
  * Launch-time validation of ALL steps' models, up front and before any state is written. Each model must be served
  * and selectable by the LAUNCHING user (resolvePlanLaunchModel: no silent swap). Returns the canonical id per step
  * (keyed by index) so a launch stores canonical ids; throws StepModelUnavailableError for the first bad step.
+ * ENG-669: `tierOwnerUserId` = the launching user, for a plan that is NOT admin-authored.
  */
 export async function resolvePlanStepModelsForLaunch(
   registry: ModelPinRegistry,
   isAdmin: () => Promise<boolean>,
   steps: ReadonlyArray<StepLike>,
+  tierOwnerUserId?: string,
 ): Promise<Map<number, string>> {
   const canonical = new Map<number, string>();
   for (let i = 0; i < steps.length; i++) {
@@ -327,7 +332,7 @@ export async function resolvePlanStepModelsForLaunch(
     const raw = steps[i]?.model;
     if (raw === undefined || raw === null || (typeof raw === 'string' && !raw.trim())) continue;
     try {
-      const resolved = await resolvePlanLaunchModel(registry, isAdmin, raw);
+      const resolved = await resolvePlanLaunchModel(registry, isAdmin, raw, tierOwnerUserId);
       if (resolved) canonical.set(i, resolved);
     } catch (error) {
       if (isModelUnavailableError(error)) throw new StepModelUnavailableError(stepNumber(steps[i], i), error);
@@ -349,8 +354,9 @@ export function isStepModelUnavailableError(error: unknown): error is StepModelU
   return error instanceof StepModelUnavailableError;
 }
 
-/** Text shown in the chat when a plan is paused because the current step's model is no longer served. */
-export function buildStepModelPausedMessage(stepCount: number, modelLabel: string): string {
-  return `Step ${stepCount} uses ${modelLabel}, which is no longer available. Choose another model in the model picker and send again to resume this step. `
+/** Text shown in the chat when a plan is paused because the current step's model is no longer served (or, ENG-669, not in the plan). */
+export function buildStepModelPausedMessage(stepCount: number, modelLabel: string, reason?: string): string {
+  const why = reason === 'not_in_plan' ? "which isn't included in your plan" : 'which is no longer available';
+  return `Step ${stepCount} uses ${modelLabel}, ${why}. Choose another model in the model picker and send again to resume this step. `
     + 'The plan is paused and nothing was sent to a different model.';
 }

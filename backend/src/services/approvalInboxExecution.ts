@@ -1,6 +1,7 @@
 import { chatbotDb } from './chatbotService';
 import { approvalInboxService, type ApprovalDecision } from './approvalInboxService';
 import { agentModeService } from './agentModeService';
+import { isModelUnavailableError } from './agentMode/modelUnavailable';
 // A service importing from the controller layer is an already-established
 // pattern in this codebase (emmaEmailService.ts does the same), not a new
 // direction — generateSessionResponse is the one place session-history
@@ -12,6 +13,7 @@ import { agentModeService } from './agentModeService';
 // concurrently-running user turn on the same session.
 import {
   generateSessionResponse,
+  modelUnavailableBody,
   tryClaimSessionGeneration,
   releaseSessionGeneration,
 } from '../controllers/agentModeController';
@@ -154,6 +156,15 @@ export async function resumeOriginSession(sessionId: string, messageContent: str
   } catch (err: any) {
     console.warn('[approval-inbox-execution] active resume failed, recording a passive note instead:', sessionId, err?.message || err);
     await recordPassiveSessionNote(sessionId, messageContent);
+    // ENG-669: the resume was refused because the session's model is outside the owner's plan. The
+    // note above is model-only context, so tell the user why Emma did not pick the work back up.
+    if (isModelUnavailableError(err)) {
+      await chatbotDb.addMessageToSession(sessionId, {
+        role: 'assistant',
+        content: modelUnavailableBody(err).error,
+        metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
+      }).catch((noteErr: any) => console.error('[approval-inbox-execution] failed to record the model refusal:', sessionId, noteErr?.message || noteErr));
+    }
   } finally {
     releaseSessionGeneration(sessionId);
   }

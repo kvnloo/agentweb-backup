@@ -20,6 +20,7 @@ import { getModelPrice } from '../utils/llmPricing';
 import { resolveOpenRouterUpstreamModelId } from '../utils/openRouterGatewayContract';
 import { LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
 import { modelCompareEntitlement } from '../services/agentMode/modelCompareEntitlement';
+import { getTierCompareBlock } from '../services/agentMode/modelAccessInstance';
 import { isCronEnabled } from '../utils/instanceState';
 import { resolveRunFunding, withRunFunding, type RunFunding } from '../services/funding/runFunding';
 import {
@@ -112,6 +113,7 @@ function compareDeps(): CompareDeps {
     isAcceptingWork: isCronEnabled,
     isFeatureEnabled: isModelCompareEnabled,
     isEntitled: (user) => modelCompareEntitlement.isEntitled(user),
+    getTierCompareBlock,
     getSession,
     checkUsage: (userId) => checkTokenUsage(userId),
     buildUsageBlock: (month, paygBlock) => buildUsageBlockCopy({ month, paygBlock }),

@@ -88,6 +88,7 @@ import {
 import { assertSequentialStepCounts } from '../services/workPlanSteps';
 import { validateModelPin, normalizeRequestedLlmModel, resolvePlanLaunchModel, canonicalPinId } from '../services/agentMode/modelPin';
 import { workPlanStepModels } from '../services/agentMode/workPlanStepModelsInstance';
+import { isSystemAuthoredPlan, modelAccess, systemModelCheck, type SystemModelSession } from '../services/agentMode/modelAccessInstance';
 import {
   anyStepCarriesModel,
   buildStepModelPausedMessage,
@@ -96,7 +97,7 @@ import {
   resolvePlanStepModelsForLaunch,
   stepModelOf,
 } from '../services/agentMode/workPlanStepModels';
-import { ModelUnavailableError, MODEL_SAVE_FAILED_MESSAGE, buildAnonymousModelUnavailableBody, buildModelUnavailableBody, isModelUnavailableError, sanitizeModelLabel } from '../services/agentMode/modelUnavailable';
+import { ModelUnavailableError, MODEL_SAVE_FAILED_MESSAGE, buildAnonymousModelUnavailableBody, buildModelUnavailableBody, describeModelUnavailableReason, isModelUnavailableError, sanitizeModelLabel, type ModelUnavailableAudience } from '../services/agentMode/modelUnavailable';
 import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
 // ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
 // on existing report/run envelopes. No surface parses or re-ranks on its own.
@@ -405,7 +406,16 @@ export async function resolveEffectiveModelForUser(input: {
   // True when there is NO explicit selection (unpinned schedule, session creation without
   // a requested model, a shared session with no stored model): the configured default
   // may then stand in as before. An explicit selection that cannot be served throws.
+  // It does NOT relax the tier allowlist (ENG-669): a stored model outside the owner's plan
+  // is refused, never corrected.
   allowSilentSwap?: boolean;
+  // ENG-669: the requested model is AgentWeb's choice, not the user's (an unpinned schedule's or
+  // a new session's configured default), so the tier allowlist does not apply to it.
+  systemModel?: boolean;
+  // ENG-669: the session the model runs in, so its system models (its kind's configured default,
+  // the pins of the admin-authored plan it was launched from) are recognised. Only read when the
+  // allowlist would otherwise refuse.
+  session?: SystemModelSession | null;
 }): Promise<EffectiveModelPolicyDecision> {
   const [usage, systemDefaultModel] = await Promise.all([
     getEffectiveLlmUsagePolicy(input.userId),
@@ -444,6 +454,29 @@ export async function resolveEffectiveModelForUser(input: {
     if (adminModelIds.includes(canonicalRequestedModel) && await isUserAdmin(input.userId)) {
       supportedModelIds = adminModelIds;
     }
+  }
+  // ENG-669: the owner's tier allowlist, on the requested AND the stored model, BEFORE the
+  // silent-swap branches below: a model outside the plan is refused (422 `not_in_plan`), never
+  // corrected to the default, so a grandfathered stored selection is not rewritten either. Only a
+  // model that would otherwise run is checked (unserved, live-voice and not-selectable ids keep
+  // their existing handling below), a paused account keeps its plain 'blocked' decision, and the
+  // configured default is never refused. Switch off => nothing is read.
+  if (
+    canonicalRequestedModel
+    && requestedResolution
+    && !requestedResolution.fellBack
+    && !input.systemModel
+    && usage.mode.usageMode !== 'paused'
+    && canonicalRequestedModel !== systemDefaultModel
+    && supportedModelIds.includes(canonicalRequestedModel)
+    && !(typeof agentModeService.isLiveModel === 'function' && agentModeService.isLiveModel(canonicalRequestedModel))
+  ) {
+    await modelAccess.assertModelAllowed({
+      ownerUserId: input.userId,
+      requestedModel: input.requestedModel as string,
+      canonicalModel: canonicalRequestedModel,
+      isSystemModel: systemModelCheck(input.session),
+    });
   }
   // FAIL-LOUD: an explicit selection that is not served must not be replaced by
   // the default (resolveGenerationModel's fallback would otherwise mask it as
@@ -528,6 +561,8 @@ async function buildUsagePausedBody(input: {
         requestedModel: input.requestedModel,
         backupModel: input.backupModel,
         backupSource: input.backupModel ? 'user' : null,
+        // ENG-669: this only stamps and echoes the refusal of a paused turn; nothing runs.
+        systemModel: true,
       }).catch((modelError) => {
         if (isModelUnavailableError(modelError)) return undefined;
         throw modelError;
@@ -565,12 +600,39 @@ async function deleteNewSessionBestEffort(sessionId: string): Promise<void> {
   }
 }
 
-/** The one 422 body for a ModelUnavailableError (display name from the registry when the id is one). */
-export function modelUnavailableBody(err: ModelUnavailableError) {
+/**
+ * The one 422 body for a ModelUnavailableError (display name from the registry when the id is one).
+ * `share_viewer`: an interactive-share / conversable visitor, who is not told the owner's plan (ENG-669).
+ */
+export function modelUnavailableBody(err: ModelUnavailableError, audience: ModelUnavailableAudience = 'owner') {
   const displayName = typeof agentModeService.getModelDisplayName === 'function'
     ? agentModeService.getModelDisplayName(err.requestedModel)
     : undefined;
-  return buildModelUnavailableBody(err, displayName);
+  return buildModelUnavailableBody(err, displayName, 'selection', audience);
+}
+
+/**
+ * ENG-669: the tier allowlist for a model that reaches generation (or storage) WITHOUT the resolver: the final
+ * gate in generateSessionResponse, the shared-turn pre-flight and the session-model PATCH routes. Same rule as
+ * the resolver: matched on the CANONICAL id against the OWNER's plan, system models pass, an unserved id is left
+ * to the existing handling. Throws ModelUnavailableError(`not_in_plan`). Switch off => returns before any read.
+ */
+async function assertModelInOwnerPlan(input: {
+  ownerUserId: string;
+  model: string | null | undefined;
+  session?: SystemModelSession | null;
+}): Promise<void> {
+  const model = typeof input.model === 'string' ? input.model.trim() : '';
+  if (!model || typeof agentModeService.resolveGenerationModel !== 'function') return;
+  if (!(await modelAccess.isEnabled())) return;
+  const resolution = agentModeService.resolveGenerationModel(model);
+  if (resolution.fellBack) return;
+  await modelAccess.assertModelAllowed({
+    ownerUserId: input.ownerUserId,
+    requestedModel: model,
+    canonicalModel: resolution.model,
+    isSystemModel: systemModelCheck(input.session),
+  });
 }
 
 /**
@@ -587,7 +649,9 @@ export function modelUnavailableBody(err: ModelUnavailableError) {
  */
 async function validateScheduleModelPin(userId: string, raw: unknown): Promise<string> {
   // Shared rule set (services/agentMode/modelPin.ts) - also used by Work Plan writes and launches.
-  return validateModelPin(agentModeService, () => isUserAdmin(userId), raw);
+  // ENG-669: `userId` is the schedule OWNER (every caller enforces ownership first), whose plan the
+  // pin runs under, so a pin outside that plan is refused now (422 not_in_plan), not at run time.
+  return validateModelPin(agentModeService, () => isUserAdmin(userId), raw, userId);
 }
 
 async function resolveScheduleBackup(input: {
@@ -2020,7 +2084,7 @@ type WorkPlanStepModelTurn =
   | { kind: 'unavailable'; stepCount: number; model: string; label: string; reason: string };
 
 async function resolveWorkPlanStepModelForTurn(
-  session: { userId: string; llmModel?: string; workPlan?: any },
+  session: { userId: string; llmModel?: string; workPlan?: any; sessionType?: string; portalType?: string },
   // `viewerIsOwner` false = an interactive-share viewer: their pick may run for the turn on a model-less step, but it
   // never rewrites the OWNER's stored step model (the viewer gets the pause; the owner resumes).
   options: { explicitPick?: string; viewerIsOwner?: boolean } = {},
@@ -2032,7 +2096,8 @@ async function resolveWorkPlanStepModelForTurn(
 
   const resolveHonored = async (model: string, stepCount: number): Promise<ResolvedStepDecision> => {
     // An explicit selection by a human: fail loud, never substitute.
-    const decision = await resolveEffectiveModelForUser({ userId: session.userId, requestedModel: model, allowSilentSwap: false });
+    // ENG-669: the session decides which step pins are system models (an admin-authored plan's).
+    const decision = await resolveEffectiveModelForUser({ userId: session.userId, requestedModel: model, allowSilentSwap: false, session });
     // Defensive: only an honored decision may run. (A paused account has no effective model; the callers' usage gates
     // answer that case before this point.)
     if (decision.modelSelection !== 'honored' || !decision.effectiveModel) {
@@ -2107,7 +2172,7 @@ async function pauseWorkPlanForUnavailableStepModel(
   turn: Extract<WorkPlanStepModelTurn, { kind: 'unavailable' }>,
   options: { emitToUser: boolean },
 ): Promise<{ content: string; message?: any }> {
-  const content = buildStepModelPausedMessage(turn.stepCount, turn.label);
+  const content = buildStepModelPausedMessage(turn.stepCount, turn.label, turn.reason);
   const session = await chatbotDb.getChatSession(sessionId);
   const last = session?.messages?.[session.messages.length - 1];
   const lastMeta = last?.metadata as any;
@@ -2136,6 +2201,8 @@ async function pauseWorkPlanForUnavailableStepModel(
       console.error(`AgentMode: failed to emit the step-model pause message for session ${sessionId}:`, emitErr);
     }
   }
+  // ENG-669: a step model outside the owner's plan is the plan limit working as configured, not a fault: no page.
+  if (turn.reason === 'not_in_plan') return { content, message };
   await sendAgentModeOncallAlert({
     subject: 'AgentMode: Work Plan paused - a step\'s model is no longer available',
     message:
@@ -2281,7 +2348,10 @@ async function scheduleAutoWorkPlanContinuation(
   let continuationModel = llmModel;
   if (currentSession?.workPlan) {
     try {
-      const stepTurn = await resolveWorkPlanStepModelForTurn({ userId: currentSession.userId, llmModel: currentSession.llmModel, workPlan: currentSession.workPlan });
+      const stepTurn = await resolveWorkPlanStepModelForTurn({
+        userId: currentSession.userId, llmModel: currentSession.llmModel, workPlan: currentSession.workPlan,
+        sessionType: currentSession.sessionType, portalType: currentSession.portalType,
+      });
       if (stepTurn.kind === 'unavailable') {
         await pauseWorkPlanForUnavailableStepModel(sessionId, userId, stepTurn, { emitToUser: true });
         autoContinuationSessions.delete(sessionId);
@@ -6896,14 +6966,20 @@ export async function runScheduledChat(
         backupModel: schedule.llmBackupModel,
         backupSource: schedule.llmBackupSource,
         allowSilentSwap: !schedulePin,
+        // ENG-669: an unpinned schedule runs the admin-configured scheduled default (a system
+        // model); a pin is the owner's choice and must be in the owner's plan.
+        systemModel: !schedulePin,
       });
     } catch (modelError) {
       if (!isModelUnavailableError(modelError)) throw modelError;
       const pinnedLabel = sanitizeModelLabel(modelError.requestedModel);
+      const reasonText = describeModelUnavailableReason(modelError.reason);
       console.error(
-        `runScheduledChat: schedule ${schedule.scheduleId} not run — pinned model "${pinnedLabel}" is ${modelError.reason === 'not_served' ? 'not served' : 'not selectable'}.`,
+        `runScheduledChat: schedule ${schedule.scheduleId} not run — pinned model "${pinnedLabel}" is ${reasonText}.`,
       );
-      void sendAgentModeOncallAlert({
+      // ENG-669: a pin outside the owner's plan is the plan limit working as configured, not a
+      // fault, so it fails the run visibly (below) without paging on-call.
+      if (modelError.reason !== 'not_in_plan') void sendAgentModeOncallAlert({
         subject: 'AgentMode: unsupported model pinned on a scheduled chat',
         message:
           `Schedule "${schedule.scheduleName}" (${schedule.scheduleId}) pins model "${pinnedLabel}", which is ` +
@@ -6923,7 +6999,9 @@ export async function runScheduledChat(
         runId: preGeneratedRunId || require('uuid').v4(),
         status: 'failure' as const,
         passed: false,
-        actualResponse: `model_unavailable: pinned model "${pinnedLabel}" is ${modelError.reason === 'not_served' ? 'not served' : 'not selectable'} — choose a served model for this schedule`,
+        actualResponse: modelError.reason === 'not_in_plan'
+          ? `model_unavailable: pinned model "${pinnedLabel}" is ${reasonText} — choose a model your plan includes for this schedule, or upgrade the plan`
+          : `model_unavailable: pinned model "${pinnedLabel}" is ${reasonText} — choose a served model for this schedule`,
         actualFunctionCalls: [],
         keywordMatches: [],
         keywordMisses: schedule.keywords || [],
@@ -8972,6 +9050,40 @@ async function updateGtmWorkItemStatus(
   console.log(`GTM work item ${gtmWorkItem.workItemId}: status updated to ${status}`);
 }
 
+/**
+ * ENG-669 picker view of the tier allowlist: `null` while the switch is off (the response is then unchanged).
+ * Otherwise the entitled ids narrowed to the plan (order kept; the configured default always stays, since a turn
+ * with no model runs it anyway, as a system model) plus `{ tier, allowedModels, upgradeRequired? }`, where `upgradeRequired` lists the
+ * tiers that include at least one of the models the plan hides (present only when something is hidden).
+ */
+async function describeModelAccessForPicker(userId: string, entitledModels: readonly string[]): Promise<{
+  models: string[];
+  modelAccess: { tier: string | null; allowedModels: string[] | '*'; upgradeRequired?: string[] };
+} | null> {
+  if (!(await modelAccess.isEnabled())) return null;
+  const access = await modelAccess.getModelAccess(userId);
+  const models = await modelAccess.filterAllowedModels(userId, entitledModels, systemModelCheck(null));
+  const hidden = entitledModels.filter((id) => !models.includes(id));
+  const upgradeRequired = hidden.length > 0
+    ? (await modelAccess.tiersAllowingModels(hidden)).filter((tier) => tier !== access.tier)
+    : undefined;
+  return {
+    models,
+    modelAccess: {
+      tier: access.tier,
+      allowedModels: access.allowedModels,
+      ...(upgradeRequired && { upgradeRequired }),
+    },
+  };
+}
+
+/** Same model after legacy-alias resolution (raw comparison for partial test doubles). */
+function sameModelId(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (!a || !b) return false;
+  const normalize = (id: string) => (typeof agentModeService.normalizeModelId === 'function' ? agentModeService.normalizeModelId(id.trim()) : id.trim());
+  return normalize(a) === normalize(b);
+}
+
 // Common function to generate AI response for a session
 // Always uses worker process to prevent blocking the main event loop
 export async function generateSessionResponse(
@@ -9089,6 +9201,14 @@ export async function generateSessionResponse(
   const session = await chatbotDb.getChatSession(sessionId);
   if (!session) {
     throw new Error('Session not found');
+  }
+  // ENG-669 final gate. Side channels (Slack and other transports, Emma email, approval-inbox resumes, GTM turns,
+  // continuations) run session.llmModel without the resolver. A STORED model is the user's selection unless it is a
+  // system model, so it must be in the owner's plan; a model the caller chose itself (a configured default, the
+  // brand-build model, a task-type default) is AgentWeb's choice and differs from the stored one. Thrown before
+  // anything is persisted; callers surface it as the model_unavailable message.
+  if (session.llmModel && sameModelId(llmModel, session.llmModel)) {
+    await assertModelInOwnerPlan({ ownerUserId: session.userId, model: llmModel, session });
   }
   // Some server-side callers (notably Slack) resume a persisted delegated
   // session without carrying the HTTP request's delegation flag. Preserve the
@@ -9866,6 +9986,8 @@ export const agentModeController = {
             // Only an explicit requestedLlmModel is a selection; a misconfigured
             // default keeps the resolver's old safety net instead of a 422.
             allowSilentSwap: !requestedLlmModel,
+            // ENG-669: without a requested model the configured default runs (a system model).
+            systemModel: !requestedLlmModel,
           });
         } catch (modelError) {
           if (!isModelUnavailableError(modelError)) throw modelError;
@@ -10265,6 +10387,7 @@ export const agentModeController = {
           backupModel: llmBackupModel,
           backupSource: llmBackupModel ? 'user' : null,
           allowSilentSwap: !explicitModelSelection,
+          session,
         });
       } catch (modelError) {
         if (!isModelUnavailableError(modelError)) throw modelError;
@@ -10647,6 +10770,7 @@ export const agentModeController = {
           backupModel: llmBackupModel,
           backupSource: llmBackupModel ? 'user' : null,
           allowSilentSwap: !explicitModelSelection,
+          session,
         });
       } catch (modelError) {
         if (!isModelUnavailableError(modelError)) throw modelError;
@@ -11413,18 +11537,22 @@ export const agentModeController = {
       const supportedModels = typeof agentModeService.isLiveModel === 'function'
         ? entitledModels.filter((id) => !agentModeService.isLiveModel(id))
         : entitledModels;
+      // ENG-669: with the tier allowlist on, offer only what the user's plan runs (the configured default always
+      // runs, so it always stays) and say which plan that is. Off: unchanged, and nothing extra is read.
+      const planAccess = await describeModelAccessForPicker(user.userId, supportedModels);
+      const plannedModels = planAccess ? planAccess.models : supportedModels;
       const optimizedModels = scheduleBackupModels(
-        usage.policy?.optimizedModelIds ?? supportedModels, supportedModels,
+        usage.policy?.optimizedModelIds ?? plannedModels, plannedModels,
       );
       // ENG-1211 AC1: nothing below the hard cap may hide a model. Only a paused
       // account has an empty picker; every other state offers the full entitled
       // set. `optimizedModels` is still returned as `scheduleBackupModels` for
       // the legacy backup field and for the ENG-1213 recommendation catalog.
-      const selectableModels = usage.mode.usageMode === 'paused' ? [] : supportedModels;
+      const selectableModels = usage.mode.usageMode === 'paused' ? [] : plannedModels;
       res.json({
         usageMode: usage.mode.usageMode,
         canGenerate: usage.mode.admissionAllowed,
-        allModels: supportedModels,
+        allModels: plannedModels,
         selectableModels,
         scheduleBackupModels: optimizedModels,
         optimizedDefaultModel: usage.policy?.optimizedDefaultModel || null,
@@ -11436,6 +11564,7 @@ export const agentModeController = {
         // keeping their own hand-copied list. A copy, so nothing downstream can mutate the registry's map.
         legacyModelAliases: { ...LEGACY_MODEL_ALIASES },
         workPlanStepModelsEnabled,
+        ...(planAccess && { modelAccess: planAccess.modelAccess }),
       });
     } catch (error) {
       console.error('AgentMode: Get model options error:', error);
@@ -11947,6 +12076,15 @@ export const agentModeController = {
 
       const defaultModel = await agentModeService.getDefaultModel();
 
+      // ENG-669 pre-flight, before the answers below are persisted: a stored model outside the
+      // OWNER's plan is refused (the visitor's 422 does not carry the owner's plan).
+      try {
+        await assertModelInOwnerPlan({ ownerUserId: session.userId, model: session.llmModel, session });
+      } catch (modelError) {
+        if (!isModelUnavailableError(modelError)) throw modelError;
+        return res.status(422).json(modelUnavailableBody(modelError, 'share_viewer'));
+      }
+
       if (workPlanInputAnswer) {
         try {
           const pendingWorkPlanInput = session.pendingWorkPlanInput;
@@ -12092,11 +12230,21 @@ export const agentModeController = {
       // authenticated, scheduled, and MCP dispatch.
       // The visitor selects nothing, so a stored model that is retired or not
       // selectable falls back to the current default (allowSilentSwap) and never throws.
-      const modelPolicyDecision: EffectiveModelPolicyDecision = await resolveEffectiveModelForUser({
-        userId: session.userId,
-        requestedModel: session.llmModel || defaultModel,
-        allowSilentSwap: true,
-      });
+      // ENG-669: a stored model outside the OWNER's plan is refused (never swapped); the visitor's
+      // 422 does not carry the owner's plan.
+      let modelPolicyDecision: EffectiveModelPolicyDecision;
+      try {
+        modelPolicyDecision = await resolveEffectiveModelForUser({
+          userId: session.userId,
+          requestedModel: session.llmModel || defaultModel,
+          allowSilentSwap: true,
+          systemModel: !session.llmModel,
+          session,
+        });
+      } catch (modelError) {
+        if (!isModelUnavailableError(modelError)) throw modelError;
+        return res.status(422).json(modelUnavailableBody(modelError, 'share_viewer'));
+      }
       if (!modelPolicyDecision.effectiveModel) {
         // Runtime always exposes this method. The guard preserves older
         // controller test doubles that intentionally mock only their subject.
@@ -15656,11 +15804,21 @@ export const agentModeController = {
       const defaultModel = await agentModeService.getDefaultModel();
       // The visitor selects nothing: a stored model that is retired or not selectable
       // falls back to the current default (allowSilentSwap never throws).
-      const conversablePolicy = await resolveEffectiveModelForUser({
-        userId: session.userId,
-        requestedModel: session.llmModel || defaultModel,
-        allowSilentSwap: true,
-      });
+      // ENG-669: a stored model outside the OWNER's plan is refused (never swapped); the visitor's
+      // 422 does not carry the owner's plan.
+      let conversablePolicy: EffectiveModelPolicyDecision;
+      try {
+        conversablePolicy = await resolveEffectiveModelForUser({
+          userId: session.userId,
+          requestedModel: session.llmModel || defaultModel,
+          allowSilentSwap: true,
+          systemModel: !session.llmModel,
+          session,
+        });
+      } catch (modelError) {
+        if (!isModelUnavailableError(modelError)) throw modelError;
+        return res.status(422).json(modelUnavailableBody(modelError, 'share_viewer'));
+      }
       const modelToUse = conversablePolicy.effectiveModel || session.llmModel || defaultModel;
 
       // Cancel generation immediately when the client disconnects
@@ -15995,9 +16153,12 @@ export const agentModeController = {
       let stepModelIds = new Map<number, string>();
       try {
         const isLauncherAdmin = () => (result.user ? isUserAdmin(result.user.userId) : Promise.resolve(false));
-        planPinnedModel = await resolvePlanLaunchModel(agentModeService, isLauncherAdmin, predefinedPlan.defaultModel);
+        // ENG-669: an admin-authored plan's pins are AgentWeb's choice (no tier check); any other plan's pins must be
+        // in the LAUNCHING user's plan (an anonymous visitor: the Free tier's).
+        const tierOwner = isSystemAuthoredPlan(predefinedPlan) ? undefined : userId;
+        planPinnedModel = await resolvePlanLaunchModel(agentModeService, isLauncherAdmin, predefinedPlan.defaultModel, tierOwner);
         if (stepModelsEnabled) {
-          stepModelIds = await resolvePlanStepModelsForLaunch(agentModeService, isLauncherAdmin, predefinedPlan.steps || []);
+          stepModelIds = await resolvePlanStepModelsForLaunch(agentModeService, isLauncherAdmin, predefinedPlan.steps || [], tierOwner);
         }
       } catch (launchModelError) {
         const stepError = isStepModelUnavailableError(launchModelError) ? launchModelError : undefined;
@@ -16531,6 +16692,7 @@ export const agentModeController = {
             userId: session.userId,
             requestedModel,
             allowSilentSwap: !explicitModel,
+            session,
           });
         } catch (modelError) {
           if (!isModelUnavailableError(modelError)) throw modelError;
@@ -16709,7 +16871,10 @@ export const agentModeController = {
       // ran their session on it. isModelSelectableBy is the single source of
       // truth for "can this user pick this model" (adminOnly + the
       // internal/live exclusions); use it instead of re-deriving a subset here.
-      if (!agentModeService.isModelSelectableBy(canonicalModel, !!user.isAdmin)) {
+      // ENG-669: with the tier allowlist on, the pick is judged for the session OWNER (below), so an
+      // admin or delegated caller cannot widen a user's session beyond what that user may run.
+      const tierAllowlistOn = await modelAccess.isEnabled();
+      if (!tierAllowlistOn && !agentModeService.isModelSelectableBy(canonicalModel, !!user.isAdmin)) {
         return res.status(403).json({ error: 'This model is not available for your account' });
       }
 
@@ -16722,6 +16887,20 @@ export const agentModeController = {
       // Check if user owns the session (or is admin)
       if (session.userId !== user.userId && !user.isAdmin) {
         return res.status(403).json({ error: 'Unauthorized access to session' });
+      }
+
+      // ENG-669: the same 422 model_unavailable the turn itself would answer, checked against the
+      // OWNER: selectability (adminOnly clears only for an admin owner), then the owner's plan.
+      if (tierAllowlistOn) {
+        try {
+          if (!agentModeService.isModelSelectableBy(canonicalModel, session.userId === user.userId ? !!user.isAdmin : await isUserAdmin(session.userId))) {
+            throw new ModelUnavailableError(String(llmModel), 'not_selectable');
+          }
+          await assertModelInOwnerPlan({ ownerUserId: session.userId, model: String(llmModel), session });
+        } catch (modelError) {
+          if (!isModelUnavailableError(modelError)) throw modelError;
+          return res.status(422).json(modelUnavailableBody(modelError));
+        }
       }
 
       // Update the session's llmModel
@@ -16784,6 +16963,15 @@ export const agentModeController = {
 
       if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
+      }
+
+      // ENG-669: the viewer writes the OWNER's session, so the pick must be in the owner's plan.
+      // The viewer's 422 does not carry the owner's plan.
+      try {
+        await assertModelInOwnerPlan({ ownerUserId: session.userId, model: String(llmModel), session });
+      } catch (modelError) {
+        if (!isModelUnavailableError(modelError)) throw modelError;
+        return res.status(422).json(modelUnavailableBody(modelError, 'share_viewer'));
       }
 
       // Update the session's llmModel
