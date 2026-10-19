@@ -486,6 +486,67 @@ describe('Admin subscription types routes', () => {
     expect(res.body.message).toContain('below minimumMarkupBps');
   });
 
+  // ENG-668: the save path rebuilds every tier from a whitelist, so a field missing from it is
+  // silently dropped on the next admin save — the pay-as-you-go opt-in would vanish from the tier.
+  describe('pay-as-you-go tier config (ENG-668)', () => {
+    const llmUsageTopUp = {
+      enabled: true,
+      minimumMarkupBps: 25_000,
+      packages: [{ id: 'aw-10', label: '10 AgentWeb Credits', priceCents: 2_500, usageCreditMicroUsd: 10_000_000, active: true }],
+    };
+    const save = (type: Record<string, unknown>) =>
+      request(app).post('/api/admin/subscription-types').send({
+        subscriptionTypes: [{ name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], ...type }],
+      });
+    const saved = () => JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string)[0];
+
+    it('GET round-trips paygOverage so the admin UI does not drop it on its next save', async () => {
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'subscription_types',
+        settingValue: JSON.stringify([{ name: 'Pro', allowedPages: ['*'], allowedSkills: ['*'], paygOverage: { allowed: true, markupBps: 30_000 } }]),
+      } as any);
+      const res = await request(app).get('/api/admin/subscription-types').expect(200);
+      expect(res.body[0].paygOverage).toEqual({ allowed: true, markupBps: 30_000 });
+    });
+
+    it('persists paygOverage on save', async () => {
+      await save({ llmUsageTopUp, paygOverage: { allowed: true, markupBps: 30_000 } }).expect(200);
+      expect(saved().paygOverage).toEqual({ allowed: true, markupBps: 30_000 });
+    });
+
+    it('a re-save of a stored tier keeps it (the round trip the admin UI performs)', async () => {
+      const stored = { name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], paygOverage: { allowed: false, markupBps: 20_000 } };
+      await request(app).post('/api/admin/subscription-types').send({ subscriptionTypes: [stored] }).expect(200);
+      expect(saved().paygOverage).toEqual({ allowed: false, markupBps: 20_000 });
+    });
+
+    it('defaults markupBps to the tier\'s own top-up markup', async () => {
+      await save({ llmUsageTopUp, paygOverage: { allowed: true } }).expect(200);
+      expect(saved().paygOverage).toEqual({ allowed: true, markupBps: 25_000 });
+    });
+
+    it('requires markupBps when there is no top-up markup to inherit', async () => {
+      const res = await save({ paygOverage: { allowed: true } }).expect(400);
+      expect(res.body.message).toContain('markupBps is required');
+      expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      [{ allowed: 'true', markupBps: 25_000 }, 'allowed must be boolean'],
+      [{ allowed: true, markupBps: 9_000 }, 'markupBps must be an integer of at least 10000'],
+      [{ allowed: true, markupBps: '25000' }, 'markupBps must be an integer of at least 10000'],
+    ])('rejects %j instead of coercing it', async (paygOverage, message) => {
+      const res = await save({ paygOverage }).expect(400);
+      expect(res.body.message).toContain(message);
+      expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
+    });
+
+    it('leaves paygOverage absent when the admin omits it', async () => {
+      await save({ llmUsageTopUp }).expect(200);
+      expect(saved()).not.toHaveProperty('paygOverage');
+    });
+  });
+
   describe('POST /api/admin/subscription-types/:typeName/skills', () => {
     const storedTypes = [
       { name: 'Basic', allowedPages: ['/'], allowedSkills: ['skill-1'] },
