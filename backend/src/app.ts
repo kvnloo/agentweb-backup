@@ -464,8 +464,7 @@ app.use("/api/agent-mode", agentModeRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/image-models", imageModelsRoutes);
 // ENG-2271: Twilio voice callbacks (form-encoded, parsed by the narrow 64kb parser mounted before the global
-// ones); every
-// route verifies the X-Twilio-Signature itself, so there is deliberately no auth middleware here.
+// ones). Every route verifies X-Twilio-Signature itself, so there is deliberately no auth middleware here.
 app.use("/api/webhooks/twilio-voice", twilioVoiceWebhookRoutes);
 app.use("/api/webhooks", webhookRoutes);
 app.use("/api/webhooks/fathom", fathomWebhookRoutes);
