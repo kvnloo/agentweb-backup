@@ -93,12 +93,20 @@ function seed(state: HotLeadCallState, extra: Partial<HotLeadCallRecord> = {}) {
   };
 }
 
-const app = () => {
+/** `errorHandler` stands in for app.ts's global handler, which logs and reports whatever reaches it. */
+const app = (opts: { errorHandler?: (err: unknown) => void } = {}) => {
   const a = express();
-  // Same order as app.ts: the route's narrow parser first, then the global wide one.
+  // Same order as app.ts: the route's narrow parser first, then the global wide ones.
   a.use(MOUNT, twilioVoiceBodyParser);
+  a.use(express.json({ limit: '50mb' }));
   a.use(express.urlencoded({ limit: '50mb', extended: true }));
   a.use(MOUNT, twilioVoiceWebhookRoutes);
+  // Express only treats a 4-argument function as an error handler.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  a.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    opts.errorHandler?.(err);
+    res.status(500).end();
+  });
   return a;
 };
 
@@ -360,6 +368,22 @@ describe('records still in dialing (orchestrator has not stored the owner CallSi
     });
     await Promise.all([owner(), post('owner', { CallSid: 'CA00000077' })]);
     expect(store.eventTypes().filter((t) => t === 'call.initiated')).toHaveLength(1);
+  });
+
+  it('adoption moves the record to owner_ringing, so the orchestrator\'s late settle loses and call.initiated is written once', async () => {
+    await ownerStatus('in-progress');
+    expect(store.record).toMatchObject({ state: 'owner_ringing', ownerCallSid: OWNER_SID });
+    // The orchestrator's settle (dialing -> owner_ringing, then call.initiated), unchanged.
+    const settled = await store.transition(LIST, LEAD, ['dialing'], { state: 'owner_ringing', ownerCallSid: OWNER_SID });
+    if (settled) await store.addEvent(LIST, LEAD, 'call.initiated');
+    expect(settled).toBe(false);
+    expect(store.eventTypes()).toEqual(['call.initiated']);
+  });
+
+  it('keeps the orchestrator\'s placement_unknown outcome untouched when adopting', async () => {
+    seed('dialing', { outcome: 'placement_unknown', ownerCallSid: undefined });
+    await ownerStatus('in-progress');
+    expect(store.record).toMatchObject({ state: 'owner_ringing', outcome: 'placement_unknown' });
   });
 
   it('the first adopted sid wins: a racing callback with another sid cannot replace it', async () => {
@@ -753,7 +777,7 @@ describe('POST /status', () => {
   it('bills only the caller that wins the metering transition (a lost race or replay must not bill)', async () => {
     seed('owner_answered');
     jest.spyOn(store, 'transition').mockResolvedValue(false);
-    await ownerStatus('completed', { CallDuration: '30' });
+    expect((await ownerStatus('completed', { CallDuration: '30' })).status).toBe(500); // lost every attempt: redelivered
     expect(recordCallUsage).not.toHaveBeenCalled();
   });
 
@@ -820,13 +844,7 @@ describe('request body parsing', () => {
 
   it('answers parse errors locally: 413/400 never reach the global error handler', async () => {
     const onError = jest.fn();
-    const a = express();
-    a.use(MOUNT, twilioVoiceBodyParser);
-    a.use(express.urlencoded({ limit: '50mb', extended: true }));
-    a.use(MOUNT, twilioVoiceWebhookRoutes);
-    // Same shape as the global handler in app.ts: any error that reaches it is logged and reported.
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- Express only treats a 4-argument function as an error handler
-    a.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => { onError(err); res.status(500).end(); });
+    const a = app({ errorHandler: onError });
     const big = await request(a).post(`${MOUNT}/owner?${QUERY}`).type('form').send({ Junk: 'x'.repeat(70 * 1024) });
     const bad = await request(a).post(`${MOUNT}/owner?${QUERY}`).set('Content-Type', 'application/x-www-form-urlencoded; charset=nope').send('CallSid=CA1');
     expect(big.status).toBe(413);
@@ -834,6 +852,37 @@ describe('request body parsing', () => {
     expect(bad.status).toBe(400);
     expect(bad.text).toBe('');
     expect(onError).not.toHaveBeenCalled();
+  });
+
+  it('limits every content type: an oversized JSON body is a 413 here, not buffered by the global 50mb parser', async () => {
+    const onError = jest.fn();
+    const res = await request(app({ errorHandler: onError })).post(`${MOUNT}/owner?${QUERY}`).type('json').send({ Junk: 'x'.repeat(70 * 1024) });
+    expect(res.status).toBe(413);
+    expect(onError).not.toHaveBeenCalled();
+    expect(fake.signatureChecks).toHaveLength(0);
+  });
+
+  it('does not let malformed JSON reach the global error handler (it is just an unsigned form body)', async () => {
+    const onError = jest.fn();
+    setVoiceProviderForTests(null);
+    mockGetCreds.mockResolvedValue({ accountSid: 'ACfake0123456789abcdef0123456789ab', authToken: 'tok' });
+    const res = await request(app({ errorHandler: onError })).post(`${MOUNT}/owner?${QUERY}`).set('X-Twilio-Signature', 'bad').type('json').send('{bad');
+    expect(res.status).toBe(401);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it('rejects a JSON body with valid-looking keys as 401: it is not a flat form', async () => {
+    setVoiceProviderForTests(null);
+    mockGetCreds.mockResolvedValue({ accountSid: 'ACfake0123456789abcdef0123456789ab', authToken: 'tok' });
+    seed('owner_ringing');
+    const params = { CallSid: OWNER_SID, CallStatus: 'in-progress' };
+    const res = await request(app())
+      .post(`${MOUNT}/owner?${QUERY}`)
+      .set('X-Twilio-Signature', getExpectedTwilioSignature('tok', `${BASE}${MOUNT}/owner?${QUERY}`, params))
+      .type('json')
+      .send(params);
+    expect(res.status).toBe(401);
+    expect(store.record?.state).toBe('owner_ringing');
   });
 
   it('keeps bracketed keys as flat strings instead of building nested objects', async () => {

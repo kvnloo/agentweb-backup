@@ -8,6 +8,8 @@
  *
  * Every endpoint runs the same guard: credentials loaded (else 503) -> signature over
  * the URL rebuilt from BACKEND_URL (else 401) -> strict query shape -> record + jobKey + CallSid match.
+ * The body is parsed by a local 64kb flat-form parser first, whatever its content type; one that is too large
+ * or unreadable is answered 413/400 there and never reaches the app's global error handler.
  * A TwiML endpoint (/owner, /gather, /dial) answers a request that passes the signature but does not
  * belong to a live call with a bare hangup and HTTP 200 (so Twilio does not retry), writing nothing.
  * /status answers such a request with an empty 200; it answers 500 only when a leg ended but no owner
@@ -18,7 +20,8 @@
  * Record lifecycle (all moves go through LeadCallStore.transition with explicit `from` sets). The
  * orchestrator creates the record in 'dialing' BEFORE calling Twilio and moves it to owner_ringing
  * (with ownerCallSid) afterwards; if that move has not landed yet, /owner and the owner /status adopt
- * the CallSid from the signed callback (same jobKey only). One record per lead, ever.
+ * the CallSid from the signed callback (same jobKey only) and move the record to owner_ringing themselves,
+ * so the orchestrator's late settle (from 'dialing') loses. One record per lead, ever.
  *   dialing/owner_ringing -> owner_answered (/owner) -> bridging (/gather, digit 1) -> connected (lead answered)
  *   -> finished (last leg's final /status).
  * A terminal record can no longer be written, so a leg is metered (meteredLegs) while the record is still
@@ -26,9 +29,8 @@
  * arrives the record stays non-terminal: WP6/ops needs a cleanup for records stuck in bridging/connected
  * (no cron is added here).
  *
- * Replay protection for decisions that do not change `state` (owner declined, lead did not answer) uses a
- * synthetic `lastSequence` entry (`<callSid>#gather`, `<callSid>#dial`): the store's max-in condition makes
- * "first writer wins" atomic without a new state or field.
+ * Decisions that do not change `state` (owner declined, lead did not answer, sid adoption) are made once
+ * through marker entries in `lastSequence`: see HotLeadCallRecord.lastSequence for the three markers.
  */
 
 import express from 'express';
@@ -42,11 +44,11 @@ import { getLeadCallStore } from '../services/voice/leadCallStore';
 import type { HotLeadCallEventType, HotLeadCallLeg, HotLeadCallRecord, HotLeadCallState } from '../services/voice/leadCallStore.types';
 import { recordCallUsage } from '../services/voice/voiceUsage';
 import { connectTwiml, hangupTwiml, leadUnreachableTwiml, ownerPromptTwiml } from '../services/voice/twiml';
-import { allowlistedE164 } from '../services/hotLeadCallConfig';
-import { toE164 } from '../services/whatsappService';
-import { parsePhoneNumberWithError } from 'libphonenumber-js';
+import { callableLeadPhone } from '../services/hotLeadCallConfig';
 
-const flatFormParser = express.urlencoded({ limit: '64kb', extended: false });
+// type: () => true so a JSON or other content type is limited and parsed here too, instead of falling
+// through to the global 50mb express.json (the same trick as the unipile and tracker parsers).
+const flatFormParser = express.urlencoded({ limit: '64kb', extended: false, type: () => true });
 
 /**
  * Twilio posts small flat form bodies. app.ts mounts this BEFORE the global 50mb extended parser (which
@@ -57,7 +59,7 @@ const flatFormParser = express.urlencoded({ limit: '64kb', extended: false });
 export const twilioVoiceBodyParser: RequestHandler = (req, res, next) => {
   flatFormParser(req, res, (err?: unknown) => {
     if (!err) return next();
-    const tooLarge = (err as { status?: unknown }).status === 413;
+    const tooLarge = typeof err === 'object' && err !== null && 'status' in err && err.status === 413;
     res.status(tooLarge ? 413 : 400).end();
   });
 };
@@ -70,7 +72,7 @@ interface CallQuery {
   jobKey: string;
   leg: HotLeadCallLeg;
 }
-type Body = Record<string, string>;
+type FormParams = Record<string, string>;
 
 const CALL_SID_SHAPE = /^CA[A-Za-z0-9]{8,40}$/;
 const QUERY_KEYS = new Set(['listId', 'leadId', 'jobKey', 'leg']);
@@ -81,9 +83,8 @@ const LEAD_NOT_REACHED = new Set(['no-answer', 'busy', 'failed', 'canceled']);
 const LEAD_REACHED = new Set(['completed', 'answered']);
 const MAX_TRANSITION_ATTEMPTS = 3;
 
-/** Decisions that do not change `state` are made once per call: see HotLeadCallRecord.lastSequence. */
+// Marker entries in `lastSequence` that make a decision first-writer-wins: see HotLeadCallRecord.lastSequence.
 const decisionKey = (ownerSid: string, step: 'gather' | 'dial'): string => `${ownerSid}#${step}`;
-/** Marker key for the one-time adoption of the owner CallSid, see withOwnerSid. */
 const ADOPT_MARKER = 'owner#adopt';
 const errorName = (err: unknown): string => (err instanceof Error ? err.name : 'unknown error');
 
@@ -93,9 +94,8 @@ const sendXml = (res: Response, xml: string): void => {
 const sendHangup = (res: Response): void => sendXml(res, hangupTwiml());
 
 function parseQuery(req: Request): CallQuery | null {
-  const raw = req.query as Record<string, unknown>;
-  if (Object.keys(raw).some((k) => !QUERY_KEYS.has(k))) return null;
-  const { listId, leadId, jobKey, leg } = raw;
+  if (Object.keys(req.query).some((k) => !QUERY_KEYS.has(k))) return null;
+  const { listId, leadId, jobKey, leg } = req.query;
   if (typeof listId !== 'string' || typeof leadId !== 'string' || typeof jobKey !== 'string') return null;
   if (![listId, leadId, jobKey].every(isWebhookSafeId)) return null;
   // The orchestrator's owner-leg status URL carries no leg; only the lead <Number> callback adds leg=lead.
@@ -103,10 +103,10 @@ function parseQuery(req: Request): CallQuery | null {
   return { listId, leadId, jobKey, leg: leg ?? 'owner' };
 }
 
-function paramsOf(req: Request): Body | null {
+function paramsOf(req: Request): FormParams | null {
   const body: unknown = req.body ?? {};
   if (typeof body !== 'object' || body === null || Array.isArray(body)) return null;
-  const params: Body = {};
+  const params: FormParams = {};
   for (const [k, v] of Object.entries(body)) {
     if (typeof v !== 'string') return null; // Twilio only sends flat strings, so this cannot be a genuine signed body
     params[k] = v;
@@ -127,23 +127,24 @@ async function loadRecord(q: CallQuery): Promise<HotLeadCallRecord | null> {
  * Owner-leg callbacks only. While the record is still 'dialing' (the orchestrator's post-call
  * transition has not landed, or failed) the first signed owner-leg callback for this job supplies
  * the owner CallSid. The jobKey was already matched by loadRecord and the signature covers it.
- * Adoption is first-writer-wins through the `#adopt` decision marker (the store's strictly-higher
- * condition), so two racing callbacks cannot overwrite each other's sid or both write call.initiated;
- * after this call the caller compares against whichever sid the re-read shows.
+ * Adoption moves the record to owner_ringing with the sid, from 'dialing' only, so the orchestrator's own
+ * settle (also from 'dialing') loses and cannot write a second call.initiated. It is first-writer-wins
+ * through the `owner#adopt` marker, so two racing callbacks cannot overwrite each other's sid; after this
+ * call the caller compares against whichever sid the re-read shows.
  * A record stuck in 'dialing'/'owner_ringing' (no callback ever) needs an ops cleanup, see header.
  */
 async function withOwnerSid(q: CallQuery, record: HotLeadCallRecord, callSid: string | undefined): Promise<HotLeadCallRecord> {
   if (record.ownerCallSid || record.state !== 'dialing' || !callSid) return record;
   const store = getLeadCallStore();
-  // The orchestrator's own settle is unchanged and loses its transition once the owner answered, so the
-  // call.initiated it would have written is written here, by the winning adoption only.
-  if (await store.transition(q.listId, q.leadId, ['dialing'], { state: 'dialing', ownerCallSid: callSid, lastSequence: { [ADOPT_MARKER]: 1 } })) {
+  // The orchestrator's settle is unchanged; it now loses its transition, so the call.initiated it would
+  // have written is written here, by the winning adoption only.
+  if (await store.transition(q.listId, q.leadId, ['dialing'], { state: 'owner_ringing', ownerCallSid: callSid, lastSequence: { [ADOPT_MARKER]: 1 } })) {
     await store.addEvent(q.listId, q.leadId, 'call.initiated');
   }
   return (await store.get(q.listId, q.leadId)) ?? record; // a lost race still shows whichever sid won
 }
 
-const sidOf = (body: Body, field: string): string | undefined => (CALL_SID_SHAPE.test(body[field] ?? '') ? body[field] : undefined);
+const sidOf = (body: FormParams, field: string): string | undefined => (CALL_SID_SHAPE.test(body[field] ?? '') ? body[field] : undefined);
 
 /** Owner id for metering. Not tied to the config being enabled: a call placed earlier must still be billed. */
 async function meteringUserId(listId: string, ctx: HotLeadCallContext | null): Promise<string | null> {
@@ -152,7 +153,7 @@ async function meteringUserId(listId: string, ctx: HotLeadCallContext | null): P
   return list && list.listId === listId && typeof list.userId === 'string' && list.userId ? list.userId : null;
 }
 
-type Handler = (req: Request, res: Response, q: CallQuery, body: Body) => Promise<void>;
+type Handler = (req: Request, res: Response, q: CallQuery, body: FormParams) => Promise<void>;
 
 interface ErrorReplies {
   /** The signed request is not for a call we can act on (malformed query). Never retried by Twilio. */
@@ -211,6 +212,7 @@ const statusReplies: ErrorReplies = { invalid: ack, failed: serverError };
  */
 async function abortCall(q: CallQuery, record: HotLeadCallRecord, from: HotLeadCallState[]): Promise<void> {
   const store = getLeadCallStore();
+  // Only /gather's decision marker applies here: from /owner the call has not reached the gather step yet.
   const decision = record.state === 'owner_answered' && record.ownerCallSid ? { [decisionKey(record.ownerCallSid, 'gather')]: 1 } : undefined;
   if (await store.transition(q.listId, q.leadId, from, { state: 'owner_answered', outcome: 'aborted', lastSequence: decision })) {
     await store.addEvent(q.listId, q.leadId, 'call.failed', { reason: 'aborted' });
@@ -257,16 +259,8 @@ router.post('/owner', guarded(async (_req, res, q, body) => {
 /** The lead's number from the lead row, re-validated now. Never from the URL or the request body. */
 async function leadPhoneFor(q: CallQuery, ctx: HotLeadCallContext): Promise<string | null> {
   const lead = await crmDb.getLeadById(q.listId, q.leadId, { consistentRead: true });
-  if (!lead || typeof lead.phone !== 'string') return null;
-  const e164 = toE164(lead.phone, 'US');
-  const allowed = e164 ? allowlistedE164(e164) : null;
-  if (!allowed) return null;
-  try {
-    const country = parsePhoneNumberWithError(allowed).country;
-    return country && ctx.config.allowedCountries.some((c) => c === country) ? allowed : null;
-  } catch {
-    return null;
-  }
+  const callable = callableLeadPhone(lead?.phone, ctx.config);
+  return 'phone' in callable ? callable.phone : null;
 }
 
 router.post('/gather', guarded(async (_req, res, q, body) => {
