@@ -54,9 +54,12 @@ export interface ClaudeAdapterConfig {
   shortCommandTimeoutMs?: number;
   /** After SIGTERM-style kill requests the wait for a process to be gone. */
   killWaitMs?: number;
+  /** Approximate cap on events buffered between the CLI and the consumer of a turn (default 8 MB). */
+  maxQueuedBytes?: number;
 }
 
 const DEFAULTS = {
+  maxQueuedBytes: 8 * 1024 * 1024,
   basePath: "/usr/local/bin:/usr/bin:/bin",
   unitTmp: "/tmp",
   mcpServerName: "emma",
@@ -101,14 +104,27 @@ class RunnerChildAdapter extends EventEmitter implements RunnerChild {
   }
 }
 
-/** A tiny unbounded async queue: events are pushed by the runner's sink and pulled by the turn generator. */
+/**
+ * An async queue between the runner's event sink (pushes as the CLI prints) and the turn generator (pulled at
+ * the pace of the host's consumer). Bounded by an approximate byte budget: a consumer that stops reading must
+ * not let a chatty CLI grow the host's memory without limit.
+ */
 class AsyncQueue<T> implements AsyncIterable<T> {
-  private items: T[] = [];
+  private items: Array<{ v: T; size: number }> = [];
   private waiter: (() => void) | undefined;
   private ended = false;
-  push(v: T): void {
+  private bytes = 0;
+  overflowed = false;
+  constructor(private readonly maxBytes: number) {}
+  push(v: T, size: number): void {
     if (this.ended) return;
-    this.items.push(v);
+    if (this.bytes + size > this.maxBytes) {
+      this.overflowed = true;
+      this.end();
+      return;
+    }
+    this.items.push({ v, size });
+    this.bytes += size;
     this.waiter?.();
   }
   end(): void {
@@ -117,7 +133,11 @@ class AsyncQueue<T> implements AsyncIterable<T> {
   }
   async *[Symbol.asyncIterator](): AsyncGenerator<T> {
     for (;;) {
-      while (this.items.length) yield this.items.shift() as T;
+      while (this.items.length) {
+        const it = this.items.shift() as { v: T; size: number };
+        this.bytes -= it.size;
+        yield it.v;
+      }
       if (this.ended) return;
       await new Promise<void>((resolve) => (this.waiter = resolve));
       this.waiter = undefined;
@@ -351,6 +371,13 @@ interface LoginState {
   exitWaiters: Array<() => void>;
 }
 
+/** Cheap size estimate of one normalized event (the text it carries plus a fixed overhead); exactness is not needed for a memory bound. */
+function approxSize(ev: ProviderEvent): number {
+  if (ev.type === "text") return 64 + ev.delta.length;
+  if (ev.type === "tool-use") return 128 + JSON.stringify(ev.input ?? null).length;
+  return 256;
+}
+
 function stripUndefined<T extends object>(o: T): Partial<T> {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as Partial<T>;
 }
@@ -405,7 +432,7 @@ class ClaudeSession implements ProviderSession {
     if (this.used) throw new Error("claude_session_single_use");
     this.used = true;
     if (this.closing || this.interrupted) return;
-    const events = new AsyncQueue<ProviderEvent>();
+    const events = new AsyncQueue<ProviderEvent>(this.cfg.maxQueuedBytes);
     const key = `${this.spec.connectionId}/${input.turnId}`;
     this.key = key;
     let result: Awaited<ReturnType<ClaudeCliRunner["send"]>> | undefined;
@@ -423,7 +450,8 @@ class ClaudeSession implements ProviderSession {
       this.runner
         .send(this.handle, input.prompt, {
           onEvent: (raw) => {
-            for (const ev of normalizeClaudeEvent(raw)) events.push(ev);
+            for (const ev of normalizeClaudeEvent(raw)) events.push(ev, approxSize(ev));
+            if (events.overflowed) void this.close(); // the consumer is not keeping up: end the process rather than buffer without bound
           },
         })
         .then(
@@ -437,6 +465,10 @@ class ClaudeSession implements ProviderSession {
           },
         );
       for await (const ev of events) yield ev;
+      if (events.overflowed) {
+        yield { type: "result", ok: false, text: "", errorKind: "transient" };
+        return;
+      }
       if (failure !== undefined) {
         yield { type: "result", ok: false, text: "", errorKind: this.adapter.mapError(failure) };
         return;

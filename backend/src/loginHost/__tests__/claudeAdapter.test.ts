@@ -293,6 +293,22 @@ describe("claude adapter: a turn", () => {
     ]);
   });
 
+  it("a consumer that stops reading cannot make the host buffer without bound: the turn ends transient and the process is killed", async () => {
+    const e = makeEnv();
+    const big = "x".repeat(200_000);
+    e.scenario({ turn: Array.from({ length: 40 }, () => ({ type: "assistant", message: { content: [{ type: "text", text: big }] } })).concat([{ type: "result", subtype: "success", is_error: false, result: "done" } as never]) });
+    const session = await makeAdapter(e.unitTmp, { maxQueuedBytes: 1_000_000 }).openSession(e.ctx, { connectionId: "conn1", epoch: 1 });
+    const out: ProviderEvent[] = [];
+    for await (const ev of session.turn({ turnId: "t1", prompt: "hi", model: "sonnet", bridgeToken: "TOKEN-0123456789-abcdef" })) {
+      out.push(ev);
+      await new Promise((r) => setTimeout(r, 300)); // a slow consumer
+    }
+    expect(out[out.length - 1]).toEqual({ type: "result", ok: false, text: "", errorKind: "transient" });
+    expect(out.length).toBeLessThan(40);
+    await session.closed;
+    expect(isGone(e.last("turn").pid)).toBe(true);
+  });
+
   it("an MCP server that does not connect ends the turn as a transient failure (no toolless success)", async () => {
     const e = makeEnv();
     e.scenario({ mcpStatus: "failed" });
