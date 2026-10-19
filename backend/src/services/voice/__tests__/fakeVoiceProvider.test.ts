@@ -62,4 +62,17 @@ describe('FakeVoiceProvider', () => {
     setVoiceProviderForTests(f);
     expect(getVoiceProvider()).toBe(f);
   });
+
+  it('scripts buyNumber and releaseNumber failures and results, still recording the attempt', async () => {
+    const f = new FakeVoiceProvider();
+    f.failNextBuyNumber('unknown', 'timeout');
+    await expect(f.buyNumber({ countryCode: 'US' })).rejects.toMatchObject({ placed: 'unknown' });
+    f.queueBuyNumberResult({ numberSid: 'PNx', phoneNumber: '+14155550123' });
+    await expect(f.buyNumber({ countryCode: 'US', areaCode: '415' })).resolves.toEqual({ numberSid: 'PNx', phoneNumber: '+14155550123' });
+    expect(f.boughtNumbers).toHaveLength(2);
+    f.failNextReleaseNumber('no', 'gone', 404);
+    await expect(f.releaseNumber('PNx')).rejects.toMatchObject({ placed: 'no', httpStatus: 404 });
+    await expect(f.releaseNumber('PNx')).resolves.toBeUndefined();
+    expect(f.releasedNumbers).toEqual(['PNx', 'PNx']);
+  });
 });

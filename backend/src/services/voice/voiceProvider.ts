@@ -2,14 +2,30 @@ import twilio from 'twilio';
 import { getTwilioCredentials, type TwilioCredentials } from '../../utils/secretsManager';
 import { redactPhone } from '../whatsappService';
 
-export interface PlaceCallParams {
+interface PlaceCallBase {
   to: string;
   from: string;
-  /** TwiML webhook Twilio fetches when the callee answers. */
-  url: string;
-  statusCallbackUrl: string;
   timeoutSeconds: number;
 }
+
+/**
+ * Either a webhook-driven call (url + statusCallbackUrl) or a self-contained one (inline `twiml`, no
+ * callbacks), never a mix: an inline call has no status callback, so nothing could meter it from a webhook.
+ */
+export type PlaceCallParams = PlaceCallBase & (
+  | {
+      /** TwiML webhook Twilio fetches when the callee answers. */
+      url: string;
+      statusCallbackUrl: string;
+      twiml?: never;
+    }
+  | {
+      /** Complete TwiML document played when the callee answers; the builder must XML-escape every dynamic value. */
+      twiml: string;
+      url?: never;
+      statusCallbackUrl?: never;
+    }
+);
 
 export interface BuyNumberParams {
   /** ISO 3166-1 alpha-2, e.g. 'US'. */
@@ -68,6 +84,8 @@ export class VoiceCallError extends Error {
   constructor(
     message: string,
     readonly placed: 'no' | 'unknown',
+    /** HTTP status when Twilio answered at all; lets a caller tell "already gone" (404) from "refused" (401, 429). */
+    readonly httpStatus?: number,
   ) {
     super(message);
     this.name = 'VoiceCallError';
@@ -130,6 +148,7 @@ function sanitizeSdkError(err: unknown, operation: string, credentials?: TwilioC
   return new VoiceCallError(
     `Twilio ${operation} failed${status ? ` (HTTP ${status}${twilioCode ? `, code ${twilioCode}` : ''})` : ''}: ${detail}`,
     definitelyNotPlaced ? 'no' : 'unknown',
+    status,
   );
 }
 
@@ -187,9 +206,9 @@ class TwilioVoiceProvider implements VoiceProvider {
       const call = await client.calls.create({
         to: p.to,
         from: p.from,
-        url: p.url,
-        statusCallback: p.statusCallbackUrl,
-        statusCallbackEvent: ['completed'],
+        ...(p.twiml === undefined
+          ? { url: p.url, statusCallback: p.statusCallbackUrl, statusCallbackEvent: ['completed'] }
+          : { twiml: p.twiml }),
         timeout: p.timeoutSeconds,
       });
       // A 2xx without a sid still means Twilio accepted something: a call may exist.

@@ -147,6 +147,25 @@ describe('real voice provider', () => {
       }));
     });
 
+    it('sends inline twiml without url or status callback when given twiml', async () => {
+      mockCreate.mockResolvedValue({ sid: 'CA124' });
+      const twiml = '<Response><Say>hi</Say></Response>';
+      await getVoiceProvider().placeCall({ to: callParams.to, from: callParams.from, twiml, timeoutSeconds: 30 });
+      const sent = mockCreate.mock.calls[0][0];
+      expect(sent).toEqual({ to: callParams.to, from: callParams.from, twiml, timeout: 30 });
+      expect(sent).not.toHaveProperty('url');
+      expect(sent).not.toHaveProperty('statusCallback');
+    });
+
+    it('records the HTTP status on a rejection so callers can tell 404 (already gone) from 401/429', async () => {
+      mockRemove.mockRejectedValue(Object.assign(new Error('not found'), { status: 404, code: 20404 }));
+      await expect(getVoiceProvider().releaseNumber('PN1')).rejects.toMatchObject({ placed: 'no', httpStatus: 404 });
+      mockRemove.mockRejectedValue(new Error('socket hang up'));
+      const err = await getVoiceProvider().releaseNumber('PN1').catch((e) => e);
+      expect(err.placed).toBe('unknown');
+      expect(err.httpStatus).toBeUndefined();
+    });
+
     it('creates the SDK client with auto-retry off and a bounded timeout', async () => {
       mockCreate.mockResolvedValue({ sid: 'CA1' });
       await getVoiceProvider().placeCall(callParams);
@@ -337,7 +356,7 @@ describe('real voice provider', () => {
           expect(dump).not.toMatch(/Authorization/i);
         }
         // Only these own enumerable props exist, so nothing else (config, request, response) can ride along.
-        expect(Object.keys(err).sort()).toEqual(['name', 'placed']);
+        expect(Object.keys(err).sort()).toEqual(['httpStatus', 'name', 'placed']);
         const logged = errSpy.mock.calls.flat().map(String).join(' ');
         expect(logged).not.toContain(B64);
         expect(logged).not.toContain(CREDS.authToken);

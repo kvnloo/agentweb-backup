@@ -210,8 +210,8 @@ describe('processHotLeadCallJob', () => {
     expect(call.from).toBe(TWILIO_NUMBER);
     expect(call.timeoutSeconds).toBe(25);
     const key = store.record!.jobKey;
-    const owner = new URL(call.url);
-    const status = new URL(call.statusCallbackUrl);
+    const owner = new URL(call.url!);
+    const status = new URL(call.statusCallbackUrl!);
     expect(owner.origin + owner.pathname).toBe('https://api.example.com/api/webhooks/twilio-voice/owner');
     expect(status.origin + status.pathname).toBe('https://api.example.com/api/webhooks/twilio-voice/status');
     for (const url of [owner, status]) {

@@ -16,10 +16,27 @@ export class FakeVoiceProvider implements VoiceProvider {
   private callSeq = 0;
   private numberSeq = 0;
   private placeCallFailures: VoiceCallError[] = [];
+  private buyNumberFailures: VoiceCallError[] = [];
+  private releaseNumberFailures: VoiceCallError[] = [];
+  private buyNumberResults: { numberSid: string; phoneNumber: string }[] = [];
 
   /** 'no' = Twilio rejected it; 'unknown' = ambiguous timeout (the fake still records the attempt). */
   failNextPlaceCall(placed: 'no' | 'unknown', message = 'scripted failure'): void {
     this.placeCallFailures.push(new VoiceCallError(message, placed));
+  }
+
+  /** Queued like failNextPlaceCall; for buyNumber the attempt is recorded and, for 'unknown', nothing is returned though a number may exist. */
+  failNextBuyNumber(placed: 'no' | 'unknown', message = 'scripted failure', httpStatus?: number): void {
+    this.buyNumberFailures.push(new VoiceCallError(message, placed, httpStatus));
+  }
+
+  failNextReleaseNumber(placed: 'no' | 'unknown', message = 'scripted failure', httpStatus?: number): void {
+    this.releaseNumberFailures.push(new VoiceCallError(message, placed, httpStatus));
+  }
+
+  /** The next buyNumber returns this instead of a generated number (e.g. one that passes the production validators). */
+  queueBuyNumberResult(result: { numberSid: string; phoneNumber: string }): void {
+    this.buyNumberResults.push(result);
   }
 
   async ensureCredentials(): Promise<void> {
@@ -37,12 +54,18 @@ export class FakeVoiceProvider implements VoiceProvider {
 
   async buyNumber(p: BuyNumberParams): Promise<{ numberSid: string; phoneNumber: string }> {
     this.boughtNumbers.push(p);
+    const failure = this.buyNumberFailures.shift();
+    if (failure) throw failure;
+    const queued = this.buyNumberResults.shift();
+    if (queued) return queued;
     const n = ++this.numberSeq;
     return { numberSid: `PN${String(n).padStart(8, '0')}`, phoneNumber: `+1555555${String(n).padStart(4, '0')}` };
   }
 
   async releaseNumber(numberSid: string): Promise<void> {
     this.releasedNumbers.push(numberSid);
+    const failure = this.releaseNumberFailures.shift();
+    if (failure) throw failure;
   }
 
   validateSignature(p: ValidateSignatureParams): boolean {
