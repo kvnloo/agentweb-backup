@@ -5,15 +5,14 @@ import { isRecord } from '../services/leadNotificationAttribution';
 import { LEAD_ORIGINS, LEAD_ORIGIN_DESCRIPTIONS } from '../services/leadNotificationConfig';
 import {
   allowlistedE164, hotLeadCallConfigOf, normalizeTimezone, HHMM, HOT_LEAD_CALL_ANNOUNCED_NAME_MAX, HOT_LEAD_CALL_COUNTRIES,
-  HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS, HOT_LEAD_CALL_SYSTEM_FIELDS,
+  HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS, HOT_LEAD_CALL_SYSTEM_FIELDS, maskPhone,
   type HotLeadCallConfig,
 } from '../services/hotLeadCallConfig';
+import { unchangedSince } from '../services/voice/setupWrites';
 import { toE164 } from '../services/whatsappService';
 import { parsePhoneNumberWithError } from 'libphonenumber-js';
 
 const WRITABLE = ['enabled', 'destinationPhone', 'leadTypes', ...HOT_LEAD_CALL_LIMIT_FIELDS, 'announcedName', 'quietHours', 'allowedCountries'];
-
-const maskPhone = (phone: string) => `***${phone.slice(-4)}`;
 
 function settings(config?: HotLeadCallConfig) {
   return {
@@ -83,7 +82,7 @@ function validateArgs(args: unknown, allowed: readonly string[]): asserts args i
   }
 }
 
-function storedConfig(stored: unknown): HotLeadCallConfig | undefined {
+export function storedConfig(stored: unknown): HotLeadCallConfig | undefined {
   if (stored === undefined) return undefined;
   const config = hotLeadCallConfigOf(stored);
   if (!config) throw new Error('Stored hot lead call settings are invalid');
@@ -146,9 +145,7 @@ emmaToolRegistry.register({
     }
 
     // First write must not race another first write; later writes must not clobber a concurrent edit.
-    await orgDb.updateOrg(org.orgId, { hotLeadCall: validated }, { condition: previous === undefined
-      ? { expression: 'attribute_not_exists(#previousHotLeadCall)', names: { '#previousHotLeadCall': 'hotLeadCall' } }
-      : { expression: '#previousHotLeadCall = :previousHotLeadCall', names: { '#previousHotLeadCall': 'hotLeadCall' }, values: { ':previousHotLeadCall': previous } } });
+    await orgDb.updateOrg(org.orgId, { hotLeadCall: validated }, { condition: unchangedSince({ hotLeadCall: previous }) });
     return { success: true, ...settings(validated) };
   },
 });

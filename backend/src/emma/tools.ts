@@ -124,6 +124,7 @@ import * as miscImpl from './impl/misc';
 import './browserCookieTools';
 import './leadNotificationTools';
 import './hotLeadCallTools';
+import './hotLeadCallSetupTools';
 
 // Register email lookup / find tool (provider-agnostic)
 import './emailLookupTool';

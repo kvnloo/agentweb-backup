@@ -6474,6 +6474,10 @@ export class AgentModeService {
     'update_lead_notification_settings',
     'get_hot_lead_call_settings',
     'update_hot_lead_call_settings',
+    'provision_hot_lead_call_number',
+    'release_hot_lead_call_number',
+    'start_hot_lead_call_verification',
+    'confirm_hot_lead_call_verification',
 
     // Scheduled Chat Management
     'list_scheduled_chats',

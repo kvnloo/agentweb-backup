@@ -868,6 +868,10 @@ export interface Organization {
   modelRoles?: import('./modelRoles').ModelRoles;
   leadNotifications?: LeadNotificationsConfig;
   hotLeadCall?: import('./hotLeadCallConfig').HotLeadCallConfig;
+  /** System-managed pending destination-phone verification (hash only); see services/voice/destinationVerification.ts. */
+  hotLeadCallVerification?: import('./voice/destinationVerification').HotLeadCallVerification;
+  /** System-managed purchase/release history (cost caps); same family as hotLeadCallVerification, see services/voice/numberProvisioning.ts. */
+  hotLeadCallProvisioning?: import('./voice/numberProvisioning').HotLeadCallProvisioning;
   /**
    * Optimistic-concurrency counter for owner-losing operations. Absent until
    * the first one; see orgDb.claimOwnerChange.
@@ -12034,10 +12038,11 @@ export const orgDb = {
   // ProjectionExpression) for call sites that only need a few fields off an
   // otherwise large org record (brandGuidelines, competitors, etc). Omit it
   // to fetch the full item as before — every existing caller is unaffected.
-  async getOrgById(orgId: string, fields?: string[]): Promise<Organization | null> {
+  async getOrgById(orgId: string, fields?: string[], consistent = false): Promise<Organization | null> {
     const params: any = {
       TableName: ORGS_TABLE,
       Key: { orgId },
+      ...(consistent ? { ConsistentRead: true } : {}),
     };
     if (fields && fields.length > 0) {
       const names: Record<string, string> = {};
