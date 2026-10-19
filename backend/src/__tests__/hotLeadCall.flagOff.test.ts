@@ -47,6 +47,11 @@ const callConfig = {
   enabled: true, destinationPhone: '+14155550100', destinationVerifiedAt: '2026-01-01T00:00:00.000Z', twilioNumber: '+14155550111',
   announcedName: 'Acme', quietHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
 };
+const originalJwtSecret = process.env.JWT_SECRET;
+afterAll(() => {
+  if (originalJwtSecret === undefined) delete process.env.JWT_SECRET;
+  else process.env.JWT_SECRET = originalJwtSecret;
+});
 let provider: FakeVoiceProvider;
 let limits: FakeLimitStore;
 let org: Record<string, unknown>;

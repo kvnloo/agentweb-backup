@@ -6,10 +6,6 @@ import { tableName } from '../../config/constants';
  * write, so concurrent callers can never both win the last slot. Correctness never depends on DynamoDB's
  * (eventual) TTL reaper: keys are bucketed per window for counters, and claims are tested against their own
  * expiry; the reaper only deletes what is already dead.
- *
- * Known limits (accepted): fixed windows can admit up to 2x a cap across a boundary; phone-rotating bots can
- * consume an org's hourly/daily caps (the Slack alert still fires); whoever submits a number first suppresses the
- * dial for that number for 24h; the cooldown skips a second genuine lead within ownerCooldownMinutes.
  */
 export interface LimitStore {
   /** Adds one to the counter at `key` unless it already holds `cap`. False = at the cap, nothing written. */

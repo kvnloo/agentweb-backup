@@ -12,7 +12,7 @@ import { buildVoiceWebhookUrl } from './voice/voiceUrls';
 import { isHotLeadCallEnabled } from './voice/hotLeadCallMode';
 import { resolveHotLeadCallContext, type HotLeadCallContext } from './voice/hotLeadCallContext';
 import { getLeadCallStore } from './voice/leadCallStore';
-import { isWithinCallWindow, reserveCallSlot } from './voice/hotLeadCallLimits';
+import { isWithinCallWindow, reserveCallSlot, type Reservation } from './voice/hotLeadCallLimits';
 // This file must not import orgLeadNotificationService: that module calls dispatchHotLeadCall.
 
 interface HotLeadCallJob {
@@ -128,13 +128,14 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
 
   // Reserve BEFORE create and give back if create does not win: a lead that never dials costs no slot, and a
   // lead refused by a limit leaves no record, so its single call slot stays unused (a repeat submission can retry).
-  let slot: Awaited<ReturnType<typeof reserveCallSlot>>;
+  let slot: Reservation;
   try {
     slot = await reserveCallSlot({ orgId: job.orgId, phoneE164: reviewed.phone, config });
   } catch (err) {
     // Fail closed (nothing dialed, no record) but leave a trace on the lead: a missing table or secret is an ops problem.
     console.warn('[hotLeadCall] call limits unavailable', { listId, leadId, error: errorText(err) });
-    await store.addEvent(listId, leadId, 'call.skipped', { reason: 'limits_unavailable' });
+    // The timeline write is best-effort: it must never mask the original failure.
+    await store.addEvent(listId, leadId, 'call.skipped', { reason: 'limits_unavailable' }).catch(() => undefined);
     throw err;
   }
   if (!slot.ok) {

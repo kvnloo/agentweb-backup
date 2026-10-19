@@ -16,7 +16,7 @@ export {};
 
 const ENDPOINT = process.env.DYNAMODB_LOCAL_ENDPOINT;
 const suite = ENDPOINT ? describe : describe.skip;
-const TABLE = 'AW-MCPSessions';
+const TABLE = require('../config/constants').tableName('AW-MCPSessions') as string;
 
 suite('hot-lead call limit store against DynamoDB Local', () => {
   let ddb: any;

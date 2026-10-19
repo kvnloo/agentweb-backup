@@ -62,6 +62,12 @@ export type Reservation = { ok: true; release: () => Promise<void> } | { ok: fal
  * limits protect money and phones, and a rejected call is rare. Order: the non-counting claims first (phone,
  * cooldown), counters last, so the common abuse refusals touch no counter at all.
  * Store failures throw (the job fails and nothing is dialed): fail closed.
+ *
+ * Known limits (accepted): fixed windows can admit up to 2x a cap across a boundary; phone-rotating bots can
+ * consume an org's hourly/daily caps (the Slack alert still fires); whoever submits a number first suppresses the
+ * dial for that number for 24h; the cooldown skips a second genuine lead within ownerCooldownMinutes; a process
+ * crash between this call and store.create leaves the 24h phone marker and the cooldown claim held with no
+ * record, so a repeat of that number is refused as duplicate_phone with a silent timeline.
  */
 export async function reserveCallSlot(input: { orgId: string; phoneE164: string; config: HotLeadCallConfig; now?: Date }): Promise<Reservation> {
   const { orgId, phoneE164, config } = input;

@@ -561,11 +561,11 @@ describe('abuse limits (reservation)', () => {
     expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'limits_unavailable' } }]);
   });
 
-  it('still fails the job (not the event write) when the limits_unavailable event itself cannot be written', async () => {
+  it('fails the job with the original error when the limits_unavailable event cannot be written', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     limits.failNext = new Error('ddb down');
     store.addEvent = async () => { throw new Error('events down'); };
-    await expect(processHotLeadCallJob(jobOf())).rejects.toThrow();
+    await expect(processHotLeadCallJob(jobOf())).rejects.toThrow('ddb down');
     warn.mockRestore();
     expect(provider.placedCalls).toHaveLength(0);
   });

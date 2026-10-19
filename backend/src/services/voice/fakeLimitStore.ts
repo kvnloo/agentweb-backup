@@ -17,6 +17,7 @@ export class FakeLimitStore implements LimitStore {
   }
 
   async incrementBelow(key: string, cap: number, expiresAtS: number): Promise<boolean> {
+    if (!(cap >= 1)) return false; // like the real store: nothing admitted, no write
     this.touch(key);
     const n = this.counters.get(key) ?? 0;
     if (n >= cap) return false;
