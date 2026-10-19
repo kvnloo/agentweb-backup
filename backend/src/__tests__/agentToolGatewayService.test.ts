@@ -438,6 +438,9 @@ describe('agentToolGatewayService', () => {
           'el => el.textContent',
           'function () { return 1; }',
           'async function f() { return 1; }',
+          'async (x = Promise.resolve(1)) => x',
+          '({ a }) => a',
+          '([a, b] = [1, 2]) => a + b',
         ])('leaves function source %s unchanged', (fn) => {
           const result = run(fn);
           expect(result.args).toEqual({ function: fn });

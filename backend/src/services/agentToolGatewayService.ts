@@ -844,7 +844,31 @@ function repairHubSpotListIdFromQuery(
 // IIFE (`(() => {...})()`) or a bare expression (`JSON.stringify({...})`), which Playwright
 // evaluates and then fails on with "TypeError: result is not a function". Wrap those
 // values in a zero-arg arrow. Values that are already function sources are left unchanged.
-const FUNCTION_SOURCE_RE = /^(?:async\s+)?(?:function\b|\([^()]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)/;
+const FUNCTION_SOURCE_RE = /^(?:async\s+)?(?:function\b|[A-Za-z_$][\w$]*\s*=>)/;
+
+// Arrow functions whose parameter list nests parens/brackets, e.g.
+// `async (x = Promise.resolve(1)) => x`, need a balanced scan, not a regex.
+function isParenArrowFunctionSource(source: string): boolean {
+  const body = source.replace(/^async\s*/, '');
+  if (!body.startsWith('(')) return false;
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (quote) {
+      if (ch === '\\') i++;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') quote = ch;
+    else if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') {
+      depth--;
+      if (depth === 0) return /^\s*=>/.test(body.slice(i + 1));
+    }
+  }
+  return false;
+}
 
 export function repairEvaluateFunctionArg(
   toolName: string,
@@ -854,7 +878,7 @@ export function repairEvaluateFunctionArg(
   const value = args.function;
   if (typeof value !== 'string') return null;
   const source = value.trim();
-  if (!source || FUNCTION_SOURCE_RE.test(source)) return null;
+  if (!source || FUNCTION_SOURCE_RE.test(source) || isParenArrowFunctionSource(source)) return null;
   args.function = `() => (${source.replace(/;\s*$/, '')})`;
   return 'function:wrap_expression';
 }
