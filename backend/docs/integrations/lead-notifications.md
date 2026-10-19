@@ -27,6 +27,10 @@ Only email placeholders matching `noemail+*@waterheater.app` (case-insensitive)
 are hidden automatically. The notification still sends. Other addresses are
 visible; legacy `excludeEmailPatterns` values no longer broaden email hiding.
 
+The same lead-created moment also feeds the optional hot-lead auto-call (a phone
+call to the business owner, press 1 to connect the lead). It is independent of
+Slack and never changes this alert; see [hot-lead-call.md](./hot-lead-call.md).
+
 ## Lead-type filter and Emma tools
 
 `leadTypes` is optional on the existing org JSON config. Absent means
