@@ -52,7 +52,10 @@ function makeDeps(overrides: Partial<ModelAccessDeps> & { switchValue?: unknown;
     resolveTier: jest.fn(async (userId: string) => (users[userId]
       ? { subscriptionType: users[userId].tier, resolved: true }
       : { subscriptionType: 'Free', resolved: false })),
-    getTierConfig: jest.fn(async (tierName: string) => TIERS.find((t) => t.name === tierName) ?? null),
+    readTierModels: jest.fn(async (tierName: string) => {
+      const tier = TIERS.find((t) => t.name === tierName);
+      return tier ? { configured: true, allowedModels: tier.allowedModels } : { configured: false };
+    }),
     listTiers: jest.fn(async () => TIERS),
     normalizeModelId: normalize,
     alertTierUnreadable: jest.fn(async () => true),
@@ -120,7 +123,7 @@ describe('the switch', () => {
     expect(await access.filterAllowedModels('u-free', ['gpt-5.5'])).toEqual(['gpt-5.5']);
     expect(deps.getUser).not.toHaveBeenCalled();
     expect(deps.resolveTier).not.toHaveBeenCalled();
-    expect(deps.getTierConfig).not.toHaveBeenCalled();
+    expect(deps.readTierModels).not.toHaveBeenCalled();
   });
 
   it('a cold-start read failure is off; a later failure keeps the last-known value; reads are cached ~60s', async () => {
@@ -157,7 +160,7 @@ describe('getModelAccess', () => {
     const access = createModelAccess(deps);
     expect(await access.getModelAccess('u-admin')).toMatchObject({ isAdmin: true, allowedModels: '*', source: 'admin' });
     expect(deps.resolveTier).not.toHaveBeenCalled();
-    expect(deps.getTierConfig).not.toHaveBeenCalled();
+    expect(deps.readTierModels).not.toHaveBeenCalled();
   });
 
   it("an anon_ owner gets the Free tier's list without a user read", async () => {
@@ -193,7 +196,7 @@ describe('unreadable tier: never blocks', () => {
     const access = createModelAccess(deps);
     const first = await access.getModelAccess('u-pro');
     advance(11_000);
-    (deps.getTierConfig as jest.Mock).mockResolvedValueOnce(null);
+    (deps.readTierModels as jest.Mock).mockRejectedValueOnce(new Error('settings read failed'));
     expect(await access.getModelAccess('u-pro')).toEqual({ ...first, source: 'last_known' });
     advance(11_000);
     (deps.resolveTier as jest.Mock).mockRejectedValueOnce(new Error('ddb down'));
@@ -215,9 +218,52 @@ describe('unreadable tier: never blocks', () => {
 
   it('a failing alert sink never fails the turn', async () => {
     const { deps } = makeDeps({ alertTierUnreadable: jest.fn().mockRejectedValue(new Error('smtp down')) });
-    (deps.getTierConfig as jest.Mock).mockRejectedValue(new Error('ddb down'));
+    (deps.readTierModels as jest.Mock).mockRejectedValue(new Error('ddb down'));
     const access = createModelAccess(deps);
     await expect(access.getModelAccess('u-free')).resolves.toMatchObject({ allowedModels: '*', source: 'unavailable' });
+  });
+});
+
+describe('unconfigured tier and read storms (review R4)', () => {
+  it('a tier with no row is every model, cached like any answer, logged once, and NEVER alerts', async () => {
+    const { deps } = makeDeps({ users: { 'u-ghost': { tier: 'Enterprise-Legacy' }, 'u-ghost-2': { tier: 'Enterprise-Legacy' } } });
+    const access = createModelAccess(deps);
+    for (let i = 0; i < 5; i++) {
+      expect(await access.getModelAccess('u-ghost')).toMatchObject({ tier: 'Enterprise-Legacy', allowedModels: '*', source: 'tier' });
+    }
+    await access.getModelAccess('u-ghost-2');
+    expect(deps.getUser).toHaveBeenCalledTimes(2);
+    expect(deps.resolveTier).toHaveBeenCalledTimes(2);
+    expect(deps.readTierModels).toHaveBeenCalledTimes(2);
+    expect(deps.alertTierUnreadable).not.toHaveBeenCalled();
+    expect((deps.log as jest.Mock).mock.calls.filter(([m]) => /no subscription_types row/.test(m))).toHaveLength(1);
+  });
+
+  it('anon_ with no Free row is every model, without an alert', async () => {
+    const { deps } = makeDeps();
+    (deps.readTierModels as jest.Mock).mockResolvedValue({ configured: false });
+    const access = createModelAccess(deps);
+    expect(await access.getModelAccess('anon_1')).toMatchObject({ tier: 'Free', allowedModels: '*', source: 'tier' });
+    expect(deps.alertTierUnreadable).not.toHaveBeenCalled();
+  });
+
+  it('a FAILING read is answered from a short cache too: N turns => bounded reads, not N of each', async () => {
+    const { deps, advance } = makeDeps();
+    (deps.readTierModels as jest.Mock).mockRejectedValue(new Error('ddb down'));
+    const access = createModelAccess(deps);
+    for (let i = 0; i < 5; i++) {
+      expect(await access.getModelAccess('u-free')).toMatchObject({ allowedModels: '*', source: 'unavailable' });
+    }
+    expect(deps.getUser).toHaveBeenCalledTimes(1);
+    expect(deps.resolveTier).toHaveBeenCalledTimes(1);
+    expect(deps.readTierModels).toHaveBeenCalledTimes(1);
+    advance(11_000);
+    await access.getModelAccess('u-free');
+    expect(deps.readTierModels).toHaveBeenCalledTimes(2);
+    // ...and a recovered read replaces the degraded answer at once.
+    (deps.readTierModels as jest.Mock).mockImplementation(async () => ({ configured: true, allowedModels: ['gemini-3.5-flash'] }));
+    advance(11_000);
+    expect(await access.getModelAccess('u-free')).toMatchObject({ allowedModels: ['gemini-3.5-flash'], source: 'tier' });
   });
 });
 

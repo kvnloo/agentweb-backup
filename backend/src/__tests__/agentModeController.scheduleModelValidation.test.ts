@@ -10,7 +10,7 @@ jest.mock('../services/subscriptionService', () => ({
   isSubscriptionFeatureEnabled: jest.fn(async () => true),
   // ENG-669: the owner's tier for the model allowlist.
   getUserSubscriptionResolution: jest.fn(async () => ({ subscriptionType: 'Free', resolved: true })),
-  getSubscriptionTypeConfig: jest.fn(async (tier: string) => (tier === 'Free' ? { name: 'Free', allowedModels: ['anthropic.claude-opus-4-8'] } : null)),
+  readTierAllowedModels: jest.fn(async (tier: string) => (tier === 'Free' ? { configured: true, allowedModels: ['gemini-3.5-flash'] } : { configured: false })),
 }));
 // ENG-669: AW-Settings rows by name; the tier-allowlist switch is off unless a test sets it.
 const mockSettings: Record<string, string | undefined> = {};
@@ -28,6 +28,8 @@ type Cfg = { name: string; internalOnly?: boolean; adminOnly?: boolean; isLive?:
 const REGISTRY: Record<string, Cfg> = {
   'gpt-5-chat-2': { name: 'GPT 5 Chat 2' },
   'anthropic.claude-sonnet-5': { name: 'Sonnet 5' },
+  // ENG-669: the one model the test Free tier lists (not the default, so "allowed" is proven on its own).
+  'gemini-3.5-flash': { name: 'Gemini 3.5 Flash' },
   'anthropic.claude-opus-4-8': { name: 'Opus 4.8', adminOnly: true },
   'internal-model': { name: 'Internal', internalOnly: true },
   'live-voice': { name: 'Live', isLive: true },
@@ -322,15 +324,20 @@ describe('ENG-669 tier model allowlist on schedule pins', () => {
       expect(res.status).toHaveBeenCalledWith(422);
       expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
         code: 'model_unavailable', reason: 'not_in_plan', requestedModel: llmModel,
-        model: NOT_IN_PLAN, tier: 'Free', allowedModels: ['anthropic.claude-opus-4-8'], upgradeRequired: ['Pro'],
+        model: NOT_IN_PLAN, tier: 'Free', allowedModels: ['gemini-3.5-flash'], upgradeRequired: ['Pro'],
       }));
     }
     expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
   });
 
-  it('create: the backup is checked too; an allowed pin is stored', async () => {
+  it('create: the backup is checked too; a pin the plan lists is stored', async () => {
     expect((await create({ llmBackupModel: NOT_IN_PLAN })).status).toHaveBeenCalledWith(422);
     expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+    await create({ llmModel: 'gemini-3.5-flash' });
+    expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(expect.objectContaining({ llmModel: 'gemini-3.5-flash' }));
+  });
+
+  it('create: the configured default is not listed but is a system model, so it is stored too', async () => {
     await create({ llmModel: 'gpt-5-chat-2' });
     expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(expect.objectContaining({ llmModel: 'gpt-5-chat-2' }));
   });
@@ -351,6 +358,51 @@ describe('ENG-669 tier model allowlist on schedule pins', () => {
     expect(changed.status).toHaveBeenCalledWith(422);
     expect(changed.json).toHaveBeenCalledWith(expect.objectContaining({ reason: 'not_in_plan' }));
     expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(1);
+  });
+
+  describe('createScheduleFromTemplate (review MAJOR 2)', () => {
+    const fromTemplate = async (tpl: Record<string, unknown>, body: Record<string, unknown> = {}) => {
+      (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue({
+        templateId: 't1', name: 'T', startingMessage: 'Hi', suggestedFrequency: 'daily', variables: [], ...tpl,
+      });
+      const res = makeRes();
+      await (agentModeController as any).createScheduleFromTemplate(
+        { user: { userId: USER, email: 'a@b.c' }, params: { templateId: 't1' }, body: { scheduleName: 'S', ...body } } as unknown as Request, res);
+      return res;
+    };
+
+    it("an admin-authored (system) template's pin is inherited as a SYSTEM model: stored with llmModelSource 'system'", async () => {
+      const res = await fromTemplate({ visibility: 'system', llmModel: NOT_IN_PLAN });
+      expect(res.status).not.toHaveBeenCalledWith(422);
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(expect.objectContaining({ llmModel: NOT_IN_PLAN, llmModelSource: 'system' }));
+    });
+
+    it("a user-authored template's pin outside the plan is a 422 at creation (not a failed run later); nothing written", async () => {
+      for (const visibility of ['private', 'public']) {
+        const res = await fromTemplate({ visibility, createdBy: USER, llmModel: NOT_IN_PLAN });
+        expect(res.status).toHaveBeenCalledWith(422);
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'model_unavailable', reason: 'not_in_plan' }));
+      }
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+    });
+
+    it("a user-authored template's pin the plan lists is inherited as the owner's pin (no system origin)", async () => {
+      await fromTemplate({ visibility: 'private', createdBy: USER, llmModel: 'gemini-3.5-flash' });
+      const created = mockScheduleDb.createSchedule.mock.calls[0][0] as any;
+      expect(created.llmModel).toBe('gemini-3.5-flash');
+      expect(created).not.toHaveProperty('llmModelSource');
+    });
+
+    it('an explicit override is the owner\'s pin even on a system template', async () => {
+      expect((await fromTemplate({ visibility: 'system', llmModel: 'gemini-3.5-flash' }, { llmModel: NOT_IN_PLAN })).status)
+        .toHaveBeenCalledWith(422);
+    });
+  });
+
+  it('update: changing the pin of a schedule inherited from a system template records it as the owner\'s', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored({ llmModel: NOT_IN_PLAN, llmModelSource: 'system' }) as any);
+    await update({ llmModel: 'gemini-3.5-flash' });
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith('s1', expect.objectContaining({ llmModel: 'gemini-3.5-flash', llmModelSource: 'user' }), ...[] as any);
   });
 
   it('switch off: the same pin is accepted exactly as before', async () => {

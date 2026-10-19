@@ -14,7 +14,7 @@ jest.mock('../services/settingsService', () => ({
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() } }));
 jest.mock('../services/subscriptionService', () => ({
   getUserSubscriptionResolution: jest.fn(),
-  getSubscriptionTypeConfig: jest.fn(),
+  readTierAllowedModels: jest.fn(),
 }));
 jest.mock('../services/workPlanService', () => ({ workPlanService: { getWorkPlan: jest.fn() } }));
 jest.mock('../services/emailService', () => ({ emailService: { sendOncallAlert: jest.fn().mockResolvedValue(undefined) } }));
@@ -41,13 +41,13 @@ jest.mock('../services/agentModeService', () => {
 
 import { getTierCompareBlock, isSystemModelFor, modelAccess } from '../services/agentMode/modelAccessInstance';
 import { userDb } from '../services/db';
-import { getSubscriptionTypeConfig, getUserSubscriptionResolution } from '../services/subscriptionService';
+import { readTierAllowedModels, getUserSubscriptionResolution } from '../services/subscriptionService';
 import { workPlanService } from '../services/workPlanService';
 import { emailService } from '../services/emailService';
 
 const mockGetUser = userDb.getUserById as jest.Mock;
 const mockResolution = getUserSubscriptionResolution as jest.Mock;
-const mockTierConfig = getSubscriptionTypeConfig as jest.Mock;
+const mockTierConfig = readTierAllowedModels as jest.Mock;
 const mockGetWorkPlan = workPlanService.getWorkPlan as jest.Mock;
 
 beforeEach(() => {
@@ -57,7 +57,7 @@ beforeEach(() => {
   settings.model_tier_allowlist_enabled = 'true';
   mockGetUser.mockResolvedValue({ isAdmin: false });
   mockResolution.mockResolvedValue({ subscriptionType: 'Free', resolved: true });
-  mockTierConfig.mockResolvedValue({ name: 'Free', allowedModels: ['agentweb-model'] });
+  mockTierConfig.mockResolvedValue({ configured: true, allowedModels: ['agentweb-model'] });
 });
 
 describe('isSystemModelFor', () => {
@@ -89,6 +89,33 @@ describe('isSystemModelFor', () => {
     mockGetWorkPlan.mockResolvedValue({ visibility: 'private', isBuiltIn: false, defaultModel: 'plan-pin', steps: [{ model: 'step-pin' }] });
     expect(await isSystemModelFor(session, 'plan-pin')).toBe(false);
     expect(await isSystemModelFor(session, 'step-pin')).toBe(false);
+  });
+
+  it('the author recorded at launch (planAuthor) decides, with NO template read: a later edit or deletion cannot matter', async () => {
+    const systemPlan = { workPlan: { templatePlanId: 'plan-1', planAuthor: 'system', planDefaultModel: 'plan-pin', steps: [{ model: 'step-pin' }] } };
+    expect(await isSystemModelFor(systemPlan, 'plan-pin')).toBe(true);
+    expect(await isSystemModelFor(systemPlan, 'step-pin')).toBe(true);
+    expect(await isSystemModelFor(systemPlan, 'gpt-5.5')).toBe(false);
+    const userPlan = { workPlan: { templatePlanId: 'plan-1', planAuthor: 'user', planDefaultModel: 'plan-pin', steps: [{ model: 'step-pin' }] } };
+    expect(await isSystemModelFor(userPlan, 'step-pin')).toBe(false);
+    expect(mockGetWorkPlan).not.toHaveBeenCalled();
+  });
+
+  it('legacy session (no planAuthor): a deleted template (null) exempts nothing', async () => {
+    mockGetWorkPlan.mockResolvedValue(null);
+    expect(await isSystemModelFor({ workPlan: { templatePlanId: 'plan-gone' } }, 'plan-pin')).toBe(false);
+  });
+
+  it("the session's stored model is a system model when AgentWeb stamped it (recorded or legacy-defaulted), not when a user picked it", async () => {
+    expect(await isSystemModelFor({ llmModel: 'gpt-5.5', llmModelSource: 'system' }, 'gpt-5.5')).toBe(true);
+    expect(await isSystemModelFor({ llmModel: 'gpt-5.5', llmModelSource: 'user' }, 'gpt-5.5')).toBe(false);
+    expect(await isSystemModelFor({
+      llmModel: 'gpt-5.5', llmUsagePolicyDecision: { effectiveModel: 'gpt-5.5', modelSelection: 'corrected' },
+    }, 'gpt-5.5')).toBe(true);
+    expect(await isSystemModelFor({
+      llmModel: 'gpt-5.5', llmUsagePolicyDecision: { effectiveModel: 'gpt-5.5', modelSelection: 'honored' },
+    }, 'gpt-5.5')).toBe(false);
+    expect(await isSystemModelFor({ llmModel: 'gpt-5.5' }, 'gpt-5.5')).toBe(false);
   });
 
   it('an unreadable template never blocks (treated as admin-authored)', async () => {
@@ -126,12 +153,12 @@ describe('getTierCompareBlock (D3)', () => {
   });
 
   it('the default counts: one allowed model + the default = two, not blocked', async () => {
-    mockTierConfig.mockResolvedValue({ name: 'Free', allowedModels: ['gpt-5.5'] });
+    mockTierConfig.mockResolvedValue({ configured: true, allowedModels: ['gpt-5.5'] });
     expect(await getTierCompareBlock('u-free')).toBeNull();
   });
 
   it('a live-voice model does not count as comparable', async () => {
-    mockTierConfig.mockResolvedValue({ name: 'Free', allowedModels: ['live-1'] });
+    mockTierConfig.mockResolvedValue({ configured: true, allowedModels: ['live-1'] });
     expect(await getTierCompareBlock('u-free')).not.toBeNull();
   });
 
@@ -146,7 +173,7 @@ describe('getTierCompareBlock (D3)', () => {
 
     modelAccess.reset();
     mockGetUser.mockResolvedValue({ isAdmin: false });
-    mockTierConfig.mockResolvedValue({ name: 'Max' });
+    mockTierConfig.mockResolvedValue({ configured: true });
     expect(await getTierCompareBlock('u-max')).toBeNull();
   });
 });

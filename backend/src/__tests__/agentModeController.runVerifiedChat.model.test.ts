@@ -95,7 +95,7 @@ describe('runVerifiedChat model selection', () => {
     });
 
     expect(mockAgentModeService.getReportGenerationDefaultModel).toHaveBeenCalled();
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-1', 'report-gen-model');
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-1', 'report-gen-model', undefined, 'system');
     expect(mockWorkerService.runInWorker).toHaveBeenCalledWith(
       expect.objectContaining({ llmModel: 'report-gen-model' }),
       expect.any(Function)
@@ -122,7 +122,7 @@ describe('runVerifiedChat model selection', () => {
     });
 
     expect(mockAgentModeService.getReportGenerationDefaultModel).toHaveBeenCalled();
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-1', 'report-gen-model');
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-1', 'report-gen-model', undefined, 'system');
     expect(mockWorkerService.runInWorker).toHaveBeenCalledWith(
       expect.objectContaining({ llmModel: 'report-gen-model' }),
       expect.any(Function)
@@ -149,7 +149,7 @@ describe('runVerifiedChat model selection', () => {
     });
 
     expect(mockAgentModeService.getReportGenerationDefaultModel).toHaveBeenCalled();
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-1', 'report-gen-model');
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-1', 'report-gen-model', undefined, 'system');
   });
 
   it('switches session to image generation model for generate_image', async () => {
@@ -177,7 +177,7 @@ describe('runVerifiedChat model selection', () => {
     });
 
     expect(mockAgentModeService.getImageGenerationDefaultModel).toHaveBeenCalled();
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-1', 'image-gen-model');
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-1', 'image-gen-model', undefined, 'system');
   });
 
   it('switches session to video generation model for generate_video', async () => {
@@ -205,7 +205,7 @@ describe('runVerifiedChat model selection', () => {
     });
 
     expect(mockAgentModeService.getVideoGenerationDefaultModel).toHaveBeenCalled();
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-1', 'video-gen-model');
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-1', 'video-gen-model', undefined, 'system');
   });
 
   it('does not override model when llmModel is explicitly provided (generate_image)', async () => {

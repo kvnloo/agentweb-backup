@@ -124,7 +124,7 @@ describe('AgentModeController - llmModel picker validation (ENG-892)', () => {
 
       expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
         sessionId,
-        'gemini-3.5-flash'
+        'gemini-3.5-flash', undefined, 'user',
       );
       expect(res.status).not.toHaveBeenCalledWith(400);
     });
@@ -140,7 +140,7 @@ describe('AgentModeController - llmModel picker validation (ENG-892)', () => {
 
       expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
         sessionId,
-        'anthropic.claude-opus-4-8'
+        'anthropic.claude-opus-4-8', undefined, 'user',
       );
     });
 
@@ -154,7 +154,7 @@ describe('AgentModeController - llmModel picker validation (ENG-892)', () => {
       );
 
       expect(res.status).not.toHaveBeenCalledWith(403);
-      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, 'anthropic.claude-opus-4-8');
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, 'anthropic.claude-opus-4-8', undefined, 'user');
     });
 
     it('still refuses registry-restricted models (internalOnly; adminOnly for non-admins)', async () => {
@@ -171,7 +171,7 @@ describe('AgentModeController - llmModel picker validation (ENG-892)', () => {
           res
         );
         if (allowed) {
-          expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, model);
+          expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, model, undefined, 'user');
         } else {
           expect(res.status).toHaveBeenCalledWith(403);
           expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
@@ -202,7 +202,7 @@ describe('AgentModeController - llmModel picker validation (ENG-892)', () => {
 
       expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
         sessionId,
-        'openrouter/example/admin-only-model'
+        'openrouter/example/admin-only-model', undefined, 'user',
       );
     });
 
@@ -247,7 +247,7 @@ describe('AgentModeController - llmModel picker validation (ENG-892)', () => {
       };
       const ok = await call('anthropic.claude-opus-5');
       expect(ok.status).not.toHaveBeenCalledWith(403);
-      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, 'anthropic.claude-opus-5');
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, 'anthropic.claude-opus-5', undefined, 'user');
       for (const m of ['internal-model', 'admin-only-model']) {
         const r = await call(m);
         expect(r.status).toHaveBeenCalledWith(403);

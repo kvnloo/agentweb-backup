@@ -230,7 +230,7 @@ describe('handleSessionResponse — edges', () => {
   it('resolves and persists a default model when the session has none', async () => {
     await handleSessionResponse(baseParams({ session: { sessionId: 's1' } }), makeAdapter());
 
-    expect(chatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('s1', 'default-model');
+    expect(chatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('s1', 'default-model', undefined, 'system');
     expect(generateSessionResponse).toHaveBeenCalledWith('s1', 'John: hello there', 'u1', 'default-model', []);
   });
 

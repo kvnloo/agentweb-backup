@@ -112,7 +112,7 @@ describe('createSessionWithPlan with per-step models', () => {
     expect(steps.map((s) => s.model)).toEqual(['gemini-3-pro-preview', undefined, 'gpt-5-chat']);
     expect('model' in steps[1]).toBe(false);
     // the session starts on the account default (no plan pin); the engine applies step 1's model at the first turn
-    expect(db.updateSessionLlmModel).toHaveBeenCalledWith('sess-1', 'gpt-5-chat');
+    expect(db.updateSessionLlmModel).toHaveBeenCalledWith('sess-1', 'gpt-5-chat', undefined, 'system');
   });
 
   it.each([
@@ -142,7 +142,7 @@ describe('createSessionWithPlan with per-step models', () => {
   it('ON: the plan pin is still resolved and still wins at launch; a bad pin is refused with no stepCount', async () => {
     publish([S(1, 'gemini-3-pro-preview')], { defaultModel: 'gpt-5-chat' });
     await agentModeController.createSessionWithPlan(req(), res());
-    expect(db.updateSessionLlmModel).toHaveBeenCalledWith('sess-1', 'gpt-5-chat');
+    expect(db.updateSessionLlmModel).toHaveBeenCalledWith('sess-1', 'gpt-5-chat', undefined, 'system');
     jest.clearAllMocks();
     publish([S(1, 'gemini-3-pro-preview')], { defaultModel: 'retired-9' });
     const r = res();

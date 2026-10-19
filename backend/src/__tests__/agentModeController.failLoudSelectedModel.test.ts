@@ -107,7 +107,7 @@ jest.mock('../services/subscriptionService', () => ({
   getAllowedSkills: jest.fn().mockResolvedValue([]),
   // ENG-669: the tier allowlist resolves the owner's tier through these two.
   getUserSubscriptionResolution: jest.fn(),
-  getSubscriptionTypeConfig: jest.fn(),
+  readTierAllowedModels: jest.fn(),
 }));
 // ENG-669: AW-Settings rows by name (the tier-allowlist switch, subscription_types); absent = null.
 const mockSettings: Record<string, string | undefined> = {};
@@ -152,7 +152,7 @@ import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverSe
 import { checkTokenUsage, incrementUserTokenUsage } from '../services/tokenUsageService';
 import { isRunStoreEnabled, claimIdempotency } from '../services/agentMode/runStore';
 import { modelAccess } from '../services/agentMode/modelAccessInstance';
-import { getSubscriptionTypeConfig, getUserSubscriptionResolution } from '../services/subscriptionService';
+import { readTierAllowedModels, getUserSubscriptionResolution } from '../services/subscriptionService';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockWorker = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
@@ -433,7 +433,7 @@ describe('POST /generate (fail-loud)', () => {
     expect(res.statusCode).toBe(200);
     expect(res.body).toMatchObject({ backupModel: 'gemini-3.5-flash', backupSource: 'user' });
     expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
-      SESSION_ID, 'gpt-5.5', expect.objectContaining({ backupModel: 'gemini-3.5-flash' }),
+      SESSION_ID, 'gpt-5.5', expect.objectContaining({ backupModel: 'gemini-3.5-flash' }), 'user',
     );
   });
 
@@ -500,7 +500,7 @@ describe('POST /generate (fail-loud)', () => {
       expect.objectContaining({ llmModel: 'gpt-5.5' }),
       expect.anything(),
     );
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'gpt-5.5', expect.objectContaining({ modelSelection: 'honored' }));
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'gpt-5.5', expect.objectContaining({ modelSelection: 'honored' }), 'user');
     expect(res.body).toMatchObject({ effectiveModel: 'gpt-5.5', modelSelection: 'honored' });
   });
 });
@@ -541,7 +541,7 @@ describe('createSession (fail-loud)', () => {
     const padded = makeRes();
     await agentModeController.createSession(createReq({ portalType: 'agent', llmModel: ' gpt-5.5' }), padded);
     expect(padded.statusCode).toBe(201);
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'gpt-5.5', expect.anything());
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'gpt-5.5', expect.anything(), 'user');
 
     const blank = makeRes();
     await agentModeController.createSession(createReq({ portalType: 'agent', llmModel: '   ' }), blank);
@@ -560,13 +560,13 @@ describe('createSession (fail-loud)', () => {
     const served = makeRes();
     await agentModeController.createSession(createReq({ portalType: 'agent', llmModel: 'gpt-5.5' }), served);
     expect(served.statusCode).toBe(201);
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'gpt-5.5', expect.anything());
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'gpt-5.5', expect.anything(), 'user');
 
     mockChatbotDb.updateSessionLlmModel.mockClear();
     const dflt = makeRes();
     await agentModeController.createSession(createReq({ portalType: 'agent' }), dflt);
     expect(dflt.statusCode).toBe(201);
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, expect.anything());
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, expect.anything(), 'system');
   });
 
   // ENG-903: these session types run on a fixed, admin-configured model; a chat-model
@@ -615,7 +615,7 @@ describe('createSession (fail-loud)', () => {
       const res = makeRes();
       await agentModeController.createSession(createReq(body), res);
       expect(res.statusCode).toBe(201);
-      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, undefined);
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, undefined, 'system');
     }
   });
 
@@ -670,7 +670,7 @@ describe('createSession (fail-loud)', () => {
     const res = makeRes();
     await agentModeController.createSession(createReq({ portalType: 'agent', sessionType: 'regular', llmModel: 'gpt-5.5' }), res);
     expect(res.statusCode).toBe(201);
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'gpt-5.5', expect.anything());
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'gpt-5.5', expect.anything(), 'user');
   });
 });
 
@@ -719,7 +719,7 @@ describe('ENG-669 tier model allowlist', () => {
   const ALLOWED = 'gemini-3.5-flash';
   const DISALLOWED = 'gpt-5.5';
   const mockResolution = getUserSubscriptionResolution as jest.Mock;
-  const mockTierConfig = getSubscriptionTypeConfig as jest.Mock;
+  const mockTierConfig = readTierAllowedModels as jest.Mock;
   const PLAN_FIELDS = { model: DISALLOWED, tier: 'Free', allowedModels: [ALLOWED], upgradeRequired: ['Pro'] };
 
   const switchOn = () => { mockSettings.model_tier_allowlist_enabled = 'true'; };
@@ -730,7 +730,10 @@ describe('ENG-669 tier model allowlist', () => {
       { name: 'Pro', allowedModels: ['*'] },
     ]);
     mockResolution.mockResolvedValue({ subscriptionType: 'Free', resolved: true });
-    mockTierConfig.mockImplementation(async (tier: string) => JSON.parse(mockSettings.subscription_types as string).find((t: any) => t.name === tier) ?? null);
+    mockTierConfig.mockImplementation(async (tier: string) => {
+      const row = JSON.parse(mockSettings.subscription_types as string).find((t: any) => t.name === tier);
+      return row ? { configured: true, allowedModels: row.allowedModels } : { configured: false };
+    });
   });
 
   const shareReq = () => ({
@@ -766,7 +769,7 @@ describe('ENG-669 tier model allowlist', () => {
       const res = makeRes();
       await agentModeController.updateSessionLlmModel({ user: { userId: OWNER }, params: { sessionId: SESSION_ID }, body: { llmModel: DISALLOWED } } as any, res);
       expect(res.statusCode).toBe(200);
-      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DISALLOWED);
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DISALLOWED, undefined, 'user');
     });
   });
 
@@ -885,7 +888,7 @@ describe('ENG-669 tier model allowlist', () => {
       const dflt = makeRes();
       await agentModeController.createSession({ user: { userId: OWNER }, body: { portalType: 'agent' } } as any, dflt);
       expect(dflt.statusCode).toBe(201);
-      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, expect.anything());
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, expect.anything(), 'system');
     });
 
     it('verified-generate: a stored model outside the plan is a 422 before anything runs', async () => {
@@ -949,7 +952,7 @@ describe('ENG-669 tier model allowlist', () => {
         const res = makeRes();
         await agentModeController.updateSessionLlmModel(patchReq(ALLOWED), res);
         expect(res.statusCode).toBe(200);
-        expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, ALLOWED);
+        expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, ALLOWED, undefined, 'user');
       });
 
       it("the shared PATCH refuses a pick outside the owner's plan without exposing the plan", async () => {
@@ -963,6 +966,80 @@ describe('ENG-669 tier model allowlist', () => {
         expect(res.body).not.toHaveProperty('allowedModels');
         expect(res.body).not.toHaveProperty('upgradeRequired');
         expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+      });
+    });
+
+    /**
+     * Review R1 (MAJOR 1): createSession with no model stamps the CURRENT default; after an admin rotates the default,
+     * that stale stamp is still AgentWeb's choice (llmModelSource 'system'), not the user's, so neither /generate (the
+     * portal echoes the stamp) nor a side channel (generateSessionResponse) may refuse it as "not in your plan".
+     */
+    describe('a system-stamped default stays exempt after the default rotates (review R1)', () => {
+      const OLD_DEFAULT = DEFAULT_MODEL; // not in the Free list ([ALLOWED])
+      const rotate = () => mockAgentModeService.getDefaultModel.mockResolvedValue(DISALLOWED);
+      afterEach(() => mockAgentModeService.getDefaultModel.mockResolvedValue(DEFAULT_MODEL));
+
+      it('createSession with no model records the stamp as a SYSTEM choice', async () => {
+        const res = makeRes();
+        await agentModeController.createSession({ user: { userId: OWNER }, body: { portalType: 'agent' } } as any, res);
+        expect(res.statusCode).toBe(201);
+        expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, OLD_DEFAULT, expect.anything(), 'system');
+      });
+
+      it('after the rotation: /generate (echo and no model) and generateSessionResponse still run, no not_in_plan', async () => {
+        rotate();
+        mockChatbotDb.getChatSession.mockResolvedValue({ ...baseSession(OLD_DEFAULT), llmModelSource: 'system' } as any);
+        for (const body of [{ llmModel: OLD_DEFAULT }, {}]) {
+          mockWorker.runInWorker.mockClear();
+          mockChatbotDb.updateSessionLlmModel.mockClear();
+          const res = makeRes();
+          await agentModeController.generateResponse(generateReq(body), res);
+          expect(res.statusCode).toBe(200);
+          expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: OLD_DEFAULT }), expect.anything());
+          // ...and the stamp stays AgentWeb's choice (the echo is not a new pick).
+          expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, OLD_DEFAULT, expect.anything(), 'system');
+        }
+        mockWorker.runInWorker.mockClear();
+        await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, OLD_DEFAULT);
+        expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: OLD_DEFAULT }), expect.anything());
+      });
+
+      it('a legacy session (no recorded source) whose decision shows the default stood in is treated as AgentWeb\'s', async () => {
+        rotate();
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...baseSession(OLD_DEFAULT),
+          llmUsagePolicyDecision: { requestedModel: null, effectiveModel: OLD_DEFAULT, backupModel: null, backupSource: null, modelSelection: 'defaulted', modelSelectionReason: 'no_requested_model_using_default', usageMode: 'full_choice', usagePolicyVersion: null, recordedAt: 'x' },
+        } as any);
+        const res = makeRes();
+        await agentModeController.generateResponse(generateReq({}), res);
+        expect(res.statusCode).toBe(200);
+      });
+
+      it('a legacy session with no evidence the system chose it is a user pick: visible 422, never a swap', async () => {
+        rotate();
+        mockChatbotDb.getChatSession.mockResolvedValue(baseSession(OLD_DEFAULT) as any);
+        const res = makeRes();
+        await agentModeController.generateResponse(generateReq({}), res);
+        expect(res.statusCode).toBe(422);
+        expect(res.body).toMatchObject({ reason: 'not_in_plan', requestedModel: OLD_DEFAULT });
+        expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+      });
+
+      it('a DIFFERENT explicit pick is the user\'s: checked, and recorded as user when allowed', async () => {
+        mockChatbotDb.getChatSession.mockResolvedValue({ ...baseSession(OLD_DEFAULT), llmModelSource: 'system' } as any);
+        const refused = makeRes();
+        await agentModeController.generateResponse(generateReq({ llmModel: DISALLOWED }), refused);
+        expect(refused.statusCode).toBe(422);
+        const ok = makeRes();
+        await agentModeController.generateResponse(generateReq({ llmModel: ALLOWED }), ok);
+        expect(ok.statusCode).toBe(200);
+        expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, ALLOWED, expect.anything(), 'user');
+      });
+
+      it('the PATCH records a pick as the user\'s', async () => {
+        const res = makeRes();
+        await agentModeController.updateSessionLlmModel({ user: { userId: OWNER }, params: { sessionId: SESSION_ID }, body: { llmModel: ALLOWED } } as any, res);
+        expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, ALLOWED, undefined, 'user');
       });
     });
 

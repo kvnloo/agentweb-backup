@@ -51,7 +51,7 @@ jest.mock('../services/settingsService', () => ({
 }));
 jest.mock('../services/subscriptionService', () => ({
   getUserSubscriptionResolution: jest.fn(async () => ({ subscriptionType: 'Free', resolved: true })),
-  getSubscriptionTypeConfig: jest.fn(async (tier: string) => (tier === 'Free' ? { name: 'Free', allowedModels: ['gpt-5-chat'] } : null)),
+  readTierAllowedModels: jest.fn(async (tier: string) => (tier === 'Free' ? { configured: true, allowedModels: ['gpt-5-chat'] } : { configured: false })),
 }));
 
 // Registry double: same shape as AgentModeService's resolveGenerationModel / isModelSelectableBy.
@@ -185,14 +185,14 @@ describe('applyPredefinedWorkPlan (Emma tool / launch / accept core)', () => {
     getUser.mockResolvedValue({ userId: 'user-1', isAdmin: true });
     const r: any = await launch('admin-only-model');
     expect(r.success).toBe(true);
-    expect(db.updateSessionLlmModel).toHaveBeenCalledWith('s1', 'admin-only-model');
+    expect(db.updateSessionLlmModel).toHaveBeenCalledWith('s1', 'admin-only-model', undefined, 'system');
   });
 
   it('valid, alias and live-served ids launch and store the canonical id; empty leaves the model untouched', async () => {
     expect(((await launch('gpt-5-chat')) as any).success).toBe(true);
-    expect(db.updateSessionLlmModel).toHaveBeenLastCalledWith('s1', 'gpt-5-chat');
+    expect(db.updateSessionLlmModel).toHaveBeenLastCalledWith('s1', 'gpt-5-chat', undefined, 'system');
     expect(((await launch('legacy-alias')) as any).success).toBe(true);
-    expect(db.updateSessionLlmModel).toHaveBeenLastCalledWith('s1', 'claude-sonnet-x');
+    expect(db.updateSessionLlmModel).toHaveBeenLastCalledWith('s1', 'claude-sonnet-x', undefined, 'system');
     db.updateSessionLlmModel.mockClear();
     expect(((await launch('')) as any).success).toBe(true);
     expect(((await launch(undefined)) as any).success).toBe(true);
@@ -253,7 +253,7 @@ describe('applyPredefinedWorkPlan (Emma tool / launch / accept core)', () => {
       const r: any = await launch('gpt-5-chat', { force: true });
       expect(r.success).toBe(false);
       expect(db.updateSessionLlmModel).toHaveBeenCalledTimes(1);
-      expect(db.updateSessionLlmModel).toHaveBeenCalledWith('s1', 'gpt-5-chat');
+      expect(db.updateSessionLlmModel).toHaveBeenCalledWith('s1', 'gpt-5-chat', undefined, 'system');
       expect(db.restoreSessionLlmModelIfUnchanged).toHaveBeenCalledWith('s1', 'gpt-5-chat', { llmModel: 'old-model', llmUsagePolicyDecision: PRIOR_DECISION });
     });
 
@@ -628,7 +628,7 @@ describe('ENG-669 tier model allowlist on plan pins', () => {
     it("an admin-authored (system) plan's pin is exempt and launches on exactly that model", async () => {
       const r = await launchPlan({ ...plan(NOT_IN_PLAN), visibility: 'system', isBuiltIn: true });
       expect(r.success).toBe(true);
-      expect(db.updateSessionLlmModel).toHaveBeenCalledWith('s1', NOT_IN_PLAN);
+      expect(db.updateSessionLlmModel).toHaveBeenCalledWith('s1', NOT_IN_PLAN, undefined, 'system');
     });
 
     it('switch off: the user plan launches as before', async () => {

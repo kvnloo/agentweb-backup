@@ -77,7 +77,9 @@ describe('chatbotDb.updateSessionLlmModel — llmModel/llmUsagePolicyDecision mu
 
     const params = updatePromiseMock.mock.calls[0][0];
     expect(params.UpdateExpression).toContain('SET llmModel = :llmModel, llmUsagePolicyDecision = :policyDecision');
-    expect(params.UpdateExpression).not.toContain('REMOVE');
+    expect(params.UpdateExpression).not.toContain('REMOVE llmUsagePolicyDecision');
+    // ENG-669: a write that does not say who chose the model drops any stale source (same rule as the decision).
+    expect(params.UpdateExpression).toContain('REMOVE llmModelSource');
     expect(params.ExpressionAttributeValues[':policyDecision']).toEqual(decision);
     expect(params.ExpressionAttributeValues[':llmModel']).toBe('openrouter/deepseek/deepseek-v4-flash');
   });

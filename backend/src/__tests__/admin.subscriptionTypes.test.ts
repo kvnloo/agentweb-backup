@@ -66,6 +66,8 @@ jest.mock('../services/agentModeService', () => ({
         ? { model: normalized, fellBack: false, requestedModel: model }
         : { model: 'gpt-5.5', fellBack: true, requestedModel: model };
     }),
+    // In this double, opus-5 is admin-only (a customer can never select it).
+    isModelSelectableBy: jest.fn((model: string, isAdmin: boolean) => isAdmin || model !== 'anthropic.claude-opus-5'),
   },
 }));
 
@@ -601,6 +603,20 @@ describe('Admin subscription types routes', () => {
       expect(unknown.body.message).toContain("unknown model id 'not-a-model'");
       await post([tier({ allowedModels: 'gpt-5.5' })]).expect(400);
       await post([tier({ allowedModels: ['gpt-5.5', 7] })]).expect(400);
+      expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
+    });
+
+    it('POST rejects an empty list (a tier that can choose no model) with 400: use "*" or name the models', async () => {
+      for (const allowedModels of [[], ['  ', '']]) {
+        const res = await post([tier({ allowedModels })]).expect(400);
+        expect(res.body.message).toContain('must name at least one model');
+      }
+      expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
+    });
+
+    it('POST rejects an id customers can never select (admin-only / internal / live-voice) with 400', async () => {
+      const res = await post([tier({ allowedModels: ['gpt-5.5', 'anthropic.claude-opus-5'] })]).expect(400);
+      expect(res.body.message).toContain("'anthropic.claude-opus-5' cannot be selected by customers");
       expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
     });
 

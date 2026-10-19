@@ -300,7 +300,7 @@ describe('compare -> select round trip over HTTP', () => {
     expect(select.body.llmModel).toBe('gemini-3.5-flash');
     expect(select.body.messages.map((m: any) => m.role)).toEqual(['user', 'assistant']);
     expect(mockAddMessages).toHaveBeenCalledTimes(1);
-    expect(mockUpdateModel).toHaveBeenCalledWith('s-1', 'gemini-3.5-flash');
+    expect(mockUpdateModel).toHaveBeenCalledWith('s-1', 'gemini-3.5-flash', undefined, 'user');
 
     // the same token cannot be replayed against a forged answer
     const forged = await request(app).post('/api/agent-mode/compare/select').set('Authorization', bearer('owner')).send({
