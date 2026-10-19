@@ -77,6 +77,7 @@ describe('usage runway while PAYG is covering', () => {
     mockPolicy.mockResolvedValue({
       billingUserId: 'owner-1', policy, costUsedMicroUsd: 120 * USD, creditsApplied: false,
       mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'payg_overage' },
+      overage: { overageMicroUsd: 20 * USD, capMicroUsd: 50 * USD, poolMicroUsd: 100 * USD, percentOfCap: 40 },
     });
     const covered = await resolveUsageRunway('owner-1', { today: '2026-10-19' });
     expect(covered.runway!.paygCovering).toBe(true);
@@ -90,6 +91,28 @@ describe('usage runway while PAYG is covering', () => {
     const blocked = await resolveUsageRunway('owner-1', { today: '2026-10-19' });
     expect(blocked.runway).not.toHaveProperty('paygCovering');
     expect(blocked.runway!.onTrack).toBe(false);
+  });
+});
+
+describe('usage runway when PAYG admits with nothing billable yet', () => {
+  it('is not paygCovering, and forecasts against the month\'s (high-water) pool instead of declaring exhaustion', async () => {
+    // A downgrade to a $100 pool after the month had a $150 pool; $120 spent: admitted at 0% billable.
+    mockRows.mockResolvedValue(overPool.dailyCostMicroUsd.map((r) => ({ ...r, userId: 'owner-1' })));
+    mockPolicy.mockResolvedValue({
+      billingUserId: 'owner-1',
+      policy: {
+        version: 'v', enforcementState: 'hard_only', optimizationCostThresholdMicroUsd: 50 * USD,
+        hardCostThresholdMicroUsd: 100 * USD, optimizedModelIds: ['m'], optimizedDefaultModel: 'm',
+      },
+      costUsedMicroUsd: 120 * USD,
+      creditsApplied: false,
+      mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'payg_overage' },
+      overage: { overageMicroUsd: 0, capMicroUsd: 75 * USD, poolMicroUsd: 150 * USD, percentOfCap: 0 },
+    });
+    const { runway } = await resolveUsageRunway('owner-1', { today: '2026-10-19' });
+    expect(runway).not.toHaveProperty('paygCovering');
+    expect(runway!.percentUsed).toBe(80);
+    expect(runway!.estimatedDaysRemaining).toBeGreaterThan(0);
   });
 });
 

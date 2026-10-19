@@ -98,7 +98,7 @@ beforeEach(() => {
   // Mirrors updateUser's ALL_NEW return for the shapes the service writes.
   mockUpdateUser.mockImplementation(async (id: string, fields: any, options: any) => {
     const user = users[id];
-    if (fields.paygOverage) user.paygOverage = fields.paygOverage;
+    Object.assign(user, fields);
     for (const { path, value } of options?.pathSets ?? []) user[path[0]] = { ...user[path[0]], [path[1]]: value };
     return user;
   });
@@ -149,6 +149,60 @@ describe('GET /api/subscription/payg', () => {
     expect(res.body).toMatchObject({ available: true, eligible: false });
   });
 
+  it('never shows a member the owner\'s payment-method status (false, field kept)', async () => {
+    const res = await get(MEMBER).expect(200);
+    expect(users[OWNER].has_payment_method).toBe(true);
+    expect(res.body.hasPaymentMethod).toBe(false);
+  });
+
+  describe('repairs a stale cached payment-method flag for an owner with PAYG on', () => {
+    beforeEach(() => {
+      users[OWNER].has_payment_method = false;
+      users[OWNER].paygOverage = {
+        enabled: true, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 1,
+      };
+    });
+
+    it('asks Stripe once, sets the flag, and the gate admits again', async () => {
+      mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 101 * USD });
+      // Before: the gate refuses on the stale flag.
+      const before = await request(app).get('/api/subscription/usage').set('x-test-user', OWNER).expect(200);
+      expect(before.body.usageBlock).toMatchObject({ reason: 'payg_inactive', paygInactiveReason: 'no_payment_method' });
+
+      const res = await get(OWNER).expect(200);
+      expect(mockHasPaymentMethod).toHaveBeenCalledWith('cus_owner');
+      expect(mockUpdateUser).toHaveBeenCalledWith(OWNER, { has_payment_method: true });
+      expect(res.body.hasPaymentMethod).toBe(true);
+
+      const after = await request(app).get('/api/subscription/usage').set('x-test-user', OWNER).expect(200);
+      expect(after.body.allowed).toBe(true);
+      expect(after.body.usageBlock).not.toHaveProperty('reason');
+    });
+
+    it('leaves the flag alone (and still answers 200) when Stripe fails', async () => {
+      mockHasPaymentMethod.mockRejectedValue(new Error('stripe down'));
+      const spy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      const res = await get(OWNER).expect(200);
+      spy.mockRestore();
+      expect(res.body.hasPaymentMethod).toBe(false);
+      expect(mockUpdateUser).not.toHaveBeenCalledWith(OWNER, { has_payment_method: true });
+    });
+
+    it('leaves the flag alone when Stripe confirms there is still no card', async () => {
+      mockHasPaymentMethod.mockResolvedValue(false);
+      expect((await get(OWNER).expect(200)).body.hasPaymentMethod).toBe(false);
+      expect(mockUpdateUser).not.toHaveBeenCalledWith(OWNER, { has_payment_method: true });
+    });
+
+    it('does not ask Stripe for a member, or when PAYG is off', async () => {
+      await get(MEMBER).expect(200);
+      expect(mockHasPaymentMethod).not.toHaveBeenCalled();
+      users[OWNER].paygOverage.enabled = false;
+      await get(OWNER).expect(200);
+      expect(mockHasPaymentMethod).not.toHaveBeenCalled();
+    });
+  });
+
   it('is unavailable while the switch is off or the tier does not allow PAYG', async () => {
     switchSpy.mockResolvedValue(false);
     expect((await get(OWNER).expect(200)).body.available).toBe(false);
@@ -172,7 +226,9 @@ describe('PUT /api/subscription/payg', () => {
     expect(fields.paygOverage).toEqual({
       enabled: true,
       capPercentOfPool: 50,
-      optIn: { month: getCurrentUsageMonth(), overageBaselineMicroUsd: 0 },
+      optIn: { month: getCurrentUsageMonth(), overageBaselineMicroUsd: 0, poolAtOptInMicroUsd: 100 * USD },
+      // Pinned at the opt-in pool so the pool cannot drop under the one the baseline was measured on.
+      poolHighWater: { month: getCurrentUsageMonth(), thresholdMicroUsd: 100 * USD },
       updatedBy: OWNER,
       updatedAt: expect.any(String),
       version: 1,
@@ -182,12 +238,39 @@ describe('PUT /api/subscription/payg', () => {
     expect(JSON.stringify(res.body)).not.toMatch(/MicroUsd/);
   });
 
+  it('enabling with a stale cached flag records the card Stripe just confirmed, so the gate admits', async () => {
+    users[OWNER].has_payment_method = false;
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 101 * USD });
+    const res = await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(200);
+
+    // Same conditional write as the settings.
+    const [, fields, options] = mockUpdateUser.mock.calls[0];
+    expect(fields.has_payment_method).toBe(true);
+    expect(options.condition.expression).toBe('attribute_not_exists(#paygOverage)');
+    expect(res.body.hasPaymentMethod).toBe(true);
+
+    const usage = await request(app).get('/api/subscription/usage').set('x-test-user', OWNER).expect(200);
+    expect(usage.body.allowed).toBe(true);
+    expect(usage.body.usageBlock).not.toHaveProperty('reason');
+  });
+
+  it('re-enabling an existing record also writes the confirmed flag, in the version-conditional update', async () => {
+    users[OWNER].has_payment_method = false;
+    users[OWNER].paygOverage = {
+      enabled: false, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 2,
+    };
+    await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(200);
+    const [, fields, options] = mockUpdateUser.mock.calls[0];
+    expect(fields).toEqual({ has_payment_method: true });
+    expect(options.condition.expression).toContain('#payg.#version = :expectedVersion');
+  });
+
   it('opting in while already past the pool records the standing overage, so it reads 0% right after', async () => {
     // $250 spent on a $100 pool (a downgrade from a bigger pool earlier this month, before opting in).
     mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 250 * USD });
     const res = await put(OWNER, { enabled: true, capPercentOfPool: 200 }).expect(200);
     expect(mockUpdateUser.mock.calls[0][1].paygOverage.optIn)
-      .toEqual({ month: getCurrentUsageMonth(), overageBaselineMicroUsd: 150 * USD });
+      .toEqual({ month: getCurrentUsageMonth(), overageBaselineMicroUsd: 150 * USD, poolAtOptInMicroUsd: 100 * USD });
     expect(res.body.overagePercentUsed).toBe(0);
     expect((await get(OWNER).expect(200)).body.overagePercentUsed).toBe(0);
 
@@ -202,7 +285,7 @@ describe('PUT /api/subscription/payg', () => {
       mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 100 * USD });
       await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(200);
       const firstOptIn = users[OWNER].paygOverage.optIn;
-      expect(firstOptIn).toEqual({ month: getCurrentUsageMonth(), overageBaselineMicroUsd: 0 });
+      expect(firstOptIn).toEqual({ month: getCurrentUsageMonth(), overageBaselineMicroUsd: 0, poolAtOptInMicroUsd: 100 * USD });
       mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 130 * USD });
       expect((await get(OWNER).expect(200)).body.overagePercentUsed).toBe(60);
 
@@ -237,7 +320,8 @@ describe('PUT /api/subscription/payg', () => {
       };
       mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 120 * USD });
       await put(OWNER, { enabled: true, capPercentOfPool: 200 }).expect(200);
-      expect(users[OWNER].paygOverage.optIn).toEqual({ month: getCurrentUsageMonth(), overageBaselineMicroUsd: 20 * USD });
+      expect(users[OWNER].paygOverage.optIn)
+        .toEqual({ month: getCurrentUsageMonth(), overageBaselineMicroUsd: 20 * USD, poolAtOptInMicroUsd: 100 * USD });
     });
   });
 

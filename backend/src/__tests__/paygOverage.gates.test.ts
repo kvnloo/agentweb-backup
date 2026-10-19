@@ -72,7 +72,7 @@ import { userDb } from '../services/db';
 import { getSubscriptionTypeConfig, getUserSubscriptionType } from '../services/subscriptionService';
 import { resolveEnforcementCostBasisMicroUsd } from '../services/spendEnforcementBasis';
 import { paygOverageSwitch } from '../services/paygOverageService';
-import { checkTokenUsage, toCustomerTokenUsage } from '../services/tokenUsageService';
+import { checkTokenUsage, getCurrentMonth, toCustomerTokenUsage } from '../services/tokenUsageService';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
 import { resolveEffectiveModelForUser } from '../controllers/agentModeController';
 import { getCurrentUsageMonth } from '../services/llmUsageCreditService';
@@ -253,7 +253,8 @@ describe('ENG-668 PAYG — mid-month downgrade (pool high-water)', () => {
     setup({ spendUsd: 140, user: { paygOverage: payg({ poolHighWater: { month: getCurrentUsageMonth(), thresholdMicroUsd: 150 * USD } }) } });
     const { status, decision } = await bothGates();
     expect(status.allowed).toBe(true);
-    expect(status.overage).toEqual({ active: true, percentOfCap: 0 });
+    // Admitted, but nothing is billable yet: PAYG is not "covering" anything, so it is not active.
+    expect(status.overage).toEqual({ active: false, percentOfCap: 0 });
     expect(decision.effectiveModel).toBe(CHOSEN_MODEL);
     // Never lowered.
     expect(mockUpdateUser).not.toHaveBeenCalled();
@@ -345,13 +346,13 @@ describe('ENG-668 PAYG — review regressions', () => {
         paygOverage: payg({
           capPercentOfPool: 200,
           poolHighWater: undefined,
-          optIn: { month: getCurrentUsageMonth(), overageBaselineMicroUsd: 150 * USD },
+          optIn: { month: getCurrentUsageMonth(), overageBaselineMicroUsd: 150 * USD, poolAtOptInMicroUsd: 100 * USD },
         }),
       },
     });
     const { status, decision } = await bothGates();
     expect(status.allowed).toBe(true);
-    expect(status.overage).toEqual({ active: true, percentOfCap: 0 });
+    expect(status.overage).toEqual({ active: false, percentOfCap: 0 });
     expect(decision.modelSelection).toBe('honored');
   });
 
@@ -363,5 +364,43 @@ describe('ENG-668 PAYG — review regressions', () => {
     expect(status.paygBlock).toEqual({ reason: 'payg_cap_reached' });
     expect(status.overage).toEqual({ active: false, percentOfCap: 380 });
     expect(decision.modelSelection).toBe('blocked');
+  });
+});
+
+describe('ENG-668 PAYG — opt-in baseline after the pool grows (counted once, not twice)', () => {
+  it('upgrade: opted in at $120 on $100, upgraded to a $200 pool, $215 spent => 15% of a $100 cap', async () => {
+    setup({
+      spendUsd: 215,
+      tierPolicy: { ...policy, optimizationCostThresholdMicroUsd: 150 * USD, hardCostThresholdMicroUsd: 200 * USD },
+      user: {
+        paygOverage: payg({
+          poolHighWater: { month: getCurrentUsageMonth(), thresholdMicroUsd: 200 * USD },
+          optIn: { month: getCurrentUsageMonth(), overageBaselineMicroUsd: 20 * USD, poolAtOptInMicroUsd: 100 * USD },
+        }),
+      },
+    });
+    const { status, decision } = await bothGates();
+    expect(status.allowed).toBe(true);
+    expect(status.overage).toEqual({ active: true, percentOfCap: 15 });
+    expect(decision.effectiveModel).toBe(CHOSEN_MODEL);
+  });
+
+  it('credits: a $50 top-up after opting in makes the pool $150; $165 spent => 20% of a $75 cap', async () => {
+    setup({
+      spendUsd: 165,
+      user: {
+        llmUsageCredits: {
+          month: getCurrentMonth(),
+          totalPurchasedMicroUsd: 50 * USD, totalMigrationOffsetMicroUsd: 0, grantIds: [], grants: [],
+        },
+        paygOverage: payg({
+          poolHighWater: { month: getCurrentUsageMonth(), thresholdMicroUsd: 150 * USD },
+          optIn: { month: getCurrentUsageMonth(), overageBaselineMicroUsd: 20 * USD, poolAtOptInMicroUsd: 100 * USD },
+        }),
+      },
+    });
+    const status = await checkTokenUsage(OWNER);
+    expect(status.allowed).toBe(true);
+    expect(status.overage).toEqual({ active: true, percentOfCap: 20 });
   });
 });
