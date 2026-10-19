@@ -685,7 +685,9 @@ router.post(
       let customerId: string | undefined | null = user?.stripe_customer_id;
       if (user && !SUBSCRIBED_STATUSES.has(user.subscription_status)) {
         try {
-          customerId = (await stripeService.resolveUserPaymentMethod(user, userId)).customerId ?? user.stripe_customer_id;
+          customerId =
+            (await stripeService.resolveUserPaymentMethod(user, userId)).customerId ??
+            (await stripeService.findLiveCustomerIdForUser(user, userId));
         } catch (lookupError: any) {
           if (!user.stripe_customer_id) throw lookupError;
           console.error(`[portal-session] card lookup failed for ${userId}; using the row's customer:`, lookupError?.message);

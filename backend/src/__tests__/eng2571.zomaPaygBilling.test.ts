@@ -203,6 +203,14 @@ describe('POST /api/stripe/create-customer-portal-session', () => {
     expect(mockStripe.billingPortal.sessions.create).toHaveBeenCalledWith(expect.objectContaining({ customer: 'cus_other' }));
   });
 
+  it('unsubscribed user with no card and no row id -> a searched live customer still opens (invoice history)', async () => {
+    mockGetUserById.mockResolvedValue({ userId: 'u1' });
+    stripeState({ cus_old: { pms: [] } }, ['cus_old']);
+    const res = await request(app).post('/api/stripe/create-customer-portal-session');
+    expect(res.status).toBe(200);
+    expect(mockStripe.billingPortal.sessions.create).toHaveBeenCalledWith(expect.objectContaining({ customer: 'cus_old' }));
+  });
+
   it('unsubscribed user with no card and no customer anywhere -> 404', async () => {
     mockGetUserById.mockResolvedValue({ userId: 'u1' });
     stripeState({}, []);
