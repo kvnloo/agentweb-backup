@@ -119,10 +119,13 @@ describe('leadCallStore transition', () => {
     expect((await getLeadCallStore().get(LIST, LEAD))?.state).toBe('dialing');
   });
 
-  it('returns false for an empty from list and for a lead without a record', async () => {
+  it('returns false for an empty from list without calling the db', async () => {
     expect(await getLeadCallStore().transition(LIST, LEAD, [], { state: 'failed' })).toBe(false);
     // An empty IN () list is invalid DynamoDB syntax, so it must never reach the db.
     expect(crmDb.updateLeadSystemRecordIf).not.toHaveBeenCalled();
+  });
+
+  it('returns false for a lead without a record', async () => {
     expect(await getLeadCallStore().transition(LIST, 'other', ['dialing'], { state: 'failed' })).toBe(false);
   });
 
@@ -201,6 +204,21 @@ describe('leadCallStore addEvent', () => {
     expect(mock(crmDb.addLeadEngagement).mock.calls[0][2].eventData).toEqual({
       day: '2026-10-19', at: '2026-10-19T10:00:00.000Z', job: 'job_1234567', ref: 'job-1234567', range: '2026-10-19 to 2026-10-20',
     });
+  });
+
+  it.each([
+    ['fullwidth digits', '４１５５５５０１００'],
+    ['Arabic-Indic digits', '٤١٥٥٥٥٠١٠٠'],
+    ['NBSP and non-breaking hyphens', '415\u00A0555\u20110100'],
+    ['fullwidth plus', '＋1 415 555 0100'],
+  ])('redacts a phone number written with %s', async (_label, phone) => {
+    await getLeadCallStore().addEvent(LIST, LEAD, 'call.failed', { note: `dial ${phone} now` });
+    expect(mock(crmDb.addLeadEngagement).mock.calls[0][2].eventData).toEqual({ note: 'dial [redacted] now' });
+  });
+
+  it('redacts a digit run glued to a trailing word but keeps ids glued on the left', async () => {
+    await getLeadCallStore().addEvent(LIST, LEAD, 'call.failed', { a: 'ext 4155550100x', b: 'job_4155550100', c: `sid ${SID_OWNER}` });
+    expect(mock(crmDb.addLeadEngagement).mock.calls[0][2].eventData).toEqual({ a: 'ext [redacted]x', b: 'job_4155550100', c: `sid ${SID_OWNER}` });
   });
 
   it('redacts a bare 10 digit number and a dashed number', async () => {

@@ -14,20 +14,22 @@ const MAX_DETAIL_VALUE_LENGTH = 200;
 
 const TERMINAL_STATES: HotLeadCallState[] = ['finished', 'failed', 'skipped'];
 
-// db.ts raises `isEngaged` (the lead counts as engaged/hot in lists and filters) when an engagement's
-// eventType or serialised eventData contains one of ENGAGED_EVENT_KEYWORDS. A call event must never do
-// that, so detail entries containing them are dropped.
-
 // Matched in order at each position: a Twilio SID (CA..., AC..., PN...: 34 chars of hex that can hold a
 // long digit run) and an ISO date (2026-10-19) are kept as they are; anything else shaped like a phone
-// number is redacted: 7+ digits with optional + and ( ) . - space separators, not glued to a preceding
-// word character or dash (so ids like job_1234567 stay intact).
-const SID_DATE_OR_PHONE = /\b[A-Z]{2}[0-9a-f]{32}\b|\b\d{4}-\d{2}-\d{2}(?!\d)|(?<![\w-])\+?\d[\d\s().-]{5,}\d(?!\w)/g;
+// number is redacted: 7+ decimal digits (any script, via \p{Nd}) with optional + and separators (spaces
+// incl. NBSP, ( ) . and any Unicode hyphen/minus). Rule: only the LEFT edge is bounded (not glued to a
+// word character or dash, so ids like job_1234567 survive); a digit run glued on the right
+// ("4155550100x") is still redacted.
+const SID_DATE_OR_PHONE =
+  /\b[A-Z]{2}[0-9a-f]{32}\b|\b\d{4}-\d{2}-\d{2}(?!\d)|(?<![\w-])[+\uFF0B]?\p{Nd}[\p{Nd}\s().\u2010-\u2015\u2212\uFF0D-]{5,}\p{Nd}/gu;
 
 function redactPhones(value: string): string {
   return value.replace(SID_DATE_OR_PHONE, (m) => (/^[A-Z]{2}|^\d{4}-\d{2}-\d{2}$/.test(m) ? m : '[redacted]'));
 }
 
+// db.ts raises `isEngaged` (the lead counts as engaged/hot in lists and filters) when an engagement's
+// eventType or serialised eventData contains one of ENGAGED_EVENT_KEYWORDS. A call event must never do
+// that, so detail entries containing them are dropped.
 function mentionsEngagement(text: string): boolean {
   const lower = text.toLowerCase();
   return ENGAGED_EVENT_KEYWORDS.some((k) => lower.includes(k));
@@ -84,6 +86,8 @@ class DynamoLeadCallStore implements LeadCallStore {
   /**
    * In `patch`, `meteredLegs` lists the legs to ADD and `lastSequence` the entries to merge (not
    * replacements). `from` must name non-terminal states only; a terminal one makes it return false.
+   * Consumer rule: because a terminal record is never revived, the webhook must meter a leg in the
+   * same transition that makes the call terminal (or before it), never in a later one.
    * The call returns false, writing nothing, when the state is not in `from`, when a
    * lastSequence entry is not higher than the stored one for that CallSid, or when a leg is already
    * metered. So metering belongs in the same transition as the state change it accompanies: the one

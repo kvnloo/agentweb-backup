@@ -11035,7 +11035,8 @@ export const crmDb = {
         n++;
       }
     }
-    for (const [field, items] of Object.entries(op.appendNew ?? {})) {
+    for (const [field, listed] of Object.entries(op.appendNew ?? {})) {
+      const items = [...new Set(listed)];
       if (items.length === 0) continue;
       const path = `#system.#k.#f${n}`;
       names[`#f${n}`] = field;

@@ -1416,7 +1416,12 @@ describe('CRM Database Service', () => {
   // ENG-2271: hot-lead call state lives at lead.system.hot_lead_call; these two primitives are its
   // conditional writes. DynamoDB evaluates the conditions, so these assert the expressions we send.
   // DynamoDB rejects an expression that declares a placeholder it never uses, or uses one it never declares.
-  const expectNoDanglingPlaceholders = (call: any) => {
+  const expectNoDanglingPlaceholders = (call: {
+    UpdateExpression: string;
+    ConditionExpression?: string;
+    ExpressionAttributeNames: Record<string, string>;
+    ExpressionAttributeValues: Record<string, unknown>;
+  }) => {
     const text = `${call.UpdateExpression} ${call.ConditionExpression}`;
     const used = (re: RegExp) => new Set(text.match(re) ?? []);
     const declaredNames = new Set(Object.keys(call.ExpressionAttributeNames));
@@ -1517,6 +1522,15 @@ describe('CRM Database Service', () => {
       const call = mockDocumentClientMethods.update.mock.calls[0][0];
       expect(new Set(Object.keys(call.ExpressionAttributeNames)).size).toBe(Object.keys(call.ExpressionAttributeNames).length);
       expectNoDanglingPlaceholders(call);
+    });
+
+    it('de-duplicates appendNew items so one value cannot be stored twice', async () => {
+      await crmDb.updateLeadSystemRecordIf('list_1', 'lead_1', 'hot_lead_call', {
+        stateIn: ['dialing'], appendNew: { meteredLegs: ['owner', 'owner', 'lead'] },
+      });
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.ExpressionAttributeValues[':v0']).toEqual(['owner', 'lead']);
+      expect(call.ConditionExpression.match(/NOT contains/g)).toHaveLength(2);
     });
 
     it('returns false for an empty stateIn without calling DynamoDB', async () => {
