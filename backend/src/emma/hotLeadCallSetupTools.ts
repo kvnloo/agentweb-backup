@@ -9,10 +9,19 @@ import { provisionNumber, releaseNumber, monthlyRentText } from '../services/voi
  * Setup tools for the hot lead auto-call: caller number, then destination-phone verification. Unlike the
  * live call flow they do NOT depend on the global hot_lead_call_mode kill switch: setup can be finished
  * while calling is off. They need org:configure and are blocked in shared sessions (toolDispatch).
+ *
+ * Spending or irreversible tools (provision, release, start verification) refuse unattended runs, mirroring
+ * A1 of services/crmSequenceActivationGate.ts (`=== true`: only an explicit unattended turn is refused).
+ * `confirm` on provision is advisory, not authorization. A2 (a deck-of-one human approval per purchase, as
+ * the CRM sequence activation gate does) is NOT built and is a precondition for general availability; until
+ * then the per-org purchase/release caps in numberProvisioning.ts are the real cost control.
  */
 
-// Description wording only; messages that state a price read the live rate card (monthlyRentText).
-const APPROX_RENT = 'about $1 to $2 per month';
+const UNATTENDED_MESSAGE = 'This needs a person to confirm in an interactive chat';
+
+function requireAttended(context: ToolContext): void {
+  if (context?.isUnattendedRun === true) throw new Error(UNATTENDED_MESSAGE);
+}
 
 const NO_ARGS_MESSAGE = 'Invalid hot lead call setup arguments';
 
@@ -37,7 +46,7 @@ emmaToolRegistry.register({
   name: 'provision_hot_lead_call_number',
   definition: {
     name: 'provision_hot_lead_call_number',
-    description: `Buy the phone number the hot lead auto-call is placed from (org owners/admins only). This spends money: the number costs ${APPROX_RENT} on your Twilio account, charged now and every month until it is released. Set it up in this order: save settings, get a number with this tool, verify the destination phone, then enable calling. Needs saved hot lead call settings, and each organization can hold one number. Pass confirm:true only after the user has explicitly agreed to the cost in this conversation; confirm is advisory and is not an authorization, so never set it on your own. Each organization can buy at most 2 numbers per day. areaCode (3 digits) is optional and picks a US area code. If the result says the purchase could not be confirmed, do not retry; tell the user to contact support. Works even while hot lead calling is switched off platform-wide.`,
+    description: `Buy the phone number the hot lead auto-call is placed from (org owners/admins only). This spends money: the number has a monthly fee on your Twilio account (the current price is stated when the user is asked to agree), charged now and every month until it is released. Set it up in this order: save settings, get a number with this tool, verify the destination phone, then enable calling. Needs saved hot lead call settings, and each organization can hold one number. Pass confirm:true only after the user has explicitly agreed to the cost in this conversation; confirm is advisory and is not an authorization, so never set it on your own. Each organization can buy at most 2 numbers per day. areaCode (3 digits) is optional and picks a US area code. If the result says the purchase could not be confirmed, do not retry; tell the user to contact support. Works even while hot lead calling is switched off platform-wide.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -49,6 +58,7 @@ emmaToolRegistry.register({
     },
   },
   execute: async (args: unknown, context?: ToolContext) => {
+    requireAttended(context);
     const { confirm, areaCode } = onlyKeys(args, ['confirm', 'areaCode']);
     if (confirm !== true) throw new Error(`Buying a number costs money (${monthlyRentText()}). Ask the user to agree, then call again with confirm:true.`);
     if (areaCode !== undefined && (typeof areaCode !== 'string' || !/^\d{3}$/.test(areaCode))) throw new Error('areaCode must be exactly 3 digits, for example 415');
@@ -70,6 +80,7 @@ emmaToolRegistry.register({
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   execute: async (args: unknown, context?: ToolContext) => {
+    requireAttended(context);
     onlyKeys(args, []);
     const org = await callerOrg(context, 'the hot lead caller number', true);
     const config = configuredOrThrow(storedConfig(org.hotLeadCall));
@@ -85,6 +96,7 @@ emmaToolRegistry.register({
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   execute: async (args: unknown, context?: ToolContext) => {
+    requireAttended(context);
     onlyKeys(args, []);
     const org = await callerOrg(context, 'hot lead call verification', true);
     const config = configuredOrThrow(storedConfig(org.hotLeadCall));
