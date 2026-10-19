@@ -28,6 +28,28 @@ describe('hotLeadCallConfigOf', () => {
     expect(hotLeadCallConfigOf(base({ announcedName: '  O\'Brien & Sons, Inc.  ' }))?.announcedName).toBe("O'Brien & Sons, Inc.");
   });
 
+  it('accepts a bare ampersand (the TwiML builder must XML-escape it)', () => {
+    expect(hotLeadCallConfigOf(base({ announcedName: 'Smith & Sons' }))?.announcedName).toBe('Smith & Sons');
+  });
+
+  it.each(['+19002223333', '+19003334444', '+18005550199', '+15335551234', '+15005550006'])('rejects premium-rate, toll-free and personal numbers (toll fraud): %s', phone => {
+    expect(hotLeadCallConfigOf(base({ destinationPhone: phone }))).toBeNull();
+    expect(hotLeadCallConfigOf(base({ twilioNumber: phone }))).toBeNull();
+  });
+  it.each(['+14155550100', '+12125550123', '+16475550123', '+14165550123'])('still accepts ordinary US and CA numbers: %s', phone => {
+    expect(hotLeadCallConfigOf(base({ destinationPhone: phone }))?.destinationPhone).toBe(phone);
+  });
+  it('rejects a destination equal to the caller number', () => {
+    expect(hotLeadCallConfigOf(base({ twilioNumber: '+14155550100' }))).toBeNull();
+  });
+
+  it.each(['EST', '+05:00', 'america/chicago', 'UTC', 'GMT', 'Mars/Olympus', 'America/Chicago '])('rejects non-canonical timezone %j', timezone => {
+    expect(hotLeadCallConfigOf(base({ quietHours: { timezone } }))).toBeNull();
+  });
+  it.each(['America/Chicago', 'America/Toronto', 'America/Los_Angeles'])('accepts canonical timezone %s', timezone => {
+    expect(hotLeadCallConfigOf(base({ quietHours: { timezone } }))?.quietHours?.timezone).toBe(timezone);
+  });
+
   it.each([null, undefined, 'x', 5, [], base({ enabled: 'true' }), base({ enabled: undefined })])('rejects non-object or bad enabled %j', raw => {
     expect(hotLeadCallConfigOf(raw)).toBeNull();
   });
@@ -53,7 +75,8 @@ describe('hotLeadCallConfigOf', () => {
     ['blank announcedName', { announcedName: '   ' }],
     ['61-char announcedName', { announcedName: 'a'.repeat(61) }],
     ['angle brackets in name', { announcedName: 'Acme <Say>' }],
-    ['ampersand-entity injection', { announcedName: 'Acme </Say><Dial>' }],
+    ['TwiML tag injection', { announcedName: 'Acme </Say><Dial>' }],
+    ['entity-style injection', { announcedName: 'Acme &lt;Say&gt;' }],
     ['newline in name', { announcedName: 'Acme\nPlumbing' }],
     ['control char in name', { announcedName: 'Acme\u0007' }],
     ['quote in name', { announcedName: 'Acme "x"' }],

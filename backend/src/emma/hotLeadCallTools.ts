@@ -1,32 +1,16 @@
 import { emmaToolRegistry } from './registry';
-import { orgDb, userDb } from '../services/db';
-import { can } from '../services/orgAuthz';
+import { orgDb } from '../services/db';
+import { callerOrg, type ToolContext } from './orgCaller';
 import { LEAD_ORIGINS, LEAD_ORIGIN_DESCRIPTIONS } from '../services/leadNotificationConfig';
 import {
-  allowlistedE164, hotLeadCallConfigOf, HOT_LEAD_CALL_ANNOUNCED_NAME_MAX, HOT_LEAD_CALL_COUNTRIES,
+  allowlistedE164, hotLeadCallConfigOf, isRecord, HOT_LEAD_CALL_ANNOUNCED_NAME_MAX, HOT_LEAD_CALL_COUNTRIES,
   HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS, HOT_LEAD_CALL_SYSTEM_FIELDS,
   type HotLeadCallConfig,
 } from '../services/hotLeadCallConfig';
 import { toE164 } from '../services/whatsappService';
+import { parsePhoneNumberWithError } from 'libphonenumber-js';
 
 const WRITABLE = ['enabled', 'destinationPhone', 'leadTypes', ...HOT_LEAD_CALL_LIMIT_FIELDS, 'announcedName', 'quietHours', 'allowedCountries'];
-
-type ToolContext = { userId?: unknown; agentUserId?: unknown } | undefined;
-
-async function callerOrg(context: ToolContext, write = false) {
-  const userId = context?.userId || context?.agentUserId;
-  if (typeof userId !== 'string' || !userId.trim()) throw new Error('Authentication required');
-  const user = await userDb.getUserById(userId);
-  if (user?.userId !== userId || typeof user.orgId !== 'string' || !user.orgId.trim()) {
-    throw new Error('Organization membership required');
-  }
-  const org = await orgDb.getOrgById(user.orgId);
-  if (!org || org.orgId !== user.orgId) throw new Error('Organization not found');
-  if (write && !can({ userId, orgId: user.orgId, orgRole: typeof user.orgRole === 'string' ? user.orgRole : undefined }, org, 'org:configure')) {
-    throw new Error('Only org owners and admins can update hot lead call settings');
-  }
-  return org;
-}
 
 const maskPhone = (phone: string) => `***${phone.slice(-4)}`;
 
@@ -44,6 +28,14 @@ function settings(config?: HotLeadCallConfig) {
     ...Object.fromEntries(HOT_LEAD_CALL_LIMIT_FIELDS.map(f => [f, config?.[f] ?? HOT_LEAD_CALL_LIMITS[f].default])),
     availableLeadTypes: LEAD_ORIGINS.map(value => ({ value, description: LEAD_ORIGIN_DESCRIPTIONS[value] })),
   };
+}
+
+function hasExtension(raw: string): boolean {
+  try {
+    return !!parsePhoneNumberWithError(raw, 'US').ext;
+  } catch {
+    return false;
+  }
 }
 
 function validateArgs(args: unknown, allowed: readonly string[]): asserts args is Record<string, unknown> {
@@ -72,7 +64,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: unknown, context?: ToolContext) => {
     validateArgs(args, []);
-    const org = await callerOrg(context);
+    const org = await callerOrg(context, 'hot lead call settings');
     return { success: true, ...settings(storedConfig(org.hotLeadCall)) };
   },
 });
@@ -106,12 +98,16 @@ emmaToolRegistry.register({
     const patch: Record<string, unknown> = Object.fromEntries(Object.entries(args).filter(([, v]) => v !== null));
     if (Object.keys(patch).length === 0) throw new Error('Invalid hot lead call settings arguments: provide at least one setting');
 
-    const org = await callerOrg(context, true);
+    const org = await callerOrg(context, 'hot lead call settings', true);
     const previous = org.hotLeadCall;
     const current = storedConfig(previous);
 
     let destinationPhone = current?.destinationPhone;
     if (patch.destinationPhone !== undefined) {
+      // toE164 silently drops extensions, which would make the owner's phone ring a different line.
+      if (typeof patch.destinationPhone === 'string' && hasExtension(patch.destinationPhone)) {
+        throw new Error('destinationPhone must not include an extension');
+      }
       const normalized = typeof patch.destinationPhone === 'string' ? toE164(patch.destinationPhone, 'US') : null;
       destinationPhone = normalized ? allowlistedE164(normalized) ?? undefined : undefined;
       if (!destinationPhone) throw new Error('destinationPhone must be a valid US or Canadian phone number');
@@ -120,6 +116,7 @@ emmaToolRegistry.register({
     const phoneChanged = destinationPhone !== current?.destinationPhone;
 
     const { quietHours, ...rest } = patch;
+    if (quietHours !== undefined && !isRecord(quietHours)) throw new Error('quietHours must be an object with start, end and timezone');
     delete rest.destinationPhone;
     const unverified: Partial<HotLeadCallConfig> = { ...current };
     delete unverified.destinationVerifiedAt;
@@ -128,7 +125,7 @@ emmaToolRegistry.register({
       ...(phoneChanged ? unverified : current),
       ...rest,
       destinationPhone,
-      ...(quietHours !== undefined ? { quietHours: { ...current?.quietHours, ...(quietHours as object) } } : {}),
+      ...(quietHours !== undefined ? { quietHours: { ...current?.quietHours, ...quietHours } } : {}),
       // A new number is unverified, so calling stays off until the system re-verifies it.
       ...(phoneChanged ? { enabled: false } : {}),
     };

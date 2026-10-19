@@ -2,6 +2,8 @@ type Tool = { name: string; definition: { description: string; inputSchema: { pr
 const handlers = new Map<string, Tool>();
 jest.mock('../emma/registry', () => ({ emmaToolRegistry: { register: (tool: Tool) => handlers.set(tool.name, tool) } }));
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() }, orgDb: { getOrgById: jest.fn(), updateOrg: jest.fn() } }));
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { orgDb, userDb } from '../services/db';
 import '../emma/hotLeadCallTools';
 import { SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS } from '../services/agentMode/core/toolDispatch';
@@ -103,6 +105,22 @@ describe('update_hot_lead_call_settings', () => {
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
 
+  it.each(['+15555550100 x12', '(415) 555-0100 ext. 5', '+14155550100;ext=7'])('rejects a phone with an extension instead of dropping it: %s', async destinationPhone => {
+    await expect(update({ destinationPhone })).rejects.toThrow('extension');
+    expect(orgDb.updateOrg).not.toHaveBeenCalled();
+  });
+  it.each(['+19002223333', '+18005550199'])('rejects toll-fraud destination %s', async destinationPhone => {
+    await expect(update({ destinationPhone })).rejects.toThrow('valid US or Canadian');
+  });
+  it.each(['08:00-21:00', 5, true, ['x']])('rejects a non-object quietHours %j instead of ignoring it', async quietHours => {
+    await expect(update({ quietHours })).rejects.toThrow('quietHours must be an object');
+    expect(orgDb.updateOrg).not.toHaveBeenCalled();
+  });
+  it('rejects a destination equal to the assigned caller number', async () => {
+    await expect(update({ destinationPhone: '+14155550111' })).rejects.toThrow();
+    expect(orgDb.updateOrg).not.toHaveBeenCalled();
+  });
+
   it.each(['destinationVerifiedAt', 'twilioNumber', 'twilioNumberSid'])('cannot set system field %s', async field => {
     await expect(update({ maxCallsPerHour: 3, [field]: field === 'twilioNumberSid' ? SID : '2026-02-02T00:00:00.000Z' })).rejects.toThrow('managed by the system');
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
@@ -164,6 +182,13 @@ describe('update_hot_lead_call_settings', () => {
   it('does not report success when a concurrent edit rejects the conditional write', async () => {
     (orgDb.updateOrg as jest.Mock).mockRejectedValueOnce(new Error('ConditionalCheckFailedException'));
     await expect(update({ maxCallsPerHour: 3 })).rejects.toThrow('ConditionalCheckFailedException');
+  });
+});
+
+describe('registration', () => {
+  it('tools.ts imports the module so the tools are registered', () => {
+    const source = readFileSync(join(__dirname, '../emma/tools.ts'), 'utf8');
+    expect(source).toContain("import './hotLeadCallTools';");
   });
 });
 
