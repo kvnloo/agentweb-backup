@@ -1288,6 +1288,110 @@ export async function getWhatsAppCredentials(): Promise<WhatsAppCredentials> {
   return whatsappCredsInFlight;
 }
 
+export interface TwilioCredentials {
+  accountSid: string;
+  authToken: string;
+}
+
+/**
+ * Get Twilio Voice credentials (ENG-2271). Same resolution rules as getWhatsAppCredentials:
+ * the TWILIO_* env pair wins only when complete (never merged with the secret, so an account
+ * sid from one environment cannot be paired with another's auth token); otherwise the secret
+ * at dev/AgentWeb/Twilio (prod/... in production), cached with a TTL, one shared in-flight
+ * lookup, successes only. The auth token also verifies inbound webhook signatures, so a
+ * missing field throws rather than returning a partial object.
+ */
+const TWILIO_ENV_VARS = {
+  accountSid: 'TWILIO_ACCOUNT_SID',
+  authToken: 'TWILIO_AUTH_TOKEN',
+} as const satisfies Record<keyof TwilioCredentials, string>;
+
+let twilioCredsCache: { value: TwilioCredentials; expiresAt: number } | null = null;
+let twilioCredsInFlight: Promise<TwilioCredentials> | null = null;
+const TWILIO_CREDS_TTL_MS = 5 * 60 * 1000;
+
+/** Test hook: forget any cached or in-flight Secrets-Manager-backed Twilio credentials. */
+export function __resetTwilioCredentialsCache(): void {
+  twilioCredsCache = null;
+  twilioCredsInFlight = null;
+}
+
+const TWILIO_SHAPE_ERROR = 'TwilioSecretShapeError';
+
+/** Our own "secret is empty / lacks a field" error: its message names fields, never values, so it is safe to log. */
+function twilioShapeError(message: string): Error {
+  return Object.assign(new Error(message), { name: TWILIO_SHAPE_ERROR });
+}
+
+async function fetchTwilioCredentialsFromSecretsManager(): Promise<TwilioCredentials> {
+  const environment = process.env.NODE_ENV || 'development';
+  const secretName = environment === 'production'
+    ? 'prod/AgentWeb/Twilio'
+    : 'dev/AgentWeb/Twilio';
+
+  const secretString = await getSecret(secretName);
+
+  if (!secretString || secretString.trim() === '') {
+    throw twilioShapeError('Twilio credentials secret is empty');
+  }
+
+  // A SyntaxError from JSON.parse can quote fragments of the secret, so the catch below logs
+  // only the error name for anything that is not one of our own shape errors.
+  const credentials = JSON.parse(secretString) as TwilioCredentials;
+
+  const missing = (['accountSid', 'authToken'] as const).filter((k) => !credentials[k]);
+  if (missing.length > 0) {
+    throw twilioShapeError(`Twilio credentials missing: ${missing.join(', ')}`);
+  }
+
+  return { accountSid: credentials.accountSid, authToken: credentials.authToken };
+}
+
+export async function getTwilioCredentials(): Promise<TwilioCredentials> {
+  const fromEnv = {} as TwilioCredentials;
+  const missingEnv: string[] = [];
+  for (const [field, envName] of Object.entries(TWILIO_ENV_VARS)) {
+    const value = process.env[envName]?.trim();
+    if (value) fromEnv[field as keyof TwilioCredentials] = value;
+    else missingEnv.push(envName);
+  }
+  if (missingEnv.length === 0) return fromEnv;
+  if (missingEnv.length < Object.keys(TWILIO_ENV_VARS).length) {
+    console.warn(
+      `[twilio] ignoring partial TWILIO_* env config (missing: ${missingEnv.join(', ')}); ` +
+        'falling back to Secrets Manager.',
+    );
+  }
+
+  // Only a success is cached (see getWhatsAppCredentials): caching a failure would turn one
+  // bad Secrets Manager call into minutes of failed webhook verification and call placement.
+  const now = Date.now();
+  if (twilioCredsCache && twilioCredsCache.expiresAt > now) {
+    return twilioCredsCache.value;
+  }
+  if (!twilioCredsInFlight) {
+    twilioCredsInFlight = fetchTwilioCredentialsFromSecretsManager()
+      .then((value) => {
+        twilioCredsCache = { value, expiresAt: Date.now() + TWILIO_CREDS_TTL_MS };
+        return value;
+      })
+      .catch((error) => {
+        const name = error instanceof Error ? error.name : 'error';
+        console.error(
+          `Error fetching Twilio credentials from Secrets Manager: ${name}` +
+            (name === TWILIO_SHAPE_ERROR ? ` (${(error as Error).message})` : ''),
+        );
+        throw new Error(
+          'Failed to fetch Twilio credentials. Set both TWILIO_* env vars or store them in Secrets Manager.',
+        );
+      })
+      .finally(() => {
+        twilioCredsInFlight = null;
+      });
+  }
+  return twilioCredsInFlight;
+}
+
 export interface TeamsBotCredentials {
   /** Microsoft App (client) ID of the bot's Entra app registration. */
   appId: string;
