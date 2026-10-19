@@ -56,6 +56,8 @@ const baseResponse = (overrideUsd: number | null) => ({
 });
 
 const ROW = 'vendor-rate-row-twilio/voice_outbound_minute';
+// hidden: true because MUI marks the page aria-hidden while the dialog is open or
+// still closing, which would hide the buttons from role queries.
 const saveBtn = () => screen.getByRole('button', { name: 'Save twilio voice_outbound_minute', hidden: true });
 const resetBtn = () => screen.getByRole('button', { name: 'Reset twilio voice_outbound_minute to default', hidden: true });
 const confirmBtn = () => within(screen.getByRole('dialog')).getByRole('button', { name: 'Confirm' });
@@ -231,7 +233,7 @@ describe('VendorRatesTab', () => {
 
     await waitFor(() => expect(mockedPut).toHaveBeenCalledTimes(1));
     expect(mockedPut).toHaveBeenCalledWith(URL, { provider: 'twilio', key: 'voice_outbound_minute', usdPerUnit: null }, HEADERS);
-    await waitFor(() => expect(screen.getByTestId('vendor-rates-version')).toHaveTextContent('Rate card version: v1'));
+    await waitFor(() => expect(screen.getByTestId('vendor-rates-version')).toHaveTextContent('Rate card version (overridden rates): v1'));
     expect(resetBtn()).toBeDisabled();
   });
 
@@ -240,20 +242,26 @@ describe('VendorRatesTab', () => {
     expect(resetBtn()).toBeDisabled();
   });
 
-  it.each(['0', '-1', 'NaN', 'abc', '1000.01', 'Infinity', '1e999', '0x10', '0b1', '0o7', '1e-3', '+1', '1,5', '.', '1.1234567', '0.0000001', '', '  '])(
+  it.each(['0', '-1', 'NaN', 'abc', '1000.01', 'Infinity', '1e999', '0x10', '0b1', '0o7', '1e-3', '+1', '1,5', '.', '1.1234567', '0.0000001'])(
     'blocks invalid price %p client-side without a dialog or PUT',
     async (bad) => {
       await renderLoaded();
       fireEvent.change(input(), { target: { value: bad } });
       fireEvent.keyDown(input(), { key: 'Enter' });
-      if (bad.trim()) {
-        fireEvent.click(saveBtn());
-        expect(await screen.findByText(/plain decimal greater than 0/)).toBeInTheDocument();
-      }
+      expect(await screen.findByText(/plain decimal greater than 0/)).toBeInTheDocument();
       expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
       expect(mockedPut).not.toHaveBeenCalled();
     },
   );
+
+  it.each(['', '  '])('keeps Save disabled and ignores Enter for empty input %p', async (empty) => {
+    await renderLoaded();
+    fireEvent.change(input(), { target: { value: empty } });
+    fireEvent.keyDown(input(), { key: 'Enter' });
+    expect(saveBtn()).toBeDisabled();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(mockedPut).not.toHaveBeenCalled();
+  });
 
   it.each([['0.014', 0.014], ['.5', 0.5], ['5.', 5], ['0.000001', 0.000001], ['1000', 1000]])(
     'accepts plain decimal %p and sends %p',
@@ -319,6 +327,67 @@ describe('VendorRatesTab', () => {
     await screen.findByText('twilio/voice_outbound_minute saved');
     expect(other).toHaveValue('0.009');
     expect(within(screen.getByTestId('vendor-rate-row-twilio/sms_segment')).getAllByText('$0.0083')).toHaveLength(2);
+  });
+
+  it.each([['Escape', (d: HTMLElement) => fireEvent.keyDown(d, { key: 'Escape' })],
+    ['backdrop click', () => fireEvent.click(document.querySelector('.MuiBackdrop-root') as Element)]])(
+    'dismissing the dialog with %s sends nothing and keeps the draft', async (_n, dismiss) => {
+      await renderLoaded();
+      fireEvent.change(input(), { target: { value: '0.02' } });
+      fireEvent.click(saveBtn());
+      dismiss(screen.getByRole('dialog'));
+      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+      expect(mockedPut).not.toHaveBeenCalled();
+      expect(input()).toHaveValue('0.02');
+    });
+
+  it('a double-click on Confirm sends exactly one PUT', async () => {
+    await renderLoaded();
+    mockedPut.mockResolvedValue({ data: baseResponse(0.02) });
+    fireEvent.change(input(), { target: { value: '0.02' } });
+    fireEvent.click(saveBtn());
+    const confirm = confirmBtn();
+    fireEvent.click(confirm);
+    fireEvent.click(confirm);
+    await screen.findByText('twilio/voice_outbound_minute saved');
+    expect(mockedPut).toHaveBeenCalledTimes(1);
+  });
+
+  it('auto-clears the success message after 4 seconds', async () => {
+    jest.useFakeTimers();
+    try {
+      await renderLoaded();
+      mockedPut.mockResolvedValue({ data: baseResponse(0.02) });
+      fireEvent.change(input(), { target: { value: '0.02' } });
+      fireEvent.click(saveBtn());
+      fireEvent.click(confirmBtn());
+      expect(await screen.findByText('twilio/voice_outbound_minute saved')).toBeInTheDocument();
+      act(() => { jest.advanceTimersByTime(3900); });
+      expect(screen.getByText('twilio/voice_outbound_minute saved')).toBeInTheDocument();
+      act(() => { jest.advanceTimersByTime(200); });
+      expect(screen.queryByText('twilio/voice_outbound_minute saved')).not.toBeInTheDocument();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('keeps the reset dialog title and body while it closes', async () => {
+    await renderLoaded(baseResponse(0.02));
+    fireEvent.click(resetBtn());
+    const dialog = screen.getByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(dialog).toHaveTextContent('Confirm reset to default');
+    expect(dialog).toHaveTextContent('Returns to the default rate');
+  });
+
+  it('survives an object-valued server error and a non-string updatedBy', async () => {
+    mockedGet.mockRejectedValueOnce({ response: { status: 502, data: { error: { message: 'bad gateway' } } } });
+    render(<VendorRatesTab />);
+    expect(await screen.findByText('Failed to load vendor rates')).toBeInTheDocument();
+
+    mockedGet.mockResolvedValueOnce({ data: { ...baseResponse(0.02), updatedBy: 42 } });
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(await screen.findByText(/unexpected response from server/)).toBeInTheDocument();
   });
 
   it('makes inputs read-only and disables buttons while a save is in flight', async () => {

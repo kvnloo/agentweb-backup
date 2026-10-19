@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   Alert,
   Box,
@@ -60,8 +60,11 @@ function formatMultiple(from: number, to: number): string {
 }
 
 // Server validation failures arrive as { error: string }.
-const serverError = (err: unknown, fallback: string): string =>
-  (err as { response?: { data?: { error?: string } } }).response?.data?.error || fallback;
+const serverError = (err: unknown, fallback: string): string => {
+  // A gateway may answer { error: { message } }; only a plain string is safe to render.
+  const e = (err as { response?: { data?: { error?: unknown } } }).response?.data?.error;
+  return typeof e === 'string' && e ? e : fallback;
+};
 
 const rowId = (rate: VendorRate) => `${rate.provider}/${rate.key}`;
 
@@ -93,6 +96,8 @@ function isVendorRatesResponse(d: unknown): d is VendorRatesResponse {
   return (
     typeof o === 'object' && o !== null &&
     typeof o.version === 'string' &&
+    (o.updatedAt === null || typeof o.updatedAt === 'string') &&
+    (o.updatedBy === null || typeof o.updatedBy === 'string') &&
     Array.isArray(o.editableProviders) && o.editableProviders.every((p) => typeof p === 'string') &&
     Array.isArray(o.rates) && o.rates.every(isVendorRate)
   );
@@ -196,9 +201,15 @@ export default function VendorRatesTab() {
     put(rate, usdPerUnit);
   };
 
-  const target = pending && (pending.usdPerUnit ?? pending.rate.defaultUsdPerUnit);
+  // Dialog content renders from the last non-null change so the close
+  // transition keeps its title and body instead of flashing an empty dialog.
+  const lastPending = useRef<PendingChange | null>(null);
+  if (pending) lastPending.current = pending;
+  const shown = pending ?? lastPending.current;
+
+  const target = shown && (shown.usdPerUnit ?? shown.rate.defaultUsdPerUnit);
   // Rounded so exact 10x / 0.1x (which float division misses by an ulp) sit on the boundary.
-  const multiple = pending && target !== null ? Math.round((target / pending.rate.effectiveUsdPerUnit) * 1e6) / 1e6 : 1;
+  const multiple = shown && target !== null ? Math.round((target / shown.rate.effectiveUsdPerUnit) * 1e6) / 1e6 : 1;
 
   if (loading) {
     return (
@@ -225,7 +236,7 @@ export default function VendorRatesTab() {
       <Typography variant="h6" gutterBottom>Vendor Rates</Typography>
       {data && (
         <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }} data-testid="vendor-rates-version">
-          Rate card version: {data.version}
+          Rate card version (overridden rates): {data.version}
           {data.updatedBy && data.updatedAt && ` · Last changed by ${data.updatedBy} at ${data.updatedAt}`}
         </Typography>
       )}
@@ -312,21 +323,21 @@ export default function VendorRatesTab() {
       })}
 
       <Dialog open={pending !== null} onClose={() => setPending(null)}>
-        <DialogTitle>{pending?.usdPerUnit === null ? 'Confirm reset to default' : 'Confirm rate change'}</DialogTitle>
+        <DialogTitle>{shown?.usdPerUnit === null ? 'Confirm reset to default' : 'Confirm rate change'}</DialogTitle>
         <DialogContent>
-          {pending && target !== null && (
+          {shown && target !== null && (
             <>
               <DialogContentText>
-                {`${rowId(pending.rate)}: ${formatPrice(pending.rate.effectiveUsdPerUnit)} -> ${formatPrice(target)} per ${pending.rate.unit} (${formatMultiple(pending.rate.effectiveUsdPerUnit, target)})`}
+                {`${rowId(shown.rate)}: ${formatPrice(shown.rate.effectiveUsdPerUnit)} -> ${formatPrice(target)} per ${shown.rate.unit} (${formatMultiple(shown.rate.effectiveUsdPerUnit, target)})`}
               </DialogContentText>
-              {pending.usdPerUnit === null && (
+              {shown.usdPerUnit === null && (
                 <DialogContentText>
-                  {`Returns to the default rate of ${formatPrice(pending.rate.defaultUsdPerUnit)} per ${pending.rate.unit}.`}
+                  {`Returns to the default rate of ${formatPrice(shown.rate.defaultUsdPerUnit)} per ${shown.rate.unit}.`}
                 </DialogContentText>
               )}
               {(multiple > 10 || multiple < 0.1) && (
                 <Alert severity="warning" sx={{ mt: 2 }}>
-                  This changes the rate by more than 10x. Check the value before confirming; it affects recorded vendor spend.
+                  This changes the rate by more than 10x (up or down). Check the value before confirming; it affects recorded vendor spend.
                 </Alert>
               )}
             </>
