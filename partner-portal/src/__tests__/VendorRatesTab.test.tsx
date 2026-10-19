@@ -5,7 +5,7 @@
  */
 
 import React from 'react';
-import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, within, act } from '@testing-library/react';
 import '@testing-library/jest-dom';
 
 jest.mock('axios', () => ({
@@ -56,6 +56,9 @@ const baseResponse = (overrideUsd: number | null) => ({
 });
 
 const ROW = 'vendor-rate-row-twilio/voice_outbound_minute';
+const saveBtn = () => screen.getByRole('button', { name: 'Save twilio voice_outbound_minute', hidden: true });
+const resetBtn = () => screen.getByRole('button', { name: 'Reset twilio voice_outbound_minute to default', hidden: true });
+const confirmBtn = () => within(screen.getByRole('dialog')).getByRole('button', { name: 'Confirm' });
 const input = () => screen.getByLabelText('New price for twilio/voice_outbound_minute');
 
 async function renderLoaded(data = baseResponse(null)) {
@@ -63,6 +66,8 @@ async function renderLoaded(data = baseResponse(null)) {
   render(<VendorRatesTab />);
   await screen.findByTestId(ROW);
 }
+
+const sub = (n: number) => ({ ...baseResponse(null), rates: [{ ...baseResponse(null).rates[0], defaultUsdPerUnit: n, effectiveUsdPerUnit: n }] });
 
 describe('VendorRatesTab', () => {
   beforeEach(() => {
@@ -74,24 +79,83 @@ describe('VendorRatesTab', () => {
 
     expect(mockedGet).toHaveBeenCalledWith(URL, HEADERS);
     expect(screen.getByTestId('vendor-rates-version')).toHaveTextContent('v1+ovr:2026-10-19T00:00:00.000Z');
+    expect(screen.getByTestId('vendor-rates-version')).toHaveTextContent('Last changed by admin-1 at 2026-10-19T00:00:00.000Z');
     const row = within(screen.getByTestId(ROW));
     expect(row.getByText('minute')).toBeInTheDocument();
-    expect(row.getByText('$0.014')).toBeInTheDocument(); // default, not rounded to cents
-    expect(row.getAllByText('$0.02')).toHaveLength(2); // override and effective
-    expect(within(screen.getByTestId('vendor-rate-row-twilio/sms_segment')).getAllByText('$0.0083')).toHaveLength(2); // default and effective
+    expect(row.getByText('$0.014')).toBeInTheDocument();
+    expect(row.getAllByText('$0.02')).toHaveLength(2);
+    expect(within(screen.getByTestId('vendor-rate-row-twilio/sms_segment')).getAllByText('$0.0083')).toHaveLength(2);
     expect(screen.getByLabelText('USD per minute', { selector: 'input' })).toBeInTheDocument();
   });
 
-  it('shows a loading spinner until the GET resolves', async () => {
-    mockedGet.mockReturnValue(new Promise(() => {}));
-    render(<VendorRatesTab />);
-    expect(screen.getByRole('progressbar')).toBeInTheDocument();
+  it.each([
+    [0.000001, '$0.000001'],
+    [0.000123, '$0.000123'],
+    [0.014, '$0.014'],
+    [0.5, '$0.50'],
+    [12, '$12.00'],
+    [1000, '$1000.00'],
+    [123.456789, '$123.456789'],
+    [0.000000001, '$0.000000001'],
+  ])('displays stored price %p exactly as %p, never $0.00', async (n, shown) => {
+    await renderLoaded(sub(n));
+    const row = within(screen.getByTestId(ROW));
+    expect(row.getAllByText(shown).length).toBeGreaterThan(0);
+    expect(row.queryByText('$0.00')).not.toBeInTheDocument();
   });
 
-  it('shows the server error message when loading fails', async () => {
-    mockedGet.mockRejectedValue({ response: { data: { error: 'boom from server' } } });
+  it('labels the loading spinner', async () => {
+    mockedGet.mockReturnValue(new Promise(() => {}));
     render(<VendorRatesTab />);
-    expect(await screen.findByText('boom from server')).toBeInTheDocument();
+    expect(screen.getByRole('progressbar', { name: 'Loading vendor rates' })).toBeInTheDocument();
+  });
+
+  it('shows the server error message when loading fails, persistently, with Retry', async () => {
+    jest.useFakeTimers();
+    try {
+      mockedGet.mockRejectedValue({ response: { status: 500, data: { error: 'boom from server' } } });
+      render(<VendorRatesTab />);
+      expect(await screen.findByText('boom from server')).toBeInTheDocument();
+      act(() => { jest.advanceTimersByTime(10000); });
+      expect(screen.getByText('boom from server')).toBeInTheDocument();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it.each([
+    ['401', { response: { status: 401, data: { error: 'Unauthorized' } } }, 'Unauthorized'],
+    ['403', { response: { status: 403, data: { error: 'Admin access required' } } }, 'Admin access required'],
+    ['network error', new Error('Network Error'), 'Failed to load vendor rates'],
+    ['5xx without body', { response: { status: 503, data: '<html>' } }, 'Failed to load vendor rates'],
+  ])('load failure %s shows an error with Retry', async (_n, rejection, text) => {
+    mockedGet.mockRejectedValue(rejection);
+    render(<VendorRatesTab />);
+    expect(await screen.findByText(text)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+  });
+
+  it.each([
+    ['an HTML string', '<!doctype html><html></html>'],
+    ['an empty object', {}],
+    ['null rates', { ...baseResponse(null), rates: null }],
+    ['null body', null],
+    ['a row with a string price', { ...baseResponse(null), rates: [{ ...baseResponse(null).rates[0], defaultUsdPerUnit: '0.014' }] }],
+    ['a missing version', { ...baseResponse(null), version: undefined }],
+    ['non-array providers', { ...baseResponse(null), editableProviders: 'twilio' }],
+  ])('treats %s as a load error without throwing', async (_n, payload) => {
+    mockedGet.mockResolvedValue({ data: payload });
+    render(<VendorRatesTab />);
+    expect(await screen.findByText(/unexpected response from server/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+  });
+
+  it('Retry reloads and renders the table', async () => {
+    mockedGet.mockRejectedValueOnce(new Error('Network Error')).mockResolvedValueOnce({ data: baseResponse(null) });
+    render(<VendorRatesTab />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Retry' }));
+    expect(await screen.findByTestId(ROW)).toBeInTheDocument();
+    expect(screen.queryByText('Failed to load vendor rates')).not.toBeInTheDocument();
   });
 
   it('shows an empty state when there are no editable providers', async () => {
@@ -100,95 +164,180 @@ describe('VendorRatesTab', () => {
     expect(await screen.findByText('No editable vendor rates.')).toBeInTheDocument();
   });
 
-  it('sends the exact PUT body on save and updates the row from the response', async () => {
+  it('asks for confirmation, then sends the exact PUT body and updates the row', async () => {
     await renderLoaded();
     mockedPut.mockResolvedValue({ data: baseResponse(0.02) });
 
     fireEvent.change(input(), { target: { value: ' 0.02 ' } });
-    fireEvent.click(within(screen.getByTestId(ROW)).getByRole('button', { name: 'Save' }));
+    fireEvent.click(saveBtn());
+
+    expect(mockedPut).not.toHaveBeenCalled();
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent('twilio/voice_outbound_minute: $0.014 -> $0.02 per minute (x1.4)');
+    fireEvent.click(confirmBtn());
 
     await waitFor(() => expect(mockedPut).toHaveBeenCalledTimes(1));
-    expect(mockedPut).toHaveBeenCalledWith(
-      URL,
-      { provider: 'twilio', key: 'voice_outbound_minute', usdPerUnit: 0.02 },
-      HEADERS,
-    );
+    expect(mockedPut).toHaveBeenCalledWith(URL, { provider: 'twilio', key: 'voice_outbound_minute', usdPerUnit: 0.02 }, HEADERS);
     expect(await screen.findByText('twilio/voice_outbound_minute saved')).toBeInTheDocument();
     expect(within(screen.getByTestId(ROW)).getAllByText('$0.02')).toHaveLength(2);
     expect(screen.getByTestId('vendor-rates-version')).toHaveTextContent('+ovr:');
     expect(input()).toHaveValue('');
   });
 
-  it('resets to default by PUTting usdPerUnit null', async () => {
+  it('Cancel sends nothing and keeps the draft', async () => {
+    await renderLoaded();
+    fireEvent.change(input(), { target: { value: '0.02' } });
+    fireEvent.click(saveBtn());
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(mockedPut).not.toHaveBeenCalled();
+    expect(input()).toHaveValue('0.02');
+  });
+
+  it('Enter in the field opens the confirmation', async () => {
+    await renderLoaded();
+    fireEvent.change(input(), { target: { value: '0.02' } });
+    fireEvent.keyDown(input(), { key: 'Enter' });
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect(mockedPut).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['0.14', 'x10.0', false], // exactly 10x: no warning
+    ['0.15', 'x10.7', true],
+    ['0.0014', '/10.0', false], // exactly 0.1x: no warning
+    ['0.0013', '/10.8', true],
+    ['0.014', 'x1.0', false],
+  ])('confirm for %s shows %s, warning=%s', async (value, multiple, warns) => {
+    await renderLoaded();
+    fireEvent.change(input(), { target: { value } });
+    fireEvent.click(saveBtn());
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent(`(${multiple})`);
+    expect(within(dialog).queryByText(/more than 10x/) !== null).toBe(warns);
+  });
+
+  it('reset confirm shows effective and default, then PUTs null', async () => {
     await renderLoaded(baseResponse(0.02));
     mockedPut.mockResolvedValue({ data: baseResponse(null) });
 
-    fireEvent.click(within(screen.getByTestId(ROW)).getByRole('button', { name: 'Reset to default' }));
+    fireEvent.click(resetBtn());
+    expect(mockedPut).not.toHaveBeenCalled();
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent('twilio/voice_outbound_minute: $0.02 -> $0.014 per minute');
+    expect(dialog).toHaveTextContent('Returns to the default rate of $0.014 per minute.');
+    fireEvent.click(confirmBtn());
 
     await waitFor(() => expect(mockedPut).toHaveBeenCalledTimes(1));
-    expect(mockedPut).toHaveBeenCalledWith(
-      URL,
-      { provider: 'twilio', key: 'voice_outbound_minute', usdPerUnit: null },
-      HEADERS,
-    );
+    expect(mockedPut).toHaveBeenCalledWith(URL, { provider: 'twilio', key: 'voice_outbound_minute', usdPerUnit: null }, HEADERS);
     await waitFor(() => expect(screen.getByTestId('vendor-rates-version')).toHaveTextContent('Rate card version: v1'));
-    expect(within(screen.getByTestId(ROW)).getByRole('button', { name: 'Reset to default' })).toBeDisabled();
+    expect(resetBtn()).toBeDisabled();
   });
 
   it('disables reset when there is no override', async () => {
     await renderLoaded();
-    expect(within(screen.getByTestId(ROW)).getByRole('button', { name: 'Reset to default' })).toBeDisabled();
+    expect(resetBtn()).toBeDisabled();
   });
 
-  it.each(['0', '-1', 'NaN', 'abc', '1000.01', 'Infinity', '1e999', '0x10x'])(
-    'blocks invalid price %p client-side without calling PUT',
+  it.each(['0', '-1', 'NaN', 'abc', '1000.01', 'Infinity', '1e999', '0x10', '0b1', '0o7', '1e-3', '+1', '1,5', '.', '1.1234567', '0.0000001', '', '  '])(
+    'blocks invalid price %p client-side without a dialog or PUT',
     async (bad) => {
       await renderLoaded();
-
       fireEvent.change(input(), { target: { value: bad } });
-      fireEvent.click(within(screen.getByTestId(ROW)).getByRole('button', { name: 'Save' }));
-
-      expect(await screen.findByText(/greater than 0 and at most 1000/)).toBeInTheDocument();
+      fireEvent.keyDown(input(), { key: 'Enter' });
+      if (bad.trim()) {
+        fireEvent.click(saveBtn());
+        expect(await screen.findByText(/plain decimal greater than 0/)).toBeInTheDocument();
+      }
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
       expect(mockedPut).not.toHaveBeenCalled();
     },
   );
 
-  it('accepts the upper bound 1000', async () => {
-    await renderLoaded();
-    mockedPut.mockResolvedValue({ data: baseResponse(1000) });
+  it.each([['0.014', 0.014], ['.5', 0.5], ['5.', 5], ['0.000001', 0.000001], ['1000', 1000]])(
+    'accepts plain decimal %p and sends %p',
+    async (typed, sent) => {
+      await renderLoaded();
+      mockedPut.mockResolvedValue({ data: baseResponse(sent) });
+      fireEvent.change(input(), { target: { value: typed } });
+      fireEvent.click(saveBtn());
+      fireEvent.click(confirmBtn());
+      await waitFor(() => expect(mockedPut).toHaveBeenCalledTimes(1));
+      expect(mockedPut.mock.calls[0][1].usdPerUnit).toBe(sent);
+    },
+  );
 
-    fireEvent.change(input(), { target: { value: '1000' } });
-    fireEvent.click(within(screen.getByTestId(ROW)).getByRole('button', { name: 'Save' }));
+  it('surfaces a server 400 error persistently and keeps the typed draft', async () => {
+    jest.useFakeTimers();
+    try {
+      await renderLoaded();
+      mockedPut.mockRejectedValue({ response: { status: 400, data: { error: 'usdPerUnit must be <= 1000' } } });
+      fireEvent.change(input(), { target: { value: '5' } });
+      fireEvent.click(saveBtn());
+      fireEvent.click(confirmBtn());
 
-    await waitFor(() => expect(mockedPut).toHaveBeenCalledTimes(1));
-    expect(mockedPut.mock.calls[0][1].usdPerUnit).toBe(1000);
+      expect(await screen.findByText('usdPerUnit must be <= 1000')).toBeInTheDocument();
+      act(() => { jest.advanceTimersByTime(10000); });
+      expect(screen.getByText('usdPerUnit must be <= 1000')).toBeInTheDocument();
+      expect(input()).toHaveValue('5');
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
-  it('surfaces a server 400 error and keeps the typed draft', async () => {
+  it.each([
+    ['403 with message', { response: { status: 403, data: { error: 'Admin access required' } } }, 'Admin access required'],
+    ['network error', new Error('Network Error'), 'Failed to save vendor rate'],
+  ])('save failure (%s) shows the server error or the fallback', async (_n, rejection, text) => {
     await renderLoaded();
-    mockedPut.mockRejectedValue({ response: { status: 400, data: { error: 'usdPerUnit must be <= 1000' } } });
-
+    mockedPut.mockRejectedValue(rejection);
     fireEvent.change(input(), { target: { value: '5' } });
-    fireEvent.click(within(screen.getByTestId(ROW)).getByRole('button', { name: 'Save' }));
-
-    expect(await screen.findByText('usdPerUnit must be <= 1000')).toBeInTheDocument();
-    expect(input()).toHaveValue('5');
+    fireEvent.click(saveBtn());
+    fireEvent.click(confirmBtn());
+    expect(await screen.findByText(text)).toBeInTheDocument();
   });
 
-  it('disables all controls while a save is in flight', async () => {
+  it('treats a malformed PUT response as a save error and keeps the table', async () => {
+    await renderLoaded();
+    mockedPut.mockResolvedValue({ data: '<html>' });
+    fireEvent.change(input(), { target: { value: '5' } });
+    fireEvent.click(saveBtn());
+    fireEvent.click(confirmBtn());
+    expect(await screen.findByText(/unexpected response from server/)).toBeInTheDocument();
+    expect(screen.getByTestId(ROW)).toBeInTheDocument();
+  });
+
+  it('leaves the other row and its draft untouched after saving one row', async () => {
+    await renderLoaded();
+    mockedPut.mockResolvedValue({ data: baseResponse(0.02) });
+    const other = screen.getByLabelText('New price for twilio/sms_segment');
+    fireEvent.change(other, { target: { value: '0.009' } });
+    fireEvent.change(input(), { target: { value: '0.02' } });
+    fireEvent.click(saveBtn());
+    fireEvent.click(confirmBtn());
+    await screen.findByText('twilio/voice_outbound_minute saved');
+    expect(other).toHaveValue('0.009');
+    expect(within(screen.getByTestId('vendor-rate-row-twilio/sms_segment')).getAllByText('$0.0083')).toHaveLength(2);
+  });
+
+  it('makes inputs read-only and disables buttons while a save is in flight', async () => {
     await renderLoaded(baseResponse(0.02));
     let resolvePut: (v: unknown) => void = () => {};
     mockedPut.mockReturnValue(new Promise((r) => { resolvePut = r; }));
 
     fireEvent.change(input(), { target: { value: '5' } });
-    fireEvent.click(within(screen.getByTestId(ROW)).getByRole('button', { name: 'Save' }));
+    fireEvent.click(saveBtn());
+    fireEvent.click(confirmBtn());
 
-    expect(await screen.findByRole('button', { name: 'Saving...' })).toBeDisabled();
-    expect(input()).toBeDisabled();
-    expect(within(screen.getByTestId(ROW)).getByRole('button', { name: 'Reset to default' })).toBeDisabled();
-    expect(screen.getByLabelText('New price for twilio/sms_segment')).toBeDisabled();
+    expect(await screen.findByText('Saving...')).toBeInTheDocument();
+    expect(saveBtn()).toBeDisabled();
+    expect(input()).toHaveAttribute('readonly');
+    expect(input()).not.toBeDisabled();
+    expect(resetBtn()).toBeDisabled();
+    expect(screen.getByLabelText('New price for twilio/sms_segment')).toHaveAttribute('readonly');
 
     resolvePut({ data: baseResponse(5) });
-    await waitFor(() => expect(input()).not.toBeDisabled());
+    await waitFor(() => expect(input()).not.toHaveAttribute('readonly'));
   });
 });

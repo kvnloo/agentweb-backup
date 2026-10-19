@@ -4,6 +4,11 @@ import {
   Box,
   Button,
   CircularProgress,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
   Paper,
   Table,
   TableBody,
@@ -37,13 +42,22 @@ interface VendorRatesResponse {
   updatedBy: string | null;
 }
 
-// Rates are fractions of a cent (e.g. 0.014), so never round to cents.
-const priceFormatter = new Intl.NumberFormat('en-US', {
-  style: 'currency',
-  currency: 'USD',
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 6,
-});
+// Show exactly what is stored: up to 6 decimals, trailing zeros trimmed but
+// never fewer than 2 (0.014 -> $0.014, 12 -> $12.00). A positive value is never
+// shown as $0.00, even if it somehow has more than 6 decimals.
+function formatPrice(n: number): string {
+  let fixed = n.toFixed(6);
+  if (n > 0 && Number(fixed) === 0) fixed = n.toFixed(20);
+  const [whole, frac = ''] = fixed.split('.');
+  const trimmed = frac.replace(/0+$/, '').padEnd(2, '0');
+  return `$${whole}.${trimmed}`;
+}
+
+// "x2.5" / "/4.0" relative to the current effective rate.
+function formatMultiple(from: number, to: number): string {
+  const m = to / from;
+  return m >= 1 ? `x${m.toFixed(1)}` : `/${(1 / m).toFixed(1)}`;
+}
 
 // Server validation failures arrive as { error: string }.
 const serverError = (err: unknown, fallback: string): string =>
@@ -51,18 +65,52 @@ const serverError = (err: unknown, fallback: string): string =>
 
 const rowId = (rate: VendorRate) => `${rate.provider}/${rate.key}`;
 
+// Plain decimals only (no sign, exponent, hex/binary/octal, separators) with at
+// most 6 decimal places, so Number() never sees a form it would reinterpret.
+const PLAIN_DECIMAL = /^(?:\d+(?:\.\d{0,6})?|\.\d{1,6})$/;
+
 function parsePrice(draft: string): number | null {
   const trimmed = draft.trim();
-  if (!trimmed) return null;
+  if (!PLAIN_DECIMAL.test(trimmed)) return null;
   const value = Number(trimmed);
-  return Number.isFinite(value) && value > 0 && value <= MAX_USD_PER_UNIT ? value : null;
+  return value > 0 && value <= MAX_USD_PER_UNIT ? value : null;
+}
+
+const isNumber = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
+function isVendorRate(r: unknown): r is VendorRate {
+  const o = r as Record<string, unknown> | null;
+  return (
+    typeof o === 'object' && o !== null &&
+    typeof o.provider === 'string' && typeof o.key === 'string' && typeof o.unit === 'string' &&
+    isNumber(o.defaultUsdPerUnit) && isNumber(o.effectiveUsdPerUnit) &&
+    (o.overrideUsdPerUnit === null || isNumber(o.overrideUsdPerUnit))
+  );
+}
+
+function isVendorRatesResponse(d: unknown): d is VendorRatesResponse {
+  const o = d as Record<string, unknown> | null;
+  return (
+    typeof o === 'object' && o !== null &&
+    typeof o.version === 'string' &&
+    Array.isArray(o.editableProviders) && o.editableProviders.every((p) => typeof p === 'string') &&
+    Array.isArray(o.rates) && o.rates.every(isVendorRate)
+  );
+}
+
+interface PendingChange {
+  rate: VendorRate;
+  // null = reset to default
+  usdPerUnit: number | null;
 }
 
 export default function VendorRatesTab() {
   const { token } = useAuth();
   const [loading, setLoading] = useState(true);
   const [savingRow, setSavingRow] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState('');
   const [error, setError] = useState('');
+  const [pending, setPending] = useState<PendingChange | null>(null);
   const [success, setSuccess] = useState('');
   const [data, setData] = useState<VendorRatesResponse | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
@@ -72,10 +120,15 @@ export default function VendorRatesTab() {
   const load = async () => {
     try {
       setLoading(true);
-      const { data: res } = await axios.get<VendorRatesResponse>(buildApiUrl('/api/admin/vendor-rates'), { headers });
+      setLoadError('');
+      const { data: res } = await axios.get<unknown>(buildApiUrl('/api/admin/vendor-rates'), { headers });
+      if (!isVendorRatesResponse(res)) {
+        setLoadError('Failed to load vendor rates: unexpected response from server');
+        return;
+      }
       setData(res);
     } catch (err) {
-      setError(serverError(err, 'Failed to load vendor rates'));
+      setLoadError(serverError(err, 'Failed to load vendor rates'));
     } finally {
       setLoading(false);
     }
@@ -84,21 +137,27 @@ export default function VendorRatesTab() {
   useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    if (error || success) {
-      const t = setTimeout(() => { setError(''); setSuccess(''); }, 4000);
+    if (success) {
+      const t = setTimeout(() => setSuccess(''), 4000);
       return () => clearTimeout(t);
     }
-  }, [error, success]);
+  }, [success]);
 
   const put = async (rate: VendorRate, usdPerUnit: number | null) => {
     const id = rowId(rate);
     try {
       setSavingRow(id);
-      const { data: res } = await axios.put<VendorRatesResponse>(
+      setError('');
+      setSuccess('');
+      const { data: res } = await axios.put<unknown>(
         buildApiUrl('/api/admin/vendor-rates'),
         { provider: rate.provider, key: rate.key, usdPerUnit },
         { headers },
       );
+      if (!isVendorRatesResponse(res)) {
+        setError('Failed to save vendor rate: unexpected response from server');
+        return;
+      }
       setData(res);
       setDrafts((prev) => {
         const next = { ...prev };
@@ -113,25 +172,53 @@ export default function VendorRatesTab() {
     }
   };
 
-  const handleSave = (rate: VendorRate) => {
+  const requestSave = (rate: VendorRate) => {
     const value = parsePrice(drafts[rowId(rate)] ?? '');
     if (value === null) {
-      setError(`Price must be a number greater than 0 and at most ${MAX_USD_PER_UNIT}`);
+      setError(`Price must be a plain decimal greater than 0 and at most ${MAX_USD_PER_UNIT}, with at most 6 decimal places`);
       return;
     }
-    put(rate, value);
+    setError('');
+    setSuccess('');
+    setPending({ rate, usdPerUnit: value });
   };
+
+  const requestReset = (rate: VendorRate) => {
+    setError('');
+    setSuccess('');
+    setPending({ rate, usdPerUnit: null });
+  };
+
+  const confirmPending = () => {
+    if (!pending) return;
+    const { rate, usdPerUnit } = pending;
+    setPending(null);
+    put(rate, usdPerUnit);
+  };
+
+  const target = pending && (pending.usdPerUnit ?? pending.rate.defaultUsdPerUnit);
+  // Rounded so exact 10x / 0.1x (which float division misses by an ulp) sit on the boundary.
+  const multiple = pending && target !== null ? Math.round((target / pending.rate.effectiveUsdPerUnit) * 1e6) / 1e6 : 1;
 
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" p={4}>
-        <CircularProgress />
+        <CircularProgress aria-label="Loading vendor rates" />
       </Box>
     );
   }
 
   return (
     <Box>
+      {loadError && (
+        <Alert
+          severity="error"
+          sx={{ mb: 2 }}
+          action={<Button color="inherit" size="small" onClick={load}>Retry</Button>}
+        >
+          {loadError}
+        </Alert>
+      )}
       {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
       {success && <Alert severity="success" sx={{ mb: 2 }}>{success}</Alert>}
 
@@ -139,6 +226,7 @@ export default function VendorRatesTab() {
       {data && (
         <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }} data-testid="vendor-rates-version">
           Rate card version: {data.version}
+          {data.updatedBy && data.updatedAt && ` · Last changed by ${data.updatedBy} at ${data.updatedAt}`}
         </Typography>
       )}
 
@@ -177,19 +265,19 @@ export default function VendorRatesTab() {
                       <TableRow key={id} data-testid={`vendor-rate-row-${id}`}>
                         <TableCell>{rate.key}</TableCell>
                         <TableCell>{rate.unit}</TableCell>
-                        <TableCell align="right">{priceFormatter.format(rate.defaultUsdPerUnit)}</TableCell>
+                        <TableCell align="right">{formatPrice(rate.defaultUsdPerUnit)}</TableCell>
                         <TableCell align="right">
-                          {rate.overrideUsdPerUnit === null ? '-' : priceFormatter.format(rate.overrideUsdPerUnit)}
+                          {rate.overrideUsdPerUnit === null ? '-' : formatPrice(rate.overrideUsdPerUnit)}
                         </TableCell>
-                        <TableCell align="right">{priceFormatter.format(rate.effectiveUsdPerUnit)}</TableCell>
+                        <TableCell align="right">{formatPrice(rate.effectiveUsdPerUnit)}</TableCell>
                         <TableCell>
                           <TextField
                             size="small"
                             label={`USD per ${rate.unit}`}
                             value={draft}
-                            onChange={(e) => setDrafts({ ...drafts, [id]: e.target.value })}
-                            disabled={busy}
-                            inputProps={{ 'aria-label': `New price for ${id}`, inputMode: 'decimal' }}
+                            onChange={(e) => setDrafts((prev) => ({ ...prev, [id]: e.target.value }))}
+                            onKeyDown={(e) => { if (e.key === 'Enter' && !busy && draft.trim()) requestSave(rate); }}
+                            inputProps={{ 'aria-label': `New price for ${id}`, inputMode: 'decimal', readOnly: busy }}
                           />
                         </TableCell>
                         <TableCell>
@@ -197,14 +285,16 @@ export default function VendorRatesTab() {
                             <Button
                               variant="contained"
                               size="small"
-                              onClick={() => handleSave(rate)}
+                              onClick={() => requestSave(rate)}
+                              aria-label={`Save ${rate.provider} ${rate.key}`}
                               disabled={busy || !draft.trim()}
                             >
                               {savingRow === id ? 'Saving...' : 'Save'}
                             </Button>
                             <Button
                               size="small"
-                              onClick={() => put(rate, null)}
+                              onClick={() => requestReset(rate)}
+                              aria-label={`Reset ${rate.provider} ${rate.key} to default`}
                               disabled={busy || rate.overrideUsdPerUnit === null}
                             >
                               Reset to default
@@ -220,6 +310,33 @@ export default function VendorRatesTab() {
           </Paper>
         );
       })}
+
+      <Dialog open={pending !== null} onClose={() => setPending(null)}>
+        <DialogTitle>{pending?.usdPerUnit === null ? 'Confirm reset to default' : 'Confirm rate change'}</DialogTitle>
+        <DialogContent>
+          {pending && target !== null && (
+            <>
+              <DialogContentText>
+                {`${rowId(pending.rate)}: ${formatPrice(pending.rate.effectiveUsdPerUnit)} -> ${formatPrice(target)} per ${pending.rate.unit} (${formatMultiple(pending.rate.effectiveUsdPerUnit, target)})`}
+              </DialogContentText>
+              {pending.usdPerUnit === null && (
+                <DialogContentText>
+                  {`Returns to the default rate of ${formatPrice(pending.rate.defaultUsdPerUnit)} per ${pending.rate.unit}.`}
+                </DialogContentText>
+              )}
+              {(multiple > 10 || multiple < 0.1) && (
+                <Alert severity="warning" sx={{ mt: 2 }}>
+                  This changes the rate by more than 10x. Check the value before confirming; it affects recorded vendor spend.
+                </Alert>
+              )}
+            </>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setPending(null)}>Cancel</Button>
+          <Button onClick={confirmPending} color="primary" variant="contained">Confirm</Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 }
