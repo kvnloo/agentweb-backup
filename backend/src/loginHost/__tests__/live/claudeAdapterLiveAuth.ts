@@ -135,18 +135,29 @@ async function main(): Promise<void> {
   const bridgeToken = "LIVE-" + randomBytes(12).toString("hex");
   const bridge = await startBridge(bridgeToken);
   const binPath = resolveClaudeBinary();
-  const adapter = new ClaudeAdapter({
-    binary: { path: binPath, version: "pinned", digest: "sha256:" + (await sha256Prefix(binPath)) },
-    systemPromptFile: promptFile,
-    turnWrapperPath: WRAPPER,
-    bridgeUrl: bridge.url,
-    basePath: "/usr/bin:/bin",
-    unitTmp,
-    startTimeoutMs: 30_000,
-    completeTimeoutMs: 60_000,
-    shortCommandTimeoutMs: 60_000,
-    authConfirmTimeoutMs: 20_000,
-  });
+  const digest = "sha256:" + (await sha256Prefix(binPath));
+  // In production every turn runs in its own systemd unit with a private /tmp. Locally each adapter instance gets its own
+  // `unitTmp` and every turn below uses a fresh one (the wrapper creates its directories exclusively and refuses a reused tmp).
+  let unitCounter = 0;
+  const mkAdapter = (tmp: string = unitTmp): ClaudeAdapter =>
+    new ClaudeAdapter({
+      binary: { path: binPath, version: "pinned", digest },
+      systemPromptFile: promptFile,
+      turnWrapperPath: WRAPPER,
+      bridgeUrl: bridge.url,
+      basePath: "/usr/bin:/bin",
+      unitTmp: tmp,
+      startTimeoutMs: 30_000,
+      completeTimeoutMs: 60_000,
+      shortCommandTimeoutMs: 60_000,
+      authConfirmTimeoutMs: 20_000,
+    });
+  const freshUnitAdapter = (): ClaudeAdapter => {
+    const d = join(root, `unit-${++unitCounter}`);
+    mkdirSync(d, { mode: 0o700 });
+    return mkAdapter(d);
+  };
+  const adapter = mkAdapter(); // sign-in, status, hazards, logout (short commands never touch the unit tmp)
 
   let signedIn = false;
   try {
@@ -174,7 +185,7 @@ async function main(): Promise<void> {
     check("expiryModel is 30 days out", (adapter.expiryModel(Date.now()).refreshExpiresAtMs ?? 0) - Date.now() > 29 * 24 * 3600 * 1000);
 
     // ── one real turn ──
-    let s1: ProviderSession = await adapter.openSession(ctx, { connectionId: "live-auth", epoch: 1 });
+    let s1: ProviderSession = await freshUnitAdapter().openSession(ctx, { connectionId: "live-auth", epoch: 1 });
     const t0 = Date.now();
     let firstEventMs = -1;
     const ev1 = await runTurn(s1, "t1", "Reply with exactly: OK", bridgeToken, () => (firstEventMs < 0 ? (firstEventMs = Date.now() - t0) : undefined));
@@ -191,19 +202,22 @@ async function main(): Promise<void> {
     check("the MCP bridge saw the real CLI connect with the stdin-delivered bearer token", bridge.stats.badAuth === 0 && bridge.stats.methods.has("initialize"), `requests=${bridge.stats.requests} badAuth=${bridge.stats.badAuth} methods=${[...bridge.stats.methods].join(",")}`);
     check("the turn's process is gone when `closed` resolves", [...pids].every((p) => !alive(p)));
     console.log(`      names in the credential home after a turn: ${readdirSync(homeDir).sort().join(", ")}`);
-    check("nothing is left in the work dir or the connection tmp dir", readdirSync(workDir).length === 0 && readdirSync(tmpDir).length === 0, `work=${readdirSync(workDir).length} tmp=${readdirSync(tmpDir).length}`);
+    check("nothing is left in the work dir", readdirSync(workDir).length === 0, `work=${readdirSync(workDir).length}`);
+    console.log(`      names in the connection tmp dir (HOME of the short commands: status/doctor): ${readdirSync(tmpDir).sort().join(", ") || "(none)"}`);
+    check("the unit-private tmp holds only the wrapper's directories", readdirSync(join(root, "unit-1")).sort().join(",") === "aw-cfg,aw-home", readdirSync(join(root, "unit-1")).sort().join(","));
 
     // ── 3 concurrent turns on ONE home (the recorded cap) ──
-    const sessions = await Promise.all([1, 2, 3].map(() => adapter.openSession(ctx, { connectionId: "live-auth", epoch: 1 })));
+    const sessions = await Promise.all([1, 2, 3].map(() => freshUnitAdapter().openSession(ctx, { connectionId: "live-auth", epoch: 1 })));
     const c0 = Date.now();
     const conc = await Promise.all(sessions.map((s, i) => runTurn(s, `c${i}`, `Reply with exactly: C${i}`, bridgeToken)));
     await Promise.all(sessions.map((s) => s.closed));
+    for (const [i, evs] of conc.entries()) console.log(`      concurrent turn ${i}: ${summarize(evs)}`);
     check("3 concurrent turns on one home all succeed", conc.every((evs) => evs[evs.length - 1]?.type === "result" && (evs[evs.length - 1] as { ok: boolean }).ok === true), `${Date.now() - c0} ms; ${conc.map((e) => summarize(e).split(",").pop()).join(" ")}`);
     const stAfter = await adapter.authStatus(ctx);
     check("the login is intact after the concurrent turns", stAfter.loggedIn === true);
 
     // ── interrupt mid-turn, then the next turn still works ──
-    s1 = await adapter.openSession(ctx, { connectionId: "live-auth", epoch: 1 });
+    s1 = await freshUnitAdapter().openSession(ctx, { connectionId: "live-auth", epoch: 1 });
     let interrupted = false;
     const evI: ProviderEvent[] = [];
     const turnI = (async () => {
@@ -218,13 +232,13 @@ async function main(): Promise<void> {
     const ended = await Promise.race([turnI.then(() => true), sleep(30_000).then(() => false)]);
     const closedI = await Promise.race([s1.closed.then(() => true), sleep(15_000).then(() => false)]);
     check("interrupt ends a running turn and the process is gone", ended && closedI && [...pids].every((p) => !alive(p)), `events=${summarize(evI)}`);
-    const sNext = await adapter.openSession(ctx, { connectionId: "live-auth", epoch: 1 });
+    const sNext = await freshUnitAdapter().openSession(ctx, { connectionId: "live-auth", epoch: 1 });
     const evN = await runTurn(sNext, "tn", "Reply with exactly: AGAIN", bridgeToken);
     await sNext.closed;
     check("a turn after the interrupt works (login not damaged)", (evN[evN.length - 1] as { ok?: boolean })?.ok === true);
 
     // ── close() during a turn kills the process ──
-    const sC = await adapter.openSession(ctx, { connectionId: "live-auth", epoch: 1 });
+    const sC = await freshUnitAdapter().openSession(ctx, { connectionId: "live-auth", epoch: 1 });
     const turnC = runTurn(sC, "tc", "Count from 1 to 400, one number per line, no other text.", bridgeToken);
     await sleep(2500);
     await sC.close();
