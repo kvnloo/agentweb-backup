@@ -88,8 +88,8 @@ async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: H
       return null;
     }
   }
-  const phone = leadPhoneE164(lead);
-  return phone ? { job, ctx, phone } : null; // always set: the invalid_phone gate refused otherwise
+  const callable = callableLeadPhone(lead.phone, ctx.config);
+  return 'phone' in callable ? { job, ctx, phone: callable.phone } : null; // always set: the phone gate refused otherwise
 }
 
 /**

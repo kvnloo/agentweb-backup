@@ -145,6 +145,7 @@ describe('dispatchHotLeadCall gates', () => {
     lead.leadId = leadId;
     await dispatchHotLeadCall('list-a', leadId, 'form_fill');
     expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'unsafe_id' } }]);
+    expect(limits.keysTouched).toEqual([]); // refused before any slot is reserved
     expect(enqueueCalls()).toHaveLength(0);
     expect(provider.placedCalls).toHaveLength(0);
   });
