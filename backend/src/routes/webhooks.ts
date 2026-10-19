@@ -37,7 +37,7 @@ import { handleHardBounceRecipients } from '../services/emailDeliverabilityServi
 import { shouldAttemptCapiSend, isCapiAccountPaused, recordCapiUsage } from '../services/capiSendBudget';
 import { suppressLeadSideEffects, isSessionList, resolveSessionIdentity } from '../utils/sessionList';
 import { getPhoneDedupeMode } from '../utils/phoneLeadDedupeMode';
-import { phoneDedupeKey, phoneNamesConflict } from '../utils/phoneLeadDedupe';
+import { fillBlankCustomFields, phoneDedupeKey, phoneNamesConflict } from '../utils/phoneLeadDedupe';
 import { findPhoneMatch } from '../services/phoneLeadMatch';
 import { upsertSessionLead } from '../services/sessionUpsertService';
 
@@ -781,12 +781,13 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       : 'off';
     const phoneKey = phoneMode === 'off' ? '' : phoneDedupeKey(normalizedPhone);
     let phoneSharedLine = false;
+    let existingFoundByPhone = false;
     if (phoneKey && (phoneMode === 'shadow' || phoneMode === 'on')) {
       try {
         const match = await findPhoneMatch(leadList.listId, phoneKey, leadData);
         // No phone number, name or lead id in this line: only counts and the decision.
         console.log(`[phone-dedupe] mode=${phoneMode} list=${leadList.listId} decision=${match.decision} candidates=${match.candidates} valid=${match.valid}`);
-        if (phoneMode === 'on' && match.decision === 'match') existingLead = match.lead;
+        if (phoneMode === 'on' && match.decision === 'match') { existingLead = match.lead; existingFoundByPhone = true; }
         // A known shared line is never collapsed, not even by the same-bucket exactly-once create.
         phoneSharedLine = match.decision === 'shared-line';
       } catch (lookupErr: any) {
@@ -810,7 +811,9 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // concurrent submission of the same email (the adopt in the create branch below). Sharing
     // it keeps both on identical merge / attribution / isUpdated semantics. Assigns the
     // enclosing `lead` and `isUpdated`.
-    const mergeIntoExistingLead = async (existingLead: any): Promise<void> => {
+    const mergeIntoExistingLead = async (existingLead: any, opts: { fillBlanksOnly?: boolean } = {}): Promise<void> => {
+      // ENG-2123: a lead matched by PHONE (not email) only has its blanks filled, never overwritten.
+      const fillBlanksOnly = opts.fillBlanksOnly === true;
       // Merge new data into existing lead (only overwrite with non-empty values)
       const normalize = (value: any): string => {
         if (value === null || value === undefined) return '';
@@ -825,7 +828,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         const newValue = normalize(leadData[field]);
         if (newValue) {
           const existingValue = normalize(existingLead[field]);
-          if (existingValue !== newValue) {
+          if (existingValue !== newValue && !(fillBlanksOnly && existingValue)) {
             updates[field] = newValue;
             changed = true;
           }
@@ -834,7 +837,9 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
       // Merge custom fields
       const existingCustomFields = existingLead.customFields || {};
-      const mergedCf = { ...existingCustomFields, ...mergedCustomFields };
+      const mergedCf = fillBlanksOnly
+        ? fillBlankCustomFields(existingCustomFields, mergedCustomFields)
+        : { ...existingCustomFields, ...mergedCustomFields };
       // `source` is defaulted to 'api' whenever the caller omits it, so a blind spread lets
       // that synthesized value overwrite a real stored source on every repeat submission —
       // the same data loss the phone adopt path was fixed for, on the far more common email
@@ -938,7 +943,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         touch,
       }));
     } else if (existingLead) {
-      await mergeIntoExistingLead(existingLead);
+      await mergeIntoExistingLead(existingLead, { fillBlanksOnly: existingFoundByPhone });
     } else {
       // Create a new lead.
       // ENG-2082: with no email there is nothing to query on beforehand, so a phone-only
@@ -1023,7 +1028,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           // consistently (one GetItem, race path only); fall back to the carried row only if
           // that read comes back empty.
           const fresh = phoneWinner || await crmDb.getLeadById(leadList.listId, createErr.existingLead.leadId, { consistentRead: true });
-          await mergeIntoExistingLead(fresh || createErr.existingLead);
+          await mergeIntoExistingLead(fresh || createErr.existingLead, { fillBlanksOnly: !!createErr?.duplicatePhone });
         } else if (!createErr?.leadAlreadyExists) {
           throw createErr;
         } else {
