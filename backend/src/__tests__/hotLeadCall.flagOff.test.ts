@@ -17,6 +17,7 @@ const postMessage = jest.fn();
 const authTest = jest.fn();
 jest.mock('@slack/web-api', () => ({ WebClient: jest.fn(() => ({ auth: { test: authTest }, chat: { postMessage } })) }));
 jest.mock('../services/db', () => ({
+  ENGAGED_EVENT_KEYWORDS: jest.requireActual('../services/db').ENGAGED_EVENT_KEYWORDS,
   crmDb: {
     getLeadListById: jest.fn(), getLeadById: jest.fn(), claimLeadStepOnce: jest.fn(), setLeadFields: jest.fn(),
     addLeadEngagement: jest.fn(), createLeadSystemRecordOnce: jest.fn(), updateLeadSystemRecordIf: jest.fn(),
