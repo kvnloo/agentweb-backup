@@ -156,6 +156,100 @@ function ignoreInterruptAfterAbort(rig: Rig) {
   rig.script.ignoreInterrupt = true;
 }
 
+describe("a hung turn that shares its uid with a live sibling", () => {
+  let rig: Rig;
+  afterEach(() => rig?.cleanup());
+
+  it("keeps counting against the caps until its close settles; a failed close then gets the uid killed once no session is left", async () => {
+    rig = makeRig({ adapter: { singleUse: true, maxProcessesPerHome: 2 }, config: { abortGraceMs: 20, adapterCallTimeoutMs: 120 } });
+    await signIn(rig, "c1", 1);
+    const uid = rig.store.get().connections.c1.uid;
+    let releaseSibling!: () => void;
+    rig.script.turnEvents = [{ wait: new Promise<void>((r) => (releaseSibling = r)) }, resultEvent];
+    const sOut = drain((await rig.mgr.runTurn(nextTurn("c1", 1))).events!);
+    await flush();
+    rig.script.hangTurn = true;
+    rig.script.closeGate = new Promise<void>(() => undefined); // a close that never returns: the hung process may still be alive
+    const hung = nextTurn("c1", 1);
+    const hOut = drain((await rig.mgr.runTurn(hung)).events!);
+    await flush();
+    rig.fs.killed.length = 0;
+    await rig.mgr.interruptTurn({ connectionId: "c1", epoch: 1, turnId: hung.turnId });
+    expect((await hOut).pop()).toMatchObject({ ok: false, aborted: "interrupted" });
+    // the hung session's close has not settled: its slot is NOT free, and nothing was killed (the sibling is running)
+    expect(await code(rig.mgr.runTurn(nextTurn("c1", 1)))).toBe("EBUSY:connection_busy");
+    expect(rig.fs.killed).not.toContain(uid);
+    await new Promise((r) => setTimeout(r, 250)); // the bounded close times out: the slot is released, the kill is deferred
+    expect(rig.fs.killed).not.toContain(uid); // the sibling is still alive
+    rig.script.hangTurn = false;
+    releaseSibling();
+    await sOut;
+    await new Promise((r) => setTimeout(r, 250)); // the sibling's own (stuck) close times out too: no live session left
+    expect(rig.fs.killed).toContain(uid); // now the possibly-live hung process is killed
+  });
+
+  it("a stale deferred kill never touches a uid the connection no longer owns (it may belong to someone else by now)", async () => {
+    rig = makeRig({ adapter: { singleUse: true } });
+    await signIn(rig, "c1", 1);
+    const foreignUid = 400_009;
+    (rig.mgr as unknown as { deferredKills: Map<string, number> }).deferredKills.set("c1", foreignUid);
+    rig.script.turnEvents = [resultEvent];
+    await drain((await rig.mgr.runTurn(nextTurn("c1", 1))).events!); // the session ends: no live session left, the deferred entry is consulted
+    await flush();
+    expect(rig.fs.killed).not.toContain(foreignUid);
+    expect((rig.mgr as unknown as { deferredKills: Map<string, number> }).deferredKills.has("c1")).toBe(false); // consumed either way
+  });
+
+  it("a close that succeeds needs no kill at all", async () => {
+    rig = makeRig({ adapter: { singleUse: true, maxProcessesPerHome: 2 }, config: { abortGraceMs: 20 } });
+    await signIn(rig, "c1", 1);
+    const uid = rig.store.get().connections.c1.uid;
+    let releaseSibling!: () => void;
+    rig.script.turnEvents = [{ wait: new Promise<void>((r) => (releaseSibling = r)) }, resultEvent];
+    const sOut = drain((await rig.mgr.runTurn(nextTurn("c1", 1))).events!);
+    await flush();
+    rig.script.hangTurn = true; // the turn hangs but the provider honours close()
+    const hung = nextTurn("c1", 1);
+    const hOut = drain((await rig.mgr.runTurn(hung)).events!);
+    await flush();
+    rig.fs.killed.length = 0;
+    await rig.mgr.interruptTurn({ connectionId: "c1", epoch: 1, turnId: hung.turnId });
+    await hOut;
+    rig.script.hangTurn = false;
+    releaseSibling();
+    await sOut;
+    await flush();
+    expect(rig.fs.killed).not.toContain(uid);
+  });
+});
+
+describe("the auth_dead result is fenced by the epoch", () => {
+  let rig: Rig;
+  afterEach(() => rig?.cleanup());
+
+  it("a result that lands while a reconnect holds the connection lock does not park the NEW login", async () => {
+    rig = makeRig({ adapter: { singleUse: true } });
+    await signIn(rig, "c1", 1);
+    let releaseTurn!: () => void;
+    rig.script.turnEvents = [{ wait: new Promise<void>((r) => (releaseTurn = r)) }, { type: "result", ok: false, text: "", errorKind: "auth_dead" }];
+    rig.script.ignoreInterrupt = true; // the old provider keeps going after the reconnect aborts it
+    const out = drain((await rig.mgr.runTurn(nextTurn("c1", 1))).events!);
+    await flush();
+    const start = await rig.mgr.loginStart({ connectionId: "c1", provider: "fake", reconnect: true });
+    await rig.mgr.loginComplete({ connectionId: "c1", loginRef: start.loginRef, code: "abcdefgh#12345678" });
+    let releasePromote!: () => void;
+    rig.fs.promoteGate = new Promise<void>((r) => (releasePromote = r));
+    const promoting = rig.mgr.loginPromote({ connectionId: "c1", loginRef: start.loginRef, epoch: 2 }); // holds the lock
+    await flush();
+    releaseTurn(); // the old turn now reports auth_dead and queues behind the lock
+    await flush();
+    releasePromote();
+    await promoting;
+    await out;
+    expect(rig.mgr.status({ connectionId: "c1" })).toMatchObject({ state: "active", epoch: 2 });
+  });
+});
+
 describe("a hung turn does not kill its siblings", () => {
   let rig: Rig;
   afterEach(() => rig?.cleanup());

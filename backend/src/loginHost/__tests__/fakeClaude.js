@@ -27,10 +27,22 @@ if (args[0] === "auth" && args[1] === "login") {
   });
   rl.once("close", () => process.exit(2));
 } else if (args[0] === "auth" && args[1] === "status") {
+  // records whether a turn process of this home is still alive while status runs (the adapter must close the turn first)
+  try {
+    const turnPid = JSON.parse(fs.readFileSync(cfgDir + "/.fake-last-turn.json", "utf8")).pid;
+    let alive = true;
+    try {
+      process.kill(turnPid, 0);
+    } catch {
+      alive = false;
+    }
+    fs.writeFileSync(cfgDir + "/.fake-status-saw-turn-alive", String(alive));
+  } catch {}
   const st = scenario.status || { loggedIn: true, authMethod: "claude.ai", subscriptionType: "max", email: null, orgId: null, orgName: null };
-  if (scenario.statusRaw !== undefined) process.stdout.write(scenario.statusRaw);
+  if (scenario.statusHang) setInterval(() => {}, 1000);
+  else if (scenario.statusRaw !== undefined) process.stdout.write(scenario.statusRaw);
   else process.stdout.write(JSON.stringify(st) + "\n");
-  process.exit(st.loggedIn === false ? 1 : 0);
+  if (!scenario.statusHang) process.exit(st.loggedIn === false ? 1 : 0);
 } else if (args[0] === "auth" && args[1] === "logout") {
   record({ mode: "logout" });
   process.exit(0);
@@ -61,6 +73,11 @@ if (args[0] === "auth" && args[1] === "login") {
       return;
     }
     record({ mode: "turn-input", mcpFile, mcpMode, firstUser: msg });
+    if (scenario.noise) process.stdout.write("warning: not json\n\n[1,2,3]\nnull\n");
+    if (scenario.bigline) {
+      process.stdout.write("x".repeat(scenario.bigline)); // one enormous line, no newline
+      await new Promise(() => {});
+    }
     out({ type: "system", subtype: "init", apiKeySource: scenario.apiKeySource || "none", mcp_servers: server ? [{ name: server, status: scenario.mcpStatus || "connected" }] : [] });
     for (const step of scenario.turn || [
       { type: "assistant", message: { id: "m1", content: [{ type: "text", text: "hello" }, { type: "tool_use", id: "tu1", name: "mcp__emma__search", input: { q: "x" } }] } },

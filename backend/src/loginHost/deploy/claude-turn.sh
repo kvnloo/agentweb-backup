@@ -10,10 +10,11 @@
 # Requirements: TMPDIR is the unit-private tmp; stdin is a pipe (POSIX `read` consumes byte by byte on a
 # pipe, so nothing after the first newline is lost).
 set -eu
+set -C   # noclobber: the config file is created exclusively, never written through a planted path
 umask 077
 : "${TMPDIR:?TMPDIR must be the unit-private tmp}"
 IFS= read -r mcp_config || exit 64
-mkdir -p "$TMPDIR/aw-home"
+mkdir "$TMPDIR/aw-home"
 printf '%s\n' "$mcp_config" > "$TMPDIR/aw-mcp.json"
 unset mcp_config
 exec "$@"

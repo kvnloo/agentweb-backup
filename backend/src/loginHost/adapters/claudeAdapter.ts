@@ -9,6 +9,7 @@
  * `claude-turn.sh` wrapper on stdin (never argv, env or a persistent file).
  */
 import { EventEmitter } from "events";
+import { Transform } from "stream";
 import { join } from "path";
 import {
   allowlistedEnv,
@@ -56,10 +57,16 @@ export interface ClaudeAdapterConfig {
   killWaitMs?: number;
   /** Approximate cap on events buffered between the CLI and the consumer of a turn (default 8 MB). */
   maxQueuedBytes?: number;
+  /** Longest stdout line (one stream-json event) accepted from the CLI before the process is killed (default 16 MB): the runner's line reader buffers a whole line. */
+  maxLineBytes?: number;
+  /** Bound on the `auth status` check that confirms an auth-looking failure (must stay below the host's abort grace; default 4 s). */
+  authConfirmTimeoutMs?: number;
 }
 
 const DEFAULTS = {
   maxQueuedBytes: 8 * 1024 * 1024,
+  maxLineBytes: 16 * 1024 * 1024,
+  authConfirmTimeoutMs: 4_000,
   basePath: "/usr/local/bin:/usr/bin:/bin",
   unitTmp: "/tmp",
   mcpServerName: "emma",
@@ -71,25 +78,35 @@ const DEFAULTS = {
 };
 
 /** The host's ChildLike as the structural child the runner expects, plus an `exited` promise that resolves when the process is really gone. */
-class RunnerChildAdapter extends EventEmitter implements RunnerChild {
+/** Exported for tests only. */
+export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
   readonly stdin: ChildLike["stdin"];
-  readonly stdout: ChildLike["stdout"];
+  readonly stdout: Transform;
   readonly stderr: ChildLike["stderr"];
   exitCode: number | null = null;
   signalCode: string | null = null;
+  /** Resolves only when the process is really gone (`onExit`), or never existed (`onError`: it could not be started). */
   readonly exited: Promise<void>;
 
-  constructor(private readonly child: ChildLike) {
+  constructor(
+    private readonly child: ChildLike,
+    maxLineBytes: number,
+  ) {
     super();
     this.stdin = child.stdin;
-    this.stdout = child.stdout;
     this.stderr = child.stderr;
     let done!: () => void;
     this.exited = new Promise<void>((r) => (done = r));
+    // The runner's line reader buffers a whole line: a CLI that never prints a newline must not grow the host's memory without bound.
+    this.stdout = new LineLimit(maxLineBytes, () => {
+      this.kill();
+      this.emit("error", new Error("stdout_line_too_long"));
+    });
+    child.stdout.on("error", () => undefined);
+    child.stdout.pipe(this.stdout);
     child.onExit((code, signal) => {
-      this.exitCode = code ?? (signal ? null : 0);
-      this.signalCode = signal;
-      if (this.exitCode === null && this.signalCode === null) this.signalCode = "UNKNOWN";
+      this.exitCode = code;
+      this.signalCode = signal ?? (code === null ? "UNKNOWN" : null); // a finished process never reports both as null (the runner reads that as "still running")
       done();
       this.emit("exit", code, signal);
     });
@@ -98,9 +115,39 @@ class RunnerChildAdapter extends EventEmitter implements RunnerChild {
       this.emit("error", err);
     });
   }
+  /** A kill that throws (or fails) is not "gone": `exited` waits for `onExit` regardless. */
   kill(): boolean {
-    this.child.kill();
-    return true;
+    try {
+      this.child.kill();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+/** Passes bytes through and calls `onOverflow` once if a single line (bytes since the last newline) exceeds `max`; nothing after that is forwarded. */
+class LineLimit extends Transform {
+  private run = 0;
+  private tripped = false;
+  constructor(
+    private readonly max: number,
+    private readonly onOverflow: () => void,
+  ) {
+    super();
+  }
+  override _transform(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null, data?: Buffer) => void): void {
+    if (this.tripped) return cb();
+    const first = chunk.indexOf(10);
+    const last = chunk.lastIndexOf(10);
+    const headRun = this.run + (first === -1 ? chunk.length : first);
+    this.run = last === -1 ? this.run + chunk.length : chunk.length - last - 1;
+    if (headRun > this.max || this.run > this.max) {
+      this.tripped = true;
+      this.onOverflow();
+      return cb();
+    }
+    cb(null, chunk);
   }
 }
 
@@ -340,7 +387,7 @@ export class ClaudeAdapter implements SubscriptionProviderAdapter {
   mapError(raw: unknown): ErrorKind {
     if (raw instanceof ClaudeCliTurnError) return "transient";
     const message = raw instanceof Error ? raw.message : typeof raw === "string" ? raw : "";
-    if (/mcp server .* is not connected/i.test(message)) return "transient";
+    if (/mcp server .* is not connected|stdout_line_too_long/i.test(message)) return "transient";
     if ((raw as { code?: string } | null)?.code === "open_failed") return "transient";
     return failureClassToKind(classifyFailureText(message)); // never auth_dead: host faults must not park a healthy login
   }
@@ -354,7 +401,9 @@ export class ClaudeAdapter implements SubscriptionProviderAdapter {
   /** Used by sessions: runs `auth status` to confirm that an auth-looking failure really means the login is dead. */
   async confirmLoggedOut(ctx: AdapterContext): Promise<ErrorKind> {
     try {
-      const st = await this.authStatus(ctx);
+      const r = await this.runShort(ctx, ["auth", "status"], this.cfg.authConfirmTimeoutMs);
+      const st = parseAuthStatus(r.output);
+      if (!st) return "transient"; // unreadable or timed out: uncertainty is never death
       return st.loggedIn ? "transient" : "auth_dead"; // a login the CLI itself reports as signed in is NOT dead: a failed refresh on the network prints similar words
     } catch {
       return "transient"; // uncertain => never park a possibly healthy login
@@ -408,6 +457,7 @@ class ClaudeSession implements ProviderSession {
         spawnProcess: (s: ClaudeCliSpawnSpec) => {
           const child = new RunnerChildAdapter(
             ctx.spawnAs({ file: cfg.turnWrapperPath, args: [s.file, ...s.args], env: s.env as Record<string, string>, cwd: s.cwd }),
+            cfg.maxLineBytes,
           );
           this.exits.push(child.exited);
           return child;
@@ -481,19 +531,23 @@ class ClaudeSession implements ProviderSession {
         return;
       }
       const cls = classifyFailureText(result.resultText);
-      const errorKind = cls === "auth_like" ? await this.adapter.confirmLoggedOut(this.ctx) : failureClassToKind(cls);
+      let errorKind: ErrorKind = failureClassToKind(cls);
+      if (cls === "auth_like") {
+        await this.close(); // the turn's process is gone first: the confirmation must not run beside it (one process per cap slot)
+        errorKind = await this.adapter.confirmLoggedOut(this.ctx);
+      }
       yield { type: "result", ok: false, text: "", errorKind };
     } catch (err) {
       if (!this.closing) yield { type: "result", ok: false, text: "", errorKind: this.adapter.mapError(err) };
     } finally {
-      void this.close();
+      void this.close().catch(() => undefined);
     }
   }
 
   async interrupt(): Promise<void> {
     this.interrupted = true;
     if (this.handle) this.runner.interrupt(this.handle); // a Claude session cannot continue after an interrupt: the process is closed
-    void this.close();
+    void this.close().catch(() => undefined);
   }
 
   close(): Promise<void> {
@@ -504,8 +558,12 @@ class ClaudeSession implements ProviderSession {
   private async doClose(): Promise<void> {
     this.closing = true;
     try {
-      if (this.key) this.runner.close({ conversationId: this.key });
-      else this.runner.closeAll();
+      try {
+        if (this.key) this.runner.close({ conversationId: this.key });
+        else this.runner.closeAll();
+      } catch {
+        /* a kill that threw: the process is not gone, so `exits` below keeps waiting for its real exit */
+      }
       // A spawn that was in flight finishes (or aborts itself) first, so its process is in `exits` before we wait.
       // (Defense in depth: `ctx.spawnAs` is synchronous today, so a process cannot appear between a close request and the
       // runner registering it; the randomized lifecycle test cannot open this window. Keep it for a port that stops being synchronous.)

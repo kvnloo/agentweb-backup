@@ -99,7 +99,7 @@ export function normalizeClaudeEvent(raw: Record<string, unknown>): ProviderEven
           if (!rec || !/^[a-z0-9_]{1,40}$/i.test(name)) continue;
           windows.push({ name, ...(num(rec.utilization) !== undefined ? { utilization: num(rec.utilization) } : {}), ...(resetMs(rec.resetsAt) !== undefined ? { resetsAtMs: resetMs(rec.resetsAt) } : {}) });
         }
-      } else if (typeof info.rateLimitType === "string") {
+      } else if (typeof info.rateLimitType === "string" && /^[a-z0-9_]{1,40}$/i.test(info.rateLimitType)) {
         windows.push({ name: info.rateLimitType, ...(num(info.utilization) !== undefined ? { utilization: num(info.utilization) } : {}), ...(resetMs(info.resetsAt) !== undefined ? { resetsAtMs: resetMs(info.resetsAt) } : {}) });
       }
       const overageStatus = typeof info.overageStatus === "string" ? info.overageStatus : undefined;

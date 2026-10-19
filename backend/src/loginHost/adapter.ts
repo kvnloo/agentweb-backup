@@ -110,7 +110,7 @@ export interface ChildLike {
   stderr: import("stream").Readable;
   kill(): void;
   onExit(cb: (code: number | null, signal: string | null) => void): void;
-  /** The process could not be started or its pipe failed (spawn error). Optional: a handle that cannot fail asynchronously omits it. */
+  /** The process could NOT BE STARTED (no `onExit` will follow). Pipe failures are reported on the streams, never here: a process whose pipe broke may still be running, and "gone" is only ever signalled by `onExit`. Optional: a handle that cannot fail to start omits it. */
   onError?(cb: (err: Error) => void): void;
 }
 

@@ -193,6 +193,8 @@ export class ConnectionManager {
   private readonly log: Logger;
   private readonly uids: UidAllocator;
   private readonly locks = new KeyedMutex();
+  /** connectionId -> uid whose hung process may still be alive; killed when the connection has no live session left. */
+  private readonly deferredKills = new Map<string, number>();
   private readonly logins = new Map<string, { connectionId: string; proc: LoginProcess; provider: string }>();
   private readonly sessions = new Map<string, HostSession[]>();
   private readonly turns = new Map<string, RunningTurn>();
@@ -564,13 +566,21 @@ export class ConnectionManager {
   /** The provider did not stop after an abort: close its session, kill the uid's processes, report the abort. */
   private async *abandonHung(c: ConnRecord, session: HostSession, running: RunningTurn, mark: () => void): AsyncGenerator<ProviderEvent, void> {
     mark();
-    this.retireSession(session);
-    void session.ready.then((s) => this.a("closeSession", async () => s.close())).catch(() => undefined);
+    const closing = session.ready.then((s) => this.a("closeSession", async () => s.close())).then(() => true, () => false);
     // Kill the uid this turn ran on, not whatever the connection has now. While other sessions of the same
-    // connection and uid are alive their turns must not die with this one: their own close() ends them.
+    // connection and uid are alive their turns must not die with this one: this session's own close() ends it.
     const sharedUid = running.uid === c.uid && (this.sessions.get(c.connectionId) ?? []).some((s) => !s.dead && s !== session);
-    if (sharedUid) this.log.warn("provider_hung_process_may_remain", { connectionId: c.connectionId });
-    else {
+    if (sharedUid) {
+      // The session keeps counting against the caps until its close has settled. If the close failed or timed out the
+      // process may still be alive: the uid is killed as soon as the last live session of this connection is gone.
+      void closing.then((closedOk) => {
+        if (!closedOk) this.deferredKills.set(c.connectionId, running.uid);
+        this.retireSession(session);
+      });
+      this.log.warn("provider_hung_process_may_remain", { connectionId: c.connectionId });
+    } else {
+      this.retireSession(session);
+      void closing;
       try {
         await this.safeKill(running.uid);
       } catch {
@@ -776,10 +786,17 @@ export class ConnectionManager {
   private retireSession(hs: HostSession): void {
     hs.dead = true;
     const list = this.sessions.get(hs.connectionId);
-    if (!list) return;
-    const i = list.indexOf(hs);
-    if (i >= 0) list.splice(i, 1);
-    if (!list.length) this.sessions.delete(hs.connectionId);
+    if (list) {
+      const i = list.indexOf(hs);
+      if (i >= 0) list.splice(i, 1);
+      if (!list.length) this.sessions.delete(hs.connectionId);
+    }
+    // A hung session whose close failed left a possibly live process on a uid that siblings were still using: kill it now that none is left.
+    const uid = this.deferredKills.get(hs.connectionId);
+    if (uid !== undefined && !(this.sessions.get(hs.connectionId) ?? []).some((s) => !s.dead)) {
+      this.deferredKills.delete(hs.connectionId);
+      if (this.state().connections[hs.connectionId]?.uid === uid) void this.safeKill(uid).catch(() => undefined); // only while the connection still owns that uid: never a uid that was freed and re-allocated
+    }
   }
 
   private async requireAttempt(connectionId: string, loginRef: string): Promise<{ c: ConnRecord; login: { connectionId: string; proc: LoginProcess; provider: string } }> {

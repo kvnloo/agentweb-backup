@@ -67,6 +67,9 @@ describe("normalizeClaudeEvent", () => {
     });
     expect(normalizeClaudeEvent({ type: "rate_limit_event", rate_limit_info: { status: "allowed" } })).toEqual([{ type: "entitlement", observation: { windows: [], status: "allowed" } }]);
     expect(normalizeClaudeEvent({ type: "rate_limit_event" })).toEqual([]);
+    // the single-window fallback validates the window name like the unified branch does
+    expect(normalizeClaudeEvent({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.5, resetsAt: 1789728000 } })).toEqual([{ type: "entitlement", observation: { windows: [{ name: "five_hour", utilization: 0.5, resetsAtMs: 1789728000000 }], status: "allowed" } }]);
+    expect(normalizeClaudeEvent({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "bad name\nwith text" } })).toEqual([{ type: "entitlement", observation: { windows: [], status: "allowed" } }]);
   });
   it("init with apiKeySource none is silent; anything else (or missing) is an alarm", () => {
     expect(normalizeClaudeEvent({ type: "system", subtype: "init", apiKeySource: "none" })).toEqual([]);

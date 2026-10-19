@@ -3,11 +3,12 @@
  * process through the real turn wrapper. No root, no systemd: the host's hardening is the port's job (1b-ii).
  */
 import { spawn } from "child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
 import type { AdapterContext, ChildLike, ProviderEvent, ProviderSession } from "../adapter";
-import { ClaudeAdapter } from "../adapters/claudeAdapter";
+import { ClaudeAdapter, RunnerChildAdapter } from "../adapters/claudeAdapter";
+import { PassThrough } from "stream";
 import { describeAdapterConformance } from "./adapterConformance";
 
 const FAKE = join(__dirname, "fakeClaude.js");
@@ -31,7 +32,8 @@ function localSpawn(spec: { file: string; args: string[]; env: Record<string, st
     stderr: c.stderr,
     kill: () => void c.kill("SIGKILL"),
     onExit: (cb) => void c.on("exit", (code, sig) => cb(code, sig)),
-    onError: (cb) => void c.on("error", cb),
+    // The contract: onError means the process could NOT BE STARTED. A node 'error' after a successful spawn (kill failed, etc.) is not that.
+    onError: (cb) => void c.on("error", (err) => (c.pid === undefined ? cb(err) : undefined)),
   };
 }
 
@@ -316,6 +318,79 @@ describe("claude adapter: a turn", () => {
     expect(events[events.length - 1]).toEqual({ type: "result", ok: false, text: "", errorKind: "transient" });
   });
 
+  it("junk on stdout (non-JSON lines, null, arrays) is ignored and the turn still completes", async () => {
+    const e = makeEnv();
+    e.scenario({ noise: true });
+    const events = await collect(await makeAdapter(e.unitTmp).openSession(e.ctx, { connectionId: "conn1", epoch: 1 }));
+    expect(events[events.length - 1]).toEqual({ type: "result", ok: true, text: "done" });
+  });
+
+  it("one enormous stdout line (no newline) kills the process and ends the turn transient instead of growing host memory", async () => {
+    const e = makeEnv();
+    e.scenario({ bigline: 3_000_000 });
+    const session = await makeAdapter(e.unitTmp, { maxLineBytes: 1_000_000 }).openSession(e.ctx, { connectionId: "conn1", epoch: 1 });
+    const events = await collect(session);
+    expect(events[events.length - 1]).toEqual({ type: "result", ok: false, text: "", errorKind: "transient" });
+    await session.closed;
+    expect(isGone(e.last("turn").pid)).toBe(true);
+  });
+
+  it("a process that cannot be started ends the turn with a failure and `closed` still resolves (it never existed)", async () => {
+    const e = makeEnv();
+    const session = await makeAdapter(e.unitTmp, { turnWrapperPath: "/nonexistent/claude-turn.sh" }).openSession(e.ctx, { connectionId: "conn1", epoch: 1 });
+    const events = await collect(session);
+    expect(events[events.length - 1]).toMatchObject({ type: "result", ok: false });
+    await Promise.race([session.closed, new Promise((_, rej) => setTimeout(() => rej(new Error("closed did not resolve")), 3000))]);
+  });
+
+  it("a kill that throws does not reject close() and does not claim the process is gone: `closed` waits for the real exit", async () => {
+    const e = makeEnv();
+    e.scenario({ turn: [{ hang: true }] });
+    let allowKill = false;
+    let realKill: (() => void) | undefined;
+    const ctx: AdapterContext = {
+      ...e.ctx,
+      spawnAs: (spec) => {
+        const child = localSpawn(spec);
+        realKill = () => child.kill();
+        return {
+          ...child,
+          kill: () => {
+            if (!allowKill) throw new Error("EPERM: cannot signal");
+            child.kill();
+          },
+        };
+      },
+    };
+    const session = await makeAdapter(e.unitTmp).openSession(ctx, { connectionId: "conn1", epoch: 1 });
+    const done = collect(session);
+    await until(() => existsSync(join(e.ctx.homeDir, ".fake-last-turn-input.json")));
+    const closing = session.close();
+    await expect(Promise.race([closing.then(() => "closed"), new Promise((r) => setTimeout(() => r("pending"), 300))])).resolves.toBe("pending"); // not gone => not closed, and no rejection
+    allowKill = true;
+    realKill?.();
+    await closing;
+    await done;
+    expect(isGone(e.last("turn").pid)).toBe(true);
+  });
+
+  it("an auth-looking failure is confirmed only AFTER the turn's process is gone (one process per cap slot)", async () => {
+    const e = makeEnv();
+    e.scenario({ turn: [{ type: "result", subtype: "error", is_error: true, result: "Not logged in · Please run /login" }], status: { loggedIn: false } });
+    const events = await collect(await makeAdapter(e.unitTmp).openSession(e.ctx, { connectionId: "conn1", epoch: 1 }));
+    expect(events[events.length - 1]).toMatchObject({ errorKind: "auth_dead" });
+    expect(readFileSync(join(e.ctx.homeDir, ".fake-status-saw-turn-alive"), "utf8")).toBe("false");
+  });
+
+  it("a status check that hangs is bounded: the turn ends transient (never parks) well before the host's abort grace", async () => {
+    const e = makeEnv();
+    e.scenario({ turn: [{ type: "result", subtype: "error", is_error: true, result: "Not logged in · Please run /login" }], statusHang: true });
+    const t0 = Date.now();
+    const events = await collect(await makeAdapter(e.unitTmp, { authConfirmTimeoutMs: 300 }).openSession(e.ctx, { connectionId: "conn1", epoch: 1 }));
+    expect(events[events.length - 1]).toMatchObject({ ok: false, errorKind: "transient" });
+    expect(Date.now() - t0).toBeLessThan(2500);
+  });
+
   it("a process that dies mid-turn ends the turn with a failure result (never silence), and `closed` resolves", async () => {
     const e = makeEnv();
     e.scenario({ turn: [{ type: "assistant", message: { content: [{ type: "text", text: "partial" }] } }, { exit: 3 }] });
@@ -371,6 +446,53 @@ describe("claude adapter: a turn", () => {
   });
 });
 
+describe("RunnerChildAdapter", () => {
+  function child() {
+    let exit: ((code: number | null, signal: string | null) => void) | undefined;
+    let err: ((e: Error) => void) | undefined;
+    const c: ChildLike = { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill: () => undefined, onExit: (cb) => void (exit = cb), onError: (cb) => void (err = cb) };
+    return { c, exit: (code: number | null, sig: string | null) => exit?.(code, sig), fail: (e: Error) => err?.(e) };
+  }
+  it("a finished process never reports both exitCode and signalCode as null (the runner reads that as still running)", async () => {
+    const h = child();
+    const a = new RunnerChildAdapter(h.c, 1000);
+    expect([a.exitCode, a.signalCode]).toEqual([null, null]); // running
+    h.exit(null, null);
+    await a.exited;
+    expect(a.exitCode === null && a.signalCode === null).toBe(false);
+  });
+  it("exit codes and signals are passed through; a start failure resolves `exited` and emits error", async () => {
+    const h = child();
+    const a = new RunnerChildAdapter(h.c, 1000);
+    h.exit(3, null);
+    expect([a.exitCode, a.signalCode]).toEqual([3, null]);
+    const h2 = child();
+    const b = new RunnerChildAdapter(h2.c, 1000);
+    const errors: Error[] = [];
+    b.on("error", (e: Error) => errors.push(e));
+    h2.fail(new Error("spawn ENOENT"));
+    await b.exited;
+    expect(errors).toHaveLength(1);
+  });
+  it("the line limit applies across chunks, counts bytes since the last newline, and stops forwarding after tripping", async () => {
+    const h = child();
+    const a = new RunnerChildAdapter(h.c, 10);
+    const errors: Error[] = [];
+    a.on("error", (e: Error) => errors.push(e));
+    const seen: string[] = [];
+    a.stdout.on("data", (b: Buffer) => seen.push(b.toString()));
+    (h.c.stdout as PassThrough).write("123456\n1234"); // 4 since the last newline
+    (h.c.stdout as PassThrough).write("56789"); // 9: ok
+    await new Promise((r) => setTimeout(r, 20));
+    expect(errors).toHaveLength(0);
+    (h.c.stdout as PassThrough).write("0123"); // 13 > 10: trips
+    (h.c.stdout as PassThrough).write("after\n");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(errors).toHaveLength(1);
+    expect(seen.join("")).not.toContain("after");
+  });
+});
+
 describe("claude adapter: credential-handling rules", () => {
   const src = readFileSync(join(__dirname, "..", "adapters", "claudeAdapter.ts"), "utf8")
     .replace(/\/\*[\s\S]*?\*\//g, "")
@@ -393,6 +515,7 @@ describe("claude-turn.sh wrapper", () => {
       let stdout = "";
       c.stdout.on("data", (b: Buffer) => (stdout += b.toString()));
       c.on("exit", (code) => resolve({ code, stdout }));
+      c.stdin.on("error", () => undefined);
       c.stdin.write('{"mcpServers":{"emma":{"headers":{"Authorization":"Bearer SECRET"}}}}\nline two\nline three\n');
       c.stdin.end();
     });
@@ -402,6 +525,32 @@ describe("claude-turn.sh wrapper", () => {
     expect(existsSync(join(dir, "aw-home"))).toBe(true);
     expect(result.code).toBe(0);
   });
+  it("never writes through a pre-existing path: a planted config file or HOME directory makes it refuse (exclusive create)", async () => {
+    const run = (dir: string) =>
+      new Promise<number | null>((resolve) => {
+        const c = spawn(WRAPPER, ["/bin/echo", "STARTED"], { env: { PATH: "/usr/bin:/bin", TMPDIR: dir }, stdio: ["pipe", "ignore", "ignore"] });
+        c.stdin.on("error", () => undefined);
+        c.on("exit", (code) => resolve(code));
+        c.stdin.end("{}\n");
+      });
+    const planted = mkdtempSync(join(tmpdir(), "wrapper-test-"));
+    roots.push(planted);
+    writeFileSync(join(planted, "aw-mcp.json"), "planted");
+    expect(await run(planted)).not.toBe(0);
+    expect(readFileSync(join(planted, "aw-mcp.json"), "utf8")).toBe("planted"); // untouched
+    const plantedDir = mkdtempSync(join(tmpdir(), "wrapper-test-"));
+    roots.push(plantedDir);
+    mkdirSync(join(plantedDir, "aw-home")); // an existing HOME dir is refused too (mkdir without -p)
+    expect(await run(plantedDir)).not.toBe(0);
+    expect(existsSync(join(plantedDir, "aw-mcp.json"))).toBe(false);
+    const planted2 = mkdtempSync(join(tmpdir(), "wrapper-test-"));
+    roots.push(planted2);
+    writeFileSync(join(planted2, "target"), "victim");
+    symlinkSync(join(planted2, "target"), join(planted2, "aw-mcp.json"));
+    expect(await run(planted2)).not.toBe(0);
+    expect(readFileSync(join(planted2, "target"), "utf8")).toBe("victim"); // a planted symlink is not followed
+  });
+
   it("refuses to run without TMPDIR or with empty stdin (never starts the CLI without its config)", async () => {
     const run = (env: Record<string, string>, input: string) =>
       new Promise<number | null>((resolve) => {

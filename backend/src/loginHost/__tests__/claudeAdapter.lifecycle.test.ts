@@ -31,6 +31,11 @@ function rng(seed: number): () => number {
   };
 }
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+/** Resolves with the promise's outcome, or `"timeout"`; the timer never outlives the call (no stray handles after the test). */
+function within<T>(p: Promise<T>, ms: number): Promise<T | "timeout"> {
+  let timer: NodeJS.Timeout;
+  return Promise.race([p, new Promise<"timeout">((r) => (timer = setTimeout(() => r("timeout"), ms)))]).finally(() => clearTimeout(timer));
+}
 const gone = (pid: number) => {
   try {
     process.kill(pid, 0);
@@ -99,10 +104,10 @@ async function runSeed(seed: number): Promise<void> {
     // a scenario that never ends on its own must be ended by the harness, like the host's deadline would
     if (name === "hang" || name === "slow") act("deadline-close", 600, () => session.close());
 
-    const closedInTime = await Promise.race([session.closed.then(() => true), sleep(8000).then(() => false)]);
-    if (!closedInTime) fail("L1: `closed` did not resolve in 8s");
-    await Promise.race([turnDone, sleep(3000)]);
+    if ((await within(session.closed, 8000)) === "timeout") fail("L1: `closed` did not resolve in 8s");
+    if ((await within(turnDone, 3000)) === "timeout") fail("L2: the turn's event stream did not end within 3s of the session closing");
     await Promise.all(actions);
+    if (plan === 0 && (name === "normal" || name === "slow") && !events.some((e) => e.type === "result")) fail("L5: an uninterrupted normal run produced no result");
 
     const turnRec = join(homeDir, ".fake-last-turn.json");
     if (existsSync(turnRec)) {
@@ -112,6 +117,7 @@ async function runSeed(seed: number): Promise<void> {
     const results = events.filter((e) => e.type === "result");
     if (results.length > 1) fail("L2: more than one result");
     if (results.length === 1 && events[events.length - 1].type !== "result") fail("L2: result is not last");
+    trace.push(`events=${events.map((e) => e.type).join(",")}`);
     await session.close();
     const stray = readdirSync(homeDir).filter((n) => !n.startsWith(".fake"));
     if (stray.length) fail(`L4: files left in the credential home: ${stray.join(",")}`);
