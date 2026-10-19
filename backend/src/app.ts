@@ -13,6 +13,7 @@ import adminRoutes from "./routes/admin";
 import adminUsageRoutes from "./routes/adminUsage";
 import mcpUsageAdminRoutes from "./routes/mcpUsageAdmin";
 import adminV0CreditsRoutes from "./routes/adminV0Credits";
+import adminVendorRatesRoutes from "./routes/adminVendorRates";
 import adminCustomSubscriptionLinksRoutes from "./routes/adminCustomSubscriptionLinks";
 import internalUsageRoutes from "./routes/internalUsage";
 import configRouter from "./routes/config";
@@ -417,6 +418,7 @@ app.use("/api/admin", adminRoutes);
 app.use("/api/admin", adminUsageRoutes);
 app.use("/api/admin", mcpUsageAdminRoutes);
 app.use("/api/admin", adminV0CreditsRoutes);
+app.use("/api/admin", adminVendorRatesRoutes);
 app.use("/api/admin", adminCustomSubscriptionLinksRoutes);
 app.use("/api/internal", internalUsageRoutes);
 // ENG-2109: MCP endpoint for claude -p sessions this backend spawned. Local-only; see routes/toolBridge.ts.
