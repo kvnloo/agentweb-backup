@@ -37,6 +37,7 @@ import agentModeRoutes from "./routes/agentMode";
 import settingsRoutes from "./routes/settings";
 import imageModelsRoutes from "./routes/image-models";
 import webhookRoutes from "./routes/webhooks";
+import twilioVoiceWebhookRoutes, { twilioVoiceBodyParser } from "./routes/twilioVoiceWebhook";
 import benchmarkRoutes from "./routes/benchmark";
 import seoRoutes from "./routes/seo";
 import funnelRoutes from "./routes/funnel";
@@ -376,6 +377,9 @@ app.use("/api/webhooks/unipile", express.json({ type: () => true, limit: "1mb" }
 // ENG-2315: public tracker ingest. Its own 16kb parser must run before the global 50mb one below
 // (body-parser skips a request whose body is already parsed).
 app.use("/api/track/event", ...trackBodyParser);
+// ENG-2271: Twilio voice callbacks are small flat forms; parse them with a narrow limit first (body-parser
+// skips a body that is already parsed), so the global 50mb extended parser below never sees them.
+app.use("/api/webhooks/twilio-voice", twilioVoiceBodyParser);
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());
@@ -458,6 +462,9 @@ app.use("/api/blog", blogRoutes);
 app.use("/api/agent-mode", agentModeRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/image-models", imageModelsRoutes);
+// ENG-2271: Twilio voice callbacks (form-encoded, parsed by the global urlencoded parser above); every
+// route verifies the X-Twilio-Signature itself, so there is deliberately no auth middleware here.
+app.use("/api/webhooks/twilio-voice", twilioVoiceWebhookRoutes);
 app.use("/api/webhooks", webhookRoutes);
 app.use("/api/webhooks/fathom", fathomWebhookRoutes);
 app.use("/api/webhooks/whatsapp", whatsappWebhookRoutes);
