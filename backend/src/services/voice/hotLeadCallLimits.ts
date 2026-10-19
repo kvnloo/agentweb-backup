@@ -4,7 +4,7 @@ import { localParts } from '../dripSendWindow';
 import type { HotLeadCallConfig } from '../hotLeadCallConfig';
 import { getLimitStore } from './limitStore';
 
-export type LimitDenial = 'duplicate_phone' | 'owner_cooldown' | 'org_hourly_cap' | 'org_daily_cap';
+type LimitDenial = 'duplicate_phone' | 'owner_cooldown' | 'org_hourly_cap' | 'org_daily_cap';
 
 const MINUTE_S = 60;
 const HOUR_S = 3600;

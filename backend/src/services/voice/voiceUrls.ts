@@ -9,9 +9,9 @@ export function isWebhookSafeId(id: string): boolean {
   return WEBHOOK_SAFE_ID.test(id);
 }
 
-export type VoiceWebhookKind = 'owner' | 'gather' | 'dial' | 'status';
+type VoiceWebhookKind = 'owner' | 'gather' | 'dial' | 'status';
 
-export interface VoiceWebhookContext {
+interface VoiceWebhookContext {
   listId: string;
   leadId: string;
   jobKey: string;

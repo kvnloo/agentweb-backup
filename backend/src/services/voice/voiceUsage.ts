@@ -1,9 +1,10 @@
 import { recordVendorUsage } from '../usageRecorderService';
+import type { HotLeadCallLeg } from './leadCallStore.types';
 
 /** 'verify' is the one-off destination-verification call (no status callback, so it is metered at an estimate). */
-export type CallLeg = 'owner' | 'lead' | 'verify';
+type CallLeg = HotLeadCallLeg | 'verify';
 
-export interface CallUsage {
+interface CallUsage {
   /** The user the call was placed for; the recorder resolves their org billing owner. */
   userId: string;
   callSid: string;

@@ -19,7 +19,11 @@ export const HOT_LEAD_CALL_LIMITS = {
 type HotLeadCallLimitField = keyof typeof HOT_LEAD_CALL_LIMITS;
 export const HOT_LEAD_CALL_LIMIT_FIELDS = Object.keys(HOT_LEAD_CALL_LIMITS) as HotLeadCallLimitField[];
 
-/** Last 4 digits only: the form in which a phone number may appear in tool output. */
+/**
+ * Last 4 digits only: the form in which a phone number may appear in tool output. Distinct on purpose from
+ * whatsappService.redactPhone (log lines, keeps the length) and orgLeadNotificationService.maskLeadPhone
+ * (Slack text, formatted): this one has a fixed width so it reveals neither length nor country.
+ */
 export const maskPhone = (phone: string) => `***${phone.slice(-4)}`;
 
 /** System-managed: set only by the number-provisioning / verification flow, never by Emma tools. */
