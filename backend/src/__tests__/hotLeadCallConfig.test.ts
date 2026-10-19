@@ -24,12 +24,8 @@ describe('hotLeadCallConfigOf', () => {
     expect(config.twilioNumberSid).toBe(SID);
   });
 
-  it('trims announcedName', () => {
+  it('trims announcedName and accepts a bare ampersand (the TwiML builder must XML-escape it)', () => {
     expect(hotLeadCallConfigOf(base({ announcedName: '  O\'Brien & Sons, Inc.  ' }))?.announcedName).toBe("O'Brien & Sons, Inc.");
-  });
-
-  it('accepts a bare ampersand (the TwiML builder must XML-escape it)', () => {
-    expect(hotLeadCallConfigOf(base({ announcedName: 'Smith & Sons' }))?.announcedName).toBe('Smith & Sons');
   });
 
   it.each(['+19002223333', '+19003334444', '+18005550199', '+15335551234', '+15005550006', '+16005550123'])('rejects premium-rate, toll-free and personal numbers (toll fraud): %s', phone => {
@@ -43,12 +39,12 @@ describe('hotLeadCallConfigOf', () => {
     expect(hotLeadCallConfigOf(base({ twilioNumber: '+14155550100' }))).toBeNull();
   });
 
-  it.each(['EST', '+05:00', 'america/chicago', 'UTC', 'GMT', 'Etc/UTC', 'Mars/Olympus', 'America/Chicago ', ''])('rejects non-IANA timezone %j', timezone => {
+  it.each(['EST', '+05:00', 'america/chicago', 'UTC', 'GMT', 'Etc/UTC', 'etc/utc', 'ETC/UTC', 'AMERICA/CHICAGO', 'America/CHICAGO', 'Mars/Olympus', 'America/Chicago ', ''])('rejects non-IANA timezone %j', timezone => {
     expect(hotLeadCallConfigOf(base({ quietHours: { timezone } }))).toBeNull();
   });
   it.each([
     'America/Chicago', 'America/Toronto', 'America/Los_Angeles', 'America/Indiana/Indianapolis', 'America/Kentucky/Louisville',
-    'America/Montreal', 'America/Halifax', 'America/St_Johns', 'America/Phoenix', 'America/Anchorage', 'Pacific/Honolulu', 'US/Eastern',
+    'America/Montreal', 'America/Halifax', 'America/St_Johns', 'America/Phoenix', 'America/Anchorage', 'Pacific/Honolulu', 'US/Eastern', 'Australia/NSW',
     'America/Nipigon', 'America/Fort_Wayne', 'Canada/Eastern',
   ])('accepts IANA timezone %s (including ICU-canonicalised aliases)', timezone => {
     expect(hotLeadCallConfigOf(base({ quietHours: { timezone } }))?.quietHours?.timezone).toBe(timezone);
@@ -90,8 +86,6 @@ describe('hotLeadCallConfigOf', () => {
     ['empty countries', { allowedCountries: [] }],
     ['duplicate countries', { allowedCountries: ['US', 'US'] }],
     ['quiet hours without timezone', { quietHours: { start: '08:00', end: '21:00' } }],
-    ['quiet hours bad timezone', { quietHours: { timezone: 'Mars/Olympus' } }],
-    ['quiet hours empty timezone', { quietHours: { timezone: '' } }],
     ['quiet hours bad time', { quietHours: { start: '8:00', timezone: 'America/Chicago' } }],
     ['quiet hours 24:00', { quietHours: { end: '24:00', timezone: 'America/Chicago' } }],
     ['quiet hours start == end', { quietHours: { start: '09:00', end: '09:00', timezone: 'America/Chicago' } }],

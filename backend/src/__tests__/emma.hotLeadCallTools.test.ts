@@ -126,8 +126,8 @@ describe('update_hot_lead_call_settings', () => {
     await expect(update({ quietHours })).rejects.toThrow('quietHours must be an object');
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
-  it.each(['UTC', 'EST', 'america/chicago', 'Mars/Olympus'])('names the timezone problem for %s', async timezone => {
-    await expect(update({ quietHours: { timezone } })).rejects.toThrow(/timezone must be an IANA name such as America\/Chicago/);
+  it.each(['UTC', 'EST', 'america/chicago', 'Mars/Olympus', 'Nope/Zone', 'AMERICA/CHICAGO', 'Etc/UTC'])('names the timezone problem for %s', async timezone => {
+    await expect(update({ quietHours: { timezone } })).rejects.toThrow(/timezone must be an IANA Area\/Location name such as America\/Chicago/);
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
   it('accepts a valid timezone change and describes quiet hours and territory limits', async () => {
@@ -136,10 +136,10 @@ describe('update_hot_lead_call_settings', () => {
     const def = handlers.get('update_hot_lead_call_settings')!.definition;
     expect(def.description).toMatch(/wraps past midnight/);
     expect(def.description).toMatch(/Puerto Rico/);
-    expect(def.description).toMatch(/UTC and abbreviations/);
+    expect(def.description).toMatch(/IANA Area\/Location name such as America\/Chicago \(UTC, abbreviations and Etc\/ zones are refused\)/);
   });
   it('rejects a destination equal to the assigned caller number', async () => {
-    await expect(update({ destinationPhone: '+14155550111' })).rejects.toThrow();
+    await expect(update({ destinationPhone: '+14155550111' })).rejects.toThrow('Check the limits and name format');
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
 
@@ -162,7 +162,7 @@ describe('update_hot_lead_call_settings', () => {
     [{ maxCallsPerHour: 31 }, settingsErr], [{ maxAgeMinutes: 0 }, settingsErr], [{ announcedName: '<Say>hi</Say>' }, settingsErr],
     [{ announcedName: 'a'.repeat(61) }, settingsErr], [{ destinationPhone: '+442071838750' }, 'valid US or Canadian'],
     [{ destinationPhone: 'abc' }, 'valid US or Canadian'], [{ destinationPhone: 5 }, 'valid US or Canadian'],
-    [{ quietHours: { timezone: 'Nope/Zone' } }, 'timezone must be'], [{ quietHours: { start: '25:00' } }, settingsErr],
+    [{ quietHours: { start: '25:00' } }, settingsErr],
     [{ allowedCountries: ['MX'] }, settingsErr],
   ])('rejects invalid arguments %j', async (args, message) => {
     await expect(update(args)).rejects.toThrow(message);

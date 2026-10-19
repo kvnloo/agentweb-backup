@@ -4,7 +4,7 @@ import { callerOrg, type ToolContext } from './orgCaller';
 import { isRecord } from '../services/leadNotificationAttribution';
 import { LEAD_ORIGINS, LEAD_ORIGIN_DESCRIPTIONS } from '../services/leadNotificationConfig';
 import {
-  allowlistedE164, hotLeadCallConfigOf, isCanonicalIanaTimezone, HHMM, HOT_LEAD_CALL_ANNOUNCED_NAME_MAX, HOT_LEAD_CALL_COUNTRIES,
+  allowlistedE164, hotLeadCallConfigOf, isIanaAreaTimezone, HHMM, HOT_LEAD_CALL_ANNOUNCED_NAME_MAX, HOT_LEAD_CALL_COUNTRIES,
   HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS, HOT_LEAD_CALL_SYSTEM_FIELDS,
   type HotLeadCallConfig,
 } from '../services/hotLeadCallConfig';
@@ -59,8 +59,8 @@ function mergeConfig(current: HotLeadCallConfig | undefined, destinationPhone: s
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const { destinationVerifiedAt: _unverify, ...unverified } = current ?? ({} as Partial<HotLeadCallConfig>);
   const mergedQuietHours = quietHours === undefined ? undefined : { ...current?.quietHours, ...quietHours };
-  if (mergedQuietHours && !isCanonicalIanaTimezone(mergedQuietHours.timezone)) {
-    throw new Error(`timezone must be an IANA name such as America/Chicago (got ${JSON.stringify(mergedQuietHours.timezone)})`);
+  if (mergedQuietHours && !isIanaAreaTimezone(mergedQuietHours.timezone)) {
+    throw new Error(`timezone must be an IANA Area/Location name such as America/Chicago; UTC, abbreviations and Etc/ zones are refused (got ${JSON.stringify(mergedQuietHours.timezone)})`);
   }
   return {
     ...(phoneChanged ? unverified : current),
@@ -107,7 +107,7 @@ emmaToolRegistry.register({
   name: 'update_hot_lead_call_settings',
   definition: {
     name: 'update_hot_lead_call_settings',
-    description: `Change your organization’s hot lead auto-call settings (org owners/admins only). Only the fields you send change; everything else is kept. The first save needs destinationPhone (US or Canada only, no extension; Puerto Rico, Guam and other territories are not supported) and announcedName. Changing destinationPhone clears its verification and turns calling off until the new number is verified. enabled:true is refused until the phone is verified and a caller number is assigned; both are managed by the system and cannot be set here. quietHours is the window in which calls ARE allowed (24h HH:MM in the given timezone, default 08:00-21:00; start later than end wraps past midnight) and is required to enable. The lead’s own timezone is not considered. timezone must be a canonical IANA name such as America/Chicago (UTC and abbreviations like EST are refused). leadTypes must contain at least one type (default form_fill). announcedName is read aloud on the call: letters, digits, spaces and . , & ' - only, max ${HOT_LEAD_CALL_ANNOUNCED_NAME_MAX} characters.`,
+    description: `Change your organization’s hot lead auto-call settings (org owners/admins only). Only the fields you send change; everything else is kept. The first save needs destinationPhone (US or Canada only, no extension; Puerto Rico, Guam and other territories are not supported) and announcedName. Changing destinationPhone clears its verification and turns calling off until the new number is verified. enabled:true is refused until the phone is verified and a caller number is assigned; both are managed by the system and cannot be set here. quietHours is the window in which calls ARE allowed (24h HH:MM in the given timezone, default 08:00-21:00; start later than end wraps past midnight) and is required to enable. The lead’s own timezone is not considered. timezone must be an IANA Area/Location name such as America/Chicago (UTC, abbreviations and Etc/ zones are refused). leadTypes must contain at least one type (default form_fill). announcedName is read aloud on the call: letters, digits, spaces and . , & ' - only, max ${HOT_LEAD_CALL_ANNOUNCED_NAME_MAX} characters.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -118,7 +118,7 @@ emmaToolRegistry.register({
         announcedName: { type: 'string', minLength: 1, maxLength: HOT_LEAD_CALL_ANNOUNCED_NAME_MAX },
         quietHours: {
           type: 'object',
-          properties: { start: { type: 'string', pattern: HHMM.source }, end: { type: 'string', pattern: HHMM.source }, timezone: { type: 'string', description: 'Canonical IANA name such as America/Chicago. UTC and abbreviations like EST are refused.' } },
+          properties: { start: { type: 'string', pattern: HHMM.source }, end: { type: 'string', pattern: HHMM.source }, timezone: { type: 'string', description: 'An IANA Area/Location name such as America/Chicago (UTC, abbreviations and Etc/ zones are refused).' } },
           additionalProperties: false,
         },
         allowedCountries: { type: 'array', items: { type: 'string', enum: [...HOT_LEAD_CALL_COUNTRIES] }, uniqueItems: true, minItems: 1 },

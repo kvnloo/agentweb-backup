@@ -5,7 +5,7 @@ import { isRecord } from './leadNotificationAttribution';
 import { isValidTimezone as isKnownTimezone } from './dripSendWindow';
 
 export const HOT_LEAD_CALL_COUNTRIES = ['US', 'CA'] as const;
-type HotLeadCallCountry = typeof HOT_LEAD_CALL_COUNTRIES[number];
+export type HotLeadCallCountry = typeof HOT_LEAD_CALL_COUNTRIES[number];
 
 const HOT_LEAD_CALL_DEFAULT_LEAD_TYPES: readonly LeadOrigin[] = ['form_fill'];
 const HOT_LEAD_CALL_DEFAULT_QUIET_HOURS = { start: '08:00', end: '21:00' } as const;
@@ -23,14 +23,14 @@ export const HOT_LEAD_CALL_LIMIT_FIELDS = Object.keys(HOT_LEAD_CALL_LIMITS) as H
 /** System-managed: set only by the number-provisioning / verification flow, never by Emma tools. */
 export const HOT_LEAD_CALL_SYSTEM_FIELDS = ['destinationVerifiedAt', 'twilioNumber', 'twilioNumberSid'] as const;
 
-interface HotLeadCallQuietHours {
+export interface HotLeadCallQuietHours {
   /**
    * The window in which calls ARE allowed (24h HH:MM, local to `timezone`); outside it the system stays quiet.
    * start > end wraps past midnight, so consumers must handle both orders. The lead's own timezone is not considered.
    */
   start: string;
   end: string;
-  /** Canonical IANA zone, e.g. America/Chicago. */
+  /** An IANA Area/Location name such as America/Chicago (UTC, abbreviations and Etc/ zones are refused). */
   timezone: string;
 }
 
@@ -38,6 +38,10 @@ export interface HotLeadCallConfig {
   enabled: boolean;
   /** E.164, US/CA only (other +1 territories such as Puerto Rico or Guam are refused). The owner's phone that is rung first. */
   destinationPhone: string;
+  /**
+   * System-managed. Any writer (the verification flow) must write conditionally on destinationPhone still
+   * equalling the verified phone, and must validate the result through hotLeadCallConfigOf.
+   */
   destinationVerifiedAt?: string;
   twilioNumber?: string;
   twilioNumberSid?: string;
@@ -69,10 +73,13 @@ const TWILIO_SID = /^PN[0-9a-f]{32}$/;
 // by Node/ICU version, so a stored zone could stop validating after an upgrade. Abbreviations (EST),
 // UTC and the Etc/ area are refused: none is a place whose local clock gates calls. The drip helper's
 // Intl check catches well-formed but unknown names.
-const IANA_ZONE = /^[A-Z][A-Za-z]+(?:\/[A-Z][A-Za-z0-9_+-]*)+$/;
+const IANA_ZONE = /^(?:[A-Z][a-z]+|US)(?:\/[A-Z][A-Za-z0-9_+-]*)+$/;
 // The drip helper alone is not enough: it accepts UTC, EST and lowercase names.
-export const isCanonicalIanaTimezone = (tz: unknown): tz is string =>
-  typeof tz === 'string' && IANA_ZONE.test(tz) && !tz.startsWith('Etc/') && isKnownTimezone(tz);
+// Rejects Etc/ (other casings already fail the shape regex) and all-caps location parts (AMERICA/CHICAGO, America/CHICAGO), which Intl would
+// case-fold and accept. Verified against all Intl.supportedValuesOf names and all tzdata slash zones: only Etc/* is refused.
+export const isIanaAreaTimezone = (tz: unknown): tz is string =>
+  typeof tz === 'string' && IANA_ZONE.test(tz) && !tz.startsWith('Etc/') &&
+  !tz.split('/').slice(1).some((part) => /^[A-Z]{4,}$/.test(part)) && isKnownTimezone(tz);
 
 // Types that bill the caller (toll fraud: premium, toll-free, shared-cost, personal, UAN) or are not a
 // person's direct line. VOIP can ring a person but is blocked anyway; note the default (min) metadata only
@@ -109,11 +116,14 @@ function quietHoursOf(raw: unknown): HotLeadCallQuietHours | null {
   const start = raw.start === undefined ? HOT_LEAD_CALL_DEFAULT_QUIET_HOURS.start : raw.start;
   const end = raw.end === undefined ? HOT_LEAD_CALL_DEFAULT_QUIET_HOURS.end : raw.end;
   if (typeof start !== 'string' || typeof end !== 'string' || !HHMM.test(start) || !HHMM.test(end) || start === end) return null;
-  if (!isCanonicalIanaTimezone(raw.timezone)) return null;
+  if (!isIanaAreaTimezone(raw.timezone)) return null;
   return { start, end, timezone: raw.timezone };
 }
 
-/** Strict validator: returns the normalized config (defaults filled) or null on anything invalid. */
+/**
+ * Strict validator: returns the normalized config (defaults filled) or null on anything invalid.
+ * A null for a STORED config means the consumer must skip the call and fall back to the Slack alert.
+ */
 export function hotLeadCallConfigOf(raw: unknown): HotLeadCallConfig | null {
   if (!isRecord(raw) || Object.keys(raw).some(k => !KEYS.has(k))) return null;
   if (typeof raw.enabled !== 'boolean') return null;
