@@ -127,6 +127,9 @@ import './leadNotificationTools';
 // Register email lookup / find tool (provider-agnostic)
 import './emailLookupTool';
 
+// Register the read-only site-wide broken-link scan (ENG-1098)
+import './siteLinkScanTool';
+
 emmaToolRegistry.register({
   name: 'enqueue_human_eval',
   definition: {
