@@ -116,6 +116,18 @@ describe('update_hot_lead_call_settings', () => {
     await expect(update({ quietHours })).rejects.toThrow('quietHours must be an object');
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
+  it.each(['UTC', 'EST', 'america/chicago', 'Mars/Olympus'])('names the timezone problem for %s', async timezone => {
+    await expect(update({ quietHours: { timezone } })).rejects.toThrow(/timezone must be an IANA name such as America\/Chicago/);
+    expect(orgDb.updateOrg).not.toHaveBeenCalled();
+  });
+  it('accepts a valid timezone change and describes quiet hours and territory limits', async () => {
+    await update({ quietHours: { timezone: 'America/Indiana/Indianapolis' } });
+    expect(lastWrite()[1].hotLeadCall.quietHours.timezone).toBe('America/Indiana/Indianapolis');
+    const def = handlers.get('update_hot_lead_call_settings')!.definition;
+    expect(def.description).toMatch(/wraps past midnight/);
+    expect(def.description).toMatch(/Puerto Rico/);
+    expect(def.description).toMatch(/UTC and abbreviations/);
+  });
   it('rejects a destination equal to the assigned caller number', async () => {
     await expect(update({ destinationPhone: '+14155550111' })).rejects.toThrow();
     expect(orgDb.updateOrg).not.toHaveBeenCalled();

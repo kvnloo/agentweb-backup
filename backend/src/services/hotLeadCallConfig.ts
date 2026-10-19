@@ -1,7 +1,7 @@
 import { parsePhoneNumberWithError } from 'libphonenumber-js';
 import { toE164 } from './whatsappService';
 import { isLeadTypes, type LeadOrigin } from './leadNotificationConfig';
-import { isValidTimezone as parsesAsTimezone } from './dripSendWindow';
+import { isRecord } from './leadNotificationAttribution';
 
 export const HOT_LEAD_CALL_COUNTRIES = ['US', 'CA'] as const;
 type HotLeadCallCountry = typeof HOT_LEAD_CALL_COUNTRIES[number];
@@ -23,16 +23,19 @@ export const HOT_LEAD_CALL_LIMIT_FIELDS = Object.keys(HOT_LEAD_CALL_LIMITS) as H
 export const HOT_LEAD_CALL_SYSTEM_FIELDS = ['destinationVerifiedAt', 'twilioNumber', 'twilioNumberSid'] as const;
 
 interface HotLeadCallQuietHours {
-  /** Calls are only placed between start and end (24h HH:MM, local to timezone). */
+  /**
+   * The window in which calls ARE allowed (24h HH:MM, local to `timezone`); outside it the system stays quiet.
+   * start > end wraps past midnight, so consumers must handle both orders. The lead's own timezone is not considered.
+   */
   start: string;
   end: string;
-  /** IANA zone, e.g. America/Chicago. */
+  /** Canonical IANA zone, e.g. America/Chicago. */
   timezone: string;
 }
 
 export interface HotLeadCallConfig {
   enabled: boolean;
-  /** E.164, US/CA only. The owner's phone that is rung first. */
+  /** E.164, US/CA only (other +1 territories such as Puerto Rico or Guam are refused). The owner's phone that is rung first. */
   destinationPhone: string;
   destinationVerifiedAt?: string;
   twilioNumber?: string;
@@ -60,16 +63,26 @@ const ANNOUNCED_NAME = /^[\p{L}\p{N} .,&'-]+$/u;
 const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
 const TWILIO_SID = /^PN[0-9a-f]{32}$/;
 
-// Local copy: leadNotificationAttribution.isRecord lives in a module that imports aws-sdk (via leadNotificationLookup).
-export const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+// IANA 'Area/Location' with proper capitalisation. Deliberately not a membership test against
+// Intl.supportedValuesOf: ICU canonicalises (America/Indianapolis, US/Eastern...) and the list differs
+// by Node/ICU version, so a stored zone could stop validating after an upgrade. Abbreviations (EST),
+// UTC and the Etc/ area are refused: none is a place whose local clock gates calls. The Intl call
+// catches well-formed but unknown names.
+const IANA_ZONE = /^[A-Z][A-Za-z]+(?:\/[A-Z][A-Za-z0-9_+-]*)+$/;
+export const isValidTimezone = (tz: unknown): tz is string => {
+  if (typeof tz !== 'string' || !IANA_ZONE.test(tz) || tz.startsWith('Etc/')) return false;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: tz }).resolvedOptions();
+    return true;
+  } catch {
+    return false;
+  }
+};
 
-// Canonical IANA names only: Intl accepts aliases like 'EST', 'america/chicago' and '+05:00', which are
-// ambiguous or case-variant. 'UTC' is not in the supported list and is meaningless as a local calling window.
-const CANONICAL_TIMEZONES: ReadonlySet<string> = new Set(Intl.supportedValuesOf('timeZone'));
-const isValidTimezone = (tz: unknown): tz is string => typeof tz === 'string' && CANONICAL_TIMEZONES.has(tz) && parsesAsTimezone(tz);
-
-// Numbers that bill the caller (toll fraud) or cannot ring a person's phone. Only a positive match
-// rejects: the default build's metadata returns undefined for types it cannot tell apart.
+// Types that bill the caller (toll fraud: premium, toll-free, shared-cost, personal, UAN) or are not a
+// person's direct line. VOIP can ring a person but is blocked anyway; note the default (min) metadata only
+// classes Canadian 600 numbers as VOIP, so US Google-Voice-style numbers still pass. Only a positive
+// match rejects: the min metadata returns undefined for types it cannot tell apart.
 const BLOCKED_NUMBER_TYPES: ReadonlySet<string | undefined> = new Set(['PREMIUM_RATE', 'TOLL_FREE', 'PERSONAL_NUMBER', 'SHARED_COST', 'UAN', 'VOIP']);
 
 /** Canonical E.164 whose country is in the US/CA allowlist, else null. */

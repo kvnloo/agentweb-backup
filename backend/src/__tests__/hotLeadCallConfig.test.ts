@@ -43,10 +43,14 @@ describe('hotLeadCallConfigOf', () => {
     expect(hotLeadCallConfigOf(base({ twilioNumber: '+14155550100' }))).toBeNull();
   });
 
-  it.each(['EST', '+05:00', 'america/chicago', 'UTC', 'GMT', 'Mars/Olympus', 'America/Chicago '])('rejects non-canonical timezone %j', timezone => {
+  it.each(['EST', '+05:00', 'america/chicago', 'UTC', 'GMT', 'Etc/UTC', 'Mars/Olympus', 'America/Chicago ', ''])('rejects non-IANA timezone %j', timezone => {
     expect(hotLeadCallConfigOf(base({ quietHours: { timezone } }))).toBeNull();
   });
-  it.each(['America/Chicago', 'America/Toronto', 'America/Los_Angeles'])('accepts canonical timezone %s', timezone => {
+  it.each([
+    'America/Chicago', 'America/Toronto', 'America/Los_Angeles', 'America/Indiana/Indianapolis', 'America/Kentucky/Louisville',
+    'America/Montreal', 'America/Halifax', 'America/St_Johns', 'America/Phoenix', 'America/Anchorage', 'Pacific/Honolulu', 'US/Eastern',
+    'America/Nipigon', 'America/Fort_Wayne', 'Canada/Eastern',
+  ])('accepts IANA timezone %s (including ICU-canonicalised aliases)', timezone => {
     expect(hotLeadCallConfigOf(base({ quietHours: { timezone } }))?.quietHours?.timezone).toBe(timezone);
   });
 
@@ -89,9 +93,9 @@ describe('hotLeadCallConfigOf', () => {
     ['quiet hours bad timezone', { quietHours: { timezone: 'Mars/Olympus' } }],
     ['quiet hours empty timezone', { quietHours: { timezone: '' } }],
     ['quiet hours bad time', { quietHours: { start: '8:00', timezone: 'UTC' } }],
-    ['quiet hours 24:00', { quietHours: { end: '24:00', timezone: 'UTC' } }],
-    ['quiet hours start == end', { quietHours: { start: '09:00', end: '09:00', timezone: 'UTC' } }],
-    ['quiet hours unknown key', { quietHours: { timezone: 'UTC', x: 1 } }],
+    ['quiet hours 24:00', { quietHours: { end: '24:00', timezone: 'America/Chicago' } }],
+    ['quiet hours start == end', { quietHours: { start: '09:00', end: '09:00', timezone: 'America/Chicago' } }],
+    ['quiet hours unknown key', { quietHours: { timezone: 'America/Chicago', x: 1 } }],
     ['quiet hours not object', { quietHours: '08:00-21:00' }],
   ])('rejects %s', (_label, over) => {
     expect(hotLeadCallConfigOf(base(over))).toBeNull();

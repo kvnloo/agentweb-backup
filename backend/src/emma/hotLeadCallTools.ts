@@ -1,9 +1,10 @@
 import { emmaToolRegistry } from './registry';
 import { orgDb } from '../services/db';
 import { callerOrg, type ToolContext } from './orgCaller';
+import { isRecord } from '../services/leadNotificationAttribution';
 import { LEAD_ORIGINS, LEAD_ORIGIN_DESCRIPTIONS } from '../services/leadNotificationConfig';
 import {
-  allowlistedE164, hotLeadCallConfigOf, isRecord, HOT_LEAD_CALL_ANNOUNCED_NAME_MAX, HOT_LEAD_CALL_COUNTRIES,
+  allowlistedE164, hotLeadCallConfigOf, isValidTimezone, HOT_LEAD_CALL_ANNOUNCED_NAME_MAX, HOT_LEAD_CALL_COUNTRIES,
   HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS, HOT_LEAD_CALL_SYSTEM_FIELDS,
   type HotLeadCallConfig,
 } from '../services/hotLeadCallConfig';
@@ -36,6 +37,39 @@ function hasExtension(raw: string): boolean {
   } catch {
     return false;
   }
+}
+
+function resolveDestinationPhone(sent: unknown, current: HotLeadCallConfig | undefined): string {
+  let phone = current?.destinationPhone;
+  if (sent !== undefined) {
+    // toE164 silently drops extensions, which would make the owner's phone ring a different line.
+    if (typeof sent === 'string' && hasExtension(sent)) throw new Error('destinationPhone must not include an extension');
+    const normalized = typeof sent === 'string' ? toE164(sent, 'US') : null;
+    phone = normalized ? allowlistedE164(normalized) ?? undefined : undefined;
+    if (!phone) throw new Error('destinationPhone must be a valid US or Canadian phone number');
+  }
+  if (!phone) throw new Error('destinationPhone is required to set up hot lead calls');
+  return phone;
+}
+
+/** Partial update over the current config; a changed phone drops verification and forces calling off. */
+function mergeConfig(current: HotLeadCallConfig | undefined, destinationPhone: string, rest: Record<string, unknown>, quietHours: unknown) {
+  if (quietHours !== undefined && !isRecord(quietHours)) throw new Error('quietHours must be an object with start, end and timezone');
+  const phoneChanged = destinationPhone !== current?.destinationPhone;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { destinationVerifiedAt: _unverify, ...unverified } = current ?? ({} as Partial<HotLeadCallConfig>);
+  const mergedQuietHours = quietHours === undefined ? undefined : { ...current?.quietHours, ...quietHours };
+  if (mergedQuietHours && !isValidTimezone(mergedQuietHours.timezone)) {
+    throw new Error(`timezone must be an IANA name such as America/Chicago (got ${JSON.stringify(mergedQuietHours.timezone)})`);
+  }
+  return {
+    ...(phoneChanged ? unverified : current),
+    ...rest,
+    destinationPhone,
+    ...(mergedQuietHours ? { quietHours: mergedQuietHours } : {}),
+    // A new number is unverified, so calling stays off until the system re-verifies it.
+    enabled: phoneChanged ? false : rest.enabled ?? current?.enabled ?? false,
+  };
 }
 
 function validateArgs(args: unknown, allowed: readonly string[]): asserts args is Record<string, unknown> {
@@ -73,18 +107,18 @@ emmaToolRegistry.register({
   name: 'update_hot_lead_call_settings',
   definition: {
     name: 'update_hot_lead_call_settings',
-    description: `Change your organization’s hot lead auto-call settings (org owners/admins only). Only the fields you send change; everything else is kept. The first save needs destinationPhone (US or Canada) and announcedName. Changing destinationPhone clears its verification and turns calling off until the new number is verified. enabled:true is refused until the phone is verified and a caller number is assigned; both are managed by the system and cannot be set here. quietHours is the window in which calls may be placed (24h HH:MM in the given IANA timezone, default 08:00-21:00) and is required to enable. leadTypes must contain at least one type (default form_fill). announcedName is read aloud on the call: letters, digits, spaces and . , & ' - only, max ${HOT_LEAD_CALL_ANNOUNCED_NAME_MAX} characters.`,
+    description: `Change your organization’s hot lead auto-call settings (org owners/admins only). Only the fields you send change; everything else is kept. The first save needs destinationPhone (US or Canada only, no extension; Puerto Rico, Guam and other territories are not supported) and announcedName. Changing destinationPhone clears its verification and turns calling off until the new number is verified. enabled:true is refused until the phone is verified and a caller number is assigned; both are managed by the system and cannot be set here. quietHours is the window in which calls ARE allowed (24h HH:MM in the given timezone, default 08:00-21:00; start later than end wraps past midnight) and is required to enable. The lead’s own timezone is not considered. timezone must be a canonical IANA name such as America/Chicago (UTC and abbreviations like EST are refused). leadTypes must contain at least one type (default form_fill). announcedName is read aloud on the call: letters, digits, spaces and . , & ' - only, max ${HOT_LEAD_CALL_ANNOUNCED_NAME_MAX} characters.`,
     inputSchema: {
       type: 'object',
       properties: {
         enabled: { type: 'boolean' },
-        destinationPhone: { type: 'string', description: 'Owner phone, US or Canada, e.g. +15555550100.' },
+        destinationPhone: { type: 'string', description: 'Owner phone, US or Canada only (not Puerto Rico, Guam or other +1 territories), no extension, e.g. +15555550100.' },
         leadTypes: { type: 'array', items: { type: 'string', enum: [...LEAD_ORIGINS] }, uniqueItems: true, minItems: 1, maxItems: LEAD_ORIGINS.length },
         ...Object.fromEntries(HOT_LEAD_CALL_LIMIT_FIELDS.map(f => [f, { type: 'integer', minimum: HOT_LEAD_CALL_LIMITS[f].min, maximum: HOT_LEAD_CALL_LIMITS[f].max }])),
         announcedName: { type: 'string', minLength: 1, maxLength: HOT_LEAD_CALL_ANNOUNCED_NAME_MAX },
         quietHours: {
           type: 'object',
-          properties: { start: { type: 'string', pattern: '^([01]\\d|2[0-3]):[0-5]\\d$' }, end: { type: 'string', pattern: '^([01]\\d|2[0-3]):[0-5]\\d$' }, timezone: { type: 'string' } },
+          properties: { start: { type: 'string', pattern: '^([01]\\d|2[0-3]):[0-5]\\d$' }, end: { type: 'string', pattern: '^([01]\\d|2[0-3]):[0-5]\\d$' }, timezone: { type: 'string', description: 'Canonical IANA name such as America/Chicago. UTC and abbreviations like EST are refused.' } },
           additionalProperties: false,
         },
         allowedCountries: { type: 'array', items: { type: 'string', enum: [...HOT_LEAD_CALL_COUNTRIES] }, uniqueItems: true, minItems: 1 },
@@ -102,33 +136,9 @@ emmaToolRegistry.register({
     const previous = org.hotLeadCall;
     const current = storedConfig(previous);
 
-    let destinationPhone = current?.destinationPhone;
-    if (patch.destinationPhone !== undefined) {
-      // toE164 silently drops extensions, which would make the owner's phone ring a different line.
-      if (typeof patch.destinationPhone === 'string' && hasExtension(patch.destinationPhone)) {
-        throw new Error('destinationPhone must not include an extension');
-      }
-      const normalized = typeof patch.destinationPhone === 'string' ? toE164(patch.destinationPhone, 'US') : null;
-      destinationPhone = normalized ? allowlistedE164(normalized) ?? undefined : undefined;
-      if (!destinationPhone) throw new Error('destinationPhone must be a valid US or Canadian phone number');
-    }
-    if (!destinationPhone) throw new Error('destinationPhone is required to set up hot lead calls');
-    const phoneChanged = destinationPhone !== current?.destinationPhone;
-
-    const { quietHours, ...rest } = patch;
-    if (quietHours !== undefined && !isRecord(quietHours)) throw new Error('quietHours must be an object with start, end and timezone');
-    delete rest.destinationPhone;
-    const unverified: Partial<HotLeadCallConfig> = { ...current };
-    delete unverified.destinationVerifiedAt;
-    const merged = {
-      enabled: false,
-      ...(phoneChanged ? unverified : current),
-      ...rest,
-      destinationPhone,
-      ...(quietHours !== undefined ? { quietHours: { ...current?.quietHours, ...quietHours } } : {}),
-      // A new number is unverified, so calling stays off until the system re-verifies it.
-      ...(phoneChanged ? { enabled: false } : {}),
-    };
+    const destinationPhone = resolveDestinationPhone(patch.destinationPhone, current);
+    const rest = Object.fromEntries(Object.entries(patch).filter(([key]) => key !== 'quietHours' && key !== 'destinationPhone'));
+    const merged = mergeConfig(current, destinationPhone, rest, patch.quietHours);
     const validated = hotLeadCallConfigOf(merged);
     if (!validated) {
       throw new Error('Invalid hot lead call settings. Check the limits and name format; enabling needs a verified phone, an assigned caller number, and quiet hours with a timezone.');
