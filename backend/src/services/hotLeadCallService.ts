@@ -1,17 +1,17 @@
 import { createHash } from 'crypto';
-import { parsePhoneNumberWithError } from 'libphonenumber-js';
 import { isSmokeTestLead } from '../utils/smokeTestLead';
 import { crmDb } from './db';
 import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from './asyncJobQueue';
-import { toE164, redactPhone } from './whatsappService';
+import { redactPhone } from './whatsappService';
 import type { HotLeadCallConfig } from './hotLeadCallConfig';
-import { allowlistedE164 } from './hotLeadCallConfig';
+import { callableLeadPhone } from './hotLeadCallConfig';
 import type { LeadOrigin } from './leadNotificationConfig';
 import { VoiceCallError, getVoiceProvider, scrubErrorText } from './voice/voiceProvider';
-import { buildVoiceWebhookUrl } from './voice/voiceUrls';
+import { buildVoiceWebhookUrl, isWebhookSafeId } from './voice/voiceUrls';
 import { isHotLeadCallEnabled } from './voice/hotLeadCallMode';
 import { resolveHotLeadCallContext, type HotLeadCallContext } from './voice/hotLeadCallContext';
 import { getLeadCallStore } from './voice/leadCallStore';
+import { isWithinCallWindow, reserveCallSlot, type Reservation } from './voice/hotLeadCallLimits';
 // This file must not import orgLeadNotificationService: that module calls dispatchHotLeadCall.
 
 interface HotLeadCallJob {
@@ -37,29 +37,20 @@ const isNonEmpty = (v: unknown): v is string => typeof v === 'string' && v.trim(
 type LeadRow = NonNullable<Awaited<ReturnType<typeof crmDb.getLeadById>>>;
 interface GateInput { config: HotLeadCallConfig; lead: LeadRow; job: HotLeadCallJob }
 
-// National-format numbers are parsed as US (forms for US/CA carry no '+1'); anything that resolves to another
-// country, or to a blocked number type, fails allowlistedE164.
-function leadPhoneE164(lead: LeadRow): string | null {
-  const e164 = typeof lead.phone === 'string' ? toE164(lead.phone, 'US') : null;
-  return e164 ? allowlistedE164(e164) : null;
-}
-
-function phoneCountry(e164: string): string | undefined {
-  try { return parsePhoneNumberWithError(e164).country; } catch { return undefined; }
-}
-
 // Gates that record `call.skipped` when they refuse, cheapest first. Each returns a skip reason or null.
 const SKIP_GATES: Array<(g: GateInput) => string | null> = [
   // Enabled configs are validated to have one, but the call must never reach create without it: a skip
   // keeps the lead's single call slot unused.
   ({ config }) => (config.twilioNumber ? null : 'no_caller_number'),
+  // The webhooks reject ids outside their strict shape; Twilio would ring the owner and every callback would fail.
+  ({ job }) => (isWebhookSafeId(job.listId) && isWebhookSafeId(job.leadId) ? null : 'unsafe_id'),
   ({ lead, config }) => {
-    const phone = leadPhoneE164(lead);
-    if (!phone) return 'invalid_phone';
-    const country = phoneCountry(phone);
-    // allowlistedE164 already limits to US/CA, so this only refuses when allowedCountries is a strict subset.
-    return country && config.allowedCountries.some(c => c === country) ? null : 'country_not_allowed';
+    const callable = callableLeadPhone(lead.phone, config);
+    return 'reason' in callable ? callable.reason : null;
   },
+  // Stateless, so it runs in every pass; the limits that count calls run once, just before create. A skip leaves
+  // the lead's call slot unused, and the Slack alert goes out regardless.
+  ({ config }) => (isWithinCallWindow(config.quietHours, new Date()) ? null : 'outside_quiet_hours'),
   // Protects against queue-reclaim delays: a lead that waited too long is no longer "hot". A missing or
   // unparseable timestamp fails closed.
   ({ lead, job, config }) => {
@@ -73,7 +64,7 @@ const SKIP_GATES: Array<(g: GateInput) => string | null> = [
  * dispatch and again in the job (state can change in between). Returns null for "do nothing";
  * refusals worth showing on the timeline also record `call.skipped`.
  */
-async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: HotLeadCallJob; ctx: HotLeadCallContext } | null> {
+async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: HotLeadCallJob; ctx: HotLeadCallContext; phone: string } | null> {
   const { listId, leadId, origin } = input;
   if (origin !== 'form_fill') return null;
   const ctx = await resolveHotLeadCallContext(listId);
@@ -97,7 +88,8 @@ async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: H
       return null;
     }
   }
-  return { job, ctx };
+  const callable = callableLeadPhone(lead.phone, ctx.config);
+  return 'phone' in callable ? { job, ctx, phone: callable.phone } : null; // always set: the phone gate refused otherwise
 }
 
 /**
@@ -121,8 +113,32 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
   const statusCallbackUrl = buildVoiceWebhookUrl('status', webhook);
   const store = getLeadCallStore();
 
+  // Reserve BEFORE create and give back if create does not win: a lead that never dials costs no slot, and a
+  // lead refused by a limit leaves no record, so its single call slot stays unused (a repeat submission can retry).
+  let slot: Reservation;
+  try {
+    slot = await reserveCallSlot({ orgId: job.orgId, phoneE164: reviewed.phone, config });
+  } catch (err) {
+    // Fail closed (nothing dialed, no record) but leave a trace on the lead: a missing table or secret is an ops problem.
+    console.warn('[hotLeadCall] call limits unavailable', { listId, leadId, error: errorText(err) });
+    // The timeline write is best-effort: it must never mask the original failure.
+    await store.addEvent(listId, leadId, 'call.skipped', { reason: 'limits_unavailable' }).catch(() => undefined);
+    throw err;
+  }
+  if (!slot.ok) {
+    // A repeat submission of a lead that was already called trips the phone marker; its timeline has the call.
+    if (slot.reason === 'duplicate_phone' && await store.get(listId, leadId)) return;
+    await store.addEvent(listId, leadId, 'call.skipped', { reason: slot.reason });
+    return;
+  }
   const startedAt = new Date().toISOString();
-  if (!await store.create(listId, leadId, { state: 'dialing', jobKey: key, startedAt, updatedAt: startedAt })) return;
+  let created = false;
+  try {
+    created = await store.create(listId, leadId, { state: 'dialing', jobKey: key, startedAt, updatedAt: startedAt });
+  } finally {
+    if (!created) await slot.release();
+  }
+  if (!created) return;
 
   // If the post-call transition fails the record stays 'dialing'; the first signed owner callback adopts the CallSid.
   const settle = async (patch: Parameters<typeof store.transition>[3], event: 'call.initiated' | 'call.failed', detail?: Record<string, string>) => {

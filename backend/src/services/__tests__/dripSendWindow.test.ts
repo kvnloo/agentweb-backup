@@ -1,4 +1,4 @@
-import { nextAllowedSendAt } from '../dripSendWindow';
+import { localParts, nextAllowedSendAt } from '../dripSendWindow';
 
 const LA = 'America/Los_Angeles';
 const business = { startHour: 9, endHour: 17, days: [1, 2, 3, 4, 5] };
@@ -81,5 +81,24 @@ describe('nextAllowedSendAt', () => {
       nextAllowedSendAt({ dueAt: new Date(), recipientTimezone: null, window: business, fallbackTimezone: 'Bad/Zone' }),
     ].map((r) => (r.ok ? 'ok' : r.error.code));
     expect(codes).toEqual(['invalid_hours', 'invalid_hours', 'empty_days', 'invalid_day', 'invalid_due_at', 'invalid_fallback_timezone']);
+  });
+});
+
+describe('localParts', () => {
+  it('reads the wall clock of the instant in the zone, across DST', () => {
+    expect(localParts(Date.parse('2026-03-08T08:00:00Z'), 'America/Chicago')).toMatchObject({ month: 3, day: 8, hour: 3, minute: 0 });
+    expect(localParts(Date.parse('2026-11-01T07:30:00Z'), 'America/Chicago')).toMatchObject({ month: 11, day: 1, hour: 1, minute: 30 });
+  });
+
+  it('maps an engine that prints midnight as hour 24 back to 0', () => {
+    const real = Intl.DateTimeFormat.prototype.formatToParts;
+    const spy = jest.spyOn(Intl.DateTimeFormat.prototype, 'formatToParts').mockImplementation(function (this: Intl.DateTimeFormat, d?: Date | number) {
+      return real.call(this, d).map((p) => (p.type === 'hour' ? { ...p, value: '24' } : p));
+    });
+    try {
+      expect(localParts(Date.parse('2026-10-19T05:00:00Z'), 'America/Chicago').hour).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

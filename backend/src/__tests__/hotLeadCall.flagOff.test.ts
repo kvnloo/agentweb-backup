@@ -17,6 +17,7 @@ const postMessage = jest.fn();
 const authTest = jest.fn();
 jest.mock('@slack/web-api', () => ({ WebClient: jest.fn(() => ({ auth: { test: authTest }, chat: { postMessage } })) }));
 jest.mock('../services/db', () => ({
+  ENGAGED_EVENT_KEYWORDS: jest.requireActual('../services/db').ENGAGED_EVENT_KEYWORDS,
   crmDb: {
     getLeadListById: jest.fn(), getLeadById: jest.fn(), claimLeadStepOnce: jest.fn(), setLeadFields: jest.fn(),
     addLeadEngagement: jest.fn(), createLeadSystemRecordOnce: jest.fn(), updateLeadSystemRecordIf: jest.fn(),
@@ -34,6 +35,8 @@ import { dispatchLeadCreated, dispatchLeadsCreated } from '../services/orgLeadNo
 import { setHotLeadCallEnabledOverride } from '../services/voice/hotLeadCallMode';
 import { FakeVoiceProvider } from '../services/voice/fakeVoiceProvider';
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
+import { FakeLimitStore } from '../services/voice/fakeLimitStore';
+import { setLimitStoreForTests } from '../services/voice/limitStore';
 
 const mock = (fn: unknown) => fn as jest.Mock;
 const flush = async () => { for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve)); };
@@ -45,11 +48,25 @@ const callConfig = {
   enabled: true, destinationPhone: '+14155550100', destinationVerifiedAt: '2026-01-01T00:00:00.000Z', twilioNumber: '+14155550111',
   announcedName: 'Acme', quietHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
 };
+const originalJwtSecret = process.env.JWT_SECRET;
+afterAll(() => {
+  if (originalJwtSecret === undefined) delete process.env.JWT_SECRET;
+  else process.env.JWT_SECRET = originalJwtSecret;
+});
 let provider: FakeVoiceProvider;
+let limits: FakeLimitStore;
 let org: Record<string, unknown>;
 
 beforeEach(() => {
   jest.resetAllMocks();
+  // Only Date is faked: 12:00 in the call window (America/Chicago), so the quiet-hours gate never depends on when this runs.
+  jest.useFakeTimers({
+    now: new Date('2026-10-19T17:00:00Z'),
+    doNotFake: ['hrtime', 'nextTick', 'performance', 'queueMicrotask', 'setImmediate', 'clearImmediate', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'],
+  });
+  process.env.JWT_SECRET = 'test-secret';
+  limits = new FakeLimitStore();
+  setLimitStoreForTests(limits);
   hotLeadCall.live = false;
   mock(notificationLookup.campaigns).mockResolvedValue({ rows: [], truncated: false });
   mock(notificationLookup.pages).mockResolvedValue([]);
@@ -74,6 +91,8 @@ beforeEach(() => {
   postMessage.mockResolvedValue({ ok: true, ts: '1.2' });
 });
 afterEach(() => {
+  jest.useRealTimers();
+  setLimitStoreForTests(null);
   setHotLeadCallEnabledOverride(null);
   setVoiceProviderForTests(null);
 });
@@ -115,6 +134,7 @@ describe('hot-lead call hook leaves the Slack lead alert untouched', () => {
     expect(callsOf()).toEqual(expected.all);
     expect(mock(queue.enqueueJob).mock.calls.map(c => c[0])).not.toContain('hot_lead_call');
     expect(provider.placedCalls).toEqual([]);
+    expect(limits.keysTouched).toEqual([]);
   });
 
   it('mode on, org without a hotLeadCall config: Slack side identical, no hot_lead_call enqueue or provider call', async () => {
@@ -128,6 +148,7 @@ describe('hot-lead call hook leaves the Slack lead alert untouched', () => {
     expect(mock(crmDb.claimLeadStepOnce)).toHaveBeenCalledTimes(1);
     expect(mock(crmDb.addLeadEngagement)).not.toHaveBeenCalled();
     expect(provider.placedCalls).toEqual([]);
+    expect(limits.keysTouched).toEqual([]);
   });
 
   it('mode on and fully configured: the Slack post is identical, and the call is placed', async () => {
@@ -141,6 +162,7 @@ describe('hot-lead call hook leaves the Slack lead alert untouched', () => {
     expect(sources).toEqual(['hot_lead_call', 'org_lead_notification']);
     expect(postMessage.mock.calls).toEqual(expected.slack[SLACK_SIDE.indexOf(postMessage)]);
     expect(provider.placedCalls).toHaveLength(1);
+    expect(limits.keysTouched.length).toBeGreaterThan(0);
     // The only claim is Slack's own; the hot-lead call takes none.
     expect(mock(crmDb.claimLeadStepOnce)).toHaveBeenCalledTimes(1);
     expect(mock(crmDb.claimLeadStepOnce).mock.calls[0][2]).toMatch(/^leadNotification_/);
