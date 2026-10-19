@@ -204,7 +204,8 @@ async function main(): Promise<void> {
     console.log(`      names in the credential home after a turn: ${readdirSync(homeDir).sort().join(", ")}`);
     check("nothing is left in the work dir", readdirSync(workDir).length === 0, `work=${readdirSync(workDir).length}`);
     console.log(`      names in the connection tmp dir (HOME of the short commands: status/doctor): ${readdirSync(tmpDir).sort().join(", ") || "(none)"}`);
-    check("the unit-private tmp holds only the wrapper's directories", readdirSync(join(root, "unit-1")).sort().join(",") === "aw-cfg,aw-home", readdirSync(join(root, "unit-1")).sort().join(","));
+    const unitNames = readdirSync(join(root, "unit-1")).sort();
+    check("the unit-private tmp has the wrapper's two directories (the CLI adds its own scratch next to them: names listed)", unitNames.includes("aw-cfg") && unitNames.includes("aw-home"), unitNames.join(","));
 
     // ── 3 concurrent turns on ONE home (the recorded cap) ──
     const sessions = await Promise.all([1, 2, 3].map(() => freshUnitAdapter().openSession(ctx, { connectionId: "live-auth", epoch: 1 })));
