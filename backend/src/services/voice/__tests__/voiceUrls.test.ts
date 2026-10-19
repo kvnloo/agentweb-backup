@@ -1,4 +1,4 @@
-import { buildVoiceWebhookUrl } from '../voiceUrls';
+import { buildVoiceWebhookUrl, isWebhookSafeId, voiceWebhookBaseUrl } from '../voiceUrls';
 
 const ctx = { listId: 'list 1', leadId: 'lead&id=2', jobKey: 'a/b?c#d' };
 
@@ -50,5 +50,40 @@ describe('buildVoiceWebhookUrl', () => {
     Object.assign(process.env, { NODE_ENV: 'staging' });
     process.env.BACKEND_URL = 'https://staging.example.com';
     expect(buildVoiceWebhookUrl('owner', ctx)).toMatch(/^https:\/\/staging\.example\.com\//);
+  });
+});
+
+describe('status callback retry override', () => {
+  beforeEach(() => { process.env.BACKEND_URL = 'https://api.example.com'; });
+
+  it('puts the documented retry fragment on status URLs only', () => {
+    const c = { listId: 'l', leadId: 'd', jobKey: 'j' };
+    expect(buildVoiceWebhookUrl('status', c)).toMatch(/\?listId=l&leadId=d&jobKey=j#rc=3&rp=5xx,ct$/);
+    for (const kind of ['owner', 'gather', 'dial'] as const) expect(buildVoiceWebhookUrl(kind, c)).not.toContain('#');
+  });
+
+  it('adds leg=lead to the query, before the fragment', () => {
+    const url = buildVoiceWebhookUrl('status', { listId: 'l', leadId: 'd', jobKey: 'j' }, { leg: 'lead' });
+    expect(url).toMatch(/\?listId=l&leadId=d&jobKey=j&leg=lead#rc=3&rp=5xx,ct$/);
+    expect(new URL(url).searchParams.get('leg')).toBe('lead');
+  });
+});
+
+describe('voiceWebhookBaseUrl', () => {
+  it('returns the configured origin without trailing slashes and refuses an unset base in staging', () => {
+    process.env.BACKEND_URL = ' https://api.example.com// ';
+    expect(voiceWebhookBaseUrl()).toBe('https://api.example.com');
+    delete process.env.BACKEND_URL;
+    Object.assign(process.env, { NODE_ENV: 'staging' });
+    expect(() => voiceWebhookBaseUrl()).toThrow(/BACKEND_URL/);
+  });
+});
+
+describe('isWebhookSafeId', () => {
+  it.each(['list-1', 'a_b.c:d', 'x'.repeat(200), '0f8fad5b-d9cb-469f-a165-70867728950e'])('accepts %s', (id) => {
+    expect(isWebhookSafeId(id)).toBe(true);
+  });
+  it.each(['', 'a@b.com', 'a+b', 'a b', 'a/b', 'a?b', 'a&b', 'x'.repeat(201), 'é'])('rejects %j', (id) => {
+    expect(isWebhookSafeId(id)).toBe(false);
   });
 });

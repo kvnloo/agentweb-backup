@@ -1,5 +1,5 @@
 import {
-  hotLeadCallConfigOf, HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS, type HotLeadCallConfig,
+  hotLeadCallConfigOf, callableLeadPhone, HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS, type HotLeadCallConfig,
 } from '../services/hotLeadCallConfig';
 
 const SID = 'PN' + 'a'.repeat(32);
@@ -132,5 +132,18 @@ describe('hotLeadCallConfigOf', () => {
     it('allows the same incomplete config when disabled', () => {
       expect(hotLeadCallConfigOf(enabledBase({ enabled: false, destinationVerifiedAt: undefined, twilioNumber: undefined, quietHours: undefined }))).not.toBeNull();
     });
+  });
+});
+
+describe('callableLeadPhone', () => {
+  const both = { allowedCountries: ['US', 'CA'] as Array<'US' | 'CA'> };
+  it.each(['(415) 555-0123', '+14155550123', '415-555-0123'])('returns the E.164 number for %s', (raw) => {
+    expect(callableLeadPhone(raw, both)).toEqual({ phone: '+14155550123' });
+  });
+  it.each([undefined, null, 5, '', 'not a number', '+442071838750', '+18005550123'])('refuses %j as invalid_phone', (raw) => {
+    expect(callableLeadPhone(raw, both)).toEqual({ reason: 'invalid_phone' });
+  });
+  it('refuses a country outside the org allowedCountries', () => {
+    expect(callableLeadPhone('+14155550123', { allowedCountries: ['CA'] })).toEqual({ reason: 'country_not_allowed' });
   });
 });
