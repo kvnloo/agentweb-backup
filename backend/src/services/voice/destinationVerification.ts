@@ -9,7 +9,7 @@ import { verificationCodeTwiml } from './twiml';
 import { isConditionalFailure, unchangedSince } from './setupWrites';
 
 /**
- * Destination-phone verification for the hot-lead auto-call (ENG-2271 WP7).
+ * Destination-phone verification for the hot-lead auto-call (ENG-2271).
  *
  * Ordering: a caller number must be provisioned first, because Twilio only places calls from numbers the
  * account owns. The verification call rings the stored destinationPhone from that number and reads a random

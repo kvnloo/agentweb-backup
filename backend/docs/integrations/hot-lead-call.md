@@ -10,9 +10,9 @@ It is a second subscriber to the same moment as the Slack lead alert
 suppresses that alert: a skipped or failed call leaves the Slack message as the
 fallback.
 
-Status of this document: written against the ENG-2271 feature branch with all of
-WP1-WP7 merged (WP7 is the Emma setup tools: provision a number, verify the
-destination). Everything marked **to confirm with Twilio** or listed under "Not
+Status of this document: written against the complete ENG-2271 feature branch,
+including the number-provisioning and destination-verification Emma tools.
+Everything marked **to confirm with Twilio** or listed under "Not
 verified" has never been run against a real Twilio account.
 
 ## Operator quick reference
@@ -107,7 +107,7 @@ All paths are under `backend/src/`.
 | Rate card and runtime rate overrides | `utils/vendorRateCard.ts`, `routes/adminVendorRates.ts` |
 | Twilio credentials | `utils/secretsManager.ts` `getTwilioCredentials` |
 | Emma settings tools | `emma/hotLeadCallTools.ts` |
-| Emma setup tools (WP7) | `emma/hotLeadCallSetupTools.ts`, `services/voice/numberProvisioning.ts`, `services/voice/destinationVerification.ts`, `services/voice/setupWrites.ts` |
+| Emma setup tools (number provisioning, destination verification) | `emma/hotLeadCallSetupTools.ts`, `services/voice/numberProvisioning.ts`, `services/voice/destinationVerification.ts`, `services/voice/setupWrites.ts` |
 | Admin UI for rates | `partner-portal/src/components/admin/VendorRatesTab.tsx` (Admin > Revenue & billing > Vendor Rates) |
 
 Tests worth knowing: `__tests__/hotLeadCall.e2e.test.ts` (the calls: real
@@ -188,7 +188,7 @@ Settings (merged):
   attribute being unchanged since it was read, so a concurrent edit fails
   instead of clobbering.
 
-Setup tools (WP7, merged). They need `org:configure`, work while the global
+Setup tools (number provisioning and destination verification). They need `org:configure`, work while the global
 kill switch is off, and are blocked in shared sessions. The three that spend
 money or cannot be undone (`provision_hot_lead_call_number`,
 `release_hot_lead_call_number`, `start_hot_lead_call_verification`) also REFUSE
@@ -289,7 +289,7 @@ What the code requires (verified from code):
 
 - A Twilio account whose credentials are in the secret above.
 - The caller ID must be a number the account owns (the TwiML `<Dial callerId>`
-  and the REST `from`). The WP7 tool buys it: `availablePhoneNumbers('US').local`,
+  and the REST `from`). The provisioning tool buys it: `availablePhoneNumbers('US').local`,
   voice-enabled, optionally by area code. The org's number is always a US local
   number, even for a Canadian owner.
 - Outbound calls to US and Canadian numbers only (`allowedCountries`).
@@ -310,8 +310,8 @@ No new table or index. The feature writes:
 | What | Where | Written by |
 | --- | --- | --- |
 | `hotLeadCall` (config) | org attribute on the org item | Emma settings tool, number provisioning, verification |
-| `hotLeadCallVerification` (HMAC of pending code, attempts, start history) | org attribute (WP7) | verification tools |
-| `hotLeadCallProvisioning` (purchase/release timestamps for the daily caps) | org attribute (WP7) | provisioning tools |
+| `hotLeadCallVerification` (HMAC of pending code, attempts, start history) | org attribute | verification tools |
+| `hotLeadCallProvisioning` (purchase/release timestamps for the daily caps) | org attribute | provisioning tools |
 | `hot_lead_call_mode` | AW-Settings item | operators |
 | `vendor_rate_overrides` | AW-Settings item | admin Vendor Rates tab |
 | `system.hot_lead_call` (call record: `state`, `jobKey`, `startedAt`, `updatedAt`, `ownerCallSid`, `leadCallSid`, `outcome`, `meteredLegs`, `lastSequence`) | on the lead row (AW-Leads), no phone number | orchestrator and webhooks |
@@ -344,7 +344,7 @@ Every Twilio call is billed to AgentWeb's account and recorded through
 | Rate key | Unit | Provisional default | Metered |
 | --- | --- | --- | --- |
 | `voice_minute_outbound` | minute | $0.014 | per leg, from the `/status` webhook |
-| `number_monthly_rent` | number_month | $1.15 | WP7 only, at purchase (first month) |
+| `number_monthly_rent` | number_month | $1.15 | provisioning tool only, at purchase (first month) |
 
 The defaults are PROVISIONAL placeholders at Twilio's public US list price
 (checked 2026-10-19) pending the rate allocation from Harsha (get this before
@@ -373,7 +373,7 @@ Rules the code enforces:
   right to bill, then billed. A crash between the two undercounts; it never
   double-bills. Twilio's status-callback retries are idempotent on the leg and on
   `lastSequence`.
-- The verification call (WP7) has no status callback and is metered at an
+- The verification call has no status callback and is metered at an
   estimated one minute.
 - **Recurring number rent is NOT metered.** Only the first month is recorded at
   purchase. A scheduled job that meters `twilio:number:<sid>:<YYYY-MM>` for every
@@ -646,7 +646,7 @@ Twilio's documentation and encoded in tests with synthetic payloads:
   `twilio:number:<sid>:<YYYY-MM>`). Only the first month is metered today.
 - **Stuck-record cleanup.** A documented sweep for records live longer than a
   call can last (and reconciliation of their Twilio legs). No cron exists.
-- **Human-approval gate for paid tools (GA precondition).** WP7 did not add one:
+- **Human-approval gate for paid tools (GA precondition).** None exists yet:
   buying and releasing a number refuse unattended runs and are capped per org,
   and `confirm` is advisory. A deck-of-one approval per purchase or release, like
   `services/crmSequenceActivationGate.ts`, is needed before general availability.

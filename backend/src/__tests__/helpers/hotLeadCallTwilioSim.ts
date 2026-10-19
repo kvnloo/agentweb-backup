@@ -1,5 +1,5 @@
 /**
- * The Twilio side of the hot-lead call end-to-end test (ENG-2271 WP8): a VoiceProvider whose signature check is
+ * The Twilio side of the hot-lead call end-to-end test (ENG-2271): a VoiceProvider whose signature check is
  * Twilio's own algorithm, and a caller that behaves like Twilio's webhook client. It only ever follows the URLs
  * the app handed out (the placeCall URLs, then the action/statusCallback URLs inside the TwiML it was answered
  * with), so a URL the app got wrong cannot be papered over by the test knowing the right one.

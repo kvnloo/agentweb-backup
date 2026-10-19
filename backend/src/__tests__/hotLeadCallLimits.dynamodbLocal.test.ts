@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-require-imports -- DynamoDB Local suite: the SDK must be required after the endpoint is configured, like leadCallStore.dynamodbLocal.test.ts */
 /**
- * ENG-2271 WP6a — the hot-lead call abuse-limit store against REAL DynamoDB semantics: the conditional counter
+ * ENG-2271: the hot-lead call abuse-limit store against REAL DynamoDB semantics: the conditional counter
  * and claim expressions under truly concurrent writers.
  *
  * Opt-in: runs only when DYNAMODB_LOCAL_ENDPOINT points at a DynamoDB Local (e.g.

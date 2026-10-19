@@ -1,5 +1,5 @@
 /**
- * Hot-lead auto-call, end to end (ENG-2271 WP8): the call itself. Everything of ours is real: dispatchLeadCreated,
+ * Hot-lead auto-call, end to end (ENG-2271): the call itself. Everything of ours is real: dispatchLeadCreated,
  * the orchestrator and its gates, the limit reservation, the LeadCallStore (on an in-memory fake of the crmDb
  * primitives), the express webhook router with its guard sequence, the TwiML builders and recordCallUsage.
  * Only the outside world is faked: Twilio (a strict FakeVoiceProvider whose signature check is Twilio's own

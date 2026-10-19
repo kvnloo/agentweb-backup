@@ -26,7 +26,7 @@
  *   -> finished (last leg's final /status).
  * A terminal record can no longer be written, so a leg is metered (meteredLegs) while the record is still
  * live, and the LAST leg to be metered performs the terminal transition. If a leg's final callback never
- * arrives the record stays non-terminal: WP6/ops needs a cleanup for records stuck in bridging/connected
+ * arrives the record stays non-terminal: records stuck in bridging/connected need an ops cleanup
  * (no cron is added here).
  *
  * Decisions that do not change `state` (owner declined, lead did not answer) are made once through marker

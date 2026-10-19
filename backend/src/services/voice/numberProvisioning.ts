@@ -7,7 +7,7 @@ import { getVoiceProvider, VoiceCallError } from './voiceProvider';
 import { isConditionalFailure, unchangedSince } from './setupWrites';
 
 /**
- * Caller-number provisioning for the hot-lead auto-call (ENG-2271 WP7): one Twilio number per org.
+ * Caller-number provisioning for the hot-lead auto-call (ENG-2271): one Twilio number per org.
  *
  * Buying and releasing are non-idempotent account changes, so every path that can leave a number billed
  * but unrecorded ("orphan") is either compensated (released again) or logged for ops with the number SID.

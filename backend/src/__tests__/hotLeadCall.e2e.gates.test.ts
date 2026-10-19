@@ -1,5 +1,5 @@
 /**
- * Hot-lead auto-call, end to end (ENG-2271 WP8): everything that must stop a call before it is dialed (kill
+ * Hot-lead auto-call, end to end (ENG-2271): everything that must stop a call before it is dialed (kill
  * switch, config, quiet hours, staleness, dedupe, cooldown, caps, unsafe ids) and the silent refusals. Same real
  * pieces and fakes as hotLeadCall.e2e.test.ts, via helpers/hotLeadCallE2eWorld.
  */

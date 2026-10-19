@@ -1,5 +1,5 @@
 /**
- * In-memory stand-in for the crmDb/userDb/orgDb primitives the hot-lead call touches (ENG-2271 WP8), so the REAL
+ * In-memory stand-in for the crmDb/userDb/orgDb primitives the hot-lead call touches (ENG-2271), so the REAL
  * LeadCallStore, orchestrator and webhooks run on top of it. Imports nothing from services/: the test's
  * jest.mock('../services/db') factory loads this module, and a service import here would be circular.
  *

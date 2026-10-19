@@ -1,5 +1,5 @@
 /**
- * Shared world for the hot-lead call end-to-end tests (ENG-2271 WP8). A test file declares the jest.mock calls
+ * Shared world for the hot-lead call end-to-end tests (ENG-2271). A test file declares the jest.mock calls
  * (they must be hoisted in the file that owns them), then calls installWorld() once at the top level.
  *
  * Mock contract the test files provide:
