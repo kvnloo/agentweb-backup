@@ -407,6 +407,54 @@ describe('agentToolGatewayService', () => {
         });
       });
 
+      describe('evaluate IIFE / bare expression wrap (ENG-2572)', () => {
+        // Live repros (Dev-AW-LoopEvents 2026-10-14..18): "TypeError: result is not a function".
+        const evaluateSchema = {
+          type: 'object',
+          properties: { function: { type: 'string' }, element: { type: 'string' }, ref: { type: 'string' } },
+          required: ['function'],
+        };
+        const run = (fn: string) => validateAndRepairToolArgs({
+          toolName: 'playwright_browser_evaluate',
+          args: { function: fn },
+          inputSchema: evaluateSchema,
+          effect: 'read',
+        });
+
+        it.each([
+          ['(() => {\n  return { title: document.title };\n})()', '() => ((() => {\n  return { title: document.title };\n})())'],
+          ['JSON.stringify({ url: window.location.href })', '() => (JSON.stringify({ url: window.location.href }))'],
+          ['document.title;', '() => (document.title)'],
+        ])('wraps %s', (input, expected) => {
+          const result = run(input);
+          expect(result.args).toEqual({ function: expected });
+          expect(result.repairs).toContain('function:wrap_expression');
+        });
+
+        it.each([
+          '() => document.title',
+          'async () => { return 1; }',
+          '(el) => el.textContent',
+          'el => el.textContent',
+          'function () { return 1; }',
+          'async function f() { return 1; }',
+        ])('leaves function source %s unchanged', (fn) => {
+          const result = run(fn);
+          expect(result.args).toEqual({ function: fn });
+          expect(result.repairs).not.toContain('function:wrap_expression');
+        });
+
+        it('does not touch other tools', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'other_tool',
+            args: { function: 'JSON.stringify(1)' },
+            inputSchema: evaluateSchema,
+            effect: 'read',
+          });
+          expect(result.args).toEqual({ function: 'JSON.stringify(1)' });
+        });
+      });
+
       describe('number/boolean -> string (ENG-2472)', () => {
         // Repro from live telemetry: call_hubspot_api {"list_id":17} rejected with
         // 'Argument "list_id" has the wrong type. Expected string.' three times in a row.

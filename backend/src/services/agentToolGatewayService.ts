@@ -840,6 +840,25 @@ function repairHubSpotListIdFromQuery(
   return 'query->list_id';
 }
 
+// ENG-2572: playwright_browser_evaluate calls the value of `function`. Models often send an
+// IIFE (`(() => {...})()`) or a bare expression (`JSON.stringify({...})`), which Playwright
+// evaluates and then fails on with "TypeError: result is not a function". Wrap those
+// values in a zero-arg arrow. Values that are already function sources are left unchanged.
+const FUNCTION_SOURCE_RE = /^(?:async\s+)?(?:function\b|\([^()]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)/;
+
+export function repairEvaluateFunctionArg(
+  toolName: string,
+  args: Record<string, unknown>,
+): string | null {
+  if (toolName !== 'playwright_browser_evaluate') return null;
+  const value = args.function;
+  if (typeof value !== 'string') return null;
+  const source = value.trim();
+  if (!source || FUNCTION_SOURCE_RE.test(source)) return null;
+  args.function = `() => (${source.replace(/;\s*$/, '')})`;
+  return 'function:wrap_expression';
+}
+
 export function validateAndRepairToolArgs(
   input: AgentToolContractValidationInput,
 ): AgentToolContractValidationResult {
@@ -1002,6 +1021,9 @@ export function validateAndRepairToolArgs(
       repairs.push(`${aliasSource}->${name}`);
     }
   }
+
+  const evaluateRepair = repairEvaluateFunctionArg(input.toolName, repairedArgs);
+  if (evaluateRepair) repairs.push(evaluateRepair);
 
   for (const name of required) {
     if (isMissingRequiredValue(repairedArgs[name], properties[name])) {
