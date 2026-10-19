@@ -19,6 +19,9 @@ import {
 } from '../mcp/zomaOnboarding';
 
 const NOW = 1_800_000_000_000;
+const NO_CARD = { hasPaymentMethod: false, customerId: null, card: null, isZoma: false };
+const CARD = { hasPaymentMethod: true, customerId: 'cus_zoma', card: { brand: 'visa', last4: '0159' }, isZoma: true };
+const paid = () => jest.fn().mockResolvedValue(CARD);
 const metaAccount = (over: any = {}) => ({
   platform: 'meta',
   account_id: 'act_111',
@@ -30,9 +33,9 @@ function deps(over: Partial<ZomaOnboardingDeps> = {}): ZomaOnboardingDeps & Reco
   return {
     getUser: jest.fn().mockResolvedValue({ userId: 'u1', email: 'a@b.co' }),
     listAccounts: jest.fn().mockResolvedValue([]),
-    findCustomerIdsByUserId: jest.fn().mockResolvedValue([]),
+    findLiveCustomerId: jest.fn(async (user: any) => user?.stripe_customer_id ?? null),
     createCustomerForUser: jest.fn().mockResolvedValue('cus_new'),
-    customerHasPaymentMethod: jest.fn().mockResolvedValue(false),
+    resolvePaymentMethod: jest.fn().mockResolvedValue(NO_CARD),
     createPaymentMethodSetupSession: jest.fn().mockResolvedValue({ url: 'https://checkout.stripe.com/c/pay/cs_setup' }),
     buildMetaConnectUrl: jest.fn().mockResolvedValue('https://www.facebook.com/v23.0/dialog/oauth?client_id=x'),
     frontendUrl: () => 'https://app.agentweb.pro',
@@ -64,11 +67,8 @@ describe('ENG-2303 zoma_status onboarding', () => {
     expect((d.createPaymentMethodSetupSession as jest.Mock).mock.calls[0][0].stripeCustomerId).toBe('cus_old');
   });
 
-  it('payment method found live on a searched customer -> paid; missing Meta -> Meta connect link', async () => {
-    const d = deps({
-      findCustomerIdsByUserId: jest.fn().mockResolvedValue(['cus_zoma']),
-      customerHasPaymentMethod: jest.fn(async (id: string) => id === 'cus_zoma'),
-    });
+  it('payment method found live by the resolver -> paid; missing Meta -> Meta connect link', async () => {
+    const d = deps({ resolvePaymentMethod: paid() });
     const r = await getZomaReadiness('u1', d);
     expect(r.payment.ready).toBe(true);
     expect(d.createPaymentMethodSetupSession).not.toHaveBeenCalled();
@@ -80,7 +80,8 @@ describe('ENG-2303 zoma_status onboarding', () => {
 
   it('expired or revoked Meta connections are not usable', async () => {
     const d = deps({
-      getUser: jest.fn().mockResolvedValue({ userId: 'u1', has_payment_method: true }),
+      getUser: jest.fn().mockResolvedValue({ userId: 'u1' }),
+      resolvePaymentMethod: paid(),
       listAccounts: jest.fn().mockResolvedValue([
         metaAccount({ token_expires_at: NOW - 1 }),
         metaAccount({ ads_scope_revoked_at: '2026-01-01' }),
@@ -92,7 +93,8 @@ describe('ENG-2303 zoma_status onboarding', () => {
 
   it('fully set up -> no next step, writes enabled, no Stripe objects minted', async () => {
     const d = deps({
-      getUser: jest.fn().mockResolvedValue({ userId: 'u1', email: 'a@b.co', has_payment_method: true }),
+      getUser: jest.fn().mockResolvedValue({ userId: 'u1', email: 'a@b.co' }),
+      resolvePaymentMethod: paid(),
       listAccounts: jest.fn().mockResolvedValue([metaAccount()]),
     });
     const r: any = await runZomaTool('zoma_status', {}, { userId: 'u1' }, d);
@@ -107,7 +109,7 @@ describe('ENG-2303 zoma_status onboarding', () => {
 
   it('a Stripe outage fails closed (not ready, no throw, no link)', async () => {
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    const d = deps({ findCustomerIdsByUserId: jest.fn().mockRejectedValue(new Error('stripe down')) });
+    const d = deps({ resolvePaymentMethod: jest.fn().mockRejectedValue(new Error('stripe down')) });
     const r = await getZomaReadiness('u1', d);
     expect(r.payment.ready).toBe(false);
     expect(r.payment.link).toBeUndefined();
@@ -123,18 +125,31 @@ describe('ENG-2303 write readiness gate', () => {
   });
 
   it('refuses without a usable Meta connection', async () => {
-    const d = deps({ getUser: jest.fn().mockResolvedValue({ userId: 'u1', has_payment_method: true }) });
+    const d = deps({ resolvePaymentMethod: paid() });
     await expect(assertZomaWriteReady('u1', d)).rejects.toThrow(ZomaNotReadyError);
   });
 
   it('refuses when the payment state cannot be read', async () => {
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    const d = deps({ findCustomerIdsByUserId: jest.fn().mockRejectedValue(new Error('x')), listAccounts: jest.fn().mockResolvedValue([metaAccount()]) });
+    const d = deps({ resolvePaymentMethod: jest.fn().mockRejectedValue(new Error('x')), listAccounts: jest.fn().mockResolvedValue([metaAccount()]) });
     await expect(assertZomaWriteReady('u1', d)).rejects.toThrow(/Could not verify a payment method/);
   });
 
+  it('ENG-2571: a stale has_payment_method flag alone never makes the user ready (checked live)', async () => {
+    const d = deps({
+      getUser: jest.fn().mockResolvedValue({ userId: 'u1', email: 'a@b.co', has_payment_method: true }),
+      listAccounts: jest.fn().mockResolvedValue([metaAccount()]),
+    });
+    const r = await getZomaReadiness('u1', d);
+    expect(r.payment.ready).toBe(false);
+    expect(r.writes_enabled).toBe(false);
+    expect(d.resolvePaymentMethod).toHaveBeenCalledWith(expect.objectContaining({ has_payment_method: true }), 'u1');
+    await expect(assertZomaWriteReady('u1', d)).rejects.toThrow(/No payment method on file/);
+  });
+
   it('passes with payment method + usable Meta and never mints Stripe objects', async () => {
-    const d = deps({ getUser: jest.fn().mockResolvedValue({ userId: 'u1', has_payment_method: true }), listAccounts: jest.fn().mockResolvedValue([metaAccount()]) });
+    const d = deps({ getUser: jest.fn().mockResolvedValue({ userId: 'u1' }),
+      resolvePaymentMethod: paid(), listAccounts: jest.fn().mockResolvedValue([metaAccount()]) });
     await expect(assertZomaWriteReady('u1', d)).resolves.toBeUndefined();
     expect(d.createCustomerForUser).not.toHaveBeenCalled();
     expect(d.createPaymentMethodSetupSession).not.toHaveBeenCalled();

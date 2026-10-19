@@ -237,6 +237,17 @@ export function isSetupModeCheckoutSession(session: any): boolean {
 
 export const ZOMA_PAYMENT_METHOD_PURCHASE_TYPE = 'zoma_payment_method';
 
+/** ENG-2571: what `resolveUserPaymentMethod` found. `customerId` never leaves the backend. */
+/** The user-row fields the ENG-2571 customer lookup reads. */
+export type CustomerCandidateUser = { stripe_customer_id?: string | null; email?: string | null } | null | undefined;
+
+export interface UserPaymentMethod {
+  hasPaymentMethod: boolean;
+  customerId: string | null;
+  card: { brand: string; last4: string } | null;
+  isZoma: boolean;
+}
+
 /**
  * Stripe Service — wraps Stripe SDK calls with validation.
  */
@@ -375,22 +386,103 @@ export const stripeService = {
     return result.data.map((c) => c.id);
   },
 
+  /**
+   * ENG-2571 — the customer, or null when Stripe says it is deleted or does not exist
+   * (`resource_missing`: a stale id on the user row, or a deleted id still in the lagging
+   * search index). Every other Stripe error throws.
+   */
+  async retrieveLiveCustomer(customerId: string, params?: Stripe.CustomerRetrieveParams): Promise<Stripe.Customer | null> {
+    const s = getStripeOrThrow();
+    try {
+      const customer = await s.customers.retrieve(customerId, params);
+      return (customer as Stripe.DeletedCustomer).deleted ? null : (customer as Stripe.Customer);
+    } catch (error: any) {
+      if (error?.code === 'resource_missing' || error?.statusCode === 404) return null;
+      throw error;
+    }
+  },
+
+  /**
+   * ENG-2571 — the user row's `stripe_customer_id` first, then this user's customers by email,
+   * then customers found by `metadata.userId`. Search lags new customers by up to a minute, so
+   * a card saved through Zoma's setup Checkout would read as "no card" right as the user lands
+   * back on Settings; the email list is consistent, and Zoma always creates with the email.
+   * Email matches count only when they carry this `metadata.userId`.
+   */
+  async customerCandidateIds(user: CustomerCandidateUser, userId: string): Promise<string[]> {
+    const ids = new Set<string>();
+    if (typeof user?.stripe_customer_id === 'string' && user.stripe_customer_id) ids.add(user.stripe_customer_id);
+    if (typeof user?.email === 'string' && user.email) {
+      const byEmail = await getStripeOrThrow().customers.list({ email: user.email, limit: 10 });
+      for (const c of byEmail.data) if (c.metadata?.userId === userId) ids.add(c.id);
+    }
+    for (const id of await stripeService.findCustomerIdsByUserId(userId)) ids.add(id);
+    return [...ids];
+  },
+
+  /** ENG-2571 — the first candidate customer that still exists in Stripe, or null. */
+  async findLiveCustomerIdForUser(user: CustomerCandidateUser, userId: string): Promise<string | null> {
+    // The row's own customer first, so a live one never waits on (or fails with) discovery.
+    const rowId = typeof user?.stripe_customer_id === 'string' && user.stripe_customer_id ? user.stripe_customer_id : null;
+    if (rowId && (await stripeService.retrieveLiveCustomer(rowId))) return rowId;
+    for (const id of await stripeService.customerCandidateIds(user, userId)) {
+      if (id === rowId) continue;
+      if (await stripeService.retrieveLiveCustomer(id)) return id;
+    }
+    return null;
+  },
+
   async createCustomerForUser(userId: string, email: string | undefined): Promise<string> {
     if (!userId) throw new Error('userId is required');
     const s = getStripeOrThrow();
-    // The idempotency key collapses rapid repeat calls (customer search is eventually consistent).
-    const customer = await s.customers.create(
-      { email, metadata: { userId, source: 'zoma_mcp' } },
-      { idempotencyKey: `zoma-customer-${userId}` },
-    );
-    return customer.id;
+    // The idempotency key collapses rapid repeat calls (customer search is eventually
+    // consistent), but Stripe replays it for 24h, including after the customer is deleted
+    // (ENG-2571). So a replayed customer that is gone chains to a key derived from its id:
+    // concurrent callers that both see the same deleted customer still share one key and
+    // dedupe, and a deletion never blocks minting a new link.
+    let idempotencyKey = `zoma-customer-${userId}`;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const customer = await s.customers.create({ email, metadata: { userId, source: 'zoma_mcp' } }, { idempotencyKey });
+      if (await stripeService.retrieveLiveCustomer(customer.id)) return customer.id;
+      idempotencyKey = `zoma-customer-${userId}-after-${customer.id}`;
+    }
+    throw new Error(`Could not create a live Stripe customer for user ${userId}: every replayed customer is deleted.`);
   },
 
-  async customerHasPaymentMethod(stripeCustomerId: string): Promise<boolean> {
-    if (!stripeCustomerId) return false;
+  /**
+   * ENG-2571 — the single answer to "does this user have a payment method, and where".
+   * Candidates are the user row's `stripe_customer_id` plus every customer carrying
+   * `metadata.userId` (Zoma's setup Checkout never touches the user row). Deleted or unknown
+   * candidates are skipped (`retrieveLiveCustomer`). The first live
+   * candidate with a payment method wins. `isZoma` means that customer completed Zoma's setup
+   * Checkout (a succeeded SetupIntent tagged ZOMA_PAYMENT_METHOD_PURCHASE_TYPE). Stripe errors
+   * propagate: callers decide how to report an unknown state, never "no card".
+   */
+  async resolveUserPaymentMethod(
+    user: CustomerCandidateUser,
+    userId: string,
+  ): Promise<UserPaymentMethod> {
     const s = getStripeOrThrow();
-    const methods = await s.paymentMethods.list({ customer: stripeCustomerId, limit: 1 });
-    return methods.data.length > 0;
+    for (const customerId of await stripeService.customerCandidateIds(user, userId)) {
+      const customer = await stripeService.retrieveLiveCustomer(customerId, { expand: ['invoice_settings.default_payment_method'] });
+      if (!customer) continue;
+      const methods = (await s.paymentMethods.list({ customer: customerId, limit: 100 })).data;
+      if (methods.length === 0) continue;
+
+      const defaultPm = customer.invoice_settings?.default_payment_method;
+      const newestCard = methods.filter((m) => m.type === 'card' && m.card).sort((a, b) => b.created - a.created)[0];
+      const cardPm = typeof defaultPm === 'object' && defaultPm?.card ? defaultPm : newestCard;
+      const setupIntents = (await s.setupIntents.list({ customer: customerId, limit: 100 })).data;
+      return {
+        hasPaymentMethod: true,
+        customerId,
+        card: cardPm?.card ? { brand: cardPm.card.brand, last4: cardPm.card.last4 } : null,
+        isZoma: setupIntents.some(
+          (si) => si.status === 'succeeded' && si.metadata?.purchaseType === ZOMA_PAYMENT_METHOD_PURCHASE_TYPE,
+        ),
+      };
+    }
+    return { hasPaymentMethod: false, customerId: null, card: null, isZoma: false };
   },
 
   /** Stripe-hosted Checkout in setup mode: saves a card, charges nothing. */
@@ -412,6 +504,7 @@ export const stripeService = {
       cancel_url: params.cancelUrl,
       metadata,
       setup_intent_data: { metadata },
+      custom_text: { submit: { message: 'Saving a card lets Zoma make changes to your ads. Nothing is charged today.' } },
     });
   },
 
