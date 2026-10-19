@@ -840,6 +840,49 @@ function repairHubSpotListIdFromQuery(
   return 'query->list_id';
 }
 
+// ENG-2572: playwright_browser_evaluate calls the value of `function`. Models often send an
+// IIFE (`(() => {...})()`) or a bare expression (`JSON.stringify({...})`), which Playwright
+// evaluates and then fails on with "TypeError: result is not a function". Wrap those
+// values in a zero-arg arrow. Values that are already function sources are left unchanged.
+const FUNCTION_SOURCE_RE = /^(?:async\s+)?(?:function\b|[A-Za-z_$][\w$]*\s*=>)/;
+
+// Arrow functions whose parameter list nests parens/brackets, e.g.
+// `async (x = Promise.resolve(1)) => x`, need a balanced scan, not a regex.
+function isParenArrowFunctionSource(source: string): boolean {
+  const body = source.replace(/^async\s*/, '');
+  if (!body.startsWith('(')) return false;
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (quote) {
+      if (ch === '\\') i++;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') quote = ch;
+    else if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') {
+      depth--;
+      if (depth === 0) return /^\s*=>/.test(body.slice(i + 1));
+    }
+  }
+  return false;
+}
+
+export function repairEvaluateFunctionArg(
+  toolName: string,
+  args: Record<string, unknown>,
+): string | null {
+  if (toolName !== 'playwright_browser_evaluate') return null;
+  const value = args.function;
+  if (typeof value !== 'string') return null;
+  const source = value.trim();
+  if (!source || FUNCTION_SOURCE_RE.test(source) || isParenArrowFunctionSource(source)) return null;
+  args.function = `() => (${source.replace(/;\s*$/, '')})`;
+  return 'function:wrap_expression';
+}
+
 export function validateAndRepairToolArgs(
   input: AgentToolContractValidationInput,
 ): AgentToolContractValidationResult {
@@ -862,6 +905,13 @@ export function validateAndRepairToolArgs(
   const repairs: string[] = [];
 
   if (!schema || schema.type !== 'object') {
+    // ENG-2572: the playwright evaluate repair must not depend on a resolved
+    // schema — MCP tools often arrive here with no inputSchema.
+    if (input.args && typeof input.args === 'object' && !Array.isArray(input.args)) {
+      const evalArgs: Record<string, unknown> = { ...(input.args as Record<string, unknown>) };
+      const evalRepair = repairEvaluateFunctionArg(input.toolName, evalArgs);
+      if (evalRepair) return { status: 'repaired', args: evalArgs, issues, repairs: [evalRepair] };
+    }
     return { status: 'valid', args: input.args, issues, repairs };
   }
 
@@ -1002,6 +1052,9 @@ export function validateAndRepairToolArgs(
       repairs.push(`${aliasSource}->${name}`);
     }
   }
+
+  const evaluateRepair = repairEvaluateFunctionArg(input.toolName, repairedArgs);
+  if (evaluateRepair) repairs.push(evaluateRepair);
 
   for (const name of required) {
     if (isMissingRequiredValue(repairedArgs[name], properties[name])) {
