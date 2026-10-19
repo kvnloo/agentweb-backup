@@ -9634,9 +9634,11 @@ lists and list entries, mirroring call_hubspot_api's CONTACT_LIST actions.
 
 ENTITY_TYPE + ACTION MATRIX:
 
-  LIST_ENTRIES → COUNT (list_id) | ADD_ENTRIES (list_id, record_ids) | REMOVE_ENTRIES (list_id, record_ids)
+  LIST_ENTRIES → COUNT (list_id) | LIST (list_id, offset?) | ADD_ENTRIES (list_id, record_ids) | REMOVE_ENTRIES (list_id, record_ids)
                Entry-level actions scoped to one already-identified list.
                COUNT returns the number of entries (e.g. for CPL = spend / count).
+               LIST returns one page of entries (entryId, recordId, values);
+               pass the returned next_offset as offset for the next page.
                ADD_ENTRIES adds Attio Person record ids to the list.
                REMOVE_ENTRIES removes Person record ids from the list (looks up
                each person's entry in the list and deletes it).
@@ -9652,8 +9654,9 @@ ENTITY_TYPE + ACTION MATRIX:
       properties: {
         entity_type: { type: 'string', enum: ['LIST_ENTRIES', 'LISTS'], description: 'Attio resource to operate on.' },
         action:      { type: 'string', enum: ['COUNT', 'ADD_ENTRIES', 'REMOVE_ENTRIES', 'LIST', 'GET', 'CREATE'], description: 'Action to perform. See ACTION MATRIX.' },
-        list_id:     { type: 'string', description: 'Required for LIST_ENTRIES COUNT/ADD_ENTRIES/REMOVE_ENTRIES and LISTS GET. For LIST_ENTRIES actions, pass the AgentWeb lead list\'s id (e.g. from get_lead_lists/get_lead_details) — it is automatically resolved to that list\'s connected Attio deal-list id; a raw Attio list id also works. For LISTS actions, always a raw Attio list id (e.g. from LISTS LIST) — never an AgentWeb list id.' },
+        list_id:     { type: 'string', description: 'Required for LIST_ENTRIES COUNT/LIST/ADD_ENTRIES/REMOVE_ENTRIES and LISTS GET. For LIST_ENTRIES actions, pass the AgentWeb lead list\'s id (e.g. from get_lead_lists/get_lead_details) — it is automatically resolved to that list\'s connected Attio deal-list id; a raw Attio list id also works. For LISTS actions, always a raw Attio list id (e.g. from LISTS LIST) — never an AgentWeb list id.' },
         record_ids:  { type: 'array', items: { type: 'string' }, maxItems: 100, description: 'Attio record ids (Person or Company, matching the target list). Required for LIST_ENTRIES ADD_ENTRIES/REMOVE_ENTRIES. Max 100 per call.' },
+        offset:      { type: 'integer', description: 'LIST_ENTRIES LIST only: page offset; pass next_offset from the previous page.' },
         name:        { type: 'string', description: 'List display name. Required for LISTS CREATE.' },
         object_type: { type: 'string', enum: ['people', 'companies'], description: 'What kind of records the new list holds. LISTS CREATE only. Defaults to "people".' },
         account_id:  { type: 'string', description: 'Attio account ID. Required when the user has multiple Attio accounts connected — the error message will list them; ask the user which to use.' },
