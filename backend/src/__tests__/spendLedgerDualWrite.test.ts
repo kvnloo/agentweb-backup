@@ -20,7 +20,7 @@ import {
   resolveRateProvenance,
 } from '../services/spendLedgerDualWrite';
 import { recordSpendEvent } from '../services/spendEventDb';
-import { VENDOR_RATE_CARD_VERSION } from '../utils/vendorRateCard';
+import { VENDOR_RATE_CARD_VERSION, setVendorRateOverridesForTests } from '../utils/vendorRateCard';
 
 const mockRecord = recordSpendEvent as jest.Mock;
 const AT = '2026-09-07T10:00:00.000Z';
@@ -147,6 +147,32 @@ describe('spendLedgerDualWrite', () => {
     it('stamps the card version when the card can price it', () => {
       expect(resolveRateProvenance('you.com', 'query')).toBe(VENDOR_RATE_CARD_VERSION);
       expect(resolveRateProvenance('apollo', 'email_reveal')).toBe(VENDOR_RATE_CARD_VERSION);
+    });
+
+    it('stamps the override version when an admin override priced the unit', () => {
+      setVendorRateOverridesForTests({ twilio: { voice_minute_outbound: 0.02 } }, '2026-11-01T00:00:00.000Z');
+      try {
+        expect(resolveRateProvenance('twilio', 'voice_minute_outbound'))
+          .toBe(`${VENDOR_RATE_CARD_VERSION}+ovr:2026-11-01T00:00:00.000Z`);
+        expect(resolveRateProvenance('twilio', 'number_monthly_rent')).toBe(VENDOR_RATE_CARD_VERSION);
+      } finally {
+        setVendorRateOverridesForTests(null);
+      }
+    });
+
+    it('prefers the version the caller priced with over a fresh lookup', () => {
+      // The override changed between pricing and mirroring: the event must carry the version of
+      // the rate that produced its amount.
+      setVendorRateOverridesForTests({ twilio: { voice_minute_outbound: 0.02 } }, '2026-11-02T00:00:00.000Z');
+      try {
+        const built = buildShadowEvent(
+          anInput({ provider: 'twilio', operation: 'voice_minute_outbound', rateCardVersion: VENDOR_RATE_CARD_VERSION }),
+          AT,
+        ) as { event: any };
+        expect(built.event.rateCardVersion).toBe(VENDOR_RATE_CARD_VERSION);
+      } finally {
+        setVendorRateOverridesForTests(null);
+      }
     });
 
     it('does NOT claim the card priced X/Twitter, which it deliberately excludes', () => {
