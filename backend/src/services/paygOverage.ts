@@ -66,8 +66,9 @@ export interface PaygOverageSettings {
    */
   poolHighWater?: { month: string; thresholdMicroUsd: number };
   /**
-   * Overage already standing when the owner turned PAYG on (off -> on), in `month` (UTC `YYYY-MM`).
+   * Overage already standing when the owner FIRST turned PAYG on (off -> on) in `month` (UTC `YYYY-MM`).
    * Only usage AFTER opting in is ever overage: this is subtracted for that month and ignored after it.
+   * Re-enabling later in the same month keeps it (never re-measured), so toggling cannot reset the cap.
    * Covers what the high-water mark cannot — a downgrade that happened BEFORE opting in, when no mark
    * was being kept.
    */

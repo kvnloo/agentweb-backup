@@ -113,8 +113,9 @@ export async function getPaygOverageView(userId: string): Promise<PaygOverageVie
  * Consent to be billed is the customer's own. A delegated admin (acting AS the customer) may only
  * reduce exposure — turn PAYG off or lower the cap — never turn it on or raise the cap.
  *
- * Only usage AFTER opting in is overage: turning PAYG on records the overage already standing at that
- * moment (`optIn`), and the gates subtract it for the rest of that month.
+ * Only usage AFTER opting in is overage: the month's FIRST off -> on records the overage already standing
+ * at that moment (`optIn`), and the gates subtract it for the rest of that month. Re-enabling within the
+ * same month keeps that baseline, so the cap stays a true per-month cap that toggling cannot reset.
  */
 export async function updatePaygOverage(input: {
   userId: string;
@@ -165,12 +166,17 @@ export async function updatePaygOverage(input: {
       throw new PaygOverageRequestError(404, 'payg_unavailable', 'This plan has no usage pool to go past');
     }
     const month = getCurrentUsageMonth();
-    const poolMicroUsd = paygOverageThresholdMicroUsd({
-      effectiveHardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd,
-      poolHighWater: existing?.poolHighWater,
-      month,
-    });
-    optIn = { month, overageBaselineMicroUsd: paygGrossOverageMicroUsd(usage.costUsedMicroUsd, poolMicroUsd) };
+    // The baseline is taken ONLY on the month's first opt-in. Re-enabling later in the same month keeps
+    // it: re-measuring would zero the overage already run up since the first opt-in, so toggling PAYG
+    // off and on would reset the cap. A new month starts with no baseline (the gates ignore a stale one).
+    if (existing?.optIn?.month !== month) {
+      const poolMicroUsd = paygOverageThresholdMicroUsd({
+        effectiveHardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd,
+        poolHighWater: existing?.poolHighWater,
+        month,
+      });
+      optIn = { month, overageBaselineMicroUsd: paygGrossOverageMicroUsd(usage.costUsedMicroUsd, poolMicroUsd) };
+    }
     await requireLivePaymentMethod(context.billingUser);
   }
 
