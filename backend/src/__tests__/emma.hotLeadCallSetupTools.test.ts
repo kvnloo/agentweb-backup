@@ -14,6 +14,7 @@ import '../emma/hotLeadCallTools';
 import '../emma/hotLeadCallSetupTools';
 import { FakeVoiceProvider } from '../services/voice/fakeVoiceProvider';
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
+import { getRecordingUnit } from '../utils/vendorRateCard';
 import { verificationTwiml } from '../services/voice/destinationVerification';
 import { SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS } from '../services/agentMode/core/toolDispatch';
 
@@ -81,6 +82,7 @@ function installOrgDb() {
   });
 }
 
+const wrongCode = (code: string) => (code === '000000' ? '000001' : '000000');
 const codeFromCall = (index = 0) => {
   const twiml = (fake.placedCalls[index] as { twiml: string }).twiml;
   return /code is ((?:\d ){5}\d)\./.exec(twiml)![1].replace(/ /g, '');
@@ -152,6 +154,13 @@ describe('permissions and registration', () => {
     await expect(start()).resolves.toMatchObject({ success: true });
     expect(isHotLeadCallEnabled).not.toHaveBeenCalled();
   });
+  it('describes confirm as advisory, the cost without a hard-coded price, and the irreversible release', () => {
+    const buy = handlers.get('provision_hot_lead_call_number')!.definition.description;
+    expect(buy).toMatch(/confirm is advisory/);
+    expect(buy).not.toMatch(/1\.15/);
+    expect(handlers.get('release_hot_lead_call_number')!.definition.description).toMatch(/cannot be recovered/);
+    expect(handlers.get('start_hot_lead_call_verification')!.definition.description).toMatch(/voicemail.*Twilio call log/);
+  });
   it('does not expose the system fields or a destination argument on any setup tool', () => {
     for (const name of SETUP_TOOLS) {
       const props = Object.keys(handlers.get(name)!.definition.inputSchema.properties);
@@ -184,8 +193,10 @@ describe('provision_hot_lead_call_number', () => {
     expect(org.hotLeadCall).toMatchObject({ twilioNumber: NEW_NUMBER, twilioNumberSid: NEW_SID, enabled: false, destinationPhone: '+14155550100' });
     expect(result).toMatchObject({ success: true, callerNumber: '***0123' });
     expect(JSON.stringify(result)).not.toMatch(/4155550123|\+1415|PN/);
-    expect(writes).toHaveLength(1);
-    expect(writes[0].condition!.expression).toBe('#previousHotLeadCall = :previousHotLeadCall');
+    expect(writes).toHaveLength(2);
+    expect(writes[0].updates.hotLeadCallProvisioning).toEqual({ purchases: [T0], releases: [] });
+    expect(writes[0].condition!.expression).toBe('attribute_not_exists(#previousHotLeadCallProvisioning) AND #previousHotLeadCall = :previousHotLeadCall');
+    expect(writes[1].condition!.expression).toBe('#previousHotLeadCall = :previousHotLeadCall');
     expect(recordVendorUsage).toHaveBeenCalledTimes(1);
     expect(recordVendorUsage).toHaveBeenCalledWith({
       userId: 'owner', provider: 'twilio', operation: 'number_monthly_rent', feature: 'hot_lead_call', unit: 'number_month',
@@ -205,51 +216,87 @@ describe('provision_hot_lead_call_number', () => {
     expect(org.hotLeadCall).toMatchObject({ destinationVerifiedAt: '2026-01-01T00:00:00.000Z', enabled: false });
   });
 
-  it('two racing provisions persist exactly one number and release the loser’s purchase', async () => {
+  it('two racing provisions reach Twilio once: the reservation is conditional, so the loser never buys', async () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
     fake.queueBuyNumberResult({ numberSid: NEW_SID_2, phoneNumber: NEW_NUMBER_2 });
     const results = await Promise.allSettled([provision(), provision()]);
     expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
-    const loser = results.find(r => r.status === 'rejected') as PromiseRejectedResult;
-    expect(loser.reason.message).toContain('released');
-    expect(fake.boughtNumbers).toHaveLength(2);
-    expect(fake.releasedNumbers).toEqual([org.hotLeadCall!.twilioNumberSid === NEW_SID ? NEW_SID_2 : NEW_SID]);
+    expect((results.find(r => r.status === 'rejected') as PromiseRejectedResult).reason.message).toContain('in progress');
+    expect(fake.boughtNumbers).toHaveLength(1);
+    expect(fake.releasedNumbers).toEqual([]);
+    expect(org.hotLeadCall!.twilioNumberSid).toBe(NEW_SID);
     expect(recordVendorUsage).toHaveBeenCalledTimes(1);
+  });
+  it('caps purchases at 2 per rolling 24h and a release/provision loop cannot get around it', async () => {
+    for (let i = 0; i < 2; i++) {
+      fake.queueBuyNumberResult({ numberSid: i ? NEW_SID_2 : NEW_SID, phoneNumber: i ? NEW_NUMBER_2 : NEW_NUMBER });
+      setTime(T0 + i * MIN);
+      await provision();
+      await release();
+    }
+    setTime(T0 + 5 * MIN);
+    await expect(provision()).rejects.toThrow('limit of 2 number purchases per day');
+    expect(fake.boughtNumbers).toHaveLength(2);
+    expect(org.hotLeadCallProvisioning!.purchases).toEqual([T0, T0 + MIN]);
+    setTime(T0 + 24 * 60 * MIN - 1);
+    await expect(provision()).rejects.toThrow('limit of 2');
+    fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
+    setTime(T0 + 24 * 60 * MIN);
+    await expect(provision()).resolves.toMatchObject({ success: true });
+    expect(fake.boughtNumbers).toHaveLength(3);
+  });
+  it('a failed purchase still uses a reservation, and a malformed history fails closed', async () => {
+    fake.failNextBuyNumber('no');
+    await expect(provision()).rejects.toThrow('nothing was bought');
+    expect(org.hotLeadCallProvisioning!.purchases).toEqual([T0]);
+    org.hotLeadCallProvisioning = { purchases: 'x', releases: [] } as never;
+    await expect(provision()).rejects.toThrow('Contact support');
+    expect(fake.boughtNumbers).toHaveLength(1);
+  });
+  it('takes the unit and the price text from the rate card', async () => {
+    fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
+    await expect(provision({})).rejects.toThrow(/\$1\.15 per month/);
+    await provision();
+    expect((recordVendorUsage as jest.Mock).mock.calls[0][0].unit).toBe(getRecordingUnit('twilio', 'number_monthly_rent'));
   });
   it('releases the purchase when a concurrent settings edit wins, and does not meter rent', async () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
-    beforeWrite = () => { org.hotLeadCall = configured({ maxCallsPerHour: 3 }); };
+    beforeWrite = i => { if (i === 1) org.hotLeadCall = configured({ maxCallsPerHour: 3 }); };
     await expect(provision()).rejects.toThrow('released');
     expect(fake.releasedNumbers).toEqual([NEW_SID]);
     expect(org.hotLeadCall).not.toHaveProperty('twilioNumberSid');
-    expect(recordVendorUsage).not.toHaveBeenCalled();
+    // The discarded purchase was still billed, so its rent is metered (idempotent per sid and month).
+    expect(recordVendorUsage).toHaveBeenCalledTimes(1);
+    expect(recordVendorUsage).toHaveBeenCalledWith(expect.objectContaining({ idempotencyKey: `twilio:number:${NEW_SID}:2026-10` }));
   });
   it('logs an ORPHAN (sid, no number) and tells the user to contact support when the loser cannot be released', async () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
     fake.failNextReleaseNumber('unknown');
-    beforeWrite = () => { org.hotLeadCall = configured({ maxCallsPerHour: 3 }); };
+    beforeWrite = i => { if (i === 1) org.hotLeadCall = configured({ maxCallsPerHour: 3 }); };
     await expect(provision()).rejects.toThrow('Contact support');
     const logged = allLogs();
     expect(logged).toContain(`ORPHAN number: org org-a sid ${NEW_SID}`);
     expect(logged).not.toContain('4155550123');
-    expect(recordVendorUsage).not.toHaveBeenCalled();
+    expect(recordVendorUsage).toHaveBeenCalledTimes(1);
   });
   it('treats an ambiguous write failure that actually landed as success (no release)', async () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
-    afterWriteThrows = new Error('socket hang up');
+    beforeWrite = i => { if (i === 1) afterWriteThrows = new Error('socket hang up'); };
     await expect(provision()).resolves.toMatchObject({ success: true });
     expect(fake.releasedNumbers).toEqual([]);
     expect(recordVendorUsage).toHaveBeenCalledTimes(1);
   });
   it('releases when an ambiguous write failure did not land', async () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
-    (orgDb.updateOrg as jest.Mock).mockRejectedValueOnce(new Error('socket hang up'));
+    beforeWrite = i => { if (i === 1) throw new Error('socket hang up'); };
     await expect(provision()).rejects.toThrow('released');
     expect(fake.releasedNumbers).toEqual([NEW_SID]);
+    // The ambiguity check must not read a stale replica.
+    expect(orgDb.getOrgById).toHaveBeenLastCalledWith('org-a', undefined, true);
   });
   it('does NOT release when it cannot tell whether the write landed, and logs the orphan risk', async () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
-    (orgDb.updateOrg as jest.Mock).mockRejectedValueOnce(new Error('socket hang up'));
+    beforeWrite = i => { if (i === 1) throw new Error('socket hang up'); };
     (orgDb.getOrgById as jest.Mock).mockResolvedValueOnce(clone(org)).mockRejectedValueOnce(new Error('db down'));
     await expect(provision()).rejects.toThrow('could not be confirmed');
     expect(fake.releasedNumbers).toEqual([]);
@@ -259,21 +306,21 @@ describe('provision_hot_lead_call_number', () => {
     fake.failNextBuyNumber('unknown', 'timeout');
     await expect(provision()).rejects.toThrow('Do not retry');
     expect(fake.boughtNumbers).toHaveLength(1);
-    expect(writes).toEqual([]);
+    expect(org.hotLeadCall).not.toHaveProperty('twilioNumberSid');
     expect(recordVendorUsage).not.toHaveBeenCalled();
     expect(allLogs()).toContain('ORPHAN RISK');
   });
   it('reports a definite rejection as nothing bought', async () => {
     fake.failNextBuyNumber('no', 'No voice-enabled number available for US/415');
     await expect(provision({ confirm: true, areaCode: '415' })).rejects.toThrow('nothing was bought or charged');
-    expect(writes).toEqual([]);
+    expect(org.hotLeadCall).not.toHaveProperty('twilioNumberSid');
     expect(recordVendorUsage).not.toHaveBeenCalled();
   });
   it('releases a purchased number that fails validation (here: equals the destination phone) instead of storing it', async () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: '+14155550100' });
     await expect(provision()).rejects.toThrow('was released');
     expect(fake.releasedNumbers).toEqual([NEW_SID]);
-    expect(writes).toEqual([]);
+    expect(org.hotLeadCall).not.toHaveProperty('twilioNumberSid');
   });
 });
 
@@ -286,8 +333,9 @@ describe('release_hot_lead_call_number', () => {
     const original = fake.releaseNumber.bind(fake);
     jest.spyOn(fake, 'releaseNumber').mockImplementation(async sid => { order.push('twilio'); return original(sid); });
     const result = await release();
-    expect(order).toEqual(['write', 'twilio', 'write']);
-    expect(writes[0].updates.hotLeadCall).toMatchObject({ enabled: false, twilioNumberSid: SID });
+    expect(order).toEqual(['write', 'write', 'twilio', 'write']);
+    expect(writes[0].updates.hotLeadCallProvisioning).toEqual({ purchases: [], releases: [T0] });
+    expect(writes[1].updates.hotLeadCall).toMatchObject({ enabled: false, twilioNumberSid: SID });
     expect(fake.releasedNumbers).toEqual([SID]);
     expect(org.hotLeadCall).toEqual(configured({ destinationVerifiedAt: '2026-01-01T00:00:00.000Z' }));
     expect(result).toMatchObject({ success: true, callerNumberReleased: true, callingEnabled: false });
@@ -316,20 +364,25 @@ describe('release_hot_lead_call_number', () => {
     expect(org.hotLeadCall).toMatchObject({ enabled: false });
     expect(org.hotLeadCall).not.toHaveProperty('twilioNumber');
   });
+  it('caps releases per day so a loop cannot hammer Twilio, and keeps the history after success', async () => {
+    org.hotLeadCallProvisioning = { purchases: [], releases: [1, 2, 3, 4, 5, 6].map(n => T0 - n) };
+    await expect(release()).rejects.toThrow('limit of 6 number releases per day');
+    expect(fake.releasedNumbers).toEqual([]);
+  });
   it('refuses when there is no number', async () => {
     org.hotLeadCall = configured();
     await expect(release()).rejects.toThrow('no caller number');
     expect(fake.releasedNumbers).toEqual([]);
   });
   it('re-reads and retries once when a settings edit lands during the final write', async () => {
-    beforeWrite = i => { if (i === 1) (org.hotLeadCall as Record<string, unknown>).maxCallsPerHour = 3; };
+    beforeWrite = i => { if (i === 2) (org.hotLeadCall as Record<string, unknown>).maxCallsPerHour = 3; };
     await release();
     expect(org.hotLeadCall).toMatchObject({ maxCallsPerHour: 3 });
     expect(org.hotLeadCall).not.toHaveProperty('twilioNumberSid');
   });
   it('gives up after a second conflict and leaves the sid so a retry (404) can finish', async () => {
     let bump = 3;
-    beforeWrite = i => { if (i >= 1) (org.hotLeadCall as Record<string, unknown>).maxCallsPerHour = bump++; };
+    beforeWrite = i => { if (i >= 2) (org.hotLeadCall as Record<string, unknown>).maxCallsPerHour = bump++; };
     await expect(release()).rejects.toThrow('Try again');
     expect(org.hotLeadCall).toHaveProperty('twilioNumberSid');
   });
@@ -374,7 +427,7 @@ describe('start_hot_lead_call_verification', () => {
     expect(output).not.toMatch(/4155550100|4155550111/);
     expect(allLogs()).not.toContain(code);
     expect(allLogs()).not.toMatch(/4155550100/);
-    await expect(confirm('000000' === code ? '000001' : '000000')).rejects.toThrow('not correct');
+    await expect(confirm(wrongCode(code))).rejects.toThrow('not correct');
     expect(allLogs()).not.toContain(code);
   });
   it('draws the code from crypto.randomInt and keeps leading zeros', async () => {
@@ -419,7 +472,7 @@ describe('start_hot_lead_call_verification', () => {
   it('a restart replaces the code and resets attempts, but not the rate history', async () => {
     await start();
     const first = codeFromCall(0);
-    await expect(confirm(first === '000000' ? '000001' : '000000')).rejects.toThrow('not correct');
+    await expect(confirm(wrongCode(first))).rejects.toThrow('not correct');
     setTime(T0 + 3 * MIN);
     await start();
     expect(org.hotLeadCallVerification).toMatchObject({ attempts: 0, startedAt: [T0, T0 + 3 * MIN], expiresAt: T0 + 13 * MIN });
@@ -460,7 +513,6 @@ describe('start_hot_lead_call_verification', () => {
 });
 
 describe('confirm_hot_lead_call_verification', () => {
-  const wrongCode = (code: string) => (code === '000000' ? '000001' : '000000');
   beforeEach(() => {
     org.hotLeadCall = withNumber({ enabled: false });
   });
@@ -471,7 +523,7 @@ describe('confirm_hot_lead_call_verification', () => {
     setTime(T0 + MIN);
     const result = await confirm(code);
     expect(org.hotLeadCall).toEqual(withNumber({ destinationVerifiedAt: new Date(T0 + MIN).toISOString() }));
-    expect(org).not.toHaveProperty('hotLeadCallVerification');
+    expect(org.hotLeadCallVerification).toEqual({ phone: '+14155550100', codeHash: null, expiresAt: 0, attempts: 0, startedAt: [T0] });
     expect(result).toMatchObject({ success: true, destinationVerified: true, destinationPhone: '***0100' });
     expect(JSON.stringify(result)).not.toMatch(/4155550100/);
     expect(JSON.stringify(result)).not.toContain(code);
@@ -491,6 +543,37 @@ describe('confirm_hot_lead_call_verification', () => {
     await start();
     await confirm(codeFromCall());
     await expect(run('update_hot_lead_call_settings', { enabled: true })).resolves.toMatchObject({ enabled: true, destinationVerified: true });
+  });
+  it('a confirm does not reset the start history: alternating phones cannot dodge the gap or the daily cap', async () => {
+    await start();
+    await confirm(codeFromCall());
+    setTime(T0 + MIN);
+    await expect(start()).rejects.toThrow('just placed');
+    const phones = ['+16475550123', '+14155550100'];
+    for (let i = 1; i <= 4; i++) {
+      setTime(T0 + 2 * i * MIN);
+      (org.hotLeadCall as Record<string, unknown>).destinationPhone = phones[i % 2];
+      delete (org.hotLeadCall as Record<string, unknown>).destinationVerifiedAt;
+      await start();
+      await confirm(codeFromCall(i));
+    }
+    (org.hotLeadCall as Record<string, unknown>).destinationPhone = '+16475550123';
+    setTime(T0 + 12 * MIN);
+    await expect(start()).rejects.toThrow('limit of 5');
+    expect(fake.placedCalls).toHaveLength(5);
+  });
+  it('a hash issued for one org or phone does not verify under another (the MAC binds both)', async () => {
+    await start();
+    const code = codeFromCall();
+    const record = clone(org.hotLeadCallVerification);
+    org.hotLeadCall = withNumber({ destinationPhone: '+16475550123' });
+    org.hotLeadCallVerification = { ...record, phone: '+16475550123' };
+    await expect(confirm(code)).rejects.toThrow('not correct');
+    org.hotLeadCall = withNumber();
+    org.hotLeadCallVerification = clone(record);
+    org.orgId = 'org-b';
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner', orgId: 'org-b', orgRole: 'owner' });
+    await expect(confirm(code)).rejects.toThrow('not correct');
   });
   it('needs a verification in progress, and a code cannot be replayed', async () => {
     await expect(confirm('123456')).rejects.toThrow('No verification is in progress');
