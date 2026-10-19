@@ -114,6 +114,13 @@ describe('secretsManager.getTwilioCredentials', () => {
     expect(errorSpy.mock.calls.flat().map(String).join(' ')).toContain('authToken');
   });
 
+  it('trims the stored values like the env path does', async () => {
+    mockGetSecretValue.mockResolvedValue({ SecretString: JSON.stringify({ accountSid: 'ACsmfake\n', authToken: ' sm-token\r\n' }) });
+
+    const { getTwilioCredentials } = await import('../utils/secretsManager');
+    await expect(getTwilioCredentials()).resolves.toStrictEqual({ accountSid: 'ACsmfake', authToken: 'sm-token' });
+  });
+
   it('never logs secret fragments when the secret is malformed JSON', async () => {
     mockGetSecretValue.mockResolvedValue({ SecretString: 'FAKE-LEAKY-TOKEN-123 is not json' });
 
@@ -122,9 +129,30 @@ describe('secretsManager.getTwilioCredentials', () => {
 
     const output = [...errorSpy.mock.calls, ...warnSpy.mock.calls].flat().map(String).join(' ');
     expect(output).toContain('SyntaxError');
-    expect(output).not.toContain('FAKE-LEAKY') // JSON.parse quotes the first ~10 chars;
+    // JSON.parse quotes only the first ~10 characters of the input in its message.
+    expect(output).not.toContain('FAKE-LEAKY');
     // No error object is passed to console either: its stack and message would carry the same text.
     expect([...errorSpy.mock.calls].flat().some((a) => typeof a === 'object')).toBe(false);
+  });
+
+  it.each([
+    ['a number accountSid', { accountSid: 123, authToken: 'tok' }, 'accountSid'],
+    ['an object authToken', { accountSid: 'ACfake', authToken: { x: 1 } }, 'authToken'],
+    ['a blank authToken', { accountSid: 'ACfake', authToken: '  ' }, 'authToken'],
+    ['a null accountSid', { accountSid: null, authToken: 'tok' }, 'accountSid'],
+  ])('fails closed when the secret has %s', async (_label, secret, field) => {
+    mockGetSecretValue.mockResolvedValue({ SecretString: JSON.stringify(secret) });
+
+    const { getTwilioCredentials } = await import('../utils/secretsManager');
+    await expect(getTwilioCredentials()).rejects.toThrow('Failed to fetch Twilio credentials');
+    expect(errorSpy.mock.calls.flat().map(String).join(' ')).toContain(field);
+  });
+
+  it.each([['null', 'null'], ['an array', '["a","b"]'], ['a string', '"tok"']])('fails closed when the secret JSON is %s', async (_l, raw) => {
+    mockGetSecretValue.mockResolvedValue({ SecretString: raw });
+
+    const { getTwilioCredentials } = await import('../utils/secretsManager');
+    await expect(getTwilioCredentials()).rejects.toThrow('Failed to fetch Twilio credentials');
   });
 
   it.each([['empty', ''], ['whitespace', '   ']])(

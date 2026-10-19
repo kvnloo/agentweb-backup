@@ -1293,14 +1293,7 @@ export interface TwilioCredentials {
   authToken: string;
 }
 
-/**
- * Get Twilio Voice credentials (ENG-2271). Same resolution rules as getWhatsAppCredentials:
- * the TWILIO_* env pair wins only when complete (never merged with the secret, so an account
- * sid from one environment cannot be paired with another's auth token); otherwise the secret
- * at dev/AgentWeb/Twilio (prod/... in production), cached with a TTL, one shared in-flight
- * lookup, successes only. The auth token also verifies inbound webhook signatures, so a
- * missing field throws rather than returning a partial object.
- */
+/** Env var for each credential field; the pair is used only when both are set. */
 const TWILIO_ENV_VARS = {
   accountSid: 'TWILIO_ACCOUNT_SID',
   authToken: 'TWILIO_AUTH_TOKEN',
@@ -1335,18 +1328,31 @@ async function fetchTwilioCredentialsFromSecretsManager(): Promise<TwilioCredent
     throw twilioShapeError('Twilio credentials secret is empty');
   }
 
-  // A SyntaxError from JSON.parse can quote fragments of the secret, so the catch below logs
-  // only the error name for anything that is not one of our own shape errors.
-  const credentials = JSON.parse(secretString) as TwilioCredentials;
+  // A SyntaxError from JSON.parse can quote fragments of the secret, so the catch in
+  // getTwilioCredentials logs only the error name for anything that is not one of our own shape errors.
+  const parsed: unknown = JSON.parse(secretString);
+  const fields = (parsed !== null && typeof parsed === 'object' ? parsed : {}) as Record<string, unknown>;
 
-  const missing = (['accountSid', 'authToken'] as const).filter((k) => !credentials[k]);
-  if (missing.length > 0) {
+  // Strings only: a number or object here would reach the SDK's Basic-auth header as garbage.
+  const usable = (v: unknown): v is string => typeof v === 'string' && v.trim() !== '';
+  const { accountSid, authToken } = fields;
+  if (!usable(accountSid) || !usable(authToken)) {
+    const missing = (['accountSid', 'authToken'] as const).filter((k) => !usable(fields[k]));
     throw twilioShapeError(`Twilio credentials missing: ${missing.join(', ')}`);
   }
 
-  return { accountSid: credentials.accountSid, authToken: credentials.authToken };
+  // Trimmed like the env path, so a trailing newline in the stored secret cannot break Basic auth.
+  return { accountSid: accountSid.trim(), authToken: authToken.trim() };
 }
 
+/**
+ * Get Twilio Voice credentials (ENG-2271). Same resolution rules as getWhatsAppCredentials:
+ * the TWILIO_* env pair wins only when complete (never merged with the secret, so an account
+ * sid from one environment cannot be paired with another's auth token); otherwise the secret
+ * at dev/AgentWeb/Twilio (prod/... in production), cached with a TTL, one shared in-flight
+ * lookup, successes only. The auth token also verifies inbound webhook signatures, so a
+ * missing field throws rather than returning a partial object.
+ */
 export async function getTwilioCredentials(): Promise<TwilioCredentials> {
   const fromEnv = {} as TwilioCredentials;
   const missingEnv: string[] = [];
@@ -1377,10 +1383,8 @@ export async function getTwilioCredentials(): Promise<TwilioCredentials> {
       })
       .catch((error) => {
         const name = error instanceof Error ? error.name : 'error';
-        console.error(
-          `Error fetching Twilio credentials from Secrets Manager: ${name}` +
-            (name === TWILIO_SHAPE_ERROR ? ` (${(error as Error).message})` : ''),
-        );
+        const detail = error instanceof Error && name === TWILIO_SHAPE_ERROR ? ` (${error.message})` : '';
+        console.error(`Error fetching Twilio credentials from Secrets Manager: ${name}${detail}`);
         throw new Error(
           'Failed to fetch Twilio credentials. Set both TWILIO_* env vars or store them in Secrets Manager.',
         );
