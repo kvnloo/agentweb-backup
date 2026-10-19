@@ -546,7 +546,11 @@ const SubscriptionTypesTab: React.FC = () => {
       }
 
       // ENG-669: blank keeps the field absent (every model); the server canonicalises ids and rejects unknown ones.
-      const allowedModels = allowedModelsInput.split(/[,\n]/).map((model) => model.trim()).filter(Boolean);
+      // A stored empty list (only possible out of band) is sent back as-is, so the server refuses it and the admin
+      // decides, rather than this editor silently turning "no models" into "every model".
+      const typedModels = allowedModelsInput.split(/[,\n]/).map((model) => model.trim()).filter(Boolean);
+      const storedEmptyList = Array.isArray(editingType?.allowedModels) && editingType.allowedModels.length === 0;
+      const allowedModels: string[] | undefined = typedModels.length > 0 ? typedModels : (storedEmptyList ? [] : undefined);
 
       // Convert all selected items back to "*" if all are selected
       const dataToSave: SubscriptionType = {
@@ -575,7 +579,7 @@ const SubscriptionTypesTab: React.FC = () => {
         // ENG-668: this form has no pay-as-you-go fields, and the tier is rebuilt from the form, so
         // keep what the tier already has instead of dropping it on every edit.
         ...(editingType?.paygOverage ? { paygOverage: editingType.paygOverage } : {}),
-        ...(allowedModels.length > 0 ? { allowedModels } : {}),
+        ...(allowedModels ? { allowedModels } : {}),
       };
 
       let updatedTypes = [...subscriptionTypes];
