@@ -847,6 +847,10 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       if (!callerSuppliedSource && 'source' in existingCustomFields) {
         mergedCf.source = existingCustomFields.source;
       }
+      // A phone-matched merge must not stamp the DEFAULTED 'api' source onto a row that never had one.
+      if (fillBlanksOnly && !callerSuppliedSource && !('source' in existingCustomFields)) {
+        delete mergedCf.source;
+      }
       if (JSON.stringify(existingCustomFields) !== JSON.stringify(mergedCf)) {
         updates.customFields = mergedCf;
         changed = true;
