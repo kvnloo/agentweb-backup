@@ -100,7 +100,7 @@ const MIN_REDACTABLE_SECRET = 8;
  * Removes anything credential-like, then phone numbers, from error text. `credentials` is absent
  * when the failure happened before any were loaded.
  */
-function scrubErrorText(text: string, credentials?: TwilioCredentials): string {
+export function scrubErrorText(text: string, credentials?: TwilioCredentials): string {
   // Exact values first: they are what we know for certain must not leak, whatever their shape.
   // The bare base64 of sid:token is what a Basic header carries, with or without its prefix.
   const known = credentials
