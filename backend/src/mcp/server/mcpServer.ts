@@ -296,13 +296,27 @@ export function setupMcpServer(
     // already-tracked AgentWeb turn are deliberately exempt: runDrain keeps
     // this listener open specifically so those calls can finish.
     const mcpMessages = Array.isArray(req.body) ? req.body : [req.body];
-    const hasToolCall = mcpMessages.some((message: any) => message?.method === 'tools/call');
+    const hasToolCall = mcpMessages.some((message: unknown) =>
+      message && typeof message === 'object' && 'method' in message && message.method === 'tools/call'
+    );
     if (
       hasToolCall &&
       (req as any)._mcpIsInternal !== true &&
       !isCronEnabled()
     ) {
-      return res.status(503).json({ message: 'Instance draining — retry on new instance' });
+      const rejection = (message: unknown) => {
+        const id = message && typeof message === 'object' && 'id' in message ? message.id : null;
+        return {
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Instance draining — retry on new instance' },
+          id: typeof id === 'string' || typeof id === 'number' ? id : null,
+        };
+      };
+      return res.status(503).json(Array.isArray(req.body)
+        ? mcpMessages.filter((message: unknown) =>
+          message && typeof message === 'object' && 'id' in message
+        ).map(rejection)
+        : rejection(req.body));
     }
 
     // ENG-1083: API key scopes are enforced. Checked per request (the auth
