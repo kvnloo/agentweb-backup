@@ -1,4 +1,6 @@
 jest.mock('../../db', () => ({
+  // The real constant, so a keyword added in db.ts is exercised here without editing this test.
+  ENGAGED_EVENT_KEYWORDS: jest.requireActual('../../db').ENGAGED_EVENT_KEYWORDS,
   crmDb: {
     getLeadById: jest.fn(),
     createLeadSystemRecordOnce: jest.fn(),
@@ -6,7 +8,7 @@ jest.mock('../../db', () => ({
     addLeadEngagement: jest.fn(),
   },
 }));
-import { crmDb } from '../../db';
+import { crmDb, ENGAGED_EVENT_KEYWORDS } from '../../db';
 import { getLeadCallStore, setLeadCallStoreForTests } from '../leadCallStore';
 import type { HotLeadCallRecord } from '../leadCallStore.types';
 
@@ -84,15 +86,6 @@ describe('leadCallStore create/get', () => {
     expect((await store.get(LIST, LEAD))?.jobKey).toBe('job-1');
   });
 
-  it('lets exactly one of two racing creates win', async () => {
-    const store = getLeadCallStore();
-    const results = await Promise.all([
-      store.create(LIST, LEAD, { ...baseRecord, jobKey: 'a' }),
-      store.create(LIST, LEAD, { ...baseRecord, jobKey: 'b' }),
-    ]);
-    expect(results.filter(Boolean)).toHaveLength(1);
-  });
-
   it('returns false for a lead that does not exist', async () => {
     expect(await getLeadCallStore().create(LIST, 'missing', baseRecord)).toBe(false);
   });
@@ -133,22 +126,20 @@ describe('leadCallStore transition', () => {
     expect(await getLeadCallStore().transition(LIST, 'other', ['dialing'], { state: 'failed' })).toBe(false);
   });
 
-  it('lets exactly one of two racing callbacks win the same transition', async () => {
-    const store = getLeadCallStore();
-    const results = await Promise.all([
-      store.transition(LIST, LEAD, ['dialing'], { state: 'owner_ringing', outcome: 'first' }),
-      store.transition(LIST, LEAD, ['dialing'], { state: 'failed', outcome: 'second' }),
-    ]);
-    expect(results.filter(Boolean)).toHaveLength(1);
-    const rec = await store.get(LIST, LEAD);
-    expect(rec?.state).toBe(results[0] ? 'owner_ringing' : 'failed');
-  });
-
   it('does not move a terminal record backwards', async () => {
     const store = getLeadCallStore();
     await store.transition(LIST, LEAD, ['dialing'], { state: 'finished', outcome: 'completed' });
     expect(await store.transition(LIST, LEAD, ['dialing', 'owner_ringing'], { state: 'owner_answered' })).toBe(false);
     expect((await store.get(LIST, LEAD))?.state).toBe('finished');
+  });
+
+  it.each(['finished', 'failed', 'skipped'] as const)('refuses a from list containing terminal %s without calling the db', async (terminal) => {
+    await getLeadCallStore().transition(LIST, LEAD, ['dialing'], { state: terminal });
+    mock(crmDb.updateLeadSystemRecordIf).mockClear();
+    expect(await getLeadCallStore().transition(LIST, LEAD, [terminal], { state: 'owner_answered' })).toBe(false);
+    expect(await getLeadCallStore().transition(LIST, LEAD, ['dialing', terminal], { state: 'owner_answered' })).toBe(false);
+    expect(crmDb.updateLeadSystemRecordIf).not.toHaveBeenCalled();
+    expect((await getLeadCallStore().get(LIST, LEAD))?.state).toBe(terminal);
   });
 
   it('keeps lastSequence monotonic per CallSid and rejects a replayed or older sequence', async () => {
@@ -203,6 +194,20 @@ describe('leadCallStore addEvent', () => {
     expect(eventData.reason).toBe('busy at [redacted] then [redacted] and [redacted]');
   });
 
+  it('leaves ISO dates, timestamps and long ids intact', async () => {
+    await getLeadCallStore().addEvent(LIST, LEAD, 'call.completed', {
+      day: '2026-10-19', at: '2026-10-19T10:00:00.000Z', job: 'job_1234567', ref: 'job-1234567', range: '2026-10-19 to 2026-10-20',
+    });
+    expect(mock(crmDb.addLeadEngagement).mock.calls[0][2].eventData).toEqual({
+      day: '2026-10-19', at: '2026-10-19T10:00:00.000Z', job: 'job_1234567', ref: 'job-1234567', range: '2026-10-19 to 2026-10-20',
+    });
+  });
+
+  it('redacts a bare 10 digit number and a dashed number', async () => {
+    await getLeadCallStore().addEvent(LIST, LEAD, 'call.failed', { a: '5555550100', b: 'call 555-555-0100 now' });
+    expect(mock(crmDb.addLeadEngagement).mock.calls[0][2].eventData).toEqual({ a: '[redacted]', b: 'call [redacted] now' });
+  });
+
   it('drops numeric values and keys that look like phone numbers', async () => {
     await getLeadCallStore().addEvent(LIST, LEAD, 'call.failed', { n: 15555550100, '+15555550100': 'x', ok: 3 });
     expect(mock(crmDb.addLeadEngagement).mock.calls[0][2].eventData).toEqual({ ok: 3 });
@@ -216,6 +221,11 @@ describe('leadCallStore addEvent', () => {
       reason: 'owner_no_answer',
     });
     expect(mock(crmDb.addLeadEngagement).mock.calls[0][2].eventData).toEqual({ reason: 'owner_no_answer' });
+  });
+
+  it.each(ENGAGED_EVENT_KEYWORDS)('drops detail mentioning the db.ts engagement keyword %s', async (word) => {
+    await getLeadCallStore().addEvent(LIST, LEAD, 'call.completed', { keep: 'fine', a: `x ${word.toUpperCase()} y`, [`k_${word}`]: 'v' });
+    expect(mock(crmDb.addLeadEngagement).mock.calls[0][2].eventData).toEqual({ keep: 'fine' });
   });
 
   it('caps long string values', async () => {

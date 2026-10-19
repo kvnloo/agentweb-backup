@@ -1,4 +1,4 @@
-import { crmDb } from '../db';
+import { crmDb, ENGAGED_EVENT_KEYWORDS } from '../db';
 import type {
   HotLeadCallEventType,
   HotLeadCallLeg,
@@ -12,23 +12,25 @@ const SYSTEM_KEY = 'hot_lead_call';
 
 const MAX_DETAIL_VALUE_LENGTH = 200;
 
-// db.ts raises `isEngaged` (the lead counts as engaged/hot in lists and filters) when an engagement's
-// eventType or serialised eventData contains one of these words (engagementMatchesKeyword). A call event
-// must never do that, so entries containing them are dropped from the detail.
-const ENGAGED_KEYWORDS = ['clicked', 'replied', 'received'];
+const TERMINAL_STATES: HotLeadCallState[] = ['finished', 'failed', 'skipped'];
 
-// A Twilio SID (CA..., AC..., PN...) is 34 chars of hex that can hold a long run of digits, so SIDs are
-// matched first and kept; anything else that looks like a phone number (7+ digits, optional + and
-// separators) is redacted.
-const SID_OR_PHONE = /\b[A-Z]{2}[0-9a-f]{32}\b|\+?\d[\d\s().-]{5,}\d/g;
+// db.ts raises `isEngaged` (the lead counts as engaged/hot in lists and filters) when an engagement's
+// eventType or serialised eventData contains one of ENGAGED_EVENT_KEYWORDS. A call event must never do
+// that, so detail entries containing them are dropped.
+
+// Matched in order at each position: a Twilio SID (CA..., AC..., PN...: 34 chars of hex that can hold a
+// long digit run) and an ISO date (2026-10-19) are kept as they are; anything else shaped like a phone
+// number is redacted: 7+ digits with optional + and ( ) . - space separators, not glued to a preceding
+// word character or dash (so ids like job_1234567 stay intact).
+const SID_DATE_OR_PHONE = /\b[A-Z]{2}[0-9a-f]{32}\b|\b\d{4}-\d{2}-\d{2}(?!\d)|(?<![\w-])\+?\d[\d\s().-]{5,}\d(?!\w)/g;
 
 function redactPhones(value: string): string {
-  return value.replace(SID_OR_PHONE, (m) => (/^[A-Z]{2}/.test(m) ? m : '[redacted]'));
+  return value.replace(SID_DATE_OR_PHONE, (m) => (/^[A-Z]{2}|^\d{4}-\d{2}-\d{2}$/.test(m) ? m : '[redacted]'));
 }
 
 function mentionsEngagement(text: string): boolean {
   const lower = text.toLowerCase();
-  return ENGAGED_KEYWORDS.some((k) => lower.includes(k));
+  return ENGAGED_EVENT_KEYWORDS.some((k) => lower.includes(k));
 }
 
 /** Detail values are scalars only; phone-like text is redacted and engagement-raising words are dropped. */
@@ -81,7 +83,8 @@ class DynamoLeadCallStore implements LeadCallStore {
 
   /**
    * In `patch`, `meteredLegs` lists the legs to ADD and `lastSequence` the entries to merge (not
-   * replacements). The call returns false, writing nothing, when the state is not in `from`, when a
+   * replacements). `from` must name non-terminal states only; a terminal one makes it return false.
+   * The call returns false, writing nothing, when the state is not in `from`, when a
    * lastSequence entry is not higher than the stored one for that CallSid, or when a leg is already
    * metered. So metering belongs in the same transition as the state change it accompanies: the one
    * caller that gets `true` meters, a replay gets `false` and does not.
@@ -92,7 +95,8 @@ class DynamoLeadCallStore implements LeadCallStore {
     from: HotLeadCallState[],
     patch: Partial<HotLeadCallRecord> & { state: HotLeadCallState },
   ): Promise<boolean> {
-    if (from.length === 0) return false;
+    // A terminal record is never revived: a caller bug that lists one in `from` is refused, not applied.
+    if (from.length === 0 || from.some((s) => TERMINAL_STATES.includes(s))) return false;
     const legs: HotLeadCallLeg[] = [...new Set(patch.meteredLegs ?? [])];
     return crmDb.updateLeadSystemRecordIf(listId, leadId, SYSTEM_KEY, {
       stateIn: from,
