@@ -8,6 +8,10 @@
  *
  * Grader verdicts (judge scores, client-health status) are deliberately not shown: the labels
  * are the ground truth those graders are validated against.
+ *
+ * Quick mode (ENG-665): one criterion at a time. Keys 1 / 2 / 3 save Pass / Fail / N/A for the
+ * open case and move to the next case in the list that lacks that criterion, so a one-off
+ * validation set is a read-and-keypress job rather than a form per case.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -125,6 +129,9 @@ function apiMessage(error: unknown, fallback: string): string {
 function isNotProvisioned(error: unknown): boolean {
   return axios.isAxiosError(error) && error.response?.status === 503;
 }
+
+/** Quick-mode keys; digits so a reviewer can keep one hand on the keyboard. */
+const QUICK_KEYS: Readonly<Record<string, LabelValue>> = { '1': 'pass', '2': 'fail', '3': 'na' };
 
 function labelledCount(c: GoldenCaseView): number {
   return c.criteria.filter((criterion) => c.labels[criterion] !== undefined).length;
@@ -414,6 +421,82 @@ function LabelForm({ goldenCase, token, onSaved }: { goldenCase: GoldenCaseView;
   );
 }
 
+function isTypingTarget(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  return !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable);
+}
+
+/** Quick mode: one criterion, saved on a click or a 1 / 2 / 3 keypress; other labels are kept as they are. */
+function QuickLabel({ goldenCase, criterion, token, onSaved }: { goldenCase: GoldenCaseView; criterion: string; token: string | null; onSaved: (saved: GoldenCaseView) => void }) {
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // A keypress during a save must not fire a second PUT with the same (now stale) version.
+  const inFlight = useRef(false);
+
+  const save = useCallback(async (value: LabelValue) => {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    setSaving(true);
+    setError(null);
+    try {
+      const res = await axios.put<{ case: GoldenCaseView }>(
+        buildApiUrl(`/api/admin/eval/golden-cases/${encodeURIComponent(goldenCase.caseId)}/labels`),
+        { labels: { ...goldenCase.labels, [criterion]: value }, notes: goldenCase.notes ?? '', expectedVersion: goldenCase.version },
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      onSaved(withoutDraft(res.data.case));
+    } catch (err) {
+      if (axios.isAxiosError(err) && err.response?.status === 409) {
+        setError('Someone saved this case after you opened it. Reload the list and label it again.');
+      } else {
+        setError(apiMessage(err, 'Failed to save the label.'));
+      }
+    } finally {
+      inFlight.current = false;
+      setSaving(false);
+    }
+  }, [goldenCase, criterion, token, onSaved]);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey || e.repeat || isTypingTarget(e.target)) return;
+      const value = QUICK_KEYS[e.key];
+      if (!value) return;
+      e.preventDefault();
+      void save(value);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [save]);
+
+  const current = goldenCase.labels[criterion];
+  return (
+    <Stack spacing={1.5}>
+      <Box>
+        <Typography variant="body2" fontWeight={600}>{criterion.replace(/_/g, ' ')}</Typography>
+        <Typography variant="caption" color="text.secondary">{CRITERION_HELP[criterion] ?? ''}</Typography>
+      </Box>
+      <Stack direction="row" spacing={1}>
+        {LABEL_OPTIONS.map((o, i) => (
+          <Button
+            key={o.value}
+            variant={current === o.value ? 'contained' : 'outlined'}
+            disabled={saving}
+            onClick={() => void save(o.value)}
+            aria-label={`quick ${criterion} ${o.value}`}
+          >
+            {o.label} ({i + 1})
+          </Button>
+        ))}
+      </Stack>
+      <Typography variant="caption" color="text.secondary">
+        Press 1, 2 or 3 to save and open the next case without this label. Other criteria on the case are left as they are.
+      </Typography>
+      {error && <Alert severity="error">{error}</Alert>}
+    </Stack>
+  );
+}
+
 export default function EvalLabelling() {
   const { token, user } = useAuth();
   const [provisioned, setProvisioned] = useState<boolean | null>(null);
@@ -423,6 +506,9 @@ export default function EvalLabelling() {
   // Filters the case list only — the open case in the detail pane stays open even if a filter
   // change hides it from the list, so switching filters mid-edit never loses unsaved work.
   const [splitFilter, setSplitFilter] = useState<'all' | 'dev' | 'test'>('all');
+  const [taskTypeFilter, setTaskTypeFilter] = useState<string>('all');
+  // Quick mode: the one criterion being labelled, or null for the full form.
+  const [quickCriterion, setQuickCriterion] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -461,6 +547,36 @@ export default function EvalLabelling() {
     if (user?.isAdmin) void fetchCases(surface);
   }, [user?.isAdmin, surface, fetchCases]);
 
+  // Task types and criteria differ per surface.
+  useEffect(() => {
+    setTaskTypeFilter('all');
+    setQuickCriterion(null);
+  }, [surface]);
+
+  const matchesFilters = (c: GoldenCaseView) =>
+    (splitFilter === 'all' || c.split === splitFilter) && (taskTypeFilter === 'all' || c.taskType === taskTypeFilter);
+
+  /** The next case in list order, after `fromId` and wrapping round, that still lacks `criterion`. */
+  const nextUnlabelled = (list: GoldenCaseView[], criterion: string, fromId: string | null): string | null => {
+    const candidates = list.filter(matchesFilters);
+    const start = fromId ? candidates.findIndex((c) => c.caseId === fromId) + 1 : 0;
+    const ordered = [...candidates.slice(start), ...candidates.slice(0, start)];
+    return ordered.find((c) => c.caseId !== fromId && c.labels[criterion] === undefined)?.caseId ?? null;
+  };
+
+  const startQuick = (criterion: string | null) => {
+    setQuickCriterion(criterion);
+    if (criterion) setSelectedId((current) => nextUnlabelled(cases, criterion, null) ?? current);
+  };
+
+  const onQuickSaved = (saved: GoldenCaseView) => {
+    if (!quickCriterion) return;
+    // Keep the list order while labelling, so "next" walks forward instead of jumping round.
+    const updated = cases.map((c) => (c.caseId === saved.caseId ? saved : c));
+    setCases(updated);
+    setSelectedId(nextUnlabelled(updated, quickCriterion, saved.caseId) ?? saved.caseId);
+  };
+
   if (!user?.isAdmin) {
     return (
       <Box sx={{ textAlign: 'center', py: 10 }}>
@@ -472,8 +588,12 @@ export default function EvalLabelling() {
 
   const selected = cases.find((c) => c.caseId === selectedId) ?? null;
   const fullyLabelled = cases.filter((c) => labelledCount(c) === c.criteria.length).length;
-  const filteredCases = splitFilter === 'all' ? cases : cases.filter((c) => c.split === splitFilter);
+  const filteredCases = cases.filter(matchesFilters);
   const filteredFullyLabelled = filteredCases.filter((c) => labelledCount(c) === c.criteria.length).length;
+  const taskTypes = [...new Set(cases.map((c) => c.taskType))].sort();
+  const surfaceCriteria = [...new Set(cases.flatMap((c) => c.criteria))];
+  const quickDone = quickCriterion ? filteredCases.filter((c) => c.labels[quickCriterion] !== undefined).length : 0;
+  const filtersOn = splitFilter !== 'all' || taskTypeFilter !== 'all';
 
   return (
     <Box sx={{ p: 3 }}>
@@ -505,12 +625,14 @@ export default function EvalLabelling() {
             <Card variant="outlined">
               <CardContent>
                 <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1} sx={{ mb: 1 }}>
-                  <Typography variant="subtitle2">
+                  <Typography variant="subtitle2" data-testid="eval-labelling-count">
                     {loading
                       ? 'Loading cases…'
-                      : splitFilter === 'all'
-                        ? `${cases.length} cases · ${fullyLabelled} fully labelled`
-                        : `${filteredCases.length} of ${cases.length} cases · ${filteredFullyLabelled} fully labelled`}
+                      : quickCriterion
+                        ? `${quickDone} of ${filteredCases.length} labelled for ${quickCriterion.replace(/_/g, ' ')}`
+                        : !filtersOn
+                          ? `${cases.length} cases · ${fullyLabelled} fully labelled`
+                          : `${filteredCases.length} of ${cases.length} cases · ${filteredFullyLabelled} fully labelled`}
                   </Typography>
                   <FormControl size="small" sx={{ minWidth: 110 }} disabled={loading}>
                     <InputLabel id="eval-labelling-split-filter-label">Split</InputLabel>
@@ -524,6 +646,34 @@ export default function EvalLabelling() {
                       <MenuItem value="all">All</MenuItem>
                       <MenuItem value="test">test</MenuItem>
                       <MenuItem value="dev">dev</MenuItem>
+                    </Select>
+                  </FormControl>
+                </Stack>
+                <Stack direction="row" spacing={1} sx={{ mb: 1 }}>
+                  <FormControl size="small" sx={{ flex: 1 }} disabled={loading}>
+                    <InputLabel id="eval-labelling-task-type-filter-label">Task type</InputLabel>
+                    <Select
+                      labelId="eval-labelling-task-type-filter-label"
+                      label="Task type"
+                      value={taskTypeFilter}
+                      onChange={(e: SelectChangeEvent) => setTaskTypeFilter(e.target.value)}
+                      data-testid="eval-labelling-task-type-filter"
+                    >
+                      <MenuItem value="all">All</MenuItem>
+                      {taskTypes.map((t) => <MenuItem key={t} value={t}>{t}</MenuItem>)}
+                    </Select>
+                  </FormControl>
+                  <FormControl size="small" sx={{ flex: 1 }} disabled={loading}>
+                    <InputLabel id="eval-labelling-quick-label">Quick mode</InputLabel>
+                    <Select
+                      labelId="eval-labelling-quick-label"
+                      label="Quick mode"
+                      value={quickCriterion ?? 'off'}
+                      onChange={(e: SelectChangeEvent) => startQuick(e.target.value === 'off' ? null : e.target.value)}
+                      data-testid="eval-labelling-quick-mode"
+                    >
+                      <MenuItem value="off">Off (all criteria)</MenuItem>
+                      {surfaceCriteria.map((c) => <MenuItem key={c} value={c}>{c.replace(/_/g, ' ')} only</MenuItem>)}
                     </Select>
                   </FormControl>
                 </Stack>
@@ -551,7 +701,7 @@ export default function EvalLabelling() {
                         ? (
                           <TableRow>
                             <TableCell colSpan={3}>
-                              <Typography variant="body2" color="text.secondary">No {splitFilter} cases.</Typography>
+                              <Typography variant="body2" color="text.secondary">{taskTypeFilter === 'all' ? `No ${splitFilter} cases.` : 'No cases match these filters.'}</Typography>
                             </TableCell>
                           </TableRow>
                         )
@@ -576,7 +726,9 @@ export default function EvalLabelling() {
                               <Typography variant="caption" color="text.secondary">{c.taskType}</Typography>
                             </TableCell>
                             <TableCell>{c.split}</TableCell>
-                            <TableCell align="right">{labelledCount(c)}/{c.criteria.length}</TableCell>
+                            <TableCell align="right">
+                              {quickCriterion ? (c.labels[quickCriterion] ?? '—') : `${labelledCount(c)}/${c.criteria.length}`}
+                            </TableCell>
                           </TableRow>
                         ))}
                   </TableBody>
@@ -591,19 +743,29 @@ export default function EvalLabelling() {
                 <Card variant="outlined">
                   <CardContent>
                     <Typography variant="subtitle2" sx={{ mb: 1 }}>Source</Typography>
-                    <SourceContext goldenCase={selected} token={token} />
+                    {/* Keyed by case so the transcript starts scrolled to the top on every case. */}
+                    <SourceContext key={selected.caseId} goldenCase={selected} token={token} />
                   </CardContent>
                 </Card>
                 <Card variant="outlined">
                   <CardContent>
                     <Typography variant="subtitle2" sx={{ mb: 1 }}>Labels</Typography>
-                    {/* Keyed by case so the form starts fresh per case but keeps its "saved" state across its own save. */}
-                    <LabelForm
-                      key={selected.caseId}
-                      goldenCase={selected}
-                      token={token}
-                      onSaved={(saved) => setCases((prev) => prev.map((c) => (c.caseId === saved.caseId ? saved : c)).sort(byLeastLabelled))}
-                    />
+                    {quickCriterion && quickDone === filteredCases.length && filteredCases.length > 0 && (
+                      <Alert severity="success" sx={{ mb: 1.5 }}>
+                        All {filteredCases.length} cases in this list are labelled for {quickCriterion.replace(/_/g, ' ')}.
+                      </Alert>
+                    )}
+                    {quickCriterion ? (
+                      <QuickLabel key={selected.caseId} goldenCase={selected} criterion={quickCriterion} token={token} onSaved={onQuickSaved} />
+                    ) : (
+                      // Keyed by case so the form starts fresh per case but keeps its "saved" state across its own save.
+                      <LabelForm
+                        key={selected.caseId}
+                        goldenCase={selected}
+                        token={token}
+                        onSaved={(saved) => setCases((prev) => prev.map((c) => (c.caseId === saved.caseId ? saved : c)).sort(byLeastLabelled))}
+                      />
+                    )}
                   </CardContent>
                 </Card>
               </Stack>
