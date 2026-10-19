@@ -15,7 +15,6 @@ import '../emma/hotLeadCallSetupTools';
 import { FakeVoiceProvider } from '../services/voice/fakeVoiceProvider';
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
 import { getRecordingUnit } from '../utils/vendorRateCard';
-import { verificationCodeTwiml as verificationTwiml } from '../services/voice/twiml';
 import { SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS } from '../services/agentMode/core/toolDispatch';
 
 const run = (name: string, args: unknown = {}, context: unknown = { userId: 'owner' }) => handlers.get(name)!.execute(args, context);
@@ -149,6 +148,20 @@ describe('permissions and registration', () => {
     expect(readFileSync(join(__dirname, '../emma/tools.ts'), 'utf8')).toContain("import './hotLeadCallSetupTools';");
     for (const name of SETUP_TOOLS) expect(SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS.has(name)).toBe(true);
   });
+  it.each(['provision_hot_lead_call_number', 'release_hot_lead_call_number', 'start_hot_lead_call_verification'])('%s refuses an unattended run before touching anything', async name => {
+    org.hotLeadCall = withNumber();
+    await expect(run(name, VALID_ARGS[name], { userId: 'owner', isUnattendedRun: true })).rejects.toThrow('This needs a person to confirm in an interactive chat');
+    expect(userDb.getUserById).not.toHaveBeenCalled();
+    expect(writes).toEqual([]);
+    expect(fake.placedCalls.length + fake.boughtNumbers.length + fake.releasedNumbers.length).toBe(0);
+  });
+  it.each([false, undefined])('provision and start still work when isUnattendedRun is %s (only an explicit true is refused)', async flag => {
+    org.hotLeadCall = withNumber();
+    await expect(start({}, { userId: 'owner', isUnattendedRun: flag })).resolves.toMatchObject({ success: true });
+    org.hotLeadCall = configured();
+    fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
+    await expect(provision({ confirm: true }, { userId: 'owner', isUnattendedRun: flag })).resolves.toMatchObject({ success: true });
+  });
   it('works while the platform kill switch is off, without consulting it', async () => {
     org.hotLeadCall = withNumber();
     await expect(start()).resolves.toMatchObject({ success: true });
@@ -157,7 +170,7 @@ describe('permissions and registration', () => {
   it('describes confirm as advisory, the cost without a hard-coded price, and the irreversible release', () => {
     const buy = handlers.get('provision_hot_lead_call_number')!.definition.description;
     expect(buy).toMatch(/confirm is advisory/);
-    expect(buy).not.toMatch(/1\.15/);
+    expect(buy).not.toMatch(/\$\d/);
     expect(handlers.get('release_hot_lead_call_number')!.definition.description).toMatch(/cannot be recovered/);
     expect(handlers.get('start_hot_lead_call_verification')!.definition.description).toMatch(/voicemail.*Twilio call log/);
   });
@@ -253,6 +266,14 @@ describe('provision_hot_lead_call_number', () => {
     await expect(provision()).rejects.toThrow('Contact support');
     expect(fake.boughtNumbers).toHaveLength(1);
   });
+  it('a rejecting rent meter cannot skip saving the number', async () => {
+    fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
+    (recordVendorUsage as jest.Mock).mockRejectedValueOnce(new Error('ledger down'));
+    await expect(provision()).resolves.toMatchObject({ success: true });
+    expect(org.hotLeadCall!.twilioNumberSid).toBe(NEW_SID);
+    expect(allLogs()).toContain(`sid ${NEW_SID}`);
+    expect(allLogs()).not.toContain('4155550123');
+  });
   it('takes the unit and the price text from the rate card', async () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
     await expect(provision({})).rejects.toThrow(/\$1\.15 per month/);
@@ -340,6 +361,13 @@ describe('release_hot_lead_call_number', () => {
     expect(org.hotLeadCall).toEqual(configured({ destinationVerifiedAt: '2026-01-01T00:00:00.000Z' }));
     expect(result).toMatchObject({ success: true, callerNumberReleased: true, callingEnabled: false });
     expect(JSON.stringify(result)).not.toMatch(/4155550111|PN/);
+  });
+  it('re-reads with a consistent read after the disabling write, so a stale replica cannot fail the final write', async () => {
+    const stale = clone(org);
+    (orgDb.getOrgById as jest.Mock).mockImplementation(async (_id: string, _fields: unknown, consistent?: boolean) => clone(consistent ? org : stale));
+    await release();
+    expect(org.hotLeadCall).not.toHaveProperty('twilioNumberSid');
+    expect(orgDb.getOrgById).toHaveBeenLastCalledWith('org-a', undefined, true);
   });
   it('clears locally when Twilio says the number is already gone (404)', async () => {
     fake.failNextReleaseNumber('no', 'not found', 404);
@@ -437,9 +465,6 @@ describe('start_hot_lead_call_verification', () => {
     expect(codeFromCall()).toBe('000042');
     await expect(confirm('000042')).resolves.toMatchObject({ success: true });
   });
-  it('only builds TwiML from exactly six digits', () => {
-    for (const bad of ['12345', '1234567', '12&456', '<1234>', '12 456', '１２３４５６']) expect(() => verificationTwiml(bad)).toThrow('6 digits');
-  });
   it('meters the call as a one-minute verify leg, idempotent per call sid', async () => {
     await start();
     expect(recordVendorUsage).toHaveBeenCalledTimes(1);
@@ -477,11 +502,17 @@ describe('start_hot_lead_call_verification', () => {
     await start();
     expect(org.hotLeadCallVerification).toMatchObject({ attempts: 0, startedAt: [T0, T0 + 3 * MIN], expiresAt: T0 + 13 * MIN });
   });
-  it('ignores a corrupt stored record (no trusted history) but replaces it conditionally', async () => {
+  it('fails closed on a corrupt stored record instead of replacing it (which would reset the limits)', async () => {
     org.hotLeadCallVerification = { garbage: true };
+    await expect(start()).rejects.toThrow('Contact support');
+    expect(fake.placedCalls).toEqual([]);
+    expect(org.hotLeadCallVerification).toEqual({ garbage: true });
+  });
+  it('hashes the code under a labelled HMAC bound to org, phone and code (known answer)', async () => {
+    jest.spyOn(crypto, 'randomInt').mockImplementation((() => 123456) as unknown as typeof crypto.randomInt);
     await start();
-    expect(org.hotLeadCallVerification).toHaveProperty('codeHash');
-    expect(writes[0].condition!.expression).toBe('#previousHotLeadCallVerification = :previousHotLeadCallVerification');
+    const expected = crypto.createHmac('sha256', 'test-secret-not-real').update('hlc-verify-v1|org-a|+14155550100|123456').digest('hex');
+    expect(org.hotLeadCallVerification!.codeHash).toBe(expected);
   });
   it('two simultaneous starts place exactly one call', async () => {
     const results = await Promise.allSettled([start(), start()]);

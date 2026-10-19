@@ -78,8 +78,10 @@ export async function startVerification(org: Organization, config: HotLeadCallCo
   }
   const now = Date.now();
   const previousRaw = org.hotLeadCallVerification;
-  // A corrupt record carries no trustworthy history; it is simply replaced (the write is still conditional on it).
-  const recent = (verificationOf(previousRaw)?.startedAt ?? []).filter(t => now - t < DAY_MS);
+  // A corrupt record would reset the rate limits if replaced, so it fails closed like the purchase history.
+  const history = previousRaw === undefined ? null : verificationOf(previousRaw);
+  if (previousRaw !== undefined && !history) throw new Error('Stored verification state is invalid. Contact support.');
+  const recent = (history?.startedAt ?? []).filter(t => now - t < DAY_MS);
   const lastStart = Math.max(0, ...recent);
   if (now - lastStart < VERIFICATION_MIN_GAP_MS) {
     throw new Error(`A verification call was just placed. Wait ${minutes(VERIFICATION_MIN_GAP_MS - (now - lastStart))} minute(s) before starting another.`);

@@ -46,6 +46,8 @@ export class FakeVoiceProvider implements VoiceProvider {
   }
 
   async placeCall(p: PlaceCallParams): Promise<{ callSid: string }> {
+    // The real provider sends whichever is set; both (or neither) would be a caller bug the fake must not hide.
+    if ((p.url === undefined) === (p.twiml === undefined)) throw new Error('FakeVoiceProvider: placeCall needs exactly one of url and twiml');
     this.placedCalls.push(p);
     const failure = this.placeCallFailures.shift();
     if (failure) throw failure;

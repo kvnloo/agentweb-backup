@@ -8,6 +8,7 @@ import {
   HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS, HOT_LEAD_CALL_SYSTEM_FIELDS, maskPhone,
   type HotLeadCallConfig,
 } from '../services/hotLeadCallConfig';
+import { unchangedSince } from '../services/voice/setupWrites';
 import { toE164 } from '../services/whatsappService';
 import { parsePhoneNumberWithError } from 'libphonenumber-js';
 
@@ -144,9 +145,7 @@ emmaToolRegistry.register({
     }
 
     // First write must not race another first write; later writes must not clobber a concurrent edit.
-    await orgDb.updateOrg(org.orgId, { hotLeadCall: validated }, { condition: previous === undefined
-      ? { expression: 'attribute_not_exists(#previousHotLeadCall)', names: { '#previousHotLeadCall': 'hotLeadCall' } }
-      : { expression: '#previousHotLeadCall = :previousHotLeadCall', names: { '#previousHotLeadCall': 'hotLeadCall' }, values: { ':previousHotLeadCall': previous } } });
+    await orgDb.updateOrg(org.orgId, { hotLeadCall: validated }, { condition: unchangedSince({ hotLeadCall: previous }) });
     return { success: true, ...settings(validated) };
   },
 });

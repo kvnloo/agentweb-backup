@@ -75,4 +75,12 @@ describe('FakeVoiceProvider', () => {
     await expect(f.releaseNumber('PNx')).resolves.toBeUndefined();
     expect(f.releasedNumbers).toEqual(['PNx', 'PNx']);
   });
+
+  it('rejects a placeCall that sets both url and twiml, or neither (the real provider would silently pick one)', async () => {
+    const f = new FakeVoiceProvider();
+    await expect(f.placeCall({ ...p, twiml: '<Response/>' } as never)).rejects.toThrow('exactly one of url and twiml');
+    await expect(f.placeCall({ to: p.to, from: p.from, timeoutSeconds: 20 } as never)).rejects.toThrow('exactly one');
+    await expect(f.placeCall({ to: p.to, from: p.from, twiml: '<Response/>', timeoutSeconds: 20 })).resolves.toEqual({ callSid: 'CA00000001' });
+    expect(f.placedCalls).toHaveLength(1);
+  });
 });

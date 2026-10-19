@@ -23,6 +23,10 @@ import { isConditionalFailure, unchangedSince } from './setupWrites';
  * release/provision loop is bounded (~2 numbers/day/org). A reservation whose purchase then fails still counts.
  * Releases are reserved the same way so a loop cannot hammer Twilio.
  *
+ * Residual, accepted (no in-flight stamp is built): the reservation is conditional, so a parallel provision
+ * normally fails before buying; should two still reach buyNumber, the loser's number is released (its rent
+ * metered) and the cost stays within the 2/day cap.
+ *
  * `confirm: true` on the tool is advisory (the model controls it); these caps are the real control. A
  * human-approval gate (approval deck) for provision/release is a recommended follow-up: the existing
  * mechanism is Meta-write specific (digest manifests halted inside agentModeService).
@@ -48,17 +52,17 @@ function provisioningOf(raw: unknown): HotLeadCallProvisioning | null {
 }
 
 /** Writes the reservation; the conditional write is what makes the caps race-free. */
-async function reserve(org: Organization, kind: 'purchases' | 'releases', max: number, reads: Record<string, unknown>): Promise<void> {
+async function reserve(org: Organization, kind: 'purchases' | 'releases', max: number): Promise<void> {
   const history = provisioningOf(org.hotLeadCallProvisioning);
   if (!history) throw new Error('Stored number purchase history is invalid. Contact support.');
   const now = Date.now();
   const recent = history[kind].filter(t => now - t < DAY_MS);
   if (recent.length >= max) {
-    throw new Error(`The limit of ${max} number ${kind === 'purchases' ? 'purchases' : 'releases'} per day was reached. Try again tomorrow.`);
+    throw new Error(`The limit of ${max} number ${kind} per day was reached. Try again tomorrow.`);
   }
   try {
     await orgDb.updateOrg(org.orgId, { hotLeadCallProvisioning: { ...history, [kind]: [...recent, now] } }, {
-      condition: unchangedSince({ hotLeadCallProvisioning: org.hotLeadCallProvisioning, ...reads }),
+      condition: unchangedSince({ hotLeadCallProvisioning: org.hotLeadCallProvisioning, hotLeadCall: org.hotLeadCall }),
     });
   } catch (err) {
     if (isConditionalFailure(err)) throw new Error('Another change to the caller number is in progress. Wait a moment and try again.');
@@ -102,10 +106,15 @@ async function meterRent(userId: string, sid: string): Promise<void> {
     console.error('[hotLeadCall] number rent not metered: twilio number_monthly_rent is missing from the rate card');
     return;
   }
-  await recordVendorUsage({
-    userId, provider: 'twilio', operation: 'number_monthly_rent', feature: 'hot_lead_call', unit, quantity: 1,
-    rateKey: 'number_monthly_rent', idempotencyKey: `twilio:number:${sid}:${new Date().toISOString().slice(0, 7)}`,
-  });
+  // recordVendorUsage should never throw, but nothing here may skip the save/discard/orphan handling after a purchase.
+  try {
+    await recordVendorUsage({
+      userId, provider: 'twilio', operation: 'number_monthly_rent', feature: 'hot_lead_call', unit, quantity: 1,
+      rateKey: 'number_monthly_rent', idempotencyKey: `twilio:number:${sid}:${new Date().toISOString().slice(0, 7)}`,
+    });
+  } catch {
+    console.error(`[hotLeadCall] number rent metering failed for sid ${sid}; meter it manually`);
+  }
 }
 
 export async function provisionNumber(p: { org: Organization; config: HotLeadCallConfig; userId: string; areaCode?: string }) {
@@ -114,7 +123,7 @@ export async function provisionNumber(p: { org: Organization; config: HotLeadCal
     throw new Error('This organization already has a caller number. Release it first if you need a different one.');
   }
 
-  await reserve(org, 'purchases', MAX_PURCHASES_PER_DAY, { hotLeadCall: org.hotLeadCall });
+  await reserve(org, 'purchases', MAX_PURCHASES_PER_DAY);
 
   let bought: { numberSid: string; phoneNumber: string };
   try {
@@ -160,7 +169,7 @@ export async function provisionNumber(p: { org: Organization; config: HotLeadCal
 /** Writes `change(current)` over the freshest stored config, retrying once if a concurrent edit wins. */
 async function rewriteConfig(orgId: string, change: (current: HotLeadCallConfig) => HotLeadCallConfig | null, firstOrg?: Organization) {
   for (let attempt = 0; attempt < 2; attempt++) {
-    const org = attempt === 0 && firstOrg ? firstOrg : await orgDb.getOrgById(orgId);
+    const org = attempt === 0 && firstOrg ? firstOrg : await orgDb.getOrgById(orgId, undefined, true);
     const current = org ? hotLeadCallConfigOf(org.hotLeadCall) : null;
     if (!org || !current) throw new Error('Stored hot lead call settings are invalid');
     const next = change(current);
@@ -179,7 +188,7 @@ export async function releaseNumber(p: { org: Organization; config: HotLeadCallC
   const { org, config } = p;
   const sid = config.twilioNumberSid;
   if (!config.twilioNumber && !sid) throw new Error('This organization has no caller number to release.');
-  await reserve(org, 'releases', MAX_RELEASES_PER_DAY, { hotLeadCall: org.hotLeadCall });
+  await reserve(org, 'releases', MAX_RELEASES_PER_DAY);
 
   // Calling goes off before the number is touched, so no call can start from a number being released.
   if (config.enabled) await rewriteConfig(org.orgId, c => ({ ...c, enabled: false }), org);
