@@ -25,10 +25,11 @@ missing keeps the 429. A non-opted account never reads the switch or writes anyt
 - The month's pool = `max(today's effective threshold after credits, poolHighWater for this UTC month)`.
   The high-water mark is written by the gate only when it rises (conditional write) and only for
   opted-in accounts, so a downgrade AFTER opting in never creates retroactive overage.
-- Only usage after opting in is overage: the PUT that turns PAYG on (off -> on) records
+- Only usage after opting in is overage: the month's FIRST off -> on records
   `optIn: { month, overageBaselineMicroUsd }` = the overage standing at that moment (same pool measure as
-  the gates), subtracted for that month only. This covers a downgrade BEFORE opting in, when no
-  high-water mark was kept.
+  the gates), subtracted for that month only. Re-enabling later in the same month keeps that baseline
+  (never re-measured), so toggling cannot reset the cap; a new month starts at baseline 0. This covers a
+  downgrade BEFORE opting in, when no high-water mark was kept.
 - The cap is stored as `capPercentOfPool` only (25|50|100|200) and re-derived every check as percent x
   the month's pool, so "50% of your plan" stays true across top-ups, plan changes and months. No
   micro-USD cap is stored.
