@@ -868,6 +868,8 @@ export interface Organization {
   modelRoles?: import('./modelRoles').ModelRoles;
   leadNotifications?: LeadNotificationsConfig;
   hotLeadCall?: import('./hotLeadCallConfig').HotLeadCallConfig;
+  /** System-managed pending destination-phone verification (hash only); see services/voice/destinationVerification.ts. */
+  hotLeadCallVerification?: import('./voice/destinationVerification').HotLeadCallVerification | null; // null = REMOVE (orgDb.updateOrg convention)
   /**
    * Optimistic-concurrency counter for owner-losing operations. Absent until
    * the first one; see orgDb.claimOwnerChange.

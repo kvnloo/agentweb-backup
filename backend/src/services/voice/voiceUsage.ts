@@ -1,6 +1,7 @@
 import { recordVendorUsage } from '../usageRecorderService';
 
-export type CallLeg = 'owner' | 'lead';
+/** 'verify' is the one-off destination-verification call (no status callback, so it is metered at an estimate). */
+export type CallLeg = 'owner' | 'lead' | 'verify';
 
 export interface CallUsage {
   /** The user the call was placed for; the recorder resolves their org billing owner. */
