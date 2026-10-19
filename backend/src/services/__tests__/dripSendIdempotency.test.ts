@@ -98,4 +98,17 @@ describe('decideDuplicateSend', () => {
       decideDuplicateSend({ key, priorSends: [{ key: 'drip:v1:other', status: 'sent', at: now }], now, staleQueuedMs }),
     ).toEqual({ send: true });
   });
+
+  it('fails closed on non-finite queued timing instead of authorizing a send', () => {
+    const k = 'drip:v1:x';
+    expect(() =>
+      decideDuplicateSend({ key: k, priorSends: [{ key: k, status: 'queued', at: new Date(NaN) }], now: 1000, staleQueuedMs: 60_000 }),
+    ).toThrow('invalid duplicate-send timing');
+    expect(() =>
+      decideDuplicateSend({ key: k, priorSends: [{ key: k, status: 'queued', at: 900 }], now: NaN, staleQueuedMs: 60_000 }),
+    ).toThrow('invalid duplicate-send timing');
+    expect(() =>
+      decideDuplicateSend({ key: k, priorSends: [{ key: k, status: 'queued', at: 900 }], now: 1000, staleQueuedMs: NaN }),
+    ).toThrow('invalid duplicate-send timing');
+  });
 });

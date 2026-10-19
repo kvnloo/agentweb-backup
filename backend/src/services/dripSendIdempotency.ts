@@ -61,9 +61,18 @@ export function decideDuplicateSend(input: DuplicateSendInput): DuplicateSendDec
   if (matching.some((p) => p.status === 'sent')) {
     return { send: false, reason: 'already_sent' };
   }
-  const freshQueued = matching.some(
-    (p) => p.status === 'queued' && now - toMs(p.at) < staleQueuedMs,
-  );
+  const queued = matching.filter((p) => p.status === 'queued');
+  // Fail closed: a non-finite timestamp or timing input would make every
+  // freshness comparison false and silently authorize a duplicate send.
+  if (
+    queued.length > 0 &&
+    (!Number.isFinite(now) ||
+      !Number.isFinite(staleQueuedMs) ||
+      queued.some((p) => !Number.isFinite(toMs(p.at))))
+  ) {
+    throw new Error('invalid duplicate-send timing');
+  }
+  const freshQueued = queued.some((p) => now - toMs(p.at) < staleQueuedMs);
   if (freshQueued) {
     return { send: false, reason: 'in_flight' };
   }
