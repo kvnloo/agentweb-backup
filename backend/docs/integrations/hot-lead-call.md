@@ -78,7 +78,7 @@ Branches (all end in `finished` once every leg that was dialed is metered):
 | Owner never picks up (no-answer, busy, failed, canceled) | owner `/status` terminal | `owner_no_answer` | `call.owner_no_answer`, `call.completed` |
 | Owner presses 1, lead does not answer | `/dial` with `no-answer`, `busy`, `failed` or `canceled` | `lead_no_answer` | `call.owner_answered`, `call.lead_no_answer`, `call.completed` |
 | Lead number no longer valid at bridge time | `/gather` | `lead_phone_invalid` (record stays `owner_answered` until the owner leg ends) | `call.owner_answered`, `call.failed` (reason `lead_phone_invalid`), `call.completed` |
-| Kill switch or config turned off while the owner is on the line | `/owner` or `/gather` | `aborted` | `call.failed` (reason `aborted`), `call.completed` |
+| Kill switch or config turned off while the owner is on the line | `/owner` or `/gather` | `aborted` | at `/owner` (still ringing): `call.failed` (reason `aborted`), `call.completed`; at `/gather` (owner was on the prompt): `call.owner_answered`, `call.failed` (reason `aborted`), `call.completed` |
 | Bridge ended but `/dial` never reported a result | `finishIfComplete` | `bridge_unconfirmed` | `call.completed` |
 
 The leg-metering rule behind "finished": the store refuses to move a terminal
@@ -110,9 +110,11 @@ All paths are under `backend/src/`.
 | Emma setup tools (WP7) | `emma/hotLeadCallSetupTools.ts`, `services/voice/numberProvisioning.ts`, `services/voice/destinationVerification.ts`, `services/voice/setupWrites.ts` |
 | Admin UI for rates | `partner-portal/src/components/admin/VendorRatesTab.tsx` (Admin > Revenue & billing > Vendor Rates) |
 
-Tests worth knowing: `__tests__/hotLeadCall.e2e.test.ts` (whole flow, real
+Tests worth knowing: `__tests__/hotLeadCall.e2e.test.ts` (the calls: real
 orchestrator + real webhooks + real store on an in-memory DB fake, signed with
-Twilio's own HMAC), `__tests__/hotLeadCallService.test.ts`,
+Twilio's own HMAC) and `__tests__/hotLeadCall.e2e.gates.test.ts` (gates, quiet
+hours, dedupe, cooldown, caps and silent refusals), sharing
+`__tests__/helpers/hotLeadCallE2eWorld.ts`; `__tests__/hotLeadCallService.test.ts`,
 `__tests__/twilioVoiceWebhook.test.ts`, `__tests__/hotLeadCall.flagOff.test.ts`
 (Slack path identical with the switch off), `__tests__/hotLeadCallLimits.dynamodbLocal.test.ts`
 and `__tests__/leadCallStore.dynamodbLocal.test.ts` (real DynamoDB expressions
@@ -239,8 +241,9 @@ built. Until it exists the unattended-run refusal and the per-org caps are the
 only controls, so enabling for more than hand-picked orgs needs that gate first.
 
 Verification limits: it proves a phone answered and the code was heard. A
-voicemail that plays the message back can also pass it, and the spoken code is
-visible in the Twilio call log to anyone with access to the Twilio account.
+voicemail that plays the message back can also pass it. The spoken code is
+believed to be visible in the Twilio call log to anyone with access to the
+Twilio account (inline TwiML is normally logged; unverified, see "Not verified").
 
 ## Settings keys (AW-Settings)
 
@@ -271,10 +274,11 @@ Jest (`NODE_ENV=test`) it is always off unless overridden.
 - `BACKEND_URL` must be the public origin Twilio can reach (scheme and host
   exactly as Twilio will call it, no trailing path). It builds every webhook URL
   AND is the base the signature is verified against, with `req.originalUrl`
-  appended (never the Host header). In `production`, `staging` or any
-  `NODE_ENV` other than `development`/`test`, an unset value throws before any
-  record is created or call placed (the localhost fallback applies only in
-  development/test).
+  appended (never the Host header). A trailing slash is stripped. An unset
+  `BACKEND_URL` throws before any record is created or call placed when
+  `NODE_ENV` is set to anything other than `development` or `test` (production,
+  staging); only `development`, `test` or an unset `NODE_ENV` fall back to
+  localhost.
 - Webhook mount: `/api/webhooks/twilio-voice`, no auth middleware; every request
   must carry a valid `X-Twilio-Signature`. The route has its own 64 KB flat-form
   body parser, registered before the global 50 MB parsers.
@@ -359,7 +363,7 @@ Rules the code enforces:
   minutes (round up per leg; Twilio's pricing page states a per-minute rate and
   no rounding rule, so rounding up is the conservative choice). A leg with
   `CallDuration` 0 records no event but is still marked metered so the call can
-  finish. A missing or non-numeric `CallDuration` is never defaulted to 0: the
+  finish. A missing, empty, blank or non-numeric `CallDuration` is never defaulted to 0: the
   leg is not billed and a warning is logged, so a malformed callback
   undercharges visibly rather than silently.
 - The owner leg is billed as an outbound minute for the whole time the owner is
@@ -477,7 +481,8 @@ mid-call. No cron cleans these up and no operator tool lists them.
   (`call.*` events) and its `system.hot_lead_call` record.
 - Otherwise run a one-off, read-only scan of `AW-Leads`, off-peak (a full scan
   of a large table consumes read capacity). Shape only, not run against
-  production here; adjust region and profile:
+  production here; adjust region and profile, and use `Dev-AW-Leads` in
+  development:
 
   ```sh
   aws dynamodb scan --region us-west-2 --table-name AW-Leads \
@@ -607,10 +612,13 @@ Twilio's documentation and encoded in tests with synthetic payloads:
   the mailbox; there is no answering-machine detection and "press 1" will not be
   pressed, so it ends as `owner_declined` after the Gather times out, and the
   answered voicemail leg is billed.
-- `BACKEND_URL` scheme and port: Twilio signs the exact URL it requested. A URL
-  with a default port, a trailing slash or an `http`/`https` mismatch behind a
-  proxy or load balancer would fail signature checks (401). Confirm with the
-  first real callback.
+- `BACKEND_URL` scheme and port: Twilio signs the exact URL it requested. The code
+  strips a trailing slash, so that is not a risk; an `http`/`https` or port
+  mismatch between `BACKEND_URL` and the URL Twilio actually calls (for example
+  behind a proxy or load balancer) would fail signature checks (401). Confirm
+  with the first real callback.
+- That the verification code spoken by inline TwiML is visible in the Twilio call
+  log (assumed from Twilio logging call instructions; not checked).
 - The `X-Twilio-Signature` for form bodies with repeated or empty parameters
   (empty values such as `FinishedOnKey` are signed by Twilio's algorithm; the
   test uses the library's own function).
