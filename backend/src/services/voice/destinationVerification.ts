@@ -16,12 +16,19 @@ import { isConditionalFailure, unchangedSince } from './setupWrites';
  *
  * The record lives in the org attribute `hotLeadCallVerification` and holds only an HMAC of the code, never
  * the code. The code must never be logged or returned: the owner hears it, nobody else may learn it.
+ *
+ * Inherent limits, accepted: the call cannot tell a person from voicemail or an IVR, so a voicemail box that
+ * plays the message back to its owner also passes verification; and the spoken code is visible in the Twilio
+ * call log to anyone with access to the Twilio account.
+ *
+ * The start history (`startedAt`) outlives a successful confirm and a phone change: after success the record
+ * is kept with no pending code, so alternating phones cannot reset the 2-minute gap or the daily cap.
  */
 
 export const VERIFICATION_CODE_TTL_MS = 10 * 60_000;
-export const VERIFICATION_MIN_GAP_MS = 2 * 60_000;
+const VERIFICATION_MIN_GAP_MS = 2 * 60_000;
 const DAY_MS = 24 * 60 * 60_000;
-export const VERIFICATION_MAX_STARTS_PER_DAY = 5;
+const VERIFICATION_MAX_STARTS_PER_DAY = 5;
 export const VERIFICATION_MAX_ATTEMPTS = 5;
 const CALL_TIMEOUT_SECONDS = 30;
 /**
@@ -29,14 +36,14 @@ const CALL_TIMEOUT_SECONDS = 30;
  * message; Twilio bills per started minute and an answered call that short is one minute, so one minute
  * is the exact charge for an answered call and a small over-estimate (one minute) for an unanswered one.
  */
-export const VERIFICATION_CALL_ESTIMATED_SECONDS = 60;
+const VERIFICATION_CALL_ESTIMATED_SECONDS = 60;
 
 export interface HotLeadCallVerification {
   /** E.164 phone the code was issued for; a code is worthless once destinationPhone differs. */
   phone: string;
-  /** Hex HMAC-SHA256 of the code, bound to the org and phone. */
-  codeHash: string;
-  /** Epoch ms; the code is valid while now < expiresAt. */
+  /** Hex HMAC-SHA256 of the code, bound to the org and phone. Null once verified: only the start history remains. */
+  codeHash: string | null;
+  /** Epoch ms; the code is valid while now < expiresAt. 0 when there is no pending code. */
   expiresAt: number;
   /** Wrong or counted confirm attempts against this code. */
   attempts: number;
@@ -47,18 +54,19 @@ export interface HotLeadCallVerification {
 
 const isEpoch = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v > 0;
 
-export function verificationOf(raw: unknown): HotLeadCallVerification | null {
+function verificationOf(raw: unknown): HotLeadCallVerification | null {
   if (!isRecord(raw)) return null;
   const { phone, codeHash, expiresAt, attempts, callSid, startedAt } = raw;
-  if (typeof phone !== 'string' || typeof codeHash !== 'string' || !/^[0-9a-f]{64}$/.test(codeHash)) return null;
-  if (!isEpoch(expiresAt) || typeof attempts !== 'number' || !Number.isInteger(attempts) || attempts < 0) return null;
+  if (typeof phone !== 'string' || (codeHash !== null && (typeof codeHash !== 'string' || !/^[0-9a-f]{64}$/.test(codeHash)))) return null;
+  if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt) || expiresAt < 0 || typeof attempts !== 'number' || !Number.isInteger(attempts) || attempts < 0) return null;
   if (callSid !== undefined && typeof callSid !== 'string') return null;
   if (!Array.isArray(startedAt) || !startedAt.every(isEpoch)) return null;
   return { phone, codeHash, expiresAt, attempts, ...(callSid ? { callSid } : {}), startedAt };
 }
 
 function hashCode(orgId: string, phone: string, code: string): string {
-  return crypto.createHmac('sha256', getJwtSecret()).update(`${orgId}|${phone}|${code}`).digest('hex');
+  // The label keeps this MAC from ever colliding with another use of the same secret.
+  return crypto.createHmac('sha256', getJwtSecret()).update(`hlc-verify-v1|${orgId}|${phone}|${code}`).digest('hex');
 }
 
 function escapeXml(text: string): string {
@@ -140,10 +148,11 @@ function sameHash(expectedHex: string, actualHex: string): boolean {
 export async function confirmVerification(org: Organization, config: HotLeadCallConfig, code: string) {
   const previousRaw = org.hotLeadCallVerification;
   const verification = verificationOf(previousRaw);
-  if (!verification) throw new Error('No verification is in progress. Start one first (start_hot_lead_call_verification).');
+  if (!verification?.codeHash) throw new Error('No verification is in progress. Start one first (start_hot_lead_call_verification).');
   if (verification.phone !== config.destinationPhone) {
     throw new Error('The destination phone changed after the code was sent. Start a new verification.');
   }
+  const expectedHash = verification.codeHash;
   const now = Date.now();
   if (now >= verification.expiresAt) throw new Error('The code has expired. Start a new verification.');
   if (verification.attempts >= VERIFICATION_MAX_ATTEMPTS) throw new Error('Too many incorrect attempts. Start a new verification.');
@@ -158,7 +167,7 @@ export async function confirmVerification(org: Organization, config: HotLeadCall
     throw err;
   }
 
-  if (!sameHash(verification.codeHash, hashCode(org.orgId, verification.phone, code))) {
+  if (!sameHash(expectedHash, hashCode(org.orgId, verification.phone, code))) {
     const left = VERIFICATION_MAX_ATTEMPTS - counted.attempts;
     throw new Error(left > 0 ? `That code is not correct. ${left} attempt(s) left.` : 'That code is not correct and no attempts are left. Start a new verification.');
   }
@@ -167,7 +176,9 @@ export async function confirmVerification(org: Organization, config: HotLeadCall
   if (!verified) throw new Error('Stored hot lead call settings are invalid');
   try {
     // Unchanged hotLeadCall means destinationPhone is still the phone the code was issued for.
-    await orgDb.updateOrg(org.orgId, { hotLeadCall: verified, hotLeadCallVerification: null }, {
+    // The record stays, without a pending code, so the start history keeps limiting later starts.
+    const spent: HotLeadCallVerification = { phone: verification.phone, codeHash: null, expiresAt: 0, attempts: 0, startedAt: verification.startedAt };
+    await orgDb.updateOrg(org.orgId, { hotLeadCall: verified, hotLeadCallVerification: spent }, {
       condition: unchangedSince({ hotLeadCall: org.hotLeadCall, hotLeadCallVerification: counted }),
     });
   } catch (err) {
