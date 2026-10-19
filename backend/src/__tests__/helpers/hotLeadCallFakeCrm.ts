@@ -140,3 +140,13 @@ export class FakeCrm {
     },
   };
 }
+
+/**
+ * What the test files' `jest.mock('../services/db')` factory returns: the three db objects delegate to whichever
+ * FakeCrm the current test installed in `crmHolder`.
+ */
+export const crmHolder: { current?: FakeCrm } = {};
+type Primitives = Record<string, (...args: unknown[]) => unknown>;
+const delegate = (pick: 'crmDb' | 'userDb' | 'orgDb') =>
+  new Proxy({}, { get: (_target, name) => (...args: unknown[]) => (crmHolder.current![pick] as unknown as Primitives)[String(name)](...args) });
+export const dbMock = { crmDb: delegate('crmDb'), userDb: delegate('userDb'), orgDb: delegate('orgDb') };

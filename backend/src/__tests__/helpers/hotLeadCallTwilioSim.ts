@@ -11,7 +11,7 @@ import { FakeVoiceProvider } from '../../services/voice/fakeVoiceProvider';
 import type { ValidateSignatureParams } from '../../services/voice/voiceProvider';
 import twilioVoiceWebhookRoutes, { twilioVoiceBodyParser } from '../../routes/twilioVoiceWebhook';
 
-export const TEST_AUTH_TOKEN = 'test-auth-token-0123456789abcdef0123';
+const TEST_AUTH_TOKEN = 'test-auth-token-0123456789abcdef0123';
 export const MOUNT = '/api/webhooks/twilio-voice';
 
 /** The strict fake, with the signature check swapped for Twilio's real HMAC over the URL and form params. */
@@ -23,7 +23,7 @@ export class SignedFakeVoiceProvider extends FakeVoiceProvider {
 }
 
 /** Same stack order as app.ts: the route's narrow body parser first, then the global wide ones. */
-export function buildWebhookApp(): express.Express {
+function buildWebhookApp(): express.Express {
   const app = express();
   app.use(MOUNT, twilioVoiceBodyParser);
   app.use(express.json({ limit: '50mb' }));
@@ -32,7 +32,7 @@ export function buildWebhookApp(): express.Express {
   return app;
 }
 
-export const unescapeXml = (s: string): string =>
+const unescapeXml = (s: string): string =>
   s.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 
 /** The value of the first `name="..."` attribute in a TwiML document, XML-unescaped. */
@@ -44,7 +44,7 @@ export function attrOf(xml: string, name: string): string {
 
 export const sayText = (xml: string): string => unescapeXml(/<Say>([^<]*)<\/Say>/.exec(xml)?.[1] ?? '');
 
-export interface TwilioReply { status: number; body: string }
+interface TwilioReply { status: number; body: string }
 
 /**
  * Posts like Twilio: the fragment of a webhook URL is never sent and never signed; the signature covers the
