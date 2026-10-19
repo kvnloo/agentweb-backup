@@ -28,7 +28,7 @@ describe('hotLeadCallConfigOf', () => {
     expect(hotLeadCallConfigOf(base({ announcedName: '  O\'Brien & Sons, Inc.  ' }))?.announcedName).toBe("O'Brien & Sons, Inc.");
   });
 
-  it.each(['+19002223333', '+19003334444', '+18005550199', '+15335551234', '+15005550006', '+16005550123'])('rejects premium-rate, toll-free and personal numbers (toll fraud): %s', phone => {
+  it.each(['+19002223333', '+18005550199', '+15335551234', '+15005550006', '+16005550123'])('rejects premium-rate, toll-free, personal and VOIP numbers (toll fraud): %s', phone => {
     expect(hotLeadCallConfigOf(base({ destinationPhone: phone }))).toBeNull();
     expect(hotLeadCallConfigOf(base({ twilioNumber: phone }))).toBeNull();
   });

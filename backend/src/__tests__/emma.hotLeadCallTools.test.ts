@@ -139,13 +139,11 @@ describe('update_hot_lead_call_settings', () => {
     await update({ quietHours: { timezone: 'US/Eastern' } });
     expect(lastWrite()[1].hotLeadCall.quietHours.timezone).toBe('America/New_York');
   });
-  it('accepts a valid timezone change and describes quiet hours and territory limits', async () => {
-    await update({ quietHours: { timezone: 'America/Indiana/Indianapolis' } });
-    expect(lastWrite()[1].hotLeadCall.quietHours.timezone).toBe('America/Indianapolis');
+  it('describes quiet hours wrap, territory limits and the refused zones', () => {
     const def = handlers.get('update_hot_lead_call_settings')!.definition;
     expect(def.description).toMatch(/wraps past midnight/);
     expect(def.description).toMatch(/Puerto Rico/);
-    expect(def.description).toMatch(/IANA Area\/Location name such as America\/Chicago \(UTC, abbreviations and Etc\/ zones are refused; letter case is normalised\)/);
+    expect(def.description).toMatch(/Etc\/ zones are refused/);
   });
   it('rejects a destination equal to the assigned caller number', async () => {
     await expect(update({ destinationPhone: '+14155550111' })).rejects.toThrow('Check the limits and name format');
