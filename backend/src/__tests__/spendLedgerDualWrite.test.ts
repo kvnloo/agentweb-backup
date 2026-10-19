@@ -20,6 +20,7 @@ import {
   resolveRateProvenance,
 } from '../services/spendLedgerDualWrite';
 import { recordSpendEvent } from '../services/spendEventDb';
+import type { SpendEvent } from '../services/spendEventDb';
 import { VENDOR_RATE_CARD_VERSION, setVendorRateOverridesForTests } from '../utils/vendorRateCard';
 
 const mockRecord = recordSpendEvent as jest.Mock;
@@ -83,14 +84,14 @@ describe('spendLedgerDualWrite', () => {
       [0.0000004, 0],
       [-0.5, 0], // clamped, not carried through as negative money
     ])('uses the SAME micro-dollar arithmetic as recordVendorUsage: $%s -> %s micro', (costUsd, expected) => {
-      const built = buildShadowEvent(anInput({ costUsd }), AT) as { event: any };
+      const built = buildShadowEvent(anInput({ costUsd }), AT) as { event: SpendEvent };
 
       expect(built.event.costMicroUsd).toBe(Math.max(0, Math.round((costUsd || 0) * 1e6)));
       expect(built.event.costMicroUsd).toBe(expected);
     });
 
     it('resolves the billing subject the same way (billingUserId || userId || system)', () => {
-      const explicit = buildShadowEvent(anInput({ userId: 'u', billingUserId: 'owner' }), AT) as { event: any };
+      const explicit = buildShadowEvent(anInput({ userId: 'u', billingUserId: 'owner' }), AT) as { event: SpendEvent };
       expect(explicit.event).toMatchObject({ billingUserId: 'owner', actingUserId: 'u' });
       // Passed through, NOT derived from payer != actor the way the charging
       // service derives it. Shadow parity is the goal here: recordVendorUsage
@@ -98,27 +99,27 @@ describe('spendLedgerDualWrite', () => {
       // would make the two rails disagree on rows that are otherwise identical.
       expect(explicit.event.onBehalfOf).toBeUndefined();
 
-      const fallback = buildShadowEvent(anInput({ userId: 'u', billingUserId: undefined }), AT) as { event: any };
+      const fallback = buildShadowEvent(anInput({ userId: 'u', billingUserId: undefined }), AT) as { event: SpendEvent };
       expect(fallback.event.billingUserId).toBe('u');
 
-      const system = buildShadowEvent(anInput({ userId: undefined, billingUserId: undefined }), AT) as { event: any };
+      const system = buildShadowEvent(anInput({ userId: undefined, billingUserId: undefined }), AT) as { event: SpendEvent };
       expect(system.event.billingUserId).toBe('system');
     });
 
     it('carries onBehalfOf and sessionId through', () => {
-      const built = buildShadowEvent(anInput({ onBehalfOf: 'member-2', sessionId: 's-9' }), AT) as { event: any };
+      const built = buildShadowEvent(anInput({ onBehalfOf: 'member-2', sessionId: 's-9' }), AT) as { event: SpendEvent };
 
       expect(built.event.onBehalfOf).toBe('member-2');
       expect(built.event.references).toEqual({ sessionId: 's-9' });
     });
 
     it('records settled, not reserved — the vendor call already happened', () => {
-      const built = buildShadowEvent(anInput(), AT) as { event: any };
+      const built = buildShadowEvent(anInput(), AT) as { event: SpendEvent };
       expect(built.event.lifecycle).toBe('settled');
     });
 
     it('derives billingMonth from the same instant', () => {
-      const built = buildShadowEvent(anInput(), '2026-01-31T23:59:59.999Z') as { event: any };
+      const built = buildShadowEvent(anInput(), '2026-01-31T23:59:59.999Z') as { event: SpendEvent };
       expect(built.event.billingMonth).toBe('2026-01');
     });
   });
@@ -168,7 +169,7 @@ describe('spendLedgerDualWrite', () => {
         const built = buildShadowEvent(
           anInput({ provider: 'twilio', operation: 'voice_minute_outbound', rateCardVersion: VENDOR_RATE_CARD_VERSION }),
           AT,
-        ) as { event: any };
+        ) as { event: SpendEvent };
         expect(built.event.rateCardVersion).toBe(VENDOR_RATE_CARD_VERSION);
       } finally {
         setVendorRateOverridesForTests(null);
@@ -181,13 +182,13 @@ describe('spendLedgerDualWrite', () => {
     });
 
     it('omits the version entirely for a vendor-measured cost', () => {
-      const built = buildShadowEvent(anInput({ costSource: 'measured' }), AT) as { event: any };
+      const built = buildShadowEvent(anInput({ costSource: 'measured' }), AT) as { event: SpendEvent };
       expect(built.event.rateCardVersion).toBeUndefined();
     });
 
     it('always sets a version for an allocated cost, so the event is never unattributable', () => {
-      const carded = buildShadowEvent(anInput({ provider: 'you.com', operation: 'query' }), AT) as { event: any };
-      const uncarded = buildShadowEvent(anInput({ provider: 'twitter', operation: 'post_read' }), AT) as { event: any };
+      const carded = buildShadowEvent(anInput({ provider: 'you.com', operation: 'query' }), AT) as { event: SpendEvent };
+      const uncarded = buildShadowEvent(anInput({ provider: 'twitter', operation: 'post_read' }), AT) as { event: SpendEvent };
 
       expect(carded.event.rateCardVersion).toBeTruthy();
       expect(uncarded.event.rateCardVersion).toBeTruthy();
@@ -196,13 +197,13 @@ describe('spendLedgerDualWrite', () => {
 
   describe('idempotency', () => {
     it('uses a call-site token when one is supplied', () => {
-      const built = buildShadowEvent(anInput({ idempotencyKey: 'vendor-req-42' }), AT) as { event: any };
+      const built = buildShadowEvent(anInput({ idempotencyKey: 'vendor-req-42' }), AT) as { event: SpendEvent };
       expect(built.event.eventId).toBe('vendor-req-42');
     });
 
     it('generates a marked id when none is — retries duplicate, matching the live rail', () => {
-      const a = buildShadowEvent(anInput(), AT) as { event: any };
-      const b = buildShadowEvent(anInput(), AT) as { event: any };
+      const a = buildShadowEvent(anInput(), AT) as { event: SpendEvent };
+      const b = buildShadowEvent(anInput(), AT) as { event: SpendEvent };
 
       expect(a.event.eventId).toMatch(/^gen:/);
       expect(a.event.eventId).not.toBe(b.event.eventId);

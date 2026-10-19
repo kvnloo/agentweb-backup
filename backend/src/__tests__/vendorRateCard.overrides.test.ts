@@ -12,7 +12,8 @@ import {
   applyVendorRateOverridesLocally,
   getAllocatedRate,
   getAllocatedRateWithVersion,
-  getRateCardVersion,
+  rateCardVersionFor,
+  isValidOverrideRate,
   parseVendorRateOverrides,
   refreshVendorRateOverrides,
   setVendorRateOverridesForTests,
@@ -44,7 +45,7 @@ describe('precedence', () => {
   it('ignores overrides for a provider outside the editable allowlist', () => {
     setVendorRateOverridesForTests({ v0: { landing_page_generation: 0.01 } } as never);
     expect(getAllocatedRate('v0', 'landing_page_generation')).toBe(2.0);
-    expect(getRateCardVersion()).toBe(VENDOR_RATE_CARD_VERSION);
+    expect(getAllocatedRateWithVersion('v0', 'landing_page_generation')?.version).toBe(VENDOR_RATE_CARD_VERSION);
   });
 });
 
@@ -54,7 +55,7 @@ describe('parseVendorRateOverrides (fail safe)', () => {
   it.each([
     ['zero', 0],
     ['negative', -1],
-    ['NaN-as-null', null],
+    ['null', null],
     ['string', '0.5'],
     ['above the cap', 1000.01],
     ['Infinity-as-null', null],
@@ -82,22 +83,28 @@ describe('parseVendorRateOverrides (fail safe)', () => {
     expect(String(warn.mock.calls[0][0])).not.toContain('7.77');
   });
 
-  it('lookup falls back to the card when the injected state is garbage', () => {
+  it('ignores a zero override', () => {
     setVendorRateOverridesForTests({ twilio: { voice_minute_outbound: 0 } } as never);
     expect(getAllocatedRate('twilio', 'voice_minute_outbound')).toBe(0.014);
+  });
+
+  it('keeps the audit fields when the last override has been removed', () => {
+    const state = parseVendorRateOverrides(stored({}));
+    expect(state).toEqual({ overrides: {}, updatedAt: T, updatedBy: 'admin-1' });
+    expect(rateCardVersionFor(state)).toBe(VENDOR_RATE_CARD_VERSION);
   });
 });
 
 describe('version stamping and snapshot consistency', () => {
   it('is the plain version with no override and suffixed with updatedAt with one', () => {
-    expect(getRateCardVersion()).toBe(VENDOR_RATE_CARD_VERSION);
+    expect(getAllocatedRateWithVersion('twilio', 'voice_minute_outbound')?.version).toBe(VENDOR_RATE_CARD_VERSION);
     setVendorRateOverridesForTests({ twilio: { voice_minute_outbound: 0.02 } }, T);
-    expect(getRateCardVersion()).toBe(`${VENDOR_RATE_CARD_VERSION}+ovr:${T}`);
+    expect(getAllocatedRateWithVersion('twilio', 'voice_minute_outbound')?.version).toBe(`${VENDOR_RATE_CARD_VERSION}+ovr:${T}`);
   });
 
   it('an empty overrides object is not an active override', () => {
     setVendorRateOverridesForTests({});
-    expect(getRateCardVersion()).toBe(VENDOR_RATE_CARD_VERSION);
+    expect(getAllocatedRateWithVersion('twilio', 'voice_minute_outbound')?.version).toBe(VENDOR_RATE_CARD_VERSION);
   });
 
   it('returns rate and version from one lookup, so a later change cannot split them', () => {
@@ -196,5 +203,85 @@ describe('refresh from AW-Settings (outside NODE_ENV=test)', () => {
     release(null); // the stale read says "no overrides"
     await slow;
     expect(getAllocatedRate('twilio', 'voice_minute_outbound')).toBe(0.05);
+  });
+});
+
+describe('6-decimal rule (a rate must never book as $0)', () => {
+  it.each([0.000001, 0.014, 1.15, 1000, 0.0125, 0.123456])('accepts %s', (v) => {
+    expect(isValidOverrideRate(v)).toBe(true);
+  });
+
+  it.each([0.0000001, 1e-7, 5e-324, 0.0140004, 1000.000001, 0, -0.000001, NaN, Infinity, 1000.01])(
+    'rejects %s',
+    (v) => {
+      expect(isValidOverrideRate(v)).toBe(false);
+    },
+  );
+
+  it('every accepted rate books at least one micro-dollar per unit', () => {
+    for (let i = 0; i < 20000; i++) {
+      const v = Math.random() < 0.5 ? Math.round(Math.random() * 1e6) / 1e6 : Math.random() * 10 ** -(Math.random() * 9);
+      if (isValidOverrideRate(v)) expect(Math.round(1 * v * 1e6)).toBeGreaterThanOrEqual(1);
+    }
+  });
+
+  it('the load path drops a stored sub-micro rate', () => {
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    expect(parseVendorRateOverrides(stored({ twilio: { voice_minute_outbound: 1e-7 } })).overrides).toEqual({});
+  });
+});
+
+describe('cold start', () => {
+  const realEnv = process.env.NODE_ENV;
+  beforeEach(() => {
+    process.env.NODE_ENV = 'production';
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-11-01T00:00:00Z'));
+    setVendorRateOverridesForTests(null);
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+  afterEach(() => {
+    process.env.NODE_ENV = realEnv;
+    jest.useRealTimers();
+  });
+
+  it('retries a failed first read after 5s, not a full TTL, and logs the failure once', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    mockGetSetting.mockRejectedValue(new Error('down'));
+    await refreshVendorRateOverrides();
+    mockGetSetting.mockClear();
+
+    jest.advanceTimersByTime(4_000);
+    getAllocatedRate('twilio', 'voice_minute_outbound');
+    await jest.advanceTimersByTimeAsync(0);
+    expect(mockGetSetting).not.toHaveBeenCalled();
+
+    jest.advanceTimersByTime(1_500);
+    getAllocatedRate('twilio', 'voice_minute_outbound');
+    await jest.advanceTimersByTimeAsync(0);
+    expect(mockGetSetting).toHaveBeenCalledTimes(1);
+    await jest.advanceTimersByTimeAsync(0);
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes('could not read'))).toHaveLength(1);
+  });
+
+  it('after one good read a failed refresh waits the full TTL again', async () => {
+    mockGetSetting.mockResolvedValueOnce(null);
+    await refreshVendorRateOverrides();
+    jest.advanceTimersByTime(61_000);
+    mockGetSetting.mockRejectedValue(new Error('down'));
+    await refreshVendorRateOverrides();
+    mockGetSetting.mockClear();
+    jest.advanceTimersByTime(6_000);
+    getAllocatedRate('twilio', 'voice_minute_outbound');
+    await jest.advanceTimersByTimeAsync(0);
+    expect(mockGetSetting).not.toHaveBeenCalled();
+  });
+
+  it('a non-editable vendor never triggers a settings read', async () => {
+    mockGetSetting.mockResolvedValue(null);
+    getAllocatedRate('v0', 'landing_page_generation');
+    getAllocatedRate('apollo', 'email_reveal');
+    await jest.advanceTimersByTimeAsync(0);
+    expect(mockGetSetting).not.toHaveBeenCalled();
   });
 });

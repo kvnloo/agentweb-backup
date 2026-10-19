@@ -156,7 +156,7 @@ export type VendorRateOverrides = Partial<Record<VendorRateProvider, Record<stri
 
 export interface VendorRateOverrideState {
   overrides: VendorRateOverrides;
-  /** ISO time of the last admin write; null when there are no overrides. */
+  /** ISO time of the last admin write; null when the item was never written. */
   updatedAt: string | null;
   updatedBy: string | null;
 }
@@ -173,17 +173,27 @@ export function isEditableVendorRate(provider: string, rateKey: string): boolean
   );
 }
 
+/**
+ * At most 6 decimal places: costs are booked in whole micro-dollars, so anything finer
+ * (1e-7 per minute) would round to a $0 "allocated" event. The single validator for both
+ * the admin route and the load path.
+ */
 export function isValidOverrideRate(value: unknown): value is number {
   return (
-    typeof value === "number" && Number.isFinite(value) && value > 0 && value <= MAX_OVERRIDE_USD_PER_UNIT
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    value > 0 &&
+    value <= MAX_OVERRIDE_USD_PER_UNIT &&
+    value === Number(value.toFixed(6)) &&
+    Math.round(value * 1e6) >= 1
   );
 }
 
 /**
  * Strictly parse the stored item. Never throws. Garbage as a whole (bad JSON,
  * wrong shape, no usable updatedAt) yields no overrides; a bad individual entry
- * is dropped on its own so one typo cannot disable the rest. Warnings carry
- * provider/key names only, never the stored values' provenance or any secret.
+ * is dropped on its own so one typo cannot disable the rest. Warnings name the
+ * provider and key only (the stored value is deliberately left out of the log).
  *
  * Stored shape: { overrides: { <provider>: { <rateKey>: <usdPerUnit> } }, updatedAt, updatedBy }
  */
@@ -211,7 +221,7 @@ export function parseVendorRateOverrides(raw: unknown): VendorRateOverrideState 
         (clean[p] ??= {})[rateKey] = value;
       }
     }
-    if (Object.keys(clean).length === 0) return NO_OVERRIDES;
+    // An emptied item keeps its audit fields (an admin reset is still a recorded change).
     return { overrides: clean, updatedAt, updatedBy: typeof updatedBy === "string" ? updatedBy : null };
   } catch (error) {
     console.warn(
@@ -230,7 +240,13 @@ export function rateCardVersionFor(state: VendorRateOverrideState): string {
 const OVERRIDE_TTL_MS = 60_000;
 const OVERRIDE_READ_TIMEOUT_MS = 1500;
 
+// A first read that fails is retried after this, not after a full TTL: until one good read has
+// landed the instance prices at the built-in defaults.
+const COLD_RETRY_MS = 5_000;
+
 let snapshot: { state: VendorRateOverrideState; at: number } = { state: NO_OVERRIDES, at: 0 };
+let loaded = false;
+let warnedCold = false;
 let inflight: Promise<void> | null = null;
 // Bumped by every read start and every local apply; a read result only lands if
 // nothing newer started since, so a slow stale read cannot clobber a fresh PUT.
@@ -244,6 +260,8 @@ export function setVendorRateOverridesForTests(
 ): void {
   testState = overrides ? parseVendorRateOverrides({ overrides, updatedAt, updatedBy: "test" }) : null;
   snapshot = { state: NO_OVERRIDES, at: 0 };
+  loaded = false;
+  warnedCold = false;
   inflight = null;
   epoch++;
 }
@@ -251,6 +269,7 @@ export function setVendorRateOverridesForTests(
 /** Make the state this instance just wrote effective immediately (admin PUT). */
 export function applyVendorRateOverridesLocally(state: VendorRateOverrideState): void {
   epoch++;
+  loaded = true;
   snapshot = { state, at: Date.now() };
 }
 
@@ -267,7 +286,7 @@ async function readOverrides(): Promise<VendorRateOverrideState | null> {
     ]);
     return parseVendorRateOverrides(row?.settingValue);
   } catch {
-    return null; // settingsService already logged; null = keep the last good snapshot
+    return null; // read error or timeout (no log here); null = keep the last good snapshot
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -276,8 +295,12 @@ async function readOverrides(): Promise<VendorRateOverrideState | null> {
 /**
  * Re-read the item now (shared in-flight read). On a read error or timeout the
  * last good snapshot is KEPT (an admin's price change should not silently
- * revert because DynamoDB hiccuped) and the next attempt waits a full TTL; a
- * missing or corrupt row means no overrides. Never rejects.
+ * revert because DynamoDB hiccuped); the next attempt waits a full TTL, or only
+ * COLD_RETRY_MS if no read has ever succeeded. A missing or corrupt row means no
+ * overrides. Never rejects.
+ *
+ * Residual (accepted): other instances lag an admin change by up to the 60s TTL, and a
+ * failed boot read prices at the built-in defaults for up to COLD_RETRY_MS afterwards.
  */
 export function refreshVendorRateOverrides(): Promise<void> {
   if (inflight) return inflight;
@@ -285,7 +308,16 @@ export function refreshVendorRateOverrides(): Promise<void> {
   const run = readOverrides()
     .then((state) => {
       if (mine !== epoch) return;
-      snapshot = { state: state ?? snapshot.state, at: Date.now() };
+      if (state) loaded = true;
+      else if (!loaded && !warnedCold) {
+        warnedCold = true;
+        console.warn("[vendorRateCard] could not read vendor rate overrides; pricing at the built-in defaults and retrying shortly");
+      }
+      const now = Date.now();
+      snapshot = {
+        state: state ?? snapshot.state,
+        at: loaded ? now : now - (OVERRIDE_TTL_MS - COLD_RETRY_MS),
+      };
     })
     .catch(() => undefined)
     .finally(() => {
@@ -310,37 +342,23 @@ function currentState(): VendorRateOverrideState {
  * version of the rate that priced it, even if an override lands in between.
  * The `+ovr` suffix is only added when the override for THIS key was applied:
  * every other key is priced by the plain card and keeps the plain version.
+ * Only editable providers touch the snapshot (and so the background read).
+ *
+ * A future overridable provider that records via `costUsd` instead of a `rateKey`
+ * must have this version passed through to the ledger mirror, as the rateKey path does.
  */
 export function getAllocatedRateWithVersion(
   provider: VendorRateProvider,
   rateKey: string,
 ): { rate: number; version: string } | null {
   if (!rateKey || !hasOwn(RATE_CARD, provider) || !hasOwn(RATE_CARD[provider], rateKey)) return null;
-  const card = { rate: RATE_CARD[provider][rateKey].usdPerUnit, version: VENDOR_RATE_CARD_VERSION };
-  try {
+  if ((EDITABLE_VENDOR_RATE_PROVIDERS as readonly string[]).includes(provider)) {
+    // Snapshot entries were validated by the parser; nothing here can throw.
     const state = currentState();
-    const override = state.overrides[provider];
-    if (
-      override &&
-      hasOwn(override, rateKey) &&
-      isEditableVendorRate(provider, rateKey) &&
-      isValidOverrideRate(override[rateKey])
-    ) {
-      return { rate: override[rateKey], version: rateCardVersionFor(state) };
-    }
-  } catch {
-    // never let the override layer break pricing: use the built-in card
+    const override = state.overrides[provider]?.[rateKey];
+    if (override !== undefined) return { rate: override, version: rateCardVersionFor(state) };
   }
-  return card;
-}
-
-/** The version a consumer with no particular key would stamp right now. */
-export function getRateCardVersion(): string {
-  try {
-    return rateCardVersionFor(currentState());
-  } catch {
-    return VENDOR_RATE_CARD_VERSION;
-  }
+  return { rate: RATE_CARD[provider][rateKey].usdPerUnit, version: VENDOR_RATE_CARD_VERSION };
 }
 
 /** Effective view of every editable rate, for the admin API. */
