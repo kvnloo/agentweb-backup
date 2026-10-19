@@ -5,7 +5,7 @@ import { isRecord } from './leadNotificationAttribution';
 import { isValidTimezone as isKnownTimezone } from './dripSendWindow';
 
 export const HOT_LEAD_CALL_COUNTRIES = ['US', 'CA'] as const;
-export type HotLeadCallCountry = typeof HOT_LEAD_CALL_COUNTRIES[number];
+type HotLeadCallCountry = typeof HOT_LEAD_CALL_COUNTRIES[number];
 
 const HOT_LEAD_CALL_DEFAULT_LEAD_TYPES: readonly LeadOrigin[] = ['form_fill'];
 const HOT_LEAD_CALL_DEFAULT_QUIET_HOURS = { start: '08:00', end: '21:00' } as const;
@@ -23,7 +23,7 @@ export const HOT_LEAD_CALL_LIMIT_FIELDS = Object.keys(HOT_LEAD_CALL_LIMITS) as H
 /** System-managed: set only by the number-provisioning / verification flow, never by Emma tools. */
 export const HOT_LEAD_CALL_SYSTEM_FIELDS = ['destinationVerifiedAt', 'twilioNumber', 'twilioNumberSid'] as const;
 
-export interface HotLeadCallQuietHours {
+interface HotLeadCallQuietHours {
   /**
    * The window in which calls ARE allowed (24h HH:MM, local to `timezone`); outside it the system stays quiet.
    * start > end wraps past midnight, so consumers must handle both orders. The lead's own timezone is not considered.
@@ -68,18 +68,21 @@ const ANNOUNCED_NAME = /^[\p{L}\p{N} .,&'-]+$/u;
 export const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
 const TWILIO_SID = /^PN[0-9a-f]{32}$/;
 
-// IANA 'Area/Location' with proper capitalisation. Deliberately not a membership test against
-// Intl.supportedValuesOf: ICU canonicalises (America/Indianapolis, US/Eastern...) and the list differs
-// by Node/ICU version, so a stored zone could stop validating after an upgrade. Abbreviations (EST),
-// UTC and the Etc/ area are refused: none is a place whose local clock gates calls. The drip helper's
-// Intl check catches well-formed but unknown names.
-const IANA_ZONE = /^(?:[A-Z][a-z]+|US)(?:\/[A-Z][A-Za-z0-9_+-]*)+$/;
-// The drip helper alone is not enough: it accepts UTC, EST and lowercase names.
-// Rejects Etc/ (other casings already fail the shape regex) and all-caps location parts (AMERICA/CHICAGO, America/CHICAGO), which Intl would
-// case-fold and accept. Verified against all Intl.supportedValuesOf names and all tzdata slash zones: only Etc/* is refused.
-export const isIanaAreaTimezone = (tz: unknown): tz is string =>
-  typeof tz === 'string' && IANA_ZONE.test(tz) && !tz.startsWith('Etc/') &&
-  !tz.split('/').slice(1).some((part) => /^[A-Z]{4,}$/.test(part)) && isKnownTimezone(tz);
+// IANA 'Area/Location' with sane capitalisation, for a calling-window clock. Not a membership test against
+// Intl.supportedValuesOf: ICU canonicalises aliases and the list varies by Node/ICU version. Checked: area
+// capitalisation, no Etc/ zones, location words are Capitalised (all-caps only for 2-3 letter names such as
+// NSW), plus Intl accepting the name. Not checked: Intl folds case, so a case variant that still looks like
+// real words (e.g. America/Los_angeles) can pass; the UTC/EST/GMT abbreviations fail for having no slash.
+const AREA = /^(?:[A-Z][a-z]+|US)$/;
+const LOCATION_WORD = /^(?:[A-Z]{2,3}|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)*)$/;
+const isLocationPart = (part: string): boolean =>
+  part === 'DumontDUrville' || // the one real name whose casing looks like a corruption
+  part.split(/[_-]/).every((word) => LOCATION_WORD.test(word) || /^(?:of|es|au)$/.test(word));
+export const isIanaAreaTimezone = (tz: unknown): tz is string => {
+  if (typeof tz !== 'string') return false;
+  const [area, ...locations] = tz.split('/');
+  return AREA.test(area) && area !== 'Etc' && locations.length > 0 && locations.every(isLocationPart) && isKnownTimezone(tz);
+};
 
 // Types that bill the caller (toll fraud: premium, toll-free, shared-cost, personal, UAN) or are not a
 // person's direct line. VOIP can ring a person but is blocked anyway; note the default (min) metadata only

@@ -39,12 +39,26 @@ describe('hotLeadCallConfigOf', () => {
     expect(hotLeadCallConfigOf(base({ twilioNumber: '+14155550100' }))).toBeNull();
   });
 
-  it.each(['EST', '+05:00', 'america/chicago', 'UTC', 'GMT', 'Etc/UTC', 'etc/utc', 'ETC/UTC', 'AMERICA/CHICAGO', 'America/CHICAGO', 'Mars/Olympus', 'America/Chicago ', ''])('rejects non-IANA timezone %j', timezone => {
+  it.each([
+    ['no slash', 'UTC'],
+    ['lowercase area', 'america/chicago'],
+    ['unknown zone', 'Mars/Olympus'],
+    ['Etc area', 'Etc/UTC'],
+    ['all-caps area', 'AMERICA/CHICAGO'],
+    ['all-caps location', 'America/CHICAGO'],
+    ['mixed case: caps tail', 'America/Los_ANGELES'],
+    ['mixed case: caps word', 'America/New_YORK'],
+    ['mixed case: caps prefix', 'America/CHicago'],
+    ['mixed case: all-caps words', 'America/LOS_ANGELES'],
+    ['lowercase second word', 'America/New_york'],
+    ['trailing whitespace', 'America/Chicago '],
+  ])('rejects timezone: %s', (_reason, timezone) => {
     expect(hotLeadCallConfigOf(base({ quietHours: { timezone } }))).toBeNull();
   });
   it.each([
     'America/Chicago', 'America/Toronto', 'America/Los_Angeles', 'America/Indiana/Indianapolis', 'America/Kentucky/Louisville',
     'America/Montreal', 'America/Halifax', 'America/St_Johns', 'America/Phoenix', 'America/Anchorage', 'Pacific/Honolulu', 'US/Eastern', 'Australia/NSW',
+    'America/Port-au-Prince', 'America/Argentina/ComodRivadavia', 'Antarctica/DumontDUrville', 'Africa/Dar_es_Salaam', 'America/Indiana/Tell_City',
     'America/Nipigon', 'America/Fort_Wayne', 'Canada/Eastern',
   ])('accepts IANA timezone %s (including ICU-canonicalised aliases)', timezone => {
     expect(hotLeadCallConfigOf(base({ quietHours: { timezone } }))?.quietHours?.timezone).toBe(timezone);

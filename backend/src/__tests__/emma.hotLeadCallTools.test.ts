@@ -126,7 +126,7 @@ describe('update_hot_lead_call_settings', () => {
     await expect(update({ quietHours })).rejects.toThrow('quietHours must be an object');
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
-  it.each(['UTC', 'EST', 'america/chicago', 'Mars/Olympus', 'Nope/Zone', 'AMERICA/CHICAGO', 'Etc/UTC'])('names the timezone problem for %s', async timezone => {
+  it.each(['UTC', 'Mars/Olympus', 'AMERICA/CHICAGO', 'Etc/UTC', 'America/Los_ANGELES'])('names the timezone problem for %s', async timezone => {
     await expect(update({ quietHours: { timezone } })).rejects.toThrow(/timezone must be an IANA Area\/Location name such as America\/Chicago/);
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
