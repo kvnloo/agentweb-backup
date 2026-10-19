@@ -3689,3 +3689,28 @@ describe('ENG-1668 follow-up — GOOGLE_ADS_RUN_FAILURE_BUDGET is env-overridabl
     expect(execute).toHaveBeenCalled();
   });
 });
+
+describe('ENG-2572 — evaluate wrap runs even without a resolved input schema', () => {
+  it.each([
+    ['(() => "iife-42")()', '() => ((() => "iife-42")())'],
+    ['JSON.stringify({v:"bare-43"});', '() => (JSON.stringify({v:"bare-43"}))'],
+  ])('wraps %s when inputSchema is undefined', (source, expected) => {
+    const result = validateAndRepairToolArgs({
+      toolName: 'playwright_browser_evaluate',
+      args: { function: source },
+      inputSchema: undefined,
+    });
+    expect(result.status).toBe('repaired');
+    expect((result.args as Record<string, unknown>).function).toBe(expected);
+    expect(result.repairs).toEqual(['function:wrap_expression']);
+  });
+
+  it('leaves real function sources untouched without a schema', () => {
+    const result = validateAndRepairToolArgs({
+      toolName: 'playwright_browser_evaluate',
+      args: { function: '() => document.title' },
+      inputSchema: undefined,
+    });
+    expect(result.status).toBe('valid');
+  });
+});

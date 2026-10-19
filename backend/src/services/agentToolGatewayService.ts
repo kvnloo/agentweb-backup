@@ -905,6 +905,13 @@ export function validateAndRepairToolArgs(
   const repairs: string[] = [];
 
   if (!schema || schema.type !== 'object') {
+    // ENG-2572: the playwright evaluate repair must not depend on a resolved
+    // schema — MCP tools often arrive here with no inputSchema.
+    if (input.args && typeof input.args === 'object' && !Array.isArray(input.args)) {
+      const evalArgs: Record<string, unknown> = { ...(input.args as Record<string, unknown>) };
+      const evalRepair = repairEvaluateFunctionArg(input.toolName, evalArgs);
+      if (evalRepair) return { status: 'repaired', args: evalArgs, issues, repairs: [evalRepair] };
+    }
     return { status: 'valid', args: input.args, issues, repairs };
   }
 
