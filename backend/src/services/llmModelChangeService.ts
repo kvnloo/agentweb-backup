@@ -160,6 +160,8 @@ async function resolveSwitchableModels(userId: string): Promise<{
 function restoreModelArgs(
   scheduleId: string,
   modelBefore: string | null,
+  /** ENG-669: the origin the change replaced ('system' = an admin-template pin); restored with the model. */
+  modelSourceBefore: 'system' | undefined,
   /**
    * The model the schedule must STILL be on for this restore to be safe — the one
    * the change being reverted installed. Without it a restore reinstates a stale
@@ -175,6 +177,12 @@ function restoreModelArgs(
   string[] | undefined,
 ] {
   const expect = expectedCurrentModel ? { llmModel: expectedCurrentModel } : undefined;
+  if (modelSourceBefore === 'system') {
+    // The apply recorded the switch as the owner's ('user'); put the admin-template origin back with the model.
+    return modelBefore === null
+      ? [scheduleId, {}, expect, undefined, ['llmModel', 'llmModelSource']]
+      : [scheduleId, { llmModel: modelBefore, llmModelSource: 'system' }, expect, undefined, undefined];
+  }
   return modelBefore === null
     ? [scheduleId, {}, expect, undefined, ['llmModel']]
     : [scheduleId, { llmModel: modelBefore }, expect, undefined, undefined];
@@ -269,6 +277,8 @@ export async function applyModelChange(
   // happened to be, because the default can move afterwards and inheritance
   // follows it while a pinned copy does not.
   const modelBefore: string | null = schedule.llmModel || null;
+  // ENG-669: an admin-template pin's origin; the switch below records the owner's choice, so an undo must restore it.
+  const modelSourceBefore: 'system' | undefined = schedule.llmModelSource === 'system' ? 'system' : undefined;
   if (modelBefore === input.toModel) {
     // Already there. Reporting success without writing keeps a double-click from
     // manufacturing history that says the model changed when it did not.
@@ -333,6 +343,7 @@ export async function applyModelChange(
       scopeId: input.scopeId,
       scopeLabel: schedule.scheduleName ?? null,
       modelBefore,
+      ...(modelSourceBefore && { modelSourceBefore }),
       modelAfter: input.toModel,
       estimatedDaysRecoveredAtDecision: input.estimatedDaysRecovered ?? null,
       confidenceAtDecision: input.confidence ?? null,
@@ -343,7 +354,7 @@ export async function applyModelChange(
     // Compensate. An unaudited change cannot be explained or undone through the
     // UI, so the customer is better served by the switch simply not happening.
     await scheduleDb
-      .updateSchedule(...restoreModelArgs(input.scopeId, modelBefore, input.toModel))
+      .updateSchedule(...restoreModelArgs(input.scopeId, modelBefore, modelSourceBefore, input.toModel))
       .catch((revertError: unknown) => {
         // A failed CONDITION is not a failed revert: it means our unaudited write
         // was already replaced by someone else's deliberate one, which is the
@@ -437,7 +448,7 @@ export async function undoModelChange(
   // that and finishes the stamp.
   try {
     await scheduleDb.updateSchedule(
-      ...restoreModelArgs(change.scopeId, change.modelBefore, change.modelAfter),
+      ...restoreModelArgs(change.scopeId, change.modelBefore, change.modelSourceBefore, change.modelAfter),
     );
   } catch (error) {
     if (!isConditionalCheckFailure(error)) throw error;

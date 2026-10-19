@@ -89,7 +89,7 @@ import { assertSequentialStepCounts } from '../services/workPlanSteps';
 import { validateModelPin, normalizeRequestedLlmModel, resolvePlanLaunchModel, canonicalPinId } from '../services/agentMode/modelPin';
 import { workPlanStepModels } from '../services/agentMode/workPlanStepModelsInstance';
 import { assertModelInOwnerPlan, isSystemAuthoredPlan, modelAccess, systemModelCheck, type SystemModelSession } from '../services/agentMode/modelAccessInstance';
-import { modelSourceAfter as modelSourceAfterStamp, type ModelSource, type StoredModelRecord } from '../services/agentMode/modelAccess';
+import { modelSourceAfter as modelSourceAfterStamp, resolveLegacyModelAlias, type ModelSource, type StoredModelRecord } from '../services/agentMode/modelAccess';
 import {
   anyStepCarriesModel,
   buildStepModelPausedMessage,
@@ -9077,22 +9077,34 @@ async function describeModelAccessForPicker(userId: string, entitledModels: read
   };
 }
 
-/** Same model after legacy-alias resolution (raw comparison for partial test doubles). */
-function sameModelId(a: string | null | undefined, b: string | null | undefined): boolean {
-  if (!a || !b) return false;
-  const normalize = (id: string) => (typeof agentModeService.normalizeModelId === 'function' ? agentModeService.normalizeModelId(id.trim()) : id.trim());
-  return normalize(a) === normalize(b);
+/**
+ * ENG-669: the canonical id a model string stands for (legacy aliases resolved; an unknown id is kept as is): the
+ * service's normaliser (the registry alias table; no fallback logging), else a resolvable id from a partial test
+ * double that only implements resolveGenerationModel, else the registry's alias table.
+ */
+function canonicalModelId(id: string): string {
+  const trimmed = id.trim();
+  if (typeof agentModeService.normalizeModelId === 'function') return agentModeService.normalizeModelId(trimmed);
+  if (typeof agentModeService.resolveGenerationModel === 'function') {
+    const resolution = agentModeService.resolveGenerationModel(trimmed);
+    if (!resolution.fellBack) return resolution.model;
+  }
+  return resolveLegacyModelAlias(trimmed);
 }
 
-/** ENG-669: who chose `model` once written to this session (see modelAccess.modelSourceAfter), alias-aware. */
+/** Same model after legacy-alias resolution. */
+function sameModelId(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (!a || !b) return false;
+  return canonicalModelId(a) === canonicalModelId(b);
+}
+
+/** ENG-669: who chose `model` once written to this session (see modelAccess.modelSourceAfter), on canonical ids. */
 function modelSourceAfter(
   session: StoredModelRecord | null | undefined,
   model: string | null | undefined,
   explicitPick: string | null | undefined,
 ): ModelSource {
-  return modelSourceAfterStamp(session, model, explicitPick, (id) => (
-    typeof agentModeService.normalizeModelId === 'function' ? agentModeService.normalizeModelId(id) : id
-  ));
+  return modelSourceAfterStamp(session, model, explicitPick, canonicalModelId);
 }
 
 // Common function to generate AI response for a session
@@ -9218,7 +9230,7 @@ export async function generateSessionResponse(
   // system model, so it must be in the owner's plan; a model the caller chose itself (a configured default, the
   // brand-build model, a task-type default) is AgentWeb's choice and differs from the stored one. Thrown before
   // anything is persisted; callers surface it as the model_unavailable message.
-  if (session.llmModel && sameModelId(llmModel, session.llmModel)) {
+  if (session.llmModel && (await modelAccess.isEnabled()) && sameModelId(llmModel, session.llmModel)) {
     await assertModelInOwnerPlan({ ownerUserId: session.userId, model: llmModel, session });
   }
   // Some server-side callers (notably Slack) resume a persisted delegated
@@ -11219,6 +11231,13 @@ export const agentModeController = {
         }
       }
     } catch (error) {
+      // ENG-669: the final gate in generateSessionResponse refused the turn's model before anything was persisted
+      // (e.g. a race with a tier change): the same 422 the pre-flight answers, never a generic 500.
+      if (isModelUnavailableError(error) && !res.headersSent) {
+        if (runSurvivalRunId) void markRunTerminal(runSurvivalRunId, 'failed', { finishReason: 'model_unavailable' });
+        if (req.body?.sessionId) markProgressComplete(req.body.sessionId);
+        return res.status(422).json(modelUnavailableBody(error));
+      }
       console.error('AgentMode: Generate response error:', error);
 
       // Run-survival: record the terminal state on the durable run record.
@@ -12355,6 +12374,11 @@ export const agentModeController = {
         releaseSessionGeneration(session.sessionId);
       }
     } catch (error) {
+      // ENG-669: a model refused by the final gate is a 422 (viewer body: no owner plan details), not a 500.
+      if (isModelUnavailableError(error) && !res.headersSent) {
+        if (req.params?.shareId) markProgressComplete(req.params.shareId);
+        return res.status(422).json(modelUnavailableBody(error, 'share_viewer'));
+      }
       console.error('AgentMode: Generate shared response error:', error);
 
       // Clean up progress store on error so session doesn't appear stuck in generating state
@@ -15873,6 +15897,11 @@ export const agentModeController = {
         skills: response.skills,
       });
     } catch (error) {
+      // ENG-669: a model refused by the final gate is a 422 (viewer body: no owner plan details), not a 500.
+      if (isModelUnavailableError(error) && !res.headersSent) {
+        if (req.params?.shareId) markProgressComplete(req.params.shareId);
+        return res.status(422).json(modelUnavailableBody(error, 'share_viewer'));
+      }
       console.error('AgentMode: Generate conversable response error:', error);
 
       // Clean up progress store on error so session doesn't appear stuck in generating state
@@ -16811,6 +16840,10 @@ export const agentModeController = {
         sessionId: sessionId
       });
     } catch (error: any) {
+      // ENG-669: a model refused by the final gate is the same 422 as the pre-flight, never a 500.
+      if (isModelUnavailableError(error) && !res.headersSent) {
+        return res.status(422).json(modelUnavailableBody(error));
+      }
       // ENG-1696: a busy session is an expected, benign outcome (the other
       // side just needs to finish), not a real failure — return the same
       // 409 shape /generate itself returns on collision, and skip the
@@ -17316,6 +17349,20 @@ export const agentModeController = {
       });
       if (!visibilityDecision.ok) {
         return res.status(visibilityDecision.status).json({ error: visibilityDecision.error });
+      }
+
+      // ENG-669: a system template's model is AgentWeb's choice: schedules created from it inherit the pin as a SYSTEM
+      // model, exempt from the tier model allowlist. So only an administrator may change it; re-sending the stored
+      // value (a client that PUTs the whole object back) is not a change.
+      const storedTemplateModel = typeof existing.llmModel === 'string' ? existing.llmModel.trim() : '';
+      const incomingTemplateModel = typeof llmModel === 'string' ? llmModel.trim() : llmModel;
+      if (
+        llmModel !== undefined
+        && canonicalizeVisibility(existing.visibility) === 'system'
+        && incomingTemplateModel !== storedTemplateModel
+        && !isRealAdmin(req)
+      ) {
+        return res.status(403).json({ error: "Only an administrator can change a system template's model." });
       }
 
       const updates: any = { updatedAt: new Date().toISOString() };

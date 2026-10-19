@@ -11,6 +11,7 @@ import {
   countAllowedRunnable,
   createModelAccess,
   isSystemAuthoredPlan,
+  resolveLegacyModelAlias,
   storedModelSource,
   type ModelAccessService,
   type StoredModelRecord,
@@ -18,7 +19,6 @@ import {
 } from './modelAccess';
 
 export { isSystemAuthoredPlan };
-import { LEGACY_MODEL_ALIASES } from './llmModelRegistry';
 
 export const modelAccess: ModelAccessService = createModelAccess({
   getSetting: async (name) => (await import('../settingsService')).settingsService.getSetting(name),
@@ -32,7 +32,7 @@ export const modelAccess: ModelAccessService = createModelAccess({
     return Array.isArray(parsed) ? (parsed as TierModelsConfig[]) : [];
   },
   // The same alias table agentModeService.normalizeModelId applies (a pure module, no service graph).
-  normalizeModelId: (id) => (Object.prototype.hasOwnProperty.call(LEGACY_MODEL_ALIASES, id) ? LEGACY_MODEL_ALIASES[id] : id),
+  normalizeModelId: resolveLegacyModelAlias,
   alertTierUnreadable: async ({ ownerUserId, tier, dedupeKey, dedupeWindowMs }) => {
     const { sendAgentModeOncallAlert } = await import('../../utils/agentModeAlerts');
     return sendAgentModeOncallAlert({

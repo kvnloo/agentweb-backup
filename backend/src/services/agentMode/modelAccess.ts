@@ -30,6 +30,12 @@
  * modelAccessInstance.ts.
  */
 import { ModelUnavailableError } from './modelUnavailable';
+import { LEGACY_MODEL_ALIASES } from './llmModelRegistry';
+
+/** The registry's legacy-alias table as a normaliser: a retired id maps to its current id, anything else is kept. */
+export function resolveLegacyModelAlias(id: string): string {
+  return Object.prototype.hasOwnProperty.call(LEGACY_MODEL_ALIASES, id) ? LEGACY_MODEL_ALIASES[id] : id;
+}
 
 export const MODEL_TIER_ALLOWLIST_SETTING = 'model_tier_allowlist_enabled';
 /** Every non-admin catalog model. */
@@ -126,20 +132,37 @@ export interface StoredModelRecord {
   llmModel?: string | null;
   llmModelSource?: ModelSource | null;
   llmUsagePolicyDecision?: { effectiveModel?: string | null; modelSelection?: string | null } | null;
+  // Side-channel markers (see storedModelSource's legacy rule).
+  sessionType?: string | null;
+  slackThread?: unknown;
+  gtmWorkItem?: unknown;
+}
+
+/**
+ * Sessions created by a side channel (a Slack thread, a GTM work item, an Emma email, a result endpoint). Before
+ * llmModelSource existed they were stamped with the then-default by a write that carried no policy decision.
+ */
+function isSideChannelSession(session: StoredModelRecord): boolean {
+  return Boolean(session.slackThread)
+    || Boolean(session.gtmWorkItem)
+    || session.sessionType === 'emma-email'
+    || session.sessionType === 'result-endpoint';
 }
 
 /**
  * Who chose the session's STORED model: its recorded `llmModelSource`; for a session written before that field
- * existed, 'system' when the stored policy decision shows the model was not the requested one (defaulted /
- * corrected), otherwise 'user' (a visible 422 at worst, never a silent swap). Undefined when nothing is stored.
+ * existed: 'system' when the stored policy decision shows the model was not the requested one (defaulted /
+ * corrected), or when there is no decision at all on a side-channel session (Slack thread, GTM work item, Emma email,
+ * result endpoint: those wrote the then-default without one); otherwise 'user' (a visible 422 at worst, never a silent
+ * swap). Undefined when nothing is stored.
  */
 export function storedModelSource(session: StoredModelRecord | null | undefined): ModelSource | undefined {
   if (!session?.llmModel) return undefined;
   if (session.llmModelSource === 'user' || session.llmModelSource === 'system') return session.llmModelSource;
   const decision = session.llmUsagePolicyDecision;
+  if (!decision) return isSideChannelSession(session) ? 'system' : 'user';
   if (
-    decision
-    && decision.effectiveModel === session.llmModel
+    decision.effectiveModel === session.llmModel
     && (decision.modelSelection === 'defaulted' || decision.modelSelection === 'corrected')
   ) {
     return 'system';
@@ -151,13 +174,15 @@ export function storedModelSource(session: StoredModelRecord | null | undefined)
  * Who chose `model` once it is written to this session (ChatSession.llmModelSource). Keeping the model the session
  * already has (an echo of the stored stamp counts: the portal re-sends the picker value every turn) keeps its source;
  * a different explicit pick is the user's; anything else (the default standing in) is AgentWeb's. Ids are compared
- * after `normalizeModelId` (legacy aliases).
+ * CANONICALLY: by default through the registry's legacy-alias table, so an alias of the stored model is the same
+ * model (sending it neither turns a system stamp into a user pick nor launders a stored user alias into a system one).
+ * Callers with the registry at hand may pass a stricter canonicaliser.
  */
 export function modelSourceAfter(
   session: StoredModelRecord | null | undefined,
   model: string | null | undefined,
   explicitPick: string | null | undefined,
-  normalizeModelId: (id: string) => string = (id) => id,
+  normalizeModelId: (id: string) => string = resolveLegacyModelAlias,
 ): ModelSource {
   const same = (a: string | null | undefined, b: string | null | undefined) =>
     Boolean(a && b && normalizeModelId(a.trim()) === normalizeModelId(b.trim()));
