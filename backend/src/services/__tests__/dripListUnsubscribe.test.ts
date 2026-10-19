@@ -53,6 +53,11 @@ describe('buildListUnsubscribeHeaders (ENG-2553)', () => {
     expect(h['List-Unsubscribe-Post']).toBe('List-Unsubscribe=One-Click');
   });
 
+  it('ENG-2557 encodes reserved chars in the mailto local part', () => {
+    const h = buildListUnsubscribeHeaders({ baseUrl: 'https://x.io/u', token, mailto: 'unsub?team@example.com' });
+    expect(h['List-Unsubscribe']).toBe(`<https://x.io/u?t=${token}>, <mailto:unsub%3Fteam@example.com?subject=unsubscribe>`);
+  });
+
   it('appends optional mailto', () => {
     const h = buildListUnsubscribeHeaders({ baseUrl: 'https://x.io/u', token, mailto: 'unsub@x.io' });
     expect(h['List-Unsubscribe']).toBe(`<https://x.io/u?t=${token}>, <mailto:unsub@x.io?subject=unsubscribe>`);

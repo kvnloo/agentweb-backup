@@ -95,7 +95,11 @@ export function buildListUnsubscribeHeaders(input: ListUnsubscribeInput): Record
     if (typeof mailto !== 'string' || CRLF.test(mailto) || !/^[^\s@<>,]+@[^\s@<>,]+\.[^\s@<>,]+$/.test(mailto)) {
       throw new Error('invalid mailto');
     }
-    entries.push(`<mailto:${mailto}?subject=unsubscribe>`);
+    // ENG-2557: encode the local part so reserved chars (e.g. '?', '&', '%') cannot start the
+    // query or change the recipient.
+    const at = mailto.lastIndexOf('@');
+    const encoded = `${encodeURIComponent(mailto.slice(0, at))}@${mailto.slice(at + 1)}`;
+    entries.push(`<mailto:${encoded}?subject=unsubscribe>`);
   }
   return {
     'List-Unsubscribe': entries.join(', '),

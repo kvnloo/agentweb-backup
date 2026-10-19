@@ -6,6 +6,11 @@ import {
 } from '../dripSuppressionList';
 
 describe('ENG-2554 do-not-email suppression', () => {
+  it('ENG-2557 accepts punycode (xn--) TLDs', () => {
+    expect(normalizeEmail('User@Example.XN--P1AI')).toBe('user@example.xn--p1ai');
+    expect(checkSuppression(buildSuppressionList([]), 'user@example.xn--p1ai')).toEqual({ suppressed: false });
+  });
+
   it('AC1 normalizes and rejects malformed addresses', () => {
     expect(normalizeEmail('  Jane.Doe@Acme.COM ')).toBe('jane.doe@acme.com');
     for (const bad of ['', 'no-at', '@acme.com', 'a@b', 'a@@b.com', 'a b@c.com', '.a@b.com', 'a..b@c.com', 42, null]) {
