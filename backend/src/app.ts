@@ -1,4 +1,5 @@
 import { registerLeadNotificationProcessor } from './services/orgLeadNotificationService';
+import { registerHotLeadCallProcessor } from './services/hotLeadCallService';
 import { evaluationAdminRoutes } from './routes/evaluation';
 import { evaluationHttpBoundary } from './middleware/evaluation';
 import express from "express";
@@ -467,6 +468,7 @@ app.use("/api/webhooks/calendly", calendlyWebhookRoutes);
 app.use("/api/webhooks/unipile", unipileWebhookRoutes);
 registerConversionRelayProcessor();
 registerLeadNotificationProcessor();
+registerHotLeadCallProcessor();
 app.use("/api/benchmark", benchmarkRoutes);
 app.use("/api/seo", seoRoutes);
 app.use("/api/funnels", funnelRoutes);
