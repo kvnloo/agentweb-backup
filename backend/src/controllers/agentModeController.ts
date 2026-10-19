@@ -9478,7 +9478,24 @@ export async function generateSessionResponse(
   // ENG-2378: the plan's CURRENT pending step may carry its own model. It wins over the request's llmModel and
   // the session's for this turn (the session model is then updated so the UI shows the truth, exactly as /generate
   // does). A step model that has become unavailable mid-plan PAUSES the plan, loudly: never a swap.
-  const stepModelTurn = await resolveWorkPlanStepModelForTurn(updatedSession, { explicitPick: explicitModelPick, viewerIsOwner: !isInteractiveShare });
+  let stepModelTurn: WorkPlanStepModelTurn;
+  try {
+    stepModelTurn = await resolveWorkPlanStepModelForTurn(updatedSession, { explicitPick: explicitModelPick, viewerIsOwner: !isInteractiveShare });
+  } catch (stepModelError) {
+    // ENG-669: the user's pick for a step whose own model is gone is refused (e.g. outside the plan). The user message
+    // is already saved, so leave the refusal in the chat (as the generic error path does for other failures) before
+    // the caller answers its 422: never an unanswered message.
+    if (isModelUnavailableError(stepModelError)) {
+      const timestamp = new Date().toISOString();
+      await chatbotDb.addMessageToSession(sessionId, {
+        role: 'assistant',
+        content: modelUnavailableBody(stepModelError, isInteractiveShare ? 'share_viewer' : 'owner').error,
+        timestamp,
+        metadata: { timestamp, isErrorMessage: true },
+      }).catch((saveErr) => console.error('AgentMode: failed to save the step-model refusal to the session:', saveErr));
+    }
+    throw stepModelError;
+  }
   if (stepModelTurn.kind === 'unavailable') {
     const paused = await pauseWorkPlanForUnavailableStepModel(sessionId, userId, stepModelTurn, { emitToUser: false });
     return {
@@ -17352,14 +17369,19 @@ export const agentModeController = {
       }
 
       // ENG-669: a system template's model is AgentWeb's choice: schedules created from it inherit the pin as a SYSTEM
-      // model, exempt from the tier model allowlist. So only an administrator may change it; re-sending the stored
-      // value (a client that PUTs the whole object back) is not a change.
-      const storedTemplateModel = typeof existing.llmModel === 'string' ? existing.llmModel.trim() : '';
-      const incomingTemplateModel = typeof llmModel === 'string' ? llmModel.trim() : llmModel;
+      // model, exempt from the tier model allowlist. So only an administrator may change it. Not a change: re-sending
+      // the stored value (a client that PUTs the whole object back), an alias of it, or any spelling of "no model"
+      // (null / blank) on a template that has none. Anything else, including a non-string, is refused (fail closed).
+      const templateModelKey = (value: unknown): string | null => {
+        if (value === null || value === undefined) return '';
+        if (typeof value !== 'string') return null;
+        return value.trim() ? canonicalModelId(value) : '';
+      };
+      const incomingTemplateModel = templateModelKey(llmModel);
       if (
         llmModel !== undefined
         && canonicalizeVisibility(existing.visibility) === 'system'
-        && incomingTemplateModel !== storedTemplateModel
+        && (incomingTemplateModel === null || incomingTemplateModel !== templateModelKey(existing.llmModel))
         && !isRealAdmin(req)
       ) {
         return res.status(403).json({ error: "Only an administrator can change a system template's model." });
