@@ -745,6 +745,13 @@ describe('POST /status', () => {
     expect(Number.isNaN(usage()[0].durationSeconds)).toBe(true);
   });
 
+  it.each(['', '   '])('treats an empty or blank CallDuration (%j) as missing, not as 0 seconds', async (blank) => {
+    seed('owner_answered');
+    await ownerStatus('completed', { CallDuration: blank });
+    expect(usage()).toHaveLength(1);
+    expect(Number.isNaN(usage()[0].durationSeconds)).toBe(true);
+  });
+
   it('meters each leg with its own CallSid and the list owner as the billed user', async () => {
     seed('connected', { leadCallSid: LEAD_SID });
     await ownerStatus('completed', { CallDuration: '61' });
