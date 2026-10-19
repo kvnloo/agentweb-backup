@@ -4,7 +4,7 @@ import { callerOrg, type ToolContext } from './orgCaller';
 import { isRecord } from '../services/leadNotificationAttribution';
 import { LEAD_ORIGINS, LEAD_ORIGIN_DESCRIPTIONS } from '../services/leadNotificationConfig';
 import {
-  allowlistedE164, hotLeadCallConfigOf, isValidTimezone, HOT_LEAD_CALL_ANNOUNCED_NAME_MAX, HOT_LEAD_CALL_COUNTRIES,
+  allowlistedE164, hotLeadCallConfigOf, isCanonicalIanaTimezone, HHMM, HOT_LEAD_CALL_ANNOUNCED_NAME_MAX, HOT_LEAD_CALL_COUNTRIES,
   HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS, HOT_LEAD_CALL_SYSTEM_FIELDS,
   type HotLeadCallConfig,
 } from '../services/hotLeadCallConfig';
@@ -59,7 +59,7 @@ function mergeConfig(current: HotLeadCallConfig | undefined, destinationPhone: s
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const { destinationVerifiedAt: _unverify, ...unverified } = current ?? ({} as Partial<HotLeadCallConfig>);
   const mergedQuietHours = quietHours === undefined ? undefined : { ...current?.quietHours, ...quietHours };
-  if (mergedQuietHours && !isValidTimezone(mergedQuietHours.timezone)) {
+  if (mergedQuietHours && !isCanonicalIanaTimezone(mergedQuietHours.timezone)) {
     throw new Error(`timezone must be an IANA name such as America/Chicago (got ${JSON.stringify(mergedQuietHours.timezone)})`);
   }
   return {
@@ -118,7 +118,7 @@ emmaToolRegistry.register({
         announcedName: { type: 'string', minLength: 1, maxLength: HOT_LEAD_CALL_ANNOUNCED_NAME_MAX },
         quietHours: {
           type: 'object',
-          properties: { start: { type: 'string', pattern: '^([01]\\d|2[0-3]):[0-5]\\d$' }, end: { type: 'string', pattern: '^([01]\\d|2[0-3]):[0-5]\\d$' }, timezone: { type: 'string', description: 'Canonical IANA name such as America/Chicago. UTC and abbreviations like EST are refused.' } },
+          properties: { start: { type: 'string', pattern: HHMM.source }, end: { type: 'string', pattern: HHMM.source }, timezone: { type: 'string', description: 'Canonical IANA name such as America/Chicago. UTC and abbreviations like EST are refused.' } },
           additionalProperties: false,
         },
         allowedCountries: { type: 'array', items: { type: 'string', enum: [...HOT_LEAD_CALL_COUNTRIES] }, uniqueItems: true, minItems: 1 },

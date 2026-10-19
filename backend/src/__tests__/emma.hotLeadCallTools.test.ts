@@ -74,11 +74,21 @@ describe('update_hot_lead_call_settings', () => {
     expect(lastWrite()[1].hotLeadCall.destinationPhone).toBe('+14155550100');
   });
 
-  it('refuses the first write without a phone and name, and refuses enabling an unconfigured org', async () => {
+  it('refuses the first write without a destination phone', async () => {
     delete org.hotLeadCall;
-    await expect(update({ maxCallsPerHour: 3 })).rejects.toThrow('destinationPhone');
-    await expect(update({ destinationPhone: '+14155550100', enabled: true })).rejects.toThrow('Invalid');
+    await expect(update({ maxCallsPerHour: 3 })).rejects.toThrow('destinationPhone is required');
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
+  });
+  it('refuses the first write without an announced name', async () => {
+    delete org.hotLeadCall;
+    await expect(update({ destinationPhone: '+14155550100' })).rejects.toThrow('Check the limits and name format');
+    expect(orgDb.updateOrg).not.toHaveBeenCalled();
+  });
+  it('a first write that asks for enabled:true is saved disabled, because the new phone is unverified', async () => {
+    delete org.hotLeadCall;
+    const result = await update({ destinationPhone: '+14155550100', announcedName: 'New Co', enabled: true });
+    expect(lastWrite()[1].hotLeadCall.enabled).toBe(false);
+    expect(result).toMatchObject({ enabled: false, destinationVerified: false });
   });
 
   it('changing the phone clears verification and forces enabled:false, even if enabled:true is sent', async () => {
@@ -144,13 +154,18 @@ describe('update_hot_lead_call_settings', () => {
     for (const f of ['destinationVerifiedAt', 'twilioNumber', 'twilioNumberSid']) expect(def.inputSchema.properties).not.toHaveProperty(f);
   });
 
+  const argsErr = 'settings arguments';
+  const settingsErr = 'Check the limits and name format';
   it.each([
-    {}, null, [], { orgId: 'org-b' }, { userId: 'victim' }, { enabled: 'yes' }, { leadTypes: [] }, { leadTypes: ['nope'] },
-    { maxCallsPerHour: 31 }, { maxAgeMinutes: 0 }, { announcedName: '<Say>hi</Say>' }, { announcedName: 'a'.repeat(61) },
-    { destinationPhone: '+442071838750' }, { destinationPhone: 'abc' }, { destinationPhone: 5 },
-    { quietHours: { timezone: 'Nope/Zone' } }, { quietHours: { start: '25:00' } }, { allowedCountries: ['MX'] },
-  ])('rejects invalid arguments %j', async args => {
-    await expect(update(args)).rejects.toThrow();
+    [{}, 'provide at least one setting'], [null, argsErr], [[], argsErr], [{ orgId: 'org-b' }, argsErr], [{ userId: 'victim' }, argsErr],
+    [{ enabled: 'yes' }, settingsErr], [{ leadTypes: [] }, settingsErr], [{ leadTypes: ['nope'] }, settingsErr],
+    [{ maxCallsPerHour: 31 }, settingsErr], [{ maxAgeMinutes: 0 }, settingsErr], [{ announcedName: '<Say>hi</Say>' }, settingsErr],
+    [{ announcedName: 'a'.repeat(61) }, settingsErr], [{ destinationPhone: '+442071838750' }, 'valid US or Canadian'],
+    [{ destinationPhone: 'abc' }, 'valid US or Canadian'], [{ destinationPhone: 5 }, 'valid US or Canadian'],
+    [{ quietHours: { timezone: 'Nope/Zone' } }, 'timezone must be'], [{ quietHours: { start: '25:00' } }, settingsErr],
+    [{ allowedCountries: ['MX'] }, settingsErr],
+  ])('rejects invalid arguments %j', async (args, message) => {
+    await expect(update(args)).rejects.toThrow(message);
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
 

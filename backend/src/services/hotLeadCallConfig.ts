@@ -2,6 +2,7 @@ import { parsePhoneNumberWithError } from 'libphonenumber-js';
 import { toE164 } from './whatsappService';
 import { isLeadTypes, type LeadOrigin } from './leadNotificationConfig';
 import { isRecord } from './leadNotificationAttribution';
+import { isValidTimezone as isKnownTimezone } from './dripSendWindow';
 
 export const HOT_LEAD_CALL_COUNTRIES = ['US', 'CA'] as const;
 type HotLeadCallCountry = typeof HOT_LEAD_CALL_COUNTRIES[number];
@@ -60,24 +61,18 @@ const QUIET_KEYS: ReadonlySet<string> = new Set(['start', 'end', 'timezone']);
 // SECURITY: this text is spoken inside TwiML <Say>. '&' is deliberately allowed ('Smith & Sons'),
 // so the TwiML builder MUST XML-escape announcedName before interpolating it.
 const ANNOUNCED_NAME = /^[\p{L}\p{N} .,&'-]+$/u;
-const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
+export const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
 const TWILIO_SID = /^PN[0-9a-f]{32}$/;
 
 // IANA 'Area/Location' with proper capitalisation. Deliberately not a membership test against
 // Intl.supportedValuesOf: ICU canonicalises (America/Indianapolis, US/Eastern...) and the list differs
 // by Node/ICU version, so a stored zone could stop validating after an upgrade. Abbreviations (EST),
-// UTC and the Etc/ area are refused: none is a place whose local clock gates calls. The Intl call
-// catches well-formed but unknown names.
+// UTC and the Etc/ area are refused: none is a place whose local clock gates calls. The drip helper's
+// Intl check catches well-formed but unknown names.
 const IANA_ZONE = /^[A-Z][A-Za-z]+(?:\/[A-Z][A-Za-z0-9_+-]*)+$/;
-export const isValidTimezone = (tz: unknown): tz is string => {
-  if (typeof tz !== 'string' || !IANA_ZONE.test(tz) || tz.startsWith('Etc/')) return false;
-  try {
-    new Intl.DateTimeFormat('en-US', { timeZone: tz }).resolvedOptions();
-    return true;
-  } catch {
-    return false;
-  }
-};
+// The drip helper alone is not enough: it accepts UTC, EST and lowercase names.
+export const isCanonicalIanaTimezone = (tz: unknown): tz is string =>
+  typeof tz === 'string' && IANA_ZONE.test(tz) && !tz.startsWith('Etc/') && isKnownTimezone(tz);
 
 // Types that bill the caller (toll fraud: premium, toll-free, shared-cost, personal, UAN) or are not a
 // person's direct line. VOIP can ring a person but is blocked anyway; note the default (min) metadata only
@@ -114,7 +109,7 @@ function quietHoursOf(raw: unknown): HotLeadCallQuietHours | null {
   const start = raw.start === undefined ? HOT_LEAD_CALL_DEFAULT_QUIET_HOURS.start : raw.start;
   const end = raw.end === undefined ? HOT_LEAD_CALL_DEFAULT_QUIET_HOURS.end : raw.end;
   if (typeof start !== 'string' || typeof end !== 'string' || !HHMM.test(start) || !HHMM.test(end) || start === end) return null;
-  if (!isValidTimezone(raw.timezone)) return null;
+  if (!isCanonicalIanaTimezone(raw.timezone)) return null;
   return { start, end, timezone: raw.timezone };
 }
 

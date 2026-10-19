@@ -32,7 +32,7 @@ describe('hotLeadCallConfigOf', () => {
     expect(hotLeadCallConfigOf(base({ announcedName: 'Smith & Sons' }))?.announcedName).toBe('Smith & Sons');
   });
 
-  it.each(['+19002223333', '+19003334444', '+18005550199', '+15335551234', '+15005550006'])('rejects premium-rate, toll-free and personal numbers (toll fraud): %s', phone => {
+  it.each(['+19002223333', '+19003334444', '+18005550199', '+15335551234', '+15005550006', '+16005550123'])('rejects premium-rate, toll-free and personal numbers (toll fraud): %s', phone => {
     expect(hotLeadCallConfigOf(base({ destinationPhone: phone }))).toBeNull();
     expect(hotLeadCallConfigOf(base({ twilioNumber: phone }))).toBeNull();
   });
@@ -92,7 +92,7 @@ describe('hotLeadCallConfigOf', () => {
     ['quiet hours without timezone', { quietHours: { start: '08:00', end: '21:00' } }],
     ['quiet hours bad timezone', { quietHours: { timezone: 'Mars/Olympus' } }],
     ['quiet hours empty timezone', { quietHours: { timezone: '' } }],
-    ['quiet hours bad time', { quietHours: { start: '8:00', timezone: 'UTC' } }],
+    ['quiet hours bad time', { quietHours: { start: '8:00', timezone: 'America/Chicago' } }],
     ['quiet hours 24:00', { quietHours: { end: '24:00', timezone: 'America/Chicago' } }],
     ['quiet hours start == end', { quietHours: { start: '09:00', end: '09:00', timezone: 'America/Chicago' } }],
     ['quiet hours unknown key', { quietHours: { timezone: 'America/Chicago', x: 1 } }],
