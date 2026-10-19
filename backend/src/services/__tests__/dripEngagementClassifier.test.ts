@@ -69,6 +69,23 @@ describe('classifyEngagementEvent (ENG-2538)', () => {
     ];
     expect(classifyEngagementEvent({ type: 'click', occurredAt: at(601), sentAt: SENT, userAgent: CHROME, link: 'c', priorEvents: spread }).human).toBe(true);
   });
+
+  it('invalid timestamps are never human', () => {
+    expect(classifyEngagementEvent({ type: 'open', occurredAt: 'garbage', sentAt: SENT, userAgent: CHROME }))
+      .toEqual({ human: false, reason: 'invalid_timestamp' });
+    expect(classifyEngagementEvent({ type: 'click', occurredAt: at(600), sentAt: 'nope', userAgent: CHROME, link: 'a' }).reason)
+      .toBe('invalid_timestamp');
+  });
+
+  it('linkless and scanner clicks do not count toward a burst', () => {
+    const prior = [
+      { type: 'click' as const, occurredAt: at(600), link: null },
+      { type: 'click' as const, occurredAt: at(600.5), link: 'b', userAgent: 'Microsoft SafeLinks' },
+    ];
+    expect(
+      classifyEngagementEvent({ type: 'click', occurredAt: at(601), sentAt: SENT, userAgent: CHROME, link: 'c', priorEvents: prior }).human,
+    ).toBe(true);
+  });
 });
 
 describe('shouldExitSequence (ENG-2538)', () => {

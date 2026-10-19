@@ -27,6 +27,7 @@ export type ClassifyReason =
   | 'proxy_open'
   | 'scanner_user_agent'
   | 'click_burst'
+  | 'invalid_timestamp'
   | 'human';
 
 export interface ClassifyResult {
@@ -88,22 +89,26 @@ export function classifyEngagementEvent(
   const at = toMs(input.occurredAt);
   const sent = toMs(input.sentAt);
 
+  if (!Number.isFinite(at) || !Number.isFinite(sent)) {
+    return { human: false, reason: 'invalid_timestamp' };
+  }
   if (input.type === 'open' && matchesAny(input.userAgent, IMAGE_PROXY_USER_AGENT_PATTERNS)) {
     return { human: false, reason: 'proxy_open' };
   }
   if (matchesAny(input.userAgent, SCANNER_USER_AGENT_PATTERNS)) {
     return { human: false, reason: 'scanner_user_agent' };
   }
-  if (Number.isFinite(at) && Number.isFinite(sent) && at - sent < opts.tooFastWindowMs) {
+  if (at - sent < opts.tooFastWindowMs) {
     return { human: false, reason: 'too_fast' };
   }
   if (input.type === 'click') {
     const links = new Set<string>();
     const all: EngagementEvent[] = [...(input.priorEvents ?? []), input];
     for (const e of all) {
-      if (e.type !== 'click') continue;
+      if (e.type !== 'click' || !e.link) continue;
+      if (e !== input && matchesAny(e.userAgent, SCANNER_USER_AGENT_PATTERNS)) continue;
       const t = toMs(e.occurredAt);
-      if (Math.abs(at - t) <= opts.burstWindowMs) links.add(e.link ?? '');
+      if (Number.isFinite(t) && Math.abs(at - t) <= opts.burstWindowMs) links.add(e.link);
     }
     if (links.size >= opts.burstMinClicks) return { human: false, reason: 'click_burst' };
   }
@@ -117,7 +122,9 @@ export interface StopConditions {
 
 /**
  * True when any human-classified event matches an enabled stop condition.
- * Each event is classified against the events preceding it.
+ * Each event is classified against every other event in the list (before and
+ * after): a scanner fans out across all links at once, so the first click of a
+ * burst must not count as human just because it arrived first.
  */
 export function shouldExitSequence(
   events: EngagementEvent[],
