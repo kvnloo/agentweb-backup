@@ -76,6 +76,7 @@ import SpendLedgerBody, { SpendLedgerPayload } from "../components/admin/SpendLe
 import RevenueTab from "../components/admin/RevenueTab";
 import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
+import VendorRatesTab from "../components/admin/VendorRatesTab";
 import OnboardingTab from "../components/admin/OnboardingTab";
 import ConnectedAccountsTab from "../components/admin/ConnectedAccountsTab";
 import ContractorsTab from "../components/admin/ContractorsTab";
@@ -6820,6 +6821,10 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
 
         <TabPanel value={tabValue} index={26}>
           <EvalV2Tab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={27}>
+          <VendorRatesTab />
         </TabPanel>
         </Box>
       </Box>
