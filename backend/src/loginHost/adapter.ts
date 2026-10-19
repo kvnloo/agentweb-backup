@@ -76,6 +76,7 @@ export interface ProviderSession {
   answer(operationId: string, answer: ServerRequestAnswer): void;
   /** Stop ONE turn (several can share a process: Codex threads); the session stays usable where the provider supports it (Codex `turn/interrupt`), otherwise it closes. */
   interrupt(turnId: string): Promise<void>;
+  /** Idempotent. Resolves only after the session's process is gone (the core frees the cap slot and the uid's cleanup relies on it). */
   close(): Promise<void>;
 }
 
@@ -109,6 +110,8 @@ export interface ChildLike {
   stderr: import("stream").Readable;
   kill(): void;
   onExit(cb: (code: number | null, signal: string | null) => void): void;
+  /** The process could not be started or its pipe failed (spawn error). Optional: a handle that cannot fail asynchronously omits it. */
+  onError?(cb: (err: Error) => void): void;
 }
 
 /**
@@ -148,6 +151,13 @@ export interface SubscriptionProviderAdapter {
   readonly maxProcessesPerHome: number;
   /** Concurrent turns one process can serve (Claude 1; Codex: many threads). */
   readonly maxTurnsPerProcess: number;
+  /**
+   * The session's process ends with its first turn (Claude: one process per turn, because the bridge token
+   * and model are fixed when the process starts). The core marks such a session consumed when it admits the
+   * turn, never hands it a second one, keeps counting it against the caps until it is really gone, and
+   * closes it when the turn ends. `close()` must resolve only after the process is gone.
+   */
+  readonly singleUse?: boolean;
   readonly loginTtlMs: number;
   /** Allowlist of model names the backend may request. */
   readonly models: ReadonlySet<string>;

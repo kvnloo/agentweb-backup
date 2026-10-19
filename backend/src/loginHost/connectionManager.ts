@@ -87,6 +87,8 @@ interface HostSession {
   ready: Promise<ProviderSession>;
   turns: Set<string>;
   dead: boolean;
+  /** Single-use adapters: the session has been given its one turn and must never be picked again. */
+  consumed: boolean;
   lastUsedMono: number;
 }
 
@@ -427,12 +429,12 @@ export class ConnectionManager {
     const list = this.sessions.get(c.connectionId) ?? [];
     this.sessions.set(c.connectionId, list);
     const nowMono = this.deps.clock.monotonicMs();
-    let hs = list.find((s) => !s.dead && s.turns.size < adapter.maxTurnsPerProcess);
+    let hs = list.find((s) => !s.dead && !s.consumed && s.turns.size < adapter.maxTurnsPerProcess);
     if (!hs) {
       if (list.filter((s) => !s.dead).length >= adapter.maxProcessesPerHome) throw new HostError("EBUSY", "connection_busy");
       if (this.liveSessionCount() >= this.cfg.maxSessionsPerHost) throw new HostError("EBUSY", "host_busy");
       const ctx = this.deps.fs.contextFor(c.connectionId, c.uid, c.homeRef, "home");
-      const fresh: HostSession = { provider: c.provider, connectionId: c.connectionId, turns: new Set(), dead: false, lastUsedMono: nowMono, ready: undefined as unknown as Promise<ProviderSession> };
+      const fresh: HostSession = { provider: c.provider, connectionId: c.connectionId, turns: new Set(), dead: false, consumed: false, lastUsedMono: nowMono, ready: undefined as unknown as Promise<ProviderSession> };
       fresh.ready = adapter.openSession(ctx, { connectionId: c.connectionId, epoch: c.epoch });
       void fresh.ready.then(
         (ps) => void ps.closed.then(() => this.retireSession(fresh)),
@@ -443,6 +445,7 @@ export class ConnectionManager {
     }
     const session = hs;
     session.turns.add(req.turnId);
+    if (adapter.singleUse) session.consumed = true; // before any await: the next admission must not pick this session
     session.lastUsedMono = nowMono;
 
     const running: RunningTurn = {
@@ -470,6 +473,7 @@ export class ConnectionManager {
       this.turns.delete(tkey);
       session.turns.delete(req.turnId);
       session.lastUsedMono = this.deps.clock.monotonicMs();
+      if (session.consumed && !session.dead) this.closeConsumed(session);
       const rec = this.state().idempotency[key];
       if (rec) (rec.outcome as { status: string }).status = status;
       this.save();
@@ -533,6 +537,11 @@ export class ConnectionManager {
           yield ev;
           break;
         }
+        // A finished-with-auth_dead turn means the login is dead (the adapter confirms with the CLI's own status first). Fenced like preflight.
+        // (The abort/epoch fence below is defense in depth: an aborted or superseded turn already left this loop at `if (running.aborted) break`.)
+        if (ev.type === "result" && !ev.ok && ev.errorKind === "auth_dead") {
+          await this.locked(c.connectionId, async () => (c.epoch === running.epoch && running.aborted === undefined ? this.markNeedsReconnect(c, "auth_dead") : undefined));
+        }
         if (ev.type === "tool-use" && adapter.toolTransport === "host_relay") running.operations.set(ev.operationId, this.deps.clock.monotonicMs());
         if (ev.type === "tool-result") running.operations.delete(ev.operationId);
         yield ev;
@@ -557,10 +566,16 @@ export class ConnectionManager {
     mark();
     this.retireSession(session);
     void session.ready.then((s) => this.a("closeSession", async () => s.close())).catch(() => undefined);
-    try {
-      await this.safeKill(running.uid); // the uid this turn ran on, not whatever the connection has now
-    } catch {
-      /* the sweeper retries */
+    // Kill the uid this turn ran on, not whatever the connection has now. While other sessions of the same
+    // connection and uid are alive their turns must not die with this one: their own close() ends them.
+    const sharedUid = running.uid === c.uid && (this.sessions.get(c.connectionId) ?? []).some((s) => !s.dead && s !== session);
+    if (sharedUid) this.log.warn("provider_hung_process_may_remain", { connectionId: c.connectionId });
+    else {
+      try {
+        await this.safeKill(running.uid);
+      } catch {
+        /* the sweeper retries */
+      }
     }
     this.log.warn("provider_hung", { connectionId: c.connectionId });
     yield { type: "result", ok: false, text: "", aborted: running.aborted ?? "hung" };
@@ -750,6 +765,14 @@ export class ConnectionManager {
     return n;
   }
 
+  /** A single-use session whose turn ended: close it, and free its cap slot once it is really gone (or the close timed out). */
+  private closeConsumed(hs: HostSession): void {
+    void hs.ready
+      .then((s) => this.a("closeSession", async () => s.close()))
+      .catch(() => undefined)
+      .finally(() => this.retireSession(hs));
+  }
+
   private retireSession(hs: HostSession): void {
     hs.dead = true;
     const list = this.sessions.get(hs.connectionId);
@@ -788,7 +811,8 @@ export class ConnectionManager {
       await this.discardAttempt(c, "not_logged_in");
       throw new HostError("EINVALID", "not_logged_in");
     }
-    const blocking = hazards.find((h) => (h.kind === "managed_settings_present" && !this.cfg.allowManagedSettings) || h.kind === "api_key_source" || h.kind === "policy_blocks_agentweb");
+    // Fail closed: ANY reported hazard blocks the connect (including `other` and kinds added later); only managed settings can be allowed by config.
+    const blocking = hazards.find((h) => !(h.kind === "managed_settings_present" && this.cfg.allowManagedSettings));
     if (blocking) {
       await this.discardAttempt(c, "hazard");
       throw new HostError("EHAZARD", blocking.kind);
