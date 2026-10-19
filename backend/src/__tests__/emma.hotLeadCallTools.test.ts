@@ -13,7 +13,11 @@ const update = (args: unknown, context: unknown = { userId: 'owner' }) => handle
 const lastWrite = () => (orgDb.updateOrg as jest.Mock).mock.calls[0];
 const SID = 'PN' + 'b'.repeat(32);
 
-let org: { orgId: string; hotLeadCall?: ReturnType<typeof stored> & { destinationVerifiedAt?: string }; [k: string]: unknown };
+let org: { orgId: string; hotLeadCall?: Record<string, unknown>; [k: string]: unknown };
+const cfg = (): Record<string, unknown> => {
+  if (!org.hotLeadCall) throw new Error('test org has no stored hotLeadCall');
+  return org.hotLeadCall;
+};
 const stored = () => ({
   enabled: true, destinationPhone: '+14155550100', destinationVerifiedAt: '2026-01-01T00:00:00.000Z',
   twilioNumber: '+14155550111', twilioNumberSid: SID, leadTypes: ['form_fill'], maxAgeMinutes: 10, maxCallsPerHour: 6,
@@ -39,7 +43,7 @@ describe('get_hot_lead_call_settings', () => {
     expect(await get()).toMatchObject({ configured: false, enabled: false, destinationPhone: null, maxCallsPerHour: 6 });
   });
   it('fails closed on malformed stored config', async () => {
-    org.hotLeadCall.maxCallsPerDay = 9999;
+    cfg().maxCallsPerDay = 9999;
     await expect(get()).rejects.toThrow('invalid');
   });
   it('allows plain org members to read', async () => {
@@ -109,8 +113,8 @@ describe('update_hot_lead_call_settings', () => {
   it('can disable and cannot enable an unverified config', async () => {
     expect(await update({ enabled: false })).toMatchObject({ enabled: false });
     jest.clearAllMocks();
-    delete org.hotLeadCall.destinationVerifiedAt;
-    org.hotLeadCall.enabled = false;
+    delete cfg().destinationVerifiedAt;
+    cfg().enabled = false;
     await expect(update({ enabled: true })).rejects.toThrow('verified');
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
@@ -208,7 +212,7 @@ describe('update_hot_lead_call_settings', () => {
   });
 
   it('fails closed on malformed stored config', async () => {
-    org.hotLeadCall.leadTypes = 'form_fill';
+    cfg().leadTypes = 'form_fill';
     await expect(update({ enabled: false })).rejects.toThrow('invalid');
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
