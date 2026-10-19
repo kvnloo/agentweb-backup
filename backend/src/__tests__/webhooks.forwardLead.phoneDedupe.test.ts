@@ -287,6 +287,74 @@ describe('mode on', () => {
   });
 });
 
+describe('a phone-matched merge only FILLS BLANKS (never overwrites)', () => {
+  const sentToUpdate = () => (crmDb.updateLead as jest.Mock).mock.calls.map((c) => c[2]);
+
+  it('on: keeps a curated company and notes, fills a blank title', async () => {
+    setPhoneDedupeModeOverride('on');
+    withCandidates([existing({ company: 'Acme', notes: 'CURATED NOTES', title: '' })]);
+    const res = await post({ firstName: 'Ana', company: 'Other Co', notes: 'FORM MESSAGE', title: 'CEO' });
+    expect(res.status).toBe(200);
+    expect(sentToUpdate()).toHaveLength(1);
+    expect(sentToUpdate()[0]).toMatchObject({ title: 'CEO' });
+    expect(sentToUpdate()[0]).not.toHaveProperty('company');
+    expect(sentToUpdate()[0]).not.toHaveProperty('notes');
+  });
+
+  it('on: a blank-name capture cannot replace curated notes (the case seen live)', async () => {
+    setPhoneDedupeModeOverride('on');
+    withCandidates([existing({ notes: 'CURATED NOTES' })]);
+    await post({ firstName: '', notes: 'FORM MESSAGE' });
+    expect(createCalls()).toHaveLength(0);
+    for (const u of sentToUpdate()) expect(u).not.toHaveProperty('notes');
+  });
+
+  it('on: does not rewrite the stored phone into the new submission\'s formatting, nor the name', async () => {
+    setPhoneDedupeModeOverride('on');
+    withCandidates([existing({ phone: '+1 212 456 7890', firstName: 'Ana', lastName: 'Lee' })]);
+    await post({ phone: '212-456-7890', firstName: 'Ana', lastName: 'Lee', company: 'Acme' });
+    expect(sentToUpdate()[0]).toMatchObject({ company: 'Acme' });
+    expect(sentToUpdate()[0]).not.toHaveProperty('phone');
+  });
+
+  it('on: custom fields add new keys and fill blank ones but never replace a stored value', async () => {
+    setPhoneDedupeModeOverride('on');
+    withCandidates([existing({ customFields: { budget: '10k', plan: '' } })]);
+    await post({ customFields: { budget: '50k', plan: 'pro', region: 'EU' } });
+    const cf = sentToUpdate()[0].customFields;
+    expect(cf).toMatchObject({ plan: 'pro', region: 'EU' });
+    expect(cf).not.toHaveProperty('budget');
+  });
+
+  it('create: a race loser adopting the winner also only fills blanks', async () => {
+    setPhoneDedupeModeOverride('create');
+    const winner = existing({ company: 'Acme', notes: 'WINNER NOTES', title: '' });
+    (crmDb.createLead as jest.Mock).mockRejectedValueOnce(Object.assign(new Error('dup'), { duplicatePhone: true, existingLead: winner }));
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue(winner);
+    const res = await post({ company: 'Other Co', notes: 'LOSER NOTES', title: 'CTO' });
+    expect(res.status).toBe(200);
+    expect(sentToUpdate()[0]).toMatchObject({ title: 'CTO' });
+    expect(sentToUpdate()[0]).not.toHaveProperty('company');
+    expect(sentToUpdate()[0]).not.toHaveProperty('notes');
+  });
+
+  it('GUARD: an EMAIL race loser adopting the winner (duplicateEmail) still overwrites, in any mode', async () => {
+    setPhoneDedupeModeOverride('on');
+    const winner = { leadId: 'lead_e2', listId: 'L1', email: 'ana@example.com', firstName: 'Ana', company: 'Old Co', notes: 'old', createdAt: '2026-10-01T00:00:00.000Z', customFields: {} };
+    (crmDb.createLead as jest.Mock).mockRejectedValueOnce(Object.assign(new Error('dup'), { duplicateEmail: true, existingLead: winner }));
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue(winner);
+    await post({ phone: undefined, email: 'ana@example.com', company: 'New Co', notes: 'new' });
+    expect(sentToUpdate()[0]).toMatchObject({ company: 'New Co', notes: 'new' });
+  });
+
+  it('GUARD: an EMAIL repeat is unchanged - it still overwrites with the newer non-empty value', async () => {
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({ leadId: 'lead_e1', listId: 'L1', email: 'ana@example.com', firstName: 'Ana', company: 'Old Co', notes: 'old', customFields: { budget: '10k' }, createdAt: '2026-10-01T00:00:00.000Z' });
+    await post({ phone: undefined, email: 'ana@example.com', company: 'New Co', notes: 'new', customFields: { budget: '50k' } });
+    expect(sentToUpdate()[0]).toMatchObject({ company: 'New Co', notes: 'new' });
+    expect(sentToUpdate()[0].customFields).toMatchObject({ budget: '50k' });
+  });
+});
+
 describe('where no phone dedupe applies, in ANY mode', () => {
   beforeEach(() => setPhoneDedupeModeOverride('on'));
   const untouched = () => {

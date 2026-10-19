@@ -19,7 +19,7 @@ export interface SuppressionResult {
 }
 
 const LOCAL_RE = /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+$/;
-const DOMAIN_RE = /^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+const DOMAIN_RE = /^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})$/;
 
 function normalizeDomain(raw: string): string | null {
   const d = raw.trim().toLowerCase();

@@ -1,7 +1,7 @@
 /**
  * ENG-2123: identity rules for phone-only capture dedupe, and the rollout-mode setting.
  */
-import { phoneDedupeKey, phoneNamesConflict, PHONE_FANOUT_CAP } from '../utils/phoneLeadDedupe';
+import { fillBlankCustomFields, phoneDedupeKey, phoneNamesConflict, PHONE_FANOUT_CAP } from '../utils/phoneLeadDedupe';
 
 describe('phoneDedupeKey', () => {
   it.each([
@@ -57,3 +57,17 @@ describe('phoneNamesConflict', () => {
 });
 
 it('the fan-out cap is 5', () => expect(PHONE_FANOUT_CAP).toBe(5));
+
+describe('fillBlankCustomFields', () => {
+  it('existing non-blank values always win; blanks and absent keys are filled', () => {
+    expect(fillBlankCustomFields({ a: '1', b: '', c: null, d: 0 }, { a: '2', b: 'x', c: 'y', d: 5, e: 'z' }))
+      .toEqual({ a: '1', b: 'x', c: 'y', d: 0, e: 'z' });
+  });
+  it('an incoming blank never blanks or adds noise over a stored value', () => {
+    expect(fillBlankCustomFields({ a: '1' }, { a: '' })).toEqual({ a: '1' });
+  });
+  it('handles missing maps', () => {
+    expect(fillBlankCustomFields(undefined, { a: '1' })).toEqual({ a: '1' });
+    expect(fillBlankCustomFields({ a: '1' }, undefined)).toEqual({ a: '1' });
+  });
+});
