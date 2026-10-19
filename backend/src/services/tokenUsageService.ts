@@ -46,7 +46,7 @@ export interface TokenUsageStatus {
   alertThresholds: ResolvedAlertThresholds;
   /**
    * ENG-668: pay-as-you-go state, present only while an account with PAYG live is past its plan pool.
-   * `active` = this turn was admitted on PAYG; `percentOfCap` = overage as a percentage of the cap the
+   * `active` = this turn was admitted on PAYG with billable overage (> 0); `percentOfCap` = overage as a percentage of the cap the
    * customer chose. Percentages only — the cap and the overage in dollars never leave the server.
    * `costPercentUsed` keeps meaning the plan pool, so it reads above 100 while this is active.
    */
@@ -447,7 +447,14 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
     // ENG-668: present only for an account with PAYG live and past its pool, so every other
     // account's status is exactly what it was.
     ...(pool.overage
-      ? { overage: { active: usageDecision.reason === "payg_overage", percentOfCap: pool.overage.percentOfCap } }
+      ? {
+          overage: {
+            // Covering means billable: admitted on PAYG AND past the pool it is measured on. Admitted at
+            // 0% (a downgrade still under this month's high-water pool) is not PAYG doing anything yet.
+            active: usageDecision.reason === "payg_overage" && pool.overage.overageMicroUsd > 0,
+            percentOfCap: pool.overage.percentOfCap,
+          },
+        }
       : {}),
     ...(pool.paygBlock ? { paygBlock: pool.paygBlock } : {}),
   };

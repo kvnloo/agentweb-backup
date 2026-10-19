@@ -62,7 +62,7 @@ type PaygCopy = { headline: string; body: string; actionTail: string; undated: s
 const PAYG_COPY: Record<"payg_cap_reached" | "payg_suspended", PaygCopy> = {
   payg_cap_reached: {
     headline: "You've reached your pay-as-you-go limit",
-    body: "You've used all of the AI usage included in your plan this month and the pay-as-you-go limit you set.",
+    body: "You've used all of the AI usage included in your plan this month and your pay-as-you-go limit.",
     actionTail: "Raise your pay-as-you-go limit or upgrade your plan to keep working before then.",
     undated: "AI usage is paused: you've reached your pay-as-you-go limit. Raise the limit or upgrade your plan to keep working.",
   },
@@ -88,6 +88,15 @@ const PAYG_INACTIVE_COPY: Record<PaygInactiveReason, PaygCopy> = {
     undated: "AI usage is paused: pay-as-you-go only covers more usage while your subscription is active. Reactivate it to keep working.",
   },
 };
+
+/**
+ * The action sentence for a PAYG block (raise the limit, update or add a payment method, reactivate),
+ * or null when the block is not PAYG's own. For surfaces that phrase their own text around the shared
+ * headline and body — the scheduled-chat email — so their call to action cannot drift from the 429's.
+ */
+export function paygBlockActionSentence(block: UsageBlockPaygInput | null | undefined): string | null {
+  return paygCopyFor(block)?.actionTail ?? null;
+}
 
 function paygCopyFor(block: UsageBlockPaygInput | null | undefined): PaygCopy | undefined {
   if (!block) return undefined;

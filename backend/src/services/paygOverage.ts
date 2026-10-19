@@ -71,8 +71,14 @@ export interface PaygOverageSettings {
    * Re-enabling later in the same month keeps it (never re-measured), so toggling cannot reset the cap.
    * Covers what the high-water mark cannot — a downgrade that happened BEFORE opting in, when no mark
    * was being kept.
+   *
+   * `poolAtOptInMicroUsd` is the month's pool the baseline was measured against. If the pool later grows
+   * (an upgrade, a top-up), the standing overage shrinks by that growth on its own, so the baseline is
+   * reduced by the same amount rather than subtracted twice (see `paygEffectiveBaselineMicroUsd`).
+   * Optional only for an opt-in written before it existed; such a baseline is treated as measured
+   * against that month's pool high-water mark.
    */
-  optIn?: { month: string; overageBaselineMicroUsd: number };
+  optIn?: { month: string; overageBaselineMicroUsd: number; poolAtOptInMicroUsd?: number };
   /** Who last changed the settings (a delegated admin's id when acting as the customer). */
   updatedBy: string;
   updatedAt: string;
@@ -94,6 +100,8 @@ export interface PaygOverageStatus {
   overageMicroUsd: number;
   /** `capPercentOfPool` x the month's pool, derived for this check. */
   capMicroUsd: number;
+  /** The month's pool this check measured overage (and the cap) against. */
+  poolMicroUsd: number;
   /** Floor, so 100 is only ever reported once the cap is actually reached. */
   percentOfCap: number;
 }
@@ -126,6 +134,37 @@ export function paygCapMicroUsd(capPercentOfPool: PaygCapPercent, poolThresholdM
 /** Overage above the month's pool before any opt-in baseline: what the baseline is recorded from. */
 export function paygGrossOverageMicroUsd(costUsedMicroUsd: number, poolMicroUsd: number): number {
   return Math.max(0, Math.round(costUsedMicroUsd) - Math.round(poolMicroUsd));
+}
+
+/**
+ * The opt-in baseline that still applies at this check, given the month's pool now.
+ *
+ * The baseline is the overage standing at opt-in, measured against the pool THEN. Growth of the pool
+ * since (an upgrade, a top-up) already lowers today's gross overage by exactly that growth, so
+ * subtracting the full baseline as well would discount the same dollars twice and hide real
+ * post-opt-in usage from the cap. The baseline shrinks by the growth instead, never below 0. The pool cannot shrink below the opt-in pool within the month:
+ * opting in raises the high-water mark to it.
+ *
+ * An opt-in from another month contributes nothing. One written before `poolAtOptInMicroUsd` existed is
+ * read as measured against the month's high-water mark (or today's pool when there is none, i.e. no
+ * growth). Returns NaN for an unreadable stored baseline, which the caller treats as unreadable input.
+ */
+export function paygEffectiveBaselineMicroUsd(input: {
+  optIn: PaygOverageSettings['optIn'] | null | undefined;
+  poolHighWater: PaygOverageSettings['poolHighWater'] | null | undefined;
+  month: string;
+  poolMicroUsd: number;
+}): number {
+  const optIn = input.optIn;
+  if (!optIn || optIn.month !== input.month) return 0;
+  const baseline = optIn.overageBaselineMicroUsd;
+  if (!Number.isFinite(baseline) || baseline < 0) return Number.NaN;
+  const legacyPoolAtOptIn = input.poolHighWater?.month === input.month && Number.isFinite(input.poolHighWater.thresholdMicroUsd)
+    ? input.poolHighWater.thresholdMicroUsd
+    : input.poolMicroUsd;
+  const poolAtOptIn = Number.isFinite(optIn.poolAtOptInMicroUsd) ? (optIn.poolAtOptInMicroUsd as number) : legacyPoolAtOptIn;
+  const poolGrowth = Math.max(0, Math.round(input.poolMicroUsd) - Math.round(poolAtOptIn));
+  return Math.max(0, Math.round(baseline) - poolGrowth);
 }
 
 /**
@@ -165,16 +204,22 @@ export function evaluatePaygAdmission(input: {
 
   const capMicroUsd = paygCapMicroUsd(account.capPercentOfPool, input.overageThresholdMicroUsd);
   if (capMicroUsd <= 0) return keep;
-  const baseline = account.optIn?.month === input.month ? account.optIn.overageBaselineMicroUsd : 0;
-  if (!Number.isFinite(baseline) || baseline < 0) return keep;
+  const baseline = paygEffectiveBaselineMicroUsd({
+    optIn: account.optIn,
+    poolHighWater: account.poolHighWater,
+    month: input.month,
+    poolMicroUsd: input.overageThresholdMicroUsd,
+  });
+  if (!Number.isFinite(baseline)) return keep;
 
   const overageMicroUsd = Math.max(
     0,
-    paygGrossOverageMicroUsd(input.costUsedMicroUsd, input.overageThresholdMicroUsd) - Math.round(baseline),
+    paygGrossOverageMicroUsd(input.costUsedMicroUsd, input.overageThresholdMicroUsd) - baseline,
   );
   const overage: PaygOverageStatus = {
     overageMicroUsd,
     capMicroUsd,
+    poolMicroUsd: Math.round(input.overageThresholdMicroUsd),
     percentOfCap: Math.floor((overageMicroUsd / capMicroUsd) * 100),
   };
 

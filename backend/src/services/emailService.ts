@@ -11,7 +11,7 @@ import { settingsService } from './settingsService';
 import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
 import { resetDateFromMonth, formatResetDateLong } from '../utils/usageCycle';
-import { buildUsageBlockCopy, type UsageBlockPaygInput } from '../utils/usageBlockCopy';
+import { buildUsageBlockCopy, paygBlockActionSentence, type UsageBlockPaygInput } from '../utils/usageBlockCopy';
 
 // ENG-351: resolve {{cite:N}} markers in Emma's text to inline source attributions, using the
 // citation metadata on the session's last assistant message. Email has no chip renderer, so this
@@ -1397,7 +1397,11 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
         ? buildUsageBlockCopy({ month: usageStatus.month, paygBlock: usageStatus.paygBlock })
         : null;
       const limitLabel = paygCopy ? paygCopy.headline : 'Monthly Usage Limit Reached';
-      const limitReasonText = paygCopy?.reason === 'payg_cap_reached' ? 'pay-as-you-go limit' : 'monthly usage limit';
+      // The PAYG reason is already the headline and the body; the cause just says usage is paused, and
+      // the call to action is the reason's own (raise the limit / update or add a card / reactivate).
+      const limitCause = paygCopy ? 'AI usage is paused' : 'you have reached your monthly usage limit';
+      const continueAction = (paygCopy && paygBlockActionSentence(usageStatus.paygBlock))
+        || 'To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.';
       const usageLine = paygCopy
         ? this.escapeHtml(paygCopy.body)
         : `<strong>Usage:</strong> ${limitPercent}% of your monthly allowance used.`;
@@ -1438,13 +1442,13 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
                 <h3>⚠️ ${limitLabel}</h3>
                 <p style="margin: 0; line-height: 1.6;">
                   Your scheduled chat <strong>"${scheduleName}"</strong> was scheduled to run at <strong>${currentDate}</strong>,
-                  but it cannot execute because you have reached your ${limitReasonText}.
+                  but it cannot execute because ${limitCause}.
                 </p>
                 <p style="margin: 10px 0 0 0; line-height: 1.6;">
                   ${usageLine}
                 </p>
                 <p style="margin: 10px 0 0 0; line-height: 1.6;">
-                  ${allowanceResetClause} To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
+                  ${allowanceResetClause} ${continueAction}
                 </p>
               </div>
             </div>
@@ -1462,11 +1466,11 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       const text = `
 Scheduled Chat Error: ${scheduleName}
 
-Your scheduled chat "${scheduleName}" was scheduled to run at ${currentDate}, but it cannot execute because you have reached your ${limitReasonText}.
+Your scheduled chat "${scheduleName}" was scheduled to run at ${currentDate}, but it cannot execute because ${limitCause}.
 
 ${usageLineText}
 
-${allowanceResetClause} To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
+${allowanceResetClause} ${continueAction}
 
 ---
 This is an automated email from your scheduled chat.

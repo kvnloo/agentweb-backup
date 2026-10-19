@@ -47,6 +47,7 @@ export interface PaygOverageView {
   /** Overage this month as a percentage of the cap; 0 while inside the plan pool. */
   overagePercentUsed: number;
   suspended: PaygSuspensionReason | null;
+  /** The billing owner has a payment method on file. Always false for a caller who is not the owner. */
   hasPaymentMethod: boolean;
 }
 
@@ -85,8 +86,35 @@ function toView(
     capPercentOfPool: isPaygCapPercent(account?.capPercentOfPool) ? account!.capPercentOfPool : null,
     overagePercentUsed,
     suspended: account?.suspended?.reason ?? null,
-    hasPaymentMethod: context.billingUser?.has_payment_method === true,
+    // The owner's billing state is the owner's: a pooled member sees false, never the owner's card status.
+    hasPaymentMethod: context.eligible && context.billingUser?.has_payment_method === true,
   };
+}
+
+/**
+ * Repair a stale cached `has_payment_method` for an owner with PAYG on.
+ *
+ * The gates read the cached flag on every check, and nothing refreshes it when a card is added in the
+ * Stripe customer portal — so an owner who added a card after enabling PAYG would be refused
+ * (`payg_inactive` / `no_payment_method`) indefinitely. Opening the PAYG settings asks Stripe once and
+ * sets the flag when a card is there. Only ever repairs upward (clearing stays with the webhooks), only
+ * for the billing owner, and a Stripe failure leaves the flag as it was rather than failing the read.
+ */
+async function repairPaymentMethodFlag(context: PaygContext): Promise<PaygContext> {
+  const user = context.billingUser;
+  if (!context.available || !context.eligible) return context;
+  if (user?.paygOverage?.enabled !== true || user.has_payment_method === true) return context;
+  const customerId = user.stripe_customer_id;
+  if (!customerId) return context;
+  try {
+    const { stripeService } = await import('./stripeService');
+    if (!(await stripeService.customerHasPaymentMethod(customerId))) return context;
+    const updated = (await userDb.updateUser(context.billingUserId, { has_payment_method: true })) as User | undefined;
+    return { ...context, billingUser: updated ?? { ...user, has_payment_method: true } };
+  } catch (error: any) {
+    console.error('[paygOverage] Could not refresh the payment-method flag:', error?.message || error);
+    return context;
+  }
 }
 
 /** Overage as % of cap, from the same pool decision the gates use. 0 unless PAYG is live and past the pool. */
@@ -97,7 +125,7 @@ async function currentOveragePercent(userId: string, context: PaygContext): Prom
 }
 
 export async function getPaygOverageView(userId: string): Promise<PaygOverageView> {
-  const context = await loadContext(userId);
+  const context = await repairPaymentMethodFlag(await loadContext(userId));
   return toView(context, context.billingUser?.paygOverage, await currentOveragePercent(userId, context));
 }
 
@@ -158,6 +186,7 @@ export async function updatePaygOverage(input: {
   if (!existing && !input.enabled) return toView(context, existing, 0);
 
   let optIn: PaygOverageSettings['optIn'] | undefined;
+  let poolHighWater: PaygOverageSettings['poolHighWater'] | undefined;
   if (turningOn) {
     // Overage already standing right now is not the customer's to pay for: it accrued before they
     // agreed. Measured exactly the way the gates measure it (same pool, same high-water mark).
@@ -175,10 +204,21 @@ export async function updatePaygOverage(input: {
         poolHighWater: existing?.poolHighWater,
         month,
       });
-      optIn = { month, overageBaselineMicroUsd: paygGrossOverageMicroUsd(usage.costUsedMicroUsd, poolMicroUsd) };
+      optIn = {
+        month,
+        overageBaselineMicroUsd: paygGrossOverageMicroUsd(usage.costUsedMicroUsd, poolMicroUsd),
+        poolAtOptInMicroUsd: poolMicroUsd,
+      };
+      // Pin the month's pool at least at the opt-in pool, so a downgrade before the next check cannot
+      // drop the pool under the one the baseline was measured against.
+      if (existing?.poolHighWater?.month !== month || existing.poolHighWater.thresholdMicroUsd < poolMicroUsd) {
+        poolHighWater = { month, thresholdMicroUsd: poolMicroUsd };
+      }
     }
     await requireLivePaymentMethod(context.billingUser);
   }
+  // Stripe just confirmed a card: the gates read the cached flag, so it is written with the settings.
+  const userFields: Partial<User> = turningOn ? { has_payment_method: true } : {};
 
   const now = new Date().toISOString();
   const nextVersion = (Number.isInteger(existing?.version) ? existing!.version : 0) + 1;
@@ -189,11 +229,12 @@ export async function updatePaygOverage(input: {
         enabled: input.enabled,
         capPercentOfPool: capPercentOfPool!,
         ...(optIn ? { optIn } : {}),
+        ...(poolHighWater ? { poolHighWater } : {}),
         updatedBy: input.actorId,
         updatedAt: now,
         version: nextVersion,
       };
-      updated = (await userDb.updateUser(context.billingUserId, { paygOverage: created }, {
+      updated = (await userDb.updateUser(context.billingUserId, { ...userFields, paygOverage: created }, {
         condition: { expression: 'attribute_not_exists(#paygOverage)', names: { '#paygOverage': 'paygOverage' } },
       })) as User;
     } else {
@@ -202,22 +243,34 @@ export async function updatePaygOverage(input: {
         enabled: input.enabled,
         ...(capPercentOfPool !== null ? { capPercentOfPool } : {}),
         ...(optIn ? { optIn } : {}),
+        ...(poolHighWater ? { poolHighWater } : {}),
         updatedBy: input.actorId,
         updatedAt: now,
         version: nextVersion,
       };
-      updated = (await userDb.updateUser(context.billingUserId, {}, {
+      const conditions = [
+        Number.isInteger(existing.version)
+          ? '#payg.#version = :expectedVersion'
+          : 'attribute_exists(#payg) AND attribute_not_exists(#payg.#version)',
+      ];
+      const values: Record<string, unknown> = Number.isInteger(existing.version) ? { ':expectedVersion': existing.version } : {};
+      if (poolHighWater) {
+        // The gate raises the mark without bumping the version; never lower one it raised meanwhile.
+        conditions.push('(attribute_not_exists(#payg.#hw) OR #payg.#hw.#hwMonth <> :hwMonth OR #payg.#hw.#hwThreshold <= :hwThreshold)');
+        values[':hwMonth'] = poolHighWater.month;
+        values[':hwThreshold'] = poolHighWater.thresholdMicroUsd;
+      }
+      updated = (await userDb.updateUser(context.billingUserId, userFields, {
         pathSets: Object.entries(fields).map(([key, value]) => ({ path: ['paygOverage', key], value })),
-        condition: Number.isInteger(existing.version)
-          ? {
-              expression: '#payg.#version = :expectedVersion',
-              names: { '#payg': 'paygOverage', '#version': 'version' },
-              values: { ':expectedVersion': existing.version },
-            }
-          : {
-              expression: 'attribute_exists(#payg) AND attribute_not_exists(#payg.#version)',
-              names: { '#payg': 'paygOverage', '#version': 'version' },
-            },
+        condition: {
+          expression: conditions.join(' AND '),
+          names: {
+            '#payg': 'paygOverage',
+            '#version': 'version',
+            ...(poolHighWater ? { '#hw': 'poolHighWater', '#hwMonth': 'month', '#hwThreshold': 'thresholdMicroUsd' } : {}),
+          },
+          ...(Object.keys(values).length > 0 ? { values } : {}),
+        },
       })) as User;
     }
   } catch (error: any) {

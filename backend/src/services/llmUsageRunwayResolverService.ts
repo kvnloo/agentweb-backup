@@ -123,11 +123,19 @@ export async function resolveUsageRunway(
   // forecast over EXACTLY the same inputs — a backtest against a different
   // ledger view would measure the difference between the two views, not the
   // accuracy of the forecast.
+  // ENG-668: admitted on pay-as-you-go. With billable overage, PAYG is covering and there is no "runs
+  // out" to forecast. Admitted at 0% billable (a downgrade still under this month's high-water pool),
+  // the customer still has that pool's included usage, so forecast against it instead of claiming the
+  // smaller current pool is already exhausted.
+  const paygAdmitted = usage.mode.reason === "payg_overage" && !!usage.overage;
+  const paygCovering = paygAdmitted && usage.overage!.overageMicroUsd > 0;
   const forecastInput = {
     // Both of these are already credit-adjusted by getEffectiveLlmUsagePolicy —
     // re-applying credits here would double-count them.
     costUsedMicroUsd: usage.costUsedMicroUsd,
-    hardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd,
+    hardThresholdMicroUsd: paygAdmitted && !paygCovering
+      ? usage.overage!.poolMicroUsd
+      : usage.policy.hardCostThresholdMicroUsd,
     attributionInferred: attributionInferred || ledgerIsIncomplete,
     dailyCostMicroUsd: rows.map((row) => ({
       date: row.date,
@@ -136,8 +144,7 @@ export async function resolveUsageRunway(
     cycleStartDate,
     cycleResetDate,
     today,
-    // ENG-668: admitted past the pool on pay-as-you-go — the same decision both admission gates reach.
-    ...(usage.mode.reason === "payg_overage" ? { paygCovering: true } : {}),
+    ...(paygCovering ? { paygCovering: true } : {}),
   };
   const runway = computeUsageRunway(forecastInput);
 
