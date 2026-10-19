@@ -1,6 +1,6 @@
 /**
- * Twilio voice webhooks (ENG-2271 WP5b): signature guard, per-endpoint state machine, metering.
- * The store is an in-memory fake with the same conditional semantics as LeadCallStore.transition.
+ * Twilio voice webhooks (ENG-2271): signature guard, per-endpoint state machine, metering.
+ * The store is FakeLeadCallStore, an in-memory fake with the same conditional semantics as LeadCallStore.
  */
 import fs from 'fs';
 import path from 'path';
@@ -23,7 +23,8 @@ import { setHotLeadCallEnabledOverride } from '../services/voice/hotLeadCallMode
 import { setLeadCallStoreForTests } from '../services/voice/leadCallStore';
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
 import { FakeVoiceProvider } from '../services/voice/fakeVoiceProvider';
-import type { HotLeadCallEventType, HotLeadCallRecord, HotLeadCallState, LeadCallStore } from '../services/voice/leadCallStore.types';
+import { FakeLeadCallStore } from '../services/voice/fakeLeadCallStore';
+import type { HotLeadCallRecord, HotLeadCallState } from '../services/voice/leadCallStore.types';
 import * as twiml from '../services/voice/twiml';
 import { buildVoiceWebhookUrl } from '../services/voice/voiceUrls';
 import twilioVoiceWebhookRoutes, { twilioVoiceBodyParser } from '../routes/twilioVoiceWebhook';
@@ -40,7 +41,6 @@ const OWNER_PHONE = '+14155550100';
 const TWILIO_NUMBER = '+14155550111';
 const LEAD_PHONE = '+14155550123';
 const QUERY = `listId=${LIST}&leadId=${LEAD}&jobKey=${JOB}`;
-const TERMINAL: HotLeadCallState[] = ['finished', 'failed', 'skipped'];
 
 const orgConfig = {
   enabled: true,
@@ -51,38 +51,7 @@ const orgConfig = {
   quietHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
 };
 
-class MemoryStore implements LeadCallStore {
-  record: HotLeadCallRecord | null = null;
-  events: Array<{ type: HotLeadCallEventType; detail?: unknown }> = [];
-  transitions = 0;
-  async get() { return this.record ? structuredClone(this.record) : null; }
-  async create(_l: string, _i: string, record: HotLeadCallRecord) {
-    if (this.record) return false;
-    this.record = { meteredLegs: [], lastSequence: {}, ...structuredClone(record) };
-    return true;
-  }
-  async transition(_l: string, _i: string, from: HotLeadCallState[], patch: Partial<HotLeadCallRecord> & { state: HotLeadCallState }) {
-    const r = this.record;
-    if (!r || from.length === 0 || from.some((s) => TERMINAL.includes(s)) || !from.includes(r.state)) return false;
-    const seq = patch.lastSequence ?? {};
-    if (Object.entries(seq).some(([k, v]) => r.lastSequence?.[k] !== undefined && r.lastSequence[k] >= v)) return false;
-    const legs = [...new Set(patch.meteredLegs ?? [])];
-    if (legs.some((l) => r.meteredLegs?.includes(l))) return false;
-    for (const key of ['state', 'jobKey', 'ownerCallSid', 'leadCallSid', 'outcome'] as const) {
-      if (patch[key] !== undefined) (r as unknown as Record<string, unknown>)[key] = patch[key];
-    }
-    r.lastSequence = { ...r.lastSequence, ...seq };
-    r.meteredLegs = [...(r.meteredLegs ?? []), ...legs];
-    this.transitions++;
-    return true;
-  }
-  async addEvent(_l: string, _i: string, type: HotLeadCallEventType, detail?: Record<string, string | number | boolean>) {
-    this.events.push({ type, detail });
-  }
-  eventTypes() { return this.events.map((e) => e.type); }
-}
-
-let store: MemoryStore;
+let store: FakeLeadCallStore;
 let fake: FakeVoiceProvider;
 let logSpy: jest.SpyInstance[];
 
@@ -132,7 +101,7 @@ const usage = () => mock(recordCallUsage).mock.calls.map((c) => c[0]);
 beforeEach(() => {
   jest.resetAllMocks();
   process.env.BACKEND_URL = `${BASE}/`;
-  store = new MemoryStore();
+  store = new FakeLeadCallStore();
   setLeadCallStoreForTests(store);
   fake = new FakeVoiceProvider();
   setVoiceProviderForTests(fake);

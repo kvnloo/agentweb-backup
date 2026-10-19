@@ -25,7 +25,7 @@ import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
 import { setLeadCallStoreForTests } from '../services/voice/leadCallStore';
 import { FakeLimitStore } from '../services/voice/fakeLimitStore';
 import { setLimitStoreForTests } from '../services/voice/limitStore';
-import type { HotLeadCallEventType, HotLeadCallRecord, LeadCallStore } from '../services/voice/leadCallStore.types';
+import { FakeLeadCallStore } from '../services/voice/fakeLeadCallStore';
 
 const mock = (fn: unknown) => fn as jest.Mock;
 const OWNER_PHONE = '+14155550100';
@@ -39,28 +39,8 @@ const config = {
   quietHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
 };
 
-class MemoryStore implements LeadCallStore {
-  record: HotLeadCallRecord | null = null;
-  events: Array<{ type: HotLeadCallEventType; detail?: Record<string, unknown> }> = [];
-  transitionError: Error | null = null;
-  async get() { return this.record; }
-  async create(_l: string, _i: string, record: HotLeadCallRecord) {
-    if (this.record) return false;
-    this.record = record;
-    return true;
-  }
-  async transition(_l: string, _i: string, from: HotLeadCallRecord['state'][], patch: Partial<HotLeadCallRecord> & { state: HotLeadCallRecord['state'] }) {
-    if (this.transitionError) throw this.transitionError;
-    if (!this.record || !from.includes(this.record.state)) return false;
-    this.record = { ...this.record, ...patch };
-    return true;
-  }
-  async addEvent(_l: string, _i: string, type: HotLeadCallEventType, detail?: Record<string, unknown>) { this.events.push({ type, detail }); }
-  types() { return this.events.map(e => e.type); }
-}
-
 let provider: FakeVoiceProvider;
-let store: MemoryStore;
+let store: FakeLeadCallStore;
 let limits: FakeLimitStore;
 let lead: Record<string, unknown>;
 let org: Record<string, unknown>;
@@ -78,7 +58,7 @@ beforeEach(() => {
   setHotLeadCallEnabledOverride(true);
   provider = new FakeVoiceProvider();
   setVoiceProviderForTests(provider);
-  store = new MemoryStore();
+  store = new FakeLeadCallStore();
   setLeadCallStoreForTests(store);
   limits = new FakeLimitStore();
   setLimitStoreForTests(limits);
@@ -105,7 +85,7 @@ describe('dispatchHotLeadCall gates', () => {
     await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
     expect(provider.placedCalls).toHaveLength(1);
     expect(store.record).toMatchObject({ state: 'owner_ringing', ownerCallSid: 'CA00000001' });
-    expect(store.types()).toEqual(['call.initiated']);
+    expect(store.eventTypes()).toEqual(['call.initiated']);
     expect(queue.markJobComplete).toHaveBeenCalledTimes(1);
   });
 
@@ -301,7 +281,7 @@ describe('processHotLeadCallJob', () => {
     await Promise.all([processHotLeadCallJob(jobOf()), processHotLeadCallJob(jobOf(second))]);
     expect(provider.placedCalls).toHaveLength(1);
     // The loser may record a duplicate_phone skip if it trips the marker before the winner's record exists.
-    expect(store.types().filter(t => t === 'call.initiated')).toHaveLength(1);
+    expect(store.eventTypes().filter(t => t === 'call.initiated')).toHaveLength(1);
     expect(store.events.filter(e => e.type === 'call.skipped').every(e => e.detail?.reason === 'duplicate_phone')).toBe(true);
   });
 
@@ -309,7 +289,7 @@ describe('processHotLeadCallJob', () => {
     await processHotLeadCallJob(jobOf());
     await processHotLeadCallJob(jobOf({ submissionId: 'sub-2', submittedAt: new Date().toISOString() }));
     expect(provider.placedCalls).toHaveLength(1);
-    expect(store.types()).toEqual(['call.initiated']);
+    expect(store.eventTypes()).toEqual(['call.initiated']);
   });
 
   it('after a crash between create and placeCall the stuck dialing record blocks every re-run', async () => {
