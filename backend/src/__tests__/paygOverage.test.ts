@@ -3,13 +3,17 @@
  *
  * Billing invariant: PAYG only ever turns a `hard_threshold_reached` 429 into an admit when EVERY
  * condition holds; any one missing or unreadable keeps the 429. Each condition is knocked out in turn.
+ * The cap is a percentage of the month's pool (never a stored dollar figure), and only usage after
+ * opting in is overage.
  */
 import {
   createPaygOverageSwitch,
   evaluatePaygAdmission,
   paygCapMicroUsd,
+  paygGrossOverageMicroUsd,
   paygOverageThresholdMicroUsd,
   PAYG_OVERAGE_SETTING,
+  toCustomerPaygOverage,
   validatePaygOverageTierConfig,
   type PaygOverageSettings,
 } from '../services/paygOverage';
@@ -17,19 +21,19 @@ import type { LlmUsageModeDecision } from '../services/llmUsagePolicyService';
 import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
 
 const USD = 1_000_000;
+const MONTH = '2026-10';
 const PAUSED: LlmUsageModeDecision = { usageMode: 'paused', admissionAllowed: false, reason: 'hard_threshold_reached' };
 
 const account = (over: Partial<PaygOverageSettings> = {}): PaygOverageSettings => ({
   enabled: true,
   capPercentOfPool: 50,
-  capMicroUsd: 50 * USD,
-  enabledBy: 'owner-1',
+  updatedBy: 'owner-1',
   updatedAt: '2026-10-01T00:00:00.000Z',
   version: 1,
   ...over,
 });
 
-/** Every admit condition true: $120 spent against a $100 pool, $50 cap => $20 overage, 40% of cap. */
+/** Every admit condition true: $120 spent against a $100 pool, 50% cap = $50 => $20 overage, 40% of cap. */
 const admitting = () => ({
   decision: PAUSED,
   switchOn: true,
@@ -39,6 +43,7 @@ const admitting = () => ({
   subscriptionStatus: 'active' as unknown,
   costUsedMicroUsd: 120 * USD,
   overageThresholdMicroUsd: 100 * USD,
+  month: MONTH,
 });
 
 describe('evaluatePaygAdmission', () => {
@@ -46,7 +51,7 @@ describe('evaluatePaygAdmission', () => {
     const result = evaluatePaygAdmission(admitting());
     expect(result.decision).toEqual({ usageMode: 'full_choice', admissionAllowed: true, reason: 'payg_overage' });
     expect(result.overage).toEqual({ overageMicroUsd: 20 * USD, capMicroUsd: 50 * USD, percentOfCap: 40 });
-    expect(result.blockReason).toBeNull();
+    expect(result.block).toBeNull();
   });
 
   it('admits a trialing subscription too', () => {
@@ -67,9 +72,10 @@ describe('evaluatePaygAdmission', () => {
     ['the subscription status is missing', { subscriptionStatus: undefined }],
     ['the cap is reached exactly', { costUsedMicroUsd: 150 * USD }],
     ['the cap is exceeded', { costUsedMicroUsd: 400 * USD }],
-    ['the stored cap is zero', { account: account({ capMicroUsd: 0 }) }],
-    ['the stored cap is unreadable', { account: account({ capMicroUsd: Number.NaN }) }],
+    ['the stored cap percentage is not one of the four', { account: account({ capPercentOfPool: 75 as any }) }],
+    ['the pool is zero (no cap can be derived)', { overageThresholdMicroUsd: 0 }],
     ['spend is unreadable', { costUsedMicroUsd: Number.NaN }],
+    ['the opt-in baseline is unreadable', { account: account({ optIn: { month: MONTH, overageBaselineMicroUsd: Number.NaN } }) }],
   ])('keeps the 429 when %s', (_label, override) => {
     const result = evaluatePaygAdmission({ ...admitting(), ...override });
     expect(result.decision).toBe(PAUSED);
@@ -78,7 +84,7 @@ describe('evaluatePaygAdmission', () => {
 
   it('names the cap as the reason once the cap is reached', () => {
     const result = evaluatePaygAdmission({ ...admitting(), costUsedMicroUsd: 150 * USD });
-    expect(result.blockReason).toBe('payg_cap_reached');
+    expect(result.block).toEqual({ reason: 'payg_cap_reached' });
     expect(result.overage).toEqual({ overageMicroUsd: 50 * USD, capMicroUsd: 50 * USD, percentOfCap: 100 });
   });
 
@@ -88,12 +94,17 @@ describe('evaluatePaygAdmission', () => {
       costUsedMicroUsd: 400 * USD,
       account: account({ suspended: { reason: 'dispute', at: '2026-10-02T00:00:00.000Z' } }),
     });
-    expect(result.blockReason).toBe('payg_suspended');
+    expect(result.block).toEqual({ reason: 'payg_suspended' });
   });
 
-  it('gives no PAYG reason for a payment-method or subscription problem (the plain block copy applies)', () => {
-    expect(evaluatePaygAdmission({ ...admitting(), hasPaymentMethod: false }).blockReason).toBeNull();
-    expect(evaluatePaygAdmission({ ...admitting(), subscriptionStatus: 'past_due' }).blockReason).toBeNull();
+  it('says PAYG is on but not covering when no payment method is on file', () => {
+    expect(evaluatePaygAdmission({ ...admitting(), hasPaymentMethod: false }).block)
+      .toEqual({ reason: 'payg_inactive', paygInactiveReason: 'no_payment_method' });
+  });
+
+  it('says PAYG is on but not covering when the subscription is not live', () => {
+    expect(evaluatePaygAdmission({ ...admitting(), subscriptionStatus: 'past_due' }).block)
+      .toEqual({ reason: 'payg_inactive', paygInactiveReason: 'subscription_inactive' });
   });
 
   it.each<LlmUsageModeDecision>([
@@ -101,7 +112,7 @@ describe('evaluatePaygAdmission', () => {
     { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' },
   ])('returns any non-hard-threshold decision untouched ($reason)', (decision) => {
     const result = evaluatePaygAdmission({ ...admitting(), decision });
-    expect(result).toEqual({ decision, overage: null, blockReason: null });
+    expect(result).toEqual({ decision, overage: null, block: null });
     expect(result.decision).toBe(decision);
   });
 
@@ -112,12 +123,54 @@ describe('evaluatePaygAdmission', () => {
   });
 });
 
+describe('the cap is a percentage of the month\'s pool, never a frozen dollar figure', () => {
+  it('derives the cap from the pool the check measures against', () => {
+    expect(evaluatePaygAdmission({ ...admitting(), overageThresholdMicroUsd: 400 * USD, costUsedMicroUsd: 500 * USD }).overage)
+      .toEqual({ overageMicroUsd: 100 * USD, capMicroUsd: 200 * USD, percentOfCap: 50 });
+  });
+
+  it('follows a smaller pool the next month (no cap carried over from a bigger plan)', () => {
+    // 50% of a $100 pool is $50, whatever the pool was when the cap was chosen.
+    const result = evaluatePaygAdmission({ ...admitting(), costUsedMicroUsd: 290 * USD });
+    expect(result.decision.admissionAllowed).toBe(false);
+    expect(result.block).toEqual({ reason: 'payg_cap_reached' });
+    expect(result.overage!.capMicroUsd).toBe(50 * USD);
+  });
+});
+
+describe('only usage after opting in is overage', () => {
+  const optedIn = (baseline: number, month = MONTH) =>
+    account({ capPercentOfPool: 200, optIn: { month, overageBaselineMicroUsd: baseline } });
+
+  it('subtracts the overage already standing at opt-in for that month', () => {
+    // Opted in at $250 spent on a $100 pool => $150 baseline. Now $260: $10 of new overage.
+    const result = evaluatePaygAdmission({ ...admitting(), account: optedIn(150 * USD), costUsedMicroUsd: 260 * USD });
+    expect(result.decision.admissionAllowed).toBe(true);
+    expect(result.overage).toEqual({ overageMicroUsd: 10 * USD, capMicroUsd: 200 * USD, percentOfCap: 5 });
+  });
+
+  it('reads 0% right at the moment of opting in', () => {
+    const result = evaluatePaygAdmission({ ...admitting(), account: optedIn(150 * USD), costUsedMicroUsd: 250 * USD });
+    expect(result.overage).toEqual({ overageMicroUsd: 0, capMicroUsd: 200 * USD, percentOfCap: 0 });
+  });
+
+  it('ignores a baseline from an earlier month', () => {
+    const result = evaluatePaygAdmission({ ...admitting(), account: optedIn(150 * USD, '2026-09'), costUsedMicroUsd: 260 * USD });
+    expect(result.overage!.overageMicroUsd).toBe(160 * USD);
+  });
+
+  it('paygGrossOverageMicroUsd is what the baseline is recorded from', () => {
+    expect(paygGrossOverageMicroUsd(250 * USD, 100 * USD)).toBe(150 * USD);
+    expect(paygGrossOverageMicroUsd(80 * USD, 100 * USD)).toBe(0);
+  });
+});
+
 describe('paygOverageThresholdMicroUsd — mid-month downgrade', () => {
   it('measures overage above the month\'s high-water mark when today\'s pool is lower', () => {
     expect(paygOverageThresholdMicroUsd({
       effectiveHardThresholdMicroUsd: 100 * USD,
-      poolHighWater: { month: '2026-10', thresholdMicroUsd: 150 * USD },
-      month: '2026-10',
+      poolHighWater: { month: MONTH, thresholdMicroUsd: 150 * USD },
+      month: MONTH,
     })).toBe(150 * USD);
   });
 
@@ -125,15 +178,15 @@ describe('paygOverageThresholdMicroUsd — mid-month downgrade', () => {
     expect(paygOverageThresholdMicroUsd({
       effectiveHardThresholdMicroUsd: 100 * USD,
       poolHighWater: { month: '2026-09', thresholdMicroUsd: 150 * USD },
-      month: '2026-10',
+      month: MONTH,
     })).toBe(100 * USD);
   });
 
   it('uses today\'s pool when it is the higher one (an upgrade or a top-up)', () => {
     expect(paygOverageThresholdMicroUsd({
       effectiveHardThresholdMicroUsd: 200 * USD,
-      poolHighWater: { month: '2026-10', thresholdMicroUsd: 150 * USD },
-      month: '2026-10',
+      poolHighWater: { month: MONTH, thresholdMicroUsd: 150 * USD },
+      month: MONTH,
     })).toBe(200 * USD);
   });
 
@@ -144,12 +197,12 @@ describe('paygOverageThresholdMicroUsd — mid-month downgrade', () => {
       costUsedMicroUsd: 120 * USD,
       overageThresholdMicroUsd: paygOverageThresholdMicroUsd({
         effectiveHardThresholdMicroUsd: 100 * USD,
-        poolHighWater: { month: '2026-10', thresholdMicroUsd: 150 * USD },
-        month: '2026-10',
+        poolHighWater: { month: MONTH, thresholdMicroUsd: 150 * USD },
+        month: MONTH,
       }),
     });
     expect(result.decision.admissionAllowed).toBe(true);
-    expect(result.overage).toEqual({ overageMicroUsd: 0, capMicroUsd: 50 * USD, percentOfCap: 0 });
+    expect(result.overage).toEqual({ overageMicroUsd: 0, capMicroUsd: 75 * USD, percentOfCap: 0 });
   });
 });
 
@@ -161,17 +214,40 @@ describe('paygCapMicroUsd', () => {
   });
 });
 
+describe('toCustomerPaygOverage', () => {
+  it('keeps only the on/off state and the percentage cap', () => {
+    expect(toCustomerPaygOverage({
+      ...account({ capPercentOfPool: 100 }),
+      poolHighWater: { month: MONTH, thresholdMicroUsd: 100 * USD },
+      optIn: { month: MONTH, overageBaselineMicroUsd: 5 * USD },
+    })).toEqual({ enabled: true, capPercentOfPool: 100 });
+  });
+
+  it('is absent for an account with nothing stored', () => {
+    expect(toCustomerPaygOverage(undefined)).toBeUndefined();
+  });
+});
+
 describe('validatePaygOverageTierConfig', () => {
   it('accepts a boolean and a markup of at least 1x', () => {
     expect(validatePaygOverageTierConfig({ allowed: true, markupBps: 10_000 })).toEqual([]);
   });
 
-  it('rejects a non-boolean allowed and a below-cost or fractional markup', () => {
+  it('does not require a markup for a tier that does not offer PAYG', () => {
+    expect(validatePaygOverageTierConfig({ allowed: false })).toEqual([]);
+  });
+
+  it('requires a markup for a tier that offers PAYG', () => {
+    expect(validatePaygOverageTierConfig({ allowed: true })).toEqual(['markupBps must be an integer of at least 10000 (1x)']);
+  });
+
+  it('rejects a non-boolean allowed and a below-cost or fractional markup, even on a tier that does not offer PAYG', () => {
     expect(validatePaygOverageTierConfig({ allowed: 'yes' as any, markupBps: 9_999 })).toEqual([
       'allowed must be boolean',
       'markupBps must be an integer of at least 10000 (1x)',
     ]);
     expect(validatePaygOverageTierConfig({ allowed: true, markupBps: 12_500.5 })).toHaveLength(1);
+    expect(validatePaygOverageTierConfig({ allowed: false, markupBps: 5_000 })).toHaveLength(1);
   });
 });
 
@@ -220,16 +296,18 @@ describe('createPaygOverageSwitch', () => {
 });
 
 describe('buildUsageBlockCopy — PAYG variants', () => {
-  it('leaves the plain block copy exactly as it was (no reason key)', () => {
-    const plain = buildUsageBlockCopy({ month: '2026-10' });
+  it('leaves the plain block copy exactly as it was (no reason keys)', () => {
+    const plain = buildUsageBlockCopy({ month: MONTH });
     expect(plain).not.toHaveProperty('reason');
-    expect(buildUsageBlockCopy({ month: '2026-10', reason: undefined })).toEqual(plain);
-    expect(buildUsageBlockCopy({ month: '2026-10', reason: null })).toEqual(plain);
+    expect(plain).not.toHaveProperty('paygInactiveReason');
+    expect(buildUsageBlockCopy({ month: MONTH, paygBlock: undefined })).toEqual(plain);
+    expect(buildUsageBlockCopy({ month: MONTH, paygBlock: null })).toEqual(plain);
   });
 
   it('says the pay-as-you-go limit was reached, with the reset date', () => {
-    const copy = buildUsageBlockCopy({ month: '2026-10', reason: 'payg_cap_reached' });
+    const copy = buildUsageBlockCopy({ month: MONTH, paygBlock: { reason: 'payg_cap_reached' } });
     expect(copy.reason).toBe('payg_cap_reached');
+    expect(copy).not.toHaveProperty('paygInactiveReason');
     expect(copy.headline).toMatch(/pay-as-you-go limit/);
     expect(copy.resetDate).toBe('2026-11-01');
     expect(copy.message).toContain('November 1, 2026');
@@ -237,22 +315,38 @@ describe('buildUsageBlockCopy — PAYG variants', () => {
   });
 
   it('says pay-as-you-go is on hold for a payment problem', () => {
-    const copy = buildUsageBlockCopy({ month: '2026-10', reason: 'payg_suspended' });
+    const copy = buildUsageBlockCopy({ month: MONTH, paygBlock: { reason: 'payg_suspended' } });
     expect(copy.reason).toBe('payg_suspended');
     expect(copy.body).toMatch(/payment/);
     expect(copy.message).toMatch(/payment method/);
   });
 
+  it.each([
+    ['no_payment_method', /payment method/],
+    ['subscription_inactive', /subscription/],
+  ] as const)('says PAYG is on but not covering (%s)', (paygInactiveReason, wording) => {
+    const copy = buildUsageBlockCopy({ month: MONTH, paygBlock: { reason: 'payg_inactive', paygInactiveReason } });
+    expect(copy.reason).toBe('payg_inactive');
+    expect(copy.paygInactiveReason).toBe(paygInactiveReason);
+    expect(copy.headline).toMatch(wording);
+    expect(copy.message).toMatch(wording);
+  });
+
   it('falls back to undated wording when the month is unreadable', () => {
-    const copy = buildUsageBlockCopy({ month: 'garbage', reason: 'payg_cap_reached' });
+    const copy = buildUsageBlockCopy({ month: 'garbage', paygBlock: { reason: 'payg_cap_reached' } });
     expect(copy.resetDate).toBeNull();
     expect(copy.resetSentence).toBeNull();
     expect(copy.message).not.toMatch(/resets on/);
   });
 
   it('never states a dollar amount', () => {
-    for (const reason of ['payg_cap_reached', 'payg_suspended'] as const) {
-      expect(JSON.stringify(buildUsageBlockCopy({ month: '2026-10', reason }))).not.toMatch(/\$/);
+    for (const paygBlock of [
+      { reason: 'payg_cap_reached' },
+      { reason: 'payg_suspended' },
+      { reason: 'payg_inactive', paygInactiveReason: 'no_payment_method' },
+      { reason: 'payg_inactive', paygInactiveReason: 'subscription_inactive' },
+    ] as const) {
+      expect(JSON.stringify(buildUsageBlockCopy({ month: MONTH, paygBlock }))).not.toMatch(/\$/);
     }
   });
 });

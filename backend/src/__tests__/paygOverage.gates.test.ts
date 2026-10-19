@@ -100,10 +100,9 @@ const policy = {
 const payg = (over: Partial<PaygOverageSettings> = {}): PaygOverageSettings => ({
   enabled: true,
   capPercentOfPool: 50,
-  capMicroUsd: 50 * USD,
   // Already at today's pool, so the high-water write is not part of every case.
   poolHighWater: { month: getCurrentUsageMonth(), thresholdMicroUsd: 100 * USD },
-  enabledBy: OWNER,
+  updatedBy: OWNER,
   updatedAt: '2026-10-01T00:00:00.000Z',
   version: 1,
   ...over,
@@ -189,16 +188,16 @@ describe('ENG-668 PAYG — both gates agree', () => {
   it('a reached cap is a 429 that says so, without dollars', async () => {
     setup({ spendUsd: 150 });
     const status = await checkTokenUsage(OWNER);
-    expect(status.usageBlockReason).toBe('payg_cap_reached');
+    expect(status.paygBlock).toEqual({ reason: 'payg_cap_reached' });
     expect(status.overage).toEqual({ active: false, percentOfCap: 100 });
 
     const customer = toCustomerTokenUsage(status);
     expect(customer.usageBlock.reason).toBe('payg_cap_reached');
     expect(customer.usageBlock.headline).toMatch(/pay-as-you-go limit/);
-    expect(customer).not.toHaveProperty('usageBlockReason');
+    expect(customer).not.toHaveProperty('paygBlock');
 
     const usage = await getEffectiveLlmUsagePolicy(OWNER);
-    expect(usage.paygBlockReason).toBe('payg_cap_reached');
+    expect(usage.paygBlock).toEqual({ reason: 'payg_cap_reached' });
   });
 
   it('a suspension is a 429 with the payment-problem variant', async () => {
@@ -222,6 +221,19 @@ describe('ENG-668 PAYG — both gates agree', () => {
     mockGetUserById.mockClear();
     expect((await checkTokenUsage(OWNER)).allowed).toBe(false);
     expect(mockGetUserById).toHaveBeenCalledTimes(readsWithoutPayg);
+  });
+
+  it.each([
+    ['no payment method is on file', { has_payment_method: false }, 'no_payment_method'],
+    ['the subscription is not live', { subscription_status: 'past_due' }, 'subscription_inactive'],
+  ] as const)('PAYG on but not covering (%s) is a 429 that says why, not the plain block', async (_label, user, paygInactiveReason) => {
+    setup({ spendUsd: 120, user });
+    const status = await checkTokenUsage(OWNER);
+    expect(status.allowed).toBe(false);
+    expect(status.paygBlock).toEqual({ reason: 'payg_inactive', paygInactiveReason });
+    const block = toCustomerTokenUsage(status).usageBlock;
+    expect(block.reason).toBe('payg_inactive');
+    expect(block.paygInactiveReason).toBe(paygInactiveReason);
   });
 
   it('customer projection exposes only percentages for PAYG', async () => {
@@ -320,5 +332,36 @@ describe('ENG-668 PAYG — dark: switch off is byte-identical to before', () => 
     const status = await checkTokenUsage(OWNER);
     expect(status).not.toHaveProperty('overage');
     expect(mockSwitch).not.toHaveBeenCalled();
+  });
+});
+
+describe('ENG-668 PAYG — review regressions', () => {
+  it('an opt-in after a pre-opt-in downgrade bills none of the usage the old, larger pool included', async () => {
+    // Earlier this month on a $400 pool, $250 spent; downgraded to $100; THEN opted in at 200%. No
+    // high-water mark existed before opting in, so the opt-in baseline is what protects that $150.
+    setup({
+      spendUsd: 250,
+      user: {
+        paygOverage: payg({
+          capPercentOfPool: 200,
+          poolHighWater: undefined,
+          optIn: { month: getCurrentUsageMonth(), overageBaselineMicroUsd: 150 * USD },
+        }),
+      },
+    });
+    const { status, decision } = await bothGates();
+    expect(status.allowed).toBe(true);
+    expect(status.overage).toEqual({ active: true, percentOfCap: 0 });
+    expect(decision.modelSelection).toBe('honored');
+  });
+
+  it('the cap follows this month\'s pool, not the pool it was chosen against', async () => {
+    // 50% chosen when the pool was $400; the pool is now $100, so the cap is $50 and $190 over is blocked.
+    setup({ spendUsd: 290, user: { paygOverage: payg({ capPercentOfPool: 50, poolHighWater: undefined }) } });
+    const { status, decision } = await bothGates();
+    expect(status.allowed).toBe(false);
+    expect(status.paygBlock).toEqual({ reason: 'payg_cap_reached' });
+    expect(status.overage).toEqual({ active: false, percentOfCap: 380 });
+    expect(decision.modelSelection).toBe('blocked');
   });
 });

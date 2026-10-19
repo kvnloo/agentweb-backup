@@ -48,6 +48,7 @@ import { getSubscriptionTypeConfig, getUserSubscriptionType } from '../../servic
 import { stripeService } from '../../services/stripeService';
 import { resolveEnforcementCostBasisMicroUsd } from '../../services/spendEnforcementBasis';
 import { paygOverageSwitch } from '../../services/paygOverageService';
+import { getCurrentUsageMonth } from '../../services/llmUsageCreditService';
 
 const USD = 1_000_000;
 const OWNER = 'owner-1';
@@ -134,7 +135,7 @@ describe('GET /api/subscription/payg', () => {
 
   it('reports overage as a percentage of the cap, never in dollars', async () => {
     users[OWNER].paygOverage = {
-      enabled: true, capPercentOfPool: 50, capMicroUsd: 50 * USD, enabledBy: OWNER,
+      enabled: true, capPercentOfPool: 50, updatedBy: OWNER,
       updatedAt: '2026-10-01T00:00:00.000Z', version: 1,
     };
     mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 110 * USD });
@@ -162,27 +163,74 @@ describe('GET /api/subscription/payg', () => {
 });
 
 describe('PUT /api/subscription/payg', () => {
-  it('enables PAYG for the billing owner, freezing the cap against the pool after credits', async () => {
-    users[OWNER].llmUsageCredits = {
-      month: require('../../services/tokenUsageService').getCurrentMonth(),
-      totalPurchasedMicroUsd: 20 * USD, totalMigrationOffsetMicroUsd: 0, grantIds: [], grants: [],
-    };
+  it('enables PAYG for the billing owner, storing the cap as a percentage only', async () => {
     const res = await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(200);
 
     expect(mockHasPaymentMethod).toHaveBeenCalledWith('cus_owner');
-    expect(res.body).toMatchObject({ enabled: true, capPercentOfPool: 50, eligible: true });
+    expect(res.body).toMatchObject({ enabled: true, capPercentOfPool: 50, eligible: true, overagePercentUsed: 0 });
     const [, fields, options] = mockUpdateUser.mock.calls[0];
-    // 50% of the $100 pool + $20 purchased credit.
-    expect(fields.paygOverage).toMatchObject({ enabled: true, capPercentOfPool: 50, capMicroUsd: 60 * USD, enabledBy: OWNER, version: 1 });
+    expect(fields.paygOverage).toEqual({
+      enabled: true,
+      capPercentOfPool: 50,
+      optIn: { month: getCurrentUsageMonth(), overageBaselineMicroUsd: 0 },
+      updatedBy: OWNER,
+      updatedAt: expect.any(String),
+      version: 1,
+    });
+    expect(fields.paygOverage).not.toHaveProperty('capMicroUsd');
     expect(options.condition.expression).toBe('attribute_not_exists(#paygOverage)');
     expect(JSON.stringify(res.body)).not.toMatch(/MicroUsd/);
   });
 
-  it('records a delegated admin as the actor', async () => {
-    await request(app).put('/api/subscription/payg')
-      .set('x-test-user', OWNER).set('x-test-delegate-admin', 'admin-9')
-      .send({ enabled: true, capPercentOfPool: 25 }).expect(200);
-    expect(mockUpdateUser.mock.calls[0][1].paygOverage.enabledBy).toBe('admin-9');
+  it('opting in while already past the pool records the standing overage, so it reads 0% right after', async () => {
+    // $250 spent on a $100 pool (a downgrade from a bigger pool earlier this month, before opting in).
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 250 * USD });
+    const res = await put(OWNER, { enabled: true, capPercentOfPool: 200 }).expect(200);
+    expect(mockUpdateUser.mock.calls[0][1].paygOverage.optIn)
+      .toEqual({ month: getCurrentUsageMonth(), overageBaselineMicroUsd: 150 * USD });
+    expect(res.body.overagePercentUsed).toBe(0);
+    expect((await get(OWNER).expect(200)).body.overagePercentUsed).toBe(0);
+
+    // $20 more after opting in is 10% of the 200% cap ($200).
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 270 * USD });
+    expect((await get(OWNER).expect(200)).body.overagePercentUsed).toBe(10);
+  });
+
+  describe('a delegated admin acting as the customer cannot consent to charges', () => {
+    const putAsDelegate = (body: unknown) => request(app).put('/api/subscription/payg')
+      .set('x-test-user', OWNER).set('x-test-delegate-admin', 'admin-9').send(body as object);
+
+    it('403s turning PAYG on, without calling Stripe or writing', async () => {
+      const res = await putAsDelegate({ enabled: true, capPercentOfPool: 25 }).expect(403);
+      expect(res.body.error).toBe('delegate_cannot_consent');
+      expect(mockHasPaymentMethod).not.toHaveBeenCalled();
+      expect(mockUpdateUser).not.toHaveBeenCalled();
+    });
+
+    describe('with PAYG already on at 50%', () => {
+      beforeEach(() => {
+        users[OWNER].paygOverage = {
+          enabled: true, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 2,
+        };
+      });
+
+      it('403s raising the cap', async () => {
+        expect((await putAsDelegate({ enabled: true, capPercentOfPool: 100 }).expect(403)).body.error)
+          .toBe('delegate_cannot_consent');
+        expect(mockUpdateUser).not.toHaveBeenCalled();
+      });
+
+      it('allows lowering the cap, recorded as the admin', async () => {
+        await putAsDelegate({ enabled: true, capPercentOfPool: 25 }).expect(200);
+        const written = Object.fromEntries(mockUpdateUser.mock.calls[0][2].pathSets.map((p: any) => [p.path[1], p.value]));
+        expect(written).toMatchObject({ capPercentOfPool: 25, updatedBy: 'admin-9' });
+      });
+
+      it('allows turning it off, recorded as the admin', async () => {
+        await putAsDelegate({ enabled: false }).expect(200);
+        expect(users[OWNER].paygOverage).toMatchObject({ enabled: false, updatedBy: 'admin-9' });
+      });
+    });
   });
 
   it('403s an org member who pools onto the owner', async () => {
@@ -250,7 +298,7 @@ describe('PUT /api/subscription/payg', () => {
   describe('with PAYG already on', () => {
     beforeEach(() => {
       users[OWNER].paygOverage = {
-        enabled: true, capPercentOfPool: 100, capMicroUsd: 100 * USD, enabledBy: OWNER,
+        enabled: true, capPercentOfPool: 100, updatedBy: OWNER,
         updatedAt: '2026-10-01T00:00:00.000Z', version: 3,
         poolHighWater: { month: '2026-10', thresholdMicroUsd: 100 * USD },
         suspended: { reason: 'payment_failed', at: '2026-10-02T00:00:00.000Z' },
@@ -266,7 +314,8 @@ describe('PUT /api/subscription/payg', () => {
       const [, fields, options] = mockUpdateUser.mock.calls[0];
       expect(fields).toEqual({});
       const written = Object.fromEntries(options.pathSets.map((p: any) => [p.path[1], p.value]));
-      expect(written).toMatchObject({ enabled: false, version: 4 });
+      expect(written).toMatchObject({ enabled: false, updatedBy: OWNER, version: 4 });
+      expect(written).not.toHaveProperty('optIn');
       expect(written).not.toHaveProperty('poolHighWater');
       expect(written).not.toHaveProperty('suspended');
       expect(options.condition.values).toEqual({ ':expectedVersion': 3 });
@@ -277,7 +326,7 @@ describe('PUT /api/subscription/payg', () => {
       expect(mockHasPaymentMethod).not.toHaveBeenCalled();
       expect(res.body.capPercentOfPool).toBe(25);
       const written = Object.fromEntries(mockUpdateUser.mock.calls[0][2].pathSets.map((p: any) => [p.path[1], p.value]));
-      expect(written).toMatchObject({ capPercentOfPool: 25, capMicroUsd: 25 * USD });
+      expect(written).toEqual({ enabled: true, capPercentOfPool: 25, updatedBy: OWNER, updatedAt: expect.any(String), version: 4 });
     });
 
     it('lets the owner turn PAYG off even after the tier stopped offering it', async () => {

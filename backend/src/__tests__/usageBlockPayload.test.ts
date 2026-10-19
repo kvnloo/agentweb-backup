@@ -80,7 +80,7 @@ describe('every usage_paused 429 emits the structured block', () => {
   });
 
   it('composes the copy once, so the refusals cannot disagree', () => {
-    expect(source).toContain('const usageBlockCopy = buildUsageBlockCopy({ month: usageStatus.month, reason: usageStatus.usageBlockReason });');
+    expect(source).toContain('const usageBlockCopy = buildUsageBlockCopy({ month: usageStatus.month, paygBlock: usageStatus.paygBlock });');
     expect(source.match(/const usageBlockCopy = /g) || []).toHaveLength(1);
   });
 

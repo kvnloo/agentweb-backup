@@ -235,6 +235,41 @@ describe('emailService.sendScheduledChatTokenLimitEmail', () => {
     jest.clearAllMocks();
   });
 
+  // ENG-668: a pay-as-you-go account is past its plan pool by design, so "N% of your monthly allowance"
+  // is not what stopped it (and can read far above 100%). The email names the PAYG reason instead.
+  it.each([
+    [{ reason: 'payg_cap_reached' }, "You've reached your pay-as-you-go limit"],
+    [{ reason: 'payg_suspended' }, 'Pay-as-you-go is on hold'],
+    [{ reason: 'payg_inactive', paygInactiveReason: 'no_payment_method' }, 'Pay-as-you-go needs a payment method'],
+    [{ reason: 'payg_inactive', paygInactiveReason: 'subscription_inactive' }, 'Pay-as-you-go needs an active subscription'],
+  ] as const)('names the PAYG reason (%j) and prints no plan percentage', async (paygBlock, headline) => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatTokenLimitEmail('user@example.com', 'My Schedule', 'schedule-123', {
+      used: 0,
+      allowance: null,
+      effectiveAllowance: null,
+      percentUsed: 0,
+      costUsed: 180,
+      costAllowance: 100,
+      costPercentUsed: 180,
+      costEnforced: true,
+      month: '2026-10',
+      paygBlock,
+    });
+
+    const [, subject, textContent, htmlContent] = spy.mock.calls[0];
+    expect(subject).toContain(headline);
+    expect(htmlContent).toContain(headline);
+    expect(textContent).toMatch(/pay-as-you-go/i);
+    for (const body of [textContent, htmlContent]) {
+      expect(body).not.toContain('180%');
+      expect(body).not.toContain('of your monthly allowance used');
+      expect(body).not.toContain('$');
+      expect(body).toContain('resets on November 1, 2026');
+    }
+  });
+
   it('renders a percentage-only message when the token cap is the cause — never the raw token count (ENG-1566)', async () => {
     const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
 

@@ -531,6 +531,11 @@ describe('Admin subscription types routes', () => {
       expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
     });
 
+    it('accepts a tier that does not offer PAYG without a markup, even with no top-up to inherit from', async () => {
+      await save({ paygOverage: { allowed: false } }).expect(200);
+      expect(saved().paygOverage).toEqual({ allowed: false });
+    });
+
     it.each([
       [{ allowed: 'true', markupBps: 25_000 }, 'allowed must be boolean'],
       [{ allowed: true, markupBps: 9_000 }, 'markupBps must be an integer of at least 10000'],
