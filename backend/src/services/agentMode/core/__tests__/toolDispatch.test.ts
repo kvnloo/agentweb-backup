@@ -786,6 +786,8 @@ describe('executePreparedTools', () => {
 
   it.each([
     ['get_lead_notification_settings', '{}'],
+    ['get_hot_lead_call_settings', '{}'],
+    ['update_hot_lead_call_settings', '{"enabled":false}'],
     ['save_org_memory', '{"content":"Remember for the whole org: x"}'],
     ['delete_org_memory', '{"memoryId":"m1"}'],
     ['save_memory', '{"content":"x"}'],

@@ -841,6 +841,7 @@ export interface User {
 export interface Organization {
   modelRoles?: import('./modelRoles').ModelRoles;
   leadNotifications?: LeadNotificationsConfig;
+  hotLeadCall?: import('./hotLeadCallConfig').HotLeadCallConfig;
   /**
    * Optimistic-concurrency counter for owner-losing operations. Absent until
    * the first one; see orgDb.claimOwnerChange.

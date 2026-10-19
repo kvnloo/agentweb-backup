@@ -262,6 +262,8 @@ export function seedSearchCallCountFromHistory(
 export const SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS: ReadonlySet<string> = new Set([
   'get_lead_notification_settings',
   'update_lead_notification_settings',
+  'get_hot_lead_call_settings',
+  'update_hot_lead_call_settings',
   'save_org_memory',
   'delete_org_memory',
   'save_memory',
