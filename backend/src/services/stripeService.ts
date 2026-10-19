@@ -422,7 +422,11 @@ export const stripeService = {
 
   /** ENG-2571 — the first candidate customer that still exists in Stripe, or null. */
   async findLiveCustomerIdForUser(user: CustomerCandidateUser, userId: string): Promise<string | null> {
+    // The row's own customer first, so a live one never waits on (or fails with) discovery.
+    const rowId = typeof user?.stripe_customer_id === 'string' && user.stripe_customer_id ? user.stripe_customer_id : null;
+    if (rowId && (await stripeService.retrieveLiveCustomer(rowId))) return rowId;
     for (const id of await stripeService.customerCandidateIds(user, userId)) {
+      if (id === rowId) continue;
       if (await stripeService.retrieveLiveCustomer(id)) return id;
     }
     return null;

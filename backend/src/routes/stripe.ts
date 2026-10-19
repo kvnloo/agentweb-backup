@@ -611,8 +611,12 @@ router.post(
   }
 );
 
-/** Subscription statuses whose billing portal is the user row's own customer. */
-const SUBSCRIBED_STATUSES = new Set(["active", "trialing", "past_due", "canceling"]);
+/**
+ * Subscription statuses whose billing portal is the user row's own customer: every
+ * non-terminal Stripe status we store, so a subscription that still needs managing (e.g.
+ * `incomplete`/`unpaid`) never opens another customer.
+ */
+const SUBSCRIBED_STATUSES = new Set(["active", "trialing", "past_due", "canceling", "incomplete", "unpaid", "paused"]);
 
 /**
  * @route GET /api/stripe/billing-summary

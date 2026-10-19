@@ -233,6 +233,15 @@ describe('POST /api/stripe/create-customer-portal-session', () => {
     expect(mockStripe.billingPortal.sessions.create).toHaveBeenCalledWith(expect.objectContaining({ customer: 'cus_old' }));
   });
 
+  it.each(['incomplete', 'unpaid', 'paused'])('a %s subscription keeps its own customer, never another card holder', async (status) => {
+    mockGetUserById.mockResolvedValue({ userId: 'u1', stripe_customer_id: 'cus_sub', subscription_status: status });
+    stripeState({ cus_sub: { pms: [] }, cus_zoma: { pms: [VISA], sis: [ZOMA_SI] } }, ['cus_zoma']);
+    const res = await request(app).post('/api/stripe/create-customer-portal-session');
+    expect(res.status).toBe(200);
+    expect(mockStripe.billingPortal.sessions.create).toHaveBeenCalledWith(expect.objectContaining({ customer: 'cus_sub' }));
+    expect(mockStripe.customers.search).not.toHaveBeenCalled();
+  });
+
   it('unsubscribed user with no card and no customer anywhere -> 404', async () => {
     mockGetUserById.mockResolvedValue({ userId: 'u1' });
     stripeState({}, []);
@@ -309,6 +318,14 @@ describe('Zoma setup Checkout + customer creation', () => {
     await createZomaPaymentSetupLink('u1', { successUrl: 's', cancelUrl: 'c' }, linkDeps({ userId: 'u1', stripe_customer_id: 'cus_gone' }));
     expect(mockStripe.checkout.sessions.create.mock.calls[0][0].customer).toBe('cus_live');
     expect(mockStripe.customers.create).not.toHaveBeenCalled();
+  });
+
+  it('a live row customer is used without waiting on discovery, even when search fails', async () => {
+    stripeState({ cus_row: {} }, []);
+    mockStripe.customers.search.mockRejectedValue(new Error('search down'));
+    mockStripe.customers.list.mockRejectedValue(new Error('list down'));
+    await expect(stripeService.findLiveCustomerIdForUser({ stripe_customer_id: 'cus_row', email: 'z@acme.co' }, 'u1')).resolves.toBe('cus_row');
+    expect(mockStripe.customers.search).not.toHaveBeenCalled();
   });
 
   it('9: concurrent first-time creates share one idempotency key (still deduped)', async () => {
