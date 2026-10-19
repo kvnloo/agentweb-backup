@@ -1,0 +1,142 @@
+import { crmDb, ENGAGED_EVENT_KEYWORDS } from '../db';
+import type {
+  HotLeadCallEventType,
+  HotLeadCallLeg,
+  HotLeadCallRecord,
+  HotLeadCallState,
+  LeadCallStore,
+} from './leadCallStore.types';
+
+/** Key under `lead.system` that holds the record. No table or index: the call state rides on the lead row. */
+const SYSTEM_KEY = 'hot_lead_call';
+
+const MAX_DETAIL_VALUE_LENGTH = 200;
+
+const TERMINAL_STATES: HotLeadCallState[] = ['finished', 'failed', 'skipped'];
+
+// Matched in order at each position: a Twilio SID (CA..., AC..., PN...: 34 chars of hex that can hold a
+// long digit run) and an ISO date (2026-10-19) are kept as they are; anything else shaped like a phone
+// number is redacted: 7+ decimal digits (any script, via \p{Nd}) with optional + and separators (spaces
+// incl. NBSP, ( ) . and any Unicode hyphen/minus). Rule: only the LEFT edge is bounded (not glued to a
+// word character or dash, so ids like job_1234567 survive); a digit run glued on the right
+// ("4155550100x") is still redacted.
+const SID_DATE_OR_PHONE =
+  /\b[A-Z]{2}[0-9a-f]{32}\b|\b\d{4}-\d{2}-\d{2}(?!\d)|(?<![\w-])[+\uFF0B]?\p{Nd}[\p{Nd}\s().\u2010-\u2015\u2212\uFF0D-]{5,}\p{Nd}/gu;
+
+function redactPhones(value: string): string {
+  return value.replace(SID_DATE_OR_PHONE, (m) => (/^[A-Z]{2}|^\d{4}-\d{2}-\d{2}$/.test(m) ? m : '[redacted]'));
+}
+
+// db.ts raises `isEngaged` (the lead counts as engaged/hot in lists and filters) when an engagement's
+// eventType or serialised eventData contains one of ENGAGED_EVENT_KEYWORDS. A call event must never do
+// that, so detail entries containing them are dropped.
+function mentionsEngagement(text: string): boolean {
+  const lower = text.toLowerCase();
+  return ENGAGED_EVENT_KEYWORDS.some((k) => lower.includes(k));
+}
+
+/** Detail values are scalars only; phone-like text is redacted and engagement-raising words are dropped. */
+function sanitizeDetail(detail: Record<string, string | number | boolean>): Record<string, string | number | boolean> {
+  const clean: Record<string, string | number | boolean> = {};
+  for (const [key, raw] of Object.entries(detail)) {
+    if (typeof raw !== 'string' && typeof raw !== 'number' && typeof raw !== 'boolean') continue;
+    if (redactPhones(key) !== key) continue;
+    const value = typeof raw === 'string' ? redactPhones(raw).slice(0, MAX_DETAIL_VALUE_LENGTH) : raw;
+    // A bare number can itself be a phone number (e.g. 15555550100).
+    if (typeof value === 'number' && redactPhones(String(value)) !== String(value)) continue;
+    if (mentionsEngagement(key) || mentionsEngagement(String(value))) continue;
+    clean[key] = value;
+  }
+  return clean;
+}
+
+function isRecord(value: unknown): value is HotLeadCallRecord {
+  return !!value && typeof value === 'object' && typeof (value as { state?: unknown }).state === 'string';
+}
+
+// The scalar fields a patch may set. An explicit list (not a spread) so a caller can never smuggle
+// other keys, phone numbers included, into the lead row.
+const SCALAR_FIELDS = ['state', 'jobKey', 'startedAt', 'updatedAt', 'ownerCallSid', 'leadCallSid', 'outcome'] as const;
+
+function scalarFields(record: Partial<HotLeadCallRecord>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const field of SCALAR_FIELDS) {
+    if (record[field] !== undefined) out[field] = record[field];
+  }
+  return out;
+}
+
+class DynamoLeadCallStore implements LeadCallStore {
+  async get(listId: string, leadId: string): Promise<HotLeadCallRecord | null> {
+    const lead = await crmDb.getLeadById(listId, leadId, { consistentRead: true });
+    const record = lead?.system?.[SYSTEM_KEY];
+    return isRecord(record) ? record : null;
+  }
+
+  async create(listId: string, leadId: string, record: HotLeadCallRecord): Promise<boolean> {
+    // meteredLegs and lastSequence are initialised empty because the conditional updates in
+    // transition() cannot append to or set a path under a missing list/map.
+    return crmDb.createLeadSystemRecordOnce(listId, leadId, SYSTEM_KEY, {
+      ...scalarFields(record),
+      meteredLegs: [...new Set(record.meteredLegs ?? [])],
+      lastSequence: { ...record.lastSequence },
+    });
+  }
+
+  /**
+   * In `patch`, `meteredLegs` lists the legs to ADD and `lastSequence` the entries to merge (not
+   * replacements). `from` must name non-terminal states only; a terminal one makes it return false.
+   * Consumer rule: because a terminal record is never revived, the webhook must meter a leg in the
+   * same transition that makes the call terminal (or before it), never in a later one.
+   * The call returns false, writing nothing, when the state is not in `from`, when a
+   * lastSequence entry is not higher than the stored one for that CallSid, or when a leg is already
+   * metered. So metering belongs in the same transition as the state change it accompanies: the one
+   * caller that gets `true` meters, a replay gets `false` and does not.
+   */
+  async transition(
+    listId: string,
+    leadId: string,
+    from: HotLeadCallState[],
+    patch: Partial<HotLeadCallRecord> & { state: HotLeadCallState },
+  ): Promise<boolean> {
+    // A terminal record is never revived: a caller bug that lists one in `from` is refused, not applied.
+    if (from.length === 0 || from.some((s) => TERMINAL_STATES.includes(s))) return false;
+    const legs: HotLeadCallLeg[] = [...new Set(patch.meteredLegs ?? [])];
+    return crmDb.updateLeadSystemRecordIf(listId, leadId, SYSTEM_KEY, {
+      stateIn: from,
+      set: { ...scalarFields(patch), updatedAt: new Date().toISOString() },
+      maxIn: patch.lastSequence ? { lastSequence: patch.lastSequence } : undefined,
+      appendNew: { meteredLegs: legs },
+    });
+  }
+
+  /** Timeline entry, best-effort: a failed write is logged and never fails the call flow. */
+  async addEvent(
+    listId: string,
+    leadId: string,
+    type: HotLeadCallEventType,
+    detail: Record<string, string | number | boolean> = {},
+  ): Promise<void> {
+    try {
+      await crmDb.addLeadEngagement(listId, leadId, {
+        eventType: type,
+        eventData: sanitizeDetail(detail),
+        createdAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.warn(`[leadCallStore] could not record ${type} for lead ${leadId}:`, err instanceof Error ? err.message : err);
+    }
+  }
+}
+
+let store: LeadCallStore | null = null;
+
+export function getLeadCallStore(): LeadCallStore {
+  if (!store) store = new DynamoLeadCallStore();
+  return store;
+}
+
+/** Test-only: swap in a fake; null restores the real store. */
+export function setLeadCallStoreForTests(replacement: LeadCallStore | null): void {
+  store = replacement;
+}

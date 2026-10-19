@@ -1,7 +1,7 @@
 /**
  * Shared contract between the hot-lead call orchestrator (places the owner call) and the Twilio
- * voice webhooks (drive the call forward). Types only: the store implementation lives with the
- * webhooks, the orchestrator and tests use the interface.
+ * voice webhooks (drive the call forward). Types only: the implementation is in leadCallStore.ts;
+ * the orchestrator, the webhooks and tests use this interface.
  */
 
 export type HotLeadCallState =

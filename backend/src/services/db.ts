@@ -176,7 +176,8 @@ const dedupeLinkedInMessageEvents = <T extends { eventId?: string; eventType?: s
   });
 };
 
-const ENGAGED_EVENT_KEYWORDS = ["clicked", "replied", "received"];
+/** Exported so callers that write engagement events can keep their payloads from raising isEngaged. */
+export const ENGAGED_EVENT_KEYWORDS = ["clicked", "replied", "received"];
 
 /**
  * Engagement count at which a lead is logged as approaching the 400 KB DynamoDB
@@ -192,6 +193,31 @@ const engagementMatchesKeyword = (engagement: any): boolean => {
     (keyword) => eventType.includes(keyword) || eventData.includes(keyword)
   );
 };
+
+/**
+ * Makes sure `lead.system` exists so a document-path SET under it cannot throw. Returns false when the
+ * lead itself does not exist (the condition keeps a deleted row from being resurrected as a bare item).
+ */
+async function ensureLeadSystemMap(listId: string, leadId: string, caller: string): Promise<boolean> {
+  try {
+    await dynamodb.update({
+      TableName: `${TABLE_PREFIX}AW-Leads`,
+      Key: { listId, leadId },
+      // `system` is a DynamoDB reserved keyword — confirmed live against a real table (round 15/16
+      // smoke test): unescaped, this throws ValidationException, invisible to unit tests since they
+      // mock dynamodb.update() and never validate expression syntax against the reserved-word list.
+      UpdateExpression: 'SET #system = if_not_exists(#system, :emptyMap)',
+      ExpressionAttributeNames: { '#system': 'system' },
+      ExpressionAttributeValues: { ':emptyMap': {} },
+      ConditionExpression: 'attribute_exists(leadId)',
+    }).promise();
+    return true;
+  } catch (err) {
+    if ((err as { code?: string }).code === 'ConditionalCheckFailedException') return false;
+    handleDynamoDbError(err, `${caller}:bootstrap`);
+    throw err;
+  }
+}
 
 // Ensure the User interface is exported
 export interface User {
@@ -10878,24 +10904,7 @@ export const crmDb = {
   async claimLeadStepOnce(listId: string, leadId: string, key: string): Promise<boolean> {
     const tableName = `${TABLE_PREFIX}AW-Leads`;
     const dynKey = { listId, leadId };
-    try {
-      await dynamodb.update({
-        TableName: tableName,
-        Key: dynKey,
-        // `system` is a DynamoDB reserved keyword — confirmed live against a real
-        // table (round 15/16 smoke test): unescaped, this throws ValidationException,
-        // invisible to unit tests since they mock dynamodb.update() and never
-        // validate expression syntax against DynamoDB's actual reserved-word list.
-        UpdateExpression: 'SET #system = if_not_exists(#system, :emptyMap)',
-        ExpressionAttributeNames: { '#system': 'system' },
-        ExpressionAttributeValues: { ':emptyMap': {} },
-        ConditionExpression: 'attribute_exists(leadId)',
-      }).promise();
-    } catch (err: any) {
-      if (err.code === 'ConditionalCheckFailedException') return false;
-      handleDynamoDbError(err, 'claimLeadStepOnce:bootstrap');
-      throw err;
-    }
+    if (!(await ensureLeadSystemMap(listId, leadId, 'claimLeadStepOnce'))) return false;
 
     // Greptile P1 on #2291 (round 17): the release-on-failure write in
     // calendlyWebhook.ts's runStepOnce is itself best-effort (swallows its own
@@ -10932,6 +10941,127 @@ export const crmDb = {
     } catch (err: any) {
       if (err.code === 'ConditionalCheckFailedException') return false;
       handleDynamoDbError(err, 'claimLeadStepOnce');
+      throw err;
+    }
+  },
+
+  /**
+   * Creates the object `record` at `lead.system[key]` ONLY if that key is absent, returning whether THIS
+   * caller created it. Unlike claimLeadStepOnce there is no stale-reclaim: an existing record is never
+   * overwritten, so the single winner of two racing creators is decided by DynamoDB, not by a read.
+   * False also covers a lead that does not exist.
+   */
+  async createLeadSystemRecordOnce(
+    listId: string,
+    leadId: string,
+    key: string,
+    record: Record<string, unknown>,
+  ): Promise<boolean> {
+    if (!(await ensureLeadSystemMap(listId, leadId, 'createLeadSystemRecordOnce'))) return false;
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+    const dynKey = { listId, leadId };
+    try {
+      await dynamodb.update({
+        TableName: tableName,
+        Key: dynKey,
+        UpdateExpression: 'SET #system.#k = :rec, updatedAt = :ts',
+        ExpressionAttributeNames: { '#system': 'system', '#k': key },
+        ExpressionAttributeValues: { ':rec': record, ':ts': new Date().toISOString() },
+        ConditionExpression: 'attribute_not_exists(#system.#k)',
+      }).promise();
+      return true;
+    } catch (err) {
+      if ((err as { code?: string }).code === 'ConditionalCheckFailedException') return false;
+      handleDynamoDbError(err, 'createLeadSystemRecordOnce');
+      throw err;
+    }
+  },
+
+  /**
+   * Conditional patch of the object record at `lead.system[key]`, applied in ONE UpdateItem. Returns
+   * false (nothing written) when ANY condition fails, so a replayed or out-of-order caller is a clean
+   * no-op rather than a partial write:
+   *  - `stateIn`: the record's current `state` must be one of these (a missing record fails too);
+   *  - `set`: plain field overwrites (undefined values are skipped);
+   *  - `maxIn`: per-entry numeric maps, e.g. { lastSequence: { [callSid]: 3 } }; an entry is written only
+   *    if it is higher than the stored one (or absent), otherwise the whole patch fails;
+   *  - `appendNew`: values appended to a list field; if any is already in the list the whole patch fails.
+   * A list named in `appendNew` must already exist on the record (the creator initialises it).
+   * A `maxIn` map must exist too, but its ENTRIES need not.
+   */
+  async updateLeadSystemRecordIf(
+    listId: string,
+    leadId: string,
+    key: string,
+    op: {
+      stateIn: string[];
+      set?: Record<string, unknown>;
+      maxIn?: Record<string, Record<string, number>>;
+      appendNew?: Record<string, string[]>;
+    },
+  ): Promise<boolean> {
+    if (op.stateIn.length === 0) return false; // an empty IN () is invalid syntax
+    const names: Record<string, string> = { '#system': 'system', '#k': key, '#state': 'state' };
+    const values: Record<string, unknown> = { ':ts': new Date().toISOString() };
+    const setClauses: string[] = ['updatedAt = :ts'];
+    const conditions: string[] = [];
+    // Every name and value goes through a generated placeholder. A placeholder that is declared but not
+    // used (or used but not declared) is a ValidationException, which the mocked unit tests cannot see,
+    // so each is created only where its clause is emitted: one name per field, one per map entry.
+    let n = 0;
+
+    op.stateIn.forEach((s, i) => { values[`:from${i}`] = s; });
+    conditions.push(`#system.#k.#state IN (${op.stateIn.map((_, i) => `:from${i}`).join(', ')})`);
+
+    for (const [field, v] of Object.entries(op.set ?? {})) {
+      if (v === undefined) continue;
+      names[`#f${n}`] = field;
+      values[`:v${n}`] = v;
+      setClauses.push(`#system.#k.#f${n} = :v${n}`);
+      n++;
+    }
+    for (const [field, entries] of Object.entries(op.maxIn ?? {})) {
+      const entryList = Object.entries(entries);
+      if (entryList.length === 0) continue;
+      const fieldName = `#f${n}`;
+      names[fieldName] = field;
+      n++;
+      for (const [entryKey, num] of entryList) {
+        names[`#e${n}`] = entryKey;
+        values[`:v${n}`] = num;
+        const path = `#system.#k.${fieldName}.#e${n}`;
+        setClauses.push(`${path} = :v${n}`);
+        conditions.push(`(attribute_not_exists(${path}) OR ${path} < :v${n})`);
+        n++;
+      }
+    }
+    for (const [field, listed] of Object.entries(op.appendNew ?? {})) {
+      const items = [...new Set(listed)];
+      if (items.length === 0) continue;
+      const path = `#system.#k.#f${n}`;
+      names[`#f${n}`] = field;
+      values[`:v${n}`] = items;
+      setClauses.push(`${path} = list_append(${path}, :v${n})`);
+      items.forEach((item, i) => {
+        values[`:v${n}_${i}`] = item;
+        conditions.push(`NOT contains(${path}, :v${n}_${i})`);
+      });
+      n++;
+    }
+
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: { listId, leadId },
+        UpdateExpression: `SET ${setClauses.join(', ')}`,
+        ConditionExpression: conditions.join(' AND '),
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+      }).promise();
+      return true;
+    } catch (err) {
+      if ((err as { code?: string }).code === 'ConditionalCheckFailedException') return false;
+      handleDynamoDbError(err, 'updateLeadSystemRecordIf');
       throw err;
     }
   },
