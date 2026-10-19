@@ -34,8 +34,10 @@ missing keeps the 429. A non-opted account never reads the switch or writes anyt
   by that growth (`max(0, baseline - max(0, poolNow - poolAtOptIn))`) so it is not subtracted twice. An
   opt-in stored without it is read as measured against that month's `poolHighWater` (no growth if none).
   Opting in also raises `poolHighWater` to the opt-in pool.
-- `overage.active` (and `/usage-runway` `paygCovering`) are true only with billable overage (> 0). Admitted
-  at 0% (a downgrade still under the month's high-water pool), the runway forecasts against that pool.
+- `overage.active` (and `/usage-runway` `paygCovering`) are true when admitted on PAYG with spend at or past
+  the month's pool — including right after opting in with overage standing (billable 0). Admitted BELOW that
+  pool (a downgrade still under the month's high-water pool), they are false and the runway — and the
+  drivers preview, through the shared `runwayAllowance` — forecasts against the high-water pool.
 - The cap is stored as `capPercentOfPool` only (25|50|100|200) and re-derived every check as percent x
   the month's pool, so "50% of your plan" stays true across top-ups, plan changes and months. No
   micro-USD cap is stored.
@@ -58,7 +60,9 @@ enabling), 503 `payment_check_unavailable`, 409 `payg_conflict` (version moved).
 Stripe and is allowed even if the tier stops offering PAYG. Enabling also writes `has_payment_method: true`
 (the card Stripe just confirmed) in the same conditional update, because the gates read the cached flag and
 nothing refreshes it when a card is added in the Stripe customer portal; GET /payg repairs a stale `false`
-for an owner with PAYG on (live check, upward only, Stripe error = leave as is). `hasPaymentMethod` in the
+for an owner with PAYG on (live check, upward only, Stripe error = leave as is; at most one live check
+per owner per 120s per process). The repair write is unconditional — a racing webhook clear could be
+overwritten; accepted. `hasPaymentMethod` in the
 GET body is the owner's only — always `false` for a pooled member.
 
 **429 / runway copy.** `usageBlock.reason` is added only for PAYG's own blocks: `payg_cap_reached`,
