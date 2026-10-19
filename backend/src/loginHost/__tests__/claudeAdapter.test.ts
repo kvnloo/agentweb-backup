@@ -417,7 +417,7 @@ describe("claude adapter: a turn", () => {
   it("a close() that arrives while the turn's process is being stopped still waits for the auth check, which then does not run at all", async () => {
     const e = makeEnv();
     e.scenario({ turn: [{ type: "result", subtype: "error", is_error: true, result: "Not logged in · Please run /login" }], status: { loggedIn: false } });
-    let session!: ProviderSession;
+    const holder: { session?: ProviderSession } = {};
     let closeFromKill: Promise<void> | undefined;
     let statusRuns = 0;
     const ctx: AdapterContext = {
@@ -428,13 +428,14 @@ describe("claude adapter: a turn", () => {
         return {
           ...child,
           kill: () => {
-            if (spec.file === WRAPPER) closeFromKill ??= session.close(); // the host closes the session exactly while the turn's process is being stopped
+            if (spec.file === WRAPPER) closeFromKill ??= holder.session?.close(); // the host closes the session exactly while the turn's process is being stopped
             child.kill();
           },
         };
       },
     };
-    session = await makeAdapter(e.unitTmp).openSession(ctx, { connectionId: "conn1", epoch: 1 });
+    const session = await makeAdapter(e.unitTmp).openSession(ctx, { connectionId: "conn1", epoch: 1 });
+    holder.session = session;
     const events = await collect(session);
     await session.closed;
     expect(statusRuns).toBe(0); // a close had begun while the process was being stopped: no check process was spawned after it (it would have run beside the next turn)
