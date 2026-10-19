@@ -3009,8 +3009,14 @@ async function getActualResponseFromSession(sessionId: string): Promise<string> 
 // ENG-1098: true when the run's executed tool ledger shows exactly one clean
 // scan_website_links result, so its scheduled report (and digest entry) is not
 // sent. Fails open: any load error or missing session means "send as today".
-export async function isCleanLinkScanSession(sessionId: string | undefined): Promise<boolean> {
+// Only a successful, passing run qualifies — a failed run (e.g. keyword miss)
+// keeps its notification and digest entry even if the transcript is a clean scan.
+export async function isCleanLinkScanSession(
+  sessionId: string | undefined,
+  run: { status?: string; passed?: boolean } | undefined
+): Promise<boolean> {
   if (!sessionId) return false;
+  if (!run || run.status !== 'success' || run.passed !== true) return false;
   try {
     const session = await chatbotDb.getChatSession(sessionId);
     const suppress = shouldSuppressScheduledNotification(session?.messages);
@@ -3143,7 +3149,7 @@ async function sendDailyDigestEmail(schedule: any, emailNotifications: string[])
     );
 
     // ENG-1098: a run whose only finding is a clean broken-link scan is not news.
-    const cleanScan = await Promise.all(todaysResults.map((result: any) => isCleanLinkScanSession(result.sessionId)));
+    const cleanScan = await Promise.all(todaysResults.map((result: any) => isCleanLinkScanSession(result.sessionId, result)));
     const digestResults = todaysResults.filter((_: any, i: number) => !cleanScan[i]);
 
     if (digestResults.length === 0) {
@@ -14420,7 +14426,7 @@ export const agentModeController = {
           if (result.sessionId) {
             try {
               const emailNotifications = scheduleToRun.emailNotifications || [];
-              if (emailNotifications.length > 0 && !(await isCleanLinkScanSession(result.sessionId))) {
+              if (emailNotifications.length > 0 && !(await isCleanLinkScanSession(result.sessionId, result))) {
                 await emailService.sendScheduledChatResultEmail(
                   emailNotifications,
                   scheduleToRun.scheduleName,
@@ -14595,7 +14601,7 @@ export const agentModeController = {
         if (result.sessionId) {
           try {
             const emailNotifications = scheduleToRun.emailNotifications || [];
-            if (emailNotifications.length > 0 && !(await isCleanLinkScanSession(result.sessionId))) {
+            if (emailNotifications.length > 0 && !(await isCleanLinkScanSession(result.sessionId, result))) {
               await emailService.sendScheduledChatResultEmail(
                 emailNotifications,
                 scheduleToRun.scheduleName,
@@ -15481,7 +15487,7 @@ export const agentModeController = {
                     }
                     // For hourly schedules with daily digest, don't send individual emails
                     // Only send the daily digest on the last run of the day
-                  } else if (!(await isCleanLinkScanSession(result.sessionId))) {
+                  } else if (!(await isCleanLinkScanSession(result.sessionId, result))) {
                     // Send individual email as usual for non-hourly schedules or hourly without daily digest
                     // (ENG-1098: unless the run was a clean broken-link scan)
                     await emailService.sendScheduledChatResultEmail(
