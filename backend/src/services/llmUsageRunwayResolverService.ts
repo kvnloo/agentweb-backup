@@ -31,6 +31,8 @@
  */
 
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
+import type { LlmUsageModeDecision, LlmUsagePolicy } from "./llmUsagePolicyService";
+import type { PaygOverageStatus } from "./paygOverage";
 import { recordUsageTelemetry, USAGE_TELEMETRY_EVENTS } from "./llmUsageTelemetry";
 import { readBilledLedgerRows, hasInferredAttribution } from "./llmUsageLedgerReader";
 
@@ -55,6 +57,31 @@ export interface ResolvedUsageRunway {
   runway: UsageRunway | null;
 }
 
+
+/**
+ * ENG-668: the allowance a runway is forecast against, and whether pay-as-you-go is covering.
+ *
+ * Shared by `/usage-runway` and the drivers preview (llmUsageDriversResolverService) so the two can never
+ * forecast against different pools. For an account admitted on PAYG the pool is the one PAYG measures
+ * overage on — the month's high-water pool, not today's possibly smaller one:
+ *   - spend at or past that pool: PAYG is covering, so there is no "runs out" (`paygCovering`), whether
+ *     or not any of it is billable yet (an opt-in baseline can make the billable part 0);
+ *   - spend below it (a downgrade still under this month's high-water pool): the included usage left in
+ *     that pool is real, so the forecast runs against it rather than declaring the smaller pool spent.
+ */
+export function runwayAllowance(usage: {
+  policy: LlmUsagePolicy;
+  costUsedMicroUsd: number;
+  mode: LlmUsageModeDecision;
+  overage?: PaygOverageStatus;
+}): { hardThresholdMicroUsd: number; paygCovering: boolean } {
+  const overage = usage.mode.reason === "payg_overage" ? usage.overage : undefined;
+  if (!overage) return { hardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd, paygCovering: false };
+  return {
+    hardThresholdMicroUsd: overage.poolMicroUsd,
+    paygCovering: usage.costUsedMicroUsd >= overage.poolMicroUsd,
+  };
+}
 
 export async function resolveUsageRunway(
   userId: string,
@@ -119,23 +146,16 @@ export async function resolveUsageRunway(
     usage.costUsedMicroUsd > 0 &&
     ledgerTotalMicroUsd < usage.costUsedMicroUsd * LEDGER_COMPLETENESS_TOLERANCE;
 
+  const { hardThresholdMicroUsd, paygCovering } = runwayAllowance({ ...usage, policy: usage.policy });
   // Named rather than inlined so the accuracy backtest below re-runs the
   // forecast over EXACTLY the same inputs — a backtest against a different
   // ledger view would measure the difference between the two views, not the
   // accuracy of the forecast.
-  // ENG-668: admitted on pay-as-you-go. With billable overage, PAYG is covering and there is no "runs
-  // out" to forecast. Admitted at 0% billable (a downgrade still under this month's high-water pool),
-  // the customer still has that pool's included usage, so forecast against it instead of claiming the
-  // smaller current pool is already exhausted.
-  const paygAdmitted = usage.mode.reason === "payg_overage" && !!usage.overage;
-  const paygCovering = paygAdmitted && usage.overage!.overageMicroUsd > 0;
   const forecastInput = {
     // Both of these are already credit-adjusted by getEffectiveLlmUsagePolicy —
     // re-applying credits here would double-count them.
     costUsedMicroUsd: usage.costUsedMicroUsd,
-    hardThresholdMicroUsd: paygAdmitted && !paygCovering
-      ? usage.overage!.poolMicroUsd
-      : usage.policy.hardCostThresholdMicroUsd,
+    hardThresholdMicroUsd,
     attributionInferred: attributionInferred || ledgerIsIncomplete,
     dailyCostMicroUsd: rows.map((row) => ({
       date: row.date,

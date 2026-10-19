@@ -91,14 +91,46 @@ function toView(
   };
 }
 
+/** At most one live Stripe check per billing owner per window from the settings read. */
+export const LIVE_PAYMENT_METHOD_CHECK_WINDOW_MS = 120_000;
+/** Bounds the map; the oldest entries are evicted first (Map keeps insertion order). */
+const LIVE_PAYMENT_METHOD_CHECK_MAX_ENTRIES = 10_000;
+const lastLivePaymentMethodCheckAt = new Map<string, number>();
+
+/**
+ * Whether a live check may run now for this owner, recording it if so. Settings pages poll and refresh;
+ * without this every GET would be a Stripe `paymentMethods.list`. Per process, which is enough to
+ * bound it — a missed repair just waits for the next window.
+ */
+function claimLivePaymentMethodCheck(billingUserId: string, now: number): boolean {
+  const last = lastLivePaymentMethodCheckAt.get(billingUserId);
+  if (last !== undefined && now - last < LIVE_PAYMENT_METHOD_CHECK_WINDOW_MS) return false;
+  // Re-insert so the entry moves to the newest end, then trim from the oldest.
+  lastLivePaymentMethodCheckAt.delete(billingUserId);
+  lastLivePaymentMethodCheckAt.set(billingUserId, now);
+  while (lastLivePaymentMethodCheckAt.size > LIVE_PAYMENT_METHOD_CHECK_MAX_ENTRIES) {
+    const oldest = lastLivePaymentMethodCheckAt.keys().next().value as string;
+    lastLivePaymentMethodCheckAt.delete(oldest);
+  }
+  return true;
+}
+
+/** Tests: forget every recorded live check. */
+export function resetLivePaymentMethodChecksForTests(): void {
+  lastLivePaymentMethodCheckAt.clear();
+}
+
 /**
  * Repair a stale cached `has_payment_method` for an owner with PAYG on.
  *
  * The gates read the cached flag on every check, and nothing refreshes it when a card is added in the
  * Stripe customer portal — so an owner who added a card after enabling PAYG would be refused
- * (`payg_inactive` / `no_payment_method`) indefinitely. Opening the PAYG settings asks Stripe once and
- * sets the flag when a card is there. Only ever repairs upward (clearing stays with the webhooks), only
- * for the billing owner, and a Stripe failure leaves the flag as it was rather than failing the read.
+ * (`payg_inactive` / `no_payment_method`) indefinitely. Opening the PAYG settings asks Stripe (at most
+ * once per owner per `LIVE_PAYMENT_METHOD_CHECK_WINDOW_MS`) and sets the flag when a card is there.
+ * Only ever repairs upward (clearing stays with the webhooks), only for the billing owner, and a
+ * Stripe failure leaves the flag as it was rather than failing the read. The write is unconditional:
+ * a webhook clearing the flag in the same instant could be overwritten (accepted; the next webhook or
+ * live check settles it).
  */
 async function repairPaymentMethodFlag(context: PaygContext): Promise<PaygContext> {
   const user = context.billingUser;
@@ -106,6 +138,7 @@ async function repairPaymentMethodFlag(context: PaygContext): Promise<PaygContex
   if (user?.paygOverage?.enabled !== true || user.has_payment_method === true) return context;
   const customerId = user.stripe_customer_id;
   if (!customerId) return context;
+  if (!claimLivePaymentMethodCheck(context.billingUserId, Date.now())) return context;
   try {
     const { stripeService } = await import('./stripeService');
     if (!(await stripeService.customerHasPaymentMethod(customerId))) return context;
