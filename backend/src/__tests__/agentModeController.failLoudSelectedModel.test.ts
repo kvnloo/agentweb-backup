@@ -1210,6 +1210,45 @@ describe('ENG-669 model source on canonical ids, final-gate 422, legacy side cha
     expect(activeSessionGenerations.has(SESSION_ID)).toBe(false);
   });
 
+  it('verified-generate: a refusal from the FINAL gate is the standard 422 owner body, not a 500', async () => {
+    assertSpy = jest.spyOn(modelAccess, 'assertModelAllowed');
+    assertSpy.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new ModelUnavailableError(DISALLOWED, 'not_in_plan', {
+      model: DISALLOWED, tier: 'Free', allowedModels: [ALLOWED], upgradeRequired: ['Pro'],
+    }));
+    storeSession({ ...baseSession(DISALLOWED), llmModelSource: 'user' });
+    const res = makeRes();
+    await agentModeController.verifiedGenerate({
+      user: { userId: OWNER }, body: { sessionId: SESSION_ID, startingMessage: MESSAGE, attachments: [], llmModel: DISALLOWED }, on: jest.fn(),
+    } as any, res);
+    expect(assertSpy).toHaveBeenCalledTimes(2);
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toMatchObject({ code: 'model_unavailable', reason: 'not_in_plan', tier: 'Free', upgradeRequired: ['Pro'] });
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+  });
+
+  it('a work-plan step refusal AFTER the user message is saved leaves the refusal in the chat (never unanswered) and is a 422', async () => {
+    mockSettings.work_plan_step_models_enabled = 'true';
+    // Pre-flight and final gate pass; the user's pick for the step whose own model is gone is then refused.
+    assertSpy = jest.spyOn(modelAccess, 'assertModelAllowed');
+    assertSpy.mockResolvedValueOnce(undefined).mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new ModelUnavailableError(DISALLOWED, 'not_in_plan', { model: DISALLOWED, tier: 'Free', allowedModels: [ALLOWED], upgradeRequired: ['Pro'] }));
+    storeSession({
+      ...baseSession(ALLOWED), llmModelSource: 'user',
+      workPlan: { title: 'P', steps: [{ stepCount: 1, title: 'S1', status: 'pending', model: 'retired-model-9' }], createdAt: 'x', updatedAt: 'x' },
+    });
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: DISALLOWED }), res);
+    expect(assertSpy).toHaveBeenCalledTimes(3);
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toMatchObject({ code: 'model_unavailable', reason: 'not_in_plan' });
+    const saved = mockChatbotDb.addMessageToSession.mock.calls.map(([, message]) => message as any).filter((m) => m.role !== 'system');
+    expect(saved.map((m) => m.role)).toEqual(['user', 'assistant']);
+    expect(saved[1]).toMatchObject({ role: 'assistant', metadata: expect.objectContaining({ isErrorMessage: true }) });
+    expect(saved[1].content).toContain("isn't included in your plan");
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    delete mockSettings.work_plan_step_models_enabled;
+  });
+
   it('shared view: a final-gate refusal is a 422 without the owner\'s plan', async () => {
     assertSpy = jest.spyOn(modelAccess, 'assertModelAllowed');
     assertSpy

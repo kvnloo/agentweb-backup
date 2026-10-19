@@ -78,3 +78,10 @@ it('an ordinary owner pin: no origin is written by the switch, recorded, or rest
   await undoModelChange('u1', applied.changeId as string);
   expect(row()).toEqual({ scheduleId: 'sc', userId: 'u1', scheduleName: 'n', llmModel: TEMPLATE_MODEL });
 });
+
+it("apply-time rollback (the audit write fails) restores the admin-template pin WITH its 'system' origin", async () => {
+  const row = seedSchedule({ scheduleId: 'sc', userId: 'u1', scheduleName: 'n', llmModel: TEMPLATE_MODEL, llmModelSource: 'system' });
+  (recordModelChange as jest.Mock).mockRejectedValueOnce(new Error('audit table down'));
+  await expect(applyModelChange('u1', { scope: 'schedule', scopeId: 'sc', toModel: SWITCH_TO })).rejects.toThrow('audit table down');
+  expect(row()).toMatchObject({ llmModel: TEMPLATE_MODEL, llmModelSource: 'system' });
+});

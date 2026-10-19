@@ -420,6 +420,23 @@ describe('ENG-669 tier model allowlist on schedule pins', () => {
       expect(res.status).not.toHaveBeenCalledWith(403);
     });
 
+    it('not a change: an alias of the stored model, or any spelling of "no model" on a template without one', async () => {
+      expect((await updateTemplate({ llmModel: 'claude-sonnet-5' })).status).not.toHaveBeenCalledWith(403); // alias of NOT_IN_PLAN
+      for (const llmModel of [null, '', '   ']) {
+        (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue({ ...systemTemplate, llmModel: undefined });
+        const res = makeRes();
+        await (agentModeController as any).updateScheduleTemplate(
+          { user: { userId: USER }, params: { templateId: 't1' }, body: { llmModel } } as unknown as Request, res);
+        expect(res.status).not.toHaveBeenCalledWith(403);
+      }
+    });
+
+    it('fail closed: clearing the stored model, or a non-string value, is a change (403)', async () => {
+      expect((await updateTemplate({ llmModel: null })).status).toHaveBeenCalledWith(403);
+      expect((await updateTemplate({ llmModel: 42 })).status).toHaveBeenCalledWith(403);
+      expect(scheduleTemplateDb.updateTemplate).not.toHaveBeenCalled();
+    });
+
     it('an administrator may change it', async () => {
       const res = await updateTemplate({ llmModel: 'gemini-3.5-flash' }, { userId: USER, isAdmin: true });
       expect(res.status).not.toHaveBeenCalledWith(403);
