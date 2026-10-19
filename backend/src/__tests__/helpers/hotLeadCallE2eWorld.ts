@@ -1,0 +1,206 @@
+/**
+ * Shared world for the hot-lead call end-to-end tests (ENG-2271 WP8). A test file declares the jest.mock calls
+ * (they must be hoisted in the file that owns them), then calls installWorld() once at the top level.
+ *
+ * Mock contract the test files provide:
+ *   '../services/db'                 -> { ENGAGED_EVENT_KEYWORDS, ...dbMock } (helpers/hotLeadCallFakeCrm)
+ *   '../services/asyncJobQueue'      -> jest.fn() for every export
+ *   '../services/usageRecorderService' -> real module with recordVendorUsage: jest.fn()
+ *   '../services/leadNotificationLookup', '@slack/web-api' -> jest.fn() stand-ins
+ */
+import { WebClient } from '@slack/web-api';
+import * as queue from '../../services/asyncJobQueue';
+import { recordVendorUsage } from '../../services/usageRecorderService';
+import { notificationLookup } from '../../services/leadNotificationLookup';
+import { dispatchLeadCreated } from '../../services/orgLeadNotificationService';
+import { setHotLeadCallEnabledOverride } from '../../services/voice/hotLeadCallMode';
+import { setVoiceProviderForTests, type PlaceCallParams } from '../../services/voice/voiceProvider';
+import { setLeadCallStoreForTests } from '../../services/voice/leadCallStore';
+import { FakeLimitStore } from '../../services/voice/fakeLimitStore';
+import { setLimitStoreForTests } from '../../services/voice/limitStore';
+import { FakeCrm, crmHolder } from './hotLeadCallFakeCrm';
+import { SignedFakeVoiceProvider, TwilioCaller, attrOf } from './hotLeadCallTwilioSim';
+
+export const mock = (fn: unknown) => fn as jest.Mock;
+export const BASE = 'https://api.example.test';
+export const LIST = 'list-a';
+export const OWNER_PHONE = '+14155550100';
+export const TWILIO_NUMBER = '+14155550111';
+export const LEAD_PHONE_AS_TYPED = '(212) 555-0142';
+export const LEAD_E164 = '+12125550142';
+const NOW = '2026-10-19T17:00:00.000Z'; // 12:00 in America/Chicago, inside the 08:00-21:00 call window
+const MINUTE_MS = 60_000;
+
+export const callConfig = {
+  enabled: true, destinationPhone: OWNER_PHONE, destinationVerifiedAt: '2026-01-01T00:00:00.000Z', twilioNumber: TWILIO_NUMBER,
+  announcedName: 'Smith & Sons', quietHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
+};
+const slackConnection = { platform: 'slack', account_id: 'T123', config: { account_type: 'bot', access_token: 'xoxb-org-a', team_id: 'T123' } };
+const orgWithSlack = { orgId: 'org-a', hotLeadCall: callConfig, leadNotifications: { enabled: true, slackChannelId: 'C123' }, connected_accounts: [slackConnection] };
+
+interface World {
+  crm: FakeCrm;
+  provider: SignedFakeVoiceProvider;
+  limits: FakeLimitStore;
+  twilio: TwilioCaller;
+  postMessage: jest.Mock;
+  consoleSpies: jest.SpyInstance[];
+}
+export const world = {} as World;
+let submissionSeq = 0;
+
+export function installWorld(): void {
+  beforeEach(() => {
+    jest.resetAllMocks();
+    jest.useFakeTimers({
+      now: new Date(NOW),
+      doNotFake: ['hrtime', 'nextTick', 'performance', 'queueMicrotask', 'setImmediate', 'clearImmediate', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'],
+    });
+    process.env.JWT_SECRET = 'test-secret';
+    process.env.BACKEND_URL = BASE;
+
+    world.crm = new FakeCrm();
+    crmHolder.current = world.crm;
+    world.crm.addOrg(orgWithSlack, [{ userId: 'owner-a' }], [{ listId: LIST, userId: 'owner-a' }]);
+    world.provider = new SignedFakeVoiceProvider();
+    setVoiceProviderForTests(world.provider);
+    world.limits = new FakeLimitStore();
+    setLimitStoreForTests(world.limits);
+    setLeadCallStoreForTests(null); // the REAL store, on the fake crm
+    setHotLeadCallEnabledOverride(true);
+    world.twilio = new TwilioCaller();
+
+    // The queue's permanent job row: a second enqueue of the same source+key is a duplicate.
+    const seen = new Set<string>();
+    mock(queue.enqueueJob).mockImplementation(async (source: string, key: string) => {
+      const job = `${source}:${key}`;
+      if (seen.has(job)) return 'duplicate';
+      seen.add(job);
+      return 'enqueued';
+    });
+    mock(queue.startHeartbeat).mockReturnValue(jest.fn());
+    mock(notificationLookup.campaigns).mockResolvedValue({ rows: [], truncated: false });
+    mock(notificationLookup.pages).mockResolvedValue([]);
+    world.postMessage = jest.fn().mockResolvedValue({ ok: true, ts: '1.2' });
+    mock(WebClient).mockImplementation(() => ({ auth: { test: jest.fn().mockResolvedValue({ ok: true, team_id: 'T123', bot_id: 'B123' }) }, chat: { postMessage: world.postMessage } }));
+    mock(recordVendorUsage).mockResolvedValue(undefined);
+    world.consoleSpies = (['log', 'warn', 'error', 'info'] as const).map((m) => jest.spyOn(console, m).mockImplementation(() => undefined));
+  });
+
+  afterEach(() => {
+    expectNoPhoneNumberAnywhere();
+    world.consoleSpies.forEach((s) => s.mockRestore());
+    jest.useRealTimers();
+    setHotLeadCallEnabledOverride(null);
+    setVoiceProviderForTests(null);
+    setLimitStoreForTests(null);
+    delete process.env.BACKEND_URL;
+  });
+}
+
+// ── clock and lead helpers ──────────────────────────────────────────────────
+
+const flush = async () => { for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve)); };
+export const setClock = (iso: string) => jest.setSystemTime(new Date(iso));
+export const advanceMinutes = (n: number) => jest.setSystemTime(Date.now() + n * MINUTE_MS);
+/** Distinct valid lead phones, one per n. */
+export const leadPhone = (n: number) => `(212) 555-01${String(10 + n)}`;
+
+interface SubmitOptions {
+  phone?: string;
+  listId?: string;
+  /** Carry a fresh server-side submission id, like a repeat form submission. */
+  submission?: boolean;
+  origin?: 'form_fill' | 'manual';
+  /** Fields merged over the default lead row. */
+  lead?: Record<string, unknown>;
+}
+
+/** A form lead lands and the app's own create hook fires, like db.createLead does. */
+export async function submitLead(leadId: string, o: SubmitOptions = {}): Promise<void> {
+  const listId = o.listId ?? LIST;
+  if (!world.crm.hasLead(listId, leadId)) {
+    world.crm.addLead({
+      listId, leadId, firstName: 'Jane', email: `${leadId}@example.com`, phone: o.phone ?? LEAD_PHONE_AS_TYPED,
+      createdAt: new Date().toISOString(), customFields: { stage: 'complete', source: 'landing' }, ...o.lead,
+    });
+  }
+  const submission = o.submission ? { submissionId: `sub-${++submissionSeq}`, submittedAt: new Date().toISOString() } : undefined;
+  await dispatchLeadCreated(listId, leadId, o.origin ?? 'form_fill', submission);
+  await flush();
+}
+
+export const recordOf = (leadId: string, listId = LIST) => world.crm.lead(listId, leadId).system?.hot_lead_call as Record<string, unknown> | undefined;
+export const eventsOf = (leadId: string) => world.crm.timeline(LIST, leadId);
+/** A webhook-driven call placed by the orchestrator (not an inline-TwiML verification call). */
+type WebhookCall = Extract<PlaceCallParams, { url: string }>;
+export function placedCall(i = 0): WebhookCall {
+  const placed = world.provider.placedCalls[i];
+  if (!placed || placed.url === undefined) throw new Error(`no webhook-driven call was placed at index ${i}`);
+  return placed;
+}
+export const usage = () => mock(recordVendorUsage).mock.calls.map(([u]) => u).sort((a, b) => a.idempotencyKey.localeCompare(b.idempotencyKey));
+/** [idempotency key, minutes] per usage event, sorted by key. */
+export const usageSummary = () => usage().map((u) => [u.idempotencyKey, u.quantity]);
+export const skipReason = (leadId: string) => (world.crm.lead(LIST, leadId).engagements ?? []).find((e) => e.eventType === 'call.skipped')?.eventData;
+
+// ── Twilio, playing one call ────────────────────────────────────────────────
+
+/**
+ * One call as Twilio plays it. Each method is one webhook Twilio would send, posted to the URL the app handed
+ * out for it: the placeCall URLs first, then the action/statusCallback URLs found in the TwiML it was answered with.
+ * SequenceNumber starts at 0, as Twilio's does.
+ */
+export function twilioCall(placed: WebhookCall, ownerSid = 'CA00000001', leadSid = 'CA00000002') {
+  const ownerLeg = { AccountSid: 'AC00000000000000000000000000000000', Direction: 'outbound-api', From: TWILIO_NUMBER, To: OWNER_PHONE };
+  const { twilio } = world;
+  let gatherUrl = '';
+  let dialUrl = '';
+  let leadStatusUrl = '';
+  return {
+    get leadStatusUrl() { return leadStatusUrl; },
+    async ownerAnswers() {
+      const reply = await twilio.post(placed.url, { ...ownerLeg, CallSid: ownerSid, CallStatus: 'in-progress' });
+      if (reply.body.includes('<Gather')) gatherUrl = attrOf(reply.body, 'action');
+      return reply;
+    },
+    async ownerPresses(digits: string) {
+      const reply = await twilio.post(gatherUrl, { ...ownerLeg, CallSid: ownerSid, CallStatus: 'in-progress', Digits: digits, FinishedOnKey: '' });
+      if (reply.body.includes('<Dial')) { dialUrl = attrOf(reply.body, 'action'); leadStatusUrl = attrOf(reply.body, 'statusCallback'); }
+      return reply;
+    },
+    leadStatus: (callStatus: string, sequence: number, extra: Record<string, string> = {}) =>
+      twilio.post(leadStatusUrl, { AccountSid: ownerLeg.AccountSid, From: TWILIO_NUMBER, To: LEAD_E164, CallSid: leadSid, ParentCallSid: ownerSid, CallStatus: callStatus, SequenceNumber: String(sequence), ...extra }),
+    dialEnds: (dialStatus: string, extra: Record<string, string> = {}) =>
+      twilio.post(dialUrl, { ...ownerLeg, CallSid: ownerSid, DialCallStatus: dialStatus, DialCallSid: leadSid, ...extra }),
+    ownerLegEnds: (callStatus: string, durationSeconds: string, sequence = 0, extra: Record<string, string> = {}) =>
+      twilio.post(placed.statusCallbackUrl, { ...ownerLeg, CallSid: ownerSid, CallStatus: callStatus, CallDuration: durationSeconds, SequenceNumber: String(sequence), ...extra }),
+  };
+}
+
+/** Rings the owner, who presses 1, and the lead answers: the call is bridged. Returns the live call. */
+export async function bridgedCall(leadId = 'lead-a') {
+  await submitLead(leadId);
+  const call = twilioCall(placedCall());
+  await call.ownerAnswers();
+  await call.ownerPresses('1');
+  await call.leadStatus('in-progress', 2);
+  return call;
+}
+
+// No phone number (owner's, caller ID, lead's) may sit in a log, a timeline event, the call record, the webhook
+// URLs we hand to Twilio, or a usage event. Numbers legitimately appear only in the Twilio request and the TwiML.
+function expectNoPhoneNumberAnywhere(): void {
+  const { crm, provider, consoleSpies } = world;
+  const surfaces: string[] = [
+    ...consoleSpies.flatMap((s) => s.mock.calls.map((c) => JSON.stringify(c))),
+    ...[...crm.leads.values()].flatMap((l) => [JSON.stringify(l.engagements ?? []), JSON.stringify(l.system?.hot_lead_call ?? {})]),
+    ...provider.placedCalls.flatMap((p) => [p.url, p.statusCallbackUrl].filter((u): u is string => u !== undefined)),
+    JSON.stringify(mock(recordVendorUsage).mock.calls),
+  ];
+  for (const text of surfaces) {
+    for (const phone of [OWNER_PHONE, TWILIO_NUMBER, LEAD_E164]) {
+      expect(text.replace(/\D/g, '')).not.toContain(phone.slice(2));
+    }
+  }
+}

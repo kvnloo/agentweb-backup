@@ -452,8 +452,8 @@ router.post('/status', guarded(async (_req, res, q, body) => {
     q,
     callSid,
     sequence: /^\d{1,9}$/.test(body.SequenceNumber ?? '') ? Number(body.SequenceNumber) : undefined,
-    // Number() of an absent field is NaN on purpose: recordCallUsage warns instead of billing 0.
-    durationSeconds: Number(body.CallDuration),
+    // An absent, empty or blank field is NaN on purpose (Number('') would be 0): recordCallUsage warns instead of billing 0.
+    durationSeconds: body.CallDuration?.trim() ? Number(body.CallDuration) : NaN,
   };
 
   const record = q.leg === 'owner' ? await withOwnerSid(q, loaded, callSid) : loaded;
