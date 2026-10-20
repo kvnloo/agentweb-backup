@@ -98,9 +98,9 @@ export async function placeMemberCall(input: PlacementInput): Promise<PlacementR
     try {
       owned = pendingCreate
         ? await pendingCreate(member)
-        // '' clears the previous attempt's call sid and outcome (an empty value means "none").
+        // The new attempt starts without the previous attempt's call sid and outcome.
         : await store.transition(listId, leadId, ['between_attempts'], {
-          state: 'dialing', attemptNo, memberId: member.id, triedMemberIds: [member.id], memberCallSid: '', outcome: '',
+          state: 'dialing', attemptNo, memberId: member.id, triedMemberIds: [member.id], clear: ['memberCallSid', 'outcome'],
         });
     } catch (err) {
       await releaseCooldown();

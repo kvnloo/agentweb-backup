@@ -594,16 +594,12 @@ describe('POST /gather: the lead phone must still be the one that passed the gat
     expect(store.record?.outcome).toBe('lead_phone_changed');
   });
 
-  it('still dials a record created before the check existed (no stored value) and says so in the log', async () => {
-    seed('member_answered', { leadPhoneMac: undefined });
+  it('refuses a record that has no stored value: a phone it cannot compare is treated as changed', async () => {
+    seed('member_answered', { leadPhoneMac: undefined as unknown as string });
     const res = await gather('1');
-    expect(res.text).toContain('<Dial');
-    expect(JSON.stringify(logSpy.flatMap((s) => s.mock.calls))).toContain('no leadPhoneMac');
-  });
-
-  it('does not warn about a missing stored value when it is present', async () => {
-    await gather('1');
-    expect(JSON.stringify(logSpy.flatMap((s) => s.mock.calls))).not.toContain('no leadPhoneMac');
+    expect(res.text).not.toContain('<Dial');
+    expect(store.record?.outcome).toBe('lead_phone_changed');
+    expect(store.eventTypes()).toEqual(['call.failed']);
   });
 
   it('keeps reporting lead_phone_invalid (not changed) when the live number is no longer callable at all', async () => {
@@ -933,13 +929,13 @@ describe('member attempt finalisation', () => {
     expect(nextAttempt()).toHaveBeenCalledTimes(1);
   });
 
-  describe('while the next attempt is being placed (dialing, call sid cleared to an empty string)', () => {
+  describe('while the next attempt is being placed (dialing, call sid and outcome cleared)', () => {
     const startNextAttempt = async () => {
       seed('member_ringing');
       nextAttempt().mockResolvedValue({ enqueued: true });
       await memberStatus('no-answer', { CallDuration: '0', SequenceNumber: '1' });
       expect(await store.transition(LIST, LEAD, ['between_attempts'], {
-        state: 'dialing', attemptNo: 2, memberId: MEMBER_ID, memberCallSid: '', outcome: '',
+        state: 'dialing', attemptNo: 2, memberId: MEMBER_ID, clear: ['memberCallSid', 'outcome'],
       })).toBe(true);
       store.events = [];
     };
@@ -951,7 +947,8 @@ describe('member attempt finalisation', () => {
       expect((await memberPrompt()).text).toContain('<Hangup/>');
       expect((await gather('1')).text).toContain('<Hangup/>');
       expect(store.transitions).toBe(writes);
-      expect(store.record).toMatchObject({ state: 'dialing', memberCallSid: '', attemptNo: 2 });
+      expect(store.record).toMatchObject({ state: 'dialing', attemptNo: 2 });
+      expect(store.record).not.toHaveProperty('memberCallSid');
       expect(store.events).toHaveLength(0);
     });
 
@@ -969,8 +966,8 @@ describe('member attempt finalisation', () => {
       expect(store.record).toMatchObject({ state: 'between_attempts', memberCallSid: NEXT_MEMBER_SID, meteredLegs: ['member:1', 'member:2'], outcome: 'member_no_answer' });
     });
 
-    it('an attempt that connects finishes as completed, not with the empty outcome the reset left behind', async () => {
-      seed('connected', { attemptNo: 2, memberCallSid: NEXT_MEMBER_SID, leadCallSid: LEAD_SID, outcome: '', meteredLegs: ['member:1', 'lead'] });
+    it('an attempt that connects finishes as completed when the reset left no outcome', async () => {
+      seed('connected', { attemptNo: 2, memberCallSid: NEXT_MEMBER_SID, leadCallSid: LEAD_SID, outcome: undefined, meteredLegs: ['member:1', 'lead'] });
       await post('status', { CallSid: NEXT_MEMBER_SID, CallStatus: 'completed', CallDuration: '60', SequenceNumber: '1' });
       expect(store.record).toMatchObject({ state: 'finished', outcome: 'completed' });
       expect(store.events.at(-1)).toMatchObject({ type: 'call.completed', detail: { outcome: 'completed' } });

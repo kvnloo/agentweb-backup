@@ -28,19 +28,20 @@ export interface HotLeadCallRecord {
   startedAt: string;
   updatedAt: string;
   /** 1-based number of the member call this record is on. */
-  attemptNo?: number;
+  attemptNo: number;
   /** The member being rung by the current attempt (HotLeadCallMember.id). */
-  memberId?: string;
+  memberId: string;
   /** Every member already called for this lead, in call order; never shrinks. */
-  triedMemberIds?: string[];
+  triedMemberIds: string[];
   memberCallSid?: string;
   leadCallSid?: string;
   /**
    * Keyed HMAC of the lead's E.164 phone as it was when the call passed the gates (never the phone itself).
    * The webhooks refuse to dial or screen a lead whose live phone no longer matches it, so a repeat
-   * submission that overwrites lead.phone cannot redirect an approved call to another number.
+   * submission that overwrites lead.phone cannot redirect an approved call to another number. A stored record
+   * without it counts as a changed phone: the webhooks never dial or screen on a number they cannot compare.
    */
-  leadPhoneMac?: string;
+  leadPhoneMac: string;
   /** Short machine reason for terminal states, e.g. 'member_no_answer', 'member_declined', 'lead_no_answer', 'lead_declined'. */
   outcome?: string;
   /** Legs already metered through recordCallUsage, so a replayed status callback cannot meter twice. */
@@ -68,6 +69,12 @@ export type HotLeadCallEventType =
   | 'call.failed'
   | 'call.skipped';
 
+/** Record fields a transition can remove (not just overwrite): the ones a next attempt starts without. */
+export type ClearableField = 'memberCallSid' | 'outcome';
+
+/** What a transition changes. `clear` removes fields; a field cannot be both set and cleared in one patch. */
+export type HotLeadCallPatch = Partial<HotLeadCallRecord> & { state: HotLeadCallState; clear?: ClearableField[] };
+
 export interface LeadCallStore {
   get(listId: string, leadId: string): Promise<HotLeadCallRecord | null>;
   /** Creates the record. Returns false if one already exists (never overwrites). */
@@ -80,7 +87,7 @@ export interface LeadCallStore {
     listId: string,
     leadId: string,
     from: HotLeadCallState[],
-    patch: Partial<HotLeadCallRecord> & { state: HotLeadCallState },
+    patch: HotLeadCallPatch,
   ): Promise<boolean>;
   addEvent(
     listId: string,

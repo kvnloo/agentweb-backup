@@ -58,7 +58,10 @@ suite('hot-lead call store against DynamoDB Local', () => {
     return leadId;
   };
   const rowOf = async (leadId: string) => (await ddb.get({ TableName: 'AW-Leads', Key: { listId: LIST, leadId } }).promise()).Item;
-  const baseRecord = { state: 'dialing' as const, jobKey: 'job-1', startedAt: '2026-10-19T10:00:00.000Z', updatedAt: '2026-10-19T10:00:00.000Z' };
+  const baseRecord = {
+    state: 'dialing' as const, jobKey: 'job-1', startedAt: '2026-10-19T10:00:00.000Z', updatedAt: '2026-10-19T10:00:00.000Z',
+    attemptNo: 1, memberId: 'maaaaaaa', triedMemberIds: ['maaaaaaa'], leadPhoneMac: 'mac-1',
+  };
 
   it('creates on a lead with no system map, then refuses a second create without overwriting', async () => {
     const leadId = await newLead();
@@ -67,14 +70,32 @@ suite('hot-lead call store against DynamoDB Local', () => {
     expect(await store.get(LIST, leadId)).toMatchObject({ state: 'dialing', jobKey: 'job-1', meteredLegs: [], lastSequence: {} });
   });
 
-  it('stores the empty strings a next attempt uses to clear the call sid and outcome', async () => {
+  it('removes the call sid and outcome when a transition clears them, and keeps everything else', async () => {
     const leadId = await newLead();
     await store.create(LIST, leadId, { ...baseRecord, state: 'dialing', memberCallSid: SID_A, outcome: 'member_no_answer' });
     await store.transition(LIST, leadId, ['dialing'], { state: 'between_attempts' });
     expect(await store.transition(LIST, leadId, ['between_attempts'], {
-      state: 'dialing', attemptNo: 2, memberId: 'mbbbbbbb', triedMemberIds: ['mbbbbbbb'], memberCallSid: '', outcome: '',
+      state: 'dialing', attemptNo: 2, memberId: 'mbbbbbbb', triedMemberIds: ['mbbbbbbb'], clear: ['memberCallSid', 'outcome'],
     })).toBe(true);
-    expect(await store.get(LIST, leadId)).toMatchObject({ state: 'dialing', attemptNo: 2, memberCallSid: '', outcome: '', triedMemberIds: ['mbbbbbbb'] });
+    const system = (await rowOf(leadId)).system.hot_lead_call;
+    expect(system).not.toHaveProperty('memberCallSid');
+    expect(system).not.toHaveProperty('outcome');
+    expect(system).toMatchObject({ state: 'dialing', attemptNo: 2, memberId: 'mbbbbbbb', triedMemberIds: ['maaaaaaa', 'mbbbbbbb'], leadPhoneMac: 'mac-1' });
+  });
+
+  it('clears nothing when the state condition fails, and tolerates clearing fields that are absent', async () => {
+    const leadId = await newLead();
+    await store.create(LIST, leadId, { ...baseRecord, memberCallSid: SID_A });
+    expect(await store.transition(LIST, leadId, ['member_ringing'], { state: 'dialing', clear: ['memberCallSid'] })).toBe(false);
+    expect((await store.get(LIST, leadId))?.memberCallSid).toBe(SID_A);
+    expect(await store.transition(LIST, leadId, ['dialing'], { state: 'dialing', clear: ['outcome'] })).toBe(true);
+    expect((await store.get(LIST, leadId))?.memberCallSid).toBe(SID_A);
+  });
+
+  it('refuses to set and clear the same field in one patch', async () => {
+    const leadId = await newLead();
+    await store.create(LIST, leadId, baseRecord);
+    await expect(store.transition(LIST, leadId, ['dialing'], { state: 'dialing', memberCallSid: SID_B, clear: ['memberCallSid'] })).rejects.toThrow('both set and removed');
   });
 
   it('keeps sibling system keys when creating', async () => {

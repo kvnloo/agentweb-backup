@@ -1,4 +1,4 @@
-import type { HotLeadCallEventType, HotLeadCallRecord, HotLeadCallState, LeadCallStore } from '../../services/voice/leadCallStore.types';
+import type { HotLeadCallEventType, HotLeadCallPatch, HotLeadCallRecord, HotLeadCallState, LeadCallStore } from '../../services/voice/leadCallStore.types';
 
 const TERMINAL: HotLeadCallState[] = ['finished', 'failed', 'skipped'];
 const SCALAR_FIELDS = ['state', 'jobKey', 'startedAt', 'updatedAt', 'memberCallSid', 'leadCallSid', 'outcome', 'attemptNo', 'memberId'] as const;
@@ -6,7 +6,7 @@ const SCALAR_FIELDS = ['state', 'jobKey', 'startedAt', 'updatedAt', 'memberCallS
 /**
  * In-memory LeadCallStore with the same conditional semantics as the DynamoDB one: create-if-absent,
  * a `from` list that names a terminal state is refused, a lastSequence entry must be strictly higher,
- * meteredLegs and triedMemberIds only append values not yet present, and every check is part of the same atomic step.
+ * meteredLegs and triedMemberIds only append values not yet present, `clear` removes fields, and every check is part of the same atomic step.
  * Tests seed or inspect `record` and `events` directly and script failures with `transitionError`.
  */
 export class FakeLeadCallStore implements LeadCallStore {
@@ -23,7 +23,7 @@ export class FakeLeadCallStore implements LeadCallStore {
 
   async create(_listId: string, _leadId: string, record: HotLeadCallRecord): Promise<boolean> {
     if (this.record) return false;
-    this.record = { meteredLegs: [], triedMemberIds: [], lastSequence: {}, ...structuredClone(record) };
+    this.record = { meteredLegs: [], lastSequence: {}, ...structuredClone(record) };
     return true;
   }
 
@@ -31,9 +31,11 @@ export class FakeLeadCallStore implements LeadCallStore {
     _listId: string,
     _leadId: string,
     from: HotLeadCallState[],
-    patch: Partial<HotLeadCallRecord> & { state: HotLeadCallState },
+    patch: HotLeadCallPatch,
   ): Promise<boolean> {
     if (this.transitionError) throw this.transitionError;
+    // The real update expression cannot touch one path twice.
+    if ((patch.clear ?? []).some((f) => patch[f] !== undefined)) throw new Error(`${patch.clear} is both set and cleared`);
     const r = this.record;
     if (!r || from.length === 0 || from.some((s) => TERMINAL.includes(s)) || !from.includes(r.state)) return false;
     const seq = patch.lastSequence ?? {};
@@ -45,6 +47,7 @@ export class FakeLeadCallStore implements LeadCallStore {
     for (const field of SCALAR_FIELDS) {
       if (patch[field] !== undefined) (r as unknown as Record<string, unknown>)[field] = patch[field];
     }
+    for (const field of patch.clear ?? []) delete r[field];
     r.lastSequence = { ...r.lastSequence, ...seq };
     r.meteredLegs = [...(r.meteredLegs ?? []), ...legs];
     r.triedMemberIds = [...(r.triedMemberIds ?? []), ...tried];

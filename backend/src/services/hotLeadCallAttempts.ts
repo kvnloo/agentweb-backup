@@ -38,11 +38,11 @@ const keyOf = (job: Pick<NextAttemptJob, 'jobKey' | 'attemptNo'>): string =>
  * itself within maxAgeMinutes of the submission, so a lead is never chased for much longer than that window.
  */
 function staticRefusal(config: HotLeadCallConfig, record: HotLeadCallRecord, now: Date): NextAttemptRefusal | null {
-  if ((record.attemptNo ?? 1) >= config.maxAttemptsPerLead) return 'max_attempts';
+  if (record.attemptNo >= config.maxAttemptsPerLead) return 'max_attempts';
   const startedAt = Date.parse(record.startedAt);
   if (!Number.isFinite(startedAt) || now.getTime() - startedAt > config.maxAgeMinutes * MINUTE_MS) return 'too_old';
   // Also empty outside the calling hours and when the whole team has been tried.
-  if (selectHotLeadCallCandidates(config, now, record.triedMemberIds ?? []).length === 0) return 'no_candidates';
+  if (selectHotLeadCallCandidates(config, now, record.triedMemberIds).length === 0) return 'no_candidates';
   return null;
 }
 
@@ -69,7 +69,7 @@ export async function requestNextHotLeadCallAttempt(args: {
     if (refusal) return { enqueued: false, reason: refusal };
     if (!await isHotLeadCallEntitled({ ownerUserId: ctx.orgOwnerUserId })) return { enqueued: false, reason: 'disabled' };
 
-    const job: NextAttemptJob = { orgId: ctx.orgId, listId, leadId, jobKey: record.jobKey, attemptNo: record.attemptNo ?? 1 };
+    const job: NextAttemptJob = { orgId: ctx.orgId, listId, leadId, jobKey: record.jobKey, attemptNo: record.attemptNo };
     const key = keyOf(job);
     const queued = await enqueueJob(NEXT_ATTEMPT_SOURCE, key, job, { claimImmediately: true });
     if (queued === 'duplicate') return { enqueued: true };
@@ -135,7 +135,7 @@ export async function processHotLeadCallNextAttempt(job: NextAttemptJob): Promis
 
   await placeMemberCall({
     orgId: job.orgId, listId, leadId, jobKey: record.jobKey, config, callerNumber,
-    candidates: selectHotLeadCallCandidates(config, now, record.triedMemberIds ?? []),
+    candidates: selectHotLeadCallCandidates(config, now, record.triedMemberIds),
     attemptNo: job.attemptNo + 1,
   });
 }

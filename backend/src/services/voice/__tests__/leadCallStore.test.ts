@@ -49,6 +49,7 @@ function installFakeDb(leads: Record<string, Row>) {
         if (items.some((x) => rec[field].includes(x))) return false;
       }
       for (const [field, v] of Object.entries(op.set ?? {})) if (v !== undefined) rec[field] = v;
+      for (const field of op.remove ?? []) delete rec[field];
       for (const [field, entries] of Object.entries<Record<string, number>>(op.maxIn ?? {})) Object.assign(rec[field], entries);
       for (const [field, items] of Object.entries<string[]>(op.appendNew ?? {})) rec[field].push(...items);
       return true;
@@ -61,6 +62,10 @@ const baseRecord: HotLeadCallRecord = {
   jobKey: 'job-1',
   startedAt: '2026-10-19T10:00:00.000Z',
   updatedAt: '2026-10-19T10:00:00.000Z',
+  attemptNo: 1,
+  memberId: 'maaaaaaa',
+  triedMemberIds: ['maaaaaaa'],
+  leadPhoneMac: 'mac-1',
 };
 
 let leads: Record<string, Row>;
@@ -170,20 +175,29 @@ describe('leadCallStore transition', () => {
 
   it('stores the attempt number, current member and tried members, and appends only new tried ids', async () => {
     const store = getLeadCallStore();
-    expect(await store.transition(LIST, LEAD, ['dialing'], { state: 'member_ringing', attemptNo: 1, memberId: 'maaaaaaa', triedMemberIds: ['maaaaaaa'] })).toBe(true);
-    expect(await store.get(LIST, LEAD)).toMatchObject({ attemptNo: 1, memberId: 'maaaaaaa', triedMemberIds: ['maaaaaaa'] });
     // A member already tried cannot be recorded again: the whole write is refused.
-    expect(await store.transition(LIST, LEAD, ['member_ringing'], { state: 'between_attempts', attemptNo: 2, triedMemberIds: ['maaaaaaa'] })).toBe(false);
+    expect(await store.transition(LIST, LEAD, ['dialing'], { state: 'between_attempts', attemptNo: 2, triedMemberIds: ['maaaaaaa'] })).toBe(false);
     expect((await store.get(LIST, LEAD))?.attemptNo).toBe(1);
-    expect(await store.transition(LIST, LEAD, ['member_ringing'], { state: 'between_attempts', attemptNo: 2, memberId: 'mbbbbbbb', triedMemberIds: ['mbbbbbbb'] })).toBe(true);
-    expect((await store.get(LIST, LEAD))?.triedMemberIds).toEqual(['maaaaaaa', 'mbbbbbbb']);
+    expect(await store.transition(LIST, LEAD, ['dialing'], { state: 'between_attempts', attemptNo: 2, memberId: 'mbbbbbbb', triedMemberIds: ['mbbbbbbb'] })).toBe(true);
+    expect(await store.get(LIST, LEAD)).toMatchObject({ attemptNo: 2, memberId: 'mbbbbbbb', triedMemberIds: ['maaaaaaa', 'mbbbbbbb'] });
   });
 
   it('seeds triedMemberIds on create so later appends have a list to extend', async () => {
     leads[`${LIST}/other`] = { listId: LIST, leadId: 'other', system: {} };
-    await getLeadCallStore().create(LIST, 'other', { ...baseRecord, attemptNo: 1, memberId: 'maaaaaaa', triedMemberIds: ['maaaaaaa', 'maaaaaaa'] });
+    await getLeadCallStore().create(LIST, 'other', { ...baseRecord, triedMemberIds: ['maaaaaaa', 'maaaaaaa'] });
     expect(leads[`${LIST}/other`].system.hot_lead_call).toMatchObject({ attemptNo: 1, memberId: 'maaaaaaa', triedMemberIds: ['maaaaaaa'] });
-    expect((await getLeadCallStore().get(LIST, LEAD))?.triedMemberIds).toEqual([]);
+  });
+
+  it('removes the fields a patch clears, and passes them to the primitive as a removal rather than an empty value', async () => {
+    const store = getLeadCallStore();
+    await store.transition(LIST, LEAD, ['dialing'], { state: 'member_ringing', memberCallSid: SID_MEMBER, outcome: 'member_no_answer' });
+    mock(crmDb.updateLeadSystemRecordIf).mockClear();
+    expect(await store.transition(LIST, LEAD, ['member_ringing'], { state: 'dialing', clear: ['memberCallSid', 'outcome'] })).toBe(true);
+    expect(mock(crmDb.updateLeadSystemRecordIf).mock.calls[0][3]).toMatchObject({ remove: ['memberCallSid', 'outcome'] });
+    const record = leads[`${LIST}/${LEAD}`].system.hot_lead_call;
+    expect(record).not.toHaveProperty('memberCallSid');
+    expect(record).not.toHaveProperty('outcome');
+    expect(record.state).toBe('dialing');
   });
 
   it('stamps updatedAt itself and drops unknown patch keys', async () => {

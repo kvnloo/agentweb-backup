@@ -104,7 +104,7 @@ const decisionKey = (callSid: string, step: 'gather' | 'dial' | 'screen'): strin
 const LEAD_SID_ADOPTED = 'lead#adopt';
 /** `meteredLegs` entry of a leg: member legs are numbered by attempt ('member:1'), the lead leg is 'lead'. */
 const meteredLegOf = (leg: HotLeadCallLeg, record: HotLeadCallRecord): MeteredLeg =>
-  leg === 'lead' ? 'lead' : `member:${record.attemptNo ?? 1}`;
+  leg === 'lead' ? 'lead' : `member:${record.attemptNo}`;
 const errorName = (err: unknown): string => (err instanceof Error ? err.name : 'unknown error');
 
 const sendXml = (res: Response, xml: string): void => {
@@ -154,7 +154,7 @@ async function loadRecord(q: CallQuery): Promise<HotLeadCallRecord | null> {
  */
 async function withMemberSid(q: CallQuery, record: HotLeadCallRecord, callSid: string | undefined): Promise<HotLeadCallRecord> {
   if (record.memberCallSid || record.state !== 'dialing' || !callSid) return record;
-  // A next attempt that is still being placed has no sid either ('' after the reset), but a late callback of an
+  // A next attempt that is still being placed has no sid either (the reset removed it), but a late callback of an
   // earlier attempt's call must not be taken for it: every earlier member leg left a marker behind.
   if (alreadyHandled(record, callSid)) return record;
   const store = getLeadCallStore();
@@ -331,8 +331,8 @@ router.post('/gather', guarded(async (_req, res, q, body) => {
   }
 
   // The call was approved for the phone that passed the gates. A repeat submission can overwrite lead.phone
-  // afterwards, so the live number must still be that one.
-  if (record.leadPhoneMac && record.leadPhoneMac !== leadPhoneMacOf(ctx.orgId, leadE164)) {
+  // afterwards, so the live number must still be that one (a record with no MAC cannot prove it and is refused).
+  if (record.leadPhoneMac !== leadPhoneMacOf(ctx.orgId, leadE164)) {
     if (await store.transition(q.listId, q.leadId, ['member_answered'], { state: 'member_answered', outcome: 'lead_phone_changed', lastSequence: decision })) {
       await store.addEvent(q.listId, q.leadId, 'call.failed', { reason: 'lead_phone_changed' });
     }
@@ -350,7 +350,6 @@ router.post('/gather', guarded(async (_req, res, q, body) => {
   });
   // Only the winner dials the lead; a replayed "1" gets a hangup instead of a second bridge.
   if (!(await store.transition(q.listId, q.leadId, ['member_answered'], { state: 'bridging', lastSequence: decision }))) return sendHangup(res);
-  if (!record.leadPhoneMac) console.warn('[twilio-voice] call record has no leadPhoneMac (created before the check existed): lead phone not compared');
   sendXml(res, connect);
 }, twimlReplies));
 
@@ -504,7 +503,6 @@ async function finishIfComplete(q: CallQuery): Promise<void> {
  * 'dialing': that is information, not a decision, so it must not suppress the real member outcome.
  */
 const decidedOutcome = (record: HotLeadCallRecord): string | undefined =>
-  // A next attempt clears the previous outcome by storing '' (the store cannot remove a field): '' means none.
   !record.outcome || record.outcome === 'placement_unknown' ? undefined : record.outcome;
 
 /**
@@ -630,7 +628,7 @@ async function nextAttemptOrFinish(q: CallQuery, attemptOutcome: string): Promis
     console.error('[twilio-voice] next attempt request failed:', errorName(err));
   }
   if (enqueued) return;
-  const outcome = (record.attemptNo ?? 1) > 1 ? 'no_member_available' : attemptOutcome;
+  const outcome = record.attemptNo > 1 ? 'no_member_available' : attemptOutcome;
   if (await store.transition(q.listId, q.leadId, ['between_attempts'], { state: 'finished', outcome })) {
     await store.addEvent(q.listId, q.leadId, 'call.completed', { outcome });
   }

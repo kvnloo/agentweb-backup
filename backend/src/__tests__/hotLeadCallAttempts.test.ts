@@ -128,8 +128,9 @@ describe('the reference team at 16:00', () => {
     await processHotLeadCallNextAttempt(nextJob());
     expect(placedTo()).toEqual([phones.C, phones.D]);
     expect(store.record).toMatchObject({
-      state: 'member_ringing', attemptNo: 2, memberId: ids.D, triedMemberIds: [ids.C, ids.D], memberCallSid: 'CA00000002', outcome: '',
+      state: 'member_ringing', attemptNo: 2, memberId: ids.D, triedMemberIds: [ids.C, ids.D], memberCallSid: 'CA00000002',
     });
+    expect(store.record).not.toHaveProperty('outcome');
     expect(store.events.at(-1)).toEqual({ type: 'call.initiated', detail: { attempt: 2, memberId: ids.D } });
 
     // Everyone has now been tried: the third attempt has nobody left.

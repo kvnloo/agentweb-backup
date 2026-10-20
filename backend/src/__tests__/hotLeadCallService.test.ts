@@ -34,7 +34,7 @@ import { setLimitStoreForTests } from '../services/voice/limitStore';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
 import { FakeLeadCallStore } from './helpers/fakeLeadCallStore';
 import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
-import { teamMember, MEMBER_ID } from './helpers/hotLeadCallFixtures';
+import { teamMember, callRecord, MEMBER_ID } from './helpers/hotLeadCallFixtures';
 
 const mock = (fn: unknown) => fn as jest.Mock;
 const MEMBER_PHONE = '+14155550100';
@@ -336,7 +336,7 @@ describe('processHotLeadCallJob', () => {
   });
 
   it('never dials for a lead that already has a record, whatever the job key', async () => {
-    store.record = { state: 'member_ringing', jobKey: 'old', startedAt: NOW, updatedAt: NOW };
+    store.record = callRecord({ state: 'member_ringing', jobKey: 'old', startedAt: NOW, updatedAt: NOW });
     await processHotLeadCallJob(jobOf());
     await processHotLeadCallJob(jobOf({ submissionId: 'sub-2', submittedAt: NOW }));
     expect(provider.placedCalls).toHaveLength(0);
@@ -362,7 +362,7 @@ describe('processHotLeadCallJob', () => {
   });
 
   it('after a crash between create and placeCall the stuck dialing record blocks every re-run', async () => {
-    store.record = { state: 'dialing', jobKey: 'crashed', startedAt: NOW, updatedAt: NOW };
+    store.record = callRecord({ state: 'dialing', jobKey: 'crashed', startedAt: NOW, updatedAt: NOW });
     await processHotLeadCallJob(jobOf());
     await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
     expect(provider.placedCalls).toHaveLength(0);
@@ -593,7 +593,7 @@ describe('abuse limits (reservation)', () => {
   });
 
   it('gives every slot back when the lead loses store.create', async () => {
-    store.record = { state: 'member_ringing', jobKey: 'old', startedAt: NOW, updatedAt: NOW };
+    store.record = callRecord({ state: 'member_ringing', jobKey: 'old', startedAt: NOW, updatedAt: NOW });
     await processHotLeadCallJob(jobOf());
     expect(provider.placedCalls).toHaveLength(0);
     expect(slots()).toEqual({ counters: [0, 0], claims: 0 });

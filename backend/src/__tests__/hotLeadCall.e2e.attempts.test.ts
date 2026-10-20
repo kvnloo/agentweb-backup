@@ -117,8 +117,9 @@ describe('a member who does not take the lead hands over to the next one', () =>
     await noAnswer(1);
     expect(rungPhones()).toEqual([PHONE.c, PHONE.d]);
     expect(record()).toMatchObject({
-      state: 'member_ringing', attemptNo: 2, memberId: ID.d, triedMemberIds: [ID.c, ID.d], memberCallSid: 'CA00000002', outcome: '', meteredLegs: ['member:1'],
+      state: 'member_ringing', attemptNo: 2, memberId: ID.d, triedMemberIds: [ID.c, ID.d], memberCallSid: 'CA00000002', meteredLegs: ['member:1'],
     });
+    expect(record()).not.toHaveProperty('outcome');
     expect(nextJobs()).toHaveLength(1);
 
     const call = await connect(2);
@@ -385,11 +386,13 @@ describe('the world changes between two attempts', () => {
     await submitLead('lead-a');
     world.provider.failNextPlaceCall('unknown'); // the call may be live; its sid was never recorded
     await noAnswer(1);
-    expect(record()).toMatchObject({ state: 'dialing', attemptNo: 2, memberId: ID.d, memberCallSid: '', outcome: 'placement_unknown' });
+    expect(record()).toMatchObject({ state: 'dialing', attemptNo: 2, memberId: ID.d, outcome: 'placement_unknown' });
+    expect(record()).not.toHaveProperty('memberCallSid');
 
     // A late callback of attempt 1's call must not be taken for it.
     await nthCall(1).memberLegEnds('completed', '0', 4);
-    expect(record()).toMatchObject({ state: 'dialing', memberCallSid: '' });
+    expect(record()).toMatchObject({ state: 'dialing' });
+    expect(record()).not.toHaveProperty('memberCallSid');
 
     const call = nthCall(2);
     await call.memberAnswers();

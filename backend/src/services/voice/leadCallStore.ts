@@ -2,6 +2,7 @@ import { crmDb, ENGAGED_EVENT_KEYWORDS } from '../db';
 import { redactPhones } from './redactText';
 import type {
   HotLeadCallEventType,
+  HotLeadCallPatch,
   HotLeadCallRecord,
   HotLeadCallState,
   LeadCallStore,
@@ -67,13 +68,14 @@ class DynamoLeadCallStore implements LeadCallStore {
     return crmDb.createLeadSystemRecordOnce(listId, leadId, SYSTEM_KEY, {
       ...scalarFields(record),
       meteredLegs: [...new Set(record.meteredLegs ?? [])],
-      triedMemberIds: [...new Set(record.triedMemberIds ?? [])],
+      triedMemberIds: [...new Set(record.triedMemberIds)],
       lastSequence: { ...record.lastSequence },
     });
   }
 
   /**
-   * In `patch`, `meteredLegs` and `triedMemberIds` list the entries to ADD (a value already present fails the write) and `lastSequence` the entries to merge (not
+   * In `patch`, `clear` removes the named fields (a next attempt starts without the previous call sid and outcome),
+   * `meteredLegs` and `triedMemberIds` list the entries to ADD (a value already present fails the write) and `lastSequence` the entries to merge (not
    * replacements). `from` must name non-terminal states only; a terminal one makes it return false.
    * Consumer rule: because a terminal record is never revived, the webhook must meter a leg in the
    * same transition that makes the call terminal (or before it), never in a later one.
@@ -86,7 +88,7 @@ class DynamoLeadCallStore implements LeadCallStore {
     listId: string,
     leadId: string,
     from: HotLeadCallState[],
-    patch: Partial<HotLeadCallRecord> & { state: HotLeadCallState },
+    patch: HotLeadCallPatch,
   ): Promise<boolean> {
     // A terminal record is never revived: a caller bug that lists one in `from` is refused, not applied.
     if (from.length === 0 || from.some((s) => TERMINAL_STATES.includes(s))) return false;
@@ -94,6 +96,7 @@ class DynamoLeadCallStore implements LeadCallStore {
     return crmDb.updateLeadSystemRecordIf(listId, leadId, SYSTEM_KEY, {
       stateIn: from,
       set: { ...scalarFields(patch), updatedAt: new Date().toISOString() },
+      remove: patch.clear,
       maxIn: patch.lastSequence ? { lastSequence: patch.lastSequence } : undefined,
       appendNew: { meteredLegs: legs, triedMemberIds: [...new Set(patch.triedMemberIds ?? [])] },
     });
