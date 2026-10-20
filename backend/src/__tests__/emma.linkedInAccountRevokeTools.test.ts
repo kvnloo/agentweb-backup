@@ -68,6 +68,21 @@ describe('ENG-1153 LinkedIn revoke tools', () => {
     expect(r.removedFromAgentWeb).toBe(false);
   });
 
+  it('reports local cleanup failure after provider revocation and preserves final state', async () => {
+    deleteAccountById.mockRejectedValueOnce(new Error('local cleanup failed'));
+    const audit = jest.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const r = await emmaToolRegistry.execute('revoke_linkedin_account', { account_id: 'acc1', confirm: true }, ctx);
+      expect(r).toEqual(expect.objectContaining({
+        revoked: false, providerRevoked: true, removedFromAgentWeb: false,
+        localError: 'local cleanup failed', cancelledActions: ['s1', 's2'], notCancelled: [],
+      }));
+      expect(audit).toHaveBeenCalledWith(expect.stringContaining('[Audit][ENG-1153]'));
+    } finally {
+      audit.mockRestore();
+    }
+  });
+
   it('cannot touch an account not connected to the caller (cross-tenant)', async () => {
     const r = await emmaToolRegistry.execute('revoke_linkedin_account', { account_id: 'acc-other-tenant', confirm: true }, ctx);
     expect(r.revoked).toBe(false);

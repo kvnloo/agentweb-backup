@@ -137,8 +137,13 @@ emmaToolRegistry.register({
       providerError = err?.message || String(err);
     }
     // Keep the local record when provider revocation fails so a retry can find it.
+    let localError: string | undefined;
     if (providerRevoked) {
-      await deleteAccountById(userId, PLATFORM as any, accountId);
+      try {
+        await deleteAccountById(userId, PLATFORM as any, accountId);
+      } catch (err: any) {
+        localError = err?.message || String(err);
+      }
     }
 
     const after = await linkedInAccounts(userId);
@@ -158,6 +163,7 @@ emmaToolRegistry.register({
       accountId,
       providerRevoked,
       ...(providerError && { providerError }),
+      ...(localError && { localError }),
       removedFromAgentWeb: !stillConnected,
       cancelledActions: cancelled,
       notCancelled,
