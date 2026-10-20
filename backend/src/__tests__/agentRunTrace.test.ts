@@ -71,10 +71,10 @@ describe('buildAgentRunTrace', () => {
     const [step1, step2, step3] = trace.workPlan!.steps;
 
     expect(trace.setupCallIds).toEqual(['c1', 'c2', 'c3']);
-    expect(step1.callIds).toEqual(['c4']);
+    expect(step1.callIds).toEqual(['c4', 'c5']);
     expect(step1.statusCallId).toBe('c5');
     expect(step1.closedWithoutCalls).toBe(false);
-    expect(step2.callIds).toEqual(['c6', 'c7']);
+    expect(step2.callIds).toEqual(['c6', 'c7', 'c8']);
     expect(step3.callIds).toEqual([]);
     expect(step3.closedWithoutCalls).toBe(true);
     expect(trace.unassignedCallIds).toEqual(['c9']);
@@ -152,6 +152,91 @@ describe('buildAgentRunTrace', () => {
     expect(trace.finalResponse?.html).toBe('second answer');
     expect(trace.workPlan).toBeUndefined();
     expect(trace.unassignedCallIds).toEqual(['new']);
+  });
+
+  it('puts a status update that closes nothing into the current segment, so every call is shown once', () => {
+    index = 0;
+    const messages = [
+      assistantCalls(call('s1', 'set_work_plan_status', { updates: [{ stepCount: 1, status: 'in_progress' }] })),
+      toolResult('s1', 'set_work_plan_status', 'ok', '2026-10-14T10:00:01Z'),
+      assistantCalls(call('w1', 'load_data', {})),
+      toolResult('w1', 'load_data', 'rows', '2026-10-14T10:00:02Z'),
+      assistantCalls(call('s2', 'set_work_plan_status', { updates: [{ stepCount: 9, status: 'completed' }] })),
+      toolResult('s2', 'set_work_plan_status', '⚠️ Tool Error: set_work_plan_status\nReason: step 9 not found', '2026-10-14T10:00:03Z'),
+      assistantCalls(call('s3', 'set_work_plan_status', { updates: [{ stepCount: 1, status: 'completed' }] })),
+      toolResult('s3', 'set_work_plan_status', 'ok', '2026-10-14T10:00:04Z'),
+    ];
+    const session = { workPlan: { steps: [{ stepCount: 1, title: 'Load', status: 'completed' }] } };
+    const trace = buildAgentRunTrace({ sessionId: 's', session, messages });
+    const shown = [...trace.setupCallIds, ...trace.workPlan!.steps.flatMap((st) => st.callIds), ...trace.unassignedCallIds];
+
+    expect(trace.workPlan!.steps[0].callIds).toEqual(['s1', 'w1', 's2', 's3']);
+    expect(shown.sort()).toEqual(trace.calls.map((c) => c.id).sort());
+  });
+
+  it('pairs results with calls in order when a provider reuses a tool-call id', () => {
+    index = 0;
+    const messages = [
+      assistantCalls(call('call_0', 'load_data', { page: 1 })),
+      toolResult('call_0', 'load_data', '⚠️ Tool Error: load_data\nReason: timeout', '2026-10-14T10:00:01Z'),
+      assistantCalls(call('call_0', 'load_data', { page: 1 })),
+      toolResult('call_0', 'load_data', 'rows: 10', '2026-10-14T10:00:05Z'),
+    ];
+    const trace = buildAgentRunTrace({ sessionId: 's', messages });
+
+    expect(trace.calls.map((c) => [c.id, c.status])).toEqual([['call_0', 'failed'], ['call_0#2', 'succeeded']]);
+    expect(trace.calls[0]).toMatchObject({ error: 'timeout', recoveredByCallId: 'call_0#2' });
+    expect(trace.calls[1].result).toBe('rows: 10');
+  });
+
+  it('keeps back-to-back runs a second apart separate', () => {
+    index = 0;
+    const messages = [
+      row({ role: 'user', content: 'run A', metadata: { timestamp: '2026-10-14T10:00:00Z' } }),
+      assistantCalls(call('a1', 'load_data', {})),
+      toolResult('a1', 'load_data', 'A rows', '2026-10-14T10:00:08Z'),
+      row({ role: 'assistant', content: 'A done' }),
+      row({ role: 'user', content: 'run B', metadata: { timestamp: '2026-10-14T10:00:11Z' } }),
+      assistantCalls(call('b1', 'load_data', {})),
+      toolResult('b1', 'load_data', 'B rows', '2026-10-14T10:00:12Z'),
+      row({ role: 'assistant', content: 'B done' }),
+    ];
+    const a = buildAgentRunTrace({ sessionId: 's', messages, startedAt: '2026-10-14T10:00:00Z', completedAt: '2026-10-14T10:00:10Z' });
+    const b = buildAgentRunTrace({ sessionId: 's', messages, startedAt: '2026-10-14T10:00:11Z', completedAt: '2026-10-14T10:00:13Z' });
+
+    expect([a.ask?.text, a.calls.map((c) => c.id), a.followUpAsks, a.finalResponse?.html]).toEqual(['run A', ['a1'], [], 'A done']);
+    expect([b.ask?.text, b.calls.map((c) => c.id), b.finalResponse?.html]).toEqual(['run B', ['b1'], 'B done']);
+  });
+
+  it('says when the plan shown is the session current one because the session ran again later', () => {
+    index = 0;
+    const messages = [
+      row({ role: 'user', content: 'first', metadata: { timestamp: '2026-10-14T09:00:00Z' } }),
+      row({ role: 'assistant', content: 'first done' }),
+      row({ role: 'user', content: 'second', metadata: { timestamp: '2026-10-14T12:00:00Z' } }),
+      row({ role: 'assistant', content: 'second done' }),
+    ];
+    const session = { workPlan: { steps: [{ stepCount: 1, title: 'Replanned', status: 'completed' }] } };
+    const early = buildAgentRunTrace({ sessionId: 's', session, messages, startedAt: '2026-10-14T09:00:00Z', completedAt: '2026-10-14T09:00:30Z' });
+    const late = buildAgentRunTrace({ sessionId: 's', session, messages, startedAt: '2026-10-14T12:00:00Z', completedAt: '2026-10-14T12:00:30Z' });
+
+    expect(early.workPlanScope).toBe('session');
+    expect(early.finalResponse?.html).toBe('first done');
+    expect(late.workPlanScope).toBe('run');
+  });
+
+  it('reads older rows that have no message wrapper', () => {
+    const messages = [
+      { messageIndex: 0, role: 'user', content: 'old ask', metadata: { timestamp: '2026-10-14T10:00:00Z' } },
+      { messageIndex: 1, role: 'assistant', content: '', tool_calls: [{ id: 'o1', function: { name: 'load_data', arguments: '{}' } }] },
+      { messageIndex: 2, role: 'tool', tool_call_id: 'o1', content: 'rows' },
+      { messageIndex: 3, role: 'assistant', content: 'old reply' },
+    ] as unknown as TraceMessageRow[];
+    const trace = buildAgentRunTrace({ sessionId: 's', messages });
+
+    expect(trace.ask?.text).toBe('old ask');
+    expect(trace.calls.map((c) => [c.id, c.status])).toEqual([['o1', 'succeeded']]);
+    expect(trace.finalResponse?.html).toBe('old reply');
   });
 
   it('caps large results and degrades every result when the run is over budget', () => {

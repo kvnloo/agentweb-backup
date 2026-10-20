@@ -231,7 +231,7 @@ describe('GET /api/admin/agent-runs/trace', () => {
     expect(res.status).toBe(200);
     expect(mockQuery).toHaveBeenCalledTimes(2);
     expect(mockQuery.mock.calls[1][0].ExclusiveStartKey).toEqual({ sessionId: 's1', messageIndex: 1 });
-    expect(res.body.trace.workPlan.steps[0].callIds).toEqual(['c1']);
+    expect(res.body.trace.workPlan.steps[0].callIds).toEqual(['c1', 'c2']);
     expect(res.body.trace.calls.map((c: { id: string }) => c.id)).toEqual(['c1', 'c2']);
     expect(res.body.trace.finalResponse.html).toBe('Done.');
     expect(res.body.trace.messagesTruncated).toBe(false);

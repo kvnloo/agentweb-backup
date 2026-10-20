@@ -349,6 +349,13 @@ describe("AgentRunsInspector", () => {
     expect(screen.getByText("bug")).toBeInTheDocument();
   });
 
+  it("warns when the plan shown is the session's current one", async () => {
+    respond([run()], { trace: { ...TRACE, workPlanScope: "session" } });
+    renderAt("/agent-runs?sessionId=session-1");
+
+    expect(await screen.findByText(/This session ran again after this run/)).toBeInTheDocument();
+  });
+
   it("falls back to the chat summary when the trace cannot be loaded", async () => {
     mockedAxios.get.mockImplementation((url: string) =>
       url.includes("/trace")
