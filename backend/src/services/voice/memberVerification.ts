@@ -1,6 +1,5 @@
 import crypto from 'crypto';
 import { orgDb, type Organization } from '../db';
-import { getJwtSecret } from '../../config/jwt';
 import { hotLeadCallConfigOf, maskPhone, MEMBER_ID, HOT_LEAD_CALL_MAX_TEAM_SIZE, type HotLeadCallConfig, type HotLeadCallMember } from '../hotLeadCallConfig';
 import { isRecord } from '../leadNotificationAttribution';
 import {
@@ -10,6 +9,7 @@ import { getVoiceProvider, VoiceCallError } from './voiceProvider';
 import { recordCallUsage } from './voiceUsage';
 import { verificationCodeTwiml } from './twiml';
 import { isConditionalFailure, unchangedSince } from './setupWrites';
+import { keyedDigest } from './keyedDigest';
 
 /**
  * Phone verification of a team member for the hot-lead auto-call (ENG-2271).
@@ -45,7 +45,7 @@ const CALL_TIMEOUT_SECONDS = 30;
  */
 const VERIFICATION_CALL_ESTIMATED_SECONDS = 60;
 
-export interface MemberVerification {
+interface MemberVerification {
   /** E.164 phone the code was issued for; a code is worthless once the member's phone differs. */
   phone: string;
   /** Hex HMAC-SHA256 of the code. Null once verified or cleared: only the start history remains. */
@@ -126,7 +126,7 @@ export function verificationAfterTeamEdit(raw: unknown, team: ReadonlyArray<Pick
 function hashCode(orgId: string, memberId: string, phone: string, code: string): string {
   // The label keeps this MAC from ever colliding with another use of the same secret; binding the member
   // means a code heard by one person cannot confirm another's phone.
-  return crypto.createHmac('sha256', getJwtSecret()).update(`hlc-verify-v2|${orgId}|${memberId}|${phone}|${code}`).digest('hex');
+  return keyedDigest('hlc-verify-v2', orgId, memberId, phone, code);
 }
 
 const minutes = (ms: number) => Math.ceil(ms / 60_000);
@@ -136,7 +136,7 @@ const seconds = (ms: number) => Math.max(1, Math.ceil(ms / 1000));
  * Which member a verification call is about. Without a memberId the only member is meant; on a larger team the
  * caller must say which one, because verifying the wrong person's phone would let an unverified number be rung.
  */
-export function memberToVerify(config: HotLeadCallConfig, memberId?: string): HotLeadCallMember {
+function memberToVerify(config: HotLeadCallConfig, memberId?: string): HotLeadCallMember {
   if (memberId === undefined) {
     if (config.team.length > 1) throw new ValidationError('Several team members are set up: say which one to verify (memberId).');
     return config.team[0];

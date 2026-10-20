@@ -1,8 +1,8 @@
-import { createHmac, randomUUID } from 'crypto';
-import { getJwtSecret } from '../../config/jwt';
+import { randomUUID } from 'crypto';
 import { localParts } from '../dripSendWindow';
 import { hhmmToMinutes, type HotLeadCallConfig } from '../hotLeadCallConfig';
 import { getLimitStore } from './limitStore';
+import { keyedDigest } from './keyedDigest';
 
 // 'in_progress': this same lead already holds the phone marker, so another dispatch of it is placing the call.
 type LimitDenial = 'duplicate_phone' | 'in_progress' | 'org_hourly_cap' | 'org_daily_cap';
@@ -40,8 +40,7 @@ export function isWithinCallWindow(callingHours: HotLeadCallConfig['callingHours
 // server secret (the repo's pattern for tokens, see unsubscribeUrl.ts) so a leaked table cannot be reversed by
 // hashing the ~10^10 US numbers. Rotating JWT_SECRET only forgets the 24h window, which errs towards one extra call.
 export function phoneMarkerKey(orgId: string, phoneE164: string): string {
-  const digest = createHmac('sha256', getJwtSecret()).update(`hot_lead_call.phone\0${orgId}\0${phoneE164}`).digest('hex');
-  return `hlc#phone#${digest}`;
+  return `hlc#phone#${keyedDigest('hot_lead_call.phone', orgId, phoneE164)}`;
 }
 // Per member, not per org: two team members can take two leads at once, while one member is not rung twice in a row.
 export const cooldownKey = (orgId: string, memberId: string): string => `hlc#cool#${orgId}#${memberId}`;

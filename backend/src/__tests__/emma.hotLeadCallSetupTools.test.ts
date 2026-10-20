@@ -535,7 +535,7 @@ describe('start_hot_lead_call_verification', () => {
   it('hashes the code under a labelled HMAC bound to org, phone and code (known answer)', async () => {
     jest.spyOn(crypto, 'randomInt').mockImplementation((() => 123456) as unknown as typeof crypto.randomInt);
     await start();
-    const expected = crypto.createHmac('sha256', 'test-secret-not-real').update('hlc-verify-v2|org-a|maaaaaaa|+14155550100|123456').digest('hex');
+    const expected = crypto.createHmac('sha256', 'test-secret-not-real').update('hlc-verify-v2\x00org-a\x00maaaaaaa\x00+14155550100\x00123456').digest('hex');
     expect(org.hotLeadCallVerification!.members[MEMBER_ID].codeHash).toBe(expected);
   });
   it('two simultaneous starts place exactly one call', async () => {
