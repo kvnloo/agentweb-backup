@@ -82,6 +82,11 @@ interface SubscriptionType {
     usageCreditMicroUsd: number;
     baseSeats: number;
   };
+  /** ENG-668: pay-as-you-go overage tier config. Not editable here yet; carried through on save. */
+  paygOverage?: {
+    allowed: boolean;
+    markupBps: number;
+  };
 }
 
 interface AvailableFeature {
@@ -557,6 +562,9 @@ const SubscriptionTypesTab: React.FC = () => {
         ...(llmUsagePolicy ? { llmUsagePolicy } : {}),
         ...(llmUsageTopUp ? { llmUsageTopUp } : {}),
         ...(seatPricing ? { seatPricing } : {}),
+        // ENG-668: this form has no pay-as-you-go fields, and the tier is rebuilt from the form, so
+        // keep what the tier already has instead of dropping it on every edit.
+        ...(editingType?.paygOverage ? { paygOverage: editingType.paygOverage } : {}),
       };
 
       let updatedTypes = [...subscriptionTypes];

@@ -110,6 +110,42 @@ export function getLlmUsageCreditAdjustment(
   };
 }
 
+/**
+ * Grant-id prefix of the monthly seat credit (`orgSeatCreditGrantService.seatCreditGrantId`). Seat credit
+ * is ledgered as `source: 'purchase'` like a top-up, so the id is what tells the two apart.
+ */
+export const SEAT_CREDIT_GRANT_ID_PREFIX = 'seat-credit:';
+
+/**
+ * ENG-668: purchased credit in this month's ledger that a refund or dispute can still take back — the
+ * additional-usage top-ups (`source: 'purchase'`, every id except the seat credit's), net of their
+ * reversals. Seat credit, admin grants and migration offsets are not counted: nothing revokes them
+ * mid-month.
+ *
+ * The PAYG pool high-water mark is recorded WITHOUT this amount, so a top-up counts toward the pool only
+ * while it is live: refunded or disputed, it stops extending the pool instead of staying behind in the
+ * mark as unbilled capacity. A ledger whose purchase total is not itemised by grant counts all of its net
+ * purchase as revocable, which only ever keeps the mark lower.
+ */
+export function getRevocablePurchasedCreditMicroUsd(
+  ledger: MonthlyLlmUsageCredits | null | undefined,
+  month = getCurrentUsageMonth(),
+): number {
+  if (!ledger || ledger.month !== month) return 0;
+  const purchasedNet = getLlmUsageCreditAdjustment(ledger, month).purchasedMicroUsd;
+  const purchaseGrants = (ledger.grants || []).filter((grant) => grant.source === 'purchase');
+  const itemisedTotal = purchaseGrants.reduce((sum, grant) => sum + Math.max(0, Math.round(grant.amountMicroUsd || 0)), 0);
+  if (itemisedTotal !== Math.round(ledger.totalPurchasedMicroUsd || 0)) return purchasedNet;
+  const reversedByGrant = new Map<string, number>();
+  for (const reversal of ledger.reversals || []) {
+    reversedByGrant.set(reversal.grantId, (reversedByGrant.get(reversal.grantId) || 0) + Math.max(0, Math.round(reversal.amountMicroUsd || 0)));
+  }
+  const revocable = purchaseGrants
+    .filter((grant) => !grant.id.startsWith(SEAT_CREDIT_GRANT_ID_PREFIX))
+    .reduce((sum, grant) => sum + Math.max(0, Math.round(grant.amountMicroUsd || 0) - (reversedByGrant.get(grant.id) || 0)), 0);
+  return Math.min(purchasedNet, revocable);
+}
+
 export function applyLlmUsageCredits(input: {
   rawCostUsedMicroUsd: number;
   hardThresholdMicroUsd: number;

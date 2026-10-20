@@ -25,6 +25,7 @@
  */
 
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
+import { runwayAllowance } from "./llmUsageRunwayResolverService";
 import { contentAuthorityOver } from "./orgContentAuthority";
 import {
   readBilledLedgerRows,
@@ -390,9 +391,12 @@ export async function previewUsageRunway(
     observedByDate.set(r.date, (observedByDate.get(r.date) || 0) + r.costMicroUsd);
   }
 
+  // ENG-668: the same allowance /usage-runway forecasts against (the PAYG month pool when admitting).
+  const { hardThresholdMicroUsd, paygCovering } = runwayAllowance({ ...usage, policy: usage.policy });
   const forecastInput = {
     costUsedMicroUsd: usage.costUsedMicroUsd,
-    hardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd,
+    hardThresholdMicroUsd,
+    ...(paygCovering ? { paygCovering: true } : {}),
     cycleStartDate,
     cycleResetDate,
     today,
@@ -521,9 +525,12 @@ export async function resolveUsageDrivers(
     observedByDate.set(r.date, (observedByDate.get(r.date) || 0) + r.costMicroUsd);
   }
   const dailyCostMicroUsd = [...observedByDate.entries()].map(([date, costMicroUsd]) => ({ date, costMicroUsd }));
+  // ENG-668: the same allowance /usage-runway forecasts against (the PAYG month pool when admitting).
+  const allowance = runwayAllowance({ ...usage, policy: usage.policy });
   const baseline = computeUsageRunway({
     costUsedMicroUsd: usage.costUsedMicroUsd,
-    hardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd,
+    hardThresholdMicroUsd: allowance.hardThresholdMicroUsd,
+    ...(allowance.paygCovering ? { paygCovering: true } : {}),
     dailyCostMicroUsd,
     cycleStartDate,
     cycleResetDate,
@@ -681,7 +688,8 @@ export async function resolveUsageDrivers(
       // combined one can never be computed on different bases.
       const projected = computeUsageRunway({
         costUsedMicroUsd: usage.costUsedMicroUsd,
-        hardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd,
+        hardThresholdMicroUsd: allowance.hardThresholdMicroUsd,
+        ...(allowance.paygCovering ? { paygCovering: true } : {}),
         dailyCostMicroUsd: counterfactualDaily(ledger, observedByDate, [
           { fromModel: driver.key, toModel: candidate },
         ]),

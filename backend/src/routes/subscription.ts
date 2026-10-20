@@ -22,6 +22,7 @@ import { resolveBillingUserId, toCustomerTokenUsage } from '../services/tokenUsa
 import { readBilledLedgerRows } from '../services/llmUsageLedgerReader';
 import { readItemizationChargeEvents } from '../services/ledgerItemizationReader';
 import { reconcileItemizedUsage } from '../services/usageItemization';
+import { getPaygOverageView, updatePaygOverage, PaygOverageRequestError } from '../services/paygOverageService';
 
 const router = express.Router();
 
@@ -44,6 +45,48 @@ router.get('/usage', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Error getting token usage:', error);
     res.status(500).json({ error: 'Failed to get token usage' });
+  }
+});
+
+/**
+ * ENG-668 — pay-as-you-go overage settings for the caller's usage pool.
+ *
+ * Same authentication as `/usage`. Anyone on the pool may read it; only the billing owner
+ * (`resolveBillingUserId(caller) === caller`) may change it — an org member who pools onto the owner
+ * gets 403, a member paying for their own plan owns their own pool. Percentages only: the cap and the
+ * overage in dollars never leave the server.
+ */
+router.get('/payg', authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as any).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+    return res.json(await getPaygOverageView(userId));
+  } catch (error) {
+    console.error('Error getting pay-as-you-go settings:', error);
+    return res.status(500).json({ error: 'Failed to get pay-as-you-go settings' });
+  }
+});
+
+router.put('/payg', authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as any).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+    const { enabled, capPercentOfPool } = req.body || {};
+    return res.json(await updatePaygOverage({
+      userId,
+      // A delegated admin acts AS the customer (req.user is the customer): record who actually did it,
+      // and let the service refuse consent that only the customer can give.
+      actorId: (req as any).delegateInfo?.adminUserId || userId,
+      isDelegated: (req as any).delegateInfo?.isDelegated === true,
+      enabled,
+      capPercentOfPool,
+    }));
+  } catch (error) {
+    if (error instanceof PaygOverageRequestError) {
+      return res.status(error.status).json({ error: error.code, message: error.message });
+    }
+    console.error('Error updating pay-as-you-go settings:', error);
+    return res.status(500).json({ error: 'Failed to update pay-as-you-go settings' });
   }
 });
 
