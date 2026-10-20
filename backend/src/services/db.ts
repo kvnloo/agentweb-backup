@@ -868,8 +868,8 @@ export interface Organization {
   modelRoles?: import('./modelRoles').ModelRoles;
   leadNotifications?: LeadNotificationsConfig;
   hotLeadCall?: import('./hotLeadCallConfig').HotLeadCallConfig;
-  /** System-managed pending destination-phone verification (hash only); see services/voice/destinationVerification.ts. */
-  hotLeadCallVerification?: import('./voice/destinationVerification').HotLeadCallVerification;
+  /** System-managed pending destination-phone verification (hash only); see services/voice/memberVerification.ts. */
+  hotLeadCallVerification?: import('./voice/memberVerification').HotLeadCallVerification;
   /** System-managed purchase/release history (cost caps); same family as hotLeadCallVerification, see services/voice/numberProvisioning.ts. */
   hotLeadCallProvisioning?: import('./voice/numberProvisioning').HotLeadCallProvisioning;
   /**

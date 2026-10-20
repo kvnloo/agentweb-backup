@@ -35,7 +35,7 @@ const NEW_SID_2 = 'PN' + 'd'.repeat(32);
 const NEW_NUMBER = '+14155550123';
 const NEW_NUMBER_2 = '+14155550124';
 
-let org: Record<string, unknown> & { orgId: string; hotLeadCall?: Record<string, unknown>; hotLeadCallVerification?: Record<string, unknown> };
+let org: Record<string, unknown> & { orgId: string; hotLeadCall?: Record<string, unknown>; hotLeadCallVerification?: { members: Record<string, Record<string, unknown> & { startedAt: number[] }>; orgStartedAt: number[] } };
 let fake: FakeVoiceProvider;
 let writes: Array<{ updates: Record<string, unknown>; condition?: { expression: string } }>;
 let beforeWrite: ((index: number) => void) | null;
@@ -460,12 +460,14 @@ describe('start_hot_lead_call_verification', () => {
     expect(call).not.toHaveProperty('statusCallbackUrl');
     const code = codeFromCall();
     expect(call.twiml).toMatch(/^<\?xml version="1\.0" encoding="UTF-8"\?><Response><Pause length="1"\/><Say>Your Agent Web verification code is (\d \d \d \d \d \d)\. Again, your code is \1\. Goodbye\.<\/Say><\/Response>$/);
-    const record = org.hotLeadCallVerification!;
+    expect(Object.keys(org.hotLeadCallVerification!.members)).toEqual([MEMBER_ID]);
+    expect(org.hotLeadCallVerification!.orgStartedAt).toEqual([T0]);
+    const record = org.hotLeadCallVerification!.members[MEMBER_ID];
     expect(record).toMatchObject({ phone: '+14155550100', expiresAt: T0 + 10 * MIN, attempts: 0, callSid: 'CA00000001', startedAt: [T0] });
     expect(record.codeHash).toMatch(/^[0-9a-f]{64}$/);
     expect(Object.keys(record).sort()).toEqual(['attempts', 'callSid', 'codeHash', 'expiresAt', 'phone', 'startedAt']);
     expect(Object.values(record)).not.toContain(code);
-    expect(result).toMatchObject({ success: true, memberId: MEMBER_ID, memberPhone: '***0100', expiresInMinutes: 10, maxAttempts: 5 });
+    expect(result).toMatchObject({ success: true, memberId: MEMBER_ID, memberPhone: '***0100', expiresInSeconds: 600, nextStartAllowedInSeconds: 120, startsLeftToday: 4, maxAttempts: 5 });
     expect(writes.every(w => !!w.condition?.expression)).toBe(true);
   });
   it('never returns or logs the code, or full phone numbers', async () => {
@@ -513,7 +515,7 @@ describe('start_hot_lead_call_verification', () => {
     await expect(start()).rejects.toThrow('limit of 5');
     setTime(T0 + 24 * 60 * MIN);
     await expect(start()).resolves.toMatchObject({ success: true });
-    expect(org.hotLeadCallVerification!.startedAt).toHaveLength(5);
+    expect(org.hotLeadCallVerification!.members[MEMBER_ID].startedAt).toHaveLength(5);
   });
   it('a restart replaces the code and resets attempts, but not the rate history', async () => {
     await start();
@@ -521,7 +523,7 @@ describe('start_hot_lead_call_verification', () => {
     await expect(confirm(wrongCode(first))).rejects.toThrow('not correct');
     setTime(T0 + 3 * MIN);
     await start();
-    expect(org.hotLeadCallVerification).toMatchObject({ attempts: 0, startedAt: [T0, T0 + 3 * MIN], expiresAt: T0 + 13 * MIN });
+    expect(org.hotLeadCallVerification!.members[MEMBER_ID]).toMatchObject({ attempts: 0, startedAt: [T0, T0 + 3 * MIN], expiresAt: T0 + 13 * MIN });
   });
   it('fails closed on a corrupt stored record instead of replacing it (which would reset the limits)', async () => {
     org.hotLeadCallVerification = { garbage: true };
@@ -532,8 +534,8 @@ describe('start_hot_lead_call_verification', () => {
   it('hashes the code under a labelled HMAC bound to org, phone and code (known answer)', async () => {
     jest.spyOn(crypto, 'randomInt').mockImplementation((() => 123456) as unknown as typeof crypto.randomInt);
     await start();
-    const expected = crypto.createHmac('sha256', 'test-secret-not-real').update('hlc-verify-v1|org-a|+14155550100|123456').digest('hex');
-    expect(org.hotLeadCallVerification!.codeHash).toBe(expected);
+    const expected = crypto.createHmac('sha256', 'test-secret-not-real').update('hlc-verify-v2|org-a|maaaaaaa|+14155550100|123456').digest('hex');
+    expect(org.hotLeadCallVerification!.members[MEMBER_ID].codeHash).toBe(expected);
   });
   it('two simultaneous starts place exactly one call', async () => {
     const results = await Promise.allSettled([start(), start()]);
@@ -575,7 +577,7 @@ describe('confirm_hot_lead_call_verification', () => {
     setTime(T0 + MIN);
     const result = await confirm(code);
     expect(org.hotLeadCall).toEqual(withNumber({ team: [teamMember('+14155550100', { verifiedAt: new Date(T0 + MIN).toISOString() })] }));
-    expect(org.hotLeadCallVerification).toEqual({ phone: '+14155550100', codeHash: null, expiresAt: 0, attempts: 0, startedAt: [T0] });
+    expect(org.hotLeadCallVerification).toEqual({ members: { [MEMBER_ID]: { phone: '+14155550100', codeHash: null, expiresAt: 0, attempts: 0, startedAt: [T0] } }, orgStartedAt: [T0] });
     expect(result).toMatchObject({ success: true, memberVerified: true, memberId: MEMBER_ID, memberPhone: '***0100', verifiedAt: new Date(T0 + MIN).toISOString() });
     expect(JSON.stringify(result)).not.toMatch(/4155550100/);
     expect(JSON.stringify(result)).not.toContain(code);
@@ -619,7 +621,7 @@ describe('confirm_hot_lead_call_verification', () => {
     const code = codeFromCall();
     const record = clone(org.hotLeadCallVerification);
     org.hotLeadCall = withNumber({ phone: '+16475550123' });
-    org.hotLeadCallVerification = { ...record, phone: '+16475550123' };
+    org.hotLeadCallVerification = { ...record, members: { [MEMBER_ID]: { ...record.members[MEMBER_ID], phone: '+16475550123' } } };
     await expect(confirm(code)).rejects.toThrow('not correct');
     org.hotLeadCall = withNumber();
     org.hotLeadCallVerification = clone(record);
@@ -653,7 +655,7 @@ describe('confirm_hot_lead_call_verification', () => {
     await start();
     const code = codeFromCall();
     const results = await Promise.allSettled([confirm(wrongCode(code)), confirm(wrongCode(code)), confirm(wrongCode(code))]);
-    expect(org.hotLeadCallVerification!.attempts).toBe(1);
+    expect(org.hotLeadCallVerification!.members[MEMBER_ID].attempts).toBe(1);
     expect(results.filter(r => r.status === 'rejected' && /Another confirmation/.test(r.reason.message))).toHaveLength(2);
   });
   it('expires exactly at expiresAt: valid 1ms before, rejected at the boundary', async () => {
@@ -756,7 +758,7 @@ describe('verification on a team of several members', () => {
   it('does not let a code sent to one member verify another', async () => {
     await start({ memberId: SECOND_ID });
     const code = codeFromCall();
-    await expect(confirm(code, undefined, MEMBER_ID)).rejects.toThrow('different phone');
+    await expect(confirm(code, undefined, MEMBER_ID)).rejects.toThrow('No verification is in progress');
     expect(teamOf().every(m => m.verifiedAt === undefined)).toBe(true);
   });
 });
