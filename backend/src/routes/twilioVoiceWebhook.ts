@@ -3,14 +3,16 @@
  * with no auth middleware: Twilio is the caller, and every request proves itself with X-Twilio-Signature.
  *
  * Call shape: Twilio rings a team member (placed by the orchestrator) -> /owner prompts "press 1" ->
- * /gather bridges to the lead with <Dial><Number> -> /dial reports how the bridge ended. /status
- * receives the per-leg call-progress callbacks and is the ONLY place usage is metered.
+ * /gather dials the lead with <Dial><Number url=/screen> -> the lead answers and /screen asks them to press 1
+ * -> /screen-result (a digit of 1 lets Twilio bridge the two calls) -> /dial reports how the bridge ended
+ * (DialBridged tells a conversation from a lead who screened themselves out). /status receives the per-leg
+ * call-progress callbacks and is the ONLY place usage is metered.
  *
  * Every endpoint runs the same guard: credentials loaded (else 503) -> signature over
  * the URL rebuilt from BACKEND_URL (else 401) -> strict query shape -> record + jobKey + CallSid match.
  * The body is parsed by a local 64kb flat-form parser first, whatever its content type; one that is too large
  * or unreadable is answered 413/400 there and never reaches the app's global error handler.
- * A TwiML endpoint (/owner, /gather, /dial) answers a request that passes the signature but does not
+ * A TwiML endpoint (/owner, /gather, /screen, /screen-result, /dial) answers a request that passes the signature but does not
  * belong to a live call with a bare hangup and HTTP 200 (so Twilio does not retry), writing nothing.
  * /status answers such a request with an empty 200; it answers 500 only when a leg ended but nobody
  * can be found to bill or metering lost its race repeatedly (nothing partial is written), or on an unexpected
@@ -22,12 +24,17 @@
  * (with memberCallSid) afterwards; if that move has not landed yet, /owner and the member /status adopt
  * the CallSid from the signed callback (same jobKey only) and move the record to member_ringing themselves,
  * so the orchestrator's late settle (from 'dialing') loses. One record per lead, ever.
- *   dialing/member_ringing -> member_answered (/owner) -> bridging (/gather, digit 1) -> connected (lead answered)
- *   -> finished (last leg's final /status).
+ *   dialing/member_ringing -> member_answered (/owner) -> bridging (/gather, digit 1) -> connected (the lead
+ *   pressed 1 at /screen-result, or /dial reports DialBridged=true) -> finished (last leg's final /status).
+ * A member leg that ends without the member taking the lead (declined, ignored the prompt, no answer, busy,
+ * failed, canceled) is metered and moves the record to between_attempts in ONE transition; the next-attempt
+ * seam is then asked for another member, and when it refuses the record finishes. Only the CURRENT attempt's
+ * member leg (body CallSid === record.memberCallSid) is acted on; a callback for an earlier attempt's sid is
+ * acknowledged and writes nothing, because that attempt was metered before the next one could start.
  * A terminal record can no longer be written, so a leg is metered (meteredLegs) while the record is still
  * live, and the LAST leg to be metered performs the terminal transition. If a leg's final callback never
- * arrives the record stays non-terminal: records stuck in bridging/connected need an ops cleanup
- * (no cron is added here).
+ * arrives the record stays non-terminal: records stuck in bridging/connected/between_attempts need an ops
+ * cleanup (no cron is added here).
  *
  * The URL paths keep their original names: /owner now serves the prompt to the team member being rung.
  *
@@ -45,8 +52,12 @@ import { resolveHotLeadCallContext, type HotLeadCallContext } from '../services/
 import { getLeadCallStore } from '../services/voice/leadCallStore';
 import type { HotLeadCallEventType, HotLeadCallLeg, HotLeadCallRecord, HotLeadCallState, MeteredLeg } from '../services/voice/leadCallStore.types';
 import { recordCallUsage } from '../services/voice/voiceUsage';
-import { connectTwiml, hangupTwiml, leadUnreachableTwiml, memberPromptTwiml } from '../services/voice/twiml';
+import {
+  bridgeTwiml, connectTwiml, hangupTwiml, leadDeclinedTwiml, leadPhoneChangedTwiml, leadScreenTwiml, leadUnreachableTwiml, memberPromptTwiml,
+} from '../services/voice/twiml';
+import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
 import { callableLeadPhone } from '../services/hotLeadCallConfig';
+import { requestNextHotLeadCallAttempt } from '../services/hotLeadCallAttempts';
 
 // type: () => true so a JSON or other content type is limited and parsed here too, instead of falling
 // through to the global 50mb express.json (the same trick as the unipile and tracker parsers).
@@ -82,11 +93,15 @@ const QUERY_KEYS = new Set(['listId', 'leadId', 'jobKey', 'leg']);
 const LIVE_STATES: HotLeadCallState[] = ['dialing', 'member_ringing', 'member_answered', 'bridging', 'connected'];
 const TERMINAL_CALL_STATUSES = new Set(['completed', 'busy', 'no-answer', 'failed', 'canceled']);
 const LEAD_NOT_REACHED = new Set(['no-answer', 'busy', 'failed']);
-const LEAD_REACHED = new Set(['completed', 'answered']);
+const DIAL_ENDED_AFTER_ANSWER = new Set(['completed', 'answered']);
+// Outcomes that belong to a member's own attempt. They are stale once a later attempt has the member on the line.
+const MEMBER_OUTCOMES = new Set(['member_declined', 'member_no_answer']);
 const MAX_TRANSITION_ATTEMPTS = 3;
 
 // Marker entries in `lastSequence` that make a decision first-writer-wins: see HotLeadCallRecord.lastSequence.
-const decisionKey = (memberSid: string, step: 'gather' | 'dial'): string => `${memberSid}#${step}`;
+const decisionKey = (callSid: string, step: 'gather' | 'dial' | 'screen'): string => `${callSid}#${step}`;
+// Written together with leadCallSid by /screen: the first writer wins the right to name the lead leg.
+const LEAD_SID_ADOPTED = 'lead#adopt';
 /** `meteredLegs` entry of a leg: member legs are numbered by attempt ('member:1'), the lead leg is 'lead'. */
 const meteredLegOf = (leg: HotLeadCallLeg, record: HotLeadCallRecord): MeteredLeg =>
   leg === 'lead' ? 'lead' : `member:${record.attemptNo ?? 1}`;
@@ -308,6 +323,15 @@ router.post('/gather', guarded(async (_req, res, q, body) => {
     return sendXml(res, leadUnreachableTwiml());
   }
 
+  // The call was approved for the phone that passed the gates. A repeat submission can overwrite lead.phone
+  // afterwards, so the live number must still be that one.
+  if (record.leadPhoneMac && record.leadPhoneMac !== leadPhoneMacOf(ctx.orgId, leadE164)) {
+    if (await store.transition(q.listId, q.leadId, ['member_answered'], { state: 'member_answered', outcome: 'lead_phone_changed', lastSequence: decision })) {
+      await store.addEvent(q.listId, q.leadId, 'call.failed', { reason: 'lead_phone_changed' });
+    }
+    return sendXml(res, leadPhoneChangedTwiml());
+  }
+
   // Built before the transition so that a builder that throws cannot leave the record 'bridging' with
   // the member hung up.
   const connect = connectTwiml({
@@ -315,10 +339,72 @@ router.post('/gather', guarded(async (_req, res, q, body) => {
     leadE164,
     dialUrl: buildVoiceWebhookUrl('dial', q),
     statusUrl: buildVoiceWebhookUrl('status', q, { leg: 'lead' }),
+    screenUrl: buildVoiceWebhookUrl('screen', q),
   });
   // Only the winner dials the lead; a replayed "1" gets a hangup instead of a second bridge.
   if (!(await store.transition(q.listId, q.leadId, ['member_answered'], { state: 'bridging', lastSequence: decision }))) return sendHangup(res);
+  if (!record.leadPhoneMac) console.warn('[twilio-voice] call record has no leadPhoneMac (created before the check existed): lead phone not compared');
   sendXml(res, connect);
+}, twimlReplies));
+
+// ── /screen and /screen-result: the lead must confirm before the two calls are bridged ──────────
+
+// Both run on the lead's leg, after the lead answers the <Number> and before the parties are connected. The
+// request parameters of that leg are not documented, so these endpoints are identified only by the signed
+// query ids plus the record state, and the body CallSid is taken to be the lead leg's.
+
+router.post('/screen', guarded(async (_req, res, q, body) => {
+  const record = await loadRecord(q);
+  const sid = sidOf(body, 'CallSid');
+  // The member's own sid here would mean the request is not on the lead's leg: never adopt it as the lead's.
+  if (!record?.memberCallSid || !sid || sid === record.memberCallSid || record.state !== 'bridging') return sendHangup(res);
+
+  const store = getLeadCallStore();
+  let current = record;
+  if (!current.leadCallSid) {
+    // First writer names the lead leg; a Twilio retry of the same request finds its own sid and is served again.
+    await store.transition(q.listId, q.leadId, ['bridging'], { state: 'bridging', leadCallSid: sid, lastSequence: { [LEAD_SID_ADOPTED]: 1 } });
+    current = (await store.get(q.listId, q.leadId)) ?? record;
+  }
+  if (current.leadCallSid !== sid || current.state !== 'bridging') return sendHangup(res);
+
+  const ctx = await liveContext(q, current);
+  if (!ctx) {
+    // Shares the dial marker, so /dial's own outcome cannot relabel an abort as a decline.
+    if (await store.transition(q.listId, q.leadId, ['bridging'], {
+      state: 'bridging', outcome: 'aborted', lastSequence: { [decisionKey(record.memberCallSid, 'dial')]: 1 },
+    })) {
+      await store.addEvent(q.listId, q.leadId, 'call.failed', { reason: 'aborted' });
+    }
+    return sendHangup(res);
+  }
+  sendXml(res, leadScreenTwiml({ announcedName: ctx.config.announcedName, resultUrl: buildVoiceWebhookUrl('screen-result', q) }));
+}, twimlReplies));
+
+router.post('/screen-result', guarded(async (_req, res, q, body) => {
+  const record = await loadRecord(q);
+  const sid = sidOf(body, 'CallSid');
+  if (!record?.memberCallSid || !sid || sid !== record.leadCallSid) return sendHangup(res);
+
+  const store = getLeadCallStore();
+  const marker = decisionKey(sid, 'screen');
+  const pressed = body.Digits === '1';
+  // One decision per screening, whatever the key: a replay or a later different digit cannot reverse it.
+  if (record.state === 'bridging') {
+    const won = pressed
+      ? await store.transition(q.listId, q.leadId, ['bridging'], { state: 'connected', lastSequence: { [marker]: 1 } })
+      : await store.transition(q.listId, q.leadId, ['bridging'], {
+        state: 'bridging',
+        outcome: 'lead_declined',
+        // The dial marker too, so /dial's DialBridged=false result for this same decline writes nothing twice.
+        lastSequence: { [marker]: 1, [decisionKey(record.memberCallSid, 'dial')]: 1 },
+      });
+    if (won) await store.addEvent(q.listId, q.leadId, pressed ? 'call.connected' : 'call.lead_declined');
+  }
+  const decided = await store.get(q.listId, q.leadId);
+  const accepted = decided?.lastSequence?.[marker] !== undefined && decided.outcome !== 'lead_declined';
+  // An empty response ends the screening leg normally, so Twilio bridges the calls.
+  sendXml(res, accepted ? bridgeTwiml() : hangupTwiml());
 }, twimlReplies));
 
 // ── /dial: the <Dial> to the lead ended ─────────────────────────────────────
@@ -334,12 +420,25 @@ router.post('/dial', guarded(async (_req, res, q, body) => {
   const dialSid = sidOf(body, 'DialCallSid');
   const leadCallSid = dialSid && dialSid !== memberSid && !record.leadCallSid ? dialSid : undefined;
 
-  if (LEAD_REACHED.has(status)) {
-    // Normally already connected by the lead's "answered" status callback; this covers it arriving late or never.
-    if (await store.transition(q.listId, q.leadId, ['bridging'], { state: 'connected', leadCallSid })) {
-      await store.addEvent(q.listId, q.leadId, 'call.connected');
+  if (DIAL_ENDED_AFTER_ANSWER.has(status)) {
+    // The lead answered, but "completed" alone does not say whether anyone talked: DialBridged does.
+    if (body.DialBridged === 'true') {
+      // Normally already connected by /screen-result; this covers it arriving late or never.
+      if (await store.transition(q.listId, q.leadId, ['bridging'], { state: 'connected', leadCallSid })) {
+        await store.addEvent(q.listId, q.leadId, 'call.connected');
+      }
+      return sendHangup(res);
     }
-    return sendHangup(res);
+    if (body.DialBridged !== 'false' || record.state !== 'bridging') return sendHangup(res);
+    // The lead hung up, pressed something else or said nothing at the screening prompt.
+    const first = await store.transition(q.listId, q.leadId, ['bridging'], {
+      state: 'bridging',
+      outcome: 'lead_declined',
+      leadCallSid,
+      lastSequence: { [decisionKey(memberSid, 'dial')]: 1 },
+    });
+    if (first) await store.addEvent(q.listId, q.leadId, 'call.lead_declined');
+    return sendXml(res, leadDeclinedTwiml());
   }
   if (status === 'canceled') {
     // The dial was cancelled while the lead was still ringing, which is the member hanging up: nobody was told the
@@ -387,7 +486,7 @@ async function finishIfComplete(q: CallQuery): Promise<void> {
   const record = await store.get(q.listId, q.leadId);
   if (!record || record.jobKey !== q.jobKey || !LIVE_STATES.includes(record.state) || !everyDialedLegMetered(record)) return;
   // Still bridging with no /dial result: we cannot say whether the lead picked up.
-  const outcome = decidedOutcome(record) ?? (record.state === 'bridging' ? 'bridge_unconfirmed' : 'completed');
+  const outcome = callOutcome(record) ?? (record.state === 'bridging' ? 'bridge_unconfirmed' : 'completed');
   if (await store.transition(q.listId, q.leadId, LIVE_STATES, { state: 'finished', outcome })) {
     await store.addEvent(q.listId, q.leadId, 'call.completed', { outcome });
   }
@@ -400,13 +499,32 @@ async function finishIfComplete(q: CallQuery): Promise<void> {
 const decidedOutcome = (record: HotLeadCallRecord): string | undefined =>
   record.outcome === 'placement_unknown' ? undefined : record.outcome;
 
-/** Outcome and timeline event when the member leg ends before the member chose anything. */
-function memberLegOutcome(current: HotLeadCallRecord, leg: HotLeadCallLeg): { outcome: string; event: HotLeadCallEventType } | undefined {
-  if (leg !== 'member' || decidedOutcome(current)) return undefined;
+/**
+ * The outcome of the call as a whole. In bridging/connected a member outcome can only be left over from an
+ * earlier attempt (the member took this one), so it is not the call's outcome.
+ */
+function callOutcome(record: HotLeadCallRecord): string | undefined {
+  const outcome = decidedOutcome(record);
+  const tookTheLead = record.state === 'bridging' || record.state === 'connected';
+  return outcome && tookTheLead && MEMBER_OUTCOMES.has(outcome) ? undefined : outcome;
+}
+
+/**
+ * How a member attempt ended when the member never took the lead, so that the next member can be tried: its
+ * outcome, and the timeline event unless /gather already wrote it. Undefined when the member took the lead,
+ * or when the call ended for a reason that must not move on to another member (aborted, lead phone changed or
+ * invalid). `record.outcome` may be left over from an earlier attempt, so the state and the decision marker
+ * of THIS attempt decide, not a stale outcome.
+ */
+function memberAttemptEnd(current: HotLeadCallRecord): { outcome: string; event?: HotLeadCallEventType } | undefined {
+  const decided = decidedOutcome(current);
+  if (decided && !MEMBER_OUTCOMES.has(decided)) return undefined;
   if (current.state === 'dialing' || current.state === 'member_ringing') return { outcome: 'member_no_answer', event: 'call.member_no_answer' };
-  // Hung up on the prompt (the Gather timeout falls through without posting to /gather).
-  if (current.state === 'member_answered') return { outcome: 'member_declined', event: 'call.member_declined' };
-  return undefined;
+  if (current.state !== 'member_answered') return undefined;
+  // Pressed something other than 1 (event already written at /gather), or hung up on the prompt (the Gather
+  // timeout falls through without posting to /gather).
+  const decidedAtGather = current.memberCallSid && current.lastSequence?.[decisionKey(current.memberCallSid, 'gather')] !== undefined;
+  return { outcome: 'member_declined', event: decidedAtGather ? undefined : 'call.member_declined' };
 }
 
 interface LegCallback {
@@ -416,45 +534,52 @@ interface LegCallback {
   durationSeconds: number;
 }
 
-/** Lead leg progress: remember its sid and flag the bridge as connected when it is answered. */
-async function handleProgress(cb: LegCallback, record: HotLeadCallRecord, callStatus: string): Promise<void> {
+/**
+ * Lead leg progress: remember its sid. An answered lead leg is NOT a connection: the lead may still hang up at
+ * the screening prompt, so connected comes from /screen-result or /dial.
+ */
+async function handleProgress(cb: LegCallback, record: HotLeadCallRecord): Promise<void> {
   const { q, callSid, sequence } = cb;
   if (q.leg !== 'lead' || (record.state !== 'bridging' && record.state !== 'connected')) return;
-  const store = getLeadCallStore();
-  const answered = callStatus === 'in-progress' && record.state === 'bridging';
-  const won = await store.transition(q.listId, q.leadId, [record.state], {
-    state: answered ? 'connected' : record.state,
+  await getLeadCallStore().transition(q.listId, q.leadId, [record.state], {
+    state: record.state,
     leadCallSid: record.leadCallSid ? undefined : callSid,
     lastSequence: sequence === undefined ? undefined : { [callSid]: sequence },
   });
-  if (won && answered) await store.addEvent(q.listId, q.leadId, 'call.connected');
+}
+
+interface Metered {
+  status: 'done' | 'no-owner-to-bill' | 'gave-up';
+  /** Set when this caller metered a member leg that ended without the member taking the lead: the attempt's outcome. */
+  attemptEnded?: string;
 }
 
 /**
  * Terminal status for one leg: record it as metered in ONE transition and bill only if this caller
- * won it. Returns 'no-owner-to-bill' when nothing could be written because nobody can be billed, and
+ * won it. A member leg that ends without the member taking the lead moves the record to between_attempts in
+ * that same transition. Returns 'no-owner-to-bill' when nothing could be written because nobody can be billed, and
  * 'gave-up' when every attempt lost its transition (the caller answers 5xx so the retry override redelivers).
  */
-async function meterLeg(cb: LegCallback): Promise<'done' | 'no-owner-to-bill' | 'gave-up'> {
+async function meterLeg(cb: LegCallback): Promise<Metered> {
   const { q, callSid, sequence } = cb;
   const store = getLeadCallStore();
   let billedUserId: string | null | undefined;
   for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt++) {
     const current = await store.get(q.listId, q.leadId);
-    if (!current || current.jobKey !== q.jobKey || !LIVE_STATES.includes(current.state)) return 'done';
+    if (!current || current.jobKey !== q.jobKey || !LIVE_STATES.includes(current.state)) return { status: 'done' };
     const meteredLeg = meteredLegOf(q.leg, current);
-    if ((current.meteredLegs ?? []).includes(meteredLeg)) return 'done';
-    if (sequence !== undefined && (current.lastSequence?.[callSid] ?? -1) >= sequence) return 'done';
+    if ((current.meteredLegs ?? []).includes(meteredLeg)) return { status: 'done' };
+    if (sequence !== undefined && (current.lastSequence?.[callSid] ?? -1) >= sequence) return { status: 'done' };
 
     if (billedUserId === undefined) billedUserId = await meteringUserId(q.listId, await resolveHotLeadCallContext(q.listId));
     if (!billedUserId) {
       console.error('[twilio-voice] no owner to bill for list', q.listId);
-      return 'no-owner-to-bill';
+      return { status: 'no-owner-to-bill' };
     }
 
-    const ended = memberLegOutcome(current, q.leg);
+    const ended = q.leg === 'member' ? memberAttemptEnd(current) : undefined;
     const won = await store.transition(q.listId, q.leadId, [current.state], {
-      state: current.state,
+      state: ended ? 'between_attempts' : current.state,
       meteredLegs: [meteredLeg],
       leadCallSid: q.leg === 'lead' && !current.leadCallSid ? callSid : undefined,
       outcome: ended?.outcome,
@@ -462,16 +587,39 @@ async function meterLeg(cb: LegCallback): Promise<'done' | 'no-owner-to-bill' | 
     });
     if (!won) continue; // state moved under us (or a replay): look again
 
-    if (ended) await store.addEvent(q.listId, q.leadId, ended.event);
+    if (ended?.event) await store.addEvent(q.listId, q.leadId, ended.event);
     try {
       await recordCallUsage({ userId: billedUserId, callSid, leg: q.leg, durationSeconds: cb.durationSeconds });
     } catch (err) {
       console.error('[twilio-voice] metering failed:', errorName(err));
     }
-    return 'done';
+    return { status: 'done', attemptEnded: ended?.outcome };
   }
   console.error('[twilio-voice] metering gave up after retries:', q.leg);
-  return 'gave-up';
+  return { status: 'gave-up' };
+}
+
+/**
+ * The attempt just ended (its leg is metered, the record is between_attempts): ask for the next member, and
+ * finish the record when there is none. A first attempt keeps its own outcome (nobody else was ever
+ * available); after a later attempt the outcome is no_member_available. If the seam throws nothing is known
+ * to have been queued, so the record finishes: a call is never placed on a guess.
+ */
+async function nextAttemptOrFinish(q: CallQuery, attemptOutcome: string): Promise<void> {
+  const store = getLeadCallStore();
+  const record = await store.get(q.listId, q.leadId);
+  if (!record || record.jobKey !== q.jobKey || record.state !== 'between_attempts') return;
+  let enqueued = false;
+  try {
+    enqueued = (await requestNextHotLeadCallAttempt({ listId: q.listId, leadId: q.leadId, record })).enqueued;
+  } catch (err) {
+    console.error('[twilio-voice] next attempt request failed:', errorName(err));
+  }
+  if (enqueued) return;
+  const outcome = (record.attemptNo ?? 1) > 1 ? 'no_member_available' : attemptOutcome;
+  if (await store.transition(q.listId, q.leadId, ['between_attempts'], { state: 'finished', outcome })) {
+    await store.addEvent(q.listId, q.leadId, 'call.completed', { outcome });
+  }
 }
 
 router.post('/status', guarded(async (_req, res, q, body) => {
@@ -497,11 +645,16 @@ router.post('/status', guarded(async (_req, res, q, body) => {
   }
 
   if (!TERMINAL_CALL_STATUSES.has(callStatus)) {
-    await handleProgress(cb, record, callStatus);
+    await handleProgress(cb, record);
     return ack(res);
   }
   // Nothing partial is left behind in either case, so the redelivery can still meter the leg.
-  if ((await meterLeg(cb)) !== 'done') return serverError(res);
+  const metered = await meterLeg(cb);
+  if (metered.status !== 'done') return serverError(res);
+  if (metered.attemptEnded) {
+    await nextAttemptOrFinish(q, metered.attemptEnded);
+    return ack(res);
+  }
   // Whichever leg is metered last finishes the call (also heals a crash between the two steps).
   await finishIfComplete(q);
   ack(res);

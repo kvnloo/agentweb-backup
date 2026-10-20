@@ -9,7 +9,7 @@ export function isWebhookSafeId(id: string): boolean {
   return WEBHOOK_SAFE_ID.test(id);
 }
 
-type VoiceWebhookKind = 'owner' | 'gather' | 'dial' | 'status';
+type VoiceWebhookKind = 'owner' | 'gather' | 'dial' | 'status' | 'screen' | 'screen-result';
 
 interface VoiceWebhookContext {
   listId: string;
@@ -23,7 +23,7 @@ interface VoiceWebhookContext {
  * TLS handshake failures, so a 5xx is NOT retried by default). `5xx,ct` retries a server error we answer, up to 3 times.
  * The fragment is never sent on the wire and Twilio omits it when signing, so req.originalUrl (what the webhook
  * validates against) has none. Only status callbacks get it: they carry the metering input and every handler is
- * idempotent on a redelivery. The TwiML fetches (/owner, /gather, /dial) happen while a person is on the line under
+ * idempotent on a redelivery. The TwiML fetches (/owner, /gather, /dial, /screen, /screen-result) happen while a person is on the line under
  * Twilio's 15 second cap for call requests, so a retry would not help them and they answer a hangup instead.
  */
 const STATUS_RETRY_FRAGMENT = '#rc=3&rp=5xx,ct';

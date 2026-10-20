@@ -19,6 +19,7 @@ import * as queue from '../services/asyncJobQueue';
 import { recordVendorUsage } from '../services/usageRecorderService';
 import { setHotLeadCallEnabledOverride } from '../services/voice/hotLeadCallMode';
 import { LEAD_UNREACHABLE_COPY } from '../services/voice/twiml';
+import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
 import { attrOf, sayText, MOUNT } from './helpers/hotLeadCallTwilioSim';
 import {
   BASE, LEAD_E164, advanceMinutes, LEAD_PHONE_AS_TYPED, LIST, MEMBER_PHONE, TWILIO_NUMBER, eventsOf, installWorld, mock, placedCall, recordOf, submitLead,
@@ -57,15 +58,21 @@ describe('a hot lead rings the member and, on 1, bridges the lead', () => {
     expect(attrOf(connect.body, 'callerId')).toBe(TWILIO_NUMBER);
     expect(connect.body).toContain(`>${LEAD_E164}</Number>`);
     expect(attrOf(connect.body, 'statusCallbackEvent')).toContain('completed');
+    expect(connect.body).toContain('<Dial answerOnBridge="true"');
+    expect(new URL(attrOf(connect.body, 'url')).pathname).toBe(`${MOUNT}/screen`);
     const statusUrl = new URL(call.leadStatusUrl);
     expect(statusUrl.searchParams.get('leg')).toBe('lead');
     expect(statusUrl.hash).toBe('#rc=3&rp=5xx,ct');
     expect(recordOf('lead-a')?.state).toBe('bridging');
 
-    // The lead's leg progresses; the lead answering connects the call.
+    // The lead's leg progresses; answering is not a connection until the lead presses 1 at the screening prompt.
     await call.leadStatus('initiated', 0);
     await call.leadStatus('ringing', 1);
     await call.leadStatus('in-progress', 2);
+    expect(recordOf('lead-a')).toMatchObject({ state: 'bridging', leadCallSid: 'CA00000002' });
+    const screening = await call.leadAnswers();
+    expect(sayText(screening.body)).toBe('Smith & Sons would like to talk to you about your enquiry. Press 1 to be connected now.');
+    expect((await call.leadPresses('1')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response/>');
     expect(recordOf('lead-a')).toMatchObject({ state: 'connected', leadCallSid: 'CA00000002' });
     expect((await call.dialEnds('completed', { DialCallDuration: '125' })).body).toContain('<Hangup/>');
 
@@ -135,6 +142,59 @@ describe('a hot lead rings the member and, on 1, bridges the lead', () => {
     expect(usage()).toEqual([expect.objectContaining({ quantity: 1, idempotencyKey: 'twilio:voice:CA00000001:member' })]);
   });
 
+  it('the lead presses 2 at the screening prompt: never bridged, lead_declined, the member is told, both legs billed', async () => {
+    await submitLead('lead-a');
+    const call = twilioCall(placedCall());
+    await call.memberAnswers();
+    await call.memberPresses('1');
+    await call.leadStatus('in-progress', 2);
+    await call.leadAnswers();
+    expect((await call.leadPresses('2')).body).toContain('<Hangup/>');
+    const told = await call.dialEnds('completed', { DialBridged: 'false' });
+    expect(sayText(told.body)).toBe('The lead did not confirm. Their details are in your lead alert.');
+    await call.leadStatus('completed', 3, { CallDuration: '12' });
+    await call.memberLegEnds('completed', '40');
+
+    expect(recordOf('lead-a')).toMatchObject({ state: 'finished', outcome: 'lead_declined' });
+    expect(eventsOf('lead-a')).toEqual(['call.initiated', 'call.member_answered', 'call.lead_declined', 'call.completed']);
+    expect(world.provider.placedCalls).toHaveLength(1);
+    expect(usageSummary()).toEqual([['twilio:voice:CA00000001:member', 1], ['twilio:voice:CA00000002:lead', 1]]);
+  });
+
+  it('the lead answers but never presses anything (voicemail, hang-up): /dial reports DialBridged=false and the lead counts as declined', async () => {
+    await submitLead('lead-a');
+    const call = twilioCall(placedCall());
+    await call.memberAnswers();
+    await call.memberPresses('1');
+    await call.leadStatus('in-progress', 2);
+    await call.leadAnswers();
+    const told = await call.dialEnds('completed', { DialBridged: 'false' });
+    expect(sayText(told.body)).toBe('The lead did not confirm. Their details are in your lead alert.');
+    await call.leadStatus('completed', 3, { CallDuration: '9' });
+    await call.memberLegEnds('completed', '35');
+
+    expect(recordOf('lead-a')).toMatchObject({ state: 'finished', outcome: 'lead_declined' });
+    expect(eventsOf('lead-a')).toEqual(['call.initiated', 'call.member_answered', 'call.lead_declined', 'call.completed']);
+  });
+
+  it('the lead phone was overwritten between dispatch and the member pressing 1: nobody is dialed, lead_phone_changed', async () => {
+    await submitLead('lead-a');
+    const record = world.crm.lead(LIST, 'lead-a').system!.hot_lead_call as Record<string, unknown>;
+    record.leadPhoneMac = leadPhoneMacOf('org-a', LEAD_E164); // what the orchestrator stores when the call passes the gates
+    const call = twilioCall(placedCall());
+    await call.memberAnswers();
+    world.crm.lead(LIST, 'lead-a').phone = '(212) 555-0199';
+    const reply = await call.memberPresses('1');
+    expect(reply.body).not.toContain('<Dial');
+    expect(sayText(reply.body)).toBe('We could not reach the lead. Their details are in your lead alert.');
+    await call.memberLegEnds('completed', '20');
+
+    expect(recordOf('lead-a')).toMatchObject({ state: 'finished', outcome: 'lead_phone_changed' });
+    expect(eventsOf('lead-a')).toEqual(['call.initiated', 'call.member_answered', 'call.failed', 'call.completed']);
+    expect(world.provider.placedCalls).toHaveLength(1);
+    expect(usageSummary()).toEqual([['twilio:voice:CA00000001:member', 1]]);
+  });
+
   it('a definite Twilio rejection ends the record as failed and is never retried, even by a repeat submission', async () => {
     world.provider.failNextPlaceCall('no');
     await submitLead('lead-a');
@@ -161,6 +221,8 @@ describe('a hot lead rings the member and, on 1, bridges the lead', () => {
     expect(recordOf('lead-a')).toMatchObject({ state: 'member_answered', memberCallSid: 'CA0000000A9' });
     await call.memberPresses('1');
     await call.leadStatus('in-progress', 2);
+    await call.leadAnswers();
+    await call.leadPresses('1');
     await call.leadStatus('completed', 3, { CallDuration: '30' });
     await call.memberLegEnds('completed', '61');
 
@@ -248,6 +310,10 @@ describe('Twilio retries and reorders callbacks', () => {
     expect(bridge.body).toContain('<Dial');
     expect(replayedBridge.body).not.toContain('<Dial');
     await twice(() => call.leadStatus('in-progress', 2));
+    const [screenPrompt, replayedPrompt] = await twice(() => call.leadAnswers());
+    expect(replayedPrompt.body).toBe(screenPrompt.body);
+    const [accepted, replayedAccept] = await twice(() => call.leadPresses('1'));
+    expect(replayedAccept.body).toBe(accepted.body);
     await twice(() => call.dialEnds('completed'));
     await twice(() => call.leadStatus('completed', 3, { CallDuration: '70' }));
     await twice(() => call.memberLegEnds('completed', '90'));
