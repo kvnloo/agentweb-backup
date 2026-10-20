@@ -12,7 +12,6 @@ import { WebClient } from '@slack/web-api';
 import * as queue from '../../services/asyncJobQueue';
 import { recordVendorUsage } from '../../services/usageRecorderService';
 import { notificationLookup } from '../../services/leadNotificationLookup';
-import { SAME_LEAD_RECHECK_MS } from '../../services/hotLeadCallService';
 import { dispatchLeadCreated } from '../../services/orgLeadNotificationService';
 import { setHotLeadCallEnabledOverride } from '../../services/voice/hotLeadCallMode';
 import { setHotLeadCallEntitledOverride } from '../../services/voice/hotLeadCallEntitlement';
@@ -105,10 +104,9 @@ export function installWorld(): void {
 
 // ── clock and lead helpers ──────────────────────────────────────────────────
 
-// The orchestrator's short same-lead re-check runs on the fake clock, so a flush also advances it past the wait.
 const flush = async () => {
   for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
-  await jest.advanceTimersByTimeAsync(SAME_LEAD_RECHECK_MS);
+  await jest.advanceTimersByTimeAsync(0);
 };
 export const setClock = (iso: string) => jest.setSystemTime(new Date(iso));
 export const advanceMinutes = (n: number) => jest.setSystemTime(Date.now() + n * MINUTE_MS);
