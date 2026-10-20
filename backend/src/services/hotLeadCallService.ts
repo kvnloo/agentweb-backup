@@ -1,8 +1,8 @@
 import { createHash } from 'crypto';
 import { isSmokeTestLead } from '../utils/smokeTestLead';
 import { crmDb } from './db';
-import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from './asyncJobQueue';
-import type { HotLeadCallConfig } from './hotLeadCallConfig';
+import { registerProcessor } from './asyncJobQueue';
+import type { HotLeadCallConfig, HotLeadCallMember } from './hotLeadCallConfig';
 import { callableLeadPhone } from './hotLeadCallConfig';
 import type { LeadOrigin } from './leadNotificationConfig';
 import { getVoiceProvider } from './voice/voiceProvider';
@@ -16,6 +16,7 @@ import { isWithinCallWindow, reserveCallSlot, type Reservation } from './voice/h
 import { selectHotLeadCallCandidates } from './hotLeadCallRoster';
 import { NEXT_ATTEMPT_SOURCE, processHotLeadCallNextAttempt } from './hotLeadCallAttempts';
 import { errorText, placeMemberCall, type PlacementResult } from './hotLeadCallPlacement';
+import { isNonEmpty, MINUTE_MS, runQueuedHotLeadJob } from './hotLeadCallQueue';
 // This file must not import orgLeadNotificationService: that module calls dispatchHotLeadCall.
 
 interface HotLeadCallJob {
@@ -30,13 +31,11 @@ type JobInput = Omit<HotLeadCallJob, 'orgId'>;
 type Submission = { submissionId: string; submittedAt: string };
 
 const SOURCE = 'hot_lead_call';
-const MINUTE_MS = 60_000;
 // Anyone can submit a landing-page form, and again, so refusals must not grow the lead row without bound:
 // one `call.skipped` event per distinct reason, and five in all.
 const MAX_SKIP_EVENTS_PER_LEAD = 5;
 const keyOf = (job: HotLeadCallJob): string =>
   createHash('sha256').update(JSON.stringify([job.orgId, job.listId, job.leadId, ...(job.submissionId ? [job.submissionId] : [])])).digest('hex');
-const isNonEmpty = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0;
 
 type LeadRow = NonNullable<Awaited<ReturnType<typeof crmDb.getLeadById>>>;
 interface GateInput { config: HotLeadCallConfig; lead: LeadRow; job: HotLeadCallJob }
@@ -120,28 +119,22 @@ async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: H
   return 'phone' in callable ? { job, ctx, phone: callable.phone, callerNumber, lead } : null; // always set: the phone gate refused otherwise
 }
 
-/**
- * Re-runs the gates, then rings the first available member, at most once per lead. The call record is the
- * at-most-once control: store.create is create-if-absent, so a lost create means a record already exists for
- * this lead and we never dial, and a throw means nothing was dialed and the job fails (the queue row dedupes
- * the same job key). A lead gets one call record ever; its later attempts (other members) are driven from that
- * record by the next-attempt job, and a lead whose first call was rejected is not retried by a new submission.
- */
-export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> {
-  if (!job || !isNonEmpty(job.orgId) || !isNonEmpty(job.listId) || !isNonEmpty(job.leadId)) throw new Error('Invalid hot lead call job');
-  if (!await isHotLeadCallEnabled()) return;
-  const reviewed = await review(job, job.orgId);
-  if (!reviewed) return;
-  const { config } = reviewed.ctx;
-  const { listId, leadId } = job;
-  const key = keyOf(job);
-  const store = getLeadCallStore();
+type Reviewed = NonNullable<Awaited<ReturnType<typeof review>>>;
 
-  // Re-evaluated now (not taken from the gates): time moves on between the gates and the reservation.
-  const candidates = selectHotLeadCallCandidates(config, new Date());
+/**
+ * Everything that must hold before a slot is reserved: the kill switch, the gates, somebody on the team available
+ * right now (time moves on between the gates and the reservation), and Twilio credentials. Returns null when the
+ * job should stop; refusals worth showing on the timeline have been recorded.
+ */
+async function preflight(job: HotLeadCallJob): Promise<(Reviewed & { candidates: HotLeadCallMember[] }) | null> {
+  if (!await isHotLeadCallEnabled()) return null;
+  const reviewed = await review(job, job.orgId);
+  if (!reviewed) return null;
+
+  const candidates = selectHotLeadCallCandidates(reviewed.ctx.config, new Date());
   if (candidates.length === 0) {
     await recordSkip(reviewed.lead, 'no_one_available');
-    return;
+    return null;
   }
 
   // Before any slot or record: with no usable Twilio credentials nothing can be dialed, and the lead's single
@@ -149,13 +142,21 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
   try {
     await getVoiceProvider().ensureCredentials();
   } catch (err) {
-    console.warn('[hotLeadCall] voice credentials unavailable', { listId, leadId, error: errorText(err) });
+    console.warn('[hotLeadCall] voice credentials unavailable', { listId: job.listId, leadId: job.leadId, error: errorText(err) });
     await recordSkip(reviewed.lead, 'credentials_unavailable');
-    return;
+    return null;
   }
+  return { ...reviewed, candidates };
+}
 
-  // Reserve BEFORE create and give back if create does not win: a lead that never dials costs no slot, and a
-  // lead refused by a limit leaves no record, so its single call slot stays unused (a repeat submission can retry).
+/**
+ * Reserves the lead's slots, then rings the first available member. The slots are taken BEFORE the record is
+ * created and given back if it is not: a lead that never dials costs no slot, and a lead refused by a limit
+ * leaves no record, so its single call slot stays unused (a repeat submission can retry).
+ */
+async function reserveAndPlace(job: HotLeadCallJob, reviewed: Reviewed & { candidates: HotLeadCallMember[] }): Promise<void> {
+  const { config } = reviewed.ctx;
+  const { listId, leadId } = job;
   let slot: Reservation;
   try {
     slot = await reserveCallSlot({ orgId: job.orgId, listId, leadId, phoneE164: reviewed.phone, config });
@@ -173,15 +174,17 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
     return;
   }
 
+  const store = getLeadCallStore();
+  const jobKey = keyOf(job);
   let created = false;
   let result: PlacementResult;
   try {
     result = await placeMemberCall({
-      orgId: job.orgId, listId, leadId, jobKey: key, config, callerNumber: reviewed.callerNumber, candidates, attemptNo: 1,
+      orgId: job.orgId, listId, leadId, jobKey, config, callerNumber: reviewed.callerNumber, candidates: reviewed.candidates, attemptNo: 1,
       createRecord: async (member) => {
         const startedAt = new Date().toISOString();
         created = await store.create(listId, leadId, {
-          state: 'dialing', jobKey: key, startedAt, updatedAt: startedAt, attemptNo: 1, memberId: member.id, triedMemberIds: [member.id],
+          state: 'dialing', jobKey, startedAt, updatedAt: startedAt, attemptNo: 1, memberId: member.id, triedMemberIds: [member.id],
           leadPhoneMac: leadPhoneMacOf(job.orgId, reviewed.phone),
         });
         return created;
@@ -194,6 +197,19 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
   if (result === 'none') await recordSkip(reviewed.lead, 'member_cooldown');
 }
 
+/**
+ * Re-runs the gates, then rings the first available member, at most once per lead. The call record is the
+ * at-most-once control: store.create is create-if-absent, so a lost create means a record already exists for
+ * this lead and we never dial, and a throw means nothing was dialed and the job fails (the queue row dedupes
+ * the same job key). A lead gets one call record ever; its later attempts (other members) are driven from that
+ * record by the next-attempt job, and a lead whose first call was rejected is not retried by a new submission.
+ */
+export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> {
+  if (!job || !isNonEmpty(job.orgId) || !isNonEmpty(job.listId) || !isNonEmpty(job.leadId)) throw new Error('Invalid hot lead call job');
+  const ready = await preflight(job);
+  if (ready) await reserveAndPlace(job, ready);
+}
+
 /** Never rejects to a lead saver. Fire-and-forget right after a successful lead write. */
 export async function dispatchHotLeadCall(listId: string, leadId: string, origin?: LeadOrigin, submission?: Submission): Promise<void> {
   try {
@@ -202,17 +218,7 @@ export async function dispatchHotLeadCall(listId: string, leadId: string, origin
     const reviewed = await review({ listId, leadId, origin, ...submission });
     if (!reviewed) return;
     const { job } = reviewed;
-    const key = keyOf(job);
-    const queued = await enqueueJob(SOURCE, key, job, { claimImmediately: true });
-    if (queued === 'duplicate') return;
-    if (queued !== 'enqueued') throw new Error('Hot lead call queue unavailable');
-    const stop = startHeartbeat(SOURCE, key);
-    try {
-      await processHotLeadCallJob(job);
-      await markJobComplete(SOURCE, key);
-    } catch (err) {
-      await markJobFailed(SOURCE, key, new Error(`Hot lead call failed: ${errorText(err)}`));
-    } finally { stop(); }
+    await runQueuedHotLeadJob({ source: SOURCE, key: keyOf(job), job, process: processHotLeadCallJob, label: 'Hot lead call' });
   } catch (err) {
     console.warn('[hotLeadCall] dispatch failed', { listId, leadId, error: errorText(err) });
   }

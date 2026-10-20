@@ -176,13 +176,13 @@ export async function nextAttemptOrFinish(q: CallQuery, attemptOutcome: string):
   const store = getLeadCallStore();
   const record = await store.get(q.listId, q.leadId);
   if (!record || record.jobKey !== q.jobKey || record.state !== 'between_attempts') return;
-  let enqueued = false;
   try {
-    enqueued = (await requestNextHotLeadCallAttempt({ listId: q.listId, leadId: q.leadId, record })).enqueued;
+    const decision = await requestNextHotLeadCallAttempt({ listId: q.listId, leadId: q.leadId, record });
+    if (decision.enqueued) return;
+    console.info('[twilio-voice] no further attempt:', decision.reason);
   } catch (err) {
     console.error('[twilio-voice] next attempt request failed:', errorName(err));
   }
-  if (enqueued) return;
   const outcome = record.attemptNo > 1 ? 'no_member_available' : attemptOutcome;
   if (await store.transition(q.listId, q.leadId, ['between_attempts'], { state: 'finished', outcome })) {
     await store.addEvent(q.listId, q.leadId, 'call.completed', { outcome });
