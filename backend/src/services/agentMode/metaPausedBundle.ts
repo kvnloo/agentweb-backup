@@ -10,6 +10,8 @@ export interface PausedMetaBundle {
   ad_set: Params;
   ads: Params[];
   currency?: string;
+  /** Server-read content carried inside the existing signed approval payload. */
+  creative_preflight?: Params[];
 }
 const CAMPAIGN_FIELDS = ['name', 'objective', 'status', 'special_ad_categories', 'spend_cap', 'advantage_campaign_budget', 'budget_amount'];
 const AD_SET_FIELDS = ['name', 'status', 'daily_budget', 'lifetime_budget', 'bid_strategy', 'bid_amount', 'optimization_goal', 'billing_event', 'destination_type', 'promoted_object', 'targeting', 'start_time', 'end_time'];
@@ -32,8 +34,8 @@ function paused(value: unknown, allowed: string[], label: string): Params {
 }
 
 /** Reject flags, parent overrides, omitted ads and wrong-type elements before any I/O. */
-export function parsePausedMetaBundle(input: unknown): PausedMetaBundle {
-  const root = fields(input, ['requested_ad_count', 'campaign', 'ad_set', 'ads', 'currency'], 'Paused bundle');
+export function parsePausedMetaBundle(input: unknown, approved = false): PausedMetaBundle {
+  const root = fields(input, ['requested_ad_count', 'campaign', 'ad_set', 'ads', 'currency', ...(approved ? ['creative_preflight'] : [])], 'Paused bundle');
   if (!Number.isSafeInteger(root.requested_ad_count) || root.requested_ad_count < 1 || root.requested_ad_count > 50 ||
       !Array.isArray(root.ads) || root.ads.length !== root.requested_ad_count) {
     throw new Error('List exactly requested_ad_count ads (1–50); a partial brief cannot be approved.');
@@ -71,7 +73,80 @@ export function parsePausedMetaBundle(input: unknown): PausedMetaBundle {
     return p;
   });
   if (root.currency !== undefined && (typeof root.currency !== 'string' || !/^[A-Z]{3}$/.test(root.currency))) throw new Error('Invalid bundle currency.');
-  return { requested_ad_count: root.requested_ad_count, campaign, ad_set, ads, ...(root.currency ? { currency: root.currency } : {}) };
+  return { requested_ad_count: root.requested_ad_count, campaign, ad_set, ads, ...(root.currency ? { currency: root.currency } : {}),
+    ...(approved ? { creative_preflight: root.creative_preflight } : {}) };
+}
+
+/** Never accept the model's self-reported count as evidence of what the user requested. */
+export function assertPausedBundleUserCount(bundle: PausedMetaBundle, messages: unknown): void {
+  if (!Array.isArray(messages) || messages.some(m => !record(m) || typeof m.role !== 'string' || typeof m.content !== 'string')) {
+    throw new Error('The user brief could not be verified.');
+  }
+  const units = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
+    'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen'];
+  const names = Array.from({ length: 51 }, (_, n) => n < 20 ? units[n]
+    : ['twenty', 'thirty', 'forty', 'fifty'][Math.floor(n / 10) - 2] + (n % 10 ? `[- ]${units[n % 10]}` : ''));
+  const countPattern = new RegExp(`\\b(\\d+|${names.slice().reverse().join('|')})\\s+(?:(?:paused|new|different|distinct|separate)\\s+)*ads?\\b(?![ -]+sets?\\b)(?:\\s+variants?)?`, 'gi');
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.role !== 'user' || message.metadata?.approvalDeckAnswer) continue;
+    const counts = [...message.content.matchAll(countPattern)].map((match: RegExpMatchArray) =>
+      /^\d+$/.test(match[1]) ? Number(match[1]) : names.findIndex(name => new RegExp(`^${name}$`, 'i').test(match[1])));
+    if (!counts.length) continue;
+    if (new Set(counts).size !== 1) throw new Error('The user brief has ambiguous ad counts; an exact count is required.');
+    if (counts[0] !== bundle.requested_ad_count) throw new Error(`The user requested ${counts[0]} ads; the bundle lists ${bundle.requested_ad_count}.`);
+    return;
+  }
+  throw new Error('An explicit ad count in the user brief is required before bundle approval.');
+}
+
+const CREATIVE_CONTENT_FIELDS = ['body', 'title', 'image_url', 'link_url', 'object_story_spec', 'asset_feed_spec', 'url_tags'];
+const COPY_FIELDS = new Set(['body', 'title', 'message', 'name', 'caption', 'description', 'text', 'link', 'link_url', 'website_url', 'url_tags']);
+const OBJECT_FIELDS = new Set(['object_story_spec', 'asset_feed_spec', 'link_data', 'video_data', 'call_to_action']);
+const ARRAY_FIELDS = new Set(['child_attachments', 'bodies', 'titles', 'descriptions', 'link_urls', 'images', 'videos', 'asset_customization_rules']);
+const PLACEHOLDER = /\blorem\s+ipsum\b|\b(?:TBD|TODO)\b|\b(?:insert|replace)[ _-]+(?:your[ _-]+)?(?:copy|text|headline|title|description|company|brand)\b|\byour[_-](?:text|copy|headline|company|brand)[_-]|\{\{[^}]+\}\}|\[(?:insert|your|company|brand|headline|placeholder)\b[^\]]*\]/i;
+
+function inspectCreativeContent(value: unknown, field: string): boolean {
+  if (value === undefined || value === null) {
+    if (field === '') throw new Error('Creative content contains a malformed element.');
+    return false;
+  }
+  if (COPY_FIELDS.has(field) && typeof value !== 'string' || OBJECT_FIELDS.has(field) && !record(value) || ARRAY_FIELDS.has(field) && !Array.isArray(value)) {
+    throw new Error(`Creative content is malformed at ${field}.`);
+  }
+  let readable = false;
+  if (typeof value === 'string') {
+    const isUrl = ['url_tags', 'link', 'link_url', 'website_url', 'image_url'].includes(field);
+    // These are live Meta URL macros, not unfinished customer copy (see utils/adUtm.ts).
+    const text = isUrl ? value.replace(/\{\{(?:(?:campaign|adset|ad)\.(?:id|name)|placement|site_source_name)\}\}/g, '') : value;
+    if (PLACEHOLDER.test(text)) throw new Error(`Creative contains placeholder text at ${field}.`);
+    readable = COPY_FIELDS.has(field) && !isUrl && !!value.trim();
+  }
+  if (Array.isArray(value)) for (const item of value) {
+    if (ARRAY_FIELDS.has(field) && !record(item)) throw new Error(`Creative content contains a malformed ${field} element.`);
+    if (['bodies', 'titles', 'descriptions'].includes(field) && (!record(item) || typeof item.text !== 'string' || !item.text.trim())) {
+      throw new Error(`Creative content contains unreadable ${field} text.`);
+    }
+    readable = inspectCreativeContent(item, '') || readable;
+  }
+  else if (record(value)) for (const [key, child] of Object.entries(value)) readable = inspectCreativeContent(child, key) || readable;
+  return readable;
+}
+
+/** Both preview and execution use this exact read-only preflight, before any parent exists. */
+export async function preflightPausedMetaCreatives(bundle: PausedMetaBundle, account: string, read: (id: string) => Promise<unknown>): Promise<Params[]> {
+  const snapshots: Params[] = [];
+  for (const id of new Set(bundle.ads.map(ad => ad.creative_id))) {
+    const creative = await read(id);
+    if (!record(creative) || creative.id !== id) throw new Error(`Creative ${id} is unavailable or has the wrong ID.`);
+    // Do not let assertOwnedByAccount's string normalization accept arrays/objects as IDs.
+    MetaService.assertOwnedByAccount(typeof creative.account_id === 'string' ? creative.account_id : undefined, id, 'Ad creative', account);
+    const snapshot: Params = { id };
+    for (const field of CREATIVE_CONTENT_FIELDS) if (creative[field] !== undefined && creative[field] !== null) snapshot[field] = creative[field];
+    if (!inspectCreativeContent(snapshot, '')) throw new Error(`Creative ${id} has no readable copy to preflight.`);
+    snapshots.push(structuredClone(snapshot));
+  }
+  return snapshots;
 }
 
 export function pausedBundleSummary(bundle: PausedMetaBundle, account: string): string {
@@ -80,26 +155,41 @@ export function pausedBundleSummary(bundle: PausedMetaBundle, account: string): 
 }
 
 export interface PausedBundleDeps {
+  preflight: (bundle: PausedMetaBundle) => Promise<Params[]>;
   normalize: (params: Params) => Promise<{ params: Params; currency?: string }>;
   write: (entity: string, params: Params, campaignId?: string, adSetId?: string) => Promise<any>;
   read: (entity: string, id: string, fields: string[]) => Promise<unknown>;
 }
 
-function matches(expected: any, actual: any, field = ''): boolean {
+function matches(expected: any, actual: any, field = '', unorderedArrays = true): boolean {
+  if (expected === null) return actual === null;
   if (actual === undefined || actual === null) return false;
   if (['start_time', 'end_time'].includes(field)) return Number.isFinite(Date.parse(expected)) && Date.parse(expected) === Date.parse(actual);
-  if (Array.isArray(expected)) return Array.isArray(actual) && expected.length === actual.length &&
-    expected.every(e => actual.some(a => matches(e, a)));
-  if (record(expected)) return record(actual) && Object.keys(expected).every(k => matches(expected[k], actual[k], k));
+  if (Array.isArray(expected)) {
+    if (!Array.isArray(actual) || expected.length !== actual.length) return false;
+    if (!unorderedArrays) return expected.every((e, i) => matches(e, actual[i], '', false));
+    const remaining = [...actual];
+    return expected.every(e => {
+      const index = remaining.findIndex(a => matches(e, a));
+      if (index === -1) return false;
+      remaining.splice(index, 1);
+      return true;
+    });
+  }
+  if (record(expected)) return record(actual) && Object.keys(expected).every(k => matches(expected[k], actual[k], k, unorderedArrays)) &&
+    // Meta may annotate targeting IDs with display names; all other extra nested fields fail closed.
+    Object.keys(actual).every(k => k in expected || (k === 'name' && typeof expected.id === 'string' && typeof actual.name === 'string'));
   return typeof expected === 'number' ? (typeof actual === 'number' || typeof actual === 'string') && String(expected) === String(actual) : expected === actual;
 }
 
 /** Called ONLY after the enclosing exact manifest was durably claimed. No model-supplied IDs. */
 export async function executePausedMetaBundle(input: unknown, deps: PausedBundleDeps) {
-  const bundle = parsePausedMetaBundle(input);
+  const bundle = parsePausedMetaBundle(input, true);
   const ledger: Array<{ entity: string; id: string; verified: boolean }> = [];
   let verifiedAds = 0;
   try {
+    const creatives = await deps.preflight(bundle);
+    if (!Array.isArray(bundle.creative_preflight) || !matches(bundle.creative_preflight, creatives, '', false)) throw new Error('Creative content changed after approval; review a fresh brief.');
     const campaignMoney = await deps.normalize(bundle.campaign);
     const adSetMoney = await deps.normalize(bundle.ad_set);
     const currencies = [campaignMoney.currency, adSetMoney.currency].filter(Boolean);
@@ -114,8 +204,13 @@ export async function executePausedMetaBundle(input: unknown, deps: PausedBundle
       const entry = { entity, id, verified: false };
       ledger.push(entry);
       if (result.success !== true || result.awaitingUserConfirmation || result.blocked || result.throttled) throw new Error(result.message || `${entity} was not confirmed.`);
-      const node = await deps.read(entity, id, ['id', ...Object.keys(expected).filter(k => k !== 'creative_id')]);
+      const moneyFields = entity === 'CAMPAIGN' ? ['daily_budget', 'lifetime_budget', 'spend_cap']
+        : entity === 'AD_SET' ? ['daily_budget', 'lifetime_budget', 'bid_amount'] : [];
+      const node = await deps.read(entity, id, [...new Set(['id', ...Object.keys(expected).filter(k => k !== 'creative_id'), ...moneyFields])]);
       if (!record(node) || node.id !== id) throw new Error(`${entity} ${id} read-back is missing or has the wrong ID.`);
+      for (const field of moneyFields) if (expected[field] === undefined && node[field] !== undefined && node[field] !== null && node[field] !== 0 && node[field] !== '0') {
+        throw new Error(`${entity} ${id} read-back contains an unapproved ${field}.`);
+      }
       for (const [field, requested] of Object.entries(expected)) {
         const applied = field === 'creative_id' ? node.creative?.id : node[field];
         if (!matches(requested, applied, field)) throw new Error(`${entity} ${id} read-back mismatch: ${field}.`);

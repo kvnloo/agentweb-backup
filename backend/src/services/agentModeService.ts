@@ -268,7 +268,7 @@ import * as twitterImpl from '../emma/impl/twitter';
 // ENG-2103 (F2): Meta/LinkedIn ads APIs tool cluster, same treatment as leadsImpl above.
 import * as adsApisImpl from '../emma/impl/adsApis';
 import { buildToolkitObjectiveGate, readBackMetaNode } from './agentMode/metaToolkitSeams';
-import { PAUSED_BUNDLE_ACTION, parsePausedMetaBundle, pausedBundleSummary, executePausedMetaBundle } from './agentMode/metaPausedBundle';
+import { PAUSED_BUNDLE_ACTION, PausedMetaBundle, parsePausedMetaBundle, pausedBundleSummary, executePausedMetaBundle, assertPausedBundleUserCount, preflightPausedMetaCreatives } from './agentMode/metaPausedBundle';
 // ENG-2103 (F2): Google Ads + HubSpot/Attio CRM passthrough tool cluster,
 // same treatment as leadsImpl above.
 import * as adsCrmApisImpl from '../emma/impl/adsCrmApis';
@@ -14890,6 +14890,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   }
 
   /** A brief is a write item, never a generic planning answer or an objective-only grant. */
+  private async preflightPausedMetaBundle(userId: string, sessionId: string | undefined, accountId: string, accessToken: string, bundle: PausedMetaBundle) {
+    const session = sessionId ? await chatbotDb.getChatSession(sessionId) : null;
+    if (!session || session.userId !== userId) throw new Error('A paused bundle needs an owned chat session and explicit review-card approval.');
+    assertPausedBundleUserCount(bundle, await chatbotDb.getMessagesFromMessagesTable(sessionId!));
+    return preflightPausedMetaCreatives(bundle, accountId, id => metaService.getAdCreative(accessToken, id));
+  }
+
   private async preparePausedMetaBundle(userId: string, sessionId: string | undefined, accountId: string, input: unknown): Promise<any> {
     try {
       const bundle = parsePausedMetaBundle(input);
@@ -14898,6 +14905,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const creds = await this.getMetaCredentials(userId, accountId);
       const { getMetaPagesAccessState, getMetaAdsNoPagesMessage } = await import('../utils/metaAdsScope');
       if (getMetaPagesAccessState(creds.connection?.config) === 'missing') throw new Error(getMetaAdsNoPagesMessage(creds.connection?.config));
+      bundle.creative_preflight = await this.preflightPausedMetaBundle(userId, sessionId, creds.accountId, creds.accessToken, bundle);
       const money = await this.normalizeMetaMoneyParams(creds.accountId, creds.accessToken,
         bundle.campaign.advantage_campaign_budget ? bundle.campaign : bundle.ad_set);
       // Frozen alongside the exact fields. A later currency/connection change invalidates the grant.
@@ -15003,6 +15011,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const { getMetaPagesAccessState, getMetaAdsNoPagesMessage } = await import('../utils/metaAdsScope');
       if (getMetaPagesAccessState(creds.connection?.config) === 'missing') throw new Error(getMetaAdsNoPagesMessage(creds.connection?.config));
       return executePausedMetaBundle(params, {
+        preflight: bundle => this.preflightPausedMetaBundle(userId, sessionId, creds.accountId, creds.accessToken, bundle),
         normalize: p => this.normalizeMetaMoneyParams(creds.accountId, creds.accessToken, p),
         write: (entity, p, campaign, adSet) => this.dispatchAuthorizedMetaWrite(userId, entity, 'CREATE', account_id, campaign, adSet, undefined, p, false, sessionId),
         read: async (entity, id, fields) => {

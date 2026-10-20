@@ -4,11 +4,12 @@ jest.mock('../services/chatbotService', () => ({
     getChatSession: jest.fn(), claimMetaWriteManifestDigest: jest.fn(),
     updateSessionApprovalDeck: jest.fn(), updateSessionWorkflowRun: jest.fn(),
     updateSessionMetaWriteFailureStreaks: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn(),
   },
 }));
 jest.mock('../services/metaService', () => ({
   ...jest.requireActual('../services/metaService'),
-  metaService: { getCampaign: jest.fn(), getAdSet: jest.fn(), getAd: jest.fn(), listCampaigns: jest.fn(), listAdSets: jest.fn() },
+  metaService: { getCampaign: jest.fn(), getAdSet: jest.fn(), getAd: jest.fn(), getAdCreative: jest.fn(), listCampaigns: jest.fn(), listAdSets: jest.fn() },
 }));
 
 import { AgentModeService } from '../services/agentModeService';
@@ -30,6 +31,8 @@ let session: any;
 let writes: any[];
 let nodes: Map<string, any>;
 let objectiveGate: jest.SpyInstance;
+let messages: any[];
+let creatives: Map<string, any>;
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -37,6 +40,13 @@ beforeEach(() => {
   session = { sessionId: SESSION, userId: 'user-1' };
   writes = [];
   nodes = new Map();
+  messages = [{ role: 'user', content: 'Create a paused campaign with three ads.' }];
+  creatives = new Map([1, 2, 3].map(n => [`creative-${n}`, {
+    id: `creative-${n}`, account_id: ACCOUNT, name: `Launch creative ${n}`,
+    object_story_spec: { page_id: 'page-1', link_data: { message: 'Meet your next customer.', name: 'Grow your business', link: 'https://agentweb.pro' } },
+  }]));
+  (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockImplementation(async () => structuredClone(messages));
+  (metaService.getAdCreative as jest.Mock).mockImplementation(async (_token, id) => structuredClone(creatives.get(id)));
   (chatbotDb.getChatSession as jest.Mock).mockImplementation(async () => structuredClone(session));
   (chatbotDb.updateSessionApprovalDeck as jest.Mock).mockImplementation(async (_id, deck, opts) => {
     if (opts?.requireStillAwaiting && session.pendingApprovalDeck?.status !== 'awaiting') return null;
@@ -103,7 +113,7 @@ async function approve() {
 it('persists one exact brief including objective and all three ads, without an objective repeat or writes', async () => {
   const deck = await stage();
   expect(deck.items).toHaveLength(1);
-  expect(session.pendingApprovalDeck.items[0].metaWriteDispatch.params).toEqual({ ...brief(), currency: 'USD' });
+  expect(session.pendingApprovalDeck.items[0].metaWriteDispatch.params).toMatchObject({ ...brief(), currency: 'USD' });
   expect(deck.items[0].question).toContain('OUTCOME_TRAFFIC');
   expect(deck.items[0].question).toContain('creative-3');
   expect(objectiveGate).not.toHaveBeenCalled();
@@ -282,5 +292,188 @@ it.each([null, 'ad', 7, [], { name: 'bad', creative_id: {} }])('rejects malforme
 it.each(['confirm', 'override_tracking_check', 'adset_id', 'account_id'])('rejects an ad-level %s override', async field => {
   const input = brief(); (input.ads[0] as any)[field] = true;
   expect((await preview(input)).success).toBe(false);
+  expect(writes).toHaveLength(0);
+});
+
+it('preflights every creative before the single approval and rechecks all before the first write', async () => {
+  const deck = await stage();
+  expect(deck.items[0].question).toContain('Meet your next customer.');
+  const reads = metaService.getAdCreative as jest.Mock;
+  expect(reads.mock.calls.map(call => call[1])).toEqual(['creative-1', 'creative-2', 'creative-3']);
+  const original = (service as any).manageMetaAdsCampaigns.getMockImplementation();
+  (service as any).manageMetaAdsCampaigns.mockImplementation(async (...args: any[]) => {
+    expect(reads.mock.calls.map(call => call[1])).toEqual([
+      'creative-1', 'creative-2', 'creative-3', 'creative-1', 'creative-2', 'creative-3',
+    ]);
+    return original(...args);
+  });
+  messages.push({ role: 'user', content: 'Approved', metadata: { approvalDeckAnswer: { deckId: deck.deckId } } });
+  const result = await service.submitApprovalDeckAnswers(SESSION, deck.deckId, [{ itemId: deck.items[0].itemId, verdict: 'approve' }], 'user');
+  if (result.outcome !== 'submitted') throw new Error('not submitted');
+  expect(result.summary?.status).toBe('fully_applied');
+  expect(writes).toHaveLength(5);
+});
+
+it('blocks material creative copy drift between preview and execution', async () => {
+  const deck = await stage();
+  creatives.get('creative-3').object_story_spec.link_data.message = 'A different, valid offer.';
+  const result = await service.submitApprovalDeckAnswers(SESSION, deck.deckId, [{ itemId: deck.items[0].itemId, verdict: 'approve' }], 'user');
+  if (result.outcome !== 'submitted') throw new Error('not submitted');
+  expect(result.summary?.status).not.toBe('fully_applied');
+  expect(writes).toHaveLength(0);
+});
+
+it.each([undefined, null, 'bad', [], 42, { id: 'wrong', account_id: ACCOUNT },
+  { id: 'creative-3', account_id: '222' }, { id: 'creative-3' },
+  { id: 'creative-3', account_id: [ACCOUNT] },
+])('refuses an unavailable, malformed or foreign third creative before approval: %p', async value => {
+  creatives.set('creative-3', value);
+  const result = await preview();
+  expect(result.success).toBe(false);
+  expect(result.awaitingUserConfirmation).not.toBe(true);
+  expect(writes).toHaveLength(0);
+  expect(chatbotDb.claimMetaWriteManifestDigest).not.toHaveBeenCalled();
+});
+
+it.each([
+  { body: 'Lorem ipsum dolor sit amet' },
+  { title: 'TBD' },
+  { object_story_spec: { link_data: { message: 'Welcome to {{company_name}}' } } },
+  { object_story_spec: { video_data: { title: '[INSERT HEADLINE HERE]' } } },
+  { object_story_spec: { link_data: { child_attachments: [{ description: 'YOUR_TEXT_HERE' }] } } },
+  { asset_feed_spec: { bodies: [{ text: '[Your company name]' }] } },
+  { asset_feed_spec: { titles: [null] } },
+  { object_story_spec: { link_data: { message: 42 } } },
+])('refuses placeholder copy or malformed creative text before approval: %p', async content => {
+  creatives.set('creative-3', { ...creatives.get('creative-3'), ...content });
+  const result = await preview();
+  expect(result.success).toBe(false);
+  expect(result.awaitingUserConfirmation).not.toBe(true);
+  expect(writes).toHaveLength(0);
+});
+
+it.each(['missing', 'foreign', 'placeholder', 'read-error'])('rechecks the third creative (%s) before creating any parent', async failure => {
+  const deck = await stage();
+  if (failure === 'missing') creatives.delete('creative-3');
+  if (failure === 'foreign') creatives.get('creative-3').account_id = '222';
+  if (failure === 'placeholder') creatives.get('creative-3').body = 'INSERT COPY HERE';
+  if (failure === 'read-error') (metaService.getAdCreative as jest.Mock).mockRejectedValue(new Error('Meta unavailable'));
+  const result = await service.submitApprovalDeckAnswers(SESSION, deck.deckId, [{ itemId: deck.items[0].itemId, verdict: 'approve' }], 'user');
+  if (result.outcome !== 'submitted') throw new Error('not submitted');
+  expect(result.summary?.status).not.toBe('fully_applied');
+  expect(writes).toHaveLength(0);
+});
+
+it.each(['three ads', '3 ads', 'three ad variants'])('blocks a self-consistent two-ad model proposal when the user requested %s', async request => {
+  messages = [{ role: 'user', content: `Build one campaign with ${request}.` },
+    { role: 'assistant', content: 'I will create two ads.' }, { role: 'user', content: 'Proceed.' }];
+  const params = brief(); params.requested_ad_count = 2; params.ads.pop();
+  const result = await preview(params);
+  expect(result.success).toBe(false);
+  expect(result.message).toMatch(/3/);
+  expect(result.awaitingUserConfirmation).not.toBe(true);
+  expect(writes).toHaveLength(0);
+});
+
+it('requires a user-sourced count instead of trusting a model-only count', async () => {
+  messages = [{ role: 'assistant', content: 'Create three ads.' }];
+  expect((await preview()).success).toBe(false);
+  expect(writes).toHaveLength(0);
+});
+
+it('rechecks user count before writes if the brief changed after preview', async () => {
+  const deck = await stage();
+  messages.push({ role: 'user', content: 'Actually, create four ads.' });
+  const result = await service.submitApprovalDeckAnswers(SESSION, deck.deckId, [{ itemId: deck.items[0].itemId, verdict: 'approve' }], 'user');
+  if (result.outcome !== 'submitted') throw new Error('not submitted');
+  expect(result.summary?.status).not.toBe('fully_applied');
+  expect(writes).toHaveLength(0);
+});
+
+it.each([
+  { age_min: 25 },
+  { excluded_geo_locations: { countries: ['CA'] } },
+  { flexible_spec: [{ interests: [{ id: 'interest-1' }] }] },
+])('rejects extra material targeting in Meta read-back: %p', async extra => {
+  (metaService.listAdSets as jest.Mock).mockImplementation(async (_a, _t, _c, opts) => {
+    const node = nodes.get(opts.adSetId);
+    return { adSets: [{ ...node, targeting: { ...node.targeting, ...extra } }] };
+  });
+  const result = await approve();
+  if (result.outcome !== 'submitted') throw new Error('not submitted');
+  expect(result.summary?.status).not.toBe('fully_applied');
+  expect(writes).toHaveLength(2);
+});
+
+it('reads and rejects an unapproved campaign budget before creating children', async () => {
+  (metaService.listCampaigns as jest.Mock).mockImplementation(async (_a, _t, opts) => ({
+    campaigns: [{ ...nodes.get(opts.campaignId), ...(opts.fields.includes('daily_budget') ? { daily_budget: '10000' } : {}) }],
+  }));
+  const result = await approve();
+  if (result.outcome !== 'submitted') throw new Error('not submitted');
+  expect(result.summary?.status).not.toBe('fully_applied');
+  expect(writes).toHaveLength(1);
+});
+
+it.each(['CAMPAIGN', 'AD_SET', 'AD'])('bundle approval never authorizes %s activation', async entity => {
+  await approve();
+  const result: any = await service.callMetaMarketingApi('user-1', entity as any, 'UPDATE', ACCOUNT,
+    entity === 'CAMPAIGN' ? 'CAMPAIGN-1' : undefined, entity === 'AD_SET' ? 'AD_SET-2' : undefined,
+    entity === 'AD' ? 'AD-3' : undefined, { status: 'ACTIVE', confirm: true }, SESSION);
+  expect(result.awaitingUserConfirmation).toBe(true);
+  expect(writes).toHaveLength(5);
+});
+
+it('distinguishes one ad set from three ads in the human brief', async () => {
+  messages = [{ role: 'user', content: 'Create one campaign, one ad set, and three ads.' }];
+  expect((await preview()).awaitingUserConfirmation).toBe(true);
+});
+
+it('preserves approved Meta URL-tag macros and null optional creative fields', async () => {
+  for (const creative of creatives.values()) {
+    creative.url_tags = 'utm_campaign={{campaign.id}}&utm_content={{ad.id}}';
+    creative.object_story_spec.link_data.caption = null;
+  }
+  const result = await approve();
+  if (result.outcome !== 'submitted') throw new Error('not submitted');
+  expect(result.summary?.status).toBe('fully_applied');
+});
+
+it('blocks a changed top-level creative image before writes', async () => {
+  creatives.get('creative-3').image_url = 'https://agentweb.pro/original.png';
+  const deck = await stage();
+  creatives.get('creative-3').image_url = 'https://agentweb.pro/different.png';
+  await service.submitApprovalDeckAnswers(SESSION, deck.deckId, [{ itemId: deck.items[0].itemId, verdict: 'approve' }], 'user');
+  expect(writes).toHaveLength(0);
+});
+
+it('does not let duplicate targeting IDs hide an extra audience', async () => {
+  const input = brief();
+  (input.ad_set.targeting as any).custom_audiences = [{ id: 'audience-1' }, { id: 'audience-1' }];
+  const result = await preview(input);
+  const deck = (service as any).buildMetaWriteApprovalDeckFromHalts([result]);
+  await chatbotDb.updateSessionApprovalDeck(SESSION, deck);
+  (metaService.listAdSets as jest.Mock).mockImplementation(async (_a, _t, _c, opts) => {
+    const node = nodes.get(opts.adSetId);
+    return { adSets: [{ ...node, targeting: { ...node.targeting, custom_audiences: [{ id: 'audience-1' }, { id: 'audience-2' }] } }] };
+  });
+  await service.submitApprovalDeckAnswers(SESSION, deck.deckId, [{ itemId: deck.items[0].itemId, verdict: 'approve' }], 'user');
+  expect(writes).toHaveLength(2);
+});
+
+it.each([{ object_story_spec: {} }, { body: '' }, { asset_feed_spec: { bodies: [{}] } }])('refuses creative content that cannot be inspected: %p', async content => {
+  creatives.set('creative-3', { id: 'creative-3', account_id: ACCOUNT, ...content });
+  expect((await preview()).success).toBe(false);
+  expect(writes).toHaveLength(0);
+});
+
+it('blocks a material carousel ordering change after approval', async () => {
+  creatives.get('creative-3').object_story_spec.link_data.child_attachments = [
+    { name: 'First offer', link: 'https://agentweb.pro/first' },
+    { name: 'Second offer', link: 'https://agentweb.pro/second' },
+  ];
+  const deck = await stage();
+  creatives.get('creative-3').object_story_spec.link_data.child_attachments.reverse();
+  await service.submitApprovalDeckAnswers(SESSION, deck.deckId, [{ itemId: deck.items[0].itemId, verdict: 'approve' }], 'user');
   expect(writes).toHaveLength(0);
 });
