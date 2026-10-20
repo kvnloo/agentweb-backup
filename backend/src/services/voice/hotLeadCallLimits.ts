@@ -43,14 +43,6 @@ export function phoneMarkerKey(orgId: string, phoneE164: string): string {
   const digest = createHmac('sha256', getJwtSecret()).update(`hot_lead_call.phone\0${orgId}\0${phoneE164}`).digest('hex');
   return `hlc#phone#${digest}`;
 }
-/**
- * Keyed hash of the lead's E.164 phone, stored on the call record so the webhooks can tell that lead.phone
- * changed after the call passed the gates (a repeat submission overwrites it). A separate domain label from the
- * phone marker keeps the two values from ever being interchangeable; org-scoped like it.
- */
-export function leadPhoneMac(orgId: string, phoneE164: string): string {
-  return createHmac('sha256', getJwtSecret()).update(`hot_lead_call.lead_phone\0${orgId}\0${phoneE164}`).digest('hex');
-}
 // Per member, not per org: two team members can take two leads at once, while one member is not rung twice in a row.
 export const cooldownKey = (orgId: string, memberId: string): string => `hlc#cool#${orgId}#${memberId}`;
 // Fixed windows (not sliding): up to twice the cap can dial across an hour or day boundary, which is

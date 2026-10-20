@@ -1,6 +1,6 @@
 import { FakeLimitStore } from '../../../__tests__/helpers/fakeLimitStore';
 import { setLimitStoreForTests } from '../limitStore';
-import { claimMemberCooldown, cooldownKey, dailyCapKey, hourlyCapKey, isWithinCallWindow, leadPhoneMac, phoneMarkerKey, reserveCallSlot } from '../hotLeadCallLimits';
+import { claimMemberCooldown, cooldownKey, dailyCapKey, hourlyCapKey, isWithinCallWindow, phoneMarkerKey, reserveCallSlot } from '../hotLeadCallLimits';
 import type { HotLeadCallConfig } from '../../hotLeadCallConfig';
 import { teamMember } from '../../../__tests__/helpers/hotLeadCallFixtures';
 
@@ -162,18 +162,5 @@ describe('claimMemberCooldown', () => {
     await claim(A.id, later);
     await stale!();
     expect(limits.claims.has(cooldownKey('o', A.id))).toBe(true);
-  });
-});
-
-describe('leadPhoneMac', () => {
-  it('is a keyed, org-scoped digest that never contains the phone and differs from the phone marker', () => {
-    const mac = leadPhoneMac('org-a', PHONE);
-    expect(mac).toMatch(/^[0-9a-f]{64}$/);
-    expect(mac).not.toContain('5550100');
-    expect(phoneMarkerKey('org-a', PHONE)).not.toContain(mac);
-    expect(leadPhoneMac('org-b', PHONE)).not.toBe(mac);
-    expect(leadPhoneMac('org-a', '+15555550101')).not.toBe(mac);
-    process.env.JWT_SECRET = 'other-secret';
-    expect(leadPhoneMac('org-a', PHONE)).not.toBe(mac);
   });
 });

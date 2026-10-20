@@ -33,7 +33,7 @@ import { FakeLimitStore } from './helpers/fakeLimitStore';
 import { setLimitStoreForTests } from '../services/voice/limitStore';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
 import { FakeLeadCallStore } from './helpers/fakeLeadCallStore';
-import { leadPhoneMac } from '../services/voice/hotLeadCallLimits';
+import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
 import { teamMember, MEMBER_ID } from './helpers/hotLeadCallFixtures';
 
 const mock = (fn: unknown) => fn as jest.Mock;
@@ -815,7 +815,7 @@ describe('credentials that cannot be loaded', () => {
 describe('the call record of the first attempt', () => {
   it('stores a keyed digest of the dispatch-time phone, never the phone', async () => {
     await processHotLeadCallJob(jobOf());
-    expect(store.record!.leadPhoneMac).toBe(leadPhoneMac('org-a', '+12125550142'));
+    expect(store.record!.leadPhoneMac).toBe(leadPhoneMacOf('org-a', '+12125550142'));
     expect(JSON.stringify(store.record)).not.toMatch(/2125550142/);
   });
 });

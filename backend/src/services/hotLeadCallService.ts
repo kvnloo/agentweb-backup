@@ -11,7 +11,8 @@ import { isHotLeadCallEnabled } from './voice/hotLeadCallMode';
 import { isHotLeadCallEntitled } from './voice/hotLeadCallEntitlement';
 import { resolveHotLeadCallContext, type HotLeadCallContext } from './voice/hotLeadCallContext';
 import { getLeadCallStore } from './voice/leadCallStore';
-import { isWithinCallWindow, leadPhoneMac, reserveCallSlot, type Reservation } from './voice/hotLeadCallLimits';
+import { leadPhoneMacOf } from './voice/leadPhoneMac';
+import { isWithinCallWindow, reserveCallSlot, type Reservation } from './voice/hotLeadCallLimits';
 import { selectHotLeadCallCandidates } from './hotLeadCallRoster';
 import { NEXT_ATTEMPT_SOURCE, processHotLeadCallNextAttempt } from './hotLeadCallAttempts';
 import { errorText, placeMemberCall, type PlacementResult } from './hotLeadCallPlacement';
@@ -181,7 +182,7 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
         const startedAt = new Date().toISOString();
         created = await store.create(listId, leadId, {
           state: 'dialing', jobKey: key, startedAt, updatedAt: startedAt, attemptNo: 1, memberId: member.id, triedMemberIds: [member.id],
-          leadPhoneMac: leadPhoneMac(job.orgId, reviewed.phone),
+          leadPhoneMac: leadPhoneMacOf(job.orgId, reviewed.phone),
         });
         return created;
       },
