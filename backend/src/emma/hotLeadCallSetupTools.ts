@@ -1,6 +1,6 @@
 import { emmaToolRegistry } from './registry';
 import { callerIdentity, callerOrg, type ToolContext } from './orgCaller';
-import type { HotLeadCallConfig } from '../services/hotLeadCallConfig';
+import { MEMBER_ID, type HotLeadCallConfig } from '../services/hotLeadCallConfig';
 import { VERIFICATION_CODE_TTL_MS, VERIFICATION_MAX_ATTEMPTS, VERIFICATION_MAX_STARTS_PER_MEMBER_PER_DAY, VERIFICATION_MAX_STARTS_PER_ORG_PER_DAY } from '../services/voice/memberVerification';
 import { confirmMemberVerification, startMemberVerification, storedHotLeadCallConfig as storedConfig } from '../services/hotLeadCallSettingsService';
 import { assertHotLeadCallEntitled } from '../services/voice/hotLeadCallEntitlement';
@@ -38,11 +38,11 @@ function userIdOf(context: ToolContext): string {
   return String(context?.userId || context?.agentUserId);
 }
 
-const MEMBER_ID_PROPERTY = { type: 'string', pattern: '^m[a-z0-9]{7}$', description: 'The team member to verify (their id from get_hot_lead_call_settings). Optional when there is only one member.' };
+const MEMBER_ID_PROPERTY = { type: 'string', pattern: MEMBER_ID.source, description: 'The team member to verify (their id from get_hot_lead_call_settings). Optional when there is only one member.' };
 
 function memberIdOf(raw: unknown): string | undefined {
   if (raw === undefined) return undefined;
-  if (typeof raw !== 'string' || !/^m[a-z0-9]{7}$/.test(raw)) throw new Error(NO_ARGS_MESSAGE);
+  if (typeof raw !== 'string' || !MEMBER_ID.test(raw)) throw new Error(NO_ARGS_MESSAGE);
   return raw;
 }
 
@@ -109,6 +109,10 @@ emmaToolRegistry.register({
     requireAttended(context);
     const { memberId } = onlyKeys(args, ['memberId']);
     const { org, caller } = await callerIdentity(context, 'hot lead call verification', true);
+    // The service words these refusals for the portal; Emma is told which of her tools fixes them.
+    if (!configuredOrThrow(storedConfig(org)).twilioNumber) {
+      throw new Error('Provision a caller number first (provision_hot_lead_call_number): the verification call is placed from it.');
+    }
     const result = await startMemberVerification(org, caller, memberIdOf(memberId));
     return {
       success: true, ...result,
@@ -131,10 +135,9 @@ emmaToolRegistry.register({
   },
   execute: async (args: unknown, context?: ToolContext) => {
     const { code, memberId } = onlyKeys(args, ['code', 'memberId']);
-    const digits = typeof code === 'string' ? code.replace(/[\s-]/g, '') : '';
-    if (!/^\d{6}$/.test(digits)) throw new Error('The code is 6 digits');
     const { org, caller } = await callerIdentity(context, 'hot lead call verification', true);
-    const result = await confirmMemberVerification(org, caller, memberIdOf(memberId), digits);
+    configuredOrThrow(storedConfig(org));
+    const result = await confirmMemberVerification(org, caller, memberIdOf(memberId), code);
     return { success: true, memberVerified: true, ...result };
   },
 });

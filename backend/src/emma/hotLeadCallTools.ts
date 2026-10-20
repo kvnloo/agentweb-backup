@@ -3,7 +3,7 @@ import { callerIdentity, type ToolContext } from './orgCaller';
 import { LEAD_ORIGINS, LEAD_ORIGIN_DESCRIPTIONS } from '../services/leadNotificationConfig';
 import { isRecord } from '../services/leadNotificationAttribution';
 import {
-  HHMM, HOT_LEAD_CALL_ANNOUNCED_NAME_MAX, HOT_LEAD_CALL_COUNTRIES, HOT_LEAD_CALL_DEFAULT_CALLING_HOURS, HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS,
+  HHMM, MEMBER_ID, HOT_LEAD_CALL_ANNOUNCED_NAME_MAX, HOT_LEAD_CALL_COUNTRIES, HOT_LEAD_CALL_DEFAULT_CALLING_HOURS, HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS,
   HOT_LEAD_CALL_MAX_TEAM_SIZE, HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER, HOT_LEAD_CALL_MEMBER_NAME_MAX, HOT_LEAD_CALL_SYSTEM_FIELDS,
   type HotLeadCallConfig, type HotLeadCallWindow,
 } from '../services/hotLeadCallConfig';
@@ -103,7 +103,7 @@ emmaToolRegistry.register({
           items: {
             type: 'object',
             properties: {
-              id: { type: 'string', pattern: '^m[a-z0-9]{7}$', description: 'Id from get_hot_lead_call_settings; leave out for a new person.' },
+              id: { type: 'string', pattern: MEMBER_ID.source, description: 'Id from get_hot_lead_call_settings; leave out for a new person.' },
               name: { type: 'string', minLength: 1, maxLength: HOT_LEAD_CALL_MEMBER_NAME_MAX },
               phone: { type: 'string', description: 'US or Canadian number. Required for a new person; leave out to keep the saved one.' },
               windows: { type: 'array', items: WINDOW_SCHEMA, minItems: 1, maxItems: HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER },

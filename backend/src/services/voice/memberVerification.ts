@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import { orgDb, type Organization } from '../db';
 import { getJwtSecret } from '../../config/jwt';
-import { hotLeadCallConfigOf, maskPhone, HOT_LEAD_CALL_MAX_TEAM_SIZE, type HotLeadCallConfig, type HotLeadCallMember } from '../hotLeadCallConfig';
+import { hotLeadCallConfigOf, maskPhone, MEMBER_ID, HOT_LEAD_CALL_MAX_TEAM_SIZE, type HotLeadCallConfig, type HotLeadCallMember } from '../hotLeadCallConfig';
 import { isRecord } from '../leadNotificationAttribution';
 import {
   ConflictError, ForbiddenError, NotFoundError, ProviderError, RateLimitedError, StoredStateInvalidError, ValidationError, VerificationCodeError,
@@ -38,7 +38,6 @@ export const VERIFICATION_MAX_STARTS_PER_MEMBER_PER_DAY = 5;
 export const VERIFICATION_MAX_STARTS_PER_ORG_PER_DAY = 20;
 export const VERIFICATION_MAX_ATTEMPTS = 5;
 const CALL_TIMEOUT_SECONDS = 30;
-const MEMBER_ID = /^m[a-z0-9]{7}$/;
 /**
  * The verification call has no status callback, so its real duration is unknown. It reads a ~10 second
  * message; Twilio bills per started minute and an answered call that short is one minute, so one minute
@@ -151,17 +150,8 @@ const recent = (times: readonly number[], now: number) => times.filter(t => now 
 /** Seconds until the oldest of a full set of starts ages out of the 24h window. */
 const untilSlotFrees = (times: readonly number[], now: number) => seconds(Math.min(...times) + DAY_MS - now);
 
-export async function startVerification(org: Organization, config: HotLeadCallConfig, userId: string, memberId?: string) {
-  const member = memberToVerify(config, memberId);
-  if (!config.twilioNumber) {
-    throw new ForbiddenError('Provision a caller number first (provision_hot_lead_call_number): the verification call is placed from it.');
-  }
-  const now = Date.now();
-  const previousRaw = org.hotLeadCallVerification;
-  const history = currentState(previousRaw);
-  const memberStarts = recent(history.members[member.id]?.startedAt ?? [], now);
-  const orgStarts = recent(history.orgStartedAt, now);
-
+/** Throws RateLimitedError (with the seconds to wait) when another start now would break a limit. */
+function assertWithinLimits(memberStarts: readonly number[], orgStarts: readonly number[], now: number): void {
   const lastStart = Math.max(0, ...memberStarts);
   if (now - lastStart < VERIFICATION_MIN_GAP_MS) {
     throw new RateLimitedError(
@@ -181,6 +171,20 @@ export async function startVerification(org: Organization, config: HotLeadCallCo
       untilSlotFrees(orgStarts, now),
     );
   }
+}
+
+export async function startVerification(org: Organization, config: HotLeadCallConfig, userId: string, memberId?: string) {
+  const member = memberToVerify(config, memberId);
+  if (!config.twilioNumber) {
+    throw new ForbiddenError('A phone number for calls has not been set up yet, and the verification call is placed from it.');
+  }
+  const now = Date.now();
+  const previousRaw = org.hotLeadCallVerification;
+  const history = currentState(previousRaw);
+  const memberStarts = recent(history.members[member.id]?.startedAt ?? [], now);
+  const orgStarts = recent(history.orgStartedAt, now);
+
+  assertWithinLimits(memberStarts, orgStarts, now);
 
   const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
   const record: MemberVerification = {
@@ -212,6 +216,9 @@ export async function startVerification(org: Organization, config: HotLeadCallCo
     if (err instanceof VoiceCallError && err.placed === 'no') {
       throw new ProviderError('The phone provider rejected the verification call, so no call was placed and nothing was charged. Check the number and try again in a few minutes.');
     }
+    // Deliberately not metered: an unconfirmed placement returns no CallSid, and the usage event is keyed by it
+    // (twilio:voice:<sid>:verify), so there is nothing to key it by. The exposure is at most one minute of
+    // voice per start, and starts are capped at 5 per person and 20 per organization per day.
     throw new ProviderError('The phone provider did not confirm whether the verification call was placed. If your phone does not ring within a minute or two, start again after the 2 minute wait.');
   }
 

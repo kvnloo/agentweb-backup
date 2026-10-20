@@ -1,6 +1,5 @@
 import { Router, Request, Response } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
-import { releaseNumberOfDeletedOrg } from "../services/voice/numberProvisioning";
 import { userDb, orgDb, Organization } from "../services/db";
 import { defaultShareSettings } from "../services/orgShareService";
 import { callerCan, can, roleOf, isBillingRoot } from "../services/orgAuthz";
@@ -9,6 +8,7 @@ import crypto from "crypto";
 import { isCompanyEmail } from "../utils/validation";
 import { getUserSubscriptionResolution, getUserSubscriptionType, getTierConfig } from "../services/subscriptionService";
 import { redactAccountSecrets } from "../utils/accountSecretRedaction";
+import { releaseNumberOfDeletedOrg } from "../services/voice/numberProvisioning";
 import { purchaseExtraSeat, removeExtraSeat } from "../services/orgSeatBillingService";
 import {
   assertSeatAvailable,

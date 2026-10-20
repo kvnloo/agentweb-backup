@@ -64,7 +64,7 @@ export interface HotLeadCallPreviewDto {
 /** Keys the REST body may carry. */
 export const REST_SETTINGS_KEYS = ['_revision', 'enabled', 'callingHours', 'maxAttemptsPerLead', 'announcedName', 'team'] as const;
 /** Further scalar settings that only the Emma tool edits (the portal has no control for them). */
-export const TOOL_ONLY_SETTINGS_KEYS = ['leadTypes', 'maxAgeMinutes', 'maxCallsPerHour', 'maxCallsPerDay', 'memberCooldownMinutes', 'allowedCountries'] as const;
+const TOOL_ONLY_SETTINGS_KEYS = ['leadTypes', 'maxAgeMinutes', 'maxCallsPerHour', 'maxCallsPerDay', 'memberCooldownMinutes', 'allowedCountries'] as const;
 // Keys applied by their own logic rather than copied over the stored config.
 const HANDLED_KEYS = ['_revision', 'enabled', 'team', 'callingHours'];
 const TEAM_ENTRY_KEYS = ['id', 'name', 'phone', 'windows'] as const;
@@ -174,7 +174,7 @@ export async function previewHotLeadCallSettings(org: Organization, caller: HotL
 
 function configOrNoMember(org: Organization): HotLeadCallConfig {
   const config = storedHotLeadCallConfig(org);
-  if (!config) throw new NotFoundError('That team member does not exist. Save the hot lead call settings first (update_hot_lead_call_settings).');
+  if (!config) throw new NotFoundError('That team member does not exist. Save the hot lead call settings first.');
   return config;
 }
 
@@ -278,8 +278,9 @@ function buildTeam(rawTeam: unknown, current: HotLeadCallConfig | undefined, err
     } else {
       entry.windows.forEach((w, j) => {
         const problem = windowProblem(w);
-        if (problem) return fail(`${at('windows')}.${j}${problem.field ? `.${problem.field}` : ''}`, problem.message);
-        windows.push(windowOf(w)!);
+        const window = problem ? null : windowOf(w);
+        if (!window) return fail(`${at('windows')}.${j}${problem?.field ? `.${problem.field}` : ''}`, problem?.message ?? 'Invalid availability window');
+        windows.push(window);
       });
     }
 
@@ -362,6 +363,8 @@ function escalationOf(current: HotLeadCallConfig | undefined, next: HotLeadCallC
     const allowed = minutesCovered(before);
     for (const m of minutesCovered(next.callingHours)) if (!allowed.has(m)) return 'widening the calling hours';
   }
+  // The business name is read aloud to the lead and the member, so a new one is a new thing to say to strangers.
+  if (next.announcedName !== current.announcedName) return 'changing the business name';
   if (teamKey(next.team) !== teamKey(current.team)) return 'changing the team';
   return null;
 }
@@ -405,7 +408,7 @@ export async function applyHotLeadCallSettings(org: Organization, caller: HotLea
   if (Object.keys(errors).length || !team) throw new ValidationError(summary(errors), errors);
 
   const entitled = await isHotLeadCallEntitled(org);
-  const wantsEnabled = (body.enabled as boolean | undefined) ?? current?.enabled ?? false;
+  const wantsEnabled = (typeof body.enabled === 'boolean' ? body.enabled : undefined) ?? current?.enabled ?? false;
   // Turning calling on is what lets calls spend money; saving while off, or editing while already on, is not gated.
   if (wantsEnabled && !current?.enabled && !entitled) throw new NotEntitledError();
 
@@ -413,7 +416,7 @@ export async function applyHotLeadCallSettings(org: Organization, caller: HotLea
     ...current,
     ...Object.fromEntries(Object.entries(body).filter(([key]) => !HANDLED_KEYS.includes(key))),
     team,
-    ...(body.callingHours ? { callingHours: { ...(body.callingHours as object), timezone: normalizeTimezone((body.callingHours as { timezone: unknown }).timezone) } } : {}),
+    ...(isRecord(body.callingHours) ? { callingHours: { ...body.callingHours, timezone: normalizeTimezone(body.callingHours.timezone) } } : {}),
     enabled: false,
   };
   const draft = hotLeadCallConfigOf(candidate);

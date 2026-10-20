@@ -101,7 +101,7 @@ const KEYS: ReadonlySet<string> = new Set([
 const CALLING_HOURS_KEYS: ReadonlySet<string> = new Set(['start', 'end', 'timezone']);
 const MEMBER_KEYS: ReadonlySet<string> = new Set(['id', 'name', 'phone', 'verifiedAt', 'windows']);
 const WINDOW_KEYS: ReadonlySet<string> = new Set(['days', 'start', 'end']);
-const MEMBER_ID = /^m[a-z0-9]{7}$/;
+export const MEMBER_ID = /^m[a-z0-9]{7}$/;
 // Shown in the portal and in tool output, never spoken, but kept as strict as the announced name.
 const MEMBER_NAME = /^[\p{L}\p{N} .,'&-]+$/u;
 // SECURITY: this text is spoken inside TwiML <Say>. '&' is deliberately allowed ('Smith & Sons'),
@@ -174,7 +174,7 @@ function limit(raw: unknown, field: HotLeadCallLimitField): number | null {
 /** Minutes since local midnight of an HH:MM (or 24:00) string that already passed validation. */
 export const hhmmToMinutes = (hhmm: string): number => Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.slice(3, 5));
 
-export function callingHoursOf(raw: unknown): HotLeadCallCallingHours | null {
+function callingHoursOf(raw: unknown): HotLeadCallCallingHours | null {
   if (!isRecord(raw) || Object.keys(raw).some(k => !CALLING_HOURS_KEYS.has(k))) return null;
   const start = raw.start === undefined ? HOT_LEAD_CALL_DEFAULT_CALLING_HOURS.start : raw.start;
   const end = raw.end === undefined ? HOT_LEAD_CALL_DEFAULT_CALLING_HOURS.end : raw.end;

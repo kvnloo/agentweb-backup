@@ -5,6 +5,7 @@ import {
   confirmMemberVerification, getHotLeadCallSettings, previewHotLeadCallSettings, startMemberVerification, updateHotLeadCallSettings,
   REST_SETTINGS_KEYS, type HotLeadCallCaller,
 } from '../services/hotLeadCallSettingsService';
+import { MEMBER_ID } from '../services/hotLeadCallConfig';
 import {
   ConflictError, ForbiddenError, NotEntitledError, NotFoundError, ProviderError, RateLimitedError, RevisionRequiredError,
   StoredStateInvalidError, ValidationError, VerificationCodeError,
@@ -17,8 +18,8 @@ import {
  */
 const router = express.Router();
 
-const MAX_BODY_BYTES = 32 * 1024;
-const MEMBER_ID = /^m[a-z0-9]{7}$/;
+// JSON.stringify(body).length, so characters of JSON text rather than bytes: a cap against absurd bodies, not a byte quota.
+const MAX_BODY_JSON_CHARS = 32 * 1024;
 const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 async function loadCaller(req: Request): Promise<{ org: Organization; caller: HotLeadCallCaller } | null> {
@@ -69,7 +70,7 @@ router.put('/', async (req, res) => {
     if (!ctx) return res.status(404).json({ error: 'No organization' });
     const body: unknown = req.body;
     if (!isPlainObject(body)) return res.status(400).json({ error: 'A settings object is required' });
-    if (JSON.stringify(body).length > MAX_BODY_BYTES) return res.status(400).json({ error: 'The settings are too large' });
+    if (JSON.stringify(body).length > MAX_BODY_JSON_CHARS) return res.status(400).json({ error: 'The settings are too large' });
     const unknown = Object.keys(body).filter(k => !(REST_SETTINGS_KEYS as readonly string[]).includes(k));
     if (unknown.length) {
       return res.status(400).json({ error: `Unknown setting: ${unknown[0]}`, fieldErrors: Object.fromEntries(unknown.map(k => [k, 'Unknown field'])) });
