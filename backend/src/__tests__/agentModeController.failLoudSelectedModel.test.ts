@@ -798,7 +798,7 @@ describe('ENG-669 tier model allowlist', () => {
       it('the only exempt paths: defaulted (nothing requested), the configured default, a system model', async () => {
         await expect(resolveEffectiveModelForUser({ userId: OWNER })).resolves.toMatchObject({ modelSelection: 'defaulted' });
         await expect(resolveEffectiveModelForUser({ userId: OWNER, requestedModel: DEFAULT_MODEL })).resolves.toMatchObject({ modelSelection: 'honored' });
-        await expect(resolveEffectiveModelForUser({ userId: OWNER, requestedModel: DISALLOWED, systemModel: true }))
+        await expect(resolveEffectiveModelForUser({ userId: OWNER, requestedModel: DISALLOWED, modelSource: 'system' }))
           .resolves.toMatchObject({ effectiveModel: DISALLOWED, modelSelection: 'honored' });
       });
 

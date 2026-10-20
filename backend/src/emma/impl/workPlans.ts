@@ -539,7 +539,8 @@ export async function applyPredefinedWorkPlan(
     let stepModelIds = new Map<number, string>();
     // ENG-669: an admin-authored plan's pins are AgentWeb's choice (no tier check); any other plan's pins must be in
     // the launching (session-owner) user's plan.
-    const tierOwner = isSystemAuthoredPlan(predefinedPlan) ? undefined : (userId || undefined);
+    const planPinSourceAtLaunch: 'system' | 'user' = isSystemAuthoredPlan(predefinedPlan) ? 'system' : 'user';
+    const tierOwner = planPinSourceAtLaunch === 'system' ? undefined : (userId || undefined);
     try {
       planPinnedModel = await resolvePlanLaunchModel(
         modelRegistry,
@@ -659,7 +660,8 @@ export async function applyPredefinedWorkPlan(
         description: step.description,
         ...(step.userInstructions !== undefined && { userInstructions: step.userInstructions }),
         // ENG-2378: the step's validated canonical model (only while the switch is on; otherwise it is not copied).
-        ...(stepModelIds.has(stepIndex) && { model: stepModelIds.get(stepIndex) }),
+        // ENG-669: with who chose it (the plan's author), recorded with the model and moved with it.
+        ...(stepModelIds.has(stepIndex) && { model: stepModelIds.get(stepIndex), modelSource: planPinSourceAtLaunch }),
         status: 'pending' as const,
         completedAt: undefined,
         notes: undefined,
@@ -685,7 +687,7 @@ export async function applyPredefinedWorkPlan(
       updatedAt: new Date().toISOString(),
       // ENG-2378: what a step WITHOUT a model falls back to: the plan default, then the model the session had before.
       ...(stepModelIds.size > 0 && {
-        ...(planPinnedModel && { planDefaultModel: planPinnedModel }),
+        ...(planPinnedModel && { planDefaultModel: planPinnedModel, planDefaultModelSource: planPinSourceAtLaunch }),
         ...(session.llmModel && { launchModel: session.llmModel, launchModelSource: storedModelSource(session) }),
       }),
       // ENG-1472: which predefined template this session's plan was launched
@@ -694,7 +696,7 @@ export async function applyPredefinedWorkPlan(
       // detect "this recommendation was already applied".
       templatePlanId: predefinedPlan.planId,
       // ENG-669: recorded now, so a later edit or deletion of the template cannot change whose pins these are.
-      planAuthor: isSystemAuthoredPlan(predefinedPlan) ? 'system' as const : 'user' as const,
+      planAuthor: planPinSourceAtLaunch,
     };
     // Validate the plan structure BEFORE the model write: updateSessionWorkPlan rejects a
     // non-sequential stepCount, and by then the model would already have been changed.
@@ -712,7 +714,7 @@ export async function applyPredefinedWorkPlan(
     if (planPinnedModel) {
       try {
         // ENG-669: an admin-authored plan's pin is AgentWeb's choice; a user plan's pin is a user's.
-        await chatbotDb.updateSessionLlmModel(sessionId, planPinnedModel, undefined, isSystemAuthoredPlan(predefinedPlan) ? 'system' : 'user');
+        await chatbotDb.updateSessionLlmModel(sessionId, planPinnedModel, undefined, planPinSourceAtLaunch);
       } catch (modelErr) {
         console.error('[applyPredefinedWorkPlan] Failed to save plan model; launch refused:', (modelErr as Error).message);
         return {
@@ -2157,11 +2159,12 @@ export async function modifyWorkPlan(
         // Update existing step (preserve status and completion info)
         // ENG-2378: the step's model follows the STEP (by title), not the stepCount slot it happened to occupy:
         // after an insert/reorder the slot holds a different step. A new/retitled step starts with no model.
-        const { model: _slotModel, ...slotWithoutModel } = workPlan.steps[existingIndex] as any;
+        // ENG-669: and the model's provenance (modelSource) moves WITH it, never stays with the slot.
+        const { model: _slotModel, modelSource: _slotModelSource, ...slotWithoutModel } = workPlan.steps[existingIndex] as any;
         const boundModel = modelBoundToStep([...originalStepsBeforeRemoval.values()], newStep.stepCount, newStep.title);
         workPlan.steps[existingIndex] = {
           ...slotWithoutModel,
-          ...(boundModel && { model: boundModel }),
+          ...boundModel,
           title: newStep.title,
           // ENG-2400: omitting description preserves the stored one (same
           // contract as userInstructions/skillIds); it used to be wiped.
@@ -2208,7 +2211,7 @@ export async function modifyWorkPlan(
         workPlan.steps.push({
           stepCount: newStep.stepCount,
           title: newStep.title,
-          ...(addedModel && { model: addedModel }),
+          ...addedModel,
           description: newStep.description,
           ...(newStep.userInstructions !== undefined && { userInstructions: newStep.userInstructions }),
           status: 'pending',

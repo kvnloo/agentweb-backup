@@ -39,7 +39,7 @@ jest.mock('../services/agentModeService', () => {
   };
 });
 
-import { getTierCompareBlock, isSystemModelFor, modelAccess } from '../services/agentMode/modelAccessInstance';
+import { getTierCompareBlock, isSystemChosen, legacyPlanPinSource, modelAccess, storedBindingSource } from '../services/agentMode/modelAccessInstance';
 import { userDb } from '../services/db';
 import { readTierAllowedModels, getUserSubscriptionResolution } from '../services/subscriptionService';
 import { workPlanService } from '../services/workPlanService';
@@ -60,11 +60,21 @@ beforeEach(() => {
   mockTierConfig.mockResolvedValue({ configured: true, allowedModels: ['agentweb-model'] });
 });
 
-describe('isSystemModelFor', () => {
-  it('the configured default is a system model everywhere', async () => {
-    expect(await isSystemModelFor(null, 'default-model')).toBe(true);
-    expect(await isSystemModelFor({ sessionType: 'regular' }, 'default-model')).toBe(true);
-    expect(await isSystemModelFor(null, 'gpt-5.5')).toBe(false);
+/**
+ * ENG-669: the ONE exemption (besides an admin owner): provenance recorded WITH the model when it was written says
+ * AgentWeb chose it, or the model is the configured default for the session's kind. Nothing is inferred at check time
+ * from a session's plan or template; the only template read is the one legacy rule for plans launched before the record.
+ */
+describe('isSystemChosen', () => {
+  it('recorded provenance decides: system is exempt, user and unrecorded are not', async () => {
+    expect(await isSystemChosen('gpt-5.5', 'system')).toBe(true);
+    expect(await isSystemChosen('gpt-5.5', 'user')).toBe(false);
+    expect(await isSystemChosen('gpt-5.5', undefined)).toBe(false);
+  });
+
+  it('the configured default is exempt everywhere, whatever the recorded source', async () => {
+    expect(await isSystemChosen('default-model', 'user', null)).toBe(true);
+    expect(await isSystemChosen('default-model', undefined, { sessionType: 'regular' })).toBe(true);
   });
 
   it.each([
@@ -74,80 +84,68 @@ describe('isSystemModelFor', () => {
     [{ sessionType: 'image-generation' }, 'image-model'],
     [{ sessionType: 'video-generation' }, 'video-model'],
     [{ sessionType: 'regular', portalType: 'emma-sidebar' }, 'cs-model'],
-  ])('%p: its configured default %s is a system model there, and only there', async (session, model) => {
-    expect(await isSystemModelFor(session, model)).toBe(true);
-    expect(await isSystemModelFor({ sessionType: 'regular', portalType: 'agent' }, model)).toBe(false);
+  ])('%p: its configured default %s is exempt there, and only there', async (session, model) => {
+    expect(await isSystemChosen(model, 'user', session)).toBe(true);
+    expect(await isSystemChosen(model, 'user', { sessionType: 'regular', portalType: 'agent' })).toBe(false);
   });
 
-  it("an admin-authored plan's pins are system models in a session launched from it; a user plan's are not", async () => {
-    const session = { sessionType: 'predefined-work-plan', workPlan: { templatePlanId: 'plan-1' } };
-    mockGetWorkPlan.mockResolvedValue({ visibility: 'system', isBuiltIn: true, defaultModel: 'plan-pin', steps: [{ model: 'step-pin' }, {}] });
-    expect(await isSystemModelFor(session, 'plan-pin')).toBe(true);
-    expect(await isSystemModelFor(session, 'step-pin')).toBe(true);
-    expect(await isSystemModelFor(session, 'gpt-5.5')).toBe(false);
-
-    mockGetWorkPlan.mockResolvedValue({ visibility: 'private', isBuiltIn: false, defaultModel: 'plan-pin', steps: [{ model: 'step-pin' }] });
-    expect(await isSystemModelFor(session, 'plan-pin')).toBe(false);
-    expect(await isSystemModelFor(session, 'step-pin')).toBe(false);
-  });
-
-  it('the author recorded at launch (planAuthor) decides, with NO template read: a later edit or deletion cannot matter', async () => {
-    const systemPlan = { workPlan: { templatePlanId: 'plan-1', planAuthor: 'system', planDefaultModel: 'plan-pin', steps: [{ model: 'step-pin' }] } };
-    expect(await isSystemModelFor(systemPlan, 'plan-pin')).toBe(true);
-    expect(await isSystemModelFor(systemPlan, 'step-pin')).toBe(true);
-    expect(await isSystemModelFor(systemPlan, 'gpt-5.5')).toBe(false);
-    const userPlan = { workPlan: { templatePlanId: 'plan-1', planAuthor: 'user', planDefaultModel: 'plan-pin', steps: [{ model: 'step-pin' }] } };
-    expect(await isSystemModelFor(userPlan, 'step-pin')).toBe(false);
+  it("no check-time inference: a session's plan pins or template exempt nothing on their own", async () => {
+    mockGetWorkPlan.mockResolvedValue({ visibility: 'system', isBuiltIn: true, defaultModel: 'plan-pin', steps: [{ model: 'step-pin' }] });
+    const session = {
+      llmModel: 'plan-pin', // a legacy stamp with no source and no decision (review F1: no longer exempt)
+      workPlan: { templatePlanId: 'plan-1', planAuthor: 'system', steps: [{ model: 'step-pin' }] },
+    };
+    expect(await isSystemChosen('plan-pin', undefined, session)).toBe(false);
+    expect(await isSystemChosen('step-pin', undefined, session)).toBe(false);
     expect(mockGetWorkPlan).not.toHaveBeenCalled();
   });
+});
 
-  it("an adopted step model (modelSource 'user') in an admin-authored plan is the user's, not a system model", async () => {
-    const session = { workPlan: { planAuthor: 'system', steps: [{ model: 'step-pin' }, { model: 'gpt-5.5', modelSource: 'user' }] } };
-    expect(await isSystemModelFor(session, 'step-pin')).toBe(true);
-    expect(await isSystemModelFor(session, 'gpt-5.5')).toBe(false);
+describe("storedBindingSource: the session's OWN stamp", () => {
+  const canonical = (id: string) => (id === 'alias-5.5' ? 'gpt-5.5' : id);
+  it('re-sending or re-selecting the stored model (any spelling) carries its recorded provenance; anything else is a user pick', async () => {
+    const session = { llmModel: 'gpt-5.5', llmModelSource: 'system' as const };
+    expect(await storedBindingSource(session, 'gpt-5.5', canonical)).toBe('system');
+    expect(await storedBindingSource(session, 'alias-5.5', canonical)).toBe('system');
+    expect(await storedBindingSource(session, 'gemini-3.5-flash', canonical)).toBe('user');
+    expect(await storedBindingSource({ llmModel: 'gpt-5.5', llmModelSource: 'user' }, 'gpt-5.5', canonical)).toBe('user');
+    expect(await storedBindingSource(null, 'gpt-5.5', canonical)).toBe('user');
+  });
+  it('legacy stamps (no source) follow the one session rule: a defaulted/corrected decision or a side channel is system', async () => {
+    expect(await storedBindingSource({ llmModel: 'gpt-5.5', llmUsagePolicyDecision: { effectiveModel: 'gpt-5.5', modelSelection: 'corrected' } }, 'gpt-5.5', canonical)).toBe('system');
+    expect(await storedBindingSource({ llmModel: 'gpt-5.5', slackThread: { channel: 'C' } }, 'gpt-5.5', canonical)).toBe('system');
+    expect(await storedBindingSource({ llmModel: 'gpt-5.5' }, 'gpt-5.5', canonical)).toBe('user');
   });
 
-  it('legacy session with a still-admin-authored template: the pins it copied at launch stay system models after a template edit', async () => {
-    mockGetWorkPlan.mockResolvedValue({ visibility: 'system', isBuiltIn: true, defaultModel: 'gemini-3.5-flash', steps: [{ model: 'gemini-3.5-flash' }] });
-    const legacy = {
-      llmModel: 'plan-pin', // stamped at launch by a write that carried no decision and no source
-      workPlan: { templatePlanId: 'plan-1', planDefaultModel: 'plan-pin', steps: [{ model: 'step-pin' }] },
-    };
-    expect(await isSystemModelFor(legacy, 'plan-pin')).toBe(true);
-    expect(await isSystemModelFor(legacy, 'step-pin')).toBe(true);
-    expect(await isSystemModelFor(legacy, 'gpt-5.5')).toBe(false);
+  it("legacy plan session: the engine's unsourced stamp of the plan's OWN pin follows the plan-pin legacy rule; another model does not", async () => {
+    mockGetWorkPlan.mockResolvedValue({ visibility: 'system', isBuiltIn: true });
+    const honored = { effectiveModel: 'step-pin', modelSelection: 'honored' as const };
+    const legacy = { llmModel: 'step-pin', llmUsagePolicyDecision: honored, workPlan: { templatePlanId: 't1', planDefaultModel: 'plan-pin', steps: [{ model: 'step-pin' }] } };
+    expect(await storedBindingSource(legacy, 'step-pin', canonical)).toBe('system');
+    expect(await storedBindingSource({ ...legacy, llmModel: 'plan-pin', llmUsagePolicyDecision: undefined }, 'plan-pin', canonical)).toBe('system');
+    expect(await storedBindingSource({ ...legacy, llmModel: 'gpt-5.5', llmUsagePolicyDecision: undefined }, 'gpt-5.5', canonical)).toBe('user');
+    // A recorded source, or a plan launched after the record existed, is never re-inferred.
+    expect(await storedBindingSource({ ...legacy, llmModelSource: 'user' }, 'step-pin', canonical)).toBe('user');
+    expect(await storedBindingSource({ ...legacy, workPlan: { ...legacy.workPlan, planAuthor: 'system' } }, 'step-pin', canonical)).toBe('user');
+    mockGetWorkPlan.mockResolvedValue({ visibility: 'private', isBuiltIn: false });
+    expect(await storedBindingSource(legacy, 'step-pin', canonical)).toBe('user');
   });
+});
 
-  it('a human pick is exempt only as the configured default or the session\'s own system stamp (not as a plan pin or kind default)', async () => {
-    const session = { sessionType: 'scheduled', llmModel: 'gpt-5.5', llmModelSource: 'system' as const, workPlan: { planAuthor: 'system', steps: [{ model: 'step-pin' }] } };
-    expect(await isSystemModelFor(session, 'step-pin', { humanPick: true })).toBe(false);
-    expect(await isSystemModelFor(session, 'sched-model', { humanPick: true })).toBe(false);
-    expect(await isSystemModelFor(session, 'default-model', { humanPick: true })).toBe(true);
-    expect(await isSystemModelFor(session, 'gpt-5.5', { humanPick: true })).toBe(true);
-    expect(await isSystemModelFor(session, 'step-pin')).toBe(true);
-  });
-
-  it('legacy session (no planAuthor): a deleted template (null) exempts nothing', async () => {
+describe('legacyPlanPinSource: the one legacy rule for plan pins', () => {
+  it('a still-admin-authored template makes the plan\'s own pins system; a user template or a deleted one does not', async () => {
+    mockGetWorkPlan.mockResolvedValue({ visibility: 'system', isBuiltIn: true });
+    expect(await legacyPlanPinSource({ templatePlanId: 'plan-1' })).toBe('system');
+    mockGetWorkPlan.mockResolvedValue({ visibility: 'private', isBuiltIn: false });
+    expect(await legacyPlanPinSource({ templatePlanId: 'plan-1' })).toBe('user');
     mockGetWorkPlan.mockResolvedValue(null);
-    expect(await isSystemModelFor({ workPlan: { templatePlanId: 'plan-gone' } }, 'plan-pin')).toBe(false);
+    expect(await legacyPlanPinSource({ templatePlanId: 'plan-gone' })).toBe('user');
+    expect(await legacyPlanPinSource({})).toBe('user');
   });
-
-  it("the session's stored model is a system model when AgentWeb stamped it (recorded or legacy-defaulted), not when a user picked it", async () => {
-    expect(await isSystemModelFor({ llmModel: 'gpt-5.5', llmModelSource: 'system' }, 'gpt-5.5')).toBe(true);
-    expect(await isSystemModelFor({ llmModel: 'gpt-5.5', llmModelSource: 'user' }, 'gpt-5.5')).toBe(false);
-    expect(await isSystemModelFor({
-      llmModel: 'gpt-5.5', llmUsagePolicyDecision: { effectiveModel: 'gpt-5.5', modelSelection: 'corrected' },
-    }, 'gpt-5.5')).toBe(true);
-    expect(await isSystemModelFor({
-      llmModel: 'gpt-5.5', llmUsagePolicyDecision: { effectiveModel: 'gpt-5.5', modelSelection: 'honored' },
-    }, 'gpt-5.5')).toBe(false);
-    expect(await isSystemModelFor({ llmModel: 'gpt-5.5' }, 'gpt-5.5')).toBe(false);
-  });
-
-  it('an unreadable template never blocks (treated as admin-authored)', async () => {
+  it('an unreadable template never blocks (system, logged)', async () => {
     mockGetWorkPlan.mockRejectedValue(new Error('ddb down'));
     const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
-    expect(await isSystemModelFor({ workPlan: { templatePlanId: 'plan-1' } }, 'gpt-5.5')).toBe(true);
+    expect(await legacyPlanPinSource({ templatePlanId: 'plan-1' })).toBe('system');
     consoleError.mockRestore();
   });
 });

@@ -34,20 +34,30 @@ the plan's `planAuthor` / `launchModelSource` (stripped for share viewers). `Sch
 (`visibility: 'system'`) schedule template; a user-authored template's pin is checked at creation (422). Only an
 administrator may change a system template's model (403 for its non-admin creator). A confirmed recommendation
 switch records `modelSourceBefore` on its audit row, so an undo restores the 'system' origin with the model. The
-session `workPlan` records `planAuthor` (and `launchModelSource`) at launch, so a later edit or deletion of the
-template does not change whose pins they are.
+session `workPlan` records `planAuthor`, `launchModelSource`, `planDefaultModelSource` and each step pin's
+`modelSource` at launch, so a later edit or deletion of the template does not change whose pins they are.
 
 **Who / what is checked.** The canonical id (after alias resolution) against the session OWNER's tier (org members:
 the org owner's tier unless they have their own live subscription; `anon_` owners: Free), never the caller. Admin
 owners bypass. Requested AND stored models are checked, before the silent-swap branches, so a stored selection outside
 the plan is a 422 and is not rewritten (grandfathering). The only exempt "no choice" path is defaulted.
 
-**System models (exempt).** The configured interactive default (everywhere); the session kind's configured default
-(scheduled, report generation, image / video generation, customer support / emma-sidebar); an unpinned schedule's
-scheduled default; the usage-paused body; the pins (plan default + step models) of an admin-authored Work Plan
-(`isBuiltIn` or `visibility: 'system'`) in a session launched from it. User-authored plan/schedule/step pins are checked
-at write (unchanged stored values stay editable) and at launch/run. Note: a schedule created from a system schedule
-template copies the template's model as a user pin, so it is checked at run time.
+**System models (exempt).** One rule (`isSystemChosen` in `modelAccessInstance.ts`): a model is exempt only when the
+provenance recorded WITH it when it was written says AgentWeb chose it, or it is the configured default for the
+session's kind (interactive default everywhere; scheduled, report generation, image / video generation, customer
+support / emma-sidebar in those sessions), or the owner is an admin. Nothing is inferred at check time from a
+session's plan or template. Provenance records: `ChatSession.llmModelSource`; on a session work plan each step pin's
+`modelSource` and `planDefaultModelSource`, stamped at launch from the plan's author (admin-authored = 'system'), and
+moved together with the model by every modify / reorder / insert (a slot never keeps another step's source); a user's
+adoption of a model for a step writes `modelSource: 'user'`. Templates carry no provenance (the author is stamped at
+launch), so saving a session plan as a template copies the model only. Re-sending or re-selecting the session's stored
+model carries its stamp's source; any other model in a request or a picker PATCH is a user's pick. Legacy records
+(written before this change, no source at all): a session stamp follows the decision / side-channel rule above; a
+plan with no `planAuthor` treats its OWN pins (plan default and step pins as copied at launch, and the engine's stamp
+of one of them) as system while its template is still admin-authored (a deleted template: user; an unreadable one
+never blocks). An unpinned schedule's default is system; a schedule created from a system schedule template copies the
+template's model as a user pin, so it is checked at run time. A refusal on an approval-inbox resume is saved once and
+pushed live once (with its messageIndex and error flag), only for a tier refusal.
 
 **Enforcement points.** `resolveEffectiveModelForUser`; `validateModelPin` / `validateScheduleModelPin` / plan write
 and launch helpers (owner/launcher threaded through); session PATCH (with the switch on: checked against the session

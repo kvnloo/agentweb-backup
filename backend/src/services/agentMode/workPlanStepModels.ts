@@ -85,11 +85,24 @@ export function createWorkPlanStepModelsSwitch(deps: WorkPlanStepModelsSwitchDep
   return { isEnabled, getState, shouldHonor };
 }
 
-type StepLike = { stepCount?: unknown; title?: unknown; model?: unknown; status?: unknown };
+type StepLike = { stepCount?: unknown; title?: unknown; model?: unknown; modelSource?: unknown; status?: unknown };
 
 /** A step's explicit model, or undefined when it has none (absent, blank or not a string). */
 export function stepModelOf(step: StepLike | null | undefined): string | undefined {
   return typeof step?.model === 'string' && step.model.trim() ? step.model.trim() : undefined;
+}
+
+/**
+ * ENG-669: a step's model WITH who chose it (`modelSource`), as one unit. Anything that moves or copies a step model
+ * (modify, reorder, carry-over) moves this pair, never the model alone, so provenance always describes its own model.
+ */
+export type StepModelBinding = { model: string; modelSource?: 'system' | 'user' };
+
+export function stepModelBindingOf(step: StepLike | null | undefined): StepModelBinding | undefined {
+  const model = stepModelOf(step);
+  if (!model) return undefined;
+  const source = step?.modelSource;
+  return source === 'system' || source === 'user' ? { model, modelSource: source } : { model };
 }
 
 /**
@@ -217,6 +230,8 @@ export function carryStoredStepModels<T extends StepLike>(
   return incoming.map((step, i) => {
     if (!allow(i) || stepModelOf(step) || (step as StepLike)?.model === '') return step;
     const j = matchOf.get(i);
+    // A TEMPLATE write: only the model is carried. A template records no per-step provenance (its author is stamped on
+    // each binding at launch), so a session's 'system' stamp saved into a user's template can never become exempt.
     const model = j === undefined ? undefined : stepModelOf(storedSteps[j]);
     return model ? { ...step, model } : step;
   });
@@ -231,13 +246,13 @@ export function modelBoundToStep(
   originals: ReadonlyArray<StepLike>,
   stepCount: number,
   title: unknown,
-): string | undefined {
+): StepModelBinding | undefined {
   const t = normTitle(title);
   if (!t) return undefined;
   const slot = originals.find((s) => Number(s?.stepCount) === stepCount);
-  if (slot && normTitle(slot.title) === t) return stepModelOf(slot);
+  if (slot && normTitle(slot.title) === t) return stepModelBindingOf(slot);
   const hits = originals.filter((s) => normTitle(s?.title) === t);
-  return hits.length === 1 ? stepModelOf(hits[0]) : undefined;
+  return hits.length === 1 ? stepModelBindingOf(hits[0]) : undefined;
 }
 
 /**

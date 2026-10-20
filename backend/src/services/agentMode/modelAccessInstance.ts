@@ -14,6 +14,7 @@ import {
   resolveLegacyModelAlias,
   storedModelSource,
   type ModelAccessService,
+  type ModelSource,
   type StoredModelRecord,
   type TierModelsConfig,
 } from './modelAccess';
@@ -64,47 +65,26 @@ export interface SystemModelSession extends StoredModelRecord {
   } | null;
 }
 
-/** The system models of a context: canonical ids, or `all` when the context could not be read (never block on it). */
-type SystemModels = { all: true } | { all: false; ids: Set<string> };
+/** A model binding's provenance, as recorded when it was written (undefined = none recorded: a user's). */
+export type BindingSource = ModelSource | undefined;
 
 /**
- * The canonical ids AgentWeb itself runs in this context, which the allowlist never refuses:
- *  - the configured interactive default, everywhere (a turn with no model runs it, so refusing it when named would
- *    only break the picker round-trip);
- *  - the default configured for the session's kind: scheduled, report generation, image / video generation,
- *    customer support (emma-sidebar);
- *  - the session's STORED model when AgentWeb stamped it (llmModelSource 'system', or a legacy decision that shows it
- *    was defaulted / corrected): e.g. the default at creation, which stays a system stamp after an admin rotates it;
- *  - the pins (plan default and step models) of an admin-authored plan the session runs: recorded at launch
- *    (`workPlan.planAuthor`), so a later edit or deletion of the template does not matter. Sessions launched before
- *    that record existed fall back to reading the template: a deleted template (null) exempts nothing, a failed read
- *    exempts everything (an outage never blocks; logged).
- * An unreadable default contributes nothing.
+ * ENG-669: the ONE answer to "did AgentWeb choose this model?", the only exemption from the tier allowlist besides an
+ * admin owner. True when the binding's provenance, recorded when it was written, says 'system', or the model is the
+ * configured default for this session's kind (the interactive default everywhere; the scheduled / report / image /
+ * video / customer-support default in such sessions). Nothing else is inferred at check time. An unreadable default
+ * contributes nothing.
  */
-async function systemModelsFor(
-  session: SystemModelSession | null | undefined,
-  options: SystemModelCheckOptions = {},
-): Promise<SystemModels> {
+export async function isSystemChosen(
+  canonicalModel: string,
+  source: BindingSource,
+  session?: SystemModelSession | null,
+): Promise<boolean> {
+  if (source === 'system') return true;
   const { agentModeService } = await import('../agentModeService');
-  const ids = new Set<string>();
-  const add = (raw: unknown) => {
-    if (typeof raw !== 'string' || !raw.trim()) return;
-    const resolution = agentModeService.resolveGenerationModel(raw.trim());
-    if (!resolution.fellBack) ids.add(resolution.model);
-  };
-
   // Each read is isolated: one that throws (even synchronously) contributes nothing and blocks nothing.
   const read = (get: () => Promise<string | undefined | null>) => Promise.resolve().then(get);
   const reads = [read(() => agentModeService.getDefaultModel())];
-  // A human's NEW pick is never AgentWeb's choice just because this session's kind or plan uses that model elsewhere:
-  // only the configured default (anyone may run it) and the session's own system stamp (re-sending it is not a pick).
-  if (options.humanPick) {
-    for (const settled of await Promise.allSettled(reads)) {
-      if (settled.status === 'fulfilled') add(settled.value);
-    }
-    if (storedModelSource(session) === 'system') add(session?.llmModel);
-    return { all: false, ids };
-  }
   const sessionType = session?.sessionType;
   if (sessionType === 'scheduled') reads.push(read(() => agentModeService.getScheduledChatsDefaultModel()));
   if (sessionType === 'report_generation') {
@@ -114,79 +94,61 @@ async function systemModelsFor(
   if (sessionType === 'video-generation') reads.push(read(() => agentModeService.getVideoGenerationDefaultModel()));
   if (session?.portalType === 'emma-sidebar') reads.push(read(() => agentModeService.getCustomerSupportDefaultModel()));
   for (const settled of await Promise.allSettled(reads)) {
-    if (settled.status === 'fulfilled') add(settled.value);
+    if (settled.status !== 'fulfilled' || typeof settled.value !== 'string' || !settled.value.trim()) continue;
+    const resolution = agentModeService.resolveGenerationModel(settled.value.trim());
+    if (!resolution.fellBack && resolution.model === canonicalModel) return true;
   }
-  if (storedModelSource(session) === 'system') add(session?.llmModel);
-
-  const plan = session?.workPlan;
-  if (plan?.planAuthor === 'system') {
-    add(plan.planDefaultModel);
-    // A step model the user adopted (modelSource 'user', recovery from a retired pin) is not the author's choice.
-    if (Array.isArray(plan.steps)) {
-      for (const step of plan.steps as Array<{ model?: unknown; modelSource?: unknown }>) {
-        if (step?.modelSource !== 'user') add(step?.model);
-      }
-    }
-    return { all: false, ids };
-  }
-  if (plan?.planAuthor === 'user') return { all: false, ids };
-
-  const templatePlanId = plan?.templatePlanId;
-  if (typeof templatePlanId === 'string' && templatePlanId) {
-    try {
-      const { workPlanService } = await import('../workPlanService');
-      const template = await workPlanService.getWorkPlan(templatePlanId);
-      if (isSystemAuthoredPlan(template)) {
-        add(template?.defaultModel);
-        for (const step of template?.steps ?? []) add((step as { model?: unknown })?.model);
-        // The pins this session copied at launch (and the plan pin it was stamped with, written without a decision
-        // or source back then), so a later edit of the template's models does not stop a running plan.
-        add(plan?.planDefaultModel);
-        if (Array.isArray(plan?.steps)) {
-          for (const step of plan.steps as Array<{ model?: unknown; modelSource?: unknown }>) {
-            if (step?.modelSource !== 'user') add(step?.model);
-          }
-        }
-        if (!session?.llmModelSource && !session?.llmUsagePolicyDecision) add(session?.llmModel);
-      }
-    } catch (error) {
-      console.error(`ModelAccess: could not read work plan template ${templatePlanId}; treating its pins as system models:`, error);
-      return { all: true };
-    }
-  }
-  return { all: false, ids };
-}
-
-/** `humanPick`: the selection is a person's NEW pick (not an echo of the stored model, not a plan/system choice). */
-export interface SystemModelCheckOptions {
-  humanPick?: boolean;
-}
-
-/** Whether AgentWeb itself runs this canonical id in this session (see systemModelsFor). */
-export async function isSystemModelFor(
-  session: SystemModelSession | null | undefined,
-  canonicalModel: string,
-  options: SystemModelCheckOptions = {},
-): Promise<boolean> {
-  const system = await systemModelsFor(session, options);
-  return system.all || system.ids.has(canonicalModel);
+  return false;
 }
 
 /**
- * `isSystemModel` callback for assertModelAllowed / filterAllowedModels, scoped to a session (or to none: the
- * interactive default only). The system set is read lazily, at most once per callback, and only if something
- * would otherwise be refused.
+ * `isSystemModel` callback for assertModelAllowed / filterAllowedModels: see isSystemChosen. A lazy `source` is only
+ * evaluated when the allowlist would otherwise refuse.
  */
 export function systemModelCheck(
   session?: SystemModelSession | null,
-  options: SystemModelCheckOptions = {},
+  source?: BindingSource | (() => Promise<BindingSource>),
 ): (canonicalModel: string) => Promise<boolean> {
-  let system: Promise<SystemModels> | undefined;
-  return async (canonicalModel) => {
-    system ??= systemModelsFor(session, options);
-    const resolved = await system;
-    return resolved.all || resolved.ids.has(canonicalModel);
-  };
+  return async (canonicalModel) => isSystemChosen(canonicalModel, typeof source === 'function' ? await source() : source, session);
+}
+
+/**
+ * The provenance of the session's STORED model when `model` is that model (re-sending or re-selecting it is not a new
+ * pick), else 'user'. `canonical` maps an id to its registry id (legacy aliases resolved).
+ */
+export async function storedBindingSource(
+  session: SystemModelSession | null | undefined,
+  model: string | null | undefined,
+  canonical: (id: string) => string,
+): Promise<ModelSource> {
+  const stored = session?.llmModel;
+  const same = (a: unknown) => typeof a === 'string' && !!a.trim() && !!model && canonical(a.trim()) === canonical(model.trim());
+  if (!stored || !same(stored)) return 'user';
+  const source = storedModelSource(session) ?? 'user';
+  // Legacy (no source recorded): the engine's stamp of a legacy plan's OWN pin follows the plan-pin legacy rule.
+  const plan = session?.workPlan;
+  if (source === 'user' && !session?.llmModelSource && plan && plan.planAuthor === undefined
+    && (same(plan.planDefaultModel) || (Array.isArray(plan.steps) && plan.steps.some((step: any) => same(step?.model))))) {
+    return legacyPlanPinSource(plan);
+  }
+  return source;
+}
+
+/**
+ * ENG-669's one legacy rule for plan pins: a plan launched before this change records no `planAuthor` and no per-binding
+ * `modelSource`. Its OWN pins (plan default and step pins, as copied at launch) are AgentWeb's when its template is still
+ * admin-authored. A deleted template proves nothing (user); a failed read never blocks (system, logged).
+ */
+export async function legacyPlanPinSource(plan: { templatePlanId?: unknown } | null | undefined): Promise<ModelSource> {
+  const templatePlanId = plan?.templatePlanId;
+  if (typeof templatePlanId !== 'string' || !templatePlanId) return 'user';
+  try {
+    const { workPlanService } = await import('../workPlanService');
+    return isSystemAuthoredPlan(await workPlanService.getWorkPlan(templatePlanId)) ? 'system' : 'user';
+  } catch (error) {
+    console.error(`ModelAccess: could not read work plan template ${templatePlanId}; treating its pins as system models:`, error);
+    return 'system';
+  }
 }
 
 /**
@@ -212,7 +174,12 @@ export async function assertModelInOwnerPlan(input: {
     ownerUserId: input.ownerUserId,
     requestedModel: model,
     canonicalModel: resolution.model,
-    isSystemModel: systemModelCheck(input.session),
+    // Exempt only as the session kind's configured default or as the session's OWN system stamp (the model stored with
+    // llmModelSource 'system'); any other model reaching here is a user's pick.
+    isSystemModel: systemModelCheck(input.session, () => storedBindingSource(input.session, model, (id) => {
+      const r = agentModeService.resolveGenerationModel(id);
+      return r.fellBack ? id : r.model;
+    })),
   });
 }
 

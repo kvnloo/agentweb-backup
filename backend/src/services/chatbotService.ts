@@ -266,8 +266,12 @@ export interface ChatSession {
       expectedAssetCountTools?: string[];
       /** ENG-2378: this step's explicit model (canonical registry id), copied from the template at launch. */
       model?: string;
-      /** ENG-669: 'user' when `model` is the user's pick adopted after the plan's own step model became unavailable. */
-      modelSource?: 'user';
+      /**
+       * ENG-669: who chose `model`, recorded WITH it and moved with it: 'system' = an admin-authored plan's pin (stamped at
+       * launch), 'user' = a user-authored plan's pin or a user's pick adopted after the step's own model became
+       * unavailable. Absent on steps written before this change (see legacyPlanPinSource).
+       */
+      modelSource?: 'user' | 'system';
       inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
     }>;
     createdAt: string;
@@ -279,6 +283,8 @@ export interface ChatSession {
     launchModel?: string;
     /** ENG-669: who chose `launchModel` (the session's llmModelSource when the plan started). */
     launchModelSource?: 'user' | 'system';
+    /** ENG-669: who chose `planDefaultModel` (stamped at launch from the plan's author). */
+    planDefaultModelSource?: 'user' | 'system';
     /**
      * ENG-669: who authored this plan, recorded at launch: 'system' = an admin-authored template (its pins are
      * AgentWeb's choice and are exempt from the tier model allowlist), 'user' = a user-authored one.
@@ -3909,6 +3915,7 @@ export class ChatbotDB {
         expectedAssetCountTools?: string[];
         /** ENG-2378: see the matching field on the read-side workPlan type above. */
         model?: string;
+        modelSource?: 'user' | 'system';
         inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
       }>;
       createdAt: string;
@@ -3919,6 +3926,7 @@ export class ChatbotDB {
       planDefaultModel?: string;
       launchModel?: string;
       launchModelSource?: 'user' | 'system';
+      planDefaultModelSource?: 'user' | 'system';
       planAuthor?: 'user' | 'system';
       engineModel?: string;
       pickedModel?: string;

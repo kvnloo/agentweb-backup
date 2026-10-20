@@ -192,6 +192,23 @@ describe('createSessionWithPlan with per-step models', () => {
     expect('planDefaultModel' in wp).toBe(false);
   });
 
+  it("ENG-669: each pin is stamped at launch WITH its provenance (the plan's author): admin plan system, user plan user", async () => {
+    publish([S(1, 'gemini-3-pro-preview'), S(2)], { defaultModel: 'gpt-5-chat' });
+    await agentModeController.createSessionWithPlan(req(), res());
+    let wp = db.updateSessionWorkPlan.mock.calls[0][1] as any;
+    expect(wp).toMatchObject({ planAuthor: 'system', planDefaultModelSource: 'system' });
+    expect(wp.steps.map((s: any) => `${s.model ?? '-'}:${s.modelSource ?? '-'}`)).toEqual(['gemini-3-pro-preview:system', '-:-']);
+    jest.clearAllMocks();
+    db.createChatSession.mockResolvedValue(session as any);
+    db.updateSessionLlmModel.mockResolvedValue(session as any);
+    db.updateSessionWorkPlan.mockResolvedValue(session as any);
+    publish([S(1, 'gemini-3-pro-preview'), S(2)], { defaultModel: 'gpt-5-chat', visibility: 'public', isBuiltIn: false });
+    await agentModeController.createSessionWithPlan(req(), res());
+    wp = db.updateSessionWorkPlan.mock.calls[0][1] as any;
+    expect(wp).toMatchObject({ planAuthor: 'user', planDefaultModelSource: 'user' });
+    expect(wp.steps[0]).toMatchObject({ model: 'gemini-3-pro-preview', modelSource: 'user' });
+  });
+
   it('a plan without step models records neither', async () => {
     publish([S(1), S(2)], { defaultModel: 'gpt-5-chat' });
     await agentModeController.createSessionWithPlan(req(), res());

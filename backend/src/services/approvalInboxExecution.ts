@@ -13,7 +13,7 @@ import { isModelUnavailableError } from './agentMode/modelUnavailable';
 // concurrently-running user turn on the same session.
 import {
   generateSessionResponse,
-  modelUnavailableBody,
+  recordModelRefusal,
   tryClaimSessionGeneration,
   releaseSessionGeneration,
 } from '../controllers/agentModeController';
@@ -156,28 +156,22 @@ export async function resumeOriginSession(sessionId: string, messageContent: str
   } catch (err: any) {
     console.warn('[approval-inbox-execution] active resume failed, recording a passive note instead:', sessionId, err?.message || err);
     await recordPassiveSessionNote(sessionId, messageContent);
-    // ENG-669: the resume was refused because the session's model is outside the owner's plan. The
-    // note above is model-only context, so tell the user why Emma did not pick the work back up.
-    if (isModelUnavailableError(err)) {
-      const refusal = modelUnavailableBody(err).error;
-      let refusalSaved = false;
-      try {
-        await chatbotDb.addMessageToSession(sessionId, {
-          role: 'assistant',
-          content: refusal,
-          metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
-        });
-        refusalSaved = true;
-      } catch (noteErr: any) {
-        console.error('[approval-inbox-execution] failed to record the model refusal:', sessionId, noteErr?.message || noteErr);
-      }
-      // Same live update the successful resume sends, so an open chat shows the refusal without a reload.
-      if (refusalSaved) {
+    // ENG-669: the resume was refused because the session's model is outside the owner's plan (only with the tier
+    // allowlist on). The note above is model-only context, so tell the user why Emma did not pick the work back up:
+    // exactly one saved refusal (reusing the one generateSessionResponse may already have saved) and one live update.
+    if (isModelUnavailableError(err) && err.reason === 'not_in_plan') {
+      const refusal = await recordModelRefusal(sessionId, err);
+      if (refusal) {
         try {
           const { io } = await import('../server');
           io.to(`user:${session.userId}`).emit('session-message-appended', {
             sessionId,
-            message: { role: 'assistant', content: refusal },
+            message: {
+              role: 'assistant',
+              content: refusal.content,
+              ...(typeof refusal.messageIndex === 'number' && { messageIndex: refusal.messageIndex }),
+              metadata: { isErrorMessage: true },
+            },
           });
         } catch (emitErr: any) {
           console.error('[approval-inbox-execution] failed to emit the model refusal:', sessionId, emitErr?.message || emitErr);

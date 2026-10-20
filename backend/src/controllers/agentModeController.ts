@@ -88,7 +88,10 @@ import {
 import { assertSequentialStepCounts } from '../services/workPlanSteps';
 import { validateModelPin, normalizeRequestedLlmModel, resolvePlanLaunchModel, canonicalPinId } from '../services/agentMode/modelPin';
 import { workPlanStepModels } from '../services/agentMode/workPlanStepModelsInstance';
-import { assertModelInOwnerPlan, isSystemAuthoredPlan, modelAccess, systemModelCheck, type SystemModelSession } from '../services/agentMode/modelAccessInstance';
+import {
+  assertModelInOwnerPlan, isSystemAuthoredPlan, legacyPlanPinSource, modelAccess, storedBindingSource, systemModelCheck,
+  type BindingSource, type SystemModelSession,
+} from '../services/agentMode/modelAccessInstance';
 import { modelSourceAfter as modelSourceAfterStamp, resolveLegacyModelAlias, type ModelSource, type StoredModelRecord } from '../services/agentMode/modelAccess';
 import {
   anyStepCarriesModel,
@@ -410,17 +413,13 @@ export async function resolveEffectiveModelForUser(input: {
   // It does NOT relax the tier allowlist (ENG-669): a stored model outside the owner's plan
   // is refused, never corrected.
   allowSilentSwap?: boolean;
-  // ENG-669: the requested model is AgentWeb's choice, not the user's (an unpinned schedule's or
-  // a new session's configured default), so the tier allowlist does not apply to it.
-  systemModel?: boolean;
-  // ENG-669: the session the model runs in, so its system models (its kind's configured default,
-  // the pins of the admin-authored plan it was launched from) are recognised. Only read when the
-  // allowlist would otherwise refuse.
+  // ENG-669: who chose the requested model, as recorded when it was written. 'system' (AgentWeb's choice: a configured
+  // default standing in, an admin plan's pin) is exempt from the tier allowlist; 'user' is checked. Lazy for a legacy
+  // plan pin (its template is read only if the allowlist would refuse). Omitted: the provenance of the session's
+  // stored model when the request re-sends that model, else a user's pick.
+  modelSource?: BindingSource | (() => Promise<BindingSource>);
+  // ENG-669: the session the model runs in (its kind's configured default is exempt; its stored stamp's provenance).
   session?: SystemModelSession | null;
-  // ENG-669: the selection is a person's new pick, so only the configured default and the session's own system stamp
-  // exempt it (not the session kind's defaults or the plan's pins). Default: an explicit selection that is not an
-  // echo of the session's stored model.
-  humanPick?: boolean;
 }): Promise<EffectiveModelPolicyDecision> {
   const [usage, systemDefaultModel] = await Promise.all([
     getEffectiveLlmUsagePolicy(input.userId),
@@ -470,7 +469,7 @@ export async function resolveEffectiveModelForUser(input: {
     canonicalRequestedModel
     && requestedResolution
     && !requestedResolution.fellBack
-    && !input.systemModel
+    && input.modelSource !== 'system'
     && usage.mode.usageMode !== 'paused'
     && canonicalRequestedModel !== systemDefaultModel
     && supportedModelIds.includes(canonicalRequestedModel)
@@ -480,10 +479,10 @@ export async function resolveEffectiveModelForUser(input: {
       ownerUserId: input.userId,
       requestedModel: input.requestedModel as string,
       canonicalModel: canonicalRequestedModel,
-      isSystemModel: systemModelCheck(input.session, {
-        humanPick: input.humanPick
-          ?? (!input.allowSilentSwap && !(input.session?.llmModel && sameModelId(input.requestedModel, input.session.llmModel))),
-      }),
+      isSystemModel: systemModelCheck(
+        input.session,
+        input.modelSource ?? (() => storedBindingSource(input.session, input.requestedModel, canonicalModelId)),
+      ),
     });
   }
   // FAIL-LOUD: an explicit selection that is not served must not be replaced by
@@ -570,7 +569,7 @@ async function buildUsagePausedBody(input: {
         backupModel: input.backupModel,
         backupSource: input.backupModel ? 'user' : null,
         // ENG-669: this only stamps and echoes the refusal of a paused turn; nothing runs.
-        systemModel: true,
+        modelSource: 'system',
       }).catch((modelError) => {
         if (isModelUnavailableError(modelError)) return undefined;
         throw modelError;
@@ -619,6 +618,36 @@ export function modelUnavailableBody(err: ModelUnavailableError, audience: Model
     ? agentModeService.getModelDisplayName(err.requestedModel)
     : undefined;
   return buildModelUnavailableBody(err, displayName, 'selection', audience);
+}
+
+/** ENG-669: refusals already saved to the chat, keyed by the error, so a caller never saves (or emits) one twice. */
+const recordedRefusals = new WeakMap<ModelUnavailableError, { content: string; messageIndex?: number }>();
+
+/**
+ * ENG-669: save a model refusal to the chat as an error message (once per error) and return what was saved, with its
+ * messageIndex, for a live `session-message-appended` emit. Never throws (a failed save returns undefined).
+ */
+export async function recordModelRefusal(
+  sessionId: string,
+  error: ModelUnavailableError,
+  audience: ModelUnavailableAudience = 'owner',
+): Promise<{ content: string; messageIndex?: number } | undefined> {
+  const already = recordedRefusals.get(error);
+  if (already) return already;
+  const content = modelUnavailableBody(error, audience).error;
+  const timestamp = new Date().toISOString();
+  try {
+    const saved = await chatbotDb.addMessageToSession(sessionId, {
+      role: 'assistant', content, timestamp, metadata: { timestamp, isErrorMessage: true },
+    });
+    const messageIndex = saved?.messages?.[saved.messages.length - 1]?.messageIndex;
+    const record = { content, ...(typeof messageIndex === 'number' && { messageIndex }) };
+    recordedRefusals.set(error, record);
+    return record;
+  } catch (saveErr) {
+    console.error('AgentMode: failed to save the model refusal to the session:', saveErr);
+    return undefined;
+  }
 }
 
 /**
@@ -2030,15 +2059,15 @@ async function userExplicitlyRequestedStop(sessionId: string, usageContext?: LLM
 
 /**
  * ENG-2378: a work plan as shown to someone who is not the owner (share / conversable / anonymous launch): never the
- * engine's internal bookkeeping (launchModel, launchModelSource, planAuthor, planDefaultModel, engineModel) and, unless
+ * engine's internal bookkeeping (launchModel, launchModelSource, planAuthor, planDefaultModel(Source), engineModel) and, unless
  * `keepStepModels`, no step models.
  * Returns a copy; the stored plan is untouched.
  */
 function redactWorkPlanForViewer(workPlan: any, options: { keepStepModels?: boolean } = {}): any {
   if (!workPlan || typeof workPlan !== 'object') return workPlan;
-  // ENG-669: launchModelSource / planAuthor are model bookkeeping too.
+  // ENG-669: launchModelSource / planAuthor / planDefaultModelSource are model bookkeeping too.
   const {
-    launchModel: _l, launchModelSource: _ls, planAuthor: _pa, planDefaultModel: _p, engineModel: _e, pickedModel: _k, ...rest
+    launchModel: _l, launchModelSource: _ls, planAuthor: _pa, planDefaultModel: _p, planDefaultModelSource: _ps, engineModel: _e, pickedModel: _k, ...rest
   } = workPlan;
   return options.keepStepModels ? rest : { ...rest, ...(Array.isArray(rest.steps) && { steps: withoutStepModels(rest.steps) }) };
 }
@@ -2071,7 +2100,7 @@ type WorkPlanStepModelTurn =
       /** The user's own pick is running on a model-less step; `engineChoice` is what the engine itself would have used. */
       userPick?: boolean; engineChoice?: string;
       /** ENG-669: who chose the model that runs (stamped as the session's llmModelSource). */
-      source: ModelSource;
+      source: ModelSource | undefined;
     }
   | { kind: 'restored'; decision: ResolvedStepDecision; source: ModelSource }
   | { kind: 'restoreFailed' }
@@ -2088,15 +2117,23 @@ async function resolveWorkPlanStepModelForTurn(
   // Checked only for a plan that carries step models, so ordinary plan turns never read the switch.
   if (!(await workPlanStepModels.shouldHonor())) return { kind: 'none' };
 
-  // ENG-669: who chose each model the plan can run. An admin-authored plan's pins are AgentWeb's (planAuthor, recorded
-  // at launch; older sessions fall back to the template via `session`); the pre-plan model keeps its own source.
-  const planPinSource: ModelSource = plan.planAuthor === 'system' ? 'system' : 'user';
+  // ENG-669: who chose each model the plan can run, as recorded WITH the model when it was written (`modelSource` on a
+  // step, `planDefaultModelSource`, `launchModelSource`). A plan launched before that record existed (no planAuthor)
+  // follows the one legacy rule, whose template read is made only when the allowlist would refuse the pin; any other
+  // unrecorded binding is a user's.
+  let legacyPinSource: Promise<ModelSource> | undefined;
+  const pinSource = (recorded: unknown): ModelSource | (() => Promise<ModelSource>) => {
+    if (recorded === 'system' || recorded === 'user') return recorded;
+    if (plan.planAuthor !== undefined) return 'user';
+    return () => (legacyPinSource ??= legacyPlanPinSource(plan));
+  };
   const launchSource: ModelSource = plan.launchModelSource === 'system' ? 'system' : 'user';
-  const resolveHonored = async (model: string, stepCount: number, source: ModelSource): Promise<ResolvedStepDecision> => {
+  const resolveHonored = async (
+    model: string, stepCount: number, source: ModelSource | (() => Promise<ModelSource>),
+  ): Promise<ResolvedStepDecision> => {
     // An explicit selection by a human: fail loud, never substitute.
     const decision = await resolveEffectiveModelForUser({
-      userId: session.userId, requestedModel: model, allowSilentSwap: false, systemModel: source === 'system', session,
-      humanPick: source === 'user',
+      userId: session.userId, requestedModel: model, allowSilentSwap: false, modelSource: source, session,
     });
     // Defensive: only an honored decision may run. (A paused account has no effective model; the callers' usage gates
     // answer that case before this point.)
@@ -2139,14 +2176,17 @@ async function resolveWorkPlanStepModelForTurn(
   const userPick = ownModel ? undefined : pick;
   const candidate = ownModel ?? (userPick || fallbackModel);
   if (!candidate) return { kind: 'none' };
-  // A step model the user's pick replaced (recovery from a retired one) stays the user's, whoever authored the plan.
-  const ownModelSource: ModelSource = step.modelSource === 'user' ? 'user' : planPinSource;
-  const candidateSource: ModelSource = userPick
+  const candidateBinding = userPick
     ? 'user'
-    : (ownModel ? ownModelSource : ((typeof plan.planDefaultModel === 'string' && plan.planDefaultModel.trim()) ? planPinSource : launchSource));
+    : ownModel
+      ? pinSource(step.modelSource)
+      : (typeof plan.planDefaultModel === 'string' && plan.planDefaultModel.trim()) ? pinSource(plan.planDefaultModelSource) : launchSource;
   try {
+    const decision = await resolveHonored(candidate, stepCount, candidateBinding);
+    // The session stamp records the binding's provenance; a legacy plan's pin is stamped with none, so it stays under
+    // the legacy rule (storedBindingSource) without reading the template here.
     return {
-      kind: 'resolved', stepCount, decision: await resolveHonored(candidate, stepCount, candidateSource), source: candidateSource,
+      kind: 'resolved', stepCount, decision, source: typeof candidateBinding === 'function' ? undefined : candidateBinding,
       ...(userPick && { userPick: true, engineChoice: fallbackModel }),
     };
   } catch (modelError) {
@@ -6978,7 +7018,7 @@ export async function runScheduledChat(
         // ENG-669: an unpinned schedule runs the admin-configured scheduled default and an
         // admin-template pin is AgentWeb's choice (system models); any other pin is the owner's
         // choice and must be in the owner's plan.
-        systemModel: scheduleRunsSystemModel,
+        modelSource: scheduleRunsSystemModel ? 'system' : 'user',
       });
     } catch (modelError) {
       if (!isModelUnavailableError(modelError)) throw modelError;
@@ -9494,17 +9534,11 @@ export async function generateSessionResponse(
   try {
     stepModelTurn = await resolveWorkPlanStepModelForTurn(updatedSession, { explicitPick: explicitModelPick, viewerIsOwner: !isInteractiveShare });
   } catch (stepModelError) {
-    // ENG-669: the user's pick for a step whose own model is gone is refused (e.g. outside the plan). The user message
-    // is already saved, so leave the refusal in the chat (as the generic error path does for other failures) before
-    // the caller answers its 422: never an unanswered message.
-    if (isModelUnavailableError(stepModelError)) {
-      const timestamp = new Date().toISOString();
-      await chatbotDb.addMessageToSession(sessionId, {
-        role: 'assistant',
-        content: modelUnavailableBody(stepModelError, isInteractiveShare ? 'share_viewer' : 'owner').error,
-        timestamp,
-        metadata: { timestamp, isErrorMessage: true },
-      }).catch((saveErr) => console.error('AgentMode: failed to save the step-model refusal to the session:', saveErr));
+    // ENG-669: the user's pick for a step whose own model is gone is outside the owner's plan. The user message is
+    // already saved, so leave the refusal in the chat (as the generic error path does for other failures) before the
+    // caller answers: never an unanswered message. Callers that also report it (approval resume) reuse this record.
+    if (isModelUnavailableError(stepModelError) && stepModelError.reason === 'not_in_plan') {
+      await recordModelRefusal(sessionId, stepModelError, isInteractiveShare ? 'share_viewer' : 'owner');
     }
     throw stepModelError;
   }
@@ -10043,7 +10077,7 @@ export const agentModeController = {
             // default keeps the resolver's old safety net instead of a 422.
             allowSilentSwap: !requestedLlmModel,
             // ENG-669: without a requested model the configured default runs (a system model).
-            systemModel: !requestedLlmModel,
+            modelSource: requestedLlmModel ? 'user' : 'system',
           });
         } catch (modelError) {
           if (!isModelUnavailableError(modelError)) throw modelError;
@@ -12310,7 +12344,7 @@ export const agentModeController = {
           userId: session.userId,
           requestedModel: session.llmModel || defaultModel,
           allowSilentSwap: true,
-          systemModel: !session.llmModel,
+          ...(!session.llmModel && { modelSource: 'system' as const }),
           session,
         });
       } catch (modelError) {
@@ -15896,7 +15930,7 @@ export const agentModeController = {
           userId: session.userId,
           requestedModel: session.llmModel || defaultModel,
           allowSilentSwap: true,
-          systemModel: !session.llmModel,
+          ...(!session.llmModel && { modelSource: 'system' as const }),
           session,
         });
       } catch (modelError) {
@@ -16291,6 +16325,8 @@ export const agentModeController = {
       let modelSaveFailed = false;
       let selectedModel: string;
       let selectedModelSource: ModelSource = 'system';
+      // ENG-669: who chose this plan's pins (plan default and step models), stamped on each binding at launch.
+      const planPinSourceAtLaunch: ModelSource = isSystemAuthoredPlan(predefinedPlan) ? 'system' : 'user';
       let workPlanWithWelcome: any;
       let conversableToken: string;
       try {
@@ -16299,7 +16335,7 @@ export const agentModeController = {
         // a model other than the one it pins; the empty session is removed best-effort.
         selectedModel = planPinnedModel || await agentModeService.getDefaultModel();
         // ENG-669: the default, or an admin-authored plan's pin, is AgentWeb's choice; a user plan's pin is a user's.
-        selectedModelSource = planPinnedModel && !isSystemAuthoredPlan(predefinedPlan) ? 'user' : 'system';
+        selectedModelSource = planPinnedModel ? planPinSourceAtLaunch : 'system';
         try {
           await chatbotDb.updateSessionLlmModel(session.sessionId, selectedModel, undefined, selectedModelSource);
         } catch (modelErr) {
@@ -16316,7 +16352,8 @@ export const agentModeController = {
             title: step.title,
             description: step.description,
             // ENG-2378: the step's validated canonical model (only while the switch is on; otherwise not copied).
-            ...(stepModelIds.has(stepIndex) && { model: stepModelIds.get(stepIndex) }),
+            // ENG-669: with who chose it (the plan's author), recorded with the model and moved with it.
+            ...(stepModelIds.has(stepIndex) && { model: stepModelIds.get(stepIndex), modelSource: planPinSourceAtLaunch }),
             // Carry the user-facing instructions through to the session so
             // <HorizontalPlanProgress> can render them in the expanded-step
             // panel. Without this, the field set in the partner-portal
@@ -16341,7 +16378,7 @@ export const agentModeController = {
           updatedAt: new Date().toISOString(),
           // ENG-2378: what a step WITHOUT a model falls back to (plan default, then the model the session starts on).
           ...(stepModelIds.size > 0 && {
-            ...(planPinnedModel && { planDefaultModel: planPinnedModel }),
+            ...(planPinnedModel && { planDefaultModel: planPinnedModel, planDefaultModelSource: planPinSourceAtLaunch }),
             launchModel: selectedModel,
             launchModelSource: selectedModelSource,
           }),
@@ -16360,7 +16397,7 @@ export const agentModeController = {
           // template regardless of which route created it.
           templatePlanId: predefinedPlan.planId,
           // ENG-669: recorded now, so a later edit or deletion of the template cannot change whose pins these are.
-          planAuthor: isSystemAuthoredPlan(predefinedPlan) ? 'system' as const : 'user' as const,
+          planAuthor: planPinSourceAtLaunch,
         };
         try {
           await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
