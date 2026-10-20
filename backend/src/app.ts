@@ -94,6 +94,7 @@ import adminWorkPlanRoutes from "./routes/adminWorkPlanRoutes";
 import adminLandingPagesRoutes from "./routes/adminLandingPages";
 import adminSessionCleanupRoutes from "./routes/adminSessionCleanup";
 import adminOrgDiagnosticsRoutes from "./routes/adminOrgDiagnostics";
+import adminScheduledChatsRoutes from "./routes/adminScheduledChats";
 import adminTrackingMonitorRoutes from "./routes/adminTrackingMonitor";
 import adminRenewalIntegrationHealthRoutes from "./routes/adminRenewalIntegrationHealth";
 import adminPromptTemplatesRoutes from "./routes/adminPromptTemplates";
@@ -538,6 +539,8 @@ app.use("/api/admin/landing-pages", authenticateToken, isAdmin, adminLandingPage
 // ENG-2314 — dry-run-first merge/delete of LP session rows. Same admin double-gate as above.
 app.use("/api/admin/session-cleanup", authenticateToken, isAdmin, adminSessionCleanupRoutes);
 app.use("/api/admin/org-diagnostics", authenticateToken, isAdmin, adminOrgDiagnosticsRoutes);
+// ENG-778 — audited cross-owner scheduled-chat inspect + pause/resume (no edit/delete).
+app.use("/api/admin/scheduled-chats", authenticateToken, isAdmin, adminScheduledChatsRoutes);
 app.use("/api/admin/tracking-monitor", authenticateToken, isAdmin, adminTrackingMonitorRoutes);
 app.use("/api/admin/renewal-integration-health", authenticateToken, isAdmin, adminRenewalIntegrationHealthRoutes);
 app.use("/api/admin/prompt-templates", authenticateToken, isAdmin, adminPromptTemplatesRoutes);
