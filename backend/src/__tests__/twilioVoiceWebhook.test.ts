@@ -885,14 +885,65 @@ describe('member attempt finalisation', () => {
     noPhoneIn(logs);
   });
 
-  it('is requested once for a replayed or concurrent final callback, and bills once', async () => {
+  it('bills and writes once for a replayed or concurrent final callback; the hand-over request is repeated (the queue key dedupes it)', async () => {
     seed('member_ringing');
     nextAttempt().mockResolvedValue({ enqueued: true });
     await Promise.all([1, 2, 3].map(() => memberStatus('no-answer', { CallDuration: '0', SequenceNumber: '1' })));
     await memberStatus('no-answer', { CallDuration: '0', SequenceNumber: '1' });
-    expect(nextAttempt()).toHaveBeenCalledTimes(1);
+    expect(nextAttempt().mock.calls.length).toBeGreaterThanOrEqual(1);
+    for (const [args] of nextAttempt().mock.calls) expect(args).toMatchObject({ listId: LIST, leadId: LEAD, record: { attemptNo: 1, jobKey: JOB } });
     expect(usage()).toHaveLength(1);
     expect(store.eventTypes()).toEqual(['call.member_no_answer']);
+    expect(store.record).toMatchObject({ state: 'between_attempts', meteredLegs: ['member:1'] });
+  });
+
+  describe('a hand-over that did not happen after the leg was metered', () => {
+    // The leg is metered and the record is between_attempts, then the store fails before the next attempt is requested.
+    const failHandOverOnce = () => {
+      const realGet = store.get.bind(store);
+      let failing = true;
+      jest.spyOn(store, 'get').mockImplementation(async (...args) => {
+        if (failing && store.record?.state === 'between_attempts') {
+          failing = false;
+          throw new Error('ddb down');
+        }
+        return realGet(...args);
+      });
+    };
+
+    it('is requested again by the Twilio retry, which finds the leg already metered, without billing twice', async () => {
+      seed('member_ringing');
+      nextAttempt().mockResolvedValue({ enqueued: true });
+      failHandOverOnce();
+      expect((await memberStatus('no-answer', { CallDuration: '0', SequenceNumber: '1' })).status).toBe(500);
+      expect(store.record).toMatchObject({ state: 'between_attempts', meteredLegs: ['member:1'], outcome: 'member_no_answer' });
+      expect(nextAttempt()).not.toHaveBeenCalled();
+
+      expect((await memberStatus('no-answer', { CallDuration: '0', SequenceNumber: '1' })).status).toBe(200);
+      expect(nextAttempt()).toHaveBeenCalledTimes(1);
+      expect(usage()).toHaveLength(1);
+      expect(store.eventTypes()).toEqual(['call.member_no_answer']);
+    });
+
+    it('finishes the record on the retry when no further attempt can be queued', async () => {
+      seed('member_ringing');
+      failHandOverOnce();
+      await memberStatus('no-answer', { CallDuration: '0', SequenceNumber: '1' });
+      await memberStatus('no-answer', { CallDuration: '0', SequenceNumber: '1' });
+      expect(store.record).toMatchObject({ state: 'finished', outcome: 'member_no_answer' });
+      expect(store.eventTypes()).toEqual(['call.member_no_answer', 'call.completed']);
+      expect(usage()).toHaveLength(1);
+    });
+
+    it('is not requested again once the next attempt has taken the record', async () => {
+      seed('member_ringing');
+      nextAttempt().mockResolvedValue({ enqueued: true });
+      await memberStatus('no-answer', { CallDuration: '0', SequenceNumber: '1' });
+      await store.transition(LIST, LEAD, ['between_attempts'], { state: 'dialing', attemptNo: 2, memberId: 'mother00', triedMemberIds: ['mother00'], clear: ['memberCallSid', 'outcome'] });
+      await memberStatus('no-answer', { CallDuration: '0', SequenceNumber: '1' });
+      expect(nextAttempt()).toHaveBeenCalledTimes(1);
+      expect(store.record?.state).toBe('dialing');
+    });
   });
 
   it('a replay after the record finished writes and requests nothing', async () => {
@@ -917,7 +968,7 @@ describe('member attempt finalisation', () => {
     expect(nextAttempt()).not.toHaveBeenCalled();
   });
 
-  it('a callback for the previous sid between attempts (before the next one is stored) is also a no-op', async () => {
+  it('a callback for the previous sid between attempts (before the next one is stored) writes and bills nothing', async () => {
     seed('member_ringing');
     nextAttempt().mockResolvedValue({ enqueued: true });
     await memberStatus('no-answer', { CallDuration: '0', SequenceNumber: '1' });
@@ -926,7 +977,6 @@ describe('member attempt finalisation', () => {
     await memberStatus('completed', { CallDuration: '0', SequenceNumber: '2' });
     expect(store.transitions).toBe(writes);
     expect(usage()).toHaveLength(1);
-    expect(nextAttempt()).toHaveBeenCalledTimes(1);
   });
 
   describe('while the next attempt is being placed (dialing, call sid and outcome cleared)', () => {

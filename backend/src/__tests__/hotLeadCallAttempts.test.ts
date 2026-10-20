@@ -224,6 +224,7 @@ describe('requestNextHotLeadCallAttempt', () => {
     await flush();
     expect(queue.markJobFailed).toHaveBeenCalledTimes(1);
     expect(queue.markJobComplete).not.toHaveBeenCalled();
+    expect(store.record).toMatchObject({ state: 'failed', outcome: 'next_attempt_failed' });
   });
 
   describe('refuses, and queues nothing, when', () => {
@@ -307,6 +308,39 @@ describe('processHotLeadCallNextAttempt', () => {
     expect(provider.placedCalls).toHaveLength(1);
     expect(store.record).toMatchObject({ state: 'finished', outcome });
     expect(store.events.at(-1)).toEqual({ type: 'call.completed', detail: { outcome } });
+  });
+
+  describe('when the job itself breaks', () => {
+    it('closes the record it was resolving as failed, rings nobody and still fails the job', async () => {
+      const record = await firstAttemptEnds();
+      mock(orgDb.getOrgById).mockRejectedValue(new Error('ddb down'));
+      await expect(processHotLeadCallNextAttempt(nextJob(record))).rejects.toThrow('ddb down');
+      expect(provider.placedCalls).toHaveLength(1);
+      expect(store.record).toMatchObject({ state: 'failed', outcome: 'next_attempt_failed' });
+      expect(store.events.at(-1)).toEqual({ type: 'call.failed', detail: { reason: 'next_attempt_failed' } });
+    });
+
+    it('leaves a record alone that has moved past the waiting state', async () => {
+      const record = await firstAttemptEnds();
+      store.get = async () => {
+        store.record!.state = 'dialing';
+        throw new Error('ddb down');
+      };
+      await expect(processHotLeadCallNextAttempt(nextJob(record))).rejects.toThrow('ddb down');
+      expect(store.record!.state).toBe('dialing');
+      expect(store.events.map((e) => e.type)).not.toContain('call.failed');
+    });
+
+    it('reports the original error, not the close that failed too', async () => {
+      const record = await firstAttemptEnds();
+      store.get = async () => {
+        store.transitionError = new Error('ddb down again');
+        throw new Error('read failed');
+      };
+      await expect(processHotLeadCallNextAttempt(nextJob(record))).rejects.toThrow('read failed');
+      expect(store.record!.state).toBe('between_attempts');
+      expect(console.warn).toHaveBeenCalledWith('[hotLeadCall] call record not closed', expect.objectContaining({ leadId: 'lead-a' }));
+    });
   });
 
   it('closes the waiting record when the calling hours closed between the attempts', async () => {

@@ -108,8 +108,18 @@ function memberAttemptEnd(current: HotLeadCallRecord): { outcome: string; event?
   return { outcome: 'member_declined', event: decidedAtGather ? undefined : 'call.member_declined' };
 }
 
+const endedKey = (callSid: string): string => `${callSid}#ended`;
+
+/** Whether this member leg was metered and ended its attempt, and nothing has moved the record on since. */
+const waitingAfterThisLeg = (record: HotLeadCallRecord, callSid: string): boolean =>
+  record.state === 'between_attempts' && record.lastSequence?.[endedKey(callSid)] !== undefined && !!record.outcome;
+
 export type Metered =
-  /** The leg is metered (by this caller or earlier). `attemptEnded` is set when this caller metered a member leg that ended without the member taking the lead: the attempt's outcome. */
+  /**
+   * The leg is metered (by this caller or earlier). `attemptEnded` is the attempt's outcome when a member leg ended
+   * without the member taking the lead and the record still waits for the next member: set for the caller that
+   * metered it and for a redelivery that finds the hand-over undone.
+   */
   | { status: 'done'; attemptEnded?: string }
   /** Nothing could be written because nobody can be billed. */
   | { status: 'no-owner-to-bill' }
@@ -127,7 +137,12 @@ export async function meterLeg(cb: LegCallback): Promise<Metered> {
   let billedUserId: string | null | undefined;
   for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt++) {
     const current = await store.get(q.listId, q.leadId);
-    if (!current || current.jobKey !== q.jobKey || !LIVE_STATES.includes(current.state)) return { status: 'done' };
+    if (!current || current.jobKey !== q.jobKey) return { status: 'done' };
+    // A redelivery of the callback that already metered this member leg and ended the attempt. Nothing is left to
+    // write, but the hand-over after it may never have happened (a store error between the two, or a next-attempt
+    // request that failed): the record is still waiting between attempts, so ask again. Asking is idempotent.
+    if (q.leg === 'member' && waitingAfterThisLeg(current, callSid)) return { status: 'done', attemptEnded: current.outcome };
+    if (!LIVE_STATES.includes(current.state)) return { status: 'done' };
     const meteredLeg = meteredLegOf(q.leg, current);
     if ((current.meteredLegs ?? []).includes(meteredLeg)) return { status: 'done' };
     if (sequence !== undefined && (current.lastSequence?.[callSid] ?? -1) >= sequence) return { status: 'done' };
@@ -143,7 +158,7 @@ export async function meterLeg(cb: LegCallback): Promise<Metered> {
       ...(sequence === undefined ? {} : { [callSid]: sequence }),
       // Tells a late callback of this call, once the next attempt is being placed, that its sid is not the next
       // attempt's (see withMemberSid in the webhook route).
-      ...(ended ? { [`${callSid}#ended`]: 1 } : {}),
+      ...(ended ? { [endedKey(callSid)]: 1 } : {}),
     };
     const won = await store.transition(q.listId, q.leadId, [current.state], {
       state: ended ? 'between_attempts' : current.state,
