@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
+import { releaseNumberOfDeletedOrg } from "../services/voice/numberProvisioning";
 import { userDb, orgDb, Organization } from "../services/db";
 import { defaultShareSettings } from "../services/orgShareService";
 import { callerCan, can, roleOf, isBillingRoot } from "../services/orgAuthz";
@@ -1185,6 +1186,7 @@ router.delete("/:orgId", async (req: Request, res: Response) => {
 
     // Delete the org
     await orgDb.deleteOrg(orgId);
+    await releaseNumberOfDeletedOrg(org);
 
     return res.json({ success: true, message: "Organization deleted" });
   } catch (error) {

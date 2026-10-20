@@ -1,5 +1,7 @@
 import request from 'supertest';
 import express from 'express';
+import { FakeVoiceProvider } from './helpers/fakeVoiceProvider';
+import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
 
 // Mock user state
 let mockUser: any = {
@@ -971,6 +973,38 @@ describe('Organization routes', () => {
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
       expect(mockOrgs['org-1']).toBeUndefined();
+    });
+
+    describe('with a hot-lead call number', () => {
+      const SID = 'PN' + 'a'.repeat(32);
+      let fake: FakeVoiceProvider;
+      beforeEach(() => {
+        mockOrgs['org-1'].hotLeadCall = { twilioNumber: '+14155550111', twilioNumberSid: SID };
+        fake = new FakeVoiceProvider();
+        setVoiceProviderForTests(fake);
+        jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      });
+      afterEach(() => setVoiceProviderForTests(null));
+
+      it('gives the number back after the org is deleted', async () => {
+        const res = await request(app).delete('/api/org/org-1');
+        expect(res.status).toBe(200);
+        expect(fake.releasedNumbers).toEqual([SID]);
+      });
+      it('still deletes the org when the number cannot be released, and logs only the sid', async () => {
+        fake.failNextReleaseNumber('unknown');
+        const res = await request(app).delete('/api/org/org-1');
+        expect(res.status).toBe(200);
+        expect(mockOrgs['org-1']).toBeUndefined();
+        const logged = (console.error as jest.Mock).mock.calls.map(c => c.join(' ')).join('\n');
+        expect(logged).toContain(SID);
+        expect(logged).not.toContain('4155550111');
+      });
+      it('does not release anything when the caller may not delete the org', async () => {
+        mockUser = mockUsers['user-2'];
+        expect((await request(app).delete('/api/org/org-1')).status).toBe(403);
+        expect(fake.releasedNumbers).toEqual([]);
+      });
     });
   });
 });
