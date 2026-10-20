@@ -100,6 +100,7 @@ import {
   checkPlanStepModelsWrite,
   resolvePlanStepModelsForLaunch,
   isStepModelUnavailableError,
+  buildStepModelPausedMessage,
 } from '../services/agentMode/workPlanStepModels';
 
 const db = chatbotDb as jest.Mocked<typeof chatbotDb>;
@@ -768,5 +769,16 @@ describe('private -> public transitions revalidate step models for NON-admin lau
     svc.submitForReview = jest.fn(async () => { throw new Error('Not authorized'); });
     const res = await request(app).post('/api/user-work-plans/p1/submit-for-review').send({});
     expect(res.status).toBe(403);
+  });
+});
+
+describe('buildStepModelPausedMessage (ENG-669)', () => {
+  it("a step model outside the plan is worded for whoever reads the chat (owner or share viewer): never 'your plan'", () => {
+    const text = buildStepModelPausedMessage(2, 'GPT-5.5', 'not_in_plan');
+    expect(text).toContain("Step 2 uses GPT-5.5, which isn't included in this account's plan.");
+    expect(text).not.toContain('your plan');
+  });
+  it('an unavailable model keeps its wording', () => {
+    expect(buildStepModelPausedMessage(1, 'X', 'not_served')).toContain('Step 1 uses X, which is no longer available.');
   });
 });

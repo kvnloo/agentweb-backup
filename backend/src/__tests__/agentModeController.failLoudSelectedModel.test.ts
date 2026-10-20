@@ -152,6 +152,7 @@ import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverSe
 import { checkTokenUsage, incrementUserTokenUsage } from '../services/tokenUsageService';
 import { isRunStoreEnabled, claimIdempotency } from '../services/agentMode/runStore';
 import { modelAccess } from '../services/agentMode/modelAccessInstance';
+import { workPlanStepModels } from '../services/agentMode/workPlanStepModelsInstance';
 import { readTierAllowedModels, getUserSubscriptionResolution } from '../services/subscriptionService';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
@@ -1247,6 +1248,48 @@ describe('ENG-669 model source on canonical ids, final-gate 422, legacy side cha
     expect(saved[1].content).toContain("isn't included in your plan");
     expect(mockWorker.runInWorker).not.toHaveBeenCalled();
     delete mockSettings.work_plan_step_models_enabled;
+  });
+
+  it("a step model the user adopted in an admin-authored plan stays the user's: checked, and paused when outside the plan", async () => {
+    const honor = jest.spyOn(workPlanStepModels, 'shouldHonor').mockResolvedValue(true);
+    storeSession({
+      ...baseSession(ALLOWED), llmModelSource: 'user',
+      workPlan: {
+        title: 'P', planAuthor: 'system', engineModel: ALLOWED, createdAt: 'x', updatedAt: 'x',
+        steps: [{ stepCount: 1, title: 'S1', status: 'pending', model: DISALLOWED, modelSource: 'user' }],
+      },
+    });
+    const result = await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, ALLOWED);
+    honor.mockRestore();
+    expect(result.content).toContain("which isn't included in this account's plan");
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+  });
+
+  it("a human's NEW pick of a model an admin-authored plan uses elsewhere is still checked against the owner's plan", async () => {
+    storeSession({
+      ...baseSession(ALLOWED), llmModelSource: 'user',
+      workPlan: { title: 'P', planAuthor: 'system', createdAt: 'x', updatedAt: 'x', steps: [{ stepCount: 1, title: 'S1', status: 'pending', model: DISALLOWED }] },
+    });
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: DISALLOWED }), res);
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toMatchObject({ reason: 'not_in_plan' });
+  });
+
+  it('shared view: an exhausted allowance keeps its usage-limit 429 even when the stored model is outside the plan', async () => {
+    mockCheckTokenUsage.mockResolvedValue({
+      allowed: false, warning: false, used: 1, allowance: 1, bonus: 0, effectiveAllowance: 1, percentUsed: 100, month: '2026-07',
+    });
+    storeSession({
+      ...baseSession(DISALLOWED), llmModelSource: 'user',
+      interactiveShareMetadata: { isActive: true, token: 'tok', sharedAt: '2026-07-01T00:00:00Z' },
+    });
+    const res = makeRes();
+    await agentModeController.generateSharedResponse({
+      params: { shareId: SESSION_ID }, query: { conversable: 'tok' }, body: { userMessage: MESSAGE, attachments: [] }, on: jest.fn(),
+    } as unknown as Request, res);
+    expect(res.statusCode).toBe(429);
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
   });
 
   it('shared view: a final-gate refusal is a 422 without the owner\'s plan', async () => {

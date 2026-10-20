@@ -101,6 +101,32 @@ describe('isSystemModelFor', () => {
     expect(mockGetWorkPlan).not.toHaveBeenCalled();
   });
 
+  it("an adopted step model (modelSource 'user') in an admin-authored plan is the user's, not a system model", async () => {
+    const session = { workPlan: { planAuthor: 'system', steps: [{ model: 'step-pin' }, { model: 'gpt-5.5', modelSource: 'user' }] } };
+    expect(await isSystemModelFor(session, 'step-pin')).toBe(true);
+    expect(await isSystemModelFor(session, 'gpt-5.5')).toBe(false);
+  });
+
+  it('legacy session with a still-admin-authored template: the pins it copied at launch stay system models after a template edit', async () => {
+    mockGetWorkPlan.mockResolvedValue({ visibility: 'system', isBuiltIn: true, defaultModel: 'gemini-3.5-flash', steps: [{ model: 'gemini-3.5-flash' }] });
+    const legacy = {
+      llmModel: 'plan-pin', // stamped at launch by a write that carried no decision and no source
+      workPlan: { templatePlanId: 'plan-1', planDefaultModel: 'plan-pin', steps: [{ model: 'step-pin' }] },
+    };
+    expect(await isSystemModelFor(legacy, 'plan-pin')).toBe(true);
+    expect(await isSystemModelFor(legacy, 'step-pin')).toBe(true);
+    expect(await isSystemModelFor(legacy, 'gpt-5.5')).toBe(false);
+  });
+
+  it('a human pick is exempt only as the configured default or the session\'s own system stamp (not as a plan pin or kind default)', async () => {
+    const session = { sessionType: 'scheduled', llmModel: 'gpt-5.5', llmModelSource: 'system' as const, workPlan: { planAuthor: 'system', steps: [{ model: 'step-pin' }] } };
+    expect(await isSystemModelFor(session, 'step-pin', { humanPick: true })).toBe(false);
+    expect(await isSystemModelFor(session, 'sched-model', { humanPick: true })).toBe(false);
+    expect(await isSystemModelFor(session, 'default-model', { humanPick: true })).toBe(true);
+    expect(await isSystemModelFor(session, 'gpt-5.5', { humanPick: true })).toBe(true);
+    expect(await isSystemModelFor(session, 'step-pin')).toBe(true);
+  });
+
   it('legacy session (no planAuthor): a deleted template (null) exempts nothing', async () => {
     mockGetWorkPlan.mockResolvedValue(null);
     expect(await isSystemModelFor({ workPlan: { templatePlanId: 'plan-gone' } }, 'plan-pin')).toBe(false);
