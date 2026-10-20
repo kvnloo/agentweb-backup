@@ -98,8 +98,8 @@ pure function: the verified team members, in team order, who have a window open 
 `at` AND only when `at` is inside the calling hours. Weekday and `HH:MM` come from
 the same local instant in the calling-hours timezone, so DST days resolve on the
 clock the business sees. The orchestrator rings the first candidate that is not in
-its cooldown. With a team of one this is the single fixed phone of the first
-version.
+its cooldown. A team of one rings that person whenever the calling hours are open and
+their window allows.
 
 **Next attempt.** When a member leg ends without the member taking the lead
 (declined, ignored the prompt, no answer, busy, failed, canceled) the member
@@ -125,9 +125,9 @@ a duplicate or stale job stops without dialing. It then re-checks everything at 
 moment it runs: kill switch, org config, entitlement, `maxAttemptsPerLead`, the
 lead's age, and who is available NOW (excluding `triedMemberIds`). The conditional
 `between_attempts` -> `dialing` move (which stores the new `attemptNo`, `memberId`,
-appends to `triedMemberIds`, and clears `memberCallSid` and `outcome` to empty
-strings, because the store cannot remove a field; every reader treats an empty
-value as none) is the lock for the attempt; then the member is called and the
+appends to `triedMemberIds`, and removes `memberCallSid` and `outcome` through the
+patch's `clear` list, a `REMOVE` in the same conditional update) is the lock for the
+attempt; then the member is called and the
 record moves to `member_ringing`, exactly like a first attempt. If the placement is
 ambiguous the record stays `dialing` with `placement_unknown` and the first signed
 callback of that call supplies its sid, for any attempt number. A callback of an
@@ -139,7 +139,20 @@ goes on to the next member within `maxAttemptsPerLead`; the record fails with
 a record that is waiting between attempts whenever it cannot ring anyone: config
 disabled, not entitled or the kill switch off -> `disabled` (with the switch off it
 makes one conditional write and no reads); no one available any more, attempts used
-up, the lead too old or no caller number -> `no_member_available`.
+up, the lead too old or no caller number -> `no_member_available`. The reason a
+further attempt was refused is logged by the webhook (`no further attempt: <reason>`).
+
+**Records stranded between attempts heal.** A job that breaks before it rang anyone
+(a store or config read failing, say) closes the record it was resolving as `failed`
+with outcome `next_attempt_failed` and a `call.failed` event (reason
+`next_attempt_failed`), then fails its queue row; a record that has already left
+`between_attempts` is not touched, because a call may be live on it. The other way to
+be stranded is a store error after the leg was metered but before the next attempt
+was requested. Twilio then redelivers the leg's final status callback (the
+`#rc=3&rp=5xx,ct` override), `/status` finds the leg already metered, the record
+still `between_attempts` and the leg's `<sid>#ended` marker present, and asks for the
+next attempt again. That request is idempotent (the queue key, then the
+`between_attempts` -> `dialing` lock) and nothing is billed twice.
 
 **Lead age.** The deadline for further attempts is measured from the record's
 `startedAt` (when the first member was rung, which was itself within
@@ -161,6 +174,7 @@ All paths are under `backend/src/`.
 | Orchestrator: gates, limits, create-first, place call | `services/hotLeadCallService.ts` (queue source `hot_lead_call`, `maxAttempts: 1`, registered in `app.ts`) |
 | Placing one member call (first and later attempts) | `services/hotLeadCallPlacement.ts` |
 | Next attempts: the request the webhooks make and the job that rings the next member (queue source `hot_lead_call_next`) | `services/hotLeadCallAttempts.ts` |
+| Queueing and running a job of either kind (enqueue, heartbeat, complete or fail) | `services/hotLeadCallQueue.ts` |
 | Keyed hash of the lead's phone kept on the call record | `services/voice/leadPhoneMac.ts` (one helper: the orchestrator stores it, `/gather` compares it) |
 | Org config type and strict validator | `services/hotLeadCallConfig.ts` |
 | Who to ring at a given time (pure routing and the portal preview) | `services/hotLeadCallRoster.ts` |
@@ -172,8 +186,9 @@ All paths are under `backend/src/`.
 | Twilio seam (`placeCall`, `buyNumber`, `releaseNumber`, `validateSignature`) | `services/voice/voiceProvider.ts` (the only file that imports `twilio`), `__tests__/helpers/fakeVoiceProvider.ts` (tests) |
 | Webhook URLs | `services/voice/voiceUrls.ts` |
 | TwiML builders (hand-built XML, XML-escaped) | `services/voice/twiml.ts` |
-| Webhook routes, mounted at `/api/webhooks/twilio-voice` | `routes/twilioVoiceWebhook.ts` (`/owner`, `/gather`, `/screen`, `/screen-result`, `/dial`, `/status`; the path names are kept from the first version, `/owner` now serves the prompt to the team member being rung) |
-| Per-leg metering | `services/voice/voiceUsage.ts` `recordCallUsage` -> `recordVendorUsage` |
+| Webhook routes, mounted at `/api/webhooks/twilio-voice` | `routes/twilioVoiceWebhook.ts` (`/owner`, `/gather`, `/screen`, `/screen-result`, `/dial`, `/status`; `/owner` serves the prompt to the team member being rung, the name predates teams) |
+| Metering of a finished leg, the hand-over to the next member and the rule that finishes a call | `services/voice/callFinalisation.ts` |
+| Per-leg usage event | `services/voice/voiceUsage.ts` `recordCallUsage` -> `recordVendorUsage` |
 | Rate card and runtime rate overrides | `utils/vendorRateCard.ts`, `routes/adminVendorRates.ts` |
 | Twilio credentials | `utils/secretsManager.ts` `getTwilioCredentials` |
 | Emma settings tools | `emma/hotLeadCallTools.ts` |
@@ -241,8 +256,8 @@ call, Slack only"). Validation applies to every read, including the webhooks.
 | `twilioNumber`, `twilioNumberSid` | system-managed. Same phone rules; sid must match `PN` + 32 hex. |
 | `leadTypes` | non-empty subset of the lead origins; default `["form_fill"]`. In practice the orchestrator only ever calls for `form_fill`; other origins return before any read. |
 | `maxAgeMinutes` | integer 1-60, default 10. A lead older than this when the first job runs (`submittedAt`, else lead `createdAt`; a missing or unparseable time fails closed) is skipped as `too_old`. Further attempts must start within this long of the call record's `startedAt`. |
-| `maxCallsPerHour` | integer 1-30, default 6. |
-| `maxCallsPerDay` | integer 1-100, default 20. |
+| `maxCallsPerHour` | integer 1-30, default 6. Counts LEADS that get a call, one per lead at its first attempt: a lead can ring up to `maxAttemptsPerLead` members and then the lead's own leg and still uses one slot. |
+| `maxCallsPerDay` | integer 1-100, default 20. Counts leads the same way. |
 | `memberCooldownMinutes` | integer 1-60, default 2. Per team member: a member who was just rung is passed over for the next available one. |
 | `maxAttemptsPerLead` | integer 1-5, default 3. How many member calls may be made for one lead; a member who was already tried is never rung again. |
 | `announcedName` | required, trimmed, 1-60 chars of letters, digits, space and `. , & ' -`. Spoken in `<Say>`; XML-escaped by the TwiML builder. |
@@ -255,8 +270,8 @@ A repeat submission with the same email overwrites `lead.phone`, so the call
 record keeps `leadPhoneMac`, a keyed HMAC of the number that passed the gates
 (`services/voice/leadPhoneMac.ts`, domain label `hlc-lead-phone-v1`; never the
 number). `/gather` refuses to dial when the live number's MAC differs
-(`lead_phone_changed`). A record without a `leadPhoneMac` (created before the
-check existed) is dialed and a warning is logged.
+(`lead_phone_changed`). A record without a `leadPhoneMac` cannot prove it and is
+refused the same way; the orchestrator always stores one.
 
 ## Emma tools
 
@@ -364,8 +379,7 @@ Twilio account (inline TwiML is normally logged; unverified, see "Not verified")
   does not buy more calls.
 - Changing a member's phone (REST or chat) clears that member's `verifiedAt` and pending code in the same write as the
   settings. Removing a member deletes their record.
-- A stored record that does not validate (including the single-record shape of the first version, which was never
-  deployed) makes start and confirm refuse ("Stored verification state is invalid. Contact support.") instead of
+- A stored record that does not validate (including a single-record shape that no released version wrote) makes start and confirm refuse ("Stored verification state is invalid. Contact support.") instead of
   being replaced, because replacing it would reset the limits. Repair is a data change that needs Harsha's approval.
 
 ## Team settings API (REST)
@@ -470,7 +484,11 @@ backend instance for 30 seconds, so a flip takes up to ~30s per instance to
 apply, and the failure direction is off. Off means `dispatchHotLeadCall` returns
 before any read or write (no lead read, no limit key, no event, no queue job),
 and in-flight calls are cut short: a member who picks up after the switch is
-turned off hears a hangup (`aborted`) while the leg is still metered. Under
+turned off hears a hangup (`aborted`) while the leg is still metered. The one
+exception to "no writes" is the next-attempt job: with the switch off it reads
+nothing and makes one conditional write (and its `call.completed` event) that closes a
+record waiting between attempts as `disabled`, so the record does not wait for a
+call that will never come. Under
 Jest (`NODE_ENV=test`) it is always off unless overridden.
 
 ## Secrets and configuration
@@ -516,7 +534,7 @@ purchased US local number needs a regulatory bundle or address on this account;
 whether A2P 10DLC applies (it is an SMS registration and this feature sends no
 SMS, so it is believed not to apply); account balance and spend limits;
 caller-ID reputation and STIR/SHAKEN attestation for the purchased numbers
-(affects whether owners see the call as spam).
+(affects whether members see the call as spam).
 
 ## Persistent data (data-plane list)
 
@@ -529,7 +547,7 @@ No new table or index. The feature writes:
 | `hotLeadCallProvisioning` (purchase/release timestamps for the daily caps) | org attribute | provisioning tools |
 | `hot_lead_call_mode` | AW-Settings item | operators |
 | `vendor_rate_overrides` | AW-Settings item | admin Vendor Rates tab |
-| `system.hot_lead_call` (call record: `state`, `jobKey`, `startedAt`, `updatedAt`, `attemptNo`, `memberId`, `triedMemberIds`, `memberCallSid`, `leadCallSid`, `outcome`, `meteredLegs` (`member:<attempt>` and `lead`), `lastSequence`) | on the lead row (AW-Leads), no phone number | orchestrator and webhooks |
+| `system.hot_lead_call` (call record: `state`, `jobKey`, `startedAt`, `updatedAt`, `attemptNo`, `memberId`, `triedMemberIds`, `leadPhoneMac` (keyed HMAC of the lead's phone, see Org config), `memberCallSid`, `leadCallSid`, `outcome`, `meteredLegs` (`member:<attempt>` and `lead`), `lastSequence`) | on the lead row (AW-Leads), no phone number | orchestrator and webhooks |
 | Timeline events `call.*` | the lead's `engagements` list | `LeadCallStore.addEvent` |
 | `hlc#phone#<hmac>`, `hlc#cool#<orgId>#<memberId>`, `hlc#cap#h#<orgId>#<UTC hour>`, `hlc#cap#d#<orgId>#<local date>` | existing table `AW-MCPSessions` (partition key `sessionId`, attribute `ttl`) | limit store |
 
@@ -613,15 +631,24 @@ back if the record is not created:
    `no_one_available` (inside the calling hours, but no verified member has an
    open window), `too_old`, then `not_entitled` (the org owner's subscription tier does not
    include the `hot_lead_call` feature; see [Plan entitlement](#plan-entitlement)).
+   Just before a slot is taken the job also loads the Twilio credentials and skips
+   with `credentials_unavailable` when it cannot: no slot or record is used, so a
+   later submission can try again.
    To stop an anonymous visitor growing a lead row by resubmitting, a lead gets
    at most one `call.skipped` event per distinct reason and at most 5 in total
    (counted from the lead's existing timeline, so two simultaneous submissions
-   can overshoot by the number in flight). A `duplicate_phone` refusal for a
-   lead that has, or within 200 ms gets, its own call record writes nothing: it
-   is the same lead racing itself.
-3. Limits, in this order: `duplicate_phone` (same org and number within 24h),
-   `member_cooldown`, `org_hourly_cap` (UTC clock hour), `org_daily_cap` (org's
-   local calendar day). Each is one conditional write.
+   can overshoot by the number in flight). A second dispatch of a lead that is
+   already being dialed (the 24h phone marker is held by that same lead; called
+   `in_progress` in the code) writes nothing: it is the same lead racing itself.
+3. Limits, taken once per lead at its first attempt, in this order: `duplicate_phone`
+   (same org and number within 24h), `org_hourly_cap` (UTC clock hour),
+   `org_daily_cap` (org's local calendar day). Both caps count LEADS, not member
+   calls (a lead rings up to `maxAttemptsPerLead` members and the lead's leg for one
+   slot). Each is one conditional write. Then, for every attempt, first and next, the
+   chosen member's cooldown: a member in cooldown is a per-attempt skip, the next
+   candidate is used instead. Only when every candidate of a lead's first attempt is
+   in cooldown is the lead skipped as `member_cooldown` (its slots are given back);
+   on a later attempt, when none is left the record closes as `no_member_available`.
 4. `limits_unavailable`: the limit store failed; nothing is dialed, the job
    fails (not retried), an event is written best-effort.
 
@@ -637,8 +664,13 @@ Known limits, accepted:
 - Whoever submits a number first suppresses calls for that number for 24h.
 - The cooldown skips a member who took a call within `memberCooldownMinutes` in favour of the next available one; when every candidate is in cooldown the lead is skipped as `member_cooldown`.
 - A process crash between reserving and `create` leaves the 24h phone marker and
-  the cooldown claim held with no record: a repeat of that number is refused as
-  `duplicate_phone` with a silent timeline.
+  the hourly and daily counts held with no record (and, if it fell between a
+  member's cooldown claim and the record, that member's cooldown): a repeat of that
+  number is refused as `duplicate_phone` with a silent timeline.
+- Calling hours and the plan are checked when a call is placed and when each next
+  attempt is requested, not again at `/gather`. A member who answers late can still
+  have the lead dialed after the window closed: up to about 40 seconds of ring time
+  can run past it. Accepted.
 - A lead gets one call record ever. A member call Twilio rejected is not retried
   for the same member; the next member is tried instead, and a lead whose every
   placement was rejected is not called again.
@@ -675,7 +707,7 @@ Event types written to the lead timeline (`eventType`, with a scalar `eventData`
 | `call.connected` | the lead pressed 1 at the screening prompt (`/screen-result`), or `/dial` reported `DialBridged=true`; an answered lead leg alone is not a connection | - |
 | `call.lead_no_answer` | `/dial` reported no-answer, busy or failed | `dialStatus` |
 | `call.completed` | last dialed leg metered; the record is `finished` | `outcome` |
-| `call.failed` | `reason`: `place_rejected`, `placement_unknown` (both also carry `attempt`, `memberId`), `lead_phone_invalid`, `lead_phone_changed`, `aborted` | `reason` |
+| `call.failed` | `reason`: `place_rejected`, `placement_unknown` (both also carry `attempt`, `memberId`), `lead_phone_invalid`, `lead_phone_changed`, `aborted`, `next_attempt_failed` | `reason` |
 | `call.skipped` | a gate or limit refused (no Twilio call made) | `reason` (list above) |
 
 Record `state`: `dialing`, `member_ringing`, `member_answered`, `between_attempts`
@@ -685,9 +717,10 @@ the type but the orchestrator records skips as events only). `outcome` values:
 `completed`, `member_declined`, `member_no_answer`, `no_member_available`,
 `lead_declined`, `lead_no_answer`, `lead_phone_invalid`, `lead_phone_changed`,
 `bridge_unconfirmed`, `aborted`, `disabled` (the next-attempt job found the kill
-switch, the org config or the plan off), `place_rejected`,
-`placement_unknown` (informational on a live `dialing` record). An empty `outcome`
-or `memberCallSid` means none: a next attempt resets them that way. Markers in
+switch, the org config or the plan off), `place_rejected`, `next_attempt_failed`
+(the next-attempt job broke before it rang anyone),
+`placement_unknown` (informational on a live `dialing` record). A next attempt
+starts with no `outcome` and no `memberCallSid`: the transition removes both. Markers in
 `lastSequence`: `<memberCallSid>#gather`, `<memberCallSid>#dial`,
 `<memberCallSid>#ended` (the member leg ended without taking the lead),
 `<leadCallSid>#screen`, `lead#adopt`.
@@ -770,10 +803,13 @@ mid-call. No cron cleans these up and no operator tool lists them.
   and we did not meter it.
 - `member_ringing` / `member_answered`: the member leg's final callback is missing.
 - `between_attempts`: the attempt's leg is metered but the record was neither
-  taken over by a next attempt nor finished (the process died between the
-  metering and the next-attempt request, or the next-attempt job never ran or
-  stopped early; a redelivered callback does not resume it). No call is in flight.
-  The lead is simply not called again.
+  taken over by a next attempt nor finished. Usually this heals by itself: a
+  redelivery of that leg's final callback asks for the next attempt again, and a
+  next-attempt job that breaks closes the record as `failed` / `next_attempt_failed`.
+  What stays is the case where Twilio never redelivers (the process died right
+  after the metering and the retries were used up) or the job's process died with
+  the queue row still claimed. No call is in flight. The lead is simply not called
+  again.
 - `bridging` / `connected`: the bridge ended but a leg callback is missing; the
   call may be unmetered.
 
@@ -825,9 +861,10 @@ Two risks come with a public lead form and must be understood before general
 availability:
 
 1. **A third party can be called.** An anonymous visitor can type any phone
-   number into a landing-page form. After the business owner presses 1, that third
-   party receives a call from the org's Twilio number, and the same victim number
-   can be entered at several orgs, so each org's owner connects once.
+   number into a landing-page form. After a team member presses 1, that third
+   party receives a call from the org's Twilio number (and must press 1 as well
+   before anyone is connected), and the same victim number can be entered at
+   several orgs, so each org can connect once.
 2. **A number-rotating bot can starve genuine leads.** A script that submits a
    different number each time uses up an org's daily and hourly caps; real leads
    after that are skipped (`org_hourly_cap` / `org_daily_cap`). The Slack alert
@@ -848,7 +885,7 @@ Owner: Anurag. None of these may be skipped before `hot_lead_call_mode` is turne
 on anywhere.
 
 1. Compliance sign-off (decision D7): consent and disclosure for automated calls
-   to business owners and for connecting leads, call recording stance (nothing is
+   to team members and for connecting leads, call recording stance (nothing is
    recorded by this feature), regional restrictions.
 2. Twilio account: production credentials in `prod/AgentWeb/Twilio`, billing and
    spend limits set, Voice Geographic Permissions allow US and Canada, no other
@@ -888,8 +925,7 @@ on anywhere.
 12. Dependency bump (whole backend): adding `twilio` raised axios 1.9.0 to 1.13.5,
     jsonwebtoken 9.0.2 to 9.0.3, jws 3.2.2 to 4.0.1, jwa 1.4.1 to 2.0.1 and some
     patch versions. After the deploy, smoke the Slack, Facebook/Meta and Teams
-    (botbuilder) HTTP paths and the Google auth paths. The regression run of the 212
-    suites that touch these libraries passed.
+    (botbuilder) HTTP paths and the Google auth paths.
 13. Rate-card version: `VENDOR_RATE_CARD_VERSION` moved from 2026-09-14 to
     2026-10-19 because a rate was added, so spend events written after the deploy
     carry the new version string for ALL vendors. Amounts are identical (checked
