@@ -24,7 +24,10 @@ missing keeps the 429. A non-opted account never reads the switch or writes anyt
 **How overage and the cap are measured.**
 - The month's pool = `max(today's effective threshold after credits, poolHighWater for this UTC month)`.
   The high-water mark is written by the gate only when it rises (conditional write) and only for
-  opted-in accounts, so a downgrade AFTER opting in never creates retroactive overage.
+  opted-in accounts, so a downgrade AFTER opting in never creates retroactive overage. Past the pool the
+  gate re-reads the owner strongly consistent (`getUserByIdConsistent`; `getUserById` goes through the
+  eventually consistent UserIdIndex) before deciding, and a lost high-water write uses the higher mark
+  that beat it. Below the pool there is no extra read.
 - Only usage after opting in is overage: the month's FIRST off -> on records
   `optIn: { month, overageBaselineMicroUsd }` = the overage standing at that moment (same pool measure as
   the gates), subtracted for that month only. Re-enabling later in the same month keeps that baseline
