@@ -12,6 +12,7 @@ import { resolveHotLeadCallContext, type HotLeadCallContext } from './voice/hotL
 import { getLeadCallStore } from './voice/leadCallStore';
 import { isWithinCallWindow, leadPhoneMac, reserveCallSlot, type Reservation } from './voice/hotLeadCallLimits';
 import { selectHotLeadCallCandidates } from './hotLeadCallRoster';
+import { NEXT_ATTEMPT_SOURCE, processHotLeadCallNextAttempt } from './hotLeadCallAttempts';
 import { errorText, placeMemberCall, type PlacementResult } from './hotLeadCallPlacement';
 // This file must not import orgLeadNotificationService: that module calls dispatchHotLeadCall.
 
@@ -204,4 +205,5 @@ export async function dispatchHotLeadCall(listId: string, leadId: string, origin
 
 export function registerHotLeadCallProcessor(): void {
   registerProcessor(SOURCE, processHotLeadCallJob, { maxAttempts: 1 });
+  registerProcessor(NEXT_ATTEMPT_SOURCE, processHotLeadCallNextAttempt, { maxAttempts: 1 });
 }
