@@ -1738,6 +1738,7 @@ export class AgentModeService {
         await import('../emma/testAccountTools');
         await import('../emma/navigateTools');
         await import('../emma/connectAccountTool');
+        await import('../emma/linkedInAccountRevokeTools');
         await import('../emma/solveRecaptchaTool');
         await import('../emma/siteSigninTools');
         await import('../emma/verificationCodeTool');
