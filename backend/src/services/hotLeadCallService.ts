@@ -83,6 +83,9 @@ async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: H
 
   const lead = await crmDb.getLeadById(listId, leadId, { consistentRead: true });
   if (!lead || lead.listId !== listId || lead.leadId !== leadId) return null;
+  // A lead gets one call record ever, so a repeat submission (fresh submissionId, same lead) has nothing to
+  // start: stop before it costs a job row, reservations or timeline reads. The lead row is already loaded.
+  if (lead.system?.hot_lead_call) return null;
   // Silent on purpose: synthetic smoke-test leads (smoke-test+N@agentweb.pro, or the reserved fictional
   // 415-555-01xx phones) must never ring anyone, and a timeline event would just be noise.
   if (isSmokeTestLead(lead)) return null;

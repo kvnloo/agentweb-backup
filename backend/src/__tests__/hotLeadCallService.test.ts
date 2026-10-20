@@ -785,6 +785,18 @@ describe('two dispatches racing for the same lead', () => {
   });
 });
 
+describe('a lead that already has a call record', () => {
+  it('stops in review, before any job row, reservation or timeline read, on a repeat submission', async () => {
+    lead.system = { hot_lead_call: { state: 'finished', jobKey: 'old' } };
+    await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill', { submissionId: 'sub-9', submittedAt: NOW });
+    expect(enqueueCalls()).toHaveLength(0);
+    expect(limits.keysTouched).toEqual([]);
+    expect(provider.placedCalls).toHaveLength(0);
+    expect(store.events).toEqual([]);
+    expect(mock(crmDb.getLeadById)).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('the call record of the first attempt', () => {
   it('stores a keyed digest of the dispatch-time phone, never the phone', async () => {
     await processHotLeadCallJob(jobOf());
