@@ -10,6 +10,7 @@ import {
   repairUnescapedQuotes,
   hasDuplicateObjectKeys,
   parseToolCallArguments,
+  normalizeRepairedToolCallArguments,
   isTruncatedJsonPrefix,
   TruncatedToolCallArgumentsError,
 } from '../repairToolCallArguments';
@@ -294,9 +295,19 @@ describe('parseToolCallArguments — duplicated concatenated objects (ENG-2597)'
     expect(parseToolCallArguments('{}{}')).toEqual({});
   });
 
-  it('collapses identical objects, whitespace-separated or key-reordered', () => {
+  it('collapses byte-identical objects, including whitespace-separated', () => {
     expect(parseToolCallArguments('{"a":1}{"a":1}')).toEqual({ a: 1 });
-    expect(parseToolCallArguments('{"a":1,"b":"x}{"} \n {"b":"x}{","a":1}{"a":1,"b":"x}{"}')).toEqual({ a: 1, b: 'x}{' });
+    expect(parseToolCallArguments('{"a":1,"b":"x}{"} \n {"a":1,"b":"x}{"}{"a":1,"b":"x}{"}')).toEqual({ a: 1, b: 'x}{' });
+  });
+
+  it('does not collapse objects that differ only textually (key order) — exact duplicates only', () => {
+    expect(() => parseToolCallArguments('{"a":1,"b":2}{"b":2,"a":1}')).toThrow();
+  });
+
+  it('does not collapse objects whose long numeric ids differ but round to the same double', () => {
+    expect(() => parseToolCallArguments(
+      '{"customer_id":12345678901234567890}{"customer_id":12345678901234567891}',
+    )).toThrow();
   });
 
   it('still throws when the concatenated objects differ', () => {
@@ -307,5 +318,28 @@ describe('parseToolCallArguments — duplicated concatenated objects (ENG-2597)'
   it('does not treat non-object trailing content as a duplicate', () => {
     expect(() => parseToolCallArguments('{}x')).toThrow();
     expect(() => parseToolCallArguments('{}[]')).toThrow();
+  });
+});
+
+describe('normalizeRepairedToolCallArguments (ENG-2597 history replay)', () => {
+  it('rewrites malformed raw arguments to the repaired JSON so history replays one valid object', () => {
+    const toolCall = { function: { arguments: '{"platform":"twitter"}{"platform":"twitter"}' } };
+    const parsed = parseToolCallArguments(toolCall.function.arguments);
+    normalizeRepairedToolCallArguments(toolCall, parsed);
+    expect(JSON.parse(toolCall.function.arguments)).toEqual({ platform: 'twitter' });
+  });
+
+  it('leaves already-valid arguments byte-for-byte untouched', () => {
+    const raw = '{ "b": 2, "a": 1 }';
+    const toolCall = { function: { arguments: raw } };
+    normalizeRepairedToolCallArguments(toolCall, { a: 1, b: 2 });
+    expect(toolCall.function.arguments).toBe(raw);
+  });
+
+  it('ignores tool calls without string arguments', () => {
+    expect(() => normalizeRepairedToolCallArguments(undefined, {})).not.toThrow();
+    const toolCall = { function: { arguments: { a: 1 } as unknown } };
+    normalizeRepairedToolCallArguments(toolCall, { a: 1 });
+    expect(toolCall.function.arguments).toEqual({ a: 1 });
   });
 });

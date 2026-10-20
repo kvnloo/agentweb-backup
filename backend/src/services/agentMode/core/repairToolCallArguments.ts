@@ -418,21 +418,36 @@ export function parseDuplicatedJsonObjects(raw: string): unknown {
     }
   }
   if (depth !== 0 || inString || parts.length < 2) return undefined;
-  let parsed: unknown[];
+  // Compare the RAW text, not parsed values: JSON.parse rounds integers past
+  // 2^53, so two calls differing only in a long numeric id would otherwise
+  // look identical and collapse into one call with a rounded id (Opslane P2).
+  // The observed stream bug duplicates bytes exactly, so exact text equality
+  // is all we need.
+  if (!parts.every((p) => p === parts[0])) return undefined;
   try {
-    parsed = parts.map((p) => JSON.parse(p));
+    return JSON.parse(parts[0]);
   } catch {
     return undefined;
   }
-  const canonical = parsed.map((p) => stableCanonical(p));
-  return canonical.every((c) => c === canonical[0]) ? parsed[0] : undefined;
 }
 
-function stableCanonical(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stableCanonical).join(',')}]`;
-  if (value && typeof value === 'object') {
-    const obj = value as Record<string, unknown>;
-    return `{${Object.keys(obj).sort().map((k) => `${JSON.stringify(k)}:${stableCanonical(obj[k])}`).join(',')}}`;
+/**
+ * ENG-2597: if `toolCall.function.arguments` is not itself valid JSON but was
+ * successfully parsed (via repair) into `parsedArgs`, overwrite it with the
+ * re-serialized repaired object. The same toolCall object lives on the
+ * assistant message saved to chat history, so the next turn replays one valid
+ * object instead of the malformed provider text. Valid JSON is left untouched.
+ */
+export function normalizeRepairedToolCallArguments(
+  toolCall: { function?: { arguments?: unknown } } | undefined,
+  parsedArgs: unknown,
+): void {
+  const fn = toolCall?.function;
+  if (!fn || typeof fn.arguments !== 'string') return;
+  try {
+    JSON.parse(fn.arguments);
+    return;
+  } catch {
+    fn.arguments = JSON.stringify(parsedArgs);
   }
-  return JSON.stringify(value);
 }
