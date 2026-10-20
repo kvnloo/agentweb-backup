@@ -17,7 +17,7 @@ import { resolveEnforcementCostBasisMicroUsd } from '../services/spendEnforcemen
 import { resolveLlmUsagePoolDecision } from '../services/llmUsagePoolDecision';
 import { getCurrentUsageMonth, type MonthlyLlmUsageCredits } from '../services/llmUsageCreditService';
 import { getCurrentMonth } from '../services/tokenUsageService';
-import type { PaygOverageSettings } from '../services/paygOverage';
+import { withPaygAdmission, type PaygOverageSettings } from '../services/paygOverage';
 import {
   computePaygSettlementAmount,
   paygSettlementIdempotencyKey,
@@ -76,7 +76,12 @@ describe('ENG-668 settlement amount = the gate\'s measurement', () => {
       subscription_status: 'active',
     };
     (userDb.getUserByIdConsistent as jest.Mock).mockResolvedValue(owner);
-    (userDb.updateUser as jest.Mock).mockResolvedValue({});
+    // Keep what the gate writes: the high-water mark it raises and the admission record settlement bills from.
+    const written: Record<string, unknown> = {};
+    (userDb.updateUser as jest.Mock).mockImplementation(async (_id: string, _fields: unknown, options: any) => {
+      for (const { path, value } of options?.pathSets ?? []) written[path[1]] = value;
+      return {};
+    });
 
     const gate = await resolveLlmUsagePoolDecision({
       billingUserId: 'u1',
@@ -87,36 +92,44 @@ describe('ENG-668 settlement amount = the gate\'s measurement', () => {
       paygTier: async () => ({ allowed: true, markupBps: 10_000 }),
       legacyRawCostUsedMicroUsd: async () => 0,
     });
+    expect(gate.mode.reason).toBe('payg_overage');
+    expect(written.admittedMonths).toEqual([{
+      month, capHighWaterMicroUsd: gate.overage!.capMicroUsd, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 10_000,
+    }]);
+
     const settled = computePaygSettlementAmount({
       month,
-      account: input.account,
-      basePolicy: policy,
+      account: { ...input.account, ...written } as PaygOverageSettings,
       creditLedger: input.credits,
       settledMicroUsd: Math.round(input.spendUsd * USD),
-      markupBps: 10_000,
-    });
-
-    expect(gate.overage).not.toBeNull();
-    expect(settled?.overage).toEqual(gate.overage);
-    expect(settled?.overageCostMicroUsd).toBe(Math.min(gate.overage!.overageMicroUsd, gate.overage!.capMicroUsd));
+    })!;
+    expect(settled.netOverageMicroUsd).toBe(gate.overage!.overageMicroUsd);
+    expect(settled.poolMicroUsd).toBe(gate.overage!.poolMicroUsd);
+    expect(settled.capMicroUsd).toBe(gate.overage!.capMicroUsd);
+    expect(settled.overageCostMicroUsd).toBe(Math.min(gate.overage!.overageMicroUsd, gate.overage!.capMicroUsd));
   });
 
-  it('is null (hold, never guess) when the tier has no enforced pool or the markup is not a price', () => {
-    const base = { month, account: account(), creditLedger: undefined, settledMicroUsd: 130 * USD };
-    expect(computePaygSettlementAmount({ ...base, basePolicy: null, markupBps: 15_000 })).toBeNull();
-    expect(computePaygSettlementAmount({ ...base, basePolicy: { ...policy, hardCostThresholdMicroUsd: 0 }, markupBps: 15_000 })).toBeNull();
-    expect(computePaygSettlementAmount({ ...base, basePolicy: policy, markupBps: undefined })).toBeNull();
-    expect(computePaygSettlementAmount({ ...base, basePolicy: policy, markupBps: 9_999 })).toBeNull();
-    expect(computePaygSettlementAmount({ ...base, basePolicy: policy, markupBps: 12_500.5 })).toBeNull();
+  const admittedAt = (over: Record<string, unknown> = {}) => ({
+    month, capHighWaterMicroUsd: 50 * USD, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 15_000, ...over,
+  });
+
+  it('is null (hold, never guess) without an admission record, a usable pool, cap or price', () => {
+    const base = { month, creditLedger: undefined, settledMicroUsd: 130 * USD };
+    const withAdmitted = (entry: Record<string, unknown> | null, over: Partial<PaygOverageSettings> = {}) =>
+      account({ admittedMonths: entry ? [entry as any] : [], ...over });
+    expect(computePaygSettlementAmount({ ...base, account: withAdmitted(null) })).toBeNull();
+    expect(computePaygSettlementAmount({ ...base, account: withAdmitted(admittedAt({ tierPoolHighWaterMicroUsd: 0 })) })).toBeNull();
+    expect(computePaygSettlementAmount({ ...base, account: withAdmitted(admittedAt({ capHighWaterMicroUsd: 0 })) })).toBeNull();
+    expect(computePaygSettlementAmount({ ...base, account: withAdmitted(admittedAt({ markupBps: null })) })).toBeNull();
+    expect(computePaygSettlementAmount({ ...base, account: withAdmitted(admittedAt({ markupBps: 9_999 })) })).toBeNull();
     expect(computePaygSettlementAmount({
-      ...base, basePolicy: policy, markupBps: 15_000,
-      account: account({ optIn: { month, overageBaselineMicroUsd: Number.NaN } }),
+      ...base, account: withAdmitted(admittedAt(), { optIn: { month, overageBaselineMicroUsd: Number.NaN } }),
     })).toBeNull();
   });
 
   it('applies the markup to the capped cost and rounds down to whole cents', () => {
     const amount = computePaygSettlementAmount({
-      month, account: account(), basePolicy: policy, creditLedger: undefined, settledMicroUsd: 133_333_333, markupBps: 12_345,
+      month, account: account({ admittedMonths: [admittedAt({ markupBps: 12_345 })] }), creditLedger: undefined, settledMicroUsd: 133_333_333,
     })!;
     // 33.333333 x 1.2345 = 41.149999... -> 41_149_999 micro-USD -> 4114 cents.
     expect(amount).toMatchObject({ overageCostMicroUsd: 33_333_333, billedMicroUsd: 41_149_999, amountCents: 4114, percentOfCap: 66 });
@@ -130,15 +143,30 @@ describe('ENG-668 settlement amount = the gate\'s measurement', () => {
         poolHighWaterClosed: { month: '2026-09', thresholdMicroUsd: 110 * USD },
         optIn: { month: '2026-10', overageBaselineMicroUsd: 0 },
         optInClosed: { month: '2026-09', overageBaselineMicroUsd: 5 * USD, poolAtOptInMicroUsd: 110 * USD },
+        admittedMonths: [{ month: '2026-09', capHighWaterMicroUsd: 55 * USD, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 10_000 }],
       }),
-      basePolicy: policy,
       creditLedger: undefined,
       settledMicroUsd: 130 * USD,
-      markupBps: 10_000,
     })!;
     // Pool $110 (closed mark), $20 gross - $5 baseline = $15.
-    expect(amount.overage.poolMicroUsd).toBe(110 * USD);
+    expect(amount.poolMicroUsd).toBe(110 * USD);
     expect(amount.overageCostMicroUsd).toBe(15 * USD);
+  });
+});
+
+describe('ENG-668 admission record merge', () => {
+  const sept = { month: '2026-09', capHighWaterMicroUsd: 50 * USD, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 15_000 };
+  it('writes nothing when an admission changes nothing, and only ever moves toward the customer', () => {
+    expect(withPaygAdmission([sept], { ...sept, capHighWaterMicroUsd: 40 * USD, markupBps: 20_000 })).toBeNull();
+    expect(withPaygAdmission([sept], { ...sept, capHighWaterMicroUsd: 60 * USD, markupBps: 20_000 }))
+      .toEqual([{ ...sept, capHighWaterMicroUsd: 60 * USD }]);
+    expect(withPaygAdmission([sept], { ...sept, tierPoolHighWaterMicroUsd: 90 * USD, markupBps: 12_000 }))
+      .toEqual([{ ...sept, markupBps: 12_000 }]);
+  });
+  it('a new month goes first and only two months are kept', () => {
+    const oct = { ...sept, month: '2026-10' };
+    const nov = { ...sept, month: '2026-11' };
+    expect(withPaygAdmission([oct, sept], nov)).toEqual([nov, oct]);
   });
 });
 

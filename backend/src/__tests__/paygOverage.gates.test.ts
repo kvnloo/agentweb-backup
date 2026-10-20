@@ -104,8 +104,11 @@ const payg = (over: Partial<PaygOverageSettings> = {}): PaygOverageSettings => (
   capPercentOfPool: 50,
   // Already at today's pool, so the high-water write is not part of every case.
   poolHighWater: { month: getCurrentUsageMonth(), thresholdMicroUsd: 100 * USD },
-  // PR-2: already marked as a month PAYG admitted in, so that write is not part of every case either.
-  admittedMonths: [getCurrentUsageMonth()],
+  // PR-2: this month's admission record already holds more than any case here reaches, so the
+  // admission write is not part of every case either.
+  admittedMonths: [{
+    month: getCurrentUsageMonth(), capHighWaterMicroUsd: 1_000 * USD, tierPoolHighWaterMicroUsd: 1_000 * USD, markupBps: 25_000,
+  }],
   updatedBy: OWNER,
   updatedAt: '2026-10-01T00:00:00.000Z',
   version: 1,
@@ -664,8 +667,11 @@ describe('ENG-668 PAYG — a refunded top-up does not stay in the pool high-wate
   });
 });
 
-describe('ENG-668 PR-2 — the gate records the months PAYG admitted in', () => {
+describe('ENG-668 PR-2 — the gate records what each month\'s admissions were measured against', () => {
   const month = getCurrentUsageMonth();
+  const entry = (over: Record<string, unknown> = {}) => ({
+    month, capHighWaterMicroUsd: 50 * USD, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 25_000, ...over,
+  });
   function stored(paygOverage: PaygOverageSettings) {
     const fake = createUserRowFake({
       userId: OWNER, email: 'owner@example.com', subscription_status: 'active', has_payment_method: true, paygOverage,
@@ -675,24 +681,40 @@ describe('ENG-668 PR-2 — the gate records the months PAYG admitted in', () => 
     mockUpdateUser.mockImplementation(fake.updateUser);
     return fake;
   }
+  const older = { month: '2000-02', capHighWaterMicroUsd: 1, tierPoolHighWaterMicroUsd: 1, markupBps: 10_000 };
 
-  it('the first PAYG admission of a month adds it, newest first, keeping one earlier month', async () => {
+  it('the first PAYG admission of a month records its cap, plan pool and markup, newest first, keeping one earlier month', async () => {
     setup({ spendUsd: 120 });
-    const fake = stored(payg({ admittedMonths: ['2000-02', '2000-01'] }));
+    const fake = stored(payg({ admittedMonths: [older, { ...older, month: '2000-01' }] }));
     expect((await checkTokenUsage(OWNER)).allowed).toBe(true);
-    expect(fake.row.paygOverage.admittedMonths).toEqual([month, '2000-02']);
+    expect(fake.row.paygOverage.admittedMonths).toEqual([entry(), older]);
 
-    // Later admissions in the same month write nothing more.
+    // Later admissions against the same cap, pool and markup write nothing more.
     mockUpdateUser.mockClear();
     await bothGates();
     expect(mockUpdateUser).not.toHaveBeenCalled();
+  });
+
+  it('a higher cap later in the month raises the record; a lower one never lowers it', async () => {
+    setup({ spendUsd: 120 });
+    const fake = stored(payg({ admittedMonths: [entry()] }));
+    fake.row = { ...fake.row, paygOverage: { ...fake.row.paygOverage, capPercentOfPool: 200 } };
+    await checkTokenUsage(OWNER);
+    expect(fake.row.paygOverage.admittedMonths).toEqual([entry({ capHighWaterMicroUsd: 200 * USD })]);
+
+    fake.row = { ...fake.row, paygOverage: { ...fake.row.paygOverage, capPercentOfPool: 25 } };
+    mockUpdateUser.mockClear();
+    // $20 overage is still under a 25% ($25) cap: admitted, measured against the lower cap, nothing written.
+    expect((await checkTokenUsage(OWNER)).allowed).toBe(true);
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+    expect(fake.row.paygOverage.admittedMonths).toEqual([entry({ capHighWaterMicroUsd: 200 * USD })]);
   });
 
   it('an account with no list yet gets one', async () => {
     setup({ spendUsd: 120 });
     const fake = stored(payg({ admittedMonths: undefined }));
     await checkTokenUsage(OWNER);
-    expect(fake.row.paygOverage.admittedMonths).toEqual([month]);
+    expect(fake.row.paygOverage.admittedMonths).toEqual([entry()]);
   });
 
   it('nothing is recorded below the pool, past the cap, or while PAYG is off', async () => {
@@ -714,10 +736,10 @@ describe('ENG-668 PR-2 — the gate records the months PAYG admitted in', () => 
 
   it('a lost race on the list (another writer changed it) never fails the check', async () => {
     setup({ spendUsd: 120 });
-    const fake = stored(payg({ admittedMonths: ['2000-01'] }));
+    const fake = stored(payg({ admittedMonths: [older] }));
     // The snapshot the gate decides on is one write behind the row.
     mockGetUserByIdConsistent.mockImplementationOnce(async () => ({ ...fake.row, paygOverage: { ...fake.row.paygOverage, admittedMonths: [] } }));
     expect((await checkTokenUsage(OWNER)).allowed).toBe(true);
-    expect(fake.row.paygOverage.admittedMonths).toEqual(['2000-01']);
+    expect(fake.row.paygOverage.admittedMonths).toEqual([older]);
   });
 });

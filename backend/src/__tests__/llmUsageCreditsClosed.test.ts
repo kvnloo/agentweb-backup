@@ -51,8 +51,10 @@ const september: MonthlyLlmUsageCredits = {
 const DAY1_SWEEP = new Date('2026-10-01T10:00:00.000Z');
 
 let store: ReturnType<typeof createUserRowFake>;
+/** A PAYG account (on or off): the only kind settlement ever measures, so the only kind that keeps a copy. */
+const PAYG = { enabled: false, capPercentOfPool: 50, updatedBy: 'owner-1', updatedAt: '2026-08-01T00:00:00.000Z', version: 1 };
 function setup(row: Record<string, unknown>) {
-  store = createUserRowFake({ userId: 'owner-1', email: 'owner@example.com', ...row });
+  store = createUserRowFake({ userId: 'owner-1', email: 'owner@example.com', paygOverage: PAYG, ...row });
   (userDb.getUserById as jest.Mock).mockImplementation(store.read);
   (userDb.updateUser as jest.Mock).mockImplementation(store.updateUser);
 }
@@ -75,6 +77,23 @@ describe('ENG-668 closed-month credit ledger', () => {
     expect(getLlmUsageCreditAdjustment(getLlmUsageCreditLedgerForMonth(store.row, '2026-09'), '2026-09')).toEqual({
       purchasedMicroUsd: 50 * USD, adminGrantedMicroUsd: 5 * USD, migrationOffsetMicroUsd: 0,
     });
+  });
+
+  it('an account with no PAYG record gets no closed copy: the rollover is exactly as before (review M7)', async () => {
+    setup({ llmUsageCredits: september, paygOverage: undefined });
+    await grantMonthlyLlmUsageCredit({
+      billingUserId: 'owner-1', grantId: 'seat-credit:org-1:2026-10', source: 'purchase', amountMicroUsd: 30 * USD, now: DAY1_SWEEP,
+    });
+    await recordLlmUsageDebit({ billingUserId: 'owner-1', workId: 'w9', amountMicroUsd: 2_000, now: DAY1_SWEEP });
+    expect(store.row.llmUsageCredits).toMatchObject({ month: '2026-10' });
+    expect(store.row).not.toHaveProperty('llmUsageCreditsClosed');
+    for (const [, fields] of (userDb.updateUser as jest.Mock).mock.calls) expect(fields).not.toHaveProperty('llmUsageCreditsClosed');
+
+    setup({ llmUsageCredits: september, paygOverage: undefined });
+    await grantMonthlyLlmUsageCredit({
+      billingUserId: 'owner-1', grantId: 'admin:owner-1:g3', source: 'admin', amountMicroUsd: 7 * USD, now: DAY1_SWEEP,
+    });
+    expect(mockTransactWrite.mock.calls[0][0].TransactItems[0].Update.UpdateExpression).toBe('SET #creditLedger = :next');
   });
 
   it('a second write in the new month leaves the closed copy alone', async () => {

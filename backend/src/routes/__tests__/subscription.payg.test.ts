@@ -62,6 +62,8 @@ import {
 } from '../../services/paygOverageService';
 import { getCurrentUsageMonth } from '../../services/llmUsageCreditService';
 import { evaluateCondition } from '../../__tests__/helpers/userRowFake';
+import { getEffectiveLlmUsagePolicy } from '../../services/llmUsagePolicyResolverService';
+import { computePaygSettlementAmount } from '../../services/paygSettlement';
 
 const USD = 1_000_000;
 const OWNER = 'owner-1';
@@ -382,6 +384,49 @@ describe('PUT /api/subscription/payg', () => {
     const res = await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(409);
     expect(res.body.error).toBe('payg_conflict');
     expect(users[OWNER].paygOverage.poolHighWater).toEqual({ month: getCurrentUsageMonth(), thresholdMicroUsd: 300 * USD });
+  });
+
+  it('off -> on after PAYG already admitted this month keeps the month\'s baseline: a toggle cannot reset the cap (review M3)', async () => {
+    const month = getCurrentUsageMonth();
+    const [y, m] = month.split('-').map(Number);
+    const previousMonth = getCurrentUsageMonth(new Date(Date.UTC(y, m - 2, 1)));
+    // Opted in last month (baseline 0 for this one) and PAYG has already admitted $45 of the $50 cap.
+    const carriedOptIn = { month: previousMonth, overageBaselineMicroUsd: 0, poolAtOptInMicroUsd: 100 * USD };
+    users[OWNER].paygOverage = {
+      enabled: true, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 3,
+      optIn: carriedOptIn,
+      poolHighWater: { month, thresholdMicroUsd: 100 * USD },
+      admittedMonths: [{ month, capHighWaterMicroUsd: 50 * USD, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 25_000 }],
+    };
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 145 * USD });
+    await put(OWNER, { enabled: false }).expect(200);
+    await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(200);
+    // No re-measured baseline: the $45 already admitted is still counted against this month's cap.
+    expect(users[OWNER].paygOverage.optIn).toEqual(carriedOptIn);
+    expect(users[OWNER].paygOverage.optInClosed).toBeUndefined();
+
+    // Another $45: the gate refuses at the cap instead of admitting a second "fresh" cap's worth.
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 190 * USD });
+    const usage = await getEffectiveLlmUsagePolicy(OWNER);
+    expect(usage.mode.admissionAllowed).toBe(false);
+    expect(usage.paygBlock).toEqual({ reason: 'payg_cap_reached' });
+    // And settlement bills at most the cap.
+    const amount = computePaygSettlementAmount({
+      month, account: users[OWNER].paygOverage, creditLedger: undefined, settledMicroUsd: 190 * USD,
+    })!;
+    expect(amount.overageCostMicroUsd).toBe(50 * USD);
+  });
+
+  it('off -> on in a month PAYG has not admitted in still measures a fresh baseline', async () => {
+    const month = getCurrentUsageMonth();
+    users[OWNER].paygOverage = {
+      enabled: false, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 3,
+      optIn: { month: '2000-01', overageBaselineMicroUsd: 0 },
+      poolHighWater: { month, thresholdMicroUsd: 100 * USD },
+    };
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 130 * USD });
+    await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(200);
+    expect(users[OWNER].paygOverage.optIn).toMatchObject({ month, overageBaselineMicroUsd: 30 * USD });
   });
 
   it('a re-enable later in the same month leaves the closed copies alone', async () => {
