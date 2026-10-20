@@ -58,5 +58,32 @@ export function phoneNamesConflict(existing: any, incoming: any): boolean {
   return false;
 }
 
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+const wellFormed = (v: string): string => v.replace(LONE_SURROGATE, '\uFFFD');
+
+/** The normalized first+last name of a submission: the seed that lets same-named racers share one separate row. */
+export function phoneNameSeed(lead: any): string {
+  // encodeURIComponent keeps a literal '|' in a name from colliding with the field delimiter. It THROWS on a lone
+  // surrogate (a name cut mid-emoji by a landing page), and this runs on the public capture route, so the name is
+  // made well-formed first: the seed must be total, never a reason to lose a lead.
+  return `${encodeURIComponent(wellFormed(norm(lead?.firstName)))}|${encodeURIComponent(wellFormed(norm(lead?.lastName)))}`;
+}
+
 /** More matches on one key than this means a shared line, not a repeat visitor: never merge. */
 export const PHONE_FANOUT_CAP = 5;
+
+const isBlank = (v: unknown): boolean => v === undefined || v === null || (typeof v === 'string' && v.trim() === '');
+
+/**
+ * A phone-matched repeat visit may only FILL blanks on the row it lands on. Phone identity is weaker than
+ * email identity (a hand-entered lead, a shared line, anyone who knows the number), so it must never replace
+ * a value a person or an earlier capture already stored. Existing non-blank keys always win.
+ */
+export function fillBlankCustomFields(existing: Record<string, any> | undefined, incoming: Record<string, any> | undefined): Record<string, any> {
+  const merged: Record<string, any> = { ...(existing || {}) };
+  for (const [k, v] of Object.entries(incoming || {})) {
+    if (isBlank(merged[k]) && !isBlank(v)) merged[k] = v;
+    else if (!(k in merged)) merged[k] = v;
+  }
+  return merged;
+}

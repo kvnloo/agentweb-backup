@@ -17,6 +17,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { buildAllowlistedEnv } from "./claudeCliRunner";
 import { resolveClaudeBinary } from "./claudeBinary";
+import { CODE_PATTERN, extractAuthorizeUrl, MAX_LOGIN_OUTPUT_CHARS } from "./claudeLoginParse";
 
 export { resolveClaudeBinary };
 
@@ -32,13 +33,12 @@ export class LoginError extends Error {
 export const START_TIMEOUT_MS = 30_000;
 export const COMPLETE_TIMEOUT_MS = 30_000;
 export const KILL_GRACE_MS = 2_000;
-export const MAX_OUTPUT_CHARS = 16_384;
+export const MAX_OUTPUT_CHARS = MAX_LOGIN_OUTPUT_CHARS;
 /** The code is `<code>#<state>`: URL-safe characters only, bounded, no whitespace or control characters. */
-export const CODE_PATTERN = /^[A-Za-z0-9._~-]{8,200}#[A-Za-z0-9._~-]{8,200}$/;
+export { CODE_PATTERN };
 export const TMP_ROOT_PREFIX = "aw-claude-login-";
 /** A pending sign-in lives at most 10 minutes; a login dir older than this is a leftover. */
 export const STALE_LOGIN_DIR_MS = 30 * 60 * 1000;
-const AUTHORIZE_URL = /https:\/\/claude\.com\/cai\/oauth\/authorize[^\s"'<>]*/;
 
 
 /** Removes login dirs a dead process left behind (they may hold a freshly written credentials file). */
@@ -80,7 +80,6 @@ export interface LocalLoginRunnerOptions {
   completeTimeoutMs?: number;
 }
 
-const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g;
 
 export class LocalClaudeLoginRunner implements LoginRunner {
   constructor(private readonly options: LocalLoginRunnerOptions = {}) {}
@@ -156,10 +155,10 @@ export class LocalClaudeLoginRunner implements LoginRunner {
     const authorizeUrl = await new Promise<string | null>((resolve) => {
       const started = Date.now();
       const poll = setInterval(() => {
-        const match = output.replace(ANSI, "").match(AUTHORIZE_URL);
+        const match = extractAuthorizeUrl(output);
         if (match) {
           clearInterval(poll);
-          resolve(match[0]);
+          resolve(match);
         } else if (exited || Date.now() - started > startTimeout) {
           clearInterval(poll);
           resolve(null);

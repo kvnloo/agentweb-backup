@@ -500,6 +500,77 @@ describe('POST — inbound messages', () => {
     expect(res.status).toBe(500);
   });
 
+  it('ignores messages and receipts addressed to another number on the same app', async () => {
+    // The sandbox test number shares this app (and its secret), so its traffic is
+    // correctly signed — but it is not this environment's number.
+    const body = JSON.stringify({
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          id: '999',
+          changes: [
+            {
+              field: 'messages',
+              value: {
+                metadata: { phone_number_id: '333' },
+                messages: [{ from: '14155550123', id: 'x', type: 'text', text: { body: 'STOP' } }],
+                statuses: [{ id: 'wamid.OUT1', status: 'failed', errors: [{ code: 131026 }] }],
+              },
+            },
+          ],
+        },
+      ],
+    });
+    const res = await post(body);
+    expect(res.status).toBe(200);
+    expect(recordInboundMessage).not.toHaveBeenCalled();
+    expect(recordOptOut).not.toHaveBeenCalled();
+    expect(handleUnrecognizedMessage).not.toHaveBeenCalled();
+    // The failed receipt for another number must not reach the owner-notification path either.
+    expect(lookupApprovalMessage).not.toHaveBeenCalled();
+  });
+
+  it('ignores a change that does not say which number it is for', async () => {
+    const body = JSON.stringify({
+      object: 'whatsapp_business_account',
+      entry: [{ changes: [{ field: 'messages', value: { messages: [{ from: '14155550123', id: 'x', type: 'text', text: { body: 'hi' } }] } }] }],
+    });
+    const res = await post(body);
+    expect(res.status).toBe(200);
+    expect(recordInboundMessage).not.toHaveBeenCalled();
+  });
+
+  it('still processes our own number when a delivery also carries another number', async () => {
+    const body = JSON.stringify({
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          changes: [
+            { field: 'messages', value: { metadata: { phone_number_id: '333' }, messages: [{ from: '447700900123', id: 'a', type: 'text', text: { body: 'hi' } }] } },
+            { field: 'messages', value: { metadata: { phone_number_id: '111' }, messages: [{ from: '14155550123', id: 'b', type: 'text', text: { body: 'hi' } }] } },
+          ],
+        },
+      ],
+    });
+    const res = await post(body);
+    expect(res.status).toBe(200);
+    expect(recordInboundMessage).toHaveBeenCalledTimes(1);
+    expect(recordInboundMessage).toHaveBeenCalledWith('+14155550123');
+  });
+
+  it('matches our number when the stored phoneNumberId is a JSON number', async () => {
+    getWhatsAppCredentials.mockResolvedValue({
+      phoneNumberId: 111 as unknown as string,
+      wabaId: '222',
+      accessToken: 'tok',
+      appSecret: APP_SECRET,
+      webhookVerifyToken: VERIFY_TOKEN,
+    });
+    const res = await post(inboundPayload('hi'));
+    expect(res.status).toBe(200);
+    expect(recordInboundMessage).toHaveBeenCalledWith('+14155550123');
+  });
+
   it('handles a payload with no entries', async () => {
     const res = await post(JSON.stringify({ object: 'whatsapp_business_account', entry: [] }));
     expect(res.status).toBe(200);
@@ -608,7 +679,7 @@ describe('POST — tapped buttons', () => {
     JSON.stringify({
       object: 'whatsapp_business_account',
       entry: [
-        { id: 'W', changes: [{ field: 'messages', value: { messaging_product: 'whatsapp', messages: [msg] } }] },
+        { id: 'W', changes: [{ field: 'messages', value: { messaging_product: 'whatsapp', metadata: { phone_number_id: '111' }, messages: [msg] } }] },
       ],
     });
 
@@ -708,7 +779,7 @@ describe('POST — messages that are not commands', () => {
     await post(
       JSON.stringify({
         object: 'whatsapp_business_account',
-        entry: [{ id: 'W', changes: [{ field: 'messages', value: { messaging_product: 'whatsapp', messages: [{
+        entry: [{ id: 'W', changes: [{ field: 'messages', value: { messaging_product: 'whatsapp', metadata: { phone_number_id: '111' }, messages: [{
           from: '14155550123', id: 'wamid.M', timestamp: '1', type: 'image',
           image: { id: 'MEDIA-123', caption: 'my dashboard is broken', mime_type: 'image/jpeg' },
         }] } }] }],
@@ -724,7 +795,7 @@ describe('POST — messages that are not commands', () => {
     await post(
       JSON.stringify({
         object: 'whatsapp_business_account',
-        entry: [{ id: 'W', changes: [{ field: 'messages', value: { messaging_product: 'whatsapp', messages: [{
+        entry: [{ id: 'W', changes: [{ field: 'messages', value: { messaging_product: 'whatsapp', metadata: { phone_number_id: '111' }, messages: [{
           from: '14155550123', id: 'wamid.D', timestamp: '1', type: 'document',
           document: { id: 'MEDIA-9', filename: 'invoice.pdf' },
         }] } }] }],

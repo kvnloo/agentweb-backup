@@ -13,6 +13,7 @@ import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch, ADM
 import { filterMessagesForClient as filterMessagesForClientPure } from '../utils/adminOnlyMessageFilter';
 import { ABOUT_AGENTWEB_TEAM, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
+import { shouldSuppressScheduledNotification } from '../services/linkScanNotificationPolicy';
 import { computeSessionModelAttribution } from '../utils/sessionModelAttribution';
 import { scheduleDb, userDb, taskDb, scheduleTemplateDb } from '../services/db';
 import { User } from '../types/auth';
@@ -50,7 +51,7 @@ import { CHAT_BRANCHING_ENABLED_SETTING, isChatBranchingSettingEnabled, healLega
 import { compareSaveAlternatives } from '../services/agentMode/compareSaveAlternativesInstance';
 import { LEGACY_MODEL_ALIASES } from '../services/agentMode/llmModelRegistry';
 import { resolveRunFunding } from '../services/funding/runFunding';
-import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError, isProviderUnavailableError } from '../utils/agentModeErrors';
+import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isProviderDeserializationError, PROVIDER_DESERIALIZATION_ERROR_CLASS, isWorkerShutdownError, isProviderUnavailableError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
@@ -3005,6 +3006,28 @@ async function getActualResponseFromSession(sessionId: string): Promise<string> 
   }
 }
 
+// ENG-1098: true when the run's executed tool ledger shows exactly one clean
+// scan_website_links result, so its scheduled report (and digest entry) is not
+// sent. Fails open: any load error or missing session means "send as today".
+// Only a successful, passing run qualifies — a failed run (e.g. keyword miss)
+// keeps its notification and digest entry even if the transcript is a clean scan.
+export async function isCleanLinkScanSession(
+  sessionId: string | undefined,
+  run: { status?: string; passed?: boolean } | undefined
+): Promise<boolean> {
+  if (!sessionId) return false;
+  if (!run || run.status !== 'success' || run.passed !== true) return false;
+  try {
+    const session = await chatbotDb.getChatSession(sessionId);
+    const suppress = shouldSuppressScheduledNotification(session?.messages);
+    if (suppress) console.log(`[ENG-1098] Clean broken-link scan in session ${sessionId}; scheduled notification suppressed.`);
+    return suppress;
+  } catch (error) {
+    console.error(`[ENG-1098] Could not read session ${sessionId} for link-scan suppression; sending as usual:`, error);
+    return false;
+  }
+}
+
 // Evaluate schedule response against expected criteria
 function evaluateScheduleResponse(
   actualResponse: string,
@@ -3125,8 +3148,12 @@ async function sendDailyDigestEmail(schedule: any, emailNotifications: string[])
       })
     );
 
-    if (todaysResults.length === 0) {
-      console.log(`No run results found for today for schedule ${schedule.scheduleName}`);
+    // ENG-1098: a run whose only finding is a clean broken-link scan is not news.
+    const cleanScan = await Promise.all(todaysResults.map((result: any) => isCleanLinkScanSession(result.sessionId, result)));
+    const digestResults = todaysResults.filter((_: any, i: number) => !cleanScan[i]);
+
+    if (digestResults.length === 0) {
+      console.log(`No run results to include in today's digest for schedule ${schedule.scheduleName}`);
       return;
     }
 
@@ -3134,11 +3161,11 @@ async function sendDailyDigestEmail(schedule: any, emailNotifications: string[])
     await emailService.sendDailyDigestEmail(
       emailNotifications,
       schedule.scheduleName,
-      todaysResults,
+      digestResults,
       schedule.scheduleId
     );
 
-    console.log(`Daily digest email sent for schedule ${schedule.scheduleName} with ${todaysResults.length} results`);
+    console.log(`Daily digest email sent for schedule ${schedule.scheduleName} with ${digestResults.length} results`);
   } catch (error) {
     console.error(`Error sending daily digest email for schedule ${schedule.scheduleName}:`, error);
     throw error;
@@ -11317,13 +11344,18 @@ export const agentModeController = {
         
         // Send oncall alert asynchronously (don't await to avoid blocking response)
         const originalMessageForAlert = (error as any)?.originalMessage;
+        // ENG-503: truncated-provider-JSON failures (already retried once in callLLM)
+        // carry a stable class and dedupe on one key instead of paging per occurrence.
+        const isDeserialization = isProviderDeserializationError(error);
         sendAgentModeOncallAlert({
+          ...(isDeserialization ? { dedupeKey: `${PROVIDER_DESERIALIZATION_ERROR_CLASS}:${user?.userId || 'unknown'}`, userId: user?.userId } : {}),
           subject: 'Agent Mode: Unknown Error in Generate Response',
           message: `An unknown error occurred while generating a response in Agent Mode.\n\nError: ${originalMessageForAlert || error.message || 'Unknown error'}`,
           sessionId,
           context: {
             'Error Message': error.message || 'Unknown error',
             'Original Error': originalMessageForAlert || 'Not available',
+            ...(isDeserialization ? { errorClass: PROVIDER_DESERIALIZATION_ERROR_CLASS } : {}),
             'Error Stack': error.stack || 'No stack trace available',
             'Error Name': error.name || 'Unknown',
             'User ID': user?.userId || 'Not available',
@@ -15455,8 +15487,9 @@ export const agentModeController = {
                     }
                     // For hourly schedules with daily digest, don't send individual emails
                     // Only send the daily digest on the last run of the day
-                  } else {
+                  } else if (!(await isCleanLinkScanSession(result.sessionId, result))) {
                     // Send individual email as usual for non-hourly schedules or hourly without daily digest
+                    // (ENG-1098: unless the run was a clean broken-link scan)
                     await emailService.sendScheduledChatResultEmail(
                       emailNotifications,
                       schedule.scheduleName,

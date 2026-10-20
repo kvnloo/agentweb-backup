@@ -157,6 +157,32 @@ describe('phoneUniqueCreate', () => {
   });
 });
 
+describe('phoneUniqueIdSeed: same-named racers share one separate row (the gap-4 fix)', () => {
+  it('eight racers with the SAME seed make ONE row, and it is a different row from the unseeded one', async () => {
+    await make({ firstName: 'Bob' });
+    const results = await Promise.all(Array.from({ length: 8 }, () => outcome(make({ firstName: 'Ana', phoneUniqueIdSeed: 'ana|' }))));
+    expect(results.filter((r) => r.ok)).toHaveLength(1);
+    for (const l of results.filter((r): r is { ok: false; e: any } => !r.ok)) {
+      expect(l.e.duplicatePhone).toBe(true);
+      expect(l.e.existingLead.firstName).toBe('Ana');
+    }
+    expect(rows.size).toBe(2);
+  });
+
+  it('different seeds in one bucket do not collide (two different people stay two rows)', async () => {
+    await make({ firstName: 'Ana', phoneUniqueIdSeed: 'ana|' });
+    await make({ firstName: 'Cara', phoneUniqueIdSeed: 'cara|' });
+    expect(rows.size).toBe(2);
+  });
+
+  it('CONTROL: without the seed the second name loses to the first row (so the tests above can fail)', async () => {
+    await make({ firstName: 'Bob' });
+    const r = await outcome(make({ firstName: 'Ana' }));
+    expect(r.ok).toBe(false);
+    expect(rows.size).toBe(1);
+  });
+});
+
 describe('id namespace: a hostile "email" can never equal a phone id', () => {
   it('an email of literally phone:<digits> in the same bucket does not collide with the phone lead', async () => {
     const phone = await make();

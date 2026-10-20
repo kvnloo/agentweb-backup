@@ -32,6 +32,8 @@ import './workflowTools';
 // ENG-1004: tranche 2 (landing pages). Same additive contract.
 import './landingWorkflowTools';
 import './publishWorkflowTools';
+// ENG-1034: the single anonymous-callable demo tool.
+import './reviewSiteTool';
 // ENG-983: progressive disclosure — tools/list returns the workflow layer plus
 // emma_search_tools; the granular catalogue stays callable and discoverable.
 import { getListedToolDefinitions } from './toolDiscovery';
@@ -47,6 +49,8 @@ export interface McpSessionContext {
   oauthClientName?: string;
   clientType?: McpClientType;
   userAgent?: string;
+  /** Caller address at session creation (req.ip, trust-proxy aware). Used only to rate-limit anonymous calls (ENG-1034). */
+  clientIp?: string;
 }
 
 /**
@@ -120,6 +124,7 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
       oauthClientName: sessionContext?.oauthClientName,
       clientType: sessionContext?.clientType,
       userAgent: sessionContext?.userAgent,
+      clientIp: sessionContext?.clientIp,
       // True only for external MCP clients (API key / OAuth) — in-process
       // portal callers never set this. Tools use it for source attribution.
       externalMcp: sessionContext ? sessionContext.isInternal !== true : false,

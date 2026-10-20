@@ -37,12 +37,12 @@ import {
   type AdsPlatform,
   type ThresholdRevision,
 } from './adsThresholds';
+import { TABLE_PREFIX } from '../config/constants';
 
 // ⚠ Matches every other table in this codebase, and inherits the same FAIL-OPEN hazard: an unset
 // or misspelled NODE_ENV resolves to the PRODUCTION table rather than erroring. Kept consistent
 // deliberately — a table whose prefix rule differs from all 60+ others is the more dangerous
 // surprise. Any SCRIPT that writes here should assert NODE_ENV explicitly rather than rely on it.
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 export const ADS_THRESHOLDS_TABLE = `${TABLE_PREFIX}AW-AdsThresholds`;
 
 const dynamodb = new AWS.DynamoDB.DocumentClient();

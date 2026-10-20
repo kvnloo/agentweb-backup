@@ -40,6 +40,8 @@ jest.mock('../services/resendService', () => ({ resendService: { sendEmail: jest
 const mockResolveLinkedInAccountForWrite = jest.fn();
 jest.mock('../services/agentMode/linkedInDailyVolumeGate', () => ({
   resolveLinkedInAccountForWrite: (...args: any[]) => mockResolveLinkedInAccountForWrite(...args),
+  // ENG-2529: the send path is paced; this suite is about URLs, so the gate always allows.
+  paceLinkedInWrite: jest.fn(async () => ({ refusal: null })),
 }));
 
 jest.mock('../services/linkedInOutreachService', () => ({
@@ -294,7 +296,11 @@ describe('a pinned LinkedIn account must belong to the sequence owner (ENG-2205)
 
   it('does not run the check when no account is pinned (auto-resolve path unchanged)', async () => {
     const stats = await processDueEnrollments();
-    expect(mockResolveLinkedInAccountForWrite).not.toHaveBeenCalled();
+    // ENG-2529: the only lookup is the write gate's, against the AUTO-resolved account (made after
+    // resolveAccountId) — the pinned-ownership pre-check never runs.
+    expect(mockResolveLinkedInAccountForWrite).toHaveBeenCalledTimes(1);
+    expect(mockResolveLinkedInAccountForWrite.mock.invocationCallOrder[0])
+      .toBeGreaterThan((mockLi.resolveAccountId as jest.Mock).mock.invocationCallOrder[0]);
     expect(mockLi.resolveAccountId).toHaveBeenCalledWith('user-1');
     expect(stats.errors).toBe(0);
     expect(mockLi.sendMessage).toHaveBeenCalledTimes(1);

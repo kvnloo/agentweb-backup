@@ -1,7 +1,7 @@
 /**
  * ENG-2123: identity rules for phone-only capture dedupe, and the rollout-mode setting.
  */
-import { phoneDedupeKey, phoneNamesConflict, PHONE_FANOUT_CAP } from '../utils/phoneLeadDedupe';
+import { fillBlankCustomFields, phoneDedupeKey, phoneNameSeed, phoneNamesConflict, PHONE_FANOUT_CAP } from '../utils/phoneLeadDedupe';
 
 describe('phoneDedupeKey', () => {
   it.each([
@@ -57,3 +57,38 @@ describe('phoneNamesConflict', () => {
 });
 
 it('the fan-out cap is 5', () => expect(PHONE_FANOUT_CAP).toBe(5));
+
+describe('fillBlankCustomFields', () => {
+  it('existing non-blank values always win; blanks and absent keys are filled', () => {
+    expect(fillBlankCustomFields({ a: '1', b: '', c: null, d: 0 }, { a: '2', b: 'x', c: 'y', d: 5, e: 'z' }))
+      .toEqual({ a: '1', b: 'x', c: 'y', d: 0, e: 'z' });
+  });
+  it('an incoming blank never blanks or adds noise over a stored value', () => {
+    expect(fillBlankCustomFields({ a: '1' }, { a: '' })).toEqual({ a: '1' });
+  });
+  it('handles missing maps', () => {
+    expect(fillBlankCustomFields(undefined, { a: '1' })).toEqual({ a: '1' });
+    expect(fillBlankCustomFields({ a: '1' }, undefined)).toEqual({ a: '1' });
+  });
+});
+
+describe('phoneNameSeed', () => {
+  it('NEVER throws, whatever the name holds (a lone surrogate from a truncated emoji used to throw URIError and 500 the lander)', () => {
+    for (const bad of ['Ana\uD83D', '\uDE00Ana', '\uD83D\uD83D', 'A\uDE00\uD83DB', '\uD83D\uDE00']) {
+      expect(() => phoneNameSeed({ firstName: bad, lastName: bad })).not.toThrow();
+    }
+  });
+  it('a lone surrogate seeds the same as itself and differently from a different name; a valid emoji is kept', () => {
+    expect(phoneNameSeed({ firstName: 'Ana\uD83D' })).toBe(phoneNameSeed({ firstName: 'Ana\uD83D' }));
+    expect(phoneNameSeed({ firstName: 'Ana\uD83D' })).not.toBe(phoneNameSeed({ firstName: 'Bob\uD83D' }));
+    expect(phoneNameSeed({ firstName: '\uD83D\uDE00' })).not.toBe(phoneNameSeed({ firstName: '\uFFFD' }));
+  });
+
+  it('normalizes case, spacing and blanks so same-named racers share one seed', () => {
+    expect(phoneNameSeed({ firstName: ' Ana ', lastName: 'LEE' })).toBe('ana|lee');
+    expect(phoneNameSeed({ firstName: 'ana', lastName: ' lee' })).toBe('ana|lee');
+    expect(phoneNameSeed({ firstName: 'Ana' })).toBe('ana|');
+    expect(phoneNameSeed({ firstName: '', lastName: '|' })).not.toBe(phoneNameSeed({ firstName: '|', lastName: '' }));
+    expect(phoneNameSeed({ firstName: 'Ana', lastName: 'Lee' })).not.toBe(phoneNameSeed({ firstName: 'Bob', lastName: 'Lee' }));
+  });
+});

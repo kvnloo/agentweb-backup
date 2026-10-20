@@ -1,0 +1,19 @@
+## ENG-2496: Zoma onboarding — one browser journey, session-independent Meta connect, setup tracing (2026-10-16)
+
+**What a live test with a brand-new account found.**
+1. *"User ID mismatch" (403).* The agent relayed a Meta connect link minted for the new Zoma user. Meta returned to `/api/oauth/meta/callback`, which bounces to the portal's `/oauth/meta/callback` page, and the portal POSTed `/api/meta-auth/finalize` with whatever AgentWeb session that browser had — a different, existing account. `stateData.userId !== req.user.userId` → 403. Any portal-session-dependent finish is wrong for Zoma: the person setting up Zoma is often signed in to the portal as someone else (or not at all).
+2. *No payment link, steps not in the page.* After approval the user got "go back to your agent"; every later step needed a new link relayed by the agent, and `add_payment` was never reached in practice.
+3. *No observability.* Only nginx access lines existed for the setup.
+
+**Fix.**
+- A Zoma Meta connect link's signed OAuth state carries `zoma: <deviceId>` next to the existing `userId`/`flow`. It still uses the **existing registered redirect URI** (`/api/oauth/meta/callback`), which forwards a state with a `zoma` claim to `/api/zoma/meta/callback`; portal states have no `zoma` claim and take the unchanged path (and `/finalize` keeps its mismatch check). No Meta app change.
+- `/api/zoma/meta/callback` verifies the state signature, requires the `zoma` claim, loads the device item, and requires `status=approved`, not expired, and `device.userId === state.userId`; then it finalizes **server-side for that user**. Several ad accounts → a server-rendered picker that can only submit accounts Meta offered (they ride in a signed, 10-minute link token).
+- `services/metaOAuthFinalize.ts` is the one implementation of finalize (code→token, granted scopes, Page probe, token session, ad-account list) and connect-ad-accounts, extracted verbatim from `routes/metaAuth.ts`; both the portal routes and Zoma call it.
+- One browser journey (`continueInBrowser`): approval → Meta → setup-mode Checkout → `/api/zoma/done` ("You're set, return to your agent"). Finished steps are skipped. The Checkout session is minted once per setup and shared with the agent's poll, which still reports `next_step` + `link` so an agent can re-send it.
+- Zoma's own link tokens (continue / picker) carry no `userId` and are signed with a key derived from `JWT_SECRET`, so they can never verify as AgentWeb auth tokens. (Meta OAuth states are, as before, plain JWTs signed with `JWT_SECRET` containing a `userId`.)
+- Form submits that redirect cross-origin: browsers apply CSP `form-action` to the whole redirect chain, so the picker page allows `https://checkout.stripe.com` and `https://www.facebook.com`.
+
+**Tracing.** `mcp/zomaSetupLog.ts` writes one JSON line per event: `{"event":"zoma_setup","setup_id","user_id","step","outcome","reason"}`. `setup_id` = first 12 hex of `sha256("zoma-setup-id:" + deviceId)`. Steps: `setup_started`, `activate_visited`, `approval`, `poll` (state changes only), `meta_redirect`, `meta_callback`, `meta_connect`, `payment_checkout`, `checkout_completed`, `token_issued`, `token_revoked`, plus `outcome:"error"` from route catch blocks. Reasons pass through `scrubReason` (redacts `zoma_…`, JWTs, Meta `EA…` tokens, Stripe keys/ids, and `code=/state=/token=` params). The same events are appended to the device item's `events` attribute (no new table/key). Device + user-code item TTL is now logical expiry **+14 days** so support can still read a finished setup; every code path checks `expiresAt`, never TTL.
+
+**Support.** `npx ts-node backend/scripts/zoma-setup-trace.ts <user_code|setup_id|email>` prints the timeline and a Logs Insights query:
+`fields @timestamp, setup_id, user_id, step, outcome, reason | filter event = "zoma_setup" and setup_id = "<id>" | sort @timestamp asc`.
