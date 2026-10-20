@@ -15,7 +15,7 @@ import {
   buildAgentRunChatContext,
   fetchAgentRunSummaries,
 } from '../services/agentRunInspectorService';
-import { buildAgentRunTrace, type TraceMessageRow, type TraceSessionRow } from '../services/agentRunTrace';
+import { ASK_LOOKBACK_MS, buildAgentRunTrace, type TraceMessageRow, type TraceSessionRow } from '../services/agentRunTrace';
 import { TABLE_PREFIX } from '../config/constants';
 
 const router = express.Router();
@@ -35,8 +35,8 @@ const FIRST_MESSAGE_LIMIT = 25;
 const LATEST_MESSAGE_LIMIT = 60;
 const TRACE_MESSAGE_PAGE = 200;
 const TRACE_MAX_MESSAGES = 1000;
-/** Read back to a minute before the run's start, so its opening user message is always included. */
-const TRACE_WINDOW_SLACK_MS = 60_000;
+/** Read back a minute past the ask lookback, so the run's own ask is always fetched. */
+const TRACE_READ_BACK_MS = ASK_LOOKBACK_MS + 60_000;
 
 router.get('/', async (req: Request, res: Response) => {
   try {
@@ -74,20 +74,22 @@ router.get('/', async (req: Request, res: Response) => {
 /**
  * One run's step-by-step trace (services/agentRunTrace.ts): work-plan steps, every tool call with
  * redacted arguments and a capped result, and the final reply. `startedAt`/`completedAt` (from the
- * list response) scope a multi-run session to this run. Admin JWT only: the agent-runs secret is
- * limited to the list (middleware/agentRunsAuth.ts).
+ * list response) scope a multi-run session to this run; `nextStartedAt`, the session's next run,
+ * bounds a run with no completion. Admin JWT only: the agent-runs secret is limited to the list
+ * (middleware/agentRunsAuth.ts).
  */
 router.get('/trace', async (req: Request, res: Response) => {
   const sessionId = parseOptionalString(req.query.sessionId);
   if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
   const startedAt = parseOptionalIso(req.query.startedAt);
   const completedAt = parseOptionalIso(req.query.completedAt);
+  const nextStartedAt = parseOptionalIso(req.query.nextStartedAt);
   try {
     const [session, { messages, truncated }] = await Promise.all([
       fetchChatSession(sessionId) as Promise<TraceSessionRow | null>,
       fetchRunMessages(sessionId, startedAt),
     ]);
-    const trace = buildAgentRunTrace({ sessionId, session, messages, startedAt, completedAt });
+    const trace = buildAgentRunTrace({ sessionId, session, messages, startedAt, completedAt, nextStartedAt });
     return res.status(200).json({ trace: { ...trace, messagesTruncated: truncated } });
   } catch (err) {
     console.error('[agentRuns] failed to build AgentRun trace:', err);
@@ -195,7 +197,7 @@ async function queryChatMessages(
  * newest TRACE_MAX_MESSAGES are returned. `truncated` means the cap cut the window short.
  */
 async function fetchRunMessages(sessionId: string, startedAt?: string): Promise<{ messages: TraceMessageRow[]; truncated: boolean }> {
-  const stopBefore = startedAt ? Date.parse(startedAt) - TRACE_WINDOW_SLACK_MS : NaN;
+  const stopBefore = startedAt ? Date.parse(startedAt) - TRACE_READ_BACK_MS : NaN;
   const messages: TraceMessageRow[] = [];
   let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
   let reachedStart = false;
@@ -212,10 +214,15 @@ async function fetchRunMessages(sessionId: string, startedAt?: string): Promise<
       const page = (result.Items ?? []) as TraceMessageRow[];
       messages.push(...page);
       lastKey = result.LastEvaluatedKey;
-      reachedStart = Number.isFinite(stopBefore) && page.some((row) => {
-        const ts = Date.parse(String((row.message as any)?.metadata?.timestamp ?? (row.message as any)?.timestamp ?? ''));
-        return Number.isFinite(ts) && ts < stopBefore;
-      });
+      // Stop only once a whole page is older than the read-back point, so one stale timestamp inside
+      // the run can't end the read early. Older rows keep their fields on the row itself.
+      const stamps = page
+        .map((row) => {
+          const m = (row.message ?? row) as any;
+          return Date.parse(String(m?.metadata?.timestamp ?? m?.timestamp ?? ''));
+        })
+        .filter((ts) => Number.isFinite(ts));
+      reachedStart = Number.isFinite(stopBefore) && stamps.length > 0 && stamps.every((ts) => ts < stopBefore);
     } while (lastKey && !reachedStart && messages.length < TRACE_MAX_MESSAGES);
   } catch (err: any) {
     if (err?.code === 'ResourceNotFoundException') return { messages: [], truncated: false };

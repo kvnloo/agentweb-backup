@@ -355,7 +355,7 @@ export default function AgentRunsInspector() {
           )}
           <Grid item xs={12} md={showList ? 8.5 : 12}>
             {selectedRun && (
-              <RunDetail key={selectedRun.runId} run={selectedRun} runEnd={runEnd(selectedRun, runs)} token={token} refreshKey={refreshKey} onCopied={setToast} />
+              <RunDetail key={selectedRun.runId} run={selectedRun} nextStartedAt={nextRunStart(selectedRun, runs)} token={token} refreshKey={refreshKey} onCopied={setToast} />
             )}
           </Grid>
         </Grid>
@@ -412,9 +412,9 @@ function DetailSkeleton() {
   );
 }
 
-/** Where this run's messages end: its completion, or for an unfinished run the next run of the same session. */
-function runEnd(run: AgentRun, runs: AgentRun[]): string | undefined {
-  if (run.completedAt || !run.startedAt) return run.completedAt;
+/** The start of the same session's next run in the results, which bounds this run's messages. */
+function nextRunStart(run: AgentRun, runs: AgentRun[]): string | undefined {
+  if (!run.startedAt) return undefined;
   return runs
     .filter((r) => r.sessionId === run.sessionId && r.startedAt && r.startedAt > run.startedAt!)
     .map((r) => r.startedAt!)
@@ -423,13 +423,13 @@ function runEnd(run: AgentRun, runs: AgentRun[]): string | undefined {
 
 function RunDetail({
   run,
-  runEnd: end,
+  nextStartedAt,
   token,
   refreshKey,
   onCopied,
 }: {
   run: AgentRun;
-  runEnd?: string;
+  nextStartedAt?: string;
   token: string | null;
   refreshKey: number;
   onCopied: (label: string) => void;
@@ -445,7 +445,8 @@ function RunDetail({
     setTraceError(null);
     const params = new URLSearchParams({ sessionId: run.sessionId });
     if (run.startedAt) params.set('startedAt', run.startedAt);
-    if (end) params.set('completedAt', end);
+    if (run.completedAt) params.set('completedAt', run.completedAt);
+    if (nextStartedAt) params.set('nextStartedAt', nextStartedAt);
     axios
       .get<{ trace: AgentRunTrace }>(buildApiUrl(`/api/admin/agent-runs/trace?${params.toString()}`), {
         headers: { Authorization: `Bearer ${token}` },
@@ -456,7 +457,7 @@ function RunDetail({
     return () => {
       cancelled = true;
     };
-  }, [run.sessionId, run.startedAt, end, token, refreshKey]);
+  }, [run.sessionId, run.startedAt, run.completedAt, nextStartedAt, token, refreshKey]);
 
   return (
     <Stack spacing={2}>

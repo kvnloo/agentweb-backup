@@ -534,7 +534,7 @@ export function WorkPlanTrace({
                     {step.closedWithoutCalls && step.status === 'completed' && (
                       <Typography variant="caption" color="text.secondary" sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mt: 0.25 }}>
                         <WarningAmberIcon sx={{ fontSize: 14, color: 'warning.dark' }} />
-                        Marked completed with no tool calls of its own.
+                        Marked completed with no work besides status updates.
                       </Typography>
                     )}
                   </>

@@ -96,6 +96,7 @@ export interface TraceStep {
   completedAt?: string;
   callIds: string[];
   statusCallId?: string;
+  /** Closed with no work since the previous update other than status updates. */
   closedWithoutCalls: boolean;
 }
 

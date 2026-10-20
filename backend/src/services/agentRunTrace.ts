@@ -29,12 +29,19 @@ export const TRACE_LIMITS = {
 
 /** Window slack around the run's start/end, for rows written a moment before or after the spine events. */
 const WINDOW_SLACK_MS = 5_000;
+/**
+ * How far before a run's spine start its ask can be stamped: the user message is saved before the
+ * job is queued, and queueing, funding and setup can take several seconds.
+ */
+export const ASK_LOOKBACK_MS = 60_000;
 
 /** Tools that manage the plan itself; before the first real work they are setup, not a step. */
 const PLAN_SETUP_TOOLS = new Set(['launch_predefined_work_plan', 'manage_predefined_work_plan', 'create_work_plan', 'update_work_plan']);
 const STEP_STATUS_TOOL = 'set_work_plan_status';
 const CLOSING_STATUSES = new Set(['completed', 'skipped', 'failed']);
 const TOOL_ERROR_PREFIX = /^\s*(?:⚠️\s*)?Tool Error\b/i;
+/** set_work_plan_status refusing an update (e.g. "❌ Cannot complete these steps yet") without a Tool Error. */
+const STATUS_REFUSED = /^\s*❌/;
 
 export type TraceCallStatus = 'succeeded' | 'failed' | 'no_result';
 
@@ -66,7 +73,7 @@ export interface AgentRunTraceStep {
   callIds: string[];
   /** The set_work_plan_status call that closed the step, if one is in the trace. */
   statusCallId?: string;
-  /** Closed by a status update with no work of its own since the previous update. */
+  /** Closed with no work since the previous update other than status updates. */
   closedWithoutCalls: boolean;
 }
 
@@ -122,13 +129,13 @@ export function buildAgentRunTrace(input: {
   messages: TraceMessageRow[];
   startedAt?: string;
   completedAt?: string;
+  /** Start of the session's next run, which bounds a run that has no completion. */
+  nextStartedAt?: string;
 }): AgentRunTrace {
   const all = [...input.messages]
     .sort((a, b) => (a.messageIndex ?? 0) - (b.messageIndex ?? 0))
     .map(normalizeMessage);
-  const inRun = withinRunWindow(all, input.startedAt, input.completedAt);
-  const lastInRun = inRun[inRun.length - 1]?.index ?? -1;
-  const sessionRanLater = all.some((m) => m.index > lastInRun && m.role !== 'system');
+  const { messages: inRun, sessionRanLater } = withinRunWindow(all, input.startedAt, input.completedAt, input.nextStartedAt);
 
   const userTexts = inRun.filter((m) => m.role === 'user').map((m) => textOf(m.content)).filter((t): t is string => !!t);
   const askText = userTexts[0];
@@ -184,30 +191,76 @@ function normalizeMessage(row: TraceMessageRow): NormalizedMessage {
   };
 }
 
-/**
- * The messages of one run. Assistant rows carry no timestamp, so each row takes the last
- * timestamp seen before it. The run starts at its first user message inside the (slack-widened)
- * start, and ends at its completion plus slack or at the next user message after its completion,
- * whichever comes first, so back-to-back runs a second apart never bleed into each other. Without
- * a run window, or with no timestamps at all, every row is in.
- */
-function withinRunWindow(messages: NormalizedMessage[], startedAt?: string, completedAt?: string): NormalizedMessage[] {
-  const start = startedAt ? Date.parse(startedAt) - WINDOW_SLACK_MS : NaN;
-  const completed = completedAt ? Date.parse(completedAt) : NaN;
-  const end = Number.isFinite(completed) ? completed + WINDOW_SLACK_MS : NaN;
-  if (!Number.isFinite(start) || !messages.some((m) => m.ts)) return messages;
-  const inWindow: NormalizedMessage[] = [];
-  let carried: number | undefined;
-  for (const m of messages) {
+/** Each row with the last timestamp seen at or before it: assistant rows carry none of their own. */
+function carriedTimestamps(messages: NormalizedMessage[]): number[] {
+  let carried = NaN;
+  return messages.map((m) => {
     const own = m.ts ? Date.parse(m.ts) : NaN;
     if (Number.isFinite(own)) carried = own;
-    if (carried === undefined || m.role === 'system' || carried < start) continue;
-    if (Number.isFinite(end) && carried > end) break;
-    if (m.role === 'user' && Number.isFinite(completed) && carried > completed) break;
-    inWindow.push(m);
+    return carried;
+  });
+}
+
+/** The run's ask: the last user message stamped in [start - ASK_LOOKBACK_MS, start + slack], after `from`. */
+function askPosition(messages: NormalizedMessage[], start: number, from = 0): number {
+  let found = -1;
+  for (let i = from; i < messages.length; i++) {
+    const m = messages[i];
+    const own = m.ts ? Date.parse(m.ts) : NaN;
+    if (m.role !== 'user' || !Number.isFinite(own)) continue;
+    if (own > start + WINDOW_SLACK_MS) break;
+    if (own >= start - ASK_LOOKBACK_MS) found = i;
   }
-  const firstAsk = inWindow.findIndex((m) => m.role === 'user');
-  return firstAsk > 0 ? inWindow.slice(firstAsk) : inWindow;
+  return found;
+}
+
+/**
+ * The messages of one run, and whether the session had another run after it.
+ *
+ * Start: the run's own ask (a user message is saved before its run starts, sometimes many
+ * seconds before), else the first row at the slack-widened start. End: the next run's ask when
+ * the next run's start is known; else the first user row stamped at or after the completion.
+ * Every run, scheduled ones included, opens with a user row; a session's only system row is its
+ * first (checked on 40 prod sessions, 2026-10-20), so system rows never mark a run boundary. Every row in between belongs to the run whatever its own timestamp says, so one
+ * out-of-order timestamp can't cut a run short. Without a start, or with no timestamps at all,
+ * every row is in.
+ */
+function withinRunWindow(
+  messages: NormalizedMessage[],
+  startedAt?: string,
+  completedAt?: string,
+  nextStartedAt?: string,
+): { messages: NormalizedMessage[]; sessionRanLater: boolean } {
+  const start = startedAt ? Date.parse(startedAt) : NaN;
+  if (!Number.isFinite(start) || !messages.some((m) => m.ts)) return { messages, sessionRanLater: false };
+  const completed = completedAt ? Date.parse(completedAt) : NaN;
+  const nextStart = nextStartedAt ? Date.parse(nextStartedAt) : NaN;
+  const carried = carriedTimestamps(messages);
+
+  const ask = askPosition(messages, start);
+  let first = ask;
+  if (first < 0) first = carried.findIndex((t) => Number.isFinite(t) && t >= start - WINDOW_SLACK_MS);
+  if (first < 0) return { messages: [], sessionRanLater: false };
+
+  let stop = messages.length;
+  if (Number.isFinite(nextStart)) {
+    const nextAsk = askPosition(messages, nextStart, first + 1);
+    if (nextAsk > first) stop = nextAsk;
+  }
+  if (Number.isFinite(completed)) {
+    for (let i = first + 1; i < stop; i++) {
+      const m = messages[i];
+      const own = m.ts ? Date.parse(m.ts) : NaN;
+      if (m.role === 'user' && Number.isFinite(own) && own >= completed) {
+        stop = i;
+        break;
+      }
+    }
+  }
+
+  const inRun = messages.slice(first, stop).filter((m) => m.role !== 'system');
+  const sessionRanLater = messages.slice(stop).some((m) => m.role === 'user');
+  return { messages: inRun, sessionRanLater };
 }
 
 function buildCalls(messages: NormalizedMessage[]): { calls: AgentRunTraceCall[]; rawArgs: Map<string, string>; truncated: boolean; degraded: boolean } {
@@ -216,12 +269,16 @@ function buildCalls(messages: NormalizedMessage[]): { calls: AgentRunTraceCall[]
   const issued: Array<{ id: string; name: string; arguments: string; result?: { content: string; ts?: string }; meta?: { duration?: number; error?: unknown } }> = [];
   const pendingResult = new Map<string, number[]>();
   const pendingMeta = new Map<string, number[]>();
-  const seen = new Map<string, number>();
+  const used = new Set<string>();
   for (const m of messages) {
+    // A tool result answers a call of the latest assistant turn; an unanswered call must not shift
+    // later results that reuse its id onto it. Timings come from a run-wide ledger, so they stay queued.
+    if (m.toolCalls.length) pendingResult.clear();
     for (const tc of m.toolCalls) {
-      const n = seen.get(tc.id) ?? 0;
-      seen.set(tc.id, n + 1);
-      const position = issued.push({ ...tc, id: n ? `${tc.id}#${n + 1}` : tc.id }) - 1;
+      let id = tc.id;
+      for (let n = 2; used.has(id); n++) id = `${tc.id}#${n}`;
+      used.add(id);
+      const position = issued.push({ ...tc, id }) - 1;
       pendingResult.set(tc.id, [...(pendingResult.get(tc.id) ?? []), position]);
       pendingMeta.set(tc.id, [...(pendingMeta.get(tc.id) ?? []), position]);
     }
@@ -244,7 +301,7 @@ function buildCalls(messages: NormalizedMessage[]): { calls: AgentRunTraceCall[]
     const result = tc.result;
     const m = tc.meta;
     const metaError = errorText(m?.error);
-    const resultIsError = !!result && TOOL_ERROR_PREFIX.test(result.content);
+    const resultIsError = !!result && (TOOL_ERROR_PREFIX.test(result.content) || (tc.name === STEP_STATUS_TOOL && STATUS_REFUSED.test(result.content)));
     const status: TraceCallStatus = metaError || resultIsError ? 'failed' : result ? 'succeeded' : 'no_result';
     const args = redactedArgs(tc.arguments);
     const shownResult = result ? capRedacted(result.content, resultCap) : undefined;
@@ -296,6 +353,7 @@ function buildSteps(
     closedWithoutCalls: false,
   }));
   const byCount = new Map(steps.map((s) => [s.stepCount, s]));
+  const callById = new Map(calls.map((c) => [c.id, c]));
 
   const setupCallIds: string[] = [];
   let segment: string[] = [];
@@ -306,12 +364,11 @@ function buildSteps(
       // An update that closes nothing (in progress, an unknown step, a failed call) is part of the
       // current segment like any other call, so every call in the trace shows in exactly one group.
       if (!closed.length || call.status === 'failed') {
-        workStarted = true;
         segment.push(call.id);
         continue;
       }
       const owner = byCount.get(closed[0])!;
-      owner.closedWithoutCalls = segment.length === 0;
+      owner.closedWithoutCalls = segment.every((id) => callById.get(id)?.name === STEP_STATUS_TOOL);
       owner.callIds.push(...segment, call.id);
       owner.statusCallId = call.id;
       for (const n of closed.slice(1)) {
