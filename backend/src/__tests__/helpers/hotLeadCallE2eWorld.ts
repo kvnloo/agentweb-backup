@@ -104,7 +104,8 @@ export function installWorld(): void {
 
 // ── clock and lead helpers ──────────────────────────────────────────────────
 
-const flush = async () => {
+/** Lets work started without being awaited (the next-attempt job the webhook queues) run to its end. */
+export const flush = async () => {
   for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
   await jest.advanceTimersByTimeAsync(0);
 };
@@ -196,6 +197,9 @@ export function twilioCall(placed: WebhookCall, memberSid = 'CA00000001', leadSi
   };
 }
 
+/** The nth member call the orchestrator placed (1-based), as Twilio plays it: sids CA0000000n and CAL000000n. */
+export const nthCall = (n: number) => twilioCall(placedCall(n - 1), `CA${String(n).padStart(8, '0')}`, `CAL${String(n).padStart(7, '0')}`);
+
 /** Rings the member, who presses 1, and the lead answers and presses 1: the call is bridged. Returns the live call. */
 export async function bridgedCall(leadId = 'lead-a') {
   await submitLead(leadId);
@@ -219,7 +223,8 @@ function expectNoPhoneNumberAnywhere(): void {
     JSON.stringify(mock(recordVendorUsage).mock.calls),
   ];
   for (const text of surfaces) {
-    for (const phone of [MEMBER_PHONE, TWILIO_NUMBER, LEAD_E164]) {
+    const team = ((crm.orgs.get('org-a')?.hotLeadCall as { team?: Array<{ phone: string }> } | undefined)?.team ?? []).map((m) => m.phone);
+    for (const phone of [MEMBER_PHONE, TWILIO_NUMBER, LEAD_E164, ...team]) {
       expect(text.replace(/\D/g, '')).not.toContain(phone.slice(2));
     }
   }

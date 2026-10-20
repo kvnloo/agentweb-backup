@@ -179,8 +179,7 @@ describe('a hot lead rings the member and, on 1, bridges the lead', () => {
 
   it('the lead phone was overwritten between dispatch and the member pressing 1: nobody is dialed, lead_phone_changed', async () => {
     await submitLead('lead-a');
-    const record = world.crm.lead(LIST, 'lead-a').system!.hot_lead_call as Record<string, unknown>;
-    record.leadPhoneMac = leadPhoneMacOf('org-a', LEAD_E164); // what the orchestrator stores when the call passes the gates
+    expect(recordOf('lead-a')?.leadPhoneMac).toBe(leadPhoneMacOf('org-a', LEAD_E164)); // stored by the orchestrator when the call passed the gates
     const call = twilioCall(placedCall());
     await call.memberAnswers();
     world.crm.lead(LIST, 'lead-a').phone = '(212) 555-0199';
