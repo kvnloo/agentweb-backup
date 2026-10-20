@@ -384,14 +384,29 @@ describe("a spawn that is still being created when killAll runs (the asynchronou
     await new Promise((r) => setTimeout(r, 60)); // anything that was going to appear has appeared
     expect(sys.activeUnits(UID)).toHaveLength(0);
   });
-  it("a client that never exits is killed after a few rounds and the kill reports honestly", async () => {
+  it("a client that will not exit is NEVER killed (its unit would still be created): killAll ends in kill_timeout, honestly", async () => {
     const { port, sys } = rig();
     sys.startLatencyMs = 10_000;
     await port.createAttemptDir(UID, "att-1");
     const ctx = port.contextFor("c", UID, "att-1", "attempt");
     ctx.spawnAs({ file: "/bin/sleep", args: ["60"], env: {}, cwd: ctx.workDir });
-    await port.killAll(UID); // the fake's client kill cancels the pending start
-    expect(sys.activeUnits(UID)).toHaveLength(0);
+    expect(await rejects(port.killAll(UID))).toBe("kill_timeout");
+    expect(sys.callsOf("/usr/bin/systemd-run")).toHaveLength(1);
+    expect(sys.clientKills).toBe(0); // the client was never signalled
+    expect([...sys.pendingStarts.keys()]).toHaveLength(1); // the request is still queued: we did not pretend it was gone
+  });
+  it("a queued start job counts as alive even with NO tracked client (after a host restart): killAll waits until the unit exists and kills it", async () => {
+    const a = rig();
+    a.sys.startLatencyMs = 40;
+    await a.port.createAttemptDir(UID, "att-1");
+    const ctx = a.port.contextFor("c", UID, "att-1", "attempt");
+    ctx.spawnAs({ file: "/bin/sleep", args: ["60"], env: {}, cwd: ctx.workDir });
+    // a fresh port instance = a restarted host: it knows no client
+    const { SystemdUserFs: P } = await import("../../ports/systemdUserFs");
+    const restarted = new P({ layout: a.layout, cmd: a.sys, root: a.sys, config: a.config });
+    await restarted.killAll(UID);
+    await new Promise((r) => setTimeout(r, 90));
+    expect(a.sys.activeUnits(UID)).toHaveLength(0);
   });
   it("wipe refuses while a client is still starting a unit", async () => {
     const { port, sys } = rig();
@@ -458,9 +473,33 @@ describe("is-active that times out", () => {
     const exits: number[] = [];
     child.onExit((c) => exits.push(c ?? -1));
     sys.isActiveTimeout = true;
-    sys.activeUnits(UID)[0].clientExit(255, null);
+    const unit = sys.activeUnits(UID)[0];
+    unit.clientExit(255, null);
     await new Promise((r) => setTimeout(r, 80));
     expect(exits).toEqual([]);
+    sys.isActiveTimeout = false; // let the watcher finish (no stray polling loop after the test)
+    sys.endUnit(unit, 255);
+    await new Promise((r) => setTimeout(r, 1300));
+    expect(exits).toEqual([255]);
+  });
+  it("'unknown' or empty from is-active is a failed query, not a state", async () => {
+    const { port, sys } = rig();
+    await port.createAttemptDir(UID, "att-1");
+    const ctx = port.contextFor("c", UID, "att-1", "attempt");
+    const child = ctx.spawnAs({ file: "/bin/sleep", args: ["60"], env: {}, cwd: ctx.workDir });
+    const exits: number[] = [];
+    child.onExit((c) => exits.push(c ?? -1));
+    const unit = sys.activeUnits(UID)[0];
+    const real = sys.run.bind(sys);
+    let garbage = true;
+    sys.run = (async (file: string, args: string[]) => (garbage && args[0] === "is-active" ? { code: 1, signal: null, stdout: args[1] ? "unknown\n" : "", stderr: "", timedOut: false } : real(file, args))) as typeof sys.run;
+    unit.clientExit(255, null);
+    await new Promise((r) => setTimeout(r, 80));
+    expect(exits).toEqual([]);
+    garbage = false;
+    sys.endUnit(unit, 255);
+    await new Promise((r) => setTimeout(r, 1300));
+    expect(exits).toEqual([255]);
   });
 });
 

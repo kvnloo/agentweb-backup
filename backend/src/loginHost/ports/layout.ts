@@ -25,6 +25,7 @@ export interface LayoutConfig {
 export type RefKind = "attempt" | "home";
 
 const ENV = /^[a-z0-9]{1,16}$/;
+const SYSTEM_DIRS = ["/", "/var", "/var/lib", "/var/tmp", "/run", "/opt", "/etc", "/usr", "/home", "/tmp", "/srv", "/root", "/boot", "/dev", "/proc", "/sys", "/bin", "/sbin", "/lib", "/lib64", "/mnt", "/media"];
 const REF = /^[a-z][a-z0-9]{1,9}-[a-z0-9]{1,64}$/;
 const SEGMENT = /^[A-Za-z0-9._-]{1,64}$/;
 const ENV_NAME = /^[A-Z][A-Z0-9_]{0,63}$/;
@@ -51,7 +52,7 @@ export class Layout {
       throw new LayoutError("shared_parent_invalid");
     }
     // The parent is masked inside every unit: it must be a dedicated directory, never a system one, and the state root must live directly in it.
-    if (["/", "/var", "/var/lib", "/run", "/opt", "/etc", "/usr", "/home", "/tmp"].includes(cfg.sharedParent) || cfg.sharedParent.endsWith("/") || cfg.stateRoot !== `${cfg.sharedParent}/${cfg.env}`) throw new LayoutError("shared_parent_invalid");
+    if (SYSTEM_DIRS.includes(cfg.sharedParent) || cfg.sharedParent.endsWith("/") || cfg.stateRoot !== `${cfg.sharedParent}/${cfg.env}`) throw new LayoutError("shared_parent_invalid");
     if (!Number.isInteger(cfg.uidMin) || !Number.isInteger(cfg.uidMax) || cfg.uidMin < 1000 || cfg.uidMax < cfg.uidMin) throw new LayoutError("uid_range_invalid");
   }
 

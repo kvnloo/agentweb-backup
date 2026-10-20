@@ -31,7 +31,14 @@ export interface SystemdPortConfig {
 }
 
 const ACTIVE_STATES = new Set(["active", "activating", "deactivating", "reloading", "refreshing"]);
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+/** Timers never keep the process alive: a watcher on a stuck unit is a last resort, not a reason to hold the host (or a test worker) open. */
+const sleep = (ms: number) =>
+  new Promise<void>((r) => {
+    const t = setTimeout(r, ms);
+    t.unref?.();
+  });
+/** How long a single unit's exit is watched after its client is gone (past it, systemd's RuntimeMaxSec and the core's kills take over). */
+const WATCH_BUDGET_MS = 15 * 60 * 1000;
 
 export interface PortDeps {
   layout: Layout;
@@ -168,7 +175,7 @@ export class SystemdUserFs implements UserFsPort {
     this.layout.assertUid(uid);
     await this.withGate(uid, async () => {
       const deadline = Date.now() + this.cfg.killTimeoutMs;
-      for (let round = 0; ; round++) {
+      for (;;) {
         await this.cmd.run(this.cfg.paths.systemctl, ["stop", this.layout.sliceName(uid)], { timeoutMs: this.cfg.commandTimeoutMs });
         const units = await this.listUnits(uid);
         for (const u of units) {
@@ -180,9 +187,10 @@ export class SystemdUserFs implements UserFsPort {
         const stray = (await this.root.procUids()).filter((p) => p.uid === uid);
         for (const p of stray) await this.root.killPid(p.pid, uid);
         // A `systemd-run` client that has not exited may still be about to create its unit (the request is asynchronous):
-        // the kill is not complete until every client of the uid is gone. After the first rounds a client that will not go is killed.
+        // the kill is not complete until every client of the uid is gone. A client is NEVER killed here: once its request
+        // reached PID 1 the unit is created anyway (verified reasoning: killing the client does not cancel the unit), so
+        // killing it would only make us believe nothing is left. A client that will not exit ends in kill_timeout (honest).
         const pending = this.clientCount(uid);
-        if (pending > 0 && round >= 2) for (const c of this.clients.get(uid) ?? []) c.kill();
         if (units.length === 0 && stray.length === 0 && pending === 0) return;
         if (Date.now() > deadline) throw new Error("kill_timeout");
         await sleep(this.cfg.killPollMs);
@@ -208,12 +216,20 @@ export class SystemdUserFs implements UserFsPort {
     const r = await this.cmd.run(this.cfg.paths.systemctl, ["list-units", "--all", "--no-legend", "--plain", this.layout.unitPattern(uid)], { timeoutMs: this.cfg.commandTimeoutMs });
     if (r.timedOut || r.code !== 0) throw new Error("list_units_failed");
     const alive: string[] = [];
+    // A unit whose start job is still queued is not "active" yet but WILL be (also after a host restart, when no client is tracked).
+    const jobs = await this.cmd.run(this.cfg.paths.systemctl, ["list-jobs", "--no-legend", "--plain"], { timeoutMs: this.cfg.commandTimeoutMs });
+    if (jobs.timedOut || jobs.code !== 0) throw new Error("list_jobs_failed");
+    for (const line of jobs.stdout.split("\n")) {
+      const t = line.trim().split(/\s+/);
+      const name = t[1];
+      if (name && t[2] === "start" && this.layout.isUnitOf(uid, name)) alive.push(name);
+    }
     for (const line of r.stdout.split("\n")) {
       const t = line.trim().split(/\s+/);
       if (t[0] === "\u25cf" || t[0] === "*") t.shift(); // a leading status marker
       const [name, , active] = t;
       // `--all` also lists loaded-but-inactive units: only a live one counts. Names are re-validated; nothing printed is trusted.
-      if (name && this.layout.isUnitOf(uid, name) && active !== undefined && ACTIVE_STATES.has(active)) alive.push(name);
+      if (name && this.layout.isUnitOf(uid, name) && active !== undefined && ACTIVE_STATES.has(active) && !alive.includes(name)) alive.push(name);
     }
     return alive;
   }
@@ -223,7 +239,7 @@ export class SystemdUserFs implements UserFsPort {
     if (r.timedOut) throw new Error("unit_state_unreadable"); // never "gone" on a guess
     const state = r.stdout.trim();
     if (ACTIVE_STATES.has(state)) return true;
-    if (state === "inactive" || state === "failed" || state === "unknown") return false;
+    if (state === "inactive" || state === "failed") return false; // "unknown"/empty is a failed query, not a state (newer systemd prints nothing on a bus error)
     throw new Error("unit_state_unreadable");
   }
 
@@ -370,18 +386,20 @@ class UnitChild implements ChildLike {
   }
 
   private async afterClientExit(code: number | null, signal: string | null): Promise<void> {
-    const deadline = Date.now() + this.ops.timeoutMs;
-    try {
-      for (;;) {
+    const started = Date.now();
+    const deadline = started + this.ops.timeoutMs;
+    const giveUpAt = started + WATCH_BUDGET_MS;
+    for (;;) {
+      try {
         if (!(await this.ops.isActive(this.unit))) break;
         await this.ops.killUnit(this.unit).catch(() => undefined);
-        // Past the budget the unit is still NOT reported gone, but we keep trying slowly: the callback must come the moment it is.
-        await sleep(Date.now() > deadline ? Math.max(this.ops.pollMs, 1000) : this.ops.pollMs);
+      } catch {
+        // The state could not be read: never claim "gone" on a guess.
       }
-    } catch {
-      // The state could not be read: never claim "gone" on a guess; try again shortly.
-      await sleep(Math.max(this.ops.pollMs, 1000));
-      return this.afterClientExit(code, signal);
+      // Past the kill budget the unit is still NOT reported gone, but we keep trying slowly (the callback must come the moment it is),
+      // up to a hard cap: `RuntimeMaxSec`, the core's uid kill and recover() are what end a unit that never dies.
+      if (Date.now() > giveUpAt) return;
+      await sleep(Date.now() > deadline ? Math.max(this.ops.pollMs, 1000) : this.ops.pollMs);
     }
     this.done = { code, signal };
     for (const cb of this.exitCallbacks.splice(0)) cb(code, signal);

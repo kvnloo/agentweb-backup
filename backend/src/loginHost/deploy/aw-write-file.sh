@@ -13,5 +13,11 @@ if [ -e "$target" ] || [ -L "$target" ]; then
   echo "target exists" >&2
   exit 1
 fi
+# Write a temporary file next to the target, then move it into place without ever replacing: a failure part-way leaves no
+# partial target (a retry would otherwise find "target exists").
+tmp="$target.tmp.$$"
+trap 'rm -f "$tmp"' EXIT
 set -C
-cat > "$target"
+cat > "$tmp"
+mv -n "$tmp" "$target"
+[ ! -e "$tmp" ]

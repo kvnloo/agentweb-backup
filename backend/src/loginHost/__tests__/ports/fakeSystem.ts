@@ -66,6 +66,10 @@ export class FakeSystem implements CommandPort, RootFs {
   inactiveLoaded: string[] = [];
   /** Unit working directory as given to systemd-run (root follows it). */
   workingDirs = new Map<string, string>();
+  /** Units whose start request reached "PID 1" but that do not exist yet (start job queued). */
+  pendingStarts = new Map<string, number>();
+  /** How many times a systemd-run CLIENT process was signalled (the port must never do that to a client that may still create its unit). */
+  clientKills = 0;
   /** Units refuse to die (`systemctl kill/stop` is a no-op): an immortal process. */
   immortal = new Set<string>();
   /** A gate the `systemctl stop <slice>` waits for (a slow kill). */
@@ -173,6 +177,10 @@ export class FakeSystem implements CommandPort, RootFs {
       const inactive = this.inactiveLoaded.filter((n) => re.test(n)).map((n) => `\u25cf ${n} loaded inactive dead Some description`);
       return ok([...lines, ...inactive, ...this.listJunk].join("\n") + "\n");
     }
+    if (sub === "list-jobs") {
+      const lines = [...this.pendingStarts.keys()].map((n, i) => `${100 + i} ${n} start waiting`);
+      return ok(lines.join("\n") + (lines.length ? "\n" : ""));
+    }
     if (sub === "is-active") {
       if (this.isActiveTimeout) return { code: null, signal: null, stdout: "", stderr: "", timedOut: true };
       if (this.isActiveGarbage) return ok("weird-state\n", 0);
@@ -227,6 +235,7 @@ export class FakeSystem implements CommandPort, RootFs {
       stderr,
       kill: () => {
         // killing the CLIENT never stops the unit (verified on systemd 252)
+        this.clientKills++;
         queueMicrotask(() => exitCbs.forEach((cb) => cb(255, null)));
       },
       onExit: (cb) => void exitCbs.push(cb),
@@ -280,15 +289,15 @@ export class FakeSystem implements CommandPort, RootFs {
       if (program) program(unit);
     };
     if (this.startLatencyMs > 0) {
-      // The unit does not exist yet: the client has asked PID 1 and is waiting. Killing the client before the unit appears
-      // prevents it; otherwise the unit appears later and the client exits when it ends.
-      let cancelled = false;
+      // The unit does not exist yet: the client has ALREADY asked PID 1 and is waiting. Killing the client does NOT cancel the
+      // request (real systemd: the start job is queued): the unit appears later regardless.
+      this.pendingStarts.set(name, uid);
       client.kill = () => {
-        cancelled = true;
+        this.clientKills++;
         queueMicrotask(() => exitCbs.forEach((cb) => cb(255, null)));
       };
       setTimeout(() => {
-        if (cancelled) return;
+        this.pendingStarts.delete(name);
         create();
       }, this.startLatencyMs);
       // the client exits when its unit ends: wire that
