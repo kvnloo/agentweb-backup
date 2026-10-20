@@ -141,8 +141,10 @@ export interface PaygOverageStatus {
  * favour within the month, so a write is needed only when an admission sees a higher cap or plan pool,
  * or a lower markup:
  *   - `capHighWaterMicroUsd`: the highest cap (`capPercentOfPool` x that moment's pool) any admission
- *     was measured against — the most the owner agreed to be billed for that month. Lowering the cap
- *     later does not un-agree to overage already admitted; raising it after the month does not reach back.
+ *     was measured against — the most the owner agreed to be billed for that month. **The cap is a
+ *     monthly total:** raising it during the month applies to the whole month, including overrun already
+ *     admitted earlier in it (the consent copy says "Your limit applies to the whole month"); lowering it
+ *     later does not un-agree to overage already admitted; and no change after the month reaches back.
  *   - `tierPoolHighWaterMicroUsd`: the highest plan pool (the tier's hard threshold, before credits) —
  *     settlement's pool for the month, so a plan change after the month cannot move its bill.
  *   - `markupBps`: the lowest tier markup seen; null when the tier had none (settlement holds the month).
@@ -275,19 +277,6 @@ export function paygEffectiveBaselineMicroUsd(input: {
   return Math.max(0, Math.round(baseline) - poolGrowth);
 }
 
-/**
- * Admit a turn past the plan pool, or keep the 429.
- *
- * Acts ONLY on `hard_threshold_reached`; every other decision is returned as-is, so with the switch
- * off — or for any account that never opted in — the gates behave exactly as they did before PAYG.
- * Admits (reason `payg_overage`, mode `full_choice`) only when all of these hold:
- *   - the switch is on;
- *   - the tier allows PAYG (`allowed === true`);
- *   - the billing owner opted in (`enabled === true`) and is not suspended;
- *   - a payment method is on file (cached flag, `=== true`);
- *   - the subscription is active or trialing;
- *   - overage since opting in is still below `capPercentOfPool` of the month's pool.
- */
 /**
  * Overage since opting in (gross overage above the month's pool, less the opt-in baseline that still
  * applies), or NaN when an input is unreadable. The one definition the gates admit against and

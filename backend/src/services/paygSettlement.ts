@@ -27,6 +27,7 @@ import {
   paygMonthState,
   paygNetOverageMicroUsd,
   paygOverageThresholdMicroUsd,
+  type PaygAdmittedMonth,
   type PaygOverageSettings,
 } from './paygOverage';
 
@@ -51,9 +52,10 @@ export type PaygSettlementHeldReason =
   /** No live Stripe customer to invoice. */
   | 'no_stripe_customer'
   /**
-   * Stripe's total for the invoice is not the recorded amount (a customer discount or balance, say). A
-   * draft is deleted before it is ever finalized, so nothing is collected; a finalized one found by
-   * search is left to Stripe and recorded.
+   * The invoice is not the one the record expects: its total is not the recorded amount (a customer
+   * discount or coupon — a credit balance lowers what is due, not the total), or the invoice the record
+   * names is void, deleted or unknown to Stripe. A draft is deleted before it is ever finalized, so
+   * nothing is collected; a finalized one is left to Stripe and its id kept on the record.
    */
   | 'invoice_mismatch';
 
@@ -79,8 +81,11 @@ export interface PaygSettlement {
   heldReason?: PaygSettlementHeldReason;
   nothingToBillReason?: 'no_overage' | 'below_minimum';
   invoiceId?: string;
-  /** A draft deleted on `invoice_mismatch` before it was finalized (audit only; nothing was collected). */
-  deletedDraftInvoiceId?: string;
+  /**
+   * On `invoice_mismatch`, an invoice that collected nothing and is no longer the record's: a draft
+   * deleted before finalizing, or one Stripe reports void or missing. Audit only.
+   */
+  uncollectedInvoice?: { invoiceId: string; reason: 'draft_deleted' | 'void' | 'missing' };
   invoicedAt?: string;
   paidAt?: string;
   failedAt?: string;
@@ -131,11 +136,10 @@ export interface PaygSettlementAmount {
   percentOfCap: number;
 }
 
-/** A month the gate admitted in, with a usable price on its record — or why it cannot be billed. */
-export function paygSettlementPrice(account: PaygOverageSettings, month: string): 'not_admitted' | 'no_price' | number {
-  const admitted = paygAdmittedMonth(account, month);
-  if (!admitted) return 'not_admitted';
-  return Number.isInteger(admitted.markupBps) && (admitted.markupBps as number) >= 10_000 ? (admitted.markupBps as number) : 'no_price';
+/** The month's recorded markup when it is a usable price (at least 1x, whole basis points), else null. */
+export function paygAdmittedMarkupBps(admitted: PaygAdmittedMonth): number | null {
+  const markup = admitted.markupBps;
+  return typeof markup === 'number' && Number.isInteger(markup) && markup >= 10_000 ? markup : null;
 }
 
 /**
@@ -151,10 +155,10 @@ export function computePaygSettlementAmount(input: {
   settledMicroUsd: number;
 }): PaygSettlementAmount | null {
   const admitted = paygAdmittedMonth(input.account, input.month);
-  const markupBps = paygSettlementPrice(input.account, input.month);
-  if (!admitted || typeof markupBps !== 'number') return null;
-  const tierPool = admitted.tierPoolHighWaterMicroUsd;
-  const capMicroUsd = admitted.capHighWaterMicroUsd;
+  if (!admitted) return null;
+  const markupBps = paygAdmittedMarkupBps(admitted);
+  const { tierPoolHighWaterMicroUsd: tierPool, capHighWaterMicroUsd: capMicroUsd } = admitted;
+  if (markupBps === null) return null;
   if (!Number.isFinite(tierPool) || tierPool <= 0 || !Number.isFinite(capMicroUsd) || capMicroUsd <= 0) return null;
   if (!Number.isFinite(input.settledMicroUsd) || input.settledMicroUsd < 0) return null;
 
@@ -179,8 +183,9 @@ export function computePaygSettlementAmount(input: {
   });
   if (!Number.isFinite(netOverageMicroUsd)) return null;
 
-  // The gate stops admitting at the cap, but work already in flight can run past it: never bill past
-  // the most the owner had agreed to at any point in the month.
+  // The cap is a MONTHLY total: the highest cap in force during the month covers the whole month,
+  // including overrun admitted earlier in it, and nothing after the month reaches back. The gate stops
+  // admitting at the cap, but work already in flight can run past it: never bill past it.
   const overageCostMicroUsd = Math.min(netOverageMicroUsd, capMicroUsd);
   const billedMicroUsd = Math.floor((overageCostMicroUsd * markupBps) / 10_000);
   return {

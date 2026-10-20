@@ -204,7 +204,9 @@ export const planRolloutUsageReset = planRolloutMigrationCredit;
 function ledgerToClose(user: Pick<User, 'llmUsageCredits' | 'paygOverage'>, month: string): MonthlyLlmUsageCredits | undefined {
   const existing = user.llmUsageCredits;
   if (!user.paygOverage || !existing || existing.month === month) return undefined;
-  const { debits: _debits, debitIds: _debitIds, ...closed } = existing;
+  const closed: MonthlyLlmUsageCredits = { ...existing };
+  delete closed.debits;
+  delete closed.debitIds;
   return closed;
 }
 

@@ -48,16 +48,39 @@ import {
   PAYG_SETTLEMENT_MONTHS_KEPT,
   paygSettlementIdempotencyKey,
   paygSettlementMonthsToPrune,
-  paygSettlementPrice,
+  paygAdmittedMarkupBps,
   previousUsageMonth,
   type PaygSettlement,
   type PaygSettlementHeldReason,
   type PaygSettlementStatus,
 } from './paygSettlement';
-import type { PaygOverageSettings } from './paygOverage';
+import { paygAdmittedMonth, type PaygOverageSettings } from './paygOverage';
 import { paygOverageInvoiceCopy } from '../utils/paygSettlementCopy';
 
 const TAG = '[paygSettlement]';
+
+const errorCode = (error: unknown): unknown => (error as { code?: unknown } | null | undefined)?.code;
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+const isConditionalFailure = (error: unknown): boolean => errorCode(error) === 'ConditionalCheckFailedException';
+
+/** The parts of Stripe's invoice, charge and dispute objects the webhooks read (Basil field names). */
+interface OverageInvoiceEvent {
+  id?: string;
+  metadata?: Record<string, string> | null;
+  hosted_invoice_url?: string | null;
+}
+interface OverageChargeEvent {
+  id?: string;
+  amount_refunded?: number;
+  refunded?: boolean;
+  currency?: string;
+}
+interface OverageDisputeEvent {
+  id?: string;
+  amount?: number;
+  currency?: string;
+  reason?: string;
+}
 /** One intake class for every held month, so alerts cluster on one canonical issue. */
 export const PAYG_SETTLEMENT_ALERT_CLASS = 'payg-settlement-held';
 
@@ -92,21 +115,33 @@ export async function runPaygSettlement(now: Date = new Date()): Promise<PaygSet
   const owners = await userDb.scanWithFilter('attribute_exists(paygOverage)', {});
   summary.scanned = owners.length;
   // One owner-month at a time: a handful of Stripe calls each, and a failure stays one owner's.
-  for (const owner of owners) {
+  for (const owner of owners as User[]) {
     const billingUserId = String(owner?.userId || '');
     if (!billingUserId) continue;
-    for (const settleMonth of monthsToSettle(owner as User, month)) {
+    let months: string[];
+    try {
+      months = monthsToSettle(owner, month);
+    } catch (error: unknown) {
+      recordFailure(summary, billingUserId, month, error);
+      continue;
+    }
+    for (const settleMonth of months) {
       try {
         const outcome = await settlePaygOverageMonth(billingUserId, settleMonth, now);
         summary.outcomes[outcome] = (summary.outcomes[outcome] ?? 0) + 1;
-      } catch (error: any) {
-        summary.failed++;
-        summary.errors.push({ billingUserId, error: error?.message || String(error) });
-        console.error(`${TAG} settling ${settleMonth} for ${billingUserId} failed; the next run retries:`, error?.message || error);
+      } catch (error: unknown) {
+        recordFailure(summary, billingUserId, settleMonth, error);
       }
     }
   }
   return summary;
+}
+
+/** One owner-month's failure: counted and logged, never allowed to stop the rest of the sweep. */
+function recordFailure(summary: PaygSettlementRunSummary, billingUserId: string, month: string, error: unknown): void {
+  summary.failed++;
+  summary.errors.push({ billingUserId, error: errorText(error) });
+  console.error(`${TAG} settling ${month} for ${billingUserId} failed; the next run retries:`, errorText(error));
 }
 
 /**
@@ -115,7 +150,7 @@ export async function runPaygSettlement(now: Date = new Date()): Promise<PaygSet
  */
 function monthsToSettle(owner: User, closingMonth: string): string[] {
   const months = new Set<string>();
-  if (owner.paygOverage && paygSettlementPrice(owner.paygOverage, closingMonth) !== 'not_admitted') months.add(closingMonth);
+  if (paygAdmittedMonth(owner.paygOverage, closingMonth)) months.add(closingMonth);
   const [year, monthNum] = closingMonth.split('-').map(Number);
   const oldest = new Date(Date.UTC(year, monthNum - PAYG_SETTLEMENT_MONTHS_KEPT, 1)).toISOString().slice(0, 7);
   for (const [settledMonth, record] of Object.entries(owner.paygSettlements ?? {})) {
@@ -140,7 +175,7 @@ export async function settlePaygOverageMonth(
   let record = user.paygSettlements?.[month];
   if (record && record.status !== 'pending') return 'already_recorded';
   if (!record) {
-    if (paygSettlementPrice(account, month) === 'not_admitted') return 'not_admitted';
+    if (!paygAdmittedMonth(account, month)) return 'not_admitted';
     const decided = await decideSettlement(user, billingUserId, account, month, now);
     if (!(await recordNewSettlement(user, billingUserId, month, decided))) return 'raced';
     if (decided.status === 'held') {
@@ -161,8 +196,8 @@ async function decideSettlement(
   now: Date,
 ): Promise<PaygSettlement> {
   const at = now.toISOString();
-  const price = paygSettlementPrice(account, month);
-  const markupBps = typeof price === 'number' ? price : null;
+  const admitted = paygAdmittedMonth(account, month);
+  const markupBps = admitted ? paygAdmittedMarkupBps(admitted) : null;
   const base: PaygSettlement = {
     status: 'held',
     idempotencyKey: paygSettlementIdempotencyKey(billingUserId, month),
@@ -243,8 +278,8 @@ async function recordNewSettlement(
       });
     }
     return true;
-  } catch (error: any) {
-    if (error?.code === 'ConditionalCheckFailedException') return false;
+  } catch (error: unknown) {
+    if (isConditionalFailure(error)) return false;
     throw error;
   }
 }
@@ -274,8 +309,8 @@ async function transitionSettlement(
       },
     });
     return true;
-  } catch (error: any) {
-    if (error?.code === 'ConditionalCheckFailedException') return false;
+  } catch (error: unknown) {
+    if (isConditionalFailure(error)) return false;
     throw error;
   }
 }
@@ -320,10 +355,14 @@ async function invoicePendingSettlement(
   });
   if (issued.outcome === 'no_customer') return holdPending(billingUserId, month, record, 'no_stripe_customer');
   if (issued.outcome === 'mismatch') {
-    // A deleted draft collected nothing and leaves no invoice behind; a finalized one is Stripe's.
-    return issued.draftDeleted
-      ? holdPending(billingUserId, month, record, 'invoice_mismatch', { deletedDraftInvoiceId: issued.invoiceId }, ['invoiceId'])
-      : holdPending(billingUserId, month, record, 'invoice_mismatch', { invoiceId: issued.invoiceId });
+    // A finalized invoice at another total is Stripe's to collect: its id stays on the record. Anything
+    // else collected nothing and is no longer this month's invoice (a deleted draft, or a recorded
+    // invoice Stripe reports void or missing): it is set aside, never invoiced over automatically.
+    return issued.reason === 'total_differs'
+      ? holdPending(billingUserId, month, record, 'invoice_mismatch', { invoiceId: issued.invoiceId })
+      : holdPending(billingUserId, month, record, 'invoice_mismatch', {
+          uncollectedInvoice: { invoiceId: issued.invoiceId, reason: issued.reason },
+        }, ['invoiceId']);
   }
 
   const { invoice } = issued;
@@ -371,9 +410,12 @@ function heldRunbook(month: string, record: PaygSettlement): string {
       + 'records the outcome on this record; if it must not be collected, void it in Stripe. Nothing will '
       + 'invoice this month again while the record exists.';
   }
-  const deleted = record.deletedDraftInvoiceId
-    ? ` The draft invoice ${record.deletedDraftInvoiceId} was deleted before it was finalized — check why Stripe's total differed (a customer discount, coupon or balance).`
-    : '';
+  const uncollected = record.uncollectedInvoice;
+  const deleted = !uncollected
+    ? ''
+    : uncollected.reason === 'draft_deleted'
+      ? ` The draft invoice ${uncollected.invoiceId} was deleted before it was finalized — check why Stripe's total differed (a customer discount or coupon).`
+      : ` The invoice ${uncollected.invoiceId} this month had recorded is ${uncollected.reason === 'void' ? 'void' : 'deleted or unknown to Stripe'} — check who voided or deleted it and whether the month should still be billed.`;
   return `No invoice was finalized and nothing was collected.${deleted} Check in Stripe that no live invoice has `
     + `metadata purchaseType=payg_overage, billingUserId and month=${month}; once the cause is fixed, remove `
     + `paygSettlements.${month} on the AW-Users row to let the next daily run settle it again (it searches `
@@ -396,11 +438,11 @@ async function alertHeld(billingUserId: string, month: string, record: PaygSettl
         settledMicroUsd: record.settledMicroUsd,
         projectedMicroUsd: record.projectedMicroUsd,
         invoiceId: record.invoiceId ?? null,
-        deletedDraftInvoiceId: record.deletedDraftInvoiceId ?? null,
+        uncollectedInvoiceId: record.uncollectedInvoice?.invoiceId ?? null,
       },
     );
-  } catch (error: any) {
-    console.error(`${TAG} on-call alert for held ${month} / ${billingUserId} failed:`, error?.message || error);
+  } catch (error: unknown) {
+    console.error(`${TAG} on-call alert for held ${month} / ${billingUserId} failed:`, errorText(error));
   }
 }
 
@@ -412,7 +454,7 @@ interface OverageInvoiceRef {
   month: string;
 }
 
-function overageInvoiceRef(invoice: any): OverageInvoiceRef | null {
+function overageInvoiceRef(invoice: OverageInvoiceEvent): OverageInvoiceRef | null {
   const metadata = invoice?.metadata || {};
   if (metadata.purchaseType !== PAYG_OVERAGE_PURCHASE_TYPE) return null;
   const billingUserId = String(metadata.billingUserId || '');
@@ -422,7 +464,7 @@ function overageInvoiceRef(invoice: any): OverageInvoiceRef | null {
 }
 
 /** The owner and the settlement an overage invoice belongs to, or null (logged) when it is not ours. */
-async function loadSettlementFor(invoice: any, event: string): Promise<{ ref: OverageInvoiceRef; user: User; record: PaygSettlement } | null> {
+async function loadSettlementFor(invoice: OverageInvoiceEvent, event: string): Promise<{ ref: OverageInvoiceRef; user: User; record: PaygSettlement } | null> {
   const ref = overageInvoiceRef(invoice);
   if (!ref) {
     console.warn(`${TAG} ${event}: overage invoice ${invoice?.id} has unreadable metadata; ignored`);
@@ -451,7 +493,7 @@ function webhookSources(record: PaygSettlement, invoiceId: string, base: PaygSet
 }
 
 /** `invoice.paid` / `invoice.payment_succeeded` for an overage invoice. */
-export async function handlePaygOverageInvoicePaid(invoice: any): Promise<void> {
+export async function handlePaygOverageInvoicePaid(invoice: OverageInvoiceEvent): Promise<void> {
   const loaded = await loadSettlementFor(invoice, 'invoice paid');
   if (!loaded) return;
   const { ref, user, record } = loaded;
@@ -466,37 +508,33 @@ export async function handlePaygOverageInvoicePaid(invoice: any): Promise<void> 
 
 /**
  * A payment-failure suspension lasts while ANY month's overage invoice is `failed`: paying one month
- * lifts it only if no other month is still unpaid. Conditional on the reason (a dispute suspension is
- * never lifted here) and on every other month the row holds still not being `failed` at write time.
+ * lifts it only if, at the read, no other month was failed — and only if `suspended` is still EXACTLY
+ * the value that read saw. Every failure re-stamps `suspended` (`suspendPayg`), so a month that fails
+ * after the read — even one created after it — changes the value and the lift does not happen. A dispute
+ * suspension is never lifted here.
  */
 async function liftPaymentFailureSuspension(billingUserId: string, user: User, paidMonth: string): Promise<void> {
-  if (user.paygOverage?.suspended?.reason !== 'payment_failed') return;
-  const otherMonths = Object.keys(user.paygSettlements ?? {}).filter((m) => m !== paidMonth);
-  if (otherMonths.some((m) => user.paygSettlements![m]?.status === 'failed')) return;
-  const names: Record<string, string> = {
-    '#payg': 'paygOverage', '#suspended': 'suspended', '#reason': 'reason', '#settlements': 'paygSettlements', '#status': 'status',
-  };
-  const clauses = ['#payg.#suspended.#reason = :paymentFailed'];
-  otherMonths.forEach((m, i) => {
-    names[`#m${i}`] = m;
-    clauses.push(`#settlements.#m${i}.#status <> :failed`);
-  });
+  const suspended = user.paygOverage?.suspended;
+  if (suspended?.reason !== 'payment_failed') return;
+  const stillFailed = Object.entries(user.paygSettlements ?? {})
+    .some(([month, record]) => month !== paidMonth && record?.status === 'failed');
+  if (stillFailed) return;
   try {
     await userDb.updateUser(billingUserId, {}, {
       pathRemoves: [{ path: ['paygOverage', 'suspended'] }],
       condition: {
-        expression: clauses.join(' AND '),
-        names,
-        values: { ':paymentFailed': 'payment_failed', ...(otherMonths.length ? { ':failed': 'failed' } : {}) },
+        expression: '#payg.#suspended = :seen',
+        names: { '#payg': 'paygOverage', '#suspended': 'suspended' },
+        values: { ':seen': suspended },
       },
     });
-  } catch (error: any) {
-    if (error?.code !== 'ConditionalCheckFailedException') throw error;
+  } catch (error: unknown) {
+    if (!isConditionalFailure(error)) throw error;
   }
 }
 
 /** `invoice.payment_failed` for an overage invoice: `failed`, PAYG suspended, one owner email. */
-export async function handlePaygOverageInvoicePaymentFailed(invoice: any): Promise<void> {
+export async function handlePaygOverageInvoicePaymentFailed(invoice: OverageInvoiceEvent): Promise<void> {
   const loaded = await loadSettlementFor(invoice, 'invoice payment failed');
   if (!loaded) return;
   const { ref, user, record } = loaded;
@@ -515,7 +553,11 @@ export async function handlePaygOverageInvoicePaymentFailed(invoice: any): Promi
 }
 
 /** `charge.dispute.created` on an overage charge: PAYG suspended (`dispute`), recorded on the settlement. */
-export async function handlePaygOverageChargeDisputed(dispute: any, charge: any, invoice: any): Promise<void> {
+export async function handlePaygOverageChargeDisputed(
+  dispute: OverageDisputeEvent,
+  charge: OverageChargeEvent,
+  invoice: OverageInvoiceEvent,
+): Promise<void> {
   const loaded = await loadSettlementFor(invoice, 'charge disputed');
   if (!loaded) return;
   const { ref } = loaded;
@@ -545,7 +587,7 @@ export async function handlePaygOverageChargeDisputed(dispute: any, charge: any,
  * `charge.refunded` on an overage charge: the cumulative refunded amount is recorded on the settlement
  * (so a redelivery lands on the same figure) and in payment history. Never lifts a suspension.
  */
-export async function handlePaygOverageChargeRefunded(charge: any, invoice: any): Promise<void> {
+export async function handlePaygOverageChargeRefunded(charge: OverageChargeEvent, invoice: OverageInvoiceEvent): Promise<void> {
   const loaded = await loadSettlementFor(invoice, 'charge refunded');
   if (!loaded) return;
   const { ref } = loaded;
@@ -571,26 +613,23 @@ export async function handlePaygOverageChargeRefunded(charge: any, invoice: any)
 }
 
 /**
- * Set `paygOverage.suspended`. A dispute replaces a payment-failure suspension (it is the stronger
- * reason, and paying the invoice must not lift it); an existing dispute is never replaced.
+ * Set `paygOverage.suspended`. A payment failure always re-stamps it (`at` and `invoiceId` of the latest
+ * failure), so a lift decided on an older read cannot clear it; it never replaces a dispute. A dispute
+ * replaces a payment-failure suspension (the stronger reason, and paying an invoice must not lift it) but
+ * never an existing dispute.
  */
 async function suspendPayg(billingUserId: string, suspended: NonNullable<PaygOverageSettings['suspended']>): Promise<void> {
   try {
     await userDb.updateUser(billingUserId, {}, {
       pathSets: [{ path: ['paygOverage', 'suspended'], value: suspended }],
-      condition: suspended.reason === 'dispute'
-        ? {
-            expression: 'attribute_exists(#payg) AND (attribute_not_exists(#payg.#suspended) OR #payg.#suspended.#reason <> :dispute)',
-            names: { '#payg': 'paygOverage', '#suspended': 'suspended', '#reason': 'reason' },
-            values: { ':dispute': 'dispute' },
-          }
-        : {
-            expression: 'attribute_exists(#payg) AND attribute_not_exists(#payg.#suspended)',
-            names: { '#payg': 'paygOverage', '#suspended': 'suspended' },
-          },
+      condition: {
+        expression: 'attribute_exists(#payg) AND (attribute_not_exists(#payg.#suspended) OR #payg.#suspended.#reason <> :dispute)',
+        names: { '#payg': 'paygOverage', '#suspended': 'suspended', '#reason': 'reason' },
+        values: { ':dispute': 'dispute' },
+      },
     });
-  } catch (error: any) {
-    // Already suspended (or no PAYG record at all): nothing to add.
-    if (error?.code !== 'ConditionalCheckFailedException') throw error;
+  } catch (error: unknown) {
+    // Suspended for a dispute already (or no PAYG record at all): nothing to add.
+    if (!isConditionalFailure(error)) throw error;
   }
 }

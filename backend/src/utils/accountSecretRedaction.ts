@@ -82,12 +82,12 @@ export const sanitizeUserForResponse = (
     stripeConnectRefreshToken,
     connected_accounts,
     paygOverage,
-    // ENG-668 PR-2: settlement records carry provider cost and markup; the closed-month ledger is
-    // settlement input. No customer surface reads either.
-    paygSettlements,
-    llmUsageCreditsClosed,
     ...safe
   } = user;
+  // ENG-668 PR-2: settlement records carry provider cost and markup; the closed-month ledger is
+  // settlement input. No customer surface reads either.
+  delete safe.paygSettlements;
+  delete safe.llmUsageCreditsClosed;
   return {
     ...safe,
     connected_accounts: redactAccountsSecrets(connected_accounts),

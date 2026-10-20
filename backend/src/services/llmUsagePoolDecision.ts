@@ -272,8 +272,8 @@ async function recordPaygAdmission(input: {
         ? { expression: 'attribute_exists(#payg) AND #payg.#admitted = :expected', names, values: { ':expected': stored } }
         : { expression: 'attribute_exists(#payg) AND attribute_not_exists(#payg.#admitted)', names },
     });
-  } catch (error: any) {
-    if (error?.code === 'ConditionalCheckFailedException') return;
-    console.error(`[paygOverage] Failed to record the PAYG admission for ${input.billingUserId}:`, error?.message || error);
+  } catch (error: unknown) {
+    if ((error as { code?: unknown } | null)?.code === 'ConditionalCheckFailedException') return;
+    console.error(`[paygOverage] Failed to record the PAYG admission for ${input.billingUserId}:`, error instanceof Error ? error.message : error);
   }
 }
