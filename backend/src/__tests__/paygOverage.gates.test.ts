@@ -564,3 +564,82 @@ describe('ENG-668 PAYG — the pool high-water mark is kept while PAYG is off', 
     expect(mockUpdateUser).not.toHaveBeenCalled();
   });
 });
+
+describe('ENG-668 PAYG — a refunded top-up does not stay in the pool high-water mark', () => {
+  function stored(row: any) {
+    mockGetUserById.mockImplementation(async () => row);
+    mockGetUserByIdConsistent.mockImplementation(async () => row);
+    mockUpdateUser.mockImplementation(async (_id: string, _fields: unknown, options: any) => {
+      for (const { path, value } of options?.pathSets ?? []) row[path[0]] = { ...row[path[0]], [path[1]]: value };
+      return row;
+    });
+    return row;
+  }
+  const credits = (grants: Array<{ id: string; amountUsd: number }>, reversals: Array<{ grantId: string; amountUsd: number }> = []) => ({
+    month: getCurrentMonth(),
+    totalPurchasedMicroUsd: grants.reduce((sum, g) => sum + g.amountUsd * USD, 0),
+    totalPurchasedReversedMicroUsd: reversals.reduce((sum, r) => sum + r.amountUsd * USD, 0),
+    totalMigrationOffsetMicroUsd: 0,
+    grantIds: grants.map((g) => g.id),
+    grants: grants.map((g) => ({ id: g.id, source: 'purchase', amountMicroUsd: g.amountUsd * USD, grantedAt: '2026-10-02T00:00:00.000Z' })),
+    reversalIds: reversals.map((_, i) => `re_${i}`),
+    reversals: reversals.map((r, i) => ({ id: `re_${i}`, grantId: r.grantId, amountMicroUsd: r.amountUsd * USD, reversedAt: '2026-10-05T00:00:00.000Z' })),
+  });
+
+  it('buy $50 (pool $150), refund it: overage is measured from $100 again, not from $150', async () => {
+    setup({ spendUsd: 90 });
+    const month = getCurrentUsageMonth();
+    const row = stored({
+      userId: OWNER, email: 'owner@example.com', subscription_status: 'active', has_payment_method: true,
+      llmUsageCredits: credits([{ id: 'stripe:cs_1', amountUsd: 50 }]),
+      paygOverage: payg({ capPercentOfPool: 50, poolHighWater: undefined }),
+    });
+
+    // While the top-up is live the pool is $150, but the mark records only the $100 a refund cannot take.
+    await checkTokenUsage(OWNER);
+    expect(row.paygOverage.poolHighWater).toEqual({ month, thresholdMicroUsd: 100 * USD });
+
+    // Refunded: $140 spent is $40 over the $100 pool = 80% of the 50% cap ($50).
+    row.llmUsageCredits = credits([{ id: 'stripe:cs_1', amountUsd: 50 }], [{ grantId: 'stripe:cs_1', amountUsd: 50 }]);
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 140 * USD });
+    const status = await checkTokenUsage(OWNER);
+    expect(status.allowed).toBe(true);
+    expect(status.overage).toEqual({ active: true, percentOfCap: 80 });
+  });
+
+  it('while the top-up is live it still extends the pool', async () => {
+    setup({ spendUsd: 140 });
+    stored({
+      userId: OWNER, email: 'owner@example.com', subscription_status: 'active', has_payment_method: true,
+      llmUsageCredits: credits([{ id: 'stripe:cs_1', amountUsd: 50 }]),
+      paygOverage: payg({ capPercentOfPool: 50, poolHighWater: undefined }),
+    });
+    const status = await checkTokenUsage(OWNER);
+    // $140 is inside the live $150 pool: not even past it.
+    expect(status.allowed).toBe(true);
+    expect(status).not.toHaveProperty('overage');
+  });
+
+  it('seat credit stays in the mark, so a later downgrade still cannot create retroactive overage', async () => {
+    setup({ spendUsd: 60 });
+    const month = getCurrentUsageMonth();
+    const row = stored({
+      userId: OWNER, email: 'owner@example.com', subscription_status: 'active', has_payment_method: true,
+      llmUsageCredits: credits([{ id: `seat-credit:org-1:${month}`, amountUsd: 20 }]),
+      paygOverage: payg({ capPercentOfPool: 50, poolHighWater: undefined }),
+    });
+    await checkTokenUsage(OWNER);
+    expect(row.paygOverage.poolHighWater).toEqual({ month, thresholdMicroUsd: 120 * USD });
+
+    // Downgrade to a $50 tier (+$20 seat = $70 pool); $110 spent is still inside the month's $120.
+    mockTierConfig.mockResolvedValue({
+      name: 'Pro', allowedPages: [], allowedSkills: [], paygOverage: { allowed: true, markupBps: 25_000 },
+      llmUsagePolicy: { ...policy, optimizationCostThresholdMicroUsd: 25 * USD, hardCostThresholdMicroUsd: 50 * USD },
+    });
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 110 * USD });
+    const { status, decision } = await bothGates();
+    expect(status.allowed).toBe(true);
+    expect(status.overage).toEqual({ active: false, percentOfCap: 0 });
+    expect(decision.effectiveModel).toBe(CHOSEN_MODEL);
+  });
+});

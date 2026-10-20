@@ -331,6 +331,20 @@ describe('PUT /api/subscription/payg', () => {
     expect(options.condition.values).toMatchObject({ ':hwMonth': getCurrentUsageMonth(), ':hwThreshold': 100 * USD });
   });
 
+  it('opting in with a live top-up pins the high-water mark without it (a refund must be able to take it back)', async () => {
+    users[OWNER].llmUsageCredits = {
+      month: require('../../services/tokenUsageService').getCurrentMonth(),
+      totalPurchasedMicroUsd: 50 * USD, totalPurchasedReversedMicroUsd: 0, totalMigrationOffsetMicroUsd: 0,
+      grantIds: ['stripe:cs_1'],
+      grants: [{ id: 'stripe:cs_1', source: 'purchase', amountMicroUsd: 50 * USD, grantedAt: '2026-10-02T00:00:00.000Z' }],
+    };
+    await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(200);
+    const written = users[OWNER].paygOverage;
+    // The opt-in pool includes the live top-up; the mark does not.
+    expect(written.optIn).toMatchObject({ poolAtOptInMicroUsd: 150 * USD });
+    expect(written.poolHighWater).toEqual({ month: getCurrentUsageMonth(), thresholdMicroUsd: 100 * USD });
+  });
+
   it('opting in while already past the pool records the standing overage, so it reads 0% right after', async () => {
     // $250 spent on a $100 pool (a downgrade from a bigger pool earlier this month, before opting in).
     mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 250 * USD });
