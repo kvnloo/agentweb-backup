@@ -3,6 +3,7 @@ import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb, orgDb, Organization } from "../services/db";
 import { defaultShareSettings } from "../services/orgShareService";
 import { callerCan, can, roleOf, isBillingRoot } from "../services/orgAuthz";
+import { deleteAccountById, PlatformType } from "../services/connectedAccountsDb";
 import { v4 as uuidv4 } from "uuid";
 import crypto from "crypto";
 import { isCompanyEmail } from "../utils/validation";
@@ -1391,6 +1392,55 @@ router.patch("/connected-accounts/:platform/:accountId/share", async (req: Reque
     });
   } catch (error) {
     console.error("Error toggling connected account org sharing:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ENG-2595: org owners/admins disconnect a *member's* connected account.
+// The personal DELETE /api/oauth/connected-accounts/:platform/:accountId only
+// touches the caller's own record, so an owner looking at a teammate's broken
+// account (e.g. Meta "Ads permission missing") had no way to remove it.
+// Scope: org-managers only, target must belong to a member of the caller's own
+// org, and the caller's own accounts keep using the personal route.
+// Platforms with remote-side cleanup (Calendly webhooks, Unipile sessions) are
+// refused here — that cleanup needs the owner's own credentials/context.
+const MEMBER_DISCONNECT_UNSUPPORTED_PLATFORMS = new Set(["calendly", "unipile"]);
+
+router.delete("/connected-accounts/:platform/:accountId", async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Not authenticated" });
+
+    const user = await userDb.getUserById(userId);
+    if (!user?.orgId) {
+      return res.status(403).json({ error: "You are not a member of any organization" });
+    }
+    const org = await orgDb.getOrgById(user.orgId);
+    if (!org) return res.status(404).json({ error: "Organization not found" });
+
+    if (!canManageOrgAccounts(user, org)) {
+      return res.status(403).json({ error: "Only the org owner can disconnect another member's connected account" });
+    }
+
+    const { platform, accountId } = req.params;
+    if (MEMBER_DISCONNECT_UNSUPPORTED_PLATFORMS.has(platform)) {
+      return res.status(409).json({ error: `Ask the member who connected this ${platform} account to disconnect it` });
+    }
+
+    const members = await orgDb.getOrgMembers(user.orgId);
+    const owner = members.find(
+      (m: any) => m.userId !== userId && m.orgId === user.orgId &&
+        (m.connected_accounts || []).some((a: any) => a.platform === platform && a.account_id === accountId)
+    );
+    if (!owner) {
+      return res.status(404).json({ error: "Connected account not found" });
+    }
+
+    await deleteAccountById(owner.userId, platform as PlatformType, accountId);
+    console.log(`[org] ENG-2595 member account disconnect: actor=${userId} org=${user.orgId} member=${owner.userId} platform=${platform} account=${accountId}`);
+    return res.json({ success: true, ownerUserId: owner.userId });
+  } catch (error) {
+    console.error("Error disconnecting member connected account:", error);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
