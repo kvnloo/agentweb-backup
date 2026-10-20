@@ -136,7 +136,10 @@ emmaToolRegistry.register({
       providerRevoked = false;
       providerError = err?.message || String(err);
     }
-    await deleteAccountById(userId, PLATFORM as any, accountId);
+    // Keep the local record when provider revocation fails so a retry can find it.
+    if (providerRevoked) {
+      await deleteAccountById(userId, PLATFORM as any, accountId);
+    }
 
     const after = await linkedInAccounts(userId);
     const stillConnected = after.some((a: any) => a.account_id === accountId);
@@ -151,7 +154,7 @@ emmaToolRegistry.register({
         `provider=${providerRevoked ? 'revoked' : 'failed'} cancelled=${cancelled.length} notCancelled=${notCancelled.length}`,
     );
     return {
-      revoked: !stillConnected,
+      revoked: providerRevoked && !stillConnected,
       accountId,
       providerRevoked,
       ...(providerError && { providerError }),

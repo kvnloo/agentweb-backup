@@ -63,6 +63,9 @@ describe('ENG-1153 LinkedIn revoke tools', () => {
     expect(r.notCancelled).toEqual([{ scheduleId: 's1', error: 'ddb down' }]);
     expect(r.providerRevoked).toBe(false);
     expect(r.providerError).toBe('unipile 500');
+    expect(r.revoked).toBe(false);
+    expect(deleteAccountById).not.toHaveBeenCalled();
+    expect(r.removedFromAgentWeb).toBe(false);
   });
 
   it('cannot touch an account not connected to the caller (cross-tenant)', async () => {
