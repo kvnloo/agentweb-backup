@@ -95,7 +95,7 @@ describe('twiml builders', () => {
     expect(root.children.map((c) => c.name)).toEqual(['Say', 'Dial']);
     expect(root.children[0].text).toBe(CONNECTING_COPY);
     const dial = root.children[1];
-    expect(dial.attrs).toEqual({ callerId: '+15555550111', timeout: '25', action: URLS.dialUrl, method: 'POST' });
+    expect(dial.attrs).toEqual({ callerId: '+15555550111', timeout: '25', timeLimit: '1800', action: URLS.dialUrl, method: 'POST' });
     expect(dial.children).toHaveLength(1);
     const number = dial.children[0];
     expect(number.name).toBe('Number');

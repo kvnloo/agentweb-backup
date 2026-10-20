@@ -19,6 +19,8 @@ const ownerPromptCopy = (announcedName: string): string => `New lead from ${anno
 const GATHER_TIMEOUT_SECONDS = 8;
 /** Ring time for the lead; Twilio may add a few seconds of buffer. */
 const LEAD_DIAL_TIMEOUT_SECONDS = 25;
+/** Maximum length of the bridged call, in seconds (Twilio <Dial timeLimit>; its default is 4 hours). */
+export const BRIDGED_CALL_TIME_LIMIT_SECONDS = 1800;
 
 const E164 = /^\+[1-9]\d{6,14}$/;
 // XML 1.0 forbids most control characters even when escaped; drop them rather than emit a document Twilio rejects.
@@ -63,7 +65,7 @@ export function connectTwiml(p: { twilioNumber: string; leadE164: string; dialUr
     `${requireE164(p.leadE164, 'lead number')}</Number>`;
   return response(
     say(CONNECTING_COPY),
-    `<Dial callerId="${requireE164(p.twilioNumber, 'caller id')}" timeout="${LEAD_DIAL_TIMEOUT_SECONDS}" action="${escapeXml(p.dialUrl)}" method="POST">${number}</Dial>`,
+    `<Dial callerId="${requireE164(p.twilioNumber, 'caller id')}" timeout="${LEAD_DIAL_TIMEOUT_SECONDS}" timeLimit="${BRIDGED_CALL_TIME_LIMIT_SECONDS}" action="${escapeXml(p.dialUrl)}" method="POST">${number}</Dial>`,
   );
 }
 
