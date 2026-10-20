@@ -27,6 +27,7 @@ import {
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import type { ChatMessage } from '../chatbotService';
 import { classifyToolErrorClass } from '../../utils/toolErrorClassifier';
+import type { UsageBlockPaygInput } from '../../utils/usageBlockCopy';
 import {
   MAX_ALTERNATIVE_LATENCY_MS,
   MAX_COMPARE_ALTERNATIVES,
@@ -152,6 +153,8 @@ export interface CompareModelDecision {
 export interface CompareUsageStatus {
   allowed: boolean;
   month?: string | null;
+  /** ENG-668: set when the block is pay-as-you-go's own (cap reached / suspended / not covered). */
+  paygBlock?: UsageBlockPaygInput;
 }
 
 export interface CompareDeps {
@@ -159,10 +162,15 @@ export interface CompareDeps {
   isFeatureEnabled(): Promise<boolean>;
   /** Plan add-on gate (see modelCompareEntitlement). Omitted = not gated. */
   isEntitled?(user: CompareUser): Promise<boolean>;
+  /**
+   * ENG-669 (D3): the SESSION OWNER's tier runs fewer than two models, so no comparison is possible. Null = not
+   * blocked (also while the tier allowlist is off). Omitted = not gated.
+   */
+  getTierCompareBlock?(ownerUserId: string): Promise<{ tier: string | null; upgradeRequired: string[] } | null>;
   getSession(sessionId: string): Promise<CompareSession | null>;
   checkUsage(userId: string): Promise<CompareUsageStatus>;
   /** Builds the 429 body fields shared with /generate (message + structured usageBlock). */
-  buildUsageBlock(month: string | null | undefined): { message: string };
+  buildUsageBlock(month: string | null | undefined, paygBlock?: UsageBlockPaygInput): { message: string };
   normalizeModelId(model: string): string;
   resolveModel(input: { userId: string; requestedModel: string }): Promise<CompareModelDecision>;
   getModelInfo(model: string): CompareModelInfo | null;
@@ -228,6 +236,16 @@ function fail(status: number, error: string, code: string, extra: Record<string,
 /** The plan does not include Compare models. Neutral wording; checked before any session read, lock or model call. */
 function notEntitledOutcome(): ServiceOutcome {
   return fail(403, 'Compare models is not available on your current plan.', 'model_compare_not_entitled');
+}
+
+/** ENG-669 (D3): the owner's plan runs fewer than two models. Checked before any usage read, lock or model call. */
+function tierCompareBlockedOutcome(block: { tier: string | null; upgradeRequired: string[] }): ServiceOutcome {
+  return fail(
+    403,
+    'Comparing models needs at least two models, and your current plan includes fewer. Upgrade your plan to compare models.',
+    'compare_not_available_for_tier',
+    { tier: block.tier, upgradeRequired: block.upgradeRequired },
+  );
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -606,6 +624,10 @@ export async function compareModels(
     return fail(403, 'Unauthorized access to session', 'forbidden');
   }
 
+  // ENG-669 (D3): judged for the SESSION OWNER, like every column below, before any spend.
+  const tierBlock = deps.getTierCompareBlock ? await deps.getTierCompareBlock(session.userId) : null;
+  if (tierBlock) return tierCompareBlockedOutcome(tierBlock);
+
   // Before any usage check or spend: a session that select would refuse is refused here.
   const notStarted = sessionNotStartedOutcome(session.messages);
   if (notStarted) return notStarted;
@@ -728,7 +750,7 @@ function safeClass(error: unknown): string {
 }
 
 function usagePausedOutcome(deps: CompareDeps, usage: CompareUsageStatus): ServiceOutcome {
-  const block = deps.buildUsageBlock(usage.month);
+  const block = deps.buildUsageBlock(usage.month, usage.paygBlock);
   return {
     status: 429,
     // Same shape as /generate's non-policy 429 (agentModeController generateResponse).
@@ -750,8 +772,9 @@ async function classifyCandidate(
   if (!info) return { ...candidate, rejection: 'model_unavailable' };
   if (info.isLive) return { ...candidate, rejection: 'model_live_unsupported' };
   // Compare has NO role logic: every user and admin may compare any model they can select. Who can
-  // select what is decided in one place only (the registry + usage-policy resolver below), never by
-  // the model's name (a name-based "opus" deny was ruled stale in ENG-2028) and never here.
+  // select what is decided in one place only (the registry + usage-policy resolver below, which also
+  // applies the owner's tier allowlist, ENG-669), never by the model's name (a name-based "opus" deny
+  // was ruled stale in ENG-2028) and never here.
   if (info.internalOnly) return { ...candidate, rejection: 'model_unavailable' };
 
   let decision: CompareModelDecision;

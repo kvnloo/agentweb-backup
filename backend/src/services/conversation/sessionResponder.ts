@@ -17,6 +17,7 @@
  */
 
 import type { ConversationChannelAdapter, ConversationRef, InboundAttachment } from './channelPort';
+import { isModelUnavailableError, type ModelUnavailableError } from '../agentMode/modelUnavailable';
 
 export interface SessionResponseParams {
   session: any;
@@ -77,14 +78,17 @@ export async function handleSessionResponse(
   // Everything from here on lives inside the try: the caller may have claimed a
   // transport-side progress indicator before calling us, so an import, model-resolution
   // or attachment failure must surface as a reply rather than escaping and leaking it.
+  // ENG-669: kept from the import below so the error path can word a model refusal without re-importing.
+  let describeModelRefusal: ((error: ModelUnavailableError) => string) | undefined;
   try {
-    const { generateSessionResponse } = await import('../../controllers/agentModeController');
+    const { generateSessionResponse, modelUnavailableBody } = await import('../../controllers/agentModeController');
+    describeModelRefusal = (error) => modelUnavailableBody(error).error;
     const { agentModeService } = await import('../agentModeService');
     const { cronJobRegistry } = await import('../../utils/cronJobRegistry');
 
     const llmModel = session.llmModel || await agentModeService.getDefaultModel();
     if (!session.llmModel) {
-      await chatbotDb.updateSessionLlmModel(session.sessionId, llmModel);
+      await chatbotDb.updateSessionLlmModel(session.sessionId, llmModel, undefined, 'system');
     }
 
     // Download and persist any files attached to the inbound message
@@ -132,8 +136,10 @@ export async function handleSessionResponse(
     // this reply usually fails too. Unguarded, the rejection escaped and skipped the
     // persistence below, so iShare viewers saw an orphaned user message — and the
     // "never throws" contract above would have been a lie for every future transport.
+    // ENG-669: the session's model is outside the owner's plan: say so (nothing ran on another model).
+    const modelRefusal = isModelUnavailableError(genError) && describeModelRefusal ? describeModelRefusal(genError) : undefined;
     try {
-      await adapter.postReply(ref, 'Sorry, I encountered an error while processing your request. Please try again.');
+      await adapter.postReply(ref, modelRefusal ?? 'Sorry, I encountered an error while processing your request. Please try again.');
     } catch (replyError) {
       console.error('❌ Failed to post the error reply:', replyError);
     }
@@ -142,7 +148,7 @@ export async function handleSessionResponse(
     try {
       await chatbotDb.addMessageToSession(session.sessionId, {
         role: 'assistant',
-        content: 'Sorry, I encountered an error processing your request. Please try again.',
+        content: modelRefusal ?? 'Sorry, I encountered an error processing your request. Please try again.',
         timestamp: new Date().toISOString(),
         metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
       });

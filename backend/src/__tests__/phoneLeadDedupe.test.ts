@@ -66,6 +66,13 @@ describe('fillBlankCustomFields', () => {
   it('an incoming blank never blanks or adds noise over a stored value', () => {
     expect(fillBlankCustomFields({ a: '1' }, { a: '' })).toEqual({ a: '1' });
   });
+  it('a blank incoming value for an ABSENT key adds nothing (a blank is not a change)', () => {
+    expect(fillBlankCustomFields({ a: '1' }, { opt: '', n: null, u: undefined, w: '   ' })).toEqual({ a: '1' });
+    expect(fillBlankCustomFields({}, { opt: '' })).toEqual({});
+  });
+  it('0 and false are real values and still fill an absent key', () => {
+    expect(fillBlankCustomFields({}, { n: 0, f: false })).toEqual({ n: 0, f: false });
+  });
   it('handles missing maps', () => {
     expect(fillBlankCustomFields(undefined, { a: '1' })).toEqual({ a: '1' });
     expect(fillBlankCustomFields({ a: '1' }, undefined)).toEqual({ a: '1' });

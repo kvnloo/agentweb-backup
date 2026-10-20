@@ -549,7 +549,7 @@ describe('AgentModeController - ishare Model Selection', () => {
           effectiveModel: 'gemini-3-pro-preview',
           modelSelection: 'honored',
           modelSelectionReason: 'requested_model_allowed',
-        }),
+        }), 'user',
       );
     });
 
