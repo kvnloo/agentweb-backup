@@ -883,6 +883,29 @@ export function repairEvaluateFunctionArg(
   return 'function:wrap_expression';
 }
 
+// ENG-2581: GAQL has no `quality_info.ad_relevance`; Google's ad-relevance
+// component is `quality_info.creative_quality_score`. Models keep emitting the
+// former despite tool-description guidance, so rewrite it (or drop it when the
+// real field is already selected).
+const GAQL_AD_RELEVANCE_RE = /\b((?:ad_group_criterion\.)?quality_info\.)ad_relevance\b/g;
+
+export function repairGaqlAdRelevance(
+  toolName: string,
+  args: Record<string, unknown>,
+): string | null {
+  if (toolName !== 'call_google_ads_reporting_api') return null;
+  const query = args.query;
+  if (typeof query !== 'string' || !/quality_info\.ad_relevance\b/.test(query)) return null;
+  if (/quality_info\.creative_quality_score\b/.test(query)) {
+    args.query = query
+      .replace(/,\s*(?:ad_group_criterion\.)?quality_info\.ad_relevance\b/g, '')
+      .replace(/(?:ad_group_criterion\.)?quality_info\.ad_relevance\b\s*,\s*/g, '');
+  } else {
+    args.query = query.replace(GAQL_AD_RELEVANCE_RE, '$1creative_quality_score');
+  }
+  return 'query:gaql_ad_relevance';
+}
+
 export function validateAndRepairToolArgs(
   input: AgentToolContractValidationInput,
 ): AgentToolContractValidationResult {
@@ -911,6 +934,8 @@ export function validateAndRepairToolArgs(
       const evalArgs: Record<string, unknown> = { ...(input.args as Record<string, unknown>) };
       const evalRepair = repairEvaluateFunctionArg(input.toolName, evalArgs);
       if (evalRepair) return { status: 'repaired', args: evalArgs, issues, repairs: [evalRepair] };
+      const gaqlRepair = repairGaqlAdRelevance(input.toolName, evalArgs);
+      if (gaqlRepair) return { status: 'repaired', args: evalArgs, issues, repairs: [gaqlRepair] };
     }
     return { status: 'valid', args: input.args, issues, repairs };
   }
@@ -1055,6 +1080,8 @@ export function validateAndRepairToolArgs(
 
   const evaluateRepair = repairEvaluateFunctionArg(input.toolName, repairedArgs);
   if (evaluateRepair) repairs.push(evaluateRepair);
+  const gaqlAdRelevanceRepair = repairGaqlAdRelevance(input.toolName, repairedArgs);
+  if (gaqlAdRelevanceRepair) repairs.push(gaqlAdRelevanceRepair);
 
   for (const name of required) {
     if (isMissingRequiredValue(repairedArgs[name], properties[name])) {
