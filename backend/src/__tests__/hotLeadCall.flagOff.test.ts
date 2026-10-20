@@ -34,9 +34,9 @@ import * as queue from '../services/asyncJobQueue';
 import { dispatchLeadCreated, dispatchLeadsCreated } from '../services/orgLeadNotificationService';
 import { setHotLeadCallEnabledOverride } from '../services/voice/hotLeadCallMode';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
-import { FakeVoiceProvider } from '../services/voice/fakeVoiceProvider';
+import { FakeVoiceProvider } from './helpers/fakeVoiceProvider';
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
-import { FakeLimitStore } from '../services/voice/fakeLimitStore';
+import { FakeLimitStore } from './helpers/fakeLimitStore';
 import { setLimitStoreForTests } from '../services/voice/limitStore';
 import { teamMember } from './helpers/hotLeadCallFixtures';
 

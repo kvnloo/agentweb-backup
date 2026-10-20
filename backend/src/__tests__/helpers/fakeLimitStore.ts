@@ -1,4 +1,4 @@
-import type { LimitStore } from './limitStore';
+import type { LimitStore } from '../../services/voice/limitStore';
 
 /**
  * In-memory LimitStore with the same semantics as the DynamoDB one. Each method is synchronous inside

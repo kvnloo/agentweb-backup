@@ -14,7 +14,7 @@ import '../emma/hotLeadCallTools';
 import '../emma/hotLeadCallSetupTools';
 import { teamMember, MEMBER_ID, VERIFIED_AT } from './helpers/hotLeadCallFixtures';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
-import { FakeVoiceProvider } from '../services/voice/fakeVoiceProvider';
+import { FakeVoiceProvider } from './helpers/fakeVoiceProvider';
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
 import { getRecordingUnit } from '../utils/vendorRateCard';
 import { SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS } from '../services/agentMode/core/toolDispatch';

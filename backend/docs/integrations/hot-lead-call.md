@@ -113,9 +113,9 @@ All paths are under `backend/src/`.
 | Org/list/owner routing for the call | `services/voice/hotLeadCallContext.ts` |
 | Global kill switch | `services/voice/hotLeadCallMode.ts` |
 | Plan entitlement (the `hot_lead_call` subscription feature) | `services/voice/hotLeadCallEntitlement.ts` |
-| Abuse limits, per-member cooldown, slot reservation | `services/voice/hotLeadCallLimits.ts`, `services/voice/limitStore.ts` (DynamoDB), `services/voice/fakeLimitStore.ts` (tests) |
-| Call record (state machine storage) and timeline events | `services/voice/leadCallStore.ts`, `services/voice/leadCallStore.types.ts` |
-| Twilio seam (`placeCall`, `buyNumber`, `releaseNumber`, `validateSignature`) | `services/voice/voiceProvider.ts` (the only file that imports `twilio`), `services/voice/fakeVoiceProvider.ts` |
+| Abuse limits, per-member cooldown, slot reservation | `services/voice/hotLeadCallLimits.ts`, `services/voice/limitStore.ts` (DynamoDB), `__tests__/helpers/fakeLimitStore.ts` (tests) |
+| Call record (state machine storage) and timeline events | `services/voice/leadCallStore.ts`, `services/voice/leadCallStore.types.ts`, `__tests__/helpers/fakeLeadCallStore.ts` (tests) |
+| Twilio seam (`placeCall`, `buyNumber`, `releaseNumber`, `validateSignature`) | `services/voice/voiceProvider.ts` (the only file that imports `twilio`), `__tests__/helpers/fakeVoiceProvider.ts` (tests) |
 | Webhook URLs | `services/voice/voiceUrls.ts` |
 | TwiML builders (hand-built XML, XML-escaped) | `services/voice/twiml.ts` |
 | Webhook routes, mounted at `/api/webhooks/twilio-voice` | `routes/twilioVoiceWebhook.ts` (`/owner`, `/gather`, `/dial`, `/status`; the path names are kept from the first version, `/owner` now serves the prompt to the team member being rung) |

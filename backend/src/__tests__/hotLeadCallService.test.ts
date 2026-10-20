@@ -26,13 +26,13 @@ import * as queue from '../services/asyncJobQueue';
 import { getSubscriptionTypeConfig, getUserSubscriptionResolution } from '../services/subscriptionService';
 import { dispatchHotLeadCall, processHotLeadCallJob, registerHotLeadCallProcessor, setSameLeadRecheckDelayForTests } from '../services/hotLeadCallService';
 import { setHotLeadCallEnabledOverride } from '../services/voice/hotLeadCallMode';
-import { FakeVoiceProvider } from '../services/voice/fakeVoiceProvider';
+import { FakeVoiceProvider } from './helpers/fakeVoiceProvider';
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
 import { setLeadCallStoreForTests } from '../services/voice/leadCallStore';
-import { FakeLimitStore } from '../services/voice/fakeLimitStore';
+import { FakeLimitStore } from './helpers/fakeLimitStore';
 import { setLimitStoreForTests } from '../services/voice/limitStore';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
-import { FakeLeadCallStore } from '../services/voice/fakeLeadCallStore';
+import { FakeLeadCallStore } from './helpers/fakeLeadCallStore';
 import { teamMember, MEMBER_ID } from './helpers/hotLeadCallFixtures';
 
 const mock = (fn: unknown) => fn as jest.Mock;

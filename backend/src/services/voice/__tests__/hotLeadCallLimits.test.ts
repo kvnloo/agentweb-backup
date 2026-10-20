@@ -1,4 +1,4 @@
-import { FakeLimitStore } from '../fakeLimitStore';
+import { FakeLimitStore } from '../../../__tests__/helpers/fakeLimitStore';
 import { setLimitStoreForTests } from '../limitStore';
 import { cooldownKey, dailyCapKey, hourlyCapKey, isWithinCallWindow, phoneMarkerKey, reserveCallSlot } from '../hotLeadCallLimits';
 import type { HotLeadCallConfig } from '../../hotLeadCallConfig';

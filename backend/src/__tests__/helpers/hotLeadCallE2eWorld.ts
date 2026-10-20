@@ -18,7 +18,7 @@ import { setHotLeadCallEnabledOverride } from '../../services/voice/hotLeadCallM
 import { setHotLeadCallEntitledOverride } from '../../services/voice/hotLeadCallEntitlement';
 import { setVoiceProviderForTests, type PlaceCallParams } from '../../services/voice/voiceProvider';
 import { setLeadCallStoreForTests } from '../../services/voice/leadCallStore';
-import { FakeLimitStore } from '../../services/voice/fakeLimitStore';
+import { FakeLimitStore } from './fakeLimitStore';
 import { setLimitStoreForTests } from '../../services/voice/limitStore';
 import { FakeCrm, crmHolder } from './hotLeadCallFakeCrm';
 import { SignedFakeVoiceProvider, TwilioCaller, attrOf } from './hotLeadCallTwilioSim';

@@ -1,4 +1,4 @@
-import { VoiceCallError, type BuyNumberParams, type PlaceCallParams, type ValidateSignatureParams, type VoiceProvider } from './voiceProvider';
+import { VoiceCallError, type BuyNumberParams, type PlaceCallParams, type ValidateSignatureParams, type VoiceProvider } from '../../services/voice/voiceProvider';
 
 /**
  * Recording VoiceProvider for tests: no network, deterministic sids (CA00000001, ...), and

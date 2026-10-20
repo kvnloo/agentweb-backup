@@ -1,4 +1,4 @@
-import type { HotLeadCallEventType, HotLeadCallRecord, HotLeadCallState, LeadCallStore } from './leadCallStore.types';
+import type { HotLeadCallEventType, HotLeadCallRecord, HotLeadCallState, LeadCallStore } from '../../services/voice/leadCallStore.types';
 
 const TERMINAL: HotLeadCallState[] = ['finished', 'failed', 'skipped'];
 const SCALAR_FIELDS = ['state', 'jobKey', 'startedAt', 'updatedAt', 'memberCallSid', 'leadCallSid', 'outcome', 'attemptNo', 'memberId'] as const;

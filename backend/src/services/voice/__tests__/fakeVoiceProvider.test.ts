@@ -1,4 +1,4 @@
-import { FakeVoiceProvider } from '../fakeVoiceProvider';
+import { FakeVoiceProvider } from '../../../__tests__/helpers/fakeVoiceProvider';
 import { getVoiceProvider, setVoiceProviderForTests, VoiceCallError } from '../voiceProvider';
 
 const p = { to: '+15555550100', from: '+15555550199', url: 'https://x/o', statusCallbackUrl: 'https://x/s', timeoutSeconds: 20 };

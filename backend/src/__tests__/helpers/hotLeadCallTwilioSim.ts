@@ -7,7 +7,7 @@
 import express from 'express';
 import request from 'supertest';
 import { getExpectedTwilioSignature, validateRequest } from 'twilio';
-import { FakeVoiceProvider } from '../../services/voice/fakeVoiceProvider';
+import { FakeVoiceProvider } from './fakeVoiceProvider';
 import type { ValidateSignatureParams } from '../../services/voice/voiceProvider';
 import twilioVoiceWebhookRoutes, { twilioVoiceBodyParser } from '../../routes/twilioVoiceWebhook';
 
