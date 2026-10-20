@@ -85,11 +85,24 @@ export function createWorkPlanStepModelsSwitch(deps: WorkPlanStepModelsSwitchDep
   return { isEnabled, getState, shouldHonor };
 }
 
-type StepLike = { stepCount?: unknown; title?: unknown; model?: unknown; status?: unknown };
+type StepLike = { stepCount?: unknown; title?: unknown; model?: unknown; modelSource?: unknown; status?: unknown };
 
 /** A step's explicit model, or undefined when it has none (absent, blank or not a string). */
 export function stepModelOf(step: StepLike | null | undefined): string | undefined {
   return typeof step?.model === 'string' && step.model.trim() ? step.model.trim() : undefined;
+}
+
+/**
+ * ENG-669: a step's model WITH who chose it (`modelSource`), as one unit. Anything that moves or copies a step model
+ * (modify, reorder, carry-over) moves this pair, never the model alone, so provenance always describes its own model.
+ */
+export type StepModelBinding = { model: string; modelSource?: 'system' | 'user' };
+
+export function stepModelBindingOf(step: StepLike | null | undefined): StepModelBinding | undefined {
+  const model = stepModelOf(step);
+  if (!model) return undefined;
+  const source = step?.modelSource;
+  return source === 'system' || source === 'user' ? { model, modelSource: source } : { model };
 }
 
 /**
@@ -217,6 +230,8 @@ export function carryStoredStepModels<T extends StepLike>(
   return incoming.map((step, i) => {
     if (!allow(i) || stepModelOf(step) || (step as StepLike)?.model === '') return step;
     const j = matchOf.get(i);
+    // A TEMPLATE write: only the model is carried. A template records no per-step provenance (its author is stamped on
+    // each binding at launch), so a session's 'system' stamp saved into a user's template can never become exempt.
     const model = j === undefined ? undefined : stepModelOf(storedSteps[j]);
     return model ? { ...step, model } : step;
   });
@@ -231,13 +246,13 @@ export function modelBoundToStep(
   originals: ReadonlyArray<StepLike>,
   stepCount: number,
   title: unknown,
-): string | undefined {
+): StepModelBinding | undefined {
   const t = normTitle(title);
   if (!t) return undefined;
   const slot = originals.find((s) => Number(s?.stepCount) === stepCount);
-  if (slot && normTitle(slot.title) === t) return stepModelOf(slot);
+  if (slot && normTitle(slot.title) === t) return stepModelBindingOf(slot);
   const hits = originals.filter((s) => normTitle(s?.title) === t);
-  return hits.length === 1 ? stepModelOf(hits[0]) : undefined;
+  return hits.length === 1 ? stepModelBindingOf(hits[0]) : undefined;
 }
 
 /**
@@ -247,11 +262,14 @@ export function modelBoundToStep(
  * `model_unavailable` 422 body is returned, extended with the offending `stepCount`.
  *
  * `storedSteps` omitted (create, or the plan's launcher scope widened) = every model is validated as new.
+ * ENG-669: `tierOwnerUserId` = the plan owner whose tier must include a new/changed step model (omitted for an
+ * admin-authored plan).
  */
 export async function checkPlanStepModelsWrite(
   isAdmin: () => Promise<boolean>,
   steps: ReadonlyArray<StepLike>,
   storedSteps?: ReadonlyArray<StepLike>,
+  tierOwnerUserId?: string,
 ): Promise<{ ok: true } | { ok: false; body: ModelUnavailableBody & { stepCount: number } }> {
   const stored = storedSteps ? [...storedSteps] : [];
   const claimed = new Set<StepLike>();
@@ -274,7 +292,7 @@ export async function checkPlanStepModelsWrite(
   for (let i = 0; i < steps.length; i++) {
     const model = stepModelOf(steps[i]);
     if (!model) continue;
-    const check = await checkPlanDefaultModelWrite(isAdmin, model, stepModelOf(counterpartOf.get(i)));
+    const check = await checkPlanDefaultModelWrite(isAdmin, model, stepModelOf(counterpartOf.get(i)), tierOwnerUserId);
     if (!check.ok) return { ok: false, body: { ...check.body, stepCount: stepNumber(steps[i], i) } };
   }
   return { ok: true };
@@ -314,11 +332,13 @@ export class StepModelUnavailableError extends Error {
  * Launch-time validation of ALL steps' models, up front and before any state is written. Each model must be served
  * and selectable by the LAUNCHING user (resolvePlanLaunchModel: no silent swap). Returns the canonical id per step
  * (keyed by index) so a launch stores canonical ids; throws StepModelUnavailableError for the first bad step.
+ * ENG-669: `tierOwnerUserId` = the launching user, for a plan that is NOT admin-authored.
  */
 export async function resolvePlanStepModelsForLaunch(
   registry: ModelPinRegistry,
   isAdmin: () => Promise<boolean>,
   steps: ReadonlyArray<StepLike>,
+  tierOwnerUserId?: string,
 ): Promise<Map<number, string>> {
   const canonical = new Map<number, string>();
   for (let i = 0; i < steps.length; i++) {
@@ -327,7 +347,7 @@ export async function resolvePlanStepModelsForLaunch(
     const raw = steps[i]?.model;
     if (raw === undefined || raw === null || (typeof raw === 'string' && !raw.trim())) continue;
     try {
-      const resolved = await resolvePlanLaunchModel(registry, isAdmin, raw);
+      const resolved = await resolvePlanLaunchModel(registry, isAdmin, raw, tierOwnerUserId);
       if (resolved) canonical.set(i, resolved);
     } catch (error) {
       if (isModelUnavailableError(error)) throw new StepModelUnavailableError(stepNumber(steps[i], i), error);
@@ -349,8 +369,10 @@ export function isStepModelUnavailableError(error: unknown): error is StepModelU
   return error instanceof StepModelUnavailableError;
 }
 
-/** Text shown in the chat when a plan is paused because the current step's model is no longer served. */
-export function buildStepModelPausedMessage(stepCount: number, modelLabel: string): string {
-  return `Step ${stepCount} uses ${modelLabel}, which is no longer available. Choose another model in the model picker and send again to resume this step. `
+/** Text shown in the chat when a plan is paused because the current step's model is no longer served (or, ENG-669, not in the plan). */
+export function buildStepModelPausedMessage(stepCount: number, modelLabel: string, reason?: string): string {
+  // Account-neutral: this text is saved to the chat, where the owner AND any share viewer read it.
+  const why = reason === 'not_in_plan' ? "which isn't included in this account's plan" : 'which is no longer available';
+  return `Step ${stepCount} uses ${modelLabel}, ${why}. Choose another model in the model picker and send again to resume this step. `
     + 'The plan is paused and nothing was sent to a different model.';
 }

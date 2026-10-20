@@ -242,12 +242,12 @@ describe('verifiedGenerate (stored model is not a selection)', () => {
   it('a stored live-voice model is replaced by the default before the run reads the session', async () => {
     mockChatbotDb.getChatSession.mockResolvedValue(session('live-voice-1') as any);
     await agentModeController.verifiedGenerate(verifiedReq(), makeRes());
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, expect.anything());
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, expect.anything(), 'system');
   });
 
   it('a stored internalOnly model is replaced by the default before the run reads the session', async () => {
     mockChatbotDb.getChatSession.mockResolvedValue(session('internal-judge-1') as any);
     await agentModeController.verifiedGenerate(verifiedReq(), makeRes());
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, expect.anything());
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, expect.anything(), 'system');
   });
 });

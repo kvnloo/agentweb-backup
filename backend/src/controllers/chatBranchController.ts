@@ -20,6 +20,7 @@ import {
   releaseIdempotency,
 } from '../services/agentMode/runStore';
 import { isModelUnavailableError } from '../services/agentMode/modelUnavailable';
+import { modelSourceAfter } from '../services/agentMode/modelAccess';
 import {
   releaseSessionGeneration,
   resolveEffectiveModelForUser,
@@ -119,7 +120,7 @@ function branchDeps(): BranchDeps {
           releaseIdempotency: (userId: string, scope: string) => releaseIdempotency(createSessionIdempotencyKey(userId, scope)),
         }
       : {}),
-    resolveModel: async ({ userId, requestedModel, explicit }) => {
+    resolveModel: async ({ userId, requestedModel, explicit, session }) => {
       try {
         const decision = await resolveEffectiveModelForUser({
           userId,
@@ -127,9 +128,16 @@ function branchDeps(): BranchDeps {
           // An explicit pick that cannot be served must fail loudly (422); only the inherited
           // source model may fall back, exactly like createSession.
           allowSilentSwap: !explicit,
+          // ENG-669: an inherited model AgentWeb stamped on the source stays AgentWeb's choice.
+          session,
         });
         const model = decision.effectiveModel ?? (await agentModeService.getDefaultModel());
-        return { ok: true, model, policy: toStoredModelPolicyDecision(decision) };
+        return {
+          ok: true,
+          model,
+          policy: toStoredModelPolicyDecision(decision),
+          source: modelSourceAfter(session, model, explicit ? requestedModel : null, (id) => agentModeService.normalizeModelId(id)),
+        };
       } catch (error) {
         if (!isModelUnavailableError(error)) throw error;
         return { ok: false, outcome: { status: 422, body: modelUnavailableBody(error) } };
@@ -140,7 +148,7 @@ function branchDeps(): BranchDeps {
         a.userId, undefined, a.portalType, a.pageIdentifier, a.selectedStartupId,
         undefined, undefined, undefined, 'regular', a.delegateInfo, a.initialState,
       ),
-    setModel: (sessionId, model, policy) => chatbotDb.updateSessionLlmModel(sessionId, model, policy),
+    setModel: (sessionId, model, policy, source) => chatbotDb.updateSessionLlmModel(sessionId, model, policy, source),
     setTitle: (sessionId, title) => chatbotDb.updateSessionTitle(sessionId, title),
     appendMessages: (sessionId, messages) => chatbotDb.addMessagesToSession(sessionId, messages),
     unarchiveSession: (sessionId) => chatbotDb.unarchiveSession(sessionId),
