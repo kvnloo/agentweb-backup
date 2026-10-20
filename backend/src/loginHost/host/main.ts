@@ -35,6 +35,8 @@ export interface HostDeps {
   adapters?: ReadonlyMap<string, SubscriptionProviderAdapter>;
   /** Tests run unprivileged: socket ownership/mode changes are skipped. */
   chownSocket?: boolean;
+  /** Tests run unprivileged: a temp directory instead of /run/aw-login-host-<env>. */
+  socketDir?: string;
   managerOverrides?: Partial<ManagerConfig>;
 }
 
@@ -105,6 +107,7 @@ export function buildHost(cfg: HostConfig, binary: VerifiedBinary, deps: HostDep
  */
 export async function stopEnvironment(cmd: CommandPort, cfg: HostConfig, layout: Layout, budgetMs = 30_000): Promise<void> {
   const deadline = Date.now() + budgetMs;
+  let final = false;
   for (;;) {
     await cmd.run(cfg.tools.systemctl, ["stop", layout.envSliceName], { timeoutMs: 30_000 });
     const units = await cmd.run(cfg.tools.systemctl, ["list-units", "--all", "--no-legend", "--plain", layout.envUnitPattern], { timeoutMs: 30_000 });
@@ -125,7 +128,10 @@ export async function stopEnvironment(cmd: CommandPort, cfg: HostConfig, layout:
       if (t[0] === "●" || t[0] === "*") t.shift();
       await cmd.run(cfg.tools.systemctl, ["kill", "-s", "SIGKILL", t[0]], { timeoutMs: 30_000 });
     }
-    if (Date.now() > deadline) throw new HostConfigError("this environment's units would not stop: refusing to serve");
+    if (Date.now() > deadline) {
+      if (final) throw new HostConfigError("this environment's units would not stop: refusing to serve");
+      final = true; // one more look after the last kill before giving up
+    }
     await new Promise((r) => setTimeout(r, 100));
   }
 }
@@ -140,18 +146,20 @@ export async function startHost(cfg: HostConfig, binary: VerifiedBinary, deps: H
   const built = buildHost(cfg, binary, deps);
   const stateDir = deps.stateDir ?? `${cfg.stateRoot}/state`;
   if (!existsSync(stateDir)) mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  await stopEnvironment(deps.cmd, cfg, built.layout);
-  built.store.open(); // the single-writer lock: throws if another host of this environment is alive
+  built.store.open(); // the single-writer lock FIRST: a second instance must fail here, before it can stop the live host's units
   try {
-    if (!existsSync(cfg.socket.dir)) mkdirSync(cfg.socket.dir, { recursive: true, mode: 0o750 });
+    await stopEnvironment(deps.cmd, cfg, built.layout);
+    const sockDir = deps.socketDir ?? cfg.socket.dir;
+    const sockPath = `${sockDir}/host.sock`;
+    if (!existsSync(sockDir)) mkdirSync(sockDir, { recursive: true, mode: 0o750 });
     if (deps.chownSocket !== false) {
-      chownSync(cfg.socket.dir, 0, cfg.socket.gid);
-      chmodSync(cfg.socket.dir, 0o750);
+      chownSync(sockDir, 0, cfg.socket.gid);
+      chmodSync(sockDir, 0o750);
     }
-    const handle = await startHostServer(built.manager, { socketPath: cfg.socketPath, socketMode: cfg.socket.mode });
+    const handle = await startHostServer(built.manager, { socketPath: sockPath, socketMode: cfg.socket.mode });
     if (deps.chownSocket !== false) {
-      chownSync(cfg.socketPath, 0, cfg.socket.gid);
-      chmodSync(cfg.socketPath, cfg.socket.mode);
+      chownSync(sockPath, 0, cfg.socket.gid);
+      chmodSync(sockPath, cfg.socket.mode);
     }
     deps.log.info("host_started", { env: cfg.env });
     let down = false;
@@ -162,8 +170,11 @@ export async function startHost(cfg: HostConfig, binary: VerifiedBinary, deps: H
         if (down) return;
         down = true;
         await handle.close();
-        await stopEnvironment(deps.cmd, cfg, built.layout).catch(() => undefined); // best effort: the next start repeats it
-        built.store.close();
+        try {
+          await stopEnvironment(deps.cmd, cfg, built.layout);
+        } finally {
+          built.store.close(); // a failed stop is reported to the caller (non-zero exit); the next start repeats it
+        }
         deps.log.info("host_stopped", { env: cfg.env });
       },
     };
@@ -182,12 +193,18 @@ export async function runMain(argv: string[] = process.argv): Promise<void> {
     if (!configPath) throw new HostConfigError("usage: main.js <config.json>");
     assertTrustedPath(configPath); // the config is root-owned and not writable by anyone else, like everything it points to
     const cfg = parseHostConfig(JSON.parse(readFileSync(configPath, "utf8")));
+    // Everything the host or a customer unit executes or reads as policy must be root-controlled too.
+    for (const p of [cfg.claude.turnWrapperPath, cfg.claude.systemPromptFile, cfg.tools.writeFileHelper, cfg.tools.systemRun, cfg.tools.systemctl, cfg.tools.setpriv, cfg.tools.env, cfg.tools.rm, cfg.tools.find, cfg.tools.setquota]) assertTrustedPath(p);
     if (existsSync("/etc/subuid")) assertNoSubuidOverlap(readFileSync("/etc/subuid", "utf8"), cfg.uidMin, cfg.uidMax);
     registerRange(`${cfg.sharedParent}/ranges`, { env: cfg.env, uidMin: cfg.uidMin, uidMax: cfg.uidMax });
     assertHomesMount(parseMounts(readFileSync("/proc/mounts", "utf8")), `${cfg.stateRoot}/u`, !!cfg.quota);
     const binary = await verifyBinary(cfg.claude.binaryPath, cfg.claude.expectedSha256, cfg.claude.version);
     const running = await startHost(cfg, binary, { cmd: nodeCommandPort, root: nodeRootFs, log });
-    const stop = () => void running.shutdown().then(() => process.exit(0));
+    const stop = () =>
+      void running.shutdown().then(
+        () => process.exit(0),
+        () => process.exit(1),
+      );
     process.on("SIGTERM", stop);
     process.on("SIGINT", stop);
   } catch (e) {
@@ -196,4 +213,3 @@ export async function runMain(argv: string[] = process.argv): Promise<void> {
   }
 }
 
-if (require.main === module) void runMain();

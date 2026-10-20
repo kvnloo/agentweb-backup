@@ -62,7 +62,7 @@ async function boot(existing?: { sys: FakeSystem; dir: string }): Promise<Rig> {
     env: "test1",
     uidMin: 400_000,
     uidMax: 410_000,
-    socket: { dir: join(dir, "run"), gid: 990 },
+    socket: { dir: "/run/aw-login-host-test1", gid: 990 },
     quota: { blocksKb: 204_800, inodes: 20_000 },
     claude: { binaryPath: "/opt/aw-claude/2.1.294/claude", expectedSha256: "a".repeat(64), version: "2.1.294", systemPromptFile: "/opt/aw-login-host/system-prompt.txt", bridgeUrl: "http://127.0.0.1:3001/mcp" },
   });
@@ -71,12 +71,12 @@ async function boot(existing?: { sys: FakeSystem; dir: string }): Promise<Rig> {
   const binary: VerifiedBinary = { path: cfg.claude.binaryPath, version: "2.1.294", digest: "sha256:" + "a".repeat(64) };
   const stateDir = join(dir, "state");
   const log = noopLogger;
-  const host = await startHost(cfg, binary, { cmd: sys, root: sys, log, stateDir, adapters: new Map([["fake", adapter]]), chownSocket: false });
+  const host = await startHost(cfg, binary, { cmd: sys, root: sys, log, stateDir, adapters: new Map([["fake", adapter]]), chownSocket: false, socketDir: join(dir, "run") });
   const rig: Rig = {
     sys,
     cfg,
     host,
-    sock: cfg.socketPath,
+    sock: join(dir, "run", "host.sock"),
     stateDir,
     script,
     async restart() {
@@ -155,10 +155,20 @@ describe("the whole host over a real socket", () => {
     const dup = new FakeSystem();
     const cfg = rig.cfg;
     await expect(
-      startHost(cfg, { path: cfg.claude.binaryPath, version: "2.1.294", digest: "sha256:" + "a".repeat(64) }, { cmd: dup, root: dup, log: noopLogger, stateDir: rig.stateDir, adapters: new Map(), chownSocket: false }),
+      startHost(cfg, { path: cfg.claude.binaryPath, version: "2.1.294", digest: "sha256:" + "a".repeat(64) }, { cmd: dup, root: dup, log: noopLogger, stateDir: rig.stateDir, adapters: new Map(), chownSocket: false, socketDir: join(rig.stateDir, "..", "run") }),
     ).rejects.toThrow();
   });
 
+  it("a second host that loses the state lock must NOT stop the live host's customer units", async () => {
+    rig = await boot();
+    const start = await call(rig.sock, "/v1/login.start", { connectionId: "c1", provider: "fake" });
+    expect(start.status).toBe(200);
+    const dup = new FakeSystem();
+    await expect(
+      startHost(rig.cfg, { path: rig.cfg.claude.binaryPath, version: "2.1.294", digest: "sha256:" + "a".repeat(64) }, { cmd: dup, root: dup, log: noopLogger, stateDir: rig.stateDir, adapters: new Map(), chownSocket: false, socketDir: join(rig.stateDir, "..", "run2") }),
+    ).rejects.toThrow();
+    expect(dup.calls).toHaveLength(0); // it never touched systemd
+  });
   it("the socket directory is the gate: owner-only mode in tests, and the socket exists", async () => {
     rig = await boot();
     expect(statSync(rig.sock).isSocket()).toBe(true);
@@ -167,7 +177,7 @@ describe("the whole host over a real socket", () => {
   it("stopEnvironment refuses to serve when a unit will not die, and waits for queued start jobs", async () => {
     const sys = new FakeSystem();
     sys.startLatencyMs = 40;
-    const cfg = parseHostConfig({ env: "test1", uidMin: 400_000, uidMax: 410_000, socket: { dir: "/run/x", gid: 990 }, claude: { binaryPath: "/opt/a/claude", expectedSha256: "a".repeat(64), version: "1", systemPromptFile: "/opt/p", bridgeUrl: "http://127.0.0.1:1/mcp" } });
+    const cfg = parseHostConfig({ env: "test1", uidMin: 400_000, uidMax: 410_000, socket: { dir: "/run/aw-login-host-test1", gid: 990 }, claude: { binaryPath: "/opt/a/claude", expectedSha256: "a".repeat(64), version: "1", systemPromptFile: "/opt/p", bridgeUrl: "http://127.0.0.1:1/mcp" } });
     const { layoutFor } = await import("../../host/main");
     const layout = layoutFor(cfg);
     sys.start("/usr/bin/systemd-run", ["--unit=aw-test1-400123-00000000000000aa.service", "--", "/usr/bin/setpriv", "--reuid=400123", "--", "/bin/sleep", "1"]);

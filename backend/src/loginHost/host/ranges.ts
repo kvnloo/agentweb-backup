@@ -4,7 +4,7 @@
  * processes). Every host registers its range in a root-owned registry under the shared parent at start-up and
  * refuses to start if it overlaps another registered range.
  */
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
 import { HostConfigError } from "./hostConfig";
 
 export interface RangeRecord {
@@ -13,8 +13,59 @@ export interface RangeRecord {
   uidMax: number;
 }
 
-export function registerRange(registryDir: string, rec: RangeRecord): void {
+/** Environments start in parallel at boot: the check-and-write below is serialized by an O_EXCL lock file (stale locks of dead pids are taken over). */
+function withRegistryLock<T>(registryDir: string, fn: () => T, waitMs: number): T {
+  const giveUp = Date.now() + waitMs;
+  const lock = `${registryDir}/.lock`;
+  for (;;) {
+    try {
+      const fd = openSync(lock, "wx", 0o600);
+      writeFileSync(fd, String(process.pid));
+      closeSync(fd);
+      break;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      let holder = 0;
+      try {
+        holder = Number(readFileSync(lock, "utf8"));
+      } catch {
+        /* just released */
+      }
+      let alive = holder > 0;
+      if (alive) {
+        try {
+          process.kill(holder, 0);
+        } catch {
+          alive = false;
+        }
+      }
+      if (!alive && holder > 0) {
+        try {
+          unlinkSync(lock);
+        } catch {
+          /* someone else took it over */
+        }
+      } else if (Date.now() > giveUp) throw new HostConfigError("range registry is locked");
+      else Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      unlinkSync(lock);
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+export function registerRange(registryDir: string, rec: RangeRecord, lockWaitMs = 5000): void {
   if (!existsSync(registryDir)) mkdirSync(registryDir, { recursive: true, mode: 0o755 });
+  withRegistryLock(registryDir, () => registerRangeLocked(registryDir, rec), lockWaitMs);
+}
+
+function registerRangeLocked(registryDir: string, rec: RangeRecord): void {
   for (const name of readdirSync(registryDir)) {
     if (!name.endsWith(".json") || name === `${rec.env}.json`) continue;
     let other: RangeRecord;

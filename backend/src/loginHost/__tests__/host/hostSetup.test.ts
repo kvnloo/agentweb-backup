@@ -47,8 +47,12 @@ describe("host config (a CLOSED schema)", () => {
     ["uid range too narrow", { uidMin: 400_000, uidMax: 400_005 }],
     ["a different shared parent", { sharedParent: "/var/lib/other" }],
     ["socket dir with a space", { socket: { dir: "/run/a b", gid: 990 } }],
-    ["socket gid 0", { socket: { dir: "/run/x", gid: 0 } }],
-    ["a world-writable socket mode", { socket: { dir: "/run/x", gid: 990, mode: 0o666 } }],
+    ["socket dir not the env-specific one", { socket: { dir: "/usr", gid: 990 } }],
+    ["a socket mode granting others access (0607)", { socket: { dir: "/run/aw-login-host-test1", gid: 990, mode: 0o607 } }],
+    ["the reserved env name", { env: "ranges", socket: { dir: "/run/aw-login-host-ranges", gid: 990 } }],
+    ["a bridge url with $", { claude: { ...base().claude, bridgeUrl: "http://127.0.0.1/$x" } }],
+    ["socket gid 0", { socket: { dir: "/run/aw-login-host-test1", gid: 0 } }],
+    ["a world-writable socket mode", { socket: { dir: "/run/aw-login-host-test1", gid: 990, mode: 0o666 } }],
     ["a memory size without a unit", { limits: { memoryMax: "1024" } }],
     ["a tmp size in the wrong case", { limits: { tmpSize: "128m" } }],
     ["a runtime ceiling below 10 s", { limits: { runtimeMaxSec: 5 } }],
@@ -159,5 +163,40 @@ describe("startup checks", () => {
   it("the host must run as root", () => {
     expect(() => assertRoot(0)).not.toThrow();
     for (const uid of [1000, undefined, 1]) expect(() => assertRoot(uid)).toThrow(HostConfigError);
+  });
+});
+
+describe("range registry under parallel starts", () => {
+  it("a held lock of a LIVE pid blocks (bounded), a stale lock of a dead pid is taken over", () => {
+    const dir = join(tmp(), "ranges");
+    mkdirSync(dir);
+    writeFileSync(join(dir, ".lock"), "999999999"); // no such pid
+    registerRange(dir, { env: "test1", uidMin: 400_000, uidMax: 410_000 }); // taken over
+    expect(readFileSync(join(dir, "test1.json"), "utf8")).toContain("400000");
+    expect(() => readFileSync(join(dir, ".lock"))).toThrow(); // released
+  });
+  it("a lock held by a LIVE process is respected: registration waits, then fails closed (never writes unlocked)", () => {
+    const dir = join(tmp(), "ranges");
+    mkdirSync(dir);
+    writeFileSync(join(dir, ".lock"), String(process.pid)); // alive
+    expect(() => registerRange(dir, { env: "test1", uidMin: 400_000, uidMax: 410_000 }, 150)).toThrow(/locked/);
+    expect(() => readFileSync(join(dir, "test1.json"))).toThrow();
+  });
+  it("two processes registering overlapping ranges at the same time: exactly one wins", async () => {
+    const dir = join(tmp(), "ranges");
+    mkdirSync(dir);
+    const { fork } = await import("child_process");
+    const script = `
+      require(${JSON.stringify(require.resolve("ts-node/register/transpile-only"))});
+      const { registerRange } = require(${JSON.stringify(join(__dirname, "../../host/ranges"))});
+      try { registerRange(${JSON.stringify(dir)}, { env: process.argv[2], uidMin: 400000, uidMax: 410000 }); process.exit(0); } catch (e) { process.exit(3); }
+    `;
+    const scriptFile = join(tmp(), "w.js");
+    writeFileSync(scriptFile, script);
+    const run = (env: string) => new Promise<number>((res) => fork(scriptFile, [env]).on("exit", (c) => res(c ?? -1)));
+    const codes = await Promise.all(["alpha", "beta", "gamma", "delta"].map(run));
+    expect(codes).not.toContain(1);
+    expect(codes.filter((c) => c === 0)).toHaveLength(1);
+    expect(codes.filter((c) => c === 3)).toHaveLength(3);
   });
 });

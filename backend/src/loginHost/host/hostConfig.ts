@@ -21,13 +21,13 @@ const hex64 = z.string().regex(/^[a-f0-9]{64}$/, "lowercase sha256 hex");
 const schema = z
   .object({
     /** `^[a-z0-9]{1,16}$`: no dash. One host per environment (test1, prod, ...). */
-    env: z.string().regex(/^[a-z0-9]{1,16}$/),
+    env: z.string().regex(/^[a-z0-9]{1,16}$/).refine((e) => e !== "ranges", "reserved name"),
     /** One constant on purpose: environments configured with different shared parents could read each other's homes. */
     sharedParent: z.literal("/var/lib/aw-login-host").default("/var/lib/aw-login-host"),
     /** Reserved numeric uid range of THIS environment: must not overlap another environment's range nor /etc/subuid. */
     uidMin: z.number().int().min(100_000),
     uidMax: z.number().int(),
-    socket: z.object({ dir: absPath, gid: z.number().int().min(1), mode: z.number().int().min(0o600).max(0o660).default(0o660) }).strict(),
+    socket: z.object({ dir: absPath, gid: z.number().int().min(1), mode: z.number().int().min(0o600).max(0o660).refine((m) => (m & 0o117) === 0, "mode must be 0600 or 0660 (write decimal 384/432 in JSON)").default(0o660) }).strict(),
     limits: z
       .object({
         memoryMax: size.default("1G"),
@@ -63,7 +63,7 @@ const schema = z
         systemPromptFile: absPath,
         turnWrapperPath: absPath.default("/opt/aw-login-host/claude-turn.sh"),
         /** The Emma tool bridge's MCP endpoint as seen from a customer process. */
-        bridgeUrl: z.string().url().refine((u) => /^https?:\/\//.test(u), "http(s) only"),
+        bridgeUrl: z.string().url().refine((u) => /^https?:\/\//.test(u) && !/[$%\s]/.test(u), "http(s) only, no $ % or whitespace"),
         models: z.array(z.string().regex(/^[A-Za-z0-9._:-]{1,64}$/)).min(1).max(20).optional(),
         basePath: z.string().regex(/^[A-Za-z0-9._/:-]{1,200}$/).optional(),
       })
@@ -98,6 +98,7 @@ export function parseHostConfig(raw: unknown): HostConfig {
   if (!r.success) throw new HostConfigError(r.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("; "));
   const c = r.data;
   if (c.uidMax < c.uidMin || c.uidMax - c.uidMin < 10 || c.uidMax > 4_000_000_000) throw new HostConfigError("uid range invalid");
+  if (c.socket.dir !== `/run/aw-login-host-${c.env}`) throw new HostConfigError(`socket.dir must be /run/aw-login-host-${c.env}`);
   const stateRoot = `${c.sharedParent}/${c.env}`;
   try {
     assertAbsPath(stateRoot);
