@@ -15,7 +15,7 @@ import { leadPhoneMacOf } from './voice/leadPhoneMac';
 import { isWithinCallWindow, reserveCallSlot, type Reservation } from './voice/hotLeadCallLimits';
 import { selectHotLeadCallCandidates } from './hotLeadCallRoster';
 import { NEXT_ATTEMPT_SOURCE, processHotLeadCallNextAttempt } from './hotLeadCallAttempts';
-import { errorText, placeMemberCall, type PlacementResult } from './hotLeadCallPlacement';
+import { errorText, holdsClaim, placeMemberCall, type PlacementResult } from './hotLeadCallPlacement';
 import { isNonEmpty, MINUTE_MS, runQueuedHotLeadJob } from './hotLeadCallQueue';
 // This file must not import orgLeadNotificationService: that module calls dispatchHotLeadCall.
 
@@ -181,12 +181,19 @@ async function reserveAndPlace(job: HotLeadCallJob, reviewed: Reviewed & { candi
   try {
     result = await placeMemberCall({
       orgId: job.orgId, listId, leadId, jobKey, config, callerNumber: reviewed.callerNumber, candidates: reviewed.candidates, attemptNo: 1,
-      createRecord: async (member) => {
+      createRecord: async (member, claimToken) => {
         const startedAt = new Date().toISOString();
-        created = await store.create(listId, leadId, {
-          state: 'dialing', jobKey, startedAt, updatedAt: startedAt, attemptNo: 1, memberId: member.id, triedMemberIds: [member.id],
-          leadPhoneMac: leadPhoneMacOf(job.orgId, reviewed.phone),
-        });
+        try {
+          created = await store.create(listId, leadId, {
+            state: 'dialing', jobKey, startedAt, updatedAt: startedAt, attemptNo: 1, memberId: member.id, triedMemberIds: [member.id],
+            leadPhoneMac: leadPhoneMacOf(job.orgId, reviewed.phone), claimToken,
+          });
+        } catch (err) {
+          // A create that committed and then reported an error still made the record ours; without it the lead's
+          // single call slot would be burned with no call. Otherwise nothing was created and the job fails.
+          if (!await holdsClaim(store, listId, leadId, claimToken)) throw err;
+          created = true;
+        }
         return created;
       },
     });

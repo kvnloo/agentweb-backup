@@ -154,6 +154,18 @@ still `between_attempts` and the leg's `<sid>#ended` marker present, and asks fo
 next attempt again. That request is idempotent (the queue key, then the
 `between_attempts` -> `dialing` lock) and nothing is billed twice.
 
+**Writes that commit and then report an error.** A store write can apply and still throw (a timeout after the
+commit). The steps that decide who dials write a random `claimToken` onto the record: creating the record (first
+attempt), the `between_attempts` -> `dialing` lock (next attempts) and the `/gather` move to `bridging`. When such a
+write throws, the writer re-reads the record: its own token means the write landed, so it goes on (places the one call,
+or returns the Dial TwiML) instead of leaving a `dialing` record nobody will ever call back, or a member hung up on while
+`bridging` waits for a lead leg. No token of its own means the write did not land: a failed create leaves no record and
+gives the slots back, a failed lock fails the job and closes the waiting record as `failed` / `next_attempt_failed`, and a
+failed `/gather` move hangs up, so the member leg's end hands over to the next member. A second writer never finds the
+first one's token, so the retry is exactly-once. Closing a waiting record is tried twice and then thrown, so the job
+fails instead of reporting a close that did not happen; the record stays `between_attempts`, where a redelivered final
+callback heals it.
+
 **Lead age.** The deadline for further attempts is measured from the record's
 `startedAt` (when the first member was rung, which was itself within
 `maxAgeMinutes` of the submission), not from the submission: a lead is never chased
@@ -407,7 +419,7 @@ removed; entries without `id` are new people (server-generated id, `phone` requi
 existing entry is unchanged; a changed phone clears that person's verification. Everything else not sent keeps its
 value. A body of only `{ _revision, enabled }` is valid. Calling hours are only required when enabling. Unknown keys,
 `verifiedAt`, `twilioNumber*` and the tool-only limits are refused with 400; the body is capped at 32 KB of JSON text (32,768 characters, not bytes), 10 people and 7
-windows per person. Turning calling on needs the plan feature and every requirement of `canEnable`; an explicit
+windows per person. The body is parsed before authentication, like the other `/api/orgs/me/*` routes. Turning calling on needs the plan feature and every requirement of `canEnable`; an explicit
 `enabled: true` that cannot work yet is a 400 naming the missing piece, while an edit that merely leaves a running
 setup without any verified person (the only verified phone changed) turns calling off. That is silent: the save succeeds
 and the response carries `enabled: false` with the blocker in `blockers`, so a client must read `enabled` from the response
@@ -922,7 +934,7 @@ on anywhere.
    the first real leads, keep the off command to hand (effective within ~30s).
 10. Plan entitlement: tick **Hot lead calls** (unticked by default, with a cost
     note) only on the paid tier(s) that include it (Subscription Types editor).
-    Tiers that saved `*` as their feature list also entitle. See [Plan entitlement](#plan-entitlement).
+    Tiers that saved `*` as their feature list also entitle (decided: `*` means every feature, this one included). See [Plan entitlement](#plan-entitlement).
 11. Decide the mitigations in [Compliance and third parties](#compliance-and-third-parties)
     before general availability (CAPTCHA/honeypot, spoken disclosure before the
     bridge, name or email besides the phone, consent text).

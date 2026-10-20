@@ -107,7 +107,9 @@ export async function processHotLeadCallNextAttempt(job: NextAttemptJob): Promis
   try {
     await placeNextAttempt(job);
   } catch (err) {
-    await closeBetweenAttempts(getLeadCallStore(), job.listId, job.leadId, 'next_attempt_failed', 'errored');
+    // The original error is the one to report; a close that fails as well leaves the record for a redelivery to heal.
+    await closeBetweenAttempts(getLeadCallStore(), job.listId, job.leadId, 'next_attempt_failed', 'errored')
+      .catch((closeErr) => console.warn('[hotLeadCall] call record not closed', { listId: job.listId, leadId: job.leadId, error: errorText(closeErr) }));
     throw err;
   }
 }

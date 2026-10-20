@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { redactPhone } from './whatsappService';
 import type { HotLeadCallConfig, HotLeadCallMember } from './hotLeadCallConfig';
 import { VoiceCallError, getVoiceProvider, scrubErrorText } from './voice/voiceProvider';
@@ -38,7 +39,7 @@ interface PlacementInput {
    * Set for a lead's first attempt: creates the call record for the first member that is not in cooldown (false
    * when one already exists). Absent for a next attempt, whose record is in `between_attempts`.
    */
-  createRecord?: (member: HotLeadCallMember) => Promise<boolean>;
+  createRecord?: (member: HotLeadCallMember, claimToken: string) => Promise<boolean>;
 }
 
 /**
@@ -48,18 +49,24 @@ interface PlacementInput {
  */
 type Closing = 'completed' | 'rejected' | 'errored';
 
-/** Closes a record that is waiting between attempts, because no further member can be rung. Never throws. */
+/**
+ * Closes a record that is waiting between attempts, because no further member can be rung. A failed write is tried
+ * once more and then thrown, so the job fails (the queue records it) instead of leaving the record waiting while the
+ * caller believes it was closed; the record stays between_attempts, where a redelivered callback can still resolve it.
+ */
 export async function closeBetweenAttempts(
   store: LeadCallStore, listId: string, leadId: string, outcome: string, closing: Closing,
 ): Promise<void> {
   const patch = closing === 'completed' ? { state: 'finished' as const, outcome } : { state: 'failed' as const, outcome };
+  let moved: boolean;
   try {
-    if (!await store.transition(listId, leadId, ['between_attempts'], patch)) return;
-    if (closing === 'completed') await store.addEvent(listId, leadId, 'call.completed', { outcome });
-    if (closing === 'errored') await store.addEvent(listId, leadId, 'call.failed', { reason: outcome });
-  } catch (err) {
-    console.warn('[hotLeadCall] call record not closed', { listId, leadId, error: errorText(err) });
+    moved = await store.transition(listId, leadId, ['between_attempts'], patch);
+  } catch {
+    moved = await store.transition(listId, leadId, ['between_attempts'], patch);
   }
+  if (!moved) return;
+  if (closing === 'completed') await store.addEvent(listId, leadId, 'call.completed', { outcome });
+  if (closing === 'errored') await store.addEvent(listId, leadId, 'call.failed', { reason: outcome });
 }
 
 /** What one member's turn came to. 'cooldown' and 'rejected' let the pass go on to the next member. */
@@ -93,6 +100,11 @@ async function settle(
   }
 }
 
+/** Whether the record carries this token: the write that was meant to put it there landed, whatever it reported. */
+export async function holdsClaim(store: LeadCallStore, listId: string, leadId: string, claimToken: string): Promise<boolean> {
+  return (await store.get(listId, leadId))?.claimToken === claimToken;
+}
+
 /**
  * One member's turn: claim their cooldown, take the record (`createRecord` for a lead's first attempt, otherwise
  * the conditional between_attempts -> dialing move; the winner of that is the only worker that may dial this
@@ -105,17 +117,23 @@ async function tryMember(
   const releaseCooldown = await claimMemberCooldown({ orgId, memberId: member.id, config });
   if (!releaseCooldown) return 'cooldown';
 
+  const claimToken = randomUUID();
   let owned: boolean;
   try {
     owned = createRecord
-      ? await createRecord(member)
+      ? await createRecord(member, claimToken)
       // The new attempt starts without the previous attempt's call sid and outcome.
       : await store.transition(listId, leadId, ['between_attempts'], {
-        state: 'dialing', attemptNo, memberId: member.id, triedMemberIds: [member.id], clear: ['memberCallSid', 'outcome'],
+        state: 'dialing', attemptNo, memberId: member.id, triedMemberIds: [member.id], claimToken, clear: ['memberCallSid', 'outcome'],
       });
   } catch (err) {
-    await releaseCooldown();
-    throw err;
+    // The write may have committed and then reported an error (a timeout): the record then says `dialing`, nobody
+    // is going to dial it, and nothing else ever will. Our own token on it means the step is ours, so go on.
+    if (await holdsClaim(store, listId, leadId, claimToken)) owned = true;
+    else {
+      await releaseCooldown();
+      throw err;
+    }
   }
   if (!owned) {
     await releaseCooldown();

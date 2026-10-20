@@ -87,12 +87,12 @@ suite('team settings and member verification against DynamoDB Local', () => {
     expect(svc.hotLeadCallRevisionOf((await read(orgId)).hotLeadCall)).toBe(dto._revision);
   });
 
-  it('ten saves racing from the same revision: exactly one wins, the others get a conflict', async () => {
+  it('ten saves racing from the same revision: exactly one wins, the others get a conflict (each a real change: none equals the stored 3)', async () => {
     const orgId = await newOrg();
     const org = await loaded(orgId);
     const revision = svc.hotLeadCallRevisionOf(org.hotLeadCall);
     const results = await Promise.allSettled(Array.from({ length: 10 }, (_, i) =>
-      svc.updateHotLeadCallSettings(org, OWNER, { _revision: revision, maxAttemptsPerLead: 1 + (i % 5) })));
+      svc.updateHotLeadCallSettings(org, OWNER, { _revision: revision, maxAttemptsPerLead: [1, 2, 4, 5][i % 4] })));
     expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
     for (const r of results.filter(x => x.status === 'rejected')) expect((r as PromiseRejectedResult).reason.name).toBe('ConflictError');
   });

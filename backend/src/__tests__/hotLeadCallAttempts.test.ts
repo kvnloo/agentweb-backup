@@ -302,6 +302,29 @@ describe('processHotLeadCallNextAttempt', () => {
     expect(store.events.at(-1)).toEqual({ type: 'call.completed', detail: { outcome } });
   });
 
+  describe('when closing the waiting record fails', () => {
+    it('retries the close once, so one failed write does not leave the record waiting', async () => {
+      const record = await firstAttemptEnds();
+      setHotLeadCallEnabledOverride(false);
+      const real = store.transition.bind(store);
+      let calls = 0;
+      store.transition = async (...args) => {
+        if (++calls === 1) throw new Error('ddb down');
+        return real(...args);
+      };
+      await processHotLeadCallNextAttempt(nextJob(record));
+      expect(store.record).toMatchObject({ state: 'finished', outcome: 'disabled' });
+    });
+
+    it('fails the job instead of reporting success, and leaves the record where a redelivered callback can resolve it', async () => {
+      const record = await firstAttemptEnds();
+      setHotLeadCallEnabledOverride(false);
+      store.transitionError = new Error('ddb down');
+      await expect(processHotLeadCallNextAttempt(nextJob(record))).rejects.toThrow('ddb down');
+      expect(store.record!.state).toBe('between_attempts');
+    });
+  });
+
   describe('when the job itself breaks', () => {
     it('closes the record it was resolving as failed, rings nobody and still fails the job', async () => {
       const record = await firstAttemptEnds();

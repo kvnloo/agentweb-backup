@@ -41,6 +41,7 @@
  * entries in `lastSequence`: see HotLeadCallRecord.lastSequence.
  */
 
+import { randomUUID } from 'crypto';
 import express from 'express';
 import type { Request, RequestHandler, Response } from 'express';
 import { crmDb } from '../services/db';
@@ -335,7 +336,19 @@ router.post('/gather', guarded(async (_req, res, q, body) => {
     screenUrl: buildVoiceWebhookUrl('screen', q),
   });
   // Only the winner dials the lead; a replayed "1" gets a hangup instead of a second bridge.
-  if (!await decide(q, ['member_answered'], { state: 'bridging', lastSequence: decision })) return sendHangup(res);
+  const claimToken = randomUUID();
+  let won: boolean;
+  try {
+    won = await decide(q, ['member_answered'], { state: 'bridging', lastSequence: decision, claimToken });
+  } catch (err) {
+    // The write may have committed and then reported an error. Our token on the record means we hold the one
+    // decision: dial the lead now, because nothing else will (the member would be hung up on, the record left
+    // bridging with no lead leg). A write that did not land leaves the record at member_answered, where the
+    // member leg's end hands over to the next member.
+    won = (await loadRecord(q))?.claimToken === claimToken;
+    if (!won) throw err;
+  }
+  if (!won) return sendHangup(res);
   sendXml(res, connect);
 }, twimlReplies));
 

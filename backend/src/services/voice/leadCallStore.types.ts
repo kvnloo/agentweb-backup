@@ -42,6 +42,13 @@ export interface HotLeadCallRecord {
    * without it counts as a changed phone: the webhooks never dial or screen on a number they cannot compare.
    */
   leadPhoneMac: string;
+  /**
+   * Random id written by the writer that takes an exclusive step (creating the record, taking a next attempt, the
+   * member's press of 1). A write that reported an error may still have committed; re-reading the record and
+   * finding one's own token tells the writer it holds the step, so it can go on instead of leaving the record
+   * stranded, and without taking the step a second time.
+   */
+  claimToken?: string;
   /** Short machine reason for terminal states, e.g. 'member_no_answer', 'member_declined', 'lead_no_answer', 'lead_declined'. */
   outcome?: string;
   /** Legs already metered through recordCallUsage, so a replayed status callback cannot meter twice. */
