@@ -1,6 +1,6 @@
 import { dynamodb } from '../../config/aws';
 import { tableName } from '../../config/constants';
-import { isConditionalFailure } from './setupWrites';
+import { errorCode, isConditionalFailure } from './setupWrites';
 
 /**
  * Atomic counters and expiring claims for the hot-lead call abuse limits. Every method is ONE conditional
@@ -56,7 +56,7 @@ class DynamoLimitStore implements LimitStore {
         ExpressionAttributeValues: { ':zero': 0, ':one': 1 },
       }).promise();
     } catch (err) {
-      if (!isConditionalFailure(err)) console.warn('[hotLeadCall] could not give a call slot back', (err as { code?: string })?.code ?? 'error');
+      if (!isConditionalFailure(err)) console.warn('[hotLeadCall] could not give a call slot back', errorCode(err) ?? 'error');
     }
   }
 
@@ -92,7 +92,7 @@ class DynamoLimitStore implements LimitStore {
         ExpressionAttributeValues: { ':token': token },
       }).promise();
     } catch (err) {
-      if (!isConditionalFailure(err)) console.warn('[hotLeadCall] could not release a call claim', (err as { code?: string })?.code ?? 'error');
+      if (!isConditionalFailure(err)) console.warn('[hotLeadCall] could not release a call claim', errorCode(err) ?? 'error');
     }
   }
 }

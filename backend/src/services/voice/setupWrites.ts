@@ -32,7 +32,13 @@ export function unchangedSince(reads: Record<string, unknown>): UpdateCondition 
   return { expression: clauses.join(' AND '), names, ...(Object.keys(values).length ? { values } : {}) };
 }
 
+/** The error's `code` when it has a string one (AWS SDK errors do), else undefined. */
+export function errorCode(err: unknown): string | undefined {
+  const code = typeof err === 'object' && err !== null ? (err as { code?: unknown }).code : undefined;
+  return typeof code === 'string' ? code : undefined;
+}
+
 export function isConditionalFailure(err: unknown): boolean {
-  const e = err as { code?: unknown; name?: unknown } | null;
-  return e?.code === 'ConditionalCheckFailedException' || e?.name === 'ConditionalCheckFailedException';
+  const name = typeof err === 'object' && err !== null ? (err as { name?: unknown }).name : undefined;
+  return errorCode(err) === 'ConditionalCheckFailedException' || name === 'ConditionalCheckFailedException';
 }

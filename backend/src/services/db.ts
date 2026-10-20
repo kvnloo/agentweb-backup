@@ -25,6 +25,7 @@ import { phoneDedupeKey, PHONE_FANOUT_CAP } from '../utils/phoneLeadDedupe';
 import { isSmokeTestPhone } from '../utils/smokeTestLead';
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
+import { isConditionalFailure } from "./voice/setupWrites";
 import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
 
 // Load environment variables from .env file
@@ -213,7 +214,7 @@ async function ensureLeadSystemMap(listId: string, leadId: string, caller: strin
     }).promise();
     return true;
   } catch (err) {
-    if ((err as { code?: string }).code === 'ConditionalCheckFailedException') return false;
+    if (isConditionalFailure(err)) return false;
     handleDynamoDbError(err, `${caller}:bootstrap`);
     throw err;
   }
@@ -5450,6 +5451,106 @@ class BenchmarkTestDB {
 export const benchmarkTestDb = new BenchmarkTestDB();
 
 // CRM Database Service
+interface LeadRecordUpdateOp {
+  stateIn: string[];
+  set?: Record<string, unknown>;
+  remove?: string[];
+  maxIn?: Record<string, Record<string, number>>;
+  appendNew?: Record<string, string[]>;
+}
+
+// Every name and value of the expression goes through a generated placeholder. A placeholder that is declared but
+// not used (or used but not declared) is a ValidationException, which the mocked unit tests cannot see, so each is
+// created only where its clause is emitted: one name per field, one per map entry.
+interface ExpressionParts {
+  names: Record<string, string>;
+  values: Record<string, unknown>;
+  set: string[];
+  remove: string[];
+  conditions: string[];
+  /** Next placeholder number. */
+  n: number;
+}
+
+const addSetClauses = (p: ExpressionParts, set: Record<string, unknown>): void => {
+  for (const [field, v] of Object.entries(set)) {
+    if (v === undefined) continue;
+    p.names[`#f${p.n}`] = field;
+    p.values[`:v${p.n}`] = v;
+    p.set.push(`#system.#k.#f${p.n} = :v${p.n}`);
+    p.n++;
+  }
+};
+
+const addRemoveClauses = (p: ExpressionParts, remove: string[]): void => {
+  for (const field of new Set(remove)) {
+    p.names[`#f${p.n}`] = field;
+    p.remove.push(`#system.#k.#f${p.n}`);
+    p.n++;
+  }
+};
+
+/** Per-entry maps: an entry is written only if it is higher than the stored one (or absent). */
+const addMaxInClauses = (p: ExpressionParts, maxIn: Record<string, Record<string, number>>): void => {
+  for (const [field, entries] of Object.entries(maxIn)) {
+    const entryList = Object.entries(entries);
+    if (entryList.length === 0) continue;
+    const fieldName = `#f${p.n}`;
+    p.names[fieldName] = field;
+    p.n++;
+    for (const [entryKey, num] of entryList) {
+      p.names[`#e${p.n}`] = entryKey;
+      p.values[`:v${p.n}`] = num;
+      const path = `#system.#k.${fieldName}.#e${p.n}`;
+      p.set.push(`${path} = :v${p.n}`);
+      p.conditions.push(`(attribute_not_exists(${path}) OR ${path} < :v${p.n})`);
+      p.n++;
+    }
+  }
+};
+
+/** Lists: new values are appended, and any value already present fails the whole write. */
+const addAppendClauses = (p: ExpressionParts, appendNew: Record<string, string[]>): void => {
+  for (const [field, listed] of Object.entries(appendNew)) {
+    const items = [...new Set(listed)];
+    if (items.length === 0) continue;
+    const path = `#system.#k.#f${p.n}`;
+    p.names[`#f${p.n}`] = field;
+    p.values[`:v${p.n}`] = items;
+    p.set.push(`${path} = list_append(${path}, :v${p.n})`);
+    items.forEach((item, i) => {
+      p.values[`:v${p.n}_${i}`] = item;
+      p.conditions.push(`NOT contains(${path}, :v${p.n}_${i})`);
+    });
+    p.n++;
+  }
+};
+
+function leadRecordUpdateExpression(key: string, op: LeadRecordUpdateOp) {
+  // DynamoDB rejects an expression that touches one path twice; say so before the round trip.
+  const overlap = (op.remove ?? []).find((f) => op.set?.[f] !== undefined);
+  if (overlap) throw new Error(`updateLeadSystemRecordIf: ${overlap} is both set and removed`);
+  const p: ExpressionParts = {
+    names: { '#system': 'system', '#k': key, '#state': 'state' },
+    values: { ':ts': new Date().toISOString() },
+    set: ['updatedAt = :ts'],
+    remove: [],
+    conditions: [`#system.#k.#state IN (${op.stateIn.map((_, i) => `:from${i}`).join(', ')})`],
+    n: 0,
+  };
+  op.stateIn.forEach((s, i) => { p.values[`:from${i}`] = s; });
+  addSetClauses(p, op.set ?? {});
+  addRemoveClauses(p, op.remove ?? []);
+  addMaxInClauses(p, op.maxIn ?? {});
+  addAppendClauses(p, op.appendNew ?? {});
+  return {
+    UpdateExpression: `SET ${p.set.join(', ')}${p.remove.length ? ` REMOVE ${p.remove.join(', ')}` : ''}`,
+    ConditionExpression: p.conditions.join(' AND '),
+    ExpressionAttributeNames: p.names,
+    ExpressionAttributeValues: p.values,
+  };
+}
+
 export const crmDb = {
   // Lead List operations
   async createLeadList(
@@ -10975,7 +11076,7 @@ export const crmDb = {
       }).promise();
       return true;
     } catch (err) {
-      if ((err as { code?: string }).code === 'ConditionalCheckFailedException') return false;
+      if (isConditionalFailure(err)) return false;
       handleDynamoDbError(err, 'createLeadSystemRecordOnce');
       throw err;
     }
@@ -10998,84 +11099,16 @@ export const crmDb = {
     listId: string,
     leadId: string,
     key: string,
-    op: {
-      stateIn: string[];
-      set?: Record<string, unknown>;
-      remove?: string[];
-      maxIn?: Record<string, Record<string, number>>;
-      appendNew?: Record<string, string[]>;
-    },
+    op: LeadRecordUpdateOp,
   ): Promise<boolean> {
     if (op.stateIn.length === 0) return false; // an empty IN () is invalid syntax
-    // DynamoDB rejects an expression that touches one path twice; say so before the round trip.
-    const overlap = (op.remove ?? []).find((f) => op.set?.[f] !== undefined);
-    if (overlap) throw new Error(`updateLeadSystemRecordIf: ${overlap} is both set and removed`);
-    const names: Record<string, string> = { '#system': 'system', '#k': key, '#state': 'state' };
-    const values: Record<string, unknown> = { ':ts': new Date().toISOString() };
-    const setClauses: string[] = ['updatedAt = :ts'];
-    const removePaths: string[] = [];
-    const conditions: string[] = [];
-    // Every name and value goes through a generated placeholder. A placeholder that is declared but not
-    // used (or used but not declared) is a ValidationException, which the mocked unit tests cannot see,
-    // so each is created only where its clause is emitted: one name per field, one per map entry.
-    let n = 0;
-
-    op.stateIn.forEach((s, i) => { values[`:from${i}`] = s; });
-    conditions.push(`#system.#k.#state IN (${op.stateIn.map((_, i) => `:from${i}`).join(', ')})`);
-
-    for (const [field, v] of Object.entries(op.set ?? {})) {
-      if (v === undefined) continue;
-      names[`#f${n}`] = field;
-      values[`:v${n}`] = v;
-      setClauses.push(`#system.#k.#f${n} = :v${n}`);
-      n++;
-    }
-    for (const field of new Set(op.remove ?? [])) {
-      names[`#f${n}`] = field;
-      removePaths.push(`#system.#k.#f${n}`);
-      n++;
-    }
-    for (const [field, entries] of Object.entries(op.maxIn ?? {})) {
-      const entryList = Object.entries(entries);
-      if (entryList.length === 0) continue;
-      const fieldName = `#f${n}`;
-      names[fieldName] = field;
-      n++;
-      for (const [entryKey, num] of entryList) {
-        names[`#e${n}`] = entryKey;
-        values[`:v${n}`] = num;
-        const path = `#system.#k.${fieldName}.#e${n}`;
-        setClauses.push(`${path} = :v${n}`);
-        conditions.push(`(attribute_not_exists(${path}) OR ${path} < :v${n})`);
-        n++;
-      }
-    }
-    for (const [field, listed] of Object.entries(op.appendNew ?? {})) {
-      const items = [...new Set(listed)];
-      if (items.length === 0) continue;
-      const path = `#system.#k.#f${n}`;
-      names[`#f${n}`] = field;
-      values[`:v${n}`] = items;
-      setClauses.push(`${path} = list_append(${path}, :v${n})`);
-      items.forEach((item, i) => {
-        values[`:v${n}_${i}`] = item;
-        conditions.push(`NOT contains(${path}, :v${n}_${i})`);
-      });
-      n++;
-    }
+    const expression = leadRecordUpdateExpression(key, op);
 
     try {
-      await dynamodb.update({
-        TableName: `${TABLE_PREFIX}AW-Leads`,
-        Key: { listId, leadId },
-        UpdateExpression: `SET ${setClauses.join(', ')}${removePaths.length ? ` REMOVE ${removePaths.join(', ')}` : ''}`,
-        ConditionExpression: conditions.join(' AND '),
-        ExpressionAttributeNames: names,
-        ExpressionAttributeValues: values,
-      }).promise();
+      await dynamodb.update({ TableName: `${TABLE_PREFIX}AW-Leads`, Key: { listId, leadId }, ...expression }).promise();
       return true;
     } catch (err) {
-      if ((err as { code?: string }).code === 'ConditionalCheckFailedException') return false;
+      if (isConditionalFailure(err)) return false;
       handleDynamoDbError(err, 'updateLeadSystemRecordIf');
       throw err;
     }
