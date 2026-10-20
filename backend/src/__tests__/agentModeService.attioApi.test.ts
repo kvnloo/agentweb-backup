@@ -18,7 +18,9 @@ const mockCreateList = jest.fn();
 const mockAddPersonToList = jest.fn();
 const mockFindListEntry = jest.fn();
 const mockDeleteListEntry = jest.fn();
+const mockListListEntriesDetailed = jest.fn();
 const mockSvcInstance = {
+  listListEntriesDetailed: mockListListEntriesDetailed,
   countListEntries: mockCountListEntries,
   getAllLists: mockGetAllLists,
   createList: mockCreateList,
@@ -129,6 +131,41 @@ const at = (args: any) => agentModeService.handleAttioApi(USER, args);
 beforeEach(() => {
   jest.clearAllMocks();
   mockAttioCreate.mockResolvedValue(mockSvcInstance);
+});
+
+// ─── LIST_ENTRIES LIST (ENG-2578) ───────────────────────────────────────────
+
+describe('LIST_ENTRIES LIST', () => {
+  it('returns error when list_id missing', async () => {
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'LIST' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/list_id is required for LIST_ENTRIES LIST/);
+    expect(mockListListEntriesDetailed).not.toHaveBeenCalled();
+  });
+
+  it('returns one page of entries with next_offset', async () => {
+    mockListListEntriesDetailed.mockResolvedValue({
+      entries: [{ entryId: 'e1', personRecordId: 'r1', values: { stage: [] } }],
+      nextOffset: 500,
+    });
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'list', list_id: LIST_ID });
+    expect(mockListListEntriesDetailed).toHaveBeenCalledWith(LIST_ID, 0);
+    expect(result).toEqual({ success: true, entries: [{ entryId: 'e1', recordId: 'r1', values: { stage: [] } }], next_offset: 500 });
+  });
+
+  it('passes offset through and omits next_offset on the last page', async () => {
+    mockListListEntriesDetailed.mockResolvedValue({ entries: [] });
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'LIST', list_id: LIST_ID, offset: 500 });
+    expect(mockListListEntriesDetailed).toHaveBeenCalledWith(LIST_ID, 500);
+    expect(result.success).toBe(true);
+    expect(result.next_offset).toBeUndefined();
+  });
+
+  it('ignores an invalid offset', async () => {
+    mockListListEntriesDetailed.mockResolvedValue({ entries: [] });
+    await at({ entity_type: 'LIST_ENTRIES', action: 'LIST', list_id: LIST_ID, offset: -3 });
+    expect(mockListListEntriesDetailed).toHaveBeenCalledWith(LIST_ID, 0);
+  });
 });
 
 // ─── LIST_ENTRIES COUNT ─────────────────────────────────────────────────────

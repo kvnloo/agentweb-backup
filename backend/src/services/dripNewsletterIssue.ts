@@ -47,7 +47,11 @@ export type NewsletterIssueValidation =
 
 export const NEWSLETTER_SUBJECT_MAX = 120;
 
-const UNSUBSCRIBE_RE = /\{\{\s*unsubscribe_url\s*\}\}|\{\{\{\s*RESEND_UNSUBSCRIBE_URL\s*\}\}\}|\/unsubscribe\b/i;
+// ENG-2557: require a clickable link. Bare "/unsubscribe" text or a placeholder outside an
+// href does not count; the href must be a merge placeholder or an http(s) URL whose path
+// contains an /unsubscribe segment.
+const UNSUBSCRIBE_RE =
+  /<a\b[^>]*\shref\s*=\s*(["'])\s*(?:\{\{\s*unsubscribe_url\s*\}\}|\{\{\{\s*RESEND_UNSUBSCRIBE_URL\s*\}\}\}|https?:\/\/[^\s"'<>/]+(?:\/[^\s"'<>]*)?\/unsubscribe(?:[/?#][^\s"'<>]*)?)\s*\1/i;
 
 function isHttpsUrl(value: unknown): boolean {
   if (typeof value !== 'string') return false;

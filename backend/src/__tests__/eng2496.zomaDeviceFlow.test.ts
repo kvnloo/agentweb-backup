@@ -343,6 +343,21 @@ describe('ENG-2496 Zoma Meta connect — session-independent, bound to the setup
     expect((h.deps.connectAdAccounts as jest.Mock).mock.calls[0]).toEqual(['user-1', [{ account_id: '222', name: 'Acct 222', currency: 'USD', account_status: 1 }], 'tsid']);
   });
 
+  it('HTTP: the multi-account picker is served with a referrer policy under which its POST carries a real Origin', async () => {
+    // Prod regression: with Referrer-Policy no-referrer the browser sent `Origin: null` on the picker
+    // submit, and the global CORS check answered {"error":"Forbidden"} before Zoma ever saw it.
+    const { h, deviceId } = await approvedSetup({
+      finalizeMeta: jest.fn().mockResolvedValue({ flow: 'marketing', adAccounts: [ACCT('111'), ACCT('222')], tokenSessionId: 'tsid', preconnectInstructions: '' }),
+    });
+    const app = express();
+    app.use('/api/zoma', createZomaRouter(h.deps));
+
+    const res = await request(app).get(ZOMA_META_CALLBACK_PATH).query({ code: 'meta-code', state: metaState('user-1', { zoma: deviceId }) });
+    expect(res.status).toBe(200);
+    expect(res.text).toContain('<form method="post" action="/api/zoma/meta/select">');
+    expect(res.headers['referrer-policy']).toBe('same-origin');
+  });
+
   it('HTTP: the callback finalizes for the state\'s user even when the browser is signed in as someone else', async () => {
     const { live, readiness } = liveReadiness();
     const { h, deviceId } = await approvedSetup({ readiness });
