@@ -200,3 +200,17 @@ describe("range registry under parallel starts", () => {
     expect(codes.filter((c) => c === 3)).toHaveLength(3);
   });
 });
+
+describe("range registry lock left empty by a dying creator", () => {
+  it("an EMPTY lock older than a few seconds is stale and taken over; a fresh empty one is respected", () => {
+    const { utimesSync } = require("fs") as typeof import("fs"); // eslint-disable-line @typescript-eslint/no-require-imports
+    const dir = join(tmp(), "ranges");
+    mkdirSync(dir);
+    writeFileSync(join(dir, ".lock"), "");
+    expect(() => registerRange(dir, { env: "test1", uidMin: 400_000, uidMax: 410_000 }, 150)).toThrow(/locked/); // just created: wait, then fail closed
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(join(dir, ".lock"), old, old);
+    registerRange(dir, { env: "test1", uidMin: 400_000, uidMax: 410_000 }, 150);
+    expect(readFileSync(join(dir, "test1.json"), "utf8")).toContain("400000");
+  });
+});

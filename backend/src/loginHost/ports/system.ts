@@ -129,7 +129,11 @@ export const nodeRootFs: RootFs = {
       const status = await readFile(`/proc/${pid}/status`, "utf8");
       const m = status.match(/^Uid:\s+(\d+)/m);
       if (!m || Number(m[1]) !== uid) return; // gone, or the pid now belongs to someone else: never signal it
-      process.kill(pid, "SIGKILL");
+      // The signal is sent AS the customer uid (no capabilities): even if the pid is reused between the check and the
+      // signal, a process of another uid cannot be signalled by it. Failure = already gone.
+      await new Promise<void>((resolve) => {
+        execFile("/usr/bin/setpriv", ["--reuid", String(uid), "--regid", String(uid), "--clear-groups", "--inh-caps=-all", "--bounding-set=-all", "--no-new-privs", "/usr/bin/kill", "-KILL", "--", String(pid)], { env: { PATH: "/usr/bin:/bin" }, timeout: 10_000 }, () => resolve());
+      });
     } catch {
       /* already gone */
     }

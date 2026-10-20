@@ -4,7 +4,7 @@
  * processes). Every host registers its range in a root-owned registry under the shared parent at start-up and
  * refuses to start if it overlaps another registered range.
  */
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { HostConfigError } from "./hostConfig";
 
 export interface RangeRecord {
@@ -30,6 +30,17 @@ function withRegistryLock<T>(registryDir: string, fn: () => T, waitMs: number): 
         holder = Number(readFileSync(lock, "utf8"));
       } catch {
         /* just released */
+      }
+      // A lock file with no pid in it is a creator that died between create and write: stale once it is a few seconds old.
+      if (!(holder > 0)) {
+        try {
+          if (Date.now() - statSync(lock).mtimeMs > 3000) {
+            unlinkSync(lock);
+            continue;
+          }
+        } catch {
+          continue; // released meanwhile
+        }
       }
       let alive = holder > 0;
       if (alive) {
