@@ -448,6 +448,32 @@ describe('fathomOnboardingIngestionService', () => {
     expect(ledger[0].status).toBe('discarded');
   });
 
+  it('refuses a reviewed ingest of a discarded entry without writing memories (Opslane 962)', async () => {
+    const prior = {
+      recordingId: 'disc-2', status: 'discarded', extractionState: 'auto_extracted', context: baseContext,
+      automationState: 'draft_account_created', draftUserId: 'fathom-draft-disc-2', memoryIds: [], orgMemoryIds: [],
+      createdAt: '2026-07-08T19:00:00.000Z', updatedAt: '2026-07-08T19:00:00.000Z',
+    };
+    const deps = makeDeps({
+      userDb: {
+        getUserById: jest.fn(async (userId: string) => ({
+          userId, email: 'fathom+disc-2@agentweb.internal', isActive: false, fathomDraftStatus: 'discarded',
+          fathomOnboardingIngestions: [prior],
+        })),
+        getUserByEmail: jest.fn(async () => null),
+        getUsersByEmailDomain: jest.fn(async () => []),
+        updateUser: jest.fn(async (_u: string, updates: Record<string, any>) => updates),
+        createFathomDraftUser: jest.fn(),
+      },
+    });
+    await expect(ingestFathomOnboardingRecording({
+      recordingId: 'disc-2', reviewOwnerUserId: 'review-owner', targetUserId: 'fathom-draft-disc-2',
+      reviewed: true, meetingText: 'notes',
+    } as any, deps as any)).rejects.toMatchObject({ statusCode: 409 });
+    expect(deps.accountMemoryDb.addMemory).not.toHaveBeenCalled();
+    expect(deps.userDb.updateUser).not.toHaveBeenCalled();
+  });
+
   it('re-reads and re-merges the ledger when a concurrent write lands between read and write (Opslane 422)', async () => {
     const stamp = '2026-07-08T19:00:00.000Z';
     const before = [{ recordingId: 'rv3-f', status: 'needs_review', context: baseContext, memoryIds: [], orgMemoryIds: [], createdAt: stamp, updatedAt: stamp }];

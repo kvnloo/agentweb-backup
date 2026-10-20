@@ -527,7 +527,12 @@ export async function ingestFathomOnboardingRecording(
 
     existing = (ledgerUser as any).fathomOnboardingIngestions as FathomOnboardingIngestion[] | undefined;
     previous = existing?.find((item) => sameLedgerRecording(item, { recordingId, recordingUrl: input.recordingUrl }));
-      // ENG-270 (Opslane 357): an admin discard sticks across unreviewed re-ingests, so the
+    // ENG-270 (Opslane 962): approving a discarded recording would write memories while the
+    // draft account stays flagged discarded; refuse it before any memory write.
+    if (reviewed && previous?.status === 'discarded') {
+      throw new FathomOnboardingReviewError(409, 'Discarded ingestion cannot be approved.');
+    }
+    // ENG-270 (Opslane 357): an admin discard sticks across unreviewed re-ingests, so the
     // ledger never says needs_review while the draft account stays flagged discarded.
     status = reviewed
       ? 'reviewed'

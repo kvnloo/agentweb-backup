@@ -39,6 +39,9 @@ router.post('/ingest', async (req: any, res) => {
 
     return res.json(result);
   } catch (error: any) {
+    if (error instanceof FathomOnboardingReviewError) {
+      return res.status(error.statusCode).json({ error: error.message });
+    }
     console.error('[fathomOnboardingAdmin] ingest failed:', error?.message);
     return res.status(500).json({ error: error?.message || 'Failed to ingest Fathom onboarding context' });
   }
