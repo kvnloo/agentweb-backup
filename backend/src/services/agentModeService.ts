@@ -6458,6 +6458,9 @@ export class AgentModeService {
     'get_lead_lists',         // Lead management teaser
     'list_connected_accounts', // Social/ads integration teaser
     'connect_account',        // Read-only UI handoff when a required account is absent
+    // LinkedIn Outreach self-service (ENG-1153): caller-scoped inspect + confirm-gated revoke.
+    'inspect_linkedin_account',
+    'revoke_linkedin_account',
 
     'get_user_profile',         // Account info teaser
     'get_account_status',       // Self account status (plan, usage, api-key count) — wraps /api/auth/me, no args
@@ -6549,6 +6552,10 @@ export class AgentModeService {
     // only asks the current page to open the existing OAuth dialog; it does not
     // grant consent or connect an account by itself.
     'connect_account',
+    // LinkedIn Outreach inspect/revoke (ENG-1153) must survive a stale DB
+    // foundation_tools override, otherwise chat cannot reach them at all.
+    'inspect_linkedin_account',
+    'revoke_linkedin_account',
     // S3 overflow retrieval is infrastructure, not a skill: whenever a tool result
     // is offloaded to S3 the model is handed a "[Full response stored at S3 key: ...]"
     // pointer and MUST be able to resolve it. A DB `foundation_tools` setting that
