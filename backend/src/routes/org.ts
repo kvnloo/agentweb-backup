@@ -3,7 +3,7 @@ import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb, orgDb, Organization } from "../services/db";
 import { defaultShareSettings } from "../services/orgShareService";
 import { callerCan, can, roleOf, isBillingRoot } from "../services/orgAuthz";
-import { deleteAccountById, PlatformType } from "../services/connectedAccountsDb";
+import { invalidateCachedPixels } from "../services/metaPixelsCache";
 import { v4 as uuidv4 } from "uuid";
 import crypto from "crypto";
 import { isCompanyEmail } from "../utils/validation";
@@ -1322,6 +1322,37 @@ router.get("/:orgId/connected-accounts", async (req: Request, res: Response) => 
   }
 });
 
+// ENG-2595: compare-and-swap on a member's whole connected_accounts list.
+// Both the share PATCH and the member DELETE read the list, change one entry,
+// and write the list back; without a condition, two near-simultaneous writes on
+// the same member silently drop one change. The write is conditioned on the
+// stored list still equalling what we read, and re-read/retried on conflict.
+// Operates on the RAW stored list (not a normalised copy) so legacy entries
+// with no config can still be removed.
+async function mutateMemberAccounts(
+  memberUserId: string,
+  mutate: (accounts: any[]) => any[] | null,
+): Promise<"ok" | "not_found"> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const member = await userDb.getUserById(memberUserId);
+    const current = Array.isArray(member?.connected_accounts) ? (member!.connected_accounts as any[]) : [];
+    const next = mutate(current);
+    if (!next) return "not_found";
+    try {
+      await userDb.updateUser(memberUserId, { connected_accounts: next } as any, {
+        condition: current.length === 0
+          ? { expression: "attribute_not_exists(#caCas) OR size(#caCas) = :caZero", names: { "#caCas": "connected_accounts" }, values: { ":caZero": 0 } }
+          : { expression: "#caCas = :caPrev", names: { "#caCas": "connected_accounts" }, values: { ":caPrev": current } },
+      });
+      return "ok";
+    } catch (err: any) {
+      if (err?.code === "ConditionalCheckFailedException" || err?.name === "ConditionalCheckFailedException") continue;
+      throw err;
+    }
+  }
+  throw new Error("connected_accounts write kept conflicting");
+}
+
 // Toggle sharing a personal connected account with the org
 router.patch("/connected-accounts/:platform/:accountId/share", async (req: Request, res: Response) => {
   try {
@@ -1380,9 +1411,16 @@ router.patch("/connected-accounts/:platform/:accountId/share", async (req: Reque
       return res.status(403).json({ error: "Only the org owner can unshare an org-shared connected account" });
     }
 
-    const updated = [...accounts];
-    updated[idx] = { ...updated[idx], sharedWithOrg };
-    await userDb.updateUser(accountOwner.userId, { connected_accounts: updated } as any);
+    const result = await mutateMemberAccounts(accountOwner.userId, (list) => {
+      const i = list.findIndex((a: any) => a?.platform === platform && a?.account_id === accountId);
+      if (i === -1) return null;
+      const updated = [...list];
+      updated[i] = { ...updated[i], sharedWithOrg };
+      return updated;
+    });
+    if (result === "not_found") {
+      return res.status(404).json({ error: "Connected account not found" });
+    }
 
     return res.json({
       success: true,
@@ -1436,7 +1474,14 @@ router.delete("/connected-accounts/:platform/:accountId", async (req: Request, r
       return res.status(404).json({ error: "Connected account not found" });
     }
 
-    await deleteAccountById(owner.userId, platform as PlatformType, accountId);
+    const result = await mutateMemberAccounts(owner.userId, (list) => {
+      const next = list.filter((a: any) => !(a?.platform === platform && a?.account_id === accountId));
+      return next.length === list.length ? null : next;
+    });
+    if (result === "not_found") {
+      return res.status(404).json({ error: "Connected account not found" });
+    }
+    invalidateCachedPixels(owner.userId);
     console.log(`[org] ENG-2595 member account disconnect: actor=${userId} org=${user.orgId} member=${owner.userId} platform=${platform} account=${accountId}`);
     return res.json({ success: true, ownerUserId: owner.userId });
   } catch (error) {

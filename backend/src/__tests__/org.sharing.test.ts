@@ -338,3 +338,28 @@ describe('DELETE /org/connected-accounts/:platform/:accountId', () => {
     expect(res.status).toBe(409);
   });
 });
+
+describe('ENG-2595: member account writes', () => {
+  it('removes a legacy entry that has no config', async () => {
+    mockUsers['user-member'].connected_accounts.push({ platform: 'meta', account_id: 'mk1-broken' });
+    mockCurrentUser = mockUsers['user-owner'];
+    const res = await request(app).delete('/org/connected-accounts/meta/mk1-broken');
+    expect(res.status).toBe(200);
+    expect(mockUsers['user-member'].connected_accounts.map((a: any) => a.account_id)).not.toContain('mk1-broken');
+  });
+
+  it('conditions the write on the list read and re-applies on conflict', async () => {
+    const { userDb } = require('../services/db');
+    // A concurrent writer removes tw-001 between our read and our write.
+    userDb.updateUser.mockImplementationOnce((userId: string, _u: any, opts: any) => {
+      expect(opts?.condition?.expression).toContain('#caCas = :caPrev');
+      mockUsers[userId].connected_accounts = mockUsers[userId].connected_accounts.filter((a: any) => a.account_id !== 'tw-001');
+      return Promise.reject(Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' }));
+    });
+    mockCurrentUser = mockUsers['user-owner'];
+    const res = await request(app).delete('/org/connected-accounts/google_ads/google-ads-001');
+    expect(res.status).toBe(200);
+    // Both changes survive: the concurrent removal AND ours.
+    expect(mockUsers['user-member'].connected_accounts).toHaveLength(0);
+  });
+});
