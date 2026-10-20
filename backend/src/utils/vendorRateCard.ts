@@ -150,8 +150,8 @@ export const EDITABLE_VENDOR_RATE_PROVIDERS: readonly VendorRateProvider[] = ["t
 /** AW-Settings item holding the overrides (see parseVendorRateOverrides for the shape). */
 export const VENDOR_RATE_OVERRIDES_SETTING = "vendor_rate_overrides";
 
-// Far above any real Twilio per-unit price: a decimal-point typo (14 for 0.014) still has to be caught by the
-// admin UI's confirm dialog, but a wild one (1400) is refused outright.
+// Far above any real Twilio per-unit price. A decimal-point slip such as 14 or 1400 for 0.014 is refused outright
+// by this ceiling; a smaller one such as 1.4 stays under it and is left to the admin UI's confirm dialog.
 export const MAX_OVERRIDE_USD_PER_UNIT = 10;
 
 export type VendorRateOverrides = Partial<Record<VendorRateProvider, Record<string, number>>>;

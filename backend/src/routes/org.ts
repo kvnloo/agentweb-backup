@@ -112,7 +112,6 @@ function buildOrgMarketStrategyForCopy(user: any): MarketStrategy | undefined {
   };
 }
 
-// All org routes require authentication
 /**
  * The org record as returned by update endpoints must not carry the hot-lead call internals: the team members'
  * phones and verification times, the caller-number sid, the pending verification (code hash) or the purchase history.
@@ -125,6 +124,7 @@ function withoutHotLeadCallInternals<T extends object | null | undefined>(org: T
   return rest as Omit<NonNullable<T>, 'hotLeadCall' | 'hotLeadCallVerification' | 'hotLeadCallProvisioning'>;
 }
 
+// All org routes require authentication
 router.use(authenticateToken);
 
 // Read and write authority over org connected accounts are separate questions, so

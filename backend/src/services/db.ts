@@ -203,9 +203,9 @@ async function ensureLeadSystemMap(listId: string, leadId: string, caller: strin
     await dynamodb.update({
       TableName: `${TABLE_PREFIX}AW-Leads`,
       Key: { listId, leadId },
-      // `system` is a DynamoDB reserved keyword — confirmed live against a real table (round 15/16
-      // smoke test): unescaped, this throws ValidationException, invisible to unit tests since they
-      // mock dynamodb.update() and never validate expression syntax against the reserved-word list.
+      // `system` is a DynamoDB reserved keyword — confirmed live against a real table:
+      // unescaped, this throws ValidationException, invisible to unit tests since they mock
+      // dynamodb.update() and never validate expression syntax against the reserved-word list.
       UpdateExpression: 'SET #system = if_not_exists(#system, :emptyMap)',
       ExpressionAttributeNames: { '#system': 'system' },
       ExpressionAttributeValues: { ':emptyMap': {} },
