@@ -6,6 +6,7 @@ import {
   REST_SETTINGS_KEYS, type HotLeadCallCaller,
 } from '../services/hotLeadCallSettingsService';
 import { MEMBER_ID } from '../services/hotLeadCallConfig';
+import { isRecord } from '../services/leadNotificationAttribution';
 import {
   ConflictError, ForbiddenError, NotEntitledError, NotFoundError, ProviderError, RateLimitedError, RevisionRequiredError,
   StoredStateInvalidError, ValidationError, VerificationCodeError,
@@ -52,7 +53,6 @@ function sendError(res: Response, err: unknown, what: string): Response {
   return res.status(500).json({ error: `Failed to ${what}` });
 }
 
-const isPlainObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
 router.get('/', async (req, res) => {
   try {
@@ -69,7 +69,7 @@ router.put('/', async (req, res) => {
     const ctx = await loadCaller(req);
     if (!ctx) return res.status(404).json({ error: 'No organization' });
     const body: unknown = req.body;
-    if (!isPlainObject(body)) return res.status(400).json({ error: 'A settings object is required' });
+    if (!isRecord(body)) return res.status(400).json({ error: 'A settings object is required' });
     if (JSON.stringify(body).length > MAX_BODY_JSON_CHARS) return res.status(400).json({ error: 'The settings are too large' });
     const unknown = Object.keys(body).filter(k => !(REST_SETTINGS_KEYS as readonly string[]).includes(k));
     if (unknown.length) {
@@ -104,7 +104,7 @@ router.post('/members/:memberId/verification/confirm', async (req: Request, res:
     const memberId = memberIdOf(req);
     if (!memberId) return res.status(404).json({ error: 'That team member does not exist.' });
     const body: unknown = req.body;
-    if (!isPlainObject(body) || Object.keys(body).some(k => k !== 'code')) return res.status(400).json({ error: 'Send {code} with the 6 digits', attemptsLeft: 0 });
+    if (!isRecord(body) || Object.keys(body).some(k => k !== 'code')) return res.status(400).json({ error: 'Send {code} with the 6 digits', attemptsLeft: 0 });
     await confirmMemberVerification(ctx.org, ctx.caller, memberId, body.code);
     return res.json({ verified: true });
   } catch (err) {

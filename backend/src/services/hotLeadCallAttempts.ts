@@ -1,8 +1,9 @@
 import { createHash } from 'crypto';
 import type { HotLeadCallConfig } from './hotLeadCallConfig';
 import { selectHotLeadCallCandidates } from './hotLeadCallRoster';
-import { closeBetweenAttempts, errorText, placeMemberCall } from './hotLeadCallPlacement';
-import { isNonEmpty, MINUTE_MS, runQueuedHotLeadJob } from './hotLeadCallQueue';
+import { closeBetweenAttempts, placeMemberCall } from './hotLeadCallPlacement';
+import { runQueuedHotLeadJob } from './hotLeadCallQueue';
+import { errorText, isNonEmpty, MINUTE_MS } from './hotLeadCallText';
 import { resolveHotLeadCallContext, type HotLeadCallContext } from './voice/hotLeadCallContext';
 import { isHotLeadCallEntitled } from './voice/hotLeadCallEntitlement';
 import { isHotLeadCallEnabled } from './voice/hotLeadCallMode';

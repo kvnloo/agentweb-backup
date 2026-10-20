@@ -183,7 +183,7 @@ describe('real voice provider', () => {
       await expect(getVoiceProvider().placeCall(callParams)).rejects.toMatchObject({ placed: 'no' });
       expect(mockCreate).not.toHaveBeenCalled();
       // The failure is logged too, with the operation and the redacted target.
-      expect(errSpy).toHaveBeenCalledWith(expect.stringMatching(/^\[voice\] placeCall to \*\*\*0100 failed \(placed=no\): Twilio credentials unavailable/));
+      expect(errSpy).toHaveBeenCalledWith(expect.stringMatching(/^\[hotLeadCall\] placeCall to \*\*\*0100 failed \(placed=no\): Twilio credentials unavailable/));
     });
   });
 

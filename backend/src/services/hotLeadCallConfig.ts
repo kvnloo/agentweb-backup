@@ -14,7 +14,7 @@ export const HOT_LEAD_CALL_MAX_TEAM_SIZE = 10;
 export const HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER = 7;
 export const HOT_LEAD_CALL_MEMBER_NAME_MAX = 40;
 /** The only time that is valid as a window end but not as a start: midnight at the end of the day. */
-export const END_OF_DAY = '24:00';
+const END_OF_DAY = '24:00';
 
 export const HOT_LEAD_CALL_LIMITS = {
   maxAgeMinutes: { default: 10, min: 1, max: 60 },
@@ -183,14 +183,30 @@ function callingHoursOf(raw: unknown): HotLeadCallCallingHours | null {
   return timezone ? { start, end, timezone } : null;
 }
 
-export function windowOf(raw: unknown): HotLeadCallWindow | null {
-  if (!isRecord(raw) || Object.keys(raw).some(k => !WINDOW_KEYS.has(k))) return null;
+export interface WindowProblem {
+  /** The field the problem concerns; '' for the window as a whole. */
+  field: '' | 'days' | 'start' | 'end';
+  message: string;
+}
+
+/** The one validator of an availability window: the window, or its first problem worded for the person who typed it. */
+export function checkWindow(raw: unknown): { window: HotLeadCallWindow } | WindowProblem {
+  if (!isRecord(raw)) return { field: '', message: 'Each availability window must be an object' };
+  if (Object.keys(raw).some(k => !WINDOW_KEYS.has(k))) return { field: '', message: 'Unknown field in an availability window' };
   const { days, start, end } = raw;
-  if (!Array.isArray(days) || days.length < 1 || days.length > 7 || new Set(days).size !== days.length) return null;
-  if (!days.every(d => typeof d === 'number' && Number.isInteger(d) && d >= 0 && d <= 6)) return null;
-  if (!isHhmm(start) || !(isHhmm(end) || end === END_OF_DAY)) return null;
-  if (hhmmToMinutes(start) >= hhmmToMinutes(end)) return null;
-  return { days: [...days], start, end };
+  if (!Array.isArray(days) || days.length < 1 || days.length > 7 || new Set(days).size !== days.length
+    || !days.every(d => typeof d === 'number' && Number.isInteger(d) && d >= 0 && d <= 6)) {
+    return { field: 'days', message: 'Pick between 1 and 7 different days (0 = Sunday to 6 = Saturday)' };
+  }
+  if (!isHhmm(start)) return { field: 'start', message: 'Start must be a time such as 09:00' };
+  if (!(isHhmm(end) || end === END_OF_DAY)) return { field: 'end', message: 'End must be a time such as 17:00, or 24:00 for the end of the day' };
+  if (hhmmToMinutes(start) >= hhmmToMinutes(end)) return { field: 'end', message: 'End must be after start; an overnight shift is two windows' };
+  return { window: { days: [...days], start, end } };
+}
+
+function windowOf(raw: unknown): HotLeadCallWindow | null {
+  const checked = checkWindow(raw);
+  return 'window' in checked ? checked.window : null;
 }
 
 /** The trimmed member name, or null when it is empty, too long or has characters outside the allowed set. */

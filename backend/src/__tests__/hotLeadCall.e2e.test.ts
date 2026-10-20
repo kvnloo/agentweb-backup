@@ -380,7 +380,7 @@ describe('simultaneous and failed deliveries', () => {
   it('treats an empty CallDuration as missing: warned about and not billed, not silently read as zero seconds', async () => {
     const call = await bridgedCall();
     await call.leadStatus('completed', 3, { CallDuration: '' });
-    expect(JSON.stringify(world.consoleSpies.flatMap((s) => s.mock.calls))).toContain('[VoiceUsage] non-finite call duration');
+    expect(JSON.stringify(world.consoleSpies.flatMap((s) => s.mock.calls))).toContain('[hotLeadCall] non-finite call duration');
     await call.memberLegEnds('completed', '30');
     expect(usageSummary()).toEqual([['twilio:voice:CA00000001:member', 1]]);
     expect(recordOf('lead-a')?.state).toBe('finished');

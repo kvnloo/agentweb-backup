@@ -184,7 +184,7 @@ class TwilioVoiceProvider implements VoiceProvider {
   // redacted (it goes to the log line).
   private async run<T>(operation: string, target: string, fn: (client: TwilioClient) => Promise<T>): Promise<T> {
     const fail = (e: VoiceCallError): never => {
-      console.error(`[voice] ${operation}${target} failed (placed=${e.placed}): ${e.message}`);
+      console.error(`[hotLeadCall] ${operation}${target} failed (placed=${e.placed}): ${e.message}`);
       throw e;
     };
     let active: Active | undefined;

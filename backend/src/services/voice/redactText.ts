@@ -19,7 +19,7 @@
 // so ids like job_1234567 survive while a glued prefix ("to4155550100") does not; a digit run glued on the
 // right ("4155550100x") is still redacted, and a leading + or %2B always starts a match.
 // No trailing \b: an underscore suffix (a word character) must not stop the SID being kept whole.
-export const RESOURCE_SID = /\b[A-Z]{2}[0-9a-f]{32}(?![0-9a-f])/;
+const RESOURCE_SID = /\b[A-Z]{2}[0-9a-f]{32}(?![0-9a-f])/;
 const ISO_DATE = /\b\d{4}-\d{2}-\d{2}(?!\d)/;
 const UUID = /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/;
 // Both need a left bound like a phone's and must end where the run ends, so they never keep the front of a longer phone-like run.

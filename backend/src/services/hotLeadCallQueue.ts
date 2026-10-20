@@ -1,8 +1,5 @@
 import { enqueueJob, markJobComplete, markJobFailed, startHeartbeat } from './asyncJobQueue';
-import { errorText } from './hotLeadCallPlacement';
-
-export const MINUTE_MS = 60_000;
-export const isNonEmpty = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0;
+import { errorText } from './hotLeadCallText';
 
 /**
  * Queues a hot-lead-call job under its permanent key and runs it once in this process: claim on enqueue,

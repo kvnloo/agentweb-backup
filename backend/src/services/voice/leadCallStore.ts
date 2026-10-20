@@ -1,5 +1,6 @@
 import { crmDb, ENGAGED_EVENT_KEYWORDS } from '../db';
 import { redactPhones } from './redactText';
+import { errorCode } from './setupWrites';
 import type {
   HotLeadCallEventType,
   HotLeadCallPatch,
@@ -116,7 +117,8 @@ class DynamoLeadCallStore implements LeadCallStore {
         createdAt: new Date().toISOString(),
       });
     } catch (err) {
-      console.warn(`[leadCallStore] could not record ${type} for lead ${leadId}:`, err instanceof Error ? err.message : err);
+      // The error text of a lower layer can echo request data, so only its code or name is logged.
+      console.warn(`[hotLeadCall] could not record ${type} for lead ${leadId}:`, errorCode(err) ?? (err instanceof Error ? err.name : 'error'));
     }
   }
 }

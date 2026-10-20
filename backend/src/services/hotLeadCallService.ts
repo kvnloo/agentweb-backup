@@ -15,8 +15,9 @@ import { leadPhoneMacOf } from './voice/leadPhoneMac';
 import { isWithinCallWindow, reserveCallSlot, type Reservation } from './voice/hotLeadCallLimits';
 import { selectHotLeadCallCandidates } from './hotLeadCallRoster';
 import { NEXT_ATTEMPT_SOURCE, processHotLeadCallNextAttempt } from './hotLeadCallAttempts';
-import { errorText, holdsClaim, placeMemberCall, type PlacementResult } from './hotLeadCallPlacement';
-import { isNonEmpty, MINUTE_MS, runQueuedHotLeadJob } from './hotLeadCallQueue';
+import { holdsClaim, placeMemberCall, type PlacementResult } from './hotLeadCallPlacement';
+import { runQueuedHotLeadJob } from './hotLeadCallQueue';
+import { errorText, isNonEmpty, MINUTE_MS } from './hotLeadCallText';
 // This file must not import orgLeadNotificationService: that module calls dispatchHotLeadCall.
 
 interface HotLeadCallJob {

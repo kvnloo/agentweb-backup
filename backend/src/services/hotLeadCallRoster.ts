@@ -2,9 +2,9 @@ import { localParts } from './dripSendWindow';
 import { hhmmToMinutes, type HotLeadCallConfig, type HotLeadCallMember } from './hotLeadCallConfig';
 import { isWithinCallWindow } from './voice/hotLeadCallLimits';
 
-export type NotCalledReason = 'unverified' | 'outside_window' | 'excluded' | 'outside_calling_hours';
+type NotCalledReason = 'unverified' | 'outside_window' | 'excluded' | 'outside_calling_hours';
 
-export interface RosterEntry {
+interface RosterEntry {
   member: HotLeadCallMember;
   /** Why this member would not be rung at the given time; absent when they would be. */
   reason?: NotCalledReason;

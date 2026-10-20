@@ -56,9 +56,12 @@ export interface HotLeadCallRecord {
   /**
    * Highest Twilio SequenceNumber handled per CallSid, to ignore out-of-order status callbacks. It also holds
    * the voice webhooks' first-writer-wins decision markers, which rely on the same strictly-higher condition
-   * (a second write of the same key fails): `<memberCallSid>#gather` (the member's one decision at the Gather)
-   * `<memberCallSid>#dial` (the one lead-side result of the dial: no answer, declined, aborted), `<leadCallSid>#screen` (the lead's one answer
-   * at the screening prompt) and `lead#adopt` (the first writer that names the lead leg).
+   * (a second write of the same key fails):
+   * - `<memberCallSid>#gather`: the member's one decision at the Gather;
+   * - `<memberCallSid>#dial`: the one lead-side result of the dial (no answer, declined, aborted);
+   * - `<memberCallSid>#ended`: the member leg ended without taking the lead;
+   * - `<leadCallSid>#screen`: the lead's one answer at the screening prompt;
+   * - `lead#adopt`: the first writer that names the lead leg.
    */
   lastSequence?: Record<string, number>;
 }
@@ -77,7 +80,7 @@ export type HotLeadCallEventType =
   | 'call.skipped';
 
 /** Record fields a transition can remove (not just overwrite): the ones a next attempt starts without. */
-export type ClearableField = 'memberCallSid' | 'outcome';
+type ClearableField = 'memberCallSid' | 'outcome';
 
 /** What a transition changes. `clear` removes fields; a field cannot be both set and cleared in one patch. */
 export type HotLeadCallPatch = Partial<HotLeadCallRecord> & { state: HotLeadCallState; clear?: ClearableField[] };

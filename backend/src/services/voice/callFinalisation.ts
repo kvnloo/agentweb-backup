@@ -77,7 +77,7 @@ export async function finishIfComplete(q: CallQuery): Promise<void> {
  * The orchestrator marks an ambiguous placement with outcome 'placement_unknown' while the record stays
  * 'dialing': that is information, not a decision, so it must not suppress the real member outcome.
  */
-export const decidedOutcome = (record: HotLeadCallRecord): string | undefined =>
+const decidedOutcome = (record: HotLeadCallRecord): string | undefined =>
   !record.outcome || record.outcome === 'placement_unknown' ? undefined : record.outcome;
 
 /**

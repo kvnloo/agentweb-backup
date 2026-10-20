@@ -13,10 +13,11 @@ It is a second subscriber to the same moment as the Slack lead alert
 suppresses that alert: a skipped or failed call leaves the Slack message as the
 fallback.
 
-Status of this document: written against the complete ENG-2271 feature branch,
-including the number-provisioning and team-member verification Emma tools.
-Everything marked **to confirm with Twilio** or listed under "Not
-verified" has never been run against a real Twilio account.
+Status of this document: it describes the code as merged, including the number-provisioning
+and team-member verification Emma tools. The behaviour is covered by tests against fakes
+and DynamoDB Local; nothing here has been run against a real Twilio account. Everything
+marked **to confirm with Twilio** or listed under "Not verified" is an assumption taken
+from Twilio's documentation.
 
 ## Operator quick reference
 
@@ -900,7 +901,7 @@ Mitigations to decide before general availability (none of them is built):
 Owner: Anurag. None of these may be skipped before `hot_lead_call_mode` is turned
 on anywhere.
 
-1. Compliance sign-off (decision D7): consent and disclosure for automated calls
+1. Compliance sign-off: consent and disclosure for automated calls
    to team members and for connecting leads, call recording stance (nothing is
    recorded by this feature), regional restrictions.
 2. Twilio account: production credentials in `prod/AgentWeb/Twilio`, billing and

@@ -1,15 +1,14 @@
 import { randomUUID } from 'crypto';
 import { redactPhone } from './whatsappService';
 import type { HotLeadCallConfig, HotLeadCallMember } from './hotLeadCallConfig';
-import { VoiceCallError, getVoiceProvider, scrubErrorText } from './voice/voiceProvider';
+import { VoiceCallError, getVoiceProvider } from './voice/voiceProvider';
+import { errorText } from './hotLeadCallText';
 import { buildVoiceWebhookUrl } from './voice/voiceUrls';
 import { claimMemberCooldown } from './voice/hotLeadCallLimits';
 import { getLeadCallStore } from './voice/leadCallStore';
 import type { HotLeadCallEventType, HotLeadCallPatch, LeadCallStore } from './voice/leadCallStore.types';
 
 const MEMBER_RING_TIMEOUT_SECONDS = 25;
-
-export const errorText = (err: unknown): string => scrubErrorText(err instanceof Error ? err.message : 'unknown').slice(0, 200);
 
 /** How a placement pass ended. */
 export type PlacementResult =

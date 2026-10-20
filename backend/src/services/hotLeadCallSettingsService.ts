@@ -7,8 +7,8 @@ import { isLeadTypes } from './leadNotificationConfig';
 import { isRecord } from './leadNotificationAttribution';
 import {
   allowlistedE164, announcedNameOf, generateMemberId, hhmmToMinutes, hotLeadCallConfigOf, maskPhone, memberNameOf, normalizeTimezone,
-  windowOf, isHhmm, HOT_LEAD_CALL_COUNTRIES, HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS, HOT_LEAD_CALL_MAX_TEAM_SIZE,
-  HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER, HOT_LEAD_CALL_MEMBER_NAME_MAX, HOT_LEAD_CALL_ANNOUNCED_NAME_MAX, HOT_LEAD_CALL_SYSTEM_FIELDS, END_OF_DAY,
+  checkWindow, isHhmm, HOT_LEAD_CALL_COUNTRIES, HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS, HOT_LEAD_CALL_MAX_TEAM_SIZE,
+  HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER, HOT_LEAD_CALL_MEMBER_NAME_MAX, HOT_LEAD_CALL_ANNOUNCED_NAME_MAX, HOT_LEAD_CALL_SYSTEM_FIELDS,
   type HotLeadCallConfig, type HotLeadCallMember,
 } from './hotLeadCallConfig';
 import { previewHotLeadCallCandidates } from './hotLeadCallRoster';
@@ -53,7 +53,7 @@ export interface HotLeadCallSettingsDto {
   limits: { maxTeamSize: number; maxWindowsPerMember: number; minAttempts: number; maxAttempts: number; nameMaxLength: number };
 }
 
-export interface HotLeadCallPreviewDto {
+interface HotLeadCallPreviewDto {
   at: string;
   timezone: string | null;
   outsideCallingHours: boolean;
@@ -217,18 +217,61 @@ function phoneOf(raw: unknown): string | null {
   return e164 ? allowlistedE164(e164) : null;
 }
 
-/** The first problem of one availability window, as the field it concerns ('' for the window as a whole) and a message. */
-function windowProblem(raw: unknown): { field: '' | 'days' | 'start' | 'end'; message: string } | null {
-  if (!isRecord(raw)) return { field: '', message: 'Each availability window must be an object' };
-  const { days, start, end } = raw;
-  if (Object.keys(raw).some(k => k !== 'days' && k !== 'start' && k !== 'end')) return { field: '', message: 'Unknown field in an availability window' };
-  if (!Array.isArray(days) || days.length < 1 || days.length > 7 || new Set(days).size !== days.length || !days.every(d => Number.isInteger(d) && d >= 0 && d <= 6)) {
-    return { field: 'days', message: 'Pick between 1 and 7 different days (0 = Sunday to 6 = Saturday)' };
+interface TeamBuild {
+  stored: Map<string, HotLeadCallMember>;
+  usedIds: string[];
+  /** Stored ids already claimed by an earlier entry of this update. */
+  seen: Set<string>;
+}
+
+/** One submitted person as a member, or null after recording every problem with it in `errors`. */
+function parseTeamEntry(entry: unknown, i: number, build: TeamBuild, errors: Errors): HotLeadCallMember | null {
+  const at = (field: string) => `team.${i}.${field}`;
+  let failed = false;
+  const fail = (path: string, message: string) => { errors[path] = message; failed = true; };
+  if (!isRecord(entry)) { fail(`team.${i}`, 'Each person must be an object'); return null; }
+  for (const key of Object.keys(entry)) {
+    if (!(TEAM_ENTRY_KEYS as readonly string[]).includes(key)) fail(at(key), key === 'verifiedAt' ? 'Verification is managed by the system and cannot be set here' : 'Unknown field');
   }
-  if (!isHhmm(start)) return { field: 'start', message: 'Start must be a time such as 09:00' };
-  if (!(isHhmm(end) || end === END_OF_DAY)) return { field: 'end', message: 'End must be a time such as 17:00, or 24:00 for the end of the day' };
-  if (hhmmToMinutes(start) >= hhmmToMinutes(end)) return { field: 'end', message: 'End must be after start; an overnight shift is two windows' };
-  return windowOf(raw) ? null : { field: '', message: 'Invalid availability window' };
+
+  let existing: HotLeadCallMember | undefined;
+  if (entry.id !== undefined) {
+    existing = typeof entry.id === 'string' ? build.stored.get(entry.id) : undefined;
+    if (!existing) fail(at('id'), 'Unknown person: reload the settings and try again');
+    else if (build.seen.has(existing.id)) fail(at('id'), 'This person is listed twice');
+    else build.seen.add(existing.id);
+  }
+
+  const name = memberNameOf(entry.name);
+  if (!name) fail(at('name'), MEMBER_NAME_HELP);
+
+  let phone: string | null = null;
+  if (entry.phone !== undefined) {
+    phone = phoneOf(entry.phone);
+    if (!phone) fail(at('phone'), PHONE_HELP);
+  } else if (existing) {
+    phone = existing.phone;
+  } else if (entry.id === undefined) {
+    fail(at('phone'), 'A phone number is required for a new person');
+  }
+
+  const windows: HotLeadCallMember['windows'] = [];
+  if (!Array.isArray(entry.windows) || entry.windows.length < 1 || entry.windows.length > HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER) {
+    fail(at('windows'), `Add between 1 and ${HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER} availability windows`);
+  } else {
+    entry.windows.forEach((w, j) => {
+      const checked = checkWindow(w);
+      if ('window' in checked) windows.push(checked.window);
+      else fail(`${at('windows')}.${j}${checked.field ? `.${checked.field}` : ''}`, checked.message);
+    });
+  }
+
+  if (failed || !name || !phone) return null;
+  const id = existing?.id ?? generateMemberId(build.usedIds);
+  if (!existing) build.usedIds.push(id);
+  // A phone that is kept stays verified; a different one starts unverified.
+  const verifiedAt = existing && existing.phone === phone ? existing.verifiedAt : undefined;
+  return { id, name, phone, ...(verifiedAt ? { verifiedAt } : {}), windows };
 }
 
 /** Members after this update, in the order given. Existing ids keep their stored phone and verification unless the phone changes. */
@@ -238,65 +281,21 @@ function buildTeam(rawTeam: unknown, current: HotLeadCallConfig | undefined, err
   if (rawTeam.length > HOT_LEAD_CALL_MAX_TEAM_SIZE) { errors.team = `A team has at most ${HOT_LEAD_CALL_MAX_TEAM_SIZE} people`; return undefined; }
 
   const stored = new Map((current?.team ?? []).map(m => [m.id, m]));
-  const usedIds = [...stored.keys()];
-  const seen = new Set<string>();
+  const build: TeamBuild = { stored, usedIds: [...stored.keys()], seen: new Set() };
   const team: HotLeadCallMember[] = [];
   let failed = false;
   const fail = (path: string, message: string) => { errors[path] = message; failed = true; };
-
   rawTeam.forEach((entry, i) => {
-    const at = (field: string) => `team.${i}.${field}`;
-    if (!isRecord(entry)) return fail(`team.${i}`, 'Each person must be an object');
-    for (const key of Object.keys(entry)) {
-      if (!(TEAM_ENTRY_KEYS as readonly string[]).includes(key)) fail(at(key), key === 'verifiedAt' ? 'Verification is managed by the system and cannot be set here' : 'Unknown field');
-    }
-
-    let existing: HotLeadCallMember | undefined;
-    if (entry.id !== undefined) {
-      existing = typeof entry.id === 'string' ? stored.get(entry.id) : undefined;
-      if (!existing) fail(at('id'), 'Unknown person: reload the settings and try again');
-      else if (seen.has(existing.id)) fail(at('id'), 'This person is listed twice');
-      else seen.add(existing.id);
-    }
-
-    const name = memberNameOf(entry.name);
-    if (!name) fail(at('name'), MEMBER_NAME_HELP);
-
-    let phone: string | null = null;
-    if (entry.phone !== undefined) {
-      phone = phoneOf(entry.phone);
-      if (!phone) fail(at('phone'), PHONE_HELP);
-    } else if (existing) {
-      phone = existing.phone;
-    } else if (entry.id === undefined) {
-      fail(at('phone'), 'A phone number is required for a new person');
-    }
-
-    const windows: HotLeadCallMember['windows'] = [];
-    if (!Array.isArray(entry.windows) || entry.windows.length < 1 || entry.windows.length > HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER) {
-      fail(at('windows'), `Add between 1 and ${HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER} availability windows`);
-    } else {
-      entry.windows.forEach((w, j) => {
-        const problem = windowProblem(w);
-        const window = problem ? null : windowOf(w);
-        if (!window) return fail(`${at('windows')}.${j}${problem?.field ? `.${problem.field}` : ''}`, problem?.message ?? 'Invalid availability window');
-        windows.push(window);
-      });
-    }
-
-    if (failed || !name || !phone) return;
-    const id = existing?.id ?? generateMemberId(usedIds);
-    if (!existing) usedIds.push(id);
-    // A phone that is kept stays verified; a different one starts unverified.
-    const verifiedAt = existing && existing.phone === phone ? existing.verifiedAt : undefined;
-    team.push({ id, name, phone, ...(verifiedAt ? { verifiedAt } : {}), windows });
+    const member = parseTeamEntry(entry, i, build, errors);
+    if (member) team.push(member);
+    else failed = true;
   });
 
   // Ids name a member in call records, and a shared phone would ring one person twice per lead.
-  const owners = new Map<string, number>();
+  const indexByPhone = new Map<string, number>();
   team.forEach((m, i) => {
-    if (owners.has(m.phone)) fail(`team.${i}.phone`, 'Another person already has this phone number');
-    else owners.set(m.phone, i);
+    if (indexByPhone.has(m.phone)) fail(`team.${i}.phone`, 'Another person already has this phone number');
+    else indexByPhone.set(m.phone, i);
     if (current?.twilioNumber === m.phone) fail(`team.${i}.phone`, 'This is the number calls are placed from; enter the person\'s own phone');
   });
   return failed ? undefined : team;
