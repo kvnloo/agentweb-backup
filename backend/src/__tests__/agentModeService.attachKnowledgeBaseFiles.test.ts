@@ -225,7 +225,7 @@ describe('AgentModeService - attachKnowledgeBaseFiles', () => {
 
       const result = await agentModeService.attachKnowledgeBaseFiles(
         'task-123',
-        [{ [key]: 'design.md', content: '# Design' } as any],
+        [{ [key]: 'design.md', content: '# Design' }],
         'user-123',
         'session-123'
       );
@@ -238,7 +238,7 @@ describe('AgentModeService - attachKnowledgeBaseFiles', () => {
   it('should return an actionable error when a file has no name (ENG-2350)', async () => {
     const result = await agentModeService.attachKnowledgeBaseFiles(
       'task-123',
-      [{ content: 'some content' } as any],
+      [{ content: 'some content' }],
       'user-123',
       'session-123'
     );
@@ -255,7 +255,7 @@ describe('AgentModeService - attachKnowledgeBaseFiles', () => {
 
     const result = await agentModeService.attachKnowledgeBaseFiles(
       'task-123',
-      [{ name: 'ok.md', content: 'fine' }, { content: 'nameless' } as any],
+      [{ name: 'ok.md', content: 'fine' }, { content: 'nameless' }],
       'user-123',
       'session-123'
     );
@@ -275,7 +275,7 @@ describe('AgentModeService - attachKnowledgeBaseFiles', () => {
 
     const result = await agentModeService.attachKnowledgeBaseFiles(
       'task-123',
-      [{ name: '', fileName: 'design.md', content: '# Design' } as any],
+      [{ name: '', fileName: 'design.md', content: '# Design' }],
       'user-123',
       'session-123'
     );
@@ -287,7 +287,7 @@ describe('AgentModeService - attachKnowledgeBaseFiles', () => {
   it('should report a missing name for a text-keyed file instead of crashing (ENG-2350)', async () => {
     const result = await agentModeService.attachKnowledgeBaseFiles(
       'task-123',
-      [{ fileName: 'design.md', text: 'wrong key' } as any],
+      [{ fileName: 'design.md', text: 'wrong key' }],
       'user-123',
       'session-123'
     );
@@ -304,7 +304,7 @@ describe('AgentModeService - attachKnowledgeBaseFiles', () => {
   ])('should return a validation error, not a TypeError, for %s (ENG-2350)', async (_label, files) => {
     const result = await agentModeService.attachKnowledgeBaseFiles(
       'task-123',
-      files as any,
+      files,
       'user-123',
       'session-123'
     );
@@ -323,7 +323,7 @@ describe('AgentModeService - attachKnowledgeBaseFiles', () => {
 
     const result = await agentModeService.attachKnowledgeBaseFiles(
       'task-123',
-      JSON.stringify([{ file_name: 'design.md', content: '# Design' }]) as any,
+      JSON.stringify([{ file_name: 'design.md', content: '# Design' }]),
       'user-123',
       'session-123'
     );
@@ -335,7 +335,7 @@ describe('AgentModeService - attachKnowledgeBaseFiles', () => {
   it('should return a clear error for files that is neither an array nor valid JSON (ENG-2350)', async () => {
     const result = await agentModeService.attachKnowledgeBaseFiles(
       'task-123',
-      'not json' as any,
+      'not json',
       'user-123',
       'session-123'
     );

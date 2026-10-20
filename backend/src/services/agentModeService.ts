@@ -10492,7 +10492,7 @@ export class AgentModeService {
 
   public async attachKnowledgeBaseFiles(
     taskId: string,
-    files: Array<{ name: string; content: string }>,
+    files: unknown,
     userId: string,
     sessionId: string
   ): Promise<any> {
