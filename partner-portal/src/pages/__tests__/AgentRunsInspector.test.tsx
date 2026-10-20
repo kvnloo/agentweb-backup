@@ -179,7 +179,7 @@ describe("AgentRunsInspector", () => {
     expect(screen.getByText("Work plan · 2 of 2 steps completed")).toBeInTheDocument();
     expect(screen.getByText("Step 1 · Load metrics")).toBeInTheDocument();
     expect(screen.getByText("Loaded 10 campaigns.")).toBeInTheDocument();
-    expect(screen.getByText("Marked completed with no tool calls of its own.")).toBeInTheDocument();
+    expect(screen.getByText("Marked completed with no work besides status updates.")).toBeInTheDocument();
     expect(screen.getByText("After the last step update")).toBeInTheDocument();
   });
 

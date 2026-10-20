@@ -157,7 +157,7 @@ describe('buildAgentRunTrace', () => {
   it('puts a status update that closes nothing into the current segment, so every call is shown once', () => {
     index = 0;
     const messages = [
-      assistantCalls(call('s1', 'set_work_plan_status', { updates: [{ stepCount: 1, status: 'in_progress' }] })),
+      assistantCalls(call('s1', 'set_work_plan_status', { updates: [{ stepCount: 1, status: 'pending' }] })),
       toolResult('s1', 'set_work_plan_status', 'ok', '2026-10-14T10:00:01Z'),
       assistantCalls(call('w1', 'load_data', {})),
       toolResult('w1', 'load_data', 'rows', '2026-10-14T10:00:02Z'),
@@ -237,6 +237,153 @@ describe('buildAgentRunTrace', () => {
     expect(trace.ask?.text).toBe('old ask');
     expect(trace.calls.map((c) => [c.id, c.status])).toEqual([['o1', 'succeeded']]);
     expect(trace.finalResponse?.html).toBe('old reply');
+  });
+
+  describe('run boundaries (fix review)', () => {
+    const user = (content: string, ts: string) => row({ role: 'user', content, metadata: { timestamp: ts } });
+    const reply = (content: string, ts?: string) => row({ role: 'assistant', content, ...(ts ? { metadata: { timestamp: ts } } : {}) });
+
+    it('bounds an unfinished run by the next run, whose ask is saved before its start', () => {
+      index = 0;
+      const messages = [
+        user('A', '2026-10-14T10:00:00Z'),
+        assistantCalls(call('a1', 'load_data', {})),
+        toolResult('a1', 'load_data', 'A rows', '2026-10-14T10:00:02Z'),
+        reply('A partial'),
+        user('B', '2026-10-14T10:00:10.950Z'),
+        assistantCalls(call('b1', 'load_data', {})),
+        toolResult('b1', 'load_data', 'B rows', '2026-10-14T10:00:12Z'),
+        reply('B done'),
+      ];
+      const a = buildAgentRunTrace({ sessionId: 's', messages, startedAt: '2026-10-14T10:00:00Z', nextStartedAt: '2026-10-14T10:00:11Z' });
+      expect([a.ask?.text, a.followUpAsks, a.calls.map((c) => c.id), a.finalResponse?.html]).toEqual(['A', [], ['a1'], 'A partial']);
+    });
+
+    it('keeps an ask saved well before the run started, and a mid-run reply with the calls around it', () => {
+      index = 0;
+      const messages = [
+        user('A', '2026-10-14T10:00:00Z'),
+        assistantCalls(call('w1', 'load_data', {})),
+        toolResult('w1', 'load_data', 'r1', '2026-10-14T10:00:08Z'),
+        assistantCalls(call('w2', 'load_data', {})),
+        toolResult('w2', 'load_data', 'r2', '2026-10-14T10:00:12Z'),
+        user('yes, go on', '2026-10-14T10:00:20Z'),
+        assistantCalls(call('w3', 'load_data', {})),
+        toolResult('w3', 'load_data', 'r3', '2026-10-14T10:00:25Z'),
+        reply('done', '2026-10-14T10:00:30Z'),
+      ];
+      const t = buildAgentRunTrace({ sessionId: 's', messages, startedAt: '2026-10-14T10:00:07Z', completedAt: '2026-10-14T10:00:30Z' });
+      expect([t.ask?.text, t.followUpAsks, t.calls.map((c) => c.id), t.finalResponse?.html]).toEqual(['A', ['yes, go on'], ['w1', 'w2', 'w3'], 'done']);
+    });
+
+    it('does not treat a trailing system row as a later run', () => {
+      index = 0;
+      const messages = [
+        user('A', '2026-10-14T10:00:00Z'),
+        reply('A done', '2026-10-14T10:00:03Z'),
+        row({ role: 'system', content: 'compacted', metadata: { timestamp: '2026-10-14T10:05:00Z' } }),
+      ];
+      const session = { workPlan: { steps: [{ stepCount: 1, title: 'x', status: 'completed' }] } };
+      const t = buildAgentRunTrace({ sessionId: 's', session, messages, startedAt: '2026-10-14T10:00:00Z', completedAt: '2026-10-14T10:00:10Z' });
+      expect([t.workPlanScope, t.finalResponse?.html]).toEqual(['run', 'A done']);
+    });
+
+    it('does not let one out-of-order timestamp end the run', () => {
+      index = 0;
+      const messages = [
+        user('A', '2026-10-14T10:00:00Z'),
+        assistantCalls(call('a1', 'load_data', {})),
+        toolResult('a1', 'load_data', 'r', '2026-10-14T10:05:00Z'),
+        assistantCalls(call('a2', 'load_data', {})),
+        toolResult('a2', 'load_data', 'r', '2026-10-14T10:00:06Z'),
+        reply('done', '2026-10-14T10:00:09Z'),
+      ];
+      const t = buildAgentRunTrace({ sessionId: 's', messages, startedAt: '2026-10-14T10:00:00Z', completedAt: '2026-10-14T10:00:10Z' });
+      expect([t.calls.map((c) => [c.id, c.status]), t.finalResponse?.html]).toEqual([[['a1', 'succeeded'], ['a2', 'succeeded']], 'done']);
+    });
+
+    it("scopes the plan to the run when the only later row is the run's own late final reply", () => {
+      index = 0;
+      const messages = [user('A', '2026-10-14T10:00:00Z'), reply('done', '2026-10-14T10:00:16Z')];
+      const session = { workPlan: { steps: [{ stepCount: 1, title: 'x', status: 'completed' }] } };
+      const t = buildAgentRunTrace({ sessionId: 's', session, messages, startedAt: '2026-10-14T10:00:00Z', completedAt: '2026-10-14T10:00:10Z' });
+      expect(t.workPlanScope).toBe('run');
+    });
+  });
+
+  describe('call pairing and steps (fix review)', () => {
+    it('does not shift later results onto an unanswered call that shares their id', () => {
+      index = 0;
+      const messages = [
+        assistantCalls(call('call_0', 'search', {})),
+        assistantCalls(call('call_0', 'fetch', {})),
+        toolResult('call_0', 'fetch', 'fetched', '2026-10-14T10:00:02Z'),
+        assistantCalls(call('call_0', 'fetch', {})),
+        toolResult('call_0', 'fetch', '⚠️ Tool Error: fetch\nReason: 500', '2026-10-14T10:00:03Z'),
+      ];
+      const t = buildAgentRunTrace({ sessionId: 's', messages });
+      expect(t.calls.map((c) => [c.id, c.name, c.status])).toEqual([
+        ['call_0', 'search', 'no_result'],
+        ['call_0#2', 'fetch', 'succeeded'],
+        ['call_0#3', 'fetch', 'failed'],
+      ]);
+    });
+
+    it('never gives two calls the same id when a provider id already contains #2', () => {
+      index = 0;
+      const messages = [
+        assistantCalls(call('a', 'search', {})),
+        toolResult('a', 'search', 'ok', '2026-10-14T10:00:01Z'),
+        assistantCalls(call('a', 'set_work_plan_status', { updates: [{ stepCount: 1, status: 'completed' }] })),
+        toolResult('a', 'set_work_plan_status', 'ok', '2026-10-14T10:00:02Z'),
+        assistantCalls(call('a#2', 'set_work_plan_status', { updates: [{ stepCount: 1, status: 'pending' }] })),
+        toolResult('a#2', 'set_work_plan_status', 'ok', '2026-10-14T10:00:03Z'),
+      ];
+      const session = { workPlan: { steps: [{ stepCount: 1, title: 'x', status: 'completed' }] } };
+      const t = buildAgentRunTrace({ sessionId: 's', session, messages });
+      const ids = t.calls.map((c) => c.id);
+      expect(new Set(ids).size).toBe(ids.length);
+      expect(t.workPlan!.steps[0].callIds).toEqual(['a', 'a#2']);
+    });
+
+    it('still flags a step closed with nothing but status updates, including a failed one and its retry', () => {
+      index = 0;
+      const messages = [
+        assistantCalls(call('w', 'load_data', {})),
+        toolResult('w', 'load_data', 'rows', '2026-10-14T10:00:01Z'),
+        assistantCalls(call('c1', 'set_work_plan_status', { updates: [{ stepCount: 1, status: 'completed' }] })),
+        toolResult('c1', 'set_work_plan_status', 'ok', '2026-10-14T10:00:02Z'),
+        assistantCalls(call('c2', 'set_work_plan_status', { updates: [{ stepCount: 2, status: 'completed' }] })),
+        toolResult('c2', 'set_work_plan_status', '❌ Cannot complete these steps yet: missing required calls', '2026-10-14T10:00:03Z'),
+        assistantCalls(call('c3', 'set_work_plan_status', { updates: [{ stepCount: 2, status: 'completed' }] })),
+        toolResult('c3', 'set_work_plan_status', 'ok', '2026-10-14T10:00:04Z'),
+      ];
+      const session = { workPlan: { steps: [{ stepCount: 1, title: 'a', status: 'completed' }, { stepCount: 2, title: 'b', status: 'completed' }] } };
+      const t = buildAgentRunTrace({ sessionId: 's', session, messages });
+      const step2 = t.workPlan!.steps[1];
+
+      expect(t.calls.find((c) => c.id === 'c2')?.status).toBe('failed');
+      expect(step2.callIds).toEqual(['c2', 'c3']);
+      expect(step2.closedWithoutCalls).toBe(true);
+    });
+
+    it('keeps plan-management calls in setup after a status update that closes nothing', () => {
+      index = 0;
+      const messages = [
+        assistantCalls(call('p', 'set_work_plan_status', { updates: [{ stepCount: 1, status: 'pending' }] })),
+        toolResult('p', 'set_work_plan_status', 'ok', '2026-10-14T10:00:01Z'),
+        assistantCalls(call('u', 'update_work_plan', {})),
+        toolResult('u', 'update_work_plan', 'ok', '2026-10-14T10:00:02Z'),
+        assistantCalls(call('w', 'load_data', {})),
+        toolResult('w', 'load_data', 'rows', '2026-10-14T10:00:03Z'),
+        assistantCalls(call('c', 'set_work_plan_status', { updates: [{ stepCount: 1, status: 'completed' }] })),
+        toolResult('c', 'set_work_plan_status', 'ok', '2026-10-14T10:00:04Z'),
+      ];
+      const session = { workPlan: { steps: [{ stepCount: 1, title: 'a', status: 'completed' }] } };
+      const t = buildAgentRunTrace({ sessionId: 's', session, messages });
+      expect(t.setupCallIds).toEqual(['u']);
+      expect(t.workPlan!.steps[0].callIds).toEqual(['p', 'w', 'c']);
+    });
   });
 
   it('caps large results and degrades every result when the run is over budget', () => {

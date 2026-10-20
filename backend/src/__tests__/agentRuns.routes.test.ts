@@ -237,7 +237,7 @@ describe('GET /api/admin/agent-runs/trace', () => {
     expect(res.body.trace.messagesTruncated).toBe(false);
   });
 
-  it('reads newest-first and stops once a page reaches before the run start', async () => {
+  it('reads newest-first and stops once a whole page is older than the read-back point', async () => {
     mockGet.mockResolvedValue({ Item: { sessionId: 's1' } });
     mockQuery
       .mockResolvedValueOnce({
@@ -247,6 +247,10 @@ describe('GET /api/admin/agent-runs/trace', () => {
           { sessionId: 's1', messageIndex: 7, message: { role: 'user', content: 'first ask', metadata: { timestamp: '2026-10-14T09:00:00Z' } } },
         ],
         LastEvaluatedKey: { sessionId: 's1', messageIndex: 7 },
+      })
+      .mockResolvedValueOnce({
+        Items: [{ sessionId: 's1', messageIndex: 6, role: 'user', content: 'older', timestamp: '2026-10-14T08:00:00Z' }],
+        LastEvaluatedKey: { sessionId: 's1', messageIndex: 6 },
       });
 
     const res = await request(buildApp())
@@ -254,11 +258,30 @@ describe('GET /api/admin/agent-runs/trace', () => {
       .query({ sessionId: 's1', startedAt: '2026-10-14T12:00:00Z', completedAt: '2026-10-14T12:01:00Z' });
 
     expect(res.status).toBe(200);
-    expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect(mockQuery).toHaveBeenCalledTimes(2);
     expect(mockQuery.mock.calls[0][0].ScanIndexForward).toBe(false);
     expect(res.body.trace.ask.text).toBe('second ask');
     expect(res.body.trace.finalResponse.html).toBe('Second answer.');
     expect(res.body.trace.messagesTruncated).toBe(false);
+  });
+
+  it('passes nextStartedAt through to bound an unfinished run', async () => {
+    mockGet.mockResolvedValue({ Item: { sessionId: 's1' } });
+    mockQuery.mockResolvedValueOnce({
+      Items: [
+        { sessionId: 's1', messageIndex: 3, message: { role: 'assistant', content: 'B done' } },
+        { sessionId: 's1', messageIndex: 2, message: { role: 'user', content: 'B', metadata: { timestamp: '2026-10-14T10:00:10Z' } } },
+        { sessionId: 's1', messageIndex: 1, message: { role: 'assistant', content: 'A partial' } },
+        { sessionId: 's1', messageIndex: 0, message: { role: 'user', content: 'A', metadata: { timestamp: '2026-10-14T10:00:00Z' } } },
+      ],
+    });
+
+    const res = await request(buildApp())
+      .get('/api/admin/agent-runs/trace')
+      .query({ sessionId: 's1', startedAt: '2026-10-14T10:00:00Z', nextStartedAt: '2026-10-14T10:00:11Z' });
+
+    expect(res.body.trace.finalResponse.html).toBe('A partial');
+    expect(res.body.trace.followUpAsks).toEqual([]);
   });
 
   it('returns 500 without leaking the error', async () => {
