@@ -214,3 +214,19 @@ export async function releaseNumber(p: { org: Organization; config: HotLeadCallC
   });
   return { callerNumberReleased: true, callingEnabled: false };
 }
+
+/**
+ * Gives the org's caller number back when the org is deleted, so it does not keep billing a monthly fee with
+ * nobody to use it. Best effort by design: the delete has already happened and must never fail because of this,
+ * so a refusal is only logged (the sid, never a phone) for an operator to release in the Twilio console.
+ */
+export async function releaseNumberOfDeletedOrg(org: Pick<Organization, 'orgId' | 'hotLeadCall'>): Promise<void> {
+  const sid = org.hotLeadCall?.twilioNumberSid;
+  if (!sid) return;
+  try {
+    await getVoiceProvider().releaseNumber(sid);
+  } catch (err) {
+    if (err instanceof VoiceCallError && err.placed === 'no' && err.httpStatus === 404) return;
+    console.error(`[hotLeadCall] ORPHAN number: org ${org.orgId} was deleted but sid ${sid} could not be released; release it in the Twilio console`);
+  }
+}

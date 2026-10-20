@@ -40,7 +40,7 @@ describe('get_hot_lead_call_settings', () => {
     const result = await get();
     expect(result).toMatchObject({
       success: true, enabled: true, callerNumberAssigned: true, maxAgeMinutes: 10, maxAttemptsPerLead: 3, memberCooldownMinutes: 2,
-      team: [{ id: MEMBER_ID, name: 'Dana Lee', phone: '***0100', verified: true, windows: [EVERY_DAY] }],
+      team: [{ id: MEMBER_ID, name: 'Dana Lee', phoneMasked: '***0100', verified: true, windows: [EVERY_DAY] }],
       callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
     });
     const json = JSON.stringify(result);
@@ -54,9 +54,16 @@ describe('get_hot_lead_call_settings', () => {
     cfg().maxCallsPerDay = 9999;
     await expect(get()).rejects.toThrow('invalid');
   });
-  it('allows plain org members to read', async () => {
+  it('shows the portal view: entitlement, blockers and no revision token', async () => {
+    const result = await get();
+    expect(result).toMatchObject({ entitled: true, canEnable: true, blockers: [], twilioNumberMasked: '***0111', announcedName: 'Acme Plumbing' });
+    expect(result).not.toHaveProperty('_revision');
+  });
+  it('is for org owners and admins only, like the team view of the REST API', async () => {
     (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'm', orgId: 'org-a', orgRole: 'member' });
-    expect((await get({}, { userId: 'm' })).success).toBe(true);
+    await expect(get({}, { userId: 'm' })).rejects.toThrow('owners and admins');
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'a', orgId: 'org-a', orgRole: 'admin' });
+    expect((await get({}, { userId: 'a' })).success).toBe(true);
   });
 });
 
@@ -79,7 +86,7 @@ describe('update_hot_lead_call_settings', () => {
   it('uses attribute_not_exists for the first write and creates a disabled config', async () => {
     delete org.hotLeadCall;
     const result = await update({ memberPhone: '(415) 555-0100', announcedName: 'New Co' });
-    expect(result).toMatchObject({ enabled: false, team: [{ phone: '***0100', name: 'Team member', verified: false, windows: [EVERY_DAY] }], callerNumberAssigned: false });
+    expect(result).toMatchObject({ enabled: false, team: [{ phoneMasked: '***0100', name: 'Team member', verified: false, windows: [EVERY_DAY] }], callerNumberAssigned: false });
     const options = lastWrite()[2];
     expect(options.condition.expression).toBe('attribute_not_exists(#previousHotLeadCall)');
     expect(options.condition.values).toBeUndefined();
@@ -102,23 +109,22 @@ describe('update_hot_lead_call_settings', () => {
   });
   it('refuses the first write without an announced name', async () => {
     delete org.hotLeadCall;
-    await expect(update({ memberPhone: '+14155550100' })).rejects.toThrow('Check the limits and name format');
+    await expect(update({ memberPhone: '+14155550100' })).rejects.toThrow('Some settings are not valid');
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
-  it('a first write that asks for enabled:true is saved disabled, because the new phone is unverified', async () => {
+  it('a first write that asks for enabled:true is refused, because the new phone is unverified', async () => {
     delete org.hotLeadCall;
-    const result = await update({ memberPhone: '+14155550100', announcedName: 'New Co', enabled: true });
-    expect(lastWrite()[1].hotLeadCall.enabled).toBe(false);
-    expect(result).toMatchObject({ enabled: false, team: [{ verified: false }] });
+    await expect(update({ memberPhone: '+14155550100', announcedName: 'New Co', enabled: true })).rejects.toThrow('Verify the phone');
+    expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
 
-  it('changing the phone clears verification and forces enabled:false, even if enabled:true is sent', async () => {
-    const result = await update({ memberPhone: '+16475550123', enabled: true });
+  it('changing the phone clears verification and turns calling off', async () => {
+    const result = await update({ memberPhone: '+16475550123' });
     const written = lastWrite()[1].hotLeadCall;
     expect(written.team).toEqual([{ id: MEMBER_ID, name: 'Dana Lee', phone: '+16475550123', windows: [EVERY_DAY] }]);
     expect(written.enabled).toBe(false);
     expect(written.twilioNumber).toBe('+14155550111');
-    expect(result).toMatchObject({ enabled: false, team: [{ id: MEMBER_ID, verified: false, phone: '***0123' }] });
+    expect(result).toMatchObject({ enabled: false, team: [{ id: MEMBER_ID, verified: false, phoneMasked: '***0123' }] });
   });
 
   it('re-sending the same phone keeps verification and enabled state', async () => {
@@ -131,7 +137,7 @@ describe('update_hot_lead_call_settings', () => {
     jest.clearAllMocks();
     delete team()[0].verifiedAt;
     cfg().enabled = false;
-    await expect(update({ enabled: true })).rejects.toThrow('verified');
+    await expect(update({ enabled: true })).rejects.toThrow('Verify the phone');
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
 
@@ -161,7 +167,7 @@ describe('update_hot_lead_call_settings', () => {
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
   it.each(['UTC', 'Mars/Olympus', 'Etc/UTC', '+05:00'])('names the timezone problem for %s', async timezone => {
-    await expect(update({ callingHours: { timezone } })).rejects.toThrow(/timezone must be an IANA Area\/Location name such as America\/Chicago/);
+    await expect(update({ callingHours: { timezone } })).rejects.toThrow(/callingHours\.timezone: Use a place name such as America\/Chicago/);
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
   it('stores and echoes the normalised timezone, and re-sending the stored zone in another case still writes cleanly', async () => {
@@ -180,7 +186,7 @@ describe('update_hot_lead_call_settings', () => {
     expect(def.description).toMatch(/Etc\/ zones are refused/);
   });
   it('rejects a member phone equal to the assigned caller number', async () => {
-    await expect(update({ memberPhone: '+14155550111' })).rejects.toThrow('Check the limits and name format');
+    await expect(update({ memberPhone: '+14155550111' })).rejects.toThrow('Some settings are not valid');
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
 
@@ -195,25 +201,27 @@ describe('update_hot_lead_call_settings', () => {
     ['a member id', { memberId: 'mzzzzzzz' }],
     ['windows', { windows: [EVERY_DAY] }],
   ])('cannot smuggle in %s', async (_label, extra) => {
-    await expect(update({ maxCallsPerHour: 3, ...extra })).rejects.toThrow('settings arguments');
+    await expect(update({ maxCallsPerHour: 3, ...extra })).rejects.toThrow(/settings arguments|Some settings are not valid|Unknown setting/);
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
 
   it('tells the model the system fields are not settable', () => {
     const def = handlers.get('update_hot_lead_call_settings')!.definition;
     expect(def.description).toMatch(/managed by the system/);
-    for (const f of ['verifiedAt', 'team', 'twilioNumber', 'twilioNumberSid']) expect(def.inputSchema.properties).not.toHaveProperty(f);
+    for (const f of ['verifiedAt', 'twilioNumber', 'twilioNumberSid']) expect(def.inputSchema.properties).not.toHaveProperty(f);
+    const memberProps = (def.inputSchema.properties as { team: { items: { properties: object } } }).team.items.properties;
+    expect(memberProps).not.toHaveProperty('verifiedAt');
   });
 
   const argsErr = 'settings arguments';
-  const settingsErr = 'Check the limits and name format';
+  const settingsErr = 'Some settings are not valid';
   it.each([
     [{}, 'provide at least one setting'], [null, argsErr], [[], argsErr], [{ orgId: 'org-b' }, argsErr], [{ userId: 'victim' }, argsErr],
     [{ enabled: 'yes' }, settingsErr], [{ leadTypes: [] }, settingsErr], [{ leadTypes: ['nope'] }, settingsErr],
     [{ maxCallsPerHour: 31 }, settingsErr], [{ maxAgeMinutes: 0 }, settingsErr], [{ announcedName: '<Say>hi</Say>' }, settingsErr],
     [{ announcedName: 'a'.repeat(61) }, settingsErr], [{ memberPhone: '+442071838750' }, 'valid US or Canadian'],
     [{ memberPhone: 'abc' }, 'valid US or Canadian'], [{ memberPhone: 5 }, 'valid US or Canadian'],
-    [{ memberName: '' }, 'memberName must be'], [{ memberName: 'x'.repeat(41) }, 'memberName must be'], [{ memberName: 7 }, 'memberName must be'],
+    [{ memberName: '' }, 'team.0.name'], [{ memberName: 'x'.repeat(41) }, 'team.0.name'], [{ memberName: 7 }, 'team.0.name'],
     [{ maxAttemptsPerLead: 6 }, settingsErr], [{ maxAttemptsPerLead: 0 }, settingsErr],
     [{ callingHours: { start: '25:00' } }, settingsErr],
     [{ allowedCountries: ['MX'] }, settingsErr],
@@ -228,7 +236,7 @@ describe('update_hot_lead_call_settings', () => {
     });
     it('shows every member masked, in priority order', async () => {
       const result = await get();
-      expect((result.team as Array<{ id: string; phone: string }>).map(m => [m.id, m.phone])).toEqual([[MEMBER_ID, '***0100'], ['mzzzzzz2', '***0122']]);
+      expect((result.team as Array<{ id: string; phoneMasked: string }>).map(m => [m.id, m.phoneMasked])).toEqual([[MEMBER_ID, '***0100'], ['mzzzzzz2', '***0122']]);
       expect(JSON.stringify(result)).not.toContain('4155550122');
     });
     it('still updates the other settings and keeps the team as stored', async () => {
@@ -280,9 +288,70 @@ describe('update_hot_lead_call_settings', () => {
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
 
-  it('does not report success when a concurrent edit rejects the conditional write', async () => {
-    (orgDb.updateOrg as jest.Mock).mockRejectedValueOnce(new Error('ConditionalCheckFailedException'));
-    await expect(update({ maxCallsPerHour: 3 })).rejects.toThrow('ConditionalCheckFailedException');
+  it('does not report success when the write fails', async () => {
+    (orgDb.updateOrg as jest.Mock).mockRejectedValueOnce(new Error('boom'));
+    await expect(update({ maxCallsPerHour: 3 })).rejects.toThrow('boom');
+  });
+});
+
+describe('update_hot_lead_call_settings with team', () => {
+  const NEW_PHONE = '+14155550133';
+  const window = { days: [1, 2, 3, 4, 5], start: '09:00', end: '17:00' };
+  beforeEach(() => {
+    (cfg() as { team: unknown }).team = [teamMember('+14155550100'), teamMember('+14155550122', { id: 'mzzzzzz2', name: 'Sam Ortiz', verifiedAt: undefined })];
+  });
+  it('replaces the whole team in the order given, drops people left out and generates ids for new people', async () => {
+    const result = await update({ team: [{ name: 'Kim Park', phone: NEW_PHONE, windows: [window] }, { id: 'mzzzzzz2', name: 'Sam Ortiz', windows: [window] }] });
+    const written = lastWrite()[1].hotLeadCall.team;
+    expect(written.map((m: { name: string }) => m.name)).toEqual(['Kim Park', 'Sam Ortiz']);
+    expect(written[0].id).toMatch(/^m[a-z0-9]{7}$/);
+    expect(written[1]).toMatchObject({ id: 'mzzzzzz2', phone: '+14155550122', windows: [window] });
+    expect(written.some((m: { id: string }) => m.id === MEMBER_ID)).toBe(false);
+    expect(result.team).toHaveLength(2);
+    expect(JSON.stringify(result)).not.toContain('4155550133');
+  });
+  it('is the same service as the REST PUT: field errors arrive as one readable message', async () => {
+    await expect(update({ team: [{ name: 'Kim Park', phone: 'abc', windows: [window] }] })).rejects.toThrow('team.0.phone');
+    expect(orgDb.updateOrg).not.toHaveBeenCalled();
+  });
+  it('cannot be combined with memberPhone or memberName', async () => {
+    await expect(update({ team: [{ name: 'Kim', phone: NEW_PHONE, windows: [window] }], memberPhone: NEW_PHONE })).rejects.toThrow('not both');
+  });
+  it('rejects a smuggled verification stamp inside a team entry', async () => {
+    await expect(update({ team: [{ id: MEMBER_ID, name: 'Dana', windows: [window], verifiedAt: '2026-02-02T00:00:00.000Z' }] })).rejects.toThrow('team.0.verifiedAt');
+  });
+  it('lets one person be edited through memberPhone on a team of one only', async () => {
+    (cfg() as { team: unknown }).team = [teamMember('+14155550100')];
+    await update({ memberName: 'Dana L' });
+    expect(lastWrite()[1].hotLeadCall.team).toEqual([{ ...teamMember('+14155550100'), name: 'Dana L' }]);
+  });
+});
+
+describe('update_hot_lead_call_settings in an unattended run', () => {
+  const unattended = { userId: 'owner', isUnattendedRun: true };
+  it.each([
+    ['raising a cap', { maxCallsPerDay: 100 }],
+    ['raising attempts per lead', { maxAttemptsPerLead: 5 }],
+    ['widening the calling hours', { callingHours: { start: '06:00' } }],
+    ['editing the team', { memberName: 'Someone Else' }],
+    ['replacing the team', { team: [{ name: 'Kim', phone: '+14155550133', windows: [{ days: [1], start: '09:00', end: '17:00' }] }] }],
+  ])('refuses %s without writing', async (_label, args) => {
+    await expect(update(args, unattended)).rejects.toThrow('This needs a person to confirm in an interactive chat');
+    expect(orgDb.updateOrg).not.toHaveBeenCalled();
+  });
+  it('refuses turning calling on', async () => {
+    cfg().enabled = false;
+    await expect(update({ enabled: true }, unattended)).rejects.toThrow('interactive chat');
+  });
+  it('still allows turning calling off and lowering a cap', async () => {
+    expect(await update({ enabled: false, maxCallsPerDay: 5 }, unattended)).toMatchObject({ success: true, enabled: false, maxCallsPerDay: 5 });
+  });
+  it.each([false, undefined])('only an explicit true counts as unattended (%s)', async flag => {
+    expect((await update({ maxCallsPerDay: 100 }, { userId: 'owner', isUnattendedRun: flag })).success).toBe(true);
+  });
+  it('a concurrent edit makes the write fail instead of overwriting it', async () => {
+    (orgDb.updateOrg as jest.Mock).mockRejectedValueOnce(Object.assign(new Error('x'), { code: 'ConditionalCheckFailedException' }));
+    await expect(update({ maxCallsPerHour: 3 })).rejects.toThrow('changed by someone else');
   });
 });
 

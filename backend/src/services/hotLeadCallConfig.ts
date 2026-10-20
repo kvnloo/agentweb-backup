@@ -8,7 +8,7 @@ export const HOT_LEAD_CALL_COUNTRIES = ['US', 'CA'] as const;
 type HotLeadCallCountry = typeof HOT_LEAD_CALL_COUNTRIES[number];
 
 const HOT_LEAD_CALL_DEFAULT_LEAD_TYPES: readonly LeadOrigin[] = ['form_fill'];
-const HOT_LEAD_CALL_DEFAULT_CALLING_HOURS = { start: '08:00', end: '21:00' } as const;
+export const HOT_LEAD_CALL_DEFAULT_CALLING_HOURS = { start: '08:00', end: '21:00' } as const;
 export const HOT_LEAD_CALL_ANNOUNCED_NAME_MAX = 60;
 export const HOT_LEAD_CALL_MAX_TEAM_SIZE = 10;
 export const HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER = 7;
@@ -173,7 +173,7 @@ function limit(raw: unknown, field: HotLeadCallLimitField): number | null {
 /** Minutes since local midnight of an HH:MM (or 24:00) string that already passed validation. */
 export const hhmmToMinutes = (hhmm: string): number => Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.slice(3, 5));
 
-function callingHoursOf(raw: unknown): HotLeadCallCallingHours | null {
+export function callingHoursOf(raw: unknown): HotLeadCallCallingHours | null {
   if (!isRecord(raw) || Object.keys(raw).some(k => !CALLING_HOURS_KEYS.has(k))) return null;
   const start = raw.start === undefined ? HOT_LEAD_CALL_DEFAULT_CALLING_HOURS.start : raw.start;
   const end = raw.end === undefined ? HOT_LEAD_CALL_DEFAULT_CALLING_HOURS.end : raw.end;
@@ -182,7 +182,7 @@ function callingHoursOf(raw: unknown): HotLeadCallCallingHours | null {
   return timezone ? { start, end, timezone } : null;
 }
 
-function windowOf(raw: unknown): HotLeadCallWindow | null {
+export function windowOf(raw: unknown): HotLeadCallWindow | null {
   if (!isRecord(raw) || Object.keys(raw).some(k => !WINDOW_KEYS.has(k))) return null;
   const { days, start, end } = raw;
   if (!Array.isArray(days) || days.length < 1 || days.length > 7 || new Set(days).size !== days.length) return null;
@@ -192,12 +192,25 @@ function windowOf(raw: unknown): HotLeadCallWindow | null {
   return { days: [...days], start, end };
 }
 
+/** The trimmed member name, or null when it is empty, too long or has characters outside the allowed set. */
+export function memberNameOf(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const name = raw.trim();
+  return name && name.length <= HOT_LEAD_CALL_MEMBER_NAME_MAX && MEMBER_NAME.test(name) ? name : null;
+}
+
+/** The trimmed spoken business name, or null when it is empty, too long or has characters outside the allowed set. */
+export function announcedNameOf(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const name = raw.trim();
+  return name && name.length <= HOT_LEAD_CALL_ANNOUNCED_NAME_MAX && ANNOUNCED_NAME.test(name) ? name : null;
+}
+
 function memberOf(raw: unknown): HotLeadCallMember | null {
   if (!isRecord(raw) || Object.keys(raw).some(k => !MEMBER_KEYS.has(k))) return null;
   if (typeof raw.id !== 'string' || !MEMBER_ID.test(raw.id)) return null;
-  if (typeof raw.name !== 'string') return null;
-  const name = raw.name.trim();
-  if (!name || name.length > HOT_LEAD_CALL_MEMBER_NAME_MAX || !MEMBER_NAME.test(name)) return null;
+  const name = memberNameOf(raw.name);
+  if (!name) return null;
   const phone = allowlistedE164(raw.phone);
   if (!phone) return null;
   let verifiedAt: string | undefined;
@@ -274,9 +287,8 @@ export function hotLeadCallConfigOf(raw: unknown): HotLeadCallConfig | null {
     limits[field] = value;
   }
 
-  if (typeof raw.announcedName !== 'string') return null;
-  const announcedName = raw.announcedName.trim();
-  if (!announcedName || announcedName.length > HOT_LEAD_CALL_ANNOUNCED_NAME_MAX || !ANNOUNCED_NAME.test(announcedName)) return null;
+  const announcedName = announcedNameOf(raw.announcedName);
+  if (!announcedName) return null;
 
   let callingHours: HotLeadCallCallingHours | undefined;
   if (raw.callingHours !== undefined) {

@@ -177,7 +177,9 @@ All paths are under `backend/src/`.
 | Rate card and runtime rate overrides | `utils/vendorRateCard.ts`, `routes/adminVendorRates.ts` |
 | Twilio credentials | `utils/secretsManager.ts` `getTwilioCredentials` |
 | Emma settings tools | `emma/hotLeadCallTools.ts` |
-| Emma setup tools (number provisioning, team-member verification) | `emma/hotLeadCallSetupTools.ts`, `services/voice/numberProvisioning.ts`, `services/voice/destinationVerification.ts`, `services/voice/setupWrites.ts` |
+| Settings service: ONE implementation of read, update, preview and verification used by both the REST routes and the Emma tools | `services/hotLeadCallSettingsService.ts` (typed errors in `services/hotLeadCallErrors.ts`) |
+| Team settings REST API (portal), mounted at `/api/orgs/me/hot-lead-call` | `routes/orgHotLeadCall.ts` |
+| Emma setup tools (number provisioning, team-member verification) | `emma/hotLeadCallSetupTools.ts`, `services/voice/numberProvisioning.ts`, `services/voice/memberVerification.ts`, `services/voice/setupWrites.ts` |
 | Admin UI for rates | `partner-portal/src/components/admin/VendorRatesTab.tsx` (Admin > Revenue & billing > Vendor Rates) |
 
 Tests worth knowing: `__tests__/hotLeadCall.e2e.test.ts` (the calls: real
@@ -262,24 +264,34 @@ Registered as foundation tools. Org membership comes from the authenticated user
 (never from arguments); reads need membership, writes need `org:configure`
 (owner/admin). Not available in shared sessions.
 
-Settings (merged):
+Settings (merged). Both tools call the same service as the REST API
+([Team settings API](#team-settings-api-rest)), so the portal and chat apply identical rules:
 
-- `get_hot_lead_call_settings({})` returns `configured`, `enabled`, the `team`
-  (each member's `id`, `name`, phone masked to the last 4 digits, `verified` and
-  `windows`), `callerNumberAssigned`, `leadTypes`, `announcedName`,
-  `callingHours`, `allowedCountries` and the limits (defaults when unset). No
-  SIDs or full numbers.
-- `update_hot_lead_call_settings({...})` takes any of `enabled`, `memberPhone`,
+- `get_hot_lead_call_settings({})` needs `org:configure`. It returns the portal view
+  (`entitled`, `enabled`, `canEnable`, plain-English `blockers`, `callingHours`,
+  `maxAttemptsPerLead`, `announcedName`, `twilioNumberMasked`, the `team` in priority order with
+  each person's `id`, `name`, `phoneMasked`, `verified` and `windows`, and `limits`) plus
+  `configured`, `callerNumberAssigned`, `leadTypes`, `allowedCountries`, the other limit fields
+  and the lead types that exist. No SIDs or full numbers, and no revision token.
+- `update_hot_lead_call_settings({...})` takes any of `enabled`, `team`, `memberPhone`,
   `memberName`, `leadTypes`, the limit fields (including `maxAttemptsPerLead`),
-  `announcedName`, `callingHours`, `allowedCountries`. `twilioNumber` and
-  `twilioNumberSid` are refused (system-managed); the team, member ids,
-  `verifiedAt` and windows cannot be sent. Through chat a team of ONE is edited:
-  the first save needs `memberPhone` and `announcedName` and creates the member
-  (available whenever the calling hours are open); with several members the tool
-  refuses `memberPhone`/`memberName` and changes only the other settings.
-  Changing the member's phone drops its verification and forces `enabled:false`. Writes are conditional on the stored
-  attribute being unchanged since it was read, so a concurrent edit fails
-  instead of clobbering.
+  `announcedName`, `callingHours`, `allowedCountries`. `twilioNumber` and `twilioNumberSid`
+  are refused (system-managed), and so is `verifiedAt` anywhere.
+  - `team` is a FULL replacement, with the semantics of the REST PUT: the order is the priority,
+    people missing from the array are removed, an entry without `id` is a new person (server-generated id,
+    phone required), an entry with an `id` edits that person and keeps the stored phone when none is sent,
+    and a changed phone clears that person's verification and any code in flight.
+  - `memberPhone` / `memberName` edit a team of ONE (the first save creates the member, available whenever
+    the calling hours are open); on a larger team the tool refuses them and asks for `team`.
+  - `callingHours` may be partial in chat: missing parts are filled from the stored hours, then the
+    08:00-21:00 defaults.
+  - The tool edits the copy it just read; the write is conditional on the stored attribute being
+    unchanged, so a concurrent edit fails ("changed by someone else") instead of clobbering.
+  - Unattended runs (`context.isUnattendedRun === true`) are refused for any change that turns calling on,
+    raises a cap (`maxAgeMinutes`, `maxCallsPerHour`, `maxCallsPerDay`, `maxAttemptsPerLead`), shortens
+    the pause between calls to one person, adds a lead type or country, widens the calling hours (or moves
+    them to another zone), first-saves the settings, or edits the team. Turning calling off and lowering a limit
+    stay allowed. Confirming a verification code has no such refusal (it needs the code).
 
 Setup tools (number provisioning and team-member verification). They need `org:configure`, work while the global
 kill switch is off, and are blocked in shared sessions. The three that spend
@@ -287,7 +299,7 @@ money or cannot be undone (`provision_hot_lead_call_number`,
 `release_hot_lead_call_number`, `start_hot_lead_call_verification`) also REFUSE
 unattended runs (`context.isUnattendedRun === true`: scheduled or autonomous
 turns) with "This needs a person to confirm in an interactive chat".
-`confirm_hot_lead_call_verification` has no such refusal:
+`confirm_hot_lead_call_verification` has no such refusal (the settings update has its own, listed above):
 
 - `provision_hot_lead_call_number({confirm: true, areaCode?})` buys one US local
   voice-enabled number (the cost is stated in the tool text, read from the live
@@ -303,17 +315,11 @@ turns) with "This needs a person to confirm in an interactive chat".
 - `release_hot_lead_call_number({})` turns calling off first, releases the
   number (a 404 from Twilio counts as already gone; any other failure keeps the
   number assigned), then clears `twilioNumber`/`twilioNumberSid`.
-- `start_hot_lead_call_verification({memberId?})` rings the SAVED phone of a member (the only member, or the one named by `memberId` on a larger team) from the
-  org number and reads a 6-digit code (inline TwiML, no webhook). The code is
-  stored only as an HMAC in `hotLeadCallVerification`, valid 10 minutes, 5
-  attempts; one start per 2 minutes, 5 per day. The start history is kept after a
-  successful confirm and after a phone change, so alternating phones cannot reset
-  the limits. A corrupt `hotLeadCallVerification` makes start refuse ("Stored
-  verification state is invalid. Contact support."). Metered as one estimated
+- `start_hot_lead_call_verification({memberId?})` rings the SAVED phone of a member (the only member, or the one named by `memberId`, required on a larger team) from the
+  org number and reads a 6-digit code (inline TwiML, no webhook). Refused when the plan lacks the feature or no caller number exists. See [Verification](#verification-per-member) for storage and limits. Metered as one estimated
   minute (leg `verify`).
 - `confirm_hot_lead_call_verification({code, memberId?})` checks the code and
-  writes that member's `verifiedAt`. The verification record is still a single
-  record for the org, so starting one for another member replaces a pending code.
+  writes that member's `verifiedAt`, only if the member's phone is still the phone the code was issued for.
 
 Order of setup, which the tool text also teaches Emma:
 
@@ -338,6 +344,92 @@ Verification limits: it proves a phone answered and the code was heard. A
 voicemail that plays the message back can also pass it. The spoken code is
 believed to be visible in the Twilio call log to anyone with access to the
 Twilio account (inline TwiML is normally logged; unverified, see "Not verified").
+
+## Verification per member
+
+`Organization.hotLeadCallVerification` is `{ members: { <memberId>: { phone, codeHash, expiresAt, attempts, callSid?, startedAt[] } }, orgStartedAt[] }`
+(epoch ms; `startedAt` entries are the starts of the last 24h). One record per team member plus an org-wide list of starts.
+
+- The code is 6 random digits, valid 10 minutes, 5 confirm attempts per code. Only an HMAC is stored,
+  bound to the org, the member id AND the phone, so a code heard by one person cannot confirm another and
+  a code is worthless once the member's phone differs. The code is never logged or returned.
+- Limits: per member 1 start per 2 minutes and 5 per day; per organization 20 starts per day. A refusal carries
+  how many seconds to wait (`retryAfterSeconds` in the REST API).
+- Attempts are counted (a conditional write) BEFORE the code is compared, and the compare is constant-time,
+  so parallel guesses cannot exceed 5 per code. Confirming sets that member's `verifiedAt` in one conditional write
+  that also requires the stored settings to be unchanged since they were read, so a phone edited in between
+  loses cleanly ("Your settings changed ... start a new verification").
+- The start history is kept after a successful confirm and after a phone change (only the pending code is
+  cleared), and the org-wide list survives removing a member, so alternating phones or deleting and re-adding people
+  does not buy more calls.
+- Changing a member's phone (REST or chat) clears that member's `verifiedAt` and pending code in the same write as the
+  settings. Removing a member deletes their record.
+- A stored record that does not validate (including the single-record shape of the first version, which was never
+  deployed) makes start and confirm refuse ("Stored verification state is invalid. Contact support.") instead of
+  being replaced, because replacing it would reset the limits. Repair is a data change that needs Harsha's approval.
+
+## Team settings API (REST)
+
+All routes live in `routes/orgHotLeadCall.ts`, mounted behind `authenticateToken` at `/api/orgs/me/hot-lead-call`. The
+organization is the caller's own (from the persisted user), never from the URL or body, and EVERY route needs
+`org:configure` (owner or admin); other members get 403. Phones are returned only as `phoneMasked` (`***` + last 4
+digits). Error bodies are `{ error: string }` plus the fields below.
+
+| Route | Success | Errors |
+| --- | --- | --- |
+| `GET /` | 200 settings (below) | 403, 404 (no org) |
+| `PUT /` | 200 the updated settings, fresh `_revision` | 400 `{error, fieldErrors}`, 403, 403 `{error, code:'not_entitled'}` when enabling without the plan feature, 409 stale or raced, 428 `_revision` missing |
+| `POST /members/:memberId/verification/start` | 200 `{expiresInSeconds, nextStartAllowedInSeconds, startsLeftToday}` | 403 (no plan feature with `code:'not_entitled'`, or no caller number), 404 unknown member, 409 raced, 429 `{error, retryAfterSeconds}` (also a `Retry-After` header), 502 phone provider failed |
+| `POST /members/:memberId/verification/confirm` body `{code}` | 200 `{verified:true}` | 400 `{error, attemptsLeft}`, 404, 409, 429 `{error, retryAfterSeconds}` (a confirm racing another) |
+| `GET /preview?at=<ISO instant>` | 200 `{at, timezone, outsideCallingHours, candidates:[{id,name}], excluded:[{id,name,reason}]}` | 400 `{error, fieldErrors:{at}}` |
+
+`_revision` is the SHA-256 of the canonical JSON (sorted keys) of the stored `hotLeadCall`, so ANY change to it
+(another editor, a verification landing, a number purchase) makes an old copy stale: re-GET after confirming a
+verification. The PUT body must carry the `_revision` of the copy it edited; the write is additionally conditional
+on the stored value, so two racing saves cannot both land.
+
+PUT semantics: `team` (when sent) replaces the whole team; its order is the priority; ids missing from it are
+removed; entries without `id` are new people (server-generated id, `phone` required); a phone left out of an
+existing entry is unchanged; a changed phone clears that person's verification. Everything else not sent keeps its
+value. A body of only `{ _revision, enabled }` is valid. Calling hours are only required when enabling. Unknown keys,
+`verifiedAt`, `twilioNumber*` and the tool-only limits are refused with 400; the body is capped at 32 KB, 10 people and 7
+windows per person. Turning calling on needs the plan feature and every requirement of `canEnable`; an explicit
+`enabled: true` that cannot work yet is a 400 naming the missing piece, while an edit that merely leaves a running
+setup without any verified person (the only verified phone changed) turns calling off.
+
+`fieldErrors` are keyed by position in the submitted body: `team.N.name`, `team.N.phone`, `team.N.id`, `team.N.windows`,
+`team.N.windows.M.days|start|end`, `callingHours.start|end|timezone`, `maxAttemptsPerLead`, `announcedName`, `enabled`.
+
+Example (fake numbers):
+
+```
+GET /api/orgs/me/hot-lead-call
+200 { "_revision": "9f2c...e1", "entitled": true, "enabled": false, "canEnable": false,
+      "blockers": ["Verify the phone of at least one person"],
+      "callingHours": { "start": "09:00", "end": "18:00", "timezone": "America/Chicago" },
+      "maxAttemptsPerLead": 3, "announcedName": "Acme Plumbing", "twilioNumberMasked": "***0111",
+      "team": [ { "id": "mk3f9a2b", "name": "Dana Lee", "phoneMasked": "***0100", "verified": false,
+                  "windows": [ { "days": [1,2,3,4,5], "start": "09:00", "end": "17:00" } ] } ],
+      "limits": { "maxTeamSize": 10, "maxWindowsPerMember": 7, "minAttempts": 1, "maxAttempts": 5, "nameMaxLength": 40 } }
+
+PUT /api/orgs/me/hot-lead-call
+{ "_revision": "9f2c...e1",
+  "team": [ { "id": "mk3f9a2b", "name": "Dana Lee", "windows": [ { "days": [1,2,3,4,5], "start": "09:00", "end": "17:00" } ] },
+            { "name": "Sam Ortiz", "phone": "(415) 555-0122", "windows": [ { "days": [6], "start": "10:00", "end": "14:00" } ] } ] }
+200 { ...updated settings, "_revision": "41ab...07" }
+
+PUT with a wrong phone:
+400 { "error": "Some settings are not valid: team.1.phone: Enter a valid US or Canadian phone number without an extension",
+      "fieldErrors": { "team.1.phone": "Enter a valid US or Canadian phone number without an extension" } }
+
+POST /api/orgs/me/hot-lead-call/members/mk3f9a2b/verification/start
+200 { "expiresInSeconds": 600, "nextStartAllowedInSeconds": 120, "startsLeftToday": 4 }
+429 { "error": "A verification call was just placed. ...", "retryAfterSeconds": 90 }
+```
+
+The preview lists, in call order, who would be rung at `at` (default now). `excluded[].reason` is `unverified` or
+`outside_window`; outside the calling hours (or with none set) `outsideCallingHours` is true, `candidates` is empty and
+the verified people are reported as `outside_window`.
 
 ## Plan entitlement
 
@@ -432,8 +524,8 @@ No new table or index. The feature writes:
 
 | What | Where | Written by |
 | --- | --- | --- |
-| `hotLeadCall` (config) | org attribute on the org item | Emma settings tool, number provisioning, verification |
-| `hotLeadCallVerification` (HMAC of pending code, attempts, start history) | org attribute | verification tools |
+| `hotLeadCall` (config) | org attribute on the org item | settings service (REST and Emma), number provisioning, verification |
+| `hotLeadCallVerification` (per member: HMAC of pending code, attempts, start history; plus the org-wide start list) | org attribute | verification flow (REST and tools); cleared per member by settings edits |
 | `hotLeadCallProvisioning` (purchase/release timestamps for the daily caps) | org attribute | provisioning tools |
 | `hot_lead_call_mode` | AW-Settings item | operators |
 | `vendor_rate_overrides` | AW-Settings item | admin Vendor Rates tab |
@@ -559,9 +651,12 @@ Known limits, accepted:
   steer `update_hot_lead_call_settings` or `confirm_hot_lead_call_verification`.
   The human-approval gate (see Known follow-ups) is a general-availability
   precondition; until then use hand-picked orgs.
-- Verification brute force: a code is 6 digits with 5 attempts per code and 5
-  codes per day, so a guesser has roughly a 5-in-a-million chance per code and
-  about 25-in-a-million per day.
+- Verification brute force: a code is 6 digits with 5 attempts per code, 5 codes per
+  person per day and 20 per organization per day, so a guesser has roughly a 5-in-a-million
+  chance per code and about 25-in-a-million per person per day.
+- Verification phone harassment: a person's phone can be rung at most 5 times a day
+  by their organization (20 across the team). An owner or admin can enter any number as a team
+  member and have it rung that often; the call only reads a code.
 - Phone-marker poisoning: whoever submits a number first holds its 24h marker,
   so a third party can submit a victim lead's number first and suppress the call
   for the genuine submission (the Slack alert still fires).
@@ -704,6 +799,14 @@ Buying and releasing are non-idempotent. Search the logs for `ORPHAN number` or
 any org. Reconcile in the Twilio console (Phone Numbers > Active numbers)
 against `hotLeadCall.twilioNumberSid` of every org, and release strays by hand.
 Do not let Emma retry an ambiguous purchase.
+
+### Deleting an organization
+
+Deleting an org (`DELETE /api/org/:orgId`, owner only) releases its caller number after the org item is removed
+(`releaseNumberOfDeletedOrg` in `services/voice/numberProvisioning.ts`), best effort: a refusal is logged as
+`ORPHAN number: org <id> was deleted but sid <sid> could not be released` (the sid, never a phone) and does not fail the
+delete. A 404 from Twilio counts as already released. Reconcile any such log line by hand as under
+[Orphan numbers](#orphan-numbers). Removing a member from an org, or an org losing its plan, does not release the number.
 
 ### Other symptoms
 

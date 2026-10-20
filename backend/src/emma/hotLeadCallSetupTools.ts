@@ -1,8 +1,8 @@
 import { emmaToolRegistry } from './registry';
-import { callerOrg, type ToolContext } from './orgCaller';
-import { storedConfig } from './hotLeadCallTools';
+import { callerIdentity, callerOrg, type ToolContext } from './orgCaller';
 import type { HotLeadCallConfig } from '../services/hotLeadCallConfig';
-import { startVerification, confirmVerification, VERIFICATION_CODE_TTL_MS, VERIFICATION_MAX_ATTEMPTS } from '../services/voice/destinationVerification';
+import { VERIFICATION_CODE_TTL_MS, VERIFICATION_MAX_ATTEMPTS, VERIFICATION_MAX_STARTS_PER_MEMBER_PER_DAY, VERIFICATION_MAX_STARTS_PER_ORG_PER_DAY } from '../services/voice/memberVerification';
+import { confirmMemberVerification, startMemberVerification, storedHotLeadCallConfig as storedConfig } from '../services/hotLeadCallSettingsService';
 import { assertHotLeadCallEntitled } from '../services/voice/hotLeadCallEntitlement';
 import { provisionNumber, releaseNumber, monthlyRentText } from '../services/voice/numberProvisioning';
 
@@ -73,7 +73,7 @@ emmaToolRegistry.register({
     if (areaCode !== undefined && (typeof areaCode !== 'string' || !/^\d{3}$/.test(areaCode))) throw new Error('areaCode must be exactly 3 digits, for example 415');
     const org = await callerOrg(context, 'the hot lead caller number', true);
     await assertHotLeadCallEntitled(org);
-    const config = configuredOrThrow(storedConfig(org.hotLeadCall));
+    const config = configuredOrThrow(storedConfig(org));
     const result = await provisionNumber({ org, config, userId: userIdOf(context), areaCode });
     return {
       success: true, ...result,
@@ -93,7 +93,7 @@ emmaToolRegistry.register({
     requireAttended(context);
     onlyKeys(args, []);
     const org = await callerOrg(context, 'the hot lead caller number', true);
-    const config = configuredOrThrow(storedConfig(org.hotLeadCall));
+    const config = configuredOrThrow(storedConfig(org));
     return { success: true, ...(await releaseNumber({ org, config })) };
   },
 });
@@ -102,16 +102,14 @@ emmaToolRegistry.register({
   name: 'start_hot_lead_call_verification',
   definition: {
     name: 'start_hot_lead_call_verification',
-    description: `Phone a saved team member's number and read out a 6-digit code, to prove the member controls it (org owners/admins only; refused when the organization's plan does not include hot lead calls). Needs saved settings and a provisioned caller number (provision_hot_lead_call_number first). It always calls the saved number, never one you pass. With one team member that member is called; with several, pass memberId. The code is only spoken on the call: it is never shown here, so ask the user to read it back, then call confirm_hot_lead_call_verification. The code is valid for ${VERIFICATION_CODE_TTL_MS / 60_000} minutes with ${VERIFICATION_MAX_ATTEMPTS} attempts. Limits: one call per 2 minutes and 5 per day. Each call costs a small Twilio voice charge. Verification proves the phone answered and the code was heard; a voicemail that plays the message back can also pass it, and the spoken code is visible in the Twilio call log to people with Twilio access. Works even while hot lead calling is switched off platform-wide.`,
+    description: `Phone a saved team member's number and read out a 6-digit code, to prove the member controls it (org owners/admins only; refused when the organization's plan does not include hot lead calls). Needs saved settings and a provisioned caller number (provision_hot_lead_call_number first). It always calls the saved number, never one you pass. With one team member that member is called; with several, pass memberId. The code is only spoken on the call: it is never shown here, so ask the user to read it back, then call confirm_hot_lead_call_verification. The code is valid for ${VERIFICATION_CODE_TTL_MS / 60_000} minutes with ${VERIFICATION_MAX_ATTEMPTS} attempts. Limits: one call per person per 2 minutes, ${VERIFICATION_MAX_STARTS_PER_MEMBER_PER_DAY} per person per day and ${VERIFICATION_MAX_STARTS_PER_ORG_PER_DAY} per day for the organization. Each call costs a small Twilio voice charge. Verification proves the phone answered and the code was heard; a voicemail that plays the message back can also pass it, and the spoken code is visible in the Twilio call log to people with Twilio access. Works even while hot lead calling is switched off platform-wide.`,
     inputSchema: { type: 'object', properties: { memberId: MEMBER_ID_PROPERTY }, additionalProperties: false },
   },
   execute: async (args: unknown, context?: ToolContext) => {
     requireAttended(context);
     const { memberId } = onlyKeys(args, ['memberId']);
-    const org = await callerOrg(context, 'hot lead call verification', true);
-    await assertHotLeadCallEntitled(org);
-    const config = configuredOrThrow(storedConfig(org.hotLeadCall));
-    const result = await startVerification(org, config, userIdOf(context), memberIdOf(memberId));
+    const { org, caller } = await callerIdentity(context, 'hot lead call verification', true);
+    const result = await startMemberVerification(org, caller, memberIdOf(memberId));
     return {
       success: true, ...result,
       note: `A call to ${result.memberPhone} is on its way. Ask the user for the 6-digit code they hear.`,
@@ -135,9 +133,8 @@ emmaToolRegistry.register({
     const { code, memberId } = onlyKeys(args, ['code', 'memberId']);
     const digits = typeof code === 'string' ? code.replace(/[\s-]/g, '') : '';
     if (!/^\d{6}$/.test(digits)) throw new Error('The code is 6 digits');
-    const org = await callerOrg(context, 'hot lead call verification', true);
-    const config = configuredOrThrow(storedConfig(org.hotLeadCall));
-    const result = await confirmVerification(org, config, digits, memberIdOf(memberId));
+    const { org, caller } = await callerIdentity(context, 'hot lead call verification', true);
+    const result = await confirmMemberVerification(org, caller, memberIdOf(memberId), digits);
     return { success: true, memberVerified: true, ...result };
   },
 });
