@@ -141,7 +141,7 @@ async function repairPaymentMethodFlag(context: PaygContext): Promise<PaygContex
   if (!claimLivePaymentMethodCheck(context.billingUserId, Date.now())) return context;
   try {
     const { stripeService } = await import('./stripeService');
-    if (!(await stripeService.customerHasPaymentMethod(customerId))) return context;
+    if (!(await stripeService.resolveUserPaymentMethod(user, context.billingUserId)).hasPaymentMethod) return context;
     const updated = (await userDb.updateUser(context.billingUserId, { has_payment_method: true })) as User | undefined;
     return { ...context, billingUser: updated ?? { ...user, has_payment_method: true } };
   } catch (error: any) {
@@ -248,7 +248,7 @@ export async function updatePaygOverage(input: {
         poolHighWater = { month, thresholdMicroUsd: poolMicroUsd };
       }
     }
-    await requireLivePaymentMethod(context.billingUser);
+    await requireLivePaymentMethod(context.billingUser, context.billingUserId);
   }
   // Stripe just confirmed a card: the gates read the cached flag, so it is written with the settings.
   const userFields: Partial<User> = turningOn ? { has_payment_method: true } : {};
@@ -318,7 +318,7 @@ export async function updatePaygOverage(input: {
   return toView(writtenContext, account, await currentOveragePercent(input.userId, writtenContext));
 }
 
-async function requireLivePaymentMethod(billingUser: User | null): Promise<void> {
+async function requireLivePaymentMethod(billingUser: User | null, billingUserId: string): Promise<void> {
   const customerId = billingUser?.stripe_customer_id;
   if (!customerId) {
     throw new PaygOverageRequestError(409, 'payment_method_required', 'Add a payment method before turning on pay-as-you-go');
@@ -326,7 +326,8 @@ async function requireLivePaymentMethod(billingUser: User | null): Promise<void>
   let hasPaymentMethod: boolean;
   try {
     const { stripeService } = await import('./stripeService');
-    hasPaymentMethod = await stripeService.customerHasPaymentMethod(customerId);
+    // ENG-2571's single answer: every live Stripe customer that belongs to this user, not just the row's.
+    hasPaymentMethod = (await stripeService.resolveUserPaymentMethod(billingUser, billingUserId)).hasPaymentMethod;
   } catch (error: any) {
     console.error('[paygOverage] Live payment-method check failed:', error?.message || error);
     throw new PaygOverageRequestError(503, 'payment_check_unavailable', 'Could not confirm your payment method right now; please try again');

@@ -34,8 +34,17 @@ jest.mock('../../services/settingsService', () => ({
   settingsService: { getSetting: jest.fn() },
 }));
 
+// The service asks ENG-2571's resolveUserPaymentMethod; the tests drive its answer per Stripe customer id.
+const mockHasPaymentMethod = jest.fn();
 jest.mock('../../services/stripeService', () => ({
-  stripeService: { customerHasPaymentMethod: jest.fn() },
+  stripeService: {
+    resolveUserPaymentMethod: jest.fn(async (user: { stripe_customer_id?: string } | null) => ({
+      hasPaymentMethod: await mockHasPaymentMethod(user?.stripe_customer_id),
+      customerId: null,
+      card: null,
+      isZoma: false,
+    })),
+  },
 }));
 
 jest.mock('../../services/spendEnforcementBasis', () => ({
@@ -45,7 +54,6 @@ jest.mock('../../services/spendEnforcementBasis', () => ({
 import subscriptionRoutes from '../subscription';
 import { userDb, orgDb } from '../../services/db';
 import { getSubscriptionTypeConfig, getUserSubscriptionType } from '../../services/subscriptionService';
-import { stripeService } from '../../services/stripeService';
 import { resolveEnforcementCostBasisMicroUsd } from '../../services/spendEnforcementBasis';
 import {
   LIVE_PAYMENT_METHOD_CHECK_WINDOW_MS,
@@ -65,7 +73,6 @@ const mockUpdateUser = (userDb as any).updateUser as jest.Mock;
 const mockGetOrgById = orgDb.getOrgById as jest.Mock;
 const mockTierName = getUserSubscriptionType as jest.Mock;
 const mockTierConfig = getSubscriptionTypeConfig as jest.Mock;
-const mockHasPaymentMethod = stripeService.customerHasPaymentMethod as jest.Mock;
 const mockSpend = resolveEnforcementCostBasisMicroUsd as jest.Mock;
 
 const policy = {
