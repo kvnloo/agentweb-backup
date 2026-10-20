@@ -119,6 +119,11 @@ export function authenticateAgentRunsSecretOrAdmin(agentRunsRouter: RequestHandl
       if (!safeSecretEquals(provided, expected)) {
         return res.status(401).json({ error: 'Unauthorized' });
       }
+      // The secret covers the run list only. Sub-routes such as /trace return tool arguments and
+      // results, so they stay behind a real admin session.
+      if (req.path !== '/') {
+        return res.status(403).json({ error: 'The agent-runs secret only covers the run list' });
+      }
       if (!narrowToSessionLookup(req, res)) return; // response already sent (400)
       return agentRunsRouter(req, res, next);
     }
