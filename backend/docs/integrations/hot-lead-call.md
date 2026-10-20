@@ -76,9 +76,10 @@ Branches (all end in `finished` once every leg that was dialed is metered):
 | Owner presses another digit | `/gather` | `owner_declined` | `call.owner_answered`, `call.owner_declined`, `call.completed` |
 | Owner hangs up on or ignores the prompt | owner `/status` terminal | `owner_declined` | `call.owner_answered`, `call.owner_declined`, `call.completed` |
 | Owner never picks up (no-answer, busy, failed, canceled) | owner `/status` terminal | `owner_no_answer` | `call.owner_no_answer`, `call.completed` |
-| Owner presses 1, lead does not answer | `/dial` with `no-answer`, `busy`, `failed` or `canceled` | `lead_no_answer` | `call.owner_answered`, `call.lead_no_answer`, `call.completed` |
+| Owner presses 1, lead does not answer | `/dial` with `no-answer`, `busy` or `failed` | `lead_no_answer` | `call.owner_answered`, `call.lead_no_answer`, `call.completed` |
 | Lead number no longer valid at bridge time | `/gather` | `lead_phone_invalid` (record stays `owner_answered` until the owner leg ends) | `call.owner_answered`, `call.failed` (reason `lead_phone_invalid`), `call.completed` |
 | Kill switch or config turned off while the owner is on the line | `/owner` or `/gather` | `aborted` | at `/owner` (still ringing): `call.failed` (reason `aborted`), `call.completed`; at `/gather` (owner was on the prompt): `call.owner_answered`, `call.failed` (reason `aborted`), `call.completed` |
+| Owner hangs up while the lead is still ringing (`/dial` reports `canceled`) | `/dial`, then `finishIfComplete` | `bridge_unconfirmed` | `call.owner_answered`, `call.completed` |
 | Bridge ended but `/dial` never reported a result | `finishIfComplete` | `bridge_unconfirmed` | `call.completed` |
 
 The leg-metering rule behind "finished": the store refuses to move a terminal
@@ -97,6 +98,7 @@ All paths are under `backend/src/`.
 | Org config type and strict validator | `services/hotLeadCallConfig.ts` |
 | Org/list/owner routing for the call | `services/voice/hotLeadCallContext.ts` |
 | Global kill switch | `services/voice/hotLeadCallMode.ts` |
+| Plan entitlement (the `hot_lead_call` subscription feature) | `services/voice/hotLeadCallEntitlement.ts` |
 | Quiet hours, abuse limits, slot reservation | `services/voice/hotLeadCallLimits.ts`, `services/voice/limitStore.ts` (DynamoDB), `services/voice/fakeLimitStore.ts` (tests) |
 | Call record (state machine storage) and timeline events | `services/voice/leadCallStore.ts`, `services/voice/leadCallStore.types.ts` |
 | Twilio seam (`placeCall`, `buyNumber`, `releaseNumber`, `validateSignature`) | `services/voice/voiceProvider.ts` (the only file that imports `twilio`), `services/voice/fakeVoiceProvider.ts` |
@@ -245,6 +247,28 @@ voicemail that plays the message back can also pass it. The spoken code is
 believed to be visible in the Twilio call log to anyone with access to the
 Twilio account (inline TwiML is normally logged; unverified, see "Not verified").
 
+## Plan entitlement
+
+Calls make AgentWeb pay Twilio, so the feature is tied to the plan, using the
+existing subscription-tier mechanism. In the admin Subscription Types editor each
+tier has a list of product features; **Hot lead calls** (`hot_lead_call`) is one.
+An org is entitled when the tier of its billing owner (`Organization.ownerUserId`;
+members and admins follow the owner's plan) lists `hot_lead_call` or `*`.
+
+- A tier row with no saved feature list (rows that predate feature lists) is NOT
+  entitled, unlike the other features. The editor displays such a row with every
+  feature ticked, and saving it from the editor grants the feature. Tick it only
+  for paid tiers and re-check the Free tier after any save.
+- Anything unresolvable (no owner, unreadable tier, lookup error) is not entitled.
+- Enforced in three places: `provision_hot_lead_call_number` and
+  `start_hot_lead_call_verification` refuse with a plain message;
+  `update_hot_lead_call_settings` refuses `enabled: true` (saving settings or
+  disabling is always allowed); and the orchestrator skips with `call.skipped`
+  `not_entitled` before any limit or record, at dispatch and again in the job, so
+  an org that loses its plan stops dialing. A call already in flight finishes.
+- `release_hot_lead_call_number` and `confirm_hot_lead_call_verification` stay
+  available so an org that lost its plan can still stop paying for a number.
+
 ## Settings keys (AW-Settings)
 
 | Key | Value | Meaning |
@@ -267,7 +291,7 @@ Jest (`NODE_ENV=test`) it is always off unless overridden.
   `prod/AgentWeb/Twilio` in production and `dev/AgentWeb/Twilio` otherwise
   (AWS Secrets Manager). The pair `TWILIO_ACCOUNT_SID` + `TWILIO_AUTH_TOKEN` in
   the environment overrides the secret, but only when BOTH are set (never mixed;
-  a partial pair is ignored with a warning). Cached 5 minutes, successes only.
+  a partial pair is ignored with a warning). A success is cached 5 minutes; a failed load is remembered for 5 seconds (one Secrets Manager read and one log line per window, callers get the same 503 meanwhile) so unauthenticated requests cannot drive a read per request.
   Missing fields throw. The auth token also verifies inbound webhook
   signatures, so rotating it takes effect within the cache TTL without a
   restart.
@@ -279,6 +303,9 @@ Jest (`NODE_ENV=test`) it is always off unless overridden.
   `NODE_ENV` is set to anything other than `development` or `test` (production,
   staging); only `development`, `test` or an unset `NODE_ENV` fall back to
   localhost.
+- The lead leg's `<Dial>` carries `timeLimit="1800"`: a bridged call is cut off
+  after 30 minutes (Twilio's `timeLimit` is the maximum duration of the `<Dial>`
+  in seconds; its default is 4 hours). Both legs are metered up to that point.
 - Webhook mount: `/api/webhooks/twilio-voice`, no auth middleware; every request
   must carry a valid `X-Twilio-Signature`. The route has its own 64 KB flat-form
   body parser, registered before the global 50 MB parsers.
@@ -352,7 +379,10 @@ go-live). They can be changed at runtime without a deploy: admin area >
 Revenue & billing > **Vendor Rates** tab, or `GET/PUT /api/admin/vendor-rates`
 (admin only). Overrides live in the `vendor_rate_overrides` setting; only
 `twilio` keys that exist on the card can be overridden; a value must be a plain
-decimal, > 0, <= 1000, at most 6 decimals; `null` removes an override. Rates are
+decimal, > 0, <= 10 USD per unit, at most 6 decimals; `null` removes an override.
+The 10 USD bound only refuses wild values (14 for 0.014 is refused); a smaller slip
+such as 1.4 for 0.014 is accepted, and the Vendor Rates tab's confirm dialog (it
+warns when a change is more than 10x up or down) is the safeguard for that. Rates are
 cached ~60 seconds. Spend events carry the rate-card version, with an
 `+ovr:<updatedAt>` suffix when an overridden rate priced them.
 
@@ -392,7 +422,14 @@ back if the record is not created:
 2. Skip gates with a `call.skipped` event: `no_caller_number`, `unsafe_id` (list
    or lead id outside `[A-Za-z0-9_.:-]{1,200}`, which the webhooks would
    reject), `invalid_phone`, `country_not_allowed`, `outside_quiet_hours`,
-   `too_old`.
+   `too_old`, then `not_entitled` (the org owner's subscription tier does not
+   include the `hot_lead_call` feature; see [Plan entitlement](#plan-entitlement)).
+   To stop an anonymous visitor growing a lead row by resubmitting, a lead gets
+   at most one `call.skipped` event per distinct reason and at most 5 in total
+   (counted from the lead's existing timeline, so two simultaneous submissions
+   can overshoot by the number in flight). A `duplicate_phone` refusal for a
+   lead that has, or within 200 ms gets, its own call record writes nothing: it
+   is the same lead racing itself.
 3. Limits, in this order: `duplicate_phone` (same org and number within 24h),
    `owner_cooldown`, `org_hourly_cap` (UTC clock hour), `org_daily_cap` (org's
    local calendar day). Each is one conditional write.
@@ -417,6 +454,19 @@ Known limits, accepted:
   retried automatically.
 - `confirm: true` on the provisioning tool is advisory. The real controls are
   the per-org purchase and release caps.
+- Two orgs configured with the same owner phone can ring that person
+  simultaneously: caps and cooldown are per org.
+- Prompt injection: the destination phone and settings are changed through Emma
+  tools, so text the model reads (a lead's form field, a web page) could try to
+  steer `update_hot_lead_call_settings` or `confirm_hot_lead_call_verification`.
+  The human-approval gate (see Known follow-ups) is a general-availability
+  precondition; until then use hand-picked orgs.
+- Verification brute force: a code is 6 digits with 5 attempts per code and 5
+  codes per day, so a guesser has roughly a 5-in-a-million chance per code and
+  about 25-in-a-million per day.
+- Phone-marker poisoning: whoever submits a number first holds its 24h marker,
+  so a third party can submit a victim lead's number first and suppress the call
+  for the genuine submission (the Slack alert still fires).
 
 ## Outcomes and timeline events
 
@@ -429,7 +479,7 @@ Event types written to the lead timeline (`eventType`, with a scalar `eventData`
 | `call.owner_declined` | owner pressed a key other than 1, or hung up on the prompt | - |
 | `call.owner_no_answer` | owner leg ended before pickup | - |
 | `call.connected` | lead answered (lead `/status` in-progress, or `/dial` completed) | - |
-| `call.lead_no_answer` | `/dial` reported no-answer, busy, failed or canceled | `dialStatus` |
+| `call.lead_no_answer` | `/dial` reported no-answer, busy or failed | `dialStatus` |
 | `call.completed` | last dialed leg metered; the record is `finished` | `outcome` |
 | `call.failed` | `reason`: `place_rejected`, `placement_unknown`, `lead_phone_invalid`, `aborted` | `reason` |
 | `call.skipped` | a gate or limit refused (no Twilio call made) | `reason` (list above) |
@@ -545,6 +595,28 @@ Do not let Emma retry an ambiguous purchase.
 | `no owner to bill for list` in logs | The list owner could not be resolved; the leg was not metered and `/status` answers 500. |
 | Slack alert arrives but no call | Expected whenever any gate refuses; the two paths are independent. |
 
+## Compliance and third parties
+
+Two risks come with a public lead form and must be understood before general
+availability:
+
+1. **A third party can be called.** An anonymous visitor can type any phone
+   number into a landing-page form. After the business owner presses 1, that third
+   party receives a call from the org's Twilio number, and the same victim number
+   can be entered at several orgs, so each org's owner connects once.
+2. **A number-rotating bot can starve genuine leads.** A script that submits a
+   different number each time uses up an org's daily and hourly caps; real leads
+   after that are skipped (`org_hourly_cap` / `org_daily_cap`). The Slack alert
+   still fires for every lead.
+
+Mitigations to decide before general availability (none of them is built):
+
+- CAPTCHA or honeypot enforcement on the lander endpoint.
+- A spoken disclosure to the lead before the bridge. This needs the Twilio
+  `<Number url>` whisper, which has not been verified.
+- Requiring a name or an email besides the phone number.
+- Consent text on the landers.
+
 ## Go-live checklist
 
 Owner: Anurag. None of these may be skipped before `hot_lead_call_mode` is turned
@@ -582,7 +654,23 @@ on anywhere.
    sent.
 9. Flip `hot_lead_call_mode` to `on` only after the org itself is enabled, watch
    the first real leads, keep the off command to hand (effective within ~30s).
-10. Known gaps accepted at launch, to be closed before general availability: the
+10. Plan entitlement: tick **Hot lead calls** only on the paid tier(s) that
+    include it (Subscription Types editor) and confirm the Free tier does not
+    have it. See [Plan entitlement](#plan-entitlement).
+11. Decide the mitigations in [Compliance and third parties](#compliance-and-third-parties)
+    before general availability (CAPTCHA/honeypot, spoken disclosure before the
+    bridge, name or email besides the phone, consent text).
+12. Dependency bump (whole backend): adding `twilio` raised axios 1.9.0 to 1.13.5,
+    jsonwebtoken 9.0.2 to 9.0.3, jws 3.2.2 to 4.0.1, jwa 1.4.1 to 2.0.1 and some
+    patch versions. After the deploy, smoke the Slack, Facebook/Meta and Teams
+    (botbuilder) HTTP paths and the Google auth paths. The regression run of the 212
+    suites that touch these libraries passed.
+13. Rate-card version: `VENDOR_RATE_CARD_VERSION` moved from 2026-09-14 to
+    2026-10-19 because a rate was added, so spend events written after the deploy
+    carry the new version string for ALL vendors. Amounts are identical (checked
+    byte for byte for v0, Apollo, Placid and Remotion); a reconciliation that
+    groups by rate-card version will see a new bucket.
+14. Known gaps accepted at launch, to be closed before general availability: the
     human-approval gate for provision/release (the tools refuse unattended runs
     and are capped per org, nothing more); recurring number-rent metering is not
     built (only the first month is recorded).
