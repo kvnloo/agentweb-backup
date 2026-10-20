@@ -67,6 +67,16 @@ suite('hot-lead call store against DynamoDB Local', () => {
     expect(await store.get(LIST, leadId)).toMatchObject({ state: 'dialing', jobKey: 'job-1', meteredLegs: [], lastSequence: {} });
   });
 
+  it('stores the empty strings a next attempt uses to clear the call sid and outcome', async () => {
+    const leadId = await newLead();
+    await store.create(LIST, leadId, { ...baseRecord, state: 'dialing', memberCallSid: SID_A, outcome: 'member_no_answer' });
+    await store.transition(LIST, leadId, ['dialing'], { state: 'between_attempts' });
+    expect(await store.transition(LIST, leadId, ['between_attempts'], {
+      state: 'dialing', attemptNo: 2, memberId: 'mbbbbbbb', triedMemberIds: ['mbbbbbbb'], memberCallSid: '', outcome: '',
+    })).toBe(true);
+    expect(await store.get(LIST, leadId)).toMatchObject({ state: 'dialing', attemptNo: 2, memberCallSid: '', outcome: '', triedMemberIds: ['mbbbbbbb'] });
+  });
+
   it('keeps sibling system keys when creating', async () => {
     const leadId = await newLead({ system: { linkedInConnectionNotifiedAt: 'x' } });
     expect(await store.create(LIST, leadId, baseRecord)).toBe(true);
