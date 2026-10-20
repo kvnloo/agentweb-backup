@@ -456,6 +456,38 @@ describe('Organization routes', () => {
     });
   });
 
+  describe('update responses do not carry the hot-lead call internals', () => {
+    const INTERNALS = ['hotLeadCall', 'hotLeadCallVerification', 'hotLeadCallProvisioning'];
+    beforeEach(() => {
+      mockOrgs['org-1'] = {
+        orgId: 'org-1',
+        name: 'Test Org',
+        ownerUserId: 'user-1',
+        hotLeadCall: { destinationPhone: '+15555550100', twilioNumberSid: 'PN' + 'a'.repeat(32) },
+        hotLeadCallVerification: { codeHash: 'deadbeef' },
+        hotLeadCallProvisioning: { purchases: ['2026-10-19T00:00:00.000Z'] },
+      };
+      mockUsers['user-1'].orgId = 'org-1';
+      mockUsers['user-1'].orgRole = 'owner';
+      mockUsers['user-1'].brandGuidelines = 'Be kind';
+    });
+
+    it('PUT /api/org/:orgId returns the updated org without them', async () => {
+      const res = await request(app).put('/api/org/org-1').send({ name: 'Renamed' });
+      expect(res.status).toBe(200);
+      expect(res.body.data).toMatchObject({ orgId: 'org-1', name: 'Renamed' });
+      for (const key of INTERNALS) expect(res.body.data).not.toHaveProperty(key);
+      expect(JSON.stringify(res.body)).not.toMatch(/5555550100|deadbeef/);
+    });
+
+    it('POST /api/org/:orgId/copy-profile returns the updated org without them', async () => {
+      const res = await request(app).post('/api/org/org-1/copy-profile').send({});
+      expect(res.status).toBe(200);
+      expect(res.body.data).toMatchObject({ orgId: 'org-1' });
+      for (const key of INTERNALS) expect(res.body.data).not.toHaveProperty(key);
+    });
+  });
+
   describe('POST /api/org/:orgId/copy-profile - copy shared profile data', () => {
     beforeEach(() => {
       mockOrgs['org-1'] = {

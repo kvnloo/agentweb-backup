@@ -113,6 +113,18 @@ function buildOrgMarketStrategyForCopy(user: any): MarketStrategy | undefined {
 }
 
 // All org routes require authentication
+/**
+ * The org record as returned by update endpoints must not carry the hot-lead call internals: the owner's
+ * destination phone and caller-number sid, the pending verification (code hash) or the purchase history.
+ * Emma's settings tool is the only place they are read, masked.
+ */
+function withoutHotLeadCallInternals<T extends object | null | undefined>(org: T): Omit<NonNullable<T>, 'hotLeadCall' | 'hotLeadCallVerification' | 'hotLeadCallProvisioning'> | T {
+  if (!org) return org;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { hotLeadCall, hotLeadCallVerification, hotLeadCallProvisioning, ...rest } = org as Record<string, unknown>;
+  return rest as Omit<NonNullable<T>, 'hotLeadCall' | 'hotLeadCallVerification' | 'hotLeadCallProvisioning'>;
+}
+
 router.use(authenticateToken);
 
 // Read and write authority over org connected accounts are separate questions, so
@@ -657,7 +669,7 @@ router.put("/:orgId", async (req: Request, res: Response) => {
     }
 
     const updated = await orgDb.updateOrg(orgId, updates);
-    return res.json({ success: true, data: updated });
+    return res.json({ success: true, data: withoutHotLeadCallInternals(updated) });
   } catch (error) {
     console.error("Error updating organization:", error);
     return res.status(500).json({ error: "Internal server error" });
@@ -1428,7 +1440,7 @@ router.post("/:orgId/copy-profile", async (req: Request, res: Response) => {
       success: true,
       message: "Profile data copied to organization",
       copiedFields: Object.keys(profileFields),
-      data: updated,
+      data: withoutHotLeadCallInternals(updated),
     });
   } catch (error) {
     console.error("Error copying profile to org:", error);
