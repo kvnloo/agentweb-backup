@@ -139,7 +139,9 @@ describe('ENG-778 admin scheduled-chat status', () => {
     const app = appAs({ user: ADMIN });
     getScheduleById.mockResolvedValue({ ...schedule(), status: 'paused' });
     isSubscriptionFeatureEnabled.mockResolvedValueOnce(false);
-    expect((await request(app).patch('/api/admin/scheduled-chats/s-1/status').send({ status: 'active' })).status).toBe(403);
+    const planRes = await request(app).patch('/api/admin/scheduled-chats/s-1/status').send({ status: 'active' });
+    expect(planRes.status).toBe(403);
+    expect(planRes.body.code).toBe('OWNER_PLAN_LACKS_SCHEDULED_CHATS');
     checkScheduleActivationRecipients.mockResolvedValueOnce({ code: 'no_authorized_recipients', safeAction: 'fix recipients' });
     expect((await request(app).patch('/api/admin/scheduled-chats/s-1/status').send({ status: 'active' })).status).toBe(400);
     expect(updateSchedule).not.toHaveBeenCalled();
