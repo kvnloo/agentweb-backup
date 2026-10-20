@@ -32,7 +32,7 @@ function displayDailyInviteCap(raw: unknown): number {
 
 const router = express.Router();
 
-async function canCallerDisconnectAccount(userId: string, platform: string, accountId?: string): Promise<{ allowed: boolean; error?: string }> {
+export async function canCallerDisconnectAccount(userId: string, platform: string, accountId?: string): Promise<{ allowed: boolean; error?: string }> {
   const user = await userDb.getUserById(userId);
   if (!user?.orgId) {
     return { allowed: true };
