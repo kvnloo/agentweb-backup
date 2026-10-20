@@ -1,5 +1,6 @@
 import { dynamodb } from '../../config/aws';
 import { tableName } from '../../config/constants';
+import { isConditionalFailure } from './setupWrites';
 
 /**
  * Atomic counters and expiring claims for the hot-lead call abuse limits. Every method is ONE conditional
@@ -24,8 +25,6 @@ export interface LimitStore {
 const LIMITS_TABLE = tableName('AW-MCPSessions');
 const PK = 'sessionId';
 
-const isConditionFailed = (err: unknown): boolean => (err as { code?: string })?.code === 'ConditionalCheckFailedException';
-
 class DynamoLimitStore implements LimitStore {
   async incrementBelow(key: string, cap: number, expiresAtS: number): Promise<boolean> {
     if (!(cap >= 1)) return false; // a zero, negative or NaN cap admits nothing (the condition would admit a first call)
@@ -40,7 +39,7 @@ class DynamoLimitStore implements LimitStore {
       }).promise();
       return true;
     } catch (err) {
-      if (isConditionFailed(err)) return false;
+      if (isConditionalFailure(err)) return false;
       throw err;
     }
   }
@@ -55,7 +54,7 @@ class DynamoLimitStore implements LimitStore {
         ExpressionAttributeValues: { ':zero': 0, ':one': 1 },
       }).promise();
     } catch (err) {
-      if (!isConditionFailed(err)) console.warn('[hotLeadCall] could not give a call slot back', (err as { code?: string })?.code ?? 'error');
+      if (!isConditionalFailure(err)) console.warn('[hotLeadCall] could not give a call slot back', (err as { code?: string })?.code ?? 'error');
     }
   }
 
@@ -71,7 +70,7 @@ class DynamoLimitStore implements LimitStore {
       }).promise();
       return true;
     } catch (err) {
-      if (isConditionFailed(err)) return false;
+      if (isConditionalFailure(err)) return false;
       throw err;
     }
   }
@@ -86,7 +85,7 @@ class DynamoLimitStore implements LimitStore {
         ExpressionAttributeValues: { ':token': token },
       }).promise();
     } catch (err) {
-      if (!isConditionFailed(err)) console.warn('[hotLeadCall] could not release a call claim', (err as { code?: string })?.code ?? 'error');
+      if (!isConditionalFailure(err)) console.warn('[hotLeadCall] could not release a call claim', (err as { code?: string })?.code ?? 'error');
     }
   }
 }

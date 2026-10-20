@@ -17,6 +17,11 @@ describe('DynamoDB limit store: incrementBelow', () => {
     expect(update).toHaveBeenCalledTimes(2);
   });
 
+  it('also recognises a failed condition reported by error name (the SDK shape differs between versions)', async () => {
+    update.mockRejectedValue(Object.assign(new Error('x'), { name: 'ConditionalCheckFailedException' }));
+    expect(await getLimitStore().incrementBelow('k', 1, 1)).toBe(false);
+  });
+
   it('propagates other DynamoDB errors so the job fails closed', async () => {
     update.mockRejectedValue(Object.assign(new Error('missing table'), { code: 'ResourceNotFoundException' }));
     await expect(getLimitStore().incrementBelow('k', 1, 1)).rejects.toThrow('missing table');
