@@ -10,3 +10,7 @@ Install checklist (test instance first; production needs the network-isolation P
 4. `/etc/aw-login-host/<env>.json` root-owned 0600, uid range disjoint from every other env and `/etc/subuid` (the host enforces both).
 5. `systemctl enable --now aw-login-host@<env>`; the socket dir `/run/aw-login-host-<env>` is the access gate (group = the backend's gid).
 Config is a CLOSED schema: unknown keys fail start-up. See `host/hostConfig.ts`.
+
+## Test instance only
+`install-test-host.sh` installs env `test1` on the throwaway test instance (loop-mounted 500M homes fs, uid range 420000-430000, socket group 1000). It is NOT a production installer: production needs its own sized volume, a real group for the backend, and the network-isolation PR first.
+The manual live runner `__tests__/live/hostLiveAuth.ts` (bundle it with esbuild, run as root on the instance) does a REAL sign-in through the host with a hidden code entry; it prints only redacted PASS/FAIL lines.
