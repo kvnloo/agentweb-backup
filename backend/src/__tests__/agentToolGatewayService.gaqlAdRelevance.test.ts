@@ -9,7 +9,8 @@ const schema = {
 };
 
 function run(args: Record<string, unknown>, toolName = 'call_google_ads_reporting_api', inputSchema: any = schema) {
-  return validateAndRepairToolArgs({ toolName, args, inputSchema, effect: 'read' });
+  const result = validateAndRepairToolArgs({ toolName, args, inputSchema, effect: 'read' });
+  return { ...result, args: result.args as Record<string, string> };
 }
 
 describe('GAQL quality_info.ad_relevance repair (ENG-2581)', () => {
