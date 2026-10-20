@@ -2,6 +2,7 @@ import '../emma/tools';
 import { mcpToolRegistry } from '../mcp/server/registry';
 import { agentModeService, ADMIN_SKILL_TOOL_NAMES } from '../services/agentModeService';
 import { userDb } from '../services/db';
+import { chatbotDb } from '../services/chatbotService';
 import { runFunnelStatusOperation, MAX_FUNNEL_STATUS_BATCH } from '../services/adminFunnelStatusService';
 
 const actor = { actorUserId: 'admin-1', actorEmail: 'admin@agentweb.pro', accountableOwner: 'harsha@agentweb.pro' };
@@ -133,6 +134,19 @@ describe('ENG-752 manage_user_funnel_status tool access', () => {
     const res: any = await tool().execute({ mode: 'apply', rows: [{ email: 'a@x.com', funnel_status: 'follow_up' }] }, { userId: 'adm', isDelegatedAdmin: true });
     expect(res.rows[0]).toMatchObject({ outcome: 'updated', after: 'follow_up' });
     expect(update).toHaveBeenCalledWith('u1', { funnelStatus: 'follow_up' });
+  });
+
+  it('audits the delegating administrator, not the impersonated target user', async () => {
+    jest.spyOn(userDb, 'getUserById').mockResolvedValue({ userId: 'cust', email: 'c@x.com', isAdmin: false } as any);
+    jest.spyOn(chatbotDb, 'getChatSession').mockResolvedValue({ delegateInfo: { isDelegated: true, adminUserId: 'adm', adminEmail: 'adm@agentweb.pro' } } as any);
+    jest.spyOn(userDb, 'getUserByEmail').mockResolvedValue({ userId: 'u1', email: 'a@x.com', funnelStatus: 'parked' } as any);
+    jest.spyOn(userDb, 'updateUser').mockResolvedValue({} as any);
+    const log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    await tool().execute({ mode: 'apply', rows: [{ email: 'a@x.com', funnel_status: 'follow_up' }] }, { userId: 'cust', isDelegatedAdmin: true, sessionId: 's1' });
+    const audit = log.mock.calls.map(([l]) => String(l)).find((l) => l.includes('[admin-audit]'));
+    expect(audit).toBeDefined();
+    expect(audit).toContain('adm@agentweb.pro');
+    expect(audit).not.toContain('"cust"');
   });
 
   it('still fails closed for a delegated non-admin with no admin identity', async () => {

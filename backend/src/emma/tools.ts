@@ -7492,14 +7492,22 @@ mcpToolRegistry.register({
       throw new Error('Admin access required to manage user funnel status');
     }
     let actorEmail: string | undefined = delegatedAdmin ? context?.adminEmail : user?.email;
-    if (delegatedAdmin && !actorEmail && context?.sessionId) {
+    // Audit the delegating administrator, not the impersonated target user.
+    let actorUserId: string | undefined = delegatedAdmin ? undefined : userId;
+    if (delegatedAdmin && context?.sessionId) {
       const session = await chatbotDb.getChatSession(context.sessionId);
-      if (session?.delegateInfo?.isDelegated) actorEmail = session.delegateInfo.adminEmail;
+      if (session?.delegateInfo?.isDelegated) {
+        actorEmail ??= session.delegateInfo.adminEmail;
+        actorUserId = session.delegateInfo.adminUserId;
+      }
     }
     // The socket sidebar marks real admins isDelegatedAdmin without an adminEmail;
     // a genuine admin row is its own actor.
-    if (!actorEmail && user?.isAdmin === true) actorEmail = user.email;
-    if (!actorEmail) throw new Error('Administrator identity unavailable');
+    if (user?.isAdmin === true) {
+      if (!actorEmail) actorEmail = user.email;
+      if (!actorUserId) actorUserId = userId;
+    }
+    if (!actorEmail || !actorUserId) throw new Error('Administrator identity unavailable');
     const mode = args?.mode;
     if (mode !== 'read' && mode !== 'preview' && mode !== 'apply') {
       throw new Error('mode must be read, preview, or apply');
@@ -7507,7 +7515,7 @@ mcpToolRegistry.register({
     const { runFunnelStatusOperation } = await import('../services/adminFunnelStatusService');
     const { recordAdminAudit } = await import('../services/adminAuditLog');
     const owner = typeof args?.accountable_owner === 'string' && args.accountable_owner.trim() ? args.accountable_owner.trim() : actorEmail;
-    return runFunnelStatusOperation(mode, args?.rows, { actorUserId: userId, actorEmail, accountableOwner: owner }, {
+    return runFunnelStatusOperation(mode, args?.rows, { actorUserId, actorEmail, accountableOwner: owner }, {
       getUserByEmail: async (email) => {
         const u: any = await userDb.getUserByEmail(email);
         return u ? { userId: u.userId, email: u.email, funnelStatus: u.funnelStatus } : undefined;
