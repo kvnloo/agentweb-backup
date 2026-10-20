@@ -9,9 +9,9 @@
 import { userDb, type User } from './db';
 import { settingsService } from './settingsService';
 import { getSubscriptionTypeConfig, getUserSubscriptionType } from './subscriptionService';
-import { resolveBillingUserId } from './tokenUsageService';
+import { getCurrentMonth, resolveBillingUserId } from './tokenUsageService';
 import { getEffectiveLlmUsagePolicy } from './llmUsagePolicyResolverService';
-import { getCurrentUsageMonth } from './llmUsageCreditService';
+import { getCurrentUsageMonth, getRevocablePurchasedCreditMicroUsd } from './llmUsageCreditService';
 import {
   createPaygOverageSwitch,
   isPaygCapPercent,
@@ -243,9 +243,15 @@ export async function updatePaygOverage(input: {
         poolAtOptInMicroUsd: poolMicroUsd,
       };
       // Pin the month's pool at least at the opt-in pool, so a downgrade before the next check cannot
-      // drop the pool under the one the baseline was measured against.
-      if (existing?.poolHighWater?.month !== month || existing.poolHighWater.thresholdMicroUsd < poolMicroUsd) {
-        poolHighWater = { month, thresholdMicroUsd: poolMicroUsd };
+      // drop the pool under the one the baseline was measured against. Like the gate's own mark, it
+      // leaves out top-up credit a refund can still revoke (llmUsagePoolDecision.ts).
+      const markMicroUsd = Math.max(
+        0,
+        usage.policy.hardCostThresholdMicroUsd
+          - getRevocablePurchasedCreditMicroUsd(context.billingUser?.llmUsageCredits, getCurrentMonth()),
+      );
+      if (existing?.poolHighWater?.month !== month || existing.poolHighWater.thresholdMicroUsd < markMicroUsd) {
+        poolHighWater = { month, thresholdMicroUsd: markMicroUsd };
       }
     }
     await requireLivePaymentMethod(context.billingUser, context.billingUserId);

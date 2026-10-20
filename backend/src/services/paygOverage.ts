@@ -60,9 +60,11 @@ export interface PaygOverageSettings {
    */
   capPercentOfPool: PaygCapPercent;
   /**
-   * The highest effective pool threshold seen in `month` (UTC `YYYY-MM`). Overage is measured above
-   * this, not above today's threshold, so a mid-month downgrade never turns usage the customer already
-   * had included into retroactive overage. Written only when it rises.
+   * The highest effective pool threshold seen in `month` (UTC `YYYY-MM`), not counting top-up credit a
+   * refund or dispute can still revoke (seat and admin credit are counted). Overage is measured above the
+   * larger of this and today's pool, so a mid-month downgrade never turns usage the customer already had
+   * included into retroactive overage, while a revoked top-up stops extending the pool. Written only when
+   * it rises.
    */
   poolHighWater?: { month: string; thresholdMicroUsd: number };
   /**
@@ -142,8 +144,9 @@ export function paygGrossOverageMicroUsd(costUsedMicroUsd: number, poolMicroUsd:
  * The baseline is the overage standing at opt-in, measured against the pool THEN. Growth of the pool
  * since (an upgrade, a top-up) already lowers today's gross overage by exactly that growth, so
  * subtracting the full baseline as well would discount the same dollars twice and hide real
- * post-opt-in usage from the cap. The baseline shrinks by the growth instead, never below 0. The pool cannot shrink below the opt-in pool within the month:
- * opting in raises the high-water mark to it.
+ * post-opt-in usage from the cap. The baseline shrinks by the growth instead, never below 0. The pool
+ * only shrinks below the opt-in pool within the month when a top-up is refunded or disputed (opting in
+ * raises the high-water mark to the rest of it); then the revoked capacity rightly stops covering usage.
  *
  * An opt-in from another month contributes nothing. One written before `poolAtOptInMicroUsd` existed is
  * read as measured against the month's high-water mark (or today's pool when there is none, i.e. no

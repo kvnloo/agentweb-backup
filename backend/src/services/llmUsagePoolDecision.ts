@@ -16,7 +16,13 @@
  */
 import type { User } from './db';
 import { userDb } from './db';
-import { applyLlmUsageCredits, getCurrentUsageMonth, getLlmUsageCreditAdjustment, type LlmUsageCreditAdjustment } from './llmUsageCreditService';
+import {
+  applyLlmUsageCredits,
+  getCurrentUsageMonth,
+  getLlmUsageCreditAdjustment,
+  getRevocablePurchasedCreditMicroUsd,
+  type LlmUsageCreditAdjustment,
+} from './llmUsageCreditService';
 import { evaluateLlmUsageMode, type LlmUsageModeDecision, type LlmUsagePolicy } from './llmUsagePolicyService';
 import { resolveEnforcementCostBasisMicroUsd } from './spendEnforcementBasis';
 import {
@@ -116,11 +122,17 @@ export async function resolveLlmUsagePoolDecision(input: {
   // month's opt-in baseline, so the pool it is measured against must include any larger pool the month
   // had while PAYG was off — otherwise usage that pool included (upgrade, spend, downgrade, re-enable)
   // would be counted, and billed, as overage. Written only when it rises, as for an enabled opt-in.
+  // The mark leaves out top-up credit a refund or dispute can still revoke: a live top-up already
+  // extends today's pool (the overage threshold is the larger of the two), and once revoked it must not
+  // linger in the mark as capacity nobody paid for. Seat and admin credit stay in it.
   const poolHighWater = await recordPoolHighWater({
     billingUserId,
     account: ownerAccount,
     month: usageMonth,
-    thresholdMicroUsd: policy.hardCostThresholdMicroUsd,
+    thresholdMicroUsd: Math.max(
+      0,
+      policy.hardCostThresholdMicroUsd - getRevocablePurchasedCreditMicroUsd(billingUser?.llmUsageCredits, month),
+    ),
   });
   // Only an opt-in that is ON is ever evaluated; an OFF one keeps today's decision exactly.
   if (ownerAccount.enabled !== true) return base;
