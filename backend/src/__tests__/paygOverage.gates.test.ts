@@ -77,6 +77,7 @@ import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverSe
 import { resolveEffectiveModelForUser } from '../controllers/agentModeController';
 import { getCurrentUsageMonth } from '../services/llmUsageCreditService';
 import type { PaygOverageSettings } from '../services/paygOverage';
+import { createUserRowFake } from './helpers/userRowFake';
 
 const USD = 1_000_000;
 const OWNER = 'owner-1';
@@ -103,6 +104,8 @@ const payg = (over: Partial<PaygOverageSettings> = {}): PaygOverageSettings => (
   capPercentOfPool: 50,
   // Already at today's pool, so the high-water write is not part of every case.
   poolHighWater: { month: getCurrentUsageMonth(), thresholdMicroUsd: 100 * USD },
+  // PR-2: already marked as a month PAYG admitted in, so that write is not part of every case either.
+  admittedMonths: [getCurrentUsageMonth()],
   updatedBy: OWNER,
   updatedAt: '2026-10-01T00:00:00.000Z',
   version: 1,
@@ -271,7 +274,7 @@ describe('ENG-668 PAYG — mid-month downgrade (pool high-water)', () => {
   });
 
   it('records a rising pool with a conditional write on the high-water mark only', async () => {
-    setup({ spendUsd: 10, user: { paygOverage: payg({ poolHighWater: { month: '2000-01', thresholdMicroUsd: 999 * USD } }) } });
+    setup({ spendUsd: 10, user: { paygOverage: payg({ poolHighWater: { month: getCurrentUsageMonth(), thresholdMicroUsd: 60 * USD } }) } });
     await checkTokenUsage(OWNER);
 
     expect(mockUpdateUser).toHaveBeenCalledTimes(1);
@@ -284,6 +287,23 @@ describe('ENG-668 PAYG — mid-month downgrade (pool high-water)', () => {
     }]);
     expect(options.condition.expression).toContain('#payg.#hw.#threshold < :hwThreshold');
     expect(options.condition.values).toEqual({ ':hwMonth': getCurrentUsageMonth(), ':hwThreshold': 100 * USD });
+  });
+
+  it('the first mark of a new month keeps the previous month\'s as poolHighWaterClosed, conditional on it exactly (PR-2)', async () => {
+    setup({ spendUsd: 10, user: { paygOverage: payg({ poolHighWater: { month: '2000-01', thresholdMicroUsd: 999 * USD } }) } });
+    await checkTokenUsage(OWNER);
+
+    expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+    const [, fields, options] = mockUpdateUser.mock.calls[0];
+    expect(fields).toEqual({});
+    expect(options.pathSets).toEqual([
+      { path: ['paygOverage', 'poolHighWaterClosed'], value: { month: '2000-01', thresholdMicroUsd: 999 * USD } },
+      { path: ['paygOverage', 'poolHighWater'], value: { month: getCurrentUsageMonth(), thresholdMicroUsd: 100 * USD } },
+    ]);
+    expect(options.condition.expression).toBe(
+      'attribute_exists(#payg) AND #payg.#hw.#month = :prevMonth AND #payg.#hw.#threshold = :prevThreshold',
+    );
+    expect(options.condition.values).toEqual({ ':prevMonth': '2000-01', ':prevThreshold': 999 * USD });
   });
 
   it('a lost high-water race or a failed write never fails the check', async () => {
@@ -641,5 +661,63 @@ describe('ENG-668 PAYG — a refunded top-up does not stay in the pool high-wate
     expect(status.allowed).toBe(true);
     expect(status.overage).toEqual({ active: false, percentOfCap: 0 });
     expect(decision.effectiveModel).toBe(CHOSEN_MODEL);
+  });
+});
+
+describe('ENG-668 PR-2 — the gate records the months PAYG admitted in', () => {
+  const month = getCurrentUsageMonth();
+  function stored(paygOverage: PaygOverageSettings) {
+    const fake = createUserRowFake({
+      userId: OWNER, email: 'owner@example.com', subscription_status: 'active', has_payment_method: true, paygOverage,
+    });
+    mockGetUserById.mockImplementation(fake.read);
+    mockGetUserByIdConsistent.mockImplementation(fake.read);
+    mockUpdateUser.mockImplementation(fake.updateUser);
+    return fake;
+  }
+
+  it('the first PAYG admission of a month adds it, newest first, keeping one earlier month', async () => {
+    setup({ spendUsd: 120 });
+    const fake = stored(payg({ admittedMonths: ['2000-02', '2000-01'] }));
+    expect((await checkTokenUsage(OWNER)).allowed).toBe(true);
+    expect(fake.row.paygOverage.admittedMonths).toEqual([month, '2000-02']);
+
+    // Later admissions in the same month write nothing more.
+    mockUpdateUser.mockClear();
+    await bothGates();
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+  });
+
+  it('an account with no list yet gets one', async () => {
+    setup({ spendUsd: 120 });
+    const fake = stored(payg({ admittedMonths: undefined }));
+    await checkTokenUsage(OWNER);
+    expect(fake.row.paygOverage.admittedMonths).toEqual([month]);
+  });
+
+  it('nothing is recorded below the pool, past the cap, or while PAYG is off', async () => {
+    setup({ spendUsd: 60 });
+    const below = stored(payg({ admittedMonths: [] }));
+    await checkTokenUsage(OWNER);
+    expect(below.row.paygOverage.admittedMonths).toEqual([]);
+
+    setup({ spendUsd: 160 });
+    const capped = stored(payg({ admittedMonths: [] }));
+    expect((await checkTokenUsage(OWNER)).allowed).toBe(false);
+    expect(capped.row.paygOverage.admittedMonths).toEqual([]);
+
+    setup({ spendUsd: 120 });
+    const off = stored(payg({ enabled: false, admittedMonths: [] }));
+    expect((await checkTokenUsage(OWNER)).allowed).toBe(false);
+    expect(off.row.paygOverage.admittedMonths).toEqual([]);
+  });
+
+  it('a lost race on the list (another writer changed it) never fails the check', async () => {
+    setup({ spendUsd: 120 });
+    const fake = stored(payg({ admittedMonths: ['2000-01'] }));
+    // The snapshot the gate decides on is one write behind the row.
+    mockGetUserByIdConsistent.mockImplementationOnce(async () => ({ ...fake.row, paygOverage: { ...fake.row.paygOverage, admittedMonths: [] } }));
+    expect((await checkTokenUsage(OWNER)).allowed).toBe(true);
+    expect(fake.row.paygOverage.admittedMonths).toEqual(['2000-01']);
   });
 });
