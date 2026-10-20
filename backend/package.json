@@ -163,8 +163,8 @@
   },
   "overrides": {
     "twilio": {
-      "axios": "1.13.5",
-      "jsonwebtoken": "9.0.3"
+      "axios": "^1.13.5",
+      "jsonwebtoken": "^9.0.3"
     },
     "sanitize-html": {
       "htmlparser2": "10.1.0"
