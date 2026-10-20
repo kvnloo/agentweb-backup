@@ -76,6 +76,12 @@ export interface AgentRunTrace {
   ask?: { text: string; truncated: boolean };
   followUpAsks: string[];
   workPlan?: { title?: string; steps: AgentRunTraceStep[] };
+  /**
+   * 'run' when this run is the session's latest activity. 'session' when the session ran again
+   * afterwards: the session keeps only its current plan, so the step titles, notes and statuses
+   * may come from a later run. Call attribution is always this run's own.
+   */
+  workPlanScope?: 'run' | 'session';
   setupCallIds: string[];
   /** Calls after the last step update (or every call, when the session has no work plan). */
   unassignedCallIds: string[];
@@ -121,6 +127,8 @@ export function buildAgentRunTrace(input: {
     .sort((a, b) => (a.messageIndex ?? 0) - (b.messageIndex ?? 0))
     .map(normalizeMessage);
   const inRun = withinRunWindow(all, input.startedAt, input.completedAt);
+  const lastInRun = inRun[inRun.length - 1]?.index ?? -1;
+  const sessionRanLater = all.some((m) => m.index > lastInRun && m.role !== 'system');
 
   const userTexts = inRun.filter((m) => m.role === 'user').map((m) => textOf(m.content)).filter((t): t is string => !!t);
   const askText = userTexts[0];
@@ -140,7 +148,7 @@ export function buildAgentRunTrace(input: {
     found: Boolean(input.session || all.length),
     ...(askText ? { ask: capRedacted(askText, TRACE_LIMITS.askChars) } : {}),
     followUpAsks,
-    ...(steps ? { workPlan: { title: input.session?.workPlan?.title, steps: steps.steps } } : {}),
+    ...(steps ? { workPlan: { title: input.session?.workPlan?.title, steps: steps.steps }, workPlanScope: sessionRanLater ? 'session' : 'run' } : {}),
     setupCallIds: steps?.setupCallIds ?? [],
     unassignedCallIds: steps ? steps.unassignedCallIds : calls.map((c) => c.id),
     calls,
@@ -152,7 +160,8 @@ export function buildAgentRunTrace(input: {
 }
 
 function normalizeMessage(row: TraceMessageRow): NormalizedMessage {
-  const m = (row.message ?? {}) as Record<string, any>;
+  // Older rows store the message fields on the row itself, with no `message` wrapper.
+  const m = (row.message ?? row) as Record<string, any>;
   const metadata = (m.metadata ?? {}) as Record<string, any>;
   const toolCalls = Array.isArray(m.tool_calls)
     ? m.tool_calls
@@ -177,38 +186,63 @@ function normalizeMessage(row: TraceMessageRow): NormalizedMessage {
 
 /**
  * The messages of one run. Assistant rows carry no timestamp, so each row takes the last
- * timestamp seen before it. Without a run window, or with no timestamps at all, every row is in.
+ * timestamp seen before it. The run starts at its first user message inside the (slack-widened)
+ * start, and ends at its completion plus slack or at the next user message after its completion,
+ * whichever comes first, so back-to-back runs a second apart never bleed into each other. Without
+ * a run window, or with no timestamps at all, every row is in.
  */
 function withinRunWindow(messages: NormalizedMessage[], startedAt?: string, completedAt?: string): NormalizedMessage[] {
   const start = startedAt ? Date.parse(startedAt) - WINDOW_SLACK_MS : NaN;
-  const end = completedAt ? Date.parse(completedAt) + WINDOW_SLACK_MS : NaN;
+  const completed = completedAt ? Date.parse(completedAt) : NaN;
+  const end = Number.isFinite(completed) ? completed + WINDOW_SLACK_MS : NaN;
   if (!Number.isFinite(start) || !messages.some((m) => m.ts)) return messages;
+  const inWindow: NormalizedMessage[] = [];
   let carried: number | undefined;
-  return messages.filter((m) => {
+  for (const m of messages) {
     const own = m.ts ? Date.parse(m.ts) : NaN;
     if (Number.isFinite(own)) carried = own;
-    if (carried === undefined || m.role === 'system') return false;
-    return carried >= start && (!Number.isFinite(end) || carried <= end);
-  });
+    if (carried === undefined || m.role === 'system' || carried < start) continue;
+    if (Number.isFinite(end) && carried > end) break;
+    if (m.role === 'user' && Number.isFinite(completed) && carried > completed) break;
+    inWindow.push(m);
+  }
+  const firstAsk = inWindow.findIndex((m) => m.role === 'user');
+  return firstAsk > 0 ? inWindow.slice(firstAsk) : inWindow;
 }
 
 function buildCalls(messages: NormalizedMessage[]): { calls: AgentRunTraceCall[]; rawArgs: Map<string, string>; truncated: boolean; degraded: boolean } {
-  const results = new Map<string, { content: string; ts?: string }>();
-  const meta = new Map<string, { duration?: number; error?: unknown }>();
+  // Providers can reuse a tool-call id within a run, so results and timings are paired with calls
+  // in message order (first unanswered call with that id), and repeated ids get a #n suffix.
+  const issued: Array<{ id: string; name: string; arguments: string; result?: { content: string; ts?: string }; meta?: { duration?: number; error?: unknown } }> = [];
+  const pendingResult = new Map<string, number[]>();
+  const pendingMeta = new Map<string, number[]>();
+  const seen = new Map<string, number>();
   for (const m of messages) {
-    if (m.role === 'tool' && m.toolCallId) results.set(m.toolCallId, { content: textOf(m.content, false) ?? '', ts: m.ts });
-    for (const tc of m.metaToolCalls) if (tc?.id) meta.set(String(tc.id), tc);
+    for (const tc of m.toolCalls) {
+      const n = seen.get(tc.id) ?? 0;
+      seen.set(tc.id, n + 1);
+      const position = issued.push({ ...tc, id: n ? `${tc.id}#${n + 1}` : tc.id }) - 1;
+      pendingResult.set(tc.id, [...(pendingResult.get(tc.id) ?? []), position]);
+      pendingMeta.set(tc.id, [...(pendingMeta.get(tc.id) ?? []), position]);
+    }
+    if (m.role === 'tool' && m.toolCallId) {
+      const position = pendingResult.get(m.toolCallId)?.shift();
+      if (position !== undefined) issued[position].result = { content: textOf(m.content, false) ?? '', ts: m.ts };
+    }
+    for (const meta of m.metaToolCalls) {
+      const position = meta?.id ? pendingMeta.get(String(meta.id))?.shift() : undefined;
+      if (position !== undefined) issued[position].meta = meta;
+    }
   }
 
-  const issued = messages.flatMap((m) => m.toolCalls);
   const truncated = issued.length > TRACE_LIMITS.maxCalls;
-  const totalResultChars = issued.slice(0, TRACE_LIMITS.maxCalls).reduce((n, tc) => n + (results.get(tc.id)?.content.length ?? 0), 0);
+  const totalResultChars = issued.slice(0, TRACE_LIMITS.maxCalls).reduce((n, tc) => n + (tc.result?.content.length ?? 0), 0);
   const degraded = totalResultChars > TRACE_LIMITS.resultBudgetChars;
   const resultCap = degraded ? TRACE_LIMITS.degradedResultChars : TRACE_LIMITS.resultChars;
 
   const calls: AgentRunTraceCall[] = issued.slice(0, TRACE_LIMITS.maxCalls).map((tc, index) => {
-    const result = results.get(tc.id);
-    const m = meta.get(tc.id);
+    const result = tc.result;
+    const m = tc.meta;
     const metaError = errorText(m?.error);
     const resultIsError = !!result && TOOL_ERROR_PREFIX.test(result.content);
     const status: TraceCallStatus = metaError || resultIsError ? 'failed' : result ? 'succeeded' : 'no_result';
@@ -241,10 +275,10 @@ function buildCalls(messages: NormalizedMessage[]): { calls: AgentRunTraceCall[]
 }
 
 /**
- * Attributes calls to steps. A set_work_plan_status call that marks steps completed / skipped /
- * failed closes a segment: the calls since the previous update belong to the lowest step it
- * closes. Plan-management calls before any real work are setup; calls after the last update stay
- * unassigned.
+ * Attributes calls to steps. A successful set_work_plan_status call that marks steps completed /
+ * skipped / failed closes a segment: the calls since the previous update, and the update itself,
+ * belong to the lowest step it closes. Plan-management calls before any real work are setup;
+ * calls after the last update stay unassigned.
  */
 function buildSteps(
   rawSteps: NonNullable<NonNullable<TraceSessionRow['workPlan']>['steps']>,
@@ -269,11 +303,17 @@ function buildSteps(
   for (const call of calls) {
     if (call.name === STEP_STATUS_TOOL) {
       const closed = closedStepCounts(rawArgs.get(call.id) ?? '').filter((n) => byCount.has(n)).sort((a, b) => a - b);
-      if (!closed.length) continue;
+      // An update that closes nothing (in progress, an unknown step, a failed call) is part of the
+      // current segment like any other call, so every call in the trace shows in exactly one group.
+      if (!closed.length || call.status === 'failed') {
+        workStarted = true;
+        segment.push(call.id);
+        continue;
+      }
       const owner = byCount.get(closed[0])!;
-      owner.callIds.push(...segment);
-      owner.statusCallId = call.id;
       owner.closedWithoutCalls = segment.length === 0;
+      owner.callIds.push(...segment, call.id);
+      owner.statusCallId = call.id;
       for (const n of closed.slice(1)) {
         const other = byCount.get(n)!;
         other.statusCallId = call.id;

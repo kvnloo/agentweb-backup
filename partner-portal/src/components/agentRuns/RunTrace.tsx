@@ -477,6 +477,12 @@ export function WorkPlanTrace({
         {trace.workPlan?.title && (
           <Typography variant="body2" fontWeight={600} sx={{ mb: 1.5 }}>{trace.workPlan.title}</Typography>
         )}
+        {trace.workPlanScope === 'session' && steps.length > 0 && (
+          <Alert severity="info" sx={{ mb: 1.5 }}>
+            This session ran again after this run. The step titles, notes and checkmarks show the plan as it is now, which may be from a
+            later run; the calls listed under each step are this run's own.
+          </Alert>
+        )}
         {(trace.callsTruncated || trace.messagesTruncated) && (
           <Alert severity="info" sx={{ mb: 1.5 }}>
             This trace is partial: very long sessions are cut at 1,000 messages and 200 tool calls.

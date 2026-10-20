@@ -105,6 +105,8 @@ export interface AgentRunTrace {
   ask?: { text: string; truncated: boolean };
   followUpAsks: string[];
   workPlan?: { title?: string; steps: TraceStep[] };
+  /** 'session': the session ran again after this run, so step titles/notes/status may be from a later run. */
+  workPlanScope?: 'run' | 'session';
   setupCallIds: string[];
   unassignedCallIds: string[];
   calls: TraceCall[];
