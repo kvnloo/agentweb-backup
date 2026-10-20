@@ -41,6 +41,12 @@ jest.mock("../services/paymentHistoryDb", () => ({
   // already assert.
   paymentHistoryDb: { getByUserId: jest.fn(async () => []) },
 }));
+// ENG-669: the tier model allowlist. Pass-through (switch off) unless a case narrows an owner's plan.
+const mockFilterAllowed = jest.fn(async (_owner: string, ids: readonly string[]) => [...ids]);
+jest.mock("../services/agentMode/modelAccessInstance", () => ({
+  modelAccess: { filterAllowedModels: (...a: [string, readonly string[]]) => mockFilterAllowed(...a) },
+  systemModelCheck: jest.fn(() => async () => false),
+}));
 jest.mock("../services/db", () => ({
   userDb: { getUserById: jest.fn() },
   orgDb: { getOrgById: jest.fn(), getOrgMembers: jest.fn() },
@@ -1450,5 +1456,41 @@ describe("PAYG: the preview and /usage-runway forecast against the same pool (EN
     }));
     const preview = await previewUsageRunway("u1", [], { today: "2026-08-11" });
     expect(preview.baselineDaysRemaining).toBe(0);
+  });
+});
+
+/**
+ * ENG-669: a schedule runs under its OWNER's plan, and an org's report pools schedules whose owners can be on
+ * different tiers. A schedule row only carries a recommendation its owner's plan includes (applyModelChange would
+ * refuse any other); the caller's own catalog is unaffected.
+ */
+describe("per-schedule recommendations follow the schedule owner's plan (ENG-669)", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockBillingQuery.mockResolvedValue([]);
+    soloAccount();
+    mockPolicy.mockResolvedValue(policyFor());
+    mockModels.mockResolvedValue([OPUS, SONNET, HAIKU]);
+    mockModelsMeta.mockResolvedValue([]);
+    mockFilterAllowed.mockImplementation(async (_owner: string, ids: readonly string[]) => [...ids]);
+    mockQuery.mockResolvedValue(opusLedger().map((r) => ({ ...r, feature: "agent_task:scheduled:sched-a" })));
+    mockSchedules.mockResolvedValue([{ scheduleId: "sched-a", scheduleName: "Daily", frequency: "daily", llmModel: OPUS }]);
+  });
+
+  it("control: an owner whose plan includes the recommendation gets it on the schedule row", async () => {
+    const { scheduleDrivers } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    expect(scheduleDrivers[0].recommendedModel).not.toBeNull();
+  });
+
+  it("an owner whose plan excludes it gets no recommendation on that row; the caller's catalog is unchanged", async () => {
+    const control = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    const recommended = control.scheduleDrivers[0].recommendedModel as string;
+    mockFilterAllowed.mockImplementation(async (owner: string, ids: readonly string[]) =>
+      (owner === "u1" ? [...ids] : ids.filter((id) => id !== recommended)));
+
+    const { scheduleDrivers, recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    expect(recommendations.map((r) => r.toModel)).toContain(recommended);
+    expect(scheduleDrivers[0]).toMatchObject({ recommendedModel: null, estimatedDaysRecovered: null, confidence: null });
+    expect(mockFilterAllowed).toHaveBeenCalledWith(expect.not.stringMatching(/^u1$/), [recommended], expect.any(Function));
   });
 });

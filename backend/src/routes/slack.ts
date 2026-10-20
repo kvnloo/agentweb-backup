@@ -43,6 +43,7 @@ import { agentModeService } from '../services/agentModeService';
 import { handleSessionResponse } from "../services/conversation/sessionResponder";
 import { slackChannelAdapter, renderOutboundForSlack } from "../services/conversation/slackChannelAdapter";
 import type { ConversationRef } from "../services/conversation/channelPort";
+import { isModelUnavailableError } from "../services/agentMode/modelUnavailable";
 
 // ENG-351 citation rendering now lives with the Slack channel adapter (ENG-272 extraction);
 // aliased here for the other Slack reply paths in this file.
@@ -262,7 +263,7 @@ async function handleMappedSlackThreadResponse(params: {
 }): Promise<boolean> {
   const { channel, threadTs, slackUserId, text, files, sessionId, userId } = params;
   const { chatbotDb } = await import('../services/chatbotService');
-  const { generateSessionResponse } = await import('../controllers/agentModeController');
+  const { generateSessionResponse, modelUnavailableBody } = await import('../controllers/agentModeController');
   const { agentModeService } = await import('../services/agentModeService');
   const { cronJobRegistry } = await import('../utils/cronJobRegistry');
   const session = await chatbotDb.getChatSession(sessionId);
@@ -301,11 +302,13 @@ async function handleMappedSlackThreadResponse(params: {
     else await postThreadResponse(channel, threadTs, 'I completed the task but was unable to format a response. Please check the portal for results or try again.');
   } catch (genError) {
     console.error('❌ Error generating thread response:', genError);
-    await postThreadResponse(channel, threadTs, 'Sorry, I encountered an error. Please try again.');
+    // ENG-669: the session's model is outside the owner's plan: say so (nothing ran on another model).
+    const modelRefusal = isModelUnavailableError(genError) ? modelUnavailableBody(genError).error : undefined;
+    await postThreadResponse(channel, threadTs, modelRefusal ?? 'Sorry, I encountered an error. Please try again.');
     try {
       await chatbotDb.addMessageToSession(sessionId, {
         role: 'assistant',
-        content: 'Sorry, I encountered an error processing your request. Please try again.',
+        content: modelRefusal ?? 'Sorry, I encountered an error processing your request. Please try again.',
         timestamp: new Date().toISOString(),
         metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
       });

@@ -38,6 +38,7 @@ import {
   type ModelChangeScope,
 } from "./llmModelChangeAuditDb";
 import { recordUsageTelemetry, USAGE_TELEMETRY_EVENTS } from "./llmUsageTelemetry";
+import { modelAccess, systemModelCheck } from "./agentMode/modelAccessInstance";
 
 export class ModelChangeNotFoundError extends Error {
   constructor(message = "Not found") {
@@ -159,6 +160,8 @@ async function resolveSwitchableModels(userId: string): Promise<{
 function restoreModelArgs(
   scheduleId: string,
   modelBefore: string | null,
+  /** ENG-669: the origin the change replaced ('system' = an admin-template pin); restored with the model. */
+  modelSourceBefore: 'system' | undefined,
   /**
    * The model the schedule must STILL be on for this restore to be safe — the one
    * the change being reverted installed. Without it a restore reinstates a stale
@@ -174,6 +177,12 @@ function restoreModelArgs(
   string[] | undefined,
 ] {
   const expect = expectedCurrentModel ? { llmModel: expectedCurrentModel } : undefined;
+  if (modelSourceBefore === 'system') {
+    // The apply recorded the switch as the owner's ('user'); put the admin-template origin back with the model.
+    return modelBefore === null
+      ? [scheduleId, {}, expect, undefined, ['llmModel', 'llmModelSource']]
+      : [scheduleId, { llmModel: modelBefore, llmModelSource: 'system' }, expect, undefined, undefined];
+  }
   return modelBefore === null
     ? [scheduleId, {}, expect, undefined, ['llmModel']]
     : [scheduleId, { llmModel: modelBefore }, expect, undefined, undefined];
@@ -250,6 +259,15 @@ export async function applyModelChange(
   if (!catalog.has(input.toModel)) {
     throw new ModelNotAvailableError("That model is not available for this change");
   }
+  // ENG-669: the schedule runs under its OWNER's plan, so a recommendation outside that plan
+  // would only make the next run fail. Throws the standard ModelUnavailableError (`not_in_plan`),
+  // which the route answers with the shared 422 body. Switch off => no read, unchanged.
+  await modelAccess.assertModelAllowed({
+    ownerUserId: schedule.userId,
+    requestedModel: input.toModel,
+    canonicalModel: input.toModel,
+    isSystemModel: systemModelCheck(null),
+  });
 
   // NULL means the schedule inherited the platform default rather than pinning a
   // model. That is the common case — 66 of 91 active production schedules carry
@@ -259,6 +277,8 @@ export async function applyModelChange(
   // happened to be, because the default can move afterwards and inheritance
   // follows it while a pinned copy does not.
   const modelBefore: string | null = schedule.llmModel || null;
+  // ENG-669: an admin-template pin's origin; the switch below records the owner's choice, so an undo must restore it.
+  const modelSourceBefore: 'system' | undefined = schedule.llmModelSource === 'system' ? 'system' : undefined;
   if (modelBefore === input.toModel) {
     // Already there. Reporting success without writing keeps a double-click from
     // manufacturing history that says the model changed when it did not.
@@ -285,7 +305,8 @@ export async function applyModelChange(
   try {
     await scheduleDb.updateSchedule(
       input.scopeId,
-      { llmModel: input.toModel },
+      // ENG-669: the confirmed switch is the owner's choice, so an inherited admin-template origin no longer applies.
+      { llmModel: input.toModel, ...(schedule.llmModelSource === 'system' && { llmModelSource: 'user' as const }) },
       // ENG-1363: `EXPECT_UNSET`, not `undefined`. Inheriting is stored two ways —
       // the attribute absent, or holding `""` — and `undefined` asserts only the
       // first. The 48 active schedules spelling it the second way failed this
@@ -322,6 +343,7 @@ export async function applyModelChange(
       scopeId: input.scopeId,
       scopeLabel: schedule.scheduleName ?? null,
       modelBefore,
+      ...(modelSourceBefore && { modelSourceBefore }),
       modelAfter: input.toModel,
       estimatedDaysRecoveredAtDecision: input.estimatedDaysRecovered ?? null,
       confidenceAtDecision: input.confidence ?? null,
@@ -332,7 +354,7 @@ export async function applyModelChange(
     // Compensate. An unaudited change cannot be explained or undone through the
     // UI, so the customer is better served by the switch simply not happening.
     await scheduleDb
-      .updateSchedule(...restoreModelArgs(input.scopeId, modelBefore, input.toModel))
+      .updateSchedule(...restoreModelArgs(input.scopeId, modelBefore, modelSourceBefore, input.toModel))
       .catch((revertError: unknown) => {
         // A failed CONDITION is not a failed revert: it means our unaudited write
         // was already replaced by someone else's deliberate one, which is the
@@ -426,7 +448,7 @@ export async function undoModelChange(
   // that and finishes the stamp.
   try {
     await scheduleDb.updateSchedule(
-      ...restoreModelArgs(change.scopeId, change.modelBefore, change.modelAfter),
+      ...restoreModelArgs(change.scopeId, change.modelBefore, change.modelSourceBefore, change.modelAfter),
     );
   } catch (error) {
     if (!isConditionalCheckFailure(error)) throw error;

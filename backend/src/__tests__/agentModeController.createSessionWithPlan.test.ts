@@ -888,7 +888,7 @@ describe('AgentModeController - createSessionWithPlan', () => {
 
       expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
         'test-session-123',
-        'gemini-3-pro-preview'
+        'gemini-3-pro-preview', undefined, 'system',
       );
       expect(mockAgentModeService.getDefaultModel).not.toHaveBeenCalled();
     });
@@ -1069,20 +1069,20 @@ describe('AgentModeController - createSessionWithPlan', () => {
       const ok = mockResponse();
       await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), ok);
       expect(ok.status).not.toHaveBeenCalledWith(422);
-      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('test-session-123', 'admin-only-model');
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('test-session-123', 'admin-only-model', undefined, 'system');
     });
 
     it('honours a legacy alias by storing the canonical id', async () => {
       planWithModel('legacy-alias');
       await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), mockResponse());
-      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('test-session-123', 'gemini-3-pro-preview');
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('test-session-123', 'gemini-3-pro-preview', undefined, 'system');
       expect(mockAgentModeService.getDefaultModel).not.toHaveBeenCalled();
     });
 
     it('whitespace-only plan model is no pin (account default)', async () => {
       planWithModel('   ');
       await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), mockResponse());
-      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('test-session-123', 'gpt-5-chat');
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('test-session-123', 'gpt-5-chat', undefined, 'system');
     });
 
     it('should use global default when work plan has no default model', async () => {
@@ -1112,7 +1112,7 @@ describe('AgentModeController - createSessionWithPlan', () => {
       expect(mockAgentModeService.getDefaultModel).toHaveBeenCalled();
       expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
         'test-session-123',
-        'gpt-5-chat'
+        'gpt-5-chat', undefined, 'system',
       );
     });
 
@@ -1144,7 +1144,7 @@ describe('AgentModeController - createSessionWithPlan', () => {
       expect(mockAgentModeService.getDefaultModel).toHaveBeenCalled();
       expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
         'test-session-123',
-        'gpt-5-chat'
+        'gpt-5-chat', undefined, 'system',
       );
     });
   });

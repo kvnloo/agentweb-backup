@@ -58,6 +58,16 @@ jest.mock('../services/agentModeService', () => ({
     // Same alias map as the real service (single source: llmModelRegistry).
     normalizeModelId: jest.fn((model: string) =>
       require('../services/agentMode/llmModelRegistry').LEGACY_MODEL_ALIASES[model] ?? model),
+    // ENG-669: like the real one over this double's catalog (alias first, then the registry check).
+    resolveGenerationModel: jest.fn((model: string) => {
+      const normalized = require('../services/agentMode/llmModelRegistry').LEGACY_MODEL_ALIASES[model] ?? model;
+      const served = ['gemini-3.1-flash-lite', 'gpt-5.5', 'anthropic.claude-opus-5', 'openrouter/qwen/qwen3.8-max-0902'];
+      return served.includes(normalized)
+        ? { model: normalized, fellBack: false, requestedModel: model }
+        : { model: 'gpt-5.5', fellBack: true, requestedModel: model };
+    }),
+    // In this double, opus-5 is admin-only (a customer can never select it).
+    isModelSelectableBy: jest.fn((model: string, isAdmin: boolean) => isAdmin || model !== 'anthropic.claude-opus-5'),
   },
 }));
 
@@ -549,6 +559,84 @@ describe('Admin subscription types routes', () => {
     it('leaves paygOverage absent when the admin omits it', async () => {
       await save({ llmUsageTopUp }).expect(200);
       expect(saved()).not.toHaveProperty('paygOverage');
+    });
+  });
+
+  // ENG-669: allowedModels is rebuilt from the same explicit whitelist, so a missing passthrough would DROP it on
+  // the first admin edit of any tier. It must round-trip as stored ("*" not expanded, absent stays absent).
+  describe('allowedModels (ENG-669 tier model allowlist)', () => {
+    const tier = (extra: Record<string, unknown> = {}) => ({ name: 'Free', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], ...extra });
+    const post = (types: unknown[]) => request(app).post('/api/admin/subscription-types').send({ subscriptionTypes: types });
+    const saved = () => JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
+
+    it('GET returns it as stored ("*" and the reserved router id untouched); absent stays absent', async () => {
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'subscription_types',
+        settingValue: JSON.stringify([
+          tier({ allowedModels: ['gpt-5.5', 'agentweb-model'] }),
+          tier({ name: 'Pro', allowedModels: ['*'] }),
+          tier({ name: 'Legacy' }),
+        ]),
+      } as any);
+      const res = await request(app).get('/api/admin/subscription-types').expect(200);
+      expect(res.body[0].allowedModels).toEqual(['gpt-5.5', 'agentweb-model']);
+      expect(res.body[1].allowedModels).toEqual(['*']);
+      expect(res.body[2]).not.toHaveProperty('allowedModels');
+    });
+
+    it('POST canonicalises legacy aliases, de-duplicates, keeps "agentweb-model", and omits an absent field', async () => {
+      await post([
+        tier({ allowedModels: [' gpt-5-chat-2 ', 'gpt-5.5', 'openrouter/qwen/qwen3.8-max', 'agentweb-model', ''] }),
+        tier({ name: 'Legacy' }),
+      ]).expect(200);
+      expect(saved()[0].allowedModels).toEqual(['gpt-5.5', 'openrouter/qwen/qwen3.8-max-0902', 'agentweb-model']);
+      expect(saved()[1]).not.toHaveProperty('allowedModels');
+    });
+
+    it('POST collapses a list containing "*" to ["*"]', async () => {
+      await post([tier({ allowedModels: ['gpt-5.5', '*'] })]).expect(200);
+      expect(saved()[0].allowedModels).toEqual(['*']);
+    });
+
+    it('POST rejects an unknown id or a non-list with 400 and saves nothing', async () => {
+      const unknown = await post([tier({ allowedModels: ['gpt-5.5', 'not-a-model'] })]).expect(400);
+      expect(unknown.body.message).toContain("unknown model id 'not-a-model'");
+      await post([tier({ allowedModels: 'gpt-5.5' })]).expect(400);
+      await post([tier({ allowedModels: ['gpt-5.5', 7] })]).expect(400);
+      expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
+    });
+
+    it('POST rejects an empty list (a tier that can choose no model) with 400: use "*" or name the models', async () => {
+      for (const allowedModels of [[], ['  ', '']]) {
+        const res = await post([tier({ allowedModels })]).expect(400);
+        expect(res.body.message).toContain('must name at least one model');
+      }
+      expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
+    });
+
+    it('POST rejects an id customers can never select (admin-only / internal / live-voice) with 400', async () => {
+      const res = await post([tier({ allowedModels: ['gpt-5.5', 'anthropic.claude-opus-5'] })]).expect(400);
+      expect(res.body.message).toContain("'anthropic.claude-opus-5' cannot be selected by customers");
+      expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
+    });
+
+    it('allowedModels and the ENG-668 paygOverage both survive the same GET -> POST round trip', async () => {
+      const stored = [tier({ allowedModels: ['gpt-5.5'], paygOverage: { allowed: true, markupBps: 30_000 } }), tier({ name: 'Pro', paygOverage: { allowed: false } })];
+      mockedSettingsService.getSetting.mockResolvedValue({ settingName: 'subscription_types', settingValue: JSON.stringify(stored) } as any);
+      const got = await request(app).get('/api/admin/subscription-types').expect(200);
+      expect(got.body[0]).toMatchObject({ allowedModels: ['gpt-5.5'], paygOverage: { allowed: true, markupBps: 30_000 } });
+      await post(got.body).expect(200);
+      expect(saved()[0]).toMatchObject({ allowedModels: ['gpt-5.5'], paygOverage: { allowed: true, markupBps: 30_000 } });
+      expect(saved()[1]).toMatchObject({ paygOverage: { allowed: false } });
+      expect(saved()[1]).not.toHaveProperty('allowedModels');
+    });
+
+    it('a GET -> POST round trip (what the admin UI does on any edit) preserves every tier\'s list', async () => {
+      const stored = [tier({ allowedModels: ['gpt-5.5'] }), tier({ name: 'Pro', allowedModels: ['*'] }), tier({ name: 'Legacy' })];
+      mockedSettingsService.getSetting.mockResolvedValue({ settingName: 'subscription_types', settingValue: JSON.stringify(stored) } as any);
+      const got = await request(app).get('/api/admin/subscription-types').expect(200);
+      await post(got.body).expect(200);
+      expect(saved().map((t: any) => t.allowedModels)).toEqual([['gpt-5.5'], ['*'], undefined]);
     });
   });
 
