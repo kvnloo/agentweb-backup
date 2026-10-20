@@ -48,9 +48,6 @@ interface GateInput { config: HotLeadCallConfig; lead: LeadRow; job: HotLeadCall
 
 // Gates that record `call.skipped` when they refuse, cheapest first. Each returns a skip reason or null.
 const SKIP_GATES: Array<(g: GateInput) => string | null> = [
-  // Enabled configs are validated to have one, but the call must never reach create without it: a skip
-  // keeps the lead's single call slot unused.
-  ({ config }) => (config.twilioNumber ? null : 'no_caller_number'),
   // The webhooks reject ids outside their strict shape; Twilio would ring the member and every callback would fail.
   ({ job }) => (isWebhookSafeId(job.listId) && isWebhookSafeId(job.leadId) ? null : 'unsafe_id'),
   ({ lead, config }) => {
@@ -91,7 +88,7 @@ async function hasCallRecord(store: LeadCallStore, listId: string, leadId: strin
  * dispatch and again in the job (state can change in between). Returns null for "do nothing";
  * refusals worth showing on the timeline also record `call.skipped`.
  */
-async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: HotLeadCallJob; ctx: HotLeadCallContext; phone: string; lead: LeadRow } | null> {
+async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: HotLeadCallJob; ctx: HotLeadCallContext; phone: string; callerNumber: string; lead: LeadRow } | null> {
   const { listId, leadId, origin } = input;
   if (origin !== 'form_fill') return null;
   const ctx = await resolveHotLeadCallContext(listId);
@@ -107,6 +104,14 @@ async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: H
   if (lead.customFields?.stage === 'email') return null;
   if (!isNonEmpty(lead.phone)) return null;
 
+  // Enabled configs are validated to have one, but the call must never reach create without it: a skip
+  // keeps the lead's single call slot unused.
+  const callerNumber = ctx.config.twilioNumber;
+  if (!callerNumber) {
+    await recordSkip(lead, 'no_caller_number');
+    return null;
+  }
+
   const job: HotLeadCallJob = { ...input, orgId: ctx.orgId };
   for (const gate of SKIP_GATES) {
     const reason = gate({ config: ctx.config, lead, job });
@@ -121,7 +126,7 @@ async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: H
     return null;
   }
   const callable = callableLeadPhone(lead.phone, ctx.config);
-  return 'phone' in callable ? { job, ctx, phone: callable.phone, lead } : null; // always set: the phone gate refused otherwise
+  return 'phone' in callable ? { job, ctx, phone: callable.phone, callerNumber, lead } : null; // always set: the phone gate refused otherwise
 }
 
 /**
@@ -197,7 +202,7 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
   try {
     ({ callSid: memberCallSid } = await getVoiceProvider().placeCall({
       to: member.phone,
-      from: config.twilioNumber!, // non-null: the no_caller_number gate refused otherwise
+      from: reviewed.callerNumber,
       url,
       statusCallbackUrl,
       timeoutSeconds: MEMBER_RING_TIMEOUT_SECONDS,
