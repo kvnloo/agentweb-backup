@@ -5,6 +5,7 @@ import { skillService } from "./skillService";
 import { hasOwnLiveSubscription } from "./orgAuthz";
 import type { LlmUsagePolicy } from "./llmUsagePolicyService";
 import type { LlmUsageTopUpConfig } from './llmUsageTopUpService';
+import type { SubscriptionPaygOverageConfig } from './paygOverage';
 import type { SeatPricingConfig } from './orgSeatService';
 
 export interface SubscriptionType {
@@ -35,6 +36,8 @@ export interface SubscriptionType {
    * used for enforcement today; this field is not yet wired to replace it.
    */
   seatPricing?: SeatPricingConfig;
+  /** ENG-668: whether this tier's billing owners may opt into pay-as-you-go overages. Absent = not offered. */
+  paygOverage?: SubscriptionPaygOverageConfig;
 }
 
 // Default pages that are always available regardless of subscription type

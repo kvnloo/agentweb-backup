@@ -190,7 +190,7 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
         // ENG-1344 AC6: one producer for the refusal, shared with the portal
         // modal, the MCP 429 and the socket error. Composed once so the flat
         // string and the structured copy cannot disagree.
-        const blockCopy = buildUsageBlockCopy({ month: usageStatus.month });
+        const blockCopy = buildUsageBlockCopy({ month: usageStatus.month, paygBlock: usageStatus.paygBlock });
         return res.status(429).json({
           error: blockCopy.message,
           usageBlock: blockCopy,
@@ -273,7 +273,7 @@ export const sendMessageStream = async (req: AuthenticatedRequest, res: Response
   // Check token usage limits
   const usageStatus = await checkTokenUsage(userId);
   if (!usageStatus.allowed) {
-    const blockCopy = buildUsageBlockCopy({ month: usageStatus.month });
+    const blockCopy = buildUsageBlockCopy({ month: usageStatus.month, paygBlock: usageStatus.paygBlock });
     res.status(429).json({
       error: blockCopy.message,
       usageBlock: blockCopy,

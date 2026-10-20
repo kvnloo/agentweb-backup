@@ -17,6 +17,7 @@ import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
 import type { OrgRole } from "./orgAuthz";
 import type { MonthlyLlmUsageCredits } from "./llmUsageCreditService";
+import type { PaygOverageSettings } from "./paygOverage";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { isEvaluationUser } from "./evaluationPolicy";
@@ -639,6 +640,8 @@ export interface User {
   tokenAllowanceBonus?: number; // One-time bonus tokens granted by admin (resets on monthly reset)
   /** Monthly purchase/migration credits. Raw provider spend remains in tokenUsage. */
   llmUsageCredits?: MonthlyLlmUsageCredits;
+  /** ENG-668: pay-as-you-go overage opt-in. Billing owners only; absent = never opted in. */
+  paygOverage?: PaygOverageSettings;
   stripe_subscription_id?: string; // Stripe subscription ID
   subscription_status?: string; // Stripe subscription status: active, trialing, past_due, canceled, canceling
   current_period_end?: string; // ISO date of current billing period end
