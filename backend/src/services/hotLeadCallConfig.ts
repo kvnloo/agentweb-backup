@@ -18,6 +18,8 @@ export const END_OF_DAY = '24:00';
 
 export const HOT_LEAD_CALL_LIMITS = {
   maxAgeMinutes: { default: 10, min: 1, max: 60 },
+  // The two caps below count LEADS that get a call, not member calls: a lead can ring up to maxAttemptsPerLead
+  // members and then the lead's own leg, and still uses one slot.
   maxCallsPerHour: { default: 6, min: 1, max: 30 },
   maxCallsPerDay: { default: 20, min: 1, max: 100 },
   memberCooldownMinutes: { default: 2, min: 1, max: 60 },
@@ -36,8 +38,6 @@ export const maskPhone = (phone: string) => `***${phone.slice(-4)}`;
 
 /** System-managed: set only by the number-provisioning / verification flow, never by Emma tools. */
 export const HOT_LEAD_CALL_SYSTEM_FIELDS = ['twilioNumber', 'twilioNumberSid'] as const;
-/** System-managed member fields, with the same rule: only the verification flow writes them. */
-export const HOT_LEAD_CALL_MEMBER_SYSTEM_FIELDS = ['verifiedAt'] as const;
 
 interface HotLeadCallCallingHours {
   /**
@@ -108,6 +108,7 @@ const MEMBER_NAME = /^[\p{L}\p{N} .,'&-]+$/u;
 // so the TwiML builder MUST XML-escape announcedName before interpolating it.
 const ANNOUNCED_NAME = /^[\p{L}\p{N} .,&'-]+$/u;
 export const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
+export const isHhmm = (v: unknown): v is string => typeof v === 'string' && HHMM.test(v);
 const TWILIO_SID = /^PN[0-9a-f]{32}$/;
 
 // Area/Location only: UTC, abbreviations (EST), offsets and Etc/ zones are not a place whose local clock gates
@@ -177,7 +178,7 @@ export function callingHoursOf(raw: unknown): HotLeadCallCallingHours | null {
   if (!isRecord(raw) || Object.keys(raw).some(k => !CALLING_HOURS_KEYS.has(k))) return null;
   const start = raw.start === undefined ? HOT_LEAD_CALL_DEFAULT_CALLING_HOURS.start : raw.start;
   const end = raw.end === undefined ? HOT_LEAD_CALL_DEFAULT_CALLING_HOURS.end : raw.end;
-  if (typeof start !== 'string' || typeof end !== 'string' || !HHMM.test(start) || !HHMM.test(end) || start === end) return null;
+  if (!isHhmm(start) || !isHhmm(end) || start === end) return null;
   const timezone = normalizeTimezone(raw.timezone);
   return timezone ? { start, end, timezone } : null;
 }
@@ -187,7 +188,7 @@ export function windowOf(raw: unknown): HotLeadCallWindow | null {
   const { days, start, end } = raw;
   if (!Array.isArray(days) || days.length < 1 || days.length > 7 || new Set(days).size !== days.length) return null;
   if (!days.every(d => typeof d === 'number' && Number.isInteger(d) && d >= 0 && d <= 6)) return null;
-  if (typeof start !== 'string' || typeof end !== 'string' || !HHMM.test(start) || !(HHMM.test(end) || end === END_OF_DAY)) return null;
+  if (!isHhmm(start) || !(isHhmm(end) || end === END_OF_DAY)) return null;
   if (hhmmToMinutes(start) >= hhmmToMinutes(end)) return null;
   return { days: [...days], start, end };
 }

@@ -105,7 +105,7 @@ export function bridgeTwiml(): string {
   return '<?xml version="1.0" encoding="UTF-8"?><Response/>';
 }
 
-/** Destination-verification call: the fixed phrase and the six digits, spaced so text-to-speech reads them one by one. */
+/** Team-member verification call: the fixed phrase and the six digits, spaced so text-to-speech reads them one by one. */
 export function verificationCodeTwiml(code: string): string {
   if (!/^\d{6}$/.test(code)) throw new Error('verification code must be 6 digits');
   const spoken = code.split('').join(' ');

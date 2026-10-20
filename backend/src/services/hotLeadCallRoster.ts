@@ -28,12 +28,13 @@ export function memberAvailableAt(member: HotLeadCallMember, timezone: string, a
  * the portal preview so the two can never disagree.
  */
 export function previewHotLeadCallCandidates(config: HotLeadCallConfig, at: Date, exclude: readonly string[] = []): RosterEntry[] {
-  const open = isWithinCallWindow(config.callingHours, at);
+  // Undefined when the calling hours are closed, or not set at all.
+  const hours = isWithinCallWindow(config.callingHours, at) ? config.callingHours : undefined;
   return config.team.map((member): RosterEntry => {
     if (!member.verifiedAt) return { member, reason: 'unverified' };
     if (exclude.includes(member.id)) return { member, reason: 'excluded' };
-    if (!open || !config.callingHours) return { member, reason: 'outside_calling_hours' };
-    if (!memberAvailableAt(member, config.callingHours.timezone, at)) return { member, reason: 'outside_window' };
+    if (!hours) return { member, reason: 'outside_calling_hours' };
+    if (!memberAvailableAt(member, hours.timezone, at)) return { member, reason: 'outside_window' };
     return { member };
   });
 }

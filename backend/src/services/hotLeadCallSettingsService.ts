@@ -7,7 +7,7 @@ import { isLeadTypes } from './leadNotificationConfig';
 import { isRecord } from './leadNotificationAttribution';
 import {
   allowlistedE164, announcedNameOf, generateMemberId, hhmmToMinutes, hotLeadCallConfigOf, maskPhone, memberNameOf, normalizeTimezone,
-  windowOf, HHMM, HOT_LEAD_CALL_COUNTRIES, HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS, HOT_LEAD_CALL_MAX_TEAM_SIZE,
+  windowOf, isHhmm, HOT_LEAD_CALL_COUNTRIES, HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS, HOT_LEAD_CALL_MAX_TEAM_SIZE,
   HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER, HOT_LEAD_CALL_MEMBER_NAME_MAX, HOT_LEAD_CALL_ANNOUNCED_NAME_MAX, HOT_LEAD_CALL_SYSTEM_FIELDS, END_OF_DAY,
   type HotLeadCallConfig, type HotLeadCallMember,
 } from './hotLeadCallConfig';
@@ -225,8 +225,8 @@ function windowProblem(raw: unknown): { field: '' | 'days' | 'start' | 'end'; me
   if (!Array.isArray(days) || days.length < 1 || days.length > 7 || new Set(days).size !== days.length || !days.every(d => Number.isInteger(d) && d >= 0 && d <= 6)) {
     return { field: 'days', message: 'Pick between 1 and 7 different days (0 = Sunday to 6 = Saturday)' };
   }
-  if (typeof start !== 'string' || !HHMM.test(start)) return { field: 'start', message: 'Start must be a time such as 09:00' };
-  if (typeof end !== 'string' || !(HHMM.test(end) || end === END_OF_DAY)) return { field: 'end', message: 'End must be a time such as 17:00, or 24:00 for the end of the day' };
+  if (!isHhmm(start)) return { field: 'start', message: 'Start must be a time such as 09:00' };
+  if (!(isHhmm(end) || end === END_OF_DAY)) return { field: 'end', message: 'End must be a time such as 17:00, or 24:00 for the end of the day' };
   if (hhmmToMinutes(start) >= hhmmToMinutes(end)) return { field: 'end', message: 'End must be after start; an overnight shift is two windows' };
   return windowOf(raw) ? null : { field: '', message: 'Invalid availability window' };
 }
@@ -304,8 +304,8 @@ function buildTeam(rawTeam: unknown, current: HotLeadCallConfig | undefined, err
 function callingHoursProblems(raw: unknown, errors: Errors): void {
   if (!isRecord(raw)) { errors.callingHours = 'callingHours must have start, end and timezone'; return; }
   for (const key of Object.keys(raw)) if (key !== 'start' && key !== 'end' && key !== 'timezone') errors[`callingHours.${key}`] = 'Unknown field';
-  if (typeof raw.start !== 'string' || !HHMM.test(raw.start)) errors['callingHours.start'] = 'Start must be a time such as 09:00';
-  if (typeof raw.end !== 'string' || !HHMM.test(raw.end)) errors['callingHours.end'] = 'End must be a time such as 18:00';
+  if (!isHhmm(raw.start)) errors['callingHours.start'] = 'Start must be a time such as 09:00';
+  if (!isHhmm(raw.end)) errors['callingHours.end'] = 'End must be a time such as 18:00';
   else if (raw.end === raw.start) errors['callingHours.end'] = 'End must differ from start';
   if (!normalizeTimezone(raw.timezone)) {
     errors['callingHours.timezone'] = 'Use a place name such as America/Chicago; UTC, abbreviations and Etc/ zones are not accepted';

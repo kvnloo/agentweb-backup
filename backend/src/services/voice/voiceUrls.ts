@@ -9,6 +9,8 @@ export function isWebhookSafeId(id: string): boolean {
   return WEBHOOK_SAFE_ID.test(id);
 }
 
+// The kinds are the URL paths. They keep the names Twilio was first given (a callback already in flight at a
+// deploy must still resolve), so '/owner' is the prompt served to the team member being rung, not to an owner.
 type VoiceWebhookKind = 'owner' | 'gather' | 'dial' | 'status' | 'screen' | 'screen-result';
 
 interface VoiceWebhookContext {

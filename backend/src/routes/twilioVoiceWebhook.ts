@@ -33,8 +33,9 @@
  * acknowledged and writes nothing, because that attempt was metered before the next one could start.
  * A terminal record can no longer be written, so a leg is metered (meteredLegs) while the record is still
  * live, and the LAST leg to be metered performs the terminal transition. If a leg's final callback never
- * arrives the record stays non-terminal: records stuck in bridging/connected/between_attempts need an ops
- * cleanup (no cron is added here). Metering and finishing live in services/voice/callFinalisation.ts.
+ * arrives the record stays non-terminal: records stuck in bridging/connected need an ops cleanup (no cron is
+ * added here). A record left in between_attempts heals: Twilio redelivers that leg's final callback, which asks for
+ * the next attempt again. Metering and finishing live in services/voice/callFinalisation.ts.
  *
  * Decisions that do not change `state` (member declined, lead did not answer) are made once through marker
  * entries in `lastSequence`: see HotLeadCallRecord.lastSequence.
