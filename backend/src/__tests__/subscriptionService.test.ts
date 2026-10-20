@@ -18,6 +18,8 @@ import {
   resolveSkillsToToolNames,
   findTiersAllowingSkill,
   getAllowedFeatures,
+  getAllAvailableSubscriptionFeatures,
+  getDefaultSubscriptionFeatureIds,
   isSubscriptionFeatureEnabled,
   setEntitlementDeniedSink,
   resetEntitlementDeniedSink,
@@ -120,6 +122,34 @@ describe('subscriptionService', () => {
     expect(await getAllowedFeatures('u1')).toEqual(['scheduled_chats']);
   });
 
+  describe('hot_lead_call is opt-in only', () => {
+    const tiers = (rows: unknown[]) =>
+      mockedSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(rows) } as never);
+
+    it('a legacy tier with no feature list does not get hot_lead_call, from either lookup', async () => {
+      mockedUserDb.getUserById.mockResolvedValue({ userId: 'u1', subscriptionType: 'Legacy' } as never);
+      tiers([{ name: 'Legacy', allowedPages: ['/'], allowedSkills: [] }]);
+      expect(await isSubscriptionFeatureEnabled('u1', 'hot_lead_call')).toBe(false);
+      expect(await getAllowedFeatures('u1')).not.toContain('hot_lead_call');
+      expect(await getAllowedFeatures('u1')).toContain('model_compare');
+    });
+
+    it('an explicit tick or a saved "*" still grants it', async () => {
+      mockedUserDb.getUserById.mockResolvedValue({ userId: 'u1', subscriptionType: 'Pro' } as never);
+      tiers([{ name: 'Pro', allowedPages: ['/'], allowedSkills: [], allowedFeatures: ['hot_lead_call'] }]);
+      expect(await isSubscriptionFeatureEnabled('u1', 'hot_lead_call')).toBe(true);
+      tiers([{ name: 'Pro', allowedPages: ['/'], allowedSkills: [], allowedFeatures: ['*'] }]);
+      expect(await isSubscriptionFeatureEnabled('u1', 'hot_lead_call')).toBe(true);
+      expect(await getAllowedFeatures('u1')).toContain('hot_lead_call');
+    });
+
+    it('the default feature set and the feature metadata agree', () => {
+      expect(getDefaultSubscriptionFeatureIds()).not.toContain('hot_lead_call');
+      expect(getAllAvailableSubscriptionFeatures().find((f) => f.id === 'hot_lead_call')?.optInOnly).toBe(true);
+      expect(getAllAvailableSubscriptionFeatures().find((f) => f.id === 'model_compare')?.optInOnly).toBe(false);
+    });
+  });
+
   describe('model_compare add-on feature', () => {
     const tiers = (rows: unknown[]) =>
       mockedSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(rows) } as any);
@@ -170,13 +200,13 @@ describe('subscriptionService', () => {
     expect(await getAllowedFeatures('u1')).toEqual([]);
   });
 
-  it('keeps legacy subscription rows permissive until an admin saves feature settings', async () => {
+  it('keeps legacy subscription rows permissive, except for paid-vendor features, until an admin saves feature settings', async () => {
     mockedUserDb.getUserById.mockResolvedValue({ userId: 'u1', subscriptionType: 'Legacy' } as any);
     mockedSettingsService.getSetting.mockResolvedValue({
       settingValue: JSON.stringify([{ name: 'Legacy', allowedPages: ['/'], allowedSkills: [] }]),
     } as any);
 
-    expect(await getAllowedFeatures('u1')).toEqual(['scheduled_chats', 'model_compare', 'hot_lead_call']);
+    expect(await getAllowedFeatures('u1')).toEqual(['scheduled_chats', 'model_compare']);
   });
 
   it('getUserSubscriptionType resolves an org member to the owner tier dynamically (ENG-288)', async () => {
