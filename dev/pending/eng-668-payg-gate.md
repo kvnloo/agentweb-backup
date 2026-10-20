@@ -23,8 +23,10 @@ missing keeps the 429. A non-opted account never reads the switch or writes anyt
 
 **How overage and the cap are measured.**
 - The month's pool = `max(today's effective threshold after credits, poolHighWater for this UTC month)`.
-  The high-water mark is written by the gate only when it rises (conditional write) and only for
-  opted-in accounts, so a downgrade AFTER opting in never creates retroactive overage. Past the pool the
+  The high-water mark is written by the gate only when it rises (conditional write), for any account with
+  a stored `paygOverage` record — ON or OFF — while the switch is on and the tier allows PAYG, so a
+  downgrade AFTER opting in never creates retroactive overage, including one made while PAYG was off and
+  followed by a same-month re-enable (which keeps the month's baseline). No record = no read, no write. Past the pool the
   gate re-reads the owner strongly consistent (`getUserByIdConsistent`; `getUserById` goes through the
   eventually consistent UserIdIndex) before deciding, and a lost high-water write uses the higher mark
   that beat it. Below the pool there is no extra read.
