@@ -1395,6 +1395,59 @@ router.patch("/connected-accounts/:platform/:accountId/share", async (req: Reque
   }
 });
 
+// Org owner/admin disconnects a member's connected account (ENG-2595)
+router.delete("/connected-accounts/:platform/:accountId/member", async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Not authenticated" });
+
+    const user = await userDb.getUserById(userId);
+    if (!user?.orgId) {
+      return res.status(403).json({ error: "You are not a member of any organization" });
+    }
+
+    const { platform, accountId } = req.params;
+    const matches = (a: any) => a.platform === platform && a.account_id === accountId;
+
+    if ((user.connected_accounts || []).some(matches)) {
+      return res.status(400).json({
+        error: "This is your own connected account; disconnect it with DELETE /api/oauth/connected-accounts/:platform/:accountId instead",
+      });
+    }
+
+    const org = await orgDb.getOrgById(user.orgId);
+    if (!org) {
+      return res.status(404).json({ error: "Organization not found" });
+    }
+
+    if (!canManageOrgAccounts(user, org)) {
+      return res.status(403).json({ error: "Only an org owner or admin can disconnect another member's connected accounts" });
+    }
+
+    const members = await orgDb.getOrgMembers(user.orgId);
+    const member = members.find(
+      (m: any) => m.userId !== userId && (m.connected_accounts || []).some(matches)
+    );
+    if (!member) {
+      return res.status(404).json({ error: "Connected account not found" });
+    }
+
+    const accounts = member.connected_accounts || [];
+    const idx = accounts.findIndex(matches);
+    const updated = [...accounts.slice(0, idx), ...accounts.slice(idx + 1)];
+    await userDb.updateUser(member.userId, { connected_accounts: updated } as any);
+
+    console.info(
+      `[org-account-delete] actor=${userId} member=${member.userId} platform=${platform} account=${accountId} org=${user.orgId}`
+    );
+
+    return res.json({ success: true, ownerUserId: member.userId, platform, accountId });
+  } catch (error) {
+    console.error("Error disconnecting member connected account:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // Copy owner's profile data to org (owner only)
 router.post("/:orgId/copy-profile", async (req: Request, res: Response) => {
   try {
