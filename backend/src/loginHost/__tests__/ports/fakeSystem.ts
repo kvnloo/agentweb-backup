@@ -45,6 +45,7 @@ export class FakeSystem implements CommandPort, RootFs {
   calls: Call[] = [];
   /** Root file operations in the order they happened. */
   ops: string[] = [];
+  pidKills: Array<{ pid: number; uid: number }> = [];
   nextPid = 1000;
   private clock = 0;
 
@@ -108,9 +109,10 @@ export class FakeSystem implements CommandPort, RootFs {
     for (const [pid, uid] of this.strays) out.push({ pid, uid });
     return out;
   }
-  killPid(pid: number): void {
-    this.strays.delete(pid);
-    for (const u of this.units.values()) if (u.pid === pid && !this.immortal.has(u.name)) this.endUnit(u, 255);
+  async killPid(pid: number, uid: number): Promise<void> {
+    this.pidKills.push({ pid, uid });
+    if (this.strays.get(pid) === uid) this.strays.delete(pid);
+    for (const u of this.units.values()) if (u.pid === pid && u.uid === uid && !this.immortal.has(u.name)) this.endUnit(u, 255);
   }
 
   // ───────────────────────────── helpers for tests ─────────────────────────────

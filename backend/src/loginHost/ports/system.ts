@@ -53,7 +53,8 @@ export interface RootFs {
   readdir(path: string): Promise<string[]>;
   /** Every process on the host with its real uid (from /proc). */
   procUids(): Promise<Array<{ pid: number; uid: number }>>;
-  killPid(pid: number): void;
+  /** SIGKILLs `pid` ONLY if it is still owned by `uid` (re-read right before the signal: a pid can be reused by another user's process). */
+  killPid(pid: number, uid: number): Promise<void>;
 }
 
 /** A fixed, minimal environment: the host's own environment never reaches a command. */
@@ -123,8 +124,11 @@ export const nodeRootFs: RootFs = {
     }
     return out;
   },
-  killPid: (pid) => {
+  async killPid(pid, uid) {
     try {
+      const status = await readFile(`/proc/${pid}/status`, "utf8");
+      const m = status.match(/^Uid:\s+(\d+)/m);
+      if (!m || Number(m[1]) !== uid) return; // gone, or the pid now belongs to someone else: never signal it
       process.kill(pid, "SIGKILL");
     } catch {
       /* already gone */

@@ -293,6 +293,7 @@ describe("killAll", () => {
     sys.strays.set(778, UID2);
     await port.killAll(UID);
     expect([...sys.strays.keys()]).toEqual([778]);
+    expect(sys.pidKills).toEqual([{ pid: 777, uid: UID }]); // the signal carries the uid it must still belong to
   });
   it("trusts nothing systemctl prints: other names in the listing are ignored", async () => {
     const { port, sys } = rig();

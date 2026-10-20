@@ -172,9 +172,9 @@ export class SystemdUserFs implements UserFsPort {
           await this.cmd.run(this.cfg.paths.systemctl, ["stop", u], { timeoutMs: this.cfg.commandTimeoutMs });
         }
         // Belt and braces: any process still running as this uid (outside every unit we know) is killed. The uid is
-        // exclusively ours, and the uid is re-read from /proc immediately before the signal.
+        // exclusively ours, and killPid re-reads the process's uid immediately before the signal (pid reuse).
         const stray = (await this.root.procUids()).filter((p) => p.uid === uid);
-        for (const p of stray) this.root.killPid(p.pid);
+        for (const p of stray) await this.root.killPid(p.pid, uid);
         if (units.length === 0 && stray.length === 0) return;
         if (Date.now() > deadline) throw new Error("kill_timeout");
         await sleep(this.cfg.killPollMs);
