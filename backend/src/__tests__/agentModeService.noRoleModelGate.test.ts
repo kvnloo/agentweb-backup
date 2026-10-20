@@ -69,7 +69,7 @@ describe('ENG-2028 PATCH llm-model for non-admins (real registry)', () => {
     await agentModeController.updateSessionLlmModel(patch(id) as any, res);
     expect(res.status).not.toHaveBeenCalled();
     const canonical = agentModeService.resolveGenerationModel(id).model;
-    expect(mockDb.updateSessionLlmModel).toHaveBeenCalledWith('s1', canonical);
+    expect(mockDb.updateSessionLlmModel).toHaveBeenCalledWith('s1', canonical, undefined, 'user');
   });
 
   it.each([...OPUS_IDS, 'openrouter/anthropic/claude-opus-5.5'])('shared PATCH %s stores canonical id', async id => {
@@ -77,7 +77,7 @@ describe('ENG-2028 PATCH llm-model for non-admins (real registry)', () => {
     await agentModeController.updateSharedSessionLlmModel(
       { params: { shareId: 's1' }, query: { conversable: 'tok' }, body: { llmModel: id } } as unknown as Request, res);
     expect(res.status).not.toHaveBeenCalled();
-    expect(mockDb.updateSessionLlmModel).toHaveBeenCalledWith('s1', agentModeService.resolveGenerationModel(id).model);
+    expect(mockDb.updateSessionLlmModel).toHaveBeenCalledWith('s1', agentModeService.resolveGenerationModel(id).model, undefined, 'user');
   });
 
   it('unknown id keeps the existing 400 on both handlers', async () => {
