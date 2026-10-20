@@ -86,7 +86,12 @@ router.patch('/:scheduleId/status', async (req: Request, res: Response) => {
       }
       // Resuming must clear the same gates the owner would face.
       if ((await isSubscriptionFeatureEnabled(schedule.userId, 'scheduled_chats')) !== true) {
-        return res.status(403).json({ error: "Schedule owner's plan does not include scheduled chats" });
+        // Intended: an admin must not re-enable a paid feature the owner's plan lacks.
+        console.warn('[admin-scheduled-chats] resume refused: owner plan lacks scheduled_chats', { scheduleId });
+        return res.status(403).json({
+          error: "Schedule owner's plan does not include scheduled chats",
+          code: 'OWNER_PLAN_LACKS_SCHEDULED_CHATS',
+        });
       }
       const owner: any = await userDb.getUserById(schedule.userId);
       const remediation = await checkScheduleActivationRecipients({
