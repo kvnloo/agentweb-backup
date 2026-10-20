@@ -276,6 +276,33 @@ describe('buildAgentRunTrace', () => {
       expect([t.ask?.text, t.followUpAsks, t.calls.map((c) => c.id), t.finalResponse?.html]).toEqual(['A', ['yes, go on'], ['w1', 'w2', 'w3'], 'done']);
     });
 
+    it('ends a finished run at a later user row that has no timestamp of its own', () => {
+      index = 0;
+      const messages = [
+        user('A', '2026-10-14T10:00:00Z'),
+        assistantCalls(call('a1', 'load_data', {})),
+        toolResult('a1', 'load_data', 'A rows', '2026-10-14T10:00:12Z'),
+        row({ role: 'user', content: 'B (legacy, no timestamp)' }),
+        assistantCalls(call('b1', 'load_data', {})),
+        row({ role: 'assistant', content: 'B done' }),
+      ];
+      const t = buildAgentRunTrace({ sessionId: 's', messages, startedAt: '2026-10-14T10:00:00Z', completedAt: '2026-10-14T10:00:10Z' });
+      expect([t.followUpAsks, t.calls.map((c) => c.id)]).toEqual([[], ['a1']]);
+    });
+
+    it('keeps a mid-run user reply that has no timestamp of its own', () => {
+      index = 0;
+      const messages = [
+        user('A', '2026-10-14T10:00:00Z'),
+        toolResult('x', 'noop', 'r', '2026-10-14T10:00:02Z'),
+        row({ role: 'user', content: 'yes' }),
+        assistantCalls(call('a2', 'load_data', {})),
+        toolResult('a2', 'load_data', 'r', '2026-10-14T10:00:05Z'),
+      ];
+      const t = buildAgentRunTrace({ sessionId: 's', messages, startedAt: '2026-10-14T10:00:00Z', completedAt: '2026-10-14T10:00:10Z' });
+      expect([t.followUpAsks, t.calls.map((c) => c.id)]).toEqual([['yes'], ['a2']]);
+    });
+
     it('does not treat a trailing system row as a later run', () => {
       index = 0;
       const messages = [
