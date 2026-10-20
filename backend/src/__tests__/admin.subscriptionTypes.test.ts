@@ -620,6 +620,17 @@ describe('Admin subscription types routes', () => {
       expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
     });
 
+    it('allowedModels and the ENG-668 paygOverage both survive the same GET -> POST round trip', async () => {
+      const stored = [tier({ allowedModels: ['gpt-5.5'], paygOverage: { allowed: true, markupBps: 30_000 } }), tier({ name: 'Pro', paygOverage: { allowed: false } })];
+      mockedSettingsService.getSetting.mockResolvedValue({ settingName: 'subscription_types', settingValue: JSON.stringify(stored) } as any);
+      const got = await request(app).get('/api/admin/subscription-types').expect(200);
+      expect(got.body[0]).toMatchObject({ allowedModels: ['gpt-5.5'], paygOverage: { allowed: true, markupBps: 30_000 } });
+      await post(got.body).expect(200);
+      expect(saved()[0]).toMatchObject({ allowedModels: ['gpt-5.5'], paygOverage: { allowed: true, markupBps: 30_000 } });
+      expect(saved()[1]).toMatchObject({ paygOverage: { allowed: false } });
+      expect(saved()[1]).not.toHaveProperty('allowedModels');
+    });
+
     it('a GET -> POST round trip (what the admin UI does on any edit) preserves every tier\'s list', async () => {
       const stored = [tier({ allowedModels: ['gpt-5.5'] }), tier({ name: 'Pro', allowedModels: ['*'] }), tier({ name: 'Legacy' })];
       mockedSettingsService.getSetting.mockResolvedValue({ settingName: 'subscription_types', settingValue: JSON.stringify(stored) } as any);
