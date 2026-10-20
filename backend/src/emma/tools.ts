@@ -7496,6 +7496,9 @@ mcpToolRegistry.register({
       const session = await chatbotDb.getChatSession(context.sessionId);
       if (session?.delegateInfo?.isDelegated) actorEmail = session.delegateInfo.adminEmail;
     }
+    // The socket sidebar marks real admins isDelegatedAdmin without an adminEmail;
+    // a genuine admin row is its own actor.
+    if (!actorEmail && user?.isAdmin === true) actorEmail = user.email;
     if (!actorEmail) throw new Error('Administrator identity unavailable');
     const mode = args?.mode;
     if (mode !== 'read' && mode !== 'preview' && mode !== 'apply') {

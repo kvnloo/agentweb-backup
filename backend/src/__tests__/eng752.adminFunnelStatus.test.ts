@@ -124,4 +124,21 @@ describe('ENG-752 manage_user_funnel_status tool access', () => {
     expect(update).toHaveBeenCalledWith('u1', { funnelStatus: 'activation' });
     expect(log.mock.calls.some(([line]) => String(line).includes('[admin-audit]') && String(line).includes('"accountableOwner":"adm@agentweb.pro"'))).toBe(true);
   });
+
+  it('applies for a real admin on the socket sidebar path (isDelegatedAdmin without adminEmail)', async () => {
+    jest.spyOn(userDb, 'getUserById').mockResolvedValue({ userId: 'adm', email: 'adm@agentweb.pro', isAdmin: true } as any);
+    jest.spyOn(userDb, 'getUserByEmail').mockResolvedValue({ userId: 'u1', email: 'a@x.com', funnelStatus: 'parked' } as any);
+    const update = jest.spyOn(userDb, 'updateUser').mockResolvedValue({} as any);
+    jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    const res: any = await tool().execute({ mode: 'apply', rows: [{ email: 'a@x.com', funnel_status: 'follow_up' }] }, { userId: 'adm', isDelegatedAdmin: true });
+    expect(res.rows[0]).toMatchObject({ outcome: 'updated', after: 'follow_up' });
+    expect(update).toHaveBeenCalledWith('u1', { funnelStatus: 'follow_up' });
+  });
+
+  it('still fails closed for a delegated non-admin with no admin identity', async () => {
+    jest.spyOn(userDb, 'getUserById').mockResolvedValue({ userId: 'cust', email: 'c@x.com', isAdmin: false } as any);
+    const update = jest.spyOn(userDb, 'updateUser').mockResolvedValue({} as any);
+    await expect(tool().execute({ mode: 'apply', rows: [{ email: 'a@x.com', funnel_status: 'parked' }] }, { userId: 'cust', isDelegatedAdmin: true })).rejects.toThrow(/Administrator identity unavailable/);
+    expect(update).not.toHaveBeenCalled();
+  });
 });
