@@ -146,7 +146,7 @@ describe('permissions and registration', () => {
   });
   it('requires saved settings first', async () => {
     delete org.hotLeadCall;
-    for (const name of SETUP_TOOLS) await expect(run(name, VALID_ARGS[name])).rejects.toThrow('Save the hot lead call settings first');
+    for (const name of SETUP_TOOLS) await expect(run(name, VALID_ARGS[name])).rejects.toThrow(/Save the hot lead call settings first \(update_hot_lead_call_settings\)/);
   });
   it('fails closed on malformed stored settings', async () => {
     (org.hotLeadCall as Record<string, unknown>).maxCallsPerDay = 9999;
@@ -443,7 +443,7 @@ describe('start_hot_lead_call_verification', () => {
 
   it('needs a provisioned caller number and places no call without one', async () => {
     org.hotLeadCall = configured();
-    await expect(start()).rejects.toThrow('Provision a caller number first');
+    await expect(start()).rejects.toThrow('Provision a caller number first (provision_hot_lead_call_number)');
     expect(fake.placedCalls).toEqual([]);
     expect(writes).toEqual([]);
   });

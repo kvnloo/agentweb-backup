@@ -265,7 +265,8 @@ describe('POST members/:memberId/verification/start', () => {
     delete (table.org.hotLeadCall as { twilioNumberSid?: string }).twilioNumberSid;
     const number = await start();
     expect(number.status).toBe(403);
-    expect(number.body.error).toContain('caller number');
+    expect(number.body.error).toContain('phone number for calls');
+    expect(number.body.error).not.toMatch(/hot_lead_call/);
     expect(fake.placedCalls).toEqual([]);
   });
   it('answers 502 when the phone provider rejects the call', async () => {

@@ -6,6 +6,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { orgDb, userDb } from '../services/db';
 import '../emma/hotLeadCallTools';
+import { ConflictError } from '../services/hotLeadCallErrors';
 import { teamMember, MEMBER_ID, EVERY_DAY } from './helpers/hotLeadCallFixtures';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
 import { SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS } from '../services/agentMode/core/toolDispatch';
@@ -196,12 +197,12 @@ describe('update_hot_lead_call_settings', () => {
   });
 
   it.each([
-    ['a whole team with a verification stamp', { team: [teamMember('+14155550100')] }],
-    ['a member verification time', { verifiedAt: '2026-02-02T00:00:00.000Z' }],
-    ['a member id', { memberId: 'mzzzzzzz' }],
-    ['windows', { windows: [EVERY_DAY] }],
-  ])('cannot smuggle in %s', async (_label, extra) => {
-    await expect(update({ maxCallsPerHour: 3, ...extra })).rejects.toThrow(/settings arguments|Some settings are not valid|Unknown setting/);
+    ['a whole team with a verification stamp', { team: [teamMember('+14155550100')] }, /team\.0\.verifiedAt: Verification is managed by the system/],
+    ['a member verification time', { verifiedAt: '2026-02-02T00:00:00.000Z' }, /Invalid hot lead call settings arguments/],
+    ['a member id', { memberId: 'mzzzzzzz' }, /Invalid hot lead call settings arguments/],
+    ['windows', { windows: [EVERY_DAY] }, /Invalid hot lead call settings arguments/],
+  ])('cannot smuggle in %s', async (_label, extra, message) => {
+    await expect(update({ maxCallsPerHour: 3, ...extra })).rejects.toThrow(message);
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
 
@@ -349,9 +350,11 @@ describe('update_hot_lead_call_settings in an unattended run', () => {
   it.each([false, undefined])('only an explicit true counts as unattended (%s)', async flag => {
     expect((await update({ maxCallsPerDay: 100 }, { userId: 'owner', isUnattendedRun: flag })).success).toBe(true);
   });
-  it('a concurrent edit makes the write fail instead of overwriting it', async () => {
+  it('a concurrent edit rejects the conditional write with a ConflictError instead of overwriting it', async () => {
     (orgDb.updateOrg as jest.Mock).mockRejectedValueOnce(Object.assign(new Error('x'), { code: 'ConditionalCheckFailedException' }));
-    await expect(update({ maxCallsPerHour: 3 })).rejects.toThrow('changed by someone else');
+    const err = await update({ maxCallsPerHour: 3 }).catch(e => e);
+    expect(err).toBeInstanceOf(ConflictError);
+    expect(err.message).toContain('changed by someone else');
   });
 });
 

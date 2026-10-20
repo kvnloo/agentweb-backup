@@ -299,6 +299,7 @@ describe('updateHotLeadCallSettings: unattended runs', () => {
     ['widening the calling hours', { callingHours: { start: '07:00', end: '21:00', timezone: 'America/Chicago' } }],
     ['moving the calling hours to another zone', { callingHours: { start: '08:00', end: '21:00', timezone: 'America/New_York' } }],
     ['editing the team', { team: [{ id: A, name: 'Dana Lee', windows: [EVERY_DAY] }] }],
+    ['changing the business name read aloud', { announcedName: 'Somebody Else Ltd' }],
     ['turning calling on', { enabled: true }],
   ])('refuses %s', async (_label, body) => {
     if (_label === 'turning calling on') table.org.hotLeadCall = stored({ enabled: false });

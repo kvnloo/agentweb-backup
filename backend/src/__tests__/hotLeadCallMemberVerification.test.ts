@@ -40,6 +40,33 @@ const wrong = (code: string) => (code === '000000' ? '000001' : '000000');
 const verificationState = () => table.org.hotLeadCallVerification as { members: Record<string, { codeHash: string | null; attempts: number; startedAt: number[]; phone: string }>; orgStartedAt: number[] };
 const team = () => (table.org.hotLeadCall as { team: Array<{ id: string; verifiedAt?: string }> }).team;
 
+const TOOL_NAME = /[a-z]+_hot_lead_call_[a-z]+|hot_lead_call_[a-z_]+/;
+
+describe('refusals worded for the portal', () => {
+  it('says plainly, without a tool name, that no caller number exists', async () => {
+    delete (table.org.hotLeadCall as { twilioNumber?: string }).twilioNumber;
+    delete (table.org.hotLeadCall as { twilioNumberSid?: string }).twilioNumberSid;
+    const err = await start().catch(e => e);
+    expect(err).toBeInstanceOf(ForbiddenError);
+    expect(err.message).toContain('phone number for calls');
+    expect(err.message).not.toMatch(TOOL_NAME);
+  });
+  it('says plainly, without a tool name, that nothing is saved yet', async () => {
+    delete table.org.hotLeadCall;
+    const err = await start().catch(e => e);
+    expect(err).toBeInstanceOf(NotFoundError);
+    expect(err.message).not.toMatch(TOOL_NAME);
+  });
+});
+
+describe('a placement the provider did not confirm', () => {
+  it('is reported without a charge being recorded, because no call sid exists to key one by', async () => {
+    fake.failNextPlaceCall('unknown');
+    await expect(start()).rejects.toThrow('did not confirm');
+    expect(recordVendorUsage).not.toHaveBeenCalled();
+  });
+});
+
 beforeAll(() => { process.env.JWT_SECRET = 'test-secret-not-real'; });
 beforeEach(() => {
   jest.clearAllMocks();
