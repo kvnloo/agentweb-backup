@@ -44,6 +44,15 @@ describe('ENG-752 admin funnelStatus capability', () => {
     expect(updates).toEqual([['u2', null]]);
   });
 
+  it('refuses empty/whitespace strings and undefined instead of clearing (only null clears)', async () => {
+    const { deps, updates, audits } = makeDeps({ 'a@x.com': { userId: 'u1', funnelStatus: 'follow_up' }, 'b@x.com': { userId: 'u2', funnelStatus: 'follow_up' }, 'c@x.com': { userId: 'u3', funnelStatus: 'follow_up' } });
+    const res = await runFunnelStatusOperation('apply', [{ email: 'a@x.com', funnel_status: '' }, { email: 'b@x.com', funnel_status: '   ' }, { email: 'c@x.com', funnel_status: undefined }], actor, deps);
+    expect(res.rows.map((r) => r.outcome)).toEqual(['invalid', 'invalid', 'invalid']);
+    expect(res.rows[0].reason).toContain('follow_up');
+    expect(updates).toEqual([]);
+    expect(audits).toEqual([]);
+  });
+
   it('preview does not write; apply writes once, audits, and is idempotent', async () => {
     const { deps, updates, audits } = makeDeps({ 'a@x.com': { userId: 'u1', funnelStatus: 'follow_up' } });
     const rows = [{ email: 'a@x.com', funnel_status: 'activation' }];

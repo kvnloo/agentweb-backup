@@ -46,10 +46,14 @@ export interface FunnelStatusActor {
 export type FunnelStatusMode = 'read' | 'preview' | 'apply';
 
 function normalizeStatus(value: unknown): { ok: true; value: string | null } | { ok: false; reason: string } {
-  if (value === null || value === undefined) return { ok: true, value: null };
+  // Only an explicit JSON null clears the stage; empty/whitespace strings and
+  // undefined are refused so a model sending "" for "none" cannot wipe a stage.
+  if (value === null) return { ok: true, value: null };
   if (typeof value !== 'string') return { ok: false, reason: 'funnel_status must be a string or null' };
   const trimmed = value.trim();
-  if (!trimmed) return { ok: true, value: null };
+  if (!trimmed) {
+    return { ok: false, reason: `funnel_status must be one of ${USER_FUNNEL_STATUS_VALUES.join(', ')} or null (empty string is not a clear)` };
+  }
   if (!USER_FUNNEL_STATUS_VALUES.includes(trimmed)) {
     return { ok: false, reason: `funnel_status must be one of ${USER_FUNNEL_STATUS_VALUES.join(', ')} or null` };
   }
