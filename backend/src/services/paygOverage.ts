@@ -97,20 +97,23 @@ export interface PaygOverageSettings {
   poolHighWaterClosed?: { month: string; thresholdMicroUsd: number };
   optInClosed?: { month: string; overageBaselineMicroUsd: number; poolAtOptInMicroUsd?: number };
   /**
-   * UTC months (newest first, at most two) in which a gate admitted at least one turn on PAYG
-   * (`reason: 'payg_overage'`). Settlement bills a month only when it is listed: spend past the pool in a
-   * month PAYG never admitted anything is the ordinary in-flight overrun every plan has, not overage the
-   * owner agreed to pay for. Written by the gate once per month, conditionally.
+   * The months (newest first, at most two) in which a gate admitted at least one turn on PAYG
+   * (`reason: 'payg_overage'`), each with what was in force while it did. Settlement bills a month only
+   * when it is listed — spend past the pool in a month PAYG never admitted anything is the ordinary
+   * in-flight overrun every plan has, not overage the owner agreed to pay for — and bills it against
+   * THIS record, never against settings or a tier read after the month ended. Written by the gate,
+   * conditionally, only when an admission changes it (see `PaygAdmittedMonth`).
    */
-  admittedMonths?: string[];
+  admittedMonths?: PaygAdmittedMonth[];
   /** Who last changed the settings (a delegated admin's id when acting as the customer). */
   updatedBy: string;
   updatedAt: string;
   /** Optimistic-concurrency token; every settings write is conditional on the version it read. */
   version: number;
   /**
-   * Set by settlement when an overage charge fails (`payment_failed`, lifted when that invoice is paid)
-   * or is disputed (`dispute`, never lifted automatically). Blocks PAYG admission while present.
+   * Set by settlement when an overage charge fails (`payment_failed`, lifted once no month's overage
+   * invoice is still `failed`) or is disputed (`dispute`, never lifted automatically). Blocks PAYG
+   * admission while present.
    */
   suspended?: { reason: PaygSuspensionReason; at: string; invoiceId?: string };
 }
@@ -133,14 +136,65 @@ export interface PaygOverageStatus {
   percentOfCap: number;
 }
 
+/**
+ * What was in force during one month's PAYG admissions. Each figure only ever moves in the customer's
+ * favour within the month, so a write is needed only when an admission sees a higher cap or plan pool,
+ * or a lower markup:
+ *   - `capHighWaterMicroUsd`: the highest cap (`capPercentOfPool` x that moment's pool) any admission
+ *     was measured against — the most the owner agreed to be billed for that month. Lowering the cap
+ *     later does not un-agree to overage already admitted; raising it after the month does not reach back.
+ *   - `tierPoolHighWaterMicroUsd`: the highest plan pool (the tier's hard threshold, before credits) —
+ *     settlement's pool for the month, so a plan change after the month cannot move its bill.
+ *   - `markupBps`: the lowest tier markup seen; null when the tier had none (settlement holds the month).
+ */
+export interface PaygAdmittedMonth {
+  month: string;
+  capHighWaterMicroUsd: number;
+  tierPoolHighWaterMicroUsd: number;
+  markupBps: number | null;
+}
+
 /** Keep the most recent months of `admittedMonths`: the current month and the one settlement closes. */
 export const PAYG_ADMITTED_MONTHS_KEPT = 2;
 
-/** `admittedMonths` with `month` added (newest first, bounded); the same array when it is already there. */
-export function withPaygAdmittedMonth(months: readonly string[] | null | undefined, month: string): string[] {
-  const current = Array.isArray(months) ? months.filter((m) => typeof m === 'string') : [];
-  if (current.includes(month)) return current;
-  return [month, ...current].slice(0, PAYG_ADMITTED_MONTHS_KEPT);
+/** The stored record for `month`, or undefined. Tolerates a malformed list (it bills nothing). */
+export function paygAdmittedMonth(
+  account: Pick<PaygOverageSettings, 'admittedMonths'> | null | undefined,
+  month: string,
+): PaygAdmittedMonth | undefined {
+  const months = account?.admittedMonths;
+  if (!Array.isArray(months)) return undefined;
+  return months.find((entry) => entry && typeof entry === 'object' && entry.month === month);
+}
+
+/**
+ * `admittedMonths` after an admission measured against `seen`, or null when that admission changes
+ * nothing (the common case: no write). Newest month first, bounded.
+ */
+export function withPaygAdmission(
+  months: readonly PaygAdmittedMonth[] | null | undefined,
+  seen: PaygAdmittedMonth,
+): PaygAdmittedMonth[] | null {
+  const current = Array.isArray(months) ? months.filter((entry) => entry && typeof entry === 'object') : [];
+  const stored = current.find((entry) => entry.month === seen.month);
+  const lowerMarkup = (a: number | null, b: number | null) => (a === null ? b : b === null ? a : Math.min(a, b));
+  const merged: PaygAdmittedMonth = stored
+    ? {
+        month: seen.month,
+        capHighWaterMicroUsd: Math.max(stored.capHighWaterMicroUsd, seen.capHighWaterMicroUsd),
+        tierPoolHighWaterMicroUsd: Math.max(stored.tierPoolHighWaterMicroUsd, seen.tierPoolHighWaterMicroUsd),
+        markupBps: lowerMarkup(stored.markupBps, seen.markupBps),
+      }
+    : seen;
+  if (
+    stored
+    && merged.capHighWaterMicroUsd === stored.capHighWaterMicroUsd
+    && merged.tierPoolHighWaterMicroUsd === stored.tierPoolHighWaterMicroUsd
+    && merged.markupBps === stored.markupBps
+  ) {
+    return null;
+  }
+  return [merged, ...current.filter((entry) => entry.month !== seen.month)].slice(0, PAYG_ADMITTED_MONTHS_KEPT);
 }
 
 /**
@@ -235,10 +289,34 @@ export function paygEffectiveBaselineMicroUsd(input: {
  *   - overage since opting in is still below `capPercentOfPool` of the month's pool.
  */
 /**
- * Overage since opting in, the cap, and the pool both are measured on — THE measurement the gates admit
- * against and settlement bills from (`paygSettlement.ts`), so the two cannot disagree for the same inputs.
- * Null when it cannot be measured (unreadable spend, pool or stored baseline, no cap): every caller then
- * refuses to act on it — the gate keeps the 429, settlement holds the month.
+ * Overage since opting in (gross overage above the month's pool, less the opt-in baseline that still
+ * applies), or NaN when an input is unreadable. The one definition the gates admit against and
+ * settlement bills from (`paygSettlement.ts`), so the two cannot disagree for the same inputs.
+ */
+export function paygNetOverageMicroUsd(input: {
+  optIn: PaygOverageSettings['optIn'] | null | undefined;
+  poolHighWater: PaygOverageSettings['poolHighWater'] | null | undefined;
+  costUsedMicroUsd: number;
+  /** From `paygOverageThresholdMicroUsd`: the month's pool. */
+  overageThresholdMicroUsd: number;
+  /** UTC `YYYY-MM`; the opt-in baseline applies only in its own month. */
+  month: string;
+}): number {
+  if (!Number.isFinite(input.costUsedMicroUsd) || !Number.isFinite(input.overageThresholdMicroUsd)) return Number.NaN;
+  const baseline = paygEffectiveBaselineMicroUsd({
+    optIn: input.optIn,
+    poolHighWater: input.poolHighWater,
+    month: input.month,
+    poolMicroUsd: input.overageThresholdMicroUsd,
+  });
+  if (!Number.isFinite(baseline)) return Number.NaN;
+  return Math.max(0, paygGrossOverageMicroUsd(input.costUsedMicroUsd, input.overageThresholdMicroUsd) - baseline);
+}
+
+/**
+ * The gate's measurement: overage since opting in, the cap, and the pool both are measured on. Null
+ * when it cannot be measured (unreadable spend, pool or stored baseline, no cap) — the gate then keeps
+ * the 429.
  */
 export function measurePaygOverage(input: {
   capPercentOfPool: unknown;
@@ -255,18 +333,8 @@ export function measurePaygOverage(input: {
 
   const capMicroUsd = paygCapMicroUsd(input.capPercentOfPool, input.overageThresholdMicroUsd);
   if (capMicroUsd <= 0) return null;
-  const baseline = paygEffectiveBaselineMicroUsd({
-    optIn: input.optIn,
-    poolHighWater: input.poolHighWater,
-    month: input.month,
-    poolMicroUsd: input.overageThresholdMicroUsd,
-  });
-  if (!Number.isFinite(baseline)) return null;
-
-  const overageMicroUsd = Math.max(
-    0,
-    paygGrossOverageMicroUsd(input.costUsedMicroUsd, input.overageThresholdMicroUsd) - baseline,
-  );
+  const overageMicroUsd = paygNetOverageMicroUsd(input);
+  if (!Number.isFinite(overageMicroUsd)) return null;
   return {
     overageMicroUsd,
     capMicroUsd,

@@ -198,13 +198,12 @@ export const planRolloutUsageReset = planRolloutMigrationCredit;
  * settlement runs after that, and measures the closed month against that month's credits — without
  * this copy it would see none and bill top-up and seat-credit usage as overage. One month only; the
  * per-debit list is left out (settlement reads totals and grants only), which keeps the copy far below
- * the debit ledger's share of the item.
+ * the debit ledger's share of the item. Only an account with a PAYG record (on or off) gets one: no other
+ * account is ever settled, so for them nothing changes.
  */
-function ledgerToClose(
-  existing: MonthlyLlmUsageCredits | null | undefined,
-  month: string,
-): MonthlyLlmUsageCredits | undefined {
-  if (!existing || existing.month === month) return undefined;
+function ledgerToClose(user: Pick<User, 'llmUsageCredits' | 'paygOverage'>, month: string): MonthlyLlmUsageCredits | undefined {
+  const existing = user.llmUsageCredits;
+  if (!user.paygOverage || !existing || existing.month === month) return undefined;
   const { debits: _debits, debitIds: _debitIds, ...closed } = existing;
   return closed;
 }
@@ -302,7 +301,7 @@ export async function grantMonthlyLlmUsageCredit(input: {
       grantIds: [...(current.grantIds || []), input.grantId],
       grants: [...(current.grants || []), grant],
     };
-    const closed = ledgerToClose(existing, month);
+    const closed = ledgerToClose(user, month);
 
     const condition: {
       expression: string;
@@ -627,7 +626,7 @@ export async function recordLlmUsageDebit(input: {
       debitIds: [...(current.debitIds || []), debitId],
       totalDebitedMicroUsd: (current.totalDebitedMicroUsd || 0) + amountMicroUsd,
     };
-    const closed = ledgerToClose(existing, month);
+    const closed = ledgerToClose(user, month);
 
     const condition: {
       expression: string;

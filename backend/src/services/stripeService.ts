@@ -505,19 +505,20 @@ export const stripeService = {
 
   /**
    * ENG-668 PR-2: create, fill and finalize one month's pay-as-you-go overage invoice, or pick up the
-   * one an earlier attempt already started. Safe to call again with the same `idempotencyKey`:
-   *   - every Stripe write carries a key derived from it (`:invoice`, `:item`, `:finalize` — one key
-   *     cannot be reused across endpoints), so a retry within Stripe's 24h key window replays the
-   *     original result instead of creating a second invoice;
-   *   - an earlier attempt's invoice id (`invoiceId`) is retrieved directly;
-   *   - past the 24h window (`searchFirst`) the keys have expired, so the invoice is first searched for
-   *     by `metadata.idempotencyKey` before anything is created.
+   * one an earlier attempt already started. Safe to call again for the same month:
+   *   - an earlier attempt's invoice id (`invoiceId`) is retrieved directly; with none, Stripe is ALWAYS
+   *     searched for this owner's invoice for this month (`metadata` purchaseType + billingUserId +
+   *     month) before anything is created, whatever the record's age — so neither a lost response nor
+   *     a record removed by hand can lead to a second invoice for the month;
+   *   - every Stripe write also carries a key derived from `idempotencyKey` (`:invoice`, `:item`,
+   *     `:finalize` — one key cannot be reused across endpoints), which covers the search index's lag
+   *     within Stripe's 24h key window.
    * The draft is created with `auto_advance: false` (an empty draft must never auto-finalize as a $0
    * invoice) and `pending_invoice_items_behavior: 'exclude'` (nothing else the customer has pending is
-   * swept onto it); finalizing turns `auto_advance` on, so Stripe charges the payment method itself.
-   * `onDraftCreated` runs before the line item is added, so the caller can record the invoice id.
-   * Returns the invoice as Stripe now holds it (normally `open` or `paid`), or null when there is none
-   * to resume and no `customerId` to create one for.
+   * swept onto it). Before finalizing, the draft's total is compared with `amountCents`: if Stripe would
+   * charge anything else (a customer discount or balance), the draft is deleted and nothing is ever
+   * finalized or collected. Finalizing turns `auto_advance` on, so Stripe charges the payment method.
+   * `recordInvoiceId` runs as soon as the invoice is known (found or created), before the line item.
    */
   async issuePaygOverageInvoice(input: {
     idempotencyKey: string;
@@ -528,21 +529,36 @@ export const stripeService = {
     lineDescription: string;
     metadata: PaygOverageInvoiceMetadata;
     invoiceId?: string | null;
-    searchFirst: boolean;
-    onDraftCreated: (invoiceId: string) => Promise<void>;
-  }): Promise<Stripe.Invoice | null> {
+    recordInvoiceId: (invoiceId: string) => Promise<void>;
+  }): Promise<
+    | { outcome: 'issued'; invoice: Stripe.Invoice }
+    | { outcome: 'mismatch'; invoiceId: string; total: number; draftDeleted: boolean }
+    | { outcome: 'no_customer' }
+  > {
     if (!Number.isInteger(input.amountCents) || input.amountCents <= 0) throw new Error('amountCents must be a positive integer');
-    if (!/^[A-Za-z0-9_:-]+$/.test(input.idempotencyKey)) throw new Error('idempotencyKey has unexpected characters');
+    const { billingUserId, month } = input.metadata;
+    if (!/^[A-Za-z0-9_-]+$/.test(billingUserId) || !/^\d{4}-\d{2}$/.test(month)) {
+      throw new Error('billingUserId or month has unexpected characters');
+    }
     const s = getStripeOrThrow();
     const metadata: Record<string, string> = { ...input.metadata };
 
     let invoice: Stripe.Invoice | null = input.invoiceId ? await s.invoices.retrieve(input.invoiceId) : null;
-    if (!invoice && input.searchFirst) {
-      const found = await s.invoices.search({ query: `metadata['idempotencyKey']:'${input.idempotencyKey}'`, limit: 10 });
-      invoice = found.data.find((candidate) => candidate.metadata?.idempotencyKey === input.idempotencyKey) ?? null;
+    if (!invoice) {
+      const found = await s.invoices.search({
+        query: `metadata['purchaseType']:'${PAYG_OVERAGE_PURCHASE_TYPE}' AND metadata['billingUserId']:'${billingUserId}' AND metadata['month']:'${month}'`,
+        limit: 10,
+      });
+      // A void invoice collected nothing; any other one is this month's invoice.
+      invoice = found.data.find((candidate) =>
+        candidate.metadata?.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE
+        && candidate.metadata?.billingUserId === billingUserId
+        && candidate.metadata?.month === month
+        && candidate.status !== 'void') ?? null;
+      if (invoice?.id) await input.recordInvoiceId(invoice.id);
     }
     if (!invoice) {
-      if (!input.customerId) return null;
+      if (!input.customerId) return { outcome: 'no_customer' };
       invoice = await s.invoices.create({
         customer: input.customerId,
         collection_method: 'charge_automatically',
@@ -553,12 +569,14 @@ export const stripeService = {
         metadata,
         ...(input.paymentMethodId ? { default_payment_method: input.paymentMethodId } : {}),
       }, { idempotencyKey: `${input.idempotencyKey}:invoice` });
-      await input.onDraftCreated(invoice.id!);
-    } else if (invoice.id && invoice.id !== input.invoiceId) {
-      await input.onDraftCreated(invoice.id);
+      await input.recordInvoiceId(invoice.id!);
     }
 
-    if (invoice.status !== 'draft') return invoice;
+    if (invoice.status !== 'draft') {
+      return invoice.total === input.amountCents
+        ? { outcome: 'issued', invoice }
+        : { outcome: 'mismatch', invoiceId: invoice.id!, total: invoice.total, draftDeleted: false };
+    }
     const customer = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id;
     if (!customer) throw new Error(`Pay-as-you-go invoice ${invoice.id} has no customer`);
     // Only this item is ever put on the draft (pending items are excluded), so any line means it is there.
@@ -571,8 +589,14 @@ export const stripeService = {
         description: input.lineDescription,
         metadata,
       }, { idempotencyKey: `${input.idempotencyKey}:item` });
+      invoice = await s.invoices.retrieve(invoice.id!);
     }
-    return s.invoices.finalizeInvoice(invoice.id!, { auto_advance: true }, { idempotencyKey: `${input.idempotencyKey}:finalize` });
+    if (invoice.total !== input.amountCents) {
+      await s.invoices.del(invoice.id!);
+      return { outcome: 'mismatch', invoiceId: invoice.id!, total: invoice.total, draftDeleted: true };
+    }
+    const finalized = await s.invoices.finalizeInvoice(invoice.id!, { auto_advance: true }, { idempotencyKey: `${input.idempotencyKey}:finalize` });
+    return { outcome: 'issued', invoice: finalized };
   },
 
   /**
@@ -1428,6 +1452,26 @@ export async function handleInvoicePaymentFailed(invoice: any): Promise<void> {
 }
 
 /**
+ * ENG-668 PR-2: the overage invoice behind a refunded or disputed charge — only while PAYG settlement
+ * is switched on, and best-effort. Recognising an overage charge costs a Stripe call per non-top-up
+ * charge, so with settlement off (the shipped state) the refund and dispute webhooks behave exactly as
+ * before and make no extra call. A failed lookup is logged and the charge is handled as before rather
+ * than failing a webhook that today records it.
+ */
+async function findPaygOverageInvoiceIfSettling(charge: any, event: string): Promise<Stripe.Invoice | null> {
+  // Only an invoice charge has a PaymentIntent to look up; anything else is never an overage charge.
+  if (!charge?.payment_intent) return null;
+  try {
+    const { paygSettlementSwitch } = await import('./paygOverageService');
+    if (!(await paygSettlementSwitch.isEnabled())) return null;
+    return await stripeService.findPaygOverageInvoiceForCharge(charge);
+  } catch (error: any) {
+    console.error(`[STRIPE] ${event}: could not check whether charge ${charge?.id} paid a pay-as-you-go invoice; handling it as before:`, error?.message || error);
+    return null;
+  }
+}
+
+/**
  * Handle charge.refunded — record the refund in payment history.
  */
 export async function handleChargeRefunded(charge: any): Promise<void> {
@@ -1435,7 +1479,7 @@ export async function handleChargeRefunded(charge: any): Promise<void> {
   // ENG-668: a refunded pay-as-you-go overage charge is recorded against its settlement only. It never
   // lifts a suspension (refunding an overage is not a reason to resume billing it).
   if (metadata.purchaseType !== 'llm_usage_top_up') {
-    const overageInvoice = await stripeService.findPaygOverageInvoiceForCharge(charge);
+    const overageInvoice = await findPaygOverageInvoiceIfSettling(charge, 'charge.refunded');
     if (overageInvoice) {
       const { handlePaygOverageChargeRefunded } = await import('./paygSettlementService');
       await handlePaygOverageChargeRefunded(charge, overageInvoice);
@@ -1542,7 +1586,7 @@ export async function handleChargeDisputeCreated(dispute: any): Promise<void> {
   const metadata = charge.metadata || {};
   if (metadata.purchaseType !== 'llm_usage_top_up') {
     // ENG-668: a chargeback on a pay-as-you-go overage charge suspends pay-as-you-go.
-    const overageInvoice = await stripeService.findPaygOverageInvoiceForCharge(charge);
+    const overageInvoice = await findPaygOverageInvoiceIfSettling(charge, 'charge.dispute.created');
     if (overageInvoice) {
       const { handlePaygOverageChargeDisputed } = await import('./paygSettlementService');
       await handlePaygOverageChargeDisputed(dispute, charge, overageInvoice);

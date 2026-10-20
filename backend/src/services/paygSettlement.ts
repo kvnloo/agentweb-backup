@@ -1,18 +1,20 @@
 /**
  * ENG-668 PR-2: what month-end pay-as-you-go settlement bills for a closed month — pure, no I/O.
  *
- * The amount is measured with the SAME functions the admission gates use (`resolveLlmUsagePoolDecision`
- * -> `applyLlmUsageCredits` -> `paygOverageThresholdMicroUsd` -> `measurePaygOverage`), never a second
- * derivation: what the customer is billed for is exactly the overage the gates admitted them into. Only
- * the inputs differ, and only in being final:
+ * The overage is measured with the SAME functions the admission gates use (`resolveLlmUsagePoolDecision`
+ * -> `applyLlmUsageCredits` -> `paygOverageThresholdMicroUsd` -> `paygNetOverageMicroUsd`), never a
+ * second derivation: what the customer is billed for is exactly the overage the gates admitted them
+ * into. Every input belongs to the month being billed — nothing written after it ends can move its bill:
  *   - spend is the AUTHORITATIVE settled total summed from AW-SpendEvents, not the gate's fail-open
  *     projection read (the caller cross-checks the two and holds the month if they drift);
- *   - credits, the pool high-water mark and the opt-in baseline are the closed month's, read from the
- *     live fields or the copies kept when the month rolled over (`llmUsageCreditsClosed`,
- *     `poolHighWaterClosed`, `optInClosed`).
+ *   - credits, the pool high-water mark and the opt-in baseline are the month's own, read from the live
+ *     fields or the copies kept when the month rolled over (`llmUsageCreditsClosed`,
+ *     `poolHighWaterClosed`, `optInClosed`);
+ *   - the plan pool, the cap and the markup are the month's `admittedMonths` record, written by the gate
+ *     at admission — never the tier or the cap setting as they stand at settlement.
  *
- * Billable = min(overage after the opt-in baseline, the month's cap) x (1 + markup), in whole cents,
- * rounded down. Every rounding goes the customer's way.
+ * Billable = min(overage after the opt-in baseline, the highest cap in force at an admission that month)
+ * x (1 + markup), in whole cents, rounded down. Every rounding goes the customer's way.
  */
 import {
   applyLlmUsageCredits,
@@ -20,13 +22,12 @@ import {
   getLlmUsageCreditAdjustment,
   type MonthlyLlmUsageCredits,
 } from './llmUsageCreditService';
-import type { LlmUsagePolicy } from './llmUsagePolicyService';
 import {
-  measurePaygOverage,
+  paygAdmittedMonth,
   paygMonthState,
+  paygNetOverageMicroUsd,
   paygOverageThresholdMicroUsd,
   type PaygOverageSettings,
-  type PaygOverageStatus,
 } from './paygOverage';
 
 /**
@@ -43,13 +44,17 @@ export type PaygSettlementHeldReason =
   | 'spend_drift'
   /** The gate measured this owner on the legacy LLM-only counter, not the spend ledger being billed. */
   | 'legacy_spend_basis'
-  /** The tier has no usable pool or the stored PAYG state is unreadable. */
+  /** The month's admission record or the stored PAYG state is unreadable. */
   | 'unmeasurable'
-  /** The tier has no valid `paygOverage.markupBps`. */
+  /** The tier had no valid `paygOverage.markupBps` when PAYG admitted in the month. */
   | 'no_price'
   /** No live Stripe customer to invoice. */
   | 'no_stripe_customer'
-  /** The invoice Stripe holds does not match the record (voided, or a different amount). */
+  /**
+   * Stripe's total for the invoice is not the recorded amount (a customer discount or balance, say). A
+   * draft is deleted before it is ever finalized, so nothing is collected; a finalized one found by
+   * search is left to Stripe and recorded.
+   */
   | 'invoice_mismatch';
 
 export interface PaygSettlement {
@@ -74,6 +79,8 @@ export interface PaygSettlement {
   heldReason?: PaygSettlementHeldReason;
   nothingToBillReason?: 'no_overage' | 'below_minimum';
   invoiceId?: string;
+  /** A draft deleted on `invoice_mismatch` before it was finalized (audit only; nothing was collected). */
+  deletedDraftInvoiceId?: string;
   invoicedAt?: string;
   paidAt?: string;
   failedAt?: string;
@@ -94,9 +101,6 @@ export const PAYG_SETTLEMENT_MONTHS_KEPT = 12;
  */
 export const PAYG_MIN_INVOICE_CENTS = 50;
 
-/** Stripe keeps an idempotency key for 24h; a `pending` record older than that is searched for first. */
-export const PAYG_STRIPE_IDEMPOTENCY_WINDOW_MS = 24 * 60 * 60 * 1000;
-
 export function paygSettlementIdempotencyKey(billingUserId: string, month: string): string {
   return `payg:${billingUserId}:${month}`;
 }
@@ -114,64 +118,79 @@ export function paygSettlementMonthsToPrune(settlements: PaygSettlements | null 
 }
 
 export interface PaygSettlementAmount {
-  /** The gate's measurement for the closed month (overage, cap and pool). */
-  overage: PaygOverageStatus;
+  /** Overage since opting in, above the month's pool (before the cap). */
+  netOverageMicroUsd: number;
+  /** The month's pool: its plan pool plus its credits, or its high-water mark, whichever is higher. */
+  poolMicroUsd: number;
+  /** The highest cap in force at any admission in the month. */
+  capMicroUsd: number;
+  markupBps: number;
   overageCostMicroUsd: number;
   billedMicroUsd: number;
   amountCents: number;
   percentOfCap: number;
 }
 
+/** A month the gate admitted in, with a usable price on its record — or why it cannot be billed. */
+export function paygSettlementPrice(account: PaygOverageSettings, month: string): 'not_admitted' | 'no_price' | number {
+  const admitted = paygAdmittedMonth(account, month);
+  if (!admitted) return 'not_admitted';
+  return Number.isInteger(admitted.markupBps) && (admitted.markupBps as number) >= 10_000 ? (admitted.markupBps as number) : 'no_price';
+}
+
 /**
- * The amount owed for `month`, or null when it cannot be measured (no enforced pool, unreadable stored
- * PAYG state, invalid markup) — the caller holds the month rather than guess.
+ * The amount owed for `month`, or null when it cannot be measured (no admission record or an unusable
+ * one, no price, unreadable stored PAYG state) — the caller holds the month rather than guess.
  */
 export function computePaygSettlementAmount(input: {
   month: string;
   account: PaygOverageSettings;
-  /** The tier's policy; its hard threshold is the plan pool before credits. */
-  basePolicy: LlmUsagePolicy | null | undefined;
   /** That month's credit ledger (live or closed). */
   creditLedger: MonthlyLlmUsageCredits | null | undefined;
   /** Authoritative settled spend for the month, micro-USD. */
   settledMicroUsd: number;
-  markupBps: unknown;
 }): PaygSettlementAmount | null {
-  const hardThreshold = input.basePolicy?.hardCostThresholdMicroUsd;
-  if (!Number.isFinite(hardThreshold) || (hardThreshold as number) <= 0) return null;
-  if (!Number.isInteger(input.markupBps) || (input.markupBps as number) < 10_000) return null;
+  const admitted = paygAdmittedMonth(input.account, input.month);
+  const markupBps = paygSettlementPrice(input.account, input.month);
+  if (!admitted || typeof markupBps !== 'number') return null;
+  const tierPool = admitted.tierPoolHighWaterMicroUsd;
+  const capMicroUsd = admitted.capHighWaterMicroUsd;
+  if (!Number.isFinite(tierPool) || tierPool <= 0 || !Number.isFinite(capMicroUsd) || capMicroUsd <= 0) return null;
   if (!Number.isFinite(input.settledMicroUsd) || input.settledMicroUsd < 0) return null;
-  const markupBps = input.markupBps as number;
 
-  // The gate's pipeline, in the gate's order (llmUsagePoolDecision.ts).
+  // The gate's pipeline, in the gate's order (llmUsagePoolDecision.ts), on the month's own inputs.
   const adjusted = applyLlmUsageCredits({
     rawCostUsedMicroUsd: input.settledMicroUsd,
-    hardThresholdMicroUsd: hardThreshold as number,
+    hardThresholdMicroUsd: tierPool,
     adjustment: getLlmUsageCreditAdjustment(input.creditLedger, input.month),
   });
   const { poolHighWater, optIn } = paygMonthState(input.account, input.month);
-  const overage = measurePaygOverage({
-    capPercentOfPool: input.account.capPercentOfPool,
+  const poolMicroUsd = paygOverageThresholdMicroUsd({
+    effectiveHardThresholdMicroUsd: adjusted.effectiveHardThresholdMicroUsd,
+    poolHighWater,
+    month: input.month,
+  });
+  const netOverageMicroUsd = paygNetOverageMicroUsd({
     optIn,
     poolHighWater,
     costUsedMicroUsd: adjusted.policyCostUsedMicroUsd,
-    overageThresholdMicroUsd: paygOverageThresholdMicroUsd({
-      effectiveHardThresholdMicroUsd: adjusted.effectiveHardThresholdMicroUsd,
-      poolHighWater,
-      month: input.month,
-    }),
+    overageThresholdMicroUsd: poolMicroUsd,
     month: input.month,
   });
-  if (!overage) return null;
+  if (!Number.isFinite(netOverageMicroUsd)) return null;
 
-  // The gate stops admitting at the cap, but work already in flight can run past it: never bill past it.
-  const overageCostMicroUsd = Math.min(overage.overageMicroUsd, overage.capMicroUsd);
+  // The gate stops admitting at the cap, but work already in flight can run past it: never bill past
+  // the most the owner had agreed to at any point in the month.
+  const overageCostMicroUsd = Math.min(netOverageMicroUsd, capMicroUsd);
   const billedMicroUsd = Math.floor((overageCostMicroUsd * markupBps) / 10_000);
   return {
-    overage,
+    netOverageMicroUsd,
+    poolMicroUsd: Math.round(poolMicroUsd),
+    capMicroUsd,
+    markupBps,
     overageCostMicroUsd,
     billedMicroUsd,
     amountCents: Math.floor(billedMicroUsd / 10_000),
-    percentOfCap: Math.floor((overageCostMicroUsd / overage.capMicroUsd) * 100),
+    percentOfCap: Math.floor((overageCostMicroUsd / capMicroUsd) * 100),
   };
 }

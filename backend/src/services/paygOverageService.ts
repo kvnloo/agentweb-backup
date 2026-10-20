@@ -15,6 +15,7 @@ import { getCurrentUsageMonth, getRevocablePurchasedCreditMicroUsd } from './llm
 import {
   createPaygOverageSwitch,
   isPaygCapPercent,
+  paygAdmittedMonth,
   PAYG_SETTLEMENT_SETTING,
   paygGrossOverageMicroUsd,
   paygOverageThresholdMicroUsd,
@@ -240,10 +241,13 @@ export async function updatePaygOverage(input: {
       throw new PaygOverageRequestError(404, 'payg_unavailable', 'This plan has no usage pool to go past');
     }
     const month = getCurrentUsageMonth();
-    // The baseline is taken ONLY on the month's first opt-in. Re-enabling later in the same month keeps
-    // it: re-measuring would zero the overage already run up since the first opt-in, so toggling PAYG
-    // off and on would reset the cap. A new month starts with no baseline (the gates ignore a stale one).
-    if (existing?.optIn?.month !== month) {
+    // The baseline is taken ONLY on the month's first opt-in, and only if PAYG has not already admitted
+    // anything this month. Re-enabling later in the same month keeps the month's baseline: re-measuring
+    // would turn overage already admitted (and billable) into "standing before opt-in", so toggling PAYG
+    // off and on would reset the cap. That includes an opt-in carried over from an earlier month — its
+    // baseline for this month is 0, and an off -> on mid-month must not replace that with the overage
+    // the owner has already run up on PAYG. A new month starts with no baseline (the gates ignore a stale one).
+    if (existing?.optIn?.month !== month && !paygAdmittedMonth(existing, month)) {
       const poolMicroUsd = paygOverageThresholdMicroUsd({
         effectiveHardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd,
         poolHighWater: existing?.poolHighWater,

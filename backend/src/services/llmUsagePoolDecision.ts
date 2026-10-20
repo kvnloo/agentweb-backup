@@ -28,8 +28,9 @@ import { resolveEnforcementCostBasisMicroUsd } from './spendEnforcementBasis';
 import {
   evaluatePaygAdmission,
   paygOverageThresholdMicroUsd,
-  withPaygAdmittedMonth,
+  withPaygAdmission,
   type PaygBlock,
+  type PaygAdmittedMonth,
   type PaygOverageSettings,
   type PaygOverageStatus,
   type SubscriptionPaygOverageConfig,
@@ -152,9 +153,19 @@ export async function resolveLlmUsagePoolDecision(input: {
     }),
     month: usageMonth,
   });
-  // Settlement bills a month only if PAYG actually admitted something in it (see `admittedMonths`).
-  if (payg.decision.reason === 'payg_overage') {
-    await recordPaygAdmittedMonth({ billingUserId, account: ownerAccount, month: usageMonth });
+  // Settlement bills a month only if PAYG actually admitted something in it, and only against what was
+  // in force when it did (see `admittedMonths`).
+  if (payg.decision.reason === 'payg_overage' && payg.overage) {
+    await recordPaygAdmission({
+      billingUserId,
+      account: ownerAccount,
+      seen: {
+        month: usageMonth,
+        capHighWaterMicroUsd: payg.overage.capMicroUsd,
+        tierPoolHighWaterMicroUsd: Math.round(basePolicy!.hardCostThresholdMicroUsd),
+        markupBps: Number.isInteger(paygTier.markupBps) ? paygTier.markupBps! : null,
+      },
+    });
   }
   return { ...base, mode: payg.decision, overage: payg.overage, paygBlock: payg.block };
 }
@@ -239,28 +250,30 @@ async function recordPoolHighWater(input: {
 }
 
 /**
- * Add `month` to the owner's `admittedMonths` the first time PAYG admits a turn in it. Conditional on
- * the list being the one this check read, so concurrent writers cannot drop each other's month. Never
- * fails the check: a lost race means another writer changed the list (the next admission re-checks), and
- * a failed write only ever leaves a month unbilled.
+ * Record what an admission was measured against in the owner's `admittedMonths` — only when it raises the
+ * month's cap or plan pool, lowers its markup, or starts the month (otherwise no write). Conditional on
+ * the list being the one this check read, so concurrent writers cannot drop each other's update. Never
+ * fails the check: a lost race means another writer changed the list (the next admission re-reads and
+ * re-applies), and a failed write only ever leaves a month billed for less, or not at all.
  */
-async function recordPaygAdmittedMonth(input: {
+async function recordPaygAdmission(input: {
   billingUserId: string;
   account: PaygOverageSettings;
-  month: string;
+  seen: PaygAdmittedMonth;
 }): Promise<void> {
   const stored = input.account.admittedMonths;
-  if (Array.isArray(stored) && stored.includes(input.month)) return;
+  const next = withPaygAdmission(stored, input.seen);
+  if (!next) return;
   const names = { '#payg': 'paygOverage', '#admitted': 'admittedMonths' };
   try {
     await userDb.updateUser(input.billingUserId, {}, {
-      pathSets: [{ path: ['paygOverage', 'admittedMonths'], value: withPaygAdmittedMonth(stored, input.month) }],
+      pathSets: [{ path: ['paygOverage', 'admittedMonths'], value: next }],
       condition: Array.isArray(stored)
         ? { expression: 'attribute_exists(#payg) AND #payg.#admitted = :expected', names, values: { ':expected': stored } }
         : { expression: 'attribute_exists(#payg) AND attribute_not_exists(#payg.#admitted)', names },
     });
   } catch (error: any) {
     if (error?.code === 'ConditionalCheckFailedException') return;
-    console.error(`[paygOverage] Failed to record the PAYG admission month for ${input.billingUserId}:`, error?.message || error);
+    console.error(`[paygOverage] Failed to record the PAYG admission for ${input.billingUserId}:`, error?.message || error);
   }
 }
