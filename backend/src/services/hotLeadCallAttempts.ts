@@ -14,6 +14,7 @@ export interface NextAttemptDecision {
  * metered the finished attempt and moved the record to `between_attempts`; when it answers
  * `enqueued: false` they finish the record. Webhooks never place calls themselves.
  */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- placeholder until the orchestrator implements attempts
 export async function requestNextHotLeadCallAttempt(_args: {
   listId: string;
   leadId: string;
