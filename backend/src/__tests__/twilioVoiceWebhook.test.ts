@@ -136,8 +136,16 @@ const ENDPOINTS: Array<[string, () => request.Test]> = [
   ['status', () => ownerStatus('completed', { CallDuration: '30' })],
 ];
 
+// Each guard test starts a fresh log window (the "cannot verify" line is logged once per window).
+let guardClock = 1_800_000_000_000;
 describe.each(ENDPOINTS)('%s guard', (name, call) => {
-  beforeEach(() => seed('owner_answered', { meteredLegs: [] }));
+  let nowSpy: jest.SpyInstance;
+  beforeEach(() => {
+    seed('owner_answered', { meteredLegs: [] });
+    guardClock += 60_000;
+    nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => guardClock);
+  });
+  afterEach(() => nowSpy.mockRestore());
 
   it('answers 503 and processes nothing when credentials cannot be loaded', async () => {
     fake.ensureCredentials = async () => { throw new Error('secrets down'); };
@@ -146,6 +154,16 @@ describe.each(ENDPOINTS)('%s guard', (name, call) => {
     expect(fake.signatureChecks).toHaveLength(0);
     expect(store.transitions).toBe(0);
     expect(recordCallUsage).not.toHaveBeenCalled();
+  });
+
+  it('logs a credentials outage once per window, not once per unauthenticated request', async () => {
+    fake.ensureCredentials = async () => { throw new Error('secrets down'); };
+    for (let i = 0; i < 20; i++) expect((await call()).status).toBe(503);
+    const outageLines = () => logSpy.flatMap((s) => s.mock.calls).filter((c) => String(c[0]).includes('cannot verify callback'));
+    expect(outageLines()).toHaveLength(1);
+    guardClock += 5_001;
+    await call();
+    expect(outageLines()).toHaveLength(2);
   });
 
   it('logs only the error name when it cannot verify (no message, no params)', async () => {
@@ -518,13 +536,28 @@ describe('POST /gather', () => {
 describe('POST /dial', () => {
   beforeEach(() => seed('bridging'));
 
-  it.each(['no-answer', 'busy', 'failed', 'canceled'])('records lead_no_answer once for DialCallStatus=%s and apologises', async (status) => {
+  it.each(['no-answer', 'busy', 'failed'])('records lead_no_answer once for DialCallStatus=%s and apologises', async (status) => {
     const res = await dial(status, { DialCallSid: LEAD_SID });
     expect(res.text).toContain('could not reach them');
     expect(res.text).toContain('<Hangup/>');
     expect(store.record).toMatchObject({ state: 'bridging', outcome: 'lead_no_answer', leadCallSid: LEAD_SID });
     await dial(status, { DialCallSid: LEAD_SID });
     expect(store.eventTypes()).toEqual(['call.lead_no_answer']);
+  });
+
+  it('treats canceled (the owner hung up while the lead was ringing) as bridge_unconfirmed: no lead_no_answer, no apology', async () => {
+    const res = await dial('canceled', { DialCallSid: LEAD_SID });
+    expect(res.text).not.toContain('could not reach them');
+    expect(res.text).toContain('<Hangup/>');
+    expect(store.record).toMatchObject({ state: 'bridging', outcome: 'bridge_unconfirmed', leadCallSid: LEAD_SID });
+    await dial('canceled', { DialCallSid: LEAD_SID });
+    expect(store.events).toEqual([]);
+
+    // Both legs end: the record finishes with that outcome and a single call.completed.
+    await ownerStatus('completed', { CallDuration: '30' });
+    await leadStatus('completed', { CallDuration: '5' });
+    expect(store.record).toMatchObject({ state: 'finished', outcome: 'bridge_unconfirmed' });
+    expect(store.eventTypes()).toEqual(['call.completed']);
   });
 
   it('records a lead that never started (no DialCallSid) without a lead sid', async () => {

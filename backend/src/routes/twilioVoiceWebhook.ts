@@ -79,7 +79,7 @@ const QUERY_KEYS = new Set(['listId', 'leadId', 'jobKey', 'leg']);
 
 const LIVE_STATES: HotLeadCallState[] = ['dialing', 'owner_ringing', 'owner_answered', 'bridging', 'connected'];
 const TERMINAL_CALL_STATUSES = new Set(['completed', 'busy', 'no-answer', 'failed', 'canceled']);
-const LEAD_NOT_REACHED = new Set(['no-answer', 'busy', 'failed', 'canceled']);
+const LEAD_NOT_REACHED = new Set(['no-answer', 'busy', 'failed']);
 const LEAD_REACHED = new Set(['completed', 'answered']);
 const MAX_TRANSITION_ATTEMPTS = 3;
 
@@ -161,6 +161,10 @@ interface ErrorReplies {
   failed: (res: Response) => void;
 }
 
+// The endpoints are public, so a broken credentials secret is hit by every unauthenticated request: log it once per window.
+const CANNOT_VERIFY_LOG_WINDOW_MS = 5_000;
+let cannotVerifyLoggedAt = 0;
+
 function guarded(handler: Handler, replies: ErrorReplies) {
   return async (req: Request, res: Response): Promise<void> => {
     const provider = getVoiceProvider();
@@ -170,7 +174,10 @@ function guarded(handler: Handler, replies: ErrorReplies) {
       url = `${voiceWebhookBaseUrl()}${req.originalUrl}`;
     } catch (err) {
       // Cannot verify right now, so nothing is processed. Only /status carries a retry override.
-      console.error('[twilio-voice] cannot verify callback:', errorName(err));
+      if (Date.now() - cannotVerifyLoggedAt >= CANNOT_VERIFY_LOG_WINDOW_MS) {
+        cannotVerifyLoggedAt = Date.now();
+        console.error('[twilio-voice] cannot verify callback:', errorName(err));
+      }
       res.status(503).end();
       return;
     }
@@ -321,6 +328,18 @@ router.post('/dial', guarded(async (_req, res, q, body) => {
     if (await store.transition(q.listId, q.leadId, ['bridging'], { state: 'connected', leadCallSid })) {
       await store.addEvent(q.listId, q.leadId, 'call.connected');
     }
+    return sendHangup(res);
+  }
+  if (status === 'canceled') {
+    // The dial was cancelled while the lead was still ringing, which is the owner hanging up: nobody was told the
+    // lead did not answer, and we cannot say whether the lead picked up. The record finishes through the
+    // normal leg metering as bridge_unconfirmed (call.completed only).
+    await store.transition(q.listId, q.leadId, ['bridging'], {
+      state: 'bridging',
+      outcome: 'bridge_unconfirmed',
+      leadCallSid,
+      lastSequence: { [decisionKey(ownerSid, 'dial')]: 1 },
+    });
     return sendHangup(res);
   }
   if (LEAD_NOT_REACHED.has(status)) {

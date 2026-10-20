@@ -187,15 +187,60 @@ describe('secretsManager.getTwilioCredentials', () => {
       expect(mockGetSecretValue).toHaveBeenCalledTimes(1);
     });
 
-    it('does not cache a failure: the next call retries against Secrets Manager', async () => {
-      mockGetSecretValue.mockResolvedValueOnce({ SecretString: '' });
-      const { getTwilioCredentials } = await import('../utils/secretsManager');
+    describe('a failed load', () => {
+      let now: number;
+      beforeEach(() => {
+        now = 1_700_000_000_000;
+        jest.spyOn(Date, 'now').mockImplementation(() => now);
+      });
 
-      await expect(getTwilioCredentials()).rejects.toThrow('Failed to fetch Twilio credentials');
+      it('is remembered for 5 seconds: callers fail fast with no Secrets Manager read and no further log lines', async () => {
+        mockGetSecretValue.mockResolvedValue({ SecretString: '' });
+        const { getTwilioCredentials } = await import('../utils/secretsManager');
 
-      mockGetSecretValue.mockResolvedValueOnce({ SecretString: JSON.stringify(secretCreds) });
-      await expect(getTwilioCredentials()).resolves.toEqual(secretCreds);
-      expect(mockGetSecretValue).toHaveBeenCalledTimes(2);
+        await expect(getTwilioCredentials()).rejects.toThrow('Failed to fetch Twilio credentials');
+        const logLinesForOneFailure = errorSpy.mock.calls.length;
+        expect(logLinesForOneFailure).toBeGreaterThan(0);
+        now += 4_999;
+        for (let i = 0; i < 50; i++) await expect(getTwilioCredentials()).rejects.toThrow('Failed to fetch Twilio credentials');
+
+        expect(mockGetSecretValue).toHaveBeenCalledTimes(1);
+        expect(errorSpy).toHaveBeenCalledTimes(logLinesForOneFailure);
+      });
+
+      it('retries against Secrets Manager once the window has passed, and logs again if it still fails', async () => {
+        mockGetSecretValue.mockResolvedValue({ SecretString: '' });
+        const { getTwilioCredentials } = await import('../utils/secretsManager');
+
+        await expect(getTwilioCredentials()).rejects.toThrow('Failed to fetch');
+        const logLinesForOneFailure = errorSpy.mock.calls.length;
+        now += 5_001;
+        await expect(getTwilioCredentials()).rejects.toThrow('Failed to fetch');
+
+        expect(mockGetSecretValue).toHaveBeenCalledTimes(2);
+        expect(errorSpy).toHaveBeenCalledTimes(2 * logLinesForOneFailure);
+      });
+
+      it('recovers on the first call after the window when the secret was fixed', async () => {
+        mockGetSecretValue.mockResolvedValueOnce({ SecretString: '' });
+        const { getTwilioCredentials } = await import('../utils/secretsManager');
+
+        await expect(getTwilioCredentials()).rejects.toThrow('Failed to fetch');
+        mockGetSecretValue.mockResolvedValueOnce({ SecretString: JSON.stringify(secretCreds) });
+        now += 5_001;
+        await expect(getTwilioCredentials()).resolves.toEqual(secretCreds);
+        await expect(getTwilioCredentials()).resolves.toEqual(secretCreds); // and the success is cached
+        expect(mockGetSecretValue).toHaveBeenCalledTimes(2);
+      });
+
+      it('does not block a complete env pair that is set inside the window', async () => {
+        mockGetSecretValue.mockResolvedValue({ SecretString: '' });
+        const { getTwilioCredentials } = await import('../utils/secretsManager');
+        await expect(getTwilioCredentials()).rejects.toThrow('Failed to fetch');
+
+        setFullEnv();
+        await expect(getTwilioCredentials()).resolves.toMatchObject({ accountSid: 'ACenvfake' });
+      });
     });
 
     it('re-fetches once the cache entry expires', async () => {
