@@ -14,6 +14,7 @@ import { resolveHotLeadCallContext, type HotLeadCallContext } from './voice/hotL
 import { getLeadCallStore } from './voice/leadCallStore';
 import type { LeadCallStore } from './voice/leadCallStore.types';
 import { isWithinCallWindow, reserveCallSlot, type Reservation } from './voice/hotLeadCallLimits';
+import { selectHotLeadCallCandidates } from './hotLeadCallRoster';
 // This file must not import orgLeadNotificationService: that module calls dispatchHotLeadCall.
 
 interface HotLeadCallJob {
@@ -63,7 +64,9 @@ const SKIP_GATES: Array<(g: GateInput) => string | null> = [
   },
   // Stateless, so it runs in every pass; the limits that count calls run once, just before create. A skip leaves
   // the lead's call slot unused, and the Slack alert goes out regardless.
-  ({ config }) => (isWithinCallWindow(config.quietHours, new Date()) ? null : 'outside_quiet_hours'),
+  ({ config }) => (isWithinCallWindow(config.callingHours, new Date()) ? null : 'outside_calling_hours'),
+  // Inside the calling hours but nobody on the team has a window open (or none is verified).
+  ({ config }) => (selectHotLeadCallCandidates(config, new Date()).length > 0 ? null : 'no_one_available'),
   // Protects against queue-reclaim delays: a lead that waited too long is no longer "hot". A missing or
   // unparseable timestamp fails closed.
   ({ lead, job, config }) => {
@@ -147,11 +150,18 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
   const statusCallbackUrl = buildVoiceWebhookUrl('status', webhook);
   const store = getLeadCallStore();
 
+  // Re-evaluated now (not taken from the gates): time moves on between the gates and the reservation.
+  const candidates = selectHotLeadCallCandidates(config, new Date());
+  if (candidates.length === 0) {
+    await recordSkip(reviewed.lead, 'no_one_available');
+    return;
+  }
+
   // Reserve BEFORE create and give back if create does not win: a lead that never dials costs no slot, and a
   // lead refused by a limit leaves no record, so its single call slot stays unused (a repeat submission can retry).
   let slot: Reservation;
   try {
-    slot = await reserveCallSlot({ orgId: job.orgId, phoneE164: reviewed.phone, config });
+    slot = await reserveCallSlot({ orgId: job.orgId, phoneE164: reviewed.phone, config, candidates });
   } catch (err) {
     // Fail closed (nothing dialed, no record) but leave a trace on the lead: a missing table or secret is an ops problem.
     console.warn('[hotLeadCall] call limits unavailable', { listId, leadId, error: errorText(err) });
@@ -166,10 +176,14 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
     await recordSkip(reviewed.lead, slot.reason);
     return;
   }
+  // The member who was not in cooldown; this first attempt is the only one for now.
+  const { member } = slot;
   const startedAt = new Date().toISOString();
   let created = false;
   try {
-    created = await store.create(listId, leadId, { state: 'dialing', jobKey: key, startedAt, updatedAt: startedAt });
+    created = await store.create(listId, leadId, {
+      state: 'dialing', jobKey: key, startedAt, updatedAt: startedAt, attemptNo: 1, memberId: member.id, triedMemberIds: [member.id],
+    });
   } finally {
     if (!created) await slot.release();
   }
@@ -187,7 +201,7 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
   let memberCallSid: string;
   try {
     ({ callSid: memberCallSid } = await getVoiceProvider().placeCall({
-      to: config.destinationPhone,
+      to: member.phone,
       from: config.twilioNumber!, // non-null: the no_caller_number gate refused otherwise
       url,
       statusCallbackUrl,
@@ -195,11 +209,11 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
     }));
   } catch (err) {
     if (err instanceof VoiceCallError && err.placed === 'no') {
-      console.warn('[hotLeadCall] member call rejected', { listId, leadId, to: redactPhone(config.destinationPhone) });
+      console.warn('[hotLeadCall] member call rejected', { listId, leadId, to: redactPhone(member.phone) });
       await settle({ state: 'failed', outcome: 'place_rejected' }, 'call.failed', { reason: 'place_rejected' });
     } else {
       // The call may be live: stay non-terminal so the webhooks can still adopt and meter it. Never retried.
-      console.warn('[hotLeadCall] member call placement unknown', { listId, leadId, to: redactPhone(config.destinationPhone) });
+      console.warn('[hotLeadCall] member call placement unknown', { listId, leadId, to: redactPhone(member.phone) });
       await settle({ state: 'dialing', outcome: 'placement_unknown' }, 'call.failed', { reason: 'placement_unknown' });
     }
     return;

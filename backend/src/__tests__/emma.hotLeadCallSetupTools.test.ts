@@ -12,6 +12,7 @@ import { recordVendorUsage } from '../services/usageRecorderService';
 import { isHotLeadCallEnabled } from '../services/voice/hotLeadCallMode';
 import '../emma/hotLeadCallTools';
 import '../emma/hotLeadCallSetupTools';
+import { teamMember, MEMBER_ID, VERIFIED_AT } from './helpers/hotLeadCallFixtures';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
 import { FakeVoiceProvider } from '../services/voice/fakeVoiceProvider';
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
@@ -22,7 +23,7 @@ const run = (name: string, args: unknown = {}, context: unknown = { userId: 'own
 const provision = (args: unknown = { confirm: true }, ctx?: unknown) => run('provision_hot_lead_call_number', args, ctx);
 const release = (ctx?: unknown) => run('release_hot_lead_call_number', {}, ctx);
 const start = (args: unknown = {}, ctx?: unknown) => run('start_hot_lead_call_verification', args, ctx);
-const confirm = (code: unknown, ctx?: unknown) => run('confirm_hot_lead_call_verification', { code }, ctx);
+const confirm = (code: unknown, ctx?: unknown, memberId?: string) => run('confirm_hot_lead_call_verification', { code, ...(memberId ? { memberId } : {}) }, ctx);
 const SETUP_TOOLS = ['provision_hot_lead_call_number', 'release_hot_lead_call_number', 'start_hot_lead_call_verification', 'confirm_hot_lead_call_verification'];
 const VALID_ARGS: Record<string, unknown> = { provision_hot_lead_call_number: { confirm: true }, release_hot_lead_call_number: {}, start_hot_lead_call_verification: {}, confirm_hot_lead_call_verification: { code: '123456' } };
 
@@ -44,11 +45,15 @@ const clone = <T>(v: T): T => (v === undefined ? v : JSON.parse(JSON.stringify(v
 const sameValue = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 const logSpies: jest.SpyInstance[] = [];
 
-const configured = (extra: Record<string, unknown> = {}) => ({
-  enabled: false, destinationPhone: '+14155550100', leadTypes: ['form_fill'], maxAgeMinutes: 10, maxCallsPerHour: 6, maxCallsPerDay: 20,
-  ownerCooldownMinutes: 2, announcedName: 'Acme Plumbing', quietHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
+// `verified` stamps the (only) member's verifiedAt and `phone` sets their phone; everything else is config.
+const configured = ({ verified, phone, ...extra }: Record<string, unknown> = {}) => ({
+  enabled: false,
+  team: [teamMember(typeof phone === 'string' ? phone : '+14155550100', verified ? {} : { verifiedAt: undefined })],
+  leadTypes: ['form_fill'], maxAgeMinutes: 10, maxCallsPerHour: 6, maxCallsPerDay: 20,
+  memberCooldownMinutes: 2, maxAttemptsPerLead: 3, announcedName: 'Acme Plumbing', callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
   allowedCountries: ['US', 'CA'], ...extra,
 });
+const firstMember = () => (org.hotLeadCall as { team: Array<Record<string, unknown>> }).team[0];
 const withNumber = (extra: Record<string, unknown> = {}) => configured({ twilioNumber: '+14155550111', twilioNumberSid: SID, ...extra });
 
 /** In-memory org table that evaluates the conditions the tools generate, merging aliases like the real orgDb.updateOrg. */
@@ -177,10 +182,10 @@ describe('permissions and registration', () => {
     expect(handlers.get('release_hot_lead_call_number')!.definition.description).toMatch(/cannot be recovered/);
     expect(handlers.get('start_hot_lead_call_verification')!.definition.description).toMatch(/voicemail.*Twilio call log/);
   });
-  it('does not expose the system fields or a destination argument on any setup tool', () => {
+  it('does not expose the system fields or a phone argument on any setup tool', () => {
     for (const name of SETUP_TOOLS) {
       const props = Object.keys(handlers.get(name)!.definition.inputSchema.properties);
-      for (const forbidden of ['to', 'phone', 'destinationPhone', 'twilioNumber', 'twilioNumberSid', 'destinationVerifiedAt', 'orgId', 'userId']) expect(props).not.toContain(forbidden);
+      for (const forbidden of ['to', 'phone', 'memberPhone', 'twilioNumber', 'twilioNumberSid', 'verifiedAt', 'team', 'orgId', 'userId']) expect(props).not.toContain(forbidden);
     }
   });
 });
@@ -212,7 +217,7 @@ describe('provision_hot_lead_call_number', () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
     const result = await provision({ confirm: true, areaCode: '415' });
     expect(fake.boughtNumbers).toEqual([{ countryCode: 'US', areaCode: '415' }]);
-    expect(org.hotLeadCall).toMatchObject({ twilioNumber: NEW_NUMBER, twilioNumberSid: NEW_SID, enabled: false, destinationPhone: '+14155550100' });
+    expect(org.hotLeadCall).toMatchObject({ twilioNumber: NEW_NUMBER, twilioNumberSid: NEW_SID, enabled: false, team: [{ phone: '+14155550100' }] });
     expect(result).toMatchObject({ success: true, callerNumber: '***0123' });
     expect(JSON.stringify(result)).not.toMatch(/4155550123|\+1415|PN/);
     expect(writes).toHaveLength(2);
@@ -232,10 +237,10 @@ describe('provision_hot_lead_call_number', () => {
     expect(fake.boughtNumbers).toEqual([{ countryCode: 'US' }]);
   });
   it('keeps verification and the enabled flag as they were', async () => {
-    org.hotLeadCall = configured({ destinationVerifiedAt: '2026-01-01T00:00:00.000Z' });
+    org.hotLeadCall = configured({ verified: true });
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
     await provision();
-    expect(org.hotLeadCall).toMatchObject({ destinationVerifiedAt: '2026-01-01T00:00:00.000Z', enabled: false });
+    expect(org.hotLeadCall).toMatchObject({ team: [{ verifiedAt: VERIFIED_AT }], enabled: false });
   });
 
   it('two racing provisions reach Twilio once: the reservation is conditional, so the loser never buys', async () => {
@@ -346,7 +351,7 @@ describe('provision_hot_lead_call_number', () => {
     expect(org.hotLeadCall).not.toHaveProperty('twilioNumberSid');
     expect(recordVendorUsage).not.toHaveBeenCalled();
   });
-  it('releases a purchased number that fails validation (here: equals the destination phone) instead of storing it', async () => {
+  it('releases a purchased number that fails validation (here: equals a team phone) instead of storing it', async () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: '+14155550100' });
     await expect(provision()).rejects.toThrow('was released');
     expect(fake.releasedNumbers).toEqual([NEW_SID]);
@@ -355,7 +360,7 @@ describe('provision_hot_lead_call_number', () => {
 });
 
 describe('release_hot_lead_call_number', () => {
-  beforeEach(() => { org.hotLeadCall = withNumber({ enabled: true, destinationVerifiedAt: '2026-01-01T00:00:00.000Z' }); });
+  beforeEach(() => { org.hotLeadCall = withNumber({ enabled: true, verified: true }); });
 
   it('turns calling off before releasing, then clears the number and sid but keeps verification', async () => {
     const order: string[] = [];
@@ -367,7 +372,7 @@ describe('release_hot_lead_call_number', () => {
     expect(writes[0].updates.hotLeadCallProvisioning).toEqual({ purchases: [], releases: [T0] });
     expect(writes[1].updates.hotLeadCall).toMatchObject({ enabled: false, twilioNumberSid: SID });
     expect(fake.releasedNumbers).toEqual([SID]);
-    expect(org.hotLeadCall).toEqual(configured({ destinationVerifiedAt: '2026-01-01T00:00:00.000Z' }));
+    expect(org.hotLeadCall).toEqual(configured({ verified: true }));
     expect(result).toMatchObject({ success: true, callerNumberReleased: true, callingEnabled: false });
     expect(JSON.stringify(result)).not.toMatch(/4155550111|PN/);
   });
@@ -394,7 +399,7 @@ describe('release_hot_lead_call_number', () => {
     expect(org.hotLeadCall).toMatchObject({ twilioNumberSid: SID, enabled: false });
   });
   it('a stored number without a sid is cleared locally with calling off and no Twilio call', async () => {
-    org.hotLeadCall = withNumber({ enabled: true, destinationVerifiedAt: '2026-01-01T00:00:00.000Z' });
+    org.hotLeadCall = withNumber({ enabled: true, verified: true });
     delete (org.hotLeadCall as Record<string, unknown>).twilioNumberSid;
     await release();
     expect(fake.releasedNumbers).toEqual([]);
@@ -441,12 +446,12 @@ describe('start_hot_lead_call_verification', () => {
     expect(fake.placedCalls).toEqual([]);
     expect(writes).toEqual([]);
   });
-  it.each([[{ to: '+14155550199' }], [{ destinationPhone: '+14155550199' }], [{ phone: '+14155550199' }]])('never takes a number from arguments (%j)', async args => {
+  it.each([[{ to: '+14155550199' }], [{ memberPhone: '+14155550199' }], [{ phone: '+14155550199' }]])('never takes a number from arguments (%j)', async args => {
     await expect(start(args)).rejects.toThrow('Invalid');
     expect(fake.placedCalls).toEqual([]);
   });
 
-  it('places one call to the stored destination from the caller number with inline TwiML and stores only a hash', async () => {
+  it('places one call to the stored member phone from the caller number with inline TwiML and stores only a hash', async () => {
     const result = await start();
     expect(fake.placedCalls).toHaveLength(1);
     const call = fake.placedCalls[0] as unknown as Record<string, unknown>;
@@ -460,7 +465,7 @@ describe('start_hot_lead_call_verification', () => {
     expect(record.codeHash).toMatch(/^[0-9a-f]{64}$/);
     expect(Object.keys(record).sort()).toEqual(['attempts', 'callSid', 'codeHash', 'expiresAt', 'phone', 'startedAt']);
     expect(Object.values(record)).not.toContain(code);
-    expect(result).toMatchObject({ success: true, destinationPhone: '***0100', expiresInMinutes: 10, maxAttempts: 5 });
+    expect(result).toMatchObject({ success: true, memberId: MEMBER_ID, memberPhone: '***0100', expiresInMinutes: 10, maxAttempts: 5 });
     expect(writes.every(w => !!w.condition?.expression)).toBe(true);
   });
   it('never returns or logs the code, or full phone numbers', async () => {
@@ -564,14 +569,14 @@ describe('confirm_hot_lead_call_verification', () => {
     org.hotLeadCall = withNumber({ enabled: false });
   });
 
-  it('verifies, writes destinationVerifiedAt, clears the pending record and keeps other settings', async () => {
+  it('verifies, writes the member’s verifiedAt, clears the pending record and keeps other settings', async () => {
     await start();
     const code = codeFromCall();
     setTime(T0 + MIN);
     const result = await confirm(code);
-    expect(org.hotLeadCall).toEqual(withNumber({ destinationVerifiedAt: new Date(T0 + MIN).toISOString() }));
+    expect(org.hotLeadCall).toEqual(withNumber({ team: [teamMember('+14155550100', { verifiedAt: new Date(T0 + MIN).toISOString() })] }));
     expect(org.hotLeadCallVerification).toEqual({ phone: '+14155550100', codeHash: null, expiresAt: 0, attempts: 0, startedAt: [T0] });
-    expect(result).toMatchObject({ success: true, destinationVerified: true, destinationPhone: '***0100' });
+    expect(result).toMatchObject({ success: true, memberVerified: true, memberId: MEMBER_ID, memberPhone: '***0100', verifiedAt: new Date(T0 + MIN).toISOString() });
     expect(JSON.stringify(result)).not.toMatch(/4155550100/);
     expect(JSON.stringify(result)).not.toContain(code);
   });
@@ -586,10 +591,10 @@ describe('confirm_hot_lead_call_verification', () => {
     await expect(confirm(bad)).rejects.toThrow(/6 digits|Invalid/);
     expect(org.hotLeadCallVerification).toEqual(before);
   });
-  it('lets the owner enable calling afterwards through the existing settings tool', async () => {
+  it('lets the org admin enable calling afterwards through the existing settings tool', async () => {
     await start();
     await confirm(codeFromCall());
-    await expect(run('update_hot_lead_call_settings', { enabled: true })).resolves.toMatchObject({ enabled: true, destinationVerified: true });
+    await expect(run('update_hot_lead_call_settings', { enabled: true })).resolves.toMatchObject({ enabled: true, team: [{ verified: true }] });
   });
   it('a confirm does not reset the start history: alternating phones cannot dodge the gap or the daily cap', async () => {
     await start();
@@ -599,12 +604,12 @@ describe('confirm_hot_lead_call_verification', () => {
     const phones = ['+16475550123', '+14155550100'];
     for (let i = 1; i <= 4; i++) {
       setTime(T0 + 2 * i * MIN);
-      (org.hotLeadCall as Record<string, unknown>).destinationPhone = phones[i % 2];
-      delete (org.hotLeadCall as Record<string, unknown>).destinationVerifiedAt;
+      firstMember().phone = phones[i % 2];
+      delete firstMember().verifiedAt;
       await start();
       await confirm(codeFromCall(i));
     }
-    (org.hotLeadCall as Record<string, unknown>).destinationPhone = '+16475550123';
+    firstMember().phone = '+16475550123';
     setTime(T0 + 12 * MIN);
     await expect(start()).rejects.toThrow('limit of 5');
     expect(fake.placedCalls).toHaveLength(5);
@@ -613,7 +618,7 @@ describe('confirm_hot_lead_call_verification', () => {
     await start();
     const code = codeFromCall();
     const record = clone(org.hotLeadCallVerification);
-    org.hotLeadCall = withNumber({ destinationPhone: '+16475550123' });
+    org.hotLeadCall = withNumber({ phone: '+16475550123' });
     org.hotLeadCallVerification = { ...record, phone: '+16475550123' };
     await expect(confirm(code)).rejects.toThrow('not correct');
     org.hotLeadCall = withNumber();
@@ -642,7 +647,7 @@ describe('confirm_hot_lead_call_verification', () => {
     for (let i = 1; i <= 4; i++) await expect(confirm(wrongCode(second))).rejects.toThrow('not correct');
     await expect(confirm(wrongCode(second))).rejects.toThrow('no attempts are left');
     await expect(confirm(second)).rejects.toThrow('Too many incorrect attempts');
-    expect(org.hotLeadCall).not.toHaveProperty('destinationVerifiedAt');
+    expect(firstMember().verifiedAt).toBeUndefined();
   });
   it('parallel guesses cannot exceed the attempt budget: only one concurrent confirm is counted', async () => {
     await start();
@@ -659,21 +664,21 @@ describe('confirm_hot_lead_call_verification', () => {
     setTime(T0 + 10 * MIN - 1);
     await expect(confirm(code)).resolves.toMatchObject({ success: true });
   });
-  it('refuses when the destination phone changed between start and confirm, and never verifies the new phone', async () => {
+  it('refuses when the member’s phone changed between start and confirm, and never verifies the new phone', async () => {
     await start();
     const code = codeFromCall();
-    org.hotLeadCall = withNumber({ destinationPhone: '+16475550123' });
-    await expect(confirm(code)).rejects.toThrow('phone changed');
-    expect(org.hotLeadCall).not.toHaveProperty('destinationVerifiedAt');
+    org.hotLeadCall = withNumber({ phone: '+16475550123' });
+    await expect(confirm(code)).rejects.toThrow('different phone');
+    expect(firstMember().verifiedAt).toBeUndefined();
   });
   it('refuses when the settings change between the check and the write (conditional write)', async () => {
     await start();
     const code = codeFromCall();
     writes.length = 0;
-    beforeWrite = i => { if (i === 1) org.hotLeadCall = withNumber({ destinationPhone: '+16475550123' }); };
+    beforeWrite = i => { if (i === 1) org.hotLeadCall = withNumber({ phone: '+16475550123' }); };
     await expect(confirm(code)).rejects.toThrow('settings changed');
-    expect(org.hotLeadCall).not.toHaveProperty('destinationVerifiedAt');
-    expect(org.hotLeadCall).toMatchObject({ destinationPhone: '+16475550123' });
+    expect(firstMember().verifiedAt).toBeUndefined();
+    expect(firstMember().phone).toBe('+16475550123');
   });
   it('compares the hash in constant time, on equal-length buffers', async () => {
     await start();
@@ -710,6 +715,48 @@ describe('confirm_hot_lead_call_verification', () => {
     for (const w of writes) expect(w.condition?.expression).toMatch(/attribute_not_exists|#previous\w+ = :previous\w+/);
   });
   it('no setup tool ever writes the system fields from arguments: update_hot_lead_call_settings still refuses them', async () => {
-    await expect(run('update_hot_lead_call_settings', { destinationVerifiedAt: '2026-02-02T00:00:00.000Z' })).rejects.toThrow('managed by the system');
+    await expect(run('update_hot_lead_call_settings', { verifiedAt: '2026-02-02T00:00:00.000Z' })).rejects.toThrow('settings arguments');
+  });
+});
+
+describe('verification on a team of several members', () => {
+  const SECOND_ID = 'mzzzzzz2';
+  const SECOND_PHONE = '+14155550122';
+  beforeEach(() => {
+    org.hotLeadCall = withNumber({ team: [teamMember('+14155550100', { verifiedAt: undefined }), teamMember(SECOND_PHONE, { id: SECOND_ID, name: 'Sam Ortiz', verifiedAt: undefined })] });
+  });
+  const teamOf = () => (org.hotLeadCall as { team: Array<Record<string, unknown>> }).team;
+
+  it('refuses to start without a memberId and places no call', async () => {
+    await expect(start()).rejects.toThrow('say which one to verify');
+    expect(fake.placedCalls).toEqual([]);
+    expect(writes).toEqual([]);
+  });
+  it('refuses an unknown memberId', async () => {
+    await expect(start({ memberId: 'mnobody0' })).rejects.toThrow('does not exist');
+    expect(fake.placedCalls).toEqual([]);
+  });
+  it.each(['MABCDEFG', 'm123', 'x1234567', 5])('rejects a malformed memberId %j', async memberId => {
+    await expect(start({ memberId })).rejects.toThrow('Invalid');
+  });
+  it('rings the chosen member and verifies only that member', async () => {
+    const started = await start({ memberId: SECOND_ID });
+    expect(fake.placedCalls[0]).toMatchObject({ to: SECOND_PHONE });
+    expect(started).toMatchObject({ memberId: SECOND_ID, memberPhone: '***0122' });
+    setTime(T0 + MIN);
+    await expect(confirm(codeFromCall(), undefined, SECOND_ID)).resolves.toMatchObject({ memberVerified: true, memberId: SECOND_ID });
+    expect(teamOf()[0].verifiedAt).toBeUndefined();
+    expect(teamOf()[1].verifiedAt).toBe(new Date(T0 + MIN).toISOString());
+  });
+  it('refuses to confirm without a memberId on a larger team', async () => {
+    await start({ memberId: SECOND_ID });
+    await expect(confirm(codeFromCall())).rejects.toThrow('say which one to verify');
+    expect(teamOf()[1].verifiedAt).toBeUndefined();
+  });
+  it('does not let a code sent to one member verify another', async () => {
+    await start({ memberId: SECOND_ID });
+    const code = codeFromCall();
+    await expect(confirm(code, undefined, MEMBER_ID)).rejects.toThrow('different phone');
+    expect(teamOf().every(m => m.verifiedAt === undefined)).toBe(true);
   });
 });

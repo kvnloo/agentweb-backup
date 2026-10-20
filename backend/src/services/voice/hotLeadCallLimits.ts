@@ -1,10 +1,10 @@
 import { createHmac, randomUUID } from 'crypto';
 import { getJwtSecret } from '../../config/jwt';
 import { localParts } from '../dripSendWindow';
-import { hhmmToMinutes, type HotLeadCallConfig } from '../hotLeadCallConfig';
+import { hhmmToMinutes, type HotLeadCallConfig, type HotLeadCallMember } from '../hotLeadCallConfig';
 import { getLimitStore } from './limitStore';
 
-type LimitDenial = 'duplicate_phone' | 'owner_cooldown' | 'org_hourly_cap' | 'org_daily_cap';
+type LimitDenial = 'duplicate_phone' | 'member_cooldown' | 'org_hourly_cap' | 'org_daily_cap';
 
 const MINUTE_S = 60;
 const HOUR_S = 3600;
@@ -42,7 +42,8 @@ export function phoneMarkerKey(orgId: string, phoneE164: string): string {
   const digest = createHmac('sha256', getJwtSecret()).update(`hot_lead_call.phone\0${orgId}\0${phoneE164}`).digest('hex');
   return `hlc#phone#${digest}`;
 }
-export const cooldownKey = (orgId: string): string => `hlc#cool#${orgId}`;
+// Per member, not per org: two team members can take two leads at once, while one member is not rung twice in a row.
+export const cooldownKey = (orgId: string, memberId: string): string => `hlc#cool#${orgId}#${memberId}`;
 // Fixed windows (not sliding): up to twice the cap can dial across an hour or day boundary, which is
 // bounded and keeps each check a single write. Hours are UTC clock hours; days are the org's local calendar day.
 export const hourlyCapKey = (orgId: string, at: Date): string => `hlc#cap#h#${orgId}#${at.toISOString().slice(0, 13)}`;
@@ -50,10 +51,12 @@ export const dailyCapKey = (orgId: string, timeZone: string, at: Date): string =
 
 // ---- reservation -----------------------------------------------------------------------------------------
 
-export type Reservation = { ok: true; release: () => Promise<void> } | { ok: false; reason: LimitDenial };
+export type Reservation = { ok: true; member: HotLeadCallMember; release: () => Promise<void> } | { ok: false; reason: LimitDenial };
 
 /**
- * Takes this lead's slot against every abuse limit, or says which one refused. Each limit is one conditional
+ * Takes this lead's slot against every abuse limit, or says which one refused. `candidates` are the members
+ * eligible to be rung, in priority order: the first one that is not in cooldown is claimed and returned, so a
+ * member who just took a call is passed over for the next one. Each limit is one conditional
  * write, so a burst of simultaneous leads can never dial more than the cap. Everything taken is given back by
  * `release()` (called when the lead loses `store.create`, or create throws) and when a later limit refuses, so a
  * lead that does not dial never costs the org a slot. A lead that dials and then fails keeps its slots: the
@@ -63,12 +66,15 @@ export type Reservation = { ok: true; release: () => Promise<void> } | { ok: fal
  *
  * Known limits (accepted): fixed windows can admit up to 2x a cap across a boundary; phone-rotating bots can
  * consume an org's hourly/daily caps (the Slack alert still fires); whoever submits a number first suppresses the
- * dial for that number for 24h; the cooldown skips a second genuine lead within memberCooldownMinutes; a process
+ * dial for that number for 24h; the cooldown skips a second genuine lead within memberCooldownMinutes
+ * when no other candidate is free; a process
  * crash between this call and store.create leaves the 24h phone marker and the cooldown claim held with no
  * record, so a repeat of that number is refused as duplicate_phone with a silent timeline.
  */
-export async function reserveCallSlot(input: { orgId: string; phoneE164: string; config: HotLeadCallConfig; now?: Date }): Promise<Reservation> {
-  const { orgId, phoneE164, config } = input;
+export async function reserveCallSlot(input: {
+  orgId: string; phoneE164: string; config: HotLeadCallConfig; candidates: readonly HotLeadCallMember[]; now?: Date;
+}): Promise<Reservation> {
+  const { orgId, phoneE164, config, candidates } = input;
   const now = input.now ?? new Date();
   const nowS = Math.floor(now.getTime() / 1000);
   const store = getLimitStore();
@@ -89,10 +95,22 @@ export async function reserveCallSlot(input: { orgId: string; phoneE164: string;
     return true;
   };
 
+  // The first candidate whose cooldown claim succeeds is the member to ring.
+  const claimed: HotLeadCallMember[] = [];
+  const claimMember = async (): Promise<boolean> => {
+    for (const candidate of candidates) {
+      if (await claim(cooldownKey(orgId, candidate.id), config.memberCooldownMinutes * MINUTE_S)) {
+        claimed.push(candidate);
+        return true;
+      }
+    }
+    return false;
+  };
+
   try {
     const steps: Array<[LimitDenial, () => Promise<boolean>]> = [
       ['duplicate_phone', () => claim(phoneMarkerKey(orgId, phoneE164), PHONE_WINDOW_S)],
-      ['owner_cooldown', () => claim(cooldownKey(orgId), config.memberCooldownMinutes * MINUTE_S)],
+      ['member_cooldown', claimMember],
       ['org_hourly_cap', () => count(hourlyCapKey(orgId, now), config.maxCallsPerHour, 2 * HOUR_S)],
       ['org_daily_cap', () => count(dailyCapKey(orgId, config.callingHours?.timezone ?? 'UTC', now), config.maxCallsPerDay, 2 * DAY_S)],
     ];
@@ -106,5 +124,5 @@ export async function reserveCallSlot(input: { orgId: string; phoneE164: string;
     await releaseAll();
     throw err;
   }
-  return { ok: true, release: releaseAll };
+  return { ok: true, member: claimed[0], release: releaseAll };
 }

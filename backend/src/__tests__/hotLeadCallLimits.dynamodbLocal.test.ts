@@ -102,12 +102,13 @@ suite('hot-lead call limit store against DynamoDB Local', () => {
   });
 
   it('a burst of 50 reservations for distinct phones in one org never exceeds the cap or the cooldown', async () => {
-    const config: any = { maxCallsPerHour: 3, maxCallsPerDay: 3, ownerCooldownMinutes: 1, quietHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' } };
+    const config: any = { maxCallsPerHour: 3, maxCallsPerDay: 3, memberCooldownMinutes: 1, callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' } };
     const now = new Date('2026-10-19T17:00:00Z');
+    const member = { id: 'maaaaaaa', name: 'Dana Lee', phone: '+14155550100', windows: [] };
     const results = await Promise.all(Array.from({ length: 50 }, (_v, i) =>
-      reserveCallSlot({ orgId: 'org-burst', phoneE164: `+1555555${String(1000 + i)}`, config, now })));
+      reserveCallSlot({ orgId: 'org-burst', phoneE164: `+1555555${String(1000 + i)}`, config, candidates: [member], now })));
     expect(results.filter(r => r.ok)).toHaveLength(1); // the cooldown admits one
-    expect(results.filter(r => !r.ok && r.reason === 'owner_cooldown')).toHaveLength(49);
+    expect(results.filter(r => !r.ok && r.reason === 'member_cooldown')).toHaveLength(49);
     const hour = await item('hlc#cap#h#org-burst#2026-10-19T17');
     expect(hour.calls).toBe(1); // every refused lead gave its counters back
   });

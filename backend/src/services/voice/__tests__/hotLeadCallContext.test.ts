@@ -5,15 +5,15 @@ jest.mock('../../db', () => ({
 }));
 import { crmDb, orgDb, userDb } from '../../db';
 import { resolveHotLeadCallContext } from '../hotLeadCallContext';
+import { teamMember } from '../../../__tests__/helpers/hotLeadCallFixtures';
 
 const mock = (fn: unknown) => fn as jest.Mock;
 const stored = {
   enabled: true,
-  destinationPhone: '+14155550100',
-  destinationVerifiedAt: '2026-01-01T00:00:00.000Z',
+  team: [teamMember('+14155550100')],
   twilioNumber: '+14155550111',
   announcedName: 'Acme Plumbing',
-  quietHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
+  callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
 };
 
 beforeEach(() => {
@@ -27,7 +27,7 @@ describe('resolveHotLeadCallContext', () => {
   it('resolves org, owner and the validated config from list ownership', async () => {
     const ctx = await resolveHotLeadCallContext('list-a');
     expect(ctx).toMatchObject({ orgId: 'org-a', ownerUserId: 'owner-a' });
-    expect(ctx?.config.destinationPhone).toBe('+14155550100');
+    expect(ctx?.config.team.map(m => m.phone)).toEqual(['+14155550100']);
     expect(crmDb.getLeadListById).toHaveBeenCalledWith('list-a', { consistentRead: true });
   });
 

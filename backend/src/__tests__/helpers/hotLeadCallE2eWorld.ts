@@ -22,6 +22,7 @@ import { FakeLimitStore } from '../../services/voice/fakeLimitStore';
 import { setLimitStoreForTests } from '../../services/voice/limitStore';
 import { FakeCrm, crmHolder } from './hotLeadCallFakeCrm';
 import { SignedFakeVoiceProvider, TwilioCaller, attrOf } from './hotLeadCallTwilioSim';
+import { teamMember } from './hotLeadCallFixtures';
 
 export const mock = (fn: unknown) => fn as jest.Mock;
 export const BASE = 'https://api.example.test';
@@ -34,8 +35,8 @@ const NOW = '2026-10-19T17:00:00.000Z'; // 12:00 in America/Chicago, inside the 
 const MINUTE_MS = 60_000;
 
 export const callConfig = {
-  enabled: true, destinationPhone: MEMBER_PHONE, destinationVerifiedAt: '2026-01-01T00:00:00.000Z', twilioNumber: TWILIO_NUMBER,
-  announcedName: 'Smith & Sons', quietHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
+  enabled: true, team: [teamMember(MEMBER_PHONE)], twilioNumber: TWILIO_NUMBER,
+  announcedName: 'Smith & Sons', callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
 };
 const slackConnection = { platform: 'slack', account_id: 'T123', config: { account_type: 'bot', access_token: 'xoxb-org-a', team_id: 'T123' } };
 const orgWithSlack = { orgId: 'org-a', hotLeadCall: callConfig, leadNotifications: { enabled: true, slackChannelId: 'C123' }, connected_accounts: [slackConnection] };

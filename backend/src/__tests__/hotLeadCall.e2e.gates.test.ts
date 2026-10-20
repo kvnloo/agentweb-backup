@@ -52,7 +52,7 @@ describe('nothing is dialed when a gate says no', () => {
     await submitLead('lead-a');
 
     expect(eventsOf('lead-a')).toEqual(['call.skipped']);
-    expect(skipReason('lead-a')).toEqual({ reason: 'outside_quiet_hours' });
+    expect(skipReason('lead-a')).toEqual({ reason: 'outside_calling_hours' });
     expect(world.provider.placedCalls).toEqual([]);
     expect(recordOf('lead-a')).toBeUndefined();
     expect(world.limits.keysTouched).toEqual([]);
@@ -80,10 +80,10 @@ describe('nothing is dialed when a gate says no', () => {
     await submitLead('lead-a', { phone: leadPhone(1) });
     await submitLead('lead-b', { phone: leadPhone(2) });
     expect(world.provider.placedCalls).toHaveLength(1);
-    expect(skipReason('lead-b')).toEqual({ reason: 'owner_cooldown' });
+    expect(skipReason('lead-b')).toEqual({ reason: 'member_cooldown' });
     expect(recordOf('lead-b')).toBeUndefined();
 
-    advanceMinutes(3); // default ownerCooldownMinutes is 2
+    advanceMinutes(3); // default memberCooldownMinutes is 2
     await submitLead('lead-c', { phone: leadPhone(3) });
     expect(world.provider.placedCalls).toHaveLength(2);
     expect(recordOf('lead-c')).toMatchObject({ state: 'member_ringing' });

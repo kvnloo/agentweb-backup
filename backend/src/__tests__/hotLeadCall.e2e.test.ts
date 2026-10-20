@@ -75,7 +75,7 @@ describe('a hot lead rings the member and, on 1, bridges the lead', () => {
     expect((await call.memberLegEnds('completed', '301')).status).toBe(200);
 
     expect(recordOf('lead-a')).toMatchObject({ state: 'finished', outcome: 'completed', memberCallSid: 'CA00000001', leadCallSid: 'CA00000002' });
-    expect([...(recordOf('lead-a')?.meteredLegs as string[])].sort()).toEqual(['lead', 'member']);
+    expect([...(recordOf('lead-a')?.meteredLegs as string[])].sort()).toEqual(['lead', 'member:1']);
     expect(eventsOf('lead-a')).toEqual(['call.initiated', 'call.member_answered', 'call.connected', 'call.completed']);
     expect(world.provider.placedCalls).toHaveLength(1);
     // Per-leg minutes, rounded up (125s -> 3, 301s -> 6), one idempotent usage event per leg's own CallSid.

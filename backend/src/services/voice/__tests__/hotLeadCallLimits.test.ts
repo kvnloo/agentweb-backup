@@ -2,11 +2,15 @@ import { FakeLimitStore } from '../fakeLimitStore';
 import { setLimitStoreForTests } from '../limitStore';
 import { cooldownKey, dailyCapKey, hourlyCapKey, isWithinCallWindow, phoneMarkerKey, reserveCallSlot } from '../hotLeadCallLimits';
 import type { HotLeadCallConfig } from '../../hotLeadCallConfig';
+import { teamMember } from '../../../__tests__/helpers/hotLeadCallFixtures';
 
 const config = {
   maxCallsPerHour: 6, maxCallsPerDay: 20, memberCooldownMinutes: 2,
   callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
 } as HotLeadCallConfig;
+const A = teamMember('+15555550100', { id: 'maaaaaaa' });
+const B = teamMember('+15555550101', { id: 'mbbbbbbb' });
+const candidates = [A];
 const NOW = new Date('2026-10-19T17:00:00Z');
 const PHONE = '+15555550100';
 let limits: FakeLimitStore;
@@ -66,36 +70,59 @@ describe('keys', () => {
     expect(hourlyCapKey('org-a', NOW)).toBe('hlc#cap#h#org-a#2026-10-19T17');
     expect(dailyCapKey('org-a', 'America/Chicago', new Date('2026-10-20T04:59:00Z'))).toBe('hlc#cap#d#org-a#2026-10-19');
     expect(dailyCapKey('org-a', 'America/Chicago', new Date('2026-10-20T05:00:00Z'))).toBe('hlc#cap#d#org-a#2026-10-20');
-    expect(cooldownKey('org-a')).toBe('hlc#cool#org-a');
+    expect(cooldownKey('org-a', 'maaaaaaa')).toBe('hlc#cool#org-a#maaaaaaa');
   });
 });
 
 describe('reserveCallSlot', () => {
   it('names the first limit that refuses, in the documented order', async () => {
-    const a = await reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, now: NOW });
+    const a = await reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, candidates, now: NOW });
     expect(a.ok).toBe(true);
-    const sameEverything = await reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, now: NOW });
+    const sameEverything = await reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, candidates, now: NOW });
     expect(sameEverything).toEqual({ ok: false, reason: 'duplicate_phone' });
-    const otherPhone = await reserveCallSlot({ orgId: 'o', phoneE164: '+15555550101', config, now: NOW });
-    expect(otherPhone).toEqual({ ok: false, reason: 'owner_cooldown' });
+    const otherPhone = await reserveCallSlot({ orgId: 'o', phoneE164: '+15555550101', config, candidates, now: NOW });
+    expect(otherPhone).toEqual({ ok: false, reason: 'member_cooldown' });
+  });
+
+  it('rings the first candidate and falls to the next while the first is in cooldown', async () => {
+    const both = [A, B];
+    const first = await reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, candidates: both, now: NOW });
+    expect(first.ok && first.member.id).toBe(A.id);
+    const second = await reserveCallSlot({ orgId: 'o', phoneE164: '+15555550101', config, candidates: both, now: NOW });
+    expect(second.ok && second.member.id).toBe(B.id);
+    const third = await reserveCallSlot({ orgId: 'o', phoneE164: '+15555550102', config, candidates: both, now: NOW });
+    expect(third).toEqual({ ok: false, reason: 'member_cooldown' });
+  });
+
+  it('keeps the cooldown per member: one member in cooldown does not block another', async () => {
+    await reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, candidates: [A], now: NOW });
+    const other = await reserveCallSlot({ orgId: 'o', phoneE164: '+15555550101', config, candidates: [B], now: NOW });
+    expect(other.ok).toBe(true);
+    expect(limits.claims.has(cooldownKey('o', A.id))).toBe(true);
+    expect(limits.claims.has(cooldownKey('o', B.id))).toBe(true);
+  });
+
+  it('refuses with member_cooldown and gives back the phone claim when there is no candidate', async () => {
+    expect(await reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, candidates: [], now: NOW })).toEqual({ ok: false, reason: 'member_cooldown' });
+    expect(limits.claims.size).toBe(0);
   });
 
   it('a claim expires exactly at its ttl and not before', async () => {
-    await reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, now: NOW });
+    await reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, candidates, now: NOW });
     const at = (s: number) => new Date(NOW.getTime() + s * 1000);
-    expect(await reserveCallSlot({ orgId: 'o', phoneE164: '+15555550101', config, now: at(119) })).toEqual({ ok: false, reason: 'owner_cooldown' });
-    expect((await reserveCallSlot({ orgId: 'o', phoneE164: '+15555550101', config, now: at(120) })).ok).toBe(true);
+    expect(await reserveCallSlot({ orgId: 'o', phoneE164: '+15555550101', config, candidates, now: at(119) })).toEqual({ ok: false, reason: 'member_cooldown' });
+    expect((await reserveCallSlot({ orgId: 'o', phoneE164: '+15555550101', config, candidates, now: at(120) })).ok).toBe(true);
   });
 
   it('stamps counters with an expiry beyond their window so the reaper never races a live window', async () => {
-    await reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, now: NOW });
+    await reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, candidates, now: NOW });
     const nowS = NOW.getTime() / 1000;
     expect(limits.counterExpiresAtS.get(hourlyCapKey('o', NOW))).toBeGreaterThanOrEqual(nowS + 3600);
     expect(limits.counterExpiresAtS.get(dailyCapKey('o', 'America/Chicago', NOW))).toBeGreaterThanOrEqual(nowS + 24 * 3600);
   });
 
   it('release returns counters and drops only its own claims', async () => {
-    const r = await reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, now: NOW });
+    const r = await reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, candidates, now: NOW });
     if (!r.ok) throw new Error('expected a reservation');
     await r.release();
     expect([...limits.counters.values()]).toEqual([0, 0]);
@@ -103,10 +130,10 @@ describe('reserveCallSlot', () => {
   });
 
   it('a stale release cannot drop a claim someone else took after expiry', async () => {
-    const r = await reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, now: NOW });
+    const r = await reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, candidates, now: NOW });
     if (!r.ok) throw new Error('expected a reservation');
     const later = new Date(NOW.getTime() + 25 * 3600 * 1000);
-    const second = await reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, now: later });
+    const second = await reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, candidates, now: later });
     expect(second.ok).toBe(true);
     await r.release();
     expect(limits.claims.has(phoneMarkerKey('o', PHONE))).toBe(true);
@@ -115,7 +142,7 @@ describe('reserveCallSlot', () => {
   it('rolls back what it took when a later step throws, and rethrows', async () => {
     const original = limits.incrementBelow.bind(limits);
     limits.incrementBelow = async (...args) => { if (args[0].includes('#cap#d#')) throw new Error('ddb down'); return original(...args); };
-    await expect(reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, now: NOW })).rejects.toThrow('ddb down');
+    await expect(reserveCallSlot({ orgId: 'o', phoneE164: PHONE, config, candidates, now: NOW })).rejects.toThrow('ddb down');
     expect([...limits.counters.values()]).toEqual([0]);
     expect(limits.claims.size).toBe(0);
   });

@@ -114,8 +114,8 @@ function buildOrgMarketStrategyForCopy(user: any): MarketStrategy | undefined {
 
 // All org routes require authentication
 /**
- * The org record as returned by update endpoints must not carry the hot-lead call internals: the owner's
- * destination phone and caller-number sid, the pending verification (code hash) or the purchase history.
+ * The org record as returned by update endpoints must not carry the hot-lead call internals: the team members'
+ * phones and verification times, the caller-number sid, the pending verification (code hash) or the purchase history.
  * Emma's settings tool is the only place they are read, masked.
  */
 function withoutHotLeadCallInternals<T extends object | null | undefined>(org: T): Omit<NonNullable<T>, 'hotLeadCall' | 'hotLeadCallVerification' | 'hotLeadCallProvisioning'> | T {

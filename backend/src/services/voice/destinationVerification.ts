@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import { orgDb, type Organization } from '../db';
 import { getJwtSecret } from '../../config/jwt';
-import { hotLeadCallConfigOf, maskPhone, type HotLeadCallConfig } from '../hotLeadCallConfig';
+import { hotLeadCallConfigOf, maskPhone, type HotLeadCallConfig, type HotLeadCallMember } from '../hotLeadCallConfig';
 import { isRecord } from '../leadNotificationAttribution';
 import { getVoiceProvider, VoiceCallError } from './voiceProvider';
 import { recordCallUsage } from './voiceUsage';
@@ -9,17 +9,17 @@ import { verificationCodeTwiml } from './twiml';
 import { isConditionalFailure, unchangedSince } from './setupWrites';
 
 /**
- * Destination-phone verification for the hot-lead auto-call (ENG-2271).
+ * Phone verification of a team member for the hot-lead auto-call (ENG-2271).
  *
  * Ordering: a caller number must be provisioned first, because Twilio only places calls from numbers the
- * account owns. The verification call rings the stored destinationPhone from that number and reads a random
- * code with inline TwiML (no webhook, no status callback); the owner types the code back to Emma.
+ * account owns. The verification call rings the member's stored phone from that number and reads a random
+ * code with inline TwiML (no webhook, no status callback); the member types the code back to Emma.
  *
  * The record lives in the org attribute `hotLeadCallVerification` and holds only an HMAC of the code, never
- * the code. The code must never be logged or returned: the owner hears it, nobody else may learn it.
+ * the code. The code must never be logged or returned: the member hears it, nobody else may learn it.
  *
  * Inherent limits, accepted: the call cannot tell a person from voicemail or an IVR, so a voicemail box that
- * plays the message back to its owner also passes verification; and the spoken code is visible in the Twilio
+ * plays the message back to its member also passes verification; and the spoken code is visible in the Twilio
  * call log to anyone with access to the Twilio account.
  *
  * The start history (`startedAt`) outlives a successful confirm and a phone change: after success the record
@@ -40,7 +40,7 @@ const CALL_TIMEOUT_SECONDS = 30;
 const VERIFICATION_CALL_ESTIMATED_SECONDS = 60;
 
 export interface HotLeadCallVerification {
-  /** E.164 phone the code was issued for; a code is worthless once destinationPhone differs. */
+  /** E.164 phone the code was issued for; a code is worthless once the member's phone differs. */
   phone: string;
   /** Hex HMAC-SHA256 of the code, bound to the org and phone. Null once verified: only the start history remains. */
   codeHash: string | null;
@@ -72,7 +72,22 @@ function hashCode(orgId: string, phone: string, code: string): string {
 
 const minutes = (ms: number) => Math.ceil(ms / 60_000);
 
-export async function startVerification(org: Organization, config: HotLeadCallConfig, userId: string) {
+/**
+ * Which member a verification call is about. Without a memberId the only member is meant; on a larger team the
+ * caller must say which one, because verifying the wrong person's phone would let an unverified number be rung.
+ */
+export function memberToVerify(config: HotLeadCallConfig, memberId?: string): HotLeadCallMember {
+  if (memberId === undefined) {
+    if (config.team.length > 1) throw new Error('Several team members are set up: say which one to verify (memberId).');
+    return config.team[0];
+  }
+  const member = config.team.find(m => m.id === memberId);
+  if (!member) throw new Error('That team member does not exist.');
+  return member;
+}
+
+export async function startVerification(org: Organization, config: HotLeadCallConfig, userId: string, memberId?: string) {
+  const member = memberToVerify(config, memberId);
   if (!config.twilioNumber) {
     throw new Error('Provision a caller number first (provision_hot_lead_call_number): the verification call is placed from it.');
   }
@@ -92,8 +107,8 @@ export async function startVerification(org: Organization, config: HotLeadCallCo
 
   const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
   const record: HotLeadCallVerification = {
-    phone: config.destinationPhone,
-    codeHash: hashCode(org.orgId, config.destinationPhone, code),
+    phone: member.phone,
+    codeHash: hashCode(org.orgId, member.phone, code),
     expiresAt: now + VERIFICATION_CODE_TTL_MS,
     attempts: 0,
     startedAt: [...recent, now],
@@ -110,11 +125,11 @@ export async function startVerification(org: Organization, config: HotLeadCallCo
   let callSid: string;
   try {
     ({ callSid } = await getVoiceProvider().placeCall({
-      to: config.destinationPhone, from: config.twilioNumber, twiml: verificationCodeTwiml(code), timeoutSeconds: CALL_TIMEOUT_SECONDS,
+      to: member.phone, from: config.twilioNumber, twiml: verificationCodeTwiml(code), timeoutSeconds: CALL_TIMEOUT_SECONDS,
     }));
   } catch (err) {
     if (err instanceof VoiceCallError && err.placed === 'no') {
-      throw new Error('The phone provider rejected the verification call, so no call was placed and nothing was charged. Check the destination number and try again in a few minutes.');
+      throw new Error('The phone provider rejected the verification call, so no call was placed and nothing was charged. Check the number and try again in a few minutes.');
     }
     throw new Error('The phone provider did not confirm whether the verification call was placed. If your phone does not ring within a minute or two, start again after the 2 minute wait.');
   }
@@ -125,7 +140,8 @@ export async function startVerification(org: Organization, config: HotLeadCallCo
   await recordCallUsage({ userId, callSid, leg: 'verify', durationSeconds: VERIFICATION_CALL_ESTIMATED_SECONDS });
 
   return {
-    destinationPhone: maskPhone(config.destinationPhone),
+    memberId: member.id,
+    memberPhone: maskPhone(member.phone),
     expiresInMinutes: VERIFICATION_CODE_TTL_MS / 60_000,
     maxAttempts: VERIFICATION_MAX_ATTEMPTS,
   };
@@ -137,12 +153,13 @@ function sameHash(expectedHex: string, actualHex: string): boolean {
   return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
 }
 
-export async function confirmVerification(org: Organization, config: HotLeadCallConfig, code: string) {
+export async function confirmVerification(org: Organization, config: HotLeadCallConfig, code: string, memberId?: string) {
+  const member = memberToVerify(config, memberId);
   const previousRaw = org.hotLeadCallVerification;
   const verification = verificationOf(previousRaw);
   if (!verification?.codeHash) throw new Error('No verification is in progress. Start one first (start_hot_lead_call_verification).');
-  if (verification.phone !== config.destinationPhone) {
-    throw new Error('The destination phone changed after the code was sent. Start a new verification.');
+  if (verification.phone !== member.phone) {
+    throw new Error('The code was sent to a different phone than this member\'s current one. Start a new verification.');
   }
   const expectedHash = verification.codeHash;
   const now = Date.now();
@@ -164,10 +181,11 @@ export async function confirmVerification(org: Organization, config: HotLeadCall
     throw new Error(left > 0 ? `That code is not correct. ${left} attempt(s) left.` : 'That code is not correct and no attempts are left. Start a new verification.');
   }
 
-  const verified = hotLeadCallConfigOf({ ...config, destinationVerifiedAt: new Date(now).toISOString() });
+  const verifiedAt = new Date(now).toISOString();
+  const verified = hotLeadCallConfigOf({ ...config, team: config.team.map(m => (m.id === member.id ? { ...m, verifiedAt } : m)) });
   if (!verified) throw new Error('Stored hot lead call settings are invalid');
   try {
-    // Unchanged hotLeadCall means destinationPhone is still the phone the code was issued for.
+    // Unchanged hotLeadCall means the member's phone is still the phone the code was issued for.
     // The record stays, without a pending code, so the start history keeps limiting later starts.
     const spent: HotLeadCallVerification = { phone: verification.phone, codeHash: null, expiresAt: 0, attempts: 0, startedAt: verification.startedAt };
     await orgDb.updateOrg(org.orgId, { hotLeadCall: verified, hotLeadCallVerification: spent }, {
@@ -177,5 +195,5 @@ export async function confirmVerification(org: Organization, config: HotLeadCall
     if (isConditionalFailure(err)) throw new Error('Your settings changed while the code was being checked. Start a new verification.');
     throw err;
   }
-  return { destinationPhone: maskPhone(verified.destinationPhone), verifiedAt: verified.destinationVerifiedAt };
+  return { memberId: member.id, memberPhone: maskPhone(member.phone), verifiedAt };
 }

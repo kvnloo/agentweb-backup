@@ -33,6 +33,7 @@ import { FakeLimitStore } from '../services/voice/fakeLimitStore';
 import { setLimitStoreForTests } from '../services/voice/limitStore';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
 import { FakeLeadCallStore } from '../services/voice/fakeLeadCallStore';
+import { teamMember, MEMBER_ID } from './helpers/hotLeadCallFixtures';
 
 const mock = (fn: unknown) => fn as jest.Mock;
 const MEMBER_PHONE = '+14155550100';
@@ -41,9 +42,9 @@ const LEAD_PHONE = '(212) 555-0142';
 const NOW = '2026-10-19T17:00:00.000Z';
 
 const config = {
-  enabled: true, destinationPhone: MEMBER_PHONE, destinationVerifiedAt: '2026-01-01T00:00:00.000Z',
+  enabled: true, team: [teamMember(MEMBER_PHONE)],
   twilioNumber: TWILIO_NUMBER, announcedName: 'Acme Plumbing',
-  quietHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
+  callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
 };
 
 let provider: FakeVoiceProvider;
@@ -209,6 +210,65 @@ describe('dispatchHotLeadCall gates', () => {
     expect(JSON.stringify(payload)).not.toMatch(/415/);
     await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill', { ...submission, submissionId: 'sub-2' });
     expect(enqueueCalls()[1][1]).not.toBe(key);
+  });
+});
+
+describe('team routing', () => {
+  const SECOND_PHONE = '+14155550122';
+  const morning = teamMember(MEMBER_PHONE, { id: 'mmorning', name: 'Early Bird', windows: [{ days: [0, 1, 2, 3, 4, 5, 6], start: '08:00', end: '12:00' }] });
+  const afternoon = teamMember(SECOND_PHONE, { id: 'mafterno', name: 'Late Lark', windows: [{ days: [0, 1, 2, 3, 4, 5, 6], start: '12:00', end: '21:00' }] });
+  // NOW is 12:00 CDT: the morning window has just closed and the afternoon one has just opened.
+  const useTeam = (team: unknown[]) => { org.hotLeadCall = { ...config, team }; };
+  const placedTo = () => provider.placedCalls.map(c => c.to);
+
+  it('records the attempt, the member and the members tried on the new record', async () => {
+    await processHotLeadCallJob(jobOf());
+    expect(store.record).toMatchObject({ attemptNo: 1, memberId: MEMBER_ID, triedMemberIds: [MEMBER_ID] });
+  });
+
+  it('rings the member whose window is open now, not the first on the team', async () => {
+    useTeam([morning, afternoon]);
+    await processHotLeadCallJob(jobOf());
+    expect(placedTo()).toEqual([SECOND_PHONE]);
+    expect(store.record).toMatchObject({ memberId: 'mafterno', triedMemberIds: ['mafterno'] });
+  });
+
+  it('rings the highest-priority member among those available', async () => {
+    useTeam([afternoon, teamMember('+14155550133', { id: 'mbackup0', windows: [{ days: [0, 1, 2, 3, 4, 5, 6], start: '09:00', end: '20:00' }] })]);
+    await processHotLeadCallJob(jobOf());
+    expect(placedTo()).toEqual([SECOND_PHONE]);
+  });
+
+  it('skips with no_one_available, at dispatch and in the job, when nobody has a window open', async () => {
+    useTeam([morning]);
+    await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
+    await processHotLeadCallJob(jobOf());
+    expect(enqueueCalls()).toHaveLength(0);
+    expect(provider.placedCalls).toHaveLength(0);
+    expect(store.record).toBeNull();
+    expect(limits.keysTouched).toEqual([]);
+    expect(store.events.map(e => e.detail?.reason)).toEqual(['no_one_available', 'no_one_available']);
+  });
+
+  it('never rings an unverified member', async () => {
+    useTeam([teamMember(MEMBER_PHONE, { verifiedAt: undefined }), teamMember(SECOND_PHONE, { id: 'mverifie', windows: afternoon.windows })]);
+    await processHotLeadCallJob(jobOf());
+    expect(placedTo()).toEqual([SECOND_PHONE]);
+  });
+
+  it('uses the next candidate when the first is in cooldown, and skips once all are', async () => {
+    useTeam([teamMember(MEMBER_PHONE), teamMember(SECOND_PHONE, { id: 'mother00' })]);
+    lead = { ...lead, leadId: 'lead-1' };
+    await processHotLeadCallJob(jobOf({ leadId: 'lead-1' }));
+    store.record = null; // the fake holds one record at a time
+    lead = { ...lead, leadId: 'lead-2', phone: '+12125550143' };
+    await processHotLeadCallJob(jobOf({ leadId: 'lead-2' }));
+    expect(placedTo()).toEqual([MEMBER_PHONE, SECOND_PHONE]);
+    store.record = null;
+    lead = { ...lead, leadId: 'lead-3', phone: '+12125550144' };
+    await processHotLeadCallJob(jobOf({ leadId: 'lead-3' }));
+    expect(placedTo()).toHaveLength(2);
+    expect(store.events.at(-1)).toEqual({ type: 'call.skipped', detail: { reason: 'member_cooldown' } });
   });
 });
 
@@ -391,36 +451,36 @@ describe('quiet hours gate', () => {
   };
 
   it.each([
-    ['07:59 CDT, one minute before the window', '2026-10-19T12:59:00Z', 'outside_quiet_hours'],
+    ['07:59 CDT, one minute before the window', '2026-10-19T12:59:00Z', 'outside_calling_hours'],
     ['08:00 CDT, the start is inclusive', '2026-10-19T13:00:00Z', 'called'],
     ['20:59:59 CDT, still inside', '2026-10-20T01:59:59Z', 'called'],
-    ['21:00 CDT, the end is exclusive', '2026-10-20T02:00:00Z', 'outside_quiet_hours'],
-    ['03:00 CDT at night', '2026-10-19T08:00:00Z', 'outside_quiet_hours'],
-    ['spring-forward day: 07:59 CDT (13:00 CST would be wrong)', '2026-03-08T12:59:00Z', 'outside_quiet_hours'],
+    ['21:00 CDT, the end is exclusive', '2026-10-20T02:00:00Z', 'outside_calling_hours'],
+    ['03:00 CDT at night', '2026-10-19T08:00:00Z', 'outside_calling_hours'],
+    ['spring-forward day: 07:59 CDT (13:00 CST would be wrong)', '2026-03-08T12:59:00Z', 'outside_calling_hours'],
     ['spring-forward day: 08:00 CDT', '2026-03-08T13:00:00Z', 'called'],
-    ['spring-forward day: 21:00 CDT', '2026-03-09T02:00:00Z', 'outside_quiet_hours'],
+    ['spring-forward day: 21:00 CDT', '2026-03-09T02:00:00Z', 'outside_calling_hours'],
     ['day before spring-forward: 08:00 CST', '2026-03-07T14:00:00Z', 'called'],
-    ['day before spring-forward: 07:59 CST', '2026-03-07T13:59:00Z', 'outside_quiet_hours'],
-    ['fall-back day: 07:59 CST', '2026-11-01T13:59:00Z', 'outside_quiet_hours'],
+    ['day before spring-forward: 07:59 CST', '2026-03-07T13:59:00Z', 'outside_calling_hours'],
+    ['fall-back day: 07:59 CST', '2026-11-01T13:59:00Z', 'outside_calling_hours'],
     ['fall-back day: 08:00 CST', '2026-11-01T14:00:00Z', 'called'],
-    ['fall-back day: 21:00 CST', '2026-11-02T03:00:00Z', 'outside_quiet_hours'],
+    ['fall-back day: 21:00 CST', '2026-11-02T03:00:00Z', 'outside_calling_hours'],
     ['fall-back day: 20:59 CST', '2026-11-02T02:59:00Z', 'called'],
   ])('%s', async (_name, iso, expected) => {
     expect(await at(iso)).toBe(expected);
   });
 
   it('handles a window that wraps past midnight (22:00-06:00)', async () => {
-    org.hotLeadCall = { ...config, quietHours: { start: '22:00', end: '06:00', timezone: 'America/Chicago' } };
-    expect(await at('2026-10-20T02:59:00Z')).toBe('outside_quiet_hours'); // 21:59 CDT
+    org.hotLeadCall = { ...config, callingHours: { start: '22:00', end: '06:00', timezone: 'America/Chicago' } };
+    expect(await at('2026-10-20T02:59:00Z')).toBe('outside_calling_hours'); // 21:59 CDT
     expect(await at('2026-10-20T03:00:00Z')).toBe('called'); // 22:00 CDT
     expect(await at('2026-10-20T10:59:00Z')).toBe('called'); // 05:59 CDT
-    expect(await at('2026-10-20T11:00:00Z')).toBe('outside_quiet_hours'); // 06:00 CDT
-    expect(await at('2026-10-19T17:00:00Z')).toBe('outside_quiet_hours'); // noon
+    expect(await at('2026-10-20T11:00:00Z')).toBe('outside_calling_hours'); // 06:00 CDT
+    expect(await at('2026-10-19T17:00:00Z')).toBe('outside_calling_hours'); // noon
   });
 
   it('uses the stored zone, not the server zone or the lead', async () => {
-    org.hotLeadCall = { ...config, quietHours: { start: '08:00', end: '21:00', timezone: 'Asia/Kolkata' } };
-    expect(await at('2026-10-19T17:00:00Z')).toBe('outside_quiet_hours'); // 22:30 IST (noon in Chicago)
+    org.hotLeadCall = { ...config, callingHours: { start: '08:00', end: '21:00', timezone: 'Asia/Kolkata' } };
+    expect(await at('2026-10-19T17:00:00Z')).toBe('outside_calling_hours'); // 22:30 IST (noon in Chicago)
     expect(await at('2026-10-19T07:00:00Z')).toBe('called'); // 12:30 IST (02:00 in Chicago)
   });
 
@@ -431,8 +491,8 @@ describe('quiet hours gate', () => {
     await processHotLeadCallJob(jobOf());
     expect(enqueueCalls()).toHaveLength(0);
     expect(store.events).toEqual([
-      { type: 'call.skipped', detail: { reason: 'outside_quiet_hours' } },
-      { type: 'call.skipped', detail: { reason: 'outside_quiet_hours' } },
+      { type: 'call.skipped', detail: { reason: 'outside_calling_hours' } },
+      { type: 'call.skipped', detail: { reason: 'outside_calling_hours' } },
     ]);
     expect(limits.keysTouched).toEqual([]);
     expect(store.record).toBeNull();
@@ -479,13 +539,13 @@ describe('abuse limits (reservation)', () => {
   it('refuses a second member call inside the cooldown and allows it at the boundary', async () => {
     expect(await submit('l1', FIRST)).toBe('called');
     later(1);
-    expect(await submit('l2', '+12125550143')).toBe('owner_cooldown');
+    expect(await submit('l2', '+12125550143')).toBe('member_cooldown');
     later(2);
     expect(await submit('l3', '+12125550144')).toBe('called');
   });
 
   it('enforces the hourly cap and gives the window back in the next hour', async () => {
-    org.hotLeadCall = { ...config, maxCallsPerHour: 2, ownerCooldownMinutes: 1 };
+    org.hotLeadCall = { ...config, maxCallsPerHour: 2, memberCooldownMinutes: 1 };
     expect(await submit('l1', '+12125550141')).toBe('called');
     later(2);
     expect(await submit('l2', '+12125550142')).toBe('called');
@@ -496,7 +556,7 @@ describe('abuse limits (reservation)', () => {
   });
 
   it('enforces the daily cap in the org\'s local day', async () => {
-    org.hotLeadCall = { ...config, maxCallsPerDay: 2, maxCallsPerHour: 30, ownerCooldownMinutes: 1 };
+    org.hotLeadCall = { ...config, maxCallsPerDay: 2, maxCallsPerHour: 30, memberCooldownMinutes: 1 };
     expect(await submit('l1', '+12125550141')).toBe('called');
     later(2);
     expect(await submit('l2', '+12125550142')).toBe('called');
@@ -508,7 +568,7 @@ describe('abuse limits (reservation)', () => {
   });
 
   it('keeps the lead\'s call slot when a limit refuses: no record is created', async () => {
-    org.hotLeadCall = { ...config, maxCallsPerHour: 1, ownerCooldownMinutes: 1 };
+    org.hotLeadCall = { ...config, maxCallsPerHour: 1, memberCooldownMinutes: 1 };
     await submit('l1', '+12125550141');
     later(2);
     store.record = null;
@@ -525,7 +585,7 @@ describe('abuse limits (reservation)', () => {
   });
 
   it('gives every slot back when a later limit refuses', async () => {
-    org.hotLeadCall = { ...config, maxCallsPerHour: 1, maxCallsPerDay: 5, ownerCooldownMinutes: 1 };
+    org.hotLeadCall = { ...config, maxCallsPerHour: 1, maxCallsPerDay: 5, memberCooldownMinutes: 1 };
     await submit('l1', '+12125550141');
     later(2);
     expect(await submit('l2', '+12125550142')).toBe('org_hourly_cap');
@@ -582,7 +642,7 @@ describe('abuse limits (reservation)', () => {
   });
 
   it('a burst of 100 simultaneous leads dials once (the cooldown) and never more than the cap', async () => {
-    org.hotLeadCall = { ...config, maxCallsPerHour: 3, ownerCooldownMinutes: 1 };
+    org.hotLeadCall = { ...config, maxCallsPerHour: 3, memberCooldownMinutes: 1 };
     const created = new Set<string>();
     mock(crmDb.getLeadById).mockImplementation(async (_l: string, id: string) => ({ ...lead, leadId: id, phone: `+1212555${String(1000 + Number(id.slice(1)))}` }));
     setLeadCallStoreForTests({
@@ -661,7 +721,7 @@ describe('timeline events stay bounded per lead', () => {
     const reasons: Array<[string, () => void]> = [
       ['invalid_phone', () => { lead.phone = '12345'; }],
       ['too_old', () => { lead.createdAt = '2026-10-19T16:00:00.000Z'; }],
-      ['outside_quiet_hours', () => { jest.setSystemTime(new Date('2026-10-19T08:00:00.000Z')); lead.createdAt = '2026-10-19T07:59:00.000Z'; }],
+      ['outside_calling_hours', () => { jest.setSystemTime(new Date('2026-10-19T08:00:00.000Z')); lead.createdAt = '2026-10-19T07:59:00.000Z'; }],
       ['not_entitled', () => { setHotLeadCallEntitledOverride(false); }],
       ['no_caller_number', () => { callerless.on = true; }],
       ['country_not_allowed', () => { org.hotLeadCall = { ...config, allowedCountries: ['CA'] }; }],

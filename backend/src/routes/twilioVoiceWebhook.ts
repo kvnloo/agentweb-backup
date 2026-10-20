@@ -217,7 +217,7 @@ const serverError = (res: Response): void => {
 const statusReplies: ErrorReplies = { invalid: ack, failed: serverError };
 
 /**
- * The member picked up but the call may no longer proceed (kill switch off, config disabled or invalid).
+ * The member picked up but the call may no longer proceed (kill switch off, config disabled or invalid, or the member removed or no longer verified).
  * Recording the outcome keeps the member leg's final callback from relabelling it 'member_no_answer'; the
  * leg is still metered as usual. The decision marker is only written from /gather.
  */
@@ -230,17 +230,23 @@ async function abortCall(q: CallQuery, record: HotLeadCallRecord, from: HotLeadC
   }
 }
 
-/** Live config + kill switch, else null (the caller hangs up). */
-async function liveContext(q: CallQuery): Promise<HotLeadCallContext | null> {
+/**
+ * Live config + kill switch, else null (the caller hangs up). A call whose member has since been removed from
+ * the team or lost their verification (phone changed) is no longer live either: nobody should be connected
+ * to a lead on a number the org no longer vouches for.
+ */
+async function liveContext(q: CallQuery, record: HotLeadCallRecord | null): Promise<HotLeadCallContext | null> {
   if (!(await isHotLeadCallEnabled())) return null;
-  return resolveHotLeadCallContext(q.listId);
+  const ctx = await resolveHotLeadCallContext(q.listId);
+  if (ctx && record && !ctx.config.team.some((m) => m.id === record.memberId && m.verifiedAt)) return null;
+  return ctx;
 }
 
 // ── /owner: the member picked up ─────────────────────────────────────────────
 
 router.post('/owner', guarded(async (_req, res, q, body) => {
-  const ctx = await liveContext(q);
   const loaded = await loadRecord(q);
+  const ctx = await liveContext(q, loaded);
   const record = loaded && (await withMemberSid(q, loaded, sidOf(body, 'CallSid')));
   // A missing record is deliberately NOT adopted (created here): the orchestrator creates the record
   // before it dials, so no record means this callback is not for a call we placed, and a call without
@@ -275,8 +281,8 @@ async function leadPhoneFor(q: CallQuery, ctx: HotLeadCallContext): Promise<stri
 }
 
 router.post('/gather', guarded(async (_req, res, q, body) => {
-  const ctx = await liveContext(q);
   const record = await loadRecord(q);
+  const ctx = await liveContext(q, record);
   if (!record?.memberCallSid || body.CallSid !== record.memberCallSid || record.state !== 'member_answered') return sendHangup(res);
   if (!ctx) {
     await abortCall(q, record, ['member_answered']);

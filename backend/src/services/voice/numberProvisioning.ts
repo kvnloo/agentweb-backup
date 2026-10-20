@@ -163,7 +163,7 @@ export async function provisionNumber(p: { org: Organization; config: HotLeadCal
     }
   }
 
-  return { callerNumber: maskPhone(bought.phoneNumber), enabled: next.enabled, destinationVerified: !!next.destinationVerifiedAt };
+  return { callerNumber: maskPhone(bought.phoneNumber), enabled: next.enabled, teamVerified: next.team.some(m => m.verifiedAt) };
 }
 
 /** Writes `change(current)` over the freshest stored config, retrying once if a concurrent edit wins. */

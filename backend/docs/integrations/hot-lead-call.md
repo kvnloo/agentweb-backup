@@ -1,9 +1,10 @@
 # Hot-lead auto-call (ENG-2271)
 
-When a landing-page form lead arrives with a phone number, AgentWeb phones the
-business owner from a Twilio number the org owns and says "New lead from
-<business name>. Are you available to take the call now? Press 1." On `1` it dials the lead and
-bridges the two. The outcome and every step are written to the lead's timeline.
+When a landing-page form lead arrives with a phone number, AgentWeb phones a
+member of the business's team from a Twilio number the org owns and says "New
+lead from <business name>. Are you available to take the call now? Press 1." On
+`1` it dials the lead and bridges the two. Which member is rung depends on the
+team's priority order and weekly availability windows (see [Who is rung](#who-is-rung)). The outcome and every step are written to the lead's timeline.
 
 It is a second subscriber to the same moment as the Slack lead alert
 ([lead-notifications.md](./lead-notifications.md)). It never delays, replaces or
@@ -11,7 +12,7 @@ suppresses that alert: a skipped or failed call leaves the Slack message as the
 fallback.
 
 Status of this document: written against the complete ENG-2271 feature branch,
-including the number-provisioning and destination-verification Emma tools.
+including the number-provisioning and team-member verification Emma tools.
 Everything marked **to confirm with Twilio** or listed under "Not
 verified" has never been run against a real Twilio account.
 
@@ -82,6 +83,18 @@ Branches (all end in `finished` once every leg that was dialed is metered):
 | Member hangs up while the lead is still ringing (`/dial` reports `canceled`) | `/dial`, then `finishIfComplete` | `bridge_unconfirmed` | `call.member_answered`, `call.completed` |
 | Bridge ended but `/dial` never reported a result | `finishIfComplete` | `bridge_unconfirmed` | `call.completed` |
 
+### Who is rung
+
+`selectHotLeadCallCandidates(config, at)` (`services/hotLeadCallRoster.ts`) is a
+pure function: the verified team members, in team order, who have a window open at
+`at` AND only when `at` is inside the calling hours. Weekday and `HH:MM` come from
+the same local instant in the calling-hours timezone, so DST days resolve on the
+clock the business sees. The orchestrator rings the first candidate that is not in
+its cooldown. With a team of one this is the single fixed phone of the first
+version. Today one attempt is made per lead; the record already carries
+`attemptNo`, `memberId` and `triedMemberIds` for the multi-attempt flow, and the
+state `between_attempts` is declared but not entered yet.
+
 The leg-metering rule behind "finished": the store refuses to move a terminal
 record, so each leg is metered while the record is still live and the LAST leg
 to be metered performs the terminal transition. A record therefore stays live
@@ -96,10 +109,11 @@ All paths are under `backend/src/`.
 | Hook (second subscriber to the lead-created moment) | `services/orgLeadNotificationService.ts` `dispatchLeadCreated` calls `dispatchHotLeadCall` first, fire-and-forget. The batch path `dispatchLeadsCreated` deliberately does not. |
 | Orchestrator: gates, limits, create-first, place call | `services/hotLeadCallService.ts` (queue source `hot_lead_call`, `maxAttempts: 1`, registered in `app.ts`) |
 | Org config type and strict validator | `services/hotLeadCallConfig.ts` |
+| Who to ring at a given time (pure routing and the portal preview) | `services/hotLeadCallRoster.ts` |
 | Org/list/owner routing for the call | `services/voice/hotLeadCallContext.ts` |
 | Global kill switch | `services/voice/hotLeadCallMode.ts` |
 | Plan entitlement (the `hot_lead_call` subscription feature) | `services/voice/hotLeadCallEntitlement.ts` |
-| Quiet hours, abuse limits, slot reservation | `services/voice/hotLeadCallLimits.ts`, `services/voice/limitStore.ts` (DynamoDB), `services/voice/fakeLimitStore.ts` (tests) |
+| Abuse limits, per-member cooldown, slot reservation | `services/voice/hotLeadCallLimits.ts`, `services/voice/limitStore.ts` (DynamoDB), `services/voice/fakeLimitStore.ts` (tests) |
 | Call record (state machine storage) and timeline events | `services/voice/leadCallStore.ts`, `services/voice/leadCallStore.types.ts` |
 | Twilio seam (`placeCall`, `buyNumber`, `releaseNumber`, `validateSignature`) | `services/voice/voiceProvider.ts` (the only file that imports `twilio`), `services/voice/fakeVoiceProvider.ts` |
 | Webhook URLs | `services/voice/voiceUrls.ts` |
@@ -109,12 +123,12 @@ All paths are under `backend/src/`.
 | Rate card and runtime rate overrides | `utils/vendorRateCard.ts`, `routes/adminVendorRates.ts` |
 | Twilio credentials | `utils/secretsManager.ts` `getTwilioCredentials` |
 | Emma settings tools | `emma/hotLeadCallTools.ts` |
-| Emma setup tools (number provisioning, destination verification) | `emma/hotLeadCallSetupTools.ts`, `services/voice/numberProvisioning.ts`, `services/voice/destinationVerification.ts`, `services/voice/setupWrites.ts` |
+| Emma setup tools (number provisioning, team-member verification) | `emma/hotLeadCallSetupTools.ts`, `services/voice/numberProvisioning.ts`, `services/voice/destinationVerification.ts`, `services/voice/setupWrites.ts` |
 | Admin UI for rates | `partner-portal/src/components/admin/VendorRatesTab.tsx` (Admin > Revenue & billing > Vendor Rates) |
 
 Tests worth knowing: `__tests__/hotLeadCall.e2e.test.ts` (the calls: real
 orchestrator + real webhooks + real store on an in-memory DB fake, signed with
-Twilio's own HMAC) and `__tests__/hotLeadCall.e2e.gates.test.ts` (gates, quiet
+Twilio's own HMAC) and `__tests__/hotLeadCall.e2e.gates.test.ts` (gates, calling
 hours, dedupe, cooldown, caps and silent refusals), sharing
 `__tests__/helpers/hotLeadCallE2eWorld.ts`; `__tests__/hotLeadCallService.test.ts`,
 `__tests__/twilioVoiceWebhook.test.ts`, `__tests__/hotLeadCall.flagOff.test.ts`
@@ -152,17 +166,22 @@ call, Slack only"). Validation applies to every read, including the webhooks.
 
 | Field | Rule |
 | --- | --- |
-| `enabled` | boolean, required. Enabled requires `destinationVerifiedAt`, `twilioNumber` and `quietHours`; a half-configured org can only be saved disabled. |
-| `destinationPhone` | required. Canonical E.164, US or CA only (Puerto Rico, Guam and other +1 territories refused); premium, toll-free, personal, shared-cost, UAN and VOIP number types refused. Must differ from `twilioNumber`. |
-| `destinationVerifiedAt` | system-managed, ISO timestamp (set by confirming the verification code). |
+| `enabled` | boolean, required. Enabled requires at least one verified team member, `twilioNumber` and `callingHours`; a half-configured org can only be saved disabled. |
+| `team` | required, 1 to 10 members; the order is the priority (first is rung first). Unknown keys are refused at every level. Member ids and phones are unique within the team. |
+| `team[].id` | `m` + 7 lowercase letters or digits, generated by the server (`generateMemberId`), never chosen by a client. Call records and cooldown keys refer to it. |
+| `team[].name` | 1-40 chars of letters, digits, space and `. , & ' -`. Shown in tool output and the portal, never spoken. |
+| `team[].phone` | Canonical E.164, US or CA only (Puerto Rico, Guam and other +1 territories refused); premium, toll-free, personal, shared-cost, UAN and VOIP number types refused. Must differ from `twilioNumber`. |
+| `team[].verifiedAt` | system-managed, ISO timestamp (set by confirming the verification code, cleared when that member's phone changes). |
+| `team[].windows` | 1 to 7 weekly availability windows `{ days, start, end }`: `days` are 0 (Sunday) to 6 (Saturday), unique, 1 to 7 of them; `start` and `end` are `HH:MM` on the `callingHours` clock; `end` may be `24:00`, `start` must be before `end` (a window never wraps midnight: overnight is two windows). Start inclusive, end exclusive. |
 | `twilioNumber`, `twilioNumberSid` | system-managed. Same phone rules; sid must match `PN` + 32 hex. |
 | `leadTypes` | non-empty subset of the lead origins; default `["form_fill"]`. In practice the orchestrator only ever calls for `form_fill`; other origins return before any read. |
 | `maxAgeMinutes` | integer 1-60, default 10. A lead older than this when the job runs (`submittedAt`, else lead `createdAt`; a missing or unparseable time fails closed) is skipped as `too_old`. |
 | `maxCallsPerHour` | integer 1-30, default 6. |
 | `maxCallsPerDay` | integer 1-100, default 20. |
-| `ownerCooldownMinutes` | integer 1-60, default 2. |
+| `memberCooldownMinutes` | integer 1-60, default 2. Per team member: a member who was just rung is passed over for the next available one. |
+| `maxAttemptsPerLead` | integer 1-5, default 3. How many members may be tried for one lead (stored now, used by the multi-attempt flow). |
 | `announcedName` | required, trimmed, 1-60 chars of letters, digits, space and `. , & ' -`. Spoken in `<Say>`; XML-escaped by the TwiML builder. |
-| `quietHours` | `{ start, end, timezone }`, `HH:MM` 24h, `start != end`, defaults 08:00 / 21:00. It is the window in which calls ARE allowed, in the org's IANA `Area/Location` timezone (UTC, abbreviations and `Etc/` refused). `start > end` wraps past midnight. Start inclusive, end exclusive, minute granularity. The lead's own timezone is not considered. Required to enable. |
+| `callingHours` | `{ start, end, timezone }`, `HH:MM` 24h, `start != end`, defaults 08:00 / 21:00. It is the window in which calls ARE allowed, in the org's IANA `Area/Location` timezone (UTC, abbreviations and `Etc/` refused). `start > end` wraps past midnight. Start inclusive, end exclusive, minute granularity. The lead's own timezone is not considered. Required to enable. Member windows are read on this same clock. |
 | `allowedCountries` | non-empty subset of `["US","CA"]` (default both); the lead's number must resolve to one of them. |
 
 The lead's number is read from the lead row at dispatch AND again at bridge time;
@@ -176,21 +195,24 @@ Registered as foundation tools. Org membership comes from the authenticated user
 
 Settings (merged):
 
-- `get_hot_lead_call_settings({})` returns `configured`, `enabled`,
-  `destinationPhone` (masked to the last 4 digits), `destinationVerified`,
-  `callerNumberAssigned`, `leadTypes`, `announcedName`, `quietHours`,
-  `allowedCountries` and the four limits (defaults when unset). No SIDs or full
-  numbers.
-- `update_hot_lead_call_settings({...})` takes any of `enabled`,
-  `destinationPhone`, `leadTypes`, the four limit fields, `announcedName`,
-  `quietHours`, `allowedCountries`. `destinationVerifiedAt`, `twilioNumber` and
-  `twilioNumberSid` are refused (system-managed). The first save needs
-  `destinationPhone` and `announcedName`. Changing `destinationPhone` drops the
-  verification and forces `enabled:false`. Writes are conditional on the stored
+- `get_hot_lead_call_settings({})` returns `configured`, `enabled`, the `team`
+  (each member's `id`, `name`, phone masked to the last 4 digits, `verified` and
+  `windows`), `callerNumberAssigned`, `leadTypes`, `announcedName`,
+  `callingHours`, `allowedCountries` and the limits (defaults when unset). No
+  SIDs or full numbers.
+- `update_hot_lead_call_settings({...})` takes any of `enabled`, `memberPhone`,
+  `memberName`, `leadTypes`, the limit fields (including `maxAttemptsPerLead`),
+  `announcedName`, `callingHours`, `allowedCountries`. `twilioNumber` and
+  `twilioNumberSid` are refused (system-managed); the team, member ids,
+  `verifiedAt` and windows cannot be sent. Through chat a team of ONE is edited:
+  the first save needs `memberPhone` and `announcedName` and creates the member
+  (available whenever the calling hours are open); with several members the tool
+  refuses `memberPhone`/`memberName` and changes only the other settings.
+  Changing the member's phone drops its verification and forces `enabled:false`. Writes are conditional on the stored
   attribute being unchanged since it was read, so a concurrent edit fails
   instead of clobbering.
 
-Setup tools (number provisioning and destination verification). They need `org:configure`, work while the global
+Setup tools (number provisioning and team-member verification). They need `org:configure`, work while the global
 kill switch is off, and are blocked in shared sessions. The three that spend
 money or cannot be undone (`provision_hot_lead_call_number`,
 `release_hot_lead_call_number`, `start_hot_lead_call_verification`) also REFUSE
@@ -212,7 +234,7 @@ turns) with "This needs a person to confirm in an interactive chat".
 - `release_hot_lead_call_number({})` turns calling off first, releases the
   number (a 404 from Twilio counts as already gone; any other failure keeps the
   number assigned), then clears `twilioNumber`/`twilioNumberSid`.
-- `start_hot_lead_call_verification({})` rings the SAVED destination from the
+- `start_hot_lead_call_verification({memberId?})` rings the SAVED phone of a member (the only member, or the one named by `memberId` on a larger team) from the
   org number and reads a 6-digit code (inline TwiML, no webhook). The code is
   stored only as an HMAC in `hotLeadCallVerification`, valid 10 minutes, 5
   attempts; one start per 2 minutes, 5 per day. The start history is kept after a
@@ -220,18 +242,19 @@ turns) with "This needs a person to confirm in an interactive chat".
   the limits. A corrupt `hotLeadCallVerification` makes start refuse ("Stored
   verification state is invalid. Contact support."). Metered as one estimated
   minute (leg `verify`).
-- `confirm_hot_lead_call_verification({code})` checks the code and writes
-  `destinationVerifiedAt`.
+- `confirm_hot_lead_call_verification({code, memberId?})` checks the code and
+  writes that member's `verifiedAt`. The verification record is still a single
+  record for the org, so starting one for another member replaces a pending code.
 
 Order of setup, which the tool text also teaches Emma:
 
-1. `update_hot_lead_call_settings`: destination phone, announced name, quiet
+1. `update_hot_lead_call_settings`: member phone, announced name, calling
    hours (with timezone), optionally lead types and limits. Saved disabled.
 2. `provision_hot_lead_call_number` (spends money, needs explicit user consent).
 3. `start_hot_lead_call_verification`, then `confirm_hot_lead_call_verification`
    with the code the member heard.
-4. `update_hot_lead_call_settings({enabled: true})`. Refused unless the phone is
-   verified, a number is assigned and quiet hours are set.
+4. `update_hot_lead_call_settings({enabled: true})`. Refused unless a member's
+   phone is verified, a number is assigned and calling hours are set.
 
 Cost bound through these tools: 2 purchases at the card's $1.15 plus 5
 verification calls at $0.014 is about $2.37 per org per day at the provisional
@@ -421,8 +444,9 @@ back if the record is not created:
    not a smoke-test lead, not a progressive-capture draft, has a phone.
 2. Skip gates with a `call.skipped` event: `no_caller_number`, `unsafe_id` (list
    or lead id outside `[A-Za-z0-9_.:-]{1,200}`, which the webhooks would
-   reject), `invalid_phone`, `country_not_allowed`, `outside_quiet_hours`,
-   `too_old`, then `not_entitled` (the org owner's subscription tier does not
+   reject), `invalid_phone`, `country_not_allowed`, `outside_calling_hours`,
+   `no_one_available` (inside the calling hours, but no verified member has an
+   open window), `too_old`, then `not_entitled` (the org owner's subscription tier does not
    include the `hot_lead_call` feature; see [Plan entitlement](#plan-entitlement)).
    To stop an anonymous visitor growing a lead row by resubmitting, a lead gets
    at most one `call.skipped` event per distinct reason and at most 5 in total
@@ -446,7 +470,7 @@ Known limits, accepted:
 - Phone-rotating bots can consume the org's hourly and daily caps; the Slack
   alert still fires.
 - Whoever submits a number first suppresses calls for that number for 24h.
-- The cooldown skips a second genuine lead within `ownerCooldownMinutes`.
+- The cooldown skips a member who took a call within `memberCooldownMinutes` in favour of the next available one; when every candidate is in cooldown the lead is skipped as `member_cooldown`.
 - A process crash between reserving and `create` leaves the 24h phone marker and
   the cooldown claim held with no record: a repeat of that number is refused as
   `duplicate_phone` with a silent timeline.
@@ -455,8 +479,8 @@ Known limits, accepted:
 - `confirm: true` on the provisioning tool is advisory. The real controls are
   the per-org purchase and release caps.
 - Two orgs configured with the same member phone can ring that person
-  simultaneously: caps and cooldown are per org.
-- Prompt injection: the destination phone and settings are changed through Emma
+  simultaneously: caps are per org and the cooldown is per member per org.
+- Prompt injection: the team phones and settings are changed through Emma
   tools, so text the model reads (a lead's form field, a web page) could try to
   steer `update_hot_lead_call_settings` or `confirm_hot_lead_call_verification`.
   The human-approval gate (see Known follow-ups) is a general-availability
@@ -589,7 +613,7 @@ Do not let Emma retry an ambiguous purchase.
 | Symptom | Likely cause |
 | --- | --- |
 | Member is called but hears "application error" | The `/owner` fetch failed: `BACKEND_URL` wrong or unreachable (check scheme and host), or credentials could not be loaded (503), or the signature failed (401). Twilio's call log shows the webhook response. |
-| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_quiet_hours`, `duplicate_phone` and `member_cooldown` are expected behavior. |
+| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_calling_hours`, `no_one_available`, `duplicate_phone` and `member_cooldown` are expected behavior. |
 | No event and no call | Kill switch off, org disabled or config invalid, lead not `form_fill`, smoke-test lead, draft lead, or no phone: all silent by design. |
 | `call.skipped` `limits_unavailable` | `AW-MCPSessions` missing, IAM denied, or throttled. Fails closed. |
 | `no owner to bill for list` in logs | The list owner could not be resolved; the leg was not metered and `/status` answers 500. |

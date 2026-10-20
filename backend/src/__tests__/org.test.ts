@@ -463,7 +463,7 @@ describe('Organization routes', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        hotLeadCall: { destinationPhone: '+15555550100', twilioNumberSid: 'PN' + 'a'.repeat(32) },
+        hotLeadCall: { team: [{ id: 'maaaaaaa', phone: '+15555550100' }], twilioNumberSid: 'PN' + 'a'.repeat(32) },
         hotLeadCallVerification: { codeHash: 'deadbeef' },
         hotLeadCallProvisioning: { purchases: ['2026-10-19T00:00:00.000Z'] },
       };

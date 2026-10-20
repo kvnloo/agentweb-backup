@@ -38,6 +38,7 @@ import { FakeVoiceProvider } from '../services/voice/fakeVoiceProvider';
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
 import { FakeLimitStore } from '../services/voice/fakeLimitStore';
 import { setLimitStoreForTests } from '../services/voice/limitStore';
+import { teamMember } from './helpers/hotLeadCallFixtures';
 
 const mock = (fn: unknown) => fn as jest.Mock;
 const flush = async () => { for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve)); };
@@ -46,8 +47,8 @@ const slackOrg = {
   connected_accounts: [{ platform: 'slack', account_id: 'T123', config: { account_type: 'bot', access_token: 'xoxb-org-a', team_id: 'T123' } }],
 };
 const callConfig = {
-  enabled: true, destinationPhone: '+14155550100', destinationVerifiedAt: '2026-01-01T00:00:00.000Z', twilioNumber: '+14155550111',
-  announcedName: 'Acme', quietHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
+  enabled: true, team: [teamMember('+14155550100')], twilioNumber: '+14155550111',
+  announcedName: 'Acme', callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
 };
 const originalJwtSecret = process.env.JWT_SECRET;
 afterAll(() => {

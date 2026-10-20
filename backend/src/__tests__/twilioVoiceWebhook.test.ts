@@ -28,6 +28,7 @@ import type { HotLeadCallRecord, HotLeadCallState } from '../services/voice/lead
 import * as twiml from '../services/voice/twiml';
 import { buildVoiceWebhookUrl } from '../services/voice/voiceUrls';
 import twilioVoiceWebhookRoutes, { twilioVoiceBodyParser } from '../routes/twilioVoiceWebhook';
+import { teamMember, MEMBER_ID } from './helpers/hotLeadCallFixtures';
 
 const mock = (fn: unknown) => fn as jest.Mock;
 const BASE = 'https://api.example.test';
@@ -44,11 +45,10 @@ const QUERY = `listId=${LIST}&leadId=${LEAD}&jobKey=${JOB}`;
 
 const orgConfig = {
   enabled: true,
-  destinationPhone: MEMBER_PHONE,
-  destinationVerifiedAt: '2026-01-01T00:00:00.000Z',
+  team: [teamMember(MEMBER_PHONE)],
   twilioNumber: TWILIO_NUMBER,
   announcedName: 'Smith & Sons',
-  quietHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
+  callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
 };
 
 let store: FakeLeadCallStore;
@@ -58,7 +58,7 @@ let logSpy: jest.SpyInstance[];
 function seed(state: HotLeadCallState, extra: Partial<HotLeadCallRecord> = {}) {
   store.record = {
     state, jobKey: JOB, startedAt: '2026-10-19T00:00:00.000Z', updatedAt: '2026-10-19T00:00:00.000Z',
-    memberCallSid: MEMBER_SID, meteredLegs: [], lastSequence: {}, ...extra,
+    memberCallSid: MEMBER_SID, attemptNo: 1, memberId: MEMBER_ID, triedMemberIds: [MEMBER_ID], meteredLegs: [], lastSequence: {}, ...extra,
   };
 }
 
@@ -754,6 +754,12 @@ describe('POST /status', () => {
     expect(Number.isNaN(usage()[0].durationSeconds)).toBe(true);
   });
 
+  it('names the member leg after the attempt it belongs to', async () => {
+    seed('member_ringing', { attemptNo: 2, memberId: MEMBER_ID, triedMemberIds: ['mother00', MEMBER_ID] });
+    await memberStatus('no-answer', { CallDuration: '0', SequenceNumber: '1' });
+    expect(store.record).toMatchObject({ state: 'finished', meteredLegs: ['member:2'] });
+  });
+
   it('meters each leg with its own CallSid and the list owner as the billed user', async () => {
     seed('connected', { leadCallSid: LEAD_SID });
     await memberStatus('completed', { CallDuration: '61' });
@@ -1021,6 +1027,41 @@ describe('aborted calls', () => {
     expect(store.record).toMatchObject({ state: 'finished', outcome: 'aborted' });
   });
 
+  it.each([
+    ['removed from the team', () => ({ team: [teamMember('+14155550199', { id: 'mother00' })] })],
+    ['no longer verified (phone changed)', () => ({ team: [teamMember(MEMBER_PHONE, { verifiedAt: undefined }), teamMember('+14155550199', { id: 'mother00' })] })],
+  ])('/owner hangs up and aborts when the member being rung was %s', async (_label, change) => {
+    seed('member_ringing');
+    mock(orgDb.getOrgById).mockResolvedValue({ orgId: 'org-a', hotLeadCall: { ...orgConfig, ...change() } });
+    const res = await memberPrompt();
+    expect(res.text).not.toContain('<Gather');
+    expect(store.record).toMatchObject({ state: 'member_answered', outcome: 'aborted' });
+    expect(store.eventTypes()).toEqual(['call.failed']);
+  });
+
+  it('/gather never dials the lead when the member was removed after answering', async () => {
+    seed('member_answered');
+    mock(orgDb.getOrgById).mockResolvedValue({ orgId: 'org-a', hotLeadCall: { ...orgConfig, team: [teamMember('+14155550199', { id: 'mother00' })] } });
+    const res = await gather('1');
+    expect(res.text).not.toContain('<Dial');
+    expect(store.record).toMatchObject({ state: 'member_answered', outcome: 'aborted' });
+  });
+
+  it('serves the prompt for the member of the record even when another member leads the team', async () => {
+    seed('member_ringing', { memberId: 'mother00' });
+    mock(orgDb.getOrgById).mockResolvedValue({
+      orgId: 'org-a',
+      hotLeadCall: { ...orgConfig, team: [teamMember(MEMBER_PHONE), teamMember('+14155550199', { id: 'mother00' })] },
+    });
+    expect((await memberPrompt()).text).toContain('<Gather');
+  });
+
+  it('hangs up on a record that names no member (it cannot be tied to the team)', async () => {
+    seed('member_ringing', { memberId: undefined });
+    const res = await memberPrompt();
+    expect(res.text).not.toContain('<Gather');
+  });
+
   it('does not abort a record that does not belong to the callback (wrong job key)', async () => {
     seed('member_ringing');
     setHotLeadCallEnabledOverride(false);
@@ -1108,7 +1149,7 @@ describe('privacy', () => {
   it('no phone number appears in any log, timeline event or non-Dial response across a full call', async () => {
     seed('member_ringing');
     const bodies: string[] = [];
-    bodies.push((await member({ From: TWILIO_NUMBER, To: MEMBER_PHONE })).text);
+    bodies.push((await memberPrompt({ From: TWILIO_NUMBER, To: MEMBER_PHONE })).text);
     bodies.push((await gather('2', { From: TWILIO_NUMBER, To: MEMBER_PHONE })).text);
     seed('member_answered');
     const connect = (await gather('1', { From: TWILIO_NUMBER, To: MEMBER_PHONE })).text;
