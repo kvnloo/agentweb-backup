@@ -9,8 +9,10 @@ import type { LeadOrigin } from './leadNotificationConfig';
 import { VoiceCallError, getVoiceProvider, scrubErrorText } from './voice/voiceProvider';
 import { buildVoiceWebhookUrl, isWebhookSafeId } from './voice/voiceUrls';
 import { isHotLeadCallEnabled } from './voice/hotLeadCallMode';
+import { isHotLeadCallEntitled } from './voice/hotLeadCallEntitlement';
 import { resolveHotLeadCallContext, type HotLeadCallContext } from './voice/hotLeadCallContext';
 import { getLeadCallStore } from './voice/leadCallStore';
+import type { LeadCallStore } from './voice/leadCallStore.types';
 import { isWithinCallWindow, reserveCallSlot, type Reservation } from './voice/hotLeadCallLimits';
 // This file must not import orgLeadNotificationService: that module calls dispatchHotLeadCall.
 
@@ -28,6 +30,17 @@ type Submission = { submissionId: string; submittedAt: string };
 const SOURCE = 'hot_lead_call';
 const OWNER_RING_TIMEOUT_SECONDS = 25;
 const MINUTE_MS = 60_000;
+// Anyone can submit a landing-page form, and again, so refusals must not grow the lead row without bound:
+// one `call.skipped` event per distinct reason, and five in all.
+const MAX_SKIP_EVENTS_PER_LEAD = 5;
+// Two dispatches racing for the same lead: the loser trips the phone marker before the winner's call record
+// is visible. One short re-check tells that apart from a genuinely different lead sharing the number.
+let sameLeadRecheckMs = 200;
+
+/** Tests only. Pass null to restore the default wait. */
+export function setSameLeadRecheckDelayForTests(ms: number | null): void {
+  sameLeadRecheckMs = ms ?? 200;
+}
 
 const keyOf = (job: HotLeadCallJob): string =>
   createHash('sha256').update(JSON.stringify([job.orgId, job.listId, job.leadId, ...(job.submissionId ? [job.submissionId] : [])])).digest('hex');
@@ -59,12 +72,28 @@ const SKIP_GATES: Array<(g: GateInput) => string | null> = [
   },
 ];
 
+/** Records `call.skipped` unless this lead's timeline already has that reason or the per-lead cap. Never throws. */
+async function recordSkip(lead: LeadRow, reason: string): Promise<void> {
+  const skipped: Array<{ eventData?: { reason?: unknown } }> = (Array.isArray(lead.engagements) ? lead.engagements : []).filter(
+    (e: { eventType?: unknown }) => e?.eventType === 'call.skipped',
+  );
+  if (skipped.length >= MAX_SKIP_EVENTS_PER_LEAD || skipped.some((e) => e.eventData?.reason === reason)) return;
+  await getLeadCallStore().addEvent(lead.listId, lead.leadId, 'call.skipped', { reason });
+}
+
+/** True when this lead already has (or, after one short wait, gets) a call record. */
+async function hasCallRecord(store: LeadCallStore, listId: string, leadId: string): Promise<boolean> {
+  if (await store.get(listId, leadId)) return true;
+  await new Promise((resolve) => setTimeout(resolve, sameLeadRecheckMs));
+  return !!(await store.get(listId, leadId));
+}
+
 /**
  * Everything that decides whether this lead should ring the owner, cheapest check first. Runs at
  * dispatch and again in the job (state can change in between). Returns null for "do nothing";
  * refusals worth showing on the timeline also record `call.skipped`.
  */
-async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: HotLeadCallJob; ctx: HotLeadCallContext; phone: string } | null> {
+async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: HotLeadCallJob; ctx: HotLeadCallContext; phone: string; lead: LeadRow } | null> {
   const { listId, leadId, origin } = input;
   if (origin !== 'form_fill') return null;
   const ctx = await resolveHotLeadCallContext(listId);
@@ -84,12 +113,17 @@ async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: H
   for (const gate of SKIP_GATES) {
     const reason = gate({ config: ctx.config, lead, job });
     if (reason) {
-      await getLeadCallStore().addEvent(listId, leadId, 'call.skipped', { reason });
+      await recordSkip(lead, reason);
       return null;
     }
   }
+  // After the stateless gates: it reads the org owner's plan. An org that lost its plan stops dialing here.
+  if (!await isHotLeadCallEntitled({ ownerUserId: ctx.orgOwnerUserId })) {
+    await recordSkip(lead, 'not_entitled');
+    return null;
+  }
   const callable = callableLeadPhone(lead.phone, ctx.config);
-  return 'phone' in callable ? { job, ctx, phone: callable.phone } : null; // always set: the phone gate refused otherwise
+  return 'phone' in callable ? { job, ctx, phone: callable.phone, lead } : null; // always set: the phone gate refused otherwise
 }
 
 /**
@@ -122,13 +156,14 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
     // Fail closed (nothing dialed, no record) but leave a trace on the lead: a missing table or secret is an ops problem.
     console.warn('[hotLeadCall] call limits unavailable', { listId, leadId, error: errorText(err) });
     // The timeline write is best-effort: it must never mask the original failure.
-    await store.addEvent(listId, leadId, 'call.skipped', { reason: 'limits_unavailable' }).catch(() => undefined);
+    await recordSkip(reviewed.lead, 'limits_unavailable').catch(() => undefined);
     throw err;
   }
   if (!slot.ok) {
-    // A repeat submission of a lead that was already called trips the phone marker; its timeline has the call.
-    if (slot.reason === 'duplicate_phone' && await store.get(listId, leadId)) return;
-    await store.addEvent(listId, leadId, 'call.skipped', { reason: slot.reason });
+    // A repeat submission of a lead that was already called, or a racing dispatch for this same lead, trips the
+    // phone marker; the timeline already has (or is about to get) the call.
+    if (slot.reason === 'duplicate_phone' && await hasCallRecord(store, listId, leadId)) return;
+    await recordSkip(reviewed.lead, slot.reason);
     return;
   }
   const startedAt = new Date().toISOString();

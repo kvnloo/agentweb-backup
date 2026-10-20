@@ -33,6 +33,7 @@ import { crmDb, userDb, orgDb } from '../services/db';
 import * as queue from '../services/asyncJobQueue';
 import { dispatchLeadCreated, dispatchLeadsCreated } from '../services/orgLeadNotificationService';
 import { setHotLeadCallEnabledOverride } from '../services/voice/hotLeadCallMode';
+import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
 import { FakeVoiceProvider } from '../services/voice/fakeVoiceProvider';
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
 import { FakeLimitStore } from '../services/voice/fakeLimitStore';
@@ -65,6 +66,7 @@ beforeEach(() => {
     doNotFake: ['hrtime', 'nextTick', 'performance', 'queueMicrotask', 'setImmediate', 'clearImmediate', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'],
   });
   process.env.JWT_SECRET = 'test-secret';
+  setHotLeadCallEntitledOverride(true);
   limits = new FakeLimitStore();
   setLimitStoreForTests(limits);
   hotLeadCall.live = false;
@@ -94,6 +96,7 @@ afterEach(() => {
   jest.useRealTimers();
   setLimitStoreForTests(null);
   setHotLeadCallEnabledOverride(null);
+  setHotLeadCallEntitledOverride(null);
   setVoiceProviderForTests(null);
 });
 
