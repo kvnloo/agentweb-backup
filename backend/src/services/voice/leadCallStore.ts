@@ -44,7 +44,7 @@ function isRecord(value: unknown): value is HotLeadCallRecord {
 
 // The scalar fields a patch may set. An explicit list (not a spread) so a caller can never smuggle
 // other keys, phone numbers included, into the lead row.
-const SCALAR_FIELDS = ['state', 'jobKey', 'startedAt', 'updatedAt', 'memberCallSid', 'leadCallSid', 'outcome', 'attemptNo', 'memberId'] as const;
+const SCALAR_FIELDS = ['state', 'jobKey', 'startedAt', 'updatedAt', 'memberCallSid', 'leadCallSid', 'outcome', 'attemptNo', 'memberId', 'leadPhoneMac'] as const;
 
 function scalarFields(record: Partial<HotLeadCallRecord>): Record<string, unknown> {
   const out: Record<string, unknown> = {};

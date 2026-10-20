@@ -35,6 +35,12 @@ export interface HotLeadCallRecord {
   triedMemberIds?: string[];
   memberCallSid?: string;
   leadCallSid?: string;
+  /**
+   * Keyed HMAC of the lead's E.164 phone as it was when the call passed the gates (never the phone itself).
+   * The webhooks refuse to dial or screen a lead whose live phone no longer matches it, so a repeat
+   * submission that overwrites lead.phone cannot redirect an approved call to another number.
+   */
+  leadPhoneMac?: string;
   /** Short machine reason for terminal states, e.g. 'member_no_answer', 'member_declined', 'lead_no_answer', 'lead_declined'. */
   outcome?: string;
   /** Legs already metered through recordCallUsage, so a replayed status callback cannot meter twice. */
@@ -43,7 +49,7 @@ export interface HotLeadCallRecord {
    * Highest Twilio SequenceNumber handled per CallSid, to ignore out-of-order status callbacks. It also holds
    * the voice webhooks' first-writer-wins decision markers, which rely on the same strictly-higher condition
    * (a second write of the same key fails): `<memberCallSid>#gather` (the member's one decision at the Gather)
-   * and `<memberCallSid>#dial` (the one lead-did-not-answer result).
+   * and `<memberCallSid>#dial` (the one lead-did-not-answer result) and `<leadCallSid>#screen` (the lead's one answer at the screening prompt).
    */
   lastSequence?: Record<string, number>;
 }
