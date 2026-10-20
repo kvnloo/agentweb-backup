@@ -280,19 +280,16 @@ describe('requestNextHotLeadCallAttempt', () => {
 });
 
 describe('processHotLeadCallNextAttempt', () => {
-  it('does nothing at all, not even a read, while the kill switch is off', async () => {
+  it('while the kill switch is off reads nothing, places nothing and closes the waiting record as disabled', async () => {
     const record = await firstAttemptEnds();
     jest.clearAllMocks();
     setHotLeadCallEnabledOverride(false);
-    const transitions = store.transitions;
     const read = jest.spyOn(store, 'get');
     await processHotLeadCallNextAttempt(nextJob(record));
     expect(read).not.toHaveBeenCalled();
     expect(crmDb.getLeadListById).not.toHaveBeenCalled();
-    expect(limits.keysTouched.length).toBeGreaterThan(0); // from the first attempt only
     expect(provider.placedCalls).toHaveLength(1);
-    expect(store.transitions).toBe(transitions);
-    expect(store.record!.state).toBe('between_attempts');
+    expect(store.record).toMatchObject({ state: 'finished', outcome: 'disabled' });
   });
 
   it.each([

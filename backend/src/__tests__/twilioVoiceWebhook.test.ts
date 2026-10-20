@@ -933,6 +933,50 @@ describe('member attempt finalisation', () => {
     expect(nextAttempt()).toHaveBeenCalledTimes(1);
   });
 
+  describe('while the next attempt is being placed (dialing, call sid cleared to an empty string)', () => {
+    const startNextAttempt = async () => {
+      seed('member_ringing');
+      nextAttempt().mockResolvedValue({ enqueued: true });
+      await memberStatus('no-answer', { CallDuration: '0', SequenceNumber: '1' });
+      expect(await store.transition(LIST, LEAD, ['between_attempts'], {
+        state: 'dialing', attemptNo: 2, memberId: MEMBER_ID, memberCallSid: '', outcome: '',
+      })).toBe(true);
+      store.events = [];
+    };
+
+    it('a late callback of the earlier attempt\'s call is not adopted as the next attempt\'s call', async () => {
+      await startNextAttempt();
+      const writes = store.transitions;
+      expect((await memberStatus('completed', { CallDuration: '3', SequenceNumber: '2' })).status).toBe(200);
+      expect((await memberPrompt()).text).toContain('<Hangup/>');
+      expect((await gather('1')).text).toContain('<Hangup/>');
+      expect(store.transitions).toBe(writes);
+      expect(store.record).toMatchObject({ state: 'dialing', memberCallSid: '', attemptNo: 2 });
+      expect(store.events).toHaveLength(0);
+    });
+
+    it('the first callback of the next attempt\'s own call is adopted, and the attempt runs to its end', async () => {
+      await startNextAttempt();
+      const prompt = await post('owner', { CallSid: NEXT_MEMBER_SID, CallStatus: 'in-progress' });
+      expect(prompt.text).toContain('<Gather');
+      expect(store.record).toMatchObject({ state: 'member_answered', memberCallSid: NEXT_MEMBER_SID, attemptNo: 2 });
+      expect(store.eventTypes()).toEqual(['call.initiated', 'call.member_answered']);
+    });
+
+    it('the next attempt\'s call, adopted from a status callback while the orchestrator is still placing it, is metered as attempt 2', async () => {
+      await startNextAttempt();
+      await post('status', { CallSid: NEXT_MEMBER_SID, CallStatus: 'no-answer', CallDuration: '0', SequenceNumber: '1' });
+      expect(store.record).toMatchObject({ state: 'between_attempts', memberCallSid: NEXT_MEMBER_SID, meteredLegs: ['member:1', 'member:2'], outcome: 'member_no_answer' });
+    });
+
+    it('an attempt that connects finishes as completed, not with the empty outcome the reset left behind', async () => {
+      seed('connected', { attemptNo: 2, memberCallSid: NEXT_MEMBER_SID, leadCallSid: LEAD_SID, outcome: '', meteredLegs: ['member:1', 'lead'] });
+      await post('status', { CallSid: NEXT_MEMBER_SID, CallStatus: 'completed', CallDuration: '60', SequenceNumber: '1' });
+      expect(store.record).toMatchObject({ state: 'finished', outcome: 'completed' });
+      expect(store.events.at(-1)).toMatchObject({ type: 'call.completed', detail: { outcome: 'completed' } });
+    });
+  });
+
   it('each attempt is metered under its own leg key and call sid, once per attempt even when replayed', async () => {
     seed('member_ringing');
     nextAttempt().mockResolvedValue({ enqueued: true });

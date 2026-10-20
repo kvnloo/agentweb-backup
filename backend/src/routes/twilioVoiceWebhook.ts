@@ -154,6 +154,9 @@ async function loadRecord(q: CallQuery): Promise<HotLeadCallRecord | null> {
  */
 async function withMemberSid(q: CallQuery, record: HotLeadCallRecord, callSid: string | undefined): Promise<HotLeadCallRecord> {
   if (record.memberCallSid || record.state !== 'dialing' || !callSid) return record;
+  // A next attempt that is still being placed has no sid either ('' after the reset), but a late callback of an
+  // earlier attempt's call must not be taken for it: every earlier member leg left a marker behind.
+  if (alreadyHandled(record, callSid)) return record;
   const store = getLeadCallStore();
   // Adoption moves the record out of 'dialing', so the orchestrator's later settle loses and only this path
   // writes call.initiated.
@@ -162,6 +165,10 @@ async function withMemberSid(q: CallQuery, record: HotLeadCallRecord, callSid: s
   }
   return (await store.get(q.listId, q.leadId)) ?? record; // a lost race still shows whichever sid won
 }
+
+/** Whether a call this record already dealt with (metered, or a decision taken on it) carries this sid. */
+const alreadyHandled = (record: HotLeadCallRecord, callSid: string): boolean =>
+  Object.keys(record.lastSequence ?? {}).some((key) => key.split('#')[0] === callSid);
 
 const sidOf = (body: FormParams, field: string): string | undefined => (CALL_SID_SHAPE.test(body[field] ?? '') ? body[field] : undefined);
 
@@ -497,7 +504,8 @@ async function finishIfComplete(q: CallQuery): Promise<void> {
  * 'dialing': that is information, not a decision, so it must not suppress the real member outcome.
  */
 const decidedOutcome = (record: HotLeadCallRecord): string | undefined =>
-  record.outcome === 'placement_unknown' ? undefined : record.outcome;
+  // A next attempt clears the previous outcome by storing '' (the store cannot remove a field): '' means none.
+  !record.outcome || record.outcome === 'placement_unknown' ? undefined : record.outcome;
 
 /**
  * The outcome of the call as a whole. In bridging/connected a member outcome can only be left over from an
@@ -578,12 +586,18 @@ async function meterLeg(cb: LegCallback): Promise<Metered> {
     }
 
     const ended = q.leg === 'member' ? memberAttemptEnd(current) : undefined;
+    const marks: Record<string, number> = {
+      ...(sequence === undefined ? {} : { [callSid]: sequence }),
+      // Tells a late callback of this call, once the next attempt is being placed, that its sid is not the next
+      // attempt's (see withMemberSid).
+      ...(ended ? { [`${callSid}#ended`]: 1 } : {}),
+    };
     const won = await store.transition(q.listId, q.leadId, [current.state], {
       state: ended ? 'between_attempts' : current.state,
       meteredLegs: [meteredLeg],
       leadCallSid: q.leg === 'lead' && !current.leadCallSid ? callSid : undefined,
       outcome: ended?.outcome,
-      lastSequence: sequence === undefined ? undefined : { [callSid]: sequence },
+      lastSequence: Object.keys(marks).length ? marks : undefined,
     });
     if (!won) continue; // state moved under us (or a replay): look again
 

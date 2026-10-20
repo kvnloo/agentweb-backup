@@ -103,9 +103,14 @@ async function runNextAttempt(job: NextAttemptJob, key: string): Promise<void> {
 export async function processHotLeadCallNextAttempt(job: NextAttemptJob): Promise<void> {
   if (!job || !isNonEmpty(job.orgId) || !isNonEmpty(job.listId) || !isNonEmpty(job.leadId) || !isNonEmpty(job.jobKey)
     || !Number.isInteger(job.attemptNo) || job.attemptNo < 1) throw new Error('Invalid hot lead call next attempt job');
-  if (!await isHotLeadCallEnabled()) return;
   const { listId, leadId } = job;
   const store = getLeadCallStore();
+  if (!await isHotLeadCallEnabled()) {
+    // No read and no call, but the record must not wait for a next attempt that will never come: one conditional
+    // write closes it if (and only if) it is waiting between attempts.
+    await closeBetweenAttempts(store, listId, leadId, 'disabled', false);
+    return;
+  }
 
   const record = await store.get(listId, leadId);
   // Another worker (or a replay) already moved this attempt on, or the record belongs to a different call.
