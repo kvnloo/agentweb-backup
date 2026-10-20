@@ -486,3 +486,81 @@ describe('ENG-668 PAYG — a stale index snapshot never decides admission past t
     expect(mockGetUserByIdConsistent).not.toHaveBeenCalled();
   });
 });
+
+describe('ENG-668 PAYG — the pool high-water mark is kept while PAYG is off', () => {
+  /** One stored row the gate reads and the conditional high-water write updates, like the table would. */
+  function storedOwner(paygOverage: PaygOverageSettings) {
+    const row: any = {
+      userId: OWNER, email: 'owner@example.com', subscription_status: 'active', has_payment_method: true, paygOverage,
+    };
+    mockGetUserById.mockImplementation(async () => row);
+    mockGetUserByIdConsistent.mockImplementation(async () => row);
+    mockUpdateUser.mockImplementation(async (_id: string, _fields: unknown, options: any) => {
+      for (const { path, value } of options?.pathSets ?? []) row[path[0]] = { ...row[path[0]], [path[1]]: value };
+      return row;
+    });
+    return row;
+  }
+  const tierWithPool = (poolUsd: number) => mockTierConfig.mockResolvedValue({
+    name: 'Pro', allowedPages: [], allowedSkills: [], paygOverage: { allowed: true, markupBps: 25_000 },
+    llmUsagePolicy: { ...policy, optimizationCostThresholdMicroUsd: (poolUsd / 2) * USD, hardCostThresholdMicroUsd: poolUsd * USD },
+  });
+
+  it('opt in -> disable -> upgrade -> spend -> downgrade -> re-enable: the off period\'s included usage is not overage', async () => {
+    setup({ spendUsd: 100 });
+    const month = getCurrentUsageMonth();
+    // Opted in at the $100 pool with nothing standing (baseline 0), then turned PAYG off.
+    const row = storedOwner(payg({
+      enabled: false,
+      capPercentOfPool: 50,
+      poolHighWater: { month, thresholdMicroUsd: 100 * USD },
+      optIn: { month, overageBaselineMicroUsd: 0, poolAtOptInMicroUsd: 100 * USD },
+    }));
+
+    // While off: upgrade to a $400 pool and spend $250 of it (checks keep running).
+    tierWithPool(400);
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 150 * USD });
+    expect((await checkTokenUsage(OWNER)).allowed).toBe(true);
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 250 * USD });
+    expect((await checkTokenUsage(OWNER)).allowed).toBe(true);
+    expect(row.paygOverage.poolHighWater).toEqual({ month, thresholdMicroUsd: 400 * USD });
+
+    // Downgrade to $100, then re-enable in the same month (the opt-in baseline is kept, by design).
+    tierWithPool(100);
+    row.paygOverage = { ...row.paygOverage, enabled: true };
+    const { status, decision } = await bothGates();
+
+    // $250 is inside the $400 pool the month had: nothing is overage, and it is admitted.
+    expect(status.allowed).toBe(true);
+    expect(status.overage).toEqual({ active: false, percentOfCap: 0 });
+    expect(status.paygBlock).toBeUndefined();
+    expect(decision.effectiveModel).toBe(CHOSEN_MODEL);
+  });
+
+  it('an OFF opt-in keeps today\'s decision exactly: past the pool it is still the plain 429', async () => {
+    setup({ spendUsd: 120 });
+    storedOwner(payg({ enabled: false, poolHighWater: undefined }));
+    const status = await checkTokenUsage(OWNER);
+    expect(status.allowed).toBe(false);
+    expect(status).not.toHaveProperty('overage');
+    expect(status).not.toHaveProperty('paygBlock');
+    // The mark was still recorded for the month.
+    expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+    // No consistent read for an OFF opt-in: nothing PAYG-specific is decided.
+    expect(mockGetUserByIdConsistent).not.toHaveBeenCalled();
+  });
+
+  it('no paygOverage record: no switch read, no consistent read, no write — exactly as before', async () => {
+    setup({ spendUsd: 120, user: { paygOverage: undefined } });
+    await bothGates();
+    expect(mockSwitch).not.toHaveBeenCalled();
+    expect(mockGetUserByIdConsistent).not.toHaveBeenCalled();
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+  });
+
+  it('while the switch is off, an OFF opt-in is not touched either', async () => {
+    setup({ spendUsd: 150, switchOn: false, user: { paygOverage: payg({ enabled: false, poolHighWater: undefined }) } });
+    await checkTokenUsage(OWNER);
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+  });
+});

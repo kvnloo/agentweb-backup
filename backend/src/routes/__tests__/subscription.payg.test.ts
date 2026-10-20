@@ -121,6 +121,10 @@ beforeEach(() => {
 
 afterEach(() => switchSpy.mockRestore());
 
+/** The PUT's own settings write (version- or absence-conditional), not the gate's high-water write. */
+const settingsWrite = () => mockUpdateUser.mock.calls.find(([, , options]: any[]) =>
+  /#payg\.#version|attribute_not_exists\(#paygOverage\)/.test(options?.condition?.expression ?? ''))!;
+
 const put = (userId: string, body: unknown) =>
   request(app).put('/api/subscription/payg').set('x-test-user', userId).send(body as object);
 const get = (userId: string) => request(app).get('/api/subscription/payg').set('x-test-user', userId);
@@ -288,7 +292,7 @@ describe('PUT /api/subscription/payg', () => {
       enabled: false, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 2,
     };
     await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(200);
-    const [, fields, options] = mockUpdateUser.mock.calls[0];
+    const [, fields, options] = settingsWrite();
     expect(fields).toEqual({ has_payment_method: true });
     expect(options.condition.expression).toContain('#payg.#version = :expectedVersion');
   });
@@ -301,17 +305,22 @@ describe('PUT /api/subscription/payg', () => {
       poolHighWater: { month: '2000-01', thresholdMicroUsd: 50 * USD },
     };
     const storedThreshold = 300 * USD;
-    mockUpdateUser.mockImplementationOnce(async (_id: string, _fields: any, options: any) => {
-      const guarded = /#payg\.#hw\.#hwThreshold <= :hwThreshold/.test(options.condition.expression);
-      if (guarded && options.condition.values[':hwThreshold'] < storedThreshold) {
-        throw Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' });
+    const recordWrite = mockUpdateUser.getMockImplementation()!;
+    mockUpdateUser.mockImplementation(async (id: string, fields: any, options: any) => {
+      // Only the settings write (version-conditional) meets the raced mark; the gate's own mark write passes.
+      if (/#payg\.#version/.test(options?.condition?.expression ?? '')) {
+        const guarded = /#payg\.#hw\.#hwThreshold <= :hwThreshold/.test(options.condition.expression);
+        if (guarded && options.condition.values[':hwThreshold'] < storedThreshold) {
+          throw Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' });
+        }
+        return users[OWNER];
       }
-      return users[OWNER];
+      return recordWrite(id, fields, options);
     });
 
     const res = await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(409);
     expect(res.body.error).toBe('payg_conflict');
-    const [, , options] = mockUpdateUser.mock.calls[0];
+    const [, , options] = settingsWrite();
     expect(options.condition.values).toMatchObject({ ':hwMonth': getCurrentUsageMonth(), ':hwThreshold': 100 * USD });
   });
 
@@ -520,6 +529,13 @@ describe('PUT /api/subscription/payg', () => {
       mockTierConfig.mockResolvedValue(tier({ paygOverage: { allowed: false, markupBps: 25_000 } }));
       await put(OWNER, { enabled: false }).expect(200);
       expect(users[OWNER].paygOverage.enabled).toBe(false);
+    });
+
+    it('turning it off with a cap in the body never needs a usage pool (tier policy now observe)', async () => {
+      mockTierConfig.mockResolvedValue(tier({ llmUsagePolicy: { ...policy, enforcementState: 'observe' } }));
+      await put(OWNER, { enabled: false, capPercentOfPool: 100 }).expect(200);
+      expect(users[OWNER].paygOverage).toMatchObject({ enabled: false, capPercentOfPool: 100 });
+      expect(mockHasPaymentMethod).not.toHaveBeenCalled();
     });
 
     it('still 403s a pooled member trying to turn it off', async () => {
