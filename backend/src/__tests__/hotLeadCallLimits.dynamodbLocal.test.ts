@@ -22,6 +22,7 @@ suite('hot-lead call limit store against DynamoDB Local', () => {
   let ddb: any;
   let limits: import('../services/voice/limitStore').LimitStore;
   let reserveCallSlot: typeof import('../services/voice/hotLeadCallLimits').reserveCallSlot;
+  let claimMemberCooldown: typeof import('../services/voice/hotLeadCallLimits').claimMemberCooldown;
   let n = 0;
   const key = () => `hlc#test#${++n}`;
 
@@ -41,7 +42,7 @@ suite('hot-lead call limit store against DynamoDB Local', () => {
     }).promise();
     ddb = new AWS.DynamoDB.DocumentClient();
     limits = require('../services/voice/limitStore').getLimitStore();
-    ({ reserveCallSlot } = require('../services/voice/hotLeadCallLimits'));
+    ({ reserveCallSlot, claimMemberCooldown } = require('../services/voice/hotLeadCallLimits'));
   }, 60_000);
 
   afterAll(async () => {
@@ -101,15 +102,38 @@ suite('hot-lead call limit store against DynamoDB Local', () => {
     await limits.release(k, 'b');
   });
 
-  it('a burst of 50 reservations for distinct phones in one org never exceeds the cap or the cooldown', async () => {
-    const config: any = { maxCallsPerHour: 3, maxCallsPerDay: 3, memberCooldownMinutes: 1, callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' } };
+  it('holder returns the live token, and nothing once the claim expired', async () => {
+    const k = key();
+    expect(await limits.holder(k, 1000)).toBeNull();
+    await limits.claim(k, 'list#lead#abc', 2000, 1000);
+    expect(await limits.holder(k, 1999)).toBe('list#lead#abc');
+    expect(await limits.holder(k, 2000)).toBeNull();
+  });
+
+  it('a burst of 50 reservations for distinct phones in one org never exceeds the cap', async () => {
+    const config: any = { maxCallsPerHour: 3, maxCallsPerDay: 3, callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' } };
     const now = new Date('2026-10-19T17:00:00Z');
-    const member = { id: 'maaaaaaa', name: 'Dana Lee', phone: '+14155550100', windows: [] };
     const results = await Promise.all(Array.from({ length: 50 }, (_v, i) =>
-      reserveCallSlot({ orgId: 'org-burst', phoneE164: `+1555555${String(1000 + i)}`, config, candidates: [member], now })));
-    expect(results.filter(r => r.ok)).toHaveLength(1); // the cooldown admits one
-    expect(results.filter(r => !r.ok && r.reason === 'member_cooldown')).toHaveLength(49);
+      reserveCallSlot({ orgId: 'org-burst', listId: 'l', leadId: `lead${i}`, phoneE164: `+1555555${String(1000 + i)}`, config, now })));
+    expect(results.filter(r => r.ok)).toHaveLength(3);
+    expect(results.filter(r => !r.ok && r.reason === 'org_hourly_cap')).toHaveLength(47);
     const hour = await item('hlc#cap#h#org-burst#2026-10-19T17');
-    expect(hour.calls).toBe(1); // every refused lead gave its counters back
+    expect(hour.calls).toBe(3); // every refused lead gave its claim back
+  });
+
+  it('a burst of 20 attempts for one member is admitted once by the cooldown', async () => {
+    const config: any = { memberCooldownMinutes: 1 };
+    const results = await Promise.all(Array.from({ length: 20 }, () =>
+      claimMemberCooldown({ orgId: 'org-cool', memberId: 'maaaaaaa', config, now: new Date('2026-10-19T17:00:00Z') })));
+    expect(results.filter(Boolean)).toHaveLength(1);
+  });
+
+  it('two dispatches of the same lead: one wins the phone marker and the other sees it in progress', async () => {
+    const config: any = { maxCallsPerHour: 30, maxCallsPerDay: 30, callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' } };
+    const now = new Date('2026-10-19T17:00:00Z');
+    const results = await Promise.all([1, 2].map(() =>
+      reserveCallSlot({ orgId: 'org-same', listId: 'l', leadId: 'lead-same', phoneE164: '+15555551234', config, now })));
+    expect(results.filter(r => r.ok)).toHaveLength(1);
+    expect(results.filter(r => !r.ok)).toEqual([{ ok: false, reason: 'in_progress' }]);
   });
 });

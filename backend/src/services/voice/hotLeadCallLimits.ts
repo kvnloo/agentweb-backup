@@ -1,10 +1,11 @@
 import { createHmac, randomUUID } from 'crypto';
 import { getJwtSecret } from '../../config/jwt';
 import { localParts } from '../dripSendWindow';
-import { hhmmToMinutes, type HotLeadCallConfig, type HotLeadCallMember } from '../hotLeadCallConfig';
+import { hhmmToMinutes, type HotLeadCallConfig } from '../hotLeadCallConfig';
 import { getLimitStore } from './limitStore';
 
-type LimitDenial = 'duplicate_phone' | 'member_cooldown' | 'org_hourly_cap' | 'org_daily_cap';
+// 'in_progress': this same lead already holds the phone marker, so another dispatch of it is placing the call.
+type LimitDenial = 'duplicate_phone' | 'in_progress' | 'org_hourly_cap' | 'org_daily_cap';
 
 const MINUTE_S = 60;
 const HOUR_S = 3600;
@@ -42,6 +43,14 @@ export function phoneMarkerKey(orgId: string, phoneE164: string): string {
   const digest = createHmac('sha256', getJwtSecret()).update(`hot_lead_call.phone\0${orgId}\0${phoneE164}`).digest('hex');
   return `hlc#phone#${digest}`;
 }
+/**
+ * Keyed hash of the lead's E.164 phone, stored on the call record so the webhooks can tell that lead.phone
+ * changed after the call passed the gates (a repeat submission overwrites it). A separate domain label from the
+ * phone marker keeps the two values from ever being interchangeable; org-scoped like it.
+ */
+export function leadPhoneMac(orgId: string, phoneE164: string): string {
+  return createHmac('sha256', getJwtSecret()).update(`hot_lead_call.lead_phone\0${orgId}\0${phoneE164}`).digest('hex');
+}
 // Per member, not per org: two team members can take two leads at once, while one member is not rung twice in a row.
 export const cooldownKey = (orgId: string, memberId: string): string => `hlc#cool#${orgId}#${memberId}`;
 // Fixed windows (not sliding): up to twice the cap can dial across an hour or day boundary, which is
@@ -51,30 +60,30 @@ export const dailyCapKey = (orgId: string, timeZone: string, at: Date): string =
 
 // ---- reservation -----------------------------------------------------------------------------------------
 
-export type Reservation = { ok: true; member: HotLeadCallMember; release: () => Promise<void> } | { ok: false; reason: LimitDenial };
+export type Reservation = { ok: true; release: () => Promise<void> } | { ok: false; reason: LimitDenial };
 
 /**
- * Takes this lead's slot against every abuse limit, or says which one refused. `candidates` are the members
- * eligible to be rung, in priority order: the first one that is not in cooldown is claimed and returned, so a
- * member who just took a call is passed over for the next one. Each limit is one conditional
+ * Takes this lead's slot against the per-lead abuse limits, or says which one refused. Taken once, at the lead's
+ * first attempt: the phone marker (24h), then the org's hourly and daily counters. Each limit is one conditional
  * write, so a burst of simultaneous leads can never dial more than the cap. Everything taken is given back by
- * `release()` (called when the lead loses `store.create`, or create throws) and when a later limit refuses, so a
- * lead that does not dial never costs the org a slot. A lead that dials and then fails keeps its slots: the
- * limits protect money and phones, and a rejected call is rare. Order: the non-counting claims first (phone,
- * cooldown), counters last, so the common abuse refusals touch no counter at all.
+ * `release()` (called when the lead does not get a call record) and when a later limit refuses, so a lead that
+ * does not dial never costs the org a slot. A lead that dials and then fails keeps its slots: the limits protect
+ * money and phones, and a rejected call is rare. The non-counting claim goes first, so the common abuse refusal
+ * touches no counter at all.
+ *
+ * The phone marker's token starts with the lead's own id, so a second dispatch of the SAME lead (a double
+ * submit) finds 'in_progress' instead of a duplicate: nothing is lost, the first dispatch is placing the call.
  * Store failures throw (the job fails and nothing is dialed): fail closed.
  *
  * Known limits (accepted): fixed windows can admit up to 2x a cap across a boundary; phone-rotating bots can
  * consume an org's hourly/daily caps (the Slack alert still fires); whoever submits a number first suppresses the
- * dial for that number for 24h; the cooldown skips a second genuine lead within memberCooldownMinutes
- * when no other candidate is free; a process
- * crash between this call and store.create leaves the 24h phone marker and the cooldown claim held with no
- * record, so a repeat of that number is refused as duplicate_phone with a silent timeline.
+ * dial for that number for 24h; a process crash between this call and store.create leaves the 24h phone marker
+ * held with no record, so a repeat of that number is refused with a silent timeline.
  */
 export async function reserveCallSlot(input: {
-  orgId: string; phoneE164: string; config: HotLeadCallConfig; candidates: readonly HotLeadCallMember[]; now?: Date;
+  orgId: string; listId: string; leadId: string; phoneE164: string; config: HotLeadCallConfig; now?: Date;
 }): Promise<Reservation> {
-  const { orgId, phoneE164, config, candidates } = input;
+  const { orgId, phoneE164, config } = input;
   const now = input.now ?? new Date();
   const nowS = Math.floor(now.getTime() / 1000);
   const store = getLimitStore();
@@ -83,8 +92,9 @@ export async function reserveCallSlot(input: {
     for (const step of undo.splice(0).reverse()) await step();
   };
 
-  const claim = async (key: string, ttlS: number): Promise<boolean> => {
-    const token = randomUUID();
+  const leadPrefix = `${input.listId}#${input.leadId}#`;
+  const claim = async (key: string, ttlS: number, tokenPrefix = ''): Promise<boolean> => {
+    const token = `${tokenPrefix}${randomUUID()}`;
     if (!await store.claim(key, token, nowS + ttlS, nowS)) return false;
     undo.push(() => store.release(key, token));
     return true;
@@ -95,26 +105,17 @@ export async function reserveCallSlot(input: {
     return true;
   };
 
-  // The first candidate whose cooldown claim succeeds is the member to ring.
-  const claimed: HotLeadCallMember[] = [];
-  const claimMember = async (): Promise<boolean> => {
-    for (const candidate of candidates) {
-      if (await claim(cooldownKey(orgId, candidate.id), config.memberCooldownMinutes * MINUTE_S)) {
-        claimed.push(candidate);
-        return true;
-      }
-    }
-    return false;
-  };
-
   try {
-    const steps: Array<[LimitDenial, () => Promise<boolean>]> = [
-      ['duplicate_phone', () => claim(phoneMarkerKey(orgId, phoneE164), PHONE_WINDOW_S)],
-      ['member_cooldown', claimMember],
+    const phoneKey = phoneMarkerKey(orgId, phoneE164);
+    if (!await claim(phoneKey, PHONE_WINDOW_S, leadPrefix)) {
+      const holder = await store.holder(phoneKey, nowS);
+      return { ok: false, reason: holder?.startsWith(leadPrefix) ? 'in_progress' : 'duplicate_phone' };
+    }
+    const counters: Array<[LimitDenial, () => Promise<boolean>]> = [
       ['org_hourly_cap', () => count(hourlyCapKey(orgId, now), config.maxCallsPerHour, 2 * HOUR_S)],
       ['org_daily_cap', () => count(dailyCapKey(orgId, config.callingHours?.timezone ?? 'UTC', now), config.maxCallsPerDay, 2 * DAY_S)],
     ];
-    for (const [reason, take] of steps) {
+    for (const [reason, take] of counters) {
       if (!await take()) {
         await releaseAll();
         return { ok: false, reason };
@@ -124,5 +125,22 @@ export async function reserveCallSlot(input: {
     await releaseAll();
     throw err;
   }
-  return { ok: true, member: claimed[0], release: releaseAll };
+  return { ok: true, release: releaseAll };
+}
+
+/**
+ * Claims one member's cooldown for this attempt: a member who just took (or was rung for) a lead is passed
+ * over for `memberCooldownMinutes`, so two near-simultaneous leads reach different people while one person is
+ * never rung twice in a row. Returns the release function, or null when the member is in cooldown. Per attempt,
+ * not per lead: every next attempt claims its own member. A placed call keeps its claim; only an attempt that
+ * does not dial (lost the race for the record) gives it back.
+ */
+export async function claimMemberCooldown(input: {
+  orgId: string; memberId: string; config: HotLeadCallConfig; now?: Date;
+}): Promise<(() => Promise<void>) | null> {
+  const nowS = Math.floor((input.now ?? new Date()).getTime() / 1000);
+  const key = cooldownKey(input.orgId, input.memberId);
+  const token = randomUUID();
+  if (!await getLimitStore().claim(key, token, nowS + input.config.memberCooldownMinutes * MINUTE_S, nowS)) return null;
+  return () => getLimitStore().release(key, token);
 }

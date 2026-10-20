@@ -15,6 +15,8 @@ export interface LimitStore {
   decrement(key: string): Promise<void>;
   /** Claims `key` for `token` unless a claim that has not yet expired exists (live while nowS < expiresAtS). */
   claim(key: string, token: string, expiresAtS: number, nowS: number): Promise<boolean>;
+  /** The token of the live claim on `key` (not yet expired at nowS), or null. A consistent read. */
+  holder(key: string, nowS: number): Promise<string | null>;
   /** Drops the claim, only if `token` still owns it (an expired claim may have been re-taken by someone else). */
   release(key: string, token: string): Promise<void>;
 }
@@ -73,6 +75,11 @@ class DynamoLimitStore implements LimitStore {
       if (isConditionalFailure(err)) return false;
       throw err;
     }
+  }
+
+  async holder(key: string, nowS: number): Promise<string | null> {
+    const { Item } = await dynamodb.get({ TableName: LIMITS_TABLE, Key: { [PK]: key }, ConsistentRead: true }).promise();
+    return Item && typeof Item.token === 'string' && Number(Item.ttl) > nowS ? Item.token : null;
   }
 
   async release(key: string, token: string): Promise<void> {

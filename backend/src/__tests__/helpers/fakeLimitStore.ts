@@ -40,6 +40,12 @@ export class FakeLimitStore implements LimitStore {
     return true;
   }
 
+  async holder(key: string, nowS: number): Promise<string | null> {
+    this.touch(key);
+    const held = this.claims.get(key);
+    return held && held.expiresAtS > nowS ? held.token : null;
+  }
+
   async release(key: string, token: string): Promise<void> {
     this.touch(key);
     if (this.claims.get(key)?.token === token) this.claims.delete(key);

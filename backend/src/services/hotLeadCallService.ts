@@ -2,19 +2,17 @@ import { createHash } from 'crypto';
 import { isSmokeTestLead } from '../utils/smokeTestLead';
 import { crmDb } from './db';
 import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from './asyncJobQueue';
-import { redactPhone } from './whatsappService';
 import type { HotLeadCallConfig } from './hotLeadCallConfig';
 import { callableLeadPhone } from './hotLeadCallConfig';
 import type { LeadOrigin } from './leadNotificationConfig';
-import { VoiceCallError, getVoiceProvider, scrubErrorText } from './voice/voiceProvider';
-import { buildVoiceWebhookUrl, isWebhookSafeId } from './voice/voiceUrls';
+import { isWebhookSafeId } from './voice/voiceUrls';
 import { isHotLeadCallEnabled } from './voice/hotLeadCallMode';
 import { isHotLeadCallEntitled } from './voice/hotLeadCallEntitlement';
 import { resolveHotLeadCallContext, type HotLeadCallContext } from './voice/hotLeadCallContext';
 import { getLeadCallStore } from './voice/leadCallStore';
-import type { LeadCallStore } from './voice/leadCallStore.types';
-import { isWithinCallWindow, reserveCallSlot, type Reservation } from './voice/hotLeadCallLimits';
+import { isWithinCallWindow, leadPhoneMac, reserveCallSlot, type Reservation } from './voice/hotLeadCallLimits';
 import { selectHotLeadCallCandidates } from './hotLeadCallRoster';
+import { errorText, placeMemberCall, type PlacementResult } from './hotLeadCallPlacement';
 // This file must not import orgLeadNotificationService: that module calls dispatchHotLeadCall.
 
 interface HotLeadCallJob {
@@ -29,18 +27,12 @@ type JobInput = Omit<HotLeadCallJob, 'orgId'>;
 type Submission = { submissionId: string; submittedAt: string };
 
 const SOURCE = 'hot_lead_call';
-const MEMBER_RING_TIMEOUT_SECONDS = 25;
 const MINUTE_MS = 60_000;
 // Anyone can submit a landing-page form, and again, so refusals must not grow the lead row without bound:
 // one `call.skipped` event per distinct reason, and five in all.
 const MAX_SKIP_EVENTS_PER_LEAD = 5;
-// Two dispatches racing for the same lead: the loser trips the phone marker before the winner's call record
-// is visible. One short re-check tells that apart from a genuinely different lead sharing the number.
-export const SAME_LEAD_RECHECK_MS = 200;
-
 const keyOf = (job: HotLeadCallJob): string =>
   createHash('sha256').update(JSON.stringify([job.orgId, job.listId, job.leadId, ...(job.submissionId ? [job.submissionId] : [])])).digest('hex');
-const errorText = (err: unknown): string => scrubErrorText(err instanceof Error ? err.message : 'unknown').slice(0, 200);
 const isNonEmpty = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0;
 
 type LeadRow = NonNullable<Awaited<ReturnType<typeof crmDb.getLeadById>>>;
@@ -74,13 +66,6 @@ async function recordSkip(lead: LeadRow, reason: string): Promise<void> {
   );
   if (skipped.length >= MAX_SKIP_EVENTS_PER_LEAD || skipped.some((e) => e.eventData?.reason === reason)) return;
   await getLeadCallStore().addEvent(lead.listId, lead.leadId, 'call.skipped', { reason });
-}
-
-/** True when this lead already has (or, after one short wait, gets) a call record. */
-async function hasCallRecord(store: LeadCallStore, listId: string, leadId: string): Promise<boolean> {
-  if (await store.get(listId, leadId)) return true;
-  await new Promise((resolve) => setTimeout(resolve, SAME_LEAD_RECHECK_MS));
-  return !!(await store.get(listId, leadId));
 }
 
 /**
@@ -130,11 +115,11 @@ async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: H
 }
 
 /**
- * Re-runs the gates, then places the member call at most once. The call record is the at-most-once
- * control: store.create is create-if-absent, so false means a record already exists for this lead and
- * we never dial, and a throw means nothing was dialed and the job fails (the queue row dedupes the
- * same job key). v1 rule: a lead gets one call record ever, so a place_rejected lead is not retried
- * automatically.
+ * Re-runs the gates, then rings the first available member, at most once per lead. The call record is the
+ * at-most-once control: store.create is create-if-absent, so a lost create means a record already exists for
+ * this lead and we never dial, and a throw means nothing was dialed and the job fails (the queue row dedupes
+ * the same job key). A lead gets one call record ever; its later attempts (other members) are driven from that
+ * record by the next-attempt job, and a lead whose first call was rejected is not retried by a new submission.
  */
 export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> {
   if (!job || !isNonEmpty(job.orgId) || !isNonEmpty(job.listId) || !isNonEmpty(job.leadId)) throw new Error('Invalid hot lead call job');
@@ -144,10 +129,6 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
   const { config } = reviewed.ctx;
   const { listId, leadId } = job;
   const key = keyOf(job);
-  const webhook = { listId, leadId, jobKey: key };
-  // Built before create: a missing BACKEND_URL must fail the job without using the lead's call slot.
-  const url = buildVoiceWebhookUrl('owner', webhook);
-  const statusCallbackUrl = buildVoiceWebhookUrl('status', webhook);
   const store = getLeadCallStore();
 
   // Re-evaluated now (not taken from the gates): time moves on between the gates and the reservation.
@@ -161,7 +142,7 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
   // lead refused by a limit leaves no record, so its single call slot stays unused (a repeat submission can retry).
   let slot: Reservation;
   try {
-    slot = await reserveCallSlot({ orgId: job.orgId, phoneE164: reviewed.phone, config, candidates });
+    slot = await reserveCallSlot({ orgId: job.orgId, listId, leadId, phoneE164: reviewed.phone, config });
   } catch (err) {
     // Fail closed (nothing dialed, no record) but leave a trace on the lead: a missing table or secret is an ops problem.
     console.warn('[hotLeadCall] call limits unavailable', { listId, leadId, error: errorText(err) });
@@ -170,55 +151,31 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
     throw err;
   }
   if (!slot.ok) {
-    // A repeat submission of a lead that was already called, or a racing dispatch for this same lead, trips the
-    // phone marker; the timeline already has (or is about to get) the call.
-    if (slot.reason === 'duplicate_phone' && await hasCallRecord(store, listId, leadId)) return;
-    await recordSkip(reviewed.lead, slot.reason);
+    // The same lead is being dialed by a racing dispatch (it holds the phone marker): nothing to add to the timeline.
+    // A different lead on the same number, or a cap, is worth showing.
+    if (slot.reason !== 'in_progress') await recordSkip(reviewed.lead, slot.reason);
     return;
   }
-  // The member who was not in cooldown; this first attempt is the only one for now.
-  const { member } = slot;
-  const startedAt = new Date().toISOString();
+
   let created = false;
+  let result: PlacementResult;
   try {
-    created = await store.create(listId, leadId, {
-      state: 'dialing', jobKey: key, startedAt, updatedAt: startedAt, attemptNo: 1, memberId: member.id, triedMemberIds: [member.id],
+    result = await placeMemberCall({
+      orgId: job.orgId, listId, leadId, jobKey: key, config, callerNumber: reviewed.callerNumber, candidates, attemptNo: 1,
+      createRecord: async (member) => {
+        const startedAt = new Date().toISOString();
+        created = await store.create(listId, leadId, {
+          state: 'dialing', jobKey: key, startedAt, updatedAt: startedAt, attemptNo: 1, memberId: member.id, triedMemberIds: [member.id],
+          leadPhoneMac: leadPhoneMac(job.orgId, reviewed.phone),
+        });
+        return created;
+      },
     });
   } finally {
+    // No record means no call: give the lead's slots back (a lost create, every member in cooldown, or an error).
     if (!created) await slot.release();
   }
-  if (!created) return;
-
-  // If the post-call transition fails the record stays 'dialing'; the first signed member callback adopts the CallSid.
-  const settle = async (patch: Parameters<typeof store.transition>[3], event: 'call.initiated' | 'call.failed', detail?: Record<string, string>) => {
-    try {
-      if (await store.transition(listId, leadId, ['dialing'], patch)) await store.addEvent(listId, leadId, event, detail);
-    } catch (err) {
-      console.warn('[hotLeadCall] call record not updated', { listId, leadId, error: errorText(err) });
-    }
-  };
-
-  let memberCallSid: string;
-  try {
-    ({ callSid: memberCallSid } = await getVoiceProvider().placeCall({
-      to: member.phone,
-      from: reviewed.callerNumber,
-      url,
-      statusCallbackUrl,
-      timeoutSeconds: MEMBER_RING_TIMEOUT_SECONDS,
-    }));
-  } catch (err) {
-    if (err instanceof VoiceCallError && err.placed === 'no') {
-      console.warn('[hotLeadCall] member call rejected', { listId, leadId, to: redactPhone(member.phone) });
-      await settle({ state: 'failed', outcome: 'place_rejected' }, 'call.failed', { reason: 'place_rejected' });
-    } else {
-      // The call may be live: stay non-terminal so the webhooks can still adopt and meter it. Never retried.
-      console.warn('[hotLeadCall] member call placement unknown', { listId, leadId, to: redactPhone(member.phone) });
-      await settle({ state: 'dialing', outcome: 'placement_unknown' }, 'call.failed', { reason: 'placement_unknown' });
-    }
-    return;
-  }
-  await settle({ state: 'member_ringing', memberCallSid }, 'call.initiated');
+  if (result === 'none') await recordSkip(reviewed.lead, 'member_cooldown');
 }
 
 /** Never rejects to a lead saver. Fire-and-forget right after a successful lead write. */
