@@ -9,52 +9,61 @@
  * forms `updateUser` callers in the PAYG code emit — and anything else throws rather than passes.
  */
 
-type Row = Record<string, any>;
+type Row = Record<string, unknown>;
+/** A map or list node inside a row, indexed by a path segment. */
+type Node = Record<string | number, unknown>;
 
 export interface UpdateUserOptions {
-  condition?: { expression: string; names?: Record<string, string>; values?: Record<string, any> };
-  pathSets?: Array<{ path: Array<string | number>; value: any }>;
+  condition?: { expression: string; names?: Record<string, string>; values?: Record<string, unknown> };
+  pathSets?: Array<{ path: Array<string | number>; value: unknown }>;
   pathRemoves?: Array<{ path: Array<string | number> }>;
 }
 
 const clone = <T>(value: T): T => (value === undefined ? value : JSON.parse(JSON.stringify(value)));
 
-function getPath(row: Row | undefined, path: Array<string | number>): any {
-  let node: any = row;
+function getPath(row: Row | undefined, path: Array<string | number>): unknown {
+  let node: unknown = row;
   for (const segment of path) {
     if (node === undefined || node === null) return undefined;
-    node = node[segment as any];
+    node = (node as Node)[segment];
   }
   return node;
 }
 
-function setPath(row: Row, path: Array<string | number>, value: any): void {
-  let node: any = row;
+function setPath(row: Row, path: Array<string | number>, value: unknown): void {
+  let node = row as Node;
   for (let i = 0; i < path.length - 1; i++) {
-    if (node[path[i] as any] === undefined || node[path[i] as any] === null) {
+    if (node[path[i]] === undefined || node[path[i]] === null) {
       // DynamoDB refuses to SET below a missing parent ("document path is invalid").
       throw Object.assign(new Error('ValidationException: The document path provided in the update expression is invalid for update'), {
         code: 'ValidationException',
       });
     }
-    node = node[path[i] as any];
+    node = node[path[i]] as Node;
   }
-  node[path[path.length - 1] as any] = clone(value);
+  node[path[path.length - 1]] = clone(value);
 }
 
 function removePath(row: Row, path: Array<string | number>): void {
   const parent = getPath(row, path.slice(0, -1));
-  if (parent && typeof parent === 'object') delete parent[path[path.length - 1] as any];
+  if (parent && typeof parent === 'object') delete (parent as Node)[path[path.length - 1]];
 }
 
-const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+/** DynamoDB compares maps by content, not key order. */
+const canonical = (value: unknown): unknown =>
+  Array.isArray(value)
+    ? value.map(canonical)
+    : value && typeof value === 'object'
+      ? Object.fromEntries(Object.keys(value as object).sort().map((k) => [k, canonical((value as Record<string, unknown>)[k])]))
+      : value;
+const equal = (a: unknown, b: unknown) => JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
 
 /** Evaluates `expression` against `row`. Supports AND / OR / parentheses and the clauses below. */
 export function evaluateCondition(
   expression: string,
   row: Row | undefined,
   names: Record<string, string> = {},
-  values: Record<string, any> = {},
+  values: Record<string, unknown> = {},
 ): boolean {
   const tokens = expression.match(/\(|\)|,|<>|<=|>=|=|<|>|[^\s(),<>=]+/g) || [];
   let i = 0;
@@ -89,7 +98,9 @@ export function evaluateCondition(
         expect(',');
         const needle = value(next());
         expect(')');
-        return Array.isArray(target) ? target.some((v) => equal(v, needle)) : typeof target === 'string' && target.includes(needle);
+        return Array.isArray(target)
+          ? target.some((v) => equal(v, needle))
+          : typeof target === 'string' && typeof needle === 'string' && target.includes(needle);
       }
       expect(')');
       return t === 'attribute_exists' ? target !== undefined : target === undefined;
@@ -98,7 +109,7 @@ export function evaluateCondition(
     const op = next();
     if (op === 'IN') {
       expect('(');
-      const options: any[] = [value(next())];
+      const options: unknown[] = [value(next())];
       while (peek() === ',') {
         next();
         options.push(value(next()));
@@ -107,13 +118,14 @@ export function evaluateCondition(
       return options.some((option) => equal(left, option));
     }
     const right = value(next());
+    const bothNumbers = typeof left === 'number' && typeof right === 'number';
     switch (op) {
       case '=': return left !== undefined && equal(left, right);
       case '<>': return left !== undefined && !equal(left, right);
-      case '<': return typeof left === 'number' && left < right;
-      case '<=': return typeof left === 'number' && left <= right;
-      case '>': return typeof left === 'number' && left > right;
-      case '>=': return typeof left === 'number' && left >= right;
+      case '<': return bothNumbers && (left as number) < (right as number);
+      case '<=': return bothNumbers && (left as number) <= (right as number);
+      case '>': return bothNumbers && (left as number) > (right as number);
+      case '>=': return bothNumbers && (left as number) >= (right as number);
       default: throw new Error(`userRowFake: unsupported operator ${op} in ${expression}`);
     }
   }
@@ -145,6 +157,13 @@ export function evaluateCondition(
  * `pathSets` / `pathRemoves`, all-or-nothing, only when the condition holds — otherwise it throws
  * `ConditionalCheckFailedException` like the real call.
  */
+/**
+ * The stored row as tests read it. Deliberately loose: tests navigate arbitrary nested attributes of the
+ * row they set up, and typing every fixture would only restate the fixture.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type FakeUserRow = Record<string, any>;
+
 export function createUserRowFake(initial: Row) {
   const state = { row: clone(initial) as Row };
   const updateUser = async (_userId: string, fields: Row = {}, options: UpdateUserOptions = {}) => {
@@ -165,8 +184,8 @@ export function createUserRowFake(initial: Row) {
     return clone(state.row);
   };
   return {
-    get row() { return state.row; },
-    set row(row: Row) { state.row = clone(row); },
+    get row(): FakeUserRow { return state.row; },
+    set row(row: FakeUserRow) { state.row = clone(row); },
     read: async () => clone(state.row),
     updateUser,
   };

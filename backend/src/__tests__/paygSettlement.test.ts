@@ -17,12 +17,14 @@ import { resolveEnforcementCostBasisMicroUsd } from '../services/spendEnforcemen
 import { resolveLlmUsagePoolDecision } from '../services/llmUsagePoolDecision';
 import { getCurrentUsageMonth, type MonthlyLlmUsageCredits } from '../services/llmUsageCreditService';
 import { getCurrentMonth } from '../services/tokenUsageService';
-import { withPaygAdmission, type PaygOverageSettings } from '../services/paygOverage';
+import { withPaygAdmission, type PaygAdmittedMonth, type PaygOverageSettings } from '../services/paygOverage';
+import type { UpdateUserOptions } from './helpers/userRowFake';
 import {
   computePaygSettlementAmount,
   paygSettlementIdempotencyKey,
   paygSettlementMonthsToPrune,
   previousUsageMonth,
+  type PaygSettlement,
 } from '../services/paygSettlement';
 
 const USD = 1_000_000;
@@ -78,7 +80,7 @@ describe('ENG-668 settlement amount = the gate\'s measurement', () => {
     (userDb.getUserByIdConsistent as jest.Mock).mockResolvedValue(owner);
     // Keep what the gate writes: the high-water mark it raises and the admission record settlement bills from.
     const written: Record<string, unknown> = {};
-    (userDb.updateUser as jest.Mock).mockImplementation(async (_id: string, _fields: unknown, options: any) => {
+    (userDb.updateUser as jest.Mock).mockImplementation(async (_id: string, _fields: unknown, options: UpdateUserOptions | undefined) => {
       for (const { path, value } of options?.pathSets ?? []) written[path[1]] = value;
       return {};
     });
@@ -116,7 +118,7 @@ describe('ENG-668 settlement amount = the gate\'s measurement', () => {
   it('is null (hold, never guess) without an admission record, a usable pool, cap or price', () => {
     const base = { month, creditLedger: undefined, settledMicroUsd: 130 * USD };
     const withAdmitted = (entry: Record<string, unknown> | null, over: Partial<PaygOverageSettings> = {}) =>
-      account({ admittedMonths: entry ? [entry as any] : [], ...over });
+      account({ admittedMonths: entry ? [entry as unknown as PaygAdmittedMonth] : [], ...over });
     expect(computePaygSettlementAmount({ ...base, account: withAdmitted(null) })).toBeNull();
     expect(computePaygSettlementAmount({ ...base, account: withAdmitted(admittedAt({ tierPoolHighWaterMicroUsd: 0 })) })).toBeNull();
     expect(computePaygSettlementAmount({ ...base, account: withAdmitted(admittedAt({ capHighWaterMicroUsd: 0 })) })).toBeNull();
@@ -177,7 +179,7 @@ describe('ENG-668 settlement helpers', () => {
   });
 
   it('keeps the month being written and the 11 before it', () => {
-    const stored = Object.fromEntries(['2025-08', '2025-09', '2025-10', '2026-08'].map((m) => [m, {} as any]));
+    const stored = Object.fromEntries(['2025-08', '2025-09', '2025-10', '2026-08'].map((m) => [m, {} as PaygSettlement]));
     expect(paygSettlementMonthsToPrune(stored, '2026-09').sort()).toEqual(['2025-08', '2025-09']);
     expect(paygSettlementMonthsToPrune(undefined, '2026-09')).toEqual([]);
   });

@@ -7,14 +7,19 @@
  * rolls the ledger over keeps the old one as `llmUsageCreditsClosed`, atomically, under the same
  * condition. The row here is real state: the conditions are evaluated, not just recorded.
  */
-const mockTransactWrite = jest.fn<{ promise: () => Promise<any> }, any[]>(() => ({ promise: async () => ({}) }));
+type TransactParams = {
+  TransactItems: Array<{
+    Update: { UpdateExpression: string; ExpressionAttributeNames: Record<string, string>; ExpressionAttributeValues: Record<string, unknown> };
+  }>;
+};
+const mockTransactWrite = jest.fn<{ promise: () => Promise<unknown> }, [TransactParams]>(() => ({ promise: async () => ({}) }));
 jest.mock('aws-sdk', () => {
   const actual = jest.requireActual('aws-sdk');
   return {
     ...actual,
     DynamoDB: {
       ...actual.DynamoDB,
-      DocumentClient: jest.fn(() => ({ transactWrite: (...a: any[]) => mockTransactWrite(...a) })),
+      DocumentClient: jest.fn(() => ({ transactWrite: (params: TransactParams) => mockTransactWrite(params) })),
     },
   };
 });
@@ -71,7 +76,9 @@ describe('ENG-668 closed-month credit ledger', () => {
     expect(result.granted).toBe(true);
     expect(store.row.llmUsageCredits).toMatchObject({ month: '2026-10', totalPurchasedMicroUsd: 30 * USD });
     // Everything settlement reads survives; the per-debit list is left behind.
-    const { debits: _d, debitIds: _di, ...expected } = september;
+    const expected: MonthlyLlmUsageCredits = { ...september };
+    delete expected.debits;
+    delete expected.debitIds;
     expect(store.row.llmUsageCreditsClosed).toEqual(expected);
     // And settlement can find September's credits on day 2.
     expect(getLlmUsageCreditAdjustment(getLlmUsageCreditLedgerForMonth(store.row, '2026-09'), '2026-09')).toEqual({
