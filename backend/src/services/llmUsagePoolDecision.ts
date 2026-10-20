@@ -40,8 +40,11 @@ export interface LlmUsagePoolDecision {
 
 export async function resolveLlmUsagePoolDecision(input: {
   billingUserId: string;
-  /** The billing owner's row, already read by the gate; never re-read here. */
-  billingUser: Pick<User, 'llmUsageCredits' | 'paygOverage' | 'has_payment_method' | 'subscription_status'> | null | undefined;
+  /**
+   * The billing owner's row, already read by the gate. Re-read (strongly consistent) only for a
+   * PAYG-enabled account past its pool, where its PAYG state decides admission.
+   */
+  billingUser: PoolBillingOwner | null | undefined;
   /** The gate's billing month (the credit ledger's key). */
   month: string;
   subscriptionType: string;
@@ -93,9 +96,23 @@ export async function resolveLlmUsagePoolDecision(input: {
   if (paygTier?.allowed !== true) return base;
 
   const usageMonth = getCurrentUsageMonth();
-  await recordPoolHighWater({
+  // Past the pool, the PAYG state decides admission, so read it strongly consistent. `billingUser` came
+  // through UserIdIndex, an eventually consistent GSI: a snapshot a moment old can miss a high-water
+  // mark raised just before a downgrade (measuring overage against the smaller pool and blocking usage
+  // the earlier pool still covers), or an opt-out the owner just made. Below the pool nothing is decided
+  // here, so the snapshot is enough and no extra read is paid. A failed read keeps the snapshot.
+  let owner: PoolBillingOwner = billingUser!;
+  if (mode.reason === 'hard_threshold_reached') {
+    const fresh = await readOwnerConsistently(billingUserId);
+    if (fresh) {
+      if (fresh.paygOverage?.enabled !== true) return base;
+      owner = fresh;
+    }
+  }
+  const ownerAccount = owner.paygOverage!;
+  const poolHighWater = await recordPoolHighWater({
     billingUserId,
-    account,
+    account: ownerAccount,
     month: usageMonth,
     thresholdMicroUsd: policy.hardCostThresholdMicroUsd,
   });
@@ -103,13 +120,13 @@ export async function resolveLlmUsagePoolDecision(input: {
     decision: mode,
     switchOn: true,
     tier: paygTier,
-    account,
-    hasPaymentMethod: billingUser?.has_payment_method,
-    subscriptionStatus: billingUser?.subscription_status,
+    account: { ...ownerAccount, ...(poolHighWater ? { poolHighWater } : {}) },
+    hasPaymentMethod: owner.has_payment_method,
+    subscriptionStatus: owner.subscription_status,
     costUsedMicroUsd,
     overageThresholdMicroUsd: paygOverageThresholdMicroUsd({
       effectiveHardThresholdMicroUsd: policy.hardCostThresholdMicroUsd,
-      poolHighWater: account.poolHighWater,
+      poolHighWater,
       month: usageMonth,
     }),
     month: usageMonth,
@@ -117,28 +134,43 @@ export async function resolveLlmUsagePoolDecision(input: {
   return { ...base, mode: payg.decision, overage: payg.overage, paygBlock: payg.block };
 }
 
+type PoolBillingOwner = Pick<User, 'llmUsageCredits' | 'paygOverage' | 'has_payment_method' | 'subscription_status'>;
+
+/** The billing owner's row, strongly consistent; null when it cannot be read (the caller keeps its snapshot). */
+async function readOwnerConsistently(billingUserId: string): Promise<PoolBillingOwner | null> {
+  try {
+    return ((await userDb.getUserByIdConsistent(billingUserId)) as PoolBillingOwner | undefined) ?? null;
+  } catch (error: any) {
+    console.error(`[paygOverage] Consistent read of ${billingUserId} failed; using the indexed snapshot:`, error?.message || error);
+    return null;
+  }
+}
+
 /**
- * Raise this month's pool high-water mark when today's effective threshold is above it.
+ * Raise this month's pool high-water mark when today's effective threshold is above it, and return the
+ * mark the check should measure against.
  *
  * Written only when it rises, and conditionally on the stored mark still being lower, so two gates
  * (or two instances) racing on the same check cannot lower it. It is NOT the settings version: the
- * settings route writes only its own fields, so the two never overwrite each other. A failed write is
- * logged and the check continues on the in-memory maximum, which is what the write would have stored.
+ * settings route writes only its own fields, so the two never overwrite each other.
+ *
+ * Losing that condition means someone stored an equal-or-higher mark this read did not see. The check
+ * then re-reads the row strongly consistent and uses that mark — measuring against the lower one it
+ * holds would count usage the higher pool still covers as overage. Any other failure is logged and the
+ * check continues on the in-memory maximum, which is what the write would have stored.
  */
 async function recordPoolHighWater(input: {
   billingUserId: string;
   account: PaygOverageSettings;
   month: string;
   thresholdMicroUsd: number;
-}): Promise<void> {
+}): Promise<PaygOverageSettings['poolHighWater']> {
   const stored = input.account.poolHighWater;
-  if (stored?.month === input.month && stored.thresholdMicroUsd >= input.thresholdMicroUsd) return;
+  if (stored?.month === input.month && stored.thresholdMicroUsd >= input.thresholdMicroUsd) return stored;
+  const ours = { month: input.month, thresholdMicroUsd: input.thresholdMicroUsd };
   try {
     await userDb.updateUser(input.billingUserId, {}, {
-      pathSets: [{
-        path: ['paygOverage', 'poolHighWater'],
-        value: { month: input.month, thresholdMicroUsd: input.thresholdMicroUsd },
-      }],
+      pathSets: [{ path: ['paygOverage', 'poolHighWater'], value: ours }],
       condition: {
         expression:
           'attribute_exists(#payg) AND (attribute_not_exists(#payg.#hw) OR #payg.#hw.#month <> :hwMonth OR #payg.#hw.#threshold < :hwThreshold)',
@@ -146,9 +178,17 @@ async function recordPoolHighWater(input: {
         values: { ':hwMonth': input.month, ':hwThreshold': input.thresholdMicroUsd },
       },
     });
+    return ours;
   } catch (error: any) {
-    // Lost the race to an equal-or-higher mark: nothing to do.
-    if (error?.code === 'ConditionalCheckFailedException') return;
-    console.error(`[paygOverage] Failed to record the pool high-water mark for ${input.billingUserId}:`, error?.message || error);
+    if (error?.code !== 'ConditionalCheckFailedException') {
+      console.error(`[paygOverage] Failed to record the pool high-water mark for ${input.billingUserId}:`, error?.message || error);
+      return ours;
+    }
+    // Lost to an equal-or-higher mark: use it.
+    const current = (await readOwnerConsistently(input.billingUserId))?.paygOverage?.poolHighWater;
+    return current?.month === input.month && Number.isFinite(current.thresholdMicroUsd)
+      && current.thresholdMicroUsd > input.thresholdMicroUsd
+      ? current
+      : ours;
   }
 }
