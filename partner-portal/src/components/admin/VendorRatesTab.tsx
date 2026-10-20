@@ -23,7 +23,7 @@ import { buildApiUrl } from '../../config';
 import { useAuth } from '../../contexts/AuthContext';
 
 // Same bounds the backend enforces (vendor-rate override contract).
-const MAX_USD_PER_UNIT = 1000;
+const MAX_USD_PER_UNIT = 10;
 
 interface VendorRate {
   provider: string;

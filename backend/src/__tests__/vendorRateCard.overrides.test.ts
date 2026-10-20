@@ -57,7 +57,7 @@ describe('parseVendorRateOverrides (fail safe)', () => {
     ['negative', -1],
     ['null', null],
     ['string', '0.5'],
-    ['above the cap', 1000.01],
+    ['above the cap', 10.01],
   ])('drops a %s rate but keeps valid siblings', (_n, bad) => {
     const state = parseVendorRateOverrides(
       stored({ twilio: { voice_minute_outbound: bad, number_monthly_rent: 2 } }),
@@ -217,11 +217,11 @@ describe('refresh from AW-Settings (outside NODE_ENV=test)', () => {
 });
 
 describe('6-decimal rule (a rate must never book as $0)', () => {
-  it.each([0.000001, 0.014, 1.15, 1000, 0.0125, 0.123456])('accepts %s', (v) => {
+  it.each([0.000001, 0.014, 1.15, 10, 0.0125, 0.123456])('accepts %s', (v) => {
     expect(isValidOverrideRate(v)).toBe(true);
   });
 
-  it.each([0.0000001, 1e-7, 5e-324, 0.0140004, 1000.000001, 0, -0.000001, NaN, Infinity, 1000.01])(
+  it.each([0.0000001, 1e-7, 5e-324, 0.0140004, 10.000001, 14, 0, -0.000001, NaN, Infinity, 10.01])(
     'rejects %s',
     (v) => {
       expect(isValidOverrideRate(v)).toBe(false);

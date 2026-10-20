@@ -242,7 +242,7 @@ describe('VendorRatesTab', () => {
     expect(resetBtn()).toBeDisabled();
   });
 
-  it.each(['0', '-1', 'NaN', 'abc', '1000.01', 'Infinity', '1e999', '0x10', '0b1', '0o7', '1e-3', '+1', '1,5', '.', '1.1234567', '0.0000001'])(
+  it.each(['0', '-1', 'NaN', 'abc', '10.01', '14', 'Infinity', '1e999', '0x10', '0b1', '0o7', '1e-3', '+1', '1,5', '.', '1.1234567', '0.0000001'])(
     'blocks invalid price %p client-side without a dialog or PUT',
     async (bad) => {
       await renderLoaded();
@@ -263,7 +263,7 @@ describe('VendorRatesTab', () => {
     expect(mockedPut).not.toHaveBeenCalled();
   });
 
-  it.each([['0.014', 0.014], ['.5', 0.5], ['5.', 5], ['0.000001', 0.000001], ['1000', 1000]])(
+  it.each([['0.014', 0.014], ['.5', 0.5], ['5.', 5], ['0.000001', 0.000001], ['10', 10]])(
     'accepts plain decimal %p and sends %p',
     async (typed, sent) => {
       await renderLoaded();
@@ -280,14 +280,14 @@ describe('VendorRatesTab', () => {
     jest.useFakeTimers();
     try {
       await renderLoaded();
-      mockedPut.mockRejectedValue({ response: { status: 400, data: { error: 'usdPerUnit must be <= 1000' } } });
+      mockedPut.mockRejectedValue({ response: { status: 400, data: { error: 'usdPerUnit must be <= 10' } } });
       fireEvent.change(input(), { target: { value: '5' } });
       fireEvent.click(saveBtn());
       fireEvent.click(confirmBtn());
 
-      expect(await screen.findByText('usdPerUnit must be <= 1000')).toBeInTheDocument();
+      expect(await screen.findByText('usdPerUnit must be <= 10')).toBeInTheDocument();
       act(() => { jest.advanceTimersByTime(10000); });
-      expect(screen.getByText('usdPerUnit must be <= 1000')).toBeInTheDocument();
+      expect(screen.getByText('usdPerUnit must be <= 10')).toBeInTheDocument();
       expect(input()).toHaveValue('5');
     } finally {
       jest.useRealTimers();

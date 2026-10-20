@@ -114,9 +114,10 @@ describe('PUT /vendor-rates validation', () => {
     ['exponent below 1e-6', { usdPerUnit: 1e-7 }],
     ['denormal', { usdPerUnit: 5e-324 }],
     ['sub-micro tail', { usdPerUnit: 0.0140004 }],
-    ['just above the cap', { usdPerUnit: 1000.000001 }],
+    ['just above the cap', { usdPerUnit: 10.000001 }],
     ['negative', { usdPerUnit: -0.01 }],
-    ['above 1000', { usdPerUnit: 1000.5 }],
+    ['above 10', { usdPerUnit: 10.5 }],
+    ['a typo of 0.014', { usdPerUnit: 14 }],
     ['string rate', { usdPerUnit: '0.02' }],
     ['missing rate', { usdPerUnit: undefined }],
     ['non-string provider', { provider: 5 }],
@@ -140,7 +141,7 @@ describe('PUT /vendor-rates validation', () => {
     expect((await as(request(app).put(URL)).send([ok])).status).toBe(400);
   });
 
-  it.each([1000, 0.000001, 0.014])('accepts %s', async (v) => {
+  it.each([10, 0.000001, 0.014])('accepts %s', async (v) => {
     expect((await as(request(app).put(URL)).send({ ...ok, usdPerUnit: v })).status).toBe(200);
   });
 });
