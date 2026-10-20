@@ -112,18 +112,24 @@ const unitsOf = (min: number, max: number) =>
     return m && Number(m[1]) >= min && Number(m[1]) <= max;
   }).length;
 
+// Cleanup state: whatever happens, a started login is cancelled and a promoted connection is revoked (server-side logout).
+let cleanup: { cid: string; loginRef?: string; promoted: boolean; revoked: boolean } | undefined;
+
 async function main() {
   await new Promise<void>((r) => bridge.listen(BRIDGE_PORT, "127.0.0.1", () => r()));
   const cid = "live-" + Math.random().toString(36).slice(2, 8);
+  cleanup = { cid, promoted: false, revoked: false };
   const start = await call("/v1/login.start", { connectionId: cid, provider: "claude" });
   check("login.start", start.status === 200 && !!start.json?.url, `ceremony=${start.json?.ceremony}`);
   if (start.status !== 200) throw new Error("login.start failed: " + start.text.slice(0, 100));
+  cleanup.loginRef = start.json.loginRef;
   console.log("\nOpen this URL in a browser (do NOT paste it anywhere), sign in, and copy the code shown:\n" + start.json.url + "\n");
   const code = await readHidden("Paste the code (hidden): ");
   const done = await call("/v1/login.complete", { connectionId: cid, loginRef: start.json.loginRef, code });
   check("login.complete", done.status === 200 && done.json?.status === "ready", `status=${done.json?.status ?? done.status} plan=${done.json?.planLabel ?? "?"}`);
   const prom = await call("/v1/login.promote", { connectionId: cid, loginRef: start.json.loginRef, epoch: 1 });
   check("login.promote", prom.status === 200 && prom.json?.state === "active", `state=${prom.json?.state}`);
+  cleanup.promoted = prom.status === 200;
 
   const uidDirs = readdirSync(HOME_ROOT).filter((n) => /^\d+$/.test(n));
   const uid = Number(uidDirs[0]);
@@ -147,6 +153,7 @@ async function main() {
   check("status-active", st.json?.state === "active", `state=${st.json?.state}`);
 
   const rev = await call("/v1/connection.revoke", { connectionId: cid, epoch: 2 });
+  cleanup.revoked = rev.status === 200;
   check("revoke", rev.status === 200, `status=${rev.status}`);
   await sleep(4000);
   const left = readdirSync(`${HOME_ROOT}/${uid}/homes`).length + readdirSync(`${HOME_ROOT}/${uid}/attempts`).length;
@@ -160,7 +167,16 @@ main()
   .catch((e) => {
     check("runner", false, String(e).slice(0, 120));
   })
-  .finally(() => {
+  .finally(async () => {
+    if (cleanup && !cleanup.revoked) {
+      try {
+        if (cleanup.promoted) await call("/v1/connection.revoke", { connectionId: cleanup.cid, epoch: 2 });
+        else if (cleanup.loginRef) await call("/v1/login.cancel", { connectionId: cleanup.cid, loginRef: cleanup.loginRef });
+        console.log("cleanup: logged out / cancelled after a failure");
+      } catch {
+        console.log("cleanup FAILED: revoke by hand (see runbook)");
+      }
+    }
     bridge.close();
     const failed = results.filter((r) => !r.ok);
     console.log(`\n${results.length - failed.length}/${results.length} checks passed${failed.length ? "; FAILED: " + failed.map((f) => f.name).join(", ") : ""}`);
