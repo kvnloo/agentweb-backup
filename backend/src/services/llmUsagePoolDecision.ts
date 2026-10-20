@@ -8,9 +8,11 @@
  * PAYG adds a step that must apply in BOTH or neither — a turn gate 1 admits and gate 2 refuses is a
  * 429 after the user already saw it accepted — so the pipeline now exists exactly once, here.
  *
- * For an account that has not opted into PAYG this does precisely what both gates did before: no
- * extra read, no write, the same decision object. The switch, the high-water mark and the PAYG
- * evaluation are reached only for a billing owner whose own row says `paygOverage.enabled === true`.
+ * For an account that has never stored a PAYG opt-in this does precisely what both gates did before: no
+ * extra read, no write, the same decision object. The switch and the high-water mark are reached only
+ * for a billing owner whose row carries a `paygOverage` record (on or off — the mark is kept while off,
+ * see below); the PAYG evaluation only when that record says `enabled === true`. The decision for an
+ * account whose opt-in is off is always the base decision.
  */
 import type { User } from './db';
 import { userDb } from './db';
@@ -86,10 +88,10 @@ export async function resolveLlmUsagePoolDecision(input: {
     paygBlock: null,
   };
 
-  // Opt-in is per billing owner and the row is already in hand, so every account that never turned
-  // PAYG on stops here: no switch read, no write. `policy_not_enforced` has no pool to go past.
+  // Opt-in is per billing owner and the row is already in hand, so every account that never stored a
+  // PAYG record stops here: no switch read, no write. `policy_not_enforced` has no pool to go past.
   const account = billingUser?.paygOverage;
-  if (account?.enabled !== true || !policy || mode.reason === 'policy_not_enforced') return base;
+  if (!account || !policy || mode.reason === 'policy_not_enforced') return base;
   const { paygOverageSwitch } = await import('./paygOverageService');
   if (!(await paygOverageSwitch.isEnabled())) return base;
   const paygTier = await input.paygTier();
@@ -102,20 +104,26 @@ export async function resolveLlmUsagePoolDecision(input: {
   // the earlier pool still covers), or an opt-out the owner just made. Below the pool nothing is decided
   // here, so the snapshot is enough and no extra read is paid. A failed read keeps the snapshot.
   let owner: PoolBillingOwner = billingUser!;
-  if (mode.reason === 'hard_threshold_reached') {
+  if (account.enabled === true && mode.reason === 'hard_threshold_reached') {
     const fresh = await readOwnerConsistently(billingUserId);
     if (fresh) {
-      if (fresh.paygOverage?.enabled !== true) return base;
+      if (!fresh.paygOverage) return base;
       owner = fresh;
     }
   }
   const ownerAccount = owner.paygOverage!;
+  // The mark is kept for a stored opt-in even while PAYG is OFF. A same-month re-enable keeps the
+  // month's opt-in baseline, so the pool it is measured against must include any larger pool the month
+  // had while PAYG was off — otherwise usage that pool included (upgrade, spend, downgrade, re-enable)
+  // would be counted, and billed, as overage. Written only when it rises, as for an enabled opt-in.
   const poolHighWater = await recordPoolHighWater({
     billingUserId,
     account: ownerAccount,
     month: usageMonth,
     thresholdMicroUsd: policy.hardCostThresholdMicroUsd,
   });
+  // Only an opt-in that is ON is ever evaluated; an OFF one keeps today's decision exactly.
+  if (ownerAccount.enabled !== true) return base;
   const payg = evaluatePaygAdmission({
     decision: mode,
     switchOn: true,
