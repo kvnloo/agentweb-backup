@@ -101,6 +101,11 @@ describe('classifyToolFailureType', () => {
     it('classifies the Slack bot not being in the channel', () => {
       expect(classifyToolFailureType('Error', 'The Slack bot is not a member of channel C09JU')).toBe('config');
     });
+    it('classifies the landing-page share non-member refusal as by_design (ENG-2585)', () => {
+      expect(
+        classifyToolFailureType('Error', "API error (400): 'x@y.com' is not a member of the page owner's organization"),
+      ).toBe('by_design');
+    });
     it('classifies a landing-page authorization gap', () => {
       expect(classifyToolFailureType('Error', 'Not authorized to edit this landing page.')).toBe('config');
     });
