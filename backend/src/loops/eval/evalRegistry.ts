@@ -337,7 +337,7 @@ export const EVAL_REGISTRY: readonly GraderEntry[] = [
       'scripts/scoreCreativeRubric.ts (offline, read-only)',
     ],
     knownIssues: ['ENG-421'],
-    notes: 'Advisory (ENG-2140, ENG-2192): never blocks generation. Off unless CREATIVE_RUBRIC_JUDGE_ENABLED=true with CREATIVE_RUBRIC_JUDGE_SAMPLE_RATE > 0 (unset in prod). Images are judged only after the deterministic gates pass. Surfaces: ad_image (7 criteria), organic_image, ad_copy, landing_page (ENG-421 criteria that apply). Runtime pairwise vs the prior best for ad images. Not yet validated against human labels (ENG-2136 harness, per-criterion kappa).',
+    notes: 'Advisory (ENG-2140, ENG-2192): never blocks generation. Off unless CREATIVE_RUBRIC_JUDGE_ENABLED=true with CREATIVE_RUBRIC_JUDGE_SAMPLE_RATE > 0. Prod: on at sample rate 0.25 (Agentweb-backend-env-prod-3, checked 2026-10-19); verdicts are stored and reported in the eval-v2 creative snapshot (report-only); nothing gates or alerts on them. Images are judged only after the deterministic gates pass. Surfaces: ad_image (7 criteria), organic_image, ad_copy, landing_page (ENG-421 criteria that apply). Runtime pairwise vs the prior best for ad images. Not yet validated against human labels (ENG-2136 harness, per-criterion kappa).',
   },
   {
     id: 'creative-performance-correlation',
