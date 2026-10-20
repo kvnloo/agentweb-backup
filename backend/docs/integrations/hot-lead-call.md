@@ -276,7 +276,7 @@ refused the same way; the orchestrator always stores one.
 ## Emma tools
 
 Registered as foundation tools. Org membership comes from the authenticated user
-(never from arguments); reads need membership, writes need `org:configure`
+(never from arguments); `get_hot_lead_call_settings` and every write need `org:configure`
 (owner/admin). Not available in shared sessions.
 
 Settings (merged). Both tools call the same service as the REST API
@@ -304,7 +304,7 @@ Settings (merged). Both tools call the same service as the REST API
     unchanged, so a concurrent edit fails ("changed by someone else") instead of clobbering.
   - Unattended runs (`context.isUnattendedRun === true`) are refused for any change that turns calling on,
     raises a cap (`maxAgeMinutes`, `maxCallsPerHour`, `maxCallsPerDay`, `maxAttemptsPerLead`), shortens
-    the pause between calls to one person, adds a lead type or country, widens the calling hours (or moves
+    the pause between calls to one person, changes the business name that is read aloud, adds a lead type or country, widens the calling hours (or moves
     them to another zone), first-saves the settings, or edits the team. Turning calling off and lowering a limit
     stay allowed. Confirming a verification code has no such refusal (it needs the code).
 
@@ -406,10 +406,13 @@ PUT semantics: `team` (when sent) replaces the whole team; its order is the prio
 removed; entries without `id` are new people (server-generated id, `phone` required); a phone left out of an
 existing entry is unchanged; a changed phone clears that person's verification. Everything else not sent keeps its
 value. A body of only `{ _revision, enabled }` is valid. Calling hours are only required when enabling. Unknown keys,
-`verifiedAt`, `twilioNumber*` and the tool-only limits are refused with 400; the body is capped at 32 KB, 10 people and 7
+`verifiedAt`, `twilioNumber*` and the tool-only limits are refused with 400; the body is capped at 32 KB of JSON text (32,768 characters, not bytes), 10 people and 7
 windows per person. Turning calling on needs the plan feature and every requirement of `canEnable`; an explicit
 `enabled: true` that cannot work yet is a 400 naming the missing piece, while an edit that merely leaves a running
-setup without any verified person (the only verified phone changed) turns calling off.
+setup without any verified person (the only verified phone changed) turns calling off. That is silent: the save succeeds
+and the response carries `enabled: false` with the blocker in `blockers`, so a client must read `enabled` from the response
+rather than assume what it sent. REST error texts are plain English; the Emma tools reword the same refusals with the
+names of the tools that fix them.
 
 `fieldErrors` are keyed by position in the submitted body: `team.N.name`, `team.N.phone`, `team.N.id`, `team.N.windows`,
 `team.N.windows.M.days|start|end`, `callingHours.start|end|timezone`, `maxAttemptsPerLead`, `announcedName`, `enabled`.
@@ -610,7 +613,8 @@ Rules the code enforces:
   double-bills. Twilio's status-callback retries are idempotent on the leg and on
   `lastSequence`.
 - The verification call has no status callback and is metered at an
-  estimated one minute.
+  estimated one minute. A placement the provider did not confirm returns no CallSid, which
+  the usage event is keyed by, so that start is not metered (at most one minute, and starts are capped per person and per day).
 - **Recurring number rent is NOT metered.** Only the first month is recorded at
   purchase. A scheduled job that meters `twilio:number:<sid>:<YYYY-MM>` for every
   stored `twilioNumberSid` each month is a follow-up (see below).
