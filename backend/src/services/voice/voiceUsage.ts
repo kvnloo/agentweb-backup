@@ -1,7 +1,7 @@
 import { recordVendorUsage } from '../usageRecorderService';
 import type { HotLeadCallLeg } from './leadCallStore.types';
 
-/** 'verify' is the one-off destination-verification call (no status callback, so it is metered at an estimate). */
+/** 'verify' is the one-off phone-verification call (no status callback, so it is metered at an estimate). */
 type CallLeg = HotLeadCallLeg | 'verify';
 
 interface CallUsage {

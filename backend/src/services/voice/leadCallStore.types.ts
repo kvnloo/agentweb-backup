@@ -1,20 +1,25 @@
 /**
- * Shared contract between the hot-lead call orchestrator (places the owner call) and the Twilio
+ * Shared contract between the hot-lead call orchestrator (places the member call) and the Twilio
  * voice webhooks (drive the call forward). Types only: the implementation is in leadCallStore.ts;
  * the orchestrator, the webhooks and tests use this interface.
  */
 
 export type HotLeadCallState =
-  | 'dialing' // record created; the owner call is being placed (or placement was ambiguous)
-  | 'owner_ringing'
-  | 'owner_answered' // owner picked up, prompt playing
-  | 'bridging' // owner pressed 1, dialing the lead
+  | 'dialing' // record created; the member call is being placed (or placement was ambiguous)
+  | 'member_ringing'
+  | 'member_answered' // member picked up, prompt playing
+  | 'between_attempts' // a member leg ended without taking the lead; the next member has not been called yet
+  | 'bridging' // member pressed 1, dialing the lead
   | 'connected' // lead answered, both legs bridged
   | 'finished' // terminal: call completed (any outcome recorded in `outcome`)
   | 'failed' // terminal: could not place or complete the call
   | 'skipped'; // terminal: a gate refused the call (no Twilio call was made)
 
-export type HotLeadCallLeg = 'owner' | 'lead';
+/** Which side of the call a Twilio callback is for. */
+export type HotLeadCallLeg = 'member' | 'lead';
+
+/** A metered leg: 'member:<attemptNo>' (one per attempt) or 'lead'. */
+export type MeteredLeg = 'lead' | `member:${number}`;
 
 export interface HotLeadCallRecord {
   state: HotLeadCallState;
@@ -22,17 +27,23 @@ export interface HotLeadCallRecord {
   jobKey: string;
   startedAt: string;
   updatedAt: string;
-  ownerCallSid?: string;
+  /** 1-based number of the member call this record is on. */
+  attemptNo?: number;
+  /** The member being rung by the current attempt (HotLeadCallMember.id). */
+  memberId?: string;
+  /** Every member already called for this lead, in call order; never shrinks. */
+  triedMemberIds?: string[];
+  memberCallSid?: string;
   leadCallSid?: string;
-  /** Short machine reason for terminal states, e.g. 'owner_no_answer', 'owner_declined', 'lead_no_answer'. */
+  /** Short machine reason for terminal states, e.g. 'member_no_answer', 'member_declined', 'lead_no_answer', 'lead_declined'. */
   outcome?: string;
   /** Legs already metered through recordCallUsage, so a replayed status callback cannot meter twice. */
-  meteredLegs?: HotLeadCallLeg[];
+  meteredLegs?: MeteredLeg[];
   /**
    * Highest Twilio SequenceNumber handled per CallSid, to ignore out-of-order status callbacks. It also holds
    * the voice webhooks' first-writer-wins decision markers, which rely on the same strictly-higher condition
-   * (a second write of the same key fails): `<ownerCallSid>#gather` (the owner's one decision at the Gather)
-   * and `<ownerCallSid>#dial` (the one lead-did-not-answer result).
+   * (a second write of the same key fails): `<memberCallSid>#gather` (the member's one decision at the Gather)
+   * and `<memberCallSid>#dial` (the one lead-did-not-answer result).
    */
   lastSequence?: Record<string, number>;
 }
@@ -40,9 +51,10 @@ export interface HotLeadCallRecord {
 /** Engagement event types written to the lead timeline (via addLeadEngagement). */
 export type HotLeadCallEventType =
   | 'call.initiated'
-  | 'call.owner_answered'
-  | 'call.owner_declined'
-  | 'call.owner_no_answer'
+  | 'call.member_answered'
+  | 'call.member_declined'
+  | 'call.member_no_answer'
+  | 'call.lead_declined'
   | 'call.connected'
   | 'call.lead_no_answer'
   | 'call.completed'

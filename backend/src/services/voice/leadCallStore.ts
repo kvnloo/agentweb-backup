@@ -2,10 +2,10 @@ import { crmDb, ENGAGED_EVENT_KEYWORDS } from '../db';
 import { redactPhones } from './redactText';
 import type {
   HotLeadCallEventType,
-  HotLeadCallLeg,
   HotLeadCallRecord,
   HotLeadCallState,
   LeadCallStore,
+  MeteredLeg,
 } from './leadCallStore.types';
 
 /** Key under `lead.system` that holds the record. No table or index: the call state rides on the lead row. */
@@ -44,7 +44,7 @@ function isRecord(value: unknown): value is HotLeadCallRecord {
 
 // The scalar fields a patch may set. An explicit list (not a spread) so a caller can never smuggle
 // other keys, phone numbers included, into the lead row.
-const SCALAR_FIELDS = ['state', 'jobKey', 'startedAt', 'updatedAt', 'ownerCallSid', 'leadCallSid', 'outcome'] as const;
+const SCALAR_FIELDS = ['state', 'jobKey', 'startedAt', 'updatedAt', 'memberCallSid', 'leadCallSid', 'outcome', 'attemptNo', 'memberId'] as const;
 
 function scalarFields(record: Partial<HotLeadCallRecord>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -62,17 +62,18 @@ class DynamoLeadCallStore implements LeadCallStore {
   }
 
   async create(listId: string, leadId: string, record: HotLeadCallRecord): Promise<boolean> {
-    // meteredLegs and lastSequence are initialised empty because the conditional updates in
+    // meteredLegs, triedMemberIds and lastSequence are initialised because the conditional updates in
     // transition() cannot append to or set a path under a missing list/map.
     return crmDb.createLeadSystemRecordOnce(listId, leadId, SYSTEM_KEY, {
       ...scalarFields(record),
       meteredLegs: [...new Set(record.meteredLegs ?? [])],
+      triedMemberIds: [...new Set(record.triedMemberIds ?? [])],
       lastSequence: { ...record.lastSequence },
     });
   }
 
   /**
-   * In `patch`, `meteredLegs` lists the legs to ADD and `lastSequence` the entries to merge (not
+   * In `patch`, `meteredLegs` and `triedMemberIds` list the entries to ADD (a value already present fails the write) and `lastSequence` the entries to merge (not
    * replacements). `from` must name non-terminal states only; a terminal one makes it return false.
    * Consumer rule: because a terminal record is never revived, the webhook must meter a leg in the
    * same transition that makes the call terminal (or before it), never in a later one.
@@ -89,12 +90,12 @@ class DynamoLeadCallStore implements LeadCallStore {
   ): Promise<boolean> {
     // A terminal record is never revived: a caller bug that lists one in `from` is refused, not applied.
     if (from.length === 0 || from.some((s) => TERMINAL_STATES.includes(s))) return false;
-    const legs: HotLeadCallLeg[] = [...new Set(patch.meteredLegs ?? [])];
+    const legs: MeteredLeg[] = [...new Set(patch.meteredLegs ?? [])];
     return crmDb.updateLeadSystemRecordIf(listId, leadId, SYSTEM_KEY, {
       stateIn: from,
       set: { ...scalarFields(patch), updatedAt: new Date().toISOString() },
       maxIn: patch.lastSequence ? { lastSequence: patch.lastSequence } : undefined,
-      appendNew: { meteredLegs: legs },
+      appendNew: { meteredLegs: legs, triedMemberIds: [...new Set(patch.triedMemberIds ?? [])] },
     });
   }
 

@@ -45,7 +45,7 @@ describe('recordCallUsage', () => {
   });
 
   it('uses a distinct idempotency key per leg and a stable one per (callSid, leg)', async () => {
-    await recordCallUsage({ ...base, leg: 'owner', durationSeconds: 30 });
+    await recordCallUsage({ ...base, leg: 'member', durationSeconds: 30 });
     await recordCallUsage({ ...base, leg: 'lead', durationSeconds: 30 });
     await recordCallUsage({ ...base, leg: 'lead', durationSeconds: 30 });
     const keys = mockRecord.mock.calls.map((c) => c[0].idempotencyKey);

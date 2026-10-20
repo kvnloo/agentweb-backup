@@ -28,7 +28,7 @@ type JobInput = Omit<HotLeadCallJob, 'orgId'>;
 type Submission = { submissionId: string; submittedAt: string };
 
 const SOURCE = 'hot_lead_call';
-const OWNER_RING_TIMEOUT_SECONDS = 25;
+const MEMBER_RING_TIMEOUT_SECONDS = 25;
 const MINUTE_MS = 60_000;
 // Anyone can submit a landing-page form, and again, so refusals must not grow the lead row without bound:
 // one `call.skipped` event per distinct reason, and five in all.
@@ -55,7 +55,7 @@ const SKIP_GATES: Array<(g: GateInput) => string | null> = [
   // Enabled configs are validated to have one, but the call must never reach create without it: a skip
   // keeps the lead's single call slot unused.
   ({ config }) => (config.twilioNumber ? null : 'no_caller_number'),
-  // The webhooks reject ids outside their strict shape; Twilio would ring the owner and every callback would fail.
+  // The webhooks reject ids outside their strict shape; Twilio would ring the member and every callback would fail.
   ({ job }) => (isWebhookSafeId(job.listId) && isWebhookSafeId(job.leadId) ? null : 'unsafe_id'),
   ({ lead, config }) => {
     const callable = callableLeadPhone(lead.phone, config);
@@ -89,7 +89,7 @@ async function hasCallRecord(store: LeadCallStore, listId: string, leadId: strin
 }
 
 /**
- * Everything that decides whether this lead should ring the owner, cheapest check first. Runs at
+ * Everything that decides whether this lead should ring a team member, cheapest check first. Runs at
  * dispatch and again in the job (state can change in between). Returns null for "do nothing";
  * refusals worth showing on the timeline also record `call.skipped`.
  */
@@ -127,7 +127,7 @@ async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: H
 }
 
 /**
- * Re-runs the gates, then places the owner call at most once. The call record is the at-most-once
+ * Re-runs the gates, then places the member call at most once. The call record is the at-most-once
  * control: store.create is create-if-absent, so false means a record already exists for this lead and
  * we never dial, and a throw means nothing was dialed and the job fails (the queue row dedupes the
  * same job key). v1 rule: a lead gets one call record ever, so a place_rejected lead is not retried
@@ -175,7 +175,7 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
   }
   if (!created) return;
 
-  // If the post-call transition fails the record stays 'dialing'; the first signed owner callback adopts the CallSid.
+  // If the post-call transition fails the record stays 'dialing'; the first signed member callback adopts the CallSid.
   const settle = async (patch: Parameters<typeof store.transition>[3], event: 'call.initiated' | 'call.failed', detail?: Record<string, string>) => {
     try {
       if (await store.transition(listId, leadId, ['dialing'], patch)) await store.addEvent(listId, leadId, event, detail);
@@ -184,27 +184,27 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
     }
   };
 
-  let ownerCallSid: string;
+  let memberCallSid: string;
   try {
-    ({ callSid: ownerCallSid } = await getVoiceProvider().placeCall({
+    ({ callSid: memberCallSid } = await getVoiceProvider().placeCall({
       to: config.destinationPhone,
       from: config.twilioNumber!, // non-null: the no_caller_number gate refused otherwise
       url,
       statusCallbackUrl,
-      timeoutSeconds: OWNER_RING_TIMEOUT_SECONDS,
+      timeoutSeconds: MEMBER_RING_TIMEOUT_SECONDS,
     }));
   } catch (err) {
     if (err instanceof VoiceCallError && err.placed === 'no') {
-      console.warn('[hotLeadCall] owner call rejected', { listId, leadId, to: redactPhone(config.destinationPhone) });
+      console.warn('[hotLeadCall] member call rejected', { listId, leadId, to: redactPhone(config.destinationPhone) });
       await settle({ state: 'failed', outcome: 'place_rejected' }, 'call.failed', { reason: 'place_rejected' });
     } else {
       // The call may be live: stay non-terminal so the webhooks can still adopt and meter it. Never retried.
-      console.warn('[hotLeadCall] owner call placement unknown', { listId, leadId, to: redactPhone(config.destinationPhone) });
+      console.warn('[hotLeadCall] member call placement unknown', { listId, leadId, to: redactPhone(config.destinationPhone) });
       await settle({ state: 'dialing', outcome: 'placement_unknown' }, 'call.failed', { reason: 'placement_unknown' });
     }
     return;
   }
-  await settle({ state: 'owner_ringing', ownerCallSid }, 'call.initiated');
+  await settle({ state: 'member_ringing', memberCallSid }, 'call.initiated');
 }
 
 /** Never rejects to a lead saver. Fire-and-forget right after a successful lead write. */

@@ -2,7 +2,7 @@
 
 When a landing-page form lead arrives with a phone number, AgentWeb phones the
 business owner from a Twilio number the org owns and says "New lead from
-<business name>. Press 1 to connect to them now." On `1` it dials the lead and
+<business name>. Are you available to take the call now? Press 1." On `1` it dials the lead and
 bridges the two. The outcome and every step are written to the lead's timeline.
 
 It is a second subscriber to the same moment as the Slack lead alert
@@ -43,19 +43,19 @@ sequenceDiagram
   participant Lead as Landing form
   participant App as AgentWeb backend
   participant Tw as Twilio
-  participant Owner as Owner's phone
+  participant Member as Member's phone
   participant LeadPhone as Lead's phone
 
   Lead->>App: form submit -> crmDb.createLead (or repeat submission)
   App->>App: dispatchLeadCreated -> dispatchHotLeadCall (kill switch, gates, limits)
   App->>App: LeadCallStore.create(state=dialing) is the lock
-  App->>Tw: calls.create(to=owner, from=org number, url=/owner, statusCallback=/status, timeout=25s)
-  App->>App: state=owner_ringing, event call.initiated
-  Tw->>Owner: rings
-  Owner-->>Tw: answers
+  App->>Tw: calls.create(to=member, from=org number, url=/owner, statusCallback=/status, timeout=25s)
+  App->>App: state=member_ringing, event call.initiated
+  Tw->>Member: rings
+  Member-->>Tw: answers
   Tw->>App: POST /owner (signed)
-  App-->>Tw: Gather TwiML (prompt, 8s, 1 digit) - state=owner_answered, call.owner_answered
-  Owner->>Tw: presses 1
+  App-->>Tw: Gather TwiML (prompt, 8s, 1 digit) - state=member_answered, call.member_answered
+  Member->>Tw: presses 1
   Tw->>App: POST /gather Digits=1 (signed)
   App-->>Tw: Say + Dial callerId=org number, Number=lead (statusCallback ...&leg=lead) - state=bridging
   Tw->>LeadPhone: rings (25s)
@@ -64,7 +64,7 @@ sequenceDiagram
   Note over App: state=connected, event call.connected
   Tw->>App: POST /dial DialCallStatus=completed (action URL, after the bridge ends)
   Tw->>App: POST /status leg=lead completed + CallDuration  -> metered once
-  Tw->>App: POST /status (owner) completed + CallDuration   -> metered once
+  Tw->>App: POST /status (member) completed + CallDuration   -> metered once
   Note over App: last leg metered -> state=finished, outcome=completed, event call.completed
 ```
 
@@ -72,14 +72,14 @@ Branches (all end in `finished` once every leg that was dialed is metered):
 
 | Situation | Webhook that decides | Outcome | Timeline events after `call.initiated` |
 | --- | --- | --- | --- |
-| Owner presses 1, lead answers | `/gather`, lead `/status` | `completed` | `call.owner_answered`, `call.connected`, `call.completed` |
-| Owner presses another digit | `/gather` | `owner_declined` | `call.owner_answered`, `call.owner_declined`, `call.completed` |
-| Owner hangs up on or ignores the prompt | owner `/status` terminal | `owner_declined` | `call.owner_answered`, `call.owner_declined`, `call.completed` |
-| Owner never picks up (no-answer, busy, failed, canceled) | owner `/status` terminal | `owner_no_answer` | `call.owner_no_answer`, `call.completed` |
-| Owner presses 1, lead does not answer | `/dial` with `no-answer`, `busy` or `failed` | `lead_no_answer` | `call.owner_answered`, `call.lead_no_answer`, `call.completed` |
-| Lead number no longer valid at bridge time | `/gather` | `lead_phone_invalid` (record stays `owner_answered` until the owner leg ends) | `call.owner_answered`, `call.failed` (reason `lead_phone_invalid`), `call.completed` |
-| Kill switch or config turned off while the owner is on the line | `/owner` or `/gather` | `aborted` | at `/owner` (still ringing): `call.failed` (reason `aborted`), `call.completed`; at `/gather` (owner was on the prompt): `call.owner_answered`, `call.failed` (reason `aborted`), `call.completed` |
-| Owner hangs up while the lead is still ringing (`/dial` reports `canceled`) | `/dial`, then `finishIfComplete` | `bridge_unconfirmed` | `call.owner_answered`, `call.completed` |
+| Member presses 1, lead answers | `/gather`, lead `/status` | `completed` | `call.member_answered`, `call.connected`, `call.completed` |
+| Member presses another digit | `/gather` | `member_declined` | `call.member_answered`, `call.member_declined`, `call.completed` |
+| Member hangs up on or ignores the prompt | member `/status` terminal | `member_declined` | `call.member_answered`, `call.member_declined`, `call.completed` |
+| Member never picks up (no-answer, busy, failed, canceled) | member `/status` terminal | `member_no_answer` | `call.member_no_answer`, `call.completed` |
+| Member presses 1, lead does not answer | `/dial` with `no-answer`, `busy` or `failed` | `lead_no_answer` | `call.member_answered`, `call.lead_no_answer`, `call.completed` |
+| Lead number no longer valid at bridge time | `/gather` | `lead_phone_invalid` (record stays `member_answered` until the member leg ends) | `call.member_answered`, `call.failed` (reason `lead_phone_invalid`), `call.completed` |
+| Kill switch or config turned off while the member is on the line | `/owner` or `/gather` | `aborted` | at `/owner` (still ringing): `call.failed` (reason `aborted`), `call.completed`; at `/gather` (member was on the prompt): `call.member_answered`, `call.failed` (reason `aborted`), `call.completed` |
+| Member hangs up while the lead is still ringing (`/dial` reports `canceled`) | `/dial`, then `finishIfComplete` | `bridge_unconfirmed` | `call.member_answered`, `call.completed` |
 | Bridge ended but `/dial` never reported a result | `finishIfComplete` | `bridge_unconfirmed` | `call.completed` |
 
 The leg-metering rule behind "finished": the store refuses to move a terminal
@@ -104,7 +104,7 @@ All paths are under `backend/src/`.
 | Twilio seam (`placeCall`, `buyNumber`, `releaseNumber`, `validateSignature`) | `services/voice/voiceProvider.ts` (the only file that imports `twilio`), `services/voice/fakeVoiceProvider.ts` |
 | Webhook URLs | `services/voice/voiceUrls.ts` |
 | TwiML builders (hand-built XML, XML-escaped) | `services/voice/twiml.ts` |
-| Webhook routes, mounted at `/api/webhooks/twilio-voice` | `routes/twilioVoiceWebhook.ts` (`/owner`, `/gather`, `/dial`, `/status`) |
+| Webhook routes, mounted at `/api/webhooks/twilio-voice` | `routes/twilioVoiceWebhook.ts` (`/owner`, `/gather`, `/dial`, `/status`; the path names are kept from the first version, `/owner` now serves the prompt to the team member being rung) |
 | Per-leg metering | `services/voice/voiceUsage.ts` `recordCallUsage` -> `recordVendorUsage` |
 | Rate card and runtime rate overrides | `utils/vendorRateCard.ts`, `routes/adminVendorRates.ts` |
 | Twilio credentials | `utils/secretsManager.ts` `getTwilioCredentials` |
@@ -131,14 +131,14 @@ the lock:
 2. `LeadCallStore.create` writes `lead.system.hot_lead_call` with `state=dialing`
    using a create-if-absent conditional write. `false` means a record already
    exists: do not dial. A lead gets at most one call record, ever (v1).
-3. `placeCall`. Success: `owner_ringing` + `call.initiated`. Twilio rejected it
+3. `placeCall`. Success: `member_ringing` + `call.initiated`. Twilio rejected it
    (HTTP 4xx other than 408, `placed: 'no'`): terminal `failed` /
    `place_rejected` + `call.failed`. Anything ambiguous (timeout, 5xx, no
    response, no sid): the record stays `dialing` with `outcome=placement_unknown`
    + `call.failed` (reason `placement_unknown`), and is NEVER retried.
-4. A `dialing` record can still be adopted: the first signed owner-leg callback
-   (`/owner` or the owner `/status`) for the same `jobKey` supplies the CallSid,
-   moves the record to `owner_ringing`, writes `call.initiated`, and the call is
+4. A `dialing` record can still be adopted: the first signed member-leg callback
+   (`/owner` or the member `/status`) for the same `jobKey` supplies the CallSid,
+   moves the record to `member_ringing`, writes `call.initiated`, and the call is
    metered normally.
 
 The queue job row also dedupes the same job key (`sha256(orgId, listId, leadId
@@ -229,7 +229,7 @@ Order of setup, which the tool text also teaches Emma:
    hours (with timezone), optionally lead types and limits. Saved disabled.
 2. `provision_hot_lead_call_number` (spends money, needs explicit user consent).
 3. `start_hot_lead_call_verification`, then `confirm_hot_lead_call_verification`
-   with the code the owner heard.
+   with the code the member heard.
 4. `update_hot_lead_call_settings({enabled: true})`. Refused unless the phone is
    verified, a number is assigned and quiet hours are set.
 
@@ -281,7 +281,7 @@ members and admins follow the owner's plan) lists `hot_lead_call` or `*`.
 backend instance for 30 seconds, so a flip takes up to ~30s per instance to
 apply, and the failure direction is off. Off means `dispatchHotLeadCall` returns
 before any read or write (no lead read, no limit key, no event, no queue job),
-and in-flight calls are cut short: an owner who picks up after the switch is
+and in-flight calls are cut short: a member who picks up after the switch is
 turned off hears a hangup (`aborted`) while the leg is still metered. Under
 Jest (`NODE_ENV=test`) it is always off unless overridden.
 
@@ -318,7 +318,7 @@ What the code requires (verified from code):
 - The caller ID must be a number the account owns (the TwiML `<Dial callerId>`
   and the REST `from`). The provisioning tool buys it: `availablePhoneNumbers('US').local`,
   voice-enabled, optionally by area code. The org's number is always a US local
-  number, even for a Canadian owner.
+  number, even for a Canadia member.
 - Outbound calls to US and Canadian numbers only (`allowedCountries`).
 - Public HTTPS reachability of `BACKEND_URL` for the four webhooks.
 
@@ -341,7 +341,7 @@ No new table or index. The feature writes:
 | `hotLeadCallProvisioning` (purchase/release timestamps for the daily caps) | org attribute | provisioning tools |
 | `hot_lead_call_mode` | AW-Settings item | operators |
 | `vendor_rate_overrides` | AW-Settings item | admin Vendor Rates tab |
-| `system.hot_lead_call` (call record: `state`, `jobKey`, `startedAt`, `updatedAt`, `ownerCallSid`, `leadCallSid`, `outcome`, `meteredLegs`, `lastSequence`) | on the lead row (AW-Leads), no phone number | orchestrator and webhooks |
+| `system.hot_lead_call` (call record: `state`, `jobKey`, `startedAt`, `updatedAt`, `attemptNo`, `memberId`, `triedMemberIds`, `memberCallSid`, `leadCallSid`, `outcome`, `meteredLegs` (`member:<attempt>` and `lead`), `lastSequence`) | on the lead row (AW-Leads), no phone number | orchestrator and webhooks |
 | Timeline events `call.*` | the lead's `engagements` list | `LeadCallStore.addEvent` |
 | `hlc#phone#<hmac>`, `hlc#cool#<orgId>`, `hlc#cap#h#<orgId>#<UTC hour>`, `hlc#cap#d#<orgId>#<local date>` | existing table `AW-MCPSessions` (partition key `sessionId`, attribute `ttl`) | limit store |
 
@@ -389,14 +389,14 @@ cached ~60 seconds. Spend events carry the rate-card version, with an
 Rules the code enforces:
 
 - Voice: one usage event per leg, with the leg's own CallSid, idempotency key
-  `twilio:voice:<CallSid>:<owner|lead>`, quantity `ceil(CallDuration / 60)`
+  `twilio:voice:<CallSid>:<member|lead>`, quantity `ceil(CallDuration / 60)`
   minutes (round up per leg; Twilio's pricing page states a per-minute rate and
   no rounding rule, so rounding up is the conservative choice). A leg with
   `CallDuration` 0 records no event but is still marked metered so the call can
   finish. A missing, empty, blank or non-numeric `CallDuration` is never defaulted to 0: the
   leg is not billed and a warning is logged, so a malformed callback
   undercharges visibly rather than silently.
-- The owner leg is billed as an outbound minute for the whole time the owner is
+- The member leg is billed as an outbound minute for the whole time the member is
   on the line, including the bridged conversation, plus the lead leg's own
   minutes. Both are outbound dials from our number.
 - The leg is marked metered in the same conditional transition that wins the
@@ -431,7 +431,7 @@ back if the record is not created:
    lead that has, or within 200 ms gets, its own call record writes nothing: it
    is the same lead racing itself.
 3. Limits, in this order: `duplicate_phone` (same org and number within 24h),
-   `owner_cooldown`, `org_hourly_cap` (UTC clock hour), `org_daily_cap` (org's
+   `member_cooldown`, `org_hourly_cap` (UTC clock hour), `org_daily_cap` (org's
    local calendar day). Each is one conditional write.
 4. `limits_unavailable`: the limit store failed; nothing is dialed, the job
    fails (not retried), an event is written best-effort.
@@ -454,7 +454,7 @@ Known limits, accepted:
   retried automatically.
 - `confirm: true` on the provisioning tool is advisory. The real controls are
   the per-org purchase and release caps.
-- Two orgs configured with the same owner phone can ring that person
+- Two orgs configured with the same member phone can ring that person
   simultaneously: caps and cooldown are per org.
 - Prompt injection: the destination phone and settings are changed through Emma
   tools, so text the model reads (a lead's form field, a web page) could try to
@@ -474,20 +474,20 @@ Event types written to the lead timeline (`eventType`, with a scalar `eventData`
 
 | Event | Written when | Data |
 | --- | --- | --- |
-| `call.initiated` | Twilio accepted the owner call (orchestrator), or a signed owner callback adopted the CallSid of an unrecorded call | - |
-| `call.owner_answered` | owner picked up (`/owner`), once | - |
-| `call.owner_declined` | owner pressed a key other than 1, or hung up on the prompt | - |
-| `call.owner_no_answer` | owner leg ended before pickup | - |
+| `call.initiated` | Twilio accepted the member call (orchestrator), or a signed member callback adopted the CallSid of an unrecorded call | - |
+| `call.member_answered` | member picked up (`/owner`), once | - |
+| `call.member_declined` | member pressed a key other than 1, or hung up on the prompt | - |
+| `call.member_no_answer` | member leg ended before pickup | - |
 | `call.connected` | lead answered (lead `/status` in-progress, or `/dial` completed) | - |
 | `call.lead_no_answer` | `/dial` reported no-answer, busy or failed | `dialStatus` |
 | `call.completed` | last dialed leg metered; the record is `finished` | `outcome` |
 | `call.failed` | `reason`: `place_rejected`, `placement_unknown`, `lead_phone_invalid`, `aborted` | `reason` |
 | `call.skipped` | a gate or limit refused (no Twilio call made) | `reason` (list above) |
 
-Record `state`: `dialing`, `owner_ringing`, `owner_answered`, `bridging`,
-`connected` (live) and `finished`, `failed`, `skipped` (terminal; `skipped` is in
+Record `state`: `dialing`, `member_ringing`, `member_answered`, `between_attempts`
+(declared for the multi-attempt flow, not entered yet), `bridging`, `connected` (live) and `finished`, `failed`, `skipped` (terminal; `skipped` is in
 the type but the orchestrator records skips as events only). `outcome` values:
-`completed`, `owner_declined`, `owner_no_answer`, `lead_no_answer`,
+`completed`, `member_declined`, `member_no_answer`, `lead_no_answer`,
 `lead_phone_invalid`, `bridge_unconfirmed`, `aborted`, `place_rejected`,
 `placement_unknown` (informational on a live `dialing` record).
 
@@ -506,7 +506,7 @@ carry the Twilio retry override `#rc=3&rp=5xx,ct` so Twilio redelivers a 5xx.
   anything other than `on` (for example `off`), or delete it. Takes up to 30s to
   reach every instance. There is no operator route or command for it: write the
   item directly (table `AW-Settings`, key `settingName = hot_lead_call_mode`,
-  attribute `settingValue`). Nothing in flight is retried; an owner already on the
+  attribute `settingValue`). Nothing in flight is retried; a member already on the
   prompt is hung up on and billed for the time used.
 - **One org:** the org owner/admin (or Emma on their behalf) calls
   `update_hot_lead_call_settings({enabled: false})`, or an operator sets
@@ -527,7 +527,7 @@ mid-call. No cron cleans these up and no operator tool lists them.
 
 **Finding them.** Start from what you know:
 
-- A report ("the owner got a call but ...") or one lead: open the lead's timeline
+- A report ("the member got a call but ...") or one lead: open the lead's timeline
   (`call.*` events) and its `system.hot_lead_call` record.
 - Otherwise run a one-off, read-only scan of `AW-Leads`, off-peak (a full scan
   of a large table consumes read capacity). Shape only, not run against
@@ -538,8 +538,8 @@ mid-call. No cron cleans these up and no operator tool lists them.
   aws dynamodb scan --region us-west-2 --table-name AW-Leads \
     --filter-expression '#s.#k.#st IN (:a,:b,:c,:d,:e) AND #s.#k.#u < :cutoff' \
     --expression-attribute-names '{"#s":"system","#k":"hot_lead_call","#st":"state","#u":"updatedAt"}' \
-    --expression-attribute-values '{":a":{"S":"dialing"},":b":{"S":"owner_ringing"},":c":{"S":"owner_answered"},":d":{"S":"bridging"},":e":{"S":"connected"},":cutoff":{"S":"<ISO time 2 hours ago>"}}' \
-    --projection-expression 'listId, leadId, #s.#k.#st, #s.#k.#u, #s.#k.ownerCallSid, #s.#k.leadCallSid, #s.#k.outcome'
+    --expression-attribute-values '{":a":{"S":"dialing"},":b":{"S":"member_ringing"},":c":{"S":"member_answered"},":d":{"S":"bridging"},":e":{"S":"connected"},":cutoff":{"S":"<ISO time 2 hours ago>"}}' \
+    --projection-expression 'listId, leadId, #s.#k.#st, #s.#k.#u, #s.#k.memberCallSid, #s.#k.leadCallSid, #s.#k.outcome'
   ```
 
   `updatedAt` is an ISO string, so the comparison is lexicographic and correct.
@@ -547,17 +547,17 @@ mid-call. No cron cleans these up and no operator tool lists them.
 
 **What each state means and what to do:**
 
-- `dialing`, no `outcome`, no `ownerCallSid`: the process died between creating
+- `dialing`, no `outcome`, no `memberCallSid`: the process died between creating
   the record and `placeCall` (or the post-call update failed). No call was
-  placed, or an unrecorded one is still adoptable by its first owner callback.
+  placed, or an unrecorded one is still adoptable by its first member callback.
   Safe. Do nothing: the Slack alert already went out, and by the once-per-lead
-  rule the lead is simply never called. (If the owner did get a call, its
+  rule the lead is simply never called. (If the member did get a call, its
   signed callbacks adopt the CallSid and the call proceeds normally.)
 - `dialing` with `outcome=placement_unknown`: the placement was ambiguous. Check
-  the Twilio call log for a call from the org's number to the owner around
+  the Twilio call log for a call from the org's number to the member around
   `startedAt`. If one exists and its callbacks never arrived, Twilio billed it
   and we did not meter it.
-- `owner_ringing` / `owner_answered`: the owner leg's final callback is missing.
+- `member_ringing` / `member_answered`: the member leg's final callback is missing.
 - `bridging` / `connected`: the bridge ended but a leg callback is missing; the
   call may be unmetered.
 
@@ -565,9 +565,9 @@ mid-call. No cron cleans these up and no operator tool lists them.
 `AW-SpendEvents` (`Dev-AW-SpendEvents` in development), partition key
 `billingUserId` (the org's billing owner, which the recorder resolves from the
 list owner), sort key `eventId`, and the event id IS the idempotency key:
-`twilio:voice:<CallSid>:<owner|lead>`. The owner CallSid is in the record; the
+`twilio:voice:<CallSid>:<member|lead>`. The member CallSid is in the record; the
 lead's is in the record once seen, or in the Twilio call log as the child of the
-owner call. A `get-item` on `(billingUserId, eventId)` shows whether a leg was
+member call. A `get-item` on `(billingUserId, eventId)` shows whether a leg was
 metered (a leg that ran 0 seconds has no event by design). Compare the minutes with the
 Twilio call log.
 
@@ -588,8 +588,8 @@ Do not let Emma retry an ambiguous purchase.
 
 | Symptom | Likely cause |
 | --- | --- |
-| Owner is called but hears "application error" | The `/owner` fetch failed: `BACKEND_URL` wrong or unreachable (check scheme and host), or credentials could not be loaded (503), or the signature failed (401). Twilio's call log shows the webhook response. |
-| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_quiet_hours`, `duplicate_phone` and `owner_cooldown` are expected behavior. |
+| Member is called but hears "application error" | The `/owner` fetch failed: `BACKEND_URL` wrong or unreachable (check scheme and host), or credentials could not be loaded (503), or the signature failed (401). Twilio's call log shows the webhook response. |
+| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_quiet_hours`, `duplicate_phone` and `member_cooldown` are expected behavior. |
 | No event and no call | Kill switch off, org disabled or config invalid, lead not `form_fill`, smoke-test lead, draft lead, or no phone: all silent by design. |
 | `call.skipped` `limits_unavailable` | `AW-MCPSessions` missing, IAM denied, or throttled. Fails closed. |
 | `no owner to bill for list` in logs | The list owner could not be resolved; the leg was not metered and `/status` answers 500. |
@@ -643,12 +643,12 @@ on anywhere.
    again and time the effect (~30s). There is no operator route for it: set the
    AW-Settings item directly.
 7. Set up the first customer (Haven) through Emma, in an attended chat: save
-   settings, provision a number, verify the owner's phone, enable. Each paid step
+   settings, provision a number, verify the member's phone, enable. Each paid step
    needs the org's explicit consent, and the production org-config write needs
    the usual authorization.
 8. Staging end-to-end with real phones before production: submit a test lead from
-   a real form, owner answers and presses 1, lead answers, both hang up; then
-   repeat for decline, owner no-answer and lead no-answer. Confirm the timeline,
+   a real form, member answers and presses 1, lead answers, both hang up; then
+   repeat for decline, member no-answer and lead no-answer. Confirm the timeline,
    one spend event per leg with plausible minutes, and that the Slack alert is
    unchanged. Fill in the "Not verified" items below from what Twilio actually
    sent.
@@ -682,10 +682,10 @@ Twilio's documentation and encoded in tests with synthetic payloads:
 
 - `<Number>` status callbacks (`statusCallbackEvent="initiated ringing answered
   completed"`) for a lead that does not answer or is busy: that they arrive
-  with `CallStatus` `no-answer`/`busy`, a `ParentCallSid` equal to the owner
+  with `CallStatus` `no-answer`/`busy`, a `ParentCallSid` equal to the member
   CallSid, a `SequenceNumber`, and a `CallDuration` (the code treats a missing
   `CallDuration` as unbilled and logs a warning).
-- `<Dial action>` behavior when the owner hangs up in the middle of the bridge:
+- `<Dial action>` behavior when the member hangs up in the middle of the bridge:
   whether `/dial` is still requested, with which `DialCallStatus`, and whether the
   lead leg is torn down. The code finishes such a call as `bridge_unconfirmed`
   if `/dial` never reports.
@@ -693,12 +693,12 @@ Twilio's documentation and encoded in tests with synthetic payloads:
   REST `calls.create` call (documented for webhook URLs in general; the SDK
   passing the fragment through untouched is assumed), and that Twilio signs the
   URL without it.
-- The owner leg's REST `statusCallbackEvent: ['completed']` delivering exactly
+- The member leg's REST `statusCallbackEvent: ['completed']` delivering exactly
   one completed callback with `CallDuration`, including for no-answer (assumed
   `0`).
-- Voicemail: the owner's voicemail answering the call. The prompt would play to
+- Voicemail: the member's voicemail answering the call. The prompt would play to
   the mailbox; there is no answering-machine detection and "press 1" will not be
-  pressed, so it ends as `owner_declined` after the Gather times out, and the
+  pressed, so it ends as `member_declined` after the Gather times out, and the
   answered voicemail leg is billed.
 - `BACKEND_URL` scheme and port: Twilio signs the exact URL it requested. The code
   strips a trailing slash, so that is not a risk; an `http`/`https` or port
@@ -710,9 +710,9 @@ Twilio's documentation and encoded in tests with synthetic payloads:
 - The `X-Twilio-Signature` for form bodies with repeated or empty parameters
   (empty values such as `FinishedOnKey` are signed by Twilio's algorithm; the
   test uses the library's own function).
-- That the owner leg is billed for the whole call duration including the bridged
-  conversation (`CallDuration` of the owner call covering the `<Dial>`), so
-  metering owner and lead legs separately matches Twilio's invoice.
+- That the member leg is billed for the whole call duration including the bridged
+  conversation (`CallDuration` of the member call covering the `<Dial>`), so
+  metering member and lead legs separately matches Twilio's invoice.
 - That the lead's "answered" event arrives as `CallStatus=in-progress` on the
   `<Number>` status callback (the connected transition depends on it; `/dial`
   completed is the backstop).

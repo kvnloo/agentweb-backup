@@ -76,7 +76,7 @@ describe('nothing is dialed when a gate says no', () => {
     expect(world.postMessage).toHaveBeenCalledTimes(2);
   });
 
-  it('two leads inside the owner cooldown ring the owner once; a lead after the cooldown rings again', async () => {
+  it('two leads inside the member cooldown ring the member once; a lead after the cooldown rings again', async () => {
     await submitLead('lead-a', { phone: leadPhone(1) });
     await submitLead('lead-b', { phone: leadPhone(2) });
     expect(world.provider.placedCalls).toHaveLength(1);
@@ -86,7 +86,7 @@ describe('nothing is dialed when a gate says no', () => {
     advanceMinutes(3); // default ownerCooldownMinutes is 2
     await submitLead('lead-c', { phone: leadPhone(3) });
     expect(world.provider.placedCalls).toHaveLength(2);
-    expect(recordOf('lead-c')).toMatchObject({ state: 'owner_ringing' });
+    expect(recordOf('lead-c')).toMatchObject({ state: 'member_ringing' });
   });
 
   it('a repeat submission inside the 24h phone window places no second call and adds nothing to the timeline', async () => {

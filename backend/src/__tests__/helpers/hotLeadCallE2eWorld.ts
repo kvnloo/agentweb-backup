@@ -26,7 +26,7 @@ import { SignedFakeVoiceProvider, TwilioCaller, attrOf } from './hotLeadCallTwil
 export const mock = (fn: unknown) => fn as jest.Mock;
 export const BASE = 'https://api.example.test';
 export const LIST = 'list-a';
-export const OWNER_PHONE = '+14155550100';
+export const MEMBER_PHONE = '+14155550100';
 export const TWILIO_NUMBER = '+14155550111';
 export const LEAD_PHONE_AS_TYPED = '(212) 555-0142';
 export const LEAD_E164 = '+12125550142';
@@ -34,7 +34,7 @@ const NOW = '2026-10-19T17:00:00.000Z'; // 12:00 in America/Chicago, inside the 
 const MINUTE_MS = 60_000;
 
 export const callConfig = {
-  enabled: true, destinationPhone: OWNER_PHONE, destinationVerifiedAt: '2026-01-01T00:00:00.000Z', twilioNumber: TWILIO_NUMBER,
+  enabled: true, destinationPhone: MEMBER_PHONE, destinationVerifiedAt: '2026-01-01T00:00:00.000Z', twilioNumber: TWILIO_NUMBER,
   announcedName: 'Smith & Sons', quietHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
 };
 const slackConnection = { platform: 'slack', account_id: 'T123', config: { account_type: 'bot', access_token: 'xoxb-org-a', team_id: 'T123' } };
@@ -161,44 +161,44 @@ export const skipReason = (leadId: string) => (world.crm.lead(LIST, leadId).enga
  * out for it: the placeCall URLs first, then the action/statusCallback URLs found in the TwiML it was answered with.
  * SequenceNumber starts at 0, as Twilio's does.
  */
-export function twilioCall(placed: WebhookCall, ownerSid = 'CA00000001', leadSid = 'CA00000002') {
-  const ownerLeg = { AccountSid: 'AC00000000000000000000000000000000', Direction: 'outbound-api', From: TWILIO_NUMBER, To: OWNER_PHONE };
+export function twilioCall(placed: WebhookCall, memberSid = 'CA00000001', leadSid = 'CA00000002') {
+  const memberLeg = { AccountSid: 'AC00000000000000000000000000000000', Direction: 'outbound-api', From: TWILIO_NUMBER, To: MEMBER_PHONE };
   const { twilio } = world;
   let gatherUrl = '';
   let dialUrl = '';
   let leadStatusUrl = '';
   return {
     get leadStatusUrl() { return leadStatusUrl; },
-    async ownerAnswers() {
-      const reply = await twilio.post(placed.url, { ...ownerLeg, CallSid: ownerSid, CallStatus: 'in-progress' });
+    async memberAnswers() {
+      const reply = await twilio.post(placed.url, { ...memberLeg, CallSid: memberSid, CallStatus: 'in-progress' });
       if (reply.body.includes('<Gather')) gatherUrl = attrOf(reply.body, 'action');
       return reply;
     },
-    async ownerPresses(digits: string) {
-      const reply = await twilio.post(gatherUrl, { ...ownerLeg, CallSid: ownerSid, CallStatus: 'in-progress', Digits: digits, FinishedOnKey: '' });
+    async memberPresses(digits: string) {
+      const reply = await twilio.post(gatherUrl, { ...memberLeg, CallSid: memberSid, CallStatus: 'in-progress', Digits: digits, FinishedOnKey: '' });
       if (reply.body.includes('<Dial')) { dialUrl = attrOf(reply.body, 'action'); leadStatusUrl = attrOf(reply.body, 'statusCallback'); }
       return reply;
     },
     leadStatus: (callStatus: string, sequence: number, extra: Record<string, string> = {}) =>
-      twilio.post(leadStatusUrl, { AccountSid: ownerLeg.AccountSid, From: TWILIO_NUMBER, To: LEAD_E164, CallSid: leadSid, ParentCallSid: ownerSid, CallStatus: callStatus, SequenceNumber: String(sequence), ...extra }),
+      twilio.post(leadStatusUrl, { AccountSid: memberLeg.AccountSid, From: TWILIO_NUMBER, To: LEAD_E164, CallSid: leadSid, ParentCallSid: memberSid, CallStatus: callStatus, SequenceNumber: String(sequence), ...extra }),
     dialEnds: (dialStatus: string, extra: Record<string, string> = {}) =>
-      twilio.post(dialUrl, { ...ownerLeg, CallSid: ownerSid, DialCallStatus: dialStatus, DialCallSid: leadSid, ...extra }),
-    ownerLegEnds: (callStatus: string, durationSeconds: string, sequence = 0, extra: Record<string, string> = {}) =>
-      twilio.post(placed.statusCallbackUrl, { ...ownerLeg, CallSid: ownerSid, CallStatus: callStatus, CallDuration: durationSeconds, SequenceNumber: String(sequence), ...extra }),
+      twilio.post(dialUrl, { ...memberLeg, CallSid: memberSid, DialCallStatus: dialStatus, DialCallSid: leadSid, ...extra }),
+    memberLegEnds: (callStatus: string, durationSeconds: string, sequence = 0, extra: Record<string, string> = {}) =>
+      twilio.post(placed.statusCallbackUrl, { ...memberLeg, CallSid: memberSid, CallStatus: callStatus, CallDuration: durationSeconds, SequenceNumber: String(sequence), ...extra }),
   };
 }
 
-/** Rings the owner, who presses 1, and the lead answers: the call is bridged. Returns the live call. */
+/** Rings the member, who presses 1, and the lead answers: the call is bridged. Returns the live call. */
 export async function bridgedCall(leadId = 'lead-a') {
   await submitLead(leadId);
   const call = twilioCall(placedCall());
-  await call.ownerAnswers();
-  await call.ownerPresses('1');
+  await call.memberAnswers();
+  await call.memberPresses('1');
   await call.leadStatus('in-progress', 2);
   return call;
 }
 
-// No phone number (owner's, caller ID, lead's) may sit in a log, a timeline event, the call record, the webhook
+// No phone number (member's, caller ID, lead's) may sit in a log, a timeline event, the call record, the webhook
 // URLs we hand to Twilio, or a usage event. Numbers legitimately appear only in the Twilio request and the TwiML.
 function expectNoPhoneNumberAnywhere(): void {
   const { crm, provider, consoleSpies } = world;
@@ -209,7 +209,7 @@ function expectNoPhoneNumberAnywhere(): void {
     JSON.stringify(mock(recordVendorUsage).mock.calls),
   ];
   for (const text of surfaces) {
-    for (const phone of [OWNER_PHONE, TWILIO_NUMBER, LEAD_E164]) {
+    for (const phone of [MEMBER_PHONE, TWILIO_NUMBER, LEAD_E164]) {
       expect(text.replace(/\D/g, '')).not.toContain(phone.slice(2));
     }
   }

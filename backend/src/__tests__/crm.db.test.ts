@@ -1467,10 +1467,10 @@ describe('CRM Database Service', () => {
   describe('updateLeadSystemRecordIf', () => {
     it('builds one conditional UpdateItem with state, set, max-map and list-append parts', async () => {
       const result = await crmDb.updateLeadSystemRecordIf('list_1', 'lead_1', 'hot_lead_call', {
-        stateIn: ['dialing', 'owner_ringing'],
-        set: { state: 'owner_answered', outcome: undefined, ownerCallSid: 'CA1' },
+        stateIn: ['dialing', 'member_ringing'],
+        set: { state: 'member_answered', outcome: undefined, memberCallSid: 'CA1' },
         maxIn: { lastSequence: { CA1: 3, CA2: 5 } },
-        appendNew: { meteredLegs: ['owner', 'lead'] },
+        appendNew: { meteredLegs: ['member:1', 'lead'] },
       });
 
       expect(result).toBe(true);
@@ -1491,11 +1491,11 @@ describe('CRM Database Service', () => {
       );
       expect(call.ExpressionAttributeNames).toEqual({
         '#system': 'system', '#k': 'hot_lead_call', '#state': 'state',
-        '#f0': 'state', '#f1': 'ownerCallSid', '#f2': 'lastSequence', '#e3': 'CA1', '#e4': 'CA2', '#f5': 'meteredLegs',
+        '#f0': 'state', '#f1': 'memberCallSid', '#f2': 'lastSequence', '#e3': 'CA1', '#e4': 'CA2', '#f5': 'meteredLegs',
       });
       expect(call.ExpressionAttributeValues).toMatchObject({
-        ':from0': 'dialing', ':from1': 'owner_ringing', ':v0': 'owner_answered', ':v1': 'CA1', ':v3': 3, ':v4': 5,
-        ':v5': ['owner', 'lead'], ':v5_0': 'owner', ':v5_1': 'lead',
+        ':from0': 'dialing', ':from1': 'member_ringing', ':v0': 'member_answered', ':v1': 'CA1', ':v3': 3, ':v4': 5,
+        ':v5': ['member:1', 'lead'], ':v5_0': 'member:1', ':v5_1': 'lead',
       });
       expectNoDanglingPlaceholders(call);
     });
@@ -1526,10 +1526,10 @@ describe('CRM Database Service', () => {
 
     it('de-duplicates appendNew items so one value cannot be stored twice', async () => {
       await crmDb.updateLeadSystemRecordIf('list_1', 'lead_1', 'hot_lead_call', {
-        stateIn: ['dialing'], appendNew: { meteredLegs: ['owner', 'owner', 'lead'] },
+        stateIn: ['dialing'], appendNew: { meteredLegs: ['member:1', 'member:1', 'lead'] },
       });
       const call = mockDocumentClientMethods.update.mock.calls[0][0];
-      expect(call.ExpressionAttributeValues[':v0']).toEqual(['owner', 'lead']);
+      expect(call.ExpressionAttributeValues[':v0']).toEqual(['member:1', 'lead']);
       expect(call.ConditionExpression.match(/NOT contains/g)).toHaveLength(2);
     });
 
@@ -1560,11 +1560,11 @@ describe('CRM Database Service', () => {
   // ENG-2271: the call timeline reuses addLeadEngagement, which raises isEngaged by keyword.
   describe('addLeadEngagement with hot-lead call events', () => {
     it.each([
-      'call.initiated', 'call.owner_answered', 'call.owner_declined', 'call.owner_no_answer', 'call.connected',
-      'call.lead_no_answer', 'call.completed', 'call.failed', 'call.skipped',
+      'call.initiated', 'call.member_answered', 'call.member_declined', 'call.member_no_answer', 'call.connected',
+      'call.lead_no_answer', 'call.lead_declined', 'call.completed', 'call.failed', 'call.skipped',
     ])('does not mark the lead engaged for %s', async (eventType) => {
       await crmDb.addLeadEngagement('list_1', 'lead_1', {
-        eventType, eventData: { leg: 'owner', seconds: 12, reason: 'no_answer' }, createdAt: '2026-10-19T10:00:00.000Z',
+        eventType, eventData: { leg: 'member', seconds: 12, reason: 'no_answer' }, createdAt: '2026-10-19T10:00:00.000Z',
       });
       const call = mockDocumentClientMethods.update.mock.calls[0][0];
       expect(call.UpdateExpression).not.toContain('isEngaged');

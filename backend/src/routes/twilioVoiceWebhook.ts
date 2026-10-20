@@ -2,7 +2,7 @@
  * Twilio voice webhooks for the hot-lead auto-call (ENG-2271). Mounted at /api/webhooks/twilio-voice
  * with no auth middleware: Twilio is the caller, and every request proves itself with X-Twilio-Signature.
  *
- * Call shape: Twilio rings the owner (placed by the orchestrator) -> /owner prompts "press 1" ->
+ * Call shape: Twilio rings a team member (placed by the orchestrator) -> /owner prompts "press 1" ->
  * /gather bridges to the lead with <Dial><Number> -> /dial reports how the bridge ended. /status
  * receives the per-leg call-progress callbacks and is the ONLY place usage is metered.
  *
@@ -12,24 +12,26 @@
  * or unreadable is answered 413/400 there and never reaches the app's global error handler.
  * A TwiML endpoint (/owner, /gather, /dial) answers a request that passes the signature but does not
  * belong to a live call with a bare hangup and HTTP 200 (so Twilio does not retry), writing nothing.
- * /status answers such a request with an empty 200; it answers 500 only when a leg ended but no owner
+ * /status answers such a request with an empty 200; it answers 500 only when a leg ended but nobody
  * can be found to bill or metering lost its race repeatedly (nothing partial is written), or on an unexpected
  * error. Twilio does NOT retry a 5xx by default, so the status callback URLs carry a retry override (see
  * voiceUrls.ts); every handler is idempotent on a redelivery (meteredLegs winner rule).
  *
  * Record lifecycle (all moves go through LeadCallStore.transition with explicit `from` sets). The
- * orchestrator creates the record in 'dialing' BEFORE calling Twilio and moves it to owner_ringing
- * (with ownerCallSid) afterwards; if that move has not landed yet, /owner and the owner /status adopt
- * the CallSid from the signed callback (same jobKey only) and move the record to owner_ringing themselves,
+ * orchestrator creates the record in 'dialing' BEFORE calling Twilio and moves it to member_ringing
+ * (with memberCallSid) afterwards; if that move has not landed yet, /owner and the member /status adopt
+ * the CallSid from the signed callback (same jobKey only) and move the record to member_ringing themselves,
  * so the orchestrator's late settle (from 'dialing') loses. One record per lead, ever.
- *   dialing/owner_ringing -> owner_answered (/owner) -> bridging (/gather, digit 1) -> connected (lead answered)
+ *   dialing/member_ringing -> member_answered (/owner) -> bridging (/gather, digit 1) -> connected (lead answered)
  *   -> finished (last leg's final /status).
  * A terminal record can no longer be written, so a leg is metered (meteredLegs) while the record is still
  * live, and the LAST leg to be metered performs the terminal transition. If a leg's final callback never
  * arrives the record stays non-terminal: records stuck in bridging/connected need an ops cleanup
  * (no cron is added here).
  *
- * Decisions that do not change `state` (owner declined, lead did not answer) are made once through marker
+ * The URL paths keep their original names: /owner now serves the prompt to the team member being rung.
+ *
+ * Decisions that do not change `state` (member declined, lead did not answer) are made once through marker
  * entries in `lastSequence`: see HotLeadCallRecord.lastSequence.
  */
 
@@ -41,9 +43,9 @@ import { voiceWebhookBaseUrl, buildVoiceWebhookUrl, isWebhookSafeId } from '../s
 import { isHotLeadCallEnabled } from '../services/voice/hotLeadCallMode';
 import { resolveHotLeadCallContext, type HotLeadCallContext } from '../services/voice/hotLeadCallContext';
 import { getLeadCallStore } from '../services/voice/leadCallStore';
-import type { HotLeadCallEventType, HotLeadCallLeg, HotLeadCallRecord, HotLeadCallState } from '../services/voice/leadCallStore.types';
+import type { HotLeadCallEventType, HotLeadCallLeg, HotLeadCallRecord, HotLeadCallState, MeteredLeg } from '../services/voice/leadCallStore.types';
 import { recordCallUsage } from '../services/voice/voiceUsage';
-import { connectTwiml, hangupTwiml, leadUnreachableTwiml, ownerPromptTwiml } from '../services/voice/twiml';
+import { connectTwiml, hangupTwiml, leadUnreachableTwiml, memberPromptTwiml } from '../services/voice/twiml';
 import { callableLeadPhone } from '../services/hotLeadCallConfig';
 
 // type: () => true so a JSON or other content type is limited and parsed here too, instead of falling
@@ -77,14 +79,17 @@ type FormParams = Record<string, string>;
 const CALL_SID_SHAPE = /^CA[A-Za-z0-9]{8,40}$/;
 const QUERY_KEYS = new Set(['listId', 'leadId', 'jobKey', 'leg']);
 
-const LIVE_STATES: HotLeadCallState[] = ['dialing', 'owner_ringing', 'owner_answered', 'bridging', 'connected'];
+const LIVE_STATES: HotLeadCallState[] = ['dialing', 'member_ringing', 'member_answered', 'bridging', 'connected'];
 const TERMINAL_CALL_STATUSES = new Set(['completed', 'busy', 'no-answer', 'failed', 'canceled']);
 const LEAD_NOT_REACHED = new Set(['no-answer', 'busy', 'failed']);
 const LEAD_REACHED = new Set(['completed', 'answered']);
 const MAX_TRANSITION_ATTEMPTS = 3;
 
 // Marker entries in `lastSequence` that make a decision first-writer-wins: see HotLeadCallRecord.lastSequence.
-const decisionKey = (ownerSid: string, step: 'gather' | 'dial'): string => `${ownerSid}#${step}`;
+const decisionKey = (memberSid: string, step: 'gather' | 'dial'): string => `${memberSid}#${step}`;
+/** `meteredLegs` entry of a leg: member legs are numbered by attempt ('member:1'), the lead leg is 'lead'. */
+const meteredLegOf = (leg: HotLeadCallLeg, record: HotLeadCallRecord): MeteredLeg =>
+  leg === 'lead' ? 'lead' : `member:${record.attemptNo ?? 1}`;
 const errorName = (err: unknown): string => (err instanceof Error ? err.name : 'unknown error');
 
 const sendXml = (res: Response, xml: string): void => {
@@ -97,9 +102,9 @@ function parseQuery(req: Request): CallQuery | null {
   const { listId, leadId, jobKey, leg } = req.query;
   if (typeof listId !== 'string' || typeof leadId !== 'string' || typeof jobKey !== 'string') return null;
   if (![listId, leadId, jobKey].every(isWebhookSafeId)) return null;
-  // The orchestrator's owner-leg status URL carries no leg; only the lead <Number> callback adds leg=lead.
-  if (leg !== undefined && leg !== 'owner' && leg !== 'lead') return null;
-  return { listId, leadId, jobKey, leg: leg ?? 'owner' };
+  // The orchestrator's member-leg status URL carries no leg; only the lead <Number> callback adds leg=lead.
+  if (leg !== undefined && leg !== 'member' && leg !== 'lead') return null;
+  return { listId, leadId, jobKey, leg: leg ?? 'member' };
 }
 
 function paramsOf(req: Request): FormParams | null {
@@ -114,7 +119,7 @@ function paramsOf(req: Request): FormParams | null {
 }
 
 /**
- * The record this callback belongs to (same job), or null. ownerCallSid may still be missing: the
+ * The record this callback belongs to (same job), or null. memberCallSid may still be missing: the
  * orchestrator creates the record in 'dialing' before calling Twilio and records the sid afterwards.
  */
 async function loadRecord(q: CallQuery): Promise<HotLeadCallRecord | null> {
@@ -123,21 +128,21 @@ async function loadRecord(q: CallQuery): Promise<HotLeadCallRecord | null> {
 }
 
 /**
- * Owner-leg callbacks only. While the record is still 'dialing' (the orchestrator's post-call
- * transition has not landed, or failed) the first signed owner-leg callback for this job supplies
- * the owner CallSid. The jobKey was already matched by loadRecord and the signature covers it.
- * Adoption moves the record to owner_ringing with the sid. That dialing -> owner_ringing transition is the
+ * Member-leg callbacks only. While the record is still 'dialing' (the orchestrator's post-call
+ * transition has not landed, or failed) the first signed member-leg callback for this job supplies
+ * the member CallSid. The jobKey was already matched by loadRecord and the signature covers it.
+ * Adoption moves the record to member_ringing with the sid. That dialing -> member_ringing transition is the
  * single-writer guard: exactly one caller wins it, so two racing callbacks cannot overwrite each other's
  * sid, and the orchestrator's own settle (also from 'dialing') loses and cannot write a second
  * call.initiated. After this call the caller compares against whichever sid the re-read shows.
- * A record stuck in 'dialing'/'owner_ringing' (no callback ever) needs an ops cleanup, see header.
+ * A record stuck in 'dialing'/'member_ringing' (no callback ever) needs an ops cleanup, see header.
  */
-async function withOwnerSid(q: CallQuery, record: HotLeadCallRecord, callSid: string | undefined): Promise<HotLeadCallRecord> {
-  if (record.ownerCallSid || record.state !== 'dialing' || !callSid) return record;
+async function withMemberSid(q: CallQuery, record: HotLeadCallRecord, callSid: string | undefined): Promise<HotLeadCallRecord> {
+  if (record.memberCallSid || record.state !== 'dialing' || !callSid) return record;
   const store = getLeadCallStore();
   // Adoption moves the record out of 'dialing', so the orchestrator's later settle loses and only this path
   // writes call.initiated.
-  if (await store.transition(q.listId, q.leadId, ['dialing'], { state: 'owner_ringing', ownerCallSid: callSid })) {
+  if (await store.transition(q.listId, q.leadId, ['dialing'], { state: 'member_ringing', memberCallSid: callSid })) {
     await store.addEvent(q.listId, q.leadId, 'call.initiated');
   }
   return (await store.get(q.listId, q.leadId)) ?? record; // a lost race still shows whichever sid won
@@ -145,7 +150,7 @@ async function withOwnerSid(q: CallQuery, record: HotLeadCallRecord, callSid: st
 
 const sidOf = (body: FormParams, field: string): string | undefined => (CALL_SID_SHAPE.test(body[field] ?? '') ? body[field] : undefined);
 
-/** Owner id for metering. Not tied to the config being enabled: a call placed earlier must still be billed. */
+/** User to bill for metering. Not tied to the config being enabled: a call placed earlier must still be billed. */
 async function meteringUserId(listId: string, ctx: HotLeadCallContext | null): Promise<string | null> {
   if (ctx) return ctx.ownerUserId;
   const list = await crmDb.getLeadListById(listId, { consistentRead: true });
@@ -212,15 +217,15 @@ const serverError = (res: Response): void => {
 const statusReplies: ErrorReplies = { invalid: ack, failed: serverError };
 
 /**
- * The owner picked up but the call may no longer proceed (kill switch off, config disabled or invalid).
- * Recording the outcome keeps the owner leg's final callback from relabelling it 'owner_no_answer'; the
+ * The member picked up but the call may no longer proceed (kill switch off, config disabled or invalid).
+ * Recording the outcome keeps the member leg's final callback from relabelling it 'member_no_answer'; the
  * leg is still metered as usual. The decision marker is only written from /gather.
  */
 async function abortCall(q: CallQuery, record: HotLeadCallRecord, from: HotLeadCallState[]): Promise<void> {
   const store = getLeadCallStore();
   // Only /gather's decision marker applies here: from /owner the call has not reached the gather step yet.
-  const decision = record.state === 'owner_answered' && record.ownerCallSid ? { [decisionKey(record.ownerCallSid, 'gather')]: 1 } : undefined;
-  if (await store.transition(q.listId, q.leadId, from, { state: 'owner_answered', outcome: 'aborted', lastSequence: decision })) {
+  const decision = record.state === 'member_answered' && record.memberCallSid ? { [decisionKey(record.memberCallSid, 'gather')]: 1 } : undefined;
+  if (await store.transition(q.listId, q.leadId, from, { state: 'member_answered', outcome: 'aborted', lastSequence: decision })) {
     await store.addEvent(q.listId, q.leadId, 'call.failed', { reason: 'aborted' });
   }
 }
@@ -231,36 +236,36 @@ async function liveContext(q: CallQuery): Promise<HotLeadCallContext | null> {
   return resolveHotLeadCallContext(q.listId);
 }
 
-// ── /owner: the owner picked up ─────────────────────────────────────────────
+// ── /owner: the member picked up ─────────────────────────────────────────────
 
 router.post('/owner', guarded(async (_req, res, q, body) => {
   const ctx = await liveContext(q);
   const loaded = await loadRecord(q);
-  const record = loaded && (await withOwnerSid(q, loaded, sidOf(body, 'CallSid')));
+  const record = loaded && (await withMemberSid(q, loaded, sidOf(body, 'CallSid')));
   // A missing record is deliberately NOT adopted (created here): the orchestrator creates the record
   // before it dials, so no record means this callback is not for a call we placed, and a call without
   // a record could never be metered.
-  if (!record || !record.ownerCallSid || body.CallSid !== record.ownerCallSid) return sendHangup(res);
+  if (!record || !record.memberCallSid || body.CallSid !== record.memberCallSid) return sendHangup(res);
 
-  const awaitingAnswer = record.state === 'owner_ringing' || record.state === 'dialing';
+  const awaitingAnswer = record.state === 'member_ringing' || record.state === 'dialing';
   if (!ctx) {
-    if (awaitingAnswer) await abortCall(q, record, ['owner_ringing', 'dialing']);
+    if (awaitingAnswer) await abortCall(q, record, ['member_ringing', 'dialing']);
     return sendHangup(res);
   }
   const store = getLeadCallStore();
   if (awaitingAnswer) {
     // Won exactly once; the event is written only by the winner.
-    if (await store.transition(q.listId, q.leadId, ['owner_ringing', 'dialing'], { state: 'owner_answered' })) {
-      await store.addEvent(q.listId, q.leadId, 'call.owner_answered');
+    if (await store.transition(q.listId, q.leadId, ['member_ringing', 'dialing'], { state: 'member_answered' })) {
+      await store.addEvent(q.listId, q.leadId, 'call.member_answered');
     }
-  } else if (record.state !== 'owner_answered') {
+  } else if (record.state !== 'member_answered') {
     return sendHangup(res);
   }
-  // A re-fetch while already owner_answered (Twilio retry) gets the same prompt again, with no second event.
-  sendXml(res, ownerPromptTwiml({ announcedName: ctx.config.announcedName, gatherUrl: buildVoiceWebhookUrl('gather', q) }));
+  // A re-fetch while already member_answered (Twilio retry) gets the same prompt again, with no second event.
+  sendXml(res, memberPromptTwiml({ announcedName: ctx.config.announcedName, gatherUrl: buildVoiceWebhookUrl('gather', q) }));
 }, twimlReplies));
 
-// ── /gather: the owner pressed a key ────────────────────────────────────────
+// ── /gather: the member pressed a key ────────────────────────────────────────
 
 /** The lead's number from the lead row, re-validated now. Never from the URL or the request body. */
 async function leadPhoneFor(q: CallQuery, ctx: HotLeadCallContext): Promise<string | null> {
@@ -272,33 +277,33 @@ async function leadPhoneFor(q: CallQuery, ctx: HotLeadCallContext): Promise<stri
 router.post('/gather', guarded(async (_req, res, q, body) => {
   const ctx = await liveContext(q);
   const record = await loadRecord(q);
-  if (!record?.ownerCallSid || body.CallSid !== record.ownerCallSid || record.state !== 'owner_answered') return sendHangup(res);
+  if (!record?.memberCallSid || body.CallSid !== record.memberCallSid || record.state !== 'member_answered') return sendHangup(res);
   if (!ctx) {
-    await abortCall(q, record, ['owner_answered']);
+    await abortCall(q, record, ['member_answered']);
     return sendHangup(res);
   }
 
   const store = getLeadCallStore();
   // One decision per call, whatever the key: a replay or a later different digit cannot reverse it.
-  const decision = { [decisionKey(record.ownerCallSid, 'gather')]: 1 };
+  const decision = { [decisionKey(record.memberCallSid, 'gather')]: 1 };
 
   if (body.Digits !== '1') {
-    if (await store.transition(q.listId, q.leadId, ['owner_answered'], { state: 'owner_answered', outcome: 'owner_declined', lastSequence: decision })) {
-      await store.addEvent(q.listId, q.leadId, 'call.owner_declined');
+    if (await store.transition(q.listId, q.leadId, ['member_answered'], { state: 'member_answered', outcome: 'member_declined', lastSequence: decision })) {
+      await store.addEvent(q.listId, q.leadId, 'call.member_declined');
     }
     return sendHangup(res);
   }
 
   const leadE164 = await leadPhoneFor(q, ctx);
   if (!leadE164 || !ctx.config.twilioNumber) {
-    if (await store.transition(q.listId, q.leadId, ['owner_answered'], { state: 'owner_answered', outcome: 'lead_phone_invalid', lastSequence: decision })) {
+    if (await store.transition(q.listId, q.leadId, ['member_answered'], { state: 'member_answered', outcome: 'lead_phone_invalid', lastSequence: decision })) {
       await store.addEvent(q.listId, q.leadId, 'call.failed', { reason: 'lead_phone_invalid' });
     }
     return sendXml(res, leadUnreachableTwiml());
   }
 
   // Built before the transition so that a builder that throws cannot leave the record 'bridging' with
-  // the owner hung up.
+  // the member hung up.
   const connect = connectTwiml({
     twilioNumber: ctx.config.twilioNumber,
     leadE164,
@@ -306,7 +311,7 @@ router.post('/gather', guarded(async (_req, res, q, body) => {
     statusUrl: buildVoiceWebhookUrl('status', q, { leg: 'lead' }),
   });
   // Only the winner dials the lead; a replayed "1" gets a hangup instead of a second bridge.
-  if (!(await store.transition(q.listId, q.leadId, ['owner_answered'], { state: 'bridging', lastSequence: decision }))) return sendHangup(res);
+  if (!(await store.transition(q.listId, q.leadId, ['member_answered'], { state: 'bridging', lastSequence: decision }))) return sendHangup(res);
   sendXml(res, connect);
 }, twimlReplies));
 
@@ -314,14 +319,14 @@ router.post('/gather', guarded(async (_req, res, q, body) => {
 
 router.post('/dial', guarded(async (_req, res, q, body) => {
   const record = await loadRecord(q);
-  if (!record?.ownerCallSid || body.CallSid !== record.ownerCallSid) return sendHangup(res);
+  if (!record?.memberCallSid || body.CallSid !== record.memberCallSid) return sendHangup(res);
 
   const store = getLeadCallStore();
-  const ownerSid = record.ownerCallSid;
+  const memberSid = record.memberCallSid;
   const status = body.DialCallStatus ?? '';
   // DialCallSid is the lead leg; keep it only if nothing contradicts it.
   const dialSid = sidOf(body, 'DialCallSid');
-  const leadCallSid = dialSid && dialSid !== ownerSid && !record.leadCallSid ? dialSid : undefined;
+  const leadCallSid = dialSid && dialSid !== memberSid && !record.leadCallSid ? dialSid : undefined;
 
   if (LEAD_REACHED.has(status)) {
     // Normally already connected by the lead's "answered" status callback; this covers it arriving late or never.
@@ -331,14 +336,14 @@ router.post('/dial', guarded(async (_req, res, q, body) => {
     return sendHangup(res);
   }
   if (status === 'canceled') {
-    // The dial was cancelled while the lead was still ringing, which is the owner hanging up: nobody was told the
+    // The dial was cancelled while the lead was still ringing, which is the member hanging up: nobody was told the
     // lead did not answer, and we cannot say whether the lead picked up. The record finishes through the
     // normal leg metering as bridge_unconfirmed (call.completed only).
     await store.transition(q.listId, q.leadId, ['bridging'], {
       state: 'bridging',
       outcome: 'bridge_unconfirmed',
       leadCallSid,
-      lastSequence: { [decisionKey(ownerSid, 'dial')]: 1 },
+      lastSequence: { [decisionKey(memberSid, 'dial')]: 1 },
     });
     return sendHangup(res);
   }
@@ -347,7 +352,7 @@ router.post('/dial', guarded(async (_req, res, q, body) => {
       state: 'bridging',
       outcome: 'lead_no_answer',
       leadCallSid,
-      lastSequence: { [decisionKey(ownerSid, 'dial')]: 1 },
+      lastSequence: { [decisionKey(memberSid, 'dial')]: 1 },
     });
     if (first) await store.addEvent(q.listId, q.leadId, 'call.lead_no_answer', { dialStatus: status });
     return sendXml(res, leadUnreachableTwiml());
@@ -368,7 +373,7 @@ function leadLegExpected(record: HotLeadCallRecord): boolean {
 
 function everyDialedLegMetered(record: HotLeadCallRecord): boolean {
   const metered = record.meteredLegs ?? [];
-  return metered.includes('owner') && (!leadLegExpected(record) || metered.includes('lead'));
+  return metered.includes(meteredLegOf('member', record)) && (!leadLegExpected(record) || metered.includes('lead'));
 }
 
 async function finishIfComplete(q: CallQuery): Promise<void> {
@@ -384,17 +389,17 @@ async function finishIfComplete(q: CallQuery): Promise<void> {
 
 /**
  * The orchestrator marks an ambiguous placement with outcome 'placement_unknown' while the record stays
- * 'dialing': that is information, not a decision, so it must not suppress the real owner outcome.
+ * 'dialing': that is information, not a decision, so it must not suppress the real member outcome.
  */
 const decidedOutcome = (record: HotLeadCallRecord): string | undefined =>
   record.outcome === 'placement_unknown' ? undefined : record.outcome;
 
-/** Outcome and timeline event when the owner leg ends before the owner chose anything. */
-function ownerLegOutcome(current: HotLeadCallRecord, leg: HotLeadCallLeg): { outcome: string; event: HotLeadCallEventType } | undefined {
-  if (leg !== 'owner' || decidedOutcome(current)) return undefined;
-  if (current.state === 'dialing' || current.state === 'owner_ringing') return { outcome: 'owner_no_answer', event: 'call.owner_no_answer' };
+/** Outcome and timeline event when the member leg ends before the member chose anything. */
+function memberLegOutcome(current: HotLeadCallRecord, leg: HotLeadCallLeg): { outcome: string; event: HotLeadCallEventType } | undefined {
+  if (leg !== 'member' || decidedOutcome(current)) return undefined;
+  if (current.state === 'dialing' || current.state === 'member_ringing') return { outcome: 'member_no_answer', event: 'call.member_no_answer' };
   // Hung up on the prompt (the Gather timeout falls through without posting to /gather).
-  if (current.state === 'owner_answered') return { outcome: 'owner_declined', event: 'call.owner_declined' };
+  if (current.state === 'member_answered') return { outcome: 'member_declined', event: 'call.member_declined' };
   return undefined;
 }
 
@@ -431,7 +436,8 @@ async function meterLeg(cb: LegCallback): Promise<'done' | 'no-owner-to-bill' | 
   for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt++) {
     const current = await store.get(q.listId, q.leadId);
     if (!current || current.jobKey !== q.jobKey || !LIVE_STATES.includes(current.state)) return 'done';
-    if ((current.meteredLegs ?? []).includes(q.leg)) return 'done';
+    const meteredLeg = meteredLegOf(q.leg, current);
+    if ((current.meteredLegs ?? []).includes(meteredLeg)) return 'done';
     if (sequence !== undefined && (current.lastSequence?.[callSid] ?? -1) >= sequence) return 'done';
 
     if (billedUserId === undefined) billedUserId = await meteringUserId(q.listId, await resolveHotLeadCallContext(q.listId));
@@ -440,10 +446,10 @@ async function meterLeg(cb: LegCallback): Promise<'done' | 'no-owner-to-bill' | 
       return 'no-owner-to-bill';
     }
 
-    const ended = ownerLegOutcome(current, q.leg);
+    const ended = memberLegOutcome(current, q.leg);
     const won = await store.transition(q.listId, q.leadId, [current.state], {
       state: current.state,
-      meteredLegs: [q.leg],
+      meteredLegs: [meteredLeg],
       leadCallSid: q.leg === 'lead' && !current.leadCallSid ? callSid : undefined,
       outcome: ended?.outcome,
       lastSequence: sequence === undefined ? undefined : { [callSid]: sequence },
@@ -475,12 +481,12 @@ router.post('/status', guarded(async (_req, res, q, body) => {
     durationSeconds: body.CallDuration?.trim() ? Number(body.CallDuration) : NaN,
   };
 
-  const record = q.leg === 'owner' ? await withOwnerSid(q, loaded, callSid) : loaded;
-  const ownerSid = record.ownerCallSid;
-  if (!ownerSid) return ack(res);
-  if (q.leg === 'owner') {
-    if (callSid !== ownerSid) return ack(res);
-  } else if (body.ParentCallSid !== ownerSid || callSid === ownerSid || (record.leadCallSid && record.leadCallSid !== callSid)) {
+  const record = q.leg === 'member' ? await withMemberSid(q, loaded, callSid) : loaded;
+  const memberSid = record.memberCallSid;
+  if (!memberSid) return ack(res);
+  if (q.leg === 'member') {
+    if (callSid !== memberSid) return ack(res);
+  } else if (body.ParentCallSid !== memberSid || callSid === memberSid || (record.leadCallSid && record.leadCallSid !== callSid)) {
     return ack(res);
   }
 

@@ -6,7 +6,7 @@ import {
   escapeXml,
   hangupTwiml,
   leadUnreachableTwiml,
-  ownerPromptTwiml,
+  memberPromptTwiml,
   verificationCodeTwiml,
 } from '../twiml';
 
@@ -55,37 +55,37 @@ const URLS = {
 const NASTY = `Smith & Sons <"O'Brien"> ]]> &amp;`;
 
 describe('twiml builders', () => {
-  it('builds the owner prompt: Gather with the prompt inside, then the no-input fallthrough and a hangup', () => {
-    const xml = ownerPromptTwiml({ announcedName: 'Acme Plumbing', gatherUrl: URLS.gatherUrl });
+  it('builds the member prompt: Gather with the prompt inside, then the no-input fallthrough and a hangup', () => {
+    const xml = memberPromptTwiml({ announcedName: 'Acme Plumbing', gatherUrl: URLS.gatherUrl });
     const root = parseXml(xml);
     expect(root.name).toBe('Response');
     expect(root.children.map((c) => c.name)).toEqual(['Gather', 'Say', 'Hangup']);
     const gather = root.children[0];
     expect(gather.attrs).toEqual({ input: 'dtmf', numDigits: '1', timeout: '8', action: URLS.gatherUrl, method: 'POST' });
-    expect(gather.children[0].text).toBe('New lead from Acme Plumbing. Press 1 to connect to them now.');
+    expect(gather.children[0].text).toBe('New lead from Acme Plumbing. Are you available to take the call now? Press 1.');
     expect(root.children[1].text).toBe(NO_INPUT_COPY);
   });
 
   it('escapes the announced name: "Smith & Sons" stays well-formed and reads back unchanged', () => {
-    const xml = ownerPromptTwiml({ announcedName: 'Smith & Sons', gatherUrl: URLS.gatherUrl });
-    expect(xml).toContain('New lead from Smith &amp; Sons. Press 1');
-    expect(parseXml(xml).children[0].children[0].text).toBe('New lead from Smith & Sons. Press 1 to connect to them now.');
+    const xml = memberPromptTwiml({ announcedName: 'Smith & Sons', gatherUrl: URLS.gatherUrl });
+    expect(xml).toContain('New lead from Smith &amp; Sons. Are you available');
+    expect(parseXml(xml).children[0].children[0].text).toBe('New lead from Smith & Sons. Are you available to take the call now? Press 1.');
   });
 
   it('survives quotes, angle brackets and entity look-alikes in the name even though the validator forbids them', () => {
-    const xml = ownerPromptTwiml({ announcedName: NASTY, gatherUrl: URLS.gatherUrl });
-    expect(parseXml(xml).children[0].children[0].text).toBe(`New lead from ${NASTY}. Press 1 to connect to them now.`);
+    const xml = memberPromptTwiml({ announcedName: NASTY, gatherUrl: URLS.gatherUrl });
+    expect(parseXml(xml).children[0].children[0].text).toBe(`New lead from ${NASTY}. Are you available to take the call now? Press 1.`);
     expect(xml.match(/<Say>/g)).toHaveLength(2);
   });
 
   it('escapes attribute values (URLs carry & between query parameters)', () => {
-    const xml = ownerPromptTwiml({ announcedName: 'A', gatherUrl: 'https://x.test/g?a=1&b="2"<' });
+    const xml = memberPromptTwiml({ announcedName: 'A', gatherUrl: 'https://x.test/g?a=1&b="2"<' });
     expect(xml).toContain('action="https://x.test/g?a=1&amp;b=&quot;2&quot;&lt;"');
     expect(parseXml(xml).children[0].attrs.action).toBe('https://x.test/g?a=1&b="2"<');
   });
 
   it('drops characters XML 1.0 cannot carry instead of emitting a document Twilio would reject', () => {
-    const xml = ownerPromptTwiml({ announcedName: 'Ac\u0000me\u0008', gatherUrl: URLS.gatherUrl });
+    const xml = memberPromptTwiml({ announcedName: 'Ac\u0000me\u0008', gatherUrl: URLS.gatherUrl });
     expect(parseXml(xml).children[0].children[0].text).toContain('Acme.');
   });
 

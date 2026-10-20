@@ -3,7 +3,7 @@
  * SDK (only voiceProvider.ts may, see the vendor metering guard).
  *
  * Copy is fixed text plus the org's announcedName. Visitor-supplied text must never be passed in:
- * it would be read aloud to the business owner.
+ * it would be read aloud to the team member.
  *
  * Attribute reference (checked 2026-10-19):
  *   https://www.twilio.com/docs/voice/twiml/gather  (a timeout with no input falls through to the next verb)
@@ -14,7 +14,7 @@
 export const CONNECTING_COPY = 'Connecting you now.';
 export const NO_INPUT_COPY = 'We did not get a response. Goodbye.';
 export const LEAD_UNREACHABLE_COPY = 'Sorry, we could not reach them. Goodbye.';
-const ownerPromptCopy = (announcedName: string): string => `New lead from ${announcedName}. Press 1 to connect to them now.`;
+const memberPromptCopy = (announcedName: string): string => `New lead from ${announcedName}. Are you available to take the call now? Press 1.`;
 
 const GATHER_TIMEOUT_SECONDS = 8;
 /** Ring time for the lead; Twilio may add a few seconds of buffer. */
@@ -50,9 +50,9 @@ export function hangupTwiml(): string {
   return response('<Hangup/>');
 }
 
-export function ownerPromptTwiml(p: { announcedName: string; gatherUrl: string }): string {
+export function memberPromptTwiml(p: { announcedName: string; gatherUrl: string }): string {
   return response(
-    `<Gather input="dtmf" numDigits="1" timeout="${GATHER_TIMEOUT_SECONDS}" action="${escapeXml(p.gatherUrl)}" method="POST">${say(ownerPromptCopy(p.announcedName))}</Gather>`,
+    `<Gather input="dtmf" numDigits="1" timeout="${GATHER_TIMEOUT_SECONDS}" action="${escapeXml(p.gatherUrl)}" method="POST">${say(memberPromptCopy(p.announcedName))}</Gather>`,
     say(NO_INPUT_COPY),
     '<Hangup/>',
   );

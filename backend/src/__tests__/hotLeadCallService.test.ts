@@ -35,13 +35,13 @@ import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEnt
 import { FakeLeadCallStore } from '../services/voice/fakeLeadCallStore';
 
 const mock = (fn: unknown) => fn as jest.Mock;
-const OWNER_PHONE = '+14155550100';
+const MEMBER_PHONE = '+14155550100';
 const TWILIO_NUMBER = '+14155550111';
 const LEAD_PHONE = '(212) 555-0142';
 const NOW = '2026-10-19T17:00:00.000Z';
 
 const config = {
-  enabled: true, destinationPhone: OWNER_PHONE, destinationVerifiedAt: '2026-01-01T00:00:00.000Z',
+  enabled: true, destinationPhone: MEMBER_PHONE, destinationVerifiedAt: '2026-01-01T00:00:00.000Z',
   twilioNumber: TWILIO_NUMBER, announcedName: 'Acme Plumbing',
   quietHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
 };
@@ -93,10 +93,10 @@ afterEach(() => {
 });
 
 describe('dispatchHotLeadCall gates', () => {
-  it('places the owner call for an eligible form fill (control for every refusal below)', async () => {
+  it('places the member call for an eligible form fill (control for every refusal below)', async () => {
     await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
     expect(provider.placedCalls).toHaveLength(1);
-    expect(store.record).toMatchObject({ state: 'owner_ringing', ownerCallSid: 'CA00000001' });
+    expect(store.record).toMatchObject({ state: 'member_ringing', memberCallSid: 'CA00000001' });
     expect(store.eventTypes()).toEqual(['call.initiated']);
     expect(queue.markJobComplete).toHaveBeenCalledTimes(1);
   });
@@ -213,18 +213,18 @@ describe('dispatchHotLeadCall gates', () => {
 });
 
 describe('processHotLeadCallJob', () => {
-  it('passes owner and status URLs with ids only, and destination/from from config, never from the lead', async () => {
+  it('passes member and status URLs with ids only, and destination/from from config, never from the lead', async () => {
     await processHotLeadCallJob(jobOf());
     const [call] = provider.placedCalls;
-    expect(call.to).toBe(OWNER_PHONE);
+    expect(call.to).toBe(MEMBER_PHONE);
     expect(call.from).toBe(TWILIO_NUMBER);
     expect(call.timeoutSeconds).toBe(25);
     const key = store.record!.jobKey;
-    const owner = new URL(call.url!);
+    const member = new URL(call.url!);
     const status = new URL(call.statusCallbackUrl!);
-    expect(owner.origin + owner.pathname).toBe('https://api.example.com/api/webhooks/twilio-voice/owner');
+    expect(member.origin + member.pathname).toBe('https://api.example.com/api/webhooks/twilio-voice/owner');
     expect(status.origin + status.pathname).toBe('https://api.example.com/api/webhooks/twilio-voice/status');
-    for (const url of [owner, status]) {
+    for (const url of [member, status]) {
       expect(Object.fromEntries(url.searchParams)).toEqual({ listId: 'list-a', leadId: 'lead-a', jobKey: key });
     }
     const everything = JSON.stringify([call, store.record, store.events]);
@@ -254,20 +254,20 @@ describe('processHotLeadCallJob', () => {
     expect(provider.placedCalls).toHaveLength(1);
   });
 
-  it('moves the record dialing -> owner_ringing with the CallSid once the call is placed', async () => {
+  it('moves the record dialing -> member_ringing with the CallSid once the call is placed', async () => {
     const states: string[] = [];
     const place = provider.placeCall.bind(provider);
     provider.placeCall = async (p) => { states.push(store.record!.state); return place(p); };
     await processHotLeadCallJob(jobOf());
     expect(states).toEqual(['dialing']);
-    expect(store.record).toMatchObject({ state: 'owner_ringing', ownerCallSid: 'CA00000001' });
+    expect(store.record).toMatchObject({ state: 'member_ringing', memberCallSid: 'CA00000001' });
   });
 
   it('does not overwrite a record a fast webhook already moved past dialing', async () => {
     const place = provider.placeCall.bind(provider);
-    provider.placeCall = async (p) => { store.record!.state = 'owner_answered'; return place(p); };
+    provider.placeCall = async (p) => { store.record!.state = 'member_answered'; return place(p); };
     await processHotLeadCallJob(jobOf());
-    expect(store.record!.state).toBe('owner_answered');
+    expect(store.record!.state).toBe('member_answered');
     expect(store.events).toEqual([]);
   });
 
@@ -278,7 +278,7 @@ describe('processHotLeadCallJob', () => {
   });
 
   it('never dials for a lead that already has a record, whatever the job key', async () => {
-    store.record = { state: 'owner_ringing', jobKey: 'old', startedAt: NOW, updatedAt: NOW };
+    store.record = { state: 'member_ringing', jobKey: 'old', startedAt: NOW, updatedAt: NOW };
     await processHotLeadCallJob(jobOf());
     await processHotLeadCallJob(jobOf({ submissionId: 'sub-2', submittedAt: NOW }));
     expect(provider.placedCalls).toHaveLength(0);
@@ -360,7 +360,7 @@ describe('processHotLeadCallJob', () => {
 
   it('scrubs phone numbers from the logged error of a failed record update', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    store.transitionError = new Error(`ddb rejected update for ${OWNER_PHONE}`);
+    store.transitionError = new Error(`ddb rejected update for ${MEMBER_PHONE}`);
     await processHotLeadCallJob(jobOf());
     const logged = JSON.stringify(warn.mock.calls);
     warn.mockRestore();
@@ -476,7 +476,7 @@ describe('abuse limits (reservation)', () => {
     expect(await submit('l1', FIRST, { orgId: 'org-b' })).toBe('called');
   });
 
-  it('refuses a second owner call inside the cooldown and allows it at the boundary', async () => {
+  it('refuses a second member call inside the cooldown and allows it at the boundary', async () => {
     expect(await submit('l1', FIRST)).toBe('called');
     later(1);
     expect(await submit('l2', '+12125550143')).toBe('owner_cooldown');
@@ -521,7 +521,7 @@ describe('abuse limits (reservation)', () => {
     later(61);
     lead.createdAt = new Date().toISOString();
     await processHotLeadCallJob(jobOf({ leadId: 'l2' }));
-    expect(store.record).toMatchObject({ state: 'owner_ringing' });
+    expect(store.record).toMatchObject({ state: 'member_ringing' });
   });
 
   it('gives every slot back when a later limit refuses', async () => {
@@ -535,7 +535,7 @@ describe('abuse limits (reservation)', () => {
   });
 
   it('gives every slot back when the lead loses store.create', async () => {
-    store.record = { state: 'owner_ringing', jobKey: 'old', startedAt: NOW, updatedAt: NOW };
+    store.record = { state: 'member_ringing', jobKey: 'old', startedAt: NOW, updatedAt: NOW };
     await processHotLeadCallJob(jobOf());
     expect(provider.placedCalls).toHaveLength(0);
     expect(slots()).toEqual({ counters: [0, 0], claims: 0 });

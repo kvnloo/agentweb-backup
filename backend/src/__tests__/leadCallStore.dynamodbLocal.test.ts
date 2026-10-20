@@ -83,10 +83,10 @@ suite('hot-lead call store against DynamoDB Local', () => {
   it('accepts the first sequence when lastSequence is empty, rejects the replay, accepts a higher one', async () => {
     const leadId = await newLead();
     await store.create(LIST, leadId, baseRecord);
-    expect(await store.transition(LIST, leadId, ['dialing'], { state: 'owner_ringing', lastSequence: { [SID_A]: 1 } })).toBe(true);
-    expect(await store.transition(LIST, leadId, ['owner_ringing'], { state: 'owner_answered', lastSequence: { [SID_A]: 1 } })).toBe(false);
-    expect((await store.get(LIST, leadId))?.state).toBe('owner_ringing');
-    expect(await store.transition(LIST, leadId, ['owner_ringing'], { state: 'owner_answered', lastSequence: { [SID_A]: 2 } })).toBe(true);
+    expect(await store.transition(LIST, leadId, ['dialing'], { state: 'member_ringing', lastSequence: { [SID_A]: 1 } })).toBe(true);
+    expect(await store.transition(LIST, leadId, ['member_ringing'], { state: 'member_answered', lastSequence: { [SID_A]: 1 } })).toBe(false);
+    expect((await store.get(LIST, leadId))?.state).toBe('member_ringing');
+    expect(await store.transition(LIST, leadId, ['member_ringing'], { state: 'member_answered', lastSequence: { [SID_A]: 2 } })).toBe(true);
   });
 
   it('applies two CallSid entries in one transition', async () => {
@@ -102,10 +102,19 @@ suite('hot-lead call store against DynamoDB Local', () => {
   it('meters each leg once', async () => {
     const leadId = await newLead();
     await store.create(LIST, leadId, baseRecord);
-    expect(await store.transition(LIST, leadId, ['dialing'], { state: 'owner_ringing', meteredLegs: ['owner'] })).toBe(true);
-    expect(await store.transition(LIST, leadId, ['owner_ringing'], { state: 'finished', meteredLegs: ['owner'] })).toBe(false);
-    expect(await store.transition(LIST, leadId, ['owner_ringing'], { state: 'owner_answered', meteredLegs: ['lead'] })).toBe(true);
-    expect((await store.get(LIST, leadId))?.meteredLegs).toEqual(['owner', 'lead']);
+    expect(await store.transition(LIST, leadId, ['dialing'], { state: 'member_ringing', meteredLegs: ['member:1'] })).toBe(true);
+    expect(await store.transition(LIST, leadId, ['member_ringing'], { state: 'finished', meteredLegs: ['member:1'] })).toBe(false);
+    expect(await store.transition(LIST, leadId, ['member_ringing'], { state: 'member_answered', meteredLegs: ['lead'] })).toBe(true);
+    expect((await store.get(LIST, leadId))?.meteredLegs).toEqual(['member:1', 'lead']);
+  });
+
+  it('stores attempt, member and tried members, and appends a tried member only once', async () => {
+    const leadId = await newLead();
+    await store.create(LIST, leadId, { ...baseRecord, attemptNo: 1, memberId: 'maaaaaaa', triedMemberIds: ['maaaaaaa'] });
+    expect(await store.get(LIST, leadId)).toMatchObject({ attemptNo: 1, memberId: 'maaaaaaa', triedMemberIds: ['maaaaaaa'] });
+    expect(await store.transition(LIST, leadId, ['dialing'], { state: 'between_attempts', attemptNo: 2, memberId: 'mbbbbbbb', triedMemberIds: ['mbbbbbbb'] })).toBe(true);
+    expect(await store.transition(LIST, leadId, ['between_attempts'], { state: 'member_ringing', triedMemberIds: ['mbbbbbbb'] })).toBe(false);
+    expect(await store.get(LIST, leadId)).toMatchObject({ state: 'between_attempts', attemptNo: 2, memberId: 'mbbbbbbb', triedMemberIds: ['maaaaaaa', 'mbbbbbbb'] });
   });
 
   it('exposes only one winner among concurrent creates', async () => {
@@ -118,10 +127,10 @@ suite('hot-lead call store against DynamoDB Local', () => {
     const leadId = await newLead();
     await store.create(LIST, leadId, baseRecord);
     const results = await Promise.all(
-      Array.from({ length: 8 }, () => store.transition(LIST, leadId, ['dialing'], { state: 'owner_ringing', meteredLegs: ['owner'], lastSequence: { [SID_A]: 1 } })),
+      Array.from({ length: 8 }, () => store.transition(LIST, leadId, ['dialing'], { state: 'member_ringing', meteredLegs: ['member:1'], lastSequence: { [SID_A]: 1 } })),
     );
     expect(results.filter(Boolean)).toHaveLength(1);
-    expect((await store.get(LIST, leadId))?.meteredLegs).toEqual(['owner']);
+    expect((await store.get(LIST, leadId))?.meteredLegs).toEqual(['member:1']);
   });
 
   it('takes a transition from the wrong state as a clean no-op', async () => {

@@ -15,7 +15,7 @@ import type { HotLeadCallRecord } from '../leadCallStore.types';
 const mock = (fn: unknown) => fn as jest.Mock;
 const LIST = 'list-a';
 const LEAD = 'lead-a';
-const SID_OWNER = 'CA' + 'a1b2c3d4'.repeat(4);
+const SID_MEMBER = 'CA' + 'a1b2c3d4'.repeat(4);
 const SID_LEAD = 'CA' + '12345678'.repeat(4);
 
 // In-memory stand-in for the two crmDb primitives with the semantics of their DynamoDB conditions:
@@ -96,7 +96,7 @@ describe('leadCallStore create/get', () => {
   });
 
   it('persists only known record fields (no way to store a phone number)', async () => {
-    const sneaky = { ...baseRecord, ownerPhone: '+15555550100' } as HotLeadCallRecord;
+    const sneaky = { ...baseRecord, memberPhone: '+15555550100' } as HotLeadCallRecord;
     await getLeadCallStore().create(LIST, LEAD, sneaky);
     expect(JSON.stringify(leads[`${LIST}/${LEAD}`])).not.toContain('5555550100');
   });
@@ -108,9 +108,9 @@ describe('leadCallStore transition', () => {
   });
 
   it('applies the patch when the current state is allowed', async () => {
-    const ok = await getLeadCallStore().transition(LIST, LEAD, ['dialing'], { state: 'owner_ringing', ownerCallSid: SID_OWNER });
+    const ok = await getLeadCallStore().transition(LIST, LEAD, ['dialing'], { state: 'member_ringing', memberCallSid: SID_MEMBER });
     expect(ok).toBe(true);
-    expect(await getLeadCallStore().get(LIST, LEAD)).toMatchObject({ state: 'owner_ringing', ownerCallSid: SID_OWNER, jobKey: 'job-1' });
+    expect(await getLeadCallStore().get(LIST, LEAD)).toMatchObject({ state: 'member_ringing', memberCallSid: SID_MEMBER, jobKey: 'job-1' });
   });
 
   it('is a no-op returning false from the wrong state', async () => {
@@ -132,40 +132,58 @@ describe('leadCallStore transition', () => {
   it('does not move a terminal record backwards', async () => {
     const store = getLeadCallStore();
     await store.transition(LIST, LEAD, ['dialing'], { state: 'finished', outcome: 'completed' });
-    expect(await store.transition(LIST, LEAD, ['dialing', 'owner_ringing'], { state: 'owner_answered' })).toBe(false);
+    expect(await store.transition(LIST, LEAD, ['dialing', 'member_ringing'], { state: 'member_answered' })).toBe(false);
     expect((await store.get(LIST, LEAD))?.state).toBe('finished');
   });
 
   it.each(['finished', 'failed', 'skipped'] as const)('refuses a from list containing terminal %s without calling the db', async (terminal) => {
     await getLeadCallStore().transition(LIST, LEAD, ['dialing'], { state: terminal });
     mock(crmDb.updateLeadSystemRecordIf).mockClear();
-    expect(await getLeadCallStore().transition(LIST, LEAD, [terminal], { state: 'owner_answered' })).toBe(false);
-    expect(await getLeadCallStore().transition(LIST, LEAD, ['dialing', terminal], { state: 'owner_answered' })).toBe(false);
+    expect(await getLeadCallStore().transition(LIST, LEAD, [terminal], { state: 'member_answered' })).toBe(false);
+    expect(await getLeadCallStore().transition(LIST, LEAD, ['dialing', terminal], { state: 'member_answered' })).toBe(false);
     expect(crmDb.updateLeadSystemRecordIf).not.toHaveBeenCalled();
     expect((await getLeadCallStore().get(LIST, LEAD))?.state).toBe(terminal);
   });
 
   it('keeps lastSequence monotonic per CallSid and rejects a replayed or older sequence', async () => {
     const store = getLeadCallStore();
-    expect(await store.transition(LIST, LEAD, ['dialing'], { state: 'owner_ringing', lastSequence: { [SID_OWNER]: 2 } })).toBe(true);
-    expect(await store.transition(LIST, LEAD, ['owner_ringing'], { state: 'owner_answered', lastSequence: { [SID_OWNER]: 2 } })).toBe(false);
-    expect(await store.transition(LIST, LEAD, ['owner_ringing'], { state: 'owner_answered', lastSequence: { [SID_OWNER]: 1 } })).toBe(false);
-    expect((await store.get(LIST, LEAD))?.state).toBe('owner_ringing');
-    expect(await store.transition(LIST, LEAD, ['owner_ringing'], { state: 'owner_answered', lastSequence: { [SID_OWNER]: 3, [SID_LEAD]: 1 } })).toBe(true);
-    expect((await store.get(LIST, LEAD))?.lastSequence).toEqual({ [SID_OWNER]: 3, [SID_LEAD]: 1 });
+    expect(await store.transition(LIST, LEAD, ['dialing'], { state: 'member_ringing', lastSequence: { [SID_MEMBER]: 2 } })).toBe(true);
+    expect(await store.transition(LIST, LEAD, ['member_ringing'], { state: 'member_answered', lastSequence: { [SID_MEMBER]: 2 } })).toBe(false);
+    expect(await store.transition(LIST, LEAD, ['member_ringing'], { state: 'member_answered', lastSequence: { [SID_MEMBER]: 1 } })).toBe(false);
+    expect((await store.get(LIST, LEAD))?.state).toBe('member_ringing');
+    expect(await store.transition(LIST, LEAD, ['member_ringing'], { state: 'member_answered', lastSequence: { [SID_MEMBER]: 3, [SID_LEAD]: 1 } })).toBe(true);
+    expect((await store.get(LIST, LEAD))?.lastSequence).toEqual({ [SID_MEMBER]: 3, [SID_LEAD]: 1 });
   });
 
   it('meters a leg at most once: the replay returns false and the list has no duplicate', async () => {
     const store = getLeadCallStore();
-    expect(await store.transition(LIST, LEAD, ['dialing'], { state: 'owner_ringing', meteredLegs: ['owner'] })).toBe(true);
-    expect(await store.transition(LIST, LEAD, ['owner_ringing'], { state: 'finished', meteredLegs: ['owner'] })).toBe(false);
-    expect(await store.transition(LIST, LEAD, ['owner_ringing'], { state: 'finished', meteredLegs: ['lead'] })).toBe(true);
-    expect((await store.get(LIST, LEAD))?.meteredLegs).toEqual(['owner', 'lead']);
+    expect(await store.transition(LIST, LEAD, ['dialing'], { state: 'member_ringing', meteredLegs: ['member:1'] })).toBe(true);
+    expect(await store.transition(LIST, LEAD, ['member_ringing'], { state: 'finished', meteredLegs: ['member:1'] })).toBe(false);
+    expect(await store.transition(LIST, LEAD, ['member_ringing'], { state: 'finished', meteredLegs: ['lead'] })).toBe(true);
+    expect((await store.get(LIST, LEAD))?.meteredLegs).toEqual(['member:1', 'lead']);
   });
 
   it('de-duplicates legs inside one patch', async () => {
-    await getLeadCallStore().transition(LIST, LEAD, ['dialing'], { state: 'finished', meteredLegs: ['owner', 'owner'] });
-    expect((await getLeadCallStore().get(LIST, LEAD))?.meteredLegs).toEqual(['owner']);
+    await getLeadCallStore().transition(LIST, LEAD, ['dialing'], { state: 'finished', meteredLegs: ['member:1', 'member:1'] });
+    expect((await getLeadCallStore().get(LIST, LEAD))?.meteredLegs).toEqual(['member:1']);
+  });
+
+  it('stores the attempt number, current member and tried members, and appends only new tried ids', async () => {
+    const store = getLeadCallStore();
+    expect(await store.transition(LIST, LEAD, ['dialing'], { state: 'member_ringing', attemptNo: 1, memberId: 'maaaaaaa', triedMemberIds: ['maaaaaaa'] })).toBe(true);
+    expect(await store.get(LIST, LEAD)).toMatchObject({ attemptNo: 1, memberId: 'maaaaaaa', triedMemberIds: ['maaaaaaa'] });
+    // A member already tried cannot be recorded again: the whole write is refused.
+    expect(await store.transition(LIST, LEAD, ['member_ringing'], { state: 'between_attempts', attemptNo: 2, triedMemberIds: ['maaaaaaa'] })).toBe(false);
+    expect((await store.get(LIST, LEAD))?.attemptNo).toBe(1);
+    expect(await store.transition(LIST, LEAD, ['member_ringing'], { state: 'between_attempts', attemptNo: 2, memberId: 'mbbbbbbb', triedMemberIds: ['mbbbbbbb'] })).toBe(true);
+    expect((await store.get(LIST, LEAD))?.triedMemberIds).toEqual(['maaaaaaa', 'mbbbbbbb']);
+  });
+
+  it('seeds triedMemberIds on create so later appends have a list to extend', async () => {
+    leads[`${LIST}/other`] = { listId: LIST, leadId: 'other', system: {} };
+    await getLeadCallStore().create(LIST, 'other', { ...baseRecord, attemptNo: 1, memberId: 'maaaaaaa', triedMemberIds: ['maaaaaaa', 'maaaaaaa'] });
+    expect(leads[`${LIST}/other`].system.hot_lead_call).toMatchObject({ attemptNo: 1, memberId: 'maaaaaaa', triedMemberIds: ['maaaaaaa'] });
+    expect((await getLeadCallStore().get(LIST, LEAD))?.triedMemberIds).toEqual([]);
   });
 
   it('stamps updatedAt itself and drops unknown patch keys', async () => {
@@ -217,8 +235,8 @@ describe('leadCallStore addEvent', () => {
   });
 
   it('redacts a digit run glued to a trailing word but keeps ids glued on the left', async () => {
-    await getLeadCallStore().addEvent(LIST, LEAD, 'call.failed', { a: 'ext 4155550100x', b: 'job_4155550100', c: `sid ${SID_OWNER}` });
-    expect(mock(crmDb.addLeadEngagement).mock.calls[0][2].eventData).toEqual({ a: 'ext [redacted]x', b: 'job_4155550100', c: `sid ${SID_OWNER}` });
+    await getLeadCallStore().addEvent(LIST, LEAD, 'call.failed', { a: 'ext 4155550100x', b: 'job_4155550100', c: `sid ${SID_MEMBER}` });
+    expect(mock(crmDb.addLeadEngagement).mock.calls[0][2].eventData).toEqual({ a: 'ext [redacted]x', b: 'job_4155550100', c: `sid ${SID_MEMBER}` });
   });
 
   it('redacts a bare 10 digit number and a dashed number', async () => {
@@ -235,10 +253,10 @@ describe('leadCallStore addEvent', () => {
     await getLeadCallStore().addEvent(LIST, LEAD, 'call.completed', {
       outcome: 'Message_Received',
       replied: true,
-      note: 'owner clicked 1',
-      reason: 'owner_no_answer',
+      note: 'member clicked 1',
+      reason: 'member_no_answer',
     });
-    expect(mock(crmDb.addLeadEngagement).mock.calls[0][2].eventData).toEqual({ reason: 'owner_no_answer' });
+    expect(mock(crmDb.addLeadEngagement).mock.calls[0][2].eventData).toEqual({ reason: 'member_no_answer' });
   });
 
   it.each(ENGAGED_EVENT_KEYWORDS)('drops detail mentioning the db.ts engagement keyword %s', async (word) => {
