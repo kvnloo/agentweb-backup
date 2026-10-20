@@ -285,7 +285,9 @@ describe('processHotLeadCallNextAttempt', () => {
     jest.clearAllMocks();
     setHotLeadCallEnabledOverride(false);
     const transitions = store.transitions;
+    const read = jest.spyOn(store, 'get');
     await processHotLeadCallNextAttempt(nextJob(record));
+    expect(read).not.toHaveBeenCalled();
     expect(crmDb.getLeadListById).not.toHaveBeenCalled();
     expect(limits.keysTouched.length).toBeGreaterThan(0); // from the first attempt only
     expect(provider.placedCalls).toHaveLength(1);
@@ -358,6 +360,17 @@ describe('processHotLeadCallNextAttempt', () => {
     await processHotLeadCallNextAttempt(nextJob(record));
     await processHotLeadCallNextAttempt({ ...nextJob(record), attemptNo: 2 });
     expect(placedTo()).toEqual([phones.C, phones.D]);
+  });
+
+  it('ignores a stale job for an earlier attempt while the record waits after a later one', async () => {
+    useConfig({ team: [member('C', '15:00', '18:00'), member('D', '14:00', '19:00'), member('E', '15:00', '18:00')] });
+    const first = structuredClone(await firstAttemptEnds());
+    await processHotLeadCallNextAttempt(nextJob(first));
+    await endCurrentAttempt();
+    expect(store.record).toMatchObject({ state: 'between_attempts', attemptNo: 2 });
+    await processHotLeadCallNextAttempt(nextJob(first)); // the job for attempt 1, replayed late
+    expect(placedTo()).toEqual([phones.C, phones.D]);
+    expect(store.record).toMatchObject({ state: 'between_attempts', attemptNo: 2 });
   });
 
   it('ignores a job for another call of the same lead and for a terminal record', async () => {
