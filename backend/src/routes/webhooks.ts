@@ -37,7 +37,7 @@ import { handleHardBounceRecipients } from '../services/emailDeliverabilityServi
 import { shouldAttemptCapiSend, isCapiAccountPaused, recordCapiUsage } from '../services/capiSendBudget';
 import { suppressLeadSideEffects, isSessionList, resolveSessionIdentity } from '../utils/sessionList';
 import { getPhoneDedupeMode } from '../utils/phoneLeadDedupeMode';
-import { phoneDedupeKey, phoneNamesConflict } from '../utils/phoneLeadDedupe';
+import { fillBlankCustomFields, phoneDedupeKey, phoneNamesConflict, phoneNameSeed } from '../utils/phoneLeadDedupe';
 import { findPhoneMatch } from '../services/phoneLeadMatch';
 import { upsertSessionLead } from '../services/sessionUpsertService';
 
@@ -781,12 +781,13 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       : 'off';
     const phoneKey = phoneMode === 'off' ? '' : phoneDedupeKey(normalizedPhone);
     let phoneSharedLine = false;
+    let existingFoundByPhone = false;
     if (phoneKey && (phoneMode === 'shadow' || phoneMode === 'on')) {
       try {
         const match = await findPhoneMatch(leadList.listId, phoneKey, leadData);
         // No phone number, name or lead id in this line: only counts and the decision.
         console.log(`[phone-dedupe] mode=${phoneMode} list=${leadList.listId} decision=${match.decision} candidates=${match.candidates} valid=${match.valid}`);
-        if (phoneMode === 'on' && match.decision === 'match') existingLead = match.lead;
+        if (phoneMode === 'on' && match.decision === 'match') { existingLead = match.lead; existingFoundByPhone = true; }
         // A known shared line is never collapsed, not even by the same-bucket exactly-once create.
         phoneSharedLine = match.decision === 'shared-line';
       } catch (lookupErr: any) {
@@ -810,7 +811,9 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // concurrent submission of the same email (the adopt in the create branch below). Sharing
     // it keeps both on identical merge / attribution / isUpdated semantics. Assigns the
     // enclosing `lead` and `isUpdated`.
-    const mergeIntoExistingLead = async (existingLead: any): Promise<void> => {
+    const mergeIntoExistingLead = async (existingLead: any, opts: { fillBlanksOnly?: boolean } = {}): Promise<void> => {
+      // ENG-2123: a lead matched by PHONE (not email) only has its blanks filled, never overwritten.
+      const fillBlanksOnly = opts.fillBlanksOnly === true;
       // Merge new data into existing lead (only overwrite with non-empty values)
       const normalize = (value: any): string => {
         if (value === null || value === undefined) return '';
@@ -825,7 +828,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         const newValue = normalize(leadData[field]);
         if (newValue) {
           const existingValue = normalize(existingLead[field]);
-          if (existingValue !== newValue) {
+          if (existingValue !== newValue && !(fillBlanksOnly && existingValue)) {
             updates[field] = newValue;
             changed = true;
           }
@@ -834,7 +837,9 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
       // Merge custom fields
       const existingCustomFields = existingLead.customFields || {};
-      const mergedCf = { ...existingCustomFields, ...mergedCustomFields };
+      const mergedCf = fillBlanksOnly
+        ? fillBlankCustomFields(existingCustomFields, mergedCustomFields)
+        : { ...existingCustomFields, ...mergedCustomFields };
       // `source` is defaulted to 'api' whenever the caller omits it, so a blind spread lets
       // that synthesized value overwrite a real stored source on every repeat submission —
       // the same data loss the phone adopt path was fixed for, on the far more common email
@@ -842,10 +847,17 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       if (!callerSuppliedSource && 'source' in existingCustomFields) {
         mergedCf.source = existingCustomFields.source;
       }
+      // A phone-matched merge must not stamp the DEFAULTED 'api' source onto a row that never had one.
+      if (fillBlanksOnly && !callerSuppliedSource && !('source' in existingCustomFields)) {
+        delete mergedCf.source;
+      }
       if (JSON.stringify(existingCustomFields) !== JSON.stringify(mergedCf)) {
         updates.customFields = mergedCf;
         changed = true;
       }
+
+      // ENG-2123: what the caller's own data changed, before the attribution refresh below flips `changed`.
+      const fieldsChanged = changed;
 
       // Attribution merge (Lead UTM — mirrors the User schema contract).
       // The new-lead path stamps firstTouch+lastTouch via createLead; the merge
@@ -920,7 +932,9 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         // Only a user-visible change makes this an "update". See the ENG-926 §B note above:
         // isUpdated drives sequence enrolment, CRM sync and owner alerts, so a silent
         // metadata backfill deliberately does not set it.
-        isUpdated = changed;
+        // A phone-matched repeat that filled nothing is not an update: the lastTouch refresh is still saved,
+        // but it must not re-run drip enrolment, CRM sync or the owner alert.
+        isUpdated = fillBlanksOnly ? fieldsChanged : changed;
       }
 
       lead = { ...existingLead, ...updates };
@@ -938,7 +952,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         touch,
       }));
     } else if (existingLead) {
-      await mergeIntoExistingLead(existingLead);
+      await mergeIntoExistingLead(existingLead, { fillBlanksOnly: existingFoundByPhone });
     } else {
       // Create a new lead.
       // ENG-2082: with no email there is nothing to query on beforehand, so a phone-only
@@ -1003,9 +1017,31 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           // ENG-2123: a concurrent submission on the same number that names a DIFFERENT person (a shared
           // household/office line). Merging would overwrite the first person's name and answers with the
           // second's, so keep two rows - exactly what happened before this feature - on an ordinary id.
-          const { phoneUniqueCreate: _separate, ...separateInput } = createInput;
-          lead = await crmDb.createLead(leadList.listId, separateInput, 'form_fill');
-          isNew = true;
+          //
+          // Everyone who names that same other person shares ONE separate row: the id is bucketed on the number
+          // AND the normalized names, so a burst of same-named submissions collapses instead of writing one row each.
+          let separateHandled = false;
+          if (phoneNamesConflict(phoneWinner, leadData)) {
+            try {
+              lead = await crmDb.createLead(leadList.listId, { ...createInput, phoneUniqueIdSeed: phoneNameSeed(leadData) }, 'form_fill');
+              isNew = true;
+              separateHandled = true;
+            } catch (nameErr: any) {
+              if (!(nameErr?.duplicatePhone && nameErr.existingLead)) throw nameErr;
+              const sameName = (await crmDb.getLeadById(leadList.listId, nameErr.existingLead.leadId, { consistentRead: true })) || nameErr.existingLead;
+              if (String(sameName.email ?? '').trim() === '' && phoneDedupeKey(sameName.phone) === phoneKey && !phoneNamesConflict(sameName, leadData)) {
+                mergedCustomFields = incomingCustomFields;
+                leadData.customFields = mergedCustomFields;
+                await mergeIntoExistingLead(sameName, { fillBlanksOnly: true });
+                separateHandled = true;
+              }
+            }
+          }
+          if (!separateHandled) {
+            const { phoneUniqueCreate: _separate, ...separateInput } = createInput;
+            lead = await crmDb.createLead(leadList.listId, separateInput, 'form_fill');
+            isNew = true;
+          }
         } else if ((createErr?.duplicateEmail || createErr?.duplicatePhone) && createErr.existingLead) {
           // The email twin of the case below: getLeadByEmail (eventually-consistent GSI) missed
           // above, but createLead's own pre-check found a row a concurrent submission wrote in
@@ -1023,7 +1059,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           // consistently (one GetItem, race path only); fall back to the carried row only if
           // that read comes back empty.
           const fresh = phoneWinner || await crmDb.getLeadById(leadList.listId, createErr.existingLead.leadId, { consistentRead: true });
-          await mergeIntoExistingLead(fresh || createErr.existingLead);
+          await mergeIntoExistingLead(fresh || createErr.existingLead, { fillBlanksOnly: !!createErr?.duplicatePhone });
         } else if (!createErr?.leadAlreadyExists) {
           throw createErr;
         } else {

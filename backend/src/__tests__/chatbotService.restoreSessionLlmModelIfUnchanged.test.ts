@@ -43,7 +43,7 @@ describe('chatbotDb.restoreSessionLlmModelIfUnchanged', () => {
     const p = updatePromiseMock.mock.calls[0][0];
     expect(p.Key).toEqual({ sessionId: 's1' });
     expect(p.ConditionExpression).toBe('llmModel = :planModel');
-    expect(p.UpdateExpression).toBe('SET llmModel = :prevModel, llmUsagePolicyDecision = :prevDecision, adminListPartition = :adminListPartition');
+    expect(p.UpdateExpression).toBe('SET llmModel = :prevModel, llmUsagePolicyDecision = :prevDecision, adminListPartition = :adminListPartition REMOVE llmModelSource');
     expect(p.ExpressionAttributeValues).toEqual({ ':planModel': 'plan-m', ':prevModel': 'old-m', ':prevDecision': DECISION, ':adminListPartition': 'all' });
   });
 
@@ -51,7 +51,7 @@ describe('chatbotDb.restoreSessionLlmModelIfUnchanged', () => {
     await chatbotDb.restoreSessionLlmModelIfUnchanged('s1', 'plan-m', { llmModel: 'old-m' });
     const p = updatePromiseMock.mock.calls[0][0];
     expect(p.ConditionExpression).toBe('llmModel = :planModel');
-    expect(p.UpdateExpression).toBe('SET llmModel = :prevModel, adminListPartition = :adminListPartition REMOVE llmUsagePolicyDecision');
+    expect(p.UpdateExpression).toBe('SET llmModel = :prevModel, adminListPartition = :adminListPartition REMOVE llmUsagePolicyDecision, llmModelSource');
     expect(p.ExpressionAttributeValues).toEqual({ ':planModel': 'plan-m', ':prevModel': 'old-m', ':adminListPartition': 'all' });
   });
 
@@ -59,7 +59,7 @@ describe('chatbotDb.restoreSessionLlmModelIfUnchanged', () => {
     await chatbotDb.restoreSessionLlmModelIfUnchanged('s1', 'plan-m', {});
     const p = updatePromiseMock.mock.calls[0][0];
     expect(p.ConditionExpression).toBe('llmModel = :planModel');
-    expect(p.UpdateExpression).toBe('SET adminListPartition = :adminListPartition REMOVE llmModel, llmUsagePolicyDecision');
+    expect(p.UpdateExpression).toBe('SET adminListPartition = :adminListPartition REMOVE llmModel, llmUsagePolicyDecision, llmModelSource');
     expect(p.ExpressionAttributeValues).toEqual({ ':planModel': 'plan-m', ':adminListPartition': 'all' });
   });
 

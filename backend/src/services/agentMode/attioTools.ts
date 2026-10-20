@@ -139,6 +139,20 @@ export async function handleAttioApi(userId: string, args: any): Promise<any> {
               : {}),
           };
         }
+        case 'LIST': {
+          // Read one page of the list's entries (ENG-2578). Agents asked for
+          // this and got "Unknown action" — there was no read path at all.
+          if (!args?.list_id) return { success: false, error: 'list_id is required for LIST_ENTRIES LIST.' };
+          const rawOffset = Number(args?.offset ?? 0);
+          const offset = Number.isInteger(rawOffset) && rawOffset > 0 ? rawOffset : 0;
+          const attioListId = await resolveAttioListId(userId, args.list_id, false);
+          const { entries, nextOffset } = await svc.listListEntriesDetailed(attioListId, offset);
+          return {
+            success: true,
+            entries: entries.map(e => ({ entryId: e.entryId, recordId: e.personRecordId, values: e.values })),
+            ...(nextOffset !== undefined ? { next_offset: nextOffset } : {}),
+          };
+        }
         case 'ADD_ENTRIES': {
           if (!args?.list_id) return { success: false, error: 'list_id is required for LIST_ENTRIES ADD_ENTRIES.' };
           // record_ids comes from model-generated tool arguments and is never
@@ -196,7 +210,7 @@ export async function handleAttioApi(userId: string, args: any): Promise<any> {
           return { success: results.some(r => r.success), results };
         }
         default:
-          return { success: false, error: `Unknown action "${action}" for LIST_ENTRIES. Valid: COUNT, ADD_ENTRIES, REMOVE_ENTRIES.` };
+          return { success: false, error: `Unknown action "${action}" for LIST_ENTRIES. Valid: COUNT, LIST, ADD_ENTRIES, REMOVE_ENTRIES.` };
       }
     }
 

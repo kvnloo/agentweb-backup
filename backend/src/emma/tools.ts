@@ -7,6 +7,7 @@ import { auditCampaigns } from '../services/adUtmAuditService';
 import type { AdPlatform } from '../utils/adUtm';
 import { metaAdReadPort, googleAdReadPort, linkedInAdReadPort } from '../services/adUtmAuditAdapters';
 import { accountMemoryDb, orgMemoryDb, userDb } from '../services/db';
+import { MEMORY_AUTOSPLIT_MAX_CHARS, splitMemoryContent } from '../utils/memoryContentLimit';
 import { crmDb } from '../services/db';
 import { askCrm } from '../services/askCrmService';
 import { createAskCrmLeadLoader, USER_LOOKUP_BUDGET } from '../services/askCrmLeadLoader';
@@ -1540,7 +1541,7 @@ ACTION MATRIX (entity_type → supported actions):
   AD_ACCOUNT      → LIST
   CAMPAIGN_GROUP  → LIST, CREATE, UPDATE
   CAMPAIGN        → LIST, CREATE, UPDATE
-  CREATIVE        → LIST, CREATE, CREATE_INLINE, CREATE_DYNAMIC, RETAG_UTM
+  CREATIVE        → LIST, CREATE, CREATE_INLINE, CREATE_DYNAMIC, RETAG_UTM, UPDATE (creative_id + status ACTIVE|PAUSED|ARCHIVED|CANCELED|DRAFT)
   POST            → CREATE, GET (post_urn)
   TARGETING       → LIST_FACETS, SEARCH, ESTIMATE_REACH
   MEDIA           → UPLOAD_IMAGE, UPLOAD_VIDEO, UPLOAD_DOCUMENT
@@ -6726,8 +6727,8 @@ emmaToolRegistry.register({
       properties: {
         content: {
           type: 'string',
-          maxLength: 2000,
-          description: 'The fact to remember. Be specific and actionable. HARD LIMIT 2000 characters — content over it is REJECTED, not truncated. If you have more to record, split it into several save_memory calls of at most 2000 characters each rather than re-sending the same oversized text, which fails identically every time (ENG-908).'
+          maxLength: MEMORY_AUTOSPLIT_MAX_CHARS,
+          description: 'The fact to remember. Be specific and actionable. Keep each fact under 2000 characters; content up to 8000 characters is split automatically into several memories at paragraph/sentence boundaries (ENG-2574). Content over 8000 characters is rejected.'
         },
         category: {
           type: 'string',
@@ -6751,18 +6752,28 @@ emmaToolRegistry.register({
     // Embed at write time so the memory can later be retrieved by relevance, not just
     // recency. Best-effort: a failure must not block saving (read path falls back to recency).
     const { embedText } = await import('../utils/embeddings');
-    const embedding = (await embedText(args.content, { userId, feature: 'embeddings' })) ?? undefined;
-    const memory = await accountMemoryDb.addMemory(
-      userId,
-      args.category,
-      args.content,
-      context?.sessionId,
-      embedding
-    );
+    // ENG-2574: split oversized content into <=2000-char rows rather than rejecting it.
+    const chunks = splitMemoryContent(String(args.content ?? ''));
+    const memoryIds: string[] = [];
+    for (const chunk of chunks) {
+      const embedding = (await embedText(chunk, { userId, feature: 'embeddings' })) ?? undefined;
+      const memory = await accountMemoryDb.addMemory(
+        userId,
+        args.category,
+        chunk,
+        context?.sessionId,
+        embedding
+      );
+      memoryIds.push(memory.memoryId);
+    }
+    const preview = `"${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`;
     return {
       success: true,
-      memoryId: memory.memoryId,
-      message: `Saved memory: "${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`
+      memoryId: memoryIds[0],
+      ...(memoryIds.length > 1 ? { memoryIds } : {}),
+      message: memoryIds.length > 1
+        ? `Saved memory as ${memoryIds.length} parts (content exceeded 2000 characters): ${preview}`
+        : `Saved memory: ${preview}`
     };
   }
 });
@@ -6804,8 +6815,8 @@ emmaToolRegistry.register({
       properties: {
         content: {
           type: 'string',
-          maxLength: 2000,
-          description: 'The org-wide fact to remember. Be specific and actionable. HARD LIMIT 2000 characters — content over it is REJECTED, not truncated. If you have more to record, split it into several save_org_memory calls of at most 2000 characters each rather than re-sending the same oversized text, which fails identically every time (ENG-831).'
+          maxLength: MEMORY_AUTOSPLIT_MAX_CHARS,
+          description: 'The org-wide fact to remember. Be specific and actionable. Keep each fact under 2000 characters; content up to 8000 characters is split automatically into several org memories at paragraph/sentence boundaries (ENG-2574). Content over 8000 characters is rejected.'
         },
         category: {
           type: 'string',
@@ -6836,18 +6847,28 @@ emmaToolRegistry.register({
 
     // Embed at write time so the memory can later be retrieved by relevance (best-effort).
     const { embedText } = await import('../utils/embeddings');
-    const embedding = (await embedText(args.content, { userId, feature: 'embeddings' })) ?? undefined;
-    const memory = await orgMemoryDb.addMemory(
-      user.orgId,
-      args.category,
-      args.content,
-      userId,
-      embedding
-    );
+    // ENG-2574: split oversized content into <=2000-char rows rather than rejecting it.
+    const chunks = splitMemoryContent(String(args.content ?? ''));
+    const memoryIds: string[] = [];
+    for (const chunk of chunks) {
+      const embedding = (await embedText(chunk, { userId, feature: 'embeddings' })) ?? undefined;
+      const memory = await orgMemoryDb.addMemory(
+        user.orgId,
+        args.category,
+        chunk,
+        userId,
+        embedding
+      );
+      memoryIds.push(memory.memoryId);
+    }
+    const preview = `"${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`;
     return {
       success: true,
-      memoryId: memory.memoryId,
-      message: `Saved org memory: "${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`
+      memoryId: memoryIds[0],
+      ...(memoryIds.length > 1 ? { memoryIds } : {}),
+      message: memoryIds.length > 1
+        ? `Saved org memory as ${memoryIds.length} parts (content exceeded 2000 characters): ${preview}`
+        : `Saved org memory: ${preview}`
     };
   }
 });
@@ -9613,9 +9634,11 @@ lists and list entries, mirroring call_hubspot_api's CONTACT_LIST actions.
 
 ENTITY_TYPE + ACTION MATRIX:
 
-  LIST_ENTRIES → COUNT (list_id) | ADD_ENTRIES (list_id, record_ids) | REMOVE_ENTRIES (list_id, record_ids)
+  LIST_ENTRIES → COUNT (list_id) | LIST (list_id, offset?) | ADD_ENTRIES (list_id, record_ids) | REMOVE_ENTRIES (list_id, record_ids)
                Entry-level actions scoped to one already-identified list.
                COUNT returns the number of entries (e.g. for CPL = spend / count).
+               LIST returns one page of entries (entryId, recordId, values);
+               pass the returned next_offset as offset for the next page.
                ADD_ENTRIES adds Attio Person record ids to the list.
                REMOVE_ENTRIES removes Person record ids from the list (looks up
                each person's entry in the list and deletes it).
@@ -9631,8 +9654,9 @@ ENTITY_TYPE + ACTION MATRIX:
       properties: {
         entity_type: { type: 'string', enum: ['LIST_ENTRIES', 'LISTS'], description: 'Attio resource to operate on.' },
         action:      { type: 'string', enum: ['COUNT', 'ADD_ENTRIES', 'REMOVE_ENTRIES', 'LIST', 'GET', 'CREATE'], description: 'Action to perform. See ACTION MATRIX.' },
-        list_id:     { type: 'string', description: 'Required for LIST_ENTRIES COUNT/ADD_ENTRIES/REMOVE_ENTRIES and LISTS GET. For LIST_ENTRIES actions, pass the AgentWeb lead list\'s id (e.g. from get_lead_lists/get_lead_details) — it is automatically resolved to that list\'s connected Attio deal-list id; a raw Attio list id also works. For LISTS actions, always a raw Attio list id (e.g. from LISTS LIST) — never an AgentWeb list id.' },
+        list_id:     { type: 'string', description: 'Required for LIST_ENTRIES COUNT/LIST/ADD_ENTRIES/REMOVE_ENTRIES and LISTS GET. For LIST_ENTRIES actions, pass the AgentWeb lead list\'s id (e.g. from get_lead_lists/get_lead_details) — it is automatically resolved to that list\'s connected Attio deal-list id; a raw Attio list id also works. For LISTS actions, always a raw Attio list id (e.g. from LISTS LIST) — never an AgentWeb list id.' },
         record_ids:  { type: 'array', items: { type: 'string' }, maxItems: 100, description: 'Attio record ids (Person or Company, matching the target list). Required for LIST_ENTRIES ADD_ENTRIES/REMOVE_ENTRIES. Max 100 per call.' },
+        offset:      { type: 'integer', description: 'LIST_ENTRIES LIST only: page offset; pass next_offset from the previous page.' },
         name:        { type: 'string', description: 'List display name. Required for LISTS CREATE.' },
         object_type: { type: 'string', enum: ['people', 'companies'], description: 'What kind of records the new list holds. LISTS CREATE only. Defaults to "people".' },
         account_id:  { type: 'string', description: 'Attio account ID. Required when the user has multiple Attio accounts connected — the error message will list them; ask the user which to use.' },

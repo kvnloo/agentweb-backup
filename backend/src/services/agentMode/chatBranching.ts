@@ -107,7 +107,8 @@ type DelegateInfo = NonNullable<ChatSession['delegateInfo']>;
 type PolicyDecision = NonNullable<ChatSession['llmUsagePolicyDecision']>;
 
 export type ModelResolution =
-  | { ok: true; model: string; policy?: PolicyDecision }
+  // ENG-669 `source`: who chose the branch's model (written as the branch session's llmModelSource).
+  | { ok: true; model: string; policy?: PolicyDecision; source?: 'user' | 'system' }
   | { ok: false; outcome: ServiceOutcome };
 
 export type IdempotencyClaimResult = { claimed: true } | { claimed: false; sessionId?: string };
@@ -123,16 +124,22 @@ export interface BranchDeps {
   recordIdempotencySessionId?(userId: string, scope: string, sessionId: string): Promise<void>;
   releaseIdempotency?(userId: string, scope: string): Promise<void>;
   /** Entitlement + usage-policy decision for the branch owner. Throws nothing: failures are an outcome. */
-  resolveModel(input: { userId: string; requestedModel?: string; explicit: boolean }): Promise<ModelResolution>;
+  resolveModel(input: {
+    userId: string;
+    requestedModel?: string;
+    explicit: boolean;
+    /** ENG-669: the source session, whose stored model (and who chose it) the branch inherits. */
+    session?: ChatSession;
+  }): Promise<ModelResolution>;
   createSession(args: {
     userId: string;
     portalType: 'agent';
     pageIdentifier: string;
     selectedStartupId?: string;
     delegateInfo?: DelegateInfo;
-    initialState: Partial<Pick<ChatSession, 'llmModel' | 'associatedSkills' | 'archived' | 'branchedFrom'>>;
+    initialState: Partial<Pick<ChatSession, 'llmModel' | 'llmModelSource' | 'associatedSkills' | 'archived' | 'branchedFrom'>>;
   }): Promise<ChatSession>;
-  setModel(sessionId: string, model: string, policy: PolicyDecision): Promise<unknown>;
+  setModel(sessionId: string, model: string, policy: PolicyDecision, source?: 'user' | 'system'): Promise<unknown>;
   setTitle(sessionId: string, title: string): Promise<unknown>;
   appendMessages(sessionId: string, messages: ChatMessage[]): Promise<unknown>;
   /**
@@ -670,6 +677,7 @@ async function createBranch(
     userId: firstRead.userId,
     requestedModel: req.alternativeModel ?? req.llmModel ?? firstRead.llmModel,
     explicit: req.alternativeModel !== undefined || req.llmModel !== undefined,
+    session: firstRead,
   });
   if (!resolved.ok) return resolved.outcome;
 
@@ -741,6 +749,7 @@ async function createBranch(
       delegateInfo: input.delegateInfo,
       initialState: {
         llmModel: resolved.model,
+        ...(resolved.source && { llmModelSource: resolved.source }),
         archived: true,
         // Computed here, never copied from the source: root = the source's root, or the source itself.
         branchedFrom: {
@@ -757,7 +766,10 @@ async function createBranch(
     deps.log('ChatBranching: branch session created (hidden until verified)', {
       sessionId: createdId, sourceSessionId: source.sessionId, userId: source.userId,
     });
-    if (resolved.policy) await deps.setModel(createdId, resolved.model, resolved.policy);
+    if (resolved.policy) {
+      if (resolved.source) await deps.setModel(createdId, resolved.model, resolved.policy, resolved.source);
+      else await deps.setModel(createdId, resolved.model, resolved.policy);
+    }
     const title = branchTitle(source);
     await deps.setTitle(createdId, title);
 

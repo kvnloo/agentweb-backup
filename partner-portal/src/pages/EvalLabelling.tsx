@@ -221,8 +221,8 @@ function SourceContext({ goldenCase, token }: { goldenCase: GoldenCaseView; toke
     return (
       <Stack spacing={1}>
         <Typography variant="subtitle2">{session.title || 'Untitled session'}</Typography>
-        <Link href={`/agent-runs?sessionId=${encodeURIComponent(goldenCase.sourceRef.id)}`} underline="hover">
-          Open tool runs in the AgentRun Inspector
+        <Link href={`/agent-runs?sessionId=${encodeURIComponent(goldenCase.sourceRef.id)}`} target="_blank" rel="noopener noreferrer" underline="hover">
+          Open the step-by-step trace (plan steps, tool calls and results) in a new tab
         </Link>
         <Box sx={{ maxHeight: 480, overflowY: 'auto', border: 1, borderColor: 'divider', borderRadius: 1, p: 1 }}>
           {messages.map((m, i) => {
