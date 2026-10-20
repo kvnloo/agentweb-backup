@@ -139,6 +139,7 @@ export default function VendorRatesTab() {
     }
   };
 
+  // Load once on mount: `load` is recreated every render and only reads state it sets itself, so listing it would refetch in a loop.
   useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
