@@ -21,6 +21,7 @@ export interface FakeLead extends Json {
 interface UpdateOp {
   stateIn: string[];
   set?: Json;
+  remove?: string[];
   maxIn?: Record<string, Record<string, number>>;
   appendNew?: Record<string, string[]>;
 }
@@ -120,6 +121,7 @@ export class FakeCrm {
         if (items.some((i) => (rec[field] as string[]).includes(i))) return false;
       }
       for (const [field, v] of Object.entries(op.set ?? {})) if (v !== undefined) rec[field] = clone(v);
+      for (const field of op.remove ?? []) delete rec[field];
       for (const [field, entries] of Object.entries(op.maxIn ?? {})) Object.assign(rec[field] as object, entries);
       for (const [field, items] of Object.entries(op.appendNew ?? {})) (rec[field] as string[]).push(...items);
       return true;

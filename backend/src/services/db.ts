@@ -10987,6 +10987,7 @@ export const crmDb = {
    * no-op rather than a partial write:
    *  - `stateIn`: the record's current `state` must be one of these (a missing record fails too);
    *  - `set`: plain field overwrites (undefined values are skipped);
+   *  - `remove`: fields deleted from the record (absent ones are fine); a field that is also in `set` is refused;
    *  - `maxIn`: per-entry numeric maps, e.g. { lastSequence: { [callSid]: 3 } }; an entry is written only
    *    if it is higher than the stored one (or absent), otherwise the whole patch fails;
    *  - `appendNew`: values appended to a list field; if any is already in the list the whole patch fails.
@@ -11000,14 +11001,19 @@ export const crmDb = {
     op: {
       stateIn: string[];
       set?: Record<string, unknown>;
+      remove?: string[];
       maxIn?: Record<string, Record<string, number>>;
       appendNew?: Record<string, string[]>;
     },
   ): Promise<boolean> {
     if (op.stateIn.length === 0) return false; // an empty IN () is invalid syntax
+    // DynamoDB rejects an expression that touches one path twice; say so before the round trip.
+    const overlap = (op.remove ?? []).find((f) => op.set?.[f] !== undefined);
+    if (overlap) throw new Error(`updateLeadSystemRecordIf: ${overlap} is both set and removed`);
     const names: Record<string, string> = { '#system': 'system', '#k': key, '#state': 'state' };
     const values: Record<string, unknown> = { ':ts': new Date().toISOString() };
     const setClauses: string[] = ['updatedAt = :ts'];
+    const removePaths: string[] = [];
     const conditions: string[] = [];
     // Every name and value goes through a generated placeholder. A placeholder that is declared but not
     // used (or used but not declared) is a ValidationException, which the mocked unit tests cannot see,
@@ -11022,6 +11028,11 @@ export const crmDb = {
       names[`#f${n}`] = field;
       values[`:v${n}`] = v;
       setClauses.push(`#system.#k.#f${n} = :v${n}`);
+      n++;
+    }
+    for (const field of new Set(op.remove ?? [])) {
+      names[`#f${n}`] = field;
+      removePaths.push(`#system.#k.#f${n}`);
       n++;
     }
     for (const [field, entries] of Object.entries(op.maxIn ?? {})) {
@@ -11057,7 +11068,7 @@ export const crmDb = {
       await dynamodb.update({
         TableName: `${TABLE_PREFIX}AW-Leads`,
         Key: { listId, leadId },
-        UpdateExpression: `SET ${setClauses.join(', ')}`,
+        UpdateExpression: `SET ${setClauses.join(', ')}${removePaths.length ? ` REMOVE ${removePaths.join(', ')}` : ''}`,
         ConditionExpression: conditions.join(' AND '),
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: values,
