@@ -32,6 +32,7 @@ import {
   isSameServedModel,
 } from '../services/agentMode/modelComparison';
 import type { ChatMessage } from '../services/chatbotService';
+import { ModelUnavailableError } from '../services/agentMode/modelUnavailable';
 
 const SECRET = 'unit-test-secret-not-a-real-one';
 const NOW = 1_790_000_000_000;
@@ -1404,5 +1405,55 @@ describe('ENG-55 data-collection policy (provider_policy_unavailable)', () => {
     const { deps } = makeDeps({ callLLM: callLLM as any, getProviderPolicy: async () => DENY });
     const out = await run(deps, body());
     expect(res(out).results[1]).toMatchObject({ errorCode: 'upstream_error' });
+  });
+});
+
+/**
+ * ENG-669 PR-A. D3: when the SESSION OWNER's tier runs fewer than two models, /compare is refused up front (403
+ * compare_not_available_for_tier + upgradeRequired) before any usage read, slot or model call. Per column: the
+ * resolver applies the owner's tier allowlist, and a column outside the plan is rejected, never substituted.
+ */
+describe('ENG-669 tier model allowlist', () => {
+  it('D3: refuses before any spend when the owner\'s plan runs fewer than two models', async () => {
+    const getTierCompareBlock = jest.fn(async () => ({ tier: 'Free', upgradeRequired: ['Pro', 'Max'] }));
+    const { deps, callLLM } = makeDeps({ getTierCompareBlock });
+    const out = await run(deps, body(), ADMIN);
+    expect(out.status).toBe(403);
+    expect(res(out)).toEqual({
+      error: 'Comparing models needs at least two models, and your current plan includes fewer. Upgrade your plan to compare models.',
+      code: 'compare_not_available_for_tier',
+      tier: 'Free',
+      upgradeRequired: ['Pro', 'Max'],
+    });
+    // Judged for the session OWNER, even when an admin calls.
+    expect(getTierCompareBlock).toHaveBeenCalledWith(OWNER.userId);
+    expect(deps.checkUsage).not.toHaveBeenCalled();
+    expect(deps.resolveModel).not.toHaveBeenCalled();
+    expect(callLLM).not.toHaveBeenCalled();
+  });
+
+  it('D3: not blocked (null) compares as before', async () => {
+    const { deps, callLLM } = makeDeps({ getTierCompareBlock: jest.fn(async () => null) });
+    const out = await run(deps, body());
+    expect(out.status).toBe(200);
+    expect(callLLM).toHaveBeenCalledTimes(2);
+  });
+
+  it('per column: a model outside the owner\'s plan is rejected and never called; the allowed column runs', async () => {
+    const resolveModel = jest.fn(async ({ requestedModel }: { requestedModel: string }) => {
+      if (requestedModel === 'gpt-5.5') {
+        throw new ModelUnavailableError('gpt-5.5', 'not_in_plan', { model: 'gpt-5.5', tier: 'Free', allowedModels: ['gemini-3.5-flash'], upgradeRequired: ['Pro'] });
+      }
+      return { effectiveModel: requestedModel, modelSelection: 'honored' };
+    });
+    const { deps, callLLM } = makeDeps({ resolveModel });
+    const out = await run(deps, body());
+    expect(out.status).toBe(200);
+    expect(res(out).results.map((r: any) => [r.model, r.status, r.errorCode])).toEqual([
+      ['gpt-5.5', 'rejected', 'model_unavailable'],
+      ['gemini-3.5-flash', 'ok', undefined],
+    ]);
+    expect(callLLM.mock.calls.map((c) => c[0])).toEqual(['gemini-3.5-flash']);
+    expect(resolveModel).toHaveBeenCalledWith({ userId: OWNER.userId, requestedModel: 'gpt-5.5' });
   });
 });

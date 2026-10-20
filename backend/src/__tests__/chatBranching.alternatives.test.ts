@@ -183,7 +183,10 @@ describe('Branch with this answer (alternativeModel)', () => {
     seed();
     const resolveModel = jest.fn(async () => ({ ok: false as const, outcome: { status: 403, body: { code: 'model_not_entitled' } } }));
     const res = await run({ messageIndex: 2, alternativeModel: 'claude-sonnet-4-6' }, makeDeps({ resolveModel }));
-    expect(resolveModel).toHaveBeenCalledWith({ userId: OWNER, requestedModel: 'claude-sonnet-4-6', explicit: true });
+    // ENG-669: the source session is passed too, so an inherited system-stamped model stays AgentWeb's choice.
+    expect(resolveModel).toHaveBeenCalledWith({
+      userId: OWNER, requestedModel: 'claude-sonnet-4-6', explicit: true, session: expect.objectContaining({ sessionId: expect.any(String) }),
+    });
     expect(res.status).toBe(403);
     expect(newIds()).toEqual([]);
   });
