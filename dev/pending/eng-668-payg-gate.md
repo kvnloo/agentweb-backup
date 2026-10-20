@@ -19,10 +19,15 @@ gate only: gate 1 would admit a turn gate 2 then refuses. It acts only on `hard_
 admits (`reason: 'payg_overage'`, `full_choice`) only when the switch is on, the tier has
 `paygOverage.allowed === true`, the owner has `paygOverage.enabled === true` and no `suspended`,
 `has_payment_method === true`, `subscription_status` is active/trialing, and overage < cap. Anything
-missing keeps the 429. A non-opted account never reads the switch or writes anything.
+missing keeps the 429. An account with no stored `paygOverage` record never reads the switch or writes
+anything; one with a record (ON or OFF) has its pool high-water mark kept up to date (below), and only an
+ON record is ever evaluated.
 
 **How overage and the cap are measured.**
 - The month's pool = `max(today's effective threshold after credits, poolHighWater for this UTC month)`.
+  The mark leaves out top-up credit a refund or dispute can still revoke (purchased grants other than
+  the `seat-credit:` grant, net of reversals); seat and admin credit stay in it. A live top-up still
+  extends today's pool; a revoked one stops covering usage instead of lingering in the mark.
   The high-water mark is written by the gate only when it rises (conditional write), for any account with
   a stored `paygOverage` record — ON or OFF — while the switch is on and the tier allows PAYG, so a
   downgrade AFTER opting in never creates retroactive overage, including one made while PAYG was off and
@@ -38,7 +43,7 @@ missing keeps the 429. A non-opted account never reads the switch or writes anyt
   pool the baseline was measured on; if the pool grows afterwards (upgrade, top-up), the baseline shrinks
   by that growth (`max(0, baseline - max(0, poolNow - poolAtOptIn))`) so it is not subtracted twice. An
   opt-in stored without it is read as measured against that month's `poolHighWater` (no growth if none).
-  Opting in also raises `poolHighWater` to the opt-in pool.
+  Opting in also raises `poolHighWater` to the opt-in pool (less any revocable top-up credit).
 - `overage.active` (and `/usage-runway` `paygCovering`) are true when admitted on PAYG with spend at or past
   the month's pool — including right after opting in with overage standing (billable 0). Admitted BELOW that
   pool (a downgrade still under the month's high-water pool), they are false and the runway — and the
