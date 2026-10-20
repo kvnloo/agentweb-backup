@@ -2,6 +2,7 @@
  * ENG-2110 PR 1b-ii: where everything lives on the worker, and the validators every path component and every
  * name must pass before it reaches a command line. Pure: no I/O. See brain `pr1b-design-v3-amendments.md`.
  *
+ *   <sharedParent>/<env> == <stateRoot>      one state root per environment under ONE shared parent, which every unit masks
  *   <stateRoot>/state/…                      host state (never visible inside a customer unit)
  *   <stateRoot>/u/                           the homes filesystem (loop-mounted, quota)
  *   <stateRoot>/u/<uid>/                     root-owned 0711
@@ -13,8 +14,10 @@ import { posix } from "path";
 export interface LayoutConfig {
   /** `^[a-z0-9]{1,16}$`: no dash (a dash in a slice name means a parent slice). */
   env: string;
-  /** Absolute, e.g. /var/lib/aw-login-host-<env>. */
+  /** Absolute, e.g. /var/lib/aw-login-host/<env>. */
   stateRoot: string;
+  /** The ONE parent of every environment's state root (e.g. /var/lib/aw-login-host): units mask all of it, so another environment's homes are never visible. */
+  sharedParent: string;
   uidMin: number;
   uidMax: number;
 }
@@ -42,6 +45,13 @@ export class Layout {
       throw new LayoutError("state_root_invalid");
     }
     if (cfg.stateRoot.length < 2 || cfg.stateRoot.endsWith("/")) throw new LayoutError("state_root_invalid");
+    try {
+      assertAbsPath(cfg.sharedParent);
+    } catch {
+      throw new LayoutError("shared_parent_invalid");
+    }
+    // The parent is masked inside every unit: it must be a dedicated directory, never a system one, and the state root must live directly in it.
+    if (["/", "/var", "/var/lib", "/run", "/opt", "/etc", "/usr", "/home", "/tmp"].includes(cfg.sharedParent) || cfg.sharedParent.endsWith("/") || cfg.stateRoot !== `${cfg.sharedParent}/${cfg.env}`) throw new LayoutError("shared_parent_invalid");
     if (!Number.isInteger(cfg.uidMin) || !Number.isInteger(cfg.uidMax) || cfg.uidMin < 1000 || cfg.uidMax < cfg.uidMin) throw new LayoutError("uid_range_invalid");
   }
 
@@ -50,6 +60,9 @@ export class Layout {
   }
   get stateRoot(): string {
     return this.cfg.stateRoot;
+  }
+  get sharedParent(): string {
+    return this.cfg.sharedParent;
   }
   /** The filesystem the homes live on (loop-mounted, quota): `attempts` and `homes` are on ONE filesystem so promote is a rename. */
   get homesRoot(): string {
@@ -125,9 +138,10 @@ export function assertEnvName(name: string): string {
   if (!ENV_NAME.test(name)) throw new LayoutError("env_name_invalid");
   return name;
 }
-/** `%` is a systemd specifier; values here are paths and fixed flags, never free text. */
+/** `%` is a systemd specifier; values here are paths and fixed flags, never free text. No control characters: transient units are written to disk and re-parsed. */
 export function assertEnvValue(value: string): string {
-  if (typeof value !== "string" || value.length > 4096 || /[\0\n\r%]/.test(value)) throw new LayoutError("env_value_invalid");
+  // eslint-disable-next-line no-control-regex
+  if (typeof value !== "string" || value.length > 4096 || /[\x00-\x1f\x7f%]/.test(value)) throw new LayoutError("env_value_invalid");
   return value;
 }
 /**
@@ -140,6 +154,7 @@ export function assertAbsPath(path: string): string {
 }
 /** A command-line argument for a customer process: `$` and `%` are expanded by the service manager in ExecStart, NUL ends a C string. */
 export function assertArg(arg: string): string {
-  if (typeof arg !== "string" || arg.length > 4096 || /[\0$%]/.test(arg)) throw new LayoutError("arg_invalid");
+  // eslint-disable-next-line no-control-regex
+  if (typeof arg !== "string" || arg.length > 4096 || /[\x00-\x1f\x7f$%]/.test(arg)) throw new LayoutError("arg_invalid");
   return arg;
 }

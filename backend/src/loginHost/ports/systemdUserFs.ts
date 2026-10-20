@@ -48,8 +48,10 @@ export class SystemdUserFs implements UserFsPort {
   private readonly root: RootFs;
   private readonly cfg: SystemdPortConfig;
   private readonly hex: (bytes: number) => string;
-  /** uid -> number of kills in flight: spawns for a gated uid are refused. */
+  /** uid -> number of kills/wipes in flight: spawns for a gated uid are refused (the gate is per operation window, not permanent: the core kills active uids too). */
   private readonly gate = new Map<number, number>();
+  /** uid -> the live `systemd-run` clients. A client that has not exited may still be about to create its unit: a kill is not complete while one exists. */
+  private readonly clients = new Map<number, Set<RunningCommand>>();
   /** Serialises wipe / killAll / create per uid (one `rm` per uid at a time). */
   private readonly locks = new Map<number, Promise<unknown>>();
   private readonly quotaSet = new Set<number>();
@@ -105,6 +107,7 @@ export class SystemdUserFs implements UserFsPort {
     await this.withUidLock(uid, async () => {
       const dir = this.layout.refDir(uid, "attempt", attemptRef);
       await this.ensureUidSkeleton(uid);
+      await this.ensureQuota(uid);
       const st = await this.root.lstat(dir);
       if (st) {
         // Idempotent retry: accept only a complete directory this port made; anything else is wiped by the caller's failure path.
@@ -118,7 +121,6 @@ export class SystemdUserFs implements UserFsPort {
         await this.root.chown(`${dir}/${sub}`, uid, uid);
       }
       await this.root.chown(dir, uid, uid);
-      await this.ensureQuota(uid);
     });
   }
 
@@ -148,12 +150,15 @@ export class SystemdUserFs implements UserFsPort {
 
   private async wipe(uid: number, dir: string): Promise<void> {
     await this.withUidLock(uid, async () => {
-      // Only with no process of the uid alive: rm as root over a tree a live customer process can still modify would be a race.
-      if ((await this.listUnits(uid)).length > 0) throw new Error("uid_busy");
-      if (!(await this.root.lstat(dir))) return;
-      const r = await this.cmd.run(this.cfg.paths.rm, ["-rf", "--one-file-system", "--", dir], { timeoutMs: this.cfg.commandTimeoutMs });
-      if (r.code !== 0 || r.timedOut) throw new Error("wipe_failed");
-      if (await this.root.lstat(dir)) throw new Error("wipe_incomplete");
+      // The gate stays closed for the whole wipe: no unit may start while root deletes under the uid's directory.
+      await this.withGate(uid, async () => {
+        // Only with no process of the uid alive (and no client about to create one): rm as root over a tree a live customer process can still modify would be a race.
+        if ((await this.listUnits(uid)).length > 0 || this.clientCount(uid) > 0) throw new Error("uid_busy");
+        if (!(await this.root.lstat(dir))) return;
+        const r = await this.cmd.run(this.cfg.paths.rm, ["-rf", "--one-file-system", "--", dir], { timeoutMs: this.cfg.commandTimeoutMs });
+        if (r.code !== 0 || r.timedOut) throw new Error("wipe_failed");
+        if (await this.root.lstat(dir)) throw new Error("wipe_incomplete");
+      });
     });
   }
 
@@ -161,10 +166,9 @@ export class SystemdUserFs implements UserFsPort {
 
   async killAll(uid: number): Promise<void> {
     this.layout.assertUid(uid);
-    this.gate.set(uid, (this.gate.get(uid) ?? 0) + 1);
-    try {
+    await this.withGate(uid, async () => {
       const deadline = Date.now() + this.cfg.killTimeoutMs;
-      for (;;) {
+      for (let round = 0; ; round++) {
         await this.cmd.run(this.cfg.paths.systemctl, ["stop", this.layout.sliceName(uid)], { timeoutMs: this.cfg.commandTimeoutMs });
         const units = await this.listUnits(uid);
         for (const u of units) {
@@ -175,15 +179,15 @@ export class SystemdUserFs implements UserFsPort {
         // exclusively ours, and killPid re-reads the process's uid immediately before the signal (pid reuse).
         const stray = (await this.root.procUids()).filter((p) => p.uid === uid);
         for (const p of stray) await this.root.killPid(p.pid, uid);
-        if (units.length === 0 && stray.length === 0) return;
+        // A `systemd-run` client that has not exited may still be about to create its unit (the request is asynchronous):
+        // the kill is not complete until every client of the uid is gone. After the first rounds a client that will not go is killed.
+        const pending = this.clientCount(uid);
+        if (pending > 0 && round >= 2) for (const c of this.clients.get(uid) ?? []) c.kill();
+        if (units.length === 0 && stray.length === 0 && pending === 0) return;
         if (Date.now() > deadline) throw new Error("kill_timeout");
         await sleep(this.cfg.killPollMs);
       }
-    } finally {
-      const n = (this.gate.get(uid) ?? 1) - 1;
-      if (n <= 0) this.gate.delete(uid);
-      else this.gate.set(uid, n);
-    }
+    });
   }
 
   async residueCount(uid: number): Promise<number> {
@@ -191,9 +195,10 @@ export class SystemdUserFs implements UserFsPort {
     const roots: string[] = [];
     for (const p of ["/tmp", "/var/tmp", "/dev/shm", this.layout.uidDir(uid)]) if (await this.root.lstat(p)) roots.push(p);
     if (roots.length === 0) return 0;
-    const r = await this.cmd.run(this.cfg.paths.find, [...roots, "-xdev", "-uid", String(uid), "-print"], { timeoutMs: this.cfg.commandTimeoutMs });
-    if (r.timedOut || (r.code !== 0 && r.code !== 1)) throw new Error("residue_scan_failed");
-    return r.stdout.split("\n").filter((l) => l.length > 0).length;
+    // One output byte per match (bounded output whatever the number of files); ONLY exit 0 is a complete scan (find exits 1 on a traversal error).
+    const r = await this.cmd.run(this.cfg.paths.find, [...roots, "-xdev", "-uid", String(uid), "-printf", "x"], { timeoutMs: this.cfg.commandTimeoutMs });
+    if (r.timedOut || r.code !== 0) throw new Error("residue_scan_failed");
+    return r.stdout.length;
   }
 
   // ───────────────────────────── internals ─────────────────────────────
@@ -202,15 +207,24 @@ export class SystemdUserFs implements UserFsPort {
   private async listUnits(uid: number): Promise<string[]> {
     const r = await this.cmd.run(this.cfg.paths.systemctl, ["list-units", "--all", "--no-legend", "--plain", this.layout.unitPattern(uid)], { timeoutMs: this.cfg.commandTimeoutMs });
     if (r.timedOut || r.code !== 0) throw new Error("list_units_failed");
-    return r.stdout
-      .split("\n")
-      .map((l) => l.trim().split(/\s+/)[0] ?? "")
-      .filter((n) => n.length > 0 && this.layout.isUnitOf(uid, n));
+    const alive: string[] = [];
+    for (const line of r.stdout.split("\n")) {
+      const t = line.trim().split(/\s+/);
+      if (t[0] === "\u25cf" || t[0] === "*") t.shift(); // a leading status marker
+      const [name, , active] = t;
+      // `--all` also lists loaded-but-inactive units: only a live one counts. Names are re-validated; nothing printed is trusted.
+      if (name && this.layout.isUnitOf(uid, name) && active !== undefined && ACTIVE_STATES.has(active)) alive.push(name);
+    }
+    return alive;
   }
 
   private async unitActive(unit: string): Promise<boolean> {
     const r = await this.cmd.run(this.cfg.paths.systemctl, ["is-active", unit], { timeoutMs: this.cfg.commandTimeoutMs });
-    return ACTIVE_STATES.has(r.stdout.trim());
+    if (r.timedOut) throw new Error("unit_state_unreadable"); // never "gone" on a guess
+    const state = r.stdout.trim();
+    if (ACTIVE_STATES.has(state)) return true;
+    if (state === "inactive" || state === "failed" || state === "unknown") return false;
+    throw new Error("unit_state_unreadable");
   }
 
   private async ensureUidSkeleton(uid: number): Promise<void> {
@@ -220,9 +234,29 @@ export class SystemdUserFs implements UserFsPort {
       [this.layout.kindDir(uid, "attempt"), 0o755],
       [this.layout.kindDir(uid, "home"), 0o755],
     ] as const) {
-      if (await this.root.lstat(dir)) continue;
+      const st = await this.root.lstat(dir);
+      if (st) {
+        // Whatever is there must be what this port made: a root-owned real directory (never a file or a symlink planted by anyone).
+        if (!st.isDirectory || st.isSymlink || st.uid !== 0) throw new Error("skeleton_invalid");
+        continue;
+      }
       await this.root.mkdir(dir, mode);
     }
+  }
+
+  private async withGate<T>(uid: number, fn: () => Promise<T>): Promise<T> {
+    this.gate.set(uid, (this.gate.get(uid) ?? 0) + 1);
+    try {
+      return await fn();
+    } finally {
+      const n = (this.gate.get(uid) ?? 1) - 1;
+      if (n <= 0) this.gate.delete(uid);
+      else this.gate.set(uid, n);
+    }
+  }
+
+  private clientCount(uid: number): number {
+    return this.clients.get(uid)?.size ?? 0;
   }
 
   private async isComplete(dir: string): Promise<boolean> {
@@ -264,6 +298,15 @@ export class SystemdUserFs implements UserFsPort {
     const unitName = this.layout.unitName(uid, this.hex(8));
     const args = systemRunArgs(this.layout, { uid, unitName, refDir, file: spec.file, args: spec.args, env: spec.env, cwd: spec.cwd }, this.cfg.limits, this.cfg.paths);
     const client = this.cmd.start(this.cfg.paths.systemRun, args);
+    const set = this.clients.get(uid) ?? new Set<RunningCommand>();
+    this.clients.set(uid, set);
+    set.add(client);
+    const forget = () => {
+      set.delete(client);
+      if (set.size === 0 && this.clients.get(uid) === set) this.clients.delete(uid);
+    };
+    client.onExit(forget);
+    client.onError(forget);
     return new UnitChild(client, unitName, {
       isActive: (u) => this.unitActive(u),
       killUnit: async (u) => {
@@ -329,13 +372,16 @@ class UnitChild implements ChildLike {
   private async afterClientExit(code: number | null, signal: string | null): Promise<void> {
     const deadline = Date.now() + this.ops.timeoutMs;
     try {
-      while (await this.ops.isActive(this.unit)) {
+      for (;;) {
+        if (!(await this.ops.isActive(this.unit))) break;
         await this.ops.killUnit(this.unit).catch(() => undefined);
-        if (Date.now() > deadline) return; // still running: NOT reported gone (the core's bounded close and its uid kill take over)
-        await sleep(this.ops.pollMs);
+        // Past the budget the unit is still NOT reported gone, but we keep trying slowly: the callback must come the moment it is.
+        await sleep(Date.now() > deadline ? Math.max(this.ops.pollMs, 1000) : this.ops.pollMs);
       }
     } catch {
-      return; // the state could not be read: never claim "gone" on a guess
+      // The state could not be read: never claim "gone" on a guess; try again shortly.
+      await sleep(Math.max(this.ops.pollMs, 1000));
+      return this.afterClientExit(code, signal);
     }
     this.done = { code, signal };
     for (const cb of this.exitCallbacks.splice(0)) cb(code, signal);

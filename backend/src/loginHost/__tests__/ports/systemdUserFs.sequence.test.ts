@@ -12,6 +12,7 @@
  *  S6 under a uid's directory only root and that uid own anything (never another uid)
  *  S7 no command argument contains a shell/service metacharacter (the dynamic parts were validated)
  *  S8 a spawn is refused while a kill of its uid is in flight, and allowed again right after (also after a failed kill)
+ *  S9 after a killAll that resolved, NOTHING spawned before it ever comes alive later (the asynchronous systemd-run start: a unit created after the listing)
  */
 import { Layout } from "../../ports/layout";
 import { SystemdUserFs, type SystemdPortConfig } from "../../ports/systemdUserFs";
@@ -40,11 +41,11 @@ async function runSeed(seed: number): Promise<void> {
   const rand = rng(seed);
   const pick = <T,>(xs: readonly T[]): T => xs[Math.floor(rand() * xs.length)];
   const sys = new FakeSystem();
-  const layout = new Layout({ env: "test1", stateRoot: "/var/lib/aw-login-host-test1", uidMin: 400_000, uidMax: 460_000 });
+  const layout = new Layout({ env: "test1", stateRoot: "/var/lib/aw-login-host/test1", sharedParent: "/var/lib/aw-login-host", uidMin: 400_000, uidMax: 460_000 });
   let counter = 0;
   const config: SystemdPortConfig = {
-    limits: { memoryMax: "1G", tasksMax: 256, tmpSize: "128M", shmSize: "64M" },
-    paths: { systemRun: "/usr/bin/systemd-run", setpriv: "/usr/bin/setpriv", inaccessible: ["/run/aw-login-host-test1"], systemctl: "/usr/bin/systemctl", rm: "/usr/bin/rm", find: "/usr/bin/find", setquota: "/usr/sbin/setquota", writeFileHelper: "/opt/aw-login-host/aw-write-file.sh" },
+    limits: { memoryMax: "1G", tasksMax: 256, tmpSize: "128M", shmSize: "64M", runtimeMaxSec: 7200 },
+    paths: { systemRun: "/usr/bin/systemd-run", setpriv: "/usr/bin/setpriv", env: "/usr/bin/env", inaccessible: ["/run/aw-login-host-test1"], systemctl: "/usr/bin/systemctl", rm: "/usr/bin/rm", find: "/usr/bin/find", setquota: "/usr/sbin/setquota", writeFileHelper: "/opt/aw-login-host/aw-write-file.sh" },
     killTimeoutMs: 80,
     killPollMs: 2,
     commandTimeoutMs: 1000,
@@ -55,13 +56,14 @@ async function runSeed(seed: number): Promise<void> {
     throw new Error(`seed ${seed}: ${m}\n  trace: ${trace.join(" | ")}`);
   };
   const children: Array<{ uid: number; child: ChildLike; unit: string }> = [];
+  const spawnedNames: Array<{ uid: number; name: string }> = [];
 
   const checkAll = (when: string) => {
     for (const u of sys.units.values()) {
       if (!new RegExp(`^aw-test1-${u.uid}-[a-f0-9]{16}\\.service$`).test(u.name)) fail(`S4 after ${when}: unit ${u.name} does not encode its uid ${u.uid}`);
     }
     for (const [p, n] of sys.tree) {
-      const m = p.match(/^\/var\/lib\/aw-login-host-test1\/u\/(\d+)\//);
+      const m = p.match(/^\/var\/lib\/aw-login-host\/test1\/u\/(\d+)\//);
       if (m && n.uid !== 0 && n.uid !== Number(m[1])) fail(`S6 after ${when}: ${p} owned by uid ${n.uid} under uid ${m[1]}'s directory`);
     }
     for (const c of sys.calls) for (const a of c.args) if (/[;|&`'"<>\n\\]/.test(a) || (/\$/.test(a))) fail(`S7 after ${when}: argument with a metacharacter: ${JSON.stringify(a)}`);
@@ -70,7 +72,7 @@ async function runSeed(seed: number): Promise<void> {
   for (let i = 0; i < STEPS; i++) {
     const uid = pick(UIDS);
     const ref = pick(REFS);
-    const op = pick(["create", "create", "promote", "wipeAtt", "wipeHome", "spawn", "spawn", "spawnShort", "killAll", "clientDeath", "endUnit", "killChild", "stray", "toggleFail", "killDuringSpawn"] as const);
+    const op = pick(["create", "create", "promote", "wipeAtt", "wipeHome", "spawn", "spawn", "spawnShort", "killAll", "clientDeath", "endUnit", "killChild", "stray", "toggleFail", "killDuringSpawn", "toggleLatency"] as const);
     trace.push(`${op}(${uid % 100},${ref})`);
     try {
       switch (op) {
@@ -110,13 +112,15 @@ async function runSeed(seed: number): Promise<void> {
           const ctx = port.contextFor("c", uid, ref, "attempt");
           try {
             const child = ctx.spawnAs({ file: "/bin/sleep", args: ["60"], env: { PATH: "/usr/bin:/bin" }, cwd: ctx.workDir });
-            const unit = [...sys.units.values()].filter((u) => u.uid === uid).pop();
-            if (!unit) break;
+            const name = (sys.calls[sys.calls.length - 1].args.find((a) => a.startsWith("--unit=")) ?? "").slice("--unit=".length);
+            spawnedNames.push({ uid, name });
             child.onExit(() => {
-              if (unit.state !== "inactive") fail(`S5 exit delivered for ${unit.name} while it is still ${unit.state}`);
+              const u = sys.units.get(name);
+              if (u && u.state !== "inactive") fail(`S5 exit delivered for ${name} while it is still ${u.state}`);
             });
-            children.push({ uid, child, unit: unit.name });
-            if (op === "spawnShort") sys.endUnit(unit, 0);
+            children.push({ uid, child, unit: name });
+            const unit = sys.units.get(name);
+            if (op === "spawnShort" && unit) sys.endUnit(unit, 0);
           } catch (e) {
             if (!/uid_gated|ENOENT/.test((e as Error).message)) fail(`unexpected spawn error ${(e as Error).message}`);
           }
@@ -124,10 +128,13 @@ async function runSeed(seed: number): Promise<void> {
         }
         case "killAll": {
           sys.failList = false;
+          const before = spawnedNames.filter((s) => s.uid === uid).map((s) => s.name);
           const res = await port.killAll(uid).then(() => "ok", (e: Error) => e.message);
           if (res === "ok") {
             if (sys.activeUnits(uid).length) fail(`S2 killAll resolved with live units of ${uid}`);
             if ([...sys.strays.values()].includes(uid)) fail(`S2 killAll resolved with a stray of ${uid}`);
+            await sleep(30); // anything still being created would have appeared by now
+            for (const n of before) if (sys.units.get(n)?.state === "active") fail(`S9 ${n} came alive AFTER killAll resolved`);
           }
           // S8: a spawn right after is allowed (the gate reopened), whatever the outcome
           if (await sys.lstat(layout.refDir(uid, "attempt", ref))) {
@@ -179,6 +186,9 @@ async function runSeed(seed: number): Promise<void> {
         case "stray":
           sys.strays.set(5000 + i, uid);
           break;
+        case "toggleLatency":
+          sys.startLatencyMs = pick([0, 0, 12]);
+          break;
         case "toggleFail": {
           const f = pick(["failRm", "failList", "startError", "immortal"] as const);
           if (f === "immortal") {
@@ -198,6 +208,7 @@ async function runSeed(seed: number): Promise<void> {
 
   // settle: remove every injected fault, then everything must be killable and wipeable
   sys.failRm = sys.failList = sys.startError = sys.rmNoop = false;
+  sys.startLatencyMs = 0;
   sys.immortal.clear();
   sys.stopGate = undefined;
   await sleep(10);

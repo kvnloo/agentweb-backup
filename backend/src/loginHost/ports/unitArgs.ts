@@ -18,6 +18,8 @@ export interface UnitLimits {
   tmpSize: string;
   /** Size of the private /dev/shm. */
   shmSize: string;
+  /** Hard ceiling on a unit's lifetime: a unit that outlives its turn (a lost client, a hung CLI) is ended by systemd itself. */
+  runtimeMaxSec: number;
 }
 
 export interface UnitSpec {
@@ -34,6 +36,8 @@ export interface UnitSpec {
 export interface UnitPaths {
   systemRun: string;
   setpriv: string;
+  /** coreutils `env`: changes into the working directory AFTER the privilege drop (see systemRunArgs). */
+  env: string;
   /** Extra paths made inaccessible inside every unit (e.g. the host's own socket directory). */
   inaccessible: string[];
 }
@@ -44,6 +48,7 @@ const SIZE = /^[1-9][0-9]{0,6}[KMG]$/;
 export function unitProperties(layout: Layout, spec: UnitSpec, limits: UnitLimits, paths: UnitPaths): string[] {
   if (!SIZE.test(limits.memoryMax) || !SIZE.test(limits.tmpSize) || !SIZE.test(limits.shmSize)) throw new Error("unit limits invalid");
   if (!Number.isInteger(limits.tasksMax) || limits.tasksMax < 1 || limits.tasksMax > 100_000) throw new Error("unit limits invalid");
+  if (!Number.isInteger(limits.runtimeMaxSec) || limits.runtimeMaxSec < 10 || limits.runtimeMaxSec > 7 * 24 * 3600) throw new Error("unit limits invalid");
   const ref = assertAbsPath(spec.refDir);
   return [
     "ProtectSystem=strict",
@@ -56,11 +61,20 @@ export function unitProperties(layout: Layout, spec: UnitSpec, limits: UnitLimit
     `TemporaryFileSystem=/var/tmp:mode=1777,nosuid,nodev,size=${limits.tmpSize}`,
     `TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev,noexec,size=${limits.shmSize}`,
     // The unit sees ONLY its own reference directory under the state root (verified: state/ and sibling uids are invisible).
-    `TemporaryFileSystem=${layout.stateRoot}`,
+    // ALL environments' state roots live under one shared parent; masking the parent hides every other environment's homes too.
+    `TemporaryFileSystem=${layout.sharedParent}`,
     `BindPaths=${ref}`,
     `ReadWritePaths=${ref}`,
     "RestrictNamespaces=yes",
     "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
+    "RestrictRealtime=yes",
+    "SystemCallArchitectures=native",
+    // The kernel attack surface a zero-capability process does not need. (`@privileged` stays allowed: setpriv, the first
+    // thing in the unit, needs setresuid/capset; it runs before any customer code and the caps are gone afterwards.)
+    "SystemCallFilter=@system-service",
+    "SystemCallFilter=~io_uring_setup io_uring_enter io_uring_register userfaultfd perf_event_open bpf keyctl add_key request_key",
+    // A denied syscall returns EPERM instead of killing the process (the default is SIGSYS): a runtime that probes for io_uring falls back.
+    "SystemCallErrorNumber=EPERM",
     "RestrictSUIDSGID=yes",
     "LockPersonality=yes",
     "ProtectControlGroups=yes",
@@ -77,6 +91,8 @@ export function unitProperties(layout: Layout, spec: UnitSpec, limits: UnitLimit
     "IPAddressDeny=169.254.169.254 fd00:ec2::254",
     `MemoryMax=${limits.memoryMax}`,
     `TasksMax=${limits.tasksMax}`,
+    `RuntimeMaxSec=${limits.runtimeMaxSec}`,
+    "OOMScoreAdjust=500", // under memory pressure the kernel picks customers, never the host service
   ];
 }
 
@@ -86,6 +102,7 @@ export function systemRunArgs(layout: Layout, spec: UnitSpec, limits: UnitLimits
   assertAbsPath(spec.file);
   assertAbsPath(spec.cwd);
   if (!spec.cwd.startsWith(spec.refDir + "/")) throw new Error("cwd must be inside the reference directory");
+  assertAbsPath(paths.env);
   for (const a of spec.args) assertArg(a);
   const env: string[] = [];
   for (const [k, v] of Object.entries(spec.env)) env.push(`--setenv=${assertEnvName(k)}=${assertEnvValue(v)}`);
@@ -96,7 +113,11 @@ export function systemRunArgs(layout: Layout, spec: UnitSpec, limits: UnitLimits
     "--pipe",
     `--unit=${spec.unitName}`,
     `--slice=${layout.sliceName(spec.uid)}`,
-    `--working-directory=${spec.cwd}`,
+    // The unit's working directory is set by PID 1 AS ROOT, following symlinks: it must therefore be the root-created
+    // reference directory itself (all of its parents are root-owned), never anything the customer can swap (verified on
+    // the instance: `work -> /proc/1/root/tmp` put a customer process in the HOST's /tmp). The change into `work` happens
+    // below, after the privilege drop, as the customer.
+    `--working-directory=${spec.refDir}`,
     ...env,
     ...unitProperties(layout, spec, limits, paths).flatMap((p) => ["-p", p]),
     "--",
@@ -108,6 +129,8 @@ export function systemRunArgs(layout: Layout, spec: UnitSpec, limits: UnitLimits
     "--bounding-set=-all",
     "--no-new-privs",
     "--",
+    paths.env,
+    `--chdir=${spec.cwd}`,
     spec.file,
     ...spec.args,
   ];

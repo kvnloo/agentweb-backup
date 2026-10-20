@@ -7,11 +7,11 @@ const UID2 = 400_101;
 
 function rig(over: Partial<SystemdPortConfig> = {}) {
   const sys = new FakeSystem();
-  const layout = new Layout({ env: "test1", stateRoot: "/var/lib/aw-login-host-test1", uidMin: 400_000, uidMax: 460_000 });
+  const layout = new Layout({ env: "test1", stateRoot: "/var/lib/aw-login-host/test1", sharedParent: "/var/lib/aw-login-host", uidMin: 400_000, uidMax: 460_000 });
   let n = 0;
   const config: SystemdPortConfig = {
-    limits: { memoryMax: "1G", tasksMax: 256, tmpSize: "128M", shmSize: "64M" },
-    paths: { systemRun: "/usr/bin/systemd-run", setpriv: "/usr/bin/setpriv", inaccessible: ["/run/aw-login-host-test1"], systemctl: "/usr/bin/systemctl", rm: "/usr/bin/rm", find: "/usr/bin/find", setquota: "/usr/sbin/setquota", writeFileHelper: "/opt/aw-login-host/aw-write-file.sh" },
+    limits: { memoryMax: "1G", tasksMax: 256, tmpSize: "128M", shmSize: "64M", runtimeMaxSec: 7200 },
+    paths: { systemRun: "/usr/bin/systemd-run", setpriv: "/usr/bin/setpriv", env: "/usr/bin/env", inaccessible: ["/run/aw-login-host-test1"], systemctl: "/usr/bin/systemctl", rm: "/usr/bin/rm", find: "/usr/bin/find", setquota: "/usr/sbin/setquota", writeFileHelper: "/opt/aw-login-host/aw-write-file.sh" },
     killTimeoutMs: 300,
     killPollMs: 5,
     commandTimeoutMs: 1000,
@@ -87,7 +87,7 @@ describe("createAttemptDir", () => {
     const q = rig({ quota: { blocksKb: 204_800, inodes: 20_000 } });
     await q.port.createAttemptDir(UID, "att-1");
     await q.port.createAttemptDir(UID, "att-2");
-    expect(q.sys.callsOf("/usr/sbin/setquota")).toEqual([{ file: "/usr/sbin/setquota", args: ["-u", String(UID), "204800", "204800", "20000", "20000", "/var/lib/aw-login-host-test1/u"] }]);
+    expect(q.sys.callsOf("/usr/sbin/setquota")).toEqual([{ file: "/usr/sbin/setquota", args: ["-u", String(UID), "204800", "204800", "20000", "20000", "/var/lib/aw-login-host/test1/u"] }]);
     const bad = rig({ quota: { blocksKb: 1, inodes: 1 } });
     bad.sys.failSetquota = true;
     expect(await rejects(bad.port.createAttemptDir(UID, "att-1"))).toBe("quota_failed");
@@ -189,7 +189,8 @@ describe("spawn (one named hardened unit per process)", () => {
     expect(call.args).toContain(`--unit=aw-test1-${UID}-0000000000000001.service`);
     expect(call.args).toContain(`--slice=aw-test1-${UID}.slice`);
     expect(call.args).toContain(`BindPaths=${layout.refDir(UID, "attempt", "att-1")}`);
-    expect(call.args.slice(call.args.indexOf("--") + 1)).toEqual(["/usr/bin/setpriv", `--reuid=${UID}`, `--regid=${UID}`, "--clear-groups", "--inh-caps=-all", "--bounding-set=-all", "--no-new-privs", "--", "/opt/aw-claude/claude", "auth", "status"]);
+    expect(call.args.slice(call.args.indexOf("--") + 1)).toEqual(["/usr/bin/setpriv", `--reuid=${UID}`, `--regid=${UID}`, "--clear-groups", "--inh-caps=-all", "--bounding-set=-all", "--no-new-privs", "--", "/usr/bin/env", `--chdir=${ctx.workDir}`, "/opt/aw-claude/claude", "auth", "status"]);
+    expect(call.args).toContain(`--working-directory=${layout.refDir(UID, "attempt", "att-1")}`);
     expect(sys.activeUnits(UID)).toHaveLength(1);
   });
   it("two processes get two different unit names", async () => {
@@ -302,6 +303,22 @@ describe("killAll", () => {
     const kills = sys.callsOf("/usr/bin/systemctl").filter((c) => c.args[0] === "kill");
     expect(kills).toEqual([]);
   });
+  it("an exit callback arrives late but surely once the unit finally dies (after the budget)", async () => {
+    const { port, sys } = rig({ killTimeoutMs: 40 });
+    await port.createAttemptDir(UID, "att-1");
+    const ctx = port.contextFor("c", UID, "att-1", "attempt");
+    const child = ctx.spawnAs({ file: "/bin/sleep", args: ["60"], env: {}, cwd: ctx.workDir });
+    const exits: number[] = [];
+    child.onExit((c) => exits.push(c ?? -1));
+    const unit = sys.activeUnits(UID)[0];
+    sys.immortal.add(unit.name);
+    unit.clientExit(255, null);
+    await new Promise((r) => setTimeout(r, 150));
+    expect(exits).toEqual([]);
+    sys.immortal.delete(unit.name); // it finally becomes killable
+    await new Promise((r) => setTimeout(r, 1300));
+    expect(exits).toEqual([255]);
+  });
   it("gives up with an error when a unit will not die (never claims clean)", async () => {
     const { port, sys } = rig();
     await port.createAttemptDir(UID, "att-1");
@@ -352,6 +369,137 @@ describe("killAll", () => {
     const { port, sys } = rig();
     sys.failList = true;
     expect(await rejects(port.killAll(UID))).toBe("list_units_failed");
+  });
+});
+
+describe("a spawn that is still being created when killAll runs (the asynchronous systemd-run start)", () => {
+  it("killAll does not return while a client has not exited: the unit that appears AFTER the first listing is killed too", async () => {
+    const { port, sys } = rig();
+    sys.startLatencyMs = 30; // the unit does not exist for 30 ms
+    await port.createAttemptDir(UID, "att-1");
+    const ctx = port.contextFor("c", UID, "att-1", "attempt");
+    ctx.spawnAs({ file: "/bin/sleep", args: ["60"], env: {}, cwd: ctx.workDir });
+    expect(sys.activeUnits(UID)).toHaveLength(0); // nothing to list yet
+    await port.killAll(UID);
+    await new Promise((r) => setTimeout(r, 60)); // anything that was going to appear has appeared
+    expect(sys.activeUnits(UID)).toHaveLength(0);
+  });
+  it("a client that never exits is killed after a few rounds and the kill reports honestly", async () => {
+    const { port, sys } = rig();
+    sys.startLatencyMs = 10_000;
+    await port.createAttemptDir(UID, "att-1");
+    const ctx = port.contextFor("c", UID, "att-1", "attempt");
+    ctx.spawnAs({ file: "/bin/sleep", args: ["60"], env: {}, cwd: ctx.workDir });
+    await port.killAll(UID); // the fake's client kill cancels the pending start
+    expect(sys.activeUnits(UID)).toHaveLength(0);
+  });
+  it("wipe refuses while a client is still starting a unit", async () => {
+    const { port, sys } = rig();
+    sys.startLatencyMs = 50;
+    await port.createAttemptDir(UID, "att-1");
+    const ctx = port.contextFor("c", UID, "att-1", "attempt");
+    ctx.spawnAs({ file: "/bin/sleep", args: ["60"], env: {}, cwd: ctx.workDir });
+    expect(await rejects(port.wipeAttempt(UID, "att-1"))).toBe("uid_busy");
+    expect(sys.callsOf("/usr/bin/rm")).toHaveLength(0);
+  });
+  it("the gate is closed for the whole wipe: no unit can start while root deletes", async () => {
+    const { port, sys } = rig();
+    await port.createAttemptDir(UID, "att-1");
+    const ctx = port.contextFor("c", UID, "att-1", "attempt");
+    let release!: () => void;
+    const slow = new Promise<void>((r) => (release = r));
+    const realRun = sys.run.bind(sys);
+    sys.run = (async (file: string, args: string[]) => {
+      if (file === "/usr/bin/rm") await slow;
+      return realRun(file, args);
+    }) as typeof sys.run;
+    const wiping = port.wipeAttempt(UID, "att-1");
+    await tick();
+    expect(() => ctx.spawnAs({ file: "/bin/sleep", args: ["1"], env: {}, cwd: ctx.workDir })).toThrow("uid_gated");
+    release();
+    await wiping;
+    await port.createAttemptDir(UID, "att-1");
+    expect(() => ctx.spawnAs({ file: "/bin/sleep", args: ["1"], env: {}, cwd: ctx.workDir })).not.toThrow();
+  });
+});
+
+describe("reading systemd's output without trusting it", () => {
+  it("loaded-but-inactive units (and a leading status marker) are not live units", async () => {
+    const { port, sys } = rig();
+    sys.inactiveLoaded = [`aw-test1-${UID}-00000000000000aa.service`];
+    await port.killAll(UID); // would spin to kill_timeout if the inactive unit counted as alive
+    await port.createAttemptDir(UID, "att-1");
+    await port.wipeAttempt(UID, "att-1"); // and would be "uid_busy"
+  });
+  it("an is-active that times out or prints something unknown is an error, never 'gone'", async () => {
+    const a = rig();
+    await a.port.createAttemptDir(UID, "att-1");
+    const ctx = a.port.contextFor("c", UID, "att-1", "attempt");
+    const child = ctx.spawnAs({ file: "/bin/sleep", args: ["60"], env: {}, cwd: ctx.workDir });
+    const exits: number[] = [];
+    child.onExit((c) => exits.push(c ?? -1));
+    a.sys.isActiveGarbage = true;
+    a.sys.activeUnits(UID)[0].clientExit(255, null);
+    await new Promise((r) => setTimeout(r, 80));
+    expect(exits).toEqual([]); // no guess
+    a.sys.isActiveGarbage = false;
+    a.sys.endUnit(a.sys.activeUnits(UID)[0], 255);
+    await new Promise((r) => setTimeout(r, 1300)); // the slow retry picks it up
+    expect(exits.length).toBe(1);
+  });
+});
+
+describe("is-active that times out", () => {
+  it("is never taken as 'gone'", async () => {
+    const { port, sys } = rig();
+    await port.createAttemptDir(UID, "att-1");
+    const ctx = port.contextFor("c", UID, "att-1", "attempt");
+    const child = ctx.spawnAs({ file: "/bin/sleep", args: ["60"], env: {}, cwd: ctx.workDir });
+    const exits: number[] = [];
+    child.onExit((c) => exits.push(c ?? -1));
+    sys.isActiveTimeout = true;
+    sys.activeUnits(UID)[0].clientExit(255, null);
+    await new Promise((r) => setTimeout(r, 80));
+    expect(exits).toEqual([]);
+  });
+});
+
+describe("the residue scan", () => {
+  it("only a COMPLETE scan (exit 0) counts: find exiting 1 (a traversal error) is an error, not a partial answer", async () => {
+    const { port, sys } = rig();
+    sys.tree.set("/tmp", { isDirectory: true, isSymlink: false, uid: 0, mode: 0o1777 });
+    sys.findExit1 = true;
+    expect(await rejects(port.residueCount(UID))).toBe("residue_scan_failed");
+  });
+});
+
+describe("skeleton and quota", () => {
+  it("refuses a uid directory (or a kind directory) that is not a root-owned real directory", async () => {
+    const a = rig();
+    a.sys.plant(a.layout.uidDir(UID), 0, "a file where a directory must be");
+    expect(await rejects(a.port.createAttemptDir(UID, "att-1"))).toBe("skeleton_invalid");
+    const b = rig();
+    await b.port.createAttemptDir(UID, "att-1");
+    b.sys.tree.get(b.layout.uidDir(UID))!.uid = UID; // handed to the customer by mistake
+    expect(await rejects(b.port.createAttemptDir(UID, "att-2"))).toBe("skeleton_invalid");
+    const c = rig();
+    await c.port.createAttemptDir(UID, "att-1");
+    c.sys.tree.set(c.layout.kindDir(UID, "attempt"), { isDirectory: false, isSymlink: true, uid: 0, mode: 0o777 });
+    expect(await rejects(c.port.createAttemptDir(UID, "att-2"))).toBe("skeleton_invalid");
+  });
+  it("the quota is also set when the directory already exists (an idempotent retry must not skip it)", async () => {
+    const { port, sys } = rig({ quota: { blocksKb: 1000, inodes: 100 } });
+    await port.createAttemptDir(UID, "att-1");
+    sys.calls.length = 0;
+    const second = rig({ quota: { blocksKb: 1000, inodes: 100 } });
+    await second.port.createAttemptDir(UID, "att-1");
+    second.sys.calls.length = 0;
+    // a fresh port instance (a host restart) with the directory already present
+    const { Layout: L } = await import("../../ports/layout");
+    void L;
+    const restarted = new (await import("../../ports/systemdUserFs")).SystemdUserFs({ layout: second.layout, cmd: second.sys, root: second.sys, config: second.config });
+    await restarted.createAttemptDir(UID, "att-1");
+    expect(second.sys.callsOf("/usr/sbin/setquota")).toHaveLength(1);
   });
 });
 

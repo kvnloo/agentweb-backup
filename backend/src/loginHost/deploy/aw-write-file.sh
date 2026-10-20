@@ -4,7 +4,14 @@
 # The target path is validated by the host (absolute, [A-Za-z0-9._/-], inside the unit's reference directory, no ..);
 # the file is created EXCLUSIVELY (noclobber): an existing file, symlink or FIFO makes it refuse.
 set -eu
-umask "$1"
+target=$2
+umask 077                       # directories are created searchable by the owner only (a 0600 mask would make them unusable)
+mkdir -p "$(dirname "$target")"
+umask "$1"                      # the requested mode applies to the FILE
+# Refuse ANY existing entry (file, symlink, FIFO, device): noclobber alone does not stop a write through a FIFO or a symlink.
+if [ -e "$target" ] || [ -L "$target" ]; then
+  echo "target exists" >&2
+  exit 1
+fi
 set -C
-mkdir -p "$(dirname "$2")"
-cat > "$2"
+cat > "$target"

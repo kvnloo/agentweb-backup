@@ -1,9 +1,9 @@
 import { assertAbsPath, assertArg, assertEnvName, assertEnvValue, assertRelPath, Layout, LayoutError } from "../../ports/layout";
 import { systemRunArgs, unitProperties, type UnitLimits, type UnitPaths, type UnitSpec } from "../../ports/unitArgs";
 
-const layout = new Layout({ env: "test1", stateRoot: "/var/lib/aw-login-host-test1", uidMin: 400_000, uidMax: 460_000 });
-const limits: UnitLimits = { memoryMax: "1G", tasksMax: 256, tmpSize: "128M", shmSize: "64M" };
-const paths: UnitPaths = { systemRun: "/usr/bin/systemd-run", setpriv: "/usr/bin/setpriv", inaccessible: ["/run/aw-login-host-test1"] };
+const layout = new Layout({ env: "test1", stateRoot: "/var/lib/aw-login-host/test1", sharedParent: "/var/lib/aw-login-host", uidMin: 400_000, uidMax: 460_000 });
+const limits: UnitLimits = { memoryMax: "1G", tasksMax: 256, tmpSize: "128M", shmSize: "64M", runtimeMaxSec: 7200 };
+const paths: UnitPaths = { systemRun: "/usr/bin/systemd-run", setpriv: "/usr/bin/setpriv", env: "/usr/bin/env", inaccessible: ["/run/aw-login-host-test1"] };
 const refDir = layout.refDir(400_123, "home", "home-0123456789ab");
 const spec = (over: Partial<UnitSpec> = {}): UnitSpec => ({
   uid: 400_123,
@@ -19,17 +19,23 @@ const throwsLayout = (fn: () => unknown) => expect(fn).toThrow(LayoutError);
 
 describe("layout", () => {
   it("builds the documented paths", () => {
-    expect(layout.homesRoot).toBe("/var/lib/aw-login-host-test1/u");
-    expect(refDir).toBe("/var/lib/aw-login-host-test1/u/400123/homes/home-0123456789ab");
-    expect(layout.refDir(400_123, "attempt", "att-1")).toBe("/var/lib/aw-login-host-test1/u/400123/attempts/att-1");
+    expect(layout.homesRoot).toBe("/var/lib/aw-login-host/test1/u");
+    expect(refDir).toBe("/var/lib/aw-login-host/test1/u/400123/homes/home-0123456789ab");
+    expect(layout.refDir(400_123, "attempt", "att-1")).toBe("/var/lib/aw-login-host/test1/u/400123/attempts/att-1");
     expect(layout.sliceName(400_123)).toBe("aw-test1-400123.slice");
     expect(layout.unitName(400_123, "0123456789abcdef")).toBe("aw-test1-400123-0123456789abcdef.service");
     expect(layout.unitPattern(400_123)).toBe("aw-test1-400123-*.service");
   });
-  it.each([["a-b"], ["UP"], [""], ["x".repeat(17)], ["has space"], ["aw.env"]])("rejects env %j (a dash would create a parent slice)", (env) => throwsLayout(() => new Layout({ env, stateRoot: "/var/lib/x", uidMin: 400_000, uidMax: 400_010 })));
-  it.each([["relative/path"], ["/trailing/"], ["/a b"], ["/a:b"], ["/a/../b"], ["/a//b"], ["/"], ["/a%b"], ["/a$b"], ["/a\nb"]])("rejects state root %j", (stateRoot) => throwsLayout(() => new Layout({ env: "ok", stateRoot, uidMin: 400_000, uidMax: 400_010 })));
+  it.each([["a-b"], ["UP"], [""], ["x".repeat(17)], ["has space"], ["aw.env"]])("rejects env %j (a dash would create a parent slice)", (env) => throwsLayout(() => new Layout({ env, stateRoot: "/var/lib/aw-login-host/x", sharedParent: "/var/lib/aw-login-host", uidMin: 400_000, uidMax: 400_010 })));
+  it.each([["relative/path"], ["/trailing/"], ["/a b"], ["/a:b"], ["/a/../b"], ["/a//b"], ["/"], ["/a%b"], ["/a$b"], ["/a\nb"]])("rejects state root %j", (stateRoot) => throwsLayout(() => new Layout({ env: "ok", stateRoot, sharedParent: "/var/lib/aw-login-host", uidMin: 400_000, uidMax: 400_010 })));
   it.each([[-1], [0], [999], [399_999], [460_001], [1.5], [NaN], ["400123" as unknown as number]])("rejects uid %j", (uid) => throwsLayout(() => layout.uidDir(uid)));
   it.each([[""], ["../x"], ["a/b"], ["a b"], ["a;b"], ["ATT-1"], ["att_1"], ["x".repeat(80)], ["att-" + "1".repeat(70)], ["a-\0"]])("rejects ref %j", (ref) => throwsLayout(() => layout.refDir(400_123, "home", ref)));
+  it.each([["/"], ["/var"], ["/var/lib"], ["/run"], ["/opt"], ["/tmp"], ["/var/lib/aw-login-host/"], ["relative"], ["/var/lib/other"]])("rejects shared parent %j (every unit masks it entirely, so it must be a dedicated directory and the state root must sit directly in it)", (sharedParent) =>
+    throwsLayout(() => new Layout({ env: "ok", stateRoot: "/var/lib/aw-login-host/ok", sharedParent, uidMin: 400_000, uidMax: 400_010 })));
+  it("the state root must be exactly <sharedParent>/<env>", () => {
+    throwsLayout(() => new Layout({ env: "ok", stateRoot: "/var/lib/aw-login-host/other", sharedParent: "/var/lib/aw-login-host", uidMin: 400_000, uidMax: 400_010 }));
+    throwsLayout(() => new Layout({ env: "ok", stateRoot: "/var/lib/aw-login-host/ok/deeper", sharedParent: "/var/lib/aw-login-host", uidMin: 400_000, uidMax: 400_010 }));
+  });
   it("recognises only its own units", () => {
     expect(layout.isUnitOf(400_123, "aw-test1-400123-0123456789abcdef.service")).toBe(true);
     expect(layout.isUnitOf(400_123, "aw-test1-400124-0123456789abcdef.service")).toBe(false);
@@ -53,8 +59,8 @@ describe("validators", () => {
   it("args and env values exclude $ and % (expanded by the service manager)", () => {
     expect(assertArg("")).toBe("");
     expect(assertArg("--model")).toBe("--model");
-    for (const bad of ["a$HOME", "${X}", "100%", "a\0b"]) throwsLayout(() => assertArg(bad));
-    for (const bad of ["a%h", "a\nb", "a\0b", "x".repeat(5000)]) throwsLayout(() => assertEnvValue(bad));
+    for (const bad of ["a$HOME", "${X}", "100%", "a\0b", "a\nb", "a\tb", "a\x1bb", "a\x7fb", "a\rb"]) throwsLayout(() => assertArg(bad));
+    for (const bad of ["a%h", "a\nb", "a\0b", "x".repeat(5000), "a\tb", "a\x1b[0mb", "a\x7fb"]) throwsLayout(() => assertEnvValue(bad));
     for (const bad of ["lower", "1X", "A B", "A=B", ""]) throwsLayout(() => assertEnvName(bad));
   });
 });
@@ -83,7 +89,14 @@ describe("unit properties: the sandbox", () => {
       "TasksMax=256",
       `BindPaths=${refDir}`,
       `ReadWritePaths=${refDir}`,
-      `TemporaryFileSystem=${layout.stateRoot}`,
+      `TemporaryFileSystem=${layout.sharedParent}`, // the shared PARENT of every environment's state root: other environments' homes are invisible too
+      "RestrictRealtime=yes",
+      "SystemCallArchitectures=native",
+      "SystemCallFilter=@system-service",
+      "SystemCallFilter=~io_uring_setup io_uring_enter io_uring_register userfaultfd perf_event_open bpf keyctl add_key request_key",
+      "SystemCallErrorNumber=EPERM",
+      "RuntimeMaxSec=7200",
+      "OOMScoreAdjust=500",
       "InaccessiblePaths=-/run/dbus",
       "InaccessiblePaths=-/run/containerd",
       "InaccessiblePaths=-/run/systemd/private",
@@ -106,9 +119,13 @@ describe("unit properties: the sandbox", () => {
   });
   it("never grants network namespaces or capabilities and never disables a protection", () => {
     const p = props().join("\n");
-    expect(p).not.toMatch(/PrivateNetwork|AmbientCapabilities|CapabilityBoundingSet|SystemCallFilter=~|ProtectSystem=(no|yes|full)|=no\b|ProtectHome=(no|read-only)/);
+    expect(p).not.toMatch(/PrivateNetwork|AmbientCapabilities|CapabilityBoundingSet|ProtectSystem=(no|yes|full)|=no\b|ProtectHome=(no|read-only)/);
+    expect(p).not.toMatch(/SystemCallFilter=~@privileged/); // setpriv (first in every unit) needs setresuid/capset
   });
   it.each([["1"], ["1g"], ["0M"], ["1GB"], ["-1G"], ["abc"], [""]])("rejects limit %j", (memoryMax) => expect(() => unitProperties(layout, spec(), { ...limits, memoryMax }, paths)).toThrow());
+  it("rejects a runtime ceiling that is missing, too small, or absurd (a unit must always have an end)", () => {
+    for (const runtimeMaxSec of [0, 5, -1, 1.5, 10 * 24 * 3600, NaN, undefined as unknown as number]) expect(() => unitProperties(layout, spec(), { ...limits, runtimeMaxSec }, paths)).toThrow();
+  });
   it("rejects a task limit that is not a sane integer", () => {
     for (const tasksMax of [0, -1, 1.5, 1_000_000, NaN]) expect(() => unitProperties(layout, spec(), { ...limits, tasksMax }, paths)).toThrow();
   });
@@ -121,14 +138,17 @@ describe("systemd-run argv", () => {
     const a = argv();
     const sep = a.indexOf("--");
     expect(a.slice(sep + 1, sep + 9)).toEqual(["/usr/bin/setpriv", "--reuid=400123", "--regid=400123", "--clear-groups", "--inh-caps=-all", "--bounding-set=-all", "--no-new-privs", "--"]);
-    expect(a.slice(sep + 9)).toEqual(["/opt/aw-login-host/claude-turn.sh", "/opt/aw-claude/2.1.294/claude", "-p", "--model", "sonnet", "--tools", ""]);
+    // the change into the customer's work directory happens AFTER the drop, as the customer
+    expect(a.slice(sep + 9)).toEqual(["/usr/bin/env", `--chdir=${refDir}/work`, "/opt/aw-login-host/claude-turn.sh", "/opt/aw-claude/2.1.294/claude", "-p", "--model", "sonnet", "--tools", ""]);
     expect(a.some((x) => x.startsWith("--uid=") || x.startsWith("--gid=") || x === "--uid" || x === "--gid")).toBe(false); // numeric uid without a passwd entry fails with 217 under --uid
   });
   it("names the unit and the slice explicitly (kill is by unit name, never by the client process) and runs it in the working directory", () => {
     const a = argv();
     expect(a).toContain("--unit=aw-test1-400123-0123456789abcdef.service");
     expect(a).toContain("--slice=aw-test1-400123.slice");
-    expect(a).toContain(`--working-directory=${refDir}/work`);
+    // systemd changes into the working directory as ROOT following symlinks: it must be the root-created reference directory itself (verified on the instance: a customer symlink in `work` otherwise reached the host's /tmp)
+    expect(a).toContain(`--working-directory=${refDir}`);
+    expect(a.some((x) => x.startsWith("--working-directory=") && x !== `--working-directory=${refDir}`)).toBe(false);
     expect(a.slice(0, 4)).toEqual(["--quiet", "--wait", "--collect", "--pipe"]);
   });
   it("passes the environment through --setenv only, validated", () => {

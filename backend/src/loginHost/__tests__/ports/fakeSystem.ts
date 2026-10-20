@@ -55,6 +55,17 @@ export class FakeSystem implements CommandPort, RootFs {
   failSetquota = false;
   failFind = false;
   failList = false;
+  /** `systemctl is-active` times out / prints something unreadable. */
+  isActiveTimeout = false;
+  isActiveGarbage = false;
+  /** `find` exits 1 (a traversal error) after printing what it found. */
+  findExit1 = false;
+  /** systemd-run needs this long before the unit exists (the asynchronous start). */
+  startLatencyMs = 0;
+  /** Loaded-but-inactive units that `list-units --all` also prints. */
+  inactiveLoaded: string[] = [];
+  /** Unit working directory as given to systemd-run (root follows it). */
+  workingDirs = new Map<string, string>();
   /** Units refuse to die (`systemctl kill/stop` is a no-op): an immortal process. */
   immortal = new Set<string>();
   /** A gate the `systemctl stop <slice>` waits for (a slow kill). */
@@ -69,7 +80,7 @@ export class FakeSystem implements CommandPort, RootFs {
   startError = false;
 
   constructor() {
-    for (const p of ["/var/lib/aw-login-host-test1", "/var/lib/aw-login-host-test1/u"]) this.tree.set(p, { isDirectory: true, isSymlink: false, uid: 0, mode: 0o711 });
+    for (const p of ["/var/lib/aw-login-host", "/var/lib/aw-login-host/test1", "/var/lib/aw-login-host/test1/u"]) this.tree.set(p, { isDirectory: true, isSymlink: false, uid: 0, mode: 0o711 });
   }
 
   // ───────────────────────────── RootFs ─────────────────────────────
@@ -159,9 +170,12 @@ export class FakeSystem implements CommandPort, RootFs {
       const pattern = rest[rest.length - 1];
       const re = new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$");
       const lines = [...this.units.values()].filter((u) => u.state === "active" && re.test(u.name)).map((u) => `${u.name} loaded active running Some description`);
-      return ok([...lines, ...this.listJunk].join("\n") + "\n");
+      const inactive = this.inactiveLoaded.filter((n) => re.test(n)).map((n) => `\u25cf ${n} loaded inactive dead Some description`);
+      return ok([...lines, ...inactive, ...this.listJunk].join("\n") + "\n");
     }
     if (sub === "is-active") {
+      if (this.isActiveTimeout) return { code: null, signal: null, stdout: "", stderr: "", timedOut: true };
+      if (this.isActiveGarbage) return ok("weird-state\n", 0);
       const u = this.units.get(rest[0]);
       return u && u.state === "active" ? ok("active\n") : ok("inactive\n", 3);
     }
@@ -196,7 +210,7 @@ export class FakeSystem implements CommandPort, RootFs {
     const found: string[] = [];
     for (const [p, n] of this.tree) if (n.uid === uid && roots.some((r) => p === r || p.startsWith(r + "/")) && p !== roots.find((r) => r === p)) found.push(p);
     for (const r of this.residue) if (r.uid === uid && roots.some((x) => r.path.startsWith(x + "/"))) found.push(r.path);
-    return ok(found.join("\n") + (found.length ? "\n" : ""));
+    return ok("x".repeat(found.length), this.findExit1 ? 1 : 0);
   }
 
   start(file: string, args: string[]): RunningCommand {
@@ -239,7 +253,11 @@ export class FakeSystem implements CommandPort, RootFs {
     const afterSetpriv = args.slice(dd + 1);
     const sp = afterSetpriv.indexOf("--");
     const uid = Number((afterSetpriv.find((a) => a.startsWith("--reuid=")) ?? "--reuid=0").slice("--reuid=".length));
-    const cmdline = afterSetpriv.slice(sp + 1);
+    let cmdline = afterSetpriv.slice(sp + 1);
+    // the privilege drop is followed by `env --chdir=<cwd>`: the change into the customer's directory happens AFTER the drop
+    if (cmdline[0]?.endsWith("/env") && cmdline[1]?.startsWith("--chdir=")) cmdline = cmdline.slice(2);
+    const wd = args.find((a) => a.startsWith("--working-directory="));
+    if (wd) this.workingDirs.set(name, wd.slice("--working-directory=".length));
     const unit: FakeUnit = {
       name,
       uid,
@@ -256,9 +274,26 @@ export class FakeSystem implements CommandPort, RootFs {
       stdinData: "",
     };
     stdin.on("data", (b: Buffer) => (unit.stdinData += b.toString()));
-    this.units.set(name, unit);
-    const program = this.programs.get(unit.file);
-    if (program) program(unit);
+    const create = () => {
+      this.units.set(name, unit);
+      const program = this.programs.get(unit.file);
+      if (program) program(unit);
+    };
+    if (this.startLatencyMs > 0) {
+      // The unit does not exist yet: the client has asked PID 1 and is waiting. Killing the client before the unit appears
+      // prevents it; otherwise the unit appears later and the client exits when it ends.
+      let cancelled = false;
+      client.kill = () => {
+        cancelled = true;
+        queueMicrotask(() => exitCbs.forEach((cb) => cb(255, null)));
+      };
+      setTimeout(() => {
+        if (cancelled) return;
+        create();
+      }, this.startLatencyMs);
+      // the client exits when its unit ends: wire that
+      unit.clientExit = (code, signal) => exitCbs.forEach((cb) => cb(code, signal));
+    } else create();
     if (this.clientDiesOnStart) queueMicrotask(() => exitCbs.forEach((cb) => cb(255, null)));
     return client;
   }
