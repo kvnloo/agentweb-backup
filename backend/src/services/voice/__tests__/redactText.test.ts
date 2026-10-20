@@ -15,6 +15,16 @@ describe('redactPhones', () => {
     ['fullwidth plus', '＋1 415 555 0100'],
     ['non-breaking hyphen and space', '555‑555 0100'],
     ['minus sign', '555−555−0100'],
+    ['comma-grouped', '1,415,555,0100'],
+    ['asterisk-separated', '415*555*0100'],
+    ['underscore-separated', '415_555_0100'],
+    ['zero-width space', '415\u200B555\u200B0100'],
+    ['zero-width joiner', '415\u200D555\u200D0100'],
+    ['word joiner', '415\u2060555\u20600100'],
+    ['byte-order mark', '415\uFEFF555\uFEFF0100'],
+    ['soft hyphen', '415\u00AD555\u00AD0100'],
+    ['URL-encoded plus', '%2B14155550100'],
+    ['lowercase URL-encoded plus', '%2b14155550100'],
   ])('redacts a %s number', (_label, num) => {
     expect(redactPhones(`dial ${num} now`)).toBe('dial [redacted] now');
   });
@@ -23,12 +33,22 @@ describe('redactPhones', () => {
     expect(redactPhones('number+15555550100')).toBe('number[redacted]');
   });
 
+  it('redacts a number glued to a word prefix', () => {
+    expect(redactPhones('to4155550100')).toBe('to[redacted]');
+    expect(redactPhones('tel:4155550100')).toBe('tel:[redacted]');
+    expect(redactPhones('callto%2B14155550100')).toBe('callto[redacted]');
+  });
+
+  it('redacts a number inside a URL query', () => {
+    expect(redactPhones('/owner?to=%2B14155550100&x=1')).toBe('/owner?to=[redacted]&x=1');
+  });
+
   it('redacts a digit run glued on the right', () => {
     expect(redactPhones('ext 4155550100x')).toBe('ext [redacted]x');
   });
 
   it('keeps Twilio SIDs, ISO dates and ids glued on the left', () => {
-    const text = `${CALL_SID} ${NUMBER_SID} 2026-10-19 2026-10-19T10:00:00.000Z job_1234567 job-1234567`;
+    const text = `${CALL_SID} ${NUMBER_SID} 2026-10-19 2026-10-19T10:00:00.000Z job_1234567 job-1234567 job_1234567_89 ${CALL_SID}_1234567`;
     expect(redactPhones(text)).toBe(text);
   });
 
