@@ -118,6 +118,7 @@ import {
   ContentCopy as ContentCopyIcon,
 } from "@mui/icons-material";
 import { staffOperatedBadge, type SelfActivitySignal } from "../utils/selfActivityBadge";
+import { ErrorState } from "../components/StatusState";
 
 interface TabPanelProps {
   children?: React.ReactNode;
@@ -3468,7 +3469,26 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
   const currentAdminTab = ADMIN_TABS.find((adminTab) => adminTab.value === tabValue);
 
   if (adminError) {
-    return <Alert severity="error">{adminError}</Alert>;
+    return (
+      <ErrorState
+        title="We couldn't load the admin dashboard"
+        description={adminError}
+        onRetry={async () => {
+          // ENG-2526: retry every load sequentially and stop at the first failure.
+          // Each loader clears the shared error on success, so parallel retries let
+          // a successful load hide a still-failing one (e.g. waitlist/analytics).
+          if (!(await loadUsers(userFilterHideBotLike))) return;
+          if (!(await loadWaitlist())) return;
+          // Analytics only loads on the Overview tab (matches the analytics effect).
+          if (tabValue === 0 && startDate && endDate) {
+            const startDateStr = format(startDate, "yyyy-MM-dd");
+            const endDateStr = format(endDate, "yyyy-MM-dd");
+            lastLoadedDatesRef.current = { startDate: startDateStr, endDate: endDateStr };
+            await loadAnalytics(startDateStr, endDateStr);
+          }
+        }}
+      />
+    );
   }
 
   return (
