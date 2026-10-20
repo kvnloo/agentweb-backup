@@ -250,8 +250,12 @@ function withinRunWindow(
   if (Number.isFinite(completed)) {
     for (let i = first + 1; i < stop; i++) {
       const m = messages[i];
+      if (m.role !== 'user') continue;
+      // A user row with no timestamp of its own (legacy rows migrated into the table have none)
+      // counts as stamped at the last time seen before it.
       const own = m.ts ? Date.parse(m.ts) : NaN;
-      if (m.role === 'user' && Number.isFinite(own) && own >= completed) {
+      const at = Number.isFinite(own) ? own : carried[i];
+      if (Number.isFinite(at) && at >= completed) {
         stop = i;
         break;
       }
