@@ -797,6 +797,21 @@ describe('a lead that already has a call record', () => {
   });
 });
 
+describe('credentials that cannot be loaded', () => {
+  it('skips with credentials_unavailable and leaves the lead\'s slot, the caps and the record untouched', async () => {
+    provider.failNextEnsureCredentials('secret missing');
+    await processHotLeadCallJob(jobOf());
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'credentials_unavailable' } }]);
+    expect(store.record).toBeNull();
+    expect(limits.keysTouched).toEqual([]);
+    expect(provider.placedCalls).toHaveLength(0);
+    // The next submission of the same lead is dialed normally.
+    await processHotLeadCallJob(jobOf({ submissionId: 'sub-2', submittedAt: NOW }));
+    expect(provider.placedCalls).toHaveLength(1);
+    expect(store.record).toMatchObject({ state: 'member_ringing' });
+  });
+});
+
 describe('the call record of the first attempt', () => {
   it('stores a keyed digest of the dispatch-time phone, never the phone', async () => {
     await processHotLeadCallJob(jobOf());

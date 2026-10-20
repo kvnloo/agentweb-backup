@@ -5,6 +5,7 @@ import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHea
 import type { HotLeadCallConfig } from './hotLeadCallConfig';
 import { callableLeadPhone } from './hotLeadCallConfig';
 import type { LeadOrigin } from './leadNotificationConfig';
+import { getVoiceProvider } from './voice/voiceProvider';
 import { isWebhookSafeId } from './voice/voiceUrls';
 import { isHotLeadCallEnabled } from './voice/hotLeadCallMode';
 import { isHotLeadCallEntitled } from './voice/hotLeadCallEntitlement';
@@ -139,6 +140,16 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
   const candidates = selectHotLeadCallCandidates(config, new Date());
   if (candidates.length === 0) {
     await recordSkip(reviewed.lead, 'no_one_available');
+    return;
+  }
+
+  // Before any slot or record: with no usable Twilio credentials nothing can be dialed, and the lead's single
+  // call slot (and the org's caps) must stay unused so a later submission can try again.
+  try {
+    await getVoiceProvider().ensureCredentials();
+  } catch (err) {
+    console.warn('[hotLeadCall] voice credentials unavailable', { listId, leadId, error: errorText(err) });
+    await recordSkip(reviewed.lead, 'credentials_unavailable');
     return;
   }
 

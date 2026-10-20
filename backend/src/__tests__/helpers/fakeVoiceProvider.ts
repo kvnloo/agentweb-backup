@@ -16,6 +16,7 @@ export class FakeVoiceProvider implements VoiceProvider {
   private callSeq = 0;
   private numberSeq = 0;
   private placeCallFailures: VoiceCallError[] = [];
+  private ensureCredentialsFailures: VoiceCallError[] = [];
   private buyNumberFailures: VoiceCallError[] = [];
   private releaseNumberFailures: VoiceCallError[] = [];
   private buyNumberResults: { numberSid: string; phoneNumber: string }[] = [];
@@ -39,7 +40,14 @@ export class FakeVoiceProvider implements VoiceProvider {
     this.buyNumberResults.push(result);
   }
 
+  /** The next ensureCredentials rejects like the real provider when the Twilio secret cannot be loaded. */
+  failNextEnsureCredentials(message = 'scripted failure'): void {
+    this.ensureCredentialsFailures.push(new VoiceCallError(`Twilio credentials unavailable: ${message}`, 'no'));
+  }
+
   async ensureCredentials(): Promise<void> {
+    const failure = this.ensureCredentialsFailures.shift();
+    if (failure) throw failure;
     // Counted only once the promise resolves: an un-awaited `void provider.ensureCredentials()` must not unlock validateSignature.
     await Promise.resolve();
     this.ensureCredentialsCalls++;
