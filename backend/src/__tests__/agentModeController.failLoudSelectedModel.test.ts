@@ -1265,6 +1265,45 @@ describe('ENG-669 model source on canonical ids, final-gate 422, legacy side cha
     expect(mockWorker.runInWorker).not.toHaveBeenCalled();
   });
 
+  it("THROUGH the adoption write: a pick that replaces an admin plan's retired step model is recorded as the user's and checked on a later turn", async () => {
+    const honor = jest.spyOn(workPlanStepModels, 'shouldHonor').mockResolvedValue(true);
+    let stored: any = {
+      ...baseSession(DEFAULT_MODEL), llmModelSource: 'system',
+      workPlan: {
+        title: 'P', planAuthor: 'system', createdAt: 'x', updatedAt: 'x',
+        steps: [{ stepCount: 1, title: 'S1', status: 'pending', model: UNSERVED }],
+      },
+    };
+    mockChatbotDb.getChatSession.mockImplementation(async () => stored);
+    mockChatbotDb.updateSessionLlmModel.mockImplementation(async (_id: string, model: string, decision: any, source?: any) => {
+      stored = { ...stored, llmModel: model, llmUsagePolicyDecision: decision, llmModelSource: source };
+      return stored;
+    });
+    const db = mockChatbotDb as any;
+    const hadWorkPlanWrite = 'updateSessionWorkPlan' in db;
+    db.updateSessionWorkPlan = jest.fn(async (_id: string, workPlan: any) => { stored = { ...stored, workPlan }; return stored; });
+    try {
+      // Turn 1: the step's own (admin) model is retired; the user's explicit pick (in the plan today) runs and is adopted.
+      const first = makeRes();
+      await agentModeController.generateResponse(generateReq({ llmModel: ALLOWED }), first);
+      expect(first.statusCode).toBe(200);
+      expect(stored.workPlan.steps[0]).toMatchObject({ model: ALLOWED, modelSource: 'user' });
+      expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: ALLOWED }), expect.anything());
+
+      // Turn 2 (a side channel, no request model): the owner's plan has since narrowed and no longer includes the pick.
+      mockSettings.subscription_types = JSON.stringify([{ name: 'Free', allowedModels: [TARGET] }, { name: 'Pro', allowedModels: ['*'] }]);
+      modelAccess.reset();
+      mockWorker.runInWorker.mockClear();
+      const second = await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, DEFAULT_MODEL);
+      // Checked as the USER's pick, not exempted as the admin plan's step pin: the plan pauses, nothing runs.
+      expect(second.content).toContain("which isn't included in this account's plan");
+      expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    } finally {
+      honor.mockRestore();
+      if (!hadWorkPlanWrite) delete db.updateSessionWorkPlan;
+    }
+  });
+
   it("a human's NEW pick of a model an admin-authored plan uses elsewhere is still checked against the owner's plan", async () => {
     storeSession({
       ...baseSession(ALLOWED), llmModelSource: 'user',
