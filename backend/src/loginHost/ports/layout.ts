@@ -1,0 +1,145 @@
+/**
+ * ENG-2110 PR 1b-ii: where everything lives on the worker, and the validators every path component and every
+ * name must pass before it reaches a command line. Pure: no I/O. See brain `pr1b-design-v3-amendments.md`.
+ *
+ *   <stateRoot>/state/…                      host state (never visible inside a customer unit)
+ *   <stateRoot>/u/                           the homes filesystem (loop-mounted, quota)
+ *   <stateRoot>/u/<uid>/                     root-owned 0711
+ *   <stateRoot>/u/<uid>/attempts/<ref>/      sign-in attempt: {home,work,tmp}
+ *   <stateRoot>/u/<uid>/homes/<ref>/         promoted home:   {home,work,tmp}
+ */
+import { posix } from "path";
+
+export interface LayoutConfig {
+  /** `^[a-z0-9]{1,16}$`: no dash (a dash in a slice name means a parent slice). */
+  env: string;
+  /** Absolute, e.g. /var/lib/aw-login-host-<env>. */
+  stateRoot: string;
+  uidMin: number;
+  uidMax: number;
+}
+
+export type RefKind = "attempt" | "home";
+
+const ENV = /^[a-z0-9]{1,16}$/;
+const REF = /^[a-z][a-z0-9]{1,9}-[a-z0-9]{1,64}$/;
+const SEGMENT = /^[A-Za-z0-9._-]{1,64}$/;
+const ENV_NAME = /^[A-Z][A-Z0-9_]{0,63}$/;
+
+export class LayoutError extends Error {
+  constructor(readonly reason: string) {
+    super(`layout: ${reason}`);
+    this.name = "LayoutError";
+  }
+}
+
+export class Layout {
+  constructor(private readonly cfg: LayoutConfig) {
+    if (!ENV.test(cfg.env)) throw new LayoutError("env_invalid");
+    try {
+      assertAbsPath(cfg.stateRoot);
+    } catch {
+      throw new LayoutError("state_root_invalid");
+    }
+    if (cfg.stateRoot.length < 2 || cfg.stateRoot.endsWith("/")) throw new LayoutError("state_root_invalid");
+    if (!Number.isInteger(cfg.uidMin) || !Number.isInteger(cfg.uidMax) || cfg.uidMin < 1000 || cfg.uidMax < cfg.uidMin) throw new LayoutError("uid_range_invalid");
+  }
+
+  get env(): string {
+    return this.cfg.env;
+  }
+  get stateRoot(): string {
+    return this.cfg.stateRoot;
+  }
+  /** The filesystem the homes live on (loop-mounted, quota): `attempts` and `homes` are on ONE filesystem so promote is a rename. */
+  get homesRoot(): string {
+    return `${this.cfg.stateRoot}/u`;
+  }
+
+  assertUid(uid: number): number {
+    if (!Number.isInteger(uid) || uid < this.cfg.uidMin || uid > this.cfg.uidMax) throw new LayoutError("uid_out_of_range");
+    return uid;
+  }
+  assertRef(ref: string): string {
+    if (typeof ref !== "string" || !REF.test(ref)) throw new LayoutError("ref_invalid");
+    return ref;
+  }
+
+  uidDir(uid: number): string {
+    return `${this.homesRoot}/${this.assertUid(uid)}`;
+  }
+  kindDir(uid: number, kind: RefKind): string {
+    return `${this.uidDir(uid)}/${kind === "attempt" ? "attempts" : "homes"}`;
+  }
+  refDir(uid: number, kind: RefKind, ref: string): string {
+    return `${this.kindDir(uid, kind)}/${this.assertRef(ref)}`;
+  }
+  homeDir(uid: number, kind: RefKind, ref: string): string {
+    return `${this.refDir(uid, kind, ref)}/home`;
+  }
+  workDir(uid: number, kind: RefKind, ref: string): string {
+    return `${this.refDir(uid, kind, ref)}/work`;
+  }
+  tmpDir(uid: number, kind: RefKind, ref: string): string {
+    return `${this.refDir(uid, kind, ref)}/tmp`;
+  }
+
+  sliceName(uid: number): string {
+    return `aw-${this.cfg.env}-${this.assertUid(uid)}.slice`;
+  }
+  /** `suffix` is lowercase hex from a CSPRNG: unit names are unguessable and never contain customer-controlled text. */
+  unitName(uid: number, suffix: string): string {
+    if (!/^[a-f0-9]{8,32}$/.test(suffix)) throw new LayoutError("unit_suffix_invalid");
+    return `aw-${this.cfg.env}-${this.assertUid(uid)}-${suffix}.service`;
+  }
+  /** systemctl pattern matching every unit of one uid. */
+  unitPattern(uid: number): string {
+    return `aw-${this.cfg.env}-${this.assertUid(uid)}-*.service`;
+  }
+  /** Whether `name` is one of THIS env's units of THIS uid (used to trust nothing that `systemctl list-units` prints). */
+  isUnitOf(uid: number, name: string): boolean {
+    return new RegExp(`^aw-${this.cfg.env}-${this.assertUid(uid)}-[a-f0-9]{8,32}\\.service$`).test(name);
+  }
+  get envSlicePattern(): string {
+    return `aw-${this.cfg.env}-*.slice`;
+  }
+  /** The slice that parents every customer slice of this env (caps the total). */
+  get envSliceName(): string {
+    return `aw-${this.cfg.env}.slice`;
+  }
+}
+
+/**
+ * A path relative to a connection's home directory, validated component by component: relative, no `..`,
+ * no empty/`.` segment, characters restricted, bounded depth and length. Anything else throws.
+ */
+export function assertRelPath(rel: string): string[] {
+  if (typeof rel !== "string" || rel.length === 0 || rel.length > 200 || rel.includes("\0") || rel.startsWith("/")) throw new LayoutError("rel_invalid");
+  const parts = rel.split("/");
+  if (parts.length > 4) throw new LayoutError("rel_too_deep");
+  for (const p of parts) if (p === "." || p === ".." || !SEGMENT.test(p)) throw new LayoutError("rel_invalid");
+  return parts;
+}
+
+export function assertEnvName(name: string): string {
+  if (!ENV_NAME.test(name)) throw new LayoutError("env_name_invalid");
+  return name;
+}
+/** `%` is a systemd specifier; values here are paths and fixed flags, never free text. */
+export function assertEnvValue(value: string): string {
+  if (typeof value !== "string" || value.length > 4096 || /[\0\n\r%]/.test(value)) throw new LayoutError("env_value_invalid");
+  return value;
+}
+/**
+ * An absolute path that is safe inside a systemd property or command line: only `[A-Za-z0-9._/-]` (no space,
+ * colon, quote, `$` or `%`, which systemd treats specially in BindPaths/ExecStart), normalized, no `..`.
+ */
+export function assertAbsPath(path: string): string {
+  if (typeof path !== "string" || path.length > 1024 || !/^\/[A-Za-z0-9._/-]*$/.test(path) || path !== posix.normalize(path) || path.split("/").includes("..")) throw new LayoutError("path_invalid");
+  return path;
+}
+/** A command-line argument for a customer process: `$` and `%` are expanded by the service manager in ExecStart, NUL ends a C string. */
+export function assertArg(arg: string): string {
+  if (typeof arg !== "string" || arg.length > 4096 || /[\0$%]/.test(arg)) throw new LayoutError("arg_invalid");
+  return arg;
+}
