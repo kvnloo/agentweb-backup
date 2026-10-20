@@ -124,8 +124,15 @@ async function main() {
   if (start.status !== 200) throw new Error("login.start failed: " + start.text.slice(0, 100));
   cleanup.loginRef = start.json.loginRef;
   console.log("\nOpen this URL in a browser (do NOT paste it anywhere), sign in, and copy the code shown:\n" + start.json.url + "\n");
+  const shownAt = Date.now();
   const code = await readHidden("Paste the code (hidden): ");
+  // Redacted diagnostics only: lengths and a boolean, never the code itself.
+  const [codePart = "", statePart = ""] = code.split("#");
+  const urlState = new URL(start.json.url).searchParams.get("state") ?? "";
+  console.log(`code-shape  | len=${code.length} code-part=${codePart.length} state-part=${statePart.length} has-#=${code.includes("#")} state-matches-url=${statePart === urlState} waited=${Math.round((Date.now() - shownAt) / 1000)}s`);
+  if (code.includes("#") && statePart !== urlState) console.log("WARNING: the state part does not match this run's link: the code is from a DIFFERENT sign-in link (use the newest link only).");
   const done = await call("/v1/login.complete", { connectionId: cid, loginRef: start.json.loginRef, code });
+  if (done.status !== 200) console.log(`host answered ${done.status} ${done.json?.error ?? ""} ${done.json?.detail ?? ""}`);
   check("login.complete", done.status === 200 && done.json?.status === "ready", `status=${done.json?.status ?? done.status} plan=${done.json?.planLabel ?? "?"}`);
   const prom = await call("/v1/login.promote", { connectionId: cid, loginRef: start.json.loginRef, epoch: 1 });
   check("login.promote", prom.status === 200 && prom.json?.state === "active", `state=${prom.json?.state}`);
