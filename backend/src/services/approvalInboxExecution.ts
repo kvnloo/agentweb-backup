@@ -159,11 +159,30 @@ export async function resumeOriginSession(sessionId: string, messageContent: str
     // ENG-669: the resume was refused because the session's model is outside the owner's plan. The
     // note above is model-only context, so tell the user why Emma did not pick the work back up.
     if (isModelUnavailableError(err)) {
-      await chatbotDb.addMessageToSession(sessionId, {
-        role: 'assistant',
-        content: modelUnavailableBody(err).error,
-        metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
-      }).catch((noteErr: any) => console.error('[approval-inbox-execution] failed to record the model refusal:', sessionId, noteErr?.message || noteErr));
+      const refusal = modelUnavailableBody(err).error;
+      let refusalSaved = false;
+      try {
+        await chatbotDb.addMessageToSession(sessionId, {
+          role: 'assistant',
+          content: refusal,
+          metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
+        });
+        refusalSaved = true;
+      } catch (noteErr: any) {
+        console.error('[approval-inbox-execution] failed to record the model refusal:', sessionId, noteErr?.message || noteErr);
+      }
+      // Same live update the successful resume sends, so an open chat shows the refusal without a reload.
+      if (refusalSaved) {
+        try {
+          const { io } = await import('../server');
+          io.to(`user:${session.userId}`).emit('session-message-appended', {
+            sessionId,
+            message: { role: 'assistant', content: refusal },
+          });
+        } catch (emitErr: any) {
+          console.error('[approval-inbox-execution] failed to emit the model refusal:', sessionId, emitErr?.message || emitErr);
+        }
+      }
     }
   } finally {
     releaseSessionGeneration(sessionId);

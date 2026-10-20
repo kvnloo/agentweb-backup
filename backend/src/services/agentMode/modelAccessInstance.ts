@@ -81,7 +81,10 @@ type SystemModels = { all: true } | { all: false; ids: Set<string> };
  *    exempts everything (an outage never blocks; logged).
  * An unreadable default contributes nothing.
  */
-async function systemModelsFor(session: SystemModelSession | null | undefined): Promise<SystemModels> {
+async function systemModelsFor(
+  session: SystemModelSession | null | undefined,
+  options: SystemModelCheckOptions = {},
+): Promise<SystemModels> {
   const { agentModeService } = await import('../agentModeService');
   const ids = new Set<string>();
   const add = (raw: unknown) => {
@@ -93,6 +96,15 @@ async function systemModelsFor(session: SystemModelSession | null | undefined): 
   // Each read is isolated: one that throws (even synchronously) contributes nothing and blocks nothing.
   const read = (get: () => Promise<string | undefined | null>) => Promise.resolve().then(get);
   const reads = [read(() => agentModeService.getDefaultModel())];
+  // A human's NEW pick is never AgentWeb's choice just because this session's kind or plan uses that model elsewhere:
+  // only the configured default (anyone may run it) and the session's own system stamp (re-sending it is not a pick).
+  if (options.humanPick) {
+    for (const settled of await Promise.allSettled(reads)) {
+      if (settled.status === 'fulfilled') add(settled.value);
+    }
+    if (storedModelSource(session) === 'system') add(session?.llmModel);
+    return { all: false, ids };
+  }
   const sessionType = session?.sessionType;
   if (sessionType === 'scheduled') reads.push(read(() => agentModeService.getScheduledChatsDefaultModel()));
   if (sessionType === 'report_generation') {
@@ -109,7 +121,12 @@ async function systemModelsFor(session: SystemModelSession | null | undefined): 
   const plan = session?.workPlan;
   if (plan?.planAuthor === 'system') {
     add(plan.planDefaultModel);
-    if (Array.isArray(plan.steps)) for (const step of plan.steps) add((step as { model?: unknown })?.model);
+    // A step model the user adopted (modelSource 'user', recovery from a retired pin) is not the author's choice.
+    if (Array.isArray(plan.steps)) {
+      for (const step of plan.steps as Array<{ model?: unknown; modelSource?: unknown }>) {
+        if (step?.modelSource !== 'user') add(step?.model);
+      }
+    }
     return { all: false, ids };
   }
   if (plan?.planAuthor === 'user') return { all: false, ids };
@@ -122,6 +139,15 @@ async function systemModelsFor(session: SystemModelSession | null | undefined): 
       if (isSystemAuthoredPlan(template)) {
         add(template?.defaultModel);
         for (const step of template?.steps ?? []) add((step as { model?: unknown })?.model);
+        // The pins this session copied at launch (and the plan pin it was stamped with, written without a decision
+        // or source back then), so a later edit of the template's models does not stop a running plan.
+        add(plan?.planDefaultModel);
+        if (Array.isArray(plan?.steps)) {
+          for (const step of plan.steps as Array<{ model?: unknown; modelSource?: unknown }>) {
+            if (step?.modelSource !== 'user') add(step?.model);
+          }
+        }
+        if (!session?.llmModelSource && !session?.llmUsagePolicyDecision) add(session?.llmModel);
       }
     } catch (error) {
       console.error(`ModelAccess: could not read work plan template ${templatePlanId}; treating its pins as system models:`, error);
@@ -131,9 +157,18 @@ async function systemModelsFor(session: SystemModelSession | null | undefined): 
   return { all: false, ids };
 }
 
+/** `humanPick`: the selection is a person's NEW pick (not an echo of the stored model, not a plan/system choice). */
+export interface SystemModelCheckOptions {
+  humanPick?: boolean;
+}
+
 /** Whether AgentWeb itself runs this canonical id in this session (see systemModelsFor). */
-export async function isSystemModelFor(session: SystemModelSession | null | undefined, canonicalModel: string): Promise<boolean> {
-  const system = await systemModelsFor(session);
+export async function isSystemModelFor(
+  session: SystemModelSession | null | undefined,
+  canonicalModel: string,
+  options: SystemModelCheckOptions = {},
+): Promise<boolean> {
+  const system = await systemModelsFor(session, options);
   return system.all || system.ids.has(canonicalModel);
 }
 
@@ -142,10 +177,13 @@ export async function isSystemModelFor(session: SystemModelSession | null | unde
  * interactive default only). The system set is read lazily, at most once per callback, and only if something
  * would otherwise be refused.
  */
-export function systemModelCheck(session?: SystemModelSession | null): (canonicalModel: string) => Promise<boolean> {
+export function systemModelCheck(
+  session?: SystemModelSession | null,
+  options: SystemModelCheckOptions = {},
+): (canonicalModel: string) => Promise<boolean> {
   let system: Promise<SystemModels> | undefined;
   return async (canonicalModel) => {
-    system ??= systemModelsFor(session);
+    system ??= systemModelsFor(session, options);
     const resolved = await system;
     return resolved.all || resolved.ids.has(canonicalModel);
   };

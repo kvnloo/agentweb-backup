@@ -417,6 +417,10 @@ export async function resolveEffectiveModelForUser(input: {
   // the pins of the admin-authored plan it was launched from) are recognised. Only read when the
   // allowlist would otherwise refuse.
   session?: SystemModelSession | null;
+  // ENG-669: the selection is a person's new pick, so only the configured default and the session's own system stamp
+  // exempt it (not the session kind's defaults or the plan's pins). Default: an explicit selection that is not an
+  // echo of the session's stored model.
+  humanPick?: boolean;
 }): Promise<EffectiveModelPolicyDecision> {
   const [usage, systemDefaultModel] = await Promise.all([
     getEffectiveLlmUsagePolicy(input.userId),
@@ -476,7 +480,10 @@ export async function resolveEffectiveModelForUser(input: {
       ownerUserId: input.userId,
       requestedModel: input.requestedModel as string,
       canonicalModel: canonicalRequestedModel,
-      isSystemModel: systemModelCheck(input.session),
+      isSystemModel: systemModelCheck(input.session, {
+        humanPick: input.humanPick
+          ?? (!input.allowSilentSwap && !(input.session?.llmModel && sameModelId(input.requestedModel, input.session.llmModel))),
+      }),
     });
   }
   // FAIL-LOUD: an explicit selection that is not served must not be replaced by
@@ -2039,7 +2046,9 @@ function redactWorkPlanForViewer(workPlan: any, options: { keepStepModels?: bool
 /** ENG-2378: public plan responses never expose step models (the plan-level defaultModel exposure is pre-existing). */
 function withoutStepModels(steps: any): any {
   return Array.isArray(steps)
-    ? steps.map((s) => (s && typeof s === 'object' && 'model' in s ? (({ model: _m, ...rest }) => rest)(s) : s))
+    ? steps.map((s) => (s && typeof s === 'object' && ('model' in s || 'modelSource' in s)
+      ? (({ model: _m, modelSource: _ms, ...rest }) => rest)(s)
+      : s))
     : steps;
 }
 
@@ -2087,6 +2096,7 @@ async function resolveWorkPlanStepModelForTurn(
     // An explicit selection by a human: fail loud, never substitute.
     const decision = await resolveEffectiveModelForUser({
       userId: session.userId, requestedModel: model, allowSilentSwap: false, systemModel: source === 'system', session,
+      humanPick: source === 'user',
     });
     // Defensive: only an honored decision may run. (A paused account has no effective model; the callers' usage gates
     // answer that case before this point.)
@@ -2129,9 +2139,11 @@ async function resolveWorkPlanStepModelForTurn(
   const userPick = ownModel ? undefined : pick;
   const candidate = ownModel ?? (userPick || fallbackModel);
   if (!candidate) return { kind: 'none' };
+  // A step model the user's pick replaced (recovery from a retired one) stays the user's, whoever authored the plan.
+  const ownModelSource: ModelSource = step.modelSource === 'user' ? 'user' : planPinSource;
   const candidateSource: ModelSource = userPick
     ? 'user'
-    : (ownModel || (typeof plan.planDefaultModel === 'string' && plan.planDefaultModel.trim()) ? planPinSource : launchSource);
+    : (ownModel ? ownModelSource : ((typeof plan.planDefaultModel === 'string' && plan.planDefaultModel.trim()) ? planPinSource : launchSource));
   try {
     return {
       kind: 'resolved', stepCount, decision: await resolveHonored(candidate, stepCount, candidateSource), source: candidateSource,
@@ -9546,7 +9558,11 @@ export async function generateSessionResponse(
         ...wpRest,
         ...(nextEngineModel && { engineModel: nextEngineModel }),
         ...(nextPickedModel && { pickedModel: nextPickedModel }),
-        steps: wp.steps.map((s: any) => (adoptStepModel && s.stepCount === (stepModelTurn as any).stepCount ? { ...s, model: adoptStepModel } : s)),
+        // ENG-669: an adopted pick is the user's, not the plan author's: recorded on the step (modelSource) so later turns
+        // keep checking it against the owner's plan even in an admin-authored plan.
+        steps: wp.steps.map((s: any) => (adoptStepModel && s.stepCount === (stepModelTurn as any).stepCount
+          ? { ...s, model: adoptStepModel, modelSource: 'user' }
+          : s)),
       });
     }
   }
@@ -12129,12 +12145,16 @@ export const agentModeController = {
       const defaultModel = await agentModeService.getDefaultModel();
 
       // ENG-669 pre-flight, before the answers below are persisted: a stored model outside the
-      // OWNER's plan is refused (the visitor's 422 does not carry the owner's plan).
+      // OWNER's plan is refused (the visitor's 422 does not carry the owner's plan). Like /generate's
+      // pre-flight, an exhausted allowance keeps its own refusal (the usage check below answers it):
+      // changing the model could not unblock that chat.
       try {
         await assertModelInOwnerPlan({ ownerUserId: session.userId, model: session.llmModel, session });
       } catch (modelError) {
         if (!isModelUnavailableError(modelError)) throw modelError;
-        return res.status(422).json(modelUnavailableBody(modelError, 'share_viewer'));
+        if ((await checkTokenUsage(session.userId)).allowed) {
+          return res.status(422).json(modelUnavailableBody(modelError, 'share_viewer'));
+        }
       }
 
       if (workPlanInputAnswer) {

@@ -356,7 +356,8 @@ export function isStepModelUnavailableError(error: unknown): error is StepModelU
 
 /** Text shown in the chat when a plan is paused because the current step's model is no longer served (or, ENG-669, not in the plan). */
 export function buildStepModelPausedMessage(stepCount: number, modelLabel: string, reason?: string): string {
-  const why = reason === 'not_in_plan' ? "which isn't included in your plan" : 'which is no longer available';
+  // Account-neutral: this text is saved to the chat, where the owner AND any share viewer read it.
+  const why = reason === 'not_in_plan' ? "which isn't included in this account's plan" : 'which is no longer available';
   return `Step ${stepCount} uses ${modelLabel}, ${why}. Choose another model in the model picker and send again to resume this step. `
     + 'The plan is paused and nothing was sent to a different model.';
 }

@@ -266,6 +266,8 @@ export interface ChatSession {
       expectedAssetCountTools?: string[];
       /** ENG-2378: this step's explicit model (canonical registry id), copied from the template at launch. */
       model?: string;
+      /** ENG-669: 'user' when `model` is the user's pick adopted after the plan's own step model became unavailable. */
+      modelSource?: 'user';
       inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
     }>;
     createdAt: string;
