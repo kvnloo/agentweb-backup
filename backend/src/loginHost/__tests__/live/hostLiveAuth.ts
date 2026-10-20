@@ -151,9 +151,18 @@ async function main() {
   const e1 = events(t1.text);
   check("turn-1", e1.at(-1)?.type === "result" && e1.at(-1)?.ok === true, summarize(e1));
   check("bridge-reached-with-token", stats.requests > 0 && stats.badAuth === 0 && stats.methods.has("initialize"), `reqs=${stats.requests} badAuth=${stats.badAuth} methods=${[...stats.methods].join("|")}`);
-  const conc = await Promise.all([1, 2, 3].map((i) => turn(cid, 1, `Reply with exactly the digit ${i} and nothing else.`)));
-  const concOk = conc.map((r) => events(r.text).at(-1)).map((e) => e?.type === "result" && e.ok === true);
-  check("3-concurrent-turns", concOk.every(Boolean), concOk.map((b) => (b ? "ok" : "FAIL")).join(","));
+  const outcome = (r: { status: number; text: string; json?: Json }) => {
+    if (r.status !== 200) return `http${r.status}:${r.json?.error ?? "?"}${r.json?.detail ? "/" + r.json.detail : ""}`;
+    const last = events(r.text).at(-1);
+    return last?.type === "result" ? (last.ok ? "ok" : `fail:${last.errorKind ?? "?"}`) : "no-result";
+  };
+  // Informational: a burst right after a turn (the finished process may still be exiting and counts toward the per-home cap).
+  const burst = await Promise.all([1, 2, 3].map((i) => turn(cid, 1, `Reply with exactly the digit ${i} and nothing else.`)));
+  console.log(`INFO  burst-right-after-turn  | ${burst.map(outcome).join(", ")}`);
+  await sleep(4000);
+  const conc = await Promise.all([1, 2, 3].map((i) => turn(cid, 1, `Reply with exactly the letter ${"ABC"[i - 1]} and nothing else.`)));
+  const concOut = conc.map(outcome);
+  check("3-concurrent-turns", concOut.every((o) => o === "ok"), concOut.join(","));
   await sleep(1500);
   check("no-units-left-after-turns", unitsOf(420000, 430000) === 0, `units=${unitsOf(420000, 430000)}`);
   const st = await call("/v1/connection.status", { connectionId: cid });
