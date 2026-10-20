@@ -21,7 +21,7 @@ jest.mock('../../middleware/auth', () => ({
 }));
 
 jest.mock('../../services/db', () => ({
-  userDb: { getUserById: jest.fn(), updateUser: jest.fn() },
+  userDb: { getUserById: jest.fn(), getUserByIdConsistent: jest.fn(), updateUser: jest.fn() },
   orgDb: { getOrgById: jest.fn() },
 }));
 
@@ -99,6 +99,7 @@ beforeEach(() => {
     },
   };
   mockGetUserById.mockImplementation(async (id: string) => users[id] ?? null);
+  ((userDb as any).getUserByIdConsistent as jest.Mock).mockImplementation(async (id: string) => users[id] ?? undefined);
   // Mirrors updateUser's ALL_NEW return for the shapes the service writes.
   mockUpdateUser.mockImplementation(async (id: string, fields: any, options: any) => {
     const user = users[id];

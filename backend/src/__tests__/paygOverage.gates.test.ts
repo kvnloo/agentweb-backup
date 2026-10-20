@@ -49,7 +49,7 @@ jest.mock('../services/generateMarketingResponseWorkerService', () => ({
 jest.mock('../services/db', () => ({
   scheduleDb: {},
   taskDb: {},
-  userDb: { getUserById: jest.fn(), updateUser: jest.fn() },
+  userDb: { getUserById: jest.fn(), getUserByIdConsistent: jest.fn(), updateUser: jest.fn() },
   orgDb: { getOrgById: jest.fn() },
 }));
 
@@ -82,6 +82,7 @@ const USD = 1_000_000;
 const OWNER = 'owner-1';
 
 const mockGetUserById = userDb.getUserById as jest.Mock;
+const mockGetUserByIdConsistent = (userDb as any).getUserByIdConsistent as jest.Mock;
 const mockUpdateUser = (userDb as any).updateUser as jest.Mock;
 const mockTierName = getUserSubscriptionType as jest.Mock;
 const mockTierConfig = getSubscriptionTypeConfig as jest.Mock;
@@ -125,14 +126,17 @@ function setup(input: {
     llmUsagePolicy: input.tierPolicy ?? policy,
     ...('tierPayg' in input ? (input.tierPayg ? { paygOverage: input.tierPayg } : {}) : { paygOverage: { allowed: true, markupBps: 25_000 } }),
   });
-  mockGetUserById.mockResolvedValue({
+  const user = {
     userId: OWNER,
     email: 'owner@example.com',
     subscription_status: 'active',
     has_payment_method: true,
     paygOverage: payg(),
     ...input.user,
-  });
+  };
+  // The index snapshot and the strongly consistent row agree unless a case says otherwise.
+  mockGetUserById.mockResolvedValue(user);
+  mockGetUserByIdConsistent.mockResolvedValue(user);
 }
 
 /** Both gates, the way /generate runs them: checkTokenUsage, then the model resolver. */
@@ -420,5 +424,65 @@ describe('ENG-668 PAYG — opting in with overage already standing', () => {
     expect(status.allowed).toBe(true);
     expect(status.overage).toEqual({ active: true, percentOfCap: 0 });
     expect(decision.effectiveModel).toBe(CHOSEN_MODEL);
+  });
+});
+
+describe('ENG-668 PAYG — a stale index snapshot never decides admission past the pool', () => {
+  const owner = (paygOverage: PaygOverageSettings) => ({
+    userId: OWNER, email: 'owner@example.com', subscription_status: 'active', has_payment_method: true, paygOverage,
+  });
+
+  it('measures against the high-water mark the consistent row holds, not the stale snapshot\'s', async () => {
+    // Saved high-water 150, then a downgrade to 100; $140 spent at a 25% cap. The UserIdIndex snapshot
+    // predates the mark: against it, $40 over a $25 cap would be payg_cap_reached.
+    setup({ spendUsd: 140, user: { paygOverage: payg({ capPercentOfPool: 25, poolHighWater: undefined }) } });
+    mockGetUserByIdConsistent.mockResolvedValue(owner(payg({
+      capPercentOfPool: 25,
+      poolHighWater: { month: getCurrentUsageMonth(), thresholdMicroUsd: 150 * USD },
+    })));
+    const { status, decision } = await bothGates();
+    expect(status.allowed).toBe(true);
+    expect(status.paygBlock).toBeUndefined();
+    expect(decision.effectiveModel).toBe(CHOSEN_MODEL);
+    // Never lowered: the consistent mark is already higher than today's pool.
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+  });
+
+  it('a lost high-water write uses the higher mark that beat it', async () => {
+    // Both reads show no mark; another instance stores 150 before our 100 lands, so our write loses.
+    setup({ spendUsd: 140, user: { paygOverage: payg({ capPercentOfPool: 25, poolHighWater: undefined }) } });
+    const raced = owner(payg({ capPercentOfPool: 25, poolHighWater: { month: getCurrentUsageMonth(), thresholdMicroUsd: 150 * USD } }));
+    let stored = owner(payg({ capPercentOfPool: 25, poolHighWater: undefined }));
+    mockGetUserByIdConsistent.mockImplementation(async () => stored);
+    mockUpdateUser.mockImplementation(async () => {
+      stored = raced;
+      throw Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' });
+    });
+    const status = await checkTokenUsage(OWNER);
+    expect(status.allowed).toBe(true);
+    expect(status.paygBlock).toBeUndefined();
+  });
+
+  it('an opt-out the snapshot has not seen yet is respected', async () => {
+    setup({ spendUsd: 120 });
+    mockGetUserByIdConsistent.mockResolvedValue(owner(payg({ enabled: false })));
+    const { status, decision } = await bothGates();
+    expect(status.allowed).toBe(false);
+    expect(decision.modelSelection).toBe('blocked');
+  });
+
+  it('a failed consistent read falls back to the snapshot rather than failing the check', async () => {
+    setup({ spendUsd: 120 });
+    mockGetUserByIdConsistent.mockRejectedValue(new Error('throttled'));
+    const spy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const status = await checkTokenUsage(OWNER);
+    spy.mockRestore();
+    expect(status.allowed).toBe(true);
+  });
+
+  it('below the pool it costs nothing: no consistent read', async () => {
+    setup({ spendUsd: 60 });
+    await bothGates();
+    expect(mockGetUserByIdConsistent).not.toHaveBeenCalled();
   });
 });
