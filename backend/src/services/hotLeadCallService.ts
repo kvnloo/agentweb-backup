@@ -36,12 +36,7 @@ const MINUTE_MS = 60_000;
 const MAX_SKIP_EVENTS_PER_LEAD = 5;
 // Two dispatches racing for the same lead: the loser trips the phone marker before the winner's call record
 // is visible. One short re-check tells that apart from a genuinely different lead sharing the number.
-let sameLeadRecheckMs = 200;
-
-/** Tests only. Pass null to restore the default wait. */
-export function setSameLeadRecheckDelayForTests(ms: number | null): void {
-  sameLeadRecheckMs = ms ?? 200;
-}
+export const SAME_LEAD_RECHECK_MS = 200;
 
 const keyOf = (job: HotLeadCallJob): string =>
   createHash('sha256').update(JSON.stringify([job.orgId, job.listId, job.leadId, ...(job.submissionId ? [job.submissionId] : [])])).digest('hex');
@@ -87,7 +82,7 @@ async function recordSkip(lead: LeadRow, reason: string): Promise<void> {
 /** True when this lead already has (or, after one short wait, gets) a call record. */
 async function hasCallRecord(store: LeadCallStore, listId: string, leadId: string): Promise<boolean> {
   if (await store.get(listId, leadId)) return true;
-  await new Promise((resolve) => setTimeout(resolve, sameLeadRecheckMs));
+  await new Promise((resolve) => setTimeout(resolve, SAME_LEAD_RECHECK_MS));
   return !!(await store.get(listId, leadId));
 }
 

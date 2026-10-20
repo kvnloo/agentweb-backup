@@ -24,7 +24,7 @@ jest.mock('../services/voice/hotLeadCallContext', () => ({
 import { crmDb, userDb, orgDb } from '../services/db';
 import * as queue from '../services/asyncJobQueue';
 import { getSubscriptionTypeConfig, getUserSubscriptionResolution } from '../services/subscriptionService';
-import { dispatchHotLeadCall, processHotLeadCallJob, registerHotLeadCallProcessor, setSameLeadRecheckDelayForTests } from '../services/hotLeadCallService';
+import { dispatchHotLeadCall, processHotLeadCallJob, registerHotLeadCallProcessor, SAME_LEAD_RECHECK_MS } from '../services/hotLeadCallService';
 import { setHotLeadCallEnabledOverride } from '../services/voice/hotLeadCallMode';
 import { FakeVoiceProvider } from './helpers/fakeVoiceProvider';
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
@@ -55,18 +55,21 @@ let org: Record<string, unknown>;
 const submission = { submissionId: 'sub-1', submittedAt: NOW };
 
 const jobOf = (extra: Record<string, unknown> = {}) => ({ orgId: 'org-a', listId: 'list-a', leadId: 'lead-a', origin: 'form_fill' as const, ...extra });
+// A refused duplicate_phone waits a moment to see whether it raced the same lead; the wait runs on the fake clock.
+const settled = async <T>(work: Promise<T>): Promise<T> => {
+  await jest.advanceTimersByTimeAsync(SAME_LEAD_RECHECK_MS);
+  return work;
+};
 const enqueueCalls = () => mock(queue.enqueueJob).mock.calls;
 
 beforeEach(() => {
   jest.resetAllMocks();
-  // setTimeout stays real: a refused duplicate_phone waits a moment to see whether it raced the same lead.
-  jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'setTimeout', 'clearTimeout'] });
+  jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] });
   jest.setSystemTime(new Date(NOW));
   process.env.BACKEND_URL = 'https://api.example.com';
   callerless.on = false;
   setHotLeadCallEnabledOverride(true);
   setHotLeadCallEntitledOverride(true);
-  setSameLeadRecheckDelayForTests(5);
   provider = new FakeVoiceProvider();
   setVoiceProviderForTests(provider);
   store = new FakeLeadCallStore();
@@ -87,7 +90,6 @@ afterEach(() => {
   jest.useRealTimers();
   setHotLeadCallEnabledOverride(null);
   setHotLeadCallEntitledOverride(null);
-  setSameLeadRecheckDelayForTests(null);
   setVoiceProviderForTests(null);
   setLeadCallStoreForTests(null);
   setLimitStoreForTests(null);
@@ -350,7 +352,7 @@ describe('processHotLeadCallJob', () => {
     ['the same job key', {}],
     ['different job keys', { submissionId: 'sub-2', submittedAt: NOW }],
   ])('places exactly one call when two jobs race for the same lead with %s', async (_name, second) => {
-    await Promise.all([processHotLeadCallJob(jobOf()), processHotLeadCallJob(jobOf(second))]);
+    await settled(Promise.all([processHotLeadCallJob(jobOf()), processHotLeadCallJob(jobOf(second))]));
     expect(provider.placedCalls).toHaveLength(1);
     // The loser trips the phone marker, finds the winner's record (after one short wait if need be) and stays silent.
     expect(store.eventTypes()).toEqual(['call.initiated']);
@@ -507,7 +509,7 @@ describe('abuse limits (reservation)', () => {
     store.record = null;
     store.events = [];
     const before = provider.placedCalls.length;
-    await processHotLeadCallJob(jobOf({ leadId, ...overrides }));
+    await settled(processHotLeadCallJob(jobOf({ leadId, ...overrides })));
     return provider.placedCalls.length > before ? 'called' : store.events.map(e => e.detail?.reason).join();
   };
   const later = (minutes: number) => jest.setSystemTime(new Date(Date.parse(NOW) + minutes * 60_000));
@@ -755,7 +757,7 @@ describe('two dispatches racing for the same lead', () => {
     const realGet = store.get.bind(store);
     let looks = 0;
     jest.spyOn(store, 'get').mockImplementation(async () => (looks++ === 0 ? null : realGet()));
-    await processHotLeadCallJob(jobOf({ submissionId: 'sub-2', submittedAt: new Date().toISOString() }));
+    await settled(processHotLeadCallJob(jobOf({ submissionId: 'sub-2', submittedAt: new Date().toISOString() })));
     expect(looks).toBe(2);
     expect(provider.placedCalls).toHaveLength(1);
     expect(store.eventTypes()).toEqual(['call.initiated']);
@@ -765,7 +767,7 @@ describe('two dispatches racing for the same lead', () => {
     await processHotLeadCallJob(jobOf());
     mock(crmDb.getLeadById).mockImplementation(async () => ({ ...lead, leadId: 'lead-b' }));
     store.record = null; // lead-b has no record of its own
-    await processHotLeadCallJob(jobOf({ leadId: 'lead-b', submissionId: 'sub-b', submittedAt: new Date().toISOString() }));
+    await settled(processHotLeadCallJob(jobOf({ leadId: 'lead-b', submissionId: 'sub-b', submittedAt: new Date().toISOString() })));
     expect(provider.placedCalls).toHaveLength(1);
     expect(store.events.at(-1)).toEqual({ type: 'call.skipped', detail: { reason: 'duplicate_phone' } });
   });
