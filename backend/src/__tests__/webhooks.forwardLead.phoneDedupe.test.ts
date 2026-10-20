@@ -452,6 +452,17 @@ describe('a phone-matched repeat that fills nothing is not an update', () => {
     expect(sent.customFields ?? {}).toEqual({});
   });
 
+  it('create: a race-loser adopt carrying only BLANK optional custom fields is lead.unchanged too', async () => {
+    setPhoneDedupeModeOverride('create');
+    const winner = existing({ company: 'Acme', customFields: { source: 'lp' } });
+    (crmDb.createLead as jest.Mock).mockRejectedValueOnce(Object.assign(new Error('dup'), { duplicatePhone: true, existingLead: winner }));
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue(winner);
+    const res = await post({ customFields: { optional_a: '', optional_b: null }, attribution: TOUCH });
+    expect(res.status).toBe(200);
+    expect(res.body.event).toBe('lead.unchanged');
+    expect(((crmDb.updateLead as jest.Mock).mock.calls[0][2].customFields) ?? {}).toEqual({});
+  });
+
   it('on: a repeat that DOES fill a blank is still reported as lead.updated', async () => {
     setPhoneDedupeModeOverride('on');
     withCandidates([existing({ title: '', customFields: { source: 'lp' } })]);
