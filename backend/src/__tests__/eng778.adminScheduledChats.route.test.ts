@@ -149,4 +149,15 @@ describe('ENG-778 admin scheduled-chat status', () => {
     expect(updateSchedule.mock.calls[0][2]).toEqual({ status: 'paused' });
     expect(isSubscriptionFeatureEnabled).toHaveBeenCalledWith('owner-9', 'scheduled_chats');
   });
+
+  it('resume refuses an exhausted limited schedule (runCount 0) so it cannot become unlimited', async () => {
+    const app = appAs({ user: ADMIN });
+    getScheduleById.mockResolvedValue({ ...schedule(), status: 'paused', runCount: 0 });
+    const res = await request(app).patch('/api/admin/scheduled-chats/s-1/status').send({ status: 'active' });
+    expect(res.status).toBe(409);
+    expect(updateSchedule).not.toHaveBeenCalled();
+
+    getScheduleById.mockResolvedValue({ ...schedule(), status: 'paused', runCount: -1 });
+    expect((await request(app).patch('/api/admin/scheduled-chats/s-1/status').send({ status: 'active' })).status).toBe(200);
+  });
 });

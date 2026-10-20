@@ -76,6 +76,14 @@ router.patch('/:scheduleId/status', async (req: Request, res: Response) => {
     }
 
     if (status === 'active') {
+      // A limited schedule that exhausted its runs (runCount 0) would be
+      // decremented to -1 (= unlimited) by the scheduler; refuse instead.
+      if (typeof schedule.runCount === 'number' && schedule.runCount !== -1 && schedule.runCount <= 0) {
+        return res.status(409).json({
+          error: 'Schedule has no runs left; set a new run limit before resuming',
+          runCount: schedule.runCount,
+        });
+      }
       // Resuming must clear the same gates the owner would face.
       if ((await isSubscriptionFeatureEnabled(schedule.userId, 'scheduled_chats')) !== true) {
         return res.status(403).json({ error: "Schedule owner's plan does not include scheduled chats" });
