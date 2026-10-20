@@ -122,8 +122,9 @@ export function normalizeTimezone(tz: unknown): string | null {
 }
 
 // Types that bill the caller (toll fraud: premium, toll-free, shared-cost, personal, UAN) or are not a
-// person's direct line. VOIP can ring a person but is blocked anyway; note the default (min) metadata only
-// classes Canadian 600 numbers as VOIP, so US Google-Voice-style numbers still pass. Only a positive
+// person's direct line. The default (min) metadata does classify US/CA toll-free (800/844/...), premium
+// (900) and personal (500/533/522) numbers, but it cannot tell VOIP from fixed or mobile in the US (only
+// Canadian 600 numbers come back as VOIP), so US Google-Voice-style numbers still pass. Only a positive
 // match rejects: the min metadata returns undefined for types it cannot tell apart.
 const BLOCKED_NUMBER_TYPES: ReadonlySet<string | undefined> = new Set(['PREMIUM_RATE', 'TOLL_FREE', 'PERSONAL_NUMBER', 'SHARED_COST', 'UAN', 'VOIP']);
 
