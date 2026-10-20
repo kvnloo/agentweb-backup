@@ -4,8 +4,8 @@ import { cooldownKey, dailyCapKey, hourlyCapKey, isWithinCallWindow, phoneMarker
 import type { HotLeadCallConfig } from '../../hotLeadCallConfig';
 
 const config = {
-  maxCallsPerHour: 6, maxCallsPerDay: 20, ownerCooldownMinutes: 2,
-  quietHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
+  maxCallsPerHour: 6, maxCallsPerDay: 20, memberCooldownMinutes: 2,
+  callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
 } as HotLeadCallConfig;
 const NOW = new Date('2026-10-19T17:00:00Z');
 const PHONE = '+15555550100';

@@ -1,7 +1,7 @@
 import { createHmac, randomUUID } from 'crypto';
 import { getJwtSecret } from '../../config/jwt';
 import { localParts } from '../dripSendWindow';
-import type { HotLeadCallConfig } from '../hotLeadCallConfig';
+import { hhmmToMinutes, type HotLeadCallConfig } from '../hotLeadCallConfig';
 import { getLimitStore } from './limitStore';
 
 type LimitDenial = 'duplicate_phone' | 'owner_cooldown' | 'org_hourly_cap' | 'org_daily_cap';
@@ -11,7 +11,7 @@ const HOUR_S = 3600;
 const DAY_S = 24 * HOUR_S;
 const PHONE_WINDOW_S = DAY_S;
 
-// ---- quiet hours -----------------------------------------------------------------------------------------
+// ---- calling hours -----------------------------------------------------------------------------------------
 
 const two = (n: number): string => String(n).padStart(2, '0');
 
@@ -20,18 +20,16 @@ function localDayAndMinutes(timeZone: string, at: Date): { date: string; minutes
   return { date: `${l.year}-${two(l.month)}-${two(l.day)}`, minutes: l.hour * 60 + l.minute };
 }
 
-const minutesOf = (hhmm: string): number => Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.slice(3, 5));
-
 /**
  * True when calls are allowed at `at`: start inclusive, end exclusive, minute granularity (20:59:59 is in a
  * window ending 21:00). start > end wraps past midnight. The zone is the org's; the lead's own is not considered.
  * Fails closed when no window is configured (a validated enabled config always has one).
  */
-export function isWithinCallWindow(quietHours: HotLeadCallConfig['quietHours'], at: Date): boolean {
-  if (!quietHours) return false;
-  const now = localDayAndMinutes(quietHours.timezone, at).minutes;
-  const start = minutesOf(quietHours.start);
-  const end = minutesOf(quietHours.end);
+export function isWithinCallWindow(callingHours: HotLeadCallConfig['callingHours'], at: Date): boolean {
+  if (!callingHours) return false;
+  const now = localDayAndMinutes(callingHours.timezone, at).minutes;
+  const start = hhmmToMinutes(callingHours.start);
+  const end = hhmmToMinutes(callingHours.end);
   return start < end ? now >= start && now < end : now >= start || now < end;
 }
 
@@ -65,7 +63,7 @@ export type Reservation = { ok: true; release: () => Promise<void> } | { ok: fal
  *
  * Known limits (accepted): fixed windows can admit up to 2x a cap across a boundary; phone-rotating bots can
  * consume an org's hourly/daily caps (the Slack alert still fires); whoever submits a number first suppresses the
- * dial for that number for 24h; the cooldown skips a second genuine lead within ownerCooldownMinutes; a process
+ * dial for that number for 24h; the cooldown skips a second genuine lead within memberCooldownMinutes; a process
  * crash between this call and store.create leaves the 24h phone marker and the cooldown claim held with no
  * record, so a repeat of that number is refused as duplicate_phone with a silent timeline.
  */
@@ -94,9 +92,9 @@ export async function reserveCallSlot(input: { orgId: string; phoneE164: string;
   try {
     const steps: Array<[LimitDenial, () => Promise<boolean>]> = [
       ['duplicate_phone', () => claim(phoneMarkerKey(orgId, phoneE164), PHONE_WINDOW_S)],
-      ['owner_cooldown', () => claim(cooldownKey(orgId), config.ownerCooldownMinutes * MINUTE_S)],
+      ['owner_cooldown', () => claim(cooldownKey(orgId), config.memberCooldownMinutes * MINUTE_S)],
       ['org_hourly_cap', () => count(hourlyCapKey(orgId, now), config.maxCallsPerHour, 2 * HOUR_S)],
-      ['org_daily_cap', () => count(dailyCapKey(orgId, config.quietHours?.timezone ?? 'UTC', now), config.maxCallsPerDay, 2 * DAY_S)],
+      ['org_daily_cap', () => count(dailyCapKey(orgId, config.callingHours?.timezone ?? 'UTC', now), config.maxCallsPerDay, 2 * DAY_S)],
     ];
     for (const [reason, take] of steps) {
       if (!await take()) {

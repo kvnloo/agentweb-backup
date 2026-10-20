@@ -1,3 +1,4 @@
+import { randomInt } from 'crypto';
 import { parsePhoneNumberWithError } from 'libphonenumber-js';
 import { toE164 } from './whatsappService';
 import { isLeadTypes, type LeadOrigin } from './leadNotificationConfig';
@@ -7,14 +8,21 @@ export const HOT_LEAD_CALL_COUNTRIES = ['US', 'CA'] as const;
 type HotLeadCallCountry = typeof HOT_LEAD_CALL_COUNTRIES[number];
 
 const HOT_LEAD_CALL_DEFAULT_LEAD_TYPES: readonly LeadOrigin[] = ['form_fill'];
-const HOT_LEAD_CALL_DEFAULT_QUIET_HOURS = { start: '08:00', end: '21:00' } as const;
+const HOT_LEAD_CALL_DEFAULT_CALLING_HOURS = { start: '08:00', end: '21:00' } as const;
 export const HOT_LEAD_CALL_ANNOUNCED_NAME_MAX = 60;
+export const HOT_LEAD_CALL_MAX_TEAM_SIZE = 10;
+export const HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER = 7;
+export const HOT_LEAD_CALL_MEMBER_NAME_MAX = 40;
+/** The only time that is valid as a window end but not as a start: midnight at the end of the day. */
+export const END_OF_DAY = '24:00';
 
 export const HOT_LEAD_CALL_LIMITS = {
   maxAgeMinutes: { default: 10, min: 1, max: 60 },
   maxCallsPerHour: { default: 6, min: 1, max: 30 },
   maxCallsPerDay: { default: 20, min: 1, max: 100 },
-  ownerCooldownMinutes: { default: 2, min: 1, max: 60 },
+  memberCooldownMinutes: { default: 2, min: 1, max: 60 },
+  /** Calls placed for one lead (each to a different team member) before giving up. */
+  maxAttemptsPerLead: { default: 3, min: 1, max: 5 },
 } as const;
 type HotLeadCallLimitField = keyof typeof HOT_LEAD_CALL_LIMITS;
 export const HOT_LEAD_CALL_LIMIT_FIELDS = Object.keys(HOT_LEAD_CALL_LIMITS) as HotLeadCallLimitField[];
@@ -27,9 +35,11 @@ export const HOT_LEAD_CALL_LIMIT_FIELDS = Object.keys(HOT_LEAD_CALL_LIMITS) as H
 export const maskPhone = (phone: string) => `***${phone.slice(-4)}`;
 
 /** System-managed: set only by the number-provisioning / verification flow, never by Emma tools. */
-export const HOT_LEAD_CALL_SYSTEM_FIELDS = ['destinationVerifiedAt', 'twilioNumber', 'twilioNumberSid'] as const;
+export const HOT_LEAD_CALL_SYSTEM_FIELDS = ['twilioNumber', 'twilioNumberSid'] as const;
+/** System-managed member fields, with the same rule: only the verification flow writes them. */
+export const HOT_LEAD_CALL_MEMBER_SYSTEM_FIELDS = ['verifiedAt'] as const;
 
-interface HotLeadCallQuietHours {
+interface HotLeadCallCallingHours {
   /**
    * The window in which calls ARE allowed (24h HH:MM, local to `timezone`); outside it the system stays quiet.
    * start > end wraps past midnight, so consumers must handle both orders. The lead's own timezone is not considered.
@@ -40,34 +50,60 @@ interface HotLeadCallQuietHours {
   timezone: string;
 }
 
-export interface HotLeadCallConfig {
-  enabled: boolean;
-  /** E.164, US/CA only (other +1 territories such as Puerto Rico or Guam are refused). The owner's phone that is rung first. */
-  destinationPhone: string;
+/** One weekly availability slot of a member, read on the callingHours clock. */
+export interface HotLeadCallWindow {
+  /** 0 = Sunday .. 6 = Saturday, unique, 1..7 entries. */
+  days: number[];
+  /** HH:MM, inclusive. */
+  start: string;
+  /** HH:MM or 24:00, exclusive; always after start. A window never wraps midnight: overnight is two windows. */
+  end: string;
+}
+
+export interface HotLeadCallMember {
+  /** Server-generated (see generateMemberId); stable across edits so cooldowns and call records can refer to it. */
+  id: string;
+  /** Read in tool output and the portal only; never spoken on a call. */
+  name: string;
+  /** E.164, US/CA only (other +1 territories such as Puerto Rico or Guam are refused). */
+  phone: string;
   /**
-   * System-managed. Any writer (the verification flow) must write conditionally on destinationPhone still
+   * System-managed. Any writer (the verification flow) must write conditionally on this member's phone still
    * equalling the verified phone, and must validate the result through hotLeadCallConfigOf.
    */
-  destinationVerifiedAt?: string;
+  verifiedAt?: string;
+  windows: HotLeadCallWindow[];
+}
+
+export interface HotLeadCallConfig {
+  enabled: boolean;
+  /** 1..HOT_LEAD_CALL_MAX_TEAM_SIZE people to ring; the order is the priority (first is rung first). */
+  team: HotLeadCallMember[];
   twilioNumber?: string;
   twilioNumberSid?: string;
   leadTypes: LeadOrigin[];
   maxAgeMinutes: number;
   maxCallsPerHour: number;
   maxCallsPerDay: number;
-  ownerCooldownMinutes: number;
+  memberCooldownMinutes: number;
+  maxAttemptsPerLead: number;
   /** Spoken aloud inside TwiML, hence the restricted charset. */
   announcedName: string;
-  /** Required before the config can be enabled. */
-  quietHours?: HotLeadCallQuietHours;
+  /** Required before the config can be enabled. Also the clock that member windows are read on. */
+  callingHours?: HotLeadCallCallingHours;
   allowedCountries: HotLeadCallCountry[];
 }
 
 const KEYS: ReadonlySet<string> = new Set([
-  'enabled', 'destinationPhone', 'destinationVerifiedAt', 'twilioNumber', 'twilioNumberSid', 'leadTypes',
-  ...HOT_LEAD_CALL_LIMIT_FIELDS, 'announcedName', 'quietHours', 'allowedCountries',
+  'enabled', 'team', 'twilioNumber', 'twilioNumberSid', 'leadTypes',
+  ...HOT_LEAD_CALL_LIMIT_FIELDS, 'announcedName', 'callingHours', 'allowedCountries',
 ]);
-const QUIET_KEYS: ReadonlySet<string> = new Set(['start', 'end', 'timezone']);
+const CALLING_HOURS_KEYS: ReadonlySet<string> = new Set(['start', 'end', 'timezone']);
+const MEMBER_KEYS: ReadonlySet<string> = new Set(['id', 'name', 'phone', 'verifiedAt', 'windows']);
+const WINDOW_KEYS: ReadonlySet<string> = new Set(['days', 'start', 'end']);
+const MEMBER_ID = /^m[a-z0-9]{7}$/;
+// Shown in the portal and in tool output, never spoken, but kept as strict as the announced name.
+const MEMBER_NAME = /^[\p{L}\p{N} .,'&-]+$/u;
 // SECURITY: this text is spoken inside TwiML <Say>. '&' is deliberately allowed ('Smith & Sons'),
 // so the TwiML builder MUST XML-escape announcedName before interpolating it.
 const ANNOUNCED_NAME = /^[\p{L}\p{N} .,&'-]+$/u;
@@ -133,13 +169,74 @@ function limit(raw: unknown, field: HotLeadCallLimitField): number | null {
   return typeof raw === 'number' && Number.isInteger(raw) && raw >= min && raw <= max ? raw : null;
 }
 
-function quietHoursOf(raw: unknown): HotLeadCallQuietHours | null {
-  if (!isRecord(raw) || Object.keys(raw).some(k => !QUIET_KEYS.has(k))) return null;
-  const start = raw.start === undefined ? HOT_LEAD_CALL_DEFAULT_QUIET_HOURS.start : raw.start;
-  const end = raw.end === undefined ? HOT_LEAD_CALL_DEFAULT_QUIET_HOURS.end : raw.end;
+/** Minutes since local midnight of an HH:MM (or 24:00) string that already passed validation. */
+export const hhmmToMinutes = (hhmm: string): number => Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.slice(3, 5));
+
+function callingHoursOf(raw: unknown): HotLeadCallCallingHours | null {
+  if (!isRecord(raw) || Object.keys(raw).some(k => !CALLING_HOURS_KEYS.has(k))) return null;
+  const start = raw.start === undefined ? HOT_LEAD_CALL_DEFAULT_CALLING_HOURS.start : raw.start;
+  const end = raw.end === undefined ? HOT_LEAD_CALL_DEFAULT_CALLING_HOURS.end : raw.end;
   if (typeof start !== 'string' || typeof end !== 'string' || !HHMM.test(start) || !HHMM.test(end) || start === end) return null;
   const timezone = normalizeTimezone(raw.timezone);
   return timezone ? { start, end, timezone } : null;
+}
+
+function windowOf(raw: unknown): HotLeadCallWindow | null {
+  if (!isRecord(raw) || Object.keys(raw).some(k => !WINDOW_KEYS.has(k))) return null;
+  const { days, start, end } = raw;
+  if (!Array.isArray(days) || days.length < 1 || days.length > 7 || new Set(days).size !== days.length) return null;
+  if (!days.every(d => typeof d === 'number' && Number.isInteger(d) && d >= 0 && d <= 6)) return null;
+  if (typeof start !== 'string' || typeof end !== 'string' || !HHMM.test(start) || !(HHMM.test(end) || end === END_OF_DAY)) return null;
+  if (hhmmToMinutes(start) >= hhmmToMinutes(end)) return null;
+  return { days: [...days], start, end };
+}
+
+function memberOf(raw: unknown): HotLeadCallMember | null {
+  if (!isRecord(raw) || Object.keys(raw).some(k => !MEMBER_KEYS.has(k))) return null;
+  if (typeof raw.id !== 'string' || !MEMBER_ID.test(raw.id)) return null;
+  if (typeof raw.name !== 'string') return null;
+  const name = raw.name.trim();
+  if (!name || name.length > HOT_LEAD_CALL_MEMBER_NAME_MAX || !MEMBER_NAME.test(name)) return null;
+  const phone = allowlistedE164(raw.phone);
+  if (!phone) return null;
+  let verifiedAt: string | undefined;
+  if (raw.verifiedAt !== undefined) {
+    const at = raw.verifiedAt;
+    if (typeof at !== 'string' || isNaN(Date.parse(at)) || new Date(at).toISOString() !== at) return null;
+    verifiedAt = at;
+  }
+  if (!Array.isArray(raw.windows) || raw.windows.length < 1 || raw.windows.length > HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER) return null;
+  const windows: HotLeadCallWindow[] = [];
+  for (const w of raw.windows) {
+    const window = windowOf(w);
+    if (!window) return null;
+    windows.push(window);
+  }
+  return { id: raw.id, name, phone, ...(verifiedAt ? { verifiedAt } : {}), windows };
+}
+
+function teamOf(raw: unknown): HotLeadCallMember[] | null {
+  if (!Array.isArray(raw) || raw.length < 1 || raw.length > HOT_LEAD_CALL_MAX_TEAM_SIZE) return null;
+  const team: HotLeadCallMember[] = [];
+  for (const m of raw) {
+    const member = memberOf(m);
+    if (!member) return null;
+    team.push(member);
+  }
+  // Ids name a member in call records and cooldown keys; a shared phone would ring one person twice per lead.
+  if (new Set(team.map(m => m.id)).size !== team.length || new Set(team.map(m => m.phone)).size !== team.length) return null;
+  return team;
+}
+
+const ID_ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyz';
+
+/** A fresh member id (crypto random, lowercase base36) that is not in `existing`. */
+export function generateMemberId(existing: readonly string[] = []): string {
+  for (;;) {
+    let id = 'm';
+    for (let i = 0; i < 7; i++) id += ID_ALPHABET[randomInt(ID_ALPHABET.length)];
+    if (!existing.includes(id)) return id;
+  }
 }
 
 /**
@@ -150,15 +247,9 @@ export function hotLeadCallConfigOf(raw: unknown): HotLeadCallConfig | null {
   if (!isRecord(raw) || Object.keys(raw).some(k => !KEYS.has(k))) return null;
   if (typeof raw.enabled !== 'boolean') return null;
 
-  const destinationPhone = allowlistedE164(raw.destinationPhone);
-  if (!destinationPhone) return null;
+  const team = teamOf(raw.team);
+  if (!team) return null;
 
-  let destinationVerifiedAt: string | undefined;
-  if (raw.destinationVerifiedAt !== undefined) {
-    const at = raw.destinationVerifiedAt;
-    if (typeof at !== 'string' || isNaN(Date.parse(at)) || new Date(at).toISOString() !== at) return null;
-    destinationVerifiedAt = at;
-  }
   let twilioNumber: string | undefined;
   if (raw.twilioNumber !== undefined) {
     twilioNumber = allowlistedE164(raw.twilioNumber) ?? undefined;
@@ -170,7 +261,7 @@ export function hotLeadCallConfigOf(raw: unknown): HotLeadCallConfig | null {
     twilioNumberSid = raw.twilioNumberSid;
   }
   // The system would otherwise call itself.
-  if (twilioNumber === destinationPhone) return null;
+  if (twilioNumber && team.some(m => m.phone === twilioNumber)) return null;
 
   const leadTypes = raw.leadTypes === undefined ? [...HOT_LEAD_CALL_DEFAULT_LEAD_TYPES] : raw.leadTypes;
   if (!isLeadTypes(leadTypes) || leadTypes.length === 0) return null;
@@ -186,28 +277,28 @@ export function hotLeadCallConfigOf(raw: unknown): HotLeadCallConfig | null {
   const announcedName = raw.announcedName.trim();
   if (!announcedName || announcedName.length > HOT_LEAD_CALL_ANNOUNCED_NAME_MAX || !ANNOUNCED_NAME.test(announcedName)) return null;
 
-  let quietHours: HotLeadCallQuietHours | undefined;
-  if (raw.quietHours !== undefined) {
-    quietHours = quietHoursOf(raw.quietHours) ?? undefined;
-    if (!quietHours) return null;
+  let callingHours: HotLeadCallCallingHours | undefined;
+  if (raw.callingHours !== undefined) {
+    callingHours = callingHoursOf(raw.callingHours) ?? undefined;
+    if (!callingHours) return null;
   }
 
   const allowedCountries = raw.allowedCountries === undefined ? [...HOT_LEAD_CALL_COUNTRIES] : raw.allowedCountries;
   if (!isCountries(allowedCountries)) return null;
 
-  // A half-configured org may save disabled while it sets up, but never enabled.
-  if (raw.enabled && (!destinationVerifiedAt || !twilioNumber || !quietHours)) return null;
+  // A half-configured org may save disabled while it sets up, but never enabled. Every member has a window
+  // (the member validator requires one), so a verified member is a reachable one.
+  if (raw.enabled && (!team.some(m => m.verifiedAt) || !twilioNumber || !callingHours)) return null;
 
   return {
     enabled: raw.enabled,
-    destinationPhone,
-    ...(destinationVerifiedAt ? { destinationVerifiedAt } : {}),
+    team,
     ...(twilioNumber ? { twilioNumber } : {}),
     ...(twilioNumberSid ? { twilioNumberSid } : {}),
     leadTypes,
     ...limits,
     announcedName,
-    ...(quietHours ? { quietHours } : {}),
+    ...(callingHours ? { callingHours } : {}),
     allowedCountries,
   };
 }
