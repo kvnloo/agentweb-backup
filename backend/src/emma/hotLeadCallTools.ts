@@ -8,6 +8,7 @@ import {
   HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS, HOT_LEAD_CALL_SYSTEM_FIELDS, maskPhone,
   type HotLeadCallConfig,
 } from '../services/hotLeadCallConfig';
+import { assertHotLeadCallEntitled } from '../services/voice/hotLeadCallEntitlement';
 import { unchangedSince } from '../services/voice/setupWrites';
 import { toE164 } from '../services/whatsappService';
 import { parsePhoneNumberWithError } from 'libphonenumber-js';
@@ -107,7 +108,7 @@ emmaToolRegistry.register({
   name: 'update_hot_lead_call_settings',
   definition: {
     name: 'update_hot_lead_call_settings',
-    description: `Change your organization’s hot lead auto-call settings (org owners/admins only). Only the fields you send change; everything else is kept. The first save needs destinationPhone (US or Canada only, no extension; Puerto Rico, Guam and other territories are not supported) and announcedName. Changing destinationPhone clears its verification and turns calling off until the new number is verified. enabled:true is refused until the phone is verified and a caller number is assigned; both are managed by the system and cannot be set here. quietHours is the window in which calls ARE allowed (24h HH:MM in the given timezone, default 08:00-21:00; start later than end wraps past midnight) and is required to enable. The lead’s own timezone is not considered. timezone must be an IANA Area/Location name such as America/Chicago (UTC, abbreviations and Etc/ zones are refused; letter case is normalised). leadTypes must contain at least one type (default form_fill). announcedName is read aloud on the call: letters, digits, spaces and . , & ' - only, max ${HOT_LEAD_CALL_ANNOUNCED_NAME_MAX} characters.`,
+    description: `Change your organization’s hot lead auto-call settings (org owners/admins only). Only the fields you send change; everything else is kept. The first save needs destinationPhone (US or Canada only, no extension; Puerto Rico, Guam and other territories are not supported) and announcedName. Changing destinationPhone clears its verification and turns calling off until the new number is verified. enabled:true is refused until the phone is verified and a caller number is assigned, and when the organization's plan does not include hot lead calls; both are managed by the system and cannot be set here. quietHours is the window in which calls ARE allowed (24h HH:MM in the given timezone, default 08:00-21:00; start later than end wraps past midnight) and is required to enable. The lead’s own timezone is not considered. timezone must be an IANA Area/Location name such as America/Chicago (UTC, abbreviations and Etc/ zones are refused; letter case is normalised). leadTypes must contain at least one type (default form_fill). announcedName is read aloud on the call: letters, digits, spaces and . , & ' - only, max ${HOT_LEAD_CALL_ANNOUNCED_NAME_MAX} characters.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -133,6 +134,8 @@ emmaToolRegistry.register({
     if (Object.keys(patch).length === 0) throw new Error('Invalid hot lead call settings arguments: provide at least one setting');
 
     const org = await callerOrg(context, 'hot lead call settings', true);
+    // Turning calling on is what lets calls spend money; saving settings while off is always allowed.
+    if (patch.enabled === true) await assertHotLeadCallEntitled(org);
     const previous = org.hotLeadCall;
     const current = storedConfig(previous);
 

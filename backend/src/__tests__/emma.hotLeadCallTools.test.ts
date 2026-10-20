@@ -6,6 +6,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { orgDb, userDb } from '../services/db';
 import '../emma/hotLeadCallTools';
+import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
 import { SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS } from '../services/agentMode/core/toolDispatch';
 
 const get = (args: unknown = {}, context: unknown = { userId: 'owner' }) => handlers.get('get_hot_lead_call_settings')!.execute(args, context);
@@ -26,6 +27,7 @@ const stored = () => ({
 });
 beforeEach(() => {
   jest.clearAllMocks();
+  setHotLeadCallEntitledOverride(true);
   org = { orgId: 'org-a', ownerUserId: 'owner', hotLeadCall: stored(), connected_accounts: [{ config: { access_token: 'secret' } }] };
   (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner', orgId: 'org-a', orgRole: 'owner' });
   (orgDb.getOrgById as jest.Mock).mockResolvedValue(org);
@@ -117,6 +119,20 @@ describe('update_hot_lead_call_settings', () => {
     cfg().enabled = false;
     await expect(update({ enabled: true })).rejects.toThrow('verified');
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
+  });
+
+  it('refuses enabled:true when the org’s plan does not include hot lead calls, but still allows saving and disabling', async () => {
+    setHotLeadCallEntitledOverride(false);
+    cfg().enabled = false;
+    await expect(update({ enabled: true })).rejects.toThrow('not included in your organization’s current plan');
+    expect(orgDb.updateOrg).not.toHaveBeenCalled();
+    expect(await update({ maxCallsPerHour: 4 })).toMatchObject({ enabled: false, maxCallsPerHour: 4 });
+    expect(await update({ enabled: false })).toMatchObject({ enabled: false });
+  });
+
+  it('enables for an entitled org with a verified phone and a number', async () => {
+    cfg().enabled = false;
+    expect(await update({ enabled: true })).toMatchObject({ enabled: true });
   });
 
   it.each(['+15555550100 x12', '(415) 555-0100 ext. 5', '+14155550100;ext=7'])('rejects a phone with an extension instead of dropping it: %s', async destinationPhone => {

@@ -12,6 +12,7 @@ import { recordVendorUsage } from '../services/usageRecorderService';
 import { isHotLeadCallEnabled } from '../services/voice/hotLeadCallMode';
 import '../emma/hotLeadCallTools';
 import '../emma/hotLeadCallSetupTools';
+import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
 import { FakeVoiceProvider } from '../services/voice/fakeVoiceProvider';
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
 import { getRecordingUnit } from '../utils/vendorRateCard';
@@ -92,6 +93,7 @@ const allLogs = () => logSpies.flatMap(s => s.mock.calls).map(c => c.map(String)
 beforeAll(() => { process.env.JWT_SECRET = 'test-secret-not-real'; });
 beforeEach(() => {
   jest.clearAllMocks();
+  setHotLeadCallEntitledOverride(true);
   jest.useFakeTimers({ now: T0, doNotFake: ['nextTick', 'setImmediate', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'queueMicrotask'] });
   writes = [];
   beforeWrite = null;
@@ -107,6 +109,7 @@ afterEach(() => {
   jest.useRealTimers();
   jest.restoreAllMocks();
   setVoiceProviderForTests(null);
+  setHotLeadCallEntitledOverride(null);
 });
 
 describe('permissions and registration', () => {
@@ -183,6 +186,12 @@ describe('permissions and registration', () => {
 });
 
 describe('provision_hot_lead_call_number', () => {
+  it('refuses, before reserving or buying anything, when the org’s plan does not include hot lead calls', async () => {
+    setHotLeadCallEntitledOverride(false);
+    await expect(provision()).rejects.toThrow('not included in your organization’s current plan');
+    expect(fake.boughtNumbers).toEqual([]);
+    expect(writes).toEqual([]);
+  });
   it.each([[{}], [{ confirm: false }], [{ confirm: 'true' }], [{ confirm: 1 }], [{ confirm: null }]])('does not spend without confirm:true (%j)', async args => {
     await expect(provision(args)).rejects.toThrow('costs money');
     expect(fake.boughtNumbers).toEqual([]);
@@ -418,6 +427,13 @@ describe('release_hot_lead_call_number', () => {
 
 describe('start_hot_lead_call_verification', () => {
   beforeEach(() => { org.hotLeadCall = withNumber(); });
+
+  it('refuses, before placing a call, when the org’s plan does not include hot lead calls', async () => {
+    setHotLeadCallEntitledOverride(false);
+    await expect(start()).rejects.toThrow('not included in your organization’s current plan');
+    expect(fake.placedCalls).toEqual([]);
+    expect(writes).toEqual([]);
+  });
 
   it('needs a provisioned caller number and places no call without one', async () => {
     org.hotLeadCall = configured();

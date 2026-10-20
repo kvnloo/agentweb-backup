@@ -5,6 +5,8 @@ import { hotLeadCallConfigOf, HotLeadCallConfig } from '../hotLeadCallConfig';
 export interface HotLeadCallContext {
   orgId: string;
   ownerUserId: string;
+  /** The org's billing owner, whose plan decides whether calls are allowed. */
+  orgOwnerUserId: string;
   config: HotLeadCallConfig;
 }
 
@@ -25,5 +27,5 @@ export async function resolveHotLeadCallContext(listId: string): Promise<HotLead
   if (!org || org.orgId !== owner.orgId) return null;
   const config = hotLeadCallConfigOf(org.hotLeadCall);
   if (!config?.enabled) return null;
-  return { orgId: org.orgId, ownerUserId: owner.userId, config };
+  return { orgId: org.orgId, ownerUserId: owner.userId, orgOwnerUserId: org.ownerUserId, config };
 }

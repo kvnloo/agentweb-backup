@@ -3,6 +3,7 @@ import { callerOrg, type ToolContext } from './orgCaller';
 import { storedConfig } from './hotLeadCallTools';
 import { maskPhone, type HotLeadCallConfig } from '../services/hotLeadCallConfig';
 import { startVerification, confirmVerification, VERIFICATION_CODE_TTL_MS, VERIFICATION_MAX_ATTEMPTS } from '../services/voice/destinationVerification';
+import { assertHotLeadCallEntitled } from '../services/voice/hotLeadCallEntitlement';
 import { provisionNumber, releaseNumber, monthlyRentText } from '../services/voice/numberProvisioning';
 
 /**
@@ -46,7 +47,7 @@ emmaToolRegistry.register({
   name: 'provision_hot_lead_call_number',
   definition: {
     name: 'provision_hot_lead_call_number',
-    description: `Buy the phone number the hot lead auto-call is placed from (org owners/admins only). This spends money: the number has a monthly fee on your Twilio account (the current price is stated when the user is asked to agree), charged now and every month until it is released. Set it up in this order: save settings, get a number with this tool, verify the destination phone, then enable calling. Needs saved hot lead call settings, and each organization can hold one number. Pass confirm:true only after the user has explicitly agreed to the cost in this conversation; confirm is advisory and is not an authorization, so never set it on your own. Each organization can buy at most 2 numbers per day. areaCode (3 digits) is optional and picks a US area code. If the result says the purchase could not be confirmed, do not retry; tell the user to contact support. Works even while hot lead calling is switched off platform-wide.`,
+    description: `Buy the phone number the hot lead auto-call is placed from (org owners/admins only; refused when the organization's plan does not include hot lead calls). This spends money: the number has a monthly fee on your Twilio account (the current price is stated when the user is asked to agree), charged now and every month until it is released. Set it up in this order: save settings, get a number with this tool, verify the destination phone, then enable calling. Needs saved hot lead call settings, and each organization can hold one number. Pass confirm:true only after the user has explicitly agreed to the cost in this conversation; confirm is advisory and is not an authorization, so never set it on your own. Each organization can buy at most 2 numbers per day. areaCode (3 digits) is optional and picks a US area code. If the result says the purchase could not be confirmed, do not retry; tell the user to contact support. Works even while hot lead calling is switched off platform-wide.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -63,6 +64,7 @@ emmaToolRegistry.register({
     if (confirm !== true) throw new Error(`Buying a number costs money (${monthlyRentText()}). Ask the user to agree, then call again with confirm:true.`);
     if (areaCode !== undefined && (typeof areaCode !== 'string' || !/^\d{3}$/.test(areaCode))) throw new Error('areaCode must be exactly 3 digits, for example 415');
     const org = await callerOrg(context, 'the hot lead caller number', true);
+    await assertHotLeadCallEntitled(org);
     const config = configuredOrThrow(storedConfig(org.hotLeadCall));
     const result = await provisionNumber({ org, config, userId: userIdOf(context), areaCode });
     return {
@@ -92,13 +94,14 @@ emmaToolRegistry.register({
   name: 'start_hot_lead_call_verification',
   definition: {
     name: 'start_hot_lead_call_verification',
-    description: `Phone the saved destination number and read out a 6-digit code, to prove the owner controls it (org owners/admins only). Needs saved settings and a provisioned caller number (provision_hot_lead_call_number first). It always calls the saved number, never one you pass. The code is only spoken on the call: it is never shown here, so ask the user to read it back, then call confirm_hot_lead_call_verification. The code is valid for ${VERIFICATION_CODE_TTL_MS / 60_000} minutes with ${VERIFICATION_MAX_ATTEMPTS} attempts. Limits: one call per 2 minutes and 5 per day. Each call costs a small Twilio voice charge. Verification proves the phone answered and the code was heard; a voicemail that plays the message back can also pass it, and the spoken code is visible in the Twilio call log to people with Twilio access. Works even while hot lead calling is switched off platform-wide.`,
+    description: `Phone the saved destination number and read out a 6-digit code, to prove the owner controls it (org owners/admins only; refused when the organization's plan does not include hot lead calls). Needs saved settings and a provisioned caller number (provision_hot_lead_call_number first). It always calls the saved number, never one you pass. The code is only spoken on the call: it is never shown here, so ask the user to read it back, then call confirm_hot_lead_call_verification. The code is valid for ${VERIFICATION_CODE_TTL_MS / 60_000} minutes with ${VERIFICATION_MAX_ATTEMPTS} attempts. Limits: one call per 2 minutes and 5 per day. Each call costs a small Twilio voice charge. Verification proves the phone answered and the code was heard; a voicemail that plays the message back can also pass it, and the spoken code is visible in the Twilio call log to people with Twilio access. Works even while hot lead calling is switched off platform-wide.`,
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   execute: async (args: unknown, context?: ToolContext) => {
     requireAttended(context);
     onlyKeys(args, []);
     const org = await callerOrg(context, 'hot lead call verification', true);
+    await assertHotLeadCallEntitled(org);
     const config = configuredOrThrow(storedConfig(org.hotLeadCall));
     const result = await startVerification(org, config, userIdOf(context));
     return {

@@ -61,6 +61,7 @@ const FREE_TIER_FALLBACK: SubscriptionType = {
 export const SUBSCRIPTION_FEATURES = {
   SCHEDULED_CHATS: "scheduled_chats",
   MODEL_COMPARE: "model_compare",
+  HOT_LEAD_CALL: "hot_lead_call",
 } as const;
 
 /**
@@ -280,6 +281,10 @@ const AVAILABLE_SUBSCRIPTION_FEATURES: ReadonlyArray<{
   id: SUBSCRIPTION_FEATURES.MODEL_COMPARE,
   label: "Compare models",
   description: "Send one prompt to several models and compare their answers side by side.",
+}, {
+  id: SUBSCRIPTION_FEATURES.HOT_LEAD_CALL,
+  label: "Hot lead calls",
+  description: "Phone the business owner when a hot lead arrives and connect them to the lead. Costs AgentWeb Twilio usage, so tick it only for paid tiers.",
 }];
 
 export function getAllAvailableSubscriptionFeatures() {

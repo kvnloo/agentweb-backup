@@ -176,7 +176,7 @@ describe('subscriptionService', () => {
       settingValue: JSON.stringify([{ name: 'Legacy', allowedPages: ['/'], allowedSkills: [] }]),
     } as any);
 
-    expect(await getAllowedFeatures('u1')).toEqual(['scheduled_chats', 'model_compare']);
+    expect(await getAllowedFeatures('u1')).toEqual(['scheduled_chats', 'model_compare', 'hot_lead_call']);
   });
 
   it('getUserSubscriptionType resolves an org member to the owner tier dynamically (ENG-288)', async () => {
