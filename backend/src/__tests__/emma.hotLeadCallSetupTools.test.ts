@@ -35,7 +35,8 @@ const NEW_SID_2 = 'PN' + 'd'.repeat(32);
 const NEW_NUMBER = '+14155550123';
 const NEW_NUMBER_2 = '+14155550124';
 
-let org: Record<string, unknown> & { orgId: string; hotLeadCall?: Record<string, unknown>; hotLeadCallVerification?: { members: Record<string, Record<string, unknown> & { startedAt: number[] }>; orgStartedAt: number[] } };
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- the stored verification state is deliberately replaced by malformed shapes in some tests
+let org: Record<string, unknown> & { orgId: string; hotLeadCall?: Record<string, unknown>; hotLeadCallVerification?: Record<string, any> };
 let fake: FakeVoiceProvider;
 let writes: Array<{ updates: Record<string, unknown>; condition?: { expression: string } }>;
 let beforeWrite: ((index: number) => void) | null;
@@ -619,7 +620,7 @@ describe('confirm_hot_lead_call_verification', () => {
   it('a hash issued for one org or phone does not verify under another (the MAC binds both)', async () => {
     await start();
     const code = codeFromCall();
-    const record = clone(org.hotLeadCallVerification);
+    const record = clone(org.hotLeadCallVerification)!;
     org.hotLeadCall = withNumber({ phone: '+16475550123' });
     org.hotLeadCallVerification = { ...record, members: { [MEMBER_ID]: { ...record.members[MEMBER_ID], phone: '+16475550123' } } };
     await expect(confirm(code)).rejects.toThrow('not correct');

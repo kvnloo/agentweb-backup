@@ -136,7 +136,7 @@ describe('updateHotLeadCallSettings: revision and concurrency', () => {
     const before = cloneJson(table.org.hotLeadCall);
     await put({ maxAttemptsPerLead: 2 });
     expect(table.writes[0].condition!.expression).toBe('#previousHotLeadCall = :previousHotLeadCall');
-    expect((table.writes[0].condition as { values: Record<string, unknown> }).values[':previousHotLeadCall']).toEqual(before);
+    expect(table.writes[0].condition!.values![':previousHotLeadCall']).toEqual(before);
   });
 });
 

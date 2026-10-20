@@ -4,7 +4,7 @@
  */
 export interface FakeOrgTable {
   org: Record<string, unknown> & { orgId: string };
-  writes: Array<{ updates: Record<string, unknown>; condition?: { expression: string } }>;
+  writes: Array<{ updates: Record<string, unknown>; condition?: { expression: string; values?: Record<string, unknown> } }>;
   /** Runs before each write is evaluated; tests use it to simulate a concurrent editor. */
   beforeWrite: ((index: number) => void) | null;
 }
