@@ -41,6 +41,12 @@ jest.mock("../services/paymentHistoryDb", () => ({
   // already assert.
   paymentHistoryDb: { getByUserId: jest.fn(async () => []) },
 }));
+// ENG-669: the tier model allowlist. Pass-through (switch off) unless a case narrows an owner's plan.
+const mockFilterAllowed = jest.fn(async (_owner: string, ids: readonly string[]) => [...ids]);
+jest.mock("../services/agentMode/modelAccessInstance", () => ({
+  modelAccess: { filterAllowedModels: (...a: [string, readonly string[]]) => mockFilterAllowed(...a) },
+  systemModelCheck: jest.fn(() => async () => false),
+}));
 jest.mock("../services/db", () => ({
   userDb: { getUserById: jest.fn() },
   orgDb: { getOrgById: jest.fn(), getOrgMembers: jest.fn() },
@@ -1386,5 +1392,105 @@ describe("ENG-1533 — `switchable` reflects this caller's real authority", () =
     expect(row).toHaveProperty("switchable", false);
     // And it stays customer-safe: authority, no economics.
     expect(JSON.stringify(customer.scheduleDrivers)).not.toMatch(/MicroUsd/i);
+  });
+});
+
+/**
+ * ENG-668 — the drivers preview forecasts against the same pool /usage-runway does.
+ *
+ * An account admitted on pay-as-you-go is measured against the month's PAYG pool (the high-water pool
+ * after a downgrade), not today's smaller one. If the preview used the current pool while the runway
+ * used the high-water one, the same screen would show "0 days left" next to "6 days left".
+ */
+describe("PAYG: the preview and /usage-runway forecast against the same pool (ENG-668)", () => {
+  // Downgraded to a $100 pool after the month had a $150 pool; $120 spent: admitted, nothing billable.
+  const paygAdmitted = () => policyFor({
+    policy: { ...policyFor().policy, hardCostThresholdMicroUsd: 100 * USD },
+    costUsedMicroUsd: 120 * USD,
+    mode: { usageMode: "full_choice", admissionAllowed: true, reason: "payg_overage" },
+    overage: { overageMicroUsd: 0, capMicroUsd: 75 * USD, poolMicroUsd: 150 * USD, percentOfCap: 0 },
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockBillingQuery.mockResolvedValue([]);
+    soloAccount();
+    mockModels.mockResolvedValue([OPUS, SONNET, HAIKU]);
+    mockModelsMeta.mockResolvedValue([]);
+    mockQuery.mockResolvedValue(opusLedger());
+    __setUsageTelemetrySinkForTests(() => {});
+  });
+
+  afterEach(() => {
+    __setUsageTelemetrySinkForTests(null);
+  });
+
+  it("uses the month's PAYG pool below it: $30 left at $5/day is 6 days, in both", async () => {
+    mockPolicy.mockResolvedValue(paygAdmitted());
+    const { resolveUsageRunway } = await import("../services/llmUsageRunwayResolverService");
+
+    const preview = await previewUsageRunway("u1", [], { today: "2026-08-11" });
+    const { runway } = await resolveUsageRunway("u1", { today: "2026-08-11" });
+
+    expect(preview.baselineDaysRemaining).toBe(6);
+    expect(runway!.estimatedDaysRemaining).toBe(6);
+  });
+
+  it("withholds the forecast in both once spend reaches that pool (PAYG covering)", async () => {
+    mockPolicy.mockResolvedValue({ ...paygAdmitted(), costUsedMicroUsd: 160 * USD });
+    const { resolveUsageRunway } = await import("../services/llmUsageRunwayResolverService");
+
+    const preview = await previewUsageRunway("u1", [{ fromModel: OPUS, toModel: SONNET }], { today: "2026-08-11" });
+    const { runway } = await resolveUsageRunway("u1", { today: "2026-08-11" });
+
+    expect(runway!.paygCovering).toBe(true);
+    expect(preview.baselineDaysRemaining).toBeNull();
+    expect(preview.estimatedDaysRecovered).toBeNull();
+  });
+
+  it("without PAYG, both still use the current pool (unchanged)", async () => {
+    mockPolicy.mockResolvedValue(policyFor({
+      policy: { ...policyFor().policy, hardCostThresholdMicroUsd: 100 * USD },
+      costUsedMicroUsd: 120 * USD,
+      mode: { usageMode: "paused", admissionAllowed: false, reason: "hard_threshold_reached" },
+    }));
+    const preview = await previewUsageRunway("u1", [], { today: "2026-08-11" });
+    expect(preview.baselineDaysRemaining).toBe(0);
+  });
+});
+
+/**
+ * ENG-669: a schedule runs under its OWNER's plan, and an org's report pools schedules whose owners can be on
+ * different tiers. A schedule row only carries a recommendation its owner's plan includes (applyModelChange would
+ * refuse any other); the caller's own catalog is unaffected.
+ */
+describe("per-schedule recommendations follow the schedule owner's plan (ENG-669)", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockBillingQuery.mockResolvedValue([]);
+    soloAccount();
+    mockPolicy.mockResolvedValue(policyFor());
+    mockModels.mockResolvedValue([OPUS, SONNET, HAIKU]);
+    mockModelsMeta.mockResolvedValue([]);
+    mockFilterAllowed.mockImplementation(async (_owner: string, ids: readonly string[]) => [...ids]);
+    mockQuery.mockResolvedValue(opusLedger().map((r) => ({ ...r, feature: "agent_task:scheduled:sched-a" })));
+    mockSchedules.mockResolvedValue([{ scheduleId: "sched-a", scheduleName: "Daily", frequency: "daily", llmModel: OPUS }]);
+  });
+
+  it("control: an owner whose plan includes the recommendation gets it on the schedule row", async () => {
+    const { scheduleDrivers } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    expect(scheduleDrivers[0].recommendedModel).not.toBeNull();
+  });
+
+  it("an owner whose plan excludes it gets no recommendation on that row; the caller's catalog is unchanged", async () => {
+    const control = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    const recommended = control.scheduleDrivers[0].recommendedModel as string;
+    mockFilterAllowed.mockImplementation(async (owner: string, ids: readonly string[]) =>
+      (owner === "u1" ? [...ids] : ids.filter((id) => id !== recommended)));
+
+    const { scheduleDrivers, recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    expect(recommendations.map((r) => r.toModel)).toContain(recommended);
+    expect(scheduleDrivers[0]).toMatchObject({ recommendedModel: null, estimatedDaysRecovered: null, confidence: null });
+    expect(mockFilterAllowed).toHaveBeenCalledWith(expect.not.stringMatching(/^u1$/), [recommended], expect.any(Function));
   });
 });

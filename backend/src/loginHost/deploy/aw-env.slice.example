@@ -1,0 +1,6 @@
+# /etc/systemd/system/aw-test1.slice : ceiling for ALL customer units of one environment (per-customer slices nest below it).
+# Copy per environment, set the numbers from the worker's size.
+[Slice]
+MemoryMax=8G
+TasksMax=4096
+CPUQuota=300%

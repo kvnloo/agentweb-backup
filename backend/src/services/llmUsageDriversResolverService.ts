@@ -25,7 +25,9 @@
  */
 
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
+import { runwayAllowance } from "./llmUsageRunwayResolverService";
 import { contentAuthorityOver } from "./orgContentAuthority";
+import { modelAccess, systemModelCheck } from "./agentMode/modelAccessInstance";
 import {
   readBilledLedgerRows,
   resolvePooledLedgerUserIds,
@@ -390,9 +392,12 @@ export async function previewUsageRunway(
     observedByDate.set(r.date, (observedByDate.get(r.date) || 0) + r.costMicroUsd);
   }
 
+  // ENG-668: the same allowance /usage-runway forecasts against (the PAYG month pool when admitting).
+  const { hardThresholdMicroUsd, paygCovering } = runwayAllowance({ ...usage, policy: usage.policy });
   const forecastInput = {
     costUsedMicroUsd: usage.costUsedMicroUsd,
-    hardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd,
+    hardThresholdMicroUsd,
+    ...(paygCovering ? { paygCovering: true } : {}),
     cycleStartDate,
     cycleResetDate,
     today,
@@ -521,9 +526,12 @@ export async function resolveUsageDrivers(
     observedByDate.set(r.date, (observedByDate.get(r.date) || 0) + r.costMicroUsd);
   }
   const dailyCostMicroUsd = [...observedByDate.entries()].map(([date, costMicroUsd]) => ({ date, costMicroUsd }));
+  // ENG-668: the same allowance /usage-runway forecasts against (the PAYG month pool when admitting).
+  const allowance = runwayAllowance({ ...usage, policy: usage.policy });
   const baseline = computeUsageRunway({
     costUsedMicroUsd: usage.costUsedMicroUsd,
-    hardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd,
+    hardThresholdMicroUsd: allowance.hardThresholdMicroUsd,
+    ...(allowance.paygCovering ? { paygCovering: true } : {}),
     dailyCostMicroUsd,
     cycleStartDate,
     cycleResetDate,
@@ -544,7 +552,13 @@ export async function resolveUsageDrivers(
       ? await agentModeService.getSupportedModels(false)
       : [],
   );
-  const catalog = (usage.policy.optimizedModelIds || []).filter((m) => supported.has(m));
+  // ENG-669: and only what the account's plan includes (switch off => unchanged, nothing read):
+  // recommending a model the tier allowlist then refuses would only break the work it targets.
+  const catalog = await modelAccess.filterAllowedModels(
+    userId,
+    (usage.policy.optimizedModelIds || []).filter((m) => supported.has(m)),
+    systemModelCheck(null),
+  );
 
   /**
    * The recommendation's confidence, capped by the forecast's own (AC6).
@@ -681,7 +695,8 @@ export async function resolveUsageDrivers(
       // combined one can never be computed on different bases.
       const projected = computeUsageRunway({
         costUsedMicroUsd: usage.costUsedMicroUsd,
-        hardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd,
+        hardThresholdMicroUsd: allowance.hardThresholdMicroUsd,
+        ...(allowance.paygCovering ? { paygCovering: true } : {}),
         dailyCostMicroUsd: counterfactualDaily(ledger, observedByDate, [
           { fromModel: driver.key, toModel: candidate },
         ]),
@@ -808,6 +823,23 @@ export async function resolveUsageDrivers(
         : null;
     const recByFromModel = new Map(ranked.map((r) => [r.fromModel, r]));
 
+    // ENG-669: a schedule runs under its OWNER's plan (applyModelChange checks exactly that), and an org's report
+    // pools schedules whose owners can be on different tiers. So a schedule only carries a recommendation its owner's
+    // plan includes. One check per distinct owner x model; switch off => no reads, every recommendation kept.
+    const ownerMayRun = new Map<string, boolean>();
+    await Promise.all(
+      [...byId.values()].flatMap((m) => {
+        const pinned = (m as { llmModel?: string }).llmModel || null;
+        const rec = (pinned || platformDefault) ? recByFromModel.get((pinned || platformDefault) as string) : undefined;
+        if (!rec) return [];
+        const key = `${m.ownerUserId}\u0000${rec.toModel}`;
+        if (ownerMayRun.has(key)) return [];
+        ownerMayRun.set(key, true);
+        return [modelAccess.filterAllowedModels(m.ownerUserId, [rec.toModel], systemModelCheck(null))
+          .then((kept) => { ownerMayRun.set(key, kept.length > 0); })];
+      }),
+    );
+
     scheduleDrivers = attribution.bySchedule.map((d) => {
       const meta = byId.get(d.key);
       // Absent record = deleted mid-cycle. Present but unnamed is a different state and
@@ -815,7 +847,8 @@ export async function resolveUsageDrivers(
       const scheduleExists = meta !== undefined;
       const pinnedModel = (meta as { llmModel?: string } | undefined)?.llmModel || null;
       const effectiveModel = pinnedModel || platformDefault;
-      const rec = effectiveModel ? recByFromModel.get(effectiveModel) : undefined;
+      const rankedRec = effectiveModel ? recByFromModel.get(effectiveModel) : undefined;
+      const rec = rankedRec && meta && ownerMayRun.get(`${meta.ownerUserId}\u0000${rankedRec.toModel}`) === false ? undefined : rankedRec;
       return {
         scheduleId: d.key,
         pinnedModel,

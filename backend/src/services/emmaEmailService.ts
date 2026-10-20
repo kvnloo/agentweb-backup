@@ -224,7 +224,7 @@ export class EmmaEmailService {
         );
         sessionId = newSession.sessionId;
         const defaultModel = await agentModeService.getDefaultModel();
-        await chatbotDb.updateSessionLlmModel(sessionId, defaultModel);
+        await chatbotDb.updateSessionLlmModel(sessionId, defaultModel, undefined, 'system');
         if (event.subject) {
           await chatbotDb.updateSessionTitle(sessionId, event.subject);
         }
@@ -236,7 +236,7 @@ export class EmmaEmailService {
       );
       sessionId = newSession.sessionId;
       const defaultModel = await agentModeService.getDefaultModel();
-      await chatbotDb.updateSessionLlmModel(sessionId, defaultModel);
+      await chatbotDb.updateSessionLlmModel(sessionId, defaultModel, undefined, 'system');
       if (event.subject) {
         await chatbotDb.updateSessionTitle(sessionId, event.subject);
       }
