@@ -117,6 +117,14 @@ export class Layout {
   get envSlicePattern(): string {
     return `aw-${this.cfg.env}-*.slice`;
   }
+  /** systemctl pattern matching EVERY unit of this environment (any uid). */
+  get envUnitPattern(): string {
+    return `aw-${this.cfg.env}-*.service`;
+  }
+  /** Whether `name` is a unit of THIS environment (any uid). */
+  isEnvUnit(name: string): boolean {
+    return new RegExp(`^aw-${this.cfg.env}-\\d+-[a-f0-9]{8,32}\\.service$`).test(name);
+  }
   /** The slice that parents every customer slice of this env (caps the total). */
   get envSliceName(): string {
     return `aw-${this.cfg.env}.slice`;

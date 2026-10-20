@@ -1,0 +1,15 @@
+{
+  "env": "test1",
+  "uidMin": 400000,
+  "uidMax": 410000,
+  "socket": { "dir": "/run/aw-login-host-test1", "gid": 990 },
+  "limits": { "memoryMax": "1G", "tasksMax": 256, "tmpSize": "128M", "shmSize": "64M", "runtimeMaxSec": 7200 },
+  "quota": { "blocksKb": 204800, "inodes": 20000 },
+  "claude": {
+    "binaryPath": "/opt/aw-claude/2.1.294/claude",
+    "expectedSha256": "<sha256 of that exact binary: sha256sum>",
+    "version": "2.1.294",
+    "systemPromptFile": "/opt/aw-login-host/system-prompt.txt",
+    "bridgeUrl": "http://127.0.0.1:3001/internal/tool-bridge/run/mcp"
+  }
+}

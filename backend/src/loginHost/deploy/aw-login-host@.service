@@ -1,0 +1,25 @@
+# ENG-2110: one login host per environment (instance = env name, e.g. aw-login-host@test1). Runs as root: it starts
+# per-customer transient units. DARK until the backend flag is on. Installed by install-host.sh.
+[Unit]
+Description=AgentWeb login host (%i)
+After=local-fs.target network.target
+RequiresMountsFor=/var/lib/aw-login-host/%i/u
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /opt/aw-login-host/dist/loginHost/host/main.js /etc/aw-login-host/%i.json
+Restart=on-failure
+RestartSec=5
+# The host's own hardening (customer units are hardened separately by the host).
+NoNewPrivileges=no
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=no
+# Customer units are NOT children of this service (own transient units in aw-<env>-<uid>.slice), so a restart of the
+# host never stops them by itself: the host's start-up stops them explicitly before serving.
+KillMode=process
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
