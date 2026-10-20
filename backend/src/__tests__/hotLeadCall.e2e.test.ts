@@ -4,7 +4,7 @@
  * primitives), the express webhook router with its guard sequence, the TwiML builders and recordCallUsage.
  * Only the outside world is faked: Twilio (a strict FakeVoiceProvider whose signature check is Twilio's own
  * HMAC, driven by a caller that follows the URLs the app hands out), DynamoDB, the job queue, Slack and the
- * usage ledger. Time is a fixed Date, so quiet hours and cooldowns are deterministic.
+ * usage ledger. Time is a fixed Date, so calling hours and cooldowns are deterministic.
  * Gates and limits are in hotLeadCall.e2e.gates.test.ts; both files share helpers/hotLeadCallE2eWorld.
  */
 jest.mock('../services/db', () => ({ ENGAGED_EVENT_KEYWORDS: jest.requireActual('../services/db').ENGAGED_EVENT_KEYWORDS, ...jest.requireActual('./helpers/hotLeadCallFakeCrm').dbMock }));
@@ -34,7 +34,7 @@ describe('a hot lead rings the member and, on 1, bridges the lead', () => {
   it('runs the whole call: one member call, a signed webhook sequence, both legs metered once, ordered timeline', async () => {
     await submitLead('lead-a');
 
-    // The orchestrator placed exactly one call, from the org's number to the verified destination.
+    // The orchestrator placed exactly one call, from the org's number to the first available member.
     expect(world.provider.placedCalls).toHaveLength(1);
     const placed = placedCall();
     expect(placed).toMatchObject({ to: MEMBER_PHONE, from: TWILIO_NUMBER, timeoutSeconds: 25 });

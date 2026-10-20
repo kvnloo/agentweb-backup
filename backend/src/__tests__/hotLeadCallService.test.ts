@@ -271,7 +271,7 @@ describe('team routing', () => {
 });
 
 describe('processHotLeadCallJob', () => {
-  it('passes member and status URLs with ids only, and destination/from from config, never from the lead', async () => {
+  it('passes member and status URLs with ids only, and member and from numbers from config, never from the lead', async () => {
     await processHotLeadCallJob(jobOf());
     const [call] = provider.placedCalls;
     expect(call.to).toBe(MEMBER_PHONE);
@@ -434,7 +434,7 @@ describe('registerHotLeadCallProcessor', () => {
   });
 });
 
-describe('quiet hours gate', () => {
+describe('calling hours gate', () => {
   // America/Chicago, window 08:00-21:00: CDT is UTC-5, CST is UTC-6.
   const at = async (iso: string) => {
     jest.setSystemTime(new Date(iso));

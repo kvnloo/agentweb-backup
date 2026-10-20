@@ -1,6 +1,6 @@
 /**
  * Hot-lead auto-call, end to end (ENG-2271): everything that must stop a call before it is dialed (kill
- * switch, config, quiet hours, staleness, dedupe, cooldown, caps, unsafe ids) and the silent refusals. Same real
+ * switch, config, calling hours, staleness, dedupe, cooldown, caps, unsafe ids) and the silent refusals. Same real
  * pieces and fakes as hotLeadCall.e2e.test.ts, via helpers/hotLeadCallE2eWorld.
  */
 jest.mock('../services/db', () => ({ ENGAGED_EVENT_KEYWORDS: jest.requireActual('../services/db').ENGAGED_EVENT_KEYWORDS, ...jest.requireActual('./helpers/hotLeadCallFakeCrm').dbMock }));

@@ -61,7 +61,7 @@ let org: Record<string, unknown>;
 
 beforeEach(() => {
   jest.resetAllMocks();
-  // Only Date is faked: 12:00 in the call window (America/Chicago), so the quiet-hours gate never depends on when this runs.
+  // Only Date is faked: 12:00 in the call window (America/Chicago), so the calling-hours gate never depends on when this runs.
   jest.useFakeTimers({
     now: new Date('2026-10-19T17:00:00Z'),
     doNotFake: ['hrtime', 'nextTick', 'performance', 'queueMicrotask', 'setImmediate', 'clearImmediate', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'],

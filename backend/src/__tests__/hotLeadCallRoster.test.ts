@@ -10,7 +10,7 @@ const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6];
 
 let nextPhone = 0;
 function member(id: string, windows: HotLeadCallWindow[], over: Partial<HotLeadCallMember> = {}): HotLeadCallMember {
-  return { id: `m${id.toLowerCase().padEnd(7, "0")}`, name: `Member ${id}`, phone: `+1415555${String(1000 + nextPhone++)}`, verifiedAt: VERIFIED, windows, ...over };
+  return { id: `m${id.toLowerCase().padEnd(7, '0')}`, name: `Member ${id}`, phone: `+1415555${String(1000 + nextPhone++)}`, verifiedAt: VERIFIED, windows, ...over };
 }
 const daily = (start: string, end: string): HotLeadCallWindow => ({ days: ALL_DAYS, start, end });
 
@@ -24,11 +24,13 @@ function configOf(team: HotLeadCallMember[], callingHours: { start: string; end:
   return config;
 }
 
-// Monday 2026-10-19, Chicago on daylight time (UTC-5).
-const chicago = (hhmm: string, date = '2026-10-19', offsetHours = 5): Date => {
+// Monday 2026-10-19. Chicago is on daylight time (UTC-5) until 2026-11-01, and on standard time (UTC-6) after.
+const CDT_HOURS_BEHIND_UTC = 5;
+const CST_HOURS_BEHIND_UTC = 6;
+const chicago = (hhmm: string, date = '2026-10-19', hoursBehindUtc = CDT_HOURS_BEHIND_UTC): Date => {
   const [h, m] = hhmm.split(':').map(Number);
   const base = new Date(`${date}T00:00:00Z`).getTime();
-  return new Date(base + (h + offsetHours) * 3600_000 + m * 60_000);
+  return new Date(base + (h + hoursBehindUtc) * 3600_000 + m * 60_000);
 };
 const ids = (members: HotLeadCallMember[]) => members.map(m => m.id.slice(1, 2).toUpperCase());
 
@@ -124,6 +126,16 @@ describe('weekdays', () => {
     expect(ids(selectHotLeadCallCandidates(split, chicago('13:30', '2026-10-21')))).toEqual(['A']); // Wed afternoon
     expect(selectHotLeadCallCandidates(split, chicago('13:30', '2026-10-19'))).toEqual([]);
     expect(selectHotLeadCallCandidates(split, chicago('11:00', '2026-10-21'))).toEqual([]);
+  });
+});
+
+describe('standard time', () => {
+  it('reads the same wall-clock windows in winter, when Chicago is six hours behind UTC', () => {
+    const team = [member('A', [daily('09:00', '12:00')]), member('C', [daily('15:00', '18:00')]), member('D', [daily('14:00', '19:00')])];
+    const monday = (hhmm: string) => chicago(hhmm, '2026-12-14', CST_HOURS_BEHIND_UTC);
+    expect(ids(selectHotLeadCallCandidates(configOf(team), monday('11:00')))).toEqual(['A']);
+    expect(ids(selectHotLeadCallCandidates(configOf(team), monday('16:00')))).toEqual(['C', 'D']);
+    expect(selectHotLeadCallCandidates(configOf(team), monday('18:30'))).toEqual([]);
   });
 });
 
