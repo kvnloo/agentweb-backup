@@ -284,11 +284,30 @@ const AVAILABLE_SUBSCRIPTION_FEATURES: ReadonlyArray<{
 }, {
   id: SUBSCRIPTION_FEATURES.HOT_LEAD_CALL,
   label: "Hot lead calls",
-  description: "Phone the business owner when a hot lead arrives and connect them to the lead. Costs AgentWeb Twilio usage, so tick it only for paid tiers.",
+  description: "Phone the business owner when a hot lead arrives and connect them to the lead.",
 }];
 
+/**
+ * Features that cost AgentWeb money per use (paid vendors). Every "all features" expansion or default
+ * (legacy rows, new tiers, an omitted list) leaves these out, so only an explicit tick, or a saved
+ * "*", grants them. A new paid-vendor feature joins this list.
+ */
+export const OPT_IN_ONLY_SUBSCRIPTION_FEATURES: ReadonlyArray<SubscriptionFeatureId> = [
+  SUBSCRIPTION_FEATURES.HOT_LEAD_CALL,
+];
+
 export function getAllAvailableSubscriptionFeatures() {
-  return AVAILABLE_SUBSCRIPTION_FEATURES.map((feature) => ({ ...feature }));
+  return AVAILABLE_SUBSCRIPTION_FEATURES.map((feature) => ({
+    ...feature,
+    optInOnly: OPT_IN_ONLY_SUBSCRIPTION_FEATURES.includes(feature.id),
+  }));
+}
+
+/** The feature ids an absent or legacy feature list stands for: everything except opt-in-only features. */
+export function getDefaultSubscriptionFeatureIds(): SubscriptionFeatureId[] {
+  return AVAILABLE_SUBSCRIPTION_FEATURES
+    .map((feature) => feature.id)
+    .filter((id) => !OPT_IN_ONLY_SUBSCRIPTION_FEATURES.includes(id));
 }
 
 /**
@@ -401,8 +420,9 @@ export async function getAllowedFeatures(userId: string): Promise<string[]> {
   if (!config) return [];
 
   // Existing subscription rows predate feature entitlements. Preserve their
-  // behavior until an admin explicitly saves this field.
-  if (!Array.isArray(config.allowedFeatures) || config.allowedFeatures.includes("*")) {
+  // behavior until an admin explicitly saves this field, except for opt-in-only features.
+  if (!Array.isArray(config.allowedFeatures)) return getDefaultSubscriptionFeatureIds();
+  if (config.allowedFeatures.includes("*")) {
     return AVAILABLE_SUBSCRIPTION_FEATURES.map((feature) => feature.id);
   }
 
@@ -423,9 +443,8 @@ export async function isSubscriptionFeatureEnabled(
   // Interactive entry points still fail closed on null, while background jobs
   // can retry later without permanently pausing a permitted schedule.
   if (!config) return null;
-  if (!Array.isArray(config.allowedFeatures) || config.allowedFeatures.includes("*")) {
-    return true;
-  }
+  if (!Array.isArray(config.allowedFeatures)) return !OPT_IN_ONLY_SUBSCRIPTION_FEATURES.includes(feature);
+  if (config.allowedFeatures.includes("*")) return true;
 
   return config.allowedFeatures.includes(feature);
 }

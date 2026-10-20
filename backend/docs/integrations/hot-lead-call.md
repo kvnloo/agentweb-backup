@@ -279,9 +279,13 @@ An org is entitled when the tier of its billing owner (`Organization.ownerUserId
 members and admins follow the owner's plan) lists `hot_lead_call` or `*`.
 
 - A tier row with no saved feature list (rows that predate feature lists) is NOT
-  entitled, unlike the other features. The editor displays such a row with every
-  feature ticked, and saving it from the editor grants the feature. Tick it only
-  for paid tiers and re-check the Free tier after any save.
+  entitled, unlike the other features. The editor shows such a row with
+  **Hot lead calls** unticked and saving it does not add the feature; a new tier
+  also starts with it unticked. Only an explicit tick (or a saved `*`) grants it.
+  Features that cost AgentWeb money are listed in
+  `OPT_IN_ONLY_SUBSCRIPTION_FEATURES` (`services/subscriptionService.ts`); every
+  "all features" default leaves them out, and a future paid-vendor feature joins
+  that list.
 - Anything unresolvable (no owner, unreadable tier, lookup error) is not entitled.
 - Enforced in three places: `provision_hot_lead_call_number` and
   `start_hot_lead_call_verification` refuse with a plain message;
@@ -678,9 +682,9 @@ on anywhere.
    sent.
 9. Flip `hot_lead_call_mode` to `on` only after the org itself is enabled, watch
    the first real leads, keep the off command to hand (effective within ~30s).
-10. Plan entitlement: tick **Hot lead calls** only on the paid tier(s) that
-    include it (Subscription Types editor) and confirm the Free tier does not
-    have it. See [Plan entitlement](#plan-entitlement).
+10. Plan entitlement: tick **Hot lead calls** (unticked by default, with a cost
+    note) only on the paid tier(s) that include it (Subscription Types editor).
+    Tiers that saved `*` as their feature list also entitle. See [Plan entitlement](#plan-entitlement).
 11. Decide the mitigations in [Compliance and third parties](#compliance-and-third-parties)
     before general availability (CAPTCHA/honeypot, spoken disclosure before the
     bridge, name or email besides the phone, consent text).
