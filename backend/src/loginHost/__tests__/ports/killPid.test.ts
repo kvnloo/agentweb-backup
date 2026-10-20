@@ -13,10 +13,6 @@ const alive = (pid: number) => {
     return false;
   }
 };
-const waitDead = async (pid: number) => {
-  for (let i = 0; i < 40 && alive(pid); i++) await new Promise((r) => setTimeout(r, 50));
-  return !alive(pid);
-};
 
 (have ? describe : describe.skip)("nodeRootFs.killPid", () => {
   // dropping to a uid needs root (setgroups); on the instance this runs as root, on a dev machine it is skipped
