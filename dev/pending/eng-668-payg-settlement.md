@@ -24,9 +24,11 @@ Nothing written after month M ends can change M's bill:
   (`capPercentOfPool` x that moment's pool) and plan pool (tier hard threshold before credits) and the
   lowest markup any admission that month was measured against. Conditional on the list it read; written
   only when an admission changes it (first of the month, a higher cap/pool, a lower markup).
-- Settlement uses that record, never the cap setting or tier as they stand at settlement: lowering the cap
-  after the usage still bills what was admitted; raising it after the month never reaches back; a plan or
-  markup change after the month leaves the bill unchanged.
+- Settlement uses that record, never the cap setting or tier as they stand at settlement. **The cap is a
+  monthly total** (product decision): raising it during the month applies to the whole month, including
+  overrun admitted earlier in it; lowering it after the usage still bills what was admitted; no change
+  after the month (cap, plan, markup) reaches back. The consent copy must say so ("Your limit applies to
+  the whole month").
 - Overage = `paygNetOverageMicroUsd` (extracted from the gate's `measurePaygOverage`, which now calls it)
   over the gate's pipeline (`applyLlmUsageCredits` -> `paygOverageThresholdMicroUsd`) on the month's own
   plan pool, credits, pool mark and opt-in. Spend = settled AW-SpendEvents for the month, reconciled with
@@ -42,10 +44,13 @@ opt-in AND only if PAYG has not admitted anything in that month. Once it has, th
 `nothing_to_bill` (no_overage); under Stripe's 50c minimum -> `nothing_to_bill` (below_minimum). `held`
 (no charge, one on-call alert, `Alert Class: payg-settlement-held`) for: spend drift or real spend with no
 projection; an owner the gate measured on the legacy counter; no valid markup recorded for the month;
-unmeasurable state; no live Stripe customer; Stripe's total not the recorded amount. The alert says what to
-do: with an invoice id on the record, **never** remove the record (check the invoice in Stripe; void it
-there if it must not be collected); with none, nothing was collected — fix the cause, then remove
-`paygSettlements.<month>` and the next run settles it again.
+unmeasurable state; no live Stripe customer; Stripe's total not the recorded amount (a customer discount
+or coupon — a credit balance lowers `amount_due`, not the total); or the invoice the record names is void,
+deleted or unknown to Stripe (recorded as `uncollectedInvoice`, never invoiced over automatically — e.g. a
+draft deleted on a mismatch whose hold write was lost). The alert says what to do: with an invoice id on
+the record, **never** remove the record (check the invoice in Stripe; void it there if it must not be
+collected); with none, nothing was collected — fix the cause, then remove `paygSettlements.<month>` and
+the next run settles it again. One owner-month's failure is logged and counted, never stops the sweep.
 
 **Idempotency.** `paygSettlements[M]` is written with `attribute_not_exists` BEFORE any Stripe call
 (`pending`, amount fixed); only `pending` is ever resumed, with the stored amount. With no invoice id on
@@ -63,8 +68,10 @@ invoice's `default_payment_method`. Records older than 12 months are pruned in t
 invoice to `paygSettlementService` before touching anything, so an overage invoice never writes
 `subscription_status`, `subscription_amount`, period or offer fields. Paid -> `paid`. Failed -> `failed`,
 `paygOverage.suspended = {reason:'payment_failed', at, invoiceId}` (PR-1's gate refuses while set), one
-owner email. **The payment-failure suspension lasts while ANY month is `failed`**: a paid webhook lifts it
-only if no other month is failed (re-checked in the write's condition); a dispute suspension is never
+owner email. **The payment-failure suspension lasts while ANY month is `failed`**: every failure re-stamps
+`suspended` (`at` and `invoiceId` of the latest failure; never over a dispute), and a paid webhook lifts it
+only if its read saw no other failed month AND `suspended` is still exactly the value it read — so a month
+that fails after the read (even one created after it) keeps the suspension. A dispute suspension is never
 lifted automatically. A `held` record that carries the invoice's id is moved to paid/failed too. Dispute on
 an overage charge -> `suspended = dispute`. Refund -> `refundedCents`, PAYG not resumed. Refund/dispute
 recognition (Basil: PaymentIntent -> `invoicePayments.list` -> invoice metadata) runs only while the switch
@@ -79,7 +86,7 @@ is on and is best-effort: a failed lookup is logged and the charge is handled as
   the settings opt-in also keeps it) and `paygOverage.optInClosed` (the month's first opt-in).
 - `paygOverage.admittedMonths` (above) and `paygSettlements` (AW-Users, by month): `{status,
   idempotencyKey, overageCostMicroUsd, billedMicroUsd, amountCents, markupBps, percentOfCap,
-  settledMicroUsd, projectedMicroUsd, createdAt, updatedAt, invoiceId?, deletedDraftInvoiceId?,
+  settledMicroUsd, projectedMicroUsd, createdAt, updatedAt, invoiceId?, uncollectedInvoice?,
   heldReason?, nothingToBillReason?, invoicedAt?, paidAt?, failedAt?, refundedCents?, dispute?}`.
 `sanitizeUserForResponse` drops `paygSettlements` and `llmUsageCreditsClosed`.
 
@@ -98,4 +105,7 @@ last instant of a month while another rolls it over; a higher mark lost to a mon
 saved at the next check; `paymentMethodId` can be a non-card default; `mrrCollectionGapService` counts
 paid overage invoices as "has ever paid"; `charge.dispute.closed` is not handled for overage charges; a
 refund of a closed month's top-up after the month ends is not reflected in `llmUsageCreditsClosed`
-(billed less, never more).
+(billed less, never more); `capHighWaterMicroUsd` includes revocable top-up credit in the pool it is a
+percentage of (the pool mark excludes it — within the consent given at the time); the gate records the
+admission month with `getCurrentUsageMonth()` while its caller's billing month comes from
+`getCurrentMonth()` (identical on the UTC fleet; pre-existing).
