@@ -21,7 +21,7 @@ import { FakeLimitStore } from './fakeLimitStore';
 import { setLimitStoreForTests } from '../../services/voice/limitStore';
 import { FakeCrm, crmHolder } from './hotLeadCallFakeCrm';
 import { SignedFakeVoiceProvider, TwilioCaller, attrOf } from './hotLeadCallTwilioSim';
-import { teamMember } from './hotLeadCallFixtures';
+import { flush, teamMember } from './hotLeadCallFixtures';
 
 export const mock = (fn: unknown) => fn as jest.Mock;
 export const BASE = 'https://api.example.test';
@@ -104,11 +104,7 @@ export function installWorld(): void {
 
 // ── clock and lead helpers ──────────────────────────────────────────────────
 
-/** Lets work started without being awaited (the next-attempt job the webhook queues) run to its end. */
-export const flush = async () => {
-  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
-  await jest.advanceTimersByTimeAsync(0);
-};
+export { flush };
 export const setClock = (iso: string) => jest.setSystemTime(new Date(iso));
 export const advanceMinutes = (n: number) => jest.setSystemTime(Date.now() + n * MINUTE_MS);
 /** Distinct valid lead phones, one per n. */

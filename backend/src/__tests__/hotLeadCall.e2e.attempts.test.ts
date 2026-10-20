@@ -23,17 +23,11 @@ import { sayText } from './helpers/hotLeadCallTwilioSim';
 import {
   LEAD_E164, LIST, advanceMinutes, eventsOf, flush, installWorld, mock, nthCall, placedCall, recordOf, setClock, skipReason, submitLead, usageSummary, world,
 } from './helpers/hotLeadCallE2eWorld';
-import { EVERY_DAY, VERIFIED_AT } from './helpers/hotLeadCallFixtures';
-import type { HotLeadCallMember } from '../services/hotLeadCallConfig';
+import { REFERENCE_ID as ID, REFERENCE_PHONE as PHONE, referenceMember, referenceTeam } from './helpers/hotLeadCallFixtures';
 
 installWorld();
 
-const PHONE = { a: '+14155550101', b: '+14155550102', c: '+14155550103', d: '+14155550104', e: '+14155550105' };
-const ID = { a: 'maaaaaaa', b: 'mbbbbbbb', c: 'mccccccc', d: 'mddddddd', e: 'meeeeeee' };
-const member = (key: keyof typeof ID, start: string, end: string): HotLeadCallMember => ({
-  id: ID[key], name: `Member ${key.toUpperCase()}`, phone: PHONE[key], verifiedAt: VERIFIED_AT, windows: [{ ...EVERY_DAY, start, end }],
-});
-const TEAM = [member('a', '09:00', '12:00'), member('b', '12:15', '15:00'), member('c', '15:00', '18:00'), member('d', '14:00', '19:00')];
+const TEAM = referenceTeam();
 
 /** Replaces the org's hot-lead settings over the world's default; the team is the reference one unless given. */
 function configure(over: Record<string, unknown> = {}): void {
@@ -128,7 +122,7 @@ describe('a member who does not take the lead hands over to the next one', () =>
     await call.leadStatus('completed', 3, { CallDuration: '120' });
     await call.memberLegEnds('completed', '150');
 
-    // Finished with a real outcome (the empty string the reset left is not one).
+    // Finished with the call's own outcome, not the member outcome of attempt 1.
     expect(record()).toMatchObject({ state: 'finished', outcome: 'completed', attemptNo: 2, memberId: ID.d });
     expect([...(record().meteredLegs as string[])].sort()).toEqual(['lead', 'member:1', 'member:2']);
     expect(eventsOf('lead-a')).toEqual([
@@ -161,8 +155,7 @@ describe('a member who does not take the lead hands over to the next one', () =>
     expect([...(record().meteredLegs as string[])].sort()).toEqual(['member:1', 'member:2']);
   });
 
-  it('presses 2 is a decline too, and the bound is maxAttemptsPerLead: with two attempts allowed a third member is never rung', async () => {
-    configure({ maxAttemptsPerLead: 2, team: [...TEAM, { ...member('e', '09:00', '19:00') }] });
+  it('a member who presses 2 has declined: that attempt ends and the next member is rung', async () => {
     setClock(chicago('16:00'));
     await submitLead('lead-a');
     const first = nthCall(1);
@@ -170,6 +163,17 @@ describe('a member who does not take the lead hands over to the next one', () =>
     expect((await first.memberPresses('2')).body).toContain('<Hangup/>');
     await first.memberLegEnds('completed', '9');
     await flush();
+
+    expect(rungPhones()).toEqual([PHONE.c, PHONE.d]);
+    expect(record()).toMatchObject({ state: 'member_ringing', attemptNo: 2, memberId: ID.d });
+    expect(eventsOf('lead-a')).toEqual(['call.initiated', 'call.member_answered', 'call.member_declined', 'call.initiated']);
+  });
+
+  it('the bound is maxAttemptsPerLead: with two attempts allowed a third member is never rung', async () => {
+    configure({ maxAttemptsPerLead: 2, team: [...TEAM, referenceMember('e', '09:00', '19:00')] });
+    setClock(chicago('16:00'));
+    await submitLead('lead-a');
+    await noAnswer(1);
     await noAnswer(2);
 
     expect(rungPhones()).toEqual([PHONE.c, PHONE.d]); // E was available the whole time
@@ -183,7 +187,6 @@ describe('a member who does not take the lead hands over to the next one', () =>
     await noAnswer(1);
     await noAnswer(2);
     expect(rungPhones()).toEqual([PHONE.c, PHONE.d]);
-    expect(rungPhones().filter((p) => p === PHONE.c)).toHaveLength(1);
   });
 });
 
@@ -348,6 +351,7 @@ describe('the world changes between two attempts', () => {
   });
 
   it('the lead has waited past maxAgeMinutes: no second call', async () => {
+    configure({ maxAgeMinutes: 10 });
     setClock(chicago('16:00'));
     await submitLead('lead-a');
     advanceMinutes(11);
@@ -368,7 +372,7 @@ describe('the world changes between two attempts', () => {
   });
 
   it('a placement Twilio rejects for the second member falls through to the third, and every attempt is on the record', async () => {
-    configure({ team: [TEAM[2], TEAM[3], member('e', '09:00', '19:00')] });
+    configure({ team: [TEAM[2], TEAM[3], referenceMember('e', '09:00', '19:00')] });
     setClock(chicago('16:00'));
     await submitLead('lead-a');
     world.provider.failNextPlaceCall('no'); // D is rejected

@@ -27,7 +27,7 @@ import { FakeLimitStore } from './helpers/fakeLimitStore';
 import { setLimitStoreForTests } from '../services/voice/limitStore';
 import { cooldownKey } from '../services/voice/hotLeadCallLimits';
 import { FakeLeadCallStore } from './helpers/fakeLeadCallStore';
-import { teamMember } from './helpers/hotLeadCallFixtures';
+import { REFERENCE_ID as ID, REFERENCE_PHONE as PHONE, flush, referenceMember, referenceTeam } from './helpers/hotLeadCallFixtures';
 import type { HotLeadCallRecord } from '../services/voice/leadCallStore.types';
 
 const mock = (fn: unknown) => fn as jest.Mock;
@@ -35,13 +35,6 @@ const LEAD_PHONE = '(212) 555-0142';
 // 16:00 CDT, in the middle of the afternoon on a Monday.
 const NOW = '2026-10-19T21:00:00.000Z';
 const at = (hhmmCdt: string) => new Date(Date.parse(`2026-10-19T${hhmmCdt}:00-05:00`));
-
-const day = (start: string, end: string) => ({ days: [0, 1, 2, 3, 4, 5, 6], start, end });
-const phones = { A: '+14155550101', B: '+14155550102', C: '+14155550103', D: '+14155550104', E: '+14155550105' } as const;
-const ids = { A: 'maaaaaaa', B: 'mbbbbbbb', C: 'mccccccc', D: 'mddddddd', E: 'meeeeeee' } as const;
-const member = (k: keyof typeof ids, start: string, end: string) => teamMember(phones[k], { id: ids[k], name: `Member ${k}`, windows: [day(start, end)] });
-// The reference team: priority order A, B, C, D.
-const referenceTeam = () => [member('A', '09:00', '12:00'), member('B', '12:15', '15:00'), member('C', '15:00', '18:00'), member('D', '14:00', '19:00')];
 
 const baseConfig = {
   enabled: true, team: referenceTeam(), twilioNumber: '+14155550111', announcedName: 'Acme Plumbing',
@@ -56,7 +49,6 @@ let lead: Record<string, unknown>;
 const jobOf = () => ({ orgId: 'org-a', listId: 'list-a', leadId: 'lead-a', origin: 'form_fill' as const });
 const useConfig = (over: Record<string, unknown>) => { org.hotLeadCall = { ...baseConfig, ...over }; };
 const placedTo = () => provider.placedCalls.map(c => c.to);
-const flush = async () => { await jest.advanceTimersByTimeAsync(0); for (let i = 0; i < 10; i++) await Promise.resolve(); };
 
 /** Dispatches the first attempt, then ends it the way the status webhook does: metered, parked between attempts. */
 async function firstAttemptEnds(outcome = 'member_no_answer'): Promise<HotLeadCallRecord> {
@@ -122,16 +114,16 @@ afterEach(() => {
 describe('the reference team at 16:00', () => {
   it('rings C first, then D as the fallback, and never the same person twice', async () => {
     await firstAttemptEnds();
-    expect(placedTo()).toEqual([phones.C]);
-    expect(store.record).toMatchObject({ attemptNo: 1, memberId: ids.C, triedMemberIds: [ids.C] });
+    expect(placedTo()).toEqual([PHONE.c]);
+    expect(store.record).toMatchObject({ attemptNo: 1, memberId: ID.c, triedMemberIds: [ID.c] });
 
     await processHotLeadCallNextAttempt(nextJob());
-    expect(placedTo()).toEqual([phones.C, phones.D]);
+    expect(placedTo()).toEqual([PHONE.c, PHONE.d]);
     expect(store.record).toMatchObject({
-      state: 'member_ringing', attemptNo: 2, memberId: ids.D, triedMemberIds: [ids.C, ids.D], memberCallSid: 'CA00000002',
+      state: 'member_ringing', attemptNo: 2, memberId: ID.d, triedMemberIds: [ID.c, ID.d], memberCallSid: 'CA00000002',
     });
     expect(store.record).not.toHaveProperty('outcome');
-    expect(store.events.at(-1)).toEqual({ type: 'call.initiated', detail: { attempt: 2, memberId: ids.D } });
+    expect(store.events.at(-1)).toEqual({ type: 'call.initiated', detail: { attempt: 2, memberId: ID.d } });
 
     // Everyone has now been tried: the third attempt has nobody left.
     await endCurrentAttempt('member_declined');
@@ -163,13 +155,13 @@ describe('the reference team at 16:00', () => {
 
 describe('attempt 3', () => {
   it('rings a third member after a second no-answer and stops at maxAttemptsPerLead', async () => {
-    useConfig({ team: [member('C', '15:00', '18:00'), member('D', '14:00', '19:00'), member('E', '15:30', '17:00')] });
+    useConfig({ team: [referenceMember('c', '15:00', '18:00'), referenceMember('d', '14:00', '19:00'), referenceMember('e', '15:30', '17:00')] });
     await firstAttemptEnds();
     await processHotLeadCallNextAttempt(nextJob());
     await endCurrentAttempt();
     await processHotLeadCallNextAttempt(nextJob());
-    expect(placedTo()).toEqual([phones.C, phones.D, phones.E]);
-    expect(store.record).toMatchObject({ attemptNo: 3, memberId: ids.E, triedMemberIds: [ids.C, ids.D, ids.E] });
+    expect(placedTo()).toEqual([PHONE.c, PHONE.d, PHONE.e]);
+    expect(store.record).toMatchObject({ attemptNo: 3, memberId: ID.e, triedMemberIds: [ID.c, ID.d, ID.e] });
     await endCurrentAttempt();
     expect(await requestNextHotLeadCallAttempt({ listId: 'list-a', leadId: 'lead-a', record: store.record! })).toEqual({ enqueued: false, reason: 'max_attempts' });
   });
@@ -192,7 +184,7 @@ describe('requestNextHotLeadCallAttempt', () => {
     await firstAttemptEnds();
     await request();
     await flush();
-    expect(placedTo()).toEqual([phones.C, phones.D]);
+    expect(placedTo()).toEqual([PHONE.c, PHONE.d]);
     expect(queue.markJobComplete).toHaveBeenCalledWith('hot_lead_call_next', expect.any(String));
   });
 
@@ -206,7 +198,7 @@ describe('requestNextHotLeadCallAttempt', () => {
     await flush();
     expect(mock(queue.enqueueJob).mock.calls[0][1]).toBe(mock(queue.enqueueJob).mock.calls[1][1]);
     expect(queue.startHeartbeat).toHaveBeenCalledTimes(1);
-    expect(placedTo()).toEqual([phones.C, phones.D]);
+    expect(placedTo()).toEqual([PHONE.c, PHONE.d]);
   });
 
   it('never throws: a queue that is down is a refusal, not an error', async () => {
@@ -269,7 +261,7 @@ describe('requestNextHotLeadCallAttempt', () => {
       await refused('too_old');
     });
     it('everyone available has been tried', async () => {
-      useConfig({ team: [member('C', '15:00', '18:00')] });
+      useConfig({ team: [referenceMember('c', '15:00', '18:00')] });
       await firstAttemptEnds();
       await refused('no_candidates');
     });
@@ -353,33 +345,33 @@ describe('processHotLeadCallNextAttempt', () => {
 
   it('computes who is available when it runs, not when it was asked', async () => {
     // At 16:00 only C and D are available; E opens at 16:30 and D is already tried.
-    useConfig({ team: [member('C', '15:00', '18:00'), member('E', '16:30', '18:00')] });
+    useConfig({ team: [referenceMember('c', '15:00', '18:00'), referenceMember('e', '16:30', '18:00')] });
     const record = await firstAttemptEnds();
     expect(await requestNextHotLeadCallAttempt({ listId: 'list-a', leadId: 'lead-a', record })).toEqual({ enqueued: false, reason: 'no_candidates' });
     jest.setSystemTime(at('16:30'));
     await processHotLeadCallNextAttempt(nextJob(record));
-    expect(placedTo()).toEqual([phones.C, phones.E]);
+    expect(placedTo()).toEqual([PHONE.c, PHONE.e]);
   });
 
   it('skips a member who is in cooldown and rings the next one', async () => {
-    useConfig({ team: [member('C', '15:00', '18:00'), member('D', '14:00', '19:00'), member('E', '15:00', '18:00')] });
+    useConfig({ team: [referenceMember('c', '15:00', '18:00'), referenceMember('d', '14:00', '19:00'), referenceMember('e', '15:00', '18:00')] });
     const record = await firstAttemptEnds();
-    await limits.claim(cooldownKey('org-a', ids.D), 'busy', Math.floor(Date.now() / 1000) + 120, Math.floor(Date.now() / 1000));
+    await limits.claim(cooldownKey('org-a', ID.d), 'busy', Math.floor(Date.now() / 1000) + 120, Math.floor(Date.now() / 1000));
     await processHotLeadCallNextAttempt(nextJob(record));
-    expect(placedTo()).toEqual([phones.C, phones.E]);
-    expect(store.record).toMatchObject({ memberId: ids.E, triedMemberIds: [ids.C, ids.E] });
+    expect(placedTo()).toEqual([PHONE.c, PHONE.e]);
+    expect(store.record).toMatchObject({ memberId: ID.e, triedMemberIds: [ID.c, ID.e] });
   });
 
   it('claims the next member\'s cooldown, so a second lead cannot ring them at the same moment', async () => {
     const record = await firstAttemptEnds();
     await processHotLeadCallNextAttempt(nextJob(record));
-    expect(limits.claims.has(cooldownKey('org-a', ids.D))).toBe(true);
+    expect(limits.claims.has(cooldownKey('org-a', ID.d))).toBe(true);
   });
 
   it('closes the record as no_member_available when every remaining candidate is in cooldown', async () => {
     const record = await firstAttemptEnds();
     const nowS = Math.floor(Date.now() / 1000);
-    await limits.claim(cooldownKey('org-a', ids.D), 'busy', nowS + 120, nowS);
+    await limits.claim(cooldownKey('org-a', ID.d), 'busy', nowS + 120, nowS);
     await processHotLeadCallNextAttempt(nextJob(record));
     expect(provider.placedCalls).toHaveLength(1);
     expect(store.record).toMatchObject({ state: 'finished', outcome: 'no_member_available' });
@@ -391,17 +383,17 @@ describe('processHotLeadCallNextAttempt', () => {
     await processHotLeadCallNextAttempt(nextJob(record));
     await processHotLeadCallNextAttempt(nextJob(record));
     await processHotLeadCallNextAttempt({ ...nextJob(record), attemptNo: 2 });
-    expect(placedTo()).toEqual([phones.C, phones.D]);
+    expect(placedTo()).toEqual([PHONE.c, PHONE.d]);
   });
 
   it('ignores a stale job for an earlier attempt while the record waits after a later one', async () => {
-    useConfig({ team: [member('C', '15:00', '18:00'), member('D', '14:00', '19:00'), member('E', '15:00', '18:00')] });
+    useConfig({ team: [referenceMember('c', '15:00', '18:00'), referenceMember('d', '14:00', '19:00'), referenceMember('e', '15:00', '18:00')] });
     const first = structuredClone(await firstAttemptEnds());
     await processHotLeadCallNextAttempt(nextJob(first));
     await endCurrentAttempt();
     expect(store.record).toMatchObject({ state: 'between_attempts', attemptNo: 2 });
     await processHotLeadCallNextAttempt(nextJob(first)); // the job for attempt 1, replayed late
-    expect(placedTo()).toEqual([phones.C, phones.D]);
+    expect(placedTo()).toEqual([PHONE.c, PHONE.d]);
     expect(store.record).toMatchObject({ state: 'between_attempts', attemptNo: 2 });
   });
 
@@ -420,11 +412,11 @@ describe('processHotLeadCallNextAttempt', () => {
   });
 
   it('places exactly one call when two workers run the same job at once, and leaks no cooldown', async () => {
-    useConfig({ team: [member('C', '15:00', '18:00'), member('D', '14:00', '19:00'), member('E', '15:00', '18:00')] });
+    useConfig({ team: [referenceMember('c', '15:00', '18:00'), referenceMember('d', '14:00', '19:00'), referenceMember('e', '15:00', '18:00')] });
     const record = await firstAttemptEnds();
     await Promise.all([processHotLeadCallNextAttempt(nextJob(record)), processHotLeadCallNextAttempt(nextJob(record))]);
     expect(provider.placedCalls).toHaveLength(2); // the first attempt's and exactly one more
-    expect(store.record).toMatchObject({ attemptNo: 2, triedMemberIds: expect.arrayContaining([ids.C]) });
+    expect(store.record).toMatchObject({ attemptNo: 2, triedMemberIds: expect.arrayContaining([ID.c]) });
     expect(store.record!.triedMemberIds).toHaveLength(2);
     const held = [...limits.claims.keys()].filter(k => k.startsWith('hlc#cool#'));
     expect(held).toHaveLength(2); // C from the first attempt and the one member actually rung
@@ -432,24 +424,24 @@ describe('processHotLeadCallNextAttempt', () => {
 
   describe('when Twilio refuses or fails the call', () => {
     it('moves on to the next member in the same job after a definite rejection', async () => {
-      useConfig({ team: [member('C', '15:00', '18:00'), member('D', '14:00', '19:00'), member('E', '15:00', '18:00')], maxAttemptsPerLead: 4 });
+      useConfig({ team: [referenceMember('c', '15:00', '18:00'), referenceMember('d', '14:00', '19:00'), referenceMember('e', '15:00', '18:00')], maxAttemptsPerLead: 4 });
       const record = await firstAttemptEnds();
       provider.failNextPlaceCall('no');
       await processHotLeadCallNextAttempt(nextJob(record));
-      expect(placedTo()).toEqual([phones.C, phones.D, phones.E]);
-      expect(store.record).toMatchObject({ state: 'member_ringing', attemptNo: 3, memberId: ids.E, triedMemberIds: [ids.C, ids.D, ids.E] });
+      expect(placedTo()).toEqual([PHONE.c, PHONE.d, PHONE.e]);
+      expect(store.record).toMatchObject({ state: 'member_ringing', attemptNo: 3, memberId: ID.e, triedMemberIds: [ID.c, ID.d, ID.e] });
       expect(store.events.slice(-2)).toEqual([
-        { type: 'call.failed', detail: { reason: 'place_rejected', attempt: 2, memberId: ids.D } },
-        { type: 'call.initiated', detail: { attempt: 3, memberId: ids.E } },
+        { type: 'call.failed', detail: { reason: 'place_rejected', attempt: 2, memberId: ID.d } },
+        { type: 'call.initiated', detail: { attempt: 3, memberId: ID.e } },
       ]);
     });
 
     it('stops at maxAttemptsPerLead even when candidates remain, and the record fails as place_rejected', async () => {
-      useConfig({ team: [member('C', '15:00', '18:00'), member('D', '14:00', '19:00'), member('E', '15:00', '18:00')], maxAttemptsPerLead: 2 });
+      useConfig({ team: [referenceMember('c', '15:00', '18:00'), referenceMember('d', '14:00', '19:00'), referenceMember('e', '15:00', '18:00')], maxAttemptsPerLead: 2 });
       const record = await firstAttemptEnds();
       provider.failNextPlaceCall('no');
       await processHotLeadCallNextAttempt(nextJob(record));
-      expect(placedTo()).toEqual([phones.C, phones.D]);
+      expect(placedTo()).toEqual([PHONE.c, PHONE.d]);
       expect(store.record).toMatchObject({ state: 'failed', outcome: 'place_rejected' });
     });
 
@@ -464,14 +456,14 @@ describe('processHotLeadCallNextAttempt', () => {
       ['an unknown placement failure', () => provider.failNextPlaceCall('unknown')],
       ['a non-Voice error', () => { provider.placeCall = async (p) => { provider.placedCalls.push(p); throw new TypeError('socket hang up'); }; }],
     ])('keeps the record in dialing as placement_unknown and never places another call after %s', async (_name, arrange) => {
-      useConfig({ team: [member('C', '15:00', '18:00'), member('D', '14:00', '19:00'), member('E', '15:00', '18:00')] });
+      useConfig({ team: [referenceMember('c', '15:00', '18:00'), referenceMember('d', '14:00', '19:00'), referenceMember('e', '15:00', '18:00')] });
       const record = await firstAttemptEnds();
       const dialedBefore = provider.placedCalls.length;
       arrange();
       await processHotLeadCallNextAttempt(nextJob(record));
       expect(provider.placedCalls).toHaveLength(dialedBefore + 1);
-      expect(store.record).toMatchObject({ state: 'dialing', attemptNo: 2, memberId: ids.D, outcome: 'placement_unknown' });
-      expect(store.events.at(-1)).toEqual({ type: 'call.failed', detail: { reason: 'placement_unknown', attempt: 2, memberId: ids.D } });
+      expect(store.record).toMatchObject({ state: 'dialing', attemptNo: 2, memberId: ID.d, outcome: 'placement_unknown' });
+      expect(store.events.at(-1)).toEqual({ type: 'call.failed', detail: { reason: 'placement_unknown', attempt: 2, memberId: ID.d } });
       await processHotLeadCallNextAttempt(nextJob(record));
       expect(provider.placedCalls).toHaveLength(dialedBefore + 1);
     });
@@ -491,8 +483,8 @@ describe('the first attempt walks the team the same way', () => {
   it('moves on to the next member after a definite rejection and counts it as an attempt', async () => {
     provider.failNextPlaceCall('no');
     await processHotLeadCallJob(jobOf());
-    expect(placedTo()).toEqual([phones.C, phones.D]);
-    expect(store.record).toMatchObject({ state: 'member_ringing', attemptNo: 2, memberId: ids.D, triedMemberIds: [ids.C, ids.D] });
+    expect(placedTo()).toEqual([PHONE.c, PHONE.d]);
+    expect(store.record).toMatchObject({ state: 'member_ringing', attemptNo: 2, memberId: ID.d, triedMemberIds: [ID.c, ID.d] });
     expect(store.eventTypes()).toEqual(['call.failed', 'call.initiated']);
   });
 
@@ -500,7 +492,7 @@ describe('the first attempt walks the team the same way', () => {
     provider.failNextPlaceCall('no');
     provider.failNextPlaceCall('no');
     await processHotLeadCallJob(jobOf());
-    expect(placedTo()).toEqual([phones.C, phones.D]);
+    expect(placedTo()).toEqual([PHONE.c, PHONE.d]);
     expect(store.record).toMatchObject({ state: 'failed', outcome: 'place_rejected', attemptNo: 2 });
     expect(store.eventTypes()).toEqual(['call.failed', 'call.failed']);
   });
@@ -509,16 +501,16 @@ describe('the first attempt walks the team the same way', () => {
     useConfig({ maxAttemptsPerLead: 1 });
     provider.failNextPlaceCall('no');
     await processHotLeadCallJob(jobOf());
-    expect(placedTo()).toEqual([phones.C]);
+    expect(placedTo()).toEqual([PHONE.c]);
     expect(store.record).toMatchObject({ state: 'failed', outcome: 'place_rejected' });
   });
 
   it('passes over a member in cooldown to the next candidate, with no record for a lead nobody can take', async () => {
     const nowS = Math.floor(Date.now() / 1000);
-    await limits.claim(cooldownKey('org-a', ids.C), 'busy', nowS + 120, nowS);
+    await limits.claim(cooldownKey('org-a', ID.c), 'busy', nowS + 120, nowS);
     await processHotLeadCallJob(jobOf());
-    expect(placedTo()).toEqual([phones.D]);
-    expect(store.record).toMatchObject({ memberId: ids.D, triedMemberIds: [ids.D] });
+    expect(placedTo()).toEqual([PHONE.d]);
+    expect(store.record).toMatchObject({ memberId: ID.d, triedMemberIds: [ID.d] });
   });
 });
 

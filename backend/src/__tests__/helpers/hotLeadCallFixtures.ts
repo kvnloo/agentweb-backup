@@ -19,3 +19,24 @@ export function callRecord(over: Partial<HotLeadCallRecord> = {}): HotLeadCallRe
     ...over,
   };
 }
+
+/** The five people of the reference scenarios (a-e), with fake numbers and ids. */
+export const REFERENCE_PHONE = { a: '+14155550101', b: '+14155550102', c: '+14155550103', d: '+14155550104', e: '+14155550105' } as const;
+export const REFERENCE_ID = { a: 'maaaaaaa', b: 'mbbbbbbb', c: 'mccccccc', d: 'mddddddd', e: 'meeeeeee' } as const;
+type ReferenceKey = keyof typeof REFERENCE_ID;
+
+/** A verified person on duty every day between `start` and `end`. */
+export const referenceMember = (key: ReferenceKey, start: string, end: string): HotLeadCallMember => ({
+  id: REFERENCE_ID[key], name: `Member ${key.toUpperCase()}`, phone: REFERENCE_PHONE[key], verifiedAt: VERIFIED_AT, windows: [{ ...EVERY_DAY, start, end }],
+});
+
+/** Priority order a, b, c, d: A 09:00-12:00, B 12:15-15:00, C 15:00-18:00, D 14:00-19:00. */
+export const referenceTeam = (): HotLeadCallMember[] => [
+  referenceMember('a', '09:00', '12:00'), referenceMember('b', '12:15', '15:00'), referenceMember('c', '15:00', '18:00'), referenceMember('d', '14:00', '19:00'),
+];
+
+/** Lets work started without being awaited (a queued job, a next-attempt request) run to its end. Needs fake timers that leave setImmediate real. */
+export const flush = async (): Promise<void> => {
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+  await jest.advanceTimersByTimeAsync(0);
+};
