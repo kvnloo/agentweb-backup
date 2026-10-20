@@ -1101,6 +1101,35 @@ createTestAccount().then(async () => {
         console.error('[orgSeatCreditGrantCron] Failed to initialize:', error);
       }
 
+      // ENG-668 PR-2 — month-end pay-as-you-go settlement. Dark behind the AW-Settings switch
+      // `payg_settlement_enabled` (exact 'true'); off = the sweep returns without reading anything.
+      // Same fixed-UTC-hour anchoring as the seat-credit sweep above, and after it, so the closed
+      // month's credit ledger has already been kept as `llmUsageCreditsClosed` when it runs. Every
+      // month's settlement record makes an extra fire a no-op.
+      try {
+        const { runPaygSettlement } = await import('./cron/paygSettlementCron');
+        const { msUntilNextUtcHour } = await import('./utils/dailySchedule');
+        const PAYG_SETTLEMENT_HOUR_UTC = 12;
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const msUntilFirstPaygSettlementRun = msUntilNextUtcHour(PAYG_SETTLEMENT_HOUR_UTC);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('paygSettlementCron', runPaygSettlement())
+            .catch(e => console.error('[paygSettlementCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('paygSettlementCron', runPaygSettlement())
+              .catch(e => console.error('[paygSettlementCron] Error:', e));
+          }, DAY_MS);
+        }, msUntilFirstPaygSettlementRun);
+        console.log(
+          `[paygSettlementCron] Initialized — first run at ${PAYG_SETTLEMENT_HOUR_UTC}:00 UTC ` +
+          `(in ${Math.round(msUntilFirstPaygSettlementRun / 60000)} min)`,
+        );
+      } catch (error) {
+        console.error('[paygSettlementCron] Failed to initialize:', error);
+      }
+
       // Pre-Renewal Ad-Integration Health Check (ENG-1270) — runs daily.
       // Charging a customer while their ad platform connection is silently dead
       // is a trust break (ThinkingAI, TransAmerica — Aug 2026 audit, both caught

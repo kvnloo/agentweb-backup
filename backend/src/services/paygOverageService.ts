@@ -15,6 +15,7 @@ import { getCurrentUsageMonth, getRevocablePurchasedCreditMicroUsd } from './llm
 import {
   createPaygOverageSwitch,
   isPaygCapPercent,
+  PAYG_SETTLEMENT_SETTING,
   paygGrossOverageMicroUsd,
   paygOverageThresholdMicroUsd,
   type PaygCapPercent,
@@ -28,6 +29,13 @@ export const paygOverageSwitch = createPaygOverageSwitch({
   now: () => Date.now(),
   log: (message, fields) => console.error(message, fields),
 });
+
+/** Month-end settlement's own switch (`paygSettlementService.ts`): off = the settlement cron does nothing. */
+export const paygSettlementSwitch = createPaygOverageSwitch({
+  getSetting: (name) => settingsService.getSetting(name),
+  now: () => Date.now(),
+  log: (message, fields) => console.error(message, fields),
+}, PAYG_SETTLEMENT_SETTING);
 
 /** A refusal the route maps straight to `status` + `{ error: code }`. */
 export class PaygOverageRequestError extends Error {
@@ -220,6 +228,10 @@ export async function updatePaygOverage(input: {
 
   let optIn: PaygOverageSettings['optIn'] | undefined;
   let poolHighWater: PaygOverageSettings['poolHighWater'] | undefined;
+  // The previous month's opt-in / mark these replace: settlement of that month runs after it closes and
+  // still needs them (see `optInClosed`).
+  let optInClosed: PaygOverageSettings['optInClosed'] | undefined;
+  let poolHighWaterClosed: PaygOverageSettings['poolHighWaterClosed'] | undefined;
   if (turningOn) {
     // Overage already standing right now is not the customer's to pay for: it accrued before they
     // agreed. Measured exactly the way the gates measure it (same pool, same high-water mark).
@@ -242,6 +254,7 @@ export async function updatePaygOverage(input: {
         overageBaselineMicroUsd: paygGrossOverageMicroUsd(usage.costUsedMicroUsd, poolMicroUsd),
         poolAtOptInMicroUsd: poolMicroUsd,
       };
+      if (existing?.optIn) optInClosed = existing.optIn;
       // Pin the month's pool at least at the opt-in pool, so a downgrade before the next check cannot
       // drop the pool under the one the baseline was measured against. Like the gate's own mark, it
       // leaves out top-up credit a refund can still revoke (llmUsagePoolDecision.ts).
@@ -252,6 +265,7 @@ export async function updatePaygOverage(input: {
       );
       if (existing?.poolHighWater?.month !== month || existing.poolHighWater.thresholdMicroUsd < markMicroUsd) {
         poolHighWater = { month, thresholdMicroUsd: markMicroUsd };
+        if (existing?.poolHighWater && existing.poolHighWater.month !== month) poolHighWaterClosed = existing.poolHighWater;
       }
     }
     await requireLivePaymentMethod(context.billingUser, context.billingUserId);
@@ -283,6 +297,8 @@ export async function updatePaygOverage(input: {
         ...(capPercentOfPool !== null ? { capPercentOfPool } : {}),
         ...(optIn ? { optIn } : {}),
         ...(poolHighWater ? { poolHighWater } : {}),
+        ...(optInClosed ? { optInClosed } : {}),
+        ...(poolHighWaterClosed ? { poolHighWaterClosed } : {}),
         updatedBy: input.actorId,
         updatedAt: now,
         version: nextVersion,
@@ -293,7 +309,20 @@ export async function updatePaygOverage(input: {
           : 'attribute_exists(#payg) AND attribute_not_exists(#payg.#version)',
       ];
       const values: Record<string, unknown> = Number.isInteger(existing.version) ? { ':expectedVersion': existing.version } : {};
-      if (poolHighWater) {
+      if (poolHighWaterClosed) {
+        // Rolling last month's mark over. Nothing raises a month's mark once the month has ended, so the
+        // closed copy is right whether the stored mark is still that one or the gate rolled it over a
+        // moment ago (this request's own usage read above does exactly that) — but, as below, never
+        // over a mark the gate has since raised higher for this month.
+        conditions.push(
+          '((#payg.#hw.#hwMonth = :prevHwMonth AND #payg.#hw.#hwThreshold = :prevHwThreshold)'
+            + ' OR (#payg.#hw.#hwMonth = :hwMonth AND #payg.#hw.#hwThreshold <= :hwThreshold))',
+        );
+        values[':prevHwMonth'] = poolHighWaterClosed.month;
+        values[':prevHwThreshold'] = poolHighWaterClosed.thresholdMicroUsd;
+        values[':hwMonth'] = poolHighWater!.month;
+        values[':hwThreshold'] = poolHighWater!.thresholdMicroUsd;
+      } else if (poolHighWater) {
         // The gate raises the mark without bumping the version; never lower one it raised meanwhile.
         conditions.push('(attribute_not_exists(#payg.#hw) OR #payg.#hw.#hwMonth <> :hwMonth OR #payg.#hw.#hwThreshold <= :hwThreshold)');
         values[':hwMonth'] = poolHighWater.month;

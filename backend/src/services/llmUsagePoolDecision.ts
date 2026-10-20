@@ -28,6 +28,7 @@ import { resolveEnforcementCostBasisMicroUsd } from './spendEnforcementBasis';
 import {
   evaluatePaygAdmission,
   paygOverageThresholdMicroUsd,
+  withPaygAdmittedMonth,
   type PaygBlock,
   type PaygOverageSettings,
   type PaygOverageStatus,
@@ -151,6 +152,10 @@ export async function resolveLlmUsagePoolDecision(input: {
     }),
     month: usageMonth,
   });
+  // Settlement bills a month only if PAYG actually admitted something in it (see `admittedMonths`).
+  if (payg.decision.reason === 'payg_overage') {
+    await recordPaygAdmittedMonth({ billingUserId, account: ownerAccount, month: usageMonth });
+  }
   return { ...base, mode: payg.decision, overage: payg.overage, paygBlock: payg.block };
 }
 
@@ -174,6 +179,11 @@ async function readOwnerConsistently(billingUserId: string): Promise<PoolBilling
  * (or two instances) racing on the same check cannot lower it. It is NOT the settings version: the
  * settings route writes only its own fields, so the two never overwrite each other.
  *
+ * The first write of a new month replaces the previous month's mark, which settlement of that month
+ * still needs (it runs after the month closes). That write moves the old mark to `poolHighWaterClosed`
+ * and is conditional on the stored mark being EXACTLY the one this check read, so the closed copy is
+ * never a stale, lower snapshot of a mark another instance raised meanwhile.
+ *
  * Losing that condition means someone stored an equal-or-higher mark this read did not see. The check
  * then re-reads the row strongly consistent and uses that mark — measuring against the lower one it
  * holds would count usage the higher pool still covers as overage. Any other failure is logged and the
@@ -188,16 +198,31 @@ async function recordPoolHighWater(input: {
   const stored = input.account.poolHighWater;
   if (stored?.month === input.month && stored.thresholdMicroUsd >= input.thresholdMicroUsd) return stored;
   const ours = { month: input.month, thresholdMicroUsd: input.thresholdMicroUsd };
+  const names = { '#payg': 'paygOverage', '#hw': 'poolHighWater', '#month': 'month', '#threshold': 'thresholdMicroUsd' };
+  const rollingOver = typeof stored?.month === 'string' && stored.month !== input.month
+    && Number.isFinite(stored.thresholdMicroUsd);
   try {
-    await userDb.updateUser(input.billingUserId, {}, {
-      pathSets: [{ path: ['paygOverage', 'poolHighWater'], value: ours }],
-      condition: {
-        expression:
-          'attribute_exists(#payg) AND (attribute_not_exists(#payg.#hw) OR #payg.#hw.#month <> :hwMonth OR #payg.#hw.#threshold < :hwThreshold)',
-        names: { '#payg': 'paygOverage', '#hw': 'poolHighWater', '#month': 'month', '#threshold': 'thresholdMicroUsd' },
-        values: { ':hwMonth': input.month, ':hwThreshold': input.thresholdMicroUsd },
-      },
-    });
+    await userDb.updateUser(input.billingUserId, {}, rollingOver
+      ? {
+          pathSets: [
+            { path: ['paygOverage', 'poolHighWaterClosed'], value: stored },
+            { path: ['paygOverage', 'poolHighWater'], value: ours },
+          ],
+          condition: {
+            expression: 'attribute_exists(#payg) AND #payg.#hw.#month = :prevMonth AND #payg.#hw.#threshold = :prevThreshold',
+            names,
+            values: { ':prevMonth': stored!.month, ':prevThreshold': stored!.thresholdMicroUsd },
+          },
+        }
+      : {
+          pathSets: [{ path: ['paygOverage', 'poolHighWater'], value: ours }],
+          condition: {
+            expression:
+              'attribute_exists(#payg) AND (attribute_not_exists(#payg.#hw) OR #payg.#hw.#month <> :hwMonth OR #payg.#hw.#threshold < :hwThreshold)',
+            names,
+            values: { ':hwMonth': input.month, ':hwThreshold': input.thresholdMicroUsd },
+          },
+        });
     return ours;
   } catch (error: any) {
     if (error?.code !== 'ConditionalCheckFailedException') {
@@ -210,5 +235,32 @@ async function recordPoolHighWater(input: {
       && current.thresholdMicroUsd > input.thresholdMicroUsd
       ? current
       : ours;
+  }
+}
+
+/**
+ * Add `month` to the owner's `admittedMonths` the first time PAYG admits a turn in it. Conditional on
+ * the list being the one this check read, so concurrent writers cannot drop each other's month. Never
+ * fails the check: a lost race means another writer changed the list (the next admission re-checks), and
+ * a failed write only ever leaves a month unbilled.
+ */
+async function recordPaygAdmittedMonth(input: {
+  billingUserId: string;
+  account: PaygOverageSettings;
+  month: string;
+}): Promise<void> {
+  const stored = input.account.admittedMonths;
+  if (Array.isArray(stored) && stored.includes(input.month)) return;
+  const names = { '#payg': 'paygOverage', '#admitted': 'admittedMonths' };
+  try {
+    await userDb.updateUser(input.billingUserId, {}, {
+      pathSets: [{ path: ['paygOverage', 'admittedMonths'], value: withPaygAdmittedMonth(stored, input.month) }],
+      condition: Array.isArray(stored)
+        ? { expression: 'attribute_exists(#payg) AND #payg.#admitted = :expected', names, values: { ':expected': stored } }
+        : { expression: 'attribute_exists(#payg) AND attribute_not_exists(#payg.#admitted)', names },
+    });
+  } catch (error: any) {
+    if (error?.code === 'ConditionalCheckFailedException') return;
+    console.error(`[paygOverage] Failed to record the PAYG admission month for ${input.billingUserId}:`, error?.message || error);
   }
 }

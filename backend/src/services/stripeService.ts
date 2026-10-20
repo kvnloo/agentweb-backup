@@ -246,6 +246,22 @@ export interface UserPaymentMethod {
   customerId: string | null;
   card: { brand: string; last4: string } | null;
   isZoma: boolean;
+  /**
+   * ENG-668: the method an off-session charge should use — the customer's invoice default, else the
+   * newest card, else the first listed. Backend only, like `customerId`.
+   */
+  paymentMethodId?: string | null;
+}
+
+/** ENG-668 PR-2: `metadata.purchaseType` on every month-end pay-as-you-go overage invoice. */
+export const PAYG_OVERAGE_PURCHASE_TYPE = 'payg_overage';
+
+/** The metadata settlement stamps on an overage invoice (and its line item). */
+export interface PaygOverageInvoiceMetadata {
+  purchaseType: typeof PAYG_OVERAGE_PURCHASE_TYPE;
+  billingUserId: string;
+  month: string;
+  idempotencyKey: string;
 }
 
 /**
@@ -473,9 +489,11 @@ export const stripeService = {
       const newestCard = methods.filter((m) => m.type === 'card' && m.card).sort((a, b) => b.created - a.created)[0];
       const cardPm = typeof defaultPm === 'object' && defaultPm?.card ? defaultPm : newestCard;
       const setupIntents = (await s.setupIntents.list({ customer: customerId, limit: 100 })).data;
+      const defaultPmId = typeof defaultPm === 'string' ? defaultPm : defaultPm?.id;
       return {
         hasPaymentMethod: true,
         customerId,
+        paymentMethodId: defaultPmId || newestCard?.id || methods[0].id,
         card: cardPm?.card ? { brand: cardPm.card.brand, last4: cardPm.card.last4 } : null,
         isZoma: setupIntents.some(
           (si) => si.status === 'succeeded' && si.metadata?.purchaseType === ZOMA_PAYMENT_METHOD_PURCHASE_TYPE,
@@ -483,6 +501,99 @@ export const stripeService = {
       };
     }
     return { hasPaymentMethod: false, customerId: null, card: null, isZoma: false };
+  },
+
+  /**
+   * ENG-668 PR-2: create, fill and finalize one month's pay-as-you-go overage invoice, or pick up the
+   * one an earlier attempt already started. Safe to call again with the same `idempotencyKey`:
+   *   - every Stripe write carries a key derived from it (`:invoice`, `:item`, `:finalize` — one key
+   *     cannot be reused across endpoints), so a retry within Stripe's 24h key window replays the
+   *     original result instead of creating a second invoice;
+   *   - an earlier attempt's invoice id (`invoiceId`) is retrieved directly;
+   *   - past the 24h window (`searchFirst`) the keys have expired, so the invoice is first searched for
+   *     by `metadata.idempotencyKey` before anything is created.
+   * The draft is created with `auto_advance: false` (an empty draft must never auto-finalize as a $0
+   * invoice) and `pending_invoice_items_behavior: 'exclude'` (nothing else the customer has pending is
+   * swept onto it); finalizing turns `auto_advance` on, so Stripe charges the payment method itself.
+   * `onDraftCreated` runs before the line item is added, so the caller can record the invoice id.
+   * Returns the invoice as Stripe now holds it (normally `open` or `paid`), or null when there is none
+   * to resume and no `customerId` to create one for.
+   */
+  async issuePaygOverageInvoice(input: {
+    idempotencyKey: string;
+    customerId: string | null;
+    paymentMethodId?: string | null;
+    amountCents: number;
+    description: string;
+    lineDescription: string;
+    metadata: PaygOverageInvoiceMetadata;
+    invoiceId?: string | null;
+    searchFirst: boolean;
+    onDraftCreated: (invoiceId: string) => Promise<void>;
+  }): Promise<Stripe.Invoice | null> {
+    if (!Number.isInteger(input.amountCents) || input.amountCents <= 0) throw new Error('amountCents must be a positive integer');
+    if (!/^[A-Za-z0-9_:-]+$/.test(input.idempotencyKey)) throw new Error('idempotencyKey has unexpected characters');
+    const s = getStripeOrThrow();
+    const metadata: Record<string, string> = { ...input.metadata };
+
+    let invoice: Stripe.Invoice | null = input.invoiceId ? await s.invoices.retrieve(input.invoiceId) : null;
+    if (!invoice && input.searchFirst) {
+      const found = await s.invoices.search({ query: `metadata['idempotencyKey']:'${input.idempotencyKey}'`, limit: 10 });
+      invoice = found.data.find((candidate) => candidate.metadata?.idempotencyKey === input.idempotencyKey) ?? null;
+    }
+    if (!invoice) {
+      if (!input.customerId) return null;
+      invoice = await s.invoices.create({
+        customer: input.customerId,
+        collection_method: 'charge_automatically',
+        auto_advance: false,
+        pending_invoice_items_behavior: 'exclude',
+        currency: 'usd',
+        description: input.description,
+        metadata,
+        ...(input.paymentMethodId ? { default_payment_method: input.paymentMethodId } : {}),
+      }, { idempotencyKey: `${input.idempotencyKey}:invoice` });
+      await input.onDraftCreated(invoice.id!);
+    } else if (invoice.id && invoice.id !== input.invoiceId) {
+      await input.onDraftCreated(invoice.id);
+    }
+
+    if (invoice.status !== 'draft') return invoice;
+    const customer = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id;
+    if (!customer) throw new Error(`Pay-as-you-go invoice ${invoice.id} has no customer`);
+    // Only this item is ever put on the draft (pending items are excluded), so any line means it is there.
+    if (!(invoice.lines?.data?.length)) {
+      await s.invoiceItems.create({
+        customer,
+        invoice: invoice.id!,
+        amount: input.amountCents,
+        currency: 'usd',
+        description: input.lineDescription,
+        metadata,
+      }, { idempotencyKey: `${input.idempotencyKey}:item` });
+    }
+    return s.invoices.finalizeInvoice(invoice.id!, { auto_advance: true }, { idempotencyKey: `${input.idempotencyKey}:finalize` });
+  },
+
+  /**
+   * ENG-668 PR-2: the pay-as-you-go overage invoice a charge paid, or null when the charge is anything
+   * else. Since API version 2025-03-31.basil a charge no longer carries `invoice`; the link is the
+   * invoice payment for the charge's PaymentIntent. Charges without a PaymentIntent are never ours.
+   */
+  async findPaygOverageInvoiceForCharge(charge: { payment_intent?: string | { id?: string } | null }): Promise<Stripe.Invoice | null> {
+    const paymentIntent = typeof charge?.payment_intent === 'string' ? charge.payment_intent : charge?.payment_intent?.id;
+    if (!paymentIntent) return null;
+    const s = getStripeOrThrow();
+    const payments = await s.invoicePayments.list({
+      payment: { type: 'payment_intent', payment_intent: paymentIntent },
+      limit: 1,
+      expand: ['data.invoice'],
+    });
+    const linked = payments.data[0]?.invoice;
+    if (!linked) return null;
+    const invoice = typeof linked === 'string' ? await s.invoices.retrieve(linked) : linked;
+    if ((invoice as Stripe.DeletedInvoice).deleted) return null;
+    return (invoice as Stripe.Invoice).metadata?.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE ? (invoice as Stripe.Invoice) : null;
   },
 
   /** Stripe-hosted Checkout in setup mode: saves a card, charges nothing. */
@@ -1070,6 +1181,14 @@ export async function handleSubscriptionUpdated(
  * Handle invoice.payment_succeeded — confirm subscription is active and sync payment info.
  */
 export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void> {
+  // ENG-668: a pay-as-you-go overage invoice is not a subscription payment. It must never write
+  // subscription_status / subscription_amount / period fields; settlement records it instead.
+  if (invoice?.metadata?.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE) {
+    const { handlePaygOverageInvoicePaid } = await import('./paygSettlementService');
+    await handlePaygOverageInvoicePaid(invoice);
+    return;
+  }
+
   const customerId = typeof invoice.customer === 'string'
     ? invoice.customer
     : invoice.customer?.id;
@@ -1256,6 +1375,13 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
  * Handle invoice.payment_failed — mark subscription as past_due and record the failure.
  */
 export async function handleInvoicePaymentFailed(invoice: any): Promise<void> {
+  // ENG-668: a failed overage charge suspends pay-as-you-go; it does not make the SUBSCRIPTION past_due.
+  if (invoice?.metadata?.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE) {
+    const { handlePaygOverageInvoicePaymentFailed } = await import('./paygSettlementService');
+    await handlePaygOverageInvoicePaymentFailed(invoice);
+    return;
+  }
+
   const customerId = typeof invoice.customer === 'string'
     ? invoice.customer
     : invoice.customer?.id;
@@ -1306,6 +1432,16 @@ export async function handleInvoicePaymentFailed(invoice: any): Promise<void> {
  */
 export async function handleChargeRefunded(charge: any): Promise<void> {
   const metadata = charge.metadata || {};
+  // ENG-668: a refunded pay-as-you-go overage charge is recorded against its settlement only. It never
+  // lifts a suspension (refunding an overage is not a reason to resume billing it).
+  if (metadata.purchaseType !== 'llm_usage_top_up') {
+    const overageInvoice = await stripeService.findPaygOverageInvoiceForCharge(charge);
+    if (overageInvoice) {
+      const { handlePaygOverageChargeRefunded } = await import('./paygSettlementService');
+      await handlePaygOverageChargeRefunded(charge, overageInvoice);
+      return;
+    }
+  }
   const customerId = typeof charge.customer === 'string'
     ? charge.customer
     : charge.customer?.id;
@@ -1405,6 +1541,13 @@ export async function handleChargeDisputeCreated(dispute: any): Promise<void> {
 
   const metadata = charge.metadata || {};
   if (metadata.purchaseType !== 'llm_usage_top_up') {
+    // ENG-668: a chargeback on a pay-as-you-go overage charge suspends pay-as-you-go.
+    const overageInvoice = await stripeService.findPaygOverageInvoiceForCharge(charge);
+    if (overageInvoice) {
+      const { handlePaygOverageChargeDisputed } = await import('./paygSettlementService');
+      await handlePaygOverageChargeDisputed(dispute, charge, overageInvoice);
+      return;
+    }
     console.log(
       `[STRIPE] Dispute ${dispute.id} is not an AgentWeb Credits purchase; no capacity to revoke`
     );
@@ -1953,14 +2096,15 @@ export async function resyncAllSubscriptionAmounts(): Promise<{
         console.log(`[STRIPE RESYNC] ${user.email}: reconciled ${Object.keys(reconcileUpdates).join(', ')}`);
       }
 
-      // 2. Refresh subscription_amount from the latest paid invoice.
+      // 2. Refresh subscription_amount from the latest paid invoice. A pay-as-you-go overage invoice
+      //    (ENG-668) is not the subscription's price, so it is skipped.
       const invoices = await stripe.invoices.list({
         customer: user.stripe_customer_id,
         status: 'paid',
-        limit: 1,
+        limit: 10,
       });
 
-      const latestPaid = invoices.data[0];
+      const latestPaid = invoices.data.find((inv) => inv.metadata?.purchaseType !== PAYG_OVERAGE_PURCHASE_TYPE);
       if (!latestPaid || typeof latestPaid.amount_paid !== 'number' || latestPaid.amount_paid <= 0) {
         if (!reconcileUpdates) summary.skipped++;
         continue;

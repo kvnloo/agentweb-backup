@@ -12,6 +12,11 @@ import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMar
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
 import { resetDateFromMonth, formatResetDateLong } from '../utils/usageCycle';
 import { buildUsageBlockCopy, paygBlockActionSentence, type UsageBlockPaygInput } from '../utils/usageBlockCopy';
+import {
+  paygInvoiceCreatedEmailCopy,
+  paygPaymentFailedEmailCopy,
+  type PaygSettlementEmailCopy,
+} from '../utils/paygSettlementCopy';
 
 // ENG-351: resolve {{cite:N}} markers in Emma's text to inline source attributions, using the
 // citation metadata on the session's last assistant message. Email has no chip renderer, so this
@@ -2723,6 +2728,71 @@ View Session: ${sessionUrl}`;
       console.error('Error sending slack triggered session email:', error);
       // Non-blocking: email failure should not interrupt the session flow
     }
+  },
+
+  /**
+   * ENG-668 PR-2: the billing owner's email when the month's pay-as-you-go overage invoice is created.
+   * A percentage of the cap only — never dollars; the Stripe invoice it links to carries the amount.
+   * Best-effort (`sendEmail` never throws): settlement does not depend on it.
+   */
+  async sendPaygOverageInvoiceEmail(input: {
+    to: string;
+    month: string;
+    percentOfCap: number;
+    invoiceUrl?: string | null;
+  }): Promise<EmailSendOutcome | void> {
+    return this.sendPaygSettlementEmail(input.to, paygInvoiceCreatedEmailCopy(input), input.invoiceUrl, '#1976d2');
+  },
+
+  /** ENG-668 PR-2: the billing owner's email when the month's overage charge fails and PAYG is put on hold. */
+  async sendPaygOveragePaymentFailedEmail(input: {
+    to: string;
+    month: string;
+    invoiceUrl?: string | null;
+  }): Promise<EmailSendOutcome | void> {
+    return this.sendPaygSettlementEmail(input.to, paygPaymentFailedEmailCopy(input), input.invoiceUrl, '#dc3545');
+  },
+
+  /** Renders the copy from `utils/paygSettlementCopy.ts`; no wording lives here. */
+  async sendPaygSettlementEmail(
+    to: string,
+    copy: PaygSettlementEmailCopy,
+    invoiceUrl: string | null | undefined,
+    accent: string,
+  ): Promise<EmailSendOutcome | void> {
+    const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+    const settingsUrl = `${customerFrontendUrl}/settings`;
+    const invoiceLink = invoiceUrl && /^https:\/\//.test(invoiceUrl) ? invoiceUrl : null;
+    const paragraphsHtml = copy.paragraphs
+      .map((p) => `<p style="margin: 0 0 12px 0; line-height: 1.6;">${this.escapeHtml(p)}</p>`)
+      .join('');
+    const html = `
+      <html>
+      <body style="font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa;">
+        <div style="max-width: 640px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+          <div style="background-color: ${accent}; color: white; padding: 20px; border-radius: 8px 8px 0 0;">
+            <h1 style="margin: 0; font-size: 22px;">${this.escapeHtml(copy.headline)}</h1>
+          </div>
+          <div style="padding: 20px;">
+            ${paragraphsHtml}
+            ${invoiceLink && copy.invoiceLinkLabel
+              ? `<p style="margin: 16px 0;"><a href="${this.escapeHtml(invoiceLink)}" style="display: inline-block; background-color: #1976d2; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px;">${this.escapeHtml(copy.invoiceLinkLabel)}</a></p>`
+              : ''}
+            <p style="margin: 16px 0 0 0;"><a href="${this.escapeHtml(settingsUrl)}" style="color: #1976d2;">${this.escapeHtml(copy.settingsLinkLabel)}</a></p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+    const text = [
+      copy.headline,
+      '',
+      ...copy.paragraphs,
+      '',
+      ...(invoiceLink && copy.invoiceLinkLabel ? [`${copy.invoiceLinkLabel}: ${invoiceLink}`] : []),
+      `${copy.settingsLinkLabel}: ${settingsUrl}`,
+    ].join('\n');
+    return this.sendEmail(to, copy.subject, text, html);
   },
 
   async sendOncallAlert(
