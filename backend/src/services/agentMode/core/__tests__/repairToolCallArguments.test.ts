@@ -288,3 +288,24 @@ describe('parseToolCallArguments (ENG-1477)', () => {
     expect(() => parseToolCallArguments('{not json}')).toThrow(expected!.message);
   });
 });
+
+describe('parseToolCallArguments — duplicated concatenated objects (ENG-2597)', () => {
+  it('collapses identical empty objects emitted twice', () => {
+    expect(parseToolCallArguments('{}{}')).toEqual({});
+  });
+
+  it('collapses identical objects, whitespace-separated or key-reordered', () => {
+    expect(parseToolCallArguments('{"a":1}{"a":1}')).toEqual({ a: 1 });
+    expect(parseToolCallArguments('{"a":1,"b":"x}{"} \n {"b":"x}{","a":1}{"a":1,"b":"x}{"}')).toEqual({ a: 1, b: 'x}{' });
+  });
+
+  it('still throws when the concatenated objects differ', () => {
+    expect(() => parseToolCallArguments('{"a":1}{"a":2}')).toThrow(/Unexpected non-whitespace/);
+    expect(() => parseToolCallArguments('{"to":"a@x.com"}{"to":"b@x.com"}')).toThrow();
+  });
+
+  it('does not treat non-object trailing content as a duplicate', () => {
+    expect(() => parseToolCallArguments('{}x')).toThrow();
+    expect(() => parseToolCallArguments('{}[]')).toThrow();
+  });
+});

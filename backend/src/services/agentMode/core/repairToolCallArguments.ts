@@ -365,6 +365,8 @@ export function parseToolCallArguments(raw: string): any {
   try {
     return JSON.parse(raw);
   } catch (primaryError) {
+    const deduped = parseDuplicatedJsonObjects(raw);
+    if (deduped !== undefined) return deduped;
     const repaired = repairUnescapedQuotes(raw);
     if (repaired !== raw && !hasDuplicateObjectKeys(repaired)) {
       try {
@@ -378,4 +380,59 @@ export function parseToolCallArguments(raw: string): any {
     }
     throw primaryError;
   }
+}
+
+/**
+ * ENG-2597: the provider stream sometimes delivers a tool call's arguments
+ * twice, back to back (`{}{}`, `{"a":1}{"a":1}`), which JSON.parse rejects
+ * with "Unexpected non-whitespace character after JSON at position N".
+ * When `raw` splits into two or more top-level objects that are all
+ * identical, return that single object. Differing objects return undefined
+ * (the caller throws) so we never guess which call the model meant.
+ */
+export function parseDuplicatedJsonObjects(raw: string): unknown {
+  const parts: string[] = [];
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let start = -1;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (depth === 0) {
+      if (/\s/.test(ch)) continue;
+      if (ch !== '{') return undefined;
+      start = i;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{' || ch === '[') depth++;
+    else if (ch === '}' || ch === ']') {
+      depth--;
+      if (depth < 0) return undefined;
+      if (depth === 0) parts.push(raw.slice(start, i + 1));
+    }
+  }
+  if (depth !== 0 || inString || parts.length < 2) return undefined;
+  let parsed: unknown[];
+  try {
+    parsed = parts.map((p) => JSON.parse(p));
+  } catch {
+    return undefined;
+  }
+  const canonical = parsed.map((p) => stableCanonical(p));
+  return canonical.every((c) => c === canonical[0]) ? parsed[0] : undefined;
+}
+
+function stableCanonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableCanonical).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    return `{${Object.keys(obj).sort().map((k) => `${JSON.stringify(k)}:${stableCanonical(obj[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
 }
