@@ -41,6 +41,7 @@ import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
   type CreativeImageReadback, type ImageSwapExpectation, type ImageSwapVerdict,
 } from './agentMode/metaImageSwapCheck';
+import { findUnappliedCreativeFields } from './agentMode/metaCreativeFieldsCheck';
 import { readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
 import { createCrmEvidenceCollector, crmEvidenceFromEarlierInvocations, crmNumbersFromSessionHistory, runCrmFreshnessShadow, serializeCrmEvidence } from '../utils/crmFreshnessGuard';
@@ -12730,6 +12731,28 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // ENG-2141: link the generated images this creative uses to it (inert unless enabled).
       if (creative?.id) {
         void stampMetaCreativeCreated({ userId, accountId, metaCreativeId: String(creative.id), params: resolvedParams });
+      }
+
+      // ENG-2596: a 200 doesn't prove Meta stored the IG identity / link description — read back.
+      let unappliedFields: string[] = [];
+      if (creative?.id && (resolvedParams.instagram_user_id || resolvedParams.description)) {
+        try {
+          const live = await metaService.getAdCreative(accessToken, String(creative.id));
+          unappliedFields = findUnappliedCreativeFields(resolvedParams, live);
+        } catch (err: unknown) {
+          console.warn(`AgentMode: creative field read-back failed for ${creative.id}:`,
+            err instanceof Error ? err.message : err);
+        }
+      }
+      if (unappliedFields.length > 0) {
+        return {
+          success: true,
+          verified: false,
+          unapplied_fields: unappliedFields,
+          message: `Ad creative "${creative.name}" was created but Meta did NOT store: ${unappliedFields.join(', ')}. ` +
+            `Do not report this creative as verified; tell the user, or recreate it.`,
+          creative: creative
+        };
       }
 
       return {
