@@ -23,10 +23,42 @@ describe('redactPhones', () => {
     ['word joiner', '415\u2060555\u20600100'],
     ['byte-order mark', '415\uFEFF555\uFEFF0100'],
     ['soft hyphen', '415\u00AD555\u00AD0100'],
+    ['left-to-right mark', '415\u200E555\u200E0100'],
+    ['right-to-left mark', '415\u200F555\u200F0100'],
+    ['Arabic letter mark', '415\u061C555\u061C0100'],
+    ['semicolon-separated', '415;555;0100'],
+    ['pipe-separated', '415|555|0100'],
+    ['hash-separated', '415#555#0100'],
+    ['tilde-separated', '415~555~0100'],
+    ['equals-separated', '415=555=0100'],
+    ['URL-encoded space', '415%20555%200100'],
+    ['URL-encoded space after a plus', '%2B1%20415%20555%200100'],
+    ['comma-grouped with a four-digit last group', '1,415,555,0100'],
     ['URL-encoded plus', '%2B14155550100'],
     ['lowercase URL-encoded plus', '%2b14155550100'],
   ])('redacts a %s number', (_label, num) => {
     expect(redactPhones(`dial ${num} now`)).toBe('dial [redacted] now');
+  });
+
+  it.each([
+    ['a UUID', 'req 550e8400-e29b-41d4-a716-446655440000 done'],
+    ['a UUID whose first block is all digits', 'id 12345678-1234-4abc-8def-123456789012'],
+    ['a UUID with a letter before a digit run', 'id f1234567-0000-4000-8000-000000000000'],
+    ['a number with thousands separators', 'sent 1,234,567 emails'],
+    ['a larger number with thousands separators', 'total 12,345,678,901'],
+    ['a list of small numbers', 'pages 1, 2, 3, 4, 5, 6, 7 and 10, 20, 30, 40'],
+  ])('keeps %s', (_label, text) => {
+    expect(redactPhones(text)).toBe(text);
+  });
+
+  it('still redacts a phone that sits next to a kept number or UUID', () => {
+    expect(redactPhones('1,234,567 and +15555550100')).toBe('1,234,567 and [redacted]');
+    expect(redactPhones('550e8400-e29b-41d4-a716-446655440000 +15555550100')).toBe('550e8400-e29b-41d4-a716-446655440000 [redacted]');
+  });
+
+  it('does not keep the front of a longer comma-grouped phone', () => {
+    expect(redactPhones('call 1,415,555,0100 now')).toBe('call [redacted] now');
+    expect(redactPhones('call 415,555,0100 now')).toBe('call [redacted] now');
   });
 
   it('redacts a number with a plus even when it is glued to a word', () => {
