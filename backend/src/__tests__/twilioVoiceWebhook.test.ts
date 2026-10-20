@@ -16,9 +16,12 @@ jest.mock('../services/db', () => ({
   orgDb: { getOrgById: jest.fn() },
 }));
 jest.mock('../services/voice/voiceUsage', () => ({ recordCallUsage: jest.fn() }));
+jest.mock('../services/hotLeadCallAttempts', () => ({ requestNextHotLeadCallAttempt: jest.fn() }));
 
 import { crmDb, orgDb, userDb } from '../services/db';
 import { recordCallUsage } from '../services/voice/voiceUsage';
+import { requestNextHotLeadCallAttempt } from '../services/hotLeadCallAttempts';
+import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
 import { setHotLeadCallEnabledOverride } from '../services/voice/hotLeadCallMode';
 import { setLeadCallStoreForTests } from '../services/voice/leadCallStore';
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
@@ -42,6 +45,7 @@ const MEMBER_PHONE = '+14155550100';
 const TWILIO_NUMBER = '+14155550111';
 const LEAD_PHONE = '+14155550123';
 const QUERY = `listId=${LIST}&leadId=${LEAD}&jobKey=${JOB}`;
+const NEXT_MEMBER_SID = 'CA00000003';
 
 const orgConfig = {
   enabled: true,
@@ -58,7 +62,8 @@ let logSpy: jest.SpyInstance[];
 function seed(state: HotLeadCallState, extra: Partial<HotLeadCallRecord> = {}) {
   store.record = {
     state, jobKey: JOB, startedAt: '2026-10-19T00:00:00.000Z', updatedAt: '2026-10-19T00:00:00.000Z',
-    memberCallSid: MEMBER_SID, attemptNo: 1, memberId: MEMBER_ID, triedMemberIds: [MEMBER_ID], meteredLegs: [], lastSequence: {}, ...extra,
+    memberCallSid: MEMBER_SID, attemptNo: 1, memberId: MEMBER_ID, triedMemberIds: [MEMBER_ID], meteredLegs: [], lastSequence: {},
+    leadPhoneMac: leadPhoneMacOf('org-a', LEAD_PHONE), ...extra,
   };
 }
 
@@ -93,6 +98,9 @@ const dial = (status: string, extra: Record<string, string> = {}) =>
   post('dial', { CallSid: MEMBER_SID, DialCallStatus: status, ...extra });
 const memberStatus = (callStatus: string, extra: Record<string, string> = {}) =>
   post('status', { CallSid: MEMBER_SID, CallStatus: callStatus, ...extra });
+const screen = (extra: Record<string, string> = {}, sid = LEAD_SID) => post('screen', { CallSid: sid, CallStatus: 'in-progress', ...extra });
+const screenResult = (digits?: string, extra: Record<string, string> = {}, sid = LEAD_SID) =>
+  post('screen-result', { CallSid: sid, ...(digits === undefined ? {} : { Digits: digits }), ...extra });
 const leadStatus = (callStatus: string, extra: Record<string, string> = {}) =>
   post('status', { CallSid: LEAD_SID, ParentCallSid: MEMBER_SID, CallStatus: callStatus, ...extra }, { query: `${QUERY}&leg=lead` });
 
@@ -101,6 +109,8 @@ const usage = () => mock(recordCallUsage).mock.calls.map((c) => c[0]);
 beforeEach(() => {
   jest.resetAllMocks();
   process.env.BACKEND_URL = `${BASE}/`;
+  process.env.JWT_SECRET = 'test-secret';
+  mock(requestNextHotLeadCallAttempt).mockResolvedValue({ enqueued: false, reason: 'no_candidates' });
   store = new FakeLeadCallStore();
   setLeadCallStoreForTests(store);
   fake = new FakeVoiceProvider();
@@ -120,6 +130,7 @@ afterEach(() => {
   setHotLeadCallEnabledOverride(null);
   logSpy.forEach((s) => s.mockRestore());
   delete process.env.BACKEND_URL;
+  delete process.env.JWT_SECRET;
 });
 
 const digitsOf = (s: string) => s.replace(/\D/g, '');
@@ -129,19 +140,22 @@ const noPhoneIn = (text: string) => {
 
 // ── guard ────────────────────────────────────────────────────────────────────
 
-const ENDPOINTS: Array<[string, () => request.Test]> = [
-  ['owner', () => memberPrompt()],
-  ['gather', () => gather('1')],
-  ['dial', () => dial('no-answer')],
-  ['status', () => memberStatus('completed', { CallDuration: '30' })],
+// The state each endpoint's guard tests start from: the screening endpoints only act on a record that is already bridging.
+const ENDPOINTS: Array<[string, () => request.Test, HotLeadCallState, Partial<HotLeadCallRecord>]> = [
+  ['owner', () => memberPrompt(), 'member_answered', {}],
+  ['gather', () => gather('1'), 'member_answered', {}],
+  ['dial', () => dial('no-answer'), 'member_answered', {}],
+  ['status', () => memberStatus('completed', { CallDuration: '30' }), 'member_answered', {}],
+  ['screen', () => screen(), 'bridging', { leadCallSid: LEAD_SID }],
+  ['screen-result', () => screenResult('1'), 'bridging', { leadCallSid: LEAD_SID }],
 ];
 
 // Each guard test starts a fresh log window (the "cannot verify" line is logged once per window).
 let guardClock = 1_800_000_000_000;
-describe.each(ENDPOINTS)('%s guard', (name, call) => {
+describe.each(ENDPOINTS)('%s guard', (name, call, startState, startExtra) => {
   let nowSpy: jest.SpyInstance;
   beforeEach(() => {
-    seed('member_answered', { meteredLegs: [] });
+    seed(startState, { meteredLegs: [], ...startExtra });
     guardClock += 60_000;
     nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => guardClock);
   });
@@ -431,7 +445,9 @@ describe('POST /gather', () => {
     expect(res.status).toBe(200);
     expect(res.headers['content-type']).toMatch(/text\/xml/);
     expect(store.record?.state).toBe('bridging');
-    expect(res.text).toContain('Connecting you now.');
+    expect(res.text).toContain('Calling the lead now, please hold.');
+    expect(res.text).toContain('<Dial answerOnBridge="true"');
+    expect(res.text).toContain(`<Number url="${BASE}${MOUNT}/screen?${QUERY.replace(/&/g, '&amp;')}" method="POST"`);
     expect(res.text).toContain(`callerId="${TWILIO_NUMBER}"`);
     expect(res.text).toContain(`>${LEAD_PHONE}</Number>`);
     expect(res.text).toContain(`${MOUNT}/status?${QUERY.replace(/&/g, '&amp;')}&amp;leg=lead#rc=3&amp;rp=5xx,ct"`);
@@ -531,6 +547,487 @@ describe('POST /gather', () => {
   });
 });
 
+describe('POST /gather: the lead phone must still be the one that passed the gates', () => {
+  beforeEach(() => seed('member_answered'));
+  const NEW_PHONE = '+14155550177';
+
+  it('refuses to dial when the live lead phone differs from the one stored at dispatch: lead_phone_changed, call.failed, polite hangup', async () => {
+    mock(crmDb.getLeadById).mockResolvedValue({ phone: NEW_PHONE });
+    const res = await gather('1');
+    expect(res.text).not.toContain('<Dial');
+    expect(res.text).toContain('We could not reach the lead. Their details are in your lead alert.');
+    expect(res.text).toContain('<Hangup/>');
+    expect(store.record).toMatchObject({ state: 'member_answered', outcome: 'lead_phone_changed' });
+    expect(store.events).toEqual([{ type: 'call.failed', detail: { reason: 'lead_phone_changed' } }]);
+    noPhoneIn(res.text);
+    noPhoneIn(JSON.stringify(logSpy.flatMap((s) => s.mock.calls)));
+  });
+
+  it('is decided once: a replayed press repeats the message without a second event, and cannot dial', async () => {
+    mock(crmDb.getLeadById).mockResolvedValue({ phone: NEW_PHONE });
+    await gather('1');
+    const again = await gather('1');
+    expect(again.text).not.toContain('<Dial');
+    expect(store.eventTypes()).toEqual(['call.failed']);
+  });
+
+  it('meters the member leg first, then finishes the record with the lead_phone_changed outcome and does not try another member', async () => {
+    mock(crmDb.getLeadById).mockResolvedValue({ phone: NEW_PHONE });
+    await gather('1');
+    expect(store.record?.state).toBe('member_answered');
+    await memberStatus('completed', { CallDuration: '15' });
+    expect(store.record).toMatchObject({ state: 'finished', outcome: 'lead_phone_changed', meteredLegs: ['member:1'] });
+    expect(store.eventTypes()).toEqual(['call.failed', 'call.completed']);
+    expect(usage()).toHaveLength(1);
+    expect(requestNextHotLeadCallAttempt).not.toHaveBeenCalled();
+  });
+
+  it('dials when the same person typed the number differently (the comparison is on the normalised E.164)', async () => {
+    mock(crmDb.getLeadById).mockResolvedValue({ phone: '(415) 555-0123' });
+    expect((await gather('1')).text).toContain(`>${LEAD_PHONE}</Number>`);
+    expect(store.record?.state).toBe('bridging');
+  });
+
+  it('keys the stored value by org: a record minted for another org does not match', async () => {
+    seed('member_answered', { leadPhoneMac: leadPhoneMacOf('org-other', LEAD_PHONE) });
+    expect((await gather('1')).text).not.toContain('<Dial');
+    expect(store.record?.outcome).toBe('lead_phone_changed');
+  });
+
+  it('still dials a record created before the check existed (no stored value) and says so in the log', async () => {
+    seed('member_answered', { leadPhoneMac: undefined });
+    const res = await gather('1');
+    expect(res.text).toContain('<Dial');
+    expect(JSON.stringify(logSpy.flatMap((s) => s.mock.calls))).toContain('no leadPhoneMac');
+  });
+
+  it('does not warn about a missing stored value when it is present', async () => {
+    await gather('1');
+    expect(JSON.stringify(logSpy.flatMap((s) => s.mock.calls))).not.toContain('no leadPhoneMac');
+  });
+
+  it('keeps reporting lead_phone_invalid (not changed) when the live number is no longer callable at all', async () => {
+    mock(crmDb.getLeadById).mockResolvedValue({ phone: 'garbage' });
+    await gather('1');
+    expect(store.record?.outcome).toBe('lead_phone_invalid');
+  });
+});
+
+// ── /screen: the lead answered ───────────────────────────────────────────────
+
+describe('POST /screen', () => {
+  beforeEach(() => seed('bridging'));
+
+  it('adopts the body CallSid as the lead leg and asks the lead to press 1, with the announced name escaped', async () => {
+    const res = await screen();
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toMatch(/text\/xml/);
+    expect(res.text).toContain('Smith &amp; Sons would like to talk to you about your enquiry. Press 1 to be connected now.');
+    expect(res.text).toContain('<Gather input="dtmf" numDigits="1" timeout="8"');
+    expect(res.text).toContain(`action="${BASE}${MOUNT}/screen-result?${QUERY.replace(/&/g, '&amp;')}"`);
+    expect(res.text).toContain('We did not get your answer. Goodbye.');
+    expect(store.record).toMatchObject({ state: 'bridging', leadCallSid: LEAD_SID });
+    expect(store.events).toHaveLength(0);
+    noPhoneIn(res.text);
+  });
+
+  it('serves the same prompt on a Twilio retry without writing again', async () => {
+    await screen();
+    const writes = store.transitions;
+    const res = await screen();
+    expect(res.text).toContain('<Gather');
+    expect(store.transitions).toBe(writes);
+  });
+
+  it('first writer wins: a different sid afterwards is ignored and gets a hangup', async () => {
+    await screen();
+    const res = await screen({}, 'CA00000099');
+    expect(res.text).not.toContain('<Gather');
+    expect(res.text).toContain('<Hangup/>');
+    expect(store.record?.leadCallSid).toBe(LEAD_SID);
+  });
+
+  it('with two different sids racing, exactly one is adopted and only that one is served the prompt', async () => {
+    const results = await Promise.all([screen({}, 'CA00000098'), screen({}, 'CA00000099')]);
+    expect(results.filter((r) => r.text.includes('<Gather'))).toHaveLength(1);
+    expect(['CA00000098', 'CA00000099']).toContain(store.record?.leadCallSid);
+  });
+
+  it('keeps a lead sid already learned from the lead status callback', async () => {
+    seed('bridging', { leadCallSid: LEAD_SID });
+    expect((await screen()).text).toContain('<Gather');
+    expect((await screen({}, 'CA00000099')).text).not.toContain('<Gather');
+    expect(store.record?.leadCallSid).toBe(LEAD_SID);
+  });
+
+  it('never adopts the member sid as the lead leg (the request would not be on the lead\'s leg)', async () => {
+    const res = await screen({}, MEMBER_SID);
+    expect(res.text).not.toContain('<Gather');
+    expect(store.record?.leadCallSid).toBeUndefined();
+    expect(store.transitions).toBe(0);
+  });
+
+  it('does not adopt a malformed or missing CallSid', async () => {
+    expect((await screen({}, 'not-a-sid')).text).not.toContain('<Gather');
+    expect((await post('screen', {})).text).not.toContain('<Gather');
+    expect(store.record?.leadCallSid).toBeUndefined();
+  });
+
+  it.each(['dialing', 'member_ringing', 'member_answered', 'between_attempts', 'connected', 'finished', 'failed'] as const)('hangs up and writes nothing when the record is %s', async (state) => {
+    seed(state);
+    const res = await screen();
+    expect(res.text).not.toContain('<Gather');
+    expect(store.transitions).toBe(0);
+    expect(store.record?.leadCallSid).toBeUndefined();
+  });
+
+  it('ignores a record that does not exist or belongs to another job', async () => {
+    expect((await post('screen', { CallSid: LEAD_SID }, { query: `listId=${LIST}&leadId=${LEAD}&jobKey=old` })).text).not.toContain('<Gather');
+    store.record = null;
+    expect((await screen()).text).not.toContain('<Gather');
+  });
+
+  it('aborts when the kill switch is off or the config is disabled: no prompt, outcome aborted once, never relabelled as a decline', async () => {
+    setHotLeadCallEnabledOverride(false);
+    const res = await screen();
+    expect(res.text).not.toContain('<Gather');
+    await screen();
+    expect(store.record).toMatchObject({ state: 'bridging', outcome: 'aborted' });
+    expect(store.eventTypes()).toEqual(['call.failed']);
+    const dialed = await dial('completed', { DialCallSid: LEAD_SID, DialBridged: 'false' });
+    expect(dialed.text).toContain('did not confirm');
+    expect(store.record?.outcome).toBe('aborted');
+    expect(store.eventTypes()).toEqual(['call.failed']);
+  });
+});
+
+describe('POST /screen-result', () => {
+  beforeEach(() => seed('bridging', { leadCallSid: LEAD_SID }));
+
+  it('Digits=1: answers an empty response (the bridge proceeds), records the decision and the connection once', async () => {
+    const res = await screenResult('1');
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toMatch(/text\/xml/);
+    expect(res.text).toBe('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+    expect(store.record).toMatchObject({ state: 'connected', lastSequence: { [`${LEAD_SID}#screen`]: 1 } });
+    expect(store.eventTypes()).toEqual(['call.connected']);
+  });
+
+  it.each([['2'], ['11'], ['#'], [''], [undefined]])('Digits=%j: hangs the lead up, outcome lead_declined, call.lead_declined once', async (digits) => {
+    const res = await screenResult(digits);
+    expect(res.text).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
+    expect(store.record).toMatchObject({ state: 'bridging', outcome: 'lead_declined' });
+    expect(store.eventTypes()).toEqual(['call.lead_declined']);
+  });
+
+  it('is one decision per screening: a replay repeats it, and a later different digit cannot reverse it', async () => {
+    await screenResult('1');
+    expect((await screenResult('1')).text).toContain('<Response/>');
+    expect((await screenResult('2')).text).toContain('<Response/>');
+    expect(store.eventTypes()).toEqual(['call.connected']);
+    expect(store.record?.outcome).toBeUndefined();
+
+    seed('bridging', { leadCallSid: LEAD_SID });
+    store.events = [];
+    await screenResult('2');
+    expect((await screenResult('1')).text).toContain('<Hangup/>');
+    expect((await screenResult('1')).text).not.toContain('<Response/>');
+    expect(store.eventTypes()).toEqual(['call.lead_declined']);
+    expect(store.record).toMatchObject({ state: 'bridging', outcome: 'lead_declined' });
+  });
+
+  it('two simultaneous answers produce one decision and one event', async () => {
+    const results = await Promise.all([screenResult('1'), screenResult('2'), screenResult('1')]);
+    expect(new Set(results.map((r) => r.text.includes('<Response/>'))).size).toBe(1);
+    expect(store.events).toHaveLength(1);
+  });
+
+  it('a decline also uses the dial marker, so /dial\'s DialBridged=false result adds nothing', async () => {
+    await screenResult('2');
+    expect(store.record?.lastSequence).toMatchObject({ [`${LEAD_SID}#screen`]: 1, [`${MEMBER_SID}#dial`]: 1 });
+  });
+
+  it('ignores a CallSid that is not the adopted lead leg (the member\'s, another, none)', async () => {
+    for (const sid of [MEMBER_SID, 'CA00000099']) expect((await screenResult('1', {}, sid)).text).toContain('<Hangup/>');
+    expect((await post('screen-result', { Digits: '1' })).text).toContain('<Hangup/>');
+    expect(store.transitions).toBe(0);
+    expect(store.events).toHaveLength(0);
+  });
+
+  it('does nothing when no lead leg was adopted by /screen', async () => {
+    seed('bridging');
+    expect((await screenResult('1')).text).toContain('<Hangup/>');
+    expect(store.transitions).toBe(0);
+  });
+
+  it.each(['dialing', 'member_ringing', 'member_answered', 'between_attempts', 'finished', 'failed'] as const)('writes nothing and hangs up when the record is %s', async (state) => {
+    seed(state, { leadCallSid: LEAD_SID });
+    expect((await screenResult('1')).text).toContain('<Hangup/>');
+    expect(store.transitions).toBe(0);
+    expect(store.events).toHaveLength(0);
+  });
+
+  it('a decline after the abort marker keeps the abort and still hangs the lead up', async () => {
+    seed('bridging', { leadCallSid: LEAD_SID, outcome: 'aborted', lastSequence: { [`${MEMBER_SID}#dial`]: 1 } });
+    const res = await screenResult('2');
+    expect(res.text).toContain('<Hangup/>');
+    expect(store.record?.outcome).toBe('aborted');
+    expect(store.events).toHaveLength(0);
+  });
+
+  it('a lead who declined still gets both legs metered and the record finishes lead_declined, without trying another member', async () => {
+    await screenResult('2');
+    await dial('completed', { DialCallSid: LEAD_SID, DialBridged: 'false' });
+    await leadStatus('completed', { CallDuration: '9', SequenceNumber: '3' });
+    expect(store.record?.state).toBe('bridging');
+    await memberStatus('completed', { CallDuration: '30' });
+    expect(store.record).toMatchObject({ state: 'finished', outcome: 'lead_declined', meteredLegs: ['lead', 'member:1'] });
+    expect(store.eventTypes()).toEqual(['call.lead_declined', 'call.completed']);
+    expect(requestNextHotLeadCallAttempt).not.toHaveBeenCalled();
+  });
+
+  it('a conversation finishes as completed even when both leg callbacks beat /dial', async () => {
+    await screenResult('1');
+    await leadStatus('completed', { CallDuration: '125', SequenceNumber: '3' });
+    await memberStatus('completed', { CallDuration: '140' });
+    expect(store.record).toMatchObject({ state: 'finished', outcome: 'completed' });
+    expect(store.eventTypes()).toEqual(['call.connected', 'call.completed']);
+  });
+});
+
+// ── member attempts: a member leg that ends without a bridge ─────────────────
+
+describe('member attempt finalisation', () => {
+  const nextAttempt = () => mock(requestNextHotLeadCallAttempt);
+
+  it.each([
+    ['member_ringing', 'no-answer'], ['member_ringing', 'busy'], ['member_ringing', 'failed'], ['member_ringing', 'canceled'],
+    ['dialing', 'no-answer'], ['member_answered', 'completed'],
+  ] as const)('%s + %s: meters member:1, moves to between_attempts and asks the seam once, with the record as it now is', async (state, callStatus) => {
+    seed(state, state === 'dialing' ? { memberCallSid: undefined } : {});
+    nextAttempt().mockResolvedValue({ enqueued: true });
+    const res = await memberStatus(callStatus, { CallDuration: '7', SequenceNumber: '1' });
+    expect(res.status).toBe(200);
+    expect(store.record).toMatchObject({ state: 'between_attempts', meteredLegs: ['member:1'] });
+    expect(usage()).toEqual([{ userId: 'owner-a', callSid: MEMBER_SID, leg: 'member', durationSeconds: 7 }]);
+    expect(nextAttempt()).toHaveBeenCalledTimes(1);
+    expect(nextAttempt().mock.calls[0][0]).toMatchObject({ listId: LIST, leadId: LEAD, record: { state: 'between_attempts', attemptNo: 1, meteredLegs: ['member:1'] } });
+  });
+
+  it('writes the matching outcome and event for a no-answer and for a hang-up on the prompt, never both', async () => {
+    seed('member_ringing');
+    nextAttempt().mockResolvedValue({ enqueued: true });
+    await memberStatus('no-answer', { CallDuration: '0' });
+    expect(store.record?.outcome).toBe('member_no_answer');
+    expect(store.eventTypes()).toEqual(['call.member_no_answer']);
+
+    seed('member_answered');
+    store.events = [];
+    await memberStatus('completed', { CallDuration: '3' });
+    expect(store.record?.outcome).toBe('member_declined');
+    expect(store.eventTypes()).toEqual(['call.member_declined']);
+  });
+
+  it('a member who pressed 2 keeps the single call.member_declined written at /gather', async () => {
+    seed('member_answered');
+    nextAttempt().mockResolvedValue({ enqueued: true });
+    await gather('2');
+    await memberStatus('completed', { CallDuration: '3' });
+    expect(store.record).toMatchObject({ state: 'between_attempts', outcome: 'member_declined' });
+    expect(store.eventTypes()).toEqual(['call.member_declined']);
+  });
+
+  it('seam enqueued: the record waits in between_attempts for the next attempt and is not finished', async () => {
+    seed('member_ringing');
+    nextAttempt().mockResolvedValue({ enqueued: true });
+    await memberStatus('no-answer', { CallDuration: '0' });
+    expect(store.record?.state).toBe('between_attempts');
+    expect(store.eventTypes()).not.toContain('call.completed');
+  });
+
+  it.each(['max_attempts', 'no_candidates', 'too_old', 'disabled'] as const)('first attempt, seam refuses (%s): finishes with the member\'s own outcome and call.completed', async (reason) => {
+    seed('member_ringing');
+    nextAttempt().mockResolvedValue({ enqueued: false, reason });
+    await memberStatus('no-answer', { CallDuration: '0' });
+    expect(store.record).toMatchObject({ state: 'finished', outcome: 'member_no_answer' });
+    expect(store.eventTypes()).toEqual(['call.member_no_answer', 'call.completed']);
+    expect(store.events[1].detail).toEqual({ outcome: 'member_no_answer' });
+  });
+
+  it('a later attempt, seam refuses: finishes with no_member_available', async () => {
+    seed('member_answered', { attemptNo: 2, memberId: 'mother00', triedMemberIds: [MEMBER_ID, 'mother00'], meteredLegs: ['member:1'], outcome: 'member_declined' });
+    nextAttempt().mockResolvedValue({ enqueued: false, reason: 'no_candidates' });
+    await memberStatus('completed', { CallDuration: '3' });
+    expect(store.record).toMatchObject({ state: 'finished', outcome: 'no_member_available', meteredLegs: ['member:1', 'member:2'] });
+    expect(store.eventTypes()).toEqual(['call.member_declined', 'call.completed']);
+    expect(store.events[1].detail).toEqual({ outcome: 'no_member_available' });
+  });
+
+  it('a stale outcome left by an earlier attempt does not hide this attempt\'s own result', async () => {
+    seed('member_ringing', { attemptNo: 2, memberCallSid: NEXT_MEMBER_SID, meteredLegs: ['member:1'], outcome: 'member_declined' });
+    nextAttempt().mockResolvedValue({ enqueued: true });
+    await post('status', { CallSid: NEXT_MEMBER_SID, CallStatus: 'no-answer', CallDuration: '0' });
+    expect(store.record).toMatchObject({ state: 'between_attempts', outcome: 'member_no_answer', meteredLegs: ['member:1', 'member:2'] });
+    expect(store.eventTypes()).toEqual(['call.member_no_answer']);
+  });
+
+  it('a stale member outcome never becomes the outcome of a call a later member took', async () => {
+    seed('connected', { attemptNo: 2, memberCallSid: NEXT_MEMBER_SID, leadCallSid: LEAD_SID, meteredLegs: ['member:1'], outcome: 'member_declined' });
+    await leadStatus('completed', { CallDuration: '60', SequenceNumber: '3', ParentCallSid: NEXT_MEMBER_SID });
+    await post('status', { CallSid: NEXT_MEMBER_SID, CallStatus: 'completed', CallDuration: '70' });
+    expect(store.record).toMatchObject({ state: 'finished', outcome: 'completed' });
+  });
+
+  it('a seam that throws finishes the record (nothing is known to be queued) and logs only the error name', async () => {
+    seed('member_ringing');
+    nextAttempt().mockRejectedValue(new Error(`queue down for ${LEAD_PHONE}`));
+    const res = await memberStatus('no-answer', { CallDuration: '0' });
+    expect(res.status).toBe(200);
+    expect(store.record).toMatchObject({ state: 'finished', outcome: 'member_no_answer' });
+    const logs = JSON.stringify(logSpy.flatMap((s) => s.mock.calls));
+    expect(logs).toContain('next attempt request failed');
+    noPhoneIn(logs);
+  });
+
+  it('is requested once for a replayed or concurrent final callback, and bills once', async () => {
+    seed('member_ringing');
+    nextAttempt().mockResolvedValue({ enqueued: true });
+    await Promise.all([1, 2, 3].map(() => memberStatus('no-answer', { CallDuration: '0', SequenceNumber: '1' })));
+    await memberStatus('no-answer', { CallDuration: '0', SequenceNumber: '1' });
+    expect(nextAttempt()).toHaveBeenCalledTimes(1);
+    expect(usage()).toHaveLength(1);
+    expect(store.eventTypes()).toEqual(['call.member_no_answer']);
+  });
+
+  it('a replay after the record finished writes and requests nothing', async () => {
+    seed('member_ringing');
+    await memberStatus('no-answer', { CallDuration: '0' });
+    store.events = [];
+    const writes = store.transitions;
+    await memberStatus('no-answer', { CallDuration: '0' });
+    expect(store.transitions).toBe(writes);
+    expect(store.events).toHaveLength(0);
+    expect(nextAttempt()).toHaveBeenCalledTimes(1);
+  });
+
+  it('a callback for an earlier attempt\'s sid is acknowledged with an empty 200 and writes nothing', async () => {
+    seed('member_ringing', { attemptNo: 2, memberCallSid: NEXT_MEMBER_SID, meteredLegs: ['member:1'] });
+    const res = await memberStatus('no-answer', { CallDuration: '0', SequenceNumber: '2' }); // MEMBER_SID: attempt 1's call
+    expect(res.status).toBe(200);
+    expect(res.text).toBe('');
+    expect(store.transitions).toBe(0);
+    expect(store.events).toHaveLength(0);
+    expect(recordCallUsage).not.toHaveBeenCalled();
+    expect(nextAttempt()).not.toHaveBeenCalled();
+  });
+
+  it('a callback for the previous sid between attempts (before the next one is stored) is also a no-op', async () => {
+    seed('member_ringing');
+    nextAttempt().mockResolvedValue({ enqueued: true });
+    await memberStatus('no-answer', { CallDuration: '0', SequenceNumber: '1' });
+    store.events = [];
+    const writes = store.transitions;
+    await memberStatus('completed', { CallDuration: '0', SequenceNumber: '2' });
+    expect(store.transitions).toBe(writes);
+    expect(usage()).toHaveLength(1);
+    expect(nextAttempt()).toHaveBeenCalledTimes(1);
+  });
+
+  it('each attempt is metered under its own leg key and call sid, once per attempt even when replayed', async () => {
+    seed('member_ringing');
+    nextAttempt().mockResolvedValue({ enqueued: true });
+    await memberStatus('no-answer', { CallDuration: '0', SequenceNumber: '1' });
+    // The orchestrator starts the next attempt.
+    await store.transition(LIST, LEAD, ['between_attempts'], { state: 'member_ringing', attemptNo: 2, memberId: 'mother00', memberCallSid: NEXT_MEMBER_SID, triedMemberIds: ['mother00'] });
+    const second = { CallSid: NEXT_MEMBER_SID, CallStatus: 'completed', CallDuration: '40', SequenceNumber: '1' };
+    await post('status', second);
+    await post('status', second);
+    expect(store.record?.meteredLegs).toEqual(['member:1', 'member:2']);
+    expect(usage()).toEqual([
+      { userId: 'owner-a', callSid: MEMBER_SID, leg: 'member', durationSeconds: 0 },
+      { userId: 'owner-a', callSid: NEXT_MEMBER_SID, leg: 'member', durationSeconds: 40 },
+    ]);
+  });
+
+  it.each([
+    ['aborted', 'member_answered'], ['lead_phone_invalid', 'member_answered'], ['lead_phone_changed', 'member_answered'],
+  ] as const)('does not ask for another member when the call ended as %s', async (outcome, state) => {
+    seed(state, { outcome });
+    await memberStatus('completed', { CallDuration: '9' });
+    expect(nextAttempt()).not.toHaveBeenCalled();
+    expect(store.record).toMatchObject({ state: 'finished', outcome });
+  });
+
+  it.each(['bridging', 'connected'] as const)('does not ask for another member when the member took the lead (%s)', async (state) => {
+    seed(state, { leadCallSid: LEAD_SID, meteredLegs: ['lead'] });
+    await memberStatus('completed', { CallDuration: '9' });
+    expect(nextAttempt()).not.toHaveBeenCalled();
+    expect(store.record?.state).toBe('finished');
+  });
+
+  it('a member who answers, presses 1 and then drops while the lead is still ringing is not a declined attempt', async () => {
+    seed('member_answered');
+    await gather('1');
+    await memberStatus('completed', { CallDuration: '9' });
+    expect(nextAttempt()).not.toHaveBeenCalled();
+    expect(store.record).toMatchObject({ state: 'bridging', meteredLegs: ['member:1'] });
+  });
+
+  it('a final callback racing the press of 1 never both bridges and moves on to another member', async () => {
+    for (let i = 0; i < 5; i++) {
+      seed('member_answered');
+      nextAttempt().mockReset().mockResolvedValue({ enqueued: true });
+      const [pressed] = await Promise.all([gather('1'), memberStatus('completed', { CallDuration: '9' })]);
+      const bridged = pressed.text.includes('<Dial');
+      expect(bridged ? store.record?.state : 'between_attempts').toBe(bridged ? 'bridging' : 'between_attempts');
+      expect(nextAttempt()).toHaveBeenCalledTimes(bridged ? 0 : 1);
+    }
+  });
+
+  it('answers 500 and requests nothing when no member can be found to bill', async () => {
+    seed('member_ringing');
+    mock(crmDb.getLeadListById).mockResolvedValue(null);
+    expect((await memberStatus('no-answer', { CallDuration: '0' })).status).toBe(500);
+    expect(nextAttempt()).not.toHaveBeenCalled();
+    expect(store.record?.state).toBe('member_ringing');
+  });
+});
+
+describe('terminal rule across several attempts', () => {
+  const secondAttempt = (state: HotLeadCallState, extra: Partial<HotLeadCallRecord> = {}) =>
+    seed(state, { attemptNo: 2, memberId: 'mother00', memberCallSid: NEXT_MEMBER_SID, triedMemberIds: [MEMBER_ID, 'mother00'], meteredLegs: ['member:1'], ...extra });
+  const secondLeadEnds = () => leadStatus('completed', { CallDuration: '40', SequenceNumber: '3', ParentCallSid: NEXT_MEMBER_SID });
+  const secondMemberEnds = (extra: Record<string, string> = {}) =>
+    post('status', { CallSid: NEXT_MEMBER_SID, CallStatus: 'completed', CallDuration: '50', ...extra });
+
+  it('finishes only when attempt 2\'s member leg and the lead leg are metered; attempt 1\'s key does not stand in for either', async () => {
+    secondAttempt('connected', { leadCallSid: LEAD_SID });
+    await secondLeadEnds();
+    expect(store.record?.state).toBe('connected');
+    await secondMemberEnds();
+    expect(store.record).toMatchObject({ state: 'finished', outcome: 'completed', meteredLegs: ['member:1', 'lead', 'member:2'] });
+    expect(usage().map((u) => [u.callSid, u.leg])).toEqual([[LEAD_SID, 'lead'], [NEXT_MEMBER_SID, 'member']]);
+  });
+
+  it('member:1 and the lead metered but member:2 not: the record stays live', async () => {
+    secondAttempt('connected', { leadCallSid: LEAD_SID, meteredLegs: ['member:1', 'lead'] });
+    await secondLeadEnds();
+    expect(store.record?.state).toBe('connected');
+  });
+
+  it('does not wait for the lead leg of an earlier attempt that never dialed one', async () => {
+    secondAttempt('member_answered', { outcome: 'lead_phone_invalid' });
+    await secondMemberEnds();
+    expect(store.record).toMatchObject({ state: 'finished', outcome: 'lead_phone_invalid', meteredLegs: ['member:1', 'member:2'] });
+  });
+
+  it('the lead leg of the bridged attempt is metered once, even replayed', async () => {
+    secondAttempt('connected', { leadCallSid: LEAD_SID });
+    for (let i = 0; i < 3; i++) await secondLeadEnds();
+    expect(usage()).toHaveLength(1);
+  });
+});
+
 // ── /dial ────────────────────────────────────────────────────────────────────
 
 describe('POST /dial', () => {
@@ -566,12 +1063,44 @@ describe('POST /dial', () => {
     expect(store.eventTypes()).toEqual(['call.lead_no_answer']);
   });
 
-  it('moves bridging to connected once on completed, with one call.connected', async () => {
-    const res = await dial('completed', { DialCallSid: LEAD_SID });
+  it('moves bridging to connected once on completed with DialBridged=true, with one call.connected', async () => {
+    const res = await dial('completed', { DialCallSid: LEAD_SID, DialBridged: 'true' });
     expect(res.text).toContain('<Hangup/>');
-    await dial('completed', { DialCallSid: LEAD_SID });
+    expect(res.text).not.toContain('did not confirm');
+    await dial('completed', { DialCallSid: LEAD_SID, DialBridged: 'true' });
     expect(store.record).toMatchObject({ state: 'connected', leadCallSid: LEAD_SID });
     expect(store.eventTypes()).toEqual(['call.connected']);
+  });
+
+  it('records lead_declined once for completed with DialBridged=false (the lead screened themselves out) and tells the member', async () => {
+    const res = await dial('completed', { DialCallSid: LEAD_SID, DialBridged: 'false' });
+    expect(res.text).toContain('The lead did not confirm. Their details are in your lead alert.');
+    expect(res.text).toContain('<Hangup/>');
+    expect(store.record).toMatchObject({ state: 'bridging', outcome: 'lead_declined', leadCallSid: LEAD_SID });
+    const replay = await dial('completed', { DialCallSid: LEAD_SID, DialBridged: 'false' });
+    expect(replay.text).toContain('did not confirm');
+    expect(store.eventTypes()).toEqual(['call.lead_declined']);
+  });
+
+  it('does not repeat call.lead_declined when /screen-result already recorded the decline', async () => {
+    seed('bridging', { leadCallSid: LEAD_SID });
+    await screenResult('2');
+    const res = await dial('completed', { DialCallSid: LEAD_SID, DialBridged: 'false' });
+    expect(res.text).toContain('did not confirm');
+    expect(store.eventTypes()).toEqual(['call.lead_declined']);
+    expect(store.record?.outcome).toBe('lead_declined');
+  });
+
+  it('writes nothing for completed without a DialBridged field: it cannot tell a conversation from a decline', async () => {
+    const res = await dial('completed', { DialCallSid: LEAD_SID });
+    expect(res.text).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
+    expect(store.transitions).toBe(0);
+  });
+
+  it('never tries another member after the lead declined: no next-attempt request from /dial', async () => {
+    await dial('completed', { DialCallSid: LEAD_SID, DialBridged: 'false' });
+    await dial('no-answer', { DialCallSid: LEAD_SID });
+    expect(requestNextHotLeadCallAttempt).not.toHaveBeenCalled();
   });
 
   it('does not downgrade a connected call or repeat the connected event when the answered callback came first', async () => {
@@ -624,6 +1153,9 @@ describe('POST /status', () => {
     await leadStatus('initiated', { SequenceNumber: '0' });
     await leadStatus('ringing', { SequenceNumber: '1' });
     await leadStatus('in-progress', { SequenceNumber: '2' });
+    expect(store.record).toMatchObject({ state: 'bridging', leadCallSid: LEAD_SID }); // answered, not yet confirmed
+    await screen();
+    await screenResult('1');
     expect(store.record).toMatchObject({ state: 'connected', leadCallSid: LEAD_SID });
     await leadStatus('completed', { SequenceNumber: '3', CallDuration: '125' });
     expect(store.record?.state).toBe('connected'); // member leg not metered yet
@@ -726,12 +1258,12 @@ describe('POST /status', () => {
     expect(store.events).toHaveLength(0);
   });
 
-  it('a lead "answered" callback moves bridging to connected exactly once', async () => {
+  it('a lead "answered" callback only remembers the lead sid: the lead may still decline at the screening prompt', async () => {
     seed('bridging');
     await leadStatus('in-progress', { SequenceNumber: '2' });
     await leadStatus('in-progress', { SequenceNumber: '2' });
-    expect(store.eventTypes()).toEqual(['call.connected']);
-    expect(store.record?.leadCallSid).toBe(LEAD_SID);
+    expect(store.events).toHaveLength(0);
+    expect(store.record).toMatchObject({ state: 'bridging', leadCallSid: LEAD_SID });
   });
 
   it('does not default a missing CallDuration to 0: the duration reaches the meter as NaN', async () => {
@@ -1107,6 +1639,8 @@ describe('ambiguous placements (dialing + outcome placement_unknown) and rejecte
     seed('member_answered', { outcome: 'placement_unknown' });
     await gather('1');
     await leadStatus('in-progress', { SequenceNumber: '2' });
+    await screen();
+    await screenResult('1');
     await leadStatus('completed', { CallDuration: '9', SequenceNumber: '3' });
     await memberStatus('completed', { CallDuration: '12' });
     expect(store.record).toMatchObject({ state: 'finished', outcome: 'completed' });

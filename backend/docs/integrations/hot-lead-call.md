@@ -3,7 +3,9 @@
 When a landing-page form lead arrives with a phone number, AgentWeb phones a
 member of the business's team from a Twilio number the org owns and says "New
 lead from <business name>. Are you available to take the call now? Press 1." On
-`1` it dials the lead and bridges the two. Which member is rung depends on the
+`1` it dials the lead, who hears "<business name> would like to talk to you about
+your enquiry. Press 1 to be connected now." and must press 1 as well; only then
+are the two calls bridged. Which member is rung depends on the
 team's priority order and weekly availability windows (see [Who is rung](#who-is-rung)). The outcome and every step are written to the lead's timeline.
 
 It is a second subscriber to the same moment as the Slack lead alert
@@ -58,12 +60,18 @@ sequenceDiagram
   App-->>Tw: Gather TwiML (prompt, 8s, 1 digit) - state=member_answered, call.member_answered
   Member->>Tw: presses 1
   Tw->>App: POST /gather Digits=1 (signed)
-  App-->>Tw: Say + Dial callerId=org number, Number=lead (statusCallback ...&leg=lead) - state=bridging
+  Note over App: live lead phone must still match the record's leadPhoneMac, else lead_phone_changed
+  App-->>Tw: Say + Dial answerOnBridge, callerId=org number, Number url=/screen (statusCallback ...&leg=lead) - state=bridging
   Tw->>LeadPhone: rings (25s)
   LeadPhone-->>Tw: answers
-  Tw->>App: POST /status leg=lead CallStatus=in-progress
+  Tw->>App: POST /status leg=lead CallStatus=in-progress (remembers the lead sid, no state change)
+  Tw->>App: POST /screen (runs on the lead's leg, before the bridge)
+  App-->>Tw: Gather 1 digit: "<business> would like to talk to you ... Press 1"
+  LeadPhone->>Tw: presses 1
+  Tw->>App: POST /screen-result Digits=1
+  App-->>Tw: empty Response - Twilio bridges the two calls
   Note over App: state=connected, event call.connected
-  Tw->>App: POST /dial DialCallStatus=completed (action URL, after the bridge ends)
+  Tw->>App: POST /dial DialCallStatus=completed DialBridged=true (action URL, after the bridge ends)
   Tw->>App: POST /status leg=lead completed + CallDuration  -> metered once
   Tw->>App: POST /status (member) completed + CallDuration   -> metered once
   Note over App: last leg metered -> state=finished, outcome=completed, event call.completed
@@ -73,13 +81,13 @@ Branches (all end in `finished` once every leg that was dialed is metered):
 
 | Situation | Webhook that decides | Outcome | Timeline events after `call.initiated` |
 | --- | --- | --- | --- |
-| Member presses 1, lead answers | `/gather`, lead `/status` | `completed` | `call.member_answered`, `call.connected`, `call.completed` |
-| Member presses another digit | `/gather` | `member_declined` | `call.member_answered`, `call.member_declined`, `call.completed` |
-| Member hangs up on or ignores the prompt | member `/status` terminal | `member_declined` | `call.member_answered`, `call.member_declined`, `call.completed` |
-| Member never picks up (no-answer, busy, failed, canceled) | member `/status` terminal | `member_no_answer` | `call.member_no_answer`, `call.completed` |
+| Member presses 1, lead answers and presses 1 | `/gather`, `/screen`, `/screen-result` | `completed` | `call.member_answered`, `call.connected`, `call.completed` |
+| Lead answers but presses another key, says nothing or hangs up | `/screen-result` (a key) or `/dial` (`completed` with `DialBridged=false`) | `lead_declined`; the member hears "The lead did not confirm. Their details are in your lead alert." and no other member is tried | `call.member_answered`, `call.lead_declined`, `call.completed` |
+| Member presses another digit, hangs up on or ignores the prompt, or never picks up (no-answer, busy, failed, canceled) | member `/status` terminal | `member_declined` / `member_no_answer` for the attempt; the record moves to `between_attempts` and the next-attempt request runs (see [Who is rung](#who-is-rung)) | `call.member_declined` or `call.member_no_answer`, then `call.completed` only when no further attempt is queued |
 | Member presses 1, lead does not answer | `/dial` with `no-answer`, `busy` or `failed` | `lead_no_answer` | `call.member_answered`, `call.lead_no_answer`, `call.completed` |
+| Lead number changed since the call passed the gates (repeat submission overwrote the phone) | `/gather` | `lead_phone_changed` (record stays `member_answered` until the member leg ends); the member hears "We could not reach the lead. Their details are in your lead alert."; no other member is tried | `call.member_answered`, `call.failed` (reason `lead_phone_changed`), `call.completed` |
 | Lead number no longer valid at bridge time | `/gather` | `lead_phone_invalid` (record stays `member_answered` until the member leg ends) | `call.member_answered`, `call.failed` (reason `lead_phone_invalid`), `call.completed` |
-| Kill switch or config turned off while the member is on the line | `/owner` or `/gather` | `aborted` | at `/owner` (still ringing): `call.failed` (reason `aborted`), `call.completed`; at `/gather` (member was on the prompt): `call.member_answered`, `call.failed` (reason `aborted`), `call.completed` |
+| Kill switch or config turned off while the member is on the line | `/owner`, `/gather` or `/screen` | `aborted` | at `/owner` (still ringing): `call.failed` (reason `aborted`), `call.completed`; at `/gather` (member was on the prompt): `call.member_answered`, `call.failed` (reason `aborted`), `call.completed`; at `/screen` (lead answered): `call.failed` (reason `aborted`), `call.completed` |
 | Member hangs up while the lead is still ringing (`/dial` reports `canceled`) | `/dial`, then `finishIfComplete` | `bridge_unconfirmed` | `call.member_answered`, `call.completed` |
 | Bridge ended but `/dial` never reported a result | `finishIfComplete` | `bridge_unconfirmed` | `call.completed` |
 
@@ -91,9 +99,21 @@ pure function: the verified team members, in team order, who have a window open 
 the same local instant in the calling-hours timezone, so DST days resolve on the
 clock the business sees. The orchestrator rings the first candidate that is not in
 its cooldown. With a team of one this is the single fixed phone of the first
-version. Today one attempt is made per lead; the record already carries
-`attemptNo`, `memberId` and `triedMemberIds` for the multi-attempt flow, and the
-state `between_attempts` is declared but not entered yet.
+version.
+
+**Next attempt.** When a member leg ends without the member taking the lead
+(declined, ignored the prompt, no answer, busy, failed, canceled) the member
+`/status` webhook, in ONE transition, meters leg `member:<attemptNo>` and moves the
+record to `between_attempts`. It then calls `requestNextHotLeadCallAttempt`
+(`services/hotLeadCallAttempts.ts`): if it answers `enqueued: true` the
+orchestrator's next-attempt job takes over from `between_attempts`; otherwise the
+webhook finishes the record (`call.completed`). A first attempt keeps its own
+outcome (`member_declined` / `member_no_answer`); after a later attempt the outcome
+is `no_member_available`. Webhooks never place calls. A member callback for any
+CallSid other than the record's current `memberCallSid` (an earlier attempt that
+was already metered) is acknowledged and writes nothing. A lead who declines or
+cannot be reached never triggers another member, and neither do `aborted`,
+`lead_phone_changed` or `lead_phone_invalid`.
 
 The leg-metering rule behind "finished": the store refuses to move a terminal
 record, so each leg is metered while the record is still live and the LAST leg
@@ -118,7 +138,7 @@ All paths are under `backend/src/`.
 | Twilio seam (`placeCall`, `buyNumber`, `releaseNumber`, `validateSignature`) | `services/voice/voiceProvider.ts` (the only file that imports `twilio`), `__tests__/helpers/fakeVoiceProvider.ts` (tests) |
 | Webhook URLs | `services/voice/voiceUrls.ts` |
 | TwiML builders (hand-built XML, XML-escaped) | `services/voice/twiml.ts` |
-| Webhook routes, mounted at `/api/webhooks/twilio-voice` | `routes/twilioVoiceWebhook.ts` (`/owner`, `/gather`, `/dial`, `/status`; the path names are kept from the first version, `/owner` now serves the prompt to the team member being rung) |
+| Webhook routes, mounted at `/api/webhooks/twilio-voice` | `routes/twilioVoiceWebhook.ts` (`/owner`, `/gather`, `/screen`, `/screen-result`, `/dial`, `/status`; the path names are kept from the first version, `/owner` now serves the prompt to the team member being rung) |
 | Per-leg metering | `services/voice/voiceUsage.ts` `recordCallUsage` -> `recordVendorUsage` |
 | Rate card and runtime rate overrides | `utils/vendorRateCard.ts`, `routes/adminVendorRates.ts` |
 | Twilio credentials | `utils/secretsManager.ts` `getTwilioCredentials` |
@@ -186,6 +206,12 @@ call, Slack only"). Validation applies to every read, including the webhooks.
 
 The lead's number is read from the lead row at dispatch AND again at bridge time;
 national-format numbers are parsed as US. It never travels in a URL or a query.
+A repeat submission with the same email overwrites `lead.phone`, so the call
+record keeps `leadPhoneMac`, a keyed HMAC of the number that passed the gates
+(`services/voice/leadPhoneMac.ts`, domain label `hlc-lead-phone-v1`; never the
+number). `/gather` refuses to dial when the live number's MAC differs
+(`lead_phone_changed`). A record without a `leadPhoneMac` (created before the
+check existed) is dialed and a warning is logged.
 
 ## Emma tools
 
@@ -506,18 +532,32 @@ Event types written to the lead timeline (`eventType`, with a scalar `eventData`
 | `call.member_answered` | member picked up (`/owner`), once | - |
 | `call.member_declined` | member pressed a key other than 1, or hung up on the prompt | - |
 | `call.member_no_answer` | member leg ended before pickup | - |
-| `call.connected` | lead answered (lead `/status` in-progress, or `/dial` completed) | - |
+| `call.lead_declined` | the lead answered but did not press 1 at the screening prompt (`/screen-result`, or `/dial` with `DialBridged=false`), once | - |
+| `call.connected` | the lead pressed 1 at the screening prompt (`/screen-result`), or `/dial` reported `DialBridged=true`; an answered lead leg alone is not a connection | - |
 | `call.lead_no_answer` | `/dial` reported no-answer, busy or failed | `dialStatus` |
 | `call.completed` | last dialed leg metered; the record is `finished` | `outcome` |
-| `call.failed` | `reason`: `place_rejected`, `placement_unknown`, `lead_phone_invalid`, `aborted` | `reason` |
+| `call.failed` | `reason`: `place_rejected`, `placement_unknown`, `lead_phone_invalid`, `lead_phone_changed`, `aborted` | `reason` |
 | `call.skipped` | a gate or limit refused (no Twilio call made) | `reason` (list above) |
 
 Record `state`: `dialing`, `member_ringing`, `member_answered`, `between_attempts`
-(declared for the multi-attempt flow, not entered yet), `bridging`, `connected` (live) and `finished`, `failed`, `skipped` (terminal; `skipped` is in
+(an attempt ended without a bridge and its leg is metered; waiting for the next
+attempt or the finish), `bridging`, `connected` (live) and `finished`, `failed`, `skipped` (terminal; `skipped` is in
 the type but the orchestrator records skips as events only). `outcome` values:
-`completed`, `member_declined`, `member_no_answer`, `lead_no_answer`,
-`lead_phone_invalid`, `bridge_unconfirmed`, `aborted`, `place_rejected`,
-`placement_unknown` (informational on a live `dialing` record).
+`completed`, `member_declined`, `member_no_answer`, `no_member_available`,
+`lead_declined`, `lead_no_answer`, `lead_phone_invalid`, `lead_phone_changed`,
+`bridge_unconfirmed`, `aborted`, `place_rejected`,
+`placement_unknown` (informational on a live `dialing` record). Decision
+markers in `lastSequence`: `<memberCallSid>#gather`, `<memberCallSid>#dial`,
+`<leadCallSid>#screen`, `lead#adopt`.
+
+Webhook endpoints (all under `/api/webhooks/twilio-voice`, query keys `listId`, `leadId`, `jobKey`, plus `leg=lead` on the lead's status callback only): `/owner` (member prompt), `/gather`
+(member's key; dials the lead), `/screen` (lead's leg after answering: adopts the
+body CallSid as the lead leg, asks for 1), `/screen-result` (the lead's key),
+`/dial` (the `<Dial action>`; `DialBridged` tells a conversation from a lead who
+screened themselves out), `/status` (per-leg progress and metering). `/screen` and `/screen-result` are
+identified only by the signed query ids plus the record state (`bridging`), and
+the body CallSid is taken to be the lead leg's, because the request parameters
+of the screening leg are not documented.
 
 Webhook answers: a bad or missing signature is 401; credentials that cannot be
 loaded 503; a signed request that is not for a live call this job owns gets a
@@ -564,9 +604,9 @@ mid-call. No cron cleans these up and no operator tool lists them.
 
   ```sh
   aws dynamodb scan --region us-west-2 --table-name AW-Leads \
-    --filter-expression '#s.#k.#st IN (:a,:b,:c,:d,:e) AND #s.#k.#u < :cutoff' \
+    --filter-expression '#s.#k.#st IN (:a,:b,:c,:d,:e,:f) AND #s.#k.#u < :cutoff' \
     --expression-attribute-names '{"#s":"system","#k":"hot_lead_call","#st":"state","#u":"updatedAt"}' \
-    --expression-attribute-values '{":a":{"S":"dialing"},":b":{"S":"member_ringing"},":c":{"S":"member_answered"},":d":{"S":"bridging"},":e":{"S":"connected"},":cutoff":{"S":"<ISO time 2 hours ago>"}}' \
+    --expression-attribute-values '{":a":{"S":"dialing"},":b":{"S":"member_ringing"},":c":{"S":"member_answered"},":d":{"S":"bridging"},":e":{"S":"connected"},":f":{"S":"between_attempts"},":cutoff":{"S":"<ISO time 2 hours ago>"}}' \
     --projection-expression 'listId, leadId, #s.#k.#st, #s.#k.#u, #s.#k.memberCallSid, #s.#k.leadCallSid, #s.#k.outcome'
   ```
 
@@ -586,6 +626,10 @@ mid-call. No cron cleans these up and no operator tool lists them.
   `startedAt`. If one exists and its callbacks never arrived, Twilio billed it
   and we did not meter it.
 - `member_ringing` / `member_answered`: the member leg's final callback is missing.
+- `between_attempts`: the attempt's leg is metered but the record was neither
+  taken over by a next attempt nor finished (the process died between the
+  metering and the next-attempt request, or the next-attempt job never ran). No
+  call is in flight. The lead is simply not called again.
 - `bridging` / `connected`: the bridge ended but a leg callback is missing; the
   call may be unmetered.
 
@@ -640,8 +684,9 @@ availability:
 Mitigations to decide before general availability (none of them is built):
 
 - CAPTCHA or honeypot enforcement on the lander endpoint.
-- A spoken disclosure to the lead before the bridge. This needs the Twilio
-  `<Number url>` whisper, which has not been verified.
+- A spoken disclosure to the lead (for example about recording) before the
+  bridge. The screening prompt (`/screen`) is the place for it; today it only
+  names the business and asks the lead to press 1.
 - Requiring a name or an email besides the phone number.
 - Consent text on the landers.
 
@@ -741,9 +786,30 @@ Twilio's documentation and encoded in tests with synthetic payloads:
 - That the member leg is billed for the whole call duration including the bridged
   conversation (`CallDuration` of the member call covering the `<Dial>`), so
   metering member and lead legs separately matches Twilio's invoice.
-- That the lead's "answered" event arrives as `CallStatus=in-progress` on the
-  `<Number>` status callback (the connected transition depends on it; `/dial`
-  completed is the backstop).
+- **Lead confirmation (go-live staging checks, none observed):**
+  - What the MEMBER hears while the lead is being screened. With
+    `answerOnBridge="true"` on a `<Dial>` whose parent leg is already answered, the
+    member is expected to hear the `<Say>` "Calling the lead now, please hold."
+    followed by ringing or silence, but this was never listened to. If the member
+    hears nothing, or hears something misleading, the fallback design is a Twilio
+    Conference (member joins a conference, the lead is called into it and
+    screened, then both are in the same room). It is documented here and not built.
+  - Billing of the screening leg: whether Twilio bills the lead leg for the time
+    spent at the screening prompt (it is the same `<Number>` call, so it is
+    expected to be one leg metered by its `completed` status callback with the
+    full `CallDuration`, screening included) and whether a lead who declines still
+    produces a `completed` status callback with a `CallDuration`.
+  - The request parameters of the `/screen` and `/screen-result` requests. The
+    handlers rely on the signed query ids and the record state only, and treat the
+    body `CallSid` as the lead leg's (a body `CallSid` equal to the member's is
+    refused, never adopted).
+  - That `DialBridged` (`true`/`false`) is sent on the `<Dial action>` request
+    after a screened-out `<Number>`, with `DialCallStatus=completed`. A `completed`
+    without `DialBridged` is ignored (the legs' status callbacks then finish the
+    record as `bridge_unconfirmed`).
+  - That a lead leg's `in-progress` status callback arrives when the lead
+    answers, before the screening result. It only records the lead's sid; the
+    connection is recorded when the lead presses 1 (or by `/dial`).
 - That `DialCallSid` is present on a `/dial` request when the lead did not answer
   (without it the lead leg is treated as never created and not awaited).
 - The rate and rounding statements: the provisional rates and "no stated rounding

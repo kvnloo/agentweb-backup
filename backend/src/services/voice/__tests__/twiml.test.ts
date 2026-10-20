@@ -2,9 +2,16 @@ import {
   CONNECTING_COPY,
   LEAD_UNREACHABLE_COPY,
   NO_INPUT_COPY,
+  LEAD_DECLINED_COPY,
+  LEAD_PHONE_CHANGED_COPY,
+  SCREEN_NO_INPUT_COPY,
+  bridgeTwiml,
   connectTwiml,
   escapeXml,
   hangupTwiml,
+  leadDeclinedTwiml,
+  leadPhoneChangedTwiml,
+  leadScreenTwiml,
   leadUnreachableTwiml,
   memberPromptTwiml,
   verificationCodeTwiml,
@@ -51,6 +58,8 @@ const URLS = {
   gatherUrl: 'https://api.example.test/api/webhooks/twilio-voice/gather?listId=l1&leadId=ld1&jobKey=j1',
   dialUrl: 'https://api.example.test/api/webhooks/twilio-voice/dial?listId=l1&leadId=ld1&jobKey=j1',
   statusUrl: 'https://api.example.test/api/webhooks/twilio-voice/status?listId=l1&leadId=ld1&jobKey=j1&leg=lead',
+  screenUrl: 'https://api.example.test/api/webhooks/twilio-voice/screen?listId=l1&leadId=ld1&jobKey=j1',
+  resultUrl: 'https://api.example.test/api/webhooks/twilio-voice/screen-result?listId=l1&leadId=ld1&jobKey=j1',
 };
 const NASTY = `Smith & Sons <"O'Brien"> ]]> &amp;`;
 
@@ -89,22 +98,30 @@ describe('twiml builders', () => {
     expect(parseXml(xml).children[0].children[0].text).toContain('Acme.');
   });
 
-  it('builds the connect response: Say, then Dial with callerId/timeout/action and one Number carrying the status callback', () => {
+  it('builds the connect response: Say, then Dial with callerId/timeout/action and one Number carrying the screening url and the status callback', () => {
     const xml = connectTwiml({ twilioNumber: '+15555550111', leadE164: '+15555550123', ...URLS });
     const root = parseXml(xml);
     expect(root.children.map((c) => c.name)).toEqual(['Say', 'Dial']);
     expect(root.children[0].text).toBe(CONNECTING_COPY);
     const dial = root.children[1];
-    expect(dial.attrs).toEqual({ callerId: '+15555550111', timeout: '25', timeLimit: '1800', action: URLS.dialUrl, method: 'POST' });
+    expect(dial.attrs).toEqual({ answerOnBridge: 'true', callerId: '+15555550111', timeout: '25', timeLimit: '1800', action: URLS.dialUrl, method: 'POST' });
     expect(dial.children).toHaveLength(1);
     const number = dial.children[0];
     expect(number.name).toBe('Number');
     expect(number.text).toBe('+15555550123');
     expect(number.attrs).toEqual({
+      url: URLS.screenUrl,
+      method: 'POST',
       statusCallback: URLS.statusUrl,
       statusCallbackEvent: 'initiated ringing answered completed',
       statusCallbackMethod: 'POST',
     });
+  });
+
+  it('escapes the screening url like every other attribute', () => {
+    const xml = connectTwiml({ twilioNumber: '+15555550111', leadE164: '+15555550123', dialUrl: 'd', statusUrl: 's', screenUrl: 'https://x.test/s?a=1&b="2"<' });
+    expect(xml).toContain('url="https://x.test/s?a=1&amp;b=&quot;2&quot;&lt;"');
+    expect(parseXml(xml).children[1].children[0].attrs.url).toBe('https://x.test/s?a=1&b="2"<');
   });
 
   it('refuses to put anything but an E.164 number into the Dial', () => {
@@ -117,6 +134,36 @@ describe('twiml builders', () => {
     expect(apology.children.map((c) => c.name)).toEqual(['Say', 'Hangup']);
     expect(apology.children[0].text).toBe(LEAD_UNREACHABLE_COPY);
     expect(hangupTwiml()).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
+  });
+
+  it('builds the lead screening prompt: a one-digit Gather with the escaped name, then a goodbye and hangup', () => {
+    const xml = leadScreenTwiml({ announcedName: 'Smith & Sons', resultUrl: URLS.resultUrl });
+    const root = parseXml(xml);
+    expect(root.children.map((c) => c.name)).toEqual(['Gather', 'Say', 'Hangup']);
+    expect(root.children[0].attrs).toEqual({ input: 'dtmf', numDigits: '1', timeout: '8', action: URLS.resultUrl, method: 'POST' });
+    expect(root.children[0].children[0].text).toBe('Smith & Sons would like to talk to you about your enquiry. Press 1 to be connected now.');
+    expect(xml).toContain('Smith &amp; Sons would like');
+    expect(root.children[1].text).toBe(SCREEN_NO_INPUT_COPY);
+  });
+
+  it('keeps the screening prompt well-formed for quotes, angle brackets and entity look-alikes in the name', () => {
+    const xml = leadScreenTwiml({ announcedName: NASTY, resultUrl: URLS.resultUrl });
+    expect(parseXml(xml).children[0].children[0].text).toBe(`${NASTY} would like to talk to you about your enquiry. Press 1 to be connected now.`);
+  });
+
+  it('answers the screening with an empty response so Twilio bridges the calls', () => {
+    expect(bridgeTwiml()).toBe('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+    expect(parseXml(bridgeTwiml()).children).toHaveLength(0);
+  });
+
+  it('builds the fixed messages for the member when the lead phone changed or the lead did not confirm', () => {
+    for (const [xml, copy] of [[leadPhoneChangedTwiml(), LEAD_PHONE_CHANGED_COPY], [leadDeclinedTwiml(), LEAD_DECLINED_COPY]] as const) {
+      const root = parseXml(xml);
+      expect(root.children.map((c) => c.name)).toEqual(['Say', 'Hangup']);
+      expect(root.children[0].text).toBe(copy);
+    }
+    expect(LEAD_PHONE_CHANGED_COPY).toBe('We could not reach the lead. Their details are in your lead alert.');
+    expect(LEAD_DECLINED_COPY).toBe('The lead did not confirm. Their details are in your lead alert.');
   });
 
   it('escapeXml output never contains a raw special character, for any input (property check)', () => {

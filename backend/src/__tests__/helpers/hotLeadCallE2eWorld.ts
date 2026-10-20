@@ -164,6 +164,9 @@ export function twilioCall(placed: WebhookCall, memberSid = 'CA00000001', leadSi
   let gatherUrl = '';
   let dialUrl = '';
   let leadStatusUrl = '';
+  let screenUrl = '';
+  let screenResultUrl = '';
+  const leadLeg = { AccountSid: memberLeg.AccountSid, From: TWILIO_NUMBER, To: LEAD_E164, CallSid: leadSid };
   return {
     get leadStatusUrl() { return leadStatusUrl; },
     async memberAnswers() {
@@ -173,25 +176,35 @@ export function twilioCall(placed: WebhookCall, memberSid = 'CA00000001', leadSi
     },
     async memberPresses(digits: string) {
       const reply = await twilio.post(gatherUrl, { ...memberLeg, CallSid: memberSid, CallStatus: 'in-progress', Digits: digits, FinishedOnKey: '' });
-      if (reply.body.includes('<Dial')) { dialUrl = attrOf(reply.body, 'action'); leadStatusUrl = attrOf(reply.body, 'statusCallback'); }
+      if (reply.body.includes('<Dial')) { dialUrl = attrOf(reply.body, 'action'); leadStatusUrl = attrOf(reply.body, 'statusCallback'); screenUrl = attrOf(reply.body, 'url'); }
       return reply;
     },
+    /** The lead answers: Twilio fetches the Number's screening url on the lead's leg. */
+    async leadAnswers() {
+      const reply = await twilio.post(screenUrl, { ...leadLeg, CallStatus: 'in-progress' });
+      if (reply.body.includes('<Gather')) screenResultUrl = attrOf(reply.body, 'action');
+      return reply;
+    },
+    /** The lead keys a digit at the screening prompt; an empty response means Twilio bridges the calls. */
+    leadPresses: (digits: string) => twilio.post(screenResultUrl, { ...leadLeg, CallStatus: 'in-progress', Digits: digits, FinishedOnKey: '' }),
     leadStatus: (callStatus: string, sequence: number, extra: Record<string, string> = {}) =>
       twilio.post(leadStatusUrl, { AccountSid: memberLeg.AccountSid, From: TWILIO_NUMBER, To: LEAD_E164, CallSid: leadSid, ParentCallSid: memberSid, CallStatus: callStatus, SequenceNumber: String(sequence), ...extra }),
     dialEnds: (dialStatus: string, extra: Record<string, string> = {}) =>
-      twilio.post(dialUrl, { ...memberLeg, CallSid: memberSid, DialCallStatus: dialStatus, DialCallSid: leadSid, ...extra }),
+      twilio.post(dialUrl, { ...memberLeg, CallSid: memberSid, DialCallStatus: dialStatus, DialCallSid: leadSid, ...(dialStatus === 'completed' ? { DialBridged: 'true' } : {}), ...extra }),
     memberLegEnds: (callStatus: string, durationSeconds: string, sequence = 0, extra: Record<string, string> = {}) =>
       twilio.post(placed.statusCallbackUrl, { ...memberLeg, CallSid: memberSid, CallStatus: callStatus, CallDuration: durationSeconds, SequenceNumber: String(sequence), ...extra }),
   };
 }
 
-/** Rings the member, who presses 1, and the lead answers: the call is bridged. Returns the live call. */
+/** Rings the member, who presses 1, and the lead answers and presses 1: the call is bridged. Returns the live call. */
 export async function bridgedCall(leadId = 'lead-a') {
   await submitLead(leadId);
   const call = twilioCall(placedCall());
   await call.memberAnswers();
   await call.memberPresses('1');
   await call.leadStatus('in-progress', 2);
+  await call.leadAnswers();
+  await call.leadPresses('1');
   return call;
 }
 

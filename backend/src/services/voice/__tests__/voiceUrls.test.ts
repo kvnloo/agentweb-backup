@@ -6,7 +6,7 @@ describe('buildVoiceWebhookUrl', () => {
   const env = { ...process.env };
   afterEach(() => { process.env = { ...env }; });
 
-  it.each(['owner', 'gather', 'dial', 'status'] as const)('builds the %s URL on the twilio-voice mount from BACKEND_URL', (kind) => {
+  it.each(['owner', 'gather', 'dial', 'status', 'screen', 'screen-result'] as const)('builds the %s URL on the twilio-voice mount from BACKEND_URL', (kind) => {
     process.env.BACKEND_URL = 'https://api.example.com';
     const url = new URL(buildVoiceWebhookUrl(kind, { listId: 'l1', leadId: 'ld1', jobKey: 'j1' }));
     expect(url.origin + url.pathname).toBe(`https://api.example.com/api/webhooks/twilio-voice/${kind}`);
@@ -59,7 +59,7 @@ describe('status callback retry override', () => {
   it('puts the documented retry fragment on status URLs only', () => {
     const c = { listId: 'l', leadId: 'd', jobKey: 'j' };
     expect(buildVoiceWebhookUrl('status', c)).toMatch(/\?listId=l&leadId=d&jobKey=j#rc=3&rp=5xx,ct$/);
-    for (const kind of ['owner', 'gather', 'dial'] as const) expect(buildVoiceWebhookUrl(kind, c)).not.toContain('#');
+    for (const kind of ['owner', 'gather', 'dial', 'screen', 'screen-result'] as const) expect(buildVoiceWebhookUrl(kind, c)).not.toContain('#');
   });
 
   it('adds leg=lead to the query, before the fragment', () => {
