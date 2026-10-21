@@ -260,6 +260,7 @@ describe('switch on: the block is recorded and the owner is told once', () => {
     expect(history[0]).toMatchObject({ blockedBy: 'model_unavailable', blockedReason: 'not_in_plan', blockedModel: 'gpt-5.5' });
     expect(computeScheduleRunHealth(history)).toMatchObject({
       lastRunStatus: 'failure', lastRunBlockedBy: 'model_unavailable', lastRunBlockedReason: 'not_in_plan',
+      lastRunBlockedModel: 'gpt-5.5',
     });
 
     expect(mockFailedEmail).toHaveBeenCalledTimes(1);

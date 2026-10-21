@@ -149,6 +149,42 @@ export async function assertAgentWebModelSelectable(input: {
   await agentWebModelRouter.route({ tier: null, taskType: input.taskType ?? taskTypeForSession(input.session), allowedModels: ALL_MODELS });
 }
 
+/** Why the pickers do not offer the AgentWeb Model to an owner while the switch is on. */
+export type AgentWebModelNotOfferedReason = 'not_in_plan' | 'unavailable_for_tier';
+
+/** The AgentWeb Model as an owner's pickers see it while the switch is on (see describeAgentWebModelAvailability). */
+export interface AgentWebModelAvailability {
+  /** Exactly offersAgentWebModel(owner): the pickers list it. */
+  offered: boolean;
+  /**
+   * Present when not offered:
+   *  - 'unavailable_for_tier': the router cannot route this owner's tier right now (unusable table, tier unavailable, or
+   *    a route with an unusable target). Nothing on it runs, AgentWeb's own choice (a system pin) included.
+   *  - 'not_in_plan': it routes this tier (every route inside the owner's allowlist), but the allowlist does not list
+   *    it: a pick of it is refused (not_in_plan), while AgentWeb's own choice (an admin-authored plan's pin, source
+   *    'system') still runs.
+   * When both apply, 'unavailable_for_tier' (neither kind of selection runs).
+   */
+  reason?: AgentWebModelNotOfferedReason;
+}
+
+/**
+ * The AgentWeb Model's availability for one owner, for GET /model-options: null while the switch is off (nothing is
+ * read beyond the cached switch, and the response is unchanged). Never names a tier.
+ */
+export async function describeAgentWebModelAvailability(ownerUserId: string): Promise<AgentWebModelAvailability | null> {
+  if (!(await agentWebModelRouter.isEnabled())) return null;
+  if (await offersAgentWebModel(ownerUserId)) return { offered: true };
+  // Not offered: AgentWeb's own pin of it still runs only if the router serves the tier with every route inside the
+  // owner's live allowlist (routeAgentWebModelSelection's check; the load-time tier check skips a tier that does not
+  // list the AgentWeb Model). That can hold only when the plan does not list it (were it listed, it would be offered).
+  const access = await modelAccess.getModelAccess(ownerUserId);
+  const allowedModels = (await modelAccess.isEnabled()) && !access.isAdmin ? access.allowedModels : ALL_MODELS;
+  return (await agentWebModelRouter.isAvailableFor(access.tier, allowedModels))
+    ? { offered: false, reason: 'not_in_plan' }
+    : { offered: false, reason: 'unavailable_for_tier' };
+}
+
 /**
  * Whether the pickers offer the AgentWeb Model to this owner: the switch is on (off: nothing is read beyond the cached
  * switch), the owner's tier includes it, and the router is currently valid for that tier (usable table, tier not

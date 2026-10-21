@@ -322,6 +322,16 @@ describe('createAgentWebModelRouter', () => {
     expect(t.deps.alert.mock.calls[0][0].detail).toContain('unknown task type "chta"');
   });
 
+  it('isAvailableFor with an allowlist: every route must be inside it, as route() requires for a turn', async () => {
+    // Free does not list the AgentWeb Model, so the load-time tier check skips it; only AgentWeb's own pin can run there.
+    const t = makeDeps({ tiers: [{ name: 'Free', allowedModels: ['good-a'] }] });
+    expect(await t.router.isAvailableFor('Free')).toBe(true);
+    expect(await t.router.isAvailableFor('Free', ['good-a'])).toBe(false); // Free's default is good-b
+    await expect(t.router.route({ tier: 'Free', taskType: 'chat', allowedModels: ['good-a'] })).rejects.toMatchObject({ reason: 'not_served' });
+    expect(await t.router.isAvailableFor('Free', ['good-a', 'good-b'])).toBe(true);
+    expect(await t.router.isAvailableFor('Free', ALL_MODELS)).toBe(true);
+  });
+
   it('route reasons never name a tier (replies are readable by share viewers)', async () => {
     const t = makeDeps();
     for (const tier of ['Pro', 'Free', null]) {

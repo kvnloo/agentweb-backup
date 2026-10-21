@@ -482,12 +482,18 @@ export function createAgentWebModelRouter(deps: AgentWebModelRouterDeps) {
    * Whether the router is currently valid for this tier (null = no tier override applies): the table is usable, the
    * tier is not unavailable, and every route the tier can take resolves to a usable target. The pickers offer the
    * AgentWeb Model only then.
+   * `allowedModels` (default: every model) also requires every route to be inside that allowlist, as `route` does for
+   * a turn: the load-time tier check covers only tiers that list the AgentWeb Model, so for a tier that does not (where
+   * only AgentWeb's own pin of it can run) this is what says whether such a pin runs.
    */
-  async function isAvailableFor(tier: string | null): Promise<boolean> {
+  async function isAvailableFor(tier: string | null, allowedModels: AllowedModels = ALL_MODELS): Promise<boolean> {
     const current = await getTableState();
     if (current.status !== 'ready') return false;
     if (tier && current.unavailableTiers[tier]) return false;
-    return AGENTWEB_TASK_TYPES.every((taskType) => !current.invalidTargets[routeFor(current.table, tier, taskType).model]);
+    return AGENTWEB_TASK_TYPES.every((taskType) => {
+      const { model } = routeFor(current.table, tier, taskType);
+      return !current.invalidTargets[model] && (allowedModels === ALL_MODELS || allowedModels.includes(model));
+    });
   }
 
   /** Forget the switch and the table (tests). */
