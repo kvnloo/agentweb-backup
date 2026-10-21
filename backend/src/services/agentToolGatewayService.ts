@@ -747,6 +747,9 @@ const DEFAULT_ARG_ALIASES: Record<string, string[]> = {
   operations_json: ['replacement_json', 'operations', 'replacements', 'replacement_instructions'],
   // playwright_browser_evaluate requires `function`; models send `expression`/`script` (ENG-2473).
   function: ['expression', 'script', 'js', 'code'],
+  // monitor_lead_volume / assess_client_health etc. require `client_name_or_email`;
+  // scheduled report runs send `client_id: "<email>"` (ENG-2610).
+  client_name_or_email: ['client_id', 'client_email', 'client'],
 };
 
 export function evaluateAgentToolPolicy(input: AgentToolPolicyInput): AgentToolPolicyDecision {
@@ -1510,6 +1513,8 @@ function findKnownAliasSource(input: {
     ].map(normalizeArgName);
     for (const key of Object.keys(input.existingArgs)) {
       if (key === input.target) continue;
+      // A key that is a real schema property is the caller's own argument, not an alias (ENG-2610).
+      if (input.properties[key]) continue;
       if (targetAliases.includes(normalizeArgName(key))) return key;
     }
   }
