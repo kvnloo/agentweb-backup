@@ -413,6 +413,17 @@ describe('buildAgentRunTrace', () => {
     });
   });
 
+  it('builds an ordered timeline of user and agent messages and calls', () => {
+    const trace = buildAgentRunTrace({ sessionId: 's1', session: SESSION, messages: plannedRun() });
+    const kinds = trace.timeline.map((e) => (e.kind === 'call' ? `call:${e.callId}` : `${e.kind}:${e.text.slice(0, 12)}`));
+
+    expect(kinds[0]).toBe('user:Run the week');
+    expect(kinds.slice(1, 4)).toEqual(['call:c1', 'call:c2', 'call:c3']);
+    expect(kinds).toContain('call:c9');
+    expect(kinds[kinds.length - 1]).toBe('agent:<p>Report re');
+    expect(trace.timelineOmitted).toBe(0);
+  });
+
   it('caps large results and degrades every result when the run is over budget', () => {
     index = 0;
     const big = 'row of data '.repeat(Math.ceil((TRACE_LIMITS.resultChars + 100) / 12));
