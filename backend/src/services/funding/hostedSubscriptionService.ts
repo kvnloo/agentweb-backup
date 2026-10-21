@@ -263,6 +263,9 @@ export class HostedSubscriptionService {
       throw new HostedSubscriptionError("busy");
     }
     if (!(await this.promote(client, connectionId, loginRef, epoch + 1))) {
+      // The host keeps the ready attempt after a failed swap, and a new sign-in is refused while it exists: discard it (the owner
+      // signs in again). If the promote in fact completed, there is no attempt left and this is a no-op.
+      await client.loginCancel({ connectionId, loginRef }).catch(() => undefined);
       await this.deps.db.hostedMarkNeedsReconnect(connectionId, epoch + 1, "promote_failed", this.nowIso());
       throw new HostedSubscriptionError("host_unavailable");
     }
@@ -329,19 +332,21 @@ export class HostedSubscriptionService {
     // Only the call that started the revoke owned that slot.
     if (began === "started") await this.deps.db.releaseSlot(current.ownerUserId);
     const after = began === "started" ? next : ((await this.deps.db.get(connectionId))?.subHostEpoch ?? next);
-    return this.finishRevoke(connectionId, after);
+    return (await this.finishRevoke(connectionId, after)) === "revoked" ? "revoked" : "revoking";
   }
 
   /** Asks the host to revoke (idempotent) and records `revoked` only on its confirmation. Never throws for a host problem. */
-  private async finishRevoke(connectionId: string, epoch: number): Promise<"revoked" | "revoking"> {
+  private async finishRevoke(connectionId: string, epoch: number): Promise<"revoked" | "revoking" | "host_down"> {
     const client = this.deps.client();
     let confirmed = false;
+    let down = !client;
     if (client) {
       try {
         confirmed = (await this.revokeOnHost(client, connectionId, epoch)).state === "revoked";
       } catch (err) {
         // A host that has never heard of the connection has nothing to wipe.
         confirmed = err instanceof LoginHostError && err.code === "ENOTFOUND";
+        down = err instanceof LoginHostError && err.ambiguous;
         if (!confirmed) console.error(`[hosted-subscription] revoke not confirmed connection=${connectionId} code=${err instanceof LoginHostError ? err.code : "error"}`);
       }
     }
@@ -350,7 +355,7 @@ export class HostedSubscriptionService {
       return "revoked";
     }
     await this.deps.db.hostedNoteRevokeAttempt(connectionId, this.nowIso()).catch(() => undefined);
-    return "revoking";
+    return down ? "host_down" : "revoking";
   }
 
   private async revokeOnHost(client: LoginHostClient, connectionId: string, epoch: number) {
@@ -387,6 +392,7 @@ export class HostedSubscriptionService {
         if (r.status === "revoking") {
           out.revoking++;
           const res = await this.finishRevoke(r.connectionId, r.subHostEpoch ?? 1);
+          if (res === "host_down") out.hostUnavailable = true;
           if (res === "revoked") out.revoked++;
           else if ((r.subRevokeAttempts ?? 0) + 1 >= REVOKE_ALARM_ATTEMPTS) {
             out.stuck++;
