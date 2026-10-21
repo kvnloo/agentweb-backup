@@ -84,9 +84,12 @@ router.post("/", async (req, res) => {
     // ENG-903: an unservable/unselectable plan model is refused now (422), not at launch.
     // A plan created by an org member is org-scoped (shared with the org), so the creator's
     // admin status does not clear an adminOnly pin.
+    // ENG-669: a user-authored pin must also be in the owner's plan (the launch re-checks the launcher's).
     const modelCheck = await checkPlanDefaultModelWrite(
       () => planAdminStatusApplies({ visibility: 'private', ownerId: userId, orgId }) ? isUserAdminSafe(userId) : Promise.resolve(false),
       defaultModel,
+      undefined,
+      userId,
     );
     if (!modelCheck.ok) return res.status(422).json(modelCheck.body);
 
@@ -96,6 +99,8 @@ router.post("/", async (req, res) => {
     const stepModelCheck = await checkPlanStepModelsWrite(
       () => planAdminStatusApplies({ visibility: 'private', ownerId: userId, orgId }) ? isUserAdminSafe(userId) : Promise.resolve(false),
       normalizedSteps,
+      undefined,
+      userId,
     );
     if (!stepModelCheck.ok) return res.status(422).json(stepModelCheck.body);
 
@@ -161,10 +166,12 @@ router.put("/:planId", async (req, res) => {
     // verbatim, which made the same resource behave differently by verb and
     // left it the one write path with no report of what it discarded (ENG-889).
     // ENG-903: validate only a CHANGED model; re-sending the stored value never blocks an edit.
+    // ENG-669: a changed pin must be in the plan OWNER's plan (an org editor edits it for the owner).
     const modelCheck = await checkPlanDefaultModelWrite(
       () => planAdminStatusApplies(plan) ? isUserAdminSafe(plan.ownerId) : Promise.resolve(false),
       defaultModel,
       plan.defaultModel,
+      plan.ownerId || userId,
     );
     if (!modelCheck.ok) return res.status(422).json(modelCheck.body);
     const stepModelsEnabled = (anyStepCarriesModel(steps) || anyStepCarriesModel(plan.steps)) && await workPlanStepModels.isEnabled();
@@ -175,6 +182,7 @@ router.put("/:planId", async (req, res) => {
         () => planAdminStatusApplies(plan) ? isUserAdminSafe(plan.ownerId) : Promise.resolve(false),
         normalized.steps,
         plan.steps,
+        plan.ownerId || userId,
       );
       if (!stepModelCheck.ok) return res.status(422).json(stepModelCheck.body);
     }

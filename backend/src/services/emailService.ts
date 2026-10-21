@@ -17,6 +17,8 @@ import {
   paygPaymentFailedEmailCopy,
   type PaygSettlementEmailCopy,
 } from '../utils/paygSettlementCopy';
+import { buildScheduleModelNotice, buildWorkPlanStepModelNotice, type ModelNoticeCopy } from '../utils/unattendedModelNoticeCopy';
+import type { ModelUnavailableReason } from './agentMode/modelUnavailable';
 
 // ENG-351: resolve {{cite:N}} markers in Emma's text to inline source attributions, using the
 // citation metadata on the session's last assistant message. Email has no chip renderer, so this
@@ -66,6 +68,15 @@ const SUPPORT_REPLY_TO = 'support@agentweb.pro';
 export const WITHHELD_REPORT_ALERT_CLASS = 'scheduled-report-withheld-no-recipients';
 
 export type EmailSendOutcome = 'sent' | 'suppressed' | 'failed';
+
+/**
+ * What sendScheduledRunFailedEmail reports. The first three classes are a schedule that keeps producing nothing after
+ * every automatic retry (ENG-826); `model_unavailable` (ENG-669 PR-D) is a run refused before it started because the
+ * schedule's saved model is outside the owner's plan or no longer available. `modelLabel` is already sanitized.
+ */
+export type ScheduledRunFailureNotice =
+  | { failedAttempts: number; failureClass: 'budget' | 'transient' | 'system' }
+  | { failureClass: 'model_unavailable'; modelLabel: string; reason: ModelUnavailableReason };
 
 const EMPTY_RUN_DIGEST_PLACEHOLDER = '(This run produced no report content.)';
 
@@ -1008,12 +1019,24 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
   // customer's schedule (e.g. the gemini-3.5-flash "LinkedIn Post Factory" runs in
   // ENG-826) could keep failing silently. Best-effort: never throws (a notification
   // failure must not break the run).
+  //
+  // ENG-669 PR-D: `model_unavailable` is a different failure with its own copy: the run never started because the
+  // schedule's saved model is outside the owner's plan (or no longer available). It is the owner's to fix, so the
+  // "keeps failing / contact support" wording above would be wrong; it says which model and how to fix it instead.
   async sendScheduledRunFailedEmail(
     toEmails: string | string[],
     scheduleName: string,
     scheduleId: string,
-    opts: { failedAttempts: number; failureClass: 'budget' | 'transient' | 'system' }
+    opts: ScheduledRunFailureNotice
   ) {
+    if (opts.failureClass === 'model_unavailable') {
+      await this.sendModelUnavailableNoticeEmail(
+        toEmails,
+        buildScheduleModelNotice({ scheduleName, modelLabel: opts.modelLabel, reason: opts.reason }),
+        `schedule ${scheduleId}`,
+      );
+      return;
+    }
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
       const currentDate = new Date().toLocaleDateString('en-US', {
@@ -1090,6 +1113,80 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       console.error(`Error sending scheduled run-failed email to ${emailList.join(', ')}:`, error);
       // Don't throw — a notification failure must not break the scheduled chat flow.
+    }
+  },
+
+  /**
+   * ENG-669 PR-D: tell the owner an unattended session's work plan paused because a step's model is outside their
+   * plan (or no longer available). Sent once per session and step (see pauseWorkPlanForUnavailableStepModel).
+   * Best-effort: never throws.
+   */
+  async sendWorkPlanStepModelUnavailableEmail(
+    toEmails: string | string[],
+    opts: {
+      sessionId: string;
+      stepCount: number;
+      modelLabel: string;
+      reason: ModelUnavailableReason;
+      scheduleName?: string | null;
+      sessionTitle?: string | null;
+    },
+  ) {
+    await this.sendModelUnavailableNoticeEmail(toEmails, buildWorkPlanStepModelNotice(opts), `session ${opts.sessionId}`);
+  },
+
+  /** Renders and sends one unattendedModelNoticeCopy notice. Every string in it is plain text and escaped here. */
+  async sendModelUnavailableNoticeEmail(toEmails: string | string[], notice: ModelNoticeCopy, logContext: string) {
+    const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const [primary, ...secondary] = notice.actions;
+      const linkHtml = (path: string) => this.escapeHtml(`${customerFrontendUrl}${path}`);
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 800px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .header { background-color: #ffc107; color: #664d03; padding: 20px; border-radius: 8px 8px 0 0; }
+            .header h1 { margin: 0; font-size: 24px; }
+            .content { padding: 20px; }
+            .info-section { background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0; border-radius: 4px; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #1976d2; color: white !important; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 10px 0; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h1>⚠️ ${this.escapeHtml(notice.headline)}</h1>
+              <p style="margin: 5px 0 0 0; opacity: 0.9;">${this.escapeHtml(notice.subheading)}</p>
+            </div>
+            <div class="content">
+              <div class="info-section">
+                ${notice.paragraphs.map((p, i) => `<p style="margin: ${i === 0 ? '0' : '10px 0 0 0'}; line-height: 1.6;">${this.escapeHtml(p)}</p>`).join('\n                ')}
+              </div>
+            </div>
+            <div class="footer">
+              ${primary ? `<a class="button" href="${linkHtml(primary.path)}">${this.escapeHtml(primary.label)}</a>` : ''}
+              ${secondary.map((a) => `<p style="margin: 10px 0 0 0;"><a href="${linkHtml(a.path)}">${this.escapeHtml(a.label)}</a></p>`).join('')}
+              <p style="margin-top: 15px; font-size: 12px; color: #6c757d;">${this.escapeHtml(notice.footer)}</p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+      const text = `${notice.headline}: ${notice.subheading}
+
+${notice.paragraphs.join('\n\n')}
+
+---
+${notice.actions.map((a) => `${a.label}: ${customerFrontendUrl}${a.path}`).join('\n')}`;
+      await this.sendEmail(emailList, notice.subject, text, html);
+      console.log(`Model-unavailable notice sent to recipients: ${emailList.join(', ')} (${logContext})`);
+    } catch (error) {
+      console.error(`Error sending model-unavailable notice to ${emailList.join(', ')} (${logContext}):`, error);
+      // Don't throw — a notification failure must not break the run.
     }
   },
 

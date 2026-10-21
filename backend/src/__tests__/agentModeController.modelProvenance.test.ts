@@ -1,0 +1,432 @@
+/**
+ * ENG-669 model provenance (review round 4, adapted from the reviewer's findings tests). A model is exempt from the
+ * tier allowlist ONLY when its provenance recorded at write time says AgentWeb chose it, or it is the configured default
+ * for the session's kind, or the owner is an admin. Nothing is inferred at check time from a session's plan or template
+ * (the one legacy rule covers plan pins written before the record existed). A user-originated write (the picker PATCH)
+ * is a user's pick. An approval-inbox resume refused by the allowlist leaves exactly one refusal and one live update,
+ * and with the switch off nothing new happens there.
+ */
+import { Request, Response } from 'express';
+
+jest.mock('../services/chatbotService', () => ({
+  chatbotDb: {
+    createChatSession: jest.fn(),
+    getChatSession: jest.fn(),
+    updateSessionLlmModel: jest.fn(),
+    addMessageToSession: jest.fn(),
+    addMessagesToSession: jest.fn(),
+    updateSessionTitle: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn(),
+    getChatSessionRecord: jest.fn(),
+    updateSessionWorkPlan: jest.fn(),
+  },
+  updateTaskExecutionStatus: jest.fn(),
+}));
+
+const mockEmit = jest.fn();
+jest.mock('../server', () => ({ io: { to: jest.fn(() => ({ emit: mockEmit })) } }));
+jest.mock('../services/approvalInboxService', () => ({ approvalInboxService: {} }));
+jest.mock('../services/emailService', () => ({
+  emailService: { sendOncallAlert: jest.fn().mockResolvedValue(undefined) },
+}));
+
+jest.mock('../services/db', () => ({
+  userDb: { getUserById: jest.fn() },
+  scheduleDb: {},
+  taskDb: {},
+}));
+
+jest.mock('../services/generateMarketingResponseWorkerService', () => ({
+  generateMarketingResponseWorkerService: {
+    runInWorker: jest.fn(),
+    cancelSession: jest.fn(),
+  },
+}));
+
+const DEFAULT_MODEL = 'gpt-5-chat-2';
+const SERVED = [DEFAULT_MODEL, 'gemini-3.5-flash', 'gpt-5.5'];
+const UNSERVED = 'retired-model-9';
+const INTERNAL_ONLY = 'internal-judge-1';
+const REGISTRY = new Set([...SERVED, INTERNAL_ONLY, 'legacy-old-alias-target']);
+
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: {
+    default_model: 'gpt-5-chat-2',
+    getDefaultModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
+    getReportsModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
+    getCustomerSupportDefaultModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
+    // internalOnly ids are registry keys but excluded from the supported set.
+    // Like the real getSupportedModels(false): the live-voice id IS in the supported set.
+    getSupportedModels: jest.fn(async () => ['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5', 'live-voice-1']),
+    // Mirrors the real behaviour: unknown ids fall back to the default, registry ids pass.
+    resolveGenerationModel: jest.fn((model: string) => {
+      const registry = new Set(['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5', 'internal-judge-1', 'legacy-old-alias-target', 'live-voice-1']);
+      // Like the real hasOwnProperty lookup, an array key coerces to its string form.
+      const normalized = model === 'legacy-old-alias' ? 'legacy-old-alias-target' : model;
+      return registry.has(String(normalized))
+        ? { model: normalized, fellBack: false, requestedModel: model }
+        : { model: 'gpt-5-chat-2', fellBack: true, requestedModel: model };
+    }),
+    isLiveModel: jest.fn((id: string) => id === 'live-voice-1'),
+    // Like the real one: registry, not internalOnly, not live (no adminOnly ids in this double).
+    isModelSelectableBy: jest.fn((id: string) => ['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5', 'legacy-old-alias-target'].includes(id)),
+    getModelDisplayName: jest.fn((id: string) => (id === 'gpt-5.5' ? 'GPT-5.5' : undefined)),
+    generateSessionTitle: jest.fn().mockResolvedValue('Test Title'),
+    getMarketingSystemPrompt: jest.fn().mockResolvedValue('System prompt'),
+    generateDiagnosticMessage: jest.fn().mockResolvedValue(null),
+    getSkillsForDisplay: jest.fn().mockResolvedValue([]),
+  },
+  AgentModeService: jest.fn(),
+}));
+
+jest.mock('../services/llmUsagePolicyResolverService', () => ({
+  getEffectiveLlmUsagePolicy: jest.fn(),
+}));
+
+jest.mock('../services/tokenUsageService', () => ({
+  checkTokenUsage: jest.fn(),
+  incrementUserTokenUsage: jest.fn(),
+  deriveBlockedByCost: jest.fn(() => ({ blockedByCost: false })),
+}));
+
+jest.mock('../utils/sseProgress', () => ({
+  progressStore: { delete: jest.fn() },
+  emitProgress: jest.fn(),
+  hasActiveProgress: jest.fn().mockReturnValue(false),
+  requestCancel: jest.fn(),
+  clearCancel: jest.fn(),
+  isCancelled: jest.fn().mockReturnValue(false),
+  registerProgressCallback: jest.fn().mockReturnValue(() => {}),
+  getLatestProgress: jest.fn().mockReturnValue(null),
+  markProgressComplete: jest.fn(),
+}));
+
+jest.mock('../services/workPlanService', () => ({
+  workPlanService: { getWorkPlan: jest.fn().mockResolvedValue(null) },
+}));
+jest.mock('../services/skillService', () => ({
+  skillService: { getInstalledSkills: jest.fn().mockResolvedValue([]) },
+}));
+jest.mock('../services/subscriptionService', () => ({
+  getAllowedSkills: jest.fn().mockResolvedValue([]),
+  // ENG-669: the tier allowlist resolves the owner's tier through these two.
+  getUserSubscriptionResolution: jest.fn(),
+  readTierAllowedModels: jest.fn(),
+}));
+// ENG-669: AW-Settings rows by name (the tier-allowlist switch, subscription_types); absent = null.
+const mockSettings: Record<string, string | undefined> = {};
+jest.mock('../services/settingsService', () => ({
+  settingsService: {
+    getSetting: jest.fn(async (name: string) => (mockSettings[name] === undefined ? null : { settingName: name, settingValue: mockSettings[name] })),
+  },
+}));
+// Delegates to the real runStore unless a test overrides it (ENG-903 ordering tests).
+jest.mock('../services/agentMode/runStore', () => {
+  const actual = jest.requireActual('../services/agentMode/runStore');
+  return {
+    ...actual,
+    isRunStoreEnabled: jest.fn((...a: unknown[]) => actual.isRunStoreEnabled(...a)),
+    claimIdempotency: jest.fn((...a: unknown[]) => actual.claimIdempotency(...a)),
+  };
+});
+jest.mock('../utils/agentModeAlerts', () => ({
+  sendAgentModeOncallAlert: jest.fn().mockResolvedValue(undefined),
+}));
+jest.mock('../utils/agentModeErrors', () => ({
+  // Spread the real module so new exports (e.g. isProviderUnavailableError) never leave the controller error handler calling undefined.
+  ...jest.requireActual('../utils/agentModeErrors'),
+  isContextLimitError: jest.fn().mockReturnValue(false),
+  isSessionLimitError: jest.fn().mockReturnValue(false),
+  isTransientLLMError: jest.fn().mockReturnValue(false),
+  isWorkerShutdownError: jest.fn().mockReturnValue(false),
+}));
+
+import {
+  agentModeController,
+  activeSessionGenerations,
+  generateSessionResponse,
+  resolveEffectiveModelForUser,
+} from '../controllers/agentModeController';
+import { ModelUnavailableError, buildModelUnavailableBody, isModelUnavailableError } from '../services/agentMode/modelUnavailable';
+import { chatbotDb } from '../services/chatbotService';
+import { agentModeService } from '../services/agentModeService';
+import { userDb } from '../services/db';
+import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
+import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
+import { checkTokenUsage, incrementUserTokenUsage } from '../services/tokenUsageService';
+import { isRunStoreEnabled, claimIdempotency } from '../services/agentMode/runStore';
+import { modelAccess } from '../services/agentMode/modelAccessInstance';
+import { workPlanStepModels } from '../services/agentMode/workPlanStepModelsInstance';
+import { readTierAllowedModels, getUserSubscriptionResolution } from '../services/subscriptionService';
+
+const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
+const mockWorker = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
+const mockPolicy = getEffectiveLlmUsagePolicy as jest.Mock;
+const mockCheckTokenUsage = checkTokenUsage as jest.Mock;
+const mockIncrementUsage = incrementUserTokenUsage as jest.Mock;
+const mockUserDb = userDb as jest.Mocked<typeof userDb>;
+const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
+
+const OWNER = 'user-owner';
+const SESSION_ID = 'session-1';
+const FULL_CHOICE = { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' };
+
+const MESSAGE = 'Please draft the launch email';
+
+
+const expectedMessage = (label: string) =>
+  `The model you selected (${label}) isn't available right now, so nothing was sent to a different model. Choose another model and try again.`;
+
+const makeRes = () => {
+  const res: any = { statusCode: 200, body: undefined };
+  res.status = jest.fn((code: number) => { res.statusCode = code; return res; });
+  res.json = jest.fn((payload: any) => { res.body = payload; return res; });
+  return res as Response & { statusCode: number; body: any };
+};
+
+const generateReq = (body: Record<string, unknown>, isAdmin = false) => ({
+  user: { userId: OWNER, isAdmin },
+  body: { sessionId: SESSION_ID, userMessage: MESSAGE, attachments: [], ...body },
+  method: 'POST',
+  path: '/api/agent-mode/generate',
+  ip: '127.0.0.1',
+  socket: { remoteAddress: '127.0.0.1' },
+  on: jest.fn(),
+} as unknown as Request);
+
+const baseSession = (llmModel?: string) => ({
+  sessionId: SESSION_ID,
+  userId: OWNER,
+  sessionType: 'regular',
+  title: 'Chat',
+  messages: [],
+  createdAt: '2026-07-01T00:00:00Z',
+  updatedAt: '2026-07-01T00:00:00Z',
+  portalType: 'agent' as const,
+  pageIdentifier: 'agent-mode',
+  ...(llmModel ? { llmModel } : {}),
+});
+
+const workerResult = { content: 'OK', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] };
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  activeSessionGenerations.clear();
+  mockPolicy.mockResolvedValue({ billingUserId: OWNER, policy: null, costUsedMicroUsd: 0, tokenUsed: 0, mode: FULL_CHOICE });
+  mockCheckTokenUsage.mockResolvedValue({
+    allowed: true, warning: false, used: 0, allowance: null, bonus: 0, effectiveAllowance: null, percentUsed: 0, month: '2026-07',
+  });
+  mockChatbotDb.getChatSession.mockResolvedValue(baseSession('gpt-5.5') as any);
+  (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
+  mockChatbotDb.addMessageToSession.mockResolvedValue(baseSession() as any);
+  mockChatbotDb.addMessagesToSession.mockResolvedValue(undefined as any);
+  mockChatbotDb.updateSessionTitle.mockResolvedValue(undefined as any);
+  mockChatbotDb.updateSessionLlmModel.mockResolvedValue(baseSession('gpt-5.5') as any);
+  mockChatbotDb.createChatSession.mockResolvedValue(baseSession() as any);
+  mockWorker.runInWorker.mockResolvedValue(workerResult as any);
+  mockUserDb.getUserById.mockResolvedValue({ userId: OWNER, isAdmin: false } as any);
+  // ENG-669: the tier allowlist is OFF unless a test turns it on (absent row = today's behaviour).
+  for (const key of Object.keys(mockSettings)) delete mockSettings[key];
+  modelAccess.reset();
+});
+
+describe('ENG-669 model provenance', () => {
+  const ALLOWED = 'gemini-3.5-flash';
+  const DISALLOWED = 'gpt-5.5';
+  const TARGET = 'legacy-old-alias-target';
+  const ALIAS = 'legacy-old-alias';
+  const mockResolution = getUserSubscriptionResolution as jest.Mock;
+  const mockTierConfig = readTierAllowedModels as jest.Mock;
+  const SUPPORTED = ['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5', 'live-voice-1'];
+
+  /** A session store that keeps what updateSessionLlmModel writes (model, decision, source). */
+  const storeSession = (initial: Record<string, unknown>) => {
+    let stored: any = { ...initial };
+    mockChatbotDb.getChatSession.mockImplementation(async () => stored);
+    mockChatbotDb.updateSessionLlmModel.mockImplementation(async (_id: string, model: string, decision: any, source?: any) => {
+      stored = { ...stored, llmModel: model, llmUsagePolicyDecision: decision, llmModelSource: source };
+      if (!source) delete stored.llmModelSource;
+      return stored;
+    });
+    return () => stored;
+  };
+
+  beforeEach(() => {
+    mockSettings.model_tier_allowlist_enabled = 'true';
+    mockSettings.subscription_types = JSON.stringify([{ name: 'Free', allowedModels: [ALLOWED] }, { name: 'Pro', allowedModels: ['*'] }]);
+    mockResolution.mockResolvedValue({ subscriptionType: 'Free', resolved: true });
+    mockTierConfig.mockImplementation(async (tier: string) => {
+      const row = JSON.parse(mockSettings.subscription_types as string).find((t: any) => t.name === tier);
+      return row ? { configured: true, allowedModels: row.allowedModels } : { configured: false };
+    });
+    (mockAgentModeService.getSupportedModels as jest.Mock).mockResolvedValue([...SUPPORTED, TARGET]);
+  });
+  afterEach(() => {
+    (mockAgentModeService.getSupportedModels as jest.Mock).mockResolvedValue(SUPPORTED);
+    mockAgentModeService.getDefaultModel.mockResolvedValue(DEFAULT_MODEL);
+    assertSpy?.mockRestore();
+    assertSpy = undefined;
+  });
+  let assertSpy: jest.SpyInstance | undefined;
+
+  const PLAN_SYSTEM = (steps: any[], extra: Record<string, unknown> = {}) => ({ title: 'P', planAuthor: 'system', createdAt: 'x', updatedAt: 'x', steps, ...extra });
+  const patch = (llmModel: string) => ({ user: { userId: OWNER }, params: { sessionId: SESSION_ID }, body: { llmModel } }) as any;
+
+  it('PATCH is a user pick: an admin plan\'s step pin picked in the portal is refused, and so is its echo on /generate', async () => {
+    const honor = jest.spyOn(workPlanStepModels, 'shouldHonor').mockResolvedValue(true);
+    storeSession({ ...baseSession(ALLOWED), llmModelSource: 'user',
+      workPlan: PLAN_SYSTEM([{ stepCount: 1, title: 'S1', status: 'pending' }, { stepCount: 2, title: 'S2', status: 'pending', model: DISALLOWED, modelSource: 'system' }]) });
+    const p = makeRes();
+    await agentModeController.updateSessionLlmModel(patch(DISALLOWED), p);
+    expect(p.statusCode).toBe(422);
+    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: DISALLOWED }), res);
+    honor.mockRestore();
+    expect(res.statusCode).toBe(422);
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+  });
+
+  it('PATCH then /generate echo: the PATCH records a user pick, so the echo is checked (no bypass via the stored stamp)', async () => {
+    const stored = storeSession({ ...baseSession(DEFAULT_MODEL), llmModelSource: 'system' });
+    const p = makeRes();
+    await agentModeController.updateSessionLlmModel(patch(ALLOWED), p);
+    expect(p.statusCode).toBe(200);
+    expect(stored().llmModelSource).toBe('user');
+    mockSettings.subscription_types = JSON.stringify([{ name: 'Free', allowedModels: [TARGET] }]); // the plan narrows
+    modelAccess.reset();
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: ALLOWED }), res);
+    expect(res.statusCode).toBe(422);
+  });
+
+  it('re-selecting the session\'s OWN system stamp in the picker is not a new pick (exempt, stays system)', async () => {
+    const stored = storeSession({ ...baseSession(DISALLOWED), llmModelSource: 'system' });
+    const p = makeRes();
+    await agentModeController.updateSessionLlmModel(patch(DISALLOWED), p);
+    expect(p.statusCode).toBe(200);
+    expect(stored().llmModelSource).toBe('system');
+  });
+
+  it('legacy session on a still-admin template: an unsourced stored pick outside the plan is refused on a side channel', async () => {
+    const { workPlanService } = require('../services/workPlanService');
+    (workPlanService.getWorkPlan as jest.Mock).mockResolvedValue({ planId: 't1', visibility: 'system', defaultModel: ALLOWED, steps: [{ stepCount: 1, model: ALLOWED }] });
+    storeSession({ ...baseSession(DISALLOWED), workPlan: { title: 'P', templatePlanId: 't1', createdAt: 'x', updatedAt: 'x', steps: [{ stepCount: 1, title: 'S1', status: 'pending' }] } });
+    const err = await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, DISALLOWED).catch((e) => e);
+    (workPlanService.getWorkPlan as jest.Mock).mockResolvedValue(null);
+    expect(err).toMatchObject({ reason: 'not_in_plan' });
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+  });
+
+  it('...and on /generate the refusal comes from the pre-flight: a 422 that writes NOTHING to the session', async () => {
+    const { workPlanService } = require('../services/workPlanService');
+    (workPlanService.getWorkPlan as jest.Mock).mockResolvedValue({ planId: 't1', visibility: 'system', defaultModel: ALLOWED, steps: [{ stepCount: 1, model: ALLOWED }] });
+    storeSession({ ...baseSession(DISALLOWED), workPlan: { title: 'P', templatePlanId: 't1', createdAt: 'x', updatedAt: 'x', steps: [{ stepCount: 1, title: 'S1', status: 'pending' }] } });
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({}), res);
+    (workPlanService.getWorkPlan as jest.Mock).mockResolvedValue(null);
+    expect(res.statusCode).toBe(422);
+    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    expect(mockChatbotDb.addMessageToSession).not.toHaveBeenCalled();
+  });
+
+  it('control: the same legacy pick without a template plan is refused on a side channel and on /generate', async () => {
+    storeSession({ ...baseSession(DISALLOWED) });
+    const err = await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, DISALLOWED).catch((e) => e);
+    expect(err).toMatchObject({ reason: 'not_in_plan' });
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({}), res);
+    expect(res.statusCode).toBe(422);
+  });
+
+  it('legacy plan pins (launched before the record) on a still-admin template run as system models', async () => {
+    const honor = jest.spyOn(workPlanStepModels, 'shouldHonor').mockResolvedValue(true);
+    const { workPlanService } = require('../services/workPlanService');
+    (workPlanService.getWorkPlan as jest.Mock).mockResolvedValue({ planId: 't1', visibility: 'system', isBuiltIn: true });
+    storeSession({ ...baseSession(ALLOWED), llmModelSource: 'user',
+      workPlan: { title: 'P', templatePlanId: 't1', createdAt: 'x', updatedAt: 'x', steps: [{ stepCount: 1, title: 'S1', status: 'pending', model: DISALLOWED }] } });
+    await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, ALLOWED);
+    honor.mockRestore();
+    (workPlanService.getWorkPlan as jest.Mock).mockResolvedValue(null);
+    expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: DISALLOWED }), expect.anything());
+  });
+
+  it.each([
+    ['system', true],
+    ['user', false],
+    [undefined, false],
+  ] as const)('a step pin recorded with modelSource %p (post-change plan, admin-authored) runs outside the plan (else pauses): %p', async (modelSource, runs) => {
+    const honor = jest.spyOn(workPlanStepModels, 'shouldHonor').mockResolvedValue(true);
+    const { workPlanService } = require('../services/workPlanService');
+    storeSession({ ...baseSession(ALLOWED), llmModelSource: 'user',
+      workPlan: PLAN_SYSTEM([{ stepCount: 1, title: 'S1', status: 'pending', model: DISALLOWED, ...(modelSource && { modelSource }) }], { templatePlanId: 't1' }) });
+    const err = await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, ALLOWED).catch((e) => e);
+    honor.mockRestore();
+    // Recorded provenance decides; nothing is inferred from the template (never read).
+    expect(workPlanService.getWorkPlan).not.toHaveBeenCalled();
+    if (runs) {
+      expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: DISALLOWED }), expect.anything());
+    } else {
+      // The plan's own pin is outside the plan: the plan pauses loudly (never a swap), nothing runs.
+      expect(String(err?.content)).toContain("which isn't included in this account's plan");
+      expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    }
+  });
+
+  it('approval resume refused by the step resolver: exactly ONE saved refusal and ONE live update carrying its messageIndex', async () => {
+    const honor = jest.spyOn(workPlanStepModels, 'shouldHonor').mockResolvedValue(true);
+    // The stored stamp is AgentWeb's (passes the final gate); the step's own model is retired, so the stored model
+    // becomes a pick for the step, which is checked as the user's and refused INSIDE generateSessionResponse (which
+    // saves the refusal); the resume must reuse that record, not save a second one.
+    const s = { ...baseSession(DISALLOWED), llmModelSource: 'system',
+      workPlan: PLAN_SYSTEM([
+        { stepCount: 1, title: 'S1', status: 'pending', model: 'retired-model-9', modelSource: 'system' },
+        { stepCount: 2, title: 'S2', status: 'pending', model: DISALLOWED, modelSource: 'system' },
+      ], { launchModel: ALLOWED }) };
+    storeSession(s);
+    (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(s);
+    mockChatbotDb.addMessageToSession.mockImplementation(async (_id: string, m: any) => ({ messages: [{ ...m, messageIndex: 7 }] }) as any);
+    const { resumeOriginSession } = require('../services/approvalInboxExecution');
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    await resumeOriginSession(SESSION_ID, 'Approved: send it');
+    honor.mockRestore();
+    const refusals = mockChatbotDb.addMessageToSession.mock.calls.map(([, m]) => m as any)
+      .filter((m) => m.role === 'assistant' && m.metadata?.isErrorMessage);
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0].content).toContain("isn't included in your plan");
+    expect(mockEmit).toHaveBeenCalledTimes(1);
+    expect(mockEmit).toHaveBeenCalledWith('session-message-appended', {
+      sessionId: SESSION_ID,
+      message: { role: 'assistant', content: refusals[0].content, messageIndex: 7, metadata: { isErrorMessage: true } },
+    });
+  });
+
+  it('switch OFF: the shared-view pre-flight reads no usage and no tier', async () => {
+    delete mockSettings.model_tier_allowlist_enabled; modelAccess.reset();
+    storeSession({ ...baseSession(DISALLOWED), llmModelSource: 'user', interactiveShareMetadata: { isActive: true, token: 'tok', sharedAt: '2026-07-01T00:00:00Z' } });
+    const res = makeRes();
+    await agentModeController.generateSharedResponse({ params: { shareId: SESSION_ID }, query: { conversable: 'tok' }, body: { userMessage: MESSAGE, attachments: [] }, on: jest.fn() } as unknown as Request, res);
+    expect(res.statusCode).toBe(200);
+    expect(mockCheckTokenUsage).toHaveBeenCalledTimes(1); // only the pre-existing usage gate
+    expect(mockResolution).not.toHaveBeenCalled();
+  });
+
+  it('switch OFF: an approval resume refused for another reason behaves as before (no refusal saved, no live update)', async () => {
+    delete mockSettings.model_tier_allowlist_enabled; modelAccess.reset();
+    const honor = jest.spyOn(workPlanStepModels, 'shouldHonor').mockResolvedValue(true);
+    const s = { ...baseSession('internal-judge-1'), llmModelSource: 'user',
+      workPlan: { title: 'P', planAuthor: 'system', launchModel: ALLOWED, createdAt: 'x', updatedAt: 'x',
+        steps: [{ stepCount: 1, title: 'S1', status: 'pending', model: 'retired-model-9', modelSource: 'system' }] } };
+    storeSession(s);
+    (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(s);
+    const { resumeOriginSession } = require('../services/approvalInboxExecution');
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    await resumeOriginSession(SESSION_ID, 'Approved');
+    honor.mockRestore();
+    const refusals = mockChatbotDb.addMessageToSession.mock.calls.map(([, m]) => m as any).filter((m) => m.role === 'assistant' && m.metadata?.isErrorMessage);
+    expect(refusals).toHaveLength(0);
+    expect(mockEmit).not.toHaveBeenCalled();
+    expect(mockResolution).not.toHaveBeenCalled();
+  });
+});

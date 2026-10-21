@@ -328,7 +328,7 @@ describe('generateResponse session ownership (acceptance — ENG-346)', () => {
           effectiveModel: 'gpt-5-chat-2',
           modelSelection: 'honored',
           usageMode: 'full_choice',
-        }),
+        }), 'user',
       );
       expect(res.body).toEqual(expect.objectContaining({
         requestedModel: 'gpt-5-chat-2',
@@ -379,7 +379,7 @@ describe('generateResponse session ownership (acceptance — ENG-346)', () => {
           modelSelection: 'blocked',
           usageMode: 'paused',
           usagePolicyVersion: 'policy-v1',
-        }),
+        }), 'user',
       );
     });
 

@@ -15,6 +15,7 @@ import { resolveOrgProfileField } from '../services/orgProfileResolver';
 import { EvaluationDenied, isEvaluationUser, requireActiveEvaluation, sandboxInfo as buildSandboxInfo } from '../services/evaluationPolicy';
 import { sanitizeUserForResponse } from '../utils/accountSecretRedaction';
 import { modelCompareEntitlement } from '../services/agentMode/modelCompareEntitlement';
+import { getTierCompareBlock, modelAccess } from '../services/agentMode/modelAccessInstance';
 
 const router = express.Router();
 
@@ -195,6 +196,15 @@ router.get('/me', authenticateToken, async (req, res) => {
       });
     } catch (error) {
       console.error('Error resolving model compare entitlement hint:', error);
+    }
+    // ENG-669 (D3) hint: the plan runs fewer than two models, so /compare answers 403
+    // compare_not_available_for_tier. Present only while the tier allowlist is on; same rule as the server.
+    try {
+      if (await modelAccess.isEnabled()) {
+        response.modelCompareTierBlocked = (await getTierCompareBlock(userId)) !== null;
+      }
+    } catch (error) {
+      console.error('Error resolving model compare tier hint:', error);
     }
 
     response.hasBrandGuidelines = !!(user.brandGuidelines?.brandData?.brandName);

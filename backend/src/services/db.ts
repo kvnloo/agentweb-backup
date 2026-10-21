@@ -3688,6 +3688,9 @@ export const scheduleDb = {
     type?: string;
     emailCampaignTaskId?: string;
     llmModel?: string;
+    // ENG-669: who chose `llmModel`: 'system' = inherited from an admin-authored schedule template (AgentWeb's
+    // choice, exempt from the tier model allowlist); 'user' or absent = the owner's pin. Additive, optional.
+    llmModelSource?: 'user' | 'system';
     llmBackupModel?: string;
     llmBackupSource?: 'user' | 'system';
     llmBackupNeedsConfirmation?: boolean;

@@ -2,24 +2,51 @@
  * FAIL-LOUD selected model: an explicit model selection (a model the REQUEST
  * carries: `/generate` `llmModel`, `requestedLlmModel` at session creation; or a
  * schedule pin) must run on exactly that model or not run at all. A model merely
- * STORED on a session is not explicit and falls back to the default.
+ * STORED on a session is not explicit and falls back to the default, EXCEPT when it is
+ * outside the owner's plan (ENG-669 `not_in_plan`): that is refused, never swapped.
  * `resolveEffectiveModelForUser` throws this instead of silently substituting the
  * default; interactive handlers translate it into the 422 body built here. This
  * file is the ONLY producer of the user-facing message text.
  */
 
-export type ModelUnavailableReason = 'not_served' | 'not_selectable';
+/**
+ * `not_in_plan` (ENG-669): the model is served and selectable, but the owner's subscription tier does
+ * not include it (services/agentMode/modelAccess.ts). It is never swapped for another model either.
+ */
+export type ModelUnavailableReason = 'not_served' | 'not_selectable' | 'not_in_plan';
+
+/** ENG-669: what the owner's plan allows, carried by a `not_in_plan` refusal so the 422 can say how to fix it. */
+export interface ModelPlanDetails {
+  /** The canonical id that was refused (after legacy-alias resolution). */
+  model: string;
+  /** The owner's effective tier name (null when it could not be named). */
+  tier: string | null;
+  /** The tier's allowlist, canonical ids. */
+  allowedModels: string[];
+  /** Tier names whose allowlist includes `model` (empty when none does). */
+  upgradeRequired: string[];
+}
+
+/** Human wording of a reason, for logs, run results and alerts. */
+export function describeModelUnavailableReason(reason: ModelUnavailableReason): string {
+  if (reason === 'not_served') return 'not served';
+  if (reason === 'not_in_plan') return "not included in the account's plan";
+  return 'not selectable';
+}
 
 export class ModelUnavailableError extends Error {
   readonly code = 'model_unavailable' as const;
   readonly requestedModel: string;
   readonly reason: ModelUnavailableReason;
+  /** Set only for `not_in_plan`. */
+  readonly plan?: ModelPlanDetails;
 
-  constructor(requestedModel: string, reason: ModelUnavailableReason) {
-    super(`model_unavailable: requested model is ${reason === 'not_served' ? 'not served' : 'not selectable'}`);
+  constructor(requestedModel: string, reason: ModelUnavailableReason, plan?: ModelPlanDetails) {
+    super(`model_unavailable: requested model is ${describeModelUnavailableReason(reason)}`);
     this.name = 'ModelUnavailableError';
     this.requestedModel = requestedModel;
     this.reason = reason;
+    if (plan) this.plan = plan;
   }
 }
 
@@ -54,9 +81,21 @@ export interface ModelUnavailableBody {
   code: 'model_unavailable';
   requestedModel: string;
   reason: ModelUnavailableReason;
+  /** ENG-669, `not_in_plan` only, and never for a share viewer: see ModelPlanDetails. */
+  model?: string;
+  tier?: string | null;
+  allowedModels?: string[];
+  upgradeRequired?: string[];
 }
 
 export type ModelUnavailableSubject = 'selection' | 'work_plan_pin';
+
+/**
+ * Who reads the body. `owner` is the account the session (or plan) belongs to; a `share_viewer`
+ * (interactive-share / conversable link) is someone else and must not learn the owner's tier, its
+ * allowlist or which tiers include the model, so those fields and the plan wording are left out.
+ */
+export type ModelUnavailableAudience = 'owner' | 'share_viewer';
 
 /**
  * The single producer of the 422 body (and its message text). `subject` says whose
@@ -68,17 +107,41 @@ export function buildModelUnavailableBody(
   err: ModelUnavailableError,
   displayName?: string | null,
   subject: ModelUnavailableSubject = 'selection',
+  audience: ModelUnavailableAudience = 'owner',
 ): ModelUnavailableBody {
   const label = sanitizeModelLabel(displayName || err.requestedModel);
-  const error = subject === 'work_plan_pin'
-    ? `This work plan's pinned model (${label}) isn't available right now, so the plan was not started and nothing was sent to a different model. The plan's model needs to be changed in the work plan settings.`
-    : `The model you selected (${label}) isn't available right now, so nothing was sent to a different model. Choose another model and try again.`;
-  return {
-    error,
+  const body: ModelUnavailableBody = {
+    error: modelUnavailableMessage(err.reason, label, subject, audience),
     code: 'model_unavailable',
     requestedModel: sanitizeModelLabel(err.requestedModel),
     reason: err.reason,
   };
+  if (err.reason === 'not_in_plan' && err.plan && audience === 'owner') {
+    body.model = err.plan.model;
+    body.tier = err.plan.tier;
+    body.allowedModels = [...err.plan.allowedModels];
+    body.upgradeRequired = [...err.plan.upgradeRequired];
+  }
+  return body;
+}
+
+function modelUnavailableMessage(
+  reason: ModelUnavailableReason,
+  label: string,
+  subject: ModelUnavailableSubject,
+  audience: ModelUnavailableAudience,
+): string {
+  if (reason === 'not_in_plan') {
+    if (audience === 'share_viewer') {
+      return `The model selected for this chat (${label}) isn't available on this account, so nothing was sent to a different model. Choose another model and try again.`;
+    }
+    return subject === 'work_plan_pin'
+      ? `This work plan's pinned model (${label}) isn't included in your plan, so the plan was not started and nothing was sent to a different model. Change the plan's model in the work plan settings, or upgrade your plan.`
+      : `The model you selected (${label}) isn't included in your plan, so nothing was sent to a different model. Choose another model, or upgrade your plan to use this one.`;
+  }
+  return subject === 'work_plan_pin'
+    ? `This work plan's pinned model (${label}) isn't available right now, so the plan was not started and nothing was sent to a different model. The plan's model needs to be changed in the work plan settings.`
+    : `The model you selected (${label}) isn't available right now, so nothing was sent to a different model. Choose another model and try again.`;
 }
 
 export interface AnonymousModelUnavailableBody {
