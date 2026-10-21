@@ -21,6 +21,7 @@ import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { AuthRequest } from "../types/express";
 import { Setting, settingsService } from "../services/settingsService";
+import { isConditionalFailure } from "../services/voice/setupWrites";
 import {
   EDITABLE_VENDOR_RATE_PROVIDERS,
   isEditableProvider,
@@ -109,7 +110,7 @@ async function writeOverrides(row: Setting | null, value: string, adminId: strin
     }
     return await settingsService.setSettingIfAbsent(VENDOR_RATE_OVERRIDES_SETTING, value, DESCRIPTION, adminId);
   } catch (error) {
-    if ((error as { code?: string })?.code === "ConditionalCheckFailedException") return false;
+    if (isConditionalFailure(error)) return false;
     throw error;
   }
 }

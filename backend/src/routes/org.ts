@@ -9,6 +9,7 @@ import { isCompanyEmail } from "../utils/validation";
 import { getUserSubscriptionResolution, getUserSubscriptionType, getTierConfig } from "../services/subscriptionService";
 import { redactAccountSecrets } from "../utils/accountSecretRedaction";
 import { releaseNumberOfDeletedOrg } from "../services/voice/numberProvisioning";
+import { omit } from "../utils/omit";
 import { purchaseExtraSeat, removeExtraSeat } from "../services/orgSeatBillingService";
 import {
   assertSeatAvailable,
@@ -120,9 +121,7 @@ function buildOrgMarketStrategyForCopy(user: any): MarketStrategy | undefined {
  */
 function withoutHotLeadCallInternals<T extends object | null | undefined>(org: T): Omit<NonNullable<T>, 'hotLeadCall' | 'hotLeadCallVerification' | 'hotLeadCallProvisioning'> | T {
   if (!org) return org;
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { hotLeadCall, hotLeadCallVerification, hotLeadCallProvisioning, ...rest } = org as Record<string, unknown>;
-  return rest as Omit<NonNullable<T>, 'hotLeadCall' | 'hotLeadCallVerification' | 'hotLeadCallProvisioning'>;
+  return omit(org as Record<string, unknown>, ['hotLeadCall', 'hotLeadCallVerification', 'hotLeadCallProvisioning']) as Omit<NonNullable<T>, 'hotLeadCall' | 'hotLeadCallVerification' | 'hotLeadCallProvisioning'>;
 }
 
 // All org routes require authentication

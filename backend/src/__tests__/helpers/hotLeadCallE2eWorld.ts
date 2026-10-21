@@ -105,6 +105,11 @@ export function installWorld(): void {
 // ── clock and lead helpers ──────────────────────────────────────────────────
 
 export { flush };
+/** A wall-clock time on 2026-10-19 (a Monday, Chicago on daylight time, UTC-5) as an ISO instant. */
+export const chicago = (hhmm: string): string => {
+  const [h, m] = hhmm.split(':').map(Number);
+  return new Date(Date.UTC(2026, 9, 19, h + 5, m)).toISOString();
+};
 export const setClock = (iso: string) => jest.setSystemTime(new Date(iso));
 export const advanceMinutes = (n: number) => jest.setSystemTime(Date.now() + n * MINUTE_MS);
 /** Distinct valid lead phones, one per n. */
@@ -135,6 +140,10 @@ export async function submitLead(leadId: string, o: SubmitOptions = {}): Promise
 }
 
 export const recordOf = (leadId: string, listId = LIST) => world.crm.lead(listId, leadId).system?.hot_lead_call as Record<string, unknown> | undefined;
+/** The phones the orchestrator has called, in order. */
+export const rungPhones = () => world.provider.placedCalls.map((p) => p.to);
+/** The call record of a lead that must have one. */
+export const record = (id = 'lead-a') => recordOf(id) as Record<string, unknown>;
 export const eventsOf = (leadId: string) => world.crm.timeline(LIST, leadId);
 /** A webhook-driven call placed by the orchestrator (not an inline-TwiML verification call). */
 type WebhookCall = Extract<PlaceCallParams, { url: string }>;

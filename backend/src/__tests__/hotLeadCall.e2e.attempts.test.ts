@@ -21,7 +21,7 @@ import { setHotLeadCallEnabledOverride } from '../services/voice/hotLeadCallMode
 import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
 import { sayText } from './helpers/hotLeadCallTwilioSim';
 import {
-  LEAD_E164, LIST, advanceMinutes, eventsOf, flush, installWorld, mock, nthCall, placedCall, recordOf, setClock, skipReason, submitLead, usageSummary, world,
+  LEAD_E164, LIST, advanceMinutes, chicago, eventsOf, flush, installWorld, mock, nthCall, placedCall, record, recordOf, rungPhones, setClock, skipReason, submitLead, usageSummary, world,
 } from './helpers/hotLeadCallE2eWorld';
 import { REFERENCE_ID as ID, REFERENCE_PHONE as PHONE, referenceMember, referenceTeam } from './helpers/hotLeadCallFixtures';
 
@@ -34,13 +34,6 @@ function configure(over: Record<string, unknown> = {}): void {
   const org = world.crm.orgs.get('org-a') as { hotLeadCall: Record<string, unknown> };
   org.hotLeadCall = { ...org.hotLeadCall, team: TEAM, maxAttemptsPerLead: 3, callingHours: { start: '09:00', end: '18:00', timezone: 'America/Chicago' }, ...over };
 }
-/** A wall-clock time on the test day in America/Chicago (UTC-5). */
-const chicago = (hhmm: string): string => {
-  const [h, m] = hhmm.split(':').map(Number);
-  return new Date(Date.UTC(2026, 9, 19, h + 5, m)).toISOString();
-};
-const rungPhones = () => world.provider.placedCalls.map((p) => p.to);
-const record = (id = 'lead-a') => recordOf(id) as Record<string, unknown>;
 const nextJobs = () => mock(queue.enqueueJob).mock.calls.filter(([source]) => source === 'hot_lead_call_next');
 
 /** Member `n` picks up, presses 1; the lead answers and presses 1 as well. The calls are bridged. */

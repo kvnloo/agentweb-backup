@@ -302,6 +302,25 @@ describe('processHotLeadCallNextAttempt', () => {
     expect(store.events.at(-1)).toEqual({ type: 'call.completed', detail: { outcome } });
   });
 
+  it('still takes the lock when the write committed, reported an error, and the first re-read of the record failed too', async () => {
+    const record = await firstAttemptEnds();
+    const real = store.transition.bind(store);
+    store.transition = async (...args) => {
+      const moved = await real(...args);
+      if (args[3].state === 'dialing') throw new Error('timeout after commit');
+      return moved;
+    };
+    const realGet = store.get.bind(store);
+    let failedReads = 0;
+    store.get = async () => {
+      if (store.record?.state === 'dialing' && failedReads++ < 2) throw new Error('read timeout');
+      return realGet();
+    };
+    await processHotLeadCallNextAttempt(nextJob(record));
+    expect(provider.placedCalls).toHaveLength(2);
+    expect(store.record).toMatchObject({ state: 'member_ringing', attemptNo: 2 });
+  });
+
   describe('when closing the waiting record fails', () => {
     it('retries the close once, so one failed write does not leave the record waiting', async () => {
       const record = await firstAttemptEnds();

@@ -149,7 +149,7 @@ export async function meterLeg(cb: LegCallback): Promise<Metered> {
 
     if (billedUserId === undefined) billedUserId = await meteringUserId(q.listId, await resolveHotLeadCallContext(q.listId));
     if (!billedUserId) {
-      console.error('[twilio-voice] no owner to bill for list', q.listId);
+      console.error('[hotLeadCall] no owner to bill for list', q.listId);
       return { status: 'no-owner-to-bill' };
     }
 
@@ -173,11 +173,11 @@ export async function meterLeg(cb: LegCallback): Promise<Metered> {
     try {
       await recordCallUsage({ userId: billedUserId, callSid, leg: q.leg, durationSeconds: cb.durationSeconds });
     } catch (err) {
-      console.error('[twilio-voice] metering failed:', errorName(err));
+      console.error('[hotLeadCall] metering failed:', errorName(err));
     }
     return { status: 'done', attemptEnded: ended?.outcome };
   }
-  console.error('[twilio-voice] metering gave up after retries:', q.leg);
+  console.error('[hotLeadCall] metering gave up after retries:', q.leg);
   return { status: 'gave-up' };
 }
 
@@ -194,9 +194,9 @@ export async function nextAttemptOrFinish(q: CallQuery, attemptOutcome: string):
   try {
     const decision = await requestNextHotLeadCallAttempt({ listId: q.listId, leadId: q.leadId, record });
     if (decision.enqueued) return;
-    console.info('[twilio-voice] no further attempt:', decision.reason);
+    console.info('[hotLeadCall] no further attempt:', decision.reason);
   } catch (err) {
-    console.error('[twilio-voice] next attempt request failed:', errorName(err));
+    console.error('[hotLeadCall] next attempt request failed:', errorName(err));
   }
   const outcome = record.attemptNo > 1 ? 'no_member_available' : attemptOutcome;
   if (await store.transition(q.listId, q.leadId, ['between_attempts'], { state: 'finished', outcome })) {

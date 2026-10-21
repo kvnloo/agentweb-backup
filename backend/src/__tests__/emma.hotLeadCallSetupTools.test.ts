@@ -711,7 +711,7 @@ describe('confirm_hot_lead_call_verification', () => {
     await provision();
     setTime(T0 + MIN);
     await start();
-    await expect(confirm(wrongCode(codeFromCall()))).rejects.toThrow();
+    await expect(confirm(wrongCode(codeFromCall()))).rejects.toThrow('That code is not correct');
     await confirm(codeFromCall());
     await release();
     expect(writes.length).toBeGreaterThanOrEqual(6);

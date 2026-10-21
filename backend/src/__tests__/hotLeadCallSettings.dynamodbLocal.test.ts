@@ -160,7 +160,7 @@ suite('team settings and member verification against DynamoDB Local', () => {
     const code = /code is ((?:\d ){5}\d)\./.exec((fake.placedCalls[fake.placedCalls.length - 1] as { twiml: string }).twiml)![1].replace(/ /g, '');
     const org = await loaded(orgId);
     await ddb.update({ TableName: TABLE(), Key: { orgId }, UpdateExpression: 'SET hotLeadCall.team[0].phone = :p', ExpressionAttributeValues: { ':p': '+16475550123' } }).promise();
-    await expect(svc.confirmMemberVerification(org, OWNER, A, code)).rejects.toThrow();
+    await expect(svc.confirmMemberVerification(org, OWNER, A, code)).rejects.toThrow('settings changed');
     expect((await read(orgId)).hotLeadCall.team[0].verifiedAt).toBeUndefined();
   });
 });

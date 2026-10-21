@@ -71,7 +71,7 @@ describe('recordVendorUsage prices from a rateKey (ENG-1929)', () => {
     });
   });
 
-  it('ENG-2271: an admin override prices the call and its event carries the override version', async () => {
+  it('an admin override prices the call and its event carries the override version', async () => {
     setVendorRateOverridesForTests({ twilio: { voice_minute_outbound: 0.02 } }, '2026-11-01T00:00:00.000Z');
     try {
       await recordVendorUsage({ ...base, provider: 'twilio', operation: 'voice_minute_outbound', unit: 'minute', quantity: 10, rateKey: 'voice_minute_outbound' });
@@ -86,7 +86,7 @@ describe('recordVendorUsage prices from a rateKey (ENG-1929)', () => {
     });
   });
 
-  it('ENG-2271: the event is stamped with the version of the rate that priced it, even if the override changes before the ledger write', async () => {
+  it('the event is stamped with the version of the rate that priced it, even if the override changes before the ledger write', async () => {
     setVendorRateOverridesForTests({ twilio: { voice_minute_outbound: 0.02 } }, '2026-11-01T00:00:00.000Z');
     // The billing-owner lookup runs between pricing and the ledger event being built.
     __setBillingOwnerResolverForTests(async (id: string) => {

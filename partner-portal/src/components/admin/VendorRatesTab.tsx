@@ -109,13 +109,12 @@ interface PendingChange {
   usdPerUnit: number | null;
 }
 
-export default function VendorRatesTab() {
-  const { token } = useAuth();
+/** Loads the rates and saves one change at a time; every message the tab shows comes from here. */
+function useVendorRates(token: string | null | undefined) {
   const [loading, setLoading] = useState(true);
   const [savingRow, setSavingRow] = useState<string | null>(null);
   const [loadError, setLoadError] = useState('');
   const [error, setError] = useState('');
-  const [pending, setPending] = useState<PendingChange | null>(null);
   const [success, setSuccess] = useState('');
   const [data, setData] = useState<VendorRatesResponse | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
@@ -178,6 +177,111 @@ export default function VendorRatesTab() {
     }
   };
 
+  return { loading, savingRow, loadError, error, setError, success, setSuccess, data, drafts, setDrafts, load, put };
+}
+
+interface RateRowProps {
+  rate: VendorRate;
+  draft: string;
+  /** Some row is being saved: every row is read-only meanwhile. */
+  busy: boolean;
+  saving: boolean;
+  onDraftChange: (value: string) => void;
+  onSave: () => void;
+  onReset: () => void;
+}
+
+function RateRow({ rate, draft, busy, saving, onDraftChange, onSave, onReset }: RateRowProps) {
+  const id = rowId(rate);
+  return (
+    <TableRow data-testid={`vendor-rate-row-${id}`}>
+      <TableCell>{rate.key}</TableCell>
+      <TableCell>{rate.unit}</TableCell>
+      <TableCell align="right">{formatPrice(rate.defaultUsdPerUnit)}</TableCell>
+      <TableCell align="right">{rate.overrideUsdPerUnit === null ? '-' : formatPrice(rate.overrideUsdPerUnit)}</TableCell>
+      <TableCell align="right">{formatPrice(rate.effectiveUsdPerUnit)}</TableCell>
+      <TableCell>
+        <TextField
+          size="small"
+          label={`USD per ${rate.unit}`}
+          value={draft}
+          onChange={(e) => onDraftChange(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && !busy && draft.trim()) onSave(); }}
+          inputProps={{ 'aria-label': `New price for ${id}`, inputMode: 'decimal', readOnly: busy }}
+        />
+      </TableCell>
+      <TableCell>
+        <Box display="flex" gap={1}>
+          <Button
+            variant="contained"
+            size="small"
+            onClick={onSave}
+            aria-label={`Save ${rate.provider} ${rate.key}`}
+            disabled={busy || !draft.trim()}
+          >
+            {saving ? 'Saving...' : 'Save'}
+          </Button>
+          <Button
+            size="small"
+            onClick={onReset}
+            aria-label={`Reset ${rate.provider} ${rate.key} to default`}
+            disabled={busy || rate.overrideUsdPerUnit === null}
+          >
+            Reset to default
+          </Button>
+        </Box>
+      </TableCell>
+    </TableRow>
+  );
+}
+
+interface ConfirmDialogProps {
+  open: boolean;
+  /** The change to confirm; kept after closing so the close transition keeps its text. */
+  change: PendingChange | null;
+  onCancel: () => void;
+  onConfirm: () => void;
+}
+
+function ConfirmRateDialog({ open, change, onCancel, onConfirm }: ConfirmDialogProps) {
+  const target = change && (change.usdPerUnit ?? change.rate.defaultUsdPerUnit);
+  // Rounded so exact 10x / 0.1x (which float division misses by an ulp) sit on the boundary.
+  const multiple = change && target !== null ? Math.round((target / change.rate.effectiveUsdPerUnit) * 1e6) / 1e6 : 1;
+  return (
+    <Dialog open={open} onClose={onCancel}>
+      <DialogTitle>{change?.usdPerUnit === null ? 'Confirm reset to default' : 'Confirm rate change'}</DialogTitle>
+      <DialogContent>
+        {change && target !== null && (
+          <>
+            <DialogContentText>
+              {`${rowId(change.rate)}: ${formatPrice(change.rate.effectiveUsdPerUnit)} -> ${formatPrice(target)} per ${change.rate.unit} (${formatMultiple(change.rate.effectiveUsdPerUnit, target)})`}
+            </DialogContentText>
+            {change.usdPerUnit === null && (
+              <DialogContentText>
+                {`Returns to the default rate of ${formatPrice(change.rate.defaultUsdPerUnit)} per ${change.rate.unit}.`}
+              </DialogContentText>
+            )}
+            {(multiple > 10 || multiple < 0.1) && (
+              <Alert severity="warning" sx={{ mt: 2 }}>
+                This changes the rate by more than 10x (up or down). Check the value before confirming; it affects recorded vendor spend.
+              </Alert>
+            )}
+          </>
+        )}
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onCancel}>Cancel</Button>
+        <Button onClick={onConfirm} color="primary" variant="contained">Confirm</Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+export default function VendorRatesTab() {
+  const { token } = useAuth();
+  const { loading, savingRow, loadError, error, setError, success, setSuccess, data, drafts, setDrafts, load, put } = useVendorRates(token);
+  const [pending, setPending] = useState<PendingChange | null>(null);
+
   const requestSave = (rate: VendorRate) => {
     const value = parsePrice(drafts[rowId(rate)] ?? '');
     if (value === null) {
@@ -206,11 +310,6 @@ export default function VendorRatesTab() {
   // transition keeps its title and body instead of flashing an empty dialog.
   const lastPending = useRef<PendingChange | null>(null);
   if (pending) lastPending.current = pending;
-  const shown = pending ?? lastPending.current;
-
-  const target = shown && (shown.usdPerUnit ?? shown.rate.defaultUsdPerUnit);
-  // Rounded so exact 10x / 0.1x (which float division misses by an ulp) sit on the boundary.
-  const multiple = shown && target !== null ? Math.round((target / shown.rate.effectiveUsdPerUnit) * 1e6) / 1e6 : 1;
 
   if (loading) {
     return (
@@ -269,53 +368,18 @@ export default function VendorRatesTab() {
                   </TableRow>
                 </TableHead>
                 <TableBody>
-                  {rates.map((rate) => {
-                    const id = rowId(rate);
-                    const busy = savingRow !== null;
-                    const draft = drafts[id] ?? '';
-                    return (
-                      <TableRow key={id} data-testid={`vendor-rate-row-${id}`}>
-                        <TableCell>{rate.key}</TableCell>
-                        <TableCell>{rate.unit}</TableCell>
-                        <TableCell align="right">{formatPrice(rate.defaultUsdPerUnit)}</TableCell>
-                        <TableCell align="right">
-                          {rate.overrideUsdPerUnit === null ? '-' : formatPrice(rate.overrideUsdPerUnit)}
-                        </TableCell>
-                        <TableCell align="right">{formatPrice(rate.effectiveUsdPerUnit)}</TableCell>
-                        <TableCell>
-                          <TextField
-                            size="small"
-                            label={`USD per ${rate.unit}`}
-                            value={draft}
-                            onChange={(e) => setDrafts((prev) => ({ ...prev, [id]: e.target.value }))}
-                            onKeyDown={(e) => { if (e.key === 'Enter' && !busy && draft.trim()) requestSave(rate); }}
-                            inputProps={{ 'aria-label': `New price for ${id}`, inputMode: 'decimal', readOnly: busy }}
-                          />
-                        </TableCell>
-                        <TableCell>
-                          <Box display="flex" gap={1}>
-                            <Button
-                              variant="contained"
-                              size="small"
-                              onClick={() => requestSave(rate)}
-                              aria-label={`Save ${rate.provider} ${rate.key}`}
-                              disabled={busy || !draft.trim()}
-                            >
-                              {savingRow === id ? 'Saving...' : 'Save'}
-                            </Button>
-                            <Button
-                              size="small"
-                              onClick={() => requestReset(rate)}
-                              aria-label={`Reset ${rate.provider} ${rate.key} to default`}
-                              disabled={busy || rate.overrideUsdPerUnit === null}
-                            >
-                              Reset to default
-                            </Button>
-                          </Box>
-                        </TableCell>
-                      </TableRow>
-                    );
-                  })}
+                  {rates.map((rate) => (
+                    <RateRow
+                      key={rowId(rate)}
+                      rate={rate}
+                      draft={drafts[rowId(rate)] ?? ''}
+                      busy={savingRow !== null}
+                      saving={savingRow === rowId(rate)}
+                      onDraftChange={(value) => setDrafts((prev) => ({ ...prev, [rowId(rate)]: value }))}
+                      onSave={() => requestSave(rate)}
+                      onReset={() => requestReset(rate)}
+                    />
+                  ))}
                 </TableBody>
               </Table>
             )}
@@ -323,32 +387,7 @@ export default function VendorRatesTab() {
         );
       })}
 
-      <Dialog open={pending !== null} onClose={() => setPending(null)}>
-        <DialogTitle>{shown?.usdPerUnit === null ? 'Confirm reset to default' : 'Confirm rate change'}</DialogTitle>
-        <DialogContent>
-          {shown && target !== null && (
-            <>
-              <DialogContentText>
-                {`${rowId(shown.rate)}: ${formatPrice(shown.rate.effectiveUsdPerUnit)} -> ${formatPrice(target)} per ${shown.rate.unit} (${formatMultiple(shown.rate.effectiveUsdPerUnit, target)})`}
-              </DialogContentText>
-              {shown.usdPerUnit === null && (
-                <DialogContentText>
-                  {`Returns to the default rate of ${formatPrice(shown.rate.defaultUsdPerUnit)} per ${shown.rate.unit}.`}
-                </DialogContentText>
-              )}
-              {(multiple > 10 || multiple < 0.1) && (
-                <Alert severity="warning" sx={{ mt: 2 }}>
-                  This changes the rate by more than 10x (up or down). Check the value before confirming; it affects recorded vendor spend.
-                </Alert>
-              )}
-            </>
-          )}
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setPending(null)}>Cancel</Button>
-          <Button onClick={confirmPending} color="primary" variant="contained">Confirm</Button>
-        </DialogActions>
-      </Dialog>
+      <ConfirmRateDialog open={pending !== null} change={pending ?? lastPending.current} onCancel={() => setPending(null)} onConfirm={confirmPending} />
     </Box>
   );
 }

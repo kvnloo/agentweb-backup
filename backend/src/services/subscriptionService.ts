@@ -292,7 +292,7 @@ const AVAILABLE_SUBSCRIPTION_FEATURES: ReadonlyArray<{
  * (legacy rows, new tiers, an omitted list) leaves these out, so only an explicit tick, or a saved
  * "*", grants them. A new paid-vendor feature joins this list.
  */
-export const OPT_IN_ONLY_SUBSCRIPTION_FEATURES: ReadonlyArray<SubscriptionFeatureId> = [
+const OPT_IN_ONLY_SUBSCRIPTION_FEATURES: ReadonlyArray<SubscriptionFeatureId> = [
   SUBSCRIPTION_FEATURES.HOT_LEAD_CALL,
 ];
 

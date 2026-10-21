@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import { localParts } from '../dripSendWindow';
-import { hhmmToMinutes, type HotLeadCallConfig } from '../hotLeadCallConfig';
+import { hhmmToMinutes, minutesOfDay, type HotLeadCallConfig } from '../hotLeadCallConfig';
 import { getLimitStore } from './limitStore';
 import { keyedDigest } from './keyedDigest';
 
@@ -18,7 +18,7 @@ const two = (n: number): string => String(n).padStart(2, '0');
 
 function localDayAndMinutes(timeZone: string, at: Date): { date: string; minutes: number } {
   const l = localParts(at.getTime(), timeZone);
-  return { date: `${l.year}-${two(l.month)}-${two(l.day)}`, minutes: l.hour * 60 + l.minute };
+  return { date: `${l.year}-${two(l.month)}-${two(l.day)}`, minutes: minutesOfDay(l) };
 }
 
 /**

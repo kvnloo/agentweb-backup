@@ -125,8 +125,8 @@ describe('twiml builders', () => {
   });
 
   it('refuses to put anything but an E.164 number into the Dial', () => {
-    expect(() => connectTwiml({ twilioNumber: '+15555550111', leadE164: '5555550123</Number><Hangup/>', ...URLS })).toThrow();
-    expect(() => connectTwiml({ twilioNumber: 'client:x', leadE164: '+15555550123', ...URLS })).toThrow();
+    expect(() => connectTwiml({ twilioNumber: '+15555550111', leadE164: '5555550123</Number><Hangup/>', ...URLS })).toThrow('TwiML lead number is not E.164');
+    expect(() => connectTwiml({ twilioNumber: 'client:x', leadE164: '+15555550123', ...URLS })).toThrow('TwiML caller id is not E.164');
   });
 
   it('builds the lead-unreachable apology and the bare hangup', () => {

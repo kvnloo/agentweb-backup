@@ -1,5 +1,5 @@
 import { localParts } from './dripSendWindow';
-import { hhmmToMinutes, type HotLeadCallConfig, type HotLeadCallMember } from './hotLeadCallConfig';
+import { hhmmToMinutes, minutesOfDay, type HotLeadCallConfig, type HotLeadCallMember } from './hotLeadCallConfig';
 import { isWithinCallWindow } from './voice/hotLeadCallLimits';
 
 type NotCalledReason = 'unverified' | 'outside_window' | 'excluded' | 'outside_calling_hours';
@@ -17,7 +17,7 @@ interface RosterEntry {
  */
 export function memberAvailableAt(member: HotLeadCallMember, timezone: string, at: Date): boolean {
   const local = localParts(at.getTime(), timezone);
-  const minutes = local.hour * 60 + local.minute;
+  const minutes = minutesOfDay(local);
   return member.windows.some(w =>
     w.days.includes(local.weekday) && minutes >= hhmmToMinutes(w.start) && minutes < hhmmToMinutes(w.end));
 }

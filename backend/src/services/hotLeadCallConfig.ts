@@ -171,6 +171,9 @@ function limit(raw: unknown, field: HotLeadCallLimitField): number | null {
   return typeof raw === 'number' && Number.isInteger(raw) && raw >= min && raw <= max ? raw : null;
 }
 
+/** Minutes since local midnight of a local-time reading (hour and minute). */
+export const minutesOfDay = (l: { hour: number; minute: number }): number => l.hour * 60 + l.minute;
+
 /** Minutes since local midnight of an HH:MM (or 24:00) string that already passed validation. */
 export const hhmmToMinutes = (hhmm: string): number => Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.slice(3, 5));
 
@@ -183,7 +186,7 @@ function callingHoursOf(raw: unknown): HotLeadCallCallingHours | null {
   return timezone ? { start, end, timezone } : null;
 }
 
-export interface WindowProblem {
+interface WindowProblem {
   /** The field the problem concerns; '' for the window as a whole. */
   field: '' | 'days' | 'start' | 'end';
   message: string;

@@ -10,6 +10,7 @@ import { recordCallUsage } from './voiceUsage';
 import { verificationCodeTwiml } from './twiml';
 import { isConditionalFailure, unchangedSince } from './setupWrites';
 import { keyedDigest } from './keyedDigest';
+import { DAY_MS } from '../hotLeadCallText';
 
 /**
  * Phone verification of a team member for the hot-lead auto-call (ENG-2271).
@@ -33,7 +34,6 @@ import { keyedDigest } from './keyedDigest';
 
 export const VERIFICATION_CODE_TTL_MS = 10 * 60_000;
 const VERIFICATION_MIN_GAP_MS = 2 * 60_000;
-const DAY_MS = 24 * 60 * 60_000;
 export const VERIFICATION_MAX_STARTS_PER_MEMBER_PER_DAY = 5;
 export const VERIFICATION_MAX_STARTS_PER_ORG_PER_DAY = 20;
 export const VERIFICATION_MAX_ATTEMPTS = 5;
@@ -173,6 +173,22 @@ function assertWithinLimits(memberStarts: readonly number[], orgStarts: readonly
   }
 }
 
+/** Rings the member and reads the code; the CallSid, or a ProviderError worded for the person who started it. */
+async function placeVerificationCall(to: string, from: string, code: string): Promise<string> {
+  try {
+    const { callSid } = await getVoiceProvider().placeCall({ to, from, twiml: verificationCodeTwiml(code), timeoutSeconds: CALL_TIMEOUT_SECONDS });
+    return callSid;
+  } catch (err) {
+    if (err instanceof VoiceCallError && err.placed === 'no') {
+      throw new ProviderError('The phone provider rejected the verification call, so no call was placed and nothing was charged. Check the number and try again in a few minutes.');
+    }
+    // Deliberately not metered: an unconfirmed placement returns no CallSid, and the usage event is keyed by it
+    // (twilio:voice:<sid>:verify), so there is nothing to key it by. The exposure is at most one minute of
+    // voice per start, and starts are capped at 5 per person and 20 per organization per day.
+    throw new ProviderError('The phone provider did not confirm whether the verification call was placed. If your phone does not ring within a minute or two, start again after the 2 minute wait.');
+  }
+}
+
 export async function startVerification(org: Organization, config: HotLeadCallConfig, userId: string, memberId?: string) {
   const member = memberToVerify(config, memberId);
   if (!config.twilioNumber) {
@@ -207,20 +223,7 @@ export async function startVerification(org: Organization, config: HotLeadCallCo
     throw err;
   }
 
-  let callSid: string;
-  try {
-    ({ callSid } = await getVoiceProvider().placeCall({
-      to: member.phone, from: config.twilioNumber, twiml: verificationCodeTwiml(code), timeoutSeconds: CALL_TIMEOUT_SECONDS,
-    }));
-  } catch (err) {
-    if (err instanceof VoiceCallError && err.placed === 'no') {
-      throw new ProviderError('The phone provider rejected the verification call, so no call was placed and nothing was charged. Check the number and try again in a few minutes.');
-    }
-    // Deliberately not metered: an unconfirmed placement returns no CallSid, and the usage event is keyed by it
-    // (twilio:voice:<sid>:verify), so there is nothing to key it by. The exposure is at most one minute of
-    // voice per start, and starts are capped at 5 per person and 20 per organization per day.
-    throw new ProviderError('The phone provider did not confirm whether the verification call was placed. If your phone does not ring within a minute or two, start again after the 2 minute wait.');
-  }
+  const callSid = await placeVerificationCall(member.phone, config.twilioNumber, code);
 
   // Trace id for ops only; losing this write loses nothing the flow needs.
   await orgDb.updateOrg(org.orgId, { hotLeadCallVerification: { ...state, members: { ...state.members, [member.id]: { ...record, callSid } } } }, { condition: unchangedSince({ hotLeadCallVerification: state }) })

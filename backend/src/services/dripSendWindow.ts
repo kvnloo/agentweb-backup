@@ -43,7 +43,7 @@ export function isValidTimezone(tz: string | null | undefined): tz is string {
   }
 }
 
-export interface LocalParts {
+interface LocalParts {
   year: number;
   month: number; // 1-12
   day: number;

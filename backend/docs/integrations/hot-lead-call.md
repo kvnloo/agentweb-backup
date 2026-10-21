@@ -236,7 +236,7 @@ the lock:
 1. All gates pass and a limit slot is reserved.
 2. `LeadCallStore.create` writes `lead.system.hot_lead_call` with `state=dialing`
    using a create-if-absent conditional write. `false` means a record already
-   exists: do not dial. A lead gets at most one call record, ever (v1).
+   exists: do not dial. A lead gets at most one call record, ever.
 3. `placeCall`. Success: `member_ringing` + `call.initiated`. Twilio rejected it
    (HTTP 4xx other than 408, `placed: 'no'`): `call.failed` (reason
    `place_rejected`) and the pass goes on to the next member; when none is left the
@@ -478,8 +478,8 @@ members and admins follow the owner's plan) lists `hot_lead_call` or `*`.
   entitled, unlike the other features. The editor shows such a row with
   **Hot lead calls** unticked and saving it does not add the feature; a new tier
   also starts with it unticked. Only an explicit tick (or a saved `*`) grants it.
-  Features that cost AgentWeb money are listed in
-  `OPT_IN_ONLY_SUBSCRIPTION_FEATURES` (`services/subscriptionService.ts`); every
+  Features that cost AgentWeb money are on the
+  opt-in-only feature list in `services/subscriptionService.ts`; every
   "all features" default leaves them out, and a future paid-vendor feature joins
   that list.
 - Anything unresolvable (no owner, unreadable tier, lookup error) is not entitled.
@@ -568,7 +568,7 @@ No new table or index. The feature writes:
 | `hotLeadCallProvisioning` (purchase/release timestamps for the daily caps) | org attribute | provisioning tools |
 | `hot_lead_call_mode` | AW-Settings item | operators |
 | `vendor_rate_overrides` | AW-Settings item | admin Vendor Rates tab |
-| `system.hot_lead_call` (call record: `state`, `jobKey`, `startedAt`, `updatedAt`, `attemptNo`, `memberId`, `triedMemberIds`, `leadPhoneMac` (keyed HMAC of the lead's phone, see Org config), `memberCallSid`, `leadCallSid`, `outcome`, `meteredLegs` (`member:<attempt>` and `lead`), `lastSequence`) | on the lead row (AW-Leads), no phone number | orchestrator and webhooks |
+| `system.hot_lead_call` (call record: `state`, `jobKey`, `startedAt`, `updatedAt`, `attemptNo`, `memberId`, `triedMemberIds`, `leadPhoneMac` (keyed HMAC of the lead's phone, see Org config), `claimToken` (random id of the writer that took an exclusive step, see Writes that commit and then report an error), `memberCallSid`, `leadCallSid`, `outcome`, `meteredLegs` (`member:<attempt>` and `lead`), `lastSequence`) | on the lead row (AW-Leads), no phone number | orchestrator and webhooks |
 | Timeline events `call.*` | the lead's `engagements` list | `LeadCallStore.addEvent` |
 | `hlc#phone#<hmac>`, `hlc#cool#<orgId>#<memberId>`, `hlc#cap#h#<orgId>#<UTC hour>`, `hlc#cap#d#<orgId>#<local date>` | existing table `AW-MCPSessions` (partition key `sessionId`, attribute `ttl`) | limit store |
 
@@ -1045,7 +1045,7 @@ Twilio's documentation and encoded in tests with synthetic payloads:
 - **Missed-call Slack line.** The Slack alert does not say whether the call was
   placed, answered or declined; deliberately deferred so the Slack path stays
   untouched.
-- **Retry after `place_rejected`.** v1 gives every lead one call record ever, so
+- **Retry after `place_rejected`.** Every lead gets one call record ever, so
   a definitively rejected placement is never retried. A deliberate retry needs a
   new store operation.
 - Voicemail detection and a post-call outcome summary in Emma.

@@ -6,6 +6,7 @@ import { isRecord } from '../leadNotificationAttribution';
 import { getVoiceProvider, VoiceCallError } from './voiceProvider';
 import { isConditionalFailure, unchangedSince } from './setupWrites';
 import { omit } from '../../utils/omit';
+import { DAY_MS } from '../hotLeadCallText';
 
 /**
  * Caller-number provisioning for the hot-lead auto-call (ENG-2271): one Twilio number per org.
@@ -33,7 +34,6 @@ import { omit } from '../../utils/omit';
  * mechanism is Meta-write specific (digest manifests halted inside agentModeService).
  */
 
-const DAY_MS = 24 * 60 * 60_000;
 const MAX_PURCHASES_PER_DAY = 2;
 const MAX_RELEASES_PER_DAY = 6;
 
