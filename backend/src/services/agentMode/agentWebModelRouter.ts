@@ -32,15 +32,14 @@
  *
  * No dependency on the service graph (unit-testable); the process-wide instance lives in agentWebModelRouterInstance.ts.
  */
-import { ALL_MODELS, AGENTWEB_MODEL_ID, normalizeAllowedModels, type AllowedModels, type TierModelsConfig } from './modelAccess';
+import { ALL_MODELS, normalizeAllowedModels, type AllowedModels, type TierModelsConfig } from './modelAccess';
 import { ModelUnavailableError } from './modelUnavailable';
+import { AGENTWEB_MODEL_DISPLAY_NAME, AGENTWEB_MODEL_ID } from './agentWebModelIds';
 
-export { AGENTWEB_MODEL_ID };
+export { AGENTWEB_MODEL_DISPLAY_NAME, AGENTWEB_MODEL_ID };
 
 export const AGENTWEB_MODEL_ROUTER_SETTING = 'agentweb_model_router_enabled';
 export const AGENTWEB_MODEL_ROUTING_TABLE_SETTING = 'agentweb_model_routing_table';
-/** Shown in the picker and in "AgentWeb Model · via X". */
-export const AGENTWEB_MODEL_DISPLAY_NAME = 'AgentWeb Model';
 
 /**
  * v0 task types: the session kinds AgentWeb already configures a model for (see modelAccessInstance.isSystemChosen):

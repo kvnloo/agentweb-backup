@@ -701,6 +701,27 @@ export async function recordModelRefusal(
 }
 
 /**
+ * ENG-669 PR-C: a background auto continuation refused because its selection, the AgentWeb Model, cannot be served (the
+ * router switched off mid-chain, or unavailable for this owner) ends its chain VISIBLY: the refusal is saved to the chat
+ * once and pushed live, instead of the chain stopping with nothing but a log line. Other refusals keep their existing
+ * handling. Never throws.
+ */
+async function reportContinuationModelRefusal(sessionId: string, userId: string, error: unknown): Promise<void> {
+  if (!isModelUnavailableError(error) || !isAgentWebModelId(error.requestedModel)) return;
+  const saved = await recordModelRefusal(sessionId, error);
+  if (!saved) return;
+  try {
+    const { io } = await import('../server');
+    io.to(`user:${userId}`).emit('session-message-appended', {
+      sessionId,
+      message: { role: 'assistant', content: saved.content, ...(typeof saved.messageIndex === 'number' && { messageIndex: saved.messageIndex }) },
+    });
+  } catch (emitErr) {
+    console.error(`AgentMode: failed to emit the continuation's model refusal for session ${sessionId}:`, emitErr);
+  }
+}
+
+/**
  * ENG-903: validate a schedule's model pin (llmModel / llmBackupModel) at the WRITE
  * site, with the same rules the picker and `resolveEffectiveModelForUser` enforce, so a
  * bad pin is refused with the portal's existing `model_unavailable` 422 instead of
@@ -1994,6 +2015,7 @@ async function scheduleAutoMediaContinuation(
     })
     .catch(async (err: any) => {
       console.error(`AgentMode: media auto-continuation failed for session ${sessionId}:`, err);
+      await reportContinuationModelRefusal(sessionId, userId, err);
       // ENG-1719: mirrors the work-plan continuation's identical fix. Left as a plain
       // console.error before, a timed-out media round silently ended the retry chain
       // without consuming a round — the exhaustion message/alert (:1200-1239) never fired
@@ -2263,15 +2285,12 @@ async function resolveWorkPlanStepModelForTurn(
       // ENG-669 PR-C: the step adopts the SELECTION (a pick of the AgentWeb Model stays the router on that step).
       return { kind: 'resolved', stepCount, decision, source: 'user', ...(ownModel && { updateStepModelTo: storedModelFor(decision, decision.effectiveModel) }) };
     }
-    const display = typeof agentModeService.getModelDisplayName === 'function'
-      ? agentModeService.getModelDisplayName(modelError.requestedModel)
-      : undefined;
     // ENG-669 PR-C: a step on the AgentWeb Model is named by its display name, and an unavailable router is "unavailable
     // right now", not a model that is gone.
     const routerUnavailable = isAgentWebModelId(candidate) && modelError.reason !== 'not_in_plan';
     return {
       kind: 'unavailable', stepCount, model: candidate,
-      label: isAgentWebModelId(candidate) ? AGENTWEB_MODEL_DISPLAY_NAME : sanitizeModelLabel(display || candidate),
+      label: modelDisplayLabel(candidate),
       reason: modelError.reason,
       ...(routerUnavailable && { routerUnavailable: true }),
     };
@@ -2629,6 +2648,7 @@ async function scheduleAutoWorkPlanContinuation(
     })
     .catch(async (err: any) => {
       console.error(`AgentMode: work-plan auto-continuation failed for session ${sessionId}:`, err);
+      await reportContinuationModelRefusal(sessionId, userId, err);
       // ENG-1717: a round killed by withGenerationTimeout rejects here, and `stillStalled`
       // (assigned only in .then) would stay false — silently ending the retry chain without
       // consuming a round, so the exhaustion message and on-call alert above never fire and
@@ -9480,10 +9500,15 @@ export async function generateSessionResponse(
     await assertModelInOwnerPlan({ ownerUserId: session.userId, model: llmModel, session });
   }
   // ENG-669 PR-C: which model a selection of the AgentWeb Model runs this turn, and why (stamped on the replies next
-  // to the concrete `llm`). A caller that runs the stored selection without the resolver (Slack and other transports,
-  // Emma email, approval resumes, GTM turns, continuations) passes `agentweb-model` itself: it is routed here, before
-  // anything is persisted. With the switch off it is refused like an unknown explicit model (never run on another).
-  // A caller that resolved first passes the routed model with its own decision (`turnModelDecision`).
+  // to the concrete `llm`). A caller that hands over the stored SELECTION without resolving it passes `agentweb-model`
+  // itself, and it is routed here, before anything is persisted: transports (sessionResponder) and Slack thread replies
+  // (session.llmModel), approval-inbox resumes, the plan-launch first turn (createSessionWithPlan), runVerifiedChat
+  // callers that pass no model (the session's stored model runs), and every auto continuation (media and work plan,
+  // from /generate, the interactive share timeout and the getSession backstop), each continuation being a turn of its
+  // own (routed again, so the switch and availability are re-checked and the replies are stamped). Emma email, GTM and
+  // result-endpoint turns pass the configured default, never a selection. With the switch
+  // off it is refused like an unknown explicit model (never run on another). A caller that resolved first passes the
+  // routed model with its own decision (`turnModelDecision`).
   let turnRouting: MessageModelRouting | undefined;
   if (isAgentWebModelId(llmModel)) {
     if (!(await agentWebModelRouter.isEnabled())) throw new ModelUnavailableError(AGENTWEB_MODEL_ID, 'not_served');
@@ -11104,7 +11129,10 @@ export const agentModeController = {
         }));
       }
       const modelToUse = modelPolicyDecision.effectiveModel;
-      // ENG-669 PR-C: the session keeps the SELECTION (`agentweb-model` when routed); `modelToUse` is what runs.
+      // ENG-669 PR-C: the session keeps the SELECTION (`agentweb-model` when routed); `modelToUse` is what runs. The
+      // auto continuations this turn may start are handed the selection too: each continuation is a turn of its own, so
+      // it is routed again (deterministic: the same table routes it to the same model), re-checks the switch and the
+      // router's availability (a rollback stops the chain with a visible refusal), and its replies carry the stamp.
       const selectedModel = storedModelFor(modelPolicyDecision, modelToUse);
       await chatbotDb.updateSessionLlmModel(
         sessionId,
@@ -11305,7 +11333,7 @@ export const agentModeController = {
               timedOutSession?.workPlan?.autocomplete === true &&
               workPlanHasUnfinishedAutocompleteWork(timedOutSession.workPlan, timedOutSession.calledFunctions)
             ) {
-              setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, modelToUse, 1).catch((err) =>
+              setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, selectedModel, 1).catch((err) =>
                 console.error(`AgentMode: work-plan auto-continuation (whole-turn timeout) failed for session ${sessionId}:`, err),
               ));
             }
@@ -11337,7 +11365,7 @@ export const agentModeController = {
               // slow turn that merely made images along the way doesn't get an unwanted
               // extra continuation call.
               if (hasPersistedMediaBudgetDeferral(timedOutSession?.messages, turnStartMs)) {
-                setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, modelToUse, 1).catch((err) =>
+                setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, selectedModel, 1).catch((err) =>
                   console.error(`AgentMode: media auto-continuation (whole-turn timeout) failed for session ${sessionId}:`, err),
                 ));
               }
@@ -11387,7 +11415,7 @@ export const agentModeController = {
       // past this request's own `finally` below, so scheduleAutoMediaContinuation
       // claims the generation lock only after THIS request has released it.
       if (hasDeferredMediaBudgetToolCall(response.toolCalls)) {
-        setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, modelToUse, 1).catch((err) =>
+        setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, selectedModel, 1).catch((err) =>
           console.error(`AgentMode: media auto-continuation (soft deferral) failed for session ${sessionId}:`, err),
         ));
       }
@@ -11399,7 +11427,7 @@ export const agentModeController = {
       // contract, and the session then sat idle for 3+ hours. Auto-fire the continuation
       // ourselves, same setImmediate-after-release pattern as the media case above.
       if (hasStalledAutocompleteWorkPlan(response.workPlan, response.toolCalls, response.calledFunctions)) {
-        setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, modelToUse, 1).catch((err) =>
+        setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, selectedModel, 1).catch((err) =>
           console.error(`AgentMode: work-plan auto-continuation failed for session ${sessionId}:`, err),
         ));
       } else if (response.workPlan?.autocomplete && hasNonRetryableWorkPlanStatusBlock(response.toolCalls)) {
@@ -12733,8 +12761,10 @@ export const agentModeController = {
             // were declared inside the outer try above and aren't visible in this catch
             // (same reason `shareId` is re-derived from req.params instead of reused) —
             // timedOutSession's strongly-consistent read already carries both fields,
-            // since updateSessionLlmModel persisted the effective model before generation
-            // started and continuationMsg being non-null guarantees timedOutSession exists.
+            // since updateSessionLlmModel persisted the model before generation started and
+            // continuationMsg being non-null guarantees timedOutSession exists. ENG-669 PR-C:
+            // that stored model is the SELECTION (`agentweb-model` when routed), so the
+            // continuation is routed again as a turn of its own, like the /generate ones.
             if (hasPersistedMediaBudgetDeferral(timedOutSession?.messages, sharedTurnStartMs)) {
               const continuationUserId = timedOutSession!.userId;
               const continuationModel = timedOutSession!.llmModel || agentModeService.default_model;

@@ -9,6 +9,8 @@
  * file is the ONLY producer of the user-facing message text.
  */
 
+import { AGENTWEB_MODEL_DISPLAY_NAME, AGENTWEB_MODEL_ID } from './agentWebModelIds';
+
 /**
  * `not_in_plan` (ENG-669): the model is served and selectable, but the owner's subscription tier does
  * not include it (services/agentMode/modelAccess.ts). It is never swapped for another model either.
@@ -109,10 +111,10 @@ export function buildModelUnavailableBody(
   subject: ModelUnavailableSubject = 'selection',
   audience: ModelUnavailableAudience = 'owner',
 ): ModelUnavailableBody {
-  const agentWebModel = err.requestedModel.trim() === AGENTWEB_MODEL_SELECTION;
+  const agentWebModel = err.requestedModel.trim() === AGENTWEB_MODEL_ID;
   // ENG-669 PR-C: the AgentWeb Model is not a registry model, so it has no registry display name; customers never see
   // the raw id.
-  const label = sanitizeModelLabel(agentWebModel ? AGENTWEB_MODEL_LABEL : (displayName || err.requestedModel));
+  const label = sanitizeModelLabel(agentWebModel ? AGENTWEB_MODEL_DISPLAY_NAME : (displayName || err.requestedModel));
   const body: ModelUnavailableBody = {
     error: agentWebModel && subject === 'selection' && err.reason !== 'not_in_plan'
       ? agentWebModelUnavailableMessage(err.reason)
@@ -130,12 +132,6 @@ export function buildModelUnavailableBody(
   return body;
 }
 
-/**
- * ENG-669 PR-C: the id of the AgentWeb Model selection, and its customer-facing name. Literals rather than imports:
- * modelAccess.ts (AGENTWEB_MODEL_ID) and agentWebModelRouter.ts (AGENTWEB_MODEL_DISPLAY_NAME) both import this module.
- */
-const AGENTWEB_MODEL_SELECTION = 'agentweb-model';
-const AGENTWEB_MODEL_LABEL = 'AgentWeb Model';
 
 /**
  * A refused selection of the AgentWeb Model: the router is off or unavailable (for everyone, this plan, or this task),
@@ -144,8 +140,8 @@ const AGENTWEB_MODEL_LABEL = 'AgentWeb Model';
  */
 function agentWebModelUnavailableMessage(reason: ModelUnavailableReason): string {
   return reason === 'not_selectable'
-    ? `${AGENTWEB_MODEL_LABEL} can't be used here. Choose a specific model to continue.`
-    : `${AGENTWEB_MODEL_LABEL} isn't available right now. Choose another model to continue.`;
+    ? `${AGENTWEB_MODEL_DISPLAY_NAME} can't be used here. Choose a specific model to continue.`
+    : `${AGENTWEB_MODEL_DISPLAY_NAME} isn't available right now. Choose another model to continue.`;
 }
 
 function modelUnavailableMessage(

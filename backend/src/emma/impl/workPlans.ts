@@ -258,6 +258,7 @@ import { anyStepCarriesModel, isStepModelUnavailableError, modelBoundToStep, res
 import { buildAnonymousModelUnavailableBody, buildAnonymousPlanModelToolMessage, buildModelUnavailableBody, buildPlanModelToolMessage, isModelUnavailableError, MODEL_SAVE_FAILED_MESSAGE } from '../../services/agentMode/modelUnavailable';
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
+import { isAgentWebModelId } from '../../services/agentMode/agentWebModelRouter';
 
 /**
  * ENG-1816 F2 follow-up: a production session reported "No work plan found in
@@ -572,7 +573,10 @@ export async function applyPredefinedWorkPlan(
       // oncall alert below still carry the details.
       const isAnonymousCaller = !userId || userId.startsWith('anon_');
       console.warn(`[applyPredefinedWorkPlan] "${predefinedPlan.title}" not launched — plan model "${body.requestedModel}" is ${modelError.reason}.`);
-      if (options?.isUnattendedRun) {
+      // ENG-669 PR-C: a pin of the AgentWeb Model refused as unavailable is the router being off or unavailable, which
+      // its own deduped alert already covers (a switch-off is a deliberate rollback): no page per launch.
+      const routerUnavailable = isAgentWebModelId(modelError.requestedModel) && modelError.reason !== 'not_in_plan';
+      if (options?.isUnattendedRun && !routerUnavailable) {
         void import('../../utils/agentModeAlerts')
           .then(({ sendAgentModeOncallAlert }) => sendAgentModeOncallAlert({
             subject: stepError
