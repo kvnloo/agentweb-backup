@@ -1,0 +1,336 @@
+/**
+ * ENG-2110 PR 2: the egress proxy over REAL sockets with local fake upstreams (`resolve`/`connect` are injected, so nothing leaves the
+ * machine). These protect the sandbox's only way out: exact allowlist, public addresses only, bridge exemption only for the bridge,
+ * bounded in every dimension, never echoing URLs or bodies.
+ */
+import { mkdtempSync, rmSync, statSync, writeFileSync, existsSync } from "fs";
+import { createServer, connect as netConnect, type Server, type Socket } from "net";
+import { tmpdir } from "os";
+import { join } from "path";
+import { EgressSocketInUseError, isForbiddenAddress, startEgressProxy, type EgressProxyHandle, type EgressProxyOptions } from "../../egress/egressProxy";
+
+const dirs: string[] = [];
+afterAll(() => dirs.forEach((d) => rmSync(d, { recursive: true, force: true })));
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** A local upstream that records what it receives and answers with a fixed banner, then echoes. */
+async function upstream(): Promise<{ server: Server; port: number; received: Buffer[]; sockets: Socket[]; close(): Promise<void> }> {
+  const received: Buffer[] = [];
+  const sockets: Socket[] = [];
+  const server = createServer((s) => {
+    sockets.push(s);
+    s.on("error", () => undefined);
+    s.write("HELLO\n");
+    s.on("data", (d) => {
+      received.push(d);
+      s.write(Buffer.concat([Buffer.from("ECHO:"), d]));
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as { port: number }).port;
+  return { server, port, received, sockets, close: () => new Promise<void>((r) => { sockets.forEach((s) => s.destroy()); server.close(() => r()); }) };
+}
+
+interface Rig {
+  sock: string;
+  proxy: EgressProxyHandle;
+  up: Awaited<ReturnType<typeof upstream>>;
+  warnings: Array<{ event: string; fields: Record<string, unknown> }>;
+  resolved: string[];
+  connects: Array<{ port: number; ip: string }>;
+  close(): Promise<void>;
+}
+
+async function rig(over: Partial<EgressProxyOptions> = {}, dns: Record<string, string[]> = {}): Promise<Rig> {
+  const dir = mkdtempSync(join(tmpdir(), "egress-"));
+  dirs.push(dir);
+  const up = await upstream();
+  const warnings: Rig["warnings"] = [];
+  const resolved: string[] = [];
+  const connects: Rig["connects"] = [];
+  const table: Record<string, string[]> = { "api.anthropic.com": ["160.79.104.10"], "claude.ai": ["160.79.104.11"], "evil.example.com": ["10.0.0.5"], "mixed.example.com": ["160.79.104.12", "169.254.169.254"], ...dns };
+  const sock = join(dir, "proxy.sock");
+  const proxy = await startEgressProxy({
+    socketPath: sock,
+    allow: ["api.anthropic.com:443", "claude.ai:443", "evil.example.com:443", "mixed.example.com:443"],
+    resolve: async (h) => {
+      resolved.push(h);
+      if (!(h in table)) throw new Error("nxdomain");
+      return table[h];
+    },
+    // Whatever address was vetted, the "network" is the local fake upstream; we record what the proxy asked for.
+    connect: (port, ip) => {
+      connects.push({ port, ip });
+      return netConnect({ port: up.port, host: "127.0.0.1" });
+    },
+    logger: { warn: (event, fields) => void warnings.push({ event, fields }) },
+    ...over,
+  });
+  return { sock, proxy, up, warnings, resolved, connects, close: async () => { await proxy.close(); await up.close(); } };
+}
+
+/** Sends raw bytes to the proxy socket and collects everything until the connection closes (or `waitMs`). */
+function talk(sock: string, bytes: string | Buffer, waitMs = 400): Promise<{ text: string; client: Socket; closed: boolean }> {
+  return new Promise((resolve) => {
+    const client = netConnect(sock);
+    let text = "";
+    let closed = false;
+    client.on("data", (d) => (text += d.toString("latin1")));
+    client.on("error", () => undefined);
+    client.on("close", () => (closed = true));
+    client.on("connect", () => client.write(bytes));
+    setTimeout(() => resolve({ text, client, closed }), waitMs);
+  });
+}
+const connectReq = (target: string, extra = "") => `CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n${extra}\r\n`;
+
+describe("isForbiddenAddress", () => {
+  it.each(["127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "224.0.0.1", "255.255.255.255", "198.18.0.1", "::1", "::", "fe80::1", "fc00::1", "fd00:ec2::254", "::ffff:10.0.0.1", "::ffff:169.254.169.254", "::ffff:7f00:1", "ff02::1", "2002:a00:1::1", "2001:db8::1", "not-an-ip"])("refuses %s", (ip) => {
+    expect(isForbiddenAddress(ip)).toBe(true);
+  });
+  it.each(["160.79.104.10", "8.8.8.8", "172.15.0.1", "172.32.0.1", "100.63.255.255", "198.20.0.1", "2607:6bc0::10", "2a00:1450:4001::200e", "::ffff:8.8.8.8"])("allows the public address %s", (ip) => {
+    expect(isForbiddenAddress(ip)).toBe(false);
+  });
+});
+
+describe("CONNECT", () => {
+  let r: Rig;
+  afterEach(async () => r && (await r.close()));
+
+  it("tunnels bytes both ways to an allowed host, connecting to the vetted address", async () => {
+    r = await rig();
+    const { client, text } = await talk(r.sock, connectReq("api.anthropic.com:443"));
+    expect(text).toContain("HTTP/1.1 200 Connection established");
+    expect(text).toContain("HELLO");
+    client.write("ping");
+    await sleep(150);
+    client.destroy();
+    expect(Buffer.concat(r.up.received).toString()).toBe("ping");
+    expect(r.connects).toEqual([{ port: 443, ip: "160.79.104.10" }]); // the address that was checked, not the name
+    expect(r.proxy.stats().allowed).toBe(1);
+  });
+
+  it("is case-insensitive on the host and forwards bytes the client sent right behind the request", async () => {
+    r = await rig();
+    const { text, client } = await talk(r.sock, connectReq("API.Anthropic.COM:443") + "early");
+    expect(text).toContain("200 Connection established");
+    await sleep(100);
+    expect(Buffer.concat(r.up.received).toString()).toBe("early");
+    client.destroy();
+  });
+
+  it("refuses a host that is not allowed with 403, counts it, and logs host:port and a reason only", async () => {
+    r = await rig();
+    const { text } = await talk(r.sock, connectReq("example.com:443", "Proxy-Authorization: Basic c2VjcmV0\r\n"));
+    expect(text).toContain("403");
+    expect(r.proxy.stats().denied).toBe(1);
+    expect(r.connects).toHaveLength(0);
+    expect(r.resolved).toHaveLength(0); // not even resolved
+    expect(r.warnings).toEqual([{ event: "egress_denied", fields: { target: "example.com:443", reason: "not_allowed" } }]);
+    expect(JSON.stringify(r.warnings)).not.toContain("c2VjcmV0");
+  });
+
+  it("refuses an allowed host on the wrong port", async () => {
+    r = await rig();
+    expect((await talk(r.sock, connectReq("api.anthropic.com:8443"))).text).toContain("403");
+  });
+
+  it.each([
+    ["a literal ipv4", "8.8.8.8:443", "403"],
+    ["a literal loopback", "127.0.0.1:443", "403"],
+    ["userinfo", "user:pw@api.anthropic.com:443", "400"],
+    ["an odd character", "api.anthropic.com/x:443", "400"],
+    ["a trailing-dot-less bad label", "-bad-.com:443", "400"],
+    ["port 0", "api.anthropic.com:0", "400"],
+    ["port 70000", "api.anthropic.com:70000", "400"],
+    ["no port", "api.anthropic.com", "400"],
+    ["an ipv6 literal", "[::1]:443", "400"],
+  ])("refuses %s", async (_n, target, status) => {
+    r = await rig();
+    expect((await talk(r.sock, connectReq(target))).text).toContain(`HTTP/1.1 ${status}`);
+    expect(r.connects).toHaveLength(0);
+  });
+
+  it("refuses an allowed NAME that resolves to a private address (DNS rebinding / SSRF) and never connects", async () => {
+    r = await rig();
+    const { text } = await talk(r.sock, connectReq("evil.example.com:443"));
+    expect(text).toContain("403");
+    expect(r.connects).toHaveLength(0);
+    expect(r.warnings[0].fields.reason).toBe("address_not_public");
+  });
+
+  it("refuses when ANY resolved address is private, even if another is public", async () => {
+    r = await rig();
+    expect((await talk(r.sock, connectReq("mixed.example.com:443"))).text).toContain("403");
+    expect(r.connects).toHaveLength(0);
+  });
+
+  it("answers 502 when the name does not resolve or resolves to nothing", async () => {
+    r = await rig({ allow: ["gone.example.com:443", "empty.example.com:443"] }, { "empty.example.com": [] });
+    expect((await talk(r.sock, connectReq("gone.example.com:443"))).text).toContain("502");
+    expect((await talk(r.sock, connectReq("empty.example.com:443"))).text).toContain("502");
+  });
+
+  it("answers 502 when the upstream refuses the connection", async () => {
+    r = await rig({ connect: () => netConnect({ port: 1, host: "127.0.0.1" }) });
+    expect((await talk(r.sock, connectReq("api.anthropic.com:443"), 600)).text).toContain("502");
+  });
+
+  it("refuses other methods with 405 and malformed requests with 400", async () => {
+    r = await rig();
+    expect((await talk(r.sock, "TRACE / HTTP/1.1\r\nHost: x\r\n\r\n")).text).toContain("405");
+    expect((await talk(r.sock, "garbage\r\n\r\n")).text).toContain("400");
+    expect((await talk(r.sock, "CONNECT api.anthropic.com:443 HTTP/1.1\r\nbad header line\r\n\r\n")).text).toContain("400");
+    expect((await talk(r.sock, "CONNECT api.anthropic.com:443 HTTP/2\r\n\r\n")).text).toContain("400");
+  });
+
+  it("refuses a plain http request to anything but the bridge (the allowlist is for CONNECT only)", async () => {
+    r = await rig();
+    const { text } = await talk(r.sock, "GET http://api.anthropic.com/ HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n");
+    expect(text).toContain("403");
+    expect(r.connects).toHaveLength(0);
+  });
+
+  it("refuses plain http even to a host:port that IS on the allowlist (the allowlist is for CONNECT only), and a listed literal IP", async () => {
+    r = await rig({ allow: ["plain.example.com:80", "8.8.8.8:443"] }, { "plain.example.com": ["160.79.104.20"] });
+    const plain = await talk(r.sock, "GET http://plain.example.com/ HTTP/1.1\r\nHost: plain.example.com\r\n\r\n");
+    expect(plain.text).toContain("403");
+    expect(r.warnings[0].fields.reason).toBe("plain_http_not_bridge");
+    expect((await talk(r.sock, connectReq("8.8.8.8:443"))).text).toContain("403");
+    expect(r.warnings[1].fields.reason).toBe("literal_ip");
+    expect(r.connects).toHaveLength(0);
+  });
+});
+
+describe("the tool bridge target", () => {
+  let r: Rig;
+  afterEach(async () => r && (await r.close()));
+
+  it("may be loopback: CONNECT to it works although loopback is forbidden for everything else", async () => {
+    r = await rig({ bridge: { host: "127.0.0.1", port: 3991 } });
+    const { text, client } = await talk(r.sock, connectReq("127.0.0.1:3991"));
+    expect(text).toContain("200 Connection established");
+    client.destroy();
+    expect(r.connects).toEqual([{ port: 3991, ip: "127.0.0.1" }]);
+    // ... and the same loopback on another port is not the bridge.
+    expect((await talk(r.sock, connectReq("127.0.0.1:3992"))).text).toContain("403");
+  });
+
+  it("a bridge NAME that resolves to a private address is allowed, while the allowlisted names still are not exempt", async () => {
+    r = await rig({ bridge: { host: "bridge.internal.test", port: 3001 } }, { "bridge.internal.test": ["10.9.9.9"] });
+    expect((await talk(r.sock, connectReq("bridge.internal.test:3001"))).text).toContain("200 Connection established");
+    expect(r.connects[0]).toEqual({ port: 3001, ip: "10.9.9.9" });
+    expect((await talk(r.sock, connectReq("evil.example.com:443"))).text).toContain("403");
+  });
+
+  it("rewrites a plain-http absolute-form request to origin-form with Connection: close, and forwards the body", async () => {
+    r = await rig({ bridge: { host: "127.0.0.1", port: 3991 } });
+    const body = '{"jsonrpc":"2.0"}';
+    const req =
+      `POST http://127.0.0.1:3991/internal/tool-bridge/run-1?x=1 HTTP/1.1\r\nHost: 127.0.0.1:3991\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n` +
+      `Authorization: Bearer abc\r\nContent-Length: ${body.length}\r\n\r\n${body}`;
+    const { client } = await talk(r.sock, req, 300);
+    client.destroy();
+    const got = Buffer.concat(r.up.received).toString("latin1");
+    expect(got.startsWith("POST /internal/tool-bridge/run-1?x=1 HTTP/1.1\r\n")).toBe(true);
+    expect(got).toContain("Connection: close\r\n");
+    expect(got).toContain("Authorization: Bearer abc\r\n");
+    expect(got.toLowerCase()).not.toContain("proxy-connection");
+    expect(got.toLowerCase()).not.toContain("keep-alive");
+    expect(got.endsWith(body)).toBe(true);
+    expect(got).not.toContain("http://127.0.0.1");
+  });
+
+  it("refuses a plain-http request to the bridge host on another port, and one with userinfo", async () => {
+    r = await rig({ bridge: { host: "127.0.0.1", port: 3991 } });
+    expect((await talk(r.sock, "GET http://127.0.0.1:3000/ HTTP/1.1\r\nHost: x\r\n\r\n")).text).toContain("403");
+    expect((await talk(r.sock, "GET http://u:p@127.0.0.1:3991/ HTTP/1.1\r\nHost: x\r\n\r\n")).text).toContain("400");
+  });
+});
+
+describe("bounds", () => {
+  let r: Rig;
+  afterEach(async () => r && (await r.close()));
+
+  it("answers 431 to an oversized head and drops a head that never completes", async () => {
+    r = await rig({ maxHeaderBytes: 128, handshakeMs: 150 });
+    expect((await talk(r.sock, `CONNECT api.anthropic.com:443 HTTP/1.1\r\nX: ${"a".repeat(400)}\r\n\r\n`)).text).toContain("431");
+    expect((await talk(r.sock, `CONNECT api.anthropic.com:443 HTTP/1.1\r\nX: ${"a".repeat(400)}`)).text).toContain("431");
+    const slow = await talk(r.sock, "CONNECT api.anthropic.com:443 HT", 500);
+    expect(slow.closed).toBe(true);
+    expect(slow.text).not.toContain("200");
+    expect(r.connects).toHaveLength(0);
+  });
+
+  it("closes an idle tunnel", async () => {
+    r = await rig({ idleMs: 150 });
+    const { client } = await talk(r.sock, connectReq("api.anthropic.com:443"), 100);
+    let closed = false;
+    client.on("close", () => (closed = true));
+    await sleep(500);
+    expect(closed).toBe(true);
+  });
+
+  it("closes a busy tunnel at its maximum lifetime", async () => {
+    r = await rig({ idleMs: 10_000, maxLifetimeMs: 250 });
+    const { client } = await talk(r.sock, connectReq("api.anthropic.com:443"), 100);
+    let closed = false;
+    client.on("close", () => (closed = true));
+    const t = setInterval(() => client.write("x"), 30);
+    await sleep(600);
+    clearInterval(t);
+    expect(closed).toBe(true);
+  });
+
+  it("answers 503 beyond the connection cap and recovers when a slot frees", async () => {
+    r = await rig({ maxConnections: 2 });
+    const a = await talk(r.sock, connectReq("api.anthropic.com:443"), 150);
+    const b = await talk(r.sock, connectReq("claude.ai:443"), 150);
+    expect(r.proxy.stats().active).toBe(2);
+    expect((await talk(r.sock, connectReq("api.anthropic.com:443"), 150)).text).toContain("503");
+    a.client.destroy();
+    await sleep(100);
+    expect((await talk(r.sock, connectReq("api.anthropic.com:443"), 150)).text).toContain("200 Connection established");
+    b.client.destroy();
+  });
+
+  it("close() destroys active tunnels and removes the socket", async () => {
+    r = await rig();
+    const { client } = await talk(r.sock, connectReq("api.anthropic.com:443"), 150);
+    let closed = false;
+    client.on("close", () => (closed = true));
+    await r.proxy.close();
+    await sleep(100);
+    expect(closed).toBe(true);
+    expect(existsSync(r.sock)).toBe(false);
+    await r.up.close();
+    r = undefined as never;
+  });
+});
+
+describe("the socket", () => {
+  it("is created with the requested mode, a stale file is replaced, a live proxy is refused", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "egress-sock-"));
+    dirs.push(dir);
+    const sock = join(dir, "p.sock");
+    writeFileSync(sock, "stale");
+    const first = await startEgressProxy({ socketPath: sock, socketMode: 0o660, allow: [] });
+    expect(statSync(sock).mode & 0o777).toBe(0o660);
+    await expect(startEgressProxy({ socketPath: sock, allow: [] })).rejects.toBeInstanceOf(EgressSocketInUseError);
+    await first.close();
+    expect(existsSync(sock)).toBe(false);
+    const again = await startEgressProxy({ socketPath: sock, allow: [] });
+    expect(statSync(sock).mode & 0o777).toBe(0o666); // default
+    await again.close();
+  });
+
+  it("counts allowed and denied separately", async () => {
+    const r = await rig();
+    const ok = await talk(r.sock, connectReq("api.anthropic.com:443"), 100);
+    await talk(r.sock, connectReq("example.com:443"), 100);
+    await talk(r.sock, connectReq("evil.example.com:443"), 100);
+    expect(r.proxy.stats()).toMatchObject({ allowed: 1, denied: 2 });
+    ok.client.destroy();
+    await r.close();
+  });
+});
