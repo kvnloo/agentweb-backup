@@ -88,6 +88,7 @@ import { resolveUsageRunway } from '../services/llmUsageRunwayResolverService';
 import { resolveEffectiveModelForUser } from '../controllers/agentModeController';
 import { getCurrentUsageMonth } from '../services/llmUsageCreditService';
 import type { PaygAdmittedMonth, PaygOverageSettings } from '../services/paygOverage';
+import { withOwnerOpenInvoice } from '../services/paygSettlement';
 import { createUserRowFake } from './helpers/userRowFake';
 
 const USD = 1_000_000;
@@ -823,5 +824,47 @@ describe('ENG-668 PR-2 — the admission record keeps the spend basis it was mea
     mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 121 * USD, basis: 'spend_ledger' });
     await checkTokenUsage(OWNER, TURN_ADMISSION);
     expect(fake.row.paygOverage.admittedMonths).toEqual([expect.objectContaining({ month, spendBasis: 'mixed' })]);
+  });
+});
+
+describe('ENG-668 PR-2 — what a blocked or cancelling owner is told (rvE2E MINOR 5/6)', () => {
+  it('a cancellation scheduled for the period end (`canceling`) keeps PAYG covering, like the plan itself', async () => {
+    setup({ spendUsd: 120, user: { subscription_status: 'canceling' } });
+    const status = await checkTokenUsage(OWNER, TURN_ADMISSION);
+    expect(status.allowed).toBe(true);
+    expect(status.paygBlock).toBeUndefined();
+    const decision = await resolveEffectiveModelForUser({ userId: OWNER, requestedModel: CHOSEN_MODEL });
+    expect(decision.effectiveModel).toBe(CHOSEN_MODEL);
+  });
+
+  it('a canceled subscription still is not covered', async () => {
+    setup({ spendUsd: 120, user: { subscription_status: 'canceled' } });
+    const status = await checkTokenUsage(OWNER, TURN_ADMISSION);
+    expect(status.allowed).toBe(false);
+    expect(status.paygBlock).toEqual({ reason: 'payg_inactive', paygInactiveReason: 'subscription_inactive' });
+  });
+
+  it('the suspended owner\'s 429 carries the unpaid invoice\'s page (and no amount)', async () => {
+    setup({
+      spendUsd: 120,
+      user: {
+        paygOverage: payg({ suspended: { reason: 'payment_failed', at: '2026-10-05T00:00:00.000Z', invoiceId: 'in_sep' } }),
+        paygSettlements: { '2026-09': { status: 'failed', invoiceId: 'in_sep', hostedInvoiceUrl: 'https://invoice.stripe.com/i/sep', amountCents: 4500 } },
+      },
+    });
+    const status = await checkTokenUsage(OWNER, TURN_ADMISSION);
+    expect(status.paygBlock).toEqual({ reason: 'payg_suspended', openInvoiceUrl: 'https://invoice.stripe.com/i/sep' });
+    const customer = toCustomerTokenUsage(status);
+    expect(customer.usageBlock).toMatchObject({ reason: 'payg_suspended', openInvoiceUrl: 'https://invoice.stripe.com/i/sep' });
+    expect(JSON.stringify(customer)).not.toMatch(/4500/);
+    const usage = await getEffectiveLlmUsagePolicy(OWNER);
+    expect(usage.paygBlock).toEqual({ reason: 'payg_suspended', openInvoiceUrl: 'https://invoice.stripe.com/i/sep' });
+  });
+
+  it('a pooled member never gets the owner\'s invoice; a dispute hold carries none', () => {
+    const settlements = { '2026-09': { status: 'failed', invoiceId: 'in_sep', hostedInvoiceUrl: 'https://invoice.stripe.com/i/sep' } } as never;
+    expect(withOwnerOpenInvoice({ reason: 'payg_suspended' }, false, settlements)).toEqual({ reason: 'payg_suspended' });
+    expect(withOwnerOpenInvoice({ reason: 'payg_suspended' }, true, {} as never)).toEqual({ reason: 'payg_suspended' });
+    expect(withOwnerOpenInvoice({ reason: 'payg_cap_reached' }, true, settlements)).toEqual({ reason: 'payg_cap_reached' });
   });
 });

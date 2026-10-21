@@ -150,7 +150,24 @@ describe('GET /api/subscription/payg', () => {
       overagePercentUsed: 0,
       suspended: null,
       hasPaymentMethod: true,
+      openInvoiceUrl: null,
     });
+  });
+
+  it('points the owner of a suspended account at the unpaid invoice (no amount); a pooled member sees none (rvE2E MINOR 5)', async () => {
+    users[OWNER].paygOverage = {
+      enabled: true, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 1,
+      suspended: { reason: 'payment_failed', at: '2026-10-05T00:00:00.000Z', invoiceId: 'in_sep' },
+    };
+    users[OWNER].paygSettlements = {
+      '2026-08': { status: 'paid', invoiceId: 'in_aug', hostedInvoiceUrl: 'https://invoice.stripe.com/i/aug' },
+      '2026-09': { status: 'failed', invoiceId: 'in_sep', hostedInvoiceUrl: 'https://invoice.stripe.com/i/sep', amountCents: 4500 },
+    };
+    const owner = await get(OWNER).expect(200);
+    expect(owner.body).toMatchObject({ suspended: 'payment_failed', openInvoiceUrl: 'https://invoice.stripe.com/i/sep' });
+    expect(JSON.stringify(owner.body)).not.toMatch(/4500|amount/i);
+    const member = await get(MEMBER).expect(200);
+    expect(member.body.openInvoiceUrl).toBeNull();
   });
 
   it('reports overage as a percentage of the cap, never in dollars', async () => {

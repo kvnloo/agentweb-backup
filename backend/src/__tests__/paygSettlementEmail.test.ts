@@ -27,7 +27,8 @@ describe('ENG-668 settlement emails', () => {
     const [to, subject, text, html] = send.mock.calls[0];
     expect(to).toBe('owner@example.com');
     expect(subject).toBe('Your pay-as-you-go invoice for September 2026');
-    expect(text).toContain('60% of the pay-as-you-go limit you set');
+    // The bill follows the month's highest limit, so the percentage is of that limit (rvE2E R4).
+    expect(text).toContain('using 60% of the highest pay-as-you-go limit you had set that month');
     expect(text).toContain('View your invoice: https://invoice.stripe.com/i/acct/in_1');
     expect(html).toContain('href="https://invoice.stripe.com/i/acct/in_1"');
     for (const body of [subject, text, html]) expect(body).not.toMatch(DOLLARS);
@@ -55,7 +56,7 @@ describe('ENG-668 settlement emails', () => {
 
   it('the percentage is a whole number within 0-100', async () => {
     await emailService.sendPaygOverageInvoiceEmail({ to: 'o@example.com', month: '2026-09', percentOfCap: 133.7 });
-    expect(send.mock.calls[0][2]).toContain('100% of the pay-as-you-go limit');
+    expect(send.mock.calls[0][2]).toContain('100% of the highest pay-as-you-go limit');
   });
 
   it('the Stripe invoice describes the month it bills', () => {
