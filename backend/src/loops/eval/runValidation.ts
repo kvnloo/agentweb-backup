@@ -35,6 +35,8 @@ import {
 import { buildLoadedSession, groupEventsBySession, type DocItem, type ReadOnlyDocReader, type ReadRequest } from './agentGraderLoader';
 import { LOOP_EVENTS_TABLE } from '../core/sensors/eventTableEventSource';
 import { OUTCOME_SHADOW_JUDGE_ID } from '../../services/outcomeJudge';
+import { buildAgentRunTrace, type AgentRunTrace, type TraceMessageRow, type TraceSessionRow } from '../../services/agentRunTrace';
+import { judgeTaskSuccess, TASK_SUCCESS_JUDGE_GRADER_ID } from '../../services/taskSuccessJudge';
 import { CREATIVE_GATES_GRADER_ID, type CreativeGateResult } from '../../services/creativeGates';
 import type { AccountHealthState } from '../../services/accountHealthClassifier';
 import type { AccountHealthUser } from '../../cron/accountHealthClassifierCron';
@@ -375,6 +377,52 @@ export function liveAgentGraders(load: (sessionId: string) => Promise<SessionFor
   }));
 }
 
+// LLM task-success judge (ENG-2591), reading the whole session as a step-by-step trace ---
+
+/** Read-only: one session's work plan, title and messages as a trace (services/agentRunTrace.ts). */
+export async function loadTraceForGrading(
+  reader: ReadOnlyDocReader,
+  tables: Pick<AgentGraderTables, 'sessions' | 'messages'>,
+  sessionId: string,
+): Promise<{ trace: AgentRunTrace; title?: string } | undefined> {
+  const [session] = await readAll(reader, {
+    TableName: tables.sessions,
+    KeyConditionExpression: 'sessionId = :s',
+    ProjectionExpression: 'sessionId, title, workPlan',
+    ExpressionAttributeValues: { ':s': sessionId },
+  });
+  if (!session) return undefined;
+  const messages = await readAll(reader, {
+    TableName: tables.messages,
+    KeyConditionExpression: 'sessionId = :s',
+    ExpressionAttributeValues: { ':s': sessionId },
+  });
+  const trace = buildAgentRunTrace({ sessionId, session: session as TraceSessionRow, messages: messages as TraceMessageRow[] });
+  return { trace, ...(typeof session.title === 'string' ? { title: session.title } : {}) };
+}
+
+/**
+ * The LLM judge's `task_success`. One model call per case, so it runs only when asked for by id;
+ * a judge error abstains rather than guessing.
+ */
+export function taskSuccessJudgeGrader(
+  loadTrace: (sessionId: string) => Promise<{ trace: AgentRunTrace; title?: string } | undefined>,
+  judge: typeof judgeTaskSuccess = judgeTaskSuccess,
+): GoldenCaseGrader {
+  return {
+    graderId: TASK_SUCCESS_JUDGE_GRADER_ID,
+    surface: 'agent',
+    criteria: ['task_success'],
+    primaryCriterion: 'task_success',
+    grade: async (c: GoldenCase) => {
+      const loaded = await loadTrace(c.sourceRef.id);
+      if (!loaded) return {};
+      const result = await judge(loaded);
+      return result.status === 'ok' ? { task_success: result.verdict } : {};
+    },
+  };
+}
+
 // Creative deterministic gates (ENG-2139/2187), read from the candidate's stored gate result ---
 
 /**
@@ -506,6 +554,7 @@ export function defaultGoldenCaseGraders(): GoldenCaseGrader[] {
   return [
     ...storedSessionJudgeGraders(doc),
     ...liveAgentGraders((sessionId) => loadSessionForGrading(reader, tables, sessionId)),
+    taskSuccessJudgeGrader((sessionId) => loadTraceForGrading(reader, tables, sessionId)),
     creativeGatesGrader(readStoredCreativeGates),
     accountHealthGrader(classifyAccountHealthForUser),
   ];
