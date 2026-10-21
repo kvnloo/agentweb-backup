@@ -33,7 +33,7 @@ import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBl
 import { appendRetryabilityGuidance } from './errorRetryability';
 import { LLM_MODEL_REGISTRY } from '../llmModelRegistry';
 import { sealTruncatedPayload, sealTruncatedPayloadWithNotice } from './truncatedPayload';
-import { parseToolCallArguments, TruncatedToolCallArgumentsError } from './repairToolCallArguments';
+import { normalizeRepairedToolCallArguments, parseToolCallArguments, TruncatedToolCallArgumentsError } from './repairToolCallArguments';
 import {
   buildToolResponseS3Header,
   buildToolResponseUnavailableHeader,
@@ -785,6 +785,10 @@ export async function executePreparedTools(
       // early string terminator. Retry through a repair pass before failing —
       // see repairToolCallArguments.ts for the observed failure signature.
       const functionArgs = parseToolCallArguments(toolCall.function.arguments);
+      // ENG-2597: when the raw arguments needed repair (duplicated object,
+      // unescaped quote), store the repaired form on the tool call so the
+      // assistant turn persisted to history replays valid JSON next turn.
+      normalizeRepairedToolCallArguments(toolCall, functionArgs);
 
       // Enforce skill-based tool access; block admin-only tools without admin access,
       // block context-restricted/shared-session tools even if the LLM hallucinates them.

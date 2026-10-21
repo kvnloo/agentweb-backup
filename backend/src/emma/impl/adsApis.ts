@@ -305,6 +305,7 @@ export type GetMetaAdsMetricsDeps = {
  * confirmed by grep to have real callers well beyond this one method.
  */
 export type CallMetaMarketingApiDeps = {
+  preparePausedMetaBundle?: (userId: string, sessionId: string | undefined, accountId: string, params: unknown) => Promise<MetaApiResult>;
   resolveCampaignObjectiveGate: (
     userId: string,
     sessionId: string | undefined,
@@ -1919,6 +1920,13 @@ export async function callMetaMarketingApi(
   deps: CallMetaMarketingApiDeps,
 ): Promise<MetaApiResult> {
   console.log(`AgentMode: callMetaMarketingApi -> ${entity_type} / ${action}`);
+
+  if (action === 'CREATE_PAUSED_BUNDLE') {
+    if (entity_type !== 'CAMPAIGN' || campaign_id || ad_set_id || ad_id || !deps.preparePausedMetaBundle) {
+      return { success: false, message: 'A paused bundle creates a new campaign, ad set and ads; existing target IDs are not allowed.' };
+    }
+    return deps.preparePausedMetaBundle(userId, sessionId, account_id, params);
+  }
 
   // Ensure params is an object
   params = params || {};
