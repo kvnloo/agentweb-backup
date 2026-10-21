@@ -19,6 +19,7 @@ const base = () => ({
   uidMin: 400_000,
   uidMax: 410_000,
   socket: { dir: "/run/aw-login-host-test1", gid: 990 },
+  egress: { allow: ["api.anthropic.com:443", "platform.claude.com:443", "claude.ai:443"] },
   claude: { binaryPath: "/opt/aw-claude/2.1.294/claude", expectedSha256: "a".repeat(64), version: "2.1.294", systemPromptFile: "/opt/aw-login-host/system-prompt.txt", bridgeUrl: "http://127.0.0.1:3001/internal/tool-bridge/run/mcp" },
 });
 const bad = (over: Record<string, unknown>) => () => parseHostConfig({ ...base(), ...over });
@@ -32,6 +33,32 @@ describe("host config (a CLOSED schema)", () => {
     expect(c.tools.systemRun).toBe("/usr/bin/systemd-run");
     expect(c.claude.turnWrapperPath).toBe("/opt/aw-login-host/claude-turn.sh");
     expect(c.socket.mode).toBe(0o660);
+  });
+  it("requires an egress policy (a host with no allowlist does not start) and derives the proxy socket path", () => {
+    const noEgress: Record<string, unknown> = { ...base() };
+    delete noEgress.egress;
+    expect(() => parseHostConfig(noEgress)).toThrow(HostConfigError);
+    const c = parseHostConfig(base());
+    expect(c.egressDir).toBe("/run/aw-egress-test1");
+    expect(c.egressSocketPath).toBe("/run/aw-egress-test1/proxy.sock");
+    expect(c.egress.launcherPath).toBe("/opt/aw-login-host/aw-net.sh");
+    expect(c.egress.socat).toBe("/usr/bin/socat");
+  });
+  it.each([
+    ["an empty allowlist", { egress: { allow: [] } }],
+    ["a literal IP", { egress: { allow: ["169.254.169.254:80"] } }],
+    ["a bracketed IPv6", { egress: { allow: ["[::1]:443"] } }],
+    ["no port", { egress: { allow: ["api.anthropic.com"] } }],
+    ["a port out of range", { egress: { allow: ["api.anthropic.com:70000"] } }],
+    ["a wildcard", { egress: { allow: ["*.anthropic.com:443"] } }],
+    ["upper case", { egress: { allow: ["API.anthropic.com:443"] } }],
+    ["a path", { egress: { allow: ["api.anthropic.com:443/x"] } }],
+    ["unknown egress keys", { egress: { allow: ["api.anthropic.com:443"], open: true } }],
+  ])("rejects an egress policy with %s", (_n, over) => expect(bad(over)).toThrow(HostConfigError));
+  it("the production port config ALWAYS isolates the network (units get PrivateNetwork and the proxy directory)", async () => {
+    const { portConfigFor } = await import("../../host/main");
+    const cfg = parseHostConfig(base());
+    expect(portConfigFor(cfg).paths.net).toEqual({ dir: "/run/aw-egress-test1", launcher: "/opt/aw-login-host/aw-net.sh", socat: "/usr/bin/socat" });
   });
   it("rejects unknown keys anywhere (nothing is silently ignored)", () => {
     expect(bad({ extra: 1 })).toThrow(HostConfigError);
