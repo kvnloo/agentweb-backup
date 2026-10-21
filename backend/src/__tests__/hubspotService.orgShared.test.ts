@@ -160,3 +160,38 @@ describe('create() with an explicit account id', () => {
     expect(getShared).toHaveBeenCalled();
   });
 });
+
+describe("create() with an account 'source' (Emma resolves own -> pasted token -> shared)", () => {
+  it("'own' never consults shared accounts, even when the caller has none", async () => {
+    getShared.mockResolvedValue([sharedFrom('owner-1', '222')]);
+    await expect(HubSpotService.create('caller-1', undefined, 'own')).rejects.toThrow('HubSpot account not connected');
+    expect(getShared).not.toHaveBeenCalled();
+  });
+
+  it("'own' with an explicit id that is only a shared account is 'not found'", async () => {
+    getShared.mockResolvedValue([sharedFrom('owner-1', '222')]);
+    await expect(HubSpotService.create('caller-1', '222', 'own')).rejects.toThrow('HubSpot account "222" not found');
+    expect(getShared).not.toHaveBeenCalled();
+  });
+
+  it("'shared' skips the caller's own accounts entirely", async () => {
+    getAccountsByUserId.mockResolvedValue([hubspotAccount('111')]);
+    getShared.mockResolvedValue([sharedFrom('owner-1', '222')]);
+    const svc = await HubSpotService.create('caller-1', undefined, 'shared');
+    expect(svc.accountId).toBe('222');
+    expect(getAccountsByUserId).not.toHaveBeenCalled();
+  });
+
+  it("'shared' with an explicit id does not look at the caller's own account", async () => {
+    getAccountById.mockResolvedValue(hubspotAccount('222'));
+    getShared.mockResolvedValue([sharedFrom('owner-1', '222')]);
+    const svc = await HubSpotService.create('caller-1', '222', 'shared');
+    expect(svc.accountId).toBe('222');
+    expect(getAccountById).not.toHaveBeenCalled();
+  });
+
+  it("'shared' with nothing shared: the unchanged 'not connected' message", async () => {
+    await expect(HubSpotService.create('caller-1', undefined, 'shared')).rejects.toThrow('HubSpot account not connected');
+  });
+});
+

@@ -21,6 +21,7 @@ import { clearHubSpotPortalCache, createAccount, getUserIdByHubSpotPortalId } fr
 const hs = (hubId: unknown) => ({ platform: 'hubspot', account_id: String(hubId), account_name: `P${hubId}`, config: { hub_id: hubId } });
 const user = (userId: string, ...accounts: any[]) => ({ userId, connected_accounts: accounts });
 const TTL = 5 * 60 * 1000;
+const MISS_REFRESH = 30 * 1000;
 
 let now = 1_700_000_000_000;
 beforeEach(() => {
@@ -57,13 +58,49 @@ describe('getUserIdByHubSpotPortalId', () => {
   it('rebuilds after the TTL, so a newly connected portal and a disconnect are seen', async () => {
     expect(await getUserIdByHubSpotPortalId(333)).toBeNull();
     mockUsers = [user('u1', hs(111)), user('u3', hs(333))];
-    now += TTL - 1;
+    now += MISS_REFRESH - 1;
     expect(await getUserIdByHubSpotPortalId(333)).toBeNull();
     expect(mockGetAllUsers).toHaveBeenCalledTimes(1);
-    now += 2;
+    now += TTL;
     expect(await getUserIdByHubSpotPortalId(333)).toBe('u3');
     expect(await getUserIdByHubSpotPortalId(222)).toBeNull();
     expect(mockGetAllUsers).toHaveBeenCalledTimes(2);
+  });
+
+  it('a MISS on a snapshot older than 30s rebuilds ONCE, so a portal connected on another instance is found in seconds', async () => {
+    expect(await getUserIdByHubSpotPortalId(333)).toBeNull();
+    expect(mockGetAllUsers).toHaveBeenCalledTimes(1);
+    mockUsers = [user('u1', hs(111)), user('u3', hs(333))];
+    now += MISS_REFRESH + 1;
+    expect(await getUserIdByHubSpotPortalId(333)).toBe('u3');
+    expect(mockGetAllUsers).toHaveBeenCalledTimes(2);
+  });
+
+  it('...and a portal that is still unknown does not rescan again until the next 30s has passed', async () => {
+    expect(await getUserIdByHubSpotPortalId(999)).toBeNull();
+    now += MISS_REFRESH + 1;
+    for (let i = 0; i < 20; i++) expect(await getUserIdByHubSpotPortalId(999)).toBeNull();
+    expect(mockGetAllUsers).toHaveBeenCalledTimes(2);
+  });
+
+  it('a HIT never triggers a rebuild before the TTL, however old the snapshot is', async () => {
+    expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
+    now += TTL - 1;
+    expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
+    expect(mockGetAllUsers).toHaveBeenCalledTimes(1);
+  });
+
+  it('a rebuild that was already reading users when a HubSpot account is connected does NOT publish its stale view', async () => {
+    let release!: (u: any[]) => void;
+    mockGetAllUsers.mockImplementationOnce(() => new Promise(res => { release = res; }));
+    const pending = getUserIdByHubSpotPortalId(444);
+    await new Promise(r => setImmediate(r));
+    mockGetUserById.mockResolvedValue({ userId: 'u9', connected_accounts: [] });
+    await createAccount('u9', 'hubspot' as any, { account_id: '444', account_name: 'P444', config: { hub_id: 444 } } as any);
+    release([user('u1', hs(111))]);                      // the pre-connection view (no 444)
+    expect(await pending).toBeNull();                    // that caller got the stale answer...
+    mockUsers = [user('u1', hs(111)), user('u9', hs(444))];
+    expect(await getUserIdByHubSpotPortalId(444)).toBe('u9'); // ...but it was not cached for 5 minutes
   });
 
   it('when two users hold the same portal the FIRST one wins, as the per-event scan did', async () => {
