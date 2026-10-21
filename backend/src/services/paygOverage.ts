@@ -97,7 +97,7 @@ export interface PaygOverageSettings {
   poolHighWaterClosed?: { month: string; thresholdMicroUsd: number };
   optInClosed?: { month: string; overageBaselineMicroUsd: number; poolAtOptInMicroUsd?: number };
   /**
-   * The months (newest first, at most two) in which a gate admitted at least one turn on PAYG
+   * The months (newest first, at most `PAYG_ADMITTED_MONTHS_KEPT`) in which a gate admitted at least one turn on PAYG
    * (`reason: 'payg_overage'`), each with what was in force while it did. Settlement bills a month only
    * when it is listed — spend past the pool in a month PAYG never admitted anything is the ordinary
    * in-flight overrun every plan has, not overage the owner agreed to pay for — and bills it against
@@ -156,8 +156,11 @@ export interface PaygAdmittedMonth {
   markupBps: number | null;
 }
 
-/** Keep the most recent months of `admittedMonths`: the current month and the one settlement closes. */
-export const PAYG_ADMITTED_MONTHS_KEPT = 2;
+/**
+ * Months of `admittedMonths` kept: the current month plus the 12 before it, so every month settlement
+ * can still act on (its 12-month window, including a held month set to `retry`) keeps its terms.
+ */
+export const PAYG_ADMITTED_MONTHS_KEPT = 13;
 
 /** The stored record for `month`, or undefined. Tolerates a malformed list (it bills nothing). */
 export function paygAdmittedMonth(

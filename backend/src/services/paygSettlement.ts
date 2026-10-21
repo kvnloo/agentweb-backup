@@ -9,7 +9,8 @@
  *     projection read (the caller cross-checks the two and holds the month if they drift);
  *   - credits, the pool high-water mark and the opt-in baseline are the month's own, read from the live
  *     fields or the copies kept when the month rolled over (`llmUsageCreditsClosed`,
- *     `poolHighWaterClosed`, `optInClosed`);
+ *     `poolHighWaterClosed`, `optInClosed`) while it is the month that just closed, and frozen on the
+ *     settlement record (`inputs`) for any later re-measurement (`retry`);
  *   - the plan pool, the cap and the markup are the month's `admittedMonths` record, written by the gate
  *     at admission — never the tier or the cap setting as they stand at settlement.
  *
@@ -20,25 +21,27 @@ import {
   applyLlmUsageCredits,
   getCurrentUsageMonth,
   getLlmUsageCreditAdjustment,
-  type MonthlyLlmUsageCredits,
+  getLlmUsageCreditLedgerForMonth,
+  type LlmUsageCreditAdjustment,
 } from './llmUsageCreditService';
+import type { User } from './db';
 import {
-  paygAdmittedMonth,
   paygMonthState,
   paygNetOverageMicroUsd,
   paygOverageThresholdMicroUsd,
   type PaygAdmittedMonth,
-  type PaygOverageSettings,
 } from './paygOverage';
 
 /**
  * `pending` — recorded BEFORE any Stripe call, with the amount fixed; Stripe is (still) being asked.
  * `invoiced` — the invoice is finalized and Stripe is collecting it. `paid` / `failed` — from webhooks.
  * `held` — not billed, on purpose: the inputs did not reconcile (or could not be read); on-call was told
- * once. `nothing_to_bill` — no overage (or less than Stripe can charge). Only `pending` is ever resumed;
- * `held` stays held until someone removes the record after looking at it.
+ * once. `nothing_to_bill` — no overage (or less than Stripe can charge). `retry` — set BY HAND on a held
+ * month once its cause is fixed: the next daily run measures the month again from the inputs frozen on
+ * the record (`inputs`) and fresh spend, and searches Stripe before creating anything. Only `pending`
+ * and `retry` are ever acted on by the sweep; everything else is final.
  */
-export type PaygSettlementStatus = 'pending' | 'invoiced' | 'paid' | 'failed' | 'held' | 'nothing_to_bill';
+export type PaygSettlementStatus = 'pending' | 'invoiced' | 'paid' | 'failed' | 'held' | 'nothing_to_bill' | 'retry';
 
 export type PaygSettlementHeldReason =
   /** Settled spend events and the persisted projection disagree beyond the §3 tolerance. */
@@ -51,6 +54,11 @@ export type PaygSettlementHeldReason =
   | 'no_price'
   /** No live Stripe customer to invoice. */
   | 'no_stripe_customer'
+  /**
+   * The month's credits, pool mark and opt-in are no longer on the row (each is kept one month past its
+   * own) and no earlier settlement froze them: the month cannot be measured safely, so it is not billed.
+   */
+  | 'inputs_unavailable'
   /**
    * The invoice is not the one the record expects: its total is not the recorded amount (a customer
    * discount or coupon — a credit balance lowers what is due, not the total), or the invoice the record
@@ -78,6 +86,13 @@ export interface PaygSettlement {
   projectedMicroUsd: number | null;
   createdAt: string;
   updatedAt: string;
+  /**
+   * The month's own inputs, frozen when the month was first measured — the row only keeps them one month
+   * past their own, so a `retry` months later measures against these, not against what the row holds now.
+   */
+  inputs?: PaygMonthInputs;
+  /** When a `retry` re-measured this month (the record was re-created in place). */
+  retriedAt?: string;
   heldReason?: PaygSettlementHeldReason;
   nothingToBillReason?: 'no_overage' | 'below_minimum';
   invoiceId?: string;
@@ -122,6 +137,32 @@ export function paygSettlementMonthsToPrune(settlements: PaygSettlements | null 
   return Object.keys(settlements ?? {}).filter((m) => m < oldestKept);
 }
 
+/** What a month is measured against besides spend and its admission record: its credits, pool mark, opt-in. */
+export interface PaygMonthInputs {
+  credits: LlmUsageCreditAdjustment;
+  poolHighWater?: { month: string; thresholdMicroUsd: number };
+  optIn?: { month: string; overageBaselineMicroUsd: number; poolAtOptInMicroUsd?: number };
+}
+
+/**
+ * `month`'s inputs from the row (live fields or the closed-month copies), or null when the row no longer
+ * holds them. They are reliable only while `month` is the month that just closed (`closingMonth`): each
+ * closed copy is kept one month, and an absent ledger then means "no credits", not "already dropped".
+ */
+export function paygMonthInputsFromRow(
+  user: Pick<User, 'llmUsageCredits' | 'llmUsageCreditsClosed' | 'paygOverage'>,
+  month: string,
+  closingMonth: string,
+): PaygMonthInputs | null {
+  if (month !== closingMonth) return null;
+  const { poolHighWater, optIn } = paygMonthState(user.paygOverage, month);
+  return {
+    credits: getLlmUsageCreditAdjustment(getLlmUsageCreditLedgerForMonth(user, month), month),
+    ...(poolHighWater ? { poolHighWater } : {}),
+    ...(optIn ? { optIn } : {}),
+  };
+}
+
 export interface PaygSettlementAmount {
   /** Overage since opting in, above the month's pool (before the cap). */
   netOverageMicroUsd: number;
@@ -143,19 +184,19 @@ export function paygAdmittedMarkupBps(admitted: PaygAdmittedMonth): number | nul
 }
 
 /**
- * The amount owed for `month`, or null when it cannot be measured (no admission record or an unusable
- * one, no price, unreadable stored PAYG state) — the caller holds the month rather than guess.
+ * The amount owed for `month`, or null when it cannot be measured (an unusable admission record or no
+ * price, unreadable stored PAYG state) — the caller holds the month rather than guess.
  */
 export function computePaygSettlementAmount(input: {
   month: string;
-  account: PaygOverageSettings;
-  /** That month's credit ledger (live or closed). */
-  creditLedger: MonthlyLlmUsageCredits | null | undefined;
+  /** The month's admission record: its plan pool, cap and markup. */
+  admitted: PaygAdmittedMonth;
+  /** The month's credits, pool mark and opt-in (`paygMonthInputsFromRow`, or frozen on the record). */
+  inputs: PaygMonthInputs;
   /** Authoritative settled spend for the month, micro-USD. */
   settledMicroUsd: number;
 }): PaygSettlementAmount | null {
-  const admitted = paygAdmittedMonth(input.account, input.month);
-  if (!admitted) return null;
+  const { admitted, inputs } = input;
   const markupBps = paygAdmittedMarkupBps(admitted);
   const { tierPoolHighWaterMicroUsd: tierPool, capHighWaterMicroUsd: capMicroUsd } = admitted;
   if (markupBps === null) return null;
@@ -166,17 +207,16 @@ export function computePaygSettlementAmount(input: {
   const adjusted = applyLlmUsageCredits({
     rawCostUsedMicroUsd: input.settledMicroUsd,
     hardThresholdMicroUsd: tierPool,
-    adjustment: getLlmUsageCreditAdjustment(input.creditLedger, input.month),
+    adjustment: inputs.credits,
   });
-  const { poolHighWater, optIn } = paygMonthState(input.account, input.month);
   const poolMicroUsd = paygOverageThresholdMicroUsd({
     effectiveHardThresholdMicroUsd: adjusted.effectiveHardThresholdMicroUsd,
-    poolHighWater,
+    poolHighWater: inputs.poolHighWater,
     month: input.month,
   });
   const netOverageMicroUsd = paygNetOverageMicroUsd({
-    optIn,
-    poolHighWater,
+    optIn: inputs.optIn,
+    poolHighWater: inputs.poolHighWater,
     costUsedMicroUsd: adjusted.policyCostUsedMicroUsd,
     overageThresholdMicroUsd: poolMicroUsd,
     month: input.month,
