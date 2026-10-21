@@ -217,6 +217,9 @@ describe('openRouterCallCostUsd', () => {
     expect(openRouterCallCostUsd({ usage: { cost: 0, cost_details: { upstream_inference_cost: 0.02 } } })).toBe(0.02);
     expect(openRouterCallCostUsd({ usage: {} })).toBeUndefined();
     expect(openRouterCallCostUsd({})).toBeUndefined();
+    // BYOK flagged in the usage block alone (no routing metadata) still adds the upstream cost.
+    expect(openRouterCallCostUsd({ usage: { cost: 0.001, is_byok: true, cost_details: { upstream_inference_cost: 0.02 } } })).toBeCloseTo(0.021);
+    expect(openRouterCallCostUsd({ usage: { cost: 0.001, is_byok: true } })).toBeUndefined();
     // BYOK with no upstream cost reported: what the provider billed is unknown, not zero.
     expect(openRouterCallCostUsd({ usage: { cost: 0.001 }, openrouter_metadata: { is_byok: true } })).toBeUndefined();
   });
