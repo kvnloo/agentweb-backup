@@ -27,10 +27,19 @@ nothing billed — rather than billed blind.
 Nothing written after month M ends can change M's bill:
 - The gate writes `paygOverage.admittedMonths` (newest first, 13 months: the current one plus settlement's
   12-month window) on PAYG admissions:
-  `{ month, capHighWaterMicroUsd, tierPoolHighWaterMicroUsd, markupBps }` — the highest cap
-  (`capPercentOfPool` x that moment's pool) and plan pool (tier hard threshold before credits) and the
-  lowest markup any admission that month was measured against. Conditional on the list it read; written
-  only when an admission changes it (first of the month, a higher cap/pool, a lower markup).
+  `{ month, capHighWaterMicroUsd, tierPoolHighWaterMicroUsd, markupBps, spendBasis }` — the highest cap
+  (`capPercentOfPool` x that moment's pool) and plan pool (tier hard threshold before credits), the
+  lowest markup, and the spend basis (`spend_ledger` | `legacy` | `mixed`) any admission that month was
+  measured against. Conditional on the list it read; written only when an admission changes it.
+- **Only a turn gate writes PAYG state.** `checkTokenUsage(userId, TURN_ADMISSION)` — passed only where a
+  turn is about to run (/generate, chat, the socket, MCP, scheduled and auto-continued runs, Compare, shared
+  sessions, verified chat) — may write the pool high-water mark and the admission record. Everything that
+  only reads usage (gate 2 / model resolution, the PAYG settings view, runway, drivers, decline, model lists,
+  `GET /usage`, the admin view) gets the same decision and writes nothing, so reading usage can never make
+  a month billable or raise its cap.
+- A month is billed only if its admissions were measured on the spend ledger throughout
+  (`spendBasis === 'spend_ledger'`); `legacy` or `mixed` is held `legacy_spend_basis`. The cutover
+  setting at settlement time plays no part.
 - Settlement uses that record, never the cap setting or tier as they stand at settlement. **The cap is a
   monthly total** (product decision): raising it during the month applies to the whole month, including
   overrun admitted earlier in it; lowering it after the usage still bills what was admitted; no change
@@ -70,7 +79,9 @@ with no record that is older than the month that just closed is held as `inputs_
 the record, Stripe is ALWAYS searched (`metadata` purchaseType + billingUserId + month, void ones ignored)
 before anything is created. Writes carry keys `payg:{billingUserId}:{M}:{record createdAt}` + `:invoice` /
 `:item` / `:finalize` (covers search-index lag; a record re-created after a cleared hold starts fresh). The
-invoice id is recorded as soon as it is known. The draft is `auto_advance: false` +
+invoice id is recorded as soon as it is known. In the search, an EMPTY draft over an hour old (a run that
+died before recording its id, key since expired) is deleted, never adopted; if more than one live invoice
+remains for the month, nothing is picked — the month is held `multiple_invoices` with their ids. The draft is `auto_advance: false` +
 `pending_invoice_items_behavior: 'exclude'`; **its total is compared with the recorded amount before
 finalizing** — on a mismatch (a customer discount or balance) the draft is deleted and the month held,
 nothing finalized or collected. Finalize sets `auto_advance: true`, so Stripe charges. Customer =
@@ -86,14 +97,21 @@ owner email. **The payment-failure suspension lasts while ANY month is `failed`.
 checked in the same write), so a failure that lost a race with the payment, or names an invoice settlement
 set aside, never suspends. The event that newly fails a month re-stamps `suspended` (`at` and `invoiceId`;
 never over a dispute); a redelivered failure for a month already failed changes nothing. A paid webhook
-lifts the suspension only if its read saw no other failed month AND `suspended` is still exactly the value
-it read — so a month that fails after the read (even one created after it) keeps the suspension. A dispute
+lifts the suspension only if a strongly consistent read taken AFTER its own `paid` write shows no month
+still failed AND `suspended` is still exactly the value that read saw — so of two months paid at once at
+least one webhook sees both paid, and a month that fails after the read (even one created after it) keeps
+the suspension. A dispute
 suspension is never lifted automatically. Every webhook ignores (logs) an invoice the record set aside
 (`uncollectedInvoice`). A `held` record that carries the invoice's id is moved to paid/failed too. Dispute on
 an overage charge -> `suspended = dispute`. Refund -> `refundedCents`, PAYG not resumed. Refund/dispute
 recognition (Basil: PaymentIntent -> `invoicePayments.list` -> invoice metadata) runs only while the switch
-is on and is best-effort: a failed lookup is logged and the charge is handled as before.
-`resyncAllSubscriptionAmounts` skips overage invoices.
+is on. A failed lookup on a **dispute** errors the webhook (500) so Stripe redelivers — a chargeback must
+never be dropped; on a **refund** the refund is recorded as before and on-call is alerted
+(`payg-settlement-lookup`). `resyncAllSubscriptionAmounts` skips overage invoices. The webhook controller
+records overage invoices neither as subscription payments (`payment_succeeded` / `payment_failed`, which
+`accountHealthClassifier` reads as subscription health) nor in the CRM mirror; settlement records them
+under their own payment-history types, `payg_overage_payment_succeeded` / `payg_overage_payment_failed`
+(deduped per invoice) — kept for the billing audit trail, invisible to the classifier.
 
 **Closed-month state (additive, optional attributes).**
 - `llmUsageCreditsClosed`: kept by the write that rolls `llmUsageCredits` into a new month
