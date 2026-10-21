@@ -166,7 +166,7 @@ export const EVAL_REGISTRY: readonly GraderEntry[] = [
     modelFamily: 'claude',
     consumers: ['scripts/runTaskSuccessJudgeTrial.ts (offline, read-only)', 'scripts/runGraderValidation.ts agent-task-success-judge'],
     knownIssues: ['ENG-2591'],
-    notes: 'ENG-2591: replaces reading the plan\'s own step checkmarks (agent-task-success measured kappa 0.20 vs blind labels on the 40 test work-plan cases, 2026-10-20). Offline only; not yet run on the golden set or compared with human labels.',
+    notes: 'ENG-2591: replaces reading the plan\'s own step checkmarks (agent-task-success measured kappa 0.20 vs blind labels on the 40 test work-plan cases, 2026-10-20). Trial 2026-10-21 on the test split: kappa 0.88 vs blind GPT-5.4 labels (n=39), 0.93 where GPT and Claude labels agree (n=34), 0.77 vs Claude labels (n=38); evidence https://linear.app/emmabyaw/issue/ENG-2591/agent-task-success-grader-stop-trusting-step-checkmarks-kappa-020-in#comment-ea8be576. AI labels, not human, so no validation is recorded and it cannot gate: advisory only. Offline only.',
   },
   {
     id: 'agent-tool-correctness',
