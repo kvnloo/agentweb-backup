@@ -83,7 +83,6 @@ export function fillBlankCustomFields(existing: Record<string, any> | undefined,
   const merged: Record<string, any> = { ...(existing || {}) };
   for (const [k, v] of Object.entries(incoming || {})) {
     if (isBlank(merged[k]) && !isBlank(v)) merged[k] = v;
-    else if (!(k in merged)) merged[k] = v;
   }
   return merged;
 }

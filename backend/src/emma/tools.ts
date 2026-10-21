@@ -18,7 +18,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { incrementUserTokenUsage } from '../services/tokenUsageService';
 import { getExecutionsWithAssets } from '../routes/tasks';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
-import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
+import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel, USER_FUNNEL_STATUS_VALUES } from '../utils/userFunnelStatus';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
 import { enqueueAutoHumanEval, claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
 import { type AskUserQuestionOption } from '../services/agentMode/core/askUserQuestion';
@@ -7452,6 +7452,80 @@ mcpToolRegistry.register({
   },
 });
 
+mcpToolRegistry.register({
+  name: 'manage_user_funnel_status',
+  definition: {
+    name: 'manage_user_funnel_status',
+    description:
+      'Admin-only: resolve AgentWeb users by email and read, preview, or apply their funnelStatus ' +
+      '(same write as PUT /api/admin/users/:userId/funnel-status). Values are limited to the approved ' +
+      'stage vocabulary or null. Max 50 rows per call; preview first, apply is idempotent and audited ' +
+      '(actor, accountable owner, before, after, timestamp). Returns updated/skipped/unresolved rows.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mode: { type: 'string', enum: ['read', 'preview', 'apply'], description: 'read current values, preview a change, or apply it.' },
+        rows: {
+          type: 'array',
+          maxItems: 50,
+          items: {
+            type: 'object',
+            properties: {
+              email: { type: 'string' },
+              funnel_status: { type: ['string', 'null'], enum: [...USER_FUNNEL_STATUS_VALUES, null], description: 'Target stage, or null to clear. Required for preview/apply.' },
+            },
+            required: ['email'],
+          },
+        },
+        accountable_owner: { type: 'string', description: 'Human accountable for an apply (defaults to the acting admin).' },
+      },
+      required: ['mode', 'rows'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+    if (context?.externalMcp === true) throw new Error('Admin access required to manage user funnel status');
+    const user = await userDb.getUserById(userId);
+    const delegatedAdmin = context?.isDelegatedAdmin === true;
+    if (user?.isAdmin !== true && !delegatedAdmin) {
+      throw new Error('Admin access required to manage user funnel status');
+    }
+    let actorEmail: string | undefined = delegatedAdmin ? context?.adminEmail : user?.email;
+    // Audit the delegating administrator, not the impersonated target user.
+    let actorUserId: string | undefined = delegatedAdmin ? undefined : userId;
+    if (delegatedAdmin && context?.sessionId) {
+      const session = await chatbotDb.getChatSession(context.sessionId);
+      if (session?.delegateInfo?.isDelegated) {
+        actorEmail ??= session.delegateInfo.adminEmail;
+        actorUserId = session.delegateInfo.adminUserId;
+      }
+    }
+    // The socket sidebar marks real admins isDelegatedAdmin without an adminEmail;
+    // a genuine admin row is its own actor.
+    if (user?.isAdmin === true) {
+      if (!actorEmail) actorEmail = user.email;
+      if (!actorUserId) actorUserId = userId;
+    }
+    if (!actorEmail || !actorUserId) throw new Error('Administrator identity unavailable');
+    const mode = args?.mode;
+    if (mode !== 'read' && mode !== 'preview' && mode !== 'apply') {
+      throw new Error('mode must be read, preview, or apply');
+    }
+    const { runFunnelStatusOperation } = await import('../services/adminFunnelStatusService');
+    const { recordAdminAudit } = await import('../services/adminAuditLog');
+    const owner = typeof args?.accountable_owner === 'string' && args.accountable_owner.trim() ? args.accountable_owner.trim() : actorEmail;
+    return runFunnelStatusOperation(mode, args?.rows, { actorUserId, actorEmail, accountableOwner: owner }, {
+      getUserByEmail: async (email) => {
+        const u: any = await userDb.getUserByEmail(email);
+        return u ? { userId: u.userId, email: u.email, funnelStatus: u.funnelStatus } : undefined;
+      },
+      updateFunnelStatus: (targetUserId, funnelStatus) => userDb.updateUser(targetUserId, { funnelStatus }),
+      audit: (event) => recordAdminAudit(event),
+    });
+  },
+});
+
 const bridgedToolNames = [
   // Scheduled Chat tools
   'list_scheduled_chats',
@@ -7493,6 +7567,7 @@ const bridgedToolNames = [
 const adminToolNames = [
   'manage_linear_governance_label',
   'read_linear_issues',
+  'manage_user_funnel_status',
   'list_predefined_work_plans',
   'manage_predefined_work_plan',
   'list_skills',

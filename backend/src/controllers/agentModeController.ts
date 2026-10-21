@@ -20,7 +20,7 @@ import { User } from '../types/auth';
 import multer from 'multer';
 import crypto from 'crypto';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
-import { emailService } from '../services/emailService';
+import { emailService, type ScheduledRunFailureNotice } from '../services/emailService';
 import {
   buildRecipientRemediation,
   checkScheduleActivationRecipients,
@@ -70,6 +70,7 @@ import { countCallsSatisfyingRequirement, RequiredCallLedgerEntry } from '../uti
 import { canonicalizeVisibility, resolveVisibilityUpdate } from '../utils/scheduleTemplateVisibility';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
+import { isNewScheduleModelBlock, isScheduleModelBlockedRun, isUnattendedPause, scheduleModelBlockFields, STEP_MODEL_NOTICE_SENT_FLAG, wasStepModelNoticeSent } from '../utils/unattendedModelNotices';
 import { shouldRunPreCheckGate, shouldForceProceedAfterSkipStreak, countTrailingGateSkips, countTrailingNoActionableOutputRuns, resolvePreCheckDecision, ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { ACCOUNT_DISCONNECTED_STATUS, MAX_CONSECUTIVE_ACCOUNT_SKIPS, AccountGateResult, buildAccountSkipReason, countTrailingAccountSkips, evaluateAccountGate } from '../utils/scheduledRunAccountGate';
 import { CapacityGateResult, SEND_CAPACITY_EXHAUSTED_STATUS, buildCapacitySkipReason, evaluateCapacityGate } from '../utils/scheduledRunCapacityGate';
@@ -101,7 +102,7 @@ import {
   resolvePlanStepModelsForLaunch,
   stepModelOf,
 } from '../services/agentMode/workPlanStepModels';
-import { ModelUnavailableError, MODEL_SAVE_FAILED_MESSAGE, buildAnonymousModelUnavailableBody, buildModelUnavailableBody, describeModelUnavailableReason, isModelUnavailableError, sanitizeModelLabel, type ModelUnavailableAudience } from '../services/agentMode/modelUnavailable';
+import { ModelUnavailableError, MODEL_SAVE_FAILED_MESSAGE, buildAnonymousModelUnavailableBody, buildModelUnavailableBody, describeModelUnavailableReason, isModelUnavailableError, sanitizeModelLabel, type ModelUnavailableAudience, type ModelUnavailableReason } from '../services/agentMode/modelUnavailable';
 import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
 // ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
 // on existing report/run envelopes. No surface parses or re-ranks on its own.
@@ -898,6 +899,9 @@ export interface ScheduleRunHealth {
   // `status: 'success'`, so the owner's card is green while sourcing is down.
   // Null when the last run was unblocked.
   lastRunBlockedBy: string | null;
+  // ENG-669 PR-D: the finer reason, when the block has one (`model_unavailable`: 'not_in_plan' | 'not_served' |
+  // 'not_selectable'), so the card can say "not in your plan" rather than just "unavailable". Absent otherwise.
+  lastRunBlockedReason?: string;
 }
 
 // ENG-1131: defined in ./utils/scheduleRunBlockedReason (not here) so
@@ -1030,7 +1034,9 @@ export function didSourcingBlockStateChange(
   currentBlockedBy: string | null,
   options: { now?: string | number | Date; cooldownMs?: number } = {},
 ): boolean {
-  const results = Array.isArray(priorRunResults) ? priorRunResults : [];
+  // ENG-669 PR-D: a run refused for its model never reached sourcing, so its `blockedBy` says nothing about LinkedIn
+  // search: it is left out rather than read as "sourcing blocked" (or, ignored, as "sourcing recovered").
+  const results = (Array.isArray(priorRunResults) ? priorRunResults : []).filter((run) => !isScheduleModelBlockedRun(run));
   if (results.length === 0) {
     return Boolean(currentBlockedBy);
   }
@@ -1217,6 +1223,7 @@ function computeRecordedRunHealth(runResults: any[] | undefined | null): Schedul
     lastRunAt: last.createdAt ?? null,
     consecutiveFailures,
     lastRunBlockedBy: last.blockedBy ?? null,
+    ...(last.blockedReason ? { lastRunBlockedReason: last.blockedReason } : {}),
   };
 }
 
@@ -2104,7 +2111,7 @@ type WorkPlanStepModelTurn =
     }
   | { kind: 'restored'; decision: ResolvedStepDecision; source: ModelSource }
   | { kind: 'restoreFailed' }
-  | { kind: 'unavailable'; stepCount: number; model: string; label: string; reason: string };
+  | { kind: 'unavailable'; stepCount: number; model: string; label: string; reason: ModelUnavailableReason };
 
 async function resolveWorkPlanStepModelForTurn(
   session: SystemModelSession & { userId: string; llmModel?: string; workPlan?: any },
@@ -2205,17 +2212,60 @@ async function resolveWorkPlanStepModelForTurn(
 }
 
 /**
+ * ENG-669 PR-D: email the owner of an unattended session whose work plan paused on a step's model. A session that is a
+ * run of the owner's schedule follows that schedule's recipients (its notification list, else the owner, nobody when
+ * the owner opted out: resolveScheduleAlertRecipients) and names the schedule; any other session emails the owner.
+ * Best-effort: a notification failure never breaks the turn.
+ */
+async function notifyOwnerOfStepModelPause(
+  sessionId: string,
+  session: { userId?: string; pageIdentifier?: string; title?: string } | null | undefined,
+  userId: string,
+  turn: Extract<WorkPlanStepModelTurn, { kind: 'unavailable' }>,
+): Promise<void> {
+  try {
+    const ownerId = session?.userId || userId;
+    const loadOwnerEmail = async () => (await userDb.getUserById(ownerId))?.email;
+    const scheduleId = extractScheduleId(session?.pageIdentifier);
+    const schedule: any = scheduleId ? await scheduleDb.getScheduleById(scheduleId) : null;
+    const ownSchedule = schedule && schedule.userId === ownerId ? schedule : null;
+    const recipients = ownSchedule
+      ? await resolveScheduleAlertRecipients(ownSchedule, loadOwnerEmail)
+      : [await loadOwnerEmail()].filter((email): email is string => typeof email === 'string' && !!email.trim());
+    if (recipients.length === 0) {
+      console.warn(`No notification recipients for session ${sessionId}; step-model pause notice skipped.`);
+      return;
+    }
+    await emailService.sendWorkPlanStepModelUnavailableEmail(recipients, {
+      sessionId,
+      stepCount: turn.stepCount,
+      modelLabel: turn.label,
+      reason: turn.reason,
+      scheduleName: ownSchedule?.scheduleName,
+      sessionTitle: session?.title,
+    });
+  } catch (notifyError) {
+    console.error(`Failed to send the step-model pause notice for session ${sessionId}:`, notifyError);
+  }
+}
+
+/**
  * ENG-2378: pause a work plan whose current step's model is no longer available. Leaves a visible assistant message
  * ("Step N uses <model>, which is no longer available. Choose another model in the model picker and send again") and sends an
  * oncall alert; the plan itself is untouched (nothing completes, nothing runs on another model). Idempotent per
  * step+model: when the transcript already ends with this exact pause, no second message or alert is produced, so a
  * continuation chain that re-checks cannot spam the chat.
+ *
+ * ENG-669 PR-D: in an `unattended` session (see isUnattendedPause) nobody reads that message, so the owner is also
+ * emailed, once per session and step. The pause message that carried the email is stamped, and an earlier stamp for
+ * the step anywhere in the transcript suppresses another. Behind the tier-allowlist switch; interactive sessions and
+ * switch off: the message and alert only, as before.
  */
 async function pauseWorkPlanForUnavailableStepModel(
   sessionId: string,
   userId: string,
   turn: Extract<WorkPlanStepModelTurn, { kind: 'unavailable' }>,
-  options: { emitToUser: boolean },
+  options: { emitToUser: boolean; unattended?: boolean },
 ): Promise<{ content: string; message?: any }> {
   const content = buildStepModelPausedMessage(turn.stepCount, turn.label, turn.reason);
   const session = await chatbotDb.getChatSession(sessionId);
@@ -2229,12 +2279,18 @@ async function pauseWorkPlanForUnavailableStepModel(
   ) {
     return { content: last.content };
   }
+  const notifyOwner = options.unattended === true
+    && !wasStepModelNoticeSent(session?.messages, turn.stepCount)
+    && await modelAccess.isEnabled();
   const timestamp = new Date().toISOString();
   const message = {
     role: 'assistant' as const,
     content,
     timestamp,
-    metadata: { timestamp, kind: 'work-plan-step-model-unavailable', stepCount: turn.stepCount, model: turn.model },
+    metadata: {
+      timestamp, kind: 'work-plan-step-model-unavailable', stepCount: turn.stepCount, model: turn.model,
+      ...(notifyOwner && { [STEP_MODEL_NOTICE_SENT_FLAG]: true }),
+    },
   };
   await chatbotDb.addMessageToSession(sessionId, message);
   console.warn(`AgentMode: work plan for session ${sessionId} paused — step ${turn.stepCount} model "${sanitizeModelLabel(turn.model)}" is ${turn.reason}.`);
@@ -2246,6 +2302,7 @@ async function pauseWorkPlanForUnavailableStepModel(
       console.error(`AgentMode: failed to emit the step-model pause message for session ${sessionId}:`, emitErr);
     }
   }
+  if (notifyOwner) await notifyOwnerOfStepModelPause(sessionId, session, userId, turn);
   // ENG-669: a step model outside the owner's plan is the plan limit working as configured, not a fault: no page.
   if (turn.reason === 'not_in_plan') return { content, message };
   await sendAgentModeOncallAlert({
@@ -2399,7 +2456,10 @@ async function scheduleAutoWorkPlanContinuation(
         llmModelSource: currentSession.llmModelSource, llmUsagePolicyDecision: currentSession.llmUsagePolicyDecision,
       });
       if (stepTurn.kind === 'unavailable') {
-        await pauseWorkPlanForUnavailableStepModel(sessionId, userId, stepTurn, { emitToUser: true });
+        // No per-turn attendance signal on this chain: the session's kind decides (isUnattendedPause).
+        await pauseWorkPlanForUnavailableStepModel(sessionId, userId, stepTurn, {
+          emitToUser: true, unattended: isUnattendedPause(currentSession),
+        });
         autoContinuationSessions.delete(sessionId);
         releaseSessionGeneration(sessionId);
         return;
@@ -6038,7 +6098,7 @@ async function resolveScheduleAlertRecipients(
 async function notifyScheduleOwnerOfFailure(
   schedule: any,
   userId: string,
-  detail: { failedAttempts: number; failureClass: any }
+  detail: ScheduledRunFailureNotice
 ): Promise<void> {
   try {
     const recipients = await resolveScheduleAlertRecipients(
@@ -7044,6 +7104,9 @@ export async function runScheduledChat(
       }).catch((alertError) => {
         console.error('AgentMode: Failed to send unsupported schedule-model alert:', alertError);
       });
+      // ENG-669 PR-D: behind the tier-allowlist switch (the refusals it makes common are what this exists for); off =>
+      // the run result and the notifications are exactly as before.
+      const modelBlock = await modelAccess.isEnabled() ? scheduleModelBlockFields(modelError) : undefined;
       const modelUnavailableResult = {
         scheduleId: schedule.scheduleId,
         runId: preGeneratedRunId || require('uuid').v4(),
@@ -7061,7 +7124,32 @@ export async function runScheduledChat(
         sessionId: '',
         attempt: 0,
         createdAt: new Date().toISOString(),
+        // ENG-669 PR-D: say WHY on the run, so runHealth.lastRunBlockedBy puts it on the schedule's card.
+        ...modelBlock,
       };
+      // ENG-669 PR-D: the owner is the one who can fix this (choose another model, or upgrade), and nobody else is told
+      // (a plan-limit refusal pages no one). Emailed once per change into the blocked state, not on every run. The
+      // history is re-read first, as for the sourcing-block transition, so a run racing this one (a Test click over
+      // the cron fire) is more likely to see the same edge. Never for a test run: the owner is watching it.
+      if (modelBlock && !isTest) {
+        let freshSchedule: any = null;
+        try {
+          freshSchedule = await scheduleDb.getScheduleById(schedule.scheduleId);
+        } catch (refetchError) {
+          console.error(`Failed to re-fetch schedule ${schedule.scheduleId} for the model-unavailable notice:`, refetchError);
+        }
+        const current = freshSchedule || schedule;
+        if (isNewScheduleModelBlock(current.runResults, modelBlock)) {
+          const display = typeof agentModeService.getModelDisplayName === 'function'
+            ? agentModeService.getModelDisplayName(modelError.requestedModel)
+            : undefined;
+          await notifyScheduleOwnerOfFailure(current, userId, {
+            failureClass: 'model_unavailable',
+            modelLabel: sanitizeModelLabel(display || modelError.requestedModel),
+            reason: modelBlock.blockedReason,
+          });
+        }
+      }
       try {
         await scheduleDb.addRunResult(schedule.scheduleId, modelUnavailableResult);
       } catch (saveError) {
@@ -9543,7 +9631,9 @@ export async function generateSessionResponse(
     throw stepModelError;
   }
   if (stepModelTurn.kind === 'unavailable') {
-    const paused = await pauseWorkPlanForUnavailableStepModel(sessionId, userId, stepModelTurn, { emitToUser: false });
+    const paused = await pauseWorkPlanForUnavailableStepModel(sessionId, userId, stepModelTurn, {
+      emitToUser: false, unattended: isUnattendedPause(updatedSession, isUnattendedRun),
+    });
     return {
       content: paused.content,
       toolCalls: [],
