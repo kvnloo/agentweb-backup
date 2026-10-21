@@ -2867,7 +2867,7 @@ export class MetaService {
         'object_type', 'link_url', objectStorySpecField, 'asset_feed_spec', 'url_tags'
       ];
       this.log(`Fetching ad creative: ${creativeId}`);
-      const result = await creative.get(fields);
+      const result = await MetaService.withReadDeadline<any>(() => creative.get(fields), 'ad creative');
       return result._data;
     } catch (error) {
       return this.handleError(error, 'getAdCreative');

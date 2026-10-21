@@ -22,6 +22,12 @@ interface LiveCreative {
   asset_feed_spec?: { descriptions?: Array<{ text?: string }> };
 }
 
+const sameText = (a: unknown, b: unknown) => String(a ?? '').trim() === String(b ?? '').trim();
+
+// Same precedence as MetaService.createAdCreative: placement_assets, then video, then carousel.
+const isCarouselCreative = (r: RequestedCreativeFields) =>
+  !r.placement_assets?.length && !r.video_id && !!r.carousel_cards?.length;
+
 /** Names of requested fields the read-back creative does not carry. Empty when all are present. */
 export function findUnappliedCreativeFields(
   requested: RequestedCreativeFields,
@@ -33,20 +39,45 @@ export function findUnappliedCreativeFields(
 
   if (requested.instagram_user_id) {
     const liveIg = spec?.instagram_user_id ?? spec?.instagram_actor_id;
-    if (liveIg !== requested.instagram_user_id) missing.push('instagram_user_id');
+    if (liveIg == null || !sameText(liveIg, requested.instagram_user_id)) missing.push('instagram_user_id');
   }
 
   if (requested.description) {
     // Carousel creatives have no creative-level description slot, so it is never written: always unapplied.
-    const liveDescription = requested.carousel_cards?.length
-      ? false
-      : requested.placement_assets?.length
-        ? live.asset_feed_spec?.descriptions?.some((d) => d?.text === requested.description)
-        : requested.video_id
-          ? spec?.video_data?.link_description === requested.description
-          : spec?.link_data?.description === requested.description;
-    if (!liveDescription) missing.push('description');
+    const stored = requested.placement_assets?.length
+      ? live.asset_feed_spec?.descriptions?.some((d) => sameText(d?.text, requested.description))
+      : requested.video_id
+        ? sameText(spec?.video_data?.link_description, requested.description)
+        : isCarouselCreative(requested)
+          ? false
+          : sameText(spec?.link_data?.description, requested.description);
+    if (!stored) missing.push('description');
   }
 
   return missing;
+}
+
+/** Tool-result message for a created creative whose requested fields Meta did not store. */
+export function buildUnappliedFieldsMessage(
+  creative: { id?: string; name?: string },
+  requested: RequestedCreativeFields,
+  unapplied: string[],
+): string {
+  const label = `Ad creative "${creative.name}" (id ${creative.id})`;
+  const carouselDescription = unapplied.includes('description') && isCarouselCreative(requested);
+  const others = unapplied.filter((f) => !(f === 'description' && carouselDescription));
+  const parts: string[] = [];
+  if (carouselDescription) {
+    parts.push(
+      'Carousel creatives have no creative-level description, so it was not applied; put per-card text in carousel_cards[].description. ' +
+      'Do not recreate the creative just to add it.',
+    );
+  }
+  if (others.length > 0) {
+    parts.push(
+      `Meta did NOT store: ${others.join(', ')}. Do not report this creative as verified; tell the user. ` +
+      'Fix or delete this creative rather than creating another with the same name.',
+    );
+  }
+  return `${label} was created. ${parts.join(' ')}`;
 }
