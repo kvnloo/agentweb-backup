@@ -87,6 +87,8 @@ describe("host config (a CLOSED schema)", () => {
     ["an uppercase sha256", { claude: { ...base().claude, expectedSha256: "A".repeat(64) } }],
     ["a relative binary path", { claude: { ...base().claude, binaryPath: "claude" } }],
     ["a binary path with a colon", { claude: { ...base().claude, binaryPath: "/opt/a:b/claude" } }],
+    ["a bridge url with an IPv6 literal host", { claude: { ...base().claude, bridgeUrl: "http://[::1]:3001/mcp" } }],
+    ["a bridge url with a bracketed public IPv6 host", { claude: { ...base().claude, bridgeUrl: "https://[2607:6bc0::10]/mcp" } }],
     ["a bridge url that is not http(s)", { claude: { ...base().claude, bridgeUrl: "file:///etc/passwd" } }],
     ["a model with a space", { claude: { ...base().claude, models: ["sonnet 4"] } }],
     ["a tool path with $", { tools: { rm: "/usr/bin/$rm" } }],

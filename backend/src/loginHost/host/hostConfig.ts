@@ -63,7 +63,12 @@ const schema = z
         systemPromptFile: absPath,
         turnWrapperPath: absPath.default("/opt/aw-login-host/claude-turn.sh"),
         /** The Emma tool bridge's MCP endpoint as seen from a customer process. */
-        bridgeUrl: z.string().url().refine((u) => /^https?:\/\//.test(u) && !/[$%\s]/.test(u), "http(s) only, no $ % or whitespace"),
+        bridgeUrl: z
+          .string()
+          .url()
+          .refine((u) => /^https?:\/\//.test(u) && !/[$%\s]/.test(u), "http(s) only, no $ % or whitespace")
+          // The egress proxy matches the bridge by plain host and port: an IPv6 literal cannot be expressed there, so it is refused up front.
+          .refine((u) => !new URL(u).hostname.startsWith("["), "IPv6 literal hosts are not supported for the tool bridge (use a name or an IPv4 address)"),
         models: z.array(z.string().regex(/^[A-Za-z0-9._:-]{1,64}$/)).min(1).max(20).optional(),
         basePath: z.string().regex(/^[A-Za-z0-9._/:-]{1,200}$/).optional(),
       })
