@@ -18,7 +18,8 @@ The misses are semantic, so step statuses and the call ledger can't capture them
 - `runValidation.ts`: `loadTraceForGrading` and `taskSuccessJudgeGrader`, so `runGraderValidation.ts agent-task-success-judge` scores it against human labels.
 - `scripts/runTaskSuccessJudgeTrial.ts` is a read-only trial.
   - It calls OpenRouter directly with no spend rows, under a `--max-usd` cap.
-  - Stdout carries case ids and verdicts only.
+  - Stdout carries case ids, verdicts, the running cost and why a case errored; `--out` (judge reasons) is rewritten after every case.
+- The verdict parser scans each `{` forward to its matching `}` and tries at most 200. The first version looped forever on a reply that started with `{` but held no verdict object, which is what a reply cut off at the output limit looks like. The output limit is now 3000 tokens.
 
 **Next.**
 1. Run the trial on dev and test, about $2 for all 80 work-plan cases, and compare against the blind AI labels.
