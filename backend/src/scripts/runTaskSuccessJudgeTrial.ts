@@ -154,8 +154,12 @@ async function main(): Promise<void> {
 }
 
 if (require.main === module) {
-  main().catch((err) => {
-    console.error(err instanceof Error ? err.message : err);
-    exit(1);
-  });
+  // Exit explicitly: the AWS and OpenRouter clients keep sockets open, so the process lingers after done:.
+  main().then(
+    () => exit(0),
+    (err) => {
+      console.error(err instanceof Error ? err.message : err);
+      exit(1);
+    },
+  );
 }

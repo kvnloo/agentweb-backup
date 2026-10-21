@@ -24,7 +24,7 @@ export const TASK_SUCCESS_JUDGE_GRADER_ID = 'agent-task-success-judge';
 export const DEFAULT_TASK_SUCCESS_JUDGE_MODEL = 'anthropic.claude-sonnet-5';
 
 const MAX_TRACE_CHARS = 60_000;
-const MAX_OUTPUT_TOKENS = 3_000;
+const MAX_OUTPUT_TOKENS = 6_000;
 const TIMEOUT_MS = 90_000;
 
 export const TASK_SUCCESS_JUDGE_PROMPT = `You label whether an AI marketing agent's session accomplished what the user asked. The criterion is task_success, with this rubric:
