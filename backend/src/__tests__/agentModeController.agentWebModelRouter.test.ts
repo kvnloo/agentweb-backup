@@ -1092,3 +1092,53 @@ describe('/model-options `agentWebModel`: the portal can tell "not offered to th
     });
   });
 });
+
+/* ============ runVerifiedChat's task-type defaults never replace a stored AgentWeb Model selection ============ */
+import { runVerifiedChat } from '../controllers/agentModeController';
+
+describe('runVerifiedChat with NO model (Slack, revisions, human-eval): a stored AgentWeb Model selection is kept', () => {
+  const REPORT_DEFAULT = 'gemini-3.8-flash';
+  const verified = (functionName: string) => runVerifiedChat({
+    sessionId: SESSION_ID, userId: OWNER, startingMessage: 'Build the report', keywords: [],
+    requiredFunctions: [{ functionName, minCount: 1 }], maxAttempts: 1, attachments: [],
+  } as any);
+  const workerReturns = (toolName: string) => mockWorker.runInWorker.mockResolvedValue({
+    content: 'Done', toolCalls: [{ name: toolName, result: { success: true } }], knowledgeBaseQueries: [], sources: [], responseMessages: [],
+  } as any);
+  const writtenModels = () => mockChatbotDb.updateSessionLlmModel.mock.calls.map((c) => c[1]);
+
+  it.each([
+    ['update_html_file', 'report'],
+    ['generate_image', 'image'],
+  ])('switch on, %s: the selection stays, it is routed on the %s route, the replies are stamped', async (tool, taskType) => {
+    turnOn({ ...TABLE, routes: { scheduled: ROUTED_SCHEDULED, [taskType]: ROUTED_SCHEDULED } });
+    const store = storeSession(baseSession(AW, { llmModelSource: 'user' }));
+    workerReturns(tool);
+    await verified(tool);
+    expect(writtenModels()).not.toContain(REPORT_DEFAULT);
+    expect(store.get()).toMatchObject({ llmModel: AW, llmModelSource: 'user' });
+    expect(workerCall().llmModel).toBe(ROUTED_SCHEDULED);
+    expect(workerCall().modelRouting).toMatchObject({ llmSelected: AW, llmRoutingTableVersion: 't1' });
+    expect(workerCall().modelRouting.llmRoutingReason).toContain(taskType);
+  });
+
+  it('after a rollback (switch off): refused visibly, the selection is kept, nothing runs on another model', async () => {
+    const store = storeSession(baseSession(AW, { llmModelSource: 'user' }));
+    workerReturns('update_html_file');
+    const error = await verified('update_html_file').then(() => null, (e) => e);
+    expect(writtenModels()).not.toContain(REPORT_DEFAULT);
+    expect(store.get()).toMatchObject({ llmModel: AW, llmModelSource: 'user' });
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    expect(error).toMatchObject({ code: 'model_unavailable', requestedModel: AW, reason: 'not_served' });
+  });
+
+  it('non-router parity: a stored concrete model is still replaced by the task-type default, as before', async () => {
+    turnOn();
+    storeSession(baseSession(OTHER, { llmModelSource: 'user' }));
+    workerReturns('update_html_file');
+    await verified('update_html_file');
+    expect(writtenModels()).toEqual([REPORT_DEFAULT]);
+    expect(mockChatbotDb.updateSessionLlmModel.mock.calls[0][3]).toBe('system');
+    expect(workerCall().llmModel).toBe(REPORT_DEFAULT);
+  });
+});

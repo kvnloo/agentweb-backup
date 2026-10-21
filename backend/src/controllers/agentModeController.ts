@@ -4945,6 +4945,10 @@ async function runVerifiedChatInner(
   let sessionModel = sessionForModel?.llmModel;
   const normalizedStartingMessage = startingMessage.toLowerCase();
 
+  // ENG-669 PR-C: the task type the AgentWeb Model routes this run on, when the session's stored selection is the
+  // router and the required functions call for a task-type default (set below). Undefined otherwise.
+  let routerTaskType: AgentWebTaskType | undefined;
+
   // Only apply task-type model overrides when no explicit model was provided.
   // When params.llmModel is set (e.g. from a scheduled chat's configured model),
   // respect the caller's choice instead of overriding based on required functions.
@@ -4958,7 +4962,17 @@ async function runVerifiedChatInner(
     const shouldUseVideoGenerationModel = requiredFunctions.some((reqFunc) => (
       reqFunc.functionName === 'generate_video'
     ));
-    if (shouldUseReportGenerationModel) {
+    if (isAgentWebModelId(sessionModel)) {
+      // ENG-669 PR-C: a stored AgentWeb Model selection is the customer's choice: never overwritten with a task-type
+      // default (that was a silent swap, and with the switch off it lost the selection for good). It runs as the
+      // selection, routed on the task's route (generateSessionResponse routes it, or refuses it visibly when the switch
+      // is off or the router cannot serve it). Every routed target can call tools (the routing table refuses one that
+      // cannot), so the run's required functions stay callable.
+      routerTaskType = shouldUseReportGenerationModel ? 'report'
+        : shouldUseImageGenerationModel ? 'image'
+          : shouldUseVideoGenerationModel ? 'video'
+            : undefined;
+    } else if (shouldUseReportGenerationModel) {
       const reportGenModel = await agentModeService.getReportGenerationDefaultModel();
       if (sessionModel !== reportGenModel) {
         await chatbotDb.updateSessionLlmModel(sessionId, reportGenModel, undefined, 'system');
@@ -5337,6 +5351,7 @@ async function runVerifiedChatInner(
           isUnattendedRun,
           undefined, // explicitModelPick
           params.modelPolicyDecisionForAudit, // ENG-669 PR-C: routing provenance on the replies
+          routerTaskType, // ENG-669 PR-C: the task's route for a stored AgentWeb Model selection
         );
         if (continuationResponse.content) {
           allContent += (allContent ? '\n\n' : '') + continuationResponse.content;
@@ -5476,6 +5491,7 @@ async function runVerifiedChatInner(
         isUnattendedRun,
         undefined, // explicitModelPick
         params.modelPolicyDecisionForAudit, // ENG-669 PR-C: routing provenance on the replies
+        routerTaskType, // ENG-669 PR-C: the task's route for a stored AgentWeb Model selection
       );
 
       if (!hasAssistantOutput(response)) {
@@ -9473,6 +9489,9 @@ export async function generateSessionResponse(
   // `llmModel`, the replies carry the selection and why; otherwise (or omitted) nothing is stamped. Never read back
   // from the session's stored decision, which may describe an earlier turn.
   turnModelDecision?: EffectiveModelPolicyDecision,
+  // ENG-669 PR-C: the task type an `agentweb-model` `llmModel` is routed on this turn. Default: the session's
+  // (taskTypeForSession). runVerifiedChat passes its required functions' task (report / image / video).
+  routerTaskType?: AgentWebTaskType,
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -9539,7 +9558,7 @@ export async function generateSessionResponse(
   let turnRouting: MessageModelRouting | undefined;
   if (isAgentWebModelId(llmModel)) {
     if (!(await agentWebModelRouter.isEnabled())) throw new ModelUnavailableError(AGENTWEB_MODEL_ID, 'not_served');
-    const routed = await routeAgentWebModelSelection({ ownerUserId: session.userId, session });
+    const routed = await routeAgentWebModelSelection({ ownerUserId: session.userId, session, ...(routerTaskType && { taskType: routerTaskType }) });
     llmModel = routed.model;
     turnRouting = { llmSelected: AGENTWEB_MODEL_ID, llmRoutingReason: routed.reason, llmRoutingTableVersion: routed.tableVersion };
   } else {
