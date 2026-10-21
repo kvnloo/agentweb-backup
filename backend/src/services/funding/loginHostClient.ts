@@ -7,7 +7,8 @@
  * path between the backend (Elastic Beanstalk) and the shared worker is not decided yet; the unix-socket
  * transport below is what the test environment uses (socket directory bind-mounted into the backend).
  */
-import { request } from "http";
+import { request as httpRequest, type ClientRequest, type IncomingMessage, type RequestOptions } from "http";
+import { request as httpsRequest } from "https";
 import { z } from "zod";
 import type { ProviderEvent } from "../../loginHost/adapter";
 import type { LoginReady, LoginStartResult } from "../../loginHost/connectionManager";
@@ -79,15 +80,21 @@ function hostErrorFrom(status: number, json: unknown): LoginHostError {
   return new LoginHostError("BAD_RESPONSE", `http_${status}`);
 }
 
-export class UnixSocketTransport implements HostTransport {
-  constructor(private readonly socketPath: string, private readonly opts: UnixSocketOptions = {}) {}
+/** How a transport reaches the host: which request function and the connection part of the options. */
+interface Connector {
+  request: (options: RequestOptions, cb: (res: IncomingMessage) => void) => ClientRequest;
+  base: RequestOptions & Record<string, unknown>;
+}
+
+class NodeTransport implements HostTransport {
+  constructor(private readonly conn: Connector, private readonly opts: UnixSocketOptions = {}) {}
 
   json(route: RouteName, body: unknown): Promise<JsonReply> {
     const maxBytes = this.opts.maxReplyBytes ?? DEFAULT_REPLY_BYTES;
     return new Promise((resolve, reject) => {
       const payload = JSON.stringify(body);
-      const req = request(
-        { socketPath: this.socketPath, agent: false, method: "POST", path: `/v1/${route}`, headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) } },
+      const req = this.conn.request(
+        { ...this.conn.base, method: "POST", path: `/v1/${route}`, headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) } },
         (res) => {
           const chunks: Buffer[] = [];
           let size = 0;
@@ -120,8 +127,8 @@ export class UnixSocketTransport implements HostTransport {
     const maxLine = this.opts.maxReplyBytes ?? DEFAULT_REPLY_BYTES;
     return new Promise((resolve, reject) => {
       const payload = JSON.stringify(body);
-      const req = request(
-        { socketPath: this.socketPath, agent: false, method: "POST", path: `/v1/${route}`, headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) } },
+      const req = this.conn.request(
+        { ...this.conn.base, method: "POST", path: `/v1/${route}`, headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) } },
         (res) => {
           clearTimeout(startTimer);
           if (res.statusCode !== 200) {
@@ -174,6 +181,33 @@ export class UnixSocketTransport implements HostTransport {
       });
       req.end(payload);
     });
+  }
+}
+
+/** The host on the same machine, over its unix socket (the test environment; the socket directory is the access gate). */
+export class UnixSocketTransport extends NodeTransport {
+  constructor(socketPath: string, opts: UnixSocketOptions = {}) {
+    super({ request: httpRequest, base: { socketPath, agent: false } }, opts);
+  }
+}
+
+export interface MutualTlsTarget {
+  /** The worker's address (an IP or a name that appears in the server certificate's SAN). */
+  host: string;
+  port: number;
+  /** This backend's client certificate and key, and the CA that signed the worker's certificate. PEM. */
+  cert: string | Buffer;
+  key: string | Buffer;
+  ca: string | Buffer;
+}
+
+/**
+ * The host on ANOTHER machine, over mutual TLS: TLS 1.3 only, the worker's certificate must chain to `ca` AND name `host`, and the worker
+ * only talks to a client certificate its CA signed with the backend's identity. No keep-alive pool (a restarted host would leave stale sockets).
+ */
+export class MutualTlsTransport extends NodeTransport {
+  constructor(target: MutualTlsTarget, opts: UnixSocketOptions = {}) {
+    super({ request: httpsRequest as Connector["request"], base: { host: target.host, port: target.port, cert: target.cert, key: target.key, ca: target.ca, minVersion: "TLSv1.3", rejectUnauthorized: true, agent: false } }, opts);
   }
 }
 
