@@ -7,6 +7,7 @@ import { type LlmUsageMode, type LlmUsagePolicy,
 } from "./llmUsagePolicyService";
 import { resolveLlmUsagePoolDecision } from './llmUsagePoolDecision';
 import type { PaygBlock } from './paygOverage';
+import { withOwnerOpenInvoice } from './paygSettlement';
 import { randomUUID } from 'crypto';
 import { recordLlmChargeEvent, LLM_CHARGE_EVENTS_TABLE } from './llmChargeAuditDb';
 import { buildUsageBlockCopy, type UsageBlockCopy } from '../utils/usageBlockCopy';
@@ -468,7 +469,10 @@ export async function checkTokenUsage(
           },
         }
       : {}),
-    ...(pool.paygBlock ? { paygBlock: pool.paygBlock } : {}),
+    // ENG-668: the owner of a suspended account is pointed at the unpaid invoice (the 429's usageBlock).
+    ...(pool.paygBlock
+      ? { paygBlock: withOwnerOpenInvoice(pool.paygBlock, userId === billingUserId, (billingUser as User | undefined)?.paygSettlements)! }
+      : {}),
   };
 }
 

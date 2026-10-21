@@ -123,6 +123,21 @@ export interface PaygBlock {
   reason: UsageBlockReason;
   /** Only with `payg_inactive`: which admission prerequisite is missing. */
   paygInactiveReason?: PaygInactiveReason;
+  /**
+   * Only with `payg_suspended`, and only for the billing owner themselves: the Stripe-hosted page of the
+   * unpaid overage invoice, where it can be paid with any card. Never sent to a pooled member.
+   */
+  openInvoiceUrl?: string;
+}
+
+/**
+ * Whether the owner's subscription lets PAYG cover more usage: active or trialing, or `canceling` — a
+ * cancellation scheduled for the period end, during which the plan itself stays fully usable — so PAYG
+ * follows plan access and does not tell a paid-up customer to "reactivate".
+ */
+export function paygSubscriptionCovers(subscriptionStatus: unknown): boolean {
+  return subscriptionStatus === 'canceling'
+    || hasOwnLiveSubscription({ subscription_status: subscriptionStatus as string | null | undefined });
 }
 
 export interface PaygOverageStatus {
@@ -353,7 +368,7 @@ export function measurePaygOverage(input: {
  *   - the tier allows PAYG (`allowed === true`);
  *   - the billing owner opted in (`enabled === true`) and is not suspended;
  *   - a payment method is on file (cached flag, `=== true`);
- *   - the subscription is active or trialing;
+ *   - the subscription is active, trialing, or canceling at the period end (`paygSubscriptionCovers`);
  *   - overage since opting in is still below `capPercentOfPool` of the month's pool.
  */
 export function evaluatePaygAdmission(input: {
@@ -390,7 +405,7 @@ export function evaluatePaygAdmission(input: {
   if (input.hasPaymentMethod !== true) {
     return { ...keep, overage, block: { reason: 'payg_inactive', paygInactiveReason: 'no_payment_method' } };
   }
-  if (!hasOwnLiveSubscription({ subscription_status: input.subscriptionStatus as string | null | undefined })) {
+  if (!paygSubscriptionCovers(input.subscriptionStatus)) {
     return { ...keep, overage, block: { reason: 'payg_inactive', paygInactiveReason: 'subscription_inactive' } };
   }
   if (overage.overageMicroUsd >= overage.capMicroUsd) return { ...keep, overage, block: { reason: 'payg_cap_reached' } };

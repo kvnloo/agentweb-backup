@@ -38,6 +38,11 @@ export interface UsageBlockCopy {
   reason?: UsageBlockReason;
   /** ENG-668: present only with `reason: 'payg_inactive'` — which PAYG prerequisite is missing. */
   paygInactiveReason?: PaygInactiveReason;
+  /**
+   * ENG-668: present only with `reason: 'payg_suspended'`, and only when the caller is the billing owner:
+   * the Stripe-hosted page of the unpaid overage invoice. Paying it (with any card) lifts the hold.
+   */
+  openInvoiceUrl?: string;
 }
 
 /**
@@ -51,6 +56,7 @@ export type PaygInactiveReason = "no_payment_method" | "subscription_inactive";
 export interface UsageBlockPaygInput {
   reason: UsageBlockReason;
   paygInactiveReason?: PaygInactiveReason;
+  openInvoiceUrl?: string;
 }
 
 const HEADLINE = "Your monthly AI usage is paused";
@@ -134,6 +140,9 @@ export function buildUsageBlockCopy(input: {
       reason: input.paygBlock.reason,
       ...(input.paygBlock.reason === "payg_inactive"
         ? { paygInactiveReason: input.paygBlock.paygInactiveReason }
+        : {}),
+      ...(input.paygBlock.reason === "payg_suspended" && input.paygBlock.openInvoiceUrl
+        ? { openInvoiceUrl: input.paygBlock.openInvoiceUrl }
         : {}),
     };
   }

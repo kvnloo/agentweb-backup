@@ -41,7 +41,14 @@ import {
  * the record (`inputs`) and fresh spend, and searches Stripe before creating anything. Only `pending`
  * and `retry` are ever acted on by the sweep; everything else is final.
  */
-export type PaygSettlementStatus = 'pending' | 'invoiced' | 'paid' | 'failed' | 'held' | 'nothing_to_bill' | 'retry';
+export type PaygSettlementStatus =
+  | 'pending' | 'invoiced' | 'paid' | 'failed' | 'held' | 'nothing_to_bill' | 'retry' | 'written_off';
+
+/**
+ * Why a month is `written_off` — final, nothing more is collected for it: its invoice was voided in
+ * Stripe (support forgave it), or a dispute on its charge was lost (the money went back).
+ */
+export type PaygWrittenOffReason = 'invoice_voided' | 'dispute_lost';
 
 export type PaygSettlementHeldReason =
   /** Settled spend events and the persisted projection disagree beyond the §3 tolerance. */
@@ -111,7 +118,17 @@ export interface PaygSettlement {
   failedAt?: string;
   /** Cumulative cents refunded on the overage charge (recorded only; a refund never resumes PAYG). */
   refundedCents?: number;
-  dispute?: { disputeId: string; at: string };
+  /** The Stripe-hosted invoice page, kept so the owner can be pointed at an unpaid invoice. */
+  hostedInvoiceUrl?: string;
+  /** When the owner was sent the invoice email — once per month, whichever of the run or `paid` got there first. */
+  emailedAt?: string;
+  /** When the owner was asked to complete a payment their bank held for authentication (once). */
+  actionRequiredEmailedAt?: string;
+  /** Stripe gave up collecting automatically; the invoice can still be paid (the month stays `failed`). */
+  uncollectibleAt?: string;
+  writtenOffReason?: PaygWrittenOffReason;
+  writtenOffAt?: string;
+  dispute?: { disputeId: string; at: string; status?: string; closedAt?: string };
   /** On `multiple_invoices`: the live invoices Stripe holds for the month. */
   conflictingInvoiceIds?: string[];
 }
@@ -127,6 +144,49 @@ export const PAYG_SETTLEMENT_MONTHS_KEPT = 12;
  * onto the customer's NEXT invoice — the subscription's. A month under it is not billed at all.
  */
 export const PAYG_MIN_INVOICE_CENTS = 50;
+
+/**
+ * How far settled AW-SpendEvents may differ from the persisted projection the gate read before the month
+ * is held as `spend_drift`: the larger of 50 cents and 1% of the month's settled spend.
+ *
+ * Why not exact: the projection is not written in the same transaction as the events. It is kept by a
+ * best-effort atomic ADD per batch of settled events (`applySettledSpendEvents`, whose failures are logged
+ * and swallowed), so a throttled write leaves it a few events' cost behind, and a reservation settled after
+ * its month lands in the events before (or without) its projection update. Those are cents-sized and leave
+ * the bill — which is computed from the events — untouched. A broken ledger (events lost, double counted,
+ * written to the wrong month) moves a month by whole events per call and quickly passes 1%; that is what
+ * this still holds. 50 cents is Stripe's minimum charge: below it nothing is billable anyway.
+ */
+export function paygSpendDriftTolerable(settledMicroUsd: number, projectedMicroUsd: number): boolean {
+  const toleranceMicroUsd = Math.max(500_000, Math.floor(Math.abs(settledMicroUsd) / 100));
+  return Math.abs(settledMicroUsd - projectedMicroUsd) <= toleranceMicroUsd;
+}
+
+/**
+ * The gate's PAYG block with the unpaid invoice's page added — only for a `payg_suspended` block, and only
+ * when the caller IS the billing owner (a pooled member is never shown the owner's invoice).
+ */
+export function withOwnerOpenInvoice<T extends { reason: string; openInvoiceUrl?: string }>(
+  block: T | null | undefined,
+  callerIsBillingOwner: boolean,
+  settlements: PaygSettlements | null | undefined,
+): T | null | undefined {
+  if (!block || block.reason !== 'payg_suspended' || !callerIsBillingOwner) return block;
+  const openInvoiceUrl = paygOpenInvoiceUrl(settlements);
+  return openInvoiceUrl ? { ...block, openInvoiceUrl } : block;
+}
+
+/**
+ * The hosted page of the owner's newest unpaid overage invoice (a month still `failed`), or undefined.
+ * Read from settlement records only — no Stripe call on a settings view or a 429.
+ */
+export function paygOpenInvoiceUrl(settlements: PaygSettlements | null | undefined): string | undefined {
+  const failed = Object.entries(settlements ?? {})
+    .filter(([, record]) => record?.status === 'failed' && typeof record.hostedInvoiceUrl === 'string'
+      && record.hostedInvoiceUrl.startsWith('https://'))
+    .sort(([a], [b]) => (a < b ? 1 : -1));
+  return failed[0]?.[1].hostedInvoiceUrl;
+}
 
 export function paygSettlementIdempotencyKey(billingUserId: string, month: string): string {
   return `payg:${billingUserId}:${month}`;

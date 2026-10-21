@@ -193,6 +193,17 @@ async function readOwnerConsistently(billingUserId: string): Promise<PoolBilling
   }
 }
 
+/** The mark a check measures against without writing: the stored one, or today's when it is higher. */
+function higherPoolHighWater(input: {
+  account: PaygOverageSettings;
+  month: string;
+  thresholdMicroUsd: number;
+}): PaygOverageSettings['poolHighWater'] {
+  const stored = input.account.poolHighWater;
+  if (stored?.month === input.month && stored.thresholdMicroUsd >= input.thresholdMicroUsd) return stored;
+  return { month: input.month, thresholdMicroUsd: input.thresholdMicroUsd };
+}
+
 /**
  * Raise this month's pool high-water mark when today's effective threshold is above it, and return the
  * mark the check should measure against.
@@ -211,17 +222,6 @@ async function readOwnerConsistently(billingUserId: string): Promise<PoolBilling
  * holds would count usage the higher pool still covers as overage. Any other failure is logged and the
  * check continues on the in-memory maximum, which is what the write would have stored.
  */
-/** The mark a check measures against without writing: the stored one, or today's when it is higher. */
-function higherPoolHighWater(input: {
-  account: PaygOverageSettings;
-  month: string;
-  thresholdMicroUsd: number;
-}): PaygOverageSettings['poolHighWater'] {
-  const stored = input.account.poolHighWater;
-  if (stored?.month === input.month && stored.thresholdMicroUsd >= input.thresholdMicroUsd) return stored;
-  return { month: input.month, thresholdMicroUsd: input.thresholdMicroUsd };
-}
-
 async function recordPoolHighWater(input: {
   billingUserId: string;
   account: PaygOverageSettings;

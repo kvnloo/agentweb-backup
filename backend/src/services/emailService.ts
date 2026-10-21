@@ -14,6 +14,7 @@ import { resetDateFromMonth, formatResetDateLong } from '../utils/usageCycle';
 import { buildUsageBlockCopy, paygBlockActionSentence, type UsageBlockPaygInput } from '../utils/usageBlockCopy';
 import {
   paygInvoiceCreatedEmailCopy,
+  paygPaymentActionRequiredEmailCopy,
   paygPaymentFailedEmailCopy,
   type PaygSettlementEmailCopy,
 } from '../utils/paygSettlementCopy';
@@ -2848,6 +2849,15 @@ View Session: ${sessionUrl}`;
     invoiceUrl?: string | null;
   }): Promise<EmailSendOutcome | void> {
     return this.sendPaygSettlementEmail(input.to, paygPaymentFailedEmailCopy(input), input.invoiceUrl, '#dc3545');
+  },
+
+  /** ENG-668 PR-2: the owner's email when their bank holds the overage charge for confirmation (3-D Secure). */
+  async sendPaygOveragePaymentActionRequiredEmail(input: {
+    to: string;
+    month: string;
+    invoiceUrl?: string | null;
+  }): Promise<EmailSendOutcome | void> {
+    return this.sendPaygSettlementEmail(input.to, paygPaymentActionRequiredEmailCopy(input), input.invoiceUrl, '#1976d2');
   },
 
   /** Renders the copy from `utils/paygSettlementCopy.ts`; no wording lives here. */

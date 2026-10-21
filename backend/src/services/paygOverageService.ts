@@ -12,6 +12,7 @@ import { getSubscriptionTypeConfig, getUserSubscriptionType } from './subscripti
 import { getCurrentMonth, resolveBillingUserId } from './tokenUsageService';
 import { getEffectiveLlmUsagePolicy } from './llmUsagePolicyResolverService';
 import { getCurrentUsageMonth, getRevocablePurchasedCreditMicroUsd } from './llmUsageCreditService';
+import { paygOpenInvoiceUrl } from './paygSettlement';
 import {
   createExactTrueSwitch,
   PAYG_OVERAGE_SETTING,
@@ -59,6 +60,12 @@ export interface PaygOverageView {
   suspended: PaygSuspensionReason | null;
   /** The billing owner has a payment method on file. Always false for a caller who is not the owner. */
   hasPaymentMethod: boolean;
+  /**
+   * The Stripe-hosted page of the newest unpaid overage invoice (a month whose charge failed), where it
+   * can be paid with any card — paying it lifts a payment-failure hold. Owner only; null otherwise.
+   * No amount: the page carries it.
+   */
+  openInvoiceUrl: string | null;
 }
 
 interface PaygContext {
@@ -98,6 +105,7 @@ function toView(
     suspended: account?.suspended?.reason ?? null,
     // The owner's billing state is the owner's: a pooled member sees false, never the owner's card status.
     hasPaymentMethod: context.eligible && context.billingUser?.has_payment_method === true,
+    openInvoiceUrl: context.eligible ? paygOpenInvoiceUrl(context.billingUser?.paygSettlements) ?? null : null,
   };
 }
 

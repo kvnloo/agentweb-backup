@@ -36,7 +36,6 @@
 import { userDb, type User } from './db';
 import { listSpendEvents, sumSettledMicroUsd } from './spendEventDb';
 import { getProjection } from './spendProjectionDb';
-import { reconcileProjection } from './spendProjection';
 import { paygSettlementSwitch } from './paygOverageService';
 import { paymentHistoryDb } from './paymentHistoryDb';
 import { stripeService, PAYG_OVERAGE_PURCHASE_TYPE, type PaygOverageInvoiceMetadata } from './stripeService';
@@ -48,6 +47,7 @@ import {
   paygSettlementMonthsToPrune,
   paygAdmittedMarkupBps,
   paygMonthInputsFromRow,
+  paygSpendDriftTolerable,
   previousUsageMonth,
   type PaygMonthInputs,
   type PaygSettlement,
@@ -93,7 +93,8 @@ export type PaygSettlementOutcome =
   | 'raced'
   | 'held'
   | 'nothing_to_bill'
-  | 'invoiced';
+  | 'invoiced'
+  | 'paid';
 
 export interface PaygSettlementRunSummary {
   /** Why nothing ran, when nothing did. */
@@ -103,12 +104,29 @@ export interface PaygSettlementRunSummary {
   outcomes: Partial<Record<PaygSettlementOutcome, number>>;
   failed: number;
   errors: Array<{ billingUserId: string; month: string; error: string }>;
+  /** Months this run moved to `held` — on-call gets ONE alert listing all of them. */
+  held: HeldMonth[];
 }
+
+/** A month a run moved to `held`, for the run's single on-call alert. */
+export interface HeldMonth {
+  billingUserId: string;
+  month: string;
+  record: PaygSettlement;
+}
+
+/**
+ * What a settle does with a month it just moved to `held`: alert on-call at once (a direct call), or hand
+ * it to the sweep, which sends one alert for the whole run (`alertHeldBatch`). Either way a month is
+ * reported exactly once — only the write that moved it to `held` reports it.
+ */
+type HeldReporter = (held: HeldMonth) => Promise<void>;
+const alertEachHeld: HeldReporter = (held) => alertHeldBatch([held]);
 
 /** The daily sweep. Off switch or day 1 of the month => no reads, no writes, no Stripe. */
 export async function runPaygSettlement(now: Date = new Date()): Promise<PaygSettlementRunSummary> {
   const month = previousUsageMonth(now);
-  const summary: PaygSettlementRunSummary = { month, scanned: 0, outcomes: {}, failed: 0, errors: [] };
+  const summary: PaygSettlementRunSummary = { month, scanned: 0, outcomes: {}, failed: 0, errors: [], held: [] };
   if (!(await paygSettlementSwitch.isEnabled())) return { ...summary, skipped: 'switch_off' };
   // Day 1 is the seat-credit sweep's (10:00 UTC) and the month's last spend events still settling.
   if (now.getUTCDate() < 2) return { ...summary, skipped: 'before_day_2' };
@@ -131,13 +149,18 @@ export async function runPaygSettlement(now: Date = new Date()): Promise<PaygSet
     }
     for (const settleMonth of months) {
       try {
-        const outcome = await settlePaygOverageMonth(billingUserId, settleMonth, now);
+        const outcome = await settlePaygOverageMonth(billingUserId, settleMonth, now, async (held) => {
+          summary.held.push(held);
+        });
         summary.outcomes[outcome] = (summary.outcomes[outcome] ?? 0) + 1;
       } catch (error: unknown) {
         recordFailure(summary, billingUserId, settleMonth, error);
       }
     }
   }
+  // One alert per run, however many months it held — turning settlement on after gate-only months
+  // would otherwise page once per owner per month.
+  if (summary.held.length) await alertHeldBatch(summary.held);
   return summary;
 }
 
@@ -179,6 +202,7 @@ export async function settlePaygOverageMonth(
   billingUserId: string,
   month: string,
   now: Date = new Date(),
+  reportHeld: HeldReporter = alertEachHeld,
 ): Promise<PaygSettlementOutcome> {
   const user = (await userDb.getUserByIdConsistent(billingUserId)) as User | undefined;
   const account = user?.paygOverage;
@@ -199,13 +223,13 @@ export async function settlePaygOverageMonth(
       : await recordNewSettlement(user, billingUserId, month, decided, previousUsageMonth(now));
     if (!written) return 'raced';
     if (decided.status === 'held') {
-      await alertHeld(billingUserId, month, decided);
+      await reportHeld({ billingUserId, month, record: decided });
       return 'held';
     }
     if (decided.status === 'nothing_to_bill') return 'nothing_to_bill';
     record = decided;
   }
-  return invoicePendingSettlement(user, billingUserId, month, record);
+  return invoicePendingSettlement(user, billingUserId, month, record, reportHeld);
 }
 
 async function decideSettlement(
@@ -245,7 +269,9 @@ async function decideSettlement(
   const settledMicroUsd = sumSettledMicroUsd(events);
   const projection = await getProjection(billingUserId, month, /* consistentRead */ true);
   const measured = { settledMicroUsd, projectedMicroUsd: projection ? projection.settledMicroUsd : null };
-  const reconciled = projection ? reconcileProjection(events, projection).ok : settledMicroUsd === 0;
+  // A projection that trails the events by the normal write lag is fine; a broken ledger is not
+  // (`paygSpendDriftTolerable`). No projection behind real spend means its writer is missing: held.
+  const reconciled = projection ? paygSpendDriftTolerable(settledMicroUsd, projection.settledMicroUsd) : settledMicroUsd === 0;
   if (!reconciled) return held('spend_drift', measured);
   if (!admitted) return held('unmeasurable', measured);
   if (markupBps === null) return held('no_price', measured);
@@ -357,14 +383,17 @@ async function invoicePendingSettlement(
   billingUserId: string,
   month: string,
   record: PaygSettlement,
+  reportHeld: HeldReporter,
 ): Promise<PaygSettlementOutcome> {
+  const hold = (reason: PaygSettlementHeldReason, extra: Partial<PaygSettlement> = {}, remove: Array<keyof PaygSettlement> = []) =>
+    holdPending(billingUserId, month, record, reason, reportHeld, extra, remove);
   let customerId: string | null = null;
-  let paymentMethodId: string | null = null;
+  let fallbackPaymentMethodId: string | null = null;
   if (!record.invoiceId) {
     // ENG-2571: charge the customer that holds the card, which is not always the row's customer.
     const resolved = await stripeService.resolveUserPaymentMethod(user, billingUserId);
     customerId = resolved.customerId ?? (await stripeService.findLiveCustomerIdForUser(user, billingUserId));
-    paymentMethodId = resolved.paymentMethodId ?? null;
+    fallbackPaymentMethodId = resolved.fallbackPaymentMethodId ?? null;
   }
 
   const copy = paygOverageInvoiceCopy(month);
@@ -379,7 +408,7 @@ async function invoicePendingSettlement(
     // held month was cleared starts fresh instead of replaying a draft that was deleted.
     idempotencyKey: `${record.idempotencyKey}:${record.createdAt}`,
     customerId,
-    paymentMethodId,
+    fallbackPaymentMethodId,
     amountCents: record.amountCents,
     description: copy.description,
     lineDescription: copy.lineDescription,
@@ -390,37 +419,80 @@ async function invoicePendingSettlement(
       await transitionSettlement(billingUserId, month, ['pending'], { status: 'pending', invoiceId });
     },
   });
-  if (issued.outcome === 'no_customer') return holdPending(billingUserId, month, record, 'no_stripe_customer');
-  if (issued.outcome === 'multiple') {
-    return holdPending(billingUserId, month, record, 'multiple_invoices', { conflictingInvoiceIds: issued.invoiceIds }, ['invoiceId']);
-  }
+  if (issued.outcome === 'no_customer') return hold('no_stripe_customer');
+  if (issued.outcome === 'multiple') return hold('multiple_invoices', { conflictingInvoiceIds: issued.invoiceIds }, ['invoiceId']);
   if (issued.outcome === 'mismatch') {
     // A finalized invoice at another total is Stripe's to collect: its id stays on the record. Anything
     // else collected nothing and is no longer this month's invoice (a deleted draft, or a recorded
     // invoice Stripe reports void or missing): it is set aside, never invoiced over automatically.
     return issued.reason === 'total_differs'
-      ? holdPending(billingUserId, month, record, 'invoice_mismatch', { invoiceId: issued.invoiceId })
-      : holdPending(billingUserId, month, record, 'invoice_mismatch', {
-          uncollectedInvoice: { invoiceId: issued.invoiceId, reason: issued.reason },
-        }, ['invoiceId']);
+      ? hold('invoice_mismatch', { invoiceId: issued.invoiceId })
+      : hold('invoice_mismatch', { uncollectedInvoice: { invoiceId: issued.invoiceId, reason: issued.reason } }, ['invoiceId']);
   }
 
   const { invoice } = issued;
+  const at = new Date().toISOString();
+  // An invoice Stripe has already collected (a balance covered it, or a search found one paid earlier)
+  // is recorded as paid, not left `invoiced` waiting for a webhook that came and went.
+  const alreadyPaid = invoice.status === 'paid';
   const marked = await transitionSettlement(billingUserId, month, ['pending'], {
-    status: 'invoiced',
+    status: alreadyPaid ? 'paid' : 'invoiced',
     invoiceId: invoice.id,
-    invoicedAt: new Date().toISOString(),
+    invoicedAt: at,
+    ...(alreadyPaid ? { paidAt: at } : {}),
+    ...(invoice.hosted_invoice_url ? { hostedInvoiceUrl: invoice.hosted_invoice_url } : {}),
   });
-  if (marked && user.email) {
-    const { emailService } = await import('./emailService');
-    await emailService.sendPaygOverageInvoiceEmail({
-      to: user.email,
-      month,
-      percentOfCap: record.percentOfCap,
-      invoiceUrl: invoice.hosted_invoice_url,
+  // The month's invoice email goes out once, whichever got there first — this run, or an `invoice.paid`
+  // webhook that beat its write (that webhook then sends it; see `sendInvoiceEmailOnce`).
+  await sendInvoiceEmailOnce(user, billingUserId, month, invoice.id!, record.percentOfCap, invoice.hosted_invoice_url);
+  if (marked && alreadyPaid) await liftPaymentFailureSuspension(billingUserId);
+  if (!marked) return 'raced';
+  return alreadyPaid ? 'paid' : 'invoiced';
+}
+
+/**
+ * Send the month's invoice email at most once: claimed with a conditional write on `emailedAt` (and the
+ * invoice it is about), so the run and a racing `invoice.paid` webhook cannot both send it, and a
+ * redelivery sends nothing.
+ */
+async function sendInvoiceEmailOnce(
+  user: Pick<User, 'email'>,
+  billingUserId: string,
+  month: string,
+  invoiceId: string,
+  percentOfCap: number,
+  invoiceUrl: string | null | undefined,
+): Promise<void> {
+  if (!user.email) return;
+  if (!(await claimSettlementFlag(billingUserId, month, invoiceId, 'emailedAt'))) return;
+  const { emailService } = await import('./emailService');
+  await emailService.sendPaygOverageInvoiceEmail({ to: user.email, month, percentOfCap, invoiceUrl });
+}
+
+/**
+ * Set a once-only timestamp on the month's record (`emailedAt`, `actionRequiredEmailedAt`) if it is not
+ * set yet and the record names `invoiceId`. True for the one caller that set it.
+ */
+async function claimSettlementFlag(
+  billingUserId: string,
+  month: string,
+  invoiceId: string,
+  flag: 'emailedAt' | 'actionRequiredEmailedAt',
+): Promise<boolean> {
+  try {
+    await userDb.updateUser(billingUserId, {}, {
+      pathSets: [{ path: ['paygSettlements', month, flag], value: new Date().toISOString() }],
+      condition: {
+        expression: '#settlements.#month.#invoiceId = :invoiceId AND attribute_not_exists(#settlements.#month.#flag)',
+        names: { '#settlements': 'paygSettlements', '#month': month, '#invoiceId': 'invoiceId', '#flag': flag },
+        values: { ':invoiceId': invoiceId },
+      },
     });
+    return true;
+  } catch (error: unknown) {
+    if (isConditionalFailure(error)) return false;
+    throw error;
   }
-  return marked ? 'invoiced' : 'raced';
 }
 
 async function holdPending(
@@ -428,6 +500,7 @@ async function holdPending(
   month: string,
   record: PaygSettlement,
   heldReason: PaygSettlementHeldReason,
+  reportHeld: HeldReporter,
   extra: Partial<PaygSettlement> = {},
   remove: Array<keyof PaygSettlement> = [],
 ): Promise<PaygSettlementOutcome> {
@@ -435,7 +508,7 @@ async function holdPending(
   if (!(await transitionSettlement(billingUserId, month, ['pending'], fields, remove))) return 'raced';
   const after = { ...record, ...fields } as PaygSettlement;
   for (const key of remove) delete after[key];
-  await alertHeld(billingUserId, month, after);
+  await reportHeld({ billingUserId, month, record: after });
   return 'held';
 }
 
@@ -451,8 +524,9 @@ function heldRunbook(month: string, record: PaygSettlement): string {
   if (record.invoiceId) {
     return `Stripe invoice ${record.invoiceId} exists for this month. Do NOT remove or retry paygSettlements.${month}. `
       + 'Open the invoice in Stripe: if its amount is right it is being collected and the paid/failed webhook '
-      + 'records the outcome on this record; if it must not be collected, void it in Stripe. Nothing will '
-      + 'invoice this month again while the record exists.';
+      + 'records the outcome on this record. If it must not be collected, void it in Stripe: that writes the month '
+      + 'off (status written_off — never billed again) and, once no other month is unpaid, lifts a payment-failure '
+      + 'hold on pay-as-you-go. Nothing will invoice this month again while the record exists.';
   }
   if (record.conflictingInvoiceIds?.length) {
     return `Stripe holds ${record.conflictingInvoiceIds.length} live invoices for this month (${record.conflictingInvoiceIds.join(', ')}). `
@@ -476,28 +550,41 @@ function heldRunbook(month: string, record: PaygSettlement): string {
   return `No invoice was created and nothing was collected. ${retry}`;
 }
 
-/** One on-call alert per held month: only the write that moved the month to `held` sends it. */
-async function alertHeld(billingUserId: string, month: string, record: PaygSettlement): Promise<void> {
+/**
+ * One on-call alert for a batch of months just moved to `held` (a whole sweep's, or one month's on a
+ * direct call). Each month appears once in its life: only the write that moved it to `held` reports it.
+ */
+async function alertHeldBatch(held: HeldMonth[]): Promise<void> {
+  if (!held.length) return;
+  const lines = held.map(({ billingUserId, month, record }) =>
+    `- ${billingUserId} ${month} (${record.heldReason}): ${heldRunbook(month, record)}`);
+  const first = held[0];
+  const subject = held.length === 1
+    ? `PAYG settlement held for ${first.month}: ${first.record.heldReason}`
+    : `PAYG settlement held ${held.length} months this run`;
   try {
     const { emailService } = await import('./emailService');
     await emailService.sendOncallAlert(
-      `PAYG settlement held for ${month}: ${record.heldReason}`,
-      `Month-end pay-as-you-go settlement held ${billingUserId} for ${month} (${record.heldReason}). `
-        + heldRunbook(month, record),
+      subject,
+      `Month-end pay-as-you-go settlement held ${held.length === 1 ? 'a month' : `${held.length} months`}; nothing was charged for them.\n`
+        + lines.join('\n'),
       {
         'Alert Class': PAYG_SETTLEMENT_ALERT_CLASS,
-        billingUserId,
-        month,
-        heldReason: record.heldReason,
-        settledMicroUsd: record.settledMicroUsd,
-        projectedMicroUsd: record.projectedMicroUsd,
-        invoiceId: record.invoiceId ?? null,
-        uncollectedInvoiceId: record.uncollectedInvoice?.invoiceId ?? null,
-        conflictingInvoiceIds: record.conflictingInvoiceIds ?? null,
+        heldCount: held.length,
+        held: held.map(({ billingUserId, month, record }) => ({
+          billingUserId,
+          month,
+          heldReason: record.heldReason,
+          settledMicroUsd: record.settledMicroUsd,
+          projectedMicroUsd: record.projectedMicroUsd,
+          invoiceId: record.invoiceId ?? null,
+          uncollectedInvoiceId: record.uncollectedInvoice?.invoiceId ?? null,
+          conflictingInvoiceIds: record.conflictingInvoiceIds ?? null,
+        })),
       },
     );
   } catch (error: unknown) {
-    console.error(`${TAG} on-call alert for held ${month} / ${billingUserId} failed:`, errorText(error));
+    console.error(`${TAG} on-call alert for ${held.length} held month(s) failed:`, errorText(error));
   }
 }
 
@@ -557,12 +644,15 @@ function webhookSources(record: PaygSettlement, invoiceId: string, base: PaygSet
 export async function handlePaygOverageInvoicePaid(invoice: OverageInvoiceEvent): Promise<void> {
   const loaded = await loadSettlementFor(invoice, 'invoice paid');
   if (!loaded) return;
-  const { ref, record } = loaded;
+  const { ref, user, record } = loaded;
   await transitionSettlement(ref.billingUserId, ref.month, webhookSources(record, ref.invoiceId, ['pending', 'invoiced', 'failed']), {
     status: 'paid',
     invoiceId: ref.invoiceId,
     paidAt: new Date().toISOString(),
   });
+  // Stripe can collect before the run records the month invoiced (a balance, an instant charge): the
+  // month's one invoice email still goes out, from here if the run has not sent it.
+  await sendInvoiceEmailOnce(user, ref.billingUserId, ref.month, ref.invoiceId, record.percentOfCap, invoice.hosted_invoice_url);
   await recordOverageInvoicePayment(ref, invoice, 'payg_overage_payment_succeeded');
   await liftPaymentFailureSuspension(ref.billingUserId);
   console.log(`${TAG} overage invoice ${ref.invoiceId} paid: ${ref.billingUserId} ${ref.month}`);
@@ -628,6 +718,8 @@ export async function handlePaygOverageInvoicePaymentFailed(invoice: OverageInvo
     status: 'failed',
     invoiceId: ref.invoiceId,
     failedAt: new Date().toISOString(),
+    // Where the owner can pay it with any card (GET /payg and the 429 point here while it is unpaid).
+    ...(invoice.hosted_invoice_url ? { hostedInvoiceUrl: invoice.hosted_invoice_url } : {}),
   });
   await suspendForPaymentFailure(ref.billingUserId, ref.month, ref.invoiceId, moved);
   await recordOverageInvoicePayment(ref, invoice, 'payg_overage_payment_failed');
@@ -653,7 +745,7 @@ export async function handlePaygOverageChargeDisputed(
     pathSets: [{ path: ['paygSettlements', ref.month, 'dispute'], value: { disputeId: String(dispute?.id || ''), at } }],
     condition: { expression: 'attribute_exists(#settlements.#month)', names: { '#settlements': 'paygSettlements', '#month': ref.month } },
   });
-  await paymentHistoryDb.record(
+  const recorded = await paymentHistoryDb.record(
     {
       userId: ref.billingUserId,
       timestamp: at,
@@ -666,7 +758,172 @@ export async function handlePaygOverageChargeDisputed(
     },
     { dedupKey: `dispute:opened:${dispute?.id}` },
   );
+  // A disputed overage suspends a customer until the dispute closes: someone has to know. Once per
+  // dispute (the history row's dedupe is the gate).
+  if (recorded.written) {
+    await alertOnCall(
+      `PAYG suspended: overage charge disputed (${ref.month})`,
+      `Pay-as-you-go is suspended for ${ref.billingUserId}: the overage charge ${charge?.id} for ${ref.month} `
+        + `(invoice ${ref.invoiceId}) is disputed (${dispute?.id}, reason ${dispute?.reason ?? 'unknown'}). Respond to the `
+        + 'dispute in Stripe. If it is won or withdrawn, pay-as-you-go resumes on its own when the dispute closes; if it '
+        + 'is lost, the month is written off and pay-as-you-go stays suspended until someone clears it.',
+      { billingUserId: ref.billingUserId, month: ref.month, invoiceId: ref.invoiceId, disputeId: dispute?.id ?? null },
+    );
+  }
   console.log(`${TAG} overage charge ${charge?.id} disputed (${dispute?.id}): ${ref.billingUserId} ${ref.month}; PAYG suspended`);
+}
+
+/**
+ * `charge.dispute.closed` on an overage charge. Won (or a closed inquiry): the dispute suspension it
+ * caused is lifted — replaced by a payment-failure suspension if another month is still unpaid, so paying
+ * that one lifts it. Lost: the money went back, so the month is written off (`dispute_lost`), PAYG stays
+ * suspended, and on-call is told. Either way the outcome is recorded on the month.
+ */
+export async function handlePaygOverageChargeDisputeClosed(
+  dispute: OverageDisputeEvent & { status?: string },
+  charge: OverageChargeEvent,
+  invoice: OverageInvoiceEvent,
+): Promise<void> {
+  const loaded = await loadSettlementFor(invoice, 'dispute closed');
+  if (!loaded) return;
+  const { ref, record } = loaded;
+  const at = new Date().toISOString();
+  const status = String(dispute?.status || 'closed');
+  await userDb.updateUser(ref.billingUserId, {}, {
+    pathSets: [{
+      path: ['paygSettlements', ref.month, 'dispute'],
+      value: { disputeId: String(dispute?.id || record.dispute?.disputeId || ''), at: record.dispute?.at ?? at, status, closedAt: at },
+    }],
+    condition: { expression: 'attribute_exists(#settlements.#month)', names: { '#settlements': 'paygSettlements', '#month': ref.month } },
+  });
+  if (status === 'won' || status === 'warning_closed') {
+    await liftDisputeSuspension(ref.billingUserId, ref.invoiceId);
+    console.log(`${TAG} dispute ${dispute?.id} on ${ref.invoiceId} closed ${status}: ${ref.billingUserId}; dispute hold lifted`);
+    return;
+  }
+  if (status === 'lost') {
+    const moved = await transitionSettlement(ref.billingUserId, ref.month, ['paid', 'invoiced', 'failed'], {
+      status: 'written_off',
+      writtenOffReason: 'dispute_lost',
+      writtenOffAt: at,
+    });
+    if (moved) {
+      await alertOnCall(
+        `PAYG dispute lost: ${ref.month} written off`,
+        `The dispute ${dispute?.id} on ${ref.billingUserId}'s overage charge for ${ref.month} (invoice ${ref.invoiceId}) was `
+          + 'lost: the money went back to the customer and the month is written off. Pay-as-you-go stays suspended (reason '
+          + 'dispute). Decide with the account owner; to resume it, remove paygOverage.suspended on the AW-Users row.',
+        { billingUserId: ref.billingUserId, month: ref.month, invoiceId: ref.invoiceId, disputeId: dispute?.id ?? null },
+      );
+    }
+  }
+}
+
+/**
+ * Lift the dispute suspension a won dispute leaves behind — only the one this invoice caused, and only
+ * if `suspended` is still exactly what this read saw. If another month is still `failed`, the account
+ * stays suspended for THAT (as a payment failure on its invoice, which paying it lifts).
+ */
+async function liftDisputeSuspension(billingUserId: string, invoiceId: string): Promise<void> {
+  const user = (await userDb.getUserByIdConsistent(billingUserId)) as User | undefined;
+  const suspended = user?.paygOverage?.suspended;
+  if (suspended?.reason !== 'dispute' || suspended.invoiceId !== invoiceId) return;
+  const failed = Object.values(user?.paygSettlements ?? {}).find((record) => record?.status === 'failed' && record.invoiceId);
+  const names = { '#payg': 'paygOverage', '#suspended': 'suspended' };
+  try {
+    await userDb.updateUser(billingUserId, {}, failed
+      ? {
+          pathSets: [{ path: ['paygOverage', 'suspended'], value: { reason: 'payment_failed', at: new Date().toISOString(), invoiceId: failed.invoiceId } }],
+          condition: { expression: '#payg.#suspended = :seen', names, values: { ':seen': suspended } },
+        }
+      : {
+          pathRemoves: [{ path: ['paygOverage', 'suspended'] }],
+          condition: { expression: '#payg.#suspended = :seen', names, values: { ':seen': suspended } },
+        });
+  } catch (error: unknown) {
+    if (!isConditionalFailure(error)) throw error;
+  }
+}
+
+/**
+ * `invoice.voided` for an overage invoice (support forgave it in Stripe): nothing is collected for the
+ * month any more, so it is written off (`invoice_voided`, invoice id kept for audit), a payment-failure
+ * suspension is lifted once no other month is still unpaid (never a dispute), and on-call is told once.
+ */
+export async function handlePaygOverageInvoiceVoided(invoice: OverageInvoiceEvent): Promise<void> {
+  const loaded = await loadSettlementFor(invoice, 'invoice voided');
+  if (!loaded) return;
+  const { ref, record } = loaded;
+  const at = new Date().toISOString();
+  const moved = await transitionSettlement(ref.billingUserId, ref.month, webhookSources(record, ref.invoiceId, ['pending', 'invoiced', 'failed']), {
+    status: 'written_off',
+    writtenOffReason: 'invoice_voided',
+    writtenOffAt: at,
+    invoiceId: ref.invoiceId,
+  });
+  await liftPaymentFailureSuspension(ref.billingUserId);
+  if (moved) {
+    await alertOnCall(
+      `PAYG overage invoice voided: ${ref.month} written off`,
+      `Invoice ${ref.invoiceId} (${ref.billingUserId}, ${ref.month}) was voided in Stripe: the month is written off and `
+        + 'will not be billed again. If it was the only unpaid month, pay-as-you-go resumed. If this was not intended, '
+        + `bill the customer by hand; settlement will not re-invoice it (set paygSettlements.${ref.month}.status to "retry" `
+        + 'only if a new invoice should be issued — it searches Stripe first and ignores void invoices).',
+      { billingUserId: ref.billingUserId, month: ref.month, invoiceId: ref.invoiceId },
+    );
+  }
+  console.log(`${TAG} overage invoice ${ref.invoiceId} voided: ${ref.billingUserId} ${ref.month} written off`);
+}
+
+/**
+ * `invoice.marked_uncollectible`: Stripe stopped collecting automatically, but the invoice can still be
+ * paid (hosted page). The month is (or becomes) `failed` with PAYG suspended, and `uncollectibleAt` is
+ * recorded; a later `invoice.paid` still records it paid and lifts the suspension.
+ */
+export async function handlePaygOverageInvoiceMarkedUncollectible(invoice: OverageInvoiceEvent): Promise<void> {
+  const loaded = await loadSettlementFor(invoice, 'invoice marked uncollectible');
+  if (!loaded) return;
+  const { ref, user, record } = loaded;
+  if (record.status === 'paid' || record.status === 'written_off') return;
+  const at = new Date().toISOString();
+  const moved = await transitionSettlement(ref.billingUserId, ref.month, webhookSources(record, ref.invoiceId, ['pending', 'invoiced']), {
+    status: 'failed',
+    invoiceId: ref.invoiceId,
+    failedAt: at,
+    ...(invoice.hosted_invoice_url ? { hostedInvoiceUrl: invoice.hosted_invoice_url } : {}),
+  });
+  await transitionSettlement(ref.billingUserId, ref.month, ['failed'], { status: 'failed', uncollectibleAt: at });
+  await suspendForPaymentFailure(ref.billingUserId, ref.month, ref.invoiceId, moved);
+  if (moved && user.email) {
+    const { emailService } = await import('./emailService');
+    await emailService.sendPaygOveragePaymentFailedEmail({ to: user.email, month: ref.month, invoiceUrl: invoice.hosted_invoice_url });
+  }
+}
+
+/**
+ * `invoice.payment_action_required`: the bank held the charge for the owner to confirm (3-D Secure, a
+ * mandate). The month stays `invoiced` and nothing is suspended; the owner is emailed once with the
+ * hosted invoice page to confirm it.
+ */
+export async function handlePaygOverageInvoicePaymentActionRequired(invoice: OverageInvoiceEvent): Promise<void> {
+  const loaded = await loadSettlementFor(invoice, 'invoice payment action required');
+  if (!loaded) return;
+  const { ref, user, record } = loaded;
+  if (record.status !== 'pending' && record.status !== 'invoiced') return;
+  if (!user.email) return;
+  if (!(await claimSettlementFlag(ref.billingUserId, ref.month, ref.invoiceId, 'actionRequiredEmailedAt'))) return;
+  const { emailService } = await import('./emailService');
+  await emailService.sendPaygOveragePaymentActionRequiredEmail({ to: user.email, month: ref.month, invoiceUrl: invoice.hosted_invoice_url });
+}
+
+/** An on-call alert outside the held-month batch (disputes, voids). Never fails the webhook. */
+async function alertOnCall(subject: string, message: string, context: Record<string, unknown>): Promise<void> {
+  try {
+    const { emailService } = await import('./emailService');
+    await emailService.sendOncallAlert(subject, message, { 'Alert Class': PAYG_SETTLEMENT_ALERT_CLASS, ...context });
+  } catch (error: unknown) {
+    console.error(`${TAG} on-call alert "${subject}" failed:`, errorText(error));
+  }
 }
 
 /**
@@ -694,7 +951,7 @@ export async function handlePaygOverageChargeRefunded(charge: OverageChargeEvent
     status: 'refunded',
     stripeInvoiceId: ref.invoiceId,
     metadata: { chargeId: charge?.id, fullRefund: charge?.refunded, purchaseType: PAYG_OVERAGE_PURCHASE_TYPE },
-  });
+  }, { dedupKey: `refund:${charge?.id}:${refundedCents}` }); // a redelivery adds no second row
   console.log(`${TAG} overage charge ${charge?.id} refunded (${refundedCents}c): ${ref.billingUserId} ${ref.month}; PAYG not resumed`);
 }
 

@@ -247,10 +247,13 @@ export interface UserPaymentMethod {
   card: { brand: string; last4: string } | null;
   isZoma: boolean;
   /**
-   * ENG-668: the method an off-session charge should use — the customer's invoice default, else the
-   * newest card, else the first listed. Backend only, like `customerId`.
+   * ENG-668: a method to pin on an off-session invoice, ONLY when the customer has no invoice default
+   * (`invoice_settings.default_payment_method` / `default_source`) for Stripe to charge — the newest
+   * card, else the first listed. Null when there is a default: an invoice's own
+   * `default_payment_method` overrides the customer's for every automatic retry, so pinning it would
+   * keep charging the old card after the owner updates theirs. Backend only, like `customerId`.
    */
-  paymentMethodId?: string | null;
+  fallbackPaymentMethodId?: string | null;
 }
 
 /** ENG-668 PR-2: `metadata.purchaseType` on every month-end pay-as-you-go overage invoice. */
@@ -521,7 +524,7 @@ export const stripeService = {
       return {
         hasPaymentMethod: true,
         customerId,
-        paymentMethodId: defaultPmId || newestCard?.id || methods[0].id,
+        fallbackPaymentMethodId: defaultPmId || customer.default_source ? null : (newestCard?.id || methods[0].id),
         card: cardPm?.card ? { brand: cardPm.card.brand, last4: cardPm.card.last4 } : null,
         isZoma: setupIntents.some(
           (si) => si.status === 'succeeded' && si.metadata?.purchaseType === ZOMA_PAYMENT_METHOD_PURCHASE_TYPE,
@@ -555,7 +558,8 @@ export const stripeService = {
   async issuePaygOverageInvoice(input: {
     idempotencyKey: string;
     customerId: string | null;
-    paymentMethodId?: string | null;
+    /** Pinned on the invoice only when given (see `UserPaymentMethod.fallbackPaymentMethodId`). */
+    fallbackPaymentMethodId?: string | null;
     amountCents: number;
     description: string;
     lineDescription: string;
@@ -616,7 +620,7 @@ export const stripeService = {
         currency: 'usd',
         description: input.description,
         metadata,
-        ...(input.paymentMethodId ? { default_payment_method: input.paymentMethodId } : {}),
+        ...(input.fallbackPaymentMethodId ? { default_payment_method: input.fallbackPaymentMethodId } : {}),
       }, { idempotencyKey: `${input.idempotencyKey}:invoice` });
       await input.recordInvoiceId(invoice.id!);
     }
@@ -1543,6 +1547,29 @@ async function findPaygOverageInvoiceIfSettling(
 }
 
 /**
+ * ENG-668: `invoice.voided`, `invoice.marked_uncollectible` and `invoice.payment_action_required` matter
+ * here only for a pay-as-you-go overage invoice (a subscription's are left to Stripe as before): each is
+ * handed to settlement, anything else is logged and acknowledged.
+ */
+export async function handleInvoiceVoided(invoice: Stripe.Invoice): Promise<void> {
+  if (invoice?.metadata?.purchaseType !== PAYG_OVERAGE_PURCHASE_TYPE) return;
+  const { handlePaygOverageInvoiceVoided } = await import('./paygSettlementService');
+  await handlePaygOverageInvoiceVoided(invoice);
+}
+
+export async function handleInvoiceMarkedUncollectible(invoice: Stripe.Invoice): Promise<void> {
+  if (invoice?.metadata?.purchaseType !== PAYG_OVERAGE_PURCHASE_TYPE) return;
+  const { handlePaygOverageInvoiceMarkedUncollectible } = await import('./paygSettlementService');
+  await handlePaygOverageInvoiceMarkedUncollectible(invoice);
+}
+
+export async function handleInvoicePaymentActionRequired(invoice: Stripe.Invoice): Promise<void> {
+  if (invoice?.metadata?.purchaseType !== PAYG_OVERAGE_PURCHASE_TYPE) return;
+  const { handlePaygOverageInvoicePaymentActionRequired } = await import('./paygSettlementService');
+  await handlePaygOverageInvoicePaymentActionRequired(invoice);
+}
+
+/**
  * Handle charge.refunded — record the refund in payment history.
  */
 export async function handleChargeRefunded(charge: any): Promise<void> {
@@ -1763,7 +1790,16 @@ export async function handleChargeDisputeClosed(dispute: any): Promise<void> {
   if (!charge) return;
 
   const metadata = charge.metadata || {};
-  if (metadata.purchaseType !== 'llm_usage_top_up') return;
+  if (metadata.purchaseType !== 'llm_usage_top_up') {
+    // ENG-668: a closed dispute on a pay-as-you-go overage charge — won lifts its hold, lost writes the
+    // month off. A failed lookup errors the webhook so Stripe redelivers (as for the dispute opening).
+    const overageInvoice = await findPaygOverageInvoiceIfSettling(charge, 'charge.dispute.closed', 'raise');
+    if (overageInvoice) {
+      const { handlePaygOverageChargeDisputeClosed } = await import('./paygSettlementService');
+      await handlePaygOverageChargeDisputeClosed(dispute, charge, overageInvoice);
+    }
+    return;
+  }
 
   const billingUserId = String(metadata.billingUserId || '');
   const user = billingUserId ? await userDb.getUserById(billingUserId) : null;

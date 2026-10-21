@@ -14,6 +14,9 @@ import {
   handleChargeDisputeCreated,
   handleChargeDisputeClosed,
   handleSubscriptionScheduleEnded,
+  handleInvoiceVoided,
+  handleInvoiceMarkedUncollectible,
+  handleInvoicePaymentActionRequired,
   reconcileAllStripeUsers,
   findBasePlanItem,
   getSubscriptionPeriodEndIso,
@@ -137,6 +140,17 @@ export async function handleWebhook(req: Request, res: Response) {
       case 'invoice.payment_failed':
         await handleInvoicePaymentFailed(event.data.object);
         if (!isPaygOverageInvoiceEvent(event)) await handleInvoicePayment(event.data.object, 'payment_failed');
+        break;
+      // ENG-668: pay-as-you-go overage invoices only (subscription invoices are a no-op here). Like the
+      // dispute events, these must be enabled on the Stripe webhook endpoint.
+      case 'invoice.voided':
+        await handleInvoiceVoided(event.data.object);
+        break;
+      case 'invoice.marked_uncollectible':
+        await handleInvoiceMarkedUncollectible(event.data.object);
+        break;
+      case 'invoice.payment_action_required':
+        await handleInvoicePaymentActionRequired(event.data.object);
         break;
       case 'charge.refunded':
         await handleChargeRefunded(event.data.object);
