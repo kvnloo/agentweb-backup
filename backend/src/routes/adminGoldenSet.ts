@@ -37,10 +37,20 @@ function sendError(res: Response, error: unknown, action: string): Response {
   return res.status(500).json({ error: 'internal_error', message: `Failed to ${action}` });
 }
 
+const MAX_CASE_ID_BYTES = 2048;
+
 export function createAdminGoldenSetRouter(getStore: () => GoldenSetStore = goldenSetStoreFromEnv): express.Router {
   const router = express.Router();
   router.use(authenticateToken);
   router.use(isAdmin);
+  // DynamoDB rejects a partition key over 2,048 bytes; answer that as a bad request, not a 500.
+  router.param('caseId', (_req: Request, res: Response, next: express.NextFunction, caseId: string) => {
+    if (Buffer.byteLength(caseId, 'utf8') > MAX_CASE_ID_BYTES) {
+      res.status(400).json({ error: 'invalid_request', message: `caseId must be at most ${MAX_CASE_ID_BYTES} bytes` });
+      return;
+    }
+    next();
+  });
 
   router.get('/status', (_req: Request, res: Response) => {
     try {
