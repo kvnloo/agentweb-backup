@@ -148,13 +148,19 @@ export interface PaygOverageStatus {
  *   - `tierPoolHighWaterMicroUsd`: the highest plan pool (the tier's hard threshold, before credits) —
  *     settlement's pool for the month, so a plan change after the month cannot move its bill.
  *   - `markupBps`: the lowest tier markup seen; null when the tier had none (settlement holds the month).
+ *   - `spendBasis`: which spend figure the gate measured the month's admissions on — the spend ledger
+ *     (what settlement bills) or the legacy LLM-only counter; `mixed` once both were seen. Settlement
+ *     bills only a month measured on the ledger throughout, whatever the cutover setting is by then.
  */
 export interface PaygAdmittedMonth {
   month: string;
   capHighWaterMicroUsd: number;
   tierPoolHighWaterMicroUsd: number;
   markupBps: number | null;
+  spendBasis: PaygSpendBasis;
 }
+
+export type PaygSpendBasis = 'spend_ledger' | 'legacy' | 'mixed';
 
 /**
  * Months of `admittedMonths` kept: the current month plus the 12 before it, so every month settlement
@@ -189,6 +195,7 @@ export function withPaygAdmission(
         capHighWaterMicroUsd: Math.max(stored.capHighWaterMicroUsd, seen.capHighWaterMicroUsd),
         tierPoolHighWaterMicroUsd: Math.max(stored.tierPoolHighWaterMicroUsd, seen.tierPoolHighWaterMicroUsd),
         markupBps: lowerMarkup(stored.markupBps, seen.markupBps),
+        spendBasis: stored.spendBasis === seen.spendBasis ? stored.spendBasis : 'mixed',
       }
     : seen;
   if (
@@ -196,6 +203,7 @@ export function withPaygAdmission(
     && merged.capHighWaterMicroUsd === stored.capHighWaterMicroUsd
     && merged.tierPoolHighWaterMicroUsd === stored.tierPoolHighWaterMicroUsd
     && merged.markupBps === stored.markupBps
+    && merged.spendBasis === stored.spendBasis
   ) {
     return null;
   }
@@ -422,7 +430,7 @@ export function validatePaygOverageTierConfig(config: SubscriptionPaygOverageCon
   return errors;
 }
 
-export interface PaygOverageSwitchDeps {
+export interface ExactTrueSwitchDeps {
   getSetting(name: string): Promise<{ settingValue?: unknown } | null>;
   now(): number;
   log(message: string, fields?: Record<string, unknown>): void;
@@ -433,10 +441,11 @@ const CACHE_TTL_MS = 60_000;
 const ERROR_RETRY_MS = 5_000;
 
 /**
- * A cached reader for one exact-'true' AW-Settings switch: the gate's `PAYG_OVERAGE_SETTING` by
- * default, or settlement's `PAYG_SETTLEMENT_SETTING`.
+ * A cached reader for one exact-'true' AW-Settings switch (the gate's `PAYG_OVERAGE_SETTING`, settlement's
+ * `PAYG_SETTLEMENT_SETTING`): only the exact string 'true' turns it on; absent, anything else, or a
+ * cold-start read failure is off; a read is cached ~60s and a failed refresh keeps the last-known value.
  */
-export function createPaygOverageSwitch(deps: PaygOverageSwitchDeps, settingName: string = PAYG_OVERAGE_SETTING) {
+export function createExactTrueSwitch(deps: ExactTrueSwitchDeps, settingName: string) {
   let known = false; // last successfully read value; cold start => off
   let validUntil = 0;
   let inFlight: Promise<void> | null = null; // one refresh at a time
@@ -447,7 +456,7 @@ export function createPaygOverageSwitch(deps: PaygOverageSwitchDeps, settingName
       known = row?.settingValue === 'true';
       validUntil = now + CACHE_TTL_MS;
     } catch (error) {
-      deps.log('PaygOverage: failed to read the PAYG switch; keeping last-known value (off if none)', {
+      deps.log('PaygOverage: failed to read a PAYG switch; keeping last-known value (off if none)', {
         setting: settingName,
         errorClass: (error as Error)?.name ?? 'Error',
         known,

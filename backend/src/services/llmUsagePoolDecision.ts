@@ -63,12 +63,20 @@ export async function resolveLlmUsagePoolDecision(input: {
   paygTier: () => Promise<SubscriptionPaygOverageConfig | null | undefined>;
   /** Lazy: read only if the basis falls back to legacy (rollback path), never on the live ledger path. */
   legacyRawCostUsedMicroUsd: () => Promise<number>;
+  /**
+   * True only for a turn gate — a check that admits a turn about to run. Only then may PAYG state be
+   * written (the pool high-water mark, and the month's admission record that makes it billable). Every
+   * other caller (settings view, runway, drivers, model lists, admin reads) gets the same decision with
+   * no write at all: reading usage must never make a month billable or raise its cap.
+   */
+  recordAdmission?: boolean;
 }): Promise<LlmUsagePoolDecision> {
   const { billingUserId, billingUser, month, basePolicy } = input;
+  const recordAdmission = input.recordAdmission === true;
   // ENG-1250 §9.6 enforcement cutover (dark by default): swap the raw spend basis
   // onto the vendor-inclusive spend ledger and leave the rest of this pipeline —
   // credit application, threshold, predicate — untouched. See spendEnforcementBasis.ts.
-  const { rawCostUsedMicroUsd } = await resolveEnforcementCostBasisMicroUsd({
+  const { rawCostUsedMicroUsd, basis: spendBasis } = await resolveEnforcementCostBasisMicroUsd({
     billingUserId,
     billingMonth: month,
     legacyRawCostUsedMicroUsd: input.legacyRawCostUsedMicroUsd,
@@ -127,7 +135,7 @@ export async function resolveLlmUsagePoolDecision(input: {
   // The mark leaves out top-up credit a refund or dispute can still revoke: a live top-up already
   // extends today's pool (the overage threshold is the larger of the two), and once revoked it must not
   // linger in the mark as capacity nobody paid for. Seat and admin credit stay in it.
-  const poolHighWater = await recordPoolHighWater({
+  const markInput = {
     billingUserId,
     account: ownerAccount,
     month: usageMonth,
@@ -135,7 +143,9 @@ export async function resolveLlmUsagePoolDecision(input: {
       0,
       policy.hardCostThresholdMicroUsd - getRevocablePurchasedCreditMicroUsd(billingUser?.llmUsageCredits, month),
     ),
-  });
+  };
+  // A read-only caller measures against the mark the write would store, without storing it.
+  const poolHighWater = recordAdmission ? await recordPoolHighWater(markInput) : higherPoolHighWater(markInput);
   // Only an opt-in that is ON is ever evaluated; an OFF one keeps today's decision exactly.
   if (ownerAccount.enabled !== true) return base;
   const payg = evaluatePaygAdmission({
@@ -155,7 +165,7 @@ export async function resolveLlmUsagePoolDecision(input: {
   });
   // Settlement bills a month only if PAYG actually admitted something in it, and only against what was
   // in force when it did (see `admittedMonths`).
-  if (payg.decision.reason === 'payg_overage' && payg.overage) {
+  if (recordAdmission && payg.decision.reason === 'payg_overage' && payg.overage) {
     await recordPaygAdmission({
       billingUserId,
       account: ownerAccount,
@@ -164,6 +174,7 @@ export async function resolveLlmUsagePoolDecision(input: {
         capHighWaterMicroUsd: payg.overage.capMicroUsd,
         tierPoolHighWaterMicroUsd: Math.round(basePolicy!.hardCostThresholdMicroUsd),
         markupBps: Number.isInteger(paygTier.markupBps) ? paygTier.markupBps! : null,
+        spendBasis: spendBasis === 'spend_ledger' ? 'spend_ledger' : 'legacy',
       },
     });
   }
@@ -200,6 +211,17 @@ async function readOwnerConsistently(billingUserId: string): Promise<PoolBilling
  * holds would count usage the higher pool still covers as overage. Any other failure is logged and the
  * check continues on the in-memory maximum, which is what the write would have stored.
  */
+/** The mark a check measures against without writing: the stored one, or today's when it is higher. */
+function higherPoolHighWater(input: {
+  account: PaygOverageSettings;
+  month: string;
+  thresholdMicroUsd: number;
+}): PaygOverageSettings['poolHighWater'] {
+  const stored = input.account.poolHighWater;
+  if (stored?.month === input.month && stored.thresholdMicroUsd >= input.thresholdMicroUsd) return stored;
+  return { month: input.month, thresholdMicroUsd: input.thresholdMicroUsd };
+}
+
 async function recordPoolHighWater(input: {
   billingUserId: string;
   account: PaygOverageSettings;

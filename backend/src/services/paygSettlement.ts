@@ -46,8 +46,13 @@ export type PaygSettlementStatus = 'pending' | 'invoiced' | 'paid' | 'failed' | 
 export type PaygSettlementHeldReason =
   /** Settled spend events and the persisted projection disagree beyond the §3 tolerance. */
   | 'spend_drift'
-  /** The gate measured this owner on the legacy LLM-only counter, not the spend ledger being billed. */
+  /**
+   * The gate measured some or all of the month's PAYG admissions on the legacy LLM-only counter, not on
+   * the spend ledger being billed (recorded per month at admission; see `PaygAdmittedMonth.spendBasis`).
+   */
   | 'legacy_spend_basis'
+  /** Stripe holds more than one live invoice for the month: a person decides which one stands. */
+  | 'multiple_invoices'
   /** The month's admission record or the stored PAYG state is unreadable. */
   | 'unmeasurable'
   /** The tier had no valid `paygOverage.markupBps` when PAYG admitted in the month. */
@@ -107,6 +112,8 @@ export interface PaygSettlement {
   /** Cumulative cents refunded on the overage charge (recorded only; a refund never resumes PAYG). */
   refundedCents?: number;
   dispute?: { disputeId: string; at: string };
+  /** On `multiple_invoices`: the live invoices Stripe holds for the month. */
+  conflictingInvoiceIds?: string[];
 }
 
 /** AW-Users `paygSettlements`, keyed by UTC `YYYY-MM`. */
@@ -130,10 +137,15 @@ export function previousUsageMonth(now: Date): string {
   return getCurrentUsageMonth(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1)));
 }
 
+/** The first month of the retention window ending at `month` (`month` and the 11 before it). */
+export function paygSettlementWindowStart(month: string): string {
+  const [year, monthNum] = month.split('-').map(Number);
+  return getCurrentUsageMonth(new Date(Date.UTC(year, monthNum - PAYG_SETTLEMENT_MONTHS_KEPT, 1)));
+}
+
 /** Months of a stored `paygSettlements` map older than the retention window ending at `month`. */
 export function paygSettlementMonthsToPrune(settlements: PaygSettlements | null | undefined, month: string): string[] {
-  const [year, monthNum] = month.split('-').map(Number);
-  const oldestKept = getCurrentUsageMonth(new Date(Date.UTC(year, monthNum - PAYG_SETTLEMENT_MONTHS_KEPT, 1)));
+  const oldestKept = paygSettlementWindowStart(month);
   return Object.keys(settlements ?? {}).filter((m) => m < oldestKept);
 }
 

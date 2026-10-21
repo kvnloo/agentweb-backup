@@ -269,6 +269,9 @@ export interface PaygChargeRef {
   payment_intent?: string | { id?: string } | null;
 }
 
+/** An empty overage draft at least this old has no run in flight behind it (runs take seconds). */
+const PAYG_ORPHAN_DRAFT_AGE_SECONDS = 60 * 60;
+
 /** An invoice by id, or null when Stripe reports it deleted or unknown. Any other Stripe error throws. */
 async function retrieveInvoiceIfExists(s: Stripe, invoiceId: string): Promise<Stripe.Invoice | null> {
   try {
@@ -562,6 +565,7 @@ export const stripeService = {
   }): Promise<
     | { outcome: 'issued'; invoice: Stripe.Invoice }
     | { outcome: 'mismatch'; invoiceId: string; reason: PaygOverageInvoiceMismatch }
+    | { outcome: 'multiple'; invoiceIds: string[] }
     | { outcome: 'no_customer' }
   > {
     if (!Number.isInteger(input.amountCents) || input.amountCents <= 0) throw new Error('amountCents must be a positive integer');
@@ -583,12 +587,23 @@ export const stripeService = {
         query: `metadata['purchaseType']:'${PAYG_OVERAGE_PURCHASE_TYPE}' AND metadata['billingUserId']:'${billingUserId}' AND metadata['month']:'${month}'`,
         limit: 10,
       });
-      // A void invoice collected nothing; any other one is this month's invoice.
-      invoice = found.data.find((candidate) =>
+      // A void invoice collected nothing; any other one is this month's.
+      const live = found.data.filter((candidate) =>
         candidate.metadata?.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE
         && candidate.metadata?.billingUserId === billingUserId
         && candidate.metadata?.month === month
-        && candidate.status !== 'void') ?? null;
+        && candidate.status !== 'void');
+      // An EMPTY draft older than any run in flight is an orphan: a run created it and died before
+      // recording its id, and the key has since expired. It can never be collected, so it is deleted
+      // rather than adopted (adopting it next to the invoice that replaced it would bill twice).
+      const orphanBefore = Math.floor(Date.now() / 1000) - PAYG_ORPHAN_DRAFT_AGE_SECONDS;
+      const isOrphan = (candidate: Stripe.Invoice) =>
+        candidate.status === 'draft' && !(candidate.lines?.data?.length) && candidate.created < orphanBefore;
+      for (const orphan of live.filter(isOrphan)) await s.invoices.del(orphan.id!);
+      const standing = live.filter((candidate) => !isOrphan(candidate));
+      // More than one live invoice for one month: never pick one — a person decides which stands.
+      if (standing.length > 1) return { outcome: 'multiple', invoiceIds: standing.map((candidate) => candidate.id!) };
+      invoice = standing[0] ?? null;
       if (invoice?.id) await input.recordInvoiceId(invoice.id);
     }
     if (!invoice) {
@@ -1487,20 +1502,42 @@ export async function handleInvoicePaymentFailed(invoice: any): Promise<void> {
 
 /**
  * ENG-668 PR-2: the overage invoice behind a refunded or disputed charge — only while PAYG settlement
- * is switched on, and best-effort. Recognising an overage charge costs a Stripe call per non-top-up
- * charge, so with settlement off (the shipped state) the refund and dispute webhooks behave exactly as
- * before and make no extra call. A failed lookup is logged and the charge is handled as before rather
- * than failing a webhook that today records it.
+ * is switched on. Recognising an overage charge costs a Stripe call per non-top-up charge, so with
+ * settlement off (the shipped state) the refund and dispute webhooks behave exactly as before and make
+ * no extra call. When the lookup itself fails:
+ *   - `dispute`: the error is raised, so the webhook answers 500 and Stripe redelivers — a chargeback on
+ *     an overage charge must suspend PAYG, and acknowledging it unrecognised would drop that for good;
+ *   - `refund`: the refund is handled as before (it is recorded either way) and on-call is told it could
+ *     not be checked, so an overage refund is never silently left off its settlement.
  */
-async function findPaygOverageInvoiceIfSettling(charge: PaygChargeRef, event: string): Promise<Stripe.Invoice | null> {
+async function findPaygOverageInvoiceIfSettling(
+  charge: PaygChargeRef,
+  event: string,
+  onLookupFailure: 'raise' | 'alert',
+): Promise<Stripe.Invoice | null> {
   // Only an invoice charge has a PaymentIntent to look up; anything else is never an overage charge.
   if (!charge?.payment_intent) return null;
+  const { paygSettlementSwitch } = await import('./paygOverageService');
+  if (!(await paygSettlementSwitch.isEnabled())) return null;
   try {
-    const { paygSettlementSwitch } = await import('./paygOverageService');
-    if (!(await paygSettlementSwitch.isEnabled())) return null;
     return await stripeService.findPaygOverageInvoiceForCharge(charge);
   } catch (error: unknown) {
-    console.error(`[STRIPE] ${event}: could not check whether charge ${charge?.id} paid a pay-as-you-go invoice; handling it as before:`, error instanceof Error ? error.message : error);
+    const message = error instanceof Error ? error.message : String(error);
+    if (onLookupFailure === 'raise') {
+      throw new Error(`${event}: could not check whether charge ${charge?.id} paid a pay-as-you-go invoice (${message}); retry`);
+    }
+    console.error(`[STRIPE] ${event}: could not check whether charge ${charge?.id} paid a pay-as-you-go invoice; handling it as before:`, message);
+    try {
+      const { emailService } = await import('./emailService');
+      await emailService.sendOncallAlert(
+        `PAYG settlement: ${event} for charge ${charge?.id} could not be checked`,
+        `Stripe's invoice lookup failed (${message}), so ${event} for charge ${charge?.id} was handled as a `
+          + 'non-overage charge. If it paid a pay-as-you-go overage invoice, record it on that month\'s settlement by hand.',
+        { 'Alert Class': 'payg-settlement-lookup', chargeId: charge?.id ?? null, event },
+      );
+    } catch (alertError: unknown) {
+      console.error(`[STRIPE] ${event}: on-call alert failed:`, alertError instanceof Error ? alertError.message : alertError);
+    }
     return null;
   }
 }
@@ -1513,7 +1550,7 @@ export async function handleChargeRefunded(charge: any): Promise<void> {
   // ENG-668: a refunded pay-as-you-go overage charge is recorded against its settlement only. It never
   // lifts a suspension (refunding an overage is not a reason to resume billing it).
   if (metadata.purchaseType !== 'llm_usage_top_up') {
-    const overageInvoice = await findPaygOverageInvoiceIfSettling(charge, 'charge.refunded');
+    const overageInvoice = await findPaygOverageInvoiceIfSettling(charge, 'charge.refunded', 'alert');
     if (overageInvoice) {
       const { handlePaygOverageChargeRefunded } = await import('./paygSettlementService');
       await handlePaygOverageChargeRefunded(charge, overageInvoice);
@@ -1620,7 +1657,7 @@ export async function handleChargeDisputeCreated(dispute: any): Promise<void> {
   const metadata = charge.metadata || {};
   if (metadata.purchaseType !== 'llm_usage_top_up') {
     // ENG-668: a chargeback on a pay-as-you-go overage charge suspends pay-as-you-go.
-    const overageInvoice = await findPaygOverageInvoiceIfSettling(charge, 'charge.dispute.created');
+    const overageInvoice = await findPaygOverageInvoiceIfSettling(charge, 'charge.dispute.created', 'raise');
     if (overageInvoice) {
       const { handlePaygOverageChargeDisputed } = await import('./paygSettlementService');
       await handlePaygOverageChargeDisputed(dispute, charge, overageInvoice);

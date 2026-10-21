@@ -14,7 +14,7 @@ import { getJwtSecret } from '../config/jwt';
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { settingsService } from '../services/settingsService';
-import { checkTokenUsage, resolveBillingUserId } from '../services/tokenUsageService';
+import { checkTokenUsage, resolveBillingUserId, TURN_ADMISSION } from '../services/tokenUsageService';
 import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
 import { getModelPrice } from '../utils/llmPricing';
 import { resolveOpenRouterUpstreamModelId } from '../utils/openRouterGatewayContract';
@@ -113,7 +113,7 @@ function compareDeps(): CompareDeps {
     isFeatureEnabled: isModelCompareEnabled,
     isEntitled: (user) => modelCompareEntitlement.isEntitled(user),
     getSession,
-    checkUsage: (userId) => checkTokenUsage(userId),
+    checkUsage: (userId) => checkTokenUsage(userId, TURN_ADMISSION),
     buildUsageBlock: (month, paygBlock) => buildUsageBlockCopy({ month, paygBlock }),
     normalizeModelId: (model) => agentModeService.normalizeModelId(model),
     resolveModel: (input) => resolveEffectiveModelForUser(input),

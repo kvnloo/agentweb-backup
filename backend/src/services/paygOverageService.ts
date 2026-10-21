@@ -13,7 +13,8 @@ import { getCurrentMonth, resolveBillingUserId } from './tokenUsageService';
 import { getEffectiveLlmUsagePolicy } from './llmUsagePolicyResolverService';
 import { getCurrentUsageMonth, getRevocablePurchasedCreditMicroUsd } from './llmUsageCreditService';
 import {
-  createPaygOverageSwitch,
+  createExactTrueSwitch,
+  PAYG_OVERAGE_SETTING,
   isPaygCapPercent,
   paygAdmittedMonth,
   PAYG_SETTLEMENT_SETTING,
@@ -25,14 +26,14 @@ import {
 } from './paygOverage';
 
 /** Process-wide switch reader: one cache, one answer for both gates and the settings routes. */
-export const paygOverageSwitch = createPaygOverageSwitch({
+export const paygOverageSwitch = createExactTrueSwitch({
   getSetting: (name) => settingsService.getSetting(name),
   now: () => Date.now(),
   log: (message, fields) => console.error(message, fields),
-});
+}, PAYG_OVERAGE_SETTING);
 
 /** Month-end settlement's own switch (`paygSettlementService.ts`): off = the settlement cron does nothing. */
-export const paygSettlementSwitch = createPaygOverageSwitch({
+export const paygSettlementSwitch = createExactTrueSwitch({
   getSetting: (name) => settingsService.getSetting(name),
   now: () => Date.now(),
   log: (message, fields) => console.error(message, fields),

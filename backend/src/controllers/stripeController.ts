@@ -18,6 +18,7 @@ import {
   findBasePlanItem,
   getSubscriptionPeriodEndIso,
   isSetupModeCheckoutSession,
+  PAYG_OVERAGE_PURCHASE_TYPE,
 } from '../services/stripeService';
 
 const CUSTOMER_FRONTEND_URL =
@@ -130,11 +131,12 @@ export async function handleWebhook(req: Request, res: Response) {
       case 'invoice.paid':
       case 'invoice.payment_succeeded':
         await handleInvoicePaymentSucceeded(event.data.object);
-        await handleInvoicePayment(event.data.object, 'payment_succeeded');
+        // A pay-as-you-go overage invoice is recorded by settlement under its own payment types.
+        if (!isPaygOverageInvoiceEvent(event)) await handleInvoicePayment(event.data.object, 'payment_succeeded');
         break;
       case 'invoice.payment_failed':
         await handleInvoicePaymentFailed(event.data.object);
-        await handleInvoicePayment(event.data.object, 'payment_failed');
+        if (!isPaygOverageInvoiceEvent(event)) await handleInvoicePayment(event.data.object, 'payment_failed');
         break;
       case 'charge.refunded':
         await handleChargeRefunded(event.data.object);
@@ -168,7 +170,9 @@ export async function handleWebhook(req: Request, res: Response) {
     // and health scores reflect live billing state. Fire-and-forget — never
     // blocks the webhook ack. Errors are swallowed inside the hook.
     // A setup-mode checkout is not a subscription event (it would map to payment.subscribed).
-    if (!(event.type === 'checkout.session.completed' && isSetupModeCheckoutSession(event.data.object))) {
+    // Nor is a pay-as-you-go overage invoice (ENG-668): the CRM mirror models the subscription.
+    if (!(event.type === 'checkout.session.completed' && isSetupModeCheckoutSession(event.data.object))
+      && !isPaygOverageInvoiceEvent(event)) {
       void sendStripeEventToCrm(event);
     }
 
@@ -309,6 +313,12 @@ async function handleInvoicePayment(
   } catch (err: any) {
     console.error(`[PaymentHistory] Failed to record ${eventType}: ${err.message}`);
   }
+}
+
+/** ENG-668: an `invoice.*` event for a pay-as-you-go overage invoice (settlement's, not the subscription's). */
+function isPaygOverageInvoiceEvent(event: { type: string; data: { object: unknown } }): boolean {
+  const metadata = (event.data?.object as { metadata?: Record<string, string> | null } | undefined)?.metadata;
+  return event.type.startsWith('invoice.') && !!metadata?.purchaseType && metadata.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE;
 }
 
 /**
