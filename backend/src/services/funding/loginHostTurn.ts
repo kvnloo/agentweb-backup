@@ -95,11 +95,14 @@ export async function runHostTurn(client: LoginHostClient, req: RouteInput<"turn
     return interrupting;
   };
 
-  // Lease renewal. Its own loop (not setInterval) so a slow renew never overlaps the next one.
+  // Lease renewal. Its own loop (not setInterval) so a slow renew never overlaps the next one. The first renew is
+  // immediate: it teaches us the host's real lease (a host may be configured far below the 30 s default) before any wait.
   const renewLoop = (async () => {
     let failures = 0;
+    let first = true;
     while (!stopped) {
-      await Promise.race([sleep(renewEvery), stopSignal]);
+      if (!first) await Promise.race([sleep(renewEvery), stopSignal]);
+      first = false;
       if (stopped) return;
       try {
         const { leaseMs } = await client.turnRenew(ids);
@@ -126,20 +129,27 @@ export async function runHostTurn(client: LoginHostClient, req: RouteInput<"turn
 
   try {
     let result: ResultEvent | undefined;
-    try {
-      for await (const ev of stream.events) {
-        if (ev.type === "result") result = ev;
-        try {
-          await opts.onEvent?.(ev);
-        } catch (err) {
-          await interrupt();
-          stream.close();
-          throw err;
-        }
+    const it = stream.events[Symbol.asyncIterator]();
+    for (;;) {
+      let next: IteratorResult<ProviderEvent>;
+      try {
+        next = await it.next();
+      } catch (err) {
+        // Only a failure while READING the stream is "the connection dropped". If the final answer already arrived, it stands.
+        if (err instanceof LoginHostError && err.ambiguous) return result ? { kind: "completed", result } : { kind: "unknown_outcome", reason: "stream_dropped" };
+        throw err;
       }
-    } catch (err) {
-      if (err instanceof LoginHostError && err.ambiguous) return { kind: "unknown_outcome", reason: "stream_dropped" };
-      throw err;
+      if (next.done) break;
+      const ev = next.value;
+      if (ev.type === "result") result = ev;
+      try {
+        await opts.onEvent?.(ev);
+      } catch (err) {
+        // The caller's own failure is theirs to see: never folded into "outcome unknown".
+        await interrupt();
+        stream.close();
+        throw err;
+      }
     }
     return result ? { kind: "completed", result } : { kind: "unknown_outcome", reason: "stream_dropped" };
   } finally {
@@ -148,6 +158,6 @@ export async function runHostTurn(client: LoginHostClient, req: RouteInput<"turn
     if (graceTimer) clearTimeout(graceTimer);
     opts.signal?.removeEventListener("abort", onAbort);
     stream.close();
-    await renewLoop.catch(() => undefined);
+    void renewLoop; // never awaited: a renew still in flight must not hold the caller (the loop swallows its own errors)
   }
 }
