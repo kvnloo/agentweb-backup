@@ -40,7 +40,7 @@ function sanitizeDetail(detail: Record<string, string | number | boolean>): Reco
   return clean;
 }
 
-function isRecord(value: unknown): value is HotLeadCallRecord {
+function isCallRecord(value: unknown): value is HotLeadCallRecord {
   return !!value && typeof value === 'object' && typeof (value as { state?: unknown }).state === 'string';
 }
 
@@ -60,7 +60,7 @@ class DynamoLeadCallStore implements LeadCallStore {
   async get(listId: string, leadId: string): Promise<HotLeadCallRecord | null> {
     const lead = await crmDb.getLeadById(listId, leadId, { consistentRead: true });
     const record = lead?.system?.[SYSTEM_KEY];
-    return isRecord(record) ? record : null;
+    return isCallRecord(record) ? record : null;
   }
 
   async create(listId: string, leadId: string, record: HotLeadCallRecord): Promise<boolean> {

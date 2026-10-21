@@ -13,7 +13,7 @@ import { recordVendorUsage } from '../services/usageRecorderService';
 import { isHotLeadCallEnabled } from '../services/voice/hotLeadCallMode';
 import '../emma/hotLeadCallTools';
 import '../emma/hotLeadCallSetupTools';
-import { teamMember, MEMBER_ID, VERIFIED_AT } from './helpers/hotLeadCallFixtures';
+import { teamMember, MEMBER_ID, VERIFIED_AT, storedHotLeadCallConfig } from './helpers/hotLeadCallFixtures';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
 import { FakeVoiceProvider } from './helpers/fakeVoiceProvider';
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
@@ -48,13 +48,11 @@ const sameValue = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringi
 const logSpies: jest.SpyInstance[] = [];
 
 // `verified` stamps the (only) member's verifiedAt and `phone` sets their phone; everything else is config.
-const configured = ({ verified, phone, ...extra }: Record<string, unknown> = {}) => ({
-  enabled: false,
-  team: [teamMember(typeof phone === 'string' ? phone : '+14155550100', verified ? {} : { verifiedAt: undefined })],
-  leadTypes: ['form_fill'], maxAgeMinutes: 10, maxCallsPerHour: 6, maxCallsPerDay: 20,
-  memberCooldownMinutes: 2, maxAttemptsPerLead: 3, announcedName: 'Acme Plumbing', callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
-  allowedCountries: ['US', 'CA'], ...extra,
-});
+const configured = ({ verified, phone, ...extra }: Record<string, unknown> = {}) => clone(storedHotLeadCallConfig(
+  // Undefined overrides drop the caller number the shared config carries; withNumber adds it back.
+  { enabled: false, twilioNumber: undefined, twilioNumberSid: undefined, ...extra },
+  [teamMember(typeof phone === 'string' ? phone : '+14155550100', verified ? {} : { verifiedAt: undefined })],
+));
 const firstMember = () => (org.hotLeadCall as { team: Array<Record<string, unknown>> }).team[0];
 const withNumber = (extra: Record<string, unknown> = {}) => configured({ twilioNumber: '+14155550111', twilioNumberSid: SID, ...extra });
 
