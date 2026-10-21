@@ -1208,6 +1208,19 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
           expect(sentCreative().instagram_user_id).toBe('ig_old');
         });
 
+        it('treats description / instagram_user_id as creative content: swaps and keeps them off the ad-level update (ENG-2609)', async () => {
+          mockSwap(OLD_LINK_SPEC, OLD_LINK_SPEC);
+
+          await agentModeService.updateMetaAdsAd('user123', 'ad_123', { description: 'New desc', instagram_user_id: 'ig_new' });
+
+          expect(sentCreative().description).toBe('New desc');
+          expect(sentCreative().instagram_user_id).toBe('ig_new');
+          for (const call of jest.mocked(metaService.updateAd).mock.calls) {
+            expect(call[2]).not.toHaveProperty('description');
+            expect(call[2]).not.toHaveProperty('instagram_user_id');
+          }
+        });
+
         it('fails with SWAP_NOT_REFLECTED and does not attach when the new creative still has the old image', async () => {
           mockSwap(OLD_LINK_SPEC, OLD_LINK_SPEC);
 

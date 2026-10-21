@@ -13045,7 +13045,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // silently drops it (see updateAd's params typing), so a UTM-only retag
   // (ENG-239 retrofit, agentModeService.retagMetaAdUtm) must also go through
   // the swap path. carriedUrlTags below already forwards it correctly.
-  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets', 'url_tags'];
+  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets', 'url_tags', 'description', 'instagram_user_id'];
 
   public async updateMetaAdsAd(userId: string, adId: string, params: any, account_id?: string): Promise<any> {
     try {

@@ -15,7 +15,6 @@ export interface RequestedCreativeFields {
 interface LiveCreative {
   object_story_spec?: {
     instagram_user_id?: string;
-    instagram_actor_id?: string;
     link_data?: { description?: string };
     video_data?: { link_description?: string };
   };
@@ -38,7 +37,7 @@ export function findUnappliedCreativeFields(
   const spec = live.object_story_spec;
 
   if (requested.instagram_user_id) {
-    const liveIg = spec?.instagram_user_id ?? spec?.instagram_actor_id;
+    const liveIg = spec?.instagram_user_id;
     if (liveIg == null || !sameText(liveIg, requested.instagram_user_id)) missing.push('instagram_user_id');
   }
 
