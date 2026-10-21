@@ -166,6 +166,32 @@ is charged twice. Invoices already issued are Stripe's to collect; their webhook
 stop collecting one, void it in Stripe: the month is written off (never billed again), and if it was the
 only unpaid month the customer's PAYG hold is lifted.
 
+**How to run the real-runtime suites.** Two opt-in suites run the money paths against real runtimes
+instead of the unit suites' in-memory row fake (`__tests__/helpers/userRowFake.ts`) and hand-written
+Stripe fakes. Both are `describe.skip` unless their env var is set, so CI never runs them; run them by hand
+before changing a condition expression or a Stripe call. From `backend/`:
+```bash
+docker run -d --rm --name ddb -p 127.0.0.1:8124:8000 amazon/dynamodb-local -jar DynamoDBLocal.jar -inMemory
+docker run -d --rm --name smock -p 127.0.0.1:12111:12111 stripe/stripe-mock:v0.195.0   # bundles 2025-05-28.basil
+DYNAMODB_LOCAL_ENDPOINT=http://127.0.0.1:8124 npx jest src/__tests__/paygOverage.dynamodbLocal.test.ts
+STRIPE_API_BASE=http://127.0.0.1:12111 npx jest src/__tests__/paygSettlement.stripeMock.test.ts
+docker stop ddb smock
+```
+- `paygOverage.dynamodbLocal.test.ts` creates its own AW-Users (`email` key, `UserIdIndex`) and
+  AW-PaymentHistory tables and drives the production writers — the turn gate (mark, admission record,
+  rollover), the credit-ledger rollover (`llmUsageCreditsClosed`, incl. the admin transaction), the
+  settings PUT (version, opt-in baseline, closed copies, payment-method repair), settlement (`pending`
+  lock, every transition, frozen inputs, `retry`, `uncollectedInvoice`) and the suspension set/lift —
+  with each race forced at an exact point, so DynamoDB itself decides the loser. It also pins where the
+  row fake differs from DynamoDB (`<>` on a missing attribute is true in DynamoDB; REMOVE below a missing
+  parent, unused expression names/values and overlapping paths are ValidationExceptions the fake accepts).
+  DynamoDB Local updates GSIs synchronously, unlike production's `UserIdIndex`.
+- `paygSettlement.stripeMock.test.ts` sends every Stripe request the PR makes through the real SDK to
+  stripe-mock, which rejects any parameter the pinned API version does not accept, and checks every field
+  the code reads exists in that version's objects; the webhook controller is driven with real signatures.
+  stripe-mock is stateless, so it proves request and response shapes, not Stripe's behaviour (search,
+  idempotency replay, discounts, deletion).
+
 **Follow-ups (known, not fixed here).** A closed high-water mark can be stale if a check raises it in the
 last instant of a month while another rolls it over; a higher mark lost to a month-change race is only
 saved at the next check; `mrrCollectionGapService` counts
