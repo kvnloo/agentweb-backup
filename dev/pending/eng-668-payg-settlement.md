@@ -49,8 +49,11 @@ Nothing written after month M ends can change M's bill:
   over the gate's pipeline (`applyLlmUsageCredits` -> `paygOverageThresholdMicroUsd`) on the month's own
   plan pool, credits, pool mark and opt-in. The credits, pool mark and opt-in come from the row only while
   M is the month that just closed (each is kept one month past its own), and are frozen on the settlement
-  record (`inputs`) the first time M is measured, so any later re-measurement (`retry`) uses M's own. Spend = settled AW-SpendEvents for the month, reconciled with
-  `reconcileProjection` against the persisted projection the gate read (1 µ$, the §3 invariant).
+  record (`inputs`) the first time M is measured, so any later re-measurement (`retry`) uses M's own. Spend = settled AW-SpendEvents for the month, checked against the
+  persisted projection the gate read within max(50c, 1% of settled spend) (`paygSpendDriftTolerable`): the
+  projection is a best-effort ADD per settled batch (failures swallowed) and trails the events by a few
+  events' cost in normal operation, which leaves the bill (computed from the events) untouched; a broken
+  ledger moves a month by whole events and passes 1%, and that is still held.
 - Billable = min(overage after the opt-in baseline, the month's `capHighWaterMicroUsd`) x `markupBps`/10000,
   rounded down to µ$, then to whole cents.
 
@@ -60,7 +63,8 @@ opt-in AND only if PAYG has not admitted anything in that month. Once it has, th
 
 **Never billed / held.** A month PAYG never admitted a turn in is never billed. 0 cents ->
 `nothing_to_bill` (no_overage); under Stripe's 50c minimum -> `nothing_to_bill` (below_minimum). `held`
-(no charge, one on-call alert, `Alert Class: payg-settlement-held`) for: spend drift or real spend with no
+(no charge; on-call is told in ONE alert per daily run listing every month that run held, `Alert Class:
+payg-settlement-held`) for: spend drift or real spend with no
 projection; an owner the gate measured on the legacy counter; no valid markup recorded for the month;
 unmeasurable state; no live Stripe customer; Stripe's total not the recorded amount (a customer discount
 or coupon — a credit balance lowers `amount_due`, not the total); or the invoice the record names is void,
@@ -85,8 +89,10 @@ remains for the month, nothing is picked — the month is held `multiple_invoice
 `pending_invoice_items_behavior: 'exclude'`; **its total is compared with the recorded amount before
 finalizing** — on a mismatch (a customer discount or balance) the draft is deleted and the month held,
 nothing finalized or collected. Finalize sets `auto_advance: true`, so Stripe charges. Customer =
-`stripeService.resolveUserPaymentMethod(user, userId).customerId` (ENG-2571), its `paymentMethodId` the
-invoice's `default_payment_method`. Records older than 12 months are pruned in the same write.
+`stripeService.resolveUserPaymentMethod(user, userId).customerId` (ENG-2571). A payment method is pinned on
+the invoice (`default_payment_method`) ONLY when the customer has no invoice default — an invoice's own
+method overrides the customer's for every automatic retry, so pinning would keep charging the old card after
+the owner updates theirs. An invoice Stripe already collected when settlement adopts it is recorded `paid`. Records older than 12 months are pruned in the same write.
 
 **Webhooks.** `handleInvoicePaymentSucceeded/Failed` hand any `metadata.purchaseType === 'payg_overage'`
 invoice to `paygSettlementService` before touching anything, so an overage invoice never writes
@@ -125,20 +131,45 @@ under their own payment-history types, `payg_overage_payment_succeeded` / `payg_
   heldReason?, nothingToBillReason?, invoicedAt?, paidAt?, failedAt?, refundedCents?, dispute?}`.
 `sanitizeUserForResponse` drops `paygSettlements` and `llmUsageCreditsClosed`.
 
-**Emails.** Copy in one place: `utils/paygSettlementCopy.ts` (needs copy review). Invoice created: the
-month and the percent of the cap only, plus the Stripe invoice link — no dollars. Payment failed: PAYG on
-hold, update the card and pay the invoice.
+**Invoice lifecycle (webhooks beyond paid/failed).** The Stripe webhook endpoint **must subscribe to**
+`invoice.voided`, `invoice.marked_uncollectible`, `invoice.payment_action_required` and
+`charge.dispute.closed` (besides the invoice paid/failed and dispute/refund events it already has).
+- `invoice.voided` (support forgave it): the month becomes `written_off` (`writtenOffReason: invoice_voided`,
+  invoice id kept), a payment-failure suspension is lifted once no other month is `failed` (never a
+  dispute), one on-call alert. Settlement never re-invoices it (only a hand-set `retry` would, after a search).
+- `invoice.marked_uncollectible`: the month stays (or becomes) `failed` with PAYG suspended, `uncollectibleAt`
+  recorded; the invoice can still be paid on its hosted page, and `invoice.paid` then lifts as usual.
+- `invoice.payment_action_required` (3-D Secure, a mandate): the month stays `invoiced`, nothing is
+  suspended; the owner gets one email with the hosted page to confirm the payment.
+- Disputes: opening one suspends PAYG and pages on-call once. `charge.dispute.closed` won (or a closed
+  inquiry) lifts that dispute hold — becoming a payment-failure hold on another still-failed month if there
+  is one; lost writes the month off (`dispute_lost`), keeps PAYG suspended and pages on-call.
+- Refunds on an overage charge are deduped per charge and cumulative amount (`refund:<charge>:<cents>`).
+- A cancellation scheduled for the period end (`subscription_status: canceling`) keeps PAYG covering, like
+  the plan itself; only `canceled` (or past_due etc.) is `subscription_inactive`.
+- The owner of a suspended account is pointed at the unpaid invoice: `GET /api/subscription/payg` returns
+  `openInvoiceUrl` (newest month still `failed`; owner only, null otherwise; no amount) and the 429
+  `usageBlock` carries `openInvoiceUrl` with `reason: payg_suspended` (owner only). Read from settlement
+  records; no Stripe call.
+
+**Emails.** Copy in one place: `utils/paygSettlementCopy.ts` (needs copy review). Invoice created — sent
+exactly once per month (`emailedAt`, claimed conditionally), by the run or by an `invoice.paid` that beat
+it: the month and the percentage of the **highest** limit the owner had set that month (the bill follows
+that limit, so the percentage matches the amount), plus the Stripe invoice link — no dollars. Payment
+failed: PAYG on hold, update the card and pay the invoice. Payment needs confirming (new): the bank asked
+for confirmation; open the invoice to confirm; PAYG stays on.
 
 **Rollback.** Set `payg_settlement_enabled` to anything but `true`: the sweep stops within ~60s and the
 refund/dispute webhooks return to exactly today's handling. A month left `pending` stays pending (no new
 charge); if the switch returns it resumes with the stored amount and Stripe is searched first, so nothing
-is charged twice. Invoices already issued are Stripe's to collect; their paid/failed webhooks keep being
-recorded. To stop collecting one, void it in Stripe.
+is charged twice. Invoices already issued are Stripe's to collect; their webhooks keep being recorded. To
+stop collecting one, void it in Stripe: the month is written off (never billed again), and if it was the
+only unpaid month the customer's PAYG hold is lifted.
 
 **Follow-ups (known, not fixed here).** A closed high-water mark can be stale if a check raises it in the
 last instant of a month while another rolls it over; a higher mark lost to a month-change race is only
-saved at the next check; `paymentMethodId` can be a non-card default; `mrrCollectionGapService` counts
-paid overage invoices as "has ever paid"; `charge.dispute.closed` is not handled for overage charges; a
+saved at the next check; `mrrCollectionGapService` counts
+paid overage invoices as "has ever paid"; a
 refund of a closed month's top-up after the month ends is not reflected in `llmUsageCreditsClosed`
 (billed less, never more); `capHighWaterMicroUsd` includes revocable top-up credit in the pool it is a
 percentage of (the pool mark excludes it — within the consent given at the time); the gate records the
