@@ -193,7 +193,17 @@ const loginStatusReply = z.union([loginReadyReply, z.object({ status: z.enum(["p
 const renewReply = z.object({ leaseMs: z.number().int().positive() });
 const acceptedLine = z.object({ type: z.literal("accepted"), turnId: z.string(), duplicate: z.boolean(), status: z.enum(["running", "finished", "failed", "aborted"]).optional() });
 
-const EVENT_TYPES: ReadonlySet<string> = new Set(["text", "tool-use", "tool-result", "usage", "entitlement", "alarm", "result"]);
+const count = z.number().finite().nonnegative().optional();
+/** Known events are checked field by field; unknown types are dropped. A known type with wrong fields is BAD_RESPONSE. */
+const EVENT_SHAPES: Record<string, z.ZodTypeAny> = {
+  text: z.object({ delta: z.string() }),
+  "tool-use": z.object({ operationId: z.string(), name: z.string(), input: z.unknown() }),
+  "tool-result": z.object({ operationId: z.string(), ok: z.boolean() }),
+  usage: z.object({ inputTokens: count, outputTokens: count, cacheReadTokens: count, cacheWriteTokens: count }),
+  entitlement: z.object({ observation: z.object({ windows: z.array(z.object({ name: z.string(), utilization: z.number().optional(), resetsAtMs: z.number().optional() })) }) }),
+  alarm: z.object({ hazard: z.unknown() }),
+  result: z.object({ ok: z.boolean(), text: z.string(), errorKind: z.string().optional(), aborted: z.string().optional() }),
+};
 
 export interface TurnStream {
   turnId: string;
@@ -283,8 +293,12 @@ export class LoginHostClient {
         const next = await it.next();
         if (next.done) return;
         const v = next.value as { type?: unknown };
-        // An event type this client does not know is dropped, not guessed at.
-        if (v && typeof v === "object" && typeof v.type === "string" && EVENT_TYPES.has(v.type)) yield next.value as ProviderEvent;
+        if (!v || typeof v !== "object" || typeof v.type !== "string") throw new LoginHostError("BAD_RESPONSE", "event");
+        // An event type this client does not know is dropped, not guessed at; a known one with wrong fields is a bad answer.
+        const shape = Object.prototype.hasOwnProperty.call(EVENT_SHAPES, v.type) ? EVENT_SHAPES[v.type] : undefined;
+        if (!shape) continue;
+        if (!shape.safeParse(next.value).success) throw new LoginHostError("BAD_RESPONSE", "event");
+        yield next.value as ProviderEvent;
       }
     })();
     return { turnId, duplicate, ...(status ? { status } : {}), events, close: () => reply.close() };
