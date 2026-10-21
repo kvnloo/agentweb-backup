@@ -68,15 +68,26 @@ jest.mock('../services/paygOverageService', () => ({
   paygOverageSwitch: { isEnabled: jest.fn() },
 }));
 
+// The runway resolver's own inputs; the read-only test below only needs it to run.
+jest.mock('../services/llmUsageLedgerReader', () => ({
+  ...jest.requireActual('../services/llmUsageLedgerReader'),
+  readBilledLedgerRows: jest.fn(async () => []),
+}));
+jest.mock('../services/llmUsageTelemetry', () => ({
+  ...jest.requireActual('../services/llmUsageTelemetry'),
+  recordUsageTelemetry: jest.fn(async () => {}),
+}));
+
 import { userDb } from '../services/db';
 import { getSubscriptionTypeConfig, getUserSubscriptionType } from '../services/subscriptionService';
 import { resolveEnforcementCostBasisMicroUsd } from '../services/spendEnforcementBasis';
 import { paygOverageSwitch } from '../services/paygOverageService';
-import { checkTokenUsage, getCurrentMonth, toCustomerTokenUsage } from '../services/tokenUsageService';
+import { checkTokenUsage, getCurrentMonth, toCustomerTokenUsage, TURN_ADMISSION } from '../services/tokenUsageService';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
+import { resolveUsageRunway } from '../services/llmUsageRunwayResolverService';
 import { resolveEffectiveModelForUser } from '../controllers/agentModeController';
 import { getCurrentUsageMonth } from '../services/llmUsageCreditService';
-import type { PaygOverageSettings } from '../services/paygOverage';
+import type { PaygAdmittedMonth, PaygOverageSettings } from '../services/paygOverage';
 import { createUserRowFake } from './helpers/userRowFake';
 
 const USD = 1_000_000;
@@ -108,6 +119,7 @@ const payg = (over: Partial<PaygOverageSettings> = {}): PaygOverageSettings => (
   // admission write is not part of every case either.
   admittedMonths: [{
     month: getCurrentUsageMonth(), capHighWaterMicroUsd: 1_000 * USD, tierPoolHighWaterMicroUsd: 1_000 * USD, markupBps: 25_000,
+    spendBasis: 'spend_ledger' as const,
   }],
   updatedBy: OWNER,
   updatedAt: '2026-10-01T00:00:00.000Z',
@@ -122,7 +134,7 @@ function setup(input: {
   user?: Record<string, unknown>;
   tierPolicy?: typeof policy;
 }) {
-  mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: input.spendUsd * USD });
+  mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: input.spendUsd * USD, basis: 'spend_ledger' });
   mockSwitch.mockResolvedValue(input.switchOn ?? true);
   mockTierName.mockResolvedValue('Pro');
   mockTierConfig.mockResolvedValue({
@@ -147,7 +159,7 @@ function setup(input: {
 
 /** Both gates, the way /generate runs them: checkTokenUsage, then the model resolver. */
 async function bothGates() {
-  const status = await checkTokenUsage(OWNER);
+  const status = await checkTokenUsage(OWNER, TURN_ADMISSION);
   const decision = await resolveEffectiveModelForUser({ userId: OWNER, requestedModel: CHOSEN_MODEL });
   return { status, decision };
 }
@@ -197,7 +209,7 @@ describe('ENG-668 PAYG — both gates agree', () => {
 
   it('a reached cap is a 429 that says so, without dollars', async () => {
     setup({ spendUsd: 150 });
-    const status = await checkTokenUsage(OWNER);
+    const status = await checkTokenUsage(OWNER, TURN_ADMISSION);
     expect(status.paygBlock).toEqual({ reason: 'payg_cap_reached' });
     expect(status.overage).toEqual({ active: false, percentOfCap: 100 });
 
@@ -212,24 +224,24 @@ describe('ENG-668 PAYG — both gates agree', () => {
 
   it('a suspension is a 429 with the payment-problem variant', async () => {
     setup({ spendUsd: 120, user: { paygOverage: payg({ suspended: { reason: 'dispute', at: '2026-10-05T00:00:00.000Z' } }) } });
-    const status = await checkTokenUsage(OWNER);
+    const status = await checkTokenUsage(OWNER, TURN_ADMISSION);
     expect(status.allowed).toBe(false);
     expect(toCustomerTokenUsage(status).usageBlock.reason).toBe('payg_suspended');
   });
 
   it('turning PAYG off takes effect on the very next check, with no extra read', async () => {
     setup({ spendUsd: 120, user: { paygOverage: undefined } });
-    await checkTokenUsage(OWNER);
+    await checkTokenUsage(OWNER, TURN_ADMISSION);
     const readsWithoutPayg = mockGetUserById.mock.calls.length;
 
     setup({ spendUsd: 120 });
     mockGetUserById.mockClear();
-    expect((await checkTokenUsage(OWNER)).allowed).toBe(true);
+    expect((await checkTokenUsage(OWNER, TURN_ADMISSION)).allowed).toBe(true);
     expect(mockGetUserById).toHaveBeenCalledTimes(readsWithoutPayg);
 
     setup({ spendUsd: 120, user: { paygOverage: payg({ enabled: false }) } });
     mockGetUserById.mockClear();
-    expect((await checkTokenUsage(OWNER)).allowed).toBe(false);
+    expect((await checkTokenUsage(OWNER, TURN_ADMISSION)).allowed).toBe(false);
     expect(mockGetUserById).toHaveBeenCalledTimes(readsWithoutPayg);
   });
 
@@ -238,7 +250,7 @@ describe('ENG-668 PAYG — both gates agree', () => {
     ['the subscription is not live', { subscription_status: 'past_due' }, 'subscription_inactive'],
   ] as const)('PAYG on but not covering (%s) is a 429 that says why, not the plain block', async (_label, user, paygInactiveReason) => {
     setup({ spendUsd: 120, user });
-    const status = await checkTokenUsage(OWNER);
+    const status = await checkTokenUsage(OWNER, TURN_ADMISSION);
     expect(status.allowed).toBe(false);
     expect(status.paygBlock).toEqual({ reason: 'payg_inactive', paygInactiveReason });
     const block = toCustomerTokenUsage(status).usageBlock;
@@ -248,7 +260,7 @@ describe('ENG-668 PAYG — both gates agree', () => {
 
   it('customer projection exposes only percentages for PAYG', async () => {
     setup({ spendUsd: 120 });
-    const customer = toCustomerTokenUsage(await checkTokenUsage(OWNER));
+    const customer = toCustomerTokenUsage(await checkTokenUsage(OWNER, TURN_ADMISSION));
     expect(customer.overage).toEqual({ active: true, percentOfCap: 40 });
     const json = JSON.stringify(customer);
     expect(json).not.toMatch(/MicroUsd/);
@@ -272,13 +284,13 @@ describe('ENG-668 PAYG — mid-month downgrade (pool high-water)', () => {
 
   it('without the high-water mark the same spend would already be 80% of the cap', async () => {
     setup({ spendUsd: 140, user: { paygOverage: payg({ poolHighWater: undefined }) } });
-    const status = await checkTokenUsage(OWNER);
+    const status = await checkTokenUsage(OWNER, TURN_ADMISSION);
     expect(status.overage).toEqual({ active: true, percentOfCap: 80 });
   });
 
   it('records a rising pool with a conditional write on the high-water mark only', async () => {
     setup({ spendUsd: 10, user: { paygOverage: payg({ poolHighWater: { month: getCurrentUsageMonth(), thresholdMicroUsd: 60 * USD } }) } });
-    await checkTokenUsage(OWNER);
+    await checkTokenUsage(OWNER, TURN_ADMISSION);
 
     expect(mockUpdateUser).toHaveBeenCalledTimes(1);
     const [userId, fields, options] = mockUpdateUser.mock.calls[0];
@@ -294,7 +306,7 @@ describe('ENG-668 PAYG — mid-month downgrade (pool high-water)', () => {
 
   it('the first mark of a new month keeps the previous month\'s as poolHighWaterClosed, conditional on it exactly (PR-2)', async () => {
     setup({ spendUsd: 10, user: { paygOverage: payg({ poolHighWater: { month: '2000-01', thresholdMicroUsd: 999 * USD } }) } });
-    await checkTokenUsage(OWNER);
+    await checkTokenUsage(OWNER, TURN_ADMISSION);
 
     expect(mockUpdateUser).toHaveBeenCalledTimes(1);
     const [, fields, options] = mockUpdateUser.mock.calls[0];
@@ -312,10 +324,10 @@ describe('ENG-668 PAYG — mid-month downgrade (pool high-water)', () => {
   it('a lost high-water race or a failed write never fails the check', async () => {
     setup({ spendUsd: 120, user: { paygOverage: payg({ poolHighWater: undefined }) } });
     mockUpdateUser.mockRejectedValueOnce(Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' }));
-    expect((await checkTokenUsage(OWNER)).allowed).toBe(true);
+    expect((await checkTokenUsage(OWNER, TURN_ADMISSION)).allowed).toBe(true);
     mockUpdateUser.mockRejectedValueOnce(new Error('throttled'));
     const spy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    expect((await checkTokenUsage(OWNER)).allowed).toBe(true);
+    expect((await checkTokenUsage(OWNER, TURN_ADMISSION)).allowed).toBe(true);
     spy.mockRestore();
   });
 });
@@ -324,7 +336,7 @@ describe('ENG-668 PAYG — dark: switch off is byte-identical to before', () => 
   /** The same account with no PAYG anywhere: what both gates returned before ENG-668. */
   async function baseline(spendUsd: number) {
     setup({ spendUsd, tierPayg: undefined, user: { paygOverage: undefined } });
-    const status = await checkTokenUsage(OWNER);
+    const status = await checkTokenUsage(OWNER, TURN_ADMISSION);
     const usage = await getEffectiveLlmUsagePolicy(OWNER);
     const decision = await resolveEffectiveModelForUser({ userId: OWNER, requestedModel: CHOSEN_MODEL });
     return { status, usage, decision };
@@ -333,7 +345,7 @@ describe('ENG-668 PAYG — dark: switch off is byte-identical to before', () => 
   it.each([10, 99.99, 100, 120, 400])('with $%p spent, an opted-in account on a PAYG tier gets exactly the baseline while the switch is off', async (spendUsd) => {
     const before = await baseline(spendUsd);
     setup({ spendUsd, switchOn: false });
-    const status = await checkTokenUsage(OWNER);
+    const status = await checkTokenUsage(OWNER, TURN_ADMISSION);
     const usage = await getEffectiveLlmUsagePolicy(OWNER);
     const decision = await resolveEffectiveModelForUser({ userId: OWNER, requestedModel: CHOSEN_MODEL });
 
@@ -346,7 +358,7 @@ describe('ENG-668 PAYG — dark: switch off is byte-identical to before', () => 
 
   it('an account that never opted in does not read the switch, the tier PAYG config, or write anything', async () => {
     setup({ spendUsd: 120, user: { paygOverage: undefined } });
-    await checkTokenUsage(OWNER);
+    await checkTokenUsage(OWNER, TURN_ADMISSION);
     await getEffectiveLlmUsagePolicy(OWNER);
     expect(mockSwitch).not.toHaveBeenCalled();
     expect(mockUpdateUser).not.toHaveBeenCalled();
@@ -357,7 +369,7 @@ describe('ENG-668 PAYG — dark: switch off is byte-identical to before', () => 
 
   it('a tier with no enforced policy has no pool to go past: PAYG is never consulted', async () => {
     setup({ spendUsd: 500, tierPolicy: { ...policy, enforcementState: 'observe' as any } });
-    const status = await checkTokenUsage(OWNER);
+    const status = await checkTokenUsage(OWNER, TURN_ADMISSION);
     expect(status).not.toHaveProperty('overage');
     expect(mockSwitch).not.toHaveBeenCalled();
   });
@@ -427,7 +439,7 @@ describe('ENG-668 PAYG — opt-in baseline after the pool grows (counted once, n
         }),
       },
     });
-    const status = await checkTokenUsage(OWNER);
+    const status = await checkTokenUsage(OWNER, TURN_ADMISSION);
     expect(status.allowed).toBe(true);
     expect(status.overage).toEqual({ active: true, percentOfCap: 20 });
   });
@@ -481,7 +493,7 @@ describe('ENG-668 PAYG — a stale index snapshot never decides admission past t
       stored = raced;
       throw Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' });
     });
-    const status = await checkTokenUsage(OWNER);
+    const status = await checkTokenUsage(OWNER, TURN_ADMISSION);
     expect(status.allowed).toBe(true);
     expect(status.paygBlock).toBeUndefined();
   });
@@ -498,7 +510,7 @@ describe('ENG-668 PAYG — a stale index snapshot never decides admission past t
     setup({ spendUsd: 120 });
     mockGetUserByIdConsistent.mockRejectedValue(new Error('throttled'));
     const spy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    const status = await checkTokenUsage(OWNER);
+    const status = await checkTokenUsage(OWNER, TURN_ADMISSION);
     spy.mockRestore();
     expect(status.allowed).toBe(true);
   });
@@ -542,10 +554,10 @@ describe('ENG-668 PAYG — the pool high-water mark is kept while PAYG is off', 
 
     // While off: upgrade to a $400 pool and spend $250 of it (checks keep running).
     tierWithPool(400);
-    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 150 * USD });
-    expect((await checkTokenUsage(OWNER)).allowed).toBe(true);
-    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 250 * USD });
-    expect((await checkTokenUsage(OWNER)).allowed).toBe(true);
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 150 * USD, basis: 'spend_ledger' });
+    expect((await checkTokenUsage(OWNER, TURN_ADMISSION)).allowed).toBe(true);
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 250 * USD, basis: 'spend_ledger' });
+    expect((await checkTokenUsage(OWNER, TURN_ADMISSION)).allowed).toBe(true);
     expect(row.paygOverage.poolHighWater).toEqual({ month, thresholdMicroUsd: 400 * USD });
 
     // Downgrade to $100, then re-enable in the same month (the opt-in baseline is kept, by design).
@@ -563,7 +575,7 @@ describe('ENG-668 PAYG — the pool high-water mark is kept while PAYG is off', 
   it('an OFF opt-in keeps today\'s decision exactly: past the pool it is still the plain 429', async () => {
     setup({ spendUsd: 120 });
     storedOwner(payg({ enabled: false, poolHighWater: undefined }));
-    const status = await checkTokenUsage(OWNER);
+    const status = await checkTokenUsage(OWNER, TURN_ADMISSION);
     expect(status.allowed).toBe(false);
     expect(status).not.toHaveProperty('overage');
     expect(status).not.toHaveProperty('paygBlock');
@@ -583,7 +595,7 @@ describe('ENG-668 PAYG — the pool high-water mark is kept while PAYG is off', 
 
   it('while the switch is off, an OFF opt-in is not touched either', async () => {
     setup({ spendUsd: 150, switchOn: false, user: { paygOverage: payg({ enabled: false, poolHighWater: undefined }) } });
-    await checkTokenUsage(OWNER);
+    await checkTokenUsage(OWNER, TURN_ADMISSION);
     expect(mockUpdateUser).not.toHaveBeenCalled();
   });
 });
@@ -619,13 +631,13 @@ describe('ENG-668 PAYG — a refunded top-up does not stay in the pool high-wate
     });
 
     // While the top-up is live the pool is $150, but the mark records only the $100 a refund cannot take.
-    await checkTokenUsage(OWNER);
+    await checkTokenUsage(OWNER, TURN_ADMISSION);
     expect(row.paygOverage.poolHighWater).toEqual({ month, thresholdMicroUsd: 100 * USD });
 
     // Refunded: $140 spent is $40 over the $100 pool = 80% of the 50% cap ($50).
     row.llmUsageCredits = credits([{ id: 'stripe:cs_1', amountUsd: 50 }], [{ grantId: 'stripe:cs_1', amountUsd: 50 }]);
-    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 140 * USD });
-    const status = await checkTokenUsage(OWNER);
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 140 * USD, basis: 'spend_ledger' });
+    const status = await checkTokenUsage(OWNER, TURN_ADMISSION);
     expect(status.allowed).toBe(true);
     expect(status.overage).toEqual({ active: true, percentOfCap: 80 });
   });
@@ -637,7 +649,7 @@ describe('ENG-668 PAYG — a refunded top-up does not stay in the pool high-wate
       llmUsageCredits: credits([{ id: 'stripe:cs_1', amountUsd: 50 }]),
       paygOverage: payg({ capPercentOfPool: 50, poolHighWater: undefined }),
     });
-    const status = await checkTokenUsage(OWNER);
+    const status = await checkTokenUsage(OWNER, TURN_ADMISSION);
     // $140 is inside the live $150 pool: not even past it.
     expect(status.allowed).toBe(true);
     expect(status).not.toHaveProperty('overage');
@@ -651,7 +663,7 @@ describe('ENG-668 PAYG — a refunded top-up does not stay in the pool high-wate
       llmUsageCredits: credits([{ id: `seat-credit:org-1:${month}`, amountUsd: 20 }]),
       paygOverage: payg({ capPercentOfPool: 50, poolHighWater: undefined }),
     });
-    await checkTokenUsage(OWNER);
+    await checkTokenUsage(OWNER, TURN_ADMISSION);
     expect(row.paygOverage.poolHighWater).toEqual({ month, thresholdMicroUsd: 120 * USD });
 
     // Downgrade to a $50 tier (+$20 seat = $70 pool); $110 spent is still inside the month's $120.
@@ -659,7 +671,7 @@ describe('ENG-668 PAYG — a refunded top-up does not stay in the pool high-wate
       name: 'Pro', allowedPages: [], allowedSkills: [], paygOverage: { allowed: true, markupBps: 25_000 },
       llmUsagePolicy: { ...policy, optimizationCostThresholdMicroUsd: 25 * USD, hardCostThresholdMicroUsd: 50 * USD },
     });
-    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 110 * USD });
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 110 * USD, basis: 'spend_ledger' });
     const { status, decision } = await bothGates();
     expect(status.allowed).toBe(true);
     expect(status.overage).toEqual({ active: false, percentOfCap: 0 });
@@ -669,8 +681,8 @@ describe('ENG-668 PAYG — a refunded top-up does not stay in the pool high-wate
 
 describe('ENG-668 PR-2 — the gate records what each month\'s admissions were measured against', () => {
   const month = getCurrentUsageMonth();
-  const entry = (over: Record<string, unknown> = {}) => ({
-    month, capHighWaterMicroUsd: 50 * USD, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 25_000, ...over,
+  const entry = (over: Partial<PaygAdmittedMonth> = {}): PaygAdmittedMonth => ({
+    month, capHighWaterMicroUsd: 50 * USD, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 25_000, spendBasis: 'spend_ledger', ...over,
   });
   function stored(paygOverage: PaygOverageSettings) {
     const fake = createUserRowFake({
@@ -681,12 +693,12 @@ describe('ENG-668 PR-2 — the gate records what each month\'s admissions were m
     mockUpdateUser.mockImplementation(fake.updateUser);
     return fake;
   }
-  const older = { month: '2000-02', capHighWaterMicroUsd: 1, tierPoolHighWaterMicroUsd: 1, markupBps: 10_000 };
+  const older: PaygAdmittedMonth = { month: '2000-02', capHighWaterMicroUsd: 1, tierPoolHighWaterMicroUsd: 1, markupBps: 10_000, spendBasis: 'spend_ledger' };
 
   it('the first PAYG admission of a month records its cap, plan pool and markup, newest first, keeping earlier months', async () => {
     setup({ spendUsd: 120 });
     const fake = stored(payg({ admittedMonths: [older, { ...older, month: '2000-01' }] }));
-    expect((await checkTokenUsage(OWNER)).allowed).toBe(true);
+    expect((await checkTokenUsage(OWNER, TURN_ADMISSION)).allowed).toBe(true);
     expect(fake.row.paygOverage.admittedMonths).toEqual([entry(), older, { ...older, month: '2000-01' }]);
 
     // Later admissions against the same cap, pool and markup write nothing more.
@@ -699,13 +711,13 @@ describe('ENG-668 PR-2 — the gate records what each month\'s admissions were m
     setup({ spendUsd: 120 });
     const fake = stored(payg({ admittedMonths: [entry()] }));
     fake.row = { ...fake.row, paygOverage: { ...fake.row.paygOverage, capPercentOfPool: 200 } };
-    await checkTokenUsage(OWNER);
+    await checkTokenUsage(OWNER, TURN_ADMISSION);
     expect(fake.row.paygOverage.admittedMonths).toEqual([entry({ capHighWaterMicroUsd: 200 * USD })]);
 
     fake.row = { ...fake.row, paygOverage: { ...fake.row.paygOverage, capPercentOfPool: 25 } };
     mockUpdateUser.mockClear();
     // $20 overage is still under a 25% ($25) cap: admitted, measured against the lower cap, nothing written.
-    expect((await checkTokenUsage(OWNER)).allowed).toBe(true);
+    expect((await checkTokenUsage(OWNER, TURN_ADMISSION)).allowed).toBe(true);
     expect(mockUpdateUser).not.toHaveBeenCalled();
     expect(fake.row.paygOverage.admittedMonths).toEqual([entry({ capHighWaterMicroUsd: 200 * USD })]);
   });
@@ -713,24 +725,24 @@ describe('ENG-668 PR-2 — the gate records what each month\'s admissions were m
   it('an account with no list yet gets one', async () => {
     setup({ spendUsd: 120 });
     const fake = stored(payg({ admittedMonths: undefined }));
-    await checkTokenUsage(OWNER);
+    await checkTokenUsage(OWNER, TURN_ADMISSION);
     expect(fake.row.paygOverage.admittedMonths).toEqual([entry()]);
   });
 
   it('nothing is recorded below the pool, past the cap, or while PAYG is off', async () => {
     setup({ spendUsd: 60 });
     const below = stored(payg({ admittedMonths: [] }));
-    await checkTokenUsage(OWNER);
+    await checkTokenUsage(OWNER, TURN_ADMISSION);
     expect(below.row.paygOverage.admittedMonths).toEqual([]);
 
     setup({ spendUsd: 160 });
     const capped = stored(payg({ admittedMonths: [] }));
-    expect((await checkTokenUsage(OWNER)).allowed).toBe(false);
+    expect((await checkTokenUsage(OWNER, TURN_ADMISSION)).allowed).toBe(false);
     expect(capped.row.paygOverage.admittedMonths).toEqual([]);
 
     setup({ spendUsd: 120 });
     const off = stored(payg({ enabled: false, admittedMonths: [] }));
-    expect((await checkTokenUsage(OWNER)).allowed).toBe(false);
+    expect((await checkTokenUsage(OWNER, TURN_ADMISSION)).allowed).toBe(false);
     expect(off.row.paygOverage.admittedMonths).toEqual([]);
   });
 
@@ -739,7 +751,77 @@ describe('ENG-668 PR-2 — the gate records what each month\'s admissions were m
     const fake = stored(payg({ admittedMonths: [older] }));
     // The snapshot the gate decides on is one write behind the row.
     mockGetUserByIdConsistent.mockImplementationOnce(async () => ({ ...fake.row, paygOverage: { ...fake.row.paygOverage, admittedMonths: [] } }));
-    expect((await checkTokenUsage(OWNER)).allowed).toBe(true);
+    expect((await checkTokenUsage(OWNER, TURN_ADMISSION)).allowed).toBe(true);
     expect(fake.row.paygOverage.admittedMonths).toEqual([older]);
+  });
+});
+
+describe('ENG-668 PR-2 — only a turn gate writes PAYG state; reading usage never does (rv4 MINOR 2)', () => {
+  const month = getCurrentUsageMonth();
+  function stored(paygOverage: PaygOverageSettings) {
+    const fake = createUserRowFake({
+      userId: OWNER, email: 'owner@example.com', subscription_status: 'active', has_payment_method: true, paygOverage,
+    });
+    mockGetUserById.mockImplementation(fake.read);
+    mockGetUserByIdConsistent.mockImplementation(fake.read);
+    mockUpdateUser.mockImplementation(fake.updateUser);
+    return fake;
+  }
+  // Past the pool, a rising pool mark from an earlier month, and no admission recorded yet: every
+  // write a check could make is pending.
+  const untouched = () => payg({ admittedMonths: undefined, poolHighWater: { month: '2000-01', thresholdMicroUsd: 1 } });
+
+  it('gate 2 (model resolution, settings view, runway, drivers) decides the same but writes nothing', async () => {
+    setup({ spendUsd: 120 });
+    const fake = stored(untouched());
+    const usage = await getEffectiveLlmUsagePolicy(OWNER);
+    expect(usage.mode.reason).toBe('payg_overage');
+    const decision = await resolveEffectiveModelForUser({ userId: OWNER, requestedModel: CHOSEN_MODEL });
+    expect(decision.effectiveModel).toBe(CHOSEN_MODEL);
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+    expect(fake.row.paygOverage.admittedMonths).toBeUndefined();
+  });
+
+  it('the usage runway is a read: no write', async () => {
+    setup({ spendUsd: 120 });
+    stored(untouched());
+    await resolveUsageRunway(OWNER, { today: `${month}-15` });
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+  });
+
+  it('checkTokenUsage without the turn flag (GET /usage, admin) is a read too; with it, the admission is recorded', async () => {
+    setup({ spendUsd: 120 });
+    const fake = stored(untouched());
+    expect((await checkTokenUsage(OWNER)).allowed).toBe(true);
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+
+    await checkTokenUsage(OWNER, TURN_ADMISSION);
+    expect(fake.row.paygOverage.admittedMonths).toEqual([expect.objectContaining({ month, spendBasis: 'spend_ledger' })]);
+    expect(fake.row.paygOverage.poolHighWater).toEqual({ month, thresholdMicroUsd: 100 * USD });
+  });
+});
+
+describe('ENG-668 PR-2 — the admission record keeps the spend basis it was measured on (rv4 MAJOR 1)', () => {
+  const month = getCurrentUsageMonth();
+  function stored(paygOverage: PaygOverageSettings) {
+    const fake = createUserRowFake({
+      userId: OWNER, email: 'owner@example.com', subscription_status: 'active', has_payment_method: true, paygOverage,
+    });
+    mockGetUserById.mockImplementation(fake.read);
+    mockGetUserByIdConsistent.mockImplementation(fake.read);
+    mockUpdateUser.mockImplementation(fake.updateUser);
+    return fake;
+  }
+
+  it('legacy-counter admissions are recorded as legacy; a later ledger admission makes the month mixed', async () => {
+    setup({ spendUsd: 120 });
+    const fake = stored(payg({ admittedMonths: undefined }));
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 120 * USD, basis: 'legacy' });
+    await checkTokenUsage(OWNER, TURN_ADMISSION);
+    expect(fake.row.paygOverage.admittedMonths).toEqual([expect.objectContaining({ month, spendBasis: 'legacy' })]);
+
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 121 * USD, basis: 'spend_ledger' });
+    await checkTokenUsage(OWNER, TURN_ADMISSION);
+    expect(fake.row.paygOverage.admittedMonths).toEqual([expect.objectContaining({ month, spendBasis: 'mixed' })]);
   });
 });

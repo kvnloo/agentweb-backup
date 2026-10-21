@@ -71,7 +71,7 @@ describe('ENG-668 settlement amount = the gate\'s measurement', () => {
   ];
 
   it.each(cases)('%s', async (_name, input) => {
-    (resolveEnforcementCostBasisMicroUsd as jest.Mock).mockResolvedValue({ rawCostUsedMicroUsd: Math.round(input.spendUsd * USD) });
+    (resolveEnforcementCostBasisMicroUsd as jest.Mock).mockResolvedValue({ rawCostUsedMicroUsd: Math.round(input.spendUsd * USD), basis: 'spend_ledger' });
     const owner = {
       paygOverage: input.account,
       llmUsageCredits: input.credits,
@@ -94,10 +94,11 @@ describe('ENG-668 settlement amount = the gate\'s measurement', () => {
       basePolicy: policy,
       paygTier: async () => ({ allowed: true, markupBps: 10_000 }),
       legacyRawCostUsedMicroUsd: async () => 0,
+      recordAdmission: true,
     });
     expect(gate.mode.reason).toBe('payg_overage');
     expect(written.admittedMonths).toEqual([{
-      month, capHighWaterMicroUsd: gate.overage!.capMicroUsd, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 10_000,
+      month, capHighWaterMicroUsd: gate.overage!.capMicroUsd, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 10_000, spendBasis: 'spend_ledger',
     }]);
 
     const afterGate = { ...input.account, ...written } as PaygOverageSettings;
@@ -114,7 +115,7 @@ describe('ENG-668 settlement amount = the gate\'s measurement', () => {
   });
 
   const admittedAt = (over: Partial<PaygAdmittedMonth> = {}): PaygAdmittedMonth => ({
-    month, capHighWaterMicroUsd: 50 * USD, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 15_000, ...over,
+    month, capHighWaterMicroUsd: 50 * USD, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 15_000, spendBasis: 'spend_ledger', ...over,
   });
   const noCredits = { purchasedMicroUsd: 0, adminGrantedMicroUsd: 0, migrationOffsetMicroUsd: 0 };
   const plain = { credits: noCredits, poolHighWater: { month, thresholdMicroUsd: 100 * USD } };
@@ -149,7 +150,7 @@ describe('ENG-668 settlement amount = the gate\'s measurement', () => {
     };
     const amount = computePaygSettlementAmount({
       month: '2026-09',
-      admitted: { month: '2026-09', capHighWaterMicroUsd: 55 * USD, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 10_000 },
+      admitted: { month: '2026-09', capHighWaterMicroUsd: 55 * USD, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 10_000, spendBasis: 'spend_ledger' },
       inputs: paygMonthInputsFromRow(row, '2026-09', '2026-09')!,
       settledMicroUsd: 130 * USD,
     })!;
@@ -166,7 +167,7 @@ describe('ENG-668 settlement amount = the gate\'s measurement', () => {
 });
 
 describe('ENG-668 admission record merge', () => {
-  const sept = { month: '2026-09', capHighWaterMicroUsd: 50 * USD, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 15_000 };
+  const sept: PaygAdmittedMonth = { month: '2026-09', capHighWaterMicroUsd: 50 * USD, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 15_000, spendBasis: 'spend_ledger' };
   it('writes nothing when an admission changes nothing, and only ever moves toward the customer', () => {
     expect(withPaygAdmission([sept], { ...sept, capHighWaterMicroUsd: 40 * USD, markupBps: 20_000 })).toBeNull();
     expect(withPaygAdmission([sept], { ...sept, capHighWaterMicroUsd: 60 * USD, markupBps: 20_000 }))

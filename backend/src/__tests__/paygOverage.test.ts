@@ -7,7 +7,7 @@
  * opting in is overage.
  */
 import {
-  createPaygOverageSwitch,
+  createExactTrueSwitch,
   evaluatePaygAdmission,
   paygCapMicroUsd,
   paygEffectiveBaselineMicroUsd,
@@ -296,10 +296,10 @@ describe('validatePaygOverageTierConfig', () => {
   });
 });
 
-describe('createPaygOverageSwitch', () => {
+describe('createExactTrueSwitch', () => {
   const build = (getSetting: jest.Mock, clock = { t: 0 }) => ({
     clock,
-    sw: createPaygOverageSwitch({ getSetting, now: () => clock.t, log: jest.fn() }),
+    sw: createExactTrueSwitch({ getSetting, now: () => clock.t, log: jest.fn() }, PAYG_OVERAGE_SETTING),
   });
 
   it.each([
