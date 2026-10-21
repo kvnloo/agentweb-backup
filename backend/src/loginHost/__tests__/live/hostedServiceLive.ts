@@ -106,8 +106,10 @@ async function main() {
     const r2 = (await db.get(id))!;
     check("reconnect-active-epoch-2", again.status === "active" && r2.subHostEpoch === 2 && r2.subNeedsReconnect === false, `epoch=${r2.subHostEpoch}`);
     check("reconnect-keeps-one-slot", (await counter()) === 1);
-    await sleep(3_000);
-    check("old-home-wiped-after-reconnect", homesLeft() === 1, `homes=${homesLeft()}`);
+    // The host wipes the replaced home in its background sweep (every 60 s), not inside the promote: wait for it.
+    const waitStart = Date.now();
+    while (homesLeft() !== 1 && Date.now() - waitStart < 90_000) await sleep(5_000);
+    check("old-home-wiped-after-reconnect", homesLeft() === 1, `homes=${homesLeft()} after ${Math.round((Date.now() - waitStart) / 1000)}s`);
   }
 
   const outcome = await svc.revokeRecord(user, id);
