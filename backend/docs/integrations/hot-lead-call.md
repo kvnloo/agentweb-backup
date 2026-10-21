@@ -875,7 +875,9 @@ mid-call. No cron cleans these up and no operator tool lists them.
   the queue poller after 5 minutes (see What the queue poller does), which resumes a first-attempt job's own
   waiting record and carries a next-attempt job on, including the case where the job's own lock was rejected and the
   record now waits at a later attempt number with no call sid (a replayed callback cannot help that one: `/status`
-  acknowledges a callback for a record that has no call sid, so only the job's re-run recovers it). A row that
+  acknowledges a callback for a record that has no call sid, so only the job's re-run recovers it). A re-run that fails before it could close
+  the record closes it on the way out, looking the record up again to guard the close with the attempt it really waits
+  after; if even that lookup fails, the record is the repair case below. A row that
   FAILED is not re-run by the poller: its error path normally closed the record already, and if that close failed too
   the record is repaired by hand when it has no call sid (Harsha's approval), or healed by replaying the final callback
   when it waits right after an attempt that had a call (a failed row is then cleared and queued again). No call is in

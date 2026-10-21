@@ -14,7 +14,7 @@ jest.mock('../utils/awsHttpOptions', () => ({ buildAwsHttpOptions: () => ({}) })
 jest.mock('../services/usageRecorderService', () => ({ recordVendorUsage: jest.fn().mockResolvedValue(undefined) }));
 
 import { spokenCode } from './helpers/spokenCode';
-import { storedHotLeadCallConfig } from './helpers/hotLeadCallFixtures';
+import { storedConfigFixture } from './helpers/hotLeadCallFixtures';
 
 export {};
 
@@ -25,7 +25,7 @@ const A = 'maaaaaaa';
 const B = 'mbbbbbbb';
 const EVERY_DAY = { days: [0, 1, 2, 3, 4, 5, 6], start: '00:00', end: '24:00' };
 
-const stored = () => storedHotLeadCallConfig({ enabled: false }, [
+const stored = () => storedConfigFixture({ enabled: false }, [
   { id: A, name: 'Dana Lee', phone: '+14155550100', windows: [EVERY_DAY] },
   { id: B, name: 'Sam Ortiz', phone: '+14155550122', windows: [EVERY_DAY] },
 ]);

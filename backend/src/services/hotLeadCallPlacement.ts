@@ -58,8 +58,17 @@ type Closing = 'completed' | 'rejected' | 'errored';
  * caller believes it was closed; the record stays between_attempts, where a redelivered callback can still resolve it.
  */
 export async function closeBetweenAttempts(
-  store: LeadCallStore, listId: string, leadId: string, attemptNo: number | undefined, outcome: string, closing: Closing,
+  store: LeadCallStore,
+  close: {
+    listId: string;
+    leadId: string;
+    /** The attempt that ended; undefined closes whichever attempt the lead's record is waiting after. */
+    attemptNo: number | undefined;
+    outcome: string;
+    closing: Closing;
+  },
 ): Promise<void> {
+  const { listId, leadId, attemptNo, outcome, closing } = close;
   // Only the record of the attempt that ended: a stale job cannot close a later attempt's waiting record.
   const patch = { state: closing === 'completed' ? 'finished' as const : 'failed' as const, outcome, ifAttemptNo: attemptNo };
   let moved: boolean;
@@ -237,13 +246,15 @@ export async function placeMemberCall(input: PlacementInput): Promise<PlacementR
       attemptNo++;
     }
     if (!recordExists) return 'none';
-    await closeBetweenAttempts(context.store, listId, leadId, attemptNo - 1, rejected ? 'place_rejected' : 'no_member_available', rejected ? 'rejected' : 'completed');
+    await closeBetweenAttempts(context.store, {
+      listId, leadId, attemptNo: attemptNo - 1, outcome: rejected ? 'place_rejected' : 'no_member_available', closing: rejected ? 'rejected' : 'completed',
+    });
     return 'closed';
   } catch (err) {
     // After a rejected call the record waits between attempts with no call in flight, so no callback will ever come
     // for it: whatever broke the pass, the record is closed here (a first attempt's job and a next attempt's alike).
     if (rejected) {
-      await closeBetweenAttempts(context.store, listId, leadId, attemptNo - 1, 'next_attempt_failed', 'errored')
+      await closeBetweenAttempts(context.store, { listId, leadId, attemptNo: attemptNo - 1, outcome: 'next_attempt_failed', closing: 'errored' })
         .catch((closeErr) => console.warn('[hotLeadCall] call record not closed', { listId, leadId, error: errorText(closeErr) }));
     }
     throw err;

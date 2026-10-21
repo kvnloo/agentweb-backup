@@ -339,10 +339,60 @@ describe('processHotLeadCallNextAttempt', () => {
     const record = await firstAttemptEnds();
     store.record = { ...store.record!, attemptNo: 3, state: 'between_attempts', triedMemberIds: [ID.c, ID.d, ID.e] };
     expect(record.attemptNo).toBe(1);
-    await closeBetweenAttempts(store, 'list-a', 'lead-a', 2, 'no_member_available', 'completed');
+    await closeBetweenAttempts(store, { listId: 'list-a', leadId: 'lead-a', attemptNo: 2, outcome: 'no_member_available', closing: 'completed' });
     expect(store.record!.state).toBe('between_attempts');
-    await closeBetweenAttempts(store, 'list-a', 'lead-a', 3, 'no_member_available', 'completed');
+    await closeBetweenAttempts(store, { listId: 'list-a', leadId: 'lead-a', attemptNo: 3, outcome: 'no_member_available', closing: 'completed' });
     expect(store.record).toMatchObject({ state: 'finished', outcome: 'no_member_available' });
+  });
+
+  describe('a re-run whose first lookup fails while the record waits after a later attempt', () => {
+    // Attempt 1 ended, its job locked attempt 2, Twilio rejected that call, and the process died: the record waits at
+    // attempt 2 with no call sid and the poller re-runs the job for attempt 1.
+    const waitingAtAttempt2 = async () => {
+      const record = await firstAttemptEnds();
+      store.record = { ...store.record!, attemptNo: 2, state: 'between_attempts', triedMemberIds: [ID.c, ID.d] };
+      return record;
+    };
+    const failOnce = (what: () => void) => { what(); };
+
+    it.each([
+      ['the org read', () => mock(orgDb.getOrgById).mockRejectedValueOnce(new Error('ddb down'))],
+      ['the lead read', () => mock(crmDb.getLeadListById).mockRejectedValueOnce(new Error('ddb down'))],
+    ])('closes the record as failed, guarded with the attempt it really waits after (%s fails)', async (_what, arm) => {
+      const record = await waitingAtAttempt2();
+      failOnce(arm);
+      await expect(processHotLeadCallNextAttempt(nextJob(record))).rejects.toThrow('ddb down');
+      expect(store.record).toMatchObject({ state: 'failed', outcome: 'next_attempt_failed', attemptNo: 2 });
+    });
+
+    it('closes it too when the very first read of the record fails (the guard is looked up again)', async () => {
+      const record = await waitingAtAttempt2();
+      const realGet = store.get.bind(store);
+      let reads = 0;
+      store.get = async () => {
+        if (++reads === 1) throw new Error('ddb down');
+        return realGet();
+      };
+      await expect(processHotLeadCallNextAttempt(nextJob(record))).rejects.toThrow('ddb down');
+      expect(store.record).toMatchObject({ state: 'failed', outcome: 'next_attempt_failed', attemptNo: 2 });
+    });
+  });
+
+  describe('with the kill switch off', () => {
+    // The job reads nothing, so it cannot tell which call or attempt a waiting record belongs to: it closes whichever
+    // waiting record the lead has. Acceptable because the switch is global and the closing is only ever to "disabled".
+    it.each([
+      ['the same call and attempt', {}],
+      ['a later attempt of the same call', { attemptNo: 3 }],
+      ['another call', { jobKey: 'another-call' }],
+    ])('closes the lead\'s waiting record whatever it belongs to (%s) and places nothing', async (_name, over) => {
+      const record = await firstAttemptEnds();
+      store.record = { ...store.record!, ...over };
+      setHotLeadCallEnabledOverride(false);
+      await processHotLeadCallNextAttempt(nextJob(record));
+      expect(store.record).toMatchObject({ state: 'finished', outcome: 'disabled' });
+      expect(provider.placedCalls).toHaveLength(1);
+    });
   });
 
   describe('when closing the waiting record fails', () => {

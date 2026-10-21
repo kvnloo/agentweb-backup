@@ -47,7 +47,7 @@ export const STORED_NUMBER_SID = 'PN' + 'b'.repeat(32);
  * A complete stored `hotLeadCall` org attribute: enabled, a caller number, calling hours 08:00-21:00 in Chicago and
  * every limit at its default. `extra` overrides any field; `team` replaces the one verified person.
  */
-export function storedHotLeadCallConfig(extra: Record<string, unknown> = {}, team: HotLeadCallMember[] = [teamMember('+14155550100')]) {
+export function storedConfigFixture(extra: Record<string, unknown> = {}, team: HotLeadCallMember[] = [teamMember('+14155550100')]) {
   return {
     enabled: true, team,
     twilioNumber: '+14155550111', twilioNumberSid: STORED_NUMBER_SID, leadTypes: ['form_fill'], maxAgeMinutes: 10, maxCallsPerHour: 6,

@@ -12,7 +12,7 @@ import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEnt
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
 import { FakeVoiceProvider } from './helpers/fakeVoiceProvider';
 import { installFakeOrgTable, type FakeOrgTable } from './helpers/fakeOrgTable';
-import { storedHotLeadCallConfig, teamMember } from './helpers/hotLeadCallFixtures';
+import { storedConfigFixture, teamMember } from './helpers/hotLeadCallFixtures';
 
 const OWNER = { userId: 'owner', orgRole: 'owner' };
 const T0 = Date.parse('2026-10-19T12:00:00.000Z');
@@ -21,7 +21,7 @@ const DAY = 24 * 60 * MIN;
 const ids = ['maaaaaaa', 'mbbbbbbb', 'mcccccccc'.slice(0, 8), 'mddddddd', 'meeeeeee'];
 const phone = (i: number) => `+1415555${String(100 + i).padStart(4, '0')}`;
 
-const config = (count = 2) => storedHotLeadCallConfig(
+const config = (count = 2) => storedConfigFixture(
   { enabled: false, twilioNumber: '+14155550999' },
   ids.slice(0, count).map((id, i) => teamMember(phone(i), { id, name: `Person ${i}`, verifiedAt: undefined })),
 );

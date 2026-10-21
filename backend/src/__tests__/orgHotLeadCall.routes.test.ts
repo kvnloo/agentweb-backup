@@ -12,7 +12,7 @@ import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEnt
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
 import { FakeVoiceProvider } from './helpers/fakeVoiceProvider';
 import { installFakeOrgTable, type FakeOrgTable } from './helpers/fakeOrgTable';
-import { EVERY_DAY, storedHotLeadCallConfig, teamMember } from './helpers/hotLeadCallFixtures';
+import { EVERY_DAY, storedConfigFixture, teamMember } from './helpers/hotLeadCallFixtures';
 import { spokenCode } from './helpers/spokenCode';
 
 const A = 'maaaaaaa';
@@ -20,7 +20,7 @@ const B = 'mbbbbbbb';
 const BASE = '/api/orgs/me/hot-lead-call';
 const WEEKDAYS = { days: [1, 2, 3, 4, 5], start: '09:00', end: '17:00' };
 
-const stored = (extra: Record<string, unknown> = {}) => storedHotLeadCallConfig({ enabled: false, ...extra }, [
+const stored = (extra: Record<string, unknown> = {}) => storedConfigFixture({ enabled: false, ...extra }, [
   teamMember('+14155550100'), teamMember('+14155550122', { id: B, name: 'Sam Ortiz', verifiedAt: undefined, windows: [WEEKDAYS] }),
 ]);
 

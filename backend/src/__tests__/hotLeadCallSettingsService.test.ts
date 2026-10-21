@@ -10,7 +10,7 @@ import {
 import { hotLeadCallConfigOf } from '../services/hotLeadCallConfig';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
 import { cloneJson, installFakeOrgTable, type FakeOrgTable } from './helpers/fakeOrgTable';
-import { EVERY_DAY, storedHotLeadCallConfig, teamMember } from './helpers/hotLeadCallFixtures';
+import { EVERY_DAY, storedConfigFixture, teamMember } from './helpers/hotLeadCallFixtures';
 
 const OWNER = { userId: 'owner', orgRole: 'owner' };
 const A = 'maaaaaaa';
@@ -20,7 +20,7 @@ const PHONE_B = '+14155550122';
 const SID = 'PN' + 'b'.repeat(32);
 const WEEKDAYS = { days: [1, 2, 3, 4, 5], start: '09:00', end: '17:00' };
 
-const stored = (extra: Record<string, unknown> = {}) => storedHotLeadCallConfig(extra, [
+const stored = (extra: Record<string, unknown> = {}) => storedConfigFixture(extra, [
   teamMember(PHONE_A), teamMember(PHONE_B, { id: B, name: 'Sam Ortiz', verifiedAt: undefined, windows: [WEEKDAYS] }),
 ]);
 

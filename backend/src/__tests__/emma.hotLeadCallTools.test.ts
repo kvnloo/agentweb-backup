@@ -7,7 +7,7 @@ import { join } from 'path';
 import { orgDb, userDb } from '../services/db';
 import '../emma/hotLeadCallTools';
 import { ConflictError } from '../services/hotLeadCallErrors';
-import { teamMember, MEMBER_ID, EVERY_DAY, storedHotLeadCallConfig, STORED_NUMBER_SID } from './helpers/hotLeadCallFixtures';
+import { teamMember, MEMBER_ID, EVERY_DAY, storedConfigFixture, STORED_NUMBER_SID } from './helpers/hotLeadCallFixtures';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
 import { SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS } from '../services/agentMode/core/toolDispatch';
 
@@ -21,7 +21,7 @@ const cfg = (): Record<string, unknown> => {
   if (!org.hotLeadCall) throw new Error('test org has no stored hotLeadCall');
   return org.hotLeadCall;
 };
-const stored = () => storedHotLeadCallConfig();
+const stored = () => storedConfigFixture();
 const team = () => cfg().team as Array<Record<string, unknown>>;
 beforeEach(() => {
   jest.clearAllMocks();

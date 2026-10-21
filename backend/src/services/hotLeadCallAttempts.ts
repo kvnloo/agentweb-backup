@@ -8,7 +8,7 @@ import { resolveHotLeadCallContext, type HotLeadCallContext } from './voice/hotL
 import { isHotLeadCallEntitled } from './voice/hotLeadCallEntitlement';
 import { isHotLeadCallEnabled } from './voice/hotLeadCallMode';
 import { getLeadCallStore } from './voice/leadCallStore';
-import type { HotLeadCallRecord } from './voice/leadCallStore.types';
+import type { HotLeadCallRecord, LeadCallStore } from './voice/leadCallStore.types';
 
 export const NEXT_ATTEMPT_SOURCE = 'hot_lead_call_next';
 
@@ -110,10 +110,27 @@ export async function processHotLeadCallNextAttempt(job: NextAttemptJob): Promis
     await placeNextAttempt(job, progress);
   } catch (err) {
     // The original error is the one to report; a close that fails as well leaves the record for a redelivery to heal.
-    await closeBetweenAttempts(getLeadCallStore(), job.listId, job.leadId, progress.endedAttempt, 'next_attempt_failed', 'errored')
+    // The error may have come before the record was read, while it waits after a LATER attempt of this call (a re-run):
+    // look once more so the close is guarded with the attempt the record is really waiting after.
+    const store = getLeadCallStore();
+    const attemptNo = await waitingAttemptOf(store, job) ?? progress.endedAttempt;
+    await closeBetweenAttempts(store, { listId: job.listId, leadId: job.leadId, attemptNo, outcome: 'next_attempt_failed', closing: 'errored' })
       .catch((closeErr) => console.warn('[hotLeadCall] call record not closed', { listId: job.listId, leadId: job.leadId, error: errorText(closeErr) }));
     throw err;
   }
+}
+
+/** The attempt the lead's record is waiting after, when it is this call's and waiting; undefined when that cannot be read. */
+async function waitingAttemptOf(store: LeadCallStore, job: NextAttemptJob): Promise<number | undefined> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const record = await store.get(job.listId, job.leadId);
+      return record && record.jobKey === job.jobKey && record.state === 'between_attempts' ? record.attemptNo : undefined;
+    } catch {
+      // Tried once more; a record that cannot be read stays for the repair described in the runbook.
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -128,7 +145,7 @@ async function placeNextAttempt(job: NextAttemptJob, progress: { endedAttempt: n
     // No read and no call, but the record must not wait for a next attempt that will never come: one conditional
     // write closes it if (and only if) it is waiting between attempts.
     // Without a read there is no attempt number to guard with: any waiting record of the lead is closed.
-    await closeBetweenAttempts(store, listId, leadId, undefined, 'disabled', 'completed');
+    await closeBetweenAttempts(store, { listId, leadId, attemptNo: undefined, outcome: 'disabled', closing: 'completed' });
     return;
   }
 
@@ -141,13 +158,15 @@ async function placeNextAttempt(job: NextAttemptJob, progress: { endedAttempt: n
 
   const loaded = await loadNextAttemptContext(listId, record, job.orgId);
   if ('refusal' in loaded) {
-    await closeBetweenAttempts(store, listId, leadId, ended, loaded.refusal === 'disabled' ? 'disabled' : 'no_member_available', 'completed');
+    await closeBetweenAttempts(store, {
+      listId, leadId, attemptNo: ended, outcome: loaded.refusal === 'disabled' ? 'disabled' : 'no_member_available', closing: 'completed',
+    });
     return;
   }
   const { ctx: { config }, now } = loaded;
   const callerNumber = config.twilioNumber;
   if (!callerNumber) {
-    await closeBetweenAttempts(store, listId, leadId, ended, 'no_member_available', 'completed');
+    await closeBetweenAttempts(store, { listId, leadId, attemptNo: ended, outcome: 'no_member_available', closing: 'completed' });
     return;
   }
 
