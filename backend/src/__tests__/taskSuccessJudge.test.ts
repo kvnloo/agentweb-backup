@@ -1,9 +1,11 @@
 import { buildAgentRunTrace, type TraceMessageRow } from '../services/agentRunTrace';
 import {
   judgeTaskSuccess,
+  labelTaskSuccess,
   renderTraceForJudge,
   TASK_SUCCESS_JUDGE_PROMPT,
   TASK_SUCCESS_JUDGE_VERSION,
+  TASK_SUCCESS_LABELLER_PROMPT,
 } from '../services/taskSuccessJudge';
 import type { RubricJudgeLlm, RubricJudgeLlmRequest } from '../services/creativeRubricJudge';
 import { defaultGoldenCaseGraders, taskSuccessJudgeGrader } from '../loops/eval/runValidation';
@@ -175,6 +177,23 @@ describe('judgeTaskSuccess', () => {
   });
 });
 
+describe('labelTaskSuccess', () => {
+  it('labels with the rubric-only prompt on GPT-5.4 by default, with room for reasoning', async () => {
+    const llm = fakeLlm('{"reason":"The email never went out.","verdict":"fail"}');
+    expect(await labelTaskSuccess({ trace: emailRun() }, { llm })).toMatchObject({ status: 'ok', verdict: 'fail', model: 'gpt-5.4' });
+    expect(llm.requests[0]).toMatchObject({ model: 'gpt-5.4', system: TASK_SUCCESS_LABELLER_PROMPT, maxTokens: 16_000 });
+    expect(TASK_SUCCESS_LABELLER_PROMPT).not.toContain('checklist');
+  });
+
+  it("refuses a labeller from the judge's or the agent's model family", async () => {
+    const llm = fakeLlm('{"reason":"x","verdict":"pass"}');
+    for (const model of ['anthropic.claude-sonnet-5', 'gemini-3.8-flash', 'not-a-model']) {
+      expect(await labelTaskSuccess({ trace: emailRun() }, { llm, model })).toMatchObject({ status: 'error', reason: expect.stringMatching(/outside the judge's/) });
+    }
+    expect(llm.requests).toHaveLength(0);
+  });
+});
+
 describe('taskSuccessJudgeGrader', () => {
   const goldenCase = { caseId: 'agent#sessionId#s1', sourceRef: { kind: 'sessionId', id: 's1' } } as unknown as GoldenCase;
 
@@ -202,11 +221,13 @@ describe('defaultGoldenCaseGraders', () => {
 
 describe('parseTrialArgs', () => {
   it('defaults to the test split, a $3 cap and the default judge model', () => {
-    expect(parseTrialArgs([])).toEqual({ split: 'test', maxUsd: 3, model: 'anthropic.claude-sonnet-5', allAgentCases: false });
+    expect(parseTrialArgs([])).toEqual({ split: 'test', maxUsd: 3, model: 'anthropic.claude-sonnet-5', allAgentCases: false, labeller: false });
   });
 
   it('reads every flag and rejects unknown or invalid ones', () => {
     expect(parseTrialArgs(['--split', 'dev', '--max-usd', '1.5', '--out', 'v.json', '--all-agent-cases'])).toMatchObject({ split: 'dev', maxUsd: 1.5, out: 'v.json', allAgentCases: true });
+    expect(parseTrialArgs(['--labeller'])).toMatchObject({ labeller: true, model: 'gpt-5.4' });
+    expect(parseTrialArgs(['--labeller', '--model', 'openai/gpt-5.2'])).toMatchObject({ labeller: true, model: 'openai/gpt-5.2' });
     expect(() => parseTrialArgs(['--split', 'prod'])).toThrow(/invalid argument/);
     expect(() => parseTrialArgs(['--max-usd', '0'])).toThrow(/invalid argument/);
   });
