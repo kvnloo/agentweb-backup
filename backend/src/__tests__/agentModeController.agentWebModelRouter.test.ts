@@ -65,6 +65,7 @@ jest.mock('../services/agentModeService', () => {
       getSupportedModelsWithMetadata: jest.fn(async () => served.map((id) => ({ id, name: id, tier: 'medium', description: 'd', provider: 'other' }))),
     },
     AgentModeService: jest.fn(),
+    normalizeWorkPlanTitleForMatch: (title: string) => title.toLowerCase().replace(/[\s_-]+/g, ' ').trim(),
   };
 });
 jest.mock('../services/agentMode/concurrentGenerationCap', () => {
@@ -244,8 +245,10 @@ beforeEach(() => {
   storeSession(baseSession(DEFAULT_MODEL, { llmModelSource: 'system' }));
 });
 
-describe('switch OFF: byte-identical to before', () => {
-  it('/generate refuses the id with exactly the unknown-model 422, writes and runs nothing', async () => {
+const AW_UNAVAILABLE = 'AgentWeb Model isn\'t available right now. Choose another model to continue.';
+
+describe('switch OFF: as before the router (the id is an unknown model), with the AgentWeb Model sentence', () => {
+  it('/generate refuses the id with the same 422 as an unknown model (code, reason, id), worded by name; writes and runs nothing', async () => {
     const unknown = makeRes();
     await agentModeController.generateResponse(generateReq({ llmModel: 'retired-model-9' }), unknown);
     const res = makeRes();
@@ -253,8 +256,9 @@ describe('switch OFF: byte-identical to before', () => {
 
     expect(res.statusCode).toBe(422);
     expect(unknown.statusCode).toBe(422);
-    expect(res.body).toEqual(buildModelUnavailableBody(new ModelUnavailableError(AW, 'not_served')));
+    expect(res.body).toEqual({ error: AW_UNAVAILABLE, code: 'model_unavailable', requestedModel: AW, reason: 'not_served' });
     expect(unknown.body).toEqual(buildModelUnavailableBody(new ModelUnavailableError('retired-model-9', 'not_served')));
+    expect(Object.keys(res.body).sort()).toEqual(Object.keys(unknown.body).sort());
     expect(mockWorker.runInWorker).not.toHaveBeenCalled();
     expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
     expect(tableReads()).toHaveLength(0);
@@ -492,10 +496,15 @@ describe('switch ON', () => {
     expect(mockWorker.runInWorker).not.toHaveBeenCalled();
   });
 
-  it('a stale routed decision describing another model stamps nothing on the reply', async () => {
-    storeSession(baseSession(AW, { llmModelSource: 'user', llmUsagePolicyDecision: { ...ROUTED_DECISION, effectiveModel: OTHER } }));
+  it('only a turn its caller routed is stamped: the session\'s stored routed decision is never read back', async () => {
+    // The stored decision describes an earlier routed turn on the SAME model; this turn's caller did not route it.
+    storeSession(baseSession(AW, { llmModelSource: 'user', llmUsagePolicyDecision: ROUTED_DECISION }));
     await generateSessionResponse(SESSION_ID, 'hi', OWNER, ROUTED_CHAT);
-    expect(workerCall().modelRouting).toBeUndefined();
+    expect(workerCall(0).modelRouting).toBeUndefined();
+    // ...and a caller decision for another model stamps nothing either.
+    await generateSessionResponse(SESSION_ID, 'hi', OWNER, OTHER, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, false, undefined, undefined, undefined, false, undefined, ROUTED_DECISION as any);
+    expect(workerCall(1).modelRouting).toBeUndefined();
   });
 
   it('the picker PATCH stores the selection as the user\'s pick; refuses it with 422 when the router is unavailable', async () => {
@@ -640,5 +649,217 @@ describe('switch ON: Work Plan step models (ENG-2378) with the AgentWeb Model', 
     expect(store.get().llmModel).toBe(AW);
     expect(store.get().workPlan.pickedModel).toBe(AW);
     expect(store.get().workPlan.engineModel).toBe(OTHER);
+  });
+});
+
+/* ============ ENG-669 PR-C review round (rv-3677): adapted from the reviewer's probes ============ */
+import { filterMessagesForClient } from '../utils/adminOnlyMessageFilter';
+import { resolveEffectiveModelForUser } from '../controllers/agentModeController';
+import { offersAgentWebModel } from '../services/agentMode/agentWebModelRouterInstance';
+import { workPlanService } from '../services/workPlanService';
+
+const ownerTier = (tier: string) => {
+  (getUserSubscriptionResolution as jest.Mock).mockResolvedValue({ subscriptionType: tier, resolved: true });
+  modelAccess.reset();
+};
+const shareReq = () => ({ params: { shareId: SESSION_ID }, query: { conversable: 'tok' }, body: { userMessage: 'hi' }, headers: {}, on: jest.fn() } as any);
+const rollback = () => { delete mockSettings[AGENTWEB_MODEL_ROUTER_SETTING]; agentWebModelRouter.reset(); };
+
+describe('MAJOR 1: the owner\'s plan never reaches a share viewer through the routing provenance', () => {
+  it('a plan-override route is stamped without the tier name, and share / conversable reads strip the routing fields', async () => {
+    turnOn({ version: 't1', default: ROUTED_SCHEDULED, tiers: { Enterprise: { routes: { chat: ROUTED_CHAT } } } });
+    mockSettings.subscription_types = JSON.stringify([{ name: 'Enterprise' }, { name: 'Free' }]);
+    ownerTier('Enterprise');
+    const store = storeSession(baseSession(AW, { llmModelSource: 'user', shareMetadata: { isShared: true } }));
+    const res = makeRes();
+    await agentModeController.generateSharedResponse(shareReq(), res);
+    expect(res.statusCode).toBe(200);
+    const stamp = workerCall().modelRouting;
+    expect(stamp).toEqual({ llmSelected: AW, llmRoutingReason: 'chat task: plan route', llmRoutingTableVersion: 't1' });
+    expect(JSON.stringify(stamp)).not.toContain('Enterprise');
+
+    // What the worker persists is then served to viewers: the share read and the conversable read strip it.
+    store.set({ messages: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'OK', llm: ROUTED_CHAT, ...stamp }] });
+    const view = makeRes();
+    await agentModeController.getSharedConversation({ params: { shareId: SESSION_ID }, query: {} } as any, view);
+    expect(view.statusCode).toBe(200);
+    const served = view.body.session.messages.find((m: any) => m.role === 'assistant');
+    expect(served).toMatchObject({ llm: ROUTED_CHAT, content: 'OK' });
+    expect(served).not.toHaveProperty('llmSelected');
+    expect(served).not.toHaveProperty('llmRoutingReason');
+    expect(served).not.toHaveProperty('llmRoutingTableVersion');
+  });
+
+  it('the non-owner message filter strips the routing fields; the owner filter keeps them', () => {
+    const message = { role: 'assistant', content: 'x', llm: ROUTED_CHAT, ...STAMP };
+    expect(filterMessagesForClient([message], { omitBranchOrigin: true })[0]).toEqual({ role: 'assistant', content: 'x', llm: ROUTED_CHAT });
+    expect(filterMessagesForClient([message])[0]).toEqual(message);
+  });
+});
+
+describe('MAJOR 2: a STORED AgentWeb Model selection the router cannot serve is refused visibly on every path', () => {
+  const expectRefused = (res: any) => {
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toEqual({ error: AW_UNAVAILABLE, code: 'model_unavailable', requestedModel: AW, reason: 'not_served' });
+  };
+  const expectUntouched = (store: { get: () => any }) => {
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    expect(store.get().llmModel).toBe(AW);
+  };
+  // Switch off (a rollback), and switch on but the router unavailable for this owner's tier.
+  const states: Array<[string, () => void]> = [
+    ['the switch is off', () => { turnOn(); rollback(); }],
+    ['the router is unavailable for the owner\'s tier', () => { turnOn({ ...TABLE, tiers: { Free: { routes: { chta: ROUTED_CHAT } } } }); mockSettings.subscription_types = JSON.stringify([{ name: 'Free' }]); }],
+  ];
+
+  describe.each(states)('when %s', (_label, setUp) => {
+    beforeEach(() => setUp());
+
+    it('interactive share turn: 422, never the default, the stored selection kept', async () => {
+      const store = storeSession(baseSession(AW, { llmModelSource: 'user' }));
+      const res = makeRes();
+      await agentModeController.generateSharedResponse(shareReq(), res);
+      expectRefused(res);
+      expectUntouched(store);
+    });
+
+    it('conversable turn: 422', async () => {
+      const store = storeSession(baseSession(AW, { llmModelSource: 'user', llmUsagePolicyDecision: ROUTED_DECISION }));
+      const res = makeRes();
+      await agentModeController.generateConversableResponse({ body: { userMessage: 'hi' }, conversableSession: store.get(), on: jest.fn() } as any, res);
+      expectRefused(res);
+      expectUntouched(store);
+    });
+
+    it('/generate with NO model in the body (MCP/API callers): 422', async () => {
+      const store = storeSession(baseSession(AW, { llmModelSource: 'user' }));
+      const res = makeRes();
+      await agentModeController.generateResponse(generateReq({}), res);
+      expectRefused(res);
+      expectUntouched(store);
+    });
+
+    it('/generate with the portal echo: 422', async () => {
+      const store = storeSession(baseSession(AW, { llmModelSource: 'user' }));
+      const res = makeRes();
+      await agentModeController.generateResponse(generateReq({ llmModel: AW }), res);
+      expectRefused(res);
+      expectUntouched(store);
+    });
+
+    it('verified-generate on the stored selection: 422', async () => {
+      const store = storeSession(baseSession(AW, { llmModelSource: 'user' }));
+      const res = makeRes();
+      await agentModeController.verifiedGenerate({
+        user: { userId: OWNER },
+        body: { sessionId: SESSION_ID, startingMessage: 'do it', requiredFunctions: [], keywords: [], attachments: [], maxAttempts: 1 },
+        on: jest.fn(),
+      } as unknown as Request, res);
+      expectRefused(res);
+      expectUntouched(store);
+    });
+
+    it('branch inheriting the selection (the resolver with allowSilentSwap, as chatBranchController calls it): refused, never corrected', async () => {
+      const session = baseSession(AW, { llmModelSource: 'user' });
+      await expect(resolveEffectiveModelForUser({ userId: OWNER, requestedModel: AW, allowSilentSwap: true, session }))
+        .rejects.toMatchObject({ code: 'model_unavailable', requestedModel: AW, reason: 'not_served' });
+    });
+  });
+});
+
+describe('MAJOR 4: a malformed tier override takes down only that tier', () => {
+  it.each([
+    ['an unknown route key', { Pro: { routes: { chta: ROUTED_SCHEDULED } } }],
+    ['an empty default', { Pro: { default: '' } }],
+    ['a non-string target', { Pro: { routes: { chat: 5 } } }],
+  ])('%s in tiers.Pro: Free still routes, Pro is refused, one alert names Pro', async (_label, tiers) => {
+    turnOn({ version: 't1', default: ROUTED_CHAT, tiers });
+    mockSettings.subscription_types = JSON.stringify([{ name: 'Free' }, { name: 'Pro' }]);
+    ownerTier('Free');
+    const free = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: AW }), free);
+    expect(free.statusCode).toBe(200);
+    expect(workerCall().llmModel).toBe(ROUTED_CHAT);
+
+    ownerTier('Pro');
+    const pro = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: AW }), pro);
+    expect(pro.statusCode).toBe(422);
+    expect(pro.body).toMatchObject({ requestedModel: AW, reason: 'not_served' });
+    const routerAlerts = mockAlert.mock.calls.map(([a]) => a.dedupeKey).filter((k) => String(k).startsWith('agentweb_model_router:'));
+    expect(routerAlerts).toEqual(['agentweb_model_router:tier:Pro']);
+  });
+});
+
+describe('MINOR c: an admin-authored plan\'s router pin is checked against the LAUNCHER\'s tier at launch', () => {
+  const plan = { planId: 'p1', title: 'Router plan', visibility: 'system', isBuiltIn: true, defaultModel: AW, steps: [{ stepCount: 1, title: 'S1' }] };
+  const launch = async () => {
+    const res = makeRes();
+    await agentModeController.createSessionWithPlan({ params: { planTitle: 'Router plan' }, body: {}, query: {}, headers: {}, on: jest.fn() } as any, res);
+    return res;
+  };
+  beforeEach(() => {
+    turnOn({ ...TABLE, tiers: { Free: { routes: { chta: ROUTED_CHAT } } } }); // the router is unavailable for Free only
+    mockSettings.subscription_types = JSON.stringify([{ name: 'Free' }, { name: 'Pro' }]);
+    Object.assign(workPlanService as any, {
+      getWorkPlansByVisibility: jest.fn(async (visibility: string) => (visibility === 'system' ? [plan] : [])),
+      getWorkPlansByOwner: jest.fn(async () => []),
+      getWorkPlansByOrg: jest.fn(async () => []),
+    });
+    mockTokenUser.user = { userId: OWNER, isAdmin: false };
+  });
+  afterEach(() => { mockTokenUser.user = undefined; });
+
+  it('refused with a visible 422 naming the AgentWeb Model for a launcher whose tier it cannot route; nothing is created', async () => {
+    ownerTier('Free');
+    const res = await launch();
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toMatchObject({ code: 'model_unavailable', requestedModel: AW, reason: 'not_served' });
+    expect(res.body.error).toContain('(AgentWeb Model)');
+    expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+  });
+
+  it('launches for a launcher whose tier it routes, storing the selection', async () => {
+    ownerTier('Pro');
+    const res = await launch();
+    expect(mockChatbotDb.createChatSession).toHaveBeenCalled();
+    expect(mockChatbotDb.updateSessionLlmModel.mock.calls[0][1]).toBe(AW);
+    expect(res.statusCode).not.toBe(422);
+  });
+});
+
+describe('MINOR e: customer copy names the AgentWeb Model, never the raw id', () => {
+  it('a step pinned to the router pauses with the display name when the router is off (no page)', async () => {
+    const honor = jest.spyOn(workPlanStepModels, 'shouldHonor').mockResolvedValue(true);
+    storeSession(baseSession(OTHER, {
+      llmModelSource: 'user',
+      workPlan: { title: 'P', planAuthor: 'user', launchModelSource: 'user', launchModel: OTHER, createdAt: 'x', updatedAt: 'x',
+        steps: [{ stepCount: 1, title: 'S1', status: 'pending', model: AW, modelSource: 'user' }] },
+    }));
+    const out = await generateSessionResponse(SESSION_ID, 'go', OWNER, OTHER);
+    honor.mockRestore();
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    expect(out.content).toContain('Step 1 uses AgentWeb Model, which is unavailable right now.');
+    expect(out.content).not.toContain(AW);
+    expect(mockAlert.mock.calls.filter(([a]) => String(a.subject).includes('Work Plan paused'))).toHaveLength(0);
+  });
+
+  it('a refusal outside the plan names the AgentWeb Model', async () => {
+    turnOn();
+    allowlist([ROUTED_CHAT]);
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: AW }), res);
+    expect(res.statusCode).toBe(422);
+    expect(res.body.error).toContain('(AgentWeb Model)');
+    expect(res.body.error).not.toContain(AW);
+  });
+});
+
+describe('admin pickers', () => {
+  it('the catalog still offers the AgentWeb Model to an admin (the plan step-model picker routes it); benchmark and default-model pickers drop it client-side and the server refuses it there', async () => {
+    turnOn();
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'admin-1', isAdmin: true });
+    expect(await offersAgentWebModel('admin-1')).toBe(true);
   });
 });

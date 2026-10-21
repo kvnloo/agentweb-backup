@@ -387,11 +387,26 @@ describe('runScheduledChat: AgentWeb Model pin (ENG-669 PR-C)', () => {
     expect(mockChatbotDb.updateSessionLlmModel.mock.calls.map((c) => c[1])).not.toContain('gpt-5.5');
   });
 
-  it('switch off: the pin fails the run like any unserved model; nothing runs', async () => {
+  it('switch off: the pin fails the run visibly, naming the AgentWeb Model; nothing runs, nobody is paged', async () => {
     const result: any = await runScheduledChat({ ...baseSchedule, llmModel: 'agentweb-model' }, USER, false, 'run-aw-2');
     await flushAsync();
     expect(result).toMatchObject({ status: 'failure', passed: false });
-    expect(result.actualResponse).toContain('model_unavailable: pinned model "agentweb-model" is not served');
+    expect(result.actualResponse).toBe(
+      'model_unavailable: AgentWeb Model is unavailable right now — choose another model for this schedule, or try again later',
+    );
     expectNothingRan();
+    expect(mockAlert).not.toHaveBeenCalled();
+  });
+
+  it('one broken routing table and three pinned schedules: exactly ONE on-call alert (the router\'s), no per-schedule pages', async () => {
+    mockSettings.agentweb_model_router_enabled = 'true';
+    mockSettings.agentweb_model_routing_table = '{not json';
+    for (const id of ['s1', 's2', 's3']) {
+      const result: any = await runScheduledChat({ ...baseSchedule, scheduleId: id, llmModel: 'agentweb-model' }, USER, false, `run-${id}`);
+      expect(result.status).toBe('failure');
+      expect(result.actualResponse).toContain('AgentWeb Model is unavailable right now');
+    }
+    await flushAsync();
+    expect(mockAlert.mock.calls.map(([a]) => a.dedupeKey)).toEqual(['agentweb_model_router:unavailable']);
   });
 });
