@@ -84,8 +84,9 @@ describe('findUnappliedCreativeFields', () => {
       { asset_feed_spec: { descriptions: [{ text: 'D' }] } })).toEqual([]);
   });
 
-  it('does not check description for carousels, and ignores unrequested fields', () => {
-    expect(findUnappliedCreativeFields({ description: 'D', carousel_cards: [{}, {}] }, {})).toEqual([]);
+  it('always flags a carousel description (no slot to write it), and ignores unrequested fields', () => {
+    expect(findUnappliedCreativeFields({ description: 'D', carousel_cards: [{}, {}] }, {})).toEqual(['description']);
+    expect(findUnappliedCreativeFields({ carousel_cards: [{}, {}] }, {})).toEqual([]);
     expect(findUnappliedCreativeFields({}, {})).toEqual([]);
   });
 

@@ -36,13 +36,15 @@ export function findUnappliedCreativeFields(
     if (liveIg !== requested.instagram_user_id) missing.push('instagram_user_id');
   }
 
-  // Carousel creatives have no creative-level description slot, so only check where one is written.
-  if (requested.description && !requested.carousel_cards?.length) {
-    const liveDescription = requested.placement_assets?.length
-      ? live.asset_feed_spec?.descriptions?.some((d) => d?.text === requested.description)
-      : requested.video_id
-        ? spec?.video_data?.link_description === requested.description
-        : spec?.link_data?.description === requested.description;
+  if (requested.description) {
+    // Carousel creatives have no creative-level description slot, so it is never written: always unapplied.
+    const liveDescription = requested.carousel_cards?.length
+      ? false
+      : requested.placement_assets?.length
+        ? live.asset_feed_spec?.descriptions?.some((d) => d?.text === requested.description)
+        : requested.video_id
+          ? spec?.video_data?.link_description === requested.description
+          : spec?.link_data?.description === requested.description;
     if (!liveDescription) missing.push('description');
   }
 
