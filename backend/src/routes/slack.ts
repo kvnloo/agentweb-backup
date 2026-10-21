@@ -1523,6 +1523,23 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                     }
                     return;
                   }
+                  // ENG-669 PR-C: the chat's model was refused (runVerifiedChat saved the refusal to the chat). Only the
+                  // owner can fix it: tell the reviewer what to do, and do not page on-call (not an outage).
+                  const { isModelUnavailableError } = await import('../services/agentMode/modelUnavailable');
+                  if (isModelUnavailableError(error)) {
+                    console.warn(`Agent Mode revision for session ${agentSessionId} refused: model_unavailable (${error.reason}).`);
+                    if (originalApproval.slackChannel) {
+                      const { modelRefusalReviewerNotice } = await import('../utils/modelRefusalReviewerNotice');
+                      await postSlackMessage(
+                        originalApproval.slackChannel,
+                        await modelRefusalReviewerNotice(error),
+                        originalApproval.slackMessageTs || undefined,
+                      ).catch((slackErr: any) =>
+                        console.warn('❌ Failed to post model-refusal notice to Slack:', slackErr?.message || slackErr),
+                      );
+                    }
+                    return;
+                  }
                   console.error('❌ Error in Agent Mode verified-generate:', error);
                   try {
                     const isSessionLimit = isSessionLimitError(error);
@@ -1787,6 +1804,23 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                             originalApproval.slackMessageTs || undefined,
                           ).catch((slackErr: any) =>
                             console.warn('❌ Failed to post session-busy notice to Slack:', slackErr?.message || slackErr),
+                          );
+                        }
+                        return;
+                      }
+                      // ENG-669 PR-C: the chat's model was refused (runVerifiedChat saved the refusal to the chat). Only the
+                      // owner can fix it: tell the reviewer what to do, and do not page on-call (not an outage).
+                      const { isModelUnavailableError } = await import('../services/agentMode/modelUnavailable');
+                      if (isModelUnavailableError(error)) {
+                        console.warn(`Agent Mode revision for session ${task.sessionId} refused: model_unavailable (${error.reason}).`);
+                        if (originalApproval.slackChannel) {
+                          const { modelRefusalReviewerNotice } = await import('../utils/modelRefusalReviewerNotice');
+                          await postSlackMessage(
+                            originalApproval.slackChannel,
+                            await modelRefusalReviewerNotice(error),
+                            originalApproval.slackMessageTs || undefined,
+                          ).catch((slackErr: any) =>
+                            console.warn('❌ Failed to post model-refusal notice to Slack:', slackErr?.message || slackErr),
                           );
                         }
                         return;
