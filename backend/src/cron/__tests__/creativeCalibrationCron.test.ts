@@ -42,6 +42,9 @@ function memoryStore(provisioned = true): GoldenSetStore & { rows: Map<string, G
     saveDraft: async () => {
       throw new Error('not used');
     },
+    setExclusion: async () => {
+      throw new Error('not used');
+    },
   };
 }
 
