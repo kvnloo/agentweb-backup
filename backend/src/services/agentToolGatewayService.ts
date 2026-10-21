@@ -973,7 +973,7 @@ export function validateAndRepairToolArgs(
   const lowRiskRepairAllowed = (input.effect ?? classifyToolEffect(input.toolName, input.args)) === 'read';
 
   for (const key of Object.keys(repairedArgs)) {
-    if (properties[key]) continue;
+    if (Object.prototype.hasOwnProperty.call(properties, key)) continue;
 
     // ENG-1668: a common LLM mistake — inventing a wrapper object (e.g.
     // `params: { criterion_resource_name: ... }`) around fields that actually
@@ -1514,7 +1514,7 @@ function findKnownAliasSource(input: {
     for (const key of Object.keys(input.existingArgs)) {
       if (key === input.target) continue;
       // A key that is a real schema property is the caller's own argument, not an alias (ENG-2610).
-      if (input.properties[key]) continue;
+      if (Object.prototype.hasOwnProperty.call(input.properties, key)) continue;
       if (targetAliases.includes(normalizeArgName(key))) return key;
     }
   }
@@ -1533,6 +1533,13 @@ function findKnownAliasSource(input: {
 }
 
 function validateJsonSchemaType(name: string, value: unknown, schema: any): AgentToolContractIssue | null {
+  if (schema === false) {
+    return {
+      code: 'invalid_args',
+      path: `$.${name}`,
+      message: `Argument "${name}" is not allowed by the tool schema.`,
+    };
+  }
   const expected = schema?.type;
   if (!expected) return null;
   const expectedTypes = Array.isArray(expected) ? expected : [expected];
