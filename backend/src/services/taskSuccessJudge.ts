@@ -158,8 +158,13 @@ export function renderTraceForJudge(trace: AgentRunTrace, title?: string): strin
       const line = takeTail ? body[j] : body[i];
       if (used + line.length + 1 > budget) break;
       used += line.length + 1;
-      if (takeTail) (keepTail.unshift(line), j--);
-      else (keepHead.push(line), i++);
+      if (takeTail) {
+        keepTail.unshift(line);
+        j--;
+      } else {
+        keepHead.push(line);
+        i++;
+      }
     }
     middle = [...keepHead, `(… ${body.length - keepHead.length - keepTail.length} timeline entries cut for length …)`, ...keepTail];
   }

@@ -56,13 +56,17 @@ export function parseTrialArgs(raw: string[]): TrialArgs {
   for (let i = 0; i < raw.length; i++) {
     const flag = raw[i];
     const value = raw[i + 1];
-    if (flag === '--split' && (value === 'dev' || value === 'test')) (args.split = value), i++;
-    else if (flag === '--max-usd' && Number(value) > 0) (args.maxUsd = Number(value)), i++;
-    else if (flag === '--model' && value) (args.model = value), i++;
-    else if (flag === '--out' && value) (args.out = value), i++;
-    else if (flag === '--all-agent-cases') args.allAgentCases = true;
+    if (flag === '--all-agent-cases') args.allAgentCases = true;
     else if (flag === '--labeller') args.labeller = true;
-    else throw new Error(`${USAGE}\nunknown or invalid argument: ${flag}`);
+    else {
+      // The remaining flags take a value.
+      if (flag === '--split' && (value === 'dev' || value === 'test')) args.split = value;
+      else if (flag === '--max-usd' && Number(value) > 0) args.maxUsd = Number(value);
+      else if (flag === '--model' && value) args.model = value;
+      else if (flag === '--out' && value) args.out = value;
+      else throw new Error(`${USAGE}\nunknown or invalid argument: ${flag}`);
+      i++;
+    }
   }
   if (!args.model) args.model = args.labeller ? DEFAULT_TASK_SUCCESS_LABELLER_MODEL : DEFAULT_TASK_SUCCESS_JUDGE_MODEL;
   return args;
