@@ -97,19 +97,30 @@ export async function startHostServer(manager: ConnectionManager, opts: HostServ
   if (opts.tls) {
     const t = opts.tls;
     const allowed = new Set(t.clientCommonNames);
+    // The caller must be the backend's IDENTITY: a certificate the CA signed is necessary, not sufficient.
+    const identityOk = (socket: TLSSocket): boolean => {
+      const cn = socket.getPeerCertificate().subject?.CN;
+      return socket.authorized === true && typeof cn === "string" && allowed.has(cn);
+    };
     const secure = createHttpsServer(
       { cert: t.cert, key: t.key, ca: t.ca, requestCert: true, rejectUnauthorized: true, minVersion: "TLSv1.3", handshakeTimeout: t.handshakeMs ?? 10_000 },
       (req, res) => {
+        // Second line of defence, checked per REQUEST: nothing reaches the manager unless this very socket carries the allowed identity.
+        if (!identityOk(req.socket as TLSSocket)) {
+          req.socket.destroy();
+          return;
+        }
         void handle(manager, req, res, opts.bodyIdleMs ?? BODY_IDLE_MS, opts.streamStallMs ?? 30_000).catch(() => {
           if (!res.headersSent) sendError(res, new HostError("EINTERNAL"));
           else res.end();
         });
       },
     );
-    // A certificate the CA signed is necessary, not sufficient: the caller must be the backend's identity.
-    secure.on("secureConnection", (socket: TLSSocket) => {
-      const cn = socket.getPeerCertificate().subject?.CN;
-      if (typeof cn !== "string" || !allowed.has(cn)) socket.destroy();
+    // First line: dropped before the HTTP parser sees a byte. `prependListener` is essential: https.Server registers its own
+    // `secureConnection` listener when it is created, and a listener added with `on` would run AFTER it, i.e. after the request
+    // had already been handed to the handler.
+    secure.prependListener("secureConnection", (socket: TLSSocket) => {
+      if (!identityOk(socket)) socket.destroy();
     });
     secure.on("tlsClientError", () => undefined); // a failed handshake is the client's problem; never an unhandled event
     secure.on("clientError", (_err, socket) => socket.destroy());

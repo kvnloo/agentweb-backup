@@ -79,6 +79,27 @@ describe("mutual TLS between the backend and the login host", () => {
     expect(await codeOf(clientFor({ cert: pem("other.pem"), key: pem("other.key.pem") }).connectionStatus({ connectionId: "c1" }))).toMatch(/UNREACHABLE|TIMEOUT/);
   });
 
+  it("a CA-signed client with the WRONG identity never reaches the manager at all (not one call, whatever the timing)", async () => {
+    await boot();
+    const spies = (["status", "revoke", "loginStart"] as const).map((m) => jest.spyOn(rig.mgr, m as never));
+    const other = { cert: pem("other.pem"), key: pem("other.key.pem"), ca: server.ca };
+    // Fire many requests the way an attacker would: write immediately after connecting, with and without waiting for the handshake.
+    const attempts = Array.from({ length: 40 }, (_v, i) =>
+      new Promise<void>((resolve) => {
+        const req = httpsRequest({ host: "127.0.0.1", port, method: "POST", path: i % 2 ? "/v1/connection.status" : "/v1/connection.revoke", ...other, agent: false, headers: { "content-type": "application/json" } }, (res) => {
+          res.resume();
+          res.on("end", resolve);
+        });
+        req.on("error", () => resolve());
+        req.end(JSON.stringify(i % 2 ? { connectionId: "c1" } : { connectionId: "c1", epoch: 9 }));
+      }),
+    );
+    await Promise.all(attempts);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(spies.map((s) => s.mock.calls.length)).toEqual([0, 0, 0]);
+    spies.forEach((s) => s.mockRestore());
+  });
+
   it("the backend refuses a worker whose certificate does not name the address it dialled", async () => {
     await boot({ cert: pem("wrong-server.pem") });
     expect(await codeOf(clientFor().connectionStatus({ connectionId: "c1" }))).toBe("UNREACHABLE");
