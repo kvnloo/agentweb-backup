@@ -28,7 +28,9 @@ jest.mock('../../middleware/auth', () => ({
     next();
   },
 }));
+jest.mock('../../services/adminAuditLog', () => ({ recordAdminAudit: jest.fn() }));
 
+import { recordAdminAudit } from '../../services/adminAuditLog';
 import { createAdminGoldenSetRouter } from '../adminGoldenSet';
 
 const ADMIN = JSON.stringify({ userId: 'admin-1', email: 'admin@example.com', isAdmin: true });
@@ -119,6 +121,27 @@ describe('admin golden-set routes: behaviour', () => {
     expect((await request(app(store)).put(path).set('x-test-user', ADMIN).send({ reason: 'x'.repeat(201) })).status).toBe(400);
     expect((await request(app(store)).put(`${base}/nope/exclusion`).set('x-test-user', ADMIN).send({ reason: 'empty_session' })).status).toBe(404);
     expect((await request(app(store)).put(path).set('x-test-user', CUSTOMER).send({ reason: 'empty_session' })).status).toBe(403);
+  });
+
+  it('audits each exclude and restore, keeping who excluded the case once it is restored (ENG-2608)', async () => {
+    (recordAdminAudit as jest.Mock).mockClear();
+    const exclusion = { reason: 'empty_session', by: 'other-admin@example.com', at: '2026-10-01T00:00:00.000Z' };
+    const store = fakeStore();
+    (store.getCase as jest.Mock).mockResolvedValue({ ...CASE, excluded: exclusion });
+    const path = `${base}/${encodeURIComponent(CASE.caseId)}/exclusion`;
+
+    await request(app(store)).put(path).set('x-test-user', ADMIN).send({ reason: 'empty_session' });
+    expect(recordAdminAudit).toHaveBeenLastCalledWith({
+      actorUserId: 'admin-1', actorEmail: 'admin@example.com', action: 'golden_case_exclude', caseId: CASE.caseId, reason: 'empty_session',
+    });
+
+    await request(app(store)).delete(path).set('x-test-user', ADMIN);
+    expect(recordAdminAudit).toHaveBeenLastCalledWith({
+      actorUserId: 'admin-1', actorEmail: 'admin@example.com', action: 'golden_case_restore', caseId: CASE.caseId, previousExclusion: exclusion,
+    });
+
+    await request(app(store)).put(`${base}/nope/exclusion`).set('x-test-user', ADMIN).send({ reason: 'empty_session' });
+    expect(recordAdminAudit).toHaveBeenCalledTimes(2);
   });
 
   it('answers 400, not 500, for a case id longer than DynamoDB allows, before touching the store (ENG-2608)', async () => {
