@@ -530,6 +530,7 @@ export const createAccount = async (
   // answer — which the picker reads as "nothing to choose" — and ship a silently untracked
   // page. See services/metaPixelsCache.ts.
   invalidateCachedPixels(userId);
+  if (platform === 'hubspot') clearHubSpotPortalCache();
 
   return accountConfig;
 };
@@ -1031,29 +1032,66 @@ export const getAccountByIdConsistent = async (
 /**
  * Find the User ID that owns a specific HubSpot Portal.
  * Required for mapping HubSpot webhooks back to local users.
+ *
+ * ENG-2605. There is no GSI on connected_accounts, so resolving a portal means reading every user.
+ * The webhook handler called this once per changed contact: a delivery of N contacts was N full
+ * scans of AW-Users (~4 MB each). One snapshot of portal -> owner is now shared by every caller on
+ * the instance and rebuilt at most once per HUBSPOT_PORTAL_MAP_TTL_MS, whether a lookup hits or
+ * misses (a miss must not rescan: portals that installed the app but are unknown here are the
+ * common case). A concurrent rebuild is shared. If a rebuild fails, a stale snapshot still
+ * answers. A portal connected inside the window is picked up at the next rebuild, or at once on
+ * the instance that took the connection.
  */
-export const getUserIdByHubSpotPortalId = async (portalId: number): Promise<string | null> => {
-  try {
-    // Note: If you have millions of users, you'd want a GSI on connected_accounts.
-    // For now, scanning or iterating is necessary to find the nested config property.
-    // The most efficient way right now is using userDb.scanAllItems
-    // Wait, let's just scan the users table where connected_accounts contains the given portalId
-    const { userDb } = await import('./db');
-    const users = await userDb.getAllUsers();
+const HUBSPOT_PORTAL_MAP_TTL_MS = 5 * 60 * 1000;
+type HubSpotPortalMap = { byPortal: Map<unknown, string>; at: number };
+let hubspotPortalMap: HubSpotPortalMap | null = null;
+let hubspotPortalMapInflight: Promise<HubSpotPortalMap> | null = null;
 
-    for (const user of users) {
-      if (user.connected_accounts) {
-        for (const account of user.connected_accounts) {
-          if (account.platform === 'hubspot' && (account.config as any).hub_id === portalId) {
-            return user.userId;
+/** Drops the portal -> user snapshot (tests; a new HubSpot connection on this instance). */
+export const clearHubSpotPortalCache = (): void => {
+  hubspotPortalMap = null;
+};
+
+const loadHubSpotPortalMap = (): Promise<HubSpotPortalMap> => {
+  if (!hubspotPortalMapInflight) {
+    hubspotPortalMapInflight = (async () => {
+      const { userDb } = await import('./db');
+      const users = await userDb.getAllUsers();
+      const byPortal = new Map<unknown, string>();
+      for (const user of users) {
+        if (!user.connected_accounts) continue;
+        try {
+          for (const account of user.connected_accounts) {
+            if (account.platform !== 'hubspot') continue;
+            const hubId = (account.config as any)?.hub_id;
+            // The first user holding a portal wins, as the per-event scan did.
+            if (hubId !== undefined && hubId !== null && !byPortal.has(hubId)) byPortal.set(hubId, user.userId);
           }
+        } catch {
+          // One malformed record must not hide every other user's portals.
         }
       }
-    }
-    return null;
+      const snapshot = { byPortal, at: Date.now() };
+      hubspotPortalMap = snapshot;
+      return snapshot;
+    })().finally(() => {
+      hubspotPortalMapInflight = null;
+    });
+  }
+  return hubspotPortalMapInflight;
+};
+
+export const getUserIdByHubSpotPortalId = async (portalId: number): Promise<string | null> => {
+  const cached = hubspotPortalMap;
+  if (cached && Date.now() - cached.at < HUBSPOT_PORTAL_MAP_TTL_MS) {
+    return cached.byPortal.get(portalId) ?? null;
+  }
+  try {
+    return (await loadHubSpotPortalMap()).byPortal.get(portalId) ?? null;
   } catch (error) {
     console.error('Error resolving HubSpot Portal ID to User ID:', error);
-    return null;
+    // A stale answer beats dropping a webhook delivery because one rebuild was throttled.
+    return cached?.byPortal.get(portalId) ?? null;
   }
 };
 
