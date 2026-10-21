@@ -254,6 +254,70 @@ describe('a rejected placement followed by a failure in the same first-attempt j
   });
 });
 
+/**
+ * Fails, in order, the writes that record a rejected placement (dialing -> between_attempts, outcome place_rejected) of
+ * the first rejection only: the nth matching write gets modes[n]; later ones pass.
+ */
+function failSettleWrites(modes: Mode[]): void {
+  const original = writers().updateLeadSystemRecordIf.bind(world.crm.crmDb);
+  let matched = 0;
+  writers().updateLeadSystemRecordIf = async (...args) => {
+    const op = args[3] as { stateIn: string[]; set?: { outcome?: string } };
+    const mode = op.stateIn.includes('dialing') && op.set?.outcome === 'place_rejected' ? modes[matched++] : undefined;
+    if (mode === undefined) return original(...args);
+    if (mode === 'before') throw new Error('injected');
+    await original(...args);
+    if (mode === 'after') throw new Error('injected');
+    return false;
+  };
+}
+
+/** Each script runs a whole call in which Twilio rejects some placements; `arm` is called just before the first rejection. */
+const rejectedScripts: Record<string, (arm: () => void) => Promise<void>> = {
+  'rejected first': async (arm) => {
+    arm();
+    world.provider.failNextPlaceCall('no');
+    await submitLead('lead-a');
+  },
+  'rejected second': async (arm) => {
+    await submitLead('lead-a');
+    arm();
+    world.provider.failNextPlaceCall('no');
+    await nthCall(1).memberLegEnds('no-answer', '0');
+    await flush();
+  },
+  'rejected twice': async (arm) => {
+    arm();
+    world.provider.failNextPlaceCall('no');
+    world.provider.failNextPlaceCall('no');
+    await submitLead('lead-a');
+  },
+  'rejected all': async (arm) => {
+    arm();
+    for (let i = 0; i < 3; i++) world.provider.failNextPlaceCall('no');
+    await submitLead('lead-a');
+  },
+};
+
+describe('a rejected placement whose record update fails more than once', () => {
+  const sequences: Mode[][] = [
+    ['before', 'after'], ['before', 'afterFalse'], ['before', 'before'], ['before', 'before', 'before'], ['before', 'before', 'after'],
+  ];
+  for (const script of Object.keys(rejectedScripts)) {
+    for (const modes of sequences) {
+      it(`${script}: settle writes ${modes.join(' then ')} leave the record ended, not waiting`, async () => {
+        setClock(chicago('16:00'));
+        await rejectedScripts[script](() => failSettleWrites(modes));
+        await noAnswerChain();
+
+        const phones = rungPhones();
+        expect(new Set(phones).size).toBe(phones.length);
+        expect(['finished', 'failed']).toContain(record().state);
+      });
+    }
+  }
+});
+
 describe('a write that did not land', () => {
   it('/gather: a bridging transition that failed hangs up and leaves the member leg to hand over', async () => {
     setClock(chicago('16:00'));

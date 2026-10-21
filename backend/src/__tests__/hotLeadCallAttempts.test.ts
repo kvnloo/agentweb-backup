@@ -18,7 +18,7 @@ import { crmDb, userDb, orgDb } from '../services/db';
 import * as queue from '../services/asyncJobQueue';
 import { processHotLeadCallJob, registerHotLeadCallProcessor } from '../services/hotLeadCallService';
 import { processHotLeadCallNextAttempt, requestNextHotLeadCallAttempt } from '../services/hotLeadCallAttempts';
-import { placeMemberCall } from '../services/hotLeadCallPlacement';
+import { closeBetweenAttempts, placeMemberCall } from '../services/hotLeadCallPlacement';
 import { hotLeadCallConfigOf } from '../services/hotLeadCallConfig';
 import { setHotLeadCallEnabledOverride } from '../services/voice/hotLeadCallMode';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
@@ -333,6 +333,18 @@ describe('processHotLeadCallNextAttempt', () => {
     });
     expect(provider.placedCalls).toHaveLength(1);
     expect(store.record).toMatchObject({ state: 'between_attempts', attemptNo: 3 });
+  });
+
+  it('a stale job cannot close the waiting record of a later attempt', async () => {
+    const record = await firstAttemptEnds();
+    store.record = { ...store.record!, attemptNo: 3, state: 'between_attempts', triedMemberIds: [ID.c, ID.d, ID.e] };
+    setHotLeadCallEnabledOverride(false);
+    await processHotLeadCallNextAttempt(nextJob(record)); // believes attempt 1 just ended
+    expect(store.record).toMatchObject({ state: 'between_attempts', attemptNo: 3 });
+    await closeBetweenAttempts(store, 'list-a', 'lead-a', 2, 'no_member_available', 'completed');
+    expect(store.record!.state).toBe('between_attempts');
+    await closeBetweenAttempts(store, 'list-a', 'lead-a', 3, 'no_member_available', 'completed');
+    expect(store.record).toMatchObject({ state: 'finished', outcome: 'no_member_available' });
   });
 
   describe('when closing the waiting record fails', () => {

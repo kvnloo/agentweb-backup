@@ -11,6 +11,8 @@ import type { HotLeadCallEventType, HotLeadCallPatch, HotLeadCallRecord, LeadCal
 const MEMBER_RING_TIMEOUT_SECONDS = 25;
 // The re-read that decides whether a write that reported a problem still landed: a read that fails is tried again.
 const CLAIM_READ_ATTEMPTS = 3;
+// Tries at recording a rejected placement before the record is closed where it stands.
+const SETTLE_ATTEMPTS = 3;
 
 /** How a placement pass ended. */
 export type PlacementResult =
@@ -51,14 +53,15 @@ interface PlacementInput {
 type Closing = 'completed' | 'rejected' | 'errored';
 
 /**
- * Closes a record that is waiting between attempts, because no further member can be rung. A failed write is tried
+ * Closes the record that is waiting between attempts after attempt `attemptNo`, because no further member can be rung. A failed write is tried
  * once more and then thrown, so the job fails (the queue records it) instead of leaving the record waiting while the
  * caller believes it was closed; the record stays between_attempts, where a redelivered callback can still resolve it.
  */
 export async function closeBetweenAttempts(
-  store: LeadCallStore, listId: string, leadId: string, outcome: string, closing: Closing,
+  store: LeadCallStore, listId: string, leadId: string, attemptNo: number, outcome: string, closing: Closing,
 ): Promise<void> {
-  const patch = closing === 'completed' ? { state: 'finished' as const, outcome } : { state: 'failed' as const, outcome };
+  // Only the record of the attempt that ended: a stale job cannot close a later attempt's waiting record.
+  const patch = { state: closing === 'completed' ? 'finished' as const : 'failed' as const, outcome, ifAttemptNo: attemptNo };
   let moved: boolean;
   try {
     moved = await store.transition(listId, leadId, ['between_attempts'], patch);
@@ -121,16 +124,25 @@ async function ownRecord(store: LeadCallStore, listId: string, leadId: string, c
 /**
  * Records that Twilio definitely rejected this attempt's call (dialing -> between_attempts). A write that reported
  * a problem may still have landed, and one that did not land leaves `dialing` with no call and no callback ever
- * coming, so the record is read back (it keeps this attempt's token) and the move is made once more if it is
- * still `dialing`. False only when the record cannot be moved on.
+ * coming, so after each try the record is read back (it keeps this attempt's token) and the move is made again
+ * while it is still `dialing`, a few times. True when the record has moved on. When it cannot be moved it is closed
+ * as failed where it stands (no call exists, so nothing else will ever resolve it) and this returns false, ending
+ * the pass. An unreadable record or one that is not ours is unknown: false, and nothing is closed.
  */
 async function settleRejection(c: PlacementContext, claimToken: string, detail: Record<string, string | number>): Promise<boolean> {
   const patch = { state: 'between_attempts', outcome: 'place_rejected' } as const;
   const event = { reason: 'place_rejected', ...detail };
-  if (await settle(c, patch, 'call.failed', event)) return true;
-  const own = await ownRecord(c.store, c.listId, c.leadId, claimToken).catch(() => null);
-  if (own?.state === 'between_attempts') return true;
-  return own?.state === 'dialing' && await settle(c, patch, 'call.failed', event);
+  for (let attempt = 1; attempt <= SETTLE_ATTEMPTS; attempt++) {
+    if (await settle(c, patch, 'call.failed', event)) return true;
+    // An unreadable record is treated as unknown.
+    const own = await ownRecord(c.store, c.listId, c.leadId, claimToken).catch(() => null);
+    if (!own) return false;
+    if (own.state !== 'dialing') return true;
+  }
+  if (await c.store.transition(c.listId, c.leadId, ['dialing'], { state: 'failed', outcome: 'place_rejected' })) {
+    await c.store.addEvent(c.listId, c.leadId, 'call.failed', event);
+  }
+  return false;
 }
 
 /**
@@ -225,13 +237,13 @@ export async function placeMemberCall(input: PlacementInput): Promise<PlacementR
       attemptNo++;
     }
     if (!recordExists) return 'none';
-    await closeBetweenAttempts(context.store, listId, leadId, rejected ? 'place_rejected' : 'no_member_available', rejected ? 'rejected' : 'completed');
+    await closeBetweenAttempts(context.store, listId, leadId, attemptNo - 1, rejected ? 'place_rejected' : 'no_member_available', rejected ? 'rejected' : 'completed');
     return 'closed';
   } catch (err) {
     // After a rejected call the record waits between attempts with no call in flight, so no callback will ever come
     // for it: whatever broke the pass, the record is closed here (a first attempt's job and a next attempt's alike).
     if (rejected) {
-      await closeBetweenAttempts(context.store, listId, leadId, 'next_attempt_failed', 'errored')
+      await closeBetweenAttempts(context.store, listId, leadId, attemptNo - 1, 'next_attempt_failed', 'errored')
         .catch((closeErr) => console.warn('[hotLeadCall] call record not closed', { listId, leadId, error: errorText(closeErr) }));
     }
     throw err;

@@ -109,7 +109,7 @@ export async function processHotLeadCallNextAttempt(job: NextAttemptJob): Promis
     await placeNextAttempt(job);
   } catch (err) {
     // The original error is the one to report; a close that fails as well leaves the record for a redelivery to heal.
-    await closeBetweenAttempts(getLeadCallStore(), job.listId, job.leadId, 'next_attempt_failed', 'errored')
+    await closeBetweenAttempts(getLeadCallStore(), job.listId, job.leadId, job.attemptNo, 'next_attempt_failed', 'errored')
       .catch((closeErr) => console.warn('[hotLeadCall] call record not closed', { listId: job.listId, leadId: job.leadId, error: errorText(closeErr) }));
     throw err;
   }
@@ -121,7 +121,7 @@ async function placeNextAttempt(job: NextAttemptJob): Promise<void> {
   if (!await isHotLeadCallEnabled()) {
     // No read and no call, but the record must not wait for a next attempt that will never come: one conditional
     // write closes it if (and only if) it is waiting between attempts.
-    await closeBetweenAttempts(store, listId, leadId, 'disabled', 'completed');
+    await closeBetweenAttempts(store, listId, leadId, job.attemptNo, 'disabled', 'completed');
     return;
   }
 
@@ -131,13 +131,13 @@ async function placeNextAttempt(job: NextAttemptJob): Promise<void> {
 
   const loaded = await loadNextAttemptContext(listId, record, job.orgId);
   if ('refusal' in loaded) {
-    await closeBetweenAttempts(store, listId, leadId, loaded.refusal === 'disabled' ? 'disabled' : 'no_member_available', 'completed');
+    await closeBetweenAttempts(store, listId, leadId, job.attemptNo, loaded.refusal === 'disabled' ? 'disabled' : 'no_member_available', 'completed');
     return;
   }
   const { ctx: { config }, now } = loaded;
   const callerNumber = config.twilioNumber;
   if (!callerNumber) {
-    await closeBetweenAttempts(store, listId, leadId, 'no_member_available', 'completed');
+    await closeBetweenAttempts(store, listId, leadId, job.attemptNo, 'no_member_available', 'completed');
     return;
   }
 
