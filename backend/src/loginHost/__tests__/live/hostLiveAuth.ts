@@ -138,9 +138,11 @@ async function main() {
   check("login.promote", prom.status === 200 && prom.json?.state === "active", `state=${prom.json?.state}`);
   cleanup.promoted = prom.status === 200;
 
+  // A uid directory outlives its connection (root-owned, empty) and is reused: earlier runs leave several. The connection's own is the one with a home.
   const uidDirs = readdirSync(HOME_ROOT).filter((n) => /^\d+$/.test(n));
-  const uid = Number(uidDirs[0]);
-  check("customer-uid-dir", uidDirs.length === 1 && uid >= 420000, `uid-dirs=${uidDirs.length} mode=${(statSync(`${HOME_ROOT}/${uid}`).mode & 0o777).toString(8)}`);
+  const withHome = uidDirs.filter((n) => readdirSync(`${HOME_ROOT}/${n}/homes`).length > 0);
+  const uid = Number(withHome[0]);
+  check("customer-uid-dir", withHome.length === 1 && uid >= 420000, `uid-dirs=${uidDirs.length} with-home=${withHome.length} mode=${(statSync(`${HOME_ROOT}/${uid}`).mode & 0o777).toString(8)}`);
   const homes = readdirSync(`${HOME_ROOT}/${uid}/homes`);
   const homeRef = homes[0];
   const entries = readdirSync(`${HOME_ROOT}/${uid}/homes/${homeRef}/home`, { recursive: true }).map(String);
