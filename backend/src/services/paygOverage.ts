@@ -112,15 +112,33 @@ export interface PaygOverageSettings {
   version: number;
   /**
    * Set by settlement when an overage charge fails (`payment_failed`, lifted once no month's overage
-   * invoice is still `failed`) or is disputed (`dispute`, never lifted automatically). Blocks PAYG
-   * admission while present.
+   * invoice is still `failed`) or is disputed (`dispute`, lifted once every dispute on the account is
+   * closed and none was lost). Blocks PAYG admission while present.
    */
-  suspended?: { reason: PaygSuspensionReason; at: string; invoiceId?: string };
+  suspended?: PaygSuspension;
+}
+
+export interface PaygSuspension {
+  reason: PaygSuspensionReason;
+  at: string;
+  invoiceId?: string;
+  /** `dispute` only: the dispute that last (re)stamped the hold. */
+  disputeId?: string;
+  /** `dispute` only: a dispute was lost — never lifted automatically (a person removes the hold). */
+  lost?: boolean;
+  /**
+   * `dispute` only: when a month last FAILED while the dispute hold covered it. Written so a dispute lift
+   * that read the row before that failure cannot remove the hold (its `= :seen` condition fails and it
+   * re-reads, then hands the hold to the failed month).
+   */
+  paymentFailedAt?: string;
 }
 
 /** Why a PAYG-enabled account is still blocked, when the reason is PAYG's own: drives the 429 copy. */
 export interface PaygBlock {
   reason: UsageBlockReason;
+  /** Only with `payg_suspended`: why — a payment that didn't go through, or a disputed one. */
+  paygSuspendedReason?: PaygSuspensionReason;
   /** Only with `payg_inactive`: which admission prerequisite is missing. */
   paygInactiveReason?: PaygInactiveReason;
   /**
@@ -401,7 +419,17 @@ export function evaluatePaygAdmission(input: {
   });
   if (!overage) return keep;
 
-  if (account.suspended) return { ...keep, overage, block: { reason: 'payg_suspended' } };
+  if (account.suspended) {
+    const suspendedReason = account.suspended.reason;
+    return {
+      ...keep,
+      overage,
+      block: {
+        reason: 'payg_suspended',
+        ...(suspendedReason === 'payment_failed' || suspendedReason === 'dispute' ? { paygSuspendedReason: suspendedReason } : {}),
+      },
+    };
+  }
   if (input.hasPaymentMethod !== true) {
     return { ...keep, overage, block: { reason: 'payg_inactive', paygInactiveReason: 'no_payment_method' } };
   }

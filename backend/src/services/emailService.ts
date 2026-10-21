@@ -2838,6 +2838,8 @@ View Session: ${sessionUrl}`;
     month: string;
     percentOfCap: number;
     invoiceUrl?: string | null;
+    /** Stripe already collected the invoice when the email goes out (the paid wording). */
+    paid?: boolean;
   }): Promise<EmailSendOutcome | void> {
     return this.sendPaygSettlementEmail(input.to, paygInvoiceCreatedEmailCopy(input), input.invoiceUrl, '#1976d2');
   },

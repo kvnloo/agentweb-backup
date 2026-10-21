@@ -17,6 +17,7 @@ import {
   handleInvoiceVoided,
   handleInvoiceMarkedUncollectible,
   handleInvoicePaymentActionRequired,
+  handleSetupIntentSucceeded,
   reconcileAllStripeUsers,
   findBasePlanItem,
   getSubscriptionPeriodEndIso,
@@ -152,6 +153,11 @@ export async function handleWebhook(req: Request, res: Response) {
       case 'invoice.payment_action_required':
         await handleInvoicePaymentActionRequired(event.data.object);
         break;
+      // ENG-668: a newly saved card replaces the one settlement pinned on an open overage invoice, so
+      // Stripe's retries charge it. Must be enabled on the webhook endpoint like the events above.
+      case 'setup_intent.succeeded':
+        await handleSetupIntentSucceeded(event.data.object);
+        break;
       case 'charge.refunded':
         await handleChargeRefunded(event.data.object);
         break;
@@ -185,7 +191,9 @@ export async function handleWebhook(req: Request, res: Response) {
     // blocks the webhook ack. Errors are swallowed inside the hook.
     // A setup-mode checkout is not a subscription event (it would map to payment.subscribed).
     // Nor is a pay-as-you-go overage invoice (ENG-668): the CRM mirror models the subscription.
+    // Nor is a saved payment method (`setup_intent.succeeded`).
     if (!(event.type === 'checkout.session.completed' && isSetupModeCheckoutSession(event.data.object))
+      && event.type !== 'setup_intent.succeeded'
       && !isPaygOverageInvoiceEvent(event)) {
       void sendStripeEventToCrm(event);
     }

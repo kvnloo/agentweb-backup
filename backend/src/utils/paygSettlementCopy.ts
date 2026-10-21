@@ -37,8 +37,12 @@ export interface PaygSettlementEmailCopy {
   settingsLinkLabel: string;
 }
 
-/** Sent once, when the month's overage invoice is created. */
-export function paygInvoiceCreatedEmailCopy(input: { month: string; percentOfCap: number }): PaygSettlementEmailCopy {
+/**
+ * Sent once, when the month's overage invoice is created — or, when Stripe had already collected it by
+ * then (`paid`: a credit balance, an instant charge, a held month's invoice paid later), in the paid
+ * wording, so the owner is never told a card "will" be charged for an invoice that is settled.
+ */
+export function paygInvoiceCreatedEmailCopy(input: { month: string; percentOfCap: number; paid?: boolean }): PaygSettlementEmailCopy {
   const label = formatUsageMonth(input.month);
   const percent = Math.max(0, Math.min(100, Math.floor(input.percentOfCap)));
   return {
@@ -48,7 +52,9 @@ export function paygInvoiceCreatedEmailCopy(input: { month: string; percentOfCap
       // The bill is measured against the highest limit in force during the month (the limit is a monthly
       // total), so the percentage is of that limit — the one the amount actually follows.
       `In ${label} your team kept working past the AI usage included in your plan, using ${percent}% of the highest pay-as-you-go limit you had set that month.`,
-      'Stripe has issued an invoice for that usage and will charge the payment method on file. The invoice shows the amount.',
+      input.paid
+        ? 'Stripe has issued an invoice for that usage, and it has already been paid. The invoice shows the amount.'
+        : 'Stripe has issued an invoice for that usage and will charge the payment method on file. The invoice shows the amount.',
     ],
     invoiceLinkLabel: 'View your invoice',
     settingsLinkLabel: 'Review your pay-as-you-go settings',

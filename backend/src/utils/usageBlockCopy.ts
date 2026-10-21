@@ -56,8 +56,13 @@ export type PaygInactiveReason = "no_payment_method" | "subscription_inactive";
 export interface UsageBlockPaygInput {
   reason: UsageBlockReason;
   paygInactiveReason?: PaygInactiveReason;
+  /** Only with `payg_suspended`: what put pay-as-you-go on hold, which decides what lifts it. */
+  paygSuspendedReason?: PaygSuspendedReason;
   openInvoiceUrl?: string;
 }
+
+/** `payment_failed`: paying the open invoice lifts the hold. `dispute`: a person lifts it. */
+export type PaygSuspendedReason = "payment_failed" | "dispute";
 
 const HEADLINE = "Your monthly AI usage is paused";
 const BODY = "You've used all of the AI usage included in your plan this month.";
@@ -65,18 +70,36 @@ const ACTION_TAIL = "Add usage or upgrade your plan to keep working before then.
 
 type PaygCopy = { headline: string; body: string; actionTail: string; undated: string };
 
-const PAYG_COPY: Record<"payg_cap_reached" | "payg_suspended", PaygCopy> = {
-  payg_cap_reached: {
-    headline: "You've reached your pay-as-you-go limit",
-    body: "You've used all of the AI usage included in your plan this month and your pay-as-you-go limit.",
-    actionTail: "Raise your pay-as-you-go limit or upgrade your plan to keep working before then.",
-    undated: "AI usage is paused: you've reached your pay-as-you-go limit. Raise the limit or upgrade your plan to keep working.",
+const PAYG_CAP_REACHED_COPY: PaygCopy = {
+  headline: "You've reached your pay-as-you-go limit",
+  body: "You've used all of the AI usage included in your plan this month and your pay-as-you-go limit.",
+  actionTail: "Raise your pay-as-you-go limit or upgrade your plan to keep working before then.",
+  undated: "AI usage is paused: you've reached your pay-as-you-go limit. Raise the limit or upgrade your plan to keep working.",
+};
+
+/**
+ * ENG-668 PR-2: a hold says what actually lifts it. A payment-failure hold lifts when the open invoice is
+ * paid (with any card, on its hosted page — updating the card alone does not pay it); a dispute hold is
+ * lifted by a person, so the account owner is asked to contact us. With no reason recorded, the same.
+ */
+const PAYG_SUSPENDED_COPY: Record<PaygSuspendedReason | "unknown", PaygCopy> = {
+  payment_failed: {
+    headline: "Pay-as-you-go is on hold",
+    body: "You've used all of the AI usage included in your plan this month, and pay-as-you-go is on hold because a recent payment didn't go through.",
+    actionTail: "Pay the open invoice to resume pay-as-you-go.",
+    undated: "AI usage is paused: pay-as-you-go is on hold because a recent payment didn't go through. Pay the open invoice to resume it.",
   },
-  payg_suspended: {
+  dispute: {
+    headline: "Pay-as-you-go is on hold",
+    body: "You've used all of the AI usage included in your plan this month, and pay-as-you-go is on hold while a recent payment is under review with your bank.",
+    actionTail: "Please contact us to resume pay-as-you-go.",
+    undated: "AI usage is paused: pay-as-you-go is on hold while a recent payment is under review with your bank. Please contact us to resume it.",
+  },
+  unknown: {
     headline: "Pay-as-you-go is on hold",
     body: "You've used all of the AI usage included in your plan this month, and pay-as-you-go is on hold because of a problem with a recent payment.",
-    actionTail: "Update your payment method to resume pay-as-you-go.",
-    undated: "AI usage is paused: pay-as-you-go is on hold because of a payment problem. Update your payment method to resume it.",
+    actionTail: "Please contact us to resume pay-as-you-go.",
+    undated: "AI usage is paused: pay-as-you-go is on hold because of a payment problem. Please contact us to resume it.",
   },
 };
 
@@ -109,7 +132,11 @@ function paygCopyFor(block: UsageBlockPaygInput | null | undefined): PaygCopy | 
   if (block.reason === "payg_inactive") {
     return block.paygInactiveReason ? PAYG_INACTIVE_COPY[block.paygInactiveReason] : undefined;
   }
-  return PAYG_COPY[block.reason];
+  if (block.reason === "payg_suspended") {
+    const why = block.paygSuspendedReason;
+    return PAYG_SUSPENDED_COPY[why === "payment_failed" || why === "dispute" ? why : "unknown"];
+  }
+  return block.reason === "payg_cap_reached" ? PAYG_CAP_REACHED_COPY : undefined;
 }
 
 /**

@@ -673,6 +673,33 @@ export const stripeService = {
     return (invoice as Stripe.Invoice).metadata?.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE ? (invoice as Stripe.Invoice) : null;
   },
 
+  /**
+   * ENG-668 PR-2: whether an overage invoice's failed attempt is only waiting for the customer to confirm
+   * it (3-D Secure, a mandate) rather than declined. Stripe reports such an attempt with
+   * `invoice.payment_failed` too, the PaymentIntent then being `requires_action`. A decline — or an
+   * authentication the customer failed or abandoned — leaves it `requires_payment_method`, which is a
+   * failure. Since 2025-03-31.basil an invoice no longer names its PaymentIntent: it is the invoice's
+   * default invoice payment. Stripe errors propagate (the webhook is retried, never guessed).
+   */
+  async paygOverageInvoicePaymentNeedsAction(invoiceId: string): Promise<boolean> {
+    const s = getStripeOrThrow();
+    const payments = await s.invoicePayments.list({ invoice: invoiceId, limit: 10, expand: ['data.payment.payment_intent'] });
+    const current = payments.data.find((payment) => payment.is_default) ?? payments.data[0];
+    const intent = current?.payment?.payment_intent;
+    if (!intent) return false;
+    const paymentIntent = typeof intent === 'string' ? await s.paymentIntents.retrieve(intent) : intent;
+    return paymentIntent.status === 'requires_action';
+  },
+
+  /**
+   * ENG-668 PR-2: the refunds on a charge (newest first). A charge object no longer includes them
+   * (API 2022-11-15+), and a webhook's charge is never expanded.
+   */
+  async listChargeRefunds(chargeId: string): Promise<Stripe.Refund[]> {
+    const refunds = await getStripeOrThrow().refunds.list({ charge: chargeId, limit: 100 });
+    return refunds.data;
+  },
+
   /** Stripe-hosted Checkout in setup mode: saves a card, charges nothing. */
   async createPaymentMethodSetupSession(params: {
     stripeCustomerId: string;
@@ -1505,24 +1532,28 @@ export async function handleInvoicePaymentFailed(invoice: any): Promise<void> {
 }
 
 /**
- * ENG-668 PR-2: the overage invoice behind a refunded or disputed charge — only while PAYG settlement
- * is switched on. Recognising an overage charge costs a Stripe call per non-top-up charge, so with
- * settlement off (the shipped state) the refund and dispute webhooks behave exactly as before and make
- * no extra call. When the lookup itself fails:
- *   - `dispute`: the error is raised, so the webhook answers 500 and Stripe redelivers — a chargeback on
- *     an overage charge must suspend PAYG, and acknowledging it unrecognised would drop that for good;
- *   - `refund`: the refund is handled as before (it is recorded either way) and on-call is told it could
- *     not be checked, so an overage refund is never silently left off its settlement.
+ * ENG-668 PR-2: the overage invoice behind a refunded or disputed charge. Recognising an overage charge
+ * costs a Stripe call per non-top-up charge that has a PaymentIntent.
+ *   - Disputes (`raise`) are looked up whether or not settlement is switched on: the switch stops NEW
+ *     charges, but a chargeback on an overage invoice already collected must still hold PAYG, and its
+ *     closing must still lift (or keep) that hold. For any other charge the outcome is unchanged; a failed
+ *     lookup raises, so the webhook answers 500 and Stripe redelivers — acknowledging a chargeback on an
+ *     overage charge unrecognised would drop it for good.
+ *   - Refunds (`alert`) are looked up only while settlement is on (`requireSwitch`), so with it off the
+ *     refund webhook is exactly as before and makes no extra call. When the lookup fails, the refund is
+ *     handled as before (it is recorded either way) and on-call is told it could not be checked.
  */
-async function findPaygOverageInvoiceIfSettling(
+async function findPaygOverageInvoiceForChargeEvent(
   charge: PaygChargeRef,
   event: string,
   onLookupFailure: 'raise' | 'alert',
 ): Promise<Stripe.Invoice | null> {
   // Only an invoice charge has a PaymentIntent to look up; anything else is never an overage charge.
   if (!charge?.payment_intent) return null;
-  const { paygSettlementSwitch } = await import('./paygOverageService');
-  if (!(await paygSettlementSwitch.isEnabled())) return null;
+  if (onLookupFailure === 'alert') {
+    const { paygSettlementSwitch } = await import('./paygOverageService');
+    if (!(await paygSettlementSwitch.isEnabled())) return null;
+  }
   try {
     return await stripeService.findPaygOverageInvoiceForCharge(charge);
   } catch (error: unknown) {
@@ -1570,6 +1601,54 @@ export async function handleInvoicePaymentActionRequired(invoice: Stripe.Invoice
 }
 
 /**
+ * ENG-668 PR-2: `setup_intent.succeeded` — a customer saved a payment method. Settlement pins a card on
+ * an overage invoice (`default_payment_method`) only when the customer has no invoice default — which is
+ * every customer who saved a card through the setup-mode Checkout (ENG-2571 / ENG-2303), since that flow
+ * sets none. An invoice's own payment method overrides the customer's for every automatic retry (Stripe:
+ * "If not set, defaults to ... the default payment method in the customer's invoice settings"), so after
+ * the owner saves a new card, Stripe would keep retrying the old one. Each OPEN overage invoice of this
+ * customer that is pinned to another method is therefore pointed at the one just saved (an open invoice's
+ * `default_payment_method` stays editable after finalizing), and Stripe's next attempt charges it.
+ *
+ * Nothing else changes: no subscription, checkout or customer field is touched, and an account with no
+ * open overage invoice costs one row read and no Stripe call. A failed row read is logged and the event
+ * acknowledged, as before this handler existed; once an open overage invoice is known, a Stripe error
+ * fails the webhook so Stripe redelivers. Requires `setup_intent.succeeded` on the webhook endpoint.
+ */
+export async function handleSetupIntentSucceeded(setupIntent: Pick<Stripe.SetupIntent, 'id' | 'customer' | 'payment_method' | 'metadata'>): Promise<void> {
+  const customerId = typeof setupIntent?.customer === 'string' ? setupIntent.customer : setupIntent?.customer?.id;
+  const paymentMethodId = typeof setupIntent?.payment_method === 'string' ? setupIntent.payment_method : setupIntent?.payment_method?.id;
+  if (!customerId || !paymentMethodId) return;
+  let user: { userId?: string; paygSettlements?: Record<string, { status?: string; invoiceId?: string }> } | null = null;
+  try {
+    // Zoma's setup Checkout tags the SetupIntent with the user; its customer need not be the row's.
+    const taggedUserId = String(setupIntent?.metadata?.userId || '');
+    user = (taggedUserId ? await userDb.getUserById(taggedUserId) : null) ?? (await findUserByStripeCustomerId(customerId));
+  } catch (error: unknown) {
+    console.error(`[STRIPE] setup_intent.succeeded ${setupIntent?.id}: could not read the account; no overage invoice re-pointed:`,
+      error instanceof Error ? error.message : error);
+    return;
+  }
+  const settlements = user?.paygSettlements ?? {};
+  const open = Object.values(settlements)
+    .filter((record) => (record?.status === 'invoiced' || record?.status === 'failed') && typeof record.invoiceId === 'string');
+  if (!open.length) return;
+  const s = getStripeOrThrow();
+  for (const record of open) {
+    const invoice = await retrieveInvoiceIfExists(s, record.invoiceId!);
+    if (!invoice || invoice.status !== 'open') continue;
+    if (invoice.metadata?.purchaseType !== PAYG_OVERAGE_PURCHASE_TYPE || invoice.metadata?.billingUserId !== user?.userId) continue;
+    const invoiceCustomer = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id;
+    const pinned = typeof invoice.default_payment_method === 'string' ? invoice.default_payment_method : invoice.default_payment_method?.id;
+    // Only a pin settlement set, on this customer's invoice, to another method. An unpinned invoice
+    // already follows the customer's own default.
+    if (invoiceCustomer !== customerId || !pinned || pinned === paymentMethodId) continue;
+    await s.invoices.update(invoice.id!, { default_payment_method: paymentMethodId }, { idempotencyKey: `payg-repoint:${invoice.id}:${paymentMethodId}` });
+    console.log(`[STRIPE] overage invoice ${invoice.id} (${user?.userId}) now charges the newly saved ${paymentMethodId} instead of ${pinned}`);
+  }
+}
+
+/**
  * Handle charge.refunded — record the refund in payment history.
  */
 export async function handleChargeRefunded(charge: any): Promise<void> {
@@ -1577,7 +1656,7 @@ export async function handleChargeRefunded(charge: any): Promise<void> {
   // ENG-668: a refunded pay-as-you-go overage charge is recorded against its settlement only. It never
   // lifts a suspension (refunding an overage is not a reason to resume billing it).
   if (metadata.purchaseType !== 'llm_usage_top_up') {
-    const overageInvoice = await findPaygOverageInvoiceIfSettling(charge, 'charge.refunded', 'alert');
+    const overageInvoice = await findPaygOverageInvoiceForChargeEvent(charge, 'charge.refunded', 'alert');
     if (overageInvoice) {
       const { handlePaygOverageChargeRefunded } = await import('./paygSettlementService');
       await handlePaygOverageChargeRefunded(charge, overageInvoice);
@@ -1684,7 +1763,7 @@ export async function handleChargeDisputeCreated(dispute: any): Promise<void> {
   const metadata = charge.metadata || {};
   if (metadata.purchaseType !== 'llm_usage_top_up') {
     // ENG-668: a chargeback on a pay-as-you-go overage charge suspends pay-as-you-go.
-    const overageInvoice = await findPaygOverageInvoiceIfSettling(charge, 'charge.dispute.created', 'raise');
+    const overageInvoice = await findPaygOverageInvoiceForChargeEvent(charge, 'charge.dispute.created', 'raise');
     if (overageInvoice) {
       const { handlePaygOverageChargeDisputed } = await import('./paygSettlementService');
       await handlePaygOverageChargeDisputed(dispute, charge, overageInvoice);
@@ -1792,8 +1871,9 @@ export async function handleChargeDisputeClosed(dispute: any): Promise<void> {
   const metadata = charge.metadata || {};
   if (metadata.purchaseType !== 'llm_usage_top_up') {
     // ENG-668: a closed dispute on a pay-as-you-go overage charge — won lifts its hold, lost writes the
-    // month off. A failed lookup errors the webhook so Stripe redelivers (as for the dispute opening).
-    const overageInvoice = await findPaygOverageInvoiceIfSettling(charge, 'charge.dispute.closed', 'raise');
+    // month off — whether or not settlement is switched on. A failed lookup errors the webhook so Stripe
+    // redelivers (as for the dispute opening).
+    const overageInvoice = await findPaygOverageInvoiceForChargeEvent(charge, 'charge.dispute.closed', 'raise');
     if (overageInvoice) {
       const { handlePaygOverageChargeDisputeClosed } = await import('./paygSettlementService');
       await handlePaygOverageChargeDisputeClosed(dispute, charge, overageInvoice);

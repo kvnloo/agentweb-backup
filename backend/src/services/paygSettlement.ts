@@ -128,9 +128,26 @@ export interface PaygSettlement {
   uncollectibleAt?: string;
   writtenOffReason?: PaygWrittenOffReason;
   writtenOffAt?: string;
-  dispute?: { disputeId: string; at: string; status?: string; closedAt?: string };
+  /**
+   * Every dispute on this month's charge, by Stripe dispute id. An entry without `closedAt` is open, and
+   * a dispute suspension lasts while ANY month has one open (or one was lost). A closed entry is final:
+   * a `charge.dispute.created` that arrives after it (reordered, retried, resent) changes nothing.
+   */
+  disputes?: Record<string, PaygDisputeRecord>;
+  /**
+   * Set in the same write that moves the month to `held`; cleared only after the on-call alert about it
+   * went out. A sweep that dies before alerting leaves it set, and the next sweep sends it.
+   */
+  alertPending?: string;
   /** On `multiple_invoices`: the live invoices Stripe holds for the month. */
   conflictingInvoiceIds?: string[];
+}
+
+/** One dispute on a month's overage charge. `status` is Stripe's closing status (won, lost, warning_closed). */
+export interface PaygDisputeRecord {
+  at: string;
+  status?: string;
+  closedAt?: string;
 }
 
 /** AW-Users `paygSettlements`, keyed by UTC `YYYY-MM`. */
@@ -163,15 +180,16 @@ export function paygSpendDriftTolerable(settledMicroUsd: number, projectedMicroU
 }
 
 /**
- * The gate's PAYG block with the unpaid invoice's page added — only for a `payg_suspended` block, and only
- * when the caller IS the billing owner (a pooled member is never shown the owner's invoice).
+ * The gate's PAYG block with the unpaid invoice's page added — only for a `payg_suspended` block, only
+ * when the caller IS the billing owner (a pooled member is never shown the owner's invoice), and never
+ * for a dispute hold (paying an invoice does not lift it; its copy asks the owner to contact us).
  */
-export function withOwnerOpenInvoice<T extends { reason: string; openInvoiceUrl?: string }>(
+export function withOwnerOpenInvoice<T extends { reason: string; paygSuspendedReason?: string; openInvoiceUrl?: string }>(
   block: T | null | undefined,
   callerIsBillingOwner: boolean,
   settlements: PaygSettlements | null | undefined,
 ): T | null | undefined {
-  if (!block || block.reason !== 'payg_suspended' || !callerIsBillingOwner) return block;
+  if (!block || block.reason !== 'payg_suspended' || !callerIsBillingOwner || block.paygSuspendedReason === 'dispute') return block;
   const openInvoiceUrl = paygOpenInvoiceUrl(settlements);
   return openInvoiceUrl ? { ...block, openInvoiceUrl } : block;
 }
