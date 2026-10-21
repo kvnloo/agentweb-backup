@@ -675,7 +675,7 @@ export async function syncSubscriptionFromStripe(
       customer: stripeCustomerId,
       status: 'all',
       limit: 10,
-      expand: ['data.discount.coupon'],
+      expand: ['data.discounts'],
     });
 
     if (subscriptions.data.length === 0) {
@@ -839,7 +839,7 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
   if (stripeSubscriptionId) {
     try {
       const s = getStripeOrThrow();
-      subscription = await s.subscriptions.retrieve(stripeSubscriptionId, { expand: ['discount.coupon'] });
+      subscription = await s.subscriptions.retrieve(stripeSubscriptionId, { expand: ['discounts'] });
       actualStatus = subscription.status; // Could be 'trialing', 'active', etc.
       currentPeriodEnd = getSubscriptionPeriodEndIso(subscription);
     } catch (err) {
@@ -1027,8 +1027,22 @@ export async function handleSubscriptionUpdated(
     }
   }
 
-  // Always sync activeOffer — set to null when discount is removed
-  updateData.activeOffer = extractActiveOffer(subscription);
+  // Always sync activeOffer — set to null when discount is removed. A webhook
+  // payload carries Basil `discounts` as ids, so fetch them expanded rather
+  // than clear a live offer; if that fetch fails, leave activeOffer as it is
+  // (the next invoice or reconcile sync corrects it).
+  let offerSource: SubscriptionDiscountSource | null = subscription;
+  if (typeof pickSubscriptionDiscount(subscription) === 'string') {
+    try {
+      offerSource = await getStripeOrThrow().subscriptions.retrieve(subscription.id, { expand: ['discounts'] });
+    } catch (err) {
+      offerSource = null;
+      console.warn(`[STRIPE] Failed to expand discounts of ${subscription.id}; activeOffer left unchanged: ${err}`);
+    }
+  }
+  if (offerSource) {
+    updateData.activeOffer = extractActiveOffer(offerSource);
+  }
 
   await userDb.updateUser(user.userId, updateData);
   syncUserUpdateToLeadList(user.email, {
@@ -1111,7 +1125,7 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
   if (subIdToFetch) {
     try {
       const s = getStripeOrThrow();
-      const subscription = await s.subscriptions.retrieve(subIdToFetch, { expand: ['discount.coupon'] }) as any;
+      const subscription = await s.subscriptions.retrieve(subIdToFetch, { expand: ['discounts'] }) as any;
       const invoicePeriodEndIso = getSubscriptionPeriodEndIso(subscription);
       if (invoicePeriodEndIso) {
         updateData.current_period_end = invoicePeriodEndIso;
@@ -1591,9 +1605,41 @@ export async function handleSubscriptionScheduleEnded(schedule: any): Promise<vo
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
+/** The part of a subscription (any API version) the activeOffer reads. */
+interface SubscriptionDiscountSource {
+  discounts?: Array<string | Stripe.Discount> | null;
+  /** Pre-Basil location. */
+  discount?: Stripe.Discount | null;
+}
+
 /**
- * Extract activeOffer from a Stripe subscription's discount field.
- * Returns null when there is no discount or the discount has no coupon.
+ * The subscription discount an activeOffer describes.
+ *
+ * Basil (2025-03-31+) removed `subscription.discount`; a subscription carries
+ * `discounts: Array<string | Stripe.Discount>`, ids unless expanded with
+ * `expand: ['discounts']` (list: `data.discounts`). A Basil Discount embeds its
+ * `coupon` (not expandable, no `source` wrapper in this version).
+ *
+ * When several discounts apply, the FIRST entry of `discounts` is used: that is
+ * Stripe's own order, the order it applies them in, so the pick is
+ * deterministic. The legacy `discount` (pre-Basil webhook payloads) is the
+ * fallback when that entry is not expanded. Returns the discount's id when it
+ * is not expanded and no legacy discount is present (the caller must fetch).
+ */
+function pickSubscriptionDiscount(
+  subscription: SubscriptionDiscountSource | null | undefined
+): Stripe.Discount | string | null {
+  const first = Array.isArray(subscription?.discounts) ? subscription.discounts[0] : undefined;
+  if (first && typeof first === 'object' && first.coupon) return first;
+  const legacy = subscription?.discount;
+  if (legacy && typeof legacy === 'object' && legacy.coupon) return legacy;
+  return typeof first === 'string' && first ? first : null;
+}
+
+/**
+ * Extract activeOffer from a Stripe subscription's discount (see
+ * pickSubscriptionDiscount). Returns null when there is no discount, the
+ * discount has no coupon, or it is an unexpanded id.
  */
 function extractActiveOffer(subscription: any): {
   couponId: string;
@@ -1604,8 +1650,8 @@ function extractActiveOffer(subscription: any): {
   durationInMonths: number | null;
   endsAt: string | null;
 } | null {
-  const discount = subscription?.discount;
-  if (!discount || !discount.coupon) return null;
+  const discount = pickSubscriptionDiscount(subscription);
+  if (!discount || typeof discount === 'string') return null;
   const coupon = discount.coupon;
   return {
     couponId: coupon.id,
@@ -1726,7 +1772,7 @@ export async function reconcileStripeUser(
     customer: user.stripe_customer_id,
     status: 'all',
     limit: 10,
-    expand: ['data.discount.coupon'],
+    expand: ['data.discounts'],
   });
 
   // Find the most relevant subscription: active > trialing > past_due > canceled
