@@ -202,6 +202,59 @@ describe('getUserIdByHubSpotPortalId', () => {
       await slow;
     });
 
+    it('a pre-move rebuild that finishes LATE cannot overwrite the fresh snapshot that replaced it', async () => {
+      const before = mockUsers;
+      let releaseOld!: (u: any[]) => void;
+      mockGetAllUsers
+        .mockImplementationOnce(async () => before)                                   // scan 1: initial snapshot
+        .mockImplementationOnce(() => new Promise(res => { releaseOld = res; }))       // scan 2: slow, reads the PRE-move view
+        .mockImplementation(async () => mockUsers);                                    // scan 3+: current data
+      expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
+      now += MISS_REFRESH + 1;
+      const slow = getUserIdByHubSpotPortalId(999);                                    // unknown portal: starts the slow rebuild
+      await new Promise(r => setImmediate(r));
+      mockUsers = [user('u1'), user('u5', hs(111))];                                   // 111 moves to u5
+      expect(await getUserIdByHubSpotPortalId(111)).toBe('u5');                        // scan 3 publishes the fresh snapshot
+      releaseOld(before);                                                              // ...and THEN the old rebuild returns its pre-move view
+      await slow;
+      mockGetAllUsers.mockClear();
+      expect(await getUserIdByHubSpotPortalId(111)).toBe('u5');                        // still the fresh snapshot: u5 verifies, no rescan
+      expect(mockGetAllUsers).not.toHaveBeenCalled();
+    });
+
+    it('a stale owner + a FAILED rebuild does not take the other portals down: they keep answering from the old snapshot', async () => {
+      expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
+      mockUsers = [user('u1'), user('u2', hs(222))];            // 111 disconnected; 222 untouched
+      mockGetAllUsers.mockRejectedValue(new Error('throttled'));
+      expect(await getUserIdByHubSpotPortalId(111)).toBeNull(); // the stale portal is never served
+      expect(await getUserIdByHubSpotPortalId(222)).toBe('u2'); // ...but 222 still resolves during the outage
+    });
+
+    it('many callers that all find the SAME owner stale cause ONE extra scan, not one each', async () => {
+      expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
+      expect(mockGetAllUsers).toHaveBeenCalledTimes(1);
+      mockUsers = [user('u1'), user('u5', hs(111))];            // 111 moved
+      const results = await Promise.all(Array.from({ length: 12 }, () => getUserIdByHubSpotPortalId(111)));
+      expect(results.every(r => r === 'u5')).toBe(true);
+      expect(mockGetAllUsers).toHaveBeenCalledTimes(2);
+    });
+
+    it('a rebuild that already published a FRESH snapshot is not thrown away by a late caller that saw the old one', async () => {
+      expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
+      mockUsers = [user('u1'), user('u5', hs(111))];
+      let release!: () => void;
+      const gate = new Promise<void>(res => { release = res; });
+      const realVerify = mockGetUserById.getMockImplementation()!;
+      // every verifier read waits on the gate, so all callers hold the OLD snapshot when they get their answer
+      mockGetUserById.mockImplementation(async (id: string) => { await gate; return realVerify(id); });
+      const calls = Array.from({ length: 6 }, () => getUserIdByHubSpotPortalId(111));
+      await new Promise(r => setImmediate(r));
+      release();
+      const out = await Promise.all(calls);
+      expect(out.every(r => r === 'u5')).toBe(true);
+      expect(mockGetAllUsers).toHaveBeenCalledTimes(2);
+    });
+
     it('a verified hit costs ONE by-id read and no scan', async () => {
       expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
       mockGetUserById.mockClear();
