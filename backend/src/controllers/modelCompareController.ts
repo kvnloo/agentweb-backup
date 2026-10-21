@@ -21,6 +21,7 @@ import { resolveOpenRouterUpstreamModelId } from '../utils/openRouterGatewayCont
 import { LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
 import { modelCompareEntitlement } from '../services/agentMode/modelCompareEntitlement';
 import { getTierCompareBlock } from '../services/agentMode/modelAccessInstance';
+import { agentWebModelRouter } from '../services/agentMode/agentWebModelRouterInstance';
 import { isCronEnabled } from '../utils/instanceState';
 import { resolveRunFunding, withRunFunding, type RunFunding } from '../services/funding/runFunding';
 import {
@@ -114,6 +115,7 @@ function compareDeps(): CompareDeps {
     isFeatureEnabled: isModelCompareEnabled,
     isEntitled: (user) => modelCompareEntitlement.isEntitled(user),
     getTierCompareBlock,
+    isAgentWebModelRouterEnabled: () => agentWebModelRouter.isEnabled(),
     getSession,
     checkUsage: (userId) => checkTokenUsage(userId),
     buildUsageBlock: (month, paygBlock) => buildUsageBlockCopy({ month, paygBlock }),

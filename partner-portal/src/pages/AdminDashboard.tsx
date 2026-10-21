@@ -119,6 +119,7 @@ import {
 } from "@mui/icons-material";
 import { staffOperatedBadge, type SelfActivitySignal } from "../utils/selfActivityBadge";
 import { ErrorState } from "../components/StatusState";
+import { withoutAgentWebModel } from "../utils/agentWebModel";
 
 interface TabPanelProps {
   children?: React.ReactNode;
@@ -8747,8 +8748,11 @@ const AgentModeSettings = () => {
         headers: { Authorization: `Bearer ${token}` }
       });
       if (Array.isArray(response.data) && response.data.length > 0) {
-        setSupportedModels(response.data);
-        return response.data;
+        // ENG-669 PR-C: the configured default stands in when nothing was chosen, so it must be one concrete model, never
+        // the AgentWeb Model (a per-turn router).
+        const models = withoutAgentWebModel(response.data);
+        setSupportedModels(models);
+        return models;
       }
     } catch (error) {
       console.error('Error loading supported models:', error);

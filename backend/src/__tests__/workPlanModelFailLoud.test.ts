@@ -207,6 +207,25 @@ describe('applyPredefinedWorkPlan (Emma tool / launch / accept core)', () => {
     expect(mockAlert).toHaveBeenCalledWith(expect.objectContaining({ dedupeKey: 'workplan_model_invalid:plan-1:retired-9' }));
   });
 
+  it('ENG-669 PR-C: an unattended launch pinned to an unavailable AgentWeb Model is refused without paging (the router alert covers it)', async () => {
+    const { agentWebModelRouter } = await import('../services/agentMode/agentWebModelRouterInstance');
+    for (const table of [undefined, '{not json']) {
+      agentWebModelRouter.reset();
+      mockAlert.mockClear();
+      mockSettings.agentweb_model_router_enabled = table ? 'true' : undefined;
+      mockSettings.agentweb_model_routing_table = table;
+      const r: any = await launch('agentweb-model', { isUnattendedRun: true });
+      expect(r.errorType).toBe('model_unavailable');
+      expect(r.message).toContain('(AgentWeb Model)');
+      expectNoSideEffects();
+      await new Promise((res) => setImmediate(res));
+      expect(mockAlert.mock.calls.map(([a]) => a.dedupeKey).filter((k) => String(k).startsWith('workplan_model_invalid'))).toEqual([]);
+    }
+    delete mockSettings.agentweb_model_router_enabled;
+    delete mockSettings.agentweb_model_routing_table;
+    agentWebModelRouter.reset();
+  });
+
   it('a FAILED model write refuses the launch and writes nothing else (model is written first)', async () => {
     db.updateSessionLlmModel.mockRejectedValueOnce(new Error('ddb down'));
     const r: any = await launch('gpt-5-chat');

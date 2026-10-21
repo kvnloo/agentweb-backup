@@ -97,17 +97,39 @@ describe('ENG-827 — the worker forwards the publish authorization in the right
     // The trailing arguments, in the order generateMarketingResponse declares them.
     // Asserted by VALUE SHAPE as well as position, so a swap cannot pass: a number is
     // never an authorization, and an authorization is never a deadline.
-    // ENG-2072: isUnattendedRun is now the LAST declared parameter — see that ticket's
+    // ENG-669 PR-C: modelRouting is now the LAST declared parameter, after ENG-2072's isUnattendedRun — see the
     // note in generateMarketingResponseWorker.ts about keeping this list in sync.
-    expect(args[args.length - 5]).toBe(turnStartMs);
-    expect(args[args.length - 4]).toEqual(authorization);
-    expect(args[args.length - 3]).toBeUndefined();
-    expect(args[args.length - 2]).toBe(true);
-    expect(args[args.length - 1]).toBeUndefined(); // isUnattendedRun, not supplied by this test
-    expect(typeof args[args.length - 5]).toBe('number');
+    expect(args[args.length - 6]).toBe(turnStartMs);
+    expect(args[args.length - 5]).toEqual(authorization);
+    expect(args[args.length - 4]).toBeUndefined();
+    expect(args[args.length - 3]).toBe(true);
+    expect(args[args.length - 2]).toBeUndefined(); // isUnattendedRun, not supplied by this test
+    expect(args[args.length - 1]).toBeUndefined(); // modelRouting, not supplied by this test
+    expect(typeof args[args.length - 6]).toBe('number');
   });
 
-  it('ENG-2072: passes isUnattendedRun as the last declared argument', async () => {
+  it('ENG-669 PR-C: passes modelRouting as the last declared argument', async () => {
+    const modelRouting = { llmSelected: 'agentweb-model', llmRoutingReason: 'chat task: table default', llmRoutingTableVersion: 't1' };
+    await handleMessage({
+      type: 'generateMarketingResponse',
+      requestId: 'req-3',
+      params: {
+        messageContent: 'go',
+        sessionHistory: [],
+        userId: 'user-1',
+        llmModel: 'gemini-3.5-flash',
+        sessionId: 'sess-1',
+        isUnattendedRun: true,
+        modelRouting,
+      },
+    });
+
+    const args = generateMarketingResponse.mock.calls[0];
+    expect(args[args.length - 1]).toEqual(modelRouting);
+    expect(args[args.length - 2]).toBe(true);
+  });
+
+  it('ENG-2072: passes isUnattendedRun right before modelRouting', async () => {
     await handleMessage({
       type: 'generateMarketingResponse',
       requestId: 'req-2',
@@ -123,6 +145,6 @@ describe('ENG-827 — the worker forwards the publish authorization in the right
 
     expect(generateMarketingResponse).toHaveBeenCalledTimes(1);
     const args = generateMarketingResponse.mock.calls[0];
-    expect(args[args.length - 1]).toBe(true);
+    expect(args[args.length - 2]).toBe(true);
   });
 });

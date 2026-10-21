@@ -152,6 +152,25 @@ describe('notice copy', () => {
   });
 });
 
+describe('notice copy: the AgentWeb Model router unavailable (ENG-669 PR-C)', () => {
+  it('a schedule on the AgentWeb Model names it and says it is unavailable right now, not gone', () => {
+    const notice = buildScheduleModelNotice({ scheduleName: 'Weekly report', modelLabel: 'AgentWeb Model', reason: 'not_served', routerUnavailable: true });
+    const text = [notice.subject, notice.headline, ...notice.paragraphs].join(' ');
+    expect(notice.subject).toBe('⚠️ Your scheduled chat "Weekly report" didn\'t run: its model is unavailable right now');
+    expect(text).toContain('is set to run on AgentWeb Model, which is unavailable right now');
+    expect(text).not.toMatch(/no longer available|agentweb-model/);
+  });
+
+  it('a work plan step on the AgentWeb Model says the same', () => {
+    const notice = buildWorkPlanStepModelNotice({
+      stepCount: 2, modelLabel: 'AgentWeb Model', reason: 'not_served', routerUnavailable: true, sessionId: 's-1', sessionTitle: 'Launch',
+    });
+    const text = [notice.subject, notice.headline, ...notice.paragraphs].join(' ');
+    expect(text).toContain('uses AgentWeb Model, which is unavailable right now');
+    expect(text).not.toMatch(/no longer available|agentweb-model/);
+  });
+});
+
 describe('emailService: the model_unavailable failure class', () => {
   beforeEach(() => jest.restoreAllMocks());
 

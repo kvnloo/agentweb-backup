@@ -87,6 +87,7 @@ import { reconcileUnconsumedCursors, ROW_KEYS as LEDGER_ROW_KEYS } from './agent
 import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
 import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionIndex } from '../utils/modelMentionRequest';
 import { resolveTurnModelCorrection } from '../utils/modelCorrectionStamp';
+import type { MessageModelRouting } from './agentMode/agentWebModelRouter';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
 // ENG-2103 (F2, Pattern A): resolveOrgProfileField's only 5 callers
 // (readBrandGuidelines/readMarketStrategy and friends) moved to
@@ -3033,6 +3034,9 @@ export class AgentModeService {
     // false/undefined otherwise); every other caller of generateMarketingResponse
     // is an attended interactive path and leaves this undefined.
     isUnattendedRun?: boolean,
+    // ENG-669 PR-C: set when `llmModel` was routed by the AgentWeb Model (the selection, the table rule and version).
+    // Stamped on this turn's assistant messages beside `llm`, like the ENG-1205 correction.
+    modelRouting?: MessageModelRouting,
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition; pendingApprovalDeck?: PendingApprovalDeck }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
@@ -4216,6 +4220,8 @@ export class AgentModeService {
 
         // Add LLM model to the response message
         responseMessage.llm = llmModel;
+        // ENG-669 PR-C: and, when the AgentWeb Model chose it, the selection and why.
+        if (modelRouting) Object.assign(responseMessage, modelRouting);
         // ENG-1205: and, when the model that ran is not the one that was asked
         // for, what was asked for — `llm` alone cannot distinguish "you picked
         // this" from "you were given this".
@@ -4930,6 +4936,7 @@ export class AgentModeService {
               role: 'assistant',
               content: staged.turnMessage,
               llm: llmModel,
+              ...modelRouting,
               metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true, approvalInboxManifestId: staged.manifestId },
             });
             if (onProgress) {
@@ -4976,6 +4983,7 @@ export class AgentModeService {
               role: 'assistant',
               content: deckPrompt,
               llm: llmModel,
+              ...modelRouting,
               // ENG-1635/1644 Phase B: no tool-call result carries the deck's data (unlike
               // ask_user_question, this halt is pushed as plain content) — this is the only
               // correlator the frontend has to know THIS message should render the
@@ -5013,6 +5021,7 @@ export class AgentModeService {
             role: 'assistant',
             content: confirmationPrompt,
             llm: llmModel,
+            ...modelRouting,
             metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true }
           });
           if (onProgress) {
@@ -5396,6 +5405,7 @@ export class AgentModeService {
             role: 'assistant',
             content,
             llm: llmModel,
+            ...modelRouting,
             metadata: { timestamp: new Date().toISOString() },
           });
         }

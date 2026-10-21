@@ -46,8 +46,13 @@ function isPlanLimit(reason: ModelUnavailableReason): boolean {
   return reason === 'not_in_plan';
 }
 
-function whyClause(reason: ModelUnavailableReason): string {
-  return isPlanLimit(reason) ? "which isn't included in your current plan" : 'which is no longer available';
+/**
+ * ENG-669 PR-C: `routerUnavailable` = the model is the AgentWeb Model and its router is off or unavailable right now.
+ * That is a temporary state, not a model that is gone, so the copy must not say "no longer available".
+ */
+function whyClause(reason: ModelUnavailableReason, routerUnavailable?: boolean): string {
+  if (isPlanLimit(reason)) return "which isn't included in your current plan";
+  return routerUnavailable ? 'which is unavailable right now' : 'which is no longer available';
 }
 
 const ONCE_ONLY =
@@ -57,20 +62,22 @@ export function buildScheduleModelNotice(input: {
   scheduleName: string;
   modelLabel: string;
   reason: ModelUnavailableReason;
+  routerUnavailable?: boolean;
 }): ModelNoticeCopy {
-  const { scheduleName, modelLabel, reason } = input;
+  const { scheduleName, modelLabel, reason, routerUnavailable } = input;
   const planLimit = isPlanLimit(reason);
+  const unavailable = routerUnavailable && !planLimit ? 'is unavailable right now' : 'is no longer available';
   return {
     // Same style as the other schedule emails (emailService): a leading emoji, and the name quoted mid-sentence.
     subject: planLimit
       ? `⚠️ Your scheduled chat "${scheduleName}" didn't run: its model isn't included in your plan`
-      : `⚠️ Your scheduled chat "${scheduleName}" didn't run: its model is no longer available`,
+      : `⚠️ Your scheduled chat "${scheduleName}" didn't run: its model ${unavailable}`,
     headline: planLimit
       ? "This schedule's model isn't included in your plan"
-      : "This schedule's model is no longer available",
+      : `This schedule's model ${unavailable}`,
     subheading: scheduleName,
     paragraphs: [
-      `Your scheduled chat "${scheduleName}" is set to run on ${modelLabel}, ${whyClause(reason)}. Its latest run did not start, and nothing was sent to a different model.`,
+      `Your scheduled chat "${scheduleName}" is set to run on ${modelLabel}, ${whyClause(reason, routerUnavailable)}. Its latest run did not start, and nothing was sent to a different model.`,
       planLimit
         ? `Each run of this schedule will stop in the same way until this is resolved. To fix this, please open the schedule and choose a model your plan includes, or upgrade your plan to keep using ${modelLabel}.`
         : 'Each run of this schedule will stop in the same way until this is resolved. To fix this, please open the schedule and choose another model.',
@@ -88,14 +95,17 @@ export function buildWorkPlanStepModelNotice(input: {
   stepCount: number;
   modelLabel: string;
   reason: ModelUnavailableReason;
+  /** ENG-669 PR-C: see whyClause. */
+  routerUnavailable?: boolean;
   sessionId: string;
   /** Set when the session is a run of one of the owner's schedules. */
   scheduleName?: string | null;
   /** The chat's title, used when there is no schedule to name. */
   sessionTitle?: string | null;
 }): ModelNoticeCopy {
-  const { stepCount, modelLabel, reason, sessionId } = input;
+  const { stepCount, modelLabel, reason, sessionId, routerUnavailable } = input;
   const planLimit = isPlanLimit(reason);
+  const unavailable = routerUnavailable && !planLimit ? 'is unavailable right now' : 'is no longer available';
   const scheduleName = input.scheduleName?.trim();
   const sessionTitle = input.sessionTitle?.trim();
   const where = scheduleName
@@ -106,13 +116,13 @@ export function buildWorkPlanStepModelNotice(input: {
   return {
     subject: planLimit
       ? `⚠️ ${workPlan} paused: a step's model isn't included in your plan`
-      : `⚠️ ${workPlan} paused: a step's model is no longer available`,
+      : `⚠️ ${workPlan} paused: a step's model ${unavailable}`,
     headline: planLimit
       ? "A work plan step's model isn't included in your plan"
-      : "A work plan step's model is no longer available",
+      : `A work plan step's model ${unavailable}`,
     subheading: scheduleName || sessionTitle || 'Work plan',
     paragraphs: [
-      `Step ${stepCount} of the work plan ${where} uses ${modelLabel}, ${whyClause(reason)}. The plan paused at that step, and nothing was sent to a different model.`,
+      `Step ${stepCount} of the work plan ${where} uses ${modelLabel}, ${whyClause(reason, routerUnavailable)}. The plan paused at that step, and nothing was sent to a different model.`,
       planLimit
         ? `To resume the plan, please open the chat, choose a model your plan includes in the model picker, and send a message. Alternatively, you can upgrade your plan to keep using ${modelLabel}.`
         : 'To resume the plan, please open the chat, choose another model in the model picker, and send a message.',
