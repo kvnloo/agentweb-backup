@@ -3,7 +3,7 @@
  * machine). These protect the sandbox's only way out: exact allowlist, public addresses only, bridge exemption only for the bridge,
  * bounded in every dimension, never echoing URLs or bodies.
  */
-import { mkdtempSync, rmSync, statSync, writeFileSync, existsSync } from "fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync, existsSync } from "fs";
 import { createServer, connect as netConnect, Socket, type Server } from "net";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -646,3 +646,120 @@ describe("vetted addresses, link-local and the DNS cache", () => {
     t2.client.destroy();
   });
 });
+
+describe("per-customer sockets (a customer can only exhaust its own share)", () => {
+  async function perUidRig(over: Partial<EgressProxyOptions> = {}) {
+    const dir = mkdtempSync(join(tmpdir(), "egress-uid-"));
+    dirs.push(dir);
+    const up = await upstream();
+    const proxy = await startEgressProxy({
+      perUid: { dir, max: 3, ownByUid: false },
+      allow: ["api.anthropic.com:443"],
+      resolve: async () => ["160.79.104.10"],
+      connect: () => netConnect({ port: up.port, host: "127.0.0.1" }),
+      maxConnections: 8,
+      ...over,
+    });
+    return { dir, proxy, up, close: async () => { await proxy.close(); await up.close(); } };
+  }
+  /** Holds `n` tunnels open through a socket (CONNECT + ClientHello, then silence). */
+  async function hold(sock: string, n: number): Promise<Socket[]> {
+    const held: Socket[] = [];
+    for (let i = 0; i < n; i++) {
+      const r = await talk(sock, hi("api.anthropic.com"), 150);
+      held.push(r.client);
+    }
+    return held;
+  }
+
+  it("listenFor creates <dir>/<uid>/proxy.sock, is idempotent, and serves a tunnel", async () => {
+    const r = await perUidRig();
+    const d = r.proxy.listenFor(400123);
+    expect(d).toBe(join(r.dir, "400123"));
+    expect(statSync(join(d, "proxy.sock")).isSocket()).toBe(true);
+    const t = await talk(join(d, "proxy.sock"), hi("api.anthropic.com"), 300);
+    expect(t.text).toContain("200 Connection established");
+    expect(r.proxy.listenFor(400123)).toBe(d); // asking again must NOT tear down the live listener or its tunnels
+    await sleep(50);
+    expect(t.client.destroyed).toBe(false);
+    expect(r.proxy.stats().perUid[400123]).toBe(1);
+    t.client.destroy();
+    await r.close();
+  });
+
+  it("one customer filling its own cap is refused (503) while another customer is served normally", async () => {
+    const r = await perUidRig();
+    const a = join(r.proxy.listenFor(400001), "proxy.sock");
+    const b = join(r.proxy.listenFor(400002), "proxy.sock");
+    const held = await hold(a, 3); // A is at its cap of 3
+    expect(r.proxy.stats().perUid[400001]).toBe(3);
+    const over = await talk(a, hi("api.anthropic.com"), 300);
+    expect(over.text).toContain("503");
+    const other = await talk(b, hi("api.anthropic.com"), 300);
+    expect(other.text).toContain("200 Connection established");
+    other.client.destroy();
+    held.forEach((s) => s.destroy());
+    await r.close();
+  });
+
+  it("the global cap still bounds the sum of all customers", async () => {
+    const r2 = await perUidRig({ maxConnections: 4 });
+    const a = join(r2.proxy.listenFor(400001), "proxy.sock");
+    const b = join(r2.proxy.listenFor(400002), "proxy.sock");
+    const h1 = await hold(a, 3);
+    const h2 = await hold(b, 1);
+    const over = await talk(b, hi("api.anthropic.com"), 300);
+    expect(over.text).toContain("503"); // B is under its own cap but the host total (4) is used up
+    [...h1, ...h2].forEach((s) => s.destroy());
+    await r2.close();
+  });
+
+  it("sockets are owned by the uid with mode 0600 when ownByUid is on (the bound directory is the unit's only view)", async () => {
+    const r = await perUidRig({ perUid: undefined });
+    expect(() => r.proxy.listenFor(400001)).toThrow(/not configured/);
+    await r.close();
+    const own = await perUidRig({ perUid: { dir: mkdtempSync(join(tmpdir(), "egress-own-")), max: 3, ownByUid: false } });
+    const dir = own.proxy.listenFor(400001);
+    expect(statSync(join(dir, "proxy.sock")).mode & 0o777).toBe(0o666); // unprivileged test mode; production mode is asserted live
+    await own.close();
+  });
+
+  it("rejects bad uids and forgetFor removes the directory and ends that customer's tunnels", async () => {
+    const r = await perUidRig();
+    expect(() => r.proxy.listenFor(0)).toThrow();
+    expect(() => r.proxy.listenFor(-5)).toThrow();
+    expect(() => r.proxy.listenFor(1.5)).toThrow();
+    const dir = r.proxy.listenFor(400001);
+    const held = await hold(join(dir, "proxy.sock"), 2);
+    r.proxy.forgetFor(400001);
+    await sleep(100);
+    expect(existsSync(dir)).toBe(false);
+    expect(held.every((s) => s.destroyed)).toBe(true);
+    expect(r.proxy.stats().perUid[400001]).toBeUndefined();
+    r.proxy.forgetFor(400001); // harmless twice
+    expect(existsSync(r.proxy.listenFor(400001))).toBe(true); // can come back
+    await r.close();
+  });
+
+  it("close() removes every customer's directory and ends their tunnels", async () => {
+    const r = await perUidRig();
+    const d1 = r.proxy.listenFor(400001);
+    const held = await hold(join(d1, "proxy.sock"), 2);
+    await r.proxy.close();
+    expect(existsSync(d1)).toBe(false);
+    await sleep(50);
+    expect(held.every((s) => s.destroyed)).toBe(true);
+    await r.up.close();
+  });
+
+  it("a stale socket from a previous run is replaced", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "egress-stale-"));
+    dirs.push(dir);
+    mkdirSync(join(dir, "400001"), { recursive: true });
+    writeFileSync(join(dir, "400001", "proxy.sock"), "stale");
+    const proxy = await startEgressProxy({ perUid: { dir, ownByUid: false }, allow: ["api.anthropic.com:443"] });
+    expect(statSync(join(proxy.listenFor(400001), "proxy.sock")).isSocket()).toBe(true);
+    await proxy.close();
+  });
+});
+

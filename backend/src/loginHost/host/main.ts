@@ -8,7 +8,7 @@
  * allocated uid, parks swaps that were interrupted), (4) only then the socket is created.
  */
 import { randomBytes } from "crypto";
-import { chmodSync, chownSync, existsSync, mkdirSync, readFileSync } from "fs";
+import { chmodSync, chownSync, existsSync, mkdirSync, readFileSync, rmSync } from "fs";
 import { ClaudeAdapter } from "../adapters/claudeAdapter";
 import type { SubscriptionProviderAdapter } from "../adapter";
 import { ConnectionManager, DEFAULT_CONFIG, type ManagerConfig } from "../connectionManager";
@@ -57,8 +57,18 @@ export function layoutFor(cfg: HostConfig): Layout {
   return new Layout({ env: cfg.env, stateRoot: cfg.stateRoot, sharedParent: cfg.sharedParent, uidMin: cfg.uidMin, uidMax: cfg.uidMax });
 }
 
-export function portConfigFor(cfg: HostConfig): SystemdPortConfig {
+/** The proxy is created after the port (start-up order), so the port reaches it through this holder; before it is set no unit can start. */
+export interface EgressRef {
+  current?: EgressProxyHandle;
+}
+
+export function portConfigFor(cfg: HostConfig, egressRef?: EgressRef): SystemdPortConfig {
   return {
+    // Every unit gets ITS OWN proxy socket (created now, synchronously, before the unit starts): fail closed if the proxy is not up.
+    egressFor: (uid) => {
+      if (!egressRef?.current) throw new Error("egress_not_ready");
+      return egressRef.current.listenFor(uid);
+    },
     limits: cfg.limits,
     paths: { ...cfg.tools, inaccessible: [cfg.socket.dir], net: { dir: cfg.egressDir, launcher: cfg.egress.launcherPath, socat: cfg.egress.socat } },
     killTimeoutMs: 15_000,
@@ -73,11 +83,13 @@ export interface BuiltHost {
   port: SystemdUserFs;
   store: StateStore;
   manager: ConnectionManager;
+  egressRef: EgressRef;
 }
 
 export function buildHost(cfg: HostConfig, binary: VerifiedBinary, deps: HostDeps): BuiltHost {
   const layout = layoutFor(cfg);
-  const port = new SystemdUserFs({ layout, cmd: deps.cmd, root: deps.root, config: portConfigFor(cfg) });
+  const egressRef: EgressRef = {};
+  const port = new SystemdUserFs({ layout, cmd: deps.cmd, root: deps.root, config: portConfigFor(cfg, egressRef) });
   const store = new StateStore(deps.stateDir ?? `${cfg.stateRoot}/state`);
   const adapters =
     deps.adapters ??
@@ -103,7 +115,7 @@ export function buildHost(cfg: HostConfig, binary: VerifiedBinary, deps: HostDep
     log: deps.log,
     config: { ...DEFAULT_CONFIG, ...cfg.manager, uidMin: cfg.uidMin, uidMax: cfg.uidMax, ...(deps.managerOverrides ?? {}) },
   });
-  return { layout, port, store, manager };
+  return { layout, port, store, manager, egressRef };
 }
 
 /**
@@ -164,18 +176,20 @@ export async function startHost(cfg: HostConfig, binary: VerifiedBinary, deps: H
     await stopEnvironment(deps.cmd, cfg, built.layout);
     // The egress proxy comes up BEFORE the API socket: no customer process can run until the host serves, and none may ever run without it.
     const egressDir = deps.egressDir ?? cfg.egressDir;
-    if (!existsSync(egressDir)) mkdirSync(egressDir, { recursive: true, mode: 0o755 });
+    rmSync(egressDir, { recursive: true, force: true }); // sockets of a previous run are stale; every customer's is created again on demand
+    mkdirSync(egressDir, { recursive: true, mode: 0o755 });
     if (deps.chownSocket !== false) {
       chownSync(egressDir, 0, 0);
       chmodSync(egressDir, 0o755); // customer uids must be able to reach the socket inside; the allowlist is the gate, not the directory
     }
     egress = await startEgressProxy({
-      socketPath: `${egressDir}/proxy.sock`,
+      perUid: { dir: egressDir, ownByUid: deps.chownSocket !== false },
       allow: cfg.egress.allow,
       bridge: bridgeTarget(cfg.claude.bridgeUrl),
       ...(deps.egressResolve ? { resolve: deps.egressResolve } : {}),
       logger: { warn: (event, fields) => deps.log.warn(event, Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, typeof v === "number" || typeof v === "boolean" ? v : String(v)]))) },
     });
+    built.egressRef.current = egress;
     const sockDir = deps.socketDir ?? cfg.socket.dir;
     const sockPath = `${sockDir}/host.sock`;
     if (!existsSync(sockDir)) mkdirSync(sockDir, { recursive: true, mode: 0o750 });
@@ -198,6 +212,7 @@ export async function startHost(cfg: HostConfig, binary: VerifiedBinary, deps: H
         if (down) return;
         down = true;
         await handle.close();
+        built.egressRef.current = undefined; // from now on no unit can start (fail closed)
         await egress?.close().catch(() => undefined);
         try {
           await stopEnvironment(deps.cmd, cfg, built.layout);

@@ -15,11 +15,18 @@
  *   - It never logs or keeps a URL, a header or a body: a denial logs `host:port` and a reason, nothing else.
  */
 import { promises as dnsPromises } from "dns";
-import { chmodSync, existsSync, rmSync } from "fs";
+import { chmodSync, chownSync, existsSync, mkdirSync, rmSync } from "fs";
 import { connect as netConnect, createServer, isIP, type Server, type Socket } from "net";
 
 export interface EgressProxyOptions {
-  socketPath: string;
+  /** A shared listener. Production units do NOT use it (see `perUid`): they each get their own socket, so omit it there. */
+  socketPath?: string;
+  /**
+   * Per-customer sockets: `listenFor(uid)` creates `<dir>/<uid>/proxy.sock`, owned by that uid with mode 0600, so a customer can reach only
+   * its own socket (and the directory is the only thing its unit sees). Each customer then has its own connection cap and cannot
+   * exhaust anyone else's share of the proxy. `ownByUid: false` (tests, unprivileged) leaves the socket world-connectable instead.
+   */
+  perUid?: { dir: string; max?: number; ownByUid?: boolean };
   /** Unix mode of the socket file. Sandboxes run as arbitrary customer uids, so the default is world-connectable; the directory and the allowlist are the gates. */
   socketMode?: number;
   /** Exact `host:port` entries, hostnames lowercase, e.g. `api.anthropic.com:443`. */
@@ -45,8 +52,12 @@ export interface EgressProxyOptions {
 }
 
 export interface EgressProxyHandle {
+  /** Creates (or returns) the listener of one customer uid and gives back the directory to bind into its units. Synchronous: it must exist before the unit starts. Needs `perUid`. */
+  listenFor(uid: number): string;
+  /** Stops one customer's listener and its tunnels, and removes its directory. */
+  forgetFor(uid: number): void;
   close(): Promise<void>;
-  stats(): { allowed: number; denied: number; active: number };
+  stats(): { allowed: number; denied: number; active: number; perUid: Record<number, number> };
 }
 
 export class EgressSocketInUseError extends Error {
@@ -500,48 +511,110 @@ export async function startEgressProxy(opts: EgressProxyOptions): Promise<Egress
     }
   };
 
-  if (existsSync(opts.socketPath)) {
-    if (await socketIsLive(opts.socketPath)) throw new EgressSocketInUseError(); // never hijack another proxy
-    rmSync(opts.socketPath, { force: true });
+  const everyone = new Set<Socket>(); // EVERY accepted socket, over-cap ones too: close() must be able to end them all
+  const perUidMax = opts.perUid?.max ?? 32;
+
+  /** One listener (shared, or one customer's). `mine` is that listener's admitted tunnels; `cap` its own limit on top of the global one. */
+  const makeServer = (mine: Set<Socket>, cap: number): Server => {
+    const server: Server = createServer((client) => {
+      client.on("error", () => undefined);
+      everyone.add(client);
+      client.once("close", () => everyone.delete(client));
+      if (clients.size >= maxConnections || mine.size >= cap) {
+        // Over a cap: answer, then drop on a short timer. A peer that never reads or closes must not hold a descriptor of the host.
+        reply(client, 503, "Service Unavailable");
+        const t = setTimeout(() => client.destroy(), 2_000);
+        t.unref?.();
+        client.once("close", () => clearTimeout(t));
+        return;
+      }
+      clients.add(client);
+      mine.add(client);
+      client.once("close", () => {
+        clients.delete(client);
+        mine.delete(client);
+      });
+      void handle(client);
+    });
+    // Never more than twice the cap of open descriptors, however the peers behave (the cap itself answers 503 below this ceiling).
+    server.maxConnections = Math.min(cap, maxConnections) * 2 + 16;
+    // Permanent: an accept error (EMFILE) must be logged, never thrown into the host process.
+    server.on("error", (err) => opts.logger?.warn("egress_server_error", { code: (err as { code?: string }).code ?? "error" }));
+    return server;
+  };
+
+  // The shared listener (tests and tools; production units get per-customer sockets instead).
+  let shared: { server: Server; path: string } | undefined;
+  if (opts.socketPath) {
+    const path = opts.socketPath;
+    if (existsSync(path)) {
+      if (await socketIsLive(path)) throw new EgressSocketInUseError(); // never hijack another proxy
+      rmSync(path, { force: true });
+    }
+    const server = makeServer(clients, maxConnections);
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(path, () => {
+        server.off("error", reject);
+        resolve();
+      });
+    });
+    chmodSync(path, opts.socketMode ?? 0o666);
+    shared = { server, path };
   }
 
-  const everyone = new Set<Socket>(); // EVERY accepted socket, over-cap ones too: close() must be able to end them all
-  const server: Server = createServer((client) => {
-    client.on("error", () => undefined);
-    everyone.add(client);
-    client.once("close", () => everyone.delete(client));
-    if (clients.size >= maxConnections) {
-      // Over the cap: answer, then drop on a short timer. A peer that never reads or closes must not hold a descriptor of the host.
-      reply(client, 503, "Service Unavailable");
-      const t = setTimeout(() => client.destroy(), 2_000);
-      t.unref?.();
-      client.once("close", () => clearTimeout(t));
-      return;
+  // Per-customer listeners.
+  const perUid = new Map<number, { server: Server; dir: string; path: string; mine: Set<Socket> }>();
+  const listenFor = (uid: number): string => {
+    if (!opts.perUid) throw new Error("egress: per-uid sockets are not configured");
+    if (!Number.isInteger(uid) || uid < 1) throw new Error("egress: bad uid");
+    const known = perUid.get(uid);
+    if (known && known.server.listening) return known.dir;
+    if (known) forgetFor(uid);
+    const dir = `${opts.perUid.dir}/${uid}`;
+    const path = `${dir}/proxy.sock`;
+    mkdirSync(dir, { recursive: true, mode: 0o755 });
+    rmSync(path, { force: true }); // a stale one from a previous run of this host
+    const mine = new Set<Socket>();
+    const server = makeServer(mine, perUidMax);
+    // For a unix socket, bind() and listen() happen inside this call: the file exists, and is connectable, when it returns. The unit that
+    // needs it is started only after. Until chown/chmod below the file is root-owned with the umask's mode (not connectable by others).
+    server.listen(path);
+    if (opts.perUid.ownByUid !== false) {
+      chownSync(path, uid, uid);
+      chmodSync(path, 0o600);
+    } else {
+      chmodSync(path, 0o666);
     }
-    clients.add(client);
-    client.once("close", () => clients.delete(client));
-    void handle(client);
-  });
-  // Never more than twice the cap of open descriptors, however the peers behave (the cap itself answers 503 below this ceiling).
-  server.maxConnections = maxConnections * 2 + 16;
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(opts.socketPath, () => {
-      server.off("error", reject);
-      resolve();
-    });
-  });
-  // Permanent: an accept error (EMFILE) must be logged, never thrown into the host process.
-  server.on("error", (err) => opts.logger?.warn("egress_server_error", { code: (err as { code?: string }).code ?? "error" }));
-  chmodSync(opts.socketPath, opts.socketMode ?? 0o666);
+    perUid.set(uid, { server, dir, path, mine });
+    return dir;
+  };
+  const forgetFor = (uid: number): void => {
+    const l = perUid.get(uid);
+    if (!l) return;
+    perUid.delete(uid);
+    for (const c of l.mine) c.destroy();
+    l.server.close();
+    rmSync(l.dir, { recursive: true, force: true });
+  };
 
   return {
-    stats: () => ({ allowed: counters.allowed, denied: counters.denied, active: clients.size }),
+    listenFor,
+    forgetFor,
+    stats: () => ({
+      allowed: counters.allowed,
+      denied: counters.denied,
+      active: clients.size,
+      perUid: Object.fromEntries([...perUid].map(([uid, l]) => [uid, l.mine.size])),
+    }),
     close: () =>
       new Promise<void>((resolve) => {
         for (const c of everyone) c.destroy();
+        for (const uid of [...perUid.keys()]) forgetFor(uid);
+        if (!shared) return resolve();
+        const { server, path } = shared;
         server.close(() => {
-          rmSync(opts.socketPath, { force: true });
+          rmSync(path, { force: true });
           resolve();
         });
       }),
