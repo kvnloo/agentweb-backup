@@ -1,0 +1,146 @@
+/**
+ * ENG-669 PR-C: the process-wide AgentWeb Model router (one switch cache, one table cache) and the two things every
+ * caller needs from it: route a selection of `agentweb-model` for a turn, and check that a selection can be stored.
+ *
+ * Service-graph modules are imported lazily, as in modelAccessInstance.ts: modelPin.ts (and through it
+ * emma/impl/workPlans.ts) reaches this file, and nothing here does any work while the switch is off.
+ */
+import { LLM_MODEL_REGISTRY } from './llmModelRegistry';
+import { getModelPrice } from '../../utils/llmPricing';
+import { ALL_MODELS, resolveLegacyModelAlias } from './modelAccess';
+import {
+  AGENTWEB_MODEL_ID,
+  createAgentWebModelRouter,
+  taskTypeForSession,
+  type AgentWebModelRoute,
+  type AgentWebModelRouter,
+  type AgentWebTaskType,
+  type RouterModelCatalog,
+} from './agentWebModelRouter';
+import {
+  listSubscriptionTiers,
+  modelAccess,
+  storedBindingSource,
+  systemModelCheck,
+  type BindingSource,
+  type SystemModelSession,
+} from './modelAccessInstance';
+
+/** The registry and price table as the routing table sees them (pure modules, no service graph). */
+export const registryRouterCatalog: RouterModelCatalog = {
+  canonical: (id) => {
+    const canonical = resolveLegacyModelAlias(id);
+    return Object.prototype.hasOwnProperty.call(LLM_MODEL_REGISTRY, canonical) ? canonical : undefined;
+  },
+  unsuitable: (id) => {
+    const config = LLM_MODEL_REGISTRY[id];
+    if (!config) return 'not a registered model';
+    if (config.adminOnly) return 'admin-only';
+    if (config.internalOnly) return 'internal-only';
+    if (config.isLive) return 'live voice';
+    if (config.supportsTools === false) return 'cannot call tools';
+    if (!getModelPrice(id)) return 'unpriced';
+    return undefined;
+  },
+};
+
+export const agentWebModelRouter: AgentWebModelRouter = createAgentWebModelRouter({
+  getSetting: async (name) => (await import('../settingsService')).settingsService.getSetting(name),
+  catalog: registryRouterCatalog,
+  // With the tier allowlist off no plan narrows any model, so there is nothing to intersect the table with.
+  readTierAllowlists: async () => ((await modelAccess.isEnabled()) ? listSubscriptionTiers() : null),
+  normalizeModelId: resolveLegacyModelAlias,
+  alert: async ({ subject, detail, dedupeKey, dedupeWindowMs }) => {
+    const { sendAgentModeOncallAlert } = await import('../../utils/agentModeAlerts');
+    return sendAgentModeOncallAlert({
+      subject,
+      message: `${detail}\n\nNOTE: deduped; further occurrences in the next hour are suppressed (grep "AgentWebModel:" in the logs).`,
+      context: { Setting: 'agentweb_model_routing_table' },
+      dedupeKey,
+      dedupeWindowMs,
+    });
+  },
+  now: () => Date.now(),
+  log: (message, fields) => console.error(message, fields ?? {}),
+});
+
+export interface RoutedSelection extends AgentWebModelRoute {
+  taskType: AgentWebTaskType;
+}
+
+/**
+ * Route a selection of the AgentWeb Model for one turn. The caller has checked the switch is on.
+ *
+ * 1. The SELECTION is the user's pick: it is checked against the owner's tier allowlist like any model (PR-A gate:
+ *    `agentweb-model` must be listed, or the tier is a wildcard), unless it is AgentWeb's own choice (`modelSource`
+ *    'system', the provenance of the stored stamp when omitted) or `skipTierCheck` (a paused account: nothing runs).
+ * 2. The routed model is AgentWeb's choice: not tier-checked as a pick, but the router refuses a route outside the
+ *    owner's live allowlist (and the table load already refused any tier/route mismatch).
+ * Throws ModelUnavailableError: `not_in_plan` for the selection, `not_served` when the router is unavailable.
+ */
+export async function routeAgentWebModelSelection(input: {
+  ownerUserId: string;
+  session?: SystemModelSession | null;
+  /** Default: the session's task type (no session = chat). */
+  taskType?: AgentWebTaskType;
+  modelSource?: BindingSource | (() => Promise<BindingSource>);
+  skipTierCheck?: boolean;
+}): Promise<RoutedSelection> {
+  if (!input.skipTierCheck && input.modelSource !== 'system') {
+    await modelAccess.assertModelAllowed({
+      ownerUserId: input.ownerUserId,
+      requestedModel: AGENTWEB_MODEL_ID,
+      canonicalModel: AGENTWEB_MODEL_ID,
+      isSystemModel: systemModelCheck(
+        input.session,
+        input.modelSource ?? (() => storedBindingSource(input.session, AGENTWEB_MODEL_ID, resolveLegacyModelAlias)),
+      ),
+    });
+  }
+  const [allowlistOn, access] = await Promise.all([modelAccess.isEnabled(), modelAccess.getModelAccess(input.ownerUserId)]);
+  const taskType = input.taskType ?? taskTypeForSession(input.session);
+  const route = await agentWebModelRouter.route({
+    tier: access.tier,
+    taskType,
+    allowedModels: allowlistOn && !access.isAdmin ? access.allowedModels : ALL_MODELS,
+  });
+  console.log('AgentWebModel: routed', {
+    owner: input.ownerUserId, tier: access.tier, taskType, model: route.model, reason: route.reason, tableVersion: route.tableVersion,
+  });
+  return { ...route, taskType };
+}
+
+/**
+ * Whether `agentweb-model` may be STORED as a selection (session PATCH, schedule / plan / step pins): the router is
+ * available, and the selection is in `ownerUserId`'s plan (omitted = an admin-authored pin, AgentWeb's choice: only
+ * availability is checked). The caller has checked the switch is on. Throws ModelUnavailableError like the turn would.
+ */
+export async function assertAgentWebModelSelectable(input: {
+  ownerUserId?: string;
+  session?: SystemModelSession | null;
+  taskType?: AgentWebTaskType;
+}): Promise<void> {
+  if (input.ownerUserId) {
+    await routeAgentWebModelSelection({
+      ownerUserId: input.ownerUserId,
+      session: input.session,
+      taskType: input.taskType,
+      // A new pick: the user's choice (re-picking the stored selection keeps its stamp's source).
+      modelSource: () => storedBindingSource(input.session, AGENTWEB_MODEL_ID, resolveLegacyModelAlias),
+    });
+    return;
+  }
+  await agentWebModelRouter.route({ tier: null, taskType: input.taskType ?? taskTypeForSession(input.session), allowedModels: ALL_MODELS });
+}
+
+/**
+ * Whether the pickers offer the AgentWeb Model to this owner: the switch is on (off: nothing is read beyond the cached
+ * switch), the router is available, and the owner's tier includes it. No owner (an anonymous catalog read) = not offered.
+ */
+export async function offersAgentWebModel(ownerUserId: string | null | undefined): Promise<boolean> {
+  if (!(await agentWebModelRouter.isEnabled())) return false;
+  if (!(await agentWebModelRouter.isAvailable())) return false;
+  if (!ownerUserId) return false;
+  const allowed = await modelAccess.filterAllowedModels(ownerUserId, [AGENTWEB_MODEL_ID]);
+  return allowed.includes(AGENTWEB_MODEL_ID);
+}

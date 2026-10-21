@@ -81,6 +81,11 @@ export interface ChatMessage {
   content: string;
   timestamp?: string; // Add direct timestamp field
   llm?: string; // LLM model used for this message (for assistant messages)
+  // ENG-669 PR-C: set when `llm` was chosen by the AgentWeb Model router: the user's selection ('agentweb-model'), the
+  // table rule that picked `llm`, and the table version ("AgentWeb Model · via <llm>").
+  llmSelected?: string;
+  llmRoutingReason?: string;
+  llmRoutingTableVersion?: string;
   name?: string; // For tool messages
   tool_call_id?: string; // For tool messages
   tool_calls?: any[]; // For assistant messages with tool calls
@@ -479,6 +484,11 @@ export interface ChatSession {
     modelSelectionReason: string;
     usageMode: 'full_choice' | 'optimized' | 'paused';
     usagePolicyVersion: string | null;
+    // ENG-669 PR-C: present when the selection was the AgentWeb Model (`requestedModel`): the router's provenance for
+    // the concrete `effectiveModel` that ran. The session's llmModel keeps the selection.
+    routedVia?: 'agentweb-model';
+    routingReason?: string;
+    tableVersion?: string;
     recordedAt: string;
   };
   delegateInfo?: {

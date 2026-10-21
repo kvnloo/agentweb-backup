@@ -11,6 +11,7 @@
  * admin-authored (system) plan's pins are AgentWeb's choice, not the user's.
  */
 import { ModelUnavailableError } from './modelUnavailable';
+import { AGENTWEB_MODEL_ID } from './modelAccess';
 
 /**
  * ENG-669: the tier allowlist for a pin, against `tierOwnerUserId`'s plan. Lazy import: this module is reached from
@@ -84,6 +85,15 @@ export async function validateModelPin(
   const requested = normalizeRequestedLlmModel(raw);
   if (!requested) return '';
   if (typeof raw !== 'string') throw new ModelUnavailableError(requested, 'not_served');
+  // ENG-669 PR-C: the AgentWeb Model is a selectable pin while its switch is on (the router picks the model per run):
+  // available router, and the selection in `tierOwnerUserId`'s plan. Switch off: an unknown id, refused below as before.
+  if (requested === AGENTWEB_MODEL_ID) {
+    const { agentWebModelRouter, assertAgentWebModelSelectable } = await import('./agentWebModelRouterInstance');
+    if (await agentWebModelRouter.isEnabled()) {
+      await assertAgentWebModelSelectable({ ownerUserId: tierOwnerUserId });
+      return AGENTWEB_MODEL_ID;
+    }
+  }
   if (typeof registry.resolveGenerationModel !== 'function' || typeof registry.isModelSelectableBy !== 'function') {
     return requested;
   }
@@ -112,7 +122,8 @@ export async function resolvePlanLaunchModel(
 ): Promise<string | undefined> {
   const pin = await validateModelPin(registry, isAdmin, rawPlanModel, tierOwnerUserId);
   if (!pin) return undefined;
-  if (typeof registry.resolveGenerationModel !== 'function') return pin;
+  // ENG-669 PR-C: the AgentWeb Model is stored as the selection; it is not a registry id.
+  if (pin === AGENTWEB_MODEL_ID || typeof registry.resolveGenerationModel !== 'function') return pin;
   const resolution = registry.resolveGenerationModel(pin);
   return resolution.fellBack ? pin : resolution.model;
 }

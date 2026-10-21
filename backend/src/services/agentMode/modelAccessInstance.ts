@@ -21,17 +21,20 @@ import {
 
 export { isSystemAuthoredPlan };
 
+/** Every configured subscription tier (admin order) with its raw `allowedModels`. Throws when the setting is unreadable. */
+export async function listSubscriptionTiers(): Promise<TierModelsConfig[]> {
+  const { settingsService } = await import('../settingsService');
+  const setting = await settingsService.getSetting('subscription_types');
+  const parsed: unknown = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
+  return Array.isArray(parsed) ? (parsed as TierModelsConfig[]) : [];
+}
+
 export const modelAccess: ModelAccessService = createModelAccess({
   getSetting: async (name) => (await import('../settingsService')).settingsService.getSetting(name),
   getUser: async (userId) => (await import('../db')).userDb.getUserById(userId),
   resolveTier: async (userId) => (await import('../subscriptionService')).getUserSubscriptionResolution(userId),
   readTierModels: async (tierName) => (await import('../subscriptionService')).readTierAllowedModels(tierName),
-  listTiers: async () => {
-    const { settingsService } = await import('../settingsService');
-    const setting = await settingsService.getSetting('subscription_types');
-    const parsed: unknown = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
-    return Array.isArray(parsed) ? (parsed as TierModelsConfig[]) : [];
-  },
+  listTiers: () => listSubscriptionTiers(),
   // The same alias table agentModeService.normalizeModelId applies (a pure module, no service graph).
   normalizeModelId: resolveLegacyModelAlias,
   alertTierUnreadable: async ({ ownerUserId, tier, dedupeKey, dedupeWindowMs }) => {

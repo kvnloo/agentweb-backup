@@ -93,6 +93,12 @@ import {
   assertModelInOwnerPlan, isSystemAuthoredPlan, legacyPlanPinSource, modelAccess, storedBindingSource, systemModelCheck,
   type BindingSource, type SystemModelSession,
 } from '../services/agentMode/modelAccessInstance';
+import {
+  AGENTWEB_MODEL_DISPLAY_NAME, AGENTWEB_MODEL_ID, isAgentWebModelId, messageRoutingOf, routingFieldsOf, selectionOf, type AgentWebTaskType, type MessageModelRouting, type ModelRouting,
+} from '../services/agentMode/agentWebModelRouter';
+import {
+  agentWebModelRouter, assertAgentWebModelSelectable, offersAgentWebModel, routeAgentWebModelSelection,
+} from '../services/agentMode/agentWebModelRouterInstance';
 import { modelSourceAfter as modelSourceAfterStamp, resolveLegacyModelAlias, type ModelSource, type StoredModelRecord } from '../services/agentMode/modelAccess';
 import {
   anyStepCarriesModel,
@@ -107,7 +113,7 @@ import { stripImageDataForPersistence } from '../services/agentMode/incrementalP
 // ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
 // on existing report/run envelopes. No surface parses or re-ranks on its own.
 import { MarketingActionCarrier, normalizeMarketingActions } from '../services/marketingActionEnvelope';
-import { DiagnosisContext } from '../services/agentModeService';
+import { DiagnosisContext, type SupportedModelInfo } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import {
   collectMediaGeneratedSince,
@@ -353,7 +359,9 @@ async function applyScheduleEditWithConsentNarrowing(
   );
 }
 
-type EffectiveModelPolicyDecision = PolicyModelDecision & {
+// ENG-669 PR-C: a decision for a selection of the AgentWeb Model carries the router's provenance (`routedVia`,
+// `routingReason`, `tableVersion`); `effectiveModel` is the concrete model that runs, `requestedModel` the selection.
+type EffectiveModelPolicyDecision = PolicyModelDecision & Partial<ModelRouting> & {
   usageMode: 'full_choice' | 'optimized' | 'paused';
   usagePolicyVersion: string | null;
 };
@@ -368,6 +376,7 @@ export function toStoredModelPolicyDecision(decision: EffectiveModelPolicyDecisi
     modelSelectionReason: decision.reason,
     usageMode: decision.usageMode,
     usagePolicyVersion: decision.usagePolicyVersion,
+    ...routingFieldsOf(decision),
     recordedAt: new Date().toISOString(),
   };
 }
@@ -403,7 +412,7 @@ async function isUserAdmin(userId: string): Promise<boolean> {
  * admin-managed policy decide what can actually reach the provider.
  */
 // Exported so the fail-loud unit tests can call it directly.
-export async function resolveEffectiveModelForUser(input: {
+export async function resolveEffectiveModelForUser(rawInput: {
   userId: string;
   requestedModel?: string | null;
   backupModel?: string | null;
@@ -421,11 +430,34 @@ export async function resolveEffectiveModelForUser(input: {
   modelSource?: BindingSource | (() => Promise<BindingSource>);
   // ENG-669: the session the model runs in (its kind's configured default is exempt; its stored stamp's provenance).
   session?: SystemModelSession | null;
+  // ENG-669 PR-C: the task type the AgentWeb Model routes on when it is the requested model. Default: the session's
+  // (taskTypeForSession); a caller without a session for the run (a scheduled run) names it.
+  taskType?: AgentWebTaskType;
 }): Promise<EffectiveModelPolicyDecision> {
   const [usage, systemDefaultModel] = await Promise.all([
-    getEffectiveLlmUsagePolicy(input.userId),
+    getEffectiveLlmUsagePolicy(rawInput.userId),
     agentModeService.getDefaultModel(),
   ]);
+  // ENG-669 PR-C: a selection of the AgentWeb Model is the user's pick of the ROUTER: the selection is tier-checked,
+  // the router picks the concrete model for the task, and that model is resolved below as AgentWeb's choice (exempt
+  // from the tier check as a pick, never silently swapped: an unavailable router or routed model is a visible 422).
+  // No backup and no fallback: the routed model runs or the turn errors. A paused account keeps its plain 'blocked'
+  // decision (nothing runs, nothing is routed). Switch off: the id is an unknown model, exactly as before (only the
+  // cached switch is read, and only for this id).
+  let routing: ModelRouting | undefined;
+  let input = rawInput;
+  if (isAgentWebModelId(rawInput.requestedModel) && usage.mode.usageMode !== 'paused' && await agentWebModelRouter.isEnabled()) {
+    const routed = await routeAgentWebModelSelection({
+      ownerUserId: rawInput.userId,
+      session: rawInput.session,
+      taskType: rawInput.taskType,
+      modelSource: rawInput.modelSource,
+    });
+    routing = { routedVia: AGENTWEB_MODEL_ID, routingReason: routed.reason, tableVersion: routed.tableVersion };
+    input = {
+      ...rawInput, requestedModel: routed.model, backupModel: null, backupSource: null, allowSilentSwap: false, modelSource: 'system',
+    };
+  }
   // Older controller unit tests intentionally use partial service doubles.
   // The runtime service always has these methods; the identity fallbacks keep
   // unrelated legacy contracts on their original full-choice behavior.
@@ -541,6 +573,8 @@ export async function resolveEffectiveModelForUser(input: {
   }
   return {
     ...decision,
+    // The selection is what was requested; `effectiveModel` stays the routed model that runs.
+    ...(routing && { requestedModel: AGENTWEB_MODEL_ID, ...routing }),
     usageMode: usage.mode.usageMode,
     usagePolicyVersion: usage.policy?.version || null,
   };
@@ -2202,7 +2236,8 @@ async function resolveWorkPlanStepModelForTurn(
       // The plan's model is gone but the user chose another one: it runs, and the step adopts it (the engine marker then
       // follows the new step model, so the stamp is the engine's own from here on).
       const decision = await resolveHonored(pick, stepCount, 'user');
-      return { kind: 'resolved', stepCount, decision, source: 'user', ...(ownModel && { updateStepModelTo: decision.effectiveModel }) };
+      // ENG-669 PR-C: the step adopts the SELECTION (a pick of the AgentWeb Model stays the router on that step).
+      return { kind: 'resolved', stepCount, decision, source: 'user', ...(ownModel && { updateStepModelTo: selectionOf(decision) }) };
     }
     const display = typeof agentModeService.getModelDisplayName === 'function'
       ? agentModeService.getModelDisplayName(modelError.requestedModel)
@@ -7079,6 +7114,9 @@ export async function runScheduledChat(
         // admin-template pin is AgentWeb's choice (system models); any other pin is the owner's
         // choice and must be in the owner's plan.
         modelSource: scheduleRunsSystemModel ? 'system' : 'user',
+        // ENG-669 PR-C: a schedule pinned to the AgentWeb Model routes as a scheduled task (the run's session does
+        // not exist yet).
+        taskType: 'scheduled',
       });
     } catch (modelError) {
       if (!isModelUnavailableError(modelError)) throw modelError;
@@ -7480,7 +7518,9 @@ export async function runScheduledChat(
     }
     await chatbotDb.updateSessionLlmModel(
       sessionId,
-      modelToUse,
+      // ENG-669 PR-C: the run's session keeps the schedule's SELECTION (`agentweb-model` when routed); `modelToUse`
+      // (the routed model) is what runs.
+      selectionOf(scheduleModelPolicy) as string,
       toStoredModelPolicyDecision(scheduleModelPolicy),
       // ENG-669: an unpinned schedule (or one pinned by an admin-authored template) runs AgentWeb's choice.
       scheduleRunsSystemModel ? 'system' : 'user',
@@ -9217,6 +9257,23 @@ async function describeModelAccessForPicker(userId: string, entitledModels: read
   };
 }
 
+/** ENG-669 PR-C: the AgentWeb Model's entry in the public model catalog (GET /public/llm-models). */
+const AGENTWEB_MODEL_PICKER_ENTRY: SupportedModelInfo = {
+  id: AGENTWEB_MODEL_ID,
+  name: AGENTWEB_MODEL_DISPLAY_NAME,
+  tier: 'medium',
+  description: 'AgentWeb picks the model for each task; every reply shows which model ran.',
+  provider: 'other',
+};
+
+/**
+ * ENG-669 PR-C: a picker list with the AgentWeb Model right AFTER the first entry. Portals pre-select index 0 (the
+ * configured default, see getSupportedModels), and the router is not the default for anyone in this release.
+ */
+function withAgentWebModelEntry<T>(list: readonly T[], entry: T): T[] {
+  return list.length > 0 ? [list[0], entry, ...list.slice(1)] : [entry];
+}
+
 /**
  * ENG-669: the canonical id a model string stands for (legacy aliases resolved; an unknown id is kept as is): the
  * service's normaliser (the registry alias table; no fallback logging), else a resolvable id from a partial test
@@ -9372,6 +9429,20 @@ export async function generateSessionResponse(
   // anything is persisted; callers surface it as the model_unavailable message.
   if (session.llmModel && (await modelAccess.isEnabled()) && sameModelId(llmModel, session.llmModel)) {
     await assertModelInOwnerPlan({ ownerUserId: session.userId, model: llmModel, session });
+  }
+  // ENG-669 PR-C: which model a selection of the AgentWeb Model runs this turn, and why (stamped on the replies next
+  // to the concrete `llm`). A caller that runs the stored selection without the resolver (Slack and other transports,
+  // Emma email, approval resumes, GTM turns, continuations) passes `agentweb-model` itself: it is routed here, before
+  // anything is persisted. With the switch off it is refused like an unknown explicit model (never run on another).
+  // A caller that resolved first passes the routed model and recorded the routed decision on the session just before.
+  let turnRouting: MessageModelRouting | undefined;
+  if (isAgentWebModelId(llmModel)) {
+    if (!(await agentWebModelRouter.isEnabled())) throw new ModelUnavailableError(AGENTWEB_MODEL_ID, 'not_served');
+    const routed = await routeAgentWebModelSelection({ ownerUserId: session.userId, session });
+    llmModel = routed.model;
+    turnRouting = { llmSelected: AGENTWEB_MODEL_ID, llmRoutingReason: routed.reason, llmRoutingTableVersion: routed.tableVersion };
+  } else if (isAgentWebModelId(session.llmModel)) {
+    turnRouting = messageRoutingOf(session.llmUsagePolicyDecision, llmModel);
   }
   // Some server-side callers (notably Slack) resume a persisted delegated
   // session without carrying the HTTP request's delegation flag. Preserve the
@@ -9657,8 +9728,13 @@ export async function generateSessionResponse(
   if (stepModelTurn.kind === 'resolved' || stepModelTurn.kind === 'restored') {
     ranModelDecision = stepModelTurn.decision;
     llmModel = stepModelTurn.decision.effectiveModel;
-    if (updatedSession.llmModel !== llmModel) {
-      await chatbotDb.updateSessionLlmModel(sessionId, llmModel, toStoredModelPolicyDecision(stepModelTurn.decision), stepModelTurn.source);
+    turnRouting = messageRoutingOf(stepModelTurn.decision, llmModel);
+    // ENG-669 PR-C: what the session and the engine's markers record is the SELECTION (`agentweb-model` for a routed
+    // step), never the routed model: the stamp then still equals the engine's own marker on the next turn, so a routed
+    // step is never mistaken for a user's pick of the concrete model. A routed decision is re-recorded every turn.
+    const stepSelection = selectionOf(stepModelTurn.decision);
+    if (updatedSession.llmModel !== stepSelection || stepModelTurn.decision.routedVia) {
+      await chatbotDb.updateSessionLlmModel(sessionId, stepSelection, toStoredModelPolicyDecision(stepModelTurn.decision), stepModelTurn.source);
     }
     // Record what the engine stamped (so the end of the plan can tell a later explicit pick apart), adopt an explicit
     // pick on the step that lost its model, and clear the marker once the pre-plan model is restored.
@@ -9667,7 +9743,7 @@ export async function generateSessionResponse(
     // engine's own choice, so the pick (the stored stamp) stands for the following turns.
     const nextEngineModel = stepModelTurn.kind === 'restored'
       ? undefined
-      : (stepModelTurn.userPick ? (stepModelTurn.engineChoice ?? (updatedSession.workPlan as any)?.engineModel) : llmModel);
+      : (stepModelTurn.userPick ? (stepModelTurn.engineChoice ?? (updatedSession.workPlan as any)?.engineModel) : stepSelection);
     const wp: any = updatedSession.workPlan;
     // A share viewer's pick runs for the turn but leaves the owner's plan alone (no adoption, no marker change).
     const viewerPick = Boolean(isInteractiveShare) && stepModelTurn.kind === 'resolved' && Boolean(stepModelTurn.userPick);
@@ -9675,7 +9751,7 @@ export async function generateSessionResponse(
     // the end-of-plan restore leaves it alone; the restore itself clears the record.
     const nextPickedModel = stepModelTurn.kind === 'restored'
       ? undefined
-      : (stepModelTurn.userPick ? llmModel : (adoptStepModel ?? (updatedSession.workPlan as any)?.pickedModel));
+      : (stepModelTurn.userPick ? stepSelection : (adoptStepModel ?? (updatedSession.workPlan as any)?.pickedModel));
     if (wp && !viewerPick && (adoptStepModel || wp.engineModel !== nextEngineModel || wp.pickedModel !== nextPickedModel)) {
       const { engineModel: _previousEngineModel, pickedModel: _previousPicked, ...wpRest } = wp;
       await chatbotDb.updateSessionWorkPlan(sessionId, {
@@ -9801,6 +9877,8 @@ export async function generateSessionResponse(
       // ENG-1816 F1: plain data across the fork boundary, same shape as
       // publishAuthorizationOverride above — never a positional argument.
       runFunding,
+      // ENG-669 PR-C: plain data too; stamped on this turn's replies beside `llm`.
+      ...(turnRouting && { modelRouting: turnRouting }),
     },
     (progress) => {
       // Emit progress updates via SSE
@@ -10181,7 +10259,8 @@ export const agentModeController = {
         }
         // Creating a session itself spends nothing. A paused account can still
         // open/read the session; provider admission remains blocked on send.
-        if (initialModelPolicy.effectiveModel) modelToUse = initialModelPolicy.effectiveModel;
+        // ENG-669 PR-C: the SELECTION is stored (a routed AgentWeb Model stays `agentweb-model`; each turn routes).
+        if (initialModelPolicy.effectiveModel) modelToUse = selectionOf(initialModelPolicy) as string;
       }
       const welcomeMessage = skill?.welcomeMessage?.trim();
       // ENG-1107 Greptile P1: when a skill carries an openingAction, the
@@ -10281,6 +10360,7 @@ export const agentModeController = {
           modelSelection: initialModelPolicy.modelSelection,
           usageMode: initialModelPolicy.usageMode,
           usagePolicyVersion: initialModelPolicy.usagePolicyVersion,
+          ...routingFieldsOf(initialModelPolicy),
         } : {}),
       });
     } catch (error) {
@@ -10975,12 +11055,14 @@ export const agentModeController = {
         }));
       }
       const modelToUse = modelPolicyDecision.effectiveModel;
+      // ENG-669 PR-C: the session keeps the SELECTION (`agentweb-model` when routed); `modelToUse` is what runs.
+      const selectedModel = selectionOf(modelPolicyDecision) as string;
       await chatbotDb.updateSessionLlmModel(
         sessionId,
-        modelToUse,
+        selectedModel,
         toStoredModelPolicyDecision(modelPolicyDecision),
         // ENG-669: the portal echoes the stored stamp every turn; that is not a new choice.
-        modelSourceAfter(session, modelToUse, llmModel),
+        modelSourceAfter(session, selectedModel, llmModel),
       );
 
       // Build page context for emma-sidebar sessions
@@ -11056,7 +11138,8 @@ export const agentModeController = {
         // session.sessionType here.
         false,
         // ENG-2378: an explicit model pick = a request model that differs from the stored stamp (the portal echoes the stamp).
-        explicitModelSelection && modelToUse !== session.llmModel ? modelToUse : undefined,
+        // ENG-669 PR-C: the pick is the selection (the engine routes an AgentWeb Model pick itself).
+        explicitModelSelection && selectedModel !== session.llmModel ? selectedModel : undefined,
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
@@ -11364,6 +11447,7 @@ export const agentModeController = {
           modelSelectionReason: reportedModelDecision.reason,
           usageMode: reportedModelDecision.usageMode,
           usagePolicyVersion: reportedModelDecision.usagePolicyVersion,
+          ...routingFieldsOf(reportedModelDecision),
         } : {}),
       });
 
@@ -11695,7 +11779,8 @@ export const agentModeController = {
     try {
       const { user } = await getUserFromToken(req);
       const models = await agentModeService.getSupportedModelsWithMetadata(user?.isAdmin === true);
-      res.json(models);
+      // ENG-669 PR-C: the AgentWeb Model, for a signed-in user whose plan includes it while the router is on.
+      res.json(await offersAgentWebModel(user?.userId) ? withAgentWebModelEntry(models, AGENTWEB_MODEL_PICKER_ENTRY) : models);
     } catch (error) {
       console.error('AgentMode: Get supported models error:', error);
       res.status(500).json({ error: 'Failed to get supported models' });
@@ -11736,15 +11821,20 @@ export const agentModeController = {
       const optimizedModels = scheduleBackupModels(
         usage.policy?.optimizedModelIds ?? plannedModels, plannedModels,
       );
+      // ENG-669 PR-C: the AgentWeb Model is offered as a pick (chat and schedule pickers), never as a schedule backup
+      // (a backup is a concrete model). Switch off: unchanged.
+      const pickerModels = await offersAgentWebModel(user.userId)
+        ? withAgentWebModelEntry(plannedModels, AGENTWEB_MODEL_ID)
+        : plannedModels;
       // ENG-1211 AC1: nothing below the hard cap may hide a model. Only a paused
       // account has an empty picker; every other state offers the full entitled
       // set. `optimizedModels` is still returned as `scheduleBackupModels` for
       // the legacy backup field and for the ENG-1213 recommendation catalog.
-      const selectableModels = usage.mode.usageMode === 'paused' ? [] : plannedModels;
+      const selectableModels = usage.mode.usageMode === 'paused' ? [] : pickerModels;
       res.json({
         usageMode: usage.mode.usageMode,
         canGenerate: usage.mode.admissionAllowed,
-        allModels: plannedModels,
+        allModels: pickerModels,
         selectableModels,
         scheduleBackupModels: optimizedModels,
         optimizedDefaultModel: usage.policy?.optimizedDefaultModel || null,
@@ -12458,12 +12548,14 @@ export const agentModeController = {
       }
       const modelToUse = modelPolicyDecision.effectiveModel;
       if (typeof chatbotDb.updateSessionLlmModel === 'function') {
+        // ENG-669 PR-C: the session keeps the SELECTION (`agentweb-model` when routed); `modelToUse` is what runs.
+        const selectedModel = selectionOf(modelPolicyDecision) as string;
         await chatbotDb.updateSessionLlmModel(
           session.sessionId,
-          modelToUse,
+          selectedModel,
           toStoredModelPolicyDecision(modelPolicyDecision),
           // The visitor selects nothing: the stored model keeps its source; a default standing in is AgentWeb's.
-          modelSourceAfter(session, modelToUse, null),
+          modelSourceAfter(session, selectedModel, null),
         );
       }
 
@@ -16028,6 +16120,16 @@ export const agentModeController = {
         return res.status(422).json(modelUnavailableBody(modelError, 'share_viewer'));
       }
       const modelToUse = conversablePolicy.effectiveModel || session.llmModel || defaultModel;
+      // ENG-669 PR-C: a routed turn records its decision (the session keeps the selection) so the reply carries
+      // which model the AgentWeb Model ran and why. Other turns write nothing here, as before.
+      if (conversablePolicy.routedVia && conversablePolicy.effectiveModel) {
+        await chatbotDb.updateSessionLlmModel(
+          session.sessionId,
+          AGENTWEB_MODEL_ID,
+          toStoredModelPolicyDecision(conversablePolicy),
+          modelSourceAfter(session, AGENTWEB_MODEL_ID, null),
+        );
+      }
 
       // Cancel generation immediately when the client disconnects
       req.on('close', () => {
@@ -16924,11 +17026,13 @@ export const agentModeController = {
           return res.status(422).json(modelUnavailableBody(modelError));
         }
         selectedModel = modelDecision.effectiveModel || session.llmModel || undefined;
-        const effectiveModel = modelDecision.effectiveModel;
-        if (effectiveModel && (modelDecision.modelSelection === 'corrected' || effectiveModel !== session.llmModel)) {
+        // ENG-669 PR-C: the session keeps the SELECTION (`agentweb-model` when routed), with the routed decision
+        // recorded every turn (the routed model can change with the table); `selectedModel` above is what runs.
+        const storedSelection = modelDecision.effectiveModel ? selectionOf(modelDecision) : null;
+        if (storedSelection && (modelDecision.modelSelection === 'corrected' || modelDecision.routedVia || storedSelection !== session.llmModel)) {
           persistSelectedModel = async () => {
             await chatbotDb.updateSessionLlmModel(
-              sessionId, effectiveModel, toStoredModelPolicyDecision(modelDecision), modelSourceAfter(session, effectiveModel, explicitModel),
+              sessionId, storedSelection, toStoredModelPolicyDecision(modelDecision), modelSourceAfter(session, storedSelection, explicitModel),
             );
           };
         }
@@ -17087,13 +17191,16 @@ export const agentModeController = {
       // accept — `fellBack` is true exactly when the id is not in the allow-list
       // after legacy-alias resolution — and store the canonical id so the field
       // stays comparable to the per-message `llm` provenance.
-      const resolution = agentModeService.resolveGenerationModel(llmModel);
-      if (resolution.fellBack) {
+      // ENG-669 PR-C: with its switch on, the AgentWeb Model is a selection rather than a registry id; it is checked
+      // for the session OWNER below (router available, selection in their plan). Off: an unsupported id, as before.
+      const routerPick = isAgentWebModelId(llmModel) && await agentWebModelRouter.isEnabled();
+      const resolution = routerPick ? null : agentModeService.resolveGenerationModel(llmModel);
+      if (resolution?.fellBack) {
         return res.status(400).json({
           error: `Unsupported model '${llmModel}'. Choose a model returned by the supported-models endpoint.`,
         });
       }
-      const canonicalModel = resolution.model;
+      const canonicalModel = resolution ? resolution.model : AGENTWEB_MODEL_ID;
 
       // ENG-2293: the allow-list check above accepts ANY registered model,
       // including adminOnly auto-added entries the picker UI already hides —
@@ -17105,7 +17212,7 @@ export const agentModeController = {
       // ENG-669: with the tier allowlist on, the pick is judged for the session OWNER (below), so an
       // admin or delegated caller cannot widen a user's session beyond what that user may run.
       const tierAllowlistOn = await modelAccess.isEnabled();
-      if (!tierAllowlistOn && !agentModeService.isModelSelectableBy(canonicalModel, !!user.isAdmin)) {
+      if (!routerPick && !tierAllowlistOn && !agentModeService.isModelSelectableBy(canonicalModel, !!user.isAdmin)) {
         return res.status(403).json({ error: 'This model is not available for your account' });
       }
 
@@ -17122,7 +17229,14 @@ export const agentModeController = {
 
       // ENG-669: the same 422 model_unavailable the turn itself would answer, checked against the
       // OWNER: selectability (adminOnly clears only for an admin owner), then the owner's plan.
-      if (tierAllowlistOn) {
+      if (routerPick) {
+        try {
+          await assertAgentWebModelSelectable({ ownerUserId: session.userId, session });
+        } catch (modelError) {
+          if (!isModelUnavailableError(modelError)) throw modelError;
+          return res.status(422).json(modelUnavailableBody(modelError));
+        }
+      } else if (tierAllowlistOn) {
         try {
           if (!agentModeService.isModelSelectableBy(canonicalModel, session.userId === user.userId ? !!user.isAdmin : await isUserAdmin(session.userId))) {
             throw new ModelUnavailableError(String(llmModel), 'not_selectable');
@@ -17160,18 +17274,20 @@ export const agentModeController = {
       // matters more, not less — an interactive-share viewer writes to the
       // owner's real session, so an unserved id here mislabels someone else's
       // session.
-      const resolution = agentModeService.resolveGenerationModel(llmModel);
-      if (resolution.fellBack) {
+      // ENG-669 PR-C: as on the owner's picker, the AgentWeb Model (switch on) is checked against the owner below.
+      const routerPick = isAgentWebModelId(llmModel) && await agentWebModelRouter.isEnabled();
+      const resolution = routerPick ? null : agentModeService.resolveGenerationModel(llmModel);
+      if (resolution?.fellBack) {
         return res.status(400).json({
           error: `Unsupported model '${llmModel}'. Choose a model returned by the supported-models endpoint.`,
         });
       }
-      const canonicalModel = resolution.model;
+      const canonicalModel = resolution ? resolution.model : AGENTWEB_MODEL_ID;
 
       // ENG-2293: same gate as updateSessionLlmModel, same reasoning — shared
       // viewers are always non-admin, so this also now blocks adminOnly
       // auto-added models, not just opus.
-      if (!agentModeService.isModelSelectableBy(canonicalModel, false)) {
+      if (!routerPick && !agentModeService.isModelSelectableBy(canonicalModel, false)) {
         return res.status(403).json({ error: 'This model is not available for shared sessions' });
       }
 
@@ -17200,7 +17316,8 @@ export const agentModeController = {
       // ENG-669: the viewer writes the OWNER's session, so the pick must be in the owner's plan.
       // The viewer's 422 does not carry the owner's plan.
       try {
-        await assertModelInOwnerPlan({ ownerUserId: session.userId, model: String(llmModel), session });
+        if (routerPick) await assertAgentWebModelSelectable({ ownerUserId: session.userId, session });
+        else await assertModelInOwnerPlan({ ownerUserId: session.userId, model: String(llmModel), session });
       } catch (modelError) {
         if (!isModelUnavailableError(modelError)) throw modelError;
         return res.status(422).json(modelUnavailableBody(modelError, 'share_viewer'));

@@ -160,6 +160,7 @@ process.on('message', async (message: any) => {
         requireWorkPlanDisposition,
         isUnattendedRun,
         runFunding,
+        modelRouting,
       } = message.params;
 
       // ENG-1816 F1: enter the ambient store BEFORE calling into agentModeService, so
@@ -223,9 +224,10 @@ process.on('message', async (message: any) => {
           publishAuthorizationOverride,
           approvedRevisionImageSources,
           requireWorkPlanDisposition,
-          // ENG-2072: see the "Keep this list in the same order" note above — this
-          // must stay LAST, matching generateMarketingResponse's own final parameter.
+          // ENG-2072: see the "Keep this list in the same order" note above.
           isUnattendedRun,
+          // ENG-669 PR-C: must stay LAST, matching generateMarketingResponse's own final parameter.
+          modelRouting,
         ),
       );
 
