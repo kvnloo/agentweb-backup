@@ -7,6 +7,7 @@ import { paymentHistoryDb } from './paymentHistoryDb';
 import { syncUserUpdateToLeadList } from './crmAutoSyncService';
 import { waitlistDb, WaitlistEntry } from './waitlistDb';
 import { findSeatLineItem } from './orgSeatBillingService';
+import { invoiceSubscriptionId } from '../utils/stripeInvoiceFields';
 
 dotenv.config();
 
@@ -1085,9 +1086,7 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
     return;
   }
 
-  const subscriptionId = typeof invoice.subscription === 'string'
-    ? invoice.subscription
-    : invoice.subscription?.id || null;
+  const subscriptionId = invoiceSubscriptionId(invoice);
 
   const updateData: Record<string, any> = {
     subscription_status: 'active',
@@ -1104,8 +1103,11 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
     updateData.subscription_amount = invoice.amount_paid;
   }
 
-  // Sync current_period_end and activeOffer from the live subscription
-  const subIdToFetch = subscriptionId || user.stripe_subscription_id;
+  // Sync current_period_end and activeOffer from the live subscription. The
+  // user's current subscription stays authoritative; the invoice's is used only
+  // when the row has none (an invoice from an older, replaced sub must not
+  // overwrite the current sub's period end or offer).
+  const subIdToFetch = user.stripe_subscription_id || subscriptionId;
   if (subIdToFetch) {
     try {
       const s = getStripeOrThrow();
@@ -1271,9 +1273,7 @@ export async function handleInvoicePaymentFailed(invoice: any): Promise<void> {
     return;
   }
 
-  const subscriptionId = typeof invoice.subscription === 'string'
-    ? invoice.subscription
-    : invoice.subscription?.id || null;
+  const subscriptionId = invoiceSubscriptionId(invoice);
 
   await userDb.updateUser(user.userId, {
     subscription_status: 'past_due',
