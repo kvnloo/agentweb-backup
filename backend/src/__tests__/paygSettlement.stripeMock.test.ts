@@ -750,10 +750,21 @@ suite('PAYG settlement Stripe calls against stripe-mock (API ' + STRIPE_API_VERS
       await handleChargeRefunded(charge);
       expect(one('GET', /^\/v1\/invoice_payments$/).query.get('payment[payment_intent]')).toBe('pi_overage');
       expect((store.row.paygSettlements as Json)[M]).toMatchObject({ refundedCents: 1000 });
+      // rv5 MINOR 4: one row per refund, with that refund's own amount (a charge no longer carries them).
+      const listed = one('GET', /^\/v1\/refunds$/);
+      expect(params(listed.query)).toEqual({ charge: charge.id, limit: '100' });
+      expect(listed.raw.data.length).toBeGreaterThan(0);
+      for (const refund of listed.raw.data) {
+        expectField(refund, 'id', 'string');
+        expectField(refund, 'amount', 'number');
+        expectField(refund, 'status', 'string', 'null');
+        expectField(refund, 'reason', 'string', 'null');
+      }
+      const refund = listed.raw.data[0];
       expect(paymentHistoryDb.record).toHaveBeenCalledWith(expect.objectContaining({
-        eventType: 'refund', amount: 1000, currency: charge.currency, stripeInvoiceId: 'in_overage',
-        metadata: expect.objectContaining({ chargeId: charge.id, fullRefund: false }),
-      }), { dedupKey: `refund:${charge.id}:1000` });
+        eventType: 'refund', amount: refund.amount, stripeInvoiceId: 'in_overage',
+        metadata: expect.objectContaining({ chargeId: charge.id, refundId: refund.id, fullRefund: false }),
+      }), { dedupKey: `refund:${refund.id}` });
     });
 
     it('charge.dispute.created: dispute -> charges.retrieve -> invoice payments -> PAYG suspended (dispute)', async () => {
@@ -773,7 +784,8 @@ suite('PAYG settlement Stripe calls against stripe-mock (API ' + STRIPE_API_VERS
       expectField(chargeGet.raw, 'payment_intent', 'string', 'object', 'null');
       expectField(chargeGet.raw, 'metadata', 'object');
       expect((store.row.paygOverage as Json).suspended).toMatchObject({ reason: 'dispute', invoiceId: 'in_overage' });
-      expect((store.row.paygSettlements as Json)[M].dispute).toMatchObject({ disputeId: dispute.id });
+      expect((store.row.paygSettlements as Json)[M].disputes).toEqual({ [dispute.id]: { at: expect.any(String) } });
+      expect((store.row.paygOverage as Json).suspended).toMatchObject({ disputeId: dispute.id });
       expect(paymentHistoryDb.record).toHaveBeenCalledWith(
         expect.objectContaining({ eventType: 'dispute_opened', amount: dispute.amount, currency: dispute.currency, metadata: expect.objectContaining({ disputeReason: dispute.reason }) }),
         { dedupKey: `dispute:opened:${dispute.id}` },
@@ -971,17 +983,114 @@ suite('PAYG settlement Stripe calls against stripe-mock (API ' + STRIPE_API_VERS
         onPath('GET', /^\/v1\/invoice_payments$/, (json) => { Object.assign(json.data[0].invoice, { id: 'in_overage', metadata: { ...META } }); }),
       ];
       useRow(ownerRow(
-        settlementRecord({ status: 'paid', invoiceId: 'in_overage', dispute: { disputeId: dispute.id, at: '2026-10-05T00:00:00.000Z' } }),
+        settlementRecord({ status: 'paid', invoiceId: 'in_overage', disputes: { [dispute.id]: { at: '2026-10-05T00:00:00.000Z' } } }),
         { paygOverage: { enabled: true, capPercentOfPool: 50, admittedMonths: [], updatedBy: OWNER, updatedAt: 'x', version: 3,
-          suspended: { reason: 'dispute', at: '2026-10-05T00:00:00.000Z', invoiceId: 'in_overage' } } },
+          suspended: { reason: 'dispute', at: '2026-10-05T00:00:00.000Z', invoiceId: 'in_overage', disputeId: dispute.id } } },
       ));
       await handleChargeDisputeClosed({ ...dispute, status });
       expect(one('GET', /^\/v1\/invoice_payments$/).query.get('payment[payment_intent]')).toBe('pi_overage');
       const after = store.row.paygOverage as Json;
       if (holdAfter) expect(after.suspended).toMatchObject(holdAfter);
       else expect(after.suspended).toBeUndefined();
-      expect((store.row.paygSettlements as Json)[M]).toMatchObject({ status: monthAfter, dispute: { disputeId: dispute.id, status, closedAt: expect.any(String) } });
+      expect((store.row.paygSettlements as Json)[M]).toMatchObject({ status: monthAfter, disputes: { [dispute.id]: { at: '2026-10-05T00:00:00.000Z', status, closedAt: expect.any(String) } } });
       expect(emailService.sendOncallAlert).toHaveBeenCalledTimes(status === 'lost' ? 1 : 0);
+    });
+  });
+
+  // ── 10. rv5 round: the Stripe calls it adds ────────────────────────────────────────────────────────
+  describe('rv5: 3-D Secure check, refunds list, re-pointing a pinned card', () => {
+    const client = () => createStripeClient('sk_test_123');
+    async function deliverSigned(type: string, object: Json) {
+      const payload = JSON.stringify({ id: `evt_${type.replace(/\W/g, '_')}`, object: 'event', api_version: STRIPE_API_VERSION, type, data: { object } });
+      const header = client().webhooks.generateTestHeaderString({ payload, secret: process.env.STRIPE_WEBHOOK_SECRET! });
+      const res: Json = { statusCode: 200, body: undefined };
+      res.status = (code: number) => { res.statusCode = code; return res; };
+      res.json = (body: Json) => { res.body = body; return res; };
+      await handleWebhook({ headers: { 'stripe-signature': header }, body: Buffer.from(payload) } as never, res as never);
+      await new Promise((r) => setImmediate(r));
+      return res;
+    }
+    /** The invoice's default payment, with its PaymentIntent expanded, says `status`. */
+    const steerIntentStatus = (status: string) =>
+      onPath('GET', /^\/v1\/invoice_payments$/, (json) => { json.data[0].is_default = true; json.data[0].payment.payment_intent.status = status; });
+
+    it('invoice.payment_failed: the invoice\'s default payment is read (invoice + expanded PaymentIntent); fields exist in this version', async () => {
+      const invoice: Json = await client().invoices.retrieve('in_overage');
+      invoice.metadata = { ...META };
+      recs = [];
+      useRow(ownerRow(settlementRecord({ status: 'invoiced', invoiceId: 'in_overage' })));
+      await handleInvoicePaymentFailed(invoice);
+      const listed = one('GET', /^\/v1\/invoice_payments$/);
+      expect(params(listed.query)).toEqual({ invoice: 'in_overage', limit: '10', 'expand[0]': 'data.payment.payment_intent' });
+      const payment = listed.raw.data[0];
+      expectField(payment, 'is_default', 'boolean');
+      expectField(payment, 'payment.type', 'string');
+      expectField(payment, 'payment.payment_intent', 'object');
+      expectField(payment.payment.payment_intent, 'status', 'string');
+      // stripe-mock's fixture PaymentIntent is `requires_payment_method`: a decline, so the month fails.
+      expect(payment.payment.payment_intent.status).toBe('requires_payment_method');
+      expect((store.row.paygSettlements as Json)[M].status).toBe('failed');
+    });
+
+    it('signed 3-D Secure pair (PaymentIntent requires_action): no suspension, no failure email, one confirm email', async () => {
+      const invoice: Json = await client().invoices.retrieve('in_overage');
+      invoice.metadata = { ...META };
+      steers = [steerIntentStatus('requires_action')];
+      useRow(ownerRow(settlementRecord({ status: 'invoiced', invoiceId: 'in_overage' })));
+      expect((await deliverSigned('invoice.payment_action_required', invoice)).statusCode).toBe(200);
+      expect((await deliverSigned('invoice.payment_failed', invoice)).statusCode).toBe(200);
+      expect((store.row.paygOverage as Json).suspended).toBeUndefined();
+      expect((store.row.paygSettlements as Json)[M].status).toBe('invoiced');
+      expect(emailService.sendPaygOveragePaymentFailedEmail).not.toHaveBeenCalled();
+      expect(emailService.sendPaygOveragePaymentActionRequiredEmail).toHaveBeenCalledTimes(1);
+    });
+
+    it('a PaymentIntent the list did not expand is retrieved (GET /v1/payment_intents/:id; `status` exists)', async () => {
+      steers = [onPath('GET', /^\/v1\/invoice_payments$/, (json) => { json.data[0].payment.payment_intent = 'pi_overage'; })];
+      await expect(stripeService.paygOverageInvoicePaymentNeedsAction('in_overage')).resolves.toBe(false);
+      const retrieved = one('GET', /^\/v1\/payment_intents\/pi_overage$/);
+      expectField(retrieved.raw, 'status', 'string');
+    });
+
+    it('the lookup failing raises (webhook 500, Stripe redelivers); the month is untouched', async () => {
+      const invoice: Json = await client().invoices.retrieve('in_overage');
+      invoice.metadata = { ...META };
+      failures = [failWith('GET', /^\/v1\/invoice_payments$/)];
+      recs = [];
+      useRow(ownerRow(settlementRecord({ status: 'invoiced', invoiceId: 'in_overage' })));
+      expect((await deliverSigned('invoice.payment_failed', invoice)).statusCode).toBe(500);
+      expect((store.row.paygSettlements as Json)[M].status).toBe('invoiced');
+      expect((store.row.paygOverage as Json).suspended).toBeUndefined();
+    });
+
+    it('setup_intent.succeeded (signed): an open overage invoice pinned to another card is pointed at the new one — POST /v1/invoices/:id accepted', async () => {
+      const setupIntent: Json = await client().setupIntents.retrieve('seti_new');
+      for (const f of ['customer', 'payment_method']) expectField(setupIntent, f, 'string', 'object', 'null');
+      expectField(setupIntent, 'metadata', 'object');
+      const invoice: Json = await client().invoices.retrieve('in_overage');
+      expectField(invoice, 'default_payment_method', 'string', 'object', 'null');
+      expectField(invoice, 'customer', 'string', 'object', 'null');
+      Object.assign(setupIntent, { status: 'succeeded', customer: 'cus_card', payment_method: 'pm_new', metadata: { userId: OWNER } });
+      steers = [onPath('GET', /^\/v1\/invoices\/in_overage$/, (json) => {
+        Object.assign(json, { status: 'open', customer: 'cus_card', default_payment_method: 'pm_card', metadata: { ...META } });
+      })];
+      recs = [];
+      useRow(ownerRow(settlementRecord({ status: 'failed', invoiceId: 'in_overage' })));
+      const res = await deliverSigned('setup_intent.succeeded', setupIntent);
+      expect(res.statusCode).toBe(200);
+      const updated = one('POST', /^\/v1\/invoices\/in_overage$/);
+      expect(params(updated.body)).toEqual({ default_payment_method: 'pm_new' });
+      expect(updated.idempotencyKey).toBe('payg-repoint:in_overage:pm_new');
+      expect(onStripeSubscriptionEvent).not.toHaveBeenCalled(); // not mirrored to the CRM
+    });
+
+    it('setup_intent.succeeded for an account with no open overage invoice: no Stripe call at all', async () => {
+      const setupIntent: Json = await client().setupIntents.retrieve('seti_new');
+      Object.assign(setupIntent, { status: 'succeeded', customer: 'cus_card', payment_method: 'pm_new', metadata: { userId: OWNER } });
+      recs = [];
+      useRow(ownerRow(settlementRecord({ status: 'paid', invoiceId: 'in_overage' })));
+      expect((await deliverSigned('setup_intent.succeeded', setupIntent)).statusCode).toBe(200);
+      expect(recs).toEqual([]);
     });
   });
 });

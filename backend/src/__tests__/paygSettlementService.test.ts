@@ -28,6 +28,8 @@ const mockStripeState = {
   loseResponse: new Set<string>(),
   /** A customer-level discount Stripe applies to every line (what makes a total differ from the item). */
   discountCents: 0,
+  /** Refunds Stripe holds per charge (`refunds.list`). */
+  refunds: new Map<string, Array<{ id: string; amount: number; status: string; currency?: string; created?: number }>>(),
 };
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
 type StripeOpts = { idempotencyKey?: string } | undefined;
@@ -93,6 +95,11 @@ const mockStripe = {
       return clone(invoice);
     })),
     list: jest.fn(),
+    update: jest.fn(async (id: string, params: { default_payment_method?: string }) => {
+      const invoice = mockStripeState.invoices.get(id)!;
+      Object.assign(invoice, params);
+      return clone(invoice);
+    }),
   },
   invoiceItems: {
     create: jest.fn(async (params: { invoice: string; amount: number; metadata?: Record<string, string> }, opts: StripeOpts) => mockIdempotent('invoiceItems.create', opts?.idempotencyKey, () => {
@@ -103,6 +110,8 @@ const mockStripe = {
     })),
   },
   invoicePayments: { list: jest.fn() },
+  paymentIntents: { retrieve: jest.fn() },
+  refunds: { list: jest.fn(async ({ charge }: { charge: string }) => ({ data: clone(mockStripeState.refunds.get(charge) ?? []) })) },
   charges: { retrieve: jest.fn() },
   subscriptions: { retrieve: jest.fn() },
 };
@@ -264,6 +273,9 @@ beforeEach(() => {
   mockStripeState.loseResponse.clear();
   mockStripeState.seq = 0;
   mockStripeState.discountCents = 0;
+  mockStripeState.refunds.clear();
+  // No invoice payment by default: a failed attempt is a decline unless a test says the bank awaits confirmation.
+  mockStripe.invoicePayments.list.mockReset().mockResolvedValue({ data: [] });
   process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = 'true';
   spend(130);
 });
@@ -308,7 +320,7 @@ describe('ENG-668 settlement — what is billed', () => {
     // One owner email: a percentage of the cap and the Stripe invoice link — never an amount.
     expect(emailService.sendPaygOverageInvoiceEmail).toHaveBeenCalledTimes(1);
     expect(emailService.sendPaygOverageInvoiceEmail).toHaveBeenCalledWith({
-      to: 'owner@example.com', month: M, percentOfCap: 60, invoiceUrl: 'https://invoice.stripe.com/i/1',
+      to: 'owner@example.com', month: M, percentOfCap: 60, invoiceUrl: 'https://invoice.stripe.com/i/1', paid: false,
     });
   });
 
@@ -639,7 +651,7 @@ describe('ENG-668 webhooks — an overage invoice never touches the subscription
       month: NEXT,
     });
     expect(admission.decision.admissionAllowed).toBe(false);
-    expect(admission.block).toEqual({ reason: 'payg_suspended' });
+    expect(admission.block).toEqual({ reason: 'payg_suspended', paygSuspendedReason: 'payment_failed' });
   });
 
   it('paying the failed invoice later lifts THAT suspension', async () => {
@@ -695,7 +707,8 @@ describe('ENG-668 webhooks — disputes and refunds on an overage charge', () =>
       payment: { type: 'payment_intent', payment_intent: 'pi_1' }, limit: 1, expand: ['data.invoice'],
     });
     expect(store.row.paygOverage.suspended).toMatchObject({ reason: 'dispute', invoiceId: 'in_1' });
-    expect(settlement()).toMatchObject({ status: 'paid', dispute: { disputeId: 'dp_1' } });
+    expect(settlement()).toMatchObject({ status: 'paid', disputes: { dp_1: { at: expect.any(String) } } });
+    expect(settlement().disputes.dp_1).not.toHaveProperty('closedAt');
   });
 
   it('a dispute replaces a payment-failure suspension, and paying never lifts it', async () => {
@@ -713,6 +726,7 @@ describe('ENG-668 webhooks — disputes and refunds on an overage charge', () =>
   it('a refund is recorded and never resumes a suspended PAYG', async () => {
     await paid();
     await handleChargeDisputeCreated({ id: 'dp_1', charge: 'ch_1', amount: 4500, currency: 'usd' });
+    mockStripeState.refunds.set('ch_1', [{ id: 're_1', amount: 4500, status: 'succeeded' }]);
     await handleChargeRefunded({ ...charge, amount_refunded: 4500, refunded: true });
     expect(settlement()).toMatchObject({ refundedCents: 4500, status: 'paid' });
     expect(store.row.paygOverage.suspended).toMatchObject({ reason: 'dispute' });
@@ -723,6 +737,7 @@ describe('ENG-668 webhooks — disputes and refunds on an overage charge', () =>
 
   it('a refund on an unsuspended account does not create or lift anything', async () => {
     await paid();
+    mockStripeState.refunds.set('ch_1', [{ id: 're_1', amount: 1000, status: 'succeeded' }]);
     await handleChargeRefunded({ ...charge, amount_refunded: 1000, refunded: false });
     expect(settlement()).toMatchObject({ refundedCents: 1000 });
     expect(store.row.paygOverage.suspended).toBeUndefined();
@@ -893,7 +908,7 @@ describe('ENG-668 settlement — races and orphans (review follow-ups)', () => {
   });
 });
 
-describe('ENG-668 webhooks — with settlement switched off, refunds and disputes are exactly as before (review M6)', () => {
+describe('ENG-668 webhooks — with settlement switched off, refunds are exactly as before; disputes are still recognised (review M6, rv5 MINOR 7)', () => {
   const subscriptionCharge = {
     id: 'ch_sub', customer: 'cus_row', amount: 4900, amount_refunded: 4900, refunded: true, currency: 'usd', payment_intent: 'pi_sub', metadata: {},
   };
@@ -907,12 +922,29 @@ describe('ENG-668 webhooks — with settlement switched off, refunds and dispute
     expect(paymentHistoryDb.record).toHaveBeenCalledWith(expect.objectContaining({ eventType: 'refund', userId: OWNER, amount: 4900 }));
   });
 
-  it('switch off: a dispute on any charge makes no extra Stripe call and suspends nothing', async () => {
+  it('switch off: a dispute on a subscription charge is looked up (one call) and handled exactly as before — nothing suspended', async () => {
     setup(ownerRow(), { switchOn: false });
     mockStripe.charges.retrieve.mockResolvedValue({ ...subscriptionCharge, refunded: false, amount_refunded: 0 });
+    mockStripe.invoicePayments.list.mockResolvedValue({ data: [{ invoice: { id: 'in_sub', object: 'invoice', metadata: {} } }] });
     await handleChargeDisputeCreated({ id: 'dp_sub', charge: 'ch_sub', amount: 4900, currency: 'usd' });
-    expect(mockStripe.invoicePayments.list).not.toHaveBeenCalled();
+    await handleChargeDisputeClosed({ id: 'dp_sub', charge: 'ch_sub', amount: 4900, currency: 'usd', status: 'won' });
+    expect(mockStripe.invoicePayments.list).toHaveBeenCalledTimes(2);
     expect(store.row.paygOverage.suspended).toBeUndefined();
+    expect(store.row.paygSettlements).toBeUndefined();
+  });
+
+  it('switch off: a dispute on an overage charge still holds PAYG, and winning it lifts the hold (rv5 MINOR 7)', async () => {
+    setup();
+    await settlePaygOverageMonth(OWNER, M, DAY2);
+    await handleInvoicePaymentSucceeded({ ...mockStripeState.invoices.get('in_1')!, status: 'paid' });
+    mockStripe.charges.retrieve.mockResolvedValue({ id: 'ch_1', customer: 'cus_card', amount: 4500, currency: 'usd', payment_intent: 'pi_1', metadata: {} });
+    mockStripe.invoicePayments.list.mockResolvedValue({ data: [{ invoice: clone(mockStripeState.invoices.get('in_1')) }] });
+    (paygSettlementSwitch.isEnabled as jest.Mock).mockResolvedValue(false); // switched off while the dispute is open
+    await handleChargeDisputeCreated({ id: 'dp_1', charge: 'ch_1', amount: 4500, currency: 'usd' });
+    expect(store.row.paygOverage.suspended).toMatchObject({ reason: 'dispute', disputeId: 'dp_1' });
+    await handleChargeDisputeClosed({ id: 'dp_1', charge: 'ch_1', amount: 4500, currency: 'usd', status: 'won' });
+    expect(store.row.paygOverage.suspended).toBeUndefined();
+    expect(settlement().disputes.dp_1).toMatchObject({ status: 'won', closedAt: expect.any(String) });
   });
 
   it('switch on but the lookup fails: the refund is still recorded, the webhook does not fail, on-call is told (rv4 MINOR 3)', async () => {
@@ -1039,7 +1071,11 @@ describe('ENG-668 webhooks — a failure after the paid webhook\'s read keeps PA
     setup(ownerRow({ paygOverage: payg({ suspended: { reason: 'dispute', at: '2026-09-20T00:00:00.000Z', invoiceId: 'in_old' } }) }));
     await settlePaygOverageMonth(OWNER, M, DAY2);
     await handleInvoicePaymentFailed(mockStripeState.invoices.get('in_1')!);
-    expect(store.row.paygOverage.suspended).toEqual({ reason: 'dispute', at: '2026-09-20T00:00:00.000Z', invoiceId: 'in_old' });
+    // Still the dispute hold; the failure only stamps `paymentFailedAt` on it (so a won-dispute lift that
+    // read the row before this failure is refused and re-reads).
+    expect(store.row.paygOverage.suspended).toEqual({
+      reason: 'dispute', at: '2026-09-20T00:00:00.000Z', invoiceId: 'in_old', paymentFailedAt: expect.any(String),
+    });
   });
 });
 
@@ -1392,7 +1428,7 @@ describe('ENG-668 lifecycle — a failed overage invoice voided or marked uncoll
     const invoice = await issueSeptember();
     for (const attempt of [1, 2, 3]) {
       await deliver('invoice.payment_failed', { ...invoice, attempt_count: attempt });
-      expect(gateBlock(store.row as { paygOverage: PaygOverageSettings })).toEqual({ reason: 'payg_suspended' });
+      expect(gateBlock(store.row as { paygOverage: PaygOverageSettings })).toEqual({ reason: 'payg_suspended', paygSuspendedReason: 'payment_failed' });
     }
     expect(emailService.sendPaygOveragePaymentFailedEmail).toHaveBeenCalledTimes(1);
     await deliver('invoice.payment_succeeded', { ...invoice, status: 'paid', amount_paid: 4500, attempt_count: 4 });
@@ -1438,25 +1474,36 @@ describe('ENG-668 lifecycle — emails, refunds, payment confirmation (rvE2E MIN
     expect(emailService.sendPaygOverageInvoiceEmail).toHaveBeenCalledTimes(1);
   });
 
-  it('R2: a redelivered charge.refunded for an overage charge records ONE refund row; a further refund adds one', async () => {
+  it('R2 / rv5 MINOR 4: one history row PER REFUND with that refund\'s own amount — two partials sum to what was refunded; a redelivery adds none', async () => {
     const invoice = await issueSeptember();
     await handleInvoicePaymentSucceeded({ ...invoice, status: 'paid', amount_paid: 4500 });
     const { paymentHistoryDb } = jest.requireMock('../services/paymentHistoryDb');
-    const dedup = new Set<string>();
-    (paymentHistoryDb.record as jest.Mock).mockImplementation(async (_row: unknown, opts?: { dedupKey?: string }) => {
-      if (opts?.dedupKey && dedup.has(opts.dedupKey)) return { written: false };
-      if (opts?.dedupKey) dedup.add(opts.dedupKey);
+    const written: Array<{ key: string; amount: number }> = [];
+    (paymentHistoryDb.record as jest.Mock).mockImplementation(async (row: { amount: number }, opts?: { dedupKey?: string }) => {
+      if (opts?.dedupKey && written.some((w) => w.key === opts.dedupKey)) return { written: false };
+      if (opts?.dedupKey) written.push({ key: opts.dedupKey, amount: row.amount });
       return { written: true };
     });
     mockStripe.invoicePayments.list.mockResolvedValue({ data: [{ invoice: clone(mockStripeState.invoices.get('in_1')) }] });
-    const charge = { id: 'ch_1', customer: 'cus_card', amount: 4500, currency: 'usd', payment_intent: 'pi_1', metadata: {}, amount_refunded: 1000, refunded: false };
+    const charge = { id: 'ch_1', customer: 'cus_card', amount: 4500, currency: 'usd', payment_intent: 'pi_1', metadata: {}, amount_refunded: 1200, refunded: false };
+    // $12 refunded, then $8 more: Stripe reports the charge's cumulative amount (1200, then 2000).
+    mockStripeState.refunds.set('ch_1', [{ id: 're_a', amount: 1200, status: 'succeeded' }]);
     await deliver('charge.refunded', charge);
     await deliver('charge.refunded', charge); // at-least-once
-    await deliver('charge.refunded', { ...charge, amount_refunded: 4500, refunded: true });
-    const refundKeys = (paymentHistoryDb.record as jest.Mock).mock.calls
-      .filter(([row]) => row.eventType === 'refund').map(([, opts]) => opts?.dedupKey);
-    expect(refundKeys).toEqual(['refund:ch_1:1000', 'refund:ch_1:1000', 'refund:ch_1:4500']);
-    expect([...dedup].filter((k) => k.startsWith('refund:'))).toEqual(['refund:ch_1:1000', 'refund:ch_1:4500']);
+    mockStripeState.refunds.set('ch_1', [{ id: 're_b', amount: 800, status: 'succeeded' }, { id: 're_a', amount: 1200, status: 'succeeded' }]);
+    await deliver('charge.refunded', { ...charge, amount_refunded: 2000 });
+    expect(written.filter((w) => w.key.startsWith('refund:'))).toEqual([
+      { key: 'refund:re_a', amount: 1200 },
+      { key: 'refund:re_b', amount: 800 },
+    ]);
+    expect(settlement()).toMatchObject({ refundedCents: 2000 });
+    // The first event delivered late never lowers the recorded cumulative figure.
+    await deliver('charge.refunded', charge);
+    expect(settlement()).toMatchObject({ refundedCents: 2000 });
+    // A failed refund returned nothing and is not recorded.
+    mockStripeState.refunds.set('ch_1', [{ id: 're_c', amount: 500, status: 'failed' }, { id: 're_b', amount: 800, status: 'succeeded' }, { id: 're_a', amount: 1200, status: 'succeeded' }]);
+    await deliver('charge.refunded', { ...charge, amount_refunded: 2000 });
+    expect(written.map((w) => w.key)).not.toContain('refund:re_c');
   });
 
   it('R4: the invoice email states the percentage of the month\'s HIGHEST limit — the one the bill follows', async () => {
@@ -1517,7 +1564,7 @@ describe('ENG-668 lifecycle — disputes are announced and closed (rvE2E MINOR 4
     await disputed();
     await handleChargeDisputeClosed({ id: 'dp_1', charge: 'ch_1', amount: 4500, currency: 'usd', status: 'won' });
     expect(store.row.paygOverage.suspended).toBeUndefined();
-    expect(settlement()).toMatchObject({ status: 'paid', dispute: { disputeId: 'dp_1', status: 'won', closedAt: expect.any(String) } });
+    expect(settlement()).toMatchObject({ status: 'paid', disputes: { dp_1: { status: 'won', closedAt: expect.any(String) } } });
   });
 
   it('won while another month is unpaid: the hold becomes that month\'s payment failure, which paying it lifts', async () => {
@@ -1531,8 +1578,8 @@ describe('ENG-668 lifecycle — disputes are announced and closed (rvE2E MINOR 4
     await disputed();
     (emailService.sendOncallAlert as jest.Mock).mockClear();
     await handleChargeDisputeClosed({ id: 'dp_1', charge: 'ch_1', amount: 4500, currency: 'usd', status: 'lost' });
-    expect(settlement()).toMatchObject({ status: 'written_off', writtenOffReason: 'dispute_lost', dispute: { status: 'lost' } });
-    expect(store.row.paygOverage.suspended).toMatchObject({ reason: 'dispute' });
+    expect(settlement()).toMatchObject({ status: 'written_off', writtenOffReason: 'dispute_lost', disputes: { dp_1: { status: 'lost' } } });
+    expect(store.row.paygOverage.suspended).toMatchObject({ reason: 'dispute', disputeId: 'dp_1', lost: true });
     expect(emailService.sendOncallAlert).toHaveBeenCalledTimes(1);
     expect((emailService.sendOncallAlert as jest.Mock).mock.calls[0][0]).toContain('dispute lost');
   });
@@ -1574,5 +1621,452 @@ describe('ENG-668 settlement — drift tolerance and one alert per sweep (rvE2E)
     (emailService.sendOncallAlert as jest.Mock).mockClear();
     await runSweep(DAY3);
     expect(emailService.sendOncallAlert).not.toHaveBeenCalled();
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════════
+// rv5 review round: 3-D Secure, dispute bookkeeping, stale events, durable alerts, emails, re-pointed card
+// ════════════════════════════════════════════════════════════════════════════════════════════════════
+import { handleSetupIntentSucceeded } from '../services/stripeService';
+import * as settlementService from '../services/paygSettlementService';
+
+describe('ENG-668 rv5 — the lifecycle round, hardened', () => {
+  const { paymentHistoryDb } = jest.requireMock('../services/paymentHistoryDb');
+  /** Charges by id, each paying one invoice (Basil: found through its PaymentIntent's invoice payment). */
+  const charges = new Map<string, { paymentIntent: string; invoiceId: string }>();
+  /** The status of each invoice's default PaymentIntent (what `invoice.payment_failed` is checked against). */
+  const intentStatus = new Map<string, string>();
+  const AUG = '2026-08';
+
+  beforeEach(() => {
+    charges.clear();
+    intentStatus.clear();
+    mockStripe.charges.retrieve.mockImplementation(async (id: string) => ({
+      id, customer: 'cus_card', amount: 4500, currency: 'usd', payment_intent: charges.get(id)?.paymentIntent, metadata: {},
+    }));
+    mockStripe.invoicePayments.list.mockImplementation(async (params: { invoice?: string; payment?: { payment_intent: string } }) => {
+      if (params.invoice) {
+        const status = intentStatus.get(params.invoice);
+        return { data: status ? [{ is_default: true, payment: { type: 'payment_intent', payment_intent: { id: `pi_${params.invoice}`, status } } }] : [] };
+      }
+      const paid = [...charges.values()].find((c) => c.paymentIntent === params.payment?.payment_intent);
+      return { data: paid ? [{ invoice: clone(mockStripeState.invoices.get(paid.invoiceId)) }] : [] };
+    });
+  });
+
+  /** September invoiced (in_1) and paid, with its charge `ch_1`. */
+  async function paidSeptember() {
+    const invoice = await issueSeptember();
+    await handleInvoicePaymentSucceeded({ ...invoice, status: 'paid', amount_paid: 4500 });
+    charges.set('ch_1', { paymentIntent: 'pi_1', invoiceId: 'in_1' });
+    return invoice;
+  }
+  /** August with its own overage invoice (`in_aug`, charge `ch_aug`), in `status`. */
+  function addAugust(status: 'paid' | 'invoiced' | 'failed') {
+    mockStripeState.invoices.set('in_aug', {
+      id: 'in_aug', object: 'invoice', customer: 'cus_card', status: status === 'paid' ? 'paid' : 'open', total: 4500, created: 1,
+      metadata: { purchaseType: 'payg_overage', billingUserId: OWNER, month: AUG, idempotencyKey: `payg:${OWNER}:${AUG}` },
+      hosted_invoice_url: 'https://invoice.stripe.com/i/aug', lines: { data: [{ amount: 4500, metadata: {} }] },
+    });
+    store.row = {
+      ...store.row,
+      paygSettlements: {
+        ...store.row.paygSettlements,
+        [AUG]: { status, invoiceId: 'in_aug', idempotencyKey: `payg:${OWNER}:${AUG}`, amountCents: 4500, percentOfCap: 60, createdAt: DAY2.toISOString(), updatedAt: DAY2.toISOString() },
+      },
+    };
+    charges.set('ch_aug', { paymentIntent: 'pi_aug', invoiceId: 'in_aug' });
+    return mockStripeState.invoices.get('in_aug')!;
+  }
+  const dispute = (id: string, chargeId: string, status?: string) => ({ id, charge: chargeId, amount: 4500, currency: 'usd', reason: 'fraudulent', ...(status ? { status } : {}) });
+
+  // ── MAJOR 1: 3-D Secure ──────────────────────────────────────────────────────────────────────────────
+  describe('3-D Secure: a payment waiting for the owner\'s confirmation is not a failure', () => {
+    it.each([
+      ['action_required, then payment_failed', ['invoice.payment_action_required', 'invoice.payment_failed']],
+      ['payment_failed, then action_required', ['invoice.payment_failed', 'invoice.payment_action_required']],
+    ])('%s (PaymentIntent requires_action): PAYG stays on, no failure email, one confirm email, month still invoiced', async (_order, events) => {
+      const invoice = await issueSeptember();
+      intentStatus.set('in_1', 'requires_action');
+      for (const type of events) expect((await deliver(type, { ...invoice, status: 'open', attempt_count: 1 })).status).not.toHaveBeenCalled();
+      expect(store.row.paygOverage.suspended).toBeUndefined();
+      expect(emailService.sendPaygOveragePaymentFailedEmail).not.toHaveBeenCalled();
+      expect(emailService.sendPaygOverageInvoiceEmail).toHaveBeenCalledTimes(1); // the run's own, before any of this
+      expect(emailService.sendPaygOveragePaymentActionRequiredEmail).toHaveBeenCalledTimes(1);
+      expect(settlement()).toMatchObject({ status: 'invoiced', actionRequiredEmailedAt: expect.any(String) });
+      expect((paymentHistoryDb.record as jest.Mock).mock.calls.map(([row]) => row.eventType)).not.toContain('payg_overage_payment_failed');
+      // Checked against THIS invoice's own payment.
+      expect(mockStripe.invoicePayments.list).toHaveBeenCalledWith({ invoice: 'in_1', limit: 10, expand: ['data.payment.payment_intent'] });
+    });
+
+    it('a PaymentIntent the list did not expand is retrieved before deciding', async () => {
+      const invoice = await issueSeptember();
+      mockStripe.invoicePayments.list.mockResolvedValue({ data: [{ is_default: true, payment: { type: 'payment_intent', payment_intent: 'pi_x' } }] });
+      mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: 'pi_x', status: 'requires_action' });
+      await deliver('invoice.payment_failed', { ...invoice, status: 'open' });
+      expect(mockStripe.paymentIntents.retrieve).toHaveBeenCalledWith('pi_x');
+      expect(store.row.paygOverage.suspended).toBeUndefined();
+    });
+
+    it.each(['requires_payment_method', undefined])('a decline or a failed authentication (PaymentIntent %p) still fails the month and holds PAYG', async (status) => {
+      const invoice = await issueSeptember();
+      if (status) intentStatus.set('in_1', status);
+      await deliver('invoice.payment_failed', { ...invoice, status: 'open' });
+      expect(settlement()).toMatchObject({ status: 'failed' });
+      expect(store.row.paygOverage.suspended).toMatchObject({ reason: 'payment_failed', invoiceId: 'in_1' });
+      expect(emailService.sendPaygOveragePaymentFailedEmail).toHaveBeenCalledTimes(1);
+    });
+
+    it('the owner confirms but the bank then declines: the later failure does fail the month', async () => {
+      const invoice = await issueSeptember();
+      intentStatus.set('in_1', 'requires_action');
+      await deliver('invoice.payment_failed', { ...invoice, status: 'open' });
+      expect(store.row.paygOverage.suspended).toBeUndefined();
+      intentStatus.set('in_1', 'requires_payment_method');
+      await deliver('invoice.payment_failed', { ...invoice, status: 'open', attempt_count: 2 });
+      expect(store.row.paygOverage.suspended).toMatchObject({ reason: 'payment_failed' });
+    });
+
+    it('the PaymentIntent lookup failing errors the webhook (500, Stripe redelivers) — never guessed either way', async () => {
+      const invoice = await issueSeptember();
+      mockStripe.invoicePayments.list.mockRejectedValueOnce(new Error('stripe 503'));
+      const errorLog = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      expect((await deliver('invoice.payment_failed', { ...invoice, status: 'open' })).status).toHaveBeenCalledWith(500);
+      errorLog.mockRestore();
+      expect(settlement()).toMatchObject({ status: 'invoiced' });
+      expect(store.row.paygOverage.suspended).toBeUndefined();
+      await deliver('invoice.payment_failed', { ...invoice, status: 'open' }); // the redelivery: a decline
+      expect(store.row.paygOverage.suspended).toMatchObject({ reason: 'payment_failed' });
+    });
+  });
+
+  // ── MAJOR 2 / MINOR 1 / MINOR 2 / MINOR 8: disputes ────────────────────────────────────────────────
+  describe('disputes are tracked one by one', () => {
+    it('closed (won) delivered BEFORE created: never suspended, the outcome kept, nobody paged', async () => {
+      await paidSeptember();
+      (emailService.sendOncallAlert as jest.Mock).mockClear();
+      await deliver('charge.dispute.closed', dispute('dp_1', 'ch_1', 'won'));
+      await deliver('charge.dispute.created', dispute('dp_1', 'ch_1', 'needs_response'));
+      expect(store.row.paygOverage.suspended).toBeUndefined();
+      expect(settlement().disputes).toEqual({ dp_1: { at: expect.any(String), status: 'won', closedAt: expect.any(String) } });
+      expect(emailService.sendOncallAlert).not.toHaveBeenCalled();
+      expect((paymentHistoryDb.record as jest.Mock).mock.calls.map(([row]) => row.eventType)).not.toContain('dispute_opened');
+    });
+
+    it('created redelivered (or resent) after the dispute was won: not re-suspended, `won` kept, nobody paged — even if history would record it again', async () => {
+      await paidSeptember();
+      await deliver('charge.dispute.created', dispute('dp_1', 'ch_1'));
+      await deliver('charge.dispute.closed', dispute('dp_1', 'ch_1', 'won'));
+      expect(store.row.paygOverage.suspended).toBeUndefined();
+      const closed = clone(settlement().disputes.dp_1);
+      (emailService.sendOncallAlert as jest.Mock).mockClear();
+      (paymentHistoryDb.record as jest.Mock).mockResolvedValue({ written: true }); // no help from the history dedupe
+      await deliver('charge.dispute.created', dispute('dp_1', 'ch_1'));
+      expect(store.row.paygOverage.suspended).toBeUndefined();
+      expect(settlement().disputes.dp_1).toEqual(closed);
+      expect(emailService.sendOncallAlert).not.toHaveBeenCalled();
+    });
+
+    it('a redelivered closed (lost) neither pages again nor re-imposes a hold someone removed', async () => {
+      await paidSeptember();
+      await deliver('charge.dispute.created', dispute('dp_1', 'ch_1'));
+      await deliver('charge.dispute.closed', dispute('dp_1', 'ch_1', 'lost'));
+      expect(store.row.paygOverage.suspended).toMatchObject({ reason: 'dispute', lost: true });
+      store.row = { ...store.row, paygOverage: { ...store.row.paygOverage, suspended: undefined } }; // an operator clears it
+      (emailService.sendOncallAlert as jest.Mock).mockClear();
+      await deliver('charge.dispute.closed', dispute('dp_1', 'ch_1', 'lost'));
+      expect(store.row.paygOverage.suspended).toBeUndefined();
+      expect(emailService.sendOncallAlert).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['the first', ['dp_s', 'dp_a']],
+      ['the second', ['dp_a', 'dp_s']],
+    ])('two disputes open on two months: winning %s keeps the hold; winning the other lifts it', async (_which, order) => {
+      await paidSeptember();
+      addAugust('paid');
+      await deliver('charge.dispute.created', dispute('dp_s', 'ch_1'));
+      await deliver('charge.dispute.created', dispute('dp_a', 'ch_aug'));
+      const chargeOf = { dp_s: 'ch_1', dp_a: 'ch_aug' } as Record<string, string>;
+      await deliver('charge.dispute.closed', dispute(order[0], chargeOf[order[0]], 'won'));
+      expect(store.row.paygOverage.suspended).toMatchObject({ reason: 'dispute' });
+      await deliver('charge.dispute.closed', dispute(order[1], chargeOf[order[1]], 'won'));
+      expect(store.row.paygOverage.suspended).toBeUndefined();
+    });
+
+    it('two disputes on the same month: the hold lasts until both are closed', async () => {
+      await paidSeptember();
+      charges.set('ch_1b', { paymentIntent: 'pi_1', invoiceId: 'in_1' });
+      await deliver('charge.dispute.created', dispute('dp_1', 'ch_1'));
+      await deliver('charge.dispute.created', dispute('dp_2', 'ch_1b'));
+      await deliver('charge.dispute.closed', dispute('dp_1', 'ch_1', 'won'));
+      expect(store.row.paygOverage.suspended).toMatchObject({ reason: 'dispute' });
+      await deliver('charge.dispute.closed', dispute('dp_2', 'ch_1b', 'warning_closed'));
+      expect(store.row.paygOverage.suspended).toBeUndefined();
+    });
+
+    it('a lost dispute keeps the hold even when another dispute is won later — only a person lifts it', async () => {
+      await paidSeptember();
+      addAugust('paid');
+      await deliver('charge.dispute.created', dispute('dp_s', 'ch_1'));
+      await deliver('charge.dispute.created', dispute('dp_a', 'ch_aug'));
+      await deliver('charge.dispute.closed', dispute('dp_s', 'ch_1', 'lost'));
+      await deliver('charge.dispute.closed', dispute('dp_a', 'ch_aug', 'won'));
+      expect(store.row.paygOverage.suspended).toMatchObject({ reason: 'dispute', lost: true, disputeId: 'dp_s' });
+      expect(settlement()).toMatchObject({ status: 'written_off', writtenOffReason: 'dispute_lost' });
+    });
+
+    it('the lift removes only a hold a RECORDED dispute set: a hand-set dispute hold, or one naming an unknown dispute, stays (rv5 MINOR 8)', async () => {
+      for (const handSet of [{ reason: 'dispute', at: '2026-10-09T00:00:00.000Z', invoiceId: 'in_1' }, { reason: 'dispute', at: '2026-10-09T00:00:00.000Z', invoiceId: 'in_1', disputeId: 'dp_unknown' }]) {
+        jest.clearAllMocks();
+        await paidSeptember();
+        await deliver('charge.dispute.created', dispute('dp_1', 'ch_1'));
+        store.row = { ...store.row, paygOverage: { ...store.row.paygOverage, suspended: handSet } };
+        await deliver('charge.dispute.closed', dispute('dp_1', 'ch_1', 'won'));
+        expect(store.row.paygOverage.suspended).toEqual(handSet);
+      }
+    });
+
+    it('won while another month is failed: the hold goes to that month (paying it lifts), never removed', async () => {
+      await paidSeptember();
+      addAugust('failed');
+      await deliver('charge.dispute.created', dispute('dp_1', 'ch_1'));
+      await deliver('charge.dispute.closed', dispute('dp_1', 'ch_1', 'won'));
+      expect(store.row.paygOverage.suspended).toMatchObject({ reason: 'payment_failed', invoiceId: 'in_aug' });
+      await deliver('invoice.paid', { ...mockStripeState.invoices.get('in_aug')!, status: 'paid', amount_paid: 4500 });
+      expect(store.row.paygOverage.suspended).toBeUndefined();
+    });
+
+    /** Run `competitor` right after the n-th strongly consistent read of the row (the lift's is the 3rd). */
+    function afterRead(n: number, competitor: () => Promise<unknown>) {
+      let reads = 0;
+      (userDb.getUserByIdConsistent as jest.Mock).mockImplementation(async () => {
+        const snapshot = await store.read();
+        reads += 1;
+        if (reads === n) await competitor();
+        return snapshot;
+      });
+    }
+
+    it('a payment failure landing after the won-lift read keeps the account suspended — the lift is refused and re-reads (rv5 MINOR 2)', async () => {
+      await paidSeptember();
+      const aug = addAugust('invoiced');
+      await deliver('charge.dispute.created', dispute('dp_1', 'ch_1'));
+      // closed: 1 = loadSettlementFor, 2 = recording it closed, 3 = the lift's read.
+      afterRead(3, () => settlementService.handlePaygOverageInvoicePaymentFailed({ ...aug, status: 'open' }));
+      await settlementService.handlePaygOverageChargeDisputeClosed(dispute('dp_1', 'ch_1', 'won'), { id: 'ch_1' }, clone(mockStripeState.invoices.get('in_1')!));
+      expect(store.row.paygSettlements[AUG].status).toBe('failed');
+      expect(store.row.paygOverage.suspended).toMatchObject({ reason: 'payment_failed', invoiceId: 'in_aug' });
+    });
+
+    it('a second dispute opened after the won-lift read keeps the account suspended', async () => {
+      await paidSeptember();
+      addAugust('paid');
+      await deliver('charge.dispute.created', dispute('dp_1', 'ch_1'));
+      afterRead(3, () => settlementService.handlePaygOverageChargeDisputed(dispute('dp_a', 'ch_aug'), { id: 'ch_aug' }, clone(mockStripeState.invoices.get('in_aug')!)));
+      await settlementService.handlePaygOverageChargeDisputeClosed(dispute('dp_1', 'ch_1', 'won'), { id: 'ch_1' }, clone(mockStripeState.invoices.get('in_1')!));
+      expect(store.row.paygOverage.suspended).toMatchObject({ reason: 'dispute', disputeId: 'dp_a' });
+    });
+  });
+
+  // ── MINOR 3: a record that names no invoice yet ─────────────────────────────────────────────────────
+  describe('a pending record with no invoice yet owns only an invoice its own run would adopt', () => {
+    const pendingNoInvoice = () => setup(ownerRow({
+      paygSettlements: { [M]: { status: 'pending', idempotencyKey: KEY, amountCents: 4500, percentOfCap: 60, createdAt: '2026-10-05T00:00:00.000Z', updatedAt: '2026-10-05T00:00:00.000Z' } },
+    }));
+    const oldInvoice = (over: Record<string, unknown> = {}) => ({
+      id: 'in_old', object: 'invoice', customer: 'cus_card', status: 'void', total: 4500, amount_due: 4500, currency: 'usd',
+      metadata: { purchaseType: 'payg_overage', billingUserId: OWNER, month: M, idempotencyKey: KEY }, hosted_invoice_url: 'https://invoice.stripe.com/i/old', ...over,
+    });
+
+    it('a late invoice.voided for an OLD invoice of the month never writes off the new pending record', async () => {
+      pendingNoInvoice();
+      await deliver('invoice.voided', oldInvoice());
+      expect(settlement()).toMatchObject({ status: 'pending' });
+      expect(settlement()).not.toHaveProperty('invoiceId');
+      expect(emailService.sendOncallAlert).not.toHaveBeenCalled();
+    });
+
+    it('an invoice whose metadata is not this record\'s key is ignored too (failed, paid)', async () => {
+      pendingNoInvoice();
+      const foreign = oldInvoice({ status: 'open', metadata: { purchaseType: 'payg_overage', billingUserId: OWNER, month: M, idempotencyKey: 'payg:someone-else:2026-09' } });
+      await deliver('invoice.payment_failed', foreign);
+      await deliver('invoice.paid', { ...foreign, status: 'paid' });
+      expect(settlement()).toMatchObject({ status: 'pending' });
+      expect(store.row.paygOverage.suspended).toBeUndefined();
+    });
+
+    it('a live invoice the run\'s search would adopt (this key, not void) is still recorded', async () => {
+      pendingNoInvoice();
+      await deliver('invoice.paid', oldInvoice({ id: 'in_live', status: 'paid', amount_paid: 4500 }));
+      expect(settlement()).toMatchObject({ status: 'paid', invoiceId: 'in_live' });
+    });
+  });
+
+  // ── MINOR 6: held-month alerts are durable ──────────────────────────────────────────────────────────
+  it('a held month\'s alert survives a sweep that dies before alerting: the next sweep sends it once, then clears it (rv5 MINOR 6)', async () => {
+    setup();
+    spend(130, 100); // drift: held
+    // The process dies right after the hold is written, before any alert.
+    await expect(settlePaygOverageMonth(OWNER, M, DAY2, async () => { throw new Error('process died'); })).rejects.toThrow('process died');
+    expect(settlement()).toMatchObject({ status: 'held', heldReason: 'spend_drift', alertPending: expect.any(String) });
+    expect(emailService.sendOncallAlert).not.toHaveBeenCalled();
+    await runSweep(DAY3);
+    expect(emailService.sendOncallAlert).toHaveBeenCalledTimes(1);
+    expect((emailService.sendOncallAlert as jest.Mock).mock.calls[0][0]).toBe(`PAYG settlement held for ${M}: spend_drift`);
+    expect(settlement()).not.toHaveProperty('alertPending');
+    await runSweep(DAY3);
+    expect(emailService.sendOncallAlert).toHaveBeenCalledTimes(1);
+  });
+
+  it('an alert that fails to go out stays pending and is sent by the next sweep', async () => {
+    setup();
+    spend(130, 100);
+    (emailService.sendOncallAlert as jest.Mock).mockRejectedValueOnce(new Error('smtp down'));
+    const errorLog = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    await runSweep(DAY2);
+    errorLog.mockRestore();
+    expect(settlement()).toMatchObject({ status: 'held', alertPending: expect.any(String) });
+    await runSweep(DAY3);
+    expect(emailService.sendOncallAlert).toHaveBeenCalledTimes(2);
+    expect(settlement()).not.toHaveProperty('alertPending');
+  });
+
+  // ── NIT: the invoice email ──────────────────────────────────────────────────────────────────────────
+  describe('the invoice email never contradicts what happened', () => {
+    it('payment_failed lands before the run records the month invoiced: only the failure email, never "will charge your card"', async () => {
+      setup();
+      const realFinalize = mockStripe.invoices.finalizeInvoice.getMockImplementation()!;
+      mockStripe.invoices.finalizeInvoice.mockImplementationOnce(async (...args: Parameters<typeof realFinalize>) => {
+        const finalized = await realFinalize(...args);
+        await handleInvoicePaymentFailed({ ...finalized, amount_due: 4500 });
+        return finalized;
+      });
+      expect(await settlePaygOverageMonth(OWNER, M, DAY2)).toBe('raced');
+      expect(emailService.sendPaygOveragePaymentFailedEmail).toHaveBeenCalledTimes(1);
+      expect(emailService.sendPaygOverageInvoiceEmail).not.toHaveBeenCalled();
+    });
+
+    it('payment_failed lands right AFTER the run records the month invoiced, before its email: still no "will charge your card" (the claim checks the state)', async () => {
+      setup();
+      let injected = false;
+      (userDb.updateUser as jest.Mock).mockImplementation(async (id: string, fields: Record<string, unknown>, options: { pathSets?: Array<{ path: unknown[]; value: unknown }> } = {}) => {
+        const result = await store.updateUser(id, fields, options as never);
+        const markedInvoiced = (options.pathSets ?? []).some((set) => set.path.join('.') === `paygSettlements.${M}.status` && set.value === 'invoiced');
+        if (markedInvoiced && !injected) {
+          injected = true;
+          await handleInvoicePaymentFailed({ ...mockStripeState.invoices.get('in_1')!, amount_due: 4500 });
+        }
+        return result;
+      });
+      expect(await settlePaygOverageMonth(OWNER, M, DAY2)).toBe('invoiced');
+      expect(injected).toBe(true);
+      expect(settlement()).toMatchObject({ status: 'failed' });
+      expect(emailService.sendPaygOveragePaymentFailedEmail).toHaveBeenCalledTimes(1);
+      expect(emailService.sendPaygOverageInvoiceEmail).not.toHaveBeenCalled();
+    });
+
+    it('voided before the run records it: no invoice email for a written-off month', async () => {
+      setup();
+      const realFinalize = mockStripe.invoices.finalizeInvoice.getMockImplementation()!;
+      mockStripe.invoices.finalizeInvoice.mockImplementationOnce(async (...args: Parameters<typeof realFinalize>) => {
+        const finalized = await realFinalize(...args);
+        await settlementService.handlePaygOverageInvoiceVoided({ ...finalized, status: 'void' });
+        return finalized;
+      });
+      await settlePaygOverageMonth(OWNER, M, DAY2);
+      expect(settlement()).toMatchObject({ status: 'written_off' });
+      expect(emailService.sendPaygOverageInvoiceEmail).not.toHaveBeenCalled();
+    });
+
+    it('collected before the run (paid webhook first) or already paid at adoption: the email says it has been paid', async () => {
+      setup();
+      const realFinalize = mockStripe.invoices.finalizeInvoice.getMockImplementation()!;
+      mockStripe.invoices.finalizeInvoice.mockImplementationOnce(async (...args: Parameters<typeof realFinalize>) => {
+        const finalized = await realFinalize(...args);
+        await handleInvoicePaymentSucceeded({ ...finalized, status: 'paid', amount_paid: 4500 });
+        return finalized;
+      });
+      await settlePaygOverageMonth(OWNER, M, DAY2);
+      expect(emailService.sendPaygOverageInvoiceEmail).toHaveBeenCalledTimes(1);
+      expect(emailService.sendPaygOverageInvoiceEmail).toHaveBeenCalledWith(expect.objectContaining({ paid: true }));
+
+      jest.clearAllMocks();
+      mockStripeState.invoices.clear();
+      mockStripeState.keys.clear();
+      setup();
+      mockStripeState.invoices.set('in_p', {
+        id: 'in_p', object: 'invoice', customer: 'cus_card', status: 'paid', total: 4500, created: 1,
+        metadata: { purchaseType: 'payg_overage', billingUserId: OWNER, month: M, idempotencyKey: KEY },
+        hosted_invoice_url: 'https://invoice.stripe.com/i/p', lines: { data: [{ amount: 4500, metadata: {} }] },
+      });
+      expect(await settlePaygOverageMonth(OWNER, M, DAY2)).toBe('paid');
+      expect(emailService.sendPaygOverageInvoiceEmail).toHaveBeenCalledTimes(1);
+      expect(emailService.sendPaygOverageInvoiceEmail).toHaveBeenCalledWith(expect.objectContaining({ paid: true }));
+    });
+
+    it('a held month whose invoice is paid later gets the paid wording', async () => {
+      setup(ownerRow({
+        paygSettlements: { [M]: { status: 'held', heldReason: 'invoice_mismatch', invoiceId: 'in_h', idempotencyKey: KEY, amountCents: 4500, percentOfCap: 60, createdAt: DAY2.toISOString(), updatedAt: DAY2.toISOString() } },
+      }));
+      await deliver('invoice.paid', {
+        id: 'in_h', object: 'invoice', status: 'paid', amount_paid: 4800, currency: 'usd', hosted_invoice_url: 'https://invoice.stripe.com/i/h',
+        metadata: { purchaseType: 'payg_overage', billingUserId: OWNER, month: M, idempotencyKey: KEY },
+      });
+      expect(settlement()).toMatchObject({ status: 'paid' });
+      expect(emailService.sendPaygOverageInvoiceEmail).toHaveBeenCalledWith(expect.objectContaining({ paid: true }));
+    });
+  });
+
+  // ── PINNED CARD: a newly saved card replaces the pin on an open overage invoice ─────────────────────
+  describe('setup_intent.succeeded re-points an open overage invoice pinned to the old card', () => {
+    const savedCard = (over: Record<string, unknown> = {}) => ({ id: 'seti_1', object: 'setup_intent', status: 'succeeded', customer: 'cus_card', payment_method: 'pm_new', metadata: {}, ...over });
+
+    it('a failed month\'s invoice pinned to pm_card now charges pm_new (Stripe\'s next retry uses it)', async () => {
+      const invoice = await issueSeptember(); // pinned: the customer had no invoice default
+      expect(invoice.default_payment_method).toBe('pm_card');
+      await deliver('invoice.payment_failed', { ...invoice, status: 'open' });
+      (userDb.getUserById as jest.Mock).mockImplementation(async (id: string) => (id === OWNER ? store.read() : undefined));
+      const r = await deliver('setup_intent.succeeded', savedCard({ metadata: { userId: OWNER, purchaseType: 'zoma_payment_method' } }));
+      expect(r.json).toHaveBeenCalledWith({ received: true });
+      expect(mockStripe.invoices.update).toHaveBeenCalledWith('in_1', { default_payment_method: 'pm_new' }, { idempotencyKey: 'payg-repoint:in_1:pm_new' });
+      expect(mockStripeState.invoices.get('in_1')!.default_payment_method).toBe('pm_new');
+    });
+
+    it('found by the row\'s customer when the SetupIntent carries no user; a redelivery changes nothing more', async () => {
+      const invoice = await issueSeptember();
+      // `findUserByStripeCustomerId` scans for the row's `stripe_customer_id`.
+      (userDb.scanWithFilter as jest.Mock).mockImplementation(async (filter: string, values: Record<string, string>) =>
+        (filter === 'stripe_customer_id = :cid' && values[':cid'] === 'cus_card' ? [store.row] : []));
+      await handleSetupIntentSucceeded(savedCard());
+      await handleSetupIntentSucceeded(savedCard());
+      expect(mockStripe.invoices.update).toHaveBeenCalledTimes(1);
+      expect(invoice.id).toBe('in_1');
+    });
+
+    it('never touches: an account with no open overage invoice (no Stripe call), an unpinned invoice, another customer\'s card', async () => {
+      setup();
+      (userDb.getUserById as jest.Mock).mockImplementation(async () => store.read());
+      await handleSetupIntentSucceeded(savedCard({ metadata: { userId: OWNER } }));
+      expect(mockStripe.invoices.retrieve).not.toHaveBeenCalled();
+
+      const invoice = await issueSeptember();
+      (userDb.getUserById as jest.Mock).mockImplementation(async () => store.read());
+      await handleSetupIntentSucceeded(savedCard({ customer: 'cus_other', metadata: { userId: OWNER } }));
+      mockStripeState.invoices.get('in_1')!.default_payment_method = undefined;
+      await handleSetupIntentSucceeded(savedCard({ metadata: { userId: OWNER } }));
+      expect(mockStripe.invoices.update).not.toHaveBeenCalled();
+      expect(invoice.status).toBe('open');
+    });
+
+    it('a row that cannot be read is logged and acknowledged, as before this handler existed', async () => {
+      setup();
+      (userDb.getUserById as jest.Mock).mockRejectedValue(new Error('throttled'));
+      const errorLog = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      const r = await deliver('setup_intent.succeeded', savedCard({ metadata: { userId: OWNER } }));
+      errorLog.mockRestore();
+      expect(r.json).toHaveBeenCalledWith({ received: true });
+      expect(mockStripe.invoices.retrieve).not.toHaveBeenCalled();
+    });
   });
 });

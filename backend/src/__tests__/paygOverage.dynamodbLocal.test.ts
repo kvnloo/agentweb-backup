@@ -62,6 +62,8 @@ jest.mock('../services/stripeService', () => ({
     resolveUserPaymentMethod: jest.fn(),
     findLiveCustomerIdForUser: jest.fn(),
     issuePaygOverageInvoice: jest.fn(),
+    paygOverageInvoicePaymentNeedsAction: jest.fn(),
+    listChargeRefunds: jest.fn(),
   },
 }));
 jest.mock('../services/spendEventDb', () => ({
@@ -98,7 +100,10 @@ suite('PAYG conditional writes against DynamoDB Local', () => {
   let settlement: typeof import('../services/paygSettlementService');
   let mocks: {
     tierName: jest.Mock; tierConfig: jest.Mock; getSetting: jest.Mock; spendBasis: jest.Mock;
-    stripe: { resolveUserPaymentMethod: jest.Mock; findLiveCustomerIdForUser: jest.Mock; issuePaygOverageInvoice: jest.Mock };
+    stripe: {
+      resolveUserPaymentMethod: jest.Mock; findLiveCustomerIdForUser: jest.Mock; issuePaygOverageInvoice: jest.Mock;
+      paygOverageInvoicePaymentNeedsAction: jest.Mock; listChargeRefunds: jest.Mock;
+    };
     listSpendEvents: jest.Mock; getProjection: jest.Mock; paymentHistory: jest.Mock;
     email: {
       sendOncallAlert: jest.Mock; sendPaygOverageInvoiceEmail: jest.Mock; sendPaygOveragePaymentFailedEmail: jest.Mock;
@@ -248,6 +253,9 @@ suite('PAYG conditional writes against DynamoDB Local', () => {
     });
     mocks.stripe.findLiveCustomerIdForUser.mockResolvedValue('cus_row');
     mocks.stripe.issuePaygOverageInvoice.mockReset();
+    // A failed attempt is a decline unless a test says the bank awaits the owner's confirmation.
+    mocks.stripe.paygOverageInvoicePaymentNeedsAction.mockReset().mockResolvedValue(false);
+    mocks.stripe.listChargeRefunds.mockReset().mockResolvedValue([]);
     mocks.paymentHistory.mockResolvedValue({ written: true });
     mocks.email.sendOncallAlert.mockResolvedValue(undefined);
     mocks.email.sendPaygOverageInvoiceEmail.mockResolvedValue('sent');
@@ -905,7 +913,7 @@ suite('PAYG conditional writes against DynamoDB Local', () => {
       expect(after.paygOverage).not.toHaveProperty('suspended');
     });
 
-    it('a second month failing re-stamps the suspension; a redelivered failure changes nothing; a dispute is never overwritten', async () => {
+    it('a second month failing re-stamps the suspension; a redelivered failure changes nothing; a dispute is never downgraded', async () => {
       const o = await failedMonths(['2026-08', M]);
       await settlement.handlePaygOverageInvoicePaymentFailed(invoiceEvent(o, 'in_2026-08', '2026-08'));
       const first = (await row(o.email)).paygOverage.suspended;
@@ -920,13 +928,16 @@ suite('PAYG conditional writes against DynamoDB Local', () => {
       await settlement.handlePaygOverageChargeDisputed({ id: 'dp_1', amount: 4500, currency: 'usd', reason: 'fraudulent' }, { id: 'ch_1' }, invoiceEvent(o, 'in_2026-08', '2026-08'));
       const disputed = (await row(o.email)).paygOverage.suspended;
       expect(disputed).toMatchObject({ reason: 'dispute', invoiceId: 'in_2026-08' });
-      expect((await record(o.email, '2026-08')).dispute).toMatchObject({ disputeId: 'dp_1' });
+      expect((await record(o.email, '2026-08')).disputes).toEqual({ dp_1: { at: expect.any(String) } });
+      // A second dispute re-stamps the dispute hold in the same write that records it open (rv5 MINOR 1/2:
+      // a won-dispute lift that read the row before it is refused).
       await settlement.handlePaygOverageChargeDisputed({ id: 'dp_2' }, { id: 'ch_2' }, invoiceEvent(o, `in_${M}`));
-      expect((await row(o.email)).paygOverage.suspended).toEqual(disputed); // never replaced by another dispute
+      const restamped = (await row(o.email)).paygOverage.suspended;
+      expect(restamped).toMatchObject({ reason: 'dispute', disputeId: 'dp_2', invoiceId: `in_${M}` });
       // Paying everything never lifts a dispute.
       await settlement.handlePaygOverageInvoicePaid(invoiceEvent(o, 'in_2026-08', '2026-08'));
       await settlement.handlePaygOverageInvoicePaid(invoiceEvent(o, `in_${M}`));
-      expect((await row(o.email)).paygOverage.suspended).toEqual(disputed);
+      expect((await row(o.email)).paygOverage.suspended).toEqual(restamped);
     });
 
     it('lift: paying one of two failed months keeps the suspension; paying the last lifts it', async () => {
@@ -1082,11 +1093,12 @@ suite('PAYG conditional writes against DynamoDB Local', () => {
       expect(await record(bad.email)).toMatchObject({ status: 'held', heldReason: 'spend_drift' });
     });
 
-    it('refund rows carry a dedupe key per charge and cumulative amount', async () => {
+    it('refund rows carry a dedupe key per refund and that refund\'s own amount', async () => {
       const o = await failedMonths([M]);
       await settlement.handlePaygOverageInvoicePaid(invoiceEvent(o, `in_${M}`));
+      mocks.stripe.listChargeRefunds.mockResolvedValue([{ id: 're_r', amount: 1200, status: 'succeeded' }]);
       await settlement.handlePaygOverageChargeRefunded({ id: 'ch_r', amount_refunded: 1200, refunded: false, currency: 'usd' }, invoiceEvent(o, `in_${M}`));
-      expect(mocks.paymentHistory).toHaveBeenCalledWith(expect.objectContaining({ eventType: 'refund', amount: 1200 }), { dedupKey: 'refund:ch_r:1200' });
+      expect(mocks.paymentHistory).toHaveBeenCalledWith(expect.objectContaining({ eventType: 'refund', amount: 1200 }), { dedupKey: 'refund:re_r' });
     });
 
     it('dispute closed: won lifts the dispute hold (map `= :seen`); won with another failed month hands the hold to it; lost writes off and keeps it', async () => {
@@ -1097,7 +1109,7 @@ suite('PAYG conditional writes against DynamoDB Local', () => {
       await settlement.handlePaygOverageChargeDisputeClosed({ id: 'dp_w', status: 'won' }, { id: 'ch_w' }, invoiceEvent(won, `in_${M}`));
       let after = await row(won.email);
       expect(after.paygOverage).not.toHaveProperty('suspended');
-      expect(after.paygSettlements[M]).toMatchObject({ status: 'paid', dispute: { disputeId: 'dp_w', status: 'won', closedAt: expect.any(String) } });
+      expect(after.paygSettlements[M]).toMatchObject({ status: 'paid', disputes: { dp_w: { status: 'won', closedAt: expect.any(String) } } });
 
       const mixed = await failedMonths(['2026-08', M]);
       await settlement.handlePaygOverageInvoicePaymentFailed(invoiceEvent(mixed, 'in_2026-08', '2026-08'));
@@ -1124,6 +1136,242 @@ suite('PAYG conditional writes against DynamoDB Local', () => {
       // `https://invoice.example/...` is an https page: it is the one offered.
       const { paygOpenInvoiceUrl } = await import('../services/paygSettlement');
       expect(paygOpenInvoiceUrl((await row(o.email)).paygSettlements)).toBe(`https://invoice.example/in_${M}`);
+    });
+  });
+
+  // ════════════════════════════════════════════════════════════════════════════════════════════════════
+  // 4b. rv5 review round — the reviewer's failing probes, kept as permanent tests on real DynamoDB
+  // ════════════════════════════════════════════════════════════════════════════════════════════════════
+  describe('rv5 lifecycle (3-D Secure, disputes one by one, stale events, refunds per refund, emails, durable alerts)', () => {
+    const M = '2026-09';
+    const NEXT = '2026-10';
+    const AUG = '2026-08';
+    const DAY2 = new Date('2026-10-02T12:00:00.000Z');
+    const admitted = (month: string) => ({
+      month, capHighWaterMicroUsd: 50 * USD, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 15_000, spendBasis: 'spend_ledger',
+    });
+    const owner = async (extra: Record<string, unknown> = {}, payg: Record<string, unknown> = {}) => {
+      const o = newOwner();
+      await put({
+        ...o, subscription_status: 'active', has_payment_method: true, stripe_customer_id: 'cus_row',
+        paygOverage: {
+          enabled: true, capPercentOfPool: 50, version: 3, updatedBy: o.userId, updatedAt: '2026-08-01T00:00:00.000Z',
+          poolHighWater: { month: NEXT, thresholdMicroUsd: 100 * USD }, poolHighWaterClosed: { month: M, thresholdMicroUsd: 100 * USD },
+          admittedMonths: [admitted(NEXT), admitted(M)], ...payg,
+        },
+        ...extra,
+      });
+      return o;
+    };
+    const spend = (settledUsd = 130, projectedUsd: number | null = settledUsd, month = M) => {
+      mocks.listSpendEvents.mockResolvedValue([{
+        billingUserId: 'x', eventId: 'e1', occurredAt: `${month}-15T10:00:00.000Z`, billingMonth: month, actingUserId: 'x',
+        provider: 'openai', operation: 'chat', unit: 'call', quantity: 1, costMicroUsd: settledUsd * USD, costSource: 'measured', lifecycle: 'settled',
+      }]);
+      mocks.getProjection.mockResolvedValue(projectedUsd === null ? null : { billingUserId: 'x', billingMonth: month, settledMicroUsd: projectedUsd * USD, computedAt: DAY2.toISOString() });
+    };
+    const record = async (email: string, month = M) => (await row(email)).paygSettlements?.[month];
+    const invoiceEvent = (o: { userId: string }, id: string, month = M) => ({
+      id, metadata: { purchaseType: 'payg_overage', billingUserId: o.userId, month, idempotencyKey: `payg:${o.userId}:${month}` },
+      amount_paid: 4500, amount_due: 4500, currency: 'usd', hosted_invoice_url: `https://invoice.example/${id}`,
+    });
+    const settle = (status: string, over: Record<string, unknown> = {}) => ({
+      status, idempotencyKey: 'k', amountCents: 4500, percentOfCap: 60, createdAt: DAY2.toISOString(), updatedAt: DAY2.toISOString(), ...over,
+    });
+    const withMonths = (months: Record<string, Record<string, unknown>>, payg: Record<string, unknown> = {}) =>
+      owner({ paygSettlements: months }, payg);
+    /** Runs `competitor` right after the n-th strongly consistent read from now, then hands back that (now stale) read. */
+    function afterNthConsistentRead(n: number, competitor: () => Promise<unknown>) {
+      const real = userDb.getUserByIdConsistent.bind(userDb);
+      let reads = 0;
+      const spy = jest.spyOn(userDb, 'getUserByIdConsistent').mockImplementation(async (...args: unknown[]) => {
+        reads += 1;
+        const snapshot = await real(...args);
+        if (reads === n) {
+          spy.mockRestore();
+          await competitor();
+        }
+        return snapshot;
+      });
+    }
+
+    beforeEach(() => spend());
+
+    // MAJOR 1
+    it('3-D Secure: the pair Stripe sends (action_required, then payment_failed with the PaymentIntent requires_action) keeps PAYG on, as the email promises', async () => {
+      const o = await withMonths({ [M]: settle('invoiced', { invoiceId: 'in_3ds' }) });
+      mocks.stripe.paygOverageInvoicePaymentNeedsAction.mockResolvedValue(true);
+      const ev = { ...invoiceEvent(o, 'in_3ds'), status: 'open', attempt_count: 1 };
+      await settlement.handlePaygOverageInvoicePaymentActionRequired(ev);
+      await settlement.handlePaygOverageInvoicePaymentFailed(ev);
+      expect(mocks.stripe.paygOverageInvoicePaymentNeedsAction).toHaveBeenCalledWith('in_3ds');
+      expect(mocks.email.sendPaygOveragePaymentActionRequiredEmail).toHaveBeenCalledTimes(1);
+      expect(mocks.email.sendPaygOveragePaymentFailedEmail).not.toHaveBeenCalled();
+      const after = await row(o.email);
+      expect(after.paygOverage).not.toHaveProperty('suspended');
+      expect(after.paygSettlements[M].status).toBe('invoiced');
+      // ...and a genuine decline afterwards still fails it.
+      mocks.stripe.paygOverageInvoicePaymentNeedsAction.mockResolvedValue(false);
+      await settlement.handlePaygOverageInvoicePaymentFailed(ev);
+      expect((await row(o.email)).paygOverage.suspended).toMatchObject({ reason: 'payment_failed', invoiceId: 'in_3ds' });
+    });
+
+    // MAJOR 2
+    it('dispute.closed (won) delivered BEFORE dispute.created: PAYG never ends suspended, `won` kept', async () => {
+      const o = await withMonths({ [M]: settle('paid', { invoiceId: 'in_ro' }) });
+      await settlement.handlePaygOverageChargeDisputeClosed({ id: 'dp_ro', status: 'won' }, { id: 'ch_ro' }, invoiceEvent(o, 'in_ro'));
+      await settlement.handlePaygOverageChargeDisputed({ id: 'dp_ro', amount: 4500, currency: 'usd' }, { id: 'ch_ro' }, invoiceEvent(o, 'in_ro'));
+      const after = await row(o.email);
+      expect(after.paygOverage).not.toHaveProperty('suspended');
+      expect(after.paygSettlements[M].disputes.dp_ro).toMatchObject({ status: 'won', closedAt: expect.any(String) });
+    });
+
+    it('dispute.created redelivered after the dispute was won: not re-suspended and nobody paged', async () => {
+      const o = await withMonths({ [M]: settle('paid', { invoiceId: 'in_rd' }) });
+      await settlement.handlePaygOverageChargeDisputed({ id: 'dp_rd' }, { id: 'ch_rd' }, invoiceEvent(o, 'in_rd'));
+      await settlement.handlePaygOverageChargeDisputeClosed({ id: 'dp_rd', status: 'won' }, { id: 'ch_rd' }, invoiceEvent(o, 'in_rd'));
+      expect((await row(o.email)).paygOverage).not.toHaveProperty('suspended');
+      mocks.email.sendOncallAlert.mockClear();
+      mocks.paymentHistory.mockResolvedValueOnce({ written: false }); // the history dedupe sees the redelivery
+      await settlement.handlePaygOverageChargeDisputed({ id: 'dp_rd' }, { id: 'ch_rd' }, invoiceEvent(o, 'in_rd'));
+      const after = await row(o.email);
+      expect(mocks.email.sendOncallAlert).not.toHaveBeenCalled();
+      expect(after.paygOverage).not.toHaveProperty('suspended');
+      expect(after.paygSettlements[M].disputes.dp_rd.status).toBe('won');
+    });
+
+    // MINOR 1
+    it('disputes open on two months: winning the FIRST keeps the hold while the second is open; winning the second lifts it', async () => {
+      const o = await withMonths({ [M]: settle('paid', { invoiceId: 'in_d1' }), [AUG]: settle('paid', { invoiceId: 'in_d2' }) });
+      await settlement.handlePaygOverageChargeDisputed({ id: 'dp_a' }, { id: 'ch_a' }, invoiceEvent(o, 'in_d1'));
+      await settlement.handlePaygOverageChargeDisputed({ id: 'dp_b' }, { id: 'ch_b' }, invoiceEvent(o, 'in_d2', AUG));
+      await settlement.handlePaygOverageChargeDisputeClosed({ id: 'dp_a', status: 'won' }, { id: 'ch_a' }, invoiceEvent(o, 'in_d1'));
+      expect((await row(o.email)).paygOverage.suspended).toMatchObject({ reason: 'dispute' });
+      await settlement.handlePaygOverageChargeDisputeClosed({ id: 'dp_b', status: 'won' }, { id: 'ch_b' }, invoiceEvent(o, 'in_d2', AUG));
+      expect((await row(o.email)).paygOverage).not.toHaveProperty('suspended');
+    });
+
+    // MINOR 2 — DynamoDB decides: the lift's `#payg.#suspended = :seen` against the failure's `paymentFailedAt` stamp
+    it('a payment failure lands after the won-lift\'s read: the lift is refused, re-reads, and the account stays suspended for the failed month', async () => {
+      const o = await withMonths({ [M]: settle('paid', { invoiceId: 'in_w' }), [AUG]: settle('invoiced', { invoiceId: 'in_f' }) });
+      await settlement.handlePaygOverageChargeDisputed({ id: 'dp_w' }, { id: 'ch_w' }, invoiceEvent(o, 'in_w'));
+      // closed: read 1 = loadSettlementFor, 2 = recording it closed, 3 = the lift's read; the failure lands after 3.
+      afterNthConsistentRead(3, () => settlement.handlePaygOverageInvoicePaymentFailed(invoiceEvent(o, 'in_f', AUG)));
+      await settlement.handlePaygOverageChargeDisputeClosed({ id: 'dp_w', status: 'won' }, { id: 'ch_w' }, invoiceEvent(o, 'in_w'));
+      const after = await row(o.email);
+      expect(after.paygSettlements[AUG].status).toBe('failed');
+      expect(after.paygOverage.suspended).toMatchObject({ reason: 'payment_failed', invoiceId: 'in_f' });
+    });
+
+    it('a second dispute opens after the won-lift\'s read: the lift is refused (the hold was re-stamped with it) and PAYG stays held', async () => {
+      const o = await withMonths({ [M]: settle('paid', { invoiceId: 'in_x1' }), [AUG]: settle('paid', { invoiceId: 'in_x2' }) });
+      await settlement.handlePaygOverageChargeDisputed({ id: 'dp_x1' }, { id: 'ch_x1' }, invoiceEvent(o, 'in_x1'));
+      afterNthConsistentRead(3, () => settlement.handlePaygOverageChargeDisputed({ id: 'dp_x2' }, { id: 'ch_x2' }, invoiceEvent(o, 'in_x2', AUG)));
+      await settlement.handlePaygOverageChargeDisputeClosed({ id: 'dp_x1', status: 'won' }, { id: 'ch_x1' }, invoiceEvent(o, 'in_x1'));
+      expect((await row(o.email)).paygOverage.suspended).toMatchObject({ reason: 'dispute', disputeId: 'dp_x2' });
+    });
+
+    it('a lost dispute: written off and held as lost in one write; a won dispute elsewhere never lifts it', async () => {
+      const o = await withMonths({ [M]: settle('paid', { invoiceId: 'in_l1' }), [AUG]: settle('paid', { invoiceId: 'in_l2' }) });
+      await settlement.handlePaygOverageChargeDisputed({ id: 'dp_l1' }, { id: 'ch_l1' }, invoiceEvent(o, 'in_l1'));
+      await settlement.handlePaygOverageChargeDisputed({ id: 'dp_l2' }, { id: 'ch_l2' }, invoiceEvent(o, 'in_l2', AUG));
+      await settlement.handlePaygOverageChargeDisputeClosed({ id: 'dp_l1', status: 'lost' }, { id: 'ch_l1' }, invoiceEvent(o, 'in_l1'));
+      await settlement.handlePaygOverageChargeDisputeClosed({ id: 'dp_l2', status: 'won' }, { id: 'ch_l2' }, invoiceEvent(o, 'in_l2', AUG));
+      const after = await row(o.email);
+      expect(after.paygOverage.suspended).toMatchObject({ reason: 'dispute', lost: true, disputeId: 'dp_l1' });
+      expect(after.paygSettlements[M]).toMatchObject({ status: 'written_off', writtenOffReason: 'dispute_lost', disputes: { dp_l1: { status: 'lost' } } });
+    });
+
+    // MINOR 3
+    it('month re-issued after `retry` (pending, new invoice not recorded yet): a late invoice.voided for the OLD invoice does not write it off', async () => {
+      const o = await withMonths({ [M]: settle('pending', { idempotencyKey: 'payg:k', createdAt: '2026-10-05T00:00:00.000Z' }) });
+      await settlement.handlePaygOverageInvoiceVoided({ ...invoiceEvent(o, 'in_old_voided'), status: 'void' });
+      expect((await record(o.email)).status).toBe('pending');
+      await settlement.handlePaygOverageInvoiceVoided(invoiceEvent(o, 'in_old_other_key')); // metadata key is not the record's
+      expect((await record(o.email)).status).toBe('pending');
+    });
+
+    // MINOR 4 — against the REAL payment-history table
+    it('two partial refunds ($12, then $8 more; Stripe reports 1200 then 2000) — history rows sum to the real $20; redeliveries add none', async () => {
+      const actual = jest.requireActual('../services/paymentHistoryDb').paymentHistoryDb;
+      mocks.paymentHistory.mockImplementation((r: Json, opts: Json) => actual.record(r, opts));
+      const o = await withMonths({ [M]: settle('paid', { invoiceId: 'in_pr' }) });
+      const id = `ch_pr_${o.userId}`;
+      const first = { id: `re_a_${o.userId}`, amount: 1200, status: 'succeeded' };
+      const second = { id: `re_b_${o.userId}`, amount: 800, status: 'succeeded' };
+      mocks.stripe.listChargeRefunds.mockResolvedValue([first]);
+      await settlement.handlePaygOverageChargeRefunded({ id, amount_refunded: 1200, refunded: false, currency: 'usd' }, invoiceEvent(o, 'in_pr'));
+      await settlement.handlePaygOverageChargeRefunded({ id, amount_refunded: 1200, refunded: false, currency: 'usd' }, invoiceEvent(o, 'in_pr'));
+      mocks.stripe.listChargeRefunds.mockResolvedValue([second, first]);
+      await Promise.all([
+        settlement.handlePaygOverageChargeRefunded({ id, amount_refunded: 2000, refunded: false, currency: 'usd' }, invoiceEvent(o, 'in_pr')),
+        settlement.handlePaygOverageChargeRefunded({ id, amount_refunded: 2000, refunded: false, currency: 'usd' }, invoiceEvent(o, 'in_pr')),
+      ]);
+      // The first event, delivered late, never lowers the cumulative figure (`#refunded < :refunded`).
+      await settlement.handlePaygOverageChargeRefunded({ id, amount_refunded: 1200, refunded: false, currency: 'usd' }, invoiceEvent(o, 'in_pr'));
+      const rows = (await ddb.query({ TableName: PAYMENT_HISTORY, KeyConditionExpression: 'userId = :u', ExpressionAttributeValues: { ':u': o.userId } }).promise()).Items
+        .filter((r: Json) => r.eventType === 'refund');
+      expect(rows).toHaveLength(2);
+      expect(rows.reduce((sum: number, r: Json) => sum + r.amount, 0)).toBe(2000);
+      expect((await record(o.email)).refundedCents).toBe(2000);
+    });
+
+    // NIT — emails when a webhook beats the run's `invoiced` write
+    it('payment_failed lands before the run\'s invoiced write: the owner never gets "will charge your card" after "payment failed"', async () => {
+      const o = await owner();
+      mocks.stripe.issuePaygOverageInvoice.mockImplementation(async (input: Json) => {
+        await input.recordInvoiceId('in_pf');
+        await settlement.handlePaygOverageInvoicePaymentFailed(invoiceEvent(o, 'in_pf'));
+        return { outcome: 'issued', invoice: { id: 'in_pf', status: 'open', hosted_invoice_url: 'https://invoice.example/in_pf' } };
+      });
+      await settlement.settlePaygOverageMonth(o.userId, M, DAY2);
+      expect(mocks.email.sendPaygOveragePaymentFailedEmail).toHaveBeenCalledTimes(1);
+      expect(mocks.email.sendPaygOverageInvoiceEmail).not.toHaveBeenCalled();
+    });
+
+    it('invoice voided before the run\'s invoiced write: no invoice email for a written-off month', async () => {
+      const o = await owner();
+      mocks.stripe.issuePaygOverageInvoice.mockImplementation(async (input: Json) => {
+        await input.recordInvoiceId('in_vv');
+        await settlement.handlePaygOverageInvoiceVoided(invoiceEvent(o, 'in_vv'));
+        return { outcome: 'issued', invoice: { id: 'in_vv', status: 'open', hosted_invoice_url: 'https://invoice.example/in_vv' } };
+      });
+      await settlement.settlePaygOverageMonth(o.userId, M, DAY2);
+      expect(await record(o.email)).toMatchObject({ status: 'written_off' });
+      expect(mocks.email.sendPaygOverageInvoiceEmail).not.toHaveBeenCalled();
+    });
+
+    it('invoice email claim (`#status = :status` on the nested record): the paid webhook first sends the paid wording, once', async () => {
+      const o = await owner();
+      mocks.stripe.issuePaygOverageInvoice.mockImplementation(async (input: Json) => {
+        await input.recordInvoiceId('in_pp');
+        await settlement.handlePaygOverageInvoicePaid(invoiceEvent(o, 'in_pp'));
+        return { outcome: 'issued', invoice: { id: 'in_pp', status: 'open', hosted_invoice_url: 'https://invoice.example/in_pp' } };
+      });
+      expect(await settlement.settlePaygOverageMonth(o.userId, M, DAY2)).toBe('raced');
+      expect(mocks.email.sendPaygOverageInvoiceEmail).toHaveBeenCalledTimes(1);
+      expect(mocks.email.sendPaygOverageInvoiceEmail).toHaveBeenCalledWith(expect.objectContaining({ paid: true }));
+    });
+
+    // MINOR 6
+    it('durable alerts: the hold and `alertPending` land in one write; a sweep that died before alerting is caught up by the next, then cleared', async () => {
+      const FM = '2031-05';
+      const o = await owner({}, {
+        poolHighWater: { month: '2031-06', thresholdMicroUsd: 100 * USD }, poolHighWaterClosed: { month: FM, thresholdMicroUsd: 100 * USD },
+        admittedMonths: [admitted(FM)],
+      });
+      spend(130, 100, FM); // $30 drift: held
+      const now = new Date('2031-06-02T12:00:00.000Z');
+      await expect(settlement.settlePaygOverageMonth(o.userId, FM, now, async () => { throw new Error('process died'); })).rejects.toThrow('process died');
+      expect(await record(o.email, FM)).toMatchObject({ status: 'held', alertPending: expect.any(String) });
+      mocks.email.sendOncallAlert.mockClear();
+      await settlement.runPaygSettlement(now);
+      const alerted = mocks.email.sendOncallAlert.mock.calls.filter(([, body]: [string, string]) => String(body).includes(o.userId));
+      expect(alerted).toHaveLength(1);
+      expect(await record(o.email, FM)).not.toHaveProperty('alertPending');
+      mocks.email.sendOncallAlert.mockClear();
+      await settlement.runPaygSettlement(now);
+      expect(mocks.email.sendOncallAlert.mock.calls.filter(([, body]: [string, string]) => String(body).includes(o.userId))).toHaveLength(0);
     });
   });
 

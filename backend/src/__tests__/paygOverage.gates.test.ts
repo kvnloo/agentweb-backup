@@ -853,12 +853,12 @@ describe('ENG-668 PR-2 — what a blocked or cancelling owner is told (rvE2E MIN
       },
     });
     const status = await checkTokenUsage(OWNER, TURN_ADMISSION);
-    expect(status.paygBlock).toEqual({ reason: 'payg_suspended', openInvoiceUrl: 'https://invoice.stripe.com/i/sep' });
+    expect(status.paygBlock).toEqual({ reason: 'payg_suspended', paygSuspendedReason: 'payment_failed', openInvoiceUrl: 'https://invoice.stripe.com/i/sep' });
     const customer = toCustomerTokenUsage(status);
     expect(customer.usageBlock).toMatchObject({ reason: 'payg_suspended', openInvoiceUrl: 'https://invoice.stripe.com/i/sep' });
     expect(JSON.stringify(customer)).not.toMatch(/4500/);
     const usage = await getEffectiveLlmUsagePolicy(OWNER);
-    expect(usage.paygBlock).toEqual({ reason: 'payg_suspended', openInvoiceUrl: 'https://invoice.stripe.com/i/sep' });
+    expect(usage.paygBlock).toEqual({ reason: 'payg_suspended', paygSuspendedReason: 'payment_failed', openInvoiceUrl: 'https://invoice.stripe.com/i/sep' });
   });
 
   it('a pooled member never gets the owner\'s invoice; a dispute hold carries none', () => {
@@ -866,5 +866,8 @@ describe('ENG-668 PR-2 — what a blocked or cancelling owner is told (rvE2E MIN
     expect(withOwnerOpenInvoice({ reason: 'payg_suspended' }, false, settlements)).toEqual({ reason: 'payg_suspended' });
     expect(withOwnerOpenInvoice({ reason: 'payg_suspended' }, true, {} as never)).toEqual({ reason: 'payg_suspended' });
     expect(withOwnerOpenInvoice({ reason: 'payg_cap_reached' }, true, settlements)).toEqual({ reason: 'payg_cap_reached' });
+    // A dispute hold is not lifted by paying, so it never points the owner at an invoice (even one unpaid).
+    expect(withOwnerOpenInvoice({ reason: 'payg_suspended', paygSuspendedReason: 'dispute' }, true, settlements))
+      .toEqual({ reason: 'payg_suspended', paygSuspendedReason: 'dispute' });
   });
 });
