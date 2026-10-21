@@ -119,7 +119,7 @@ describe('ENG-2599 invoice webhooks read Basil subscription and price fields', (
       id: 'sub_basil',
       status: 'active',
       items: { data: [{ current_period_end: PERIOD_END, price: { id: 'price_pro' } }] },
-      discount: null,
+      discounts: [],
     });
   });
 
@@ -128,7 +128,7 @@ describe('ENG-2599 invoice webhooks read Basil subscription and price fields', (
 
     await deliver('invoice.paid', basilInvoice());
 
-    expect(mockSubscriptionsRetrieve).toHaveBeenCalledWith('sub_basil', { expand: ['discount.coupon'] });
+    expect(mockSubscriptionsRetrieve).toHaveBeenCalledWith('sub_basil', { expand: ['discounts'] });
     expect(userDb.updateUser).toHaveBeenCalledWith('u1', expect.objectContaining({
       subscription_status: 'active',
       stripe_subscription_id: 'sub_basil',
