@@ -402,8 +402,8 @@ export async function loadTraceForGrading(
 }
 
 /**
- * The LLM judge's `task_success`. One model call per case, so it runs only when asked for by id;
- * a judge error abstains rather than guessing.
+ * The LLM judge's `task_success`. One model call per case, so `defaultGoldenCaseGraders` includes it
+ * only when asked to; a judge error abstains rather than guessing.
  */
 export function taskSuccessJudgeGrader(
   loadTrace: (sessionId: string) => Promise<{ trace: AgentRunTrace; title?: string } | undefined>,
@@ -542,8 +542,12 @@ async function classifyAccountHealthForUser(userId: string): Promise<AccountHeal
   return classifyAccountHealth(signals).state;
 }
 
-/** Every golden-case adapter available on this branch, reading production (or `Dev-`) tables read-only. */
-export function defaultGoldenCaseGraders(): GoldenCaseGrader[] {
+/**
+ * Every golden-case adapter available on this branch, reading production (or `Dev-`) tables
+ * read-only. LLM judges that cost a model call per case (`agent-task-success-judge`) are left out
+ * unless asked for, so a suite that runs every grader (offline suite --golden) never pays for them.
+ */
+export function defaultGoldenCaseGraders(options: { llmJudges?: boolean } = {}): GoldenCaseGrader[] {
   const doc = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || 'us-west-2' });
   const prefix = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
   const reader: ReadOnlyDocReader = {
@@ -554,7 +558,7 @@ export function defaultGoldenCaseGraders(): GoldenCaseGrader[] {
   return [
     ...storedSessionJudgeGraders(doc),
     ...liveAgentGraders((sessionId) => loadSessionForGrading(reader, tables, sessionId)),
-    taskSuccessJudgeGrader((sessionId) => loadTraceForGrading(reader, tables, sessionId)),
+    ...(options.llmJudges ? [taskSuccessJudgeGrader((sessionId) => loadTraceForGrading(reader, tables, sessionId))] : []),
     creativeGatesGrader(readStoredCreativeGates),
     accountHealthGrader(classifyAccountHealthForUser),
   ];

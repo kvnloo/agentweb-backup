@@ -59,18 +59,27 @@ async function unmeteredJudgeLlm(cost: { usd: number }): Promise<RubricJudgeLlm>
   const client = await agentModeService.getOpenRouterClient();
   return {
     async complete(request) {
-      const res = await client.chat.completions.create({
-        model: resolveOpenRouterUpstreamModelId(request.model),
-        messages: [
-          { role: 'system', content: request.system },
-          { role: 'user', content: request.content.map((part) => (part.type === 'text' ? part.text : '')).join('\n') },
-        ],
-        ...(LLM_MODEL_REGISTRY[request.model]?.supportsTemperature === false ? {} : { temperature: 0 }),
-        max_tokens: request.maxTokens,
-      });
-      const reported = (res.usage as { cost?: unknown } | undefined)?.cost;
-      if (typeof reported === 'number' && Number.isFinite(reported)) cost.usd += reported;
-      return readChatCompletion(res as Parameters<typeof readChatCompletion>[0]);
+      // Non-streaming request: the response is a single completion with usage.
+      const res = (await client.chat.completions.create(
+        {
+          model: resolveOpenRouterUpstreamModelId(request.model),
+          messages: [
+            { role: 'system', content: request.system },
+            { role: 'user', content: request.content.map((part) => (part.type === 'text' ? part.text : '')).join('\n') },
+          ],
+          ...(LLM_MODEL_REGISTRY[request.model]?.supportsTemperature === false ? {} : { temperature: 0 }),
+          max_tokens: request.maxTokens,
+          // OpenRouter reports each call's cost only when asked; the cap depends on it.
+          usage: { include: true },
+        } as Parameters<typeof client.chat.completions.create>[0],
+        { timeout: request.timeoutMs },
+      )) as unknown as Parameters<typeof readChatCompletion>[0] & { usage?: Record<string, unknown> };
+      const usage = res.usage as { cost?: unknown; cost_details?: { upstream_inference_cost?: unknown } } | undefined;
+      const reported = [usage?.cost, usage?.cost_details?.upstream_inference_cost].find((v) => typeof v === 'number' && Number.isFinite(v) && v > 0);
+      // No reported cost means the cap can't work: stop instead of spending blind.
+      if (typeof reported !== 'number') throw new Error('OpenRouter reported no cost for a judge call; refusing to continue without a working --max-usd cap');
+      cost.usd += reported;
+      return readChatCompletion(res);
     },
   };
 }
@@ -112,6 +121,7 @@ async function main(): Promise<void> {
       continue;
     }
     const result = await judgeTaskSuccess(loaded, { llm, model: args.model });
+    if (result.status === 'error' && /reported no cost/.test(result.reason)) throw new Error(result.reason);
     judged += 1;
     const key = result.status === 'ok' ? result.verdict : 'error';
     tally[key] = (tally[key] ?? 0) + 1;

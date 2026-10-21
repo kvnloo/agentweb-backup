@@ -161,7 +161,7 @@ export const EVAL_REGISTRY: readonly GraderEntry[] = [
     graderType: 'llm_judge',
     measures: 'task_success pass | fail | na per session with the human labelling rubric: every requested deliverable delivered with tool or content evidence, explicit constraints respected; checklist before verdict',
     source: 'services/taskSuccessJudge.ts (prompt, trace rendering, model guard) over services/agentRunTrace.ts; golden-case adapter loops/eval/runValidation.ts (taskSuccessJudgeGrader); trial scripts/runTaskSuccessJudgeTrial.ts',
-    version: 'prompt-sha256:851b1d0c1430',
+    version: 'prompt-sha256:17fef09dc816',
     model: 'anthropic.claude-sonnet-5 via OpenRouter (Google and OpenAI models refused: the agent runs on Gemini)',
     modelFamily: 'claude',
     consumers: ['scripts/runTaskSuccessJudgeTrial.ts (offline, read-only)', 'scripts/runGraderValidation.ts agent-task-success-judge'],
