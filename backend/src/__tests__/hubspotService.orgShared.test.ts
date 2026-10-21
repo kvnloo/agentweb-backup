@@ -103,6 +103,19 @@ describe('create() without an account id', () => {
     expect(updateAccountTokens.mock.calls.some(c => c[0] === 'caller-1')).toBe(false);
   });
 
+  it('a mid-operation refresh stays on the ORIGINAL owner: if the owner removed the account, a teammate\'s shared copy of the same portal is NOT used', async () => {
+    getShared.mockResolvedValue([sharedFrom('owner-1', '222')]);
+    const svc = await HubSpotService.create('caller-1');
+    // owner-1 has since removed the account; owner-2 shares a copy of the SAME portal id
+    getAccountById.mockResolvedValue(null);
+    getShared.mockResolvedValue([sharedFrom('owner-2', '222', { token_expires_at: 0 })]);
+    mockPost.mockResolvedValue({ data: { access_token: 'wrong-tok', expires_in: 1800 } });
+    jest.spyOn(Date, 'now').mockReturnValue(Date.now() + 2 * 60 * 60 * 1000);
+    await expect(svc.getContactById('1')).rejects.toThrow(/not found/);
+    expect(mockPost).not.toHaveBeenCalled();
+    expect(updateAccountTokens).not.toHaveBeenCalled();
+  });
+
   it('two shared accounts and none of the caller\'s: ambiguity, naming both', async () => {
     getShared.mockResolvedValue([sharedFrom('owner-1', '222'), sharedFrom('owner-2', '333')]);
     await expect(HubSpotService.create('caller-1')).rejects.toThrow(/Multiple HubSpot accounts found: \[Portal 222 \(ID: 222\), Portal 333 \(ID: 333\)\]\. Specify account_id\./);

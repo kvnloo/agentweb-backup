@@ -32,6 +32,8 @@ beforeEach(() => {
   jest.spyOn(console, 'error').mockImplementation(() => undefined);
   mockUsers = [user('u1', hs(111)), user('u2', hs(222))];
   mockGetAllUsers.mockImplementation(async () => mockUsers);
+  // A cached hit re-reads its owner by id; by default that is the same data the scan sees.
+  mockGetUserById.mockImplementation(async (id: string) => mockUsers.find(u => u.userId === id));
 });
 afterEach(() => jest.restoreAllMocks());
 
@@ -95,7 +97,7 @@ describe('getUserIdByHubSpotPortalId', () => {
     mockGetAllUsers.mockImplementationOnce(() => new Promise(res => { release = res; }));
     const pending = getUserIdByHubSpotPortalId(444);
     await new Promise(r => setImmediate(r));
-    mockGetUserById.mockResolvedValue({ userId: 'u9', connected_accounts: [] });
+    mockGetUserById.mockImplementation(async (id: string) => (id === 'u9' ? { userId: 'u9', connected_accounts: [] } : mockUsers.find(u => u.userId === id)));
     await createAccount('u9', 'hubspot' as any, { account_id: '444', account_name: 'P444', config: { hub_id: 444 } } as any);
     release([user('u1', hs(111))]);                      // the pre-connection view (no 444)
     expect(await pending).toBeNull();                    // that caller got the stale answer...
@@ -139,7 +141,7 @@ describe('getUserIdByHubSpotPortalId', () => {
   });
 
   it('connecting a HubSpot account drops the snapshot at once; another platform does not', async () => {
-    mockGetUserById.mockResolvedValue({ userId: 'u9', connected_accounts: [] });
+    mockGetUserById.mockImplementation(async (id: string) => (id === 'u9' ? { userId: 'u9', connected_accounts: [] } : mockUsers.find(u => u.userId === id)));
     expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
     await createAccount('u9', 'attio' as any, { account_id: 'w1', account_name: 'W', config: {} } as any);
     expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
@@ -148,5 +150,78 @@ describe('getUserIdByHubSpotPortalId', () => {
     mockUsers = [...mockUsers, user('u9', hs(444))];
     expect(await getUserIdByHubSpotPortalId(444)).toBe('u9');
     expect(mockGetAllUsers).toHaveBeenCalledTimes(2);
+  });
+
+  describe('a cached HIT is verified against its owner (no waiting for the TTL)', () => {
+    it('a portal that MOVED to another user resolves to the new owner at once, with one rebuild', async () => {
+      expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
+      mockUsers = [user('u1'), user('u5', hs(111))];           // 111 moved from u1 to u5
+      now += 1000;
+      expect(await getUserIdByHubSpotPortalId(111)).toBe('u5');
+      expect(mockGetAllUsers).toHaveBeenCalledTimes(2);
+      expect(await getUserIdByHubSpotPortalId(111)).toBe('u5'); // and the new answer is cached
+      expect(mockGetAllUsers).toHaveBeenCalledTimes(2);
+    });
+
+    it('a portal whose owner DISCONNECTED resolves to null at once', async () => {
+      expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
+      mockUsers = [user('u1'), user('u2', hs(222))];
+      now += 1000;
+      expect(await getUserIdByHubSpotPortalId(111)).toBeNull();
+    });
+
+    it('an owner whose record is gone resolves to null', async () => {
+      expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
+      mockUsers = [user('u2', hs(222))];
+      expect(await getUserIdByHubSpotPortalId(111)).toBeNull();
+    });
+
+    it('an owner who now holds a DIFFERENT portal no longer owns this one (the check is on the portal id, not the platform)', async () => {
+      expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
+      mockUsers = [user('u1', hs(777)), user('u2', hs(222))];   // u1 reconnected to another portal
+      expect(await getUserIdByHubSpotPortalId(111)).toBeNull();
+      expect(await getUserIdByHubSpotPortalId(777)).toBe('u1');
+    });
+
+    it('a rebuild already IN FLIGHT with a pre-move view is not joined: the stale owner forces a fresh read', async () => {
+      const before = mockUsers;
+      let releaseOld!: (u: any[]) => void;
+      mockGetAllUsers
+        .mockImplementationOnce(async () => before)                                            // initial snapshot
+        .mockImplementationOnce(() => new Promise(res => { releaseOld = res; }))                // slow rebuild, pre-move view
+        .mockImplementation(async () => mockUsers);                                             // later reads see current data
+      expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
+      now += MISS_REFRESH + 1;
+      const slow = getUserIdByHubSpotPortalId(999);                                             // unknown portal: starts the slow rebuild
+      await new Promise(r => setImmediate(r));
+      mockUsers = [user('u1'), user('u5', hs(111))];                                            // 111 moves to u5 meanwhile
+      const lookup = getUserIdByHubSpotPortalId(111);
+      await new Promise(r => setImmediate(r));
+      releaseOld(before);                                                                       // the slow rebuild finally returns its OLD view
+      expect(await lookup).toBe('u5');
+      await slow;
+    });
+
+    it('a verified hit costs ONE by-id read and no scan', async () => {
+      expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
+      mockGetUserById.mockClear();
+      for (let i = 0; i < 5; i++) expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
+      expect(mockGetUserById).toHaveBeenCalledTimes(5);
+      expect(mockGetAllUsers).toHaveBeenCalledTimes(1);
+    });
+
+    it('if the verifying read FAILS the snapshot is trusted (a throttle must not drop events)', async () => {
+      expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
+      mockGetUserById.mockRejectedValue(new Error('throttled'));
+      expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
+      expect(mockGetAllUsers).toHaveBeenCalledTimes(1);
+    });
+
+    it('a stale owner is never served from the old snapshot even when the rebuild also fails', async () => {
+      expect(await getUserIdByHubSpotPortalId(111)).toBe('u1');
+      mockUsers = [user('u1'), user('u2', hs(222))];
+      mockGetAllUsers.mockRejectedValueOnce(new Error('throttled'));
+      expect(await getUserIdByHubSpotPortalId(111)).toBeNull();
+    });
   });
 });
