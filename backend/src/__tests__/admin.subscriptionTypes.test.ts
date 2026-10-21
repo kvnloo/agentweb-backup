@@ -29,7 +29,9 @@ jest.mock('../services/subscriptionService', () => ({
   getAllAvailableConnectedAccounts: jest.fn(() => ['linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom', 'instagram']),
   getAllAvailableSubscriptionFeatures: jest.fn(() => [
     { id: 'scheduled_chats', label: 'Scheduled chats', description: 'Create and run scheduled chats.' },
+    { id: 'hot_lead_call', label: 'Hot lead calls', description: 'Costs AgentWeb money.', optInOnly: true },
   ]),
+  getDefaultSubscriptionFeatureIds: jest.fn(() => ['scheduled_chats']),
   getPublicAllowedSkills: jest.fn(async () => []),
   // Keep getAllAvailableFunctionCalls for backward compat if referenced elsewhere
   getAllAvailableFunctionCalls: jest.fn(async () => ['generate_image', 'generate_video', 'search_web']),
@@ -171,7 +173,66 @@ describe('Admin subscription types routes', () => {
       .get('/api/admin/subscription-features')
       .set('Authorization', 'Bearer test-token')
       .expect(200);
-    expect(res.body.features).toEqual([expect.objectContaining({ id: 'scheduled_chats' })]);
+    expect(res.body.features).toEqual([
+      expect.objectContaining({ id: 'scheduled_chats' }),
+      expect.objectContaining({ id: 'hot_lead_call', optInOnly: true }),
+    ]);
+  });
+
+  describe('opt-in-only features (hot_lead_call) are never implied by a default', () => {
+    const storeTiers = (tiers: unknown[]) =>
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'subscription_types',
+        settingValue: JSON.stringify(tiers),
+        description: 'Subscription types',
+        updatedAt: new Date().toISOString(),
+        updatedBy: 'system',
+      } as never);
+    const legacyFree = { name: 'Free', allowedPages: ['/'], allowedSkills: [] };
+    const getTiers = async () => (await request(app)
+      .get('/api/admin/subscription-types').set('Authorization', 'Bearer test-token').expect(200)).body;
+    const postTiers = (subscriptionTypes: unknown[]) => request(app)
+      .post('/api/admin/subscription-types').set('Authorization', 'Bearer test-token')
+      .send({ subscriptionTypes }).expect(200);
+    const savedTiers = () => JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
+
+    beforeEach(() => mockedSettingsService.setSetting.mockResolvedValue(undefined as never));
+
+    it('GET shows a legacy tier without hot_lead_call', async () => {
+      storeTiers([legacyFree]);
+      expect((await getTiers())[0].allowedFeatures).toEqual(['scheduled_chats']);
+    });
+
+    it('GET returns the default Basic row without hot_lead_call when nothing is stored', async () => {
+      storeTiers([]);
+      expect((await getTiers())[0].allowedFeatures).toEqual(['scheduled_chats']);
+    });
+
+    it('GET keeps an explicit tick, and a saved "*" still shows every feature', async () => {
+      storeTiers([
+        { ...legacyFree, name: 'Pro', allowedFeatures: ['hot_lead_call'] },
+        { ...legacyFree, name: 'Team', allowedFeatures: ['*'] },
+      ]);
+      const [pro, team] = await getTiers();
+      expect(pro.allowedFeatures).toEqual(['hot_lead_call']);
+      expect(team.allowedFeatures).toEqual(['scheduled_chats', 'hot_lead_call']);
+    });
+
+    it('POST without allowedFeatures defaults to everything except hot_lead_call', async () => {
+      await postTiers([legacyFree]);
+      expect(savedTiers()[0].allowedFeatures).toEqual(['scheduled_chats']);
+    });
+
+    it('POST stores an explicit hot_lead_call tick as given', async () => {
+      await postTiers([{ ...legacyFree, name: 'Pro', allowedFeatures: ['scheduled_chats', 'hot_lead_call'] }]);
+      expect(savedTiers()[0].allowedFeatures).toEqual(['scheduled_chats', 'hot_lead_call']);
+    });
+
+    it('a GET -> POST round trip of an untouched legacy tier does not persist hot_lead_call', async () => {
+      storeTiers([legacyFree]);
+      await postTiers(await getTiers());
+      expect(savedTiers()[0].allowedFeatures).not.toContain('hot_lead_call');
+    });
   });
 
   it('POST /api/admin/subscription-types should save expanded skills instead of "*"', async () => {

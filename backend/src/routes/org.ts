@@ -9,6 +9,7 @@ import crypto from "crypto";
 import { isCompanyEmail } from "../utils/validation";
 import { getUserSubscriptionResolution, getUserSubscriptionType, getTierConfig } from "../services/subscriptionService";
 import { redactAccountSecrets } from "../utils/accountSecretRedaction";
+import { omit } from "../utils/omit";
 import { purchaseExtraSeat, removeExtraSeat } from "../services/orgSeatBillingService";
 import {
   assertSeatAvailable,
@@ -111,6 +112,16 @@ function buildOrgMarketStrategyForCopy(user: any): MarketStrategy | undefined {
       ? (user.icpCompletedAt ?? now)
       : existing?.icpUpdatedAt,
   };
+}
+
+/**
+ * The org record as returned by update endpoints must not carry the hot-lead call internals: the team members'
+ * phones and verification times, the caller-number sid, the pending verification (code hash) or the purchase history.
+ * Emma's settings tool is the only place they are read, masked.
+ */
+function withoutHotLeadCallInternals<T extends object | null | undefined>(org: T): Omit<NonNullable<T>, 'hotLeadCall' | 'hotLeadCallVerification' | 'hotLeadCallProvisioning'> | T {
+  if (!org) return org;
+  return omit(org as Record<string, unknown>, ['hotLeadCall', 'hotLeadCallVerification', 'hotLeadCallProvisioning']) as Omit<NonNullable<T>, 'hotLeadCall' | 'hotLeadCallVerification' | 'hotLeadCallProvisioning'>;
 }
 
 // All org routes require authentication
@@ -658,7 +669,7 @@ router.put("/:orgId", async (req: Request, res: Response) => {
     }
 
     const updated = await orgDb.updateOrg(orgId, updates);
-    return res.json({ success: true, data: updated });
+    return res.json({ success: true, data: withoutHotLeadCallInternals(updated) });
   } catch (error) {
     console.error("Error updating organization:", error);
     return res.status(500).json({ error: "Internal server error" });
@@ -1174,6 +1185,10 @@ router.delete("/:orgId", async (req: Request, res: Response) => {
 
     // Delete the org
     await orgDb.deleteOrg(orgId);
+    // Loaded here, not at the top: the number provisioning chain reaches the Twilio and Secrets Manager clients, which the
+    // org routes (and every test that mounts them) should not load unless an organization is actually deleted.
+    const { releaseNumberOfDeletedOrg } = await import("../services/voice/numberProvisioning");
+    await releaseNumberOfDeletedOrg(org);
 
     return res.json({ success: true, message: "Organization deleted" });
   } catch (error) {
@@ -1523,7 +1538,7 @@ router.post("/:orgId/copy-profile", async (req: Request, res: Response) => {
       success: true,
       message: "Profile data copied to organization",
       copiedFields: Object.keys(profileFields),
-      data: updated,
+      data: withoutHotLeadCallInternals(updated),
     });
   } catch (error) {
     console.error("Error copying profile to org:", error);

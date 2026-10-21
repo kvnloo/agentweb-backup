@@ -66,6 +66,7 @@ code believes about the vendor's API shape.
 | Integration | Runbook | What it covers |
 | --- | --- | --- |
 | Attio | [attio-app-setup.md](./attio-app-setup.md) | Registering/managing the Attio OAuth developer app: redirect URIs, required scopes, Secrets Manager credential storage, end-to-end verification. |
+| Twilio (hot-lead auto-call) | [hot-lead-call.md](../../backend/docs/integrations/hot-lead-call.md) | Call flow, org config, Emma setup tools, metering, abuse limits, ops runbook, go-live checklist and what is not yet verified against a real Twilio account. |
 
 ## Template
 

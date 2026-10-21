@@ -82,6 +82,13 @@ describe("getAllocatedRate", () => {
   it("prices Remotion Lambda blended render estimate at $0.1375", () => {
     expect(getAllocatedRate("remotion", "render")).toBeCloseTo(0.1375, 6);
   });
+
+  it("prices Twilio outbound voice minutes and monthly number rent at list price (provisional)", () => {
+    expect(getAllocatedRate("twilio", "voice_minute_outbound")).toBeCloseTo(0.014, 6);
+    expect(getAllocatedRate("twilio", "number_monthly_rent")).toBeCloseTo(1.15, 6);
+    expect(getRecordingUnit("twilio", "voice_minute_outbound")).toBe("minute");
+    expect(getRecordingUnit("twilio", "number_monthly_rent")).toBe("number_month");
+  });
 });
 
 // computeAllocatedCost was removed by ENG-1929: pricing now happens inside
@@ -98,7 +105,7 @@ describe("vendor rate card", () => {
       // Pinned deliberately. A rate edit that does not bump this leaves two
       // different prices sharing one version, and a historical spend event can
       // no longer be re-derived from the card that produced it.
-      expect(VENDOR_RATE_CARD_VERSION).toBe("2026-09-14");
+      expect(VENDOR_RATE_CARD_VERSION).toBe("2026-10-19");
     });
   });
 

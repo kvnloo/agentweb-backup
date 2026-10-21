@@ -48,6 +48,7 @@ jest.mock('../services/db', () => ({
     getLeadListsByUserId: jest.fn(),
     getLeadsByListId: jest.fn(),
     updateLead: jest.fn().mockResolvedValue(undefined),
+    setLeadFields: jest.fn().mockResolvedValue(undefined),
     getLeadEngagements: jest.fn().mockResolvedValue({ engagements: [] }),
   },
 }));
@@ -220,7 +221,7 @@ describe('notifyNewConnections', () => {
     await notifyNewConnections([NEW_CONNECTION]);
 
     expect(mockCrmDb.getLeadListById).not.toHaveBeenCalled();
-    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    expect(mockCrmDb.setLeadFields).not.toHaveBeenCalled();
     expect(mockAlertService.notifyLinkedInConnectionAccepted).not.toHaveBeenCalled();
   });
 
@@ -230,7 +231,7 @@ describe('notifyNewConnections', () => {
 
     await notifyNewConnections([NEW_CONNECTION]);
 
-    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    expect(mockCrmDb.setLeadFields).not.toHaveBeenCalled();
     expect(mockAlertService.notifyLinkedInConnectionAccepted).not.toHaveBeenCalled();
   });
 
@@ -240,7 +241,7 @@ describe('notifyNewConnections', () => {
 
     await notifyNewConnections([NEW_CONNECTION]);
 
-    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    expect(mockCrmDb.setLeadFields).not.toHaveBeenCalled();
     expect(mockAlertService.notifyLinkedInConnectionAccepted).not.toHaveBeenCalled();
   });
 
@@ -278,13 +279,17 @@ describe('notifyNewConnections', () => {
 
     await notifyNewConnections([NEW_CONNECTION]);
 
-    expect(mockCrmDb.updateLead).toHaveBeenCalledWith(
+    // Only the one key is written, never a map rebuilt from the lead snapshot, so a stale
+    // `lead.system` cannot erase other markers (e.g. system.hot_lead_call).
+    expect(mockCrmDb.setLeadFields).toHaveBeenCalledWith(
       MATCHING_LEAD.listId,
       MATCHING_LEAD.leadId,
-      expect.objectContaining({
-        system: expect.objectContaining({ linkedInConnectionNotifiedAt: expect.any(String) }),
-        skipFieldNamesUpdate: true,
-      }),
+      { system: { linkedInConnectionNotifiedAt: expect.any(String) } },
+    );
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalledWith(
+      MATCHING_LEAD.listId,
+      MATCHING_LEAD.leadId,
+      expect.objectContaining({ system: expect.anything() }),
     );
     expect(mockAlertService.notifyLinkedInConnectionAccepted).toHaveBeenCalledWith(LIST, MATCHING_LEAD);
   });
@@ -348,7 +353,7 @@ describe('generateConnectionFollowUpDraft — activity history', () => {
 
     await notifyNewConnections([NEW_CONNECTION]);
 
-    // updateLead should be called twice: once for notifiedAt, once for messageDraft
+    // updateLead carries the messageDraft; the notifiedAt marker goes through setLeadFields
     const draftCall = (mockCrmDb.updateLead as jest.Mock).mock.calls.find(
       (args: any[]) => args[2]?.messageDraft,
     );
