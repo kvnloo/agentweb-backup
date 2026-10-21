@@ -19,7 +19,7 @@ The misses are semantic, so step statuses and the call ledger can't capture them
 - `scripts/runTaskSuccessJudgeTrial.ts` is a read-only trial.
   - It calls OpenRouter directly with no spend rows, under a `--max-usd` cap.
   - Stdout carries case ids, verdicts, the running cost and why a case errored; `--out` (judge reasons) is rewritten after every case.
-- The verdict parser scans each `{` forward to its matching `}` and tries at most 200. The first version looped forever on a reply that started with `{` but held no verdict object, which is what a reply cut off at the output limit looks like. The output limit is now 3000 tokens.
+- The verdict parser scans each `{` forward to its matching `}` and tries at most 200. The first version looped forever on a reply that started with `{` but held no verdict object, which is what a reply cut off at the output limit looks like. The output limit is now 6000 tokens: at 3000, 2 of 60 judged replies on long sessions were still cut off.
 
 **Next.**
 1. Run the trial on dev and test, about $2 for all 80 work-plan cases, and compare against the blind AI labels.
