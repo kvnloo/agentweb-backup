@@ -8,7 +8,7 @@
  * allocated uid, parks swaps that were interrupted), (4) only then the socket is created.
  */
 import { randomBytes } from "crypto";
-import { chmodSync, chownSync, existsSync, mkdirSync, readFileSync } from "fs";
+import { chmodSync, chownSync, existsSync, mkdirSync, readFileSync, rmSync } from "fs";
 import { ClaudeAdapter } from "../adapters/claudeAdapter";
 import type { SubscriptionProviderAdapter } from "../adapter";
 import { ConnectionManager, DEFAULT_CONFIG, type ManagerConfig } from "../connectionManager";
@@ -17,6 +17,7 @@ import { systemClock } from "../ports";
 import { Layout } from "../ports/layout";
 import { nodeCommandPort, nodeRootFs, type CommandPort, type RootFs } from "../ports/system";
 import { SystemdUserFs, type SystemdPortConfig } from "../ports/systemdUserFs";
+import { startEgressProxy, type EgressProxyHandle } from "../egress/egressProxy";
 import { startHostServer, type HostServerHandle } from "../server";
 import { StateStore } from "../stateStore";
 import { assertTrustedPath, verifyBinary, type VerifiedBinary } from "./binary";
@@ -37,6 +38,10 @@ export interface HostDeps {
   chownSocket?: boolean;
   /** Tests run unprivileged: a temp directory instead of /run/aw-login-host-<env>. */
   socketDir?: string;
+  /** Tests run unprivileged: a temp directory instead of /run/aw-egress-<env> for the egress proxy socket. */
+  egressDir?: string;
+  /** Tests: the egress proxy's name resolution and upstream connect (no real network). */
+  egressResolve?: (host: string) => Promise<string[]>;
   managerOverrides?: Partial<ManagerConfig>;
 }
 
@@ -52,10 +57,20 @@ export function layoutFor(cfg: HostConfig): Layout {
   return new Layout({ env: cfg.env, stateRoot: cfg.stateRoot, sharedParent: cfg.sharedParent, uidMin: cfg.uidMin, uidMax: cfg.uidMax });
 }
 
-export function portConfigFor(cfg: HostConfig): SystemdPortConfig {
+/** The proxy is created after the port (start-up order), so the port reaches it through this holder; before it is set no unit can start. */
+export interface EgressRef {
+  current?: EgressProxyHandle;
+}
+
+export function portConfigFor(cfg: HostConfig, egressRef?: EgressRef): SystemdPortConfig {
   return {
+    // Every unit gets ITS OWN proxy socket (created now, synchronously, before the unit starts): fail closed if the proxy is not up.
+    egressFor: (uid) => {
+      if (!egressRef?.current) throw new Error("egress_not_ready");
+      return egressRef.current.listenFor(uid);
+    },
     limits: cfg.limits,
-    paths: { ...cfg.tools, inaccessible: [cfg.socket.dir] },
+    paths: { ...cfg.tools, inaccessible: [cfg.socket.dir], net: { dir: cfg.egressDir, launcher: cfg.egress.launcherPath, socat: cfg.egress.socat } },
     killTimeoutMs: 15_000,
     killPollMs: 100,
     commandTimeoutMs: 30_000,
@@ -68,11 +83,13 @@ export interface BuiltHost {
   port: SystemdUserFs;
   store: StateStore;
   manager: ConnectionManager;
+  egressRef: EgressRef;
 }
 
 export function buildHost(cfg: HostConfig, binary: VerifiedBinary, deps: HostDeps): BuiltHost {
   const layout = layoutFor(cfg);
-  const port = new SystemdUserFs({ layout, cmd: deps.cmd, root: deps.root, config: portConfigFor(cfg) });
+  const egressRef: EgressRef = {};
+  const port = new SystemdUserFs({ layout, cmd: deps.cmd, root: deps.root, config: portConfigFor(cfg, egressRef) });
   const store = new StateStore(deps.stateDir ?? `${cfg.stateRoot}/state`);
   const adapters =
     deps.adapters ??
@@ -98,7 +115,7 @@ export function buildHost(cfg: HostConfig, binary: VerifiedBinary, deps: HostDep
     log: deps.log,
     config: { ...DEFAULT_CONFIG, ...cfg.manager, uidMin: cfg.uidMin, uidMax: cfg.uidMax, ...(deps.managerOverrides ?? {}) },
   });
-  return { layout, port, store, manager };
+  return { layout, port, store, manager, egressRef };
 }
 
 /**
@@ -136,9 +153,16 @@ export async function stopEnvironment(cmd: CommandPort, cfg: HostConfig, layout:
   }
 }
 
+/** The tool bridge's host:port as the proxy must allow it (it may be loopback/private, unlike every allowlist entry). */
+export function bridgeTarget(bridgeUrl: string): { host: string; port: number } {
+  const u = new URL(bridgeUrl);
+  return { host: u.hostname.replace(/^\[|\]$/g, "").toLowerCase(), port: u.port ? Number(u.port) : u.protocol === "https:" ? 443 : 80 };
+}
+
 export interface RunningHost {
   built: BuiltHost;
   handle: HostServerHandle;
+  egress: EgressProxyHandle;
   shutdown(): Promise<void>;
 }
 
@@ -146,9 +170,26 @@ export async function startHost(cfg: HostConfig, binary: VerifiedBinary, deps: H
   const built = buildHost(cfg, binary, deps);
   const stateDir = deps.stateDir ?? `${cfg.stateRoot}/state`;
   if (!existsSync(stateDir)) mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  let egress: EgressProxyHandle | undefined;
   built.store.open(); // the single-writer lock FIRST: a second instance must fail here, before it can stop the live host's units
   try {
     await stopEnvironment(deps.cmd, cfg, built.layout);
+    // The egress proxy comes up BEFORE the API socket: no customer process can run until the host serves, and none may ever run without it.
+    const egressDir = deps.egressDir ?? cfg.egressDir;
+    rmSync(egressDir, { recursive: true, force: true }); // sockets of a previous run are stale; every customer's is created again on demand
+    mkdirSync(egressDir, { recursive: true, mode: 0o755 });
+    if (deps.chownSocket !== false) {
+      chownSync(egressDir, 0, 0);
+      chmodSync(egressDir, 0o755); // customer uids must be able to reach the socket inside; the allowlist is the gate, not the directory
+    }
+    egress = await startEgressProxy({
+      perUid: { dir: egressDir, ownByUid: deps.chownSocket !== false },
+      allow: cfg.egress.allow,
+      bridge: bridgeTarget(cfg.claude.bridgeUrl),
+      ...(deps.egressResolve ? { resolve: deps.egressResolve } : {}),
+      logger: { warn: (event, fields) => deps.log.warn(event, Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, typeof v === "number" || typeof v === "boolean" ? v : String(v)]))) },
+    });
+    built.egressRef.current = egress;
     const sockDir = deps.socketDir ?? cfg.socket.dir;
     const sockPath = `${sockDir}/host.sock`;
     if (!existsSync(sockDir)) mkdirSync(sockDir, { recursive: true, mode: 0o750 });
@@ -166,10 +207,13 @@ export async function startHost(cfg: HostConfig, binary: VerifiedBinary, deps: H
     return {
       built,
       handle,
+      egress,
       shutdown: async () => {
         if (down) return;
         down = true;
         await handle.close();
+        built.egressRef.current = undefined; // from now on no unit can start (fail closed)
+        await egress?.close().catch(() => undefined);
         try {
           await stopEnvironment(deps.cmd, cfg, built.layout);
         } finally {
@@ -179,6 +223,7 @@ export async function startHost(cfg: HostConfig, binary: VerifiedBinary, deps: H
       },
     };
   } catch (e) {
+    await egress?.close().catch(() => undefined);
     built.store.close();
     throw e;
   }
@@ -194,7 +239,7 @@ export async function runMain(argv: string[] = process.argv): Promise<void> {
     assertTrustedPath(configPath); // the config is root-owned and not writable by anyone else, like everything it points to
     const cfg = parseHostConfig(JSON.parse(readFileSync(configPath, "utf8")));
     // Everything the host or a customer unit executes or reads as policy must be root-controlled too.
-    for (const p of [cfg.claude.turnWrapperPath, cfg.claude.systemPromptFile, cfg.tools.writeFileHelper, cfg.tools.systemRun, cfg.tools.systemctl, cfg.tools.setpriv, cfg.tools.env, cfg.tools.rm, cfg.tools.find, ...(cfg.quota ? [cfg.tools.setquota] : [])]) assertTrustedPath(p);
+    for (const p of [cfg.claude.turnWrapperPath, cfg.egress.launcherPath, cfg.egress.socat, cfg.claude.systemPromptFile, cfg.tools.writeFileHelper, cfg.tools.systemRun, cfg.tools.systemctl, cfg.tools.setpriv, cfg.tools.env, cfg.tools.rm, cfg.tools.find, ...(cfg.quota ? [cfg.tools.setquota] : [])]) assertTrustedPath(p);
     if (existsSync("/etc/subuid")) assertNoSubuidOverlap(readFileSync("/etc/subuid", "utf8"), cfg.uidMin, cfg.uidMax);
     registerRange(`${cfg.sharedParent}/ranges`, { env: cfg.env, uidMin: cfg.uidMin, uidMax: cfg.uidMax });
     assertHomesMount(parseMounts(readFileSync("/proc/mounts", "utf8")), `${cfg.stateRoot}/u`, !!cfg.quota);

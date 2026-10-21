@@ -1,12 +1,14 @@
 #!/bin/bash
 # TEST INSTANCE ONLY (not production): installs the login host for env test1 from /tmp/aw-install (idempotent). Run as root.
-# Expects: start.js, hostLiveAuth.js, claude-turn.sh, aw-write-file.sh, aw-login-host@.service (esbuild bundles of src/loginHost/host/start.ts and __tests__/live/hostLiveAuth.ts), node 22 at /opt/aw-live, pinned claude at /opt/aw-claude/2.1.294/claude.
+# Expects: start.js, hostLiveAuth.js, claude-turn.sh, aw-net.sh, aw-write-file.sh, aw-login-host@.service (esbuild bundles of src/loginHost/host/start.ts and __tests__/live/hostLiveAuth.ts), node 22 at /opt/aw-live, pinned claude at /opt/aw-claude/2.1.294/claude.
 set -euo pipefail
 D=/opt/aw-login-host
 mkdir -p $D/dist/loginHost/host /etc/aw-login-host /run/aw-login-host-test1
 install -m 0755 -o root -g root /tmp/aw-install/start.js $D/dist/loginHost/host/start.js
 install -m 0755 -o root -g root /tmp/aw-install/claude-turn.sh $D/claude-turn.sh
 install -m 0755 -o root -g root /tmp/aw-install/aw-write-file.sh $D/aw-write-file.sh
+install -m 0755 -o root -g root /tmp/aw-install/aw-net.sh $D/aw-net.sh
+command -v socat >/dev/null || dnf -y install socat >/dev/null   # the in-sandbox loopback->proxy forwarder (PR 2)
 install -m 0644 -o root -g root /tmp/aw-install/hostLiveAuth.js $D/hostLiveAuth.js
 install -m 0644 -o root -g root /tmp/aw-install/aw-login-host@.service /etc/systemd/system/aw-login-host@.service
 printf 'You are a helpful assistant. Keep answers short.\n' > $D/system-prompt.txt; chmod 0644 $D/system-prompt.txt
@@ -32,6 +34,7 @@ cat > /etc/aw-login-host/test1.json <<CFG
   "socket": { "dir": "/run/aw-login-host-test1", "gid": 1000 },
   "limits": { "memoryMax": "1G", "tasksMax": 256, "tmpSize": "128M", "shmSize": "64M", "runtimeMaxSec": 1800 },
   "quota": { "blocksKb": 102400, "inodes": 10000 },
+  "egress": { "allow": ["api.anthropic.com:443", "platform.claude.com:443", "console.anthropic.com:443", "claude.ai:443"] },
   "claude": { "binaryPath": "/opt/aw-claude/2.1.294/claude", "expectedSha256": "$SHA", "version": "2.1.294",
               "systemPromptFile": "/opt/aw-login-host/system-prompt.txt", "bridgeUrl": "http://127.0.0.1:3991/mcp" }
 }

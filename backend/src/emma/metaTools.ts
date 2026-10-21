@@ -601,7 +601,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
 
             // --- Custom Audience ---
             subtype: { type: "string", enum: ["CUSTOM", "LOOKALIKE"], description: "Audience subtype." },
-            description: { type: "string", description: "Audience description." },
+            description: { type: "string", description: "CUSTOM_AUDIENCE CREATE: audience description. AD_CREATIVE CREATE: link description (the line under the headline) — written to link_data.description (video_data.link_description; asset_feed_spec.descriptions for placement_assets)." },
             customer_file_source: { type: "string", description: "Source type for CUSTOM audiences (e.g., USER_PROVIDED_ONLY)." },
             lookalike_spec: { type: "object", description: "Lookalike config: { origin: [{ id, type }], ratio: 0.01, country: 'US' }." },
             id: { type: "string", description: "Audience ID for UPLOAD_USERS." },

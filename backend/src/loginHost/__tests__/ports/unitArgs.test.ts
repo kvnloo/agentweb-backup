@@ -132,6 +132,41 @@ describe("unit properties: the sandbox", () => {
   it("an extra inaccessible path is validated like every other path", () => expect(() => unitProperties(layout, spec(), limits, { ...paths, inaccessible: ["/run/x y"] })).toThrow(LayoutError));
 });
 
+describe("network isolation (PR 2)", () => {
+  const net = { dir: "/run/aw-egress-test1", launcher: "/opt/aw-login-host/aw-net.sh", socat: "/usr/bin/socat" };
+  const withNet = { ...paths, net };
+
+  it("gives the unit its own network namespace and only the egress proxy socket directory, read-only, on an empty /run", () => {
+    const props = unitProperties(layout, spec(), limits, withNet);
+    expect(props).toContain("PrivateNetwork=yes");
+    expect(props).toContain("TemporaryFileSystem=/run:ro");
+    expect(props).toContain("BindReadOnlyPaths=/run/aw-egress-test1:/run/aw-egress");
+    expect(props.filter((p) => p.startsWith("BindReadOnlyPaths="))).toHaveLength(1);
+    expect(props.filter((p) => p.startsWith("BindPaths="))).toHaveLength(1); // still ONE writable bind
+    expect(props).toContain("IPAddressDeny=169.254.169.254 fd00:ec2::254"); // defence in depth stays
+  });
+
+  it("without a net policy the shape is the old shared network (the host config makes the policy mandatory)", () => {
+    const props = unitProperties(layout, spec(), limits, paths);
+    expect(props.some((p) => p.startsWith("PrivateNetwork"))).toBe(false);
+  });
+
+  it("starts the process through the launcher: <launcher> <socat> <file> <args>, after the privilege drop and the chdir", () => {
+    const argv = systemRunArgs(layout, spec(), limits, withNet);
+    const at = argv.indexOf("/opt/aw-login-host/aw-net.sh");
+    expect(at).toBeGreaterThan(argv.indexOf("--chdir=" + `${refDir}/work`));
+    expect(argv.slice(at, at + 4)).toEqual(["/opt/aw-login-host/aw-net.sh", "/usr/bin/socat", "/opt/aw-login-host/claude-turn.sh", "/opt/aw-claude/2.1.294/claude"]);
+    expect(argv.indexOf("--reuid=400123")).toBeLessThan(at); // the launcher runs as the customer, never as root
+    expect(systemRunArgs(layout, spec(), limits, paths)).not.toContain("/opt/aw-login-host/aw-net.sh");
+  });
+
+  it("validates the proxy directory and the launcher/socat paths like every other path", () => {
+    expect(() => unitProperties(layout, spec(), limits, { ...paths, net: { ...net, dir: "/run/a b" } })).toThrow(LayoutError);
+    expect(() => systemRunArgs(layout, spec(), limits, { ...paths, net: { ...net, launcher: "rel/aw-net.sh" } })).toThrow(LayoutError);
+    expect(() => systemRunArgs(layout, spec(), limits, { ...paths, net: { ...net, socat: "/usr/bin/socat;x" } })).toThrow(LayoutError);
+  });
+});
+
 describe("systemd-run argv", () => {
   const argv = () => systemRunArgs(layout, spec(), limits, paths);
   it("starts the unit as root, then setpriv drops to the uid with no capabilities and no-new-privs, then the file and args", () => {
