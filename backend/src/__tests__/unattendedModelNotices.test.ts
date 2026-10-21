@@ -117,10 +117,10 @@ describe('notice copy', () => {
     const notice = buildScheduleModelNotice({ scheduleName: 'Weekly report', modelLabel: 'GPT-5.5', reason: 'not_in_plan' });
     const text = allText(notice);
     expect(notice.subject).toContain('Weekly report');
-    expect(text).toContain('"Weekly report" is set to run on GPT-5.5, which isn\'t included in your current plan.');
+    expect(text).toContain('Your scheduled chat "Weekly report" is set to run on GPT-5.5, which isn\'t included in your current plan.');
     expect(text).toContain('nothing was sent to a different model');
     expect(text).toContain('choose a model your plan includes, or upgrade your plan');
-    expect(text).toContain('once');
+    expect(text).toContain("We'll only email you once about this, not on every run.");
     expect(notice.actions.map((a) => a.path)).toEqual([SCHEDULES_PATH, PRICING_PATH]);
   });
 
@@ -130,6 +130,7 @@ describe('notice copy', () => {
     expect(text).toContain('which is no longer available');
     expect(text.toLowerCase()).not.toContain('upgrade');
     expect(notice.actions.map((a) => a.path)).toEqual([SCHEDULES_PATH]);
+    expect(notice.subject).toBe('⚠️ Your scheduled chat "Weekly report" didn\'t run: its model is no longer available');
   });
 
   it('work plan step: names the step, model and schedule (or the chat), links the chat', () => {
@@ -145,6 +146,9 @@ describe('notice copy', () => {
     expect(forChat.paragraphs[0]).toContain('in your chat "Research"');
     expect(forChat.footer).toBe('This is an automated email from AgentWeb.');
     expect(forChat.actions.map((a) => a.path)).toEqual(['/agent-mode/s-2']);
+    expect(forChat.subject).toBe('⚠️ Your work plan "Research" paused: a step\'s model is no longer available');
+    expect(buildWorkPlanStepModelNotice({ stepCount: 1, modelLabel: 'M', reason: 'not_in_plan', sessionId: 's-3' }).subject)
+      .toBe('⚠️ Your work plan paused: a step\'s model isn\'t included in your plan');
   });
 });
 
@@ -159,7 +163,7 @@ describe('emailService: the model_unavailable failure class', () => {
     expect(spy).toHaveBeenCalledTimes(1);
     const [recipients, subject, text, html] = spy.mock.calls[0];
     expect(recipients).toEqual(['owner@example.com']);
-    expect(subject).toBe('⚠️ Scheduled chat not run, its model isn\'t in your plan: Weekly report');
+    expect(subject).toBe('⚠️ Your scheduled chat "Weekly report" didn\'t run: its model isn\'t included in your plan');
     expect(text).toContain('GPT-5.5');
     expect(text).not.toMatch(/contact support|times in a row|keeps failing/i);
     expect(html).not.toMatch(/contact support|times in a row|Keeps Failing/i);
@@ -185,7 +189,7 @@ describe('emailService: the model_unavailable failure class', () => {
     await emailService.sendWorkPlanStepModelUnavailableEmail(['owner@example.com'], {
       sessionId: 'session-1', stepCount: 2, modelLabel: 'GPT-5.5', reason: 'not_in_plan', sessionTitle: 'Research',
     });
-    expect(spy.mock.calls[0][1]).toBe('⚠️ Work plan paused, a step\'s model isn\'t in your plan: Research');
+    expect(spy.mock.calls[0][1]).toBe('⚠️ Your work plan "Research" paused: a step\'s model isn\'t included in your plan');
     expect(spy.mock.calls[0][2]).toContain('/agent-mode/session-1');
 
     spy.mockRejectedValue(new Error('SMTP down'));

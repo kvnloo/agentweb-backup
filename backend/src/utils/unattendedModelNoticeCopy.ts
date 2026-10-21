@@ -51,7 +51,7 @@ function whyClause(reason: ModelUnavailableReason): string {
 }
 
 const ONCE_ONLY =
-  "We're emailing you once about this, not on every run. The schedule's card in AgentWeb shows it too.";
+  "We'll only email you once about this, not on every run. You'll also see it on the schedule's card in AgentWeb.";
 
 export function buildScheduleModelNotice(input: {
   scheduleName: string;
@@ -61,18 +61,19 @@ export function buildScheduleModelNotice(input: {
   const { scheduleName, modelLabel, reason } = input;
   const planLimit = isPlanLimit(reason);
   return {
+    // Same style as the other schedule emails (emailService): a leading emoji, and the name quoted mid-sentence.
     subject: planLimit
-      ? `⚠️ Scheduled chat not run, its model isn't in your plan: ${scheduleName}`
-      : `⚠️ Scheduled chat not run, its model is no longer available: ${scheduleName}`,
+      ? `⚠️ Your scheduled chat "${scheduleName}" didn't run: its model isn't included in your plan`
+      : `⚠️ Your scheduled chat "${scheduleName}" didn't run: its model is no longer available`,
     headline: planLimit
       ? "This schedule's model isn't included in your plan"
       : "This schedule's model is no longer available",
     subheading: scheduleName,
     paragraphs: [
-      `"${scheduleName}" is set to run on ${modelLabel}, ${whyClause(reason)}. Its latest run did not start, and nothing was sent to a different model.`,
+      `Your scheduled chat "${scheduleName}" is set to run on ${modelLabel}, ${whyClause(reason)}. Its latest run did not start, and nothing was sent to a different model.`,
       planLimit
-        ? `Every run of this schedule will stop the same way until it's fixed. To fix it, open the schedule and choose a model your plan includes, or upgrade your plan to keep using ${modelLabel}.`
-        : "Every run of this schedule will stop the same way until it's fixed. To fix it, open the schedule and choose another model.",
+        ? `Each run of this schedule will stop in the same way until this is resolved. To fix this, please open the schedule and choose a model your plan includes, or upgrade your plan to keep using ${modelLabel}.`
+        : 'Each run of this schedule will stop in the same way until this is resolved. To fix this, please open the schedule and choose another model.',
       ONCE_ONLY,
     ],
     actions: [
@@ -100,11 +101,12 @@ export function buildWorkPlanStepModelNotice(input: {
   const where = scheduleName
     ? `in a run of your scheduled chat "${scheduleName}"`
     : sessionTitle ? `in your chat "${sessionTitle}"` : 'in one of your chats';
-  const subjectName = scheduleName || sessionTitle || `step ${stepCount}`;
+  const name = scheduleName || sessionTitle;
+  const workPlan = name ? `Your work plan "${name}"` : 'Your work plan';
   return {
     subject: planLimit
-      ? `⚠️ Work plan paused, a step's model isn't in your plan: ${subjectName}`
-      : `⚠️ Work plan paused, a step's model is no longer available: ${subjectName}`,
+      ? `⚠️ ${workPlan} paused: a step's model isn't included in your plan`
+      : `⚠️ ${workPlan} paused: a step's model is no longer available`,
     headline: planLimit
       ? "A work plan step's model isn't included in your plan"
       : "A work plan step's model is no longer available",
@@ -112,9 +114,9 @@ export function buildWorkPlanStepModelNotice(input: {
     paragraphs: [
       `Step ${stepCount} of the work plan ${where} uses ${modelLabel}, ${whyClause(reason)}. The plan paused at that step, and nothing was sent to a different model.`,
       planLimit
-        ? `To resume it, open the chat, choose a model your plan includes in the model picker, and send a message. Or upgrade your plan to keep using ${modelLabel}.`
-        : 'To resume it, open the chat, choose another model in the model picker, and send a message.',
-      "To keep it from happening again, change that step's model in the work plan's settings.",
+        ? `To resume the plan, please open the chat, choose a model your plan includes in the model picker, and send a message. Alternatively, you can upgrade your plan to keep using ${modelLabel}.`
+        : 'To resume the plan, please open the chat, choose another model in the model picker, and send a message.',
+      "To prevent this from happening again, please change that step's model in the work plan's settings.",
     ],
     actions: [
       { label: 'Open the chat', path: `/agent-mode/${encodeURIComponent(sessionId)}` },
