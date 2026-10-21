@@ -25,8 +25,9 @@ export const DEFAULT_TASK_SUCCESS_JUDGE_MODEL = 'anthropic.claude-sonnet-5';
 
 const MAX_TRACE_CHARS = 60_000;
 const MAX_OUTPUT_TOKENS = 6_000;
-// The labeller is a reasoning model whose hidden reasoning counts against the output limit.
+// The labeller is a reasoning model: its hidden reasoning counts against the output limit and takes time.
 const LABELLER_MAX_OUTPUT_TOKENS = 16_000;
+const LABELLER_TIMEOUT_MS = 300_000;
 const TIMEOUT_MS = 90_000;
 
 export const TASK_SUCCESS_JUDGE_PROMPT = `You label whether an AI marketing agent's session accomplished what the user asked. The criterion is task_success, with this rubric:
@@ -218,10 +219,9 @@ export async function judgeTaskSuccess(
   options: { llm?: RubricJudgeLlm; model?: string } = {},
 ): Promise<TaskSuccessJudgeResult> {
   const model = options.model ?? DEFAULT_TASK_SUCCESS_JUDGE_MODEL;
-  if (LLM_MODEL_REGISTRY[model]?.provider !== 'anthropic') {
-    return { status: 'error', reason: `judge model ${model} is not a registered Claude model; the judge must sit outside the agent's model family`, model };
-  }
-  return runTaskSuccessPrompt(TASK_SUCCESS_JUDGE_PROMPT, MAX_OUTPUT_TOKENS, model, input, options.llm);
+  const problem = taskSuccessModelProblem(model, 'judge');
+  if (problem) return { status: 'error', reason: problem, model };
+  return runTaskSuccessPrompt(TASK_SUCCESS_JUDGE_PROMPT, { maxTokens: MAX_OUTPUT_TOKENS, timeoutMs: TIMEOUT_MS }, model, input, options.llm);
 }
 
 /** Blind cross-family label for a trial (see TASK_SUCCESS_LABELLER_PROMPT). Never throws. */
@@ -230,16 +230,28 @@ export async function labelTaskSuccess(
   options: { llm?: RubricJudgeLlm; model?: string } = {},
 ): Promise<TaskSuccessJudgeResult> {
   const model = options.model ?? DEFAULT_TASK_SUCCESS_LABELLER_MODEL;
+  const problem = taskSuccessModelProblem(model, 'labeller');
+  if (problem) return { status: 'error', reason: problem, model };
+  return runTaskSuccessPrompt(TASK_SUCCESS_LABELLER_PROMPT, { maxTokens: LABELLER_MAX_OUTPUT_TOKENS, timeoutMs: LABELLER_TIMEOUT_MS }, model, input, options.llm);
+}
+
+/**
+ * Why `model` can't serve as the judge (a registered Claude model, outside the agent's Gemini family)
+ * or the labeller (outside both); undefined when it can.
+ */
+export function taskSuccessModelProblem(model: string, role: 'judge' | 'labeller'): string | undefined {
   const provider = LLM_MODEL_REGISTRY[model]?.provider;
-  if (!provider || provider === 'anthropic' || provider === 'google') {
-    return { status: 'error', reason: `labeller model ${model} must be a registered model outside the judge's (Claude) and the agent's (Gemini) families`, model };
+  if (role === 'judge') {
+    return provider === 'anthropic' ? undefined : `judge model ${model} is not a registered Claude model; the judge must sit outside the agent's model family`;
   }
-  return runTaskSuccessPrompt(TASK_SUCCESS_LABELLER_PROMPT, LABELLER_MAX_OUTPUT_TOKENS, model, input, options.llm);
+  return provider && provider !== 'anthropic' && provider !== 'google'
+    ? undefined
+    : `labeller model ${model} must be a registered model outside the judge's (Claude) and the agent's (Gemini) families`;
 }
 
 async function runTaskSuccessPrompt(
   prompt: string,
-  maxTokens: number,
+  { maxTokens, timeoutMs }: { maxTokens: number; timeoutMs: number },
   model: string,
   input: { trace: AgentRunTrace; title?: string },
   injected?: RubricJudgeLlm,
@@ -253,7 +265,7 @@ async function runTaskSuccessPrompt(
       system: prompt,
       content: [{ type: 'text', text: renderTraceForJudge(input.trace, input.title) }],
       maxTokens,
-      timeoutMs: TIMEOUT_MS,
+      timeoutMs,
     });
   } catch (err) {
     return { status: 'error', reason: `LLM call failed: ${err instanceof Error ? err.message : String(err)}`, model };

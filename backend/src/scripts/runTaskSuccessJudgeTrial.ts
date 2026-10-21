@@ -36,6 +36,7 @@ import {
   labelTaskSuccess,
   TASK_SUCCESS_JUDGE_VERSION,
   TASK_SUCCESS_LABELLER_PROMPT,
+  taskSuccessModelProblem,
 } from '../services/taskSuccessJudge';
 
 export interface TrialArgs {
@@ -67,6 +68,20 @@ export function parseTrialArgs(raw: string[]): TrialArgs {
   return args;
 }
 
+/**
+ * What one OpenRouter call cost us. On our own provider key (BYOK) `usage.cost` is only OpenRouter's
+ * fee and the provider bills the upstream inference cost directly, so both count (as in
+ * codingAgentService). Undefined when the response reports no cost.
+ */
+export function openRouterCallCostUsd(res: { usage?: unknown; openrouter_metadata?: { is_byok?: unknown } }): number | undefined {
+  const usage = res.usage as { cost?: unknown; cost_details?: { upstream_inference_cost?: unknown } } | undefined;
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined);
+  const gateway = num(usage?.cost);
+  const upstream = num(usage?.cost_details?.upstream_inference_cost);
+  const byok = res.openrouter_metadata?.is_byok === true || (gateway === 0 && (upstream ?? 0) > 0);
+  return byok ? (gateway ?? 0) + (upstream ?? 0) : gateway;
+}
+
 /** OpenRouter without the usage ledger; adds each call's reported cost to `cost.usd`. */
 async function unmeteredJudgeLlm(cost: { usd: number }): Promise<RubricJudgeLlm> {
   const { agentModeService } = await import('../services/agentModeService');
@@ -88,11 +103,10 @@ async function unmeteredJudgeLlm(cost: { usd: number }): Promise<RubricJudgeLlm>
           usage: { include: true },
         } as Parameters<typeof client.chat.completions.create>[0],
         { timeout: request.timeoutMs },
-      )) as unknown as Parameters<typeof readChatCompletion>[0] & { usage?: Record<string, unknown> };
-      const usage = res.usage as { cost?: unknown; cost_details?: { upstream_inference_cost?: unknown } } | undefined;
-      const reported = [usage?.cost, usage?.cost_details?.upstream_inference_cost].find((v) => typeof v === 'number' && Number.isFinite(v) && v > 0);
+      )) as unknown as Parameters<typeof readChatCompletion>[0] & { usage?: Record<string, unknown>; openrouter_metadata?: { is_byok?: unknown } };
+      const reported = openRouterCallCostUsd(res);
       // No reported cost means the cap can't work: stop instead of spending blind.
-      if (typeof reported !== 'number') throw new Error('OpenRouter reported no cost for a judge call; refusing to continue without a working --max-usd cap');
+      if (!reported) throw new Error('OpenRouter reported no cost for a judge call; refusing to continue without a working --max-usd cap');
       cost.usd += reported;
       return readChatCompletion(res);
     },
@@ -101,6 +115,9 @@ async function unmeteredJudgeLlm(cost: { usd: number }): Promise<RubricJudgeLlm>
 
 async function main(): Promise<void> {
   const args = parseTrialArgs(argv.slice(2));
+  // Refuse a wrong model before reading any session, not once per case.
+  const modelProblem = taskSuccessModelProblem(args.model, args.labeller ? 'labeller' : 'judge');
+  if (modelProblem) throw new Error(modelProblem);
   const store = goldenSetStoreFromEnv();
   if (!store.isProvisioned()) throw new Error(`Golden-set store not provisioned: set ${GOLDEN_CASES_TABLE_ENV}.`);
   const doc = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || 'us-west-2' });
