@@ -10,7 +10,7 @@ import {
 } from '../services/taskSuccessJudge';
 import type { RubricJudgeLlm, RubricJudgeLlmRequest } from '../services/creativeRubricJudge';
 import { defaultGoldenCaseGraders, taskSuccessJudgeGrader } from '../loops/eval/runValidation';
-import { openRouterCallCostUsd, parseTrialArgs } from '../scripts/runTaskSuccessJudgeTrial';
+import { openRouterCallCostUsd, parseTrialArgs, requireReportedCostUsd } from '../scripts/runTaskSuccessJudgeTrial';
 import type { GoldenCase } from '../loops/eval/goldenSet';
 
 let index = 0;
@@ -79,6 +79,14 @@ describe('renderTraceForJudge', () => {
     expect(text).toContain('FINAL REPLY TO THE USER: THE FINAL REPLY');
     expect(text).toMatch(/timeline entries cut for length/);
     expect(text.length).toBeLessThanOrEqual(62_000);
+  });
+
+  it('shows an ask longer than a timeline entry in full, so a requirement at its end is not cut', () => {
+    index = 0;
+    const ask = `${'Context about the account. '.repeat(55)}Finally: publish it, do not leave it as a draft.`;
+    const trace = buildAgentRunTrace({ sessionId: 's1', messages: [row({ role: 'user', content: ask, metadata: { timestamp: '2026-10-14T10:00:00Z' } })] });
+    expect(ask.length).toBeGreaterThan(1_000);
+    expect(renderTraceForJudge(trace)).toContain('do not leave it as a draft.');
   });
 
   it('shows which arguments a recovering call used, so a retry on another account is visible', () => {
@@ -209,6 +217,15 @@ describe('openRouterCallCostUsd', () => {
     expect(openRouterCallCostUsd({ usage: { cost: 0, cost_details: { upstream_inference_cost: 0.02 } } })).toBe(0.02);
     expect(openRouterCallCostUsd({ usage: {} })).toBeUndefined();
     expect(openRouterCallCostUsd({})).toBeUndefined();
+    // BYOK with no upstream cost reported: what the provider billed is unknown, not zero.
+    expect(openRouterCallCostUsd({ usage: { cost: 0.001 }, openrouter_metadata: { is_byok: true } })).toBeUndefined();
+  });
+
+  it('lets a real zero cost through and stops only when no cost was reported', () => {
+    expect(requireReportedCostUsd({ usage: { cost: 0 } })).toBe(0);
+    expect(requireReportedCostUsd({ usage: { cost: 0.02 } })).toBe(0.02);
+    expect(() => requireReportedCostUsd({ usage: {} })).toThrow(/reported no cost/);
+    expect(() => requireReportedCostUsd({ usage: { cost: 0.001 }, openrouter_metadata: { is_byok: true } })).toThrow(/reported no cost/);
   });
 });
 
