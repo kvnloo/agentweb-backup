@@ -367,22 +367,37 @@ async function findOrgSharedHubSpotAccounts(userId: string) {
   }
 }
 
-async function resolveHubSpotAccount(userId: string, accountId?: string) {
+/**
+ * Which accounts may serve a call. 'any' (the default): the caller's own, then org-shared ones. 'own':
+ * the caller's own only (exactly the pre-ENG-2605 behaviour). 'shared': only accounts an org admin
+ * shared. Emma's tool needs the split so a pasted private-app token on the caller's OWN lead list is
+ * tried before a teammate's shared account, never after it.
+ */
+export type HubSpotAccountSource = 'any' | 'own' | 'shared';
+
+async function resolveHubSpotAccount(userId: string, accountId?: string, source: HubSpotAccountSource = 'any') {
   if (accountId) {
-    const account = await getAccountById(accountId, userId);
-    if (account && account.platform === 'hubspot') return { account, ownerUserId: userId };
-    const sharedMatch = (await findOrgSharedHubSpotAccounts(userId)).find(acc => acc.account_id === accountId);
-    if (sharedMatch) return { account: sharedMatch, ownerUserId: sharedMatch.userId };
+    if (source !== 'shared') {
+      const account = await getAccountById(accountId, userId);
+      if (account && account.platform === 'hubspot') return { account, ownerUserId: userId };
+    }
+    if (source !== 'own') {
+      const sharedMatch = (await findOrgSharedHubSpotAccounts(userId)).find(acc => acc.account_id === accountId);
+      if (sharedMatch) return { account: sharedMatch, ownerUserId: sharedMatch.userId };
+    }
     throw new Error(`HubSpot account "${accountId}" not found. Please reconnect your account.`);
   }
 
-  const accounts = await getAccountsByUserId(userId);
-  const hubspotAccounts = accounts.filter(acc => acc.platform === 'hubspot');
-  // The caller's own account always wins; shared accounts are only considered when they have none.
-  if (hubspotAccounts.length === 1) return { account: hubspotAccounts[0], ownerUserId: userId };
-  if (hubspotAccounts.length > 1) {
-    const list = hubspotAccounts.map(a => `${a.account_name} (ID: ${a.account_id})`).join(', ');
-    throw new Error(`Multiple HubSpot accounts found: [${list}]. Specify account_id.`);
+  if (source !== 'shared') {
+    const accounts = await getAccountsByUserId(userId);
+    const hubspotAccounts = accounts.filter(acc => acc.platform === 'hubspot');
+    // The caller's own account always wins; shared accounts are only considered when they have none.
+    if (hubspotAccounts.length === 1) return { account: hubspotAccounts[0], ownerUserId: userId };
+    if (hubspotAccounts.length > 1) {
+      const list = hubspotAccounts.map(a => `${a.account_name} (ID: ${a.account_id})`).join(', ');
+      throw new Error(`Multiple HubSpot accounts found: [${list}]. Specify account_id.`);
+    }
+    if (source === 'own') throw new Error('HubSpot account not connected. Please connect your HubSpot account in Settings.');
   }
 
   const shared = await findOrgSharedHubSpotAccounts(userId);
@@ -447,8 +462,8 @@ export class HubSpotService {
    * OAuth path — resolves and (if needed) refreshes the token from the DB,
    * then returns a fully-initialised instance. One DB read per operation.
    */
-  static async create(userId: string, accountId?: string): Promise<HubSpotService> {
-    const { account, ownerUserId } = await resolveHubSpotAccount(userId, accountId);
+  static async create(userId: string, accountId?: string, source: HubSpotAccountSource = 'any'): Promise<HubSpotService> {
+    const { account, ownerUserId } = await resolveHubSpotAccount(userId, accountId, source);
     const config = account.config as any;
     const expiresAt: number = config.token_expires_at || 0;
     const portalId: string | undefined = config.hub_id !== undefined ? String(config.hub_id) : account.account_id;
