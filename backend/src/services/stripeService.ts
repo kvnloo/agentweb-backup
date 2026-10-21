@@ -1081,6 +1081,9 @@ export async function handleSubscriptionUpdated(
   );
 }
 
+/** Subscription statuses that still bill (mrrCollectionGapService's LIVE_STATUSES). */
+const LIVE_SUBSCRIPTION_STATUSES: ReadonlySet<string> = new Set(['active', 'trialing', 'past_due']);
+
 /**
  * Handle invoice.payment_succeeded — confirm subscription is active and sync payment info.
  */
@@ -1118,14 +1121,32 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
   }
 
   // Sync current_period_end and activeOffer from the live subscription. The
-  // user's current subscription stays authoritative; the invoice's is used only
-  // when the row has none (an invoice from an older, replaced sub must not
-  // overwrite the current sub's period end or offer).
+  // user's stored subscription stays authoritative while it is live, so an
+  // older, replaced sub's invoice cannot overwrite the current sub's period end
+  // or offer. When the stored one is no longer live and the invoice's own
+  // subscription is (a resubscribe whose invoice.paid beats
+  // checkout.session.completed / customer.subscription.created), sync from the
+  // invoice's. Only that differing case costs a second retrieve; if it fails,
+  // the stored subscription is synced as before.
   const subIdToFetch = user.stripe_subscription_id || subscriptionId;
   if (subIdToFetch) {
     try {
       const s = getStripeOrThrow();
-      const subscription = await s.subscriptions.retrieve(subIdToFetch, { expand: ['discounts'] }) as any;
+      let subscription = await s.subscriptions.retrieve(subIdToFetch, { expand: ['discounts'] }) as any;
+      if (
+        subscriptionId &&
+        subscriptionId !== subIdToFetch &&
+        !LIVE_SUBSCRIPTION_STATUSES.has(subscription?.status)
+      ) {
+        try {
+          const invoiceSubscription = await s.subscriptions.retrieve(subscriptionId, { expand: ['discounts'] });
+          if (LIVE_SUBSCRIPTION_STATUSES.has(invoiceSubscription.status)) {
+            subscription = invoiceSubscription;
+          }
+        } catch (err) {
+          console.warn(`[STRIPE] Failed to fetch invoice subscription ${subscriptionId}; syncing stored ${subIdToFetch}: ${err}`);
+        }
+      }
       const invoicePeriodEndIso = getSubscriptionPeriodEndIso(subscription);
       if (invoicePeriodEndIso) {
         updateData.current_period_end = invoicePeriodEndIso;
@@ -1620,9 +1641,9 @@ interface SubscriptionDiscountSource {
  * `expand: ['discounts']` (list: `data.discounts`). A Basil Discount embeds its
  * `coupon` (not expandable, no `source` wrapper in this version).
  *
- * When several discounts apply, the FIRST entry of `discounts` is used: that is
- * Stripe's own order, the order it applies them in, so the pick is
- * deterministic. The legacy `discount` (pre-Basil webhook payloads) is the
+ * When several discounts apply, the first listed entry of `discounts` is used,
+ * so the pick is deterministic (Stripe does not document the list order as the
+ * order discounts are applied). The legacy `discount` (pre-Basil webhook payloads) is the
  * fallback when that entry is not expanded. Returns the discount's id when it
  * is not expanded and no legacy discount is present (the caller must fetch).
  */
