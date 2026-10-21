@@ -41,9 +41,12 @@ export interface InvoiceLinePriceSource {
   price?: IdRef;
 }
 
-function idOf(ref: IdRef): string | null {
+/** The id of a Stripe reference that may be a plain id or an expanded `{ id }` object. */
+export function stripeIdOf(ref: unknown): string | null {
   if (typeof ref === 'string') return ref || null;
-  if (ref && typeof ref === 'object' && typeof ref.id === 'string') return ref.id || null;
+  if (ref && typeof ref === 'object' && typeof (ref as { id?: unknown }).id === 'string') {
+    return (ref as { id: string }).id || null;
+  }
   return null;
 }
 
@@ -55,7 +58,7 @@ export function invoiceSubscriptionId(
   invoice: InvoiceSubscriptionSource | null | undefined
 ): string | null {
   if (!invoice) return null;
-  return idOf(invoice.parent?.subscription_details?.subscription) ?? idOf(invoice.subscription);
+  return stripeIdOf(invoice.parent?.subscription_details?.subscription) ?? stripeIdOf(invoice.subscription);
 }
 
 /** The price id of an invoice line item, or null when it has none. */
@@ -63,5 +66,5 @@ export function invoiceLinePriceId(
   line: InvoiceLinePriceSource | null | undefined
 ): string | null {
   if (!line) return null;
-  return idOf(line.pricing?.price_details?.price) ?? idOf(line.price);
+  return stripeIdOf(line.pricing?.price_details?.price) ?? stripeIdOf(line.price);
 }
