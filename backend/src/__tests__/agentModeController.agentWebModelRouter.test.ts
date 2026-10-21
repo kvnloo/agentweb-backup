@@ -942,3 +942,153 @@ describe('approval-inbox resume on an unservable AgentWeb Model selection', () =
     expect(refusalsSaved()).toEqual([]);
   });
 });
+
+/* ============ ENG-669 PR-C switch-on fixes: /model-options `agentWebModel` ============ */
+import { describeAgentWebModelAvailability } from '../services/agentMode/agentWebModelRouterInstance';
+
+describe('/model-options `agentWebModel`: the portal can tell "not offered to this tier" from "switch off"', () => {
+  const options = async () => {
+    const res = makeRes();
+    await agentModeController.getModelOptions({ user: { userId: OWNER, isAdmin: false } } as any, res);
+    expect(res.statusCode).toBe(200);
+    return res.body;
+  };
+  const NAME = 'AgentWeb Model';
+  const DESCRIPTION = 'AgentWeb picks the model for each task; every reply shows which model ran.';
+  /** The /model-options keys on main (before this field); `modelAccess` only while the tier allowlist is on. */
+  const MAIN_KEYS = [
+    'usageMode', 'canGenerate', 'allModels', 'selectableModels', 'scheduleBackupModels', 'optimizedDefaultModel',
+    'usagePolicyVersion', 'chatBranchingEnabled', 'compareSaveAlternatives', 'legacyModelAliases', 'workPlanStepModelsEnabled',
+  ];
+  /** A plan that routes the table (both route targets) but does not list the AgentWeb Model. */
+  const PLAN_WITHOUT_AW = [ROUTED_CHAT, ROUTED_SCHEDULED];
+  const sessionTurn = async (source: 'system' | 'user') => {
+    storeSession(baseSession(AW, { llmModelSource: source }));
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({}), res);
+    return res;
+  };
+
+  describe('switch OFF: the field is absent, the response is exactly main\'s, nothing beyond the switch is read', () => {
+    it.each([
+      ['tier allowlist off', () => undefined, MAIN_KEYS],
+      ['tier allowlist on', () => allowlist(PLAN_WITHOUT_AW), [...MAIN_KEYS, 'modelAccess']],
+    ])('%s', async (_label, setUp, keys) => {
+      setUp();
+      const filter = jest.spyOn(modelAccess, 'filterAllowedModels');
+      const body = await options();
+      expect(Object.keys(body).sort()).toEqual([...keys].sort());
+      expect(body).not.toHaveProperty('agentWebModel');
+      expect(body.allModels).not.toContain(AW);
+      expect(tableReads()).toHaveLength(0);
+      expect(filter.mock.calls.some(([, ids]) => ids.includes(AW))).toBe(false);
+      expect(await describeAgentWebModelAvailability(OWNER)).toBeNull();
+      filter.mockRestore();
+    });
+  });
+
+  describe('switch ON', () => {
+    beforeEach(() => turnOn());
+
+    it('offered: enabled + offered with its name and description, no reason; listed right after the default', async () => {
+      const body = await options();
+      expect(body.agentWebModel).toEqual({ enabled: true, offered: true, name: NAME, description: DESCRIPTION });
+      expect(body.allModels.slice(0, 2)).toEqual([DEFAULT_MODEL, AW]);
+    });
+
+    it('the description is the catalog entry\'s (one wording for both lists)', async () => {
+      mockTokenUser.user = { userId: OWNER, isAdmin: false };
+      const catalog = makeRes();
+      await agentModeController.getSupportedModels({ headers: {} } as any, catalog);
+      mockTokenUser.user = undefined;
+      const entry = catalog.body.find((m: any) => m.id === AW);
+      expect((await options()).agentWebModel).toMatchObject({ name: entry.name, description: entry.description });
+    });
+
+    it('routable for the tier but not in its plan: not_in_plan, the name still sent, not listed', async () => {
+      allowlist(PLAN_WITHOUT_AW);
+      const body = await options();
+      expect(body.agentWebModel).toEqual({ enabled: true, offered: false, reason: 'not_in_plan', name: NAME, description: DESCRIPTION });
+      expect(body.allModels).not.toContain(AW);
+      expect(body.selectableModels).not.toContain(AW);
+    });
+
+    it.each([
+      ['in the plan, but a route target is outside it', [AW, ROUTED_SCHEDULED]],
+      ['outside the plan too (the stronger reason wins)', [ROUTED_SCHEDULED]],
+    ])('the router cannot route the tier, %s: unavailable_for_tier', async (_label, plan) => {
+      allowlist(plan);
+      const body = await options();
+      expect(body.agentWebModel).toEqual({ enabled: true, offered: false, reason: 'unavailable_for_tier', name: NAME, description: DESCRIPTION });
+      expect(body.allModels).not.toContain(AW);
+    });
+
+    it('a broken override for the tier with the allowlist OFF: unavailable_for_tier, no modelAccess', async () => {
+      turnOn({ ...TABLE, tiers: { Free: { routes: { chta: ROUTED_CHAT } } } });
+      mockSettings.subscription_types = JSON.stringify([{ name: 'Free' }]);
+      const body = await options();
+      expect(body).not.toHaveProperty('modelAccess');
+      expect(body.agentWebModel).toEqual({ enabled: true, offered: false, reason: 'unavailable_for_tier', name: NAME, description: DESCRIPTION });
+    });
+
+    it('the reason says what runs: not_in_plan = AgentWeb\'s own pin runs and a pick is refused (not_in_plan)', async () => {
+      allowlist(PLAN_WITHOUT_AW);
+      expect((await options()).agentWebModel.reason).toBe('not_in_plan');
+      const system = await sessionTurn('system');
+      expect(system.statusCode).toBe(200);
+      expect(workerCall().llmModel).toBe(ROUTED_CHAT);
+      const pick = await sessionTurn('user');
+      expect(pick.statusCode).toBe(422);
+      expect(pick.body).toMatchObject({ code: 'model_unavailable', requestedModel: AW, reason: 'not_in_plan' });
+    });
+
+    it.each([
+      ['a broken override for the tier', () => {
+        turnOn({ ...TABLE, tiers: { Free: { routes: { chta: ROUTED_CHAT } } } });
+        mockSettings.subscription_types = JSON.stringify([{ name: 'Free' }]);
+      }],
+      // Free does not list the router, so the table's load-time tier check skips Free; the chat route is outside it.
+      ['a plan without the router whose allowlist misses a route', () => allowlist([ROUTED_SCHEDULED])],
+    ])('the reason says what runs: unavailable_for_tier (%s) = neither AgentWeb\'s own pin nor a pick runs', async (_label, setUp) => {
+      setUp();
+      expect((await options()).agentWebModel.reason).toBe('unavailable_for_tier');
+      const system = await sessionTurn('system');
+      expect(system.statusCode).toBe(422);
+      expect(system.body).toMatchObject({ code: 'model_unavailable', requestedModel: AW, reason: 'not_served' });
+      // A pick is refused too (outside the plan it is refused as not_in_plan before the route is checked).
+      const pick = await sessionTurn('user');
+      expect(pick.statusCode).toBe(422);
+      expect(pick.body).toMatchObject({ code: 'model_unavailable', requestedModel: AW });
+      expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    });
+
+    it('`offered` always equals offersAgentWebModel and whether the lists carry it', async () => {
+      const cases: Array<() => void> = [
+        () => undefined,
+        () => allowlist(PLAN_WITHOUT_AW),
+        () => allowlist([AW, ROUTED_SCHEDULED]),
+        () => allowlist([AW, ...PLAN_WITHOUT_AW]),
+      ];
+      for (const setUp of cases) {
+        delete mockSettings.model_tier_allowlist_enabled;
+        delete mockSettings.subscription_types;
+        setUp();
+        modelAccess.reset();
+        agentWebModelRouter.reset();
+        const body = await options();
+        const offered = await offersAgentWebModel(OWNER);
+        expect(body.agentWebModel.offered).toBe(offered);
+        expect(body.allModels.includes(AW)).toBe(offered);
+        expect(body.selectableModels.includes(AW)).toBe(offered);
+        expect('reason' in body.agentWebModel).toBe(!offered);
+      }
+    });
+
+    it('never names a tier (only enabled / offered / reason / name / description)', async () => {
+      allowlist(PLAN_WITHOUT_AW, [{ name: 'Pro', allowedModels: ['*'] }]);
+      const { agentWebModel } = await options();
+      expect(Object.keys(agentWebModel).sort()).toEqual(['description', 'enabled', 'name', 'offered', 'reason']);
+      expect(JSON.stringify(agentWebModel)).not.toMatch(/Free|Pro/);
+    });
+  });
+});

@@ -97,7 +97,8 @@ import {
   AGENTWEB_MODEL_DISPLAY_NAME, AGENTWEB_MODEL_ID, isAgentWebModelId, messageRoutingOf, routingFieldsOf, storedModelFor, type AgentWebTaskType, type MessageModelRouting, type ModelRouting,
 } from '../services/agentMode/agentWebModelRouter';
 import {
-  agentWebModelRouter, assertAgentWebModelSelectable, offersAgentWebModel, routeAgentWebModelSelection,
+  agentWebModelRouter, assertAgentWebModelSelectable, describeAgentWebModelAvailability, offersAgentWebModel, routeAgentWebModelSelection,
+  type AgentWebModelAvailability,
 } from '../services/agentMode/agentWebModelRouterInstance';
 import { modelSourceAfter as modelSourceAfterStamp, resolveLegacyModelAlias, type ModelSource, type StoredModelRecord } from '../services/agentMode/modelAccess';
 import {
@@ -981,6 +982,9 @@ export interface ScheduleRunHealth {
   // ENG-669 PR-D: the finer reason, when the block has one (`model_unavailable`: 'not_in_plan' | 'not_served' |
   // 'not_selectable'), so the card can say "not in your plan" rather than just "unavailable". Absent otherwise.
   lastRunBlockedReason?: string;
+  // ENG-669 PR-C: the model id the blocked run was refused on (the run's `blockedModel`), when the block names one, so
+  // the card describes the model of THAT run, not whatever the schedule is set to now. Absent otherwise.
+  lastRunBlockedModel?: string;
 }
 
 // ENG-1131: defined in ./utils/scheduleRunBlockedReason (not here) so
@@ -1303,6 +1307,8 @@ function computeRecordedRunHealth(runResults: any[] | undefined | null): Schedul
     consecutiveFailures,
     lastRunBlockedBy: last.blockedBy ?? null,
     ...(last.blockedReason ? { lastRunBlockedReason: last.blockedReason } : {}),
+    ...(last.blockedBy && typeof last.blockedModel === 'string' && last.blockedModel
+      ? { lastRunBlockedModel: last.blockedModel } : {}),
   };
 }
 
@@ -9332,6 +9338,27 @@ const AGENTWEB_MODEL_PICKER_ENTRY: SupportedModelInfo = {
 };
 
 /**
+ * ENG-669 PR-C: GET /model-options `agentWebModel` (present only while the switch is on): `enabled` (always true when
+ * present), `offered` (the pickers list it), `reason` when not offered ('not_in_plan' | 'unavailable_for_tier', see
+ * AgentWebModelAvailability), and its display `name` / `description`, sent even when it is not offered.
+ */
+function agentWebModelPickerState(state: AgentWebModelAvailability): {
+  enabled: true;
+  offered: boolean;
+  reason?: AgentWebModelAvailability['reason'];
+  name: string;
+  description: string;
+} {
+  return {
+    enabled: true,
+    offered: state.offered,
+    ...(state.reason && { reason: state.reason }),
+    name: AGENTWEB_MODEL_PICKER_ENTRY.name,
+    description: AGENTWEB_MODEL_PICKER_ENTRY.description,
+  };
+}
+
+/**
  * ENG-669 PR-C: a picker list with the AgentWeb Model right AFTER the first entry. Portals pre-select index 0 (the
  * configured default, see getSupportedModels), and the router is not the default for anyone in this release.
  */
@@ -11901,7 +11928,11 @@ export const agentModeController = {
       );
       // ENG-669 PR-C: the AgentWeb Model is offered as a pick (chat and schedule pickers), never as a schedule backup
       // (a backup is a concrete model). Switch off: unchanged.
-      const pickerModels = await offersAgentWebModel(user.userId)
+      // `agentWebModel` (switch on only) tells the portal whether it is offered and, when not, why, with its name, so a
+      // stored selection of it is never shown as "unavailable" when it runs (an admin-authored plan's pin is AgentWeb's
+      // choice: it runs outside the plan) and a pick outside the plan says so. Never names a tier.
+      const agentWebModelState = await describeAgentWebModelAvailability(user.userId);
+      const pickerModels = agentWebModelState?.offered
         ? withAgentWebModelEntry(plannedModels, AGENTWEB_MODEL_ID)
         : plannedModels;
       // ENG-1211 AC1: nothing below the hard cap may hide a model. Only a paused
@@ -11925,6 +11956,7 @@ export const agentModeController = {
         legacyModelAliases: { ...LEGACY_MODEL_ALIASES },
         workPlanStepModelsEnabled,
         ...(planAccess && { modelAccess: planAccess.modelAccess }),
+        ...(agentWebModelState && { agentWebModel: agentWebModelPickerState(agentWebModelState) }),
       });
     } catch (error) {
       console.error('AgentMode: Get model options error:', error);
