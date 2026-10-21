@@ -437,6 +437,10 @@ const runDrain = async (reason: string): Promise<void> => {
   await import('./services/funding/claudeSubscriptionService')
     .then((m) => m.shutdownClaudeSubscriptionService())
     .catch(() => undefined);
+  // ENG-2110 1c: pending hosted sign-ins are cancelled on the login host (it also expires them itself).
+  await import('./services/funding/hostedSubscriptionService')
+    .then((m) => m.shutdownHostedSubscriptionService())
+    .catch(() => undefined);
   if (!cronDrain.drained) {
     console.warn(
       `[gracefulShutdown] Cron drain ceiling reached — ${cronDrain.stuckCount} job(s) still in-flight:`,
@@ -1607,6 +1611,17 @@ createTestAccount().then(async () => {
           .catch((error) => console.error('[ClaudeSubscription] boot recovery failed:', (error as { code?: string })?.code || 'error'));
       } catch (error) {
         console.error('[ClaudeSubscription] Failed to initialize:', (error as { code?: string })?.code || 'error');
+      }
+
+      // Hosted subscription logins (ENG-2110 1c/1d): finish unconfirmed disconnects. Not flag-gated on purpose.
+      try {
+        const { scheduleHostedSubscriptionSweep } = await import('./cron/hostedSubscriptionSweepCron');
+        scheduleHostedSubscriptionSweep({
+          isCronEnabled,
+          track: (jobName, promise) => cronJobRegistry.track(jobName, promise),
+        });
+      } catch (error) {
+        console.error('[HostedSubscription] Failed to initialize sweep:', (error as { code?: string })?.code || 'error');
       }
 
       // Weekly Engineering Scoreboard — read-only backend replacement for the
