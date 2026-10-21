@@ -135,7 +135,8 @@ export function renderTraceForJudge(trace: AgentRunTrace, title?: string): strin
   }
   const askEntry = trace.timeline.findIndex((e) => e.kind === 'user');
   const ask = askEntry >= 0 ? trace.timeline[askEntry] : undefined;
-  head.push('', `USER (the ask): ${ask && ask.kind === 'user' ? clip(ask.text, 2_000) : clip(trace.ask?.text, 2_000) || '(none)'}`);
+  // trace.ask is the same first message kept to 4,000 chars; its timeline entry is cut at 1,000.
+  head.push('', `USER (the ask): ${clip(trace.ask?.text ?? (ask && ask.kind === 'user' ? ask.text : undefined), 2_000) || '(none)'}`);
 
   const body = trace.timeline
     .filter((_, i) => i !== askEntry)

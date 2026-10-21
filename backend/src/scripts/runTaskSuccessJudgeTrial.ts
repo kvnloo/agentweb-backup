@@ -83,7 +83,16 @@ export function openRouterCallCostUsd(res: { usage?: unknown; openrouter_metadat
   const gateway = num(usage?.cost);
   const upstream = num(usage?.cost_details?.upstream_inference_cost);
   const byok = res.openrouter_metadata?.is_byok === true || (gateway === 0 && (upstream ?? 0) > 0);
-  return byok ? (gateway ?? 0) + (upstream ?? 0) : gateway;
+  // On our own key without an upstream cost, what the provider billed is unknown, not zero.
+  if (byok) return upstream === undefined ? undefined : (gateway ?? 0) + upstream;
+  return gateway;
+}
+
+/** The call's cost for the --max-usd cap; throws when none was reported, since the cap can't work blind. A cost of 0 is a cost. */
+export function requireReportedCostUsd(res: Parameters<typeof openRouterCallCostUsd>[0]): number {
+  const reported = openRouterCallCostUsd(res);
+  if (reported === undefined) throw new Error('OpenRouter reported no cost for a judge call; refusing to continue without a working --max-usd cap');
+  return reported;
 }
 
 /** OpenRouter without the usage ledger; adds each call's reported cost to `cost.usd`. */
@@ -108,10 +117,7 @@ async function unmeteredJudgeLlm(cost: { usd: number }): Promise<RubricJudgeLlm>
         } as Parameters<typeof client.chat.completions.create>[0],
         { timeout: request.timeoutMs },
       )) as unknown as Parameters<typeof readChatCompletion>[0] & { usage?: Record<string, unknown>; openrouter_metadata?: { is_byok?: unknown } };
-      const reported = openRouterCallCostUsd(res);
-      // No reported cost means the cap can't work: stop instead of spending blind.
-      if (!reported) throw new Error('OpenRouter reported no cost for a judge call; refusing to continue without a working --max-usd cap');
-      cost.usd += reported;
+      cost.usd += requireReportedCostUsd(res);
       return readChatCompletion(res);
     },
   };
