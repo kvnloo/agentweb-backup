@@ -8,7 +8,7 @@ const INLINE_PREFIX =
   /NODE_ENV\s*(===|!==)\s*['"](development|production)['"]\s*\?\s*['"](Dev-)?['"]\s*:\s*['"](Dev-)?['"]/g;
 
 // Lower this when sites move to `TABLE_PREFIX` / `tableName()`; never raise it.
-const MAX_INLINE_PREFIX_DEFINITIONS = 140;
+const MAX_INLINE_PREFIX_DEFINITIONS = 125;
 
 const SRC_ROOT = path.resolve(__dirname, '..', '..');
 
