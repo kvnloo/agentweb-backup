@@ -121,6 +121,16 @@ describe('admin golden-set routes: behaviour', () => {
     expect((await request(app(store)).put(path).set('x-test-user', CUSTOMER).send({ reason: 'empty_session' })).status).toBe(403);
   });
 
+  it('answers 400, not 500, for a case id longer than DynamoDB allows, before touching the store (ENG-2608)', async () => {
+    const store = fakeStore();
+    const long = encodeURIComponent('x'.repeat(2049));
+    expect((await request(app(store)).put(`${base}/${long}/exclusion`).set('x-test-user', ADMIN).send({ reason: 'empty_session' })).status).toBe(400);
+    expect((await request(app(store)).delete(`${base}/${long}/exclusion`).set('x-test-user', ADMIN)).status).toBe(400);
+    expect((await request(app(store)).get(`${base}/${long}`).set('x-test-user', ADMIN)).status).toBe(400);
+    expect(store.setExclusion).not.toHaveBeenCalled();
+    expect(store.getCase).not.toHaveBeenCalled();
+  });
+
   it('saves labels as the admin, validating them against the case surface', async () => {
     const store = fakeStore();
     const res = await request(app(store)).put(labelsPath).set('x-test-user', ADMIN).send({ labels: { task_success: 'fail' }, notes: 'claimed publish', expectedVersion: 0 });
