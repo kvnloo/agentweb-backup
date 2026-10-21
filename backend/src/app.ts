@@ -329,6 +329,9 @@ app.use((req, res, next) => {
       // ENG-2315: the tracker SDK and its ingest are called from visitors' browsers on any customer
       // domain. Origins are enforced per list inside the route (trackingConfig.allowedOrigins), not here.
       req.path === '/api/track/event' ||
+      // ENG-2593: customer web forms on any domain POST leads here from the browser.
+      // Access is gated per list (publicAccessEnabled) inside routes/webhooks.ts.
+      req.path === '/api/webhooks/forward-lead' ||
       req.path.startsWith('/sdk/v1/') ||
       req.path.startsWith('/batch-review/')) {
     // Allow all origins for public endpoints
