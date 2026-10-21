@@ -204,7 +204,7 @@ function guarded(handler: Handler, replies: ErrorReplies) {
       // Cannot verify right now, so nothing is processed. Only /status carries a retry override.
       if (Date.now() - cannotVerifyLoggedAt >= CANNOT_VERIFY_LOG_WINDOW_MS) {
         cannotVerifyLoggedAt = Date.now();
-        console.error('[twilio-voice] cannot verify callback:', errorName(err));
+        console.error('[hotLeadCall] cannot verify callback:', errorName(err));
       }
       res.status(503).end();
       return;
@@ -224,7 +224,7 @@ function guarded(handler: Handler, replies: ErrorReplies) {
       await handler(req, res, q, body);
     } catch (err) {
       // Name only: an error message from a lower layer may echo request data.
-      console.error('[twilio-voice] handler failed:', errorName(err));
+      console.error('[hotLeadCall] handler failed:', errorName(err));
       if (!res.headersSent) replies.failed(res);
     }
   };

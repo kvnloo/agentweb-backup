@@ -1,5 +1,6 @@
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() }, orgDb: { getOrgById: jest.fn(), updateOrg: jest.fn() } }));
 jest.mock('../services/usageRecorderService', () => ({ recordVendorUsage: jest.fn().mockResolvedValue(undefined) }));
+import { spokenCode } from './helpers/spokenCode';
 import { orgDb } from '../services/db';
 import { recordVendorUsage } from '../services/usageRecorderService';
 import { confirmMemberVerification, startMemberVerification } from '../services/hotLeadCallSettingsService';
@@ -35,7 +36,7 @@ const snapshot = () => JSON.parse(JSON.stringify(table.org));
 // null means "no memberId sent"; omitted means the first member.
 const start = (memberId: string | null = ids[0]) => startMemberVerification(snapshot(), OWNER, memberId ?? undefined);
 const confirm = (code: string, memberId: string = ids[0]) => confirmMemberVerification(snapshot(), OWNER, memberId, code);
-const codeOfCall = (index: number) => /code is ((?:\d ){5}\d)\./.exec((fake.placedCalls[index] as { twiml: string }).twiml)![1].replace(/ /g, '');
+const codeOfCall = (index: number) => spokenCode(fake.placedCalls[index]);
 const wrong = (code: string) => (code === '000000' ? '000001' : '000000');
 const verificationState = () => table.org.hotLeadCallVerification as { members: Record<string, { codeHash: string | null; attempts: number; startedAt: number[]; phone: string }>; orgStartedAt: number[] };
 const team = () => (table.org.hotLeadCall as { team: Array<{ id: string; verifiedAt?: string }> }).team;

@@ -4,6 +4,7 @@ jest.mock('../emma/registry', () => ({ emmaToolRegistry: { register: (tool: Tool
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() }, orgDb: { getOrgById: jest.fn(), updateOrg: jest.fn() } }));
 jest.mock('../services/usageRecorderService', () => ({ recordVendorUsage: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('../services/voice/hotLeadCallMode', () => ({ isHotLeadCallEnabled: jest.fn().mockResolvedValue(false) }));
+import { spokenCode } from './helpers/spokenCode';
 import crypto from 'crypto';
 import { readFileSync } from 'fs';
 import { join } from 'path';
@@ -89,10 +90,7 @@ function installOrgDb() {
 }
 
 const wrongCode = (code: string) => (code === '000000' ? '000001' : '000000');
-const codeFromCall = (index = 0) => {
-  const twiml = (fake.placedCalls[index] as { twiml: string }).twiml;
-  return /code is ((?:\d ){5}\d)\./.exec(twiml)![1].replace(/ /g, '');
-};
+const codeFromCall = (index = 0) => spokenCode(fake.placedCalls[index]);
 const setTime = (ms: number) => jest.setSystemTime(ms);
 const allLogs = () => logSpies.flatMap(s => s.mock.calls).map(c => c.map(String).join(' ')).join('\n');
 

@@ -168,9 +168,23 @@ failed `/gather` move hangs up, so the member leg's end hands over to the next m
 first one's token, so the retry is exactly-once, and a `false` that really is a lost race (another dispatch of the lead,
 another worker on the lock) carries somebody else's token and changes nothing. Timeline events (`call.completed` and
 the others) and usage events are written after the decision they report, so a write that commits and then errors can
-lose one: a usage event lost this way under-bills, and nothing is ever billed twice. Closing a waiting record is tried twice and then thrown, so the job
-fails instead of reporting a close that did not happen; the record stays `between_attempts`, where a redelivered final
-callback heals it.
+lose one: a usage event lost this way under-bills, and nothing is ever billed twice.
+
+A placement Twilio definitely rejected is recorded the same way: if the update to `between_attempts` errors, or lands and
+answers `false`, the record is read back and the move is made once more if it did not land, so the pass goes on to
+the next member.
+
+Closing a waiting record is tried twice and then thrown, so the job fails (the queue row is marked failed) instead of
+reporting a close that did not happen, and the record stays `between_attempts`. A replayed final callback of the attempt
+that ended then asks for the next attempt again: the queue key is a duplicate, and a duplicate whose row FAILED is
+cleared and queued again (a pending, running or completed row is left alone), so the job runs once more. That needs a
+replay: Twilio redelivers a final status callback only when we answered it with a 5xx, so a record whose failure
+happened after we answered 200 waits until someone replays the callback (or it is repaired as under Stuck records).
+
+When the re-read itself fails three times in a row after a write that may have landed (the lock and `/gather` read
+three times; the first create reads three times in its own step and three more in the member's turn, six in all), the
+writer gives up and the outcome is the unknown one: a record that is `dialing` with no `memberCallSid`, or `bridging`
+with no `leadCallSid`, and no call in flight. Those are the cleanup case under [Stuck records](#stuck-records).
 
 **Lead age.** The deadline for further attempts is measured from the record's
 `startedAt` (when the first member was rung, which was itself within
@@ -545,9 +559,9 @@ What the code requires (verified from code):
 - The caller ID must be a number the account owns (the TwiML `<Dial callerId>`
   and the REST `from`). The provisioning tool buys it: `availablePhoneNumbers('US').local`,
   voice-enabled, optionally by area code. The org's number is always a US local
-  number, even for a Canadia member.
+  number, even for a Canadian member.
 - Outbound calls to US and Canadian numbers only (`allowedCountries`).
-- Public HTTPS reachability of `BACKEND_URL` for the four webhooks.
+- Public HTTPS reachability of `BACKEND_URL` for the six endpoints (`/owner`, `/gather`, `/screen`, `/screen-result`, `/dial`, `/status`).
 
 To confirm with Twilio (not verifiable from this repo): Voice Geographic
 Permissions must allow outbound calls to the United States and Canada; whether a
@@ -684,6 +698,9 @@ Known limits, accepted:
 - Phone-rotating bots can consume the org's hourly and daily caps; the Slack
   alert still fires.
 - Whoever submits a number first suppresses calls for that number for 24h.
+- A limit-store claim (the phone marker, the cooldown) that the SDK retried after losing the response
+  can answer "taken" because its own first try took it. That fails closed: the lead is refused as
+  `duplicate_phone` (or the member passed over) and not called; the claim expires with its 24h or cooldown window.
 - The cooldown skips a member who took a call within `memberCooldownMinutes` in favour of the next available one; when every candidate is in cooldown the lead is skipped as `member_cooldown`.
 - A process crash between reserving and `create` leaves the 24h phone marker and
   the hourly and daily counts held with no record (and, if it fell between a
@@ -825,13 +842,25 @@ mid-call. No cron cleans these up and no operator tool lists them.
   and we did not meter it.
 - `member_ringing` / `member_answered`: the member leg's final callback is missing.
 - `between_attempts`: the attempt's leg is metered but the record was neither
-  taken over by a next attempt nor finished. Usually this heals by itself: a
-  redelivery of that leg's final callback asks for the next attempt again, and a
-  next-attempt job that breaks closes the record as `failed` / `next_attempt_failed`.
-  What stays is the case where Twilio never redelivers (the process died right
-  after the metering and the retries were used up) or the job's process died with
-  the queue row still claimed. No call is in flight. The lead is simply not called
-  again.
+  taken over by a next attempt nor finished. A next-attempt job that breaks closes
+  the record as `failed` / `next_attempt_failed`; if that close fails too, a REPLAY
+  of the leg's final callback re-drives the job (a failed queue row is cleared and
+  queued again). Twilio replays only after a 5xx, so otherwise it stays until someone
+  replays the callback or the record is repaired. It also stays when the process died
+  with the queue row still claimed. No call is in flight; the lead is simply not
+  called again.
+- `dialing` with no `memberCallSid` and no `outcome`, or `bridging` with no
+  `leadCallSid`, and older than 10 minutes (a ring is 25 seconds): a deciding write
+  may have landed and its re-reads failed (see Writes that commit and then report an
+  error). Find them with the read-only scan above, with `:cutoff` set to 10 minutes
+  ago, keeping the rows where `attribute_not_exists(#s.#k.memberCallSid)` for
+  `dialing` or `attribute_not_exists(#s.#k.leadCallSid)` for `bridging`. Steps:
+  (1) confirm in the Twilio call log that no call was placed from the org's number
+  around `startedAt` (a `dialing` record) or that the member's call ended without a
+  child call to the lead (a `bridging` one); (2) if a call exists, meter it by hand
+  as under Checking what was billed; (3) the lead is not called again by itself:
+  closing the record (state `failed`, outcome `store_error`) is a production data
+  change that needs Harsha's approval, like any repair below.
 - `bridging` / `connected`: the bridge ended but a leg callback is missing; the
   call may be unmetered.
 

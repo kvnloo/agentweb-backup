@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Alert,
   Box,
@@ -139,7 +139,7 @@ function useVendorRates(token: string | null | undefined) {
   };
 
   // Load once on mount: `load` is recreated every render and only reads state it sets itself, so listing it would refetch in a loop.
-  useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps -- load once on mount
 
   useEffect(() => {
     if (success) {
@@ -277,62 +277,109 @@ function ConfirmRateDialog({ open, change, onCancel, onConfirm }: ConfirmDialogP
   );
 }
 
-export default function VendorRatesTab() {
-  const { token } = useAuth();
-  const { loading, savingRow, loadError, error, setError, success, setSuccess, data, drafts, setDrafts, load, put } = useVendorRates(token);
-  const [pending, setPending] = useState<PendingChange | null>(null);
+interface StatusAlertsProps {
+  loadError: string;
+  error: string;
+  success: string;
+  onRetry: () => void;
+}
 
-  const requestSave = (rate: VendorRate) => {
-    const value = parsePrice(drafts[rowId(rate)] ?? '');
-    if (value === null) {
-      setError(`Price must be a plain decimal greater than 0 and at most ${MAX_USD_PER_UNIT}, with at most 6 decimal places`);
-      return;
-    }
-    setError('');
-    setSuccess('');
-    setPending({ rate, usdPerUnit: value });
-  };
-
-  const requestReset = (rate: VendorRate) => {
-    setError('');
-    setSuccess('');
-    setPending({ rate, usdPerUnit: null });
-  };
-
-  const confirmPending = () => {
-    if (!pending) return;
-    const { rate, usdPerUnit } = pending;
-    setPending(null);
-    put(rate, usdPerUnit);
-  };
-
-  // Dialog content renders from the last non-null change so the close
-  // transition keeps its title and body instead of flashing an empty dialog.
-  const lastPending = useRef<PendingChange | null>(null);
-  if (pending) lastPending.current = pending;
-
-  if (loading) {
-    return (
-      <Box display="flex" justifyContent="center" p={4}>
-        <CircularProgress aria-label="Loading vendor rates" />
-      </Box>
-    );
-  }
-
+function StatusAlerts({ loadError, error, success, onRetry }: StatusAlertsProps) {
   return (
-    <Box>
+    <>
       {loadError && (
-        <Alert
-          severity="error"
-          sx={{ mb: 2 }}
-          action={<Button color="inherit" size="small" onClick={load}>Retry</Button>}
-        >
+        <Alert severity="error" sx={{ mb: 2 }} action={<Button color="inherit" size="small" onClick={onRetry}>Retry</Button>}>
           {loadError}
         </Alert>
       )}
       {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
       {success && <Alert severity="success" sx={{ mb: 2 }}>{success}</Alert>}
+    </>
+  );
+}
 
+interface ProviderRatesTableProps {
+  provider: string;
+  rates: VendorRate[];
+  drafts: Record<string, string>;
+  savingRow: string | null;
+  setDrafts: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+  onSave: (rate: VendorRate) => void;
+  onReset: (rate: VendorRate) => void;
+}
+
+function ProviderRatesTable({ provider, rates, drafts, savingRow, setDrafts, onSave, onReset }: ProviderRatesTableProps) {
+  return (
+    <Paper variant="outlined" sx={{ p: 3, mb: 3 }}>
+      <Typography variant="subtitle1" fontWeight={600} gutterBottom sx={{ textTransform: 'capitalize' }}>
+        {provider}
+      </Typography>
+      {rates.length === 0 ? (
+        <Typography variant="body2" color="text.secondary">No editable rates.</Typography>
+      ) : (
+        <Table size="small">
+          <TableHead>
+            <TableRow>
+              <TableCell>Rate key</TableCell>
+              <TableCell>Unit</TableCell>
+              <TableCell align="right">Default</TableCell>
+              <TableCell align="right">Override</TableCell>
+              <TableCell align="right">Effective</TableCell>
+              <TableCell>New price</TableCell>
+              <TableCell />
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {rates.map((rate) => (
+              <RateRow
+                key={rowId(rate)}
+                rate={rate}
+                draft={drafts[rowId(rate)] ?? ''}
+                busy={savingRow !== null}
+                saving={savingRow === rowId(rate)}
+                onDraftChange={(value) => setDrafts((prev) => ({ ...prev, [rowId(rate)]: value }))}
+                onSave={() => onSave(rate)}
+                onReset={() => onReset(rate)}
+              />
+            ))}
+          </TableBody>
+        </Table>
+      )}
+    </Paper>
+  );
+}
+
+export default function VendorRatesTab() {
+  const { token } = useAuth();
+  const { loading, savingRow, loadError, error, setError, success, setSuccess, data, drafts, setDrafts, load, put } = useVendorRates(token);
+  const [pending, setPending] = useState<PendingChange | null>(null);
+  // Dialog content renders from the last non-null change so the close
+  // transition keeps its title and body instead of flashing an empty dialog.
+  const lastPending = useRef<PendingChange | null>(null);
+  if (pending) lastPending.current = pending;
+
+  const request = (rate: VendorRate, usdPerUnit: number | null) => {
+    setError('');
+    setSuccess('');
+    setPending({ rate, usdPerUnit });
+  };
+  const requestSave = (rate: VendorRate) => {
+    const value = parsePrice(drafts[rowId(rate)] ?? '');
+    if (value === null) setError(`Price must be a plain decimal greater than 0 and at most ${MAX_USD_PER_UNIT}, with at most 6 decimal places`);
+    else request(rate, value);
+  };
+  const confirmPending = () => {
+    if (!pending) return;
+    setPending(null);
+    put(pending.rate, pending.usdPerUnit);
+  };
+
+  if (loading) {
+    return <Box display="flex" justifyContent="center" p={4}><CircularProgress aria-label="Loading vendor rates" /></Box>;
+  }
+  return (
+    <Box>
+      <StatusAlerts loadError={loadError} error={error} success={success} onRetry={load} />
       <Typography variant="h6" gutterBottom>Vendor Rates</Typography>
       {data && (
         <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }} data-testid="vendor-rates-version">
@@ -340,53 +387,21 @@ export default function VendorRatesTab() {
           {data.updatedBy && data.updatedAt && ` · Last changed by ${data.updatedBy} at ${data.updatedAt}`}
         </Typography>
       )}
-
       {data && data.editableProviders.length === 0 && (
         <Typography variant="body2" color="text.secondary">No editable vendor rates.</Typography>
       )}
-
-      {data && data.editableProviders.map((provider) => {
-        const rates = data.rates.filter((r) => r.provider === provider);
-        return (
-          <Paper key={provider} variant="outlined" sx={{ p: 3, mb: 3 }}>
-            <Typography variant="subtitle1" fontWeight={600} gutterBottom sx={{ textTransform: 'capitalize' }}>
-              {provider}
-            </Typography>
-            {rates.length === 0 ? (
-              <Typography variant="body2" color="text.secondary">No editable rates.</Typography>
-            ) : (
-              <Table size="small">
-                <TableHead>
-                  <TableRow>
-                    <TableCell>Rate key</TableCell>
-                    <TableCell>Unit</TableCell>
-                    <TableCell align="right">Default</TableCell>
-                    <TableCell align="right">Override</TableCell>
-                    <TableCell align="right">Effective</TableCell>
-                    <TableCell>New price</TableCell>
-                    <TableCell />
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {rates.map((rate) => (
-                    <RateRow
-                      key={rowId(rate)}
-                      rate={rate}
-                      draft={drafts[rowId(rate)] ?? ''}
-                      busy={savingRow !== null}
-                      saving={savingRow === rowId(rate)}
-                      onDraftChange={(value) => setDrafts((prev) => ({ ...prev, [rowId(rate)]: value }))}
-                      onSave={() => requestSave(rate)}
-                      onReset={() => requestReset(rate)}
-                    />
-                  ))}
-                </TableBody>
-              </Table>
-            )}
-          </Paper>
-        );
-      })}
-
+      {data && data.editableProviders.map((provider) => (
+        <ProviderRatesTable
+          key={provider}
+          provider={provider}
+          rates={data.rates.filter((r) => r.provider === provider)}
+          drafts={drafts}
+          savingRow={savingRow}
+          setDrafts={setDrafts}
+          onSave={requestSave}
+          onReset={(rate) => request(rate, null)}
+        />
+      ))}
       <ConfirmRateDialog open={pending !== null} change={pending ?? lastPending.current} onCancel={() => setPending(null)} onConfirm={confirmPending} />
     </Box>
   );

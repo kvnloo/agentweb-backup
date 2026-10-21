@@ -13,6 +13,8 @@ jest.unmock('aws-sdk');
 jest.mock('../utils/awsHttpOptions', () => ({ buildAwsHttpOptions: () => ({}) }));
 jest.mock('../services/usageRecorderService', () => ({ recordVendorUsage: jest.fn().mockResolvedValue(undefined) }));
 
+import { spokenCode } from './helpers/spokenCode';
+
 export {};
 
 const ENDPOINT = process.env.DYNAMODB_LOCAL_ENDPOINT;
@@ -142,7 +144,7 @@ suite('team settings and member verification against DynamoDB Local', () => {
   it('parallel wrong guesses cannot exceed the attempt budget, and the right code then verifies only that member', async () => {
     const orgId = await newOrg();
     await svc.startMemberVerification(await loaded(orgId), OWNER, A);
-    const code = /code is ((?:\d ){5}\d)\./.exec((fake.placedCalls[fake.placedCalls.length - 1] as { twiml: string }).twiml)![1].replace(/ /g, '');
+    const code = spokenCode(fake.placedCalls[fake.placedCalls.length - 1]);
     const wrong = code === '000000' ? '000001' : '000000';
     const org = await loaded(orgId);
     const results = await Promise.allSettled(Array.from({ length: 8 }, () => svc.confirmMemberVerification(org, OWNER, A, wrong)));
@@ -157,7 +159,7 @@ suite('team settings and member verification against DynamoDB Local', () => {
   it('a phone edited between the confirm read and its write is not marked verified', async () => {
     const orgId = await newOrg();
     await svc.startMemberVerification(await loaded(orgId), OWNER, A);
-    const code = /code is ((?:\d ){5}\d)\./.exec((fake.placedCalls[fake.placedCalls.length - 1] as { twiml: string }).twiml)![1].replace(/ /g, '');
+    const code = spokenCode(fake.placedCalls[fake.placedCalls.length - 1]);
     const org = await loaded(orgId);
     await ddb.update({ TableName: TABLE(), Key: { orgId }, UpdateExpression: 'SET hotLeadCall.team[0].phone = :p', ExpressionAttributeValues: { ':p': '+16475550123' } }).promise();
     await expect(svc.confirmMemberVerification(org, OWNER, A, code)).rejects.toThrow('settings changed');
