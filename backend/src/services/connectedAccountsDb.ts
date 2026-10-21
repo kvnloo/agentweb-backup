@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { userDb, User } from './db';
 import { invalidateCachedPixels } from './metaPixelsCache';
+import { isEvaluationUser } from './evaluationPolicy';
 import type { DailyVolumeState } from './linkedInWritePacer';
 
 // ============================================
@@ -1070,9 +1071,14 @@ const loadHubSpotPortalMap = (): Promise<HubSpotPortalMap> => {
     const generation = hubspotPortalMapGeneration;
     const inflight = (async () => {
       const { userDb } = await import('./db');
-      const users = await userDb.getAllUsers();
+      // scanWithFilter, not getAllUsers(): the latter also runs three per-user count scans (tasks, workflows,
+      // chat sessions) for the admin dashboard, which this lookup does not need and which let an unrelated
+      // table's throttling fail the rebuild. Same population as before: tombstoned (deleted_) users are
+      // excluded by scanWithFilter, evaluation users are excluded here, as getAllUsers did by default.
+      const users = await userDb.scanWithFilter('attribute_exists(connected_accounts)', {});
       const byPortal = new Map<unknown, string>();
       for (const user of users) {
+        if (!user || typeof user.userId !== 'string' || isEvaluationUser(user.userId)) continue;
         if (!user.connected_accounts) continue;
         try {
           for (const account of user.connected_accounts) {
@@ -1139,8 +1145,13 @@ export const getUserIdByHubSpotPortalId = async (portalId: number): Promise<stri
   } catch (error) {
     console.error('Error resolving HubSpot Portal ID to User ID:', error);
     // A stale answer beats dropping a webhook delivery because one rebuild was throttled, but never
-    // an owner we have just seen no longer holds the portal.
-    return cachedOwnerIsStale ? null : (cached?.byPortal.get(portalId) ?? null);
+    // an owner we have just seen no longer holds the portal, and an expired snapshot's owner is
+    // verified like any other hit (this path skips the fresh-snapshot check above). If that read
+    // fails too, the snapshot is trusted.
+    if (cachedOwnerIsStale) return null;
+    const fallback = cached?.byPortal.get(portalId);
+    if (fallback === undefined) return null;
+    return (await ownerStillHoldsPortal(fallback, portalId)) === false ? null : fallback;
   }
 };
 
