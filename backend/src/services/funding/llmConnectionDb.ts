@@ -107,6 +107,16 @@ export interface LlmConnectionRecord {
   /** The stored login is probably dead (the CLI said so); the owner must sign in again. */
   subNeedsReconnect?: boolean;
   subReconnectReason?: string;
+  // ---- hosted logins (ENG-2110 1c): the login lives in a per-customer home on the login host, which only the CLI touches.
+  // ---- A hosted row holds NO secret: no `sealed`, no `subVersion`, no lease. All names start with `sub` so subUpdate aliases them.
+  subHosted?: boolean;
+  /** The credential epoch the host must agree on; moves up on reconnect and on disconnect (fencing). */
+  subHostEpoch?: number;
+  /** Non-secret account id the provider offers without reading tokens. */
+  subAccountFingerprint?: string;
+  subRevokeStartedAt?: string;
+  subRevokeAttempts?: number;
+  subLastRevokeAttemptAt?: string;
 }
 
 /** Non-secret facts read from a Claude login, kept next to the sealed blob. */
@@ -295,8 +305,9 @@ export class LlmConnectionDb {
             "SET #status = :revoked, revokedAt = :now, updatedAt = :now, revokedByUserId = :by" +
             (by.adminId ? ", revokedByAdminId = :admin" : "") +
             " REMOVE sealed, orgId",
-          ConditionExpression: "attribute_exists(connectionId) AND attribute_not_exists(revokedAt)",
-          ExpressionAttributeNames: { "#status": "status" },
+          // A hosted login is never revoked by this write: its home must be wiped by the login host first (hostedMarkRevoked).
+          ConditionExpression: "attribute_exists(connectionId) AND attribute_not_exists(revokedAt) AND attribute_not_exists(#hosted)",
+          ExpressionAttributeNames: { "#status": "status", "#hosted": "subHosted" },
           ExpressionAttributeValues: {
             ":revoked": "revoked",
             ":now": now,
@@ -475,6 +486,105 @@ export class LlmConnectionDb {
       names: { "#kind": "kind", "#status": "status" },
       values: { ":expired": "expired", ":active": "active", ":sub": "claude_subscription", ":nowMs": nowMs, ":now": nowIso },
     });
+  }
+
+  // ===================== hosted logins (ENG-2110 1c) =====================
+  /**
+   * The owner disconnected: fence the connection (epoch up), stop it being usable (`revoking`) and drop any org share. The
+   * caller releases the owner's slot when this returns "started". "already" = it is revoking or revoked (retries are fine).
+   * Nothing here says the login host has wiped the home: only `hostedMarkRevoked` does.
+   */
+  async hostedBeginRevoke(connectionId: string, nextEpoch: number, by: { userId: string; adminId?: string }, nowIso: string): Promise<"started" | "already" | "missing" | "not_hosted"> {
+    const started = await this.subUpdate(connectionId, {
+      update:
+        "SET #status = :revoking, subHostEpoch = :next, subRevokeStartedAt = :now, updatedAt = :now, revokedByUserId = :by" +
+        (by.adminId ? ", revokedByAdminId = :admin" : "") +
+        " REMOVE orgId",
+      condition:
+        "attribute_exists(connectionId) AND #kind = :sub AND subHosted = :yes AND attribute_not_exists(revokedAt) AND subHostEpoch < :next AND " +
+        "(#status = :active OR #status = :invalid OR #status = :disabled OR #status = :expired)",
+      names: { "#kind": "kind", "#status": "status" },
+      values: {
+        ":revoking": "revoking", ":next": nextEpoch, ":now": nowIso, ":by": by.userId, ":sub": "claude_subscription", ":yes": true,
+        ":active": "active", ":invalid": "invalid", ":disabled": "disabled", ":expired": "expired",
+        ...(by.adminId ? { ":admin": by.adminId } : {}),
+      },
+    });
+    if (started) return "started";
+    const now = await this.get(connectionId);
+    if (!now) return "missing";
+    if (!now.subHosted) return "not_hosted";
+    return "already";
+  }
+
+  /** The login host confirmed the wipe (or never had the home). Only moves `revoking` -> `revoked`. */
+  async hostedMarkRevoked(connectionId: string, nowIso: string): Promise<boolean> {
+    return this.subUpdate(connectionId, {
+      update: "SET #status = :revoked, revokedAt = :now, updatedAt = :now",
+      condition: "attribute_exists(connectionId) AND subHosted = :yes AND #status = :revoking",
+      names: { "#status": "status" },
+      values: { ":revoked": "revoked", ":revoking": "revoking", ":now": nowIso, ":yes": true },
+    });
+  }
+
+  async hostedNoteRevokeAttempt(connectionId: string, nowIso: string): Promise<void> {
+    await this.subUpdate(connectionId, {
+      update: "SET subRevokeAttempts = if_not_exists(subRevokeAttempts, :zero) + :one, subLastRevokeAttemptAt = :now",
+      condition: "attribute_exists(connectionId) AND subHosted = :yes AND #status = :revoking",
+      names: { "#status": "status" },
+      values: { ":zero": 0, ":one": 1, ":now": nowIso, ":yes": true, ":revoking": "revoking" },
+    });
+  }
+
+  /** Reconnect step 1: the record moves to the epoch the host will be asked to promote. Conditional on the epoch we read. */
+  async hostedAdvanceEpoch(connectionId: string, expectedEpoch: number, nextEpoch: number, nowIso: string): Promise<boolean> {
+    return this.subUpdate(connectionId, {
+      update: "SET subHostEpoch = :next, updatedAt = :now",
+      condition:
+        "attribute_exists(connectionId) AND subHosted = :yes AND attribute_not_exists(revokedAt) AND subHostEpoch = :cur AND " +
+        "(#status = :active OR #status = :invalid OR #status = :disabled OR #status = :expired)",
+      names: { "#status": "status" },
+      values: { ":next": nextEpoch, ":cur": expectedEpoch, ":now": nowIso, ":yes": true, ":active": "active", ":invalid": "invalid", ":disabled": "disabled", ":expired": "expired" },
+    });
+  }
+
+  /** The host cannot serve this login any more (home lost, login dead, promote failed): the owner must sign in again. */
+  async hostedMarkNeedsReconnect(connectionId: string, epoch: number, reason: string, nowIso: string): Promise<boolean> {
+    return this.subUpdate(connectionId, {
+      update: "SET #status = :invalid, subNeedsReconnect = :yes, subReconnectReason = :reason, updatedAt = :now",
+      condition: "attribute_exists(connectionId) AND subHosted = :yes AND attribute_not_exists(revokedAt) AND subHostEpoch = :e AND (#status = :active OR #status = :invalid)",
+      names: { "#status": "status" },
+      values: { ":invalid": "invalid", ":yes": true, ":reason": reason, ":now": nowIso, ":e": epoch, ":active": "active" },
+    });
+  }
+
+  /** Reconnect step 3: the host promoted the new login at `epoch`. */
+  async hostedMarkReconnected(connectionId: string, epoch: number, ready: { plan?: string; refreshExpiresAtMs?: number; fingerprint?: string }, nowIso: string): Promise<boolean> {
+    const sets = ["#status = :active", "subNeedsReconnect = :no", "updatedAt = :now"];
+    const values: Record<string, unknown> = { ":active": "active", ":no": false, ":now": nowIso, ":e": epoch, ":yes": true, ":invalid": "invalid", ":expired": "expired" };
+    if (ready.plan) {
+      sets.push("subType = :type");
+      values[":type"] = ready.plan;
+    }
+    if (ready.refreshExpiresAtMs) {
+      sets.push("subRefreshExpiresAtMs = :ref");
+      values[":ref"] = ready.refreshExpiresAtMs;
+    }
+    if (ready.fingerprint) {
+      sets.push("subAccountFingerprint = :fp");
+      values[":fp"] = ready.fingerprint;
+    }
+    return this.subUpdate(connectionId, {
+      update: `SET ${sets.join(", ")} REMOVE subReconnectReason`,
+      condition: "attribute_exists(connectionId) AND subHosted = :yes AND attribute_not_exists(revokedAt) AND subHostEpoch = :e AND (#status = :active OR #status = :invalid OR #status = :expired)",
+      names: { "#status": "status" },
+      values,
+    });
+  }
+
+  /** Every hosted login, any status (the sweeper filters). */
+  async listHosted(): Promise<LlmConnectionRecord[]> {
+    return (await this.listSubscriptions()).filter((r) => r.subHosted === true);
   }
 
   /** Every Claude-login connection, via the provider index (small: one row per connected customer). */
