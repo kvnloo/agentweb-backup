@@ -9,6 +9,8 @@ import { getLeadCallStore } from './voice/leadCallStore';
 import type { HotLeadCallEventType, HotLeadCallPatch, LeadCallStore } from './voice/leadCallStore.types';
 
 const MEMBER_RING_TIMEOUT_SECONDS = 25;
+// The re-read that decides whether a write that reported a problem still landed: a read that fails is tried again.
+const CLAIM_READ_ATTEMPTS = 3;
 
 /** How a placement pass ended. */
 export type PlacementResult =
@@ -101,7 +103,13 @@ async function settle(
 
 /** Whether the record carries this token: the write that was meant to put it there landed, whatever it reported. */
 export async function holdsClaim(store: LeadCallStore, listId: string, leadId: string, claimToken: string): Promise<boolean> {
-  return (await store.get(listId, leadId))?.claimToken === claimToken;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return (await store.get(listId, leadId))?.claimToken === claimToken;
+    } catch (err) {
+      if (attempt >= CLAIM_READ_ATTEMPTS) throw err;
+    }
+  }
 }
 
 /**
@@ -117,7 +125,8 @@ async function tryMember(
   if (!releaseCooldown) return 'cooldown';
 
   const claimToken = randomUUID();
-  let owned: boolean;
+  let owned = false;
+  let failure: unknown;
   try {
     owned = createRecord
       ? await createRecord(member, claimToken)
@@ -126,16 +135,16 @@ async function tryMember(
         state: 'dialing', attemptNo, memberId: member.id, triedMemberIds: [member.id], claimToken, clear: ['memberCallSid', 'outcome'],
       });
   } catch (err) {
-    // The write may have committed and then reported an error (a timeout): the record then says `dialing`, nobody
-    // is going to dial it, and nothing else ever will. Our own token on it means the step is ours, so go on.
-    if (await holdsClaim(store, listId, leadId, claimToken)) owned = true;
-    else {
-      await releaseCooldown();
-      throw err;
-    }
+    failure = err;
   }
+  // A write can commit and still report an error (a timeout after the commit) or, when the SDK retried it after
+  // losing the response, report that it lost (its own condition failed against its own first try). Either way the
+  // record then says `dialing`, nobody is going to dial it and nothing else ever will. Our own token on it means the
+  // step is ours, so go on; a competing winner can never carry our token.
+  if (!owned && await holdsClaim(store, listId, leadId, claimToken).catch(() => false)) owned = true;
   if (!owned) {
     await releaseCooldown();
+    if (failure) throw failure;
     return 'lost';
   }
 

@@ -20,7 +20,7 @@ const SID_LEAD = 'CA' + '12345678'.repeat(4);
 
 // In-memory stand-in for the two crmDb primitives with the semantics of their DynamoDB conditions:
 // each call is one atomic step (no await between check and write), exactly like a conditional UpdateItem.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- the fake's rows are schemaless JSON, like the real item
 type Row = Record<string, any>;
 function installFakeDb(leads: Record<string, Row>) {
   const rowOf = (listId: string, leadId: string) => leads[`${listId}/${leadId}`];

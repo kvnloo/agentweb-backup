@@ -158,12 +158,17 @@ next attempt again. That request is idempotent (the queue key, then the
 **Writes that commit and then report an error.** A store write can apply and still throw (a timeout after the
 commit). The steps that decide who dials write a random `claimToken` onto the record: creating the record (first
 attempt), the `between_attempts` -> `dialing` lock (next attempts) and the `/gather` move to `bridging`. When such a
-write throws, the writer re-reads the record: its own token means the write landed, so it goes on (places the one call,
+write throws, or answers that it lost (the AWS SDK retries a timed-out conditional write, and when the first try had
+committed the retry fails its own condition, which the store reports as `false`), the writer re-reads the record, up to
+three times if the read itself fails: its own token means the write landed, so it goes on (places the one call,
 or returns the Dial TwiML) instead of leaving a `dialing` record nobody will ever call back, or a member hung up on while
 `bridging` waits for a lead leg. No token of its own means the write did not land: a failed create leaves no record and
 gives the slots back, a failed lock fails the job and closes the waiting record as `failed` / `next_attempt_failed`, and a
 failed `/gather` move hangs up, so the member leg's end hands over to the next member. A second writer never finds the
-first one's token, so the retry is exactly-once. Closing a waiting record is tried twice and then thrown, so the job
+first one's token, so the retry is exactly-once, and a `false` that really is a lost race (another dispatch of the lead,
+another worker on the lock) carries somebody else's token and changes nothing. Timeline events (`call.completed` and
+the others) and usage events are written after the decision they report, so a write that commits and then errors can
+lose one: a usage event lost this way under-bills, and nothing is ever billed twice. Closing a waiting record is tried twice and then thrown, so the job
 fails instead of reporting a close that did not happen; the record stays `between_attempts`, where a redelivered final
 callback heals it.
 

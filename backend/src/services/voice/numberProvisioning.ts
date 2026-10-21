@@ -5,6 +5,7 @@ import { getAllocatedRate, getRecordingUnit } from '../../utils/vendorRateCard';
 import { isRecord } from '../leadNotificationAttribution';
 import { getVoiceProvider, VoiceCallError } from './voiceProvider';
 import { isConditionalFailure, unchangedSince } from './setupWrites';
+import { omit } from '../../utils/omit';
 
 /**
  * Caller-number provisioning for the hot-lead auto-call (ENG-2271): one Twilio number per org.
@@ -208,9 +209,7 @@ export async function releaseNumber(p: { org: Organization; config: HotLeadCallC
 
   await rewriteConfig(org.orgId, c => {
     if (!c.twilioNumber && !c.twilioNumberSid) return null;
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    const { twilioNumber: _number, twilioNumberSid: _sid, ...rest } = c;
-    return { ...rest, enabled: false };
+    return { ...omit(c, ['twilioNumber', 'twilioNumberSid']), enabled: false };
   });
   return { callerNumberReleased: true, callingEnabled: false };
 }
